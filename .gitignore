@@ -100,7 +100,7 @@ aiter/ops/opus/configs/
 
 # Debug assembly dumps from csrc/opus_gemm/gen_co/build_co.py. The .co files
 # next to them ARE tracked (the wheel needs them); these are just for analysis.
-csrc/opus_gemm/gen_co/*/asm/
+csrc/opus_gemm/gen_co/**/asm/
 
 # Backstop for local runs of .github/scripts/update_split_test_times.py, whose
 # --summary-path still defaults to the working directory. The workflow itself

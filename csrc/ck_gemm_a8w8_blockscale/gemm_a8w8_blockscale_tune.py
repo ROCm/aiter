@@ -18,6 +18,7 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.opus._arch import _device_arch_and_cu
 from aiter.ops.opus.gemm_op_a8w8 import (
     opus_gemm_a8w8_blockscale_bpreshuffle_tune,
 )
@@ -36,7 +37,8 @@ from gemm_a8w8_blockscale_cktile_instance import (
     candidate_kernels_cktile_dict,
 )
 from gemm_a8w8_blockscale_instance import candidate_kernels_dict
-from opus_gemm.opus_gemm_common import gfx942_a8w8_kernels_list
+
+from csrc.opus_gemm.opus_gemm_common import get_registry
 
 block_shape = (128, 128)
 
@@ -199,6 +201,9 @@ def generate_data(m, n, k, seed, device="cuda"):
 
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
+    def get_gfx(self):
+        return _device_arch_and_cu(torch.cuda.current_device())[0]
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}",
@@ -466,7 +471,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
         run_kwargs,
     ):
-        gfx, _, M, N, K = info_keys
+        gfx, cu_num, M, N, K = info_keys
         if not preshuffleB or gfx != "gfx942":
             return []
 
@@ -474,7 +479,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ref_keys = ["x", "weight", "x_scale", "w_scale"]
         ref_args = (ref_keys, None, dtypes.bf16)
         tasks_opus = []
-        for kernel_id, kernel in gfx942_a8w8_kernels_list.items():
+        for kernel_id, kernel in get_registry(
+            "a8w8_blockscale_bpreshuffle", gfx, cu_num
+        ).items():
             if N % kernel.B_N != 0 or K % kernel.B_K != 0:
                 continue
             if not kernel.has_oob and M % kernel.B_M != 0:

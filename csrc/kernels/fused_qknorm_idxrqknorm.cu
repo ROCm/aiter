@@ -8,7 +8,6 @@
 #include "fused_qknorm_idxrqknorm.h"
 
 #include <hip/hip_bfloat16.h>
-#include <type_traits>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -229,9 +228,9 @@ __device__ __forceinline__ void normAndRope(
     }
 }
 
-// ---- MXFP4 index-K write (index_cache_dtype="mxfp4") ----------------------------------
-// One 128-token page is [128 x 64 B e2m1][128 x 4 B e8m0], 8704 B: the layout
-// minimax_m3_index_score_fp4 reads. Low nibble = even element, one e8m0 per 32 elements.
+// ---- MXFP4 row write (index K, main K/V) -----------------------------------------------
+// One 128-token page is [128 x 64 B e2m1][128 x 4 B e8m0], 8704 B. Low nibble = even element,
+// one e8m0 per 32 elements.
 constexpr int kFp4PageTokens = 128;
 constexpr int kFp4DataBytes  = kHeadDim / 2;  // packed e2m1 bytes per token
 constexpr int kFp4ScaleBytes = kHeadDim / 32; // e8m0 bytes per token
@@ -260,16 +259,19 @@ __device__ __forceinline__ uint8_t mxfp4ScaleE8m0(const float amax)
     return exponent;
 }
 
-// Quantize one lane's kElemsPerLane elements of a head row and write them into token `tok`
-// of `page` (a [128 x 64 B e2m1][128 x 4 B e8m0] page, 8704 B). Shared by the index-K row and
-// the main K/V rows (kv_cache_dtype="mxfp4"). The elements are rounded to scalar_t first, so
-// the bytes are the quantization of exactly the bf16/fp16 row the "auto" cache would hold.
+// Quantize one lane's kElemsPerLane elements of a head row into row `slot` of the MXFP4
+// pages at `cache` (page = slot / 128 at s_block bytes, + head_off bytes). The elements are
+// rounded to scalar_t first, so the bytes are the quantization of the row "auto" would store.
 template <typename scalar_t>
-__device__ __forceinline__ void storeMxfp4Row(uint8_t* __restrict__ page,
-                                              int tok,
+__device__ __forceinline__ void storeMxfp4Row(uint8_t* __restrict__ cache,
+                                              int64_t slot,
+                                              int64_t s_block,
+                                              int64_t head_off,
                                               const float (&elems)[kElemsPerLane],
                                               int lane_id)
 {
+    uint8_t* page = cache + (slot / kFp4PageTokens) * s_block + head_off;
+    const int tok = static_cast<int>(slot % kFp4PageTokens);
     float v[kElemsPerLane];
     float local_amax = 0.0f;
 #pragma unroll
@@ -303,19 +305,6 @@ __device__ __forceinline__ void storeMxfp4Row(uint8_t* __restrict__ page,
     }
 }
 
-// Index-K slot `slot` of a contiguous run of 8704 B pages.
-template <typename scalar_t>
-__device__ __forceinline__ void storeIndexKMxfp4(uint8_t* __restrict__ index_cache,
-                                                 int64_t slot,
-                                                 const float (&elems)[kElemsPerLane],
-                                                 int lane_id)
-{
-    storeMxfp4Row<scalar_t>(index_cache + (slot / kFp4PageTokens) * kFp4PageBytes,
-                            static_cast<int>(slot % kFp4PageTokens),
-                            elems,
-                            lane_id);
-}
-
 template <typename scalar_t,
           typename cache_t,
           typename index_cache_t,
@@ -328,7 +317,7 @@ template <typename scalar_t,
           bool kInsertKV,
           bool kAsmLayout,
           bool kIndexFp4,
-          bool kKvFp4 = false>
+          bool kKvFp4>
 __global__ void fusedQKNormIdxrQKNormKernel(
     scalar_t* __restrict__ qkv,
     scalar_t* __restrict__ q_out,
@@ -371,9 +360,8 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int64_t v_s_block,
     int64_t v_s_token,
     int64_t v_s_head,
-    // Main Q in e4m3 (optional): round(q to scalar_t) / *q_scale. Null q_scale means 1.0.
-    opus::fp8_t* __restrict__ q_fp8_out,
-    const float* __restrict__ q_scale)
+    // Main Q as unit-scale e4m3 (replaces the q_out row when set).
+    opus::fp8_t* __restrict__ q_fp8_out)
 {
     const int warps_per_block = blockDim.x / 32;
     const int lane_id = threadIdx.x % 32;
@@ -483,10 +471,10 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                     // MXFP4 main V: the raw row, one e8m0 per 32 elements (8 lanes).
                     float velems[kElemsPerLane];
                     loadElems(row_ptr + dim_base, velems);
-                    storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_v) +
-                                                (mapped_slot / kFp4PageTokens) * v_s_block +
-                                                static_cast<int64_t>(head) * v_s_head,
-                                            static_cast<int>(mapped_slot % kFp4PageTokens),
+                    storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_v),
+                                            mapped_slot,
+                                            v_s_block,
+                                            static_cast<int64_t>(head) * v_s_head,
                                             velems,
                                             lane_id);
                 }
@@ -570,10 +558,9 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                     q_fp8_out + static_cast<int64_t>(token_idx) * nq * kHeadDim +
                         slot * kHeadDim + dim_base,
                     elems,
-                    q_scale != nullptr ? *q_scale : 1.0f);
+                    1.0f);
             }
-            // With only the fp8 copy requested the bf16 row is not written back.
-            if(q_out != nullptr || q_fp8_out == nullptr)
+            else
             {
                 storeElems(store_ptr + dim_base, elems);
             }
@@ -601,8 +588,12 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                 {
                     if constexpr(kIndexFp4)
                     {
-                        storeIndexKMxfp4<scalar_t>(
-                            reinterpret_cast<uint8_t*>(index_cache), mapped_slot, elems, lane_id);
+                        storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(index_cache),
+                                                mapped_slot,
+                                                kFp4PageBytes,
+                                                0,
+                                                elems,
+                                                lane_id);
                     }
                     else
                     {
@@ -615,10 +606,10 @@ __global__ void fusedQKNormIdxrQKNormKernel(
             {
                 if(is_k)
                 {
-                    storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_k) +
-                                                (mapped_slot / kFp4PageTokens) * k_s_block +
-                                                static_cast<int64_t>(head) * k_s_head,
-                                            static_cast<int>(mapped_slot % kFp4PageTokens),
+                    storeMxfp4Row<scalar_t>(reinterpret_cast<uint8_t*>(kv_cache_k),
+                                            mapped_slot,
+                                            k_s_block,
+                                            static_cast<int64_t>(head) * k_s_head,
                                             elems,
                                             lane_id);
                 }
@@ -753,8 +744,7 @@ void launchFusedQKNormIdxrQKNorm(
     bool static_kv_scale,
     bool asm_layout,
     hipStream_t stream,
-    opus::fp8_t* q_fp8_out = nullptr,
-    const float* q_scale   = nullptr)
+    opus::fp8_t* q_fp8_out = nullptr)
 {
     const int v_slots = insert_kv ? nkv : 0;
     const int idx_slots = process_index ? niq + 1 : 0;
@@ -814,8 +804,7 @@ void launchFusedQKNormIdxrQKNorm(
                                           v_s_block,                                         \
                                           v_s_token,                                         \
                                           v_s_head,                                          \
-                                          q_fp8_out,                                         \
-                                          q_scale)
+                                          q_fp8_out)
 
 #define LAUNCH_SCALE(IS_SPARSE, PROCESS_INDEX, INSERT, ASM)     \
     do                                                          \
@@ -928,9 +917,7 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch,
-    std::optional<aiter_tensor_t> q_fp8_out,
-    std::optional<aiter_tensor_t> q_scale)
+    bool skip_index_branch)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
 
@@ -970,9 +957,9 @@ static void fused_qknorm_idxrqknorm_impl(
                 "kv_cache_k and kv_cache_v must be provided together");
     const bool insert_kv = kv_cache_k.has_value();
     const bool mxfp4_kv_cache = kv_cache_dtype == "mxfp4";
-    AITER_CHECK(!mxfp4_kv_cache || (insert_kv && process_index) ||
-                    (insert_kv && has_index && skip_index_branch),
-                "kv_cache_dtype='mxfp4' requires the sparse insert mode (kv caches + index slots in qkv)");
+    AITER_CHECK(!mxfp4_kv_cache || (insert_kv && has_index),
+                "kv_cache_dtype='mxfp4' requires the sparse insert mode "
+                "(kv caches + index slots in qkv)");
     const bool fp8_kv_cache =
         insert_kv && kv_cache_dtype.rfind("fp8", 0) == 0;
     const bool fp8_kv_per_token =
@@ -984,7 +971,8 @@ static void fused_qknorm_idxrqknorm_impl(
         insert_kv && process_index && index_cache_dtype.rfind("fp8", 0) == 0;
     const bool mxfp4_index_cache = index_cache_dtype == "mxfp4";
     AITER_CHECK(!mxfp4_index_cache || (insert_kv && process_index),
-                "index_cache_dtype='mxfp4' requires the sparse insert mode (kv caches + index branch)");
+                "index_cache_dtype='mxfp4' requires the sparse insert mode "
+                "(kv caches + index branch)");
     const int expected_row = (nq + 2 * nkv + (has_index ? niq + 1 : 0)) * kHeadDim;
     AITER_CHECK(positions.dim() == 1 && positions.size(0) >= num_tokens,
                 "positions must be 1D with at least num_tokens elements");
@@ -1114,7 +1102,7 @@ static void fused_qknorm_idxrqknorm_impl(
             AITER_CHECK(mxfp4_kv_cache ? kc.dtype() == AITER_DTYPE_u8 : kc.dtype() == qkv.dtype(),
                         "kv_cache dtype must match qkv for a non-fp8 cache (uint8 for mxfp4)");
             AITER_CHECK(!mxfp4_kv_cache || (!k_scale.has_value() && !v_scale.has_value()),
-                        "kv_cache_dtype='mxfp4' keeps its e8m0 scales in the pages: no k_scale/v_scale");
+                        "kv_cache_dtype='mxfp4' keeps its scales in the pages: no k_scale/v_scale");
         }
 
         if(mxfp4_kv_cache)
@@ -1177,7 +1165,9 @@ static void fused_qknorm_idxrqknorm_impl(
                 // mode and includes gaps belonging to the opposite K/V side. It
                 // therefore cannot define the independently mapped index-cache
                 // capacity. As with slot_mapping, callers own bounds validity.
-                AITER_CHECK(index_cache->numel() % (mxfp4_index_cache ? kFp4PageBytes : kHeadDim) == 0,
+                AITER_CHECK(index_cache->numel() %
+                                    (mxfp4_index_cache ? kFp4PageBytes : kHeadDim) ==
+                                0,
                             "index_cache must contain contiguous 128-element rows "
                             "(whole 8704 B pages for mxfp4)");
             }
@@ -1253,26 +1243,13 @@ static void fused_qknorm_idxrqknorm_impl(
         }
     }
 
-    if(q_fp8_out.has_value())
-    {
-        AITER_CHECK(insert_kv, "q_fp8_out requires the insert mode (kv caches)");
-        AITER_CHECK(q_fp8_out->is_gpu() && q_fp8_out->is_contiguous() &&
-                        (q_fp8_out->dtype() == AITER_DTYPE_fp8 ||
-                         q_fp8_out->dtype() == AITER_DTYPE_u8) &&
-                        q_fp8_out->numel() == static_cast<int64_t>(num_tokens) * nq * kHeadDim,
-                    "q_fp8_out must be a contiguous e4m3 CUDA tensor of num_tokens * num_heads * 128");
-    }
-    if(q_scale.has_value())
-    {
-        AITER_CHECK(q_fp8_out.has_value() && q_scale->is_gpu() && q_scale->is_contiguous() &&
-                        q_scale->dtype() == AITER_DTYPE_fp32 && q_scale->numel() == 1,
-                    "q_scale must be a [1] float32 CUDA tensor and needs q_fp8_out");
-    }
     if(q_out.has_value())
     {
+        const bool q_is_fp8 = q_out->dtype() == AITER_DTYPE_fp8 || q_out->dtype() == AITER_DTYPE_u8;
+        AITER_CHECK(!q_is_fp8 || insert_kv, "fp8 q_out requires the insert mode (kv caches)");
         AITER_CHECK(q_out->is_gpu() && q_out->is_contiguous() &&
-                        q_out->dtype() == qkv.dtype(),
-                    "q_out must be contiguous CUDA and match qkv dtype");
+                        (q_out->dtype() == qkv.dtype() || q_is_fp8),
+                    "q_out must be contiguous CUDA and match qkv dtype or fp8 e4m3");
         AITER_CHECK(q_out->numel() == static_cast<int64_t>(num_tokens) * nq * kHeadDim,
                     "q_out must have num_tokens * num_heads * 128 elements");
     }
@@ -1302,24 +1279,26 @@ static void fused_qknorm_idxrqknorm_impl(
         opus::fp8_t* index_q_fp8_ptr =
             index_q_is_fp8 ? reinterpret_cast<opus::fp8_t*>(index_q_out->data_ptr())
                            : nullptr;
+        const bool q_is_fp8 =
+            q_out.has_value() &&
+            (q_out->dtype() == AITER_DTYPE_fp8 || q_out->dtype() == AITER_DTYPE_u8);
+        T* q_ptr = (!q_is_fp8 && q_out.has_value()) ? reinterpret_cast<T*>(q_out->data_ptr())
+                                                    : nullptr;
         opus::fp8_t* q_fp8_ptr =
-            q_fp8_out.has_value() ? reinterpret_cast<opus::fp8_t*>(q_fp8_out->data_ptr()) : nullptr;
-        const float* q_scale_ptr =
-            q_scale.has_value() ? reinterpret_cast<const float*>(q_scale->data_ptr()) : nullptr;
-        if(mxfp4_kv_cache)
+            q_is_fp8 ? reinterpret_cast<opus::fp8_t*>(q_out->data_ptr()) : nullptr;
+        if(mxfp4_kv_cache || mxfp4_index_cache)
         {
-            // MXFP4 main K/V (sparse insert only): the index cache is "auto", fp8 or mxfp4.
-            auto launch_kv_fp4 = [&](auto index_tag, auto index_dt_tag, auto index_fp4_tag) {
-                using IndexT = typename decltype(index_tag)::type;
-                launchFusedQKNormIdxrQKNorm<T,
-                                            uint8_t,
-                                            IndexT,
-                                            vllm::Fp8KVCacheDataType::kAuto,
-                                            decltype(index_dt_tag)::value,
-                                            decltype(index_fp4_tag)::value,
-                                            true>(
+            // MXFP4 main K/V and/or index K (sparse insert only); the other cache keeps its type.
+            const bool kv_scaled = fp8_kv_per_token || fp8_kv_static;
+            auto launch_fp4 = [&]<typename CacheT,
+                                  typename IndexT,
+                                  vllm::Fp8KVCacheDataType kv_dt,
+                                  vllm::Fp8KVCacheDataType index_dt,
+                                  bool kIndexFp4,
+                                  bool kKvFp4>() {
+                launchFusedQKNormIdxrQKNorm<T, CacheT, IndexT, kv_dt, index_dt, kIndexFp4, kKvFp4>(
                     reinterpret_cast<T*>(qkv.data_ptr()),
-                    q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                    q_ptr,
                     index_q_ptr,
                     index_q_fp8_ptr,
                     reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1333,86 +1312,11 @@ static void fused_qknorm_idxrqknorm_impl(
                     reinterpret_cast<int64_t*>(slot_mapping->data_ptr()),
                     process_index ? reinterpret_cast<int64_t*>(index_slot_mapping->data_ptr())
                                   : nullptr,
-                    reinterpret_cast<uint8_t*>(kv_cache_k->data_ptr()),
-                    reinterpret_cast<uint8_t*>(kv_cache_v->data_ptr()),
-                    process_index ? reinterpret_cast<IndexT*>(index_cache->data_ptr()) : nullptr,
-                    nullptr,
-                    nullptr,
-                    static_cast<float>(eps),
-                    static_cast<int>(rotary_dim),
-                    num_tokens,
-                    nq,
-                    nkv,
-                    niq,
-                    static_cast<int>(block_size),
-                    x,
-                    max_kv_tokens,
-                    k_s_block,
-                    k_s_token,
-                    k_s_head,
-                    v_s_block,
-                    v_s_token,
-                    v_s_head,
-                    has_index,
-                    process_index,
-                    insert_kv,
-                    false,
-                    false,
-                    false,
-                    stream,
-                    q_fp8_ptr,
-                    q_scale_ptr);
-            };
-            using Dt = vllm::Fp8KVCacheDataType;
-            if(!process_index || index_cache_dtype == "auto")
-            {
-                launch_kv_fp4(std::type_identity<T>{},
-                              std::integral_constant<Dt, Dt::kAuto>{},
-                              std::integral_constant<bool, false>{});
-            }
-            else if(mxfp4_index_cache)
-            {
-                launch_kv_fp4(std::type_identity<uint8_t>{},
-                              std::integral_constant<Dt, Dt::kAuto>{},
-                              std::integral_constant<bool, true>{});
-            }
-            else
-            {
-                launch_kv_fp4(std::type_identity<opus::fp8_t>{},
-                              std::integral_constant<Dt, Dt::kFp8E4M3>{},
-                              std::integral_constant<bool, false>{});
-            }
-            return;
-        }
-        if(mxfp4_index_cache)
-        {
-            // MXFP4 index K only changes how the index-K slot is written; every other
-            // slot of the kernel is the same code as the "auto"/fp8 instantiations.
-            auto launch_mxfp4 = [&](auto cache_tag, auto kv_dt_tag, float* ks, float* vs) {
-                using CacheT = typename decltype(cache_tag)::type;
-                launchFusedQKNormIdxrQKNorm<T,
-                                            CacheT,
-                                            uint8_t,
-                                            decltype(kv_dt_tag)::value,
-                                            vllm::Fp8KVCacheDataType::kAuto,
-                                            true>(
-                    reinterpret_cast<T*>(qkv.data_ptr()),
-                    q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
-                    index_q_ptr,
-                    index_q_fp8_ptr,
-                    reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
-                    reinterpret_cast<const T*>(k_norm_weight.data_ptr()),
-                    reinterpret_cast<const T*>(index_q_norm_weight->data_ptr()),
-                    reinterpret_cast<const T*>(index_k_norm_weight->data_ptr()),
-                    reinterpret_cast<const T*>(cos_sin_cache.data_ptr()),
-                    reinterpret_cast<int64_t*>(positions.data_ptr()),
-                    reinterpret_cast<int64_t*>(slot_mapping->data_ptr()),
-                    reinterpret_cast<int64_t*>(index_slot_mapping->data_ptr()),
                     reinterpret_cast<CacheT*>(kv_cache_k->data_ptr()),
                     reinterpret_cast<CacheT*>(kv_cache_v->data_ptr()),
-                    reinterpret_cast<uint8_t*>(index_cache->data_ptr()),
-                    ks,
-                    vs,
+                    process_index ? reinterpret_cast<IndexT*>(index_cache->data_ptr()) : nullptr,
+                    kv_scaled ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr,
+                    kv_scaled ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr,
                     static_cast<float>(eps),
                     static_cast<int>(rotary_dim),
                     num_tokens,
@@ -1435,28 +1339,31 @@ static void fused_qknorm_idxrqknorm_impl(
                     fp8_kv_static,
                     asm_layout,
                     stream,
-                    q_fp8_ptr,
-                    q_scale_ptr);
+                    q_fp8_ptr);
             };
-            if(fp8_kv_cache)
+            using Dt = vllm::Fp8KVCacheDataType;
+            if(mxfp4_kv_cache && mxfp4_index_cache)
             {
-                launch_mxfp4(std::type_identity<opus::fp8_t>{},
-                             std::integral_constant<vllm::Fp8KVCacheDataType,
-                                                    vllm::Fp8KVCacheDataType::kFp8E4M3>{},
-                             (fp8_kv_per_token || fp8_kv_static)
-                                 ? reinterpret_cast<float*>(k_scale->data_ptr())
-                                 : nullptr,
-                             (fp8_kv_per_token || fp8_kv_static)
-                                 ? reinterpret_cast<float*>(v_scale->data_ptr())
-                                 : nullptr);
+                launch_fp4
+                    .template operator()<uint8_t, uint8_t, Dt::kAuto, Dt::kAuto, true, true>();
+            }
+            else if(mxfp4_kv_cache && process_index && index_cache_dtype != "auto")
+            {
+                launch_fp4.template
+                operator()<uint8_t, opus::fp8_t, Dt::kAuto, Dt::kFp8E4M3, false, true>();
+            }
+            else if(mxfp4_kv_cache)
+            {
+                launch_fp4.template operator()<uint8_t, T, Dt::kAuto, Dt::kAuto, false, true>();
+            }
+            else if(fp8_kv_cache)
+            {
+                launch_fp4.template
+                operator()<opus::fp8_t, uint8_t, Dt::kFp8E4M3, Dt::kAuto, true, false>();
             }
             else
             {
-                launch_mxfp4(std::type_identity<T>{},
-                             std::integral_constant<vllm::Fp8KVCacheDataType,
-                                                    vllm::Fp8KVCacheDataType::kAuto>{},
-                             nullptr,
-                             nullptr);
+                launch_fp4.template operator()<T, uint8_t, Dt::kAuto, Dt::kAuto, true, false>();
             }
             return;
         }
@@ -1470,7 +1377,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kFp8E4M3,
                                             vllm::Fp8KVCacheDataType::kFp8E4M3>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
-                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                q_ptr,
                 index_q_ptr,
                 index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1518,8 +1425,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr,
-                q_scale_ptr);
+                q_fp8_ptr);
             }
             else
             {
@@ -1529,7 +1435,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kFp8E4M3,
                                             vllm::Fp8KVCacheDataType::kAuto>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
-                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                q_ptr,
                 index_q_ptr,
                 index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1577,8 +1483,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr,
-                q_scale_ptr);
+                q_fp8_ptr);
             }
         }
         else
@@ -1591,7 +1496,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kAuto,
                                             vllm::Fp8KVCacheDataType::kFp8E4M3>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
-                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                q_ptr,
                 index_q_ptr,
                 index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1635,8 +1540,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr,
-                q_scale_ptr);
+                q_fp8_ptr);
             }
             else
             {
@@ -1646,7 +1550,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kAuto,
                                             vllm::Fp8KVCacheDataType::kAuto>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
-                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                q_ptr,
                 index_q_ptr,
                 index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1690,8 +1594,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr,
-                q_scale_ptr);
+                q_fp8_ptr);
             }
         }
     });
@@ -1723,9 +1626,7 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch,
-    std::optional<aiter_tensor_t> q_fp8_out,
-    std::optional<aiter_tensor_t> q_scale)
+    bool skip_index_branch)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
@@ -1752,9 +1653,7 @@ void fused_qknorm_idxrqknorm(
                                                 k_scale,
                                                 v_scale,
                                                 asm_layout,
-                                                skip_index_branch,
-                                                q_fp8_out,
-                                                q_scale);
+                                                skip_index_branch);
 }
 
 } // namespace aiter

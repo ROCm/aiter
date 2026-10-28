@@ -131,6 +131,7 @@ _LAZY_IMPORTS = {
         "gather_kv_b_proj_flydsl_supported",
     ),
     "pa_decode": (".pa_decode", "pa_decode"),
+    "pa_decode_mxfp4": (".pa_decode_mxfp4", "pa_decode_mxfp4"),
     "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
     "prepare_gemm_a16wfp4_weight": (
         ".gemm_a16wfp4",
@@ -165,20 +166,20 @@ _LAZY_IMPORTS = {
         "work_map_size",
     ),
     "minimax_m3_index_score_fp4_flydsl": (
-        ".kernels.minimax_m3_index_score_fp4",
+        ".kernels.minimax_m3_index_score",
         "score_flydsl_fp4",
     ),
     "minimax_m3_index_score_fp4_flydsl_supported": (
-        ".kernels.minimax_m3_index_score_fp4",
+        ".kernels.minimax_m3_index_score",
         "index_score_supported_fp4",
-    ),
-    "minimax_m3_index_score_prefill_fp4_flydsl": (
-        ".kernels.minimax_m3_index_score_prefill_fp4",
-        "score_prefill_flydsl_fp4",
     ),
     "minimax_m3_index_score_prefill_flydsl": (
         ".kernels.minimax_m3_index_score_prefill",
         "score_prefill_flydsl",
+    ),
+    "minimax_m3_index_score_prefill_fp4_flydsl": (
+        ".kernels.minimax_m3_index_score_prefill_fp4",
+        "score_prefill_flydsl_fp4",
     ),
     # Its own, not the decode scorer's: prefill's output is
     # [heads, total_q, max_block] and is sized from the ragged batch.
@@ -237,6 +238,7 @@ __all__ = [
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
     "pa_decode",
+    "pa_decode_mxfp4",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
 ]

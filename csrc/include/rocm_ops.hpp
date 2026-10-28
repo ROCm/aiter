@@ -2028,9 +2028,7 @@ namespace py = pybind11;
           py::arg("k_scale")           = std::nullopt, \
           py::arg("v_scale")           = std::nullopt, \
           py::arg("asm_layout")        = false,        \
-          py::arg("skip_index_branch") = false,        \
-          py::arg("q_fp8_out")         = std::nullopt, \
-          py::arg("q_scale")           = std::nullopt)
+          py::arg("skip_index_branch") = false)
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                           \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",                    \
@@ -2373,6 +2371,34 @@ namespace py = pybind11;
           py::arg("is_decode"));                 \
     m.def("topk_use_mulblocks", &topk_use_mulblocks, py::arg("numRows"), py::arg("stride0"));
 
+#define TOP_K_PER_ROW_SAMPLED_PYBIND             \
+    AITER_SET_STREAM_PYBIND;                      \
+    m.def("top_k_per_row_prefill_sampled",       \
+          &top_k_per_row_prefill_sampled,        \
+          py::arg("logits"),                     \
+          py::arg("rowStarts"),                  \
+          py::arg("rowEnds"),                    \
+          py::arg("indices"),                    \
+          py::arg("values"),                     \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt,   \
+          py::arg("ragged")    = true,           \
+          py::arg("nan_high")  = false);         \
+    m.def("topk_sampled_workspace_size",         \
+          &topk_sampled_workspace_size,          \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"));                         \
+    m.def("topk_sampled_supports",               \
+          &topk_sampled_supports,                \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"),                          \
+          py::arg("device_id") = -1);
+
 #define MLA_METADATA_PYBIND                              \
     AITER_SET_STREAM_PYBIND;                             \
     m.def("get_mla_decode_head_plan_v1",                 \
@@ -2518,11 +2544,30 @@ namespace py = pybind11;
           py::arg("rowEnds")   = std::nullopt,    \
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1,               \
-          py::arg("workspace") = std::nullopt);   \
+          py::arg("workspace") = std::nullopt,    \
+          py::arg("nan_high")  = false);          \
+    m.def("topk_plain_use_mulblocks",             \
+          &topk_plain_use_mulblocks,              \
+          py::arg("numRows"),                     \
+          py::arg("stride0"),                     \
+          py::arg("k"),                           \
+          py::arg("ragged"));                     \
     m.def("topk_plain_workspace_size",            \
           &topk_plain_workspace_size,             \
           py::arg("numRows"),                     \
           py::arg("stride0"),                     \
+          py::arg("k"));                          \
+    m.def("topk_plain_width",                     \
+          &topk_plain_width,                      \
+          py::arg("name"));                       \
+    m.def("topk_plain_uses_radix",                \
+          &topk_plain_uses_radix,                 \
+          py::arg("width"),                       \
+          py::arg("k"));                          \
+    m.def("topk_plain_reads_pitch",               \
+          &topk_plain_reads_pitch,                \
+          py::arg("numRows"),                     \
+          py::arg("width"),                       \
           py::arg("k"));
 
 #define RMSNORM_QUANT_PYBIND                 \
