@@ -51,12 +51,16 @@ def default_launch_cfg(tokens: int) -> LaunchCfg:
 def _default_launch_cfg(tokens: int) -> LaunchCfg:
     if tokens <= 256:
         g = GemmCfg(tile_m=16, tile_n=256)
+        # G2 (N = H) in wider tiles: half the tasks, so half the per-task fixed cost
+        # (prologue, epilogue) a persistent CTA pays serially; 1024 wide at 64 tokens
+        g2 = GemmCfg(tile_m=16, tile_n=1024 if tokens == 64 else 512, num_buffers=2)
         # tuned (TP4, scripts/tune_mm.py): 2 CTAs per CU up to 64 tokens (cheaper
         # grid syncs, few tiles anyway), 3 from 128 (more weight streams in flight);
         # every CTA counts the routes itself (no barrier 1), static task order
         return LaunchCfg(
-            "small", g, g, cta_per_cu=3, place_rpw=1, dyn=False, local_hist=True,
-            df2=tokens <= 8,  # G2 -> RS by m-tile counts: only pays at the fewest tiles
+            "small", g, g2, cta_per_cu=2 if tokens == 64 else 3, place_rpw=1, dyn=False,
+            local_hist=True,
+            df2=tokens <= 128,  # G2 -> RS by m-tile counts (no barrier 4; wide G2 tiles)
             df0=tokens <= 64,  # placement -> G1 by expert counts (no barrier 2)
         )
     # mid / big: 128-row tiles re-read each expert's weights half as often; their
@@ -69,8 +73,13 @@ def _default_launch_cfg(tokens: int) -> LaunchCfg:
     if tokens <= 2048:
         # 3 CTAs per CU (a 128-row tile's 424 VGPRs allow 2): smaller tiles, more
         # tiles in flight; 32-row tiles up to 1024 tokens, 64-row at 2048
-        gs = GemmCfg(tile_m=32 if tokens <= 1024 else 64, tile_n=256, tile_k=256, num_buffers=2)
-        return LaunchCfg("mid", gs, gs, cta_per_cu=3, place_rpw=1 if tokens <= 512 else 4)
+        tm = 32 if tokens <= 1024 else 64
+        gs = GemmCfg(tile_m=tm, tile_n=256, tile_k=256, num_buffers=2)
+        # G2 in 512-wide tiles (tile_k 128 for the LDS); at 2048 its 64-row tile then
+        # needs 2 CTAs per CU
+        g2 = GemmCfg(tile_m=tm, tile_n=512, tile_k=128, num_buffers=2 if tokens <= 1024 else 3)
+        return LaunchCfg("mid", gs, g2, cta_per_cu=3 if tokens <= 1024 else 2,
+                         place_rpw=1 if tokens <= 512 else 4)
     if tokens <= 8192:
         return LaunchCfg("mid", g, g, cta_per_cu=2, place_rpw=16, rs_pull=q8, rs_q8=q8)
     return LaunchCfg("big", g, g, cta_per_cu=2, place_rpw=32, rs_pull=True, rs_q8=q8)

@@ -121,6 +121,8 @@ class LaunchCfg:
     ar: bool = False  # replicated in / out (MoE + all-reduce); the small path
     ar_two: bool = False  # AR: Y as reduce-scatter (own T/tp rows) + all-gather
     spread: bool = False  # static GEMM task order spread over CUs
+    waves_per_eu: int = 0  # compile hint (0: none)
+    expert_hint: bool = True  # tasks get their expert from an LDS psum bisect
     rs_q8: bool = False  # RS partials as int8 + e8m0 per 32 (else bf16; no gain measured)
 
     @property

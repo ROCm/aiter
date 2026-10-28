@@ -35,6 +35,8 @@ _EXP = set(__import__("os").environ.get("MEGA_EXP", "").split("+"))
 if __import__("os").environ.get("MEGA_DEV_WB", "0") != "1":
     _EXP.add("nofence")
 _EXP_NOFENCE = "nofence" in _EXP
+# s_sleep units (64 clocks each) between spin polls (MEGA_SPIN_SLEEP)
+SPIN_SLEEP = int(__import__("os").environ.get("MEGA_SPIN_SLEEP", "1"))
 
 
 def i32(v):
@@ -227,7 +229,7 @@ def spin_agent(addr, target, err_addr, err_bit):
     n = i32(0)
     alive = fx.Boolean(True)
     while before(cur, target) & alive:
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(SPIN_SLEEP)
         cur = ld_agent(addr)
         n = n + i32(1)
         if (n & i32(1023)) == i32(0):
@@ -244,7 +246,7 @@ def spin_sys(addr, target, err_addr, err_bit):
     n = i32(0)
     alive = fx.Boolean(True)
     while before(cur, target) & alive:
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(SPIN_SLEEP)
         cur = ld_sys(addr)
         n = n + i32(1)
         if (n & i32(1023)) == i32(0):

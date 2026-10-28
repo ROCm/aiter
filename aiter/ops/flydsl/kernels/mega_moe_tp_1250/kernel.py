@@ -163,7 +163,7 @@ def compile_mega_moe_tp_1250(
     NB_PER_LANE = LPR // 32  # MX blocks per lane
     wrep2 = g2.tile_m // g2.m_warp // 16
     stage1_act = ACTS[act]
-    LDS_BYTES = {4: 72, 3: 100, 2: 159, 1: 300}[cfg.cta_per_cu] * 1024  # of 320 KB per CU
+    LDS_BYTES = {6: 50, 5: 60, 4: 72, 3: 100, 2: 158, 1: 300}[cfg.cta_per_cu] * 1024  # of 320 KB per CU
     # LDS of the routing phases (inside the GEMM arena: phases never overlap)
     L_HIST = 0
     L_SCAN0 = L_HIST + E * 4
@@ -174,6 +174,7 @@ def compile_mega_moe_tp_1250(
     DF1 = cfg.df1
     Q8 = cfg.rs_q8
     LH = cfg.local_hist
+    EHINT = cfg.expert_hint
     CPC = cfg.cta_per_cu
     SPREAD = cfg.spread
     AR = cfg.ar
@@ -237,13 +238,21 @@ def compile_mega_moe_tp_1250(
     )
     TS = os.environ.get("MEGA_TS", "0") == "1"  # debug phase stamps
     EXP = os.environ.get("MEGA_EXP", "")  # perf experiments (device.py _EXP)
+    # gemmonly: G1 / G2 on the routing a previous launch left (same inputs): every
+    # phase before G1 and after barrier 4 is skipped
+    GEMMONLY = EXP == "gemmonly"
     if EXP:
         name += "_" + EXP
     if not _EXP_NOFENCE:
         name += "_devwb"
+    from .device import SPIN_SLEEP
+
+    if SPIN_SLEEP != 1:
+        name += f"_sl{SPIN_SLEEP}"
     if TS:
         name += "_ts"
     Q_LDS = LDS_BYTES  # the claimed task's broadcast word
+    LEXP = LDS_BYTES + 16  # [E] psum (expert ends) for the tasks' expert bisect
     lds_slot = {}
 
     def lds_arena(n):
@@ -268,6 +277,7 @@ def compile_mega_moe_tp_1250(
             mma_first_group=g.mma_first_group or None,
             ds_first_n=None if g.ds_first_n < 0 else g.ds_first_n,
             c_sep=g.c_sep,
+            expert_given=int(cfg.expert_hint),
         )
 
     @flyc.jit
@@ -384,7 +394,7 @@ def compile_mega_moe_tp_1250(
             bid = fx.Int32(gpu.block_id("x"))
             wave = uni(tid // WAVE)
             lane = tid % WAVE
-            lptr = fx.SharedAllocator().allocate(LDS_BYTES + 16, alignment=1024)._ptr
+            lptr = fx.SharedAllocator().allocate(LDS_BYTES + 16 + E * 4, alignment=1024)._ptr
             lds_slot["ptr"] = lptr
             L = uni(fx.Int32(fx.ptrtoint(lptr)))
             peers = [p0, p1, p2, p3, p4, p5, p6, p7]
@@ -474,214 +484,229 @@ def compile_mega_moe_tp_1250(
                     return ld_i32(ids_in + i64(t * i32(TOPK) + k) * 4)
                 return ld_i32(mine + off_ids + (i64(arow(t)) * TOPK + i64(k)) * 4)
 
-            # ---------------- AG: own rows -> MXFP4, pushed to every rank ----------
-            if fx.const_expr(AGS):
-                # ids / weights first, signalled on their own: routing needs only them
-                for i in range(gw, m, GW):
+            if fx.const_expr(not GEMMONLY):  # experiment: GEMM phases only
+                # ---------------- AG: own rows -> MXFP4, pushed to every rank ----------
+                if fx.const_expr(AGS):
+                    # ids / weights first, signalled on their own: routing needs only them
+                    for i in range(gw, m, GW):
+                        if lane < i32(TOPK):
+                            idv = ld_i32(ids_in + i64(i * i32(TOPK) + lane) * 4)
+                            twv = ld_f32(tw_in + i64(i * i32(TOPK) + lane) * 4)
+                            bad = (idv < i32(0)) | (idv >= i32(E))
+                            idv = bad.select(i32(-1), idv)
+                            dr = i64(rank * i32(mmax) + i)
+                            for p in range_constexpr(tp):
+                                st_i32(peers[p] + off_ids + (dr * TOPK + i64(lane)) * 4, idv)
+                                st_i32(peers[p] + off_tw + (dr * TOPK + i64(lane)) * 4,
+                                       twv.bitcast(fx.Int32))
+                    rel_wg()
+                    gpu.barrier()
+                    if tid == i32(0):
+                        if bid * i32(NW) < m:
+                            rel_sys()
+                            gi = bid // i32(SYNC_GS)
+                            gsz = fx.min(nw_ag - gi * i32(SYNC_GS), i32(SYNC_GS))
+                            old = add_agent(wgc + i64(i32(2 * SYNC_NG) + gi) * 4, 1)
+                            if old + i32(1) == gsz:
+                                for p in range_constexpr(tp):
+                                    add_sys(peers[p] + off_flag + i64(FL_ID * 4) + i64(par) * (LINE * 4), 1)
+                # lane l quantizes MX blocks b * WAVE + l: a wave's store b is 512
+                # contiguous bytes of FP4 (and 32 of scales) on the xGMI
+                # AR (not LH): every token quantized once into the own arena (no push);
+                # barrier 1 orders it before the placement copy
+                for i in range(gw, m if not (AR and LH) else 0, GW):
+                    src = x_in + i64(i) * (H * 2) + i64(lane) * 64
+                    q, scs = [], []
+                    for b in range_constexpr(NB_PER_LANE):
+                        v4s = [ld_v4(src + (b * WAVE * 64 + j * 16)) for j in range_constexpr(4)]
+                        qb, e8 = quant_fp4_block32(v4s)
+                        q.append(qb)
+                        scs.append(e8)
+                    dr = i64(i) if AR else i64(rank * i32(mmax) + i)
+                    idv = i32(-1)
+                    twv = fx.Float32(0.0)
                     if lane < i32(TOPK):
                         idv = ld_i32(ids_in + i64(i * i32(TOPK) + lane) * 4)
                         twv = ld_f32(tw_in + i64(i * i32(TOPK) + lane) * 4)
                         bad = (idv < i32(0)) | (idv >= i32(E))
                         idv = bad.select(i32(-1), idv)
-                        dr = i64(rank * i32(mmax) + i)
-                        for p in range_constexpr(tp):
-                            st_i32(peers[p] + off_ids + (dr * TOPK + i64(lane)) * 4, idv)
-                            st_i32(peers[p] + off_tw + (dr * TOPK + i64(lane)) * 4,
-                                   twv.bitcast(fx.Int32))
+                    for p in range_constexpr(1 if AR else tp):
+                        base = mine if AR else peers[p]
+                        dq = base + off_xq + dr * XB + i64(lane) * 16
+                        ds = base + off_xs + dr * XS + i64(lane)
+                        for b in range_constexpr(NB_PER_LANE):
+                            st_v4(dq + b * WAVE * 16, q[b])
+                            st_i8(ds + b * WAVE, scs[b])
+                        if fx.const_expr(not AGS and not AR):
+                            if lane < i32(TOPK):
+                                st_i32(base + off_ids + (dr * TOPK + i64(lane)) * 4, idv)
+                                st_i32(
+                                    base + off_tw + (dr * TOPK + i64(lane)) * 4,
+                                    twv.bitcast(fx.Int32),
+                                )
+                ts(15)
                 rel_wg()
                 gpu.barrier()
                 if tid == i32(0):
-                    if bid * i32(NW) < m:
+                    if (bid * i32(NW) < m) & (notar == i32(1)):  # this CTA pushed rows
                         rel_sys()
+                        # the group's last writer signals every rank
                         gi = bid // i32(SYNC_GS)
                         gsz = fx.min(nw_ag - gi * i32(SYNC_GS), i32(SYNC_GS))
-                        old = add_agent(wgc + i64(i32(2 * SYNC_NG) + gi) * 4, 1)
+                        old = add_agent(wgc + i64(i32(0 * SYNC_NG) + gi) * 4, 1)
                         if old + i32(1) == gsz:
                             for p in range_constexpr(tp):
-                                add_sys(peers[p] + off_flag + i64(FL_ID * 4) + i64(par) * (LINE * 4), 1)
-            # lane l quantizes MX blocks b * WAVE + l: a wave's store b is 512
-            # contiguous bytes of FP4 (and 32 of scales) on the xGMI
-            # AR (not LH): every token quantized once into the own arena (no push);
-            # barrier 1 orders it before the placement copy
-            for i in range(gw, m if not (AR and LH) else 0, GW):
-                src = x_in + i64(i) * (H * 2) + i64(lane) * 64
-                q, scs = [], []
-                for b in range_constexpr(NB_PER_LANE):
-                    v4s = [ld_v4(src + (b * WAVE * 64 + j * 16)) for j in range_constexpr(4)]
-                    qb, e8 = quant_fp4_block32(v4s)
-                    q.append(qb)
-                    scs.append(e8)
-                dr = i64(i) if AR else i64(rank * i32(mmax) + i)
-                idv = i32(-1)
-                twv = fx.Float32(0.0)
-                if lane < i32(TOPK):
-                    idv = ld_i32(ids_in + i64(i * i32(TOPK) + lane) * 4)
-                    twv = ld_f32(tw_in + i64(i * i32(TOPK) + lane) * 4)
-                    bad = (idv < i32(0)) | (idv >= i32(E))
-                    idv = bad.select(i32(-1), idv)
-                for p in range_constexpr(1 if AR else tp):
-                    base = mine if AR else peers[p]
-                    dq = base + off_xq + dr * XB + i64(lane) * 16
-                    ds = base + off_xs + dr * XS + i64(lane)
-                    for b in range_constexpr(NB_PER_LANE):
-                        st_v4(dq + b * WAVE * 16, q[b])
-                        st_i8(ds + b * WAVE, scs[b])
-                    if fx.const_expr(not AGS and not AR):
-                        if lane < i32(TOPK):
-                            st_i32(base + off_ids + (dr * TOPK + i64(lane)) * 4, idv)
-                            st_i32(
-                                base + off_tw + (dr * TOPK + i64(lane)) * 4,
-                                twv.bitcast(fx.Int32),
-                            )
-            ts(15)
-            rel_wg()
-            gpu.barrier()
-            if tid == i32(0):
-                if (bid * i32(NW) < m) & (notar == i32(1)):  # this CTA pushed rows
-                    rel_sys()
-                    # the group's last writer signals every rank
-                    gi = bid // i32(SYNC_GS)
-                    gsz = fx.min(nw_ag - gi * i32(SYNC_GS), i32(SYNC_GS))
-                    old = add_agent(wgc + i64(i32(0 * SYNC_NG) + gi) * 4, 1)
-                    if old + i32(1) == gsz:
-                        for p in range_constexpr(tp):
-                            add_sys(peers[p] + off_flag + i64(FL_AG * 4) + i64(par) * (LINE * 4), 1)
-                ts(16)
-                ts(17)
-            ts(1)
-            # ---------------- R1: wait every rank; routes per expert ----------------
-            if (tid == i32(0)) & (notar == i32(1)):  # every rank's writers done (AGS: ids)
-                spin_sys(
-                    mine + off_flag + i64((FL_ID if AGS else FL_AG) * 4) + i64(par) * (LINE * 4),
-                    i32(tp) * ceildiv(nw_ag, i32(SYNC_GS)), err, ERR_AG,
-                )
-                acq_sys()
-            gpu.barrier()
-            acq_wg()
-            ts(2)
-            for e in range(tid, E, BLK):
-                lds_st(L + L_HIST + e * 4, 0)
-            gpu.barrier()
-            nr = Tt * i32(TOPK)
-            # LH: every CTA counts every route itself (no grid count, no barrier 1)
-            for r in range(
-                (i32(0) if LH else bid * i32(BLK)) + tid, nr, BLK if LH else NCTA * BLK
-            ):
-                t = r // i32(TOPK)
-                eid = ids_at(t, r - t * i32(TOPK))
-                if eid >= i32(0):
-                    lds_add(L + L_HIST + eid * 4, 1)
-            gpu.barrier()
-            if fx.const_expr(not LH):
-                for e in range(tid, E, BLK):
-                    c = lds_ld(L + L_HIST + e * 4)
-                    if c > i32(0):
-                        add_agent(ctrl + (CT_CNT * 4) + i64(e) * 4, c)
-                ts(12)
-                barrier(1)
-            ts(3)
-            # ---------------- R2: expert starts, placement, A rows -----------------
-            for e in range(tid, E, BLK):
-                if fx.const_expr(LH):
-                    c = lds_ld(L + L_HIST + e * 4)
-                else:
-                    c = ld_i32(ctrl + (CT_CNT * 4) + i64(e) * 4)
-                lds_st(L + L_CNT + e * 4, c)
-                lds_st(L + L_SCAN0 + e * 4, (c + i32(AM - 1)) // i32(AM) * i32(AM))
-            gpu.barrier()
-            for st_i in range_constexpr(SCAN_STEPS):
-                d = 1 << st_i
-                src_s = (L_SCAN0, L_SCAN1)[st_i % 2]
-                dst_s = (L_SCAN1, L_SCAN0)[st_i % 2]
-                for e in range(tid, E, BLK):
-                    v = lds_ld(L + src_s + e * 4)
-                    prev = lds_ld(L + src_s + (fx.max(e - i32(d), i32(0))) * 4)
-                    v = v + (e >= i32(d)).select(prev, i32(0))
-                    lds_st(L + dst_s + e * 4, v)
-                gpu.barrier()
-            src_s = (L_SCAN0, L_SCAN1)[SCAN_STEPS % 2]
-            # src_s: inclusive scan of the aligned counts; start = it - aligned
-            for e in range(tid, E, BLK):
-                c = lds_ld(L + L_CNT + e * 4)
-                al = (c + i32(AM - 1)) // i32(AM) * i32(AM)
-                st = lds_ld(L + src_s + e * 4) - al
-                lds_st(L + L_HIST + e * 4, st)
-                if fx.const_expr(DF0):  # every CTA (same values): its own tasks read it
-                    st_i32(psum_addr + i64(e) * 4, st + c)
-                else:
-                    if bid == i32(0):
-                        st_i32(psum_addr + i64(e) * 4, st + c)
-            gpu.barrier()
-            ts(13)
-            if fx.const_expr(AGS):  # the A rows: every rank's AG rows landed
-                if tid == i32(0):
+                                add_sys(peers[p] + off_flag + i64(FL_AG * 4) + i64(par) * (LINE * 4), 1)
+                    ts(16)
+                    ts(17)
+                ts(1)
+                # ---------------- R1: wait every rank; routes per expert ----------------
+                if (tid == i32(0)) & (notar == i32(1)):  # every rank's writers done (AGS: ids)
                     spin_sys(
-                        mine + off_flag + i64(FL_AG * 4) + i64(par) * (LINE * 4),
+                        mine + off_flag + i64((FL_ID if AGS else FL_AG) * 4) + i64(par) * (LINE * 4),
                         i32(tp) * ceildiv(nw_ag, i32(SYNC_GS)), err, ERR_AG,
                     )
                     acq_sys()
                 gpu.barrier()
                 acq_wg()
-            # each wave places RPW routes (lane j: route j's slot), then copies their
-            # A rows CH at a time, loads first (no branch: a dropped route's row
-            # goes to the spare row cm - 1)
-            spare = cm - i32(1)
-            for pb in range(gw, ceildiv(nr, i32(RPW)), GW):
-                r = pb * i32(RPW) + lane
-                pos = i32(-1)
-                ar = i32(0)
-                eidl = i32(0)
-                if (lane < i32(RPW)) & (r < nr):
+                ts(2)
+                for e in range(tid, E, BLK):
+                    lds_st(L + L_HIST + e * 4, 0)
+                gpu.barrier()
+                nr = Tt * i32(TOPK)
+                # LH: every CTA counts every route itself (no grid count, no barrier 1)
+                for r in range(
+                    (i32(0) if LH else bid * i32(BLK)) + tid, nr, BLK if LH else NCTA * BLK
+                ):
                     t = r // i32(TOPK)
-                    ar = t if AR else arow(t)  # AR: the token (its x row)
                     eid = ids_at(t, r - t * i32(TOPK))
-                    eidl = eid
                     if eid >= i32(0):
-                        pos = lds_ld(L + L_HIST + eid * 4) + add_agent(
-                            ctrl + (CT_FILL * 4) + i64(eid) * 4, 1
-                        )
-                    st_i32(rpos + i64(r) * 4, pos)
-                for j0 in range_constexpr(0, RPW, CH):
-                    pss = [rdlane(pos, j0 + jj) for jj in range_constexpr(CH)]
-                    ars = [i64(rdlane(ar, j0 + jj)) for jj in range_constexpr(CH)]
-                    if fx.const_expr(AR and LH):  # the route rows straight from x (as AG)
-                        for jj in range_constexpr(CH):
-                            drow = i64((pss[jj] >= i32(0)).select(pss[jj], spare))
-                            srcx = x_in + ars[jj] * (H * 2) + i64(lane) * 64
-                            dq = a1_addr + drow * XB + i64(lane) * 16
-                            dsc = a1s_addr + drow * XS + i64(lane)
-                            for b in range_constexpr(NB_PER_LANE):
-                                v4s = [ld_v4(srcx + (b * WAVE * 64 + j * 16)) for j in range_constexpr(4)]
-                                qb, e8 = quant_fp4_block32(v4s)
-                                st_v4(dq + b * WAVE * 16, qb)
-                                st_i8(dsc + b * WAVE, e8)
-                    vs, ss = [], []
-                    for jj in range_constexpr(CH if not (AR and LH) else 0):
-                        # access cc of a lane: 16 B at cc * 512 + lane * 16 (a wave's
-                        # access is 512 contiguous bytes)
-                        s0 = mine + off_xq + ars[jj] * XB + i64(lane) * 16
-                        vs.append([ld_v4(s0 + cc * 512) for cc in range_constexpr(XB // WAVE // 16)])
-                        ss.append(ld_i32(mine + off_xs + ars[jj] * XS + i64(lane) * 4))
-                    for jj in range_constexpr(CH if not (AR and LH) else 0):
-                        drow = i64((pss[jj] >= i32(0)).select(pss[jj], spare))
-                        d0 = a1_addr + drow * XB + i64(lane) * 16
-                        for cc in range_constexpr(XB // WAVE // 16):
-                            st_v4(d0 + cc * 512, vs[jj][cc])
-                        st_i32(a1s_addr + drow * XS + i64(lane) * 4, ss[jj])
-                if fx.const_expr(DF0):  # this batch's rows are in a1: count them
-                    rel_wg()
-                    if pos >= i32(0):
-                        add_agent(placed + i64(eidl) * 4, 1)
-            ts(14)
-            if fx.const_expr(not DF0):
-                barrier(2)
-            ts(4)
-            if fx.const_expr(not DF0):
-                if bid == i32(0):
+                        lds_add(L + L_HIST + eid * 4, 1)
+                gpu.barrier()
+                if fx.const_expr(not LH):
                     for e in range(tid, E, BLK):
-                        st_i32(ctrl + (CT_CNT * 4) + i64(e) * 4, 0)
-                        st_i32(ctrl + (CT_FILL * 4) + i64(e) * 4, 0)
+                        c = lds_ld(L + L_HIST + e * 4)
+                        if c > i32(0):
+                            add_agent(ctrl + (CT_CNT * 4) + i64(e) * 4, c)
+                    ts(12)
+                    barrier(1)
+                ts(3)
+                # ---------------- R2: expert starts, placement, A rows -----------------
+                for e in range(tid, E, BLK):
+                    if fx.const_expr(LH):
+                        c = lds_ld(L + L_HIST + e * 4)
+                    else:
+                        c = ld_i32(ctrl + (CT_CNT * 4) + i64(e) * 4)
+                    lds_st(L + L_CNT + e * 4, c)
+                    lds_st(L + L_SCAN0 + e * 4, (c + i32(AM - 1)) // i32(AM) * i32(AM))
+                gpu.barrier()
+                for st_i in range_constexpr(SCAN_STEPS):
+                    d = 1 << st_i
+                    src_s = (L_SCAN0, L_SCAN1)[st_i % 2]
+                    dst_s = (L_SCAN1, L_SCAN0)[st_i % 2]
+                    for e in range(tid, E, BLK):
+                        v = lds_ld(L + src_s + e * 4)
+                        prev = lds_ld(L + src_s + (fx.max(e - i32(d), i32(0))) * 4)
+                        v = v + (e >= i32(d)).select(prev, i32(0))
+                        lds_st(L + dst_s + e * 4, v)
+                    gpu.barrier()
+                src_s = (L_SCAN0, L_SCAN1)[SCAN_STEPS % 2]
+                # src_s: inclusive scan of the aligned counts; start = it - aligned
+                for e in range(tid, E, BLK):
+                    c = lds_ld(L + L_CNT + e * 4)
+                    al = (c + i32(AM - 1)) // i32(AM) * i32(AM)
+                    st = lds_ld(L + src_s + e * 4) - al
+                    lds_st(L + L_HIST + e * 4, st)
+                    lds_st(L + LEXP + e * 4, st + c)  # outside the GEMM arena
+                    if fx.const_expr(DF0):  # every CTA (same values): its own tasks read it
+                        st_i32(psum_addr + i64(e) * 4, st + c)
+                    else:
+                        if bid == i32(0):
+                            st_i32(psum_addr + i64(e) * 4, st + c)
+                gpu.barrier()
+                ts(13)
+                if fx.const_expr(AGS):  # the A rows: every rank's AG rows landed
+                    if tid == i32(0):
+                        spin_sys(
+                            mine + off_flag + i64(FL_AG * 4) + i64(par) * (LINE * 4),
+                            i32(tp) * ceildiv(nw_ag, i32(SYNC_GS)), err, ERR_AG,
+                        )
+                        acq_sys()
+                    gpu.barrier()
+                    acq_wg()
+                # each wave places RPW routes (lane j: route j's slot), then copies their
+                # A rows CH at a time, loads first (no branch: a dropped route's row
+                # goes to the spare row cm - 1)
+                spare = cm - i32(1)
+                for pb in range(gw, ceildiv(nr, i32(RPW)), GW):
+                    r = pb * i32(RPW) + lane
+                    pos = i32(-1)
+                    ar = i32(0)
+                    eidl = i32(0)
+                    if (lane < i32(RPW)) & (r < nr):
+                        t = r // i32(TOPK)
+                        ar = t if AR else arow(t)  # AR: the token (its x row)
+                        eid = ids_at(t, r - t * i32(TOPK))
+                        eidl = eid
+                        if eid >= i32(0):
+                            pos = lds_ld(L + L_HIST + eid * 4) + add_agent(
+                                ctrl + (CT_FILL * 4) + i64(eid) * 4, 1
+                            )
+                        st_i32(rpos + i64(r) * 4, pos)
+                    for j0 in range_constexpr(0, RPW, CH):
+                        pss = [rdlane(pos, j0 + jj) for jj in range_constexpr(CH)]
+                        ars = [i64(rdlane(ar, j0 + jj)) for jj in range_constexpr(CH)]
+                        if fx.const_expr(AR and LH):  # the route rows straight from x (as AG)
+                            for jj in range_constexpr(CH):
+                                drow = i64((pss[jj] >= i32(0)).select(pss[jj], spare))
+                                srcx = x_in + ars[jj] * (H * 2) + i64(lane) * 64
+                                dq = a1_addr + drow * XB + i64(lane) * 16
+                                dsc = a1s_addr + drow * XS + i64(lane)
+                                for b in range_constexpr(NB_PER_LANE):
+                                    v4s = [ld_v4(srcx + (b * WAVE * 64 + j * 16)) for j in range_constexpr(4)]
+                                    qb, e8 = quant_fp4_block32(v4s)
+                                    st_v4(dq + b * WAVE * 16, qb)
+                                    st_i8(dsc + b * WAVE, e8)
+                        vs, ss = [], []
+                        for jj in range_constexpr(CH if not (AR and LH) else 0):
+                            # access cc of a lane: 16 B at cc * 512 + lane * 16 (a wave's
+                            # access is 512 contiguous bytes)
+                            s0 = mine + off_xq + ars[jj] * XB + i64(lane) * 16
+                            vs.append([ld_v4(s0 + cc * 512) for cc in range_constexpr(XB // WAVE // 16)])
+                            ss.append(ld_i32(mine + off_xs + ars[jj] * XS + i64(lane) * 4))
+                        for jj in range_constexpr(CH if not (AR and LH) else 0):
+                            drow = i64((pss[jj] >= i32(0)).select(pss[jj], spare))
+                            d0 = a1_addr + drow * XB + i64(lane) * 16
+                            for cc in range_constexpr(XB // WAVE // 16):
+                                st_v4(d0 + cc * 512, vs[jj][cc])
+                            st_i32(a1s_addr + drow * XS + i64(lane) * 4, ss[jj])
+                    if fx.const_expr(DF0):  # this batch's rows are in a1: count them
+                        rel_wg()
+                        if pos >= i32(0):
+                            add_agent(placed + i64(eidl) * 4, 1)
+                ts(14)
+                if fx.const_expr(not DF0):
+                    barrier(2)
+                ts(4)
+                if fx.const_expr(not DF0):
+                    if bid == i32(0):
+                        for e in range(tid, E, BLK):
+                            st_i32(ctrl + (CT_CNT * 4) + i64(e) * 4, 0)
+                            st_i32(ctrl + (CT_FILL * 4) + i64(e) * 4, 0)
             # ---------------- G1 / G2: the grouped GEMM tiles ----------------------
+            def ehint(tk_, n_nt):
+                """the task's expert (gemm_tile's bisect, over the LDS psum copy)"""
+                if not EHINT:
+                    return i32(-1)
+                row0 = mtile_of(tk_, n_mt, n_nt) * i32(g1.tile_m)
+                lo, hi = i32(0), i32(E)
+                for _ in range_constexpr(max(1, (max(2, E) - 1).bit_length() + 1)):
+                    mid = (lo + hi) >> i32(1)
+                    midc = (mid < i32(E - 1)).select(mid, i32(E - 1))
+                    right = lds_ld(L + LEXP + midc * 4) <= row0
+                    lo = right.select(mid + i32(1), lo)
+                    hi = right.select(hi, mid)
+                return lo
             rows = ld_i32(psum_addr + (E - 1) * 4)
             n_mt = ceildiv(rows, i32(g1.tile_m))
             n1 = n_mt * i32(NT1)
@@ -714,7 +739,8 @@ def compile_mega_moe_tp_1250(
                             gpu.barrier()
                             acq_wg()
                         task1(a2, a1, w1, a1s, w1s, psum, a1, a2s, a2, cm, i32(2 * I),
-                              swiglu_limit, situ_beta, situ_linear_beta, tq, rows)
+                              swiglu_limit, situ_beta, situ_linear_beta, tq, rows,
+                              ehint(tq, NT1))
                         if fx.const_expr(g1.c_sep):
                             tdm_ops.tensor_wait(0)
                         rel_wg()
@@ -733,7 +759,8 @@ def compile_mega_moe_tp_1250(
                         gpu.barrier()
                         acq_wg()
                         task2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
-                              swiglu_limit, situ_beta, situ_linear_beta, t2, rows)
+                              swiglu_limit, situ_beta, situ_linear_beta, t2, rows,
+                              ehint(t2, NT2))
                         if fx.const_expr(DF2):  # this m-tile's G2 tile done
                             tdm_ops.tensor_wait(0)
                             rel_wg()
@@ -760,7 +787,7 @@ def compile_mega_moe_tp_1250(
                     gpu.barrier()
                     acq_wg()
                 task1(a2, a1, w1, a1s, w1s, psum, a1, a2s, a2, cm, i32(2 * I),
-                      swiglu_limit, situ_beta, situ_linear_beta, tk, rows)
+                      swiglu_limit, situ_beta, situ_linear_beta, tk, rows, ehint(tk, NT1))
                 if fx.const_expr(DF1):  # this m-tile's G1 tile done
                     if fx.const_expr(g1.c_sep):
                         tdm_ops.tensor_wait(0)
@@ -783,7 +810,7 @@ def compile_mega_moe_tp_1250(
                     gpu.barrier()
                     acq_wg()
                 task2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
-                      swiglu_limit, situ_beta, situ_linear_beta, tk, rows)
+                      swiglu_limit, situ_beta, situ_linear_beta, tk, rows, ehint(tk, NT2))
                 if fx.const_expr(DF2):
                     tdm_ops.tensor_wait(0)
                     rel_wg()
@@ -801,350 +828,351 @@ def compile_mega_moe_tp_1250(
                         st_i32(ctrl + (CT_CNT * 4) + i64(e) * 4, 0)
                         st_i32(ctrl + (CT_FILL * 4) + i64(e) * 4, 0)
             ts(8)
-            # ---------------- RS: topk sums pushed to the owner rank ----------------
-            # unit (token t, column chunk cu of CW elements): lane k < TOPK fetches
-            # route k's slot and weight, then all TOPK rows' loads are in flight at
-            # once; access j of a lane is 16 B at cu * CW * 2 + j * 512 + lane * 16, so
-            # a wave's store is 512 contiguous bytes (one xGMI burst, not 32 pieces)
-            for u in range(gw, Tt * i32(NCH), GW):
-                t = u // i32(NCH)
-                cu = u - t * i32(NCH)
-                o = i32(0) if AR else t // m
-                i = t if AR else t - o * m
-                ar = o * i32(mmax) + i
-                psl = i32(-1)
-                wl = fx.Float32(0.0)
-                if lane < i32(TOPK):
-                    psl = ld_i32(rpos + i64(t * i32(TOPK) + lane) * 4)
-                    if fx.const_expr(AR):
-                        wl = ld_f32(tw_in + i64(t * i32(TOPK) + lane) * 4)
-                    else:
-                        wl = ld_f32(mine + off_tw + (i64(ar) * TOPK + i64(lane)) * 4)
-                # a dropped route: row 0 read, weight 0 (no branch)
-                if fx.const_expr(DF2):  # every G2 tile of this token's routes' m-tiles
-                    if (lane < i32(TOPK)) & (psl >= i32(0)):
-                        spin_agent(cnt2 + i64(psl // i32(g2.tile_m)) * 4, NT2, err, ERR_DF)
-                    acq_agent()
-                wl = (psl >= i32(0)).select(wl, fx.Float32(0.0))
-                psl = fx.max(psl, i32(0))
-                fs = []
-                for k in range_constexpr(TOPK):
-                    srow_k = rdlane(psl, k)
-                    if fx.const_expr(EXP == "rs_contig"):  # experiment: contiguous rows
-                        srow_k = t * i32(TOPK) + i32(k)
-                    src = gout_addr + i64(srow_k) * (H * 2)
-                    if fx.const_expr(G2Q8):  # 8 fp8 + their block's e8m0 per access
-                        fs.append([
-                            (ld_v2(src + eoff(cu, j)), ld_u8(src + H + eoff(cu, j) // 32))
-                            for j in range_constexpr(4)
-                        ])
-                    else:
-                        fs.append([ld_v4(src + eoff(cu, j) * 2) for j in range_constexpr(4)])
-                acc = [fx.Float32(0.0)] * 32
-                for k in range_constexpr(TOPK):
-                    w = rdlane(wl.bitcast(fx.Int32), k).bitcast(fx.Float32)
-                    for j in range_constexpr(4):
-                        if fx.const_expr(G2Q8):
-                            f = fp8x8_f32(fs[k][j][0], fs[k][j][1])
+            if fx.const_expr(not GEMMONLY):  # experiment: GEMM phases only
+                # ---------------- RS: topk sums pushed to the owner rank ----------------
+                # unit (token t, column chunk cu of CW elements): lane k < TOPK fetches
+                # route k's slot and weight, then all TOPK rows' loads are in flight at
+                # once; access j of a lane is 16 B at cu * CW * 2 + j * 512 + lane * 16, so
+                # a wave's store is 512 contiguous bytes (one xGMI burst, not 32 pieces)
+                for u in range(gw, Tt * i32(NCH), GW):
+                    t = u // i32(NCH)
+                    cu = u - t * i32(NCH)
+                    o = i32(0) if AR else t // m
+                    i = t if AR else t - o * m
+                    ar = o * i32(mmax) + i
+                    psl = i32(-1)
+                    wl = fx.Float32(0.0)
+                    if lane < i32(TOPK):
+                        psl = ld_i32(rpos + i64(t * i32(TOPK) + lane) * 4)
+                        if fx.const_expr(AR):
+                            wl = ld_f32(tw_in + i64(t * i32(TOPK) + lane) * 4)
                         else:
-                            f = bf16x8_f32(fs[k][j])
-                        for q in range_constexpr(8):
-                            acc[j * 8 + q] = acc[j * 8 + q] + w * f[q]
-                dst_rank = peer(o)
-                if fx.const_expr(EXP == "rs_local"):  # experiment: RS rows to own arena
-                    dst_rank = mine
-                drow = dst_rank + off_recv + i64(rank * i32(mmax) + i) * (H * 2)
-                if fx.const_expr(PULL):  # own arena, slot [owner][row]: owners read it
-                    drow = mine + off_recv + i64(o * i32(mmax) + i) * (H * 2)
-                if fx.const_expr(AR):  # own arena, slot t: every rank reads it
-                    drow = mine + off_recv + i64(t) * (H * 2)
-                if fx.const_expr(Q8):
-                    # 16 int8 per lane at element offsets (a wave's store: 512
-                    # contiguous bytes); block e8m0s after the H data bytes, by the
-                    # block's first (even) lane
-                    for hh in range_constexpr(2):
-                        words, e8 = q8_block(acc[16 * hh : 16 * hh + 16])
-                        el = eoff(cu, 2 * hh)
-                        st_v4(drow + el, fx.Vector.from_elements(words, fx.Int32))
-                        if (lane & i32(1)) == i32(0):
-                            st_i8(drow + H + el // 32, e8)
-                else:
-                    out = []
-                    for q in range_constexpr(16):
-                        lo = acc[2 * q].to(fx.BFloat16)
-                        hi = acc[2 * q + 1].to(fx.BFloat16)
-                        out.append(
-                            fx.Vector.from_elements([lo, hi], fx.BFloat16).bitcast(fx.Int32)[0]
-                        )
-                    for j in range_constexpr(4):
-                        st_v4(
-                            drow + eoff(cu, j) * 2,
-                            fx.Vector.from_elements(out[4 * j : 4 * j + 4], fx.Int32),
-                        )
-            ts(18)
-            rel_wg()
-            gpu.barrier()
-            if tid == i32(0):
-                if bid * i32(NW) < Tt * i32(NCH):  # this CTA pushed rows
-                    rel_sys()
-                    # the group's last writer signals every rank
-                    gi = bid // i32(SYNC_GS)
-                    gsz = fx.min(nw_rs - gi * i32(SYNC_GS), i32(SYNC_GS))
-                    old = add_agent(wgc + i64(i32(1 * SYNC_NG) + gi) * 4, 1)
-                    if old + i32(1) == gsz:
-                        for p in range_constexpr(tp):
-                            add_sys(peers[p] + off_flag + i64(FL_RS * 4) + i64(par) * (LINE * 4), 1)
-                ts(19)
-                ts(20)
-            ts(9)
-            # ---------------- Y: own rows = sum of every rank's partial ------------
-            if tid == i32(0):  # every rank's writer CTAs done
-                spin_sys(
-                    mine + off_flag + i64(FL_RS * 4) + i64(par) * (LINE * 4),
-                    i32(tp) * ceildiv(nw_rs, i32(SYNC_GS)), err, ERR_RS,
-                )
-                acq_sys()
-            gpu.barrier()
-            acq_wg()
-            ts(10)
-            if fx.const_expr(DF0 and DF2):
-                # (no barrier 4) past the RS wait every G1 tile is done, and a G1 tile
-                # ran only once its expert's rows were all placed: the routing counts
-                # are dead
-                if bid == i32(0):
-                    for e in range(tid, E, BLK):
-                        st_i32(ctrl + (CT_CNT * 4) + i64(e) * 4, 0)
-                        st_i32(ctrl + (CT_FILL * 4) + i64(e) * 4, 0)
-            # unit (row i, column chunk cu): the RS layout, every rank's partial loaded
-            # at once
-            # Y by TDM (YT): helpers (no dynamic control flow; the loop is below)
-            if fx.const_expr(True):
-                lds_load_b32, _ = make_lds_copy_ops(32)
-                lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
-                p8s = fx.PointerType.get(
-                    elem_ty=fx.Int8.ir_type, address_space=fx.AddressSpace.Shared, alignment=16
-                )
-                i8g = fx.PointerType.get(
-                    elem_ty=fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=16
-                )
-
-                def gview(base, off, shape, stride):
-                    return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
-
-                def lview(off, shape, stride):
-                    return fx.Tensor(
-                        fx.make_view(fx.recast_iter(p8s, lptr + off), fx.make_layout(shape, stride))
-                    )
-
-                srcs = []
-                for p in range_constexpr(tp):
-                    if fx.const_expr(PULL):
-                        a_ = peers[p] + off_recv + i64(rank * i32(mmax)) * (H * 2)
-                    else:
-                        a_ = mine + off_recv + i64(i32(p * mmax)) * (H * 2)
-                    srcs.append(fx.inttoptr(i8g, a_))
-                ydst = fx.inttoptr(i8g, y_out)
-                n_rt = ceildiv(m, i32(YT_T))
-                y_total = n_rt * i32(YT_CK)
-                y_last = y_total - i32(1)
-                in_idx0 = fx.index_cast(T.index, fx.ptrtoint(lptr))
-
-                def issue_load(work, buf, live):
-                    work = (work > y_last).select(y_last, work)
-                    rt = work // i32(YT_CK)
-                    ck = work - rt * i32(YT_CK)
-                    i0 = rt * i32(YT_T)
-                    left = m - i0
-                    oob = (left > i32(YT_T)).select(i32(YT_T), left)
-                    oob = live.select(oob, i32(1))
-                    for p in range_constexpr(tp):
-                        gt = gview(srcs[p], i64(i0) * (H * 2) + i64(ck) * YT_PB, (YT_T, YT_PB),
-                                   (H * 2, 1))
-                        at = fx.rocdl.make_tdm_atom(gt, [oob, None], strides=[H * 2, None],
-                                                    num_warps=NW)
-                        fx.copy(at, gt, lview(buf * YT_IN + p * YT_SRC, (YT_T, YT_PB), (YT_PB, 1)))
-                        if fx.const_expr(Q8):
-                            gs = gview(srcs[p], i64(i0) * (H * 2) + H + i64(ck) * YT_SB,
-                                       (YT_T, YT_SB), (H * 2, 1))
-                            ats = fx.rocdl.make_tdm_atom(gs, [oob, None], strides=[H * 2, None],
-                                                         num_warps=NW)
-                            fx.copy(ats, gs, lview(buf * YT_IN + p * YT_SRC + YT_T * YT_PB,
-                                                   (YT_T, YT_SB), (YT_SB, 1)))
-
-                def reduce_tile(buf):
-                    for r in range_constexpr(YT_ROUNDS):
-                        slot = tid + i32(r * BLK)
-                        row = slot // i32(YC // 16)
-                        e16 = (slot - row * i32(YC // 16)) * i32(16)
-                        acc = None
-                        for p in range_constexpr(tp):
-                            sb = buf * YT_IN + p * YT_SRC
-                            if fx.const_expr(Q8):
-                                pay = fx.Vector(lds_load_b128(in_idx0, sb + row * YT_PB + e16))
-                                sc_i = e16 // i32(32)
-                                dw = fx.Int32(lds_load_b32(
-                                    in_idx0, sb + YT_T * YT_PB + row * YT_SB + (sc_i // i32(4)) * i32(4)
-                                )[0])
-                                e8 = (dw >> ((sc_i % i32(4)) * i32(8))) & i32(0xFF)
-                                f = q8_unpack(pay, e8, 4)
+                            wl = ld_f32(mine + off_tw + (i64(ar) * TOPK + i64(lane)) * 4)
+                    # a dropped route: row 0 read, weight 0 (no branch)
+                    if fx.const_expr(DF2):  # every G2 tile of this token's routes' m-tiles
+                        if (lane < i32(TOPK)) & (psl >= i32(0)):
+                            spin_agent(cnt2 + i64(psl // i32(g2.tile_m)) * 4, NT2, err, ERR_DF)
+                        acq_agent()
+                    wl = (psl >= i32(0)).select(wl, fx.Float32(0.0))
+                    psl = fx.max(psl, i32(0))
+                    fs = []
+                    for k in range_constexpr(TOPK):
+                        srow_k = rdlane(psl, k)
+                        if fx.const_expr(EXP == "rs_contig"):  # experiment: contiguous rows
+                            srow_k = t * i32(TOPK) + i32(k)
+                        src = gout_addr + i64(srow_k) * (H * 2)
+                        if fx.const_expr(G2Q8):  # 8 fp8 + their block's e8m0 per access
+                            fs.append([
+                                (ld_v2(src + eoff(cu, j)), ld_u8(src + H + eoff(cu, j) // 32))
+                                for j in range_constexpr(4)
+                            ])
+                        else:
+                            fs.append([ld_v4(src + eoff(cu, j) * 2) for j in range_constexpr(4)])
+                    acc = [fx.Float32(0.0)] * 32
+                    for k in range_constexpr(TOPK):
+                        w = rdlane(wl.bitcast(fx.Int32), k).bitcast(fx.Float32)
+                        for j in range_constexpr(4):
+                            if fx.const_expr(G2Q8):
+                                f = fp8x8_f32(fs[k][j][0], fs[k][j][1])
                             else:
-                                f = []
-                                for j in range_constexpr(2):
-                                    f += bf16x8_f32(
-                                        fx.Vector(lds_load_b128(in_idx0, sb + row * YT_PB + e16 * 2 + j * 16))
-                                    )
-                            acc = f if acc is None else [a + b for a, b in zip(acc, f)]
-                        for j in range_constexpr(2):
-                            words = []
-                            for q in range_constexpr(4):
-                                words.append(
-                                    fx.Vector.from_elements(
-                                        [acc[8 * j + 2 * q].to(fx.BFloat16),
-                                         acc[8 * j + 2 * q + 1].to(fx.BFloat16)],
-                                        fx.BFloat16,
-                                    ).bitcast(fx.Int32)[0]
-                                )
-                            lds_store_b128(
-                                in_idx0, YT_OUT0 + buf * YT_OB + row * (YC * 2) + e16 * 2 + j * 16,
-                                fx.Vector.from_elements(words, fx.Int32).ir_value(),
+                                f = bf16x8_f32(fs[k][j])
+                            for q in range_constexpr(8):
+                                acc[j * 8 + q] = acc[j * 8 + q] + w * f[q]
+                    dst_rank = peer(o)
+                    if fx.const_expr(EXP == "rs_local"):  # experiment: RS rows to own arena
+                        dst_rank = mine
+                    drow = dst_rank + off_recv + i64(rank * i32(mmax) + i) * (H * 2)
+                    if fx.const_expr(PULL):  # own arena, slot [owner][row]: owners read it
+                        drow = mine + off_recv + i64(o * i32(mmax) + i) * (H * 2)
+                    if fx.const_expr(AR):  # own arena, slot t: every rank reads it
+                        drow = mine + off_recv + i64(t) * (H * 2)
+                    if fx.const_expr(Q8):
+                        # 16 int8 per lane at element offsets (a wave's store: 512
+                        # contiguous bytes); block e8m0s after the H data bytes, by the
+                        # block's first (even) lane
+                        for hh in range_constexpr(2):
+                            words, e8 = q8_block(acc[16 * hh : 16 * hh + 16])
+                            el = eoff(cu, 2 * hh)
+                            st_v4(drow + el, fx.Vector.from_elements(words, fx.Int32))
+                            if (lane & i32(1)) == i32(0):
+                                st_i8(drow + H + el // 32, e8)
+                    else:
+                        out = []
+                        for q in range_constexpr(16):
+                            lo = acc[2 * q].to(fx.BFloat16)
+                            hi = acc[2 * q + 1].to(fx.BFloat16)
+                            out.append(
+                                fx.Vector.from_elements([lo, hi], fx.BFloat16).bitcast(fx.Int32)[0]
                             )
-
-                def store_tile(work, buf):
-                    rt = work // i32(YT_CK)
-                    ck = work - rt * i32(YT_CK)
-                    i0 = rt * i32(YT_T)
-                    left = m - i0
-                    gt = gview(ydst, i64(i0) * (H * 2) + i64(ck) * (YC * 2), (YT_T, YC * 2),
-                               (H * 2, 1))
-                    at = fx.rocdl.make_tdm_atom(
-                        gt, [(left > i32(YT_T)).select(i32(YT_T), left), None],
-                        strides=[H * 2, None], num_warps=NW,
-                    )
-                    fx.copy(at, lview(YT_OUT0 + buf * YT_OB, (YT_T, YC * 2), (YC * 2, 1)), gt)
-
-
-            # YU units per wave at a time: every unit's (remote, under PULL) loads are
-            # in flight together; a unit past the end reloads the first one, unstored
-            mt = m // i32(tp)  # AR2: this rank's rows [rank * mt, (rank + 1) * mt)
-            n_y = mt * i32(NCH) if AR2 else m * i32(NCH)
-            y_row0 = rank * mt if AR2 else i32(0)
-
-            def y_loads(i, cu):
-                fs, es = [], []
-                for p in range_constexpr(tp):
-                    srow = mine + off_recv + i64(i32(p * mmax) + i) * (H * 2)
-                    if fx.const_expr(PULL):  # rank p's partial of my row, in its arena
-                        srow = peers[p] + off_recv + i64(rank * i32(mmax) + i) * (H * 2)
-                    if fx.const_expr(AR):  # rank p's partial of token i, in its arena
-                        srow = peers[p] + off_recv + i64(i) * (H * 2)
-                    if fx.const_expr(Q8):
-                        fs.append([ld_v4(srow + eoff(cu, 2 * hh)) for hh in range_constexpr(2)])
-                        es.append(
-                            [ld_u8(srow + H + eoff(cu, 2 * hh) // 32) for hh in range_constexpr(2)]
-                        )
-                    else:
-                        fs.append([ld_v4(srow + eoff(cu, j) * 2) for j in range_constexpr(4)])
-                return fs, es
-
-            def y_rows(fs, es):
-                """the 4 accesses' bf16 output (4 x i32 each)"""
-                if fx.const_expr(Q8):
-                    deq = [
-                        [q8_unpack(fs[p][hh], es[p][hh], 4) for hh in range_constexpr(2)]
-                        for p in range_constexpr(tp)
-                    ]
-                yrs = []
-                for j in range_constexpr(4):
-                    if fx.const_expr(Q8):
-                        h0 = 8 * (j % 2)
-                        acc = deq[0][j // 2][h0 : h0 + 8]
-                        for p in range_constexpr(1, tp):
-                            acc = [a + b for a, b in zip(acc, deq[p][j // 2][h0 : h0 + 8])]
-                    else:
-                        acc = bf16x8_f32(fs[0][j])
-                        for p in range_constexpr(1, tp):
-                            acc = [a + b for a, b in zip(acc, bf16x8_f32(fs[p][j]))]
-                    out = []
-                    for q in range_constexpr(4):
-                        out.append(
-                            fx.Vector.from_elements(
-                                [acc[2 * q].to(fx.BFloat16), acc[2 * q + 1].to(fx.BFloat16)],
-                                fx.BFloat16,
-                            ).bitcast(fx.Int32)[0]
-                        )
-                    yrs.append(fx.Vector.from_elements(out, fx.Int32))
-                return yrs
-
-            if fx.const_expr(YT):
-                # combine.py's pipeline: prime the first tile twice (a uniform wait
-                # count), then per trip: prefetch the next, wait for this one, sum,
-                # store
-                issue_load(bid, i32(0), bid <= y_last)
-                issue_load(bid, i32(0), bid <= y_last)
-                for work in range(bid, y_total, NCTA):
-                    ybuf = (work // i32(NCTA)) % i32(2)
-                    ynxt = work + i32(NCTA)
-                    issue_load(ynxt, i32(1) - ybuf, ynxt <= y_last)
-                    tdm_ops.tensor_wait(YT_WAIT)
-                    workgroup_barrier()
-                    reduce_tile(ybuf)
-                    workgroup_barrier()
-                    store_tile(work, ybuf)
-                tdm_ops.tensor_wait(0)
-            for u0 in range(gw, n_y if not YT else 0, GW * YU):
-                us_ = [u0 + i32(kk * GW) for kk in range_constexpr(YU)]
-                oks = [uu < n_y for uu in us_]
-                us_ = [oks[kk].select(us_[kk], u0) for kk in range_constexpr(YU)]
-                iis = [uu // i32(NCH) for uu in us_]
-                cus = [us_[kk] - iis[kk] * i32(NCH) for kk in range_constexpr(YU)]
-                iis = [y_row0 + ii for ii in iis]
-                lds_ = [y_loads(iis[kk], cus[kk]) for kk in range_constexpr(YU)]
-                for kk in range_constexpr(YU):
-                    yrows = y_rows(*lds_[kk])
-                    if oks[kk]:
                         for j in range_constexpr(4):
                             st_v4(
-                                y_out + i64(iis[kk]) * (H * 2) + eoff(cus[kk], j) * 2, yrows[j]
+                                drow + eoff(cu, j) * 2,
+                                fx.Vector.from_elements(out[4 * j : 4 * j + 4], fx.Int32),
                             )
-                            if fx.const_expr(AR2):
-                                st_v4(
-                                    mine + off_yred + i64(iis[kk]) * (H * 2) + eoff(cus[kk], j) * 2,
-                                    yrows[j],
-                                )
-            if fx.const_expr(AR2):
-                # every rank's reduced rows ready, then pull the other ranks' rows
-                nw_y = fx.min(ceildiv(mt * i32(NCH), i32(NW)), i32(NCTA))
-                ts(21)
+                ts(18)
                 rel_wg()
                 gpu.barrier()
                 if tid == i32(0):
-                    if bid * i32(NW) < mt * i32(NCH):
+                    if bid * i32(NW) < Tt * i32(NCH):  # this CTA pushed rows
                         rel_sys()
+                        # the group's last writer signals every rank
                         gi = bid // i32(SYNC_GS)
-                        gsz = fx.min(nw_y - gi * i32(SYNC_GS), i32(SYNC_GS))
-                        old = add_agent(wgc + i64(i32(2 * SYNC_NG) + gi) * 4, 1)
+                        gsz = fx.min(nw_rs - gi * i32(SYNC_GS), i32(SYNC_GS))
+                        old = add_agent(wgc + i64(i32(1 * SYNC_NG) + gi) * 4, 1)
                         if old + i32(1) == gsz:
                             for p in range_constexpr(tp):
-                                add_sys(peers[p] + off_flag + i64(FL_Y * 4) + i64(par) * (LINE * 4), 1)
+                                add_sys(peers[p] + off_flag + i64(FL_RS * 4) + i64(par) * (LINE * 4), 1)
+                    ts(19)
+                    ts(20)
+                ts(9)
+                # ---------------- Y: own rows = sum of every rank's partial ------------
+                if tid == i32(0):  # every rank's writer CTAs done
                     spin_sys(
-                        mine + off_flag + i64(FL_Y * 4) + i64(par) * (LINE * 4),
-                        i32(tp) * ceildiv(nw_y, i32(SYNC_GS)), err, ERR_RS,
+                        mine + off_flag + i64(FL_RS * 4) + i64(par) * (LINE * 4),
+                        i32(tp) * ceildiv(nw_rs, i32(SYNC_GS)), err, ERR_RS,
                     )
                     acq_sys()
                 gpu.barrier()
                 acq_wg()
-                ts(22)
-                for u in range(gw, (m - mt) * i32(NCH), GW):
-                    rr = u // i32(NCH)
-                    cu = u - rr * i32(NCH)
-                    q_ = rr // mt
-                    o_ = (rank + i32(1) + q_) % i32(tp)
-                    trow = o_ * mt + (rr - q_ * mt)
-                    srcy = peers_sel(o_) + off_yred + i64(trow) * (H * 2)
-                    vy = [ld_v4(srcy + eoff(cu, j) * 2) for j in range_constexpr(4)]
+                ts(10)
+                if fx.const_expr(DF0 and DF2):
+                    # (no barrier 4) past the RS wait every G1 tile is done, and a G1 tile
+                    # ran only once its expert's rows were all placed: the routing counts
+                    # are dead
+                    if bid == i32(0):
+                        for e in range(tid, E, BLK):
+                            st_i32(ctrl + (CT_CNT * 4) + i64(e) * 4, 0)
+                            st_i32(ctrl + (CT_FILL * 4) + i64(e) * 4, 0)
+                # unit (row i, column chunk cu): the RS layout, every rank's partial loaded
+                # at once
+                # Y by TDM (YT): helpers (no dynamic control flow; the loop is below)
+                if fx.const_expr(True):
+                    lds_load_b32, _ = make_lds_copy_ops(32)
+                    lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
+                    p8s = fx.PointerType.get(
+                        elem_ty=fx.Int8.ir_type, address_space=fx.AddressSpace.Shared, alignment=16
+                    )
+                    i8g = fx.PointerType.get(
+                        elem_ty=fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=16
+                    )
+
+                    def gview(base, off, shape, stride):
+                        return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
+
+                    def lview(off, shape, stride):
+                        return fx.Tensor(
+                            fx.make_view(fx.recast_iter(p8s, lptr + off), fx.make_layout(shape, stride))
+                        )
+
+                    srcs = []
+                    for p in range_constexpr(tp):
+                        if fx.const_expr(PULL):
+                            a_ = peers[p] + off_recv + i64(rank * i32(mmax)) * (H * 2)
+                        else:
+                            a_ = mine + off_recv + i64(i32(p * mmax)) * (H * 2)
+                        srcs.append(fx.inttoptr(i8g, a_))
+                    ydst = fx.inttoptr(i8g, y_out)
+                    n_rt = ceildiv(m, i32(YT_T))
+                    y_total = n_rt * i32(YT_CK)
+                    y_last = y_total - i32(1)
+                    in_idx0 = fx.index_cast(T.index, fx.ptrtoint(lptr))
+
+                    def issue_load(work, buf, live):
+                        work = (work > y_last).select(y_last, work)
+                        rt = work // i32(YT_CK)
+                        ck = work - rt * i32(YT_CK)
+                        i0 = rt * i32(YT_T)
+                        left = m - i0
+                        oob = (left > i32(YT_T)).select(i32(YT_T), left)
+                        oob = live.select(oob, i32(1))
+                        for p in range_constexpr(tp):
+                            gt = gview(srcs[p], i64(i0) * (H * 2) + i64(ck) * YT_PB, (YT_T, YT_PB),
+                                       (H * 2, 1))
+                            at = fx.rocdl.make_tdm_atom(gt, [oob, None], strides=[H * 2, None],
+                                                        num_warps=NW)
+                            fx.copy(at, gt, lview(buf * YT_IN + p * YT_SRC, (YT_T, YT_PB), (YT_PB, 1)))
+                            if fx.const_expr(Q8):
+                                gs = gview(srcs[p], i64(i0) * (H * 2) + H + i64(ck) * YT_SB,
+                                           (YT_T, YT_SB), (H * 2, 1))
+                                ats = fx.rocdl.make_tdm_atom(gs, [oob, None], strides=[H * 2, None],
+                                                             num_warps=NW)
+                                fx.copy(ats, gs, lview(buf * YT_IN + p * YT_SRC + YT_T * YT_PB,
+                                                       (YT_T, YT_SB), (YT_SB, 1)))
+
+                    def reduce_tile(buf):
+                        for r in range_constexpr(YT_ROUNDS):
+                            slot = tid + i32(r * BLK)
+                            row = slot // i32(YC // 16)
+                            e16 = (slot - row * i32(YC // 16)) * i32(16)
+                            acc = None
+                            for p in range_constexpr(tp):
+                                sb = buf * YT_IN + p * YT_SRC
+                                if fx.const_expr(Q8):
+                                    pay = fx.Vector(lds_load_b128(in_idx0, sb + row * YT_PB + e16))
+                                    sc_i = e16 // i32(32)
+                                    dw = fx.Int32(lds_load_b32(
+                                        in_idx0, sb + YT_T * YT_PB + row * YT_SB + (sc_i // i32(4)) * i32(4)
+                                    )[0])
+                                    e8 = (dw >> ((sc_i % i32(4)) * i32(8))) & i32(0xFF)
+                                    f = q8_unpack(pay, e8, 4)
+                                else:
+                                    f = []
+                                    for j in range_constexpr(2):
+                                        f += bf16x8_f32(
+                                            fx.Vector(lds_load_b128(in_idx0, sb + row * YT_PB + e16 * 2 + j * 16))
+                                        )
+                                acc = f if acc is None else [a + b for a, b in zip(acc, f)]
+                            for j in range_constexpr(2):
+                                words = []
+                                for q in range_constexpr(4):
+                                    words.append(
+                                        fx.Vector.from_elements(
+                                            [acc[8 * j + 2 * q].to(fx.BFloat16),
+                                             acc[8 * j + 2 * q + 1].to(fx.BFloat16)],
+                                            fx.BFloat16,
+                                        ).bitcast(fx.Int32)[0]
+                                    )
+                                lds_store_b128(
+                                    in_idx0, YT_OUT0 + buf * YT_OB + row * (YC * 2) + e16 * 2 + j * 16,
+                                    fx.Vector.from_elements(words, fx.Int32).ir_value(),
+                                )
+
+                    def store_tile(work, buf):
+                        rt = work // i32(YT_CK)
+                        ck = work - rt * i32(YT_CK)
+                        i0 = rt * i32(YT_T)
+                        left = m - i0
+                        gt = gview(ydst, i64(i0) * (H * 2) + i64(ck) * (YC * 2), (YT_T, YC * 2),
+                                   (H * 2, 1))
+                        at = fx.rocdl.make_tdm_atom(
+                            gt, [(left > i32(YT_T)).select(i32(YT_T), left), None],
+                            strides=[H * 2, None], num_warps=NW,
+                        )
+                        fx.copy(at, lview(YT_OUT0 + buf * YT_OB, (YT_T, YC * 2), (YC * 2, 1)), gt)
+
+
+                # YU units per wave at a time: every unit's (remote, under PULL) loads are
+                # in flight together; a unit past the end reloads the first one, unstored
+                mt = m // i32(tp)  # AR2: this rank's rows [rank * mt, (rank + 1) * mt)
+                n_y = mt * i32(NCH) if AR2 else m * i32(NCH)
+                y_row0 = rank * mt if AR2 else i32(0)
+
+                def y_loads(i, cu):
+                    fs, es = [], []
+                    for p in range_constexpr(tp):
+                        srow = mine + off_recv + i64(i32(p * mmax) + i) * (H * 2)
+                        if fx.const_expr(PULL):  # rank p's partial of my row, in its arena
+                            srow = peers[p] + off_recv + i64(rank * i32(mmax) + i) * (H * 2)
+                        if fx.const_expr(AR):  # rank p's partial of token i, in its arena
+                            srow = peers[p] + off_recv + i64(i) * (H * 2)
+                        if fx.const_expr(Q8):
+                            fs.append([ld_v4(srow + eoff(cu, 2 * hh)) for hh in range_constexpr(2)])
+                            es.append(
+                                [ld_u8(srow + H + eoff(cu, 2 * hh) // 32) for hh in range_constexpr(2)]
+                            )
+                        else:
+                            fs.append([ld_v4(srow + eoff(cu, j) * 2) for j in range_constexpr(4)])
+                    return fs, es
+
+                def y_rows(fs, es):
+                    """the 4 accesses' bf16 output (4 x i32 each)"""
+                    if fx.const_expr(Q8):
+                        deq = [
+                            [q8_unpack(fs[p][hh], es[p][hh], 4) for hh in range_constexpr(2)]
+                            for p in range_constexpr(tp)
+                        ]
+                    yrs = []
                     for j in range_constexpr(4):
-                        st_v4(y_out + i64(trow) * (H * 2) + eoff(cu, j) * 2, vy[j])
-            ts(11)
+                        if fx.const_expr(Q8):
+                            h0 = 8 * (j % 2)
+                            acc = deq[0][j // 2][h0 : h0 + 8]
+                            for p in range_constexpr(1, tp):
+                                acc = [a + b for a, b in zip(acc, deq[p][j // 2][h0 : h0 + 8])]
+                        else:
+                            acc = bf16x8_f32(fs[0][j])
+                            for p in range_constexpr(1, tp):
+                                acc = [a + b for a, b in zip(acc, bf16x8_f32(fs[p][j]))]
+                        out = []
+                        for q in range_constexpr(4):
+                            out.append(
+                                fx.Vector.from_elements(
+                                    [acc[2 * q].to(fx.BFloat16), acc[2 * q + 1].to(fx.BFloat16)],
+                                    fx.BFloat16,
+                                ).bitcast(fx.Int32)[0]
+                            )
+                        yrs.append(fx.Vector.from_elements(out, fx.Int32))
+                    return yrs
+
+                if fx.const_expr(YT):
+                    # combine.py's pipeline: prime the first tile twice (a uniform wait
+                    # count), then per trip: prefetch the next, wait for this one, sum,
+                    # store
+                    issue_load(bid, i32(0), bid <= y_last)
+                    issue_load(bid, i32(0), bid <= y_last)
+                    for work in range(bid, y_total, NCTA):
+                        ybuf = (work // i32(NCTA)) % i32(2)
+                        ynxt = work + i32(NCTA)
+                        issue_load(ynxt, i32(1) - ybuf, ynxt <= y_last)
+                        tdm_ops.tensor_wait(YT_WAIT)
+                        workgroup_barrier()
+                        reduce_tile(ybuf)
+                        workgroup_barrier()
+                        store_tile(work, ybuf)
+                    tdm_ops.tensor_wait(0)
+                for u0 in range(gw, n_y if not YT else 0, GW * YU):
+                    us_ = [u0 + i32(kk * GW) for kk in range_constexpr(YU)]
+                    oks = [uu < n_y for uu in us_]
+                    us_ = [oks[kk].select(us_[kk], u0) for kk in range_constexpr(YU)]
+                    iis = [uu // i32(NCH) for uu in us_]
+                    cus = [us_[kk] - iis[kk] * i32(NCH) for kk in range_constexpr(YU)]
+                    iis = [y_row0 + ii for ii in iis]
+                    lds_ = [y_loads(iis[kk], cus[kk]) for kk in range_constexpr(YU)]
+                    for kk in range_constexpr(YU):
+                        yrows = y_rows(*lds_[kk])
+                        if oks[kk]:
+                            for j in range_constexpr(4):
+                                st_v4(
+                                    y_out + i64(iis[kk]) * (H * 2) + eoff(cus[kk], j) * 2, yrows[j]
+                                )
+                                if fx.const_expr(AR2):
+                                    st_v4(
+                                        mine + off_yred + i64(iis[kk]) * (H * 2) + eoff(cus[kk], j) * 2,
+                                        yrows[j],
+                                    )
+                if fx.const_expr(AR2):
+                    # every rank's reduced rows ready, then pull the other ranks' rows
+                    nw_y = fx.min(ceildiv(mt * i32(NCH), i32(NW)), i32(NCTA))
+                    ts(21)
+                    rel_wg()
+                    gpu.barrier()
+                    if tid == i32(0):
+                        if bid * i32(NW) < mt * i32(NCH):
+                            rel_sys()
+                            gi = bid // i32(SYNC_GS)
+                            gsz = fx.min(nw_y - gi * i32(SYNC_GS), i32(SYNC_GS))
+                            old = add_agent(wgc + i64(i32(2 * SYNC_NG) + gi) * 4, 1)
+                            if old + i32(1) == gsz:
+                                for p in range_constexpr(tp):
+                                    add_sys(peers[p] + off_flag + i64(FL_Y * 4) + i64(par) * (LINE * 4), 1)
+                        spin_sys(
+                            mine + off_flag + i64(FL_Y * 4) + i64(par) * (LINE * 4),
+                            i32(tp) * ceildiv(nw_y, i32(SYNC_GS)), err, ERR_RS,
+                        )
+                        acq_sys()
+                    gpu.barrier()
+                    acq_wg()
+                    ts(22)
+                    for u in range(gw, (m - mt) * i32(NCH), GW):
+                        rr = u // i32(NCH)
+                        cu = u - rr * i32(NCH)
+                        q_ = rr // mt
+                        o_ = (rank + i32(1) + q_) % i32(tp)
+                        trow = o_ * mt + (rr - q_ * mt)
+                        srcy = peers_sel(o_) + off_yred + i64(trow) * (H * 2)
+                        vy = [ld_v4(srcy + eoff(cu, j) * 2) for j in range_constexpr(4)]
+                        for j in range_constexpr(4):
+                            st_v4(y_out + i64(trow) * (H * 2) + eoff(cu, j) * 2, vy[j])
+                ts(11)
             # ---------------- done: the last CTA advances the epoch ----------------
             # (orders no data: only every CTA's read of the epoch precedes it)
             if tid == i32(0):
@@ -1168,4 +1196,6 @@ def compile_mega_moe_tp_1250(
         "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
         "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     }
+    if cfg.waves_per_eu:  # cap VGPRs so that many waves (CTAs per CU) fit a SIMD
+        launch.compile_hints["waves_per_eu"] = cfg.waves_per_eu
     return launch, NCTA

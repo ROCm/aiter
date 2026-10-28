@@ -164,6 +164,7 @@ def make_gemm_a8w4_tdm_task(
     ds_first_n=None,
     c_sep=0,
     q8_rows=0,
+    expert_given=0,
 ):
     """Build the per-tile body of the grouped A8W4 TDM GEMM (all arguments are
     compile-time). Returns ``(gemm_task, block, kernel name)``: with ``persistent_workers`` the
@@ -270,6 +271,7 @@ def make_gemm_a8w4_tdm_task(
         rolled_drain,
         c_sep,
         q8_rows,
+        expert_given,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -484,6 +486,7 @@ def make_gemm_a8w4_tdm_task(
         f32_situ_linear_beta: fx.Float32,
         task_id: task_index_type,
         schedule_rows: task_index_type,
+        expert_hint: task_index_type,
     ):
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
@@ -547,17 +550,20 @@ def make_gemm_a8w4_tdm_task(
         # result with the padding sentinel so it remains defined outside the
         # dynamic branch and the existing main-body guard stays valid.
         expert = blk_m * 0 + n_experts
-        if has_work:
-            lo, hi = blk_m * 0, blk_m * 0 + n_experts
-            for _ in range_constexpr(
-                max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
-            ):
-                mid = (lo + hi) >> 1
-                mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-                go_right = tile_map[mid_clamped] <= blk_m
-                lo = go_right.select(mid + 1, lo)
-                hi = go_right.select(hi, mid)
-            expert = lo
+        if const_expr(expert_given):  # the caller's bisect (same semantics)
+            expert = has_work.select(fx.Int32(expert_hint), expert)
+        else:
+            if has_work:
+                lo, hi = blk_m * 0, blk_m * 0 + n_experts
+                for _ in range_constexpr(
+                    max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
+                ):
+                    mid = (lo + hi) >> 1
+                    mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
+                    go_right = tile_map[mid_clamped] <= blk_m
+                    lo = go_right.select(mid + 1, lo)
+                    hi = go_right.select(hi, mid)
+                expert = lo
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)
