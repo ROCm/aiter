@@ -8532,17 +8532,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             )
         self._invocation_configuration(args)
         rows = [row.to_dict() for _, row in untunedf.iterrows()]
-        # Candidates are A4W4 only. Tuning any other precision would publish
-        # A4W4 kernels under that row's key, so reject the batch up front.
-        for index, row in enumerate(rows):
-            if any(
-                _parse_tuning_type(row[col]) != dtypes.fp4x2
-                for col in ("q_dtype_a", "q_dtype_w")
-            ):
-                raise ValueError(
-                    f"row {index + 2} {tuple(row[k] for k in self.keys)}: "
-                    "--mxfp4-flydsl tunes A4W4 rows only"
-                )
 
         if not rows:
             return []
