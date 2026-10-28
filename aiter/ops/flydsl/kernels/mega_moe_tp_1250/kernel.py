@@ -170,10 +170,11 @@ def compile_mega_moe_tp_1250(
     L_SCAN1 = L_SCAN0 + E * 4
     L_CNT = L_SCAN1 + E * 4
     assert L_CNT + E * 4 <= LDS_BYTES
-    SCAN_STEPS = max(1, (E - 1).bit_length())
+    EPT = (E + BLK - 1) // BLK  # experts a thread scans
     DF1 = cfg.df1
     Q8 = cfg.rs_q8
     LH = cfg.local_hist
+    BF = cfg.b_first
     EHINT = cfg.expert_hint
     CPC = cfg.cta_per_cu
     SPREAD = cfg.spread
@@ -230,12 +231,22 @@ def compile_mega_moe_tp_1250(
     assert CW == 4 * 256  # a lane's 4 accesses of 8 elements, 512 B apart
     RPW = cfg.place_rpw  # routes a wave places per batch
     CH = min(4, RPW)  # A rows a wave copies at once
+    QO = cfg.q_once
+    assert not QO or (cfg.ar and cfg.local_hist)
+    # one route a wave: its x row early
+    XEARLY = cfg.ar and cfg.local_hist and RPW == 1 and not QO
     assert RPW <= WAVE and RPW % CH == 0
     name = (
         f"mega_moe_tp1250_h{H}_i{I}_e{E}_k{TOPK}_tp{tp}_mm{mmax}_{act}_{cfg.path}"
         f"_g1m{g1.tile_m}n{g1.tile_n}b{g1.num_buffers}"
         f"_g2m{g2.tile_m}n{g2.tile_n}b{g2.num_buffers}_c{NCTA}"
     )
+    if g1.b_th or g2.b_th:
+        name += f"_th{g1.b_th}x{g2.b_th}"
+    if cfg.b_first:
+        name += "_bf"
+    if cfg.q_once:
+        name += "_qo"
     TS = os.environ.get("MEGA_TS", "0") == "1"  # debug phase stamps
     EXP = os.environ.get("MEGA_EXP", "")  # perf experiments (device.py _EXP)
     # gemmonly: G1 / G2 on the routing a previous launch left (same inputs): every
@@ -277,6 +288,7 @@ def compile_mega_moe_tp_1250(
             mma_first_group=g.mma_first_group or None,
             ds_first_n=None if g.ds_first_n < 0 else g.ds_first_n,
             c_sep=g.c_sep,
+            tdm_b_th=g.b_th,
             expert_given=int(cfg.expert_hint),
         )
 
@@ -333,6 +345,7 @@ def compile_mega_moe_tp_1250(
             quant_wmma_rep=wrep2,
             row_major_ascale=1,
             num_buffers=min(g1.num_buffers, ceildiv(H, g1.tile_k)),
+            a_wait=int(cfg.b_first and cfg.df0 and not cfg.dyn),
             **gemm_kw(g1),
         )
         task2, b2, _ = make_gemm_a8w4_tdm_task(
@@ -341,6 +354,7 @@ def compile_mega_moe_tp_1250(
             ep_quant_bits=8 if cfg.g2_q8 else 0,
             q8_rows=int(cfg.g2_q8),
             num_buffers=min(g2.num_buffers, ceildiv(I, g2.tile_k)),
+            a_wait=int(cfg.b_first and cfg.df1),
             **gemm_kw(g2),
         )
         assert b1 == b2 == BLK
@@ -514,7 +528,7 @@ def compile_mega_moe_tp_1250(
                 # contiguous bytes of FP4 (and 32 of scales) on the xGMI
                 # AR (not LH): every token quantized once into the own arena (no push);
                 # barrier 1 orders it before the placement copy
-                for i in range(gw, m if not (AR and LH) else 0, GW):
+                for i in range(gw, m if not (AR and LH) or QO else 0, GW):
                     src = x_in + i64(i) * (H * 2) + i64(lane) * 64
                     q, scs = [], []
                     for b in range_constexpr(NB_PER_LANE):
@@ -548,6 +562,10 @@ def compile_mega_moe_tp_1250(
                 rel_wg()
                 gpu.barrier()
                 if tid == i32(0):
+                    if fx.const_expr(QO):  # this CTA's quantized tokens are out
+                        if bid * i32(NW) < m:
+                            rel_agent()
+                            add_agent(wgc, 1)
                     if (bid * i32(NW) < m) & (notar == i32(1)):  # this CTA pushed rows
                         rel_sys()
                         # the group's last writer signals every rank
@@ -592,37 +610,52 @@ def compile_mega_moe_tp_1250(
                     barrier(1)
                 ts(3)
                 # ---------------- R2: expert starts, placement, A rows -----------------
-                for e in range(tid, E, BLK):
+                # expert starts: an exclusive scan of the AM-aligned counts. A thread
+                # owns EPT consecutive experts; a wave scans its threads' sums by
+                # shuffles, one barrier joins the waves' totals
+                cs, als = [], []
+                for j in range_constexpr(EPT):
+                    sx_e = tid * i32(EPT) + i32(j)
+                    sx_ec = fx.min(sx_e, i32(E - 1))
                     if fx.const_expr(LH):
-                        c = lds_ld(L + L_HIST + e * 4)
+                        sx_c = lds_ld(L + L_HIST + sx_ec * 4)
                     else:
-                        c = ld_i32(ctrl + (CT_CNT * 4) + i64(e) * 4)
-                    lds_st(L + L_CNT + e * 4, c)
-                    lds_st(L + L_SCAN0 + e * 4, (c + i32(AM - 1)) // i32(AM) * i32(AM))
+                        sx_c = ld_i32(ctrl + (CT_CNT * 4) + i64(sx_ec) * 4)
+                    sx_c = (sx_e < i32(E)).select(sx_c, i32(0))
+                    cs.append(sx_c)
+                    als.append(rup(sx_c))
+                incl = []
+                run = i32(0)
+                for j in range_constexpr(EPT):
+                    run = run + als[j]
+                    incl.append(run)
+                wsc = run
+                for k in range_constexpr(5):
+                    up = fx.Int32(gpu.shuffle_up(wsc, 1 << k, WAVE))
+                    wsc = wsc + (lane >= i32(1 << k)).select(up, i32(0))
+                if lane == i32(WAVE - 1):
+                    lds_st(L + L_SCAN0 + wave * 4, wsc)
                 gpu.barrier()
-                for st_i in range_constexpr(SCAN_STEPS):
-                    d = 1 << st_i
-                    src_s = (L_SCAN0, L_SCAN1)[st_i % 2]
-                    dst_s = (L_SCAN1, L_SCAN0)[st_i % 2]
-                    for e in range(tid, E, BLK):
-                        v = lds_ld(L + src_s + e * 4)
-                        prev = lds_ld(L + src_s + (fx.max(e - i32(d), i32(0))) * 4)
-                        v = v + (e >= i32(d)).select(prev, i32(0))
-                        lds_st(L + dst_s + e * 4, v)
-                    gpu.barrier()
-                src_s = (L_SCAN0, L_SCAN1)[SCAN_STEPS % 2]
-                # src_s: inclusive scan of the aligned counts; start = it - aligned
-                for e in range(tid, E, BLK):
-                    c = lds_ld(L + L_CNT + e * 4)
-                    al = (c + i32(AM - 1)) // i32(AM) * i32(AM)
-                    st = lds_ld(L + src_s + e * 4) - al
-                    lds_st(L + L_HIST + e * 4, st)
-                    lds_st(L + LEXP + e * 4, st + c)  # outside the GEMM arena
-                    if fx.const_expr(DF0):  # every CTA (same values): its own tasks read it
-                        st_i32(psum_addr + i64(e) * 4, st + c)
-                    else:
-                        if bid == i32(0):
-                            st_i32(psum_addr + i64(e) * 4, st + c)
+                base = wsc - run  # the threads before this one in its wave
+                for w in range_constexpr(NW - 1):
+                    base = base + (wave > i32(w)).select(lds_ld(L + L_SCAN0 + w * 4), i32(0))
+                for j in range_constexpr(EPT):
+                    sx_e = tid * i32(EPT) + i32(j)
+                    if sx_e < i32(E):
+                        sx_st = base + incl[j] - als[j]
+                        sx_c = cs[j]
+                        lds_st(L + L_HIST + sx_e * 4, sx_st)
+                        lds_st(L + LEXP + sx_e * 4, sx_st + sx_c)  # outside the GEMM arena
+                gpu.barrier()
+                # psum from LDS: a wave's store is 128 contiguous bytes (every CTA
+                # stores it under DF0, so scattered 4-byte stores contend)
+                if fx.const_expr(DF0):  # every CTA (same values): its own tasks read it
+                    for pe_ in range(tid, E, BLK):
+                        st_i32(psum_addr + i64(pe_) * 4, lds_ld(L + LEXP + pe_ * 4))
+                else:
+                    if bid == i32(0):
+                        for pe0 in range(tid, E, BLK):
+                            st_i32(psum_addr + i64(pe0) * 4, lds_ld(L + LEXP + pe0 * 4))
                 gpu.barrier()
                 ts(13)
                 if fx.const_expr(AGS):  # the A rows: every rank's AG rows landed
@@ -638,8 +671,20 @@ def compile_mega_moe_tp_1250(
                 # A rows CH at a time, loads first (no branch: a dropped route's row
                 # goes to the spare row cm - 1)
                 spare = cm - i32(1)
+                if fx.const_expr(QO):  # every token quantized (by the writer CTAs)
+                    if tid == i32(0):
+                        spin_agent(wgc, nw_ag, err, ERR_DF)
+                        acq_agent()
+                    gpu.barrier()
+                    acq_wg()
                 for pb in range(gw, ceildiv(nr, i32(RPW)), GW):
                     r = pb * i32(RPW) + lane
+                    if fx.const_expr(XEARLY):  # the route's x row loads go out before
+                        # its slot's atomic (they overlap); quantized once both land
+                        srcx0 = x_in + i64(fx.min(pb, nr - i32(1)) // i32(TOPK)) * (H * 2) \
+                            + i64(lane) * 64
+                        xv = [[ld_v4(srcx0 + (b * WAVE * 64 + j * 16)) for j in range_constexpr(4)]
+                              for b in range_constexpr(NB_PER_LANE)]
                     pos = i32(-1)
                     ar = i32(0)
                     eidl = i32(0)
@@ -656,25 +701,29 @@ def compile_mega_moe_tp_1250(
                     for j0 in range_constexpr(0, RPW, CH):
                         pss = [rdlane(pos, j0 + jj) for jj in range_constexpr(CH)]
                         ars = [i64(rdlane(ar, j0 + jj)) for jj in range_constexpr(CH)]
-                        if fx.const_expr(AR and LH):  # the route rows straight from x (as AG)
+                        if fx.const_expr(AR and LH and not QO):  # route rows straight from x
                             for jj in range_constexpr(CH):
                                 drow = i64((pss[jj] >= i32(0)).select(pss[jj], spare))
                                 srcx = x_in + ars[jj] * (H * 2) + i64(lane) * 64
                                 dq = a1_addr + drow * XB + i64(lane) * 16
                                 dsc = a1s_addr + drow * XS + i64(lane)
                                 for b in range_constexpr(NB_PER_LANE):
-                                    v4s = [ld_v4(srcx + (b * WAVE * 64 + j * 16)) for j in range_constexpr(4)]
+                                    if fx.const_expr(XEARLY):
+                                        v4s = xv[b]
+                                    else:
+                                        v4s = [ld_v4(srcx + (b * WAVE * 64 + j * 16))
+                                               for j in range_constexpr(4)]
                                     qb, e8 = quant_fp4_block32(v4s)
                                     st_v4(dq + b * WAVE * 16, qb)
                                     st_i8(dsc + b * WAVE, e8)
                         vs, ss = [], []
-                        for jj in range_constexpr(CH if not (AR and LH) else 0):
+                        for jj in range_constexpr(CH if not (AR and LH) or QO else 0):
                             # access cc of a lane: 16 B at cc * 512 + lane * 16 (a wave's
                             # access is 512 contiguous bytes)
                             s0 = mine + off_xq + ars[jj] * XB + i64(lane) * 16
                             vs.append([ld_v4(s0 + cc * 512) for cc in range_constexpr(XB // WAVE // 16)])
                             ss.append(ld_i32(mine + off_xs + ars[jj] * XS + i64(lane) * 4))
-                        for jj in range_constexpr(CH if not (AR and LH) else 0):
+                        for jj in range_constexpr(CH if not (AR and LH) or QO else 0):
                             drow = i64((pss[jj] >= i32(0)).select(pss[jj], spare))
                             d0 = a1_addr + drow * XB + i64(lane) * 16
                             for cc in range_constexpr(XB // WAVE // 16):
@@ -740,7 +789,7 @@ def compile_mega_moe_tp_1250(
                             acq_wg()
                         task1(a2, a1, w1, a1s, w1s, psum, a1, a2s, a2, cm, i32(2 * I),
                               swiglu_limit, situ_beta, situ_linear_beta, tq, rows,
-                              ehint(tq, NT1))
+                              ehint(tq, NT1), i64(0), i32(0), err)
                         if fx.const_expr(g1.c_sep):
                             tdm_ops.tensor_wait(0)
                         rel_wg()
@@ -750,17 +799,20 @@ def compile_mega_moe_tp_1250(
                             add_agent(cnt1 + i64(mtile_of(tq, n_mt, NT1)) * 4, 1)
                     else:
                         t2 = tq - n1
-                        if tid == i32(0):  # every G1 tile of this m-tile done
-                            spin_agent(
-                                cnt1 + i64(mtile_of(t2, n_mt, H // g2.tile_n)) * 4,
-                                NT1, err, ERR_DF,
-                            )
-                            acq_agent()
-                        gpu.barrier()
-                        acq_wg()
-                        task2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
-                              swiglu_limit, situ_beta, situ_linear_beta, t2, rows,
-                              ehint(t2, NT2))
+                        cnt_t2 = cnt1 + i64(mtile_of(t2, n_mt, H // g2.tile_n)) * 4
+                        if fx.const_expr(BF):  # the tile waits for the m-tile after B
+                            task2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
+                                  swiglu_limit, situ_beta, situ_linear_beta, t2, rows,
+                                  ehint(t2, NT2), cnt_t2, i32(NT1), err)
+                        else:
+                            if tid == i32(0):  # every G1 tile of this m-tile done
+                                spin_agent(cnt_t2, NT1, err, ERR_DF)
+                                acq_agent()
+                            gpu.barrier()
+                            acq_wg()
+                            task2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
+                                  swiglu_limit, situ_beta, situ_linear_beta, t2, rows,
+                                  ehint(t2, NT2), i64(0), i32(0), err)
                         if fx.const_expr(DF2):  # this m-tile's G2 tile done
                             tdm_ops.tensor_wait(0)
                             rel_wg()
@@ -774,7 +826,16 @@ def compile_mega_moe_tp_1250(
                     tq = uni(lds_ld(L + Q_LDS))
                     gpu.barrier()
             for tk in range(vbid, n1 if not DYN else 0, NCTA):
-                if fx.const_expr(DF0):
+                if fx.const_expr(DF0 and BF and not DYN):  # the tile waits for its rows after B
+                    bf_e = expert_of(mtile_of(tk, n_mt, NT1) * i32(TM1), psum_addr)
+                    bf_s = (bf_e > i32(0)).select(
+                        rup(ld_i32(psum_addr + i64(fx.max(bf_e - i32(1), i32(0))) * 4)),
+                        i32(0),
+                    )
+                    task1(a2, a1, w1, a1s, w1s, psum, a1, a2s, a2, cm, i32(2 * I),
+                          swiglu_limit, situ_beta, situ_linear_beta, tk, rows, ehint(tk, NT1),
+                          placed + i64(bf_e) * 4, ld_i32(psum_addr + i64(bf_e) * 4) - bf_s, err)
+                elif fx.const_expr(DF0):
                     if tid == i32(0):
                         e_mt = expert_of(mtile_of(tk, n_mt, NT1) * i32(TM1), psum_addr)
                         st0 = (e_mt > i32(0)).select(
@@ -786,8 +847,10 @@ def compile_mega_moe_tp_1250(
                         acq_agent()
                     gpu.barrier()
                     acq_wg()
-                task1(a2, a1, w1, a1s, w1s, psum, a1, a2s, a2, cm, i32(2 * I),
-                      swiglu_limit, situ_beta, situ_linear_beta, tk, rows, ehint(tk, NT1))
+                if fx.const_expr(not (DF0 and BF and not DYN)):
+                    task1(a2, a1, w1, a1s, w1s, psum, a1, a2s, a2, cm, i32(2 * I),
+                          swiglu_limit, situ_beta, situ_linear_beta, tk, rows, ehint(tk, NT1),
+                          i64(0), i32(0), err)
                 if fx.const_expr(DF1):  # this m-tile's G1 tile done
                     if fx.const_expr(g1.c_sep):
                         tdm_ops.tensor_wait(0)
@@ -802,15 +865,21 @@ def compile_mega_moe_tp_1250(
             ts(6)
             n2 = n_mt * i32(H // g2.tile_n)
             for tk in range(vbid, n2 if not DYN else 0, NCTA):
-                if fx.const_expr(DF1):  # wait for every G1 tile of this m-tile
-                    if tid == i32(0):
-                        mt2 = mtile_of(tk, n_mt, H // g2.tile_n)
-                        spin_agent(cnt1 + i64(mt2) * 4, NT1, err, ERR_DF)
-                        acq_agent()
-                    gpu.barrier()
-                    acq_wg()
-                task2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
-                      swiglu_limit, situ_beta, situ_linear_beta, tk, rows, ehint(tk, NT2))
+                if fx.const_expr(DF1 and BF):  # the tile waits for the m-tile after B
+                    task2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
+                          swiglu_limit, situ_beta, situ_linear_beta, tk, rows, ehint(tk, NT2),
+                          cnt1 + i64(mtile_of(tk, n_mt, H // g2.tile_n)) * 4, i32(NT1), err)
+                else:
+                    if fx.const_expr(DF1):  # wait for every G1 tile of this m-tile
+                        if tid == i32(0):
+                            mt2 = mtile_of(tk, n_mt, H // g2.tile_n)
+                            spin_agent(cnt1 + i64(mt2) * 4, NT1, err, ERR_DF)
+                            acq_agent()
+                        gpu.barrier()
+                        acq_wg()
+                    task2(gout, a2, w2, a2s, w2s, psum, a2, a2, a2, cm, i32(H),
+                          swiglu_limit, situ_beta, situ_linear_beta, tk, rows, ehint(tk, NT2),
+                          i64(0), i32(0), err)
                 if fx.const_expr(DF2):
                     tdm_ops.tensor_wait(0)
                     rel_wg()

@@ -32,6 +32,7 @@ from ..gemm_common_gfx1250 import (
     workgroup_barrier,
 )
 from ..kernels_common import ceildiv
+from .device import acq_agent, acq_wg, spin_agent
 from ..mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
@@ -165,6 +166,7 @@ def make_gemm_a8w4_tdm_task(
     c_sep=0,
     q8_rows=0,
     expert_given=0,
+    a_wait=0,
 ):
     """Build the per-tile body of the grouped A8W4 TDM GEMM (all arguments are
     compile-time). Returns ``(gemm_task, block, kernel name)``: with ``persistent_workers`` the
@@ -272,6 +274,7 @@ def make_gemm_a8w4_tdm_task(
         c_sep,
         q8_rows,
         expert_given,
+        a_wait,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -487,6 +490,9 @@ def make_gemm_a8w4_tdm_task(
         task_id: task_index_type,
         schedule_rows: task_index_type,
         expert_hint: task_index_type,
+        wait_addr: fx.Int64,
+        wait_target: fx.Int32,
+        wait_err: fx.Int64,
     ):
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
@@ -946,7 +952,8 @@ def make_gemm_a8w4_tdm_task(
                 pred = pred | (wave == w)
             return pred
 
-        def issue(s, kt, my_jobs=None):
+        def issue(s, kt, my_jobs=None, kind=None):
+            """kind: only the B (jobs 1, 3: B, B scales) or A (0, 2) loads"""
             base_i8 = fx.recast_iter(p8_shared, base_ptr)
             # Only the last tile is ragged: a prologue kt picks its extent at
             # compile time, a loop kt selects it with one scalar compare.
@@ -979,8 +986,10 @@ def make_gemm_a8w4_tdm_task(
             else:
                 for g in range_constexpr(len(job_waves)):
                     if owns(job_waves[g]):
-                        for j in jobs:
-                            if const_expr(j.waves == job_waves[g]):
+                        for ji, j in enumerate(jobs):
+                            if const_expr(j.waves == job_waves[g] and (
+                                kind is None or (ji % 2 == 1) == (kind == "B")
+                            )):
                                 emit(j)
 
         def dispatch_wave_job(fn):
@@ -1510,13 +1519,30 @@ def make_gemm_a8w4_tdm_task(
                 if full_cluster:
                     cluster_sync()
 
+            def prologue(n):
+                """the first n stages' loads; a_wait: B first, then the caller's
+                dependency (the A rows: wait_addr reaches wait_target), then A"""
+                if const_expr(a_wait):
+                    assert len(jobs) == 4
+                    for i in range_constexpr(n):
+                        issue(i, i, kind="B")
+                    if fx.Int32(tid) == fx.Int32(0):
+                        spin_agent(wait_addr, wait_target, wait_err, 64)
+                        acq_agent()
+                    workgroup_barrier()
+                    acq_wg()
+                    for i in range_constexpr(n):
+                        issue(i, i, kind="A")
+                else:
+                    for i in range_constexpr(n):
+                        issue(i, i)
+
             def run_mainloop(interleaved_lds_load):
                 # Post-compute wins for decode and for shallow pipelines: at
                 # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
                 if const_expr(tile_m <= 32 or num_buffers <= 2):
                     # Post-compute issue: better for decode (small tile_m).
-                    for i in range_constexpr(num_buffers):
-                        issue(i, i)
+                    prologue(num_buffers)
                     n_steady = K_TILES - num_buffers
                     if const_expr(next_stage_on):
                         # Every rolled iteration reads the carry, so prime it here --
@@ -1589,8 +1615,7 @@ def make_gemm_a8w4_tdm_task(
                     # Mid-compute prefetch: better for prefill. PRE is both the tiles
                     # resident before the loop and the issue lead; the carry adds one.
                     PRE = num_buffers if next_stage_on else num_buffers - 1
-                    for i in range_constexpr(PRE):
-                        issue(i, i)
+                    prologue(PRE)
                     n_steady = K_TILES - PRE
                     if const_expr(next_stage_on):
                         pipeline_fence(outstanding=TDM_PER * (PRE - 1))

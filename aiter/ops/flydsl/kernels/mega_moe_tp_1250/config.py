@@ -96,6 +96,7 @@ class GemmCfg:
     mma_first_group: int = 0
     ds_first_n: int = -1
     c_sep: int = 0  # output staging in its own LDS region; store not waited per task
+    b_th: int = 0  # TDM temporal hint of the B (weight) loads (gemm_tile tdm_b_th)
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,12 @@ class LaunchCfg:
     waves_per_eu: int = 0  # compile hint (0: none)
     expert_hint: bool = True  # tasks get their expert from an LDS psum bisect
     rs_q8: bool = False  # RS partials as int8 + e8m0 per 32 (else bf16; no gain measured)
+    # a GEMM task's B (weight) prologue loads go out before it waits for its A rows
+    # (G1: placement (static order), G2: the m-tile's G1 tiles), inside the tile
+    b_first: bool = True  # -2~3 us small, -1~2% mid / big
+    # AR + local_hist: every token quantized once at the start (under the routing
+    # count; placement copies the rows) instead of per route (6x the x reads)
+    q_once: bool = False
 
     @property
     def align_m(self) -> int:
