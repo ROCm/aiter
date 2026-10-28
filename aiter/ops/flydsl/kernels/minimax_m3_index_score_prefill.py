@@ -29,6 +29,12 @@ with it: Q takes an LDS object of its own past tile_q 128 (`stage_q_lds`), and
 What bounds the shape is register pressure, through occupancy; LDS never binds,
 since gfx950 has 160 KB per CU.
 
+An MXFP4 index cache (e2m1 pages plus one e8m0 byte per 32 elements, passed as
+`score_prefill_flydsl(..., k_scale=...)`) is read natively by the same builder
+(`k_fp4`): the page stays MXFP4 through LDS and is fed to the scaled MFMA as the fp4
+A operand with the e8m0 byte as block scale; the e4m3 Q option (`q_fp8`) belongs to
+that path. Layout and contract: `minimax_m3_index_score_fp4_cache`.
+
 Layout contract: this kernel and the decode scorer read the SAME cache and so
 must agree on the k-axis map. The shape constants come from that module rather
 than being restated here, but the LDS path's addressing is its own, so what
