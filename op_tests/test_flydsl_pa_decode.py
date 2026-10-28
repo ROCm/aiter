@@ -50,9 +50,14 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         for seq, (ctx, (start, count)) in enumerate(zip(lengths, info)):
             assert start == cursor
             first = (
-                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0
+                max(max(ctx, 0) - query_length + 1 - window, 0)
+                // plan.context_partition_size
+                if window
+                else 0
             )
-            last = (max(ctx, 0) + 255) // 256
+            last = (
+                max(ctx, 0) + plan.context_partition_size - 1
+            ) // plan.context_partition_size
             assert 0 <= count <= min(last - first, plan.max_partitions)
             assert (count > 0) == (last > first)
             tile = first
@@ -508,6 +513,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
+        schedule_kwargs.pop("context_partition_size", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:

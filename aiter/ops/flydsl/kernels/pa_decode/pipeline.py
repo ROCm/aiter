@@ -19,7 +19,7 @@ from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK
+from .traits import LOG2E, MFMA_MNK
 
 
 class PaDecodePipeline:
@@ -672,8 +672,8 @@ class Gfx1250Bf16Pipeline:
             )
         state_stride = 2 + t.head_dim // 64
         begin, end = (
-            ctx.planned_start * KV_COMPUTE_BLOCK,
-            ctx.planned_end * KV_COMPUTE_BLOCK,
+            ctx.planned_start * t.context_partition_size,
+            ctx.planned_end * t.context_partition_size,
         )
         self.mem.stage_bf16_page(begin, fx.Int32(0))
         for token_i, state in range(begin, end, 128, init=initial):
@@ -861,8 +861,8 @@ class Gfx1250Pipeline:
         if const_expr(t.q_tiles == t.m_tiles):
             self.mem.stage_query()
         begin, end = (
-            ctx.planned_start * KV_COMPUTE_BLOCK,
-            ctx.planned_end * KV_COMPUTE_BLOCK,
+            ctx.planned_start * t.context_partition_size,
+            ctx.planned_end * t.context_partition_size,
         )
         self.mem.stage_kv(begin, fx.Int32(0))
         # Per-M-tile state: maximum, denominator, then wave-owned D fragments.

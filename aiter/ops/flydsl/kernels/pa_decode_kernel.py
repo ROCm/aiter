@@ -97,6 +97,7 @@ def _pa_decode_tile_kernel_name(
     sliding_window,
     query_splits,
     direct_output=False,
+    context_partition_size=256,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -113,6 +114,8 @@ def _pa_decode_tile_kernel_name(
         name += f"_qs{query_splits}"
     if direct_output:
         name += "_direct"
+    if context_partition_size != 256:
+        name += f"_cp{context_partition_size}"
     return name
 
 
@@ -140,6 +143,7 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     direct_output: bool = False,
     trans_k: bool = True,
+    context_partition_size: int | None = None,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -182,22 +186,25 @@ def compile_pa_decode_tile(
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    if context_partition_size is None:
+        context_partition_size = 128 if architecture == "gfx1250" else KV_COMPUTE_BLOCK
     if architecture == "gfx1250":
         if direct_output and num_partitions != 1:
             raise ValueError("direct_output requires a one-partition plan")
         if query_splits is None:
-            # Split the measured spilling BF16 specialization into one Q tile
-            # per CTA. Other shapes retain fused queries and their KV reuse.
-            query_splits = (
-                4
-                if kv_dtype == "bf16"
-                and head_dim == 1024
-                and query_group_size == 16
-                and query_length == 4
-                and block_size == 128
-                and trans_v
-                and sliding_window == 0
-                else 1
+            query_splits = Gfx1250Traits.select_query_splits(
+                head_dim=head_dim,
+                query_group_size=query_group_size,
+                query_length=query_length,
+                kv_dtype=kv_dtype,
+                block_size=block_size,
+                sliding_window=sliding_window,
+                num_seqs=num_seqs,
+                num_kv_heads=num_kv_heads,
+                num_compute_units=num_compute_units,
+                work_capacity=work_capacity,
+                context_partition_size=context_partition_size,
+                max_context_length=max_context_length,
             )
         return compile_gfx1250_pa_decode(
             head_dim=head_dim,
@@ -212,9 +219,12 @@ def compile_pa_decode_tile(
             compute_dtype=kv_dtype,
             direct_output=direct_output,
             query_splits=query_splits,
+            context_partition_size=context_partition_size,
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
+    if context_partition_size != KV_COMPUTE_BLOCK:
+        raise NotImplementedError("128-token context partitions require gfx1250")
     if direct_output:
         raise NotImplementedError("direct_output requires gfx1250")
     schedule = PaDecodeSchedule.select(
@@ -456,9 +466,15 @@ def compile_gfx1250_pa_decode(
     compute_dtype="fp8",
     direct_output=False,
     query_splits=1,
+    context_partition_size=128,
 ):
-    if query_splits not in (1, 2, 4) or query_length % query_splits:
-        raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
+    if type(context_partition_size) is not int or context_partition_size not in (
+        128,
+        256,
+    ):
+        raise ValueError("gfx1250 context_partition_size must be 128 or 256")
+    if query_splits not in (1, 2, 3, 4) or query_length % query_splits:
+        raise ValueError("query_splits must be 1, 2, 3, or 4 and divide query_length")
     t = Gfx1250Traits(
         head_dim,
         query_group_size,
@@ -472,6 +488,7 @@ def compile_gfx1250_pa_decode(
         compute_dtype,
         direct_output,
         query_splits,
+        context_partition_size,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
@@ -501,6 +518,7 @@ def compile_gfx1250_pa_decode(
         sliding_window=sliding_window,
         query_splits=query_splits,
         direct_output=direct_output,
+        context_partition_size=context_partition_size,
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=(128, 1, 1))

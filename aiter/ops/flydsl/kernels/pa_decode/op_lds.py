@@ -878,7 +878,7 @@ class Gfx1250Memory:
             8,
             8,
         )
-        if const_expr(full_tile):
+        if const_expr(full_tile and t.trans_v):
             self.tdm_copy(
                 ctx.value_cache_ptr,
                 off,
@@ -890,22 +890,37 @@ class Gfx1250Memory:
                 8,
             )
         else:
-            # V packs eight tokens per dimension; mask inside each chunk.
-            for chunk in range_constexpr(2):
-                count = fx.max(fx.Int32(0), fx.min(fx.Int32(8), valid - chunk * 8))
-                self.tdm_copy(
-                    ctx.value_cache_ptr,
-                    off + chunk * t.head_dim * 8,
-                    kv_off
-                    + t.k_bytes
-                    + ctx.warp * t.head_dim * 32
-                    + chunk * t.head_dim * 16,
-                    (t.head_dim, 8),
-                    (8, 1),
-                    (None, count),
-                    8,
-                    8,
-                )
+            self.stage_bf16_v_chunks(
+                off,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 32,
+                fx.Int32(0),
+                valid,
+                2,
+                full_tile,
+            )
+
+    @flyc.jit
+    def stage_bf16_v_chunks(
+        self, off, shared_offset, token, valid, chunks, full_tile=False
+    ):
+        """Gather either BF16 V cache layout into packed [token/8, D, 8]."""
+        ctx, t = self.ctx, self.t
+        for chunk in range_constexpr(chunks):
+            count = fx.max(fx.Int32(0), fx.min(fx.Int32(8), valid - token - chunk * 8))
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                (
+                    off + (token // 8 + chunk) * t.head_dim * 8
+                    if t.trans_v
+                    else off + token + chunk * 8
+                ),
+                shared_offset + chunk * t.head_dim * 16,
+                (t.head_dim, 8),
+                (8, 1) if t.trans_v else (t.block_size, 1),
+                (None, None) if full_tile else (None, count),
+                8,
+                8,
+            )
 
     @flyc.jit
     def stage_packed_tdm(self, token_base, kv_off, full_tile, cached_page=None):
@@ -1111,7 +1126,7 @@ class Gfx1250Memory:
 
     @flyc.jit
     def stage_bf16_page(self, token_base, buffer):
-        """Gather a BF16 page without transposition; zero-fill its unwritten tail."""
+        """Stage either BF16 V layout as vector-8 chunks; zero-fill the tail."""
         ctx, t = self.ctx, self.t
         safe = (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
@@ -1132,31 +1147,51 @@ class Gfx1250Memory:
             8,
         )
         if token_base + 128 <= ctx.planned_context:
-            self.tdm_copy(
-                ctx.value_cache_ptr,
-                off + ctx.warp * t.head_dim * 32,
-                kv_off + t.k_bytes + ctx.warp * t.head_dim * 64,
-                (32 * t.head_dim,),
-                (1,),
-                (None,),
-                8,
-                8,
-            )
-        else:
-            # Token extents apply inside each eight-token V chunk.
-            for chunk in range_constexpr(4):
-                count = fx.max(
-                    fx.Int32(0), fx.min(fx.Int32(8), valid - ctx.warp * 32 - chunk * 8)
-                )
+            if const_expr(t.trans_v):
                 self.tdm_copy(
                     ctx.value_cache_ptr,
-                    off + (ctx.warp * 4 + chunk) * t.head_dim * 8,
-                    kv_off + t.k_bytes + (ctx.warp * 4 + chunk) * t.head_dim * 16,
-                    (t.head_dim, 8),
-                    (8, 1),
-                    (None, count),
+                    off + ctx.warp * t.head_dim * 32,
+                    kv_off + t.k_bytes + ctx.warp * t.head_dim * 64,
+                    (32 * t.head_dim,),
+                    (1,),
+                    (None,),
                     8,
                     8,
+                )
+            else:
+                self.stage_bf16_v_chunks(
+                    off,
+                    kv_off + t.k_bytes + ctx.warp * t.head_dim * 64,
+                    ctx.warp * 32,
+                    valid,
+                    4,
+                    True,
+                )
+        else:
+            if const_expr(t.trans_v):
+                # Keep the shuffled page's existing tail-copy scheduling.
+                for chunk in range_constexpr(4):
+                    count = fx.max(
+                        fx.Int32(0),
+                        fx.min(fx.Int32(8), valid - ctx.warp * 32 - chunk * 8),
+                    )
+                    self.tdm_copy(
+                        ctx.value_cache_ptr,
+                        off + (ctx.warp * 4 + chunk) * t.head_dim * 8,
+                        kv_off + t.k_bytes + (ctx.warp * 4 + chunk) * t.head_dim * 16,
+                        (t.head_dim, 8),
+                        (8, 1),
+                        (None, count),
+                        8,
+                        8,
+                    )
+            else:
+                self.stage_bf16_v_chunks(
+                    off,
+                    kv_off + t.k_bytes + ctx.warp * t.head_dim * 64,
+                    ctx.warp * 32,
+                    valid,
+                    4,
                 )
 
     @flyc.jit

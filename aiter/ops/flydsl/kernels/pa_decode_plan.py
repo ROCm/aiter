@@ -18,7 +18,9 @@ _PLAN_SCAN_LDS_BYTES = 512
 
 
 @cache
-def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_length):
+def compile_pa_decode_plan(
+    batch, capacity, max_parts, sliding_window, query_length, context_partition_size=256
+):
     """Allocate packed tasks with one block-wide scan, without GPU readback."""
     threads = max(64, min(1024, 1 << (capacity - 1).bit_length()))
     items = (batch + threads - 1) // threads
@@ -58,9 +60,11 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
             if fx.const_expr(sliding_window > 0):
                 first = (
                     fx.max(length - (query_length - 1) - sliding_window, fx.Int64(0))
-                    // 256
+                    // context_partition_size
                 )
-            count = (length + 255) // 256 - first
+            count = (
+                length + context_partition_size - 1
+            ) // context_partition_size - first
             tiles.append(count)
             nonempty.append(fx.Int32(count > 0))
 
@@ -118,9 +122,11 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
                         fx.max(
                             length - (query_length - 1) - sliding_window, fx.Int64(0)
                         )
-                        // 256
+                        // context_partition_size
                     )
-                num_tiles = (length + 255) // 256 - first
+                num_tiles = (
+                    length + context_partition_size - 1
+                ) // context_partition_size - first
                 part = fx.Int64(slot - start)
                 work[slot * 4] = seq
                 work[slot * 4 + 1] = fx.Int32(first + part * num_tiles // count)
@@ -149,8 +155,8 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
 class PADecodePlan:
     """Reusable GPU metadata; refresh it whenever context lengths change.
 
-    ``work_info`` is [capacity, 4]: sequence, begin/end absolute 256-token tile,
-    original context length. Tile ranges are half-open and cover the MTP union.
+    ``work_info`` is [capacity, 4]: sequence, begin/end absolute context partition,
+    original context length. Ranges are half-open and cover the MTP union.
     ``reduce_info`` is [batch, 2]: first packed task, actual task count.
     """
 
@@ -161,6 +167,7 @@ class PADecodePlan:
     sliding_window: int = 0
     query_length: int = 1
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE
+    context_partition_size: int = 256
 
     @property
     def capacity(self) -> int:
@@ -173,9 +180,16 @@ class PADecodePlan:
             raise ValueError(f"plan supports batches in [1, {self.max_batch_size}]")
         if self.num_kv_heads != num_kv_heads:
             raise ValueError("plan KV head count does not match the cache")
-        num_compute_units = torch.cuda.get_device_properties(
-            device
-        ).multi_processor_count
+        properties = torch.cuda.get_device_properties(device)
+        num_compute_units = properties.multi_processor_count
+        if type(self.context_partition_size) is not int:
+            raise TypeError("plan context_partition_size must be an int")
+        arch = properties.gcnArchName.split(":", 1)[0]
+        supported_sizes = (128, 256) if arch == "gfx1250" else (256,)
+        if self.context_partition_size not in supported_sizes:
+            raise ValueError(
+                f"plan context_partition_size must be in {supported_sizes} on {arch}"
+            )
         if not 1 <= self.max_partitions <= num_compute_units:
             raise ValueError(f"plan max_partitions must be in [1, {num_compute_units}]")
         if self.sliding_window < 0 or self.query_length < 1:
@@ -200,6 +214,7 @@ def plan_pa_decode(
     max_partitions: int | None = None,
     max_batch_size: int | None = None,
     workgroup_budget: int | None = None,
+    context_partition_size: int | None = None,
     sliding_window: int = 0,
     query_length: int = 1,
     plan: PADecodePlan | None = None,
@@ -208,6 +223,9 @@ def plan_pa_decode(
 
     Allocate outside graph capture; pass ``plan`` to refresh buffers in place.
     The budget counts task slots across KV heads before query splitting.
+    ``context_partition_size`` defaults to 128 tokens on gfx1250 and 256 on
+    other targets. gfx1250 also supports 256 tokens. Omitting it on refresh
+    preserves the existing partition size.
 
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
     omitting it on refresh preserves the existing limit.
@@ -245,6 +263,14 @@ def plan_pa_decode(
         raise ValueError("num_kv_heads must be positive")
     dev = context_lengths.device
     properties = torch.cuda.get_device_properties(dev)
+    if context_partition_size is None:
+        context_partition_size = (
+            (128 if properties.gcnArchName.split(":", 1)[0] == "gfx1250" else 256)
+            if plan is None
+            else plan.context_partition_size
+        )
+    if type(context_partition_size) is not int:
+        raise TypeError("context_partition_size must be an int")
     num_compute_units = properties.multi_processor_count
     task_end_bytes = (batch * 4 + 15) // 16 * 16
     if task_end_bytes + _PLAN_SCAN_LDS_BYTES > properties.shared_memory_per_block:
@@ -274,6 +300,7 @@ def plan_pa_decode(
             sliding_window,
             query_length,
             max_batch_size,
+            context_partition_size,
         )
     else:
         if workgroup_budget is not None:
@@ -282,6 +309,8 @@ def plan_pa_decode(
             raise ValueError("max_partitions must match the reused plan")
         if max_batch_size != plan.max_batch_size:
             raise ValueError("max_batch_size must match the reused plan")
+        if context_partition_size != plan.context_partition_size:
+            raise ValueError("context_partition_size must match the reused plan")
         if sliding_window != plan.sliding_window:
             raise ValueError("sliding_window must match the reused plan")
         if sliding_window > 0 and query_length != plan.query_length:
@@ -295,6 +324,7 @@ def plan_pa_decode(
             # Clamp windows to int32 lengths; dense plans share one specialization.
             min(sliding_window, 2**31 - 1),
             query_length if sliding_window > 0 else 1,
+            plan.context_partition_size,
         )
         _run_compiled(
             launch,
