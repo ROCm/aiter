@@ -593,6 +593,11 @@ class K5BvTuner(TunerCommon):
         if args.run_config and run_config_file:
             tunedf = self.get_tuned_gemm_list(run_config_file)
             if not tunedf.empty and self.keys[0] in tunedf.columns:
+                # Replay only rows tuned on this device, as TunerCommon.run does.
+                tunedf = tunedf[
+                    (tunedf["gfx"].astype(str) == str(self.get_gfx()))
+                    & (tunedf["cu_num"] == self.get_cu_num())
+                ]
                 self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
                     drop=True
                 )
