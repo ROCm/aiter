@@ -31,7 +31,8 @@ def _clone_function(tmp_path):
         "mp_lock": lambda *, lockPath, MainFunc: MainFunc(),
     }
     code = compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec")
-    exec(code, namespace)
+    # Execute only this checked-in function to keep CPU tests independent of ROCm.
+    exec(code, namespace)  # noqa: S102
     return namespace["clone_3rdparty"]
 
 
