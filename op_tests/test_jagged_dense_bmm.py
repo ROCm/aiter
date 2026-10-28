@@ -948,8 +948,7 @@ def main():
         return
     if not _HAS_TRITON:
         aiter.logger.warning(
-            "generative-recommenders Triton baseline unavailable (%s); "
-            "running flydsl-only",
+            "Triton baseline unavailable (%s); running flydsl-only",
             _TRITON_ERR,
         )
 

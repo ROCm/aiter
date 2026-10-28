@@ -80,10 +80,11 @@ def _scan_kernel(
         row = step * _THREADS + tid
         if row < upper_bound:
             base = row * 4
-            buffer_ops.buffer_store(zero, map_rsrc, base)
-            buffer_ops.buffer_store(bm_tiles, map_rsrc, base + 1)
-            buffer_ops.buffer_store(zero, map_rsrc, base + 2)
-            buffer_ops.buffer_store(zero, map_rsrc, base + 3)
+            buffer_ops.buffer_store(
+                fx.Vector.from_elements((zero, bm_tiles, zero, zero)),
+                map_rsrc,
+                base,
+            )
     fx.gpu.barrier()
 
     n_chunks = fx.ceildiv(n_groups, chunk_width)
@@ -134,10 +135,11 @@ def _scan_kernel(
             row0 = running + inclusive - count
             for local in range(zero, count, one):
                 base = (row0 + local) * 4
-                buffer_ops.buffer_store(group, map_rsrc, base)
-                buffer_ops.buffer_store(local, map_rsrc, base + 1)
-                buffer_ops.buffer_store(seq_start, map_rsrc, base + 2)
-                buffer_ops.buffer_store(seq_end, map_rsrc, base + 3)
+                buffer_ops.buffer_store(
+                    fx.Vector.from_elements((group, local, seq_start, seq_end)),
+                    map_rsrc,
+                    base,
+                )
         fx.gpu.barrier()
         _running = yield [running + chunk_total]
 

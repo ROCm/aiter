@@ -284,11 +284,13 @@ def _build_launcher(
             )
 
             A_buf = fx.rocdl.make_buffer_tensor(
-                A_g, num_records_bytes=fx.Int64(M_b * K * 2)
+                A_g,
+                num_records_bytes=fx.Int64(M_b) * fx.Int64(K) * fx.Int64(2),
             )
             B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
             C_buf = fx.rocdl.make_buffer_tensor(
-                C_g, num_records_bytes=fx.Int64(M_b * N * 2)
+                C_g,
+                num_records_bytes=fx.Int64(M_b) * fx.Int64(N) * fx.Int64(2),
             )
 
             gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[
@@ -320,9 +322,9 @@ def _build_launcher(
             uni_copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
             buffer_copy_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
 
-            thr_copy_s2r_A = fx.make_tiled_copy_A(
-                buffer_copy_128b, tiled_mma
-            ).get_slice(tid)
+            thr_copy_s2r_A = fx.make_tiled_copy_A(uni_copy_128b, tiled_mma).get_slice(
+                tid
+            )
             thr_copy_g2r_B = fx.make_tiled_copy_B(
                 buffer_copy_128b, tiled_mma
             ).get_slice(tid)
@@ -362,7 +364,7 @@ def _build_launcher(
                         soffset=fx.Int32(a_next_k) * gA_k_stride,
                     )
                 if fx.const_expr(b_next_k is not None):
-                    b_fetch_slot = (b_read_slot + 2) % B_STAGES
+                    b_fetch_slot = (b_read_slot + (B_STAGES - 1)) % B_STAGES
                     fx.copy(
                         buffer_copy_128b,
                         thr_gB_k[None, None, None, 0],

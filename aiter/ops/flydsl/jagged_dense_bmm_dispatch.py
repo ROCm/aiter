@@ -29,7 +29,6 @@ __all__ = [
     "SUPPORTED_GFX",
     "analytic_config",
     "jagged_dense_bmm_dispatched",
-    "resolve_config",
     "tile_bucket",
 ]
 
@@ -211,6 +210,10 @@ def jagged_dense_bmm_dispatched(
     xcd_w: int | None = None,
     block_k: int | None = None,
 ):
+    """Eager-only: write ``C`` in place and return ``None``.
+
+    Not registered for FakeTensor or ``torch.compile``.
+    """
     _require_supported_arch()
     output_n = B.shape[0] // n_groups
     reduction_k = B.shape[1]
