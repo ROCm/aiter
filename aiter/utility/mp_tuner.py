@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import functools
 import math
 import multiprocessing as mp
 import os
@@ -88,6 +89,20 @@ def _reset_task_start_times(task_start_times, task_indices, task_pids=None):
             task_pids[k] = 0
 
 
+def compares_whole_output(compare_fn):
+    """Mark a compare_fn that the worker calls once with the whole (ref, res)
+    tuples instead of once per output tensor."""
+    compare_fn.compares_whole_output = True
+    return compare_fn
+
+
+def _compares_whole_output(compare_fn):
+    # functools.partial does not carry the wrapped function's attributes.
+    while isinstance(compare_fn, functools.partial):
+        compare_fn = compare_fn.func
+    return getattr(compare_fn, "compares_whole_output", False)
+
+
 def _merge_error_ratio(current, observed):
     if not math.isfinite(observed):
         return 1.0
@@ -166,6 +181,12 @@ def worker(
                 )
                 for el in ref
             ]
+            if _compares_whole_output(compare_fn):
+                err_ratio = compare_fn(
+                    ref, res, msg=f"info:{info} res ", printLog=printLog
+                )
+                max_err_ratio = _merge_error_ratio(max_err_ratio, err_ratio)
+                return info, us, round(max_err_ratio, 4)
             for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
                     # Skip generic reshape when a custom compare_fn is given: it
@@ -335,7 +356,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 ref = ref_noused
             else:
                 ref = cached_ref
-                _cur_key = (id(ref_func), ref_args, data_key)
+                _cur_key = (id(ref_func), ref_args, ref_kwargs, data_key)
                 if (
                     ref is None
                     and not fast_mode

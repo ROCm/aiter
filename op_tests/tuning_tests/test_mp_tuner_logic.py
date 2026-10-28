@@ -11,6 +11,7 @@ Simulates async_result behavior without GPU/multiprocessing to verify:
 Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 """
 
+import functools
 import importlib
 import multiprocessing as mp
 import os
@@ -19,6 +20,10 @@ import sys
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
+
+
+def _scaled_ref(x, scale):
+    return x * scale
 
 
 def _wait_for_release(release, value):
@@ -436,6 +441,66 @@ class TestWorkerErrorRatio(unittest.TestCase):
         self.assertIsNotNone(merge_error_ratio)
         self.assertEqual(merge_error_ratio(0.1, 0.2), 0.2)
         self.assertEqual(merge_error_ratio(0.2, 0.1), 0.2)
+
+    def test_whole_output_compare_gets_both_tuples_once(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("worker runs the task on a GPU")
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        calls = []
+
+        @tuner.compares_whole_output
+        def compare(ref, res, msg="", printLog=True):
+            calls.append((len(ref), len(res)))
+            return 0.25
+
+        values = torch.ones(4, device="cuda")
+        _, _, err = tuner.worker(
+            0,
+            "info",
+            lambda x: (x * 2, x * 3),
+            [values],
+            {},
+            ref=(values, values),
+            compare_fn=compare,
+        )
+        self.assertEqual(err, 0.25)
+        self.assertEqual(calls, [(2, 2)])
+        self.assertTrue(
+            tuner._compares_whole_output(functools.partial(compare, msg="m"))
+        )
+
+    def test_cached_reference_respects_ref_kwargs(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("work_group runs the tasks on a GPU")
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        values = torch.ones(4, device="cuda")
+
+        def task(scale):
+            return (
+                ("info", scale),
+                None,
+                (),
+                lambda x: x * scale,
+                (values,),
+                {},
+                _scaled_ref,
+                (["x"],),
+                {"scale": scale},
+                None,
+            )
+
+        rets = tuner.work_group(
+            {os.getpid(): 0},
+            True,
+            0.05,
+            (2, {"x": values}),
+            [task(2), task(3)],
+        )
+        self.assertEqual([err for _, _, err in rets], [0.0, 0.0])
 
 
 if __name__ == "__main__":
