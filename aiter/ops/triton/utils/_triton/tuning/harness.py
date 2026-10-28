@@ -14,8 +14,10 @@ Record fields:
   status    ready (worker is set up), start (candidate began), ok, error
   baseline  true for the installed config
   config    the raw candidate, never the mutated copy; for the baseline the installed config
-            (launched through the wrapper's own config=None path unless keys DEFAULT.json does
-            not have had to be stripped first; dropped_keys lists them)
+            of the folder the install writes (CU-agnostic, or <cu_num>cu/ first with --cu-dir),
+            launched through the wrapper's own config=None path unless that path serves
+            another config or keys DEFAULT.json does not have had to be stripped first
+            (dropped_keys lists them)
   gpu       HIP_VISIBLE_DEVICES of the worker
   cu_num    CU count of the worker's device (get_config_cu_num()), the <cu_num>cu/ folder it tunes for
   is_tuned  baseline only: a specialized file served this shape
@@ -39,7 +41,7 @@ from kernels import (
     family_bounds,
     flops,
     get_spec,
-    resolve_installed,
+    installed_baseline,
 )
 from space import UnknownConfigKey, build_space, load_defaults
 
@@ -184,11 +186,12 @@ def benchmark(
         t0 = time.time()
         try:
             if is_baseline:
-                installed, record["is_tuned"] = resolve_installed(spec, shape, backend)
-                dropped = sorted(k for k in installed if k not in keys)
-                record["config"] = {k: v for k, v in installed.items() if k in keys}
+                record["config"], record["is_tuned"], dropped, explicit = (
+                    installed_baseline(spec, shape, backend, keys, scope_cu_num)
+                )
                 if dropped:  # keys DEFAULT.json does not have are never launched
                     record["dropped_keys"] = dropped
+                if explicit:
                     candidate = record["config"]
                 # otherwise candidate stays None: the wrapper's own installed-config path
             median, low, high = time_with_cuda_graph(

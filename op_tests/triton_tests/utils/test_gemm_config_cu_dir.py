@@ -235,6 +235,41 @@ def test_resolve_installed_scope(tree, tuning, monkeypatch):
     )
 
 
+def test_baseline_uses_install_scope(tree, tuning, monkeypatch):
+    kernels, _, _, _ = tuning
+    monkeypatch.setattr(gemm_config_utils, "get_config_cu_num", lambda: 96)
+    spec = kernels.get_spec("gemm_a16w16")
+    keys = ("BLOCK_M", "BLOCK_N", "BLOCK_K")
+    shape = {"M": 8, "N": 128, "K": 256}
+    assert kernels.installed_baseline(spec, shape, "gluon", keys) == (
+        _bucket(2),
+        True,
+        [],
+        True,
+    )
+    assert kernels.installed_baseline(spec, shape, "gluon", keys, cu_num=96) == (
+        _bucket(96),
+        True,
+        [],
+        False,
+    )
+    other = {"M": 8, "N": 512, "K": 256}
+    assert kernels.installed_baseline(spec, other, "gluon", keys) == (
+        _bucket(4),
+        True,
+        [],
+        False,
+    )
+    config, _, dropped, explicit = kernels.installed_baseline(
+        spec, other, "gluon", keys[:2]
+    )
+    assert (config, dropped, explicit) == (
+        {"BLOCK_M": 4, "BLOCK_N": 64},
+        ["BLOCK_K"],
+        True,
+    )
+
+
 def test_family_bounds_cu_first(tree, tuning):
     kernels, _, _, _ = tuning
     tree(

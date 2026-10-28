@@ -158,6 +158,19 @@ def resolve_installed(spec, shape, backend, cu_num=_DEVICE_CU):
     return gemm_config_utils._copy_gemm_config(config), is_tuned
 
 
+def installed_baseline(spec, shape, backend, keys, cu_num=None):
+    """The installed config of the scope a sweep installs into (cu_num as resolve_installed:
+    None is the CU-agnostic folder) -> (config with only `keys`, is_tuned, dropped keys,
+    explicit). explicit: launch the config itself, because the wrapper's config=None path
+    serves this device's lookup, which can be another scope's file, or keys were dropped.
+    """
+    installed, is_tuned = resolve_installed(spec, shape, backend, cu_num=cu_num)
+    config = {k: v for k, v in installed.items() if k in keys}
+    dropped = sorted(k for k in installed if k not in keys)
+    explicit = bool(dropped) or installed != resolve_installed(spec, shape, backend)[0]
+    return config, is_tuned, dropped, explicit
+
+
 def seed_table(spec, backend, shape_nk, cu_num=None):
     """(path, table) to install into: this shape's own file (the <cu_num>cu/ one first when
     cu_num is given), else a new DEFAULT_FALLBACK table. A DEFAULT_FALLBACK table without
