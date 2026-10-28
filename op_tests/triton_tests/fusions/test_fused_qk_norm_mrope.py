@@ -4,7 +4,10 @@
 import pytest
 import torch
 
-from aiter.ops.triton.fusions.fused_qk_norm_mrope import fused_qk_norm_mrope
+from aiter.ops.triton.fusions.fused_qk_norm_mrope import (
+    fused_qk_norm_mrope,
+    fused_qk_norm_mrope_cache,
+)
 from aiter.ops.triton.utils._triton import arch_info
 
 pytestmark = pytest.mark.skipif(
@@ -15,6 +18,8 @@ HEAD_DIM = 256
 ROPE_HALF = 32
 MAX_POS = 4096
 SECTION = [11, 11, 10]
+BLOCK = 16
+X = 8  # bf16 values in 16 bytes
 
 
 def make_inputs(num_tokens, q_heads, k_heads):
@@ -74,3 +79,61 @@ def test_fused_qk_norm_mrope(num_tokens, q_heads, k_heads):
     # One bf16 rounding of each output value.
     torch.testing.assert_close(q_out.float(), ref_q, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(k_out.float(), ref_k, atol=1e-2, rtol=1e-2)
+
+
+def make_cache_inputs(num_tokens, q_heads, k_heads):
+    inputs = make_inputs(num_tokens, q_heads, k_heads)
+    num_blocks = num_tokens // BLOCK + 4
+    # A V with strided rows, and a different slot for each token. Some tokens are pad tokens.
+    inputs["v"] = torch.randn(
+        (num_tokens, 2 * k_heads * HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+    )[:, : k_heads * HEAD_DIM]
+    # The last tokens have no slot (graph padding).
+    slots = torch.randperm(num_blocks * BLOCK, device="cuda")[
+        : num_tokens - num_tokens // 10
+    ]
+    slots[2::7] = -1
+    inputs["slot_mapping"] = slots
+    inputs["k_cache"] = torch.zeros(
+        (num_blocks, k_heads, HEAD_DIM // X, BLOCK, X),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    inputs["v_cache"] = torch.zeros(
+        (num_blocks, k_heads, BLOCK // X, HEAD_DIM, X),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    return inputs
+
+
+@pytest.mark.parametrize("num_tokens", [1, 37, 300])
+@pytest.mark.parametrize("q_heads, k_heads", [(4, 1), (16, 2)])
+def test_fused_qk_norm_mrope_cache(num_tokens, q_heads, k_heads):
+    inputs = make_cache_inputs(num_tokens, q_heads, k_heads)
+    q_out, k_out = fused_qk_norm_mrope_cache(**inputs)
+    ref_q = torch_ref(inputs["q"], inputs["q_weight"], q_heads, inputs)
+    ref_k = torch_ref(inputs["k"], inputs["k_weight"], k_heads, inputs)
+    torch.testing.assert_close(q_out.float(), ref_q, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_out.float(), ref_k, atol=1e-2, rtol=1e-2)
+
+    # The tokens with a slot fill their cache rows. All other rows stay zero.
+    slots = inputs["slot_mapping"]
+    written = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+    written[: len(slots)] = slots >= 0
+    blk, off = (
+        slots[written[: len(slots)]] // BLOCK,
+        slots[written[: len(slots)]] % BLOCK,
+    )
+    ref_k_cache = torch.zeros_like(inputs["k_cache"], dtype=torch.float32)
+    ref_k_cache[blk, :, :, off, :] = ref_k[written].unflatten(
+        -1, (k_heads, HEAD_DIM // X, X)
+    )
+    ref_v_cache = torch.zeros_like(inputs["v_cache"])
+    ref_v_cache[blk, :, off // X, :, off % X] = inputs["v"][written].unflatten(
+        -1, (k_heads, HEAD_DIM)
+    )
+    torch.testing.assert_close(
+        inputs["k_cache"].float(), ref_k_cache, atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(inputs["v_cache"], ref_v_cache, atol=0, rtol=0)
