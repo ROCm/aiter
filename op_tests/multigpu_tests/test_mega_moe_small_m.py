@@ -156,8 +156,6 @@ def run(args):
             ("c384_uneven", [336, 182, 280, 119, 224, 308, 154, 210][:world], 0),
             ("c384_padded", [448] * world, 160),
             ("c384_idle", [448, 0, 7, 0, 364, 1, 0, 280][:world], 0),
-            ("uniform672", [672] * world, 0),
-            ("uniform1024", [1024] * world, 0),
         ]
         cases = [c for c in cases if max(c[1]) <= moe.small_m_mtpr]
         failures = []
@@ -215,6 +213,80 @@ def run(args):
                     )
                 if not ok:
                     failures.append(f"acc {name} w{which}")
+
+        # ---- 1b. truly empty ranks and rank-local -1 slots -----------------
+        if not args.time_only:
+            bind(0, 0)
+            tpr = [0, 64, 0, 13, 64, 0, 40, 0][:world]
+            n = tpr[rank]
+            xi, wi, ii = x[:n].clone(), w[:n].clone(), ids[:n].clone()
+            if rank % 2:
+                # The combine input still holds the rows of the calls above: a -1 slot must not read them.
+                gen = torch.Generator(device=device).manual_seed(args.seed + rank)
+                ii[torch.rand(ii.shape, generator=gen, device=device) < 1 / 3] = -1
+            out = moe.forward_small_m(xi, wi, ii, max_tokens=max(tpr))[:n].clone()
+            _barrier()
+            ref = _reference(
+                xi,
+                wi,
+                ii,
+                refw[0],
+                rank,
+                world,
+                net["model_dim"],
+                net["inter_dim"],
+                experts,
+                net["swiglu_limit"],
+            )
+            rel_ref = _rel_l2(out, ref)
+            ok = rel_ref < args.rtol and _all_true(
+                bool(torch.isfinite(out).all()), device
+            )
+            if rank == 0:
+                print(
+                    f"[EDGE] empty_ranks+masked_slots tpr={tpr} relL2_vs_ref={rel_ref:.6f} "
+                    f"{'PASS' if ok else 'FAIL'}",
+                    flush=True,
+                )
+            if not ok:
+                failures.append("empty ranks / masked slots")
+            # Skewed routes: the rank holding the hot experts sends FP8 rows and reads cached weights, the others
+            # keep BF16 rows, so the combine reads both formats.
+            hot = torch.arange(topk, dtype=ids.dtype, device=device)
+            for name, n, share in (
+                ("hot60", 128, 3),
+                ("one_rank", 64, 5),
+                ("hot60", 448, 3),
+            ):
+                if n > moe.small_m_mtpr:
+                    continue
+                xi, wi, ii = x[:n].clone(), w[:n].clone(), ids[:n].clone()
+                ii[(torch.arange(n, device=device) % 5) < share] = hot
+                out = moe.forward_small_m(xi, wi, ii, max_tokens=n)[:n].clone()
+                _barrier()
+                ref = _reference(
+                    xi,
+                    wi,
+                    ii,
+                    refw[0],
+                    rank,
+                    world,
+                    net["model_dim"],
+                    net["inter_dim"],
+                    experts,
+                    net["swiglu_limit"],
+                )
+                rel_ref = _rel_l2(out, ref)
+                ok = rel_ref < args.rtol and _all_true(
+                    bool(torch.isfinite(out).all()), device
+                )
+                if rank == 0:
+                    print(
+                        f"[EDGE] {name} tpr={n} relL2_vs_ref={rel_ref:.6f} {'PASS' if ok else 'FAIL'}",
+                        flush=True,
+                    )
+                if not ok:
+                    failures.append(f"skewed {name} {n}")
 
         # ---- 2. layer rebinding + main/small-input alternation (eager) ------
         if args.time_only:

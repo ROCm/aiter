@@ -36,8 +36,8 @@ def _small_m_mtprs(mtprs) -> tuple[int, ...]:
     if not mtprs:
         raise ValueError("small_m_mtprs must not be empty")
     for m in mtprs:
-        if m <= 0 or m & (m - 1) or m > 1024:
-            raise ValueError(f"small_m_mtprs: {m} must be a power of two <= 1024")
+        if m <= 0 or m & (m - 1) or m > 512:
+            raise ValueError(f"small_m_mtprs: {m} must be a power of two <= 512")
     return tuple(mtprs)
 
 
@@ -54,6 +54,7 @@ def large_m_eligible(
     max_tok_per_rank: int,
     swiglu_limit: float,
     fanout_masks: tuple[int, ...] = (),
+    act: str = "silu",
 ) -> bool:
     """Whether the large-input path supports this layout (EP8 DeepSeek-V4 a8w4)."""
     return (
@@ -68,6 +69,7 @@ def large_m_eligible(
         and quant == "a8w4"
         and max_tok_per_rank == 8192
         and swiglu_limit == 10.0
+        and act == "silu"
         and not fanout_masks
     )
 
@@ -84,6 +86,7 @@ def small_m_eligible(
     quant: str,
     swiglu_limit: float,
     fanout_masks: tuple[int, ...] = (),
+    act: str = "silu",
 ) -> bool:
     """Whether the small-input path supports this layout (EP8 DeepSeek-V4 a8w4)."""
     return (
@@ -96,6 +99,7 @@ def small_m_eligible(
         and topk == 6
         and quant == "a8w4"
         and swiglu_limit == 10.0
+        and act == "silu"
         and not fanout_masks
     )
 
@@ -209,6 +213,7 @@ class MegaMoEV2:
             max_tok_per_rank=self.mtpr,
             swiglu_limit=self.swiglu_limit,
             fanout_masks=self._initial_fanout_masks,
+            act=self.act,
         ):
             large_m_args = {
                 "rank": self.rank,
@@ -244,6 +249,7 @@ class MegaMoEV2:
             quant=quant,
             swiglu_limit=self.swiglu_limit,
             fanout_masks=self._initial_fanout_masks,
+            act=self.act,
         ):
             from .mega_moe_small_m import SmallMRuntime
 
@@ -281,7 +287,8 @@ class MegaMoEV2:
         The caller must make the same main/small-input choice on every EP rank for a
         given call: the two paths share no protocol state. ``max_tokens`` is the
         DP-global max rows of this call and picks the runtime, so every rank
-        lands on the same instance; it defaults to the local row count.
+        lands on the same instance; it defaults to the local row count. ``topk_ids``
+        may contain -1 (skipped, contributing zero).
         """
         if self._small_m is None:
             raise RuntimeError("small-input path is not enabled (set AITER_MEGA_SMALL_M=1)")
@@ -308,16 +315,13 @@ class MegaMoEV2:
             raise RuntimeError("the large-input path is not available (set AITER_MEGA_LARGE_M=1)")
         self._large_m_on = bool(enabled)
 
-    def _get_large_m(self, run_tokens: int, mask_invalid_slots):
+    def _get_large_m(self):
         """The large-input runtime when it is enabled, else None (main path).
 
-        The choice never depends on this rank's ``run_tokens``. The large-input path has no
-        masked combine, so masked calls stay on main.
+        The choice depends on no per-rank input (token count, mask), so every rank takes the
+        same path. The large-input combine always skips invalid (-1) top-k slots.
         """
-        if not self._large_m_on or not 0 <= run_tokens <= self.mtpr:
-            return None
-        masked = self._combine_mask if mask_invalid_slots is None else mask_invalid_slots
-        return None if masked else self._large_m
+        return self._large_m if self._large_m_on else None
 
     def select_layer_state(self, layer_slot: int) -> None:
         """Select the large-input protocol state for a shared operator layer."""
@@ -1018,7 +1022,7 @@ class MegaMoEV2:
             raise ValueError("wts must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
-        large_m = self._get_large_m(run_tokens, mask_invalid_slots)
+        large_m = self._get_large_m()
         if large_m is not None:
             return large_m.forward(
                 x_bf16,
@@ -1068,7 +1072,7 @@ class MegaMoEV2:
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        large_m = self._get_large_m(run_tokens, mask_invalid_slots)
+        large_m = self._get_large_m()
         if large_m is not None:
             return large_m.forward_prequant(
                 x_q,

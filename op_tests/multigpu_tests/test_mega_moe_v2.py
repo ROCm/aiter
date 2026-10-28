@@ -440,6 +440,20 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         rel_l2 = _rel_l2(output, reference)
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
+    if args.expect_large_m:
+        _check_large_m_edges(
+            moe,
+            x,
+            weights,
+            ids,
+            eager_output,
+            ref_weights,
+            args,
+            rank,
+            world,
+            device,
+            0 < int(token_max.item()) <= args.accuracy_max_bs,
+        )
     if args.smoke_only:
         if args.layer_stress_cycles:
             _run_layer_slot_stress(
@@ -497,6 +511,92 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         )
     if args.pad_tail_rows:
         _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device)
+
+
+def _check_large_m_edges(
+    moe,
+    x,
+    weights,
+    ids,
+    eager_output,
+    ref_weights,
+    args,
+    rank,
+    world,
+    device,
+    check_mask,
+):
+    """Large-input path: explicit stream, rank-local mask and the SiLU-only gate."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import (
+        large_m_eligible,
+        small_m_eligible,
+    )
+
+    tokens = x.shape[0]
+    # A zero-input call first, so a quant buffer reused on the current stream holds other data.
+    moe(torch.zeros_like(x), weights, ids)
+    # Only the side stream waits for the inputs; the current stream is held back,
+    # so work left on it would run after the kernel.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    torch.cuda._sleep(50_000_000)
+    output = moe(x, weights, ids, stream=side)[:tokens]
+    torch.cuda.synchronize()
+    stream_exact = torch.equal(output, eager_output)
+    if not _reduce_float(stream_exact, device, dist.ReduceOp.MIN):
+        raise AssertionError(f"bs={tokens} explicit stream changed the output")
+    _barrier()
+
+    if check_mask:
+        # Rank 0 alone masks a third of its slots; the path choice must not depend on it.
+        masked_ids = ids.clone()
+        mask = rank == 0
+        if mask:
+            gen = torch.Generator(device=device).manual_seed(args.seed + 17)
+            drop = torch.rand(ids.shape, generator=gen, device=device) < 1 / 3
+            masked_ids[drop] = -1
+        output = moe(x, weights, masked_ids, mask_invalid_slots=mask)[:tokens].clone()
+        _barrier()
+        reference = _reference(
+            x,
+            weights,
+            masked_ids,
+            ref_weights,
+            rank,
+            world,
+            moe.model_dim,
+            moe.inter_dim,
+            moe.experts,
+            moe.swiglu_limit,
+            moe.act,
+            moe.situ_beta,
+            moe.situ_linear_beta,
+        )
+        rel_l2 = _rel_l2(output, reference)
+        if rel_l2 >= args.rtol:
+            raise AssertionError(f"bs={tokens} rank-local mask relL2={rel_l2:.6f}")
+
+    layout = {
+        "arch": "gfx950",
+        "world_size": 8,
+        "model_dim": 7168,
+        "inter_dim": 3072,
+        "experts": 384,
+        "topk": 6,
+        "quant": "a8w4",
+        "swiglu_limit": 10.0,
+    }
+    if not large_m_eligible(enabled=True, max_tok_per_rank=8192, **layout) or (
+        large_m_eligible(enabled=True, max_tok_per_rank=8192, act="situv2", **layout)
+        or small_m_eligible(enabled=True, act="situv2", **layout)
+    ):
+        raise AssertionError("the large/small-input paths must be gated to SiLU")
+    if rank == 0:
+        print(
+            f"[LARGE-M] bs={tokens} explicit_stream=PASS "
+            f"rank_local_mask={'PASS' if check_mask else 'SKIP'} silu_gate=PASS",
+            flush=True,
+        )
 
 
 def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device):

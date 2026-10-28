@@ -50,8 +50,8 @@ TOKEN_BUCKETS = (
     16384,
     32768,
 )
-# The small-input single kernel keeps fixed slots up to this MTPR.
-SMALL_M_FIXED_SLOT_MAX_MTPR = 1024
+# The small-input single kernel keeps fixed slots up to this MTPR (past it the main path is faster).
+SMALL_M_FIXED_SLOT_MAX_MTPR = 512
 # The large-input path runs on an instance of this MTPR only.
 LARGE_M_MTPR = 8192
 REFERENCE_EXPERTS_PER_RANK = 48
@@ -228,7 +228,7 @@ def select_mega_moe_config(
     model_dim: int = 7168,
     inter_dim: int = 3072,
 ) -> MegaMoEConfig:
-    """Small-input (fixed-slot, MTPR <= 1024) or large-input (MTPR 8192) config for ``tokens`` per rank."""
+    """Small-input (fixed-slot, MTPR <= 512) or large-input (MTPR 8192) config for ``tokens`` per rank."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
     if mtpr > SMALL_M_FIXED_SLOT_MAX_MTPR and mtpr != LARGE_M_MTPR:

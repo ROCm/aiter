@@ -4,7 +4,7 @@
 """MegaMoEV2 small-input path: quant, dispatch, GEMM1, GEMM2 and combine fused into one kernel.
 
 Dispatch writes each routed token straight into its expert's fixed slot on the destination rank; the
-runtime owns its buffers and protocol state and serves up to 1024 tokens per rank.
+runtime owns its buffers and protocol state and serves up to 512 tokens per rank.
 """
 
 import functools
@@ -17,6 +17,7 @@ import mori.ir.flydsl as mori_shmem
 import mori.shmem as ms
 import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -31,7 +32,7 @@ from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from ..tensor_shim import _run_compiled
-from .dispatch import _wave_inclusive_scan_i32
+from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .mega_moe_fused_gemm import (
     SMALL_M_FIXED_SLOT_MAX_MTPR,
     AddrBuffer,
@@ -92,7 +93,7 @@ class DispatchSlot(IntEnum):
     FC_INP = 31
     FC_OUT = 32
     FC_TRECV = 33
-    PLAN_NV = 34  # i64 (gate_epoch << 32 | num_valid): plan flag that carries num_valid
+    PLAN_NV = 34  # i64 (gate_epoch << 32 | row-count bits | num_valid): plan flag that carries num_valid
     XCD_ACQ = (
         35  # per-XCD i64 copy of PLAN_NV, republished after that XCD's L2 invalidation
     )
@@ -372,6 +373,10 @@ def emit_direct_fixed_slot_finalize(
         inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
         metadata_base = inclusive_tiles - num_expert_tiles
         total_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, fz_epr - 1))
+        routed_rows = fx.Int32(
+            fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(safe_count, lane), fz_epr - 1)
+        )
+        hot_expert = _wave_reduce_max_i32(safe_count, lane) >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
 
         if valid_expert:
             if no_overflow:
@@ -395,7 +400,14 @@ def emit_direct_fixed_slot_finalize(
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         comm_ops.fence_system_release()
         if lane == fx.Int32(0):
+            # Low 32 bits: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT / _PLAN_FP8_ROWS_BIT.
             nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
+            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))).select(
+                fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0)
+            )
+            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
+                fx.Int32(1 << _PLAN_FP8_ROWS_BIT), fx.Int32(0)
+            )
             comm_ops.store_i64_global_system(
                 plan_nv[0], (fx.Int64(plan_nv[1]) << fx.Int64(32)) | fx.Int64(nv_flag))
     fx.barrier()
@@ -404,11 +416,13 @@ def emit_direct_fixed_slot_finalize(
 # fmt: off
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
-    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", store_cm=2):
+    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", store_cm=2, fp8_rows=None):
 # fmt: on
     """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers.
 
     ``store_cm`` is the cache policy of the BF16 row stores (2 = NT).
+    ``p2p_quant_type="dynamic"``: the wave-uniform ``fp8_rows`` picks FP8 (1x32 E8M0) or BF16 rows at run time;
+    both use the BF16 row stride.
     """
     kMChunks = BM // 16
     numAccN = (BN // 4) // 16
@@ -422,11 +436,12 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         else None
     )
 
+    dynamic = p2p_quant_type == "dynamic"
     quant_fp8 = p2p_quant_type == "fp8_blockwise_1x32"
-    if p2p_quant_type not in ("none", "fp8_blockwise_1x32"):
+    if p2p_quant_type not in ("none", "fp8_blockwise_1x32", "dynamic"):
         raise ValueError(f"unsupported p2p_quant_type={p2p_quant_type!r}")
-    out_elem_bytes = 1 if quant_fp8 else 2
-    token_nbytes = N_OUT + N_OUT // 32 if quant_fp8 else N_OUT * out_elem_bytes
+    assert not (dynamic and g2_bf16_lds)
+    token_nbytes = N_OUT + N_OUT // 32 if quant_fp8 else N_OUT * 2
 
     fx.barrier()
 
@@ -485,7 +500,6 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         rsrc_dst = AddrBuffer(peer_base, comb_inp_nbytes)
         slot = dest_lid * fx.Int32(topk) + s
         row_base = slot * fx.Int32(token_nbytes)
-        row_off = row_base + n_block_idx * fx.Int32(BN * out_elem_bytes)
 
         # Inactive lanes read safe LDS and issue a bounded OOB store.
         active = lane < fx.Int32(BN // 8)
@@ -512,9 +526,9 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 )
             )
             weighted_v8 = fx.Vector.from_elements([v8[i] * weight for i in range_constexpr(8)], fx.Float32)
-            if const_expr(not quant_fp8):
-                pk = weighted_v8.to(fx.BFloat16)
-        if const_expr(quant_fp8):
+
+        def _store_fp8():
+            row_off = row_base + n_block_idx * fx.Int32(BN)
             vals = [fx.Float32(weighted_v8[i]) for i in range_constexpr(8)]
             local_max = fabs_f32(vals[0])
             for q in range_constexpr(1, 8):
@@ -590,36 +604,63 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                     store_at(e8m0.to(fx.Int8), rsrc_dst, scale_off, 2, offset_is_bytes=True)
 
             store_scale_if_leader()
-        else:
+
+        def _store_bf16(pk):
+            row_off = row_base + n_block_idx * fx.Int32(BN * 2)
             off = (valid & active).select(
-                row_off + col * fx.Int32(out_elem_bytes),
+                row_off + col * fx.Int32(2),
                 fx.Int32(comb_inp_nbytes),
             )
             store_at(pk.ir_value(), rsrc_dst, off, store_cm, offset_is_bytes=True)
 
+        if const_expr(dynamic):
 
-def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, N_OUT, flag_is_value=False, l1_acquire=False):
+            @flyc.jit
+            def store_dynamic():
+                if fp8_rows != fx.Int32(0):
+                    _store_fp8()
+                else:
+                    _store_bf16(weighted_v8.to(fx.BFloat16))
+
+            store_dynamic()
+        elif const_expr(quant_fp8):
+            _store_fp8()
+        else:
+            _store_bf16(pk if const_expr(g2_bf16_lds) else weighted_v8.to(fx.BFloat16))
+
+
+def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_experts, experts_per_rank, N_OUT,
+    flag_is_value=False, l1_acquire=False, row_format=False):
     """Combine after this WG's P2P scatter: grid ticket, cross-device flag, reduce by the last WGs.
 
     ``flag_is_value``: ``arg_flag`` is this launch's flag itself (identical on every rank) instead of the address
     of a counter the last WG advances.
     ``l1_acquire``: the reducers acquire the peers' rows by dropping only the CU's L1. Valid when the combine input
     lives in the uncached shmem heap (never held in L2) and the local rows were released by the last WG.
+    ``row_format``: each rank sent its rows as BF16 or FP8 (1x32 E8M0 scales after the values, BF16 row stride),
+    as ``i32_fp8_rows`` says; the choice travels as the low bit of the published flag.
 
-    Matches ep_combine_intranode(skip_stage1=True, bf16): out[t] = bf16(sum_k f32(inp[t * topk + k])).
+    Matches ep_combine_intranode(skip_stage1=True, bf16): out[t] = bf16(sum_k f32(inp[t * topk + k])), where an
+    invalid (-1) slot ``k`` of ``idx`` contributes zero.
     """
     row_i32 = N_OUT * 2 // 4
     chunks = row_i32 // 256
     assert row_i32 % 256 == 0
+    assert flag_is_value or not row_format
 
     # fmt: off
     @flyc.jit
     def fused_combine_tail(tx_i32: fx.Int32, lane: fx.Int32, wave: fx.Int32, arg_cnt: fx.Int64, arg_flag: fx.Int64,
         arg_xdb: fx.Int64, arg_p2p_xdb: fx.Int64, arg_inp: fx.Int64, arg_out: fx.Int64, arg_trecv: fx.Int64,
-        i32_cur_tok: fx.Int32, i32_grid: fx.Int32):
+        arg_idx: fx.Int64, i32_cur_tok: fx.Int32, i32_grid: fx.Int32, i32_fp8_rows: fx.Int32):
     # fmt: on
         ticket_ptr = lds_typed_ptr(fx.Int32(lds_fc_off), T.i32, align=4)
         flag_ptr = lds_typed_ptr(fx.Int32(lds_fc_off + 8), T.i64, align=8)
+
+        def fmt_ptr(peer):
+            # One word per peer: its format bit, already shifted to the peer's position.
+            return lds_typed_ptr(fx.Int32(lds_fc_off + 16) + peer * fx.Int32(4), T.i32, align=4)
+
         last = i32_grid - fx.Int32(1)
         # Every wave waits for its own P2P stores before the WG takes its ticket.
         rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -627,6 +668,8 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, N_OUT, fl
         if tx_i32 == fx.Int32(0):
             if const_expr(flag_is_value):
                 flag_lane = arg_flag
+                if const_expr(row_format):
+                    flag_lane = (arg_flag << fx.Int64(1)) | fx.Int64(i32_fp8_rows)
             else:
                 flag_lane = fx.Int64(comm_ops.load_i64_global(arg_flag))
             # The P2P rows target the uncached shmem heap, so store completion makes them visible to peers
@@ -654,13 +697,24 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, N_OUT, fl
         first = i32_grid - nred
         if fx.Int32(ticket) >= first:
             if tx_i32 < fx.Int32(npes):
-                mori_shmem.uint64_wait_until_equals(arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), flag)
+                if const_expr(row_format):
+                    # Any format bit of this launch's flag; earlier launches published smaller values.
+                    seen = fx.Int64(mori_shmem.uint64_wait_until_greater_than(
+                        arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), (arg_flag << fx.Int64(1)) - fx.Int64(1)))
+                    fx.ptr_store(fx.Int32(seen & fx.Int64(1)) << tx_i32, fmt_ptr(tx_i32))
+                else:
+                    mori_shmem.uint64_wait_until_equals(arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), flag)
                 if const_expr(l1_acquire):
                     comm_ops.invalidate_l1()
                 else:
                     comm_ops.fence_system_acquire()
             fx.barrier()
+            fp8_peers = fx.Int32(0)
+            if const_expr(row_format):
+                for peer in range_constexpr(npes):
+                    fp8_peers = fp8_peers | fx.Int32(fx.ptr_load(fmt_ptr(fx.Int32(peer)), result_type=T.i32))
             inp_rsrc = AddrBuffer(arg_inp)
+            idx_rsrc = AddrBuffer(arg_idx)
             out_rsrc = AddrBuffer(arg_out)
             items = i32_cur_tok * fx.Int32(chunks)
             worker = (fx.Int32(ticket) - first) * fx.Int32(4) + wave
@@ -668,14 +722,48 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, N_OUT, fl
                 tok = item // fx.Int32(chunks)
                 col = (item - tok * fx.Int32(chunks)) * fx.Int32(256) + lane * fx.Int32(4)
                 src = tok * fx.Int32(topk * row_i32) + col
-                vals = [
-                    load_at(inp_rsrc, src + fx.Int32(k * row_i32), fx.Int32, 4, 2)
-                    for k in range_constexpr(topk)
-                ]
-                acc = fx.Vector(vals[0]).bitcast(fx.BFloat16).to(fx.Float32)
-                for k in range_constexpr(1, topk):
-                    acc = acc + fx.Vector(vals[k]).bitcast(fx.BFloat16).to(fx.Float32)
-                store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
+                # The id and row loads issue together; the row of an invalid (-1) slot is never written this
+                # launch, so it is zeroed after the load instead of gating the load on the id.
+                eids = [load_at(idx_rsrc, tok * fx.Int32(topk) + fx.Int32(k), fx.Int32, 1) for k in range_constexpr(topk)]
+                if fp8_peers == fx.Int32(0):
+                    vals = [load_at(inp_rsrc, src + fx.Int32(k * row_i32), fx.Int32, 4, 2) for k in range_constexpr(topk)]
+                    acc = Vec.filled(8, 0.0, fx.Float32)
+                    for k in range_constexpr(topk):
+                        valid = (eids[k] >= fx.Int32(0)) & (eids[k] < fx.Int32(total_experts))
+                        words = fx.Vector(vals[k])
+                        words = fx.Vector.from_elements(
+                            [valid.select(words[w], fx.Int32(0)) for w in range_constexpr(4)], fx.Int32
+                        )
+                        acc = acc + words.bitcast(fx.BFloat16).to(fx.Float32)
+                    store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
+                else:
+                    # Some peer sent FP8 rows: the lane's 8 values are 2 i32 of its FP8 row (byte col * 2) plus the
+                    # scale byte of their 32-value block.
+                    acc = Vec.filled(8, 0.0, fx.Float32)
+                    sc_byte = col // fx.Int32(16)
+                    for k in range_constexpr(topk):
+                        valid = (eids[k] >= fx.Int32(0)) & (eids[k] < fx.Int32(total_experts))
+                        peer = valid.select(eids[k], fx.Int32(0)) // fx.Int32(experts_per_rank)
+                        row_k = src - col + fx.Int32(k * row_i32)
+                        contrib = Vec.filled(8, 0.0, fx.Float32)
+                        if valid:
+                            if ((fp8_peers >> peer) & fx.Int32(1)) != fx.Int32(0):
+                                words = fx.Vector(load_at(inp_rsrc, row_k + col // fx.Int32(2), fx.Int32, 2, 2))
+                                sc_word = load_at(inp_rsrc, row_k + fx.Int32(N_OUT // 4) + sc_byte // fx.Int32(4),
+                                    fx.Int32, 1, 2)
+                                e8m0 = (sc_word >> ((sc_byte & fx.Int32(3)) * fx.Int32(8))) & fx.Int32(0xFF)
+                                scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+                                quads = []
+                                for w in range_constexpr(2):
+                                    lo = cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=words[w], word_sel=False)
+                                    hi = cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=words[w], word_sel=True)
+                                    quads.append(lo.shuffle(hi, [0, 1, 2, 3]) * scale)
+                                contrib = quads[0].shuffle(quads[1], [0, 1, 2, 3, 4, 5, 6, 7])
+                            else:
+                                words = fx.Vector(load_at(inp_rsrc, row_k + col, fx.Int32, 4, 2))
+                                contrib = words.bitcast(fx.BFloat16).to(fx.Float32)
+                        acc = acc + contrib
+                    store_at(acc.to(fx.BFloat16).bitcast(fx.Int32).ir_value(), out_rsrc, tok * fx.Int32(row_i32) + col, 2)
 
     return fused_combine_tail
 
@@ -687,12 +775,14 @@ def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False):
     weight = packed + BM * 4
     peer = weight + BM * 4
     fc = peer + npes * 8
-    return {"packed": packed, "weight": weight, "peer": peer, "fc": fc, "bytes": fc + 16}
+    # fc: ticket (4 B), flag (8 B at +8), one format word per peer (at +16).
+    return {"packed": packed, "weight": weight, "peer": peer, "fc": fc, "bytes": fc + 16 + npes * 4}
 
 
 # fmt: off
 def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhoist, g2_ascale_pf, expert_offset,
-    npes, topk, N_OUT, max_tok, recv_cap, comb_inp_nbytes, clamp_a, store_cm=2, row_mask=False):
+    npes, topk, N_OUT, max_tok, recv_cap, comb_inp_nbytes, clamp_a, store_cm=2, row_mask=False,
+    p2p_quant_type="none"):
 # fmt: on
     """One stage2 tile (m_block, n_block) as a jit helper, for kernels that run GEMM2 after their own phase.
 
@@ -712,7 +802,7 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
     def g2_tile(lds_base_i32: fx.Int32, tx_i32: fx.Int32, lane: fx.Int32, wave: fx.Int32, m_block: fx.Int32,
         n_block: fx.Int32, arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
         arg_eids: fx.Int64, arg_stids: fx.Int64, arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_tile_rows: fx.Int64,
-        i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32):
+        i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_fp8_rows: fx.Int32):
     # fmt: on
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)
@@ -744,7 +834,8 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
         p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT, BM=BM, BN=BN, npes=npes,
             topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=max_tok - 1, recv_cap=recv_cap,
             comb_inp_nbytes=comb_inp_nbytes, lds_packed_off=lay["packed"], lds_weight_off=lay["weight"],
-            lds_peer_off=lay["peer"], g2_bf16_lds=False, p2p_quant_type="none", store_cm=store_cm)
+            lds_peer_off=lay["peer"], g2_bf16_lds=False, p2p_quant_type=p2p_quant_type, store_cm=store_cm,
+            fp8_rows=i32_fp8_rows)
         # fmt: on
 
     return g2_tile, lay
@@ -852,12 +943,19 @@ def compile_mega_moe_stage1(
         a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
-        clamp_a=True, store_cm=0, row_mask=True,
+        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic",
+    )
+    g2_tile_cached, _ = make_g2_tile_runner(
+        BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=False, INTER_MAX=inter_dim,
+        a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
+        npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
+        recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
+        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic",
     )
     # The combine input is in the uncached shmem heap: the reducers only need to drop their L1.
     fused_combine_tail = make_fused_combine_tail(lds_fc_off=g2_lay["fc"], reducers=fused_reducers,
-        npes=int(fuse_npes), rank=int(rank), topk=int(fuse_topk), N_OUT=model_dim, flag_is_value=True,
-        l1_acquire=True)
+        npes=int(fuse_npes), rank=int(rank), topk=int(fuse_topk), total_experts=fz_total_experts,
+        experts_per_rank=fz_epr, N_OUT=model_dim, flag_is_value=True, l1_acquire=True, row_format=True)
     g2_scratch_off = g2_lay["bytes"]
     lds_pool_bytes = max(lds_pool_bytes, (g2_scratch_off + 16 + 15) // 16 * 16)
     # The combine reducers spin until every CTA has taken its ticket, so no CTA may still be waiting for a
@@ -1049,6 +1147,25 @@ def compile_mega_moe_stage1(
             rows_rsrc=_make_buffer_from_addr(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
             lookahead=1,
         )
+        # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
+        # reuse it, while the other ranks keep streaming W1 once per tile.
+        if const_expr(b_cache_modifier != 0):
+            _, _do_cached_tile = build_fused_gemm1(
+                x_tensor=x, w_rsrc=w_rsrc,
+                sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
+                trb_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
+                a_buf=a_buf, a_scale_lds=a_scale_lds, c_tile=c_tile,
+                model_dim=model_dim, inter_dim=inter_dim, sort_block_m=sort_block_m,
+                tile_n=tile_n, num_waves=NUM_WAVES, n_per_wave=n_per_wave, wave_id=wave_id,
+                m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N, a_k_step_bytes=A_K_STEP_BYTES,
+                total_threads=TOTAL_THREADS, k_iters=K_ITERS, a_lds_i32=a_lds_i32,
+                n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=0,
+                swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
+                async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
+                swiglu_limit=swiglu_limit,
+                rows_rsrc=_make_buffer_from_addr(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
+                lookahead=1,
+            )
 
         a_g2_cnt = _disp_ptr(DispatchSlot.G2_CNT)
         a_g2_ready = _disp_ptr(DispatchSlot.G2_READY)
@@ -1090,7 +1207,9 @@ def compile_mega_moe_stage1(
                 comm_ops.invalidate_l1()
             fx.ptr_store(fx.Int32(plan_word & fx.Int64(0xFFFFFFFF)), nv_ptr)
         fx.barrier()
-        num_valid = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(nv_ptr).ir_value()))
+        plan_low = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(nv_ptr).ir_value()))
+        num_valid = plan_low & fx.Int32((1 << _PLAN_CACHED_W_BIT) - 1)
+        cached_w = (plan_low >> fx.Int32(_PLAN_CACHED_W_BIT)) & fx.Int32(1)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
         total_work = num_m_tiles * fx.Int32(N_TILES)
 
@@ -1165,7 +1284,13 @@ def compile_mega_moe_stage1(
             work = Vec(work_scratch_view.load())[0]
             has_work = (work < total_work).select(fx.Int32(1), fx.Int32(0))
             if has_work != fx.Int32(0):
-                _do_scheduled_tile(work)
+                if const_expr(b_cache_modifier != 0):
+                    if cached_w != fx.Int32(0):
+                        _do_cached_tile(work)
+                    else:
+                        _do_scheduled_tile(work)
+                else:
+                    _do_scheduled_tile(work)
                 # Same-XCD handoff: store completion puts the tile in the shared L2; the next work fetch
                 # counts it and the last of the m-tile's N_TILES CTAs raises its ready epoch.
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -1185,6 +1310,9 @@ def compile_mega_moe_stage1(
         g2_head = a_work_head + fx.Int64(work_shard) * fx.Int64(64)
         g2_active = fx.Int32(1) == fx.Int32(1)
         g2_fetch = fx.Int32(0)
+        # A rank that receives many rows sends its GEMM2 rows as FP8: they halve the traffic it would otherwise
+        # spend most of its GEMM2 sending; the other ranks keep BF16 rows.
+        fp8_rows = (plan_low >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)
         while g2_active:
             fx.barrier()
             if tid == fx.Int32(0):
@@ -1204,9 +1332,15 @@ def compile_mega_moe_stage1(
                 # to memory by the other XCD into lines this XCD has not cached, before it was counted: only the
                 # CU's L1 can be stale.
                 comm_ops.invalidate_l1()
-                g2_tile(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq, g2_bscale,
-                    g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks, fx.Int32(inter_dim),
-                    fx.Int32(model_dim))
+                # As in GEMM1, a rank that receives many rows reads W2 through the cache.
+                if cached_w != fx.Int32(0):
+                    g2_tile_cached(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
+                        g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
+                        fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows)
+                else:
+                    g2_tile(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq, g2_bscale,
+                        g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks, fx.Int32(inter_dim),
+                        fx.Int32(model_dim), fp8_rows)
             g2_active = g2_local < g2_units
             g2_fetch = fx.Int32(1)
         # The entry-ticket epoch is the same on every rank and needs no load; the high bit keeps it apart from
@@ -1214,8 +1348,8 @@ def compile_mega_moe_stage1(
         fc_flag = fx.Int64(gate_epoch) + fx.Int64(1 << 40)
         fused_combine_tail(tid, g2_lane, g2_wave, _disp_ptr(DispatchSlot.FC_CNT), fc_flag,
             _disp_ptr(DispatchSlot.FC_XDB), _disp_ptr(DispatchSlot.FC_P2P_XDB), _disp_ptr(DispatchSlot.FC_INP),
-            _disp_ptr(DispatchSlot.FC_OUT), _disp_ptr(DispatchSlot.FC_TRECV), i32_cur_tok,
-            fx.Int32(launch_grid_x))
+            _disp_ptr(DispatchSlot.FC_OUT), _disp_ptr(DispatchSlot.FC_TRECV), addr_in_idx, i32_cur_tok,
+            fx.Int32(launch_grid_x), fp8_rows)
 
     @flyc.jit
     def launch(
@@ -1267,10 +1401,23 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
 _COMBINE_REDUCERS = 256
 # Token bucket from which the expert m-tile is 64 rows instead of 32.
 _BM64_MIN_BUCKET = 256
+# Routed rows a rank receives (before tile padding) from which the streaming GEMM1 / GEMM2 bodies give way to
+# cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
+# cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688).
+_CACHED_W_MIN_ROWS = 2560
+# Routed rows a rank receives from which its GEMM2 sends FP8 rows (1x32 E8M0 scales, the numerics of the main
+# path) to the combine instead of BF16: above the 3072 rows of uniform routing at 512 tokens.
+_FP8_ROWS_MIN_ROWS = 3584
+# Rows of a rank's largest expert from which the rank also takes both of the above: its rows sit in a few experts
+# (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
+_HOT_EXPERT_MIN_ROWS = 256
+# Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29).
+_PLAN_CACHED_W_BIT = 29
+_PLAN_FP8_ROWS_BIT = 30
 
 
 class SmallMRuntime:
-    """Small-input single-kernel MegaMoE (MTPR <= 1024) with one in-flight launch per instance.
+    """Small-input single-kernel MegaMoE (MTPR <= 512) with one in-flight launch per instance.
 
     Owns its own dispatch/combine buffers and protocol state; weights are bound
     by pointer so one instance serves every layer.
@@ -1306,6 +1453,13 @@ class SmallMRuntime:
         self._reducers = _COMBINE_REDUCERS
         self.max_recv = self.world_size * self.mtpr
         self._s1_scale_dim = self.model_dim // 32
+        # A 0-row rank passes this 1-row stand-in (invalid expert ids): the kernel reads row 0 of its inputs
+        # before checking the token count.
+        self._idle_inputs = (
+            torch.zeros((1, self.model_dim), dtype=torch.bfloat16, device=self.dev),
+            torch.zeros((1, self.topk), dtype=torch.float32, device=self.dev),
+            torch.full((1, self.topk), self.experts, dtype=torch.int32, device=self.dev),
+        )
         # fmt: off
         self.comb_cfg = FlyDSLDispatchCombineConfig(rank=self.rank, world_size=self.world_size,
             hidden_dim=self.model_dim, max_num_inp_token_per_rank=self.mtpr, num_experts_per_rank=self.epr,
@@ -1476,6 +1630,8 @@ class SmallMRuntime:
             raise ValueError("topk_ids must be contiguous int32")
         if tuple(topk_ids.shape) != (run_tokens, self.topk):
             raise ValueError(f"topk_ids must have shape ({run_tokens}, {self.topk})")
+        if run_tokens == 0:
+            x_bf16, wts, topk_ids = self._idle_inputs
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
         elif hasattr(stream, "cuda_stream"):
