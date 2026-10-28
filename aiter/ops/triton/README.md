@@ -149,7 +149,8 @@ or `normalization`.
 
 The suffix depends on the family. For example, GEMM files use
 `N=<N>-K=<K>`, batched GEMM files use `B=<B>-N=<N>-K=<K>` and MHC files use
-`C=<C>`. Some families use a custom suffix.
+`C=<C>`. Some families use a custom suffix. MHA forward files use
+`DQ=<d>-DV=<d>-CAUSAL=<0|1>` (see [`configs/AGENTS.md`](configs/AGENTS.md)).
 
 Example: `configs/gfx950/triton/gemm/gemm_a16w16/GEMM-A16W16-N=256-K=7168.json`.
 `<d_type>` is the config name in lowercase, with `_` in place of `-`. A GEMM

@@ -140,6 +140,9 @@ Do not flag:
   archs, also on gfx1250.
 - A specialized file with `"DEFAULT_FALLBACK": true` that has only some
   buckets. The loader takes the other buckets from `DEFAULT.json`.
+- An MHA forward shape file (`MHA-DQ=<d>-DV=<d>-CAUSAL=<0|1>.json`) with
+  `SK_LEQ_<x>` buckets and no `"any"`. A key past the largest bucket gets
+  the `DEFAULT.json` rules. See `configs/AGENTS.md`, "MHA forward".
 
 In MOE dispatch tables, flag:
 

@@ -42,7 +42,7 @@ from _utils import (
     results_path,
     shape_from_args,
 )
-from kernels import get_spec
+from kernels import KERNELS, get_spec
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FINAL_ROUND_SIZE = 10
@@ -56,8 +56,7 @@ def parse_args(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("kernel", type=get_spec)
-    add_shape_args(parser, with_m=False)
-    parser.add_argument("--M", type=int, nargs="+", help="M values to sweep")
+    add_shape_args(parser, KERNELS.values(), multi_m=True)
     parser.add_argument(
         "--all-buckets",
         action="store_true",
@@ -102,8 +101,9 @@ def parse_args(argv=None):
         parser.error("--batch must be positive")
     if len(set(args.gpu)) != len(args.gpu):
         parser.error("--gpu values must be distinct: one worker per GPU")
-    if bool(args.M) == args.all_buckets:
-        parser.error("give --M values or --all-buckets, not both")
+    bucket_dim = args.kernel.bucket_dim
+    if bool(getattr(args, bucket_dim)) == args.all_buckets:
+        parser.error(f"give --{bucket_dim} values or --all-buckets, not both")
     return args
 
 
@@ -155,14 +155,14 @@ def all_bucket_ms(spec, args, gpu):
     """Every bucket of the family up to TOP_BUCKET_M; "any" is DEFAULT.json's, never swept."""
     first = plan(
         spec,
-        shape_from_args(args, spec.dims, 1),
+        shape_from_args(args, spec, 1),
         args.backend,
         gpu,
         args.runs_dir,
         args.setup_timeout,
     )
     ms = [b for b in first["bounds"] if b <= TOP_BUCKET_M]
-    print(f"all buckets: M = {ms}", flush=True)
+    print(f"all buckets: {spec.bucket_dim} = {ms}", flush=True)
     return ms
 
 
@@ -395,13 +395,9 @@ def install(spec, args, backend, gpu):
         sys.executable,
         os.path.join(HERE, "write_best_configs.py"),
         spec.name,
-        "--N",
-        str(args.N),
-        "--K",
-        str(args.K),
     ]
-    if "B" in spec.dims:
-        command += ["--B", str(args.B)]
+    for dim, value in shape_from_args(args, spec, with_m=False).items():
+        command += [f"--{dim}", str(value)]
     command += ["--backend", backend, "--runs-dir", args.runs_dir]
     print("\ninstalling:", " ".join(command[1:]), flush=True)
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
@@ -413,8 +409,8 @@ def main(argv=None):
     spec, gpus = args.kernel, args.gpu
     os.makedirs(args.runs_dir, exist_ok=True)
 
-    for M in args.M or all_bucket_ms(spec, args, gpus[0]):
-        shape = shape_from_args(args, spec.dims, M)
+    for M in getattr(args, spec.bucket_dim) or all_bucket_ms(spec, args, gpus[0]):
+        shape = shape_from_args(args, spec, M)
         plan_ = plan(
             spec, shape, args.backend, gpus[0], args.runs_dir, args.setup_timeout
         )

@@ -121,6 +121,13 @@ through `get_gemm_config` and must come back `is_tuned`; if not, the previous fi
 the command fails.
 Config reads are cached per process, so restart Python to pick up a new file.
 
+## MHA forward (proposal)
+
+`mha_varlen_fwd` tunes the bf16 Triton varlen forward. `--SK` plays the part of `--M`; the installer
+writes `SK_LEQ_<x>` buckets into `MHA-DQ=..-DV=..-CAUSAL=..json` (see `configs/AGENTS.md`):
+
+    python3 sweep_configs.py mha_varlen_fwd --Z 2 --HQ 8 --HK 8 --SQ 2048 --SK 2048 --DQ 128 --DV 128 --CAUSAL 1 --gpu 0
+
 ## Adding a kernel or a key
 
 Kernel: add one function to `kernels.py`, decorated with `@kernel(<config family>, ...)` giving the

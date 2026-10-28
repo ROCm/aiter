@@ -37,12 +37,13 @@ here. Update this file in the same change as any behaviour change.
 5. The installed file is seeded with this shape's file if it exists (keeping every bucket it does
    not replace), else it starts with only `"DEFAULT_FALLBACK": true` and `DEFAULT.json`'s
    `M_BOUNDS`: never copy untuned buckets (another shape's or `DEFAULT.json`'s) into a shape file.
+   M here and below is the family's `bucket_dim` (`SK` for MHA).
    The loader serves the buckets a `DEFAULT_FALLBACK` file lacks from `DEFAULT.json`. Bounds: the
    kernel's explicit `bounds`, else the seed's `M_BOUNDS`, else `STANDARD_M_BOUNDS`.
    `--all-buckets` only chooses the M list (the family's buckets up to `TOP_BUCKET_M`, 8192). Ms
-   above the largest bound are not tuned. Every installed file ships an `any`: a copy of
+   above the largest bound are not tuned. Every installed GEMM file ships an `any`: a copy of
    `DEFAULT.json`'s `any`, rewritten on every install (the one bucket copied from `DEFAULT.json`;
-   a tuned small-M tile as fallback breaks kernels such as MXFP4 preshuffle at M >= 32).
+   a tuned small-M tile as fallback breaks kernels such as MXFP4 preshuffle at M >= 32). MHA has none.
    `DEFAULT.json` is never written, so its `any` never changes; only `M_LEQ_*` buckets are tuned;
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is
@@ -84,6 +85,9 @@ generator, preallocates the output, and returns `(call, inputs, should_skip)`;
 resets and derived keys live in `call`. Keep everything about a kernel inside that one function;
 the `kernels.py` docstring has a complete example. Then run the checks below.
 
+A non-GEMM family also sets the `KernelSpec` fields that default to GEMM and adds its values to
+`OP_SEARCH_SPACE`; `should_skip_generic` is GEMM only. `mha_varlen_fwd` is the example.
+
 ## Adding a key
 
 Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothing else.
@@ -107,6 +111,7 @@ Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothin
     python3 sweep_configs.py gemm_afp4wfp4_preshuffle --M 4 64 --N 256 --K 512 --gpu 0 --runs-dir /tmp/runs
     python3 sweep_configs.py gemm_afp4wfp4_preshuffle --all-buckets --N 256 --K 512 --gpu 0 1 2 3 --runs-dir /tmp/runs2
     python3 verify_configs.py gemm_afp4wfp4_preshuffle --M 64 --N 256 --K 512 --expect-tuned
+    HIP_VISIBLE_DEVICES=0 python3 harness.py mha_varlen_fwd --Z 2 --HQ 8 --HK 8 --SQ 2048 --SK 2048 --DQ 128 --DV 128 --CAUSAL 1 --plan --space-out /tmp/m.json
     # then delete the test file configs/gfx1250/gluon/gemm/gemm_afp4wfp4_preshuffled/GEMM-AFP4WFP4_PRESHUFFLED-N=256-K=512.json
 
 ## Do not

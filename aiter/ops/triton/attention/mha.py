@@ -221,6 +221,44 @@ def check_gluon_forward_support(**feature_flags) -> None:
         raise ValueError(reason)
 
 
+def get_mha_fwd_config(
+    dtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_v: int,
+    *,
+    causal: bool = False,
+    dropout_p: float = 0.0,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    batch_heads: int | None = None,
+    backend: Literal["triton", "gluon"] | None = "triton",
+) -> dict[str, any]:
+    """The tile the Triton or Gluon forward runs when ``config`` is None.
+
+    Both forwards resolve their tile through this, so it matches what runs.
+    ``batch_heads`` is batch * num_q_heads. Gluon reads only the dtype and
+    head dims. Under ``mha_set_impl("dao_ai")`` the forward ignores the tile.
+    """
+    backend = _resolve_backend(backend)
+    has_pe = head_dim_qk > head_dim_v
+    if backend == "gluon":
+        is_fp8 = types._is_fp8(torch.empty(0, dtype=dtype))
+        return dict(_get_gluon_config(is_fp8=is_fp8, has_pe=has_pe))
+    return dict(
+        _get_config(
+            dropout_p > 0.0,
+            dtype,
+            has_pe=has_pe,
+            head_dim_v=head_dim_v,
+            causal=bool(causal),
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            batch_heads=batch_heads,
+            head_dim_qk=head_dim_qk,
+        )
+    )
+
+
 def _get_softmax_scale(q: torch.Tensor, softmax_scale: float | None) -> float:
     return q.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
 
@@ -315,7 +353,9 @@ def _gluon_flash_attn_forward(
         )
 
     if config is None:
-        config = _get_gluon_config(is_fp8=IS_FP8, has_pe=pe_head_dim > 0)
+        config = get_mha_fwd_config(
+            q.dtype, qk_head_dim, v_head_dim, causal=causal, backend="gluon"
+        )
     config = dict(config)
     BLOCK_M = config.pop("BLOCK_M")
     BLOCK_N = config.pop("BLOCK_N")
@@ -685,12 +725,12 @@ def _flash_attn_forward(
             ), f"dao_ai softmax_lse shape {softmax_lse.shape} != expected (batch={batch}, nheads={num_q_heads}, ...)"
     else:
         if config is None:
-            config = _get_config(
-                enable_dropout,
+            config = get_mha_fwd_config(
                 q.dtype,
-                has_pe=pe_head_dim > 0,
-                head_dim_v=v_head_dim,
-                causal=bool(causal),
+                qk_head_dim,
+                v_head_dim,
+                causal=causal,
+                dropout_p=dropout_p,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
                 batch_heads=batch * num_q_heads,

@@ -15,7 +15,14 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     remap_xcd,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -937,6 +944,33 @@ def _attn_fwd(
     tl.store(out_ptr + offs_out, op, mask=out_mask)
 
 
+def _get_shape_config(
+    cfg_dir: str,
+    head_dim_qk: int,
+    head_dim_v: int,
+    causal: bool,
+    max_seqlen_k: int,
+) -> dict | None:
+    """The tile of this shape's ``SK_LEQ_<x>`` file, or None to use DEFAULT.json."""
+    name = f"MHA-DQ={head_dim_qk}-DV={head_dim_v}-CAUSAL={int(causal)}.json"
+    table = load_config_json(f"{cfg_dir}/{name}", required=False)
+    if table is None:
+        return None
+    buckets = {}
+    for key, tile in table.items():
+        bound = key.removeprefix("SK_LEQ_")
+        if key == "any" or (bound != key and bound.isdigit()):
+            buckets[key] = tile
+        elif bound != key:
+            _LOGGER.warning(
+                "%s: skipping bucket %r, its bound is not an integer", name, key
+            )
+    bounds = [int(key.removeprefix("SK_LEQ_")) for key in buckets if key != "any"]
+    if "any" not in buckets and max_seqlen_k > max(bounds, default=-1):
+        return None
+    return select_leq_config(buckets, max_seqlen_k, prefix="SK_LEQ_")
+
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     enable_dropout: bool,
@@ -947,8 +981,20 @@ def _get_config(
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     batch_heads: int | None = None,
+    head_dim_qk: int | None = None,
 ):
     cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+    # Shape files hold tiles the harness tuned, and it times bf16 only.
+    if (
+        None not in (head_dim_qk, head_dim_v, max_seqlen_k)
+        and not enable_dropout
+        and dtype == torch.bfloat16
+    ):
+        tuned = _get_shape_config(
+            cfg_dir, head_dim_qk, head_dim_v, causal, max_seqlen_k
+        )
+        if tuned is not None:
+            return tuned
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
     fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
