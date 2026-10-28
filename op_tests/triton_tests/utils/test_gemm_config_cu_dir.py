@@ -103,3 +103,85 @@ def test_get_config_cu_num_unreadable(monkeypatch):
         assert config_utils.get_config_cu_num() is None
     finally:
         config_utils.get_config_cu_num.cache_clear()
+
+
+@pytest.fixture
+def tuning(monkeypatch):
+    import os
+    import sys
+
+    import aiter
+
+    tuning_dir = os.path.join(
+        aiter.__path__[0], "ops", "triton", "utils", "_triton", "tuning"
+    )
+    monkeypatch.syspath_prepend(tuning_dir)
+    import kernels
+    import space
+    import sweep_configs
+    import write_best_configs
+
+    yield kernels, space, sweep_configs, write_best_configs
+    for name in ("kernels", "space", "sweep_configs", "write_best_configs", "_utils"):
+        sys.modules.pop(name, None)
+
+
+def test_tuning_defaults_cu_first(tree, tuning):
+    kernels, space, _, _ = tuning
+    tree(
+        "gfx1250/96cu/gluon/gemm/gemm_a16w16/DEFAULT.json",
+        {"M_BOUNDS": [16, 64], "any": _bucket(98)},
+    )
+    spec = kernels.get_spec("gemm_a16w16")
+    _, buckets, path = space.load_defaults(spec, "gluon", cu_num=96)
+    assert path.endswith("/96cu/gluon/gemm/gemm_a16w16/DEFAULT.json")
+    assert buckets["any"] == _bucket(98)
+    assert space.load_defaults(spec, "gluon")[1]["any"] == _bucket(1)
+    path, seed = kernels.seed_table(spec, "gluon", {"N": 1024, "K": 256}, cu_num=96)
+    assert path.endswith("/96cu/gluon/gemm/gemm_a16w16/DEFAULT.json")
+    assert seed == {"DEFAULT_FALLBACK": True, "M_BOUNDS": [16, 64]}
+
+
+def test_install_ignores_other_cu_records(tree, tuning, tmp_path):
+    kernels, _, _, write_best_configs = tuning
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    shape = {"M": 16, "N": 128, "K": 256}
+    records = [
+        {"status": "ok", "baseline": True, "config": None, "us": 9.0, "cu_num": 96},
+        {"status": "ok", "config": _bucket(96), "us": 5.0, "cu_num": 96},
+        {"status": "ok", "config": _bucket(192), "us": 1.0, "cu_num": 192},
+        {"status": "ok", "config": _bucket(7), "us": 2.0},
+    ]
+    with open(
+        runs / "sweep-gfx1250-gluon-gemm_a16w16-M=16-N=128-K=256.jsonl", "w"
+    ) as f:
+        f.writelines(json.dumps(dict(record, shape=shape)) + "\n" for record in records)
+    spec = kernels.get_spec("gemm_a16w16")
+    shape_nk = {"N": 128, "K": 256}
+    load = write_best_configs.load_winners
+    assert load(str(runs), "gfx1250", "gluon", spec, shape_nk)[16].record["us"] == 1.0
+    winner = load(str(runs), "gfx1250", "gluon", spec, shape_nk, cu_num=96)[16]
+    assert (winner.record["us"], winner.baseline["us"]) == (5.0, 9.0)
+    assert (
+        load(str(runs), "gfx1250", "gluon", spec, shape_nk, cu_num=192)[16].baseline
+        is None
+    )
+
+
+@pytest.mark.parametrize("recorded, ok", [(96, True), (None, True), (192, False)])
+def test_resume_needs_same_cu_num(tuning, tmp_path, recorded, ok):
+    import argparse
+
+    _, _, sweep_configs, _ = tuning
+    out = tmp_path / "sweep.jsonl"
+    ready = {"status": "ready", "calls": 24, "replays": 25, "cold_mb": 1024}
+    if recorded is not None:
+        ready["cu_num"] = recorded
+    out.write_text(json.dumps(ready) + "\n")
+    args = argparse.Namespace(calls=24, replays=25, cold_mb=1024)
+    if ok:
+        sweep_configs.check_settings(str(out), args, 96)
+    else:
+        with pytest.raises(SystemExit):
+            sweep_configs.check_settings(str(out), args, 96)

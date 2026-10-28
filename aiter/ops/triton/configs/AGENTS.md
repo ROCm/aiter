@@ -73,6 +73,9 @@ on. `get_gemm_config()` reads each file (`DEFAULT.json` and the specialized
 files) from the `<cu_num>cu/` folder when it is there, else from the
 CU-agnostic folder. Put a file in `<cu_num>cu/` only when it was tuned on
 that CU count. Only the GEMM loader reads these folders.
+`sweep_configs.py` records the CU count with every result, and
+`write_best_configs.py --cu-dir` installs only results timed on this
+device's CU count, seeded from the same `DEFAULT.json` the loader reads.
 
 ## Loaders
 

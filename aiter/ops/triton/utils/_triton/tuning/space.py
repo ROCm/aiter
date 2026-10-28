@@ -55,17 +55,30 @@ class UnknownConfigKey(Exception):
     pass
 
 
-def load_defaults(spec, backend):
-    """Keys and buckets of the family's DEFAULT.json -> (keys, buckets, default_path).
-
-    The keys are the union over all buckets, in file order. M_BOUNDS, _note and friends are
-    not buckets.
-    """
+def find_default(spec, backend, cu_num=None):
+    """(path, table) of the DEFAULT.json the loader reads: <arch>/<cu_num>cu/ first when
+    cu_num is given, else the CU-agnostic one; table is None when neither exists."""
     from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
     config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
+    if cu_num is not None:
+        cu_dir = resolve_config_dir(
+            "gemm", spec.config_name, backend=backend, cu_num=cu_num
+        )
+        table = load_config_json(f"{cu_dir}/DEFAULT.json", required=False)
+        if table is not None:
+            return f"{cu_dir}/DEFAULT.json", table
     default_path = f"{config_dir}/DEFAULT.json"
-    table = load_config_json(default_path, required=False)
+    return default_path, load_config_json(default_path, required=False)
+
+
+def load_defaults(spec, backend, cu_num=None):
+    """Keys and buckets of the family's DEFAULT.json -> (keys, buckets, default_path).
+
+    The keys are the union over all buckets, in file order. M_BOUNDS, _note and friends are
+    not buckets. With cu_num, the <arch>/<cu_num>cu/ DEFAULT.json is used when there is one.
+    """
+    default_path, table = find_default(spec, backend, cu_num)
     if table is None:
         raise FileNotFoundError(f"Required config file doesn't exist: {default_path}")
     buckets = {name: entry for name, entry in table.items() if isinstance(entry, dict)}

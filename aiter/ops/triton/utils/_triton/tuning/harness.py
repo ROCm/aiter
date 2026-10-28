@@ -17,6 +17,7 @@ Record fields:
             (launched through the wrapper's own config=None path unless keys DEFAULT.json does
             not have had to be stripped first; dropped_keys lists them)
   gpu       HIP_VISIBLE_DEVICES of the worker
+  cu_num    CU count of the worker's device (get_config_cu_num()), the <cu_num>cu/ folder it tunes for
   is_tuned  baseline only: a specialized file served this shape
   us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
   error     the exception text when status is error
@@ -112,6 +113,8 @@ def gpu_alive():
 
 
 def plan(spec, shape, backend, arch, should_skip, space_out):
+    from aiter.ops.triton.utils.config_utils import get_config_cu_num
+
     try:
         configs, report = build_space(spec, shape, backend, arch, should_skip)
     except UnknownConfigKey as e:
@@ -125,6 +128,7 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
         shape=shape,
         bounds=list(family_bounds(spec, backend, shape)),
         configs=configs,
+        cu_num=get_config_cu_num(),
     )
     with open(space_out, "w") as f:
         json.dump(plan_, f)
@@ -134,6 +138,8 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
 def benchmark(
     spec, shape, backend, arch, call, inputs, candidates, out, calls, replays, cold_mb
 ):
+    from aiter.ops.triton.utils.config_utils import get_config_cu_num
+
     keys, _, _ = load_defaults(spec, backend)
     copies = make_cold_copies(inputs, cold_mb)
     common = {
@@ -142,6 +148,7 @@ def benchmark(
         "arch": arch,
         "shape": shape,
         "gpu": os.environ.get("HIP_VISIBLE_DEVICES"),
+        "cu_num": get_config_cu_num(),
     }
     append_record(
         out,

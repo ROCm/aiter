@@ -43,12 +43,13 @@ Winner = namedtuple(
 )  # baseline: the installed config's record or None
 
 
-def load_winners(runs_dir, arch, backend, spec, shape_nk):
+def load_winners(runs_dir, arch, backend, spec, shape_nk, cu_num=None):
     """M -> Winner from every per-M result file of this (kernel, backend, N, K[, B]).
 
     When several GPUs swept an M, only the final round (<results>.final.jsonl, timed on one
     GPU) counts. When the M's plan file is present only its candidates (and the baseline) can win,
-    so records of candidates that are no longer in the search space are ignored.
+    so records of candidates that are no longer in the search space are ignored. With cu_num,
+    only records timed on a device with that CU count count (records without one are skipped).
     """
     winners = {}
     for path in results_files(runs_dir, arch, backend, spec.name, shape_nk):
@@ -67,6 +68,14 @@ def load_winners(runs_dir, arch, backend, spec, shape_nk):
                 f"  M={M}: timed on several GPUs but the final round is missing; rerun the sweep. Skipped."
             )
             continue
+        if cu_num is not None:
+            records = {k: r for k, r in records.items() if r.get("cu_num") == cu_num}
+            timed_here = [r for r in ok if r.get("cu_num") == cu_num]
+            if len(timed_here) < len(ok):
+                print(
+                    f"  M={M}: {len(ok) - len(timed_here)} records not timed at {cu_num} CUs; ignored"
+                )
+            ok = timed_here
         plan_file = plan_path(runs_dir, arch, backend, spec.name, dict(shape_nk, M=M))
         if os.path.exists(plan_file):
             with open(plan_file) as f:
@@ -155,20 +164,20 @@ def install(spec, backend, shape_nk, runs_dir, cu_dir=False):
 
     arch = arch_info.get_arch()
     backend = backend or spec.default_backend(arch)
-    winners = load_winners(runs_dir, arch, backend, spec, shape_nk)
-    if not winners:
-        sys.exit(f"no results for {spec.name} {backend} {shape_nk} in {runs_dir}")
     cu_num = None
     if cu_dir:
         cu_num = get_config_cu_num()
         if cu_num is None:
             sys.exit("--cu-dir: the CU count of this device cannot be read")
+    winners = load_winners(runs_dir, arch, backend, spec, shape_nk, cu_num=cu_num)
+    if not winners:
+        sys.exit(f"no results for {spec.name} {backend} {shape_nk} in {runs_dir}")
 
     seed_path, seed = seed_table(spec, backend, shape_nk, cu_num=cu_num)
     print(f"seeding from {seed_path}")
     # the loader walks the kernel's explicit bounds, else the M_BOUNDS of the file it picks
     bounds = spec.bounds or seed.get("M_BOUNDS") or gemm_config_utils.STANDARD_M_BOUNDS
-    keys, default_buckets, _ = load_defaults(spec, backend)
+    keys, default_buckets, _ = load_defaults(spec, backend, cu_num=cu_num)
     assignments = assign_buckets(winners, bounds)
     if not assignments:
         sys.exit(

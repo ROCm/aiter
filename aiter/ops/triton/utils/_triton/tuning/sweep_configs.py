@@ -3,7 +3,8 @@
 """Driver: sweep the full search space for one kernel and shape, then install the winners.
 
 Per M:   plan            harness.py --plan: load defaults, generate combinations, prune
-         check_settings  records can only be resumed when they were timed the same way
+         check_settings  records can only be resumed when they were timed the same way,
+                         on the same CU count
          sweep           harness.py --configs ...: the candidates are dealt round-robin to the
                          GPUs, one serial worker per GPU, with crash and hang recovery
          final_round     with several GPUs: re-time the baseline and the ten fastest on the first
@@ -189,8 +190,8 @@ def print_plan(plan_, shape):
     )
 
 
-def check_settings(out, args):
-    """Records can only be resumed when they were timed the same way."""
+def check_settings(out, args, cu_num=None):
+    """Records can only be resumed when they were timed the same way, on the same CU count."""
     ready = next((r for r in iter_records(out) if r["status"] == "ready"), None)
     if ready is None:
         return
@@ -199,6 +200,12 @@ def check_settings(out, args):
         sys.exit(
             f"{out} was timed with calls={recorded[0]} replays={recorded[1]} cold_mb={recorded[2]}; "
             "rerun with the same settings or --fresh"
+        )
+    # records from before cu_num was recorded resume; an install with --cu-dir ignores them
+    if ready.get("cu_num") not in (None, cu_num):
+        sys.exit(
+            f"{out} was timed at cu_num={ready.get('cu_num')}, this device has {cu_num}; "
+            "use another --runs-dir or --fresh"
         )
 
 
@@ -431,7 +438,7 @@ def main(argv=None):
         out = results_path(args.runs_dir, plan_["arch"], backend, spec.name, shape)
         if args.fresh:
             discard(out)
-        check_settings(out, args)
+        check_settings(out, args, plan_.get("cu_num"))
         print(f"  results: {out}", flush=True)
         candidates = [None] + plan_["configs"]  # None is the installed baseline
         sweep(spec, shape, backend, candidates, out, gpus, args)
