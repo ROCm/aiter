@@ -160,7 +160,7 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         )
         stash_stride = HV * tl.num_programs(1) * STASH_W
         num_replay = tl.load(num_accepted_tokens + i_n).to(tl.int32) - 1
-        for i_r in range(0, num_replay):
+        for i_r in range(num_replay):
             p_r = p_stash + i_r * stash_stride
             b_h = _gated_delta_rule_step(
                 b_h,
@@ -200,13 +200,12 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
         b_a = tl.load(p_a).to(tl.float32)
-        if DEFER_SPEC_STATE:
-            if i_t > 0:
-                p_r = p_stash + (i_t - 1) * stash_stride
-                tl.store(p_r + o_k, b_k.to(p_r.dtype.element_ty), mask=mask_k)
-                tl.store(p_r + BK + o_r, b_v.to(p_r.dtype.element_ty), mask=mask_v)
-                tl.store(p_r + BK + BV, b_a.to(p_r.dtype.element_ty))
-                tl.store(p_r + BK + BV + 1, b_b.to(p_r.dtype.element_ty))
+        if DEFER_SPEC_STATE and i_t > 0:
+            p_r = p_stash + (i_t - 1) * stash_stride
+            tl.store(p_r + o_k, b_k.to(p_r.dtype.element_ty), mask=mask_k)
+            tl.store(p_r + BK + o_r, b_v.to(p_r.dtype.element_ty), mask=mask_v)
+            tl.store(p_r + BK + BV, b_a.to(p_r.dtype.element_ty))
+            tl.store(p_r + BK + BV + 1, b_b.to(p_r.dtype.element_ty))
 
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)

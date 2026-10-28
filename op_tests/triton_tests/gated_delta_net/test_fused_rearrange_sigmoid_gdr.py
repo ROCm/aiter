@@ -304,21 +304,21 @@ def test_fused_rearrange_sigmoid_gdr_defer_spec_state(N: int, max_t: int):
         )[:, : 2 * key_dim + value_dim]
         a = torch.randn(num_tokens, HV, device=device, dtype=dtype)
         b_gate = torch.randn(num_tokens, HV, device=device, dtype=dtype)
-        common = dict(
-            A_log=A_log,
-            a=a,
-            b=b_gate,
-            dt_bias=dt_bias,
-            qkv=qkv,
-            key_dim=key_dim,
-            value_dim=value_dim,
-            head_k_dim=K,
-            head_v_dim=V,
-            cu_seqlens=cu,
-            ssm_state_indices=idx,
-            num_accepted_tokens=torch.tensor(acc, device=device, dtype=torch.int32),
-            use_qk_l2norm_in_kernel=True,
-        )
+        common = {
+            "A_log": A_log,
+            "a": a,
+            "b": b_gate,
+            "dt_bias": dt_bias,
+            "qkv": qkv,
+            "key_dim": key_dim,
+            "value_dim": value_dim,
+            "head_k_dim": K,
+            "head_v_dim": V,
+            "cu_seqlens": cu,
+            "ssm_state_indices": idx,
+            "num_accepted_tokens": torch.tensor(acc, device=device, dtype=torch.int32),
+            "use_qk_l2norm_in_kernel": True,
+        }
         o_ref, _ = fused_rearrange_sigmoid_gated_delta_rule(
             initial_state=state_ref, **common
         )
