@@ -46,18 +46,14 @@ jobs:
     if: >-
       (!github.event.pull_request || github.event.pull_request.draft == false) &&
       github.event.action != 'labeled'
-    name: OPUS Tests (${{ matrix.label }})
+    name: OPUS Tests (${{ matrix.runner == 'linux-aiter-oci-mi300x-1' && 'MI300X' || 'MI35X' }})
     needs: [check-signal, ci_config]
     env:
       DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
+        runner: ${{ fromJSON(github.ref == 'refs/heads/main' && '["linux-aiter-mi35x-1","linux-aiter-oci-mi300x-1"]' || '["linux-aiter-mi35x-1"]') }}
     runs-on: ${{ matrix.runner }}
 
     steps:
