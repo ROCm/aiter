@@ -340,7 +340,7 @@ _BF16_CASES = _COMMON_CASES + [
         for dim in (256, 128)
     ],
 ]
-# FP8 head 256, page 64, plain V, uniform query length with at most 32 query
+# FP8 head 256, page 16/64, uniform query length with at most 48 query
 # rows: the gfx950 pipe, for per-tensor and per-token scales. A plan-independent
 # staging bound selects its specialization;
 # other architectures run the same cases on the generic path.
@@ -423,6 +423,58 @@ _PIPE_CASES = [
             "pattern": "varied",
         },
     ),
+    # Three M-tiles (MTP-5 verify at GQA 8): q5 gives 40 rows and pads the
+    # third M-tile, q6 fills it with 48. Page 16 with transposed V and
+    # per-token scales is the Qwen3.5 TP4 decode layout. The edge lengths put
+    # causal edges on page (16) and tile (256) boundaries, 7 gives every row
+    # at most one page, 0 and 1 leave rows empty, and 4103 spans 17 tiles
+    # over 4 partitions.
+    *(
+        (
+            f"d256-page{page}-q{length}-edges-{mode}-{'transposed' if trans_v else 'plain'}-v",
+            {
+                **_PIPE_BASE,
+                "query_length": length,
+                "block_size": page,
+                "scale_mode": mode,
+                "trans_v": trans_v,
+                "lengths": (0, 1, 7, 255, 256, 257, 4103),
+                "max_partitions": 4,
+                "pattern": "varied" if mode == "per-token" else "random",
+            },
+        )
+        for length, page, mode, trans_v in product(
+            (5, 6), (16, 64), ("per-tensor", "per-token"), (False, True)
+        )
+    ),
+    # Many partitions with a short tail; sequences with few or no tasks must
+    # not change a channel of the three-M-tile output.
+    (
+        "d256-page16-q6-np81",
+        {
+            **_PIPE_BASE,
+            "query_length": 6,
+            "block_size": 16,
+            "trans_v": True,
+            "lengths": (0, 1, 257, 66532),
+            "max_partitions": 81,
+            "budget": 81,
+            "pattern": "one_hot_v",
+        },
+    ),
+    # Every row of the last M-tile sees a different number of tokens.
+    (
+        "d256-page16-q6-one-hot-token",
+        {
+            **_PIPE_BASE,
+            "query_length": 6,
+            "block_size": 16,
+            "trans_v": True,
+            "lengths": (6, 17, 250, 262),
+            "max_partitions": 2,
+            "pattern": "one_hot_token",
+        },
+    ),
 ]
 _INVALID_CASES = [
     ("fp16-query", NotImplementedError, "BF16 KV requires bfloat16 queries"),
@@ -435,6 +487,17 @@ _INVALID_CASES = [
     ("vector16-k", ValueError, "key_cache shape must be"),
     ("vector16-v", ValueError, "transposed value_cache shape must be"),
 ]
+
+
+@pytest.mark.parametrize(
+    "query_length,group,pipe",
+    [(4, 8, True), (5, 8, True), (6, 8, True), (7, 8, False), (8, 8, False)],
+)
+def test_d256_pipe_rows(query_length, group, pipe):
+    """The pipe takes up to three M-tiles (48 rows); four are not validated."""
+    traits = pytest.importorskip("aiter.ops.flydsl.kernels.pa_decode.traits")
+    for page in (16, 64):
+        assert traits.d256_pipe("gfx950", "fp8", 256, page, query_length, group) == pipe
 
 
 def _check_output(output, reference):
@@ -768,7 +831,7 @@ def _poison_unowned(cache, scale, owned, fill):
 @pytest.mark.parametrize("fill", ["nan", "inf"])
 @pytest.mark.parametrize(
     "query_length,kv_heads,group_size,head_dim",
-    [(1, 1, 8, 128), (4, 2, 8, 256), (4, 1, 16, 128)],
+    [(1, 1, 8, 128), (4, 2, 8, 256), (6, 1, 8, 256), (4, 1, 16, 128)],
 )
 @pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize(
