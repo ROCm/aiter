@@ -34,6 +34,9 @@ NQ, NIQ, HD, ROT = 16, 1, 128, 64  # MiniMax-M3 TP4
 PAGE_BYTES = 128 * (64 + 4)
 SENTINEL = 0xA5
 FP8_MAX = torch.finfo(dtypes.fp8).max
+DEFAULT_DTYPES = [dtypes.bf16, dtypes.fp16]
+DEFAULT_TOKENS = [1, 7, 300, 1031]
+DEFAULT_PERF_TOKENS = [1, 32, 128, 1024, 4096, 16384]
 
 INDEX_CASES = ("sequential", "index_shuffled", "index_skipped", "differ")
 KV_CASES = ("sequential", "shuffled", "main_skipped", "differ")
@@ -382,65 +385,28 @@ def test_write_perf(T, kv):
     return ret
 
 
-def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning(
-            "fused_qknorm_idxrqknorm mxfp4 unsupported on %s; skipping", get_gfx()
-        )
-        return
+def summary(name, rows):
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
 
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter,
-        description="Test fused_qknorm_idxrqknorm MXFP4 caches and fp8 Q",
-    )
-    parser.add_argument(
-        "-d",
-        "--dtype",
-        type=dtypes.str2Dtype,
-        choices=[dtypes.bf16, dtypes.fp16],
-        nargs="*",
-        default=[dtypes.bf16, dtypes.fp16],
-        help="Input dtype. e.g.: -d bf16 fp16",
-    )
-    parser.add_argument(
-        "-t",
-        "--tokens",
-        type=int,
-        nargs="*",
-        default=[1, 7, 300, 1031],
-        help="Tokens of the byte-equality sweep. e.g.: -t 1 300",
-    )
-    parser.add_argument(
-        "--perf_tokens",
-        type=int,
-        nargs="*",
-        default=[1, 32, 128, 1024, 4096, 16384],
-        help="Tokens of the index-K write timing. e.g.: --perf_tokens 1 4096",
-    )
-    args = parser.parse_args()
 
-    def summary(name, rows):
-        df = pd.DataFrame(rows)
-        aiter.logger.info(
-            "%s summary (markdown):\n%s", name, df.to_markdown(index=False)
-        )
-
+def sweep(dtype_list, tokens, perf_tokens):
     summary(
         "write bytes",
         [
             test_write_bytes(T, nkv, dtype, kv, bs, index, case)
             for dtype, T, (kv, bs, index, case, nkv) in itertools.product(
-                args.dtype, args.tokens, CONFIGS
+                dtype_list, tokens, CONFIGS
             )
         ],
     )
-    summary("skip_index_branch", [test_skip_index_branch(d) for d in args.dtype])
+    summary("skip_index_branch", [test_skip_index_branch(d) for d in dtype_list])
     summary(
         "q_fp8_out",
         [
             test_q_fp8_out(*cfg)
             for cfg in itertools.product(
-                args.dtype, ("auto", "mxfp4"), (None, 0.25, 3.0), (True, False)
+                dtype_list, ("auto", "mxfp4"), (None, 0.25, 3.0), (True, False)
             )
         ],
     )
@@ -461,9 +427,71 @@ def main():
         "index-K write",
         [
             test_write_perf(T, kv)
-            for kv, T in itertools.product(("fp8", "auto"), args.perf_tokens)
+            for kv, T in itertools.product(("fp8", "auto"), perf_tokens)
         ],
     )
+
+
+def test_sweep():
+    """The pytest entry: the whole script run with its default sweep."""
+    if get_gfx() in SUPPORTED_GFX:
+        sweep(DEFAULT_DTYPES, DEFAULT_TOKENS, DEFAULT_PERF_TOKENS)
+
+
+# The sweep drives these (they take arguments, or are only parts of it), not pytest.
+for _fn in (
+    test_write_bytes,
+    test_skip_index_branch,
+    test_views_into_one_pool,
+    test_q_fp8_out,
+    test_existing_index_modes_unchanged,
+    test_rewriting_a_slot_replaces_all_68_bytes,
+    test_zero_and_extreme_rows,
+    test_pages_dequantize_to_the_reference,
+    test_reference_scale_rule_is_the_hip_rule,
+    test_rejections,
+    test_write_perf,
+):
+    _fn.__test__ = False
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "fused_qknorm_idxrqknorm mxfp4 unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Test fused_qknorm_idxrqknorm MXFP4 caches and fp8 Q",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.bf16, dtypes.fp16],
+        nargs="*",
+        default=DEFAULT_DTYPES,
+        help="Input dtype. e.g.: -d bf16 fp16",
+    )
+    parser.add_argument(
+        "-t",
+        "--tokens",
+        type=int,
+        nargs="*",
+        default=DEFAULT_TOKENS,
+        help="Tokens of the byte-equality sweep. e.g.: -t 1 300",
+    )
+    parser.add_argument(
+        "--perf_tokens",
+        type=int,
+        nargs="*",
+        default=DEFAULT_PERF_TOKENS,
+        help="Tokens of the index-K write timing. e.g.: --perf_tokens 1 4096",
+    )
+    args = parser.parse_args()
+    sweep(args.dtype, args.tokens, args.perf_tokens)
 
 
 if __name__ == "__main__":
