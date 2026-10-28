@@ -7,6 +7,8 @@
 constexpr int32_t kPaMetadataSharedMaxBatches = 512;
 constexpr int32_t kPaMetadataSharedMaxWaves = kPaMetadataSharedMaxBatches / opus::get_warp_size();
 constexpr int32_t kPaMetadataMaxParallelBatches = 32768;
+// Larger pages leave few tasks, where the serial generator is faster than the parallel launch.
+constexpr int32_t kPaMetadataParallelPageSize = 16;
 
 struct PaMetadataV12ChunkRecord
 {
@@ -866,10 +868,10 @@ void get_pa_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [ba
         num_batches > kPaMetadataSharedMaxBatches ? static_cast<int64_t>(num_batches) + 2 * chunks
                                                   : 0;
 
-    // The parallel kernels only reproduce the dense, single-Q-tile, full-CU, page-sized layout.
+    // The parallel kernels only reproduce the dense, single-Q-tile, full-CU, page-16 layout.
     const bool layout_supported =
-        topk < 0 && num_splits == num_cu && kv_granularity == block_size && block_size > 0 &&
-        (block_size & (block_size - 1)) == 0 && max_seqlen_qo > 0 && num_heads_per_head_k > 0 &&
+        topk < 0 && num_splits == num_cu && block_size == kPaMetadataParallelPageSize &&
+        kv_granularity == block_size && max_seqlen_qo > 0 && num_heads_per_head_k > 0 &&
         static_cast<int64_t>(max_seqlen_qo) * num_heads_per_head_k <= kPackedQoLenPerWg &&
         static_cast<int64_t>(num_heads_k) * num_heads_per_head_k <= 65535;
     // Parallel output needs scratch rows; smaller legacy allocations fall back to serial.

@@ -1041,10 +1041,10 @@ def get_pa_metadata_v1(
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
             fast_mode: default=True. Uses parallel generation for dense, single-Q-tile inputs
-                       with page-sized KV granularity, up to 32768 requests and the full CU
-                       worker budget. False, other configurations, or buffers without the extra
-                       scratch space (see get_pa_metadata_info_v1) use the serial generator
-                       with identical metadata. Valid inputs require consistent
+                       with page size 16 (block_size=kv_granularity=16), up to 32768 requests and
+                       the full CU worker budget. False, other page sizes or configurations, or
+                       buffers without the extra scratch space (see get_pa_metadata_info_v1) use
+                       the serial generator with identical metadata. Valid inputs require consistent
                        indptrs, context lengths and positive Q lengths. Empty contexts have no
                        attention work in the parallel path; callers own their outputs.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
