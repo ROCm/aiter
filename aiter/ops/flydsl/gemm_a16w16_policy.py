@@ -122,7 +122,13 @@ class GemmConfigPruner:
                         config["block_n"],
                         config["group_m"],
                     )
-                    in ((320, 224, 2), (320, 224, 16), (224, 320, 8))
+                    in (
+                        (320, 224, 2),
+                        (320, 224, 4),
+                        (320, 224, 16),
+                        (224, 320, 8),
+                        (160, 192, 16),
+                    )
                     or (tiles >= num_cus and tiles % 8 == 0)
                 )
             ):
@@ -269,19 +275,24 @@ def get_flydsl_a16w16_configs(
                 "use_half_tile_interleaved": False,
             }
         )
-    for block_m, block_n, m_waves, n_waves, group_m in (
-        (256, 192, 4, 4, 0),
-        (288, 192, 2, 4, 0),
-        (320, 224, 4, 2, 2),
-        (320, 224, 4, 2, 16),
-        (224, 320, 2, 4, 8),
+    for block_m, block_n, stages, m_waves, n_waves, group_m in (
+        (256, 192, 2, 4, 4, 0),
+        (288, 192, 2, 2, 4, 0),
+        (320, 224, 2, 4, 2, 0),
+        (320, 224, 2, 4, 2, 2),
+        (320, 224, 2, 4, 2, 4),
+        (320, 224, 2, 4, 2, 16),
+        (224, 320, 2, 2, 4, 8),
+        (224, 192, 3, 2, 6, 0),
+        (160, 192, 3, 2, 4, 16),
+        (192, 192, 3, 3, 4, 0),
     ):
         configs.append(
             {
                 "block_m": block_m,
                 "block_n": block_n,
                 "block_k": 64,
-                "stages": 2,
+                "stages": stages,
                 "split_k": 1,
                 "m_waves": m_waves,
                 "n_waves": n_waves,
@@ -346,6 +357,9 @@ def get_flydsl_a16w16_configs(
                 (288, 192),
                 (320, 224),
                 (224, 320),
+                (224, 192),
+                (160, 192),
+                (192, 192),
             ):
                 continue
 
