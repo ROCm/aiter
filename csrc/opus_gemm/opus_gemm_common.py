@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""OPUS kernel registrations shared by selection and code generation."""
+
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from decimal import Decimal, InvalidOperation
+
+_A16W16_CO_TAGS = frozenset(
+    {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
+)
 
 # Legacy cache policy = traits default for split-barrier & persistent a16w16 (see
 # opus_gemm_traits_a16w16_gfx950.cuh).
@@ -20,6 +27,44 @@ _GFX942_KERNEL_NAME_TAGS = {
     "a16w16_quad_mfma32_kbuf1": "quad_mfma32",
     "a16w16_quad_mfma32_kbuf1_sk": "splitk_quad_mfma32_bf16ws",
 }
+
+
+_SF_SHUF_SUB_HEADER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "include",
+    "gfx950",
+    "opus_gemm_traits_a8w8_scale_gfx950.cuh",
+)
+_SF_SHUF_SUB_CACHE: list[int] = []
+
+
+def _opus_sf_shuf_sub() -> int:
+    """``OPUS_SF_SHUF_SUB_VALUE``, parsed from the traits header.
+
+    One source of truth for the A-scale layout's ``sub``. The host picks which
+    ``shuffle_scale_a(x, K, sub)`` to feed a kid and the kernel decides how to
+    read it; if those two numbers disagree the kid does not fail, it returns
+    wrong numbers -- so this is parsed rather than restated. Raises if the
+    #define is absent, because a default here would resurrect exactly the
+    silent divergence it exists to prevent.
+    """
+    if not _SF_SHUF_SUB_CACHE:
+        import re
+
+        with open(_SF_SHUF_SUB_HEADER) as f:
+            m = re.search(
+                r"^#define\s+OPUS_SF_SHUF_SUB_VALUE\s+(\d+)\s*$",
+                f.read(),
+                re.MULTILINE,
+            )
+        if not m:
+            raise RuntimeError(
+                f"OPUS_SF_SHUF_SUB_VALUE not found in {_SF_SHUF_SUB_HEADER}; "
+                "the A-scale layout is undefined and any shuffled kid handed a "
+                "guessed sub would return wrong numbers silently"
+            )
+        _SF_SHUF_SUB_CACHE.append(int(m.group(1)))
+    return _SF_SHUF_SUB_CACHE[0]
 
 
 @dataclass
@@ -63,18 +108,10 @@ class OpusGemmInstance:
     arch_prefix: str = ""
     # Optional generated name tag override for same-pipeline variants.
     name_tag: str = ""
-    # SplitK workspace storage dtype; splitK launchers still use fp32 tune dispatch.
-    # Split-K partial type, per kid. Keep the DEFAULT at fp32: several pipelines
-    # static_assert on it -- gfx942's em3en4_lds1_pgr2_sk among them -- so a
-    # bf16 default silently retargets every split-K family on every arch and
-    # only shows up as a compile error on the arches you did not build.
-    # The gfx1250 _ws families opt in to bf16 (see _gfx1250_ws_bf16_partial):
-    # it halves what the reduce reads back and what a sweep allocates, and it
-    # clears the gate the tuner applies -- at rtol=atol=5e-2, which is what a
-    # bf16 output gets, err_ratio measures 0.004-0.012 against a 0.05 line, flat
-    # from split_k=1 to 16. It is the coarser choice: against a 1e-2 tolerance
-    # the same partials fail from split_k=2 on.
-    splitk_workspace_dtype: str = "fp32_t"
+    # Physical workspace storage dtype for this exact kid. External-workspace
+    # kids must declare it explicitly; non-workspace kids leave it unset.
+    # The launch-dispatch host specialization remains fp32 independently.
+    splitk_workspace_dtype: str | None = None
 
     # gfx1250 cluster/TDM split-K consumer tiling: "tileN" (split N) or
     # "tileM" (split M). Only consumed by the a16w16_cluster_tdm_splitk_ws tag.
@@ -94,71 +131,78 @@ class OpusGemmInstance:
     cluster_wg_m: int = 4
     cluster_wg_n: int = 4
 
-    # gfx1250 FUSED single-kernel split-K (a16w16_clusterlaunch_tdm_splitk_fuse):
-    # SplitK and MClusterWg are COMPILE-TIME (cluster dims (SplitK, MClusterWg, 1)),
-    # so each kid bakes one combo. fuse_ws_dtype = DataWs partial storage
-    # ("bf16_t" default; "fp32_t" for higher reduce precision). Ignored by every
-    # other pipeline. fuse_split_k == 0 marks "not a fuse kid".
-    fuse_split_k: int = 0
-    fuse_m_cluster: int = 1
-    fuse_ws_dtype: str = "bf16_t"
-
-    # --- a8w8_mxscale BMM flatmm-splitK axes (kernel_tag ==
-    # "a8w8_mxscale_bmm_flatmm_splitk"). The BMM main kernel template is
-    #   gemm_a8w8_mxscale_flatmm_splitk_kernel<Traits, D_OUT, DIRECT_ONLY,
-    #                                          PREFETCH_SCALE>
-    # so unlike a16w16 each kid carries two compile-time booleans in addition to
-    # the tile. direct_only == consumer-self-load direct-store (splitK==1 only);
-    # prefetch_scale == scale-prefetch variant; fused_reduce == splitK==2 fused
-    # tail-reduce launch path. These drive both the launcher body and the set of
-    # device instantiations gen_instances emits for the kid.
+    # gfx950 a8w8 MXFP8 BMM compile-time axes.  BMM instances live in the
+    # canonical local kid registry, but their generated symbols share the
+    # ``opus_bmm`` root and a uniform exact-kid launcher signature.
     direct_only: bool = False
     prefetch_scale: bool = False
     fused_reduce: bool = False
-    # a8w8_mxscale BMM flatmm-splitK only: preload this split's SFA (per-token) +
-    # SFB (block) scale panels into LDS once, then read scales from LDS in the
-    # consumer instead of a per-K-tile global buffer_load. Maps to the kernel's
-    # 5th template bool PRELOAD_SF_LDS.
     preload_sf: bool = False
+    # a8w8_mxscale BMM wave8 families only: the A scale panel arrives M-packed
+    # from the host (shuffle_scale_mxsk_mpack) and is read straight from global,
+    # so there is no panel to stage. Maps to the wave8 kernel's trailing
+    # `bool SFA_MPACK_GLOBAL`; see needs_mpacked_sfa for the caller's side of it.
+    mpack_sfa: bool = False
+    # a8w8_mxscale BMM wave8 families and flatmm-splitK: both scale panels arrive
+    # in the reference kernel's layout (shuffle_scale_a / _b) and are read from
+    # global one dword per (M subtile pair, K tile pair). Maps to the trailing
+    # `bool SHUFFLE_SCALE` of either kernel; see needs_shuffle_scale for the
+    # caller's side. Mutually exclusive with preload_sf, which it replaces.
+    shuffle_scale: bool = False
+    # a8w8_mxscale BMM wave8 families and flatmm-splitK: stage the shuffled scale
+    # words through the LDS panel instead of reading them from global on every K
+    # tile. Requires shuffle_scale. Maps to the kernel's trailing
+    # `bool SF_SHUF_IN_LDS`; see the _sfshuf_lds name suffix.
+    # The panel does not fit every tile and the kernel static_asserts rather than
+    # degrading, so an ill-fitting kid is a build error rather than a mislabelled
+    # reg build.
+    sf_shuf_in_lds: bool = False
+    # a8w8_mxscale BMM wave8 families only: band height in M tiles for the L2
+    # rasterization of the workgroup -> tile map, 0 for the plain linear map. Maps
+    # to the wave8 kernel's trailing `int XCD_WGM`.
+    xcd_wgm: int = 0
+    # a8w8_mxscale BMM wave1 only: register ring depth in K tiles, 0 for the
+    # traits' VGPR-budget default. Maps to the wave1 traits' trailing `int RING_`.
+    wave1_ring: int = 0
+    # Compact BMM: issue future B before current LDS reads, then issue A.
+    early_b: bool = False
     # a8w8_mxscale BMM specialized-pipeline axis (minterleave / mouter /
     # mouter_tunable / wave4m2_selfload families). Maps to the kernel's trailing
     # `bool SKIP_SCALE_WAIT` template param: skip the s_waitcnt on the per-K-tile
     # scale load (the scale is issued a tile ahead), trading a correctness margin
     # for pipeline overlap. Drives both the launcher body and the device
     # instantiation set for the kid.
+    # Optional override for the D_OUT=void split-K specialization.  None keeps
+    # the direct-output specialization's preload_sf setting; False lets an
+    # exact kid retain its tuned splitK=1 preload while using the equivalent
+    # lower-register-pressure path for FP32 workspace partials.
+    workspace_preload_sf: bool | None = None
     skip_scale_wait: bool = False
-    # a8w8_mxscale BMM wave4m2_selfload family extra bool axis (kernel template
-    # order: <Traits, D_OUT, SKIP_SCALE_WAIT, PACK_SCALE_ON_DEMAND>).
     pack_scale_on_demand: bool = False
-    # a8w8_mxscale BMM pipeline family (kids 150/151/152): dual bf16/fp32
-    # traits + one of the gemm_a8w8_scale_* kernels selected by these flags
-    # (all-false = plain scale kernel).
-    k1024_only: bool = False
-    k1024_lb1: bool = False
-    # a8w8_mxscale BMM pipeline family (kid158): preload BOTH SFA (per-token) and
-    # SFB (block) scale panels into LDS. Maps to the pipeline kernel
-    # gemm_a8w8_scale_preload_sf_kernel.
     preload_sf_lds: bool = False
-    # Symbol root ("opus_gemm" for GEMM, "opus_bmm" for the batched frontends).
     name_root: str = "opus_gemm"
 
-    # --- pre-compiled (.co) families only (kernel_tag in _A16W16_CO_TAGS) ------
-    # Device-side entry-point attributes. They never reach the host launcher --
-    # it only needs the traits constants -- but they DO reach the symbol name,
-    # because two entries differing only in these must not collide on one .co.
-    # co_num_vgpr == 0 omits the amdgpu_num_vgpr attribute entirely.
+    # gfx1250 fused single-kernel split-K. SplitK and the N-direction cluster
+    # peer count are compile-time kernel properties. The partial storage dtype
+    # deliberately uses the shared splitk_workspace_dtype field above so every
+    # external-workspace kid has one exact-kid dtype source of truth.
+    fuse_split_k: int = 0
+    # Historical field name retained for #4246/tuned-config compatibility; in
+    # the current N-direction pipeline this is the number of N-tile peers.
+    fuse_m_cluster: int = 1
+
+    # Pre-compiled (.co) family metadata. These fields participate in the
+    # stable symbol/image name and are otherwise consumed only by gfx1250
+    # CO code generation.
     co_num_vgpr: int = 0
     co_min_waves_per_eu: int = 1
-    # Device-pass flags for this entry, verbatim. A tuple so the dataclass stays
-    # hashable-ish and no two instances can share a mutable default.
     co_device_flags: tuple = ()
-    # Free-form name suffix, for entries that differ ONLY in co_device_flags.
     co_variant: str = ""
-    # a/b/c/acc spellings; co_traits_args() in the gfx1250 codegen reads these.
     co_dtypes: tuple = ("bf16_t", "bf16_t", "bf16_t", "fp32_t")
-    # (TileM, TileN): how the 4 waves tile the block. Only the wave-layout co
-    # family reads it; (4, 1) is the fixed layout of the original pipeline.
     co_wave_layout: tuple = (4, 1)
+
+    # Optional logical-M limit imposed by this exact kernel's launch geometry.
+    max_m: int | None = None
 
     @property
     def name(self) -> str:
@@ -174,7 +218,8 @@ class OpusGemmInstance:
         # tag inserts shift right by one slot when arch_prefix is set
         tag_at = 1 + (1 if self.arch_prefix else 0)
         if self.kernel_tag == "a8w8_mxscale_bmm_flatmm_splitk":
-            # opus_bmm_a8w8_mxscale_flatmm_splitk_<geom>_wgpcu{N}[_selfload][_scaleprefetch]
+            # opus_bmm_a8w8_mxscale_flatmm_splitk_<geom>_wgpcu{N}[_selfload]
+            #     [_scaleprefetch][_sfpreload][_sfshuf]
             parts.insert(tag_at, "a8w8_mxscale_flatmm_splitk")
             parts.append(f"wgpcu{self.WG_PER_CU}")
             if self.direct_only:
@@ -183,8 +228,111 @@ class OpusGemmInstance:
                 parts.append("scaleprefetch")
             if self.preload_sf:
                 parts.append("sfpreload")
+            # Same trap as the bdirect branch below, and this one was live: the
+            # flatmm split-K kernel has implemented SHUFFLE_SCALE all along and the
+            # codegen spells it on every kid of that kernel, but no suffix here
+            # meant a shuffle_scale kid would have deduplicated onto its plain
+            # sibling and been emitted as the plain one -- measuring as "the layout
+            # makes no difference" with nothing raised.
+            if self.shuffle_scale:
+                parts.append("sfshuf")
+        elif self.kernel_tag in (
+            "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+            "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+        ):
+            # opus_bmm_a8w8_mxscale_bpreshuffle_bdirect[_tilen]_<geom>_wgpcu{N}
+            #     [_scaleprefetch][_sfpreload]
+            # The two flag suffixes matter: instances are deduplicated by name, so
+            # a tile that differs only by a bool would otherwise silently collapse
+            # onto its plain sibling and never be emitted.
+            #
+            # tilen shows in the T_MxT_N geom field as well (1x2 vs 2x1), so the
+            # tag token is belt and braces -- but the geom field is name-only and
+            # supplied by the factory, and this is the one that tracks the traits
+            # struct actually instantiated.
+            parts.insert(
+                tag_at,
+                (
+                    "a8w8_mxscale_bpreshuffle_bdirect_tilen"
+                    if self.kernel_tag.endswith("_tilen")
+                    else "a8w8_mxscale_bpreshuffle_bdirect"
+                ),
+            )
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.prefetch_scale:
+                parts.append("scaleprefetch")
+            if self.preload_sf:
+                parts.append("sfpreload")
+            if self.shuffle_scale:
+                # "sfshuf_lds" rather than a separate token, so the reg/lds pair of
+                # one kid differs in exactly this suffix and nothing else. Same
+                # rule as the wave8 families below -- and the same reason as the
+                # dedup note above: without it the panel kid hashes to the reg
+                # kid's filename, is never emitted, and the tuner ranks one kernel
+                # against itself while reporting that the panel changed nothing.
+                parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_allwave":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_allwave_<geom>_wgpcu{N}_sfpreload
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_allwave")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.preload_sf:
+                parts.append("sfpreload")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_blds":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_blds_<geom>_wgpcu{N}
+            #     [_scaleprefetch][_sfpreload]
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_blds")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.prefetch_scale:
+                parts.append("scaleprefetch")
+            if self.preload_sf:
+                parts.append("sfpreload")
+            if self.shuffle_scale:
+                parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave8n4":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_<geom>_wgpcu{N}_sfpreload
+            #     [_xcd{N}][_sfgmpack][_sfshuf]
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_wave8n4")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.preload_sf:
+                parts.append("sfpreload")
+            if self.xcd_wgm:
+                parts.append(f"xcd{self.xcd_wgm}")
+            if self.mpack_sfa:
+                parts.append("sfgmpack")
+            if self.shuffle_scale:
+                # "sfshuf_lds" rather than a separate token, so the reg/lds pair of
+                # one kid differs in exactly this suffix and nothing else.
+                parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
+        elif self.kernel_tag in (
+            "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+            "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+        ):
+            # opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1[_blds]_<geom>_wgpcu{N}_sfpreload
+            #     [_xcd{N}][_sfgmpack]
+            parts.insert(
+                tag_at, self.kernel_tag.replace("a8w8_mxscale_bmm_", "a8w8_mxscale_")
+            )
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.preload_sf:
+                parts.append("sfpreload")
+            if self.xcd_wgm:
+                parts.append(f"xcd{self.xcd_wgm}")
+            if self.mpack_sfa:
+                parts.append("sfgmpack")
+            if self.shuffle_scale:
+                parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_compact")
+            parts.append(f"buf{self.num_slots}")
+            if self.early_b:
+                parts.append("earlyb")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave1":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_wave1_<geom>_wgpcu{N}
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_wave1")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.wave1_ring:
+                parts.append(f"ring{self.wave1_ring}")
         elif self.kernel_tag == "a8w8_mxscale_bmm_minterleave":
-            # opus_bmm_a8w8_mxscale_flatmm_minterleave_<geom>_wgpcu{N}[_skip_scale_wait]
             parts.insert(tag_at, "a8w8_mxscale_flatmm_minterleave")
             parts.append(f"wgpcu{self.WG_PER_CU}")
             if self.skip_scale_wait:
@@ -194,11 +342,16 @@ class OpusGemmInstance:
             parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline":
             parts.insert(tag_at, "a8w8_mxscale_pipeline")
-            if self.k1024_only:
-                parts.append("k1024")
-            elif self.k1024_lb1:
-                parts.append("k1024lb1")
-            elif self.preload_sf_lds:
+            if self.preload_sf_lds:
+                parts.append("preload_sf")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline_bpreshuffle":
+            # opus_bmm_a8w8_mxscale_pipeline_bpreshuffle_<geom>[_preload_sf].
+            # Without this branch the tag fell through to the bare default, so
+            # kid31 was named opus_bmm_<geom> alone: it advertised neither the
+            # preshuffled B its caller must pass nor the scale preload, on a
+            # codegen that deduplicates instances by name.
+            parts.insert(tag_at, "a8w8_mxscale_pipeline_bpreshuffle")
+            if self.preload_sf_lds:
                 parts.append("preload_sf")
         elif self.kernel_tag == "a8w8_mxscale_bmm_mouter":
             parts.insert(tag_at, "a8w8_mxscale_flatmm_mouter")
@@ -231,7 +384,7 @@ class OpusGemmInstance:
         elif self.kernel_tag == "a16w16_mono_tile":
             parts.insert(tag_at, "mono_tile")
         elif self.kernel_tag == "a16w16_cluster_tdm_splitk_ws":
-            # gfx1250 fp32-workspace split-K with a separate reduce kernel.
+            # gfx1250 typed-workspace split-K with a separate reduce kernel.
             # Name it opus_gemm_gfx1250_splitk_* (note the "splitk_" segment) so
             # the reduce-TU arch detection in gen_instances.py -- which keys on
             # "opus_gemm_<arch>_splitk_" -- buckets it like the gfx942 splitk kids.
@@ -250,43 +403,29 @@ class OpusGemmInstance:
             parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
             parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
         elif self.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
-            # FUSED single-kernel split-K. The visible segment is "skfuse" (NOT
-            # "splitk_...") so the reduce-TU detection (keys on "_splitk_" in the
-            # kernel name, gen_instances.py) never emits a reduce kernel for it.
-            # It IS still in SPLITK_TAGS (fp32 lookup ABI). m{m}s{split_k}ws{dt}
-            # + cluster geometry keep each (tile, split_k, m_cluster, ws_dtype)
-            # symbol unique.
+            # Keep "splitk_" out of this visible segment: fused kids do not
+            # need a separate reduce-kernel TU. The historical fuse_m_cluster
+            # field is an N-peer count, hence the n{} spelling.
             parts.insert(tag_at, "skfuse")
-            # fuse_m_cluster now groups N-tile peers (A-multicast); tag as n{}.
             parts.append(f"n{self.fuse_m_cluster}s{self.fuse_split_k}")
-            parts.append("wsf32" if self.fuse_ws_dtype == "fp32_t" else "wsbf16")
+            parts.append(
+                "wsf32" if self.splitk_workspace_dtype == "fp32_t" else "wsbf16"
+            )
             parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
-        elif self.kernel_tag.startswith("a16w16_4wave"):
-            # gfx1250 symmetric 4-wave compute pipeline, loaded from a
-            # pre-compiled .co (see include/gfx1250/opus_co_launch_gfx1250.cuh).
-            # This name is used THREE ways and they must stay equal: the host
-            # launcher symbol, the extern "C" kernel symbol inside the .co, and
-            # the .co filename. That identity is what lets the codegen emit the
-            # load call without reading any sidecar. No "splitk_" segment: the
-            # reduce-TU detection in gen_instances.py keys on that substring and
-            # this pipeline has no reduce kernel.
-            #
-            # The trailing segments carry every axis a .co can differ on:
-            # cluster dims, ring depth, the pinned VGPR budget and the
-            # launch_bounds waves-per-EU. Two JSON entries differing in any one
-            # of them are two distinct symbols and two distinct .co files; if
-            # they differ ONLY in device_flags, co_variant separates them.
+        elif self.kernel_tag in _A16W16_CO_TAGS:
+            # The host launcher symbol, ELF entry point and .co filename must
+            # remain identical. Encode every device configuration axis that
+            # can distinguish two pre-built images in this stable name.
             parts.insert(
                 tag_at,
-                (
-                    "4wave_wl_co"
-                    if self.kernel_tag == "a16w16_4wave_wl_co"
-                    else "4wave_co"
-                ),
+                {
+                    "a16w16_4wave_wl_co": "4wave_wl_co",
+                    "a16w16_4wave_wlr_co": "4wave_wlr_co",
+                }.get(self.kernel_tag, "4wave_co"),
             )
-            # Wave layout only shows up for the family that can vary it, so the
+            # Wave layout only shows up for the families that can vary it, so the
             # 4wave_co names already on disk are untouched.
-            if self.kernel_tag == "a16w16_4wave_wl_co":
+            if self.kernel_tag in ("a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"):
                 parts.append(f"w{self.co_wave_layout[0]}x{self.co_wave_layout[1]}")
             parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
             parts.append(f"p{self.num_slots}")
@@ -312,39 +451,138 @@ class OpusGemmInstance:
 
     @property
     def m_align(self) -> int:
-        """M multiple this kid's generated host guard enforces (1 == any M).
-
-        The launcher family decides it, not the kid: see _BMM_M_ALIGN_TILES and
-        the AITER_CHECK blocks the matching launcher body in
-        codegen/gen_instances_gfx950.py emits. Consumers that pick a kid for a
-        shape (the tuner's candidate filter, the runtime's padded-M lookup) must
-        read it from here rather than keep their own list -- two hand-maintained
-        copies is exactly how kid326 ended up excluded from tuning while the
-        runtime dispatched it anyway.
-        """
+        """M multiple enforced by the generated launcher (1 means tail-safe)."""
         mult = _BMM_M_ALIGN_TILES.get(self.kernel_tag)
         if mult is not None:
             return self.B_M * mult if mult else 1
-        # Non-BMM families: has_oob is the codegen flag that says whether the
-        # tail is masked, and opus_gemm_tune.py already gates on it this way.
         return 1 if self.has_oob else self.B_M
 
+    @property
+    def needs_preshuffled_b(self) -> bool:
+        """Whether this kid reads B from shuffle_weight(w, layout=(16, 16)).
 
-# a8w8_mxscale BMM launcher family -> the B_M multiple its host guard requires,
-# or 0 when the launcher masks a partial M tile and emits no M check at all.
-# Mirrors the AITER_CHECK blocks in the launcher bodies of
-# codegen/gen_instances_gfx950.py (_BMM_*_LAUNCHER_BODY); gen_instances asserts
-# the two agree, so a guard edit that forgets this table fails the build.
+        Read it from here for the same reason as m_align: a caller that hands a
+        row-major B to one of these kids gets no error, just a wrong answer, so
+        a hand-maintained second list of "the preshuffled ones" fails silently.
+        The m_align guard did exactly that -- it fed every kid the plain weight
+        and reported ~1.47 relative error for all 15 of them.
+        """
+        return "bpreshuffle" in self.kernel_tag
+
+    @property
+    def needs_mpacked_sfa(self) -> tuple[int, int] | None:
+        """(B_M, SFA_MB) for shuffle_scale_mxsk_mpack, or None for a plain A scale.
+
+        Same silent-wrong-answer hazard as needs_preshuffled_b: the layout is a
+        permutation of the same byte count, so a kid handed the plain (M, K/128)
+        scale runs and returns wrong numbers. SFA_MB = T_M*W_M is the row block one
+        M subtile steps over, which is what the packing folds into the low axis.
+        """
+        if not self.mpack_sfa:
+            return None
+        return self.B_M, self.T_M * self.W_M
+
+    @property
+    def needs_shuffle_scale(self) -> int | None:
+        """shuffle_scale_a's ``sub``, or None for a plain A scale.
+
+        sub is the row distance between the two M subtiles a dword pairs. It is a
+        property of the *layout*, not of this kid's wave grid: the quantize kernel
+        emits the A scale once per launch, so a deployment holds exactly one sub
+        and every kid must read that one. The value is READ FROM THE HEADER
+        (``_opus_sf_shuf_sub()``) rather than restated here -- if the host's sub
+        and the kernel's disagree the kid does not fail, it returns plausible
+        wrong numbers.
+
+        Same silent-wrong-answer hazard as needs_mpacked_sfa: a kid handed the
+        plain panels runs and returns wrong numbers. The A panel goes in with
+        stride(1) as the per-batch slab and stride(0) zeroed; the kernel derives
+        every other term, including the K block pair count, from the problem shape.
+
+        The two pipelines assert their own tile against this sub, so a kid whose
+        grid cannot read it fails to compile.
+        """
+        if not self.shuffle_scale:
+            return None
+        return _opus_sf_shuf_sub()
+
+
+def a16w16_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
+    """Mirror gfx950 ``Traits::prefetch_k_iter`` for host-side planning.
+
+    The exact launcher and both GEMM/BMM tuning paths must agree on the
+    minimum number of K tiles a flatmm instance can consume. Keep this
+    scalar-only calculation next to the canonical instance metadata so the
+    runtime launch plan and tuner do not drift.
+    """
+    sizeof_da = 2  # BF16
+    load_group_m = 64 if instance.W_M >= 32 else 32
+    load_group_n = 64 if instance.W_N >= 32 else 32
+    load_group_k = instance.W_K * 2
+    num_m = instance.B_M // load_group_m
+    num_n = instance.B_N // load_group_n
+    num_k = instance.B_K // load_group_k
+    smem_linear = 64 * 16 // sizeof_da  # WARP_SIZE=64
+    smem_sub = smem_linear // load_group_k
+    slots = load_group_m // smem_sub
+    padding = 16 // sizeof_da if instance.W_M >= 32 else 2 * 16 // sizeof_da
+    per_group_load = slots * (smem_linear + padding) * sizeof_da
+    per_iter = (num_m + num_n) * num_k * per_group_load
+    lds_total = 163840
+    return max(
+        1,
+        (lds_total // max(instance.WG_PER_CU, 1)) // max(per_iter, 1),
+    )
+
+
+def a8w8_mxscale_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
+    """Mirror gfx950 MXFP8 flatmm ``Traits::prefetch_k_iter``."""
+    if instance.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave1":
+        return 1  # the wave1 traits' per-split floor: its ring pads past the end
+    sizeof_da = 1  # FP8
+    is_tile_n = instance.B_M == 16
+    load_group_m = 16 if is_tile_n else 32
+    load_group_n = 16 if is_tile_n else 32
+    load_group_k = instance.W_K
+    num_m = instance.B_M // load_group_m
+    num_n = instance.B_N // load_group_n
+    num_k = instance.B_K // load_group_k
+    smem_linear = 64 * 16 // sizeof_da  # WARP_SIZE=64
+    smem_sub = smem_linear // load_group_k
+    slots = load_group_m // smem_sub
+    padding = 2 * 16 // sizeof_da
+    per_group_load = slots * (smem_linear + padding) * sizeof_da
+    per_iter = (num_m + num_n) * num_k * per_group_load
+    lds_total = 163840
+    return max(
+        1,
+        (lds_total // max(instance.WG_PER_CU, 1)) // max(per_iter, 1),
+    )
+
+
 _BMM_M_ALIGN_TILES = {
     "a8w8_mxscale_bmm_flatmm_splitk": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_blds": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_allwave": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_compact": 0,
     "a8w8_mxscale_bmm_pipeline": 0,
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle": 0,
     "a8w8_mxscale_bmm_fused": 0,
-    "a8w8_mxscale_bmm_minterleave": 2,  # MI=2 M tiles per WG, baked in
-    "a8w8_mxscale_bmm_wave4m2_selfload": 2,  # LOGICAL_B_M = B_M * 2
+    "a8w8_mxscale_bmm_minterleave": 2,
+    "a8w8_mxscale_bmm_wave4m2_selfload": 2,
     "a8w8_mxscale_bmm_wave8n2": 1,
     "a8w8_mxscale_bmm_mouter": 1,
     "a8w8_mxscale_bmm_mouter_tunable": 1,
 }
+
+# GROUP_N=GROUP_K=32 counterparts use the base local kid plus this stride.
+MX32_KID_STRIDE = 1000
 
 
 def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, cachectl_a=0, cachectl_b=17):
@@ -354,11 +592,10 @@ def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, cachectl_a=0, cachectl
     matches the traits-default cache policy for the split-barrier pipeline
     (see opus_gemm_a16w16_traits_gfx950 in
     csrc/opus_gemm/include/gfx950/opus_gemm_traits_a16w16_gfx950.cuh).
-    This is the "legacy" policy used by KID 4..9 and 1004..1009 -- the
+    This is the "legacy" policy used by KID 0..5 and 46..51 -- the
     `_LEGACY_CACHECTL` special-case in OpusGemmInstance.name keeps these
     kids emitting the bare `..._0x0x0` symbol (no `_cA0cB17` suffix) so
-    the production heuristic dispatcher and the opus tuned CSV stay
-    bit-compatible.
+    the Python policy and OPUS tuned CSV stay bit-compatible.
     """
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     inst = OpusGemmInstance(
@@ -408,6 +645,7 @@ def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu, has_oob=True):
         ["fp32_t"],
         wg_per_cu,
         has_oob=has_oob,
+        splitk_workspace_dtype="fp32_t",
     )
 
 
@@ -440,207 +678,905 @@ def _a16w16_flatmm(bm, bn, bk, wg_per_cu):
 # fmt: off
 # --- per-pipeline kernel instance lists ---
 a8w8_scale_kernels_list = {
-    # kid 1 (256x256) is the launcher hardcoded by opus_gemm.cu's
-    # opus_dispatch_scale (the only a8w8_scale GEMM path). The 128x256 sibling
-    # kid 720 was removed below.
-    1: OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
+    0: OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
 }
-
-# Dead 128x256 scale GEMM tiles removed (no CSV/dispatch caller):
-#   - kid 720 (a8w8_scale, fp32 block-scale): only consumer was the removed
-#     opus_bmm_a8w8_scale mmajor path.
-#   - kid 710 (a8w8_mxscale, e8m0 block-scale): only consumer was the opus_bmm
-#     kid 149 hand-written adapter (via the _mmajor sibling), now replaced by
-#     the BMM-native a8w8_mxscale_bmm_pipeline 128x256 instance.
-# Both were the same gemm_a8w8_scale_kernel specialization, differing only in
-# scale dtype; opus_dispatch_scale still uses the 256x256 kid 1 above.
 
 
 def _a8w8_mxscale_bmm_flatmm_splitk(
-    bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False
+    bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False,
+    shuffle_scale=False,
+    quant_block=128,
 ):
-    """fp8 e8m0 mxscale BATCHED matmul flatmm split-K tile.
-
-    Backs opus_bmm_a8w8_mxscale(); the main kernel
-    (gemm_a8w8_mxscale_flatmm_splitk_kernel) writes an fp32 workspace and a
-    shared reduce kernel casts to the Y dtype (bf16/fp32), so output_dtypes is
-    fp32 workspace here. Locked geometry (matches the hand-written traits in
-    opus_bmm.cu): BLOCK_SIZE=256 (4 waves), T_M=2/T_N=1, MFMA 16x16x128 (fp8),
-    VEC=(16,16,4), GROUP=(1,128,128) (per-token M, 128x128 block scale).
-    direct_only / prefetch_scale are the two kernel compile-time booleans.
-    """
-    # tileN (bm==16): consumers split N (T_M=1, T_N=2). tileM (bm>=32): split M
-    # (T_M=2, T_N=1). The real T_M/T_N is derived in the C++ traits from B_M;
-    # these values only drive the generated symbol name, so keep them honest.
+    # quant_block is GROUP_N and GROUP_K together: A and B quantise on the same
+    # block, either DSv4's 128 or MX's 32. GROUP_M stays 1 (per token) for both.
     t_m, t_n = (1, 2) if bm == 16 else (2, 1)
+    inst = OpusGemmInstance(
+        256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4,
+        1, quant_block, quant_block, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
+        wg_per_cu, splitk_workspace_dtype="fp32_t",
+    )
+    inst.name_root = "opus_bmm"
+    inst.direct_only = direct_only
+    inst.prefetch_scale = prefetch_scale
+    inst.preload_sf = preload_sf
+    # The kernel's static_asserts: the shuffle_scale dword pairs adjacent M
+    # subtiles and spans at most two K blocks, and it replaces the LDS panels
+    # rather than filling them. SFA_MB = T_M*W_M = 32 for this family.
+    if shuffle_scale:
+        assert not preload_sf, "shuffle_scale replaces the LDS scale panels"
+        assert bm % 64 == 0, f"B_M={bm}: shuffle_scale needs COM_REP_M even"
+        assert bk // 128 <= 2, f"B_K={bk}: shuffle_scale spans at most two K blocks"
+    inst.shuffle_scale = shuffle_scale
+    return inst
+
+
+_BMM_MXSCALE_SPLITK_TILES = {
+    67: (16,  32, 256, 2, False, False),
+    68: (16,  32, 256, 2, False, True),
+    69: (16,  32, 128, 2, False, False),
+    70: (16,  32, 256, 4, False, False),
+    66: (16,  32, 512, 2, False, False),
+    65: (16,  64, 256, 2, False, False),
+    64: (16, 128, 256, 1, False, False),
+    63: (16,  32, 512, 2, False, True),
+    72: (32,  32, 256, 2, False, True),
+    74: (32,  32, 128, 2, False, True),
+    71: (64,  32, 256, 2, False, False),
+    73: (64,  32, 256, 1, False, False),
+    140: (32,  64, 256, 2, False, False),
+    141: (32,  64, 256, 1, False, False),
+    142: (32,  64, 256, 2, True,  False),
+    143: (64,  64, 128, 2, False, False),
+    144: (64,  64, 128, 2, False, True),
+    4: (128, 128, 128, 1, False, False),
+    8: (128, 128, 128, 1, False, True),
+    9: (64,  128, 256, 1, False, False),
+    10: (128, 64,  256, 1, False, False),
+    62: (32, 256, 128, 1, False, False),
+    2:  (64, 128, 128, 2, False, False),
+    0:   (32, 128, 128, 2, False, False),
+    1:  (32, 128, 128, 2, False, False),
+}
+_bmm_flatmm_local = {
+    kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, direct, prefetch)
+    for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
+}
+_BMM_MXSCALE_SPLITK_PRELOAD_TILES = {
+    75: (64, 32, 256, 2),
+    76: (128, 128, 128, 1),
+    77: (128, 64, 256, 1),
+    78: (64, 128, 256, 1),
+}
+_bmm_flatmm_local.update({
+    kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, preload_sf=True)
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
+})
+
+
+
+# Preshuffled-weight MXFP8 BMM kernel registrations.
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg_per_cu, prefetch_scale=False,
+                                          preload_sf=False, shuffle_scale=False,
+                                          tilen=False, sf_shuf_in_lds=False,
+                                          quant_block=128):
+    """Preshuffled B bypassing LDS, on the flatmm producer/consumer split.
+
+    Same kernel, launcher and tile geometry as the plain flatmm split-K family
+    (BLOCK_SIZE=256, MFMA 16x16x128, VEC=(16,16,4), GROUP=(1,128,128)); the
+    traits alias flips the B layout, the MFMA scale_op_sel byte select and B's
+    path. The 16x16 preshuffle order already IS the mfma_16x16x128 B fragment
+    order, so the consumer waves buffer_load B straight into their MFMA registers
+    and the producer waves stage A only. Callers pass shuffle_weight(w, (16, 16)).
+    """
+    # Same tileN/tileM naming rule as the plain flatmm split-K family: the real
+    # T_M/T_N comes from B_M in the traits, these only drive the symbol name.
+    # tilen forces the B_M == 16 grid onto a wider tile, so the name has to follow
+    # the traits rather than B_M.
+    t_m, t_n = (1, 2) if (bm == 16 or tilen) else (2, 1)
     inst = OpusGemmInstance(
         256,            # BLOCK_SIZE
         bm, bn, bk,     # BLOCK tile
         t_m, t_n,       # T_M, T_N (4-wave warp-spec; tileN=1,2 / tileM=2,1)
         16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
-        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
-        "a8w8_mxscale_bmm_flatmm_splitk",
-        # Single <fp32_t> host instantiation: the launcher is templated on D_C
-        # only to satisfy the codegen host-decl machinery; its body ignores D_C
-        # and branches on Y.dtype() at runtime (native __bf16/float), exactly
-        # like the hand-written _impl. The fp32 split-K workspace dtype is fixed
-        # inside the traits, and the reduce kernel casts to the runtime Y dtype.
-        ["fp32_t"],
+        # GROUP_M=1 (per-token); GROUP_N=GROUP_K=quant_block, DSv4's 128 or MX's
+        # 32. The traits this family derives from carry the 32 path, so the only
+        # thing that made these 128-only was the literal.
+        1, quant_block, quant_block,
+        ("a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen" if tilen
+         else "a8w8_mxscale_bmm_bpreshuffle_bdirect"),
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
         wg_per_cu,
     )
     inst.name_root = "opus_bmm"
-    inst.direct_only = direct_only
     inst.prefetch_scale = prefetch_scale
     inst.preload_sf = preload_sf
+    inst.shuffle_scale = shuffle_scale
+    # The shuffled layout's own LDS scale panel. Distinct from preload_sf, which
+    # stages the *plain* panel and is mutually exclusive with shuffle_scale in
+    # this pipeline (both fill the same LDS, with different addressing) -- so a
+    # panel kid here reads preload_sf False and sf_shuf_in_lds True, where a wave8
+    # panel kid carries both.
+    assert not sf_shuf_in_lds or shuffle_scale, (
+        "sf_shuf_in_lds stages the shuffled scale words; it means nothing without "
+        "shuffle_scale"
+    )
+    assert not (sf_shuf_in_lds and preload_sf), (
+        "the plain and shuffled scale panels are alternative fills of the same "
+        "LDS; the pipeline static_asserts they never coexist"
+    )
+    inst.sf_shuf_in_lds = sf_shuf_in_lds
     return inst
 
 
-# fp8 e8m0 mxscale BMM flatmm split-K tiles. kid numbers preserved from the old
-# opus_bmm.cu switch so existing tuned CSVs / heuristics keep working. Each kid =
-# (B_M, B_N, B_K, WG_PER_CU, direct_only, prefetch_scale). Big-tile pipelines
-# (mouter / minterleave / wave*n* / pipeline, kids 131/132/134/140-163/149-152)
-# stay monolithic in opus_bmm.cu and are NOT migrated here.
-_BMM_MXSCALE_SPLITK_TILES = {
-    # tileN (B_M=16): single 16-row MFMA M-wave so small-M/decode shapes (M<=32)
-    # don't over-compute a fat B_M tile. Targets the G=2 K=4096 M<=32 gap vs bf16.
-    316: (16,  32,  256, 2, False, False),
-    317: (16,  32,  256, 2, False, True),    # scale prefetch
-    318: (16,  32,  128, 2, False, False),
-    # prefetch-depth sweep: higher WG_PER_CU shrinks per-WG LDS -> shallower
-    # prefetch_k_iter + more occupancy (small-M/few-tile shapes want this).
-    319: (16,  32,  256, 4, False, False),
-    314: (16,  32,  512, 2, False, False),   # fewer K-iters (8) per WG
-    # wider-N tileN: larger B_N raises COM_REP_N (more MFMA/iter) to hide
-    # ds_read+scale latency; WG_PER_CU keeps prefetch_k_iter >= 3.
-    313: (16,  64,  256, 2, False, False),   # COM_REP_N=2
-    312: (16, 128,  256, 1, False, False),   # COM_REP_N=4
-    # M=16/32 last-mile (G=2 N=1024 K=4096): 311 = wide-K tileN + scale prefetch;
-    # 321/323 = 32x32 tileM (exact M=32 fit, no OOB waste, COM_REP_N=2).
-    311: (16,  32,  512, 2, False, True),
-    321: (32,  32,  256, 2, False, True),
-    323: (32,  32,  128, 2, False, True),
-    # fine tiles (small / mid M)
-    320: (64,  32,  256, 2, False, False),
-    322: (64,  32,  256, 1, False, False),
-    # kid324 = kid320 tile + SFA+SFB scale panels preloaded into LDS
-    # (PRELOAD_SF_LDS; wired via the preload-tiles dict below, not the 6-tuple).
-    # ATT on kid320 showed ~20% of consumer cycles stalled on vmcnt for the
-    # per-K-tile global scale load; staging both panels into LDS once (ds_read /
-    # lgkmcnt) breaks the mid-M valley: G4 K4096 M256 0.93->1.00x, M512
-    # 0.94->1.01x, M192 0.91->0.98x vs bf16 (+8-26% TFLOPS over kid320, M128-1024).
-    # Other attempts (scaleprefetch, B_K=128/512, wg4, 64x64 splitK) all <= kid320.
-    640: (32,  64,  256, 2, False, False),
-    642: (32,  64,  256, 1, False, False),
-    646: (32,  64,  256, 2, True,  False),   # consumer self-load (splitK==1)
-    650: (64,  64,  128, 2, False, False),
-    653: (64,  64,  128, 2, False, True),    # scale prefetch
-    # No 64x64x256 kid: mirroring bf16's MT64x64x256 forces wg_per_cu=1 (LDS
-    # ~198KB), so at M=256 it runs half the WGs and lands 0.77x vs bf16. bf16 only
-    # wins it via stream-K (refills low tile count), which the flatmm pipeline lacks.
-    128: (128, 128, 128, 1, False, False),
-    137: (128, 128, 128, 1, False, True),    # scale prefetch
-    138: (64,  128, 256, 1, False, False),
-    139: (128, 64,  256, 1, False, False),
-    # baseline tiles (guaranteed-runnable fallbacks; kid 0 is the heuristic default)
-    256: (32,  256, 128, 1, False, False),
-    64:  (64,  128, 128, 2, False, False),
-    0:   (32,  128, 128, 2, False, False),
-    32:  (32,  128, 128, 2, False, False),
+# bdirect tiles use producer waves for A and consumer waves for direct B loads.
+# Scale-panel variants preload E8M0 scales; the small-M tiles retain the
+# producer/consumer split with a 16-row output tile.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)
+    28: (16, 32, 512, 2),
+    26: (16, 32, 256, 2),
+    # kid24 omits the scale panels used by kid25.
+    24: (64, 32, 256, 2),
 }
-a8w8_mxscale_bmm_flatmm_splitk_kernels_list = {
-    kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, direct, prefetch)
-    for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
+_bmm_bpre_bdirect_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg)
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILES.items()
 }
+# Plain-scale panel variant of the BM16 tile. COM_REP_M=1 lets the panel
+# use the caller's row-major scale layout directly.
+_bmm_bpre_bdirect_local[89] = (
+    _a8w8_mxscale_bmm_bpreshuffle_bdirect(
+        16, 32, 512, 2, prefetch_scale=False, preload_sf=True
+    )
+)
 
-# SFA/SFB-into-LDS preload variants (PRELOAD_SF_LDS). Kept in a separate dict so
-# the base 6-tuple stays untouched; each entry is (B_M, B_N, B_K, WG_PER_CU) and
-# always sets preload_sf=True (non-direct, non-prefetch).
-_BMM_MXSCALE_SPLITK_PRELOAD_TILES = {
-    324: (64, 32, 256, 2),  # = kid320 + SFA/SFB scale panels preloaded to LDS
-    # mid-M wg1 tiles + SFA/SFB preload (same mechanism as kid324/kid158): staging
-    # both scale panels into LDS removes the per-K-tile global scale vmcnt load that
-    # gated the plain/scaleprefetch tiles. On K=4096 M256-2048 this wins +13-17%
-    # over the old kid137/653/139 picks (kid325 ships G2/M2048, G4/M1024, G8/M512,
-    # G16/M256; kid326 ships G8/M256). K=1024 gains are ~noise (few K-tiles). kid327
-    # kept as a candidate but wins nothing robustly (clock-fragile at cold sclk).
-    325: (128, 128, 128, 1),  # = kid128/137 tile + preload
-    326: (128, 64,  256, 1),  # = kid139 tile + preload
-    327: (64,  128, 256, 1),  # = kid138 tile + preload
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_PRELOAD_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)
+    25: (64, 32, 256, 2),
+    # 128x128x128 bdirect tile with preloaded scale panels.
+    29: (128, 128, 128, 1),
 }
-a8w8_mxscale_bmm_flatmm_splitk_kernels_list.update({
-    kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, preload_sf=True)
-    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
+# Larger B_K=256 tiles require additional staging and fragment registers.
+# This family uses B_K=128 for its wider tiles to stay within those budgets.
+_bmm_bpre_bdirect_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, preload_sf=True)
+    for kid, (bm, bn, bk, wg)
+    in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_PRELOAD_TILES.items()
 })
 
 
-def _a8w8_mxscale_bmm_minterleave(bm, bn, bk, wg_per_cu, skip_scale_wait=False):
-    """fp8 e8m0 mxscale BATCHED matmul M-tile-interleaved tile.
+def _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg_per_cu, prefetch_scale=False,
+                                       preload_sf=False, shuffle_scale=False,
+                                       sf_shuf_in_lds=False, quant_block=128):
+    """Preshuffled B staged through LDS by producer waves.
 
-    Backs opus_bmm_a8w8_mxscale() kids 162/163. The main kernel
-    (gemm_a8w8_mxscale_flatmm_minterleave_kernel<Traits, D_OUT, SKIP_SCALE_WAIT>)
-    processes MI=2 consecutive M tiles per WG (baked in the launcher, requires
-    M % (MI*B_M) == 0); splitK is unused (must be 1). Same locked geometry /
-    traits as the flatmm split-K family (BLOCK_SIZE=256, T_M=2/T_N=1, MFMA
-    16x16x128, VEC=(16,16,4), GROUP=(1,128,128), fp32 workspace tuple slot).
-    """
+    Consumers read their MFMA fragments from LDS. The tile geometry matches
+    the plain flatmm family; the traits select B's byte order and scale_op_sel.
+    Callers pass shuffle_weight(w, (16, 16))."""
     t_m, t_n = (1, 2) if bm == 16 else (2, 1)
     inst = OpusGemmInstance(
         256,            # BLOCK_SIZE
         bm, bn, bk,     # BLOCK tile
-        t_m, t_n,       # T_M, T_N (name only)
-        16, 16, 128,    # W_M, W_N, W_K (name only)
+        t_m, t_n,       # T_M, T_N
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
-        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
-        "a8w8_mxscale_bmm_minterleave",
+        # GROUP_M=1 (per-token); GROUP_N=GROUP_K=quant_block, 128 or MX's 32.
+        1, quant_block, quant_block,
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        ["fp32_t"],
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.prefetch_scale = prefetch_scale
+    inst.preload_sf = preload_sf
+    inst.shuffle_scale = shuffle_scale
+    assert not (shuffle_scale and preload_sf), (
+        "preload_sf stages the *plain* scale panel and reads it with the plain "
+        "layout's addressing; the two flags are mutually exclusive (static_assert "
+        "in opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh). A shuffled "
+        "kid that wants an LDS panel asks for sf_shuf_in_lds instead."
+    )
+    assert not sf_shuf_in_lds or shuffle_scale, (
+        "sf_shuf_in_lds stages the shuffled scale words; it means nothing without "
+        "shuffle_scale"
+    )
+    inst.sf_shuf_in_lds = sf_shuf_in_lds
+    return inst
+
+
+# Map each plain flatmm tile to its preshuffled-B/LDS counterpart.
+# Keep explicit IDs so existing tuned configurations remain valid.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF = {
+    72: 35,
+    144: 36,
+    75: 37,
+    76: 38,
+    77: 39,
+    1: 60,
+    2: 61,
+    4: 40,
+    8: 41,
+    9: 42,
+    10: 43,
+    62: 44,
+    63: 45,
+    64: 46,
+    65: 47,
+    66: 48,
+    67: 49,
+    68: 50,
+    69: 51,
+    70: 52,
+    71: 53,
+    73: 54,
+    74: 55,
+    78: 56,
+    140: 57,
+    141: 58,
+    143: 59,
+}
+_bmm_bpre_blds_local = {
+    twin: _a8w8_mxscale_bmm_bpreshuffle_blds(
+        plain.B_M, plain.B_N, plain.B_K, plain.WG_PER_CU,
+        prefetch_scale=plain.prefetch_scale,
+        preload_sf=plain.preload_sf,
+    )
+    for plain, twin in (
+        # The twin map uses this family's local kid numbers.
+        (_bmm_flatmm_local[plain_kid], twin_kid)
+        for plain_kid, twin_kid in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF.items()
+    )
+}
+
+# Plain-scale panel variant of the BM16 tile with prefetched A scales.
+# COM_REP_M=1 allows direct panel loads from the caller's scale layout.
+_bmm_bpre_blds_local[88] = (
+    _a8w8_mxscale_bmm_bpreshuffle_blds(
+        32, 32, 256, 2, prefetch_scale=False, preload_sf=True
+    )
+)
+
+# kid142 is the DIRECT_ONLY persistent schedule, which carries its own B staging
+# and rejects the flags this family sets. kid0 is the heuristic default and an
+# alias of kid1's geometry, whose preshuffled twin covers its tile.
+_BLDS_NO_TWIN = {0, 142}
+_blds_untwinned = sorted(
+    kid
+    for kid in _bmm_flatmm_local
+    if kid not in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF and kid not in _BLDS_NO_TWIN
+)
+assert not _blds_untwinned, (
+    f"plain flatmm kids {_blds_untwinned} have no preshuffled-B twin. A preshuffled "
+    "deployment cannot dispatch a row-major kid, so any cell one of these wins is a "
+    "cell preshuffling B costs performance on. Add an id to "
+    "_BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF, or to _BLDS_NO_TWIN with the reason."
+)
+
+# Small tiles compatible with the shuffled-scale layout.
+# Each shuffled-scale variant retains its plain counterpart's geometry.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_SCALE_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, prefetch_scale)   plain winner it answers
+    270: (16, 32, 256, 4, False),   # kid52
+    271: (32, 32, 256, 2, True),    # kid35
+    # kid272 wins nothing, and neither does its plain twin kid47. Kept only so
+    # kid47's tile stays expressible under the wholesale switch; retire together.
+    272: (16, 64, 256, 2, False),   # kid47
+    # kid48 is the same tile without prefetch and deliberately gets no twin: it
+    # wins nothing, so a twin would measure a kid the tuner never picks.
+    274: (16, 32, 512, 2, True),    # kid45
+}
+_bmm_bpre_blds_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg, prefetch_scale=pf,
+                                            shuffle_scale=True)
+    for kid, (bm, bn, bk, wg, pf)
+    in _BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_SCALE_TILES.items()
+})
+
+# blds variant with an LDS shuffled-scale panel.
+# The registered BM32 tile fully consumes each packed scale word.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_PANEL_TILES = {
+    276: (32, 32, 256, 2, True),    # kid271 + panel
+}
+_bmm_bpre_blds_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg, prefetch_scale=pf,
+                                            shuffle_scale=True, sf_shuf_in_lds=True)
+    for kid, (bm, bn, bk, wg, pf)
+    in _BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_PANEL_TILES.items()
+})
+
+# The shuffled-scale bdirect twins. A shuffled kid reads its A scale as packed
+# dwords instead of per-subtile bytes, so it replaces the plain LDS scale panel
+# rather than filling it -- one twin therefore answers both the panelled and the
+# un-panelled member of a plain pair (kid248 stands against kid24 and kid25).
+#
+# Flags track the plain twin; the per-kid comment names it.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_SCALE_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, prefetch_scale)     twin of
+    248: (64, 32, 256, 2, False),    # kid24 / kid25
+    249: (128, 128, 128, 1, False),  # kid29
+    # ... and the same two tiles with the scale load hoisted ahead of the LDS wait.
+    # PREFETCH_SCALE is only testable here: the wave8n4/wavetm1 pipeline
+    # static_asserts !PREFETCH_SCALE.
+    250: (64, 32, 256, 2, True),     # kid248 + prefetch
+    251: (128, 128, 128, 1, True),   # kid249 + prefetch
+    269: (16, 32, 256, 2, False),    # kid26
+    # B_K=512, i.e. COM_REP_K=4, which spends two A-scale dwords along K
+    # (SF_GEOM::KD). prefetch_scale is off because kid28 does not have it and
+    # SF_PREFETCH is gated on COM_REP_K==1 anyway, so it would be inert.
+    273: (16, 32, 512, 2, False),    # kid28
+}
+_bmm_bpre_bdirect_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, prefetch_scale=pf,
+                                               shuffle_scale=True)
+    for kid, (bm, bn, bk, wg, pf)
+    in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_SCALE_TILES.items()
+})
+
+# Shuffled-scale variants with an LDS panel. The prologue stages scales
+# once so the K loop reads the panel from LDS. SF_SHUF_IN_LDS and
+# SUBTILE_TILE remain separate registered traits.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_PANEL_TILES = {
+    275: (16, 32, 512, 2, False),    # kid273 + panel
+}
+_bmm_bpre_bdirect_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, prefetch_scale=pf,
+                                               shuffle_scale=True, sf_shuf_in_lds=True)
+    for kid, (bm, bn, bk, wg, pf)
+    in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_PANEL_TILES.items()
+})
+
+# Paired plain-panel and shuffled-scale bdirect configurations.
+# B_M=128 uses B_K=128 to satisfy the minimum prefetch depth.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE = {
+    #    (B_M, B_N, B_K, WG_PER_CU)   term moved, and what it moves
+    (79, 252): (64,  32,  128, 2),   # B_K  256->128: COM_REP_K 2->1
+    (80, 253): (128, 32,  128, 2),   # B_M   64->128: COM_REP_M 2->4, vs (336,337)
+    (81, 254): (64,  32,  256, 1),   # WG_PER_CU 2->1: occupancy only, geometry fixed
+    # (344, 345): (64, 128, 256, 1) -- B_N 32->128, vs (342,343). Unwired, see below.
+}
+# The 64x128x256 bdirect variants are not instantiated because of register
+# pressure. LDS feasibility alone does not establish register feasibility.
+for (_plain_kid, _shuf_kid), (_bm, _bn, _bk, _wg) in (
+    _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE.items()
+):
+    _bmm_bpre_bdirect_local[_plain_kid] = (
+        _a8w8_mxscale_bmm_bpreshuffle_bdirect(_bm, _bn, _bk, _wg, preload_sf=True)
+    )
+    _bmm_bpre_bdirect_local[_shuf_kid] = (
+        _a8w8_mxscale_bmm_bpreshuffle_bdirect(_bm, _bn, _bk, _wg, prefetch_scale=True,
+                                              shuffle_scale=True)
+    )
+
+
+# bdirect variants with the T_M=1, T_N=2 consumer grid at B_M > 16.
+# These remain registered but are excluded from the default tuning policy.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILEN_TILES = {
+    #    (B_M, B_N, B_K, WG_PER_CU, preload_sf)   corresponding shuffled-scale ID
+    85: (64, 32, 256, 1, True),    # kid81 (wg1 + panels)
+    86: (64, 32, 256, 2, True),    # kid25 (wg2 + panels), the family's m<=256 winner
+    87: (64, 32, 256, 2, False),   # kid24 (wg2, no panels), owns the K=1024 end
+}
+_bmm_bpre_bdirect_tilen_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, preload_sf=pre,
+                                               tilen=True)
+    for kid, (bm, bn, bk, wg, pre)
+    in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILEN_TILES.items()
+}
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_allwave(bm, bn, bk, wg_per_cu, quant_block=128):
+    """Four compute waves on a 2x2 grid, with both A and preshuffled B in LDS.
+
+    All waves stage operands into the ring and perform MFMA."""
+    inst = OpusGemmInstance(
+        256,            # BLOCK_SIZE (4 waves)
+        bm, bn, bk,     # BLOCK tile
+        2, 2,           # T_M, T_N (name only; ALL_WAVE derives the 2x2 grid)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, quant_block, quant_block,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K
+        "a8w8_mxscale_bmm_bpreshuffle_allwave",
+        ["fp32_t"],
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.preload_sf = True
+    return inst
+
+
+# A and B both staged means twice the LDS per ring slot: 64x64x256 at two
+# workgroups a CU and 128x128x256 at one leave fewer than the three slots the
+# pipeline needs, so neither is here.
+_BMM_MXSCALE_BPRESHUFFLE_ALLWAVE_TILES = {
+    #    (B_M, B_N, B_K, WG_PER_CU)
+    100: (64, 64, 256, 1),
+    101: (64, 64, 128, 2),
+    102: (64, 128, 256, 1),
+    103: (64, 128, 128, 2),
+    104: (128, 64, 256, 1),
+    105: (128, 128, 128, 1),
+    106: (128, 64, 128, 2),
+}
+_bmm_bpre_allwave_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_allwave(bm, bn, bk, wg)
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_ALLWAVE_TILES.items()
+}
+# No GROUP_K=32 twins yet: the all-wave traits cap B_N at GROUP_N, which at 32
+# rejects every tile here.
+
+
+# Derive GROUP_N=GROUP_K=32 variants from existing plain-scale instances.
+# Geometry and scheduling stay aligned with their group128 counterparts.
+# Shuffled-scale variants require a different producer layout and are excluded.
+def _mx32_twins(local, ctor, skip=frozenset(), **ctor_kwargs):
+    """{mirror + MX32_KID_STRIDE: the same tile at quant_block=32}.
+
+    `skip` holds mirrors whose twin clang 22 cannot compile, the same defect
+    _MX32_CLANG_REGCLASS_SKIP covers for the split-K family, plus any whose twin
+    is held out for returning wrong answers.
+    """
+    twins = {}
+    for kid, inst in local.items():
+        if kid in skip:
+            continue
+        if inst.shuffle_scale or getattr(inst, "sf_shuf_in_lds", False):
+            continue
+        twins[kid + MX32_KID_STRIDE] = ctor(
+            inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
+            prefetch_scale=inst.prefetch_scale,
+            preload_sf=inst.preload_sf,
+            quant_block=32,
+            **ctor_kwargs,
+        )
+    return twins
+
+
+_bmm_bpre_bdirect_local.update(
+    _mx32_twins(_bmm_bpre_bdirect_local, _a8w8_mxscale_bmm_bpreshuffle_bdirect)
+)
+_bmm_bpre_blds_local.update(
+    # Exclude group32 variants affected by ROCm 7.2.4 clang-22 register
+    # allocation defects: kid44 fails register-class validation, while
+    # kids40/41 can reload an incomplete spilled MFMA accumulator.
+    _mx32_twins(_bmm_bpre_blds_local, _a8w8_mxscale_bmm_bpreshuffle_blds,
+                skip=frozenset({44, 40, 41}))
+)
+_bmm_bpre_bdirect_tilen_local.update(
+    _mx32_twins(_bmm_bpre_bdirect_tilen_local,
+                _a8w8_mxscale_bmm_bpreshuffle_bdirect, tilen=True)
+)
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg_per_cu, xcd_wgm=0,
+                                          mpack_sfa=False, shuffle_scale=False,
+                                          sf_shuf_in_lds=False, quant_block=128):
+    """Eight compute waves on a 2x4 grid with preshuffled B loaded directly.
+
+    SCALE_OPSEL requires COM_REP_M = B_M/(W_M*T_M) to be a multiple of four.
+    Eight waves distribute the accumulator and fragment register footprint.
+    Only A is staged in LDS; B loads are consumed one N repeat at a time."""
+    inst = OpusGemmInstance(
+        512,            # BLOCK_SIZE (8 waves)
+        bm, bn, bk,     # BLOCK tile
+        2, 4,           # T_M, T_N (name only; traits derive the real 2x4 grid)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, quant_block, quant_block,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K
+        "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
         ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
         wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.preload_sf = True
+    inst.xcd_wgm = xcd_wgm
+    inst.mpack_sfa = mpack_sfa
+    inst.shuffle_scale = shuffle_scale
+    assert not sf_shuf_in_lds or shuffle_scale, (
+        "sf_shuf_in_lds stages the shuffled scale words; it means nothing without "
+        "shuffle_scale"
+    )
+    inst.sf_shuf_in_lds = sf_shuf_in_lds
+    return inst
+
+
+_BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)
+    30: (256, 256, 128, 1),
+    # Half-M tile satisfying the SCALE_OPSEL COM_REP_M alignment.
+    23: (128, 256, 128, 1),
+    # 128x128 tile with the wave8n4 schedule.
+    27: (128, 64,  256, 1),
+    # 128x128 wave8n4 variants at two K tile depths.
+    83: (128, 128, 256, 1),
+    84: (128, 128, 128, 1),
+}
+_bmm_bpre_wave8n4_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg)
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_TILES.items()
+}
+
+# wave8n4 variants with XCD-aware banded workgroup mapping.
+# XCD_WGM selects the M-band height; zero keeps the linear tile order.
+_BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_XCD_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, XCD_WGM)     twin of
+    82: (256, 256, 128, 1, 4),               # kid30 + FlyDSL's band height
+    # Apply band height 4 to the additional 2x4 tiles.
+    90: (128, 64,  256, 1, 4),               # kid27 + band 4
+    91: (128, 128, 256, 1, 4),               # kid83 + band 4
+    # 347: (256, 256, 128, 1, 2),             # kid30 + half of it; noise, see above
+}
+_bmm_bpre_wave8n4_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg, xcd_wgm=wgm)
+    for kid, (bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_XCD_TILES.items()
+})
+
+# Shuffled-scale counterparts of the wave8n4 tiles.
+# The scale layout is fixed by its producer; every selected kernel must
+# consume that same layout. This wave grid uses SHUF_SUB=32 to pair
+# M subtiles in each packed scale word.
+_BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_SHUFFLE_SCALE_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)     twin of
+    245: (256, 256, 128, 1),         # kid30
+    246: (128, 256, 128, 1),         # kid23
+    247: (128, 64,  256, 1),         # kid27 -- also the only COM_REP_K=2 shuffled kid
+}
+_bmm_bpre_wave8n4_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg, shuffle_scale=True)
+    for kid, (bm, bn, bk, wg)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_SHUFFLE_SCALE_TILES.items()
+})
+
+# Additional wave8n4 shuffled-scale counterparts with matching geometry.
+_BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_SHUF_TWIN_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, XCD_WGM, SF_SHUF_IN_LDS)   twin of
+    # -- reg form, the tiles that had no shuffled twin at all --
+    255: (256, 256, 128, 1, 4, False),                    # kid82  (15 rows)
+    256: (128, 128, 256, 1, 0, False),                    # kid83
+    257: (128, 128, 128, 1, 0, False),                    # kid84
+    # -- lds form, one per tile above plus one per kid245/246/247 --
+    258: (256, 256, 128, 1, 0, True),                     # kid30 / kid245
+    259: (128, 256, 128, 1, 0, True),                     # kid23 / kid246
+    260: (128, 64,  256, 1, 0, True),                     # kid27 / kid247
+    261: (256, 256, 128, 1, 4, True),                     # kid82 / kid255
+    262: (128, 128, 256, 1, 0, True),                     # kid83 / kid256
+    263: (128, 128, 128, 1, 0, True),                     # kid84 / kid257
+}
+_bmm_bpre_wave8n4_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg, xcd_wgm=wgm,
+                                               shuffle_scale=True,
+                                               sf_shuf_in_lds=lds)
+    for kid, (bm, bn, bk, wg, wgm, lds)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_SHUF_TWIN_TILES.items()
+})
+
+# B_K=256 variants with matched plain and shuffled-scale configurations.
+
+
+
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_wavetm1(block_size, bm, bn, bk, wg_per_cu,
+                                          xcd_wgm=0, mpack_sfa=False,
+                                          shuffle_scale=False, sf_shuf_in_lds=False,
+                                          quant_block=128, blds=False):
+    """T_M=1 tiles with A fragments retained in registers at B_M=128.
+
+    BLOCK_SIZE selects a 1x8 or 1x4 grid. The blds variant stages B through
+    the LDS ring; the direct-B variant loads it into registers."""
+    inst = OpusGemmInstance(
+        block_size,     # BLOCK_SIZE (512 -> 8 waves / 1x8, 256 -> 4 waves / 1x4)
+        bm, bn, bk,     # BLOCK tile
+        1, block_size // 64,  # T_M, T_N (name only; traits derive the real grid)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, quant_block, quant_block,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1" + ("_blds" if blds else ""),
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.preload_sf = True
+    inst.xcd_wgm = xcd_wgm
+    inst.mpack_sfa = mpack_sfa
+    inst.shuffle_scale = shuffle_scale
+    assert not sf_shuf_in_lds or shuffle_scale, (
+        "sf_shuf_in_lds stages the shuffled scale words; it means nothing without "
+        "shuffle_scale"
+    )
+    inst.sf_shuf_in_lds = sf_shuf_in_lds
+    return inst
+
+
+# T_M=1 tiles. BLOCK_SIZE selects the number of N waves.
+# At B_M=128 the A fragments stay in registers; larger tiles use the
+# family's LDS streaming schedule.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU)
+    32: (512, 128, 256, 128, 1),
+    33: (256, 128, 256, 128, 1),
+}
+_bmm_bpre_wavetm1_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg)
+    for kid, (bs, bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_TILES.items()
+}
+
+# wavetm1 variants with XCD-aware workgroup rasterization.
+# The mapping groups nearby M tiles into bands to share cache-resident
+# operands. XCD_WGM selects the band height.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_XCD_TILES = {
+    # (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    34: (256, 128, 256, 128, 1, 4),   # kid33 with band height 4
+    92: (512, 128, 256, 128, 1, 4),   # = kid32 (1x8) + band 4
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_XCD_TILES.items()
+})
+
+# kid243 uses SFA_MPACK_GLOBAL: the caller supplies the A scale panel
+# packed along M instead of having the prologue pack ordinary scales.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_MPACK_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    243: (256, 128, 256, 128, 1, 4),
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm,
+                                               mpack_sfa=True)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_MPACK_TILES.items()
+})
+
+# Narrower wavetm1 tiles on the 1x4 compute-wave grid.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    93: (256, 64, 128, 256, 1, 4),
+    94: (256, 128, 128, 128, 1, 4),
+    95: (256, 64, 256, 128, 1, 4),
+    96: (256, 64, 64, 256, 1, 4),
+    97: (256, 128, 64, 256, 1, 4),
+    98: (256, 128, 128, 256, 1, 4),
+    99: (256, 64, 128, 128, 1, 4),
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_TILES.items()
+})
+
+# The 1x4 tiles at two workgroups per CU.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_WG2_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    117: (256, 128, 128, 128, 2, 4),
+    118: (256, 64, 128, 256, 2, 4),
+    119: (256, 64, 256, 128, 2, 4),
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_WG2_TILES.items()
+})
+
+# The 1x4 tiles with B staged through the LDS ring (wavetm1_blds). kid120 is
+# flydsl's b2/m2048 tile, 128x128x128 at four slots; the others are the 1x4
+# tiles whose A+B slot still leaves three.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_BLDS_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    120: (256, 128, 128, 128, 1, 4),
+    121: (256, 64, 128, 128, 1, 4),
+    122: (256, 64, 128, 256, 1, 4),
+    123: (256, 128, 256, 128, 1, 4),
+    # Two-wave decode tiles using the shared A/B LDS staging schedule.
+    # The B-LDS variant also participates in the scale-panel residency budget.
+    124: (128, 16, 32, 256, 2, 0),
+}
+_bmm_bpre_wavetm1_blds_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm, blds=True)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_BLDS_TILES.items()
+}
+
+# kid244 reads both scales in the shuffle_scale_a / shuffle_scale_b layout.
+# Each scale word packs two M subtiles crossed with two K blocks; B bytes
+# are duplicated for the shared scale_op_sel selection. At B_K=128 the
+# K loop unrolls by two to select the two K blocks in each word.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_SHUFFLE_SCALE_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    244: (256, 128, 256, 128, 1, 4),
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm,
+                                               shuffle_scale=True)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_SHUFFLE_SCALE_TILES.items()
+})
+
+# Matched plain and shuffled-scale wavetm1 configurations.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_SHUF_TWIN_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM, SF_SHUF_IN_LDS)  twin of
+    # -- reg form; kid34's is kid244 above --
+    264: (512, 128, 256, 128, 1, 0, False),                          # kid32
+    265: (256, 128, 256, 128, 1, 0, False),                          # kid33
+    # -- lds form --
+    266: (256, 128, 256, 128, 1, 4, True),                           # kid34 / kid244
+    267: (512, 128, 256, 128, 1, 0, True),                           # kid32 / kid264
+    268: (256, 128, 256, 128, 1, 0, True),                           # kid33 / kid265
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm,
+                                               shuffle_scale=True,
+                                               sf_shuf_in_lds=lds)
+    for kid, (bs, bm, bn, bk, wg, wgm, lds)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_SHUF_TWIN_TILES.items()
+})
+
+# GROUP_K=32 counterparts of the all-compute direct-B families.
+# Construct them from the original instance's traits.
+def _mx32_wave8_twins(local, ctor, *lead, skip=frozenset(), **ctor_kwargs):
+    # ctor_kwargs is not decoration. This builds the twin from the mirror's
+    # *tile* attributes only, so any ctor flag that is not one of those -- blds
+    # being the one that exists today -- is silently lost and the twin comes out
+    # as a different kernel wearing the twin's id. It has to be passed back in
+    # here, by the caller, the same way the mirror's own dict passes it.
+    return {
+        kid + MX32_KID_STRIDE: ctor(
+            *[getattr(inst, a) for a in lead],
+            inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
+            xcd_wgm=inst.xcd_wgm, quant_block=32, **ctor_kwargs,
+        )
+        for kid, inst in local.items()
+        if kid not in skip
+        and not (inst.shuffle_scale or inst.mpack_sfa or inst.sf_shuf_in_lds)
+    }
+
+
+_bmm_bpre_wave8n4_local.update(
+    _mx32_wave8_twins(_bmm_bpre_wave8n4_local, _a8w8_mxscale_bmm_bpreshuffle_wave8n4)
+)
+_bmm_bpre_wavetm1_local.update(
+    # The smaller B_K=128 tiles use the ring path when the whole-split scale
+    # panel would exceed their residency budget.
+    _mx32_wave8_twins(_bmm_bpre_wavetm1_local, _a8w8_mxscale_bmm_bpreshuffle_wavetm1,
+                      "BLOCK_SIZE", skip=frozenset({95, 99, 119}))
+)
+_bmm_bpre_wavetm1_blds_local.update(
+    # GROUP_K=32 counterparts of the wave8n4 tiles.
+    _mx32_wave8_twins(_bmm_bpre_wavetm1_blds_local,
+                      _a8w8_mxscale_bmm_bpreshuffle_wavetm1,
+                      "BLOCK_SIZE", skip=frozenset({123}), blds=True)
+)
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_wave1(bm, bn, bk, wg_per_cu, ring=0, quant_block=128, group_n=None):
+    """Single-wave decode kernel with operands loaded directly into registers.
+
+    The pipeline uses no LDS staging or inter-wave barriers."""
+    inst = OpusGemmInstance(
+        64,             # BLOCK_SIZE: one wave64
+        bm, bn, bk,     # BLOCK tile
+        1, 1,           # T_M, T_N
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, quant_block if group_n is None else group_n, quant_block,
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.wave1_ring = ring
+    return inst
+
+
+# Single-wave decode tiles with several N/K depths and load schedules.
+_BMM_MXSCALE_BPRESHUFFLE_WAVE1_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)
+    107: (16, 32, 256, 2),
+    108: (16, 64, 256, 2),
+    109: (16, 32, 512, 2),
+    110: (32, 32, 256, 2),
+    111: (16, 32, 128, 2),
+    112: (16, 32, 256, 1),
+    # kid112 with the ring pinned shallower (default 4 stages, 192 VGPRs).
+    113: (16, 32, 256, 1, 2),
+    114: (16, 32, 256, 1, 3),
+    # B_N=16 variants increase the number of N tiles per workgroup row.
+    115: (16, 16, 256, 2),
+    116: (16, 16, 256, 1),
+}
+_bmm_bpre_wave1_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave1(*geom)
+    for kid, geom in _BMM_MXSCALE_BPRESHUFFLE_WAVE1_TILES.items()
+}
+
+# Independent per-N-row K32 scales.
+_bmm_bpre_wave1_local.update({
+    kid + 124: _a8w8_mxscale_bmm_bpreshuffle_wave1(
+        *geom, quant_block=32, group_n=1
+    )
+    for kid, geom in _BMM_MXSCALE_BPRESHUFFLE_WAVE1_TILES.items()
+})
+_bmm_bpre_wave1_local[241] = _a8w8_mxscale_bmm_bpreshuffle_wave1(
+    16, 16, 128, 2, quant_block=32, group_n=1
+)
+
+
+# Larger per-row K32 tile for shapes with enough output tiles to fill the GPU.
+# A two-stage register ring bounds operand storage while each load feeds more
+# MFMAs than the decode tiles above.
+_bmm_bpre_wave1_local[242] = _a8w8_mxscale_bmm_bpreshuffle_wave1(
+    64, 64, 128, 2, 2, quant_block=32, group_n=1
+)
+
+
+# Derive GROUP_N=GROUP_K=32 flatmm variants with kid + MX32_KID_STRIDE.
+# Exclude tiles affected by the ROCm 7.2.4 clang-22
+# register-class defect at the larger register footprints.
+_MX32_CLANG_REGCLASS_SKIP = frozenset({4, 10, 62})
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, direct, prefetch, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
+    if kid not in _MX32_CLANG_REGCLASS_SKIP
+})
+# GROUP_K=32 PRELOAD_SF_LDS variants use the bounded scale ring selected
+# by SF_USE_RING, instead of allocating a whole-split scale panel.
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, preload_sf=True, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
+})
+
+
+# ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this
+# exact high-pressure PRELOAD_SF_LDS + D_OUT=void specialization after the
+# workspace kargs moved to a direct pointer.  Its splitK=1 BF16/FP32 kernels
+# keep PRELOAD_SF_LDS; only the split-K workspace specialization uses the
+# semantically equivalent non-preload implementation (the same geometry as
+# local kid 10).
+_bmm_flatmm_local[77].workspace_preload_sf = False
+
+
+def _a8w8_mxscale_bmm_minterleave(bm, bn, bk, wg_per_cu, skip_scale_wait=False):
+    t_m, t_n = (1, 2) if bm == 16 else (2, 1)
+    inst = OpusGemmInstance(
+        256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4,
+        1, 128, 128, "a8w8_mxscale_bmm_minterleave", ["fp32_t"], wg_per_cu,
     )
     inst.name_root = "opus_bmm"
     inst.skip_scale_wait = skip_scale_wait
     return inst
 
 
-# fp8 e8m0 mxscale BMM M-tile-interleaved tiles (kids 162/163). Fixed geometry
-# m128n128k128 wg1; the only axis is SKIP_SCALE_WAIT.
-_BMM_MXSCALE_MINTERLEAVE_TILES = {
-    #   (B_M, B_N, B_K, WG_PER_CU, skip_scale_wait)
-    162: (128, 128, 128, 1, False),
-    163: (128, 128, 128, 1, True),   # skip per-K-tile scale s_waitcnt
-}
-a8w8_mxscale_bmm_minterleave_kernels_list = {
-    kid: _a8w8_mxscale_bmm_minterleave(bm, bn, bk, wg, skip)
-    for kid, (bm, bn, bk, wg, skip) in _BMM_MXSCALE_MINTERLEAVE_TILES.items()
+_bmm_minterleave_local = {
+    20: _a8w8_mxscale_bmm_minterleave(128, 128, 128, 1, False),
+    21: _a8w8_mxscale_bmm_minterleave(128, 128, 128, 1, True),
 }
 
 
 def _a8w8_mxscale_bmm_spec(tag, bm, bn, bk, wg_per_cu, **flags):
-    """Generic fp8 e8m0 mxscale BMM specialized-pipeline tile builder.
-
-    Same locked geometry/traits family as the flatmm split-K kids (BLOCK_SIZE
-    256, MFMA 16x16x128, VEC=(16,16,4), GROUP=(1,128,128), fp32 workspace tuple
-    slot). `tag` selects the kernel family (wave8n2 / wave4m2_selfload);
-    `flags` sets the family's compile-time axes.
-    """
     t_m, t_n = (1, 2) if bm == 16 else (2, 1)
     inst = OpusGemmInstance(
-        256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4, 1, 128, 128,
-        tag, ["fp32_t"], wg_per_cu,
+        256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4,
+        1, 128, 128, tag, ["fp32_t"], wg_per_cu,
+        splitk_workspace_dtype=("fp32_t" if tag == "a8w8_mxscale_bmm_fused" else None),
     )
     inst.name_root = "opus_bmm"
-    for key, val in flags.items():
-        setattr(inst, key, val)
+    for key, value in flags.items():
+        setattr(inst, key, value)
     return inst
 
 
-# fused (kid 100): the only fused-reduce path (splitK counter variant). Same
-# 256x32x128x128 wg2 traits as standard kid 0/32, so its device symbols resolve
-# to the standard family's TUs -> host-only launcher emit.
-a8w8_mxscale_bmm_fused_kernels_list = {
-    100: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_fused", 32, 128, 128, 2),
+_bmm_fused_local = {
+    3: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_fused", 32, 128, 128, 2),
 }
 
-# pipeline (kids 149/150/151/152/158): BLOCK_SIZE 512, m{128,256}n256k128, dual
+# pipeline (kids 14/15/151/152/16/17/22): BLOCK_SIZE 512, m{128,256}n{128,256}k128, dual
 # bf16/fp32 traits (output dtype baked into the traits tuple), non-splitk scale
 # kargs. One of the gemm_a8w8_scale_* kernels selected by flags. The wave
 # layout (T_M/T_N/W_*) is derived inside opus_gemm_a8w8_scale_traits_gfx950 from
@@ -648,8 +1584,34 @@ a8w8_mxscale_bmm_fused_kernels_list = {
 # OpusGemmInstance are cosmetic for this tag).
 def _a8w8_mxscale_bmm_pipeline(**flags):
     inst = OpusGemmInstance(
+        512, 256, 256, 128, 2, 1, 16, 16, 128, 16, 16, 4,
+        1, 128, 128, "a8w8_mxscale_bmm_pipeline", ["fp32_t"], 1,
+    )
+    inst.name_root = "opus_bmm"
+    for key, value in flags.items():
+        setattr(inst, key, value)
+    return inst
+
+
+_bmm_pipeline_local = {
+    14: _a8w8_mxscale_bmm_pipeline(B_M=128),
+    15: _a8w8_mxscale_bmm_pipeline(),
+    16: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True),
+    # kid17 uses preloaded scales at the half-M tile.
+    17: _a8w8_mxscale_bmm_pipeline(B_M=128, preload_sf_lds=True),
+    # kid22 uses preloaded scales with the N tile halved.
+    22: _a8w8_mxscale_bmm_pipeline(B_N=128, preload_sf_lds=True),
+}
+
+
+def _a8w8_mxscale_bmm_pipeline_bpreshuffle(**flags):
+    """Preshuffled-weight variant of the quadrant-scheduled pipeline.
+
+    The tile, 4x2 wave grid and LDS staging match kid158. The producer's
+    B addressing consumes shuffle_weight(w, (16, 16))."""
+    inst = OpusGemmInstance(
         512, 256, 256, 128, 2, 1, 16, 16, 128, 16, 16, 4, 1, 128, 128,
-        "a8w8_mxscale_bmm_pipeline", ["fp32_t"], 1,
+        "a8w8_mxscale_bmm_pipeline_bpreshuffle", ["fp32_t"], 1,
     )
     inst.name_root = "opus_bmm"
     for key, val in flags.items():
@@ -657,86 +1619,186 @@ def _a8w8_mxscale_bmm_pipeline(**flags):
     return inst
 
 
-a8w8_mxscale_bmm_pipeline_kernels_list = {
-    # kid 149: B_M=128 plain scale pipeline (m128n256k128). Same gemm_a8w8_scale_
-    # kernel as kid 150, just half the M tile -> 2x output tiles -> fills more CUs
-    # on batched wo_a shapes. Was a hand-written cross-module adapter delegating
-    # to opus_gemm's a8w8_mxscale GEMM launcher; now BMM-native codegen.
-    149: _a8w8_mxscale_bmm_pipeline(B_M=128),
-    150: _a8w8_mxscale_bmm_pipeline(),
-    151: _a8w8_mxscale_bmm_pipeline(k1024_only=True),
-    152: _a8w8_mxscale_bmm_pipeline(k1024_lb1=True),
-    # kid158: preload BOTH SFA (per-token) and SFB (block) scale panels into LDS.
-    158: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True),
+_bmm_pipeline_bpre_local = {
+    # kid31: kid16 (preload_sf_lds) with a preshuffled B.
+    31: _a8w8_mxscale_bmm_pipeline_bpreshuffle(preload_sf_lds=True),
 }
-
-# mouter (kids 131/144) + mouter_tunable (kids 160/161): wg1 m128n128k128,
-# 1 bool axis <SKIP_SCALE_WAIT>. Both share gemm_..._mouter_kernel, so the
-# tunable variant reuses the mouter device instantiations (host-only emit).
-a8w8_mxscale_bmm_mouter_kernels_list = {
-    131: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter", 128, 128, 128, 1),
-    144: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter", 128, 128, 128, 1, skip_scale_wait=True),
+_bmm_mouter_local = {
+    5: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter", 128, 128, 128, 1),
+    12: _a8w8_mxscale_bmm_spec(
+        "a8w8_mxscale_bmm_mouter", 128, 128, 128, 1, skip_scale_wait=True
+    ),
 }
-a8w8_mxscale_bmm_mouter_tunable_kernels_list = {
-    160: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter_tunable", 128, 128, 128, 1),
-    161: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter_tunable", 128, 128, 128, 1, skip_scale_wait=True),
+_bmm_mouter_tunable_local = {
+    18: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter_tunable", 128, 128, 128, 1),
+    19: _a8w8_mxscale_bmm_spec(
+        "a8w8_mxscale_bmm_mouter_tunable", 128, 128, 128, 1,
+        skip_scale_wait=True,
+    ),
 }
-
-# wave8n2 (kid 132): wg1 m128n128k128, no compile-time flags (logical B_N = 256).
-a8w8_mxscale_bmm_wave8n2_kernels_list = {
-    132: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_wave8n2", 128, 128, 128, 1),
+_bmm_wave8n2_local = {
+    6: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_wave8n2", 128, 128, 128, 1),
 }
-
-# wave4m2_selfload (kids 134/142/148): wg1 m128n128k128, 2 bool axes
-# <SKIP_SCALE_WAIT, PACK_SCALE_ON_DEMAND> (logical B_M = 128*2 = 256).
 _BMM_WAVE4M2_TILES = {
-    #   (ssw,   psod)
-    134: (False, False),
-    142: (True,  False),
-    148: (True,  True),
+    7: (False, False),
+    11: (True, False),
+    13: (True, True),
 }
-a8w8_mxscale_bmm_wave4m2_selfload_kernels_list = {
+_bmm_wave4m2_local = {
     kid: _a8w8_mxscale_bmm_spec(
         "a8w8_mxscale_bmm_wave4m2_selfload", 128, 128, 128, 1,
-        skip_scale_wait=ssw, pack_scale_on_demand=psod,
+        skip_scale_wait=skip, pack_scale_on_demand=pack,
     )
-    for kid, (ssw, psod) in _BMM_WAVE4M2_TILES.items()
+    for kid, (skip, pack) in _BMM_WAVE4M2_TILES.items()
 }
+
 
 # All name-keyed a8w8_mxscale BMM kernel families (gfx950-only). Kept as a tuple
 # of the per-family kid-keyed dicts -- NOT merged into one dict, because int kids
 # repeat across families and are deduped downstream by launcher NAME (see
 # gen_instances.py). Single source of truth for both consumers there: the codegen
 # kdict merge and the BMM int-kid tune-lookup emitter.
+# Kids that read their scales in a layout the quantiser has to produce -- the
+# shuffle_scale words (with or without the LDS panel) and the host M-packed A
+# panel. Nothing upstream emits those layouts yet, and no tuned row uses these
+# kids, so they stay defined but are not built; set this to True to put all
+# of them back into the catalogue, the codegen and the tuner.
+BMM_BUILD_RELAID_SCALE_KIDS = False
+
+
+def _relaid_scale(inst):
+    return bool(inst.shuffle_scale or getattr(inst, "sf_shuf_in_lds", False)
+                or inst.mpack_sfa)
+
+
+def _bmm_kernel_table(kernels):
+    return {
+        kid: inst
+        for kid, inst in kernels.items()
+        if BMM_BUILD_RELAID_SCALE_KIDS or not _relaid_scale(inst)
+    }
+
+
+a8w8_mxscale_bmm_flatmm_splitk_kernels_list = _bmm_kernel_table(_bmm_flatmm_local)
+a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list = _bmm_kernel_table(_bmm_bpre_bdirect_local)
+a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen_kernels_list = _bmm_kernel_table(_bmm_bpre_bdirect_tilen_local)
+a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list = _bmm_kernel_table(_bmm_bpre_blds_local)
+a8w8_mxscale_bmm_bpreshuffle_allwave_kernels_list = _bmm_kernel_table(_bmm_bpre_allwave_local)
+a8w8_mxscale_bmm_bpreshuffle_wave8n4_kernels_list = _bmm_kernel_table(_bmm_bpre_wave8n4_local)
+a8w8_mxscale_bmm_bpreshuffle_wavetm1_kernels_list = _bmm_kernel_table(_bmm_bpre_wavetm1_local)
+a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds_kernels_list = _bmm_kernel_table(
+    _bmm_bpre_wavetm1_blds_local
+)
+a8w8_mxscale_bmm_bpreshuffle_wave1_kernels_list = _bmm_kernel_table(_bmm_bpre_wave1_local)
+a8w8_mxscale_bmm_pipeline_bpreshuffle_kernels_list = _bmm_kernel_table(_bmm_pipeline_bpre_local)
+a8w8_mxscale_bmm_fused_kernels_list = _bmm_kernel_table(_bmm_fused_local)
+a8w8_mxscale_bmm_minterleave_kernels_list = _bmm_kernel_table(_bmm_minterleave_local)
+a8w8_mxscale_bmm_mouter_kernels_list = _bmm_kernel_table(_bmm_mouter_local)
+a8w8_mxscale_bmm_mouter_tunable_kernels_list = _bmm_kernel_table(
+    _bmm_mouter_tunable_local
+)
+a8w8_mxscale_bmm_pipeline_kernels_list = _bmm_kernel_table(_bmm_pipeline_local)
+a8w8_mxscale_bmm_wave8n2_kernels_list = _bmm_kernel_table(_bmm_wave8n2_local)
+a8w8_mxscale_bmm_wave4m2_selfload_kernels_list = _bmm_kernel_table(
+    _bmm_wave4m2_local
+)
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_compact(bm, bn, bk, wm, wn, nb, nt, early_b):
+    return OpusGemmInstance(
+        wm * wn * 64,
+        bm,
+        bn,
+        bk,
+        wm,
+        wn,
+        16,
+        16,
+        128,
+        16,
+        16,
+        4,
+        1,
+        128,
+        128,
+        "a8w8_mxscale_bmm_bpreshuffle_compact",
+        ["fp32_t"],
+        WG_PER_CU=1,
+        cachectl_a=0,
+        cachectl_b=2 if nt else 0,
+        num_slots=nb,
+        early_b=early_b,
+        name_root="opus_bmm",
+        max_m=2047,
+    )
+
+
+# Explicit local ids keep existing tuned CSVs stable when adding configurations.
+# Arguments: BM, BN, BK, WM, WN, LDS slots, non-temporal B, early B prefetch.
+a8w8_mxscale_bmm_bpreshuffle_compact_kernels_list = _bmm_kernel_table(
+    {
+        125: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 256, 2, 2, 4, True, False),
+        126: _a8w8_mxscale_bmm_bpreshuffle_compact(96, 64, 256, 2, 2, 3, False, False),
+        127: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 256, 4, 2, 4, True, False),
+        128: _a8w8_mxscale_bmm_bpreshuffle_compact(
+            192, 128, 128, 2, 4, 3, False, False
+        ),
+        129: _a8w8_mxscale_bmm_bpreshuffle_compact(256, 128, 128, 4, 2, 3, True, False),
+        130: _a8w8_mxscale_bmm_bpreshuffle_compact(192, 128, 128, 2, 4, 3, False, True),
+        131: _a8w8_mxscale_bmm_bpreshuffle_compact(256, 128, 128, 4, 2, 3, True, True),
+        132: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 32, 512, 1, 2, 3, False, False),
+        133: _a8w8_mxscale_bmm_bpreshuffle_compact(32, 32, 512, 2, 2, 2, False, False),
+        134: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 64, 512, 1, 4, 2, False, False),
+        135: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 64, 256, 1, 4, 3, False, False),
+        136: _a8w8_mxscale_bmm_bpreshuffle_compact(32, 64, 256, 2, 2, 3, False, False),
+        137: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 32, 256, 2, 2, 3, False, False),
+        138: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 128, 2, 2, 3, False, False),
+        139: _a8w8_mxscale_bmm_bpreshuffle_compact(
+            128, 128, 128, 2, 2, 2, False, False
+        ),
+    }
+)
+
+
 a8w8_mxscale_bmm_kernel_lists = (
+    a8w8_mxscale_bmm_bpreshuffle_compact_kernels_list,
     a8w8_mxscale_bmm_flatmm_splitk_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_allwave_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_wave8n4_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_wavetm1_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_wave1_kernels_list,
     a8w8_mxscale_bmm_fused_kernels_list,
     a8w8_mxscale_bmm_minterleave_kernels_list,
     a8w8_mxscale_bmm_mouter_kernels_list,
     a8w8_mxscale_bmm_mouter_tunable_kernels_list,
     a8w8_mxscale_bmm_pipeline_kernels_list,
+    a8w8_mxscale_bmm_pipeline_bpreshuffle_kernels_list,
     a8w8_mxscale_bmm_wave8n2_kernels_list,
     a8w8_mxscale_bmm_wave4m2_selfload_kernels_list,
 )
 
 
 a8w8_kernels_list = {
-    2: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0, "a8w8", ["fp32_t"]),
+    0: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0, "a8w8", ["fp32_t"]),
 }
 
 a16w16_kernels_list = {
     # -- MFMA 16x16x32, T_N=2, BS=256 (2-block/CU capable) --
-    # 3:  _a16w16(256, 128, 128, 32,  2, 16, 16, 32),  # disabled: intermittent accuracy (suspected compiler issue with VGPR=104/AGPR=64)
-    4:  _a16w16(256, 128, 256, 32,  2, 16, 16, 32),
-    5:  _a16w16(256, 256, 128, 32,  2, 16, 16, 32),
+    # disabled: _a16w16(256, 128, 128, 32,  2, 16, 16, 32),  # disabled: intermittent accuracy (suspected compiler issue with VGPR=104/AGPR=64)
+    0:  _a16w16(256, 128, 256, 32,  2, 16, 16, 32),
+    1:  _a16w16(256, 256, 128, 32,  2, 16, 16, 32),
     # -- MFMA 16x16x32, T_N=4, BS=512 (1-block/CU) --
-    6:  _a16w16(512, 128, 128, 64,  4, 16, 16, 32),
-    7:  _a16w16(512, 256, 128, 64,  4, 16, 16, 32),
-    8:  _a16w16(512, 128, 256, 64,  4, 16, 16, 32),
-    9:  _a16w16(512, 256, 256, 64,  4, 16, 16, 32),  # existing / current default
+    2:  _a16w16(512, 128, 128, 64,  4, 16, 16, 32),
+    3:  _a16w16(512, 256, 128, 64,  4, 16, 16, 32),
+    4:  _a16w16(512, 128, 256, 64,  4, 16, 16, 32),
+    5:  _a16w16(512, 256, 256, 64,  4, 16, 16, 32),  # existing / current default
 }
 
-# Removed (kids 100-115, a16w16_flatmm non-splitk): Rationale: the non-splitk a16w16_flatmm
+# Removed a16w16_flatmm non-splitk: Rationale: the non-splitk a16w16_flatmm
 # pipeline has two latent correctness b...
 a16w16_flatmm_kernels_list = {}
 
@@ -744,38 +1806,38 @@ a16w16_flatmm_kernels_list = {}
 # exactly: * 8 WG_PER_CU=2 tiles (...
 a16w16_flatmm_splitk_kernels_list = {
     # WG_PER_CU=2, cc tile 0..7
-    200: _a16w16_flatmm_splitk( 64,  64,  64, 2),   # cc tile 0: M>=128 sweet spot (default)
-    201: _a16w16_flatmm_splitk( 32,  32,  64, 2),   # cc tile 1
-    202: _a16w16_flatmm_splitk( 32,  32, 128, 2),   # cc tile 2
-    203: _a16w16_flatmm_splitk( 32,  64,  64, 2),   # cc tile 3
-    204: _a16w16_flatmm_splitk( 32, 128,  64, 2),   # cc tile 4
-    205: _a16w16_flatmm_splitk( 64,  32,  64, 2),   # cc tile 5
-    206: _a16w16_flatmm_splitk( 64,  32, 128, 2),   # cc tile 6: recommended for medium M
-    207: _a16w16_flatmm_splitk(128,  32,  64, 2),   # cc tile 7
+    6: _a16w16_flatmm_splitk( 64,  64,  64, 2),   # cc tile 0: M>=128 sweet spot (default)
+    7: _a16w16_flatmm_splitk( 32,  32,  64, 2),   # cc tile 1
+    8: _a16w16_flatmm_splitk( 32,  32, 128, 2),   # cc tile 2
+    9: _a16w16_flatmm_splitk( 32,  64,  64, 2),   # cc tile 3
+    10: _a16w16_flatmm_splitk( 32, 128,  64, 2),   # cc tile 4
+    11: _a16w16_flatmm_splitk( 64,  32,  64, 2),   # cc tile 5
+    12: _a16w16_flatmm_splitk( 64,  32, 128, 2),   # cc tile 6: recommended for medium M
+    13: _a16w16_flatmm_splitk(128,  32,  64, 2),   # cc tile 7
     # WG_PER_CU=1, cc tile 8..10 (160 KB/wg LDS; zero VGPR spill only)
-    208: _a16w16_flatmm_splitk( 64,  64, 128, 1),   # cc tile 8: deep K, high compute/load ratio
-    209: _a16w16_flatmm_splitk(256,  32,  64, 1),   # cc tile 9: very tall, narrow N
-    210: _a16w16_flatmm_splitk( 32, 256,  64, 1),   # cc tile 10: very wide, narrow M
-    # Tile coverage extension (kids 211..223): B_M=96 OR B_N=96 lanes for shapes whose M or N is a
+    14: _a16w16_flatmm_splitk( 64,  64, 128, 1),   # cc tile 8: deep K, high compute/load ratio
+    15: _a16w16_flatmm_splitk(256,  32,  64, 1),   # cc tile 9: very tall, narrow N
+    16: _a16w16_flatmm_splitk( 32, 256,  64, 1),   # cc tile 10: very wide, narrow M
+    # Tile coverage extension (kids 17..29): B_M=96 OR B_N=96 lanes for shapes whose M or N is a
     # multiple of 96.
-    211: _a16w16_flatmm_splitk( 32,  96,  64, 1),   # pfk=9, VGPR=176/512, AGPR=24
-    212: _a16w16_flatmm_splitk( 32,  96,  64, 2),   # pfk=4, VGPR=176/256, AGPR=24
-    213: _a16w16_flatmm_splitk( 32,  96, 128, 1),   # pfk=4, VGPR=288/512, AGPR=24
-    214: _a16w16_flatmm_splitk( 64,  96,  64, 1),   # pfk=7, VGPR=192/512, AGPR=48
-    215: _a16w16_flatmm_splitk( 64,  96,  64, 2),   # pfk=3, VGPR=192/256, AGPR=48
-    216: _a16w16_flatmm_splitk( 64,  96, 128, 1),   # pfk=3, VGPR=320/512, AGPR=48
-    217: _a16w16_flatmm_splitk( 96,  32,  64, 1),   # pfk=9, VGPR=144/512, AGPR=24
-    218: _a16w16_flatmm_splitk( 96,  32,  64, 2),   # pfk=4, VGPR=144/256, AGPR=24
-    219: _a16w16_flatmm_splitk( 96,  32, 128, 1),   # pfk=4, VGPR=224/512, AGPR=24
-    220: _a16w16_flatmm_splitk( 96,  64,  64, 1),   # pfk=7, VGPR=176/512, AGPR=48
-    221: _a16w16_flatmm_splitk( 96,  64,  64, 2),   # pfk=3, VGPR=176/256, AGPR=48
-    222: _a16w16_flatmm_splitk( 96,  64, 128, 1),   # pfk=3, VGPR=288/512, AGPR=48
-    223: _a16w16_flatmm_splitk( 96,  96,  64, 2),   # pfk=3, VGPR=208/256, AGPR=72  (81% VGPR -- watch)
+    17: _a16w16_flatmm_splitk( 32,  96,  64, 1),   # pfk=9, VGPR=176/512, AGPR=24
+    18: _a16w16_flatmm_splitk( 32,  96,  64, 2),   # pfk=4, VGPR=176/256, AGPR=24
+    19: _a16w16_flatmm_splitk( 32,  96, 128, 1),   # pfk=4, VGPR=288/512, AGPR=24
+    20: _a16w16_flatmm_splitk( 64,  96,  64, 1),   # pfk=7, VGPR=192/512, AGPR=48
+    21: _a16w16_flatmm_splitk( 64,  96,  64, 2),   # pfk=3, VGPR=192/256, AGPR=48
+    22: _a16w16_flatmm_splitk( 64,  96, 128, 1),   # pfk=3, VGPR=320/512, AGPR=48
+    23: _a16w16_flatmm_splitk( 96,  32,  64, 1),   # pfk=9, VGPR=144/512, AGPR=24
+    24: _a16w16_flatmm_splitk( 96,  32,  64, 2),   # pfk=4, VGPR=144/256, AGPR=24
+    25: _a16w16_flatmm_splitk( 96,  32, 128, 1),   # pfk=4, VGPR=224/512, AGPR=24
+    26: _a16w16_flatmm_splitk( 96,  64,  64, 1),   # pfk=7, VGPR=176/512, AGPR=48
+    27: _a16w16_flatmm_splitk( 96,  64,  64, 2),   # pfk=3, VGPR=176/256, AGPR=48
+    28: _a16w16_flatmm_splitk( 96,  64, 128, 1),   # pfk=3, VGPR=288/512, AGPR=48
+    29: _a16w16_flatmm_splitk( 96,  96,  64, 2),   # pfk=3, VGPR=208/256, AGPR=72  (81% VGPR -- watch)
 }
 
-# non-OOB variants: kid + 1000, same tile but HAS_OOB=false.
+# non-OOB variants: kid + 46, same tile but HAS_OOB=false.
 a16w16_kernels_list_nooob = {
-    kid + 1000: _a16w16(
+    kid + 46: _a16w16(
         inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
         inst.T_N, inst.W_M, inst.W_N, inst.W_K, has_oob=False,
         cachectl_a=inst.cachectl_a, cachectl_b=inst.cachectl_b,
@@ -784,13 +1846,15 @@ a16w16_kernels_list_nooob = {
 }
 
 # CPOL variants for a16w16: 3 policies per kid, tuner picks best per shape.
+# Explicit local OOB/nooob ranges keep the cache policies disjoint.
 _CACHECTL_CONFIGS = [
-    (2000, 1, 17, "Mheavy"),   # kid_offset, cachectl_a, cachectl_b
-    (3000, 17, 1, "Nheavy"),
-    (4000, 0,  0, "balanced"),
+    # (oob_offset, nooob_offset, cachectl_a, cachectl_b, tag)
+    (97, 103, 1, 17, "Mheavy"),
+    (140, 109, 17, 1, "Nheavy"),
+    (146, 152, 0, 0, "balanced"),
 ]
 a16w16_kernels_list_cpol = {}
-for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
+for offset, _nooob_offset, ca, cb, _tag in _CACHECTL_CONFIGS:
     for kid, inst in a16w16_kernels_list.items():
         new_inst = _a16w16(
             inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
@@ -801,7 +1865,7 @@ for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
         a16w16_kernels_list_cpol[kid + offset] = new_inst
 
 a16w16_kernels_list_cpol_nooob = {}
-for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
+for _oob_offset, offset, ca, cb, _tag in _CACHECTL_CONFIGS:
     for kid, inst in a16w16_kernels_list.items():
         new_inst = _a16w16(
             inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
@@ -809,10 +1873,10 @@ for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
         )
         new_inst.cachectl_a = ca
         new_inst.cachectl_b = cb
-        a16w16_kernels_list_cpol_nooob[kid + offset + 1000] = new_inst
+        a16w16_kernels_list_cpol_nooob[kid + offset] = new_inst
 
 a16w16_flatmm_splitk_kernels_list_nooob = {
-    kid + 1000: _a16w16_flatmm_splitk(
+    kid + 46: _a16w16_flatmm_splitk(
         inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU, has_oob=False,
     )
     for kid, inst in a16w16_flatmm_splitk_kernels_list.items()
@@ -852,7 +1916,7 @@ _PERSISTENT_TILES = [
 
 # Legacy (300..303): cachectl == (0, 17).
 a16w16_persistent_kernels_list = {
-    300 + i: _a16w16_persistent(bm, bn, bk)
+    30 + i: _a16w16_persistent(bm, bn, bk)
     for i, (bm, bn, bk) in enumerate(_PERSISTENT_TILES)
 }
 
@@ -860,9 +1924,9 @@ a16w16_persistent_kernels_list = {
 # compact base offset per cpol group.
 _PERSISTENT_CPOL_GROUPS = [
     # (base_kid, cachectl_a, cachectl_b)
-    (304,  1, 17),   # Mheavy
-    (308, 17,  1),   # Nheavy
-    (312,  0,  0),   # balanced
+    (34, 1, 17),   # Mheavy
+    (38, 17, 1),   # Nheavy
+    (42, 0, 0),    # balanced
 ]
 a16w16_persistent_kernels_list_cpol = {}
 for _base, _ca, _cb in _PERSISTENT_CPOL_GROUPS:
@@ -871,17 +1935,17 @@ for _base, _ca, _cb in _PERSISTENT_CPOL_GROUPS:
             bm, bn, bk, cachectl_a=_ca, cachectl_b=_cb
         )
 
-# Nooob mirrors at +1000 for both legacy (1300..1305) and cpol (1306..1323).
+# Nooob mirrors at +1000 for both legacy (1300..1303) and cpol (1304..1315).
 # Explicit cachectl inheritance keeps name() consistent with parents.
 a16w16_persistent_kernels_list_nooob = {
-    kid + 1000: _a16w16_persistent(
+    kid + 46: _a16w16_persistent(
         inst.B_M, inst.B_N, inst.B_K, has_oob=False,
         cachectl_a=inst.cachectl_a, cachectl_b=inst.cachectl_b,
     )
     for kid, inst in a16w16_persistent_kernels_list.items()
 }
 a16w16_persistent_kernels_list_cpol_nooob = {
-    kid + 1000: _a16w16_persistent(
+    kid + 46: _a16w16_persistent(
         inst.B_M, inst.B_N, inst.B_K, has_oob=False,
         cachectl_a=inst.cachectl_a, cachectl_b=inst.cachectl_b,
     )
@@ -922,11 +1986,7 @@ def _a16w16_mono_tile(bm, bn, bk):
     )
 
 
-# 5 mono-tile tiles, kids 1400..1404. Kid range deliberately starts at
-# 1400 (above the persistent +1000 nooob mirror range that ends at 1323)
-# and below the next reserved family slot. No "base/nooob" mirror split:
-# mono-tile is non-OOB by construction, so kids land in the >=1000 band
-# the way other families' nooob mirrors do.
+# 1 mono-tile tiles, local kids 92..96.
 #
 # B_K=128 tiles (e.g. (64,256,128), (128,128,128)) are intentionally
 # excluded: the pipeline uses 2x smem_a + 3x smem_b (A double-buffered,
@@ -935,14 +1995,14 @@ def _a16w16_mono_tile(bm, bn, bk):
 # pipeline drops B to two slots.
 _MONO_TILE_TILES = [
     # (B_M, B_N, B_K)
-    (192, 256, 64),   # 1400
-    (128, 256, 64),   # 1401
-    (192, 128, 64),   # 1402
-    (128, 128, 64),   # 1403
-    ( 64, 128, 64),   # 1404
+    (192, 256, 64),   # 92
+    (128, 256, 64),   # 93
+    (192, 128, 64),   # 94
+    (128, 128, 64),   # 95
+    ( 64, 128, 64),   # 96
 ]
 a16w16_mono_tile_kernels_list = {
-    1400 + i: _a16w16_mono_tile(bm, bn, bk)
+    92 + i: _a16w16_mono_tile(bm, bn, bk)
     for i, (bm, bn, bk) in enumerate(_MONO_TILE_TILES)
 }
 
@@ -956,12 +2016,12 @@ a16w16_mono_tile_kernels_list = {
 #   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_persistent_4g_safe_gfx950.cuh
 #   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_mono_tile_4g_safe_gfx950.cuh
 #
-# Offset choice: +5000 sits above the cpol band (which uses +2000/+3000/+4000)
-# and well clear of the nooob mirror band (+1000). 4g_safe kids carry HAS_OOB
+# Offset choice: +5000 is reserved for legacy 4g_safe variants; cpol variants
+# use explicit disjoint offsets rather than an unconditional +1000 mirror.
+# 4g_safe kids carry HAS_OOB
 # from their parent (M/N tail is absorbed by the per-WG BR num_records, so
 # the per-thread predicate is structurally a no-op for valid in-tile threads;
 # we still emit both has_oob variants for consistency with the legacy axis).
-_FOUR_G_SAFE_OFFSET = 5000
 
 
 def _make_4g_safe(inst: "OpusGemmInstance") -> "OpusGemmInstance":
@@ -974,33 +2034,52 @@ def _make_4g_safe(inst: "OpusGemmInstance") -> "OpusGemmInstance":
 
 
 a16w16_kernels_list_4g_safe = {
-    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
-    for kid, inst in a16w16_kernels_list.items()
+    115 + i: _make_4g_safe(inst)
+    for i, inst in enumerate(a16w16_kernels_list.values())
 }
 a16w16_kernels_list_4g_safe_nooob = {
-    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
-    for kid, inst in a16w16_kernels_list_nooob.items()
+    125 + i: _make_4g_safe(inst)
+    for i, inst in enumerate(a16w16_kernels_list_nooob.values())
 }
 a16w16_persistent_kernels_list_4g_safe = {
-    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
-    for kid, inst in a16w16_persistent_kernels_list.items()
+    121 + i: _make_4g_safe(inst)
+    for i, inst in enumerate(a16w16_persistent_kernels_list.values())
 }
 a16w16_persistent_kernels_list_4g_safe_nooob = {
-    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
-    for kid, inst in a16w16_persistent_kernels_list_nooob.items()
+    131 + i: _make_4g_safe(inst)
+    for i, inst in enumerate(a16w16_persistent_kernels_list_nooob.values())
 }
 a16w16_mono_tile_kernels_list_4g_safe = {
-    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
-    for kid, inst in a16w16_mono_tile_kernels_list.items()
+    135 + i: _make_4g_safe(inst)
+    for i, inst in enumerate(a16w16_mono_tile_kernels_list.values())
 }
 
 
-# -- gfx942 kernel lists ------------------------------------------------ Kid offset: gfx942
-GFX942_KID_OFFSET = 10000
+# -- gfx942 kernel lists ------------------------------------------------
+
+# Split-K launch policy is consumed by both the Python Torch-workspace planner
+# and the generated host launcher.  Keep it beside the canonical instances so
+# the two sides cannot silently drift and disagree about workspace capacity.
+GFX942_MAX_AUTO_SPLIT_K = 16
+GFX942_MIN_ITERS_PER_SPLIT = 2
+GFX942_QUAD_MFMA32_SPLITK_TAG = "a16w16_quad_mfma32_kbuf1_sk"
+GFX942_EVEN_LOOP_SPLITK_TAGS = frozenset(
+    {
+        "a16w16_kbuf2v_sk",
+        "a16w16_kbuf2v_bk128_sk",
+        GFX942_QUAD_MFMA32_SPLITK_TAG,
+    }
+)
+
+# gfx942 bf16-workspace launchers can use the exact-N row-block reducer only
+# for these output widths.  Keep the *set* here beside the instance source so
+# runtime selection, tuning, and codegen can consume one value.  The detailed
+# (VEC, N_VEC, ROWS_PER_BLOCK) reduce configurations remain codegen-owned.
+GFX942_BF16WS_EXACT_N = frozenset({64, 128, 256, 384, 512, 1024, 2048})
 
 
 def _a16w16_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
-    """Factory for gfx942 a16w16 kbuf1-large-tile kid instances (kid 10000,
+    """Factory for gfx942 a16w16 kbuf1-large-tile kid instances (local kid 0,
     MFMA 16x16x16). Same algorithm family as kbuf1 (4-phase, 2 barriers/iter)
     but with a larger tile + BS=512 + inline LDS-staged epilogue.
     """
@@ -1061,6 +2140,7 @@ def _a16w16_splitk_tag_gfx942(bs, bm, bn, bk, tn, wm, wn, wk, tag):
         tag,
         ["fp32_t"],
         arch_prefix="gfx942",
+        splitk_workspace_dtype="fp32_t",
     )
 
 
@@ -1115,6 +2195,7 @@ def _a16w16_kbuf2v_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     return OpusGemmInstance(
         bs, bm, bn, bk, 2, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
         "a16w16_kbuf2v_sk", ["fp32_t"], arch_prefix="gfx942",
+        splitk_workspace_dtype="fp32_t",
     )
 
 
@@ -1124,6 +2205,7 @@ def _a16w16_kbuf2v_bk128_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     return OpusGemmInstance(
         bs, bm, bn, bk, 2, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
         "a16w16_kbuf2v_bk128_sk", ["fp32_t"], arch_prefix="gfx942",
+        splitk_workspace_dtype="fp32_t",
     )
 
 
@@ -1151,6 +2233,7 @@ def _a16w16_em3en4_lds1_pgr2_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     return OpusGemmInstance(
         bs, bm, bn, bk, 2, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
         "a16w16_em3en4_lds1_pgr2_sk", ["fp32_t"], arch_prefix="gfx942",
+        splitk_workspace_dtype="fp32_t",
     )
 
 
@@ -1185,35 +2268,35 @@ def _a8w8_blockscale_bpreshuffle_singlebuf_gfx942(
 # gfx942 kid registry -- per-family flat maps.
 
 gfx942_nosplit_kernels_list = {
-    10000: _a16w16_gfx942        (512, 128, 128,  64,    4, 16, 16, 16),   # kbuf1_large_tile (4-phase, big tile)
-    10001: _a16w16_p1_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),   # P1 depth=2 sibling of 10201
-    10003: _a16w16_kbuf2v_bk128_gfx942(256, 64,  64, 128,    2, 16, 16, 16),   # P1 B_K=128 sibling of 10203
-    10006: _a16w16_quad_mfma32_gfx942(256, 256, 256, 32, 2, 2, 32, 32, 8), # quad MFMA32 pipeline
-    10300: _a16w16_wave_k_coop_gfx942(512, 16, 16, 64,    1, 16, 16, 16),  # wave-K-coop 16x16, T_K=8
-    10301: _a16w16_wave_k_coop_gfx942(512, 16, 32, 32,    1, 16, 16, 16),  # WKC 16x32, B_K=32
-    10302: _a16w16_wave_k_coop_gfx942(512, 32, 16, 64,    1, 16, 16, 16),  # WKC 32x16, aliased partial
-    10303: _a16w16_wave_k_coop_gfx942(256, 32, 32, 64,    1, 16, 16, 16),  # WKC 32x32, T_K=4
-    10305: _a16w16_wave_k_coop_gfx942(512, 16, 32, 64,    1, 16, 16, 16),  # WKC 16x32, B_K=64
-    10310: _a16w16_wave_k_coop_accum_gfx942(256, 16, 16, 64, 1, 16, 16, 16),  # WKC 16x16 split8 atomic accumulate
-    10311: _a16w16_wave_k_coop_accum_gfx942(512, 16, 32, 32, 1, 16, 16, 16),  # WKC 16x32 split8 atomic accumulate
-    10312: _a16w16_wave_k_coop_accum_gfx942(512, 32, 16, 64, 1, 16, 16, 16),  # WKC 32x16 split8 atomic accumulate
-    10313: _a16w16_wave_k_coop_accum_gfx942(256, 32, 32, 64, 1, 16, 16, 16),  # WKC 32x32 split8 atomic accumulate
-    10314: _a16w16_wave_k_coop_accum_gfx942(256, 64, 16, 64, 1, 16, 16, 16),  # WKC 64x16 split8 atomic accumulate
+    0: _a16w16_gfx942        (512, 128, 128,  64,    4, 16, 16, 16),   # kbuf1_large_tile (4-phase, big tile)
+    1: _a16w16_p1_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),   # P1 depth=2 sibling of 10201
+    2: _a16w16_kbuf2v_bk128_gfx942(256, 64,  64, 128,    2, 16, 16, 16),   # P1 B_K=128 sibling of 10203
+    3: _a16w16_quad_mfma32_gfx942(256, 256, 256, 32, 2, 2, 32, 32, 8), # quad MFMA32 pipeline
+    12: _a16w16_wave_k_coop_gfx942(512, 16, 16, 64,    1, 16, 16, 16),  # wave-K-coop 16x16, T_K=8
+    13: _a16w16_wave_k_coop_gfx942(512, 16, 32, 32,    1, 16, 16, 16),  # WKC 16x32, B_K=32
+    14: _a16w16_wave_k_coop_gfx942(512, 32, 16, 64,    1, 16, 16, 16),  # WKC 32x16, aliased partial
+    15: _a16w16_wave_k_coop_gfx942(256, 32, 32, 64,    1, 16, 16, 16),  # WKC 32x32, T_K=4
+    16: _a16w16_wave_k_coop_gfx942(512, 16, 32, 64,    1, 16, 16, 16),  # WKC 16x32, B_K=64
+    17: _a16w16_wave_k_coop_accum_gfx942(256, 16, 16, 64, 1, 16, 16, 16),  # WKC 16x16 split8 atomic accumulate
+    18: _a16w16_wave_k_coop_accum_gfx942(512, 16, 32, 32, 1, 16, 16, 16),  # WKC 16x32 split8 atomic accumulate
+    19: _a16w16_wave_k_coop_accum_gfx942(512, 32, 16, 64, 1, 16, 16, 16),  # WKC 32x16 split8 atomic accumulate
+    20: _a16w16_wave_k_coop_accum_gfx942(256, 32, 32, 64, 1, 16, 16, 16),  # WKC 32x32 split8 atomic accumulate
+    21: _a16w16_wave_k_coop_accum_gfx942(256, 64, 16, 64, 1, 16, 16, 16),  # WKC 64x16 split8 atomic accumulate
 }
 
 gfx942_splitk_kernels_list = {
-    10200: _a16w16_kbuf1_sk_gfx942      (512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile
-    10201: _a16w16_kbuf2v_sk_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),                # P1 depth=2 + V-dbuf
-    10203: _a16w16_kbuf2v_bk128_sk_gfx942(256, 64,  64, 128,    2, 16, 16, 16),                # P1 B_K=128 sub-K decomp
-    10204: _a16w16_em3en4_lds1_pgr2_sk_gfx942 (256, 128,  96, 128,    2, 16, 16, 16),                # EM3EN4 LDS1/PGR2 hipb-orientation (host 128M x 96N)
-    10205: _a16w16_kbuf1_sk_gfx942      (512,  64, 128,  64,    4, 16, 16, 16),                # legacy 4-phase M64 x N128
-    10210: _a16w16_kbuf1_sk_bf16ws_gfx942(512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile + bf16 workspace
-    10213: _a16w16_kbuf2v_bk128_sk_bf16ws_gfx942(256, 64,  64, 128,    2, 16, 16, 16),           # P1 B_K=128 + bf16 workspace
-    10216: _a16w16_quad_mfma32_sk_bf16ws_gfx942(256, 256, 256, 32, 2, 2, 32, 32, 8, group_m=6),  # 10006 bf16 splitK sibling, group-M=6
+    4: _a16w16_kbuf1_sk_gfx942      (512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile
+    5: _a16w16_kbuf2v_sk_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),                # P1 depth=2 + V-dbuf
+    6: _a16w16_kbuf2v_bk128_sk_gfx942(256, 64,  64, 128,    2, 16, 16, 16),                # P1 B_K=128 sub-K decomp
+    7: _a16w16_em3en4_lds1_pgr2_sk_gfx942 (256, 128,  96, 128,    2, 16, 16, 16),                # EM3EN4 LDS1/PGR2 hipb-orientation (host 128M x 96N)
+    8: _a16w16_kbuf1_sk_gfx942      (512,  64, 128,  64,    4, 16, 16, 16),                # legacy 4-phase M64 x N128
+    9: _a16w16_kbuf1_sk_bf16ws_gfx942(512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile + bf16 workspace
+    10: _a16w16_kbuf2v_bk128_sk_bf16ws_gfx942(256, 64,  64, 128,    2, 16, 16, 16),           # P1 B_K=128 + bf16 workspace
+    11: _a16w16_quad_mfma32_sk_bf16ws_gfx942(256, 256, 256, 32, 2, 2, 32, 32, 8, group_m=6),  # 3 bf16 splitK sibling, group-M=6
 }
 
 gfx942_a8w8_kernels_list = {
-    11000: _a8w8_blockscale_bpreshuffle_singlebuf_gfx942(
+    0: _a8w8_blockscale_bpreshuffle_singlebuf_gfx942(
         512, 128, 128, 128, 4, 2, 16, 16, 32, vec=16),
 }
 # NOTE: 10402 (a16w16_naive_64x64) was removed -- 32.85us never matched WKC's
@@ -1222,14 +2305,11 @@ gfx942_a8w8_kernels_list = {
 gfx942_kernels_list = {
     **gfx942_nosplit_kernels_list,
     **gfx942_splitk_kernels_list,
-    **gfx942_a8w8_kernels_list,
 }
 
 # -- gfx1250 kernel lists ----------------------------------------------------
-# Kid offset: gfx1250 kids live in the 20000+ range, disjoint from gfx950
-# (<10000) and gfx942 (50000+). Today only the cluster/TDM split-K (atomic
-# fp32 reduction) pipeline is wired (????:fp32 output, no bias).
-GFX1250_KID_OFFSET = 20000
+# Both #4246 families are represented: two-stage
+# cluster/TDM kids and fused in-cluster-reduce kids.
 
 
 def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout, num_slots=3, wg_per_cu=2):
@@ -1239,10 +2319,11 @@ def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout, num_slots=3, wg_pe
     (demon_gcn/wmma_opus_rdna4/gemm_a16w16_cluster_tdm_splitk_reduce_4wave.cc):
     BLOCK_SIZE=128 (4 waves x 32 = 2 producer + 2 consumer), MFMA 16x16x32,
     NO-CLUSTER (one WG per B_M x B_N tile). The main kernel WMMA-accumulates in
-    fp32 and PLAIN-stores each split's partial into an fp32 workspace; a separate
-    reduce kernel sums the split slices, folds bias, and casts to the Y dtype.
-    output_dtypes = ["fp32_t"] (only the fp32-workspace main kernel is
-    instantiated; Y bf16/fp32 is a runtime decision in the reduce kernel).
+    fp32 and casts each split's partial into the exact kid's typed workspace; a
+    separate reduce kernel sums the split slices in fp32, folds bias, and casts
+    to the Y dtype. The two-stage families keep partials in fp32 workspace. The
+    output_dtypes = ["fp32_t"] token selects the existing host launch-dispatch
+    specialization; Y bf16/fp32 remains a runtime decision in the reducer.
 
     layout: "tileN" (consumers split N; B_N>=32) -> T_M=1, T_N=2;
             "tileM" (consumers split M; B_M>=32) -> T_M=2, T_N=1.
@@ -1259,6 +2340,9 @@ def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout, num_slots=3, wg_pe
         "a16w16_cluster_tdm_splitk_ws",
         ["fp32_t"],
         arch_prefix="gfx1250",
+        splitk_workspace_dtype="fp32_t",
+        # The separate reducer places one logical row in each grid.y block.
+        max_m=65535,
         ctdm_layout=layout,
         num_slots=num_slots,
         wg_per_cu=wg_per_cu,
@@ -1323,10 +2407,9 @@ def _ctdm_pick_configs(bm, bn, bk):
 # per-TDM request count hits the 256 direct-copy limit on some operand (e.g.
 # 32x256x128, 32x128x256) yield no config and are dropped automatically.
 _GFX1250_CTDM_TILES = [
-    # -- ORIGINAL 11 tiles: KEEP THIS ORDER (indices 0..10) -- the C++ heuristic
-    #    opus_a16w16_heuristic_kid_gfx1250() hardcodes kids 20000/20024/20032
-    #    (16x32/64/128, idx 0/3/4) and 20040/20048/20056 (32x32/64/128, idx
-    #    5/6/7), and tuned CSVs reference these numbers. Do NOT reorder/insert.
+    # -- ORIGINAL 11 tiles: KEEP THIS ORDER (indices 0..10) -- tuned CSVs and
+    #    the Python heuristic reference the stable kids derived from these
+    #    indices. Do NOT reorder/insert.
     # tileN family (B_M=16)
     (16, 32, 128, "tileN"),
     (16, 32, 256, "tileN"),
@@ -1346,7 +2429,7 @@ _GFX1250_CTDM_TILES = [
     #    _ctdm_pick_configs() still drops any tile whose per-TDM direct-copy
     #    request hits the 256-request limit (those deadlock the no-cluster TDM
     #    engine -- they remain available only via the multicast clusterlaunch
-    #    variant). New kids are 20088+ (idx*8), clear of the clusterlaunch band.
+    #    variant).
     (16, 64, 256, "tileN"),
     (16, 128, 256, "tileN"),
     (16, 256, 128, "tileN"),
@@ -1366,17 +2449,16 @@ _GFX1250_CTDM_TILES = [
     (128, 128, 128, "tileM"),
 ]
 
-# Kid numbering (clean, contiguous; heuristic / tuned-CSV back-compat dropped):
-#   plain (no-cluster) kids occupy [20000, 20100), ONE P=3 kid per tile (P=2 is
+# Kid numbering is stable for tuned CSVs and the Python heuristic:
+#   plain (no-cluster) local kids start at 0, ONE P=3 kid per tile (P=2 is
 #   dropped -- unvalidated). Tiles the picker rejects (>=256-request TDM
 #   direct-copy, now FIXED) fall back to P=3, 1 WG/CU so every no-spill tile still
-#   emits a plain kid (LDS(P=3) <= 320 KB for this set). The C++ heuristic
-#   constants in opus_gemm_heuristic_dispatch_gfx1250.cuh are regenerated to match.
+#   emits a plain kid (LDS(P=3) <= 320 KB for this set).
 #
 # The consumer kExpN stability guard (previously _GFX1250_MAX_KEXPN=8) is removed.
 gfx1250_kernels_list = {}
-GFX1250_PLAIN_KID_OF = {}   # (B_M,B_N,B_K) -> kid (P=3; for tuner + heuristic regen)
-_GFX1250_KID_BASE = 20000
+GFX1250_PLAIN_KID_OF = {}  # (B_M,B_N,B_K) -> kid (P=3; tuner + Python heuristic)
+_GFX1250_KID_BASE = 0
 _p_kid = _GFX1250_KID_BASE
 for _bm, _bn, _bk, _layout in _GFX1250_CTDM_TILES:
     # P=3 only (P=2 kids removed -- not validated); fall back to (P=3, 1 WG/CU)
@@ -1388,19 +2470,17 @@ for _bm, _bn, _bk, _layout in _GFX1250_CTDM_TILES:
         )
         GFX1250_PLAIN_KID_OF[(_bm, _bn, _bk)] = _p_kid
         _p_kid += 1
-assert _p_kid <= 20100, f"plain gfx1250 kids overflow the [20000,20100) band: {_p_kid}"
 
 GFX1250_BASE_KIDS = frozenset(gfx1250_kernels_list.keys())
 
 
 # -- gfx1250 CLUSTER-LAUNCH (multicast) variant ------------------------------
-# Same 4-wave TDM split-K + fp32 workspace + reduce kernel, but launched as a
+# Same 4-wave TDM split-K + typed workspace + reduce kernel, but launched as a
 # (cluster_wg_m x cluster_wg_n x 1) workgroup CLUSTER: peers co-reside and share
 # A/B TDM loads via CLUSTER_LOAD_ASYNC multicast (named-barrier producer/consumer
 # handshake, same as the plain base). The host launcher rounds the grid up to the
-# cluster dims; the workgroups that round-up adds own no tile and return at their
-# cluster-barrier arrival, so no shape needs an exact cluster fill. Distinct kid
-# band (20100+) so it never collides with the no-cluster base kids (20000..20099).
+# cluster dims; surplus workgroups take the pipeline's uniform tile_oob exit.
+# Logical workspace strides use the unrounded tile counts.
 def _a16w16_clusterlaunch_tdm_splitk_ws_gfx1250(
     bm, bn, bk, layout, cwm, cwn, num_slots=3, wg_per_cu=2
 ):
@@ -1440,8 +2520,8 @@ _GFX1250_CLUSTERLAUNCH_TILES = [
     (128, 128, 128, 1),
 ]
 _GFX1250_CLUSTERLAUNCH_P = 3            # all tiles use prefetch depth P=3
-# Clusterlaunch kids occupy [20100, 21000) (plain uses [20000, 20100)).
-_GFX1250_CLUSTERLAUNCH_KID_BASE = 20100
+# Clusterlaunch local kids follow the plain table.
+_GFX1250_CLUSTERLAUNCH_KID_BASE = _p_kid
 _GFX1250_MAX_MULTICAST_WG = 5          # TDM multicast fan-out limit (WGs per group)
 
 
@@ -1470,9 +2550,8 @@ def _gfx1250_valid_cluster_dims():
     return dims
 
 
-# Deterministic kid numbering: 20500 + running index over (tile outer, then
-# cluster dim (cwn outer, cwm inner)). Kid numbers are provisional -- a global
-# renumber is pending. The kExpN stability guard has been removed, so ALL 26
+# Deterministic local numbering over (tile outer, then
+# cluster dim (cwn outer, cwm inner)). The kExpN stability guard has been removed, so ALL 26
 # no-spill tiles are expanded (incl. B_N=256 tileM -> kExpN=16). The multicast
 # clusterlaunch path is not bound by the no-cluster 256-request TDM limit, so no
 # per-TDM request drop is applied here.
@@ -1491,23 +2570,30 @@ for _bm, _bn, _bk, _wg in _GFX1250_CLUSTERLAUNCH_TILES:
         GFX1250_CLUSTERLAUNCH_KID_OF[(_bm, _bn, _bk, _cwm, _cwn)] = _cl_kid
         _cl_kid += 1
 
-assert _cl_kid <= 21000, f"clusterlaunch gfx1250 kids overflow [20100,21000): {_cl_kid}"
 GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys())
 
 
-# -- gfx1250 FUSED single-kernel split-K (a16w16_clusterlaunch_tdm_splitk_fuse) --
-# Single kernel: last split WG folds bias + reduces the SplitK-1 partials in-kernel
-# (cluster-barrier sync), no separate reduce kernel. SplitK / MClusterWg are
-# COMPILE-TIME (cluster dims (SplitK, MClusterWg, 1)); DataWs (bf16/fp32) is a kid
-# property. B is TDM-multicast across the MClusterWg M-peers.
+# -- gfx1250 FUSED single-kernel split-K -------------------------------
+# The first SplitK-1 WGs publish typed partial tiles to caller-owned storage;
+# the last WG consumes those tiles after the cluster barrier and writes Y in
+# the same kernel. There is no separate reduce launch, but this remains an
+# external-workspace family. Workspace is tile-major:
+#   [num_tiles_m, num_tiles_n, SplitK-1, B_M, B_N]
+# SplitK and the N-peer count are compile-time properties of each exact kid.
 #
-# CURRENTLY UNREGISTERED (see GFX1250_SPLITK_FUSE_ENABLED below): the pipeline is
-# still being fixed, so the family contributes no kid. Its band has been moved to
-# [27000, 30000) -- the pre-compiled .co family took over the [21000, 27000) head
-# while this one is unregistered.
+# The final #4246 decision leaves this family unregistered until its pipeline
+# is fixed. The factory, emitter, and device source remain available, but no kid
+# is visible to exact dispatch/capability queries.
 def _a16w16_splitk_fuse_gfx1250(
-    bm, bn, bk, layout, split_k, m_cluster, ws_dtype="bf16_t",
-    num_slots=3, wg_per_cu=2,
+    bm,
+    bn,
+    bk,
+    layout,
+    split_k,
+    n_cluster,
+    ws_dtype="bf16_t",
+    num_slots=3,
+    wg_per_cu=2,
 ):
     from dataclasses import replace
 
@@ -1517,78 +2603,198 @@ def _a16w16_splitk_fuse_gfx1250(
     return replace(
         inst,
         kernel_tag="a16w16_clusterlaunch_tdm_splitk_fuse",
-        # output_dtypes MUST stay ["fp32_t"] (the split-K lookup invariant): the
-        # host launcher is instantiated ONLY as <fp32_t> and opus_gemm.cu forces
-        # the fuse band to the <fp32_t> dispatch slot; the launcher then picks the
-        # real Y dtype at RUNTIME (if Y.dtype()==bf16 ... else float). Advertising
-        # bf16_t here would make gen_a16w16_tune_lookup emit &{name}<bf16_t> in the
-        # BF16 tune map -> undefined symbol (that specialization is never built).
-        # The tuner exempts fuse kids from the output-dtype narrowing separately.
+        # The <fp32_t> host token selects the workspace dispatch ABI. The
+        # fused launcher chooses the real bf16/fp32 Y type at runtime.
         output_dtypes=["fp32_t"],
+        splitk_workspace_dtype=ws_dtype,
+        # This family reduces in-kernel, without the separate grid.y launch.
+        max_m=None,
         fuse_split_k=split_k,
-        fuse_m_cluster=m_cluster,
-        fuse_ws_dtype=ws_dtype,
+        # Historical #4246 field name; physically this is an N-peer count.
+        fuse_m_cluster=n_cluster,
     )
 
 
-# Registration switch for the whole fused family. False sweeps no (tile, split_k,
-# n_cluster, ws) combination at all, so gfx1250_splitk_fuse_kernels_list stays
-# empty: no kid to look up, nothing for the tuner to pick, nothing for the codegen
-# to emit, and the kid band below is unclaimed. The factory above, the emitter in
-# codegen/gen_instances_gfx1250.py and the device pipeline are all still here --
-# flipping this back to True is the only step needed to bring the family back.
 GFX1250_SPLITK_FUSE_ENABLED = False
 
 gfx1250_splitk_fuse_kernels_list = {}
-# Kid band the family claims WHEN ENABLED. The current sweep needs 1377 kids, so
-# [23000, 30000) has room to spare; while disabled the whole range is free.
-# It used to start at 21000 -- the pre-compiled .co family took [21000, 23000)
-# while this one was unregistered.
-GFX1250_SPLITK_FUSE_KID_BASE = 27000
-_sf_kid = GFX1250_SPLITK_FUSE_KID_BASE
-# (B_M, B_N, B_K, layout, split_k, m_cluster, ws_dtype) -> kid, for the tuner /
-# candidate selection to look a fuse kid up by config.
 GFX1250_SPLITK_FUSE_KID_OF = {}
-# Fuse tiles = the SAME no-spill (B_M, B_N, B_K) set as the clusterlaunch sweep
-# (_GFX1250_CLUSTERLAUNCH_TILES), so fuse covers the full tile range. Layout
-# follows the base rule (B_M==16 -> tileN, else tileM); wg_per_cu is inherited
-# per tile from the clusterlaunch table (the fuse producer shares the same TDM
-# request profile, so that wg keeps 2-WG/CU co-residency TDM-budget-safe).
-#
-# N-DIRECTION MULTICAST: the cluster is (SplitK, n_cluster, 1) where the 2nd dim
-# (stored in the fuse_m_cluster field) groups n_cluster N-tile peers that share
-# A[M-tile] via TDM multicast (mirrors the clusterlaunch cwn A-multicast that
-# wins at small M). n_cluster is swept 1..5 (TDM fan-out <= 5) subject to
-# SplitK*n_cluster <= 16 (16-WG cluster budget).
-#
-# split_k sweep per workspace dtype:
-#   * bf16 workspace: split_k 2..15
-#   * fp32 workspace: split_k 2..8 (kept conservative; the reduce now stages
-#     partials through a bounded LDS RING (kFuseReduceRing in the pipeline), so
-#     split_k is NO LONGER LDS-bounded -- this cap could be lifted to 15 too).
-# SplitK is capped at 15 (NOT 16): each __cluster_dims__ axis is a 4-bit field.
-# SplitK / n_cluster are COMPILE-TIME (cluster dims), so each (tile, split_k,
-# n_cluster, ws) is a distinct kid; neither is a runtime knob for fuse.
-_FUSE_REDUCE_RING = 3  # must match kFuseReduceRing in the fuse pipeline header
+
+# The bounded LDS ring used by the fused reducer must fit inside the traits'
+# shared allocation. These constants mirror the fused pipeline.
+_FUSE_REDUCE_RING = 3
 _FUSE_NUM_SLOTS = 3
 
 
 def _fuse_ring_lds_ok(bm, bn, bk, wg, ws_bytes):
-    """Guard: the reduce LDS ring (kFuseReduceRing tiles of B_M*B_N*ws_bytes)
-    must fit kLdsTotalBytes. Mirrors the traits LDS formula so we never emit a
-    kid that would fail the pipeline's ring static_assert at compile time."""
     pitch = bk + 8
-    seg_ab = _FUSE_NUM_SLOTS * (bm + bn) * pitch * 2  # bf16 A/B footprint
-    lds_total = (160 * 1024 + 1024) if (wg == 1 and seg_ab <= 160 * 1024) else seg_ab
+    seg_ab = _FUSE_NUM_SLOTS * (bm + bn) * pitch * 2
+    lds_total = (
+        160 * 1024 + 1024 if wg == 1 and seg_ab <= 160 * 1024 else seg_ab
+    )
     return _FUSE_REDUCE_RING * bm * bn * ws_bytes <= lds_total
 
 
-_FUSE_WS_SWEEP = (("bf16_t", 2, 15), ("fp32_t", 4, 8))  # (ws_dtype, elem_bytes, sk_hi)
-# N-direction cluster (A-multicast) fan-out: the fuse_m_cluster field holds the
-# cluster's 2nd-dim WG count, which for this pipeline groups N-tile peers sharing
-# A. TDM multicast fans out to <= 5 WGs, and the cluster (SplitK, n_cluster, 1)
-# must satisfy SplitK*n_cluster <= 16 (16-bit workgroup_mask / 16-WG budget).
+# BF16 storage covers SplitK 2..15; the conservative FP32 family covers 2..8.
+# Cluster dims are (SplitK, n_cluster, 1), so SplitK*n_cluster must fit the
+# 16-WG cluster budget and each axis stays within its hardware limit.
+_FUSE_WS_SWEEP = (("bf16_t", 2, 15), ("fp32_t", 4, 8))
 _FUSE_MAX_NCLUSTER = 5
+
+
+# -- gfx1250 symmetric 4-wave compute, pre-compiled .co ---------------------
+# JSON is the single source of truth shared by the offline image builder and
+# this host-launcher registry. The device kernels need compiler facilities not
+# available in the release JIT toolchain, so gen_instances emits host launchers
+# only and loads the matching image at runtime.
+CO_KERNELS_JSON = os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels.json")
+
+_CO_DTYPE_BYTES = {
+    "bf16_t": 2,
+    "fp16_t": 2,
+    "fp32_t": 4,
+    "fp8_t": 1,
+    "bf8_t": 1,
+}
+
+
+def _co_instance_from_json(arch, entry):
+    """Convert one JSON record to the exact host/device CO configuration."""
+    tag = entry["tag"]
+    bm, bn, bk = entry["tile"]
+    cwm, cwn = entry["cluster"]
+    lb_threads, lb_waves = entry["launch_bounds"]
+    dtypes = entry["dtypes"]
+    assert lb_threads == entry["block_size"], (
+        f"co kid {entry['kid']}: launch_bounds[0]={lb_threads} must equal "
+        f"block_size={entry['block_size']}"
+    )
+    vec_a = 16 // _CO_DTYPE_BYTES[dtypes["a"]]
+    vec_b = 16 // _CO_DTYPE_BYTES[dtypes["b"]]
+    return OpusGemmInstance(
+        entry["block_size"],
+        bm,
+        bn,
+        bk,
+        4,
+        1,
+        16,
+        16,
+        32,
+        vec_a,
+        vec_b,
+        8,
+        0,
+        0,
+        0,
+        tag,
+        [dtypes["c"]],
+        arch_prefix=arch,
+        num_slots=entry["num_slots"],
+        cluster_wg_m=cwm,
+        cluster_wg_n=cwn,
+        co_num_vgpr=entry.get("num_vgpr", 0),
+        co_min_waves_per_eu=lb_waves,
+        co_device_flags=tuple(entry.get("device_flags", ())),
+        co_variant=entry.get("variant", ""),
+        co_dtypes=(dtypes["a"], dtypes["b"], dtypes["c"], dtypes["acc"]),
+        co_wave_layout=tuple(entry.get("wave_layout", (4, 1))),
+    )
+
+
+def _validate_co_instance(kid, instance):
+    """Validate the runtime contract baked into one pre-built image."""
+    if instance.arch_prefix != "gfx1250":
+        raise ValueError(
+            f"CO kid {kid} must target gfx1250, got {instance.arch_prefix!r}"
+        )
+    if instance.output_dtypes != ["bf16_t"]:
+        raise ValueError(f"CO kid {kid} must expose BF16 output only")
+    if instance.co_dtypes != (
+        "bf16_t",
+        "bf16_t",
+        "bf16_t",
+        "fp32_t",
+    ):
+        raise ValueError(f"CO kid {kid} has unsupported dtype contract")
+    if instance.splitk_workspace_dtype is not None:
+        raise ValueError(f"CO kid {kid} must not declare workspace storage")
+
+
+def co_image_path(path, instance):
+    """Return the pre-built image corresponding to an instance JSON file."""
+    return os.path.join(
+        os.path.dirname(path), instance.arch_prefix, f"{instance.name}.co"
+    )
+
+
+def _load_co_kernels(path, require_image=True):
+    """Load pre-built CO instances, safely dropping records with no image."""
+    if not os.path.exists(path):
+        return {}
+
+    import json
+
+    with open(path) as stream:
+        document = json.load(stream)
+
+    instances = {}
+    seen_names = {}
+    missing = []
+    for arch, entries in document.items():
+        if arch.startswith("_"):
+            continue
+        for entry in entries:
+            kid = entry["kid"]
+            tag = entry["tag"]
+            if tag not in _A16W16_CO_TAGS:
+                raise ValueError(f"unsupported CO kernel tag {tag!r} for kid {kid}")
+            if type(kid) is not int or kid < 0:
+                raise ValueError(f"invalid local CO kid {kid}")
+            assert kid not in instances, f"duplicate co kid {kid} in {path}"
+            instance = _co_instance_from_json(arch, entry)
+            _validate_co_instance(kid, instance)
+            assert instance.name not in seen_names, (
+                f"co kids {seen_names[instance.name]} and {kid} generate the same "
+                f"symbol {instance.name!r}"
+            )
+            seen_names[instance.name] = kid
+            if require_image and not os.path.exists(co_image_path(path, instance)):
+                missing.append((kid, instance.name))
+                continue
+            instances[kid] = instance
+
+    if missing:
+        preview = ", ".join(f"{kid} ({name}.co)" for kid, name in missing[:5])
+        suffix = f", ... and {len(missing) - 5} more" if len(missing) > 5 else ""
+        print(
+            f"[opus] {len(missing)} pre-compiled (.co) kid(s) dropped -- image "
+            f"not found under {os.path.dirname(path)}: {preview}{suffix}. Build "
+            "them with csrc/opus_gemm/gen_co/build_co.py.",
+            file=sys.stderr,
+        )
+    return instances
+
+
+gfx1250_4wave_co_kernels_list = {
+    kid: instance
+    for kid, instance in _load_co_kernels(CO_KERNELS_JSON).items()
+    if instance.kernel_tag in _A16W16_CO_TAGS
+}
+# The offline builder must see declared records even before their images exist.
+gfx1250_4wave_co_kernels_declared = {
+    kid: instance
+    for kid, instance in _load_co_kernels(
+        CO_KERNELS_JSON, require_image=False
+    ).items()
+    if instance.kernel_tag in _A16W16_CO_TAGS
+}
+
+GFX1250_SPLITK_FUSE_KID_BASE = max(
+    (*gfx1250_kernels_list, *gfx1250_clusterlaunch_kernels_list,
+     *gfx1250_4wave_co_kernels_declared), default=-1,
+) + 1000
+_sf_kid = GFX1250_SPLITK_FUSE_KID_BASE
 _fuse_tiles_seen = set()
 _fuse_tiles = _GFX1250_CLUSTERLAUNCH_TILES if GFX1250_SPLITK_FUSE_ENABLED else ()
 for _bm, _bn, _bk, _wg in _fuse_tiles:
@@ -1598,197 +2804,55 @@ for _bm, _bn, _bk, _wg in _fuse_tiles:
     _layout = "tileN" if _bm == 16 else "tileM"
     for _ws, _ws_bytes, _sk_hi in _FUSE_WS_SWEEP:
         if not _fuse_ring_lds_ok(_bm, _bn, _bk, _wg, _ws_bytes):
-            continue  # ring wouldn't fit LDS for this (tile, ws) -- skip
+            continue
         for _nc in range(1, _FUSE_MAX_NCLUSTER + 1):
             for _sk in range(2, _sk_hi + 1):
-                if _sk * _nc > 16:  # SplitK * n_cluster <= 16 (cluster budget)
+                if _sk * _nc > 16:
                     continue
-                gfx1250_splitk_fuse_kernels_list[_sf_kid] = _a16w16_splitk_fuse_gfx1250(
-                    _bm, _bn, _bk, _layout,
-                    split_k=_sk, m_cluster=_nc, ws_dtype=_ws, wg_per_cu=_wg,
+                gfx1250_splitk_fuse_kernels_list[_sf_kid] = (
+                    _a16w16_splitk_fuse_gfx1250(
+                        _bm,
+                        _bn,
+                        _bk,
+                        _layout,
+                        split_k=_sk,
+                        n_cluster=_nc,
+                        ws_dtype=_ws,
+                        wg_per_cu=_wg,
+                    )
                 )
                 GFX1250_SPLITK_FUSE_KID_OF[
                     (_bm, _bn, _bk, _layout, _sk, _nc, _ws)
                 ] = _sf_kid
                 _sf_kid += 1
-assert _sf_kid <= 30000, f"splitk_fuse gfx1250 kids overflow [27000,30000): {_sf_kid}"
+
 GFX1250_SPLITK_FUSE_KIDS = frozenset(gfx1250_splitk_fuse_kernels_list.keys())
+assert bool(GFX1250_SPLITK_FUSE_KIDS) == GFX1250_SPLITK_FUSE_ENABLED
 
-
-# -- gfx1250 SYMMETRIC 4-WAVE COMPUTE, pre-compiled .co (a16w16_4wave_co) -----
-# No producer/consumer split: all 4 waves issue TDM and run WMMA, each owning
-# 32 M rows and the full B_N across the whole K loop (~256 fp32 VGPR/lane of
-# accumulators live throughout). No workspace, no split-K, no bias -- bf16 C is
-# stored straight out through LDS by one TDM per wave.
-#
-# THE DEVICE SIDE OF THIS FAMILY IS NOT JIT-COMPILED. The kernel needs
-# __builtin_amdgcn_pin_vgpr / amdgpu_num_vgpr / -amdgpu-expert-scheduling-mode,
-# none of which a release ROCm toolchain provides, so it is built ahead of time
-# by gen_co/build_co.py into gen_co/gfx1250/<name>.co and loaded at runtime.
-# gen_co/co_kernels.json is the single source of truth for BOTH the offline
-# build and the JIT codegen, which is what keeps the .co filename, the .co's
-# extern "C" symbol and the host launcher symbol identical. Adding a variant
-# (another VGPR budget, another cluster shape, other device flags) is an edit to
-# that file only -- nothing here enumerates configurations.
-# A full tile x wave-layout x ring-depth x cluster sweep is a few thousand
-# entries, so the co band is 6000 wide. splitk_fuse sits above it at 27000.
-GFX1250_4WAVE_CO_KID_BASE = 21000
-GFX1250_4WAVE_CO_KID_END = 27000
-
-CO_KERNELS_JSON = os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels.json")
-
-# Which kid band each pre-compiled tag is allowed to claim. A tag with no entry
-# here is rejected outright rather than landing on some other family's kids.
-_CO_KID_BANDS = {
-    "a16w16_4wave_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
-    # Same band: kids are explicit in the JSON, so the two co families just
-    # continue the numbering rather than each reserving a sub-range.
-    "a16w16_4wave_wl_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
-}
-
-
-_CO_DTYPE_BYTES = {"bf16_t": 2, "fp16_t": 2, "fp32_t": 4, "fp8_t": 1, "bf8_t": 1}
-
-
-def _co_instance_from_json(arch, e):
-    """One JSON entry -> one OpusGemmInstance. Every field the .co and the host
-    launcher must agree on comes from this single conversion."""
-    tag = e["tag"]
-    bm, bn, bk = e["tile"]
-    cwm, cwn = e["cluster"]
-    lb_threads, lb_waves = e["launch_bounds"]
-    d = e["dtypes"]
-    # The host launcher starts the grid with dim3(Traits::BLOCK_SIZE); if these
-    # two disagree the kernel is launched with a block size its
-    # __launch_bounds__ never promised, which fails silently rather than loudly.
-    assert lb_threads == e["block_size"], (
-        f"co kid {e['kid']}: launch_bounds[0]={lb_threads} must equal "
-        f"block_size={e['block_size']}"
-    )
-    vec_a = 16 // _CO_DTYPE_BYTES[d["a"]]
-    vec_b = 16 // _CO_DTYPE_BYTES[d["b"]]
-    return OpusGemmInstance(
-        e["block_size"],
-        bm, bn, bk,
-        4, 1,           # T_M, T_N: the 4 waves split M, each owns the full N
-        16, 16, 32,     # WMMA 16x16x32
-        vec_a, vec_b, 8,
-        0, 0, 0,        # GROUP (unused)
-        tag,
-        # The kernel stores C straight through LDS with no reduce kernel behind
-        # it to cast anything else, so unlike the gfx1250 split-K kids this is
-        # the real output dtype, not an ABI placeholder for a workspace slot.
-        [d["c"]],
-        arch_prefix=arch,
-        num_slots=e["num_slots"],
-        cluster_wg_m=cwm,
-        cluster_wg_n=cwn,
-        co_num_vgpr=e.get("num_vgpr", 0),
-        co_min_waves_per_eu=lb_waves,
-        co_device_flags=tuple(e.get("device_flags", ())),
-        co_variant=e.get("variant", ""),
-        co_dtypes=(d["a"], d["b"], d["c"], d["acc"]),
-        co_wave_layout=tuple(e.get("wave_layout", (4, 1))),
-    )
-
-
-def co_image_path(path, inst):
-    """Where the pre-built image for `inst` lives, relative to co_kernels.json.
-
-    The one place the layout `gen_co/<arch>/<symbol>.co` is spelled on the Python
-    side; the C++ loader spells the same thing under $OPUS_GEN_CO_DIR.
-    """
-    return os.path.join(os.path.dirname(path), inst.arch_prefix, f"{inst.name}.co")
-
-
-def _load_co_kernels(path, require_image=True):
-    """Parse gen_co/co_kernels.json into {kid: OpusGemmInstance}.
-
-    A MISSING FILE IS NOT AN ERROR: the family goes empty, exactly like
-    GFX1250_SPLITK_FUSE_ENABLED=False. A data file that failed to ship should
-    cost the co kids, not the whole opus codegen. A malformed one still raises.
-
-    ``require_image`` extends that same degradation to the images themselves: an
-    entry whose .co is not on disk is DROPPED (with a warning) rather than
-    registered. Without this, a kid can exist all the way through codegen, the
-    tuner and the tuned CSV and only fail at its first launch -- which is
-    precisely what a wheel built from a tree where the .co files were never
-    committed would ship. build_co.py is the one caller that must see the
-    unfiltered table: it is what produces the missing images.
-    """
-    if not os.path.exists(path):
-        return {}
-    import json
-
-    with open(path) as f:
-        doc = json.load(f)
-
-    out = {}
-    seen_names = {}
-    missing = []
-    for arch, entries in doc.items():
-        if arch.startswith("_"):  # "_comment"
-            continue
-        for e in entries:
-            kid = e["kid"]
-            lo, hi = _CO_KID_BANDS[e["tag"]]
-            assert lo <= kid < hi, (
-                f"co kid {kid} (tag {e['tag']}) outside its band [{lo},{hi})"
-            )
-            assert kid not in out, f"duplicate co kid {kid} in {path}"
-            inst = _co_instance_from_json(arch, e)
-            # The name is the .co filename, the .co's extern "C" symbol AND the
-            # host launcher symbol. Two entries colliding here would silently
-            # overwrite one .co with the other.
-            assert inst.name not in seen_names, (
-                f"co kids {seen_names[inst.name]} and {kid} generate the same "
-                f"symbol {inst.name!r} -- give one of them a distinct "
-                f'"variant" string'
-            )
-            seen_names[inst.name] = kid
-            if require_image and not os.path.exists(co_image_path(path, inst)):
-                missing.append((kid, inst.name))
-                continue
-            out[kid] = inst
-    if missing:
-        print(
-            f"[opus] {len(missing)} pre-compiled (.co) kid(s) dropped -- image "
-            f"not found under {os.path.dirname(path)}: "
-            # A full sweep is thousands of entries; naming every one turns a
-            # warning into a wall of text on every codegen run.
-            + ", ".join(f"{kid} ({name}.co)" for kid, name in missing[:5])
-            + (f", ... and {len(missing) - 5} more" if len(missing) > 5 else "")
-            + ". Build them with csrc/opus_gemm/gen_co/build_co.py --llvm-bin "
-            "<pin-capable LLVM>.",
-            file=sys.stderr,
-        )
-    return out
-
-
-gfx1250_4wave_co_kernels_list = {
-    kid: inst
-    for kid, inst in _load_co_kernels(CO_KERNELS_JSON).items()
-    if inst.kernel_tag.startswith("a16w16_4wave")
-}
-# Every JSON entry, image on disk or not. ONLY for build_co.py (the producer);
-# everything that dispatches must use the filtered table above.
-gfx1250_4wave_co_kernels_declared = {
-    kid: inst
-    for kid, inst in _load_co_kernels(CO_KERNELS_JSON, require_image=False).items()
-    if inst.kernel_tag.startswith("a16w16_4wave")
-}
-# symbol name -> kid, for candidate selection. Keyed on the name rather than on
-# (tile, cluster) because two variants may share a tile and differ only in the
-# VGPR budget -- a (tile, cluster) key would silently drop one of them.
 GFX1250_4WAVE_CO_KID_OF = {
-    k.name: kid for kid, k in gfx1250_4wave_co_kernels_list.items()
+    instance.name: kid for kid, instance in gfx1250_4wave_co_kernels_list.items()
 }
-GFX1250_4WAVE_CO_KIDS = frozenset(gfx1250_4wave_co_kernels_list.keys())
+GFX1250_4WAVE_CO_KIDS = frozenset(gfx1250_4wave_co_kernels_list)
+
+_GFX1250_PRE_CO_KIDS = (
+    frozenset(gfx1250_kernels_list)
+    | frozenset(gfx1250_clusterlaunch_kernels_list)
+    | GFX1250_SPLITK_FUSE_KIDS
+)
+assert not (GFX1250_4WAVE_CO_KIDS & _GFX1250_PRE_CO_KIDS), (
+    "gfx1250 CO kids overlap an existing gfx1250 family"
+)
+
+# Flatten the eight BMM launcher tags into the same canonical exact-kid
+# registry used by every other OPUS family.
+a8w8_mxscale_bmm_kernels_list = {
+    kid: instance
+    for family in a8w8_mxscale_bmm_kernel_lists
+    for kid, instance in family.items()
+}
 
 # combined list (used by production gen_instances / dispatch)
-kernels_list = {
-    **a8w8_scale_kernels_list,
-    **a8w8_kernels_list,
+gfx950_a16w16_kernels_list = {
     **a16w16_kernels_list,
     **a16w16_kernels_list_nooob,
     **a16w16_kernels_list_cpol,
@@ -1806,126 +2870,226 @@ kernels_list = {
     **a16w16_persistent_kernels_list_4g_safe,
     **a16w16_persistent_kernels_list_4g_safe_nooob,
     **a16w16_mono_tile_kernels_list_4g_safe,
-    **gfx942_kernels_list,
+}
+
+gfx1250_a16w16_kernels_list = {
     **gfx1250_kernels_list,
     **gfx1250_clusterlaunch_kernels_list,
     **gfx1250_splitk_fuse_kernels_list,
-    **gfx1250_4wave_co_kernels_list,
+    **gfx1250_4wave_co_kernels_declared,
 }
 
-default_kernels_dict = {
-    (-1): OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
-    (-2): OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0,     "a8w8",       ["fp32_t"]),
-    (-3): _a16w16(512, 256, 256, 64, 4, 16, 16, 32),  # same as a16w16 #9
+KERNEL_REGISTRY = {
+    "a16w16": {
+        "gfx950": {cu: dict(sorted(gfx950_a16w16_kernels_list.items())) for cu in (128, 256)},
+        "gfx942": {cu: dict(sorted(gfx942_kernels_list.items())) for cu in (80, 228, 304)},
+        "gfx1250": {256: dict(sorted(gfx1250_a16w16_kernels_list.items()))},
+    },
+    "a8w8": {"gfx950": {cu: dict(a8w8_kernels_list) for cu in (128, 256)}},
+    "a8w8_blockscale": {"gfx950": {cu: dict(a8w8_scale_kernels_list) for cu in (128, 256)}},
+    "a8w8_mxscale_bmm": {"gfx950": {cu: dict(sorted(a8w8_mxscale_bmm_kernels_list.items())) for cu in (128, 256)}},
+    "a8w8_blockscale_bpreshuffle": {"gfx942": {cu: dict(gfx942_a8w8_kernels_list) for cu in (80, 228, 304)}},
 }
+
 # fmt: on
 
 
-# Subset-compile kid taxonomy (consumed by gen_instances.py for the `HEURISTIC_DEFAULT_KIDS ?
-
-# Splitk kids: a16w16_flatmm_splitk pipeline (kid 200..223 + nooob mirror).
-SPLITK_KIDS = (
-    frozenset(a16w16_flatmm_splitk_kernels_list.keys())
-    | frozenset(a16w16_flatmm_splitk_kernels_list_nooob.keys())
-    | frozenset(gfx942_splitk_kernels_list.keys())
-    | frozenset(gfx1250_kernels_list.keys())
-    | frozenset(gfx1250_clusterlaunch_kernels_list.keys())
+# Generated names must identify one configuration. Multiple IDs may alias
+# the same configuration, but distinct traits must not share a name.
+_name_owner = {}
+_name_clashes = []
+for _cat in (
+    *a8w8_mxscale_bmm_kernel_lists,
+    gfx950_a16w16_kernels_list,
+    gfx942_kernels_list,
+    gfx1250_a16w16_kernels_list,
+):
+    for _kid, _inst in _cat.items():
+        _sig = repr(asdict(_inst))
+        _owner = _name_owner.setdefault(_inst.name, (_kid, _sig))
+        if _owner[1] != _sig:
+            _name_clashes.append((_owner[0], _kid, _inst.name))
+assert not _name_clashes, (
+    "these kid pairs differ in configuration yet share one instance name, so only "
+    f"one of each pair can be emitted: {_name_clashes}. Whatever distinguishes them "
+    "has to appear in OpusGemmInstance.name for their kernel_tag."
 )
 
-# Non-splitk a16w16-family kids: split-barrier 4..9 + cpol/nooob mirrors, persistent 300..315 +
-# cpol/nooob mirrors.
-NON_SPLITK_KIDS = (
-    frozenset(a16w16_kernels_list.keys())
-    | frozenset(a16w16_kernels_list_nooob.keys())
-    | frozenset(a16w16_kernels_list_cpol.keys())
-    | frozenset(a16w16_kernels_list_cpol_nooob.keys())
-    | frozenset(a16w16_persistent_kernels_list.keys())
-    | frozenset(a16w16_persistent_kernels_list_cpol.keys())
-    | frozenset(a16w16_persistent_kernels_list_nooob.keys())
-    | frozenset(a16w16_persistent_kernels_list_cpol_nooob.keys())
-    | frozenset(a16w16_mono_tile_kernels_list.keys())
-    | frozenset(gfx942_nosplit_kernels_list.keys())
+
+@dataclass(frozen=True, order=True)
+class KernelKey:
+    family: str
+    gfx: str
+    cu_num: int
+    kid: int
+
+    def __post_init__(self):
+        object.__setattr__(self, "family", self.family.strip().lower())
+        object.__setattr__(self, "gfx", self.gfx.split(":", 1)[0].strip().lower())
+        if type(self.cu_num) is not int or self.cu_num <= 0:
+            raise ValueError("kernel identity requires a positive integer cu_num")
+        if type(self.kid) is not int or self.kid < 0:
+            raise ValueError("kernel identity requires a non-negative integer kid")
+
+    def encode(self) -> str:
+        return f"{self.family}/{self.gfx}/{self.cu_num}/{self.kid}"
+
+    @classmethod
+    def decode(cls, value: str) -> "KernelKey":
+        family, gfx, cu_num, kid = value.split("/")
+        return cls(family, gfx, int(cu_num), int(kid))
+
+
+def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
+    """Select available kernels from the family/gfx/CU table."""
+    family = family.strip().lower()
+    gfx = gfx.split(":", 1)[0].strip().lower()
+    tables = KERNEL_REGISTRY.get(family, {}).get(gfx, {})
+    if not tables:
+        return {}
+    if type(cu_num) is not int or cu_num not in tables:
+        raise ValueError(f"unregistered OPUS namespace {family}/{gfx}/{cu_num}")
+    records = tables[cu_num]
+    if family == "a16w16" and gfx == "gfx1250":
+        return {
+            kid: instance
+            for kid, instance in records.items()
+            if instance.kernel_tag not in _A16W16_CO_TAGS
+            or os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
+        }
+    return records
+
+
+def parse_integer(value, *, name, minimum=0):
+    try:
+        number = Decimal(str(value))
+        integer = int(number)
+        if number != integer or integer < minimum:
+            raise ValueError
+        return integer
+    except (InvalidOperation, ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(
+            f"invalid {name} {value!r}; expected an integer >= {minimum}"
+        ) from exc
+
+
+def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
+    kid = min(
+        (
+            kid
+            for kid, instance in get_registry(family, gfx, cu_num).items()
+            if instance.name == name
+        ),
+        default=None,
+    )
+    if kid is None:
+        raise ValueError(
+            f"kernel symbol {name!r} is absent from {family}/{gfx}/{cu_num}"
+        )
+    return kid
+
+
+def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
+    """Select the default compile set from the current CU table."""
+    defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((gfx, cu_num), ())
+    return {
+        KernelKey("a16w16", gfx, cu_num, kid)
+        for kid in get_registry("a16w16", gfx, cu_num)
+        if kid in defaults
+    }
+
+
+def _in_group(name, family, instance):
+    if family == "a16w16":
+        workspace = instance.splitk_workspace_dtype is not None
+        return {
+            "SPLITK_KIDS": workspace,
+            "NON_SPLITK_KIDS": not workspace,
+            "BIAS_AWARE_KIDS": workspace or instance.kernel_tag == "a16w16",
+            "GFX1250_4WAVE_CO_KIDS": instance.kernel_tag in _A16W16_CO_TAGS,
+            "SPLITK_4G_SAFE_KIDS": workspace and instance.is_4g_safe,
+            "NON_SPLITK_4G_SAFE_KIDS": not workspace and instance.is_4g_safe,
+            "FOUR_G_SAFE_KIDS": instance.is_4g_safe,
+        }.get(name, False)
+    return family == "a8w8_mxscale_bmm" and name == "BMM_MXSCALE_KIDS"
+
+
+def group_kids(name, gfx, family="a16w16", *, cu_num):
+    """Derive capability groups from the selected namespace's instances."""
+    return frozenset(
+        kid
+        for kid, instance in get_registry(family, gfx, cu_num).items()
+        if _in_group(name, family, instance)
+    )
+
+
+BMM_MXSCALE_WORKSPACE_TAGS = frozenset(
+    {
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_fused",
+    }
+)
+BMM_MXSCALE_WORKSPACE_KIDS = frozenset(
+    ("a8w8_mxscale_bmm", "gfx950", kid)
+    for kid, instance in a8w8_mxscale_bmm_kernels_list.items()
+    if instance.kernel_tag in BMM_MXSCALE_WORKSPACE_TAGS and not instance.direct_only
 )
 
-# 4g_safe kid families. Per-WG-tight BR sizing -- selectable for any shape
-# (M/N/K tail safe by BR num_records). All current 4g_safe kids are non-splitk
-# (split-barrier / persistent / mono_tile variants). flatmm_splitk_4g_safe
-# can be added later if needed.
-SPLITK_4G_SAFE_KIDS = frozenset()
-NON_SPLITK_4G_SAFE_KIDS = (
-    frozenset(a16w16_kernels_list_4g_safe.keys())
-    | frozenset(a16w16_kernels_list_4g_safe_nooob.keys())
-    | frozenset(a16w16_persistent_kernels_list_4g_safe.keys())
-    | frozenset(a16w16_persistent_kernels_list_4g_safe_nooob.keys())
-    | frozenset(a16w16_mono_tile_kernels_list_4g_safe.keys())
-)
-# Per the opus kid pruning policy (project memory), 4g_safe kids are added
-# additively -- they do NOT shadow or replace any existing kid.
-NON_SPLITK_KIDS = NON_SPLITK_KIDS | NON_SPLITK_4G_SAFE_KIDS
+_SUPPORTED_SPLITK_WORKSPACE_DTYPES = frozenset({"bf16_t", "fp32_t"})
+for _tables in KERNEL_REGISTRY["a16w16"].values():
+    for _workspace_kid, _workspace_instance in next(iter(_tables.values())).items():
+        _workspace_dtype = _workspace_instance.splitk_workspace_dtype
+        if (
+            _workspace_dtype is not None
+            and _workspace_dtype not in _SUPPORTED_SPLITK_WORKSPACE_DTYPES
+        ):
+            raise ValueError(
+                f"workspace kid {_workspace_kid} must explicitly declare "
+                f"splitk_workspace_dtype, got {_workspace_dtype!r}"
+            )
 
-# All-4g_safe-kids superset, consumed by the per-kid 4 GiB filter in
-# opus_gemm_tune.py (legacy kids are dropped from the candidate pool when
-# A/B/C bytes exceed UINT32_MAX; 4g_safe kids stay).
-FOUR_G_SAFE_KIDS = SPLITK_4G_SAFE_KIDS | NON_SPLITK_4G_SAFE_KIDS
-
-# Bias-aware kids: gfx950 split-barrier (4..9 + cpol/nooob mirrors), 4g_safe
-# mirrors, and the entire splitk family (gfx950 a16w16_flatmm_splitk + gfx942
-# splitk). Persistent excluded (launcher rejects bias).
-BIAS_AWARE_KIDS = (
-    frozenset(a16w16_kernels_list.keys())
-    | frozenset(a16w16_kernels_list_nooob.keys())
-    | frozenset(a16w16_kernels_list_cpol.keys())
-    | frozenset(a16w16_kernels_list_cpol_nooob.keys())
-    | frozenset(a16w16_kernels_list_4g_safe.keys())
-    | frozenset(a16w16_kernels_list_4g_safe_nooob.keys())
-    | SPLITK_KIDS
-)
-
-# Heuristic-dispatch fallback kids (gfx950).
-HEURISTIC_DEFAULT_KIDS_GFX950 = frozenset(
+# Exact-id kernels kept in every default build.  The high-level A16 caller-side
+# heuristics below the tuned lookup are constrained to these ids; the unified
+# public/C++ launch path still receives one already-resolved exact kid.
+DEFAULT_COMPILED_KIDS_GFX950 = frozenset(
     {
         # splitk fallback (small M / non-aligned big M)
-        200,
-        1200,  # cc tile 0: (64, 64, 64) WG=2
-        206,
-        1206,  # cc tile 6: (64, 32, 128) WG=2
-        208,
-        1208,  # cc tile 8: (64, 64, 128) WG=1
+        6,
+        52,  # cc tile 0: (64, 64, 64) WG=2
+        12,
+        58,  # cc tile 6: (64, 32, 128) WG=2
+        14,
+        60,  # cc tile 8: (64, 64, 128) WG=1
         # persistent fallback (large M, tile-aligned)
-        300,
-        1300,  # persistent (256, 256, 64)
+        30,
+        76,  # persistent (256, 256, 64)
     }
 )
 
-HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
+DEFAULT_COMPILED_KIDS_GFX942 = frozenset(
     {
-        # gfx942 heuristic dispatcher fallbacks.
-        10000,  # gfx942 split-barrier    512x128x128x64 16x16x16 (large problem)
-        10001,  # gfx942 p1               256x64x64x64
-        10003,  # gfx942 p1_bk128         256x64x64x128
-        10200,  # gfx942 splitk          512x128x128x64 16x16x16 (N > 128)
-        10201,  # gfx942 splitk_p1        256x64x64x64  (depth=2 + workspace + reduce)
-        10203,  # gfx942 splitk_p1_bk128  256x64x64x128 (B_K=128 Option B; dev/bench)
-        10204,  # gfx942 splitk_em3en4_lds1_pgr2 256x128x96x128 hipb-orientation
-        10205,  # gfx942 splitk_legacy    512x64x128x64 16x16x16
-        10210,  # gfx942 splitk_legacy_bf16ws 512x128x128x64
-        10213,  # gfx942 splitk_p1_bk128_bf16ws 256x64x64x128
-        10300,  # gfx942 wave_k_coop     512x16x16x64 T_K=8
-        10301,  # gfx942 wave_k_coop     512x16x32x32 T_K=8
-        10302,  # gfx942 wave_k_coop     512x32x16x64 T_K=8
-        10303,  # gfx942 wave_k_coop     256x32x32x64 T_K=4
-        10305,  # gfx942 wave_k_coop     512x16x32x64 T_K=8
+        # Representative exact-id launchers kept in default gfx942 builds.
+        0,  # gfx942 split-barrier    512x128x128x64 16x16x16 (large problem)
+        1,  # gfx942 p1               256x64x64x64
+        2,  # gfx942 p1_bk128         256x64x64x128
+        4,  # gfx942 splitk          512x128x128x64 16x16x16 (N > 128)
+        5,  # gfx942 splitk_p1        256x64x64x64  (depth=2 + workspace + reduce)
+        6,  # gfx942 splitk_p1_bk128  256x64x64x128 (B_K=128 Option B; dev/bench)
+        7,  # gfx942 splitk_em3en4_lds1_pgr2 256x128x96x128 hipb-orientation
+        8,  # gfx942 splitk_legacy    512x64x128x64 16x16x16
+        9,  # gfx942 splitk_legacy_bf16ws 512x128x128x64
+        10,  # gfx942 splitk_p1_bk128_bf16ws 256x64x64x128
+        12,  # gfx942 wave_k_coop     512x16x16x64 T_K=8
+        13,  # gfx942 wave_k_coop     512x16x32x32 T_K=8
+        14,  # gfx942 wave_k_coop     512x32x16x64 T_K=8
+        15,  # gfx942 wave_k_coop     256x32x32x64 T_K=4
+        16,  # gfx942 wave_k_coop     512x16x32x64 T_K=8
     }
 )
 
-# gfx1250 has no shape-heuristic dispatch yet (tune-id entry only). This set
-# is used purely to keep the kid in the subset-compile set S so the tune-id
-# path can always reach it.
-# Only the kids the C++ heuristic (opus_a16w16_heuristic_kid_gfx1250) can return
-# must be force-compiled as the always-available (M,N,K) fallback. Every other
-# plain kid and ALL clusterlaunch kids are compiled on demand by the tuner
-# (candidate selection + sidecar expansion), so default builds stay small.
-HEURISTIC_DEFAULT_KIDS_GFX1250 = (
+# Keep representative plain/clusterlaunch workspace kids and all CO host kids
+# in default gfx1250 builds; the tuner compiles other device kids on demand.
+DEFAULT_COMPILED_KIDS_GFX1250 = (
     frozenset(
         GFX1250_PLAIN_KID_OF[_t]
         for _t in (
@@ -1936,44 +3100,226 @@ HEURISTIC_DEFAULT_KIDS_GFX1250 = (
             (32, 64, 128),
             (32, 128, 128),
         )
-        # The 4wave_co kids are NOT reachable from the C++ shape heuristic; they are
-        # here only for this set's other job -- membership in the subset-compile set
-        # S (gen_instances.py), so the explicit-kernelId path can always reach them.
-        # Their device side is a pre-built .co, so "compiling" one is just the host
-        # launcher: no per-kid device TU is emitted (see the co emit branch in
-        # codegen/gen_instances_gfx1250.py).
     )
-    | GFX1250_4WAVE_CO_KIDS
+    | frozenset({GFX1250_CLUSTERLAUNCH_KID_OF[(16, 32, 128, 2, 1)]})
+    | frozenset(gfx1250_4wave_co_kernels_declared)
 )
 
-HEURISTIC_DEFAULT_KIDS = (
-    HEURISTIC_DEFAULT_KIDS_GFX950
-    | HEURISTIC_DEFAULT_KIDS_GFX942
-    | HEURISTIC_DEFAULT_KIDS_GFX1250
-)
 
-HEURISTIC_DEFAULT_KIDS_BY_ARCH = {
-    "gfx950": HEURISTIC_DEFAULT_KIDS_GFX950,
-    "gfx942": HEURISTIC_DEFAULT_KIDS_GFX942,
-    "gfx1250": HEURISTIC_DEFAULT_KIDS_GFX1250,
+DEFAULT_COMPILED_KIDS_BY_ARCH = {
+    "gfx950": DEFAULT_COMPILED_KIDS_GFX950,
+    "gfx942": DEFAULT_COMPILED_KIDS_GFX942,
+    "gfx1250": DEFAULT_COMPILED_KIDS_GFX1250,
 }
 
 
-def heuristic_kids_for_arch(arches):
-    """Return the heuristic-default kid subset whose arch_prefix matches.
+DEFAULT_COMPILED_KIDS = frozenset(
+    ("a16w16", gfx, kid)
+    for gfx, kids in DEFAULT_COMPILED_KIDS_BY_ARCH.items()
+    for kid in kids
+)
 
-    ``arches`` is an iterable of lowercase arch strings (e.g. ``{"gfx942"}``)
-    or ``None`` (caller does not know / multi-arch build) -- in the ``None``
-    case the full union is returned so the legacy multi-arch behaviour is
-    preserved.
+DEFAULT_COMPILED_KIDS_BY_NAMESPACE = {
+    (gfx, cu): DEFAULT_COMPILED_KIDS_BY_ARCH[gfx] & table.keys()
+    for gfx, tables in KERNEL_REGISTRY["a16w16"].items()
+    for cu, table in tables.items()
+}
+
+
+def default_compiled_kids_for_arch(arches, *, cu_num=None):
+    arches = set(arches or OPUS_KERNEL_TAGS_BY_ARCH_FAMILY)
+    if cu_num is not None:
+        return frozenset(
+            (key.family, key.gfx, key.kid)
+            for gfx in arches
+            for key in default_compiled_keys(gfx, cu_num)
+        )
+    return frozenset(
+        ("a16w16", gfx, kid)
+        for gfx in arches
+        for kid in DEFAULT_COMPILED_KIDS_BY_ARCH.get(gfx, ())
+    )
+
+
+# Map each architecture and interface to its registered kernel tags.
+# An empty set means that the interface exists but has no kernel on that arch.
+OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
+    "gfx950": {
+        "a16w16": frozenset(
+            {
+                "a16w16",
+                "a16w16_flatmm",
+                "a16w16_flatmm_splitk",
+                "a16w16_mono_tile",
+                "a16w16_persistent",
+            }
+        ),
+        "a8w8": frozenset({"a8w8"}),
+        "a8w8_blockscale": frozenset({"a8w8_scale"}),
+        # Keep in step with _A8W8_MXSCALE_BMM_TAGS in aiter/ops/opus/launch_plan.py.
+        # They are two hand-maintained copies of the same list and both are
+        # consulted, this one first: get_kernel_instance rejects a kid whose tag
+        # is missing here before the plan builder ever checks its own copy. A tag
+        # added to only one of them therefore looks like "no registered OPUS
+        # kernel", which reads as a missing kernel rather than a missing list
+        # entry -- that is exactly how all 133 preshuffled rows were dropped
+        # while the kids were present in kernels_list the whole time.
+        "a8w8_mxscale_bmm": frozenset(
+            {
+                "a8w8_mxscale_bmm_flatmm_splitk",
+                "a8w8_mxscale_bmm_fused",
+                "a8w8_mxscale_bmm_minterleave",
+                "a8w8_mxscale_bmm_mouter",
+                "a8w8_mxscale_bmm_mouter_tunable",
+                "a8w8_mxscale_bmm_pipeline",
+                "a8w8_mxscale_bmm_wave8n2",
+                "a8w8_mxscale_bmm_wave4m2_selfload",
+                # The preshuffled-B families: unreachable upstream, where gfx950
+                # preshuffle is off, but every row of the preshuffled tuned table
+                # names one.
+                "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+                "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+                "a8w8_mxscale_bmm_bpreshuffle_blds",
+                "a8w8_mxscale_bmm_bpreshuffle_allwave",
+                "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
+                "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+                "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+                "a8w8_mxscale_bmm_bpreshuffle_wave1",
+                "a8w8_mxscale_bmm_bpreshuffle_compact",
+                "a8w8_mxscale_bmm_pipeline_bpreshuffle",
+            }
+        ),
+        "a8w8_blockscale_bpreshuffle": frozenset(),
+    },
+    "gfx942": {
+        "a16w16": frozenset(
+            {
+                "a16w16_em3en4_lds1_pgr2_sk",
+                "a16w16_kbuf1_large_tile",
+                "a16w16_kbuf1_sk",
+                "a16w16_kbuf2v",
+                "a16w16_kbuf2v_bk128",
+                "a16w16_kbuf2v_bk128_sk",
+                "a16w16_kbuf2v_sk",
+                "a16w16_quad_mfma32_kbuf1",
+                "a16w16_quad_mfma32_kbuf1_sk",
+                "a16w16_wave_k_coop",
+                "a16w16_wave_k_coop_accum",
+            }
+        ),
+        "a8w8": frozenset(),
+        "a8w8_blockscale": frozenset(),
+        "a8w8_mxscale_bmm": frozenset(),
+        "a8w8_blockscale_bpreshuffle": frozenset(
+            {"a8w8_blockscale_bpreshuffle_singlebuf"}
+        ),
+    },
+    "gfx1250": {
+        "a16w16": frozenset(
+            {
+                "a16w16_cluster_tdm_splitk_ws",
+                "a16w16_clusterlaunch_tdm_splitk_fuse",
+                "a16w16_clusterlaunch_tdm_splitk_ws",
+                "a16w16_4wave_co",
+                "a16w16_4wave_wl_co",
+                "a16w16_4wave_wlr_co",
+            }
+        ),
+        "a8w8": frozenset(),
+        "a8w8_blockscale": frozenset(),
+        "a8w8_mxscale_bmm": frozenset(),
+        "a8w8_blockscale_bpreshuffle": frozenset(),
+    },
+}
+
+
+def canonical_output_dtype(output_dtype) -> str | None:
+    """Normalize supported output dtype names for registry lookup."""
+    if output_dtype is None:
+        return None
+    value = str(output_dtype).strip().lower()
+    aliases = {
+        "bf16": "bf16_t",
+        "bfloat16": "bf16_t",
+        "bf16_t": "bf16_t",
+        "torch.bfloat16": "bf16_t",
+        "fp32": "fp32_t",
+        "float": "fp32_t",
+        "float32": "fp32_t",
+        "fp32_t": "fp32_t",
+        "torch.float32": "fp32_t",
+    }
+    return aliases.get(value, value)
+
+
+def get_kernel_instance(
+    arch: str,
+    family: str,
+    kid: int,
+    output_dtype=None,
+    *,
+    cu_num: int,
+) -> OpusGemmInstance | None:
+    """Return a kernel registered for ``(arch, interface, kid, Y.dtype)``."""
+    arch = str(arch).lower().split(":", 1)[0]
+    family = str(family).lower()
+    family_tags = OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.get(arch, {}).get(family)
+    if family_tags is None:
+        return None
+
+    try:
+        kid = int(kid)
+    except (TypeError, ValueError):
+        return None
+
+    instance = get_registry(family, arch, cu_num).get(kid)
+    if instance is None or instance.kernel_tag not in family_tags:
+        return None
+    instance_arch = (instance.arch_prefix or "gfx950").lower()
+    if instance_arch != arch:
+        return None
+
+    dtype = canonical_output_dtype(output_dtype)
+    if dtype is not None:
+        # Workspace reducers own the final cast, so their host dispatch
+        # specialization in ``output_dtypes`` is not the Y dtype contract.
+        if family == "a16w16" and instance.splitk_workspace_dtype is not None:
+            # The current gfx942 BF16-workspace reducer is exact-N and writes
+            # BF16 only.  Other A16 workspace reducers support BF16/FP32 Y.
+            allowed = (
+                {"bf16_t"}
+                if arch == "gfx942" and instance.splitk_workspace_dtype == "bf16_t"
+                else {"bf16_t", "fp32_t"}
+            )
+            output_compatible = dtype in allowed
+        elif family == "a8w8_mxscale_bmm":
+            output_compatible = dtype in {"bf16_t", "fp32_t"}
+        else:
+            output_compatible = dtype in instance.output_dtypes
+        if not output_compatible:
+            return None
+    return instance
+
+
+def kernel_needs_external_workspace(
+    arch: str, family: str, kid: int, *, cu_num: int
+) -> bool:
+    """Return whether a registered kernel requires caller-owned workspace.
+
+    Unknown logical keys are errors rather than ``False``: treating an unknown
+    kid as a non-workspace kernel would let a caller launch it without the
+    allocation required for memory safety.  Capability comes from the existing
+    selected kernel instance, never from a numeric kid range or tag substring.
+    The registry includes all enabled two-stage reducers. If the experimental
+    gfx1250 fused family is re-enabled, its first SplitK-1 WGs also publish
+    external partial tiles and therefore enter this same capability set.
     """
-    if arches is None:
-        return HEURISTIC_DEFAULT_KIDS
-    arches = {a.lower() for a in arches}
-    out = frozenset()
-    for arch in arches:
-        out = out | HEURISTIC_DEFAULT_KIDS_BY_ARCH.get(arch, frozenset())
-    return out
+    instance = get_kernel_instance(arch, family, kid, cu_num=cu_num)
+    if instance is None:
+        raise KeyError(
+            f"unknown OPUS kernel (arch={arch!r}, family={family!r}, kid={kid!r})"
+        )
+    return instance.splitk_workspace_dtype is not None and not instance.direct_only
 
 
 def _opus_sidecar_path():
@@ -1981,14 +3327,14 @@ def _opus_sidecar_path():
 
     Lives in ``{bd_dir}/`` (one level above the per-module build dir) so
     it survives ``aiter.jit.core.clear_build("module_deepgemm_opus")`` --
-    which ``build_module()`` calls when ``AITER_REBUILD == 1`` -- and is
-    therefore seeds the last successfully compiled set into the next codegen.
-    The tuner passes new candidates through ``--extra_kids``; it does not
+    which ``build_module()`` calls when ``AITER_REBUILD == 1`` -- and
+    seeds the last successfully compiled set into the next codegen.
+    The tuner passes new candidates through ``--extra_kernel_keys``; it does not
     advance this file before compiling. JIT atomically copies the generated
     sidecar back here after installing the .so, independently of source-cache
     publication. Its adjacent ``.receipt`` binds the contents to that binary;
-    the tuner requires both to match before skipping a rebuild. A plain runtime
-    dispatch uses the CSV/C++ lookup, not this file.
+    the tuner requires both to match before skipping a rebuild. Runtime exact
+    dispatch resolves the caller-selected kid without reading this file.
     """
     # Import lazily to avoid circular import at module load (aiter imports
     # opus_gemm_common, opus_gemm_common imports aiter.jit.core).

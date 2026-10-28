@@ -24,7 +24,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.topk_per_row_small_k import (
+from aiter.ops.flydsl.topk.topk_per_row_small_k import (
     topk_per_row_small_k,
     topk_per_row_small_k_supported,
 )

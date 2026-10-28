@@ -81,7 +81,7 @@ def test_stage1_async_loads_match_synchronous_and_replay(tile_m, tile_n):
     with torch.cuda.stream(stream):
         synchronous = launch(False).clone()
         expected = launch(True).clone()
-        torch.testing.assert_close(expected, synchronous, rtol=0.02, atol=0.02)
+        torch.testing.assert_close(expected, synchronous, rtol=0, atol=0)
         for _ in range(50):
             output.fill_(float("nan"))
             launch(True)

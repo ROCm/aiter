@@ -225,8 +225,10 @@ def gen_group_sizes(
         while num_unused_tokens == M:
             num_unused_tokens = int(
                 torch.binomial(
-                    torch.tensor(float(M), device=device),
-                    torch.tensor(unused_tokens_prob, device=device),
+                    torch.tensor(float(M), device=device, dtype=torch.float32),
+                    torch.tensor(
+                        unused_tokens_prob, device=device, dtype=torch.float32
+                    ),
                 ).item()
             )
     else:
@@ -244,7 +246,9 @@ def gen_group_sizes(
 
     if num_unused_tokens > 0:
         _LOGGER.debug(
-            f"Group sizes generation: dropped {num_unused_tokens} token{'s' if num_unused_tokens > 1 else ''}.",
+            "Group sizes generation: dropped %d token%s.",
+            num_unused_tokens,
+            "s" if num_unused_tokens > 1 else "",
         )
 
     if unused_experts_prob > 0:
@@ -252,7 +256,8 @@ def gen_group_sizes(
         num_used_experts = 0
         while num_used_experts == 0:
             used_experts = torch.nonzero(
-                torch.rand((G,), device=device) >= unused_experts_prob
+                torch.rand((G,), device=device, dtype=torch.float32)
+                >= unused_experts_prob
             ).squeeze()
             num_used_experts = used_experts.numel()
     else:
@@ -271,12 +276,16 @@ def gen_group_sizes(
 
     if num_unused_experts > 0:
         _LOGGER.debug(
-            f"Group sizes generation: dropped {num_unused_experts} expert{'s' if num_unused_experts > 1 else ''}.",
+            "Group sizes generation: dropped %d expert%s.",
+            num_unused_experts,
+            "s" if num_unused_experts > 1 else "",
         )
 
     group_sizes = torch.bincount(
         used_experts[
-            torch.randint(low=0, high=num_used_experts, size=(num_used_tokens,))
+            torch.randint(
+                low=0, high=num_used_experts, size=(num_used_tokens,), device=device
+            )
         ],
         minlength=G,
     ).to(group_sizes_dtype)

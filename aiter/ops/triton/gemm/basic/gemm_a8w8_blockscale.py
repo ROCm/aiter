@@ -21,7 +21,10 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.gemm_config_utils import (
+    clamp_num_buffers,
+    compute_splitk_params,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -66,7 +69,11 @@ def gemm_a8w8_blockscale(
         torch.Tensor: Output with shape (M, N).
     """
     _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "GEMM_A8W8_BLOCKSCALE: x=%s w=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -95,12 +102,12 @@ def gemm_a8w8_blockscale(
     if config is None:
         config, _ = _get_config(M, N, K, backend=backend)
 
+    # Normalizing can lower NUM_KSPLIT, so size the outputs afterwards.
+    compute_splitk_params(config, K)
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
@@ -109,8 +116,6 @@ def gemm_a8w8_blockscale(
         )
     else:
         y_pp = None
-
-    compute_splitk_params(config, K)
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
@@ -159,15 +164,19 @@ def gemm_a8w8_blockscale(
             for i in range(int(math.log2(config["num_warps"] // 2))):
                 warp_bases.append((1 << i, 0))
             extra_constexpr["warp_bases"] = tuple(warp_bases)
-            config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+            k_tiles = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+            config["NUM_BUFFERS"] = clamp_num_buffers(config["NUM_BUFFERS"], k_tiles)
         else:
             raise AssertionError(
                 f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'"
             )
 
         _LOGGER.info(
-            f"GEMM_A8W8 BLOCKSCALE [gluon/{arch}]: x={tuple(x.shape)} "
-            f"w={tuple(w.shape)} kernel={kernel_type}"
+            "GEMM_A8W8 BLOCKSCALE [gluon/%s]: x=%s w=%s kernel=%s",
+            arch,
+            tuple(x.shape),
+            tuple(w.shape),
+            kernel_type,
         )
     else:
         impl = triton_gemm_a8w8_blockscale_kernel
@@ -265,7 +274,11 @@ def gemm_a8w8_blockscale_preshuffle(
         torch.Tensor: Output with shape (M, N).
     """
     _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "GEMM_A8W8_BLOCKSCALE: x=%s w=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -303,12 +316,12 @@ def gemm_a8w8_blockscale_preshuffle(
     if kernel_type_from_config is not None:
         kernel_type = kernel_type_from_config
 
+    # Normalizing can lower NUM_KSPLIT, so size the outputs afterwards.
+    compute_splitk_params(config, K)
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
@@ -370,8 +383,10 @@ def gemm_a8w8_blockscale_preshuffle(
             kernel_type in _PRESHUFFLE_KERNEL_MAP
         ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_PRESHUFFLE_KERNEL_MAP.keys())}"
         _LOGGER.info(
-            f"GEMM_A8W8 BLOCKSCALE PRESHUFFLE [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} "
-            f"kernel={kernel_type}"
+            "GEMM_A8W8 BLOCKSCALE PRESHUFFLE [gluon/gfx1250]: x=%s w=%s kernel=%s",
+            tuple(x.shape),
+            tuple(w.shape),
+            kernel_type,
         )
 
         impl = _PRESHUFFLE_KERNEL_MAP[kernel_type]
@@ -379,7 +394,10 @@ def gemm_a8w8_blockscale_preshuffle(
         for i in range(int(math.log2(config["num_warps"] // 2))):
             warp_bases.append((1 << i, 0))
         extra_constexpr["warp_bases"] = tuple(warp_bases)
-        config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+        k_tiles = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+        config["NUM_BUFFERS"] = clamp_num_buffers(
+            config["NUM_BUFFERS"], k_tiles, prefetch_all=kernel_type == "compute_bound"
+        )
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
 

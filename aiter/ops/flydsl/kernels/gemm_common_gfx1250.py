@@ -3,7 +3,6 @@
 from collections import namedtuple
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import as_ir_value, gpu, rocdl
 from flydsl.expr.rocdl import cluster, tdm_ops
@@ -43,6 +42,33 @@ def make_lds_copy_ops(bits):
     return load, store
 
 
+def make_gemm_grid(
+    M,
+    N,
+    tile_m,
+    tile_n,
+    cluster_m,
+    *,
+    split_k=1,
+    persistent_n_tiles=1,
+    fused_splitk=False,
+):
+    """Pad M to whole clusters and split long grids without duplicating tiles.
+
+    Fused split-K reserves grid.z for the K splits of one tile. Other grids
+    may put exact chunks of M there, keeping grid.x in whole cluster rows.
+    """
+    rows = fx.ceildiv(M, tile_m)
+    rows = fx.ceildiv(fx.max(rows, 1), cluster_m) * cluster_m
+    run = rows
+    if not fused_splitk:
+        divisor = rows & -rows
+        capped = fx.min(divisor, 32)
+        fits = (capped % cluster_m) == 0
+        run = ((rows > 32) & (divisor >= 8) & fits).select(capped, rows)
+    return run, fx.ceildiv(N, tile_n) // persistent_n_tiles, (rows // run) * split_k
+
+
 def make_sgpr_opaque(val_i32):
     """Return ``val_i32`` unchanged but hidden from constant folding.
 
@@ -56,7 +82,7 @@ def make_sgpr_opaque(val_i32):
     Emits no instruction.
     """
     op = llvm_dialect.InlineAsmOp(
-        res=ir.IntegerType.get_signless(32),
+        res=T.i32,
         operands_=[as_ir_value(val_i32)],
         asm_string="",
         constraints="=s,s",
@@ -66,31 +92,30 @@ def make_sgpr_opaque(val_i32):
     return op.res
 
 
-def _raw_lds_ptr(lds_base_idx, byte_offset):
-    """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
-    lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
-    total_byte = fx.Index(lds_base_idx) + fx.Index(byte_offset)
-    return llvm_dialect.inttoptr(lds_ptr_ty, fx.Int32(total_byte).ir_value())
+def _lds_ptr(lds_base_idx, byte_offset, element_type, alignment):
+    """Materialize an aligned LDS pointer from a pre-extracted byte base."""
+    lds_ptr_ty = fx.PointerType.get(element_type, fx.AddressSpace.Shared, alignment)
+    total_byte = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
+    return fx.inttoptr(lds_ptr_ty, total_byte)
 
 
 def lds_load_b128_raw(lds_base_idx, byte_offset):
-    """Load 16 bytes from LDS using a pre-extracted base index (raw LLVM)."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(
-        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val
-    )
+    """Load 16 bytes from LDS using a pre-extracted byte base."""
+    vec_type = fx.Vector.make_type(4, fx.Int32)
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 16)
+    return as_ir_value(fx.ptr_load(ptr_val, result_type=vec_type))
 
 
 def lds_load_b32_raw(lds_base_idx, byte_offset):
     """Load 4 bytes from LDS as ``i32`` using a pre-extracted base index."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 4)
+    return as_ir_value(fx.ptr_load(ptr_val))
 
 
 def lds_store_b128_raw(lds_base_idx, byte_offset, data):
-    """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM)."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    llvm_dialect.store(as_ir_value(data), ptr_val)
+    """Store 16 bytes to LDS using a pre-extracted byte base."""
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 16)
+    fx.ptr_store(as_ir_value(data), ptr_val)
 
 
 def workgroup_barrier(use_cluster=False):
@@ -135,9 +160,7 @@ def pipeline_fence_wait(use_cluster=False):
 
 def fmin_f32(a, b):
     """Scalar f32 min (maps to v_min_num_f32)."""
-    from flydsl.expr import arith
-
-    return fx.Float32(arith.minnumf(as_ir_value(a), as_ir_value(b)))
+    return fx.minnumf(fx.Float32(a), fx.Float32(b))
 
 
 def fclamp_f32(x, lo, hi):
@@ -147,14 +170,27 @@ def fclamp_f32(x, lo, hi):
     )
 
 
+def _fma_f32(a, b, c):
+    """Evaluate ``a * b + c`` as one fused f32 operation."""
+    return fx.Float32(fx.fma(fx.Float32(a), fx.Float32(b), fx.Float32(c)))
+
+
 def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
-    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp)."""
+    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp).
+
+    Uses v_tanh_f32 (1 TRANS op) instead of exp2+rcp (2 TRANS ops):
+        sigmoid(x) = 0.5*(1 + tanh(x/2))
+    """
     _one = fx.Float32(1.0)
+    _half = fx.Float32(0.5)
     g = fmin_f32(g, limit_f32)
     u = fclamp_f32(u, neg_limit_f32, limit_f32)
+    half_gate = g * _half
     if swiglu:
-        return g * sigmoid_f32(g, alpha=1.702) * (u + _one)
-    return g * sigmoid_f32(g) * u
+        th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(half_gate * fx.Float32(1.702))))
+        return _fma_f32(half_gate, th, half_gate) * (u + _one)
+    th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(half_gate)))
+    return _fma_f32(half_gate, th, half_gate) * u
 
 
 def _tanh_f32(x, tanh_mul):
@@ -267,7 +303,15 @@ def batched_situv2(pairs, *, consts, range_constexpr):
 
 
 def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
-    """Batched silu/swiglu with pipelined exp2/rcp for better TRANS utilisation.
+    """Batched silu/swiglu with pipelined tanh for better TRANS utilisation.
+
+    Uses v_tanh_f32 (1 TRANS op) instead of exp2+rcp (2 TRANS ops):
+        sigmoid(x) = 0.5*(1 + tanh(x/2))
+
+    Tanh is issued in groups of CHUNK; after each group a sched_barrier
+    lets the compiler interleave the previous group's VALU consumers
+    (add-one, mul-half, final products) with the next group's TRANS
+    latency, avoiding a long TRANS-only stall.
 
     Args:
         pairs: list of (gate, up) f32 value pairs.
@@ -279,37 +323,47 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
         list of activated f32 values, same length as *pairs*.
     """
     _one = fx.Float32(1.0)
-    nlog2e = fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
+    _half = fx.Float32(0.5)
+    _half_scale = fx.Float32((1.702 * 0.5) if swiglu else 0.5)
     N = len(pairs)
-    # Stage 1: clamp + exp2
-    gs, us, exp_vals = [], [], []
+    CHUNK = 4
+    # Stage 1: clamp all pairs
+    gs, us = [], []
     for i in range_constexpr(N):
         g = fmin_f32(pairs[i][0], limit_f32)
         u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
         gs.append(g)
         us.append(u)
     rocdl.sched_barrier(0)
-    for i in range_constexpr(N):
-        exp_val = fx.Float32(rocdl.exp2(T.f32, as_ir_value(gs[i] * nlog2e)))
-        exp_vals.append(exp_val)
-    # Stage 2a: add 1+exp
-    rocdl.sched_barrier(0)
-    sum_vals = []
-    for i in range_constexpr(N):
-        sum_vals.append(_one + exp_vals[i])
-    # Stage 2b: rcp
-    rocdl.sched_barrier(0)
-    rcp_vals = []
-    for i in range_constexpr(N):
-        rcp_vals.append(fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
-    # Stage 3: final mul
-    rocdl.sched_barrier(0)
-    results = []
-    for i in range_constexpr(N):
+    # Stage 2+3 interleaved: issue CHUNK tanh, then consume previous CHUNK.
+    tanh_vals = [None] * N
+    results = [None] * N
+    n_chunks = (N + CHUNK - 1) // CHUNK
+    for c in range_constexpr(n_chunks):
+        lo = c * CHUNK
+        hi = min(lo + CHUNK, N)
+        for i in range_constexpr(lo, hi):
+            tanh_vals[i] = fx.Float32(
+                rocdl.tanh(T.f32, as_ir_value(gs[i] * _half_scale))
+            )
+        rocdl.sched_barrier(0)
+        prev_lo = (c - 1) * CHUNK if c > 0 else None
+        prev_hi = lo if c > 0 else None
+        if prev_lo is not None:
+            for i in range_constexpr(prev_lo, prev_hi):
+                sig = _half * (_one + tanh_vals[i])
+                if swiglu:
+                    results[i] = gs[i] * sig * (us[i] + _one)
+                else:
+                    results[i] = gs[i] * sig * us[i]
+    # Drain last chunk's VALU
+    drain_lo = (n_chunks - 1) * CHUNK
+    for i in range_constexpr(drain_lo, N):
+        sig = _half * (_one + tanh_vals[i])
         if swiglu:
-            results.append(gs[i] * rcp_vals[i] * (us[i] + _one))
+            results[i] = gs[i] * sig * (us[i] + _one)
         else:
-            results.append(gs[i] * rcp_vals[i] * us[i])
+            results[i] = gs[i] * sig * us[i]
     return results
 
 

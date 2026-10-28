@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Per-row top-k with a DeepSelect-shaped interface, over four backends.
+"""Per-row top-k with a DeepSelect-shaped interface, over five backends.
 
-aiter carries four per-row selectors, each fastest in a different corner and
+aiter carries five per-row selectors, each fastest in a different corner and
 none able to cover the whole domain:
 
     argmax   k=1 only, and a reduction rather than a selection: the row split
@@ -39,20 +39,19 @@ import triton
 import triton.language as tl
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
-from aiter.ops.flydsl.kernels.topk_per_row_radix_stream import (
-    build_topk_per_row_radix_stream_module,
-    topk_per_row_radix_stream_block_threads,
-    topk_per_row_radix_stream_lds_plan,
+from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
+from aiter.ops.flydsl.kernels.topk.topk_per_row_radix_stream import (
     topk_per_row_radix_stream_serves,
 )
-from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
-from aiter.ops.flydsl.topk_per_row_argmax import (
+from aiter.ops.flydsl.topk.row_lens import no_row_lens
+from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
+from aiter.ops.flydsl.topk.topk_per_row_argmax import (
     ARGMAX_DTYPES,
     topk_per_row_argmax,
     topk_per_row_argmax_serves,
 )
-from aiter.ops.flydsl.topk_per_row_small_k import (
+from aiter.ops.flydsl.topk.topk_per_row_radix_stream import topk_per_row_radix_stream
+from aiter.ops.flydsl.topk.topk_per_row_small_k import (
     topk_per_row_small_k,
     topk_per_row_small_k_serves,
 )
@@ -60,7 +59,7 @@ from aiter.ops.topk_plain import topk_plain, topk_plain_batches_ragged_rows
 
 __all__ = ["topk_select", "topk_select_backend"]
 
-_SUPPORTED_GFX = ("gfx942", "gfx950")
+_SUPPORTED_GFX = ("gfx942", "gfx950", "gfx1250")
 
 _PLAIN_MAX_K = 2048
 # Which backends can promise a column order among equal scores. `plain` appears
@@ -155,23 +154,6 @@ def _unsupported_arch() -> str | None:
     at import: aiter is imported for codegen on hosts with no GPU."""
     gfx = get_gfx()
     return None if gfx in _SUPPORTED_GFX else gfx
-
-
-@lru_cache(maxsize=8)
-def _full_rows(rows: int, width: int, device: torch.device) -> torch.Tensor:
-    """The default `end`: every row live to the full width.
-
-    Cached because it is a constant the kernels only read, and building it per
-    call is an allocation and a fill launch -- 6us against 7-10us of device time
-    for the selection.
-    """
-    return torch.full((rows,), width, dtype=torch.int32, device=device)
-
-
-@lru_cache(maxsize=8)
-def _no_range(device: torch.device) -> torch.Tensor:
-    """`plain`'s "no per-row range given" sentinel."""
-    return torch.empty(0, dtype=torch.int32, device=device)
 
 
 @triton.jit
@@ -472,7 +454,7 @@ def topk_select(
     tie: str | None = None,
     deterministic: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
-    """Per-row top-k, dispatched across aiter's four selectors.
+    """Per-row top-k, dispatched across aiter's five selectors.
 
     Parameter names, order and return shape follow ``deep_select.topk``, and
     the return shape means the 2-tuple specifically: DeepSelect returns
@@ -527,7 +509,9 @@ def topk_select(
         topk: elements to select per row.
         sorted: sort the returned values descending. Done on the host.
         end: ``[rows]`` int32 exclusive right bound per row, DeepSelect's
-            ``end``; this is each row's live length. Defaults to the full width.
+            ``end``; this is each row's live length. Defaults to the full width,
+            which every backend takes from the input's shape: no length tensor
+            is built or read, so a captured graph holds no address for one.
         sorted_index: sort the returned indices ascending. Done on the host.
         output_idx: ``[rows, topk]`` int32 to write into; allocated if omitted.
         output_idx_offset: ``[rows]`` int32 added to every live index.
@@ -573,9 +557,8 @@ def topk_select(
     if not 1 <= topk <= width:
         raise ValueError(f"topk must be in [1, {width}], got {topk}")
 
-    row_lens = _full_rows(rows, width, input.device) if end is None else end
-    if row_lens.shape != (rows,) or row_lens.dtype != torch.int32:
-        raise ValueError(f"end must be int32 [{rows}], got {tuple(row_lens.shape)}")
+    if end is not None and (end.shape != (rows,) or end.dtype != torch.int32):
+        raise ValueError(f"end must be int32 [{rows}], got {tuple(end.shape)}")
     idx = (
         torch.empty((rows, topk), dtype=torch.int32, device=input.device)
         if output_idx is None
@@ -596,9 +579,7 @@ def topk_select(
         deterministic,
         input.dtype is torch.float32,
     )
-    _dispatch(
-        backend, input, row_lens, idx, topk, rows, end is not None, tie, deterministic
-    )
+    _dispatch(backend, input, end, idx, topk, rows, tie, deterministic)
 
     values = None
     if return_value or sorted:
@@ -636,69 +617,13 @@ def topk_select(
     return values, idx
 
 
-# A row is one workgroup, so a call with few rows leaves the machine empty
-# however wide those rows are. The split cuts each row into G slices, selects
-# each in its own workgroup, and merges the G*k survivors -- trading a second
-# pass over a much smaller array for G times the parallelism.
-#
-# Sweep these over the domain the ROUTER reaches, not by forcing `stream`. Fitted
-# the other way once, and the cells it was fitted on could not run: the chain put
-# `decode` ahead of `stream` across the whole of the split's own gate, so of 565
-# routing cells 36 would have split and `stream` was picked on none -- which is
-# how the block target came to contradict itself, stopping G at 2 for 128 rows
-# where 4 measured 1.2x faster.
-#
-# Over the 108 cells the router does send here (`stream_split_grid.csv`), the
-# best G is 4 below 128 rows, 2 at 192..256 but 1.4x..1.6x SLOWER there at
-# k >= 2048, and 1 from 512 rows up where the machine is full and the merge is
-# pure cost. Hence the row bound: lifting it to 256 scores better against the
-# per-cell oracle and is 0.976x as an A/B, 26 cells slower. This rule changes
-# twelve cells and none of them regress.
-_SPLIT_TARGET_BLOCKS = 512
-_SPLIT_MAX_ROWS = 128
-_SPLIT_MIN_WIDTH = 1 << 18
-# Bounds the MERGE, not the fan-out: stage 2 selects from `G * k` values in one
-# workgroup per row, so a G large enough makes it the original problem again.
-# Never binding in the reachable domain -- `_SPLIT_TARGET_BLOCKS` holds G to
-# `512 // rows`, and the router keeps 64 rows and fewer for `decode`.
-_SPLIT_MAX_PARTS = 16
-
-
-def _stream_split_parts(rows: int, width: int, k: int, ragged: bool) -> int:
-    """How many slices to cut each row into, or 1 to select it whole.
-
-    Ragged rows are excluded, and not only for tidiness: a slice shorter than k
-    pads with -1, and the merge's labels would then repeat. Its tie select
-    assumes labels are unique -- it gives untied slots the key 0, and a repeated
-    -1 label maps onto that same 0 -- so the count would come out wrong. A row
-    at least `parts * k` wide has no short slice and no repeated label.
-    """
-    if ragged or rows > _SPLIT_MAX_ROWS or width < _SPLIT_MIN_WIDTH:
-        return 1
-    parts = 1
-    while (
-        parts * 2 <= _SPLIT_MAX_PARTS
-        and rows * parts * 2 <= _SPLIT_TARGET_BLOCKS
-        and width >= parts * 2 * k
-    ):
-        parts *= 2
-    return parts
-
-
-def _stream_scratch(input, dtype=None):
-    """A placeholder for a stream argument this mode does not use.
-
-    The kernel takes one tensor per optional output -- the per-slice values a
-    split writes, and the column labels a merge reads -- and a build that uses
-    neither still has to be handed something of the right dtype for the launcher
-    to specialise on.
-    """
-    return torch.empty(1, 1, dtype=dtype or input.dtype, device=input.device)
-
-
-def _dispatch(
-    backend, input, row_lens, idx, topk, rows, ragged, tie=None, deterministic=False
-):
+def _dispatch(backend, input, row_lens, idx, topk, rows, tie=None, deterministic=False):
+    # Every backend puts rows on a grid dimension, and HIP rejects a zero-sized
+    # launch. An empty batch has nothing to select, so `idx` stays [0, topk].
+    if rows == 0:
+        return
+    # `row_lens` None means every row is full-width; each backend takes that
+    # length from the input's shape.
     if backend == "argmax":
         topk_per_row_argmax(input, row_lens, idx)
     elif backend == "small_k":
@@ -712,11 +637,11 @@ def _dispatch(
         # caching allocator rather than kept, the way `get_topk_scratch_workspace`
         # argues for -- a kept buffer would be shared across streams.
         vals = torch.empty_like(idx, dtype=input.dtype)
-        if ragged:
+        if row_lens is not None:
             starts = torch.zeros_like(row_lens)
             topk_plain(input, idx, vals, topk, True, starts, row_lens, -1, 1)
         else:
-            empty = _no_range(input.device)
+            empty = no_row_lens(input.device)
             topk_plain(input, idx, vals, topk, True, empty, empty, -1, 1)
     elif backend == "decode":
         # `stable` buys the smallest-index tie-break AND the selected set being
@@ -745,90 +670,6 @@ def _dispatch(
             stable=tie == "low" or deterministic,
         )
     elif backend == "stream":
-        wave = wave_size_of(input.device.index)
-        parts = _stream_split_parts(rows, input.shape[1], topk, ragged)
-        if parts > 1:
-            # Stage 1 launches `rows * parts` blocks and stage 2 launches
-            # `rows`, so the two sit on opposite sides of the block-width rule
-            # and each has to ask it for itself.
-            part_idx = torch.empty(
-                rows, parts * topk, dtype=torch.int32, device=input.device
-            )
-            part_val = torch.empty(
-                rows, parts * topk, dtype=input.dtype, device=input.device
-            )
-            stream = torch.cuda.current_stream(input.device)
-            _run_compiled(
-                build_topk_per_row_radix_stream_module(
-                    topk,
-                    wave,
-                    partial=True,
-                    block_threads=topk_per_row_radix_stream_block_threads(
-                        rows * parts, topk
-                    ),
-                    # A slice, not the row: this stage runs one block per
-                    # slice over a slice's width, and the plan reads both.
-                    lds_plan=topk_per_row_radix_stream_lds_plan(
-                        rows * parts, -(-input.shape[1] // parts), topk
-                    ),
-                ),
-                input,
-                row_lens,
-                part_idx,
-                part_val,
-                _stream_scratch(input, torch.int32),
-                parts,
-                rows * parts,
-                stream,
-            )
-            # The merge orders by the ORIGINAL column, which `part_idx` carries,
-            # so its answer is the unsplit answer rather than merely a valid
-            # one -- and it writes those columns straight out, with no slot-to
-            # -column gather to undo afterwards.
-            _run_compiled(
-                build_topk_per_row_radix_stream_module(
-                    topk,
-                    wave,
-                    labelled=True,
-                    block_threads=topk_per_row_radix_stream_block_threads(rows, topk),
-                    # The merge's rows are `parts * topk` wide, not the input's.
-                    lds_plan=topk_per_row_radix_stream_lds_plan(
-                        rows, parts * topk, topk
-                    ),
-                ),
-                part_val,
-                torch.full(
-                    (rows,), parts * topk, dtype=torch.int32, device=input.device
-                ),
-                idx,
-                _stream_scratch(input),
-                part_idx,
-                1,
-                rows,
-                stream,
-            )
-            return
-        _run_compiled(
-            # The block width follows the ROW COUNT and k, not the row width --
-            # see the sweep behind `topk_per_row_radix_stream_block_threads`.
-            # Costs a mean 1.001x against choosing per cell, where holding one
-            # width costs 1.135x and a worst 2.03x.
-            build_topk_per_row_radix_stream_module(
-                topk,
-                wave,
-                block_threads=topk_per_row_radix_stream_block_threads(rows, topk),
-                # The deepest prefetch the budget allows is not the one that
-                # wins, and the budget has no term for the row count.
-                lds_plan=topk_per_row_radix_stream_lds_plan(rows, input.shape[1], topk),
-            ),
-            input,
-            row_lens,
-            idx,
-            _stream_scratch(input),
-            _stream_scratch(input, torch.int32),
-            1,
-            rows,
-            torch.cuda.current_stream(input.device),
-        )
+        topk_per_row_radix_stream(input, row_lens, idx, topk)
     else:
         raise ValueError(f"unknown backend {backend!r}")

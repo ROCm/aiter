@@ -195,7 +195,7 @@ def _exp(x):
 def _is_zero_or_nan(value):
     """Preserve the ordered-zero or unordered-NaN reduction invalidity test."""
     value = fx.Float32(value)
-    return (value == fx.Float32(0.0)) | fly_math.isnan(value)
+    return (value == 0.0) | fly_math.isnan(value)
 
 
 # Massive-path sub-tiers (mirror MlaReduceProblemSize, reduce.cu:121).
@@ -490,7 +490,7 @@ def compile_mla_reduce(
                     in_bounds = (row_i32 >= fx.Int32(0)) & (row_i32 < num_partial_rows)
                     safe_row_i32 = in_bounds.select(row_i32, fx.Int32(0))
                 else:
-                    in_bounds = fx.Int32(0) == fx.Int32(0)
+                    in_bounds = fx.Int32(0) == 0
                     safe_row_i32 = row_i32
                 return safe_row_i32, in_bounds
 
@@ -1167,7 +1167,10 @@ def plan_splitk_capture_safe(
 def _get_splitk_scratch(num_slots: int, K: int, Dv: int, device_index: int):
     """Pre-allocate (once) the split-K scratch: partial weighted-output
     accumulators + (m_j, l_j) per partial. Cached so CUDA-graph replays reuse
-    the same device buffers (capture-safe). Zero-initialized (partials fully
+    the same device buffers. The key carries no stream, so unlike the
+    stream-keyed scratch caches a first miss inside a capture needs a shape
+    combination no eager launch has used; see aiter.utility.graph_alloc if that
+    ever changes. Zero-initialized (partials fully
     overwrite their own rows every launch)."""
     import torch
 
