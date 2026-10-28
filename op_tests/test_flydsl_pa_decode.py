@@ -197,6 +197,136 @@ def test_pa_decode_graph_plan_refresh(device, kv_dtype, max_partitions):
         _check_output(output, reference)
 
 
+@pytest.mark.parametrize(
+    "head_size,dtype,with_sinks",
+    [
+        (128, torch.bfloat16, False),
+        (128, torch.bfloat16, True),
+        (64, torch.float16, False),
+        (192, torch.bfloat16, True),
+        (256, torch.float16, False),
+        (512, torch.bfloat16, False),
+    ],
+)
+def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
+    """Rungs split across partition groups match the single-group ladder bit for bit.
+
+    Register-only CTAs (24 and 32 partition bounds) and the register branch of
+    dual-mode CTAs reduce the same packed partials with one group and with
+    split groups. Slots past the live tasks hold NaN.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 splits register rungs across partition groups")
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
+    from aiter.ops.flydsl.kernels.tensor_shim import (
+        _run_compiled,
+        get_dtype_str,
+        ptr_arg,
+    )
+
+    kv_heads, rows = 2, 16
+    counts = (17, 0, 32, 1, 24, 16, 31, 20)
+    first = [sum(counts[:i]) for i in range(len(counts))]
+    capacity = sum(counts) + 8
+    torch.manual_seed(0)
+    exp_sums = torch.full((kv_heads, capacity, rows), float("nan"), device=device)
+    max_logits = torch.full_like(exp_sums, float("nan"))
+    logits = torch.full(
+        (kv_heads, capacity, rows, head_size), float("nan"), dtype=dtype, device=device
+    )
+    live = sum(counts)
+    exp_sums[:, :live] = torch.rand(kv_heads, live, rows, device=device) * 50 + 0.5
+    max_logits[:, :live] = torch.randn(kv_heads, live, rows, device=device) * 4
+    logits[:, :live] = torch.randn(kv_heads, live, rows, head_size, device=device).to(
+        dtype
+    )
+    reduce_info = torch.tensor(
+        [[f, c] for f, c in zip(first, counts)], dtype=torch.int32, device=device
+    )
+    sinks = None
+    if with_sinks:
+        sinks = torch.linspace(-3, 3, kv_heads * rows, device=device).to(dtype)
+        sinks[0] = float("-inf")
+
+    def pairs_for(partitions):
+        return head_size % 128 == 0 if partitions > 32 else head_size in (128, 256)
+
+    def run(partitions, groups):
+        pairs = pairs_for(partitions)
+        compiled = compile_pa_decode_ps_reduce(
+            architecture="gfx1250",
+            max_context_partition_num=partitions,
+            head_size=head_size,
+            output_dtype_str=get_dtype_str(dtype),
+            logits_dtype_str=get_dtype_str(dtype),
+            sink_dtype_str=get_dtype_str(dtype),
+            use_sinks=with_sinks,
+            query_group_size=rows,
+            pairs=pairs,
+            parallel_groups=groups,
+        )
+        out = torch.full(
+            (len(counts), 1, kv_heads, rows, head_size),
+            float("nan"),
+            dtype=dtype,
+            device=device,
+        )
+        pointer = fx.BFloat16 if dtype == torch.bfloat16 else fx.Float16
+        _run_compiled(
+            compiled["launch"],
+            ptr_arg(out, pointer),
+            ptr_arg(exp_sums, fx.Float32),
+            ptr_arg(max_logits, fx.Float32),
+            ptr_arg(logits, pointer),
+            (
+                flyc.from_c_void_p(pointer, 0)
+                if sinks is None
+                else ptr_arg(sinks, pointer)
+            ),
+            *out.stride()[:4],
+            *exp_sums.stride()[:2],
+            *logits.stride()[:3],
+            1,
+            len(counts),
+            kv_heads,
+            ptr_arg(reduce_info, fx.Int32),
+            -(-(1 << 30) // rows),
+            -(-(1 << 30) // (rows * kv_heads)),
+            torch.cuda.current_stream(),
+        )
+        return out
+
+    reference = torch.zeros(len(counts), kv_heads, rows, head_size, device=device)
+    for seq, (f, c) in enumerate(zip(first, counts)):
+        if c == 0:
+            continue
+        maxima = max_logits[:, f : f + c].double()
+        top = maxima.max(dim=1).values
+        if sinks is not None:
+            top = torch.maximum(top, sinks.double().view(kv_heads, rows))
+        mass = exp_sums[:, f : f + c].double() * torch.exp(maxima - top[:, None])
+        total = mass.sum(dim=1)
+        if sinks is not None:
+            total = total + torch.exp(sinks.double().view(kv_heads, rows) - top)
+        weights = mass / total[:, None]
+        reference[seq] = (
+            (weights[..., None] * logits[:, f : f + c].double()).sum(1).float()
+        )
+    for partitions, split in ((32, 4), (24, 4), (32, 2), (64, 16), (256, 16)):
+        if split * head_size // (2 if pairs_for(partitions) else 1) // 32 > 32:
+            continue
+        single, grouped = run(partitions, 1), run(partitions, split)
+        assert torch.equal(single.view(torch.int16), grouped.view(torch.int16))
+        # Plans keep every count within the partition bound.
+        bounded = [seq for seq, c in enumerate(counts) if c <= partitions]
+        torch.testing.assert_close(
+            grouped[bounded, 0].float(), reference[bounded], atol=2e-2, rtol=2e-2
+        )
+
+
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()

@@ -31,6 +31,11 @@ WAVE = 64
 REGISTER_PARTITIONS = 64
 DUAL_REGISTER_PARTITIONS = 32
 MAX_CTA_WAVES = 16
+# gfx1250 rungs of more than SPLIT_PARTITIONS partitions spread their loads
+# over up to SPLIT_GROUPS groups: a wave issuing 32 partial loads took 0.6 us
+# longer than one issuing 16, more than the split's barrier costs.
+SPLIT_PARTITIONS = 16
+SPLIT_GROUPS = 4
 
 
 def _shuffle_offsets(parts):
@@ -72,6 +77,11 @@ def compile_pa_decode_ps_reduce(
     publishes the softmax weights to LDS, each group sums a contiguous chunk
     and group 0 adds the partials.
 
+    On gfx1250, rungs of more than 16 partitions split their loads across up
+    to four groups: ``parallel_groups`` of them for register-only CTAs. Group 0
+    still adds every weighted partial in partition order, so the result
+    matches the single-group ladder bit for bit.
+
     ``pairs`` gives each lane two adjacent bf16/f16 elements (D % 128 == 0, a
     four-byte aligned base and even strides); output stores stay scalar.
     ``num_xcds`` > 0 launches a 1-D grid that gives each XCD a contiguous run
@@ -109,7 +119,7 @@ def compile_pa_decode_ps_reduce(
     groups = parallel_groups
     if groups < 1 or groups & (groups - 1):
         raise ValueError(f"parallel_groups must be a power of two, got {groups}")
-    if groups > 1 and not dual:
+    if groups > 1 and not dual and architecture != "gfx1250":
         raise ValueError(f"parallel_groups > 1 requires NP > {register_partitions}")
     if groups * group_waves > max_cta_waves:
         raise ValueError(f"{groups} groups of {group_waves} waves exceed the CTA")
@@ -123,7 +133,11 @@ def compile_pa_decode_ps_reduce(
 
     low_rungs = high_rungs = dual_rungs = lds_rungs = ()
     if not dual:
-        block = [head_size // elems, 1, 1]
+        block = (
+            [wave, group_waves * groups, 1]
+            if groups > 1
+            else [head_size // elems, 1, 1]
+        )
         # NP <= 8 is one rung; above, test c > 8 first, then the largest rung
         # in each half.
         low_rungs = (1, 2, 4, 8)
@@ -145,11 +159,19 @@ def compile_pa_decode_ps_reduce(
     reverse_pair = not dual and partitions > 32
     # Groups tile whole wave-sized weight chunks, so their slots stay in range.
     weight_chunks = -(-partitions // wave)
+    split = min(groups, SPLIT_GROUPS) if architecture == "gfx1250" else 1
+    split_rows = 1
+    for rung in high_rungs + dual_rungs:
+        per = -(-rung // split)
+        if split > 1 and rung > SPLIT_PARTITIONS:
+            split_rows = max(split_rows, (-(-rung // per) - 1) * per)
 
     @fx.struct
     class SharedStorage:
         weights: fx.Array[fx.Float32, weight_chunks * wave, 16]
         partials: fx.Array[fx.Float32, max(1, (groups - 1) * head_size), 16]
+        if split > 1:
+            products: fx.Array[fx.Float32, split_rows * head_size, 16]
 
     kernel_name = (
         f"pa_decode_reduce_kernel_o{output_dtype_str}_d{head_size}"
@@ -259,6 +281,15 @@ def compile_pa_decode_ps_reduce(
             * logits_item_bytes,
         )
 
+        if fx.const_expr(dual or groups > 1):
+            worker = fx.thread_idx.y
+            partition_group = udiv_const(worker, group_waves)
+            unit = urem_const(worker, group_waves) * c_wave + lane
+        else:
+            unit = fx.thread_idx.x
+        if fx.const_expr(architecture == "gfx1250" and (dual or groups > 1)):
+            storage = fx.SharedAllocator().allocate(SharedStorage).peek()
+
         def _zero():
             if fx.const_expr(pairs):
                 return fx.full(2, 0.0, fx.Float32)
@@ -358,6 +389,64 @@ def compile_pa_decode_ps_reduce(
                 acc = acc + _to_f32(logits[part]) * part_weight
             return acc
 
+        def _reduce_split(rung, unit):
+            # Group g loads and weights partitions [g * per, (g + 1) * per);
+            # group 0 then adds every product in partition order.
+            per = -(-rung // split)
+            products = storage.products.view(
+                fx.make_layout((split_rows, head_size), (head_size, 1))
+            )
+            part_sum, part_max = _lane_stats(0)
+            begin = partition_group * fx.Int32(per)
+            logits = [
+                _load_logits(begin + fx.Int32(j), unit) for j in fx.range_constexpr(per)
+            ]
+            (weight,) = _softmax_weights([part_sum], [part_max], _shuffle_offsets(wave))
+            weighted = [
+                _to_f32(logits[j])
+                * fx.gpu.shuffle_idx(weight, begin + fx.Int32(j), wave)
+                for j in fx.range_constexpr(per)
+            ]
+            if (partition_group > zero_i) & (
+                partition_group < fx.Int32(-(-rung // per))
+            ):
+                for j in fx.range_constexpr(per):
+                    row = begin - fx.Int32(per - j)
+                    if fx.const_expr(pairs):
+                        products[row, unit * 2] = weighted[j][0]
+                        products[row, unit * 2 + 1] = weighted[j][1]
+                    else:
+                        products[row, unit] = weighted[j]
+            fx.gpu.barrier()
+            acc = _zero()
+            if partition_group == zero_i:
+                for part in fx.range_constexpr(rung):
+                    if fx.const_expr(part < per):
+                        acc = acc + weighted[part]
+                    elif fx.const_expr(pairs):
+                        acc = acc + fx.Vector.from_elements(
+                            [
+                                products[part - per, unit * 2],
+                                products[part - per, unit * 2 + 1],
+                            ],
+                            dtype=fx.Float32,
+                        )
+                    else:
+                        acc = acc + fx.Float32(products[part - per, unit])
+            return acc
+
+        def _reduce_rung(rung, unit):
+            # Every group enters each rung: split rungs hold a CTA barrier.
+            acc = _zero()
+            if fx.const_expr(split > 1 and rung > SPLIT_PARTITIONS):
+                acc = _reduce_split(rung, unit)
+            elif fx.const_expr(dual or groups > 1):
+                if partition_group == zero_i:
+                    acc = _reduce_register(rung, unit)
+            else:
+                acc = _reduce_register(rung, unit)
+            return acc
+
         def _top_first(rungs, reduce, unit, scale=1):
             # CTA-uniform count: the largest rung is the first test and the
             # smallest the fall-through. Branches carry the same acc type.
@@ -385,28 +474,23 @@ def compile_pa_decode_ps_reduce(
         if fx.const_expr(not dual):
             # Select one unrolled rung, so loads past it are skipped rather
             # than masked.
-            unit = fx.thread_idx.x
             acc = _zero()
             if fx.const_expr(partitions <= 8):
-                acc = _reduce_register(partitions, unit)
+                acc = _reduce_rung(partitions, unit)
             else:
                 if part_count > 8:
-                    acc = _top_first(high_rungs, _reduce_register, unit)
+                    acc = _top_first(high_rungs, _reduce_rung, unit)
                 else:
-                    acc = _top_first(low_rungs, _reduce_register, unit)
-            _store(acc, unit)
+                    acc = _top_first(low_rungs, _reduce_rung, unit)
+            if fx.const_expr(groups > 1):
+                if partition_group == zero_i:
+                    _store(acc, unit)
+            else:
+                _store(acc, unit)
         else:
-            worker = fx.thread_idx.y
-            partition_group = udiv_const(worker, group_waves)
-            unit = urem_const(worker, group_waves) * c_wave + lane
 
-            def _reduce_lds():
+            def _publish_weights(weights):
                 # Every thread reaches each barrier; the count is CTA-uniform.
-                storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-                weights = storage.weights
-                partials = storage.partials.view(
-                    fx.make_layout((max(1, groups - 1), head_size), (head_size, 1))
-                )
                 if worker == zero_i:
                     sums, maxes = [], []
                     for chunk in fx.range_constexpr(weight_chunks):
@@ -420,21 +504,24 @@ def compile_pa_decode_ps_reduce(
                         weights[lane + fx.Int32(chunk * wave)] = chunk_weights[chunk]
                 fx.gpu.barrier()
 
-                def _group_sum(rung, unit):
-                    # Inactive slots have zero weight and load zero past the
-                    # sequence bound, so they add exactly +0.
-                    group_acc = _zero()
-                    begin = partition_group * fx.Int32(rung)
-                    if begin < part_count:
-                        for local in fx.range_constexpr(rung):
-                            part = begin + fx.Int32(local)
-                            weight = fx.Float32(weights[part])
-                            group_acc = (
-                                group_acc + _to_f32(_load_logits(part, unit)) * weight
-                            )
-                    return group_acc
+            def _group_sum(rung, unit, weights, values=None):
+                # Inactive slots have zero weight and load zero past the
+                # sequence bound, so they add exactly +0.
+                group_acc = _zero()
+                begin = partition_group * fx.Int32(rung)
+                if begin < part_count:
+                    for local in fx.range_constexpr(rung):
+                        part = begin + fx.Int32(local)
+                        weight = fx.Float32(weights[part])
+                        value = (
+                            _load_logits(part, unit)
+                            if values is None
+                            else values[local]
+                        )
+                        group_acc = group_acc + _to_f32(value) * weight
+                return group_acc
 
-                acc = _top_first(lds_rungs, _group_sum, unit, groups)
+            def _combine(acc, partials):
                 if fx.const_expr(groups > 1):
                     # Idle groups publish +0, so the combine needs no range checks.
                     if partition_group > zero_i:
@@ -458,13 +545,50 @@ def compile_pa_decode_ps_reduce(
                                 acc = acc + fx.Float32(partials[other - 1, unit])
                 return acc
 
+            def _partials(storage):
+                return storage.partials.view(
+                    fx.make_layout((max(1, groups - 1), head_size), (head_size, 1))
+                )
+
+            def _reduce_lds():
+                storage = fx.SharedAllocator().allocate(SharedStorage).peek()
+                weights = storage.weights
+                partials = _partials(storage)
+                _publish_weights(weights)
+
+                def _sum(rung, unit):
+                    return _group_sum(rung, unit, weights)
+
+                return _combine(_top_first(lds_rungs, _sum, unit, groups), partials)
+
+            def _reduce_lds_rung(rung, unit):
+                # Group loads overlap the statistics loads that the weight
+                # barrier waits for.
+                begin = partition_group * fx.Int32(rung)
+                values = [
+                    _load_logits(begin + fx.Int32(local), unit)
+                    for local in fx.range_constexpr(rung)
+                ]
+                weights = storage.weights
+                partials = _partials(storage)
+                _publish_weights(weights)
+                return _combine(_group_sum(rung, unit, weights, values), partials)
+
             if part_count <= fx.Int32(DUAL_REGISTER_PARTITIONS):
-                # Few live partitions skip LDS and both barriers.
-                if partition_group == zero_i:
-                    register_acc = _bottom_first(dual_rungs, _reduce_register, unit)
-                    _store(register_acc, unit)
+                # Few live partitions skip the weight exchange.
+                if fx.const_expr(split > 1):
+                    register_acc = _bottom_first(dual_rungs, _reduce_rung, unit)
+                    if partition_group == zero_i:
+                        _store(register_acc, unit)
+                else:
+                    if partition_group == zero_i:
+                        ladder_acc = _bottom_first(dual_rungs, _reduce_register, unit)
+                        _store(ladder_acc, unit)
             else:
-                lds_acc = _reduce_lds()
+                if fx.const_expr(architecture == "gfx1250"):
+                    lds_acc = _top_first(lds_rungs, _reduce_lds_rung, unit, groups)
+                else:
+                    lds_acc = _reduce_lds()
                 if partition_group == zero_i:
                     _store(lds_acc, unit)
 
