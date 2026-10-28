@@ -165,11 +165,11 @@ _LAZY_IMPORTS = {
         "work_map_size",
     ),
     "minimax_m3_index_score_fp4_flydsl": (
-        ".kernels.minimax_m3_index_score_fp4",
+        ".kernels.minimax_m3_index_score",
         "score_flydsl_fp4",
     ),
     "minimax_m3_index_score_fp4_flydsl_supported": (
-        ".kernels.minimax_m3_index_score_fp4",
+        ".kernels.minimax_m3_index_score",
         "index_score_supported_fp4",
     ),
     "minimax_m3_index_score_prefill_flydsl": (

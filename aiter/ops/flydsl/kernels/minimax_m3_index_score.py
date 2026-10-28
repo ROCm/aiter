@@ -29,6 +29,18 @@ K is widened fp8 -> bf16 and the MFMA is bf16, because the operator this
 replaces lifts K to Q's precision rather than rounding Q down. That is a
 numerics contract: the selector consumes these scores as a top-k ranking, and
 a tie reordered near the cut changes which blocks are chosen.
+
+The same builder also scores an MXFP4 index cache (`score_flydsl_fp4`): e2m1
+elements, two to a byte (the LOW nibble is the even element), one e8m0 scale per
+32 elements, passed as two views `k_data uint8 [pages, 128, 64]` and `k_scale
+uint8 [pages, 128, 4]`, each with its own page stride. A lane's 16 B data load
+(elements 32g..32g+31) is exactly its four k-steps and one e8m0 group. With a
+bf16 Q, each data dword is widened by `v_cvt_scalef32_pk_bf16_fp4` and fed to
+the same bf16 MFMA, so K is still lifted to Q's precision. With an e4m3 Q, one
+`v_mfma_scale_f32_16x16x128_f8f6f4` per tile takes fp4 K with its e8m0 byte and
+Q as stored; the products are exact in fp32. e8m0 bytes 0 and 255 are
+unsupported (the hardware reads the scale as a float whose exponent field is the
+byte, so 0 scales by 0.0 and 255 is NaN); a conforming writer never emits them.
 """
 
 import math
@@ -37,7 +49,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import triton
 import triton.language as tl
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter import dtypes
@@ -77,6 +90,23 @@ Q_LOADS = 4  # Q accesses per feature tile
 BLOCK_K = 64  # k an access block spans across the four lane groups
 LANE_BLOCK = 16  # k one lane group takes inside that block
 ACCESS_BYTES = 16
+
+# MXFP4 index cache: a token is HEAD_DIM/2 packed e2m1 bytes plus HEAD_DIM/32
+# e8m0 bytes. One lane's 16 B load is KSTEPS * LANE_K == GROUP elements, which is
+# what lets its whole K fragment share one scale.
+GROUP = 32  # elements one e8m0 scale covers
+DATA_BYTES = HEAD_DIM // 2
+SCALE_BYTES = HEAD_DIM // GROUP
+DATA_UNITS = DATA_BYTES // ACCESS_BYTES  # 16 B accesses per token row
+assert KSTEPS * LANE_K == GROUP
+# K tiles kept in flight per wave (the fp8 scorer uses 3 at 2 KiB a tile; an
+# MXFP4 tile is half the bytes). Swept 2/3/4/6/8: 6 is 15-35% faster than 3 where
+# batch*context is small and within 2% of the best once it is not.
+MXFP4_TILE_DEPTH = 6
+# Cache policy of the MXFP4 K data stream (2 = nt): every 128 B line is read
+# once, so the L1 has nothing to keep. Not `geom["nt_k"]`, which is tuned for the
+# fp8 layout.
+MXFP4_K_CACHE = 2
 
 
 def fp8_dwords_to_bf16(raw, lo, dwords):
@@ -177,6 +207,34 @@ def bf16_dwords_to_fp8(raw, dwords):
             )
         words.append(fx.Int32(w))
     return words
+
+
+def e8m0_to_f32(packed, byte_pos):
+    """Byte `byte_pos` of the i32 `packed` as the f32 2^(byte-127).
+
+    The scale operand of `v_cvt_scalef32_*` is a float, and a float whose
+    exponent field is the e8m0 byte and whose mantissa is zero is exactly that
+    power of two. 0 and 255 are the two bytes this does not mean what e8m0 means
+    for; see the module docstring.
+    """
+    b = packed.shrui(byte_pos * fx.Int32(8)) & fx.Int32(0xFF)
+    return (b << fx.Int32(23)).bitcast(fx.Float32)
+
+
+def fp4_dword_to_bf16(word, scale_f32):
+    """One dword of 8 packed e2m1, times `scale_f32`, as 8 bf16 in element order.
+
+    The scale-and-widen is one instruction per output pair; `sel` picks which
+    byte of the dword is unpacked, low nibble first. The one place the nibble
+    order is decided.
+    """
+    w = _to_raw(fx.Int32(word))
+    s = _to_raw(scale_f32)
+    elems = []
+    for sel in range_constexpr(4):
+        pair = fx.Vector(fx.rocdl.cvt_scalef32_pk_bf16_fp4(T.vec(2, T.bf16), w, s, sel))
+        elems += [fx.BFloat16(pair[0]), fx.BFloat16(pair[1])]
+    return elems
 
 
 # rocdl.sched_group_barrier instruction-class masks (rocdl._SCHED_MASK_INT_TO_KW).
@@ -386,10 +444,14 @@ def geometry(batch, max_block, S, H, cp_world=1, cp_rank=0, device=None):
     }
 
 
-def kernel_name(S: int, H: int, geom) -> str:
+def kernel_name(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = False) -> str:
     """Geometry -> kernel name. The default launch keeps the name it had before
     any of these knobs existed, so its JIT cache entries are not orphaned."""
-    name = f"m3_index_score_S{S}_H{H}_fp8_L{geom['pages_per_wave']}"
+    if mxfp4:
+        name = f"m3_index_score_S{S}_H{H}_fp4{'_qf8' if q_fp8 else ''}"
+        name += f"_L{geom['pages_per_wave']}_d{MXFP4_TILE_DEPTH}"
+    else:
+        name = f"m3_index_score_S{S}_H{H}_fp8_L{geom['pages_per_wave']}"
     if geom["waves_per_tok"] > 1:
         name += f"_tw{geom['waves_per_tok']}"
     if geom["nt_k"] != 2:  # 2 is the default policy; only mark the others
@@ -404,11 +466,13 @@ def kernel_name(S: int, H: int, geom) -> str:
     return name
 
 
-def build_index_score(S: int, H: int, geom):
-    """Compile a score kernel specialised on (S, H, geometry, Q dtype).
+def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = False):
+    """Compile a score kernel specialised on (S, H, geometry, cache format, Q dtype).
 
     S = max query tokens per request (num_spec + 1), H = index heads, and
     F = S*H is the feature count, laid out as column n = tok*H + head.
+    `mxfp4` reads the two-view MXFP4 cache instead of the fp8 one; `q_fp8`
+    (MXFP4 only) takes an e4m3 Q and one scaled MFMA per tile.
     """
     pages_per_wave = geom["pages_per_wave"]
     nt_k = geom["nt_k"]
@@ -426,6 +490,8 @@ def build_index_score(S: int, H: int, geom):
     PAGE_SLOTS = WAVES // WAVES_PER_TOK
     TOK_TILES_PER_WAVE = TOK_TILES // WAVES_PER_TOK  # token tiles one wave walks
     CHUNK = PAGE_SLOTS * pages_per_wave
+    tile_depth = MXFP4_TILE_DEPTH if mxfp4 else 3
+    k_loads = 1 if mxfp4 else K_LOADS
     # The kernel's only LDS: the cross-wave partial-max exchange, one fp32 per
     # (wave, tile, lane). Zero unless the token axis is split.
     RED_SLOTS = WAVES * FEAT_TILES_PER_WAVE * WAVE if WAVES_PER_TOK > 1 else 0
@@ -443,31 +509,31 @@ def build_index_score(S: int, H: int, geom):
         else None
     )
 
-    @flyc.kernel(
-        name=kernel_name(S, H, geom),
-        known_block_size=[THREADS, 1, 1],
-    )
-    def score_kernel(
-        arg_q: fx.Pointer,
-        arg_k: fx.Pointer,
-        arg_score: fx.Pointer,
-        arg_bt: fx.Pointer,
-        arg_work: fx.Pointer,
-        i32_batch: fx.Int32,
-        i32_stride_q_n: fx.Int32,
-        i32_stride_q_h: fx.Int32,
-        i32_stride_k_blk: fx.Int32,
-        i32_stride_k_pos: fx.Int32,
-        i32_stride_s_h: fx.Int32,
-        i32_stride_s_b: fx.Int32,
-        i32_stride_s_k: fx.Int32,
-        i32_stride_bt_b: fx.Int32,
-        f32_scale: fx.Float32,
+    def score_body(
+        arg_q,
+        arg_k,
+        arg_ks,
+        arg_score,
+        arg_bt,
+        arg_work,
+        i32_batch,
+        i32_stride_q_n,
+        i32_stride_q_h,
+        i32_stride_k_blk,
+        i32_stride_k_aux,
+        i32_stride_s_h,
+        i32_stride_s_b,
+        i32_stride_s_k,
+        i32_stride_bt_b,
+        f32_scale,
     ):
         """One CTA scores CHUNK pages of request b.
 
-        arg_q      [batch*S, H, 128] bf16 or fp8 query
-        arg_k      [pages, 128, 128] fp8 index key cache
+        arg_q      [batch*S, H, 128] bf16 query (e4m3 with `q_fp8`)
+        arg_k      fp8: [pages, 128, 128] index key cache;
+                   mxfp4: [pages, 128, 64] packed e2m1 data
+        arg_ks     mxfp4: [pages, 128, 4] e8m0 scales; unused for fp8
+        i32_stride_k_aux  fp8: token stride of arg_k; mxfp4: page stride of arg_ks
         arg_score  [H, batch*S, max_block] fp32, one per (feature, page)
         arg_bt     [batch, >= max_block] int32 block table
         arg_work   [rows, 2] int32 work map; see make_work_map
@@ -550,21 +616,48 @@ def build_index_score(S: int, H: int, geom):
         # Q is addressed by access index, not k-step.
         q_load_offset, as_bf16_frag, convert_k = fragment_helpers(g)
 
-        def load_q_frag(i, j):
-            """One lane's 16 B of Q for (feature tile i, Q access j), from gmem."""
+        def q_row_head(i):
+            """Q row and head of feature tile i's column. Columns past F are
+            padding; clamp them to row 0 so the load stays in bounds, then drop
+            the result at store time."""
             tok, head = tok_head_of(i)
             row = b * fx.Int32(S) + tok
-            # Columns past F are padding; clamp them to row 0 so the load stays
-            # in bounds, then drop the result at store time.
             f = feature_of(i)
             in_range = f < fx.Int32(F)
-            row = in_range.select(row, fx.Int32(0))
-            head = in_range.select(head, fx.Int32(0))
-            off = row * i32_stride_q_n + head * i32_stride_q_h + q_load_offset(j)
+            return in_range.select(row, fx.Int32(0)), in_range.select(head, fx.Int32(0))
+
+        def load_q_frag(i, j):
+            """One lane's 16 B of Q for (feature tile i, Q access j), from gmem."""
+            row, head = q_row_head(i)
+            off = row * i32_stride_q_n + head * i32_stride_q_h
+            if const_expr(mxfp4):
+                # One 16 B MXFP4 K access is 32 contiguous elements, so Q follows
+                # the same map: lane group g takes 32g.. in four 16 B accesses.
+                off = off + g * fx.Int32(GROUP) + fx.Int32(j * LANE_K)
+            else:
+                off = off + q_load_offset(j)
             # Q is bf16, which is also the compute dtype, so there is no
             # conversion on this path at all.
             return fx.add_offset(fx.get_iter(q_buf), off >> fx.Int32(1)).load(
                 T.vec(4, T.i32)
+            )
+
+        def load_q8(i):
+            """One lane's e4m3 B operand of the scaled MFMA for feature tile i: 32
+            bytes, Q[16g .. 16g+15] then Q[64+16g .. 64+16g+15] of its column.
+            That is how the hardware lays an fp8 operand out against an fp4 A (the
+            tests pin it), NOT the contiguous 32g.. run the fp4 K fragment holds."""
+            row, head = q_row_head(i)
+            base = row * i32_stride_q_n + head * i32_stride_q_h + g * fx.Int32(16)
+            halves = [
+                fx.add_offset(
+                    fx.get_iter(q_buf), (base + fx.Int32(64 * h)) >> fx.Int32(2)
+                ).load(T.vec(4, T.i32))
+                for h in range_constexpr(2)
+            ]
+            return fx.Vector.from_elements(
+                [halves[h][k] for h in range_constexpr(2) for k in range_constexpr(4)],
+                dtype=fx.Int32,
             )
 
         # Only the token-wave partial-max exchange needs LDS; otherwise the
@@ -577,16 +670,24 @@ def build_index_score(S: int, H: int, geom):
         # -- stage Q in registers, held for the whole page loop ---------------
         # One 16 B gmem access per (tile, Q access), hoisted so the extra
         # k-steps gfx942 needs cost register slicing, not loads.
-        q_raw = [
-            [load_q_frag(i, j) for j in range_constexpr(Q_LOADS)]
-            for i in range_constexpr(FEAT_TILES_PER_WAVE)
-        ]
+        if const_expr(q_fp8):
+            q_b = [load_q8(i) for i in range_constexpr(FEAT_TILES_PER_WAVE)]
+        else:
+            q_raw = [
+                [load_q_frag(i, j) for j in range_constexpr(Q_LOADS)]
+                for i in range_constexpr(FEAT_TILES_PER_WAVE)
+            ]
 
-        q_frag = [
-            [as_bf16_frag(q_raw[i][ks // 1], ks % 1) for ks in range_constexpr(KSTEPS)]
-            for i in range_constexpr(FEAT_TILES_PER_WAVE)
-        ]
-        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.BFloat16))
+            q_frag = [
+                [
+                    as_bf16_frag(q_raw[i][ks // 1], ks % 1)
+                    for ks in range_constexpr(KSTEPS)
+                ]
+                for i in range_constexpr(FEAT_TILES_PER_WAVE)
+            ]
+            mma_atom = fx.make_mma_atom(
+                fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.BFloat16)
+            )
         zero4 = fx.full(4, 0.0, fx.Float32)
         neg_inf = fx.Float32(NEG_INF)
         # -- page ids and their buffer descriptors, one batch up front --------
@@ -613,7 +714,11 @@ def build_index_score(S: int, H: int, geom):
         # Widen BEFORE multiplication: a pool can exceed the descriptor's
         # 4 GiB range, and only within-page offsets belong in the index.
         page_bytes = fx.Int64(i32_stride_k_blk)
+        if const_expr(mxfp4):
+            ks_page_bytes = fx.Int64(i32_stride_k_aux)
         k_base = fx.Int64(fx.ptrtoint(arg_k))
+        if const_expr(mxfp4):
+            ks_base = fx.Int64(fx.ptrtoint(arg_ks))
         page_buffers = []
         for pp in pages:
             p_clamped = (pp < last).select(pp, last)
@@ -626,14 +731,32 @@ def build_index_score(S: int, H: int, geom):
                 fx.get_iter(bt_buf), b * i32_stride_bt_b + column
             ).load(T.i32)
             address = k_base + fx.Int64(page) * page_bytes
-            page_buffers.append(
-                ptr_buf_tensor(
+            if const_expr(mxfp4):
+                # Each descriptor spans exactly the bytes its view owns in a
+                # page, so a bad block id reads inside the pool rather than the
+                # neighbour view -- the page STRIDE may be larger (single-region
+                # pages).
+                page_data = ptr_buf_tensor(
                     fx.inttoptr(arg_k.type, address),
                     fx.Int32,
                     unit_elems=4,
-                    num_records_bytes=fx.Int32(page_bytes),
+                    num_records_bytes=fx.Int32(PAGE * DATA_BYTES),
                 )
-            )
+                page_scale = ptr_buf_tensor(
+                    fx.inttoptr(arg_ks.type, ks_base + fx.Int64(page) * ks_page_bytes),
+                    fx.Int32,
+                    num_records_bytes=fx.Int32(PAGE * SCALE_BYTES),
+                )
+                page_buffers.append((page_data, page_scale))
+            else:
+                page_buffers.append(
+                    ptr_buf_tensor(
+                        fx.inttoptr(arg_k.type, address),
+                        fx.Int32,
+                        unit_elems=4,
+                        num_records_bytes=fx.Int32(page_bytes),
+                    )
+                )
         # K is streamed -- every byte read once per launch -- so `nt_k` keeps it
         # from allocating in L1 for no reuse. Q, the block table and the work
         # map keep the default policy.
@@ -658,8 +781,15 @@ def build_index_score(S: int, H: int, geom):
             # Access block i starts at k = i*block_k and lane group g takes
             # lane_block of it, so the four g-lanes tile one 64 B line.
             tok_row = fx.Int32(MFMA_M * tok_tile) + tw_tok + u
+            if const_expr(mxfp4):
+                # This lane's 16 B of data and the token's 4 scale bytes (a
+                # dword, shared by the four lane groups of the token).
+                page_data, page_scale = page
+                data = load_k16(page_data, tok_row * fx.Int32(DATA_UNITS) + g)
+                scale = fx.add_offset(fx.get_iter(page_scale), tok_row).load(T.i32)
+                return data, scale
             base = (
-                tok_row * i32_stride_k_pos
+                tok_row * i32_stride_k_aux
                 + fx.Int32(i * BLOCK_K)
                 + g * fx.Int32(LANE_BLOCK)
             )
@@ -673,15 +803,60 @@ def build_index_score(S: int, H: int, geom):
             the per-feature running max. `p` is the logical block index and
             `tok_tile` the wave's local index within that page. The whole
             arithmetic body of the kernel; the rest is addressing."""
-            accs = []
-            for i in range_constexpr(FEAT_TILES_PER_WAVE):
-                acc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
-                acc.store(zero4)
-                accs.append(acc)
-            for ks in range_constexpr(KSTEPS):
-                kf = convert_k(raws, ks)
+            if const_expr(q_fp8):
+                data, scale_word = raws[0]
+                # A = K as fp4 (4 dwords; the other 4 are unused by cbsz=4), scaled
+                # by this lane group's e8m0 byte (scaleA, byte 0 of the shifted
+                # word); B = Q as e4m3 with unit scale (0x7F = 2^0 in all four
+                # bytes).
+                a_k = fx.Vector.from_elements(
+                    [data[k] for k in range_constexpr(4)]
+                    + [fx.Int32(0) for _ in range_constexpr(4)],
+                    dtype=fx.Int32,
+                )
+                scale_a = fx.Int32(scale_word).shrui(g * fx.Int32(8))
+                accs = [
+                    fx.Vector(
+                        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            T.f32x4,
+                            [
+                                a_k,
+                                q_b[i],
+                                zero4,
+                                4,
+                                0,
+                                0,
+                                scale_a,
+                                0,
+                                fx.Int32(0x7F7F7F7F),
+                            ],
+                        )
+                    )
+                    for i in range_constexpr(FEAT_TILES_PER_WAVE)
+                ]
+            else:
+                if const_expr(mxfp4):
+                    data, scale_word = raws[0]
+                    scale_f32 = e8m0_to_f32(fx.Int32(scale_word), g)
+                accs = []
                 for i in range_constexpr(FEAT_TILES_PER_WAVE):
-                    fx.gemm(mma_atom, accs[i], kf, q_frag[i][ks], accs[i])
+                    acc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+                    acc.store(zero4)
+                    accs.append(acc)
+                for ks in range_constexpr(KSTEPS):
+                    if const_expr(mxfp4):
+                        # The bf16 A-fragment of k-step `ks`: dword ks of the lane's
+                        # 16 B.
+                        kf = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.BFloat16)
+                        kf.store(
+                            fx.Vector.from_elements(
+                                fp4_dword_to_bf16(data[ks], scale_f32), fx.BFloat16
+                            )
+                        )
+                    else:
+                        kf = convert_k(raws, ks)
+                    for i in range_constexpr(FEAT_TILES_PER_WAVE):
+                        fx.gemm(mma_atom, accs[i], kf, q_frag[i][ks], accs[i])
             # This lane holds tokens 16*tok_tile + 4*g + r of the wave's slice.
             # The page's base token is a *global* position: the cutoff counts
             # the whole context, not this rank's share. The scale is applied in
@@ -695,7 +870,11 @@ def build_index_score(S: int, H: int, geom):
             for i in range_constexpr(FEAT_TILES_PER_WAVE):
                 tok, _ = tok_head_of(i)
                 causal_len = seq_len - fx.Int32(S) + tok + fx.Int32(1)
-                v = fx.Vector(fx.memref_load_vec(accs[i]))
+                v = (
+                    accs[i]
+                    if const_expr(q_fp8)
+                    else fx.Vector(fx.memref_load_vec(accs[i]))
+                )
                 for r in range_constexpr(4):
                     ok = (tok_base + fx.Int32(r)) < causal_len
                     run_max[i] = run_max[i].maximumf(
@@ -715,15 +894,15 @@ def build_index_score(S: int, H: int, geom):
                 nxt_page = page_buffers[j + 1] if j + 1 < pages_per_wave else None
                 # ---------- MAIN LOOP: K pipeline + MFMA over one page --------
                 run_max = [neg_inf for _ in range_constexpr(FEAT_TILES_PER_WAVE)]
-                # Three tok_tiles in flight, capped by the wave's token slice
+                # `tile_depth` tok_tiles in flight, capped by the wave's token slice
                 # and carried across pages, consumed before the queue refills.
                 # The scheduling boundaries below are what keep that window
                 # from collapsing back to one tok_tile.
-                depth = min(3, TOK_TILES_PER_WAVE)
+                depth = min(tile_depth, TOK_TILES_PER_WAVE)
                 queue = list(carry) if carry is not None else []
                 for tok_tile in range_constexpr(len(queue), depth):
                     queue.append(
-                        [issue_k(page, tok_tile, i) for i in range_constexpr(K_LOADS)]
+                        [issue_k(page, tok_tile, i) for i in range_constexpr(k_loads)]
                     )
                 carry = []
                 for tok_tile in range_constexpr(TOK_TILES_PER_WAVE):
@@ -734,13 +913,13 @@ def build_index_score(S: int, H: int, geom):
                     fx.rocdl.sched_barrier(0)
                     if const_expr(future < TOK_TILES_PER_WAVE):
                         queue.append(
-                            [issue_k(page, future, i) for i in range_constexpr(K_LOADS)]
+                            [issue_k(page, future, i) for i in range_constexpr(k_loads)]
                         )
                     elif nxt_page is not None:
                         carry.append(
                             [
                                 issue_k(nxt_page, future - TOK_TILES_PER_WAVE, i)
-                                for i in range_constexpr(K_LOADS)
+                                for i in range_constexpr(k_loads)
                             ]
                         )
                 # ---------- EPILOGUE: fold, scale, store one value/feature ----
@@ -816,6 +995,138 @@ def build_index_score(S: int, H: int, geom):
                     if is_writer:
                         fx.add_offset(fx.get_iter(s_buf), addr).store(m)
 
+    # The body is shared; only the kernel signature differs (MXFP4 passes two
+    # cache views). It is rewritten here because FlyDSL rewrites only the source
+    # of the decorated kernel, and the body holds runtime `if`s.
+    score_body = ASTRewriter.transform(score_body)
+    if mxfp4:
+
+        @flyc.kernel(
+            name=kernel_name(S, H, geom, mxfp4, q_fp8), known_block_size=[THREADS, 1, 1]
+        )
+        def score_kernel(
+            arg_q: fx.Pointer,
+            arg_kd: fx.Pointer,
+            arg_ks: fx.Pointer,
+            arg_score: fx.Pointer,
+            arg_bt: fx.Pointer,
+            arg_work: fx.Pointer,
+            i32_batch: fx.Int32,
+            i32_stride_q_n: fx.Int32,
+            i32_stride_q_h: fx.Int32,
+            i32_stride_kd_blk: fx.Int32,
+            i32_stride_ks_blk: fx.Int32,
+            i32_stride_s_h: fx.Int32,
+            i32_stride_s_b: fx.Int32,
+            i32_stride_s_k: fx.Int32,
+            i32_stride_bt_b: fx.Int32,
+            f32_scale: fx.Float32,
+        ):
+            score_body(
+                arg_q,
+                arg_kd,
+                arg_ks,
+                arg_score,
+                arg_bt,
+                arg_work,
+                i32_batch,
+                i32_stride_q_n,
+                i32_stride_q_h,
+                i32_stride_kd_blk,
+                i32_stride_ks_blk,
+                i32_stride_s_h,
+                i32_stride_s_b,
+                i32_stride_s_k,
+                i32_stride_bt_b,
+                f32_scale,
+            )
+
+        @flyc.jit
+        def launch(
+            arg_q: fx.Pointer,
+            arg_kd: fx.Pointer,
+            arg_ks: fx.Pointer,
+            arg_score: fx.Pointer,
+            arg_bt: fx.Pointer,
+            arg_work: fx.Pointer,
+            i32_stride_q_n: fx.Int32,
+            i32_stride_q_h: fx.Int32,
+            i32_stride_kd_blk: fx.Int32,
+            i32_stride_ks_blk: fx.Int32,
+            i32_stride_s_h: fx.Int32,
+            i32_stride_s_b: fx.Int32,
+            i32_stride_s_k: fx.Int32,
+            i32_stride_bt_b: fx.Int32,
+            f32_scale: fx.Float32,
+            i32_batch: fx.Int32,
+            i32_chunks: fx.Int32,
+            stream: fx.Stream,
+        ):
+            score_kernel(
+                arg_q,
+                arg_kd,
+                arg_ks,
+                arg_score,
+                arg_bt,
+                arg_work,
+                i32_batch,
+                i32_stride_q_n,
+                i32_stride_q_h,
+                i32_stride_kd_blk,
+                i32_stride_ks_blk,
+                i32_stride_s_h,
+                i32_stride_s_b,
+                i32_stride_s_k,
+                i32_stride_bt_b,
+                f32_scale,
+            ).launch(
+                grid=(fx.Int64(i32_batch), fx.Int64(i32_chunks), 1),
+                block=(THREADS, 1, 1),
+                stream=stream,
+            )
+
+        return launch, CHUNK
+
+    @flyc.kernel(
+        name=kernel_name(S, H, geom),
+        known_block_size=[THREADS, 1, 1],
+    )
+    def score_kernel(
+        arg_q: fx.Pointer,
+        arg_k: fx.Pointer,
+        arg_score: fx.Pointer,
+        arg_bt: fx.Pointer,
+        arg_work: fx.Pointer,
+        i32_batch: fx.Int32,
+        i32_stride_q_n: fx.Int32,
+        i32_stride_q_h: fx.Int32,
+        i32_stride_k_blk: fx.Int32,
+        i32_stride_k_pos: fx.Int32,
+        i32_stride_s_h: fx.Int32,
+        i32_stride_s_b: fx.Int32,
+        i32_stride_s_k: fx.Int32,
+        i32_stride_bt_b: fx.Int32,
+        f32_scale: fx.Float32,
+    ):
+        score_body(
+            arg_q,
+            arg_k,
+            None,
+            arg_score,
+            arg_bt,
+            arg_work,
+            i32_batch,
+            i32_stride_q_n,
+            i32_stride_q_h,
+            i32_stride_k_blk,
+            i32_stride_k_pos,
+            i32_stride_s_h,
+            i32_stride_s_b,
+            i32_stride_s_k,
+            i32_stride_bt_b,
+            f32_scale,
+        )
+
     @flyc.jit
     def launch(
         arg_q: fx.Pointer,
@@ -864,10 +1175,10 @@ def build_index_score(S: int, H: int, geom):
 _CACHE = {}
 
 
-def _get(S, H, geom, device):
-    key = (S, H, tuple(sorted(geom.items())), device)
+def _get(S, H, geom, device, mxfp4=False, q_fp8=False):
+    key = (S, H, tuple(sorted(geom.items())), device, mxfp4, q_fp8)
     if key not in _CACHE:
-        _CACHE[key] = build_index_score(S, H, geom)
+        _CACHE[key] = build_index_score(S, H, geom, mxfp4, q_fp8)
     return _CACHE[key]
 
 
@@ -1252,6 +1563,40 @@ def _validate_bounds(batch, max_block, geom) -> int:
     return batch * chunks
 
 
+def _validate_cache_mxfp4(k_data, k_scale, device):
+    """Shapes, dtypes and strides of the two MXFP4 views. Contents (block ids
+    inside the pool, e8m0 not 0/255) are a caller contract."""
+    import torch
+
+    _validate_tensor(k_data, "k_data", (torch.uint8,), 3, device, 16, False)
+    _validate_tensor(k_scale, "k_scale", (torch.uint8,), 3, device, 4, False)
+    if k_data.shape[1:] != (PAGE, DATA_BYTES) or k_data.shape[0] > 0x7FFFFFFF:
+        raise ValueError("k_data: expected [pages, 128, 64] uint8 with int32 page IDs")
+    if k_scale.shape != (k_data.shape[0], PAGE, SCALE_BYTES):
+        raise ValueError(
+            "k_scale: expected [pages, 128, 4] uint8, same pages as k_data"
+        )
+    if k_data.stride(1) != DATA_BYTES or k_data.stride(2) != 1:
+        raise ValueError(
+            f"k_data: tokens must be packed (stride(1) {DATA_BYTES}, stride(2) 1), "
+            f"got {k_data.stride()}"
+        )
+    if k_scale.stride(1) != SCALE_BYTES or k_scale.stride(2) != 1:
+        raise ValueError(
+            f"k_scale: tokens must be packed (stride(1) {SCALE_BYTES}, stride(2) 1), "
+            f"got {k_scale.stride()}"
+        )
+    # A page stride below the view's own extent makes successive pages overlap.
+    if k_data.stride(0) < PAGE * DATA_BYTES or k_data.stride(0) % 16:
+        raise ValueError(
+            f"k_data: page stride must be a multiple of 16 B and >= {PAGE * DATA_BYTES}"
+        )
+    if k_scale.stride(0) < PAGE * SCALE_BYTES or k_scale.stride(0) % 4:
+        raise ValueError(
+            f"k_scale: page stride must be a multiple of 4 B and >= {PAGE * SCALE_BYTES}"
+        )
+
+
 def _validate_metadata(
     idx_q,
     cache,
@@ -1262,9 +1607,13 @@ def _validate_metadata(
     seq_lens=None,
     out=None,
     work_map=None,
+    k_scale=None,
     **cp,
 ):
     """Metadata only: no device reads, synchronisation or allocations.
+
+    `k_scale` selects the MXFP4 cache: `cache` is then its data view and Q may
+    also be e4m3.
 
     Contents are a caller contract: 0 <= seq_lens <= INT32_MAX-127, each length
     fits max_block's local CP bound and the global block table, and every
@@ -1278,16 +1627,30 @@ def _validate_metadata(
         raise ValueError("S and H must be positive integers")
     device = idx_q.device
     _validate_arch(device)
-    # Q is bf16 and the cache is fp8: this scores what
-    # `fused_qknorm_idxrqknorm` writes, and the launch binds those two types.
-    _validate_tensor(idx_q, "idx_q", (torch.bfloat16,), 3, device, 16)
-    _validate_tensor(cache, "cache", (dtypes.fp8,), 3, device, 16, False)
+    mxfp4 = k_scale is not None
+    # fp8 cache: Q is bf16 and this scores what `fused_qknorm_idxrqknorm` writes;
+    # the launch binds those two types.
+    _validate_tensor(
+        idx_q,
+        "idx_q",
+        (torch.bfloat16, dtypes.fp8) if mxfp4 else (torch.bfloat16,),
+        3,
+        device,
+        16,
+    )
+    if mxfp4:
+        _validate_cache_mxfp4(cache, k_scale, device)
+    else:
+        _validate_tensor(cache, "cache", (dtypes.fp8,), 3, device, 16, False)
     if idx_q.shape[1:] != (H, HEAD_DIM) or idx_q.shape[0] % S:
         raise ValueError("idx_q: expected [batch*S, H, 128]")
-    if cache.shape[1:] != (PAGE, HEAD_DIM) or cache.shape[0] > 0x7FFFFFFF:
+    if not mxfp4 and (
+        cache.shape[1:] != (PAGE, HEAD_DIM) or cache.shape[0] > 0x7FFFFFFF
+    ):
         raise ValueError("cache: expected [pages, 128, 128] with int32 page IDs")
-    for t, name in ((idx_q, "idx_q"), (cache, "cache")):
-        _validate_rows(t, name)
+    _validate_rows(idx_q, "idx_q")
+    if not mxfp4:
+        _validate_rows(cache, "cache")
     batch = idx_q.shape[0] // S
     geom = geometry(batch, max_block, S, H, device=device, **cp)
     rows = _validate_bounds(batch, max_block, geom)
@@ -1328,6 +1691,51 @@ def _validate_metadata(
     return batch, geom
 
 
+def _supported(
+    idx_q,
+    cache,
+    k_scale,
+    S,
+    H,
+    max_block,
+    block_table,
+    seq_lens,
+    sm_scale,
+    q_scale,
+    out,
+    work_map,
+    **cp,
+) -> bool:
+    """Metadata-only predicate sharing the entry points' validation.
+
+    It has to answer for everything `score_flydsl` would reject, or a
+    dispatcher that trusts it routes here and takes a raise instead of a
+    fallback. `_validate_metadata` skips `block_table`/`seq_lens` when they are
+    None -- the entry point requires them -- and never sees the scale, so both
+    are checked here.
+    """
+    if block_table is None or seq_lens is None:
+        return False  # explicit None, which the entry point also refuses
+    try:
+        _validate_metadata(
+            idx_q,
+            cache,
+            S,
+            H,
+            max_block,
+            block_table,
+            seq_lens,
+            out,
+            work_map,
+            k_scale=k_scale,
+            **cp,
+        )
+        scaled = sm_scale * q_scale * LOG2E
+        return math.isfinite(scaled) and 2**-149 <= scaled <= (2 - 2**-23) * 2**127
+    except (AttributeError, IndexError, TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
 def index_score_supported(
     idx_q,
     cache,
@@ -1342,24 +1750,56 @@ def index_score_supported(
     work_map=None,
     **cp,
 ) -> bool:
-    """Metadata-only predicate sharing the entry point's validation.
+    """Metadata-only predicate for `score_flydsl`."""
+    return _supported(
+        idx_q,
+        cache,
+        None,
+        S,
+        H,
+        max_block,
+        block_table,
+        seq_lens,
+        sm_scale,
+        1.0,
+        out,
+        work_map,
+        **cp,
+    )
 
-    It has to answer for everything `score_flydsl` would reject, or a
-    dispatcher that trusts it routes here and takes a raise instead of a
-    fallback. `_validate_metadata` skips `block_table`/`seq_lens` when they are
-    None -- the entry point requires them -- and never sees the scale, so both
-    are checked here.
-    """
-    if block_table is None or seq_lens is None:
-        return False  # explicit None, which the entry point also refuses
-    try:
-        _validate_metadata(
-            idx_q, cache, S, H, max_block, block_table, seq_lens, out, work_map, **cp
-        )
-        scaled = sm_scale * LOG2E
-        return math.isfinite(scaled) and 2**-149 <= scaled <= (2 - 2**-23) * 2**127
-    except (AttributeError, IndexError, TypeError, ValueError, ZeroDivisionError):
-        return False
+
+def index_score_supported_fp4(
+    idx_q,
+    k_data,
+    k_scale,
+    S: int,
+    H: int,
+    max_block: int,
+    block_table,
+    *,
+    seq_lens,
+    sm_scale=1.0,
+    q_scale=1.0,
+    out=None,
+    work_map=None,
+    **cp,
+) -> bool:
+    """Metadata-only predicate for `score_flydsl_fp4`."""
+    return _supported(
+        idx_q,
+        k_data,
+        k_scale,
+        S,
+        H,
+        max_block,
+        block_table,
+        seq_lens,
+        sm_scale,
+        q_scale,
+        out,
+        work_map,
+        **cp,
+    )
 
 
 # Feature count from which the transposed score layout starts paying.
@@ -1398,6 +1838,93 @@ def alloc_score(batch, S, H, max_block, device):
     )
 
 
+def _score(
+    idx_q,
+    cache,
+    k_scale,
+    block_table,
+    seq_lens,
+    S,
+    H,
+    sm_scale,
+    q_scale,
+    max_block,
+    out,
+    work_map,
+    cp_world,
+    cp_rank,
+):
+    import torch
+
+    mxfp4 = k_scale is not None
+    batch, geom = _validate_metadata(
+        idx_q,
+        cache,
+        S,
+        H,
+        max_block,
+        block_table,
+        seq_lens,
+        out,
+        work_map,
+        k_scale=k_scale,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+    )
+    if block_table is None or seq_lens is None:
+        raise ValueError("block_table and seq_lens are required")
+    scaled = sm_scale * q_scale * LOG2E
+    if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
+        raise ValueError(
+            "sm_scale * q_scale * LOG2E must be finite and positive in FP32"
+            if mxfp4
+            else "sm_scale * LOG2E must be finite and positive in FP32"
+        )
+    q_fp8 = idx_q.dtype == dtypes.fp8
+    if mxfp4:
+        geom = {**geom, "nt_k": MXFP4_K_CACHE}
+    if out is None:
+        out = alloc_score(batch, S, H, max_block, idx_q.device)
+    launch, _chunk = _get(S, H, geom, idx_q.device.index, mxfp4, q_fp8)
+    # The grid depends only on launch-time bounds, never on seq_lens contents,
+    # so it stays valid across a cudagraph replay with different lengths.
+    chunks = _grid_chunks(max_block, geom)
+    # Per *step*, not per layer -- a serving caller should hoist this out and
+    # pass it in, since every layer of a step sees the same lengths.
+    if work_map is None:
+        work_map = _make_map(seq_lens, max_block, geom, batch * chunks)
+    if mxfp4:
+        k_args = (
+            ptr_arg(cache, fx.Uint8),
+            ptr_arg(k_scale, fx.Uint8),
+        )
+        k_strides = (cache.stride(0), k_scale.stride(0))
+    else:
+        k_args = (ptr_arg(cache, fx.Float8E4M3FN),)
+        k_strides = (cache.stride(0), cache.stride(1))
+    with torch.cuda.device(idx_q.device):
+        _run_compiled(
+            launch,
+            ptr_arg(idx_q, fx.Float8E4M3FN if q_fp8 else fx.BFloat16),
+            *k_args,
+            ptr_arg(out, fx.Float32),
+            ptr_arg(block_table, fx.Int32),
+            ptr_arg(work_map, fx.Int32),
+            idx_q.stride(0),
+            idx_q.stride(1),
+            *k_strides,
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            block_table.stride(0),
+            float(scaled),
+            batch,
+            chunks,
+            torch.cuda.current_stream(idx_q.device).cuda_stream,
+        )
+    return out
+
+
 def score_flydsl(
     idx_q,
     cache,
@@ -1420,55 +1947,65 @@ def score_flydsl(
     positions the causal mask; the score is stored at the local p, giving the
     compacted [H, tokens, ceil(blocks/world)] shard the CP selector reads.
     """
-    import torch
-
-    batch, geom = _validate_metadata(
+    return _score(
         idx_q,
         cache,
-        S,
-        H,
-        max_block,
+        None,
         block_table,
         seq_lens,
+        S,
+        H,
+        sm_scale,
+        1.0,
+        max_block,
         out,
         work_map,
-        cp_world=cp_world,
-        cp_rank=cp_rank,
+        cp_world,
+        cp_rank,
     )
-    if block_table is None or seq_lens is None:
-        raise ValueError("block_table and seq_lens are required")
-    scaled = sm_scale * LOG2E
-    if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
-        raise ValueError("sm_scale * LOG2E must be finite and positive in FP32")
-    if out is None:
-        out = alloc_score(batch, S, H, max_block, idx_q.device)
-    launch, _chunk = _get(S, H, geom, idx_q.device.index)
-    # The grid depends only on launch-time bounds, never on seq_lens contents,
-    # so it stays valid across a cudagraph replay with different lengths.
-    chunks = _grid_chunks(max_block, geom)
-    # Per *step*, not per layer -- a serving caller should hoist this out and
-    # pass it in, since every layer of a step sees the same lengths.
-    if work_map is None:
-        work_map = _make_map(seq_lens, max_block, geom, batch * chunks)
-    with torch.cuda.device(idx_q.device):
-        _run_compiled(
-            launch,
-            ptr_arg(idx_q, fx.BFloat16),
-            ptr_arg(cache, fx.Float8E4M3FN),
-            ptr_arg(out, fx.Float32),
-            ptr_arg(block_table, fx.Int32),
-            ptr_arg(work_map, fx.Int32),
-            idx_q.stride(0),
-            idx_q.stride(1),
-            cache.stride(0),
-            cache.stride(1),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            block_table.stride(0),
-            float(scaled),
-            batch,
-            chunks,
-            torch.cuda.current_stream(idx_q.device).cuda_stream,
-        )
-    return out
+
+
+def score_flydsl_fp4(
+    idx_q,
+    k_data,
+    k_scale,
+    block_table,
+    seq_lens,
+    S,
+    H,
+    sm_scale,
+    max_block,
+    out=None,
+    work_map=None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    q_scale: float = 1.0,
+):
+    """`score_flydsl` for an MXFP4 index cache.
+
+    `k_data [pages, 128, 64]` and `k_scale [pages, 128, 4]` are uint8 views with
+    their own page strides (two tensors, or two views of one `[128 x 64 B
+    data][128 x 4 B scale]` page); everything else, including the CP shard, the
+    work map and the score layout, is as in `score_flydsl`.
+
+    `idx_q` is bf16 or e4m3 (`dtypes.fp8`), dispatched on its dtype. An e4m3 Q is
+    used as stored times `q_scale` (default 1.0: the plain cast the writer
+    produces); `q_scale` must be positive and is folded into the score
+    multiplier, like `sm_scale`.
+    """
+    return _score(
+        idx_q,
+        k_data,
+        k_scale,
+        block_table,
+        seq_lens,
+        S,
+        H,
+        sm_scale,
+        q_scale,
+        max_block,
+        out,
+        work_map,
+        cp_world,
+        cp_rank,
+    )
