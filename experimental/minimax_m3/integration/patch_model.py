@@ -35,19 +35,14 @@ old_loop = '''        aux_hidden_states = self._maybe_add_hidden_state([], 0, hi
             )
 '''
 new_loop = '''        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        if not getattr(self, "aux_hidden_state_layers", None):
-            # MiniMax-M3 mono decode (vllm.models.minimax_m3.amd.mono.hook)
-            from vllm.models.minimax_m3.amd.mono.hook import run_layers
+        # MiniMax-M3 mono decode (vllm.models.minimax_m3.amd.mono.hook); EAGLE3's aux
+        # hidden states collected on either path
+        from vllm.models.minimax_m3.amd.mono.hook import run_layers
 
-            hidden_states, residual = run_layers(
-                self, positions, hidden_states, residual, self._m3_vllm_config
-            )
-        else:
-            for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
-                hidden_states, residual = layer(positions, hidden_states, residual)
-                self._maybe_add_hidden_state(
-                    aux_hidden_states, idx + 1, hidden_states, residual
-                )
+        hidden_states, residual = run_layers(
+            self, positions, hidden_states, residual, self._m3_vllm_config,
+            aux_hidden_states if getattr(self, "aux_hidden_state_layers", None) else None,
+        )
 '''
 assert s.count(old_loop) == 1, "loop anchor"
 s = s.replace(old_loop, new_loop)

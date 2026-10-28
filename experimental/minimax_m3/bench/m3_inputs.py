@@ -50,10 +50,10 @@ class SynthAttn:
         return self.k16, self.v16
 
 
-def make_layers(n_layers, nb, rank, dev, seed=0):
+def make_layers(n_layers, nb, rank, dev, seed=0, max_pos=MAX_POS):
     """``n_layers`` sparse layers (ordinal % 4 == 0 selects, as layers 3, 7, .. 59)."""
     rows = qkv_rows(ONE_INDEX_HEAD.count)
-    pos = torch.arange(MAX_POS, device=dev, dtype=torch.float32)[:, None]
+    pos = torch.arange(max_pos, device=dev, dtype=torch.float32)[:, None]
     inv = 1.0 / (5e6 ** (torch.arange(0, ROTARY_DIM // 2, device=dev, dtype=torch.float32) / (ROTARY_DIM // 2)))
     ang = pos * inv[None, :]
     cos_sin = torch.cat([ang.cos(), ang.sin()], dim=1).to(torch.bfloat16).contiguous()
@@ -92,9 +92,11 @@ def make_step(rows, ctx, nb, dev, seed=0):
     need = (ctx + BLOCK - 1) // BLOCK
     assert rows * need <= nb, "cache too small"
     perm = torch.randperm(nb, generator=g, device=dev).to(torch.int32)
-    bt_buf = torch.zeros(16, BT_WIDTH, dtype=torch.int32, device=dev)  # persistent, as vLLM's
+    bt_buf = torch.zeros(64, BT_WIDTH, dtype=torch.int32, device=dev)  # persistent, as vLLM's
+    import os
     for r in range(rows):
-        bt_buf[r, :need] = perm[r * need:(r + 1) * need]
+        q = r % 16 if os.environ.get("M3_DUP_ROWS") else r
+        bt_buf[r, :need] = perm[q * need:(q + 1) * need]
     block_table = bt_buf[:rows]
     seq_lens = torch.full((rows,), ctx, dtype=torch.int32, device=dev)
     positions = torch.full((rows,), ctx - 1, dtype=torch.int64, device=dev)
@@ -102,6 +104,34 @@ def make_step(rows, ctx, nb, dev, seed=0):
     slot = (block_table[:, p // BLOCK].long() * BLOCK + p % BLOCK).contiguous()
     md = SimpleNamespace(
         decode=SimpleNamespace(block_table=block_table, seq_lens=seq_lens, decode_query_len=1),
+        slot_mapping=slot, num_prefills=0,
+    )
+    return md, positions
+
+
+def make_spec_step(reqs, ql, ctx, nb, dev, seed=0):
+    """One speculative-verify decode step after a ``ctx``-token prefill: ``reqs`` requests of
+    ``ql`` rows each (1 + draft tokens), request r's rows at positions ctx .. ctx + ql - 1 (their
+    K / V / index keys are inserted by the step itself); vLLM's metadata: seq_lens = ctx + ql per
+    request, decode_query_len = ql, one slot per row. The block table is as wide as the context
+    needs (vLLM's persistent table is max_model_len / 128 wide)."""
+    g = _gen(4242 + seed, dev)
+    total = ctx + ql
+    need = (total + BLOCK - 1) // BLOCK
+    assert reqs * need <= nb, "cache too small"
+    width = max(BT_WIDTH, need)
+    perm = torch.randperm(nb, generator=g, device=dev).to(torch.int32)
+    bt_buf = torch.zeros(64, width, dtype=torch.int32, device=dev)
+    for r in range(reqs):
+        bt_buf[r, :need] = perm[r * need:(r + 1) * need]
+    block_table = bt_buf[:reqs]
+    seq_lens = torch.full((reqs,), total, dtype=torch.int32, device=dev)
+    pos = torch.arange(ctx, total, device=dev, dtype=torch.int64)
+    positions = pos.repeat(reqs).contiguous()
+    rows_bt = block_table.repeat_interleave(ql, dim=0)
+    slot = (rows_bt.gather(1, (positions // BLOCK)[:, None]).flatten().long() * BLOCK + positions % BLOCK).contiguous()
+    md = SimpleNamespace(
+        decode=SimpleNamespace(block_table=block_table, seq_lens=seq_lens, decode_query_len=ql),
         slot_mapping=slot, num_prefills=0,
     )
     return md, positions

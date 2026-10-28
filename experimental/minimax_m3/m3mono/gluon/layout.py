@@ -8,6 +8,7 @@ while a peer still reads the previous layer's pairs there). A tagged pair is 8 b
 (tag << 32 | value); bf16 data travel two to a pair. Regions are 256-byte aligned.
 """
 
+import os
 from dataclasses import dataclass
 
 TP = 4
@@ -22,7 +23,15 @@ N_ROUTED, TOP_K, SLOTS = 128, 4, 5
 INTER = 768  # expert intermediate a rank
 SPLIT_KEYS = 256
 N_SPLIT = 8  # partitions of a <= 2048-key context
-MAX_SHORT = N_SPLIT * SPLIT_KEYS  # contexts past this need the indexer (not in this build)
+MAX_SHORT = N_SPLIT * SPLIT_KEYS  # contexts up to this attend every key (no indexer)
+# the indexer (contexts past MAX_SHORT, rows <= LONG_S): FlyDSL's selection, 128-key blocks
+SPARSE_BLOCK = 128
+TOPK_BLOCKS = 16  # selected blocks (= 2 a split partition)
+LONG_FROM_BLOCKS = 512  # past this a request's blocks are ranked in N_SPLIT shares
+MAX_INDEX_BLOCKS = 8192  # 1M context
+LONG_S = 16  # rows a long-context step may have (the score region's rows)
+SHARE_BATCH = 2  # blocks a thread keys in a long share (N_SPLIT * THREADS * 2 >= MAX_INDEX_BLOCKS)
+STAB_WORDS = 32  # a token's sparse table: 16 block ids, the sparse context length (padded)
 O_ROWS = 32
 N_O = HIDDEN // O_ROWS  # 192
 N_ROUTER = 16  # router tasks a token (8 experts each, one a wave)
@@ -34,7 +43,11 @@ N_DN = HIDDEN // DN_ROWS  # 192
 SCORE_COPIES = 8
 BLOCKS, THREADS = 256, 512
 PAIR = 8
-MAX_S = 4  # step rows this build serves (the narrow MoE)
+MAX_S = 64  # step rows the scratch / peer buffers hold (the row stride); the narrow MoE serves S <= 4
+WIDE_FROM = 5  # rows from here run the expert-grouped (wide) MoE
+SUPPORTED_S = 64  # rows the kernel builds for (past FUSED_MAX_S: hybrid only)
+FUSED_MAX_S = 16  # rows the in-kernel (wide) MoE serves
+AG_RS_FROM = 8  # rows from here reduce-scatter + all-gather the all-reduces (FlyDSL's: half the link bytes)
 
 # the epoch buffer, int32 words: the epoch, then a tagged pair a CTA (it read it)
 EP_EPOCH = 0
@@ -80,14 +93,41 @@ class StepLayout:
             ("mid", s * SLOTS * INTER // 2 * PAIR),  # swiglu outputs, bf16 pairs
             ("ar", s * HIDDEN // 2 * PAIR),  # FFN all-reduce: next layer's hidden in
             ("own", s * 2 * 64 * PAIR),  # the own-key task's fp8 K then V (2 bytes a pair)
+            ("oq", s * O_K // 4 * PAIR),  # merge tasks (S > 1): a token's merged FP8 o input, 4 a pair
+            ("oqs", s * PAIR),  # its per-token scale
+            ("x8", s * HIDDEN // 4 * PAIR),  # norm tasks (S > 2): a token's FP8 qkv input, 4 a pair
+            ("x8s", s * PAIR),  # its per-token scale
+            # qkv K-split (S > 16): tile t's K-slice c partial [tile][slice][token][16 rows], f32 tagged
+            ("qkvp", ROWS16 * 8 * s * 16 * PAIR),
+            # wide MoE: the MXFP8 mid rows (token k, slot) = row 5 k + slot, 4 fp8 a pair, and
+            # their E8M0 codes (one a pair, 24 a row)
+            # and its xn plain (the router's words then a flag a router task; 16 B loads)
+            ("xnp", s * HIDDEN),  # MXFP8 xn bytes, row k
+            ("xscp", s * HIDDEN // 32),  # its E8M0 codes, a byte each
+            ("xnf", s * 16 * PAIR),  # router task (k, tq)'s flag
+            ("ugf", (min(128, 4 * s) + 1) * (INTER // 32) * PAIR),  # wide up / gate pair's mids-out flag
+            ("midw", s * SLOTS * INTER // 4 * PAIR),
+            ("midwsc", s * SLOTS * (INTER // 32) * PAIR),
+            # the indexer (long contexts): token k's block b score at pair k * MAX_INDEX_BLOCKS + b
+            ("isc", LONG_S * MAX_INDEX_BLOCKS * PAIR),
+            # a long request's share candidates: (token k, share j, rank r) -> pairs 2 i, 2 i + 1
+            # (key, block id), i = (k * N_SPLIT + j) * TOPK_BLOCKS + r
+            ("cand", LONG_S * N_SPLIT * TOPK_BLOCKS * 2 * PAIR),
+            ("ikf", s * PAIR),  # token k's index key in the cache (stage_ik's flag)
         ]
         return _lay(items)[0]
 
     def half(self) -> int:
         return _lay(list((k, v[1]) for k, v in self.regions().items()))[1]
 
-    def nbytes(self) -> int:
+    def stab(self) -> int:
+        """Byte offset of the step-global sparse tables (past both halves): token k's at
+        word k * STAB_WORDS, written by a selecting layer, read by the reusing ones (later
+        launches)."""
         return 2 * self.half()
+
+    def nbytes(self) -> int:
+        return 2 * self.half() + padded(LONG_S * STAB_WORDS * 4, 256)
 
 
 def region(name: str) -> int:
@@ -95,9 +135,21 @@ def region(name: str) -> int:
 
 
 def peer_regions() -> dict:
-    """One parity's peer regions: [src rank][MAX_S][HIDDEN / 2] pairs each."""
+    """One parity's peer regions: attn / ffn [src rank][MAX_S][HIDDEN / 2] pairs each, then
+    (AG_RS_FROM rows on) the owners' all-gathered sums aag / fag [MAX_S][HIDDEN / 2] pairs."""
     n = TP * MAX_S * HIDDEN // 2 * PAIR
-    return {"attn": 0, "ffn": n, "_half": 2 * n}
+    m = MAX_S * HIDDEN // 2 * PAIR
+    # dense (DENSE_AR: plain bf16 pairs, 4 bytes, DSENT until written) twins of the four
+    d, e = n // 2, m // 2
+    b = 2 * n + 2 * m
+    return {"attn": 0, "ffn": n, "aag": 2 * n, "fag": 2 * n + m,
+            "attnd": b, "ffnd": b + d, "aagd": b + 2 * d, "fagd": b + 2 * d + e, "_half": b + 2 * d + 2 * e}
+
+
+def dense_spans() -> list:
+    """(byte offset, bytes) of one parity's dense regions (filled with 0xFF)."""
+    pr = peer_regions()
+    return [(pr["attnd"], pr["_half"] - pr["attnd"])]
 
 
 def peer_half() -> int:
@@ -111,4 +163,17 @@ def split_cta(task: int) -> int:
 
 
 ROUTER_BASE = N_O  # the router tasks on the CTAs past the o tasks (192 ..)
-SHARED_BASE = N_O  # the shared expert's up / gate tasks there too, after the router
+
+
+def norm_base(S: int) -> int:
+    """S > 2: token k's norm task on CTA norm_base + k (past the own-key tasks 161 ..);
+    past 16 rows (hybrid) on the CTAs past the FFN all-reduce tasks (192 ..)."""
+    return N_DN if S > 16 else ROWS16 + 1 + max(S, 4)
+
+
+def merge_base(S: int) -> int:
+    """S > 1: token k's merge task on CTA merge_base + k: a router CTA, idle in the split,
+    up to 4 rows (past them the kernel puts it on token k's partition-7 split CTA, 248 - 8 k)."""
+    return N_O
+SHARED_BASE = int(os.environ.get("VLLM_M3_GLUON_SHARED_BASE", str(N_O)))  # the shared expert's up / gate tasks
+# there too, after the router (192); 128: off the router CTAs (on o / down ones)

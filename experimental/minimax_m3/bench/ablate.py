@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 
 sys.path.insert(0, os.path.dirname(__file__))
-from m3_inputs import StandaloneRunner, make_layers, make_step  # noqa: E402
+from m3_inputs import StandaloneRunner, make_layers, make_spec_step, make_step  # noqa: E402
 from bench_layer_tp import FLY_POINTS, timeline_summary  # noqa: E402
 
 # region -> (FlyDSL stage bits, Gluon STAGES bits)
@@ -29,6 +29,17 @@ REGIONS = {
     "moe": (64, 32 | 64 | 128 | 256),  # routing, shared + routed up / gate, down, FFN all-reduce
     "all": (127, 511),
 }
+# hybrid (VLLM_M3_GLUON_HYBRID=1): the previous layer's FFN all-reduce runs first in every
+# launch unless bit 1024; the MoE is AITER's (not in the kernel)
+HYB_REGIONS = {
+    "empty": 1024, "far": 0, "qkv": 1 | 2 | 1024, "norm": 2048 | 1024, "pnorm": 4096 | 1024, "split": 4 | 1024, "merge+o": 8 | 1024, "router": 16 | 1024,
+    "all": 511,
+    # one stage alone (kernel.py AB_* bits)
+    "qkv_only": (1 << 23) | 1024, "ik": 2 | 1024, "own": (1 << 24) | 1024, "split_only": (1 << 25) | 1024,
+    "merge": (1 << 26) | 1024, "o": (1 << 27) | 1024, "router_only": (1 << 28) | 1024, "topk": (1 << 29) | 1024, "o_gemm": (1 << 30) | 1024,
+}
+if os.environ.get("VLLM_M3_GLUON_HYBRID") == "1":
+    REGIONS = {k: (REGIONS.get(k, (0, 0))[0], v) for k, v in HYB_REGIONS.items()}
 
 
 def time_graph(fn, group, n_inner=20, reps=15):
@@ -100,6 +111,7 @@ class Glu:
         from vllm.models.minimax_m3.amd.mono.gluon.runner import GluonStandalone
 
         self.r = GluonStandalone(layers, rank, group, dev, timeline=timeline)
+        self.r.ql = int(os.environ.get("M3_ABL_QL", "1"))
         self.r.md = md
         assert self.r.prepare(rows)
         self.rows, self.positions, self.hidden, self.resid, self.L = rows, positions, hidden, resid, L
@@ -145,6 +157,7 @@ def main():
     ap.add_argument("--rows", type=int, default=1)
     ap.add_argument("--ctx", type=int, default=1536)
     ap.add_argument("--layer", type=int, default=1)
+    ap.add_argument("--ql", type=int, default=1, help="rows a request (speculative verify): rows // ql requests")
     ap.add_argument("--backends", default="flydsl,gluon")
     ap.add_argument("--regions", default=",".join(REGIONS))
     ap.add_argument("--timeline", action="store_true", help="also each region's stamps (one replay, rank 0)")
@@ -156,9 +169,14 @@ def main():
     dist.init_process_group("gloo")
     group = dist.new_group(backend="gloo")
     rows, L = a.rows, a.layer
-    nb = rows * ((a.ctx + 127) // 128) + 8
-    layers = make_layers(L + 2, nb, rank, dev)  # layer L is never the step's last
-    md, positions = make_step(rows, a.ctx, nb, dev)
+    os.environ["M3_ABL_QL"] = str(a.ql)
+    reqs = rows // a.ql
+    nb = reqs * ((a.ctx + a.ql + 127) // 128) + 8
+    layers = make_layers(L + 2, nb, rank, dev, max_pos=a.ctx + a.ql + 16)  # layer L is never the step's last
+    if a.ql > 1:
+        md, positions = make_spec_step(reqs, a.ql, a.ctx, nb, dev)
+    else:
+        md, positions = make_step(rows, a.ctx, nb, dev)
     hidden = torch.randn(rows, 6144, generator=torch.Generator(device=dev).manual_seed(5), device=dev).bfloat16()
     resid = (torch.randn(rows, 6144, generator=torch.Generator(device=dev).manual_seed(6), device=dev) * 4).bfloat16()
     backs = {}
@@ -180,6 +198,8 @@ def main():
                 dist.barrier(group=group)
                 fn()
                 torch.cuda.synchronize()
+                if rank == 0 and os.environ.get("M3_TL_SAVE"):
+                    torch.save(tl[L].cpu(), f"{os.environ['M3_TL_SAVE']}_{b}_{reg}.pt")
                 if rank == 0:
                     pts = FLY_POINTS if b == "flydsl" else getattr(x.r, "TL_NAMES", {})
                     print(f"  {b} {reg} stamps (us after the first CTA start):\n" + timeline_summary(tl.cpu(), L, pts),
@@ -190,7 +210,7 @@ def main():
                     os.makedirs(a.dump, exist_ok=True)
                     x.dump(bits, f"{a.dump}/gluon_{reg}_rows{rows}.s")
     if rank == 0:
-        print(f"rows={rows} ctx={a.ctx} layer={L} ({'selects' if layers[L].index_topk else 'reuses'}): "
+        print(f"rows={rows} ql={a.ql} ctx={a.ctx} layer={L} ({'selects' if layers[L].index_topk else 'reuses'}): "
               f"us per launch, region = replay - empty", flush=True)
         names = list(backs)
         print(f"  {'region':10s}" + "".join(f" {n:>9s}" for n in names) + ("   gap  ratio" if len(names) == 2 else ""))

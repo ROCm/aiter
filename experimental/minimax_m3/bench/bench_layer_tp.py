@@ -63,6 +63,8 @@ FLY_POINTS = {  # FlyDSL K4 stamp points (fuse_k1: K1's on 27..31)
 def timeline_summary(tl, layer, points):
     """Per stamp point: CTAs reaching it, median / max us after the layer's first CTA start."""
     t = tl[layer].double()
+    if not (t[:, 0] > 0).any():
+        return "    (no stamps)"
     t0 = t[:, 0][t[:, 0] > 0].min()
     rows = []
     for k in range(t.shape[1]):
@@ -106,10 +108,13 @@ def main():
     layers = make_layers(a.layers, nb, rank, dev)
     backends = a.backends.split(",")
     runners = {b: make_runner(b, layers, rank, group, dev, a.debug, a.timeline) for b in backends}
-    hidden0 = (torch.randn(16, 6144, generator=torch.Generator(device=dev).manual_seed(5), device=dev)
+    hidden0 = (torch.randn(64, 6144, generator=torch.Generator(device=dev).manual_seed(5), device=dev)
                ).to(torch.bfloat16)
-    resid0 = (torch.randn(16, 6144, generator=torch.Generator(device=dev).manual_seed(6), device=dev) * 4
+    resid0 = (torch.randn(64, 6144, generator=torch.Generator(device=dev).manual_seed(6), device=dev) * 4
               ).to(torch.bfloat16)
+    if os.environ.get("M3_DUP_ROWS"):  # self-check: row r a copy of row r % 16 (inputs, cache rows)
+        hidden0 = hidden0[torch.arange(64, device=dev) % 16].contiguous()
+        resid0 = resid0[torch.arange(64, device=dev) % 16].contiguous()
     for ctx in ctxs:
         for rows in rows_list:
             md, positions = make_step(rows, ctx, nb, dev)
@@ -150,6 +155,9 @@ def main():
                     for b in res:
                         if b != "flydsl":
                             line += f"  {b}/flydsl {res[b] / res['flydsl']:.2f}"
+                if os.environ.get("M3_BENCH_SAVE") and outs:
+                    torch.save({b: [x.cpu() for x in o] for b, o in outs.items()},
+                               f"{os.environ['M3_BENCH_SAVE']}_rows{rows}.pt")
                 if a.check and "flydsl" in outs:
                     for b in outs:
                         if b != "flydsl":
@@ -160,7 +168,7 @@ def main():
                 for b, r in runners.items():
                     tl = r.tl_buf.cpu()
                     os.makedirs("bench/logs", exist_ok=True)
-                    torch.save(tl, f"bench/logs/tl_{b}_r{rank}_rows{rows}_ctx{ctx}.pt")
+                    torch.save(tl, f"bench/logs/tl{os.environ.get('M3_TL_TAG', '')}_{b}_r{rank}_rows{rows}_ctx{ctx}.pt")
                     if rank == 0:
                         pts = FLY_POINTS if b == "flydsl" else getattr(r, "TL_NAMES", {})
                         for li in (0, 1):

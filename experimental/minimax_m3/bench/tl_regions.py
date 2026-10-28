@@ -11,11 +11,11 @@ SEG = ["layer boundary: launch gap + input poll + residual", "RMSnorm + FP8 quan
        "head hand-off, q/k norm+RoPE, KV loads", "split attention (slowest split)", "split -> o merge hop",
        "o GEMV + all-reduce", "o -> router hop", "router logits/scores/publish", "scores -> routed (top-k)",
        "xn stage + routed up/gate", "up/gate -> mids hop", "down GEMV + all-reduce"]
-PER = {1: (37.4, 53.7), 2: (46.5, 72.6), 4: (58.8, 105.7)}
+PER = {1: (39.1, 46.1)}
 def pt(tl, k, stat):
     t = tl[1].double(); t0 = t[:, 0][t[:, 0] > 0].min(); v = t[:, k]; v = (v[v > 0] - t0) / 100
     return (v.median() if stat == "med" else v.max()).item()
-for rows in (1, 2, 4):
+for rows in (1,):
     f = torch.load(f"bench/logs/tl_flydsl_r0_rows{rows}_ctx1536.pt"); g = torch.load(f"bench/logs/tl_gluon_r0_rows{rows}_ctx1536.pt")
     pf, pg = PER[rows]
     fb = [pt(f, b[1], b[2]) for b in B]; gb = [pt(g, b[3], b[4]) for b in B]

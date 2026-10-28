@@ -28,6 +28,8 @@ THREADS = gl.constexpr(N_THREADS)
 WAVES = gl.constexpr(N_WAVES)
 BLOCKS = gl.constexpr(N_BLOCKS)
 T1 = gl.constexpr(gl.BlockedLayout([1], [64], [8], [0]))
+ONE = gl.constexpr(gl.BlockedLayout([1], [64], [8], [0]))  # a [1] tensor (every thread)
+TS_L = gl.constexpr(gl.BlockedLayout([1], [64], [8], [0]))
 
 # poll watchdog: iterations of (load round trip + s_sleep 1); several seconds
 POLL_LIMIT = gl.constexpr(1 << int(os.environ.get("VLLM_M3_GLUON_POLL_LOG2", "22")))
@@ -38,9 +40,13 @@ POLL_LIMIT = gl.constexpr(1 << int(os.environ.get("VLLM_M3_GLUON_POLL_LOG2", "22
 TRACE = gl.constexpr(int(os.environ.get("VLLM_M3_GLUON_TRACE", "0")))
 # intra-GPU hand-offs at device scope (SC1: past the per-XCD L2s), the peer ones at system
 # scope (SC0 | SC1); Triton's cache modifiers only reach the latter (~2-3 us a hop vs ~1)
+WAIT2_EXACT = gl.constexpr(int(os.environ.get("VLLM_M3_GLUON_WAIT2_EXACT", "0")))
+WAIT2 = gl.constexpr(int(os.environ.get("VLLM_M3_GLUON_WAIT2", "1")))  # lean mailbox wait (_wait2_asm)
+PEEK_CM = gl.constexpr(os.environ.get("VLLM_M3_GLUON_PEEK_CM", ".cv"))  # peeks' cache policy (.cv = sc0 sc1)
+PUT_CM = gl.constexpr(os.environ.get("VLLM_M3_GLUON_PUT_CM", ".wt"))  # tagged puts' cache policy (.wt = sc0 sc1; .cg / .cs: see the asm)
 DEV_SCOPE = gl.constexpr(int(os.environ.get("VLLM_M3_GLUON_DEV_SCOPE", "0")))  # 1: polls, 2: puts
 FIRST_ERR = gl.constexpr(int(os.environ.get("VLLM_M3_GLUON_FIRST_ERR", "0")))
-TRACE_SLOTS = gl.constexpr(32)
+TRACE_SLOTS = gl.constexpr(64)
 
 
 @gluon.constexpr_function
@@ -153,6 +159,82 @@ def _wait_asm(n, k, limit, sys=True):
 
 
 @gluon.constexpr_function
+def _wait2_asm(n, k, limit, sys=True, exact=False):
+    """``_wait_asm`` with FlyDSL's per-word cost. Tags only grow (epoch * 64 + layer + 1), so
+    a word is pending iff 0 < w < LO (an unused element was loaded masked: 0; the scratch
+    starts as (1, tag 0), never 0). The landed case is then 4 ops a word, with no address
+    or predicate work: those run only when a lane re-polls (address = base + 8 idx, built
+    in the word's own registers; unused elements re-read word 0 and are zeroed after).
+
+    Operands (k each, ``pack`` order): outputs W_0..W_n-1 (i64), ERR (i32, also a temp);
+    inputs V (tied to W), B_0..B_n-1 (i64 bases), I_0..I_n-1 (i32 pair indices), P_0..P_n-1
+    (i32, 0 = element unused), LO = tag << 32."""
+    def W(t, e):
+        return f"${t * k + e}"
+
+    nout = (n + 1) * k
+
+    def ERR(e):
+        return f"${n * k + e}"
+
+    def B(t, e):
+        return f"${nout + n * k + t * k + e}"
+
+    def I(t, e):
+        return f"${nout + 2 * n * k + t * k + e}"
+
+    def P(t, e):
+        return f"${nout + 3 * n * k + t * k + e}"
+
+    LO = f"${nout + 4 * n * k}"
+    HI = f"${nout + 4 * n * k + k}"
+    SEXEC, MASK, PM, CNT = _WS
+    cm = "sc0 sc1" if sys else "sc1"
+    lines = ["s_nop 4", f"s_mov_b64 {SEXEC}, exec", f"s_mov_b64 {MASK}, 0"]
+    for t in range(n):
+        for e in range(k):
+            if exact:
+                lines += [f"v_cmp_lt_u64 vcc, {W(t, e)}, {LO}", f"v_cmp_ge_u64_e64 {PM}, {W(t, e)}, {HI}",
+                          f"s_or_b64 vcc, vcc, {PM}"]
+            else:
+                lines += [f"v_cmp_lt_u64 vcc, {W(t, e)}, {LO}"]
+            lines += [f"v_cmp_ne_u64_e64 {PM}, 0, {W(t, e)}", f"s_and_b64 vcc, vcc, {PM}", f"s_or_b64 {MASK}, {MASK}, vcc"]
+    lines += [f"s_and_b64 exec, exec, {MASK}", "s_cbranch_execz 3f", f"s_mov_b32 {CNT}, 0", "1:"]
+    for t in range(n):
+        for e in range(k):
+            lines += [f"v_cmp_ne_u32 vcc, 0, {P(t, e)}", f"v_cndmask_b32 {ERR(e)}, 0, {I(t, e)}, vcc",
+                      f"v_mad_u64_u32 {W(t, e)}, {PM}, {ERR(e)}, 8, {B(t, e)}",
+                      f"global_load_dwordx2 {W(t, e)}, {W(t, e)}, off {cm}"]
+    lines += ["s_waitcnt vmcnt(0)", f"s_mov_b64 {MASK}, 0"]
+    for t in range(n):
+        for e in range(k):
+            lines += [f"v_cmp_lt_u64 vcc, {W(t, e)}, {LO}"]
+            if exact:
+                lines += [f"v_cmp_ge_u64_e64 {PM}, {W(t, e)}, {HI}", f"s_or_b64 vcc, vcc, {PM}"]
+            lines += [f"v_cmp_ne_u32_e64 {PM}, 0, {P(t, e)}", f"s_and_b64 vcc, vcc, {PM}", f"s_or_b64 {MASK}, {MASK}, vcc"]
+    lines += [f"s_and_b64 exec, exec, {MASK}", "s_cbranch_execz 2f", "s_sleep 1",
+              f"s_add_u32 {CNT}, {CNT}, 1", f"s_cmp_lt_u32 {CNT}, {limit}", "s_cbranch_scc1 1b",
+              f"s_mov_b64 {MASK}, exec", "s_branch 5f", "2:", f"s_mov_b64 {MASK}, 0", "5:",
+              f"s_mov_b64 exec, {SEXEC}"]
+    # the re-polled lanes' unused elements (re-read word 0) -> 0, as the masked load left them
+    for t in range(n):
+        for e in range(k):
+            lines += [f"v_cmp_ne_u32 vcc, 0, {P(t, e)}", f"v_cndmask_b32 {ERR(e)}, 32, 0, vcc",
+                      f"v_lshlrev_b64 {W(t, e)}, {ERR(e)}, {W(t, e)}", f"v_lshlrev_b64 {W(t, e)}, {ERR(e)}, {W(t, e)}"]
+    lines += [f"v_cndmask_b32_e64 {ERR(e)}, 0, 1, {MASK}" for e in range(k)]
+    lines += ["s_branch 4f", "3:", f"s_mov_b64 exec, {SEXEC}"] + [f"v_mov_b32 {ERR(e)}, 0" for e in range(k)]
+    lines += ["4:", "s_nop 4"]
+    return "\n".join(lines)
+
+
+@gluon.constexpr_function
+def _wait2_constraints(n, k):
+    outs = ["=&v"] * (n * k) + ["=&v"] * k
+    ins = [str(i) for i in range(n * k)] + ["v"] * (3 * n * k) + ["v"] * (2 * k)
+    return ",".join(outs + ins + ["~{vcc}", "~{scc}", "~{memory}", _WS_CLOBBER])
+
+
+@gluon.constexpr_function
 def _wait_constraints(n, k):
     outs = ["=&v"] * (n * k) + ["=&v"] * k
     ins = [str(i) for i in range(n * k)] + ["v"] * (n * k) + ["v"] * (n * k) + ["v"] * (2 * k)
@@ -162,6 +244,32 @@ def _wait_constraints(n, k):
 @gluon.constexpr_function
 def _wait_dtypes(n):
     return [gl.int64] * n + [gl.int32]
+
+
+@gluon.jit
+def wait_words2(items, tag, PACK: gl.constexpr, SYS: gl.constexpr = False):
+    """``wait_words`` on ``_wait2_asm``: ``peeked`` must be a masked load (0 where pred is
+    off) and pred must mean "element used" (not "not landed yet")."""
+    N: gl.constexpr = len(items)
+    vs = ()
+    bs = ()
+    is_ = ()
+    ps = ()
+    for i in gl.static_range(N):
+        ptr, idx, pred, peeked = items[i]
+        vs = vs + (peeked + idx.to(gl.int64) * 0,)
+        bs = bs + ((ptr + idx * 0).to(gl.int64, bitcast=True),)
+        is_ = is_ + (idx,)
+        ps = ps + ((pred.to(gl.int32) != 0).to(gl.int32) + idx * 0,)
+    lo = gl.full(vs[0].shape, 0, gl.int64, vs[0].type.layout) + (tag.to(gl.int64) << 32)
+    hi = lo + (1 << 32)
+    r = gl.inline_asm_elementwise(
+        _wait2_asm(N, PACK, POLL_LIMIT, SYS or (DEV_SCOPE & 1) == 0, WAIT2_EXACT != 0), _wait2_constraints(N, PACK),
+        vs + bs + is_ + ps + (lo, hi), dtype=_wait_dtypes(N), is_pure=False, pack=PACK)
+    out = ()
+    for i in gl.static_range(N):
+        out = out + (r[i].to(gl.int32),)
+    return out, r[N]
 
 
 @gluon.jit
@@ -190,6 +298,145 @@ def wait_words(items, tag, PACK: gl.constexpr, SYS: gl.constexpr = False):
         # peek, or unused) keep their peeked value (their re-load address is a dummy)
         out = out + (gl.where(ps[i] != 0, r[i], vs[i]).to(gl.int32),)
     return out, r[N]
+
+
+# Dense hand-offs (the all-reduces past 16 rows): plain i32 words (bf16 pairs) whose value is
+# its own flag. A slot holds DSENT (0xFFFFFFFF, two NaN bf16 no producer stores: ``dense_word``)
+# until its producer's word lands; its one reader resets it after reading (the next write is a
+# later layer, ordered behind the read by the layers' own hand-offs / launch boundaries). Half
+# the link bytes of tagged pairs, and no store-ack round trip before a flag. A layout that
+# replicates elements across threads (PR_L tiles narrower than 64 tokens) must put a CTA barrier
+# between the wait and the reset: every replica polls, but only one stores, and its reset would
+# otherwise hide the word from a replica that had not read it yet.
+@gluon.constexpr_function
+def _waitd_asm(n, k, limit):
+    """``_wait2_asm`` on dense words: an element is pending iff it is used and reads DSENT.
+
+    Operands (k each, ``pack`` order): outputs W_0..W_n-1 (i32), ERR (i32, also a temp), T
+    (i64 temp); inputs V (tied to W), B_0..B_n-1 (i64 bases), I_0..I_n-1 (i32 word indices),
+    P_0..P_n-1 (i32, 0 = element unused)."""
+    def W(t, e):
+        return f"${t * k + e}"
+
+    def ERR(e):
+        return f"${n * k + e}"
+
+    def T(e):
+        return f"${(n + 1) * k + e}"
+
+    nout = (n + 2) * k
+
+    def B(t, e):
+        return f"${nout + n * k + t * k + e}"
+
+    def I(t, e):
+        return f"${nout + 2 * n * k + t * k + e}"
+
+    def P(t, e):
+        return f"${nout + 3 * n * k + t * k + e}"
+
+    SEXEC, MASK, PM, CNT = _WS
+    lines = ["s_nop 4", f"s_mov_b64 {SEXEC}, exec", f"s_mov_b64 {MASK}, 0"]
+    for t in range(n):  # a masked (unused) element was loaded as 0: never pending here
+        for e in range(k):
+            lines += [f"v_cmp_eq_u32 vcc, -1, {W(t, e)}", f"s_or_b64 {MASK}, {MASK}, vcc"]
+    lines += [f"s_and_b64 exec, exec, {MASK}", "s_cbranch_execz 3f", f"s_mov_b32 {CNT}, 0", "1:"]
+    for t in range(n):
+        for e in range(k):
+            lines += [f"v_cmp_ne_u32 vcc, 0, {P(t, e)}", f"v_cndmask_b32 {ERR(e)}, 0, {I(t, e)}, vcc",
+                      f"v_mad_u64_u32 {T(e)}, {PM}, {ERR(e)}, 4, {B(t, e)}",
+                      f"global_load_dword {W(t, e)}, {T(e)}, off sc0 sc1"]
+    lines += ["s_waitcnt vmcnt(0)", f"s_mov_b64 {MASK}, 0"]
+    for t in range(n):
+        for e in range(k):
+            lines += [f"v_cmp_eq_u32 vcc, -1, {W(t, e)}", f"v_cmp_ne_u32_e64 {PM}, 0, {P(t, e)}",
+                      f"s_and_b64 vcc, vcc, {PM}", f"s_or_b64 {MASK}, {MASK}, vcc"]
+    lines += [f"s_and_b64 exec, exec, {MASK}", "s_cbranch_execz 2f", "s_sleep 1",
+              f"s_add_u32 {CNT}, {CNT}, 1", f"s_cmp_lt_u32 {CNT}, {limit}", "s_cbranch_scc1 1b",
+              f"s_mov_b64 {MASK}, exec", "s_branch 5f", "2:", f"s_mov_b64 {MASK}, 0", "5:",
+              f"s_mov_b64 exec, {SEXEC}"]
+    for t in range(n):  # the re-polled lanes' unused elements (re-read word 0) -> 0
+        for e in range(k):
+            lines += [f"v_cmp_ne_u32 vcc, 0, {P(t, e)}", f"v_cndmask_b32 {W(t, e)}, 0, {W(t, e)}, vcc"]
+    lines += [f"v_cndmask_b32_e64 {ERR(e)}, 0, 1, {MASK}" for e in range(k)]
+    lines += ["s_branch 4f", "3:", f"s_mov_b64 exec, {SEXEC}"] + [f"v_mov_b32 {ERR(e)}, 0" for e in range(k)]
+    lines += ["4:", "s_nop 4"]
+    return "\n".join(lines)
+
+
+@gluon.constexpr_function
+def _waitd_constraints(n, k):
+    outs = ["=&v"] * (n * k) + ["=&v"] * k + ["=&v"] * k
+    ins = [str(i) for i in range(n * k)] + ["v"] * (3 * n * k)
+    return ",".join(outs + ins + ["~{vcc}", "~{scc}", "~{memory}", _WS_CLOBBER])
+
+
+@gluon.constexpr_function
+def _waitd_dtypes(n):
+    return [gl.int32] * n + [gl.int32, gl.int64]
+
+
+@gluon.jit
+def dense_word(w):
+    """A bf16-pair word as a dense hand-off stores it: never DSENT (a NaN pair stays NaN)."""
+    return gl.where(w == -1, -2, w)
+
+
+@gluon.jit
+def put_dense(region, idx, w, mask=None):
+    """Dense word ``idx`` of ``region`` (``*i32``, a peer's or own) := w, system scope."""
+    cdna4.buffer_store(dense_word(w), region, idx, mask=mask, cache=".wt")
+
+
+@gluon.jit
+def peek_dense(ptr, idx, pred):
+    """A dense word load issued (``wait_dense`` finishes it): (words, used mask)."""
+    p = pred.to(gl.int32) != 0
+    return cdna4.buffer_load(ptr, idx, mask=p, other=0, cache=PEEK_CM), p.to(gl.int32) + idx * 0
+
+
+@gluon.jit
+def wait_dense(items, PACK: gl.constexpr):
+    """Every ``(ptr, idx, peek_dense)`` item landed -> (i32 words tuple, err). Same shape and
+    layout each, PACK = its elements a thread."""
+    N: gl.constexpr = len(items)
+    vs = ()
+    bs = ()
+    is_ = ()
+    ps = ()
+    for i in gl.static_range(N):
+        ptr, idx, pk = items[i]
+        vs = vs + (pk[0] + idx * 0,)
+        bs = bs + ((ptr + idx * 0).to(gl.int64, bitcast=True),)
+        is_ = is_ + (idx,)
+        ps = ps + (pk[1],)
+    r = gl.inline_asm_elementwise(_waitd_asm(N, PACK, POLL_LIMIT), _waitd_constraints(N, PACK), vs + bs + is_ + ps,
+                                  dtype=_waitd_dtypes(N), is_pure=False, pack=PACK)
+    out = ()
+    for i in gl.static_range(N):
+        out = out + (r[i],)
+    return out, r[N]
+
+
+@gluon.jit
+def put_dense2(region, idx2, w0, w1, mask=None):
+    """Two dense words as one 8-byte store at word pair ``idx2`` (words 2 idx2, + 1) of
+    ``region`` (``*i32``)."""
+    v = (dense_word(w1).to(gl.int64) << 32) | (dense_word(w0).to(gl.uint32, bitcast=True).to(gl.int64))
+    cdna4.buffer_store(v, region.to(gl.pointer_type(gl.int64), bitcast=True), idx2, mask=mask, cache=".wt")
+
+
+@gluon.jit
+def reset_dense2(ptr, idx2, mask=None):
+    """``reset_dense`` of word pair ``idx2`` (one 8-byte store)."""
+    cdna4.buffer_store(gl.full(idx2.shape, -1, gl.int64, idx2.type.layout), ptr.to(gl.pointer_type(gl.int64),
+                       bitcast=True), idx2, mask=mask, cache=".wt")
+
+
+@gluon.jit
+def reset_dense(ptr, idx, mask=None):
+    """A read dense slot back to DSENT (its one reader, after the read)."""
+    cdna4.buffer_store(gl.full(idx.shape, -1, gl.int32, idx.type.layout), ptr, idx, mask=mask, cache=".wt")
 
 
 @gluon.jit
@@ -227,7 +474,7 @@ def _peek(ptr, idx, tag, pred):
     """One coherent load of the tagged pairs ``ptr[idx]`` (``ptr``: *i64) -> (words,
     i32 nonzero where pred is set but the tag is not there yet)."""
     p = pred.to(gl.int32) != 0
-    v = cdna4.buffer_load(ptr, idx, mask=p, other=0, cache=".cv")
+    v = cdna4.buffer_load(ptr, idx, mask=p, other=0, cache=PEEK_CM)
     return v, (p & ((v >> 32).to(gl.int32) != tag)).to(gl.int32)
 
 
@@ -280,11 +527,25 @@ def pair_word(value, tag):
 @gluon.jit
 def put_sys(region, idx, value, tag, mask=None):
     """Tagged pair ``idx`` of ``region`` (``*i64``) := (value, tag), system scope (a peer's)."""
-    cdna4.buffer_store(pair_word(value, tag), region, idx, mask=mask, cache=".wt")
+    cdna4.buffer_store(pair_word(value, tag), region, idx, mask=mask, cache=PUT_CM)
 
 
 _PUT_DEV = gl.constexpr("v_cmp_ne_u32 vcc, 0, $2\ns_and_saveexec_b64 $0, vcc\ns_cbranch_execz 1f\n"
                         "global_store_dwordx2 $3, $1, off sc1\n1:\ns_or_b64 exec, exec, $0")
+
+
+@gluon.jit
+def put_dev(region, idx, value, tag, mask=None):
+    """``put`` at device scope (sc1) whatever DEV_SCOPE: the inline-asm global_store."""
+    w = pair_word(value, tag)
+    if mask is None:
+        m = (w != 0) | (w == 0)
+    else:
+        m = mask
+    m = (m & ((w != 0) | (w == 0))).to(gl.int32)
+    a = (region + idx).to(gl.int64, bitcast=True) + (w * 0)
+    gl.inline_asm_elementwise(_PUT_DEV, "=&s,v,v,v,~{vcc},~{scc},~{memory}", [w, m, a], dtype=gl.int64, is_pure=False,
+                              pack=1)
 
 
 @gluon.jit
@@ -298,7 +559,7 @@ def put(region, idx, value, tag, mask=None):
             m = mask
         m = (m & ((w != 0) | (w == 0))).to(gl.int32)
         a = (region + idx).to(gl.int64, bitcast=True) + (w * 0)
-        gl.inline_asm_elementwise(_PUT_DEV, "=&s,v,v,v,~{vcc},~{memory}", [w, m, a], dtype=gl.int64, is_pure=False,
+        gl.inline_asm_elementwise(_PUT_DEV, "=&s,v,v,v,~{vcc},~{scc},~{memory}", [w, m, a], dtype=gl.int64, is_pure=False,
                                   pack=1)
     else:
         put_sys(region, idx, value, tag, mask)
@@ -317,14 +578,42 @@ def drain(x):
 
 @gluon.jit
 def stamp(trace, bid, slot):
-    """Trace word ``slot`` of CTA ``bid`` := now (``trace``: *i64), when TRACE."""
-    if TRACE:
+    """Trace word ``slot`` of CTA ``bid`` := now (``trace``: *i64), when TRACE. TRACE=3:
+    ``trace`` is (pointer, LDS record): FlyDSL's stamps -- one thread's time into LDS, no
+    barrier and no global store (that would sit on every later vmcnt wait), flushed by
+    ``stamp_flush`` at the layer's end. A None trace: no stamp."""
+    if trace is None:
+        pass
+    elif TRACE == 3:
+        one = gl.arange(0, 1, layout=ONE)
+        now = gl.inline_asm_elementwise("s_memrealtime $0\ns_waitcnt lgkmcnt(0)", "=s,v,~{memory}", [one],
+                                        dtype=gl.int64, is_pure=False, pack=1)
+        trace[1].slice(slot, 1).store(now)
+    elif TRACE:
         if TRACE == 1:  # TRACE=2: no barrier (wave 0's own time: does not reorder the CTA)
             gl.barrier()
         tid = gl.arange(0, THREADS, layout=T1)
         now = gl.inline_asm_elementwise("s_memrealtime $0\ns_waitcnt lgkmcnt(0)", "=s,v", [tid], dtype=gl.int64,
                                         is_pure=False, pack=1)
         gl.store(trace + bid * TRACE_SLOTS + slot + tid * 0, now, mask=tid == 0)
+
+
+@gluon.jit
+def stamp_init(trace):
+    """TRACE=3: the CTA's LDS record zeroed (its stamps not reached stay 0)."""
+    if TRACE == 3:
+        t = gl.arange(0, TRACE_SLOTS, layout=TS_L)
+        trace[1].store(t.to(gl.int64) * 0)
+        gl.barrier()
+
+
+@gluon.jit
+def stamp_flush(trace, bid):
+    """TRACE=3: the CTA's LDS record -> trace pointer [CTA][TRACE_SLOTS]."""
+    if TRACE == 3:
+        gl.barrier()
+        t = gl.arange(0, TRACE_SLOTS, layout=TS_L)
+        gl.store(trace[0] + bid * TRACE_SLOTS + t, trace[1].load(TS_L))
 
 
 @gluon.jit
@@ -339,6 +628,40 @@ def uniform(x):
     # on some waves); after it, a VMEM reading the SGPR needs 5 (a wild pointer).
     return gl.inline_asm_elementwise("s_nop 4\nv_readfirstlane_b32 $0, $1\ns_nop 4", "=s,v", [x], dtype=gl.int32,
                                      is_pure=False, pack=1)
+
+
+@gluon.constexpr_function
+def _uni_asm(n):
+    n = getattr(n, "value", n)
+    return "\n".join(["s_nop 4"] + [f"v_readfirstlane_b32 ${i}, ${n + i}" for i in range(n)] + ["s_nop 4"])
+
+
+@gluon.constexpr_function
+def _uni_cons(n):
+    n = getattr(n, "value", n)
+    return ",".join(["=s"] * n + ["v"] * n)
+
+
+@gluon.constexpr_function
+def _uni_types(n):
+    n = getattr(n, "value", n)
+    return (gl.int32,) * n
+
+
+@gluon.jit
+def uniforms(xs):
+    """``uniform`` of a tuple of i32 scalars, 8 a block: one pair of hazard pads per 8
+    v_readfirstlane instead of per value."""
+    gl.static_assert(len(xs) % 8 == 0, "uniforms: a multiple of 8 values")
+    out = ()
+    for i0 in gl.static_range(0, len(xs), 8):
+        args = ()
+        for j in gl.static_range(8):
+            args = args + (xs[i0 + j],)
+        r = gl.inline_asm_elementwise(_uni_asm(8), _uni_cons(8), args, dtype=_uni_types(8), is_pure=False, pack=1)
+        for j in gl.static_range(8):
+            out = out + (r[j],)
+    return out
 
 
 @gluon.jit

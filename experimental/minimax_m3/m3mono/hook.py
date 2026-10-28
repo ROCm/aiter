@@ -47,7 +47,9 @@ def get_runner(model, vllm_config):
         try:
             r = _runner_cls()(model, vllm_config)
             sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
-            widths = sorted({w for w in sizes if w <= MAX_TOKENS} | {1})
+            mt = r.max_tokens() if hasattr(r, "max_tokens") else MAX_TOKENS
+            q = getattr(r, "ql", 1)
+            widths = sorted({w for w in sizes if w <= mt and w % q == 0} | {q})
             for w in widths:
                 if not r.prepare(w):
                     raise MonoUnsupported(f"width {w} not prepared")
@@ -62,7 +64,7 @@ def get_runner(model, vllm_config):
 def supports(runner, hidden: torch.Tensor) -> bool:
     """A pure decode step the kernels serve (TP-uniform inputs only)."""
     n = hidden.shape[0]
-    if not 1 <= n <= MAX_TOKENS:
+    if not 1 <= n <= (runner.max_tokens() if hasattr(runner, "max_tokens") else MAX_TOKENS):
         return False
     md = runner.sparse_metadata()
     if md is None or getattr(md, "decode", None) is None:
@@ -70,7 +72,7 @@ def supports(runner, hidden: torch.Tensor) -> bool:
     if getattr(md, "num_prefills", 0):
         return False
     q_len = int(md.decode.decode_query_len)
-    if n % q_len:
+    if n % q_len or q_len != getattr(runner, "ql", q_len):
         return False
     if not runner.k4.prepare(n):
         return False
@@ -85,8 +87,9 @@ def _nrmse(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a - b).norm() / b.norm().clamp_min(1e-30))
 
 
-def run_layers(model, positions, hidden, residual, vllm_config):
-    """The decoder loop with the mono hand-off; returns (hidden, residual)."""
+def run_layers(model, positions, hidden, residual, vllm_config, aux=None):
+    """The decoder loop with the mono hand-off; returns (hidden, residual). ``aux``:
+    EAGLE3's aux hidden-state list (vLLM's ``_maybe_add_hidden_state``), appended to."""
     layers = model.layers[model.start_layer : model.end_layer]
     runner = get_runner(model, vllm_config) if model.start_layer == 0 else None
     use = runner is not None and supports(runner, hidden)
@@ -94,6 +97,8 @@ def run_layers(model, positions, hidden, residual, vllm_config):
         if use and idx == N_DENSE:
             break
         hidden, residual = layer(positions, hidden, residual)
+        if aux is not None:
+            model._maybe_add_hidden_state(aux, idx + 1, hidden, residual)
     if not use:
         return hidden, residual
     if CHECK == "layer" and not torch.cuda.is_current_stream_capturing():
@@ -115,6 +120,8 @@ def run_layers(model, positions, hidden, residual, vllm_config):
                     max(w[1] for w in worst), max(worst, key=lambda w: w[1])[2])
         return hidden, residual
     h_mono, r_mono = runner.forward(positions, hidden, residual)
+    if aux is not None and getattr(model, "aux_hidden_state_layers", None):
+        aux.extend(runner.aux_states(hidden.shape[0]))
     if CHECK == "1" and not torch.cuda.is_current_stream_capturing():
         h_m, r_m = h_mono.clone(), r_mono.clone()
         for layer in layers[N_DENSE:]:

@@ -19,7 +19,9 @@ for n in widths:
     h = torch.zeros(16, LY.HIDDEN, dtype=torch.bfloat16, device=dev)
     u8 = torch.zeros(1024, dtype=torch.uint8, device=dev)
     pr = LY.peer_regions()
-    args = (z64, 57, h, z64, z64, i32, 4, i32, h, h, h, h, u8, 0, z64, i32, i32, z64, 0, 0.088, 1e-6, 2.0, 1.0, 7.0, 3)
+    w5 = torch.zeros(16, 5, dtype=torch.float32, device=dev)
+    args = (z64, 57, h, z64, z64, i32, 4, i32, h, h, h, h, u8, 0, z64, i32, i32, z64, 0, 0.088, 1e-6, 2.0, 1.0, 7.0, 3,
+            h, i32, w5, h)
     cc = m3_step_kernel.warmup(*args, grid=(256,), S=n, HALF=LY.StepLayout().half(), PHALF=pr["_half"],
                                FFN_OFF=pr["ffn"], num_warps=8, enable_fp_fusion=False, STAGES=STAGES, LOOP=bool(int(os.environ.get('LOOP', '0'))))
     cc._init_handles()
