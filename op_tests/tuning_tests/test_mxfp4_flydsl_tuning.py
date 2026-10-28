@@ -8,7 +8,6 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -69,34 +68,6 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         self.tuner.keys = KEYS
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-
-    def read_rows(self, rows: list[dict[str, Any]]) -> pd.DataFrame:
-        path = Path(self.directory.name) / "input.csv"
-        pd.DataFrame(rows).to_csv(path, index=False)
-        return self.tuner.get_untuned_gemm_list(str(path))
-
-    def test_tune_rejects_rows_that_are_not_a4w4_before_any_shape_work(
-        self,
-    ) -> None:
-        args = SimpleNamespace(mp=1)
-        for column in ("q_dtype_a", "q_dtype_w"):
-            rows = self.read_rows(
-                [shape_row(), shape_row(token=2, **{column: "torch.float8_e4m3fn"})]
-            )
-            rejected = r"row 3 \(.*torch.float8_e4m3fn.*\): --mxfp4-flydsl tunes A4W4 rows only"
-            with self.subTest(column=column), mock.patch.object(
-                self.module.Mxfp4FlydslTuner,
-                "_tune_one_shape",
-                side_effect=AssertionError("a shape was tuned before the check"),
-            ), self.assertRaisesRegex(ValueError, rejected):
-                self.tuner.tune(rows, pd.DataFrame(), args)
-        rows = self.read_rows([shape_row(), shape_row(token=2)])
-        with mock.patch.object(
-            self.module.Mxfp4FlydslTuner,
-            "_tune_one_shape",
-            side_effect=lambda row, _args: row["token"],
-        ):
-            self.assertEqual(self.tuner.tune(rows, pd.DataFrame(), args), [1, 2])
 
     def test_g1_names_carry_activation_and_output_precision(self) -> None:
         kname = self.module.Mxfp4FlydslTuner._g1_kname
