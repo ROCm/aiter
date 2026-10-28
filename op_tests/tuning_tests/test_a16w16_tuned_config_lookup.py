@@ -125,8 +125,11 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
         self.assertTrue(
             _use_split_k_workspace(320, 6288, 7, torch.bfloat16, False, False)
         )
+        self.assertTrue(
+            _use_split_k_workspace(386, 6288, 7, torch.bfloat16, False, False)
+        )
         self.assertFalse(
-            _use_split_k_workspace(321, 6288, 7, torch.bfloat16, False, False)
+            _use_split_k_workspace(387, 6288, 7, torch.bfloat16, False, False)
         )
         self.assertFalse(
             _use_split_k_workspace(320, 6288, 1, torch.bfloat16, False, False)
@@ -308,6 +311,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                 ((4032, 2880, 7168), (192, 256, 2, 1, 4, 4, 0)),
                 ((279, 7168, 35840), (320, 192, 2, 5, 4, 2, 0)),
                 ((312, 6288, 7168), (320, 192, 2, 7, 4, 4, 0)),
+                ((322, 6288, 7168), (384, 192, 2, 7, 8, 1, 0)),
                 ((4033, 2880, 7168), (256, 192, 2, 1, 4, 4, 0)),
                 ((5382, 2112, 7168), (256, 192, 2, 1, 4, 4, 0)),
                 ((3079, 8448, 7168), (288, 192, 2, 1, 2, 4, 0)),

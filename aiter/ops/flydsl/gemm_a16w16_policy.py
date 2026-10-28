@@ -290,6 +290,21 @@ def get_flydsl_a16w16_configs(
                 "use_half_tile_interleaved": False,
             }
         )
+    if 320 < m <= 384 and k % 7 == 0:
+        configs.append(
+            {
+                "block_m": 384,
+                "block_n": 192,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 7,
+                "m_waves": 8,
+                "n_waves": 1,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+            }
+        )
     for block_m, block_n, stages, m_waves, n_waves, group_m in (
         (256, 192, 2, 4, 4, 0),
         (288, 192, 2, 2, 4, 0),
@@ -375,6 +390,7 @@ def get_flydsl_a16w16_configs(
                 (224, 192),
                 (160, 192),
                 (192, 192),
+                (384, 192),
             ):
                 continue
 

@@ -35,7 +35,7 @@ from .tensor_shim import (
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
 GEMM_A16W16_DTYPE_FP16 = 3
-SPLIT_K_WORKSPACE_MAX_ELEMS = 7 * 320 * 6288
+SPLIT_K_WORKSPACE_MAX_ELEMS = 7 * 386 * 6288
 
 
 def _use_split_k_workspace(m, n, split_k, out_dtype, has_bias, half_tile):
