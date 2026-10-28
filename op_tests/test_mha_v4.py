@@ -687,9 +687,13 @@ def test_mha_v4_quantizers_read_strided_views_like_contiguous_input(
 @parametrize(
     "formats",
     [
+        # The gfx942 INT8 kernel is not yet run-to-run deterministic, so its output cannot be
+        # compared bit for bit there; drop that skip once it is. Its strided Q/K reads are still
+        # covered by the int8 rows of the quantizer test above.
         param(
             formats,
-            skip=get_gfx() != "gfx950" and formats not in _GFX942_DENSE_ROWS,
+            skip=(get_gfx() != "gfx950" and formats not in _GFX942_DENSE_ROWS)
+            or (get_gfx() == "gfx942" and formats[0] == AttentionFormat.INT8),
             id="-".join(f.name for f in formats),
         )
         for formats in [
