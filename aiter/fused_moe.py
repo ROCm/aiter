@@ -141,6 +141,10 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
 _FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
 _FUSED_DECODE_SORT_QUANT_MAX_M = 128
+# (num_experts, topk) pairs where the Triton single-launch sort was measured
+# faster than the Opus sort, up to _SMALL_SORT_MAX_M tokens (gfx950).
+_SMALL_SORT_ROUTES = {(128, 4)}
+_SMALL_SORT_MAX_M = 224
 
 # Internal benchmark/test hook (not a public switch): set True to force the
 # generic sort+quant path so base-vs-head latency can be measured from one
@@ -612,6 +616,7 @@ def _moe_sorting_impl(
     accumulate=True,
     output_aux=False,
     output=None,
+    extra_zero_buf=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -685,7 +690,38 @@ def _moe_sorting_impl(
         )
         aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
-    if use_opus:
+    small_sort = (
+        use_opus
+        and dispatch_policy == 0
+        and not output_aux
+        and not return_local_topk_ids
+        and expert_mask is None
+        and num_local_tokens is None
+        and 0 < M <= _SMALL_SORT_MAX_M
+        and (num_experts, topk) in _SMALL_SORT_ROUTES
+        and topk_ids.dtype == dtypes.i32
+        and topk_weights.dtype == dtypes.fp32
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and moe_buf.is_contiguous()
+        and (extra_zero_buf is None or extra_zero_buf.is_contiguous())
+    )
+    if small_sort:
+        from aiter.ops.triton.moe.moe_sort_small import moe_sort_small
+
+        moe_sort_small(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            int(block_size),
+            extra_zero_buf=extra_zero_buf,
+        )
+    elif use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
             M, num_experts, topk, dispatch_policy, topk_ids.get_device()
         )
@@ -727,6 +763,8 @@ def _moe_sorting_impl(
             num_local_tokens,
             dispatch_policy,
         )
+    if extra_zero_buf is not None and not small_sort:
+        extra_zero_buf.zero_()
     ret = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
     if output_aux:
         ret = (*ret, aux_m_indices, aux_reverse_sorted)
@@ -827,8 +865,14 @@ def moe_sorting(
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     output_aux=False,
     output=None,
+    extra_zero_buf=None,
 ):
     asm_mode = AsmMoeMode(flat)
+    if extra_zero_buf is not None and (
+        _USE_FLYDSL_MOE_SORTING or output_aux or not asm_mode.requires_host_sort
+    ):
+        extra_zero_buf.zero_()
+        extra_zero_buf = None
     if (
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
@@ -876,6 +920,7 @@ def moe_sorting(
             accumulate=accumulate,
             output_aux=output_aux,
             output=output,
+            extra_zero_buf=extra_zero_buf,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -1488,6 +1533,14 @@ def fused_moe_(
         quant_dtype_a2=quant_dtype_a2,
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
+    )
+
+
+def _uses_cktile_splitk(metadata) -> bool:
+    stage1 = metadata.stage1
+    return (
+        getattr(stage1, "func", None) is cktile_moe_stage1
+        and int(stage1.keywords.get("split_k", 1)) > 1
     )
 
 
@@ -2144,6 +2197,19 @@ def _fused_moe_impl(
             # The reducer overwrites the final output, including masked rows.
             # An empty buffer also suppresses the sort's EP zero-fill.
             sort_output = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
+        splitk_workspace = None
+        if _uses_cktile_splitk(metadata):
+            # The sort zeroes this alongside moe_buf, so stage 1 skips its own
+            # torch.zeros. A separate tensor keeps the returned output compact.
+            splitk_workspace = torch.empty(
+                (M * topk, w1.shape[1]),
+                dtype=metadata.stage1.keywords.get("dtype", torch.bfloat16),
+                device=topk_ids.device,
+            )
+            _stage1_extra_args = {
+                **(_stage1_extra_args or {}),
+                "splitk_workspace": splitk_workspace,
+            }
         sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
@@ -2159,6 +2225,7 @@ def _fused_moe_impl(
             and asm_mode is not AsmMoeMode.POST_REDUCE,
             flat=asm_mode,
             output=sort_output,
+            extra_zero_buf=splitk_workspace,
         )
         if need_local_topk_ids:
             (
@@ -6532,6 +6599,7 @@ def cktile_moe_stage1(
     dtype=torch.bfloat16,
     kernel_name="",
     post_activation_layout="auto",
+    splitk_workspace=None,
 ):
     token_num = hidden_states.shape[0]
     _, _n1, k1 = w1.shape
@@ -6554,7 +6622,14 @@ def cktile_moe_stage1(
     # Split-k reduces into a token-topk workspace and applies activation after
     # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
     workspace_rows = token_num * topk
-    if needs_post_activation:
+    if (
+        needs_post_activation
+        and splitk_workspace is not None
+        and tuple(splitk_workspace.shape) == (workspace_rows, w1.shape[1])
+        and splitk_workspace.dtype == dtype
+    ):
+        tmp_out = splitk_workspace
+    elif needs_post_activation:
         tmp_out = torch.zeros(
             (workspace_rows, w1.shape[1]), dtype=dtype, device=out.device
         )
