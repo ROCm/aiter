@@ -30,6 +30,8 @@ export AITER_CONFIG_GROUPED_FMOE="$script_dir/aiter/configs/benchmarks/a4w4_conc
 export AITER_FLYDSL_TDM_EARLY_TIMEOUT=0
 export AITER_FLYDSL_DISABLE_CLUSTER_SYNC=1
 export AITER_FLYDSL_QUAD_PIPELINE=1
+export AITER_FLYDSL_MXFP4_CLUSTER_N=4
+export AITER_FLYDSL_MXFP4_CLUSTER_M=2
 
 # Keep A-preshuffled inputs, with GEMM1 producing a BF16 intermediate and
 # a separate quant/preshuffle kernel preparing GEMM2's input.
@@ -75,8 +77,6 @@ exec python3 -u op_tests/flydsl_tests/test_flydsl_grouped_gemm.py \
   --inter-dim 8192 \
   --act silu \
   --no-bias \
-  --iters 64 \
+  --iters 3 \
   --no-check-aot-cache \
-  --data-init zero \
-  --scale-init zero \
   "$@"

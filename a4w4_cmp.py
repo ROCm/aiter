@@ -18,6 +18,9 @@ for _k, _v in {
     "AITER_FLYDSL_DS_FIRST_N": "8",
     "AITER_FLYDSL_EXPLICIT_VGPR_PARTITION": "1",
     "AITER_FLYDSL_LDS_WAR_ORDER": "1",
+    "AITER_FLYDSL_LDS_WAR_ORDER": "1",
+    "AITER_FLYDSL_MXFP4_CLUSTER_N": "4",
+    "AITER_FLYDSL_MXFP4_CLUSTER_M": "2",
 }.items():
     os.environ.setdefault(_k, _v)
 
@@ -41,7 +44,7 @@ parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 parser.add_argument("M", type=int)
 parser.add_argument("N", type=int)
 parser.add_argument("K", type=int)
-parser.add_argument("--order", default="tdm,compute,asm", help="comma list of compute,asm,tdm")
+parser.add_argument("--order", default="asm,tdm,compute", help="comma list of compute,asm,tdm")
 parser.add_argument("--idle", type=float, default=2.0, help="seconds idle before each kernel")
 parser.add_argument(
     "--init",
@@ -75,7 +78,7 @@ fns = {
     "compute": lambda: run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
         xq.view(torch.uint8), wq.view(torch.uint8), xs, ws, out_c, COMPUTE
     ),
-    "asm": lambda: gemm_mxfp4_asm(xq, wq, xs, ws, dtype=dtype, a_preshuffle=False),
+    "asm": lambda: gemm_mxfp4_asm(xq, wq, xs, ws, dtype=dtype, a_preshuffle=True),
     "tdm": lambda: gemm_a4w4_tdm(xq_t, xs_t, wq, ws_t, dtype=dtype),
 }
 ref = fns["asm"]().clone()
