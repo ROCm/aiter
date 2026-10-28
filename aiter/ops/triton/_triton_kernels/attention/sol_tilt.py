@@ -6,6 +6,9 @@ Triton kernels for the Sol-Attn Jensen cap and pooled value tilt (PoC).
 
 Each runs one program per (KV block, head, batch) or (Q tile, head, batch), so the cap and the
 factors cost one pass over Q's bytes, one over K and V, and no per-block host work.
+
+Float arguments go through tl.cast to fp32 first: an eager launch passes them as fp32, but
+torch.compile can pass fp64 scalars, and Python floats while it checks which tensors a kernel writes.
 """
 
 import triton
@@ -40,6 +43,7 @@ def _sol_q_tile_absmax_kernel(
     HAS_SCALE dequantizes by an E8M0 byte per 32 dims first; ROTATE takes |q R| for R = rot_gain
     times the +-1 matrix at rot_ptr instead of |q|.
     """
+    rot_gain = tl.cast(rot_gain, tl.float32)
     t = tl.program_id(0)
     h = tl.program_id(1)
     b = tl.program_id(2)
@@ -137,6 +141,8 @@ def _sol_jensen_cap_kernel(
     applies 2^floor(log2 gain) to those bytes instead of scaling var, which stays as it is, and
     stores that power of two as the gain.
     """
+    per_nat = tl.cast(per_nat, tl.float32)
+    log_kv_tile = tl.cast(log_kv_tile, tl.float32)
     n = tl.program_id(0)
     h = tl.program_id(1)
     b = tl.program_id(2)
@@ -328,6 +334,11 @@ def _sol_tilt_shift_kernel(
     b_scale = qd kd vd b_per_scale. shift_ptr gets both as signed bytes (s low), clamped to
     [-128, 127]; unit_ptr gets fmax / a_max and b_scale / b_unit, b_unit = vd w_max 2^vshift.
     """
+    score_unit = tl.cast(score_unit, tl.float32)
+    b_per_scale = tl.cast(b_per_scale, tl.float32)
+    w_max_limit = tl.cast(w_max_limit, tl.float32)
+    fmax = tl.cast(fmax, tl.float32)
+    b_headroom = tl.cast(b_headroom, tl.float32)
     pairs = tl.arange(0, BLOCK)
     a_max = tl.zeros([BLOCK], dtype=tl.float32)
     b_max = tl.zeros([BLOCK], dtype=tl.float32)
@@ -377,6 +388,10 @@ def _sol_tilt_unit_kernel(
     update is P score B u3: u2 = 1 / (q_multiplier qd kd u0), u3 = b_scale / (vd u1), b_scale =
     qd kd vd b_per_scale. Writes (u0, u1, u2, u3) to unit_ptr.
     """
+    q_multiplier = tl.cast(q_multiplier, tl.float32)
+    b_per_scale = tl.cast(b_per_scale, tl.float32)
+    a_fmax = tl.cast(a_fmax, tl.float32)
+    b_fmax = tl.cast(b_fmax, tl.float32)
     pairs = tl.arange(0, BLOCK)
     a_max = tl.zeros([BLOCK], dtype=tl.float32)
     b_max = tl.zeros([BLOCK], dtype=tl.float32)
@@ -414,6 +429,7 @@ def _sol_tilt_valu_kernel(
     m = u3 2^-vshift in (w_max / 2, w_max]. out_ptr gets vshift as a signed byte in bits 8..15 of
     dword 0, sigma's bits in dword 1, then the first STRIDES of stride0, stride1 and stride2.
     """
+    w_max = tl.cast(w_max, tl.float32)
     if STRIDES > 0:
         tl.store(out_ptr + 2, stride0)
     if STRIDES > 1:
@@ -439,6 +455,7 @@ def _sol_tilt_scaled_kernel(unit_ptr, scale_stride, out_ptr, w_max):
     w_max]. out_ptr gets vshift as a signed byte in bits 8..15 of dword 0, sigma's bits in dword
     1, and the K-scale plane stride in dword 2. The score side has no shift of its own.
     """
+    w_max = tl.cast(w_max, tl.float32)
     u2 = tl.load(unit_ptr + 2)
     u3 = tl.maximum(tl.load(unit_ptr + 3), 1e-30)
     vshift = tl.minimum(tl.maximum(tl.ceil(tl.log2(u3 / w_max)), -127.0), 127.0)
@@ -506,3 +523,19 @@ def _sol_tilt_pack_kernel(
             fa = libdevice.nearbyint(fa)
         tl.store(ext_k_ptr + (r + 1) * stride_er + ext, fa.to(ext_k_ptr.dtype.element_ty))
         tl.store(ext_v_ptr + (r + 1) * stride_vr + ext_v, (fb * b_unit).to(ext_v_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _sol_tilt_stack_kernel(plane0_ptr, planes_ptr, out_ptr, size, width, BLOCK: tl.constexpr):
+    """Row p of out_ptr's (1 + rank, width) gets plane0 for p = 0, else plane p - 1 of planes.
+
+    Each plane holds `size` elements of out_ptr's dtype; the rest of the row is left as it is.
+    """
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    p = tl.program_id(1)
+    live = i < size
+    if p == 0:
+        x = tl.load(plane0_ptr + i, mask=live)
+    else:
+        x = tl.load(planes_ptr + (p - 1).to(tl.int64) * size + i, mask=live)
+    tl.store(out_ptr + p.to(tl.int64) * width + i, x, mask=live)

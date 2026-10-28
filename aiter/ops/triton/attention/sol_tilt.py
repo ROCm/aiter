@@ -27,6 +27,7 @@ from aiter.ops.triton._triton_kernels.attention.sol_tilt import (
     _sol_tilt_pack_kernel,
     _sol_tilt_shift_kernel,
     _sol_tilt_scaled_kernel,
+    _sol_tilt_stack_kernel,
     _sol_tilt_unit_kernel,
     _sol_tilt_valu_kernel,
 )
@@ -427,18 +428,21 @@ def _stack_planes(
     """plane0 and planes as one contiguous (1 + rank)-plane allocation: (plane 0 view, stride in bytes).
 
     With row_tile > 1 each plane is followed by zeroed rows (dim 1, BSHD) taking the last batch's
-    up to a multiple of it; plane 0 keeps the contiguous strides torch.cat would give it.
+    up to a multiple of it; plane 0's strides are contiguous either way.
+
+    A kernel writes every plane: the Sol kernel reaches planes 1..rank only through the byte
+    stride, so under torch.compile torch ops building them would be cut down to plane 0.
     """
-    if row_tile == 1:
-        ext = torch.cat([plane0.unsqueeze(0), planes.to(plane0.dtype)])
-        return ext[0], ext.stride(0) * ext.element_size()
-    rows = plane0.shape[1]
-    row = plane0[0, 0].numel()
+    plane0 = plane0.contiguous()
     size = plane0.numel()
-    ext = plane0.new_zeros(1 + planes.shape[0], size + (-rows % row_tile) * row)
-    ext[0, :size].view(plane0.shape).copy_(plane0)
-    ext[1:, :size].view(planes.shape).copy_(planes)
-    return ext[0, :size].view(plane0.shape), ext.stride(0) * ext.element_size()
+    pad = (-plane0.shape[1] % row_tile) * plane0[0, 0].numel()
+    shape = (1 + planes.shape[0], size + pad)
+    ext = plane0.new_zeros(shape) if pad else plane0.new_empty(shape)
+    block = 1024
+    _sol_tilt_stack_kernel[(triton.cdiv(size, block), shape[0])](
+        plane0, planes.to(plane0.dtype).contiguous(), ext, size, shape[1], BLOCK=block,
+    )
+    return ext.as_strided(plane0.shape, plane0.stride()), ext.stride(0) * ext.element_size()
 
 
 def _plane0_of_packed(
