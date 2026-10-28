@@ -25,13 +25,14 @@ different kernels, the M between them are bisected down to every M at which
 the runtime switches kernels: a row can switch more than once in its bucket
 (the gfx1250 stage-1 quant's K split steps through several values).
 
-A caller behind an expert-parallel dispatch also passes an expert mask, and
-the launches it masks (the stage-2 reduction, the gfx1250 route) compile for
-the mask's length: the global expert count, which no tuned row records. Such
-callers are described by EP deployment profiles (``moe_ep_profiles.csv``):
-what one rank passes ``fused_moe`` (its local expert count, routing columns
-and mask length) and the largest M it passes. A profile is replayed with the
-mask at every bucket's smallest and largest M up to that M, bisected as
+A caller behind an expert-parallel dispatch also passes an expert mask, which
+brings in launches no tuned row reaches: the gfx950 stage-2 reduction, compiled
+for the mask's length, and the gfx1250 route. The mask's length follows from
+the deployment (global experts, EPLB replicas, fused shared experts), which no
+tuned row records, so these callers come from the ``fused_moe`` deployments of
+``moe_deployments.json`` (see :mod:`aiter.aot.flydsl.deployments`): what one
+rank passes ``fused_moe`` and the largest M it passes. Each is replayed with
+the mask at every bucket's smallest and largest M up to that M, bisected as
 above, and reads the tuned tables serving reads; it needs no tuned row.
 
 A row is compiled for the arch its ``gfx`` column names. With ``GPU_ARCHS``
@@ -54,8 +55,8 @@ Usage:
     # Custom CSV file(s)
     python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
 
-    # Custom EP deployment profile table(s) only
-    python -m aiter.aot.flydsl.moe --ep-profile /path/to/profiles.csv
+    # Custom deployment file(s) only
+    python -m aiter.aot.flydsl.moe --deployments /path/to/deployments.json
 
     # Verify a cache instead: fail on any kernel the replay would compile
     python -m aiter.aot.flydsl.moe --check
@@ -88,6 +89,8 @@ from aiter.aot.flydsl.common import (
     replay_env,
     run_jobs_parallel,
 )
+from aiter.aot.flydsl.deployments import DEFAULT_DEPLOYMENTS, FusedMoECall
+from aiter.aot.flydsl.deployments import load as load_deployments
 from aiter.jit.core import AITER_CONFIGS
 from aiter_worker_limits import adopt_legacy_max_jobs
 
@@ -96,9 +99,6 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
     AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE,
-]
-DEFAULT_EP_PROFILES = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_ep_profiles.csv")
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
@@ -128,21 +128,12 @@ _ROW_FIELDS = (
 )
 # gate_mode is overwritten by each job's variant.
 _ROW_KEY = ("csv_path", *(f for f in _ROW_FIELDS if f != "gate_mode"))
-_EP_PROFILE_COLUMNS = (
-    "gfx",
-    "cu_num",
-    "model_dim",
-    "inter_dim",
-    "expert",
-    "topk",
-    "expert_mask_size",
-    "act_type",
-    "dtype",
-    "q_dtype_a",
-    "q_dtype_w",
-    "q_type",
-    "max_token",
-)
+# (q_dtype_a, q_dtype_w) of the deployments' quant recipes; gfx950 and gfx1250,
+# the archs fused_moe deployments target, take OCP FP8.
+_DEPLOYMENT_DTYPES = {
+    "a8w4": ("torch.float8_e4m3fn", "torch.float4_e2m1fn_x2"),
+    "a4w4": ("torch.float4_e2m1fn_x2", "torch.float4_e2m1fn_x2"),
+}
 # get_padded_M: M below the first tier takes the next power of two, larger M
 # the highest tier not above it.
 _PADDED_M_TIERS = (32768, 131072)
@@ -173,7 +164,7 @@ def job_arch(job: dict) -> str:
 
 def _is_grouped(row: dict) -> bool:
     """Served by FlyDSL's grouped GEMM: a row of the gfx1250 grouped table, or
-    a gfx1250 EP profile."""
+    a gfx1250 EP deployment."""
     if row.get("expert_mask_size"):
         return job_arch(row) == "gfx1250"
     return (row.get("kernelName1") or "").strip().startswith("grouped_gemm")
@@ -319,39 +310,37 @@ def _buckets(max_token: int) -> list[tuple[int, int, int]]:
     return result
 
 
-def read_ep_profiles(csv_path: str) -> list[dict]:
-    """The rows of an EP deployment profile table. Each describes what one
-    rank passes ``fused_moe``: ``expert`` local experts (``w1.shape[0]``),
-    ``topk`` routing columns (``topk_ids.shape[1]``), an expert mask of
-    ``expert_mask_size`` entries, and at most ``max_token`` rows of M."""
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        missing = [c for c in _EP_PROFILE_COLUMNS if c not in (reader.fieldnames or ())]
-        if missing:
-            raise ValueError(f"{csv_path}: EP profile table lacks {missing}")
-        profiles = [
-            {key: (value or "").strip() for key, value in row.items()} for row in reader
-        ]
-    for line, profile in enumerate(profiles, start=2):
-        # The mask holds every global expert, the fused shared ones and a sentinel.
-        if not 0 < _int(profile["expert"]) < _int(profile["expert_mask_size"]):
-            raise ValueError(
-                f"{csv_path}:{line}: expert_mask_size must exceed the local expert count"
-            )
-        if _int(profile["max_token"]) < 1:
-            raise ValueError(f"{csv_path}:{line}: max_token must be positive")
-    return profiles
+def deployment_row(call: FusedMoECall) -> dict:
+    """What one rank of an EP deployment passes ``fused_moe``, in the columns
+    of a tuned row."""
+    q_dtype_a, q_dtype_w = _DEPLOYMENT_DTYPES[call.quant]
+    row = dict.fromkeys(_ROW_FIELDS, "")
+    row.update(
+        gfx=call.gfx,
+        cu_num=str(call.cu_num),
+        model_dim=str(call.model.model_dim),
+        inter_dim=str(call.model.inter_dim),
+        expert=str(call.local_experts),
+        topk=str(call.topk_cols),
+        expert_mask_size=str(call.mask_size),
+        act_type=f"ActivationType.{call.model.activation}",
+        dtype="torch.bfloat16",
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type="QuantType.per_1x32",
+        use_g1u1="1",
+        doweight_stage1="0",
+    )
+    return row
 
 
-def parse_ep_profiles(csv_path: str, edges: bool = True) -> list[dict]:
-    """One job per (profile, tuning bucket, replayed M, caller-side variant)."""
-    csv_path = os.path.abspath(csv_path)
+def parse_deployments(paths: Sequence[str], edges: bool = True) -> list[dict]:
+    """One job per (``fused_moe`` deployment, tuning bucket, replayed M,
+    caller-side variant) of the deployment files ``paths``."""
     jobs = []
-    for profile in read_ep_profiles(csv_path):
-        shape = {field: profile.get(field, "") for field in _ROW_FIELDS}
-        shape["use_g1u1"] = shape["use_g1u1"] or "1"
-        label = f"EP {profile.get('model') or 'profile'}"
-        for bucket, low, high in _buckets(_int(profile["max_token"])):
+    for call in load_deployments(paths).fused_moe:
+        shape = deployment_row(call)
+        for bucket, low, high in _buckets(call.max_tokens):
             row = {**shape, "token": str(bucket)}
             points = [low, high] if edges and low < high else [high]
             for index, variant in enumerate(_variants(row)):
@@ -360,22 +349,20 @@ def parse_ep_profiles(csv_path: str, edges: bool = True) -> list[dict]:
                         {
                             **row,
                             **variant,
-                            "csv_path": csv_path,
+                            "csv_path": call.path,
                             "m": m,
                             "primary": index == 0,
-                            "kernel_name": label,
+                            "kernel_name": call.id,
                         }
                     )
     return dedupe_jobs(jobs)
 
 
-def _collect_jobs(csv_paths, ep_profiles, edges: bool) -> list[dict]:
-    return dedupe_jobs(
-        collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
-        + collect_aot_jobs(
-            ep_profiles, functools.partial(parse_ep_profiles, edges=edges)
-        )
-    )
+def _collect_jobs(csv_paths, deployments, edges: bool) -> list[dict]:
+    jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
+    if deployments:
+        jobs += parse_deployments(deployments, edges)
+    return dedupe_jobs(jobs)
 
 
 def _dtype(name: str):
@@ -568,7 +555,7 @@ def _without_device_queries():
 @contextmanager
 def _runtime_reads(job: dict):
     """Point the runtime's tuned-config lookup at the row's own table. An EP
-    profile reads the tables serving reads."""
+    deployment reads the tables serving reads."""
     if job["expert_mask_size"]:
         env = {}
     elif _is_grouped(job):
@@ -799,15 +786,15 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
 def run(
     csv_paths: Sequence[str],
     *,
-    ep_profiles: Sequence[str] = (),
+    deployments: Sequence[str] = (),
     edges: bool = True,
     check: bool = False,
 ) -> int:
-    """Replay every FlyDSL row of ``csv_paths`` and every EP profile of
-    ``ep_profiles`` whose arch ``GPU_ARCHS`` names (all of them when it names
-    none), one process per arch. Returns the number of archs whose replay
-    failed."""
-    jobs = _collect_jobs(csv_paths, ep_profiles, edges)
+    """Replay every FlyDSL row of ``csv_paths`` and every ``fused_moe``
+    deployment of the files ``deployments`` whose arch ``GPU_ARCHS`` names (all
+    of them when it names none), one process per arch. Returns the number of
+    archs whose replay failed."""
+    jobs = _collect_jobs(csv_paths, deployments, edges)
     targets = aot_target_archs()
     skipped = Counter(
         job_arch(job) for job in jobs if targets and job_arch(job) not in targets
@@ -817,13 +804,9 @@ def run(
     rows = {
         tuple(job[f] for f in _ROW_KEY) for job in jobs if not job["expert_mask_size"]
     }
-    profiles = {
-        tuple(job[f] for f in _ROW_KEY if f != "token")
-        for job in jobs
-        if job["expert_mask_size"]
-    }
+    calls = {job["kernel_name"] for job in jobs if job["expert_mask_size"]}
     print(
-        f"[aiter] FlyDSL MoE replay: {len(rows)} rows, {len(profiles)} EP profiles, "
+        f"[aiter] FlyDSL MoE replay: {len(rows)} rows, {len(calls)} EP deployments, "
         f"{len(jobs)} jobs, archs {', '.join(archs) or '-'}",
         flush=True,
     )
@@ -855,8 +838,8 @@ def run(
         command = [sys.executable, "-m", "aiter.aot.flydsl.moe", "--arch", arch]
         if csv_paths:
             command += ["--csv", *csv_paths]
-        if ep_profiles:
-            command += ["--ep-profile", *ep_profiles]
+        if deployments:
+            command += ["--deployments", *deployments]
         if not edges:
             command.append("--row-tokens-only")
         if check:
@@ -869,7 +852,7 @@ def run(
 def main():
     parser = argparse.ArgumentParser(
         description="AOT pre-compile the FlyDSL kernels of tuned fused-MoE configs "
-        "and EP deployment profiles",
+        "and EP deployments",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
@@ -879,18 +862,19 @@ def main():
         help="Path(s) to tuned CSV config file(s); defaults come from AITER_CONFIGS",
     )
     parser.add_argument(
-        "--ep-profile",
+        "--deployments",
         type=str,
         nargs="+",
-        help="Path(s) to EP deployment profile table(s); default moe_ep_profiles.csv.\n"
-        "Without --csv and --ep-profile both defaults are replayed, with one of\n"
-        "them only what it names.",
+        help="Path(s) to MoE deployment file(s), whose fused_moe deployments are\n"
+        "replayed; default moe_deployments.json. Without --csv and\n"
+        "--deployments both defaults are replayed, with one of them only\n"
+        "what it names.",
     )
     parser.add_argument(
         "--row-tokens-only",
         action="store_true",
         help="replay each row only at its tuned token count, and each EP\n"
-        "profile at each bucket's largest M",
+        "deployment at each bucket's largest M",
     )
     parser.add_argument(
         "--check",
@@ -900,20 +884,20 @@ def main():
     parser.add_argument("--arch", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    if args.csv is None and args.ep_profile is None:
-        args.csv, args.ep_profile = DEFAULT_CSVS, DEFAULT_EP_PROFILES
+    if args.csv is None and args.deployments is None:
+        args.csv, args.deployments = DEFAULT_CSVS, DEFAULT_DEPLOYMENTS
     csv_paths = [os.path.abspath(p) for p in args.csv or ()]
-    ep_profiles = [os.path.abspath(p) for p in args.ep_profile or ()]
-    for csv_path in csv_paths + ep_profiles:
-        if not os.path.isfile(csv_path):
-            print(f"Error: CSV file not found: {csv_path}")
+    deployments = [os.path.abspath(p) for p in args.deployments or ()]
+    for path in csv_paths + deployments:
+        if not os.path.isfile(path):
+            print(f"Error: file not found: {path}")
             sys.exit(1)
     if args.check:
         os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
     edges = not args.row_tokens_only
 
     if args.arch:
-        jobs = _collect_jobs(csv_paths, ep_profiles, edges)
+        jobs = _collect_jobs(csv_paths, deployments, edges)
         jobs = [job for job in jobs if job_arch(job) == args.arch]
         sys.exit(1 if jobs and _replay_arch(jobs, args.arch) else 0)
 
@@ -925,14 +909,14 @@ def main():
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")
-    for profile_path in ep_profiles:
-        print(f"  EP profiles:  {profile_path}")
+    for path in deployments:
+        print(f"  Deployments:  {path}")
     print(f"  Cache dir:    {cache_dir}")
     print("=" * 72, flush=True)
 
     total_t0 = time.time()
     failed_archs = run(
-        csv_paths, ep_profiles=ep_profiles, edges=edges, check=args.check
+        csv_paths, deployments=deployments, edges=edges, check=args.check
     )
     print(f"\n  Total time:   {time.time() - total_t0:.1f}s")
     if failed_archs:

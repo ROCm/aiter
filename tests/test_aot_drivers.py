@@ -137,7 +137,7 @@ class PaGluonProcessLimitTest(unittest.TestCase):
         self.assertEqual(worker_count.call_args_list, [call(3), call(3)])
 
 
-class FlyDSLMoeEpProfileTest(unittest.TestCase):
+class FlyDSLMoeDeploymentTest(unittest.TestCase):
     def test_buckets_follow_get_padded_m(self):
         from aiter.aot.flydsl import moe
         from aiter.fused_moe import get_padded_M
@@ -152,33 +152,121 @@ class FlyDSLMoeEpProfileTest(unittest.TestCase):
                     self.assertEqual(get_padded_M(low), bucket)
                     self.assertEqual(get_padded_M(high), bucket)
 
-    def test_default_profiles_replay_masked_callers(self):
-        from aiter.aot.flydsl import moe
+    def _load_edited(self, edit):
+        """Load a copy of the default deployment file after ``edit``."""
+        import json
+        import tempfile
 
-        profiles = moe.read_ep_profiles(moe.DEFAULT_EP_PROFILES[0])
-        jobs = moe.parse_ep_profiles(moe.DEFAULT_EP_PROFILES[0])
-        self.assertTrue(profiles)
+        from aiter.aot.flydsl import deployments
+
+        with open(deployments.DEFAULT_DEPLOYMENTS[0]) as f:
+            document = json.load(f)
+        edit(document)
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(document, f)
+            f.flush()
+            return deployments.load([f.name])
+
+    def test_default_deployments_derive_rank_calls(self):
+        from aiter.aot.flydsl import deployments
+
+        by_id = {d.id: d for d in deployments.load().fused_moe}
+        # (local experts, routing columns, mask length) of one rank's fused_moe.
+        expected = {
+            "deepseek-v4-pro/gfx950/a8w4/ep8-r32": (52, 6, 417),
+            "glm-5.3-flash/gfx950/a4w4/ep8-fused": (37, 10, 290),
+            "glm-5.3-flash/gfx950/a4w4/ep4": (72, 8, 289),
+            "kimi-k3/gfx1250/a4w4/ep16": (56, 16, 897),
+        }
+        for name, shape in expected.items():
+            with self.subTest(name):
+                deployment = by_id[name]
+                self.assertEqual(
+                    (
+                        deployment.local_experts,
+                        deployment.topk_cols,
+                        deployment.mask_size,
+                    ),
+                    shape,
+                )
+
+    def test_default_deployments_replay_masked_callers(self):
+        from aiter.aot.flydsl import deployments, moe
+
+        fused_moe = deployments.load().fused_moe
+        jobs = moe.parse_deployments(deployments.DEFAULT_DEPLOYMENTS)
+        self.assertTrue(fused_moe)
         self.assertTrue(all(job["expert_mask_size"] for job in jobs))
         callers = {
             (job["kernel_name"], job["expert"], job["local_tokens"]) for job in jobs
         }
-        for profile in profiles:
+        for deployment in fused_moe:
             for local_tokens in (False, True):
-                key = (f"EP {profile['model']}", profile["expert"], local_tokens)
+                key = (deployment.id, str(deployment.local_experts), local_tokens)
                 self.assertIn(key, callers)
 
-    def test_profile_mask_must_exceed_local_experts(self):
-        import tempfile
+    def test_default_mega_moe_jobs(self):
+        from aiter.aot.flydsl import mega_moe
 
-        from aiter.aot.flydsl import moe
+        jobs = mega_moe.deployment_jobs()
+        # DeepSeek-V4-Pro r0/r32/r64 and Kimi-K3, by two quants, three max
+        # tokens per rank and eight ranks.
+        self.assertEqual(len(jobs), 4 * 2 * 3 * 8)
+        self.assertEqual({job["experts_per_rank"] for job in jobs}, {48, 52, 56, 112})
+        for job in jobs:
+            situ = job["experts_per_rank"] == 112
+            activation = (
+                ("situv2", 4.0, 25.0, 0.0) if situ else ("silu", 1.0, 1.0, 10.0)
+            )
+            key = ("act", "situ_beta", "situ_linear_beta", "swiglu_limit")
+            self.assertEqual(tuple(job[k] for k in key), activation)
+        narrowed = mega_moe.deployment_jobs(mtprs=[8192], experts_per_ranks=[48])
+        self.assertEqual(len(narrowed), 2 * 8)
 
-        with open(moe.DEFAULT_EP_PROFILES[0]) as f:
-            header, row = f.readline(), f.readline().split(",")
-        row[header.split(",").index("expert_mask_size")] = row[
-            header.split(",").index("expert")
-        ]
-        with tempfile.NamedTemporaryFile("w", suffix=".csv") as f:
-            f.write(header + ",".join(row))
-            f.flush()
-            with self.assertRaisesRegex(ValueError, "expert_mask_size"):
-                moe.read_ep_profiles(f.name)
+    def test_own_file_names_default_models(self):
+        deployment = {
+            "model": "deepseek-v4-pro",
+            "gfx": "gfx950",
+            "cu_num": 256,
+            "quant": "a8w4",
+            "ep": 32,
+            "max_tokens": 1024,
+            "source": "test",
+        }
+
+        def edit(document):
+            document.clear()
+            document.update(schema_version=1, fused_moe=[deployment])
+
+        (loaded,) = self._load_edited(edit).fused_moe
+        self.assertEqual(loaded.id, "deepseek-v4-pro/gfx950/a8w4/ep32")
+        self.assertEqual((loaded.local_experts, loaded.mask_size), (12, 385))
+
+    def test_deployment_validation(self):
+        def unfusable(document):
+            model = dict(document["models"]["glm-5.3-flash"], shared_experts=0)
+            document["models"]["glm-no-shared"] = model
+            fused = next(
+                d for d in document["fused_moe"] if d.get("shared_expert_mode")
+            )
+            fused["model"] = "glm-no-shared"
+
+        cases = {
+            "unknown keys": lambda d: d["fused_moe"][0].update(redundant=[32]),
+            "do not split": lambda d: d["fused_moe"][1].update(
+                redundant_experts=[0, 36]
+            ),
+            "no shared experts to fuse": unfusable,
+            "unknown model": lambda d: d["fused_moe"][0].update(model="kimi-k4"),
+            "listed twice": lambda d: d["fused_moe"].append(dict(d["fused_moe"][0])),
+            "exactly for Situv2": lambda d: d["models"]["deepseek-v4-pro"].update(
+                situ_beta=4.0
+            ),
+            "missing keys": lambda d: d["mega_moe"][0].pop("max_tokens_per_rank"),
+            "differs from its other definition": lambda d: d["models"][
+                "kimi-k3"
+            ].update(top_k=8),
+        }
+        for message, edit in cases.items():
+            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                self._load_edited(edit)

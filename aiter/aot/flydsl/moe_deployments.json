@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "models": {
+    "deepseek-v4-pro": {
+      "name": "DeepSeek-V4-Pro",
+      "model_dim": 7168,
+      "inter_dim": 3072,
+      "routed_experts": 384,
+      "top_k": 6,
+      "shared_experts": 1,
+      "activation": "Silu",
+      "swiglu_limit": 10.0,
+      "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro; ATOM recipes/DeepSeek-V4.md"
+    },
+    "kimi-k3": {
+      "name": "Kimi-K3",
+      "model_dim": 3584,
+      "inter_dim": 3072,
+      "routed_experts": 896,
+      "top_k": 16,
+      "shared_experts": 1,
+      "activation": "Situv2",
+      "situ_beta": 4.0,
+      "situ_linear_beta": 25.0,
+      "source": "ATOM recipes/Kimi-K3.md; SGLang kimi_k3.py (SiTUv2 betas)",
+      "note": "SiTUv2 (hidden_act situ) saturates on its own, so no swiglu_limit. The shared expert count is unconfirmed; no deployment fuses it yet."
+    },
+    "glm-5.3-flash": {
+      "name": "GLM-5.3-Flash",
+      "model_dim": 4096,
+      "inter_dim": 2048,
+      "routed_experts": 288,
+      "top_k": 8,
+      "shared_experts": 1,
+      "activation": "Silu",
+      "source": "ROCm/aiter#6435"
+    }
+  },
+  "fused_moe": [
+    {
+      "model": "kimi-k3",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "quant": "a8w4",
+      "ep": 8,
+      "max_tokens": 32768,
+      "source": "model_configs/kimik3_a8w4_tuned_fmoe.csv (expert 112, topk 16)"
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "quant": "a8w4",
+      "ep": 8,
+      "redundant_experts": [0, 32, 64],
+      "max_tokens": 131072,
+      "source": "ROCm/aiter#6928; ATOM recipes/DeepSeek-V4.md (EPLB)"
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "quant": "a8w4",
+      "ep": 16,
+      "max_tokens": 65536,
+      "source": "model_configs/dsv4_fp8fp4_tuned_fmoe.csv (expert 24, topk 6)"
+    },
+    {
+      "model": "glm-5.3-flash",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "quant": "a4w4",
+      "ep": [8, 4, 2],
+      "shared_expert_mode": "fused",
+      "max_tokens": 16384,
+      "source": "ROCm/aiter#6435"
+    },
+    {
+      "model": "glm-5.3-flash",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "quant": "a4w4",
+      "ep": 4,
+      "max_tokens": 16384,
+      "source": "ROCm/aiter#6435",
+      "note": "vLLM, shared expert not fused"
+    },
+    {
+      "model": "kimi-k3",
+      "gfx": "gfx1250",
+      "cu_num": 256,
+      "quant": "a4w4",
+      "ep": [8, 16],
+      "max_tokens": 131072,
+      "source": "ROCm/aiter#6438"
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "gfx": "gfx1250",
+      "cu_num": 256,
+      "quant": ["a4w4", "a8w4"],
+      "ep": 4,
+      "max_tokens": 32768,
+      "source": "ROCm/aiter#5176"
+    }
+  ],
+  "mega_moe": [
+    {
+      "model": "deepseek-v4-pro",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "quant": ["a8w4", "a4w4"],
+      "ep": 8,
+      "redundant_experts": [0, 32, 64],
+      "max_tokens_per_rank": [8192, 16384, 32768],
+      "source": "MegaMoE profiles the service ships",
+      "note": "r0, r32 and r64 all ship, so an EPLB change of the physical expert count never compiles online"
+    },
+    {
+      "model": "kimi-k3",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "quant": ["a8w4", "a4w4"],
+      "ep": 8,
+      "max_tokens_per_rank": [8192, 16384, 32768],
+      "source": "MegaMoE profiles the service ships"
+    }
+  ]
+}

@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import fnmatch
 import os
 from contextlib import nullcontext
 
@@ -11,7 +12,8 @@ import torch
 import aiter
 from aiter import ActivationType, QuantType, dtypes, get_gfx, pertoken_quant
 from aiter.aot.flydsl.common import run_only_env
-from aiter.aot.flydsl.moe import DEFAULT_EP_PROFILES, read_ep_profiles
+from aiter.aot.flydsl.deployments import DEFAULT_DEPLOYMENTS
+from aiter.aot.flydsl.deployments import load as load_deployments
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -576,16 +578,17 @@ def test_fmoe_ep_mxfp4(
     fake_ep_rank=0,
     const_init=None,
     activation=ActivationType.Silu,
+    situ_betas=(DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA),
     check_aot=False,
-    profile=None,
+    deployment=None,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}; activation Silu or Situv2
-    (with the Kimi-K3 betas).
+    (with situ_betas, the Kimi-K3 betas by default).
 
     check_aot runs fused_moe in FlyDSL run-only mode, so a kernel missing from
     the AOT cache fails the case, and holds the result to logits_diff < 0.01.
-    profile names the EP deployment profile the case reproduces.
+    deployment names the EP deployment the case reproduces.
 
     ep_mode selects how tokens/routing reach fused_moe:
       * "real" (default): simulate MORI dispatch. `token` is the GLOBAL token count;
@@ -844,7 +847,7 @@ def test_fmoe_ep_mxfp4(
 
     beta = linear_beta = None
     if activation == ActivationType.Situv2:
-        beta, linear_beta = DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
+        beta, linear_beta = situ_betas
     ref = _ep_reference(
         quant_label,
         ref_input,
@@ -922,8 +925,8 @@ def test_fmoe_ep_mxfp4(
         f"(recv={total_recv}, trim_M={trim_M}) model_dim={model_dim} "
         f"inter_dim={inter_dim} E={E} topk={topk} shared_E={shared_E}"
     )
-    if profile:
-        _msg = f"[{profile}] {_msg}"
+    if deployment:
+        _msg = f"[{deployment}] {_msg}"
     # Optional per-kernel (gemm1/gemm2) timing, gated by AITER_EP_KERNEL_BENCH=1.
     # Mirrors the TP test's --scenario kernel: one eager fused_moe call with the
     # grouped kernel_bench hook set captures the gemm1/gemm2 launch callables,
@@ -979,9 +982,9 @@ def test_fmoe_ep_mxfp4(
     except RuntimeError as error:
         if check_aot and "FLYDSL_RUNTIME_RUN_ONLY" in str(error):
             raise RuntimeError(
-                f"{_msg}: FlyDSL AOT cache miss. Build the EP profiles into the "
-                "same FLYDSL_RUNTIME_CACHE_DIR first: python -m "
-                "aiter.aot.flydsl.moe --ep-profile <profile csv>"
+                f"{_msg}: FlyDSL AOT cache miss. Build the EP deployments into "
+                "the same FLYDSL_RUNTIME_CACHE_DIR first: python -m "
+                "aiter.aot.flydsl.moe --deployments <deployments json>"
             ) from error
         raise
 
@@ -1014,7 +1017,7 @@ def test_fmoe_ep_mxfp4(
 
     summary_table.append(
         {
-            "profile": profile or "-",
+            "deployment": deployment or "-",
             "aot_check": check_aot,
             "quant": quant_label,
             "act": activation.name,
@@ -1041,68 +1044,49 @@ def test_fmoe_ep_mxfp4(
     )
 
 
-# Activation dtype of the MXFP4 profiles test_fmoe_ep_mxfp4 can build.
-_PROFILE_QUANTS = {"float8_e4m3fn": "a8w4_mxfp4", "float4_e2m1fn_x2": "a4w4_mxfp4"}
+# test_fmoe_ep_mxfp4's quant label of each deployment quant recipe.
+_DEPLOYMENT_QUANTS = {"a8w4": "a8w4_mxfp4", "a4w4": "a4w4_mxfp4"}
 
 
-def _name(value):
-    """``QuantType.per_1x32`` -> ``per_1x32``, ``torch.bfloat16`` -> ``bfloat16``."""
-    return str(value or "").strip().split(".")[-1]
+def _deployment_ep_args(call, ep_mode):
+    """test_fmoe_ep_mxfp4 arguments whose fused_moe call is the deployment's:
+    its local expert count, routing columns and mask length. Real mode routes
+    topk columns plus shared_E + 1 shared or masked ones, fake mode topk local
+    ones."""
+    shared_E = call.fused_shared
+    if ep_mode == "real":
+        topk, routable = call.topk_cols - shared_E - 1, call.physical_experts
+    else:
+        topk, routable = call.topk_cols, call.physical_experts // call.ep
+    if not 1 <= topk <= routable:
+        raise ValueError(
+            f"{call.id}: no {ep_mode}-mode EP call has {call.topk_cols} routing columns"
+        )
+    return {
+        "E": call.physical_experts,
+        "topk": topk,
+        "shared_E": shared_E,
+        "ep": call.ep,
+    }
 
 
-def _profile_ep_args(profile, ep_mode):
-    """test_fmoe_ep_mxfp4 arguments whose fused_moe call has the profile's
-    local expert count, routing columns and mask length. The mask holds E
-    routed experts, shared_E fused shared ones and a sentinel; a rank holds
-    E // ep routed experts plus the shared ones. Real mode routes topk columns
-    plus shared_E + 1 shared or masked ones, fake mode topk local ones."""
-    local, columns, mask = (
-        int(profile[key]) for key in ("expert", "topk", "expert_mask_size")
-    )
-    for shared_E in range(local):
-        E = mask - 1 - shared_E
-        if E % (local - shared_E):
-            continue
-        topk = columns - shared_E - 1 if ep_mode == "real" else columns
-        if 1 <= topk <= (E if ep_mode == "real" else local - shared_E):
-            return {
-                "E": E,
-                "topk": topk,
-                "shared_E": shared_E,
-                "ep": E // (local - shared_E),
-            }
-    raise ValueError(
-        f"no {ep_mode}-mode EP layout has {local} local experts, "
-        f"{columns} routing columns and a {mask}-entry expert mask"
-    )
-
-
-def _aot_ep_profiles(paths):
-    """(profile, quant label, activation) of each EP deployment profile in
-    ``paths`` that runs on this GPU and that test_fmoe_ep_mxfp4 can build."""
+def _aot_ep_deployments(paths, patterns):
+    """(deployment, quant label, activation) of each fused_moe deployment of
+    ``paths`` that runs on this GPU, whose id matches one of ``patterns`` (any
+    id without patterns) and that test_fmoe_ep_mxfp4 can build."""
     gfx, cu_num = get_gfx(), get_cu_num()
-    profiles = []
-    for path in paths:
-        for profile in read_ep_profiles(path):
-            if profile["gfx"] != gfx or int(profile["cu_num"]) != cu_num:
-                continue
-            quant = _PROFILE_QUANTS.get(_name(profile["q_dtype_a"]))
-            act = _name(profile["act_type"])
-            if (
-                quant is None
-                or _name(profile["q_type"]) != "per_1x32"
-                or _name(profile["q_dtype_w"]) != "float4_e2m1fn_x2"
-                or act not in ("Silu", "Situv2")
-                or (profile.get("use_g1u1") or "1") != "1"
-                or (profile.get("doweight_stage1") or "0") != "0"
-            ):
-                print(
-                    f"skip EP profile {profile.get('model')}: not an MXFP4 "
-                    "a8w4/a4w4 Silu/SiTUv2 g1u1 case"
-                )
-                continue
-            profiles.append((profile, quant, getattr(ActivationType, act)))
-    return profiles
+    found = []
+    for call in load_deployments(paths).fused_moe:
+        if call.gfx != gfx or call.cu_num != cu_num:
+            continue
+        if patterns and not any(fnmatch.fnmatch(call.id, p) for p in patterns):
+            continue
+        if call.model.activation not in ("Silu", "Situv2"):
+            print(f"skip EP deployment {call.id}: not a Silu or SiTUv2 model")
+            continue
+        activation = getattr(ActivationType, call.model.activation)
+        found.append((call, _DEPLOYMENT_QUANTS[call.quant], activation))
+    return found
 
 
 parser = argparse.ArgumentParser(
@@ -1130,7 +1114,7 @@ parser.add_argument(
     ],
     help="""Select test to run.
     e.g.: -t g1u1_int8quant
-          or -t aot_ep_profiles          (EP deployment profiles of the AOT build,
+          or -t aot_ep_profiles          (EP deployments of the AOT build,
                                           per_1x32 mxfp4, FlyDSL run-only: fails on
                                           any kernel missing from the AOT cache;
                                           gfx950/gfx1250)
@@ -1247,15 +1231,24 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--ep-profile",
+    "--deployments",
     type=str,
-    nargs="*",
-    default=DEFAULT_EP_PROFILES,
-    help="""EP deployment profile table(s) aot_ep_profiles runs, each profile at
-    every -m token count up to its max_token (default: the AOT build's,
-    aiter/aot/flydsl/moe_ep_profiles.csv). Precompile the same tables into
-    FLYDSL_RUNTIME_CACHE_DIR first:
-      python -m aiter.aot.flydsl.moe --ep-profile <csv>""",
+    nargs="+",
+    default=DEFAULT_DEPLOYMENTS,
+    help="""MoE deployment file(s) whose fused_moe deployments aot_ep_profiles
+    runs, each at every -m token count up to its max_tokens (default: the AOT
+    build's, aiter/aot/flydsl/moe_deployments.json). Precompile the same files
+    into FLYDSL_RUNTIME_CACHE_DIR first:
+      python -m aiter.aot.flydsl.moe --deployments <json>""",
+)
+parser.add_argument(
+    "--deployment-id",
+    type=str,
+    nargs="+",
+    metavar="GLOB",
+    help="""Run only the deployments whose id matches one of these glob
+    patterns, e.g. --deployment-id 'deepseek-v4-pro/*'. List the ids with
+      python -m aiter.aot.flydsl.deployments""",
 )
 parser.add_argument(
     "--seed", type=int, default=0, help="Random input and routing seed."
@@ -1296,26 +1289,27 @@ for test in args.test:
         if gpu_arch not in ("gfx950", "gfx1250"):
             print(f"skip {test}: mxfp4 requires gfx950/gfx1250, got {gpu_arch}")
             continue
-        for profile, label, act in _aot_ep_profiles(args.ep_profile):
-            ep_args = _profile_ep_args(profile, args.ep_mode)
+        for call, label, act in _aot_ep_deployments(
+            args.deployments, args.deployment_id
+        ):
+            ep_args = _deployment_ep_args(call, args.ep_mode)
             for m in args.token:
                 # Real mode needs token // ep >= 1 source tokens per rank.
-                if m > int(profile["max_token"]) or (
-                    args.ep_mode == "real" and m < ep_args["ep"]
-                ):
+                if m > call.max_tokens or (args.ep_mode == "real" and m < call.ep):
                     continue
                 test_fmoe_ep_mxfp4(
                     label,
                     m,
-                    int(profile["model_dim"]),
-                    int(profile["inter_dim"]),
+                    call.model.model_dim,
+                    call.model.inter_dim,
                     **ep_args,
                     ep_mode=args.ep_mode,
                     fake_ep_rank=args.fake_ep_rank,
                     const_init=args.const_init,
                     activation=act,
+                    situ_betas=(call.model.situ_beta, call.model.situ_linear_beta),
                     check_aot=True,
-                    profile=profile.get("model") or "-",
+                    deployment=call.id,
                 )
     elif test == "test_fmoe_16_bit":
         print("test test_fmoe 16 bit")
