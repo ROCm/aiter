@@ -155,6 +155,23 @@ def _mxfp4_ceil_scale_from_amax(amax):
 
 
 @triton.jit
+def _mxfp4_roundup_scale_from_amax(amax):
+    """The E8M0 scale of the HIP per_1x32_f4_quant and its reciprocal: amax
+    floored at aiter::kAmaxFloor (1e-10), then
+    fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundUp>, 2^ceil(log2(amax / 6)).
+    Unlike _mxfp4_ceil_scale_from_amax, an all-zero block gets byte 92, as
+    there, not 1."""
+    ratio = (tl.maximum(amax, 1e-10) * (1.0 / 6.0)).to(tl.uint32, bitcast=True)
+    exponent = (ratio >> 23) & 0xFF
+    # Round up if the mantissa is nonzero, unless the ratio is Inf or NaN.
+    exponent = tl.where(
+        (exponent < 0xFF) & ((ratio & 0x7FFFFF) != 0), exponent + 1, exponent
+    )
+    quant_scale = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
+    return exponent.to(tl.uint8), quant_scale
+
+
+@triton.jit
 def _mxfp4_quant_op(
     x,
     BLOCK_SIZE_N,
@@ -167,7 +184,8 @@ def _mxfp4_quant_op(
     Converts given x (in fp32) to mxfp4 format.
     x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
     SCALING_MODE: 0 is "even" (_mxfp4_scale_from_amax), 1 is "ceil"
-    (_mxfp4_ceil_scale_from_amax).
+    (_mxfp4_ceil_scale_from_amax), 2 is "roundup"
+    (_mxfp4_roundup_scale_from_amax).
     USE_ASM: see _mxfp4_pack_op.
 
     """
@@ -177,9 +195,11 @@ def _mxfp4_quant_op(
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
     if SCALING_MODE == 0:
         bs_e8m0, quant_scale = _mxfp4_scale_from_amax(amax)
-    else:
-        tl.static_assert(SCALING_MODE == 1)
+    elif SCALING_MODE == 1:
         bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(amax)
+    else:
+        tl.static_assert(SCALING_MODE == 2)
+        bs_e8m0, quant_scale = _mxfp4_roundup_scale_from_amax(amax)
 
     # Compute quantized x
     qx = x * quant_scale

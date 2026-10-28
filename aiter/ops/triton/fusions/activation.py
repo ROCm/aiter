@@ -21,6 +21,9 @@ fp8_dtype = aiter.dtypes.fp8
 
 _LOGGER = AiterTritonLogger()
 
+# scaling_mode -> SCALING_MODE of _mxfp4_quant_op.
+_MXFP4_SCALING_MODES = {"even": 0, "ceil": 1, "roundup": 2}
+
 
 def _get_silu_and_mul_backward_config(n_cols: int) -> dict:
     config_dir = resolve_config_dir("fusions", "SILU-AND-MUL-BACKWARD")
@@ -34,6 +37,7 @@ def act_mul_and_mxfp4_quant(
     scaling_mode: str = "even",
     shuffle: bool = False,
     scale_shuffle_padding: bool = False,
+    round_to_input_dtype: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply the activation function and quantize the result to MX FP4 format.
@@ -50,13 +54,25 @@ def act_mul_and_mxfp4_quant(
 
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
-            - etc.
+            - "ceil": 2^ceil(log2(amax / 6)), so no value saturates.
+            - "roundup": the scale of `per_1x32_f4_quant_hip`, "ceil" with the
+              block amax floored at 1e-10 as there.
         shuffle: Indicates whether to enable preshuffling of scales.
             - When enabled, scale dimensions (X, Y) are adjusted to be multiples of 8 and 256, respectively.
+        round_to_input_dtype: Round the activation to x.dtype, and its product
+            with the second part again, before quantizing: what an unfused
+            act-and-mul in x.dtype writes, e.g. `F.silu(a) * b` on bf16
+            tensors. With scaling_mode="roundup" the output then equals that
+            act-and-mul followed by `per_1x32_f4_quant_hip`, byte for byte.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
     _LOGGER.info("ACT_MUL_MXFP4_QUANT: x=%s activation=%s", tuple(x.shape), activation)
+    if scaling_mode not in _MXFP4_SCALING_MODES:
+        raise ValueError(
+            f"scaling_mode must be one of {tuple(_MXFP4_SCALING_MODES)}, "
+            f"got {scaling_mode!r}"
+        )
     # Assume x is 2D-Tensor for now
     M, N = x.shape
     # Activation (N/2) and storing results in uint8 (N/2) results in a feature dimension of N/4
@@ -124,12 +140,13 @@ def act_mul_and_mxfp4_quant(
         M=M,
         N=N_half,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
+        SCALING_MODE=_MXFP4_SCALING_MODES[scaling_mode],
         ACTIVATION=activation,
         scaleN=scaleN_valid,
         scaleM_pad=(scaleM if use_scale_shuffle_padding else 1),
         scaleN_pad=scaleN,
         SHUFFLE=shuffle,
+        ROUND_TO_INPUT_DTYPE=round_to_input_dtype,
         NUM_ITER=NUM_ITER,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
