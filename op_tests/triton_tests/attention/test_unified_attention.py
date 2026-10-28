@@ -313,6 +313,7 @@ def ref_paged_attn(
     v_descale: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     causal: int = 1,
+    qq_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     _, block_size, num_kv_heads, head_size = key_cache.shape
@@ -359,6 +360,8 @@ def ref_paged_attn(
             mask |= sliding_window_mask
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
+        if qq_bias is not None:
+            attn[:, :, kv_len - query_len :] += qq_bias[:query_len, :query_len]
         if causal:
             attn.masked_fill_(mask, float("-inf"))
         if sinks is not None:
@@ -737,6 +740,88 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+# Query lengths that leave padded rows in the last query block (BLOCK_Q of 2/4/8),
+# on the 3D split-KV path (long KV) and the 2D path (KV <= 512).
+@pytest.mark.parametrize(
+    "num_heads, query_len, kv_len",
+    [
+        ((32, 8), 3, 4096),
+        ((32, 8), 4, 4096),
+        ((16, 1), 3, 4096),
+        ((32, 8), 3, 256),
+        ((32, 8), 5, 256),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_qq_bias_padded_query_rows(
+    num_heads: tuple[int, int], query_len: int, kv_len: int
+) -> None:
+    if DEVICE_ARCH == "gfx1250":
+        pytest.skip("gfx1250 Gluon kernel does not mask padded qq_bias rows")
+    seq_lens = [(query_len, kv_len)] * 2
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=16,
+        head_size=128,
+        num_heads=num_heads,
+        device="cuda",
+    )
+    qq_bias = torch.randn(query_len, query_len, dtype=torch.float32, device="cuda")
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        qq_bias=qq_bias,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=output.dtype,
+        qq_bias=qq_bias,
+    )
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize(

@@ -356,7 +356,7 @@ def kernel_unified_attention_2d(
                 is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
                 qq_bias = tl.load(
                     qq_bias_row_ptrs + key_rel_pos[None, :],
-                    mask=is_query_key[None, :],
+                    mask=query_mask_0[:, None] & is_query_key[None, :],
                     other=0.0,
                 )
                 S += qq_bias * RCP_LN2
@@ -494,7 +494,8 @@ def kernel_unified_attention_2d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
@@ -909,7 +910,8 @@ def kernel_unified_attention_3d(
             is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
