@@ -436,7 +436,9 @@ def _check_fused_qkv_split_qk_rope_with_cache(
         )
 
     # Random slot mapping (shuffled unique slots)
-    slot_mapping = torch.randperm(num_blocks * block_size)[:B].to(torch.int32).cuda()
+    slot_mapping = torch.randperm(num_blocks * block_size, device="cuda")[:B].to(
+        torch.int32
+    )
 
     # Triton Call
     tri_result = fused_qkv_split_qk_norm_rope_cache(
