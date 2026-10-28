@@ -4,7 +4,6 @@
 #include <opus/hip_minimal.hpp>
 #include <opus/opus.hpp>
 #include "../opus_gemm_utils.cuh"
-#include "opus_gemm_kargs_a8w8_mxscale_bpreshuffle_gfx950.cuh"
 #include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh"
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
@@ -47,7 +46,7 @@ __device__ inline Fragment load_operand_fragment_staged(Mem& smem, const Offsets
     return result;
 }
 
-// A layouts: global memory -> LDS -> registers.
+// A global memory -> LDS layouts.
 template<class T>
 __device__ inline auto make_layout_ga_scale(int lane_id, int wave_id_m, int wave_id_n, int stride_a) {
     constexpr int threads_k = T::B_K / T::VEC_A;
@@ -92,35 +91,7 @@ __device__ inline auto make_layout_sa_scale(int wave_id_m, int wave_id_n) {
         opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id_n, wave_id_m}));
 }
 
-template<class T>
-__device__ inline constexpr auto make_layout_ra_scale(int lane_id, int wave_id_m) {
-    constexpr auto ra_block_shape = opus::make_tuple(
-        opus::number<T::E_M>{},
-        opus::number<T::T_N>{},
-        opus::number<T::T_M>{},
-        opus::number<T::A_ROWS_PER_WAVE>{},
-        opus::number<T::E_K>{},
-        opus::number<T::A_CHUNKS_PER_FRAGMENT>{},
-        opus::number<T::WARP_SIZE / T::W_M>{},
-        opus::number<T::VEC_A>{});
-
-    constexpr auto ra_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    const int lane_id_m = lane_id % T::W_M;
-    const int matrix_row = wave_id_m * T::W_M + lane_id_m;
-    const int producer_n = matrix_row / (T::A_ROWS_PER_WAVE * T::T_M);
-    const int producer_m = matrix_row % T::T_M;
-    const int producer_lane_row = (matrix_row % (T::A_ROWS_PER_WAVE * T::T_M)) / T::T_M;
-
-    return opus::make_layout<T::VEC_A>(
-        ra_block_shape,
-        opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding>{}, 1_I}),
-        opus::unfold_p_coord(ra_block_dim, opus::tuple{producer_n, producer_m, producer_lane_row, lane_id / T::W_M}));
-}
-
-// B-preshuffle layouts: global memory -> LDS -> registers.
+// Preshuffled B global memory -> LDS layouts.
 template<class T>
 __device__ inline constexpr auto make_layout_gb_scale(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
     constexpr int lanes_n = T::W_N;
@@ -170,6 +141,35 @@ __device__ inline constexpr auto make_layout_sb_scale(int wave_id_m, int wave_id
         opus::unfold_p_coord(sb_block_dim, opus::tuple{wave_id_n, wave_id_m}));
 }
 
+// A/B LDS -> MFMA register layouts.
+template<class T>
+__device__ inline constexpr auto make_layout_ra_scale(int lane_id, int wave_id_m) {
+    constexpr auto ra_block_shape = opus::make_tuple(
+        opus::number<T::E_M>{},
+        opus::number<T::T_N>{},
+        opus::number<T::T_M>{},
+        opus::number<T::A_ROWS_PER_WAVE>{},
+        opus::number<T::E_K>{},
+        opus::number<T::A_CHUNKS_PER_FRAGMENT>{},
+        opus::number<T::WARP_SIZE / T::W_M>{},
+        opus::number<T::VEC_A>{});
+
+    constexpr auto ra_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    const int lane_id_m = lane_id % T::W_M;
+    const int matrix_row = wave_id_m * T::W_M + lane_id_m;
+    const int producer_n = matrix_row / (T::A_ROWS_PER_WAVE * T::T_M);
+    const int producer_m = matrix_row % T::T_M;
+    const int producer_lane_row = (matrix_row % (T::A_ROWS_PER_WAVE * T::T_M)) / T::T_M;
+
+    return opus::make_layout<T::VEC_A>(
+        ra_block_shape,
+        opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding>{}, 1_I}),
+        opus::unfold_p_coord(ra_block_dim, opus::tuple{producer_n, producer_m, producer_lane_row, lane_id / T::W_M}));
+}
+
 template<class T>
 __device__ inline constexpr auto make_layout_rb_scale(int lane_id, int wave_id_n) {
     constexpr int k_vectors = T::W_N * T::W_K / (T::WARP_SIZE * T::VEC_B);
@@ -201,7 +201,7 @@ __device__ inline constexpr auto make_layout_gsfa_scale(int lane_id, int wave_id
         opus::number<T::SFA_K_COLUMNS_PER_WAVE>{}, // K128 groups per wave
         opus::number<T::SFA_PASSES>{}, // passes along M
         opus::number<T::SFA_THREADS_PER_GROUP>{}, // threads per K128 group
-        opus::number<T::VEC_SCALE_A>{});           // 16 contiguous M scale bytes per thread
+        opus::number<T::VEC_SCALE_A>{}); // 16 contiguous M scale bytes per thread
 
     constexpr auto block_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
@@ -221,7 +221,7 @@ __device__ inline constexpr auto make_layout_ssfa_scale(int lane_id, int wave_id
         opus::number<T::SFA_K_COLUMNS_PER_WAVE>{}, // K128 groups per wave
         opus::number<T::SFA_PASSES>{}, // passes along M
         opus::number<T::SFA_THREADS_PER_GROUP>{}, // threads per K128 group
-        opus::number<T::VEC_SCALE_A>{});           // 16 contiguous M scale bytes per thread
+        opus::number<T::VEC_SCALE_A>{}); // 16 contiguous M scale bytes per thread
 
     constexpr auto block_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
@@ -239,7 +239,7 @@ __device__ inline constexpr auto make_layout_rsfa_scale(int lane_id, int wave_id
         opus::number<T::E_M>{}, // M repeats
         opus::number<T::T_M>{}, // M waves
         opus::number<T::W_M>{}, // 16 M lanes
-        1_I);                   // one scale byte per M repeat
+        1_I); // one scale byte per M repeat
 
     constexpr auto block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
@@ -301,7 +301,7 @@ __device__ inline constexpr auto make_layout_rsfb_scale() {
 
 } // namespace opus_gemm_bpreshuffle_pingpong_lds_layout
 
-// Publish the next A/B LDS tile at PUBLISH_M, then replace consumed fragments.
+// Two LDS stages feed an A fragment ring and reusable B fragments.
 template<class Traits>
 __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 kargs) {
@@ -315,7 +315,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     using D_ACC = opus::fp32_t;
     using D_SF = unsigned char;
     using D_SF_PACK = unsigned int;
-    namespace layout_panel = opus_gemm_bpreshuffle_pingpong_lds_layout;
 
     // Tile and thread coordinates.
     const int wave_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
@@ -392,16 +391,16 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     // Matrix and scale layouts: global -> LDS -> registers.
     const auto u_ga = make_layout_ga_scale<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_a);
     const auto u_sa = make_layout_sa_scale<T>(wave_id_m, wave_id_n);
-    const auto u_ra = layout_panel::make_layout_ra_scale<T>(lane_id, wave_id_m);
     const auto u_gb = make_layout_gb_scale<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
     const auto u_sb = make_layout_sb_scale<T>(wave_id_m, wave_id_n);
+    const auto u_ra = make_layout_ra_scale<T>(lane_id, wave_id_m);
     const auto u_rb = make_layout_rb_scale<T>(lane_id, wave_id_n);
-    const auto u_gsfa = layout_panel::make_layout_gsfa_scale<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_sfa);
-    const auto u_ssfa = layout_panel::make_layout_ssfa_scale<T>(lane_id, wave_id_m, wave_id_n);
-    const auto u_rsfa = layout_panel::make_layout_rsfa_scale<T>(lane_id, wave_id_m);
-    const auto u_gsfb = layout_panel::make_layout_gsfb_scale<T>(lane_id, wave_id, kargs.stride_sfb);
-    const auto u_ssfb = layout_panel::make_layout_ssfb_scale<T>(lane_id, wave_id);
-    const auto u_rsfb = layout_panel::make_layout_rsfb_scale();
+    const auto u_gsfa = make_layout_gsfa_scale<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_sfa);
+    const auto u_ssfa = make_layout_ssfa_scale<T>(lane_id, wave_id_m, wave_id_n);
+    const auto u_rsfa = make_layout_rsfa_scale<T>(lane_id, wave_id_m);
+    const auto u_gsfb = make_layout_gsfb_scale<T>(lane_id, wave_id, kargs.stride_sfb);
+    const auto u_ssfb = make_layout_ssfb_scale<T>(lane_id, wave_id);
+    const auto u_rsfb = make_layout_rsfb_scale();
 
     // Matrix and scale LDS; matrix storage is reused for the C epilogue.
     alignas(16) __shared__ char smem_matrix[T::LDS_BYTES];
@@ -521,9 +520,9 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
             constexpr int m_repeat = decltype(m_i)::value;
             const auto offsets = layout_to_offsets<T::VEC_A>(u_ra + sa_offset(static_cast<int>(stage_i)));
             if constexpr (T::PIN_A) {
-                load_operand_fragment_pinned<T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT>( number<(m_repeat % T::A_RING) * 8>{}, v_a[m_repeat % T::A_RING], s_a, offsets);
+                load_operand_fragment_pinned<T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT>(number<(m_repeat % T::A_RING) * 8>{}, v_a[m_repeat % T::A_RING], s_a, offsets);
             } else {
-                v_a[m_repeat % T::A_RING] = load_operand_fragment_staged< T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_a>(s_a, offsets);
+                v_a[m_repeat % T::A_RING] = load_operand_fragment_staged<T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_a>(s_a, offsets);
             }
         } else {
             constexpr int m_repeat = decltype(m_i)::value;
@@ -543,9 +542,9 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
             constexpr int n_repeat = decltype(n_i)::value;
             const auto offsets = layout_to_offsets<T::VEC_B>(u_rb + sb_offset(decltype(stage_i)::value));
             if constexpr (T::PIN_B) {
-                load_operand_fragment_pinned<T::VEC_B, n_repeat * T::B_CHUNKS_PER_FRAGMENT>( number<64 + n_repeat * 8>{}, v_b[n_repeat], s_b, offsets);
+                load_operand_fragment_pinned<T::VEC_B, n_repeat * T::B_CHUNKS_PER_FRAGMENT>(number<64 + n_repeat * 8>{}, v_b[n_repeat], s_b, offsets);
             } else {
-                v_b[n_repeat] = load_operand_fragment_staged< T::VEC_B, n_repeat * T::B_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_b>(s_b, offsets);
+                v_b[n_repeat] = load_operand_fragment_staged<T::VEC_B, n_repeat * T::B_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_b>(s_b, offsets);
             }
         } else {
             constexpr int n_repeat = decltype(n_i)::value;
@@ -634,12 +633,46 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
         v_sfb = v_sfb_next;
     };
 
+    // Final K tile and BF16 output helpers.
+    auto finish_tile = [&](auto stage_i) {
+        static_for<T::E_M>([&](auto m_i) {
+            constexpr int m = decltype(m_i)::value;
+            s_waitcnt_lgkmcnt(0_I);
+            static_for<T::E_N>([&](auto n_i) { mma_scale_fragment(m_i, n_i); });
+            if constexpr (m + T::A_RING < T::E_M)
+                load_a_fragment(number<m + T::A_RING>{}, stage_i);
+        });
+    };
+
+    auto stage_output_fragment = [&](auto c_i) {
+        constexpr int c_index = decltype(c_i)::value;
+        const auto c = [&] {
+            if constexpr (T::FRAGMENT_ARRAYS)
+                return v_c[c_index];
+            else
+                return slice(v_c, number<c_index * ELEM_C>{}, number<(c_index + 1) * ELEM_C>{});
+        }();
+        store<T::VEC_C>(s_c, cast<D_C>(c), gc_offsets[c_index]);
+    };
+
+    const int output_thread_id = wave_id * T::WARP_SIZE + lane_id;
+    auto copy_output_bf16 = [&](int copy_index) {
+        const int linear = output_thread_id * T::VEC_OUTPUT + copy_index * T::BLOCK_SIZE * T::VEC_OUTPUT;
+        const int output_row = linear / T::B_N;
+        const int output_col = linear % T::B_N;
+        const auto value = load<T::VEC_OUTPUT>(s_c, c_offset(output_row, output_col));
+        // The bounded SRD drops complete rows beyond valid_rows; BOUNDED_OUTPUT
+        // omits the additional lane guard.
+        if (T::BOUNDED_OUTPUT || row + output_row < kargs.m)
+            store<T::VEC_OUTPUT>(g_c, value, output_row * kargs.stride_c + output_col, 0, opus::number<2>{});
+    };
+
     // ===== Prologue =====
     // Publish scales and the first matrix tile, then prefetch K+1.
     issue_matrix_prefetch(number<0>{}, 0);
     __builtin_amdgcn_sched_barrier(0);
 
-    // Spread short-K scale loads across waves without reserving K-specific kernels.
+    // Distribute valid K128 scale groups across waves.
     static_for<T::SFA_K_PASSES>([&](auto i) {
         const int first_k = decltype(i)::value * T::SFA_K_PANEL;
         if (first_k < scale_k_groups)
@@ -672,15 +705,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     }
 
     // ===== Epilogue =====
-    auto finish_tile = [&](auto stage_i) {
-        static_for<T::E_M>([&](auto m_i) {
-            constexpr int m = decltype(m_i)::value;
-            s_waitcnt_lgkmcnt(0_I);
-            static_for<T::E_N>([&](auto n_i) { mma_scale_fragment(m_i, n_i); });
-            if constexpr (m + T::A_RING < T::E_M)
-                load_a_fragment(number<m + T::A_RING>{}, stage_i);
-        });
-    };
     if constexpr (T::FRAGMENT_ARRAYS || (T::FIXED_K == 0 && T::E_M >= 3)) {
         // One final MFMA site keeps pinned C/D in place and shortens live
         // ranges when the final LDS stage is selected at runtime.
@@ -695,17 +719,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
 
     // ===== Output writeback =====
     // Stage BF16 fragments only after the final tile has released its LDS reads.
-    auto stage_output_fragment = [&](auto c_i) {
-        constexpr int c_index = decltype(c_i)::value;
-        const auto c = [&] {
-            if constexpr (T::FRAGMENT_ARRAYS)
-                return v_c[c_index];
-            else
-                return slice(v_c, number<c_index * ELEM_C>{}, number<(c_index + 1) * ELEM_C>{});
-        }();
-        store<T::VEC_C>(s_c, cast<D_C>(c), gc_offsets[c_index]);
-    };
-
     s_waitcnt_lgkmcnt(0_I);
     opus::sync_threads();
 
@@ -714,17 +727,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     // Write contiguous BF16 vectors, preserving the final partial M tile guard.
     s_waitcnt_lgkmcnt(0_I);
     opus::sync_threads();
-    const int output_thread_id = wave_id * T::WARP_SIZE + lane_id;
-    auto copy_output_bf16 = [&](int copy_index) {
-        const int linear = output_thread_id * T::VEC_OUTPUT + copy_index * T::BLOCK_SIZE * T::VEC_OUTPUT;
-        const int output_row = linear / T::B_N;
-        const int output_col = linear % T::B_N;
-        const auto value = load<T::VEC_OUTPUT>(s_c, c_offset(output_row, output_col));
-        // The bounded SRD drops complete rows beyond valid_rows. Keep the
-        // lane guard as the default; eligible configurations can omit it.
-        if (T::BOUNDED_OUTPUT || row + output_row < kargs.m)
-            store<T::VEC_OUTPUT>(g_c, value, output_row * kargs.stride_c + output_col, 0, opus::number<2>{});
-    };
+
     static_for<T::OUTPUT_PASSES>([&](auto copy_i) { copy_output_bf16(decltype(copy_i)::value); });
 }
-#endif
+#endif // gfx950

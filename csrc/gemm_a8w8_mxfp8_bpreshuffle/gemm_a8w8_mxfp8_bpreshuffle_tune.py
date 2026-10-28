@@ -14,14 +14,15 @@ w_scale_block (1x32: a shape list without the column is one):
 
 --mxscale_table tunes gemm_a8w8_blockscale_bpreshuffle's e8m0 table instead,
 the only one the 32x32 (w_scale [N/32, K/32], as bmm's) and 128x128 blocks
-(w_scale [N/128, K/128], x_scale 1x128 as its column-major bytes) have: the
-batched GEMM at B = 1 (bmm) joins as a third backend on them (its candidates:
-the table's tuned bmm kernels for M/2..2M, its heuristic pick, and their
-split-K neighbours). With --libtype both (default), OPUS joins on 128x128:
-shape filtering selects up to four geometries per pipeline, including their
-schedule and pin variants and the saved winner, before a single measurement
-pass alongside FlyDSL. FlyDSL rows use kernelId "mxfp8" or "bmm"; OPUS rows
-use libtype "opus" and a numeric kernelId:
+(w_scale [N/128, K/128], x_scale 1x128 as its column-major bytes) have, and
+the one its 1x32 calls read: the batched GEMM at B = 1 (bmm) joins the mxfp8
+pipelines on every block (its candidates: the table's tuned bmm kernels for
+M/2..2M, its heuristic pick, and their split-K neighbours). With --libtype
+both (default), OPUS joins on 128x128: shape filtering selects up to four
+geometries per pipeline, including their schedule and pin variants and the
+saved winner, before a single measurement pass alongside FlyDSL. FlyDSL rows
+use kernelId "mxfp8" or "bmm"; OPUS rows use libtype "opus" and a numeric
+kernelId:
 
     python3 csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py \\
         --mxscale_table \\
@@ -106,25 +107,26 @@ def run_torch(x_deq, w_deq, dtype=dtypes.bf16):
     return F.linear(x_deq, w_deq).to(dtype)
 
 
-def opus_kernel_name(kid):
+def opus_kernel_name(kid, *, cu_num):
     from csrc.opus_gemm.opus_gemm_common import (
-        a8w8_mxscale_gemm_bpreshuffle_kernels_list,
         a8w8_mxscale_bpreshuffle_kernel_name,
+        get_registry,
     )
 
-    instance = a8w8_mxscale_gemm_bpreshuffle_kernels_list[int(kid)]
+    instance = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)[int(kid)]
     return a8w8_mxscale_bpreshuffle_kernel_name(instance)
 
 
-def opus_candidates(m, n, k, kids=None):
+def opus_candidates(m, n, k, kids=None, *, cu_num):
     from csrc.opus_gemm.opus_gemm_common import (
-        a8w8_mxscale_gemm_bpreshuffle_kernels_list,
         candidate_kids_for_shape,
+        get_registry,
     )
 
+    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)
     return [
-        (kid, a8w8_mxscale_gemm_bpreshuffle_kernels_list[kid])
-        for kid in candidate_kids_for_shape("gfx950", m, n, k)
+        (kid, registry[kid])
+        for kid in candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num)
         if kids is None or kid in kids
     ]
 
@@ -185,25 +187,27 @@ def _opus_filtered_candidates(
     return sorted(selected), len(retained)
 
 
-def opus_available_kids():
+def opus_available_kids(*, cu_num):
     from csrc.opus_gemm.opus_gemm_common import (
-        a8w8_mxscale_gemm_bpreshuffle_kernels_list,
+        get_registry,
     )
 
     opus_dir = Path(__file__).resolve().parents[1] / "opus_gemm"
     co_dir = Path(os.environ.get("OPUS_GEN_CO_DIR") or opus_dir / "gen_co") / "gfx950"
     return {
         kid
-        for kid, instance in a8w8_mxscale_gemm_bpreshuffle_kernels_list.items()
+        for kid, instance in get_registry(
+            "a8w8_blockscale_bpreshuffle", "gfx950", cu_num
+        ).items()
         if instance.bpreshuffle_co is None
         or (co_dir / instance.bpreshuffle_co["image"]).is_file()
     }
 
 
-def ensure_opus_kids_compiled(kids):
+def ensure_opus_kids_compiled(kids, *, cu_num):
     if not kids:
         return False
-    missing = set(kids) - opus_available_kids()
+    missing = set(kids) - opus_available_kids(cu_num=cu_num)
     if missing:
         raise FileNotFoundError(
             f"OPUS COs are unavailable for kernel IDs {sorted(missing)}; "
@@ -224,7 +228,9 @@ def ensure_opus_kids_compiled(kids):
 
         if compiler:
             os.environ["HIP_CLANG_PATH"] = compiler
-        return _ensure_kids_compiled(kids)
+        return _ensure_kids_compiled(
+            kids, family="a8w8_blockscale_bpreshuffle", gfx="gfx950", cu_num=cu_num
+        )
     finally:
         if compiler:
             if previous_compiler is None:
@@ -243,6 +249,7 @@ def run_gemm_opus(x, weight_shuffle, x_scale, w_scale, out, kid):
         weight_shuffle,
         out,
         kid=kid,
+        family="a8w8_blockscale_bpreshuffle",
         layout="bpreshuffle",
         x_scale=x_scale,
         w_scale=w_scale,
@@ -250,62 +257,52 @@ def run_gemm_opus(x, weight_shuffle, x_scale, w_scale, out, kid):
 
 
 # The batched GEMM at B = 1 in --mxscale_table mode: its ids follow mxfp8's
-# (kernelId records the backend in that table), its split-K variants the
-# batched tuner's.
+# (kernelId records the backend in that table).
 KERNEL_ID_BASE_BMM = 3_000_000
-_BMM_SPLITS = (1, 2, 4, 8, 16)
 MXSCALE_KERNEL_ID = "mxfp8"
 MXSCALE_BMM_KERNEL_ID = "bmm"
 
 
-def _bmm_scale_args(w_scale_block, m=None):
-    g = int(w_scale_block.split("x")[1])
-    # The blockscale x_scale (1x128) is passed as its column-major bytes.
+def _bmm_scale_args(w_scale_block):
+    from aiter.ops.gemm_op_common import mxscale_bmm_groups_of_block
+
+    rows, cols = mxscale_bmm_groups_of_block(w_scale_block)
+    # generate_data's x_scale is as wide as the w_scale block; a 1x128 one
+    # (blockscale) is passed as its column-major bytes.
     return {
-        "x_scale_k": g,
-        "w_scale_n": g,
-        "w_scale_k": g,
-        "x_scale_transposed": g == 128 and (m is None or m > 1),
+        "x_scale_k": cols,
+        "w_scale_n": rows,
+        "w_scale_k": cols,
+        "x_scale_transposed": cols == 128,
     }
 
 
 def bmm_candidates(m, n, k, w_scale_block, seeds=()):
     """bmm kernelNames to time for a shape: ``seeds`` (tuned bmm rows of nearby
-    M), the heuristic pick, and their split-K neighbours that run it."""
-    if w_scale_block not in ("32x32", "128x128"):
-        return []
+    M), the heuristic pick, and their split-K neighbours that run it. A
+    1x128 x_scale is read row-major at M = 1, which a row may serve through
+    padded M, so 128x128 candidates must run both layouts."""
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
-        bmm_kernel_name,
-        check_bmm_config,
+        bmm_candidate_names,
+        bmm_config_runs,
         parse_bmm_kernel_name,
-        pick_bmm_kernel_name,
     )
 
-    scale_args = _bmm_scale_args(w_scale_block, m)
-    names = set(seeds)
-    try:
-        names.add(pick_bmm_kernel_name(1, m, n, k, **scale_args))
-    except ValueError:
-        pass
-    out = set()
+    scale_args = _bmm_scale_args(w_scale_block)
+    names = bmm_candidate_names(1, m, n, k, seeds, **scale_args)
+    row_major = {**scale_args, "x_scale_transposed": False}
+    out = []
     for name in names:
         cfg = parse_bmm_kernel_name(name)
-        if cfg is None:
+        tiles = math.ceil(m / cfg["tile_m"]) * (n // cfg["tile_n"])
+        if cfg["splits"] > 1 and tiles > (1 << 16):
             continue
-        base = cfg["splits"]
-        for sp in _BMM_SPLITS:
-            if sp != base and not base / 2 <= sp <= base * 2:
-                continue
-            c = {**cfg, "splits": sp}
-            try:
-                check_bmm_config(n, k, 1, **c, **scale_args)
-            except ValueError:
-                continue
-            tiles = math.ceil(m / c["tile_m"]) * (n // c["tile_n"])
-            if c["splits"] > 1 and tiles > (1 << 16):
-                continue
-            out.add(bmm_kernel_name(**c))
-    return sorted(out)
+        if scale_args["x_scale_transposed"] and not bmm_config_runs(
+            1, n, k, row_major, cfg
+        ):
+            continue
+        out.append(name)
+    return out
 
 
 def run_bmm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
@@ -360,6 +357,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             _op, "_get_mxscale_bpreshuffle_config", _op.get_mxscale_bpreshuffle_config
         ).cache_clear()
         _op._load_mxscale_bpreshuffle_tuned.cache_clear()
+        _op._mxscale_bpreshuffle_tuned_nk.cache_clear()
+        _op._MXSCALE_UNTUNED_REPORTED.clear()
         _op._CKGEMM_CONFIG_CACHE.clear()
         _op._CKGEMM_HAS_GFX.clear()
 
@@ -368,8 +367,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             "--mxscale_table",
             action="store_true",
             help="Tune gemm_a8w8_blockscale_bpreshuffle's e8m0 table: bmm (the "
-            "batched GEMM at B = 1) joins on 32x32 / 128x128; OPUS JIT/CO "
-            "joins on 128x128.",
+            "batched GEMM at B = 1) joins on 1x32 / 32x32 / 128x128; OPUS JIT/CO "
+            "joins on 128x128. FlyDSL kernelId names mxfp8 or bmm; "
+            "OPUS IDs are numeric.",
         )
         self.parser.add_argument(
             "--libtype",
@@ -449,7 +449,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 for row in self.untunedf.itertuples()
                 if row.libtype == "opus"
             }
-            ensure_opus_kids_compiled(kids)
+            ensure_opus_kids_compiled(kids, cu_num=self.get_cu_num())
         op = (
             gemm_a8w8_blockscale_bpreshuffle
             if getattr(self, "_mxscale_table", False)
@@ -519,11 +519,13 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         if args.libtype != "flydsl" and self._mxscale_table:
             if args.libtype == "opus" and set(untunedf.w_scale_block) != {"128x128"}:
                 raise ValueError("OPUS supports A 1x128 / B 128x128 scales only")
-            opus_kids = opus_available_kids()
+            opus_kids = opus_available_kids(cu_num=cu_num)
             for row in untunedf.itertuples():
                 if row.w_scale_block == "128x128":
                     shape = (int(row.M), int(row.N), int(row.K))
-                    opus_by_shape[shape] = opus_candidates(*shape, opus_kids)
+                    opus_by_shape[shape] = opus_candidates(
+                        *shape, opus_kids, cu_num=cu_num
+                    )
                     if args.libtype == "opus" and not opus_by_shape[shape]:
                         raise ValueError(f"No OPUS candidate supports {shape}")
         for i in range(len(untunedf)):
@@ -557,7 +559,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     splits = parse_bmm_kernel_name(name)["splits"]
                     runs.append((KERNEL_ID_BASE_BMM + j, splits, name, run_bmm_flydsl))
             runs.extend(
-                (kid, 1, opus_kernel_name(kid), run_gemm_opus) for kid, _ in opus
+                (kid, 1, opus_kernel_name(kid, cu_num=cu_num), run_gemm_opus)
+                for kid, _ in opus
             )
             for kernel_id, split_k, name, run in runs:
                 is_opus = run is run_gemm_opus
@@ -598,7 +601,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         if not tasks:
             return []
         ensure_opus_kids_compiled(
-            {task[0][1] for task in tasks if task[0][-1] == "opus"}
+            {task[0][1] for task in tasks if task[0][-1] == "opus"},
+            cu_num=self.get_cu_num(),
         )
         counts = Counter(task[0][0] for task in tasks)
         return mp_tuner(
@@ -674,7 +678,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             if time in (self.INVALID_TIME, self.INF_TIME):
                 kernelName = "None"
             elif libtype == "opus":
-                kernelName = opus_kernel_name(kernelId)
+                kernelName = opus_kernel_name(kernelId, cu_num=int(keys[1]))
             elif libtype == "flydsl" and getattr(self, "_mxscale_table", False):
                 kernelId = (
                     MXSCALE_BMM_KERNEL_ID
@@ -726,7 +730,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 and float(row["us"]) > 0
                 and math.isfinite(float(row["us"]))
             ):
-                row["kernelName"] = opus_kernel_name(row["kernelId"])
+                row["kernelName"] = opus_kernel_name(
+                    row["kernelId"], cu_num=int(row["cu_num"])
+                )
             if row.get("us") not in (None, "", "Null"):
                 row["us"] = f"{float(row['us']):.4f}"
         with path.open("w", newline="") as stream:

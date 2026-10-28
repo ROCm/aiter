@@ -4,12 +4,161 @@
 #include <opus/hip_minimal.hpp>
 #include <opus/opus.hpp>
 #include "../opus_gemm_utils.cuh"
-#include "opus_gemm_kargs_a8w8_mxscale_bpreshuffle_gfx950.cuh"
 #include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
 #include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_overlap_gfx950.cuh"
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
 namespace opus_gemm_prefetch_b_vgpr_detail {
+
+// Global A copies preserve the row-dependent XOR permutation used by the LDS ring.
+template<class T>
+__device__ inline auto make_layout_ga(int thread_id, int stride_a) {
+    auto u = opus::make_layout<16>(
+        opus::make_tuple(opus::number<T::A_COPIES>{}, opus::number<16>{}),
+        opus::make_tuple(opus::number<T::BLOCK_SIZE * 16>{}, opus::number<1>{}),
+        opus::make_tuple(opus::underscore{}, opus::underscore{}));
+    opus::static_for<T::A_COPIES>([&](auto i) {
+        const int linear = u.offsets[i] + thread_id * 16;
+        const int row = linear / T::B_K;
+        const int k = (linear % T::B_K) ^ ((row % (T::B_K / 16)) * 16);
+        u.offsets[i] = row * stride_a + k;
+    });
+    return u;
+}
+
+// VMEM-to-LDS adds the lane displacement; the layout contains each wave base.
+template<class T>
+__device__ inline auto make_layout_sa(int wave_id) {
+    return opus::make_layout<16>(
+        opus::make_tuple(opus::number<T::A_COPIES>{}, opus::number<16>{}),
+        opus::make_tuple(opus::number<T::BLOCK_SIZE * 16>{}, opus::number<1>{}),
+        opus::make_tuple(opus::underscore{}, opus::underscore{})) + wave_id * 64 * 16;
+}
+
+// Each B fragment has two K64 halves and is loaded directly into its VGPR slot.
+template<class T>
+__device__ inline auto make_layout_gb(int lane_id, int wave_id_n, int stride_b) {
+    return opus::make_layout<16>(
+        opus::make_tuple(opus::number<T::B_K / 128>{}, opus::number<T::NR>{},
+                         opus::number<2>{}, opus::number<16>{}),
+        opus::make_tuple(opus::number<2048>{}, 16 * stride_b,
+                         opus::number<1024>{}, opus::number<1>{}),
+        opus::make_tuple(opus::underscore{}, opus::underscore{}, opus::underscore{}, opus::underscore{}))
+        + wave_id_n * (T::B_N / T::T_N) * stride_b + (lane_id / 16) * 256 + (lane_id % 16) * 16;
+}
+
+// Raw E8M0 scale panels retain their physical K-major A and N-major B strides.
+template<class T>
+__device__ inline auto make_layout_gsfa(int stride_sfa) {
+    return opus::make_layout(
+        opus::make_tuple(opus::number<T::SCALE_COLS>{}, opus::number<T::SA_ROWS>{}),
+        opus::make_tuple(stride_sfa, opus::number<1>{}));
+}
+
+template<class T>
+__device__ inline auto make_layout_gsfb(int stride_sfb) {
+    return opus::make_layout(
+        opus::make_tuple(opus::number<T::SB_ROWS>{}, opus::number<T::SCALE_COLS>{}),
+        opus::make_tuple(stride_sfb, opus::number<1>{}));
+}
+
+template<class T>
+__device__ inline auto make_layout_ssfa(int wave_id) {
+    return opus::make_layout<16>(
+        opus::make_tuple(opus::number<T::SA_COPIES>{}, opus::number<16>{}),
+        opus::make_tuple(opus::number<T::BLOCK_SIZE * 16>{}, opus::number<1>{}),
+        opus::make_tuple(opus::underscore{}, opus::underscore{})) + wave_id * 64 * 16;
+}
+
+template<class T>
+__device__ inline constexpr auto make_layout_ssfb() {
+    return opus::make_layout(
+        opus::make_tuple(opus::number<T::BLOCK_SIZE / 64>{}, opus::number<64>{}, opus::number<4>{}),
+        opus::make_tuple(opus::number<64 * 4>{}, opus::number<4>{}, opus::number<1>{}));
+}
+
+// Construct only the current K128 A fragment's offsets at its consumption point.
+template<class T>
+__device__ inline auto make_layout_ra(int lane_id, int k_slice) {
+    auto u = opus::make_layout<16>(
+        opus::make_tuple(opus::number<T::MR>{}, opus::number<2>{}, opus::number<16>{}),
+        opus::make_tuple(opus::number<16 * T::B_K>{}, opus::number<64>{}, opus::number<1>{}),
+        opus::make_tuple(opus::underscore{}, opus::underscore{}, opus::underscore{}));
+    opus::static_for<T::MR * 2>([&](auto i) {
+        constexpr int m = decltype(i)::value / 2;
+        constexpr int half = decltype(i)::value % 2;
+        const int row = m * 16 + lane_id % 16;
+        const int k_vector = (k_slice * 8 + lane_id / 16 + half * 4) ^ (row % (T::B_K / 16));
+        u.offsets[i] = row * T::B_K + k_vector * 16;
+    });
+    return u;
+}
+
+template<class T>
+__device__ inline auto make_layout_rsfa(int lane_id) {
+    return opus::make_layout(
+        opus::make_tuple(opus::number<T::B_K / 128>{}, opus::number<T::MR>{}),
+        opus::make_tuple(opus::number<T::SA_ROWS>{}, opus::number<16>{})) + lane_id % 16;
+}
+
+template<class T>
+__device__ inline auto make_layout_rsfb(int wave_id_n) {
+    constexpr int groups = (T::B_N / T::T_N + 127) / 128;
+    constexpr int scale_stride = T::SB_SLOTS ? 4 : 1;
+    return opus::make_layout(
+        opus::make_tuple(opus::number<T::B_K / 128>{}, opus::number<groups>{}),
+        opus::make_tuple(opus::number<scale_stride>{}, opus::number<T::SCALE_COLS * scale_stride>{}))
+        + (wave_id_n * (T::B_N / T::T_N) / 128) * T::SCALE_COLS * scale_stride;
+}
+
+// MFMA C fragments scatter into the padded LDS output stripe.
+template<class T>
+__device__ inline auto make_layout_sc(int lane_id, int wave_id_n) {
+    return opus::make_layout<4>(
+        opus::make_tuple(opus::number<T::MR>{}, opus::number<T::NR>{}, opus::number<4>{}),
+        opus::make_tuple(opus::number<16 * (T::B_N + 8)>{}, opus::number<16>{}, opus::number<1>{}),
+        opus::make_tuple(opus::underscore{}, opus::underscore{}, opus::underscore{}))
+        + (lane_id % 16) * (T::B_N + 8) + wave_id_n * (T::B_N / T::T_N) + (lane_id / 16) * 4;
+}
+
+template<class T, int Rows>
+__device__ inline auto make_layout_sc_copy(int thread_id) {
+    constexpr int copies = (Rows * (T::B_N / 8) + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
+    auto u = opus::make_layout<8>(
+        opus::make_tuple(opus::number<copies>{}, opus::number<8>{}),
+        opus::make_tuple(opus::number<T::BLOCK_SIZE * 8>{}, opus::number<1>{}),
+        opus::make_tuple(opus::underscore{}, opus::underscore{}));
+    opus::static_for<copies>([&](auto i) {
+        const int index = decltype(i)::value * T::BLOCK_SIZE + thread_id;
+        u.offsets[i] = (index / (T::B_N / 8)) * (T::B_N + 8) + (index % (T::B_N / 8)) * 8;
+    });
+    return u;
+}
+
+template<class T, int Rows>
+__device__ inline auto make_layout_gc_copy(int thread_id, int stride_c) {
+    constexpr int copies = (Rows * (T::B_N / 8) + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
+    auto u = opus::make_layout<8>(
+        opus::make_tuple(opus::number<copies>{}, opus::number<8>{}),
+        opus::make_tuple(opus::number<T::BLOCK_SIZE * 8>{}, opus::number<1>{}),
+        opus::make_tuple(opus::underscore{}, opus::underscore{}));
+    opus::static_for<copies>([&](auto i) {
+        const int index = decltype(i)::value * T::BLOCK_SIZE + thread_id;
+        u.offsets[i] = (index / (T::B_N / 8)) * stride_c + (index % (T::B_N / 8)) * 8;
+    });
+    return u;
+}
+
+template<class T, bool ContiguousWaveN>
+__device__ inline auto make_layout_gc_packed(int lane_id, int wave_id_m, int wave_id_n, int stride_c) {
+    return opus::make_layout<8>(
+        opus::make_tuple(opus::number<T::E_M>{}, opus::number<T::E_N>{}, opus::number<8>{}),
+        opus::make_tuple(T::T_M * 16 * stride_c,
+                         opus::number<(ContiguousWaveN ? 1 : T::T_N) * 16>{}, opus::number<1>{}),
+        opus::make_tuple(opus::underscore{}, opus::underscore{}, opus::underscore{}))
+        + (wave_id_m * 16 + lane_id % 16) * stride_c
+        + (ContiguousWaveN ? wave_id_n * T::E_N : wave_id_n) * 16 + (lane_id / 32) * 8;
+}
 
 // Read an A fragment directly from LDS into its assigned AGPRs.
 template<int Vec, int OFFSET_BEGIN, class Reg, class Fragment, class Mem, class Offsets>
@@ -33,13 +182,14 @@ __device__ inline void load_operand_fragment_pinned(Reg reg, Fragment& fragment,
 }
 
 // Pack adjacent MFMA output fragments into contiguous BF16 stores.
-// Use the known wave64 lane directly; opus::shfl adds lane-id instructions here.
+// Use lane_id directly; opus::shfl adds a lane-ID query here.
 template<class T, bool ContiguousWaveN = false, class Accumulators, class Gmem>
 __device__ __forceinline__ void store_mfma16_packed(
-    const Accumulators& c, Gmem gc, int lane, int wm, int wn, int stride_c) {
+    const Accumulators& c, Gmem g_c, int lane_id, int wave_id_m, int wave_id_n, int stride_c) {
     using namespace opus;
     static_assert(T::W_M == 16 && T::W_N == 16);
-    const int side = (lane / 16) % 2;
+    const int side = (lane_id / 16) % 2;
+    const auto u_gc = make_layout_gc_packed<T, ContiguousWaveN>(lane_id, wave_id_m, wave_id_n, stride_c);
     static_for<T::E_M * T::E_N / 2>([&](auto pair) {
         constexpr int ci = decltype(pair)::value * 2;
         const auto first = __builtin_bit_cast(vector_t<unsigned, 2>, cast<bf16_t>(c[ci]));
@@ -48,32 +198,25 @@ __device__ __forceinline__ void store_mfma16_packed(
         const unsigned own1 = side ? second[1] : first[1];
         const unsigned src0 = side ? first[0] : second[0];
         const unsigned src1 = side ? first[1] : second[1];
-        const unsigned other0 = __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, src0);
-        const unsigned other1 = __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, src1);
+        const unsigned other0 = __builtin_amdgcn_ds_bpermute((lane_id ^ 16) * 4, src0);
+        const unsigned other1 = __builtin_amdgcn_ds_bpermute((lane_id ^ 16) * 4, src1);
         vector_t<unsigned, 4> packed;
         packed[0] = side ? other0 : own0;
         packed[1] = side ? other1 : own1;
         packed[2] = side ? own0 : other0;
         packed[3] = side ? own1 : other1;
-        const int m = (ci + side) / T::E_N;
-        const int n = (ci + side) % T::E_N;
-        const int rr = (m * T::T_M + wm) * 16 + lane % 16;
-        const int nn = (ContiguousWaveN ? n + wn * T::E_N : n * T::T_N + wn) * 16 + (lane / 32) * 8;
-        store<8>(gc, __builtin_bit_cast(vector_t<bf16_t, 8>, packed),
-            rr * stride_c + nn, 0, number<T::STORE_CACHE>{});
+        store<8>(g_c, __builtin_bit_cast(vector_t<bf16_t, 8>, packed),
+            u_gc.offsets[ci + side], 0, number<T::STORE_CACHE>{});
     });
     if constexpr (T::E_M * T::E_N % 2 != 0) {
         constexpr int ci = T::E_M * T::E_N - 1;
         const auto words = __builtin_bit_cast(vector_t<unsigned, 2>, cast<bf16_t>(c[ci]));
-        const unsigned other0 = __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, words[0]);
-        const unsigned other1 = __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, words[1]);
+        const unsigned other0 = __builtin_amdgcn_ds_bpermute((lane_id ^ 16) * 4, words[0]);
+        const unsigned other1 = __builtin_amdgcn_ds_bpermute((lane_id ^ 16) * 4, words[1]);
         if (side == 0) {
             vector_t<unsigned, 4> packed{words[0], words[1], other0, other1};
-            const int rr = ((ci / T::E_N) * T::T_M + wm) * 16 + lane % 16;
-            const int nn =
-                (ContiguousWaveN ? (ci % T::E_N) + wn * T::E_N : (ci % T::E_N) * T::T_N + wn) * 16 + (lane / 32) * 8;
-            store<8>(gc, __builtin_bit_cast(vector_t<bf16_t, 8>, packed),
-                rr * stride_c + nn, 0, number<T::STORE_CACHE>{});
+            store<8>(g_c, __builtin_bit_cast(vector_t<bf16_t, 8>, packed),
+                u_gc.offsets[ci], 0, number<T::STORE_CACHE>{});
         }
     }
 }
@@ -143,12 +286,10 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
     static_assert(T::MR * 16 == T::B_M && T::NR * T::T_N * 16 == T::B_N);
 
     // Tile and thread coordinates.
-    const Index tid = thread_id_x();
-    const Index lane = tid % 64;
-    const Index lane16 = lane % 16;
-    const Index kg = lane / 16;
-    const Index wave = __builtin_amdgcn_readfirstlane(tid / 64);
-    const Index wn = wave;
+    const Index thread_id = thread_id_x();
+    const Index lane_id = thread_id % 64;
+    const Index wave_id = __builtin_amdgcn_readfirstlane(thread_id / 64);
+    const Index wave_id_n = wave_id;
     const unsigned pid = block_id_x();
     const unsigned gm = (M + BM - 1) / BM;
     const unsigned gn = N / BN;
@@ -167,84 +308,100 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
     const int col = M <= BM ? tile * BN : (tile % gn) * BN;
     const int valid_rows = M % BM == 0 ? BM : (M <= BM ? M : (row == (gm - 1) * BM ? M % BM : BM));
 
+    constexpr int F = KS * NR;
+    constexpr int MAX_ROWS = BM;
+    constexpr int C_ROWS = output_rows(BM, BN, T::PIPELINE_BYTES);
+    constexpr int STEADY = P - T::INITIAL_A;
+    constexpr int START = T::INITIAL_A < STEADY ? T::INITIAL_A : STEADY;
+    constexpr int PERIOD = []() constexpr {
+        if constexpr (T::ROTATE_B) return 1;
+        int a = NB, b = BS;
+        while (b) { int r = a % b; a = b; b = r; }
+        return NB / a * BS;
+    }();
+    constexpr int GROUPS = (STEADY - START) / PERIOD;
+    constexpr int END = START + GROUPS * PERIOD;
+
     // Matrix and scale global-memory views, bounded for the final partial M tile.
-    auto ga = make_gmem(reinterpret_cast<const fp8_t*>(args.ptr_a) + row * stride_a,
+    auto g_a = make_gmem(reinterpret_cast<const fp8_t*>(args.ptr_a) + row * stride_a,
         static_cast<unsigned>(valid_rows * stride_a));
-    auto gb = make_gmem(reinterpret_cast<const fp8_t*>(args.ptr_b) + col * stride_b,
+    auto g_b = make_gmem(reinterpret_cast<const fp8_t*>(args.ptr_b) + col * stride_b,
         static_cast<unsigned>(BN * stride_b));
-    auto gsa = make_gmem(reinterpret_cast<const unsigned char*>(args.ptr_sfa),
+    auto g_sfa = make_gmem(reinterpret_cast<const unsigned char*>(args.ptr_sfa),
         static_cast<unsigned>((SC - 1) * args.stride_sfa + M));
-    auto gsb = make_gmem(reinterpret_cast<const unsigned char*>(args.ptr_sfb),
+    auto g_sfb = make_gmem(reinterpret_cast<const unsigned char*>(args.ptr_sfb),
         static_cast<unsigned>((N / 128 - 1) * args.stride_sfb + SC));
-    auto gc = make_gmem(reinterpret_cast<bf16_t*>(args.ptr_c) + static_cast<int64_t>(row) * stride_c + col,
+    auto g_c = make_gmem(reinterpret_cast<bf16_t*>(args.ptr_c) + static_cast<int64_t>(row) * stride_c + col,
         static_cast<unsigned>(((valid_rows - 1) * stride_c + BN) * 2));
+
+    // Matrix, scale, and output layouts.
+    const auto u_ga = make_layout_ga<T>(thread_id, stride_a);
+    const auto u_sa = make_layout_sa<T>(wave_id);
+    const auto u_gb = make_layout_gb<T>(lane_id, wave_id_n, stride_b);
+    const auto u_gsfa = make_layout_gsfa<T>(args.stride_sfa);
+    const auto u_gsfb = make_layout_gsfb<T>(args.stride_sfb);
+    const auto u_ssfa = make_layout_ssfa<T>(wave_id);
+    constexpr auto u_ssfb = make_layout_ssfb<T>();
+    const auto u_rsfa = make_layout_rsfa<T>(lane_id);
+    const auto u_rsfb = make_layout_rsfb<T>(wave_id_n);
+    const auto u_sc = make_layout_sc<T>(lane_id, wave_id_n);
+    const auto u_sc_copy = make_layout_sc_copy<T, C_ROWS>(thread_id);
+    const auto u_gc_copy = make_layout_gc_copy<T, C_ROWS>(thread_id, stride_c);
 
     // A and scale LDS; the allocation is reused for the BF16 epilogue.
     alignas(16) __shared__ unsigned char arena[T::LDS_BYTES];
-    auto sa = make_smem(reinterpret_cast<fp8_t*>(arena));
-    auto ss = make_smem(arena);
+    auto s_a = make_smem(reinterpret_cast<fp8_t*>(arena));
+    auto s_scale = make_smem(arena);
+    auto s_c = make_smem(reinterpret_cast<bf16_t*>(arena));
 
     // MMA accumulators and the B register ring.
     using Base = decltype(make_mfma<fp8_t, fp8_t, fp32_t>(16_I, 16_I, 128_I, mfma_adaptor_swap_ab{}));
-    array<typename Base::vtype_c, MR * NR> c{};
-    array<typename Base::vtype_b, BS> bregs;
+    array<typename Base::vtype_c, MR * NR> r_c{};
+    array<typename Base::vtype_b, BS> r_b;
 
     auto issue_b = [&](auto slot_i, auto fragment_i, int kt) {
         constexpr int set = decltype(slot_i)::value;
         constexpr int fragment = decltype(fragment_i)::value;
-        constexpr int ks = fragment / NR;
-        constexpr int n = fragment % NR;
-        const int br = wn * (BN / WaveColumns) + n * 16;
-        const int off = ks * 2048 + kg * 256 + lane16 * 16;
-        set_slice(bregs[set],
-            load<16>(gb, off, br * stride_b + kt * (BK * 16), number<T::B_CACHE>{}), 0_I, 16_I);
-        set_slice(bregs[set],
-            load<16>(gb, off + 1024, br * stride_b + kt * (BK * 16), number<T::B_CACHE>{}), 16_I, 32_I);
+        set_slice(r_b[set],
+            load<16>(g_b, u_gb.offsets[fragment * 2], kt * (BK * 16), number<T::B_CACHE>{}), 0_I, 16_I);
+        set_slice(r_b[set],
+            load<16>(g_b, u_gb.offsets[fragment * 2 + 1], kt * (BK * 16), number<T::B_CACHE>{}), 16_I, 32_I);
     };
     auto issue_a = [&](int slot, int kt) {
         __builtin_amdgcn_sched_barrier(0);
         static_for<T::A_COPIES>([&](auto ii) {
             constexpr int i = decltype(ii)::value;
-            const int lin = (i * T::BLOCK_SIZE + tid) * 16;
-            const int r = lin / BK;
-            const int kc = (lin % BK) ^ ((r % (BK / 16)) * 16);
-            async_load<16>(ga, arena + slot * T::STAGE_BYTES + (i * T::BLOCK_SIZE + wave * 64) * 16,
-                r * stride_a + kc, kt * BK, 0_I, number<T::CACHECTL_A>{});
+            async_load<16>(g_a, arena + slot * T::STAGE_BYTES + u_sa.offsets[i],
+                u_ga.offsets[i], kt * BK, 0_I, number<T::CACHECTL_A>{});
         });
         __builtin_amdgcn_sched_barrier(0);
     };
 
-    // ===== Prologue =====
-    static_for<T::SA_COPIES>([&](auto ii) {
-        constexpr int i = decltype(ii)::value;
-        const int index = (i * T::BLOCK_SIZE + tid) * 16;
-        const int sr = index % T::SA_ROWS;
-        const int scol = index / T::SA_ROWS;
-        const int sc = scol < SC ? scol : SC - 1;
-        int source = sr < BM && row + sr < M ? sc * args.stride_sfa + row + sr : (SC - 1) * args.stride_sfa + M;
-        async_load<16>(gsa, arena + T::OFF_SA + (i * T::BLOCK_SIZE + wave * 64) * 16, source);
-    });
-    auto* sbdst = arena + T::OFF_SB + wave * 64 * 4;
-    if constexpr (T::SB_SLOTS) {
-        const int index = tid % (T::SB_ROWS * SC);
-        const int sr = index / SC;
-        const int sc = index % SC;
-        async_load<1>(gsb, sbdst, (col / 128 + sr) * args.stride_sfb + sc);
-    } else {
-        const int index = tid % (T::SB_ROWS * (SC / 4));
-        const int sr = index / (SC / 4);
-        const int word = index % (SC / 4);
-        async_load<4>(gsb, sbdst, (col / 128 + sr) * args.stride_sfb + word * 4);
-    }
-    static_for<T::INITIAL_A>([&](auto i) { issue_a(decltype(i)::value, decltype(i)::value); });
+    auto issue_scale_panels = [&]() {
+        static_for<T::SA_COPIES>([&](auto ii) {
+            constexpr int i = decltype(ii)::value;
+            const int index = (i * T::BLOCK_SIZE + thread_id) * 16;
+            const int sr = index % T::SA_ROWS;
+            const int scol = index / T::SA_ROWS;
+            const int scale_col = scol < SC ? scol : SC - 1;
+            int source = sr < BM && row + sr < M ? u_gsfa(scale_col, sr) + row : (SC - 1) * args.stride_sfa + M;
+            async_load<16>(g_sfa, arena + T::OFF_SA + u_ssfa.offsets[i], source);
+        });
+        auto* sbdst = arena + T::OFF_SB + u_ssfb(wave_id, 0, 0);
+        if constexpr (T::SB_SLOTS) {
+            const int index = thread_id % (T::SB_ROWS * SC);
+            const int sr = index / SC;
+            const int scale_col = index % SC;
+            async_load<1>(g_sfb, sbdst, u_gsfb(col / 128 + sr, scale_col));
+        } else {
+            const int index = thread_id % (T::SB_ROWS * (SC / 4));
+            const int sr = index / (SC / 4);
+            const int word = index % (SC / 4);
+            async_load<4>(g_sfb, sbdst, u_gsfb(col / 128 + sr, word * 4));
+        }
+    };
 
-    constexpr int F = KS * NR;
-    static_for<BD>([&](auto i) {
-        constexpr int fragment = decltype(i)::value;
-        issue_b(number<fragment % BS>{}, number<fragment % F>{}, fragment / F);
-    });
-
-    // ===== Main loop =====
+    // Prepare the panel consumer before issuing the prologue requests.
     auto consume_panel = [&](int t, auto phase_i) {
         constexpr int phase = decltype(phase_i)::value;
         constexpr bool future_a = phase + T::INITIAL_A < P;
@@ -259,40 +416,38 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         s_waitcnt_lgkmcnt(0_I);
         opus::sync_threads();
 
-        array<array<typename Base::vtype_a, MR>, T::ROTATE_B ? 1 : KS> af;
-        array<array<unsigned, (MR + 3) / 4>, KS> as{};
-        array<unsigned, KS> bs{};
+        array<array<typename Base::vtype_a, MR>, T::ROTATE_B ? 1 : KS> r_a;
+        array<array<unsigned, (MR + 3) / 4>, KS> r_sfa{};
+        array<unsigned, KS> r_sfb{};
         static_for<KS>([&](auto ki) {
             constexpr int ks = decltype(ki)::value;
-            const int scale_col = t * KS + ks;
             static_for<(BN / WaveColumns + 127) / 128>([&](auto group_i) {
                 constexpr int group = decltype(group_i)::value;
-                const int group_n = wn * (BN / WaveColumns) / 128 + group;
-                const unsigned scale = load<1>(ss, T::OFF_SB + (group_n * SC + scale_col) * (T::SB_SLOTS ? 4 : 1))[0];
-                bs[ks] |= scale << (group * 8);
+                const unsigned scale = load<1>(s_scale,
+                    T::OFF_SB + u_rsfb(ks, group) + t * KS * (T::SB_SLOTS ? 4 : 1))[0];
+                r_sfb[ks] |= scale << (group * 8);
             });
             static_for<MR>([&](auto mi) {
                 constexpr int m = decltype(mi)::value;
-                const int ar = m * 16 + lane16;
-                const unsigned scale = load<1>(ss, T::OFF_SA + scale_col * T::SA_ROWS + ar)[0];
-                as[ks][m / 4] |= scale << ((m % 4) * 8);
+                const unsigned scale = load<1>(s_scale, T::OFF_SA + u_rsfa(ks, m) + t * KS * T::SA_ROWS)[0];
+                r_sfa[ks][m / 4] |= scale << ((m % 4) * 8);
             });
         });
         auto read_a = [&](auto ki) {
             constexpr int ks = decltype(ki)::value;
+            const auto u_ra = make_layout_ra<T>(lane_id, ks);
             static_for<MR>([&](auto mi) {
                 constexpr int m = decltype(mi)::value;
-                const int ar = m * 16 + lane16;
-                const int lo = slot * T::STAGE_BYTES + ar * BK + (((ks * 8 + kg) ^ (ar % (BK / 16))) * 16);
-                const int hi = slot * T::STAGE_BYTES + ar * BK + (((ks * 8 + kg + 4) ^ (ar % (BK / 16))) * 16);
+                const int lo = slot * T::STAGE_BYTES + u_ra.offsets[m * 2];
+                const int hi = slot * T::STAGE_BYTES + u_ra.offsets[m * 2 + 1];
                 if constexpr (T::PIN_A) {
                     array<int, 2> offsets;
                     offsets[0] = lo;
                     offsets[1] = hi;
-                    load_operand_fragment_pinned<16, 0>(number<(ks * MR + m) * 8>{}, af[T::ROTATE_B ? 0 : ks][m], sa, offsets);
+                    load_operand_fragment_pinned<16, 0>(number<(ks * MR + m) * 8>{}, r_a[T::ROTATE_B ? 0 : ks][m], s_a, offsets);
                 } else {
-                    set_slice(af[T::ROTATE_B ? 0 : ks][m], load<16>(sa, lo), 0_I, 16_I);
-                    set_slice(af[T::ROTATE_B ? 0 : ks][m], load<16>(sa, hi), 16_I, 32_I);
+                    set_slice(r_a[T::ROTATE_B ? 0 : ks][m], load<16>(s_a, lo), 0_I, 16_I);
+                    set_slice(r_a[T::ROTATE_B ? 0 : ks][m], load<16>(s_a, hi), 16_I, 32_I);
                 }
             });
         };
@@ -324,13 +479,13 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
                 constexpr int m = decltype(mi)::value;
                 constexpr int ci = m * NR + n;
                 if constexpr (T::PIN_C) {
-                    [[clang::amdgpu_pin_agpr(128 + ci * 4)]] c[ci] = c[ci];
+                    [[clang::amdgpu_pin_agpr(128 + ci * 4)]] r_c[ci] = r_c[ci];
                     [[clang::amdgpu_pin_agpr(128 + ci * 4)]]
-                    c[ci] = Base{}(af[T::ROTATE_B ? 0 : ks][m], bregs[(T::ROTATE_B ? fragment : phase * F + fragment) % BS], c[ci],
-                        static_cast<int>(as[ks][m / 4]), static_cast<int>(bs[ks]), number<m % 4>{}, number<n / 8>{});
+                    r_c[ci] = Base{}(r_a[T::ROTATE_B ? 0 : ks][m], r_b[(T::ROTATE_B ? fragment : phase * F + fragment) % BS], r_c[ci],
+                        static_cast<int>(r_sfa[ks][m / 4]), static_cast<int>(r_sfb[ks]), number<m % 4>{}, number<n / 8>{});
                 } else {
-                    c[ci] = Base{}(af[T::ROTATE_B ? 0 : ks][m], bregs[(T::ROTATE_B ? fragment : phase * F + fragment) % BS], c[ci],
-                        static_cast<int>(as[ks][m / 4]), static_cast<int>(bs[ks]), number<m % 4>{}, number<n / 8>{});
+                    r_c[ci] = Base{}(r_a[T::ROTATE_B ? 0 : ks][m], r_b[(T::ROTATE_B ? fragment : phase * F + fragment) % BS], r_c[ci],
+                        static_cast<int>(r_sfa[ks][m / 4]), static_cast<int>(r_sfb[ks]), number<m % 4>{}, number<n / 8>{});
                 }
                 if constexpr (future_a && fragment == 0 && m == PublishM)
                     issue_a((T::ROTATE_B ? t + NB - 1 : phase + NB - 1) % NB, t + NB - 1);
@@ -338,28 +493,28 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         });
         if constexpr (T::ROTATE_B) {
             // Advance the bounded queue without expanding its ring period.
-            auto next_b = bregs;
+            auto next_b = r_b;
             static_for<BS>([&](auto i) {
                 constexpr int slot_b = decltype(i)::value;
-                next_b[slot_b] = bregs[(slot_b + F) % BS];
+                next_b[slot_b] = r_b[(slot_b + F) % BS];
             });
-            bregs = next_b;
+            r_b = next_b;
         }
     };
-    constexpr int STEADY = P - T::INITIAL_A;
-    constexpr int START = T::INITIAL_A < STEADY ? T::INITIAL_A : STEADY;
+    // ===== Prologue =====
+    // Issue initial scale/matrix loads and consume startup panels.
+    issue_scale_panels();
+    static_for<T::INITIAL_A>([&](auto i) { issue_a(decltype(i)::value, decltype(i)::value); });
+    static_for<BD>([&](auto i) {
+        constexpr int fragment = decltype(i)::value;
+        issue_b(number<fragment % BS>{}, number<fragment % F>{}, fragment / F);
+    });
     static_for<START>([&](auto i) {
         constexpr int t = decltype(i)::value;
         consume_panel(t, number<t>{});
     });
-    constexpr int PERIOD = []() constexpr {
-        if constexpr (T::ROTATE_B) return 1;
-        int a = NB, b = BS;
-        while (b) { int r = a % b; a = b; b = r; }
-        return NB / a * BS;
-    }();
-    constexpr int GROUPS = (STEADY - START) / PERIOD;
-    constexpr int END = START + GROUPS * PERIOD;
+    // ===== Main loop =====
+    // Consume the steady A-stage/B-queue period.
     if constexpr (GROUPS > 0) {
 #pragma nounroll
         for (int group = 0; group < GROUPS; ++group) {
@@ -369,19 +524,18 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
             });
         }
     }
+    // ===== Epilogue =====
+    // Drain the remaining panels before output writeback.
     static_for<P - END>([&](auto i) {
         constexpr int t = END + decltype(i)::value;
         consume_panel(t, number<t>{});
     });
 
     // ===== Output writeback =====
-    // Pack BF16 output directly or stage contiguous stripes through LDS.
+    // Pack BF16 directly or reuse LDS for contiguous stripes.
     if constexpr (T::OUTPUT == 2) {
-        opus_gemm_prefetch_b_vgpr_detail::store_mfma16_packed<T, true>(c, gc, lane, 0, wn, stride_c);
+        opus_gemm_prefetch_b_vgpr_detail::store_mfma16_packed<T, true>(r_c, g_c, lane_id, 0, wave_id_n, stride_c);
     } else {
-        auto sc = make_smem(reinterpret_cast<bf16_t*>(arena));
-        constexpr int MAX_ROWS = BM;
-        constexpr int C_ROWS = output_rows(BM, BN, T::PIPELINE_BYTES);
         static_for<(MAX_ROWS + C_ROWS - 1) / C_ROWS>([&](auto parti) {
             constexpr int part = decltype(parti)::value;
             constexpr int PART_ROWS = MAX_ROWS - part * C_ROWS < C_ROWS ? MAX_ROWS - part * C_ROWS : C_ROWS;
@@ -393,9 +547,8 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
                     static_for<NR>([&](auto ni) {
                         constexpr int n = decltype(ni)::value;
                         constexpr int ci = m * NR + n;
-                        const int rr = m * 16 + lane16;
-                        const int nn = wn * (BN / WaveColumns) + n * 16 + kg * 4;
-                        store<4>(sc, cast<bf16_t>(c[ci]), (rr - part * C_ROWS) * (BN + 8) + nn);
+                        store<4>(s_c, cast<bf16_t>(r_c[ci]),
+                            u_sc.offsets[ci] - part * C_ROWS * (BN + 8));
                     });
             });
             s_waitcnt_lgkmcnt(0_I);
@@ -404,23 +557,21 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
             array<vector_t<bf16_t, 8>, CHUNKS> output;
             static_for<CHUNKS>([&](auto ii) {
                 constexpr int i = decltype(ii)::value;
-                const int index = i * T::BLOCK_SIZE + tid;
+                const int index = i * T::BLOCK_SIZE + thread_id;
                 const int rr = index / (BN / 8);
-                const int nn = index % (BN / 8) * 8;
                 if constexpr (PART_ROWS * (BN / 8) % T::BLOCK_SIZE == 0)
-                    output[i] = load<8>(sc, rr * (BN + 8) + nn);
+                    output[i] = load<8>(s_c, u_sc_copy.offsets[i]);
                 else if (rr < PART_ROWS)
-                    output[i] = load<8>(sc, rr * (BN + 8) + nn);
+                    output[i] = load<8>(s_c, u_sc_copy.offsets[i]);
             });
             __builtin_amdgcn_sched_barrier(0);
             s_waitcnt_lgkmcnt(0_I);
             static_for<CHUNKS>([&](auto ii) {
                 constexpr int i = decltype(ii)::value;
-                const int index = i * T::BLOCK_SIZE + tid;
+                const int index = i * T::BLOCK_SIZE + thread_id;
                 const int rr = index / (BN / 8);
-                const int nn = index % (BN / 8) * 8;
                 if (rr < PART_ROWS && part * C_ROWS + rr < valid_rows)
-                    store<8>(gc, output[i], (part * C_ROWS + rr) * stride_c + nn, 0, number<T::STORE_CACHE>{});
+                    store<8>(g_c, output[i], part * C_ROWS * stride_c + u_gc_copy.offsets[i], 0, number<T::STORE_CACHE>{});
             });
         });
     }

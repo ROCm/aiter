@@ -91,6 +91,7 @@ inline void* opus_validate_workspace(aiter_tensor_t& workspace,
 #endif
 
 #include "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh"
+#include "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"
 #include "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh"
 // Both opus_gemm_a16w16_traits_gfx950 (split-barrier) and
 // opus_gemm_a16w16_flatmm_traits_gfx950 (warp-spec) live in this one header.

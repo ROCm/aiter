@@ -11,7 +11,9 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_overlap_traits
     : opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits<
         BM, BN, NB, BD, BC, XCD, FixedK, WN, WGPerCU, ACache, StoreCache,
         Output, BlockK, Contiguous, PinA, PinC, GroupM> {
+    // Select the M repeat that issues the next A-stage prefetch.
     static constexpr int PUBLISH_M = PublishM;
 
+    // Publish before the final M repeat without changing the fragment queue.
     static_assert(PublishM >= 0 && PublishM < BM / 16 - 1);
 };

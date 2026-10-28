@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"
+
 #include <opus/opus.hpp>
 
+// M repeats share an A fragment ring, B fragments, and two LDS matrix stages.
 template<int BlockM = 192, int BlockN = 256, int ScalePanel = 128, int FixedK = 0,
     int WaveM = 4, int GroupM = 0, int CacheA = 0, int CacheB = 0,
     bool FragmentArrays = false, bool PinA = false, bool PinB = false, bool PinC = false,
     bool XcdOrder = false, bool BoundedOutput = false, int PublishM = 0, int GroupN = 8>
 struct opus_gemm_bpreshuffle_pingpong_lds_traits {
+    // Wave64 topology and block/MFMA tile dimensions.
     static constexpr int BLOCK_SIZE = WaveM * 2 * 64;
     static constexpr int WARP_SIZE = 64;
     static constexpr int NUM_WAVES = BLOCK_SIZE / WARP_SIZE;
@@ -41,6 +45,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
 
     static_assert(E_M >= 2 && B_N >= NUM_WAVES * 16);
 
+    // K specialization, tile grouping, and matrix cache policies.
     static constexpr int FIXED_K = FixedK;
     static constexpr int GROUPED_M = GroupM;
     static constexpr int CACHE_A = CacheA;
@@ -50,6 +55,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static_assert(CacheA == 0 || CacheA == 1 || CacheA == 17);
     static_assert(CacheB == 0 || CacheB == 1 || CacheB == 17);
 
+    // Fragment arrays support independent A/B/C pinning.
     static constexpr bool PIN_A = PinA;
     static constexpr bool PIN_B = PinB;
     static constexpr bool PIN_C = PinC;
@@ -59,11 +65,13 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr bool BOUNDED_OUTPUT = BoundedOutput;
     static constexpr int PUBLISH_M = PublishM;
 
-    // Publish the next LDS tile before the last M repeat reloads B.
+    // The publication index excludes the final M repeat.
     static_assert(PublishM >= 0 && PublishM < BlockM / (WaveM * 16) - 1);
+    // Pinned B occupies AGPRs 64-127; pinned C starts at AGPR 128.
     static_assert(!PIN_B || E_N * 8 <= 64);
     static_assert(!PIN_C || 128 + E_M * E_N * 4 <= 256);
 
+    // Vector widths and K128 block-scale groups.
     static constexpr int VEC_A = 16;
     static constexpr int VEC_B = 16;
     static constexpr int VEC_C = 4;
@@ -77,6 +85,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int GROUP_K = 128;
     static constexpr int SCALE_N_HALVES = (B_N + GROUP_N - 1) / GROUP_N;
 
+    // Launch-order swizzles for matrix-tile reuse.
     static constexpr int SWIZZLE_GROUP_M = 4;
     static constexpr int SWIZZLE_GROUP_N = GroupN;
     static_assert(GroupN == 4 || GroupN == 8 || GroupN == 16 || GroupN == 32 || GroupN == 64);
@@ -87,6 +96,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int MAX_K = ScalePanel * GROUP_K;
     static constexpr int LOOP_UNROLL = 2;
 
+    // Padded matrix LDS rows and two ping-pong stages.
     static constexpr int smem_linear_wave = WARP_SIZE * VEC_A;
     static constexpr int smem_m_rep = B_M * B_K / smem_linear_wave;
     static constexpr int smem_n_rep = B_N * B_K / smem_linear_wave;
@@ -100,6 +110,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int MATRIX_VMEM_INSTRUCTIONS = B_M * B_K / (BLOCK_SIZE * VEC_A) + B_N * B_K / (BLOCK_SIZE * VEC_B);
     static_assert(NUM_STAGES == 2);
 
+    // Raw A-scale bytes and packed B-scale words share the LDS allocation.
     static constexpr int SCALE_PANEL = ScalePanel;
     static constexpr int SFA_BYTES = B_M * SCALE_PANEL;
     static constexpr int SFB_BYTES = SCALE_PANEL * sizeof(unsigned);
@@ -110,6 +121,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int SFA_ROWS_PER_PASS = SFA_THREADS_PER_GROUP * VEC_SCALE_A;
     static constexpr int SFA_PASSES = (B_M + SFA_ROWS_PER_PASS - 1) / SFA_ROWS_PER_PASS;
 
+    // Scale-panel passes must cover the K columns and M rows.
     static_assert(BLOCK_SIZE % SCALE_PANEL == 0);
     static_assert(SFA_THREADS_PER_GROUP <= WARP_SIZE);
     static_assert(FIXED_K == 0 || (FIXED_K % B_K == 0 && FIXED_K <= MAX_K));
@@ -122,6 +134,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int B_SCALE_PACKS = 1;
     static constexpr int LDS_BYTES = MATRIX_LDS_BYTES + SFA_BYTES + SFB_BYTES;
 
+    // The BF16 epilogue reuses LDS with a padded row stride.
     static constexpr int C_LDS_ROW_STRIDE_ELEMS = B_N + 8;
     static constexpr int OUTPUT_PASSES = B_M * B_N / (BLOCK_SIZE * VEC_OUTPUT);
     static_assert(B_M * C_LDS_ROW_STRIDE_ELEMS * sizeof(opus::bf16_t) <= LDS_BYTES);

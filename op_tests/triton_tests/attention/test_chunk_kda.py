@@ -62,8 +62,10 @@ def make_inputs(seqlens, H, seed=0, dup_keys=False, gate_shift=0.0):
         k.copy_(k[:, :1] + 0.02 * k)
     g = torch.randn(1, T, H, D, dtype=torch.bfloat16, device=DEVICE) + gate_shift
     beta = torch.randn(1, T, H, dtype=torch.bfloat16, device=DEVICE)
-    A_log = torch.log(torch.empty(H, device=DEVICE).uniform_(1, 16))
-    dt_bias = torch.randn(H * D, device=DEVICE)
+    A_log = torch.log(
+        torch.empty(H, dtype=torch.float32, device=DEVICE).uniform_(1, 16)
+    )
+    dt_bias = torch.randn(H * D, dtype=torch.float32, device=DEVICE)
     cu = torch.tensor(
         [0, *itertools.accumulate(seqlens)], dtype=torch.int32, device=DEVICE
     )
@@ -129,8 +131,10 @@ def make_vllm_inputs(seqlens, H=K3_H, nd_tok=0, spec=False, pad_tok=3, seed=0):
         "v": v,
         "g": g,
         "beta": beta,
-        "A_log": torch.log(torch.empty(H, device=DEVICE).uniform_(1, 16)),
-        "dt_bias": torch.randn(H * D, device=DEVICE),
+        "A_log": torch.log(
+            torch.empty(H, dtype=torch.float32, device=DEVICE).uniform_(1, 16)
+        ),
+        "dt_bias": torch.randn(H * D, dtype=torch.float32, device=DEVICE),
         "cu_seqlens": torch.tensor(
             [0, *itertools.accumulate(seqlens)], dtype=torch.int32, device=DEVICE
         ),
@@ -144,7 +148,9 @@ def make_vllm_inputs(seqlens, H=K3_H, nd_tok=0, spec=False, pad_tok=3, seed=0):
 
 def make_page_cache(num_slots, H=K3_H, guard=0):
     """vLLM hybrid pages; ``guard`` POISON pages on each side catch -1 / num_slots rows."""
-    raw = torch.full(((num_slots + 2 * guard) * K3_PAGE,), POISON, device=DEVICE)
+    raw = torch.full(
+        ((num_slots + 2 * guard) * K3_PAGE,), POISON, dtype=torch.float32, device=DEVICE
+    )
     cache = raw.as_strided(
         (num_slots, H, D, D), (K3_PAGE, D * D, D, 1), guard * K3_PAGE + K3_STATE_OFF
     )
@@ -155,8 +161,10 @@ def seed_slots(raw, cache, slots, has_init):
     """Random valid slots; returns (expected start state, writable mask of raw, valid)."""
     valid = (slots >= 0) & (slots < cache.shape[0])
     rows = slots[valid].long()
-    cache[rows] = torch.randn(len(rows), *cache.shape[1:], device=DEVICE)
-    h0 = torch.zeros(len(slots), *cache.shape[1:], device=DEVICE)
+    cache[rows] = torch.randn(
+        len(rows), *cache.shape[1:], dtype=torch.float32, device=DEVICE
+    )
+    h0 = torch.zeros(len(slots), *cache.shape[1:], dtype=torch.float32, device=DEVICE)
     h0[valid & has_init] = cache[slots[valid & has_init].long()]
     written = torch.zeros_like(raw, dtype=torch.bool)
     written.as_strided(cache.shape, cache.stride(), cache.storage_offset())[rows] = True
@@ -237,14 +245,20 @@ def workspace_ref(inp, scale):
 
 @pytest.mark.parametrize(
     "seqlens",
-    [[64], [1], [63], [65], [300], [1, 64, 130, 7], [1000], [5, 0, 70]],
+    [[64], [1], [63], [65], [300], [1, 64, 130, 7], [1000], [4096], [5, 0, 70]],
 )
-def test_chunk_kda(seqlens):
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_chunk_kda(seqlens, state_dtype):
     H = 4
+    if state_dtype == torch.bfloat16 and ARCH != "gfx950":
+        pytest.skip("bf16 state requires gfx950")
     inp = make_inputs(seqlens, H)
-    h0 = torch.randn(len(seqlens), H, D, D, device=DEVICE)
+    h0 = torch.randn(len(seqlens), H, D, D, dtype=torch.float32, device=DEVICE).to(
+        state_dtype
+    )
     o_ref, s_ref = run_ref(inp, h0)
     o, s = run_kernel(inp, initial_state=h0, output_final_state=True)
+    assert s.dtype == state_dtype
     assert_close("o", o_ref, o)
     assert_close("final_state", s_ref, s)
 
@@ -262,18 +276,21 @@ def test_chunk_kda_workspace(seqlens):
 
 
 @pytest.mark.parametrize("padded", [False, True])
-def test_chunk_kda_paged(padded):
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_chunk_kda_paged(padded, state_dtype):
     """State cache in place, out aliasing v; ``padded`` gives a hybrid-page slot stride."""
     seqlens, H = [130, 1, 64, 257], 24
+    if state_dtype == torch.bfloat16 and ARCH != "gfx950":
+        pytest.skip("bf16 state requires gfx950")
     inp = make_inputs(seqlens, H, seed=1)
     N = len(seqlens)
     lead, tail = (3 * 2 * H * D, 1000) if padded else (0, 0)
     page = lead + H * D * D + tail
-    raw = torch.full((3 * N, page), POISON, device=DEVICE)
+    raw = torch.full((3 * N, page), POISON, device=DEVICE, dtype=state_dtype)
     cache = raw.as_strided((3 * N, H, D, D), (page, D * D, D, 1), storage_offset=lead)
     slots = torch.randperm(3 * N, device=DEVICE)[:N].int()
     has_init = torch.tensor([True, False, True, False], device=DEVICE)
-    cache[slots.long()] = torch.randn(N, H, D, D, device=DEVICE)
+    cache[slots.long()] = torch.randn(N, H, D, D, device=DEVICE, dtype=state_dtype)
     h0 = torch.where(has_init[:, None, None, None], cache[slots.long()], 0.0)
     o_ref, s_ref = run_ref(inp, h0)
     written = torch.zeros_like(raw, dtype=torch.bool)
@@ -299,7 +316,7 @@ def test_chunk_kda_fused_norm():
     seqlens, H = [200, 70], 4
     inp = make_inputs(seqlens, H, seed=2)
     og = torch.randn_like(inp["v"])
-    nw = torch.rand(D, device=DEVICE) + 0.5
+    nw = torch.rand(D, dtype=torch.float32, device=DEVICE) + 0.5
     eps = 1e-5
     o_ref, _ = run_ref(inp)
     of = o_ref.float()
@@ -325,7 +342,7 @@ def test_chunk_kda_stress(dup_keys, gate_shift):
     """Near-duplicate keys and gates pinned at the lower bound."""
     seqlens, H = [512, 77], 4
     inp = make_inputs(seqlens, H, seed=3, dup_keys=dup_keys, gate_shift=gate_shift)
-    h0 = torch.randn(len(seqlens), H, D, D, device=DEVICE)
+    h0 = torch.randn(len(seqlens), H, D, D, dtype=torch.float32, device=DEVICE)
     o_ref, s_ref = run_ref(inp, h0)
     o, s = run_kernel(inp, initial_state=h0, output_final_state=True)
     assert_close("o", o_ref, o, 1.25 * RATIO)
@@ -563,7 +580,7 @@ def test_chunk_kda_host_checks(bad):
     ci, co = prepare_chunk_kda_metadata(inp["cu_seqlens"])
     slots = torch.arange(N, dtype=torch.int32, device=DEVICE)
     paged = {
-        "state_cache": torch.zeros(N, H, D, D, device=DEVICE),
+        "state_cache": torch.zeros(N, H, D, D, dtype=torch.float32, device=DEVICE),
         "state_indices": slots,
         "has_initial_state": torch.ones(N, dtype=torch.bool, device=DEVICE),
     }
@@ -579,14 +596,18 @@ def test_chunk_kda_host_checks(bad):
             "indices_strided": {"chunk_indices": ci.t().contiguous().t()},
             "out_short": {"out": inp["v"][:, 1:]},
             "out_heads": {"out": inp["v"][:, :, 1:]},
-            "out_dtype": {"out": torch.empty(1, T, H, D, device=DEVICE)},
+            "out_dtype": {
+                "out": torch.empty(1, T, H, D, dtype=torch.float32, device=DEVICE)
+            },
             "state_indices_short": dict(paged, state_indices=slots[1:]),
             "state_indices_float": dict(paged, state_indices=slots.float()),
             "has_init_short": dict(
                 paged, has_initial_state=paged["has_initial_state"][1:]
             ),
             "initial_state_rows": {
-                "initial_state": torch.zeros(N - 1, H, D, D, device=DEVICE)
+                "initial_state": torch.zeros(
+                    N - 1, H, D, D, dtype=torch.float32, device=DEVICE
+                )
             },
         }[bad]
     )

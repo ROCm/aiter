@@ -132,7 +132,7 @@ def build_moe_contiguous_psum_module():
         p_p = ptr_buf_tensor(psum)
         c_p = ptr_buf_tensor(contiguous_m)
 
-        is_lane0 = tid == fx.Uint32(0)
+        is_lane0 = tid == 0
         if is_lane0:
             carry[0] = fx.Int32(0)
         gpu.barrier()
@@ -250,11 +250,13 @@ def build_moe_contiguous_psum_remap_module():
         route_max_m: Int32,
         tile_m: Int32,
         num_valid_routes: fx.Pointer,
+        row_to_token: fx.Pointer,
+        topk: Int32,
     ):
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
         gtid = bid * MAX_EXPERTS_PER_BLOCK + tid
-        is_blk0 = bid == fx.Uint32(0)
+        is_blk0 = bid == 0
         tile_v = fx.Uint32(tile_m)
         tile_minus_1 = tile_v - 1
 
@@ -266,11 +268,12 @@ def build_moe_contiguous_psum_remap_module():
 
         m_p = ptr_buf_tensor(masked_m)
         rows_p = ptr_buf_tensor(topids_to_rows)
+        r2t_p = ptr_buf_tensor(row_to_token)
         s_p = ptr_buf_tensor(starts)
         p_p = ptr_buf_tensor(psum)
         c_p = ptr_buf_tensor(contiguous_m)
 
-        is_lane0 = tid == fx.Uint32(0)
+        is_lane0 = tid == 0
         if is_lane0:
             carry[0] = fx.Int32(0)
         gpu.barrier()
@@ -338,19 +341,24 @@ def build_moe_contiguous_psum_remap_module():
             valid_route_count = fx.Uint32(
                 ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)]
             )
+        write_row_to_token = fx.Int64(ptrtoint(row_to_token)) != 0
+        topk_v = fx.Uint32(topk)
         for route in range(gtid, valid_route_count, REMAP_NBLK * MAX_EXPERTS_PER_BLOCK):
             row_raw = rows_p[route]
             # An EP route with no grouped row carries the negative
             # DROPPED_ROUTE_ROW sentinel: the row math would turn it into a wild
             # expert index, and downstream consumers check for the sentinel, so
             # leave the slot untouched.
-            row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+            row_is_mapped = fx.Int32(row_raw) >= 0
             if row_is_mapped:
                 row = fx.Uint32(row_raw)
                 m = fx.Uint32(route_max_m)
                 expert = row // m
                 slot = row - expert * m
-                rows_p[route] = fx.Uint32(starts_lds[expert]) + slot
+                final_row = fx.Uint32(starts_lds[expert]) + slot
+                rows_p[route] = final_row
+                if write_row_to_token:
+                    r2t_p[final_row] = route // topk_v
 
     @flyc.jit
     def launch_psum_remap(
@@ -364,6 +372,8 @@ def build_moe_contiguous_psum_remap_module():
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
         num_valid_routes: fx.Pointer,
+        row_to_token: fx.Pointer,
+        topk: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         psum_remap_kernel(
@@ -377,6 +387,8 @@ def build_moe_contiguous_psum_remap_module():
             route_max_m,
             tile_m,
             num_valid_routes,
+            row_to_token,
+            topk,
         ).launch(
             grid=(REMAP_NBLK, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
@@ -424,6 +436,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         topk: Int32,
         max_tok: Int32,
         slot_stride: Int32,
+        row_to_token: fx.Pointer,
     ):
         # Uint32 for the same reason as psum_remap_kernel: all counts/indices.
         tid = fx.Uint32(fx.thread_idx.x)
@@ -442,6 +455,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         w_p = ptr_buf_tensor(gather_w, fx.BFloat16)
         tis_p = ptr_buf_tensor(tis)
         ep_p = ptr_buf_tensor(ep_rowmap)
+        r2t_p = ptr_buf_tensor(row_to_token)
 
         # Lanes past ``experts`` stay out of the scan entirely: they never write
         # lds0, and an in-range lane only ever reads indices below its own, so
@@ -470,7 +484,7 @@ def build_moe_contiguous_psum_remap_ep_module():
 
         bid = fx.Uint32(fx.block_idx.x)
         gtid = bid * MAX_EXPERTS_PER_BLOCK + tid
-        is_blk0 = bid == fx.Uint32(0)
+        is_blk0 = bid == 0
         # Multi-block: every block keeps its exclusive per-expert starts in LDS so the
         # grid-strided scatter reads starts from LDS (never global -> no cross-block
         # barrier). Only block 0 writes the global starts/psum/contiguous_m outputs.
@@ -497,6 +511,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         # ordered before this launch, so the scatter below only writes kept rows.
         nvr = fx.Uint32(ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)])
         topk_v = fx.Uint32(topk)
+        write_row_to_token = fx.Int64(ptrtoint(row_to_token)) != 0
         max_tok_v = fx.Uint32(max_tok)
         # Fused remap + ep_rowmap scatter over valid routes ([0, nvr)).
         for route in range(gtid, nvr, EP_REMAP_NBLK * MAX_EXPERTS_PER_BLOCK):
@@ -505,7 +520,7 @@ def build_moe_contiguous_psum_remap_ep_module():
             # masked->contiguous math would turn it into a wild expert index (OOB
             # LDS read of starts) and there is nothing to scatter. The route
             # kernel gives exactly the gather_w == 0 routes this sentinel.
-            row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+            row_is_mapped = fx.Int32(row_raw) >= 0
             if row_is_mapped:
                 row = fx.Uint32(row_raw)
                 m = fx.Uint32(route_max_m)
@@ -513,6 +528,8 @@ def build_moe_contiguous_psum_remap_ep_module():
                 slot = row - expert * m
                 final_row = fx.Uint32(starts_lds[expert]) + slot
                 rows_p[route] = final_row
+                if write_row_to_token:
+                    r2t_p[final_row] = route // topk_v
                 # ep_rowmap scatter for this row: packed dest + f32 weight bits.
                 w_f32 = w_p[route].to(fx.Float32)
                 t = fx.Uint32(route) // topk_v
@@ -542,6 +559,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         topk: fx.Int32,
         max_tok: fx.Int32,
         slot_stride: fx.Int32,
+        row_to_token: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         psum_remap_ep_kernel(
@@ -560,6 +578,7 @@ def build_moe_contiguous_psum_remap_ep_module():
             topk,
             max_tok,
             slot_stride,
+            row_to_token,
         ).launch(
             grid=(EP_REMAP_NBLK, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),

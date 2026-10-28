@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"
+
 template<int BM, int BN, int NB, int BD, int BC = 0, bool XCD = false,
     int FixedK = 7168, int WN = 4, int WGPerCU = 1, int ACache = 0, int StoreCache = 2,
     int Output = 0, int BlockK = 256, bool Contiguous = false,
     bool PinA = false, bool PinC = false, int GroupM = 0>
 struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
+    // Workgroup launch and cache policy.
     static constexpr int BLOCK_SIZE = WN * 64;
     static constexpr int WG_PER_CU = WGPerCU;
 
     static constexpr int CACHECTL_A = ACache;
     static constexpr int STORE_CACHE = StoreCache;
 
+    // Matrix and wave tiles.
     static constexpr int B_M = BM;
     static constexpr int B_N = BN;
     static constexpr int B_K = BlockK;
@@ -20,6 +24,7 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr int T_N = WN;
     static constexpr int T_K = 1;
 
+    // Fixed-K panel and scale counts.
     static constexpr int K = FixedK;
     static constexpr int PANELS = K / B_K;
     static constexpr int SCALE_COLS = K / 128;
@@ -27,22 +32,26 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr int W_M = 16;
     static constexpr int W_N = 16;
 
+    // MFMA repeats; output 0 uses LDS stripes and output 2 uses packed stores.
     static constexpr int MR = BM / 16;
     static constexpr int NR = BN / (WN * 16);
     static constexpr int OUTPUT = Output;
     static constexpr int E_M = MR;
     static constexpr int E_N = NR;
 
+    // Operand storage, pinning, and grouped tile order.
     static constexpr bool CONTIGUOUS = Contiguous;
     static constexpr bool PIN_A = PinA;
     static constexpr bool PIN_C = PinC;
     static constexpr int GROUPED_M = GroupM;
 
+    // Bound tile grouping and pinned fragments to the supported AGPR ranges.
     static_assert(GroupM == 0 || GroupM == 4 || GroupM == 8);
     static_assert(!PinA || (B_K / 128) * MR * 8 <= 128);
     static_assert(!PinC || MR * NR * 4 <= 128);
     static_assert(Output == 0 || Output == 2);
 
+    // A stages and the B fragment prefetch queue.
     static constexpr int STAGES = NB;
     static constexpr int B_FRAGMENTS = (B_K / 128) * NR;
     // Keep cross-K prefetch within the wave's register budget. Each B fragment
@@ -62,7 +71,7 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr bool XCD_ORDER = XCD;
     static constexpr bool SB_SLOTS = SCALE_COLS % 4 != 0;
 
-    // The A ring and resident byte-scale panels share LDS with the output tile.
+    // The A ring and byte-scale panels share LDS; output 0 reuses it for BF16 stripes.
     static constexpr int A_BYTES = BM * B_K;
     static constexpr int STAGE_BYTES = A_BYTES;
     static constexpr int A_COPIES = A_BYTES / (BLOCK_SIZE * 16);
@@ -78,6 +87,7 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
 
     static constexpr int INITIAL_A = NB - 1;
 
+    // Require legal tile divisibility, scale loads, and per-CU LDS usage.
     static_assert(BM > 0 && BM % 16 == 0 && BN > 0 && BN % (WN * 16) == 0);
     static_assert(WN == 1 || WN == 2 || WN == 4 || WN == 8);
     static_assert(NB >= 2 && BD >= 1 && BD < NB);
