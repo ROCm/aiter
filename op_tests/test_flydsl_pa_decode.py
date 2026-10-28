@@ -230,6 +230,19 @@ _COMMON_CASES = [
         for page, group in ((16, 8), (128, 16))
         for pattern in ("small_query", "probability_tail")
     ],
+    # Sparse decode rows of up to 2048 tokens take 8 partitions, which gfx1250
+    # merges within one workgroup cluster; replays must not see stale partials.
+    (
+        "cluster8",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (2048,) * 6 + (0, 1, 257, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 8,
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
@@ -285,6 +298,16 @@ _BF16_CASES = _COMMON_CASES + [
     (
         "head256",
         {"kv_heads": 2, "head_dim": 256, "block_size": 16, "max_partitions": 7},
+    ),
+    (
+        "cluster16",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (4096,) * 3 + (0, 255),
+            "max_partitions": 16,
+            "cluster": 16,
+        },
     ),
     ("head192-decode", {"group_size": 16, "head_dim": 192, "max_partitions": 4}),
     (
@@ -503,6 +526,9 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
+    if case["cluster"] is not None:
+        expected = case["cluster"] if arch == "gfx1250" else 0
+        assert compile_kwargs[-1]["cluster_merge"] == expected
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
@@ -577,6 +603,7 @@ def test_pa_decode(case, device, monkeypatch):
             "wide": False,
             "pipe": False,
             "staged": None,
+            "cluster": None,
         },
         **case,
     )
