@@ -1071,13 +1071,13 @@ def _deployment_ep_args(call, ep_mode):
 
 
 def _aot_ep_deployments(paths, patterns):
-    """(deployment, quant label, activation) of each fused_moe deployment of
-    ``paths`` that runs on this GPU, whose id matches one of ``patterns`` (any
-    id without patterns) and that test_fmoe_ep_mxfp4 can build."""
+    """(deployment, quant label, activation) of each EP fused_moe deployment
+    of ``paths`` that runs on this GPU, whose id matches one of ``patterns``
+    (any id without patterns) and that test_fmoe_ep_mxfp4 can build."""
     gfx, cu_num = get_gfx(), get_cu_num()
     found = []
     for call in load_deployments(paths).fused_moe:
-        if call.gfx != gfx or call.cu_num != cu_num:
+        if not call.is_ep or call.gfx != gfx or call.cu_num != cu_num:
             continue
         if patterns and not any(fnmatch.fnmatch(call.id, p) for p in patterns):
             continue

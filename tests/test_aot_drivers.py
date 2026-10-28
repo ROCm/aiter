@@ -167,43 +167,106 @@ class FlyDSLMoeDeploymentTest(unittest.TestCase):
             f.flush()
             return deployments.load([f.name])
 
+    @staticmethod
+    def _rank_call(deployment):
+        """(local experts, routing columns, mask length, intermediate dim,
+        FHMoE shared expert slot) of one rank's fused_moe."""
+        return (
+            deployment.local_experts,
+            deployment.topk_cols,
+            deployment.mask_size,
+            deployment.inter_dim,
+            deployment.shared_expert_id,
+        )
+
     def test_default_deployments_derive_rank_calls(self):
         from aiter.aot.flydsl import deployments
 
         by_id = {d.id: d for d in deployments.load().fused_moe}
-        # (local experts, routing columns, mask length) of one rank's fused_moe.
         expected = {
-            "deepseek-v4-pro/gfx950/a8w4/ep8-r32": (52, 6, 417),
-            "glm-5.3-flash/gfx950/a4w4/ep8-fused": (37, 10, 290),
-            "glm-5.3-flash/gfx950/a4w4/ep4": (72, 8, 289),
-            "kimi-k3/gfx1250/a4w4/ep16": (56, 16, 897),
+            "deepseek-v4-pro/gfx950/a8w4/ep8-r32": (52, 6, 417, 3072, -1),
+            "glm-5.3-flash/gfx950/a4w4/ep8-fused": (37, 10, 290, 2048, -1),
+            "glm-5.3-flash/gfx950/a4w4/ep4": (72, 8, 289, 2048, -1),
+            "kimi-k3/gfx1250/a4w4/ep16": (56, 16, 897, 3072, -1),
+            "deepseek-v4-pro/gfx950/a8w4/tp8": (384, 6, 0, 384, -1),
+            "deepseek-v4-pro/gfx950/a8w4/tp8-fhmoe": (385, 7, 0, 384, 384),
         }
         for name, shape in expected.items():
             with self.subTest(name):
-                deployment = by_id[name]
-                self.assertEqual(
-                    (
-                        deployment.local_experts,
-                        deployment.topk_cols,
-                        deployment.mask_size,
-                    ),
-                    shape,
-                )
+                self.assertEqual(self._rank_call(by_id[name]), shape)
 
-    def test_default_deployments_replay_masked_callers(self):
+    def test_default_deployments_replay_their_callers(self):
         from aiter.aot.flydsl import deployments, moe
 
         fused_moe = deployments.load().fused_moe
-        jobs = moe.parse_deployments(deployments.DEFAULT_DEPLOYMENTS)
-        self.assertTrue(fused_moe)
-        self.assertTrue(all(job["expert_mask_size"] for job in jobs))
-        callers = {
-            (job["kernel_name"], job["expert"], job["local_tokens"]) for job in jobs
-        }
+        self.assertTrue(any(d.is_ep for d in fused_moe))
+        self.assertTrue(any(not d.is_ep for d in fused_moe))
+        callers = {}
+        for job in moe.parse_deployments(deployments.DEFAULT_DEPLOYMENTS):
+            caller = (
+                job["expert"],
+                job["expert_mask_size"],
+                job["shared_expert_id"],
+                job["local_tokens"],
+            )
+            callers.setdefault(job["deployment"], set()).add(caller)
         for deployment in fused_moe:
-            for local_tokens in (False, True):
-                key = (deployment.id, str(deployment.local_experts), local_tokens)
-                self.assertIn(key, callers)
+            with self.subTest(deployment.id):
+                mask = str(deployment.mask_size or "")
+                slot = deployment.shared_expert_id
+                shared = str(slot) if slot >= 0 else ""
+                # Only a caller behind an EP dispatch passes num_local_tokens.
+                local_tokens = (False, True) if deployment.is_ep else (False,)
+                expected = {
+                    (str(deployment.local_experts), mask, shared, passed)
+                    for passed in local_tokens
+                }
+                self.assertEqual(callers[deployment.id], expected)
+
+    def test_tensor_parallel_derivation(self):
+        from aiter.aot.flydsl import moe
+
+        base = {
+            "model": "deepseek-v4-pro",
+            "gfx": "gfx950",
+            "cu_num": 256,
+            "quant": "a8w4",
+            "max_tokens": 1024,
+            "source": "test",
+        }
+
+        def edit(document):
+            document.clear()
+            document.update(
+                schema_version=1,
+                fused_moe=[
+                    dict(base, tp=[8, 4], shared_expert_mode="fused"),
+                    dict(base, tp=8, pad_align=256),
+                    dict(base, pad_align=128),
+                ],
+            )
+
+        by_id = {d.id: d for d in self._load_edited(edit).fused_moe}
+        # A shared expert fused under TP takes a column but no sentinel, and
+        # padding grows the split intermediate dim.
+        expected = {
+            "deepseek-v4-pro/gfx950/a8w4/tp8-fused": (385, 7, 0, 384, -1),
+            "deepseek-v4-pro/gfx950/a8w4/tp4-fused": (385, 7, 0, 768, -1),
+            "deepseek-v4-pro/gfx950/a8w4/tp8-pad256": (384, 6, 0, 512, -1),
+            "deepseek-v4-pro/gfx950/a8w4/tp1": (384, 6, 0, 3072, -1),
+        }
+        self.assertEqual(set(by_id), set(expected))
+        for name, shape in expected.items():
+            with self.subTest(name):
+                self.assertEqual(self._rank_call(by_id[name]), shape)
+        row = moe.deployment_row(by_id["deepseek-v4-pro/gfx950/a8w4/tp8-pad256"])
+        self.assertEqual(
+            (row["model_dim"], row["inter_dim"], row["hidden_pad"]),
+            ("7168", "512", ""),
+        )
+        self.assertEqual(
+            (row["intermediate_pad"], row["expert_mask_size"]), ("128", "")
+        )
 
     def test_default_mega_moe_jobs(self):
         from aiter.aot.flydsl import mega_moe
@@ -251,7 +314,27 @@ class FlyDSLMoeDeploymentTest(unittest.TestCase):
             )
             fused["model"] = "glm-no-shared"
 
+        def tp8(document):
+            return next(d for d in document["fused_moe"] if d.get("tp"))
+
+        def two_shared(document):
+            model = dict(document["models"]["deepseek-v4-pro"], shared_experts=2)
+            document["models"]["dsv4-two-shared"] = model
+            fhmoe = next(
+                d
+                for d in document["fused_moe"]
+                if d.get("shared_expert_mode") == "fhmoe"
+            )
+            fhmoe["model"] = "dsv4-two-shared"
+
         cases = {
+            "over TP or over EP, not both": lambda d: d["fused_moe"][1].update(tp=2),
+            "need an EP group": lambda d: tp8(d).update(redundant_experts=32),
+            "does not split over TP7": lambda d: tp8(d).update(tp=7),
+            "FHMoE runs without EP": lambda d: d["fused_moe"][1].update(
+                shared_expert_mode="fhmoe"
+            ),
+            "FHMoE runs exactly one shared expert": two_shared,
             "unknown keys": lambda d: d["fused_moe"][0].update(redundant=[32]),
             "do not split": lambda d: d["fused_moe"][1].update(
                 redundant_experts=[0, 36]

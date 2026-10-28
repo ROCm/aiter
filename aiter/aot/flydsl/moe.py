@@ -31,9 +31,12 @@ for the mask's length, and the gfx1250 route. The mask's length follows from
 the deployment (global experts, EPLB replicas, fused shared experts), which no
 tuned row records, so these callers come from the ``fused_moe`` deployments of
 ``moe_deployments.json`` (see :mod:`aiter.aot.flydsl.deployments`): what one
-rank passes ``fused_moe`` and the largest M it passes. Each is replayed with
-the mask at every bucket's smallest and largest M up to that M, bisected as
-above, and reads the tuned tables serving reads; it needs no tuned row.
+rank passes ``fused_moe`` and the largest M it passes. The file also lists
+tensor-parallel deployments, whose rank passes no mask but the padded, split
+intermediate dim and the shared-expert handling its framework uses (FHMoE
+among them). Each deployment is replayed at every bucket's smallest and largest
+M up to that M, bisected as above, and reads the tuned tables serving reads; it
+needs no tuned row.
 
 A row is compiled for the arch its ``gfx`` column names. With ``GPU_ARCHS``
 naming targets, as the wheel build sets it, only rows of those archs are
@@ -164,8 +167,8 @@ def job_arch(job: dict) -> str:
 
 def _is_grouped(row: dict) -> bool:
     """Served by FlyDSL's grouped GEMM: a row of the gfx1250 grouped table, or
-    a gfx1250 EP deployment."""
-    if row.get("expert_mask_size"):
+    a gfx1250 deployment."""
+    if row.get("deployment"):
         return job_arch(row) == "gfx1250"
     return (row.get("kernelName1") or "").strip().startswith("grouped_gemm")
 
@@ -311,18 +314,24 @@ def _buckets(max_token: int) -> list[tuple[int, int, int]]:
 
 
 def deployment_row(call: FusedMoECall) -> dict:
-    """What one rank of an EP deployment passes ``fused_moe``, in the columns
-    of a tuned row."""
+    """What one rank of a deployment passes ``fused_moe``, in the columns of a
+    tuned row."""
     q_dtype_a, q_dtype_w = _DEPLOYMENT_DTYPES[call.quant]
     row = dict.fromkeys(_ROW_FIELDS, "")
     row.update(
+        deployment=call.id,
         gfx=call.gfx,
         cu_num=str(call.cu_num),
-        model_dim=str(call.model.model_dim),
-        inter_dim=str(call.model.inter_dim),
+        model_dim=str(call.hidden_dim),
+        inter_dim=str(call.inter_dim),
         expert=str(call.local_experts),
         topk=str(call.topk_cols),
-        expert_mask_size=str(call.mask_size),
+        expert_mask_size=str(call.mask_size or ""),
+        shared_expert_id=(
+            str(call.shared_expert_id) if call.shared_expert_id >= 0 else ""
+        ),
+        hidden_pad=str(call.hidden_pad or ""),
+        intermediate_pad=str(call.intermediate_pad or ""),
         act_type=f"ActivationType.{call.model.activation}",
         dtype="torch.bfloat16",
         q_dtype_a=q_dtype_a,
@@ -331,6 +340,9 @@ def deployment_row(call: FusedMoECall) -> dict:
         use_g1u1="1",
         doweight_stage1="0",
     )
+    if call.shared_expert_id >= 0:
+        # FHMoE reads the gate/up layout from the row, not from the caller.
+        row["gate_mode"] = f"GateMode.{_caller_gate_mode(row).name}"
     return row
 
 
@@ -340,10 +352,14 @@ def parse_deployments(paths: Sequence[str], edges: bool = True) -> list[dict]:
     jobs = []
     for call in load_deployments(paths).fused_moe:
         shape = deployment_row(call)
+        variants = _variants(shape)
+        if not call.is_ep:
+            # num_local_tokens is the count an EP dispatch received.
+            variants = [v for v in variants if not v["local_tokens"]]
         for bucket, low, high in _buckets(call.max_tokens):
             row = {**shape, "token": str(bucket)}
             points = [low, high] if edges and low < high else [high]
-            for index, variant in enumerate(_variants(row)):
+            for index, variant in enumerate(variants):
                 for m in points:
                     jobs.append(
                         {
@@ -554,9 +570,9 @@ def _without_device_queries():
 
 @contextmanager
 def _runtime_reads(job: dict):
-    """Point the runtime's tuned-config lookup at the row's own table. An EP
+    """Point the runtime's tuned-config lookup at the row's own table. A
     deployment reads the tables serving reads."""
-    if job["expert_mask_size"]:
+    if job.get("deployment"):
         env = {}
     elif _is_grouped(job):
         env = {"AITER_CONFIG_GROUPED_FMOE": job["csv_path"]}
@@ -802,11 +818,11 @@ def run(
     jobs = [job for job in jobs if job_arch(job) not in skipped]
     archs = sorted({job_arch(job) for job in jobs})
     rows = {
-        tuple(job[f] for f in _ROW_KEY) for job in jobs if not job["expert_mask_size"]
+        tuple(job[f] for f in _ROW_KEY) for job in jobs if not job.get("deployment")
     }
-    calls = {job["kernel_name"] for job in jobs if job["expert_mask_size"]}
+    calls = {job["deployment"] for job in jobs if job.get("deployment")}
     print(
-        f"[aiter] FlyDSL MoE replay: {len(rows)} rows, {len(calls)} EP deployments, "
+        f"[aiter] FlyDSL MoE replay: {len(rows)} rows, {len(calls)} deployments, "
         f"{len(jobs)} jobs, archs {', '.join(archs) or '-'}",
         flush=True,
     )
@@ -852,7 +868,7 @@ def run(
 def main():
     parser = argparse.ArgumentParser(
         description="AOT pre-compile the FlyDSL kernels of tuned fused-MoE configs "
-        "and EP deployments",
+        "and MoE deployments",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(

@@ -66,6 +66,28 @@
       "source": "model_configs/dsv4_fp8fp4_tuned_fmoe.csv (expert 24, topk 6)"
     },
     {
+      "model": "deepseek-v4-pro",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "quant": "a8w4",
+      "tp": 8,
+      "pad_align": 128,
+      "max_tokens": 131072,
+      "source": "ATOM recipes/DeepSeek-V4.md (-tp 8, ATOM_MOE_GU_ITLV=1); ATOM models/deepseek_v4 (pad_align=128; the block-FP8 shared expert does not fuse into the MXFP4 routed experts)",
+      "note": "max_tokens follows model_configs/dsv4_fp8fp4_tuned_fmoe.csv (expert 384, topk 6, inter 384)"
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "quant": "a8w4",
+      "tp": 8,
+      "shared_expert_mode": "fhmoe",
+      "max_tokens": 2048,
+      "source": "vLLM models/deepseek_v4/amd/model.py (heterogeneous shared expert on gfx950 TP8: FHMoE while aiter.fhmoe.supports_dsv4_i384_fhmoe(M))",
+      "note": "max_tokens is the largest M tuned_fhmoe.csv covers, which is what vLLM checks before taking FHMoE"
+    },
+    {
       "model": "glm-5.3-flash",
       "gfx": "gfx950",
       "cu_num": 256,

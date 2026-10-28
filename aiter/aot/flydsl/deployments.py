@@ -4,12 +4,13 @@
 """MoE deployments the AOT replays compile for.
 
 ``moe_deployments.json`` records each MoE model's architecture once, and each
-deployment of it by its knobs: EP size, EPLB redundant experts, shared-expert
-handling, quant recipe and token range. What one rank hands the runtime is
-derived here, with the convention ATOM and vLLM share:
+deployment of it by its knobs: TP or EP size, EPLB redundant experts,
+shared-expert handling, weight padding, quant recipe and token range. What one
+rank hands the runtime is derived here, with the convention ATOM and vLLM share:
 
-- ``fused_moe``: the ``fused_moe`` call behind an EP dispatch, which ``moe.py``
-  replays and ``op_tests/test_moe_ep.py -t aot_ep_profiles`` checks;
+- ``fused_moe``: one rank's ``fused_moe`` call, behind an EP dispatch or on a
+  tensor-parallel slice of every expert, which ``moe.py`` replays and
+  ``op_tests/test_moe_ep.py -t aot_ep_profiles`` checks for EP;
 - ``mega_moe``: the ``MegaMoEV2`` each rank builds, which ``mega_moe.py``
   replays.
 
@@ -35,8 +36,10 @@ SCHEMA_VERSION = 1
 QUANTS = ("a8w4", "a4w4")
 ACTIVATIONS = ("Silu", "Situv2", "Swiglu")
 # separate: the shared experts run outside fused_moe; fused: every rank runs
-# them as extra local experts, as ATOM and vLLM fuse them.
-SHARED_EXPERT_MODES = ("separate", "fused")
+# them as extra local experts, as ATOM and vLLM fuse them; fhmoe: FHMoE runs the
+# shared expert from its own weights in one extra slot, as vLLM's DeepSeek-V4
+# does under TP.
+SHARED_EXPERT_MODES = ("separate", "fused", "fhmoe")
 _SECTION_ARCHS = {"fused_moe": ("gfx950", "gfx1250"), "mega_moe": ("gfx950",)}
 _SECTION_ACTIVATIONS = {"fused_moe": ACTIVATIONS, "mega_moe": ("Silu", "Situv2")}
 _MODEL_ID = re.compile(r"[a-z0-9][a-z0-9.\-]*")
@@ -54,12 +57,16 @@ _MODEL_REQUIRED = {
 }
 _MODEL_OPTIONAL = {"swiglu_limit", "situ_beta", "situ_linear_beta", "note"}
 _SITU_PARAMS = ("situ_beta", "situ_linear_beta")
-_DEPLOYMENT_REQUIRED = {"model", "gfx", "cu_num", "quant", "ep", "source"}
+_DEPLOYMENT_REQUIRED = {"model", "gfx", "cu_num", "quant", "source"}
 _DEPLOYMENT_OPTIONAL = {"redundant_experts", "note"}
 _SECTION_KEYS = {
-    "fused_moe": ({"max_tokens"}, {"shared_expert_mode"}),
-    "mega_moe": ({"max_tokens_per_rank"}, set()),
+    "fused_moe": ({"max_tokens"}, {"ep", "tp", "pad_align", "shared_expert_mode"}),
+    "mega_moe": ({"ep", "max_tokens_per_rank"}, set()),
 }
+
+
+def _round_up(value: int, align: int) -> int:
+    return (value + align - 1) // align * align
 
 
 @dataclass(frozen=True)
@@ -100,33 +107,74 @@ class _Deployment:
 
 @dataclass(frozen=True)
 class FusedMoECall(_Deployment):
-    """What one rank passes ``fused_moe`` behind an EP dispatch."""
+    """What one rank passes ``fused_moe``: behind an EP dispatch, or as one
+    tensor-parallel slice of every expert."""
 
+    tp: int
+    pad_align: int
     shared_expert_mode: str
     max_tokens: int
 
     @property
+    def is_ep(self) -> bool:
+        return self.ep > 1
+
+    @property
     def fused_shared(self) -> int:
-        return self.model.shared_experts if self.shared_expert_mode == "fused" else 0
+        """Shared experts the call runs in extra expert slots."""
+        if self.shared_expert_mode == "separate":
+            return 0
+        return self.model.shared_experts
 
     @property
     def local_experts(self) -> int:
-        """``w1.shape[0]``: the rank's slots, then the fused shared experts."""
+        """``w1.shape[0]``: the rank's slots (every expert under TP), then the
+        shared experts it runs."""
         return self.physical_experts // self.ep + self.fused_shared
 
     @property
     def topk_cols(self) -> int:
-        """``topk_ids.shape[1]``. Fused shared experts take a column each, and
-        a sentinel column masks them on the tokens of other ranks."""
+        """``topk_ids.shape[1]``. A shared expert the call runs takes a column,
+        and behind an EP dispatch a sentinel column masks it on the tokens of
+        other ranks."""
         if not self.fused_shared:
             return self.model.top_k
-        return self.model.top_k + self.fused_shared + 1
+        return self.model.top_k + self.fused_shared + self.is_ep
 
     @property
     def mask_size(self) -> int:
-        """``expert_mask.numel()``: every slot, the fused shared experts and
-        a sentinel."""
+        """``expert_mask.numel()`` behind an EP dispatch: every slot, the fused
+        shared experts and a sentinel. 0 under TP, which passes no mask."""
+        if not self.is_ep:
+            return 0
         return self.physical_experts + self.fused_shared + 1
+
+    @property
+    def shared_expert_id(self) -> int:
+        """FHMoE's slot for the shared expert, after the routed experts; -1
+        when FHMoE does not run it."""
+        if self.shared_expert_mode != "fhmoe":
+            return -1
+        return self.model.routed_experts
+
+    @property
+    def hidden_dim(self) -> int:
+        """``hidden_states.shape[1]``: the model dim padded to ``pad_align``."""
+        return _round_up(self.model.model_dim, self.pad_align)
+
+    @property
+    def inter_dim(self) -> int:
+        """The rank's expert intermediate dim: the model's split over TP and
+        padded to ``pad_align``, as ATOM's FusedMoE pads MXFP4 weights."""
+        return _round_up(self.model.inter_dim // self.tp, self.pad_align)
+
+    @property
+    def hidden_pad(self) -> int:
+        return self.hidden_dim - self.model.model_dim
+
+    @property
+    def intermediate_pad(self) -> int:
+        return self.inter_dim - self.model.inter_dim // self.tp
 
 
 @dataclass(frozen=True)
@@ -255,16 +303,20 @@ def _expand(section: str, where: str, path: str, entry, models: dict) -> list:
         "cu_num": _int(where, "cu_num", entry["cu_num"]),
         "source": _text(where, "source", entry["source"]),
     }
-    if section == "fused_moe":
+    fused_moe = section == "fused_moe"
+    if fused_moe:
         mode = _choice(
             where,
             "shared_expert_mode",
             entry.get("shared_expert_mode", "separate"),
             SHARED_EXPERT_MODES,
         )
-        if mode == "fused" and not model.shared_experts:
+        if mode != "separate" and not model.shared_experts:
             _fail(where, f"{model.id} has no shared experts to fuse")
+        if mode == "fhmoe" and model.shared_experts != 1:
+            _fail(where, "FHMoE runs exactly one shared expert")
         common["shared_expert_mode"] = mode
+        common["pad_align"] = _int(where, "pad_align", entry.get("pad_align", 1))
         common["max_tokens"] = _int(where, "max_tokens", entry["max_tokens"])
     else:
         common["max_tokens_per_rank"] = tuple(
@@ -272,14 +324,16 @@ def _expand(section: str, where: str, path: str, entry, models: dict) -> list:
             for m in _values(where, entry, "max_tokens_per_rank", None)
         )
     deployments = []
-    for quant, ep, redundant in itertools.product(
+    for quant, ep, redundant, tp in itertools.product(
         _values(where, entry, "quant", None),
-        _values(where, entry, "ep", None),
+        _values(where, entry, "ep", 1),
         _values(where, entry, "redundant_experts", 0),
+        _values(where, entry, "tp", 1),
     ):
         _choice(where, "quant", quant, QUANTS)
-        _int(where, "ep", ep, 2)
+        _int(where, "ep", ep, 1 if fused_moe else 2)
         _int(where, "redundant_experts", redundant, 0)
+        _int(where, "tp", tp)
         # ATOM refuses an EP group its expert slots do not split over evenly.
         if (model.routed_experts + redundant) % ep:
             _fail(
@@ -287,13 +341,39 @@ def _expand(section: str, where: str, path: str, entry, models: dict) -> list:
                 f"{model.routed_experts} routed + {redundant} redundant experts "
                 f"do not split over EP{ep}",
             )
-        name = f"{model.id}/{gfx}/{quant}/ep{ep}"
+        if redundant and ep == 1:
+            _fail(where, "redundant_experts need an EP group to place replicas in")
+        if tp > 1 and ep > 1:
+            _fail(where, "the experts split over TP or over EP, not both")
+        if model.inter_dim % tp:
+            _fail(where, f"inter_dim {model.inter_dim} does not split over TP{tp}")
+        name = f"{model.id}/{gfx}/{quant}/" + (f"ep{ep}" if ep > 1 else f"tp{tp}")
         name += f"-r{redundant}" if redundant else ""
-        if common.get("shared_expert_mode") == "fused":
-            name += "-fused"
-        kind = FusedMoECall if section == "fused_moe" else MegaMoEProfile
+        if not fused_moe:
+            deployments.append(
+                MegaMoEProfile(
+                    id=name, quant=quant, ep=ep, redundant_experts=redundant, **common
+                )
+            )
+            continue
+        if mode == "fhmoe" and ep > 1:
+            _fail(where, "FHMoE runs without EP")
+        align = common["pad_align"]
+        if (
+            _round_up(model.model_dim, align) != model.model_dim
+            or _round_up(model.inter_dim // tp, align) != model.inter_dim // tp
+        ):
+            name += f"-pad{align}"
+        name += "" if mode == "separate" else f"-{mode}"
         deployments.append(
-            kind(id=name, quant=quant, ep=ep, redundant_experts=redundant, **common)
+            FusedMoECall(
+                id=name,
+                quant=quant,
+                ep=ep,
+                redundant_experts=redundant,
+                tp=tp,
+                **common,
+            )
         )
     return deployments
 
@@ -344,12 +424,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {error}", file=sys.stderr)
         return 1
     print(
-        f"{'fused_moe':42} {'expert':>6} {'topk':>4} {'mask':>4} {'max_M':>7}  source"
+        f"{'fused_moe':42} {'expert':>6} {'topk':>4} {'mask':>4} {'inter':>5} "
+        f"{'max_M':>7}  source"
     )
     for call in deployments.fused_moe:
         print(
             f"{call.id:42} {call.local_experts:6} {call.topk_cols:4} "
-            f"{call.mask_size:4} {call.max_tokens:7}  {call.source}"
+            f"{call.mask_size or '-':>4} {call.inter_dim:5} {call.max_tokens:7}  "
+            f"{call.source}"
         )
     print(f"\n{'mega_moe':42} {'E/rank':>6} {'topk':>4}  max tokens per rank; source")
     for profile in deployments.mega_moe:
