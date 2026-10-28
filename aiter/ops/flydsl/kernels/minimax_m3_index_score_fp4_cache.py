@@ -8,6 +8,8 @@ decode scorer); duplicated so the prefill scorers do not depend on the decode PR
 Keep the two in step, or have the decode file import from here once both are in.
 """
 
+import torch
+
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     HEAD_DIM,
     PAGE,
@@ -21,8 +23,6 @@ SCALE_BYTES = HEAD_DIM // 32  # e8m0 bytes per token
 def _validate_cache(k_data, k_scale, device):
     """Shapes, dtypes and strides of the two views. Contents (block ids inside
     the pool, e8m0 not 0/255) are a caller contract."""
-    import torch
-
     _validate_tensor(k_data, "k_data", (torch.uint8,), 3, device, 16, False)
     _validate_tensor(k_scale, "k_scale", (torch.uint8,), 3, device, 4, False)
     if k_data.shape[1:] != (PAGE, DATA_BYTES) or k_data.shape[0] > 0x7FFFFFFF:
