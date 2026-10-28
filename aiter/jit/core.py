@@ -236,7 +236,7 @@ AITER_CONFIG_CONV3D_BF16 = os.getenv(
 )
 
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
-# (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
+# (qwen3_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
 # get_config_file returns this path as-is, and the opt AOT reads it, so it has to
 # be a readable csv rather than a missing path.

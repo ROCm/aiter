@@ -24,6 +24,7 @@ from aiter.jit.core import (
     AITER_ROOT_DIR,
 )
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.ops.flydsl import linear_attention_prefill_kernels as _k5_mod
 from aiter.ops.flydsl.linear_attention_prefill_kernels import _hipeq_select_bv
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     chunk_gated_delta_rule_fwd_h_flydsl_opt as k5,
@@ -196,7 +197,9 @@ def build_k5_inputs(case, snapshot_dtype, seed=0):
 
 
 def bench_us(args, bv: int, warmup: int, iters: int) -> float:
-    os.environ["FLYDSL_K5_OPT_BV"] = str(bv)
+    # The kernel module reads FLYDSL_K5_OPT_BV once at import, so set its copy.
+    prev = _k5_mod._OPT_BV_ENV
+    _k5_mod._OPT_BV_ENV = str(bv)
     try:
         for _ in range(warmup):
             k5(**args)
@@ -210,7 +213,7 @@ def bench_us(args, bv: int, warmup: int, iters: int) -> float:
         torch.cuda.synchronize()
         return statistics.median(s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends))
     finally:
-        os.environ.pop("FLYDSL_K5_OPT_BV", None)
+        _k5_mod._OPT_BV_ENV = prev
 
 
 def lookup_key_from_case(

@@ -6,9 +6,10 @@
 Backends per shape: FlyDSL opt, Triton ``opt_vk``, and the HIP/C++ K5 kernel
 where the shape allows it. The pure-torch fp32 reference is never timed.
 
-Shapes: Qwen3.5-35B (Hv=32) and -397B (Hv=64), TP 1/2/4/8, dense prompts and
-varlen batches. ``PREFILL_PARAMS`` / ``PREFILL_TEST_IDS`` hold the full catalog
-consumed by ``csrc/gdn_k5/chunk_gdn_h_opt_tune.py``.
+Shapes: Qwen3.5-35B (Hv=32), Qwen3.5-397B (Hv=64) and Qwen3.8-27B (Hv=48),
+TP 1/2/4/8, dense prompts and varlen batches. ``PREFILL_PARAMS`` /
+``PREFILL_TEST_IDS`` hold the full catalog consumed by
+``csrc/gdn_k5/chunk_gdn_h_opt_tune.py``.
 
 Run the default sweep::
 
@@ -315,10 +316,11 @@ def expand_groups(groups):
     return out
 
 
-# Qwen3.5 GDN prefill deployments: Hk=16 KV heads, K=V=128, chunk BT=64.
+# Qwen3.5 / Qwen3.8 GDN prefill deployments: Hk=16 KV heads, K=V=128, chunk BT=64.
 K5_MODELS = {
     "35b": {"label": "Qwen3.5-35B", "Hv": 32},
     "397b": {"label": "Qwen3.5-397B", "Hv": 64},
+    "27b": {"label": "Qwen3.8-27B", "Hv": 48},
 }
 _DENSE_PROMPT_LENS = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
 _VARLEN_SEQLENS = [1024, 2048, 4096, 8192]
@@ -389,6 +391,8 @@ _PREFILL_GROUPS = [
     *_k5_dense_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["35b"]["label"], K5_MODELS["35b"]["Hv"]),
     *_k5_varlen_groups(K5_MODELS["397b"]["label"], K5_MODELS["397b"]["Hv"]),
+    *_k5_dense_groups(K5_MODELS["27b"]["label"], K5_MODELS["27b"]["Hv"]),
+    *_k5_varlen_groups(K5_MODELS["27b"]["label"], K5_MODELS["27b"]["Hv"]),
 ]
 
 # Full tuner catalog. ``csrc/gdn_k5/chunk_gdn_h_opt_tune.py`` loads this module

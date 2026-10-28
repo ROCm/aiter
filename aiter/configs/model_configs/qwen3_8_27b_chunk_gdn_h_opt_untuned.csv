@@ -1,0 +1,9 @@
+dtype,K,V,BT,H,Hg,is_varlen,use_h0,store_fs
+torch.bfloat16,128,128,64,48,16,False,True,False
+torch.bfloat16,128,128,64,24,8,False,True,False
+torch.bfloat16,128,128,64,12,4,False,True,False
+torch.bfloat16,128,128,64,6,2,False,True,False
+torch.bfloat16,128,128,64,48,16,True,True,True
+torch.bfloat16,128,128,64,24,8,True,True,True
+torch.bfloat16,128,128,64,12,4,True,True,True
+torch.bfloat16,128,128,64,6,2,True,True,True
