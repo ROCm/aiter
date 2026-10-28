@@ -336,6 +336,7 @@ def test_fused_rope_concat_and_cache_mla(
     valid_frac: float = 1.0,
     compute_all_q_rope: bool = False,
     is_nope_first: bool = True,
+    max_position: int = 0,
 ):
     ret = {}
     torch.set_default_device(device)
@@ -372,7 +373,9 @@ def test_fused_rope_concat_and_cache_mla(
         num_tokens, num_heads, qk_rope_head_dim, dtype=dtype, device=device
     )
     entry_size = kv_lora_rank + qk_rope_head_dim
-    cos_cache, sin_cache = compute_cache(num_tokens, qk_rope_head_dim // 2, dtype)
+    # A cos/sin cache shorter than the positions tests that the kernel clamps them.
+    max_position = max_position or num_tokens
+    cos_cache, sin_cache = compute_cache(max_position, qk_rope_head_dim // 2, dtype)
     cos_cache = cos_cache.to(device)
     sin_cache = sin_cache.to(device)
 
@@ -412,7 +415,7 @@ def test_fused_rope_concat_and_cache_mla(
         kv_cache_dtype,
         scale,
         q_scale,
-        pos,
+        pos.clamp(max=max_position - 1),
         cos_cache,
         sin_cache,
         is_neox,
@@ -575,11 +578,18 @@ def test_fused_rope_concat_and_cache_mla(
             f"layout={q_nope_layout}, stride={tuple(q_nope.stride())}, "
             f"max_abs={q_nope_max_abs}"
         )
+    # Positions past a short cos/sin cache must use its last row.
+    if max_position < num_tokens and max(err_kv, err_q_out) > 0.05:
+        raise AssertionError(
+            f"positions not clamped to a {max_position}-row cos/sin cache: "
+            f"kv_err={err_kv}, q_err={err_q_out}"
+        )
     ret["fused_qk_us"] = avg_us
     ret["num_valid"] = num_valid
     ret["padded"] = num_tokens - num_valid
     ret["compute_all_q_rope"] = compute_all_q_rope
     ret["is_nope_first"] = is_nope_first
+    ret["max_position"] = max_position
     # ret["unfused_us"] = ref_us
     ret["hip_kv_err"] = err_kv
     ret["hip_q_err"] = err_q_out
@@ -762,6 +772,17 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "-mp",
+    "--max_position",
+    type=int,
+    nargs="*",
+    default=[0, 1],
+    help="""rows in the cos/sin cache. 0 means one row per token.
+    A shorter cache tests that positions past it are clamped.
+    e.g.: -mp 0 1""",
+)
+
+parser.add_argument(
     "-c",
     "--case",
     type=str,
@@ -809,10 +830,12 @@ if "fused_qk" in args.case:
                                     valid_frac,
                                     compute_all_q_rope,
                                     is_nope_first,
+                                    max_position,
                                 ) in itertools.product(
                                     args.valid_frac,
                                     args.compute_all_q_rope,
                                     args.is_nope_first,
+                                    args.max_position,
                                 ):
                                     if q_dtype == "fp8" and kv_cache_dtype != "fp8":
                                         continue
@@ -845,6 +868,9 @@ if "fused_qk" in args.case:
                                     # uninteresting (padded, early-return).
                                     if compute_all_q_rope != (valid_frac < 1.0):
                                         continue
+                                    # Only the decode kernels clamp positions.
+                                    if max_position and num_kv_heads != 1:
+                                        continue
                                     ret = test_fused_rope_concat_and_cache_mla(
                                         args.kv_lora_rank,
                                         args.qk_rope_head_dim,
@@ -862,6 +888,7 @@ if "fused_qk" in args.case:
                                         valid_frac,
                                         compute_all_q_rope,
                                         is_nope_first,
+                                        max_position,
                                     )
                                     df.append(ret)
     df = pd.DataFrame(df)

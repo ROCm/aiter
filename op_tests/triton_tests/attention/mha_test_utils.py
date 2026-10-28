@@ -52,7 +52,9 @@ def pad_rearrange_dropout_mask(
     batch_size = cu_seqlens_q.numel() - 1
 
     padded_dropout_mask = torch.ones(
-        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
+        (batch_size, num_q_heads, seqlen_q, seqlen_k),
+        device="cuda",
+        dtype=torch.float32,
     )
     for b in range(batch_size):
         start_q = cu_seqlens_q[b].item()

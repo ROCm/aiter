@@ -27,8 +27,9 @@ MAX_G2L_EXPERTS = 512
 # the plain device-atomic kernel when the local bucket count (E) exceeds it.
 MAX_ROUTE_BUCKETS = 512
 
-# ``topids_to_rows`` value for an EP route that owns no grouped row (non-local
-# expert, or dead-tail padding). Such routes claim no per-expert slot, so
+# ``topids_to_rows`` value for a route that owns no grouped row: an EP route to a
+# non-local expert or in the dead-tail padding, or a route to expert -1 (a pad
+# row the router left unrouted). Such routes claim no per-expert slot, so
 # masked_m / psum / the grouped GEMM cover only the routes this rank owns instead
 # of every route it received. Consumers (psum remap, the stage1 route-indexed
 # quant scatter, gather-reduce) must skip it rather than use it as a row index.
@@ -147,10 +148,16 @@ def build_moe_topids_to_rows_module():
             out_p = ptr_buf_tensor(topids_to_rows)
 
             e = topk_p[route]
-            ptr = _i32_ptr(atomic_buffer) + e
-            slot = fx.atomic_add(ptr, c1_i32, syncscope="agent")
-            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-            out_p[route] = row
+            # The counter is indexed through a raw pointer, so an id of -1
+            # must not reach the atomic.
+            routed = fx.Int32(e) >= 0
+            if routed:
+                ptr = _i32_ptr(atomic_buffer) + e
+                slot = fx.atomic_add(ptr, c1_i32, syncscope="agent")
+                row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
+                out_p[route] = row
+            else:
+                out_p[route] = fx.Int32(DROPPED_ROUTE_ROW)
 
     @flyc.jit
     def launch_topids_to_rows(
@@ -436,7 +443,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             my_rank = fx.Uint32(
                 fx.atomic_add(
                     lds_cnt + eff_e,
-                    fx.Int32(c1),
+                    c1,
                     syncscope="workgroup",
                 )
             )
