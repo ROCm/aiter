@@ -2487,6 +2487,67 @@ def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
     check_varlen_capable_objects(arch)
 
 
+def check_lse_capable_objects(arch="gfx950"):
+    """Every dense row _LSE_CAPABLE_QV claims must really read the LSE kernarg.
+
+    Same hole as the varlen gate: the key is (q_format, v_format) alone, so a pair that gains a
+    second object inherits the claim. O never reads LSE, so every output test still passes while
+    the returned LSE is whatever the buffer held. Matched on the kernarg load rather than a bare
+    literal, and calibrated against a pre-LSE object, which reads neither 0x40 nor 0x100.
+    """
+    asm_dir = os.environ.get(
+        "AITER_ASM_DIR", os.path.join(mha_v4_module.AITER_ROOT_DIR, "hsa")
+    )
+    root = os.path.join(asm_dir, arch, "fmha_v4_fwd")
+    with open(os.path.join(root, "fmha_v4_fwd.csv"), encoding="utf-8") as manifest:
+        rows = [
+            line.strip().split(",")
+            for line in manifest
+            if line.strip() and not line.startswith("#")
+        ]
+    header, rows = rows[0], rows[1:]
+    q_at, v_at = header.index("q_format"), header.index("v_format")
+    mode_at, co_at = header.index("mode"), header.index("co_name")
+
+    claimed = sorted(
+        {
+            row[co_at]
+            for row in rows
+            if row[mode_at] == "0"
+            and (AttentionFormat(int(row[q_at])), AttentionFormat(int(row[v_at])))
+            in mha_v4_module._LSE_CAPABLE_QV
+        }
+    )
+    assert claimed, f"no dense {arch} rows are claimed LSE-capable"
+
+    silent = []
+    for name in claimed:
+        listing = subprocess.run(
+            [_llvm_objdump(), "-d", f"--mcpu={arch}", os.path.join(root, name)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        if not re.search(
+            r"s_load_dword(?:x2)?\s+s\[?\d+(?::\d+)?\]?, s\[0:1\], 0x100\b",
+            re.sub(r"//.*", "", listing),
+        ):
+            silent.append(name)
+    assert not silent, (
+        f"{arch} rows claimed in _LSE_CAPABLE_QV never load the LSE kernarg: {silent}; "
+        "they would return whatever the LSE buffer already held"
+    )
+    aiter.logger.info(
+        "LSE gate: all %d claimed %s rows load the LSE kernarg", len(claimed), arch
+    )
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@parametrize("arch", ["gfx950"])
+def test_mha_v4_lse_capable_rows_load_the_lse_kernarg(arch):
+    check_lse_capable_objects(arch)
+
+
 if __name__ == "__main__":
     main()
     # CI runs this file as a script, so the checks only execute if main() invokes them.
