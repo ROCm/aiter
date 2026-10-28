@@ -254,6 +254,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         from aiter.ops import gemm_op_a8w8 as _op
 
         _op._load_mxscale_bpreshuffle_tuned.cache_clear()
+        _op._mxscale_bpreshuffle_tuned_nk.cache_clear()
         _op.get_mxscale_bpreshuffle_config.cache_clear()
         _op._get_mxfp8_bpreshuffle_config.cache_clear()
         _op._load_mxfp8_bpreshuffle_tuned.cache_clear()
