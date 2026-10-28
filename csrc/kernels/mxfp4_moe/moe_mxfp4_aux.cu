@@ -153,12 +153,26 @@ void mxfp4_moe_sort_kernel(
     int64_t D_HIDDEN,
     int64_t D_INTER,
     int64_t MB,
-    int64_t prologue)
+    int64_t prologue,
+    std::optional<aiter_tensor_t> num_local_tokens)
 {
     (void)D_INTER;
     HipDeviceGuard guard(topk_ids.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(M_logical);
+
+    const int32_t* local_tokens_ptr = nullptr;
+    if (num_local_tokens.has_value()) {
+        auto& local = num_local_tokens.value();
+        AITER_CHECK(local.dtype() == AITER_DTYPE_i32 && local.numel() >= 1 &&
+                        local.device_id == topk_ids.device_id,
+                    "mxfp4_moe_sort: num_local_tokens must be an int32 [1] tensor "
+                    "on the topk_ids device");
+        AITER_CHECK(prologue == 0,
+                    "mxfp4_moe_sort: num_local_tokens is only supported by the "
+                    "inline_quant (prologue=0) sort");
+        local_tokens_ptr = static_cast<const int32_t*>(local.data_ptr());
+    }
 
     void* bf16_zero_ptr = (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
     void* bf16_zero_ws_ptr = nullptr;
@@ -203,7 +217,7 @@ void mxfp4_moe_sort_kernel(
             static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
             static_cast<float*>(sorted_weights.data_ptr()),
             static_cast<int32_t*>(m_indices.data_ptr()),
-            bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes);
+            bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes, local_tokens_ptr);
     } else {
         const std::string key = "aux_sortonly_NE" + std::to_string(NE)
             + "_TOPK" + std::to_string(TOPK) + "_MB" + std::to_string(MB)
@@ -214,7 +228,8 @@ void mxfp4_moe_sort_kernel(
             static_cast<int32_t*>(sorted_token_ids.data_ptr()), static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
             static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
             static_cast<float*>(sorted_weights.data_ptr()),
-            static_cast<int32_t*>(m_indices.data_ptr()));
+            static_cast<int32_t*>(m_indices.data_ptr()),
+            local_tokens_ptr);
     }
 }
 
