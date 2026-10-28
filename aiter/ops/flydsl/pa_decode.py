@@ -247,10 +247,10 @@ def pa_decode(
     the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
     that still own several tasks merge them in the tile kernel using the plan's
     arrival counters. Otherwise, when P = min(partition bound, max_partitions)
-    is in [2, 16] and P CTAs per sequence fit the plan capacity or two per CU
-    (head_dim <= 512), each sequence's tasks run as one cluster of P
-    workgroups that merges them on chip. Other plans use packed scratch and
-    the separate reducer.
+    is in [2, 16], P CTAs per sequence fit the plan capacity or two per CU,
+    and the sequences times KV heads stay within 15 per 16 CUs (head_dim <=
+    512), each sequence's tasks run as one cluster of P workgroups that merges
+    them on chip. Other plans use packed scratch and the separate reducer.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -658,7 +658,9 @@ def pa_decode(
     num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
     # Other gfx1250 plans merge each sequence's tasks, at most P of them, in a
     # cluster of P CTAs. Its idle CTAs wait at the cluster barrier, so the grid
-    # stays within the plan's or the default two-per-CU budget.
+    # stays within the plan's or the default two-per-CU budget. gfx1250 keeps
+    # 15 clusters resident per 16 CUs (240 on 256 CUs) whatever their size;
+    # later clusters run as a second wave, which is slower than the reducer.
     cluster_partitions = min(partition_bound, num_partitions)
     cluster_merge = (
         cluster_partitions
@@ -671,6 +673,7 @@ def pa_decode(
             and 2 <= cluster_partitions <= CLUSTER_PARTITIONS
             and num_seqs * cluster_partitions
             <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
+            and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
             and head_dim <= MERGE_HEAD_DIM
         )
         else 0
