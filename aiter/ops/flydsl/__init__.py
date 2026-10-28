@@ -177,6 +177,9 @@ _LAZY_IMPORTS = {
     "qsa_indexer_block_ids": (".qsa_paged", "qsa_indexer_block_ids"),
     "flydsl_qsa_paged_gqa": (".qsa_paged", "flydsl_qsa_paged_gqa"),
     "qsa_layer": (".qsa_paged", "qsa_layer"),
+    # One-release aliases. vLLM still calls the previous stage names.
+    "qsa_k1_block_ids": (".qsa_paged", "qsa_indexer_block_ids"),
+    "qsa_k2": (".qsa_paged", "flydsl_qsa_paged_gqa"),
 }
 
 __all__ = [
@@ -229,6 +232,8 @@ __all__ = [
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
     "qsa_indexer_block_ids",
+    "qsa_k1_block_ids",
+    "qsa_k2",
     "qsa_layer",
 ]
 

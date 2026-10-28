@@ -39,6 +39,10 @@ _THIRD_ABOVE = 4
 _THIRD_THRESHOLD = 5
 _RUNNING_ABOVE = 6
 _RUNNING_EQUAL = 7
+# -inf's first-pass bucket. `_f32_to_ord` sends NaN to the top key, so no
+# other value shares it.
+_NEG_INF_BUCKET = 3
+_NEG_INF_BITS = -8388608  # 0xFF800000
 
 
 def one_workgroup_rows_are_exact(width: int) -> bool:
@@ -55,6 +59,7 @@ def build_topk_per_row_decode_one_workgroup_module(
     full_rows: bool = False,
     exact_rows: bool = False,
     compact: bool = False,
+    finite_only: bool = False,
 ):
     """packed_rows: row r is read from element row_starts[r] of a flat input
     (indices still relative to that start); otherwise from the input's row r
@@ -68,7 +73,12 @@ def build_topk_per_row_decode_one_workgroup_module(
     against the same build without it, interleaved in one process: 0.976x at
     64 rows of 16384, k=2048, but 1.007x-1.012x at k=512 over 8192 with fewer
     instructions and branches -- unexplained. `topk_select` only routes k >= 1024
-    to widths this kernel serves, which is the side that gains."""
+    to widths this kernel serves, which is the side that gains.
+
+    finite_only: a row with fewer than k finite values returns those, in
+    column order, then -1, so no -inf column is selected. A row with at
+    least k is the same top-k as without it. The first pass's histogram
+    already counts -inf, so a row that needs no packing pays one LDS read."""
     if exact_rows and not full_rows:
         raise ValueError("exact_rows is a full-rows build; pass full_rows=True")
     if wave_size not in (32, 64):
@@ -104,6 +114,7 @@ def build_topk_per_row_decode_one_workgroup_module(
             **({"packed": 1} if packed_rows else {}),
             **({"full": 1} if full_rows else {}),
             **({"exact": 1} if exact_rows else {}),
+            **({"finite": 1} if finite_only else {}),
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
@@ -483,9 +494,10 @@ def build_topk_per_row_decode_one_workgroup_module(
             row_indices,
             row_values,
         ):
-            if tid == 0:
-                metadata[_RUNNING_ABOVE] = zero
-            gpu.barrier()
+            # Each thread keeps the running base. A shared cursor was read
+            # by every wave and then advanced by thread 0 with no barrier
+            # between, so a late wave could compact from the next base.
+            running_above = zero
             num_steps = (row_vectors + block_threads - one) // block_threads
             for step in range(zero, num_steps, one):
                 vector_idx = step * block_threads + tid
@@ -510,15 +522,13 @@ def build_topk_per_row_decode_one_workgroup_module(
                     block_total,
                     _block_equal,
                 ) = block_exclusive_scan_pair(local, zero, scan, metadata)
-                cursor = metadata[_RUNNING_ABOVE] + prefix
+                cursor = running_above + prefix
                 for lane_idx in range_constexpr(_VEC):
                     if flags[lane_idx] == one:
                         cand_bits[cursor] = rvals[lane_idx].bitcast(fx.Int32)
                         cand_cols[cursor] = col_base + lane_idx
                         cursor = cursor + one
-                if tid == 0:
-                    metadata[_RUNNING_ABOVE] = metadata[_RUNNING_ABOVE] + block_total
-                gpu.barrier()
+                running_above = running_above + block_total
 
             clear_histogram(histogram)
             for index in range(tid, candidate_count, block_threads):
@@ -574,10 +584,8 @@ def build_topk_per_row_decode_one_workgroup_module(
             third_threshold = metadata[_THIRD_THRESHOLD]
             num_needed = need_after_second - metadata[_THIRD_ABOVE]
 
-            if tid == 0:
-                metadata[_RUNNING_ABOVE] = zero
-                metadata[_RUNNING_EQUAL] = zero
-            gpu.barrier()
+            running_above = zero
+            running_equal = zero
             scatter_steps = (candidate_count + block_threads - one) // block_threads
             for step in range(zero, scatter_steps, one):
                 index = step * block_threads + tid
@@ -599,8 +607,8 @@ def build_topk_per_row_decode_one_workgroup_module(
                     block_above,
                     block_equal,
                 ) = block_exclusive_scan_pair(above_i32, equal_i32, scan, metadata)
-                my_above = metadata[_RUNNING_ABOVE] + above_prefix
-                my_equal = metadata[_RUNNING_EQUAL] + equal_prefix
+                my_above = running_above + above_prefix
+                my_equal = running_equal + equal_prefix
                 accepted_equal = (my_equal < num_needed).select(my_equal, num_needed)
                 out_pos = my_above + accepted_equal
                 cls = above_i32 * two + equal_i32
@@ -613,33 +621,70 @@ def build_topk_per_row_decode_one_workgroup_module(
                         row_indices[out_pos] = col
                         if const_expr(write_values):
                             row_values[out_pos] = value
-                if tid == 0:
-                    metadata[_RUNNING_ABOVE] = metadata[_RUNNING_ABOVE] + block_above
-                    metadata[_RUNNING_EQUAL] = metadata[_RUNNING_EQUAL] + block_equal
-                gpu.barrier()
+                running_above = running_above + block_above
+                running_equal = running_equal + block_equal
 
-        if row_len <= top_k:
+        def finish_finite(scan, metadata, row_indices, row_values):
+            """Write the row's finite columns in order, then -1 up to k.
+
+            Called only when the row has fewer than k of them."""
+            running = zero
+            num_steps = (row_vectors + block_threads - one) // block_threads
+            for step in range(zero, num_steps, one):
+                vector_idx = step * block_threads + tid
+                active_vector = vector_idx < row_vectors
+                safe_vector_idx = active_vector.select(vector_idx, zero)
+                col_base = safe_vector_idx * vec_width
+                rvals = _load_f32x4(input_resource, safe_vector_idx)
+                flags = fx.make_rmem_tensor(_VEC, fx.Int32)
+                for lane_idx in range_constexpr(_VEC):
+                    col = col_base + lane_idx
+                    finite = rvals[lane_idx].bitcast(fx.Int32) != fx.Int32(
+                        _NEG_INF_BITS
+                    )
+                    keep = active_vector & (col < row_len) & finite
+                    flags[lane_idx] = keep.select(one, zero)
+                local = flags[0] + flags[1] + flags[2] + flags[3]
+                (
+                    prefix,
+                    _unused_prefix,
+                    block_total,
+                    _unused_total,
+                ) = block_exclusive_scan_pair(local, zero, scan, metadata)
+                cursor = running + prefix
+                for lane_idx in range_constexpr(_VEC):
+                    if flags[lane_idx] == one:
+                        row_indices[cursor] = col_base + lane_idx
+                        if const_expr(write_values):
+                            row_values[cursor] = rvals[lane_idx]
+                        cursor = cursor + one
+                running = running + block_total
+
             for output_step in range_constexpr(output_steps):
                 out_pos = output_step * _BLOCK_THREADS + tid
-                if out_pos < k:
-                    valid = out_pos < row_len
-                    row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
+                if (out_pos < k) & (out_pos >= running):
+                    row_indices[out_pos] = fx.Int32(-1)
                     if const_expr(write_values):
-                        # read only inside the row: a packed row's next
-                        # elements are another row's, or past the buffer
-                        value = fx.Float32(float("-inf"))
-                        if valid:
-                            value = input_row[out_pos]
-                        row_values[out_pos] = value
+                        row_values[out_pos] = fx.Float32(float("-inf"))
 
-        if row_len > top_k:
-            if tid < 8:
-                metadata[tid] = zero
-            gpu.barrier()
+        if row_len <= top_k:
+            if const_expr(finite_only):
+                finish_finite(scan, metadata, row_indices, row_values)
+            else:
+                for output_step in range_constexpr(output_steps):
+                    out_pos = output_step * _BLOCK_THREADS + tid
+                    if out_pos < k:
+                        valid = out_pos < row_len
+                        row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
+                        if const_expr(write_values):
+                            # read only inside the row: a packed row's next
+                            # elements are another row's, or past the buffer
+                            value = fx.Float32(float("-inf"))
+                            if valid:
+                                value = input_row[out_pos]
+                            row_values[out_pos] = value
 
-            clear_histogram(histogram)
-            reread_row(histogram_pass1)
-            gpu.barrier()
+        def finish_select(histogram, scan, metadata, row_indices, row_values):
             choose_threshold(
                 top_k,
                 _FIRST_ABOVE,
@@ -690,6 +735,23 @@ def build_topk_per_row_decode_one_workgroup_module(
                     row_indices,
                     row_values,
                 )
+
+        if row_len > top_k:
+            if tid < 8:
+                metadata[tid] = zero
+            gpu.barrier()
+
+            clear_histogram(histogram)
+            reread_row(histogram_pass1)
+            gpu.barrier()
+            if const_expr(finite_only):
+                finite_count = row_len - histogram[fx.Int32(_NEG_INF_BUCKET)]
+                if finite_count < top_k:
+                    finish_finite(scan, metadata, row_indices, row_values)
+                else:
+                    finish_select(histogram, scan, metadata, row_indices, row_values)
+            else:
+                finish_select(histogram, scan, metadata, row_indices, row_values)
 
     @flyc.jit
     def launch_topk_per_row_decode_one_workgroup(

@@ -3,8 +3,8 @@
 
 """AOT warm set for Flash-Next QSA at TP1.
 
-Six jobs, not complete coverage. The indexer is the page-16 emit kernel, the
-4-head one-row scorer (decode M=1 and M=8 share it), and the 4-head
+Six jobs, not complete coverage. The indexer is the page-16 emit kernel,
+the 4-head one-row scorer (decode M=1 and M=8 share it), and the 4-head
 16-row prefill scorer. Sparse GQA is Hq=24, Hkv=2, D=256 at the three bar
 launches: M=1 (BLOCK_N 16, 128 splits), M=8 (BLOCK_N 16, 32 splits),
 and M=512 (BLOCK_N 32, one split). Those long-row jobs also compile
@@ -13,8 +13,9 @@ the stable decode radix.
 Runtime JIT is required for every other compile. Not prebuilt: TP2/4/8
 ((12, 256), (6, 256), (3, 256)), (10, 128), the 8-head scorers, the
 other split counts (M=2 is 64 splits, M=16 is BLOCK_N 32 with 32
-splits), every wide-cache stride, and the compact one-workgroup and
-streaming indexer selectors. This module is only imported by the AOT
+splits), every wide-cache stride, the compact one-workgroup and
+streaming indexer selectors, and the valid-page pack that follows the
+streaming and split selectors. This module is only imported by the AOT
 collector.
 """
 
