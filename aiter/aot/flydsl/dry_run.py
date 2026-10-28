@@ -59,6 +59,10 @@ def _forbid(*_args, **_kwargs):
     raise GpuRuntimeReached("FlyDSL AOT dry run reached the GPU runtime")
 
 
+# The index items of basic indexing, which answers a view of its operand.
+_VIEW_INDEX = (int, slice, type(None), type(Ellipsis))
+
+
 class _TritonDriver:
     """Stand-in for Triton's active driver: answers the target queries that
     modules make at import (e.g. picking autotune configs per backend). A
@@ -142,6 +146,33 @@ def dry_run(
             + tensor.storage_offset() * tensor.element_size()
         )
 
+    real_getitem = torch.Tensor.__getitem__
+
+    def getitem(tensor, index):
+        """``tensor[index]``, which torch takes a device guard for before it
+        dispatches: with the GPUs hidden that guard initializes HIP and
+        raises, while every other op reaches the fake. Basic indexing is
+        replayed on a meta tensor of the same layout and taken again of this
+        one, so the view keeps the storage and offset ``data_ptr`` reads."""
+        if not isinstance(tensor, FakeTensor) or tensor.device.type != "cuda":
+            return real_getitem(tensor, index)
+        items = index if isinstance(index, tuple) else (index,)
+        if all(isinstance(item, _VIEW_INDEX) for item in items):
+            layout = torch.empty_strided(
+                tensor.shape, tensor.stride(), dtype=tensor.dtype, device="meta"
+            )
+            view = real_getitem(layout, index)
+            return tensor.as_strided(
+                view.shape,
+                view.stride(),
+                tensor.storage_offset() + view.storage_offset(),
+            )
+        if all(item is None or isinstance(item, torch.Tensor) for item in items):
+            # Advanced indexing copies; it is this op, which dispatches
+            # without the guard.
+            return torch.ops.aten.index(tensor, list(items))
+        return real_getitem(tensor, index)
+
     convert, tensor_cls, _, _ = jit_core._pybind_develop_hooks()
     cached = (
         chip_info.get_gfx,
@@ -177,6 +208,7 @@ def dry_run(
             (torch.cuda, "is_current_stream_capturing", lambda: False),
             (graph_alloc, "_persistent_pool", lambda _index: None),
             (torch.Tensor, "data_ptr", data_ptr),
+            (torch.Tensor, "__getitem__", getitem),
             (torch.Tensor, "record_stream", lambda *_a, **_k: None),
             (chip_info, "_detect_native", lambda: [arch]),
             (
