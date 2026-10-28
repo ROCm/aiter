@@ -114,7 +114,7 @@ class GemmConfigPruner:
                 and config["m_waves"] == 2
                 and config["n_waves"] == 4
                 and config["k_waves"] == 1
-                and config["group_m"] in (0, 4)
+                and config["group_m"] in (0, 1, 2, 4, 8, 16)
             )
             validated_grouped_half_tile = (
                 config["use_half_tile_interleaved"]
@@ -293,6 +293,21 @@ def get_flydsl_a16w16_configs(
         dict(zip(selections, combo))
         for combo in itertools.product(*selections.values())
     ]
+    for group_m in (1, 2, 8, 16):
+        configs.append(
+            {
+                "block_m": 256,
+                "block_n": 256,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 1,
+                "m_waves": 2,
+                "n_waves": 4,
+                "k_waves": 1,
+                "group_m": group_m,
+                "use_half_tile_interleaved": True,
+            }
+        )
     if m <= 320 and k % 5 == 0:
         configs.append(
             {

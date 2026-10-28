@@ -166,8 +166,8 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                 16384, 6288, 7168, torch.bfloat16, torch.bfloat16, False
             )
 
-        self.assertEqual(len(configs), 2)
-        self.assertEqual({config["group_m"] for config in configs}, {0, 4})
+        self.assertEqual(len(configs), 6)
+        self.assertEqual({config["group_m"] for config in configs}, {0, 1, 2, 4, 8, 16})
         for config in configs:
             self.assertEqual(
                 (
@@ -271,7 +271,14 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             == (256, 256, 64)
             and (config["m_waves"], config["n_waves"], config["k_waves"]) == (2, 4, 1)
         ]
-        assert {config["group_m"] for config in validated_half_tiles} == {0, 4}
+        assert {config["group_m"] for config in validated_half_tiles} == {
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+        }
         assert any(
             config["use_half_tile_interleaved"]
             and (
