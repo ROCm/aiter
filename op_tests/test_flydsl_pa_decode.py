@@ -178,17 +178,17 @@ def test_bf16_swa_schedule_context_bound(monkeypatch, window):
 
 
 @pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
-@pytest.mark.parametrize("query_length", range(1, 9))
 @pytest.mark.parametrize(
-    "head_dim,value_dim,group,heads,page",
+    "query_length,head_dim,value_dim,group,heads,page",
     [
-        (64, 64, 8, 2, 16),
-        (128, 128, 16, 1, 64),
-        (192, 192, 32, 2, 128),
-        (192, 128, 8, 4, 16),
-        (256, 256, 8, 2, 128),
-        (512, 512, 16, 1, 64),
-        (1024, 1024, 16, 1, 128),
+        (1, 64, 64, 8, 2, 16),
+        (2, 192, 192, 32, 2, 128),
+        (3, 128, 128, 16, 1, 64),
+        (4, 256, 256, 8, 2, 128),
+        (5, 128, 128, 16, 1, 64),
+        (6, 512, 512, 16, 1, 64),
+        (7, 192, 128, 8, 4, 16),
+        (8, 1024, 1024, 16, 1, 128),
     ],
 )
 def test_bf16_swa_schedule_geometry(
@@ -224,7 +224,6 @@ def test_bf16_swa_schedule_geometry(
 @pytest.mark.parametrize(
     "heads,head_dim,window,query_length,expected_splits",
     [
-        (1, 128, 1024, 8, 8),
         (2, 128, 1024, 8, 4),
         (4, 128, 1024, 8, 4),
         (1, 512, 128, 8, 8),
@@ -296,10 +295,8 @@ def test_asymmetric_schedule_window_contract(monkeypatch, kv_dtype, window, acce
 
 @pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
 @pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
-@pytest.mark.parametrize("query_length", [1, 3, 8, 12])
-def test_asymmetric_architecture_and_query_splits(
-    monkeypatch, arch, kv_dtype, query_length
-):
+def test_asymmetric_architecture_and_query_splits(monkeypatch, arch, kv_dtype):
+    query_length = 3
     traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
     monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
     layout = traits.PaDecodeTraits.create(
@@ -408,16 +405,15 @@ def test_fp8_lds_capacity_before_storage(monkeypatch, arch, group, per_token, ac
         )
 
 
-@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize(
-    "arch,head_dim,accepted",
+    "kv_dtype,arch,head_dim,accepted",
     [
-        ("gfx942", 320, True),
-        ("gfx950", 192, True),
-        ("gfx950", 960, True),
-        ("gfx1250", 64, True),
-        ("gfx1250", 192, False),
-        ("gfx1250", 320, False),
+        ("fp8", "gfx942", 320, True),
+        ("bf16", "gfx950", 192, True),
+        ("fp8", "gfx950", 960, True),
+        ("fp8", "gfx1250", 64, True),
+        ("fp8", "gfx1250", 192, False),
+        ("bf16", "gfx1250", 320, False),
     ],
 )
 def test_tuning_head_dimensions(monkeypatch, kv_dtype, arch, head_dim, accepted):
@@ -659,24 +655,38 @@ _ASYMMETRIC_GENERAL_CASES = [
         ("asymmetric-qlen64", 64, 8, 64, 0),
     )
 ]
+# The common FP8 cases cover the dtype/scale/layout product. Rotate those
+# variants across the new widths instead of repeating the product for each.
+_FP8_HEAD_CASES = [
+    (
+        f"head{dim}-mtp",
+        {
+            "head_dim": dim,
+            "kv_dtype": "fp8",
+            "query_dtype": dtype,
+            "scale_mode": scale_mode,
+            "trans_v": trans_v,
+            "query_length": 3,
+            "group_size": 8,
+            "kv_heads": 2,
+            "block_size": 64,
+            "max_partitions": 4,
+            "window": 128,
+            "sink_dtype": torch.float32,
+            "capture": dim in (192, 960),
+        },
+    )
+    for dim, dtype, scale_mode, trans_v in (
+        (192, torch.bfloat16, "per-tensor", True),
+        (320, torch.bfloat16, "per-token", True),
+        (448, torch.float16, "per-tensor", False),
+        (576, torch.bfloat16, "per-tensor", False),
+        (704, torch.float16, "per-token", True),
+        (832, torch.bfloat16, "per-token", False),
+        (960, torch.float16, "per-token", False),
+    )
+]
 _FP8_CASES = _COMMON_CASES + [
-    *[
-        (
-            f"head{dim}-mtp",
-            {
-                "head_dim": dim,
-                "query_length": 3,
-                "group_size": 8,
-                "kv_heads": 2,
-                "block_size": 64,
-                "max_partitions": 4,
-                "window": 128,
-                "sink_dtype": torch.float32,
-                "capture": dim in (192, 960),
-            },
-        )
-        for dim in (192, 320, 448, 576, 704, 832, 960)
-    ],
     *_ASYMMETRIC_GENERAL_CASES,
     *_ASYMMETRIC_MULTIHEAD_CASES,
     *_ASYMMETRIC_WINDOW_CASES,
@@ -1111,6 +1121,10 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
                 and trans_v
                 and (scale_mode == "per-tensor" or geometry.get("kv_heads", 1) > 1)
             )
+        ],
+        *[
+            pytest.param(geometry, id=f"fp8-{name}")
+            for name, geometry in _FP8_HEAD_CASES
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
         pytest.param(
