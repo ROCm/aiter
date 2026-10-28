@@ -3,6 +3,7 @@
 
 """FlyDSL MOE kernel management: naming, compilation, and high-level API."""
 
+import collections
 import functools
 import os
 import re
@@ -859,6 +860,73 @@ def runtime_swiglu_limit(swiglu_limit: float | None, act: str) -> float:
     return float(swiglu_limit) if swiglu_limit else float("inf")
 
 
+def _a16w4_fp8_mfma_enabled() -> bool:
+    """``AITER_FLYDSL_A16W4_FP8_MFMA=1``: run the gfx942 a16w4 GEMMs on fp8 MFMA.
+
+    Opt-in, and not a16 numerics: stage 1 quantizes the activation and stage 2 the
+    bf16 intermediate per row to e4m3fnuz, and both GEMMs run fp8 MFMA on the MXFP4
+    weight decoded to e4m3fnuz. gfx942 only; elsewhere the setting is ignored.
+    """
+    if os.environ.get("AITER_FLYDSL_A16W4_FP8_MFMA", "0") != "1":
+        return False
+    from flydsl.runtime.device import get_rocm_arch
+
+    if str(get_rocm_arch()).startswith("gfx942"):
+        return True
+    _warn_a16w4_fp8_once(
+        "AITER_FLYDSL_A16W4_FP8_MFMA is gfx942-only; the bf16 a16w4 path is used."
+    )
+    return False
+
+
+@functools.cache
+def _warn_a16w4_fp8_once(msg: str):
+    from aiter import logger
+
+    logger.warning(msg)
+
+
+# Keyed by the scale's address, which is only an identity while the tensor is alive:
+# the entry keeps a reference to it so the allocator cannot hand the address to
+# another scale. Assumes weight scales are not modified in place.
+_A16W4_FP8_SREF: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_A16W4_FP8_SREF_MAX = 512
+
+
+def _a16w4_fp8_sref(w_scale: torch.Tensor, experts: int, n_out: int, k_groups: int):
+    """Cached ``[E, n_out]`` u8 reference exponents of an MXFP4 scale for the fp8 mode.
+
+    None (with a one-time warning) when some e8m0 group sits more than
+    ``A16W4_FP8_MAX_RESIDUAL`` binades below its column maximum: the fp8 weight decode
+    is not exact there, so that stage keeps the bf16 kernel.
+    """
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import mxfp4_scale_ref_exponent
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.utils import (
+        A16W4_FP8_MAX_RESIDUAL,
+    )
+
+    scale_u8 = w_scale.view(torch.uint8)
+    key = (scale_u8.data_ptr(), scale_u8.numel(), experts, n_out, k_groups)
+    hit = _A16W4_FP8_SREF.get(key)
+    if hit is None:
+        sref, max_res = mxfp4_scale_ref_exponent(scale_u8, experts * n_out, k_groups)
+        if max_res > A16W4_FP8_MAX_RESIDUAL:
+            _warn_a16w4_fp8_once(
+                f"AITER_FLYDSL_A16W4_FP8_MFMA: an e8m0 group sits {max_res} binades "
+                f"below its column maximum (fp8 decode is exact to "
+                f"{A16W4_FP8_MAX_RESIDUAL}); this stage uses the bf16 a16w4 kernel."
+            )
+            sref = None
+        else:
+            sref = sref.view(experts, n_out)
+        hit = (scale_u8, sref)
+        _A16W4_FP8_SREF[key] = hit
+        while len(_A16W4_FP8_SREF) > _A16W4_FP8_SREF_MAX:
+            _A16W4_FP8_SREF.popitem(last=False)
+    _A16W4_FP8_SREF.move_to_end(key)
+    return hit[1]
+
+
 def _s1_args_fp4(
     out,
     a,
@@ -1558,8 +1626,20 @@ def _flydsl_moe_stage1_impl(
         sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
         _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
         inter_sorted = _alloc(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
+        _a = a.to(torch.bfloat16).contiguous()
+        _fp8 = {}
+        if b_dtype == "fp4" and w1_scale is not None and _a16w4_fp8_mfma_enabled():
+            _sref = _a16w4_fp8_sref(w1_scale, E, 2 * inter_dim, model_dim // 32)
+            if _sref is not None:
+                from aiter.ops.quant import dynamic_per_token_scaled_quant
+
+                _a_q = torch.empty(_a.shape, dtype=dtypes.fp8, device=dev)
+                _a_s = torch.empty((token_num, 1), dtype=torch.float32, device=dev)
+                dynamic_per_token_scaled_quant(_a_q, _a, _a_s)
+                _a = _a_q
+                _fp8 = {"a_dtype": "fp8", "a_scale": _a_s, "w1_sref": _sref}
         flydsl_a16w4_gemm1(
-            a_bf16=a.to(torch.bfloat16).contiguous(),
+            a_bf16=_a,
             w1_u8=w1.view(torch.uint8).contiguous(),
             w1_scale_u8=(
                 w1_scale.view(torch.uint8).contiguous().view(-1)
@@ -1592,6 +1672,7 @@ def _flydsl_moe_stage1_impl(
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
             w_dtype=b_dtype,
             w_layout="standard",
+            **_fp8,
         )
         return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
@@ -2090,6 +2171,26 @@ def _flydsl_moe_stage2_impl(
             )
             if expert_mask is not None:
                 gemm2_out.zero_()
+        _fp8 = {}
+        if b_dtype == "fp4" and w2_scale is not None and _a16w4_fp8_mfma_enabled():
+            _sref = _a16w4_fp8_sref(w2_scale, E, model_dim, inter_dim // 32)
+            if _sref is not None:
+                from aiter.ops.quant import dynamic_per_token_scaled_quant
+                from aiter.utility import dtypes
+
+                # A sorted row is one route and stage 2 contracts over inter_dim, so a
+                # per-row scale is constant over K. gemm2 reads no row past num_valid.
+                _i_q = torch.empty(
+                    inter_states.shape, dtype=dtypes.fp8, device=inter_states.device
+                )
+                _i_s = torch.empty(
+                    (max_sorted, 1), dtype=torch.float32, device=inter_states.device
+                )
+                dynamic_per_token_scaled_quant(
+                    _i_q, inter_states, _i_s, num_rows=num_valid_ids
+                )
+                inter_states = _i_q
+                _fp8 = {"a_dtype": "fp8", "a_scale": _i_s, "w2_sref": _sref}
         flydsl_a16w4_gemm2(
             inter_sorted_bf16=inter_states,
             w2_u8=w2.view(torch.uint8).contiguous(),
@@ -2117,6 +2218,7 @@ def _flydsl_moe_stage2_impl(
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
             epilog=_epilog,
+            **_fp8,
         )
         if _epilog == "reduce":
             _run_moe_reduction(
