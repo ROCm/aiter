@@ -131,6 +131,7 @@ _LAZY_IMPORTS = {
         "gather_kv_b_proj_flydsl_supported",
     ),
     "pa_decode": (".pa_decode", "pa_decode"),
+    "pa_decode_mxfp4": (".pa_decode_mxfp4", "pa_decode_mxfp4"),
     "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
     "prepare_gemm_a16wfp4_weight": (
         ".gemm_a16wfp4",
@@ -222,6 +223,7 @@ __all__ = [
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
     "pa_decode",
+    "pa_decode_mxfp4",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
 ]
