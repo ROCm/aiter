@@ -976,11 +976,9 @@ def main():
     spec["dispatch_wire"] = resolve_dispatch_wire(args.dispatch_wire, args.quant_type)
     modes, skipped_unfused_compact = resolve_modes(args.stage1_fused, args.stage2_fused)
 
-    if get_gfx() not in ("gfx950", "gfx1250"):
+    if get_gfx() != "gfx1250":
         if dist_ctx.rank == 0:
-            print(
-                f"skip {args.quant_type}: mxfp4 requires gfx950/gfx1250, got {get_gfx()}"
-            )
+            print(f"skip: MegaMoEGfx1250 requires gfx1250, got {get_gfx()}")
         dist_ctx.shutdown()
         return
 

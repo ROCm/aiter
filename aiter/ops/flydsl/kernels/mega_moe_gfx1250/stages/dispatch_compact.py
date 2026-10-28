@@ -11,9 +11,9 @@ import torch
 
 from aiter import dtypes
 
-from ...tensor_shim import _run_compiled
+from ...tensor_shim import _preload_compiled, _run_compiled
 from ..arena import _align_up
-from ..config import _DISPATCH_COMPACT
+from ..config import _DISPATCH_COMPACT, _WAVE_SIZE
 from ..dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from ..recipe import MegaMoEConfig
 from ..types import _from_gpu_ptr
@@ -96,6 +96,10 @@ def _compact_gemm_align_m(
 # The widest compact tile a grouped-GEMM CSV row names; bounds the compact
 # rows when the tile cannot be looked up (inter_dim unknown).
 _MAX_COMPACT_TILE_M = 256
+# The compact plan's limits: its LDS histogram's (rank, expert) segments, and
+# the lanes of its one block, which runs a wave per peer.
+_MAX_PLAN_SEGMENTS = 1024
+_MAX_PLAN_THREADS = 1024
 
 
 @dataclass(frozen=True)
@@ -186,11 +190,29 @@ class _CompactDispatch(_Dispatch):
         )
         self._slot = 0
         self._plan_pending = False
+        self._pending_align = None  # the alignment the pending plan writes
         self._plan_launches = {}
 
     @classmethod
     def check(cls, config: MegaMoEConfig) -> None:
-        """Nothing beyond MegaMoEConfig's own checks."""
+        from ..compact_plan import compact_plan_waves
+
+        segs = config.world_size * config.experts_per_rank
+        if segs > _MAX_PLAN_SEGMENTS:
+            raise ValueError(
+                f"the compact plan holds at most {_MAX_PLAN_SEGMENTS} (rank, "
+                f"expert) segments, got world_size * experts_per_rank = {segs}"
+            )
+        waves = compact_plan_waves(
+            npes=config.world_size,
+            max_routes=config.max_tokens_per_rank * config.topk,
+        )
+        if waves * _WAVE_SIZE > _MAX_PLAN_THREADS:
+            raise ValueError(
+                "the compact plan runs a wave per peer in one block of at most "
+                f"{_MAX_PLAN_THREADS // _WAVE_SIZE} waves, got {waves} for "
+                f"world_size={config.world_size}"
+            )
 
     @classmethod
     def regions(cls, config: MegaMoEConfig, caps=None) -> dict:
@@ -383,7 +405,14 @@ class _CompactDispatch(_Dispatch):
         _check_recv_token_bound(config, "recv_token_bound", recv_token_bound)
         _check_recv_token_bound(config, "next_recv_token_bound", next_recv_token_bound)
         if begin_step:
-            self._step = self._step_for(self._recv_bound(token_count, recv_token_bound))
+            self._step = self._step_for(self._recv_bound(recv_token_bound))
+        if self._plan_pending and self._pending_align != self._step.align_m:
+            raise ValueError(
+                "the compact plan already started for this step aligns each "
+                f"expert's rows to {self._pending_align}, but "
+                f"recv_token_bound={recv_token_bound} needs {self._step.align_m}; "
+                "pass the bound the plan was started with"
+            )
         kernel = self._kernels[_pick(self.schedule, token_count)]
         if not self._plan_pending:
             self._launch_plan(topk_ids, token_count, self._slot, self._step.align_m)
@@ -432,7 +461,7 @@ class _CompactDispatch(_Dispatch):
             # other slot and overlaps the expert GEMM (and later combine/RMS).
             nxt = 1 - slot
             count = int(next_topk_ids.shape[0])
-            ahead = self._step_for(self._recv_bound(count, next_recv_token_bound))
+            ahead = self._step_for(self._recv_bound(next_recv_token_bound))
             self._launch_plan(next_topk_ids, count, nxt, ahead.align_m)
             self._slot = nxt
         return batch
@@ -441,31 +470,24 @@ class _CompactDispatch(_Dispatch):
         """Launch the plan for ``topk_ids`` on the side stream, into this step."""
         _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
         token_count = int(topk_ids.shape[0])
-        self._step = self._step_for(self._recv_bound(token_count, recv_token_bound))
+        self._step = self._step_for(self._recv_bound(recv_token_bound))
         self._launch_plan(topk_ids, token_count, self._slot, self._step.align_m)
 
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
-        """Compile the plan this bound's tile needs, in both slots."""
+        """Compile the plan this bound's tile needs, in both slots.
+        ``token_count`` is unused: the bound alone picks the tile."""
         _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
-        tok = (
-            int(self.config.max_tokens_per_rank)
-            if token_count is None
-            else int(token_count)
-        )
-        self._step = self._step_for(self._recv_bound(tok, recv_token_bound))
+        self._step = self._step_for(self._recv_bound(recv_token_bound))
         for slot in range(self._PLAN_SLOTS):
             self._plan_for(self._step.align_m, slot)
 
-    def _recv_bound(self, token_count: int, recv_token_bound: int | None) -> int:
-        """Static safe recv bound for this step: the caller's, already checked.
-
-        Without one: dispatch deduplicates a token's routes to the same peer, so
-        one rank can receive at most ``world_size * token_count`` rows.
-        """
-        if recv_token_bound is not None:
-            return int(recv_token_bound)
-        inferred = int(self.config.world_size) * max(1, int(token_count))
-        return min(inferred, int(self.config.max_recv))
+    def _recv_bound(self, recv_token_bound: int | None) -> int:
+        """This step's recv bound: the caller's, already checked, else the
+        arena's capacity. What a rank receives depends on its peers' token
+        counts, so nothing smaller can be inferred from its own."""
+        if recv_token_bound is None:
+            return int(self.config.max_recv)
+        return int(recv_token_bound)
 
     def _step_for(self, recv_bound: int) -> _CompactStep:
         from ..compact_plan import compact_row_capacity
@@ -519,8 +541,25 @@ class _CompactDispatch(_Dispatch):
                 max_routes=geo.max_routes,
                 hist_pingpong=False,
             )
+            # Compiled now, without a launch, so a graph capture never has to.
+            _preload_compiled(launch, *self._plan_args(0, 0, key[1]))
             self._plan_launches[key] = launch
         return launch
+
+    def _plan_args(self, topk_ids_ptr: int, token_count: int, slot: int) -> tuple:
+        return (
+            self.res.arena.handle,
+            topk_ids_ptr,
+            self._tok_maps[slot].data_ptr(),
+            self._block_hists[slot].data_ptr(),
+            self._send_bases[slot].data_ptr(),
+            self._masked_ms[slot].data_ptr(),
+            self._psums[slot].data_ptr(),
+            self._barriers[slot].data_ptr(),
+            self.config.rank,
+            token_count,
+            fx.Stream(self._plan_stream),
+        )
 
     def _launch_plan(
         self, topk_ids: torch.Tensor, token_count: int, slot: int, align_m: int
@@ -530,20 +569,11 @@ class _CompactDispatch(_Dispatch):
         with torch.cuda.stream(plan_stream):
             _run_compiled(
                 self._plan_for(align_m, slot),
-                self.res.arena.handle,
-                topk_ids.data_ptr(),
-                self._tok_maps[slot].data_ptr(),
-                self._block_hists[slot].data_ptr(),
-                self._send_bases[slot].data_ptr(),
-                self._masked_ms[slot].data_ptr(),
-                self._psums[slot].data_ptr(),
-                self._barriers[slot].data_ptr(),
-                self.config.rank,
-                token_count,
-                fx.Stream(plan_stream),
+                *self._plan_args(topk_ids.data_ptr(), token_count, slot),
             )
         self._plan_event.record(plan_stream)
         self._plan_pending = True
+        self._pending_align = align_m
 
     def _wait_plan(self) -> None:
         if not self._plan_pending:

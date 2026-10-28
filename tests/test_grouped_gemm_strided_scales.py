@@ -11,11 +11,10 @@ needed: the compiled launch is replaced by one that records its arguments.
 import pytest
 import torch
 
-try:
-    from aiter.ops.flydsl import grouped_gemm_mxfp4 as GG
-    from aiter.ops.flydsl.kernels.tensor_shim import flat_arg
-except Exception as error:  # noqa: BLE001  (no flydsl, no aiter build, ...)
-    pytest.skip(f"FlyDSL does not import here: {error}", allow_module_level=True)
+pytest.importorskip("flydsl", reason="the grouped GEMM is built with FlyDSL")
+
+from aiter.ops.flydsl import grouped_gemm_mxfp4 as GG
+from aiter.ops.flydsl.kernels.tensor_shim import flat_arg
 
 ROWS, PAYLOAD, SCALE_ROW, WIRE_ROW = 8, 256, 8, 384
 

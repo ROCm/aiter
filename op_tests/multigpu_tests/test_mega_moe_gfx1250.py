@@ -9,9 +9,10 @@ Spawns one rank per GPU (4 by default, 2 is the minimum). Anywhere else -- not
 gfx1250, fewer than two GPUs, no mori -- it prints why and exits 0, since CI's
 MULTIGPU job runs every file in this directory on its gfx950 runners.
 
-Covered, on the a4w4 recipe (fp4 dispatch wire) plus a bf16 wire:
+Covered, on the fp4 and fp8 dispatch wires (a4w4 and a8w4) plus a bf16 wire:
   * every dispatch/combine pairing against the fp32 reference, and a captured
-    graph's replay against the eager result, bit for bit;
+    graph's replay against the eager result, bit for bit; the fp8 wire runs
+    with AITER_FORCE_A8W4=0, since the wire picks the GEMM's A operand;
   * pairings MegaMoE cannot run fail before the symmetric arena is allocated,
     and a failure after it frees what was built;
   * mori's combine reads fused_moe's rows in place (zero-copy staging);
@@ -40,17 +41,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 HIDDEN, INTER, TOPK, TOKENS = 7168, 1024, 8, 32
 EXPERTS_PER_RANK = 8
-QUANT_KEY = "a4w4_mxfp4"
+# The quant key a dispatch wire runs as; bf16 has the GEMM quantize to fp4.
+QUANT_KEY = {"bf16": "a4w4_mxfp4", "fp4": "a4w4_mxfp4", "fp8": "a8w4_mxfp4"}
 # (label, dispatch, combine, dispatch_wire, the step's combine wire)
 PAIRINGS = (
     ("mori+fused bf16", "mori", "fused_scatter", "bf16", "bf16"),
     ("mori+fused", "mori", "fused_scatter", "fp4", "bf16"),
     ("mori+fused fp4", "mori", "fused_scatter", "fp4", "fp4"),
+    ("mori+fused fp8 combine", "mori", "fused_scatter", "fp4", "fp8"),
+    ("mori+fused fp8", "mori", "fused_scatter", "fp8", "bf16"),
     ("mori+mori bf16", "mori", "mori", "bf16", "bf16"),
     ("mori+mori", "mori", "mori", "fp4", "bf16"),
     ("mori+mori fp4", "mori", "mori", "fp4", "fp4"),
+    ("mori+mori fp8", "mori", "mori", "fp8", "bf16"),
     ("compact+fused", "compact", "fused_scatter", "fp4", "bf16"),
     ("compact+fused fp4", "compact", "fused_scatter", "fp4", "fp4"),
+    ("compact+fused fp8", "compact", "fused_scatter", "fp8", "fp8"),
 )
 # The combine wires in the legacy combine_quant spelling.
 LEGACY_QUANT = {"bf16": "none", "fp8": "mxfp8", "fp4": "mxfp4"}
@@ -81,6 +87,26 @@ def _fields(dispatch, combine, wire, step_wire):
         "dispatch_wire": wire,
         "combine_wires": wires,
     }
+
+
+class _Checks:
+    """Rank-local checks raised on every rank together, so a rank that fails
+    one does not leave its peers inside a collective."""
+
+    def __init__(self, label):
+        self.label, self.failed = label, []
+
+    def __call__(self, ok, what):
+        if not ok:
+            self.failed.append(what)
+
+    def settle(self):
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, self.failed)
+        self.failed = []
+        bad = {rank: failed for rank, failed in enumerate(gathered) if failed}
+        if bad:
+            raise AssertionError(f"{self.label}: {bad}")
 
 
 def _skip_reason() -> str | None:
@@ -142,7 +168,8 @@ class _Ctx:
         self.B = B
         self.rank, self.world, self.comm, self.device = rank, world, comm, device
         self.experts = EXPERTS_PER_RANK * world
-        self.spec = B.resolve_spec(QUANT_KEY)
+        # The expert-GEMM fields are the same for every quant key.
+        self.spec = B.resolve_spec(QUANT_KEY["fp4"])
         w1, w2, _, _ = B.make_shared_weights(
             self.experts, HIDDEN, INTER, torch.bfloat16, device
         )
@@ -150,7 +177,10 @@ class _Ctx:
         q1, s1, q2, s2 = B.raw_quant_weights(
             w1[lo:hi].contiguous(), w2[lo:hi].contiguous()
         )
-        self.weights = B.shuffle_group(q1, s1, q2, s2, self.spec, EXPERTS_PER_RANK)
+        self.weights = {
+            key: B.shuffle_group(q1, s1, q2, s2, B.resolve_spec(key), EXPERTS_PER_RANK)
+            for key in set(QUANT_KEY.values())
+        }
         self.ids, self.wts = B.make_routings(
             1, TOKENS, self.experts, TOPK, device, seed=11
         )[0]
@@ -226,7 +256,7 @@ class _Ctx:
         return MegaMoEGfx1250(**kw)
 
     def layer(self, mega, combine_wire=None, **step):
-        w1, w2, w1s, w2s = self.weights
+        w1, w2, w1s, w2s = self.weights[QUANT_KEY[mega.recipe.dispatch_wire]]
         y = mega(
             self.B._rmsnorm(self.x),
             self.wts,
@@ -244,14 +274,16 @@ class _Ctx:
 def _check_pairings(ctx):
     """Each pairing against the reference, then a graph replay against eager."""
     for label, *pairing in PAIRINGS:
-        step_cq = pairing[-1]
+        wire, step_cq = pairing[2], pairing[-1]
+        check = _Checks(label)
         mega = ctx.build(**_fields(*pairing))
         try:
             out = ctx.layer(mega, step_cq).clone()
             torch.cuda.synchronize()
             diff = ctx.B._calc_diff(out, ctx.ref)
-            tol = ctx.B.default_logits_tol(QUANT_KEY, LEGACY_QUANT[step_cq], 1)
-            assert diff <= tol, f"{label}: diff {diff:.5f} > tol {tol:.5f}"
+            tol = ctx.B.default_logits_tol(QUANT_KEY[wire], LEGACY_QUANT[step_cq], 1)
+            check(diff <= tol, f"diff {diff:.5f} > tol {tol:.5f}")
+            check.settle()
 
             ctx.comm.barrier()
             side = torch.cuda.Stream()
@@ -266,7 +298,8 @@ def _check_pairings(ctx):
                 captured = ctx.layer(mega, step_cq)
             graph.replay()
             torch.cuda.synchronize()
-            assert torch.equal(captured, out), f"{label}: graph replay != eager"
+            check(torch.equal(captured, out), "graph replay != eager")
+            check.settle()
             del graph
         finally:
             torch.cuda.synchronize()
@@ -276,6 +309,7 @@ def _check_pairings(ctx):
 
 
 def _check_rejected_before_alloc(ctx):
+    check = _Checks("rejected before alloc")
     for entry, overrides, message in REJECTED:
         counting = _CountingCommunicator(ctx.comm)
         build = ctx.build if entry == "recipe" else ctx.build_legacy
@@ -284,10 +318,11 @@ def _check_rejected_before_alloc(ctx):
                 warnings.simplefilter("ignore", DeprecationWarning)
                 build(communicator=counting, **overrides).close()
         except ValueError as error:
-            assert message in str(error), f"{overrides}: {error}"
+            check(message in str(error), f"{overrides}: {error}")
         else:
-            raise AssertionError(f"{overrides} was accepted")
-        assert counting.allocs == 0, f"{overrides}: allocated before failing"
+            check(False, f"{overrides} was accepted")
+        check(counting.allocs == 0, f"{overrides}: allocated before failing")
+        check.settle()
 
 
 def _check_unwind(ctx):
@@ -380,32 +415,44 @@ def _check_close_order(ctx):
 def _check_atom_surface(ctx):
     """ATOM's Triton experts drive dispatch and combine themselves."""
     mega = ctx.build()
+    check = _Checks("ATOM surface")
     try:
         mega._atom_per_rank_size = 1  # ATOM stamps its own attributes on
         cfg = mega._config
-        assert (cfg.rank, cfg.world_size, cfg.hidden_dim) == (
-            ctx.rank,
-            ctx.world,
-            HIDDEN,
+        check(
+            (cfg.rank, cfg.world_size, cfg.hidden_dim) == (ctx.rank, ctx.world, HIDDEN),
+            "rank, world_size, hidden_dim",
         )
-        assert (cfg.max_tokens_per_rank, cfg.topk) == (TOKENS, TOPK)
-        assert cfg.stage1_fused is False and cfg.stage2_fused is True
-        assert cfg.dispatch_wire == "fp4" and cfg.is_quant_dispatch_wire
-        assert cfg.dispatch_backend == "mori"
-        assert cfg.combine_slot_stride_bytes == 1 << (HIDDEN * 2 - 1).bit_length()
-        assert mega._arena.local_ptr("comb_inp") > 0
+        check(
+            (cfg.max_tokens_per_rank, cfg.topk) == (TOKENS, TOPK),
+            "max_tokens_per_rank, topk",
+        )
+        check(cfg.stage1_fused is False and cfg.stage2_fused is True, "stage flags")
+        check(cfg.dispatch_wire == "fp4" and cfg.is_quant_dispatch_wire, "wire")
+        check(cfg.dispatch_backend == "mori", "dispatch_backend")
+        check(
+            cfg.combine_slot_stride_bytes == 1 << (HIDDEN * 2 - 1).bit_length(),
+            "combine_slot_stride_bytes",
+        )
+        check(mega._arena.local_ptr("comb_inp") > 0, "_arena")
+        check.settle()
         recv_x, recv_w, recv_ids, total, routing = mega._dispatch(
             ctx.B._rmsnorm(ctx.x), ctx.wts, ctx.ids
         )
-        assert recv_x.shape == (ctx.world * TOKENS, HIDDEN // 2)
-        assert recv_w.shape == recv_ids.shape == (ctx.world * TOKENS, TOPK)
-        assert total.shape == (1,) and routing.token_count == TOKENS
+        check(recv_x.shape == (ctx.world * TOKENS, HIDDEN // 2), "recv_x")
+        check(
+            recv_w.shape == recv_ids.shape == (ctx.world * TOKENS, TOPK),
+            "recv_w, recv_ids",
+        )
+        check(total.shape == (1,) and routing.token_count == TOKENS, "routing")
         scales = mega._recv_dispatch_scales()
-        assert scales is not None and scales.shape[0] == ctx.world * TOKENS
+        check(scales is not None and scales.shape[0] == ctx.world * TOKENS, "scales")
+        check.settle()
         out = mega._combine(routing)
         torch.cuda.synchronize()
-        assert out.shape == (TOKENS, HIDDEN) and out.dtype == torch.bfloat16
-        assert mega.max_tokens_per_rank == TOKENS and mega.topk == TOPK
+        check(out.shape == (TOKENS, HIDDEN) and out.dtype == torch.bfloat16, "combine")
+        check(mega.max_tokens_per_rank == TOKENS and mega.topk == TOPK, "facade")
+        check.settle()
     finally:
         torch.cuda.synchronize()
         ctx.comm.barrier()
@@ -418,6 +465,7 @@ def _check_keyword_constructor(ctx):
     runs bit for bit as from_recipe does; combine_quant= steps as combine_wire=."""
     for label, dispatch, combine, wire, step_wire in PAIRINGS:
         cq = LEGACY_QUANT[step_wire]
+        check = _Checks(label)
         outs = []
         for entry in ("legacy", "recipe"):
             if entry == "legacy":
@@ -429,24 +477,29 @@ def _check_keyword_constructor(ctx):
                         dispatch_wire=wire,
                         combine_quant=cq,
                     )
-                assert any(
-                    issubclass(w.category, DeprecationWarning) for w in caught
-                ), f"{label}: no DeprecationWarning"
-                assert mega.recipe == ctx.recipe(
-                    **_fields(dispatch, combine, wire, step_wire)
-                ), f"{label}: {mega.recipe}"
+                check(
+                    any(issubclass(w.category, DeprecationWarning) for w in caught),
+                    "no DeprecationWarning",
+                )
+                check(
+                    mega.recipe
+                    == ctx.recipe(**_fields(dispatch, combine, wire, step_wire)),
+                    f"built {mega.recipe}",
+                )
                 step = {"combine_quant": None if cq == "none" else cq}
             else:
                 mega = ctx.build(**_fields(dispatch, combine, wire, step_wire))
                 step = {"combine_wire": step_wire}
             try:
+                check.settle()
                 outs.append(ctx.layer(mega, **step).clone())
                 torch.cuda.synchronize()
             finally:
                 ctx.comm.barrier()
                 mega.close()
                 ctx.comm.barrier()
-        assert torch.equal(outs[0], outs[1]), f"{label}: keyword != from_recipe"
+        check(torch.equal(outs[0], outs[1]), "keyword != from_recipe")
+        check.settle()
 
 
 def _check_a1_scale_refused(ctx):
@@ -470,13 +523,14 @@ def _check_vmm_bound(ctx):
 
     granularity = 2 << 20
     for label, *pairing in PAIRINGS:
+        check = _Checks(label)
         counting = _CountingCommunicator(ctx.comm)
         mega = ctx.build(communicator=counting, **_fields(*pairing))
         try:
             (allocated,) = counting.alloc_bytes
             need = MegaMoEGfx1250.required_vmm_bytes(mega.recipe, mega.geometry)
             rounded = -(-allocated // granularity) * granularity
-            assert need == rounded, f"{label}: {need} != {rounded} ({allocated})"
+            check(need == rounded, f"{need} != {rounded} ({allocated})")
             bound = MegaMoEGfx1250.required_vmm_bytes(
                 world_size=ctx.world,
                 hidden_dim=HIDDEN,
@@ -485,11 +539,12 @@ def _check_vmm_bound(ctx):
                 topk=TOPK,
                 stage1_fused=pairing[0] == "compact",
             )
-            assert bound >= need, f"{label}: keyword bound {bound} < {need}"
+            check(bound >= need, f"keyword bound {bound} < {need}")
         finally:
             ctx.comm.barrier()
             mega.close()
             ctx.comm.barrier()
+        check.settle()
 
 
 CHECKS = (

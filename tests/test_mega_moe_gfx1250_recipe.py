@@ -17,22 +17,21 @@ import types
 import pytest
 import torch
 
-try:
-    from aiter import ActivationType, QuantType
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
-        arena,
-        mori_caps,
-        recipe,
-        transport,
-    )
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import mega_moe as MM
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.compact_plan import (
-        compact_done_nbytes,
-        compact_hist_stride,
-        compact_row_capacity,
-    )
-except Exception as error:  # noqa: BLE001  (no flydsl, no aiter build, ...)
-    pytest.skip(f"MegaMoE does not import here: {error}", allow_module_level=True)
+pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
+
+from aiter import ActivationType, QuantType
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
+    arena,
+    mori_caps,
+    recipe,
+    transport,
+)
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import mega_moe as MM
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.compact_plan import (
+    compact_done_nbytes,
+    compact_hist_stride,
+    compact_row_capacity,
+)
 
 D, C = MM.DispatchKind, MM.CombineKind
 COMPACT_TILE = 64
@@ -494,3 +493,31 @@ def test_recv_token_bound_out_of_range(mori, dispatch, wire):
         stage.prefetch(ids, over)
     with pytest.raises(ValueError, match="^" + message):
         stage.warmup(over)
+
+
+def test_compact_plan_limits():
+    # A wave per peer in one block of at most 32 waves.
+    with pytest.raises(ValueError, match="runs a wave per peer"):
+        _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), 64, 7168, 8, 16, 8)
+    # An LDS histogram of at most 1024 (rank, expert) segments.
+    with pytest.raises(ValueError, match="at most 1024"):
+        _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), 32, 7168, 8, 16, 64)
+
+
+def test_compact_default_bound_is_the_capacity(mori):
+    config = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), 4, 7168, 8, 16, 8)
+    stage = recipe._stage_classes(config.recipe)[0](config, None)
+    # What a rank receives depends on its peers' token counts, not its own.
+    assert stage._recv_bound(None) == config.max_recv
+    assert stage._recv_bound(5) == 5
+
+
+def test_compact_refuses_a_plan_started_for_another_alignment(mori):
+    config = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), 4, 7168, 8, 16, 8)
+    stage = recipe._stage_classes(config.recipe)[0](config, None)
+    stage._plan_pending, stage._pending_align = True, COMPACT_TILE // 2
+    x = torch.zeros(4, 7168, dtype=torch.bfloat16)
+    ids = torch.zeros(4, 8, dtype=torch.int32)
+    wts = torch.zeros(4, 8, dtype=torch.float32)
+    with pytest.raises(ValueError, match="the compact plan already started"):
+        stage.dispatch(x, wts, ids, recv_token_bound=8)

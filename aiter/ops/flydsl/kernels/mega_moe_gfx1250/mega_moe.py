@@ -317,12 +317,14 @@ class MegaMoEGfx1250:
         decode batch) can shrink the GEMM's grid with it. It must be a python int
         so the shape stays static under graph capture, and must not cut below the
         received count -- the kernels skip the tail past the device-side count on
-        their own.
+        their own. Every rank must pass the same bound: on the compact dispatch
+        it picks the row alignment all senders lay their rows out with.
 
         ``next_topk_ids`` (and optional ``next_recv_token_bound``) start the next
         layer's compact plan on a side stream after this dispatch, so it overlaps
         the expert GEMM. The two plans use independent hist/done slots and local
-        tok_map/psum buffers. Omit them to keep the plan sequential.
+        tok_map/psum buffers. Omit them to keep the plan sequential. The next
+        forward has to pass the same bound the plan was started with.
 
         ``combine_wire`` picks this step's combine wire out of the recipe's
         ``combine_wires``, so a caller can quantize the steps with enough tokens
@@ -473,6 +475,10 @@ class MegaMoEGfx1250:
 
         compute = self.recipe.compute
         extra = {}
+        # A quantizing wire fixes the GEMM's A operand; bf16 leaves it to fused_moe.
+        quant_dtype_a = self._config.dispatch_wire_spec.quant_dtype
+        if quant_dtype_a is not None:
+            extra["quant_dtype_a"] = quant_dtype_a
         if compute.activation == ActivationType.Situv2:
             extra["beta"] = self.situ_beta
             extra["linear_beta"] = self.situ_linear_beta
@@ -541,6 +547,7 @@ class MegaMoEGfx1250:
         token_count: int | None = None,
     ) -> None:
         """Compile the compact plan this bound needs, before any graph capture.
+        ``token_count`` is unused: the bound alone picks the tile.
 
         The plan is compiled per tile alignment and the alignment follows the
         bound's token bucket, so a captured batch whose bucket never ran eagerly
