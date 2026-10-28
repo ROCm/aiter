@@ -1,24 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""fused_qknorm_idxrqknorm writing an MXFP4 index cache (index_cache_dtype="mxfp4").
+"""fused_qknorm_idxrqknorm writing MXFP4 caches and an fp8 main Q.
 
-The judge is the "auto" mode of the SAME op: it writes the post-norm/rope index K as
-bf16/fp16, and `per_1x32_f4_quant` (aiter's torch MXFP4 reference, RoundUp) applied to
-that row is what the "mxfp4" bytes must equal, bit for bit. Everything else the op
-produces (q, index q, main K/V and scales) must not move at all, since MXFP4 only
-changes how the index-K slot is stored.
-
-Page layout under test: one 128-token page is [128 x 64 B e2m1][128 x 4 B e8m0]
-(8704 B), low nibble the even element.
+``index_cache_dtype="mxfp4"`` and ``kv_cache_dtype="mxfp4"`` store the post norm + RoPE
+index K, main K and the raw V as uint8 pages of 128 tokens, ``[128 x 64 B e2m1][128 x 4 B
+e8m0]`` (8704 B), the low nibble the even element. The judge is the "auto" mode of the SAME
+op: ``per_1x32_f4_quant`` (aiter's torch MXFP4 reference) applied to the rows "auto" writes
+is what the MXFP4 bytes must equal, bit for bit, and every other output must not move.
+``q_fp8_out`` must equal ``bf16(q) / q_scale`` rounded to e4m3, saturating at its max.
 """
 
 import argparse
 import itertools
+import os
+import subprocess
 import sys
 
 import pandas as pd
-import pytest
 import torch
 
 import aiter
@@ -28,261 +27,328 @@ from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, run_perftest
 from aiter.utility import fp4_utils
 
-NQ, NKV, NIQ, HD, ROT = 16, 1, 1, 128, 64  # MiniMax-M3 TP4
+torch.set_default_device("cuda")
+
+SUPPORTED_GFX = ["gfx950"]
+NQ, NIQ, HD, ROT = 16, 1, 128, 64  # MiniMax-M3 TP4
 PAGE_BYTES = 128 * (64 + 4)
 SENTINEL = 0xA5
-requires_gfx950 = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx() != "gfx950",
-    reason="requires gfx950",
-)
+FP8_MAX = torch.finfo(dtypes.fp8).max
+
+INDEX_CASES = ("sequential", "index_shuffled", "index_skipped", "differ")
+KV_CASES = ("sequential", "shuffled", "main_skipped", "differ")
+# (kv_cache_dtype, block_size, index_cache_dtype, slot case, kv heads)
+CONFIGS = [
+    (kv, bs, index, case, nkv)
+    for kv, bs, index, cases, nkvs in (
+        ("fp8", 16, "mxfp4", INDEX_CASES, (1,)),
+        ("auto", 16, "mxfp4", INDEX_CASES, (1,)),
+        ("mxfp4", 128, "mxfp4", KV_CASES, (1, 2)),
+        ("mxfp4", 128, "fp8", KV_CASES, (1, 2)),
+        ("mxfp4", 128, "auto", KV_CASES, (1, 2)),
+    )
+    for case in cases
+    for nkv in nkvs
+]
 
 
-def make_inputs(T, dtype, seed=0):
+def make_inputs(T, nkv, dtype, seed=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    row = (NQ + 2 * NKV + NIQ + 1) * HD
-    qkv = torch.randn(T, row, dtype=dtype, device="cuda", generator=g)
-    w = (torch.randn(HD, dtype=dtype, device="cuda", generator=g) * 0.1).to(dtype)
-    cs = torch.randn(max(T, 64), ROT, dtype=dtype, device="cuda", generator=g)
-    return qkv, w, cs, torch.arange(T, dtype=torch.int64, device="cuda")
-
-
-def run_op(inputs, slots, index_slots, kv, index_dtype, dtype):
-    """One call of the fused op. Returns the cache tensors and every other output."""
-    qkv, w, cs, pos = inputs
-    T = qkv.shape[0]
-    cap = int(max(slots.max(), index_slots.max())) + 1
-    nb16 = -(-max(cap, T) // 16)
-    nb128 = -(-max(cap, T) // 128)
-    kvdt = dtypes.fp8 if kv == "fp8" else dtype
-    x = 16 // torch.empty(0, dtype=kvdt).element_size()
-    kc = torch.zeros(nb16, NKV, HD // x, 16, x, dtype=kvdt, device="cuda")
-    vc = torch.zeros(nb16, NKV, 16 // x, HD, x, dtype=kvdt, device="cuda")
-    ks = (
-        torch.zeros(nb16, NKV, 16, dtype=torch.float32, device="cuda")
-        if kv == "fp8"
-        else None
-    )
-    vs = (
-        torch.zeros(nb16, NKV, 16, dtype=torch.float32, device="cuda")
-        if kv == "fp8"
-        else None
-    )
-    if index_dtype == "mxfp4":
-        ic = torch.full((nb128, PAGE_BYTES), SENTINEL, dtype=torch.uint8, device="cuda")
-    elif index_dtype == "fp8":
-        ic = torch.zeros(nb128, 128, HD, dtype=dtypes.fp8, device="cuda")
-    else:
-        ic = torch.zeros(nb128, 128, HD, dtype=dtype, device="cuda")
-    qo = torch.empty(T, NQ * HD, dtype=dtype, device="cuda")
-    iq = torch.empty(T, NIQ * HD, dtype=dtype, device="cuda")
-    aiter.fused_qknorm_idxrqknorm(
-        qkv.clone(), w, w, cs, pos, NQ, NKV, ROT, 1e-6, w, w, NIQ,
-        slots, kc, vc, ic, 16, qo, iq, index_slots,
-        kv_cache_dtype="fp8" if kv == "fp8" else "auto",
-        index_cache_dtype=index_dtype, k_scale=ks, v_scale=vs, asm_layout=True,
-    )  # fmt: skip
-    return ic, {"q": qo, "iq": iq, "kc": kc, "vc": vc, "ks": ks, "vs": vs}
-
-
-def expected_pages(ic_auto, index_slots, nb128):
-    """The page bytes the MXFP4 write must produce: the reference quantizer on the
-    "auto" rows, scattered to the written slots; every other byte stays SENTINEL."""
-    rows = ic_auto.reshape(-1, HD)
-    q, s = per_1x32_f4_quant(rows)
-    data = q.view(torch.uint8).reshape(-1, 64)
-    scale = s.view(torch.uint8).reshape(-1, 4)
-    # An all-zero group: per_1x32_f4_quant yields e8m0 0, which the fp4 scorer does not
-    # support; the HIP rule (indexer_fp4_scale_e8m0, copied into the op) clamps amax
-    # to eps and yields 1. Data bytes are 0 either way.
-    zero_group = rows.float().reshape(-1, 4, 32).abs().amax(-1) == 0
-    scale = torch.where(zero_group & (scale == 0), torch.ones_like(scale), scale)
-    want = torch.full((nb128, PAGE_BYTES), SENTINEL, dtype=torch.uint8, device="cuda")
-    ok = index_slots[index_slots >= 0]
-    page, tok = ok // 128, ok % 128
-    for p, t, slot in zip(page.tolist(), tok.tolist(), ok.tolist()):
-        want[p, t * 64 : (t + 1) * 64] = data[slot]
-        want[p, 128 * 64 + t * 4 : 128 * 64 + (t + 1) * 4] = scale[slot]
-    return want
+    row = (NQ + 2 * nkv + NIQ + 1) * HD
+    qkv = torch.randn(T, row, dtype=dtype, generator=g)
+    w = (torch.randn(HD, dtype=dtype, generator=g) * 0.1).to(dtype)
+    cs = torch.randn(max(T, 64), ROT, dtype=dtype, generator=g)
+    return qkv, w, cs, torch.arange(T, dtype=torch.int64)
 
 
 def slot_cases(T):
-    seq = torch.arange(T, dtype=torch.int64, device="cuda")
-    perm = torch.randperm(((T + 127) // 128 + 1) * 128, device="cuda")[:T].to(
-        torch.int64
-    )
+    """(main slots, index slots) per case; -1 marks a skipped token."""
+    seq = torch.arange(T, dtype=torch.int64)
+    perm = torch.randperm(((T + 127) // 128 + 1) * 128)[:T].to(torch.int64)
     skipped = perm.clone()
     skipped[::3] = -1
     return {
         "sequential": (seq, seq),
-        "shuffled_slots": (seq, perm),
-        "skipped_slots": (seq, skipped),
-        "main_and_index_differ": (perm.flip(0).clone(), seq),
+        "shuffled": (perm, perm),
+        "index_shuffled": (seq, perm),
+        "index_skipped": (seq, skipped),
+        "main_skipped": (skipped, skipped),
+        "differ": (perm.flip(0).clone(), seq),
     }
 
 
-@requires_gfx950
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("kv", ["fp8", "auto"])
-@pytest.mark.parametrize("T", [1, 7, 128, 300, 1031])
-@pytest.mark.parametrize(
-    "case", ["sequential", "shuffled_slots", "skipped_slots", "main_and_index_differ"]
-)
-def test_bytes_equal_the_reference_quantizer(dtype, kv, T, case):
+def make_call(
+    inputs,
+    nkv,
+    slots,
+    kv,
+    bs,
+    index_dtype,
+    dtype,
+    index_slots=None,
+    skip_index=False,
+    ic=None,
+    pool=False,
+    **extra,
+):
+    """A closure running the op once, and the tensors it writes (caches, q, index q).
+
+    kv "auto"/"fp8" with bs 16 is the page-16 asm layout, "auto" with bs 128 the plain
+    page-128 layout, "mxfp4" the 8704 B pages (pool: K and V as views of one pool)."""
+    qkv, w, cs, pos = inputs
+    T = qkv.shape[0]
+    index_slots = slots if index_slots is None else index_slots
+    n = max(int(max(slots.max(), index_slots.max())) + 1, T)
+    nb, nb128 = -(-n // bs), -(-n // 128)
+    ks = vs = None
+    if kv == "mxfp4":
+        kvp = torch.full((nb, 2, nkv, PAGE_BYTES), SENTINEL, dtype=torch.uint8)
+        kc, vc = (
+            (kvp[:, 0], kvp[:, 1]) if pool else (kvp[:, 0].clone(), kvp[:, 1].clone())
+        )
+    elif bs == 16:
+        kvdt = dtypes.fp8 if kv == "fp8" else dtype
+        x = 16 // torch.empty(0, dtype=kvdt).element_size()
+        kc = torch.zeros(nb, nkv, HD // x, 16, x, dtype=kvdt)
+        vc = torch.zeros(nb, nkv, 16 // x, HD, x, dtype=kvdt)
+        if kv == "fp8":
+            ks = torch.zeros(nb, nkv, 16, dtype=torch.float32)
+            vs = torch.zeros_like(ks)
+    else:
+        kc = torch.zeros(nb, 128, nkv, HD, dtype=dtype)
+        vc = torch.zeros_like(kc)
+    if ic is None:
+        ic = {
+            "mxfp4": lambda: torch.full(
+                (nb128, PAGE_BYTES), SENTINEL, dtype=torch.uint8
+            ),
+            "fp8": lambda: torch.zeros(nb128, 128, HD, dtype=dtypes.fp8),
+            "auto": lambda: torch.zeros(nb128, 128, HD, dtype=dtype),
+        }[index_dtype]()
+    out = {
+        "q": torch.empty(T, NQ * HD, dtype=dtype),
+        "iq": torch.empty(T, NIQ * HD, dtype=dtype),
+        "ic": ic, "kc": kc, "vc": vc, "ks": ks, "vs": vs,
+    }  # fmt: skip
+    q_out = extra.pop("q_out", out["q"])
+
+    def call():
+        aiter.fused_qknorm_idxrqknorm(
+            qkv, w, w, cs, pos, NQ, nkv, ROT, 1e-6, w, w, NIQ,
+            slots, kc, vc, ic, bs, q_out, out["iq"], index_slots,
+            kv_cache_dtype=kv, index_cache_dtype=index_dtype, k_scale=ks, v_scale=vs,
+            asm_layout=bs == 16, skip_index_branch=skip_index, **extra,
+        )  # fmt: skip
+
+    return call, out
+
+
+def run_op(*args, **kwargs):
+    call, out = make_call(*args, **kwargs)
+    call()
+    return out
+
+
+def expected_pages(auto_cache, slots):
+    """The pages the MXFP4 write must produce for the rows an "auto" cache
+    ([pages, 128, kv heads, 128]) holds at `slots`; every other byte stays SENTINEL."""
+    nb, _, nkv, _ = auto_cache.shape
+    want = torch.full((nb, nkv, PAGE_BYTES), SENTINEL, dtype=torch.uint8)
+    ok = slots[slots >= 0]
+    if ok.numel() == 0:  # per_1x32_f4_quant cannot take zero rows
+        return want
+    rows = auto_cache[ok // 128, ok % 128].reshape(-1, HD)
+    q, s = per_1x32_f4_quant(rows)
+    data = q.view(torch.uint8).reshape(-1, nkv, 64)
+    scale = s.view(torch.uint8).reshape(-1, 4)[: rows.shape[0]].reshape(-1, nkv, 4)
+    # An all-zero group: per_1x32_f4_quant yields e8m0 0, which the fp4 scorer does not
+    # support; the op's rule (indexer_fp4_scale_e8m0 in cache_kernels.cu) clamps amax to eps
+    # and yields 1. Data bytes are 0 either way.
+    zero = rows.float().reshape(-1, nkv, 4, 32).abs().amax(-1) == 0
+    scale = torch.where(zero & (scale == 0), torch.ones_like(scale), scale)
+    strides = (nkv * PAGE_BYTES, PAGE_BYTES)
+    d = torch.as_strided(want, (nb, nkv, 128, 64), (*strides, 64, 1))
+    sc = torch.as_strided(want, (nb, nkv, 128, 4), (*strides, 4, 1), 128 * 64)
+    d[ok // 128, :, ok % 128] = data
+    sc[ok // 128, :, ok % 128] = scale
+    return want
+
+
+def index_pages(ic_auto, slots):
+    return expected_pages(ic_auto[:, :, None], slots).view(-1, PAGE_BYTES)
+
+
+def same(a, b):
+    return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@benchmark()
+def test_write_bytes(T, nkv, dtype, kv, bs, index_dtype, case):
     torch.manual_seed(T)
     slots, index_slots = slot_cases(T)[case]
-    inputs = make_inputs(T, dtype, seed=T)
-    ic_auto, out_auto = run_op(inputs, slots, index_slots, kv, "auto", dtype)
-    ic_fp4, out_fp4 = run_op(inputs, slots, index_slots, kv, "mxfp4", dtype)
-    # MXFP4 changes how the index-K slot is stored and nothing else.
-    for name, ref in out_auto.items():
-        if ref is not None:
-            assert torch.equal(
-                ref.view(torch.uint8) if ref.dtype != torch.uint8 else ref,
-                (
-                    out_fp4[name].view(torch.uint8)
-                    if out_fp4[name].dtype != torch.uint8
-                    else out_fp4[name]
-                ),
-            ), name
-    want = expected_pages(ic_auto, index_slots, ic_fp4.shape[0])
-    assert torch.equal(ic_fp4, want)
+    inputs = make_inputs(T, nkv, dtype, seed=T)
+    auto = lambda d: "auto" if d == "mxfp4" else d
+    base = run_op(
+        inputs, nkv, slots, auto(kv), bs, auto(index_dtype), dtype, index_slots
+    )
+    got = run_op(inputs, nkv, slots, kv, bs, index_dtype, dtype, index_slots)
+    for name, ref in base.items():
+        if ref is None:
+            continue
+        if name == "ic" and index_dtype == "mxfp4":
+            ref = index_pages(ref, index_slots)
+        elif name in ("kc", "vc") and kv == "mxfp4":
+            ref = expected_pages(ref, slots)
+        assert same(got[name], ref), f"{name} differs from the auto-mode reference"
+    return {"result": "PASS"}
 
 
-@requires_gfx950
+@benchmark()
+def test_skip_index_branch(dtype):
+    """A layer that reuses another layer's top-k skips the index slots, not the main KV."""
+    T = 300
+    slots = slot_cases(T)["shuffled"][0]
+    inputs = make_inputs(T, 1, dtype)
+    base = run_op(inputs, 1, slots, "auto", 128, "auto", dtype, skip_index=True)
+    got = run_op(inputs, 1, slots, "mxfp4", 128, "auto", dtype, skip_index=True)
+    for name in ("kc", "vc"):
+        assert same(got[name], expected_pages(base[name], slots)), name
+    return {"result": "PASS"}
+
+
+def test_views_into_one_pool():
+    """K and V as strided views of one pool ([pages, 2, kv heads, 8704]) land right."""
+    T, nkv, dtype = 300, 2, torch.bfloat16
+    slots = slot_cases(T)["shuffled"][0]
+    inputs = make_inputs(T, nkv, dtype)
+    base = run_op(inputs, nkv, slots, "auto", 128, "auto", dtype)
+    got = run_op(inputs, nkv, slots, "mxfp4", 128, "auto", dtype, pool=True)
+    for name in ("kc", "vc"):
+        assert same(got[name], expected_pages(base[name], slots)), name
+    aiter.logger.info("test_views_into_one_pool: PASS")
+
+
+@benchmark()
+def test_q_fp8_out(dtype, kv, scale, bf16_q_too):
+    T = 300
+    slots = slot_cases(T)["shuffled"][0]
+    inputs = make_inputs(T, 1, dtype)
+    inputs[0][:8, : NQ * HD] *= 600.0  # some elements saturate
+    q8 = torch.empty(T, NQ * HD, dtype=dtypes.fp8)
+    q_scale = None if scale is None else torch.tensor([scale], dtype=torch.float32)
+    extra = {"q_fp8_out": q8, "q_scale": q_scale}
+    if not bf16_q_too:
+        extra["q_out"] = None
+    q = run_op(inputs, 1, slots, kv, 128, "auto", dtype, **extra)["q"]
+    q_ref = run_op(inputs, 1, slots, kv, 128, "auto", dtype)["q"]
+    want = (q_ref.float() / (1.0 if scale is None else scale)).clamp(-FP8_MAX, FP8_MAX)
+    assert same(q8, want.to(dtypes.fp8))
+    if bf16_q_too:
+        assert same(q, q_ref)
+    return {"result": "PASS"}
+
+
 def test_existing_index_modes_unchanged():
     """ "auto" and "fp8" write what they always did: the fp8 rows are the cast of the
     "auto" rows, and nothing else moved between the two."""
     T, dtype = 300, torch.bfloat16
-    slots = torch.arange(T, dtype=torch.int64, device="cuda")
-    inputs = make_inputs(T, dtype)
-    ic_auto, out_auto = run_op(inputs, slots, slots, "fp8", "auto", dtype)
-    ic_fp8, out_fp8 = run_op(inputs, slots, slots, "fp8", "fp8", dtype)
-    assert torch.equal(
-        ic_fp8.view(torch.uint8), ic_auto.to(dtypes.fp8).view(torch.uint8)
-    )
-    assert torch.equal(out_auto["q"], out_fp8["q"]) and torch.equal(
-        out_auto["iq"], out_fp8["iq"]
-    )
+    slots = torch.arange(T, dtype=torch.int64)
+    inputs = make_inputs(T, 1, dtype)
+    auto = run_op(inputs, 1, slots, "fp8", 16, "auto", dtype)
+    fp8 = run_op(inputs, 1, slots, "fp8", 16, "fp8", dtype)
+    assert same(fp8["ic"], auto["ic"].to(dtypes.fp8))
+    assert same(auto["q"], fp8["q"]) and same(auto["iq"], fp8["iq"])
+    aiter.logger.info("test_existing_index_modes_unchanged: PASS")
 
 
-@requires_gfx950
 def test_rewriting_a_slot_replaces_all_68_bytes():
     """Overwriting a token with different content leaves no stale data or scale byte."""
     T, dtype = 300, torch.bfloat16
-    slots = torch.arange(T, dtype=torch.int64, device="cuda")
-    a, b = make_inputs(T, dtype, seed=1), make_inputs(T, dtype, seed=2)
-    # Scale the second batch so its e8m0 bytes differ from the first's everywhere.
-    b = (b[0] * 8, *b[1:])
-    nb128 = -(-T // 128)
-    ic = torch.full((nb128, PAGE_BYTES), SENTINEL, dtype=torch.uint8, device="cuda")
-    ic_b_auto, _ = run_op(b, slots, slots, "auto", "auto", dtype)
-    for inputs in (a, b):  # write a, then b over it, into the same pages
-        qkv, w, cs, pos = inputs
-        nb16 = -(-T // 16)
-        kc = torch.zeros(nb16, NKV, HD // 8, 16, 8, dtype=dtype, device="cuda")
-        vc = torch.zeros(nb16, NKV, 16 // 8, HD, 8, dtype=dtype, device="cuda")
-        aiter.fused_qknorm_idxrqknorm(
-            qkv.clone(), w, w, cs, pos, NQ, NKV, ROT, 1e-6, w, w, NIQ,
-            slots, kc, vc, ic, 16, torch.empty(T, NQ * HD, dtype=dtype, device="cuda"),
-            torch.empty(T, NIQ * HD, dtype=dtype, device="cuda"), slots,
-            kv_cache_dtype="auto", index_cache_dtype="mxfp4", asm_layout=True,
-        )  # fmt: skip
-    assert torch.equal(ic, expected_pages(ic_b_auto, slots, nb128))
+    slots = torch.arange(T, dtype=torch.int64)
+    a = make_inputs(T, 1, dtype, seed=1)
+    b = make_inputs(T, 1, dtype, seed=2)
+    b = (b[0] * 8, *b[1:])  # so b's e8m0 bytes differ from a's everywhere
+    ic_b = run_op(b, 1, slots, "auto", 16, "auto", dtype)["ic"]
+    ic = run_op(a, 1, slots, "auto", 16, "mxfp4", dtype)["ic"]
+    run_op(b, 1, slots, "auto", 16, "mxfp4", dtype, ic=ic)  # b over a, same pages
+    assert torch.equal(ic, index_pages(ic_b, slots))
+    aiter.logger.info("test_rewriting_a_slot_replaces_all_68_bytes: PASS")
 
 
-@requires_gfx950
 def test_zero_and_extreme_rows():
     """amax 0 (eps clamp), sparse rows and a single outlier go through the same e8m0
     rule. (The op RMS-normalises the row first, so magnitude cannot be swept here.)"""
     T, dtype = 64, torch.bfloat16
-    slots = torch.arange(T, dtype=torch.int64, device="cuda")
-    qkv, w, cs, pos = make_inputs(T, dtype)
-    ik = qkv[:, -HD:]
+    slots = torch.arange(T, dtype=torch.int64)
+    inputs = make_inputs(T, 1, dtype)
+    ik = inputs[0][:, -HD:]
     ik[0] = 0
-    ik[2, ::2] = 0  # half the groups' elements zero
+    ik[2, ::2] = 0  # half of every group's elements zero
     ik[3, 5] = 3e4  # one outlier in an otherwise ordinary row
-    inputs = (qkv, w, cs, pos)
-    ic_auto, _ = run_op(inputs, slots, slots, "auto", "auto", dtype)
-    ic_fp4, _ = run_op(inputs, slots, slots, "auto", "mxfp4", dtype)
-    assert torch.equal(ic_fp4, expected_pages(ic_auto, slots, ic_fp4.shape[0]))
+    auto = run_op(inputs, 1, slots, "auto", 16, "auto", dtype)["ic"]
+    got = run_op(inputs, 1, slots, "auto", 16, "mxfp4", dtype)["ic"]
+    assert torch.equal(got, index_pages(auto, slots))
+    aiter.logger.info("test_zero_and_extreme_rows: PASS")
 
 
-@requires_gfx950
 def test_pages_dequantize_to_the_reference():
     """Read the pages back the way a consumer addresses them (data at token * 64, scale
     at 128 * 64 + token * 4), dequantize in torch, and compare with the dequantized
     reference quantization of the "auto" rows."""
     T, dtype = 300, torch.bfloat16
-    slots = torch.arange(T, dtype=torch.int64, device="cuda")
-    inputs = make_inputs(T, dtype)
-    ic_auto, _ = run_op(inputs, slots, slots, "auto", "auto", dtype)
-    ic_fp4, _ = run_op(inputs, slots, slots, "auto", "mxfp4", dtype)
-    pages = ic_fp4.shape[0]
-    kd = torch.as_strided(ic_fp4, (pages, 128, 64), (PAGE_BYTES, 64, 1))
-    ks = torch.as_strided(ic_fp4, (pages, 128, 4), (PAGE_BYTES, 4, 1), 128 * 64)
+    slots = torch.arange(T, dtype=torch.int64)
+    inputs = make_inputs(T, 1, dtype)
+    auto = run_op(inputs, 1, slots, "auto", 16, "auto", dtype)["ic"]
+    ic = run_op(inputs, 1, slots, "auto", 16, "mxfp4", dtype)["ic"]
+    pages = ic.shape[0]
+    kd = torch.as_strided(ic, (pages, 128, 64), (PAGE_BYTES, 64, 1))
+    ks = torch.as_strided(ic, (pages, 128, 4), (PAGE_BYTES, 4, 1), 128 * 64)
 
     def dequant(data, scale):
         f = fp4_utils.mxfp4_to_f32(data.reshape(-1, 64).clone())
         e = fp4_utils.e8m0_to_f32(scale.reshape(-1, 4)).repeat_interleave(32, -1)
         return f * e
 
-    got = dequant(kd, ks)[:T]
-    qz, s = per_1x32_f4_quant(ic_auto.reshape(-1, HD))
+    qz, s = per_1x32_f4_quant(auto.reshape(-1, HD))
     ref = dequant(qz.view(torch.uint8), s.view(torch.uint8))[:T]
-    assert torch.equal(got, ref)
+    assert torch.equal(dequant(kd, ks)[:T], ref)
+    aiter.logger.info("test_pages_dequantize_to_the_reference: PASS")
 
 
 def test_reference_scale_rule_is_the_hip_rule():
-    """The e8m0 rule copied into the op (mxfp4ScaleE8m0) is the one in
-    cache_kernels.cu's indexer_fp4_scale_e8m0; this pins the torch quantizer, which
-    the byte-equality tests above use, to that rule on its bit-level definition."""
+    """The e8m0 rule in the op (mxfp4ScaleE8m0) is the one in cache_kernels.cu's
+    indexer_fp4_scale_e8m0; this pins the torch quantizer the byte-equality tests use
+    to that rule on its bit-level definition."""
     torch.manual_seed(0)
-    x = (
-        torch.randn(4096, HD) * torch.exp2(torch.randint(-12, 12, (4096, 1)).float())
-    ).to(torch.bfloat16)
+    x = torch.randn(4096, HD) * torch.exp2(torch.randint(-12, 12, (4096, 1)).float())
+    x = x.to(torch.bfloat16)
     _, s = per_1x32_f4_quant(x)
     amax = x.float().reshape(-1, 32).abs().amax(-1)
     eps = 6.0 * torch.tensor(2.0**-126)
-    bits = (
-        torch.maximum(amax, eps) * torch.tensor(1.0 / 6.0, dtype=torch.float32)
-    ).view(torch.int32)
+    bits = (torch.maximum(amax, eps) * torch.tensor(1.0 / 6.0)).view(torch.int32)
     e = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
     assert torch.equal(e.to(torch.uint8), s.view(torch.uint8).reshape(-1))
+    aiter.logger.info("test_reference_scale_rule_is_the_hip_rule: PASS")
 
 
 def rejection_call(case):
-    """One mxfp4 call that is (or, for "good", is not) a contract violation."""
+    """One mxfp4 index-cache call that is (or, for "good", is not) a contract violation."""
     T, dtype = 32, torch.bfloat16
-    slots = torch.arange(T, dtype=torch.int64, device="cuda")
-    qkv, w, cs, pos = make_inputs(T, dtype)
-    kc = torch.zeros(2, NKV, HD // 8, 16, 8, dtype=dtype, device="cuda")
-    vc = torch.zeros(2, NKV, 16 // 8, HD, 8, dtype=dtype, device="cuda")
-    qo = torch.empty(T, NQ * HD, dtype=dtype, device="cuda")
-    iq = torch.empty(T, NIQ * HD, dtype=dtype, device="cuda")
     ic = {
-        "good": torch.zeros(1, PAGE_BYTES, dtype=torch.uint8, device="cuda"),
-        "not_uint8": torch.zeros(1, 128, HD, dtype=dtype, device="cuda"),
-        "partial_page": torch.zeros(PAGE_BYTES + 128, dtype=torch.uint8, device="cuda"),
-    }.get(case, torch.zeros(1, PAGE_BYTES, dtype=torch.uint8, device="cuda"))
-    aiter.fused_qknorm_idxrqknorm(
-        qkv, w, w, cs, pos, NQ, NKV, ROT, 1e-6, w, w, NIQ,
-        slots, kc, vc, ic, 16, qo, iq, slots,
-        kv_cache_dtype="auto", index_cache_dtype="mxfp4", asm_layout=True,
-        skip_index_branch=(case == "skip_index_branch"),
+        "not_uint8": torch.zeros(1, 128, HD, dtype=dtype),
+        "partial_page": torch.zeros(PAGE_BYTES + 128, dtype=torch.uint8),
+    }.get(case)
+    run_op(
+        make_inputs(T, 1, dtype), 1, torch.arange(T, dtype=torch.int64), "auto", 16,
+        "mxfp4", dtype, ic=ic, skip_index=case == "skip_index_branch",
     )  # fmt: skip
     torch.cuda.synchronize()
 
 
-@requires_gfx950
-@pytest.mark.parametrize(
-    "case", ["good", "not_uint8", "partial_page", "skip_index_branch"]
-)
+@benchmark()
 def test_rejections(case):
-    """AITER_CHECK aborts the process rather than raising, so each case runs in its
-    own interpreter; "good" proves the harness itself is sound."""
-    import os
-    import subprocess
-
+    """AITER_CHECK aborts the process rather than raising, so each case runs in its own
+    interpreter; "good" proves the harness itself is sound."""
     here = os.path.dirname(os.path.abspath(__file__))
     code = (
         f"import sys; sys.path.insert(0, {here!r}); "
@@ -296,74 +362,109 @@ def test_rejections(case):
     else:
         assert r.returncode != 0
         assert "mxfp4" in r.stderr or "index" in r.stderr, r.stderr[-500:]
+    return {"result": "PASS"}
 
 
-def write_runner(T, kv, name, dtype=torch.bfloat16):
-    """A closure running the op once with index_cache_dtype=`name`."""
-    slots = torch.arange(T, dtype=torch.int64, device="cuda")
-    qkv, w, cs, pos = make_inputs(T, dtype)
-    nb16, nb128 = -(-T // 16), -(-T // 128)
-    kvdt = dtypes.fp8 if kv == "fp8" else dtype
-    x = 16 // torch.empty(0, dtype=kvdt).element_size()
-    kc = torch.zeros(nb16, NKV, HD // x, 16, x, dtype=kvdt, device="cuda")
-    vc = torch.zeros(nb16, NKV, 16 // x, HD, x, dtype=kvdt, device="cuda")
-    ks = torch.zeros(nb16, NKV, 16, device="cuda") if kv == "fp8" else None
-    vs = torch.zeros(nb16, NKV, 16, device="cuda") if kv == "fp8" else None
-    shape, idt = {
-        "auto": ((nb128, 128, HD), dtype),
-        "fp8": ((nb128, 128, HD), dtypes.fp8),
-        "mxfp4": ((nb128, PAGE_BYTES), torch.uint8),
-    }[name]
-    ic = torch.zeros(shape, dtype=idt, device="cuda")
-    qo = torch.empty(T, NQ * HD, dtype=dtype, device="cuda")
-    iq = torch.empty(T, NIQ * HD, dtype=dtype, device="cuda")
-
-    def run():
-        aiter.fused_qknorm_idxrqknorm(
-            qkv, w, w, cs, pos, NQ, NKV, ROT, 1e-6, w, w, NIQ,
-            slots, kc, vc, ic, 16, qo, iq, slots,
-            kv_cache_dtype="fp8" if kv == "fp8" else "auto",
-            index_cache_dtype=name, k_scale=ks, v_scale=vs, asm_layout=True,
-        )  # fmt: skip
-
-    return run
-
-
-@pytest.mark.skip(
-    reason="perf sweep: run via python op_tests/test_fused_qknorm_idxrqknorm_mxfp4.py"
-)
 @benchmark()
 def test_write_perf(T, kv):
+    """Cost of the index-K write by index cache dtype (M3 TP4 shape)."""
+    dtype = torch.bfloat16
+    slots = torch.arange(T, dtype=torch.int64)
+    kv_row = HD * (1 if kv == "fp8" else 2)
     ret = {"gfx": get_gfx()}
-    for name in ("auto", "fp8", "mxfp4"):
-        _, us = run_perftest(write_runner(T, kv, name), num_iters=20, num_warmup=5)
+    for name, index_row in (("auto", 2 * HD), ("fp8", HD), ("mxfp4", 68)):
+        call, _ = make_call(make_inputs(T, 1, dtype), 1, slots, kv, 16, name, dtype)
+        _, us = run_perftest(call, num_iters=20, num_warmup=5)
+        # bytes: qkv read; q, index q, K, V and index K written
+        nbytes = T * (2 * (NQ + 2 + NIQ + 1) * HD + 2 * (NQ + NIQ) * HD + 2 * kv_row)
         ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = (nbytes + T * index_row) / us / 1e6
     return ret
 
 
-def parse_args(argv=None):
-    ap = argparse.ArgumentParser(
-        description="fused_qknorm_idxrqknorm index-cache write sweep"
-    )
-    ap.add_argument(
-        "--tokens", type=int, nargs="*", default=[1, 32, 128, 1024, 4096, 16384]
-    )
-    ap.add_argument("--kv", nargs="*", choices=["fp8", "auto"], default=["fp8", "auto"])
-    return ap.parse_args(argv)
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "fused_qknorm_idxrqknorm mxfp4 unsupported on %s; skipping", get_gfx()
+        )
+        return
 
-
-def main(argv=None):
-    args = parse_args(argv)
-    if not torch.cuda.is_available() or get_gfx() != "gfx950":
-        aiter.logger.warning("requires gfx950; skipping sweep")
-        return 0
-    rows = [test_write_perf(T, kv) for kv, T in itertools.product(args.kv, args.tokens)]
-    aiter.logger.info(
-        "index-cache write summary (markdown):\n%s",
-        pd.DataFrame(rows).to_markdown(index=False),
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Test fused_qknorm_idxrqknorm MXFP4 caches and fp8 Q",
     )
-    return 0
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.bf16, dtypes.fp16],
+        nargs="*",
+        default=[dtypes.bf16, dtypes.fp16],
+        help="Input dtype. e.g.: -d bf16 fp16",
+    )
+    parser.add_argument(
+        "-t",
+        "--tokens",
+        type=int,
+        nargs="*",
+        default=[1, 7, 300, 1031],
+        help="Tokens of the byte-equality sweep. e.g.: -t 1 300",
+    )
+    parser.add_argument(
+        "--perf_tokens",
+        type=int,
+        nargs="*",
+        default=[1, 32, 128, 1024, 4096, 16384],
+        help="Tokens of the index-K write timing. e.g.: --perf_tokens 1 4096",
+    )
+    args = parser.parse_args()
+
+    def summary(name, rows):
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "%s summary (markdown):\n%s", name, df.to_markdown(index=False)
+        )
+
+    summary(
+        "write bytes",
+        [
+            test_write_bytes(T, nkv, dtype, kv, bs, index, case)
+            for dtype, T, (kv, bs, index, case, nkv) in itertools.product(
+                args.dtype, args.tokens, CONFIGS
+            )
+        ],
+    )
+    summary("skip_index_branch", [test_skip_index_branch(d) for d in args.dtype])
+    summary(
+        "q_fp8_out",
+        [
+            test_q_fp8_out(*cfg)
+            for cfg in itertools.product(
+                args.dtype, ("auto", "mxfp4"), (None, 0.25, 3.0), (True, False)
+            )
+        ],
+    )
+    test_views_into_one_pool()
+    test_existing_index_modes_unchanged()
+    test_rewriting_a_slot_replaces_all_68_bytes()
+    test_zero_and_extreme_rows()
+    test_pages_dequantize_to_the_reference()
+    test_reference_scale_rule_is_the_hip_rule()
+    summary(
+        "rejections",
+        [
+            test_rejections(c)
+            for c in ("good", "not_uint8", "partial_page", "skip_index_branch")
+        ],
+    )
+    summary(
+        "index-K write",
+        [
+            test_write_perf(T, kv)
+            for kv, T in itertools.product(("fp8", "auto"), args.perf_tokens)
+        ],
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
