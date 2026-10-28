@@ -243,6 +243,16 @@ _COMMON_CASES = [
             "cluster": 8,
         },
     ),
+    (
+        "mtp4-g16-page128",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+            "sink_dtype": torch.float32,
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
@@ -282,6 +292,39 @@ _FP8_CASES = _COMMON_CASES + [
         "default-cap",
         {"group_size": 16, "block_size": 128, "max_partitions": None},
     ),
+    # Four 16-row query tiles at D128 give each gfx1250 wave its own tile.
+    # Varied token magnitudes make a misplaced per-token scale fail; rows past
+    # one page run unmasked interior pages (two-token rows exceed FP8 P error).
+    (
+        "mtp4-g16-page128-direct",
+        {"query_length": 4, "group_size": 16, "block_size": 128},
+    ),
+    (
+        "mtp4-g16-page128-varied",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": None,
+            "lengths": (65, 129, 257, 300, 1027, 4100),
+            "pattern": "varied",
+        },
+    ),
+    (
+        "mtp4-g16-page128-probability_tail",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "pattern": "probability_tail",
+        },
+    ),
+    # 60 rows pad the last wave's tile; GQA 8 puts two queries in each tile.
+    (
+        "mtp5-g12-page128",
+        {"query_length": 5, "group_size": 12, "block_size": 128, "max_partitions": 7},
+    ),
+    ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
     (
