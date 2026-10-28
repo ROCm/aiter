@@ -130,7 +130,15 @@ def test_jdbba(B, D, Kout, Mi, regime, dtype):
     uniform = regime == "uniform"
     out = _nan_out(L, N, dtype)
 
-    candidates = {"flydsl": lambda: _launch(d, out, B, Mi, uniform)}
+    def _flydsl_with_transpose():
+        # Callers that build dense per call in (B, K, N) pay this transpose.
+        dense_tall = d["dense"].transpose(1, 2).reshape(B * N, d["K"]).contiguous()
+        return _launch({**d, "dense_tall": dense_tall}, out, B, Mi, uniform)
+
+    candidates = {
+        "flydsl": lambda: _launch(d, out, B, Mi, uniform),
+        "flydsl+transpose": _flydsl_with_transpose,
+    }
     if _HAS_TRITON:
         so64 = d["seq_offsets"].to(torch.int64)
         candidates["triton"] = lambda: triton_jagged_dense_bmm_add_fwd(
