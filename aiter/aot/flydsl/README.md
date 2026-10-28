@@ -92,10 +92,9 @@ stage-2 reduction, compiled for the mask's length
 the deployment, which no tuned row records, so these callers come from the
 `fused_moe` deployments of `moe_deployments.json` (see
 [MoE deployments](#moe-deployments)). A tensor-parallel caller passes no
-mask, but its call also depends on what tuned rows leave out: the padding its
-framework gives the split intermediate dim (`intermediate_pad`, which the
-FlyDSL GEMMs compile in) and how it runs the shared expert (in the routed
-weights, apart, or through FHMoE). The file lists those deployments too.
+mask, but its call also depends on what tuned rows leave out: how it runs the
+shared expert (in the routed weights, apart, or through FHMoE). The file
+lists those deployments too.
 
 Each deployment replays at the smallest and largest M of every
 `get_padded_M` bucket up to `max_tokens`, bisected as for rows, with the
@@ -145,7 +144,6 @@ a list, and expand to every combination:
 | `tp` | `fused_moe` only: TP size of the experts, default 1. The experts split over TP or over EP, not both |
 | `redundant_experts` | EPLB redundant experts (ATOM's `num_redundant_experts`), default 0; EP only |
 | `shared_expert_mode` | `fused_moe` only: `separate` (default), `fused` into the rank's experts, or `fhmoe` (FHMoE runs the one shared expert from its own weights; TP only) |
-| `pad_align` | `fused_moe` only: what the framework pads the hidden and split intermediate dims up to (ATOM's `FusedMoE(pad_align)`), default 1 |
 | `max_tokens` | `fused_moe` only: the largest M a rank passes |
 | `max_tokens_per_rank` | `mega_moe` only: MegaMoE's `max_tok_per_rank`, one value or a list |
 | `source`, `note` | where the deployment comes from; free text |
@@ -160,8 +158,7 @@ passes:
   plus, behind an EP dispatch, a sentinel column that masks them on the tokens
   of other ranks (ATOM's `init_aiter_topK_meta_data`);
 - behind an EP dispatch, an `expert_mask` of P + S + 1 entries; under TP none;
-- `inter_dim` / TP padded up to `pad_align`, and `hidden_size` padded the
-  same way, with the padding as `hidden_pad` and `intermediate_pad`;
+- an intermediate dim of `inter_dim` / TP, and the model's `hidden_size`;
 - with `fhmoe`, `shared_expert_id` = the routed expert count, the shared
   expert's slot.
 
@@ -171,8 +168,8 @@ local experts, top-k 6 and a 449-entry mask; at TP8 through FHMoE it passes
 intermediate dim of 384. A MegaMoE rank holds P / EP experts.
 
 Each deployment gets an id, `{model}/{gfx}/{quant}/ep{N}[-r{redundant}][-fused]`
-or `{model}/{gfx}/{quant}/tp{N}[-pad{align}][-fused|-fhmoe]` (`-pad` only when
-the alignment pads), for example `deepseek-v4-pro/gfx950/a8w4/ep8-r32`, which
+or `{model}/{gfx}/{quant}/tp{N}[-fused|-fhmoe]`, for example
+`deepseek-v4-pro/gfx950/a8w4/ep8-r32`, which
 the replays log and `test_moe_ep.py --deployment-id` selects by. Files given
 together load together: their models merge, one id per definition, and a file
 of your own may name the default file's models without repeating them.
