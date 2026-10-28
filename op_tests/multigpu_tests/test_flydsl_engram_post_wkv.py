@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Run with torchrun --standalone --nproc_per_node={2,4,8} on gfx950.
+"""Run with torchrun --standalone --nproc_per_node={2,4} on gfx950.
 
 Independent FP32 reference, changing graph inputs/masks, rank arrival skew,
 and both signed-int32 and uint32 epoch wrap boundaries. No ATOM dependency.
@@ -41,7 +41,7 @@ def main():
     post = FusedEngramPost(group.cpu_group)
     keys, rotation = 20480 // tp, rank * (5120 // tp)
     count, max_nrmse = 0, 0.0
-    for m in (1, 8, 13, 16, 33, 128):
+    for m in (1, 8, 13, 16, 33, 64, 96, 128, 7, 2):
         torch.manual_seed(7900 + m)
         h = torch.randn(m, 4, 5120, device="cuda", dtype=torch.bfloat16)
         kv = torch.randn(m, 25600, device="cuda", dtype=torch.bfloat16)
@@ -59,7 +59,9 @@ def main():
         local = local_kv()
         for masked in (False, True):
             mask = (torch.arange(m, device="cuda") % 3 != 0) if masked else None
-            post(h, local, weight, mask, value_start=rotation)
+            # Only M=1 is warmed: capture unseen M using the same binary.
+            if m == 1:
+                post(h, local, weight, mask, value_start=rotation)
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -71,7 +73,7 @@ def main():
                 if start is not None:
                     # Only active slots have a valid message history. Leave
                     # never-used slots at their initial epoch for later M.
-                    post.epoch[: m * (4 // min(tp, 4))].fill_(start)
+                    post.epoch[: m * 4].fill_(start)
                     torch.cuda.synchronize()
                     dist.barrier(group=group.cpu_group)
                 for repeat in range(3):
@@ -123,6 +125,7 @@ def main():
                         max_nrmse = max(max_nrmse, nrmse)
                         count += 1
             del graph, outputs
+    assert len(post.compiled) == 2, len(post.compiled)
     metrics = [None] * tp
     dist.all_gather_object(metrics, (count, max_nrmse), group=group.cpu_group)
     if rank == 0:

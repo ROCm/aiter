@@ -14,9 +14,10 @@ from .quick_allreduce_int4_ipc import UncachedIpcHeap as Heap
 class FusedEngramPost:
     """One workspace per serialized TP group call sequence, initialized eagerly.
 
-    All ranks must invoke the same shapes in the same order. Warm each shape
-    before graph capture. Graphs retain the workspace and its device epochs;
-    callers must keep this object alive for the lifetime of their graphs.
+    All ranks must invoke the same shapes in the same order. Warm each mask/
+    value-rotation/epsilon configuration before graph capture; M is dynamic.
+    Graphs retain the workspace and its device epochs; callers must keep this
+    object alive for the lifetime of their graphs.
     """
 
     def __init__(self, group):
@@ -27,8 +28,8 @@ class FusedEngramPost:
         self.group = group
         self.rank = dist.get_rank(group)
         self.tp = dist.get_world_size(group)
-        if self.tp not in (2, 4, 8):
-            raise ValueError("Fused Engram requires TP2, TP4 or TP8")
+        if self.tp not in (2, 4):
+            raise ValueError("Fused Engram requires TP2 or TP4")
         from .quick_allreduce_int4 import _validate_ipc_process_group
 
         _validate_ipc_process_group(group, rank=self.rank)
@@ -114,20 +115,19 @@ class FusedEngramPost:
             self.epoch,
             self.error,
             self.peers,
-            m,
             self.tp,
             self.rank,
-            min(m * (4 // min(self.tp, 4)), GRID_CAP),
+            m * 4,
             mask is not None,
             value_start,
             eps,
             torch.cuda.current_stream(),
         )
-        key = (m, mask is not None, value_start, eps)
+        key = (mask is not None, value_start, eps)
         if key not in self.compiled:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    "Warm the fused Engram shape before CUDA Graph capture"
+                    "Warm the fused Engram configuration before CUDA Graph capture"
                 )
             _preload_compiled(launch, *args)
             dist.barrier(group=self.group)
