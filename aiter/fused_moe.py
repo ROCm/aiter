@@ -6,6 +6,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from enum import IntEnum
 
 import torch
 
@@ -77,6 +78,19 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 
 AUX_SORT_OPUS = "opus"
+
+
+class AsmMoeMode(IntEnum):
+    """ASM manifest modes; integer values are the CSV contract."""
+
+    SORTED = 0
+    NO_SORT = 1
+    EMSORT = 2
+    POST_REDUCE = 3
+
+    @property
+    def requires_host_sort(self) -> bool:
+        return self is AsmMoeMode.SORTED or self is AsmMoeMode.POST_REDUCE
 
 
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
@@ -768,15 +782,16 @@ def moe_sorting(
     dispatch_policy=0,
     return_local_topk_ids=False,
     accumulate=True,
-    flat=False,
+    flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     output_aux=False,
     output=None,
 ):
+    asm_mode = AsmMoeMode(flat)
     if (
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
         and not return_local_topk_ids
-        and flat not in (1, 2)
+        and asm_mode.requires_host_sort
         and not output_aux
         and dispatch_policy == 0
     ):
@@ -794,7 +809,7 @@ def moe_sorting(
         )
     # FLAT kernel: in-kernel routing (manifest flat=1 or flat=2); pass through unsorted topk.
     # `output` cannot be written in place: FLAT needs extra bytes appended to moe_buf.
-    if flat in (1, 2):
+    if not asm_mode.requires_host_sort:
         assert output is None, "FLAT over-allocates moe_buf; the caller copies"
         return _moe_prepare_unsorted_input(
             topk_ids, topk_weights, model_dim, moebuf_dtype
@@ -1717,7 +1732,8 @@ def _fused_moe_impl(
             f"kernel block size {metadata.block_m}"
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
-    if metadata.flat == 3 and block_size_M != 256:
+    asm_mode = AsmMoeMode(metadata.flat)
+    if asm_mode is AsmMoeMode.POST_REDUCE and block_size_M != 256:
         raise ValueError(
             f"Post-reduction block_size_M={block_size_M} is incompatible: sorting requires 256-row tiles"
         )
@@ -1769,7 +1785,7 @@ def _fused_moe_impl(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert metadata.flat not in (1, 2) or get_gfx() in (
+    assert asm_mode.requires_host_sort or get_gfx() in (
         "gfx942",
         "gfx950",
     ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
@@ -1904,8 +1920,8 @@ def _fused_moe_impl(
             moe_sorting_dispatch_policy,
             return_local_topk_ids=need_local_topk_ids,
             accumulate=not runtime_stage2_reduce,
-            flat=metadata.flat,
-            output=None if metadata.flat in (1, 2) else output,
+            flat=asm_mode,
+            output=output if asm_mode.requires_host_sort else None,
         )
         if need_local_topk_ids:
             (
@@ -2034,8 +2050,9 @@ def fused_moe_1stage(
     M: int | None = None,
     device=None,
     doweight_stage1: bool | None = None,
-    flat: int = 0,
+    flat: AsmMoeMode | int = AsmMoeMode.SORTED,
 ):
+    asm_mode = AsmMoeMode(flat)
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
         aiter.fmoe(
@@ -2127,7 +2144,7 @@ def fused_moe_1stage(
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
             )
-        elif isG1U1 and flat == 3:
+        elif isG1U1 and asm_mode is AsmMoeMode.POST_REDUCE:
             # The by-name launcher lookup does not check the sorted tile size.
             if int(block_size_M) != 256:
                 raise ValueError(
@@ -2378,8 +2395,7 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_quant: str = ""
     stage2_has_bias: bool = False
-    # ASM mode: 0 sorted, 1 no_sort, 2 emsort, 3 sorted + post_reduce.
-    flat: int = 0
+    flat: AsmMoeMode | int = AsmMoeMode.SORTED
     output_aux: bool | str = False
     prequant: bool = True
     skip_inter_quant: bool = False
@@ -3787,7 +3803,7 @@ def get_2stage_cfgs(
                     "incomplete metadata"
                 )
 
-    if cfg is not None and cfg.get("flat", 0) == 3:
+    if cfg is not None and cfg.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE:
         post_reduce_supported = (
             gfx == "gfx950"
             and dtype == dtypes.bf16
@@ -3984,7 +4000,7 @@ def get_2stage_cfgs(
         run_1stage_xbf16 = False
         # No tuned config => default host moe_sort (flat=0). A tuned FLAT row
         # sets flat=1 (one token per TG) or flat=2 (EMSORT).
-        cfg_flat = 0
+        cfg_flat = AsmMoeMode.SORTED
         if (
             activation,
             q_type,
@@ -4086,9 +4102,9 @@ def get_2stage_cfgs(
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
         if "flat" in cfg:
-            cfg_flat = int(cfg["flat"]) if run_1stage else 0
+            cfg_flat = AsmMoeMode(int(cfg["flat"])) if run_1stage else AsmMoeMode.SORTED
         else:
-            cfg_flat = 0
+            cfg_flat = AsmMoeMode.SORTED
 
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
@@ -4157,7 +4173,7 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
             flat=cfg_flat,
-            output_aux=(AUX_SORT_OPUS if cfg_flat == 3 else False),
+            output_aux=(AUX_SORT_OPUS if cfg_flat is AsmMoeMode.POST_REDUCE else False),
             **route_bucket_metadata,
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")

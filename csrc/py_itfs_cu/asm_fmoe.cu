@@ -69,6 +69,14 @@ struct __attribute__((packed)) KernelArgs
     p3 _p27;
 };
 
+enum class AsmMoeMode : int
+{
+    SORTED      = 0,
+    NO_SORT     = 1,
+    EMSORT      = 2,
+    POST_REDUCE = 3,
+};
+
 class FMoeKernel
 {
     private:
@@ -78,9 +86,8 @@ class FMoeKernel
     uint32_t num_persistent_tgs = 0;
     uint32_t tgs_align          = 1;
     const char* name            = nullptr;
-    // flat_mode: 0 = sorted, 1 = no_sort, 2 = emsort, 3 = sorted + post_reduce.
-    // Mode 3 uses the standard persistent grid; Python reduces its route partials.
-    int flat_mode = 0;
+    // POST_REDUCE uses the sorted persistent grid; Python reduces route partials.
+    AsmMoeMode flat_mode = AsmMoeMode::SORTED;
     // Manifest limits. 0 max_tokens means no separate token cap.
     uint32_t max_tokens      = 0;
     uint32_t max_assignments = 0;
@@ -91,7 +98,7 @@ class FMoeKernel
                const char* hsaco,
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0,
-               int flat_mode               = 0,
+               int flat_mode               = static_cast<int>(AsmMoeMode::SORTED),
                uint32_t tgs_align          = 1,
                uint32_t max_tokens         = 0,
                uint32_t max_assignments    = 0,
@@ -101,7 +108,7 @@ class FMoeKernel
         this->num_persistent_tgs = num_persistent_tgs;
         this->tgs_align          = std::max(tgs_align, 1u);
         this->name               = name;
-        this->flat_mode          = flat_mode;
+        this->flat_mode          = static_cast<AsmMoeMode>(flat_mode);
         this->max_tokens         = max_tokens;
         this->max_assignments    = max_assignments;
         this->max_experts        = max_experts;
@@ -110,7 +117,7 @@ class FMoeKernel
     const char* get_name() const { return name; }
     int get_num_persistent_tgs() { return num_persistent_tgs; }
     int get_sub_GU() { return sub_GU; }
-    int get_flat_mode() const { return flat_mode; }
+    AsmMoeMode get_flat_mode() const { return flat_mode; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
     template <int I_elemSize, int O_elemSize, bool switchGxy = false>
@@ -205,18 +212,18 @@ class FMoeKernel
         int gdx;
         int gdy;
         int gdz;
-        // flat_mode==1: one-TG-per-(token,topk) grid; no host moe_sort.
-        // flat_mode==2: EMSORT consumes raw topk and uses the configured persistent
+        // NO_SORT: one-TG-per-(token,topk) grid; no host moe_sort.
+        // EMSORT consumes raw topk and uses the configured persistent
         // TG pool as a 2D grid: hidden slices on X, expert owners on Y. The shader
         // derives expert ownership from tgy and loops over its compacted queue.
-        if(this->flat_mode == 1)
+        if(this->flat_mode == AsmMoeMode::NO_SORT)
         {
             bdx = 256;
             gdx = ((inter_dim + sub_GU - 1) / sub_GU);
             gdy = static_cast<int>(topk);
             gdz = static_cast<int>(token_cnt);
         }
-        else if(this->flat_mode == 2)
+        else if(this->flat_mode == AsmMoeMode::EMSORT)
         {
             // Each EMSORT binary declares its own queue in the manifest
             // (max_tokens, max_assignments, max_experts). A zero max_tokens
@@ -357,9 +364,10 @@ static bool ps_grid_fits(const CFG::mapped_type& cfg, int inter_dim)
 static bool kernel_fits(
     const CFG::mapped_type& cfg, int vskip, int smf, int block_size_M, int inter_dim, int model_dim)
 {
-    return cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m && cfg.flat == 0 &&
-           inter_dim % cfg.subGU_n == 0 && model_dim % std::max(cfg.dim_align, 1) == 0 &&
-           model_dim >= cfg.dim_min && ps_grid_fits(cfg, inter_dim);
+    return cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m &&
+           cfg.flat == static_cast<int>(AsmMoeMode::SORTED) && inter_dim % cfg.subGU_n == 0 &&
+           model_dim % std::max(cfg.dim_align, 1) == 0 && model_dim >= cfg.dim_min &&
+           ps_grid_fits(cfg, inter_dim);
 }
 
 FMoeKernel* get_heuristic_kernel(int inter_dim,

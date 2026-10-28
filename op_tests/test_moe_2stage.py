@@ -19,6 +19,7 @@ from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
+    AsmMoeMode,
     _flydsl_route_output_nbytes,
     _is_flydsl_stage2,
     _stage2_runtime_uses_route_reduce,
@@ -335,7 +336,7 @@ def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
     ):
         metadata = _q256_metadata(**metadata_overrides)
         assert not metadata.run_1stage and metadata.stage2 is not None
-        assert metadata.flat != 3
+        assert metadata.flat != AsmMoeMode.POST_REDUCE
         if "quant_dtype_a2" in overrides:
             assert metadata.fuse_quant == "fp8"
             assert "_afp8_" in metadata.stage2.keywords["kernelName"]
@@ -1364,7 +1365,7 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
-        post_reduce = row.get("flat", 0) == 3
+        post_reduce = row.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE
         # ASM 1-stage emsort/flat rows dispatch through fused_moe too;
         # include them so the test harness exercises the emsort path. Only
         # per_1x32 (MXFP4) ASM rows: the other ASM families (per_Token,
@@ -1888,6 +1889,14 @@ def test_route_workspace_token_capacity():
     aiter.logger.info("moe_2stage: route workspace capacity passed")
 
 
+def test_asm_mode_values():
+    assert [mode.value for mode in AsmMoeMode] == [0, 1, 2, 3]
+    assert AsmMoeMode(False) is AsmMoeMode.SORTED
+    assert AsmMoeMode(True) is AsmMoeMode.NO_SORT
+    with pytest.raises(ValueError):
+        AsmMoeMode(4)
+
+
 def test_asm_sort_modes():
     """Only no_sort/emsort bypass sorting; post_reduce preserves caller output."""
     module = aiter.fused_moe
@@ -1900,7 +1909,13 @@ def test_asm_sort_modes():
             patch.object(module, "_moe_sorting_impl") as sorted_input,
             patch.object(module, "_flydsl_moe_sorting") as flydsl,
         ):
-            for mode in (0, 1, 2, 3):
+            for mode, requires_sort in (
+                (AsmMoeMode.SORTED, True),
+                (AsmMoeMode.NO_SORT, False),
+                (AsmMoeMode.EMSORT, False),
+                (AsmMoeMode.POST_REDUCE, True),
+            ):
+                assert mode.requires_host_sort is requires_sort
                 for call in (no_sort, sorted_input, flydsl):
                     call.reset_mock()
                 result = module.moe_sorting(
@@ -1909,12 +1924,12 @@ def test_asm_sort_modes():
                     8,
                     512,
                     dtypes.bf16,
-                    flat=mode,
-                    output=output if mode in (0, 3) else None,
+                    flat=int(mode),
+                    output=output if requires_sort else None,
                 )
                 expected = (
                     no_sort
-                    if mode in (1, 2)
+                    if not requires_sort
                     else flydsl if flydsl_sort else sorted_input
                 )
                 assert result is expected.return_value
@@ -1922,12 +1937,18 @@ def test_asm_sort_modes():
                     sum(call.call_count for call in (no_sort, sorted_input, flydsl))
                     == 1
                 )
-                if mode in (0, 3):
+                if requires_sort:
                     assert expected.call_args.kwargs["output"] is output
                 else:
                     with pytest.raises(AssertionError, match="caller copies"):
                         module.moe_sorting(
-                            ids, weights, 8, 512, dtypes.bf16, flat=mode, output=output
+                            ids,
+                            weights,
+                            8,
+                            512,
+                            dtypes.bf16,
+                            flat=int(mode),
+                            output=output,
                         )
 
 
@@ -1960,7 +1981,7 @@ def test_asm_post_reduce_mode():
     ):
         reducer = kernels.return_value._run_moe_reduction
         reducer.side_effect = reduce
-        for mode in (0, 1, 2, 3):
+        for mode in AsmMoeMode:
             producer.reset_mock()
             reducer.reset_mock()
             returned = module.fused_moe_1stage(
@@ -1975,18 +1996,19 @@ def test_asm_post_reduce_mode():
                 output,
                 True,
                 block_size_M=256,
-                flat=mode,
+                flat=int(mode),
                 q_dtype_a=dtypes.bf16,
                 kernelName="mode_selected_producer",
             )
             assert returned is output
             assert producer.call_count == 1
-            assert reducer.call_count == (1 if mode == 3 else 0)
+            requires_reduce = mode is AsmMoeMode.POST_REDUCE
+            assert reducer.call_count == int(requires_reduce)
             assert torch.equal(
-                output, torch.full_like(output, topk if mode == 3 else 1)
+                output, torch.full_like(output, topk if requires_reduce else 1)
             )
             assert producer.call_args.args[0].shape == (
-                (tokens, topk * model) if mode == 3 else (tokens, model)
+                (tokens, topk * model) if requires_reduce else (tokens, model)
             )
 
 
@@ -2091,14 +2113,14 @@ def test_q256_token_boundaries():
         return
     metadata = _q256_metadata()
     assert metadata.run_1stage and metadata.block_m == 256
-    assert metadata.flat == 3
-    assert metadata.stage1.keywords["flat"] == 3
+    assert metadata.flat is AsmMoeMode.POST_REDUCE
+    assert metadata.stage1.keywords["flat"] is AsmMoeMode.POST_REDUCE
     for gate_up_interleave in (False, None):
         supported = _q256_metadata(
             opus_weights_shuffled=True, gate_up_interleave=gate_up_interleave
         )
         assert supported.run_1stage and supported.block_m == 256
-        assert supported.flat == 3
+        assert supported.flat is AsmMoeMode.POST_REDUCE
     for unsupported in (
         {"opus_weights_shuffled": False},
         {"is_shuffled": False},
@@ -2114,7 +2136,7 @@ def test_q256_token_boundaries():
     ):
         fallback = _q256_metadata(**unsupported)
         assert not fallback.run_1stage and fallback.stage2 is not None
-        assert fallback.flat != 3
+        assert fallback.flat != AsmMoeMode.POST_REDUCE
     rows = []
     for token in (4096, 4097, 8191, 8192, 8193):
         case = _q256_case(token, 8192)

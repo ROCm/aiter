@@ -28,6 +28,7 @@ from aiter import (
     dtypes,
 )
 from aiter.fused_moe import (
+    AsmMoeMode,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
     asm_stage1,
@@ -224,7 +225,9 @@ def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
     """Map names to ASM mode: 0 sorted, 1 no_sort, 2 emsort, 3 post_reduce."""
     if "flat" not in df.columns:
         return {}
-    return dict(zip(df["knl_name"], df["flat"].fillna(0).astype(int)))
+    return dict(
+        zip(df["knl_name"], df["flat"].fillna(AsmMoeMode.SORTED.value).astype(int))
+    )
 
 
 def torch_dynamic_mxfp8_quant(x: torch.Tensor):
@@ -2967,10 +2970,11 @@ class FmoeTuner(TunerCommon):
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
                 # Only no_sort/emsort consume raw topk. Post-reduce entries need
                 # a reduction and are not candidates for this direct-output tuner.
-                flat_flag = int(asm_1stage_flat.get(el, 0))
-                if flat_flag == 3:
+                flat_flag = int(asm_1stage_flat.get(el, AsmMoeMode.SORTED))
+                asm_mode = AsmMoeMode(flat_flag)
+                if asm_mode is AsmMoeMode.POST_REDUCE:
                     continue
-                if flat_flag in (1, 2):
+                if not asm_mode.requires_host_sort:
                     _data_idx = [0, 1, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
                 else:
                     _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
@@ -3073,10 +3077,11 @@ class FmoeTuner(TunerCommon):
                     continue
                 for el in xbf16_kernels.get((tile_m, tile_n, 0), []):
                     # xbf16: internal quant; only no_sort/emsort take raw topk.
-                    flat_flag = int(xbf16_flat.get(el, 0))
-                    if flat_flag == 3:
+                    flat_flag = int(xbf16_flat.get(el, AsmMoeMode.SORTED))
+                    asm_mode = AsmMoeMode(flat_flag)
+                    if asm_mode is AsmMoeMode.POST_REDUCE:
                         continue
-                    if flat_flag in (1, 2):
+                    if not asm_mode.requires_host_sort:
                         _data_idx = [0, 0, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
                     else:
                         _data_idx = [0, 0, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
@@ -5331,8 +5336,8 @@ class FmoeTuner(TunerCommon):
             resultdf["xbf16"] = 0
         resultdf["xbf16"] = resultdf["xbf16"].fillna(0).astype(int)
         if "flat" not in resultdf.columns:
-            resultdf["flat"] = 0
-        resultdf["flat"] = resultdf["flat"].fillna(0).astype(int)
+            resultdf["flat"] = AsmMoeMode.SORTED.value
+        resultdf["flat"] = resultdf["flat"].fillna(AsmMoeMode.SORTED.value).astype(int)
         if "nt" not in resultdf.columns:
             resultdf["nt"] = 0
         resultdf["nt"] = resultdf["nt"].fillna(0).astype(int)
@@ -5400,7 +5405,7 @@ class FmoeTuner(TunerCommon):
                 stage = tail[0]
                 kernelName = tail[1]
                 block_m = tail[2]
-                flat_flag = int(tail[3]) if len(tail) > 3 else 0
+                flat_flag = int(tail[3]) if len(tail) > 3 else AsmMoeMode.SORTED.value
                 v2_flag = int(tail[4]) if len(tail) > 4 else 0
                 nt_flag = int(tail[5]) if len(tail) > 5 else 0
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
@@ -5599,7 +5604,7 @@ class FmoeTuner(TunerCommon):
             )
             profileDF["run_1stage"] = 0
             profileDF["xbf16"] = 0
-            profileDF["flat"] = 0
+            profileDF["flat"] = AsmMoeMode.SORTED.value
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
             if len(profileDF) == 0:
                 print(
@@ -5752,8 +5757,15 @@ class FmoeTuner(TunerCommon):
                 )
 
             # Only no_sort/emsort avoid the host sort; post_reduce is sorted input.
+            host_sort_modes = [
+                mode.value for mode in AsmMoeMode if mode.requires_host_sort
+            ]
+            raw_route_modes = [
+                mode.value for mode in AsmMoeMode if not mode.requires_host_sort
+            ]
             has_flat = (
-                "flat" in profileDF.columns and profileDF["flat"].isin([1, 2]).any()
+                "flat" in profileDF.columns
+                and profileDF["flat"].isin(raw_route_modes).any()
             )
             if has_flat:
                 from aiter.fused_moe import moe_sorting
@@ -5784,7 +5796,7 @@ class FmoeTuner(TunerCommon):
                         us_sort_cache[bm] = 0.0
                 print(f"  moe_sorting benchmark per block_m: {us_sort_cache}")
                 profileDF["us_moe_sort"] = profileDF["block_m"].map(us_sort_cache)
-                non_flat = profileDF["flat"].isin([0, 3])
+                non_flat = profileDF["flat"].isin(host_sort_modes)
                 profileDF.loc[non_flat, "us1"] = (
                     profileDF.loc[non_flat, "us1"]
                     + profileDF.loc[non_flat, "us_moe_sort"]
@@ -5802,8 +5814,8 @@ class FmoeTuner(TunerCommon):
             # (additive fairness + idxmin) stays exactly as it was.
             if has_flat:
                 try:
-                    flat_mask = profileDF["flat"].isin([1, 2])
-                    nf_mask = profileDF["flat"].isin([0, 3])
+                    flat_mask = profileDF["flat"].isin(raw_route_modes)
+                    nf_mask = profileDF["flat"].isin(host_sort_modes)
                     if not (flat_mask.any() and nf_mask.any()):
                         raise RuntimeError("missing FLAT or non-FLAT class")
                     # Rank candidates by us1+us2 (us2 is 0 for 1-stage rows,
@@ -5905,7 +5917,7 @@ class FmoeTuner(TunerCommon):
                             model_dim,
                             dtype,
                             1,
-                            flat=True,
+                            flat=AsmMoeMode.NO_SORT,
                         )
                         aiter.fmoe_fp8_blockscale_g1u1(
                             mbuf,
@@ -6958,7 +6970,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 "us": 0,
                 "run_1stage": 0,
                 "xbf16": 0,
-                "flat": 0,
+                "flat": AsmMoeMode.SORTED.value,
                 "tflops": 0,
                 "bw": 0,
             }
@@ -7767,7 +7779,7 @@ if __name__ == "__main__":
         "us",
         "run_1stage",
         "xbf16",
-        # 1 if FLAT 1stage (manifest flat); else 0.
+        # Serialized AsmMoeMode value from the manifest.
         "flat",
         "tflops",
         "bw",
