@@ -3,8 +3,11 @@ import triton.experimental.gluon.language as gl
 import triton.language as tl
 from triton.experimental import gluon
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -14,7 +17,7 @@ def matmul_launch_metadata(grid, kernel, args):
     hist = args["ExptHist"]
     if hist is not None:
         n_rows = int(hist.float().mean())
-        n_tokens = float(hist.sum())
+        n_tokens = int(hist.sum())
         n_w_bytes = (W.numel() * W.element_size() // hist.numel()) * (hist > 0).sum()
     else:
         n_tokens = None

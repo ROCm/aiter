@@ -444,25 +444,20 @@ jobs:
               # ROCm libs ship in the consumer container; torch libs are
               # provided by the user-installed PyTorch wheel.
               EXCLUDES=(
-                --exclude libamdhip64.so.7
-                --exclude libamdhip64.so
-                --exclude libhsa-runtime64.so.1
-                --exclude libhsa-runtime64.so
-                --exclude librocblas.so
-                --exclude librocsparse.so
-                --exclude librocsolver.so
-                --exclude libhipblas.so
-                --exclude libhipblaslt.so
-                --exclude librccl.so.1
-                --exclude librccl.so
-                --exclude libMIOpen.so.1
-                --exclude libMIOpen.so
-                --exclude libtorch.so
-                --exclude libtorch_cpu.so
-                --exclude libtorch_hip.so
-                --exclude libtorch_python.so
-                --exclude libc10.so
-                --exclude libc10_hip.so
+                --exclude "libamdhip64.so*"
+                --exclude "libhsa-runtime64.so*"
+                --exclude "libamd_comgr.so*"
+                --exclude "librocblas.so*"
+                --exclude "librocsparse.so*"
+                --exclude "librocsolver.so*"
+                --exclude "librocroller.so*"
+                --exclude "libroctx64.so*"
+                --exclude "libhipblas.so*"
+                --exclude "libhipblaslt.so*"
+                --exclude "librccl.so*"
+                --exclude "libMIOpen.so*"
+                --exclude "libtorch*.so*"
+                --exclude "libc10*.so*"
               )
               for whl in dist/*.whl; do
                 echo "=== auditwheel show (raw) ==="
@@ -473,6 +468,20 @@ jobs:
               done
               echo "=== Repaired wheels ==="
               ls -lh dist-repaired/
+              # Guard: nothing should have been grafted. auditwheel copies any
+              # non-excluded external lib into <pkg>.libs/ inside the wheel, so
+              # a non-empty .libs/ means an exclude pattern stopped matching
+              # (e.g. a de-torched module gained a direct ROCm DT_NEEDED, or a
+              # ROCm bump changed a SONAME major).
+              for whl in dist-repaired/*.whl; do
+                grafted=$(${PYBIN}/python -m zipfile -l "${whl}" | grep "\.libs/" || true)
+                if [ -n "${grafted}" ]; then
+                  echo "ERROR: auditwheel grafted external libs into ${whl}:"
+                  echo "${grafted}"
+                  echo "Add the missing SONAME glob to EXCLUDES above."
+                  exit 1
+                fi
+              done
               # Replace original dist with repaired copies (keeps existing
               # downstream upload logic untouched).
               rm -f dist/*.whl

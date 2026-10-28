@@ -9,12 +9,7 @@ import contextlib
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as std_arith
-from flydsl._mlir.dialects import fly as fly_dialect
-from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl._mlir.dialects import vector
-from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.rocdl import tdm_ops as _tdm_ops
 from flydsl.expr.typing import Vector as Vec
@@ -30,21 +25,20 @@ compute_warp_distribution = _tdm_ops.compute_warp_distribution
 
 __all__ = [
     "TDMDescriptor2D",
+    "clamp_tensor_descriptor_2d_inner_extent",
     "make_tensor_descriptor_2d",
     "tensor_load_2d",
     "tensor_wait",
     "update_tensor_descriptor_2d_addr64",
     "update_tensor_descriptor_2d_lds_addr",
+    "update_tensor_descriptor_2d_pred",
 ]
 
 
 def _fly_lds_base_index(raw: ir.Value) -> ir.Value:
     """Extract a Fly shared pointer / view as an LDS byte index."""
-    ptr_type = ir.Type.parse("!llvm.ptr<3>")
-    ptr = fly_dialect.extract_aligned_pointer_as_index(ptr_type, raw)
-    i64 = ir.IntegerType.get_signless(64)
-    ptr_i64 = llvm_dialect.ptrtoint(i64, ptr)
-    return std_arith.IndexCastOp(ir.IndexType.get(), ptr_i64).result
+    ptr = fx.Pointer(raw) if isinstance(raw.type, fx.PointerType) else fx.get_iter(raw)
+    return fx.Index(fx.ptrtoint(ptr)).ir_value()
 
 
 class _FlyAwareMemrefDialect:
@@ -83,19 +77,27 @@ def _clamp_inner_extent(desc: TDMDescriptor2D, bound) -> TDMDescriptor2D:
     g1 = Vec(desc.dgroup1)
     b = fx.Int32(bound)
     dim0 = (b > 0).select(b, fx.Int32(0))
-    packed = (
-        (
-            _DIM0_LO_SGPR,
-            (fx.Int32(g1[_DIM0_LO_SGPR]) & 0xFFFF) | ((dim0 & 0xFFFF) << 16),
-        ),
-        (_DIM0_HI_SGPR, ((fx.Int32(g1[_DIM0_HI_SGPR]) >> 16) << 16) | (dim0 >> 16)),
+    dim0 = fx.Uint32(dim0)
+    lanes = [fx.Uint32(g1[i]) for i in range(8)]
+    lanes[_DIM0_LO_SGPR] = (lanes[_DIM0_LO_SGPR] & 0xFFFF) | ((dim0 & 0xFFFF) << 16)
+    lanes[_DIM0_HI_SGPR] = (lanes[_DIM0_HI_SGPR] & fx.Uint32(0xFFFF0000)) | (dim0 >> 16)
+    return TDMDescriptor2D(
+        dgroup0=desc.dgroup0,
+        dgroup1=Vec.from_elements(lanes, fx.Uint32).ir_value(),
     )
-    raw = _raw(desc.dgroup1)
-    for position, value in packed:
-        raw = vector.InsertOp(
-            _raw(value), raw, static_position=[position], dynamic_position=[]
-        ).result
-    return TDMDescriptor2D(dgroup0=desc.dgroup0, dgroup1=raw)
+
+
+def clamp_tensor_descriptor_2d_inner_extent(
+    desc: TDMDescriptor2D, bound, predicate=None
+) -> TDMDescriptor2D:
+    """Limit a 2-D load after advancing its global address along dim0."""
+    if predicate is not None:
+        g1 = Vec(desc.dgroup1)
+        old = (fx.Uint32(g1[_DIM0_LO_SGPR]) >> 16) | (
+            (fx.Uint32(g1[_DIM0_HI_SGPR]) & 0xFFFF) << 16
+        )
+        bound = predicate.select(fx.Int32(bound), fx.Int32(old))
+    return _clamp_inner_extent(desc, bound)
 
 
 def make_tensor_descriptor_2d(*args, oob_inner_bound=None, **kwargs) -> TDMDescriptor2D:
@@ -119,12 +121,20 @@ def update_tensor_descriptor_2d_lds_addr(
     new_lds_addr,
 ) -> TDMDescriptor2D:
     """Return a 2-D descriptor with its LDS address replaced."""
+    g0 = Vec(desc.dgroup0)
     return TDMDescriptor2D(
-        dgroup0=vector.InsertOp(
-            _raw(new_lds_addr),
-            _raw(desc.dgroup0),
-            static_position=[1],
-            dynamic_position=[],
-        ).result,
+        dgroup0=Vec.from_elements(
+            [g0[0], new_lds_addr, g0[2], g0[3]], fx.Int32
+        ).ir_value(),
+        dgroup1=desc.dgroup1,
+    )
+
+
+@dsl_loc_tracing
+def update_tensor_descriptor_2d_pred(desc: TDMDescriptor2D, pred) -> TDMDescriptor2D:
+    """Enable one wave's TDM load only when its panel needs refilling."""
+    g0 = Vec(desc.dgroup0)
+    return TDMDescriptor2D(
+        dgroup0=Vec.from_elements([pred, g0[1], g0[2], g0[3]], fx.Int32).ir_value(),
         dgroup1=desc.dgroup1,
     )
