@@ -27,7 +27,7 @@ class TestMxfp4CpuIsolation(unittest.TestCase):
         cases = (
             (
                 TestMxfp4FlydslInputsAndCandidates,
-                "test_tune_rejects_rows_that_are_not_a4w4_before_any_shape_work",
+                "test_g1_names_carry_activation_and_output_precision",
             ),
             (
                 TestMxfp4FlydslInputsAndCandidates,
