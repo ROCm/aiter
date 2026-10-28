@@ -30,6 +30,8 @@ from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PL
 from .kernels.pa_decode_reduce import (
     DUAL_REGISTER_PARTITIONS,
     REGISTER_PARTITIONS,
+    SPLIT_GROUPS,
+    SPLIT_PARTITIONS,
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
@@ -117,6 +119,17 @@ def launch_pa_decode_ps_reduce(
     )
     ctas = batch * kv_heads * rows
     groups, num_xcds = 1, 0
+    if not dual and arch == "gfx1250" and partitions > SPLIT_PARTITIONS:
+        # Register rungs above 16 partitions split their loads over groups,
+        # within the same wave budget as the dual-mode CTA.
+        group_waves = head_size // wave // (2 if pairs else 1)
+        budget = max_cta_waves * props.multi_processor_count
+        while (
+            2 * groups <= SPLIT_GROUPS
+            and 2 * groups * group_waves <= max_cta_waves
+            and 2 * groups * group_waves * ctas <= budget
+        ):
+            groups *= 2
     if dual:
         # Partition groups fill the CTA while the grid stays within 16 waves
         # per CU. D128 sequences averaging at most 32 partitions keep one.
