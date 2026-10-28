@@ -768,10 +768,17 @@ class Gfx1250Traits:
     direct_output: bool = False
     query_splits: int = 1
     merge_partitions: bool = False
+    # Workgroups per sequence cluster that merges its partitions; 0 disables.
+    cluster_merge: int = 0
 
     WAVE = 32
     NWARP = 4
     FP8_MAX = 448.0
+
+    @property
+    def merged_output(self):
+        # Tasks of multi-partition sequences merge partials in the tile kernel.
+        return self.merge_partitions or self.cluster_merge > 0
 
     @property
     def bf16_packed(self):

@@ -508,6 +508,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
+        schedule_kwargs.pop("cluster_merge", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:

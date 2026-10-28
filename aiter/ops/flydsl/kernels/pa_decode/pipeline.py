@@ -797,15 +797,13 @@ class Gfx1250Bf16Pipeline:
                     # Retire P reads before another query tile overwrites them.
                     gpu.barrier()
             final = yield next_state
-        slot = fx.Int64(ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
-            gpu.block_id("x")
-        )
+        slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
 
         def store(direct):
             # Direct stores write final rows; other tasks store packed partials.
             pout = fx.recast_iter(
                 t.q_dtype,
-                ctx.output_ptr if t.merge_partitions and direct else ctx.pout_ptr,
+                ctx.output_ptr if t.merged_output and direct else ctx.pout_ptr,
             )
             pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
             psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
@@ -848,12 +846,13 @@ class Gfx1250Bf16Pipeline:
                                 pmax[partial_row] = row_max
                                 psum[partial_row] = denom
 
-        if const_expr(t.merge_partitions):
+        if const_expr(t.merged_output):
             if ctx.task_count == 1:
                 store(True)
             else:
                 store(False)
-                self.merge.arrive()
+                if const_expr(t.merge_partitions):
+                    self.merge.arrive()
         else:
             store(t.direct_output)
 
@@ -1243,15 +1242,13 @@ class Gfx1250Pipeline:
             if const_expr(t.packed_lds):
                 next_state.append(vfactor)
             final = yield next_state
-        slot = fx.Int64(ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
-            gpu.block_id("x")
-        )
+        slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
 
         def store(direct):
             # Direct stores write final rows; other tasks store packed partials.
             pout = fx.recast_iter(
                 t.q_dtype,
-                ctx.output_ptr if t.merge_partitions and direct else ctx.pout_ptr,
+                ctx.output_ptr if t.merged_output and direct else ctx.pout_ptr,
             )
             pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
             psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
@@ -1297,11 +1294,12 @@ class Gfx1250Pipeline:
                                 pmax[partial_row] = row_max
                                 psum[partial_row] = denom
 
-        if const_expr(t.merge_partitions):
+        if const_expr(t.merged_output):
             if ctx.task_count == 1:
                 store(True)
             else:
                 store(False)
-                self.merge.arrive()
+                if const_expr(t.merge_partitions):
+                    self.merge.arrive()
         else:
             store(t.direct_output)
