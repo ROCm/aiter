@@ -978,8 +978,6 @@ def _attn_fwd_inner(
 #   dot2   P@V for tile j         VEC1 for tile j+1  (row max, exp2 burst)
 #   mem2   read K[j+2] from LDS   async-copy V[j+2] -> LDS
 #
-# See kernels/attention/README.md of the gfx950 Gluon tutorial for the derivation.
-
 # The pipeline has a three-tile prologue and drain; below this many tiles they
 # overlap and the stage barriers no longer order an LDS slot's read before the
 # copy that overwrites it.  A correctness bound, not a tuning knob.
@@ -1952,14 +1950,47 @@ def _attn_fwd(
 # ---------------------------------------------------------------------------
 
 
-def _get_config(is_fp8: bool, has_pe: bool = False):
+def _get_config(
+    is_fp8: bool,
+    has_pe: bool = False,
+    causal: bool = False,
+    v_head_dim: int = 0,
+    sliding_window: int = 0,
+    seqlen_k: int = 0,
+):
+    """Tile / wave configuration for one masking + dtype mode.
+
+    `BLOCK_M = 32 * num_warps`.  The wide tile (256 / 8 waves) is the default: two
+    waves per SIMD overlap softmax with MFMA.  Causal attention below
+    `causal_wide_min_seqlen_k` keys, and a causal sliding window, take the narrow
+    tile (128 / 4 waves), which wastes less on the masked diagonal.
+    """
     arch = arch_info.get_arch()
     fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
     fwd_cfg = load_config_json(fpath)["fwd"]
-    # TODO: configs are not tuned
     if is_fp8:
+        # A 64-wide head doubles BLOCK_N to amortise the softmax.  Only an exact
+        # 64: padded heads (56, 32) spill at that tile.
+        if v_head_dim == 64 and "fp8_small_head" in fwd_cfg:
+            return fwd_cfg["fp8_small_head"]
         return fwd_cfg["fp8"]
     elif has_pe:
+        # The wide tile fits only a V head <= 64; a wider one spills.
+        if v_head_dim and v_head_dim <= 64 and "pe_narrow_v" in fwd_cfg:
+            return fwd_cfg["pe_narrow_v"]
         return fwd_cfg["pe"]
+    elif v_head_dim > 128 and "wide_head" in fwd_cfg:
+        # Past 128 the default tile spills.
+        return fwd_cfg["wide_head"]
+    elif causal and sliding_window > 0 and "causal_window" in fwd_cfg:
+        return fwd_cfg["causal_window"]
+    elif (
+        causal
+        and "causal_short" in fwd_cfg
+        and seqlen_k < fwd_cfg["causal_wide_min_seqlen_k"]
+    ):
+        return fwd_cfg["causal_short"]
+    elif causal and "causal" in fwd_cfg:
+        return fwd_cfg["causal"]
     else:
         return fwd_cfg["default"]
