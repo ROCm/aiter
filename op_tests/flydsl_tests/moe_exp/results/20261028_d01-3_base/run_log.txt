@@ -1,0 +1,25 @@
+start      2026-10-28 23:35:34 UTC
+host       heliosr-1b114-d01-3   boot 2026-10-28 14:09:13
+repo       2489bae2d 2026-10-27 16:20:59 +0800 Optimize gfx1250 MoE A-preshuffle preparation and prefill scheduling (#6984)
+dirty      0 modified tracked files
+python     3.12.3 | torch 2.11.0+rocm10.1.0a20260820 | flydsl 0.3.3.dev882 | aiter 0.1.26.dev44+g2489bae2d @ /data/lixzhang/flydsl_moe_exp/site/aiter/__init__.py
+site       /data/lixzhang/flydsl_moe_exp/site
+firmware   CP_MEC1 FW_VERSION: 2560 PM FW_VERSION: 02.125.15.00
+clock       MAX_CLK: 2400 MHz
+variants   base
+rounds     5 timed (+ warm-up round 0)
+args       --scenario kernel --data-format a4w4 --experts 64 --tokens 1536 --topk 8 --model-dim 7168 --inter-dim 2048 --act silu --no-bias --iters 128 --no-check-aot-cache --data-init uniform --scale-init uniform
+base env   AITER_USE_GROUPED_GEMM=1 AITER_GROUPED_A4W4_A_PRESHUFFLE=1 AITER_GROUPED_DEBUG=0 ENABLE_CK=0 FLYDSL_DUMP_IR=1 AITER_LOG_MORE=1 AITER_MOE_EXPERT_BALANCE=true AITER_FLYDSL_EXPLICIT_VGPR_PARTITION=1 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
+[2026-10-28 23:35:34 UTC] base_r0 start (idle (GPU use 0%)) 
+[2026-10-28 23:36:01 UTC] base_r0 rc=0 gemm1: us = 83.62 gemm2: us = 59.00 gemm1: graph_us = 80.51 gemm2: graph_us = 53.63 
+[2026-10-28 23:36:03 UTC] base_r1 start (idle (GPU use 0%)) 
+[2026-10-28 23:36:31 UTC] base_r1 rc=0 gemm1: us = 83.73 gemm2: us = 58.87 gemm1: graph_us = 80.47 gemm2: graph_us = 53.73 
+[2026-10-28 23:36:33 UTC] base_r2 start (idle (GPU use 0%)) 
+[2026-10-28 23:37:01 UTC] base_r2 rc=0 gemm1: us = 83.76 gemm2: us = 58.40 gemm1: graph_us = 80.85 gemm2: graph_us = 53.62 
+[2026-10-28 23:37:03 UTC] base_r3 start (idle (GPU use 0%)) 
+[2026-10-28 23:37:31 UTC] base_r3 rc=0 gemm1: us = 84.30 gemm2: us = 59.18 gemm1: graph_us = 80.35 gemm2: graph_us = 53.90 
+[2026-10-28 23:37:33 UTC] base_r4 start (idle (GPU use 0%)) 
+[2026-10-28 23:38:00 UTC] base_r4 rc=0 gemm1: us = 83.76 gemm2: us = 58.80 gemm1: graph_us = 81.05 gemm2: graph_us = 53.63 
+[2026-10-28 23:38:02 UTC] base_r5 start (idle (GPU use 0%)) 
+[2026-10-28 23:38:30 UTC] base_r5 rc=0 gemm1: us = 84.19 gemm2: us = 59.30 gemm1: graph_us = 80.86 gemm2: graph_us = 54.05 
+[2026-10-28 23:38:30 UTC] DONE
