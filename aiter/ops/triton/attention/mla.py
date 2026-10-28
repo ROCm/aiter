@@ -113,11 +113,14 @@ def select_3d_config(
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
     else:
-        # Tuned split-KV launch values. Only archs with a tuned file have them.
+        # Tuned split-KV launch values, per KV cache dtype. Only archs and KV
+        # dtypes with a tuned entry use them.
         tuned = load_config_json(
             f"{resolve_config_dir('attention', 'MLA_DECODE')}/DEFAULT.json",
             required=False,
         )
+        if tuned is not None:
+            tuned = tuned.get(str(kv_dtype).removeprefix("torch."))
         if tuned is not None:
             attn_num_warps = tuned["attn"]["num_warps"]
             seg_cap = tuned["attn"]["MAX_SEGMENTS"]
