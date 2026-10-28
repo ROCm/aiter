@@ -185,3 +185,63 @@ def test_resume_needs_same_cu_num(tuning, tmp_path, recorded, ok):
     else:
         with pytest.raises(SystemExit):
             sweep_configs.check_settings(str(out), args, 96)
+
+
+def test_resume_checks_every_ready_record(tuning, tmp_path):
+    import argparse
+
+    _, _, sweep_configs, _ = tuning
+    out = tmp_path / "sweep.jsonl"
+    ready = {"status": "ready", "calls": 24, "replays": 25, "cold_mb": 1024}
+    out.write_text(json.dumps(ready) + "\n" + json.dumps(dict(ready, cu_num=96)) + "\n")
+    args = argparse.Namespace(calls=24, replays=25, cold_mb=1024)
+    with pytest.raises(SystemExit):
+        sweep_configs.check_settings(str(out), args, 192)
+
+
+def test_install_keeps_cu_timing_of_retimed_config(tree, tuning, tmp_path):
+    kernels, _, _, write_best_configs = tuning
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    shape = {"M": 16, "N": 128, "K": 256}
+    records = [
+        {"status": "ok", "config": _bucket(96), "us": 5.0, "cu_num": 96},
+        {"status": "ok", "config": _bucket(96), "us": 1.0, "cu_num": 192},
+    ]
+    with open(
+        runs / "sweep-gfx1250-gluon-gemm_a16w16-M=16-N=128-K=256.jsonl", "w"
+    ) as f:
+        f.writelines(json.dumps(dict(record, shape=shape)) + "\n" for record in records)
+    spec = kernels.get_spec("gemm_a16w16")
+    winners = write_best_configs.load_winners(
+        str(runs), "gfx1250", "gluon", spec, {"N": 128, "K": 256}, cu_num=96
+    )
+    assert winners[16].record["us"] == 5.0
+
+
+def test_resolve_installed_scope(tree, tuning, monkeypatch):
+    kernels, _, _, _ = tuning
+    monkeypatch.setattr(gemm_config_utils, "get_config_cu_num", lambda: 96)
+    spec = kernels.get_spec("gemm_a16w16")
+    shape = {"M": 8, "N": 128, "K": 256}
+    assert kernels.resolve_installed(spec, shape, "gluon") == (_bucket(96), True)
+    assert kernels.resolve_installed(spec, shape, "gluon", cu_num=None) == (
+        _bucket(2),
+        True,
+    )
+    assert kernels.resolve_installed(spec, shape, "gluon", cu_num=96) == (
+        _bucket(96),
+        True,
+    )
+
+
+def test_family_bounds_cu_first(tree, tuning):
+    kernels, _, _, _ = tuning
+    tree(
+        "gfx1250/96cu/gluon/gemm/gemm_a16w16/DEFAULT.json",
+        {"M_BOUNDS": [16, 64], "any": _bucket(98)},
+    )
+    spec = kernels.get_spec("gemm_a16w16")
+    shape = {"N": 1024, "K": 256}
+    assert kernels.family_bounds(spec, "gluon", shape, cu_num=96) == (16, 64)
+    assert kernels.family_bounds(spec, "gluon", shape) != (16, 64)

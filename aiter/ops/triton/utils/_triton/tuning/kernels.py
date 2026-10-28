@@ -123,19 +123,39 @@ def flops(shape):
     return 2.0 * shape.get("B", 1) * shape["M"] * shape["N"] * shape["K"]
 
 
-def resolve_installed(spec, shape, backend):
-    """The installed config for this shape (raw JSON bucket) and is_tuned, through the real loader."""
-    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+_DEVICE_CU = object()
 
-    return get_gemm_config(
+
+def resolve_installed(spec, shape, backend, cu_num=_DEVICE_CU):
+    """The installed config for this shape (raw JSON bucket) and is_tuned, through the real loader.
+
+    By default the loader looks up this device's <cu_num>cu/ folder first; cu_num=None reads only
+    the CU-agnostic folder and cu_num=<n> the <n>cu/ folder first, so an install can check the
+    scope it wrote to."""
+    from aiter.ops.triton.utils import gemm_config_utils
+
+    if cu_num is _DEVICE_CU:
+        return gemm_config_utils.get_gemm_config(
+            spec.config_name,
+            shape["M"],
+            shape["N"],
+            shape["K"],
+            bounds=spec.bounds,
+            backend=backend,
+            B=shape.get("B"),
+        )
+    config, is_tuned = gemm_config_utils._get_gemm_config_cached(
         spec.config_name,
         shape["M"],
         shape["N"],
         shape["K"],
-        bounds=spec.bounds,
-        backend=backend,
-        B=shape.get("B"),
+        spec.bounds,
+        None,
+        backend,
+        shape.get("B"),
+        cu_num,
     )
+    return gemm_config_utils._copy_gemm_config(config), is_tuned
 
 
 def seed_table(spec, backend, shape_nk, cu_num=None):
@@ -169,15 +189,17 @@ def seed_table(spec, backend, shape_nk, cu_num=None):
     }
 
 
-def family_bounds(spec, backend, shape_nk):
+def family_bounds(spec, backend, shape_nk, cu_num=None):
     """The M bounds the loader walks for this shape: the kernel's explicit bounds, else the
-    served file's M_BOUNDS, else the standard list."""
+    served file's M_BOUNDS (the <cu_num>cu/ one first when cu_num is given), else the
+    standard list."""
     from aiter.ops.triton.utils.gemm_config_utils import STANDARD_M_BOUNDS
 
     if spec.bounds:
         return tuple(spec.bounds)
     return tuple(
-        seed_table(spec, backend, shape_nk)[1].get("M_BOUNDS") or STANDARD_M_BOUNDS
+        seed_table(spec, backend, shape_nk, cu_num=cu_num)[1].get("M_BOUNDS")
+        or STANDARD_M_BOUNDS
     )
 
 

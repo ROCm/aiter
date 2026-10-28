@@ -53,13 +53,17 @@ def load_winners(runs_dir, arch, backend, spec, shape_nk, cu_num=None):
     """
     winners = {}
     for path in results_files(runs_dir, arch, backend, spec.name, shape_nk):
-        records = read_records(path)
+        records = read_records(path, cu_num)
         ok = [r for r in records.values() if r["status"] == "ok"]
         if not ok:
+            if cu_num is not None and read_records(path):
+                print(
+                    f"  {os.path.basename(path)}: no record timed at {cu_num} CUs; skipped"
+                )
             continue
         M = ok[0]["shape"]["M"]
         if os.path.exists(final_results_path(path)):
-            records = read_records(final_results_path(path))
+            records = read_records(final_results_path(path), cu_num)
             ok = [r for r in records.values() if r["status"] == "ok"]
         elif (
             len({r.get("gpu") for r in ok} - {None}) > 1
@@ -68,14 +72,6 @@ def load_winners(runs_dir, arch, backend, spec, shape_nk, cu_num=None):
                 f"  M={M}: timed on several GPUs but the final round is missing; rerun the sweep. Skipped."
             )
             continue
-        if cu_num is not None:
-            records = {k: r for k, r in records.items() if r.get("cu_num") == cu_num}
-            timed_here = [r for r in ok if r.get("cu_num") == cu_num]
-            if len(timed_here) < len(ok):
-                print(
-                    f"  M={M}: {len(ok) - len(timed_here)} records not timed at {cu_num} CUs; ignored"
-                )
-            ok = timed_here
         plan_file = plan_path(runs_dir, arch, backend, spec.name, dict(shape_nk, M=M))
         if os.path.exists(plan_file):
             with open(plan_file) as f:
@@ -209,7 +205,9 @@ def install(spec, backend, shape_nk, runs_dir, cu_dir=False):
     load_config_json.cache_clear()
     gemm_config_utils._get_gemm_config_cached.cache_clear()
     for bucket, winner in assignments.items():
-        got, is_tuned = resolve_installed(spec, dict(shape_nk, M=winner.M), backend)
+        got, is_tuned = resolve_installed(
+            spec, dict(shape_nk, M=winner.M), backend, cu_num=cu_num
+        )
         if got != table[bucket] or not is_tuned:
             if previous is None:  # never leave a bad file in the tree
                 os.remove(target)

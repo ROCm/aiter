@@ -113,21 +113,23 @@ def parse_args(argv=None):
     return args
 
 
-def worker_command(spec, shape, backend, extra):
+def worker_command(spec, shape, backend, extra, cu_dir=False):
     command = [sys.executable, os.path.join(HERE, "harness.py"), spec.name]
     for d in spec.dims:
         command += [f"--{d}", str(shape[d])]
     if backend:
         command += ["--backend", backend]
+    if cu_dir:
+        command.append("--cu-dir")
     return command + extra
 
 
-def plan(spec, shape, backend, gpu, runs_dir, timeout):
+def plan(spec, shape, backend, gpu, runs_dir, timeout, cu_dir=False):
     """Ask the worker for the space; keep the plan under a name unique to arch, backend, kernel and shape."""
     fd, space_file = tempfile.mkstemp(prefix="plan-", suffix=".json", dir=runs_dir)
     os.close(fd)
     command = worker_command(
-        spec, shape, backend, ["--plan", "--space-out", space_file]
+        spec, shape, backend, ["--plan", "--space-out", space_file], cu_dir
     )
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
     try:
@@ -166,6 +168,7 @@ def all_bucket_ms(spec, args, gpu):
         gpu,
         args.runs_dir,
         args.setup_timeout,
+        args.cu_dir,
     )
     ms = [b for b in first["bounds"] if b <= TOP_BUCKET_M]
     print(f"all buckets: M = {ms}", flush=True)
@@ -202,9 +205,11 @@ def check_settings(out, args, cu_num=None):
             "rerun with the same settings or --fresh"
         )
     # records from before cu_num was recorded resume; an install with --cu-dir ignores them
-    if ready.get("cu_num") not in (None, cu_num):
+    recorded_cu = {r.get("cu_num") for r in iter_records(out) if r["status"] == "ready"}
+    other_cu = sorted(recorded_cu - {None, cu_num})
+    if other_cu:
         sys.exit(
-            f"{out} was timed at cu_num={ready.get('cu_num')}, this device has {cu_num}; "
+            f"{out} was timed at cu_num={other_cu}, this device has {cu_num}; "
             "use another --runs-dir or --fresh"
         )
 
@@ -294,6 +299,7 @@ def run_batch(spec, shape, backend, batch, out, gpu, args):
             "--out",
             out,
         ],
+        args.cu_dir,
     )
     outcome = run_worker(command, env, log_path, args.stall, args.setup_timeout)
     if outcome in ("finished", "cancelled"):
@@ -430,7 +436,13 @@ def main(argv=None):
     for M in args.M or all_bucket_ms(spec, args, gpus[0]):
         shape = shape_from_args(args, spec.dims, M)
         plan_ = plan(
-            spec, shape, args.backend, gpus[0], args.runs_dir, args.setup_timeout
+            spec,
+            shape,
+            args.backend,
+            gpus[0],
+            args.runs_dir,
+            args.setup_timeout,
+            args.cu_dir,
         )
         backend = plan_["backend"]
         print_plan(plan_, shape)

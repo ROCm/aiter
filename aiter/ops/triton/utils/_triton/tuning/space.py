@@ -225,9 +225,11 @@ def exceeds_lds(config, spec, arch, backend):
     return buffers * tile_bytes > _LDS_CAP_BYTES.get(arch, 64 * 1024)
 
 
-def build_space(spec, shape, backend, arch, kernel_should_skip):
-    """All configs to benchmark for one shape, plus a report of how the space was built."""
-    keys, buckets, default_path = load_defaults(spec, backend)
+def build_space(spec, shape, backend, arch, kernel_should_skip, cu_num=None):
+    """All configs to benchmark for one shape, plus a report of how the space was built.
+    With cu_num, the keys come from the <arch>/<cu_num>cu/ DEFAULT.json when there is one.
+    """
+    keys, buckets, default_path = load_defaults(spec, backend, cu_num=cu_num)
     defaults = default_values(spec, backend, shape["M"], keys, buckets)
     values, pinned = candidate_values(spec, backend, keys, defaults, default_path)
 

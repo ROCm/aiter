@@ -112,11 +112,13 @@ def gpu_alive():
         return False
 
 
-def plan(spec, shape, backend, arch, should_skip, space_out):
+def plan(spec, shape, backend, arch, should_skip, space_out, scope_cu_num=None):
     from aiter.ops.triton.utils.config_utils import get_config_cu_num
 
     try:
-        configs, report = build_space(spec, shape, backend, arch, should_skip)
+        configs, report = build_space(
+            spec, shape, backend, arch, should_skip, cu_num=scope_cu_num
+        )
     except UnknownConfigKey as e:
         print(e, file=sys.stderr)
         return 2
@@ -126,7 +128,7 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
         backend=backend,
         kernel=spec.name,
         shape=shape,
-        bounds=list(family_bounds(spec, backend, shape)),
+        bounds=list(family_bounds(spec, backend, shape, cu_num=scope_cu_num)),
         configs=configs,
         cu_num=get_config_cu_num(),
     )
@@ -136,11 +138,22 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
 
 
 def benchmark(
-    spec, shape, backend, arch, call, inputs, candidates, out, calls, replays, cold_mb
+    spec,
+    shape,
+    backend,
+    arch,
+    call,
+    inputs,
+    candidates,
+    out,
+    calls,
+    replays,
+    cold_mb,
+    scope_cu_num=None,
 ):
     from aiter.ops.triton.utils.config_utils import get_config_cu_num
 
-    keys, _, _ = load_defaults(spec, backend)
+    keys, _, _ = load_defaults(spec, backend, cu_num=scope_cu_num)
     copies = make_cold_copies(inputs, cold_mb)
     common = {
         "kernel": spec.name,
@@ -215,6 +228,11 @@ def main(argv=None):
         "--plan", action="store_true", help="only build the search space"
     )
     parser.add_argument("--space-out", help="where --plan writes the space (JSON)")
+    parser.add_argument(
+        "--cu-dir",
+        action="store_true",
+        help="plan from the <arch>/<cu_num>cu/ DEFAULT.json and file, as the --cu-dir install does",
+    )
     parser.add_argument("--configs", help="JSON list of candidates, null = baseline")
     parser.add_argument("--out", help="JSONL results file, appended")
     parser.add_argument("--replays", type=int, default=25)
@@ -235,9 +253,18 @@ def main(argv=None):
     backend = args.backend or spec.default_backend(arch)
     check_backend(spec, arch, backend)
     call, inputs, should_skip = spec.setup(shape, backend)
+    scope_cu_num = None
+    if args.cu_dir:
+        from aiter.ops.triton.utils.config_utils import get_config_cu_num
+
+        scope_cu_num = get_config_cu_num()
+        if scope_cu_num is None:
+            sys.exit("--cu-dir: the CU count of this device cannot be read")
 
     if args.plan:
-        return plan(spec, shape, backend, arch, should_skip, args.space_out)
+        return plan(
+            spec, shape, backend, arch, should_skip, args.space_out, scope_cu_num
+        )
     with open(args.configs) as f:
         candidates = json.load(f)
     benchmark(
@@ -252,6 +279,7 @@ def main(argv=None):
         args.calls,
         args.replays,
         args.cold_mb,
+        scope_cu_num,
     )
     return 0
 
