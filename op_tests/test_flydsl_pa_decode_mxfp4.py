@@ -42,6 +42,7 @@ pytestmark = pytest.mark.skipif(
 
 HEAD_DIM = 128
 Q_MAX_FP8 = 448.0
+NUM_CUS = torch.cuda.get_device_properties(0).multi_processor_count
 
 
 # --------------------------------------------------------------------------
@@ -466,9 +467,9 @@ def test_pa_decode_mxfp4_plan_free_is_bitwise_the_planned_path(rows):
         free = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale, max_partitions=mp)
         torch.cuda.synchronize()
         assert torch.equal(planned, free), f"rows {rows} max_partitions {mp}"
-    # the default split is the planner's budget: 8 tasks up to 64 rows, 1 from 512
+    # the default split is the planner's budget: 2 * CUs // rows, at most the 8 tiles
     default = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale)
-    want = 1 if rows >= 512 else 8
+    want = min(8, max(1, 2 * NUM_CUS // rows))
     explicit = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale, max_partitions=want)
     torch.cuda.synchronize()
     assert torch.equal(default, explicit)
@@ -496,10 +497,11 @@ def test_pa_decode_mxfp4_plan_free_empty_rows(max_partitions):
             assert (out[r] == 0).all(), f"row {r}"
 
 
-@pytest.mark.parametrize("rows", [255, 256, 257])
+@pytest.mark.parametrize("rows", [NUM_CUS - 1, NUM_CUS, NUM_CUS + 1])
 def test_pa_decode_mxfp4_plan_free_default_split_boundaries(rows):
-    """The default split is max(1, 2 * 256 CUs // rows): 2 tasks at 255/256 rows, 1 at
-    257. Both sides of the switch agree with each other and with the reference."""
+    """The default split is max(1, 2 * CUs // rows): 2 tasks at CUs - 1 and CUs rows,
+    1 at CUs + 1. Both sides of the switch agree with each other and with the
+    reference."""
     ctx, bt, k, v, q = make_case([600] * rows, 16, 128, seed=rows)
     _, kd, ks, k_deq = quantize_pages(k, 128)
     _, vd, vs, v_deq = quantize_pages(v, 128)
