@@ -579,6 +579,60 @@ for _qd, _topk, _stage, _bound in itertools.product(
 
 
 # ---------------------------------------------------------------------------
+# Padding sentinels under a num_local_tokens count.
+#
+# Sorted with a real-row count, a block's padding slots hold the sentinel
+# (topk << 24 | count): a real token id with an out-of-range slot. The stage-2
+# quant + sort must not take it for a route -- its row, count * topk + topk,
+# lies past `out` when count is the last real row -- and must leave the real
+# routes exactly as an uncounted sort does.
+# ---------------------------------------------------------------------------
+_PS_TAIL = 2  # extra out rows checked for stray writes
+
+
+def _check_padding_sentinels(quant_dtype, tokens, topk, bound):
+    weights, ids = _zero_weight_routing(topk)
+    weights, ids = weights[:tokens].contiguous(), ids[:tokens].contiguous()
+    valid = tokens - 1
+    ids[valid:] = -1
+    weights[valid:] = 0.0
+    count = torch.tensor([valid], dtype=torch.int32)
+    rows = tokens * topk
+    torch.manual_seed(9)
+    x = torch.randn(rows, _ZW_COLS, dtype=torch.bfloat16)
+    out_cols = _ZW_COLS // 2 if quant_dtype == dtypes.fp4x2 else _ZW_COLS
+    tag = f"{quant_dtype} tokens={tokens} topk={topk} bound={bound}"
+    results = []
+    for num_local_tokens in (count, None):
+        sorted_ids, sorted_w, _, num_valid, _ = moe_sorting(
+            ids, weights, _ZW_EXPERTS, _ZW_COLS, torch.bfloat16, _ZW_BLOCK,
+            None, num_local_tokens,
+        )  # fmt: skip
+        buf = torch.full((rows + _PS_TAIL, out_cols), _SENTINEL, dtype=torch.uint8)
+        scale = torch.empty(
+            ((sorted_ids.shape[0] + 31) // 32 * 32, _ZW_COLS // 32), dtype=torch.uint8
+        )
+        args = (buf[:rows].view(quant_dtype), scale.view(dtypes.fp8_e8m0), x,
+                sorted_ids, num_valid, tokens, _ZW_BLOCK, rows)  # fmt: skip
+        if bound:
+            fused_dynamic_mx_quant_moe_sort_hip_bounded(
+                *args, _ZW_EXPERTS, 32, sorted_w
+            )
+        else:
+            fused_dynamic_mx_quant_moe_sort_hip(*args, 32, sorted_w)
+        assert (buf[rows:] == _SENTINEL).all(), f"{tag}: wrote past out"
+        results.append(buf[: valid * topk])
+    assert torch.equal(results[0], results[1]), f"{tag}: a real route changed"
+    aiter.logger.info("padding sentinels OK: %s", tag)
+
+
+for _qd, _tokens, _bound in itertools.product(
+    (dtypes.fp8, dtypes.fp4x2), (2, 5, 7, 33), (False, True)
+):
+    _check_padding_sentinels(_qd, _tokens, 6, _bound)
+
+
+# ---------------------------------------------------------------------------
 # Fused route-sort + MXFP4 activation-quant kernel (gfx950 decode).
 #
 # `mxfp4_moe_sort_quant_fwd` fuses Opus route sorting, BF16->MXFP4 activation
@@ -604,7 +658,6 @@ _FUSED_GATE_KWARGS = {
     "activation": aiter.ActivationType.Silu,
     "is_g1u1": True,
     "expert_mask": None,
-    "num_local_tokens": None,
     "need_local_topk_ids": False,
     "run_1stage": False,
     "stage1_is_flydsl": True,
@@ -683,7 +736,7 @@ def _canonical_entries(sorted_ids, sorted_weights, sorted_experts, num_valid_ids
     return sorted(entries)
 
 
-def _run_fused(hidden, topk_ids, topk_weights, experts, bm):
+def _run_fused(hidden, topk_ids, topk_weights, experts, bm, num_local_tokens=None):
     tokens = hidden.shape[0]
     route_count = topk_ids.numel()
     active_experts = min(experts, route_count)
@@ -713,6 +766,7 @@ def _run_fused(hidden, topk_ids, topk_weights, experts, bm):
         activation_quant,
         activation_scale_token,
         experts,
+        num_local_tokens,
     )
     return (
         sorted_ids,
@@ -884,6 +938,32 @@ def _check_fused_disable_toggle():
         fused_moe._fused_decode_sort_quant_disabled = False
 
 
+def _check_fused_num_local_tokens(experts, topk, block_size, tokens=16, valid=5):
+    """`num_local_tokens`, as in moe_sorting_opus_fwd: the launch over all rows
+    sorts and quantizes exactly what one over the local rows alone does, and
+    zeroes the whole moe_buf."""
+    hidden, topk_ids, topk_weights = _make_fused_inputs(tokens, experts, topk)
+    count = torch.tensor([valid], dtype=torch.int32, device="cuda")
+    f_ids, f_weights, f_experts, f_valid, f_buf, f_quant, f_scale = _run_fused(
+        hidden, topk_ids, topk_weights, experts, block_size, count
+    )
+    r_ids, r_weights, r_experts, r_valid, _, r_quant, r_scale = _run_fused(
+        hidden[:valid].contiguous(),
+        topk_ids[:valid].contiguous(),
+        topk_weights[:valid].contiguous(),
+        experts,
+        block_size,
+    )
+    assert _canonical_entries(
+        f_ids, f_weights, f_experts, f_valid, block_size
+    ) == _canonical_entries(r_ids, r_weights, r_experts, r_valid, block_size)
+    torch.testing.assert_close(f_valid, r_valid, rtol=0, atol=0)
+    assert int(f_valid[1].item()) == valid
+    torch.testing.assert_close(f_buf, torch.zeros_like(f_buf))
+    assert torch.equal(f_quant[:valid].view(torch.uint8), r_quant.view(torch.uint8))
+    assert torch.equal(f_scale[:valid].view(torch.uint8), r_scale.view(torch.uint8))
+
+
 def _check_fused_cuda_graph_replay_safe(experts, topk, block_size):
     hidden, topk_ids, topk_weights = _make_fused_inputs(4, experts, topk)
     # Compile/warm up before capture: the graph only records the fixed-address
@@ -918,3 +998,4 @@ if _running_on_gfx950():
 
     for E, topk in _FUSED_ROUTES:
         _check_fused_cuda_graph_replay_safe(E, topk, 32)
+        _check_fused_num_local_tokens(E, topk, 32)
