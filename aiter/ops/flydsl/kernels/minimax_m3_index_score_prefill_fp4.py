@@ -15,8 +15,11 @@ and 255 are outside the contract, as in the decode scorer.
 
 Cost: every referenced page is read once (8.5 KB) and written once (16 KB) per
 call, into a `batch * max_block` page staging buffer. Layout, dtypes and strides of
-`k_data`/`k_scale` are the decode scorer's (`minimax_m3_index_score_fp4`).
+`k_data`/`k_scale` are the decode scorer's MXFP4 layout (see
+`minimax_m3_index_score_fp4_cache`).
 """
+
+from functools import lru_cache
 
 import torch
 import triton
@@ -188,18 +191,13 @@ def dequant_pages_fp8(
     return out
 
 
-_IDENTITY = {}
-
-
+@lru_cache(maxsize=32)
 def _identity_table(batch, max_block, device):
-    """`[batch, max_block]` arange, the staged block table. Memoised: it only
-    depends on the two bounds."""
-    key = (batch, max_block, device)
-    if key not in _IDENTITY:
-        _IDENTITY[key] = torch.arange(
-            batch * max_block, dtype=torch.int32, device=device
-        ).view(batch, max_block)
-    return _IDENTITY[key]
+    """`[batch, max_block]` arange, the staged block table. Memoised (bounded): it
+    only depends on the two bounds."""
+    return torch.arange(batch * max_block, dtype=torch.int32, device=device).view(
+        batch, max_block
+    )
 
 
 def score_prefill_flydsl_fp4(

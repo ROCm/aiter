@@ -3,9 +3,9 @@
 
 """MXFP4 index-cache layout constants and view validation, for the prefill scorers.
 
-The same constants and `_validate_cache` as `minimax_m3_index_score_fp4` (the
-decode scorer); duplicated so the prefill scorers do not depend on the decode PR.
-Keep the two in step, or have the decode file import from here once both are in.
+The same constants and `_validate_cache` as the decode scorer's MXFP4 path
+(ROCm/aiter#7060); duplicated so the prefill scorers do not depend on the decode PR.
+Keep the two in step, or have the decode path import from here once both are in.
 """
 
 import torch
