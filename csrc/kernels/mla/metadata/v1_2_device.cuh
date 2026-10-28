@@ -82,14 +82,12 @@ mla_v12_effective_splits(const MlaMetadataV1KernelParameter& params, const int32
 
 template <typename Traits>
 __device__ __forceinline__ int32_t mla_v12_num_qo_tiles(const MlaMetadataV1KernelParameter& params,
-                                                        QoState<Traits>& qo_state,
-                                                        const int32_t batch_idx)
+                                                        const int32_t seqlen_qo)
 {
     if constexpr(Traits::kQoSplits)
     {
         // An empty request (graph padding) still needs one tile; zero tiles never advance the
         // planner past it.
-        const int32_t seqlen_qo = qo_state.get_seqlen(batch_idx);
         if(params.num_heads * 2 > Traits::kPackedQoLenPerWg)
         {
             return max(seqlen_qo, 1);
@@ -130,16 +128,21 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
             p_lds_seqlens_kv[bid] = seqlen_kv;
         }
 
-        // mla_v12_num_qo_tiles reads this slot back through qo_state.get_seqlen.
-        if constexpr(QoState<Traits>::is_unique() == false)
+        int32_t seqlen_qo;
+        if constexpr(QoState<Traits>::is_unique())
         {
-            p_lds_seqlens_qo[bid] =
+            seqlen_qo = qo_state.get_seqlen(bid);
+        }
+        else
+        {
+            seqlen_qo =
                 params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
+            p_lds_seqlens_qo[bid] = seqlen_qo;
         }
 
         const int32_t num_blocks = integer_divide_ceil_power2(
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
-        const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, bid);
+        const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, seqlen_qo);
         const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
         sum_blocks += unit_blocks * num_qo_tiles;
     }
@@ -573,9 +576,9 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
         int32_t remain_payload = payload;
         while(curr_batch < num_batches)
         {
-            const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, curr_batch);
-            const int32_t qo_tile_size =
-                integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
+            const int32_t seqlen_qo     = qo_state.get_seqlen(curr_batch);
+            const int32_t num_qo_tiles  = mla_v12_num_qo_tiles<Traits>(params, seqlen_qo);
+            const int32_t qo_tile_size  = integer_divide_ceil(seqlen_qo, num_qo_tiles);
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
                 curr_kv_seqlen, params.kv_granularity, params.kv_granularity_log2);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
@@ -937,10 +940,10 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                                                   num_batches,
                                                                   lane_idx);
 
+    const int32_t seqlen_qo0 = (num_batches > 0) ? qo_state.get_seqlen(0) : 0;
     const int32_t qo_tiles =
-        (num_batches > 0) ? mla_v12_num_qo_tiles<Traits>(params, qo_state, 0) : 1;
-    const int32_t qo_tile_size =
-        (num_batches > 0) ? integer_divide_ceil(qo_state.get_seqlen(0), qo_tiles) : 1;
+        (num_batches > 0) ? mla_v12_num_qo_tiles<Traits>(params, seqlen_qo0) : 1;
+    const int32_t qo_tile_size = (num_batches > 0) ? integer_divide_ceil(seqlen_qo0, qo_tiles) : 1;
 
     // kv blocks of a batch, and the extent the fragments are cut out of
     auto kv_len_of = [&](const int32_t bid) -> int32_t {
