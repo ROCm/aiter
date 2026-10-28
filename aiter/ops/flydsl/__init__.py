@@ -177,6 +177,10 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "score_prefill_flydsl",
     ),
+    "minimax_m3_index_score_prefill_fp4_flydsl": (
+        ".kernels.minimax_m3_index_score_prefill_fp4",
+        "score_prefill_flydsl_fp4",
+    ),
     # Its own, not the decode scorer's: prefill's output is
     # [heads, total_q, max_block] and is sized from the ragged batch.
     "minimax_m3_index_score_prefill_alloc": (
@@ -229,6 +233,7 @@ __all__ = [
     "minimax_m3_index_score_fp4_flydsl_supported",
     "minimax_m3_index_score_prefill_alloc",
     "minimax_m3_index_score_prefill_flydsl",
+    "minimax_m3_index_score_prefill_fp4_flydsl",
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
