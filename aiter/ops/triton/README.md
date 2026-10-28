@@ -147,6 +147,13 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 `<op>` is `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`
 or `normalization`.
 
+The plain `<arch>/` folder holds the configs of the arch's default CU count
+(gfx1250: 192 CUs). A GEMM family tuned on another CU count has its own tree,
+`configs/<arch>/<cu_num>cu/<backend>/gemm/<d_type>/`, with its own
+`DEFAULT.json`. `get_gemm_config()` reads that tree on a device with that CU
+count and the plain folder in every other case. See
+[CU trees](configs/AGENTS.md#cu-trees).
+
 The suffix depends on the family. For example, GEMM files use
 `N=<N>-K=<K>`, batched GEMM files use `B=<B>-N=<N>-K=<K>` and MHC files use
 `C=<C>`. Some families use a custom suffix.

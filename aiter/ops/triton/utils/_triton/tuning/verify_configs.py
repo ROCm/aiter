@@ -36,14 +36,16 @@ def main(argv=None):
     shape = shape_from_args(args, spec.dims)
     ensure_repo_on_path()
     from aiter.ops.triton.utils._triton import arch_info
-    from aiter.ops.triton.utils.config_utils import resolve_config_dir
+    from aiter.ops.triton.utils.config_utils import get_config_cu_num
+    from aiter.ops.triton.utils.gemm_config_utils import gemm_config_dir
 
     arch = arch_info.get_arch()
     backend = args.backend or spec.default_backend(arch)
     check_backend(spec, arch, backend)
     config, is_tuned = resolve_installed(spec, shape, backend)
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
-    print(f"config dir: {config_dir}")
+    cu_num = get_config_cu_num()
+    config_dir = gemm_config_dir(spec.config_name, backend, cu_num)
+    print(f"config dir: {config_dir} (device: {cu_num} CUs)")
     print(f"backend {backend}, arch {arch}, shape {shape}, is_tuned {is_tuned}")
     print(f"config: {json.dumps(config)}")
 

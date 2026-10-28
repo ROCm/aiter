@@ -18,11 +18,37 @@ logger = AiterTritonLogger()
 
 from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
+    get_config_cu_num,
     load_config_json,
     resolve_config_dir,
 )
 
 STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
+# get_gemm_config(cu_num=DEVICE_CU_NUM): the tree of this device's CU count.
+DEVICE_CU_NUM = object()
+
+
+def gemm_config_dir(
+    config_name: str, backend: str = "triton", cu_num: int | None = None
+) -> str:
+    """The directory ``get_gemm_config()`` reads for a family on a device with
+    ``cu_num`` CUs.
+
+    ``configs/<arch>/<cu_num>cu/<backend>/gemm/<d_type>/`` when that tree has
+    a ``DEFAULT.json``, else the default tree
+    ``configs/<arch>/<backend>/gemm/<d_type>/``. A CU tree is complete on its
+    own: once chosen, no file is read from the default tree, and a shape
+    without a file there gets the tree's own ``DEFAULT.json``. ``cu_num=None``
+    (the count cannot be read) is the default tree.
+    """
+    default_dir = resolve_config_dir("gemm", config_name, backend=backend)
+    if cu_num is None:
+        return default_dir
+    cu_dir = resolve_config_dir("gemm", config_name, backend=backend, cu_num=cu_num)
+    if load_config_json(f"{cu_dir}/DEFAULT.json", required=False) is None:
+        return default_dir
+    return cu_dir
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -35,6 +61,7 @@ def _get_gemm_config_cached(
     specialized_filename: str | None = None,
     backend: str = "triton",
     B: int | None = None,
+    cu_num: int | None = None,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
@@ -42,7 +69,9 @@ def _get_gemm_config_cached(
     callers can freely mutate the returned dict without polluting the cache.
 
     Resolves from ``<arch>/<backend>/gemm/<d_type>/`` (prefix-less filenames,
-    default named ``DEFAULT.json``). ``backend`` is declared by the caller and
+    default named ``DEFAULT.json``), or from the ``<arch>/<cu_num>cu/`` tree
+    of ``cu_num`` when that tree has its own ``DEFAULT.json``
+    (``gemm_config_dir()``). ``backend`` is declared by the caller and
     defaults to ``"triton"``; there is no cross-backend fallback.
     """
     # Input validation
@@ -55,10 +84,10 @@ def _get_gemm_config_cached(
         and all(x < y for x, y in itertools.pairwise(bounds))
     ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
 
-    # Every GEMM family lives in the nested layout <arch>/<backend>/gemm/
-    # <d_type>/ (no arch prefix, default named DEFAULT.json); the shared path
-    # builder lives in resolve_config_dir().
-    cfg_dir = resolve_config_dir("gemm", config_name, backend=backend)
+    # <arch>/<backend>/gemm/<d_type>/ (no arch prefix, default named
+    # DEFAULT.json), or the <arch>/<cu_num>cu/ tree of this CU count when it
+    # has its own DEFAULT.json.
+    cfg_dir = gemm_config_dir(config_name, backend, cu_num)
 
     # Load default config (must exist)
     default_fpath = f"{cfg_dir}/DEFAULT.json"
@@ -142,12 +171,16 @@ def get_gemm_config(
     specialized_filename: str | None = None,
     backend: str = "triton",
     B: int | None = None,
+    cu_num=DEVICE_CU_NUM,
 ) -> tuple[dict, bool]:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
 
     This function provides a unified way to load GEMM configs across all kernels.
     It uses the following logic:
+    0. Pick the tree: <arch>/<cu_num>cu/<backend>/gemm/<d_type>/ when the device's
+       CU count (get_config_cu_num()) has a tree with a DEFAULT.json, else
+       <arch>/<backend>/gemm/<d_type>/. Every file below comes from that one tree.
     1. Load default config file: <d_type>/DEFAULT.json
     2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
     3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
@@ -167,13 +200,19 @@ def get_gemm_config(
             or "gluon". Declared by the caller; there is no fallback to
             the other backend.
         B: Batch dimension for batched GEMM (optional)
+        cu_num: CU count whose <arch>/<cu_num>cu/ tree is read when it has a
+            DEFAULT.json. Default: this device's (get_config_cu_num()). None
+            reads the default tree only. Kernels never pass it; the tuning
+            scripts do, to address one tree.
 
     Returns:
         Dictionary with the config params (a fresh deep-copy safe to mutate),
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
+    if cu_num is DEVICE_CU_NUM:
+        cu_num = get_config_cu_num()
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename, backend, B
+        config_name, M, N, K, bounds, specialized_filename, backend, B, cu_num
     )
     return _copy_gemm_config(config), is_tuned
 
