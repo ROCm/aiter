@@ -679,7 +679,10 @@ block_find_pivot_wide_wave0(const uint32_t* __restrict__ s_w, uint32_t* __restri
 // NaN -- otherwise every NaN is above it under both -- so that is the one case
 // remapped: no key above the NaN class, and k_out of its members taken by
 // column. The caller has to show the emitter every NaN of the row then.
-constexpr uint32_t NAN_ONE_KEY = 0xFF000002u; // the lowest positive NaN; +inf is 0xFF000001
+constexpr uint32_t NAN_ONE_KEY = sortable_key_bits<true>(0x7F800001u); // the lowest positive NaN
+static_assert(NAN_ONE_KEY == sortable_key_bits<true>(0x7F800000u) + 1u &&
+                  sortable_key_bits<true>(0xFFFFFFFFu) > NAN_ONE_KEY,
+              "every NaN keys above +inf, the lowest positive one right above it");
 
 template <bool NAN_ONE>
 __device__ __forceinline__ void nan_one_remap(uint32_t& pivot, int& ngt, int& eq_needed)
@@ -987,6 +990,194 @@ __device__ __forceinline__ void block_gather_by_column(int c,
         carry_e += tot >> 16;
         __syncthreads(); // the next window clears what this one read
     }
+}
+
+// The windowed stable emit. The block bitmaps above walk every window in turn,
+// each with all c candidates twice and a scan of its words, and the scan's
+// thread-contiguous words conflict in the LDS banks: 3.6us a window at
+// 1 x 524288, k=2048. Here the entries at or above the pivot are counted and
+// bucketed by window of STABLE_WIN_COLS columns once, and the first nww waves
+// then take the windows in parallel, each through its own 3 * STABLE_WIN_WORDS
+// words of bitmaps (16-byte aligned; the first nww_first waves' in s_bm, the
+// rest in s_bm_rest) read and written 64 lanes x 16 bytes at a time, with no
+// block barrier between windows. s_keys: the candidate keys, rewritten in place
+// as entries; s_list: the entries; s_wc: HIST_SLOTS words. All threads must call.
+constexpr int STABLE_WIN_WORDS = 256;
+constexpr int STABLE_WIN_COLS  = 32 * STABLE_WIN_WORDS;
+constexpr int STABLE_WIN_MAX   = 512;
+// A wave pays its windows one after another, the list sort a log^2 of k: past
+// this many windows a wave, the sort is the cheaper of the two. Windowed over
+// sort, 1 x 1M..4M, 16 waves: 1.05 / 0.99 / 0.88 at 16 windows a wave for
+// k=512 / 1024 / 2048, 1.14 / 1.14 / 1.02 at 24.
+__host__ __device__ constexpr int stable_win_per_wave(int K) { return 13 + (K - 512) / 155; }
+
+__host__ __device__ constexpr int stable_win_count(int len)
+{
+    return len / STABLE_WIN_COLS + (len % STABLE_WIN_COLS != 0 ? 1 : 0);
+}
+// Replicas of each window's counter and cursor, lane & (rep - 1) picking one:
+// lanes of a wave meeting at one counter serialise, as at s_hist (1x131200,
+// k=2048: the count pass 1.68us with one, 0.80us with four).
+__host__ __device__ constexpr int stable_win_reps(int nwin)
+{
+    return 2 * 4 * nwin <= HIST_SLOTS ? 4 : 2 * 2 * nwin <= HIST_SLOTS ? 2 : 1;
+}
+static_assert(2 * STABLE_WIN_MAX <= HIST_SLOTS, "the window counts live in s_hist");
+static_assert(!TOPK_SAMPLED_DEVICE || STABLE_WIN_WORDS == 4 * WAVE_SIZE,
+              "one 16-byte load per lane covers a bitmap");
+
+template <bool WRITE_VALUES, bool NAN_ONE, typename ColFn>
+__device__ __forceinline__ void block_gather_by_window(int c,
+                                                       int len,
+                                                       int nww,
+                                                       int nww_first,
+                                                       int idx_base,
+                                                       uint32_t pivot,
+                                                       int eq_needed,
+                                                       int* __restrict__ out,
+                                                       float* __restrict__ out_val,
+                                                       const float* __restrict__ row,
+                                                       uint32_t* __restrict__ s_keys,
+                                                       uint32_t* __restrict__ s_bm,
+                                                       uint32_t* __restrict__ s_bm_rest,
+                                                       uint32_t* __restrict__ s_list,
+                                                       uint32_t* __restrict__ s_wc,
+                                                       ColFn col_at)
+{
+    static_assert(!(NAN_ONE && WRITE_VALUES), "NAN_ONE is instantiated for indices only");
+    const int lane  = threadIdx.x & (WAVE_SIZE - 1);
+    const int wid   = threadIdx.x / WAVE_SIZE;
+    const int nwin  = stable_win_count(len);
+    const int reps  = stable_win_reps(nwin);
+    const int nslot = nwin * reps;
+    const int rep   = lane & (reps - 1);
+    uint32_t* s_cur = s_wc + nslot;
+    auto wave_sync  = [] {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    };
+    for(int w = threadIdx.x; w < nslot; w += blockDim.x)
+        s_wc[w] = 0u;
+    __syncthreads();
+    // Per slot: above | equal << 16. A window holds at most c <= PHASE_C_CAP_MAX
+    // entries, so each count, and each prefix below, fits a 16-bit half. Each key
+    // becomes its entry, column << 1 | equal, or STABLE_NONE below the pivot.
+    for(int i = threadIdx.x; i < c; i += blockDim.x)
+    {
+        const uint32_t k = nan_one_key<NAN_ONE>(s_keys[i]);
+        uint32_t e       = STABLE_NONE;
+        if(k >= pivot)
+        {
+            const int col = col_at(i);
+            e             = ((uint32_t)col << 1) | (k == pivot ? 1u : 0u);
+            atomicAdd(&s_wc[(col / STABLE_WIN_COLS) * reps + rep], k > pivot ? 1u : 0x10000u);
+        }
+        s_keys[i] = e;
+    }
+    __syncthreads();
+    if(wid == 0)
+    {
+        // One wave, its loads issued together: nslot <= HIST_SLOTS / 2.
+        constexpr int ROUNDS = HIST_SLOTS / 2 / WAVE_SIZE;
+        uint32_t v[ROUNDS];
+#pragma unroll
+        for(int j = 0; j < ROUNDS; j++)
+            v[j] = j * WAVE_SIZE + lane < nslot ? s_wc[j * WAVE_SIZE + lane] : 0u;
+        uint32_t carry = 0;
+#pragma unroll
+        for(int j = 0; j < ROUNDS; j++)
+        {
+            if(j * WAVE_SIZE >= nslot)
+                break;
+            const uint32_t inc = aiter::wave_inclusive_sum_dpp(v[j]);
+            const uint32_t p   = carry + inc - v[j];
+            if(j * WAVE_SIZE + lane < nslot)
+            {
+                s_wc[j * WAVE_SIZE + lane]  = p;
+                s_cur[j * WAVE_SIZE + lane] = (p & 0xFFFFu) + (p >> 16);
+            }
+            carry += (uint32_t)__builtin_amdgcn_readlane((int)inc, WAVE_SIZE - 1);
+        }
+    }
+    __syncthreads();
+    for(int i = threadIdx.x; i < c; i += blockDim.x)
+    {
+        const uint32_t e = s_keys[i];
+        if(e != STABLE_NONE)
+        {
+            const int col     = (int)(e >> 1);
+            const int w       = col / STABLE_WIN_COLS;
+            const uint32_t at = atomicAdd(&s_cur[w * reps + rep], 1u);
+            s_list[at]        = ((uint32_t)(col - w * STABLE_WIN_COLS) << 1) | (e & 1u);
+        }
+    }
+    __syncthreads();
+    uint32_t* s_gt  = wid < nww_first ? s_bm + wid * 3 * STABLE_WIN_WORDS
+                                      : s_bm_rest + (wid - nww_first) * 3 * STABLE_WIN_WORDS;
+    uint32_t* s_eq  = s_gt + STABLE_WIN_WORDS;
+    uint32_t* s_pre = s_eq + STABLE_WIN_WORDS;
+    for(int w = wid; wid < nww && w < nwin; w += nww)
+    {
+        // The scatter's last cursor ended at the window's end.
+        const uint32_t pw0 = (uint32_t)__builtin_amdgcn_readfirstlane((int)s_wc[w * reps]);
+        const int beg      = (int)((pw0 & 0xFFFFu) + (pw0 >> 16));
+        const int end      = __builtin_amdgcn_readfirstlane((int)s_cur[w * reps + reps - 1]);
+        if(beg == end)
+            continue;
+        for(int j = lane; j < 2 * STABLE_WIN_WORDS / 4; j += WAVE_SIZE)
+            reinterpret_cast<uint4*>(s_gt)[j] = uint4{0u, 0u, 0u, 0u}; // s_gt, s_eq adjacent
+        wave_sync();
+        for(int e = beg + lane; e < end; e += WAVE_SIZE)
+        {
+            const uint32_t v = s_list[e];
+            const int col    = (int)(v >> 1);
+            atomicOr(&(v & 1u ? s_eq : s_gt)[col >> 5], 1u << (col & 31));
+        }
+        wave_sync();
+        // Lane l takes words 4l .. 4l + 3: four counts, one wave scan.
+        uint32_t run = pw0;
+        for(int j = 0; j < STABLE_WIN_WORDS / 4; j += WAVE_SIZE)
+        {
+            const uint4 g      = reinterpret_cast<const uint4*>(s_gt)[j + lane];
+            const uint4 e      = reinterpret_cast<const uint4*>(s_eq)[j + lane];
+            const uint32_t c0  = (uint32_t)__popc(g.x) | ((uint32_t)__popc(e.x) << 16);
+            const uint32_t c1  = (uint32_t)__popc(g.y) | ((uint32_t)__popc(e.y) << 16);
+            const uint32_t c2  = (uint32_t)__popc(g.z) | ((uint32_t)__popc(e.z) << 16);
+            const uint32_t c3  = (uint32_t)__popc(g.w) | ((uint32_t)__popc(e.w) << 16);
+            const uint32_t tot = c0 + c1 + c2 + c3;
+            const uint32_t inc = aiter::wave_inclusive_sum_dpp(tot);
+            const uint32_t b   = run + inc - tot;
+            reinterpret_cast<uint4*>(s_pre)[j + lane] =
+                uint4{b, b + c0, b + c0 + c1, b + c0 + c1 + c2};
+            run += (uint32_t)__builtin_amdgcn_readlane((int)inc, WAVE_SIZE - 1);
+        }
+        wave_sync();
+        const int w0 = w * STABLE_WIN_COLS;
+        for(int e = beg + lane; e < end; e += WAVE_SIZE)
+        {
+            const uint32_t v     = s_list[e];
+            const int col        = (int)(v >> 1);
+            const int wd         = col >> 5;
+            const uint32_t below = (1u << (col & 31)) - 1u;
+            const uint32_t pw    = s_pre[wd];
+            const unsigned g     = (pw & 0xFFFFu) + (unsigned)__popc(s_gt[wd] & below);
+            const unsigned q     = (pw >> 16) + (unsigned)__popc(s_eq[wd] & below);
+            int pos              = -1;
+            if(!(v & 1u))
+                pos = (int)(g + min(q, (unsigned)eq_needed));
+            else if(q < (unsigned)eq_needed)
+                pos = (int)(g + q);
+            if(pos >= 0)
+            {
+                out[pos] = idx_base + w0 + col;
+                if(WRITE_VALUES)
+                    out_val[pos] = row[w0 + col];
+            }
+        }
+        wave_sync(); // the next window clears what this one read
+    }
+    __syncthreads();
 }
 
 // Gathers the entries at or above the pivot into s_list, up to list_cap of
