@@ -14,10 +14,13 @@ import subprocess
 import sys
 import types
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import pytest
+from flydsl.expr.typing import Constexpr
 
 from aiter.aot.flydsl import gemm, replay
-from aiter.aot.flydsl.dry_run import GpuRuntimeReached
+from aiter.aot.flydsl.dry_run import GpuRuntimeReached, dry_run
 
 
 @pytest.mark.parametrize("path", gemm.DEFAULT_CSVS)
@@ -144,6 +147,72 @@ def test_python_ops_run_their_body_under_fake_tensors():
         finally:
             torch_guard.run_python_ops_for_real(previous)
     assert calls == [torch.Size([3])]
+
+
+@flyc.jit
+def _launch_probe(m: fx.Int32, cluster_m: Constexpr[int]):
+    raise AssertionError("an identified launch is never traced")
+
+
+def _fitted_cluster_m(m):
+    """The largest cluster_m up to 4 that divides M's 256-row tile count, as
+    the gfx1250 GEMMs fit it."""
+    tiles = -(-m // 256)
+    return next(cm for cm in (4, 3, 2, 1) if tiles % cm == 0)
+
+
+def test_identified_kernels_compile_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
+    with dry_run("gfx1250", 256), replay.identified_kernels() as kernels:
+        assert _launch_probe(1, 2) is None
+        _launch_probe(7, 2)
+        _launch_probe(1, 4)
+    # A runtime value is no part of a kernel's identity; a constexpr is.
+    assert len(kernels) == 2
+    assert not any(path.suffix == ".pkl" for path in tmp_path.rglob("*"))
+
+
+def test_scan_builds_every_kernel_between_equal_ends(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
+    module = types.ModuleType("aot_replay_scan_probe")
+    module.LABEL = "PROBE"
+    module.AOT_ARCH_DEFAULT = "gfx1250"
+    module.SCAN_ARCHS = ("gfx1250",)
+    module.describe = lambda job: f"M={job['m']}"
+
+    def replay_probe(job):
+        if job["m"] % 2:
+            raise RuntimeError(f"no kernel for an odd M={job['m']}")
+        _launch_probe(job["m"], _fitted_cluster_m(job["m"]))
+
+    module.replay = replay_probe
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    built = set()
+
+    def replay_job(module, job, probe=False):
+        with replay.identified_kernels() as kernels:
+            try:
+                with dry_run("gfx1250", 256):
+                    module.replay(job)
+            except RuntimeError as error:
+                return {"compile_time": 0.0, "refused": str(error)}, frozenset()
+        built.add(_fitted_cluster_m(job["m"]))
+        return {"compile_time": 0.0}, frozenset(kernels)
+
+    monkeypatch.setattr(replay, "replay_job", replay_job)
+    # M=5120 and M=6144 both fit cluster_m 4, M=5632 fits 2, and the row's
+    # smallest M, 4097, is refused.
+    job = {
+        "kernel_name": "probe",
+        "gfx": "gfx1250",
+        "cu_num": 256,
+        "m": 6144,
+        "m_low": 4097,
+    }
+    outcome = replay._replay_batch(module.__name__, [job], "probe")
+    assert built == {1, 2, 3, 4}
+    assert any(probe.get("refused") for probe in outcome["probes"])
 
 
 def _gemm_aot(table, cache_dir, *extra):
