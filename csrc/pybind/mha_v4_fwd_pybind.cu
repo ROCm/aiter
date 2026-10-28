@@ -85,7 +85,10 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("kv_range_tokens")  = 0,
           py::arg("mean_k_var")       = std::nullopt,
           py::arg("sorted_dispatch")  = -1,
-          py::arg("mean_k_var_scale") = std::nullopt);
+          py::arg("mean_k_var_scale") = std::nullopt,
+          py::arg("tilt_rank")         = 0,
+          py::arg("tilt_plane_stride") = 0,
+          py::arg("tilt_shift")        = std::nullopt);
     m.def("mha_v4_sparse_work_table",
           &aiter::torch_itfs::mha_v4_sparse_work_table,
           py::arg("lut_count"),

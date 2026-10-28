@@ -1133,6 +1133,9 @@ def _fmha_v4_fwd_sol_fake(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    tilt_rank: int = 0,
+    tilt_plane_stride: int = 0,
+    tilt_shift: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format, v_pack
@@ -1140,6 +1143,7 @@ def _fmha_v4_fwd_sol_fake(
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
     del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale
     del out, lse, kv_range_tokens, mean_k_var, sorted_dispatch, mean_k_var_scale
+    del tilt_rank, tilt_plane_stride, tilt_shift
 
 
 @compile_ops(
@@ -1178,6 +1182,9 @@ def _fmha_v4_fwd_sol(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    tilt_rank: int = 0,
+    tilt_plane_stride: int = 0,
+    tilt_shift: Optional[Tensor] = None,  # noqa: UP045
 ) -> None: ...
 
 
@@ -1213,6 +1220,9 @@ def _mha_v4_fwd_sol_launch(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    tilt_rank: int = 0,
+    tilt_plane_stride: int = 0,
+    tilt_shift: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
     _fmha_v4_fwd_sol(
         q,
@@ -1245,6 +1255,9 @@ def _mha_v4_fwd_sol_launch(
         mean_k_var,
         sorted_dispatch,
         mean_k_var_scale,
+        tilt_rank,
+        tilt_plane_stride,
+        tilt_shift,
     )
 
 
@@ -1280,6 +1293,9 @@ def _mha_v4_fwd_sol_launch_fake(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    tilt_rank: int = 0,
+    tilt_plane_stride: int = 0,
+    tilt_shift: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out, lse
     del q_format, k_format, v_format, v_pack
@@ -1413,6 +1429,7 @@ def mha_v4_packed(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: Optional[bool] = None,  # noqa: UP045
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    sol_tilt: Optional[tuple[int, int, Tensor]] = None,  # noqa: UP045
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 
@@ -1469,9 +1486,21 @@ def mha_v4_packed(
     by quantize_v_mxfp4_fp6_p / quantize_v_mxfp6_fp6_p is AttentionPack.V_FOR_FP6_P; those
     rows take an FP6 P operand and serve LSE, ragged KV, KV ranges, the Jensen term and sorted
     dispatch in every block-sparse mode.
+
+    sol_tilt, (rank, plane stride in bytes, shift), adds the low-rank pooled value tilt (PoC) on
+    a tilt-enabled Sol row. aiter.ops.triton.attention.sol_tilt.sol_tilt_factors returns it with the
+    factor planes; shift is a one-element int32 device tensor the kernel reads itself, so
+    building the factors needs no host sync. The i8fp8 row takes sol_tilt_planes' planes and
+    sol_tilt_valu_params' two-element tensor as shift, and the f8f6, f6f6 and f6f4 rows its
+    four-element one, which adds the V and V-scale plane strides; the mxfp4 row's five-element one
+    adds its K-scale plane stride after them. The mxfp8, bf16fp8 and bf16 rows take
+    sol_tilt_scaled_params' three-element tensor: the same value shift and score multiplier, plus
+    the row's second plane stride.
     """
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
     pooled = _sol_attn_triple(mean_k, mean_v, block_bitmap)
+    if sol_tilt is not None and pooled is None:
+        raise ValueError("sol_tilt corrects the Sol-Attn pooled values; it needs the pooled triple")
     if mean_k_var is not None and pooled is None:
         raise ValueError(
             "mean_k_var corrects the Sol-Attn pooled logits; it needs the pooled triple "
@@ -1641,6 +1670,7 @@ def mha_v4_packed(
                 mean_k_var,
                 -1 if sorted_dispatch is None else int(bool(sorted_dispatch)),
                 mean_k_var_scale,
+                *(sol_tilt or (0, 0, None)),
             )
             # The Sol-Attn rows return ln(L) - ln(kv_tile). A constant cancels in a ring merge of
             # Sol-Attn ranks, but merging against a dense row's or flash-attn's LSE would misweight

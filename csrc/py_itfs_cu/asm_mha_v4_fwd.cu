@@ -1387,7 +1387,10 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                      int64_t kv_range_tokens,
                      const std::optional<at::Tensor>& mean_k_var,
                      int64_t sorted_dispatch,
-                     const std::optional<at::Tensor>& mean_k_var_scale)
+                     const std::optional<at::Tensor>& mean_k_var_scale,
+                     int64_t tilt_rank,
+                     int64_t tilt_plane_stride,
+                     const std::optional<at::Tensor>& tilt_shift)
 {
     const MhaV4Recipe recipe{q_format,
                              k_format,
@@ -1722,6 +1725,34 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
     if(use_sorted)
     {
         args.ptr_work_table.value = work_table.data_ptr();
+    }
+    // Low-rank tilt (PoC): planes 1..rank of mean_k's and mean_v's allocations, tilt_plane_stride
+    // bytes apart, carry each block's covariance factors. It rides the V-scale stride slots, which
+    // no row reads (see above), and needs the Jensen row's unfolded pooled P. The code object must
+    // be tilt-enabled; any other row ignores the slots. The shifts depend on the factors'
+    // maxima, so the 0x400 slot holds a pointer to them rather than their value, and the factors
+    // never round-trip through the host.
+    TORCH_CHECK(tilt_rank >= 0 && tilt_rank <= 64, "tilt_rank must be in [0, 64]");
+    if(tilt_rank > 0)
+    {
+        TORCH_CHECK(cfg.jensen != 0, "the tilt needs a Jensen row");
+        TORCH_CHECK(tilt_plane_stride > 0 && tilt_plane_stride <= 0x7FFFFFFF / tilt_rank,
+                    "tilt_plane_stride must be positive and keep rank planes in 31 bits");
+        TORCH_CHECK(tilt_shift.has_value(), "the tilt needs its tilt_shift tensor");
+        const auto& shift = tilt_shift.value();
+        // Dword 0 holds two signed bytes: the score GEMM's E8M0 shift, then the value GEMM's E8M0
+        // exponent. An integer-score row (i8fp8) reads dword 1 too, its f32 score multiplier. Rows
+        // whose planes do not all step by tilt_plane_stride read their other plane strides from
+        // dword 2 on: MXFP8's K-scale planes, BF16/FP8's and BF16's V planes, an FP6-P V's
+        // V and V-scale planes, and after those MXFP4's K-scale planes.
+        TORCH_CHECK(shift.dtype() == at::kInt && shift.numel() >= 1 && shift.numel() <= 8 &&
+                        shift.is_contiguous() && shift.is_cuda() && shift.device() == q.device(),
+                    "tilt_shift must be one to eight contiguous int32 elements on Q's device");
+        args.s_mean_v_scale_Seqs.value = static_cast<uint32_t>(tilt_rank);
+        args.s_mean_v_scale_Hs.value   = static_cast<uint32_t>(tilt_plane_stride);
+        const void* shift_ptr          = shift.data_ptr();
+        static_assert(sizeof(ScalarSlot) >= sizeof(shift_ptr));
+        std::memcpy(&args.s_mean_v_scale_Bs, &shift_ptr, sizeof(shift_ptr));
     }
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;

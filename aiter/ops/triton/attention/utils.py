@@ -475,7 +475,8 @@ def _sol_attn_pool_packed_k(
     """Pool a packed (MXFP4 or MXFP6) K into one row per KV block, WITH a pooled E8M0 scale.
 
     Source-side pooling as in :func:`_sol_attn_pool_mxfp4_k`. Returns (mean_data, mean_scale,
-    mean_pooled), and with `variance` also (var_data, var_scale) in mean_k's layouts.
+    mean_pooled), and with `variance` also (var_data, var_scale) in mean_k's layouts and var_pooled,
+    the fp32 variance in the rotated basis before packing.
 
     The variance is the one the kernel's Jensen term needs, which is of K as the kernel holds it:
     in the basis the packer's Hadamard rotation moves it to, where q_d^2 * var[d] is summed. A
@@ -504,8 +505,10 @@ def _sol_attn_pool_packed_k(
     rotated_var = _sol_attn_block_variance(
         rotate(k_source.contiguous()).float(), BLOCK_N
     )
-    return result + _sol_attn_pack_k(
-        rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N
+    return (
+        *result,
+        *_sol_attn_pack_k(rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N),
+        rotated_var,
     )
 
 
@@ -781,6 +784,9 @@ def sol_prepare(
             takes it as mean_k_var.
         mean_k_var_scale: mean_k_var's E8M0 scale in mean_k_scale's layout when k_variance is set
             and K is block-scaled (k_scale given, or packed); otherwise None. mha_v4_packed takes it as mean_k_var_scale.
+        mean_k_var_pooled: for a packed K with k_variance, the fp32 variance in the rotated basis
+            before packing, (batch, num_kv_blocks, nheads_kv, d), since the packed codes cannot be
+            read back; otherwise None. sol_jensen_cap takes it.
         mean_k_pooled, mean_v_pooled: the pooled operand as the packer saw it, before quantization,
             for a packed operand whose mean_k / mean_v cannot be read back and dequantized. None
             for the addressable recipes, where dequantizing the pooled tensor with its own scale
@@ -878,7 +884,7 @@ def sol_prepare(
     # other: mxfp8 has an E8M0 K and a per-tensor V, f8f6 the reverse.
     mean_k_scale = mean_v_scale = None
     mean_k_pooled = mean_v_pooled = None
-    mean_k_var = mean_k_var_scale = None
+    mean_k_var = mean_k_var_scale = mean_k_var_pooled = None
     k_routing_var = None
     if k_packed_format is not None:
         pooled_k = _sol_attn_pool_packed_k(
@@ -886,7 +892,7 @@ def sol_prepare(
         )
         mean_k, mean_k_scale, mean_k_pooled = pooled_k[:3]
         if k_variance:
-            mean_k_var, mean_k_var_scale = pooled_k[3:]
+            mean_k_var, mean_k_var_scale, mean_k_var_pooled = pooled_k[3:]
         k_routing = mean_k_pooled
     elif k_scale is None and (k_variance or error_router):
         mean_k, stored_var = _sol_attn_pool_reuse_descale(
@@ -1014,6 +1020,7 @@ def sol_prepare(
         "mean_v_pooled": mean_v_pooled,
         "mean_k_var": mean_k_var,
         "mean_k_var_scale": mean_k_var_scale,
+        "mean_k_var_pooled": mean_k_var_pooled,
         "block_bitmap": block_bitmap,
         "kv_block_indices": kv_block_indices,
         "lut_start": lut_start,
