@@ -230,12 +230,13 @@ __device__ inline constexpr auto make_layout_rb_scale(int lane_id, int wave_id_n
 
     constexpr int P = T::smem_linear_wave + T::smem_padding;
     constexpr int n_repeats = T::NUM_WAVES / T::T_N;
+    constexpr int k_vectors = T::W_N * T::W_K / T::WARP_SIZE / T::VEC_B;
 
     constexpr auto rb_block_shape = opus::make_tuple(
         opus::number<T::E_N / n_repeats>{}, // 2
         opus::number<n_repeats>{}, // 2
         opus::number<T::T_N>{}, // 2
-        opus::number<T::W_N * T::W_K / T::WARP_SIZE / T::VEC_B>{}, // 2
+        opus::number<k_vectors>{}, // 2
         opus::number<T::E_K>{}, // 1
         opus::number<T::WARP_SIZE>{}, // 64
         opus::number<T::VEC_B>{}); // 16
@@ -248,7 +249,7 @@ __device__ inline constexpr auto make_layout_rb_scale(int lane_id, int wave_id_n
 
     return opus::make_layout<T::VEC_B>(
         rb_block_shape,
-        opus::unfold_x_stride(rb_block_dim, rb_block_shape, opus::tuple{opus::number<8 * P>{}, opus::number<P>{}, opus::number<4 * P>{}, 1_I}),
+        opus::unfold_x_stride(rb_block_dim, rb_block_shape, opus::tuple{opus::number<T::NUM_WAVES * k_vectors * P>{}, opus::number<P>{}, opus::number<T::NUM_WAVES * P>{}, 1_I}),
         opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n, lane_id}));
 }
 

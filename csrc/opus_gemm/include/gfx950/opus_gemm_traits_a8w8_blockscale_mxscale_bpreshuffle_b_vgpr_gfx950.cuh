@@ -9,7 +9,9 @@ template<int BM, int BN, int NB, int BD, int BC = 0, bool XCD = false,
     bool PinA = false, bool PinC = false, int GroupM = 0>
 struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     // Workgroup launch and cache policy.
-    static constexpr int BLOCK_SIZE = WN * 64;
+    static constexpr int WARP_SIZE = 64;
+    static constexpr int BLOCK_SIZE = WN * WARP_SIZE;
+    static constexpr int NUM_WAVES = BLOCK_SIZE / WARP_SIZE;
     static constexpr int WG_PER_CU = WGPerCU;
 
     static constexpr int CACHECTL_A = ACache;
@@ -24,17 +26,31 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr int T_N = WN;
     static constexpr int T_K = 1;
 
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 128;
+
+    // Operand vectors, scale-byte copies, and BF16 output vectors.
+    static constexpr int VEC_A = 16;
+    static constexpr int VEC_B = 16;
+    static constexpr int VEC_C = 4;
+    static constexpr int VEC_SCALE_A = 16;
+    static constexpr int VEC_SCALE_B = 4;
+    static constexpr int VEC_OUTPUT = 8;
+    static constexpr int C_PADDING = 8;
+    static constexpr int GROUP_N = 128;
+    static constexpr int GROUP_K = 128;
+    static constexpr int A_CHUNKS_PER_FRAGMENT = W_M * W_K / (WARP_SIZE * VEC_A);
+    static constexpr int B_CHUNKS_PER_FRAGMENT = W_N * W_K / (WARP_SIZE * VEC_B);
+
     // Fixed-K panel and scale counts.
     static constexpr int K = FixedK;
     static constexpr int PANELS = K / B_K;
-    static constexpr int SCALE_COLS = K / 128;
-
-    static constexpr int W_M = 16;
-    static constexpr int W_N = 16;
+    static constexpr int SCALE_COLS = K / GROUP_K;
 
     // MFMA repeats; output 0 uses LDS stripes and output 2 uses packed stores.
-    static constexpr int MR = BM / 16;
-    static constexpr int NR = BN / (WN * 16);
+    static constexpr int MR = BM / W_M;
+    static constexpr int NR = BN / (WN * W_N);
     static constexpr int OUTPUT = Output;
     static constexpr int E_M = MR;
     static constexpr int E_N = NR;
@@ -53,7 +69,7 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
 
     // A stages and the B fragment prefetch queue.
     static constexpr int STAGES = NB;
-    static constexpr int B_FRAGMENTS = (B_K / 128) * NR;
+    static constexpr int B_FRAGMENTS = (B_K / W_K) * NR;
     // Keep cross-K prefetch within the wave's register budget. Each B fragment
     // costs eight dwords; reserve space for A, C, packed scales and addressing.
     static constexpr int REGISTER_BUDGET = WGPerCU == 2 ? 256 : 512;
@@ -69,17 +85,17 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr int B_SETS = B_AHEAD + 1;
     static constexpr int B_CACHE = BC;
     static constexpr bool XCD_ORDER = XCD;
-    static constexpr bool SB_SLOTS = SCALE_COLS % 4 != 0;
+    static constexpr bool SB_SLOTS = SCALE_COLS % VEC_SCALE_B != 0;
 
     // The A ring and byte-scale panels share LDS; output 0 reuses it for BF16 stripes.
     static constexpr int A_BYTES = BM * B_K;
     static constexpr int STAGE_BYTES = A_BYTES;
-    static constexpr int A_COPIES = A_BYTES / (BLOCK_SIZE * 16);
-    static constexpr int SA_ROWS = (BM + 15) / 16 * 16;
-    static constexpr int SA_COPIES = (SA_ROWS * SCALE_COLS + BLOCK_SIZE * 16 - 1) / (BLOCK_SIZE * 16);
-    static constexpr int SA_BYTES = SA_COPIES * BLOCK_SIZE * 16;
-    static constexpr int SB_ROWS = (BN + 127) / 128;
-    static constexpr int SB_BYTES = BLOCK_SIZE * 4;
+    static constexpr int A_COPIES = A_BYTES / (BLOCK_SIZE * VEC_A);
+    static constexpr int SA_ROWS = (BM + VEC_SCALE_A - 1) / VEC_SCALE_A * VEC_SCALE_A;
+    static constexpr int SA_COPIES = (SA_ROWS * SCALE_COLS + BLOCK_SIZE * VEC_SCALE_A - 1) / (BLOCK_SIZE * VEC_SCALE_A);
+    static constexpr int SA_BYTES = SA_COPIES * BLOCK_SIZE * VEC_SCALE_A;
+    static constexpr int SB_ROWS = (BN + GROUP_N - 1) / GROUP_N;
+    static constexpr int SB_BYTES = BLOCK_SIZE * VEC_SCALE_B;
     static constexpr int OFF_SA = NB * STAGE_BYTES;
     static constexpr int OFF_SB = OFF_SA + SA_BYTES;
     static constexpr int PIPELINE_BYTES = OFF_SB + SB_BYTES;
