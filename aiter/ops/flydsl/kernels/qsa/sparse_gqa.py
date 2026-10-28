@@ -24,6 +24,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import (
     BFloat16,
     Float32,
@@ -35,6 +36,7 @@ from flydsl.expr import (
 )
 from flydsl.expr import math as fxmath
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E, kernel_signature
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
 
@@ -181,6 +183,59 @@ def _paged_gqa_coverage_reason(
     return None
 
 
+def _paged_gqa_lds_bytes(
+    head_dim: int, block_n: int, block_threads: int, use_k32: bool
+) -> int:
+    """Bytes of the split kernel's ``SharedStorage``, including tail alignment.
+
+    The fields are the production struct (no test pad): KV, the score tile,
+    and one partial per wave. gfx950 prefill keeps K and V in separate
+    regions; gfx942 and gfx950 decode overlay them, and gfx942 pads each K
+    row by 8. ``dsl_size_of`` rounds the struct up to 16. The compiler's
+    ``group_segment`` size leaves that tail off (165896 where this reports
+    165904) and both device limits are multiples of 16, so the two sizes
+    reject the same shapes.
+    """
+    num_waves = block_threads // 64
+    n_subtiles = block_n // 16
+    # Same predicates as the storage struct below.
+    token_major_v = use_k32 and block_n == 16
+    split_kv_lds = use_k32 and not token_major_v
+    qk_split = not token_major_v and num_waves > 1 and n_subtiles % num_waves == 0
+    qk_score_slots = n_subtiles * 64 * 4 if qk_split else 1
+    if use_k32:
+        kv_elems = block_n * head_dim * (2 if split_kv_lds else 1)
+    else:
+        kv_elems = block_n * (head_dim + 8)
+    # (byte size, alignment) in declaration order. Array[T, n, align].
+    fields = (
+        (kv_elems * 2, 16),
+        (qk_score_slots * 4, 16),
+        (num_waves * 4, 4),
+    )
+    offset = 0
+    align = 1
+    for size, field_align in fields:
+        offset = (offset + field_align - 1) // field_align * field_align
+        offset += size
+        align = max(align, field_align)
+    return (offset + align - 1) // align * align
+
+
+def _paged_gqa_lds_reason(lds_bytes: int, use_k32: bool) -> str | None:
+    """Why this split tile does not fit in LDS, or None when it does.
+
+    ``use_k32`` is the gfx950 layout. The overlay layout is gfx942, whose
+    workgroup LDS is 64 KiB. A test pad is not part of ``lds_bytes`` here;
+    the builder passes the struct it actually allocated.
+    """
+    arch = "gfx950" if use_k32 else "gfx942"
+    capacity = get_lds_capacity_bytes(arch)
+    if lds_bytes > capacity:
+        return f"shared memory {lds_bytes} exceeds {arch} LDS capacity {capacity}"
+    return None
+
+
 def build_qsa_sparse_gqa_module(
     n_q_heads: int,
     n_kv_heads: int,
@@ -192,6 +247,7 @@ def build_qsa_sparse_gqa_module(
     n_splits: int,
     wide_cache: bool,
     kv_strides: tuple[int, int, int] | None = None,
+    lds_pad_elems: int = 0,
 ):
     if n_kv_heads < 1 or n_q_heads % n_kv_heads:
         raise ValueError(
@@ -311,7 +367,20 @@ def build_qsa_sparse_gqa_module(
             fx.make_layout(shape, (k_stride, 1)),
         )
 
-    if use_k32:
+    # A test passes a pad larger than the kv tile so that symbol is not at
+    # byte 0. The production launch leaves it empty and keeps today's layout.
+    if lds_pad_elems < 0:
+        raise ValueError(f"lds_pad_elems must be >= 0, got {lds_pad_elems}")
+    if use_k32 and lds_pad_elems:
+
+        @fx.struct
+        class SharedStorage:
+            pad: fx.Array[BFloat16, lds_pad_elems, 16]
+            kv: fx.Array[BFloat16, block_n * head_dim + v_elem_off, 16]
+            scores: fx.Array[Float32, qk_score_slots, 16]
+            partial: fx.Array[Int32, num_waves, 4]
+
+    elif use_k32:
 
         @fx.struct
         class SharedStorage:
@@ -326,6 +395,20 @@ def build_qsa_sparse_gqa_module(
             kv: fx.Array[BFloat16, block_n * k_stride, 16]
             scores: fx.Array[Float32, qk_score_slots, 16]
             partial: fx.Array[Int32, num_waves, 4]
+
+    # The host estimate describes the unpadded struct. A test pad is a
+    # different allocation and is checked on its own size.
+    lds_bytes = dsl_size_of(SharedStorage)
+    if not lds_pad_elems:
+        expected = _paged_gqa_lds_bytes(head_dim, block_n, block_threads, use_k32)
+        if lds_bytes != expected:
+            raise RuntimeError(
+                f"split shared storage is {lds_bytes} bytes, "
+                f"the host estimate is {expected}"
+            )
+    lds_reason = _paged_gqa_lds_reason(lds_bytes, use_k32)
+    if lds_reason is not None:
+        raise ValueError(lds_reason)
 
     @fx.struct
     class MergeStorage:
@@ -344,6 +427,7 @@ def build_qsa_sparse_gqa_module(
             qkk=qk_k,
             wide=int(wide_cache),
             **({"kvs": "x".join(str(s) for s in kv_strides)} if strided_wide else {}),
+            **({"pad": lds_pad_elems} if lds_pad_elems else {}),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -363,16 +447,16 @@ def build_qsa_sparse_gqa_module(
         n_cache_blocks: Int32,
         softmax_scale_log2: Float32,
     ):
-        row = Int32(gpu.block_id("x"))
-        kv_h = Int32(gpu.block_id("y"))
-        split = Int32(gpu.block_id("z"))
-        tid = Int32(gpu.thread_id("x"))
+        row = fx.block_idx.x
+        kv_h = fx.block_idx.y
+        split = fx.block_idx.z
+        tid = fx.thread_idx.x
         zero = Int32(0)
         one = Int32(1)
         page = Int32(page_size)
         thread_coord = fx.idx2crd(tid, fx.make_layout((num_waves, 64), (64, 1)))
-        wave = Int32(fx.get(thread_coord, 0))
-        lane = Int32(fx.get(thread_coord, 1))
+        wave = Int32(thread_coord[0].unpack())
+        lane = Int32(thread_coord[1].unpack())
         lane_m = lane % Int32(16)
         lane_kg = _idiv(lane, Int32(16))
 
@@ -433,6 +517,18 @@ def build_qsa_sparse_gqa_module(
             v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
+        # const_expr has to stay its own if: combined with the lane test,
+        # the pad body is still traced on the production launch, which has
+        # no pad field. A deletable store would drop the symbol.
+        if const_expr(lds_pad_elems):  # noqa: SIM102
+            if tid == zero:
+                llvm.inline_asm(
+                    ir.Type.parse("!llvm.void"),
+                    [Int32(fx.ptrtoint(storage.pad.ptr)).ir_value()],
+                    "ds_write_b32 $0, $0\n",
+                    "v,~{memory}",
+                    has_side_effects=True,
+                )
         k_arr = storage.kv
         score_arr = storage.scores
         score_copy = fx.make_copy_atom(fx.UniversalCopy128b(), Float32)
@@ -458,7 +554,7 @@ def build_qsa_sparse_gqa_module(
         q_copy = g_copy if qk_k == 32 else buf_copy_atom(8, BFloat16)
         qk_q_copy = fx.make_tiled_copy_B(q_copy, qk_wave_mma).get_slice(lane)
         pv_b_atom = fx.make_copy_atom(
-            (fx.rocdl.cdna4.LDSReadTrans16_64b() if use_k32 else fx.UniversalCopy64b()),
+            (fx.rocdl.cdna4.LDSReadTrans(16, 64) if use_k32 else fx.UniversalCopy64b()),
             BFloat16,
         )
 
@@ -575,7 +671,7 @@ def build_qsa_sparse_gqa_module(
                 scan_state = yield [mine]
             val = Int32(scan_state)
             for sh in (32, 16, 8, 4, 2, 1):
-                peer = val.shuffle_xor(Int32(sh), Int32(64))
+                peer = fx.gpu.shuffle_xor(val, sh, 64)
                 val = (val > peer).select(val, peer)
             # Every lane of the wave holds the same max, so the store is uniform.
             partial[wave] = val
@@ -699,6 +795,8 @@ def build_qsa_sparse_gqa_module(
         # floats up to the moment its index lands. Decode only: prefill has
         # enough tiles to hide the chain and loses 6% at L32768 if pinned.
         if const_expr(decode_tr_pv):
+            # sched_barrier is not in the stable rocdl export. sched_vmem is
+            # a counted group barrier, not this mask.
             fx.rocdl.sched_barrier("vmem_read")
         phys0 = load_page(tok0)
 
@@ -794,6 +892,8 @@ def build_qsa_sparse_gqa_module(
                         fx.copy(lds_copy, k_store_frag, k_dst)
             if const_expr(token_major_v):
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
+                # s_barrier has no stable export. gpu.barrier adds a fence
+                # this waitcnt already ordered.
                 fx.rocdl.s_barrier()
             else:
                 gpu.barrier()
@@ -904,6 +1004,8 @@ def build_qsa_sparse_gqa_module(
                     store_amd_v4(a0, lo)
                     store_amd_v4(a1, hi)
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
+                # s_barrier has no stable export. gpu.barrier adds a fence
+                # this waitcnt already ordered.
                 fx.rocdl.s_barrier()
             elif const_expr(use_k32):
                 store_elem = (
@@ -911,7 +1013,12 @@ def build_qsa_sparse_gqa_module(
                     + chunk_owner * Int32(128)
                     + _idiv(col, Int32(32)) * Int32(32 * head_dim)
                 )
-                store_addr = Int32((store_elem + Int32(v_elem_off)) * Int32(2))
+                # Byte address of this lane's V slot. ptrtoint includes the
+                # kv symbol base; an offset from LDS 0 matches only while
+                # that symbol is placed at byte 0.
+                store_addr = Int32(
+                    fx.ptrtoint(k_arr.ptr + store_elem + Int32(v_elem_off))
+                )
                 for gc in range_constexpr(n_gather_chunks):
                     if const_expr(gc < v_pf_chunks):
                         base = gc * gather_chunk
@@ -1012,6 +1119,7 @@ def build_qsa_sparse_gqa_module(
             score_lives = []
             live_bits = Int64(0)
             if const_expr(decode_tr_pv):
+                # ballot has no stable export. The i64 result is the wave64 mask.
                 live_bits = Int64(fx.rocdl.ballot(Int64.ir_type, live))
             for ng in range_constexpr(n_subtiles):
                 sc = []
@@ -1029,14 +1137,14 @@ def build_qsa_sparse_gqa_module(
                     score = score_live.select(score, _neg_inf())
                     sc.append(score)
                     lives.append(score_live)
-                    tile_max = tile_max.maximumf(score)
+                    tile_max = fx.max(tile_max, score)
                 scores.append(sc)
                 score_lives.append(lives)
-            tile_peer = tile_max.shuffle_xor(Int32(32), Int32(64))
-            tile_max = tile_max.maximumf(tile_peer)
-            tile_peer = tile_max.shuffle_xor(Int32(16), Int32(64))
-            tile_max = tile_max.maximumf(tile_peer)
-            m_new = m_prev.maximumf(tile_max)
+            tile_peer = fx.gpu.shuffle_xor(tile_max, 32, 64)
+            tile_max = fx.max(tile_max, tile_peer)
+            tile_peer = fx.gpu.shuffle_xor(tile_max, 16, 64)
+            tile_max = fx.max(tile_max, tile_peer)
+            m_new = fx.max(m_prev, tile_max)
             alpha = _exp2(m_prev - m_new)
             # No mass yet: -inf - -inf is NaN, and a zero denominator has
             # nothing to carry. A finite max with a positive denominator
@@ -1060,6 +1168,8 @@ def build_qsa_sparse_gqa_module(
                 if const_expr(decode_tr_pv):
                     # Pack P as the MFMA-B fragment directly. Building four
                     # scalar bf16 elements made LLVM add two v_perm ops.
+                    # cvt_pk_bf16_f32 has no stable export; cvt_sr_f32_to_bf16
+                    # converts one value.
                     p_lo = fx.rocdl.cvt_pk_bf16_f32(probs[0], probs[1])
                     p_hi = fx.rocdl.cvt_pk_bf16_f32(probs[2], probs[3])
                     p_vecs.append(
@@ -1069,9 +1179,9 @@ def build_qsa_sparse_gqa_module(
                     )
                 else:
                     p_vecs.append(fx.Vector.from_elements(probs, BFloat16))
-            p_peer = p_sum.shuffle_xor(Int32(32), Int32(64))
+            p_peer = fx.gpu.shuffle_xor(p_sum, 32, 64)
             p_sum = p_sum + p_peer
-            p_peer = p_sum.shuffle_xor(Int32(16), Int32(64))
+            p_peer = fx.gpu.shuffle_xor(p_sum, 16, 64)
             p_sum = p_sum + p_peer
             l_new = l_prev * alpha + p_sum
             h0 = lane_kg * Int32(4)
@@ -1089,6 +1199,19 @@ def build_qsa_sparse_gqa_module(
                     Float32,
                 )
             next_acc = []
+            # D=128 decode miscompiles the first unrolled 16x16x16 PV MFMA:
+            # that chunk is NaN or about 1e36 and every later chunk matches.
+            # One unused MFMA occupies the bad slot. Decode never reads this
+            # scratch; the store only keeps the call from being deleted.
+            if const_expr(decode_tr_pv and head_dim == 128):
+                junk = pv_mfma(
+                    fx.Vector.filled(4, 0.0, BFloat16),
+                    p_vecs[0],
+                    fx.Vector(state[0]) * alpha4,
+                )
+                storage.partial.view(fx.make_layout(num_waves, 1))[wave] = junk[
+                    0
+                ].bitcast(Int32)
             for c in range_constexpr(out_chunks):
                 d = wave * Int32(head_dim // num_waves) + Int32(c * 16) + lane_m
                 acc4 = fx.Vector(state[c]) * alpha4
@@ -1248,10 +1371,10 @@ def build_qsa_sparse_gqa_module(
         partial_lse: fx.Tensor,
         out: fx.Tensor,
     ):
-        row = Int32(gpu.block_id("x"))
-        head = Int32(gpu.block_id("y"))
-        d_slice = Int32(gpu.block_id("z"))
-        lane = Int32(gpu.thread_id("x"))
+        row = fx.block_idx.x
+        head = fx.block_idx.y
+        d_slice = fx.block_idx.z
+        lane = fx.thread_idx.x
         zero_f = Float32(0.0)
         # The wave reduces the LSEs, so past 64 splits a lane owns several.
         lses = []
@@ -1264,9 +1387,9 @@ def build_qsa_sparse_gqa_module(
         lse_max = lses[0]
         for j in range_constexpr(merge_per_lane):
             if const_expr(j > 0):
-                lse_max = lse_max.maximumf(lses[j])
+                lse_max = fx.max(lse_max, lses[j])
         for sh in (32, 16, 8, 4, 2, 1):
-            lse_max = lse_max.maximumf(lse_max.shuffle_xor(Int32(sh), Int32(64)))
+            lse_max = fx.max(lse_max, fx.gpu.shuffle_xor(lse_max, sh, 64))
 
         merge_storage = fx.SharedAllocator().allocate(MergeStorage).peek()
         weights = merge_storage.weights.view(fx.make_layout(merge_slots, 1))
@@ -1277,7 +1400,7 @@ def build_qsa_sparse_gqa_module(
             weights[lane + Int32(j * 64)] = w
             den = den + w
         for sh in (32, 16, 8, 4, 2, 1):
-            den = den + den.shuffle_xor(Int32(sh), Int32(64))
+            den = den + fx.gpu.shuffle_xor(den, sh, 64)
         gpu.barrier()
 
         if lane < Int32(merge_slice):
