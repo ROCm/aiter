@@ -74,6 +74,7 @@ _RESIDENT_WGS_PER_CU = {
 
 # Cache-policy bits of the gfx94x/gfx950 buffer intrinsics (LLVM CPol).
 _CPOL_SC0 = 1
+_CPOL_NT = 2
 _CPOL_SC1 = 16
 
 
@@ -294,9 +295,14 @@ def _store_v4i32_nt_global(addr_i64, data):
 
 
 def _load_i32_nt(rsrc, elem_off):
+    """NT load: misses the CU cache.
+
+    A persistent block re-reads the same inbox slot every tile, so a load
+    that may hit the CU cache can return the previous tile's packet.
+    """
     return fx.Int32(
         buffer_ops.buffer_load(
-            rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=4  # NT
+            rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=_CPOL_NT
         )
     )
 
