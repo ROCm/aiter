@@ -3,88 +3,49 @@
 
 """Dispatch layer for jagged_dense_bmm_broadcast_add.
 
-Resolves per-shape kernel config from ``jagged_dense_bmm_dispatch.json``
-(explicit override -> table winner -> defaults) and routes uniform vs skew
-launches. Tuning rationale and benchmark notes live in the JSON; skew XCD
-remap is gated in ``_skew_compact_xcd``.
+Resolves per-shape kernel config from the live arch's section of
+``jagged_dense_bmm_dispatch.json`` (explicit override -> table winner ->
+kernel defaults) and routes uniform vs skew launches.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from pathlib import Path
 
 import torch
-from flydsl.runtime.device import get_rocm_arch
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.jagged_dense_bmm_gen import jagged_dense_bmm
 
-__all__ = [
-    "jagged_dense_bmm_dispatched",
-    "resolve_config",
-    "shape_id",
-]
+__all__ = ["jagged_dense_bmm_dispatched"]
 
-_DISPATCH_TABLE: dict | None = None
-_DISPATCH_CACHE: dict[tuple, dict] = {}
+SUPPORTED_ARCHS = ("gfx942",)
 
 SKEW_COMPACT_XCD_C = 32
 SKEW_COMPACT_XCD_W = 8
+_SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
 
-_SCHEMA_DEFAULTS = {
-    "xcd_c": None,
-    "xcd_w": None,
-    "block_k": None,
-    "threads": None,
-}
+_CFG_KEYS = ("xcd_c", "xcd_w", "block_k", "threads")
 
 
-def _dispatch_json_paths() -> tuple[Path, ...]:
+def _dispatch_json_path() -> Path:
     env = os.environ.get("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON")
     if env:
-        return (Path(env),)
-    return (Path(__file__).resolve().parent / "jagged_dense_bmm_dispatch.json",)
+        return Path(env)
+    return Path(__file__).resolve().parent / "jagged_dense_bmm_dispatch.json"
 
 
-def _detect_arch() -> str | None:
-    env = os.environ.get("FLYDSL_JAGGED_DENSE_BMM_ARCH")
-    if env:
-        return env
-    return get_rocm_arch()
-
-
-def _select_arch_section(data: dict, arch: str | None) -> dict:
-    by_arch = data.get("by_arch")
-    if not isinstance(by_arch, dict):
-        return data  # legacy flat schema (e.g. an env-var override file)
-    if arch and arch in by_arch:
-        return by_arch[arch]
-    if arch:
-        for sect in by_arch.values():
-            if sect.get("gfx") == arch:
-                return sect
-    if len(by_arch) == 1:
-        return next(iter(by_arch.values()))
-    return {}
-
-
-def _load_dispatch_table() -> dict:
-    global _DISPATCH_TABLE
-    if _DISPATCH_TABLE is not None:
-        return _DISPATCH_TABLE
-    arch = _detect_arch()
-    for path in _dispatch_json_paths():
-        if path.is_file():
-            data = json.loads(path.read_text())
-            section = _select_arch_section(data, arch)
-            _DISPATCH_TABLE = {
-                "gfx": section.get("gfx"),
-                "winners": dict(section.get("winners") or {}),
-            }
-            return _DISPATCH_TABLE
-    _DISPATCH_TABLE = {"gfx": None, "winners": {}}
-    return _DISPATCH_TABLE
+@functools.cache
+def _load_winners(arch: str) -> dict:
+    path = _dispatch_json_path()
+    if not path.is_file():
+        return {}
+    section = json.loads(path.read_text()).get("by_arch", {}).get(arch, {})
+    return dict(section.get("winners") or {})
 
 
 def shape_id(
@@ -93,40 +54,20 @@ def shape_id(
     return f"B{n_groups}D{reduction_k}K{output_n}N{max_seq_len}"
 
 
-def _coerce(v):
-    if v is None:
-        return None
-    return int(v)
-
-
-_SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
-
-
 def _skew_compact_xcd(n_groups: int, reduction_k: int) -> tuple[int | None, int | None]:
     if n_groups > _SKEW_XCD_REMAP_SMALL_B_THRESHOLD or reduction_k >= 512:
         return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
     return None, None
 
 
-def _normalize_cfg(cfg: dict) -> dict:
-    return {
-        key: _coerce(cfg.get(key, default)) for key, default in _SCHEMA_DEFAULTS.items()
-    }
-
-
 def _config_valid(cfg: dict, *, reduction_k: int) -> bool:
-    bk = cfg.get("block_k")
-    if bk is None:
-        bk = 64
-    return not (reduction_k % bk != 0 or reduction_k // bk < 2)
-
-
-def _heuristic_dispatch() -> dict:
-    return _normalize_cfg({})
+    bk = cfg["block_k"] or 64
+    return reduction_k % bk == 0 and reduction_k // bk >= 2
 
 
 def resolve_config(
     *,
+    arch: str,
     n_groups: int,
     reduction_k: int,
     output_n: int,
@@ -135,46 +76,56 @@ def resolve_config(
     xcd_w: int | None = None,
     block_k: int | None = None,
 ) -> dict:
-    key = (
-        n_groups,
-        reduction_k,
-        output_n,
-        max_seq_len,
-        xcd_c,
-        xcd_w,
-        block_k,
-    )
-    cached = _DISPATCH_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    explicit = {
-        "xcd_c": xcd_c,
-        "xcd_w": xcd_w,
-        "block_k": block_k,
-    }
-
-    table = _load_dispatch_table()
     sid = shape_id(
         n_groups=n_groups,
         reduction_k=reduction_k,
         output_n=output_n,
         max_seq_len=max_seq_len,
     )
-    entry = table["winners"].get(sid)
-    if entry is not None:
-        cfg = _normalize_cfg(entry)
-        if not _config_valid(cfg, reduction_k=reduction_k):
-            cfg = _heuristic_dispatch()
-    else:
-        cfg = _heuristic_dispatch()
-
-    for k, v in explicit.items():
+    entry = _load_winners(arch).get(sid) or {}
+    cfg = {k: None if entry.get(k) is None else int(entry[k]) for k in _CFG_KEYS}
+    if not _config_valid(cfg, reduction_k=reduction_k):
+        cfg = dict.fromkeys(_CFG_KEYS)
+    for k, v in (("xcd_c", xcd_c), ("xcd_w", xcd_w), ("block_k", block_k)):
         if v is not None:
             cfg[k] = int(v)
-
-    _DISPATCH_CACHE[key] = cfg
     return cfg
+
+
+def _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups: int) -> tuple[int, int]:
+    tensors = {"C": C, "A": A, "B": B, "BIAS": BIAS, "SEQ_OFFSETS": SEQ_OFFSETS}
+    for name, t in tensors.items():
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(t).__name__}")
+        if t.device != A.device or t.device.type != "cuda":
+            raise ValueError(f"{name} must be on A's GPU device {A.device}")
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    for name in ("C", "A", "B", "BIAS"):
+        if tensors[name].dtype != torch.bfloat16:
+            raise TypeError(f"{name} must be bfloat16, got {tensors[name].dtype}")
+    if SEQ_OFFSETS.dtype != torch.int32:
+        raise TypeError(f"SEQ_OFFSETS must be int32, got {SEQ_OFFSETS.dtype}")
+    if n_groups < 1:
+        raise ValueError(f"n_groups must be >= 1, got {n_groups}")
+    if A.dim() != 2 or B.dim() != 2 or C.dim() != 2:
+        raise ValueError("A, B and C must be 2-D")
+    if B.shape[0] % n_groups:
+        raise ValueError(
+            f"B rows {B.shape[0]} are not a multiple of n_groups={n_groups}"
+        )
+    N, K = B.shape[0] // n_groups, B.shape[1]
+    if A.shape[1] != K:
+        raise ValueError(f"A has K={A.shape[1]}, B has K={K}")
+    if tuple(C.shape) != (A.shape[0], N):
+        raise ValueError(f"C must be {(A.shape[0], N)}, got {tuple(C.shape)}")
+    if tuple(BIAS.shape) != (n_groups * N,):
+        raise ValueError(f"BIAS must be {(n_groups * N,)}, got {tuple(BIAS.shape)}")
+    if tuple(SEQ_OFFSETS.shape) != (n_groups + 1,):
+        raise ValueError(
+            f"SEQ_OFFSETS must be {(n_groups + 1,)}, got {tuple(SEQ_OFFSETS.shape)}"
+        )
+    return N, K
 
 
 def jagged_dense_bmm_dispatched(
@@ -187,14 +138,44 @@ def jagged_dense_bmm_dispatched(
     max_seq_len: int,
     stream=None,
     uniform_seqlen: bool = True,
-    # explicit overrides (None -> dispatch table / heuristic / kernel default)
     xcd_c: int | None = None,
     xcd_w: int | None = None,
     block_k: int | None = None,
 ):
-    output_n = B.shape[0] // n_groups
-    reduction_k = B.shape[1]
+    """``C[s:e] = A[s:e] @ dense[b] + bias[b]`` for each group ``b`` in place.
+
+    Args:
+        C: ``(L, N)`` bf16 output. Rows of a group are all written; rows past
+            ``SEQ_OFFSETS[-1]`` in an over-allocated ``C`` are left untouched.
+        A: ``(L, K)`` bf16 packed jagged rows. ``L = A.shape[0]`` may exceed
+            ``SEQ_OFFSETS[-1]``; extra rows are not read.
+        B: ``(n_groups * N, K)`` bf16 dense weights, one ``N x K`` panel per
+            group, i.e. ``dense.transpose(1, 2).reshape(-1, K)`` of a
+            ``(n_groups, K, N)`` tensor.
+        BIAS: ``(n_groups * N,)`` bf16.
+        SEQ_OFFSETS: ``(n_groups + 1,)`` int32 prefix sum of group lengths,
+            read on the device only.
+        max_seq_len: Uniform path: must be >= the longest group, which is
+            not checked; rows past it are not computed. Skew path: only a
+            tuning-table key.
+        stream: Defaults to the current torch stream. The op makes one launch
+            on it, so it is safe under graph capture.
+        uniform_seqlen: True selects the dense ``(group, M-tile, N-tile)``
+            grid; False the compact grid that skips empty tiles.
+        xcd_c, xcd_w, block_k: Override the tuned config.
+
+    Eager-only: no FakeTensor or ``torch.compile`` registration.
+    """
+    arch = get_gfx_runtime()
+    if arch not in SUPPORTED_ARCHS:
+        raise RuntimeError(f"jagged_dense_bmm supports {SUPPORTED_ARCHS}, not {arch}")
+    output_n, reduction_k = _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups)
+    if A.shape[0] == 0:
+        return
+    if uniform_seqlen and max_seq_len < 1:
+        raise ValueError(f"max_seq_len must be >= 1, got {max_seq_len}")
     cfg = resolve_config(
+        arch=arch,
         n_groups=n_groups,
         reduction_k=reduction_k,
         output_n=output_n,
@@ -203,9 +184,8 @@ def jagged_dense_bmm_dispatched(
         xcd_w=xcd_w,
         block_k=block_k,
     )
-
     if stream is None:
-        stream = torch.cuda.current_stream(SEQ_OFFSETS.device)
+        stream = torch.cuda.current_stream(A.device)
 
     if not uniform_seqlen:
         sc_xcd_c, sc_xcd_w = _skew_compact_xcd(n_groups, reduction_k)
@@ -218,10 +198,10 @@ def jagged_dense_bmm_dispatched(
             n_groups,
             max_seq_len,
             stream=stream,
-            xcd_c=sc_xcd_c,
-            xcd_w=sc_xcd_w,
+            xcd_c=sc_xcd_c if xcd_c is None else xcd_c,
+            xcd_w=sc_xcd_w if xcd_w is None else xcd_w,
             uniform_seqlen=False,
-            block_k=cfg.get("block_k"),
+            block_k=cfg["block_k"],
         )
 
     return jagged_dense_bmm(
@@ -235,6 +215,6 @@ def jagged_dense_bmm_dispatched(
         stream=stream,
         xcd_c=cfg["xcd_c"],
         xcd_w=cfg["xcd_w"],
-        block_k=cfg.get("block_k"),
-        threads=_coerce(cfg.get("threads")),
+        block_k=cfg["block_k"],
+        threads=cfg["threads"],
     )
