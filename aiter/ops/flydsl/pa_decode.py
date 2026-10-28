@@ -132,15 +132,15 @@ def launch_pa_decode_ps_reduce(
             groups *= 2
     if dual:
         # Partition groups fill the CTA while the grid stays within 16 waves
-        # per CU. D128 sequences averaging at most 32 partitions keep one.
+        # per CU. D128 sequences averaging at most 32 partitions keep one, or
+        # on gfx1250 the four that split their 32-partition rung.
         group_waves = head_size // wave // (2 if pairs else 1)
         budget = max_cta_waves * props.multi_processor_count
-        if head_size != 128 or exp_sums.shape[1] > DUAL_REGISTER_PARTITIONS * batch:
-            while (
-                2 * groups * group_waves <= max_cta_waves
-                and 2 * groups * group_waves * ctas <= budget
-            ):
-                groups *= 2
+        max_groups = max_cta_waves // group_waves
+        if head_size == 128 and exp_sums.shape[1] <= DUAL_REGISTER_PARTITIONS * batch:
+            max_groups = SPLIT_GROUPS if arch == "gfx1250" else 1
+        while 2 * groups <= max_groups and 2 * groups * group_waves * ctas <= budget:
+            groups *= 2
         per_seq = rows * kv_heads
         if (
             arch != "gfx1250"
