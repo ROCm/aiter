@@ -12,7 +12,6 @@ from .gemm1 import compile_moe_gemm1
 from .gemm2 import compile_moe_gemm2
 from .moe_reduce import (
     compile_moe_reduction,
-    invert_sorted_ids,
     sorted_sum,
 )
 from .quant import flydsl_absmax, flydsl_quant_per_tensor
@@ -24,6 +23,5 @@ __all__ = [
     "compile_moe_reduction",
     "flydsl_absmax",
     "flydsl_quant_per_tensor",
-    "invert_sorted_ids",
     "sorted_sum",
 ]

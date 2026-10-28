@@ -11,13 +11,12 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
-    invert_sorted_ids,
     sorted_sum,
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.common import (
@@ -210,8 +209,7 @@ class Config:
         else:
             if problem.inter_dim not in (192, 256, 320, 384, 512, 640):
                 return (
-                    "8x1 paths require inter_dim in "
-                    "{192, 256, 320, 384, 512, 640}"
+                    "8x1 paths require inter_dim in " "{192, 256, 320, 384, 512, 640}"
                 )
             expected_block_m = 256 if self.down_path == "8x1" else 64
             if self.BLOCK_M != expected_block_m or gateup_block_m != 64:
@@ -688,9 +686,7 @@ def precompile_flydsl_moe(
             )
 
             metadata_capacity = (
-                batch * topk + experts * config.BLOCK_M - topk
-                + config.BLOCK_M
-                - 1
+                batch * topk + experts * config.BLOCK_M - topk + config.BLOCK_M - 1
             ) // config.BLOCK_M
             full_capacity, tail_capacity = task_capacities(
                 metadata_capacity,
@@ -708,16 +704,6 @@ def precompile_flydsl_moe(
             )
         compile_launcher(down, *down_args, 0)
 
-        invert = invert_sorted_ids(topk)
-        compile_launcher(
-            invert._flydsl_executable,
-            _ptr(int32),
-            _ptr(int32),
-            _ptr(int32),
-            fx.Uint32(batch * topk),
-            fx.Uint32(batch),
-            0,
-        )
         reduction = sorted_sum(topk, model_dim, config.down_output_padding_bytes)
         compile_launcher(
             reduction._flydsl_executable,
@@ -843,7 +829,16 @@ def _run_prefill(
     situ_linear_beta: float,
 ):
     gateup_block_m = config.GATEUP_BLOCK_M or config.BLOCK_M
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+    # Opus also returns each route's sorted row; merged repeated expert IDs get -1.
+    (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        cur_out,
+        _,
+        loc_ids,
+    ) = moe_sorting(
         topk_ids,
         topk_weight,
         problem.experts,
@@ -853,6 +848,7 @@ def _run_prefill(
         None,
         None,
         0,
+        output_aux=AUX_SORT_OPUS,
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
@@ -931,16 +927,11 @@ def _run_prefill(
         if output_padding_bytes is not None
         else 0
     )
-    # Opus may coalesce duplicate expert IDs in zero-weight HIP padding rows.
-    # Their omitted route slots are not written by invert_sorted_ids. Map those
-    # slots to a dedicated zero row instead of dereferencing uninitialized IDs.
-    zero_route_row = sorted_expert_ids.shape[0] * config.BLOCK_M
     gemm2_out = torch.empty(
-        [zero_route_row + 1, output_row_size],
+        [sorted_expert_ids.shape[0] * config.BLOCK_M, output_row_size],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    gemm2_out[zero_route_row].zero_()
     down_tile_n = {
         "default": 128,
         "1x4_64x256": 256,
@@ -1000,19 +991,6 @@ def _run_prefill(
     else:
         _launch(down_kernel, *down_args)
 
-    loc_ids = torch.full(
-        [problem.batch, problem.topk],
-        zero_route_row,
-        dtype=torch.int32,
-        device=hidden_states.device,
-    )
-    invert_sorted_ids(problem.topk)(
-        sorted_ids,
-        loc_ids,
-        num_valid_ids,
-        sorted_ids.shape[0],
-        problem.batch,
-    )
     sorted_sum(problem.topk, problem.model_dim, output_padding_bytes)(
         loc_ids, gemm2_out, cur_out, problem.batch
     )

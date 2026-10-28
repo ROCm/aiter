@@ -79,6 +79,8 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 #     tuned-CSV rows routed to the port (exactly the codegen'd shapes).
 #   opus / ck -> never use adaptive (legacy; ck still needs AITER_USE_CK_MOE_SORTING)
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
+# Request Opus auxiliary maps without entering the shape-specific adaptive sort.
+AUX_SORT_OPUS = "opus"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
@@ -197,7 +199,11 @@ def _moe_sorting_impl(
     device = topk_ids.device
     M, topk = topk_ids.shape
 
-    if output_aux and _MOE_SORT_BACKEND not in ("opus", "ck"):
+    if (
+        output_aux
+        and output_aux != AUX_SORT_OPUS
+        and _MOE_SORT_BACKEND not in ("opus", "ck")
+    ):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
         return _adaptive_moe_sort(
@@ -239,7 +245,10 @@ def _moe_sorting_impl(
     aux_reverse_sorted = None
     if output_aux:
         use_opus = True
-        dispatch_policy = 1
+        # Opus aux callers keep their policy, including auto/multi-phase prefill.
+        # Boolean aux callers retain the legacy single-kernel path.
+        if output_aux != AUX_SORT_OPUS:
+            dispatch_policy = 1
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
         )
