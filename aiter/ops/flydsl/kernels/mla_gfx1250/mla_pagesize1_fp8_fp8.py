@@ -1236,13 +1236,20 @@ def launch_mla_pagesize1_fp8_fp8(
                         )
                     )
 
+            # The metadata planner deliberately emits one work item for a
+            # zero-length KV row. Do not issue TDM gathers for such an item:
+            # every row index would be the one-past-end `num_pages` sentinel,
+            # and an all-OOB gather can fault on gfx1250.
+            has_tokens = kv_start < kv_end
             if const_expr(q_operands is None):
                 page_indices = load_prologue_page_indices(kv_start, kv_end)
-                issue_prologue(page_indices, [0])
+                if has_tokens:
+                    issue_prologue(page_indices, [0])
                 q_operands = load_q(work_info)
-                issue_prologue(page_indices, range(1, KV_PROLOGUE_TILES))
+                if has_tokens:
+                    issue_prologue(page_indices, range(1, KV_PROLOGUE_TILES))
             else:
-                if issue_tiles:
+                if issue_tiles & has_tokens:
                     issue_prologue(
                         load_prologue_page_indices(kv_start, kv_end),
                         range(KV_PROLOGUE_TILES),
