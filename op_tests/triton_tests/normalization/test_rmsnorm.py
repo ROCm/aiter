@@ -397,12 +397,12 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
     B_T = B * T
     # Use integers to ensure consistent results across layouts,
     # avoiding discrepancies in floating-point reductions with varying data layouts
-    x = torch.floor(torch.distributions.Uniform(-3, 3).sample((B_T, D))).to(
-        dtype=dtype, device="cuda"
-    )
-    w = torch.floor(torch.distributions.Uniform(-3, 3).sample((D,))).to(
-        dtype=dtype, device="cuda"
-    )
+    x = torch.floor(
+        torch.empty((B_T, D), device="cuda", dtype=torch.float32).uniform_(-3, 3)
+    ).to(dtype)
+    w = torch.floor(
+        torch.empty((D,), device="cuda", dtype=torch.float32).uniform_(-3, 3)
+    ).to(dtype)
 
     EPS = 1e-6
     quant_dtype = torch.float8_e4m3fnuz

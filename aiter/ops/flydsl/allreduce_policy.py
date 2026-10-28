@@ -504,8 +504,8 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx950",
         link="xgmi",
         world_size=2,
-        oneshot=Window(0, 3 * MiB),
-        mesh=Window(448 * KiB, None),
+        oneshot=Window(0, 64 * MiB),
+        mesh=Window(512 * KiB, None),
         ring=None,
     ),
     FamilyPolicy(
@@ -513,7 +513,7 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="xgmi",
         world_size=4,
         oneshot=Window(0, 160 * KiB),
-        mesh=Window(960 * KiB, None),
+        mesh=Window(384 * KiB, None),
         ring=None,
     ),
     FamilyPolicy(
@@ -521,7 +521,7 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="xgmi",
         world_size=8,
         oneshot=Window(0, 96 * KiB),
-        mesh=Window(1600 * KiB, None),
+        mesh=Window(384 * KiB, None),
         ring=None,
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
@@ -599,6 +599,9 @@ _POLICY_BY_KEY = _index(FAMILY_POLICIES)
 #                               covers in one round, then the 4 KiB tile.
 #     TP4  atoms=1 cap128 b256 -- one rung over the whole window
 #     TP8  atoms=1 cap128 b128 -- one rung over the whole window
+#
+#     The numbers above are gfx942. On gfx950 the rung is atoms=1 cap128 and
+#     one rung over the whole window: b256 for TP2, b128 for TP4 and TP8.
 ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (
@@ -614,15 +617,11 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
         OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
     ("gfx950", "xgmi", 2): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
-        OneShotRung(
-            min_bytes=256 * KiB, atoms=1, grid_cap=128, fanout="peer", block=256
-        ),
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
     ),
     ("gfx950", "xgmi", 4): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
     ),
     ("gfx950", "xgmi", 8): (
         OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
@@ -649,6 +648,8 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 #
 #   xGMI  ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
 #         Block 512 from 4 MiB.
+#         gfx950: ST=8 b256, then b512 from 4 MiB for TP4 (ST=1) and TP8 (ST=8).
+#         TP2 stays on one rung.
 #   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
 #         TP8 ST=8 everywhere.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
@@ -667,19 +668,16 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
         TwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128, block=512),
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
     ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
     ),
     ("gfx950", "xgmi", 4): (
         TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
         TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
     ),
     ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
-        TwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=4 * MiB, super_tile=8, grid_cap=128, block=512),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (

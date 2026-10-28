@@ -73,6 +73,7 @@ from .kernels.comm.quick_allreduce_fusions import (
     quick_reduce_row_block_options,
 )
 from .kernels.comm.quick_allreduce_mesh import (
+    DEFAULT_DIVISOR,
     clamp_grid_cap,
     make_quick_allreduce_mesh_kernel,
     mesh_fanout_fits,
@@ -88,6 +89,28 @@ from .kernels.comm.transport import (
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")
+
+# The sum is restored in fp16 before the bf16 store, by scaling each group's
+# dequant scale (at least 2**-10) by the divisor; restored values reach
+# 480 * divisor. Both must stay normal fp16: 2**-10 * divisor >= 2**-14 and
+# 480 * divisor < 65504.
+DIVISOR_MIN = 2.0**-4
+DIVISOR_MAX = 128.0
+
+
+def _check_divisor(divisor: float) -> float:
+    """One shared positive divisor. ``1`` disables the scaling."""
+    msg = (
+        f"FlyQuickAllReduce divisor must be a finite float in "
+        f"[{DIVISOR_MIN:g}, {DIVISOR_MAX:g}], got {divisor!r}"
+    )
+    try:
+        value = float(divisor)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(msg) from exc
+    if not math.isfinite(value) or not DIVISOR_MIN <= value <= DIVISOR_MAX:
+        raise ValueError(msg)
+    return value
 
 
 @dataclass(frozen=True)
@@ -106,6 +129,8 @@ class _Algorithm:
     # ``(block, world_size, codec) -> bool``: whether a fused row-sized block
     # can build; None when every row geometry can.
     fused_block_ok: Callable[[int, int, str], bool] | None = None
+    # Whether the plain kernel takes the shared ``divisor`` as its last argument.
+    has_divisor: bool = False
 
 
 def _build_mesh(
@@ -155,6 +180,7 @@ ALGORITHMS = {
         st_ladder=mesh_st_ladder,
         fused_st_ladder=fused_mesh_st_ladder,
         fused_block_ok=mesh_fanout_fits,
+        has_divisor=True,
     ),
     "ring": _Algorithm(
         name="ring",
@@ -460,7 +486,15 @@ class FlyQuickAllReduce:
         return max(1, min(num_tiles, grid))
 
     def _launch_args(
-        self, eng: _StEngine, inp_ptr, out_ptr, stream, *, live_bytes, num_tiles
+        self,
+        eng: _StEngine,
+        inp_ptr,
+        out_ptr,
+        stream,
+        *,
+        live_bytes,
+        num_tiles,
+        divisor: float = DEFAULT_DIVISOR,
     ):
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
@@ -475,10 +509,20 @@ class FlyQuickAllReduce:
             Int64(int(eng._gpu_peer_ptrs)),
             Int64(int(eng._colors)),
             Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
+            *((Float32(divisor),) if self._algo.has_divisor else ()),
             stream,
         )
 
-    def _launch_eng(self, eng: _StEngine, inp, out, stream, *, live_bytes: int) -> None:
+    def _launch_eng(
+        self,
+        eng: _StEngine,
+        inp,
+        out,
+        stream,
+        *,
+        live_bytes: int,
+        divisor: float = DEFAULT_DIVISOR,
+    ) -> None:
         num_tiles = max(1, (live_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
         args = self._launch_args(
             eng,
@@ -487,6 +531,7 @@ class FlyQuickAllReduce:
             stream,
             live_bytes=live_bytes,
             num_tiles=num_tiles,
+            divisor=divisor,
         )
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
@@ -556,11 +601,30 @@ class FlyQuickAllReduce:
         """
         return int(nbytes) >= self.min_bytes
 
-    def allreduce(self, inp, out, stream=None):
+    def _check_divisor_supported(self, divisor: float) -> None:
+        """A divisor other than 1 needs the mesh schedule's INT4 wire format."""
+        if divisor != DEFAULT_DIVISOR and (
+            not self._algo.has_divisor or "int4" not in (self.rs_codec, self.ag_codec)
+        ):
+            raise ValueError(
+                "FlyQuickAllReduce divisor is only supported by the mesh "
+                f"algorithm with the int4 codec, got algorithm={self.algorithm!r}, "
+                f"rs_codec={self.rs_codec!r}, ag_codec={self.ag_codec!r}"
+            )
+
+    def allreduce(self, inp, out, stream=None, divisor: float = DEFAULT_DIVISOR):
         """Two-shot INT4 all-reduce into ``out``.
 
         ``stream=None`` uses the current PyTorch stream on this device.
+        ``divisor`` defaults to 1, which keeps the previous INT4 result.
+        Loaded values are divided by it before the first pack, and the
+        finished sum is multiplied by it once. Every rank must pass the same
+        divisor; this is not checked, and a mismatch silently gives each rank
+        a different result. Only the mesh schedule with the INT4 codec takes
+        a divisor other than 1.
         """
+        divisor = _check_divisor(divisor)
+        self._check_divisor_supported(divisor)
         live_bytes = check_payload(
             inp, out, device_index=self._device_index, owner="FlyQuickAllReduce"
         )
@@ -574,7 +638,14 @@ class FlyQuickAllReduce:
                 "to override."
             )
         cfg, _num_tiles = self._pick_cfg(live_bytes)
-        self._launch_eng(self._by_cfg[cfg], inp, out, stream, live_bytes=live_bytes)
+        self._launch_eng(
+            self._by_cfg[cfg],
+            inp,
+            out,
+            stream,
+            live_bytes=live_bytes,
+            divisor=divisor,
+        )
 
 
 class FlyQuickAllReduceRMSNorm:

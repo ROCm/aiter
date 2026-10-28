@@ -22,6 +22,9 @@ sweep ends in a markdown table:
   every kernel the engine's own ``cfgs_for`` says the window selects.
 * ``test_quick_allreduce_int4_edge_inputs`` -- payloads that land on the E4M3
   scale's edge cases, and degenerate groups that must stay finite.
+* ``test_quick_allreduce_int4_divisor`` -- the mesh's shared divisor at TP8: an
+  outlier fill that clips the E4M3 scale at divisor 1 must recover SQNR at
+  divisor 8, and a small-magnitude fill must keep full SQNR at the default.
 * ``test_quick_allreduce_transport`` -- the ``fp16`` wire format, a lossless
   passthrough, on an exactly representable input: the result must be
   bit-identical to the fp32 reference, which separates a chunk-addressing or
@@ -65,7 +68,7 @@ runs both unless one is named. Its ``test_quick_allreduce_rmsnorm_*`` sweeps
 end in one table each. ``test_quick_allreduce_rmsnorm_shipped`` runs every
 shipped instance on the shipping engine: the shapes come from the ladder file
 and the payload regime from the fused dispatch policy (the schedule's window).
-A retuned ladder is covered without editing the test. Each shape is graded on 
+A retuned ladder is covered without editing the test. Each shape is graded on
 SQNR against an fp32 oracle. The transport is guarded by the
 bit-exactness of ``residual_out`` on the lossless wire (native, padded-width
 and pinned-super-tile geometries), a run-ahead and graph-replay check, and
@@ -172,7 +175,10 @@ from aiter.ops.flydsl.allreduce_policy import (
     mesh_st_ladder,
     ring_st_ladder,
 )
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import clamp_grid_cap
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import (
+    DEFAULT_DIVISOR,
+    clamp_grid_cap,
+)
 from aiter.ops.flydsl.kernels.comm.transport import (
     ATOMS,
 )
@@ -272,6 +278,11 @@ LEGACY_SHAPES_PER_WORLD_SIZE = {
     2: [(512, 5120), (9216, 4096)],
 }
 
+# The divisor cases: ``outlier`` at this divisor against ``outlier`` at 1, and
+# the SQNR it must win back.
+OUTLIER_DIVISOR = 8.0
+DIVISOR_RECOVERY_DB = 3.0
+
 # (tp, algorithm, tokens, hidden, fill).
 EDGE_CASES = (
     (2, "mesh", 16, 1024, "pos_underflow"),
@@ -360,6 +371,8 @@ OPERATIONS = ("ar", "ar_rmsnorm")
 
 _FILLS = (
     "normal",
+    "outlier",
+    "small",
     "degenerate",
     "exact",
     "pos_underflow",
@@ -375,8 +388,9 @@ def _make_inp(
     """One rank's contribution, for whichever edge case *fill* names."""
     shape = (tokens, hidden)
     gen = torch.Generator().manual_seed(1234 + rank)
-    if fill == "normal":
-        src = torch.randn(shape, generator=gen, dtype=torch.float32) * 0.1
+    if fill in ("normal", "outlier", "small"):
+        std = {"normal": 0.1, "outlier": 100.0, "small": 0.005}[fill]
+        src = torch.randn(shape, generator=gen, dtype=torch.float32) * std
     elif fill == "degenerate":
         # Half the rows exactly zero, half far below the E4M3 magnitude floor
         # of 2^-7. Both drive the group extremum to (or under) zero, which is
@@ -836,7 +850,8 @@ def _run_rank(
 ) -> list[dict]:
     """One rank of one verify spawn: build the engine, then run every case.
 
-    A case is ``(tokens, hidden, fill, time_it)``. The engine is built once, so
+    A case is ``(tokens, hidden, fill, time_it)``, with an optional fifth
+    element: the ``divisor`` its all-reduces pass. The engine is built once, so
     every case shares its compiled binaries and IPC inbox. *timing* is
     ``(reps, rounds)`` for ``fab.time_graphs``. *window* is the payload range
     production dispatch routes to this engine, if any; every row then carries
@@ -859,7 +874,8 @@ def _run_rank(
 
     rows = []
     try:
-        for ntok, hidden, fill, time_it in cases:
+        for ntok, hidden, fill, time_it, *extra in cases:
+            divisor = extra[0] if extra else DEFAULT_DIVISOR
             if fill == "run_ahead":
                 rows.append(
                     {
@@ -879,7 +895,7 @@ def _run_rank(
             tile_bytes = _tile_bytes(cfg_used[1])
 
             out = torch.zeros_like(inp)
-            fly.allreduce(inp, out)
+            fly.allreduce(inp, out, divisor=divisor)
             torch.cuda.synchronize()
             dist.barrier(group=group)
             m = _metrics(out, ref, rank, tile_bytes, group)
@@ -888,7 +904,11 @@ def _run_rank(
             if time_it:
                 # The IPC inbox is allocated at init, so the captured launch is
                 # safe to replay.
-                g = fab.capture(lambda src=inp, dst=out: fly.allreduce(src, dst))
+                g = fab.capture(
+                    lambda src=inp, dst=out, div=divisor: fly.allreduce(
+                        src, dst, divisor=div
+                    )
+                )
                 for _ in range(GRAPH_REPLAYS):
                     out.zero_()
                     g.replay()
@@ -1161,7 +1181,7 @@ def _spawn(target, world_size: int, **kwds) -> list:
 # Rows are registered up front, grouped by the engine they need, so that each
 # engine is built by exactly one spawn however many tables read from it.
 # A spawn key is ``(tp, sorted engine kwargs)``; a case is
-# ``(tokens, hidden, fill, time_it)``, or ``(tokens, hidden)`` in a bench
+# ``(tokens, hidden, fill, time_it[, divisor])``, or ``(tokens, hidden)`` in a bench
 # spawn, whose key also names its schedules.
 _CASES: dict[tuple, list[tuple]] = {}
 # Production dispatch window of a shipping engine whose kernel coverage is
@@ -1254,6 +1274,7 @@ def _check_sqnr(
     floor: float,
     expected_st: int | None,
     algorithm: str,
+    check_close: bool = True,
 ) -> bool:
     fails = _identity_fails(rows, algorithm)
     for rank, row in enumerate(rows):
@@ -1269,7 +1290,7 @@ def _check_sqnr(
                 f"rank {rank}: min-tile SQNR {row['min_tile_sqnr_db']:.2f} dB "
                 f"< {TILE_SQNR_MIN_DB}"
             )
-        if row["err"] >= CLOSE_ERR_RATIO:
+        if check_close and row["err"] >= CLOSE_ERR_RATIO:
             fails.append(
                 f"rank {rank}: checkAllclose err {row['err']:.3f} >= {CLOSE_ERR_RATIO}"
             )
@@ -1468,6 +1489,48 @@ def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
         )
     ret = _summary(rows)
     ret["rel_mae"] = max(r["rel_mae"] for r in rows)
+    return ret
+
+
+@benchmark()
+def test_quick_allreduce_int4_divisor(tokens, hidden, tp, fill, divisor):
+    """The shared divisor on the shipping mesh engine; correctness only.
+
+    ``small`` at the default divisor must keep the plain INT4 accuracy. An
+    ``outlier`` fill clips the E4M3 scale at divisor 1, so the same input at
+    ``divisor`` must recover SQNR; it is the divisor's reason to exist.
+    """
+    key = _ship_key(tp, "mesh", None)
+    nbytes = tokens * hidden * 2
+    label = f"tp={tp} mesh {tokens}x{hidden} fill={fill} divisor={divisor:g}"
+    rows = _result(key, (tokens, hidden, fill, False, divisor))
+    ret = _summary(rows)
+    ret["divisor"] = divisor
+    ret["sqnr_vs_divisor1_db"] = None
+    if fill == "outlier":
+        base = _result(key, (tokens, hidden, fill, False, DEFAULT_DIVISOR))
+        ret["sqnr_vs_divisor1_db"] = ret["sqnr_db"] - min(r["sqnr_db"] for r in base)
+        if ret["sqnr_vs_divisor1_db"] < DIVISOR_RECOVERY_DB:
+            _check(
+                label,
+                [
+                    (
+                        f"SQNR {ret['sqnr_db']:.2f} dB is only "
+                        f"{ret['sqnr_vs_divisor1_db']:.2f} dB above divisor 1; "
+                        f"expected the E4M3 clip to be recovered by "
+                        f"{DIVISOR_RECOVERY_DB} dB"
+                    )
+                ],
+            )
+    # CLOSE_ATOL is calibrated to the 0.1-std fill, not to the outlier's 100.
+    _check_sqnr(
+        label,
+        rows,
+        floor=SQNR_MIN_DB,
+        expected_st=_shipping_st(rows, nbytes, "mesh", tp),
+        algorithm="mesh",
+        check_close=fill != "outlier",
+    )
     return ret
 
 
@@ -2154,7 +2217,9 @@ def _low_latency_hidden_ok(hidden: int, tp: int) -> bool:
 def _pinned_st_kw(super_tile: int) -> dict:
     # The low-latency build is ST=1 only. Where the ladder ships it (a mesh
     # width tuned to it), an ST>1 pin means the default build at that ST.
-    return {"super_tile": super_tile} | ({"low_latency": False} if super_tile > 1 else {})
+    return {"super_tile": super_tile} | (
+        {"low_latency": False} if super_tile > 1 else {}
+    )
 
 
 def _fused_sqnr_fails(rows: list[dict]) -> list[str]:
@@ -3063,6 +3128,23 @@ def _verify(args, tps, algos, dts, link) -> None:
     edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
     for tp, algorithm, tokens, hidden, fill in edge:
         _register(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
+    # The divisor on the mesh at TP8, on the payloads that reach every mesh
+    # kernel: the ST=1 and ST>1 epilogues handle our own chunk differently.
+    divisor = []
+    if (8, "mesh") in plans:
+        divisor = [
+            (n // _ROW_BYTES, HIDDEN, 8, fill, div)
+            for n in plans[(8, "mesh")][0]
+            for fill, div in (
+                ("small", DEFAULT_DIVISOR),
+                ("outlier", OUTLIER_DIVISOR),
+            )
+        ]
+    for tokens, hidden, tp, fill, div in divisor:
+        key = _ship_key(tp, "mesh", None)
+        _register(key, (tokens, hidden, fill, False, div))
+        if fill == "outlier":
+            _register(key, (tokens, hidden, fill, False, DEFAULT_DIVISOR))
     pinned = []
     if args.extended:
         pinned = [c for c in PINNED_CODEC_CASES if c[0] in tps and "ring" in algos]
@@ -3125,6 +3207,13 @@ def _verify(args, tps, algos, dts, link) -> None:
         [
             test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill)
             for tp, algorithm, tokens, hidden, fill in edge
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce INT4 divisor",
+        [
+            test_quick_allreduce_int4_divisor(tokens, hidden, tp, fill, div)
+            for tokens, hidden, tp, fill, div in divisor
         ],
     )
     _summarize(
