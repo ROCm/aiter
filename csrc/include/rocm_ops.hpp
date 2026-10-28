@@ -2584,7 +2584,8 @@ namespace py = pybind11;
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false,  \
           py::arg("gemma_norm") = false,     \
-          py::arg("scale_layout_m32k4") = false); \
+          py::arg("scale_layout_m32k4") = false, \
+          py::arg("round_before_quant") = false); \
     m.def("add_rmsnorm",                     \
           &aiter::add_rmsnorm,               \
           py::arg("out"),                    \

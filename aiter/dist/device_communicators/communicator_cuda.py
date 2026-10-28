@@ -523,6 +523,54 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 out, res_out, scale_out, bf16_out = result
             else:
                 out, res_out, scale_out = result
+        elif (
+            quant_type == "per_token"
+            and not emit_bf16
+            and ca_comm is not None
+            and not ca_comm.disabled
+            and not ca_comm.has_old_arch_fused_kernels
+            and (self.qr_comm is None or self.qr_comm.disabled)
+            and input_.dim() == 2
+            # Match the vectorized FP8 store alignment; tail rows keep
+            # the existing standalone quantizer.
+            and hidden_dim % 32 == 0
+            and total_bytes > 0
+            and input_.dtype in (torch.float16, torch.bfloat16)
+            and input_.is_contiguous()
+            and res_inp_.is_contiguous()
+            and res_inp_.shape == input_.shape
+            and res_inp_.dtype == input_.dtype
+            and res_inp_.device == input_.device
+            and weight_.is_contiguous()
+            and weight_.numel() == hidden_dim
+            and weight_.dtype == input_.dtype
+            and weight_.device == input_.device
+            and ca_comm.can_fuse_ar_rms(input_, hidden_dim, hidden_dim)
+            and not ca_comm.should_fuse_ar_rms(input_, hidden_dim, hidden_dim)
+            and ca_comm.should_custom_ar(input_, prefill_support)
+        ):
+            # Keep the LL all-reduce, but fuse its residual/norm and quant
+            # epilogue. Round to the input dtype before amax, just as the
+            # separate norm -> per-token quant path does.
+            from aiter import add_rmsnorm_quant
+
+            ar_out = self.all_reduce(input_, prefill_support=prefill_support)
+            out = torch.empty_like(ar_out, dtype=fp8)
+            res_out = torch.empty_like(res_inp_)
+            scale_out = torch.empty(
+                (*ar_out.shape[:-1], 1), dtype=torch.float32, device=ar_out.device
+            )
+            add_rmsnorm_quant(
+                out,
+                ar_out,
+                res_inp_,
+                res_out,
+                scale_out,
+                weight_,
+                eps,
+                gemma_norm=gemma_norm,
+                round_before_quant=True,
+            )
         else:
             out_, res_out = self.fused_allreduce_rmsnorm(
                 input_,

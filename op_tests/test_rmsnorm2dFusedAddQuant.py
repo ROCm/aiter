@@ -4,6 +4,7 @@
 # selection lists and FILE_TIMES bookkeeping that reference this path.
 
 import argparse
+import itertools
 from functools import partial
 
 import pandas as pd
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import QuantType, dtypes, get_gfx, get_torch_quant
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
@@ -290,6 +291,155 @@ def test_rmsnorm(
         )
 
     return ret
+
+
+@benchmark()
+def _round_before_quant_case(m, n, dtype, gemma, pattern):
+    """Match the T-rounded split path, not direct FP32 quantization."""
+    torch.manual_seed(2026)
+    x = torch.randn((m, n), dtype=dtype, device="cuda") * 0.2
+    residual = torch.randn_like(x)
+    weight = torch.randn(n, dtype=dtype, device="cuda") * 0.1
+    if pattern == "zero":
+        x.zero_()
+        residual.zero_()
+    elif pattern == "cancel":
+        residual = -x
+    elif pattern == "small":
+        x *= 1e-5
+        residual *= 1e-5
+    norm = torch.empty_like(x)
+    q = torch.empty_like(x, dtype=dtypes.fp8)
+    scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    res_out = torch.empty_like(x)
+
+    def split():
+        aiter.rmsnorm2d_fwd_with_add(norm, x, residual, res_out, weight, 1e-6, gemma)
+        aiter.dynamic_per_token_scaled_quant(q, norm, scale)
+
+    def fused():
+        aiter.add_rmsnorm_quant(
+            q,
+            x,
+            residual,
+            res_out,
+            scale,
+            weight,
+            1e-6,
+            gemma_norm=gemma,
+            round_before_quant=True,
+        )
+
+    split()
+    expected = [v.clone() for v in (q, scale, res_out)]
+    # Independent FP32 reference for norm and residual.
+    value = x.float() + residual.float()
+    ref = (
+        value
+        * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+        * (weight.float() + int(gemma))
+    ).to(dtype)
+    checkAllclose(ref.float(), norm.float(), rtol=1e-2, atol=1e-2, tol_err_ratio=0)
+    assert torch.equal(res_out, value.to(dtype))
+    ret = {"gfx": get_gfx()}
+    candidates = {"split": split, "fused": fused}
+    for name, fn in candidates.items():
+        fn()
+        for actual, want in zip((q, scale, res_out), expected):
+            assert torch.equal(actual.view(torch.uint8), want.view(torch.uint8))
+        err = checkAllclose(
+            expected[0].float() * expected[1],
+            q.float() * scale,
+            rtol=0,
+            atol=0,
+            tol_err_ratio=0,
+            msg=f"{name}: match split quant",
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn()
+        graph.replay()
+        _, us = run_perftest(graph.replay, num_iters=7, num_warmup=2, num_rotate_args=1)
+        for actual, want in zip((q, scale, res_out), expected):
+            assert torch.equal(actual.view(torch.uint8), want.view(torch.uint8))
+        # Logical local arithmetic and memory traffic; reduction overhead excluded.
+        flops = (10 + int(gemma)) * m * n + 2 * m
+        nbytes = (3 * m * n + n) * x.element_size() + m * n + 4 * m
+        if name == "split":
+            nbytes += 2 * m * n * x.element_size()
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def test_round_before_quant():
+    import pytest
+
+    if not torch.cuda.is_available() or get_gfx() != "gfx1250":
+        pytest.skip("requires gfx1250")
+    # 96 catches the standalone quantizer's non-floored narrow-row path.
+    rows = [
+        _round_before_quant_case(m, n, dtype, gemma, pattern)
+        for (m, n), dtype, gemma, pattern in itertools.product(
+            [
+                (3, 32),
+                (3, 64),
+                (3, 96),
+                (3, 128),
+                (3, 160),
+                (12, 512),
+                (12, 4096),
+                (12, 6144),
+                (33, 6176),
+                (33, 8192),
+            ],
+            [dtypes.bf16, dtypes.fp16],
+            [False, True],
+            ["random", "zero", "cancel", "small"],
+        )
+    ]
+    aiter.logger.info(
+        "round-before-quant summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
+def test_round_before_quant_rejects_unsupported():
+    import pytest
+
+    if not torch.cuda.is_available() or get_gfx() != "gfx1250":
+        pytest.skip("requires gfx1250")
+    # Rejected configurations are tested, not silently excluded from the sweep.
+    for n, out_dtype, group_size, shuffle, layout, scale_dtype in [
+        (0, dtypes.fp8, 0, False, False, torch.float32),
+        (128, dtypes.fp8, 0, False, False, torch.uint8),
+        (136, dtypes.fp8, 0, False, False, torch.float32),
+        (2056, dtypes.fp8, 0, False, False, torch.float32),
+        (8320, dtypes.fp8, 0, False, False, torch.float32),
+        (128, dtypes.i8, 0, False, False, torch.float32),
+        (128, dtypes.fp8, 32, False, False, torch.float32),
+        (128, dtypes.fp8, 0, True, False, torch.float32),
+        (128, dtypes.fp8, 32, False, True, torch.uint8),
+    ]:
+        x = torch.zeros((2, n), dtype=dtypes.bf16, device="cuda")
+        out = torch.empty_like(x, dtype=out_dtype)
+        scale = torch.empty((2, n), dtype=scale_dtype, device=x.device)
+        with pytest.raises(RuntimeError, match="round_before_quant requires"):
+            aiter.add_rmsnorm_quant(
+                out,
+                x,
+                x,
+                torch.empty_like(x),
+                scale,
+                torch.ones(n, dtype=x.dtype, device=x.device),
+                1e-6,
+                group_size=group_size,
+                shuffle_scale=shuffle,
+                scale_layout_m32k4=layout,
+                round_before_quant=True,
+            )
 
 
 if __name__ == "__main__":
