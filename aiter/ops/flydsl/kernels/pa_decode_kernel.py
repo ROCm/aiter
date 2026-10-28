@@ -114,8 +114,7 @@ def _pa_decode_tile_kernel_name(
         name += f"_qs{query_splits}"
     if direct_output:
         name += "_direct"
-    if context_partition_size != 256:
-        name += f"_cp{context_partition_size}"
+    name += f"_cp{context_partition_size}"
     return name
 
 
