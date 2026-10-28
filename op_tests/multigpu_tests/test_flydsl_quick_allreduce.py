@@ -1189,15 +1189,16 @@ def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
     group = tp_group.device_group
     comm = tp_group.device_communicator
     qr = comm.qr_comm
-    built = qr is not None and qr._fly_policy is not None
+    fly = None if qr is None else qr._fly_ar
+    built = fly is not None and fly.policy is not None
     res = {"built": built, "unloaded": [], "rows": []}
 
     try:
         if built:
             link = fly_policy.detect_link()
             cases = []
-            for alg, eng in qr._fly_engines.items():
-                lo, hi = qr._fly_policy.window(alg, quantized=True).inclusive_range()
+            for alg, eng in fly.engines.items():
+                lo, hi = fly.policy.window(alg, quantized=True).inclusive_range()
                 res["unloaded"] += [
                     f"{alg.value} {key}"
                     for key in eng.cfgs_for(lo, hi)
@@ -1215,7 +1216,7 @@ def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
                     cases.append((alg, cfg, nbytes, inp, ref))
 
             ran = []
-            for alg, eng in qr._fly_engines.items():
+            for alg, eng in fly.engines.items():
 
                 def allreduce(*args, _run=eng.allreduce, _alg=alg, **kw):
                     ran.append(_alg)
