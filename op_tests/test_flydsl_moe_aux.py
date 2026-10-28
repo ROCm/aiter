@@ -302,6 +302,7 @@ def test_psum_remap(numel, E, tile_m):
     rows0[::101] = -1  # DROPPED_ROUTE_ROW must be left untouched
     masked = counts.clone()
     nvr = torch.tensor([numel], dtype=I32)
+    null_row_to_token = torch.empty(0, dtype=I32)
 
     ref_starts = run_torch_psum(masked, tile_m)[0]
     keep = rows0.cpu() >= 0
@@ -326,6 +327,8 @@ def test_psum_remap(numel, E, tile_m):
             route_max_m,
             tile_m,
             ptr_arg(nvr),
+            ptr_arg(null_row_to_token),
+            1,  # topk, unused while row_to_token is null.
             stream=torch.cuda.current_stream().cuda_stream,
         )
 
@@ -395,6 +398,7 @@ def test_psum_remap_ep(numel, E, tile_m, topk):
 
     masked = counts.clone()
     nvr = torch.tensor([numel], dtype=I32)
+    null_row_to_token = torch.empty(0, dtype=I32)
     gather_w = (torch.rand(numel) * 2 - 1).to(torch.bfloat16)
     tis = torch.randint(0, max_tok * 4, (tokens,), dtype=I32)
     cap_rows = E * route_max_m
@@ -443,6 +447,7 @@ def test_psum_remap_ep(numel, E, tile_m, topk):
             topk,
             max_tok,
             slot_stride,
+            ptr_arg(null_row_to_token),
             stream=torch.cuda.current_stream().cuda_stream,
         )
 
