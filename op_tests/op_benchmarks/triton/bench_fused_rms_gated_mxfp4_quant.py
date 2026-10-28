@@ -49,6 +49,18 @@ def torch_rms_gated(x, weight, z, group_size, norm_before_gate, activation):
     return y.to(x.dtype)
 
 
+def hadamard32(device) -> torch.Tensor:
+    h = torch.ones((1, 1), device=device)
+    while h.shape[0] < 32:
+        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
+    return h / 32**0.5
+
+
+def torch_rotate(y, h):
+    M, N = y.shape
+    return (y.float().view(M, N // 32, 32) @ h).view(M, N).to(y.dtype)
+
+
 _XZW_OUT_VAL_KEYS = ["x", "z", "weight"]
 
 
@@ -60,19 +72,25 @@ def _generate_xzw_pool_inputs(M, N, group_size, dtype):
 
 
 def _generate_quant_only_pool_inputs(
-    M, N, group_size, dtype, norm_before_gate, activation
+    M, N, group_size, dtype, norm_before_gate, activation, hadamard_rotate
 ):
     x, z, weight = _generate_xzw_pool_inputs(M, N, group_size, dtype)
-    # The quant alone on an already normalized activation: what the fused
-    # kernel costs on top of it. Renamed "x" to match dynamic_mxfp4_quant's
-    # first positional param.
-    return (torch_rms_gated(x, weight, z, group_size, norm_before_gate, activation),)
+    # The quant alone on an already normalized (and rotated) activation: what
+    # the fused kernel costs on top of it. Renamed "x" to match
+    # dynamic_mxfp4_quant's first positional param.
+    y = torch_rms_gated(x, weight, z, group_size, norm_before_gate, activation)
+    if hadamard_rotate:
+        y = torch_rotate(y, hadamard32(y.device))
+    return (y,)
 
 
-def _torch_full_fn(x, z, weight, group_size, norm_before_gate, activation):
-    dynamic_mxfp4_quant(
-        torch_rms_gated(x, weight, z, group_size, norm_before_gate, activation)
-    )
+def _torch_full_fn(
+    x, z, weight, group_size, norm_before_gate, activation, hadamard_rotate, h
+):
+    y = torch_rms_gated(x, weight, z, group_size, norm_before_gate, activation)
+    if hadamard_rotate:
+        y = torch_rotate(y, h)
+    dynamic_mxfp4_quant(y)
 
 
 def run_benchmark(args):
@@ -105,6 +123,7 @@ def run_benchmark(args):
             "activation": args.activation,
             "norm_before_gate": not args.norm_after_gate,
             "transpose_scale": args.transpose_scale,
+            "hadamard_rotate": args.hadamard_rotate,
         },
     )
 
@@ -123,8 +142,10 @@ def run_benchmark(args):
         activation,
         norm_before_gate,
         transpose_scale,
+        hadamard_rotate,
     ):
         dtype = get_dtype(dtype)
+        h = hadamard32("cuda") if hadamard_rotate else None
 
         if provider == "fused":
             _p_gen = functools.partial(
@@ -138,6 +159,7 @@ def run_benchmark(args):
                 activation=activation,
                 group_size=group_size,
                 transpose_scale=transpose_scale,
+                hadamard_rotate=hadamard_rotate,
             )
             x_elem_size = rot_bufs[0]["x"].element_size()
         elif provider == "quant_only":
@@ -149,6 +171,7 @@ def run_benchmark(args):
                 dtype,
                 norm_before_gate,
                 activation,
+                hadamard_rotate,
             )
             rot_bufs = bencher.build_pool([_p_gen], [["x"]])
             kernel_fn = dynamic_mxfp4_quant
@@ -163,6 +186,8 @@ def run_benchmark(args):
                 group_size=group_size,
                 norm_before_gate=norm_before_gate,
                 activation=activation,
+                hadamard_rotate=hadamard_rotate,
+                h=h,
             )
             x_elem_size = rot_bufs[0]["x"].element_size()
         else:
@@ -219,6 +244,13 @@ def parse_args(args: list[str] | None = None):
         "--transpose-scale",
         action="store_true",
         help="Fused provider writes column-major scales, as dynamic_mxfp4_quant does.",
+    )
+    parser.add_argument(
+        "--hadamard-rotate",
+        action="store_true",
+        help="Rotate each 32-element block by the normalized Hadamard matrix before "
+        "the quant: fused passes hadamard_rotate=True, torch rotates with a matmul, "
+        "quant_only quantizes a pre-rotated input. gfx950 only.",
     )
     override_parser_action(
         parser,
