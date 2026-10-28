@@ -110,6 +110,9 @@ cmd_build() {
     docker build -t "$IMAGE_A" $(build_args) --build-arg WITH_ALLREDUCE=0 -f "$HERE/Dockerfile" "$HERE"
 }
 
+# ./Dockerfile needs BuildKit (RUN --mount); the legacy builder rejects it.
+export DOCKER_BUILDKIT=1
+
 # Target build options for ./Dockerfile; empty = its defaults (MI350P).
 build_args() {
     [ -n "${AITER_CU_NUM:-}" ] && echo "--build-arg AITER_CU_NUM=$AITER_CU_NUM"
