@@ -81,6 +81,7 @@ AUX_SORT_OPUS = "opus"
 _Q256_KERNEL = (
     "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route"
 )
+_Q256_KERNELS = (_Q256_KERNEL, _Q256_KERNEL + "_weighted")
 
 
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
@@ -1722,7 +1723,7 @@ def _fused_moe_impl(
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     if (
-        getattr(metadata.stage1, "keywords", {}).get("kernelName", "") == _Q256_KERNEL
+        getattr(metadata.stage1, "keywords", {}).get("kernelName", "") in _Q256_KERNELS
         and block_size_M != 256
     ):
         raise ValueError(
@@ -2155,7 +2156,7 @@ def fused_moe_1stage(
             )
             return moe_buf
 
-        if isG1U1 and kernelName == _Q256_KERNEL:
+        if isG1U1 and kernelName in _Q256_KERNELS:
             if a2_scale is not None:
                 raise ValueError("Q256 does not support caller-provided hidden scales")
             # The ASM stores one weighted BF16 row per token/topk slot.
@@ -3789,7 +3790,7 @@ def get_2stage_cfgs(
                     "incomplete metadata"
                 )
 
-    if cfg is not None and kn1 == _Q256_KERNEL:
+    if cfg is not None and kn1 in _Q256_KERNELS:
         q256_supported = (
             gfx == "gfx950"
             and dtype == dtypes.bf16
@@ -4161,7 +4162,7 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
             flat=cfg_flat,
-            output_aux=(AUX_SORT_OPUS if kernelName1 == _Q256_KERNEL else False),
+            output_aux=(AUX_SORT_OPUS if kernelName1 in _Q256_KERNELS else False),
             **route_bucket_metadata,
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
