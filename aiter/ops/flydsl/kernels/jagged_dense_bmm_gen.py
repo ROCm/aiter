@@ -122,7 +122,7 @@ def _build_launcher(
             # f(g) = seq_offsets[g] // BLOCK_M + g: strictly increasing, and
             # each group gets at least ceil(M_g / BLOCK_M) slots. Find the
             # last g with f(g) <= tile_row; surplus slots fail start_m < M_b.
-            c_bm = fx.Int32(BLOCK_M)
+            c_bm_shift = fx.Int32(BLOCK_M.bit_length() - 1)
             c_one = fx.Int32(1)
             for _, state in range(
                 fx.Int32(0),
@@ -132,12 +132,12 @@ def _build_launcher(
             ):
                 lo, hi = state[0], state[1]
                 mid = (lo + hi + c_one) >> c_one
-                take = load_seq(mid) // c_bm + mid <= tile_row
+                take = (load_seq(mid) >> c_bm_shift) + mid <= tile_row
                 results = yield [take.select(mid, lo), take.select(hi, mid - c_one)]
             off_b = results[0]
             seq_start = load_seq(off_b)
             seq_end = load_seq(off_b + c_one)
-            block_m_idx = tile_row - (seq_start // c_bm + off_b)
+            block_m_idx = tile_row - ((seq_start >> c_bm_shift) + off_b)
         else:
             grid_x = fx.Int32(fx.grid_dim.x)
             bm_tiles = grid_x // fx.Int32(N_BLOCKS)
@@ -448,8 +448,8 @@ def jagged_dense_bmm(
     K = B.shape[1]
     bmn = BLOCK_M if block_m is None else int(block_m)
     bnn = BLOCK_N if block_n is None else int(block_n)
-    if bmn <= 0:
-        raise ValueError(f"block_m must be positive, got {bmn}")
+    if bmn <= 0 or bmn & (bmn - 1):
+        raise ValueError(f"block_m must be a power of two, got {bmn}")
     # No partial-tile path in N: N_BLOCKS floors, so a non-divisor block_n
     # would silently drop the trailing N % block_n output columns.
     if bnn <= 0 or N % bnn != 0:
