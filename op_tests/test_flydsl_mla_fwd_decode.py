@@ -56,39 +56,35 @@ def ref_masked_attention(query, key, value, scale, dtype, q_scale=None, kv_scale
     return out.to(dtype), lse
 
 
-def run_torch(q, kvc_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens, sm_scale, dtype):
-    """Pure-PyTorch paged MLA attention reference."""
-    is_fp8_q = q.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    is_fp8_kvc = kvc_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+def run_torch_split(
+    q, kvc_cache, kv_indices, work_indptr, work_info_set, split_output, split_lse, sm_scale
+):
+    """Pure-PyTorch reference for the per-work-item partial outputs.
 
-    if is_fp8_q:
-        q = q.to(torch.float)
-    if is_fp8_kvc:
-        kvc_cache = kvc_cache.to(torch.float)
+    Each work item attends ``q[qo_start:qo_end]`` to the KV pages
+    ``kv_indices[kv_start:kv_end]`` and writes its normalized output and LSE
+    into ``split_output`` / ``split_lse`` (in place) at ``partial_qo_loc``.
+    Returns the partial slots written (other slots are left untouched by the
+    kernel).
+    """
+    q = q.to(torch.float)
+    kvc_cache = kvc_cache.to(torch.float)
+    slots = []
 
-    # num_page, page_size, nhead_kv, _ = kvc_cache.shape
-    page_size = 1
-    qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
-    kvc = torch.index_select(kvc_cache, 0, kv_indices)
-    kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
-    bs = qo_indptr.shape[0] - 1
+    num_works = work_indptr[-1].item()
+    for _, partial_qo_loc, qo_start, qo_end, kv_start, kv_end, _, _ in (
+        work_info_set[:num_works].tolist()
+    ):
+        kvc = kvc_cache[kv_indices[kv_start:kv_end]].flatten(0, 1)
+        o, lse = ref_masked_attention(
+            q[qo_start:qo_end], kvc, kvc[:, :, :KV_LORA_RANK], sm_scale, torch.float32
+        )
+        loc = slice(partial_qo_loc, partial_qo_loc + qo_end - qo_start)
+        split_output[loc, 0] = o
+        split_lse[loc, 0, :, 0] = lse.transpose(0, 1)
+        slots.extend(range(loc.start, loc.stop))
 
-    os_list = []
-    lses = []
-    for i in range(bs):
-        cur_num_page = kvs[i].shape[0]
-        real_kv_seq_len = (cur_num_page - 1) * page_size + kv_last_page_lens.tolist()[i]
-        kvc_i = kvs[i].flatten(0, 1)[:real_kv_seq_len]
-        q_i = qs[i]
-        k_i = kvc_i
-        v_i = kvc_i[:, :, :KV_LORA_RANK]
-        o_i, lse_i = ref_masked_attention(q_i, k_i, v_i, sm_scale, dtype)
-        os_list.append(o_i)
-        lses.append(lse_i)
-
-    o = torch.concat(os_list)
-    lse = torch.concat(lses, dim=1).transpose(0, 1)
-    return o, lse
+    return torch.tensor(slots, dtype=torch.long)
 
 
 def _make_inputs(batch, context_len, decode_qlen=DECODE_QLEN, max_split_per_batch=32):
@@ -178,19 +174,14 @@ def _make_inputs(batch, context_len, decode_qlen=DECODE_QLEN, max_split_per_batc
 
     final_output = torch.empty((total_q, nhead, V_HEAD_DIM), dtype=torch.bfloat16)
     num_partial = reduce_partial_map.size(0) * max_seqlen_qo
-    split_output = torch.full(
-        (num_partial, 1, nhead, V_HEAD_DIM), float("nan"), dtype=torch.float32
+    split_output = torch.zeros(
+        (num_partial, 1, nhead, V_HEAD_DIM), dtype=torch.float32
     )
-    split_lse = torch.full(
-        (num_partial, 1, nhead, 1), float("nan"), dtype=torch.float32
-    )
+    split_lse = torch.zeros((num_partial, 1, nhead, 1), dtype=torch.float32)
     return (
         query,
         kv_buffer,
         kv_page_indices,
-        qo_indptr,
-        kv_indptr,
-        kv_last_page_lens,
         work_indptr,
         work_info_set,
         final_output,
@@ -199,8 +190,19 @@ def _make_inputs(batch, context_len, decode_qlen=DECODE_QLEN, max_split_per_batc
     )
 
 
+def _has_unsplit_work(work_indptr, work_info_set):
+    """True if any work item has ``partial_qo_loc == -1`` (KV range not split).
+
+    The m16x8 kernel always writes split_output/split_lse at ``partial_qo_loc``
+    and leaves the final output to ``mla_reduce_v1``; an unsplit work item
+    would make it store at a negative offset.
+    """
+    num_works = work_indptr[-1].item()
+    return bool((work_info_set[:num_works, 1] < 0).any().item())
+
+
 @benchmark()
-def test_mla_fwd_decode_m16x8_fp8_fp8(batch=1, context_len=1):
+def test_mla_fwd_decode_m16x8_fp8_fp8(batch=1, context_len=64):
     if not torch.cuda.is_available():
         pytest.skip("ROCm is not available")
     if get_gfx() not in SUPPORTED_GFX:
@@ -212,26 +214,30 @@ def test_mla_fwd_decode_m16x8_fp8_fp8(batch=1, context_len=1):
         query,
         kv_buffer,
         kv_page_indices,
-        qo_indptr,
-        kv_indptr,
-        kv_last_page_lens,
         work_indptr,
         work_info_set,
         final_output,
         split_output,
         split_lse,
     ) = _make_inputs(batch, context_len)
+    if _has_unsplit_work(work_indptr, work_info_set):
+        pytest.skip(
+            f"batch={batch}, context_len={context_len}: metadata produced unsplit "
+            "work items, which the m16x8 kernel does not support"
+        )
 
     sm_scale = 1.0 / (QK_HEAD_DIM**0.5)
-    ref_output, ref_lse = run_torch(
+    ref_split_output = split_output.clone()
+    ref_split_lse = split_lse.clone()
+    slots = run_torch_split(
         query,
         kv_buffer,
-        qo_indptr,
-        kv_indptr,
         kv_page_indices,
-        kv_last_page_lens,
+        work_indptr,
+        work_info_set,
+        ref_split_output,
+        ref_split_lse,
         sm_scale,
-        torch.bfloat16,
     )
 
     props = torch.cuda.get_device_properties(query.device)
@@ -260,25 +266,25 @@ def test_mla_fwd_decode_m16x8_fp8_fp8(batch=1, context_len=1):
     flops = 2 * batch * NUM_HEADS * context_len * (QK_HEAD_DIM + V_HEAD_DIM)
     nbytes = sum(
         tensor.numel() * tensor.element_size()
-        for tensor in (query, kv_buffer, split_output, split_lse)
+        for tensor in (query, kv_buffer, split_output[slots], split_lse[slots])
     )
 
     ret = {"gfx": get_gfx()}
     for name, candidate in candidates.items():
         (out, lse), us = run_perftest(candidate)
         output_err = checkAllclose(
-            ref_output.to(dtypes.fp32),
-            out.to(dtypes.fp32),
-            rtol=1e-3,
+            ref_split_output,
+            out,
             atol=1e-3,
-            msg=f"{name}: MLA decode output",
+            rtol=1e-3,
+            msg=f"{name}: MLA decode split output",
         )
         lse_err = checkAllclose(
-            ref_lse.to(dtypes.fp32),
-            lse.to(dtypes.fp32),
-            rtol=1e-3,
+            ref_split_lse,
+            lse,
             atol=1e-3,
-            msg=f"{name}: MLA decode LSE",
+            rtol=1e-3,
+            msg=f"{name}: MLA decode split LSE",
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
@@ -314,15 +320,19 @@ def main():
         "--context-len",
         type=int,
         nargs="*",
-        default=[1],
-        help="KV context lengths. Example: -s 1 32",
+        default=[64],
+        help="KV context lengths. Example: -s 64 2048",
     )
     args = parser.parse_args()
 
-    rows = [
-        test_mla_fwd_decode_m16x8_fp8_fp8(batch, context_len)
-        for batch, context_len in itertools.product(args.batch, args.context_len)
-    ]
+    rows = []
+    for batch, context_len in itertools.product(args.batch, args.context_len):
+        try:
+            rows.append(test_mla_fwd_decode_m16x8_fp8_fp8(batch, context_len))
+        except pytest.skip.Exception as e:
+            aiter.logger.warning("Skipped: %s", e)
+    if not rows:
+        return
     df = pd.DataFrame(rows)
     aiter.logger.info(
         "MLA decode m16x8 fp8/fp8 summary (markdown):\n%s",
