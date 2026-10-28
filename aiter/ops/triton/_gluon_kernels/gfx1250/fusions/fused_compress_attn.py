@@ -105,7 +105,7 @@ def fused_compress_attn_fp4_gfx1250(
         entry = last_pos // RATIO
         block_table_row = block_tables_ptr + seq * stride_block_tables_seq
         block = gl.load(block_table_row + entry // K_PER_BLOCK)
-        cache_row = block * K_PER_BLOCK + entry % K_PER_BLOCK
+        cache_row = block.to(gl.int64) * K_PER_BLOCK + entry % K_PER_BLOCK
 
         # =================================================================
         # Load the window, the RoPE values and the RMSNorm weight
