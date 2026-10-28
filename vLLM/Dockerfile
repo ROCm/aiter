@@ -25,7 +25,23 @@ ARG WITH_ALLREDUCE=1
 ARG B_ALLREDUCE=3c4adc5ea70af0b60e4d942bbb8b7ee19da3f7bf
 ARG B_ALLREDUCE_BRANCH=users/vpietila/flydsl-fused-comm-kernels
 
+# MI350P branches. Re-resolve with a forcing refspec: these get force-pushed,
+# and a plain fetch keeps the old tip and still exits 0.
+#   git ls-remote https://github.com/ROCm/aiter.git 'refs/heads/<branch>'
+ARG B_FLYDSLXCD=0a330263d61d6eea7e49b466361f00e4decce6fc  # relbers/gfx950_flydsl_xcd_count
+ARG B_TRITONXCD=7ad35acd2d6affe795b251b73ca8c567340dca8c  # relbers/gfx950_triton_xcd_count
+ARG B_OPUSXCD=08de374c34f50a25717e0821f0aad668f128c1ba    # relbers/gfx950_opus_xcd_count
+ARG B_HIPXCD=af390d69f43baa858b3c6edaad8adff1bdd34400     # relbers/gfx950_hip_xcd_count
+ARG B_ARCHCU=9b65132fa091fb7e59300b0541d343a0afd964c2     # relbers/arch-all-cu-nums
+ARG B_AOTFILTER=5193cf94a2a76c3b10a96f2036a6fd4a824a24a1  # relbers/flydsl-gemm-aot-arch-filter
+ARG B_FMOEACC=abbef9d36ee0614ce80c9f4c8db1f079b1a851d4    # relbers/fmoe-tuner-accuracy
+ARG B_TUNING=5e0e5998a86d7a4649d72c521feff39dbc9e9c4e     # mi350p-tuning
+
 ENV MAX_JOBS=6
+
+# Bare "gfx950" means 256 CU -> 8 XCDs, baking the wrong die count into the
+# AOT kernels. MI350P is 128 CU -> 4.
+ENV AITER_GPU_TARGETS=gfx950:128
 
 # Merge commits need an identity; a clean image has none.
 ENV GIT_AUTHOR_NAME="aiter mi350p build" \
@@ -37,6 +53,8 @@ ENV GIT_AUTHOR_NAME="aiter mi350p build" \
 RUN git clone --no-checkout "${AITER_UPSTREAM}" "${AITER_DIR}" \
     && cd "${AITER_DIR}" \
     && git fetch -q origin "+refs/heads/${B_ALLREDUCE_BRANCH}:refs/remotes/origin/allreduce" \
+      '+refs/heads/relbers/*:refs/remotes/origin/relbers/*' \
+      '+refs/heads/mi350p-tuning:refs/remotes/origin/mi350p-tuning' \
     && git checkout -q -B mi350p "${AITER_MAIN}"
 
 RUN cd "${AITER_DIR}" \
@@ -44,10 +62,22 @@ RUN cd "${AITER_DIR}" \
          git merge --no-edit "${B_ALLREDUCE}" ; \
        else echo "baseline: aiter main only"; fi
 
-# ---- Parked: MI350P tuning PRs (5182, 5340, 5504, 5505, 5848, 5668) ----------
-# Re-enable once they merge conflict-free with main + PR 5670.
-# ENV AITER_GPU_TARGETS=gfx950:128 and the mi350p config-count check.
-# -------------------------------------------------------------------------
+# The four xcd_count branches first, then the rest.
+#
+# With WITH_ALLREDUCE=1 these steps stop on a modify/delete. The comm branch
+# deletes aiter/ops/flydsl/{,kernels/}quick_allreduce_int4.py and their
+# op_test, having rewritten that path under kernels/comm/; main modifies the
+# same three files in #6049. The branches carry main past that commit, so the
+# deletion and the edit meet. The three files are the comm branch's to
+# reconcile. Onto AITER_MAIN alone the eight merge with no conflict.
+RUN cd "${AITER_DIR}" && git merge --no-edit "${B_FLYDSLXCD}"
+RUN cd "${AITER_DIR}" && git merge --no-edit "${B_TRITONXCD}"
+RUN cd "${AITER_DIR}" && git merge --no-edit "${B_OPUSXCD}"
+RUN cd "${AITER_DIR}" && git merge --no-edit "${B_HIPXCD}"
+RUN cd "${AITER_DIR}" && git merge --no-edit "${B_ARCHCU}"
+RUN cd "${AITER_DIR}" && git merge --no-edit "${B_AOTFILTER}"
+RUN cd "${AITER_DIR}" && git merge --no-edit "${B_FMOEACC}"
+RUN cd "${AITER_DIR}" && git merge --no-edit "${B_TUNING}"
 
 # ck_tile comes from this submodule (jit/core.py points CK_DIR at it). Without
 # it the build falls back to /opt/rocm's older copy and fails to compile.
