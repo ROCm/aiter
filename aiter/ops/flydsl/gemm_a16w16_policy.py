@@ -115,7 +115,16 @@ class GemmConfigPruner:
                 (iou >= min_iou or near_cu_rect)
                 and tiles <= max_tiles
                 and config["split_k"] <= max_split_k
-                and (config["group_m"] == 0 or (tiles >= num_cus and tiles % 8 == 0))
+                and (
+                    config["group_m"] == 0
+                    or (
+                        config["block_m"],
+                        config["block_n"],
+                        config["group_m"],
+                    )
+                    in ((320, 224, 2), (320, 224, 16), (224, 320, 8))
+                    or (tiles >= num_cus and tiles % 8 == 0)
+                )
             ):
                 kept.append(config)
 
@@ -245,6 +254,42 @@ def get_flydsl_a16w16_configs(
         dict(zip(selections, combo))
         for combo in itertools.product(*selections.values())
     ]
+    if m <= 320 and k % 5 == 0:
+        configs.append(
+            {
+                "block_m": 320,
+                "block_n": 192,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 5,
+                "m_waves": 4,
+                "n_waves": 2,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+            }
+        )
+    for block_m, block_n, m_waves, n_waves, group_m in (
+        (256, 192, 4, 4, 0),
+        (288, 192, 2, 4, 0),
+        (320, 224, 4, 2, 2),
+        (320, 224, 4, 2, 16),
+        (224, 320, 2, 4, 8),
+    ):
+        configs.append(
+            {
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 1,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                "k_waves": 1,
+                "group_m": group_m,
+                "use_half_tile_interleaved": False,
+            }
+        )
     is_large_gemm = use_large_gemm_fast_path and m >= 4096 and n >= 4096 and k >= 4096
     if is_large_gemm:
         configs = [
@@ -290,9 +335,17 @@ def get_flydsl_a16w16_configs(
         if not is_large_gemm and not config["use_half_tile_interleaved"]:
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
-            if (mma_m_iters > 4 or mma_n_iters > 4) and config["block_m"] not in (
-                208,
-                224,
+            if (mma_m_iters > 4 or mma_n_iters > 4) and (
+                config["block_m"],
+                config["block_n"],
+            ) not in (
+                (208, 256),
+                (224, 256),
+                (320, 192),
+                (256, 192),
+                (288, 192),
+                (320, 224),
+                (224, 320),
             ):
                 continue
 
