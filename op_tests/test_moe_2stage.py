@@ -19,7 +19,6 @@ from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
-    _ASM_ROUTE_PARTIAL_KERNELS,
     _flydsl_route_output_nbytes,
     _is_flydsl_stage2,
     _stage2_runtime_uses_route_reduce,
@@ -286,7 +285,7 @@ def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
     torch.cuda.synchronize()
     for block_size in (128, 64):
         with torch.profiler.profile(activities=activities) as prof:
-            with pytest.raises(ValueError, match=r"Q256.*block_size_M.*256"):
+            with pytest.raises(ValueError, match=r"Post-reduction.*block_size_M.*256"):
                 fused_moe(*call_args, block_size_M=block_size, **kwargs)
             torch.cuda.synchronize()
         names = [
@@ -336,10 +335,7 @@ def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
     ):
         metadata = _q256_metadata(**metadata_overrides)
         assert not metadata.run_1stage and metadata.stage2 is not None
-        assert (
-            metadata.stage1.keywords.get("kernelName", "")
-            not in _ASM_ROUTE_PARTIAL_KERNELS
-        )
+        assert metadata.flat != 3
         if "quant_dtype_a2" in overrides:
             assert metadata.fuse_quant == "fp8"
             assert "_afp8_" in metadata.stage2.keywords["kernelName"]
@@ -541,6 +537,7 @@ def test_fmoe(
     ref_dtype="bf16",
     gate_up_layout: bool | None = None,
     expected_kernel=None,
+    post_reduce=False,
     shared_expert_id=None,
     q256_dispatch_regressions=True,
 ):
@@ -866,7 +863,7 @@ def test_fmoe(
     # the 2-stage flydsl/torch path does via its bf16 a2 buffer).
     if ref_dtype == "fp32":
         stage1_ref_dtype = dtypes.fp32
-    if expected_kernel in _ASM_ROUTE_PARTIAL_KERNELS:
+    if post_reduce:
         # Q256 quantizes the FP32 SiLU*up result, without a BF16 round trip.
         stage1_ref_dtype = dtypes.fp32
 
@@ -919,7 +916,7 @@ def test_fmoe(
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
-    if expected_kernel in _ASM_ROUTE_PARTIAL_KERNELS:
+    if post_reduce:
         out2_ref = _torch_q256_stage2(out1_ref, w2_qt, w2_scale, topk_ids, topk_weights)
     else:
         out2_ref = torch_moe_stage2(
@@ -1044,7 +1041,7 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    if expected_kernel in _ASM_ROUTE_PARTIAL_KERNELS:
+    if post_reduce:
         ret = _check_q256_integration(
             (input, w1_qt_aiter, w2_qt_aiter, topk_weights, topk_ids),
             _fused_moe_kwargs,
@@ -1367,6 +1364,7 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
+        post_reduce = row.get("flat", 0) == 3
         # ASM 1-stage emsort/flat rows dispatch through fused_moe too;
         # include them so the test harness exercises the emsort path. Only
         # per_1x32 (MXFP4) ASM rows: the other ASM families (per_Token,
@@ -1377,12 +1375,12 @@ def _iter_csv_cases():
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
             and not (
-                kernel_name1.startswith(("_ZN5aiter", "fmoe_"))
+                (kernel_name1.startswith("_ZN5aiter") or post_reduce)
                 and str(row.get("q_type", "")) == "QuantType.per_1x32"
             )
         ):
             continue
-        if kernel_name1 in _ASM_ROUTE_PARTIAL_KERNELS and get_gfx() != "gfx950":
+        if post_reduce and get_gfx() != "gfx950":
             continue
         if args.csv_filter:
             _kn = kernel_name1 + " " + kernel_name2
@@ -1446,7 +1444,8 @@ def _iter_csv_cases():
             args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
         )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
-        if kernel_name1 in _ASM_ROUTE_PARTIAL_KERNELS:
+        if post_reduce:
+            kwargs["post_reduce"] = True
             kwargs["expected_kernel"] = kernel_name1
             kwargs["shared_expert_id"] = 512
             kwargs["check_aot_cache"] = False
@@ -1889,6 +1888,108 @@ def test_route_workspace_token_capacity():
     aiter.logger.info("moe_2stage: route workspace capacity passed")
 
 
+def test_asm_sort_modes():
+    """Only no_sort/emsort bypass sorting; post_reduce preserves caller output."""
+    module = aiter.fused_moe
+    ids, weights, output = object(), object(), object()
+    for flydsl_sort in (False, True):
+        with (
+            patch.object(module, "_USE_FLYDSL_MOE_SORTING", flydsl_sort),
+            patch.object(module, "_USE_CK_MOE_SORTING", False),
+            patch.object(module, "_moe_prepare_unsorted_input") as no_sort,
+            patch.object(module, "_moe_sorting_impl") as sorted_input,
+            patch.object(module, "_flydsl_moe_sorting") as flydsl,
+        ):
+            for mode in (0, 1, 2, 3):
+                for call in (no_sort, sorted_input, flydsl):
+                    call.reset_mock()
+                result = module.moe_sorting(
+                    ids,
+                    weights,
+                    8,
+                    512,
+                    dtypes.bf16,
+                    flat=mode,
+                    output=output if mode in (0, 3) else None,
+                )
+                expected = (
+                    no_sort
+                    if mode in (1, 2)
+                    else flydsl if flydsl_sort else sorted_input
+                )
+                assert result is expected.return_value
+                assert (
+                    sum(call.call_count for call in (no_sort, sorted_input, flydsl))
+                    == 1
+                )
+                if mode in (0, 3):
+                    assert expected.call_args.kwargs["output"] is output
+                else:
+                    with pytest.raises(AssertionError, match="caller copies"):
+                        module.moe_sorting(
+                            ids, weights, 8, 512, dtypes.bf16, flat=mode, output=output
+                        )
+
+
+@_with_default_device("cpu")
+def test_asm_post_reduce_mode():
+    """Post-reduction is selected by mode, independently of the kernel name."""
+    module = aiter.fused_moe
+    tokens, topk, model = 4, 2, 512
+    hidden = torch.zeros((tokens, model), dtype=dtypes.bf16)
+    w1 = torch.empty((2, 512, model), dtype=dtypes.bf16)
+    w2 = torch.empty((2, model, 256), dtype=dtypes.bf16)
+    ids = torch.arange(tokens * topk, dtype=dtypes.i32)
+    weights = torch.ones(tokens * topk, dtype=dtypes.fp32)
+    experts = torch.zeros(1, dtype=dtypes.i32)
+    counts = torch.tensor([tokens * topk, tokens], dtype=dtypes.i32)
+    output = torch.empty_like(hidden)
+
+    def produce(out, *args, **kwargs):
+        assert kwargs["fc2_smooth_scale"] is None
+        out.fill_(1)
+
+    def reduce(partials, out, *args, **kwargs):
+        assert partials.shape == (tokens, topk, model)
+        assert kwargs["streaming_loads"] is True
+        out.copy_(partials.float().sum(1))
+
+    with (
+        patch.object(aiter, "fmoe_g1u1", side_effect=produce) as producer,
+        patch.object(module, "_get_flydsl_moe_kernels") as kernels,
+    ):
+        reducer = kernels.return_value._run_moe_reduction
+        reducer.side_effect = reduce
+        for mode in (0, 1, 2, 3):
+            producer.reset_mock()
+            reducer.reset_mock()
+            returned = module.fused_moe_1stage(
+                hidden,
+                w1,
+                w2,
+                topk,
+                ids,
+                weights,
+                experts,
+                counts,
+                output,
+                True,
+                block_size_M=256,
+                flat=mode,
+                q_dtype_a=dtypes.bf16,
+                kernelName="mode_selected_producer",
+            )
+            assert returned is output
+            assert producer.call_count == 1
+            assert reducer.call_count == (1 if mode == 3 else 0)
+            assert torch.equal(
+                output, torch.full_like(output, topk if mode == 3 else 1)
+            )
+            assert producer.call_args.args[0].shape == (
+                (tokens, topk * model) if mode == 3 else (tokens, model)
+            )
+
+
 def _q256_case(token, model_dim, shared_expert_id=512):
     # 512 routed experts (top-10) plus one shared expert in every token's routes.
     return {
@@ -1909,6 +2010,7 @@ def _q256_case(token, model_dim, shared_expert_id=512):
         "disable_stage2_bias": True,
         "expected_kernel": _Q256_KERNEL
         + ("_weighted" if (token, model_dim) == (8192, 8192) else ""),
+        "post_reduce": True,
     }
 
 
@@ -1989,13 +2091,14 @@ def test_q256_token_boundaries():
         return
     metadata = _q256_metadata()
     assert metadata.run_1stage and metadata.block_m == 256
-    assert metadata.stage1.keywords["kernelName"] in _ASM_ROUTE_PARTIAL_KERNELS
+    assert metadata.flat == 3
+    assert metadata.stage1.keywords["flat"] == 3
     for gate_up_interleave in (False, None):
         supported = _q256_metadata(
             opus_weights_shuffled=True, gate_up_interleave=gate_up_interleave
         )
         assert supported.run_1stage and supported.block_m == 256
-        assert supported.stage1.keywords["kernelName"] in _ASM_ROUTE_PARTIAL_KERNELS
+        assert supported.flat == 3
     for unsupported in (
         {"opus_weights_shuffled": False},
         {"is_shuffled": False},
@@ -2011,10 +2114,7 @@ def test_q256_token_boundaries():
     ):
         fallback = _q256_metadata(**unsupported)
         assert not fallback.run_1stage and fallback.stage2 is not None
-        assert (
-            fallback.stage1.keywords.get("kernelName", "")
-            not in _ASM_ROUTE_PARTIAL_KERNELS
-        )
+        assert fallback.flat != 3
     rows = []
     for token in (4096, 4097, 8191, 8192, 8193):
         case = _q256_case(token, 8192)
@@ -2412,7 +2512,7 @@ def main():
     q256_selected = False
     for kwargs, extras in case_iter:
         seen += 1
-        q256_selected |= kwargs.get("expected_kernel", "") in _ASM_ROUTE_PARTIAL_KERNELS
+        q256_selected |= kwargs.get("post_reduce", False)
         skip_reason = _moe_2stage_skip_reason(kwargs)
         if skip_reason is not None:
             aiter.logger.warning(

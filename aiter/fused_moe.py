@@ -78,14 +78,6 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 
 AUX_SORT_OPUS = "opus"
 
-# These ASM producers write BF16 token/topk partials, reduced in FP32 below.
-_ASM_ROUTE_PARTIAL_KERNELS = frozenset(
-    {
-        "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route",
-        "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route_weighted",
-    }
-)
-
 
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
     """Pick the auxiliary sort: Opus (one CTA per expert) or the fused one.
@@ -784,7 +776,7 @@ def moe_sorting(
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
         and not return_local_topk_ids
-        and not flat
+        and flat not in (1, 2)
         and not output_aux
         and dispatch_policy == 0
     ):
@@ -802,7 +794,7 @@ def moe_sorting(
         )
     # FLAT kernel: in-kernel routing (manifest flat=1 or flat=2); pass through unsorted topk.
     # `output` cannot be written in place: FLAT needs extra bytes appended to moe_buf.
-    if flat:
+    if flat in (1, 2):
         assert output is None, "FLAT over-allocates moe_buf; the caller copies"
         return _moe_prepare_unsorted_input(
             topk_ids, topk_weights, model_dim, moebuf_dtype
@@ -1725,13 +1717,9 @@ def _fused_moe_impl(
             f"kernel block size {metadata.block_m}"
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
-    if (
-        getattr(metadata.stage1, "keywords", {}).get("kernelName", "")
-        in _ASM_ROUTE_PARTIAL_KERNELS
-        and block_size_M != 256
-    ):
+    if metadata.flat == 3 and block_size_M != 256:
         raise ValueError(
-            f"Q256 block_size_M={block_size_M} is incompatible: sorting requires 256-row tiles"
+            f"Post-reduction block_size_M={block_size_M} is incompatible: sorting requires 256-row tiles"
         )
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
@@ -1781,7 +1769,7 @@ def _fused_moe_impl(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert not metadata.flat or get_gfx() in (
+    assert metadata.flat not in (1, 2) or get_gfx() in (
         "gfx942",
         "gfx950",
     ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
@@ -1917,7 +1905,7 @@ def _fused_moe_impl(
             return_local_topk_ids=need_local_topk_ids,
             accumulate=not runtime_stage2_reduce,
             flat=metadata.flat,
-            output=None if metadata.flat else output,
+            output=None if metadata.flat in (1, 2) else output,
         )
         if need_local_topk_ids:
             (
@@ -2139,7 +2127,7 @@ def fused_moe_1stage(
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
             )
-        elif isG1U1 and kernelName in _ASM_ROUTE_PARTIAL_KERNELS:
+        elif isG1U1 and flat == 3:
             # The by-name launcher lookup does not check the sorted tile size.
             if int(block_size_M) != 256:
                 raise ValueError(
@@ -2390,6 +2378,7 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_quant: str = ""
     stage2_has_bias: bool = False
+    # ASM mode: 0 sorted, 1 no_sort, 2 emsort, 3 sorted + post_reduce.
     flat: int = 0
     output_aux: bool | str = False
     prequant: bool = True
@@ -3798,8 +3787,8 @@ def get_2stage_cfgs(
                     "incomplete metadata"
                 )
 
-    if cfg is not None and kn1 in _ASM_ROUTE_PARTIAL_KERNELS:
-        q256_supported = (
+    if cfg is not None and cfg.get("flat", 0) == 3:
+        post_reduce_supported = (
             gfx == "gfx950"
             and dtype == dtypes.bf16
             and inter_dim == 256
@@ -3825,7 +3814,7 @@ def get_2stage_cfgs(
                 or has_stage2_bias
                 or has_stage2_scatter
                 or has_num_local_tokens
-                # A2 scales only exclude Q256; legacy scale handling is unchanged.
+                # These producers requantize their hidden values internally.
                 or has_a2_scale
                 or swiglu_limit
             )
@@ -3833,16 +3822,14 @@ def get_2stage_cfgs(
             and situ_linear_beta == 1.0
             and cfg.get("run_1stage", False)
             and cfg.get("block_m") == 256
-            and not (
-                cfg.get("ksplit", 0) or cfg.get("flat", 0) or cfg.get("xbf16", False)
-            )
+            and not (cfg.get("ksplit", 0) or cfg.get("xbf16", False))
         )
-        if not q256_supported:
+        if not post_reduce_supported:
             if config_file is not None:
-                raise ValueError("Unsupported Q256 fused MoE configuration")
+                raise ValueError("Unsupported post-reduction fused MoE configuration")
             cfg = None
             logger.warning(
-                "[fused_moe] discarding incompatible automatic Q256 config; "
+                "[fused_moe] discarding incompatible automatic post-reduction config; "
                 "using default heuristics"
             )
 
@@ -4170,9 +4157,7 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
             flat=cfg_flat,
-            output_aux=(
-                AUX_SORT_OPUS if kernelName1 in _ASM_ROUTE_PARTIAL_KERNELS else False
-            ),
+            output_aux=(AUX_SORT_OPUS if cfg_flat == 3 else False),
             **route_bucket_metadata,
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")

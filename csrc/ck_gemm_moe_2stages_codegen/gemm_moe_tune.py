@@ -221,12 +221,7 @@ def _dump_prefilter_candidates(profile_df, args, stage_tag):
 
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
-    """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.
-
-    If the column is absent, every kernel is treated as non-FLAT (equivalent
-    to all zeros). Only manifests that include FLAT 1-stage asm variants need
-    the column.
-    """
+    """Map names to ASM mode: 0 sorted, 1 no_sort, 2 emsort, 3 post_reduce."""
     if "flat" not in df.columns:
         return {}
     return dict(zip(df["knl_name"], df["flat"].fillna(0).astype(int)))
@@ -2970,9 +2965,12 @@ class FmoeTuner(TunerCommon):
                 continue
 
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
-                # Per-kernel ``flat`` in asm manifest (FLAT == raw topk, no host sort).
+                # Only no_sort/emsort consume raw topk. Post-reduce entries need
+                # a reduction and are not candidates for this direct-output tuner.
                 flat_flag = int(asm_1stage_flat.get(el, 0))
-                if flat_flag:
+                if flat_flag == 3:
+                    continue
+                if flat_flag in (1, 2):
                     _data_idx = [0, 1, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
                 else:
                     _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
@@ -3074,9 +3072,11 @@ class FmoeTuner(TunerCommon):
                 if inter_dim % tile_n != 0 or smf != 0:
                     continue
                 for el in xbf16_kernels.get((tile_m, tile_n, 0), []):
-                    # xbf16: internal quant; FLAT kernels (manifest flat=1) take raw topk.
+                    # xbf16: internal quant; only no_sort/emsort take raw topk.
                     flat_flag = int(xbf16_flat.get(el, 0))
-                    if flat_flag:
+                    if flat_flag == 3:
+                        continue
+                    if flat_flag in (1, 2):
                         _data_idx = [0, 0, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
                     else:
                         _data_idx = [0, 0, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
@@ -5751,9 +5751,10 @@ class FmoeTuner(TunerCommon):
                     profileDF.loc[non_xbf16, "us1"] + us_quant
                 )
 
-            # moe_sorting fairness: nonzero flat sorts internally (flat=1 one-token
-            # grid, flat=2 EMSORT). Add the host sort cost to flat=0 rows only.
-            has_flat = "flat" in profileDF.columns and (profileDF["flat"] != 0).any()
+            # Only no_sort/emsort avoid the host sort; post_reduce is sorted input.
+            has_flat = (
+                "flat" in profileDF.columns and profileDF["flat"].isin([1, 2]).any()
+            )
             if has_flat:
                 from aiter.fused_moe import moe_sorting
                 from aiter.test_common import run_perftest
@@ -5783,7 +5784,7 @@ class FmoeTuner(TunerCommon):
                         us_sort_cache[bm] = 0.0
                 print(f"  moe_sorting benchmark per block_m: {us_sort_cache}")
                 profileDF["us_moe_sort"] = profileDF["block_m"].map(us_sort_cache)
-                non_flat = profileDF["flat"] == 0
+                non_flat = profileDF["flat"].isin([0, 3])
                 profileDF.loc[non_flat, "us1"] = (
                     profileDF.loc[non_flat, "us1"]
                     + profileDF.loc[non_flat, "us_moe_sort"]
@@ -5801,8 +5802,8 @@ class FmoeTuner(TunerCommon):
             # (additive fairness + idxmin) stays exactly as it was.
             if has_flat:
                 try:
-                    flat_mask = profileDF["flat"] != 0
-                    nf_mask = profileDF["flat"] == 0
+                    flat_mask = profileDF["flat"].isin([1, 2])
+                    nf_mask = profileDF["flat"].isin([0, 3])
                     if not (flat_mask.any() and nf_mask.any()):
                         raise RuntimeError("missing FLAT or non-FLAT class")
                     # Rank candidates by us1+us2 (us2 is 0 for 1-stage rows,

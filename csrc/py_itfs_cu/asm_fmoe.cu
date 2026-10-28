@@ -78,7 +78,8 @@ class FMoeKernel
     uint32_t num_persistent_tgs = 0;
     uint32_t tgs_align          = 1;
     const char* name            = nullptr;
-    // flat_mode: 0 = host-sorted, 1 = flat one-token-per-TG grid, 2 = emsort persistent grid
+    // flat_mode: 0 = sorted, 1 = no_sort, 2 = emsort, 3 = sorted + post_reduce.
+    // Mode 3 uses the standard persistent grid; Python reduces its route partials.
     int flat_mode = 0;
     // Manifest limits. 0 max_tokens means no separate token cap.
     uint32_t max_tokens      = 0;
