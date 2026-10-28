@@ -104,6 +104,18 @@ class GemmConfigPruner:
         kept = []
         for config, iou in zip(configs, ious):
             tiles = self._tiles(config)
+            validated_half_tile = (
+                config["use_half_tile_interleaved"]
+                and config["block_m"] == 256
+                and config["block_n"] == 256
+                and config["block_k"] == 64
+                and config["stages"] == 2
+                and config["split_k"] == 1
+                and config["m_waves"] == 2
+                and config["n_waves"] == 4
+                and config["k_waves"] == 1
+                and config["group_m"] == 0
+            )
             near_cu_rect = (
                 iou >= 0.90 and tiles * 4 >= num_cus * 3 and tiles * 4 <= num_cus * 5
             )
@@ -113,7 +125,7 @@ class GemmConfigPruner:
                 else self._ceil_div(self.max_split_grid_rounds * num_cus, tiles)
             )
             if (
-                (iou >= min_iou or near_cu_rect)
+                (iou >= min_iou or near_cu_rect or validated_half_tile)
                 and tiles <= max_tiles
                 and config["split_k"] <= max_split_k
                 and (

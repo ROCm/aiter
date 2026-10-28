@@ -255,6 +255,13 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             and 6288 % config["block_n"] != 0
             for config in configs
         )
+        assert any(
+            config["use_half_tile_interleaved"]
+            and (config["block_m"], config["block_n"], config["block_k"])
+            == (256, 256, 64)
+            and (config["m_waves"], config["n_waves"], config["k_waves"]) == (2, 4, 1)
+            for config in configs
+        )
 
     def test_large_m_full_search_keeps_wide_ragged_n_tiles(self):
         from types import SimpleNamespace
