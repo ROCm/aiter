@@ -2292,6 +2292,42 @@ def test_mha_v4_mxfp4_hd256_seqlens_k_matches_truncated_kv(lengths, padded):
         ), f"batch {b} of {lengths} differs from its truncated control"
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+def test_mha_v4_mxfp4_hd256_lse_tracks_hd128():
+    """_LSE_CAPABLE_QV is keyed on (q_format, v_format) with no head-dim term, so hd256 inherited
+    the MXFP4 claim without its epilogue ever being compared against torch.
+
+    Two bounds because they catch different things. The absolute one separates a real LSE from an
+    object that never wrote one, which leaves the buffer as torch.empty handed it back. The
+    comparison against hd128 is what a constant cannot do: the residual is MXFP4 quantization, so
+    only a sibling recipe says whether hd256 carries more of it than it should.
+    """
+
+    def lse_error(head_dim):
+        torch.manual_seed(43)
+        q = torch.randn((1, 256, 4, head_dim), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn((1, 256, 4, head_dim), device="cuda", dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        formats = (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4)
+
+        _, lse = mha_v4(q, k, v, *formats, return_lse=True)
+        torch.cuda.synchronize()
+
+        scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(
+            0, 2, 1, 3
+        ).transpose(-1, -2)
+        reference = torch.logsumexp(scores * head_dim**-0.5, dim=-1)
+        actual = lse.float().reshape(reference.shape)
+        assert torch.isfinite(actual).all(), f"hd{head_dim} LSE is not finite"
+        error = ((actual - reference).abs().max() / reference.abs().max()).item()
+        assert error < 0.1, f"hd{head_dim} LSE relative error {error:.5f}"
+        return error
+
+    hd128 = lse_error(128)
+    hd256 = lse_error(256)
+    assert hd256 < 3 * hd128, f"hd256 LSE error {hd256:.5f} vs hd128 {hd128:.5f}"
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
 def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
     """A null slot and a slot naming the whole key length must run the same code path."""
