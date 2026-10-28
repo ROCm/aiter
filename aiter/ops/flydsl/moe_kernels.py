@@ -2485,6 +2485,15 @@ def _get_compiled_topids_to_rows():
     return build_moe_topids_to_rows_module()
 
 
+@functools.lru_cache(maxsize=128)
+def _get_compiled_topids_to_rows_lds(n_buckets: int):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_lds_module,
+    )
+
+    return build_moe_topids_to_rows_lds_module(n_buckets)
+
+
 @functools.cache
 def _get_compiled_topids_to_rows_g2l(weight_dtype: str):
     from aiter.ops.flydsl.kernels.moe_route_maps import (
@@ -2665,7 +2674,25 @@ def flydsl_moe_topids_to_rows(
             torch.cuda.current_stream(),
         )
     else:
-        topids_to_rows_kernel = _get_compiled_topids_to_rows()
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+        from aiter.ops.flydsl.kernels.moe_route_maps import (
+            BLOCK_THREADS,
+            MAX_ROUTE_BUCKETS,
+        )
+
+        # Keep small calls and wave64 paths unchanged. Each 256-bucket sweep
+        # adds histogram work; amortize it across at least four route blocks.
+        use_lds = (
+            get_gfx_runtime() == "gfx1250"
+            and 0 < int(E) <= MAX_ROUTE_BUCKETS
+            and numel
+            >= 4 * ((int(E) + BLOCK_THREADS - 1) // BLOCK_THREADS) * BLOCK_THREADS
+        )
+        topids_to_rows_kernel = (
+            _get_compiled_topids_to_rows_lds(int(E))
+            if use_lds
+            else _get_compiled_topids_to_rows()
+        )
         _dispatch_compiled(
             topids_to_rows_kernel,
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
