@@ -8,50 +8,34 @@ The operator is the one `minimax_m3_index_score` documents,
     score[head, row, p] = max over t in [0,128) of dot(K[page, t, :], Q[row, head, :]) * scale
 
 with a per-query causal cutoff; only the K cache differs. K is MXFP4: e2m1
-elements, two to a byte (the LOW nibble is the even element), with one e8m0
-scale per 32 elements. A 128-wide index token is therefore 64 data bytes plus
-4 scale bytes, and the cache reaches the kernel as TWO views:
+elements, two to a byte (the LOW nibble is the even element), one e8m0 scale per
+32 elements (scale byte 0 covers elements 0..31, byte 1 covers 32..63, ...). The
+cache reaches the kernel as two views, each with its own page stride, so the
+caller may pass two tensors or two views of one `[128 x 64 B data][128 x 4 B
+scale]` (8704 B) page:
 
-    k_data   uint8 [pages, 128, 64]   token-major, stride(1) == 64, stride(2) == 1
-    k_scale  uint8 [pages, 128, 4]    token-major, stride(1) == 4,  stride(2) == 1
+    k_data   uint8 [pages, 128, 64]   stride(1) == 64, stride(2) == 1
+    k_scale  uint8 [pages, 128, 4]    stride(1) == 4,  stride(2) == 1
 
-Each view carries its own page stride, so a caller may hand over two separate
-tensors or two views of one single-region page (`[128 x 64 B data][128 x 4 B
-scale]`, 8704 B). The kernel cannot tell the difference. Scale byte 0 covers
-elements 0..31, byte 1 covers 32..63 and so on.
+Tile and work map are the fp8 scorer's (one wave per page, register-local max
+over the page's tokens). A lane's 16 B data load (elements 32g..32g+31 for lane
+group g) is exactly its four k-steps and exactly one e8m0 group.
 
-Dataflow. Same tile as the fp8 scorer (bf16 16x16x32 MFMA, A = K with M = token,
-B = Q with N = feature, one wave per page, register-local max over the page's
-tokens). What changes is the K side, and it changes in a way that suits the
-format: a token row is 64 B, so one lane's 16 B access (lane group g takes bytes
-16g..16g+15, i.e. elements 32g..32g+31) is exactly the four k-steps of that
-lane AND exactly one e8m0 group. Per 16-token tile a lane issues one 16 B data
-load and one 4 B scale load, widens each of the four dwords with four
-`v_cvt_scalef32_pk_bf16_fp4`, and feeds the unchanged bf16 MFMA. The 64 lanes of
-a tile read 1 KiB of contiguous data.
+bf16 Q: each data dword is widened with `v_cvt_scalef32_pk_bf16_fp4` and fed to
+the bf16 16x16x32 MFMA. K is lifted to Q's precision and Q is never rounded
+down; e2m1 x 2^e is exact in bf16, so the scores are those of `dequantize(K)`.
 
-Numerics contract for a bf16 Q, unchanged from the fp8 scorer: K is LIFTED to
-Q's precision (bf16), Q is never rounded down. e2m1 x 2^e is exact in bf16, so
-the scores are those of `dequantize(K)` scored with bf16 arithmetic and an fp32
-accumulator.
+e4m3 Q (`idx_q.dtype == dtypes.fp8`): no widening, one
+`v_mfma_scale_f32_16x16x128_f8f6f4` per tile (A = fp4 K with its e8m0 byte,
+B = Q). Products are exact in fp32.
 
-A Q that is already e4m3 (`idx_q.dtype == dtypes.fp8`, what the index-Q writer
-emits for q8kv4) takes a different, cheaper K path: no widening at all, one
-`v_mfma_scale_f32_16x16x128_f8f6f4` per tile with A = K as fp4 plus its e8m0
-scale and B = Q as e4m3. The products are exact in fp32 (e2m1 x e4m3 x 2^e), so
-the scores are those of `dequantize(K)` against `Q` read as stored.
+e8m0 bytes 0 and 255 are unsupported: the hardware takes the scale as the float
+whose exponent field is the byte, so 0 scales by 0.0 and 255 is NaN. A conforming
+writer (`indexer_fp4_scale_e8m0`) never emits either. Garbage in a page's unwritten
+tail is harmless as in the fp8 cache: every such token is masked before the max.
 
-e8m0 values 0 and 255 are not supported: the hardware takes the scale as the
-float whose exponent field is the byte, so 0 scales by 0.0 (not 2^-127) and 255
-is NaN. A conforming writer (`indexer_fp4_scale_e8m0`) clamps amax and never
-emits either. Garbage bytes in the unwritten tail of a page are harmless for
-the same reason they are in the fp8 cache: an MFMA row depends on one token
-only, and every such token is masked out before the max.
-
-The work map, geometry, CP shard and score layout are the fp8 scorer's own and
-are imported rather than restated. The builder below is a COPY of
-`build_index_score` with the K side replaced, not a parameterisation of it; the
-two can drift, and a change to one's epilogue or work-map decode has to be
+The builder is a COPY of `build_index_score` with the K side replaced, not a
+parameterisation of it; a change to one's epilogue or work-map decode has to be
 mirrored in the other.
 """
 
@@ -124,15 +108,9 @@ DATA_UNITS = DATA_BYTES // 16  # 16 B accesses per token row
 # 6 is 15-35% faster than 3 where batch*context is small (the launch is latency
 # bound there) and within 2% of the best from 3 to 8 once it is not.
 TILE_DEPTH = 6
-# Cache policy of the K data stream (0 cached, 2 nt): every 128 B line is read
-# once, by one instruction, so there is no reuse for the L1 to keep.
+# Cache policy of the K data stream (2 = nt): every 128 B line is read once, so
+# the L1 has nothing to keep. Not `geom["nt_k"]`, which is tuned for the fp8 layout.
 K_CACHE = 2
-
-
-def _cache_policy(geom) -> int:
-    """The data stream's policy. `geometry` picks the fp8 scorer's (L1 kept where
-    each line is requested twice); that does not apply to this layout."""
-    return K_CACHE
 
 
 def kernel_name(S: int, H: int, geom, q_fp8: bool = False) -> str:
@@ -141,8 +119,6 @@ def kernel_name(S: int, H: int, geom, q_fp8: bool = False) -> str:
     name += f"_d{TILE_DEPTH}"
     if geom["waves_per_tok"] > 1:
         name += f"_tw{geom['waves_per_tok']}"
-    if _cache_policy(geom) != 2:
-        name += f"_kc{_cache_policy(geom)}"
     if geom["spread"]:
         name += "_sp"
     if geom["cp_world"] > 1:
@@ -187,7 +163,6 @@ def build_index_score_fp4(S: int, H: int, geom, q_fp8: bool = False):
 
     `q_fp8` swaps the K path for one scaled MFMA per tile with Q held as e4m3."""
     pages_per_wave = geom["pages_per_wave"]
-    nt_k = _cache_policy(geom)
     CP_WORLD = geom["cp_world"]
     CP_RANK = geom["cp_rank"]
     SPREAD = bool(geom["spread"])
@@ -289,14 +264,16 @@ def build_index_score_fp4(S: int, H: int, geom, q_fp8: bool = False):
         # k map: lane group g holds k = 32g .. 32g+31, k-step ks the 8 of them
         # from 32g + 8ks. K reads the same range as one contiguous 16 B access,
         # Q as four 16 B accesses; both sides MUST use this one map.
-        def load_q_frag(i, j):
-            """One lane's 16 B of Q for (feature tile i, Q access j), from gmem."""
+        def q_row_head(i):
+            """Q row and head of feature tile i's column; padding columns read row 0."""
             tok, head = tok_head_of(i)
             row = b * fx.Int32(S) + tok
-            f = feature_of(i)
-            in_range = f < fx.Int32(F)
-            row = in_range.select(row, fx.Int32(0))
-            head = in_range.select(head, fx.Int32(0))
+            in_range = feature_of(i) < fx.Int32(F)
+            return in_range.select(row, fx.Int32(0)), in_range.select(head, fx.Int32(0))
+
+        def load_q_frag(i, j):
+            """One lane's 16 B of Q for (feature tile i, Q access j), from gmem."""
+            row, head = q_row_head(i)
             off = (
                 row * i32_stride_q_n
                 + head * i32_stride_q_h
@@ -317,12 +294,7 @@ def build_index_score_fp4(S: int, H: int, geom, q_fp8: bool = False):
             bytes, Q[16g .. 16g+15] then Q[64+16g .. 64+16g+15] of its column.
             That is how the hardware lays an fp8 operand out against an fp4 A (the
             tests pin it), NOT the contiguous 32g.. run the fp4 K fragment holds."""
-            tok, head = tok_head_of(i)
-            row = b * fx.Int32(S) + tok
-            f = feature_of(i)
-            in_range = f < fx.Int32(F)
-            row = in_range.select(row, fx.Int32(0))
-            head = in_range.select(head, fx.Int32(0))
+            row, head = q_row_head(i)
             base = row * i32_stride_q_n + head * i32_stride_q_h + g * fx.Int32(16)
             halves = [
                 fx.add_offset(
@@ -403,8 +375,7 @@ def build_index_score_fp4(S: int, H: int, geom, q_fp8: bool = False):
             )
         # K data is streamed; the scale lines are shared by two adjacent tiles,
         # so they keep the default policy.
-        k_atom = buf_copy_atom(16, fx.Int32, cache_modifier=nt_k)
-        g_shift = g  # scale byte index within the token's 4 scale bytes
+        k_atom = buf_copy_atom(16, fx.Int32, cache_modifier=K_CACHE)
 
         def load_k16(page_buf, unit):
             src = fx.slice(page_buf, (unit, None))
@@ -464,7 +435,7 @@ def build_index_score_fp4(S: int, H: int, geom, q_fp8: bool = False):
                     for i in range_constexpr(FEAT_TILES_PER_WAVE)
                 ]
             else:
-                scale_f32 = e8m0_to_f32(fx.Int32(scale_word), g_shift)
+                scale_f32 = e8m0_to_f32(fx.Int32(scale_word), g)
                 accs = []
                 for i in range_constexpr(FEAT_TILES_PER_WAVE):
                     acc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
@@ -620,7 +591,7 @@ def build_index_score_fp4(S: int, H: int, geom, q_fp8: bool = False):
             stream=stream,
         )
 
-    return launch, CHUNK
+    return launch
 
 
 _CACHE = {}
@@ -817,7 +788,7 @@ def score_flydsl_fp4(
     q_fp8 = idx_q.dtype == dtypes.fp8
     if out is None:
         out = alloc_score(batch, S, H, max_block, idx_q.device)
-    launch, _chunk = _get(S, H, geom, idx_q.device.index, q_fp8)
+    launch = _get(S, H, geom, idx_q.device.index, q_fp8)
     chunks = _grid_chunks(max_block, geom)
     if work_map is None:
         work_map = _make_map(seq_lens, max_block, geom, batch * chunks)
