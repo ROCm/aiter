@@ -5,11 +5,19 @@
 # A/B: build twice from this file,
 #   docker build -t vllm-aiter-ar   .                         # main + FlyDSL comm branch
 #   docker build -t vllm-aiter-main --build-arg WITH_ALLREDUCE=0 .   # plain main
+#
+# Stages: aiter-src (clone, merges, submodule, pip) -> final (FlyDSL AOT, wheel,
+# env). To debug the compile without rebuilding the source layers:
+#   docker build --target aiter-src -t aiter-src .
+#   docker run --rm -it aiter-src bash
+# BuildKit cache mounts keep the CK/HIP object files across failed builds, so a
+# retry only recompiles what failed or changed. Needs BuildKit (docker build's
+# default on current Docker); `docker builder prune` clears the cache.
 
 # Pinned: nightly of vLLM 49cb2bbf71 (2026-10-16), the vLLM the existing images
 # were built on. Dockerfile.vllm-fork overlays a fork branch cut from this commit.
 ARG BASE=vllm/vllm-openai-rocm:nightly-49cb2bbf71cfd36ee5aa33d1e184b1cddff55294
-FROM ${BASE}
+FROM ${BASE} AS aiter-src
 
 # main as of 2026-10-21: the newest main the comm branch below contains, so the
 # baseline image and the all-reduce image differ only by the comm work.
@@ -38,14 +46,6 @@ ARG B_ARCHCU=9b65132fa091fb7e59300b0541d343a0afd964c2     # relbers/arch-all-cu-
 ARG B_AOTFILTER=5193cf94a2a76c3b10a96f2036a6fd4a824a24a1  # relbers/flydsl-gemm-aot-arch-filter
 ARG B_FMOEACC=abbef9d36ee0614ce80c9f4c8db1f079b1a851d4    # relbers/fmoe-tuner-accuracy
 ARG B_TUNING=5e0e5998a86d7a4649d72c521feff39dbc9e9c4e     # mi350p-tuning
-
-# Build parallelism for the AOT compile (FlyDSL kernels, then the CK/HIP modules).
-ARG AITER_BUILD_JOBS=64
-ENV AITER_MAX_JOBS=${AITER_BUILD_JOBS}
-
-# GPU targets - MI350P
-ARG AITER_GPU_ARCH=gfx950
-ARG AITER_CU_NUM=128
 
 # Merge commits need an identity; a clean image has none.
 ENV GIT_AUTHOR_NAME="aiter mi350p build" \
@@ -83,12 +83,57 @@ RUN cd "${AITER_DIR}" && git submodule update --init --recursive \
 
 RUN cd "${AITER_DIR}" && pip install -r requirements.txt && pip install pyyaml
 
+
+FROM aiter-src AS final
+
+# 1 = comm branch merged (redeclared: ARGs do not cross stages), 0 = baseline.
+ARG WITH_ALLREDUCE=1
+ARG AITER_DIR=/opt/aiter
+
+# Build parallelism for the AOT compile (FlyDSL kernels, then the CK/HIP modules).
+# Built for 64 CPUs. aiter sizes its worker pools from this ceiling, bounded by
+# the CPUs and free memory the builder sees (~1.5 GB per worker), so a smaller
+# machine just gets fewer workers.
+# These are ARGs, set per RUN below and not ENV: the build settings stay out of
+# the runtime image, and changing them reruns only the compile steps.
+ARG AITER_BUILD_JOBS=64
+
+# Build options for MI350P
+ARG AITER_GPU_ARCH=gfx950
+ARG AITER_CU_NUM=128
+
+# Code generators run as subprocesses and `import aiter` for the XCD count. The
+# base image ships its own, older aiter in site-packages, which they would find
+# instead of /opt/aiter. Check up front that the merged tree is imported and 
+# yields MI350P's 4. The wheel build below sets the same PYTHONPATH and AITER_AOT_IMPORT.
+RUN cd "${AITER_DIR}" \
+    && PYTHONPATH="${AITER_DIR}" AITER_AOT_IMPORT=1 \
+       GPU_ARCHS="${AITER_GPU_ARCH}" CU_NUM="${AITER_CU_NUM}" \
+       python3 -c "import aiter; from aiter.jit.utils.build_targets import build_num_xcds as n; \
+assert aiter.__file__.startswith('${AITER_DIR}/'), aiter.__file__; \
+print('aiter from', aiter.__file__, '- XCDs:', n('${AITER_GPU_ARCH}')); \
+assert n('${AITER_GPU_ARCH}') == 4"
+
+# FlyDSL AOT first, as its own layer: setup.py runs the same step again below and
+# finds the kernels already in the cache, so a CK/HIP failure does not redo it.
+RUN cd "${AITER_DIR}" \
+    && AITER_MAX_JOBS="${AITER_BUILD_JOBS}" AITER_AOT_IMPORT=1 \
+       GPU_ARCHS="${AITER_GPU_ARCH}" CU_NUM="${AITER_CU_NUM}" \
+       python3 -c "from aiter.aot.flydsl.common import run_aot; run_aot('aiter/jit/flydsl_cache')"
+
 # Installing as a wheel, the way vLLM's docker/Dockerfile.rocm_base does.
 # PYTHONPATH over the pre-installed aiter would leave two trees, one shadowing
 # the other. PREBUILD_KERNELS compiles kernels in rather than leaving them to
 # JIT on first request.
-RUN cd "${AITER_DIR}" \
-    && PREBUILD_KERNELS=1 AITER_USE_SYSTEM_TRITON=1 \
+# The cache mount holds ninja's object files; the built modules land in the layer.
+# A failed build leaves blob.staging dirs behind, each with an "owner" marker
+# (pid + hostname). BuildKit's hostname and low pids repeat between builds, so a
+# new build would read the dead owner as live and refuse to generate: clear them.
+RUN --mount=type=cache,target=/opt/aiter/aiter/jit/build \
+    find /opt/aiter/aiter/jit/build -name 'blob.staging' -prune -exec rm -rf {} + \
+    && cd "${AITER_DIR}" \
+    && AITER_MAX_JOBS="${AITER_BUILD_JOBS}" PREBUILD_KERNELS=1 AITER_USE_SYSTEM_TRITON=1 \
+       PYTHONPATH="${AITER_DIR}" AITER_AOT_IMPORT=1 \
        GPU_ARCHS="${AITER_GPU_ARCH}" CU_NUM="${AITER_CU_NUM}" \
     python3 setup.py bdist_wheel --dist-dir=dist \
     && ls -la dist/*.whl
