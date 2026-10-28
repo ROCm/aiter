@@ -173,9 +173,12 @@ def compile_pa_decode_tile(
     are absent and query/output strides match. Other tasks write packed partials
     for the shared reducer, which applies sinks once.
 
-    Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
-    Pages past the sequence are pinned to block 0; callers must leave the
-    unwritten tail of the last owned page finite. ``wide_kv_addressing`` protects
+    Pages past the sequence are pinned to block 0 and the unwritten tail of the
+    last owned page is read as is. On gfx942/gfx950 a sequence's last tile
+    zeroes V bytes and K/V scales at or past its context before PV, so those
+    rows may hold anything, including NaN (``0 * NaN == NaN`` in PV MFMA).
+    The gfx1250 pipelines still require those V bytes to remain finite.
+    ``wide_kv_addressing`` protects
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
     and permits unsigned buffer offsets instead of i64.
     """
