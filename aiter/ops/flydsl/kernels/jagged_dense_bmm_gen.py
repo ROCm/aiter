@@ -55,7 +55,7 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD):
 
     total = c_num_rows * c_num_cols
     period = fx.Int32(nXCD * C)
-    prefix = total - (total % period)  # largest multiple of period <= total
+    prefix = total - (total % period)
     xy_g = (xy < prefix).select(xy_g_remap, xy)
 
     tids_per_grp = cW * c_num_cols
@@ -91,11 +91,11 @@ def _build_launcher(
     def jdbba_kernel(
         C: fx.Tensor,  # out    (L, N)   bf16
         A: fx.Tensor,  # jagged (L, K)   bf16
-        B: fx.Tensor,  # dense  (B_groups * N, K) bf16 (pre-transposed, tall)
-        BIAS: fx.Tensor,  # bias   (B_groups * N,)   bf16
-        SEQ_OFFSETS: fx.Tensor,  # (B_groups + 1,) int32
+        B: fx.Tensor,  # dense  (n_groups * N, K) bf16 (pre-transposed, tall)
+        BIAS: fx.Tensor,  # bias   (n_groups * N,)   bf16
+        SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
         n_groups: fx.Int32,
-        search_steps: fx.Int32,  # compact: ceil(log2(n_groups)); else unused
+        search_steps: fx.Int32,
         tiled_mma: fx.TiledMma,
         tiled_copy_g2s_A: fx.TiledCopy,
         tiled_copy_s2g_C: fx.TiledCopy,
@@ -121,11 +121,15 @@ def _build_launcher(
             else:
                 tile_row = fx.Int32(pid_mn)
                 block_n_idx = fx.Int32(raw_b)
-            # Group g owns M-tile slots [f(g), f(g+1)) with
-            # f(g) = seq_offsets[g] // BLOCK_M + g: strictly increasing, and
-            # each group gets at least ceil(M_g / BLOCK_M) slots. Find the
-            # last g with f(g) <= tile_row; surplus slots fail start_m < M_b.
+            # Group g owns M-tile slots [f(g), f(g+1)), with
+            # f(g) = seq_offsets[g] // BLOCK_M + g. f is strictly increasing and
+            # gives each group >= ceil(M_g / BLOCK_M) slots; surplus slots fail
+            # start_m < M_b.
             c_bm_shift = fx.Int32(BLOCK_M.bit_length() - 1)
+
+            def slot_start(g, seq_g):
+                return (seq_g >> c_bm_shift) + g
+
             c_one = fx.Int32(1)
             for _, state in range(
                 fx.Int32(0),
@@ -135,12 +139,12 @@ def _build_launcher(
             ):
                 lo, hi = state[0], state[1]
                 mid = (lo + hi + c_one) >> c_one
-                take = (load_seq(mid) >> c_bm_shift) + mid <= tile_row
+                take = slot_start(mid, load_seq(mid)) <= tile_row
                 results = yield [take.select(mid, lo), take.select(hi, mid - c_one)]
             off_b = results[0]
             seq_start = load_seq(off_b)
             seq_end = load_seq(off_b + c_one)
-            block_m_idx = tile_row - ((seq_start >> c_bm_shift) + off_b)
+            block_m_idx = tile_row - slot_start(off_b, seq_start)
         else:
             grid_x = fx.Int32(fx.grid_dim.x)
             bm_tiles = grid_x // fx.Int32(N_BLOCKS)
@@ -489,11 +493,13 @@ def jagged_dense_bmm(
     nthreads = THREADS if threads is None else threads
     compact = not uniform_seqlen
     if compact:
-        # A.shape[0] >= L bounds the occupied M-tiles without a device readback.
+        # Slot-count bound from A.shape[0] >= SEQ_OFFSETS[-1]; reading
+        # SEQ_OFFSETS[-1] would need a host sync.
         grid_m = A.shape[0] // bmn + n_groups
     else:
         grid_m = (max_seq_len + bmn - 1) // bmn
 
+    search_steps = (n_groups - 1).bit_length()
     key = (N, K, bmn, bnn, block_k, nthreads, xcd_c, xcd_w, compact, get_num_xcds())
     launch_args = (
         C,
@@ -503,7 +509,7 @@ def jagged_dense_bmm(
         SEQ_OFFSETS,
         grid_m,
         n_groups,
-        (n_groups - 1).bit_length(),
+        search_steps,
         stream,
     )
 
