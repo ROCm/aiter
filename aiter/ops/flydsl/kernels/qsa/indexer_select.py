@@ -4,7 +4,9 @@
 """FlyDSL indexer-select kernels for QSA.
 
 ``build_qsa_indexer_emit_module`` writes block ids when every row fits in the
-budget. ``build_qsa_indexer_decode_scores_module`` and
+budget, packed past any missing page. ``build_qsa_pack_valid_blocks_module``
+does the same for a selector that keeps ``-inf`` columns.
+``build_qsa_indexer_decode_scores_module`` and
 ``build_qsa_indexer_prefill_scores_module`` are the one-row and 16-row BF16
 MFMA scorers. ``build_qsa_indexer_active_columns_module`` reports the widest
 visible column count. Host dispatch and top-512 selection live in
@@ -25,9 +27,11 @@ from flydsl.expr import (
     gpu,
     range_constexpr,
 )
+from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
+from aiter.ops.flydsl.kernels.topk.topk_common import _warp_inclusive_prefix_i32
 
 # The indexer contract this module implements, rather than any one model's
 # numbers: a budget of _K compressed blocks, _KV_HEADS head of _D elements,
@@ -42,16 +46,19 @@ _D = 128
 _R = 4
 _KV_HEADS = 1
 _STREAM_SELECT_MIN_COLUMNS = 32768
-# topk_select's decode gate for k=512 is rows <= 64. Above that, one
-# workgroup per row loses to the streaming selector.
+# Above this many rows, qsa_paged selects the stable decode radix at any
+# width. The streaming selector is only a packed table at or above
+# _STREAM_SELECT_MIN_COLUMNS with no more rows than this.
 _DECODE_MAX_ROWS = 64
 # Columns per workgroup of the 16-row scorer.
 _ROWS_BLOCK_N = 64
-# gfx9 LDS is 64 banks of 4 bytes. A row of 128 bf16 is 256 bytes, one
-# full pass of the banks, so the 16 lanes that reload one MFMA column
-# (lane_m 0..15, the same d) all hit one bank. Eight bf16 of padding is
-# 16 bytes: the bank advances by 4, those lanes take distinct banks, and
-# each row stays 16-byte aligned for the 8-wide stores.
+# gfx950 LDS is 64 banks of 4 bytes; gfx942 has 32. A row of 128 bf16 is
+# 256 bytes, so without padding the 16 lanes that reload one MFMA column
+# (lane_m 0..15, the same d) all hit one bank on either arch. Eight bf16
+# of padding is 16 bytes and advances the bank by 4. On gfx950 those 16
+# lanes take distinct banks. On gfx942 the same step still collides 2
+# ways, because 16 lanes do not fit in 32 banks at a stride of 4. Each
+# row stays 16-byte aligned for the 8-wide stores.
 _LDS_ROW_PAD = 8
 # One-row partial scores. A lane stride of 4 fp32 puts lanes 16 apart in
 # the same bank, so the 64-lane store conflicts 4 ways. Stride 5 is
@@ -97,36 +104,77 @@ def _neg_inf():
     return Float32(float("-inf"))
 
 
-def build_qsa_indexer_emit_module(page_size: int):
+def _block_exclusive_count(flag, tid, wave_size, num_waves, wave_totals):
+    """Exclusive prefix and total of a 0/1 ``flag`` over the workgroup.
+
+    Each wave publishes its total, then every thread adds the totals of the
+    waves before its own, so the scan costs one barrier.
+    """
+    lane = tid % Int32(wave_size)
+    wave = _idiv(tid, Int32(wave_size))
+    inclusive = _warp_inclusive_prefix_i32(flag, lane, wave_size)
+    # Every lane stores its wave's total, read from the last lane, so the
+    # store needs no runtime branch in this plain helper.
+    wave_total = Int32(
+        fx.rocdl.ds_bpermute(T.i32, Int32((wave_size - 1) * 4), inclusive)
+    )
+    wave_totals[wave] = wave_total
+    gpu.barrier()
+    before = Int32(0)
+    total = Int32(0)
+    for w in range_constexpr(num_waves):
+        count = wave_totals[Int32(w)]
+        before = before + (wave > Int32(w)).select(count, Int32(0))
+        total = total + count
+    return before + inclusive - flag, total
+
+
+def _scan_waves(wave_size: int) -> int:
+    if wave_size not in (32, 64) or _BLOCK_THREADS % wave_size:
+        raise ValueError(f"wave size must be 32 or 64, got {wave_size}")
+    return _BLOCK_THREADS // wave_size
+
+
+def build_qsa_indexer_emit_module(page_size: int, wave_size: int):
     """Build the short-context emit kernel.
 
-    The kernel writes block ids from the query position and the context
-    length. It does not take Q, the cache, the page table, or the score
-    scale; those stay on the host wrapper for the long-row scorer.
+    The kernel writes the visible block ids from the query position and the
+    context length, skips a block whose page id is not in the cache, and
+    packs the rest in front of ``-1``. It does not take Q, the cache, or the
+    score scale; those stay on the host wrapper for the long-row scorer.
     """
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
-    if _K % _BLOCK_THREADS:
-        raise ValueError("block budget must be a multiple of block threads")
+    if _K != _BLOCK_THREADS:
+        raise ValueError("emit writes one block id per thread")
+    num_waves = _scan_waves(wave_size)
+
+    @fx.struct
+    class EmitStorage:
+        wave_totals: fx.Array[Int32, num_waves]
 
     @flyc.kernel(
         name="qsa_indexer_emit_"
-        + kernel_signature(ps=page_size, k=_K, blk=_BLOCK_THREADS),
+        + kernel_signature(ps=page_size, k=_K, blk=_BLOCK_THREADS, wave=wave_size),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def qsa_indexer_emit_kernel(
         token_to_req: fx.Tensor,
         query_positions: fx.Tensor,
         context_lens: fx.Tensor,
+        page_table: fx.Tensor,
         block_ids: fx.Tensor,
         n_columns: Int32,
         n_req: Int32,
+        n_cache_blocks: Int32,
     ):
-        row = Int32(gpu.block_id("x"))
-        tid = Int32(gpu.thread_id("x"))
+        row = fx.block_idx.x
+        tid = fx.thread_idx.x
         zero = Int32(0)
         one = Int32(1)
         neg_one = Int32(-1)
+        storage = fx.SharedAllocator().allocate(EmitStorage)
+        wave_totals = storage.wave_totals.peek().view(fx.make_layout(num_waves, 1))
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
         safe_req = valid_req.select(req, zero)
@@ -136,16 +184,30 @@ def build_qsa_indexer_emit_module(page_size: int):
         vis_s = _idiv(slen, Int32(_R))
         visible = (vis_q < vis_s).select(vis_q, vis_s)
         take = (tid < visible) & (tid < n_columns) & valid_req
-        block_ids[row, tid] = take.select(tid, neg_one)
+        logical_page = _idiv(take.select(tid, zero), Int32(page_size))
+        phys = page_table[safe_req, logical_page]
+        take = take & (phys >= zero) & (phys < n_cache_blocks)
+        flag = take.select(one, zero)
+        slot, kept = _block_exclusive_count(
+            flag, tid, wave_size, num_waves, wave_totals
+        )
+        # Kept ids land below ``kept`` and padding at or above it, so the
+        # two stores never touch one slot.
+        if take:
+            block_ids[row, slot] = tid
+        if tid >= kept:
+            block_ids[row, tid] = neg_one
 
     @flyc.jit
     def launch_qsa_indexer_emit(
         token_to_req: fx.Tensor,
         query_positions: fx.Tensor,
         context_lens: fx.Tensor,
+        page_table: fx.Tensor,
         block_ids: fx.Tensor,
         n_columns: Int32,
         n_req: Int32,
+        n_cache_blocks: Int32,
         rows: Int32,
         stream: fx.Stream,
     ):
@@ -153,9 +215,11 @@ def build_qsa_indexer_emit_module(page_size: int):
             token_to_req,
             query_positions,
             context_lens,
+            page_table,
             block_ids,
             n_columns,
             n_req,
+            n_cache_blocks,
         ).launch(
             grid=(rows, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
@@ -163,6 +227,92 @@ def build_qsa_indexer_emit_module(page_size: int):
         )
 
     return launch_qsa_indexer_emit
+
+
+def build_qsa_pack_valid_blocks_module(page_size: int, wave_size: int):
+    """Pack a block-id row so a missing page does not occupy a slot.
+
+    Only selectors that keep ``-inf`` columns need it: the split decode
+    radix past 20000 columns and the streaming selector. With fewer than
+    512 finite scores they fill the rest from that page. Each kept id
+    stays in its previous order, then the row is ``-1``.
+    """
+    if page_size < 1:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if _K != _BLOCK_THREADS:
+        raise ValueError("the pack reads one block id per thread")
+    num_waves = _scan_waves(wave_size)
+
+    @fx.struct
+    class PackStorage:
+        wave_totals: fx.Array[Int32, num_waves]
+
+    @flyc.kernel(
+        name="qsa_pack_valid_blocks_"
+        + kernel_signature(ps=page_size, k=_K, wave=wave_size),
+        known_block_size=[_BLOCK_THREADS, 1, 1],
+    )
+    def qsa_pack_valid_blocks_kernel(
+        block_ids: fx.Tensor,
+        page_table: fx.Tensor,
+        token_to_req: fx.Tensor,
+        n_columns: Int32,
+        n_cache_blocks: Int32,
+        n_req: Int32,
+    ):
+        row = fx.block_idx.x
+        tid = fx.thread_idx.x
+        zero = Int32(0)
+        one = Int32(1)
+        neg_one = Int32(-1)
+        storage = fx.SharedAllocator().allocate(PackStorage)
+        wave_totals = storage.wave_totals.peek().view(fx.make_layout(num_waves, 1))
+
+        req = token_to_req[row]
+        valid_req = (req >= zero) & (req < n_req)
+        safe_req = valid_req.select(req, zero)
+        block = block_ids[row, tid]
+        in_range = valid_req & (block >= zero) & (block < n_columns)
+        safe_block = in_range.select(block, zero)
+        logical_page = _idiv(safe_block, Int32(page_size))
+        phys = page_table[safe_req, logical_page]
+        phys_live = (phys >= zero) & (phys < n_cache_blocks)
+        keep = in_range & phys_live
+        flag = keep.select(one, zero)
+        # The scan's barrier also orders every load above before the stores.
+        exclusive, total = _block_exclusive_count(
+            flag, tid, wave_size, num_waves, wave_totals
+        )
+        if flag == one:
+            block_ids[row, exclusive] = block
+        if tid >= total:
+            block_ids[row, tid] = neg_one
+
+    @flyc.jit
+    def launch_qsa_pack_valid_blocks(
+        block_ids: fx.Tensor,
+        page_table: fx.Tensor,
+        token_to_req: fx.Tensor,
+        n_columns: Int32,
+        n_cache_blocks: Int32,
+        n_req: Int32,
+        rows: Int32,
+        stream: fx.Stream,
+    ):
+        qsa_pack_valid_blocks_kernel(
+            block_ids,
+            page_table,
+            token_to_req,
+            n_columns,
+            n_cache_blocks,
+            n_req,
+        ).launch(
+            grid=(rows, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_qsa_pack_valid_blocks
 
 
 def _dense_indexer_strides(page_size: int) -> tuple[int, int, int]:
@@ -287,9 +437,9 @@ def build_qsa_indexer_decode_scores_module(
         score_scale: Float32,
         n_cache_blocks: Int32,
     ):
-        tile = Int32(gpu.block_id("x"))
-        row = Int32(gpu.block_id("y"))
-        tid = Int32(gpu.thread_id("x"))
+        tile = fx.block_idx.x
+        row = fx.block_idx.y
+        tid = fx.thread_idx.x
         zero = Int32(0)
         one = Int32(1)
         page = Int32(page_size)
@@ -595,22 +745,14 @@ def build_qsa_indexer_prefill_scores_module(
         # Row tiles vary fastest, so workgroups resident together share
         # column tiles: the same K, many Q tiles. Each workgroup scores
         # tiles_per_wg consecutive column tiles with one Q staging.
-        row_tile = Int32(gpu.block_id("x"))
-        tile0 = Int32(gpu.block_id("y")) * tiles_per_wg
-        tid = Int32(gpu.thread_id("x"))
+        row_tile = fx.block_idx.x
+        tile0 = fx.block_idx.y * tiles_per_wg
+        tid = fx.thread_idx.x
         zero = Int32(0)
         one = Int32(1)
         page = Int32(page_size)
         wave = _idiv(tid, Int32(64))
         lane = tid - wave * Int32(64)
-        lane_m = lane % Int32(16)
-        lane_kg = _idiv(lane, Int32(16))
-        # The A row this lane feeds: row lane_m, or (row, head) when folded.
-        if const_expr(fold_heads):
-            a_row = _idiv(lane_m, Int32(n_heads))
-            a_head = lane_m - a_row * Int32(n_heads)
-        else:
-            a_row = lane_m
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
         # A buffer resource is wave-uniform, so a per-lane wide row would
@@ -644,6 +786,26 @@ def build_qsa_indexer_prefill_scores_module(
         req_lds = storage.req.view(fx.make_layout(block_m, 1))
         live_lds = storage.live.view(fx.make_layout(block_n, 1))
         qk_mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, qk_k, BFloat16))
+        # One atom per wave. Its M and N projections are the lane's row and
+        # column. Folded M is (row, head):(4, 1), so m = 4*row + head and
+        # one chain holds four heads of one row.
+        thr_qk = fx.make_tiled_mma(
+            qk_mma, fx.make_layout((1, 1, 1), (0, 0, 0))
+        ).get_slice(lane)
+        c_m = thr_qk.partition_C(fx.make_view(0, fx.make_layout((16, 16), (1, 0))))
+        c_n = thr_qk.partition_C(fx.make_view(0, fx.make_layout((16, 16), (0, 1))))
+        a_m = thr_qk.partition_A(fx.make_view(0, fx.make_layout((16, qk_k), (1, 0))))
+        a_k = thr_qk.partition_A(fx.make_view(0, fx.make_layout((16, qk_k), (0, 1))))
+        b_n = thr_qk.partition_B(fx.make_view(0, fx.make_layout((16, qk_k), (1, 0))))
+        atom_n = Int32(fx.get_scalar(c_n[0]))
+        k_col = Int32(fx.get_scalar(b_n[0]))
+        if const_expr(fold_heads):
+            fold = fx.make_layout((block_m, n_heads), (n_heads, 1))
+            a_crd = fx.idx2crd(fx.get_scalar(a_m[0]), fold)
+            a_row = Int32(a_crd[0].unpack())
+            a_head = Int32(a_crd[1].unpack())
+        else:
+            a_row = Int32(fx.get_scalar(a_m[0]))
         qk_a = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
         qk_b = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
         qk_c = fx.make_rmem_tensor(fx.make_layout(4, 1), Float32)
@@ -774,23 +936,33 @@ def build_qsa_indexer_prefill_scores_module(
 
                         # This wave's 16 columns against the tile: 16 rows per
                         # head, or 4 rows x 4 heads in one chain when folded.
-                        n_row_t = wave * Int32(16) + lane_m
+                        # K's column is the B atom's N. The score column is
+                        # the C atom's N. Both are this lane's column.
+                        n_row_t = wave * Int32(16) + k_col
+                        out_n_t = wave * Int32(16) + atom_n
                         accs_t = []
                         for head_t in range_constexpr(mfma_chains):
                             acc4_t = fx.Vector.filled(4, 0.0, Float32)
                             a_head_t = a_head if const_expr(fold_heads) else head_t
                             for ks_t in range_constexpr(k_steps):
-                                dk_t = Int32(ks_t * qk_k) + lane_kg * Int32(qk_vec)
+                                dk_t = Int32(ks_t * qk_k)
                                 a_vec_t = fx.Vector.from_elements(
                                     [
-                                        q_lds[a_row, a_head_t, dk_t + Int32(i_t)]
+                                        q_lds[
+                                            a_row,
+                                            a_head_t,
+                                            dk_t + Int32(fx.get_scalar(a_k[i_t])),
+                                        ]
                                         for i_t in range_constexpr(qk_vec)
                                     ],
                                     BFloat16,
                                 )
                                 b_vec_t = fx.Vector.from_elements(
                                     [
-                                        k_lds[n_row_t, dk_t + Int32(i_t)]
+                                        k_lds[
+                                            n_row_t,
+                                            dk_t + Int32(fx.get_scalar(a_k[i_t])),
+                                        ]
                                         for i_t in range_constexpr(qk_vec)
                                     ],
                                     BFloat16,
@@ -808,15 +980,15 @@ def build_qsa_indexer_prefill_scores_module(
                                 )
                             accs_t.append(acc4_t)
 
-                        # 16x16 C: n = lane%16 (column), m = 4*(lane/16) + elem:
-                        # the row, or 4*row + head when folded.
-                        out_col_t = tile_t * Int32(block_n) + n_row_t
+                        out_col_t = tile_t * Int32(block_n) + out_n_t
                         # A visible column on an invalid page scored a zeroed K;
                         # it must not tie into the top-512.
                         page_live_t = live_lds[n_row_t] != zero
                         if const_expr(fold_heads):
-                            # m = 4*(lane/16) + elem = 4*row + head.
-                            row_local_t = lane_kg
+                            # The four C values are the four heads of one row.
+                            row_local_t = Int32(
+                                fx.idx2crd(fx.get_scalar(c_m[0]), fold)[0].unpack()
+                            )
                             row_t = row_tile * Int32(block_m) + row_local_t
                             score_t = Float32(0.0)
                             for i_t in range_constexpr(4):
@@ -828,12 +1000,15 @@ def build_qsa_indexer_prefill_scores_module(
                                 live_t = (
                                     out_col_t < visible_lds[row_local_t]
                                 ) & page_live_t
+                                # ``scores`` must keep a dynamic row stride:
+                                # a static layout, use_32bit_stride=True, or
+                                # an Int32 linear index would wrap.
                                 scores[row_t, out_col_t] = live_t.select(
                                     score_t * score_scale, _neg_inf()
                                 )
                         else:
                             for i_t in range_constexpr(4):
-                                row_local_t = lane_kg * Int32(4) + Int32(i_t)
+                                row_local_t = Int32(fx.get_scalar(c_m[i_t]))
                                 row_t = row_tile * Int32(block_m) + row_local_t
                                 score_t = Float32(0.0)
                                 for head_t in range_constexpr(n_heads):
