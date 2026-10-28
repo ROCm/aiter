@@ -4,6 +4,9 @@
 
 Supports optional DeepGEMM-style contiguous-M scheduler
 (AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
+For A4W4, the matched tuned CSV row's ``a_preshuffle`` field selects packed
+(M/16, K/128, 4, 16, 16-byte) A for both grouped GEMMs. The field defaults to
+zero and follows the same token-bucket lookup as the other kernel parameters.
 """
 
 import csv
@@ -596,6 +599,7 @@ def _grouped_a8w4_tdm_moe(
     tdm_b_th=0,
     lds_soa_load_interleave=0,
     rolled_drain=0,
+    a_preshuffle=0,
     persistent_workers=0,
     persistent_workers2=0,
     data_format="a8w4",
@@ -626,6 +630,8 @@ def _grouped_a8w4_tdm_moe(
     )
     if _compact:
         stage2_scatter = _compact_ctx
+    _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
+    a_preshuffled = bool(_a_preshuffle_requested and not _compact)
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -733,6 +739,7 @@ def _grouped_a8w4_tdm_moe(
         _fuse_ep_route_quant = (
             _direct_ep_mask
             and enable_ep_scatter
+            and not _a_preshuffle_requested
             and int(E) <= 256
             and a1_scale is not None
             and hidden_states.dtype
@@ -809,10 +816,16 @@ def _grouped_a8w4_tdm_moe(
                 "max_tok": int(stage2_scatter.max_tokens_per_rank),
                 "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             }
+    _apre_row_to_token = (
+        torch.full((int(contiguous_m),), -1, dtype=torch.int32, device=device)
+        if a_preshuffled
+        else None
+    )
     _fuse_psum_quant = (
         _is_ep
         and enable_ep_scatter
         and not _compact
+        and not a_preshuffled
         and not _fuse_ep_route_quant
         and int(E) <= 256
         and dtype in (torch.bfloat16, dtypes.bf16)
@@ -856,6 +869,8 @@ def _grouped_a8w4_tdm_moe(
             _align_m,
             num_valid_routes=_ep_nvr,
             ep_scatter_params=ep_scatter_params,
+            row_to_token=_apre_row_to_token,
+            topk=int(topk),
         )
         psum = psum.to(torch.int32).contiguous()
     # Turns the TDM GEMM2 epilogue into the fused P2P scatter-combine.
@@ -947,6 +962,7 @@ def _grouped_a8w4_tdm_moe(
     _rm_min_tokens = int(os.environ.get("AITER_TDM_ROW_MAJOR_A1_MIN_TOKENS", "1024"))
     _row_major_a1 = (
         _prequantized
+        and not a_preshuffled
         and not _compact
         and not _fuse_ep_route_quant
         and ep_psum_params is None
@@ -962,13 +978,14 @@ def _grouped_a8w4_tdm_moe(
     _compact_ascale = (
         not _compact
         and not _prequantized
+        and not a_preshuffled
         and _ep_nvr is None
         and _use_fused_quant_preshuffle(
             model_dim, wmma_rep, _quant_mode, token_num, topk
         )
     )
     _compact_ascale_buf = None
-    _row_to_token = None
+    _row_to_token = _apre_row_to_token
     if _compact_ascale:
         _compact_ascale_buf = torch.empty(
             (token_num, model_dim // 32), dtype=torch.uint8, device=device
@@ -1025,6 +1042,7 @@ def _grouped_a8w4_tdm_moe(
             row_to_token=_row_to_token,
             ep_psum_params=ep_psum_params,
             row_major_scale=_row_major_a1,
+            payload_preshuffled=a_preshuffled,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1080,6 +1098,7 @@ def _grouped_a8w4_tdm_moe(
             n_warp=n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
+            a_preshuffled=int(a_preshuffled),
             stage1_act=stage1_act,
             bias=_b1,
             swiglu_limit=sl,
@@ -1122,6 +1141,7 @@ def _grouped_a8w4_tdm_moe(
             n_warp=n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
+            a_preshuffled=int(a_preshuffled),
             stage1_act=stage1_act,
             bias=_b1,
             swiglu_limit=sl,
@@ -1148,6 +1168,7 @@ def _grouped_a8w4_tdm_moe(
             quant_mode=_quant_mode,
             masked_m=None,
             topids_to_rows=None,
+            payload_preshuffled=a_preshuffled,
         )
 
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
@@ -1171,6 +1192,7 @@ def _grouped_a8w4_tdm_moe(
         n_warp=n_warp2,
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
+        a_preshuffled=int(a_preshuffled),
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
@@ -1204,7 +1226,9 @@ def _grouped_a8w4_tdm_moe(
                     prequantized_scale=src_a1_scale if _prequantized else None,
                     out_payload=a1_payload,
                     out_scale=a1_scale,
+                    row_to_token=_apre_row_to_token,
                     row_major_scale=_row_major_a1,
+                    payload_preshuffled=a_preshuffled,
                 ),
             )
         )
@@ -1223,6 +1247,7 @@ def _grouped_a8w4_tdm_moe(
                         topids_to_rows=None,
                         out_payload=a2_payload,
                         out_scale=a2_scale,
+                        payload_preshuffled=a_preshuffled,
                     ),
                 )
             )
@@ -1249,6 +1274,7 @@ def _grouped_a8w4_tdm_moe(
                         n_warp=n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
+                        a_preshuffled=int(a_preshuffled),
                         stage1_act=stage1_act,
                         bias=_b1,
                         swiglu_limit=sl,
@@ -1293,6 +1319,7 @@ def _grouped_a8w4_tdm_moe(
                         n_warp=n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
+                        a_preshuffled=int(a_preshuffled),
                         stage1_act=stage1_act,
                         bias=_b1,
                         swiglu_limit=sl,
@@ -1333,6 +1360,7 @@ def _grouped_a8w4_tdm_moe(
                     n_warp=n_warp2,
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
+                    a_preshuffled=int(a_preshuffled),
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
@@ -1420,15 +1448,23 @@ def grouped_gemm_gfx1250_a8w4(
     can fall back to the generic MoE.
     """
 
-    def _grouped_dbg(msg: str, stacklevel: int = 1):
-        if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        ):
+    # Read once per call (still honours a runtime change of the variable): when
+    # it is off -- always, in serving -- no debug message is formatted at all.
+    _dbg_on = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
+
+    def _grouped_dbg(msg, stacklevel: int = 1):
+        # ``msg`` may be a zero-arg callable so call sites only build their
+        # f-string when debugging is on.
+        if _dbg_on:
             import inspect
 
+            if callable(msg):
+                msg = msg()
             frame = inspect.stack()[stacklevel]
             print(
                 f"[grouped-gemm-debug] {frame.filename}:{frame.lineno} {msg}",
@@ -1441,7 +1477,7 @@ def grouped_gemm_gfx1250_a8w4(
         return repr(v)
 
     _grouped_dbg(
-        "inputs: "
+        lambda: "inputs: "
         + ", ".join(
             f"{k}={_fmt(v)}"
             for k, v in [
@@ -1480,7 +1516,9 @@ def grouped_gemm_gfx1250_a8w4(
         return None
     _is_ep = expert_mask is not None
     if _is_ep:
-        _grouped_dbg(f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}")
+        _grouped_dbg(
+            lambda: f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}"
+        )
     if hidden_pad != 0 or intermediate_pad != 0:
         hidden_pad = 0
         intermediate_pad = 0
@@ -1507,16 +1545,19 @@ def grouped_gemm_gfx1250_a8w4(
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
     q_dtype_w_key = dtypes.fp4x2 if w_is_mxfp4 else q_dtype_w
-    _grouped_dbg(f"eligible data_format={data_format}")
+    _grouped_dbg(lambda: f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None
-    _gfx_env = ";".join(
-        str(os.environ.get(k, "")).lower()
-        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
-    )
-    _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
-    if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and not _force_gfx1250:
-        return None
+    # The env overrides only matter off gfx1250 (same condition, evaluated
+    # lazily so the native-arch path skips the four env reads).
+    if get_gfx() != "gfx1250":
+        _gfx_env = ";".join(
+            str(os.environ.get(k, "")).lower()
+            for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
+        )
+        _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
+        if "gfx1250" not in _gfx_env and not _force_gfx1250:
+            return None
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
@@ -1559,7 +1600,7 @@ def grouped_gemm_gfx1250_a8w4(
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
-        _grouped_dbg(f"using grouped CSV config: {cfg_row}")
+        _grouped_dbg(lambda: f"using grouped CSV config: {cfg_row}")
     else:
         logger.info(
             "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
@@ -1625,6 +1666,9 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
+            # Follow the matched CSV bucket, including padded token counts
+            # (for example, 6144 -> 8192), just like the other kernel knobs.
+            _tdm_kw["a_preshuffle"] = _as_int(cfg_row.get("a_preshuffle"), 0)
             # GEMM1 always has a local epilogue; stage2_scatter only changes
             # GEMM2, so it does not restrict GEMM1's persistent scheduler.
             _tdm_kw["persistent_workers"] = _as_int(
@@ -1889,6 +1933,8 @@ def contiguous_psum_remap(
     tile_m: int,
     num_valid_routes: torch.Tensor | None = None,
     ep_scatter_params: dict | None = None,
+    row_to_token: torch.Tensor | None = None,
+    topk: int = 1,
 ):
     """Tile-aligned psum and in-place masked-row -> contiguous-row remap.
 
@@ -1915,6 +1961,11 @@ def contiguous_psum_remap(
             .to(device=device, dtype=torch.int32)
             .contiguous()
         )
+    row_to_token_i32 = (
+        row_to_token.reshape(-1)
+        if row_to_token is not None
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
     if ep_scatter_params is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
         # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
@@ -1936,6 +1987,7 @@ def contiguous_psum_remap(
             int(ep_scatter_params["topk"]),
             int(ep_scatter_params["max_tok"]),
             int(ep_scatter_params["slot_stride"]),
+            ptr_arg(row_to_token_i32),
             torch.cuda.current_stream(),
         )
         return starts, psum, contiguous_m_t
@@ -1958,6 +2010,8 @@ def contiguous_psum_remap(
         int(route_max_m),
         int(tile_m),
         ptr_arg(num_valid_routes_i32),
+        ptr_arg(row_to_token_i32),
+        int(topk),
         torch.cuda.current_stream(),
     )
     return starts, psum, contiguous_m_t
