@@ -3,7 +3,6 @@
 
 
 import torch
-from typing import Optional
 
 from ..jit.core import compile_ops
 
@@ -65,7 +64,7 @@ def all_gather_lastdim_add(
     inp: torch.Tensor,
     out: torch.Tensor,
     add_b: torch.Tensor,
-    add_c: Optional[torch.Tensor] = None,
+    add_c: torch.Tensor | None = None,
     reg_ptr: int = 0,
     reg_bytes: int = 0,
 ) -> None: ...

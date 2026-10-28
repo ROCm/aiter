@@ -1907,17 +1907,24 @@ class CustomAllreduce:
                 "all_gather_lastdim_add is not supported on gfx1250"
             )
         assert inp.dim() == 2, "all_gather_lastdim_add only supports 2D tensors"
+        assert inp.is_contiguous(), "all_gather_lastdim_add expects a contiguous inp"
         shape = (inp.shape[0], inp.shape[1] * self.world_size)
         if out is None:
             out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
         for t in (add_b, add_c, out):
             assert t is None or (
-                t.shape == shape and t.is_contiguous()
-            ), f"all_gather_lastdim_add expects contiguous {shape} add/out tensors"
+                t.shape == shape
+                and t.is_contiguous()
+                and t.dtype == inp.dtype
+                and t.device == inp.device
+            ), (
+                f"all_gather_lastdim_add expects contiguous {shape} add/out "
+                f"tensors with inp's dtype ({inp.dtype}) and device ({inp.device})"
+            )
         registered = (
             self._IS_CAPTURING
             and torch.cuda.is_current_stream_capturing()
-            and self.enable_register_for_capturing
+            and self._capture_registered(inp)
         )
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
