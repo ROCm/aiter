@@ -506,7 +506,7 @@ CAPS = frozenset({"mori_cco", "sdma"})
 def test_shipped_profile_rules_are_signature_checked_and_match_the_generator():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 30 + 87 and len(prof.rules()) == 24
+    assert len(prof) == 30 + 90 and len(prof.rules()) == 24
     large_rules = [r for r in prof.rules() if r.vid == "sp_qkv.large.v1"]
     small_rules = [r for r in prof.rules() if r.vid == "sp_qkv.small.v1"]
     assert (
@@ -523,7 +523,7 @@ def test_shipped_profile_rules_are_signature_checked_and_match_the_generator():
         ), r.label()
         assert (
             r.m_multiple in (256, 512, 1024)
-            and 1024 <= r.m_min <= r.m_max <= 8192
+            and 512 <= r.m_min <= r.m_max <= 8192
             and "chunks_mod4" in r.name
         )
         assert (
@@ -633,8 +633,14 @@ def test_fallback_rules_are_the_chunks_mod4_classes_and_valid_on_the_whole_grid(
                 mode,
                 m,
             )  # odd chunks -> n=1, chunks % 4 == 2 -> n=2, chunks % 4 == 0 -> n=4; half_first 0; valid for the real plan at all 87 points
+    # the rules also cover the 768 pad bucket (m_min 768: 3 chunks -> n=1; the exact rows say n=1 as well: shadowed); 512 is not covered
+    for mode in specs.MODES:
+        assert at(mode, 768) == (1, 0, "rule"), (mode, 768)
+        assert match_prefix(
+            specs.sp_qkv_spec(mode), MatchCtx("gfx950", 256, 4, 512, CAPS), only
+        ) == (None, 0)
     # a rules-only profile has no exact rows: off-grid / out-of-range m stay native
-    for m in (512, 1100, 1281, 8448):
+    for m in (1100, 1281, 8448):
         assert match_prefix(
             specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, m, CAPS), only
         ) == (None, 0)
@@ -643,7 +649,15 @@ def test_fallback_rules_are_the_chunks_mod4_classes_and_valid_on_the_whole_grid(
 def test_off_grid_and_out_of_range_m_stay_native_and_small_m_is_unaffected(
     sp_qkv_catalog,
 ):
-    for m in (257, 512, 768, 1000, 1100, 1281, 8448, 9216, 16384):
+    for m in (
+        257,
+        1000,
+        1100,
+        1281,
+        8448,
+        9216,
+        16384,
+    ):  # match_prefix: exact rows / rules only (512 and 768 are exact rows now; bucket_for_m pads the rest)
         for mode in specs.MODES:
             assert match_prefix(
                 specs.sp_qkv_spec(mode), MatchCtx("gfx950", 256, 4, m, CAPS), PROFILE
@@ -724,6 +738,7 @@ def _row_doc(r):
         "m": r.m,
         "vid": r.vid,
         "params": dict(r.params),
+        **({"pad_min": r.pad_min} if r.pad_min is not None else {}),
     }
 
 
@@ -960,7 +975,14 @@ def test_everything_else_is_explicitly_native(sp_qkv_catalog):
     for mode in specs.MODES:
         for m in range(1, 257):
             assert _small_at(mode, m)[0] is not None, (mode, m)
-        for m in [257, 300, 512, 768, 1000, 1023, 1025, 8193]:
+        for m in [
+            257,
+            300,
+            1000,
+            1023,
+            1025,
+            8193,
+        ]:  # match_prefix: exact rows / rules only
             assert _small_at(mode, m) == (None, 0), (
                 mode,
                 m,
@@ -968,7 +990,7 @@ def test_everything_else_is_explicitly_native(sp_qkv_catalog):
     # the small rows end at m=256 (the r23 bucket row), the small rules at m=255 (the large rules start at 1024)
     assert all(r.m <= 256 for r in prof.rows() if r.vid == "sp_qkv.small.v1")
     assert all(r.m_max <= 255 for r in prof.rules() if r.vid == "sp_qkv.small.v1")
-    assert all(r.m_min >= 1024 for r in prof.rules() if r.vid == "sp_qkv.large.v1")
+    assert all(r.m_min >= 512 for r in prof.rules() if r.vid == "sp_qkv.large.v1")
 
 
 def test_every_local_m_up_to_128_fuses_and_the_shape_switches_follow_their_m_limits(
@@ -1200,7 +1222,7 @@ def test_with_both_mp128_flags_off_the_profile_has_no_mp128_source_and_m65_to_25
     monkeypatch.setattr(specs, "SMALL_R22_IN_PROFILE", False)
     doc = json.loads(json.dumps(gen_profile.build_profile()))
     prof = parse_profile(doc)
-    assert len(prof) == 24 + 87 and len(prof.rules()) == 18 and len(doc["rows"]) == 111
+    assert len(prof) == 24 + 90 and len(prof.rules()) == 18 and len(doc["rows"]) == 114
     assert not {"r21", "r22"} & {dict(e.params).get("src") for e in prof.entries()}
     wb = doc["window_budget"]
     assert (
@@ -1233,7 +1255,7 @@ def test_with_only_the_r21_flag_on_r21_nh2_takes_the_mp128_slot_with_8mib_views(
     prof = parse_profile(doc)
     srcs = {dict(e.params).get("src") for e in prof.entries()}
     assert "r21" in srcs and "r22" not in srcs
-    assert len(prof) == 27 + 87 and len(prof.rules()) == 21
+    assert len(prof) == 27 + 90 and len(prof.rules()) == 21
     wb = doc["window_budget"]
     assert wb["small_owners"] == 12 and wb["max_windows"] == 52
     assert Counter(wb["small_window_sizes"]) == {4 << 20: 21, 8 << 20: 3}
@@ -1305,7 +1327,7 @@ def test_with_the_r22_flag_on_both_flags_r22_wins_with_a_4mib_view_budget_and_un
     srcs = {dict(e.params).get("src") for e in prof.entries()}
     assert "r22" in srcs and "r21" not in srcs  # r22 REPLACES r21 in the MP128 slot
     assert (
-        len(prof) == 27 + 87
+        len(prof) == 27 + 90
         and len(prof.rules()) == 21
         and [(r["m_min"], r["m_max"]) for r in doc["native_m_ranges"]] == [(129, 255)]
     )
@@ -1481,7 +1503,7 @@ def test_with_the_r23_flag_on_a_rule_covers_129_to_255_with_8mib_views_units_and
     doc = json.loads(json.dumps(gen_profile.build_profile()))
     prof = parse_profile(doc)
     assert (
-        len(prof) == 30 + 87 and len(prof.rules()) == 21 + 3
+        len(prof) == 30 + 90 and len(prof.rules()) == 21 + 3
     )  # one more rule per mode + one bucket row (m=256) per mode
     r23_rules = [r for r in doc["rules"] if r["params"].get("src") == "r23"]
     mode_of = {specs.sp_qkv_spec(m).signature(): m for m in specs.MODES}
@@ -1546,10 +1568,12 @@ def test_with_the_r23_flag_on_a_rule_covers_129_to_255_with_8mib_views_units_and
             for a in jit.device_cmd_one("r23", u.meta["dev"], TOOL, "/out", "sm_ran")
         ]
         assert any(a.endswith("small/r23/device/ran_kernel.cu") for a in cmd)
-    # the KEY gate: 157 + 128 token counts (every local m 1..256) x 65 sites, all distinct non-zero 31-bit ids
+    # the KEY gate: 286 token counts = 30 large (the 1024..8192 grid + the 768 bucket) + 128 (local m 1..128) + 128 (local m 129..256) x 65 sites, all distinct non-zero 31-bit ids
     rep = callid.check_profile_call_ids(prof, R23_KEY_SITES, world=4)
     assert (
-        rep.unresolved == [] and rep.keys == (157 + 128) * len(R23_KEY_SITES) and rep.ok
+        rep.unresolved == []
+        and rep.keys == (30 + 128 + 128) * len(R23_KEY_SITES)
+        and rep.ok
     )
     # nh=2 is another build; r23 without an MP128 source leaves m 65..128 native
     monkeypatch.setattr(specs, "SMALL_R23_PROFILE_NH", 2)
@@ -1675,15 +1699,21 @@ def test_bucket_for_m_small_pads_into_the_smallest_exact_row_within_its_band(
         ):
             row = prof.lookup(sig, "gfx950", 256, 4, _bucket(mode, m, prof))
             assert dict(row.params)["src"] == src, (mode, m)
-        # above the envelope: native (m 257..895); the shipped large rows are r13 (pad-M from m_pad_min_large = 896): m 896..1023 -> the 1024 bucket, then ceil 256
-        for m in (257, 300, 512, 895, 8193, 20000):
+        # above the small envelope: the shipped large rows are r13 (pad-M): m 257..512 native (the 512 bucket is not shipped); the 768 bucket pads from its per-mode pad_min
+        # (dense 700, indexer 600, reuse 513); the 1024 bucket from 769 (all modes), then ceil 256 up to 8192; 8193+ native
+        floor768 = {"dense": 700, "indexer": 600, "reuse": 513}[mode]
+        for m in (257, 300, 511, 512, floor768 - 1):
             assert _bucket(mode, m, prof) is None, (mode, m)
-        for m in (896, 1000, 1023, 1024):
+        for m in (floor768, 700 if mode == "dense" else floor768, 767, 768):
+            assert _bucket(mode, m, prof) == 768, (mode, m)
+        for m in (769, 896, 1000, 1023, 1024):
             assert _bucket(mode, m, prof) == 1024, (mode, m)
         for m in (1025, 1100, 1280):
             assert _bucket(mode, m, prof) == 1280, (mode, m)
         for m in (4096, 8191, 8192):
             assert _bucket(mode, m, prof) == (m if m != 8191 else 8192), (mode, m)
+        for m in (8193, 20000):
+            assert _bucket(mode, m, prof) is None, (mode, m)
 
 
 def test_bucket_for_m_is_a_pure_function_of_the_real_m(sp_qkv_catalog):
@@ -1697,19 +1727,37 @@ def test_bucket_for_m_is_a_pure_function_of_the_real_m(sp_qkv_catalog):
             )  # capabilities / graph mode never change the choice
 
 
-def test_bucket_for_m_large_pads_to_ceil_256_with_r13_and_honours_m_pad_min_large(
+def test_bucket_for_m_large_pads_to_ceil_256_with_r13_and_honours_the_floors(
     jit_root, sp_qkv_catalog
 ):
     doc = json.loads(json.dumps(gen_profile.build_profile()))
-    assert doc["m_pad_min_large"] == specs.M_PAD_MIN_LARGE == 896
+    assert doc["m_pad_min_large"] == specs.M_PAD_MIN_LARGE == 769
     assert {
         r["params"]["src"]
         for r in doc["rows"] + doc["rules"]
         if r["vid"] == "sp_qkv.large.v1"
     } == {"r13"}
+    # Evidence's per-mode floors are explicit row fields (768: dense 700, indexer 600, reuse 513; 1024: 769 in every mode); no 512 row
+    floors = {
+        (r["cell"].split("_")[0], r["m"]): r["pad_min"]
+        for r in doc["rows"]
+        if "pad_min" in r
+    }
+    assert floors == {
+        ("dense", 768): 700,
+        ("indexer", 768): 600,
+        ("reuse", 768): 513,
+        ("dense", 1024): 769,
+        ("indexer", 1024): 769,
+        ("reuse", 1024): 769,
+    }
+    assert not any(r["m"] == 512 and r["vid"] == "sp_qkv.large.v1" for r in doc["rows"])
     prof = parse_profile(doc)
     for mode in specs.MODES:
         for m, want in (
+            (257, None),
+            (512, None),
+            (769, 1024),
             (896, 1024),
             (1000, 1024),
             (1023, 1024),
@@ -1722,45 +1770,93 @@ def test_bucket_for_m_large_pads_to_ceil_256_with_r13_and_honours_m_pad_min_larg
             (4097, 4352),
             (8191, 8192),
             (8192, 8192),
+            (8193, None),
         ):
             assert _bucket(mode, m, prof) == want, (mode, m)
-        assert _bucket(mode, 8193, prof) is None  # above the largest row
-        for m in (
-            257,
-            300,
-            512,
-            768,
-            895,
-        ):  # below m_pad_min_large: native (native wins there)
-            assert _bucket(mode, m, prof) is None, (mode, m)
-        assert _bucket(mode, 129, prof) == 256  # the small band is unchanged
-    # the profile field moves the threshold: 512 pads m >= 512 into the 1024 bucket, 300 stays native; 1024 pads nothing below 1024
-    prof512 = parse_profile({**doc, "m_pad_min_large": 512})
+        assert (
+            _bucket(mode, 129, prof) == 256 and _bucket(mode, 256, prof) == 256
+        )  # the small band is unchanged
+    # the 768 bucket, per mode
+    for mode, floor in (("dense", 700), ("indexer", 600), ("reuse", 513)):
+        assert (
+            _bucket(mode, floor - 1, prof) is None
+            and _bucket(mode, floor, prof) == 768
+            and _bucket(mode, 768, prof) == 768
+        )
+    assert _bucket("dense", 699, prof) is None and _bucket("dense", 700, prof) == 768
     assert (
-        _bucket("dense", 600, prof512) == 1024
-        and _bucket("dense", 300, prof512) is None
-        and _bucket("dense", 511, prof512) is None
+        _bucket("indexer", 599, prof) is None and _bucket("indexer", 600, prof) == 768
     )
-    prof1024 = parse_profile({**doc, "m_pad_min_large": 1024})
+    assert _bucket("reuse", 512, prof) is None and _bucket("reuse", 513, prof) == 768
+
+    # tightening ONE bucket's range by editing its row (the 896 study at the 1024 bucket): 769..895 becomes native for that mode, 768 is untouched
+    d = json.loads(json.dumps(doc))
+    for r in d["rows"]:
+        if (
+            r["vid"] == "sp_qkv.large.v1"
+            and r["m"] == 1024
+            and r["cell"].startswith("dense")
+        ):
+            r["pad_min"] = 896
+    p = parse_profile(d)
     assert (
-        _bucket("dense", 1023, prof1024) is None
-        and _bucket("dense", 1025, prof1024) == 1280
+        _bucket("dense", 895, p) is None
+        and _bucket("dense", 896, p) == 1024
+        and _bucket("indexer", 895, p) == 1024
     )
-    # an exact row is never padded away: m == a row is that row even below the threshold
+    # "no larger bucket" rule: lowering the 768 floor of one mode below 700 does not let m fall through to 1024 from below, and removing the 768 row's floor
+    # falls back to the profile field (769: nothing below pads)
+    d = json.loads(json.dumps(doc))
+    for r in d["rows"]:
+        if r["vid"] == "sp_qkv.large.v1" and r["m"] == 768:
+            del r["pad_min"]
+    p = parse_profile(d)
     assert (
-        _bucket("dense", 1024, parse_profile({**doc, "m_pad_min_large": 4096})) == 1024
+        _bucket("reuse", 700, p) is None
+        and _bucket("reuse", 769, p) == 1024
+        and _bucket("reuse", 768, p) == 768
     )
-    # without the field the class default (896) applies
+    # a row without pad_min uses the profile field m_pad_min_large: the 1280 row (no row floor) with the field raised to 1400 pads only from 1400 on (1536 bucket)
+    d = json.loads(json.dumps(doc))
+    d["m_pad_min_large"] = 1400
+    p = parse_profile(d)
+    assert (
+        _bucket("dense", 1300, p) is None
+        and _bucket("dense", 1400, p) == 1536
+        and _bucket("dense", 1536, p) == 1536
+    )
+    assert (
+        _bucket("dense", 800, p) == 1024
+    )  # rows WITH pad_min ignore the profile field
+    # an exact row is never padded away: m == a row is that row whatever the floors
+    d["m_pad_min_large"] = 4096
+    assert _bucket("dense", 1280, parse_profile(d)) == 1280
+    # without the field the class default (769) applies
     nofield = {k: v for k, v in doc.items() if k != "m_pad_min_large"}
-    assert (
-        _bucket("dense", 896, parse_profile(nofield)) == 1024
-        and _bucket("dense", 895, parse_profile(nofield)) is None
-    )
+    assert _bucket("dense", 1300, parse_profile(nofield)) == 1536
     for bad in (0, -1, "1024", True, 1.5):
         with pytest.raises(
             ProfileError, match="m_pad_min_large must be a positive int"
         ):
             parse_profile({**doc, "m_pad_min_large": bad})
+    # row.pad_min is validated: an int in 1..m
+    for bad in (0, -1, "300", True, 1.5, 769):
+        d = json.loads(json.dumps(doc))
+        next(r for r in d["rows"] if r["vid"] == "sp_qkv.large.v1" and r["m"] == 768)[
+            "pad_min"
+        ] = bad
+        with pytest.raises(
+            ProfileError, match=r"pad_min must be an int in 1\.\.m \(768\)"
+        ):
+            parse_profile(d)
+    # the Row carries it (and _row_doc round-trips it)
+    row = next(
+        r
+        for r in prof.rows()
+        if r.m == 768 and r.vid == "sp_qkv.large.v1" and r.pad_min == 700
+    )
+    assert _row_doc(row)["pad_min"] == 700
+    assert all(r.pad_min is None for r in prof.rows() if r.vid == "sp_qkv.small.v1")
 
 
 def test_the_r12_layout_has_no_pad_m_for_the_large_band_only_exact_rows(
@@ -1771,13 +1867,14 @@ def test_the_r12_layout_has_no_pad_m_for_the_large_band_only_exact_rows(
     )  # the rollback / A/B layout
     prof = parse_profile(json.loads(json.dumps(gen_profile.build_profile())))
     for mode in specs.MODES:
-        for m in (896, 1000, 1023, 1025, 1100, 8191):
+        for m in (257, 300, 513, 769, 896, 1000, 1023, 1025, 1100, 8191):
             assert _bucket(mode, m, prof) is None, (
                 mode,
                 m,
             )  # r12 launches its bound M only
-        for m in (1024, 1280, 8192):
+        for m in (768, 1024, 1280, 8192):
             assert _bucket(mode, m, prof) == m, (mode, m)
+        assert _bucket(mode, 512, prof) is None  # no 512 row in the shipped layouts
         assert _bucket(mode, 129, prof) == 256  # the small band keeps padding
 
 
@@ -1807,12 +1904,32 @@ def test_match_padded_returns_the_bucket_plan_and_native_none(
     )
     assert (bucket, plan.bucket_m) == (16, 16)  # m == an exact row
     assert match_padded(
-        specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 500, caps), PROFILE
+        specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 8200, caps), PROFILE
     ) == (
         None,
         0,
         None,
-    )  # m 257..1023: native
+    )  # m > 8192: native
+    for mode in specs.MODES:  # m 257..512: native (the 512 bucket is not shipped)
+        assert match_padded(
+            specs.sp_qkv_spec(mode), MatchCtx("gfx950", 256, 4, 500, CAPS), PROFILE
+        ) == (None, 0, None)
+    assert match_padded(
+        specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 600, CAPS), PROFILE
+    ) == (
+        None,
+        0,
+        None,
+    )  # dense floor 700
+    p600, _n, b600 = match_padded(
+        specs.sp_qkv_spec("reuse"), MatchCtx("gfx950", 256, 4, 600, CAPS), PROFILE
+    )
+    assert (b600, p600.M, p600.n, p600.half_first) == (
+        768,
+        768,
+        1,
+        0,
+    )  # the 768 bucket (3 chunks: n must be 1)
     # the large plan (the shipped r13 layout): built for the BUCKET M, run with the real rows
     prof = parse_profile(json.loads(json.dumps(gen_profile.build_profile())))
     plan900, n900, bucket900 = match_padded(
@@ -1874,3 +1991,100 @@ def test_the_r12_layout_keeps_the_budget_and_swaps_only_the_large_source(
         and {u.meta["src"] for u in large} == {"r13"}
         and len(large) == 2
     )
+
+
+# ======================================================================= the 512 / 768 pad buckets: plan constraints and the r13 static asserts
+def test_the_512_and_768_buckets_use_the_only_params_legal_for_2_and_3_chunks(
+    monkeypatch, jit_root, sp_qkv_catalog
+):
+    from aiter.gemm_fusion import ContractError
+    from aiter.ops.gemm_fusion.sp_qkv import variants_large
+
+    # the capability (both buckets, n=1 / half_first 0) and what the profile ships: 768 only (Evidence: 512 never pays for dense / indexer, ~1.005 for reuse)
+    assert specs.LARGE_PAD_BUCKETS == {512: (1, 0), 768: (1, 0)}
+    assert specs.LARGE_PAD_BUCKETS_IN_PROFILE == (768,)
+    assert specs.LARGE_BUCKET_PAD_MIN == {
+        "dense": {512: 512, 768: 700, 1024: 769},
+        "indexer": {512: 512, 768: 600, 1024: 769},
+        "reuse": {512: 450, 768: 513, 1024: 769},
+    }
+
+    def plan(mode, m, **params):
+        base = {"n": 1, "half_first": 0, "no_gridread": 1, "src": "r13"}
+        return variants_large.SpQkvLarge(
+            specs.sp_qkv_spec(mode).prefix(1),
+            {**base, **params},
+            MatchCtx("gfx950", 256, 4, m, CAPS),
+        )
+
+    for mode in specs.MODES:
+        assert (
+            plan(mode, 512).n == 1 and plan(mode, 768).n == 1
+        )  # the plans exist for both
+        # 2 chunks: puts per peer n in {1, 2} (n must divide the chunk count; n=2 may be half-first); 4 does not divide 2
+        assert (
+            plan(mode, 512, n=2).n == 2
+            and plan(mode, 512, n=2, half_first=1).half_first == 1
+        )
+        with pytest.raises(ContractError, match=r"n=4 invalid for 2 chunks"):
+            plan(mode, 512, n=4)
+        # 3 chunks: only n=1 divides 3; quarter-first (n=3) exists only at 8 chunks (dense build), half-first needs n >= 2
+        for bad, msg in (
+            ({"n": 2}, r"n=2 invalid for 3 chunks"),
+            ({"n": 4}, r"n=4 invalid for 3 chunks"),
+            ({"n": 3, "half_first": 2}, "quarter-first"),
+            ({"n": 1, "half_first": 1}, "half-first needs n >= 2"),
+        ):
+            with pytest.raises(ContractError, match=msg):
+                plan(mode, 768, **bad)
+    # the shipped profile: the 768 rows (n=1, per-mode floors, "not swept" note), NO 512 rows
+    clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    doc = json.loads(Path(profmod._resolve(PROFILE)).read_text(encoding="utf-8"))
+    notes = {(r["sig"], r["m"]): r.get("note", "") for r in doc["rows"]}
+    for mode in specs.MODES:
+        sig = specs.sp_qkv_spec(mode).prefix(1).signature()
+        assert prof.lookup(sig, "gfx950", 256, 4, 512) is None
+        row = prof.lookup(sig, "gfx950", 256, 4, 768)
+        assert dict(row.params) == {
+            "n": 1,
+            "half_first": 0,
+            "no_gridread": 1,
+            "src": "r13",
+        }
+        assert (
+            row.pad_min == specs.LARGE_BUCKET_PAD_MIN[mode][768]
+            and row.vid == "sp_qkv.large.v1"
+        )
+        assert (
+            "not swept" in notes[(sig, 768)] and "Evidence floors" in notes[(sig, 768)]
+        )
+    # the CAPABILITY: switching the 512 bucket on adds its rows with the per-mode floors (dense / indexer: exact m only, reuse from 450)
+    monkeypatch.setattr(specs, "LARGE_PAD_BUCKETS_IN_PROFILE", (512, 768))
+    p2 = parse_profile(json.loads(json.dumps(gen_profile.build_profile())))
+    assert len(p2) == len(prof) + 3
+    assert _bucket("dense", 500, p2) is None and _bucket("dense", 512, p2) == 512
+    assert _bucket("indexer", 511, p2) is None and _bucket("indexer", 512, p2) == 512
+    assert (
+        _bucket("reuse", 449, p2) is None
+        and _bucket("reuse", 450, p2) == 512
+        and _bucket("reuse", 512, p2) == 512
+    )
+    assert (
+        _bucket("reuse", 513, p2) == 768 and _bucket("dense", 513, p2) is None
+    )  # 768 keeps its own floors
+    # r13's static proof (lg_r6x.hpp r13_live_ok) lists the chunk counts it instantiates: n1 {1,2,4,8,16,32}, n2 {2..32}: both buckets are inside it or n=1 (a single group copying every live row: contiguous by construction)
+    import re
+
+    hpp = Path(
+        os.path.join(jit.CSRC, "large", "r13", "device", "lg_r6x.hpp")
+    ).read_text(encoding="utf-8")
+    n1 = {int(x) for x in re.findall(r"r13_live_ok<1, 0>\((\d+)\)", hpp)}
+    n2 = {int(x) for x in re.findall(r"r13_live_ok<2, 0>\((\d+)\)", hpp)}
+    assert {1, 2, 4, 8, 16, 32} == n1 and 2 in n2
+    assert (
+        512 // 256 in n1 and 512 // 256 in n2
+    )  # 2 chunks: n=1 and n=2 are both asserted
+    assert (
+        768 // 256 not in n1
+    )  # 3 chunks: n=1 is the single-group plan (and the odd-chunk n=1 rows 1280 / 1792 / ... already run: Evidence G-M1)

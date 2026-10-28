@@ -123,13 +123,32 @@ def small_cell_params(mode: str, T: int) -> dict:
 # default captured bucket, and a range rule over 65..128): r22 (tuned MP128, SM_MP 128, 3-slot Rx in ONE 4 MiB view) {nh 1, b_quad 1, gemm_bn128 0, rx3 1} (SMALL_R22_IN_PROFILE),
 # which replaced r21 (SM_MP 128, nh=2, its Rx needs an 8 MiB arena view; still selectable, SMALL_R21_IN_PROFILE). The MP256 slot serves local m 129..255 (T 516..1020) with ONE range
 # rule per mode and no exact row (the default capture list pads to T = 256, 512 at most): r23 (SM_MP 256, 3-slot Rx in an 8 MiB view) {nh 1, b_quad 1, rx3 1, gemm_bn128 0, pfk 4,
-# p_nt 2, push_passtrip 1} (SMALL_R23_IN_PROFILE). So every local m 1..255 fuses; local m 256..1023 has no fused path (deliberately native: no row, no rule) and the large path
-# starts at m=1024.
+# p_nt 2, push_passtrip 1} (SMALL_R23_IN_PROFILE) plus its bucket row at m=256. So every local m 1..256 fuses on the small plans (pad-M buckets 1, 2, 4, 8, 12, 16, 32, 64, 128, 256); local m
+# 257..8192 pads into the large r13 buckets (768 from its per-mode pad_min 700 / 600 / 513, 1024 from 769, then every multiple of 256); m 257..512 and 513..pad_min-1 of the 768 bucket are native, and m > 8192 is native.
 SMALL_P2_M = (1, 2, 4, 8, 12)
-# R16 pad-M: the smallest real local m the LARGE plans are padded into a bucket for (the profile field m_pad_min_large, read by match.bucket_for_m); below it only exact rows. From the
-# Evidence m0 study of large/r13g at the 1024 bucket (same-window ratios vs native): native wins below m_real ~ 896 for dense (~768 for indexer / reuse), the pad path wins from there up
-# (B/C 1.07-1.23 at every m_real >= 1024), so m_real 896..1023 is served by the 1024 bucket and local m 257..895 stays native (outside the small envelope, below the large band).
-M_PAD_MIN_LARGE = 896
+# R16 pad-M, the large buckets (match.bucket_for_m): a real local m is padded into the first exact large row >= m (the bucket) only from that row's floor on: the row's own pad_min, else the
+# profile field m_pad_min_large (M_PAD_MIN_LARGE). Evidence's floors on the r13 profile with the 512 / 768 / 1024 buckets (two windows, worst B/C vs native):
+#   bucket 512 : never pays for dense (0.958 even at m=512 exact) / indexer (0.979); reuse only ~1.005 from m=450 up; n=2 is worse  -> NOT in the shipped profile (capability kept below);
+#   bucket 768 : dense >= 1.0 from m=700 (1.015), indexer from 600 (1.016), reuse from 513 (1.022)                                  -> shipped, per-mode pad_min 700 / 600 / 513;
+#   bucket 1024: every mode >= 1.0 at m=769 (dense 1.025, indexer / reuse ~1.19)                                                      -> shipped, pad_min 769.
+# Result: m 257..512 native (all modes), 513..699 native for dense, 513..599 for indexer, then 768 / 1024 / ceil 256 up to 8192; 8193+ native.
+# The shipped profile rows carry their own pad_min, so m_pad_min_large only matters for rows WITHOUT one (the rows from 1280 up): 769 = no row without its own floor pads below the
+# 1024 bucket's range (and, were a row's pad_min removed, it would stop padding below 769).
+M_PAD_MIN_LARGE = 769
+# The large buckets BELOW the swept grid (p1_sweep.P1_GRID = 1024..8192 step 256): local m -> (n, half_first), same for the three modes. NOT swept: n = 1 / half_first = 0 is the best at
+# the smallest swept cells (m=1024 and 1280, every mode, p1_sweep.P1_BEST) and the only legal puts_per_peer at 3 chunks (n must divide the chunk count; n=3 exists only as quarter-first at
+# 8 chunks); 2 chunks would also allow n=2, which Evidence measured worse at 512. The CAPABILITY (both buckets) is kept; LARGE_PAD_BUCKETS_IN_PROFILE selects what the profile ships.
+LARGE_PAD_BUCKETS = {512: (1, 0), 768: (1, 0)}
+LARGE_PAD_BUCKETS_IN_PROFILE = (
+    768,
+)  # 512 dropped: it never pays for dense / indexer and only ~1.005 for reuse (see above)
+# Per-mode floors (row.pad_min) of the buckets below / at the start of the grid, from the Evidence numbers above. The 512 entries are the capability's floors if it is switched on: dense /
+# indexer never pay (floor = 512: exact m only), reuse from 450.
+LARGE_BUCKET_PAD_MIN = {
+    "dense": {512: 512, 768: 700, 1024: 769},
+    "indexer": {512: 512, 768: 600, 1024: 769},
+    "reuse": {512: 450, 768: 513, 1024: 769},
+}
 SMALL_R20_ROW_M = (64,)
 SMALL_R20_RULE_M = (33, 64)  # (m_min, m_max), every m (m_multiple 1)
 SMALL_R20_SRC = "r20"
@@ -171,7 +190,7 @@ _NATIVE_NOTE_R23_ONLY = "no fused path (T 260..512): native by design in this la
 _NATIVE_NOTE_R21_ON = "no fused path (T 516..1020): native by design; the small kernels end at m=128 (r21 MP128, nh=2: 1.10-1.42x of native over T 260..512, GPU58 tick-free X1 timing), the large path starts at m=1024"
 _NATIVE_NOTE_R22_ON = "no fused path (T 516..1020): native by design; the small kernels end at m=128 (r22 MP128 {nh 1, BN64, p_nt 2, push_passtrip 1}: T512 B/C 1.28-1.33x of native (55.7 / 56.5 / 55.6 us; 1.23-1.28x before passtrip, 1.19-1.23x before p_nt) vs r21 nh=2 at 1.09-1.16x, GPU58 timing, all gates passed), the large path starts at m=1024"
 _NATIVE_NOTE_R21_OFF = "no fused path (T 260..1020, incl. the default capture bucket T=512): native by design; the small kernels end at m=64, the large path starts at m=1024 (r21 MP128 is not selected in this layout)"
-NATIVE_M_RANGES = ()  # the SHIPPED layout (r22 + r23 on): every local m 1..255 fuses (local m 257..895 is outside the small envelope and below the large band: native; m 896..1023 pads into the 1024 bucket, the large rows start at 1024)
+NATIVE_M_RANGES = ()  # the SHIPPED layout (r22 + r23 on): every local m 1..255 fuses (local m 257..512 and up to the 768 bucket's per-mode pad_min - 1 are native; above them the large buckets 768 / 1024 / ... pad)
 
 
 def native_m_ranges() -> tuple[dict, ...]:

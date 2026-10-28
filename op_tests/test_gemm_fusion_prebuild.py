@@ -162,17 +162,17 @@ def test_row_mode_recovery_and_unknown_rows_are_skipped_not_errors(jit_root):
     modes = sorted((r.vid.split(".")[1], pb.row_mode(r)) for r in prof.rows())
     from collections import Counter
 
-    # 30 small rows (6 tuned + 15 P2 + 3 r20 + 3 r22 + 3 r23 bucket rows, 10 per mode) and 87 large rows (29 per mode): the mode is recovered from the signature for rows AND rules
+    # 30 small rows (6 tuned + 15 P2 + 3 r20 + 3 r22 + 3 r23 bucket rows, 10 per mode) and 90 large rows (30 per mode): the mode is recovered from the signature for rows AND rules
     assert Counter(m for v, m in modes if v == "small") == {
         "dense": 10,
         "indexer": 10,
         "reuse": 10,
     }
     assert Counter(m for v, m in modes if v == "large") == {
-        "dense": 29,
-        "indexer": 29,
-        "reuse": 29,
-    }
+        "dense": 30,
+        "indexer": 30,
+        "reuse": 30,
+    }  # 29 swept (1024..8192) + the 768 pad bucket
     assert Counter(pb.row_mode(r) for r in prof.rules()) == {
         "dense": 8,  # per mode: 3 chunks-mod-4 large layers + 5 small ranges (r19 1..16, r19 17..32, r20 33..64, r22 65..128, r23 129..255)
         "indexer": 8,

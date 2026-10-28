@@ -258,8 +258,8 @@ def test_small_variant_registers_and_contract(monkeypatch):
         PROFILE,
     )
     assert n == 2 and plan.params["reuse_no_idx"] == 1
-    # not covered -> native (every local m 1..255 fuses: rows + the r19 / r20 / r22 / r23 rules; m 256..1023 is native by design, the large path starts at m=1024)
-    for m_native in (257, 300, 512, 1000):
+    # not covered by an exact row / rule -> native for match_prefix (every local m 1..256 has a small row or rule; the large rows sit at 512, 768 and 1024..8192 step 256: bucket_for_m pads the rest)
+    for m_native in (257, 300, 1000):
         assert match_prefix(
             spec, MatchCtx("gfx950", 256, 4, m_native, frozenset({"mori_cco"})), PROFILE
         ) == (None, 0), m_native
@@ -291,13 +291,15 @@ def test_small_variant_registers_and_contract(monkeypatch):
 
 
 # ======================================================================= large-M (S2-2b-iii)
-def test_profile_has_117_rows_and_large_prefix_signatures():
-    """24 small rows (see test_small_profile_rows...) + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep, src r12)."""
+def test_profile_has_120_rows_and_large_prefix_signatures():
+    """30 small rows (see test_small_profile_rows...) + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep) + 3 pad-bucket rows (m = 768; the 512 bucket is capability only), src r13."""
     from aiter.ops.gemm_fusion.sp_qkv import p1_sweep
 
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 117  # 30 small + 87 large
+    assert (
+        len(prof) == 120
+    )  # 30 small + 90 large (87 swept + the 768 pad bucket x 3 modes)
     assert (
         len(p1_sweep.P1_GRID) == 29
         and sum(len(v) for v in p1_sweep.P1_BEST.values()) == 87
@@ -339,7 +341,15 @@ def test_profile_has_117_rows_and_large_prefix_signatures():
         ("indexer", 8192),
         ("reuse", 4096),
     }
-    assert sum(1 for v in notes.values() if v) == 4
+    assert sum(1 for v in notes.values() if v and not v.startswith("R16")) == 4
+    assert (
+        sum(
+            1
+            for v in notes.values()
+            if v.startswith("R16 pad-M bucket below the P1 grid (not swept)")
+        )
+        == 3
+    )  # 768 x 3 modes
     # reuse and dense large rows have different signatures (reuse drops iq/ik in the exchange)
     assert (
         specs.sp_qkv_spec("dense").prefix(1).signature()
@@ -460,7 +470,26 @@ def test_large_variant_contract_and_sizes(monkeypatch):
         and p1024.M == 1024
         and (p1024.n, p1024.half_first) == (1, 0)
     )
-    for m_native in (512, 768, 1100, 8448):
+    assert match_prefix(spec, MatchCtx("gfx950", 256, 4, 512, caps), PROFILE) == (
+        None,
+        0,
+    )  # the 512 bucket is NOT in the shipped profile (never pays for dense / indexer, ~1.005 for reuse)
+    for m in (
+        768,
+    ):  # the R16 bucket below the swept grid: an exact row, n=1 (the best at the smallest swept cells, the only legal n at 3 chunks)
+        pm, nm = match_prefix(spec, MatchCtx("gfx950", 256, 4, m, caps), PROFILE)
+        assert (
+            nm == 1
+            and pm.profile_source == "row"
+            and pm.M == m
+            and (pm.n, pm.half_first) == (1, 0)
+        )
+    for m_native in (
+        512,
+        520,
+        1100,
+        8448,
+    ):  # match_prefix is exact rows / rules only: off the 256 grid stays native (bucket_for_m pads)
         assert match_prefix(
             spec, MatchCtx("gfx950", 256, 4, m_native, caps), PROFILE
         ) == (
@@ -4941,9 +4970,9 @@ def test_profile_selects_r13_for_large_rows_and_rules_and_budgets_the_page():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     large = [e for e in prof.entries() if e.vid == "sp_qkv.large.v1"]
-    assert len(large) == 87 + 9 and {dict(e.params)["src"] for e in large} == {
+    assert len(large) == 90 + 9 and {dict(e.params)["src"] for e in large} == {
         "r13"
-    }  # 87 exact rows + the 9 fallback rules
+    }  # 87 swept + 3 bucket rows (768) = 90 exact rows + the 9 fallback rules
     small = [e for e in prof.rows() if e.vid == "sp_qkv.small.v1"]
     assert len(small) == 30 and {dict(e.params)["src"] for e in small} == {
         "r19",
@@ -4960,7 +4989,7 @@ def test_profile_selects_r13_for_large_rows_and_rules_and_budgets_the_page():
         and specs.LARGE_R13_IN_PROFILE is True
         and specs.large_profile_src() == "r13"
     )
-    assert prof.meta["m_pad_min_large"] == specs.M_PAD_MIN_LARGE == 896
+    assert prof.meta["m_pad_min_large"] == specs.M_PAD_MIN_LARGE == 769
     # the arena is the sum of the shared set and the small windows: 468 MiB (336 shared + 132 small)
     assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 468 << 20
 

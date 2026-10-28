@@ -155,10 +155,10 @@ LARGE_SRC_SHA = {
 )
 class SpQkvLarge(Plan):
     n_stages = 1
-    # R16 bucket selection (match.bucket_for_m): a real local m is padded into a larger bucket only from this m on (profile field m_pad_min_large; default 896: native wins below m_real ~ 896 at the 1024 bucket (dense; ~768 for indexer / reuse), the large path's
-    # first multiple: m 256..1023 stays native until measurements say otherwise)
+    # R16 bucket selection (match.bucket_for_m): a real local m is padded into the bucket (the first exact row >= m) only from the bucket's floor on: the row's own pad_min, else the
+    # profile field m_pad_min_large (default 769). The shipped rows carry Evidence's per-mode floors (768: 700 / 600 / 513, 1024: 769); the 512 bucket never paid (see specs).
     pad_m_min_field = "m_pad_min_large"
-    pad_m_min_default = 896
+    pad_m_min_default = 769
 
     def __init__(self, spec, params, ctx):
         self.spec, self.params = spec, dict(params)

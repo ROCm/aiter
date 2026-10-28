@@ -137,7 +137,7 @@ def bucket_for_m(
     Per prefix (longest first, like match_prefix) the candidates are the profile's EXACT rows of (sig, arch, cu, world), ascending in m: the smallest row with m_row >= m whose variant
     accepts the launch (``Plan.accepts_launch_m(params, m_row, m)``: m == m_row always; below it only pad-M sources, within their padded rows and shape switches) wins, so m == an
     exact row is that row, and e.g. m 129..256 lands on the MP256 row, m 65..128 on the MP128 row, m 896..1023 on the 1024 row, m 1025..1280 on the 1280 row. A variant that declares ``pad_m_min_field``
-    (the large plans: profile field ``m_pad_min_large``, default 896 = where the pad path starts to beat native at the 1024 bucket) is padded only from that m on: below it only an exact row is used. When no row can take m, a range rule covering
+    (the large plans: profile field ``m_pad_min_large``) is padded only from that m on, and a row's own ``pad_min`` overrides it for that bucket: below the floor of the first row >= m the m is native (exact rows only). When no row can take m, a range rule covering
     m resolves it exactly (the bucket is m itself); otherwise the next shorter prefix, else None. A pure function of (spec, arch, cu, world, m) and the immutable profile, so every
     rank chooses the same bucket. Capabilities / graph mode are not consulted here (they are checked when the plan is built for the bucket).
     """
@@ -154,7 +154,10 @@ def bucket_for_m(
 def bucket_in_band(
     prof: Profile, sig: str, arch: str, cu: int, world: int, m: int
 ) -> tuple[int, str] | None:
-    """The bucket of ONE (sig, arch, cu, world) band for the real local m: (bucket_m, vid), or None (see bucket_for_m for the rule). Shared with the call_id universe."""
+    """The bucket of ONE (sig, arch, cu, world) band for the real local m: (bucket_m, vid), or None (see bucket_for_m for the rule). Shared with the call_id universe.
+    Floors: the first row with m_row >= m is the only bucket m can be padded into; if m is below that bucket's floor (the row's own ``pad_min``, else the profile field of the variant's
+    ``pad_m_min_field`` / the class default, else 1) the m is NOT padded (native for this band): a larger bucket would only pad more. A row whose plan cannot take m (accepts_launch_m)
+    is skipped (the next row is tried)."""
     m = int(m)
     for row in prof.bucket_rows(sig, arch, cu, world):
         if row.m < m:
@@ -162,11 +165,16 @@ def bucket_in_band(
         if row.m == m:
             return m, row.vid
         cls = _variant_info(row.vid).factory
-        field = getattr(cls, "pad_m_min_field", None)
-        if field is not None and m < int(
-            prof.meta.get(field, getattr(cls, "pad_m_min_default", 1))
-        ):
-            continue
+        floor = row.pad_min
+        if floor is None:
+            field = getattr(cls, "pad_m_min_field", None)
+            floor = (
+                int(prof.meta.get(field, getattr(cls, "pad_m_min_default", 1)))
+                if field is not None
+                else 1
+            )
+        if m < floor:
+            break
         accepts = getattr(cls, "accepts_launch_m", None)
         if accepts is not None and accepts(dict(row.params), row.m, m):
             return row.m, row.vid

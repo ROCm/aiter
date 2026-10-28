@@ -47,6 +47,9 @@ class Row:
     m: int
     vid: str
     params: types.MappingProxyType
+    # R16 pad-M: the smallest REAL local m padded into this row as a bucket (None = the variant's / profile's default floor): the pad range of the bucket is [pad_min, m]; a real m in
+    # (previous bucket, pad_min) is native. Lets a measurement tighten one bucket's range without code changes.
+    pad_min: int | None = None
 
 
 @dataclass(frozen=True)
@@ -191,8 +194,20 @@ def parse_profile(doc: dict, path: str = "<memory>") -> Profile:
         key = (r["sig"], r["arch"], r["cu"], r["world"], r["m"])
         if key in rows:
             raise ProfileError(f"{path}: duplicate row key {key} (row {i})")
+        pad_min = r.get("pad_min")
+        if pad_min is not None and (
+            isinstance(pad_min, bool)
+            or not isinstance(pad_min, int)
+            or not 1 <= pad_min <= r["m"]
+        ):
+            raise ProfileError(
+                f"{path}: row {i} pad_min must be an int in 1..m ({r['m']}), got {pad_min!r}"
+            )
         rows[key] = Row(
-            *key, r["vid"], types.MappingProxyType(dict(r.get("params", {})))
+            *key,
+            r["vid"],
+            types.MappingProxyType(dict(r.get("params", {}))),
+            pad_min,
         )
     rules = _parse_rules(doc.get("rules", []), path)
     meta = {k: v for k, v in doc.items() if k not in ("rows", "rules")}

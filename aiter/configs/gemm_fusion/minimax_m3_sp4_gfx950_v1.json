@@ -45,7 +45,7 @@
     }
   },
   "wait_budget_us": 5000000,
-  "m_pad_min_large": 896,
+  "m_pad_min_large": 769,
   "generated_by": {
     "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
     "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
@@ -597,7 +597,8 @@
         "no_gridread": 1,
         "src": "r13"
       },
-      "cell": "dense_T4096"
+      "cell": "dense_T4096",
+      "pad_min": 769
     },
     {
       "sig": "15f0490f0df1d837",
@@ -1021,6 +1022,23 @@
       "cell": "dense_T32768"
     },
     {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 768,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T3072",
+      "pad_min": 700,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 700..768 pad into it (Evidence floors)"
+    },
+    {
       "sig": "0fd134d47bb1534f",
       "arch": "gfx950",
       "cu": 256,
@@ -1033,7 +1051,8 @@
         "no_gridread": 1,
         "src": "r13"
       },
-      "cell": "indexer_T4096"
+      "cell": "indexer_T4096",
+      "pad_min": 769
     },
     {
       "sig": "0fd134d47bb1534f",
@@ -1458,6 +1477,23 @@
       "note": "P1 sweep best; replaces the r11-era tuned (n=4, half_first=0)"
     },
     {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 768,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T3072",
+      "pad_min": 600,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 600..768 pad into it (Evidence floors)"
+    },
+    {
       "sig": "1f5973865d6bcd73",
       "arch": "gfx950",
       "cu": 256,
@@ -1470,7 +1506,8 @@
         "no_gridread": 1,
         "src": "r13"
       },
-      "cell": "reuse_T4096"
+      "cell": "reuse_T4096",
+      "pad_min": 769
     },
     {
       "sig": "1f5973865d6bcd73",
@@ -1892,6 +1929,23 @@
         "src": "r13"
       },
       "cell": "reuse_T32768"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 768,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T3072",
+      "pad_min": 513,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 513..768 pad into it (Evidence floors)"
     }
   ],
   "rules": [
@@ -2217,7 +2271,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 1024,
+      "m_min": 768,
       "m_max": 8192,
       "m_multiple": 256,
       "vid": "sp_qkv.large.v1",
@@ -2235,7 +2289,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 1024,
+      "m_min": 768,
       "m_max": 8192,
       "m_multiple": 512,
       "vid": "sp_qkv.large.v1",
@@ -2253,7 +2307,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 1024,
+      "m_min": 768,
       "m_max": 8192,
       "m_multiple": 1024,
       "vid": "sp_qkv.large.v1",
@@ -2271,7 +2325,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 1024,
+      "m_min": 768,
       "m_max": 8192,
       "m_multiple": 256,
       "vid": "sp_qkv.large.v1",
@@ -2289,7 +2343,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 1024,
+      "m_min": 768,
       "m_max": 8192,
       "m_multiple": 512,
       "vid": "sp_qkv.large.v1",
@@ -2307,7 +2361,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 1024,
+      "m_min": 768,
       "m_max": 8192,
       "m_multiple": 1024,
       "vid": "sp_qkv.large.v1",
@@ -2325,7 +2379,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 1024,
+      "m_min": 768,
       "m_max": 8192,
       "m_multiple": 256,
       "vid": "sp_qkv.large.v1",
@@ -2343,7 +2397,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 1024,
+      "m_min": 768,
       "m_max": 8192,
       "m_multiple": 512,
       "vid": "sp_qkv.large.v1",
@@ -2361,7 +2415,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 1024,
+      "m_min": 768,
       "m_max": 8192,
       "m_multiple": 1024,
       "vid": "sp_qkv.large.v1",

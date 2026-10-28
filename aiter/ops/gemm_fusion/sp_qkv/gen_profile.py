@@ -94,7 +94,11 @@ def build_small_rules():
 
 
 LARGE_VID = "sp_qkv.large.v1"
-RULE_M_MIN, RULE_M_MAX, RULE_M_BASE = 1024, 8192, 256
+RULE_M_MIN, RULE_M_MAX, RULE_M_BASE = (
+    768,
+    8192,
+    256,
+)  # 768 = the lowest large bucket of the shipped profile (specs.LARGE_PAD_BUCKETS_IN_PROFILE)
 
 
 def _plan_valid(mode, params, m):
@@ -125,7 +129,7 @@ def build_large_rows():
         sp = specs.sp_qkv_spec(mode).prefix(
             1
         )  # GEMM + SPExchange only; HeadNormRopeCache runs natively in ATOM
-        for m in p1_sweep.P1_GRID:
+        for m in sorted(set(p1_sweep.P1_GRID)):
             n, half_first = p1_sweep.P1_BEST[mode][m]
             params = {
                 "n": n,
@@ -153,7 +157,36 @@ def build_large_rows():
                 row["note"] = (
                     f"P1 sweep best; replaces the r11-era tuned (n={old['n']}, half_first={old['half_first']})"
                 )
+            if m in specs.LARGE_BUCKET_PAD_MIN[mode]:
+                row["pad_min"] = specs.LARGE_BUCKET_PAD_MIN[mode][m]
             rows.append(row)
+        # R16: the buckets below the swept grid that the profile ships (specs.LARGE_PAD_BUCKETS_IN_PROFILE: 768): not swept, params from specs.LARGE_PAD_BUCKETS (see there)
+        for m in specs.LARGE_PAD_BUCKETS_IN_PROFILE:
+            n, half_first = specs.LARGE_PAD_BUCKETS[m]
+            params = {
+                "n": n,
+                "half_first": half_first,
+                "no_gridread": 1,
+                "src": specs.large_profile_src(),
+            }
+            assert _plan_valid(mode, params, m), (mode, m, params)
+            rows.append(
+                {
+                    "sig": sp.signature(),
+                    "arch": ARCH,
+                    "cu": CU,
+                    "world": WORLD,
+                    "m": m,
+                    "vid": LARGE_VID,
+                    "params": params,
+                    "cell": f"{mode}_T{WORLD * m}",
+                    "pad_min": specs.LARGE_BUCKET_PAD_MIN[mode][m],
+                    "note": (
+                        f"R16 pad-M bucket below the P1 grid (not swept): n={n}, half_first={half_first} = the best at the smallest swept cells; "
+                        f"real m {specs.LARGE_BUCKET_PAD_MIN[mode][m]}..{m} pad into it (Evidence floors)"
+                    ),
+                }
+            )
     return rows
 
 
@@ -181,7 +214,7 @@ def build_large_rules():
                 "no_gridread": 1,
                 "src": specs.large_profile_src(),
             }
-            for m in range(RULE_M_MIN, RULE_M_MAX + 1, step):
+            for m in range(-(-RULE_M_MIN // step) * step, RULE_M_MAX + 1, step):
                 assert _plan_valid(mode, params, m), (mode, step, m, params)
             rules.append(
                 {
@@ -259,7 +292,8 @@ def build_profile():
         # engine (a clean first call poisoned at the natural ~213 ms cold-start skew; Evidence 05055ac9); keep the PG timeout > ~3 x budget + recover; the cost of a large value is only failure-detection latency (a dead peer holds the stream for up to ~2-3 budgets). AITER_GEMM_FUSION_WAIT_BUDGET_US
         # overrides it for tuning only. Small-M uses an iteration count (20,000,000) instead and is not affected.
         "wait_budget_us": WAIT_BUDGET_US,
-        # R16 pad-M: the smallest real local m a large plan is padded into a bucket for (aiter.gemm_fusion.match.bucket_for_m): 896 (m 896..1023 -> the 1024 bucket); below it: exact rows only (m 257..895 native)
+        # R16 pad-M: the smallest real local m a large plan is padded into a bucket for (aiter.gemm_fusion.match.bucket_for_m) when its row has no pad_min of its own; the 768 rows carry
+        # 700 / 600 / 513 (dense / indexer / reuse) and the 1024 rows 769 (Evidence's floors), so this only matters for the rows from 1280 up
         "m_pad_min_large": specs.M_PAD_MIN_LARGE,
         "generated_by": {
             "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
