@@ -124,6 +124,8 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         ("gfx950", 128, 1024, 1, 1, 2),
         ("gfx950", 8, 4096, 8, 8, 4),
         ("gfx942", 8, 2048, 1, 1, 8),
+        ("gfx942", 48, 4096, 4, 4, 1),
+        ("gfx950", 48, 4096, 4, 4, 2),
     ],
 )
 def test_bf16_swa_query_split_schedule(
@@ -172,6 +174,89 @@ def test_bf16_swa_schedule_context_bound(monkeypatch, window):
         sliding_window=window,
     )
     assert traits.PaDecodeTraits.create(schedule).query_splits == 8
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+@pytest.mark.parametrize("query_length", range(1, 9))
+@pytest.mark.parametrize(
+    "head_dim,value_dim,group,heads,page",
+    [
+        (64, 64, 8, 2, 16),
+        (128, 128, 16, 1, 64),
+        (192, 192, 32, 2, 128),
+        (192, 128, 8, 4, 16),
+        (256, 256, 8, 2, 128),
+        (512, 512, 16, 1, 64),
+        (1024, 1024, 16, 1, 128),
+    ],
+)
+def test_bf16_swa_schedule_geometry(
+    monkeypatch, arch, query_length, head_dim, value_dim, group, heads, page
+):
+    """All short query lengths select legal splits and an actual layout that fits LDS."""
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
+    for batch, parts in ((8, 1), (48, 8)):
+        layout = traits.PaDecodeTraits.create(
+            traits.PaDecodeSchedule.select(
+                head_dim=head_dim,
+                value_dim=value_dim,
+                query_group_size=group,
+                block_size=page,
+                num_seqs=batch,
+                num_kv_heads=heads,
+                num_compute_units=304 if arch == "gfx942" else 256,
+                work_capacity=batch * parts,
+                num_partitions=parts,
+                query_dtype="bf16",
+                kv_dtype="bf16",
+                query_length=query_length,
+                max_context_length=8192,
+                sliding_window=4096,
+            )
+        )
+        assert query_length % layout.query_splits == 0
+        assert layout.QUERIES_PER_CTA * layout.query_splits == query_length
+        assert layout.total_bytes <= traits.BF16_LDS_LIMIT_BYTES
+
+
+@pytest.mark.parametrize(
+    "heads,head_dim,window,query_length,expected_splits",
+    [
+        (1, 128, 1024, 8, 8),
+        (2, 128, 1024, 8, 4),
+        (4, 128, 1024, 8, 4),
+        (1, 512, 128, 8, 8),
+        (1, 512, 1024, 8, 4),
+        (1, 128, 1024, 9, 1),
+        (1, 128, 1024, 12, 1),
+        (1, 128, 1024, 16, 2),
+    ],
+)
+def test_bf16_swa_work_and_query_bounds(
+    monkeypatch, heads, head_dim, window, query_length, expected_splits
+):
+    """Account for KV heads/bytes; longer queries retain the LDS-based fallback."""
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
+    layout = traits.PaDecodeTraits.create(
+        traits.PaDecodeSchedule.select(
+            head_dim=head_dim,
+            query_group_size=16,
+            block_size=64,
+            num_seqs=8,
+            num_kv_heads=heads,
+            num_compute_units=256,
+            work_capacity=64,
+            num_partitions=8,
+            query_dtype="bf16",
+            kv_dtype="bf16",
+            query_length=query_length,
+            max_context_length=8192,
+            sliding_window=window,
+        )
+    )
+    assert layout.query_splits == expected_splits
 
 
 @pytest.mark.parametrize(
@@ -542,6 +627,34 @@ _FP8_CASES = _COMMON_CASES + [
     ),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *[
+        (
+            f"swa-general-q{qlen}-d{dim}-v{vdim}",
+            {
+                "query_length": qlen,
+                "head_dim": dim,
+                "value_dim": vdim,
+                "group_size": group,
+                "kv_heads": heads,
+                "block_size": page,
+                "window": window,
+                "max_partitions": parts,
+                "lengths": (0, 1, 7, 127, 257, 2047, 4097, 8192) * (batch // 8),
+                "sink_dtype": torch.float32,
+                "capture": True,
+            },
+        )
+        for qlen, dim, vdim, group, heads, page, window, parts, batch in (
+            (1, 64, 64, 8, 2, 16, 127, 1, 8),
+            (2, 192, 192, 16, 1, 64, 512, 4, 8),
+            (3, 128, 128, 16, 1, 64, 512, 8, 48),
+            (4, 256, 256, 8, 2, 128, 1023, 4, 8),
+            (5, 128, 128, 16, 1, 64, 4096, 1, 8),
+            (6, 512, 512, 16, 1, 64, 2048, 1, 8),
+            (7, 192, 128, 8, 2, 16, 1025, 4, 8),
+            (8, 1024, 1024, 16, 1, 128, 2048, 4, 8),
+        )
+    ],
     *_ASYMMETRIC_GENERAL_CASES,
     *_ASYMMETRIC_MULTIHEAD_CASES,
     # BF16 has no FP8 residual cutoff; retain the shared mask/length coverage.

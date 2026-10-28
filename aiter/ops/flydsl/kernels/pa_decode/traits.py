@@ -205,17 +205,7 @@ class PaDecodeSchedule:
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
         # Scalar KV scheduling also supports FP16 queries and multiple query rows.
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
-        TUNED_BF16_SWA = (
-            is_bf16_kv
-            and arch in BF16_KV_SUPPORTED_ARCHS
-            and not asymmetric_value
-            and head_dim == 128
-            and query_length == 8
-            and query_group_size == 16
-            and num_kv_heads == 1
-            and block_size == 64
-            and sliding_window > 0
-        )
+        TUNED_BF16_SWA = is_bf16_kv and query_length <= 8 and sliding_window > 0
 
         partition_workgroups = num_seqs * num_kv_heads * num_partitions
         assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
@@ -254,7 +244,66 @@ class PaDecodeSchedule:
                 else query_length
             )
             query_splits = 1
-            if asymmetric_value:
+            if TUNED_BF16_SWA:
+                # Planned tasks may own multiple KV tiles under a small budget.
+                kv_tiles = window_tiles
+                if max_context_length is not None:
+                    kv_tiles = min(
+                        kv_tiles,
+                        max(1, ceildiv(max_context_length, KV_COMPUTE_BLOCK)),
+                    )
+                tasks_per_seq = min(
+                    num_partitions, max(1, work_capacity // num_seqs), kv_tiles
+                )
+                tiles_per_task = ceildiv(kv_tiles, tasks_per_seq)
+                active_tasks = min(
+                    split_workgroups, num_seqs * num_kv_heads * tasks_per_seq
+                )
+                # Include fixed CTA overhead and the cost of repeated wide KV
+                # loads. A 256 KiB floor retains the small-head work policy.
+                work_bytes = max(
+                    256 * 1024, KV_COMPUTE_BLOCK * (head_dim + value_dim) * 2
+                )
+                cu_work_bytes = num_compute_units * 256 * 1024
+                active_work_bytes = active_tasks * work_bytes
+                tile_work_bytes = active_work_bytes * tiles_per_task
+                candidates = [
+                    splits
+                    for splits in range(1, query_length + 1)
+                    if query_length % splits == 0
+                    and _bf16_lds_bytes(
+                        head_dim,
+                        query_length // splits * query_group_size,
+                        block_size,
+                    )
+                    <= BF16_LDS_LIMIT_BYTES
+                ]
+                if candidates:
+                    query_splits = candidates[0]
+                    # Prefer full M-tiles; smaller query groups can share a CTA.
+                    row_tiles = ceildiv(query_length * query_group_size, MFMA_MNK)
+                    for splits in reversed(candidates):
+                        budget = (2 if splits == query_length else 3) * cu_work_bytes
+                        if splits <= row_tiles and splits * tile_work_bytes <= budget:
+                            query_splits = splits
+                            break
+                    # Increase only to another valid divisor. On gfx942 a
+                    # near-full unsplit grid avoids unnecessary repeated KV work.
+                    for splits in candidates:
+                        if splits < query_splits:
+                            continue
+                        query_splits = splits
+                        if splits * active_work_bytes >= cu_work_bytes:
+                            break
+                        if (
+                            arch == "gfx942"
+                            and splits == 1
+                            and 4 * active_tasks >= 3 * num_compute_units
+                        ):
+                            break
+                # The common BF16 resource check below reports an impossible
+                # one-query group when no candidate fits the LDS limit.
+            elif asymmetric_value:
                 # Include serial KV work when a small partition budget gives
                 # each task many tiles. Two M-tiles then amortize K/V loads.
                 kv_work = split_workgroups
@@ -271,48 +320,6 @@ class PaDecodeSchedule:
                     and query_splits * split_workgroups < num_compute_units
                 ):
                     query_splits += 1
-            elif TUNED_BF16_SWA:
-                # Share the CDNA policy: the device CU count scales its
-                # parallelism thresholds on both gfx942 and gfx950.
-                # Estimate the planned KV work, including multiple tiles per
-                # task when the partition cap or work budget is small.
-                kv_tiles = window_tiles
-                if max_context_length is not None:
-                    kv_tiles = min(
-                        kv_tiles,
-                        max(1, ceildiv(max_context_length, KV_COMPUTE_BLOCK)),
-                    )
-                tasks_per_seq = min(
-                    num_partitions, max(1, work_capacity // num_seqs), kv_tiles
-                )
-                tiles_per_task = ceildiv(kv_tiles, tasks_per_seq)
-                active_tasks = min(split_workgroups, num_seqs * tasks_per_seq)
-                tile_workgroups = active_tasks * tiles_per_task
-                # Splitting lowers the BF16 Q/P LDS and accumulator footprint;
-                # taper it as duplicated KV work grows. The common LDS check
-                # below enforces the selected CTA's resource limit.
-                if query_length * tile_workgroups <= 2 * num_compute_units:
-                    query_splits = query_length
-                elif 4 * tile_workgroups <= 3 * num_compute_units:
-                    query_splits = 4
-                elif 2 * tile_workgroups <= 3 * num_compute_units:
-                    query_splits = 2
-                # Do not trade away the only available CTA parallelism merely
-                # because a small work budget gives each task a longer KV loop.
-                while (
-                    query_splits < query_length
-                    and query_splits * active_tasks < num_compute_units
-                ):
-                    # On gfx942, duplicating KV work loses to a near-full
-                    # unsplit grid. Allow a quarter of the CUs to be idle
-                    # before promoting one split solely to fill the device.
-                    if (
-                        arch == "gfx942"
-                        and query_splits == 1
-                        and 4 * active_tasks >= 3 * num_compute_units
-                    ):
-                        break
-                    query_splits *= 2
             elif (
                 TUNED_PER_TOKEN
                 and (num_kv_heads == 1 or sliding_window == 0)
