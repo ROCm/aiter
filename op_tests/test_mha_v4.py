@@ -556,7 +556,10 @@ def test_mha_v4_rotated_fp8_quantization_matches_reference(sequence, heads):
 
     assert torch.equal(rotated, expected_rotated)
     assert torch.equal(actual, expected)
-    assert torch.equal(scale, expected_scale)
+    # Values in the message: a bare equality failure here is not reproducible off the arch that saw it.
+    assert torch.equal(
+        scale, expected_scale
+    ), f"scale {scale.item():.9e} vs expected {expected_scale.item():.9e}"
 
 
 def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
@@ -650,7 +653,12 @@ torch.cuda.synchronize()
 
 
 _K_MEAN_OOB_SHAPES = [(3975, 3), (999, 3), (1001, 5)]
-_K_MEAN_OOB_KERNELS = ["hd128", "mxfp8", "mxfp6", "mxfp4"]
+_K_MEAN_OOB_KERNELS = [
+    "hd128",
+    param("mxfp8", skip=get_gfx() != "gfx950"),
+    param("mxfp6", skip=get_gfx() != "gfx950"),
+    param("mxfp4", skip=get_gfx() != "gfx950"),
+]
 
 
 def check_k_mean_bound(kernel, seq, heads):
