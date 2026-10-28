@@ -2,9 +2,11 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import itertools
 import os
 from unittest import mock
 
+import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -12,7 +14,10 @@ import aiter
 import aiter.ops.rmsnorm as rmsnorm_ops
 from aiter import dtypes
 from aiter.jit.utils import chip_info
-from aiter.test_common import checkAllclose, perftest
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+from aiter.ops.rmsnorm import add_rmsnorm, rmsnorm
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 
 @perftest()
@@ -188,68 +193,266 @@ def test_rmsnorm2d_tail_dispatch_follows_device():
         chip_info.get_gfx_custom_op_core.cache_clear()
 
 
-# for dtype in [dtypes.fp16, dtypes.bf16]:
-#     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-#         for n in [4096, 8192, 16384, 32768, 65536]:
-#             test_rmsnorm2d(dtype, m, n)
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
-l_dtype = ["fp16", "bf16", "fp32"]
-l_m = [1, 2, 4, 8, 16, 32, 64, 128, 256]
-l_n = [4096, 8192, 16384, 32768, 65536]
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""Data type.
-    e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-m",
-    "--m",
-    type=int,
-    nargs="?",
-    default=None,
-    help="""M of mnk.
-    e.g.: -m 32""",
-)
-parser.add_argument(
-    "-n",
-    "--n",
-    type=int,
-    nargs="?",
-    default=None,
-    help="""N of mnk.
-    e.g.: -n 1024""",
-)
 
-args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.n is not None:
-    l_n = [args.n]
+def run_torch_no_quant(x, weight, epsilon, residual=None, gemma_norm=False):
+    """No-quant C++ semantics: normalize the FP32 sum, then cast the output."""
+    value = x.to(dtypes.fp32)
+    if residual is not None:
+        value = value + residual.to(dtypes.fp32)
+    factor = weight.to(dtypes.fp32) + (1.0 if gemma_norm else 0.0)
+    out = F.rms_norm(value, (x.shape[-1],), factor, epsilon)
+    return out.to(x.dtype), value.to(x.dtype) if residual is not None else None
 
-print("\nstart fuse add test")
-for dtype in l_dtype:
-    for m in l_m:
-        for n in l_n:
-            test_rmsnorm2d_fuseAdd(dtype, m, n)
 
-print("\nstart row tail and determinism tests")
-test_rmsnorm2d_tail_dispatch_follows_device()
-for dtype in [d for d in l_dtype if d in (dtypes.fp16, dtypes.bf16)]:
-    for m in [1, 64]:
-        for n in [1002, 4094, 8190]:
-            test_rmsnorm2d_row_tail(dtype, m, n)
-    test_rmsnorm2d_fuseAdd_deterministic(dtype, 8192, 65536)
+@benchmark()
+def test_rmsnorm2d_cpp(m, n, dtype, mode, gemma_norm, layout, second_n=0):
+    """Public C++ candidates, including row-strided and dual-input fallbacks.
+
+    For MiniMax-M3, N=6144 is the hidden width; N=128 is a per-head norm,
+    not the concatenated heads. M counts rows/tokens (or token*local_heads),
+    not context length. This is an independent no-quant baseline, not the
+    allreduce/quant/RoPE/cache-insert fused path.
+    """
+    assert dtype in (dtypes.fp16, dtypes.bf16)
+    assert mode in ("norm", "add_norm")
+    assert layout in ("contiguous", "strided")
+    assert m > 0 and 0 < n <= 8192 and n % 8 == 0
+    assert 0 <= second_n <= 8192 and second_n % 8 == 0
+    eps = 1e-6
+    if layout == "strided":
+        # Views of one packed allocation: no copy/contiguous conversion.
+        storage = torch.randn((m, n + second_n + 16), dtype=dtype, device="cuda")
+        x = storage[:, :n]
+        second = storage[:, n : n + second_n] if second_n else None
+    else:
+        x = torch.randn((m, n), dtype=dtype, device="cuda")
+        second = (
+            torch.randn((m, second_n), dtype=dtype, device="cuda") if second_n else None
+        )
+    weight = torch.randn(n, dtype=dtype, device="cuda")
+    second_weight = (
+        torch.randn(second_n, dtype=dtype, device="cuda") if second_n else None
+    )
+    residual = None
+    if mode == "add_norm":
+        residual_storage = torch.randn(
+            (m, n + (16 if layout == "strided" else 0)), dtype=dtype, device="cuda"
+        )
+        residual = residual_storage[:, :n]
+
+    ref, res_ref = run_torch_no_quant(x, weight, eps, residual, gemma_norm)
+    second_ref = None
+    if second is not None:
+        second_ref, _ = run_torch_no_quant(
+            second, second_weight, eps, gemma_norm=gemma_norm
+        )
+
+    def allocate_output(width):
+        if not width:
+            return None, None
+        backing = torch.full(
+            (m, width + (16 if layout == "strided" else 0)),
+            7,
+            dtype=dtype,
+            device="cuda",
+        )
+        view = backing[:, :width]
+        view.fill_(float("nan"))
+        return backing, view
+
+    out_storage, out = allocate_output(n)
+    res_storage, res_out = allocate_output(n if residual is not None else 0)
+    second_storage, second_out = allocate_output(second_n)
+
+    def run_fused():
+        fused_qk_rmsnorm_group_quant(
+            q=x,
+            q_weight=weight,
+            q_epsilon=eps,
+            q_out_scale=None,
+            q_out_unquantized=out,
+            q_residual=residual,
+            q_res_out=res_out,
+            k=second,
+            k_weight=second_weight,
+            k_out=second_out,
+            k_epsilon=eps if second is not None else None,
+            gemma_norm=gemma_norm,
+        )
+        return out, res_out, second_out
+
+    def run_generic():
+        if residual is None:
+            rmsnorm(out, x, weight, eps, gemma_norm)
+        else:
+            add_rmsnorm(out, x, residual, res_out, weight, eps, gemma_norm)
+        if second is not None:
+            rmsnorm(second_out, second, second_weight, eps, gemma_norm)
+        return out, res_out, second_out
+
+    candidates = {"fused_cpp": run_fused, "generic_cpp": run_generic}
+    # Logical math counts: N squares + N-1 sum additions + mean/epsilon/rsqrt
+    # (three scalar operations) + 2N output multiplies. Count rsqrt as one
+    # operation. Gemma adds N weight offsets, residual adds N elements per row.
+    # These are op-level numerators, not hardware instruction/HBM counters.
+    flops = m * ((4 + int(gemma_norm)) * n + 2)
+    nbytes = (2 * m * n + n) * x.element_size()
+    if residual is not None:
+        flops += m * n
+        nbytes += 2 * m * n * x.element_size()
+    if second is not None:
+        flops += m * ((4 + int(gemma_norm)) * second_n + 2)
+        nbytes += (2 * m * second_n + second_n) * second.element_size()
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        # Both candidates reuse MODEL-style caller-provided output buffers.
+        # Poison between candidates to catch unwritten elements; no allocations
+        # or poisoning are performed in the timed callable.
+        for value in (out, res_out, second_out):
+            if value is not None:
+                value.fill_(float("nan"))
+        (actual, res_actual, second_actual), us = run_perftest(fn, num_rotate_args=1)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            actual.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            tol_err_ratio=0,
+            msg=f"{name}: rmsnorm",
+        )
+        assert err == 0, f"{name}: norm mismatch"
+        if residual is not None:
+            res_err = checkAllclose(
+                res_ref.to(dtypes.fp32),
+                res_actual.to(dtypes.fp32),
+                rtol=0,
+                atol=0,
+                tol_err_ratio=0,
+                msg=f"{name}: residual",
+            )
+            assert res_err == 0, f"{name}: residual mismatch"
+        if second is not None:
+            second_err = checkAllclose(
+                second_ref.to(dtypes.fp32),
+                second_actual.to(dtypes.fp32),
+                rtol=1e-2,
+                atol=1e-2,
+                tol_err_ratio=0,
+                msg=f"{name}: second norm",
+            )
+            assert second_err == 0, f"{name}: second norm mismatch"
+            err = max(err, second_err)
+        if layout == "strided":
+            for backing, width in (
+                (out_storage, n),
+                (res_storage, n),
+                (second_storage, second_n),
+            ):
+                if backing is not None:
+                    assert torch.all(
+                        backing[:, width:] == 7
+                    ), f"{name}: padding overwritten"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("C++ RMSNorm unsupported on %s; skipping", get_gfx())
+        return
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="C++ no-quant RMSNorm correctness/performance shape sweep",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.fp16, dtypes.bf16],
+    )
+    parser.add_argument(
+        "-m",
+        "--m",
+        type=int,
+        nargs="*",
+        default=[1, 7, 128, 255, 256, 257, 1024, 4096, 16384, 32768],
+        help="Number of rows, not sequence/context length",
+    )
+    parser.add_argument(
+        "-n",
+        "--n",
+        type=int,
+        nargs="*",
+        default=[128, 6144],
+        help="Per-row normalization width",
+    )
+    parser.add_argument(
+        "-s",
+        "--mn",
+        type=dtypes.str2tuple,
+        nargs="*",
+        help="Explicit (M,N) pairs; otherwise use the -m/-n product",
+    )
+    parser.add_argument(
+        "--modes",
+        nargs="*",
+        choices=["norm", "add_norm"],
+        default=["norm", "add_norm"],
+    )
+    parser.add_argument("--gemma", type=int, choices=[0, 1], nargs="*", default=[0, 1])
+    parser.add_argument(
+        "--layout",
+        nargs="*",
+        choices=["contiguous", "strided"],
+        default=["contiguous"],
+    )
+    parser.add_argument(
+        "--second-n",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="Optional second input width (0 disables it); its rows match M",
+    )
+    args = parser.parse_args()
+    shapes = args.mn if args.mn is not None else list(itertools.product(args.m, args.n))
+    if any(
+        len(shape) != 2
+        or shape[0] <= 0
+        or not 0 < shape[1] <= 8192
+        or shape[1] % 8 != 0
+        for shape in shapes
+    ):
+        parser.error("C++ candidates need M>0 and N divisible by 8, 0<N<=8192")
+    if any(n < 0 or n > 8192 or n % 8 for n in args.second_n):
+        parser.error("--second-n must be 0 or divisible by 8, <=8192")
+    torch.manual_seed(2026)
+    for dtype in args.dtype:
+        if dtype not in (dtypes.fp16, dtypes.bf16):
+            aiter.logger.warning(
+                "C++ no-quant candidates do not support %s; skipping", dtype
+            )
+            continue
+        rows = []
+        for (m, n), mode, gemma, layout, second_n in itertools.product(
+            shapes, args.modes, args.gemma, args.layout, args.second_n
+        ):
+            rows.append(
+                test_rmsnorm2d_cpp(m, n, dtype, mode, bool(gemma), layout, second_n)
+            )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "C++ RMSNorm summary (markdown), dtype=%s:\n%s",
+            dtype,
+            df.to_markdown(index=False),
+        )
+
+
+if __name__ == "__main__":
+    main()
