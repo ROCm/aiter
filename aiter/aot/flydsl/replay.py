@@ -24,19 +24,29 @@ A module provides
 - ``replay(job)``: build the caller's inputs and call the public entry.
 - ``describe(job) -> str``: one line naming the job in the log.
 - optionally ``config_env(csv_paths)``, the environment that points the
-  runtime's tuned-config lookups at the given tables, and
-  ``configure(parser)`` for options of its own.
+  runtime's tuned-config lookups at the given tables,
+  ``configure(parser)`` for options of its own, and ``SCAN_ARCHS``, the archs
+  whose jobs have every size identified (below).
 
 Its ``python -m`` entry is :func:`main`, and ``setup.py``'s build runs
 :func:`run_default`. Both run one process per target arch (``replay_env``),
 each replaying its jobs in a pool of workers.
 
-Where a job's two ends request different FlyDSL kernels, the sizes between
-them are bisected down to every size at which the runtime switches kernels
-(as in ``moe.py``). Each choice the runtime makes from the size is monotonic,
-so two sizes that request the same kernels bound a run that requests nothing
-else. An end that requests no FlyDSL kernel at all (another backend serves
-it) bounds nothing, and is not bisected against.
+For an arch in ``SCAN_ARCHS``, every size of a job's range is identified:
+replayed with its launches stopped at their cache identity
+(:func:`identified_kernels`, nothing compiled), and one size per set of
+kernels not yet built is replayed for real. A runtime whose choices are not
+monotonic in the size needs that, as a gfx1250 GEMM's are: it fits cluster_m
+to the number of M tiles and specializes a ragged last tile, so M=5120 and
+M=6144 can request one kernel and M=5632 another.
+
+Otherwise, where a job's two ends request different FlyDSL kernels, the sizes
+between them are bisected down to every size at which the runtime switches
+kernels (as in ``moe.py``). That holds only while each choice the runtime
+makes from the size is monotonic, so that two sizes that request the same
+kernels bound a run that requests nothing else. An end that requests no
+FlyDSL kernel at all (another backend serves it, or the runtime refuses the
+size) bounds nothing, and is not bisected against.
 """
 
 from __future__ import annotations
@@ -91,6 +101,37 @@ def requested_kernels() -> Iterator[set]:
         return key
 
     with mock.patch.object(JitFunction, "_build_full_cache_key", record):
+        yield kernels
+
+
+@contextmanager
+def identified_kernels() -> Iterator[set]:
+    """Like :func:`requested_kernels`, but a launch stops at its cache
+    identity: nothing is traced, compiled or read from the cache, and the
+    launcher gets the None a COMPILE_ONLY launch returns. The identity is
+    derived as the head of ``JitFunction._compile_or_execute`` derives it."""
+    from unittest import mock
+
+    from flydsl.compiler.jit_function import JitFunction
+
+    kernels = set()
+
+    def identify(self, args, kwargs, *, execute, return_compiled=False):
+        bound_self, args = self._split_self(args)
+        owner_cls = type(bound_self) if bound_self is not None else None
+        self._ensure_cache_manager(owner_cls)
+        self._snapshot_or_check_globals(owner_cls)
+        bound = self._sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        key = self._build_full_cache_key(
+            bound.arguments,
+            owner_cls=owner_cls,
+            bound_self=bound_self,
+            effective_hints=self._effective_compile_hints(),
+        )
+        kernels.add((self.manager_key, key))
+
+    with mock.patch.object(JitFunction, "_compile_or_execute", identify):
         yield kernels
 
 
@@ -201,9 +242,62 @@ def _bisect(module, job: dict, kernels: dict, low: int, high: int) -> list[dict]
     ]
 
 
+def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
+    """The FlyDSL kernels the runtime requests at each of ``sizes``, identified
+    without compiling: each distinct set, or for a size the call fails at its
+    error with the numbers masked, mapped to the first size to request it."""
+    import logging
+
+    from aiter.aot.flydsl.dry_run import dry_run
+
+    arch = job_arch(job, _default_arch(module))
+    found: dict = {}
+    logger = logging.getLogger("aiter")
+    level = logger.level
+    # The runtime warns at every untuned size, and a scan visits thousands.
+    logger.setLevel(logging.ERROR)
+    try:
+        with dry_run(arch, int(job.get("cu_num") or 0), python_ops=True):
+            for size in sizes:
+                with identified_kernels() as kernels:
+                    try:
+                        module.replay({**job, "m": size})
+                        outcome = frozenset(kernels)
+                    except Exception as error:  # noqa: BLE001
+                        outcome = (
+                            type(error).__name__,
+                            re.sub(r"\d+", "N", str(error)),
+                        )
+                found.setdefault(outcome, size)
+    finally:
+        logger.setLevel(level)
+    return found
+
+
+def _scan(module: Any, job: dict, low: int, built: frozenset) -> list[dict]:
+    """Identify every size from ``low`` up to the job's own, and replay one
+    size per set of kernels ``built`` lacks, and one per kind of failure (which
+    :func:`replay_job` then reports as it reports any probe)."""
+    built = set(built)
+    probes = []
+    for outcome, size in _kernel_sets(module, job, range(low, job["m"])).items():
+        if isinstance(outcome, frozenset) and outcome <= built:
+            continue
+        result, kernels = replay_job(module, {**job, "m": size}, probe=True)
+        probes.append(result)
+        built |= kernels or set()
+    return probes
+
+
+def _scans(module: Any, arch: str) -> bool:
+    return arch in getattr(module, "SCAN_ARCHS", ())
+
+
 def _replay_batch(module_name: str, jobs: list[dict], kernel_name: str) -> dict:
-    """Replay each job at its size and at the smallest size it serves, and
-    bisect between the two where they request different kernels."""
+    """Replay each job at its size, then the smaller sizes it serves: every
+    one of them identified where the module scans the job's arch
+    (``SCAN_ARCHS``), else the smallest, bisecting between the two where they
+    request different kernels."""
     module = importlib.import_module(module_name)
     results, probes = [], []
     for job in jobs:
@@ -212,6 +306,9 @@ def _replay_batch(module_name: str, jobs: list[dict], kernel_name: str) -> dict:
         results.append(result)
         low_m = job.get("m_low")
         if low_m is None or low_m >= job["m"] or high is None:
+            continue
+        if _scans(module, job_arch(job, _default_arch(module))):
+            probes += _scan(module, job, low_m, high)
             continue
         low_result, low = replay_job(module, {**job, "m": low_m}, probe=True)
         probes.append(low_result)
@@ -292,8 +389,9 @@ def replay_arch(module_name: str, jobs: list[dict], arch: str, label: str) -> in
             print(f"  [UNREACHED] {count} x handed to: {reason}", flush=True)
     probes_failed = sum(1 for r in probes if r["compile_time"] is None)
     if probes:
+        tag = "SCAN" if _scans(module, arch) else "BISECT"
         print(
-            f"  [BISECT] {len(probes)} sizes inside rows' ranges, "
+            f"  [{tag}] {len(probes)} sizes inside rows' ranges, "
             f"{probes_failed} failed",
             flush=True,
         )

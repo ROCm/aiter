@@ -18,10 +18,14 @@ change.
 A row tuned at M also serves the M between the previous tuned M of its shape
 and M, and some compile-time parameters follow the actual M (a4w4's cluster_m
 and bounded-M variants, mxfp8's split-K and cluster fallbacks), so every row
-is replayed at its M and at the smallest M it serves, and bisected between the
-two where they request different kernels (``replay.py``). That also reaches
-the FlyDSL heuristic kernels the runtime falls back to below a shape's
-smallest tuned M.
+is replayed at its M and at the smaller M it serves. On gfx1250 every one of
+those M is identified without compiling, and one M per set of kernels they
+request is replayed (``SCAN_ARCHS``, ``replay.py``): bisecting between the two
+ends would not do there, as cluster_m is the largest that divides M's tile
+count, so the kernels change and change back as M grows. Rows of other archs
+are replayed at the smallest M they serve and bisected between the two ends
+where they request different kernels. Either way that also reaches the FlyDSL
+heuristic kernels the runtime falls back to below a shape's smallest tuned M.
 
 Rows are replayed for the arch their ``gfx`` column names (``cu_num`` for
 legacy rows); with ``GPU_ARCHS`` naming targets, only those archs. The
@@ -51,6 +55,9 @@ from aiter.jit.core import AITER_CONFIGS
 
 LABEL = "GEMM"
 AOT_ARCH_DEFAULT = "gfx950"
+# Archs whose GEMMs pick kernels non-monotonically in M: cluster_m is fitted to
+# the number of M tiles, and a ragged last tile is a variant of its own.
+SCAN_ARCHS = ("gfx1250",)
 # Tables without a cu_num column were tuned on a full part of their gfx.
 _DEFAULT_CU_NUM = 256
 

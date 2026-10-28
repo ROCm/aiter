@@ -15,7 +15,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
-| `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, bisection, `--check` |
+| `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, size scans and bisection, `--check` |
 | `dry_run.py` | Runs aiter's real host code on CPU (FakeTensors, `COMPILE_ONLY=1`, GPU runtime forbidden) |
 
 ### How `moe.py` works
@@ -112,9 +112,17 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   `gemm_a8w8_mxfp8_bpreshuffle`, `gemm_a8w8_blockscale_bpreshuffle` (e8m0
   scales), `batched_gemm_a8w8_mxscale_bpreshuffle`, `gemm_a16w16` and
   `gemm_a4w4`. A row tuned at M also serves the M down to the previous tuned M
-  of its shape, so it is replayed at both, and bisected between them where they
-  request different kernels; that also reaches the FlyDSL heuristic kernels the
-  runtime falls back to below a shape's smallest tuned M. The a4w4 table's
+  of its shape. On gfx1250 (`SCAN_ARCHS`) every one of those M is identified
+  first: replayed with each FlyDSL launch stopped at its cache key, so nothing
+  compiles. Then one M per set of kernels the row's own replay did not build
+  is replayed for real, reported as `[SCAN]`. Bisecting between the two ends
+  would miss kernels there, since the gfx1250 GEMMs fit cluster_m to the
+  number of M tiles and specialize a ragged last tile: M=5120 and M=6144 can
+  request one kernel and M=5632 another. Rows of other archs are replayed at
+  both ends and bisected between them where they request different kernels
+  (`[BISECT]`). Either way this reaches the FlyDSL heuristic kernels the
+  runtime falls back to below a shape's smallest tuned M; the scan also
+  reaches them past a smallest M the runtime refuses. The a4w4 table's
   non-FlyDSL rows are replayed too, since M below them falls back to FlyDSL.
 - `conv.py` replays each row with both output layouts (part of the compile
   key) from an NCDHW input, which reaches the pre-transpose as well.
