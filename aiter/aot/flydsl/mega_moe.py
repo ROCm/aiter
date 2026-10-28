@@ -3,16 +3,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compilation for the MegaMoE A8W4 and A4W4 deployment profiles.
+"""AOT pre-compilation for the MegaMoE A8W4 and A4W4 deployments.
 
-Each job builds the runtime's own ``MegaMoEV2`` for one rank of a deployment
-profile and calls its ``preload_aot_bundles()``. The runtime derives the bundle
-plan, sizes its buffers and loads every production Stage1/prepare, Stage2 and
+Each job builds the runtime's own ``MegaMoEV2`` for one rank of a ``mega_moe``
+deployment of ``moe_deployments.json`` (see :mod:`aiter.aot.flydsl.deployments`)
+and calls its ``preload_aot_bundles()``. The runtime derives the bundle plan,
+sizes its buffers and loads every production Stage1/prepare, Stage2 and
 combine variant itself; inside :func:`aiter.aot.flydsl.dry_run.dry_run` those
 kernels are compiled into the cache instead of launched. mori shmem, through
 which the runtime allocates symmetric buffers and exchanges peer pointers, hands
-out FakeTensors and fake addresses, so no GPU or process group is needed. This
-module only owns the deployment profiles.
+out FakeTensors and fake addresses, so no GPU or process group is needed.
 
 aiter fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so like
 the MoE replay this one runs in a process of its own, started with
@@ -20,11 +20,14 @@ the MoE replay this one runs in a process of its own, started with
 ``GPU_ARCHS`` names targets without gfx950.
 
 Usage:
-    # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
+    # Every MegaMoE deployment the service ships (DeepSeek-V4-Pro and Kimi-K3)
     python -m aiter.aot.flydsl.mega_moe
 
-    # One custom profile
+    # Only some of them
     python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48 --mtpr 8192
+
+    # Deployments of your own
+    python -m aiter.aot.flydsl.mega_moe --deployments /path/to/deployments.json
 """
 
 from __future__ import annotations
@@ -47,116 +50,55 @@ from aiter.aot.flydsl.common import (
     replay_env,
     run_jobs_parallel,
 )
+from aiter.aot.flydsl.deployments import DEFAULT_DEPLOYMENTS, QUANTS
+from aiter.aot.flydsl.deployments import load as load_deployments
 from aiter_worker_limits import adopt_legacy_max_jobs
 
 ARCH = "gfx950"
 # The combine launch geometry is tuned per GPU model, read from the device name.
 DEVICE_NAME = "AMD Instinct MI355X"
 NUM_CU = 256
-DEFAULT_MTPRS = (8192, 16384, 32768)
-DEFAULT_QUANTS = ("a8w4", "a4w4")
-# DeepSeek-V4-Pro deployment profiles: r0, r32, and r64 redundant experts.
-# Keep all three in the default AOT job set so the service never falls back to
-# an online compile merely because EPLB changes the physical expert count.
-DEFAULT_EXPERTS_PER_RANKS = (48, 52, 56)
-# Kimi-K3 deployment profile (EP8 / epr112, topk16, d3584 / i3072).  Added to
-# the default AOT job set so K3 serving never falls back to an online compile.
-K3_EXPERTS_PER_RANKS = (112,)
-K3_TOPK = 16
-K3_MODEL_DIM = 3584
-K3_INTER_DIM = 3072
-# K3 uses SiTUv2 (hidden_act="situ"); tanh self-saturates so no hard clamp.
-# beta=4.0 / linear_beta=25.0 are the K3 checkpoint constants the MegaMoE SiTU
-# kernel bakes in (SGLang kimi_k3.py asserts exactly these).
-K3_ACT = "situv2"
-K3_SITU_BETA = 4.0
-K3_SITU_LINEAR_BETA = 25.0
-WORLD_SIZE = 8
-TOPK = 6
-MODEL_DIM = 7168
-INTER_DIM = 3072
-SWIGLU_LIMIT = 10.0
 
 
-def default_jobs(
-    mtprs=DEFAULT_MTPRS,
-    experts_per_ranks=DEFAULT_EXPERTS_PER_RANKS,
+def deployment_jobs(
+    paths=DEFAULT_DEPLOYMENTS,
     *,
-    quants=DEFAULT_QUANTS,
-    world_size=WORLD_SIZE,
-    topk=TOPK,
-    model_dim=MODEL_DIM,
-    inter_dim=INTER_DIM,
-    swiglu_limit=SWIGLU_LIMIT,
-    act="silu",
-    situ_beta=1.0,
-    situ_linear_beta=1.0,
-):
-    """One job per rank of every (max tokens per rank, experts per rank) pair;
-    rank is a compile-time parameter of the kernels."""
-    shape_suffix = ""
-    if (world_size, topk, model_dim, inter_dim) != (
-        WORLD_SIZE,
-        TOPK,
-        MODEL_DIM,
-        INTER_DIM,
-    ):
-        shape_suffix = f"_w{world_size}_k{topk}_d{model_dim}_i{inter_dim}"
-    act_suffix = "" if act == "silu" else f"_{act}"
-    return [
-        {
-            "kernel_name": (
-                f"mega_moe_{quant}_mtpr{mtpr}_epr{experts_per_rank}"
-                f"_rank{rank}{shape_suffix}{act_suffix}"
-            ),
-            "quant": quant,
-            "mtpr": mtpr,
-            "experts_per_rank": experts_per_rank,
-            "rank": rank,
-            "world_size": world_size,
-            "topk": topk,
-            "model_dim": model_dim,
-            "inter_dim": inter_dim,
-            "swiglu_limit": swiglu_limit,
-            "act": act,
-            "situ_beta": situ_beta,
-            "situ_linear_beta": situ_linear_beta,
-        }
-        for mtpr in mtprs
-        for experts_per_rank in experts_per_ranks
-        for quant in quants
-        for rank in range(world_size)
-    ]
-
-
-def production_jobs(
-    mtprs=DEFAULT_MTPRS,
-    *,
-    quants=DEFAULT_QUANTS,
-    world_size=WORLD_SIZE,
-    swiglu_limit=SWIGLU_LIMIT,
-):
-    """Every geometry the service ships: V4-Pro (default shape) + Kimi-K3.
-
-    Used by the default build so both profiles are AOT-covered and neither
-    triggers an online JIT compile at serving time.
-    """
-    jobs = default_jobs(
-        mtprs, quants=quants, world_size=world_size, swiglu_limit=swiglu_limit
-    )
-    jobs += default_jobs(
-        mtprs,
-        K3_EXPERTS_PER_RANKS,
-        quants=quants,
-        world_size=world_size,
-        topk=K3_TOPK,
-        model_dim=K3_MODEL_DIM,
-        inter_dim=K3_INTER_DIM,
-        swiglu_limit=0.0,
-        act=K3_ACT,
-        situ_beta=K3_SITU_BETA,
-        situ_linear_beta=K3_SITU_LINEAR_BETA,
-    )
+    mtprs=None,
+    quants=None,
+    experts_per_ranks=None,
+) -> list[dict]:
+    """One job per rank of every ``mega_moe`` deployment of the files
+    ``paths``, at each of its max tokens per rank; rank is a compile-time
+    parameter of the kernels. ``mtprs``, ``quants`` and ``experts_per_ranks``
+    narrow the jobs down to the values they list."""
+    jobs = []
+    for profile in load_deployments(paths).mega_moe:
+        if quants and profile.quant not in quants:
+            continue
+        if experts_per_ranks and profile.experts_per_rank not in experts_per_ranks:
+            continue
+        model = profile.model
+        for mtpr in profile.max_tokens_per_rank:
+            if mtprs and mtpr not in mtprs:
+                continue
+            jobs += [
+                {
+                    "kernel_name": f"{profile.id}/mtpr{mtpr}/rank{rank}",
+                    "quant": profile.quant,
+                    "mtpr": mtpr,
+                    "experts_per_rank": profile.experts_per_rank,
+                    "rank": rank,
+                    "world_size": profile.ep,
+                    "topk": model.top_k,
+                    "model_dim": model.model_dim,
+                    "inter_dim": model.inter_dim,
+                    "swiglu_limit": model.swiglu_limit,
+                    "act": model.activation.lower(),
+                    "situ_beta": model.situ_beta,
+                    "situ_linear_beta": model.situ_linear_beta,
+                }
+                for rank in range(profile.ep)
+            ]
     return jobs
 
 
@@ -270,61 +212,40 @@ def run(argv: list[str] | None = None) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mtpr", type=int, nargs="+", default=list(DEFAULT_MTPRS))
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--deployments",
+        nargs="+",
+        default=DEFAULT_DEPLOYMENTS,
+        help="MoE deployment file(s) whose mega_moe deployments to compile "
+        "(default: moe_deployments.json)",
+    )
+    parser.add_argument(
+        "--mtpr", type=int, nargs="+", help="only these max tokens per rank"
+    )
     parser.add_argument(
         "--experts-per-rank",
         type=int,
         nargs="+",
-        default=list(DEFAULT_EXPERTS_PER_RANKS),
-        help="deployment profiles to compile (for example 48 52 56 for r0/r32/r64)",
+        help="only deployments with these experts per rank "
+        "(for example 48 52 56 for DeepSeek-V4-Pro r0/r32/r64)",
     )
-    parser.add_argument("--world-size", type=int, default=WORLD_SIZE)
-    parser.add_argument("--topk", type=int, default=TOPK)
-    parser.add_argument("--model-dim", type=int, default=MODEL_DIM)
-    parser.add_argument("--inter-dim", type=int, default=INTER_DIM)
-    parser.add_argument("--swiglu-limit", type=float, default=SWIGLU_LIMIT)
-    parser.add_argument("--act", default="silu", choices=("silu", "situv2"))
-    parser.add_argument("--situ-beta", type=float, default=1.0)
-    parser.add_argument("--situ-linear-beta", type=float, default=1.0)
-    parser.add_argument(
-        "--quant",
-        nargs="+",
-        choices=DEFAULT_QUANTS,
-        default=list(DEFAULT_QUANTS),
-    )
+    parser.add_argument("--quant", nargs="+", choices=QUANTS, help="only these quants")
     args = parser.parse_args()
     if os.environ.get("AITER_AOT_REPLAY") != "1":
         raise SystemExit(run(sys.argv[1:]))
     check_replay_process(ARCH)
-    default_shape = (
-        list(args.experts_per_rank) == list(DEFAULT_EXPERTS_PER_RANKS)
-        and args.topk == TOPK
-        and args.model_dim == MODEL_DIM
-        and args.inter_dim == INTER_DIM
+    jobs = deployment_jobs(
+        args.deployments,
+        mtprs=args.mtpr,
+        quants=args.quant,
+        experts_per_ranks=args.experts_per_rank,
     )
-    if default_shape:
-        # Default build ships both V4-Pro and Kimi-K3 so neither JITs online.
-        jobs = production_jobs(
-            tuple(args.mtpr),
-            quants=tuple(args.quant),
-            world_size=args.world_size,
-            swiglu_limit=args.swiglu_limit,
-        )
-    else:
-        jobs = default_jobs(
-            tuple(args.mtpr),
-            tuple(args.experts_per_rank),
-            quants=tuple(args.quant),
-            world_size=args.world_size,
-            topk=args.topk,
-            model_dim=args.model_dim,
-            inter_dim=args.inter_dim,
-            swiglu_limit=args.swiglu_limit,
-            act=args.act,
-            situ_beta=args.situ_beta,
-            situ_linear_beta=args.situ_linear_beta,
-        )
+    if not jobs:
+        print("[aiter] FlyDSL MegaMoE replay: no deployment matches", flush=True)
+        raise SystemExit(1)
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)
     print(
