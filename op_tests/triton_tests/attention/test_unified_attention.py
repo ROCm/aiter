@@ -762,20 +762,28 @@ def test_triton_unified_attn(
 
 
 # Query lengths that leave padded rows in the last query block (BLOCK_Q of 2/4/8),
-# on the 3D split-KV path (long KV) and the 2D path (KV <= 512).
+# on the 3D split-KV path (long KV) and the 2D path (KV <= 512). Head 192 / V 128
+# hits the gfx950 MiMo tiles: a BLOCK_M 64 3D tile holds 4 query positions, so 6
+# leaves padded rows, and the 2D prefill tile holds 16, so 264 leaves 8.
 @pytest.mark.parametrize(
-    "num_heads, query_len, kv_len",
+    "num_heads, query_len, kv_len, head_size, v_head_size",
     [
-        ((32, 8), 3, 4096),
-        ((32, 8), 4, 4096),
-        ((16, 1), 3, 4096),
-        ((32, 8), 3, 256),
-        ((32, 8), 5, 256),
+        ((32, 8), 3, 4096, 128, 128),
+        ((32, 8), 4, 4096, 128, 128),
+        ((16, 1), 3, 4096, 128, 128),
+        ((32, 8), 3, 256, 128, 128),
+        ((32, 8), 5, 256, 128, 128),
+        ((16, 1), 6, 2000, 192, 128),
+        ((16, 1), 264, 4096, 192, 128),
     ],
 )
 @torch.inference_mode()
 def test_triton_unified_attn_qq_bias_padded_query_rows(
-    num_heads: tuple[int, int], query_len: int, kv_len: int
+    num_heads: tuple[int, int],
+    query_len: int,
+    kv_len: int,
+    head_size: int,
+    v_head_size: int,
 ) -> None:
     if DEVICE_ARCH == "gfx1250":
         pytest.skip("gfx1250 Gluon kernel does not mask padded qq_bias rows")
@@ -800,7 +808,8 @@ def test_triton_unified_attn_qq_bias_padded_query_rows(
         seq_lens=seq_lens,
         num_blocks=2048,
         block_size=16,
-        head_size=128,
+        head_size=head_size,
+        v_head_size=v_head_size,
         num_heads=num_heads,
         device="cuda",
     )
