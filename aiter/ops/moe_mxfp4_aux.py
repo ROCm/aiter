@@ -47,6 +47,8 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (129, 6144, 512, 5),
         (129, 6144, 768, 5),
         (129, 6144, 1536, 5),
+        (128, 6144, 768, 4),
+        (128, 6144, 1536, 4),
         (256, 3072, 256, 8),
         (256, 3072, 512, 8),
         (256, 7168, 256, 8),
@@ -131,6 +133,7 @@ def mxfp4_moe_sort(
     D_INTER: int,
     MB: int,
     prologue: int,
+    num_local_tokens: Tensor | None = None,
 ) -> None: ...
 
 
