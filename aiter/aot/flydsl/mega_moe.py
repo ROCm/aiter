@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT profile bundles for MegaMoE A8W4 and A4W4 deployment shapes."""
+"""AOT profile bundles for MegaMoE A8W4 and A4W4 deployment shapes, plus the opt-in small-/large-input kernels."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from aiter.aot.flydsl.common import compile_only_env, override_env, run_jobs_par
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     build_mega_moe_bundle_plan,
 )
+from aiter.ops.flydsl.kernels.mega_moe.mega_moe_fused_gemm import LARGE_M_MTPR
 
 DEFAULT_MTPRS = (8192, 16384, 32768)
 DEFAULT_QUANTS = ("a8w4", "a4w4")
@@ -45,6 +46,9 @@ MODEL_DIM = 7168
 INTER_DIM = 3072
 NUM_CU = 256
 SWIGLU_LIMIT = 10.0
+# Opt-in small-/large-input kernels (AITER_MEGA_SMALL_M / AITER_MEGA_LARGE_M): DeepSeek-V4-Pro EP8 a8w4 only.
+SMALL_M_MTPRS = (256, 512)
+FUSED_PATH_EXPERTS_PER_RANK = 48
 _DEFAULT_COMBINE_BLOCK_NUM = 128
 _DEFAULT_COMBINE_WARP_NUM = 8
 
@@ -94,7 +98,7 @@ def default_jobs(
     # Activation is baked into the Stage1 epilogue, so a non-default act needs a
     # distinct AOT artifact name (mirrors the runtime kernel-name act suffix).
     act_suffix = "" if act == "silu" else f"_{act}"
-    return [
+    jobs = [
         {
             "kernel_name": (
                 f"mega_moe_{quant}_stage{stage}_bundle_mtpr{mtpr}_epr{experts_per_rank}"
@@ -119,6 +123,44 @@ def default_jobs(
         for quant in quants
         for rank in range(world_size)
         for stage in (1, 2)
+    ]
+    fused_shape = (
+        "a8w4" in quants
+        and FUSED_PATH_EXPERTS_PER_RANK in experts_per_ranks
+        and (world_size, topk, model_dim, inter_dim, swiglu_limit, act)
+        == (WORLD_SIZE, TOPK, MODEL_DIM, INTER_DIM, SWIGLU_LIMIT, "silu")
+    )
+    if fused_shape:
+        jobs += fused_path_jobs(large_m=LARGE_M_MTPR in mtprs)
+    return jobs
+
+
+def fused_path_jobs(*, large_m=True):
+    """Small-input runtimes (MTPR 256/512) and the large-input kernel (MTPR 8192) for every rank."""
+    common = {
+        "quant": "a8w4",
+        "experts_per_rank": FUSED_PATH_EXPERTS_PER_RANK,
+        "world_size": WORLD_SIZE,
+        "topk": TOPK,
+        "model_dim": MODEL_DIM,
+        "inter_dim": INTER_DIM,
+        "swiglu_limit": SWIGLU_LIMIT,
+    }
+    stages = [("small_m", mtpr) for mtpr in SMALL_M_MTPRS]
+    if large_m:
+        stages.append(("large_m", LARGE_M_MTPR))
+    return [
+        {
+            "kernel_name": (
+                f"mega_moe_a8w4_{stage}_mtpr{mtpr}_epr{FUSED_PATH_EXPERTS_PER_RANK}_rank{rank}"
+            ),
+            "stage": stage,
+            "mtpr": mtpr,
+            "rank": rank,
+            **common,
+        }
+        for stage, mtpr in stages
+        for rank in range(WORLD_SIZE)
     ]
 
 
@@ -481,6 +523,167 @@ def _compile_stage2(
         )
 
 
+def _main_stage_tensors(model_dim, inter_dim):
+    """Stage1 placeholders with the runtime tensors' dtype and rank (see _compile_stage1)."""
+    return (
+        _tensor((1, inter_dim), torch.float8_e4m3fn),
+        _tensor((1, model_dim), torch.float8_e4m3fn),
+        _tensor((2, 2, 2), torch.uint8),
+        _tensor((1, model_dim // 128), torch.int32),
+        _tensor((2, 2), torch.uint8),
+        _tensor((1,), torch.int32),
+        _tensor((1,), torch.int32),
+    )
+
+
+def _compile_small_m(
+    mtpr, rank, *, world_size, topk, model_dim, inter_dim, swiglu_limit
+):
+    """Every config a small-input runtime of this MTPR selects (one per token bucket)."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_fused_gemm import TOKEN_BUCKETS
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import (
+        _COMBINE_REDUCERS,
+        run_mega_moe_stage1,
+        small_m_config,
+    )
+
+    epr = FUSED_PATH_EXPERTS_PER_RANK
+    fuse_cap, num_valid_max, _ = _group_major_geometry(
+        mtpr, epr, world_size=world_size, topk=topk, fixed_slot_dispatch=True
+    )
+    seen = set()
+    for bucket in (b for b in TOKEN_BUCKETS if b <= mtpr):
+        config = small_m_config(
+            bucket, mtpr, experts_per_rank=epr, model_dim=model_dim, inter_dim=inter_dim
+        )
+        stage1, stage2 = config.stage1, config.stage2
+        if (stage1, stage2) in seen:
+            continue
+        seen.add((stage1, stage2))
+        run_mega_moe_stage1(
+            *_main_stage_tensors(model_dim, inter_dim),
+            _tensor((1,), torch.uint8),
+            fx.Int32(num_valid_max),
+            fx.Int64(0),
+            fx.Int32(1),
+            *([fx.Int64(0)] * 6),
+            fx.Stream(None),
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            rank=rank,
+            experts_per_rank=epr,
+            fuse_npes=world_size,
+            fuse_topk=topk,
+            fuse_cap=fuse_cap,
+            fuse_mtpr=mtpr,
+            fuse_scale_dim=model_dim // 32,
+            fused=(
+                stage2.block_n,
+                stage2.block_k,
+                world_size * mtpr,
+                _COMBINE_REDUCERS,
+            ),
+            num_cu=NUM_CU,
+            sort_block_m=stage1.sort_block_m,
+            tile_n=stage1.tile_n,
+            tile_k=stage1.tile_k,
+            num_waves=stage1.num_waves,
+            grid_mult=min(stage1.grid_mult, 2),
+            pipe_weights=stage1.pipe_weights,
+            mfma_amajor=stage1.mfma_amajor,
+            swizzle_a=stage1.swizzle_a,
+            async_a_copy=stage1.async_a_copy,
+            num_dispatch_cu=stage1.num_dispatch_cu,
+            use_tile_resource=stage1.use_tile_resource,
+            waves_per_eu_hint=stage1.waves_per_eu_hint,
+            b_nt=stage1.b_nt,
+            swiglu_limit=swiglu_limit,
+        )
+
+
+def _compile_large_m(rank, *, world_size, topk, model_dim, inter_dim, swiglu_limit):
+    """The persistent large-input kernel and its quant kernel."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_fused_gemm import (
+        select_mega_moe_config,
+    )
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import (
+        LARGE_M_G2_CHUNK,
+        large_m_kernel_specs,
+        run_mega_moe_stage1,
+    )
+    from aiter.ops.flydsl.kernels.mega_moe.quant import _get_launcher
+
+    mtpr, epr = LARGE_M_MTPR, FUSED_PATH_EXPERTS_PER_RANK
+    fuse_cap, num_valid_max, _ = _group_major_geometry(
+        mtpr, epr, world_size=world_size, topk=topk
+    )
+    config = select_mega_moe_config(
+        mtpr, mtpr, experts_per_rank=epr, model_dim=model_dim, inter_dim=inter_dim
+    )
+    stage1 = config.stage1
+    s2_spec, c_spec = large_m_kernel_specs(
+        config,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        topk=topk,
+        rank=rank,
+        npes=world_size,
+        mtpr=mtpr,
+        experts_per_rank=epr,
+        num_valid_max=num_valid_max,
+    )
+    scale_dim = model_dim // 32
+    _get_launcher(model_dim, "fp8")(
+        _tensor((2, model_dim), torch.bfloat16),
+        _tensor((2, model_dim), torch.float8_e4m3fn),
+        _tensor((2, scale_dim), torch.uint8),
+        2,
+        (2 * scale_dim + 63) // 64,
+        fx.Stream(None),
+    )
+    run_mega_moe_stage1(
+        *_main_stage_tensors(model_dim, inter_dim),
+        _tensor((2,), torch.int32),
+        _tensor((1,), torch.uint8),
+        fx.Int32(num_valid_max),
+        fx.Int64(0),
+        fx.Int32(1),
+        *([fx.Int64(0)] * 6),
+        fx.Stream(None),
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        rank=rank,
+        experts_per_rank=epr,
+        fuse_npes=world_size,
+        fuse_topk=topk,
+        fuse_cap=fuse_cap,
+        fuse_mtpr=mtpr,
+        fuse_scale_dim=scale_dim,
+        num_cu=NUM_CU,
+        fused_stage2=s2_spec,
+        fused_args=(0,) * 14,
+        fused_combine=c_spec,
+        fused_combine_args=(0, 0, 0, 0, 0, 1, model_dim + scale_dim),
+        sort_block_m=stage1.sort_block_m,
+        tile_n=stage1.tile_n,
+        tile_k=stage1.tile_k,
+        num_waves=stage1.num_waves,
+        grid_mult=stage1.grid_mult,
+        pipe_weights=stage1.pipe_weights,
+        mfma_amajor=stage1.mfma_amajor,
+        swizzle_a=stage1.swizzle_a,
+        async_a_copy=stage1.async_a_copy,
+        num_dispatch_cu=stage1.num_dispatch_cu,
+        use_tile_resource=stage1.use_tile_resource,
+        waves_per_eu_hint=stage1.waves_per_eu_hint,
+        b_nt=stage1.b_nt,
+        work_shards=stage1.work_shards,
+        payload_chunk_rows=stage1.payload_chunk_rows,
+        swiglu_limit=swiglu_limit,
+        fused_g2_chunk=LARGE_M_G2_CHUNK,
+    )
+
+
 def compile_one_config(**job):
     result = {**job, "compile_time": None}
     started = time.time()
@@ -494,6 +697,21 @@ def compile_one_config(**job):
         situ_beta = job.get("situ_beta", 1.0)
         situ_linear_beta = job.get("situ_linear_beta", 1.0)
         a_dtype = "fp4" if job["quant"] == "a4w4" else "fp8"
+        if job["stage"] in ("small_m", "large_m"):
+            shape = {
+                "world_size": world_size,
+                "topk": topk,
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "swiglu_limit": swiglu_limit,
+            }
+            with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
+                if job["stage"] == "small_m":
+                    _compile_small_m(job["mtpr"], job["rank"], **shape)
+                else:
+                    _compile_large_m(job["rank"], **shape)
+            result["compile_time"] = time.time() - started
+            return result
         plan = build_mega_moe_bundle_plan(
             job["mtpr"],
             a_dtype=a_dtype,

@@ -13,7 +13,6 @@ from enum import IntEnum
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import mori.ir.flydsl as mori_shmem
 import mori.shmem as ms
 import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
@@ -357,7 +356,7 @@ def emit_direct_fixed_slot_finalize(
     if warp == fx.Int32(0):
         for source in range(lane, fz_npes, 64):
             done_index = parity * fx.Int32(fz_npes) + source
-            mori_shmem.int32_wait_until_equals(a_source_done + fx.Int64(done_index) * fx.Int64(4), expected)
+            comm_ops.wait_i32_until_equals(a_source_done + fx.Int64(done_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
 
         valid_expert = lane < fx.Int32(fz_epr)
@@ -699,11 +698,11 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
             if tx_i32 < fx.Int32(npes):
                 if const_expr(row_format):
                     # Any format bit of this launch's flag; earlier launches published smaller values.
-                    seen = fx.Int64(mori_shmem.uint64_wait_until_greater_than(
-                        arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), (arg_flag << fx.Int64(1)) - fx.Int64(1)))
+                    seen = fx.Int64(comm_ops.spin_until_ge_i64(
+                        arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), arg_flag << fx.Int64(1)))
                     fx.ptr_store(fx.Int32(seen & fx.Int64(1)) << tx_i32, fmt_ptr(tx_i32))
                 else:
-                    mori_shmem.uint64_wait_until_equals(arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), flag)
+                    comm_ops.wait_i64_until_equals(arg_xdb + fx.Int64(tx_i32) * fx.Int64(8), flag)
                 if const_expr(l1_acquire):
                     comm_ops.invalidate_l1()
                 else:
@@ -1040,7 +1039,7 @@ def compile_mega_moe_stage1(
         producer = (ticket > fx.Int32(0)) & (ticket <= fx.Int32(dispatch_blocks))
 
         def _wait_gate():
-            mori_shmem.int32_wait_until_equals(gate_addr, gate_epoch)
+            comm_ops.wait_i32_until_equals(gate_addr, gate_epoch)
 
         def _load_epoch():
             # Independent loads (no parity -> expected chain); only valid after the gate.
@@ -1198,12 +1197,12 @@ def compile_mega_moe_stage1(
             a_xcd_acq = _disp_ptr(DispatchSlot.XCD_ACQ) + fx.Int64(xcd) * fx.Int64(128)
             plan_word = fx.Int64(0)
             if first_local == fx.Int32(0):
-                plan_word = fx.Int64(mori_shmem.int64_wait_until_greater_than(
-                    _disp_ptr(DispatchSlot.PLAN_NV), plan_floor))
+                plan_word = fx.Int64(comm_ops.spin_until_ge_i64(
+                    _disp_ptr(DispatchSlot.PLAN_NV), plan_floor + fx.Int64(1)))
                 comm_ops.fence_agent_acquire()
                 comm_ops.store_i64_global_system(a_xcd_acq, plan_word)
             else:
-                plan_word = fx.Int64(mori_shmem.int64_wait_until_greater_than(a_xcd_acq, plan_floor))
+                plan_word = fx.Int64(comm_ops.spin_until_ge_i64(a_xcd_acq, plan_floor + fx.Int64(1)))
                 comm_ops.invalidate_l1()
             fx.ptr_store(fx.Int32(plan_word & fx.Int64(0xFFFFFFFF)), nv_ptr)
         fx.barrier()
@@ -1326,7 +1325,7 @@ def compile_mega_moe_stage1(
                 g2_m = g2_u // fx.Int32(g2_n_blocks)
                 g2_n = g2_u - g2_m * fx.Int32(g2_n_blocks)
                 if tid == fx.Int32(0):
-                    mori_shmem.int32_wait_until_equals(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), gate_epoch)
+                    comm_ops.wait_i32_until_equals(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), gate_epoch)
                 fx.barrier()
                 # GEMM1 wrote this m-tile through this XCD's L2, or (in an m-tile shared by two XCDs) written back
                 # to memory by the other XCD into lines this XCD has not cached, before it was counted: only the
@@ -1414,6 +1413,36 @@ _HOT_EXPERT_MIN_ROWS = 256
 # Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29).
 _PLAN_CACHED_W_BIT = 29
 _PLAN_FP8_ROWS_BIT = 30
+
+
+def small_m_config(
+    tokens: int, mtpr: int, *, experts_per_rank: int, model_dim: int, inter_dim: int
+):
+    """The kernel config of a small-input call with ``tokens`` rows on an ``mtpr`` runtime."""
+    config = select_mega_moe_config(
+        tokens,
+        mtpr,
+        experts_per_rank=experts_per_rank,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+    )
+    if config.stage2.persist:
+        # Buckets >= 128 select a persistent GEMM2; the kernel runs GEMM2 in its own grid with NT B loads.
+        config = replace(
+            config,
+            stage2=replace(
+                config.stage2, block_n=256, persist=False, persist_cu=0, use_nt=True
+            ),
+        )
+    if nearest_token_bucket(max(tokens, 1)) >= _BM64_MIN_BUCKET:
+        # 64-row expert tiles: at ~35+ rows per expert a 32-row tile splits every expert in two and streams its
+        # weights twice.
+        config = replace(
+            config,
+            stage1=replace(config.stage1, sort_block_m=64),
+            stage2=replace(config.stage2, block_m=64),
+        )
+    return config
 
 
 class SmallMRuntime:
@@ -1592,27 +1621,11 @@ class SmallMRuntime:
         self._s1_disp = disp
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
-        config = select_mega_moe_config(
-            tokens,
-            self.mtpr,
-            experts_per_rank=self.epr,
-            model_dim=self.model_dim,
-            inter_dim=self.inter_dim,
+        config = small_m_config(
+            tokens, self.mtpr, experts_per_rank=self.epr, model_dim=self.model_dim, inter_dim=self.inter_dim
         )
-        if config.stage2.persist:
-            # Buckets >= 128 select a persistent GEMM2; the kernel runs GEMM2 in its own grid with NT B loads.
-            config = replace(config, stage2=replace(config.stage2, block_n=256, persist=False, persist_cu=0, use_nt=True))
-        config = self._bm64_override(tokens, config)
         self._active_config = config
         return config
-
-    def _bm64_override(self, tokens: int, config: MegaMoEConfig) -> MegaMoEConfig:
-        """64-row expert tiles from token bucket _BM64_MIN_BUCKET up: at ~35+ rows per expert a
-        32-row tile splits every expert in two and streams its weights twice."""
-        if nearest_token_bucket(max(tokens, 1)) < _BM64_MIN_BUCKET:
-            return config
-        stage1 = replace(config.stage1, sort_block_m=64)
-        return replace(config, stage1=stage1, stage2=replace(config.stage2, block_m=64))
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
         run_tokens = int(x_bf16.shape[0])

@@ -13,7 +13,6 @@ from enum import IntEnum
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import mori.ir.flydsl as mori_shmem
 import mori.shmem as ms
 import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
@@ -344,7 +343,7 @@ def emit_dispatch_plan(
     r_pair_base = AddrBuffer(a_pair_base)
     r_lc = AddrBuffer(a_lc)
     if tid == fx.Int32(0):
-        mori_shmem.int32_wait_until_equals(a_group_done, fx.Int32(dispatch_blocks))
+        comm_ops.wait_i32_until_equals(a_group_done, fx.Int32(dispatch_blocks))
         comm_ops.fence_agent_acquire()
         store_at(fx.Int32(0), AddrBuffer(a_group_done), fx.Int32(0))
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -390,7 +389,7 @@ def emit_dispatch_plan(
             comm_ops.store_i32_system(remote_done, done_index, expected)
         for source in range(lane, fz_npes, 64):
             done_index = parity * fx.Int32(fz_npes) + source
-            mori_shmem.int32_wait_until_equals(a_cd + fx.Int64(done_index) * fx.Int64(4), expected)
+            comm_ops.wait_i32_until_equals(a_cd + fx.Int64(done_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
 
         r_nv = AddrBuffer(a_nv)
@@ -529,7 +528,7 @@ def emit_dispatch_plan(
         active_group_blocks = fx.Int32(dispatch_blocks)
         if const_expr(dispatch_blocks > 32):
             active_group_blocks = load_at(AddrBuffer(a_active_payload_blocks), fx.Int32(0), fx.Int32, 1)
-        mori_shmem.int32_wait_until_equals(a_group_done, active_group_blocks)
+        comm_ops.wait_i32_until_equals(a_group_done, active_group_blocks)
         comm_ops.fence_agent_acquire()
         comm_ops.fence_agent_release()
         comm_ops.store_i32_system(a_pair_order_ready, parity, expected)
@@ -574,7 +573,7 @@ def emit_dispatch_group(
         comm_ops.fence_agent_release()
         comm_ops.atomic_add_agent(a_group_done, fx.Int32(1))
     if tid == fx.Int32(0):
-        mori_shmem.int32_wait_until_equals(a_pair_ready + fx.Int64(parity) * fx.Int64(4), expected)
+        comm_ops.wait_i32_until_equals(a_pair_ready + fx.Int64(parity) * fx.Int64(4), expected)
         comm_ops.fence_agent_acquire()
     fx.barrier()
 
@@ -601,7 +600,7 @@ def emit_dispatch_group(
     # Payload-active producers are chosen per destination, so some of them sit
     # out adaptive grouping; all must still see this launch's pair order.
     if tid == fx.Int32(0):
-        mori_shmem.int32_wait_until_equals(a_pair_order_ready + fx.Int64(parity) * fx.Int64(4), expected)
+        comm_ops.wait_i32_until_equals(a_pair_order_ready + fx.Int64(parity) * fx.Int64(4), expected)
         comm_ops.fence_agent_acquire()
     fx.barrier()
 
@@ -681,7 +680,7 @@ def emit_dispatch_payload(
     producer_destination = producer_slot % fx.Int32(num_destinations)
     ready_index = parity * fx.Int32(num_destinations) + producer_destination
     if tid == fx.Int32(0):
-        mori_shmem.int32_wait_until_equals(a_plan_ready + fx.Int64(ready_index) * fx.Int64(4), expected)
+        comm_ops.wait_i32_until_equals(a_plan_ready + fx.Int64(ready_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
     destination_ready_rows = fx.Int32(0)
     if tid == fx.Int32(0):
@@ -1167,6 +1166,49 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
 _SC0_CACHE = 1
 
 
+# Chunks of 3 n-major GEMM2 units keep consecutive m-blocks of one n-block together for W2 reuse while short
+# enough to narrow the per-CTA drain tail; the kernel takes them only when the received rows warrant it.
+LARGE_M_G2_CHUNK = 3
+
+
+def large_m_kernel_specs(
+    config, *, model_dim, inter_dim, topk, rank, npes, mtpr, experts_per_rank, num_valid_max
+):
+    """The fused Stage2 and Combine specs of the large-input kernel (part of its compile key)."""
+    s1, stage2 = config.stage1, config.stage2
+    nw = int(s1.num_waves)
+    if nw not in (4, 8):
+        raise ValueError(f"fused path needs 4 or 8 Stage1 waves, got {nw}")
+    s2_bm = int(stage2.block_m)
+    s2_bn = int(stage2.block_n) * (nw // 4)
+    if model_dim % s2_bn:
+        raise ValueError(f"model_dim={model_dim} is not divisible by fused Stage2 BN={s2_bn}")
+    p2p_quant = config.p2p_quant
+    assert p2p_quant == "fp8_blockwise_1x32", p2p_quant
+    g2_bhoist, g2_ascale_pf, _sp, _gn, _m01, _bf = _resolve_g2_knobs(
+        stage2.b_hoist, stage2.ascale_prefetch, stage2.spatial_partition, False, False
+    )
+    # The P2P rows are FP8 with one E8M0 scale per 32 values.
+    row_nbytes = model_dim + model_dim // 32
+    # fmt: off
+    s2_spec = (
+        ("model_dim", model_dim), ("topk", topk), ("rank", rank), ("npes", npes), ("max_tok", mtpr),
+        ("experts", experts_per_rank), ("BM", s2_bm), ("BN", s2_bn), ("BK", int(stage2.block_k)), ("NW", nw),
+        ("SBM", int(s1.sort_block_m)), ("a_dtype", "fp8"), ("use_nt", bool(stage2.use_nt)),
+        ("INTER_MAX", inter_dim), ("has_pad", False), ("g2_bhoist", bool(g2_bhoist)),
+        ("g2_ascale_pf", bool(g2_ascale_pf)), ("recv_cap", npes * mtpr),
+        ("comb_inp_nbytes", mtpr * topk * row_nbytes), ("g2_bf16_lds", False),
+        ("p2p_quant_type", p2p_quant), ("p2p_cache_mod", 19),
+        ("max_g2_m_blocks", (num_valid_max + s2_bm - 1) // s2_bm), ("inter_dim", inter_dim),
+    )
+    c_spec = (
+        ("blockwise", True), ("topk", topk), ("model_dim", model_dim), ("npes", npes), ("max_tok", mtpr),
+        ("combine_token_bytes", 2 * model_dim),
+    )
+    # fmt: on
+    return s2_spec, c_spec
+
+
 def _torch_stream(stream):
     """The torch stream for ``stream`` (None, a torch stream, an fx.Stream or a raw handle)."""
     if stream is None:
@@ -1434,7 +1476,7 @@ def compile_mega_moe_stage1(
                 launch_ready_table = _make_buffer_from_addr(p_launch_ready, fx.Int64)
                 remote_launch_ready = _buffer_load(launch_ready_table, peer, fx.Int64)
                 comm_ops.store_i32_system(remote_launch_ready, fx.Int32(fz_rank), launch_epoch)
-                mori_shmem.int32_wait_until_greater_than(
+                comm_ops.wait_i32_until_greater_than(
                     a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch - fx.Int32(1)
                 )
                 comm_ops.fence_system_acquire()
@@ -1479,7 +1521,7 @@ def compile_mega_moe_stage1(
             fx.barrier()
         else:
             if tid == fx.Int32(0):
-                mori_shmem.int32_wait_until_equals(gate_addr, gate_epoch)
+                comm_ops.wait_i32_until_equals(gate_addr, gate_epoch)
                 comm_ops.fence_agent_acquire()
             fx.barrier()
 
@@ -1562,7 +1604,7 @@ def compile_mega_moe_stage1(
         if tid == fx.Int32(0):
             local_plan_ready = _buffer_load(disp_rsrc, fx.Int32(int(DispatchSlot.PLAN_READY)), fx.Int64)
             ready_index = payload_parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
-            mori_shmem.int32_wait_until_equals(
+            comm_ops.wait_i32_until_equals(
                 local_plan_ready + fx.Int64(ready_index) * fx.Int64(4), payload_expected)
             comm_ops.fence_agent_acquire()
         fx.barrier()
@@ -1576,7 +1618,7 @@ def compile_mega_moe_stage1(
             expected_tiles = _buffer_load(
                 _make_buffer_from_addr(addr_tile_expected, fx.Int32), tile_index, fx.Int32
             )
-            mori_shmem.int32_wait_until_equals(
+            comm_ops.wait_i32_until_equals(
                 addr_tile_ready + fx.Int64(tile_index) * fx.Int64(4), expected_tiles
             )
 
@@ -1636,7 +1678,7 @@ def compile_mega_moe_stage1(
                     work = fx.Int32(comm_ops.atomic_add_agent(a_work_head, fx.Int32(1)))
                     if work < total_work:
                         ready_slot = work // fx.Int32(N_TILES)
-                        mori_shmem.int32_wait_until_equals(
+                        comm_ops.wait_i32_until_equals(
                             _disp_ptr(DispatchSlot.READY_TILE_EPOCH)
                             + fx.Int64(ready_slot) * fx.Int64(4),
                             fx.Int32(fx.ptr_load(epoch_slot_ptr, result_type=T.i32)),
@@ -1734,7 +1776,7 @@ def compile_mega_moe_stage1(
                     g2_wait_m = g2_unit // fx.Int32(g2_num_n_blocks)
                 if g2_has != fx.Int32(0):
                     g1_tile = g2_wait_m * fx.Int32(S2_BM) // fx.Int32(S2_SBM)
-                    mori_shmem.int32_wait_until_greater_than(
+                    comm_ops.wait_i32_until_greater_than(
                         addr_mtile_ctr + fx.Int64(g1_tile) * fx.Int64(4), fx.Int32(N_TILES - 1)
                     )
                     comm_ops.fence_agent_acquire()
@@ -1793,7 +1835,7 @@ def compile_mega_moe_stage1(
         fx.barrier()
         if tid == fx.Int32(0):
             for source in range_constexpr(fz_npes):
-                mori_shmem.int32_wait_until_greater_than(
+                comm_ops.wait_i32_until_greater_than(
                     c_tok_ready
                     + fx.Int64(C_MTPR + source) * fx.Int64(4),
                     c_gen - fx.Int32(1),
@@ -2274,34 +2316,15 @@ class LargeMRuntime:
     def _fused_all_kwargs(self, cur_tok: int, config: MegaMoEConfig):
         """Stage1 config plus the fused Stage2/Combine specs (hashable) and runtime args."""
         s1 = config.stage1
-        stage2 = config.stage2
-        nw = int(s1.num_waves)
-        if nw not in (4, 8):
-            raise ValueError(f"fused path needs 4 or 8 Stage1 waves, got {nw}")
-        s2_bm = int(stage2.block_m)
-        s2_bn = int(stage2.block_n) * (nw // 4)
-        if self.model_dim % s2_bn:
-            raise ValueError(f"model_dim={self.model_dim} is not divisible by fused Stage2 BN={s2_bn}")
-        p2p_quant = config.p2p_quant
-        assert p2p_quant == "fp8_blockwise_1x32", p2p_quant
         inv = self._g2_inv
-        g2_bhoist, g2_ascale_pf, _sp, _gn, _m01, _bf = _resolve_g2_knobs(
-            stage2.b_hoist, stage2.ascale_prefetch, stage2.spatial_partition, False, False
+        if int(self.comb_cfg.combine_token_bytes) != 2 * self.model_dim:
+            raise ValueError("the fused combine writes BF16 output rows")
+        s2_spec, c_spec = large_m_kernel_specs(
+            config, model_dim=self.model_dim, inter_dim=self.inter_dim, topk=self.topk, rank=self.rank,
+            npes=self.world_size, mtpr=self.mtpr, experts_per_rank=self.epr, num_valid_max=int(self._s1_nvm),
         )
-        max_g2_m_blocks = (int(self._s1_nvm) + s2_bm - 1) // s2_bm
-        if max_g2_m_blocks > self._fused_max_blocks:
+        if dict(s2_spec)["max_g2_m_blocks"] > self._fused_max_blocks:
             raise ValueError("fused counter arena is smaller than the Stage2 m-block count")
-        s2_spec = (
-            ("model_dim", int(inv["model_dim"])), ("topk", int(inv["topk"])), ("rank", int(inv["rank"])),
-            ("npes", int(inv["npes"])), ("max_tok", int(inv["max_tok"])), ("experts", int(inv["experts"])),
-            ("BM", s2_bm), ("BN", s2_bn), ("BK", int(stage2.block_k)), ("NW", nw),
-            ("SBM", int(s1.sort_block_m)), ("a_dtype", "fp8"), ("use_nt", bool(stage2.use_nt)),
-            ("INTER_MAX", int(inv["INTER_MAX"])), ("has_pad", False), ("g2_bhoist", bool(g2_bhoist)),
-            ("g2_ascale_pf", bool(g2_ascale_pf)), ("recv_cap", int(inv["recv_cap"])),
-            ("comb_inp_nbytes", int(inv["comb_inp_nbytes"])), ("g2_bf16_lds", False),
-            ("p2p_quant_type", p2p_quant), ("p2p_cache_mod", 19),
-            ("max_g2_m_blocks", max_g2_m_blocks), ("inter_dim", int(self.inter_dim)),
-        )
         op = self._s1_op
         comb_op = self.comb_op
         s2_args = (
@@ -2312,13 +2335,7 @@ class LargeMRuntime:
             self._fused_comb_mtile_ctr.data_ptr(), self._p2p_tok_ready.data_ptr(),
         )
         assert len(s2_args) == 13
-        cfg = self.comb_cfg
         row_nbytes = int(inv["comb_inp_nbytes"]) // (int(inv["max_tok"]) * int(inv["topk"]))
-        c_spec = (
-            ("blockwise", p2p_quant == "fp8_blockwise_1x32"), ("topk", int(self.topk)),
-            ("model_dim", int(self.model_dim)), ("npes", int(self.world_size)), ("max_tok", int(self.mtpr)),
-            ("combine_token_bytes", int(cfg.combine_token_bytes)),
-        )
         c_args = (
             comb_op.shmem_comb_inp_tok.data_ptr(), comb_op.shmem_comb_out_tok.data_ptr(),
             self._tok_ready.data_ptr(), self._fused_comb_ctr.data_ptr(), 0, int(cur_tok),
@@ -2329,10 +2346,7 @@ class LargeMRuntime:
             "fused_args": (self._fused_mtile_ctr.data_ptr(), *s2_args),
             "fused_combine": c_spec,
             "fused_combine_args": c_args,
-            # Chunks of 3 n-major units keep consecutive m-blocks of one n-block together for W2 reuse
-            # while short enough to narrow the per-CTA G2 drain tail; the kernel takes them only
-            # when the received rows warrant it.
-            "fused_g2_chunk": 3,
+            "fused_g2_chunk": LARGE_M_G2_CHUNK,
         }
         return s1, kw
 
