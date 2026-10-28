@@ -38,7 +38,6 @@ __all__ = [
 SUPPORTED_GFX = ("gfx942", "gfx950")
 
 _DISPATCH_TABLES: dict[tuple, dict] = {}
-_DISPATCH_CACHE: dict[tuple, dict] = {}
 
 _XCD_C_SMALL_K = 32
 _XCD_C_LARGE_K = 120
@@ -175,26 +174,7 @@ def resolve_config(
     block_k: int | None = None,
 ) -> dict:
     bucket = tile_bucket(n_groups, max_seq_len, output_n)
-    arch = _runtime_arch()
-    cu = int(get_cu_num())
     n_xcds = int(get_num_xcds())
-    key = (
-        arch,
-        cu,
-        n_xcds,
-        uniform_seqlen,
-        reduction_k,
-        output_n,
-        bucket,
-        n_groups > _SKEW_REMAP_MIN_GROUPS,
-        xcd_c,
-        xcd_w,
-        block_k,
-    )
-    cached = _DISPATCH_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     cfg = analytic_config(
         uniform_seqlen=uniform_seqlen,
         n_groups=n_groups,
@@ -213,7 +193,6 @@ def resolve_config(
     if block_k is not None:
         cfg["block_k"] = int(block_k)
 
-    _DISPATCH_CACHE[key] = cfg
     return cfg
 
 

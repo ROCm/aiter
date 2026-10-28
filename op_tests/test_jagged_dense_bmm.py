@@ -655,7 +655,6 @@ def test_jdbba_tile_map_inplace(B, D, Kout, Mi, dtype):
 
 def _clear_dispatch_cache():
     jdbba_dispatch._DISPATCH_TABLES.clear()
-    jdbba_dispatch._DISPATCH_CACHE.clear()
     AITER_CONFIGS.get_config_file.cache_clear()
 
 
