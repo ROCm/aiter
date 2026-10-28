@@ -1960,6 +1960,11 @@ def _unified_attention_gluon_kernel_2d(
             q_block_local_idx = q_block_global_idx % Q_BLOCKS_PER_SEQ
         cur_batch_query_len: gl.int32 = SEQLEN_Q
         cur_batch_in_all_start_index = seq_idx * SEQLEN_Q
+        # A pad seq (seqused_k == 0) need not have q/out rows behind it: under DP
+        # a rank's batch is padded past the rows it holds. Leave before q is read
+        # or out written; the search path does the same through its zero length.
+        if gl.load(seq_lens_ptr + seq_idx) == 0:
+            return
     elif not ALL_DECODE:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q

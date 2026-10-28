@@ -339,7 +339,8 @@ def unified_attention(
     ALL_DECODE = int(max_seqlen_q) == 1
     # With equal_seqlen_q, seq i's queries are q rows [i, i + 1) * max_seqlen_q.
     # Trailing pad seqs may have no rows behind them so long as their seqused_k
-    # is 0: the 3d kernel returns on an empty KV before it touches q.
+    # is 0: the launches stop at the last seq with rows, and both kernels return
+    # on an empty KV before they touch q or out.
     SPEC_DECODE = equal_seqlen_q and not ALL_DECODE
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
@@ -847,7 +848,11 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     if params.all_decode:
         total_query_blocks = NUM_SEQS
     elif params.spec_decode:
-        total_query_blocks = NUM_SEQS * triton.cdiv(SEQLEN_Q, BLOCK_Q)
+        # only the seqs with q rows behind them; the trailing pad seqs of a
+        # DP-padded batch have none (and seqused_k == 0)
+        total_query_blocks = min(
+            NUM_SEQS, params.num_tokens // SEQLEN_Q
+        ) * triton.cdiv(SEQLEN_Q, BLOCK_Q)
     else:
         total_query_blocks = params.num_tokens // BLOCK_Q + NUM_SEQS
 
@@ -933,7 +938,10 @@ def _unified_attention_3d_gfx1250(
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
     elif params.spec_decode:
-        total_num_q_blocks = params.num_seqs * triton.cdiv(SEQLEN_Q, config["BLOCK_Q"])
+        # only the seqs with q rows behind them, as in the 2d launch
+        total_num_q_blocks = min(
+            params.num_seqs, params.num_tokens // SEQLEN_Q
+        ) * triton.cdiv(SEQLEN_Q, config["BLOCK_Q"])
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
