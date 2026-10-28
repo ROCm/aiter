@@ -40,6 +40,18 @@ def torch_rms_gated(x, weight, z, group_size, norm_before_gate, activation):
     return y.to(x.dtype)
 
 
+def hadamard32(device) -> torch.Tensor:
+    h = torch.ones((1, 1), device=device)
+    while h.shape[0] < 32:
+        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
+    return h / 32**0.5
+
+
+def torch_rotate(y, h):
+    M, N = y.shape
+    return (y.float().view(M, N // 32, 32) @ h).view(M, N).to(y.dtype)
+
+
 def run_benchmark(args):
     if args.shape is not None:
         M, N, G = args.shape
@@ -70,6 +82,7 @@ def run_benchmark(args):
             "activation": args.activation,
             "norm_before_gate": not args.norm_after_gate,
             "transpose_scale": args.transpose_scale,
+            "hadamard_rotate": args.hadamard_rotate,
         },
     )
 
@@ -84,11 +97,13 @@ def run_benchmark(args):
         activation,
         norm_before_gate,
         transpose_scale,
+        hadamard_rotate,
     ):
         dtype = get_dtype(dtype)
         x = torch.randn((M, N), dtype=dtype, device="cuda")
         z = torch.randn((M, N), dtype=dtype, device="cuda")
         w = torch.randn(group_size, dtype=dtype, device="cuda")
+        h = hadamard32(x.device) if hadamard_rotate else None
 
         if provider == "fused":
 
@@ -102,12 +117,15 @@ def run_benchmark(args):
                     activation=activation,
                     group_size=group_size,
                     transpose_scale=transpose_scale,
+                    hadamard_rotate=hadamard_rotate,
                 )
 
         elif provider == "quant_only":
-            # The quant alone on an already normalized activation: what the
-            # fused kernel costs on top of it.
+            # The quant alone on an already normalized (and rotated) activation:
+            # what the fused kernel costs on top of it.
             y = torch_rms_gated(x, w, z, group_size, norm_before_gate, activation)
+            if hadamard_rotate:
+                y = torch_rotate(y, h)
 
             def fn():
                 dynamic_mxfp4_quant(y)
@@ -115,9 +133,10 @@ def run_benchmark(args):
         elif provider == "torch":
 
             def fn():
-                dynamic_mxfp4_quant(
-                    torch_rms_gated(x, w, z, group_size, norm_before_gate, activation)
-                )
+                y = torch_rms_gated(x, w, z, group_size, norm_before_gate, activation)
+                if hadamard_rotate:
+                    y = torch_rotate(y, h)
+                dynamic_mxfp4_quant(y)
 
         else:
             raise ValueError(f"Unknown provider: {provider}")
@@ -176,6 +195,13 @@ def parse_args(args: list[str] | None = None):
         "--transpose-scale",
         action="store_true",
         help="Fused provider writes column-major scales, as dynamic_mxfp4_quant does.",
+    )
+    parser.add_argument(
+        "--hadamard-rotate",
+        action="store_true",
+        help="Rotate each 32-element block by the normalized Hadamard matrix before "
+        "the quant: fused passes hadamard_rotate=True, torch rotates with a matmul, "
+        "quant_only quantizes a pre-rotated input. gfx950 only.",
     )
     parser.add_argument(
         "--metric",
