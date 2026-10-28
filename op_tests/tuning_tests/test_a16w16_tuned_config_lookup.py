@@ -117,6 +117,30 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
 
 
 class TestGfx950FlydslCandidates(unittest.TestCase):
+    def test_split_k_workspace_boundary_and_fallbacks(self):
+        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+            _use_split_k_workspace,
+        )
+
+        self.assertTrue(
+            _use_split_k_workspace(320, 6288, 7, torch.bfloat16, False, False)
+        )
+        self.assertFalse(
+            _use_split_k_workspace(321, 6288, 7, torch.bfloat16, False, False)
+        )
+        self.assertFalse(
+            _use_split_k_workspace(320, 6288, 1, torch.bfloat16, False, False)
+        )
+        self.assertFalse(
+            _use_split_k_workspace(320, 6288, 7, torch.float32, False, False)
+        )
+        self.assertFalse(
+            _use_split_k_workspace(320, 6288, 7, torch.bfloat16, True, False)
+        )
+        self.assertFalse(
+            _use_split_k_workspace(320, 6288, 7, torch.bfloat16, False, True)
+        )
+
     def test_ragged_large_n_keeps_the_required_large_tile(self):
         from types import SimpleNamespace
 
@@ -283,6 +307,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                 ((576, 20480, 7168), (192, 256, 2, 1, 4, 4, 0)),
                 ((4032, 2880, 7168), (192, 256, 2, 1, 4, 4, 0)),
                 ((279, 7168, 35840), (320, 192, 2, 5, 4, 2, 0)),
+                ((312, 6288, 7168), (320, 192, 2, 7, 4, 4, 0)),
                 ((4033, 2880, 7168), (256, 192, 2, 1, 4, 4, 0)),
                 ((5382, 2112, 7168), (256, 192, 2, 1, 4, 4, 0)),
                 ((3079, 8448, 7168), (288, 192, 2, 1, 2, 4, 0)),

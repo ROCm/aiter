@@ -35,6 +35,17 @@ from .tensor_shim import (
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
 GEMM_A16W16_DTYPE_FP16 = 3
+SPLIT_K_WORKSPACE_MAX_ELEMS = 7 * 320 * 6288
+
+
+def _use_split_k_workspace(m, n, split_k, out_dtype, has_bias, half_tile):
+    return (
+        out_dtype is torch.bfloat16
+        and split_k > 1
+        and not has_bias
+        and not half_tile
+        and split_k * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS
+    )
 
 
 @fx.struct
@@ -51,6 +62,7 @@ class GemmA16W16Gfx950Param:
     k_waves: fx.Constexpr[int]
     group_m: fx.Constexpr[int]
     use_half_tile_interleaved: fx.Constexpr[bool]
+    use_split_k_workspace: fx.Constexpr[bool]
     a_is_transposed: fx.Constexpr[bool]
     b_is_transposed: fx.Constexpr[bool]
     has_bias: fx.Constexpr[bool]
@@ -108,6 +120,7 @@ def make_gemm_a16w16_gfx950_param(
     k_waves: int = 1,
     group_m: int = 0,
     use_half_tile_interleaved: bool = False,
+    use_split_k_workspace: bool = False,
     a_is_transposed: bool = False,
     b_is_transposed: bool = True,
     has_bias: bool = False,
@@ -311,6 +324,7 @@ def make_gemm_a16w16_gfx950_param(
         k_waves=k_waves,
         group_m=group_m,
         use_half_tile_interleaved=use_half_tile_interleaved,
+        use_split_k_workspace=use_split_k_workspace,
         a_is_transposed=a_is_transposed,
         b_is_transposed=b_is_transposed,
         has_bias=has_bias,
@@ -337,6 +351,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += "_kst4" if param.is_split_k else "_ks1"
+    name += "_skws" if param.use_split_k_workspace else ""
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
@@ -527,6 +542,7 @@ def write_cshuffle_vec_to_global(
 @flyc.kernel
 def gemm_a16w16_gfx950_kernel(
     out: fx.Tensor,
+    workspace: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
@@ -544,6 +560,7 @@ def gemm_a16w16_gfx950_kernel(
     param: GemmA16W16Gfx950Param,
 ):
     is_split_k = param.is_split_k
+    atomic_split_k = is_split_k and not param.use_split_k_workspace
     is_slice_k = param.k_waves > 1
     block_m = param.block_m
     main_block_m = 192 if const_expr(param.residual_m_tile) else block_m
@@ -568,7 +585,7 @@ def gemm_a16w16_gfx950_kernel(
         if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
         else elem_dtype
     )
-    if const_expr(is_split_k):
+    if const_expr(atomic_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
             block_n,
@@ -614,12 +631,13 @@ def gemm_a16w16_gfx950_kernel(
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
+    workspace_buf = fx.rocdl.make_buffer_tensor(workspace, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
         bias_buf = None
 
-    if const_expr(is_split_k):
+    if const_expr(atomic_split_k):
         splitk_protocol.init(
             semaphore,
             signal,
@@ -943,7 +961,7 @@ def gemm_a16w16_gfx950_kernel(
             async_load_b_to_lds(stage, stage)
             async_load_a_to_lds(stage, stage)
             rocdl.asyncmark()
-        if const_expr(is_split_k):
+        if const_expr(atomic_split_k):
             splitk_protocol.zero_c()
             expected_signal = splitk_protocol.take_ticket(split_k)
             splitk_protocol.publish(expected_signal)
@@ -986,7 +1004,7 @@ def gemm_a16w16_gfx950_kernel(
                 col = fx.get_scalar(tail_c_col[i])
                 tail_sC[row, col] = tail_frag_C_out[i]
 
-    if const_expr(is_split_k):
+    if const_expr(atomic_split_k):
         splitk_protocol.wait_until_initialized(expected_signal)
     else:
         gpu.barrier()
@@ -994,7 +1012,7 @@ def gemm_a16w16_gfx950_kernel(
     cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
     cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
     cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
-    lane_contig_atomics = is_split_k
+    lane_contig_atomics = atomic_split_k
     if const_expr(lane_contig_atomics):
         # Split-K: lanes walk consecutive output elements (one fp32, or one bf16/fp16
         # pair for the packed atomics), so each wave-level atomic covers whole 64 B
@@ -1064,19 +1082,27 @@ def gemm_a16w16_gfx950_kernel(
                     )
                     c_vec = c_vec + peer_c_vec
                 global_offset = global_row * n + global_col
-                write_cshuffle_vec_to_global(
-                    out,
-                    out_buf,
-                    global_offset,
-                    c_vec,
-                    is_split_k,
-                    param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                )
+                if const_expr(param.use_split_k_workspace):
+                    partial_offset = ks_idx * m * n + global_offset
+                    fx.ptr_store(
+                        c_vec,
+                        fx.get_iter(workspace_buf) + partial_offset,
+                    )
+                else:
+                    write_cshuffle_vec_to_global(
+                        out,
+                        out_buf,
+                        global_offset,
+                        c_vec,
+                        is_split_k,
+                        param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                    )
 
 
 @flyc.kernel
 def gemm_a16w16_hti_gfx950_kernel(
     out: fx.Tensor,
+    workspace: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
@@ -1513,6 +1539,7 @@ def gemm_a16w16_hti_gfx950_kernel(
 @flyc.jit
 def gemm_a16w16_gfx950(
     out: fx.Tensor,
+    workspace: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
@@ -1587,6 +1614,7 @@ def gemm_a16w16_gfx950(
     gemm_a16w16_kernel_impl._func.__name__ = make_gemm_a16w16_gfx950_kernel_name(param)
     kernel_call = gemm_a16w16_kernel_impl(
         out,
+        workspace,
         a,
         b,
         bias,
@@ -1753,6 +1781,16 @@ def get_split_k_buffers(stream, device, split_k):
     return semaphore, signal
 
 
+@functools.cache
+def get_split_k_workspace(stream, device):
+    with persistent_alloc(torch.device(device)):
+        return torch.empty(
+            SPLIT_K_WORKSPACE_MAX_ELEMS,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+
 def _dynamic_tensor_arg(tensor, leading_dim):
     return flyc.from_dlpack(tensor.detach()).mark_layout_dynamic(
         leading_dim=leading_dim
@@ -1889,6 +1927,15 @@ def gemm_a16w16(
     )
     kwargs["has_bias"] = bias is not None
     split_k = kwargs["split_k"]
+    use_split_k_workspace = _use_split_k_workspace(
+        m,
+        n,
+        split_k,
+        out.dtype,
+        bias is not None,
+        kwargs["use_half_tile_interleaved"],
+    )
+    kwargs["use_split_k_workspace"] = use_split_k_workspace
     assert_no_k_tail(k, kwargs)
 
     if bias is not None:
@@ -1898,12 +1945,17 @@ def gemm_a16w16(
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
+    workspace = get_split_k_workspace(stream, device) if use_split_k_workspace else out
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)
+    workspace_arg = (
+        _dynamic_tensor_arg(workspace, 0) if use_split_k_workspace else out_arg
+    )
     bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
     dispatch_args = (
         out_arg,
+        workspace_arg,
         a_arg,
         b_arg,
         bias_arg,
@@ -1920,4 +1972,25 @@ def gemm_a16w16(
         compiler=flyc.compile,
         dispatch_args=dispatch_args,
     )
+    if use_split_k_workspace:
+        from .gemm_a8w8_splitk_reduce_gfx1250 import (
+            compile_gemm_a8w8_splitk_reduce,
+        )
+        from .tensor_shim import _run_compiled, ptr_arg
+
+        _run_compiled(
+            compile_gemm_a8w8_splitk_reduce(
+                split_k=split_k,
+                out_dtype_str="bf16",
+                partial_dtype_str="bf16",
+                unroll=1,
+            ),
+            ptr_arg(workspace),
+            ptr_arg(out),
+            m * n,
+            1,
+            n,
+            m * n * 2,
+            fx.Stream(stream),
+        )
     return out
