@@ -1186,5 +1186,159 @@ class TestStage2RelativeL2Compare(unittest.TestCase):
         self.assertEqual(self._compare(ref, res), 1.0)
 
 
+class TestRunConfigRouting(unittest.TestCase):
+    """How FmoeTuner.run_config calls fused_moe and builds its reference for a
+    row: gate mode, activation dtype, fp8 scale rule and the fp32 retry. The
+    kernel call and the torch reference are replaced by recorders."""
+
+    md, inter, expert, topk = 256, 256, 4, 2
+
+    def setUp(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("run_config builds its inputs on the GPU")
+
+    def _row(self, token, q_dtype_a, q_dtype_w, act="Silu", kernel1="", stage1=0):
+        return {
+            "gfx": "gfx950",
+            "cu_num": 256,
+            "token": token,
+            "model_dim": self.md,
+            "inter_dim": self.inter,
+            "expert": self.expert,
+            "topk": self.topk,
+            "act_type": f"ActivationType.{act}",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": q_dtype_a,
+            "q_dtype_w": q_dtype_w,
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
+            "kernelName1": kernel1,
+            "run_1stage": stage1,
+        }
+
+    def _run(self, row, first_reference_matches=True):
+        """Run run_config on one row; return the fused_moe kwargs, the reference
+        calls and the result. The kernel returns ones; the reference returns
+        ones, or zeros unless it quantizes the fp32 result."""
+        from unittest import mock
+
+        import pandas as pd
+        import torch
+
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        kernel_calls, reference_calls = [], []
+
+        def kernel(hidden, *args, **kwargs):
+            kernel_calls.append(kwargs)
+            return torch.ones(hidden.shape, dtype=torch.bfloat16, device="cuda")
+
+        def reference(a1_qt, *args, quantize_fp32=False, **kwargs):
+            reference_calls.append(
+                dict(kwargs, a1_dtype=a1_qt.dtype, quantize_fp32=quantize_fp32)
+            )
+            fill = 1.0 if first_reference_matches or quantize_fp32 else 0.0
+            return torch.full(
+                (a1_qt.shape[0], self.md), fill, dtype=torch.bfloat16, device="cuda"
+            )
+
+        tuner = gemm_moe_tune.FmoeTuner.__new__(gemm_moe_tune.FmoeTuner)
+        tuner.untunedf = pd.DataFrame([row])
+        args = SimpleNamespace(warmup=1, iters=2, errRatio=0.05)
+        with mock.patch.object(
+            gemm_moe_tune.FmoeTuner, "torch_moe_2stages", staticmethod(reference)
+        ):
+            (result,) = tuner.run_config(args, target_fused_moe=kernel)
+        self.assertEqual(result["status"], "ok", result)
+        return kernel_calls[-1], reference_calls
+
+    def test_a8w4_runs_interleaved_with_the_fp8_activation(self):
+        from aiter import dtypes
+        from aiter.utility import fp4_utils
+
+        kernel, refs = self._run(
+            self._row(
+                256,
+                "torch.float8_e4m3fn",
+                "torch.float4_e2m1fn_x2",
+                kernel1="flydsl_moe1_afp8_wfp4_bf16_t32x64x256_fp8",
+            )
+        )
+        self.assertEqual(kernel["gate_mode"], "interleave")
+        self.assertIsNone(kernel["quant_dtype_a"])
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.fp8)
+        self.assertIsNotNone(refs[0]["a1_scale"])
+        self.assertIs(refs[0]["fp8_scale_fn"], fp4_utils.f32_to_fused_moe_mxfp8_scale)
+
+    def test_unfused_stage1_quantizes_stage2_input_with_roundup(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        _, refs = self._run(
+            self._row(
+                256,
+                "torch.float8_e4m3fn",
+                "torch.float4_e2m1fn_x2",
+                kernel1="flydsl_moe1_afp8_wfp4_bf16_t32x64x256",
+            )
+        )
+        self.assertIs(refs[0]["fp8_scale_fn"], gemm_moe_tune._roundup_mxfp8_scale)
+
+    def test_a8w4_below_the_bound_warns_and_runs_bf16(self):
+        from aiter import dtypes
+
+        with self.assertLogs("aiter", level="WARNING") as logs:
+            kernel, refs = self._run(
+                self._row(1, "torch.float8_e4m3fn", "torch.float4_e2m1fn_x2")
+            )
+        self.assertEqual(kernel["gate_mode"], "interleave")
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.bf16)
+        self.assertTrue(any("kernels are not what" in m for m in logs.output))
+
+    def test_mxfp8_runs_interleaved_with_the_fp8_activation(self):
+        from aiter import dtypes
+
+        kernel, refs = self._run(
+            self._row(256, "torch.float8_e4m3fn", "torch.float8_e4m3fn")
+        )
+        self.assertEqual(kernel["gate_mode"], "interleave")
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.fp8)
+
+    def test_situv2_row_passes_its_tuned_activation_dtype(self):
+        from aiter import dtypes
+
+        kernel, refs = self._run(
+            self._row(256, "torch.float4_e2m1fn_x2", "torch.float4_e2m1fn_x2", "Situv2")
+        )
+        self.assertEqual(kernel["gate_mode"], "separated")
+        self.assertEqual(kernel["quant_dtype_a"], dtypes.fp4x2)
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.fp4x2)
+
+    def test_asm_1stage_reference_quantizes_the_activation_to_fp4(self):
+        from aiter import dtypes
+
+        kernel, refs = self._run(
+            self._row(
+                16,
+                "torch.bfloat16",
+                "torch.float4_e2m1fn_x2",
+                "Situv2",
+                kernel1="_ZN5aiter46fmoe_bf16_pertokenMXfp4_g1u1_flat_situv2_16x32E",
+                stage1=1,
+            )
+        )
+        self.assertEqual(kernel["quant_dtype_a"], dtypes.bf16)
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.fp4x2)
+
+    def test_failing_shape_is_retried_at_the_fp32_quantization_point(self):
+        row = self._row(256, "torch.float4_e2m1fn_x2", "torch.float4_e2m1fn_x2")
+        _, refs = self._run(row, first_reference_matches=False)
+        self.assertEqual([r["quantize_fp32"] for r in refs], [False, True])
+        _, refs = self._run(row)
+        self.assertEqual([r["quantize_fp32"] for r in refs], [False])
+
+
 if __name__ == "__main__":
     unittest.main()
