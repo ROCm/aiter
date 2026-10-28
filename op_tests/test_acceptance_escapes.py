@@ -35,6 +35,7 @@ from aiter.test_common import checkAllclose
 from aiter.utility.cos_diff import (
     COS_DIFF_THRESHOLD,
     _whole,
+    as_rows,
     combined_cos_diff,
     worst_row_cos_diff,
 )
@@ -391,6 +392,43 @@ def test_dropped_rows_pass_the_tuner_cosine_gate():
     ), f"expected the shipped metric to accept, got {whole}"
 
     worst = worst_row_cos_diff(ref, out)
+    assert worst == 1.0, worst
+    assert worst > COS_DIFF_THRESHOLD
+
+
+def test_dropped_stage1_route_fails_the_row_score():
+    """Fused stage 1 is ``[token, topk, inter]``. Dropping one route per token
+    must fail the row score.
+
+    Collapsing only the leading dimension scores each token. Zeroing one
+    route of every token then scores ``1 / (2 * topk - 1)``, which at
+    ``topk=8`` is 0.067: under the 0.1 gate, and the same number as the
+    whole-tensor score. ``as_rows`` is what the tuner uses after decoding,
+    and it keeps the last dimension, so that dropped route scores 1.
+    """
+    token, topk, inter = 32, 8, 64
+    g = torch.Generator().manual_seed(4)
+    ref = torch.randn(token, topk, inter, generator=g, dtype=torch.float64)
+    ref = ref / ref.norm(dim=-1, keepdim=True)
+    out = ref.clone()
+    out[:, 0, :] = 0
+
+    whole = _whole(ref.flatten(), out.flatten())
+    token_score = 1.0 / (2 * topk - 1)
+    assert abs(whole - token_score) < 1e-9, (whole, token_score)
+    assert whole < COS_DIFF_THRESHOLD
+
+    # The axis this used to score: one row per token, routes flattened in.
+    collapsed = worst_row_cos_diff(ref.reshape(token, -1), out.reshape(token, -1))
+    assert abs(collapsed - token_score) < 1e-9, collapsed
+    assert collapsed < COS_DIFF_THRESHOLD
+
+    rows = as_rows(ref)
+    assert rows.shape == (token * topk, inter)
+    assert as_rows(ref.reshape(token, -1)).shape == (token, topk * inter)
+    assert as_rows(ref.reshape(-1)) is None
+
+    worst = worst_row_cos_diff(rows, as_rows(out))
     assert worst == 1.0, worst
     assert worst > COS_DIFF_THRESHOLD
 

@@ -92,6 +92,7 @@ from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.cos_diff import (
     COS_DIFF_THRESHOLD,
+    as_rows,
     combined_cos_diff,
     rowwise_enabled,
 )
@@ -311,21 +312,28 @@ def _to_f64_flat(t):
 
 
 def _to_f64_rows(t):
-    """Same decode as ``_to_f64_flat`` but keeping the leading row dimension.
+    """Same decode as ``_to_f64_flat``, then one row per trailing vector.
 
-    Returns None for anything that is not already row-shaped, so the caller
-    falls back to the whole-tensor score rather than inventing a row axis.
+    ``as_rows`` keeps the last dimension as the feature axis, so a fused
+    stage-1 tensor ``[token, topk, inter]`` is scored per route. Collapsing
+    only ``shape[0]`` would score a whole token. Rank below 2 returns None
+    and the caller falls back, rather than inventing a feature axis.
+
+    fp4x2 is unpacked along its last axis before that split. The packed
+    width is two codes per byte, not the route's feature axis, and
+    ``fp4x2.double()`` faults the queue.
     """
     if t.dim() < 2:
         return None
-    rows = t.shape[0]
     if t.dtype == dtypes.fp4x2:
-        b = t.reshape(rows, -1).contiguous().view(torch.uint8)
+        b = t.contiguous().view(torch.uint8)
         lut = torch.tensor(_E2M1_LUT, device=b.device, dtype=torch.float64)
-        return torch.stack(
+        t = torch.stack(
             [lut[(b & 0xF).long()], lut[((b >> 4) & 0xF).long()]], dim=-1
-        ).reshape(rows, -1)
-    return t.double().reshape(rows, -1)
+        ).flatten(-2)
+    else:
+        t = t.double()
+    return as_rows(t)
 
 
 def cosine_diff_compare(ref, res, msg="", printLog=True):

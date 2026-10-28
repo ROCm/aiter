@@ -18,7 +18,10 @@ terms a kernel can silently drop the output of nearly one expert in six and
 still be selected as the best candidate.
 
 Scoring each row on its own and taking the worst removes the dilution: a zeroed
-row scores 1.0 regardless of how many correct rows surround it.
+row scores 1.0 regardless of how many correct rows surround it. The row is one
+trailing vector. A fused stage-1 tensor ``[token, topk, inter]`` is therefore
+one row per route; collapsing only the leading dimension would score a whole
+token and leave a kernel that drops one route of every token under the gate.
 
 Rows whose reference energy is below ``COS_DIFF_ROW_ENERGY_FLOOR`` relative to
 the mean row energy are skipped. Padding rows in the sorted MoE layout are
@@ -53,6 +56,19 @@ def _whole(x, y):
     num = 2.0 * (x * y).sum().item()
     den = max((x * x + y * y).sum().item(), 1e-12)
     return 1.0 - num / den
+
+
+def as_rows(t):
+    """One row per trailing vector, or None when there is no such axis.
+
+    Rank 2 is already ``[rows, cols]``. A higher rank keeps its last
+    dimension as the feature axis and collapses the leading ones, so
+    ``[token, topk, inter]`` becomes ``[token * topk, inter]``. Rank below
+    2 returns None rather than inventing a feature axis.
+    """
+    if t is None or t.dim() < 2:
+        return None
+    return t.reshape(-1, t.shape[-1])
 
 
 def worst_row_cos_diff(x, y, energy_floor=COS_DIFF_ROW_ENERGY_FLOOR):
