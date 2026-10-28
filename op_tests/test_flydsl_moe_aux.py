@@ -822,17 +822,32 @@ def test_route_maps(numel, E, topk, max_m):
     return ret
 
 
+def _decode_topk_ids(tokens, E, topk):
+    """Decode routing with a fused shared expert: each token picks topk-1
+    distinct routed experts from [0, E-1) and always routes to expert E-1."""
+    routed = torch.rand(tokens, E - 1).topk(topk - 1, dim=1).indices
+    shared = torch.full((tokens, 1), E - 1, dtype=routed.dtype)
+    return torch.cat([routed, shared], dim=1).to(I32).contiguous()
+
+
 @benchmark()
-def test_route_psum_fused(numel, E, tile_m):
+def test_route_psum_fused(numel, E, tile_m, topk=0):
     """Single-workgroup route + LDS atomic + psum + remap, all in one launch.
 
     Collapses what test_topids_to_rows and test_contiguous_psum cover separately,
     so the checks are the union: exact masked_m/starts/psum against the torch
     prefix sum, and the row invariants against the *contiguous* bands it emits.
+
+    With ``topk`` set, routing is decode-shaped (``_decode_topk_ids``) and max_m
+    is the TP grouped path's.
     """
     launch = build_moe_route_psum_fused_module()
-    max_m = max(512, 4 * numel // E)
-    topk_ids = torch.randint(0, E, (numel,), dtype=I32)
+    if topk:
+        topk_ids = _decode_topk_ids(numel // topk, E, topk).reshape(-1)
+        max_m = max(tile_m, (numel + tile_m - 1) // tile_m * tile_m)
+    else:
+        max_m = max(512, 4 * numel // E)
+        topk_ids = torch.randint(0, E, (numel,), dtype=I32)
     counts = torch.bincount(topk_ids.long(), minlength=E).to(I32)
     assert max_m > int(counts.max()), "max_m too small for this shape"
     ref_starts, ref_psum, _ = run_torch_psum(counts, tile_m)
@@ -1191,6 +1206,11 @@ def main():
                 args.numel, [e for e in args.experts if e <= 512], args.tile_m
             )
         ],
+    )
+    # MiniMax-M3 TP decode: 128 routed + 1 fused shared expert, top-5.
+    summarize(
+        "moe_route_psum_fused (M3 decode)",
+        [test_route_psum_fused(t * 5, 129, 64, topk=5) for t in (1, 4, 16)],
     )
     summarize(
         "moe_route_g2l_fused",

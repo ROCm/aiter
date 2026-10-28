@@ -713,6 +713,16 @@ def _grouped_a8w4_tdm_moe(
     _ep_nvt = None
     _fuse_ep_route_quant = False
     ep_rowmap = None
+    # Small TP batches: one workgroup counts, scans and remaps every route, in
+    # place of the counter fill, route and psum-remap launches; it runs where the
+    # psum is built below.
+    _fused_tp_route = (
+        not _compact
+        and not _is_ep
+        and not enable_ep_scatter
+        and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+        and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+    )
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -797,7 +807,7 @@ def _grouped_a8w4_tdm_moe(
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
             )
-    else:
+    elif not _fused_tp_route:
         _fuse_ep_route_quant = False
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
         ep_rowmap = None
@@ -837,6 +847,10 @@ def _grouped_a8w4_tdm_moe(
         psum = stage2_scatter.compact_psum
     elif _fuse_ep_route_quant:
         psum = None
+    elif _fused_tp_route:
+        _masked_m, topids_to_rows, psum = fused_route_psum_remap(
+            topk_ids, E, max_m, _align_m
+        )
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
         # every workgroup re-derives the (E,) prefix in LDS, so this launch
@@ -1448,15 +1462,23 @@ def grouped_gemm_gfx1250_a8w4(
     can fall back to the generic MoE.
     """
 
-    def _grouped_dbg(msg: str, stacklevel: int = 1):
-        if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        ):
+    # Read once per call (still honours a runtime change of the variable): when
+    # it is off -- always, in serving -- no debug message is formatted at all.
+    _dbg_on = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
+
+    def _grouped_dbg(msg, stacklevel: int = 1):
+        # ``msg`` may be a zero-arg callable so call sites only build their
+        # f-string when debugging is on.
+        if _dbg_on:
             import inspect
 
+            if callable(msg):
+                msg = msg()
             frame = inspect.stack()[stacklevel]
             print(
                 f"[grouped-gemm-debug] {frame.filename}:{frame.lineno} {msg}",
@@ -1469,7 +1491,7 @@ def grouped_gemm_gfx1250_a8w4(
         return repr(v)
 
     _grouped_dbg(
-        "inputs: "
+        lambda: "inputs: "
         + ", ".join(
             f"{k}={_fmt(v)}"
             for k, v in [
@@ -1508,7 +1530,9 @@ def grouped_gemm_gfx1250_a8w4(
         return None
     _is_ep = expert_mask is not None
     if _is_ep:
-        _grouped_dbg(f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}")
+        _grouped_dbg(
+            lambda: f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}"
+        )
     if hidden_pad != 0 or intermediate_pad != 0:
         hidden_pad = 0
         intermediate_pad = 0
@@ -1535,16 +1559,19 @@ def grouped_gemm_gfx1250_a8w4(
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
     q_dtype_w_key = dtypes.fp4x2 if w_is_mxfp4 else q_dtype_w
-    _grouped_dbg(f"eligible data_format={data_format}")
+    _grouped_dbg(lambda: f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None
-    _gfx_env = ";".join(
-        str(os.environ.get(k, "")).lower()
-        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
-    )
-    _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
-    if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and not _force_gfx1250:
-        return None
+    # The env overrides only matter off gfx1250 (same condition, evaluated
+    # lazily so the native-arch path skips the four env reads).
+    if get_gfx() != "gfx1250":
+        _gfx_env = ";".join(
+            str(os.environ.get(k, "")).lower()
+            for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
+        )
+        _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
+        if "gfx1250" not in _gfx_env and not _force_gfx1250:
+            return None
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
@@ -1587,7 +1614,7 @@ def grouped_gemm_gfx1250_a8w4(
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
-        _grouped_dbg(f"using grouped CSV config: {cfg_row}")
+        _grouped_dbg(lambda: f"using grouped CSV config: {cfg_row}")
     else:
         logger.info(
             "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
@@ -1826,10 +1853,11 @@ def _get_compiled_route_psum_fused():
 
 
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
-# grid-stride, so a larger count is correct but stops being worth fusing.
+# grid-stride, so a larger count is correct but stops being worth fusing; on
+# gfx1250 the split launches catch up at about 2.5K routes.
 # EXPERTS is a hard limit, enforced below: the scan and the LDS route counter
 # are both one slot per lane.
-_FUSED_ROUTE_PSUM_MAX_NUMEL = 4096
+_FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
 _FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
 
 
