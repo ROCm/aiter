@@ -912,6 +912,235 @@ namespace aiter {
         }
     }
 
+    static constexpr int mhc_fnres_ks = 1024;  // Lockstep with MHC_FNRES_KS in aiter/ops/mhc.py.
+    // Per 32-K chunk, the LDS fn slice holds three bf16 A fragments:
+    //   frag 0 = hi(fn rows 0-15), frag 1 = lo(fn rows 0-15),
+    //   frag 2 = fn rows 16-23: lanes with lane%16 < 8 hold hi(row 16 + lane%16), the rest
+    //            lo(row 8 + lane%16), so its C rows 0-7 and 8-15 add up to rows 16-23.
+    // Each fragment is 64 lanes x 16 B, contiguous, so a wave reads it with one
+    // conflict-free ds_read_b128. Chunks sit this many 16 B units apart; the 4-unit pad
+    // spreads the fill's scattered writes over all LDS banks.
+    static constexpr int mhc_fnres_csu = 3 * 64 + 4;
+
+    // The contraction is order-free, so K is permuted for long per-lane x loads: inside a
+    // K-block of 32*T elements, lane group g = lane/16 holds T runs of 8 at g*8*T + t*8,
+    // which MFMA chunk c = block*T + t consumes. Returns the slice-relative K of the run
+    // that group g holds in chunk c; the fn fill places fn at exactly this K. It is affine
+    // in g, so k(c, g) = k(c, 0) + k(0, g).
+    template <int T>
+    __host__ __device__ constexpr int mhc_fnres_k(int c, int g) {
+        return (c / T) * 32 * T + g * 8 * T + (c % T) * 8;
+    }
+
+    template <int num_warps, int P, bool fn_packed>
+    __global__ __launch_bounds__(num_warps * 64, 1)
+    void mhc_pre_gemm_sqrsum_fnres_kernel(
+        float* out,
+        float* sqrsum,
+        const opus::bf16_t* x,
+        const float* fn,
+        int m,
+        int rows_per_group,
+        int x_stride,
+        int fn_stride,
+        int out_stride
+    )
+    {
+#if defined(__gfx950__)
+        using bf16x8_t = opus::vector_t<opus::bf16_t, 8>;
+        using bf16x2_t = opus::vector_t<opus::bf16_t, 2>;
+        using bf16x4_t = opus::vector_t<opus::bf16_t, 4>;
+        using u32x2_t = opus::vector_t<opus::u32_t, 2>;
+        using u32x4_t = opus::vector_t<opus::u32_t, 4>;
+        using fp32x4_t = opus::vector_t<float, 4>;
+        static constexpr int KS = mhc_fnres_ks;
+        static constexpr int T = 8;
+        static constexpr int n_chunks = KS / 32;
+        static constexpr int n_blocks = KS / (32 * T);
+        static constexpr int csu = mhc_fnres_csu;
+        static constexpr int n_seg = KS / 32;
+        static constexpr int per_wave = 3 * n_seg / num_warps;
+        static_assert(KS % (32 * T) == 0, "KS must be a multiple of the 32*T K-block");
+        static_assert(n_blocks % P == 0, "prefetch depth must divide the K-blocks per tile");
+        static_assert(3 * n_seg % num_warps == 0, "fn fill splits the row segments evenly over warps");
+        __shared__ bf16x8_t s_fn[n_chunks * csu];
+
+        const int lane = threadIdx.x % 64;
+        const int warp = __builtin_amdgcn_readfirstlane(threadIdx.x / 64);
+        const int row_l = lane % 16;
+        const int grp = lane / 16;
+        const int k_split = blockIdx.y;
+        const int row0 = blockIdx.x * rows_per_group;
+        const int rows = min(rows_per_group, m - row0);
+        const int n_tiles = (rows + 15) / 16;
+        const int wave_tiles = n_tiles > warp ? (n_tiles - warp + num_warps - 1) / num_warps : 0;
+
+        // Rows >= rows fall outside all three buffers: loads return 0, stores are dropped.
+        auto g_x = opus::make_gmem<opus::bf16_t>(
+            x + static_cast<int64_t>(row0) * x_stride + k_split * KS,
+            static_cast<unsigned>(rows) * x_stride * sizeof(opus::bf16_t));
+        auto g_out = opus::make_gmem<float>(
+            out + (static_cast<int64_t>(k_split) * m + row0) * out_stride,
+            static_cast<unsigned>(rows) * out_stride * sizeof(float));
+        auto g_sq = opus::make_gmem<float>(
+            sqrsum + static_cast<int64_t>(k_split) * m + row0, static_cast<unsigned>(rows) * sizeof(float));
+        // Past the end of any buffer range. Masking by offset keeps the loop one basic
+        // block; a branch there makes the compiler copy the prefetched x registers at the
+        // latch, which waits for those loads.
+        static constexpr int oob = 1 << 29;
+        const int x_lane = row_l * x_stride + mhc_fnres_k<T>(0, grp);
+        auto x_tile_off = [&](int j) {
+            return j < wave_tiles ? x_lane + (warp + j * num_warps) * 16 * x_stride : oob;
+        };
+        bf16x8_t xb[P][T];
+        auto load_block = [&](bf16x8_t (&dst)[T], int off, int b) {
+            opus::static_for<T>([&](auto t) {
+                dst[t.value] = g_x.template load<8>(off + mhc_fnres_k<T>(b * T + t.value, 0));
+            });
+        };
+
+        {
+            // Lane (rho, kp) loads 16 B of fn row 8 * rg + rho, 8 lanes to a 128 B line, so a wave
+            // load touches 8 lines instead of the 64 of a fragment-order load.
+            const float* fn_s = fn + k_split * KS;
+            const int rho = lane / 8, kp = lane % 8;
+            fp32x4_t raw[per_wave];
+            opus::static_for<per_wave>([&](auto i) {
+                const int q = warp * per_wave + i.value;
+                raw[i.value] = *reinterpret_cast<const fp32x4_t*>(
+                    fn_s + (q / n_seg * 8 + rho) * fn_stride + q % n_seg * 32 + kp * 4);
+            });
+            // x prefetch after the fn loads: loads return in order, so the fill then waits
+            // only for fn (L2) while the first x blocks stream in behind it.
+            __builtin_amdgcn_sched_barrier(0);
+            opus::static_for<P>([&](auto p) { load_block(xb[p.value], x_tile_off(0), p.value); });
+            __builtin_amdgcn_sched_barrier(0);
+            char* s_bytes = reinterpret_cast<char*>(s_fn);
+            opus::static_for<per_wave>([&](auto i) {
+                const int q = warp * per_wave + i.value;
+                const int rg = q / n_seg, seg = q % n_seg;
+                const int f_hi = rg < 2 ? 0 : 2, f_lo = rg < 2 ? 1 : 2;
+                const int r_hi = rg < 2 ? rg * 8 + rho : rho, r_lo = rg < 2 ? rg * 8 + rho : 8 + rho;
+                // Packed fn (mhc_shuffle_fn, kb = 8): hi of K0..K0+7 in floats 0-3, lo in floats 4-7.
+                const int k = fn_packed ? (seg * 4 + kp / 2) * 8 : seg * 32 + kp * 4;
+                const int blk = k / (32 * T), rem = k % (32 * T);
+                const int g = rem / (8 * T), c = blk * T + rem % (8 * T) / 8, e = rem % 8;
+                const int slot = c * csu + g * 16;
+                if constexpr (fn_packed) {
+                    const int f = kp % 2 ? f_lo : f_hi, r = kp % 2 ? r_lo : r_hi;
+                    *reinterpret_cast<bf16x8_t*>(s_bytes + (slot + f * 64 + r) * 16) =
+                        __builtin_bit_cast(bf16x8_t, raw[i.value]);
+                } else {
+                    bf16x4_t hi, lo;
+                    opus::static_for<4>([&](auto j) {
+                        const float v = raw[i.value][j.value];
+                        hi[j.value] = opus::fp32_to_bf16(v);
+                        lo[j.value] = opus::fp32_to_bf16(v - opus::bf16_to_fp32(hi[j.value]));
+                    });
+                    *reinterpret_cast<u32x2_t*>(s_bytes + (slot + f_hi * 64 + r_hi) * 16 + e * 2) =
+                        __builtin_bit_cast(u32x2_t, hi);
+                    *reinterpret_cast<u32x2_t*>(s_bytes + (slot + f_lo * 64 + r_lo) * 16 + e * 2) =
+                        __builtin_bit_cast(u32x2_t, lo);
+                }
+            });
+        }
+        __syncthreads();
+
+        fp32x4_t acc_hi, acc_lo, acc_2;
+        float sq;
+        auto clear_acc = [&]() {
+            opus::clear(acc_hi);
+            opus::clear(acc_lo);
+            opus::clear(acc_2);
+            sq = 0.0f;
+        };
+        clear_acc();
+        static constexpr int frag_prefetch_depth = 2;
+        bf16x8_t frag[frag_prefetch_depth][3];
+        auto read_frags = [&](bf16x8_t (&dst)[3], const bf16x8_t* s_frag, int c) {
+            opus::static_for<3>([&](auto f) { dst[f.value] = s_frag[c * csu + f.value * 64]; });
+        };
+        opus::static_for<frag_prefetch_depth>([&](auto d) { read_frags(frag[d.value], s_fn + lane, d.value); });
+        for (int j = 0; j < wave_tiles; j++) {
+            // Opaque per tile, so the compiler cannot hoist all 3*n_chunks fragment reads out
+            // of the loop into registers (it spills).
+            int frag_lane = lane;
+            asm volatile("" : "+v"(frag_lane));
+            const bf16x8_t* s_frag = s_fn + frag_lane;
+            opus::static_for<n_blocks>([&](auto b) {
+                constexpr int p = b.value % P;
+                constexpr int b_next = b.value + P;
+                opus::static_for<T>([&](auto t) {
+                    constexpr int c = b.value * T + t.value;
+                    constexpr int d = c % frag_prefetch_depth;
+                    const bf16x8_t xv = xb[p][t.value];
+                    acc_hi = opus::mfma_f32_16x16x32_bf16{}(frag[d][0], xv, acc_hi);
+                    acc_lo = opus::mfma_f32_16x16x32_bf16{}(frag[d][1], xv, acc_lo);
+                    acc_2  = opus::mfma_f32_16x16x32_bf16{}(frag[d][2], xv, acc_2);
+                    read_frags(frag[d], s_frag, (c + frag_prefetch_depth) % n_chunks);
+                    const u32x4_t xw = __builtin_bit_cast(u32x4_t, xv);
+                    opus::static_for<4>([&](auto q) {
+                        // Through a scalar: clang bit_casts an ext_vector element as element 0.
+                        const opus::u32_t w = xw[q.value];
+                        const bf16x2_t x2 = __builtin_bit_cast(bf16x2_t, w);
+                        sq = __builtin_amdgcn_fdot2_f32_bf16(x2, x2, sq, false);
+                    });
+                    // Keeps the sum here: sunk into the epilogue it holds every x register
+                    // of the tile live.
+                    asm volatile("" : "+v"(sq));
+                    // Pins the ring: otherwise the scheduler sinks each fragment read next
+                    // to its MFMA and waits out the full LDS latency every chunk.
+                    __builtin_amdgcn_sched_barrier(0);
+                });
+                load_block(xb[p], x_tile_off(j + b_next / n_blocks), b_next % n_blocks);
+            });
+
+            const int tile_row = (warp + j * num_warps) * 16;
+            const int out_off = (tile_row + row_l) * out_stride + grp * 4;
+            g_out.template store<4>(acc_hi + acc_lo, out_off);
+            fp32x4_t acc_2r;
+            opus::static_for<4>([&](auto i) {
+                const float a = acc_2[i.value];
+                const opus::u32_t v = __builtin_bit_cast(opus::u32_t, a);
+                const auto sw = __builtin_amdgcn_permlane32_swap(v, v, false, true);
+                const opus::u32_t s0 = sw[0], s1 = sw[1];
+                acc_2r[i.value] = __builtin_bit_cast(float, s0) + __builtin_bit_cast(float, s1);
+            });
+            g_out.template store<4>(acc_2r, lane < 32 ? out_off + 16 : oob);
+            const float sq_row = cross_row_sum_4(sq, lane);
+            g_sq.template store<1>(sq_row, lane < 16 ? tile_row + lane : oob);
+            clear_acc();
+        }
+#endif
+    }
+
+    template <int num_warps, int P>
+    static void mhc_pre_gemm_sqrsum_fnres_launch(
+        aiter_tensor_t& out, aiter_tensor_t& sqrsum, aiter_tensor_t& x, aiter_tensor_t& fn,
+        bool fn_packed, int m, int split_k, int cu_num, int x_stride, int fn_stride,
+        int out_stride, hipStream_t stream)
+    {
+        // LDS holds one workgroup per CU; aim for one wave of workgroups.
+        int groups = std::max(1, cu_num / split_k);
+        const int rows_per_group = ((m + groups - 1) / groups + 15) / 16 * 16;
+        groups = (m + rows_per_group - 1) / rows_per_group;
+        const dim3 grid(groups, split_k), block(num_warps * 64);
+        auto launch = [&](auto packed) {
+            mhc_pre_gemm_sqrsum_fnres_kernel<num_warps, P, decltype(packed)::value>
+                <<<grid, block, 0, stream>>>(
+                    reinterpret_cast<float*>(out.data_ptr()),
+                    reinterpret_cast<float*>(sqrsum.data_ptr()),
+                    reinterpret_cast<const opus::bf16_t*>(x.data_ptr()),
+                    reinterpret_cast<const float*>(fn.data_ptr()),
+                    m, rows_per_group, x_stride, fn_stride, out_stride);
+        };
+        if (fn_packed) {
+            launch(std::true_type{});
+        } else {
+            launch(std::false_type{});
+        }
+    }
+
 #define MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(num_warps, tile_n, tile_k, vector_fn_load) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(x.dtype(), "mhc_pre_gemm_sqrsum", [&] { \
         using DTYPE_I = typename hip2opus<scalar_t>::type; \
@@ -990,6 +1219,23 @@ namespace aiter {
 
         const HipDeviceGuard device_guard(x.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
+
+        if (tile_k == mhc_fnres_ks) {
+            if (get_gpu_arch() != "gfx950" || x.dtype() != AITER_DTYPE_bf16 || hc_mult3 != 24) {
+                tile_k = 128;
+            }
+        }
+        if (tile_k == mhc_fnres_ks) {
+            AITER_CHECK(hc_hidden_size == mhc_fnres_ks * split_k, "tile_k ", mhc_fnres_ks, " needs hc_hidden_size == tile_k * split_k");
+            if (m >= 8192) {
+                mhc_pre_gemm_sqrsum_fnres_launch<16, 1>(out, sqrsum, x, fn, w_preshuffle_bf16, m, split_k,
+                                                        cu_num, x_stride, fn_stride, out_stride, stream);
+            } else {
+                mhc_pre_gemm_sqrsum_fnres_launch<8, 2>(out, sqrsum, x, fn, w_preshuffle_bf16, m, split_k,
+                                                       cu_num, x_stride, fn_stride, out_stride, stream);
+            }
+            return;
+        }
 
         if (w_preshuffle_bf16) {
 #define MHC_PRE_BF16 true
