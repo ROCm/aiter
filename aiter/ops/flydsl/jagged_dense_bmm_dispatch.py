@@ -3,9 +3,10 @@
 
 """Dispatch layer for jagged_dense_bmm_broadcast_add.
 
-Resolves per-shape kernel config from the live arch's section of
-``jagged_dense_bmm_dispatch.json`` (explicit override -> table winner ->
-kernel defaults) and routes uniform vs skew launches.
+Picks a per-shape config from the live arch's section of
+``jagged_dense_bmm_dispatch.json``: explicit override, then table winner, then
+kernel default. The skew path takes only ``block_k`` from the table; its XCD
+remap comes from ``_skew_compact_xcd`` unless overridden.
 """
 
 from __future__ import annotations
@@ -147,8 +148,10 @@ def jagged_dense_bmm_dispatched(
     Args:
         C: ``(L, N)`` bf16 output. Rows of a group are all written; rows past
             ``SEQ_OFFSETS[-1]`` in an over-allocated ``C`` are left untouched.
-        A: ``(L, K)`` bf16 packed jagged rows. ``L = A.shape[0]`` may exceed
-            ``SEQ_OFFSETS[-1]``; extra rows are not read.
+        A: ``(L, K)`` bf16 packed jagged rows. Requires
+            ``L >= SEQ_OFFSETS[-1]``, which is not checked; extra rows are not
+            read. One group's rows of ``A`` and of ``C`` must each stay under
+            4 GiB, the 32-bit buffer bound.
         B: ``(n_groups * N, K)`` bf16 dense weights, one ``N x K`` panel per
             group, i.e. ``dense.transpose(1, 2).reshape(-1, K)`` of a
             ``(n_groups, K, N)`` tensor.
@@ -158,8 +161,8 @@ def jagged_dense_bmm_dispatched(
         max_seq_len: Uniform path: must be >= the longest group, which is
             not checked; rows past it are not computed. Skew path: only a
             tuning-table key.
-        stream: Defaults to the current torch stream. The op makes one launch
-            on it, so it is safe under graph capture.
+        stream: Defaults to the current torch stream. One launch and no host
+            sync, so the call can be captured in a graph.
         uniform_seqlen: True selects the dense ``(group, M-tile, N-tile)``
             grid; False the compact grid that skips empty tiles.
         xcd_c, xcd_w, block_k: Override the tuned config.
