@@ -116,6 +116,18 @@ class GemmConfigPruner:
                 and config["k_waves"] == 1
                 and config["group_m"] in (0, 4)
             )
+            validated_grouped_half_tile = (
+                config["use_half_tile_interleaved"]
+                and config["group_m"] == 4
+                and (
+                    config["block_m"],
+                    config["block_n"],
+                    config["block_k"],
+                    config["m_waves"],
+                    config["n_waves"],
+                )
+                == (192, 128, 128, 2, 4)
+            )
             near_cu_rect = (
                 iou >= 0.90 and tiles * 4 >= num_cus * 3 and tiles * 4 <= num_cus * 5
             )
@@ -125,12 +137,18 @@ class GemmConfigPruner:
                 else self._ceil_div(self.max_split_grid_rounds * num_cus, tiles)
             )
             if (
-                (iou >= min_iou or near_cu_rect or validated_half_tile)
+                (
+                    iou >= min_iou
+                    or near_cu_rect
+                    or validated_half_tile
+                    or validated_grouped_half_tile
+                )
                 and tiles <= max_tiles
                 and config["split_k"] <= max_split_k
                 and (
                     config["group_m"] == 0
                     or validated_half_tile
+                    or validated_grouped_half_tile
                     or (
                         config["block_m"],
                         config["block_n"],
