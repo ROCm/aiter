@@ -61,18 +61,13 @@ def cu_num_to_arch(cu_num: int, default: str = "gfx950") -> str:
     return _CU_NUM_TO_ARCH.get(cu_num, default)
 
 
-# AOT topology follows the target SKU, independent of the build host.
-_NON_DEFAULT_NUM_XCDS = {
-    ("gfx950", 128): 4,  # MI350P
-    ("gfx942", 80): 4,  # MI308X
-    ("gfx942", 228): 6,  # MI300A
-}
-
-DEFAULT_NUM_XCDS = 8
-
-
-def target_num_xcds(gfx: str, cu_num: int, default: int = DEFAULT_NUM_XCDS) -> int:
-    return _NON_DEFAULT_NUM_XCDS.get((gfx, int(cu_num)), default)
+def target_num_xcds(gfx: str, cu_num: int, default: int = 8) -> int:
+    # AOT topology follows the target SKU, independent of the build host.
+    return {
+        ("gfx950", 128): 4,  # MI350P
+        ("gfx942", 80): 4,  # MI308X
+        ("gfx942", 228): 6,  # MI300A
+    }.get((gfx, int(cu_num)), default)
 
 
 def job_identity(job: dict[str, Any]) -> tuple:

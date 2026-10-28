@@ -52,7 +52,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
-    DEFAULT_NUM_XCDS,
     collect_aot_jobs,
     compile_only_env,
     cu_num_to_arch,
@@ -715,7 +714,7 @@ def _compile_preshuffle_to_cache(
     use_async_copy: int,
     waves_per_eu: int,
     xcd_swizzle: int = 0,
-    num_xcds: int = DEFAULT_NUM_XCDS,
+    num_xcds: int = 8,
     lds_stage: int = 2,
     scheduler: str = "Default",
     k_split: int = 1,
@@ -897,7 +896,7 @@ def _compile_8wave_to_cache(
     block_n: int,
     waves_per_eu: int,
     xcd_swizzle: int,
-    num_xcds: int = DEFAULT_NUM_XCDS,
+    num_xcds: int = 8,
     **kwargs,
 ):
     del kwargs
@@ -931,7 +930,7 @@ def _compile_mxfp8_8wave_to_cache(
     k: int,
     waves_per_eu: int,
     xcd_swizzle: int,
-    num_xcds: int = DEFAULT_NUM_XCDS,
+    num_xcds: int = 8,
     w_scale_block: str = "1x32",
     **kwargs,
 ):
