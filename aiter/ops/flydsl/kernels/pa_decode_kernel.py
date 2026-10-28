@@ -68,6 +68,7 @@ from .pa_decode.op_merge import (
 )
 from .pa_decode.pipeline import (
     Gfx1250Bf16Pipeline,
+    Gfx1250Bf16WavePipeline,
     Gfx1250Pipeline,
     Gfx1250WavePipeline,
     PaDecodePipeline,
@@ -677,7 +678,9 @@ def compile_gfx1250_pa_decode(
             if const_expr(t.cluster_merge):
                 ctx.task_count = count
                 ctx.output_ptr = output
-            if const_expr(t.bf16_page128_packed):
+            if const_expr(t.bf16_wave_query_tiles):
+                Gfx1250Bf16WavePipeline(ctx).run()
+            elif const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
             elif const_expr(t.wave_query_tiles):
                 Gfx1250WavePipeline(ctx).run()

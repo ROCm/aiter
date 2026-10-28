@@ -384,6 +384,65 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
+    # Four 16-row query tiles at D128 over page128 caches: on gfx1250, wave
+    # pairs share two tiles and split every page, in each output mode. One
+    # task per sequence runs window-masked, unmasked and causal pages in turn;
+    # one slot per sequence merges the long rows' tasks across replays.
+    (
+        "mtp4-g16-page128-direct",
+        {"query_length": 4, "group_size": 16, "block_size": 128},
+    ),
+    (
+        "mtp4-g16-page128-cluster",
+        {
+            "query_length": 4,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+        },
+    ),
+    (
+        "mtp4-g16-page128-merge",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "capture": True,
+        },
+    ),
+    (
+        "mtp4-g16-page128-fp16-query",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "query_dtype": torch.float16,
+            "lengths": (65, 1027, 4100),
+            "max_partitions": 3,
+            "sink_dtype": torch.float16,
+        },
+    ),
+    (
+        "mtp4-g16-page128-window",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (65, 300, 1027, 4100),
+            "window": 700,
+            "sink_dtype": torch.float32,
+        },
+    ),
+    # 60 rows pad the last tile; GQA 8 puts two queries in each tile.
+    (
+        "mtp5-g12-page128",
+        {"query_length": 5, "group_size": 12, "block_size": 128, "max_partitions": 7},
+    ),
+    ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
     (
         "loose-bound",
@@ -726,6 +785,9 @@ def test_pa_decode(case, device, monkeypatch):
             key, value = key.to(compute_type), value.to(compute_type)
             if mode == "python":
                 key_scale, value_scale = 0.25, 2.0
+    else:
+        # FP16 queries read BF16 caches.
+        key, value = key.to(compute_type), value.to(compute_type)
     logical_key = key.float() * (1.0 if key_scale is None else key_scale)
     logical_value = value.float() * (1.0 if value_scale is None else value_scale)
     pages = key.shape[0]

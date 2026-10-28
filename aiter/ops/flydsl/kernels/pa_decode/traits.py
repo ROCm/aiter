@@ -936,6 +936,16 @@ class Gfx1250Traits:
         )
 
     @property
+    def bf16_wave_query_tiles(self):
+        # Four D128 query tiles over BF16 page128 caches: wave pairs share two
+        # tiles, P stays in registers, and a page needs only its buffer barrier.
+        return (
+            self.bf16_page128_packed
+            and self.m_tiles == self.NWARP
+            and self.head_dim == 128
+        )
+
+    @property
     def async_page(self):
         # Two packed buffers overlap page DMA and asynchronous per-token scale
         # copies with QK/softmax/PV. Windowed tiles keep synchronous staging.
