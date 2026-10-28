@@ -343,7 +343,9 @@ def _fwd_kernel_stage2_dchunk(
             mask=valid[:, None] & mask_d[None, :],
             other=0.0,
         )
-        acc = tl.sum(w[:, None] * v, axis=0) / tl.sum(w, axis=0)
+        e_sum = tl.sum(w, axis=0)
+        # No valid split (empty sequence): e_sum == 0, define O = 0.
+        acc = tl.where(e_sum > 0, tl.sum(w[:, None] * v, axis=0) / e_sum, 0.0)
         tl.store(
             O + cur_qo * stride_obs + cur_head * stride_oh + offs_d, acc, mask=mask_d
         )
@@ -365,9 +367,11 @@ def _launch_stage2_dchunk(
 ):
     max_splits = triton.next_power_of_2(num_kv_splits)
     # Narrower chunks at more splits keep the CTA count up; cap the tile at 4K
-    # fp32 elements (64 VGPRs/lane at num_warps=1).
+    # fp32 elements (64 data VGPRs/lane at num_warps=1 on wave64, ~120 total)
+    # so it fits the 128-VGPR budget of waves_per_eu=4 without spilling, up to
+    # 128 splits.
     d_chunk = min(256 if num_kv_splits <= 8 else 128, triton.next_power_of_2(Lv))
-    while max_splits * d_chunk > 4096 and d_chunk > 64:
+    while max_splits * d_chunk > 4096 and d_chunk > 32:
         d_chunk //= 2
     _fwd_kernel_stage2_dchunk[(num_seqs, num_heads, triton.cdiv(Lv, d_chunk))](
         logits,
@@ -2684,7 +2688,13 @@ def mla_decode_fwd_v4_nm(
         # Small grids underfill the GPU with one CTA per (seq, head): chunk Lv
         # across more CTAs and reduce the splits as a tile instead. Large grids
         # are bandwidth-bound and already full, where the loop kernel is faster.
-        if num_seqs * num_heads <= 2048:
+        # Tuned on gfx950 (wave64) for up to 128 splits; other archs keep the
+        # loop kernel.
+        if (
+            runtime_gfx == "gfx950"
+            and num_kv_splits <= 128
+            and num_seqs * num_heads <= 2048
+        ):
             _launch_stage2_dchunk(
                 logits,
                 attn_lse,
