@@ -8,34 +8,76 @@ _mha_v4_per_tensor_amax_repr = make_kernel_repr(
     "mha_v4_per_tensor_amax_kernel",
     [
         "STRIDED",
+        "HEAD_DIM",
         "BLOCK_SIZE",
     ],
 )
 
 
 @triton.jit
-def _mha_v4_per_tensor_input_offsets(
-    offsets,
-    head_dim,
+def _mha_v4_per_tensor_block_offsets(
+    block,
+    numel,
     heads,
     sequence,
     stride_b,
     stride_s,
     stride_h,
     STRIDED: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    """Map logical BSHD element indices to input offsets; only the last dimension must be dense."""
+    """Input offsets, contiguous output offsets and mask for one block of logical elements.
+
+    A strided input is a BSHD view whose last dimension alone is dense, so the block is taken as
+    a tile of whole rows: the batch/sequence/head decomposition runs once per row rather than once
+    per element, which would otherwise dominate these memory-bound kernels.
+    """
     if STRIDED:
-        offsets = offsets.to(tl.int64)
-        row = offsets // head_dim
-        token_flat = row // heads
-        return (
-            (token_flat // sequence) * stride_b
-            + (token_flat % sequence) * stride_s
-            + (row % heads) * stride_h
-            + offsets % head_dim
+        input_offsets, offsets, mask = _mha_v4_per_tensor_row_tile_offsets(
+            block,
+            numel,
+            heads,
+            sequence,
+            stride_b,
+            stride_s,
+            stride_h,
+            HEAD_DIM,
+            BLOCK_SIZE // HEAD_DIM,
         )
-    return offsets
+    else:
+        offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        input_offsets = offsets
+        mask = offsets < numel
+    return input_offsets, offsets, mask
+
+
+@triton.jit
+def _mha_v4_per_tensor_row_tile_offsets(
+    block,
+    numel,
+    heads,
+    sequence,
+    stride_b,
+    stride_s,
+    stride_h,
+    HEAD_DIM: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    rows = (block * ROWS + tl.arange(0, ROWS)).to(tl.int64)
+    cols = tl.arange(0, HEAD_DIM)
+    token_flat = rows // heads
+    row_base = (
+        (token_flat // sequence) * stride_b
+        + (token_flat % sequence) * stride_s
+        + (rows % heads) * stride_h
+    )
+    mask = (rows < numel // HEAD_DIM)[:, None]
+    return (
+        row_base[:, None] + cols[None, :],
+        rows[:, None] * HEAD_DIM + cols[None, :],
+        mask,
+    )
 
 
 @triton.jit(repr=_mha_v4_per_tensor_amax_repr)
@@ -43,24 +85,30 @@ def mha_v4_per_tensor_amax_kernel(
     input_ptr,
     partial_ptr,
     numel,
-    head_dim,
     heads,
     sequence,
     stride_b,
     stride_s,
     stride_h,
     STRIDED: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     block = tl.program_id(0)
-    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    input_offsets = _mha_v4_per_tensor_input_offsets(
-        offsets, head_dim, heads, sequence, stride_b, stride_s, stride_h, STRIDED
+    input_offsets, _, mask = _mha_v4_per_tensor_block_offsets(
+        block,
+        numel,
+        heads,
+        sequence,
+        stride_b,
+        stride_s,
+        stride_h,
+        STRIDED,
+        HEAD_DIM,
+        BLOCK_SIZE,
     )
-    values = tl.load(input_ptr + input_offsets, mask=offsets < numel, other=0.0).to(
-        tl.float32
-    )
-    tl.store(partial_ptr + block, tl.max(tl.abs(values), axis=0))
+    values = tl.load(input_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
+    tl.store(partial_ptr + block, tl.max(tl.abs(values)))
 
 
 _mha_v4_per_tensor_scale_repr = make_kernel_repr(
@@ -92,6 +140,7 @@ _mha_v4_per_tensor_quant_repr = make_kernel_repr(
     [
         "IS_INT8",
         "STRIDED",
+        "HEAD_DIM",
         "BLOCK_SIZE",
     ],
 )
@@ -103,7 +152,6 @@ def mha_v4_per_tensor_quant_kernel(
     output_ptr,
     scale_ptr,
     numel,
-    head_dim,
     heads,
     sequence,
     stride_b,
@@ -111,13 +159,21 @@ def mha_v4_per_tensor_quant_kernel(
     stride_h,
     IS_INT8: tl.constexpr,
     STRIDED: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     block = tl.program_id(0)
-    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < numel
-    input_offsets = _mha_v4_per_tensor_input_offsets(
-        offsets, head_dim, heads, sequence, stride_b, stride_s, stride_h, STRIDED
+    input_offsets, offsets, mask = _mha_v4_per_tensor_block_offsets(
+        block,
+        numel,
+        heads,
+        sequence,
+        stride_b,
+        stride_s,
+        stride_h,
+        STRIDED,
+        HEAD_DIM,
+        BLOCK_SIZE,
     )
     values = tl.load(input_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
     scale = tl.load(scale_ptr)

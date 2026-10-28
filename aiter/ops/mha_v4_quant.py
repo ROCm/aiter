@@ -189,23 +189,32 @@ def _quantize_per_tensor(
     """Quantize to a single scale. `partial` supplies precomputed per-block amaxes.
 
     The output is contiguous. The input may also be a BSHD view whose last dimension alone is
-    contiguous, such as a sequence crop of a packed QKV tensor.
+    contiguous, such as a sequence crop of a packed QKV tensor; its head dimension must then be a
+    power of two no larger than the block, so that a block is a whole number of rows.
     """
     strided = not input.is_contiguous()
-    if strided and (input.dim() != 4 or input.stride(-1) != 1):
-        raise ValueError(
-            "MHA v4 per-tensor quantization requires contiguous input or BSHD input with a "
-            "contiguous last dimension"
-        )
+    if strided:
+        head_dim = input.shape[-1] if input.dim() == 4 else 0
+        if (
+            input.stride(-1) != 1
+            or head_dim <= 0
+            or head_dim & (head_dim - 1)
+            or head_dim > MHA_V4_PER_TENSOR_BLOCK_SIZE
+        ):
+            raise ValueError(
+                "MHA v4 per-tensor quantization requires contiguous input or BSHD input with a "
+                "contiguous last dimension of power-of-two size"
+            )
     numel = input.numel()
     blocks = triton.cdiv(numel, MHA_V4_PER_TENSOR_BLOCK_SIZE)
     scale = input.new_empty((1,), dtype=torch.float32)
     output = input.new_empty(input.shape, dtype=output_dtype)
     if strided:
-        _, sequence, heads, head_dim = input.shape
-        layout = (head_dim, heads, sequence, *input.stride()[:3])
+        _, sequence, heads, _ = input.shape
+        layout = (heads, sequence, *input.stride()[:3])
     else:
-        layout = (1, 1, 1, 0, 0, 0)
+        head_dim = 1
+        layout = (1, 1, 0, 0, 0)
     if partial is None:
         partial = input.new_empty((blocks,), dtype=torch.float32)
         mha_v4_per_tensor_amax_kernel[(blocks,)](
@@ -214,6 +223,7 @@ def _quantize_per_tensor(
             numel,
             *layout,
             STRIDED=strided,
+            HEAD_DIM=head_dim,
             BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
             num_warps=8,
         )
@@ -244,6 +254,7 @@ def _quantize_per_tensor(
         *layout,
         IS_INT8=output_dtype == torch.int8,
         STRIDED=strided,
+        HEAD_DIM=head_dim,
         BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
         num_warps=8,
     )
