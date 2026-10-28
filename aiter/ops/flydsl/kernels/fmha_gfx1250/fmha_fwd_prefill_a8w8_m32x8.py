@@ -1406,17 +1406,6 @@ def _attention_core_multi_kv_tiles(
         prefetch_row0 = _tile_row0(prefetch_tile_idx)
         prefetch_valid = _kv_valid(prefetch_tile_idx)
 
-        def _drain_barrier():
-            # Both halves have exactly one copy outstanding and the next body reads it, so
-            # both drain to 0: there is nothing older to leave in flight.
-            #
-            # dscnt is drained only to _num_head_carry: the leading half issues its ring head at the
-            # tail of the previous body, so a full drain here would retire it right before
-            # the gemm that wants it in flight. The gemm's own last ring fragment already
-            # took dscnt to 0, so every read older than the head is retired regardless --
-            # the WAR wall for the slot about to be written still holds.
-            _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
-
         # This half's descriptor for tile ``pf``'s K (LO) or V (HI) into the oldest slot.
         # Built up front: pure, so its address VALU overlaps the drain; only the copy
         # itself must stay after the barrier.
@@ -1586,10 +1575,10 @@ def _attention_core_multi_kv_tiles(
                 head=pvqk_head,
             )
             carry_next = s_acc
-            _drain_barrier()
+            _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             head_next = []
         else:
-            _drain_barrier()
+            _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             pvqk_head = _pvqk_head()
             prefetch_desc.async_load()
             rocdl.sched_barrier(0)
