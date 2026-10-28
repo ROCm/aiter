@@ -508,6 +508,10 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
 #define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
     FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V)
 
+// gfx1250 no-quant rows use coalesced wave32 vector chunks.
+#define FUSED_RMSNORM_GFX1250_NO_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
+    FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, true)
+
 #define FUSED_RMSNORM_FP8_PER_TOKEN_QUANT_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V) \
     FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, 1, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, false, true, true)
 
@@ -991,6 +995,24 @@ void fused_qk_rmsnorm_group_quant(
     HipDeviceGuard device_guard(inp1.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     (void)get_num_cu_func();
+
+    // MI455 uses wave32. Keep quantized and dual-input dispatch unchanged.
+    // No-quant does not execute the group-scale reduction, so RTS=1 is sufficient.
+    if(no_quant && !has_second_input && get_gpu_arch() == "gfx1250")
+    {
+        if(n1 == 128)
+        {
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, 32, 4, 1);
+            return;
+        }
+        // Preserve the low-latency decode dispatch; interleave wins once rows
+        // are numerous enough to benefit from the denser 256-thread blocks.
+        if(n1 == 6144 && m >= 256)
+        {
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_GFX1250_NO_QUANT_DISPATCH, 256, 24, 1);
+            return;
+        }
+    }
 
     if(per_token_quant)
     {
