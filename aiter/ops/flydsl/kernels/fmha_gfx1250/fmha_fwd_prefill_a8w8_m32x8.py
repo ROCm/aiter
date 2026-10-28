@@ -71,11 +71,13 @@ from .fmha_buffer_managers import (
     _ir,
 )
 from .fmha_utils import (
+    BLOCK_SIZE,
     DTYPE_MAP,
     LDS_CHUNK_BYTES,
     LDS_QO_BYTES,
     NUM_Q_TILES_CHOICES,
     NUM_WAVES,
+    WAVE_SIZE,
     WMMA_M,
     _alloc_lds,
     _bare_barrier,
@@ -100,6 +102,7 @@ from .fmha_utils import (
     _tree_reduce_multi,
     _warp_id,
     _wg_kv_span,
+    _zero_slot,
     schedule_bank,
     supports_gqa_ratio,
 )
@@ -108,8 +111,6 @@ from .fmha_utils import (
 # Threadgroup / arch constants
 # ============================================================================
 
-WAVE_SIZE = 32  # gfx1250 kernels run wave32
-BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
 
 # "m32x8": each wave owns WMMA_ROW_PER_WAVE adjacent 16-row (WMMA M) Q sub-tiles →
 # BLOCK_M = 16 * 2 * 8 = 256 Q rows per threadgroup. Each wave's 2 tiles are
@@ -1009,7 +1010,6 @@ def _attention_prologue(
     _start_valid = _kv_valid(start_tile_idx)
     k_start_desc = _k_desc(_k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid)
     v_start_desc = _v_desc(_k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid)
-    v_dummy_desc = _v_desc(_k_lds_buf(_PHYSICAL_SLOT[0]), start_row0, _start_valid)
 
     # Per-half counter usage, off the descriptors' declared counts. A counter this half
     # never touches gets -1 ("do not wait on it"), NOT 0.
@@ -1029,12 +1029,23 @@ def _attention_prologue(
     if USE_TDM_LOADER:
         _early = {
             WarpType.LO: [k_start_desc],
-            WarpType.HI: [v_start_desc, v_dummy_desc],
+            WarpType.HI: [v_start_desc],
         }
         _late = {WarpType.LO: [], WarpType.HI: []}
     else:
         _early = {WarpType.LO: [], WarpType.HI: []}
-        _late = {WarpType.LO: [k_start_desc], WarpType.HI: [v_start_desc, v_dummy_desc]}
+        _late = {WarpType.LO: [k_start_desc], WarpType.HI: [v_start_desc]}
+
+    # Body start reads V(start-1) from logical slot 0 against a zero P. Zero the slot
+    # rather than refetching V(start) into it: stale LDS can decode to NaN, and 0*NaN is
+    # NaN. Sits in Q's global-load shadow, between its part1 and part2.
+    _zero_slot(
+        _v_lds_buf(_PHYSICAL_SLOT[0]),
+        v_blk_bytes,
+        KV_LDS_SPLITS,
+        _SPLIT_STRIDE,
+        warp_idx * fx.Int32(WAVE_SIZE) + lane_idx,
+    )
 
     _is_lo = warp_idx < fx.Int32(NUM_WAVES // 2)
     if USE_TDM_LOADER:

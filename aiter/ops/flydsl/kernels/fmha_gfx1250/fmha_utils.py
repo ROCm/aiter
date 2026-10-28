@@ -48,11 +48,14 @@ from .fmha_buffer_managers import (
     OManager16bV2,
     OManager16bV3,
     _ir,
+    _lds_ptr_b128,
 )
 
 # m32x8 geometry. Defined here rather than in each sibling so ``_block_m`` cannot
 # drift from the kernel that calls it.
+WAVE_SIZE = 32  # gfx1250 kernels run wave32
 NUM_WAVES = 8  # "m32x8" -- 8 waves per threadgroup
+BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
 WMMA_M = 16  # query rows per WMMA tile (the "m16" in m32x8)
 
 
@@ -78,6 +81,34 @@ def _alloc_lds():
     SharedAllocator flydsl permits; K/V, Q and the O epilogue all carve this base."""
     smem = fx.SharedAllocator().allocate(get_lds_capacity_bytes("gfx1250"))
     return fx.Int32(fx.ptrtoint(smem.peek().ptr))
+
+
+def _zero_slot(base, size, num_splits, split_stride, tid):
+    """Zero one K|V LDS slot: all ``num_splits`` halves, ``split_stride`` bytes apart.
+
+    ``size`` is the whole slot in bytes. Whole rounds share one address and ride
+    ds_store's immediate offset. The partial round wraps surplus lanes with ``tid % rem``
+    rather than branching -- callers are module-level, where a runtime if would need its
+    own ``@flyc.jit`` -- which is safe because re-zeroing is idempotent and keeps the LDS
+    conflict 2-way instead of one address per wave. ``tid`` is the caller's
+    workgroup-wide thread index.
+    """
+    half = size // num_splits
+    assert half % 16 == 0, f"slot half {half}B is not a b128 multiple"
+    full, rem = divmod(half // 16, BLOCK_SIZE)
+    zero = fx.Vector.filled(4, 0, fx.Int32)
+    for seg in range(0, num_splits * split_stride, split_stride):
+        seg_base = base + fx.Int32(seg)
+        ptr = _lds_ptr_b128(seg_base + tid * fx.Int32(16))
+        for i in range(full):
+            fx.ptr_store(_ir(zero), fx.add_offset(ptr, i * BLOCK_SIZE * 16))
+        if rem:
+            tail = (
+                seg_base
+                + fx.Int32(full * BLOCK_SIZE * 16)
+                + (tid % fx.Int32(rem)) * fx.Int32(16)
+            )
+            fx.ptr_store(_ir(zero), _lds_ptr_b128(tail))
 
 
 def _bare_barrier():
