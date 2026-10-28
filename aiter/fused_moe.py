@@ -264,9 +264,10 @@ def _fused_decode_sort_quant(
 kernel_bench_callable = None
 
 
-# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
-# topk_weights through the sorted_* kernarg slots and accumulate via
-# global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
+# FLAT 1stage asm kernels ingest raw topk_ids / topk_weights through the
+# sorted_* kernarg slots and accumulate via global_atomic_pk_add_bf16, so
+# moe_sorting is a pass-through for them. The manifest value is flat=1
+# (one token per TG) or flat=2 (EMSORT); either nonzero value takes this path.
 
 
 def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
@@ -811,7 +812,7 @@ def moe_sorting(
             accumulate=accumulate,
             output=output,
         )
-    # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
+    # FLAT kernel: in-kernel routing (manifest flat=1 or flat=2); pass through unsorted topk.
     # `output` cannot be written in place: FLAT needs extra bytes appended to moe_buf.
     if flat:
         assert output is None, "FLAT over-allocates moe_buf; the caller copies"
@@ -2315,6 +2316,39 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 cfg_2stages = None
 cfg_2stages_by_file = {}
+
+# Itanium symbols encode the activation (`_silu_` / `_gelu_` / `_situv2_`).
+# SiLU and GELU are the same length, so swapping the tag keeps the mangled
+# name valid and names the twin kernel in the other activation's cfg map.
+_ASM_ACT_TAG = {
+    ActivationType.Silu: "_silu_",
+    ActivationType.Gelu: "_gelu_",
+    ActivationType.Situv2: "_situv2_",
+}
+
+
+def _retarget_asm_activation(kernel_name, activation):
+    """Point a 1-stage asm symbol at the kernel for `activation`.
+
+    A tuned row is stored under one activation. The act-type-disabled fallback
+    can hand that symbol to a different activation. SiLU/GELU twins share the
+    mangled length, so the tag is swapped in place. A length-changing tag is
+    dropped and the activation's own cfg map selects a kernel.
+    """
+    if not isinstance(kernel_name, str) or not kernel_name:
+        return kernel_name
+    want = _ASM_ACT_TAG.get(activation)
+    if want is None or want in kernel_name:
+        return kernel_name
+    for other in _ASM_ACT_TAG.values():
+        if other not in kernel_name:
+            continue
+        if len(other) == len(want):
+            return kernel_name.replace(other, want, 1)
+        return ""
+    return kernel_name
+
+
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -2402,7 +2436,7 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_quant: str = ""
     stage2_has_bias: bool = False
-    flat: bool = False
+    flat: int = 0
     output_aux: bool | str = False
     prequant: bool = True
     skip_inter_quant: bool = False
@@ -3452,6 +3486,24 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
+def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
+    # is_shuffled is true when either weight is tagged. weights_shuffled is
+    # the both-weights flag when the caller passed opus_weights_shuffled,
+    # which fused_moe and fused_moe_2stages do. gfx is the live device;
+    # get_gfx() follows GPU_ARCHS and can hide an actual gfx950 process.
+    if (
+        gfx == "gfx950"
+        and q_dtype_w == dtypes.fp8
+        and q_type in (QuantType.per_Tensor, QuantType.per_Token)
+        and not weights_shuffled
+    ):
+        raise RuntimeError(
+            "gfx950 fp8 CK MoE reads the shuffle_weight() layout on "
+            "both w1 and w2; unshuffled per_Tensor and per_Token "
+            "weights are unsupported"
+        )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -3940,7 +3992,8 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         run_1stage_xbf16 = False
-        # No tuned config => default host moe_sort. For FLAT, run tuner and set flat=1.
+        # No tuned config => default host moe_sort (flat=0). A tuned FLAT row
+        # sets flat=1 (one token per TG) or flat=2 (EMSORT).
         cfg_flat = 0
         if (
             activation,
@@ -3997,6 +4050,16 @@ def get_2stage_cfgs(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
     else:
+        # A tuned CK row does not use the heuristic above. is_shuffled is the
+        # OR, so one tagged weight used to skip the preshuffle warning too.
+        tuned_names = (
+            str(cfg.get("kernelName1", "") or ""),
+            str(cfg.get("kernelName2", "") or ""),
+        )
+        if not cfg.get("run_1stage", False) and any(
+            "moe_ck2stages" in name for name in tuned_names
+        ):
+            _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled)
         block_m = cfg["block_m"]
         nt_override = int(os.environ.get("AITER_USE_NT", "-1"))
         if nt_override != -1:
@@ -4014,6 +4077,14 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        if run_1stage:
+            retargeted = _retarget_asm_activation(kernelName1, activation)
+            if retargeted != kernelName1:
+                logger.info(
+                    f"[fused_moe] 1-stage kernel {kernelName1!r} is for a "
+                    f"different activation; using {retargeted!r} for {activation}"
+                )
+                kernelName1 = retargeted
         if not is_shuffled and not run_1stage:
             logger.warning(
                 f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
@@ -4597,6 +4668,8 @@ def get_2stage_cfgs(
                 activation=activation,
             )
         else:
+            # Plain fp8 CK instances read the shuffle_weight() layout.
+            _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled)
             stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,

@@ -7,8 +7,7 @@ from functools import lru_cache
 
 import torch
 
-from ..kernels.tensor_shim import wave_size_of
-from ..kernels.topk.topk_launch import run_topk_launcher
+from ..kernels.tensor_shim import _run_compiled, wave_size_of
 from ..kernels.topk.topk_per_row_small_k import (
     build_topk_per_row_small_k_module,
     lds_limit,
@@ -155,7 +154,7 @@ def topk_per_row_small_k(
         bool(init_blocks or local_blocks),
         row_lens is None,
     )
-    run_topk_launcher(
+    _run_compiled(
         launcher,
         scores,
         row_len_slot(row_lens, scores.device),
