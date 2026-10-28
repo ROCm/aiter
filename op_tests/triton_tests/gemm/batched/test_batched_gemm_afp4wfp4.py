@@ -235,20 +235,8 @@ def test_batched_gemm_afp4_wfp4_ragged_k_scales(K: int, scale_tail: str):
         x_scales = _scales_with_tail(x_scales, 255)
     else:
         w_scales = _scales_with_tail(w_scales, 255)
-    # BLOCK_SIZE_K 256 leaves a partial last block at K = 2112.
-    config = {
-        "BLOCK_SIZE_M": 32,
-        "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 256,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 4,
-        "num_stages": 1,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": None,
-        "NUM_KSPLIT": 1,
-        "SPLITK_BLOCK_SIZE": K,
-    }
-    batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out, config=config)
+    # With the BLOCK_SIZE_K of 256 that the gfx950 and gfx1250 tables give for
+    # M = 32, K = 2112 leaves a partial last block and K = 2048 does not.
+    batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
 
     torch.testing.assert_close(torch_out, out)
