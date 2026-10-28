@@ -36,6 +36,7 @@ from aiter.fused_moe import (
     fused_moe,
     fused_topk,
     moe_sorting,
+    resolve_activation_dtype,
     torch_moe,
     torch_moe_stage1,
     torch_moe_stage2,
@@ -2893,6 +2894,7 @@ class FmoeTuner(TunerCommon):
         doweight_stage1=False,
         swiglu_limit=None,
         quantize_fp32=False,
+        fp8_scale_fn=None,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -2928,7 +2930,11 @@ class FmoeTuner(TunerCommon):
             if AQDType in (dtypes.bf16, dtypes.fp16):
                 a2_qt, a2_scale = ref1.to(AQDType), None
             elif AQDType == dtypes.fp8:
-                a2_qt, a2_scale = torch_dynamic_mxfp8_quant(ref1)
+                # fp8_scale_fn: the e8m0 rule of whatever quantizes the
+                # stage-1 result in the kernel pair (default RoundUp).
+                a2_qt, a2_scale = _mxfp8_quant(
+                    ref1, fp8_scale_fn or _roundup_mxfp8_scale
+                )
             else:
                 a2_qt, a2_scale = aiter.get_torch_quant(quant_type)(
                     ref1, quant_dtype=AQDType
@@ -5002,6 +5008,7 @@ class FmoeTuner(TunerCommon):
         return tasks_flydsl
 
     def run_config(self, args, target_fused_moe=None, config_string=""):
+        from aiter import logger
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import checkAllclose, run_perftest
 
@@ -5026,25 +5033,52 @@ class FmoeTuner(TunerCommon):
             doweight_stage1 = bool(row["doweight_stage1"])
             limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
             swiglu_limit = None if limit_env in (None, "") else float(limit_env)
-            # fused_moe overrides the activation quant dtype at runtime for
-            # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
-            # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
-            # The config's nominal q_dtype_a (e.g. a8w4=fp8) is ignored, so the
-            # kernel actually runs a4w4. Mirror that here so the reference and the
-            # kernel weight layout match (else outputs are uncorrelated).
-            # Source of truth: aiter/fused_moe.py q_dtype_a selection.
+            # As in serving and op_tests/test_moe_2stage.py, a8w4 and mxfp8
+            # weights use the gate/up-interleaved layout.
+            gate_mode = (
+                "interleave"
+                if q_type == QuantType.per_1x32
+                and q_dtype_a == dtypes.fp8
+                and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
+                else "separated"
+            )
             eff_q_dtype_a = q_dtype_a
+            quant_dtype_a = None
             if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
-                if act_type == ActivationType.Swiglu:
-                    eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
-                else:
-                    eff_q_dtype_a = dtypes.fp4x2
+                if act_type == ActivationType.Situv2:
+                    # The opt-in dtype the row was tuned for (AITER_SITUV2_A8W4 /
+                    # AITER_SITUV2_A4W4); otherwise fused_moe picks it.
+                    quant_dtype_a = q_dtype_a
+                eff_q_dtype_a = quant_dtype_a or resolve_activation_dtype(
+                    q_type,
+                    q_dtype_w,
+                    activation=act_type,
+                    gate_mode=gate_mode,
+                    M=token,
+                )
+            runs_q_dtype_a = eff_q_dtype_a
+            if (
+                row.get("run_1stage", 0) == 1
+                and q_type == QuantType.per_1x32
+                and q_dtype_w == dtypes.fp4x2
+            ):
+                # The asm 1-stage kernels quantize the activation to MXFP4
+                # themselves, whatever fused_moe hands them.
+                eff_q_dtype_a = dtypes.fp4x2
             shape_str = (
                 f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
                 f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
                 f"{row['q_dtype_w']}, {row['q_type']}, g1u1={use_g1u1}, "
                 f"dw_s1={doweight_stage1})"
             )
+            if runs_q_dtype_a != q_dtype_a:
+                # fused_moe looks the shape up under the activation dtype it
+                # runs, so this row's kernels are not the ones checked.
+                logger.warning(
+                    f"run_config {shape_str}: fused_moe runs a {runs_q_dtype_a} "
+                    f"activation here, not the row's {q_dtype_a}; the row's "
+                    f"kernels are not what is checked"
+                )
             allowed_err_ratio, allowed_err_ratio_desc = (
                 self._get_run_config_err_ratio_limit(row, args)
             )
@@ -5224,15 +5258,11 @@ class FmoeTuner(TunerCommon):
                     # a16w4 (bf16 activation): reference runs activation in bf16.
                     a1_qt = hidden.to(dtype)
                     a1_scale = None
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a == dtypes.fp8
-                    and q_dtype_w == dtypes.fp8
-                ):
-                    # mxfp8 (a8w8): kernel quantizes the activation internally; the
-                    # reference runs activation in bf16 (mirror test_moe_2stage).
-                    a1_qt = hidden.to(dtype)
-                    a1_scale = None
+                elif q_type == QuantType.per_1x32 and eff_q_dtype_a == dtypes.fp8:
+                    # a8w4 / mxfp8: fused_moe quantizes the activation with
+                    # fused_dynamic_mxfp8_quant_moe_sort (RoundUp); the reference
+                    # reads the same codes and scales.
+                    a1_qt, a1_scale = _mxfp8_quant(hidden, _roundup_mxfp8_scale)
                 else:
                     # Use the *effective* activation dtype (what fused_moe runs),
                     # not the config's nominal q_dtype_a. For Silu+SEPARATED fp4
@@ -5266,6 +5296,8 @@ class FmoeTuner(TunerCommon):
                         else None
                     ),
                     swiglu_limit=swiglu_limit,
+                    gate_mode=gate_mode,
+                    quant_dtype_a=quant_dtype_a,
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
@@ -5276,6 +5308,15 @@ class FmoeTuner(TunerCommon):
                 # The torch reference detects int4 weights by the i4x2 dtype, so
                 # pass an i4x2-reinterpreted view to the reference only (the kernel
                 # path above consumes the int8 w*_qt). Mirrors op_tests/test_moe_2stage.py.
+                # An fp8 stage-2 input comes from a fused FlyDSL stage 1 (its own
+                # scale rule) or else is RoundUp: opus' fused stage 1 and
+                # fused_moe's quantization after an unfused one.
+                kernel1 = str(row.get("kernelName1", ""))
+                fp8_scale_fn = (
+                    fp4_utils.f32_to_fused_moe_mxfp8_scale
+                    if kernel1.startswith("flydsl_moe1") and kernel1.endswith("_fp8")
+                    else _roundup_mxfp8_scale
+                )
                 w1_qt_ref, w2_qt_ref = w1_qt, w2_qt
                 if q_type == QuantType.per_1x32 and w1_qt.dtype == dtypes.i8:
                     w1_qt_ref = w1_qt.view(dtypes.i4x2)
@@ -5295,6 +5336,7 @@ class FmoeTuner(TunerCommon):
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
                     swiglu_limit=swiglu_limit,
+                    fp8_scale_fn=fp8_scale_fn,
                 )
                 ref = reference()
                 if not _all_finite(out) or not _all_finite(ref):
@@ -5318,7 +5360,14 @@ class FmoeTuner(TunerCommon):
                         err_fp32 = checkAllclose(out, ref_fp32, printLog=False)
                         if err_fp32 < err_ratio:
                             ref, err_ratio = ref_fp32, err_fp32
-                    checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                    # Logged against the threshold that decides the shape, so
+                    # "failed!" means the elementwise check did fail.
+                    checkAllclose(
+                        out,
+                        ref,
+                        tol_err_ratio=allowed_err_ratio,
+                        msg=f"run_config {shape_str}",
+                    )
                     # Element-wise err_ratio (atol/rtol) is overly strict for lossy
                     # fp4/fp8 MoE: even a correct kernel differs on most elements
                     # vs the higher-precision reference. op_tests/test_moe_2stage.py
@@ -5334,8 +5383,16 @@ class FmoeTuner(TunerCommon):
                         else 0.0
                     )
                     cos_tol = float(os.environ.get("AITER_RUN_CONFIG_COS_TOL", "0.01"))
-                    if err_ratio <= allowed_err_ratio or logits_diff <= cos_tol:
+                    if err_ratio <= allowed_err_ratio:
                         status = "ok"
+                    elif logits_diff <= cos_tol:
+                        status = "ok"
+                        logger.warning(
+                            f"run_config {shape_str}: accepted on "
+                            f"logits_diff={logits_diff:.6g} (<= {cos_tol}) although "
+                            f"err_ratio={err_ratio:.6g} exceeds "
+                            f"{allowed_err_ratio_desc}"
+                        )
                     else:
                         diag = tensor_compare_diagnostics(ref, out)
                         status = (
@@ -6417,8 +6474,10 @@ class FmoeTuner(TunerCommon):
             swiglu_limit=None,
             beta=None,
             linear_beta=None,
+            gate_mode=None,
+            quant_dtype_a=None,
         ):
-            del beta, linear_beta
+            del beta, linear_beta, gate_mode, quant_dtype_a
             if doweight_stage1:
                 raise NotImplementedError(
                     "gfx942 FlyDSL whole-graph tuning does not support "
