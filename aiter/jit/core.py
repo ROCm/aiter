@@ -1403,12 +1403,13 @@ def build_module(
             flags_hip += [
                 "-mllvm -amdgpu-early-inline-all=true",
                 "-mllvm -amdgpu-function-calls=false",
-                # Newer LLVM won't inline across differing target features, as in CK-tile's
-                # target("no-packed-fp32-ops") kentry. The flag changes nothing on older LLVM.
-                "-mllvm -ignore-tti-inline-compatible=true",
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+        # Starting with ROCm 10.1 (HIP 7.16), LLVM won't inline across differing target features,
+        # as in CK-tile's target("no-packed-fp32-ops") kentry. This flag restores the inlining.
+        if hip_version >= Version("7.16"):
+            flags_hip += ["-mllvm -ignore-tti-inline-compatible=true"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
         # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +
