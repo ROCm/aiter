@@ -84,6 +84,10 @@ from .pa_decode.traits import (
     PaDecodeSchedule,
     PaDecodeTraits,
 )
+from .tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+)
 
 __all__ = [
     "CLUSTER_PARTITIONS",
@@ -564,15 +568,19 @@ def compile_gfx1250_pa_decode(
         cluster_merge=cluster_merge,
     )
 
+    # Every argument that reducer-fed and direct-output kernels read fits in
+    # the 30 user SGPRs (120 bytes) that preload kernel arguments, ahead of
+    # the merge-only arguments.
     @flyc.kernel(name=kernel_name, known_block_size=(128, 1, 1))
     def pa_decode_tile_kernel(
-        pmax: fx.Pointer,
-        psum: fx.Pointer,
-        pout: fx.Pointer,
+        work: fx.Pointer,
+        table: fx.Pointer,
         query: fx.Pointer,
         key: fx.Pointer,
         value: fx.Pointer,
-        table: fx.Pointer,
+        pmax: fx.Pointer,
+        psum: fx.Pointer,
+        pout: fx.Pointer,
         ks: fx.Pointer,
         vs: fx.Pointer,
         max_blocks: fx.Int32,
@@ -580,12 +588,12 @@ def compile_gfx1250_pa_decode(
         sk_head: fx.Int32,
         sq_row: fx.Int32,
         sq_head: fx.Int32,
-        work: fx.Pointer,
         sequences: fx.Int32,
-        output: fx.Pointer,
-        reduce_info: fx.Pointer,
-        counters: fx.Pointer,
         capacity: fx.Int32,
+        kv_heads: fx.Int32,
+        reduce_info: fx.Pointer,
+        output: fx.Pointer,
+        counters: fx.Pointer,
     ):
         _ = tag
 
@@ -663,6 +671,7 @@ def compile_gfx1250_pa_decode(
             )
             # Packed partials are [KV heads, capacity, rows] by task slot.
             ctx.task_slot, ctx.capacity = task_slot, capacity
+            ctx.n_kv = kv_heads
             if const_expr(t.merge_partitions):
                 # Issued early: only the epilogue reads the sequence's tasks.
                 tasks = fx.ptr_load(
@@ -737,13 +746,14 @@ def compile_gfx1250_pa_decode(
         if const_expr(t.cluster_merge):
             grid_x = sequences * t.cluster_merge
         pa_decode_tile_kernel(
-            pmax,
-            psum,
-            pout,
+            work,
+            table,
             query,
             key,
             value,
-            table,
+            pmax,
+            psum,
+            pout,
             ks,
             vs,
             max_blocks,
@@ -751,12 +761,12 @@ def compile_gfx1250_pa_decode(
             sk_head,
             sq_row,
             sq_head,
-            work,
             sequences,
-            output,
-            reduce_info,
-            counters,
             capacity,
+            kv_heads,
+            reduce_info,
+            output,
+            counters,
             value_attrs=(
                 {"rocdl.cluster_dims": f"{t.cluster_merge},1,1"}
                 if t.cluster_merge
@@ -769,10 +779,19 @@ def compile_gfx1250_pa_decode(
             cluster=(t.cluster_merge, 1, 1) if t.cluster_merge else None,
         )
 
+    llvm_options = {}
     if t.bf16_wave_query_tiles:
         # Iterative ILP scheduling leaves fewer VGPR bank switches per page.
-        launch.compile_hints["llvm_options"] = {
-            "amdgpu-sched-strategy": "iterative-ilp"
-        }
+        llvm_options["amdgpu-sched-strategy"] = "iterative-ilp"
+    if not t.merged_output:
+        # Argument loads that a preload leaves behind are slower than those of
+        # an unpreloaded kernel (cluster merges ran 2-6% slower), so merging
+        # kernels, whose arguments do not all fit, keep loading them.
+        llvm_options["amdgpu-kernarg-preload"] = AITER_FLYDSL_KERNARG_PRELOAD
+        llvm_options["amdgpu-kernarg-preload-count"] = (
+            AITER_FLYDSL_KERNARG_PRELOAD_COUNT
+        )
+    if llvm_options:
+        launch.compile_hints["llvm_options"] = llvm_options
     compiled = {"launch": launch, "kernel": pa_decode_tile_kernel}
     return _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)
