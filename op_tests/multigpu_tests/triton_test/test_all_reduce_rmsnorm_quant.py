@@ -132,7 +132,7 @@ def _dispatch_worker(rank, init_method):
     try:
         if tp.device_communicator.gluon_ar is None:
             failures.append(f"rank {rank}: the TP communicator has no Gluon inboxes")
-        for tokens in (1, 8, 128, 512):  # 512 rows at hidden 2048 are 2 MiB
+        for tokens in (1, 8, 128, 1024, 2048):  # 2048 rows at hidden 2048 are 8 MiB
             x, residual, weight, *ref = _inputs(tokens, rank, device)
             outs = tensor_model_parallel_fused_allreduce_rmsnorm(
                 x, residual, weight, EPS, gemma_norm=True
@@ -140,10 +140,10 @@ def _dispatch_worker(rank, init_method):
             name = f"rank {rank} dispatch tokens {tokens}"
             failures += _compare(name, outs, *ref, tp.device_group)
 
-        # The plain all-reduce, up to 512 KiB. Bit-exact only on the Gluon path.
+        # The plain all-reduce, up to 4 MiB. Bit-exact only on the Gluon path.
         if tp.device_communicator.gluon_ar_plain is None:
             failures.append(f"rank {rank}: no Gluon inboxes for the plain all-reduce")
-        for tokens in (1, 8, 128):  # 128 rows at hidden 2048 are 512 KiB
+        for tokens in (1, 8, 128, 1024):  # 1024 rows at hidden 2048 are 4 MiB
             gen = torch.Generator(device=device).manual_seed(1000 + tokens)
             shape = (tokens, HIDDEN)
             xs = [

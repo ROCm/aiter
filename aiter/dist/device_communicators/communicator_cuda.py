@@ -15,11 +15,11 @@ from aiter.utility.dtypes import fp8
 
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
-# gfx1250, 4 ranks: the Gluon all-reduce + RMSNorm takes decode sizes. RCCL is
-# faster above them (prefill).
-_GLUON_AR_MAX_BYTES = 2 << 20
-# The plain Gluon all-reduce is faster than the custom all-reduce up to 512 KiB.
-_GLUON_PLAIN_AR_MAX_BYTES = 512 << 10
+# gfx1250, 4 ranks: the Gluon all-reduce + RMSNorm takes up to 2048 tokens of hidden
+# 2048. RCCL is faster above that.
+_GLUON_AR_MAX_BYTES = 8 << 20
+# The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
+_GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori")
