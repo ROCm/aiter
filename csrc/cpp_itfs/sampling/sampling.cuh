@@ -1423,8 +1423,9 @@ static void topk_renorm_from_probs(
 
     size_t pivot_bytes      = (size_t)batch_size * sizeof(float);
     size_t normalizer_bytes = (size_t)batch_size * sizeof(float);
-    size_t out_idx_bytes    = (size_t)batch_size * max_k * sizeof(int);
-    size_t total_bytes = radix_buf_size + pivot_bytes + normalizer_bytes + out_idx_bytes;
+    // No out_idx: unused here, and unsafe -- the kernel strides it by max_k but
+    // bounds writes by the per-row k, so k > max_k ran past the workspace.
+    size_t total_bytes = radix_buf_size + pivot_bytes + normalizer_bytes;
 
     static void* s_workspace = nullptr;
     static size_t s_workspace_size = 0;
@@ -1437,12 +1438,11 @@ static void topk_renorm_from_probs(
     char* ptr = static_cast<char*>(s_workspace);
     void*  radix_buf  = ptr;                             ptr += radix_buf_size;
     float* pivot_buf  = reinterpret_cast<float*>(ptr);   ptr += pivot_bytes;
-    float* norm_buf   = reinterpret_cast<float*>(ptr);   ptr += normalizer_bytes;
-    int*   out_idx    = reinterpret_cast<int*>(ptr);
+    float* norm_buf   = reinterpret_cast<float*>(ptr);
 
     radix_topk::standalone_stable_radix_10bits<float, int, false>(
         radix_buf, radix_buf_size, probs, batch_size, (int64_t)vocab_size,
-        nullptr, nullptr, max_k, nullptr, out_idx, true, stream, 0,
+        nullptr, nullptr, max_k, nullptr, nullptr, true, stream, 0,
         pivot_buf, norm_buf, top_k_arr);
 
     constexpr int BT = 1024;

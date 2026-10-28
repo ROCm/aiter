@@ -16,8 +16,6 @@ Correctness is not checked here — see op_tests/test_fused_clamp_act_mul.py for
 the value/scale reference test.
 """
 
-import argparse
-
 import torch
 import triton
 
@@ -25,6 +23,10 @@ from aiter import dtypes
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     _is_gluon_available,
     fused_clamp_act_mul,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -54,7 +56,7 @@ def run_benchmark(args):
     # Resolve the backend the same way the wrapper does, so the plot name and the
     # actual dispatch agree; fail fast if gluon is explicitly asked for but absent.
     backend = args.backend
-    if backend == "auto":
+    if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
     elif backend == "gluon" and not _is_gluon_available():
         raise ValueError(
@@ -78,7 +80,7 @@ def run_benchmark(args):
         x_vals=x_vals_list,
         line_arg="unit",
         line_vals=[ylabel],
-        line_names=[ylabel],
+        line_names=[""],  # prevents double bandwidth text
         styles=[("green", "-")],
         ylabel=ylabel,
         plot_name=f"{get_caller_name_no_ext()}_{backend}_{args.quant}",
@@ -125,7 +127,7 @@ def run_benchmark(args):
             backend=backend,
         )
 
-        ms = triton.testing.do_bench_cudagraph(fn, rep=100, return_mode="mean")
+        ms = triton.testing.do_bench_cudagraph(fn, rep=args.rep, return_mode="mean")
 
         # Memory-bound: read gate+up (M x 2N), write out (M x N) + small scale
         # buffer. Weights add M x 1 when broadcast (negligible) or a full
@@ -152,11 +154,7 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused_clamp_act_mul",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="fused_clamp_act_mul")
     parser.add_argument(
         "--dtype",
         type=str,
@@ -173,20 +171,7 @@ def parse_args(args: list[str] | None = None):
         metavar=("M", "N"),
         help="user-defined (M, N=n_half) shape; N must be a multiple of 128",
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "bandwidth", "throughput"],
-        default="bandwidth",
-        help="metric to plot",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["auto", "triton", "gluon"],
-        default="auto",
-        help="dispatch backend; 'auto' picks gluon on gfx1250, triton elsewhere",
-    )
+    override_parser_action(parser, action="--metric", default="bandwidth")
     parser.add_argument(
         "--quant",
         type=str,
@@ -221,6 +206,14 @@ def parse_args(args: list[str] | None = None):
         choices=("broadcast", "full"),
         help="weight layout when --weighted 1: 'broadcast' is [M, 1] applied "
         "across the row, 'full' is [M, n_half], one weight per output element.",
+    )
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=20,
+        help="do_bench_cudagraph measurement target, in ms (default is 20). "
+        "captured graph unrolls rep/kernel_ms iterations, so its made configurable "
+        "Large rep can bloat the graph for small kernels and break profilers.",
     )
     parser.add_argument(
         "-print_vgpr",
