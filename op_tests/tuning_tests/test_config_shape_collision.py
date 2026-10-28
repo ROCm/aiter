@@ -597,6 +597,36 @@ class TestConfigShapeCollision(unittest.TestCase):
         self._check_family("AITER_CONFIG_MHA_FWD", "tuned_mha_fwd")
 
 
+@unittest.skipIf(core is None, f"aiter not importable: {_IMPORT_ERR}")
+class TestCompiledTablesRefuseModelRows(unittest.TestCase):
+    """Kernels compiled from a table are looked up by (gfx, cu_num, shape)
+    only, so rows tuned on MI300X and MI325X would collapse into one."""
+
+    def test_filter_tune_df_refuses_rows_that_name_a_gpu_model(self):
+        import pandas as pd
+
+        from aiter.jit.utils.build_targets import filter_tune_df
+
+        row = {"gfx": "gfx942", "cu_num": 304, "M": 128, "N": 4096, "K": 4096}
+        target = [("gfx942", 304)]
+        tagged = pd.DataFrame(
+            [
+                {**row, "gpu_model": "mi300x", "kernelId": 1},
+                {**row, "gpu_model": "mi325x", "kernelId": 2},
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "gpu_model"):
+            filter_tune_df(tagged, target)
+
+        blank = pd.DataFrame(
+            [
+                {**row, "gpu_model": float("nan"), "kernelId": 1},
+                {**row, "gpu_model": " ", "kernelId": 2},
+            ]
+        )
+        self.assertEqual(len(filter_tune_df(blank, target)), 2)
+
+
 def _fix_real_tree():
     """Resolve every family against the REAL checkout (not a temp copy) so
     `update_config_files`' existing auto-dedup (keep lowest-`us` per shape) writes
