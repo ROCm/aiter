@@ -16,6 +16,7 @@ from aiter.utility.graph_alloc import persistent_alloc
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
+    SPLIT_K_COUNTER_STRIDE,
     SPLIT_K_SEMAPHORE_MAX_LEN,
     BlockSwizzle,
     SplitKReduction,
@@ -308,8 +309,8 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     # @flyc.kernel bodies, so old bf16-rounding fp32 binaries are never reused.
     out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
-    # "f32" marks the fp32 split-K and slice-K reductions (cache key).
-    name += f"_ks{param.split_k}" + ("f32" if param.split_k > 1 else "")
+    # "fp32" and "f32" mark the fp32 split-K and slice-K reductions (cache key).
+    name += f"_ks{param.split_k}" + ("fp32" if param.split_k > 1 else "")
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += "f32" if param.k_waves > 1 else ""
     name += f"_gm{param.group_m}"
@@ -682,8 +683,6 @@ def gemm_a16w16_gfx950_kernel(
         async_load_b_to_lds(stage, stage)
         async_load_a_to_lds(stage, stage)
         rocdl.asyncmark()
-    if const_expr(is_split_k):
-        ticket = splitk_reduction.take_ticket()
     rocdl.sched_barrier(0)
 
     main_loop_end = k_tiles - (stages - 1)
@@ -781,24 +780,19 @@ def gemm_a16w16_gfx950_kernel(
         # Calls through plain names: a dynamic `if` treats `obj.method()` as
         # state that must be yielded.
         store_partial = splitk_reduction.store_partial
-        signal_done = splitk_reduction.signal_done
-        wait_for_partials = splitk_reduction.wait_for_partials
         accumulate = splitk_reduction.accumulate
         if const_expr(is_slice_k):
             if k_wave_idx == 0:
                 store_partial((frag_C,))
         else:
             store_partial((frag_C,))
-        if splitk_reduction.is_reducer(ticket):
-            wait_for_partials(ticket)
+        if splitk_reduction.arrive():
             if const_expr(is_slice_k):
                 if k_wave_idx == 0:
                     accumulate(frag_C, 0, init_frag_C)
             else:
                 accumulate(frag_C, 0, init_frag_C)
             store_c_tile_to_global()
-        else:
-            signal_done()
     else:
         if const_expr(not is_slice_k):
             gpu.barrier()
@@ -1085,8 +1079,6 @@ def gemm_a16w16_hti_gfx950_kernel(
     async_load_a_to_lds(0, 0, 0)
     async_load_b_to_lds(1, 0, 0)
     async_load_a_to_lds(1, 0, 0)
-    if const_expr(is_split_k):
-        ticket = splitk_reduction.take_ticket()
     rocdl.sched_barrier(0)
     if wid // n_waves == 1:
         rocdl.s_barrier()
@@ -1192,13 +1184,10 @@ def gemm_a16w16_hti_gfx950_kernel(
             rocdl.s_barrier()
         rocdl.s_barrier()
         store_partial = splitk_reduction.store_partial
-        signal_done = splitk_reduction.signal_done
-        wait_for_partials = splitk_reduction.wait_for_partials
         accumulate = splitk_reduction.accumulate
         group = fx.size(c00.shape).unpack() // 4
         store_partial((c00, c01, c10, c11))
-        if splitk_reduction.is_reducer(ticket):
-            wait_for_partials(ticket)
+        if splitk_reduction.arrive():
             accumulate(c00, 0, lambda: init_c_fragment(c00, 0, True))
             accumulate(c01, group, lambda: init_c_fragment(c01, 1, True))
             accumulate(c10, 2 * group, lambda: init_c_fragment(c10, 0, True))
@@ -1212,8 +1201,6 @@ def gemm_a16w16_hti_gfx950_kernel(
             store_half_tile_to_global(0, 1)
             store_half_tile_to_global(1, 0)
             store_half_tile_to_global(1, 1)
-        else:
-            signal_done()
     else:
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(0, 0)
@@ -1271,9 +1258,9 @@ def gemm_a16w16_gfx950(
             ),
         ),
     )
-    split_alignment = GFX950_DMA_BYTES // param.in_data_bytes
+    # Whole K tiles per split; the last split takes the remainder.
     working_k = (k + split_k - 1) // split_k
-    working_k = (working_k + split_alignment - 1) // split_alignment * split_alignment
+    working_k = (working_k + param.block_k - 1) // param.block_k * param.block_k
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
     gemm_a16w16_kernel_impl = (
@@ -1348,18 +1335,9 @@ def assert_no_k_tail(k: int, kwargs: dict):
     block_k = kwargs["block_k"]
     stages = kwargs["stages"]
     use_half_tile_interleaved = kwargs["use_half_tile_interleaved"]
-    async_load_vec_size = GFX950_DMA_BYTES // 2
     working_k = (k + split_k - 1) // split_k
-    working_k = (
-        (working_k + async_load_vec_size - 1)
-        // async_load_vec_size
-        * async_load_vec_size
-    )
+    working_k = (working_k + block_k - 1) // block_k * block_k
     last_working_k = k - (split_k - 1) * working_k
-    assert working_k % block_k == 0, (
-        "K-tail is unsupported: aligned split-K partition size "
-        f"{working_k} is not divisible by block_k={block_k}"
-    )
     assert last_working_k > 0 and last_working_k % block_k == 0, (
         "K-tail is unsupported: final split-K partition size "
         f"{last_working_k} must be positive and divisible by block_k={block_k}"
@@ -1389,13 +1367,13 @@ def assert_no_k_tail(k: int, kwargs: dict):
 
 
 @functools.lru_cache(maxsize=128)
-def get_split_k_buffers(stream, device, split_k):
-    # Keyed by split_k: per launch a tile's ticket word advances by split_k and its
-    # done word (second half) by split_k - 1, which is what lets the kernel derive
-    # the launch index from its ticket.
+def get_split_k_buffers(stream, device):
+    # One arrival counter per output tile, which the last split to arrive resets.
     with persistent_alloc(torch.device(device)):
         return torch.zeros(
-            (2 * SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int64, device=device
+            (SPLIT_K_SEMAPHORE_MAX_LEN * SPLIT_K_COUNTER_STRIDE,),
+            dtype=torch.int32,
+            device=device,
         )
 
 
@@ -1543,7 +1521,7 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
-    semaphore = get_split_k_buffers(stream, device, split_k)
+    semaphore = get_split_k_buffers(stream, device)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)

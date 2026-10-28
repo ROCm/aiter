@@ -3,6 +3,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
     const_expr,
     gpu,
@@ -15,6 +16,9 @@ from .tensor_shim import buf_base_i64
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
+# Int32 words between two tiles' split-K counters: one 128-byte line each, so the
+# tiles' arrivals do not serialize on a shared line.
+SPLIT_K_COUNTER_STRIDE = 32
 
 
 def wait_vmcnt_and_barrier(vmcnt=0):
@@ -68,18 +72,16 @@ class BlockSwizzle:
 class SplitKReduction:
     """Deterministic fp32 split-K reduction.
 
-    Every workgroup takes a ticket when it starts and stores its fp32 partial. The
-    tile's last workgroup to start reduces: the others count themselves done once
-    their stores have landed, the reducer waits for that count and adds every
-    split's partial in split order, so the sum does not depend on arrival order.
-    Waiting only on workgroups that took a ticket earlier, and so are already
-    running, cannot deadlock. Partials use sc1 buffer stores and loads, which are
-    coherent at agent scope (what LLVM emits for monotonic agent-scope accesses),
-    so no cache-wide fence is needed. Per launch a tile's ticket word advances by
-    SPLIT_K and its done word by SPLIT_K - 1 (buffers are keyed by split_k and never
-    reset), so ticket // SPLIT_K is the launch index. Partials are thread-major
-    float4 groups of the MMA fragments; ``tid`` and ``THREADS`` index the threads
-    that hold the tile (k-wave 0 under slice-K).
+    Every workgroup stores its fp32 partial, waits for the stores to land, then
+    counts itself in on the tile's counter. The last split to arrive adds every
+    split's partial in split order, so the sum does not depend on arrival order,
+    and writes C once; no workgroup waits for another. The counter increments
+    with wrap at SPLIT_K - 1, so the last arrival also resets it for the next
+    launch. Partials use sc1 buffer stores and loads, which are coherent at agent
+    scope (what LLVM emits for monotonic agent-scope accesses), so no cache-wide
+    fence is needed. Partials are thread-major float4 groups of the MMA
+    fragments; ``tid`` and ``THREADS`` index the threads that hold the tile
+    (k-wave 0 under slice-K).
     """
 
     SC1 = 16  # buffer cache policy: coherent at agent scope
@@ -91,9 +93,8 @@ class SplitKReduction:
 
     @flyc.jit
     def init(self, semaphore, workspace, flag_ptr, tid, tile_idx, ks_idx):
-        self.ticket_ptr = _global_sync_ptr(semaphore, tile_idx, fx.Int64)
-        self.done_ptr = _global_sync_ptr(
-            semaphore, SPLIT_K_SEMAPHORE_MAX_LEN + tile_idx, fx.Int64
+        self.counter_ptr = _global_sync_ptr(
+            semaphore, tile_idx * SPLIT_K_COUNTER_STRIDE, fx.Int32
         )
         self.slots = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(workspace, max_size=True),
@@ -106,26 +107,6 @@ class SplitKReduction:
         self.copy_atom = fx.make_copy_atom(
             fx.rocdl.BufferCopy128b(self.SC1), fx.Float32
         )
-
-    @flyc.jit
-    def take_ticket(self):
-        # Issued early so the round trip hides under the K loop; only thread 0
-        # holds the ticket.
-        ticket = fx.Int64(0)
-        if fx.thread_idx.x == 0:
-            ticket = fx.atomic_add(self.ticket_ptr, fx.Int64(1), syncscope="agent")
-        return ticket
-
-    @flyc.jit
-    def is_reducer(self, ticket):
-        # The flag sits in shared C, which aliases the A/B stages: wait for the
-        # K loop of every wave before writing it.
-        gpu.barrier()
-        if fx.thread_idx.x == 0:
-            last = (ticket % self.SPLIT_K) == (self.SPLIT_K - 1)
-            fx.ptr_store(last.select(fx.Int32(1), fx.Int32(0)), self.flag_ptr)
-        gpu.barrier()
-        return fx.ptr_load(self.flag_ptr) != 0
 
     def _slot(self, ks, group):
         offset = self.tile_base + ks * self.TILE_ELEMS
@@ -147,25 +128,26 @@ class SplitKReduction:
                 group += 1
 
     @flyc.jit
-    def signal_done(self):
+    def arrive(self):
+        """Count this split in once its partial has landed; true in every thread
+        of the tile's last split to arrive."""
         rocdl.s_waitcnt(vmcnt=0)
+        # The flag sits in shared C, which aliases the A/B stages: the barrier also
+        # waits for the K loop of every wave before it is written.
         gpu.barrier()
         if fx.thread_idx.x == 0:
-            fx.atomic_add(self.done_ptr, fx.Int64(1), syncscope="agent")
-
-    @flyc.jit
-    def wait_for_partials(self, ticket):
-        rocdl.s_waitcnt(vmcnt=0)  # this workgroup reads its own partial back too
-        if fx.thread_idx.x == 0:
-            target = (ticket // self.SPLIT_K + 1) * (self.SPLIT_K - 1)
-            done = target - 1
-            while done < target:
-                done = fx.generic_load(
-                    self.done_ptr,
-                    memory_order=fx.AtomicOrdering.Monotonic,
-                    syncscope="agent",
-                )
+            old = llvm.atomicrmw(
+                llvm.AtomicBinOp.uinc_wrap,
+                self.counter_ptr.llvm_ptr,
+                fx.as_ir_value(fx.Int32(self.SPLIT_K - 1)),
+                llvm.AtomicOrdering.monotonic,
+                syncscope="agent",
+                alignment=4,
+            )
+            last = fx.Int32(old) == (self.SPLIT_K - 1)
+            fx.ptr_store(last.select(fx.Int32(1), fx.Int32(0)), self.flag_ptr)
         gpu.barrier()
+        return fx.ptr_load(self.flag_ptr) != 0
 
     def accumulate(self, frag, first_group, init_frag):
         """Set ``frag`` to init + every split's partial, in split order;

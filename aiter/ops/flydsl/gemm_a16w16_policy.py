@@ -33,6 +33,9 @@ class GemmConfigPruner:
     target_waves_per_cu: int = 8
     max_split_grid_rounds: int = 2
     max_tile_grid_ratio: int = 4
+    # The kernel gives each split whole K tiles (the last split the remainder),
+    # so split_k adds no K padding.
+    whole_tile_splits: bool = False
 
     @staticmethod
     def _ceil_div(value, divisor):
@@ -47,6 +50,8 @@ class GemmConfigPruner:
         split_k = config["split_k"]
         padded_m = self._ceil_div(self.m, config["block_m"]) * config["block_m"]
         padded_n = self._ceil_div(self.n, config["block_n"]) * config["block_n"]
+        if self.whole_tile_splits:
+            split_k = 1
         part_k = self.k // split_k
         padded_k = (
             self._ceil_div(part_k, config["block_k"]) * config["block_k"] * split_k
@@ -217,8 +222,7 @@ def get_flydsl_a16w16_configs(
     if get_gfx() != "gfx950":
         return []
 
-    split_k_candidates = [1]
-    split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
+    split_k_candidates = list(range(1, 17))
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
@@ -242,6 +246,8 @@ def get_flydsl_a16w16_configs(
         k,
         device_props,
         2,
+        max_split_grid_rounds=3,
+        whole_tile_splits=True,
     ).prune(configs)
 
     in_dtype_id = (
