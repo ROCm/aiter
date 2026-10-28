@@ -340,7 +340,10 @@ class TunerCommon:
         results[SELECT_COLUMN] = "power"
         for name, value in conditions.items():
             results[name] = value
-        missing = [c for c in POWER_ROW_COLUMNS if c not in self.columns]
+        # watts / tflops_per_w are power-tune columns. They stay off the
+        # latency CSV schema, which is the column list a latency tune writes.
+        power_columns = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS
+        missing = [c for c in power_columns if c not in self.columns]
         if missing:
             self.columns = list(self.columns) + missing
         return results
@@ -1755,8 +1758,6 @@ class GemmCommonTuner(TunerCommon):
                 "tflops",
                 "bw",
                 "errRatio",
-                "watts",
-                "tflops_per_w",
             ]
         if key is None:
             key = ["gfx", "cu_num", "M", "N", "K"]
@@ -1830,28 +1831,29 @@ class GemmCommonTuner(TunerCommon):
             else:
                 kernelName = str(resolved)
             tflops, bw = self.calculate(el)
-            from aiter.utility.tune_result import power_columns
+            from aiter.utility.tune_result import power_columns, power_selection_enabled
 
-            watts, tflops_per_w = power_columns(el, tflops)
             key_dict = dict(zip(self.keys, keys))
-
+            metrics = {
+                "kernelId": [kernelId],
+                "splitK": [splitK],
+                "us": [time],
+                "kernelName": [kernelName],
+                "errRatio": [err_ratio],
+                "tflops": [tflops],
+                "bw": [bw],
+            }
+            watt_text = ""
+            if power_selection_enabled():
+                watts, tflops_per_w = power_columns(el, tflops)
+                metrics["watts"] = [watts]
+                metrics["tflops_per_w"] = [tflops_per_w]
+                watt_text = f", {watts=} W, {tflops_per_w=} TFLOPS/W"
             if len(results) == self.topk:
                 print(
-                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s, {watts=} W, {tflops_per_w=} TFLOPS/W"
+                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s{watt_text}"
                 )
-            key_dict.update(
-                {
-                    "kernelId": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                    "errRatio": [err_ratio],
-                    "tflops": [tflops],
-                    "bw": [bw],
-                    "watts": [watts],
-                    "tflops_per_w": [tflops_per_w],
-                }
-            )
+            key_dict.update(metrics)
             rows.append(key_dict)
         # Build the frame once. Concatenating per row is O(n^2) in both time and
         # allocation: with -o2 (profile of every candidate) a 42-shape x ~600

@@ -1028,32 +1028,33 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 else:
                     kernelName = "None"
             tflops, bw = self.calculate(el)
-            from aiter.utility.tune_result import power_columns
+            from aiter.utility.tune_result import power_columns, power_selection_enabled
 
-            watts, tflops_per_w = power_columns(el, tflops)
             key_dict = dict(zip(self.keys, keys))
+            metrics = {
+                "libtype": [libtype],
+                "solidx": [kernelId],
+                "splitK": [splitK],
+                "us": [time],
+                "kernelName": [kernelName],
+                "err_ratio": [err_ratio],
+                "tflops": [tflops],
+                "bw": [bw],
+            }
+            watt_text = ""
+            if power_selection_enabled():
+                watts, tflops_per_w = power_columns(el, tflops)
+                metrics["watts"] = [watts]
+                metrics["tflops_per_w"] = [tflops_per_w]
+                watt_text = f", watts={watts} W, tflops_per_w={tflops_per_w} TFLOPS/W"
             if len(results) == self.topk:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is "
                     f"libtype={libtype} kernelId={kernelId} {kernelName} "
                     f"splitK={splitK}, {time}us, err_ratio={err_ratio}, "
-                    f"tflops={tflops} TFLOPS, bw={bw} GB/s, "
-                    f"watts={watts} W, tflops_per_w={tflops_per_w} TFLOPS/W"
+                    f"tflops={tflops} TFLOPS, bw={bw} GB/s{watt_text}"
                 )
-            key_dict.update(
-                {
-                    "libtype": [libtype],
-                    "solidx": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                    "err_ratio": [err_ratio],
-                    "tflops": [tflops],
-                    "bw": [bw],
-                    "watts": [watts],
-                    "tflops_per_w": [tflops_per_w],
-                }
-            )
+            key_dict.update(metrics)
             rows.append(key_dict)
         # Build the frame once. Concatenating per row is O(n^2) in both time and
         # allocation: with -o2 (profile of every candidate) a 42-shape x ~600
@@ -1089,8 +1090,6 @@ if __name__ == "__main__":
         "err_ratio",
         "tflops",
         "bw",
-        "watts",
-        "tflops_per_w",
     ]
     tuner = GemmA16W16Tuner(
         "GemmA16W16Tuner",

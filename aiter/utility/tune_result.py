@@ -63,6 +63,56 @@ def efficiency_cost(us, watts) -> float:
     return us_f * watts_f
 
 
+def stage_energy(us, watts) -> float:
+    """Energy of one stage. A stage that did not run (us <= 0) costs 0.
+
+    Unmeasured watts on a stage that did run are NaN, so the pair sorts last.
+    """
+    try:
+        us_f = float(us)
+    except (TypeError, ValueError):
+        return float("nan")
+    if math.isnan(us_f):
+        return float("nan")
+    if us_f <= 0:
+        return 0.0
+    cost = efficiency_cost(us_f, watts)
+    if math.isinf(cost):
+        return float("nan")
+    return cost
+
+
+def measure_all_accurate(select_power: bool, shortlist: int, qualified: int) -> int:
+    """How many accuracy-qualified candidates the accurate pass should time.
+
+    Latency mode keeps the shortlist. Power mode times every qualified
+    candidate, because a cooler kernel can sit outside the latency window.
+    An empty qualified set leaves the shortlist alone.
+    """
+    if select_power and qualified > 0:
+        return qualified
+    return shortlist
+
+
+def candidate_beats(current, challenger, select_power: bool) -> bool:
+    """True when challenger replaces current. Equal rank keeps current."""
+    if current is None:
+        return True
+
+    def _field(row, name):
+        if isinstance(row, dict):
+            return row.get(name, float("nan"))
+        return getattr(row, name, float("nan"))
+
+    current_rank = selection_rank(
+        _field(current, "us"), _field(current, "watts"), select_power
+    )
+    challenger_rank = selection_rank(
+        _field(challenger, "us"), _field(challenger, "watts"), select_power
+    )
+    return challenger_rank < current_rank
+
+
 def sort_by_energy_then_latency(frame, us_col="us", watts_col="watts"):
     """Order by package energy, then by latency.
 
@@ -128,7 +178,9 @@ class TuneResult(tuple):
 
 
 def attach_power_columns(df, results):
-    """Add watts and tflops_per_w when a tuner result frame does not already have them."""
+    """Add watts and tflops_per_w on a power tune. Latency frames stay unchanged."""
+    if not power_selection_enabled():
+        return df
     if df is None or not hasattr(df, "columns"):
         return df
     if len(df) != len(list(results)):
@@ -172,14 +224,27 @@ def attach_power_columns(df, results):
     return out
 
 
-def sort_frame_for_selection(df):
-    """Order rows so the preferred kernel is first. Power mode uses TFLOP/s/W when present."""
+def sort_frame_for_selection(df, select_power=None):
+    """Order rows so the preferred kernel is first.
+
+    Power mode uses ``us * watts`` (the same key as ``selection_rank``). A
+    frame that recorded ``tflops_per_w`` and not watts falls back to that
+    column. Latency mode, and a power frame with neither column, uses ``us``.
+    """
+    if select_power is None:
+        select_power = power_selection_enabled()
     if (
-        power_selection_enabled()
+        select_power
+        and "watts" in df.columns
+        and df["watts"].notna().any()
+    ):
+        return sort_by_energy_then_latency(df)
+    if (
+        select_power
         and "tflops_per_w" in df.columns
         and df["tflops_per_w"].notna().any()
     ):
-        return df.sort_values("tflops_per_w", ascending=False, kind="stable")
+        return df.sort_values("tflops_per_w", ascending=False, kind="mergesort")
     if "us" in df.columns:
-        return df.sort_values("us", kind="stable")
+        return df.sort_values("us", kind="mergesort")
     return df

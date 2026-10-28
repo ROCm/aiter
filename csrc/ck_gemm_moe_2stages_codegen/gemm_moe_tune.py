@@ -437,53 +437,38 @@ def rank_moe_pairs(profile_df, select_power: bool):
     """Rank paired MoE candidates.
 
     Power mode orders by stage energy ``us1*watts1 + us2*watts2`` (stage 2
-    contributes only when it actually ran). Latency mode orders by ``us``.
-    Unmeasured rows sort last. ``rank`` 1 is the winner for that ordering.
+    contributes only when it actually ran), using the shared selection key.
+    Latency mode orders by ``us``. Unmeasured rows sort last. ``rank`` 1 is
+    the winner for that ordering.
     """
+    from aiter.utility.tune_result import sort_by_energy_then_latency, stage_energy
+
     frame = profile_df.copy()
     us1 = _numeric_column(frame, "us1")
     us2 = _numeric_column(frame, "us2", default=0.0).fillna(0.0)
     watts1 = _numeric_column(frame, "watts1")
     watts2 = _numeric_column(frame, "watts2")
-    stage2_energy = us2 * watts2
-    stage2_energy = stage2_energy.where(us2 > 0, 0.0)
-    stage2_energy = stage2_energy.where(watts2.notna() | (us2 <= 0), float("nan"))
-    energy = us1 * watts1 + stage2_energy
-    frame["energy"] = energy.round(1)
+    energy = [
+        stage_energy(a, b) + stage_energy(c, d)
+        for a, b, c, d in zip(us1, watts1, us2, watts2, strict=True)
+    ]
+    frame["energy"] = pd.Series(energy, index=frame.index).round(1)
     us = _numeric_column(frame, "us")
     if us.isna().all() and "us1" in frame.columns:
         us = us1
-    mean_watts = energy / us.replace(0, pd.NA)
+        frame["us"] = us
+    mean_watts = frame["energy"] / us.replace(0, pd.NA)
     frame["watts"] = mean_watts.round(3)
     if "tflops" in frame.columns:
         tflops = pd.to_numeric(frame["tflops"], errors="coerce")
         frame["tflops_per_w"] = (tflops / mean_watts).round(6)
-    sort_col = "energy" if select_power else "us"
-    if sort_col not in frame.columns:
-        sort_col = "us"
-    frame = frame.sort_values(sort_col, kind="mergesort", na_position="last")
+    if select_power:
+        frame = sort_by_energy_then_latency(frame)
+    else:
+        frame = frame.sort_values("us", kind="mergesort", na_position="last")
     frame = frame.reset_index(drop=True)
     frame.insert(0, "rank", range(1, len(frame) + 1))
     return frame
-
-
-def _candidate_beats(current, challenger, select_power: bool) -> bool:
-    """True when challenger replaces current.
-
-    Latency mode keeps the lower ``us``. Power mode keeps the lower
-    ``us * package watts``. Equal rank keeps the candidate already chosen.
-    """
-    if current is None:
-        return True
-    from aiter.utility.tune_result import selection_rank
-
-    current_rank = selection_rank(
-        current.get("us"), current.get("watts", float("nan")), select_power
-    )
-    challenger_rank = selection_rank(
-        challenger.get("us"), challenger.get("watts", float("nan")), select_power
-    )
-    return challenger_rank < current_rank
 
 
 def _select_mxfp4_accuracy_promotion(candidates, performance_finalists):
@@ -6129,13 +6114,13 @@ class FmoeTuner(TunerCommon):
                     )
 
                     if power_selection_enabled(getattr(args, "select", None)):
-                        from aiter.utility.package_power import measure_package_watts
+                        from aiter.utility.package_power import record_package_watts
 
                         device_index = torch.cuda.current_device()
-                        watts_flat = measure_package_watts(
+                        watts_flat = record_package_watts(
                             _flat_seq, device_index=device_index
                         )
-                        watts_nf = measure_package_watts(
+                        watts_nf = record_package_watts(
                             _nf_seq, device_index=device_index
                         )
                         cost_flat = efficiency_cost(us_flat_e2e, watts_flat)
@@ -6776,7 +6761,9 @@ class GroupedFmoeTuner(FmoeTuner):
                         f"us={us}{watt_text}",
                         flush=True,
                     )
-                    if _candidate_beats(best, candidate, select_power):
+                    from aiter.utility.tune_result import candidate_beats
+
+                    if candidate_beats(best, candidate, select_power):
                         best = candidate
                 except Exception as exc:  # noqa: BLE001
                     failures.append(f"tile_m={candidate['tile_m']}: {exc}")
@@ -8537,7 +8524,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     f"us={us}{watt_text}",
                     flush=True,
                 )
-                if _candidate_beats(best, candidate, select_power):
+                from aiter.utility.tune_result import candidate_beats
+
+                if candidate_beats(best, candidate, select_power):
                     best = candidate
                 if fast_scan:
                     successful.append(candidate)
@@ -8556,11 +8545,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if timeout > 0:
                     signal.alarm(0)
         if fast_scan and successful:
-            finalist_count = max(1, int(getattr(args, "fast_scan_finalists", 5)))
+            from aiter.utility.tune_result import measure_all_accurate
+
+            shortlist = max(1, int(getattr(args, "fast_scan_finalists", 5)))
+            finalist_count = measure_all_accurate(
+                select_power, shortlist, len(successful)
+            )
             if select_power:
                 # A power winner can sit outside the latency shortlist, same as
                 # the hipBLASLt accurate pass timing every heuristic.
-                finalist_count = len(successful)
                 print(
                     f"[mxfp4-port] select=power: retiming all {finalist_count} "
                     "accurate candidates",

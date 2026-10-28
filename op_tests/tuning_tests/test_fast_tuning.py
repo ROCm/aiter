@@ -1011,15 +1011,15 @@ class TestMoePowerRanking(unittest.TestCase):
 
 class TestPowerSelectionGaps(unittest.TestCase):
     def test_candidate_beats_uses_energy_only_in_power_mode(self):
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import _candidate_beats
+        from aiter.utility.tune_result import candidate_beats
 
         hot = {"us": 10.0, "watts": 1000.0}
         cool = {"us": 20.0, "watts": 200.0}
-        self.assertTrue(_candidate_beats(hot, cool, True))
-        self.assertFalse(_candidate_beats(cool, hot, True))
-        self.assertFalse(_candidate_beats(hot, cool, False))
-        self.assertTrue(_candidate_beats(hot, {"us": 9.0, "watts": 5000.0}, False))
-        self.assertTrue(_candidate_beats(None, hot, True))
+        self.assertTrue(candidate_beats(hot, cool, True))
+        self.assertFalse(candidate_beats(cool, hot, True))
+        self.assertFalse(candidate_beats(hot, cool, False))
+        self.assertTrue(candidate_beats(hot, {"us": 9.0, "watts": 5000.0}, False))
+        self.assertTrue(candidate_beats(None, hot, True))
 
     def test_grouped_power_keeps_lower_energy_tile(self):
         import pandas as pd
@@ -1161,6 +1161,36 @@ class TestPowerSelectionGaps(unittest.TestCase):
         self.assertEqual(list(same_key["name"]), ["fast", "slow"])
         self.assertEqual(ordered.iloc[0]["name"], "cool")
 
+    def test_latency_frame_does_not_gain_watts(self):
+        import pandas as pd
+
+        from aiter.utility.tune_result import attach_power_columns
+
+        frame = pd.DataFrame([{"us": 10.0, "tflops": 100.0}])
+        previous = os.environ.pop("AITER_SELECT", None)
+        try:
+            out = attach_power_columns(frame, [SimpleNamespace(watts=400.0)])
+        finally:
+            if previous is not None:
+                os.environ["AITER_SELECT"] = previous
+        self.assertNotIn("watts", out.columns)
+
+    def test_selection_prefers_energy_over_tflops_per_watt(self):
+        import pandas as pd
+
+        from aiter.utility.tune_result import sort_frame_for_selection
+
+        # Same FLOPs would make the two orders agree. Different tflops here
+        # shows the rank is us*watts, not the stored efficiency column.
+        frame = pd.DataFrame(
+            [
+                {"name": "hot", "us": 10.0, "watts": 1000.0, "tflops_per_w": 9.0},
+                {"name": "cool", "us": 20.0, "watts": 200.0, "tflops_per_w": 1.0},
+            ]
+        )
+        ordered = sort_frame_for_selection(frame, select_power=True)
+        self.assertEqual(list(ordered["name"]), ["cool", "hot"])
+
     def test_power_path_expands_per_device_and_rejects_one_file(self):
         from aiter.utility.package_power import (
             power_input_path,
@@ -1243,7 +1273,16 @@ class TestPowerTableSeparation(unittest.TestCase):
         self.assertEqual(stamped.iloc[0]["power_cap_w"], "1400")
         self.assertEqual(
             stub.columns,
-            ["M", "us", "select", "perf_level", "power_cap_w", "sclk_max_mhz"],
+            [
+                "M",
+                "us",
+                "watts",
+                "tflops_per_w",
+                "select",
+                "perf_level",
+                "power_cap_w",
+                "sclk_max_mhz",
+            ],
         )
         latency = TunerCommon._stamp_power_rows(
             SimpleNamespace(columns=["M", "us"]),
@@ -1279,7 +1318,7 @@ class TestPowerTableSeparation(unittest.TestCase):
     def test_merge_refuses_power_and_latency_rows_for_one_shape(self):
         import pandas as pd
 
-        from aiter.jit.core import AITER_CONFIG
+        from aiter.utility.power_configs import power_merge_conflict
 
         mixed = pd.DataFrame(
             [
@@ -1287,18 +1326,18 @@ class TestPowerTableSeparation(unittest.TestCase):
                 {"M": 1, "us": 9.0, "select": "power", "power_cap_w": "1400"},
             ]
         )
-        self.assertIn("latency row", AITER_CONFIG._power_merge_conflict(mixed, ["M"]))
+        self.assertIn("latency row", power_merge_conflict(mixed, ["M"]))
         caps = pd.DataFrame(
             [
                 {"M": 1, "us": 5.0, "select": "power", "power_cap_w": "1400"},
                 {"M": 1, "us": 9.0, "select": "power", "power_cap_w": "1000"},
             ]
         )
-        self.assertIn("power_cap_w", AITER_CONFIG._power_merge_conflict(caps, ["M"]))
+        self.assertIn("power_cap_w", power_merge_conflict(caps, ["M"]))
         same = caps.assign(power_cap_w="1400")
-        self.assertIsNone(AITER_CONFIG._power_merge_conflict(same, ["M"]))
+        self.assertIsNone(power_merge_conflict(same, ["M"]))
         latency_only = pd.DataFrame([{"M": 1, "us": 5.0}, {"M": 1, "us": 6.0}])
-        self.assertIsNone(AITER_CONFIG._power_merge_conflict(latency_only, ["M"]))
+        self.assertIsNone(power_merge_conflict(latency_only, ["M"]))
 
     def test_power_overlay_replaces_only_covered_shapes(self):
         import tempfile
@@ -1306,6 +1345,7 @@ class TestPowerTableSeparation(unittest.TestCase):
         import pandas as pd
 
         from aiter.jit.core import AITER_CONFIG, AITER_CONFIGS
+        from aiter.utility.power_configs import _overlay_power_tables
 
         with tempfile.TemporaryDirectory() as tmp:
             latency_file = f"{tmp}/latency.csv"
@@ -1333,8 +1373,8 @@ class TestPowerTableSeparation(unittest.TestCase):
                 ),
                 mock.patch("tempfile.gettempdir", return_value=tmp),
             ):
-                merged_path = AITER_CONFIGS._overlay_power_tables(
-                    latency_file, [power_file], "tuned_demo", None
+                merged_path = _overlay_power_tables(
+                    AITER_CONFIGS, latency_file, [power_file], "tuned_demo", None
                 )
             merged = pd.read_csv(merged_path).sort_values("M")
         self.assertEqual(list(merged["kernel"]), ["cool", "only_latency"])
