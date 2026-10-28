@@ -571,7 +571,7 @@ def compile_gfx1250_pa_decode(
     # Every argument that reducer-fed and direct-output kernels read fits in
     # the 30 user SGPRs (120 bytes) that preload kernel arguments, ahead of
     # the merge-only arguments.
-    @flyc.kernel(name=kernel_name, known_block_size=(128, 1, 1))
+    @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
         work: fx.Pointer,
         table: fx.Pointer,
@@ -601,8 +601,8 @@ def compile_gfx1250_pa_decode(
             # Empty sequences have no attention mass; clear this CTA's rows.
             rows = fx.recast_iter(t.q_dtype, dst)
             tid = fx.Int32(gpu.thread_id("x"))
-            for i in range_constexpr((t.rows * t.head_dim + 127) // 128):
-                index = i * 128 + tid
+            for i in range_constexpr(-(-t.rows * t.head_dim // t.BLOCK_THREADS)):
+                index = i * t.BLOCK_THREADS + tid
                 if index < t.rows * t.head_dim:
                     row, d = index // t.head_dim, index % t.head_dim
                     kv_query = fx.Int32(gpu.block_id("y"))
@@ -774,7 +774,7 @@ def compile_gfx1250_pa_decode(
             ),
         ).launch(
             grid=(grid_x, kv_heads * t.query_splits, 1),
-            block=(128, 1, 1),
+            block=(t.BLOCK_THREADS, 1, 1),
             stream=stream,
             cluster=(t.cluster_merge, 1, 1) if t.cluster_merge else None,
         )
