@@ -144,6 +144,25 @@ def _test_gemm_gfx1250(dtype, M, N, K):
         "tuned": lambda: gemm_a4w4(xq, wq, xs, ws, dtype=dtype),
         "asm": lambda: gemm_mxfp4_asm(xq, wq, xs, ws, dtype=dtype, a_preshuffle=False),
     }
+    if os.environ.get("AITER_GEMM_A4W4_TDM") == "1" and _FLYDSL_AVAILABLE:
+        # The grouped-MoE TDM pipeline as a dense GEMM; it quantizes A itself
+        # into its own layout, outside the timed call.
+        from aiter.ops.flydsl.a4w4_tdm_gemm_gfx1250 import (
+            gemm_a4w4_tdm,
+            prepare_a4w4_tdm_a,
+            prepare_a4w4_tdm_b_scale,
+            tdm_launch_error,
+        )
+
+        tdm_err = tdm_launch_error(M, N, K)
+        if tdm_err is None:
+            xq_tdm, xs_tdm = prepare_a4w4_tdm_a(x)
+            ws_tdm = prepare_a4w4_tdm_b_scale(ws_raw.view(torch.uint8)[:N])
+            candidates["tdm"] = lambda: gemm_a4w4_tdm(
+                xq_tdm, xs_tdm, wq, ws_tdm, dtype=dtype
+            )
+        else:
+            aiter.logger.info(f"tdm skipped for M={M} N={N} K={K}: {tdm_err}")
     config = _a4w4_mxscale_config(M, N, K) or ("asm", "")
     # An asm pick, or the other kernel family, would hide the coverage an off-grid M is for.
     # Without FlyDSL there is no family to check: both candidates still verify ASM.

@@ -97,6 +97,10 @@ if INTERLEAVED_LDS_LOAD not in (0, 1):
     raise ValueError("AITER_FLYDSL_INTERLEAVED_LDS_LOAD must be 0 or 1")
 if LDS_WAR_ORDER not in (0, 1):
     raise ValueError("AITER_FLYDSL_LDS_WAR_ORDER must be 0 or 1")
+# A loads issued before the first B load / between two B loads of a slot.
+LDS_WAR_B_START = int(os.environ.get("AITER_FLYDSL_LDS_WAR_B_START", "1"))
+LDS_WAR_B_STEP = int(os.environ.get("AITER_FLYDSL_LDS_WAR_B_STEP", "2"))
+LDS_WAR_PIN_SCALE = int(os.environ.get("AITER_FLYDSL_LDS_WAR_PIN_SCALE", "1"))
 if LDS_SOA_LOAD_INTERLEAVE not in (None, 0, 1):
     raise ValueError("LDS_SOA_LOAD_INTERLEAVE must be 0 or 1")
 if FORCE_1X4_CLUSTER not in (0, 1):
@@ -244,6 +248,9 @@ def launch_gemm_a8w4_tdm(
     # Arithmetic, not `and`: the AST rewriter moves a boolean operand into a
     # nested function, which hides the global from the JIT cache key.
     war_order_on = interleaved_lds_load_on * LDS_WAR_ORDER
+    war_b_start = LDS_WAR_B_START + 0
+    war_b_step = LDS_WAR_B_STEP + 0
+    war_pin_scale = war_order_on * LDS_WAR_PIN_SCALE * SUPPORT_EXPLICIT_VGPR_PARTITION
     WMMA_M = 16
     WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
@@ -310,6 +317,9 @@ def launch_gemm_a8w4_tdm(
         planar_lds_on,
         interleaved_lds_load_on,
         war_order_on,
+        war_b_start,
+        war_b_step,
+        war_pin_scale,
         row_major_ascale,
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
@@ -482,6 +492,10 @@ def launch_gemm_a8w4_tdm(
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     if war_order_on:
         _interleaved_lds_load += "_warorder"
+        if (war_b_start, war_b_step) != (1, 2):
+            _interleaved_lds_load += f"_b{war_b_start}x{war_b_step}"
+        if not war_pin_scale:
+            _interleaved_lds_load += "_nopinsc"
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
@@ -1282,12 +1296,15 @@ def launch_gemm_a8w4_tdm(
                     fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
                     reg += WMMA_VECTOR_DWORDS
                 assert reg <= 256 + (slot_idx + 1) * 128
-            return RmemSlot(
-                a=a,
-                b=b,
-                sa=fx.make_rmem_tensor(SA_WIDTH, fx.Int32),
-                sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
-            )
+            sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
+            sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
+            if const_expr(war_pin_scale):
+                # Unpinned, the allocator gives the next slot's A scale a
+                # register an in-flight WMMA still reads. SB stays unpinned:
+                # its loads merge into differently paired ds_load_2addr ops per
+                # k128, and no fixed placement keeps all of them even-aligned.
+                fx.set_register(sa, register_class=fx.rocdl.VGPR, start=240 + slot_idx * 8)
+            return RmemSlot(a=a, b=b, sa=sa, sb=sb)
 
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
@@ -1297,10 +1314,13 @@ def launch_gemm_a8w4_tdm(
             """Interleaved A/B loads, B by its last read in the previous k128.
 
             A slot is refilled right after the WMMAs that last read it, so a DS
-            load into a register one of the newest WMMAs still reads costs a
-            full s_wait_alu va_vdst(0) drain of the WMMA pipe. A and B keep
-            alternating between their planar LDS segments. Scales come last,
-            in index order so adjacent dwords still merge into ds_load_2addr.
+            load into a register a recent WMMA still reads costs an s_wait_alu
+            va_vdst stall. Every row reads all of B, so B goes in last-read
+            order, one B after the first ``war_b_start`` A loads and then every
+            ``war_b_step`` A loads; A and B still alternate between their
+            planar LDS segments, which matters more than a later B. Scales
+            come last, in index order so adjacent dwords merge into
+            ds_load_2addr.
             """
             last_b = {}
             pos = 0
@@ -1311,11 +1331,18 @@ def launch_gemm_a8w4_tdm(
                     pos += 1
             b_order = sorted(last_b, key=lambda wn: last_b[wn])
             order = []
-            for i in range_constexpr(max(wmma_m_rep, wmma_n_rep)):
-                if const_expr(i < wmma_m_rep):
-                    order.append(("a", i))
-                if const_expr(i < wmma_n_rep):
-                    order.append(("b", b_order[i]))
+            next_b = 0
+            for i in range_constexpr(wmma_m_rep):
+                order.append(("a", i))
+                if const_expr(
+                    next_b < wmma_n_rep
+                    and i + 1 >= war_b_start
+                    and (i + 1 - war_b_start) % war_b_step == 0
+                ):
+                    order.append(("b", b_order[next_b]))
+                    next_b += 1
+            for j in range_constexpr(next_b, wmma_n_rep):
+                order.append(("b", b_order[j]))
             return (
                 order
                 + [("sa", i) for i in range(sa_pairs)]
