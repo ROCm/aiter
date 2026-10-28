@@ -114,7 +114,7 @@ class GemmConfigPruner:
                 and config["m_waves"] == 2
                 and config["n_waves"] == 4
                 and config["k_waves"] == 1
-                and config["group_m"] == 0
+                and config["group_m"] in (0, 4)
             )
             near_cu_rect = (
                 iou >= 0.90 and tiles * 4 >= num_cus * 3 and tiles * 4 <= num_cus * 5
@@ -130,6 +130,7 @@ class GemmConfigPruner:
                 and config["split_k"] <= max_split_k
                 and (
                     config["group_m"] == 0
+                    or validated_half_tile
                     or (
                         config["block_m"],
                         config["block_n"],
