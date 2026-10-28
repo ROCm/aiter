@@ -56,8 +56,6 @@ def _fused_qknorm_idxrqknorm_hip(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
-    q_fp8_out: Tensor | None = None,
-    q_scale: Tensor | None = None,
 ) -> None:
     pass
 
@@ -89,8 +87,6 @@ def fused_qknorm_idxrqknorm(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
-    q_fp8_out: Tensor | None = None,
-    q_scale: Tensor | None = None,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
@@ -103,8 +99,8 @@ def fused_qknorm_idxrqknorm(
     #   no k_scale/v_scale.
     # index_cache_dtype="mxfp4": index_cache is whole contiguous pages; only the index-K write
     #   changes.
-    # q_fp8_out [T, num_heads * 128] e4m3 (insert mode): e4m3(bf16(q) / q_scale), q_scale a
-    #   [1] float32 device tensor (None = 1.0); with q_out None the bf16 q is not written.
+    # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3, saturating,
+    #   written instead of the bf16 q (as index_q_out).
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
@@ -166,6 +162,4 @@ def fused_qknorm_idxrqknorm(
         v_scale,
         asm_layout,
         skip_index_branch,
-        q_fp8_out,
-        q_scale,
     )
