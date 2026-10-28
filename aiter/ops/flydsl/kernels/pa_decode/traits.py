@@ -967,7 +967,15 @@ class Gfx1250Traits:
 
     @property
     def p_bytes(self):
-        return 16 * self.v_stride
+        return self.p_tiles * 16 * self.v_stride
+
+    @property
+    def p_tiles(self):
+        return self.m_tiles if self.fp8_batched_softmax else 1
+
+    @property
+    def fp8_batched_softmax(self):
+        return self.fp8_multi_tile and self.head_dim == 128 and self.async_page
 
     @property
     def async_page(self):
@@ -1014,7 +1022,7 @@ class Gfx1250Traits:
 
     @property
     def total_bytes(self):
-        return self.stats_offset + 576
+        return self.stats_offset + self.p_tiles * 512 + 64
 
     @property
     def use_tdm(self):

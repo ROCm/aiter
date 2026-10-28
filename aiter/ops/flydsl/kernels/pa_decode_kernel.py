@@ -520,6 +520,9 @@ def compile_gfx1250_pa_decode(
         context_partition_size=context_partition_size,
     )
 
+    if t.fp8_batched_softmax:
+        kernel_name += f"_sm{t.m_tiles}"
+
     @flyc.kernel(name=kernel_name, known_block_size=(128, 1, 1))
     def pa_decode_tile_kernel(
         pmax: fx.Pointer,
