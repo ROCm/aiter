@@ -147,13 +147,18 @@ def dry_run(
         )
 
     real_getitem = torch.Tensor.__getitem__
+    real_contiguous = torch.Tensor.contiguous
+
+    # A handful of torch's Tensor methods take a device guard in their own
+    # binding, before the call reaches the dispatcher and the fake with it.
+    # With the GPUs hidden that guard initializes HIP and raises, so the ones
+    # a replay's host code reaches stand in below. Every other op is bound
+    # straight to the dispatcher and needs nothing.
 
     def getitem(tensor, index):
-        """``tensor[index]``, which torch takes a device guard for before it
-        dispatches: with the GPUs hidden that guard initializes HIP and
-        raises, while every other op reaches the fake. Basic indexing is
-        replayed on a meta tensor of the same layout and taken again of this
-        one, so the view keeps the storage and offset ``data_ptr`` reads."""
+        """``tensor[index]``. Basic indexing is replayed on a meta tensor of
+        the same layout and taken again of this one, so the view keeps the
+        storage and offset ``data_ptr`` reads."""
         if not isinstance(tensor, FakeTensor) or tensor.device.type != "cuda":
             return real_getitem(tensor, index)
         items = index if isinstance(index, tuple) else (index,)
@@ -172,6 +177,13 @@ def dry_run(
             # without the guard.
             return torch.ops.aten.index(tensor, list(items))
         return real_getitem(tensor, index)
+
+    def contiguous(tensor, memory_format=torch.contiguous_format):
+        """``tensor.contiguous()``, whose binding takes the guard only on the
+        copy it answers an operand of another layout with."""
+        if not isinstance(tensor, FakeTensor) or tensor.device.type != "cuda":
+            return real_contiguous(tensor, memory_format=memory_format)
+        return torch.ops.aten.contiguous(tensor, memory_format=memory_format)
 
     convert, tensor_cls, _, _ = jit_core._pybind_develop_hooks()
     cached = (
@@ -209,6 +221,7 @@ def dry_run(
             (graph_alloc, "_persistent_pool", lambda _index: None),
             (torch.Tensor, "data_ptr", data_ptr),
             (torch.Tensor, "__getitem__", getitem),
+            (torch.Tensor, "contiguous", contiguous),
             (torch.Tensor, "record_stream", lambda *_a, **_k: None),
             (chip_info, "_detect_native", lambda: [arch]),
             (
