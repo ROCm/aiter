@@ -111,7 +111,7 @@ Agent 3
         from codegen import gen_instances_gfx1250 as gen
         from opus_gemm_common import gfx1250_4wave_co_kernels_declared
 
-        k = gfx1250_4wave_co_kernels_declared[21016]
+        k = gfx1250_4wave_co_kernels_declared[496]
         cg = SimpleNamespace(
             impl_path="unused", _host_instantiations=[], _device_instantiations=[]
         )
