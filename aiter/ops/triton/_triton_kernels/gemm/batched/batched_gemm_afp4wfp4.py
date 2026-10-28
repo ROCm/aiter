@@ -204,8 +204,7 @@ def _batched_gemm_afp4_wfp4_kernel(
                 b_scales = tl.load(b_scale_ptrs)
             else:
                 scale_mask = offs_scale_k[None, :] < (
-                    2 * K // SCALE_GROUP_SIZE
-                    - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
                 a_scales = tl.load(a_scale_ptrs, mask=scale_mask, other=127)
                 b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
