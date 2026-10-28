@@ -12,6 +12,7 @@ struct opus_gemm_bpreshuffle_wave_interleave_traits {
     static constexpr int T_N = WaveN;
     static constexpr int T_K = 1;
     static constexpr int BLOCK_SIZE = T_M * T_N * WARP_SIZE;
+    static constexpr int NUM_WAVES = BLOCK_SIZE / WARP_SIZE;
 
     // MFMA geometry and matrix/scale copy widths.
     static constexpr int W_M = 16;
@@ -37,6 +38,11 @@ struct opus_gemm_bpreshuffle_wave_interleave_traits {
     static constexpr int HALF_N = B_N / N_HALVES;
     static constexpr int E_M = HALF_M / (T_M * W_M);
     static constexpr int E_N = HALF_N / (T_N * W_N);
+    static constexpr int LDS_WAVE_BYTES = WARP_SIZE * VEC_B;
+    static constexpr int B_K_PER_WAVE_LOAD = (WARP_SIZE / W_N) * VEC_B;
+    static constexpr int B_N_REPEATS = HALF_N / (NUM_WAVES * W_N);
+    static constexpr int B_K_REPEATS = K_STAGE / B_K_PER_WAVE_LOAD;
+    static constexpr int B_WAVE_N_SLOT_STRIDE = E_N * (B_N_REPEATS == 1 ? 1 : B_K_REPEATS);
 
     // K specialization, tile ordering, and global-memory cache policies.
     static constexpr int FIXED_K = FixedK;
@@ -53,10 +59,14 @@ struct opus_gemm_bpreshuffle_wave_interleave_traits {
     static constexpr int B_SLOT = HALF_N * K_STAGE;
     static constexpr int MATRIX_BYTES = LDS_STAGES * (M_HALVES * A_SLOT + N_HALVES * B_SLOT);
 
-    // K=0 A scales stay in registers; later groups occupy LDS.
+    // K=0 A scales stay in registers; later groups contain one word per M lane/wave.
     static constexpr int SCALE_GROUPS = 128;
-    static constexpr bool PACKED_SCALE = E_M == SCALE_WORD_BYTES;
-    static constexpr int SFA_BYTES = (SCALE_GROUPS - 1) * B_M;
+    static constexpr int SFA_M_VECTORS = M_HALVES * T_M * SCALE_WORD_BYTES;
+    static constexpr int SFA_K_COLUMNS_PER_WAVE = WARP_SIZE / SFA_M_VECTORS;
+    static constexpr int SFA_K_COLUMNS_PER_PASS = NUM_WAVES * SFA_K_COLUMNS_PER_WAVE;
+    static constexpr int SFA_PASSES_PER_CACHE_PANEL = (SCALE_GROUPS - 1 + SFA_K_COLUMNS_PER_PASS - 1) / SFA_K_COLUMNS_PER_PASS;
+    static constexpr int SFA_PANEL_PITCH = M_HALVES * T_M * W_M * SCALE_WORD_BYTES;
+    static constexpr int SFA_BYTES = (SCALE_GROUPS - 1) * SFA_PANEL_PITCH;
     static constexpr int SFB_BYTES = SCALE_GROUPS * N_HALVES;
     static constexpr int LDS_BYTES = MATRIX_BYTES + SFA_BYTES + SFB_BYTES;
 
@@ -73,6 +83,8 @@ struct opus_gemm_bpreshuffle_wave_interleave_traits {
     static_assert(!XcdOrder || GroupM > 0);
     static_assert(CacheA == 0 || CacheA == 1 || CacheA == 17);
     static_assert(CacheB == 0 || CacheB == 1 || CacheB == 17);
+    static_assert(E_M <= SCALE_WORD_BYTES && W_M == VEC_SCALE_A);
+    static_assert(B_STEPS == B_N_REPEATS * B_K_REPEATS);
     static_assert(LDS_BYTES <= 163840);
     static_assert(B_M * C_STRIDE * 2 <= LDS_BYTES);
 };

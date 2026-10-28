@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstdint>
 #include <opus/hip_minimal.hpp>
 #include <opus/opus.hpp>
 #include "../opus_gemm_utils.cuh"
@@ -18,50 +19,45 @@ __device__ inline int a_offset(int row, int col) {
     return offset ^ (((offset % (T::W_M * T::K_STAGE)) >> 8) << 4);
 }
 
-template<class T>
-__device__ inline int b_offset(int row, int col) {
-    constexpr int n_lanes = T::WARP_SIZE / (T::K_STAGE / T::VEC_B);
-    return (row / n_lanes) * (T::WARP_SIZE * T::VEC_B) +
-        (row % n_lanes) * T::VEC_B + (col / T::VEC_B) * (n_lanes * T::VEC_B);
-}
-
 // A global-memory vectors use the LDS XOR swizzle.
 template<class T>
-__device__ inline auto make_layout_ga(int lane_id, int wave_id, int stride_a) {
+__device__ inline auto make_layout_ga(int lane_id, int wave_id_m, int wave_id_n, int stride_a) {
     constexpr int threads_k = T::K_STAGE / T::VEC_A;
     constexpr int threads_m = T::WARP_SIZE / threads_k;
 
     constexpr auto ga_block_shape = opus::make_tuple(
         opus::number<T::A_STEPS>{},
-        opus::number<T::BLOCK_SIZE / T::WARP_SIZE>{},
+        opus::number<T::T_M>{},
+        opus::number<T::T_N>{},
         opus::number<threads_m>{},
         opus::number<threads_k>{},
         opus::number<T::VEC_A>{});
     constexpr auto ga_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
     return opus::make_layout<T::VEC_A>(
         ga_block_shape,
         opus::unfold_x_stride(ga_block_dim, ga_block_shape, opus::tuple{stride_a, 1_I}),
-        opus::unfold_p_coord(ga_block_dim, opus::tuple{wave_id, lane_id / threads_k, lane_id % threads_k}));
+        opus::unfold_p_coord(ga_block_dim, opus::tuple{wave_id_m, wave_id_n, lane_id / threads_k, lane_id % threads_k}));
 }
 
 // LDS producer offsets exclude the lane offset supplied by async_load.
 template<class T>
-__device__ inline auto make_layout_sa(int wave_id) {
+__device__ inline auto make_layout_sa(int wave_id_m, int wave_id_n) {
     constexpr auto sa_block_shape = opus::make_tuple(
         opus::number<T::A_STEPS>{},
-        opus::number<T::BLOCK_SIZE / T::WARP_SIZE>{},
+        opus::number<T::T_M>{},
+        opus::number<T::T_N>{},
         opus::number<T::VEC_A>{});
     constexpr auto sa_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}));
 
     return opus::make_layout<T::VEC_A>(
         sa_block_shape,
         opus::unfold_x_stride(sa_block_dim, sa_block_shape, opus::tuple{opus::number<T::WARP_SIZE * T::VEC_A>{}, 1_I}),
-        opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id}));
+        opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id_m, wave_id_n}));
 }
 
 // A LDS -> MFMA register layouts.
@@ -92,78 +88,61 @@ __device__ inline auto make_layout_ra(int lane_id, int wave_id_m) {
 
 // B global-memory coordinates follow the N16/K64 preshuffle.
 template<class T>
-__device__ inline auto make_layout_gb(int lane_id, int wave_id, int stride_b) {
-    constexpr int n_lanes = T::WARP_SIZE / (T::K_STAGE / T::VEC_B);
-    constexpr int waves_per_n_group = T::W_N / n_lanes;
-    constexpr int k_vectors_per_half = T::WARP_SIZE / T::W_N;
-    constexpr int lanes_per_k_half = n_lanes * k_vectors_per_half;
-
+__device__ inline auto make_layout_gb(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
     constexpr auto gb_block_shape = opus::make_tuple(
-        opus::number<T::B_STEPS>{},
-        opus::number<T::BLOCK_SIZE / (waves_per_n_group * T::WARP_SIZE)>{},
-        opus::number<waves_per_n_group>{},
-        opus::number<T::WARP_SIZE / lanes_per_k_half>{},
-        opus::number<k_vectors_per_half>{},
-        opus::number<n_lanes>{},
+        opus::number<T::B_N_REPEATS>{},
+        opus::number<T::T_M>{},
+        opus::number<T::T_N>{},
+        opus::number<T::B_K_REPEATS>{},
+        opus::number<T::WARP_SIZE>{},
         opus::number<T::VEC_B>{});
     constexpr auto gb_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
 
     return opus::make_layout<T::VEC_B>(
         gb_block_shape,
-        opus::unfold_x_stride(gb_block_dim, gb_block_shape,
-            opus::tuple{stride_b * T::W_N, opus::number<n_lanes * T::VEC_B>{}, opus::number<T::W_N * T::VEC_B>{}, 1_I}),
-        opus::unfold_p_coord(gb_block_dim,
-            opus::tuple{wave_id / waves_per_n_group, wave_id % waves_per_n_group, lane_id / lanes_per_k_half, (lane_id / n_lanes) % k_vectors_per_half, lane_id % n_lanes}));
+        opus::unfold_x_stride(gb_block_dim, gb_block_shape, opus::tuple{stride_b * T::W_N, 1_I}),
+        opus::unfold_p_coord(gb_block_dim, opus::tuple{wave_id_m, wave_id_n, lane_id}));
 }
 
 template<class T>
-__device__ inline auto make_layout_sb(int wave_id) {
+__device__ inline auto make_layout_sb(int wave_id_m, int wave_id_n) {
     constexpr auto sb_block_shape = opus::make_tuple(
         opus::number<T::B_STEPS>{},
-        opus::number<T::BLOCK_SIZE / T::WARP_SIZE>{},
+        opus::number<T::T_M>{},
+        opus::number<T::T_N>{},
         opus::number<T::VEC_B>{});
     constexpr auto sb_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}));
 
     return opus::make_layout<T::VEC_B>(
         sb_block_shape,
-        opus::unfold_x_stride(sb_block_dim, sb_block_shape, opus::tuple{opus::number<T::WARP_SIZE * T::VEC_B>{}, 1_I}),
-        opus::unfold_p_coord(sb_block_dim, opus::tuple{wave_id}));
+        opus::unfold_x_stride(sb_block_dim, sb_block_shape, opus::tuple{opus::number<T::LDS_WAVE_BYTES>{}, 1_I}),
+        opus::unfold_p_coord(sb_block_dim, opus::tuple{wave_id_m, wave_id_n}));
 }
 
 template<class T>
 __device__ inline auto make_layout_rb(int lane_id, int wave_id_n) {
-    constexpr int n_lanes = T::WARP_SIZE / (T::W_K / T::VEC_B);
-    constexpr int lanes_k = T::WARP_SIZE / T::W_N;
-    constexpr int chunks = T::W_N * T::W_K / (T::WARP_SIZE * T::VEC_B);
-
     constexpr auto rb_block_shape = opus::make_tuple(
         opus::number<T::E_N>{},
         opus::number<T::T_N>{},
-        opus::number<T::W_N / n_lanes>{},
-        opus::number<n_lanes>{},
-        opus::number<chunks>{},
-        opus::number<lanes_k>{},
+        opus::number<T::B_K_REPEATS>{},
+        opus::number<T::WARP_SIZE>{},
         opus::number<T::VEC_B>{});
     constexpr auto rb_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}),
         opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
     return opus::make_layout<T::VEC_B>(
         rb_block_shape,
         opus::unfold_x_stride(rb_block_dim, rb_block_shape,
-            opus::tuple{opus::number<T::W_N * T::W_K>{}, opus::number<T::E_N * T::W_N * T::W_K>{}, opus::number<n_lanes * T::W_K>{}, opus::number<T::VEC_B>{}, opus::number<n_lanes * T::VEC_B>{}, 1_I}),
-        opus::unfold_p_coord(rb_block_dim,
-            opus::tuple{wave_id_n, (lane_id % T::W_N) / n_lanes, lane_id % n_lanes, lane_id / T::W_N}));
+            opus::tuple{opus::number<T::LDS_WAVE_BYTES>{}, opus::number<T::B_WAVE_N_SLOT_STRIDE * T::LDS_WAVE_BYTES>{},
+                opus::number<T::NUM_WAVES * T::LDS_WAVE_BYTES>{}, 1_I}),
+        opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n, lane_id}));
 }
 
 // Each wave reads one scale byte for every M repeat in both matrix halves.
@@ -186,45 +165,48 @@ __device__ inline auto make_layout_gsfa_first(int lane_id, int wave_id_m) {
 }
 
 template<class T>
-__device__ inline auto make_layout_gsfa(int lane_id, int wave_id, int stride_sfa) {
-    constexpr int copies = (T::SFA_BYTES + T::BLOCK_SIZE * T::VEC_SCALE_A - 1) / (T::BLOCK_SIZE * T::VEC_SCALE_A);
+__device__ inline auto make_layout_gsfa(int lane_id, int wave_id_m, int wave_id_n, int stride_sfa) {
     constexpr auto gsfa_block_shape = opus::make_tuple(
-        opus::number<copies>{},
-        opus::number<T::BLOCK_SIZE / T::WARP_SIZE>{},
-        opus::number<T::WARP_SIZE>{},
+        opus::number<T::SFA_PASSES_PER_CACHE_PANEL>{},
+        opus::number<T::T_M>{},
+        opus::number<T::T_N>{},
+        opus::number<T::SFA_K_COLUMNS_PER_WAVE>{},
+        opus::number<T::B_M / T::VEC_SCALE_A>{},
         opus::number<T::VEC_SCALE_A>{});
     constexpr auto gsfa_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
-    auto layout = opus::make_layout<T::VEC_SCALE_A>(
+    const int m_group = (lane_id % T::SFA_M_VECTORS) / T::SCALE_WORD_BYTES;
+    const int m_vector = (m_group / T::T_M) * (T::HALF_M / T::VEC_SCALE_A)
+        + (m_group % T::T_M) * T::E_M + lane_id % T::SCALE_WORD_BYTES;
+    return opus::make_layout<T::VEC_SCALE_A>(
         gsfa_block_shape,
-        opus::unfold_x_stride(gsfa_block_dim, gsfa_block_shape, opus::tuple{opus::number<T::VEC_SCALE_A>{}, 1_I}),
-        opus::unfold_p_coord(gsfa_block_dim, opus::tuple{wave_id, lane_id}));
-    // BlockM=192 can put successive producer copies in different scale rows.
-    opus::static_for<copies>([&](auto i) {
-        constexpr int copy = decltype(i)::value;
-        const int linear = layout.offsets[copy];
-        layout.offsets[copy] = (linear / T::B_M + 1) * stride_sfa + linear % T::B_M;
-    });
-    return layout;
+        opus::unfold_x_stride(gsfa_block_dim, gsfa_block_shape, opus::tuple{stride_sfa, 1_I}),
+        opus::unfold_p_coord(gsfa_block_dim, opus::tuple{wave_id_m, wave_id_n, lane_id / T::SFA_M_VECTORS, m_vector}));
 }
 
 template<class T>
-__device__ inline auto make_layout_ssfa(int wave_id) {
-    constexpr int copies = (T::SFA_BYTES + T::BLOCK_SIZE * T::VEC_SCALE_A - 1) / (T::BLOCK_SIZE * T::VEC_SCALE_A);
+__device__ inline auto make_layout_ssfa(int lane_id, int wave_id_m, int wave_id_n) {
     constexpr auto ssfa_block_shape = opus::make_tuple(
-        opus::number<copies>{},
-        opus::number<T::BLOCK_SIZE / T::WARP_SIZE>{},
-        opus::number<T::VEC_SCALE_A>{});
+        opus::number<T::SFA_PASSES_PER_CACHE_PANEL>{},
+        opus::number<T::T_M>{},
+        opus::number<T::T_N>{},
+        opus::number<T::SFA_K_COLUMNS_PER_WAVE>{},
+        opus::number<T::M_HALVES>{},
+        opus::number<T::T_M>{},
+        opus::number<T::W_M>{},
+        opus::number<T::SCALE_WORD_BYTES>{});
     constexpr auto ssfa_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
 
-    return opus::make_layout<T::VEC_SCALE_A>(
+    const int m_group = (lane_id % T::SFA_M_VECTORS) / T::SCALE_WORD_BYTES;
+    return opus::make_layout<T::SCALE_WORD_BYTES>(
         ssfa_block_shape,
-        opus::unfold_x_stride(ssfa_block_dim, ssfa_block_shape, opus::tuple{opus::number<T::WARP_SIZE * T::VEC_SCALE_A>{}, 1_I}),
-        opus::unfold_p_coord(ssfa_block_dim, opus::tuple{wave_id}));
+        opus::unfold_x_stride(ssfa_block_dim, ssfa_block_shape, opus::tuple{opus::number<T::SFA_PANEL_PITCH>{}, 1_I}),
+        opus::unfold_p_coord(ssfa_block_dim, opus::tuple{wave_id_m, wave_id_n, lane_id / T::SFA_M_VECTORS,
+            m_group / T::T_M, m_group % T::T_M, lane_id % T::SCALE_WORD_BYTES}));
 }
 
 template<class T>
@@ -232,81 +214,16 @@ __device__ inline auto make_layout_rsfa(int lane_id, int wave_id_m) {
     constexpr auto rsfa_block_shape = opus::make_tuple(
         opus::number<T::M_HALVES>{},
         opus::number<T::T_M>{},
-        opus::number<T::E_M>{},
-        opus::number<T::W_M>{},
-        1_I);
-    constexpr auto rsfa_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
-
-    return opus::make_layout<1>(
-        rsfa_block_shape,
-        opus::unfold_x_stride(rsfa_block_dim, rsfa_block_shape, opus::tuple{1_I, 1_I}),
-        opus::unfold_p_coord(rsfa_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M}));
-}
-
-// PACKED_SCALE reads four M16 bytes per output word; offsets stay in bytes.
-template<class T>
-__device__ inline auto make_layout_sfa_repack(int lane_id, int wave_id) {
-    constexpr int words_per_group = T::B_M / T::SCALE_WORD_BYTES;
-    constexpr int rounds = (T::SCALE_GROUPS - 1) * words_per_group / T::BLOCK_SIZE + 1;
-    constexpr auto sfa_repack_block_shape = opus::make_tuple(
-        opus::number<rounds>{},
-        opus::number<T::BLOCK_SIZE / T::WARP_SIZE>{},
-        opus::number<T::WARP_SIZE / T::W_M>{},
         opus::number<T::W_M>{},
         opus::number<T::SCALE_WORD_BYTES>{});
-    constexpr auto sfa_repack_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
-
-    return opus::make_layout(
-        sfa_repack_block_shape,
-        opus::unfold_x_stride(sfa_repack_block_dim, sfa_repack_block_shape,
-            opus::tuple{opus::number<T::B_M>{}, opus::number<T::W_M * T::SCALE_WORD_BYTES>{}, 1_I, opus::number<T::W_M>{}}),
-        opus::unfold_p_coord(sfa_repack_block_dim, opus::tuple{wave_id, lane_id / T::W_M, lane_id % T::W_M}));
-}
-
-// Packed-scale writes and reads count dwords rather than raw scale bytes.
-template<class T>
-__device__ inline auto make_layout_psfa(int lane_id, int wave_id) {
-    constexpr int words_per_group = T::B_M / T::SCALE_WORD_BYTES;
-    constexpr int rounds = (T::SCALE_GROUPS - 1) * words_per_group / T::BLOCK_SIZE + 1;
-    constexpr auto psfa_block_shape = opus::make_tuple(
-        opus::number<rounds>{},
-        opus::number<T::BLOCK_SIZE / T::WARP_SIZE>{},
-        opus::number<T::WARP_SIZE>{},
-        1_I);
-    constexpr auto psfa_block_dim = opus::make_tuple(
+    constexpr auto rsfa_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}));
 
-    return opus::make_layout(
-        psfa_block_shape,
-        opus::unfold_x_stride(psfa_block_dim, psfa_block_shape, opus::tuple{1_I, 1_I}),
-        opus::unfold_p_coord(psfa_block_dim, opus::tuple{wave_id, lane_id}));
-}
-
-template<class T>
-__device__ inline auto make_layout_rsfa_packed(int lane_id, int wave_id_m) {
-    // Only the PACKED_SCALE branch consumes this E_M=4 mapping.
-    constexpr auto rsfa_packed_block_shape = opus::make_tuple(
-        opus::number<T::M_HALVES>{},
-        opus::number<T::T_M>{},
-        opus::number<T::W_M>{},
-        1_I);
-    constexpr auto rsfa_packed_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
-
-    return opus::make_layout(
-        rsfa_packed_block_shape,
-        opus::unfold_x_stride(rsfa_packed_block_dim, rsfa_packed_block_shape,
-            opus::tuple{opus::number<T::HALF_M / T::SCALE_WORD_BYTES>{}, opus::number<T::E_M * T::SCALE_WORD_BYTES>{}, 1_I}),
-        opus::unfold_p_coord(rsfa_packed_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M}));
+    return opus::make_layout<T::SCALE_WORD_BYTES>(
+        rsfa_block_shape,
+        opus::unfold_x_stride(rsfa_block_dim, rsfa_block_shape, opus::tuple{opus::number<T::SCALE_WORD_BYTES>{}, 1_I}),
+        opus::unfold_p_coord(rsfa_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M}));
 }
 
 template<class T>
@@ -473,14 +390,14 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
     // Matrix and scale layouts: global -> LDS -> register fragments.
     constexpr int a_threads_k = T::K_STAGE / T::VEC_A;
     constexpr int a_rows_per_wave = T::WARP_SIZE / a_threads_k;
-    auto u_ga = make_layout_ga<T>(lane_id, wave_id, kargs.stride_a);
+    auto u_ga = make_layout_ga<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_a);
     opus::static_for<T::A_STEPS>([&](auto i) {
         constexpr int step = decltype(i)::value;
         const int row = lane_id / a_threads_k + wave_id * a_rows_per_wave + step * (T::BLOCK_SIZE / a_threads_k);
         const int col = lane_id % a_threads_k * T::VEC_A;
         u_ga.offsets[step] += a_offset<T>(row, col) % T::K_STAGE - col;
     });
-    const auto u_sa = make_layout_sa<T>(wave_id);
+    const auto u_sa = make_layout_sa<T>(wave_id_m, wave_id_n);
     constexpr int a_chunks = T::W_M * T::W_K / (T::WARP_SIZE * T::VEC_A);
     constexpr int a_k_lane_groups = T::WARP_SIZE / T::W_M;
     auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
@@ -489,20 +406,17 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
         const int row = (wave_id_m * T::E_M + m) * T::W_M + lane_id % T::W_M;
         opus::static_for<a_chunks>([&](auto chunk_i) {
             constexpr int chunk = decltype(chunk_i)::value;
-            u_ra.offsets[m * a_chunks + chunk] = a_offset<T>(row,
-                lane_id / T::W_M * T::VEC_A + chunk * a_k_lane_groups * T::VEC_A);
+            const int col = lane_id / T::W_M * T::VEC_A + chunk * a_k_lane_groups * T::VEC_A;
+            u_ra.offsets[m * a_chunks + chunk] += a_offset<T>(row, col) - (row * T::K_STAGE + col);
         });
     });
-    const auto u_gb = make_layout_gb<T>(lane_id, wave_id, kargs.stride_b);
-    const auto u_sb = make_layout_sb<T>(wave_id);
+    const auto u_gb = make_layout_gb<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
+    const auto u_sb = make_layout_sb<T>(wave_id_m, wave_id_n);
     const auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
     const auto u_gsfa_first = make_layout_gsfa_first<T>(lane_id, wave_id_m);
-    const auto u_gsfa = make_layout_gsfa<T>(lane_id, wave_id, kargs.stride_sfa);
-    const auto u_ssfa = make_layout_ssfa<T>(wave_id);
+    const auto u_gsfa = make_layout_gsfa<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_sfa);
+    const auto u_ssfa = make_layout_ssfa<T>(lane_id, wave_id_m, wave_id_n);
     const auto u_rsfa = make_layout_rsfa<T>(lane_id, wave_id_m);
-    const auto u_sfa_repack = make_layout_sfa_repack<T>(lane_id, wave_id);
-    const auto u_psfa = make_layout_psfa<T>(lane_id, wave_id);
-    const auto u_rsfa_packed = make_layout_rsfa_packed<T>(lane_id, wave_id_m);
     const auto u_gsfb = make_layout_gsfb<T>(lane_id, wave_id, kargs.stride_sfb);
     const auto u_rsfb = make_layout_rsfb<T>();
     const auto u_sc = make_layout_sc<T>(lane_id, wave_id_m, wave_id_n);
@@ -558,8 +472,9 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
         });
     };
 
-    // Keep K=0 scales in registers. The remaining 127 A columns plus packed
-    // B scales fit exactly beside the matrix slots at the maximum K=16384.
+    // Keep K=0 scales in registers. The remaining packed panels fit beside the
+    // matrix slots at the maximum K=16384, including padded M-repeat words.
+    vector_t<unsigned char, T::VEC_SCALE_A> sfa_panel_raw[T::SFA_PASSES_PER_CACHE_PANEL];
     auto load_sfa_first = [&] {
         static_for<2>([&](auto half_i) {
             constexpr int half = decltype(half_i)::value;
@@ -570,13 +485,18 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
         });
     };
     auto load_sfa_panel = [&] {
-        constexpr int bytes_per_copy = T::BLOCK_SIZE * 16;
-        static_for<(T::SFA_BYTES + bytes_per_copy - 1) / bytes_per_copy>([&](auto i) {
-            constexpr int copy = decltype(i)::value;
-            const int linear = ssfa_offsets[copy] + lane_id * 16;
-            const int group = linear / T::B_M;
-            if (group + 1 < loops && group < T::SCALE_GROUPS - 1)
-                async_load<16>(g_sfa, s_sfa.ptr + ssfa_offsets[copy], gsfa_offsets[copy]);
+        const int m_group = (lane_id % T::SFA_M_VECTORS) / T::SCALE_WORD_BYTES;
+        const int lane_in_quad = lane_id % T::SCALE_WORD_BYTES;
+        const int scale_row = (m_group / T::T_M) * T::HALF_M
+            + ((m_group % T::T_M) * T::E_M + lane_in_quad) * T::W_M;
+        static_for<T::SFA_PASSES_PER_CACHE_PANEL>([&](auto pass_i) {
+            constexpr int pass = decltype(pass_i)::value;
+            const int group = pass * T::SFA_K_COLUMNS_PER_PASS
+                + wave_id * T::SFA_K_COLUMNS_PER_WAVE + lane_id / T::SFA_M_VECTORS;
+            sfa_panel_raw[pass] = {};
+            if (group + 1 < loops && group < T::SCALE_GROUPS - 1
+                && lane_in_quad < T::E_M && scale_row < valid_rows)
+                sfa_panel_raw[pass] = load<T::VEC_SCALE_A>(g_sfa, gsfa_offsets[pass] + kargs.stride_sfa);
         });
     };
     auto load_sfb_panel = [&] {
@@ -587,57 +507,39 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
             store<1>(s_sfb, vector_t<unsigned short, 1>{static_cast<unsigned short>(lo | (hi << 8))}, u_rsfb(sf_group, 0_I));
         }
     };
-    auto repack_sfa_panel = [&] {
-        if constexpr (T::PACKED_SCALE) {
-            // Repack four M16 scale bytes into a dword once, before accumulators
-            // become live. A main-loop scale read then feeds four MFMAs directly.
-            constexpr int words_per_group = T::B_M / 4;
-            constexpr int rounds = (T::SCALE_GROUPS - 1) * words_per_group / T::BLOCK_SIZE + 1;
-            array<unsigned, rounds> packed{};
-            s_waitcnt_vmcnt(number<0>{});
-            s_waitcnt_lgkmcnt(number<0>{});
-            sync_threads();
-            static_for<rounds>([&](auto i) {
-                constexpr int step = decltype(i)::value;
-                const int word = u_psfa(step, 0_I);
-                const int group = word / words_per_group;
-                if (group + 1 < loops && group < T::SCALE_GROUPS - 1)
-                    static_for<4>([&](auto b) {
-                        packed[step] |=
-                            static_cast<unsigned>(load<1>(s_sfa, u_sfa_repack(step, b))[0]) <<
-                            (decltype(b)::value * 8);
-                    });
-            });
-            s_waitcnt_lgkmcnt(number<0>{});
-            sync_threads();
-            auto s_packed = make_smem(reinterpret_cast<unsigned*>(s_sfa.ptr));
-            static_for<rounds>([&](auto i) {
-                constexpr int step = decltype(i)::value;
-                const int word = u_psfa(step, 0_I);
-                const int group = word / words_per_group;
-                if (group + 1 < loops && group < T::SCALE_GROUPS - 1)
-                    store<1>(s_packed, vector_t<unsigned, 1>{packed[step]}, word);
-            });
-            s_waitcnt_lgkmcnt(number<0>{});
-            sync_threads();
-        }
+    auto publish_sfa_panel = [&] {
+        const int lane_in_quad = lane_id % T::SCALE_WORD_BYTES;
+        const unsigned pair_byte_select = lane_in_quad % 2 ? 0x03070105u : 0x06020400u;
+        const unsigned quad_byte_select = lane_in_quad / 2 ? 0x03020706u : 0x05040100u;
+        auto transpose_sfa_word_4x4 = [&](unsigned lane_word) {
+            const unsigned adjacent_lane = opus::mov_dpp(lane_word, opus::number<0xb1>{});
+            const unsigned paired_bytes = __builtin_amdgcn_perm(adjacent_lane, lane_word, pair_byte_select);
+            const unsigned opposite_pair = opus::mov_dpp(paired_bytes, opus::number<0x4e>{});
+            return __builtin_amdgcn_perm(opposite_pair, paired_bytes, quad_byte_select);
+        };
+        static_for<T::SFA_PASSES_PER_CACHE_PANEL>([&](auto pass_i) {
+            constexpr int pass = decltype(pass_i)::value;
+            const int group = pass * T::SFA_K_COLUMNS_PER_PASS
+                + wave_id * T::SFA_K_COLUMNS_PER_WAVE + lane_id / T::SFA_M_VECTORS;
+            if (group + 1 < loops && group < T::SCALE_GROUPS - 1) {
+                const auto raw_words = __builtin_bit_cast(vector_t<unsigned, T::VEC_SCALE_A / T::SCALE_WORD_BYTES>, sfa_panel_raw[pass]);
+                static_for<T::VEC_SCALE_A / T::SCALE_WORD_BYTES>([&](auto word_i) {
+                    constexpr int word = decltype(word_i)::value;
+                    const unsigned packed_scales = transpose_sfa_word_4x4(raw_words[word]);
+                    store<T::SCALE_WORD_BYTES>(s_sfa,
+                        __builtin_bit_cast(vector_t<unsigned char, T::SCALE_WORD_BYTES>, packed_scales),
+                        ssfa_offsets[pass] + word * T::SCALE_WORD_BYTES * T::SCALE_WORD_BYTES);
+                });
+            }
+        });
     };
 
     auto read_scale_a = [&](int k, auto half_i) {
         constexpr int half = decltype(half_i)::value;
-        unsigned result = 0;
         if (k == 0)
             return first_scale_a[half];
-        if constexpr (T::PACKED_SCALE) {
-            auto s_packed = make_smem(reinterpret_cast<unsigned*>(s_sfa.ptr));
-            result = load<1>(s_packed, (k - 1) * (T::B_M / 4) + u_rsfa_packed(half, 0_I))[0];
-        } else {
-            static_for<T::E_M>([&](auto i) {
-                constexpr int m = decltype(i)::value;
-                result |= static_cast<unsigned>(load<1>(s_sfa, (k - 1) * T::B_M + u_rsfa.offsets[half * T::E_M + m])[0]) << (m * 8);
-            });
-        }
-        return result;
+        return __builtin_bit_cast(unsigned, load<T::SCALE_WORD_BYTES>(s_sfa,
+            (k - 1) * T::SFA_PANEL_PITCH + u_rsfa.offsets[half]));
     };
     auto issue_tile = [&](auto stage_i, int k) {
         constexpr int first = decltype(stage_i)::value * 2;
@@ -694,7 +596,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
     load_sfa_first();
     load_sfa_panel();
     load_sfb_panel();
-    repack_sfa_panel();
+    publish_sfa_panel();
     issue_tile(0_I, 0);
 
     // ===== Main loop =====

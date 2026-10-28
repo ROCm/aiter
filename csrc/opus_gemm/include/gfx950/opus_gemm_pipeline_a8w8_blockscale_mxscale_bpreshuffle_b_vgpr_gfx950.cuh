@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstdint>
 #include <opus/hip_minimal.hpp>
 #include <opus/opus.hpp>
 #include "../opus_gemm_utils.cuh"
@@ -12,64 +13,84 @@ namespace opus_gemm_prefetch_b_vgpr_detail {
 
 // Global A copies preserve the row-dependent XOR permutation used by the LDS ring.
 template<class T>
-__device__ inline auto make_layout_ga(int lane_id, int wave_id_n) {
+__device__ inline auto make_layout_ga(int lane_id, int wave_id_n, int stride_a) {
+    constexpr int threads_k = T::B_K / T::VEC_A;
+    constexpr int threads_m_per_block = T::BLOCK_SIZE / threads_k;
+    constexpr int threads_m_per_wave = T::WARP_SIZE / threads_k;
+
     constexpr auto ga_block_shape = opus::make_tuple(
-        opus::number<T::A_COPIES>{},
-        opus::number<T::NUM_WAVES>{},
-        opus::number<T::WARP_SIZE>{},
+        opus::number<T::B_M / threads_m_per_block>{},
+        opus::number<T::T_N>{},
+        opus::number<threads_m_per_wave>{},
+        opus::number<T::T_M>{},
+        opus::number<threads_k>{},
         opus::number<T::VEC_A>{});
 
     constexpr auto ga_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
     return opus::make_layout<T::VEC_A>(
         ga_block_shape,
-        opus::unfold_x_stride(ga_block_dim, ga_block_shape, opus::tuple{opus::number<1>{}}),
-        opus::unfold_p_coord(ga_block_dim, opus::tuple{wave_id_n, lane_id}));
+        opus::unfold_x_stride(ga_block_dim, ga_block_shape, opus::tuple{stride_a, 1_I}),
+        opus::unfold_p_coord(ga_block_dim, opus::tuple{wave_id_n, lane_id / threads_k, 0_I, lane_id % threads_k}));
 }
 
 // VMEM-to-LDS adds the lane displacement; the layout contains each wave base.
 template<class T>
 __device__ inline auto make_layout_sa(int wave_id_n) {
+    constexpr int smem_linear_wave = T::WARP_SIZE * T::VEC_A;
+    constexpr int smem_m_rep = T::B_M * T::B_K / smem_linear_wave;
+
     constexpr auto sa_block_shape = opus::make_tuple(
-        opus::number<T::A_COPIES>{},
-        opus::number<T::NUM_WAVES>{},
+        opus::number<smem_m_rep / T::NUM_WAVES>{},
+        opus::number<T::T_N>{},
+        opus::number<T::T_M>{},
         opus::number<T::VEC_A>{});
 
     constexpr auto sa_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}));
 
     return opus::make_layout<T::VEC_A>(
         sa_block_shape,
-        opus::unfold_x_stride(sa_block_dim, sa_block_shape, opus::tuple{opus::number<T::WARP_SIZE * T::VEC_A>{}, opus::number<1>{}}),
-        opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id_n}));
+        opus::unfold_x_stride(sa_block_dim, sa_block_shape, opus::tuple{opus::number<smem_linear_wave>{}, 1_I}),
+        opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id_n, 0_I}));
 }
 
 // Construct only the current K128 A fragment's offsets at its consumption point.
 template<class T>
 __device__ inline auto make_layout_ra(int lane_id) {
+    constexpr int smem_linear_wave = T::WARP_SIZE * T::VEC_A;
+    constexpr int rows_per_slot = smem_linear_wave / T::B_K;
+    constexpr int slots_per_m = T::W_M / rows_per_slot;
+    constexpr int k_slices = T::B_K / T::W_K;
+
     constexpr auto ra_block_shape = opus::make_tuple(
-        opus::number<T::MR>{},
-        opus::number<T::W_M>{},
+        opus::number<T::E_M>{},
+        opus::number<slots_per_m>{},
+        opus::number<rows_per_slot>{},
+        opus::number<k_slices>{},
         opus::number<T::A_CHUNKS_PER_FRAGMENT>{},
         opus::number<T::WARP_SIZE / T::W_M>{},
         opus::number<T::VEC_A>{});
 
     constexpr auto ra_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    const int lane_id_m = lane_id % T::W_M;
 
     return opus::make_layout<T::VEC_A>(
         ra_block_shape,
-        opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<T::B_K>{}, opus::number<1>{}}),
-        opus::unfold_p_coord(ra_block_dim, opus::tuple{lane_id % T::W_M, lane_id / T::W_M}));
+        opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<smem_linear_wave>{}, 1_I}),
+        opus::unfold_p_coord(ra_block_dim, opus::tuple{lane_id_m / rows_per_slot, lane_id_m % rows_per_slot, 0_I, lane_id / T::W_M}));
 }
 
 // Each B fragment has two K64 halves and is loaded directly into its VGPR slot.
 template<class T>
-__device__ inline auto make_layout_gb(int lane_id, int wave_id_n, int stride_b) {
-    constexpr auto gb_block_shape = opus::make_tuple(
+__device__ inline auto make_layout_rb(int lane_id, int wave_id_n, int stride_b) {
+    constexpr auto rb_block_shape = opus::make_tuple(
         opus::number<T::B_K / T::W_K>{},
         opus::number<T::T_N>{},
         opus::number<T::NR>{},
@@ -78,66 +99,76 @@ __device__ inline auto make_layout_gb(int lane_id, int wave_id_n, int stride_b) 
         opus::number<T::W_N>{},
         opus::number<T::VEC_B>{});
 
-    constexpr auto gb_block_dim = opus::make_tuple(
+    constexpr auto rb_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}),
         opus::make_tuple(opus::p_dim{}, opus::y_dim{}),
         opus::make_tuple(opus::y_dim{}),
         opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
 
     return opus::make_layout<T::VEC_B>(
-        gb_block_shape,
-        opus::unfold_x_stride(gb_block_dim, gb_block_shape, opus::tuple{opus::number<T::W_N * T::W_K>{}, T::W_N * stride_b, opus::number<T::WARP_SIZE * T::VEC_B>{}, opus::number<1>{}}),
-        opus::unfold_p_coord(gb_block_dim, opus::tuple{wave_id_n, lane_id / T::W_N, lane_id % T::W_N}));
+        rb_block_shape,
+        opus::unfold_x_stride(rb_block_dim, rb_block_shape, opus::tuple{opus::number<T::W_N * T::W_K>{}, T::W_N * stride_b, opus::number<T::WARP_SIZE * T::VEC_B>{}, opus::number<1>{}}),
+        opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n, lane_id / T::W_N, lane_id % T::W_N}));
 }
 
-// Raw E8M0 scale panels retain their physical K-major A and N-major B strides.
+// A scale vectors cover four M16 repeats per quad before the VGPR transpose.
 template<class T>
-__device__ inline auto make_layout_gsfa(int stride_sfa) {
+__device__ inline auto make_layout_gsfa(int lane_id, int wave_id_n, int stride_sfa) {
     constexpr auto gsfa_block_shape = opus::make_tuple(
-        opus::number<T::SCALE_COLS>{},
-        opus::number<T::SA_ROWS>{});
-
-    constexpr auto gsfa_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::y_dim{}));
-
-    return opus::make_layout(
-        gsfa_block_shape,
-        opus::unfold_x_stride(gsfa_block_dim, gsfa_block_shape, opus::tuple{stride_sfa, opus::number<1>{}}),
-        opus::unfold_p_coord(gsfa_block_dim, opus::tuple{}));
-}
-
-template<class T>
-__device__ inline auto make_layout_ssfa(int wave_id_n) {
-    constexpr auto ssfa_block_shape = opus::make_tuple(
-        opus::number<T::SA_COPIES>{},
-        opus::number<T::NUM_WAVES>{},
+        opus::number<T::SFA_PASSES_PER_CACHE_PANEL>{},
+        opus::number<T::T_N>{},
+        opus::number<T::T_M>{},
+        opus::number<T::SFA_K_COLUMNS_PER_WAVE>{},
+        opus::number<T::SFA_M_VECTORS>{},
         opus::number<T::VEC_SCALE_A>{});
 
-    constexpr auto ssfa_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
+    constexpr auto gsfa_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
     return opus::make_layout<T::VEC_SCALE_A>(
+        gsfa_block_shape,
+        opus::unfold_x_stride(gsfa_block_dim, gsfa_block_shape, opus::tuple{stride_sfa, 1_I}),
+        opus::unfold_p_coord(gsfa_block_dim, opus::tuple{wave_id_n, 0_I, lane_id / T::SFA_M_VECTORS, lane_id % T::SFA_M_VECTORS}));
+}
+
+template<class T>
+__device__ inline auto make_layout_ssfa(int lane_id, int wave_id_n) {
+    constexpr auto ssfa_block_shape = opus::make_tuple(
+        opus::number<T::SFA_PASSES_PER_CACHE_PANEL>{},
+        opus::number<T::T_N>{},
+        opus::number<T::T_M>{},
+        opus::number<T::SFA_K_COLUMNS_PER_WAVE>{},
+        opus::number<T::SFA_PACKED_M_GROUPS>{},
+        opus::number<T::W_M>{},
+        opus::number<T::VEC_SF>{});
+
+    constexpr auto ssfa_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout<T::VEC_SF>(
         ssfa_block_shape,
-        opus::unfold_x_stride(ssfa_block_dim, ssfa_block_shape, opus::tuple{opus::number<T::WARP_SIZE * T::VEC_SCALE_A>{}, opus::number<1>{}}),
-        opus::unfold_p_coord(ssfa_block_dim, opus::tuple{wave_id_n}));
+        opus::unfold_x_stride(ssfa_block_dim, ssfa_block_shape, opus::tuple{opus::number<T::SFA_PANEL_PITCH>{}, 1_I}),
+        opus::unfold_p_coord(ssfa_block_dim, opus::tuple{wave_id_n, 0_I, lane_id / T::SFA_M_VECTORS,
+            (lane_id % T::SFA_M_VECTORS) / T::VEC_SF, lane_id % T::VEC_SF}));
 }
 
 template<class T>
 __device__ inline auto make_layout_rsfa(int lane_id) {
     constexpr auto rsfa_block_shape = opus::make_tuple(
         opus::number<T::B_K / T::GROUP_K>{},
-        opus::number<T::MR>{},
-        opus::number<T::W_M>{});
+        opus::number<T::SFA_PACKED_M_GROUPS>{},
+        opus::number<T::W_M>{},
+        opus::number<T::VEC_SF>{});
 
     constexpr auto rsfa_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
 
-    return opus::make_layout(
+    return opus::make_layout<T::VEC_SF>(
         rsfa_block_shape,
-        opus::unfold_x_stride(rsfa_block_dim, rsfa_block_shape, opus::tuple{opus::number<T::SA_ROWS>{}, opus::number<1>{}}),
+        opus::unfold_x_stride(rsfa_block_dim, rsfa_block_shape, opus::tuple{opus::number<T::SFA_PANEL_PITCH>{}, 1_I}),
         opus::unfold_p_coord(rsfa_block_dim, opus::tuple{lane_id % T::W_M}));
 }
 
@@ -461,17 +492,18 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         static_cast<unsigned>(((valid_rows - 1) * stride_c + BN) * 2));
 
     // Matrix, scale, and output layouts.
-    auto u_ga = make_layout_ga<T>(lane_id, wave_id_n);
+    constexpr int a_threads_k = T::B_K / T::VEC_A;
+    constexpr int a_rows_per_wave = T::WARP_SIZE / a_threads_k;
+    auto u_ga = make_layout_ga<T>(lane_id, wave_id_n, stride_a);
     opus::static_for<T::A_COPIES>([&](auto i) {
-        const int linear = u_ga.offsets[i];
-        const int row = linear / T::B_K;
-        const int k = (linear % T::B_K) ^ ((row % (T::B_K / T::VEC_A)) * T::VEC_A);
-        u_ga.offsets[i] = row * stride_a + k;
+        const int row = (decltype(i)::value * T::NUM_WAVES + wave_id_n) * a_rows_per_wave + lane_id / a_threads_k;
+        const int k = (lane_id % a_threads_k) * T::VEC_A;
+        u_ga.offsets[i] += (k ^ ((row % a_threads_k) * T::VEC_A)) - k;
     });
     const auto u_sa = make_layout_sa<T>(wave_id_n);
-    const auto u_gb = make_layout_gb<T>(lane_id, wave_id_n, stride_b);
-    const auto u_gsfa = make_layout_gsfa<T>(args.stride_sfa);
-    const auto u_ssfa = make_layout_ssfa<T>(wave_id_n);
+    const auto u_rb = make_layout_rb<T>(lane_id, wave_id_n, stride_b);
+    const auto u_gsfa = make_layout_gsfa<T>(lane_id, wave_id_n, args.stride_sfa);
+    const auto u_ssfa = make_layout_ssfa<T>(lane_id, wave_id_n);
     const auto u_rsfa = make_layout_rsfa<T>(lane_id);
     const auto u_gsfb = make_layout_gsfb<T>(args.stride_sfb);
     constexpr auto u_ssfb = make_layout_ssfb<T>();
@@ -495,9 +527,13 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         constexpr int set = decltype(slot_i)::value;
         constexpr int fragment = decltype(fragment_i)::value;
         set_slice(r_b[set],
-            load<16>(g_b, u_gb.offsets[fragment * 2], kt * (BK * 16), number<T::B_CACHE>{}), 0_I, 16_I);
+            load<T::VEC_B>(g_b, u_rb.offsets[fragment * T::B_CHUNKS_PER_FRAGMENT],
+                kt * (BK * T::W_N), number<T::B_CACHE>{}),
+            0_I, number<T::VEC_B>{});
         set_slice(r_b[set],
-            load<16>(g_b, u_gb.offsets[fragment * 2 + 1], kt * (BK * 16), number<T::B_CACHE>{}), 16_I, 32_I);
+            load<T::VEC_B>(g_b, u_rb.offsets[fragment * T::B_CHUNKS_PER_FRAGMENT + 1],
+                kt * (BK * T::W_N), number<T::B_CACHE>{}),
+            number<T::VEC_B>{}, number<T::B_CHUNKS_PER_FRAGMENT * T::VEC_B>{});
     };
     auto issue_a = [&](int slot, int kt) {
         __builtin_amdgcn_sched_barrier(0);
@@ -509,15 +545,18 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         __builtin_amdgcn_sched_barrier(0);
     };
 
+    vector_t<unsigned char, T::VEC_SCALE_A> sfa_panel_raw[T::SFA_PASSES_PER_CACHE_PANEL];
     auto issue_scale_panels = [&]() {
-        static_for<T::SA_COPIES>([&](auto ii) {
-            constexpr int i = decltype(ii)::value;
-            const int index = (i * T::BLOCK_SIZE + thread_id) * 16;
-            const int sr = index % T::SA_ROWS;
-            const int scol = index / T::SA_ROWS;
-            const int scale_col = scol < SC ? scol : SC - 1;
-            int source = sr < BM && row + sr < M ? u_gsfa(scale_col, sr) + row : (SC - 1) * args.stride_sfa + M;
-            async_load<16>(g_sfa, arena + T::OFF_SA + u_ssfa.offsets[i], source);
+        static_for<T::SFA_PASSES_PER_CACHE_PANEL>([&](auto pass_i) {
+            constexpr int pass = decltype(pass_i)::value;
+            const int lane_k = lane_id / T::SFA_M_VECTORS;
+            const int scale_col = pass * T::SFA_K_COLUMNS_PER_PASS
+                + wave_id_n * T::SFA_K_COLUMNS_PER_WAVE + lane_k;
+            const int scale_row = (lane_id % T::SFA_M_VECTORS) * T::VEC_SCALE_A;
+            sfa_panel_raw[pass] = {};
+            if (lane_k < T::SFA_K_COLUMNS_PER_WAVE && scale_col < SC
+                && scale_row < BM && row + scale_row < M)
+                sfa_panel_raw[pass] = load<T::VEC_SCALE_A>(g_sfa, u_gsfa.offsets[pass] + row);
         });
         auto* sbdst = arena + T::OFF_SB + u_ssfb(wave_id, 0, 0);
         if constexpr (T::SB_SLOTS) {
@@ -531,6 +570,34 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
             const int word = index % (SC / 4);
             async_load<4>(g_sfb, sbdst, u_gsfb(col / 128 + sr, word * 4));
         }
+    };
+
+    // The same 4x4 byte transpose as 4wave; TM=1 packs M,M+16,M+32,M+48.
+    auto publish_sfa_panel = [&]() {
+        const int lane_in_quad = lane_id % T::VEC_SF;
+        const unsigned pair_byte_select = lane_in_quad % 2 ? 0x03070105u : 0x06020400u;
+        const unsigned quad_byte_select = lane_in_quad / 2 ? 0x03020706u : 0x05040100u;
+        auto transpose_sfa_word_4x4 = [&](unsigned lane_word) {
+            const unsigned adjacent_lane = opus::mov_dpp(lane_word, opus::number<0xb1>{});
+            const unsigned paired_bytes = __builtin_amdgcn_perm(adjacent_lane, lane_word, pair_byte_select);
+            const unsigned opposite_pair = opus::mov_dpp(paired_bytes, opus::number<0x4e>{});
+            return __builtin_amdgcn_perm(opposite_pair, paired_bytes, quad_byte_select);
+        };
+        static_for<T::SFA_PASSES_PER_CACHE_PANEL>([&](auto pass_i) {
+            constexpr int pass = decltype(pass_i)::value;
+            const int lane_k = lane_id / T::SFA_M_VECTORS;
+            const int scale_col = pass * T::SFA_K_COLUMNS_PER_PASS
+                + wave_id_n * T::SFA_K_COLUMNS_PER_WAVE + lane_k;
+            if (lane_k < T::SFA_K_COLUMNS_PER_WAVE && scale_col < SC) {
+                const auto raw_words = __builtin_bit_cast(vector_t<unsigned, T::VEC_SCALE_A / T::VEC_SF>, sfa_panel_raw[pass]);
+                static_for<T::VEC_SCALE_A / T::VEC_SF>([&](auto word_i) {
+                    constexpr int word = decltype(word_i)::value;
+                    const unsigned packed_scales = transpose_sfa_word_4x4(raw_words[word]);
+                    store<T::VEC_SF>(s_scale, __builtin_bit_cast(vector_t<unsigned char, T::VEC_SF>, packed_scales),
+                        T::OFF_SA + u_ssfa.offsets[pass] + word * T::VEC_SF * T::VEC_SF);
+                });
+            }
+        });
     };
 
     // Prepare the panel consumer before issuing the prologue requests.
@@ -549,7 +616,7 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         opus::sync_threads();
 
         array<array<typename Base::vtype_a, MR>, T::ROTATE_B ? 1 : KS> r_a;
-        array<array<unsigned, (MR + 3) / 4>, KS> r_sfa{};
+        array<array<unsigned, T::SFA_PACKED_M_GROUPS>, KS> r_sfa;
         array<unsigned, KS> r_sfb{};
         static_for<KS>([&](auto ki) {
             constexpr int ks = decltype(ki)::value;
@@ -559,21 +626,23 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
                     T::OFF_SB + u_rsfb(ks, group) + t * KS * (T::SB_SLOTS ? 4 : 1))[0];
                 r_sfb[ks] |= scale << (group * 8);
             });
-            static_for<MR>([&](auto mi) {
-                constexpr int m = decltype(mi)::value;
-                const unsigned scale = load<1>(s_scale, T::OFF_SA + u_rsfa(ks, m) + t * KS * T::SA_ROWS)[0];
-                r_sfa[ks][m / 4] |= scale << ((m % 4) * 8);
+            static_for<T::SFA_PACKED_M_GROUPS>([&](auto pack_i) {
+                constexpr int pack = decltype(pack_i)::value;
+                r_sfa[ks][pack] = __builtin_bit_cast(unsigned, load<T::VEC_SF>(s_scale,
+                    T::OFF_SA + u_rsfa.offsets[ks * T::SFA_PACKED_M_GROUPS + pack]
+                        + t * KS * T::SFA_PANEL_PITCH));
             });
         });
         auto read_a = [&](auto ki) {
             constexpr int ks = decltype(ki)::value;
             auto u_ra = make_layout_ra<T>(lane_id);
+            u_ra += ks * T::W_K;
             opus::static_for<T::MR * T::A_CHUNKS_PER_FRAGMENT>([&](auto i) {
                 constexpr int m = decltype(i)::value / T::A_CHUNKS_PER_FRAGMENT;
                 constexpr int half = decltype(i)::value % T::A_CHUNKS_PER_FRAGMENT;
                 const int row = m * T::W_M + lane_id % T::W_M;
-                const int k_vector = (ks * (T::W_K / T::VEC_A) + lane_id / T::W_M + half * (T::WARP_SIZE / T::W_M)) ^ (row % (T::B_K / T::VEC_A));
-                u_ra.offsets[i] = row * T::B_K + k_vector * T::VEC_A;
+                const int k_vector = ks * (T::W_K / T::VEC_A) + lane_id / T::W_M + half * (T::WARP_SIZE / T::W_M);
+                u_ra.offsets[i] += ((k_vector ^ (row % (T::B_K / T::VEC_A))) - k_vector) * T::VEC_A;
             });
             static_for<MR>([&](auto mi) {
                 constexpr int m = decltype(mi)::value;
@@ -621,10 +690,10 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
                     [[clang::amdgpu_pin_agpr(128 + ci * 4)]] r_c[ci] = r_c[ci];
                     [[clang::amdgpu_pin_agpr(128 + ci * 4)]]
                     r_c[ci] = Base{}(r_a[T::ROTATE_B ? 0 : ks][m], r_b[(T::ROTATE_B ? fragment : phase * F + fragment) % BS], r_c[ci],
-                        static_cast<int>(r_sfa[ks][m / 4]), static_cast<int>(r_sfb[ks]), number<m % 4>{}, number<n / 8>{});
+                        static_cast<int>(r_sfa[ks][m / T::VEC_SF]), static_cast<int>(r_sfb[ks]), number<m % T::VEC_SF>{}, number<n / 8>{});
                 } else {
                     r_c[ci] = Base{}(r_a[T::ROTATE_B ? 0 : ks][m], r_b[(T::ROTATE_B ? fragment : phase * F + fragment) % BS], r_c[ci],
-                        static_cast<int>(r_sfa[ks][m / 4]), static_cast<int>(r_sfb[ks]), number<m % 4>{}, number<n / 8>{});
+                        static_cast<int>(r_sfa[ks][m / T::VEC_SF]), static_cast<int>(r_sfb[ks]), number<m % T::VEC_SF>{}, number<n / 8>{});
                 }
                 if constexpr (future_a && fragment == 0 && m == PublishM)
                     issue_a((T::ROTATE_B ? t + NB - 1 : phase + NB - 1) % NB, t + NB - 1);
@@ -648,6 +717,7 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         constexpr int fragment = decltype(i)::value;
         issue_b(number<fragment % BS>{}, number<fragment % F>{}, fragment / F);
     });
+    publish_sfa_panel();
     static_for<START>([&](auto i) {
         constexpr int t = decltype(i)::value;
         consume_panel(t, number<t>{});

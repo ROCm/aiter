@@ -76,6 +76,7 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int VEC_B = 16;
     static constexpr int VEC_C = 4;
     static constexpr int VEC_SCALE_A = 16;
+    static constexpr int VEC_SF = sizeof(unsigned);
     static constexpr int VEC_OUTPUT = 8;
     static constexpr int A_CHUNKS_PER_FRAGMENT = W_M * W_K / (WARP_SIZE * VEC_A);
     static constexpr int B_CHUNKS_PER_FRAGMENT = W_N * W_K / (WARP_SIZE * VEC_B);
@@ -110,29 +111,26 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int MATRIX_VMEM_INSTRUCTIONS = B_M * B_K / (BLOCK_SIZE * VEC_A) + B_N * B_K / (BLOCK_SIZE * VEC_B);
     static_assert(NUM_STAGES == 2);
 
-    // Raw A-scale bytes and packed B-scale words share the LDS allocation.
+    // Four M-repeat scales per A word; B packs its N128 scales into one word.
     static constexpr int SCALE_PANEL = ScalePanel;
-    static constexpr int SFA_BYTES = B_M * SCALE_PANEL;
+    static constexpr int A_SCALE_PACKS = (E_M + VEC_SF - 1) / VEC_SF;
+    static constexpr int SFA_M_VECTORS = A_SCALE_PACKS * T_M * VEC_SF;
+    static constexpr int SFA_K_COLUMNS_PER_WAVE = WARP_SIZE / SFA_M_VECTORS;
+    static constexpr int SFA_K_COLUMNS_PER_PASS = NUM_WAVES * SFA_K_COLUMNS_PER_WAVE;
+    static constexpr int SFA_PASSES_PER_CACHE_PANEL = (SCALE_PANEL + SFA_K_COLUMNS_PER_PASS - 1) / SFA_K_COLUMNS_PER_PASS;
+    static constexpr int SFA_PANEL_PITCH = A_SCALE_PACKS * T_M * W_M * VEC_SF;
+    static constexpr int SFA_BYTES = SFA_PANEL_PITCH * SCALE_PANEL;
     static constexpr int SFB_BYTES = SCALE_PANEL * sizeof(unsigned);
-    static constexpr int SFA_K_PANEL = SCALE_PANEL < 32 ? SCALE_PANEL : 32;
-    static constexpr int SFA_K_PASSES = SCALE_PANEL / SFA_K_PANEL;
-    static constexpr int SFA_THREADS_PER_GROUP = BLOCK_SIZE / SFA_K_PANEL;
-    static constexpr int SFA_K_COLUMNS_PER_WAVE = WARP_SIZE / SFA_THREADS_PER_GROUP;
-    static constexpr int SFA_ROWS_PER_PASS = SFA_THREADS_PER_GROUP * VEC_SCALE_A;
-    static constexpr int SFA_PASSES = (B_M + SFA_ROWS_PER_PASS - 1) / SFA_ROWS_PER_PASS;
 
     // Scale-panel passes must cover the K columns and M rows.
     static_assert(BLOCK_SIZE % SCALE_PANEL == 0);
-    static_assert(SFA_THREADS_PER_GROUP <= WARP_SIZE);
+    static_assert(W_M == VEC_SCALE_A && WARP_SIZE % SFA_M_VECTORS == 0);
     static_assert(FIXED_K == 0 || (FIXED_K % B_K == 0 && FIXED_K <= MAX_K));
-    static_assert(WARP_SIZE % SFA_THREADS_PER_GROUP == 0);
-    static_assert(T_N * T_M * SFA_K_COLUMNS_PER_WAVE == SFA_K_PANEL);
-    static_assert(SFA_K_PANEL * SFA_K_PASSES == SCALE_PANEL);
-    static_assert(SFA_PASSES * SFA_ROWS_PER_PASS >= B_M);
+    static_assert(SFA_PASSES_PER_CACHE_PANEL * SFA_K_COLUMNS_PER_PASS >= SCALE_PANEL);
 
-    static constexpr int A_SCALE_PACKS = (E_M + 3) / 4;
     static constexpr int B_SCALE_PACKS = 1;
     static constexpr int LDS_BYTES = MATRIX_LDS_BYTES + SFA_BYTES + SFB_BYTES;
+    static_assert(LDS_BYTES <= 160 * 1024);
 
     // The BF16 epilogue reuses LDS with a padded row stride.
     static constexpr int C_LDS_ROW_STRIDE_ELEMS = B_N + 8;

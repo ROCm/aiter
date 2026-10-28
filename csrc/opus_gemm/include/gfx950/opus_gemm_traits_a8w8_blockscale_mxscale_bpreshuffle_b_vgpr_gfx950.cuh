@@ -36,6 +36,7 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr int VEC_C = 4;
     static constexpr int VEC_SCALE_A = 16;
     static constexpr int VEC_SCALE_B = 4;
+    static constexpr int VEC_SF = sizeof(unsigned);
     static constexpr int VEC_OUTPUT = 8;
     static constexpr int C_PADDING = 8;
     static constexpr int GROUP_N = 128;
@@ -94,6 +95,12 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr int SA_ROWS = (BM + VEC_SCALE_A - 1) / VEC_SCALE_A * VEC_SCALE_A;
     static constexpr int SA_COPIES = (SA_ROWS * SCALE_COLS + BLOCK_SIZE * VEC_SCALE_A - 1) / (BLOCK_SIZE * VEC_SCALE_A);
     static constexpr int SA_BYTES = SA_COPIES * BLOCK_SIZE * VEC_SCALE_A;
+    static constexpr int SFA_PACKED_M_GROUPS = (MR + VEC_SF - 1) / VEC_SF;
+    static constexpr int SFA_M_VECTORS = SFA_PACKED_M_GROUPS * VEC_SF;
+    static constexpr int SFA_K_COLUMNS_PER_WAVE = WARP_SIZE / SFA_M_VECTORS;
+    static constexpr int SFA_K_COLUMNS_PER_PASS = NUM_WAVES * SFA_K_COLUMNS_PER_WAVE;
+    static constexpr int SFA_PASSES_PER_CACHE_PANEL = (SCALE_COLS + SFA_K_COLUMNS_PER_PASS - 1) / SFA_K_COLUMNS_PER_PASS;
+    static constexpr int SFA_PANEL_PITCH = SFA_PACKED_M_GROUPS * W_M * VEC_SF;
     static constexpr int SB_ROWS = (BN + GROUP_N - 1) / GROUP_N;
     static constexpr int SB_BYTES = BLOCK_SIZE * VEC_SCALE_B;
     static constexpr int OFF_SA = NB * STAGE_BYTES;
@@ -112,6 +119,7 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static_assert(BN <= 256 && (WGPerCU == 1 || WGPerCU == 2));
     static_assert(B_K == 128 || B_K == 256);
     static_assert(A_BYTES % (BLOCK_SIZE * 16) == 0 && PANELS >= INITIAL_A);
+    static_assert(W_M == VEC_SCALE_A && SFA_PANEL_PITCH * SCALE_COLS <= SA_BYTES);
     static_assert(SB_ROWS * (SB_SLOTS ? SCALE_COLS : SCALE_COLS / 4) <= BLOCK_SIZE);
     static_assert(((LDS_BYTES + 1279) / 1280 * 1280) * WGPerCU <= 160 * 1024);
     static_assert(MR * NR * 4 <= 256);
