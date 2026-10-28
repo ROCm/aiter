@@ -276,6 +276,21 @@ def get_flydsl_a16w16_configs(
                 "use_half_tile_interleaved": False,
             }
         )
+    if k % 2 == 0 and 2 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
+        configs.append(
+            {
+                "block_m": 320,
+                "block_n": 192,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 2,
+                "m_waves": 4,
+                "n_waves": 4,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+            }
+        )
     if k % 4 == 0 and 4 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
         configs.append(
             {
