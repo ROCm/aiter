@@ -13,12 +13,21 @@ namespace opus_gemm_prefetch_b_vgpr_detail {
 // Global A copies preserve the row-dependent XOR permutation used by the LDS ring.
 template<class T>
 __device__ inline auto make_layout_ga(int thread_id, int stride_a) {
+    constexpr auto ga_block_shape = opus::make_tuple(
+        opus::number<T::A_COPIES>{},
+        opus::number<T::BLOCK_SIZE / 64>{},
+        opus::number<64>{},
+        opus::number<16>{});
+
+    constexpr auto ga_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
     auto u = opus::make_layout<16>(
-        opus::make_tuple(opus::number<T::A_COPIES>{}, opus::number<16>{}),
-        opus::make_tuple(opus::number<T::BLOCK_SIZE * 16>{}, opus::number<1>{}),
-        opus::make_tuple(opus::underscore{}, opus::underscore{}));
+        ga_block_shape,
+        opus::unfold_x_stride(ga_block_dim, ga_block_shape, opus::tuple{opus::number<1>{}}),
+        opus::unfold_p_coord(ga_block_dim, opus::tuple{thread_id / 64, thread_id % 64}));
     opus::static_for<T::A_COPIES>([&](auto i) {
-        const int linear = u.offsets[i] + thread_id * 16;
+        const int linear = u.offsets[i];
         const int row = linear / T::B_K;
         const int k = (linear % T::B_K) ^ ((row % (T::B_K / 16)) * 16);
         u.offsets[i] = row * stride_a + k;
@@ -29,61 +38,39 @@ __device__ inline auto make_layout_ga(int thread_id, int stride_a) {
 // VMEM-to-LDS adds the lane displacement; the layout contains each wave base.
 template<class T>
 __device__ inline auto make_layout_sa(int wave_id) {
+    constexpr auto sa_block_shape = opus::make_tuple(
+        opus::number<T::A_COPIES>{},
+        opus::number<T::BLOCK_SIZE / 64>{},
+        opus::number<16>{});
+
+    constexpr auto sa_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
     return opus::make_layout<16>(
-        opus::make_tuple(opus::number<T::A_COPIES>{}, opus::number<16>{}),
-        opus::make_tuple(opus::number<T::BLOCK_SIZE * 16>{}, opus::number<1>{}),
-        opus::make_tuple(opus::underscore{}, opus::underscore{})) + wave_id * 64 * 16;
-}
-
-// Each B fragment has two K64 halves and is loaded directly into its VGPR slot.
-template<class T>
-__device__ inline auto make_layout_gb(int lane_id, int wave_id_n, int stride_b) {
-    return opus::make_layout<16>(
-        opus::make_tuple(opus::number<T::B_K / 128>{}, opus::number<T::NR>{},
-                         opus::number<2>{}, opus::number<16>{}),
-        opus::make_tuple(opus::number<2048>{}, 16 * stride_b,
-                         opus::number<1024>{}, opus::number<1>{}),
-        opus::make_tuple(opus::underscore{}, opus::underscore{}, opus::underscore{}, opus::underscore{}))
-        + wave_id_n * (T::B_N / T::T_N) * stride_b + (lane_id / 16) * 256 + (lane_id % 16) * 16;
-}
-
-// Raw E8M0 scale panels retain their physical K-major A and N-major B strides.
-template<class T>
-__device__ inline auto make_layout_gsfa(int stride_sfa) {
-    return opus::make_layout(
-        opus::make_tuple(opus::number<T::SCALE_COLS>{}, opus::number<T::SA_ROWS>{}),
-        opus::make_tuple(stride_sfa, opus::number<1>{}));
-}
-
-template<class T>
-__device__ inline auto make_layout_gsfb(int stride_sfb) {
-    return opus::make_layout(
-        opus::make_tuple(opus::number<T::SB_ROWS>{}, opus::number<T::SCALE_COLS>{}),
-        opus::make_tuple(stride_sfb, opus::number<1>{}));
-}
-
-template<class T>
-__device__ inline auto make_layout_ssfa(int wave_id) {
-    return opus::make_layout<16>(
-        opus::make_tuple(opus::number<T::SA_COPIES>{}, opus::number<16>{}),
-        opus::make_tuple(opus::number<T::BLOCK_SIZE * 16>{}, opus::number<1>{}),
-        opus::make_tuple(opus::underscore{}, opus::underscore{})) + wave_id * 64 * 16;
-}
-
-template<class T>
-__device__ inline constexpr auto make_layout_ssfb() {
-    return opus::make_layout(
-        opus::make_tuple(opus::number<T::BLOCK_SIZE / 64>{}, opus::number<64>{}, opus::number<4>{}),
-        opus::make_tuple(opus::number<64 * 4>{}, opus::number<4>{}, opus::number<1>{}));
+        sa_block_shape,
+        opus::unfold_x_stride(sa_block_dim, sa_block_shape, opus::tuple{opus::number<64 * 16>{}, opus::number<1>{}}),
+        opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id}));
 }
 
 // Construct only the current K128 A fragment's offsets at its consumption point.
 template<class T>
 __device__ inline auto make_layout_ra(int lane_id, int k_slice) {
+    constexpr auto ra_block_shape = opus::make_tuple(
+        opus::number<T::MR>{},
+        opus::number<16>{},
+        opus::number<2>{},
+        opus::number<4>{},
+        opus::number<16>{});
+
+    constexpr auto ra_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
     auto u = opus::make_layout<16>(
-        opus::make_tuple(opus::number<T::MR>{}, opus::number<2>{}, opus::number<16>{}),
-        opus::make_tuple(opus::number<16 * T::B_K>{}, opus::number<64>{}, opus::number<1>{}),
-        opus::make_tuple(opus::underscore{}, opus::underscore{}, opus::underscore{}));
+        ra_block_shape,
+        opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<T::B_K>{}, opus::number<1>{}}),
+        opus::unfold_p_coord(ra_block_dim, opus::tuple{lane_id % 16, lane_id / 16}));
     opus::static_for<T::MR * 2>([&](auto i) {
         constexpr int m = decltype(i)::value / 2;
         constexpr int half = decltype(i)::value % 2;
@@ -94,40 +81,171 @@ __device__ inline auto make_layout_ra(int lane_id, int k_slice) {
     return u;
 }
 
+// Each B fragment has two K64 halves and is loaded directly into its VGPR slot.
+template<class T>
+__device__ inline auto make_layout_gb(int lane_id, int wave_id_n, int stride_b) {
+    constexpr auto gb_block_shape = opus::make_tuple(
+        opus::number<T::B_K / 128>{},
+        opus::number<T::T_N>{},
+        opus::number<T::NR>{},
+        opus::number<2>{},
+        opus::number<4>{},
+        opus::number<16>{},
+        opus::number<16>{});
+
+    constexpr auto gb_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout<16>(
+        gb_block_shape,
+        opus::unfold_x_stride(gb_block_dim, gb_block_shape, opus::tuple{opus::number<2048>{}, 16 * stride_b, opus::number<1024>{}, opus::number<1>{}}),
+        opus::unfold_p_coord(gb_block_dim, opus::tuple{wave_id_n, lane_id / 16, lane_id % 16}));
+}
+
+// Raw E8M0 scale panels retain their physical K-major A and N-major B strides.
+template<class T>
+__device__ inline auto make_layout_gsfa(int stride_sfa) {
+    constexpr auto gsfa_block_shape = opus::make_tuple(
+        opus::number<T::SCALE_COLS>{},
+        opus::number<T::SA_ROWS>{});
+
+    constexpr auto gsfa_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    return opus::make_layout(
+        gsfa_block_shape,
+        opus::unfold_x_stride(gsfa_block_dim, gsfa_block_shape, opus::tuple{stride_sfa, opus::number<1>{}}),
+        opus::unfold_p_coord(gsfa_block_dim, opus::tuple{}));
+}
+
+template<class T>
+__device__ inline auto make_layout_ssfa(int wave_id) {
+    constexpr auto ssfa_block_shape = opus::make_tuple(
+        opus::number<T::SA_COPIES>{},
+        opus::number<T::BLOCK_SIZE / 64>{},
+        opus::number<16>{});
+
+    constexpr auto ssfa_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    return opus::make_layout<16>(
+        ssfa_block_shape,
+        opus::unfold_x_stride(ssfa_block_dim, ssfa_block_shape, opus::tuple{opus::number<64 * 16>{}, opus::number<1>{}}),
+        opus::unfold_p_coord(ssfa_block_dim, opus::tuple{wave_id}));
+}
+
 template<class T>
 __device__ inline auto make_layout_rsfa(int lane_id) {
+    constexpr auto rsfa_block_shape = opus::make_tuple(
+        opus::number<T::B_K / 128>{},
+        opus::number<T::MR>{},
+        opus::number<16>{});
+
+    constexpr auto rsfa_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}));
+
     return opus::make_layout(
-        opus::make_tuple(opus::number<T::B_K / 128>{}, opus::number<T::MR>{}),
-        opus::make_tuple(opus::number<T::SA_ROWS>{}, opus::number<16>{})) + lane_id % 16;
+        rsfa_block_shape,
+        opus::unfold_x_stride(rsfa_block_dim, rsfa_block_shape, opus::tuple{opus::number<T::SA_ROWS>{}, opus::number<1>{}}),
+        opus::unfold_p_coord(rsfa_block_dim, opus::tuple{lane_id % 16}));
+}
+
+template<class T>
+__device__ inline auto make_layout_gsfb(int stride_sfb) {
+    constexpr auto gsfb_block_shape = opus::make_tuple(
+        opus::number<T::SB_ROWS>{},
+        opus::number<T::SCALE_COLS>{});
+
+    constexpr auto gsfb_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    return opus::make_layout(
+        gsfb_block_shape,
+        opus::unfold_x_stride(gsfb_block_dim, gsfb_block_shape, opus::tuple{stride_sfb, opus::number<1>{}}),
+        opus::unfold_p_coord(gsfb_block_dim, opus::tuple{}));
+}
+
+template<class T>
+__device__ inline constexpr auto make_layout_ssfb() {
+    constexpr auto ssfb_block_shape = opus::make_tuple(
+        opus::number<T::BLOCK_SIZE / 64>{},
+        opus::number<64>{},
+        opus::number<4>{});
+
+    constexpr auto ssfb_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    return opus::make_layout(
+        ssfb_block_shape,
+        opus::unfold_x_stride(ssfb_block_dim, ssfb_block_shape, opus::tuple{opus::number<4>{}, opus::number<1>{}}),
+        opus::unfold_p_coord(ssfb_block_dim, opus::tuple{}));
 }
 
 template<class T>
 __device__ inline auto make_layout_rsfb(int wave_id_n) {
     constexpr int groups = (T::B_N / T::T_N + 127) / 128;
     constexpr int scale_stride = T::SB_SLOTS ? 4 : 1;
+    constexpr auto rsfb_block_shape = opus::make_tuple(
+        opus::number<T::B_K / 128>{},
+        opus::number<groups>{},
+        opus::number<T::SB_ROWS>{});
+
+    constexpr auto rsfb_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}));
+
     return opus::make_layout(
-        opus::make_tuple(opus::number<T::B_K / 128>{}, opus::number<groups>{}),
-        opus::make_tuple(opus::number<scale_stride>{}, opus::number<T::SCALE_COLS * scale_stride>{}))
-        + (wave_id_n * (T::B_N / T::T_N) / 128) * T::SCALE_COLS * scale_stride;
+        rsfb_block_shape,
+        opus::unfold_x_stride(rsfb_block_dim, rsfb_block_shape, opus::tuple{opus::number<scale_stride>{}, opus::number<T::SCALE_COLS * scale_stride>{}, opus::number<T::SCALE_COLS * scale_stride>{}}),
+        opus::unfold_p_coord(rsfb_block_dim, opus::tuple{wave_id_n * (T::B_N / T::T_N) / 128}));
 }
 
 // MFMA C fragments scatter into the padded LDS output stripe.
 template<class T>
 __device__ inline auto make_layout_sc(int lane_id, int wave_id_n) {
+    constexpr auto sc_block_shape = opus::make_tuple(
+        opus::number<T::MR>{},
+        opus::number<16>{},
+        opus::number<T::T_N>{},
+        opus::number<T::NR>{},
+        opus::number<4>{},
+        opus::number<4>{});
+
+    constexpr auto sc_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+
     return opus::make_layout<4>(
-        opus::make_tuple(opus::number<T::MR>{}, opus::number<T::NR>{}, opus::number<4>{}),
-        opus::make_tuple(opus::number<16 * (T::B_N + 8)>{}, opus::number<16>{}, opus::number<1>{}),
-        opus::make_tuple(opus::underscore{}, opus::underscore{}, opus::underscore{}))
-        + (lane_id % 16) * (T::B_N + 8) + wave_id_n * (T::B_N / T::T_N) + (lane_id / 16) * 4;
+        sc_block_shape,
+        opus::unfold_x_stride(sc_block_dim, sc_block_shape, opus::tuple{opus::number<T::B_N + 8>{}, opus::number<16>{}, opus::number<1>{}}),
+        opus::unfold_p_coord(sc_block_dim, opus::tuple{lane_id % 16, wave_id_n, lane_id / 16}));
 }
 
 template<class T, int Rows>
 __device__ inline auto make_layout_sc_copy(int thread_id) {
     constexpr int copies = (Rows * (T::B_N / 8) + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
+    constexpr auto sc_copy_block_shape = opus::make_tuple(
+        opus::number<copies>{},
+        opus::number<T::BLOCK_SIZE>{},
+        opus::number<8>{});
+
+    constexpr auto sc_copy_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
     auto u = opus::make_layout<8>(
-        opus::make_tuple(opus::number<copies>{}, opus::number<8>{}),
-        opus::make_tuple(opus::number<T::BLOCK_SIZE * 8>{}, opus::number<1>{}),
-        opus::make_tuple(opus::underscore{}, opus::underscore{}));
+        sc_copy_block_shape,
+        opus::unfold_x_stride(sc_copy_block_dim, sc_copy_block_shape, opus::tuple{opus::number<1>{}}),
+        opus::unfold_p_coord(sc_copy_block_dim, opus::tuple{thread_id}));
     opus::static_for<copies>([&](auto i) {
         const int index = decltype(i)::value * T::BLOCK_SIZE + thread_id;
         u.offsets[i] = (index / (T::B_N / 8)) * (T::B_N + 8) + (index % (T::B_N / 8)) * 8;
@@ -138,10 +256,18 @@ __device__ inline auto make_layout_sc_copy(int thread_id) {
 template<class T, int Rows>
 __device__ inline auto make_layout_gc_copy(int thread_id, int stride_c) {
     constexpr int copies = (Rows * (T::B_N / 8) + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
+    constexpr auto gc_copy_block_shape = opus::make_tuple(
+        opus::number<copies>{},
+        opus::number<T::BLOCK_SIZE>{},
+        opus::number<8>{});
+
+    constexpr auto gc_copy_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
     auto u = opus::make_layout<8>(
-        opus::make_tuple(opus::number<copies>{}, opus::number<8>{}),
-        opus::make_tuple(opus::number<T::BLOCK_SIZE * 8>{}, opus::number<1>{}),
-        opus::make_tuple(opus::underscore{}, opus::underscore{}));
+        gc_copy_block_shape,
+        opus::unfold_x_stride(gc_copy_block_dim, gc_copy_block_shape, opus::tuple{opus::number<1>{}}),
+        opus::unfold_p_coord(gc_copy_block_dim, opus::tuple{thread_id}));
     opus::static_for<copies>([&](auto i) {
         const int index = decltype(i)::value * T::BLOCK_SIZE + thread_id;
         u.offsets[i] = (index / (T::B_N / 8)) * stride_c + (index % (T::B_N / 8)) * 8;
@@ -151,13 +277,25 @@ __device__ inline auto make_layout_gc_copy(int thread_id, int stride_c) {
 
 template<class T, bool ContiguousWaveN>
 __device__ inline auto make_layout_gc_packed(int lane_id, int wave_id_m, int wave_id_n, int stride_c) {
+    constexpr auto gc_packed_block_shape = opus::make_tuple(
+        opus::number<T::E_M>{},
+        opus::number<T::T_M>{},
+        opus::number<16>{},
+        opus::number<T::E_N>{},
+        opus::number<T::T_N>{},
+        opus::number<2>{},
+        opus::number<8>{});
+
+    constexpr auto gc_packed_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+
     return opus::make_layout<8>(
-        opus::make_tuple(opus::number<T::E_M>{}, opus::number<T::E_N>{}, opus::number<8>{}),
-        opus::make_tuple(T::T_M * 16 * stride_c,
-                         opus::number<(ContiguousWaveN ? 1 : T::T_N) * 16>{}, opus::number<1>{}),
-        opus::make_tuple(opus::underscore{}, opus::underscore{}, opus::underscore{}))
-        + (wave_id_m * 16 + lane_id % 16) * stride_c
-        + (ContiguousWaveN ? wave_id_n * T::E_N : wave_id_n) * 16 + (lane_id / 32) * 8;
+        gc_packed_block_shape,
+        opus::unfold_x_stride(gc_packed_block_dim, gc_packed_block_shape, opus::tuple{stride_c, opus::number<(ContiguousWaveN ? 1 : T::T_N) * 16>{}, opus::number<(ContiguousWaveN ? T::E_N : 1) * 16>{}, opus::number<1>{}}),
+        opus::unfold_p_coord(gc_packed_block_dim, opus::tuple{wave_id_m, lane_id % 16, wave_id_n, lane_id / 32}));
 }
 
 // Read an A fragment directly from LDS into its assigned AGPRs.
@@ -339,10 +477,10 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
     const auto u_sa = make_layout_sa<T>(wave_id);
     const auto u_gb = make_layout_gb<T>(lane_id, wave_id_n, stride_b);
     const auto u_gsfa = make_layout_gsfa<T>(args.stride_sfa);
-    const auto u_gsfb = make_layout_gsfb<T>(args.stride_sfb);
     const auto u_ssfa = make_layout_ssfa<T>(wave_id);
-    constexpr auto u_ssfb = make_layout_ssfb<T>();
     const auto u_rsfa = make_layout_rsfa<T>(lane_id);
+    const auto u_gsfb = make_layout_gsfb<T>(args.stride_sfb);
+    constexpr auto u_ssfb = make_layout_ssfb<T>();
     const auto u_rsfb = make_layout_rsfb<T>(wave_id_n);
     const auto u_sc = make_layout_sc<T>(lane_id, wave_id_n);
     const auto u_sc_copy = make_layout_sc_copy<T, C_ROWS>(thread_id);
