@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -12,10 +13,14 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
@@ -26,6 +31,8 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
 
 
 def bench_gemm_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
     M: int,
     N: int,
     K: int,
@@ -35,7 +42,9 @@ def bench_gemm_fn(
     gluon: bool,
 ):
     c_dtype = torch.bfloat16
-    x, _, w, _, _, x_scale, w_scale, _, y = generate_gemm_afp4wfp4_inputs(
+
+    _p_gen = functools.partial(
+        generate_gemm_afp4wfp4_inputs,
         M,
         N,
         K,
@@ -45,37 +54,43 @@ def bench_gemm_fn(
         shuffle_scales_fg=preshuffle,
         shuffle_weight_fg=preshuffle,
     )
-    # flops
-    flops = 2.0 * M * N * K
-    # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
-    mem_read += (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
+    # (x, w, w_shuffed, x_scales, w_scales, x_scales_shuffled, w_scales_shuffled, out_dtype, y)
+    # gemm_afp4wfp4_preshuffle names its activation/weight kwargs x_fp4/w_preshuf;
+    # the non-preshuffle kernel uses x/w. w_shuffed/*_shuffled already collapse to the
+    # unshuffled tensors when preshuffle is False, so one mapping covers both kernels.
+    x_key = "x_fp4" if preshuffle else "x"
+    w_key = "w_preshuf" if preshuffle else "w"
+    _out_vals_keys = [x_key, "_", w_key, "_", "_", "x_scales", "w_scales", "_", "y"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], **kwargs_rot_bufs
     )
-    mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
-    mem = mem_read + mem_write
+
     if preshuffle:
-        ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4_preshuffle(x, w, x_scale, w_scale, c_dtype, y),
-            warmup=25,
-            rep=100,
+        kernel_fn = functools.partial(gemm_afp4wfp4_preshuffle, dtype=c_dtype)
+    elif gluon:
+        kernel_fn = functools.partial(
+            triton_gemm_afp4wfp4, dtype=c_dtype, backend="gluon"
         )
     else:
-        if gluon:
-            ms = triton.testing.do_bench(
-                lambda: triton_gemm_afp4wfp4(
-                    x, w, x_scale, w_scale, c_dtype, y, backend="gluon"
-                ),
-                warmup=25,
-                rep=100,
-            )
-        else:
-            ms = triton.testing.do_bench(
-                lambda: triton_gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
-                warmup=25,
-                rep=100,
-            )
+        kernel_fn = functools.partial(triton_gemm_afp4wfp4, dtype=c_dtype)
+
+    # flops
+    flops = 2.0 * M * N * K
+    # memory transfer. x/w are e2m1, packed two values per byte, so the byte
+    # count is K // 2 wide; the mx scale tensors keep their own numel (one
+    # scale per 32 K-elements, which doesn't reduce to a clean M/N/K product).
+    mem_read = (M * K // 2) * rot_bufs[0][x_key].element_size() + (
+        N * K // 2
+    ) * rot_bufs[0][w_key].element_size()
+    mem_read += (
+        rot_bufs[0]["x_scales"].numel() * rot_bufs[0]["x_scales"].element_size()
+        + rot_bufs[0]["w_scales"].numel() * rot_bufs[0]["w_scales"].element_size()
+    )
+    mem_write = (M * N) * rot_bufs[0]["y"].element_size()
+    mem = mem_read + mem_write
+
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
         return ms
@@ -118,6 +133,9 @@ def run_benchmark(args, defaults):
 def run_model_benchmark(args):
     benchmark = get_model_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4(
         M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
@@ -134,7 +152,17 @@ def run_model_benchmark(args):
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, args.preshuffle, args.gluon)
+        return bench_gemm_fn(
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            args.preshuffle,
+            args.gluon,
+        )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
@@ -142,9 +170,22 @@ def run_model_benchmark(args):
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4(M, N, K, metric, model_name=None, **kwargs):
-        return bench_gemm_fn(M, N, K, metric, args.layout, args.preshuffle, args.gluon)
+        return bench_gemm_fn(
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            args.preshuffle,
+            args.gluon,
+        )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
