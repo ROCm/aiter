@@ -1,6 +1,16 @@
 ## Summary
 
-<!-- What does this pull request change? -->
+<!-- Briefly describe what this pull request changes. -->
+
+## Motivation
+
+<!-- Why is this change needed? What is insufficient about the current behavior? -->
+
+## Changes
+
+<!-- List the main changes and their impact on existing code or users. -->
+
+-
 
 ## Performance (if applicable)
 
@@ -9,6 +19,31 @@
 | Hardware | Workload/configuration | Before | After | Change |
 |----------|------------------------|--------|-------|--------|
 |          |                        |        |       |        |
+
+## Testing
+
+<!-- Check applicable items and explain any important unchecked item in "Validation and unverified scope" below. -->
+
+- [ ] Unit tests added or updated
+- [ ] Performance benchmarks run
+- [ ] Tested on MI250X
+- [ ] Tested on MI300X
+
+## Documentation
+
+- [ ] Docstrings updated
+- [ ] User guide updated
+- [ ] Performance guide updated
+- [ ] No documentation change is needed, with the reason stated below
+
+## Dependencies
+
+- [ ] No new third-party dependencies added
+- [ ] New dependencies are listed and justified below
+
+## Breaking Changes
+
+<!-- List breaking changes and the migration path. Write "None" when there are none. -->
 
 ## PR Self-Review
 

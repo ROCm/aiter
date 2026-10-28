@@ -454,8 +454,9 @@ Examples:
 ### PR Description Template
 
 GitHub automatically loads `.github/pull_request_template.md`. Complete its
-summary and PR Self-Review sections, and add performance, documentation,
-dependency or migration details when they apply to the change.
+summary, motivation, changes, testing and PR Self-Review sections. Complete the
+performance, documentation, dependency and breaking-change sections when they
+apply, and state why when an expected item was not run or is not applicable.
 
 ### Code Review Process
 
