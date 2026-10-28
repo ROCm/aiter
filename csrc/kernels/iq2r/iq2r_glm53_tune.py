@@ -208,6 +208,8 @@ def time_us(calls, warmup: int, iters: int) -> float:
 
 
 class IQ2RGlm53Tuner(TunerCommon):
+    SUPPORTS_POWER_SELECT = True
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "untune_file": f"{core.AITER_ROOT_DIR}/aiter/configs/iq2r_glm53_untuned.csv",

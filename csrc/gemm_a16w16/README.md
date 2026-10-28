@@ -77,7 +77,7 @@ If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with n
 ### `--select`
 - **Choices**: `latency` (default), `power` (experimental; `efficiency` and `power_efficiency` are aliases)
 - **Also**: `AITER_SELECT`
-- **Description**: Rank kernels that pass `errRatio`. `latency` keeps the lowest `us`. `power` ranks by TFLOP/s per package watt (`us * PPT watts`) and writes `watts` and `tflops_per_w`. This applies to every backend that uses the shared tuner, including asm, opus, flydsl, triton, skinny, torch, and hipblaslt. Runtime dispatch is unchanged: the one CSV row per shape is the kernel that runs.
+- **Description**: Rank kernels that pass `errRatio`. `latency` keeps the lowest `us`. `power` ranks by package energy (`us * PPT watts`) and writes `watts` and `tflops_per_w`. This applies to every backend that uses the shared tuner, including asm, opus, flydsl, triton, skinny, torch, and hipblaslt. Runtime dispatch is unchanged: the one CSV row per shape is the kernel that runs. A batch that records no finite watts is left as a latency result and is not labeled `select=power`. `--compare --update_improved` compares latency only and cannot be combined with `--select power`.
 
 Power mode is experimental. It minimizes `us * package watts` among kernels that pass `errRatio` and adds no latency or throughput bound, so a slower kernel can win when it uses less energy. The score is an isolated replay of each kernel under the clock, power cap, and thermal state in effect during the tune. The winner can change in another model, under another power-management setting, or next to other kernels. Latency remains the default.
 

@@ -1045,7 +1045,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
             if power_selection_enabled():
                 watts, tflops_per_w = power_columns(el, tflops)
                 metrics["watts"] = [watts]
-                metrics["tflops_per_w"] = [tflops_per_w]
                 watt_text = f", watts={watts} W, tflops_per_w={tflops_per_w} TFLOPS/W"
             if len(results) == self.topk:
                 print(

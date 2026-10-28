@@ -401,6 +401,8 @@ def dataframe_from_cases(
 
 
 class K5BvTuner(TunerCommon):
+    SUPPORTS_POWER_SELECT = True
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "untune_file": _DEFAULT_UNTUNED,

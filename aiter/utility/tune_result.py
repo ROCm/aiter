@@ -178,7 +178,11 @@ class TuneResult(tuple):
 
 
 def attach_power_columns(df, results):
-    """Add watts and tflops_per_w on a power tune. Latency frames stay unchanged."""
+    """Add watts on a power tune. Latency frames stay unchanged.
+
+    ``tflops_per_w`` is added later by ``TunerCommon.power_metrics``, so a
+    tuner with its own formula (MoE stage energy) is not overwritten here.
+    """
     if not power_selection_enabled():
         return df
     if df is None or not hasattr(df, "columns"):
@@ -196,32 +200,10 @@ def attach_power_columns(df, results):
             watts.append(float("nan"))
         else:
             watts.append(round(watts_f, 3))
-    out = df
-    if "watts" not in out.columns:
-        out = out.copy()
-        out["watts"] = watts
-    if "tflops_per_w" not in out.columns and "tflops" in out.columns:
-        if out is df:
-            out = out.copy()
-        per_w = []
-        for tflops, watts_f in zip(out["tflops"], out["watts"]):
-            try:
-                tflops_f = float(tflops)
-                watts_v = float(watts_f)
-            except (TypeError, ValueError):
-                per_w.append(float("nan"))
-                continue
-            if (
-                math.isnan(tflops_f)
-                or math.isnan(watts_v)
-                or tflops_f <= 0
-                or watts_v <= 0
-            ):
-                per_w.append(float("nan"))
-            else:
-                per_w.append(round(tflops_f / watts_v, 6))
-        out["tflops_per_w"] = per_w
-    return out
+    if "watts" not in df.columns:
+        df = df.copy()
+        df["watts"] = watts
+    return df
 
 
 def sort_frame_for_selection(df, select_power=None):
