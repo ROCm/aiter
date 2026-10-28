@@ -2592,89 +2592,61 @@ def test_dsv4_i384_fhmoe_config_has_true_shapes():
     assert ordinary_m16["kernelName2"].startswith("opus_")
 
 
-def test_fhmoe_aot_manifest_covers_native_i384():
+def test_fhmoe_aot_replays_dedicated_rows():
     from aiter.aot.flydsl.moe import parse_csv
-    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
-    ordinary_path = (
-        Path(__file__).resolve().parents[1]
-        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
-    )
-    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
-    ordinary_jobs = parse_csv(str(ordinary_path))
-    base_jobs = parse_csv(str(config_path))
-    dedicated_jobs = [job for job in base_jobs if job["inter_dim"] == 384]
-    hy4_jobs = [job for job in base_jobs if job["inter_dim"] == 256]
-    ordinary_fhmoe_jobs = [
-        job for job in ordinary_jobs if job.get("shared_expert_id", -1) >= 0
-    ]
+    configs = Path(__file__).resolve().parents[1] / "aiter/configs"
+    ordinary_jobs = parse_csv(str(configs / "model_configs/dsv4_fp8fp4_tuned_fmoe.csv"))
+    dedicated_jobs = parse_csv(str(configs / "tuned_fhmoe.csv"))
+    i384_jobs = [job for job in dedicated_jobs if job["inter_dim"] == "384"]
+    hy4_jobs = [job for job in dedicated_jobs if job["inter_dim"] == "256"]
 
-    assert not ordinary_fhmoe_jobs
-    assert len(dedicated_jobs) == 24
-    assert all(job["inter_dim"] == 384 for job in dedicated_jobs)
-    assert all(job["shared_expert_id"] == 384 for job in dedicated_jobs)
-    assert all(job["b_dtype"] == "fp4" for job in dedicated_jobs)
-    assert all(not job.get("enable_bias", False) for job in dedicated_jobs)
-    assert {job["token_num"] for job in dedicated_jobs} == {
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        128,
-        256,
-        512,
-        1024,
-        2048,
+    assert all(job["shared_expert_id"] in ("", "-1") for job in ordinary_jobs)
+    assert i384_jobs and hy4_jobs
+    assert len(i384_jobs) + len(hy4_jobs) == len(dedicated_jobs)
+    assert {job["shared_expert_id"] for job in i384_jobs} == {"384"}
+    assert {job["shared_expert_id"] for job in hy4_jobs} == {"256"}
+    assert {job["bias"] for job in dedicated_jobs} == {"none"}
+    assert {job["gate_mode"] for job in dedicated_jobs} == {GateMode.INTERLEAVE.value}
+    # Only MXFP8 routed weights let a caller leave the shared expert unclamped.
+    assert {job["clamp_shared"] for job in i384_jobs} == {True}
+    assert {job["clamp_shared"] for job in hy4_jobs} == {True, False}
+    for jobs, top in ((i384_jobs, 2048), (hy4_jobs, 32768)):
+        tokens = {1 << exponent for exponent in range(top.bit_length())}
+        assert {int(job["token"]) for job in jobs} == tokens
+        # Each row also replays at the smallest M that resolves to it.
+        assert {(int(job["token"]), job["m"]) for job in jobs} == {
+            (token, m) for token in tokens for m in {token // 2 + 1, token}
+        }
+    assert {
+        (job["kernelName1"], job["kernelName2"])
+        for job in i384_jobs
+        if job["token"] == "2048"
+    } == {
+        (
+            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
+        )
     }
-    assert len(hy4_jobs) == 48
-    assert all(job["shared_expert_id"] == 256 for job in hy4_jobs)
-    assert all(job["b_dtype"] == "fp8" for job in hy4_jobs)
-    hy4_stage1_jobs = [job for job in hy4_jobs if job["stage"] == 1]
-    assert len(hy4_stage1_jobs) == 32
-    assert {job["clamp_shared"] for job in hy4_stage1_jobs} == {True, False}
-    assert all("clamp_shared" not in job for job in hy4_jobs if job["stage"] == 2)
-    assert {job["token_num"] for job in hy4_jobs} == {
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        128,
-        256,
-        512,
-        1024,
-        2048,
-        4096,
-        8192,
-        16384,
-        32768,
-    }
-    for job in base_jobs:
-        params = get_flydsl_kernel_params(job["kernel_name"])
-        assert params is not None
-        assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
-        # HY4's FP8/FP8 rows are intentionally non-persistent. Restored DSV4
-        # FP8/FP4 rows retain their legacy persist suffixes; the shared runtime
-        # normalizes FP8-A grid scheduling in resolve_flydsl_grid_y_persist_m.
-        if job["stage"] == 2 and job["a_dtype"] == "fp8" and job["b_dtype"] == "fp8":
-            assert not job.get("persist", False)
-        if job["stage"] == 1:
-            assert job["inter_dim"] % job["tile_n"] == 0
-        else:
-            assert job["inter_dim"] % job["tile_k"] == 0
 
-    m2048_names = {
-        job["kernel_name"] for job in dedicated_jobs if job["token_num"] == 2048
+
+@pytest.mark.parametrize(
+    "table", ("model_configs/gptoss_fp8fp4_tuned_fmoe.csv", "tuned_grouped_fmoe.csv")
+)
+def test_moe_aot_replays_swiglu_bias_with_interleaved_weights(table: str):
+    from aiter.aot.flydsl.moe import parse_csv
+
+    configs = Path(__file__).resolve().parents[1] / "aiter/configs"
+    variants = {
+        (job["gate_mode"], job["bias"])
+        for job in parse_csv(str(configs / table))
+        if job["act_type"] == "ActivationType.Swiglu"
     }
-    assert m2048_names == {
-        "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
-        "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
-    }
+    # GPT-OSS a8w4 on gfx950, and every gfx1250 caller, pass gate/up-interleaved
+    # weights; Swiglu callers also pass expert bias, which is a FlyDSL compile key.
+    assert {
+        (GateMode.INTERLEAVE.value, bias) for bias in ("none", "both", "stage1")
+    } <= variants
 
 
 def test_fhmoe_aot_import_is_safe_in_lightweight_mode():
@@ -2688,9 +2660,10 @@ def test_fhmoe_aot_import_is_safe_in_lightweight_mode():
 import aiter
 assert not hasattr(aiter, "ActivationType")
 from aiter.fhmoe_contract import max_fhmoe_reduce_tokens
-from aiter.aot.flydsl.fhmoe import _FHMoEAOTBackend
+from aiter.aot.flydsl.moe import parse_csv
+from aiter.jit.core import AITER_CONFIGS
 assert max_fhmoe_reduce_tokens(9, 6144, 2) == 38836
-assert _FHMoEAOTBackend(shared_expert_id=256).shared_expert_id == 256
+assert parse_csv(AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE)
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -2703,6 +2676,30 @@ assert _FHMoEAOTBackend(shared_expert_id=256).shared_expert_id == 256
     assert result.returncode == 0, result.stderr
 
 
+def _fhmoe_rows(*, model_dim: str, token: str) -> tuple[list[str], list[dict]]:
+    import csv
+
+    source = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    with source.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        assert reader.fieldnames is not None
+        rows = [
+            row
+            for row in reader
+            if row["model_dim"] == model_dim and row["token"] == token
+        ]
+        return list(reader.fieldnames), rows
+
+
+def _write_fhmoe_rows(path: Path, fields: list[str], rows: list[dict]) -> None:
+    import csv
+
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def test_fhmoe_aot_cache_is_retrievable_in_run_only_mode(tmp_path: Path):
     import subprocess
     import sys
@@ -2710,30 +2707,21 @@ def test_fhmoe_aot_cache_is_retrievable_in_run_only_mode(tmp_path: Path):
     if get_gfx() != "gfx950":
         pytest.skip("FHMoE AOT cache retrieval requires gfx950")
     root = Path(__file__).resolve().parents[1]
-    cache = tmp_path / "cache"
+    fields, rows = _fhmoe_rows(model_dim="6144", token="1")
+    assert rows
+    table = tmp_path / "tuned_fhmoe.csv"
+    _write_fhmoe_rows(table, fields, rows)
     env = os.environ.copy()
-    env["FLYDSL_RUNTIME_CACHE_DIR"] = str(cache)
-    compile_env = dict(env, AITER_AOT_IMPORT="1")
-    compile_code = """
-from aiter.aot.flydsl.moe import compile_one_config, parse_csv
-from aiter.jit.core import AITER_CONFIGS
-jobs = [
-    job for job in parse_csv(AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE)
-    if job["model_dim"] == 6144 and job["token_num"] == 1
-]
-assert len(jobs) == 3
-for job in jobs:
-    assert compile_one_config(**job)["compile_time"] is not None
-"""
+    env["FLYDSL_RUNTIME_CACHE_DIR"] = str(tmp_path / "cache")
     compiled = subprocess.run(
-        [sys.executable, "-c", compile_code],
+        [sys.executable, "-m", "aiter.aot.flydsl.moe", "--csv", str(table)],
         cwd=root,
-        env=compile_env,
+        env=env,
         capture_output=True,
         text=True,
         check=False,
     )
-    assert compiled.returncode == 0, compiled.stderr
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
 
     run_env = dict(env, FLYDSL_RUNTIME_RUN_ONLY="1")
     retrieve_code = """
@@ -2781,484 +2769,60 @@ compile_flydsl_fhmoe_stage2(
 
 
 def test_fhmoe_aot_csv_preserves_padding(tmp_path: Path):
-    import csv
-
     from aiter.aot.flydsl.moe import parse_csv
 
-    source = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
-    with source.open(newline="") as stream:
-        reader = csv.DictReader(stream)
-        assert reader.fieldnames is not None
-        row = next(
-            row for row in reader if row["model_dim"] == "6144" and row["token"] == "1"
-        )
-        fields = reader.fieldnames
-    row["hidden_pad"] = "64"
-    row["intermediate_pad"] = "128"
+    fields, rows = _fhmoe_rows(model_dim="6144", token="1")
     padded = tmp_path / "padded_fhmoe.csv"
-    with padded.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        writer.writerow(row)
+    _write_fhmoe_rows(
+        padded,
+        fields,
+        [{**rows[0], "hidden_pad": "64", "intermediate_pad": "128"}],
+    )
 
     jobs = parse_csv(str(padded))
     assert jobs
     assert all(job["gfx"] == "gfx950" for job in jobs)
-    assert all(job["model_dim_pad"] == 64 for job in jobs)
-    assert all(job["inter_dim_pad"] == 128 for job in jobs)
-
-
-@pytest.mark.parametrize("stage", (1, 2))
-def test_fhmoe_aot_forwards_padding_to_compiler(
-    monkeypatch: pytest.MonkeyPatch, stage: int
-):
-    from aiter.aot.flydsl import moe as aot_moe
-
-    forwarded = {}
-
-    class Backend:
-        def build_stage1_args(self, *_args, **_kwargs):
-            return ()
-
-        def build_stage2_args(self, *_args, **_kwargs):
-            return ()
-
-        def compile_stage1(self, **kwargs):
-            forwarded.update(kwargs)
-            return object()
-
-        def compile_stage2(self, **kwargs):
-            forwarded.update(kwargs)
-            return object()
-
-    monkeypatch.setattr(aot_moe, "_run_compiled", lambda *_args: None)
-    aot_moe._precompile_to_cache(
-        stage=stage,
-        model_dim=256,
-        inter_dim=128,
-        experts=9,
-        topk=3,
-        tile_m=32,
-        tile_n=128,
-        tile_k=128,
-        a_dtype="fp8",
-        b_dtype="fp8",
-        out_dtype="bf16",
-        gate_mode="interleave",
-        mode="atomic",
-        cu_num=256,
-        token_num=1,
-        block_m=32,
-        model_dim_pad=64,
-        inter_dim_pad=128,
-        _aot_backend=Backend(),
-    )
-
-    assert forwarded["model_dim_pad"] == 64
-    assert forwarded["inter_dim_pad"] == 128
-
-
-def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.aot.flydsl import moe as aot_moe
-
-    forwarded = {}
-    compile_arch = []
-
-    def precompile(**kwargs):
-        forwarded.update(kwargs)
-        compile_arch.append(os.environ.get("FLYDSL_GPU_ARCH"))
-
-    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
-    monkeypatch.setenv("FLYDSL_GPU_ARCH", "gfx1250")
-    aot_fhmoe.precompile_fhmoe_to_cache(
-        experts=385,
-        shared_expert_id=384,
-        cu_num=256,
-        stage=2,
-        model_dim=7168,
-        inter_dim=384,
-        topk=7,
-    )
-
-    assert forwarded["inter_dim"] == 384
-    assert forwarded["_aot_backend"].shared_expert_id == 384
-    assert compile_arch == ["gfx950"]
-    assert os.environ["FLYDSL_GPU_ARCH"] == "gfx1250"
-
-
-def test_fhmoe_aot_stage2_scale_size_uses_padded_inter_dim():
-    from aiter.aot.flydsl.moe import _mx_w2_scale_numel
-
-    assert _mx_w2_scale_numel(385, 7168, 384) == 385 * 7168 * (512 // 32)
-    assert _mx_w2_scale_numel(257, 6144, 256) == 257 * 6144 * (256 // 32)
-
-
-def test_fhmoe_aot_precompile_accepts_hy4_mxfp8(monkeypatch: pytest.MonkeyPatch):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.aot.flydsl import moe as aot_moe
-
-    forwarded = {}
-
-    def precompile(**kwargs):
-        forwarded.update(kwargs)
-
-    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
-    aot_fhmoe.precompile_fhmoe_to_cache(
-        experts=257,
-        shared_expert_id=256,
-        a_dtype="fp8",
-        b_dtype="fp8",
-        cu_num=256,
-        stage=1,
-        model_dim=6144,
-        inter_dim=256,
-        topk=9,
-        gate_mode="interleave",
-    )
-
-    assert forwarded["b_dtype"] == "fp8"
-    assert forwarded["inter_dim"] == 256
-    assert forwarded["_aot_backend"].shared_expert_id == 256
-
-
-@pytest.mark.parametrize("cu_num", (-1, 0, 256))
-def test_fhmoe_aot_precompile_accepts_hy4_mxfp8_stage2(
-    monkeypatch: pytest.MonkeyPatch, cu_num: int
-):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.aot.flydsl import moe as aot_moe
-
-    forwarded = {}
-
-    def precompile(**kwargs):
-        forwarded.update(kwargs)
-
-    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
-    aot_fhmoe.precompile_fhmoe_to_cache(
-        experts=257,
-        shared_expert_id=256,
-        a_dtype="fp8",
-        b_dtype="fp8",
-        cu_num=cu_num,
-        stage=2,
-        model_dim=6144,
-        inter_dim=256,
-        topk=9,
-    )
-
-    assert forwarded["stage"] == 2
-    assert forwarded["b_dtype"] == "fp8"
-    assert forwarded["cu_num"] == 256
-
-
-def test_fhmoe_aot_compile_job_forwards_explicit_target_gfx(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.aot.flydsl import moe as aot_moe
-
-    forwarded = {}
-
-    def precompile(**kwargs):
-        forwarded.update(kwargs)
-
-    monkeypatch.setattr(aot_fhmoe, "precompile_fhmoe_to_cache", precompile)
-    result = aot_moe.compile_one_config(
-        kernel_name="flydsl_moe2_afp8_wfp8_bf16_t32x128x128_atomic",
-        model_dim=6144,
-        inter_dim=256,
-        experts=257,
-        topk=9,
-        cu_num=256,
-        gfx="gfx950",
-        shared_expert_id=256,
-        stage=2,
-        a_dtype="fp8",
-        b_dtype="fp8",
-    )
-
-    assert result["compile_arch"] == "gfx950"
-    assert forwarded["gfx"] == "gfx950"
-    assert forwarded["cu_num"] == 256
-
-
-def test_fhmoe_aot_precompile_rejects_separated_mxfp8():
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-
-    with pytest.raises(ValueError, match="interleaved gate/up layout"):
-        aot_fhmoe.precompile_fhmoe_to_cache(
-            experts=257,
-            shared_expert_id=256,
-            a_dtype="fp8",
-            b_dtype="fp8",
-            cu_num=256,
-            stage=1,
-            model_dim=6144,
-            inter_dim=256,
-            topk=9,
-        )
-
-
-def test_fhmoe_aot_precompile_rejects_unknown_cu_count():
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-
-    with pytest.raises(ValueError, match="requires target gfx950"):
-        aot_fhmoe.precompile_fhmoe_to_cache(
-            experts=257,
-            shared_expert_id=256,
-            a_dtype="fp8",
-            b_dtype="fp8",
-            cu_num=999,
-            stage=2,
-            model_dim=6144,
-            inter_dim=256,
-            topk=9,
-        )
-
-
-def test_fhmoe_aot_precompile_rejects_non_gfx950_target():
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-
-    with pytest.raises(ValueError, match="gfx='gfx1250'.*cu_num=256"):
-        aot_fhmoe.precompile_fhmoe_to_cache(
-            experts=257,
-            shared_expert_id=256,
-            a_dtype="fp8",
-            b_dtype="fp8",
-            cu_num=256,
-            gfx="gfx1250",
-            stage=2,
-            model_dim=6144,
-            inter_dim=256,
-            topk=9,
-        )
-
-
-def test_fhmoe_aot_precompile_rejects_non_256_target_cu():
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-
-    with pytest.raises(ValueError, match="gfx='gfx942'.*cu_num=304"):
-        aot_fhmoe.precompile_fhmoe_to_cache(
-            experts=257,
-            shared_expert_id=256,
-            a_dtype="fp8",
-            b_dtype="fp8",
-            cu_num=304,
-            gfx="gfx942",
-            stage=2,
-            model_dim=6144,
-            inter_dim=256,
-            topk=9,
-        )
-
-
-def test_fhmoe_aot_precompile_rejects_invalid_stage():
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-
-    with pytest.raises(ValueError, match="stage must be 1 or 2"):
-        aot_fhmoe.precompile_fhmoe_to_cache(
-            experts=257,
-            shared_expert_id=256,
-            cu_num=256,
-            stage=0,
-        )
-
-
-def test_fhmoe_aot_clamp_default_and_explicit_unclamped_specialization(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.ops.flydsl import fhmoe as ops_fhmoe
-
-    monkeypatch.setattr(
-        ops_fhmoe,
-        "compile_flydsl_fhmoe_stage1",
-        lambda **kwargs: kwargs,
-    )
-    backend = aot_fhmoe._FHMoEAOTBackend(shared_expert_id=256)
-    kwargs = {
-        "model_dim": 6144,
-        "inter_dim": 256,
-        "experts": 257,
-        "topk": 9,
-        "b_dtype": "fp8",
-        "model_dim_pad": 0,
-        "inter_dim_pad": 0,
-        "gate_mode": "interleave",
-        "doweight_stage1": False,
-    }
-
-    assert backend.compile_stage1(**kwargs)["clamp_shared"] is True
-    assert (
-        backend.compile_stage1(**(kwargs | {"clamp_shared": False}))["clamp_shared"]
-        is False
-    )
+    assert all(job["hidden_pad"] == "64" for job in jobs)
+    assert all(job["intermediate_pad"] == "128" for job in jobs)
 
 
 @pytest.mark.parametrize("clamp_shared", (True, False))
-def test_fhmoe_aot_precompile_forwards_clamp_shared(
-    monkeypatch: pytest.MonkeyPatch,
-    clamp_shared: bool,
+def test_fhmoe_aot_replay_forwards_caller_choices(
+    monkeypatch: pytest.MonkeyPatch, clamp_shared: bool
 ):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+    import aiter.fhmoe as fhmoe_module
     from aiter.aot.flydsl import moe as aot_moe
+    from aiter.aot.flydsl.dry_run import dry_run
 
-    captured = {}
+    config = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    job = next(
+        job
+        for job in aot_moe.parse_csv(str(config))
+        if job["inter_dim"] == "256"
+        and job["clamp_shared"] is clamp_shared
+        and not job["local_tokens"]
+    )
+    job = {**job, "hidden_pad": "64", "intermediate_pad": "128"}
+    calls = []
     monkeypatch.setattr(
-        aot_fhmoe._FHMoEAOTBackend,
-        "compile_stage1",
-        lambda _self, **kwargs: captured.update(kwargs) or object(),
+        fhmoe_module, "_fhmoe_impl", lambda **kwargs: calls.append(kwargs)
     )
-    monkeypatch.setattr(aot_moe, "_run_compiled", lambda *_args, **_kwargs: None)
+    # A replay process imports aiter for its arch; this one imported it for the
+    # host, whose fp8 alias is fnuz on gfx942.
+    monkeypatch.setattr(dtypes, "fp8", torch.float8_e4m3fn)
+    with dry_run("gfx950", 256):
+        aot_moe._replay(job)
 
-    aot_moe._precompile_to_cache(
-        stage=1,
-        model_dim=6144,
-        inter_dim=256,
-        experts=257,
-        topk=9,
-        tile_m=32,
-        tile_n=64,
-        tile_k=256,
-        a_dtype="fp8",
-        b_dtype="fp8",
-        out_dtype="fp8",
-        token_num=1,
-        gate_mode="interleave",
-        k_wave=2,
-        shared_expert_id=256,
-        clamp_shared=clamp_shared,
-        _aot_backend=aot_fhmoe._FHMoEAOTBackend(shared_expert_id=256),
+    (call,) = calls
+    assert call["clamp_shared"] is clamp_shared
+    assert (call["hidden_pad"], call["intermediate_pad"]) == (64, 128)
+    assert call["gate_mode"] == GateMode.INTERLEAVE.value
+    assert call["shared_expert_id"] == 256
+    assert call["w1"].dtype == dtypes.fp8
+    assert all(
+        call[name] is not None
+        for name in ("shared_w1", "shared_w2", "shared_w1_scale", "shared_w2_scale")
     )
-
-    assert captured["clamp_shared"] is clamp_shared
-
-
-def test_fhmoe_aot_precompile_accepts_generic_mxfp8_clamp_modes(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.aot.flydsl import moe as aot_moe
-
-    forwarded = {}
-
-    def precompile(**kwargs):
-        forwarded.update(kwargs)
-
-    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
-    aot_fhmoe.precompile_fhmoe_to_cache(
-        experts=9,
-        shared_expert_id=8,
-        a_dtype="fp8",
-        b_dtype="fp8",
-        cu_num=256,
-        stage=1,
-        model_dim=256,
-        inter_dim=128,
-        topk=3,
-        gate_mode="interleave",
-    )
-
-    assert forwarded["b_dtype"] == "fp8"
-    assert forwarded["_aot_backend"].shared_expert_id == 8
-    aot_fhmoe.precompile_fhmoe_to_cache(
-        experts=9,
-        shared_expert_id=8,
-        a_dtype="fp8",
-        b_dtype="fp8",
-        cu_num=256,
-        stage=1,
-        model_dim=256,
-        inter_dim=128,
-        topk=3,
-        gate_mode="interleave",
-        clamp_shared=False,
-    )
-    assert forwarded["clamp_shared"] is False
-
-
-def test_fhmoe_aot_keeps_mxfp4_shared_expert_clamped():
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-
-    with pytest.raises(ValueError, match="MXFP8 routed weights"):
-        aot_fhmoe.precompile_fhmoe_to_cache(
-            experts=385,
-            shared_expert_id=384,
-            a_dtype="fp8",
-            b_dtype="fp4",
-            cu_num=256,
-            stage=1,
-            model_dim=7168,
-            inter_dim=384,
-            topk=7,
-            gate_mode="interleave",
-            clamp_shared=False,
-        )
-
-
-def test_fhmoe_aot_keeps_dsv4_shape_mxfp8_generic(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.aot.flydsl import moe as aot_moe
-
-    forwarded = {}
-
-    def precompile(**kwargs):
-        forwarded.update(kwargs)
-
-    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
-    aot_fhmoe.precompile_fhmoe_to_cache(
-        experts=385,
-        shared_expert_id=384,
-        a_dtype="fp8",
-        b_dtype="fp8",
-        cu_num=256,
-        stage=1,
-        model_dim=7168,
-        inter_dim=384,
-        topk=7,
-        gate_mode="interleave",
-    )
-
-    assert forwarded["b_dtype"] == "fp8"
-    assert forwarded["model_dim"] == 7168
-    assert forwarded["_aot_backend"].shared_expert_id == 384
-
-
-def test_fhmoe_aot_stage1_forwards_optional_swiglu_abi(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.ops.flydsl import fhmoe as ops_fhmoe
-
-    tensor = torch.empty(0)
-    forwarded = {}
-
-    monkeypatch.setattr(aot_fhmoe, "_shared_weight", lambda *_: tensor)
-    monkeypatch.setattr(aot_fhmoe, "_shared_scale", lambda *_: tensor)
-
-    def build_args(*args, **kwargs):
-        forwarded.update(kwargs)
-        return args
-
-    monkeypatch.setattr(ops_fhmoe, "_s1_args_fhmoe", build_args)
-
-    result = aot_fhmoe._FHMoEAOTBackend(shared_expert_id=8).build_stage1_args(
-        *((tensor,) * 10),
-        1,
-        2,
-        3,
-        4,
-        "cpu",
-        swiglu_limit=10.0,
-        pass_swiglu_limit=False,
-    )
-
-    assert result
-    assert forwarded["swiglu_limit"] == 10.0
-    assert forwarded["pass_swiglu_limit"] is False
 
 
 @pytest.mark.parametrize(

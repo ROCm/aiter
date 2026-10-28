@@ -135,7 +135,6 @@ def _is_fused_decode_sort_quant_enabled(
     activation: ActivationType,
     is_g1u1: bool,
     expert_mask: torch.Tensor | None,
-    num_local_tokens: torch.Tensor | None,
     need_local_topk_ids: bool,
     run_1stage: bool,
     stage1_is_flydsl: bool,
@@ -178,7 +177,6 @@ def _is_fused_decode_sort_quant_enabled(
         and activation == ActivationType.Silu
         and is_g1u1
         and expert_mask is None
-        and num_local_tokens is None
         and not need_local_topk_ids
         and not run_1stage
         and stage1_is_flydsl
@@ -247,6 +245,7 @@ def _fused_decode_sort_quant(
     moebuf_dtype: torch.dtype,
     accumulate: bool,
     compact_scale: bool = False,
+    num_local_tokens: torch.Tensor | None = None,
 ):
     """Return standard sorted metadata plus the pre-quantized stage-1 input."""
     device = hidden_states.device
@@ -286,6 +285,7 @@ def _fused_decode_sort_quant(
         activation_quant,
         activation_scale_token,
         global_experts,
+        num_local_tokens,
     )
     activation_scale = activation_scale_token
     if not compact_scale:
@@ -311,9 +311,10 @@ def _fused_decode_sort_quant(
 kernel_bench_callable = None
 
 
-# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
-# topk_weights through the sorted_* kernarg slots and accumulate via
-# global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
+# FLAT 1stage asm kernels ingest raw topk_ids / topk_weights through the
+# sorted_* kernarg slots and accumulate via global_atomic_pk_add_bf16, so
+# moe_sorting is a pass-through for them. The manifest value is flat=1
+# (one token per TG) or flat=2 (EMSORT); either nonzero value takes this path.
 
 
 def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
@@ -838,7 +839,7 @@ def moe_sorting(
             accumulate=accumulate,
             output=output,
         )
-    # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
+    # FLAT kernel: in-kernel routing (manifest flat=1 or flat=2); pass through unsorted topk.
     # `output` cannot be written in place: FLAT needs extra bytes appended to moe_buf.
     if flat:
         assert output is None, "FLAT over-allocates moe_buf; the caller copies"
@@ -1875,7 +1876,6 @@ def _fused_moe_impl(
         activation=activation,
         is_g1u1=isG1U1,
         expert_mask=expert_mask,
-        num_local_tokens=num_local_tokens,
         need_local_topk_ids=need_local_topk_ids,
         run_1stage=metadata.run_1stage,
         stage1_is_flydsl=stage1_func is _flydsl_stage1_wrapper,
@@ -1946,6 +1946,7 @@ def _fused_moe_impl(
             moebuf_dtype=dtype,
             accumulate=not runtime_stage2_reduce,
             compact_scale=fused_compact_scale,
+            num_local_tokens=num_local_tokens,
         )
         local_topk_ids = None
     else:
@@ -2280,6 +2281,39 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 cfg_2stages = None
 cfg_2stages_by_file = {}
+
+# Itanium symbols encode the activation (`_silu_` / `_gelu_` / `_situv2_`).
+# SiLU and GELU are the same length, so swapping the tag keeps the mangled
+# name valid and names the twin kernel in the other activation's cfg map.
+_ASM_ACT_TAG = {
+    ActivationType.Silu: "_silu_",
+    ActivationType.Gelu: "_gelu_",
+    ActivationType.Situv2: "_situv2_",
+}
+
+
+def _retarget_asm_activation(kernel_name, activation):
+    """Point a 1-stage asm symbol at the kernel for `activation`.
+
+    A tuned row is stored under one activation. The act-type-disabled fallback
+    can hand that symbol to a different activation. SiLU/GELU twins share the
+    mangled length, so the tag is swapped in place. A length-changing tag is
+    dropped and the activation's own cfg map selects a kernel.
+    """
+    if not isinstance(kernel_name, str) or not kernel_name:
+        return kernel_name
+    want = _ASM_ACT_TAG.get(activation)
+    if want is None or want in kernel_name:
+        return kernel_name
+    for other in _ASM_ACT_TAG.values():
+        if other not in kernel_name:
+            continue
+        if len(other) == len(want):
+            return kernel_name.replace(other, want, 1)
+        return ""
+    return kernel_name
+
+
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -2367,7 +2401,7 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_quant: str = ""
     stage2_has_bias: bool = False
-    flat: bool = False
+    flat: int = 0
     output_aux: bool | str = False
     prequant: bool = True
     skip_inter_quant: bool = False
@@ -3418,6 +3452,24 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
+def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
+    # is_shuffled is true when either weight is tagged. weights_shuffled is
+    # the both-weights flag when the caller passed opus_weights_shuffled,
+    # which fused_moe and fused_moe_2stages do. gfx is the live device;
+    # get_gfx() follows GPU_ARCHS and can hide an actual gfx950 process.
+    if (
+        gfx == "gfx950"
+        and q_dtype_w == dtypes.fp8
+        and q_type in (QuantType.per_Tensor, QuantType.per_Token)
+        and not weights_shuffled
+    ):
+        raise RuntimeError(
+            "gfx950 fp8 CK MoE reads the shuffle_weight() layout on "
+            "both w1 and w2; unshuffled per_Tensor and per_Token "
+            "weights are unsupported"
+        )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -3910,7 +3962,8 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         run_1stage_xbf16 = False
-        # No tuned config => default host moe_sort. For FLAT, run tuner and set flat=1.
+        # No tuned config => default host moe_sort (flat=0). A tuned FLAT row
+        # sets flat=1 (one token per TG) or flat=2 (EMSORT).
         cfg_flat = 0
         if (
             activation,
@@ -3922,8 +3975,20 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict.get(get_gfx(), {}):
             if q_type == QuantType.per_1x128:
+                xbf16 = (
+                    get_gfx() == "gfx950"
+                    and int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
+                )
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 128 == 0)
+                run_1stage = (
+                    token > 32
+                    and inter_dim % 128 == 0
+                    and aiter.fmoe_fp8_blockscale_g1u1_has_kernel(
+                        activation.value, xbf16, BLOCK_SIZE_M, inter_dim, model_dim
+                    )
+                    == 1
+                )
+                run_1stage_xbf16 = run_1stage and xbf16
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -3931,14 +3996,12 @@ def get_2stage_cfgs(
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
-            if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
-                run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
-
         block_m = (
             BLOCK_SIZE_M
             if run_1stage
             else (
-                (64 if token > 32 else 16)
+                # block_m=16 CK stage1 uses KPerBlock=256 (K=model_dim)
+                (64 if token > 32 else 16 if model_dim % 256 == 0 else 32)
                 if q_type == QuantType.per_1x128
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
@@ -3957,6 +4020,16 @@ def get_2stage_cfgs(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
     else:
+        # A tuned CK row does not use the heuristic above. is_shuffled is the
+        # OR, so one tagged weight used to skip the preshuffle warning too.
+        tuned_names = (
+            str(cfg.get("kernelName1", "") or ""),
+            str(cfg.get("kernelName2", "") or ""),
+        )
+        if not cfg.get("run_1stage", False) and any(
+            "moe_ck2stages" in name for name in tuned_names
+        ):
+            _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled)
         block_m = cfg["block_m"]
         nt_override = int(os.environ.get("AITER_USE_NT", "-1"))
         if nt_override != -1:
@@ -3974,6 +4047,14 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        if run_1stage:
+            retargeted = _retarget_asm_activation(kernelName1, activation)
+            if retargeted != kernelName1:
+                logger.info(
+                    f"[fused_moe] 1-stage kernel {kernelName1!r} is for a "
+                    f"different activation; using {retargeted!r} for {activation}"
+                )
+                kernelName1 = retargeted
         if not is_shuffled and not run_1stage:
             logger.warning(
                 f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
@@ -4576,6 +4657,8 @@ def get_2stage_cfgs(
                 activation=activation,
             )
         else:
+            # Plain fp8 CK instances read the shuffle_weight() layout.
+            _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled)
             stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
@@ -5884,6 +5967,7 @@ def fused_topk(
     renormalize: bool,
     topk_ids: torch.Tensor | None = None,
     topk_weights: torch.Tensor | None = None,
+    num_valid_rows: torch.Tensor | None = None,  # see aiter.topk_gating
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -5894,8 +5978,10 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
+    # The asm kernel takes no pad-row count.
     if (
-        get_gfx() in ["gfx942", "gfx950"]
+        num_valid_rows is None
+        and get_gfx() in ["gfx942", "gfx950"]
         and (expert, topk)
         in [
             (128, 4),
@@ -5941,6 +6027,7 @@ def fused_topk(
             token_expert_indicies,
             gating_output,
             renormalize,
+            num_valid_rows=num_valid_rows,
         )
 
     del token_expert_indicies  # Not used. Will be used in the future.

@@ -7,7 +7,8 @@ arch has a kernel for the operands' w_scale block.
 ``XQ [M, B, K]`` fp8, ``WQ [B, N, K]`` fp8 preshuffled, ``x_scale`` and
 ``w_scale`` e8m0 blocks, ``Out [M, B, N]`` bf16. ``x_scale`` is row-major, or
 with x_scale_transposed (B = 1, 1x128 blocks) column-major [K / 128, M] under
-the same shape, the blockscale convention. The per-arch modules
+the same shape, the blockscale convention. A gfx1250 1x32 ``w_scale`` holds
+n32k4-shuffled bytes (``shuffle_scale_n32k4``), gfx950's is row-major. The per-arch modules
 (batched_gemm_a8w8_gfx950, batched_gemm_a8w8_gfx1250) hold the kernels; a tuned
 kernelName names one of them, so it is only valid on its arch.
 """
@@ -26,13 +27,21 @@ from ..gemm_op_common import mxscale_w_scale_block
 
 _GFX950 = ("batched_gemm_a8w8_gfx950", "run_bmm_a8w8_mxfp8_gfx950")
 _GFX1250 = ("batched_gemm_a8w8_gfx1250", "run_bmm_a8w8_mxfp8_128_gfx1250")
+_GFX1250_MX32 = ("batched_gemm_a8w8_gfx1250", "run_bmm_a8w8_mxfp8_32_gfx1250")
 # (gfx, w_scale block, x_scale column-major) -> (module, runner, its layout
 # argument). Only the running arch's module is ever imported.
 _RUNNERS = {
     ("gfx950", "32x32", False): (*_GFX950, {}),
+    ("gfx950", "32x32", True): (*_GFX950, {"x_scale_transposed": True}),
+    ("gfx950", "1x32", False): (*_GFX950, {}),
+    ("gfx950", "1x32", True): (*_GFX950, {"x_scale_transposed": True}),
     ("gfx950", "128x128", False): (*_GFX950, {}),
     ("gfx950", "128x128", True): (*_GFX950, {"x_scale_transposed": True}),
     ("gfx1250", "128x128", False): (*_GFX1250, {}),
+    # 1x32: the n32k4-shuffled [B, N, K/32] scale every gfx1250 mxfp8_32 GEMM
+    # reads; 32x32: the raw block scale, read in place.
+    ("gfx1250", "1x32", False): (*_GFX1250_MX32, {}),
+    ("gfx1250", "32x32", False): (*_GFX1250_MX32, {"w_scale_32x32": True}),
 }
 
 
