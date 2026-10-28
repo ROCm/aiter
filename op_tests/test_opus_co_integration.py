@@ -286,16 +286,20 @@ def test_gfx1250_co_assets_and_host_only_codegen(tmp_path, monkeypatch):
             assert stream.read(4) == b"\x7fELF"
         assert instance.splitk_workspace_dtype is None
 
-    image_dir = Path(CO_KERNELS_JSON).parent / GFX1250
-    build_info = json.loads((image_dir / "build_info.json").read_text())
-    assert len(build_info["kernels"]) == 221
-    assert {entry["kernarg_segment_size"] for entry in build_info["kernels"]} == {64}
-    assert {
-        entry["kid"]: entry["symbol"] for entry in build_info["kernels"]
-    } == symbols_by_kid
-    assert {image.stem for image in image_dir.glob("*.co")} == set(
-        symbols_by_kid.values()
-    )
+    # Check every tracked profile (regular and A0) so stale kids cannot hide in one.
+    profiles = _co_test_profile_dirs(Path(CO_KERNELS_JSON).parent)
+    assert [relative for _, relative in profiles] == [GFX1250, f"{GFX1250}-a0"]
+    for image_dir, _ in profiles:
+        build_info = json.loads((image_dir / "build_info.json").read_text())
+        assert len(build_info["kernels"]) == 221, image_dir
+        kernarg_sizes = {entry["kernarg_segment_size"] for entry in build_info["kernels"]}
+        assert kernarg_sizes == {64}, image_dir
+        assert {
+            entry["kid"]: entry["symbol"] for entry in build_info["kernels"]
+        } == symbols_by_kid, image_dir
+        assert {image.stem for image in image_dir.glob("*.co")} == set(
+            symbols_by_kid.values()
+        ), image_dir
 
     monkeypatch.syspath_prepend(
         str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")

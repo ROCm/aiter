@@ -72,8 +72,10 @@ replays with strong numerical assertions.
 A0 profile: on c7-1, ROCm 10.0 / HIP `7.15.26333` rejected the real strict ELF with
 `hipErrorNoBinaryForGpu`. The machine's already-available ROCm 10.1 / HIP
 `7.16.26385` runtime successfully loaded it through both the HIP driver and the
-existing aiter path. Three family representatives (21016, 21105, 21316) passed
+existing aiter path. Three family representatives (496, 544, 715) passed
 CPU-golden BMM checks at tiny `1x1x1` and ragged `129x129x385` shapes.
+Kids are the gfx1250 local ids from #6937. The runs logged the same kernels
+under their earlier global ids (21000 band); each was matched by kernel record.
 
 The exhaustive A0 suite is **not certified**. The GPU-input suite reported
 repeated failures; an isolated diagnostic then stalled in GPU random-input setup
@@ -102,10 +104,10 @@ private containers and directories.
 
 A subsequent native-HIP test was performed on g21-10 in the exact
 `rocm/dev-ubuntu-24.04:10.1.0-full` image (HIP `7.16.26385`). The initial run
-successfully loaded and launched the current ASIC-0 strict COs for kids 21016,
-21105 and 21316: six tiny/tail, batch-2 cases matched the CPU golden exactly.
+successfully loaded and launched the current ASIC-0 strict COs for kids 496,
+544 and 715: six tiny/tail, batch-2 cases matched the CPU golden exactly.
 No PyTorch, GPU RNG or rocminfo was used. A repeat full-list run later stopped
-progressing on the 21316 tail case, so it does not certify all 221 variants.
+progressing on the 715 tail case, so it does not certify all 221 variants.
 Details and exact reproduction commands are in
 [A0_DEVFULL_LAUNCH.md](A0_DEVFULL_LAUNCH.md).
 

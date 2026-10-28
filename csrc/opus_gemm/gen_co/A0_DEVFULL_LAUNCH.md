@@ -28,11 +28,14 @@ case starts with a NaN-poisoned output and launches twice to check reinitializat
 
 The initial smoke run completed successfully:
 
+Kids are the gfx1250 local ids from #6937. The runs logged the same kernels
+under their earlier global ids (21000 band); each was matched by kernel record.
+
 | kid | family | completed shapes (M/N/K) | batch | row padding | max absolute error |
 |---:|---|---|---:|---:|---:|
-| 21016 | compute, c1x1 | 1/1/1; 129/129/385 | 2 | 0; 8 | 0 |
-| 21105 | wave-layout, c1x1 | 1/1/1; 129/129/385 | 2 | 0; 8 | 0 |
-| 21316 | ring/pin, c4x4 | 1/1/1; 257/257/257 | 2 | 0; 8 | 0 |
+| 496 | compute, c1x1 | 1/1/1; 129/129/385 | 2 | 0; 8 | 0 |
+| 544 | wave-layout, c1x1 | 1/1/1; 129/129/385 | 2 | 0; 8 | 0 |
+| 715 | ring/pin, c4x4 | 1/1/1; 257/257/257 | 2 | 0; 8 | 0 |
 
 ```text
 A0_NATIVE_CO_LAUNCH_PASS variants=3 cases=6
@@ -45,7 +48,7 @@ It is not a claim about performance or every registered variant.
 ## Full-run limitation
 
 A subsequent attempt over all 221 variants did not complete. It passed the first
-five cases, then stopped producing progress after `LOAD_OK kid=21316` for the
+five cases, then stopped producing progress after `LOAD_OK kid=715` for the
 257/257/257, batch=2, pad=8 case—the same case that passed in the initial smoke.
 The process exceeded its 420-second test window. The launch test has since been
 instrumented with separate launch-submitted, stream-complete and output-copy

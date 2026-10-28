@@ -343,9 +343,8 @@ tuning when this limit is exceeded.
 gfx1250 clusterlaunch exact kids round the physical launch grid up to complete
 clusters; tile-less workgroups exit inside the pipeline. This does not change
 the logical workspace shape above. The experimental fused family is disabled,
-so no fused kid in `[27000,30000)` can be resolved through the public registry.
-The `[21000,27000)` band belongs to pre-built CO kids, which are direct and
-therefore never request a workspace.
+so no fused kid can be resolved through the public registry. The pre-built CO
+kids (currently 496–716) are direct and therefore never request a workspace.
 
 gfx942 BF16-workspace kids `10210`, `10213`, and `10216` are exact ids. Their
 registered exact-N contract is `{64,128,256,384,512,1024,2048}`. A different N

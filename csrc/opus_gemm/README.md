@@ -93,8 +93,9 @@ void opus_gemm_a8w8_mxscale_bmm_launch(
 | `a8w8_mxscale_bmm` | empty | registered BMM ids, including compact ids 8470--8484; BF16/FP32 Y | empty |
 
 Empty tables are explicit capability states. `kernels_list` is the source of
-truth for registered ids. The pre-built gfx1250 A16W16 CO ids occupy the
-reserved `[21000,27000)` band.
+truth for registered ids. The pre-built gfx1250 A16W16 CO ids are local
+ids in the a16w16/gfx1250/CU namespace and follow the two-stage and
+clusterlaunch ids (currently 496–716).
 The MXFP8 BMM ids are
 `8000 + family_local_kid`, which places them in an unused global band while
 preserving family-local tuning/debug correlation. Historical child-dictionary
@@ -165,8 +166,8 @@ using the VEC=8/BLOCK=128 geometry.
 
 The fused gfx1250 factory, emitter and device pipeline remain in-tree for repair,
 but `GFX1250_SPLITK_FUSE_ENABLED` is `False`. No fused kid is registered, the
-unified capability tables cannot return one, and its `[27000,30000)` band is
-unclaimed. The preceding `[21000,27000)` band is reserved for CO ids.
+unified capability tables cannot return one. When enabled, its ids would start
+at `GFX1250_SPLITK_FUSE_KID_BASE`, 1000 above the largest gfx1250 A16W16 id.
 
 gfx942 continues to wave-uniformize both halves of the direct 64-bit workspace
 pointer with `__builtin_amdgcn_readfirstlane` in main and reduce kernels.

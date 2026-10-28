@@ -114,23 +114,25 @@ ABBA process order: baseline, named, named, baseline. Each process uses 50 kerne
 per graph, 20 graph replays per sample, and 7 samples after warmup. The table pools
 14 samples for each implementation. Clocks were not forcibly fixed; small
 percent-level differences are not evidence of a speedup.
+Kids are the gfx1250 local ids from #6937. The runs logged the same kernels
+under their earlier global ids (21000 band); each was matched by kernel record.
 
 | kid | M/N/K | production us | named us | named/production |
 |---:|---|---:|---:|---:|
-| 21063 | 4096/2048/7168 | 59.619 | 60.103 | 1.008x |
-| 21063 | 512/2048/4096 | 20.438 | 20.133 | 0.985x |
-| 21105 | 4096/2048/7168 | 84.081 | 84.068 | 1.000x |
-| 21105 | 512/2048/4096 | 13.032 | 12.935 | 0.993x |
-| 21177 | 4096/2048/7168 | 60.163 | 60.158 | 1.000x |
-| 21177 | 512/2048/4096 | 19.125 | 19.294 | 1.009x |
-| 21208 | 4096/2048/7168 | 92.360 | 92.696 | 1.004x |
-| 21208 | 512/2048/4096 | 11.571 | 11.689 | 1.010x |
-| 21316 | 4096/2048/7168 | 75.880 | 75.765 | 0.998x |
-| 21316 | 512/2048/4096 | 35.253 | 35.177 | 0.998x |
-| 21317 | 4096/2048/7168 | 75.049 | 75.168 | 1.002x |
-| 21317 | 512/2048/4096 | 35.217 | 35.345 | 1.004x |
-| 21301 | 4096/2048/7168 | 132.179 | 132.156 | 1.000x |
-| 21301 | 512/2048/4096 | 16.099 | 16.404 | 1.019x |
+| 543 | 4096/2048/7168 | 59.619 | 60.103 | 1.008x |
+| 543 | 512/2048/4096 | 20.438 | 20.133 | 0.985x |
+| 544 | 4096/2048/7168 | 84.081 | 84.068 | 1.000x |
+| 544 | 512/2048/4096 | 13.032 | 12.935 | 0.993x |
+| 596 | 4096/2048/7168 | 60.163 | 60.158 | 1.000x |
+| 596 | 512/2048/4096 | 19.125 | 19.294 | 1.009x |
+| 612 | 4096/2048/7168 | 92.360 | 92.696 | 1.004x |
+| 612 | 512/2048/4096 | 11.571 | 11.689 | 1.010x |
+| 715 | 4096/2048/7168 | 75.880 | 75.765 | 0.998x |
+| 715 | 512/2048/4096 | 35.253 | 35.177 | 0.998x |
+| 716 | 4096/2048/7168 | 75.049 | 75.168 | 1.002x |
+| 716 | 512/2048/4096 | 35.217 | 35.345 | 1.004x |
+| 700 | 4096/2048/7168 | 132.179 | 132.156 | 1.000x |
+| 700 | 512/2048/4096 | 16.099 | 16.404 | 1.019x |
 
 Median latency ratio: **1.001x**; range **0.985x–1.019x**. The large first-version
 regression is resolved; no material overall speedup is claimed. This is a
@@ -138,8 +140,8 @@ representative 14-case comparison, not a full-model retuning or all-shape
 performance certification.
 
 For all seven measured kids, the final VGPR counts match the production counts.
-For example, 21063 has 768/768 actual accumulator-bank WMMA destinations and
-21 VA_VDST(0) waits; 21105 has 384/384 and 19 waits; 21316 has 1024/1024 and 38
+For example, 543 has 768/768 actual accumulator-bank WMMA destinations and
+21 VA_VDST(0) waits; 544 has 384/384 and 19 waits; 715 has 1024/1024 and 38
 waits. Historical wlr `wmma_dst_hi` metadata counted only v256–v511; the new
 counter correctly includes the entire v256–v1023 addressable high register file,
 so the old 512/1024 metadata must not be mistaken for half of its actual WMMAs

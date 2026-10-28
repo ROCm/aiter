@@ -130,7 +130,7 @@ an edit to this file and nothing else.
 
 | field | notes |
 |---|---|
-| `kid` | explicit, not positional; reordering the list must not renumber. All three gfx1250 co families share the band `[21000, 23000)` |
+| `kid` | explicit, not positional; reordering the list must not renumber. Kids are local to the a16w16/gfx1250/CU namespace; the three co families currently use 496–716, after the two-stage and clusterlaunch kids |
 | `tag` | `kernel_tag`: `a16w16_4wave_co`, `a16w16_4wave_wl_co` or `a16w16_4wave_wlr_co`; picks the codegen emit branch and the traits/kargs names |
 | `block_size` | threads per workgroup; **must** equal `launch_bounds[0]` (asserted) |
 | `tile` | `[B_M, B_N, B_K]` |
