@@ -89,12 +89,13 @@ All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
 `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`.
 `<d_type>` is `config_name.lower().replace("-", "_")`. A GEMM config tuned on
 one CU count can go in `configs/<arch>/<cu_num>cu/<backend>/gemm/<d_type>/`
-(for example `gfx1250/96cu/`). The GEMM loader reads it first. Flag:
+(for example `gfx1250/96cu/`). `get_gemm_config()` reads it first. Flag:
 
 - A config file outside this layout, for example in `configs/gemm/` or at the
   top of `configs/`.
-- A `<cu_num>cu/` folder for an op other than `gemm`. Only the GEMM loader
-  reads these folders.
+- A `<cu_num>cu/` folder for an op other than `gemm`, or for a GEMM family
+  that `get_gemm_config()` does not load, for example `gemm/grouped/`. No
+  other loader reads these folders.
 - An arch prefix in a file name in `configs/<arch>/...`. The default file must
   be `DEFAULT.json`.
 - A specialized file in a folder without `DEFAULT.json`, when the loader needs

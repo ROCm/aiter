@@ -72,7 +72,8 @@ configs/gfx1250/96cu/gluon/gemm/gemm_a16w16/GEMM-A16W16-N=7168-K=256.json
 on. `get_gemm_config()` reads each file (`DEFAULT.json` and the specialized
 files) from the `<cu_num>cu/` folder when it is there, else from the
 CU-agnostic folder. Put a file in `<cu_num>cu/` only when it was tuned on
-that CU count. Only the GEMM loader reads these folders.
+that CU count. Only `get_gemm_config()` reads these folders. Families with
+their own loader, for example the grouped GEMM `gemm/grouped/`, do not.
 `sweep_configs.py` records the CU count with every result. With `--cu-dir`
 it plans from the `<cu_num>cu/` `DEFAULT.json` and file, as the loader reads
 them, and `write_best_configs.py --cu-dir` installs only results timed on

@@ -148,8 +148,9 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 or `normalization`.
 
 A GEMM config tuned on one CU count goes in `configs/<arch>/<cu_num>cu/<backend>/gemm/<d_type>/`,
-for example `configs/gfx1250/96cu/`. The GEMM loader reads each file from that folder
-first and uses the CU-agnostic file when it is not there.
+for example `configs/gfx1250/96cu/`. `get_gemm_config()` reads each file from that folder
+first and uses the CU-agnostic file when it is not there. Families with their own loader,
+for example the grouped GEMM, do not read this folder.
 
 The suffix depends on the family. For example, GEMM files use
 `N=<N>-K=<K>`, batched GEMM files use `B=<B>-N=<N>-K=<K>` and MHC files use
