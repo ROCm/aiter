@@ -3,11 +3,13 @@
 
 """gfx1250 Stage2-fused MegaMoE host pipeline."""
 
+import contextlib
 import functools
 import os
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 from enum import Enum
-from types import SimpleNamespace
+from typing import ClassVar, Protocol
 
 import flydsl.expr as fx
 import torch
@@ -35,6 +37,7 @@ from .types import Stage2ScatterContext, _from_gpu_ptr
 __all__ = [
     "CombineKind",
     "DispatchKind",
+    "ExpertComputeConfig",
     "MegaMoEGeometry",
     "MegaMoEGfx1250",
     "MegaMoERecipe",
@@ -47,7 +50,7 @@ _MAX_EXPERTS_PER_RANK = 512
 # flydsl_dispatch_combine_intranode_op.py); that path has no fp4.
 _COMBINE_QUANT_MODES = ("none", "mxfp8", "mxfp4")
 _COMBINE_QUANT_BITS = {"none": 0, "mxfp8": 8, "mxfp4": 4}
-# The wires mori's combine offers (stage2_fused=False), as its quant_type names.
+# The combine wires mori offers, as its quant_type names.
 # "fp4_blockwise" is MXFP4 -- e2m1 plus one e8m0 per 32 -- the same format the
 # fused reduce calls "mxfp4". It has no MXFP8.
 _MORI_COMBINE_QUANT = {0: "none", 4: "fp4_blockwise"}
@@ -184,8 +187,8 @@ def _compact_gemm_align_m(
 
     Arena size is fixed at MegaMoE init. Honour ``AITER_TDM_TILE_M{,2}``, otherwise
     use the same grouped-GEMM CSV row fused_moe will pick for this recv-token
-    bucket. Flooring at 64 used to pad compact_cap to EPR*64 even when the CSV
-    tile is 16/32, which launched a 3–4× GEMM grid at small tpr.
+    bucket. No floor at 64: the CSV tile can be 16 or 32, and padding every
+    expert to 64 rows would run a 3-4x GEMM grid at small batches.
 
     ``recv_bound`` is this step's recv-token bound; it defaults to the arena's
     full capacity, which is the bucket to size the arena against but not the one
@@ -228,11 +231,11 @@ def _compact_gemm_align_m(
         inter_dim=config.geometry.inter_dim,
         experts=config.experts_per_rank,
         topk=-1,
-        activation=config.recipe.activation,
+        activation=config.recipe.compute.activation,
         dtype=dtypes.bf16,
         q_dtype_a=q_dtype_a,
         q_dtype_w=dtypes.fp4x2,
-        quant_type=config.recipe.quant_type,
+        quant_type=config.recipe.compute.quant_type,
     )
     tile_m = 64
     tile_m2 = 64
@@ -244,35 +247,30 @@ def _compact_gemm_align_m(
 
 @dataclass(frozen=True)
 class _MoriCapabilities:
-    """What the installed mori offers, found out once.
+    """The installed mori, as MegaMoE drives it.
 
     MegaMoE drives mori's EpDispatchPlan / EpCombinePlan directly, past its op
-    layer, so it follows mori's version itself -- here, rather than in the
-    pipeline. Each optional field is a helper some mori PR added, None on a mori
-    from before it.
+    layer, so every mori name it uses is reached through here. It needs plans
+    that describe() themselves (ROCm/mori#844): the arena regions, the staging
+    buffer and the scale stride all come from that, so none of mori's sizing is
+    copied here. Such a mori also has what the pipeline relies on beyond sizing:
+    the aggregated dispatch reservation the fp4 push combine reads its landing
+    offsets from, and a dispatch that overwrites total_recv, so nothing zeroes
+    it ahead of one.
     """
 
     ep_plans: object
     hip_backend: object
     lookup: object
-    scale_stride_bytes: object  # ROCm/mori#593
-    push_wire_nbytes: object  # ROCm/mori#719
-    push_land_rows: object  # ROCm/mori#745
-    ep_staging_bytes: object  # ROCm/mori#703
-    tokoff_wanted: object  # ROCm/mori#726, TokOffExt.wanted
-    self_first_enabled: object  # a mori between #726 and #745
-    plan_describe: bool  # ROCm/mori#844: Plan.describe() and arena_regions()
 
     def tuning(self, config, quant_type: str = "none") -> dict:
-        # Only named when quantizing: an older mori's lookup has no quant_type.
-        quant_kw = {} if quant_type == "none" else {"quant_type": quant_type}
         return self.lookup(
             config.world_size,
             config.hidden_dim,
             config.topk,
             dtype=config.dispatch_wire_spec.mori_tuning_dtype,
             experts_per_rank=config.experts_per_rank,
-            **quant_kw,
+            quant_type=quant_type,
         )
 
     def dispatch_schedule(self, config) -> tuple:
@@ -300,57 +298,16 @@ class _MoriCapabilities:
             (None, tuned["combine_block_num"], tuned["combine_warp_num_per_block"]),
         )
 
-    def scale_stride(self, config) -> int:
-        """The stride mori lays a forwarded scale row down at."""
-        if self.scale_stride_bytes is None:
-            raise RuntimeError(
-                f"dispatch_wire={config.dispatch_wire!r} needs a mori whose EP "
-                "dispatch carries a per-token scale row (ROCm/mori#593 or later); "
-                "the installed one has no scale_stride_bytes"
-            )
-        return self.scale_stride_bytes(config.dispatch_scale_nbytes)
+    def describe_dispatch(self, requests) -> list[dict]:
+        """What mori reports for each dispatch plan request -- its arena regions,
+        staging bytes and scale stride -- without building or compiling one."""
+        plan = self.ep_plans.EpDispatchPlan
+        return [plan.describe(arch=_MORI_ARCH, **request) for request in requests]
 
-    def push_wire_bytes(self, config) -> int:
-        """Pitch of one landed row of mori's fp4 push combine.
-
-        Asked of mori rather than recomputed: it is the kernel's slot layout,
-        padded to the kernel's own alignment.
-        """
-        if self.push_wire_nbytes is None:
-            raise RuntimeError(
-                "combine_quant='mxfp4' with stage2_fused=False needs a mori with the "
-                "fp4 push combine (ROCm/mori#719 or later)"
-            )
-        return self.push_wire_nbytes(
-            SimpleNamespace(
-                hidden_dim=config.hidden_dim, quant_type=_MORI_COMBINE_QUANT[4]
-            )
-        )
-
-    def push_landing_rows(self, config) -> int | None:
-        """Landing rows of mori's push combine, one per (token, destination rank).
-
-        None for a mori from before ROCm/mori#745, whose push combine lands a row
-        per (source peer, recv slot) and does not read its offsets off the
-        dispatch.
-        """
-        if self.push_land_rows is None:
-            return None
-        return self.push_land_rows(
-            SimpleNamespace(
-                max_num_inp_token_per_rank=config.max_tokens_per_rank,
-                world_size=config.world_size,
-                num_experts_per_token=config.topk,
-            )
-        )
-
-    def describe(self, plan_cls, requests) -> list[dict] | None:
-        """What mori reports for each plan request -- its arena regions, staging
-        -- without building or compiling one; None for a mori from before
-        ROCm/mori#844, which is sized from the formulas here instead."""
-        if not self.plan_describe:
-            return None
-        return [plan_cls.describe(arch=_MORI_ARCH, **request) for request in requests]
+    def describe_combine(self, requests) -> list[dict]:
+        """What mori reports for each combine plan request."""
+        plan = self.ep_plans.EpCombinePlan
+        return [plan.describe(arch=_MORI_ARCH, **request) for request in requests]
 
     def region_sizes(self, infos) -> dict:
         """The arena regions ``infos`` ask for, under this package's names."""
@@ -358,42 +315,34 @@ class _MoriCapabilities:
             self.ep_plans.arena_regions(*infos, region_names=_MORI_REGION_NAMES)
         )
 
-    def staging_bytes(self, config, scale_bytes: int) -> int | None:
-        """The dispatch's staging buffer (ROCm/mori#703); None before it."""
-        if self.ep_staging_bytes is None:
-            return None
-        return self.ep_staging_bytes(
-            config.world_size,
-            config.max_recv,
-            scale_bytes,
-            config.max_tokens_per_rank,
+    def dispatch_plan(self, request: dict, arena):
+        return self.ep_plans.EpDispatchPlan(
+            **request, arena=arena, region_names=_MORI_REGION_NAMES
         )
 
-    def slot_word(self, config) -> tuple[bool, dict]:
-        """(tokoff_ext, the dispatch plan's kwargs for it).
+    def combine_plan(self, request: dict, arena):
+        return self.ep_plans.EpCombinePlan(
+            **request, arena=arena, region_names=_MORI_REGION_NAMES
+        )
 
-        Driving EpDispatchPlan directly bypasses mori's op layer
-        (EpDispatchCombineOpHip), so take its decisions from mori rather than
-        keep a copy that drifts: whether the slot allocator word moves out of the
-        cco window into tokoff-ext memory, and how the dispatch reserves slots,
-        which follows from where the word lives. Since ROCm/mori#726 the plan
-        takes where the word lives (tok_off_ext) and derives the rest itself
-        (selfFirst, since #745 the aggregated reservation). A mori from before
-        selfFirst has neither helper and rejects the kwarg; its op layer kept
-        tokoff-ext on unless MORI_EP_TOKOFF_EXT=0/false/no/off.
+    def tokoff_ext_wanted(self, config) -> bool:
+        """Whether mori's slot allocator word moves out of the cco window into
+        tokoff-ext memory, as mori's op layer decides it.
 
         Collective when $MORI_EP_TOKOFF_EXT is on: TokOffExt.wanted checks that
         every rank shares the host.
         """
-        if self.tokoff_wanted is None:
-            env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
-            return env not in ("0", "false", "no", "off"), {}
-        tokoff_ext = self.tokoff_wanted(config.world_size)
-        if self.self_first_enabled is not None:
-            return tokoff_ext, {
-                "self_first": int(self.self_first_enabled(not tokoff_ext))
-            }
-        return tokoff_ext, {"tok_off_ext": int(tokoff_ext)}
+        return bool(self.hip_backend.TokOffExt.wanted(config.world_size))
+
+    def tokoff_ext(self, config, device):
+        """mori's tokoff-ext allocation, reused rather than duplicated: its IPC
+        handle protocol must match the kernel byte for byte. Collective."""
+        return self.hip_backend.TokOffExt(config.rank, config.world_size, device)
+
+    @property
+    def xdb_flag_slots(self) -> int:
+        """Per-block epoch slots of the combine's entry barrier."""
+        return self.hip_backend._XDB_FLAG_SLOTS
 
 
 @functools.cache
@@ -402,32 +351,26 @@ def _mori_capabilities() -> _MoriCapabilities:
         from mori.ops.dispatch_combine_v2 import ep_plans
     except ImportError as error:
         raise RuntimeError(
-            "stage1_fused=False dispatches through mori, which needs a mori "
-            "with ops/dispatch_combine_v2 (JIT v2, PR #548 or later)"
+            "MegaMoE's mori dispatch and combine need a mori with "
+            "ops/dispatch_combine_v2"
         ) from error
     except OSError as error:
         raise RuntimeError(
-            "stage1_fused=False dispatches through mori, which needs mori's "
-            "libmori_ops_v2.so; it is built by mori's CMake and is not "
-            "shipped by every install"
+            "MegaMoE's mori dispatch and combine need mori's libmori_ops_v2.so; "
+            "it is built by mori's CMake and is not shipped by every install"
         ) from error
+    if not (
+        hasattr(ep_plans.EpDispatchPlan, "describe")
+        and hasattr(ep_plans, "arena_regions")
+    ):
+        raise RuntimeError(
+            "MegaMoE sizes mori's arena regions with Plan.describe(), which needs "
+            "ROCm/mori#844 or later; the installed mori has none"
+        )
     from mori.ops.dispatch_combine_v2 import hip_backend
     from mori.ops.dispatch_combine_v2.hip_tuning_configs import lookup
 
-    tokoff = getattr(hip_backend, "TokOffExt", None)
-    return _MoriCapabilities(
-        ep_plans=ep_plans,
-        hip_backend=hip_backend,
-        lookup=lookup,
-        scale_stride_bytes=getattr(hip_backend, "scale_stride_bytes", None),
-        push_wire_nbytes=getattr(hip_backend, "push_wire_nbytes", None),
-        push_land_rows=getattr(hip_backend, "push_land_rows", None),
-        ep_staging_bytes=getattr(hip_backend, "ep_staging_bytes", None),
-        tokoff_wanted=getattr(tokoff, "wanted", None),
-        self_first_enabled=getattr(ep_plans, "self_first_enabled", None),
-        plan_describe=hasattr(ep_plans.EpDispatchPlan, "describe")
-        and hasattr(ep_plans, "arena_regions"),
-    )
+    return _MoriCapabilities(ep_plans=ep_plans, hip_backend=hip_backend, lookup=lookup)
 
 
 class SymmetricArena:
@@ -477,28 +420,29 @@ class SymmetricArena:
         _from_gpu_ptr(pointer, (size,), torch.int8).zero_()
 
     def close(self):
-        self._window.close()
-        self._memory.close()
+        try:
+            self._window.close()
+        finally:
+            self._memory.close()
 
 
 class DispatchKind(str, Enum):
     """How tokens reach their experts' rank."""
 
-    # mori's EpDispatchPlan: token-major recv rows (the old stage1_fused=False).
+    # mori's EpDispatchPlan: a recv row per received token.
     MORI = "mori"
     # The FlyDSL compact plan: recv rows grouped per expert, the layout the
-    # grouped GEMM reads directly (the old stage1_fused=True).
+    # grouped GEMM reads in place.
     COMPACT = "compact"
 
 
 class CombineKind(str, Enum):
     """How expert results return to their tokens."""
 
-    # mori's EpCombinePlan over fused_moe's per-recv-row output (the old
-    # stage2_fused=False).
+    # mori's EpCombinePlan over fused_moe's per-recv-row output.
     MORI = "mori"
     # The gemm2 epilogue P2P-scatters into the peers' slots and a FlyDSL reduce
-    # sums them (the old stage2_fused=True).
+    # sums them.
     FUSED_SCATTER = "fused_scatter"
 
 
@@ -508,13 +452,62 @@ _COMBINE_QUANT_WIRE = {quant: wire for wire, quant in _COMBINE_WIRE_QUANT.items(
 
 
 @dataclass(frozen=True)
+class ExpertComputeConfig:
+    """The expert GEMM a MegaMoE runs between its dispatch and its combine."""
+
+    activation: ActivationType = ActivationType.Silu
+    gate_mode: GateMode = GateMode.INTERLEAVE
+    quant_type: QuantType = QuantType.per_1x32
+    hidden_pad: int = 0
+    intermediate_pad: int = 0
+    swiglu_limit: float = 0.0
+
+    def __post_init__(self):
+        def coerce(name, value):
+            object.__setattr__(self, name, value)
+
+        coerce("activation", ActivationType(self.activation))
+        coerce("gate_mode", GateMode(self.gate_mode))
+        coerce("quant_type", QuantType(self.quant_type))
+        coerce("hidden_pad", int(self.hidden_pad))
+        coerce("intermediate_pad", int(self.intermediate_pad))
+        coerce("swiglu_limit", float(self.swiglu_limit))
+        if self.hidden_pad < 0 or self.intermediate_pad < 0:
+            raise ValueError(
+                "padding must be non-negative, got "
+                f"{self.hidden_pad}, {self.intermediate_pad}"
+            )
+        if self.swiglu_limit < 0:
+            raise ValueError(
+                f"swiglu_limit must be non-negative, got {self.swiglu_limit}"
+            )
+        if self.gate_mode != GateMode.INTERLEAVE:
+            raise ValueError("MegaMoE's expert GEMM requires gate_mode=INTERLEAVE")
+        if self.quant_type != QuantType.per_1x32:
+            raise ValueError("MegaMoE's expert GEMM requires quant_type=per_1x32")
+        if self.activation not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
+            raise ValueError(
+                "MegaMoE's expert GEMM does not support "
+                f"activation={self.activation}"
+            )
+
+
+@dataclass(frozen=True)
 class MegaMoERecipe:
-    """What a MegaMoE runs: its transport and its expert GEMM.
+    """What a MegaMoE runs: its transport, and the expert GEMM in between.
 
     Policy only -- the model's shape is a ``MegaMoEGeometry``. A caller picks a
     recipe and hands it to ``MegaMoEGfx1250.from_recipe``; everything built from
     it is fixed there, so forward() never chooses a path. Hashable, so it can key
     a cache of instances.
+
+    Which pairings run is the stages' to say: a dispatch declares the wires it
+    carries and the row layout it delivers, a combine the layouts it accepts and
+    the wires it offers.
 
     ``combine_wires`` are the formats a combine is BUILT for. bf16 is always one
     of them, and each step names the one it runs on (forward's ``combine_wire``);
@@ -528,12 +521,7 @@ class MegaMoERecipe:
     # error, not a slow path. bf16 has the GEMM quantize on arrival.
     dispatch_wire: str = "bf16"
     combine_wires: tuple = ("bf16",)
-    activation: ActivationType = ActivationType.Silu
-    gate_mode: GateMode = GateMode.INTERLEAVE
-    quant_type: QuantType = QuantType.per_1x32
-    hidden_pad: int = 0
-    intermediate_pad: int = 0
-    swiglu_limit: float = 0.0
+    compute: ExpertComputeConfig = field(default_factory=ExpertComputeConfig)
 
     def __post_init__(self):
         def coerce(name, value):
@@ -541,9 +529,11 @@ class MegaMoERecipe:
 
         coerce("dispatch", DispatchKind(self.dispatch))
         coerce("combine", CombineKind(self.combine))
-        coerce("activation", ActivationType(self.activation))
-        coerce("gate_mode", GateMode(self.gate_mode))
-        coerce("quant_type", QuantType(self.quant_type))
+        if not isinstance(self.compute, ExpertComputeConfig):
+            raise TypeError(
+                "compute must be an ExpertComputeConfig, got "
+                f"{type(self.compute).__name__}"
+            )
         wires = tuple(self.combine_wires)
         unknown = [w for w in wires if w not in _COMBINE_WIRE_QUANT]
         if unknown or "bf16" not in wires or len(set(wires) - {"bf16"}) > 1:
@@ -558,50 +548,29 @@ class MegaMoERecipe:
                 f"dispatch_wire must be one of {_DISPATCH_WIRES}, "
                 f"got {self.dispatch_wire!r}"
             )
-        if self.dispatch is DispatchKind.COMPACT and not self.is_quant_dispatch_wire:
-            raise ValueError("stage1_fused requires an fp8 or fp4 dispatch wire")
-        if self.combine is CombineKind.MORI:
-            if self.dispatch is DispatchKind.COMPACT:
-                raise ValueError(
-                    "stage1_fused requires stage2_fused: the compact plan "
-                    "groups recv rows per expert, and only the gemm2 scatter "
-                    "maps them back to their tokens"
-                )
-            mori_modes = tuple(
-                mode
-                for mode in _COMBINE_QUANT_MODES
-                if _COMBINE_QUANT_BITS[mode] in _MORI_COMBINE_QUANT
-            )
-            if self.combine_quant not in mori_modes:
-                raise ValueError(
-                    "stage2_fused=False combines through mori, whose wires are "
-                    f"{mori_modes}; got combine_quant={self.combine_quant!r}"
-                )
-        if self.hidden_pad < 0 or self.intermediate_pad < 0:
+        dispatch, combine = _stage_classes(self)
+        if self.dispatch_wire not in dispatch.wires:
             raise ValueError(
-                "padding must be non-negative, got "
-                f"{self.hidden_pad}, {self.intermediate_pad}"
+                f"dispatch={self.dispatch.value} carries an "
+                f"{' or '.join(dispatch.wires)} dispatch_wire, "
+                f"got {self.dispatch_wire!r}"
             )
-        if self.swiglu_limit < 0:
+        if dispatch.output_layout not in combine.accepted_layouts:
+            takers = [
+                kind.value
+                for kind, stage in _stage_registry()[1].items()
+                if dispatch.output_layout in stage.accepted_layouts
+            ]
             raise ValueError(
-                f"swiglu_limit must be non-negative, got {self.swiglu_limit}"
+                f"combine={self.combine.value} does not accept the "
+                f"{dispatch.output_layout.value} rows "
+                f"dispatch={self.dispatch.value} delivers; "
+                f"combine={' or '.join(takers)} does"
             )
-        if self.gate_mode != GateMode.INTERLEAVE:
+        if not set(self.combine_wires) <= set(combine.wires):
             raise ValueError(
-                "MegaMoE fused stage2 scatter requires gate_mode=INTERLEAVE"
-            )
-        if self.quant_type != QuantType.per_1x32:
-            raise ValueError(
-                "MegaMoE fused stage2 scatter requires quant_type=per_1x32"
-            )
-        if self.activation not in (
-            ActivationType.Silu,
-            ActivationType.Swiglu,
-            ActivationType.Situv2,
-        ):
-            raise ValueError(
-                "MegaMoE fused stage2 scatter does not support "
-                f"activation={self.activation}"
+                f"combine={self.combine.value} offers the {combine.wires} wires, "
+                f"got combine_wires={self.combine_wires!r}"
             )
 
     @classmethod
@@ -654,12 +623,14 @@ class MegaMoERecipe:
                 dispatch_wire if dispatch_wire is not None else read_dispatch_wire_env()
             ),
             combine_wires=("bf16",) if wire == "bf16" else ("bf16", wire),
-            activation=activation,
-            gate_mode=gate_mode,
-            quant_type=quant_type,
-            hidden_pad=int(hidden_pad),
-            intermediate_pad=int(intermediate_pad),
-            swiglu_limit=float(swiglu_limit),
+            compute=ExpertComputeConfig(
+                activation=activation,
+                gate_mode=gate_mode,
+                quant_type=quant_type,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                swiglu_limit=swiglu_limit,
+            ),
         )
 
     @property
@@ -671,6 +642,17 @@ class MegaMoERecipe:
     def combine_quant(self) -> str:
         """The quantized combine format built, in the legacy spelling."""
         return _COMBINE_WIRE_QUANT[self.combine_wires[-1]]
+
+
+def _stage_registry() -> tuple:
+    """(dispatch stage per DispatchKind, combine stage per CombineKind)."""
+    return _DISPATCH_STAGES, _COMBINE_STAGES
+
+
+def _stage_classes(recipe: MegaMoERecipe) -> tuple:
+    """The (dispatch, combine) stage classes ``recipe`` names."""
+    dispatch_stages, combine_stages = _stage_registry()
+    return dispatch_stages[recipe.dispatch], combine_stages[recipe.combine]
 
 
 @dataclass(frozen=True)
@@ -735,26 +717,8 @@ class MegaMoEConfig:
                 "one e8m0 scale covers 32 features, so a quantizing dispatch "
                 f"wire needs hidden_dim % 32 == 0, got {self.hidden_dim}"
             )
-        # Every wire, not just the quantized ones: the reduce tiles hidden in
-        # whole chunks and has no tail path.
-        if (
-            self.recipe.combine is CombineKind.FUSED_SCATTER
-            and self.hidden_dim % _COMBINE_CHUNK_ELEMS
-        ):
-            raise ValueError(
-                f"the combine reduce tiles hidden in {_COMBINE_CHUNK_ELEMS}-"
-                f"element chunks with no tail path, so it needs hidden_dim % "
-                f"{_COMBINE_CHUNK_ELEMS} == 0, got {self.hidden_dim}"
-            )
-        if (
-            self.recipe.combine is CombineKind.MORI
-            and self.combine_quant_bits
-            and self.hidden_dim % _MORI_FP4_COMBINE_HIDDEN_ALIGN
-        ):
-            raise ValueError(
-                "mori's fp4 combine needs hidden_dim % "
-                f"{_MORI_FP4_COMBINE_HIDDEN_ALIGN} == 0, got {self.hidden_dim}"
-            )
+        for stage in _stage_classes(self.recipe):
+            stage.check(self)
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank={self.rank} must be in [0, {self.world_size})")
         if self.world_size > _MAX_WORLD_SIZE:
@@ -805,16 +769,6 @@ class MegaMoEConfig:
     @property
     def max_recv(self) -> int:
         return self.world_size * self.max_tokens_per_rank
-
-    def compact_row_cap(self, tile_m: int = 64) -> int:
-        from .compact_plan import compact_row_capacity
-
-        return compact_row_capacity(
-            max_recv=self.max_recv,
-            topk=self.topk,
-            experts_per_rank=self.experts_per_rank,
-            tile_m=tile_m,
-        )
 
     # -- the recipe, under the names callers read --------------------------------
     @property
@@ -903,28 +857,12 @@ class MegaMoEConfig:
     def dispatch_scale_nbytes(self) -> int:
         """Per-token e8m0 row as WE produce it: one byte per 32 features, packed.
 
-        Handed to mori as-is. mori lays it down at its own, 128 B-aligned stride
-        (dispatch_scale_dst_nbytes) because that is what keeps a TDM run's start aligned;
-        that padding is mori's business, and the quant op's output can go straight
-        onto the dispatch wire without a repack.
+        Handed to the dispatch as-is. The rows arrive at the dispatch stage's own,
+        128 B-aligned stride (its ``scale_stride``), which keeps a TDM run's start
+        aligned; that padding is the transport's business, and the quant op's
+        output goes straight onto the dispatch wire without a repack.
         """
         return self.hidden_dim // 32 if self.is_quant_dispatch_wire else 0
-
-    @property
-    def dispatch_scale_dst_nbytes(self) -> int:
-        """The stride the rows ARRIVE at, which the receiving gather addresses by.
-
-        Asked of mori rather than recomputed: it is the transport's layout
-        decision, and a local copy of the rule would drift the first time the
-        alignment changes.
-        """
-        if not self.is_quant_dispatch_wire:
-            return 0
-        if self.stage1_fused:
-            return _align_up(self.dispatch_scale_nbytes, 128)
-        # Asked only here: a bf16 wire needs none of this, so an older mori keeps
-        # working until someone asks for fp8/fp4.
-        return _mori_capabilities().scale_stride(self)
 
     def combine_slot_stride_for(self, quant_bits: int) -> int:
         """Slot pitch on the ``quant_bits`` wire: the payload rounded up to a
@@ -953,8 +891,8 @@ class MegaMoEConfig:
         return self.combine_slot_stride_for(0)
 
 
-# The order the regions are laid down in. Kept to the order the pipeline always
-# appended them in, so every pairing keeps the offsets it always had.
+# The order the regions are laid down in: fixed, so a region's offset does not
+# depend on which stage declares it.
 _ARENA_REGION_ORDER = (
     "tok_off",
     "recv_num",
@@ -1026,13 +964,18 @@ class _CompactGeometry:
 
     @classmethod
     def of(cls, config: MegaMoEConfig, tile_m: int | None = None):
-        from .compact_plan import compact_hist_stride
+        from .compact_plan import compact_hist_stride, compact_row_capacity
 
         tile = _compact_gemm_align_m(config) if tile_m is None else tile_m
         max_routes = config.max_tokens_per_rank * config.topk
         return cls(
             tile_m=tile,
-            cap=config.compact_row_cap(tile),
+            cap=compact_row_capacity(
+                max_recv=config.max_recv,
+                topk=config.topk,
+                experts_per_rank=config.experts_per_rank,
+                tile_m=tile,
+            ),
             wire_row=_align_up(
                 config.dispatch_token_nbytes + config.dispatch_scale_nbytes, 128
             ),
@@ -1055,12 +998,15 @@ def _cco_alloc_bytes(nbytes: int, granularity: int) -> int:
 
 # -- the transport ---------------------------------------------------------------
 #
-# A dispatch stage and a combine stage, picked by the recipe, over one arena.
-# Each stage declares the regions it needs (``regions``, pure, so the arena can be
-# sized before any communicator exists), plans in ``__init__`` with nothing
-# allocated, then allocates in ``build``. They meet only through the shared
-# ``_EpResources``, the ``_DispatchBatch`` the dispatch hands the expert GEMM, and
-# the ``_ComputeTarget`` the combine has the GEMM write into.
+# A dispatch stage and a combine stage, picked by the recipe, over one arena;
+# ``DispatchStage`` and ``CombineStage`` are what each provides. A stage's class
+# declares what can be checked before anything exists -- the wires and row
+# layouts it handles, its geometry checks, the arena regions it needs -- so a
+# recipe is checked and an arena sized before any communicator exists. An
+# instance plans in ``__init__`` with nothing allocated, then allocates in
+# ``build``. They meet only through the shared ``_EpResources``, the
+# ``_DispatchBatch`` the dispatch hands the expert GEMM, and the
+# ``_ComputeTarget`` the combine has the GEMM write into.
 
 
 @dataclass
@@ -1100,7 +1046,7 @@ class _EpResources:
             device=device,
         )
         # Send counts, then per destination mori's reservation base and push
-        # landing offset (ROCm/mori#745).
+        # landing offset.
         self.destination_peer_counter = torch.zeros(
             2 * config.world_size, dtype=torch.int32, device=device
         )
@@ -1121,10 +1067,49 @@ class _EpResources:
         )
 
     def close(self):
-        self.arena.close()
-        if self.tokoff_ext is not None:
-            self.tokoff_ext.close()
-            self.tokoff_ext = None
+        tokoff_ext, self.tokoff_ext = self.tokoff_ext, None
+        _close_all([self.arena] + ([] if tokoff_ext is None else [tokoff_ext]))
+
+
+class BatchLayout(str, Enum):
+    """How a dispatch lays its recv rows out for the expert GEMM."""
+
+    # A row per received token; its topk ids and weights come alongside.
+    TOKEN_MAJOR = "token_major"
+    # Rows grouped per local expert and padded to the GEMM tile; an
+    # ``ExpertGrouping`` says where each expert's rows are.
+    EXPERT_GROUPED = "expert_grouped"
+
+
+@dataclass(frozen=True)
+class ExpertGrouping:
+    """Where an expert-grouped batch keeps each expert's rows, as the grouped
+    GEMM and its gemm2 scatter read them.
+
+    The ints are this step's shape, not the arena's, and python ints, so a
+    captured graph keeps a static grid.
+    """
+
+    masked_m: torch.Tensor  # per local expert, its rows
+    psum: torch.Tensor  # per local expert, where its rows end
+    ep_rowmap: torch.Tensor  # per row, where the gemm2 scatter sends it
+    wire_row_stride: int  # bytes from a row to the next, its scales included
+    recv_bound: int  # the recv-token bound, i.e. the CSV token bucket
+    align_m: int  # per-expert row alignment the plan wrote
+    rows: int  # row upper bound, bounding the GEMM grid
+
+    def scatter_fields(self) -> dict:
+        """As ``Stage2ScatterContext``'s compact_* fields."""
+        return {
+            "compact_layout": True,
+            "compact_masked_m": self.masked_m,
+            "compact_psum": self.psum,
+            "compact_ep_rowmap": self.ep_rowmap,
+            "compact_wire_row_stride": self.wire_row_stride,
+            "compact_recv_bound": self.recv_bound,
+            "compact_align_m": self.align_m,
+            "compact_rows": self.rows,
+        }
 
 
 @dataclass
@@ -1138,18 +1123,101 @@ class _DispatchBatch:
     scales: torch.Tensor | None  # the wire's e8m0 rows; None on bf16
     num_local_tokens: torch.Tensor | None
     routing: Routing
-    # The compact plan's per-expert grouping, as Stage2ScatterContext's compact_*
-    # fields; None for token-major rows.
-    compact_rows: dict | None = None
+    layout: BatchLayout
+    grouping: ExpertGrouping | None = None  # set on EXPERT_GROUPED rows only
 
 
 @dataclass
 class _ComputeTarget:
     """Where the expert GEMM leaves its rows: scattered into the peers' slots by
-    its gemm2 epilogue, or written to ``output``."""
+    its gemm2 epilogue, or written to ``output``.
+
+    ``dispatch_context`` is what the grouped GEMM reads an expert-grouped batch's
+    grouping from; None on token-major rows.
+    """
 
     scatter: Stage2ScatterContext | None = None
     output: torch.Tensor | None = None
+    dispatch_context: Stage2ScatterContext | None = None
+
+
+class DispatchStage(Protocol):
+    """Tokens out to their experts' ranks, into the arena's recv rows.
+
+    Built as ``Stage(config, caps)``, where ``caps`` is mori's capabilities if
+    either stage of the recipe drives mori and None otherwise.
+    """
+
+    wires: ClassVar[tuple]  # the dispatch wires it carries
+    output_layout: ClassVar[BatchLayout]  # how it lays its recv rows out
+    uses_mori: ClassVar[bool]
+    # Whether it leaves mori's aggregated slot reservation for the combine.
+    provides_aggregated_reservation: bool
+    scale_stride: int  # the stride an e8m0 row arrives at; 0 on bf16
+    recv_scales: torch.Tensor | None  # the arrived e8m0 rows; None on bf16
+
+    @classmethod
+    def check(cls, config: MegaMoEConfig) -> None:
+        """Raise ValueError for a geometry it cannot run."""
+
+    @classmethod
+    def regions(cls, config: MegaMoEConfig, caps) -> dict:
+        """The arena regions it needs, by name. Pure: no instance, no GPU."""
+
+    def build(self, res: "_EpResources") -> None:
+        """Allocate and bind, once the arena exists."""
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        recv_token_bound: int | None = None,
+        next_topk_ids: torch.Tensor | None = None,
+        next_recv_token_bound: int | None = None,
+        begin_step: bool = True,
+    ) -> _DispatchBatch: ...
+
+    def prefetch(self, topk_ids, recv_token_bound=None) -> None: ...
+
+    def warmup(self, recv_token_bound=None, token_count=None) -> None: ...
+
+    def recv_views(self) -> tuple:
+        """(recv_x, recv_weights, recv_ids) over the whole arena."""
+
+    def close(self) -> None: ...
+
+
+class CombineStage(Protocol):
+    """Expert results back to their tokens' ranks, summed per token.
+
+    Built as ``Stage(config, caps)``, as a dispatch stage is.
+    """
+
+    wires: ClassVar[tuple]  # the combine wires it can be built for
+    accepted_layouts: ClassVar[frozenset]  # the BatchLayouts it can combine
+    uses_mori: ClassVar[bool]
+    # Whether it reads its landing offsets off mori's aggregated reservation.
+    needs_aggregated_reservation: bool
+
+    @classmethod
+    def check(cls, config: MegaMoEConfig) -> None: ...
+
+    @classmethod
+    def regions(cls, config: MegaMoEConfig, caps) -> dict: ...
+
+    def build(self, res: "_EpResources") -> None: ...
+
+    def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
+        """Where the expert GEMM leaves this batch's rows."""
+
+    def finish(
+        self, routing: Routing, quant_bits: int, expert_out=None
+    ) -> torch.Tensor:
+        """Combine the rows ``prepare`` placed, on the ``quant_bits`` wire."""
+
+    def close(self) -> None: ...
 
 
 def _schedule_specs(schedule) -> list:
@@ -1157,37 +1225,40 @@ def _schedule_specs(schedule) -> list:
     return sorted({tuple(entry[1:]) for entry in schedule})
 
 
+def _pick(schedule, token_count: int) -> tuple:
+    """The spec of the first (bound, *spec) entry whose bound covers
+    ``token_count``; past every bound, the last entry's."""
+    for upper_bound, *spec in schedule:
+        if upper_bound is None or token_count <= upper_bound:
+            return tuple(spec)
+    return tuple(schedule[-1][1:])
+
+
+def _check_recv_token_bound(config: MegaMoEConfig, name: str, bound) -> None:
+    """A caller's recv-token bound has to be a slot count the arena holds."""
+    if bound is not None and not 0 < int(bound) <= config.max_recv:
+        raise ValueError(f"{name} must be in (0, {config.max_recv}], got {bound}")
+
+
+def _close_all(closeables) -> None:
+    """close() each of ``closeables`` in order, the rest even if one raises."""
+    with contextlib.ExitStack() as stack:
+        for closeable in reversed(list(closeables)):
+            stack.callback(closeable.close)
+
+
 class _Dispatch:
-    """Tokens out to their experts' ranks, into the arena's recv rows."""
+    """What both dispatches share: the recv views over the routing regions, and
+    the sender's rows quantized onto the wire."""
 
-    compact = None  # the compact row geometry, on the compact plan
-    tokoff_ext = False  # mori's slot word lives outside the window
-
-    def __init__(self, config: MegaMoEConfig, mori, schedule: tuple):
+    def __init__(self, config: MegaMoEConfig, schedule: tuple):
         self.config = config
-        self.mori = mori
         self.schedule = schedule
         # A spec is (block, warp), plus route_parallel on the compact path.
         self.specs = _schedule_specs(schedule)
         self.res = None
         self._quant_payload = None
         self._quant_scales = None
-        # Points at the persistent scale rows, set per dispatch on a quantizing
-        # wire; 0 (and unread) on bf16.
-        self._sent_scales_ptr = 0
-
-    @staticmethod
-    def routing_regions(config: MegaMoEConfig) -> dict:
-        """The routing both dispatches write and the combine reads back."""
-        max_recv, topk = config.max_recv, config.topk
-        return {
-            "tok_off": 4,
-            # mori's gfx1250 dispatch signals 8 bytes a source (ROCm/mori#745).
-            "recv_num": 2 * config.world_size * 4,
-            "recv_to_src_token": max_recv * 4,
-            "out_idx": max_recv * topk * 4,
-            "out_wts": max_recv * topk * 4,
-        }
 
     def build(self, res: _EpResources) -> None:
         self.res = res
@@ -1226,17 +1297,11 @@ class _Dispatch:
         """(recv_x, recv_weights, recv_ids) over the whole arena."""
         return self.recv_x, self.recv_weights, self.recv_ids
 
-    def select(self, token_count: int) -> tuple:
-        for upper_bound, *spec in self.schedule:
-            if upper_bound is None or token_count <= upper_bound:
-                spec = tuple(spec)
-                return spec if spec in self.specs else self.specs[-1]
-        return self.specs[-1]
-
-    def _quantize(self, hidden_states: torch.Tensor, token_count: int):
-        """What goes on the wire: hidden_states on bf16, else its MX rows."""
+    def _quantize(self, hidden_states: torch.Tensor, token_count: int) -> tuple:
+        """What goes on the wire, as (payload, address of its e8m0 rows):
+        hidden_states and 0 on bf16, else its MX rows."""
         if self._quant_payload is None:
-            return hidden_states
+            return hidden_states, 0
         # Quantize ONCE PER LOCAL TOKEN here, instead of once per received
         # copy on the far side. Destination-independent, so the bytes are the
         # same either way; the preshuffle cannot move with it, because its
@@ -1252,24 +1317,14 @@ class _Dispatch:
             32,
             shuffle_scale=False,
         )
-        # Straight onto the wire; mori restrides these packed rows while it
-        # stages them, so there is no repack here.
-        self._sent_scales_ptr = scale_rows.data_ptr()
-        return payload
+        # Straight onto the wire; the dispatch restrides these packed rows while
+        # it stages them, so there is no repack here.
+        return payload, scale_rows.data_ptr()
 
     def _routing(self, token_count: int) -> Routing:
         return Routing(
             token_count=token_count, reverse_source_view=self._reverse_source
         )
-
-    def prefetch(self, topk_ids, recv_token_bound=None) -> None:
-        """Nothing to run ahead off the compact plan."""
-
-    def warmup(self, recv_token_bound=None, token_count=None) -> None:
-        """Nothing to compile ahead off the compact plan."""
-
-    def close(self) -> None:
-        pass
 
 
 class _MoriDispatch(_Dispatch):
@@ -1281,100 +1336,88 @@ class _MoriDispatch(_Dispatch):
     and handed out block-local.
     """
 
-    def __init__(self, config: MegaMoEConfig, mori):
+    wires = _DISPATCH_WIRES
+    output_layout = BatchLayout.TOKEN_MAJOR
+    uses_mori = True
+
+    def __init__(self, config: MegaMoEConfig, caps: _MoriCapabilities):
         # mori's geometry is a compile-time Cfg field, so it brings its own
         # tuned buckets.
-        super().__init__(config, mori, mori.dispatch_schedule(config))
-        self.tokoff_ext, self._slot_word_kw = mori.slot_word(config)
-        # Since ROCm/mori#703 the dispatch stages through a buffer its caller
-        # binds; one serves every plan, as only one launches at a time.
-        infos = self.describe(config, mori, self.specs)
-        if infos is not None:
-            self._staging_nbytes = max(info["stagingBytes"] for info in infos)
-        else:
-            self._staging_nbytes = mori.staging_bytes(
-                config, config.dispatch_scale_nbytes
-            )
+        super().__init__(config, caps.dispatch_schedule(config))
+        self.caps = caps
+        # Where mori's slot word lives decides how the plans reserve slots:
+        # outside the window, there is no aggregated reservation.
+        self.tokoff_ext = caps.tokoff_ext_wanted(config)
+        self.provides_aggregated_reservation = not self.tokoff_ext
+        infos = self.describe(config, caps, self.specs)
+        # One staging buffer serves every plan, as only one launches at a time.
+        self._staging_nbytes = max(info["stagingBytes"] for info in infos)
+        self.scale_stride = infos[0]["scaleStride"]
         self._staging = None
         self._plans = {}
 
     @staticmethod
-    def request(config: MegaMoEConfig, spec: tuple, slot_word_kw=None) -> dict:
+    def request(config: MegaMoEConfig, spec: tuple, tokoff_ext=False) -> dict:
         """The plan request for ``spec``: what describe() reads, and what the
         plan is built from once the arena is added."""
-        # Passed only on a quantizing wire, matching dispatch_scale_dst_nbytes:
-        # mori grew scale_bytes in #593 and rejects UNKNOWN kwargs outright, so
-        # sending the bf16 wire's harmless 0 would make an older mori refuse
-        # the whole plan.
-        scale_kw = (
-            {"scale_bytes": config.dispatch_scale_nbytes}
-            if config.is_quant_dispatch_wire
-            else {}
-        )
-        return dict(
-            world_size=config.world_size,
+        return {
+            "world_size": config.world_size,
             # see dispatch_wire_elem_count; mori's plan_api: "the caller halves
             # hiddenDim"
-            hidden_dim=config.dispatch_wire_elem_count,
-            max_tok_per_rank=config.max_tokens_per_rank,
-            num_expert_per_rank=config.experts_per_rank,
-            num_expert_per_token=config.topk,
-            max_recv=config.max_recv,
-            dtype=config.dispatch_wire_spec.mori_dtype,
-            use_weights=True,
-            **scale_kw,
-            **(slot_word_kw or {}),
-            block_num=spec[0],
-            warp_per_block=spec[1],
+            "hidden_dim": config.dispatch_wire_elem_count,
+            "max_tok_per_rank": config.max_tokens_per_rank,
+            "num_expert_per_rank": config.experts_per_rank,
+            "num_expert_per_token": config.topk,
+            "max_recv": config.max_recv,
+            "dtype": config.dispatch_wire_spec.mori_dtype,
+            "use_weights": True,
+            "scale_bytes": config.dispatch_scale_nbytes,
+            "tok_off_ext": int(tokoff_ext),
+            "block_num": spec[0],
+            "warp_per_block": spec[1],
+        }
+
+    @staticmethod
+    def describe(config: MegaMoEConfig, caps, specs=None) -> list[dict]:
+        """mori's info for every plan this dispatch builds.
+
+        Without tokoff-ext: where the slot word lives sizes nothing, and asking
+        would be collective.
+        """
+        if specs is None:
+            specs = _schedule_specs(caps.dispatch_schedule(config))
+        return caps.describe_dispatch(
+            [_MoriDispatch.request(config, spec) for spec in specs]
         )
 
-    @staticmethod
-    def describe(config: MegaMoEConfig, mori, specs=None) -> list[dict] | None:
-        """mori's info for every plan this dispatch builds, None before #844.
+    @classmethod
+    def check(cls, config: MegaMoEConfig) -> None:
+        """Nothing beyond what mori's describe() refuses."""
 
-        Without the slot word's kwargs: where that word lives sizes nothing, and
-        asking would be collective.
-        """
-        if not mori.plan_describe:
-            return None
-        if specs is None:
-            specs = _schedule_specs(mori.dispatch_schedule(config))
-        requests = [_MoriDispatch.request(config, spec) for spec in specs]
-        return mori.describe(mori.ep_plans.EpDispatchPlan, requests)
-
-    @staticmethod
-    def regions(config: MegaMoEConfig, mori, compact=None) -> dict:
-        infos = _MoriDispatch.describe(config, mori)
-        if infos is not None:
-            return mori.region_sizes(infos)
-        regions = _Dispatch.routing_regions(config)
-        regions["disp_out"] = config.max_recv * config.dispatch_token_nbytes
-        if config.is_quant_dispatch_wire:
-            regions["disp_out_scales"] = config.max_recv * mori.scale_stride(config)
-        return regions
+    @classmethod
+    def regions(cls, config: MegaMoEConfig, caps) -> dict:
+        return caps.region_sizes(cls.describe(config, caps))
 
     def build(self, res: _EpResources) -> None:
         super().build(res)
         config, arena = self.config, res.arena
-        if self._staging_nbytes is not None:
-            self._staging = torch.zeros(
-                self._staging_nbytes, dtype=torch.uint8, device=res.total_recv.device
-            )
-        EpDispatchPlan = self.mori.ep_plans.EpDispatchPlan
+        device = res.total_recv.device
+        if self.tokoff_ext:
+            res.tokoff_ext = self.caps.tokoff_ext(config, device)
+        self._staging = torch.zeros(
+            self._staging_nbytes, dtype=torch.uint8, device=device
+        )
         for spec in self.specs:
-            plan = EpDispatchPlan(
-                **self.request(config, spec, self._slot_word_kw),
-                arena=arena,
-                region_names=_MORI_REGION_NAMES,
+            plan = self.caps.dispatch_plan(
+                self.request(config, spec, self.tokoff_ext), arena
             )
             # The kernels dereference the window, so the plans have to outlive
             # them; held from here so a failed bind still closes it.
             self._plans[spec] = plan
             plan.bind(rank=config.rank)
-            if self._staging is not None:
-                # The tensor, not its address: a mori with ROCm/mori#844 checks it
-                # against the plan's stagingBytes, an older one reads its address.
-                plan.bind(staging_base=self._staging)
+            # The tensor, not its address: mori checks it against the plan's
+            # stagingBytes.
+            plan.bind(staging_base=self._staging)
         self._tok_off_peers = None if res.tokoff_ext is None else res.tokoff_ext.peers
         # Width in whatever recv_dtype counts: features for bf16/fp8, bytes for
         # fp4 -- see _DispatchWire.recv_dtype.
@@ -1390,7 +1433,7 @@ class _MoriDispatch(_Dispatch):
         self.recv_scales = (
             _from_gpu_ptr(
                 arena.local_ptr("disp_out_scales"),
-                (config.max_recv, config.dispatch_scale_dst_nbytes),
+                (config.max_recv, self.scale_stride),
                 torch.uint8,
             )
             if config.is_quant_dispatch_wire
@@ -1412,16 +1455,12 @@ class _MoriDispatch(_Dispatch):
         plan to run ahead, so the next layer's ids go unused."""
         config, res = self.config, self.res
         token_count = hidden_states.shape[0]
-        if recv_token_bound is not None:
-            bound = int(recv_token_bound)
-            if bound <= 0 or bound > config.max_recv:
-                raise ValueError(
-                    f"recv_token_bound must be in (0, {config.max_recv}], "
-                    f"got {recv_token_bound}"
-                )
-        plan = self._plans[self.select(token_count)]
-        payload = self._quantize(hidden_states, token_count)
-        # No total_recv.zero_(): mori's gfx1250 dispatch overwrites it.
+        _check_recv_token_bound(config, "recv_token_bound", recv_token_bound)
+        _check_recv_token_bound(config, "next_recv_token_bound", next_recv_token_bound)
+        plan = self._plans[_pick(self.schedule, token_count)]
+        payload, scales_ptr = self._quantize(hidden_states, token_count)
+        # No total_recv.zero_(): the dispatch overwrites it (see
+        # _MoriCapabilities).
         plan.launch(
             stream=torch.cuda.current_stream().cuda_stream,
             token_indices=topk_ids.data_ptr(),
@@ -1433,7 +1472,7 @@ class _MoriDispatch(_Dispatch):
             grid_barrier=res.dispatch_barrier.data_ptr(),
             tok_off_peers=self._tok_off_peers,
             num_tokens=token_count,
-            scales_buf=self._sent_scales_ptr,
+            scales_buf=scales_ptr,
         )
         x, weights, ids, scales = (
             self.recv_x,
@@ -1442,6 +1481,7 @@ class _MoriDispatch(_Dispatch):
             self.recv_scales,
         )
         if recv_token_bound is not None:
+            bound = int(recv_token_bound)
             x, weights, ids = x[:bound], weights[:bound], ids[:bound]
             if scales is not None:
                 scales = scales[:bound]
@@ -1452,12 +1492,20 @@ class _MoriDispatch(_Dispatch):
             scales=scales,
             num_local_tokens=res.total_recv,
             routing=self._routing(token_count),
+            layout=BatchLayout.TOKEN_MAJOR,
         )
 
+    def prefetch(self, topk_ids, recv_token_bound=None) -> None:
+        """Nothing to run ahead: the plan is the dispatch."""
+        _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
+
+    def warmup(self, recv_token_bound=None, token_count=None) -> None:
+        """Nothing to compile ahead: every plan was built with the arena."""
+        _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
+
     def close(self) -> None:
-        for plan in self._plans.values():
-            plan.close()
-        self._plans = {}
+        plans, self._plans = self._plans, {}
+        _close_all(plans.values())
         # After the plans, which hold its address.
         self._staging = None
 
@@ -1489,9 +1537,14 @@ class _CompactDispatch(_Dispatch):
     copies.
     """
 
+    wires = ("fp8", "fp4")
+    output_layout = BatchLayout.EXPERT_GROUPED
+    uses_mori = False
+    # The plan reserves the recv slots itself.
+    provides_aggregated_reservation = False
     _PLAN_SLOTS = 2
 
-    def __init__(self, config: MegaMoEConfig, mori=None):
+    def __init__(self, config: MegaMoEConfig, caps=None):
         # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
         blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
         warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
@@ -1499,8 +1552,9 @@ class _CompactDispatch(_Dispatch):
             schedule = ((None, int(blocks_env or "64"), int(warps_env or "8")),)
         else:
             schedule = _DISPATCH_COMPACT
-        super().__init__(config, mori, schedule)
+        super().__init__(config, schedule)
         self.compact = _CompactGeometry.of(config)
+        self.scale_stride = _align_up(config.dispatch_scale_nbytes, 128)
         self._step = _CompactStep(
             recv_bound=config.max_recv,
             align_m=self.compact.tile_m,
@@ -1510,17 +1564,34 @@ class _CompactDispatch(_Dispatch):
         self._plan_pending = False
         self._plan_launches = {}
 
+    @classmethod
+    def check(cls, config: MegaMoEConfig) -> None:
+        """Nothing beyond MegaMoEConfig's own checks."""
+
+    @classmethod
+    def regions(cls, config: MegaMoEConfig, caps=None) -> dict:
+        return cls.regions_for_tile(config, _compact_gemm_align_m(config))
+
     @staticmethod
-    def regions(config: MegaMoEConfig, mori=None, compact=None) -> dict:
+    def regions_for_tile(config: MegaMoEConfig, tile_m: int) -> dict:
+        """The arena regions at GEMM tile ``tile_m``, which pads every expert's
+        rows and so sizes the recv rows and their map."""
         from .compact_plan import compact_done_nbytes
 
-        geo = compact if compact is not None else _CompactGeometry.of(config)
-        regions = _Dispatch.routing_regions(config)
-        regions["disp_out"] = geo.cap * geo.wire_row
-        regions["ep_rowmap"] = (geo.cap + 1) * 8
-        regions["compact_hist"] = 2 * geo.hist_stride * 4
-        regions["compact_done"] = compact_done_nbytes()
-        return regions
+        geo = _CompactGeometry.of(config, tile_m)
+        max_recv, topk = config.max_recv, config.topk
+        return {
+            "tok_off": 4,
+            # 8 bytes a source, as mori's dispatch signals.
+            "recv_num": 2 * config.world_size * 4,
+            "recv_to_src_token": max_recv * 4,
+            "out_idx": max_recv * topk * 4,
+            "out_wts": max_recv * topk * 4,
+            "disp_out": geo.cap * geo.wire_row,
+            "ep_rowmap": (geo.cap + 1) * 8,
+            "compact_hist": 2 * geo.hist_stride * 4,
+            "compact_done": compact_done_nbytes(),
+        }
 
     def build(self, res: _EpResources) -> None:
         super().build(res)
@@ -1603,7 +1674,7 @@ class _CompactDispatch(_Dispatch):
             torch.empty(slots * config.topk, dtype=torch.int32, device=device),
             torch.empty(slots, dtype=torch.int32, device=device),
             torch.empty(
-                slots * config.dispatch_scale_dst_nbytes,
+                slots * self.scale_stride,
                 dtype=torch.uint8,
                 device=device,
             ),
@@ -1655,7 +1726,7 @@ class _CompactDispatch(_Dispatch):
                         arena.offset("disp_out") + config.dispatch_token_nbytes
                     ),
                     scale_bytes=config.dispatch_scale_nbytes,
-                    scale_stride=config.dispatch_scale_dst_nbytes,
+                    scale_stride=self.scale_stride,
                     block_num=geom[0],
                     warp_num_per_block=geom[1],
                     clear_route_counter=False,
@@ -1685,13 +1756,15 @@ class _CompactDispatch(_Dispatch):
         is issued."""
         config, res = self.config, self.res
         token_count = int(hidden_states.shape[0])
+        _check_recv_token_bound(config, "recv_token_bound", recv_token_bound)
+        _check_recv_token_bound(config, "next_recv_token_bound", next_recv_token_bound)
         if begin_step:
             self._step = self._step_for(self._recv_bound(token_count, recv_token_bound))
-        kernel = self._kernels[self.select(token_count)]
+        kernel = self._kernels[_pick(self.schedule, token_count)]
         if not self._plan_pending:
             self._launch_plan(topk_ids, token_count, self._slot, self._step.align_m)
         stream = fx.Stream(torch.cuda.current_stream())
-        payload = self._quantize(hidden_states, token_count)
+        payload, scales_ptr = self._quantize(hidden_states, token_count)
         self._wait_plan()
         slot, step = self._slot, self._step
         _run_compiled(
@@ -1705,7 +1778,7 @@ class _CompactDispatch(_Dispatch):
             res.dispatch_barrier.data_ptr(),
             res.total_recv.data_ptr(),
             *self._stage_ptrs,
-            self._sent_scales_ptr,
+            scales_ptr,
             res.route_counter.data_ptr(),
             config.rank,
             token_count,
@@ -1718,16 +1791,16 @@ class _CompactDispatch(_Dispatch):
             scales=self.recv_scales,
             num_local_tokens=None,
             routing=self._routing(token_count),
-            compact_rows={
-                "compact_layout": True,
-                "compact_masked_m": self._masked_ms[slot],
-                "compact_psum": self._psums[slot],
-                "compact_ep_rowmap": self._ep_rowmap,
-                "compact_wire_row_stride": self.compact.wire_row,
-                "compact_recv_bound": step.recv_bound,
-                "compact_align_m": step.align_m,
-                "compact_rows": step.rows,
-            },
+            layout=BatchLayout.EXPERT_GROUPED,
+            grouping=ExpertGrouping(
+                masked_m=self._masked_ms[slot],
+                psum=self._psums[slot],
+                ep_rowmap=self._ep_rowmap,
+                wire_row_stride=self.compact.wire_row,
+                recv_bound=step.recv_bound,
+                align_m=step.align_m,
+                rows=step.rows,
+            ),
         )
         if next_topk_ids is not None and int(next_topk_ids.shape[0]) > 0:
             # Dispatch of this layer is done, so tok_map[slot] is free. GEMM
@@ -1742,12 +1815,14 @@ class _CompactDispatch(_Dispatch):
 
     def prefetch(self, topk_ids, recv_token_bound=None) -> None:
         """Launch the plan for ``topk_ids`` on the side stream, into this step."""
+        _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
         token_count = int(topk_ids.shape[0])
         self._step = self._step_for(self._recv_bound(token_count, recv_token_bound))
         self._launch_plan(topk_ids, token_count, self._slot, self._step.align_m)
 
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
         """Compile the plan this bound's tile needs, in both slots."""
+        _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
         tok = (
             int(self.config.max_tokens_per_rank)
             if token_count is None
@@ -1758,15 +1833,15 @@ class _CompactDispatch(_Dispatch):
             self._plan_for(self._step.align_m, slot)
 
     def _recv_bound(self, token_count: int, recv_token_bound: int | None) -> int:
-        """Static safe recv bound for this step.
+        """Static safe recv bound for this step: the caller's, already checked.
 
-        Dispatch deduplicates a token's routes to the same peer, so one rank can
-        receive at most ``world_size * token_count`` rows. Use that exact bound
-        when the caller did not provide a tighter graph bucket.
+        Without one: dispatch deduplicates a token's routes to the same peer, so
+        one rank can receive at most ``world_size * token_count`` rows.
         """
+        if recv_token_bound is not None:
+            return int(recv_token_bound)
         inferred = int(self.config.world_size) * max(1, int(token_count))
-        bound = inferred if recv_token_bound is None else int(recv_token_bound)
-        return max(1, min(bound, int(self.config.max_recv)))
+        return min(inferred, int(self.config.max_recv))
 
     def _step_for(self, recv_bound: int) -> _CompactStep:
         from .compact_plan import compact_row_capacity
@@ -1852,30 +1927,23 @@ class _CompactDispatch(_Dispatch):
         torch.cuda.current_stream().wait_event(self._plan_event)
         self._plan_pending = False
 
-
-class _Combine:
-    """Expert results back to their tokens' ranks, summed per token."""
-
-    # Whether the combine reads its landing offsets off mori's aggregated
-    # dispatch reservation.
-    needs_aggregated_reservation = False
-
-    def __init__(self, config: MegaMoEConfig, mori):
-        self.config = config
-        self.mori = mori
-        self.res = None
-
     def close(self) -> None:
-        pass
+        """Nothing to release: its kernels and buffers are not held by mori."""
 
 
-class _FusedScatterCombine(_Combine):
+class _FusedScatterCombine:
     """The gemm2 epilogue P2P-scatters each row into the slot of the peer its
     token came from, packed as the step's wire; after a cross-device barrier a
     FlyDSL reduce sums each token's slots."""
 
-    def __init__(self, config: MegaMoEConfig, mori=None):
-        super().__init__(config, mori)
+    wires = tuple(_COMBINE_WIRE_QUANT)
+    accepted_layouts = frozenset(BatchLayout)
+    uses_mori = False
+    needs_aggregated_reservation = False
+
+    def __init__(self, config: MegaMoEConfig, caps=None):
+        self.config = config
+        self.res = None
         self._tiles = {
             bits: _combine_tile(
                 topk=config.topk, hidden_dim=config.hidden_dim, quant_bits=bits
@@ -1883,8 +1951,19 @@ class _FusedScatterCombine(_Combine):
             for bits in config.combine_quant_bit_modes
         }
 
-    @staticmethod
-    def regions(config: MegaMoEConfig, mori=None) -> dict:
+    @classmethod
+    def check(cls, config: MegaMoEConfig) -> None:
+        # Every wire, not just the quantized ones: the reduce tiles hidden in
+        # whole chunks and has no tail path.
+        if config.hidden_dim % _COMBINE_CHUNK_ELEMS:
+            raise ValueError(
+                f"the combine reduce tiles hidden in {_COMBINE_CHUNK_ELEMS}-"
+                f"element chunks with no tail path, so it needs hidden_dim % "
+                f"{_COMBINE_CHUNK_ELEMS} == 0, got {config.hidden_dim}"
+            )
+
+    @classmethod
+    def regions(cls, config: MegaMoEConfig, caps=None) -> dict:
         return {
             "cross_device_barrier": config.world_size * 8,
             # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
@@ -1928,17 +2007,19 @@ class _FusedScatterCombine(_Combine):
 
     def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
         config, arena = self.config, self.res.arena
+        grouped = batch.layout is BatchLayout.EXPERT_GROUPED
+        scatter = Stage2ScatterContext(
+            arena_handle=arena.handle,
+            combine_input_offset=arena.offset("comb_inp"),
+            slot_stride_bytes=config.combine_slot_stride_for(quant_bits),
+            max_tokens_per_rank=config.max_tokens_per_rank,
+            world_size=config.world_size,
+            source_token_map=batch.routing.source_token_map,
+            **(batch.grouping.scatter_fields() if grouped else {}),
+            combine_quant_bits=quant_bits,
+        )
         return _ComputeTarget(
-            scatter=Stage2ScatterContext(
-                arena_handle=arena.handle,
-                combine_input_offset=arena.offset("comb_inp"),
-                slot_stride_bytes=config.combine_slot_stride_for(quant_bits),
-                max_tokens_per_rank=config.max_tokens_per_rank,
-                world_size=config.world_size,
-                source_token_map=batch.routing.source_token_map,
-                **(batch.compact_rows or {}),
-                combine_quant_bits=quant_bits,
-            )
+            scatter=scatter, dispatch_context=scatter if grouped else None
         )
 
     def finish(
@@ -1966,8 +2047,11 @@ class _FusedScatterCombine(_Combine):
         )
         return res.output(routing.token_count)
 
+    def close(self) -> None:
+        """Nothing to release: its kernels and buffers are not held by mori."""
 
-class _MoriCombine(_Combine):
+
+class _MoriCombine:
     """mori's EpCombinePlan over fused_moe's per-recv-row output.
 
     bf16 gathers: fused_moe writes its rows straight into this rank's comb_inp
@@ -1978,10 +2062,16 @@ class _MoriCombine(_Combine):
     and sums what landed for its own tokens. Both zero total_recv on the way out.
     """
 
-    def __init__(self, config: MegaMoEConfig, mori):
-        super().__init__(config, mori)
+    wires = ("bf16", "fp4")
+    accepted_layouts = frozenset({BatchLayout.TOKEN_MAJOR})
+    uses_mori = True
+
+    def __init__(self, config: MegaMoEConfig, caps: _MoriCapabilities):
+        self.config = config
+        self.caps = caps
+        self.res = None
         self._schedules = {
-            bits: mori.combine_schedule(config, bits)
+            bits: caps.combine_schedule(config, bits)
             for bits in config.combine_quant_bit_modes
         }
         self._specs = {
@@ -1991,71 +2081,60 @@ class _MoriCombine(_Combine):
         self._max_blocks = max(
             block for wire in self._specs.values() for block, _ in wire
         )
-        slots = mori.hip_backend._XDB_FLAG_SLOTS
+        slots = caps.xdb_flag_slots
         if self._max_blocks > slots:
             raise ValueError(
                 f"mori combine block_num {self._max_blocks} exceeds the "
                 f"{slots} per-block epoch slots its entry barrier owns"
             )
-        self.needs_aggregated_reservation = bool(
-            config.combine_quant_bits and mori.push_landing_rows(config) is not None
-        )
+        # The fp4 push combine reads its landing offsets off the reservation.
+        self.needs_aggregated_reservation = bool(config.combine_quant_bits)
         self._plans = {}
+
+    @classmethod
+    def check(cls, config: MegaMoEConfig) -> None:
+        if config.combine_quant_bits and (
+            config.hidden_dim % _MORI_FP4_COMBINE_HIDDEN_ALIGN
+        ):
+            raise ValueError(
+                "mori's fp4 combine needs hidden_dim % "
+                f"{_MORI_FP4_COMBINE_HIDDEN_ALIGN} == 0, got {config.hidden_dim}"
+            )
 
     @staticmethod
     def request(config: MegaMoEConfig, quant_bits: int, spec: tuple) -> dict:
         """The plan request for ``spec`` on the ``quant_bits`` wire."""
-        # Named only on the fp4 wire: an older mori rejects unknown kwargs.
-        fp4_kw = {"combine_fp4": True} if quant_bits else {}
-        return dict(
-            world_size=config.world_size,
-            hidden_dim=config.hidden_dim,
-            max_tok_per_rank=config.max_tokens_per_rank,
-            num_expert_per_rank=config.experts_per_rank,
-            num_expert_per_token=config.topk,
-            max_recv=config.max_recv,
-            dtype=torch.bfloat16,
-            use_weights=True,
-            **fp4_kw,
-            block_num=spec[0],
-            warp_per_block=spec[1],
-        )
+        return {
+            "world_size": config.world_size,
+            "hidden_dim": config.hidden_dim,
+            "max_tok_per_rank": config.max_tokens_per_rank,
+            "num_expert_per_rank": config.experts_per_rank,
+            "num_expert_per_token": config.topk,
+            "max_recv": config.max_recv,
+            "dtype": torch.bfloat16,
+            "use_weights": True,
+            "combine_fp4": bool(quant_bits),
+            "block_num": spec[0],
+            "warp_per_block": spec[1],
+        }
 
-    @staticmethod
-    def regions(config: MegaMoEConfig, mori) -> dict:
-        if mori.plan_describe:
-            requests = [
-                _MoriCombine.request(config, bits, spec)
-                for bits in config.combine_quant_bit_modes
-                for spec in _schedule_specs(mori.combine_schedule(config, bits))
-            ]
-            infos = mori.describe(mori.ep_plans.EpCombinePlan, requests)
-            return mori.region_sizes(infos)
-        # mori's outTok: one bf16 staging row per recv slot, then, for the fp4
-        # push combine, its landing rows and, from four ranks up, a u64 flag per
-        # landing row for the overlapped combine (EpFp4Ovl) -- the same three
-        # parts mori's own out_tok sizes.
-        nbytes = config.max_recv * config.hidden_dim * 2
-        if config.combine_quant_bits:
-            landing_rows = mori.push_landing_rows(config)
-            if landing_rows is None:
-                landing_rows = config.world_size * config.max_recv
-            nbytes += landing_rows * mori.push_wire_bytes(config)
-            if config.world_size >= 4:
-                nbytes += landing_rows * 8
-        return {"cross_device_barrier": config.world_size * 8, "comb_inp": nbytes}
+    @classmethod
+    def regions(cls, config: MegaMoEConfig, caps) -> dict:
+        requests = [
+            cls.request(config, bits, spec)
+            for bits in config.combine_quant_bit_modes
+            for spec in _schedule_specs(caps.combine_schedule(config, bits))
+        ]
+        return caps.region_sizes(caps.describe_combine(requests))
 
     def build(self, res: _EpResources) -> None:
         self.res = res
         config = self.config
         device = res.total_recv.device
-        EpCombinePlan = self.mori.ep_plans.EpCombinePlan
         for bits, wire_specs in self._specs.items():
             for spec in wire_specs:
-                plan = EpCombinePlan(
-                    **self.request(config, bits, spec),
-                    arena=res.arena,
-                    region_names=_MORI_REGION_NAMES,
+                plan = self.caps.combine_plan(
+                    self.request(config, bits, spec), res.arena
                 )
                 self._plans[bits, spec] = plan
                 plan.bind(rank=config.rank)
@@ -2063,7 +2142,7 @@ class _MoriCombine(_Combine):
         # One epoch per block: each block is the only writer of its own slot.
         # Starts at 1 so the zeroed peer slots cannot alias the first launch.
         self._cross_device_flag = torch.ones(
-            self.mori.hip_backend._XDB_FLAG_SLOTS, dtype=torch.int64, device=device
+            self.caps.xdb_flag_slots, dtype=torch.int64, device=device
         )
         self._grid_barrier = torch.zeros(1, dtype=torch.uint32, device=device)
         # The entry barrier's intra-grid fan-out: 16 lines per block.
@@ -2092,6 +2171,15 @@ class _MoriCombine(_Combine):
         )
 
     def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
+        """fused_moe writes its rows straight into this rank's comb_inp staging.
+
+        Overwriting the previous step's rows there is safe because of the
+        dispatch, not the combine: peers read those rows during their combine,
+        and this step's dispatch, which the GEMM waits for, does not finish on
+        this rank until every peer has dispatched to it -- which each peer does
+        only after its own previous combine, in stream order. A dispatch that
+        let a rank run ahead of a peer's combine would break this.
+        """
         return _ComputeTarget(output=self._stage[: batch.x.shape[0]])
 
     def finish(
@@ -2100,7 +2188,7 @@ class _MoriCombine(_Combine):
         """``expert_out`` is fused_moe's per-recv-slot output, already in the
         staging rows; mori moves it from there."""
         count = routing.token_count
-        plan = self._plans[quant_bits, self._select(quant_bits, count)]
+        plan = self._plans[quant_bits, _pick(self._schedules[quant_bits], count)]
         plan.launch(
             stream=torch.cuda.current_stream().cuda_stream,
             inp_token_buf=expert_out,
@@ -2109,35 +2197,34 @@ class _MoriCombine(_Combine):
         )
         return self.res.output(count)
 
-    def _select(self, quant_bits: int, token_count: int) -> tuple:
-        schedule = self._schedules[quant_bits]
-        for upper_bound, *spec in schedule:
-            if upper_bound is None or token_count <= upper_bound:
-                return tuple(spec)
-        return tuple(schedule[-1][1:])
-
     def close(self) -> None:
-        for plan in self._plans.values():
-            plan.close()
-        self._plans = {}
+        plans, self._plans = self._plans, {}
+        _close_all(plans.values())
 
 
-_DISPATCH_STAGES = {
+_DISPATCH_STAGES: dict = {
     DispatchKind.MORI: _MoriDispatch,
     DispatchKind.COMPACT: _CompactDispatch,
 }
-_COMBINE_STAGES = {
+_COMBINE_STAGES: dict = {
     CombineKind.MORI: _MoriCombine,
     CombineKind.FUSED_SCATTER: _FusedScatterCombine,
 }
 
 
-def _arena_layout(config: MegaMoEConfig, mori, compact=None) -> _ArenaLayout:
+def _capabilities_for(recipe: MegaMoERecipe) -> _MoriCapabilities | None:
+    """mori's capabilities if a stage ``recipe`` names drives mori, else None."""
+    if any(stage.uses_mori for stage in _stage_classes(recipe)):
+        return _mori_capabilities()
+    return None
+
+
+def _arena_layout(config: MegaMoEConfig, caps) -> _ArenaLayout:
     """The one arena formula: what the runtime allocates and what
     ``required_vmm_bytes`` reports."""
+    dispatch, combine = _stage_classes(config.recipe)
     return _ArenaLayout.merge(
-        _DISPATCH_STAGES[config.recipe.dispatch].regions(config, mori, compact),
-        _COMBINE_STAGES[config.recipe.combine].regions(config, mori),
+        dispatch.regions(config, caps), combine.regions(config, caps)
     )
 
 
@@ -2153,49 +2240,77 @@ class _EpDispatcher:
         self.device = torch.device("cuda", torch.cuda.current_device())
         self._closed = False
         recipe = config.recipe
-        uses_mori = (
-            recipe.dispatch is DispatchKind.MORI or recipe.combine is CombineKind.MORI
-        )
-        self.mori = _mori_capabilities() if uses_mori else None
-        self.dispatch = _DISPATCH_STAGES[recipe.dispatch](config, self.mori)
-        self.combine = _COMBINE_STAGES[recipe.combine](config, self.mori)
-        # The push combine finds its landing offsets in the aggregated
-        # reservation's signal, which tok_off_ext turns off; mori's op layer
-        # refuses the pair the same way.
-        if self.dispatch.tokoff_ext and self.combine.needs_aggregated_reservation:
+        dispatch_cls, combine_cls = _stage_classes(recipe)
+        caps = _capabilities_for(recipe)
+        self._dispatch: DispatchStage = dispatch_cls(config, caps)
+        self._combine: CombineStage = combine_cls(config, caps)
+        # mori's op layer refuses this pair the same way.
+        if (
+            self._combine.needs_aggregated_reservation
+            and not self._dispatch.provides_aggregated_reservation
+        ):
             raise ValueError(
-                f"combine_quant={config.combine_quant!r} with stage2_fused=False "
-                "needs mori's aggregated dispatch reservation, which "
-                "MORI_EP_TOKOFF_EXT=1 turns off"
+                f"combine={recipe.combine.value} on the {recipe.combine_wires[-1]} "
+                "wire reads its landing offsets off mori's aggregated dispatch "
+                "reservation, which this dispatch does not make "
+                "(MORI_EP_TOKOFF_EXT=1 turns it off)"
             )
-        self.layout = _arena_layout(config, self.mori, self.dispatch.compact)
+        self.layout = _arena_layout(config, caps)
         self.res = _EpResources(SymmetricArena(communicator, self.layout))
         try:
             self.res.allocate(config, self.device)
-            if self.dispatch.tokoff_ext:
-                # Reuse mori's builder rather than duplicate its IPC handle
-                # protocol, which must match the kernel byte for byte.
-                self.res.tokoff_ext = self.mori.hip_backend.TokOffExt(
-                    config.rank, config.world_size, self.device
-                )
-            self.dispatch.build(self.res)
-            self.combine.build(self.res)
+            self._dispatch.build(self.res)
+            self._combine.build(self.res)
         except BaseException:
             self.close()
             raise
+
+    @property
+    def arena(self) -> SymmetricArena:
+        return self.res.arena
+
+    @property
+    def total_recv(self) -> torch.Tensor:
+        return self.res.total_recv
+
+    @property
+    def recv_scales(self) -> torch.Tensor | None:
+        """The forwarded e8m0 rows over the whole arena; None on bf16."""
+        return self._dispatch.recv_scales
+
+    def recv_views(self) -> tuple:
+        """(recv_x, recv_weights, recv_ids) over the whole arena."""
+        return self._dispatch.recv_views()
+
+    def dispatch(self, hidden_states, topk_weights, topk_ids, **step) -> _DispatchBatch:
+        """``step`` is recv_token_bound, next_topk_ids, next_recv_token_bound
+        and begin_step, as the dispatch stage takes them."""
+        return self._dispatch.dispatch(hidden_states, topk_weights, topk_ids, **step)
+
+    def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
+        return self._combine.prepare(batch, quant_bits)
+
+    def combine(self, routing: Routing, quant_bits: int, expert_out=None):
+        return self._combine.finish(routing, quant_bits, expert_out)
+
+    def prefetch(self, topk_ids, recv_token_bound=None) -> None:
+        self._dispatch.prefetch(topk_ids, recv_token_bound)
+
+    def warmup(self, recv_token_bound=None, token_count=None) -> None:
+        self._dispatch.warmup(recv_token_bound, token_count)
 
     def close(self):
         if self._closed:
             return
         self._closed = True
-        # A launch still in flight (a graph replay, say) reads the window: let it
-        # finish before anything it reads is freed.
-        torch.cuda.synchronize(self.device)
-        # The plans hold the window and their kernels dereference it, so they
-        # go before the arena does.
-        self.combine.close()
-        self.dispatch.close()
-        self.res.close()
+        try:
+            # A launch still in flight (a graph replay, say) reads the window:
+            # let it finish before anything it reads is freed.
+            torch.cuda.synchronize(self.device)
+        finally:
+            # The plans hold the window and their kernels dereference it, so
+            # they go before the arena does.
+            _close_all((self._combine, self._dispatch, self.res))
 
 
 def _require_gfx1250():
@@ -2204,13 +2319,39 @@ def _require_gfx1250():
         raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
 
 
+def _alias(owner: str, name: str) -> property:
+    """A read-only attribute that is ``self.<owner>.<name>``."""
+    return property(lambda self: getattr(getattr(self, owner), name))
+
+
 class MegaMoEGfx1250:
     """A8W4 EP MoE: dispatch, the grouped expert GEMM, combine.
 
-    Built from a ``MegaMoERecipe`` (what runs) and a ``MegaMoEGeometry`` (the
-    shape it runs at): ``from_recipe``. The keyword constructor takes the older
-    stage1_fused / stage2_fused flags and turns them into a recipe first.
+    Built by ``from_recipe`` from a ``MegaMoERecipe`` (what runs) and a
+    ``MegaMoEGeometry`` (the shape it runs at); forward() takes the rest. A
+    model's MoE layers share their geometry, recipe and communication arena and
+    differ only in their weights, so one instance serves every layer (weights
+    are forward() arguments) and the model keeps a single cco symmetric arena
+    instead of one per layer.
+
+    The keyword constructor, which takes the older stage1_fused / stage2_fused
+    flags, is deprecated. ``_config``, ``_arena``, ``_dispatch()``,
+    ``_combine()`` and ``_recv_dispatch_scales()`` are kept for ATOM's Triton
+    experts, which drive the dispatch and the combine themselves.
     """
+
+    model_dim = _alias("geometry", "model_dim")
+    inter_dim = _alias("geometry", "inter_dim")
+    experts = _alias("geometry", "experts")
+    experts_per_rank = _alias("geometry", "experts_per_rank")
+    topk = _alias("geometry", "topk")
+    max_tokens_per_rank = _alias("geometry", "max_tokens_per_rank")
+    activation = _alias("compute", "activation")
+    gate_mode = _alias("compute", "gate_mode")
+    quant_type = _alias("compute", "quant_type")
+    hidden_pad = _alias("compute", "hidden_pad")
+    intermediate_pad = _alias("compute", "intermediate_pad")
+    swiglu_limit = _alias("compute", "swiglu_limit")
 
     def __init__(
         self,
@@ -2237,13 +2378,15 @@ class MegaMoEGfx1250:
         combine_quant: str | None = None,
         dispatch_backend: str | None = None,
     ):
-        """Everything here is fixed for the whole model; forward() takes the rest.
-
-        A model's MoE layers share their geometry, expert-GEMM recipe and
-        communication arena and differ only in their weights, so one instance
-        serves every layer (weights are forward() arguments) and the model keeps a
-        single cco symmetric arena instead of one per layer.
-        """
+        """Deprecated: build a ``MegaMoERecipe`` and a ``MegaMoEGeometry`` and use
+        ``from_recipe``. This turns the flags into a recipe the same way
+        (``MegaMoERecipe.from_legacy``)."""
+        warnings.warn(
+            "MegaMoEGfx1250(**kwargs) is deprecated; use MegaMoEGfx1250.from_recipe "
+            "with a MegaMoERecipe and a MegaMoEGeometry",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         _require_gfx1250()
         geometry = MegaMoEGeometry(
             rank=rank,
@@ -2317,8 +2460,8 @@ class MegaMoEGfx1250:
         if recipe is None:
             return cls._legacy_vmm_bound(granularity, **legacy)
         config = MegaMoEConfig(recipe=recipe, geometry=geometry)
-        mori = None if recipe.dispatch is DispatchKind.COMPACT else _mori_capabilities()
-        return _cco_alloc_bytes(_arena_layout(config, mori).total_bytes, granularity)
+        layout = _arena_layout(config, _capabilities_for(recipe))
+        return _cco_alloc_bytes(layout.total_bytes, granularity)
 
     @classmethod
     def _legacy_vmm_bound(
@@ -2332,6 +2475,9 @@ class MegaMoEGfx1250:
         topk,
         stage1_fused=False,
     ):
+        """The largest arena any recipe with this dispatch takes. inter_dim is
+        not named, so the compact rows are sized for the widest GEMM tile a
+        CSV row names."""
         geometry = MegaMoEGeometry(
             rank=0,
             world_size=world_size,
@@ -2355,47 +2501,50 @@ class MegaMoEGfx1250:
                     (CombineKind.MORI, ("bf16", "fp4")),
                 )
             ]
-        mori = None if stage1_fused else _mori_capabilities()
-        largest = 0
+        caps = None if stage1_fused else _mori_capabilities()
+        sizes, refused = [], []
         for recipe in candidates:
             try:
                 config = MegaMoEConfig(recipe=recipe, geometry=geometry)
-            except ValueError:
-                continue  # e.g. mori's fp4 combine at a hidden it cannot tile
-            compact = (
-                _CompactGeometry.of(config, _MAX_COMPACT_TILE_M)
+            except ValueError as error:
+                refused.append(error)  # e.g. mori's fp4 combine at this hidden
+                continue
+            dispatch, combine = _stage_classes(recipe)
+            dispatch_regions = (
+                _CompactDispatch.regions_for_tile(config, _MAX_COMPACT_TILE_M)
                 if stage1_fused
-                else None
+                else dispatch.regions(config, caps)
             )
-            layout = _arena_layout(config, mori, compact)
-            largest = max(largest, layout.total_bytes)
-        return _cco_alloc_bytes(largest, granularity)
+            layout = _ArenaLayout.merge(dispatch_regions, combine.regions(config, caps))
+            sizes.append(layout.total_bytes)
+        if not sizes:
+            raise ValueError(
+                f"no recipe with stage1_fused={bool(stage1_fused)} runs at "
+                f"world_size={world_size}, hidden_dim={hidden_dim}, "
+                f"max_tokens_per_rank={max_tokens_per_rank}, experts={experts}, "
+                f"topk={topk}: {refused[-1]}"
+            )
+        return _cco_alloc_bytes(max(sizes), granularity)
 
     def _build(self, recipe, geometry, communicator, situ_beta, situ_linear_beta):
         config = MegaMoEConfig(recipe=recipe, geometry=geometry)
         self.recipe = recipe
         self.geometry = geometry
-        self.model_dim = geometry.model_dim
-        self.inter_dim = geometry.inter_dim
-        self.experts = geometry.experts
-        self.experts_per_rank = geometry.experts_per_rank
-        self.topk = geometry.topk
-        self.max_tokens_per_rank = geometry.max_tokens_per_rank
-        self.activation = recipe.activation
-        self.gate_mode = recipe.gate_mode
-        self.quant_type = recipe.quant_type
-        self.hidden_pad = recipe.hidden_pad
-        self.intermediate_pad = recipe.intermediate_pad
-        self.swiglu_limit = recipe.swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
 
         device = torch.device("cuda", torch.cuda.current_device())
-        self.expert_mask = torch.zeros(self.experts, dtype=torch.int32, device=device)
-        first_expert = geometry.rank * self.experts_per_rank
-        self.expert_mask[first_expert : first_expert + self.experts_per_rank] = 1
+        self.expert_mask = torch.zeros(
+            geometry.experts, dtype=torch.int32, device=device
+        )
+        first_expert = geometry.rank * geometry.experts_per_rank
+        self.expert_mask[first_expert : first_expert + geometry.experts_per_rank] = 1
         self._config = config
         self._ep = _EpDispatcher(config, communicator)
+
+    @property
+    def compute(self) -> ExpertComputeConfig:
+        return self.recipe.compute
 
     def forward(
         self,
@@ -2457,7 +2606,7 @@ class MegaMoEGfx1250:
             hidden_states, topk_weights, topk_ids, w1, w2, w1_scale, w2_scale, a1_scale
         )
         ep = self._ep
-        batch = ep.dispatch.dispatch(
+        batch = ep.dispatch(
             hidden_states,
             topk_weights,
             topk_ids,
@@ -2465,7 +2614,7 @@ class MegaMoEGfx1250:
             next_topk_ids=next_topk_ids,
             next_recv_token_bound=next_recv_token_bound,
         )
-        target = ep.combine.prepare(batch, quant_bits)
+        target = ep.prepare(batch, quant_bits)
         expert_out = self._compute(
             batch,
             target,
@@ -2478,7 +2627,7 @@ class MegaMoEGfx1250:
             a1_scale=a1_scale,
             a2_scale=a2_scale,
         )
-        return ep.combine.finish(batch.routing, quant_bits, expert_out)
+        return ep.combine(batch.routing, quant_bits, expert_out)
 
     __call__ = forward
 
@@ -2554,8 +2703,8 @@ class MegaMoEGfx1250:
                 f"topk_ids must have shape {expected_shape}, "
                 f"got {tuple(topk_ids.shape)}"
             )
-        if self._config.is_quant_dispatch_wire:
-            assert a1_scale is None, (
+        if self._config.is_quant_dispatch_wire and a1_scale is not None:
+            raise ValueError(
                 "a1_scale is produced by the quantizing dispatch wire itself; a "
                 "caller-supplied one would be silently discarded"
             )
@@ -2580,15 +2729,14 @@ class MegaMoEGfx1250:
             set_flydsl_dispatch_context,
         )
 
+        compute = self.recipe.compute
         extra = {}
-        if self.activation == ActivationType.Situv2:
+        if compute.activation == ActivationType.Situv2:
             extra["beta"] = self.situ_beta
             extra["linear_beta"] = self.situ_linear_beta
-        # The grouped GEMM finds the compact rows' scatter here, not in its
-        # arguments.
-        set_flydsl_dispatch_context(
-            target.scatter if batch.compact_rows is not None else None
-        )
+        # The grouped GEMM finds an expert-grouped batch's grouping here, not in
+        # its arguments.
+        set_flydsl_dispatch_context(target.dispatch_context)
         try:
             return fused_moe(
                 batch.x,
@@ -2597,20 +2745,20 @@ class MegaMoEGfx1250:
                 batch.topk_weights,
                 batch.topk_ids,
                 expert_mask=self.expert_mask,
-                activation=self.activation,
-                gate_mode=self.gate_mode,
-                quant_type=self.quant_type,
+                activation=compute.activation,
+                gate_mode=compute.gate_mode,
+                quant_type=compute.quant_type,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 a1_scale=a1_scale if batch.scales is None else batch.scales,
                 a2_scale=a2_scale,
                 bias1=bias1,
                 bias2=bias2,
-                hidden_pad=self.hidden_pad,
-                intermediate_pad=self.intermediate_pad,
+                hidden_pad=compute.hidden_pad,
+                intermediate_pad=compute.intermediate_pad,
                 dtype=dtypes.bf16,
                 num_local_tokens=batch.num_local_tokens,
-                swiglu_limit=self.swiglu_limit,
+                swiglu_limit=compute.swiglu_limit,
                 stage2_scatter=target.scatter,
                 output=target.output,
                 **extra,
@@ -2658,7 +2806,7 @@ class MegaMoEGfx1250:
         caller that captures a ladder of batch sizes warms every rung through
         here first. A no-op off the compact path.
         """
-        self._ep.dispatch.warmup(recv_token_bound, token_count)
+        self._ep.warmup(recv_token_bound, token_count)
 
     def prefetch_compact_plan(
         self,
@@ -2672,12 +2820,12 @@ class MegaMoEGfx1250:
         to ``forward`` so the plan overlaps the previous expert GEMM instead.
         A no-op off the compact path.
         """
-        self._ep.dispatch.prefetch(topk_ids, recv_token_bound)
+        self._ep.prefetch(topk_ids, recv_token_bound)
 
     # -- for callers that drive the transport themselves (ATOM's Triton experts)
     @property
     def _arena(self) -> SymmetricArena:
-        return self._ep.res.arena
+        return self._ep.arena
 
     def _dispatch(
         self,
@@ -2688,13 +2836,13 @@ class MegaMoEGfx1250:
     ):
         """Dispatch alone: (recv_x, recv_weights, recv_indices, total_recv,
         routing), each over the arena's full recv rows."""
-        stage = self._ep.dispatch
-        batch = stage.dispatch(hidden_states, topk_weights, topk_ids, begin_step=False)
-        return (*stage.recv_views(), self._ep.res.total_recv, batch.routing)
+        ep = self._ep
+        batch = ep.dispatch(hidden_states, topk_weights, topk_ids, begin_step=False)
+        return (*ep.recv_views(), ep.total_recv, batch.routing)
 
     def _recv_dispatch_scales(self) -> torch.Tensor | None:
         """The forwarded e8m0 rows, or None on the bf16 wire."""
-        return self._ep.dispatch.recv_scales
+        return self._ep.recv_scales
 
     def _combine(
         self,
@@ -2705,7 +2853,7 @@ class MegaMoEGfx1250:
         """Combine alone, on the ``combine_quant_bits`` wire (bf16 by default).
         On the fused path the results are already in the peers' slots; on
         mori's, ``expert_out`` is fused_moe's output in its staging rows."""
-        return self._ep.combine.finish(routing, combine_quant_bits, expert_out)
+        return self._ep.combine(routing, combine_quant_bits, expert_out)
 
     def __enter__(self):
         return self

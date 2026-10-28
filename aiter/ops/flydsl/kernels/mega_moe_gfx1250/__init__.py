@@ -8,6 +8,7 @@ import importlib
 __all__ = [
     "CombineKind",
     "DispatchKind",
+    "ExpertComputeConfig",
     "MegaMoEGeometry",
     "MegaMoEGfx1250",
     "MegaMoERecipe",

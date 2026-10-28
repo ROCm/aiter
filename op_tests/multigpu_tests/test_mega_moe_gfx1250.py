@@ -17,8 +17,9 @@ Covered, on the a4w4 recipe (fp4 dispatch wire) plus a bf16 wire:
   * mori's combine reads fused_moe's rows in place (zero-copy staging);
   * close() releases the plans before the window and the window before its memory;
   * the members ATOM's Triton path reaches (_dispatch, _combine, _arena, _config);
-  * from_recipe builds what the keyword constructor builds, and
-    required_vmm_bytes covers exactly what the arena allocates.
+  * the deprecated keyword constructor builds what from_recipe builds, and
+    required_vmm_bytes covers exactly what the arena allocates;
+  * a caller's a1_scale on a quantizing dispatch wire is refused.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import os
 import socket
 import sys
 import traceback
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -39,30 +41,46 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 HIDDEN, INTER, TOPK, TOKENS = 7168, 1024, 8, 32
 EXPERTS_PER_RANK = 8
 QUANT_KEY = "a4w4_mxfp4"
-# (label, stage1_fused, stage2_fused, dispatch_wire, combine_quant)
+# (label, dispatch, combine, dispatch_wire, the step's combine wire)
 PAIRINGS = (
-    ("mori+fused bf16", False, True, "bf16", "none"),
-    ("mori+fused", False, True, "fp4", "none"),
-    ("mori+fused mxfp4", False, True, "fp4", "mxfp4"),
-    ("mori+mori bf16", False, False, "bf16", "none"),
-    ("mori+mori", False, False, "fp4", "none"),
-    ("mori+mori mxfp4", False, False, "fp4", "mxfp4"),
-    ("compact+fused", True, True, "fp4", "none"),
-    ("compact+fused mxfp4", True, True, "fp4", "mxfp4"),
+    ("mori+fused bf16", "mori", "fused_scatter", "bf16", "bf16"),
+    ("mori+fused", "mori", "fused_scatter", "fp4", "bf16"),
+    ("mori+fused fp4", "mori", "fused_scatter", "fp4", "fp4"),
+    ("mori+mori bf16", "mori", "mori", "bf16", "bf16"),
+    ("mori+mori", "mori", "mori", "fp4", "bf16"),
+    ("mori+mori fp4", "mori", "mori", "fp4", "fp4"),
+    ("compact+fused", "compact", "fused_scatter", "fp4", "bf16"),
+    ("compact+fused fp4", "compact", "fused_scatter", "fp4", "fp4"),
 )
-# Rejected configurations and the message each must raise with.
+# The combine wires in the legacy combine_quant spelling.
+LEGACY_QUANT = {"bf16": "none", "fp8": "mxfp8", "fp4": "mxfp4"}
+# Rejected configurations and the message each must raise with: recipe fields,
+# or the keyword constructor's flags.
 REJECTED = (
+    ("recipe", {"dispatch": "compact", "combine": "mori"}, "combine=mori does not"),
     (
-        {"stage1_fused": True, "stage2_fused": False},
-        "stage1_fused requires stage2_fused",
+        "recipe",
+        {"dispatch": "compact", "dispatch_wire": "bf16"},
+        "dispatch=compact carries an fp8 or fp4 dispatch_wire",
     ),
     (
-        {"stage1_fused": True, "dispatch_wire": "bf16"},
-        "requires an fp8 or fp4 dispatch",
+        "recipe",
+        {"combine": "mori", "combine_wires": ("bf16", "fp8")},
+        "combine=mori offers the ('bf16', 'fp4') wires",
     ),
-    ({"stage2_fused": False, "combine_quant": "mxfp8"}, "combines through mori"),
-    ({"dispatch_backend": "flydsl"}, "does not match"),
+    ("legacy", {"dispatch_backend": "flydsl"}, "does not match"),
 )
+
+
+def _fields(dispatch, combine, wire, step_wire):
+    """The recipe fields a pairing names."""
+    wires = ("bf16",) if step_wire == "bf16" else ("bf16", step_wire)
+    return {
+        "dispatch": dispatch,
+        "combine": combine,
+        "dispatch_wire": wire,
+        "combine_wires": wires,
+    }
 
 
 def _skip_reason() -> str | None:
@@ -144,7 +162,47 @@ class _Ctx:
             torch.bfloat16
         )
 
-    def build(self, communicator=None, **overrides):
+    def recipe(self, **fields):
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
+            ExpertComputeConfig,
+            MegaMoERecipe,
+        )
+
+        compute = ExpertComputeConfig(
+            activation=self.spec["activation"],
+            gate_mode=self.spec["gate_mode"],
+            quant_type=self.spec["aiter_qtype"],
+        )
+        return MegaMoERecipe(
+            **{**_fields("mori", "fused_scatter", "fp4", "bf16"), **fields},
+            compute=compute,
+        )
+
+    def geometry(self):
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGeometry
+
+        return MegaMoEGeometry(
+            rank=self.rank,
+            world_size=self.world,
+            model_dim=HIDDEN,
+            inter_dim=INTER,
+            experts=self.experts,
+            topk=TOPK,
+            max_tokens_per_rank=TOKENS,
+        )
+
+    def build(self, communicator=None, **fields):
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+
+        return MegaMoEGfx1250.from_recipe(
+            self.recipe(**fields),
+            self.geometry(),
+            communicator=self.comm if communicator is None else communicator,
+        )
+
+    def build_legacy(self, communicator=None, **overrides):
+        """The deprecated keyword constructor; its warning is the caller's to
+        check."""
         from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
 
         kw = {
@@ -167,7 +225,7 @@ class _Ctx:
         kw.update(overrides)
         return MegaMoEGfx1250(**kw)
 
-    def layer(self, mega, combine_quant=None):
+    def layer(self, mega, combine_wire=None, **step):
         w1, w2, w1s, w2s = self.weights
         y = mega(
             self.B._rmsnorm(self.x),
@@ -177,23 +235,22 @@ class _Ctx:
             w2=w2,
             w1_scale=w1s,
             w2_scale=w2s,
-            combine_quant=combine_quant,
+            combine_wire=combine_wire,
+            **step,
         )
         return self.x + y
 
 
 def _check_pairings(ctx):
     """Each pairing against the reference, then a graph replay against eager."""
-    for label, s1, s2, wire, cq in PAIRINGS:
-        mega = ctx.build(
-            stage1_fused=s1, stage2_fused=s2, dispatch_wire=wire, combine_quant=cq
-        )
+    for label, *pairing in PAIRINGS:
+        step_cq = pairing[-1]
+        mega = ctx.build(**_fields(*pairing))
         try:
-            step_cq = None if cq == "none" else cq
             out = ctx.layer(mega, step_cq).clone()
             torch.cuda.synchronize()
             diff = ctx.B._calc_diff(out, ctx.ref)
-            tol = ctx.B.default_logits_tol(QUANT_KEY, cq, 1)
+            tol = ctx.B.default_logits_tol(QUANT_KEY, LEGACY_QUANT[step_cq], 1)
             assert diff <= tol, f"{label}: diff {diff:.5f} > tol {tol:.5f}"
 
             ctx.comm.barrier()
@@ -219,10 +276,13 @@ def _check_pairings(ctx):
 
 
 def _check_rejected_before_alloc(ctx):
-    for overrides, message in REJECTED:
+    for entry, overrides, message in REJECTED:
         counting = _CountingCommunicator(ctx.comm)
+        build = ctx.build if entry == "recipe" else ctx.build_legacy
         try:
-            ctx.build(communicator=counting, **overrides).close()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                build(communicator=counting, **overrides).close()
         except ValueError as error:
             assert message in str(error), f"{overrides}: {error}"
         else:
@@ -242,7 +302,7 @@ def _check_unwind(ctx):
 
     ep_plans.EpCombinePlan.bind = bind
     try:
-        ctx.build(communicator=counting, stage2_fused=False).close()
+        ctx.build(communicator=counting, combine="mori").close()
     except RuntimeError as error:
         assert "injected" in str(error), error
     else:
@@ -259,7 +319,7 @@ def _check_zero_copy(ctx):
     """With mori's combine, fused_moe writes its rows straight into comb_inp."""
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import mega_moe as mm
 
-    mega = ctx.build(stage2_fused=False)
+    mega = ctx.build(combine="mori")
     seen = {}
     real = mm.fused_moe
 
@@ -301,7 +361,7 @@ def _check_close_order(ctx):
         patched[cls] = original
         cls.close = close
     try:
-        mega = ctx.build(communicator=counting, stage2_fused=False)
+        mega = ctx.build(communicator=counting, combine="mori")
         ctx.layer(mega)
         torch.cuda.synchronize()
         ctx.comm.barrier()
@@ -353,35 +413,55 @@ def _check_atom_surface(ctx):
         ctx.comm.barrier()
 
 
-def _check_recipe_entry(ctx):
-    """from_recipe with the recipe the flags resolve to runs bit for bit alike."""
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
-
-    for label, s1, s2, wire, cq in PAIRINGS:
-        step_cq = None if cq == "none" else cq
+def _check_keyword_constructor(ctx):
+    """The deprecated keyword constructor builds the recipe its flags name, and
+    runs bit for bit as from_recipe does; combine_quant= steps as combine_wire=."""
+    for label, dispatch, combine, wire, step_wire in PAIRINGS:
+        cq = LEGACY_QUANT[step_wire]
         outs = []
         for entry in ("legacy", "recipe"):
             if entry == "legacy":
-                mega = ctx.build(
-                    stage1_fused=s1,
-                    stage2_fused=s2,
-                    dispatch_wire=wire,
-                    combine_quant=cq,
-                )
-                recipe, geometry = mega.recipe, mega.geometry
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", DeprecationWarning)
+                    mega = ctx.build_legacy(
+                        stage1_fused=dispatch == "compact",
+                        stage2_fused=combine == "fused_scatter",
+                        dispatch_wire=wire,
+                        combine_quant=cq,
+                    )
+                assert any(
+                    issubclass(w.category, DeprecationWarning) for w in caught
+                ), f"{label}: no DeprecationWarning"
+                assert mega.recipe == ctx.recipe(
+                    **_fields(dispatch, combine, wire, step_wire)
+                ), f"{label}: {mega.recipe}"
+                step = {"combine_quant": None if cq == "none" else cq}
             else:
-                mega = MegaMoEGfx1250.from_recipe(
-                    recipe, geometry, communicator=ctx.comm
-                )
-                assert mega.recipe == recipe and mega._config.stage1_fused is s1
+                mega = ctx.build(**_fields(dispatch, combine, wire, step_wire))
+                step = {"combine_wire": step_wire}
             try:
-                outs.append(ctx.layer(mega, step_cq).clone())
+                outs.append(ctx.layer(mega, **step).clone())
                 torch.cuda.synchronize()
             finally:
                 ctx.comm.barrier()
                 mega.close()
                 ctx.comm.barrier()
-        assert torch.equal(outs[0], outs[1]), f"{label}: from_recipe != legacy"
+        assert torch.equal(outs[0], outs[1]), f"{label}: keyword != from_recipe"
+
+
+def _check_a1_scale_refused(ctx):
+    """The fp4 wire makes its own scales; a caller's would be dropped."""
+    mega = ctx.build()
+    try:
+        ctx.layer(mega, a1_scale=torch.ones(1, device=ctx.device))
+    except ValueError as error:
+        assert "a1_scale is produced by the quantizing dispatch wire" in str(error)
+    else:
+        raise AssertionError("a1_scale was accepted")
+    finally:
+        ctx.comm.barrier()
+        mega.close()
+        ctx.comm.barrier()
 
 
 def _check_vmm_bound(ctx):
@@ -389,15 +469,9 @@ def _check_vmm_bound(ctx):
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
 
     granularity = 2 << 20
-    for label, s1, s2, wire, cq in PAIRINGS:
+    for label, *pairing in PAIRINGS:
         counting = _CountingCommunicator(ctx.comm)
-        mega = ctx.build(
-            communicator=counting,
-            stage1_fused=s1,
-            stage2_fused=s2,
-            dispatch_wire=wire,
-            combine_quant=cq,
-        )
+        mega = ctx.build(communicator=counting, **_fields(*pairing))
         try:
             (allocated,) = counting.alloc_bytes
             need = MegaMoEGfx1250.required_vmm_bytes(mega.recipe, mega.geometry)
@@ -409,7 +483,7 @@ def _check_vmm_bound(ctx):
                 max_tokens_per_rank=TOKENS,
                 experts=ctx.experts,
                 topk=TOPK,
-                stage1_fused=s1,
+                stage1_fused=pairing[0] == "compact",
             )
             assert bound >= need, f"{label}: keyword bound {bound} < {need}"
         finally:
@@ -425,7 +499,8 @@ CHECKS = (
     _check_zero_copy,
     _check_close_order,
     _check_atom_surface,
-    _check_recipe_entry,
+    _check_keyword_constructor,
+    _check_a1_scale_refused,
     _check_vmm_bound,
 )
 
