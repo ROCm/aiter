@@ -920,18 +920,32 @@ class Gfx1250Traits:
 
     WAVE = 32
     NWARP = 4
+    BLOCK_THREADS = NWARP * WAVE
     FP8_MAX = 448.0
 
     @property
     def bf16_packed(self):
-        # Bound resident Q/accumulator registers and keep two pages within LDS.
+        # Page16 gathers one vector-8 page per wave. Page128 keeps resident
+        # Q/accumulator registers bounded and two pages within LDS.
         return (
             self.bf16
             and self.trans_v
-            and self.block_size == 128
             and self.head_dim in (64, 128, 256)
-            and (self.head_dim <= 128 or self.rows <= 32)
+            and (
+                self.block_size == 16
+                or (
+                    self.block_size == 128 and (self.head_dim <= 128 or self.rows <= 32)
+                )
+            )
         )
+
+    @property
+    def bf16_page16_packed(self):
+        return self.bf16_packed and self.block_size == 16
+
+    @property
+    def bf16_page128_packed(self):
+        return self.bf16_packed and self.block_size == 128
 
     @property
     def TOKENS(self):
@@ -939,7 +953,7 @@ class Gfx1250Traits:
         # Windowed rows retain 64-token normalization for FP8 accuracy.
         return (
             128
-            if self.bf16_packed
+            if self.bf16_page128_packed
             or (
                 self.packed_lds
                 and self.head_dim in (128, 256)
@@ -987,28 +1001,41 @@ class Gfx1250Traits:
 
     @property
     def q_bytes(self):
-        return 0 if self.bf16_packed else self.q_tiles * 16 * self.q_stride
+        return 0 if self.bf16_page128_packed else self.q_tiles * 16 * self.q_stride
+
+    @property
+    def fp8_multi_tile(self):
+        # Bound resident Q/output fragments: D128 fits four query tiles,
+        # D256 fits two. Both reuse K/V operands in their staged LDS layout;
+        # page16 and windowed attention retain 64-token chunks.
+        # A one-token window does not amortize resident operand setup.
+        return (
+            not self.bf16
+            and self.head_dim in (128, 256)
+            and self.block_size >= 16
+            and self.sliding_window != 1
+            and 2 <= self.m_tiles
+            and self.m_tiles * self.head_dim <= 512
+        )
 
     @property
     def packed_lds(self):
         # FP8 cache layout is independent of scalar or per-token scales.
-        # Page16 tiles gather one page per wave without padded LDS rows.
-        # Two fused query tiles reuse the packed page and K128 WMMA path for
-        # measured D256/G8/MTP4 full attention, without extra KV fetches.
+        # Each wave gathers 16-token V chunks from either cache layout;
+        # page16 has the same byte order with or without the singleton axis.
+        # Plain D128/page64 single-M tiles retain the faster padded pipeline.
+        # Multiple query tiles reuse packed chunks and K128 WMMA without
+        # fetching K/V again for each query tile.
         return (
             not self.bf16
             and self.head_dim in (128, 256)
-            and (self.block_size == 16 or self.block_size >= 64)
-            and self.trans_v
+            and self.block_size >= 16
+            and (self.m_tiles == 1 or self.fp8_multi_tile)
             and (
-                self.m_tiles == 1
-                or (
-                    self.head_dim == 256
-                    and self.block_size == 128
-                    and self.query_length == 4
-                    and self.query_group_size == 8
-                    and self.sliding_window == 0
-                )
+                self.trans_v
+                or self.head_dim != 128
+                or self.block_size != 64
+                or self.m_tiles != 1
             )
         )
 
@@ -1042,20 +1069,35 @@ class Gfx1250Traits:
 
     @property
     def async_page(self):
-        # Two packed buffers overlap page DMA with QK/softmax/PV. Keep this
-        # measured specialization separate from windowed and smaller-D tiles.
+        # Two packed buffers overlap page DMA with QK/softmax/PV. Keep these
+        # measured specializations separate from windowed and single-M D128 tiles.
         return (
             self.packed_lds
-            and self.head_dim == 256
+            and (self.head_dim == 256 or self.fp8_multi_tile)
             and self.block_size == 128
+            and self.sliding_window == 0
+        )
+
+    @property
+    def page16_async_scales(self):
+        # Each wave copies one page's contiguous FP32 token scales into LDS.
+        return (
+            self.packed_lds
+            and self.block_size == 16
+            and self.per_token_kv
             and self.sliding_window == 0
         )
 
     @property
     def buffers(self):
         if self.packed_lds:
-            # Page16 gathering can overlap the next four pages in a second buffer.
-            return 2 if self.async_page or self.block_size == 16 else 1
+            # Multi-tile 64-token chunks overlap gathered pages or windowed
+            # staging just like the 128-token asynchronous page path.
+            return (
+                2
+                if self.async_page or self.block_size == 16 or self.fp8_multi_tile
+                else 1
+            )
         return (
             2 if self.q_bytes + 2 * self.kv_stride + self.p_bytes + 576 <= 327680 else 1
         )

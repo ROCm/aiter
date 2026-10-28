@@ -446,6 +446,12 @@ def test_tuning_head_dimensions(monkeypatch, kv_dtype, arch, head_dim, accepted)
         tuning.main(["--kv-dtype", kv_dtype, "--head-dim", str(head_dim)])
 
 
+@pytest.mark.parametrize("window", [-17, -1, 0])
+def test_tuning_nonpositive_window(window):
+    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
+    assert tuning._parse_args(["--sliding-window", str(window)]).sliding_window == 0
+
+
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()
