@@ -735,6 +735,12 @@ def asm_gemm(
     return gemm_a16w16_asm(inp, weights, result, bias, splitK, kernelName, bpreshuffle)
 
 
+@functools.cache
+def _flydsl_hgemm_kernel_params(kernel_name: str) -> dict | None:
+    """Parsed once per tuned name; `flydsl_gemm` only reads the result."""
+    return _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(kernel_name)
+
+
 def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -752,9 +758,7 @@ def flydsl_gemm(
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
-    flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(
-        config["kernelName"]
-    )
+    flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
     fused_bias = None
     if (
         bias is not None
