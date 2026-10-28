@@ -360,12 +360,16 @@ class Gemm:
 
     def run_solutions(self):
         self.run_fast_solutions()
-        from aiter.utility.tune_result import power_selection_enabled
+        from aiter.utility.tune_result import (
+            measure_all_accurate,
+            power_selection_enabled,
+        )
 
         # The fast screen keeps only topn by latency. A power winner can sit
         # outside that window, so the accurate pass has to time every solution.
-        if power_selection_enabled():
-            self.topn = max(self.topn, len(self.hipb_sols))
+        self.topn = measure_all_accurate(
+            power_selection_enabled(), self.topn, len(self.hipb_sols)
+        )
         self.functional_get_topn_fastest()
         rets = self.run_best_solutions()
         return rets
@@ -445,8 +449,6 @@ class GemmTuner(GemmCommonTuner):
                 "err_ratio",
                 "tflops",
                 "bw",
-                "watts",
-                "tflops_per_w",
             ]
         if key is None:
             key = [
@@ -724,8 +726,18 @@ class GemmTuner(GemmCommonTuner):
         return ret
 
     def processResult(self, rets, fast_mode):
-        from aiter.utility.tune_result import power_columns, sort_frame_for_selection
+        from aiter.utility.tune_result import (
+            power_columns,
+            power_selection_enabled,
+            sort_frame_for_selection,
+        )
 
+        select_power = power_selection_enabled()
+        columns = list(self.columns)
+        if select_power:
+            for extra in ("watts", "tflops_per_w"):
+                if extra not in columns:
+                    columns.append(extra)
         results = []
         for el in rets:
             info, us, err_ratio = el
@@ -755,14 +767,15 @@ class GemmTuner(GemmCommonTuner):
                 self.get_bpe(eval(info[0][4])),
                 self.get_bpe(eval(info[0][5])),
             )
-            watts, tflops_per_w = power_columns(el, tflops)
             res_one.append(tflops)
             res_one.append(bw)
-            res_one.append(watts)
-            res_one.append(tflops_per_w)
+            if select_power:
+                watts, tflops_per_w = power_columns(el, tflops)
+                res_one.append(watts)
+                res_one.append(tflops_per_w)
 
             results.append(res_one)
-        gtimedf = pd.DataFrame(results, columns=self.columns)
+        gtimedf = pd.DataFrame(results, columns=columns)
         gtimedf = sort_frame_for_selection(gtimedf)
         return gtimedf
 

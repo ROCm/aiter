@@ -230,17 +230,12 @@ def worker(
         max_err_ratio = 1.0
 
     if measure_power and us not in (-1, 0) and us != float("inf") and res is not None:
-        try:
-            from aiter.utility.package_power import measure_package_watts
+        from aiter.utility.package_power import record_package_watts
 
-            def _replay():
-                return func(*args, **kwargs)
+        def _replay():
+            return func(*args, **kwargs)
 
-            watts = measure_package_watts(_replay, device_index=gpu_id)
-        except Exception as e:  # noqa: BLE001
-            if printLog:
-                print(f"package power measurement failed info:{info}: {e}", flush=True)
-            watts = float("nan")
+        watts = record_package_watts(_replay, device_index=gpu_id)
 
     return TuneResult(info, us, round(max_err_ratio, 4), watts)
 
