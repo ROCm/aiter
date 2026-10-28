@@ -27,6 +27,7 @@ from .allreduce_host_shared import (
     check_world_size,
     kernel_symbol,
     payload_probes,
+    preload_launcher,
     require_arch,
 )
 from .allreduce_policy import (
@@ -48,7 +49,7 @@ from .kernels.comm.one_shot_allreduce_rmsnorm import (
     fused_padded_block_options,
     fused_split_options,
 )
-from .kernels.tensor_shim import _preload_compiled, _run_compiled
+from .kernels.tensor_shim import _run_compiled
 
 logger = logging.getLogger("aiter")
 
@@ -266,7 +267,8 @@ class OneShotAllReduce:
         return [key for key in self._by_cfg if key in picked]
 
     def preload(self, *, payload_range=None) -> None:
-        """JIT-compile rung binaries without launching any of them.
+        """JIT-compile rung binaries and load them onto the device, without
+        launching any of them.
 
         ``payload_range=(lo, hi)`` takes only the rungs ``allreduce`` would run
         for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every one.
@@ -274,14 +276,16 @@ class OneShotAllReduce:
         routes only its own window here, so the rest never run.
 
         Local to this rank, not a collective. ``CustomAllreduce`` calls it once
-        at init, via ``preload_fly_engines``, to keep each rung's JIT compile off
-        the first real all-reduce, which may be inside a CUDA graph capture.
+        at init, via ``preload_fly_engines``, to keep each rung's JIT compile and
+        module load off the first real all-reduce, which may be inside a HIP
+        graph capture.
         """
         keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
-        for key in keys:
-            eng, spec = self._by_cfg[key]
-            args = self._launch_args(eng, spec, 0, 0, None, live_bytes=0)
-            _preload_compiled(eng.launch, *args)
+        with torch.cuda.device(self._device_index):
+            for key in keys:
+                eng, spec = self._by_cfg[key]
+                args = self._launch_args(eng, spec, 0, 0, None, live_bytes=0)
+                preload_launcher(eng.launch, *args)
 
     def variant(self, nbytes: int) -> str:
         """Identity of the binary an *nbytes* payload would run."""
@@ -788,8 +792,8 @@ class OneShotAllReduceRMSNorm:
         return [key for key in self._by_cfg if key in picked]
 
     def preload(self, hidden: int, *, payload_range=None) -> None:
-        """Build hidden dim and JIT-compile its rung binaries without launching
-        any of them.
+        """Build hidden dim and JIT-compile its rung binaries and load them onto
+        the device, without launching any of them.
 
         ``payload_range=(lo, hi)`` takes only the rungs ``allreduce_rmsnorm``
         would run for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes
@@ -799,9 +803,8 @@ class OneShotAllReduceRMSNorm:
         A collective only when hidden dim is not built yet, since building
         exchanges IPC handles, so every rank must call it with the same widths
         in the same order. The compile itself is local. ``FlyDSLAllReduceRMSNorm``
-        calls it via ``preload_fly_engines`` to keep the JIT off the first real
-        call, which may be inside a HIP graph capture. The HIP module load
-        still happens on each binary's first launch.
+        calls it via ``preload_fly_engines`` to keep the JIT and the module load
+        off the first real call, which may be inside a HIP graph capture.
         """
         hidden = int(hidden)
         self._build_hidden(hidden)
@@ -809,12 +812,13 @@ class OneShotAllReduceRMSNorm:
             keys = [key for key in self._by_cfg if key[0] == hidden]
         else:
             keys = self.cfgs_for(hidden, *payload_range)
-        for key in keys:
-            eng, spec = self._by_cfg[key]
-            args = self._launch_args(
-                eng, spec, (0,) * 5, 0.0, None, hidden=hidden, live_bytes=0
-            )
-            _preload_compiled(eng.launch, *args)
+        with torch.cuda.device(self._device_index):
+            for key in keys:
+                eng, spec = self._by_cfg[key]
+                args = self._launch_args(
+                    eng, spec, (0,) * 5, 0.0, None, hidden=hidden, live_bytes=0
+                )
+                preload_launcher(eng.launch, *args)
 
     def variant(self, hidden: int, nbytes: int) -> str:
         """``<jit symbol>/g<grid_cap>/x<grid_x>`` for this (hidden, payload)."""

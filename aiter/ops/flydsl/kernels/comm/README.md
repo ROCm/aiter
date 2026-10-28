@@ -327,8 +327,7 @@ is not.
 * `none` or `inf` sets no upper limit. Only the `MAX` variables accept it.
 * A maximum of `0` disables the algorithm. A minimum that is equal to the
   maximum also disables it.
-* If an algorithm has no window in the table, a variable creates one. The
-  other bound is then `0` for the minimum, or no upper limit for the maximum.
+* A variable cannot enable an algorithm that has no window in the table.
 * If a value is not valid, the code logs a warning and uses the value from the
   table.
 * If the mesh and the ring windows overlap after the change, the code logs a
@@ -467,6 +466,18 @@ for its own rank in registers. That part does not go through the inbox.
 A host class builds one engine for each different config in its ladder. Each
 engine exchanges IPC handles with all ranks. All ranks must build the same
 engines in the same order. If they do not, the processes deadlock.
+
+Each rank works out what to build on its own, from its environment
+(`AITER_FLY_AR*`, `AITER_CUSTOM_AR_{MIN,MAX}_SIZE`,
+`AITER_QUICK_REDUCE_QUANTIZATION`), its arch and its link, so ranks can
+disagree. Before any engine is built, every rank votes over the CPU group on
+what it would build: `CustomAllreduce` gathers each rank's plan for the
+one-shot (`all_ranks_agree_on_plan`), and the backends in `flydsl_backends.py`
+compare a digest of the policy, arch, link and FlyDSL version
+(`vote_on_digest`). They build only if every rank agrees, otherwise FlyDSL
+collectives are off on every rank. The vote runs even when FlyDSL is off or
+declines on that rank, because a rank that skipped it would leave its peers
+waiting.
 
 ### The mesh and the ring are persistent kernels
 

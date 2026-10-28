@@ -211,12 +211,16 @@ class QuickAllReduce:
         )
 
     def _init_fly_rms_backend(self):
-        """Build the quantized FlyDSL fused all-reduce+RMSNorm engines."""
-        if self._fly_quantization() is None:
-            return
+        """Build the quantized FlyDSL fused all-reduce+RMSNorm engines.
+
+        Every rank gets here and votes, even one whose regime FlyDSL does not
+        serve: a rank that skipped the vote would leave its peers waiting."""
         try:
             rms = FlyDSLAllReduceRMSNorm(
-                group=self.group, device=self.device, quantized=True
+                group=self.group,
+                device=self.device,
+                quantized=True,
+                serve=self._fly_quantization() is not None,
             )
         except Exception:
             logger.warning(
@@ -232,12 +236,12 @@ class QuickAllReduce:
     def _init_fly_backend(self):
         """Build the FlyDSL mesh/ring engines that will serve plain all-reduce,
         and compile the binaries the policy routes to them before any graph
-        capture begins."""
-        quantization = self._fly_quantization()
-        if quantization is None:
-            return
+        capture begins.
+
+        Every rank gets here and votes, even one whose regime FlyDSL does not
+        serve: a rank that skipped the vote would leave its peers waiting."""
         fly_ar = FlyDSLQuickAllReduce(
-            self.group, self.device, quantization=quantization
+            self.group, self.device, quantization=self._fly_quantization()
         )
         if fly_ar.disabled:
             fly_ar.close()

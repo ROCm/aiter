@@ -439,6 +439,15 @@ def _ladder(algorithm: str, world_size: int, link: str) -> tuple:
     return ring_st_ladder(world_size=world_size, link=link)
 
 
+def _ships(world_size: int, algorithm: str, link: str) -> bool:
+    """Whether production has a ladder for algorithm at world_size on this
+    host. A schedule without one is never built, so nothing that runs the
+    shipped ladder sweeps it. The pinned-ladder transport cases still run its
+    kernel."""
+    table = fly_policy.LADDERS[fly_policy.AllReduceAlgorithm(algorithm)]
+    return (ARCH, link, int(world_size)) in table
+
+
 def _expected_cfg(
     nbytes: int,
     *,
@@ -1056,7 +1065,7 @@ def _bench_rank(
     return rows
 
 
-def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
+def _dispatch_rank(rank: int, tp: int, init_method: str, skewed: bool = False) -> dict:
     """One rank of the production-dispatch spawn.
 
     Unlike every other spawn here, this one does not build its own engines: it
@@ -1071,12 +1080,16 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     ran (a wrapper on each engine's ``allreduce`` records it), and the accuracy of
     the all-reduce the top-level returned. Unbounded windows are cut at
     ``TOP_PAYLOAD_BYTES``, as everywhere else in this file.
+
+    *skewed* leaves FlyDSL off on the last rank alone. The init must then
+    return on every rank, with nothing built, instead of leaving the other
+    ranks waiting in the engines' collectives.
     """
     import torch.distributed as dist
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_FLY_AR"] = "0" if skewed and rank == tp - 1 else "1"
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
     # No candidate here uses custom all-reduce; only the quick-reduce slot.
     set_custom_all_reduce(False)
@@ -1094,7 +1107,7 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
 
     probes = []
     try:
-        if built:
+        if built and not skewed:
             ran = []
             for alg, eng in fly.engines.items():
 
@@ -1145,6 +1158,115 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     return {"built": built, "probes": probes}
 
 
+def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
+    """One rank of the first-call-in-capture spawn.
+
+    Stands up the production ``QuickAllReduce`` with ``AITER_FLY_AR=1`` and
+    ``AITER_QUICK_REDUCE_QUANTIZATION=INT4``, as ``_dispatch_rank`` does, but
+    makes no eager call. The first launch of every kernel the mesh and the ring
+    serve is inside one HIP graph capture.
+
+    It records the served kernels that were not loaded at init. That check
+    does not depend on whether HIP tolerates a module load during capture. It
+    then replays the graph and checks every output against an fp32 reference.
+    """
+    import torch.distributed as dist
+
+    from aiter.dist.parallel_state import graph_capture
+    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+    set_custom_all_reduce(False)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(tp, 1)
+    tp_group = get_tp_group()
+    gloo = tp_group.cpu_group
+    group = tp_group.device_group
+    comm = tp_group.device_communicator
+    qr = comm.qr_comm
+    built = qr is not None and qr._fly_policy is not None
+    res = {"built": built, "unloaded": [], "rows": []}
+
+    try:
+        if built:
+            link = fly_policy.detect_link()
+            cases = []
+            for alg, eng in qr._fly_engines.items():
+                lo, hi = qr._fly_policy.window(alg, quantized=True).inclusive_range()
+                res["unloaded"] += [
+                    f"{alg.value} {key}"
+                    for key in eng.cfgs_for(lo, hi)
+                    if not launcher_loaded(eng._by_cfg[key].launch)
+                ]
+                payloads = _kernel_payloads(
+                    tp, alg.value, link, lo, min(hi, TOP_PAYLOAD_BYTES)
+                )
+                for cfg, nbytes in sorted(payloads.items(), key=lambda kv: kv[1]):
+                    inp = _make_inp(
+                        nbytes // _ROW_BYTES, HIDDEN, "normal", rank=rank, device=device
+                    )
+                    ref = inp.to(torch.float32)
+                    dist.all_reduce(ref, group=group)
+                    cases.append((alg, cfg, nbytes, inp, ref))
+
+            ran = []
+            for alg, eng in qr._fly_engines.items():
+
+                def allreduce(*args, _run=eng.allreduce, _alg=alg, **kw):
+                    ran.append(_alg)
+                    return _run(*args, **kw)
+
+                eng.allreduce = allreduce
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            error = None
+            try:
+                with graph_capture() as gc, torch.cuda.graph(g, stream=gc.stream):
+                    outs = [comm.all_reduce(case[3]) for case in cases]
+            except Exception as e:  # noqa: BLE001
+                error = f"{type(e).__name__}: {e}"
+            res["capture_error"] = error
+            res["ran"] = [a.value for a in ran]
+            res["expected"] = [case[0].value for case in cases]
+            # Replay only if every rank captured: the graph launches peers'
+            # kernels that wait for each other.
+            vote = torch.tensor([error is None], dtype=torch.int32)
+            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=gloo)
+            if vote.item():
+                sqnr = [float("inf")] * len(cases)
+                for _ in range(GRAPH_REPLAYS):
+                    torch.cuda.synchronize()
+                    dist.barrier(group=gloo)
+                    for out in outs:
+                        out.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    dist.barrier(group=gloo)
+                    g.replay()
+                    torch.cuda.synchronize()
+                    for i, (case, out) in enumerate(zip(cases, outs)):
+                        sqnr[i] = min(sqnr[i], _sqnr_db(out.float(), case[4]))
+                res["rows"] = [
+                    {
+                        "algorithm": alg.value,
+                        "cfg": str(cfg),
+                        "nbytes": nbytes,
+                        "sqnr_db": s,
+                    }
+                    for (alg, cfg, nbytes, _inp, _ref), s in zip(cases, sqnr)
+                ]
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=gloo)
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    return res
+
+
 def _spawn(target, world_size: int, **kwds) -> list:
     """*target* on every rank of a new spawn, with *kwds* and the rendezvous."""
     if world_size not in SUPPORTED_WORLDS:
@@ -1188,9 +1310,10 @@ _CASES: dict[tuple, list[tuple]] = {}
 # checked, per spawn key.
 _WINDOWS: dict[tuple, tuple[int, int]] = {}
 _RESULTS: dict[tuple, dict[tuple, list[dict]]] = {}
-# Per-rank production-dispatch results, per world size. Keyed by tp alone: the
-# dispatch spawn builds the production communicator, not a knob-pinned engine.
-_DISPATCH: dict[int, list] = {}
+# Per-rank production-dispatch results, per ``(tp, skewed)``. Not keyed by
+# knobs: the dispatch spawn builds the production communicator, not a
+# knob-pinned engine.
+_DISPATCH: dict[tuple[int, bool], list] = {}
 _FAILURES: list[str] = []
 # ``(reps, rounds)`` for every timed graph; set by ``main()``.
 _TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
@@ -1244,10 +1367,10 @@ def _result(key: tuple, case: tuple) -> list[dict]:
     return _RESULTS[key][case]
 
 
-def _dispatch_ranks(tp: int) -> list[dict]:
-    if tp not in _DISPATCH:
-        _DISPATCH[tp] = _spawn(_dispatch_rank, tp)
-    return _DISPATCH[tp]
+def _dispatch_ranks(tp: int, skewed: bool = False) -> list[dict]:
+    if (tp, skewed) not in _DISPATCH:
+        _DISPATCH[tp, skewed] = _spawn(_dispatch_rank, tp, skewed=skewed)
+    return _DISPATCH[tp, skewed]
 
 
 def _check(label: str, fails: list[str]) -> bool:
@@ -2352,7 +2475,7 @@ def _run_ahead_case(tp: int, algorithm: str) -> tuple[int, int] | None:
     return (pick[0][0], pick[0][1]) if pick else None
 
 
-def _fused_rung_fails(rows: list[dict], case: "fab.FusedCase") -> list[str]:
+def _fused_rung_fails(rows: list[dict], case: fab.FusedCase) -> list[str]:
     """The run took the instance of the rung the shape is meant to reach: its
     low-latency build, and its super-tile where the rung is ST=1, or where the
     payload is the end of its slice (an ST>1 rung falls back to ST=1 below the
@@ -2892,8 +3015,8 @@ def _host_padded_hidden_limits() -> list[str]:
 def _padded_pick(hidden: int, world_size: int):
     from aiter.ops.flydsl.allreduce_policy import BLOCK_ALIGN
     from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
-        quick_reduce_atoms_choices,
         padded_row_block,
+        quick_reduce_atoms_choices,
     )
 
     return padded_row_block(
@@ -3060,6 +3183,65 @@ def test_quick_allreduce_host_checks(check):
     return {"gfx": ARCH, "passed": _check(f"host-side {check}", fails)}
 
 
+@benchmark()
+def test_quick_allreduce_dispatch_skewed_rank(tp):
+    """``AITER_FLY_AR=1`` on every rank but the last: the init returns on every
+    rank (the spawn timeout catches a hang) and none builds the FlyDSL backend."""
+    ranks = _dispatch_ranks(tp, skewed=True)
+    _check(
+        f"tp={tp} dispatch with one rank skewed",
+        [
+            f"rank {rank}: built the FlyDSL backend while the last rank has "
+            "AITER_FLY_AR=0"
+            for rank, r in enumerate(ranks)
+            if r["built"]
+        ],
+    )
+    return {"gfx": ARCH, "built": [r["built"] for r in ranks]}
+
+
+@benchmark()
+def test_quick_allreduce_first_call_in_capture(tp):
+    """Production dispatch with ``AITER_FLY_AR=1`` and no eager call: every
+    served kernel is loaded at init, and the graph whose capture holds the
+    first launch of each one replays within the INT4 floor."""
+    ranks = _spawn(_capture_first_rank, tp)
+    fails = []
+    for rank, r in enumerate(ranks):
+        if not r["built"]:
+            fails.append(
+                f"rank {rank}: the FlyDSL backend was not built under AITER_FLY_AR=1"
+            )
+            continue
+        if r["unloaded"]:
+            fails.append(
+                f"rank {rank}: served kernels not loaded at init: {r['unloaded']}"
+            )
+        if r["capture_error"]:
+            fails.append(f"rank {rank}: capture failed: {r['capture_error']}")
+            continue
+        if r["ran"] != r["expected"]:
+            fails.append(
+                f"rank {rank}: captured calls ran {r['ran']}, expected {r['expected']}"
+            )
+        for row in r["rows"]:
+            if not row["sqnr_db"] >= SQNR_MIN_DB:
+                fails.append(
+                    f"rank {rank}: {row['algorithm']} {row['cfg']} at "
+                    f"{row['nbytes']} B SQNR {row['sqnr_db']:.2f} dB below the "
+                    f"{SQNR_MIN_DB} dB floor"
+                )
+    _check(f"tp={tp} first call in capture", fails)
+    rows0 = ranks[0]["rows"]
+    return {
+        "gfx": ARCH,
+        "kernels": [f"{row['algorithm']} {row['cfg']}" for row in rows0],
+        "payloads": [row["nbytes"] for row in rows0],
+        "unloaded": sum(len(r["unloaded"]) for r in ranks),
+        "min_sqnr_db": min((row["sqnr_db"] for row in rows0), default=float("nan")),
+    }
+
+
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
         aiter.logger.info(
@@ -3074,6 +3256,7 @@ def _verify(args, tps, algos, dts, link) -> None:
     plans = {
         (tp, algorithm): _ship_payloads(tp, algorithm, link)
         for tp, algorithm in itertools.product(tps, algos)
+        if _ships(tp, algorithm, link)
     }
     # Engines exactly as production builds them: only these are checked for
     # kernel coverage.
@@ -3111,7 +3294,7 @@ def _verify(args, tps, algos, dts, link) -> None:
         knobs = [
             (tokens, hidden, tp, algorithm, None, block)
             for tp, algorithm, tokens, hidden, block in KNOB_CASES
-            if tp in tps and algorithm in algos
+            if (tp, algorithm) in plans
         ]
     if dts:
         for tokens, hidden, tp, algorithm, grid_cap, block in ship + knobs:
@@ -3125,7 +3308,7 @@ def _verify(args, tps, algos, dts, link) -> None:
     ]
     for tp, algorithm, tokens, hidden in run_ahead:
         _register(_ship_key(tp, algorithm, None), (tokens, hidden, "run_ahead", False))
-    edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
+    edge = [c for c in EDGE_CASES if (c[0], c[1]) in plans]
     for tp, algorithm, tokens, hidden, fill in edge:
         _register(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
     # The divisor on the mesh at TP8, on the payloads that reach every mesh
@@ -3147,7 +3330,7 @@ def _verify(args, tps, algos, dts, link) -> None:
             _register(key, (tokens, hidden, fill, False, DEFAULT_DIVISOR))
     pinned = []
     if args.extended:
-        pinned = [c for c in PINNED_CODEC_CASES if c[0] in tps and "ring" in algos]
+        pinned = [c for c in PINNED_CODEC_CASES if (c[0], "ring") in plans]
     for tp, tokens, hidden, rs, ag in pinned:
         _register(
             _key(tp, algorithm="ring", rs_codec=rs, ag_codec=ag),
@@ -3235,6 +3418,14 @@ def _verify(args, tps, algos, dts, link) -> None:
     _summarize(
         "flydsl quick allreduce production dispatch",
         [test_quick_allreduce_dispatch(tp) for tp in tps],
+    )
+    _summarize(
+        "flydsl quick allreduce dispatch with one rank skewed",
+        [test_quick_allreduce_dispatch_skewed_rank(tp) for tp in tps],
+    )
+    _summarize(
+        "flydsl quick allreduce first call in capture",
+        [test_quick_allreduce_first_call_in_capture(tp) for tp in tps],
     )
 
 
@@ -4018,22 +4209,25 @@ def _bench(args, tps, algos, link) -> None:
     extra = _candidates(args, "ar", algos)
     rows = []
     for tp in tps:
+        shipped = tuple(a for a in algos if _ships(tp, a, link))
+        if not shipped:
+            continue
         if args.mnk is not None:
             shapes = [(int(t), int(h)) for t, h in args.mnk]
         else:
-            payloads = {n for a in algos for n in _ship_payloads(tp, a, link)[0]}
+            payloads = {n for a in shipped for n in _ship_payloads(tp, a, link)[0]}
             shapes = [(n // _ROW_BYTES, HIDDEN) for n in sorted(payloads)]
         policy = fly_policy.resolve_family_policy(world_size=tp, link=link)
         for grid_cap, block in itertools.product(args.grid_cap, args.block):
             # Every case of a spawn is registered before its first result.
             for shape in shapes:
-                _register(_bench_key(tp, algos, grid_cap, block, extra), shape)
+                _register(_bench_key(tp, shipped, grid_cap, block, extra), shape)
             rows += [
                 bench_quick_allreduce_int4(
                     tokens,
                     hidden,
                     tp,
-                    algos,
+                    shipped,
                     route=_route(policy, tokens * hidden * 2),
                     grid_cap=grid_cap,
                     block=block,

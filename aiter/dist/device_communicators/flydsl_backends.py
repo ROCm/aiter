@@ -59,7 +59,84 @@ def all_ranks_same(value: int, group) -> bool:
     return int(both[0]) == value == -int(both[1])
 
 
+def all_ranks_agree_on_plan(plan, group, *, owner: str) -> bool:
+    """Whether every rank in the group holds the same FlyDSL plan.
+
+    plan is this rank's dict of every input to its engine build, or an str
+    naming why this rank declines. It is computed locally, from the environment
+    and the host. Hence, ranks can disagree. One ``all_gather_object`` on the
+    CPU group settles it before any engine is built.
+
+    Every rank that reaches the FlyDSL init must call this, whatever its own
+    verdict, including when FlyDSL is off or not importable.
+
+    True only if every rank holds the same dict.
+    """
+
+    plans = [None] * dist.get_world_size(group)
+    dist.all_gather_object(plans, plan, group=group)
+    if all(isinstance(p, str) for p in plans):
+        return False
+    if all(p == plans[0] for p in plans):
+        return True
+    logger.warning(
+        "%s disabled: the ranks disagree on the FlyDSL setup: %s",
+        owner,
+        _plan_differences(plans),
+    )
+    return False
+
+
+def _plan_differences(plans) -> str:
+    """The ranks that decline and the plan fields that differ, per rank."""
+
+    parts = [
+        f"rank {r} declines ({p})" for r, p in enumerate(plans) if isinstance(p, str)
+    ]
+    built = {r: p for r, p in enumerate(plans) if not isinstance(p, str)}
+    for key in sorted({k for p in built.values() for k in p}):
+        values = {r: p.get(key) for r, p in built.items()}
+        if any(v != values[min(values)] for v in values.values()):
+            parts.append(
+                f"{key}: " + ", ".join(f"rank {r}={v}" for r, v in values.items())
+            )
+    return "; ".join(parts)
+
+
 _POLICY_DECLINED = 0
+
+
+def vote_on_digest(digest: int, group, *, tag: str) -> bool:
+    """Whether every rank of *group* holds the same digest, and it is not the
+    declined marker.
+
+    Building an engine is a collective, so a rank that declines alone must not
+    leave its peers waiting in one. Every rank that reaches a FlyDSL init calls
+    this, whatever its own verdict: FlyDSL off, not importable, an unsupported
+    arch or a policy it cannot resolve all vote ``_POLICY_DECLINED``. If any
+    rank would build and the digests differ, every rank logs it.
+    """
+    both = torch.tensor([digest, -digest], dtype=torch.int64)
+    dist.all_reduce(both, op=dist.ReduceOp.MAX, group=group)
+    highest, lowest = int(both[0]), -int(both[1])
+    if highest == lowest:
+        return digest != _POLICY_DECLINED
+    logger.warning(
+        "%s disabled: the ranks disagree on the FlyDSL setup (check that the "
+        "AITER_FLY_AR* variables, the arch and the link are the same on every "
+        "rank).",
+        tag,
+    )
+    return False
+
+
+def _flydsl_version():
+    try:
+        from aiter.ops.flydsl import installed_flydsl_version
+
+        return installed_flydsl_version
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _digest(parts) -> int:
@@ -75,6 +152,7 @@ def _policy_digest(
     same engines in the same order.
     """
     parts = (
+        _flydsl_version(),
         quantized,
         link,
         arch,
@@ -86,7 +164,8 @@ def _policy_digest(
 
 
 def preload_fly_engines(engines, *args) -> None:
-    """Compile the binaries each engine serves, without launching them.
+    """Compile the binaries each engine serves and load them onto the device,
+    without launching them.
 
     *engines* holds ``(engine, (lo, hi))`` pairs, ``lo..hi`` being the payload
     bytes (inclusive) the dispatcher routes to that engine. Binaries its ladder
@@ -94,11 +173,10 @@ def preload_fly_engines(engines, *args) -> None:
     *args* go to every ``preload`` ahead of the range: the hidden dim, for the
     fused engines, whose binaries are per width.
 
-    FlyDSL compiles a binary on its first launch, and if that happens inside an
-    active CUDA graph capture, the capture pays seconds of JIT. The kernels take
-    the payload size at runtime, so one preload per binary covers every size.
-
-    The HIP module load is left to the first launch.
+    FlyDSL would otherwise compile a binary, JIT its host wrapper and load its
+    HIP module on its first launch, and if that happens inside an active HIP
+    graph capture, the capture pays for it. The kernels take the payload size at
+    runtime, so one preload per binary covers every size.
     """
 
     for engine, payload_range in engines:
@@ -123,56 +201,63 @@ class FlyDSLQuickAllReduce:
         group: ProcessGroup,
         device: torch.device,
         *,
-        quantization: str = "INT4",
+        quantization: str | None = "INT4",
     ):
         self.disabled = True
         self.policy = None
         self.engines: dict[Any, Any] = {}
-        self._tag = "FlyDSL quick all-reduce (%s)" % quantization
+        self._tag = f"FlyDSL quick all-reduce ({quantization})"
 
-        if not _FLY_IMPORT_OK or not fly_policy.enabled():
-            return
-        if quantization not in FLY_QUANTIZATIONS:
+        world_size = dist.get_world_size(group=group)
+        # Every rank votes below, whatever it decided here: ``digest`` stays
+        # declined unless this rank would build.
+        digest = _POLICY_DECLINED
+        link = policy = None
+        if not _FLY_IMPORT_OK:
+            logger.debug("%s disabled: flydsl is not importable.", self._tag)
+        elif not fly_policy.enabled():
+            pass
+        elif quantization is None:
+            logger.debug("%s disabled: no FlyDSL schedule for this regime.", self._tag)
+        elif quantization not in FLY_QUANTIZATIONS:
             logger.warning(
                 "%s disabled: supported quantizations are %s.",
                 self._tag,
                 tuple(FLY_QUANTIZATIONS),
             )
-            return
+        elif world_size not in fly_policy.SUPPORTED_WORLDS:
+            logger.debug("%s disabled: no schedule for TP%d.", self._tag, world_size)
+        else:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        world_size = dist.get_world_size(group=group)
-        if world_size not in fly_policy.SUPPORTED_WORLDS:
-            return
-
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        arch = get_gfx_runtime()
-        if arch not in fly_policy.SUPPORTED_ARCHS:
-            logger.debug("%s disabled: unsupported arch %s.", self._tag, arch)
-            return
-
-        # As in FlyDSLAllReduceRMSNorm: building is a collective, so the ranks
-        # agree on what they would build before any of them starts.
-        digest = _POLICY_DECLINED
-        try:
-            link = fly_policy.detect_link()
-            policy = fly_policy.resolve_family_policy(
-                world_size=world_size, arch=arch, link=link
-            )
-            digest = _digest(("plain", quantization, link, arch, policy))
-        except fly_policy.NoPolicyError as e:
-            logger.debug("%s disabled: %s", self._tag, e)
-        except ValueError as e:
-            logger.warning("%s disabled: %s", self._tag, e)
-        if not all_ranks_same(digest, group):
-            if digest != _POLICY_DECLINED:
-                logger.warning(
-                    "%s disabled: the ranks resolved different policies (check "
-                    "that the AITER_FLY_AR* variables are the same on every rank).",
-                    self._tag,
-                )
-            return
-        if digest == _POLICY_DECLINED:
+            arch = get_gfx_runtime()
+            if arch not in fly_policy.SUPPORTED_ARCHS:
+                logger.debug("%s disabled: unsupported arch %s.", self._tag, arch)
+            else:
+                # The link and the policy come from the environment of each
+                # process, and a digest of everything the build depends on is
+                # what the ranks compare.
+                try:
+                    link = fly_policy.detect_link()
+                    policy = fly_policy.resolve_family_policy(
+                        world_size=world_size, arch=arch, link=link
+                    )
+                    digest = _digest(
+                        (
+                            "plain",
+                            _flydsl_version(),
+                            quantization,
+                            link,
+                            arch,
+                            world_size,
+                            policy,
+                        )
+                    )
+                except fly_policy.NoPolicyError as e:
+                    logger.debug("%s disabled: %s", self._tag, e)
+                except ValueError as e:
+                    logger.warning("%s disabled: %s", self._tag, e)
+        if not vote_on_digest(digest, group, tag=self._tag):
             return
 
         self.group = group
@@ -321,6 +406,7 @@ class FlyDSLAllReduceRMSNorm:
         *,
         quantized: bool,
         hiddens: tuple[int, ...] = (),
+        serve: bool = True,
     ):
         self.disabled = True
         self._engines: dict[str, Any] = {}
@@ -335,52 +421,50 @@ class FlyDSLAllReduceRMSNorm:
             "quantized" if self._quantized else "exact"
         )
 
-        if not _FLY_IMPORT_OK or not fly_policy.enabled():
-            return
-
         world_size = dist.get_world_size(group=group)
-        if world_size not in fly_policy.SUPPORTED_WORLDS:
-            return
-
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        arch = get_gfx_runtime()
-        if arch not in fly_policy.SUPPORTED_ARCHS:
-            logger.debug("%s disabled: unsupported arch %s.", self._tag, arch)
-            return
-
-        # The link and the policy come from the environment of each process.
-        # Building an engine is a collective, so ranks that resolved different
-        # policies would deadlock in the IPC exchange. Every rank therefore
-        # sends a digest of what it would build (or a declined marker) first,
-        # and all of them proceed only when the digests are the same.
+        # Every rank votes below, whatever it decided here: ``digest`` stays
+        # declined unless this rank would build.
         digest = _POLICY_DECLINED
-        try:
-            link = fly_policy.detect_link()
-            policy = fly_policy.resolve_fused_policy(
-                world_size=world_size, arch=arch, link=link
-            )
-            digest = _policy_digest(
-                quantized=self._quantized,
-                link=link,
-                arch=arch,
-                policy=policy,
-                world_size=world_size,
-                hiddens=hiddens,
-            )
-        except fly_policy.NoPolicyError as e:
-            logger.debug("%s disabled: %s", self._tag, e)
-        except ValueError as e:
-            logger.warning("%s disabled: %s", self._tag, e)
-        if not all_ranks_same(digest, group):
-            if digest != _POLICY_DECLINED:
-                logger.warning(
-                    "%s disabled: the ranks resolved different policies (check "
-                    "that the AITER_FLY_AR* variables are the same on every rank).",
-                    self._tag,
-                )
-            return
-        if digest == _POLICY_DECLINED:
+        link = policy = None
+        if not _FLY_IMPORT_OK:
+            logger.debug("%s disabled: flydsl is not importable.", self._tag)
+        elif not fly_policy.enabled():
+            pass
+        elif not serve:
+            logger.debug("%s disabled: not served in this configuration.", self._tag)
+        elif world_size not in fly_policy.SUPPORTED_WORLDS:
+            logger.debug("%s disabled: no schedule for TP%d.", self._tag, world_size)
+        else:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            arch = get_gfx_runtime()
+            if arch not in fly_policy.SUPPORTED_ARCHS:
+                logger.debug("%s disabled: unsupported arch %s.", self._tag, arch)
+            else:
+                # The link and the policy come from the environment of each
+                # process. Building an engine is a collective, so ranks that
+                # resolved different policies would deadlock in the IPC
+                # exchange. Every rank therefore votes a digest of what it
+                # would build (or the declined marker) first, and all of them
+                # proceed only when the digests are the same.
+                try:
+                    link = fly_policy.detect_link()
+                    policy = fly_policy.resolve_fused_policy(
+                        world_size=world_size, arch=arch, link=link
+                    )
+                    digest = _policy_digest(
+                        quantized=self._quantized,
+                        link=link,
+                        arch=arch,
+                        policy=policy,
+                        world_size=world_size,
+                        hiddens=hiddens,
+                    )
+                except fly_policy.NoPolicyError as e:
+                    logger.debug("%s disabled: %s", self._tag, e)
+                except ValueError as e:
+                    logger.warning("%s disabled: %s", self._tag, e)
+        if not vote_on_digest(digest, group, tag=self._tag):
             return
 
         self.group = group

@@ -18,14 +18,16 @@ from unittest import mock
 import pytest
 import torch
 
-from aiter.dist.device_communicators.custom_all_reduce import (
-    CustomAllreduce,
-    is_weak_contiguous,
-)
+from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 from aiter.dist.device_communicators.flydsl_backends import (
     FlyDSLAllReduceRMSNorm,
     FlyDSLQuickAllReduce,
 )
+
+# The custom all-reduce's own ``is_weak_contiguous`` is strict; the quick-reduce
+# one still accepts a transpose of a whole allocation, which is the gap the
+# FlyDSL selectors have to close.
+from aiter.dist.device_communicators.quick_all_reduce import is_weak_contiguous
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.allreduce_policy import (
     RING_SUPER_TILES,
@@ -164,10 +166,17 @@ def test_exact_mode_runs_only_the_one_shot(cell):
     assert row.algorithms(quantized=False) in ((), (ONESHOT,))
 
 
-def test_every_platform_has_one_ladder_per_algorithm():
-    keys = sorted((a, link, ws) for link, ws, a in CELLS)
-    for table in (P.ONESHOT_LADDER, P.MESH_ST_LADDER, P.RING_ST_LADDER):
-        assert sorted(table) == keys
+@pytest.mark.parametrize("alg", list(AllReduceAlgorithm))
+def test_ladders_match_the_windows(alg):
+    """An algorithm has a ladder exactly on the platforms whose policy gives it
+    a window. Without one, dispatch would route payloads to an engine that
+    cannot be built."""
+    windowed = sorted(
+        (arch, link, ws)
+        for link, ws, arch in CELLS
+        if _row(link, ws, arch).window(alg, quantized=True) is not None
+    )
+    assert sorted(P.LADDERS[alg]) == windowed
 
 
 @pytest.mark.parametrize("cell", CELLS)
@@ -180,10 +189,10 @@ def test_ladders_are_well_formed(cell):
     """
     link, ws, arch = cell
     kw = {"world_size": ws, "link": link, "arch": arch}
-    for name, rungs, valid_st in (
-        ("mesh", mesh_st_ladder(**kw), SUPER_TILES),
-        ("ring", ring_st_ladder(**kw), RING_SUPER_TILES),
-    ):
+    two_shot = [("mesh", mesh_st_ladder(**kw), SUPER_TILES)]
+    if _row(*cell).window(RING, quantized=True) is not None:
+        two_shot.append(("ring", ring_st_ladder(**kw), RING_SUPER_TILES))
+    for name, rungs, valid_st in two_shot:
         assert rungs, name
         assert rungs[0].min_bytes == 0, name
         floors = [r.min_bytes for r in rungs]
@@ -379,16 +388,25 @@ def test_unreadable_topology_needs_the_link_variable():
     P._probe_link.cache_clear()
 
 
-def test_override_enables_a_disabled_algorithm():
-    """gfx950/xGMI has no ring. Overriding its window creates one, with the
-    other bound unbounded."""
-    with _env(
-        AITER_FLY_AR_MESH_MAX_BYTES=str(512 << 20),
-        AITER_FLY_AR_RING_MIN_BYTES=str(512 << 20),
+@pytest.mark.parametrize("cell", [("xgmi", ws, "gfx950") for ws in WORLDS])
+def test_override_cannot_enable_an_algorithm_without_a_ladder(cell):
+    """gfx950/xGMI has no ring, and no ring ladder to build one from. An
+    override that would open a ring window is ignored, with a warning."""
+    link, ws, _arch = cell
+    table = _row(*cell)
+    with (
+        _env(
+            AITER_FLY_AR_MESH_MAX_BYTES=str(512 << 20),
+            AITER_FLY_AR_RING_MIN_BYTES=str(512 << 20),
+        ),
+        mock.patch.object(P.logger, "warning") as warning,
     ):
-        p = _resolve("xgmi", 4)
-        assert p.window(RING, quantized=True) == Window(512 << 20, None)
-        assert p.select(1 << 30, quantized=True) == RING
+        p = _resolve(link, ws)
+    assert p.window(RING, quantized=True) is None
+    assert p.mesh == Window(table.mesh.min, 512 << 20)
+    assert p.select(1 << 30, quantized=True) is None
+    warning.assert_called_once()
+    assert warning.call_args.args[1] == "RING"
 
 
 def test_equal_bounds_disable():
@@ -1196,7 +1214,18 @@ def test_plain_backend_declines_together(differ):
         assert all(builds) and builds[0] == builds[1]
 
 
-def test_unknown_quantization_declines():
-    with mock.patch.object(P, "enabled", return_value=True):
-        backend = FlyDSLQuickAllReduce(None, torch.device("cpu"), quantization="INT8")
+def test_unknown_quantization_declines(tmp_path):
+    """The decline still goes through the vote, which needs a group."""
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
+    )
+    try:
+        with mock.patch.object(P, "enabled", return_value=True):
+            backend = FlyDSLQuickAllReduce(
+                dist.group.WORLD, torch.device("cpu"), quantization="INT8"
+            )
+    finally:
+        dist.destroy_process_group()
     assert backend.disabled and backend.select(1 << 20) is None
