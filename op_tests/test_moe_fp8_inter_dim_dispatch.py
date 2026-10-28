@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Regression for per-tensor FP8 CK MoE shards aligned to 128, but not 256 (e.g. 384)."""
+"""Test per-tensor FP8 CK MoE shards whose inter_dim is a multiple of 128 but not of 256."""
 
 import pytest
 import torch
@@ -24,7 +24,7 @@ RELATIVE_ERROR_TOLERANCE = 0.1
 
 @pytest.fixture(autouse=True)
 def default_dispatch(monkeypatch):
-    # Explicitly bypass CSV tuning: a tuned kernel must not hide this bug.
+    # Bypass the tuned CSV so that a tuned kernel cannot hide a dispatch bug.
     monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
     get_2stage_cfgs.cache_clear()
     yield
@@ -62,7 +62,7 @@ def compute_relative_error(tokens, model_dim, inter_dim, experts, topk, block_m)
         block_size_M=block_m,
     )
     torch.accelerator.synchronize()
-    # Independent reference on the dequantized weights; accumulate in FP32.
+    # Compute the reference from the dequantized weights in FP32.
     w1_dq = w1_q.float() * w1_scale.view(experts, 1, 1)
     w2_dq = w2_q.float() * w2_scale.view(experts, 1, 1)
     expected = torch.zeros(tokens, model_dim, device="cuda", dtype=torch.float32)
@@ -86,7 +86,7 @@ def compute_relative_error(tokens, model_dim, inter_dim, experts, topk, block_m)
 def test_per_tensor_fp8_ck_default_alignment(
     tokens, model_dim, inter_dim, experts, topk, block_m
 ):
-    # 384 regresses the KPerBlock=128 fallback. 256 and 512 retain the old path.
+    # 384 needs the KPerBlock 128 instances. 256 and 512 use the KPerBlock 256 ones.
     err = compute_relative_error(tokens, model_dim, inter_dim, experts, topk, block_m)
     assert (
         err < RELATIVE_ERROR_TOLERANCE
@@ -102,8 +102,8 @@ def test_per_tensor_fp8_ck_default_alignment(
 def test_per_tensor_fp8_ck_kperblock_128_shapes(
     tokens, model_dim, inter_dim, experts, topk, block_m
 ):
-    # These are the multiples of 128 that are not multiples of 256, so they run
-    # only on the KPerBlock=128 instances added for block_m 32 and 64.
+    # These shapes are multiples of 128 but not of 256, so only the KPerBlock 128
+    # instances divide them.
     err = compute_relative_error(tokens, model_dim, inter_dim, experts, topk, block_m)
     assert (
         err < RELATIVE_ERROR_TOLERANCE

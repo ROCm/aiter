@@ -64,8 +64,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     using AElementOp  = PassThrough;
     using BElementOp  = PassThrough;
 
-    // Padding N and K lets CK run an N or K that no tile divides (N, K multiples of 8), at the
-    // cost of bounds checks on every load, so only the shapes that need it ask for it.
+    // Padding lets CK run an N or K that no tile divides, but it adds a bounds check to every load.
+    // Only the shapes that need it use it.
     static constexpr auto GemmSpec =
         PadK ? ck::tensor_operation::device::GemmSpecialization::NKPadding
              : ck::tensor_operation::device::GemmSpecialization::Default;
@@ -89,8 +89,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 = ck::is_same_v<B0DataType, I4> ? 32 : K1 / sizeof(B0DataType);
     static constexpr ck::index_t EVec = MPerBlock == 16 ? 4 : 16 / sizeof(EDataType);
-    // NPerBlock 16/32 tiles (for an inter_dim that isn't a multiple of 64): the formulas above
-    // assume NPerBlock >= 64, so size the CShuffle lanes from the narrow shuffle tile instead.
+    // The lane counts above assume NPerBlock is at least 64.
+    // The 16- and 32-wide N tiles size their CShuffle lanes from the narrow tile instead.
     static constexpr ck::index_t CShuffleNLaneNarrow =
         CShuffleNXDLPerWave * MNPerXDL * NWaves / EVec;
     static constexpr ck::index_t CMLane =
@@ -267,8 +267,8 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     using AElementOp  = PassThrough;
     using BElementOp  = PassThrough;
 
-    // Padding N and K lets CK run an N or K that no tile divides (N, K multiples of 8), at the
-    // cost of bounds checks on every load, so only the shapes that need it ask for it.
+    // Padding lets CK run an N or K that no tile divides, but it adds a bounds check to every load.
+    // Only the shapes that need it use it.
     static constexpr auto GemmSpec =
         PadK ? ck::tensor_operation::device::GemmSpecialization::NKPadding
              : ck::tensor_operation::device::GemmSpecialization::Default;
@@ -284,8 +284,8 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         ck::is_same_v<B0DataType, I4> ? 32 : NPerBlock / 2 / NXDLPerWave; // 64
     static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
     // Note: some fp8 instances didn't compile with AK1/BK1=16
-    // KVec8 instances read 8-element K vectors (for an inter_dim that is a multiple of 8 but not of
-    // 16; its weights are shuffled in 8-element vectors).
+    // KVec8 instances read weights preshuffled in 8-element K vectors.
+    // They are used for an inter_dim that is a multiple of 8 but not of 16.
     static_assert(!KVec8 || (PadK && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1),
                   "KVec8 is for padded FP8 instances");
     static constexpr ck::index_t K1  = KVec8 || (BLOCKSIZE == 256 && KPerBlock == 64 &&
@@ -293,7 +293,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                                            ? 8
                                            : 16;
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
-    // The preshuffled B layout is in 16-byte K vectors (8-byte for KVec8); BK1 matches it.
+    // BK1 matches the K vector of the preshuffled weights, which is 16 bytes, or 8 bytes for KVec8.
     static constexpr ck::index_t BK1   = ck::is_same_v<B0DataType, I4>
                                              ? 32 / sizeof(B0DataType)
                                              : (KVec8 ? 8 : 16) / sizeof(B0DataType);

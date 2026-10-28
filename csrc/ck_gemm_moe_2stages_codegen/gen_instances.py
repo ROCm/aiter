@@ -81,9 +81,8 @@ A16W16_A8W8_gemm1_gfx950_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
-        // The 64-wide N tiles need inter_dim % 64 == 0; otherwise use the 32-wide ones, or the
-        // 16-wide ones when inter_dim isn't a multiple of 32 either.
-        // FP8 only: the bf16 kernels that share this dispatch have no narrow instances.
+        // The 64-wide N tiles need an inter_dim that is a multiple of 64. Otherwise use the
+        // narrower tiles, which only the FP8 kernels define.
         if constexpr (sizeof({A0DataType}) == 1)
         {{
             if (inter_dim % 64 != 0)
@@ -91,7 +90,7 @@ A16W16_A8W8_gemm1_gfx950_heuristic_dispatch = """
                 const bool pad_k = model_dim % (128/sizeof({A0DataType})) != 0;
                 if (inter_dim % 32 != 0)
                 {{
-                    // The padded twins also pad N, for an inter_dim that isn't a multiple of 16.
+                    // The padded copies also pad N, for an inter_dim that is not a multiple of 16.
                     const bool pad = pad_k || inter_dim % 16 != 0;
                     if (block_m == 32)
                     {{
@@ -128,7 +127,8 @@ A16W16_A8W8_gemm1_gfx950_heuristic_dispatch = """
                 }}
             }}
         }}
-        // The 128-wide N tiles (block_m 128/256) need inter_dim % 128 == 0; otherwise use the 64-wide ones.
+        // For block_m 128 and 256, the 128-wide N tiles need an inter_dim that is a
+        // multiple of 128. Otherwise use the 64-wide ones.
         if (block_m == 32)
         {{
             if (model_dim % (128/sizeof({A0DataType})) != 0)
@@ -260,15 +260,18 @@ A8W8_gemm1_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
-        // The 128-wide N tiles need inter_dim % 128 == 0; otherwise use the 64-wide ones.
+        // The 128-wide N tiles need an inter_dim above 192 that is a multiple of 128.
+        // Otherwise use the 64-wide ones.
         const bool n64 = inter_dim <= 192 || inter_dim % 128 != 0;
-        // The KPerBlock 128 tiles need model_dim % 128 == 0; otherwise use the KPerBlock 64 ones.
+        // The KPerBlock 128 tiles need a model_dim that is a multiple of 128.
+        // Otherwise use the KPerBlock 64 ones.
         const bool k64 = model_dim % 128 != 0;
-        // The 64-wide N tiles need inter_dim % 64 == 0; otherwise use the 32-wide ones (KPerBlock 64).
+        // The 64-wide N tiles need an inter_dim that is a multiple of 64.
+        // Otherwise use the 32-wide ones.
         const bool n32 = inter_dim % 64 != 0;
-        // ... and the 16-wide ones when inter_dim isn't a multiple of 32.
+        // Use the 16-wide N tiles when inter_dim is not a multiple of 32.
         const bool n16 = inter_dim % 32 != 0;
-        // ... with N (and K) padded in CK when inter_dim isn't a multiple of 16.
+        // Pad N and K when inter_dim is not a multiple of 16.
         const bool padn = inter_dim % 16 != 0;
         if (block_m == 16)
         {{
@@ -334,7 +337,7 @@ A8W8_gemm1_heuristic_dispatch = """
         }}
         else if (block_m == 128)
         {{
-            // The narrow N tiles are slow at this block_m: pad N to the 64-wide tile in CK.
+            // The narrow N tiles are slow at this block_m, so pad N to the 64-wide tile instead.
             if (n32)
                 return k64 ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 64/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
             if (k64)
@@ -352,7 +355,7 @@ A8W8_gemm1_heuristic_dispatch = """
         }}
         else if (block_m == 256)
         {{
-            // The narrow N tiles are slow at this block_m: pad N to the 64-wide tile in CK.
+            // The narrow N tiles are slow at this block_m, so pad N to the 64-wide tile instead.
             if (n32)
                 return k64 ? ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 64/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true> : ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true>;
             if (k64)
@@ -579,8 +582,7 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
-        // An inter_dim (K) that isn't a multiple of 16 has 8-element-vector weights: KPerBlock 32,
-        // which runs the single-rate FP8 MFMA on gfx950.
+        // An inter_dim that is not a multiple of 16 uses the KVec8 instances.
         if (inter_dim % 16 != 0)
         {{
             if (block_m == 32)
@@ -600,7 +602,8 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 32, 4, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
             }}
         }}
-        // The 128-wide N tiles need model_dim % 128 == 0; otherwise use the 64-wide ones.
+        // The 128-wide N tiles need a model_dim that is a multiple of 128.
+        // Otherwise use the 64-wide ones.
         if (model_dim % 128 != 0)
         {{
             const bool pad_k = inter_dim % (128/sizeof({A0DataType})) != 0;
@@ -654,7 +657,7 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
         else if (block_m == 128)
         {{
             constexpr int k128 = 128/sizeof({A0DataType});
-            // Already the smallest tile, so pad only when it does not divide K.
+            // This is the smallest tile, so pad only when it does not divide K.
             if (inter_dim % k128 == 0)
             {{
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
@@ -664,7 +667,7 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
         else if (block_m == 256)
         {{
             constexpr int k128 = 128/sizeof({A0DataType});
-            // Already the smallest tile, so pad only when it does not divide K.
+            // This is the smallest tile, so pad only when it does not divide K.
             if (inter_dim % k128 == 0)
             {{
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, k128, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
@@ -749,12 +752,12 @@ A8W8_gemm2_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
-        // The 128-wide tiles need inter_dim (K) and model_dim (N) % 128 == 0; otherwise use the 64-wide ones.
+        // The 128-wide tiles need inter_dim and model_dim to be multiples of 128.
+        // Otherwise use the 64-wide ones.
         const bool tile64 = inter_dim <= 192 || inter_dim % 128 != 0 || model_dim % 128 != 0;
-        // An inter_dim (K) that isn't a multiple of 64 runs the 64-wide tiles with K padded in CK.
+        // An inter_dim that is not a multiple of 64 uses the 64-wide tiles with K padded.
         const bool padk = inter_dim % 64 != 0;
-        // An inter_dim (K) that isn't a multiple of 16 has 8-element-vector weights (KVec8 instances;
-        // KPerBlock 32 for the small block_m).
+        // An inter_dim that is not a multiple of 16 uses the KVec8 instances.
         const bool kvec8 = inter_dim % 16 != 0;
         if (block_m == 16)
         {{
