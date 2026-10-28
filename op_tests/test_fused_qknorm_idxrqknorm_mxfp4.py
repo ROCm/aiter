@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""fused_qknorm_idxrqknorm writing MXFP4 caches and an fp8 main Q.
+"""fused_qknorm_idxrqknorm writing MXFP4 caches and an e4m3 main Q.
 
 ``index_cache_dtype="mxfp4"`` and ``kv_cache_dtype="mxfp4"`` store the post norm + RoPE
 index K, main K and the raw V as uint8 pages of 128 tokens, ``[128 x 64 B e2m1][128 x 4 B
 e8m0]`` (8704 B), the low nibble the even element. The judge is the "auto" mode of the SAME
 op: ``per_1x32_f4_quant`` (aiter's torch MXFP4 reference) applied to the rows "auto" writes
 is what the MXFP4 bytes must equal, bit for bit, and every other output must not move.
-``q_fp8_out`` must equal ``bf16(q) / q_scale`` rounded to e4m3, saturating at its max.
+An e4m3 ``q_out`` must equal ``bf16(q)`` rounded to e4m3, saturating at its max.
 """
 
 import argparse
@@ -232,22 +232,21 @@ def test_views_into_one_pool():
 
 
 @benchmark()
-def test_q_fp8_out(dtype, kv, scale, bf16_q_too):
+def test_q_fp8_out(dtype, kv, q_dtype):
+    """An e4m3 q_out gets bf16(q) rounded to e4m3 (unit scale, saturating) and replaces the
+    bf16 q, as an e4m3 index_q_out does: the packed qkv row is not written back either.
+    """
     T = 300
     slots = slot_cases(T)["shuffled"][0]
     inputs = make_inputs(T, 1, dtype)
     inputs[0][:8, : NQ * HD] *= 600.0  # some elements saturate
-    q8 = torch.empty(T, NQ * HD, dtype=dtypes.fp8)
-    q_scale = None if scale is None else torch.tensor([scale], dtype=torch.float32)
-    extra = {"q_fp8_out": q8, "q_scale": q_scale}
-    if not bf16_q_too:
-        extra["q_out"] = None
-    q = run_op(inputs, 1, slots, kv, 128, "auto", dtype, **extra)["q"]
+    qkv = inputs[0].clone()
+    q8 = torch.empty(T, NQ * HD, dtype=q_dtype)
+    run_op(inputs, 1, slots, kv, 128, "auto", dtype, q_out=q8)
     q_ref = run_op(inputs, 1, slots, kv, 128, "auto", dtype)["q"]
-    want = (q_ref.float() / (1.0 if scale is None else scale)).clamp(-FP8_MAX, FP8_MAX)
-    assert same(q8, want.to(dtypes.fp8))
-    if bf16_q_too:
-        assert same(q, q_ref)
+    want = q_ref.float().clamp(-FP8_MAX, FP8_MAX).to(dtypes.fp8)
+    assert same(q8, want)
+    assert torch.equal(inputs[0], qkv)
     return {"result": "PASS"}
 
 
@@ -402,11 +401,11 @@ def sweep(dtype_list, tokens, perf_tokens):
     )
     summary("skip_index_branch", [test_skip_index_branch(d) for d in dtype_list])
     summary(
-        "q_fp8_out",
+        "e4m3 q_out",
         [
             test_q_fp8_out(*cfg)
             for cfg in itertools.product(
-                dtype_list, ("auto", "mxfp4"), (None, 0.25, 3.0), (True, False)
+                dtype_list, ("auto", "mxfp4"), (dtypes.fp8, torch.uint8)
             )
         ],
     )
@@ -464,7 +463,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Test fused_qknorm_idxrqknorm MXFP4 caches and fp8 Q",
+        description="Test fused_qknorm_idxrqknorm MXFP4 caches and e4m3 q_out",
     )
     parser.add_argument(
         "-d",

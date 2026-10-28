@@ -360,9 +360,8 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int64_t v_s_block,
     int64_t v_s_token,
     int64_t v_s_head,
-    // Main Q in e4m3 (optional): round(q to scalar_t) / *q_scale. Null q_scale means 1.0.
-    opus::fp8_t* __restrict__ q_fp8_out,
-    const float* __restrict__ q_scale)
+    // Main Q as unit-scale e4m3 (replaces the q_out row when set).
+    opus::fp8_t* __restrict__ q_fp8_out)
 {
     const int warps_per_block = blockDim.x / 32;
     const int lane_id = threadIdx.x % 32;
@@ -559,10 +558,9 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                     q_fp8_out + static_cast<int64_t>(token_idx) * nq * kHeadDim +
                         slot * kHeadDim + dim_base,
                     elems,
-                    q_scale != nullptr ? *q_scale : 1.0f);
+                    1.0f);
             }
-            // With only the fp8 copy requested the bf16 row is not written back.
-            if(q_out != nullptr || q_fp8_out == nullptr)
+            else
             {
                 storeElems(store_ptr + dim_base, elems);
             }
@@ -746,8 +744,7 @@ void launchFusedQKNormIdxrQKNorm(
     bool static_kv_scale,
     bool asm_layout,
     hipStream_t stream,
-    opus::fp8_t* q_fp8_out = nullptr,
-    const float* q_scale   = nullptr)
+    opus::fp8_t* q_fp8_out = nullptr)
 {
     const int v_slots = insert_kv ? nkv : 0;
     const int idx_slots = process_index ? niq + 1 : 0;
@@ -807,8 +804,7 @@ void launchFusedQKNormIdxrQKNorm(
                                           v_s_block,                                         \
                                           v_s_token,                                         \
                                           v_s_head,                                          \
-                                          q_fp8_out,                                         \
-                                          q_scale)
+                                          q_fp8_out)
 
 #define LAUNCH_SCALE(IS_SPARSE, PROCESS_INDEX, INSERT, ASM)     \
     do                                                          \
@@ -921,9 +917,7 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch,
-    std::optional<aiter_tensor_t> q_fp8_out,
-    std::optional<aiter_tensor_t> q_scale)
+    bool skip_index_branch)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
 
@@ -1249,27 +1243,13 @@ static void fused_qknorm_idxrqknorm_impl(
         }
     }
 
-    if(q_fp8_out.has_value())
-    {
-        AITER_CHECK(insert_kv, "q_fp8_out requires the insert mode (kv caches)");
-        AITER_CHECK(q_fp8_out->is_gpu() && q_fp8_out->is_contiguous() &&
-                        (q_fp8_out->dtype() == AITER_DTYPE_fp8 ||
-                         q_fp8_out->dtype() == AITER_DTYPE_u8) &&
-                        q_fp8_out->numel() == static_cast<int64_t>(num_tokens) * nq * kHeadDim,
-                    "q_fp8_out must be a contiguous e4m3 CUDA tensor of "
-                    "num_tokens * num_heads * 128");
-    }
-    if(q_scale.has_value())
-    {
-        AITER_CHECK(q_fp8_out.has_value() && q_scale->is_gpu() && q_scale->is_contiguous() &&
-                        q_scale->dtype() == AITER_DTYPE_fp32 && q_scale->numel() == 1,
-                    "q_scale must be a [1] float32 CUDA tensor and needs q_fp8_out");
-    }
     if(q_out.has_value())
     {
+        const bool q_is_fp8 = q_out->dtype() == AITER_DTYPE_fp8 || q_out->dtype() == AITER_DTYPE_u8;
+        AITER_CHECK(!q_is_fp8 || insert_kv, "fp8 q_out requires the insert mode (kv caches)");
         AITER_CHECK(q_out->is_gpu() && q_out->is_contiguous() &&
-                        q_out->dtype() == qkv.dtype(),
-                    "q_out must be contiguous CUDA and match qkv dtype");
+                        (q_out->dtype() == qkv.dtype() || q_is_fp8),
+                    "q_out must be contiguous CUDA and match qkv dtype or fp8 e4m3");
         AITER_CHECK(q_out->numel() == static_cast<int64_t>(num_tokens) * nq * kHeadDim,
                     "q_out must have num_tokens * num_heads * 128 elements");
     }
@@ -1299,10 +1279,13 @@ static void fused_qknorm_idxrqknorm_impl(
         opus::fp8_t* index_q_fp8_ptr =
             index_q_is_fp8 ? reinterpret_cast<opus::fp8_t*>(index_q_out->data_ptr())
                            : nullptr;
+        const bool q_is_fp8 =
+            q_out.has_value() &&
+            (q_out->dtype() == AITER_DTYPE_fp8 || q_out->dtype() == AITER_DTYPE_u8);
+        T* q_ptr = (!q_is_fp8 && q_out.has_value()) ? reinterpret_cast<T*>(q_out->data_ptr())
+                                                    : nullptr;
         opus::fp8_t* q_fp8_ptr =
-            q_fp8_out.has_value() ? reinterpret_cast<opus::fp8_t*>(q_fp8_out->data_ptr()) : nullptr;
-        const float* q_scale_ptr =
-            q_scale.has_value() ? reinterpret_cast<const float*>(q_scale->data_ptr()) : nullptr;
+            q_is_fp8 ? reinterpret_cast<opus::fp8_t*>(q_out->data_ptr()) : nullptr;
         if(mxfp4_kv_cache || mxfp4_index_cache)
         {
             // MXFP4 main K/V and/or index K (sparse insert only); the other cache keeps its type.
@@ -1315,7 +1298,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                   bool kKvFp4>() {
                 launchFusedQKNormIdxrQKNorm<T, CacheT, IndexT, kv_dt, index_dt, kIndexFp4, kKvFp4>(
                     reinterpret_cast<T*>(qkv.data_ptr()),
-                    q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                    q_ptr,
                     index_q_ptr,
                     index_q_fp8_ptr,
                     reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1356,8 +1339,7 @@ static void fused_qknorm_idxrqknorm_impl(
                     fp8_kv_static,
                     asm_layout,
                     stream,
-                    q_fp8_ptr,
-                    q_scale_ptr);
+                    q_fp8_ptr);
             };
             using Dt = vllm::Fp8KVCacheDataType;
             if(mxfp4_kv_cache && mxfp4_index_cache)
@@ -1395,7 +1377,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kFp8E4M3,
                                             vllm::Fp8KVCacheDataType::kFp8E4M3>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
-                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                q_ptr,
                 index_q_ptr,
                 index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1443,8 +1425,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr,
-                q_scale_ptr);
+                q_fp8_ptr);
             }
             else
             {
@@ -1454,7 +1435,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kFp8E4M3,
                                             vllm::Fp8KVCacheDataType::kAuto>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
-                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                q_ptr,
                 index_q_ptr,
                 index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1502,8 +1483,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr,
-                q_scale_ptr);
+                q_fp8_ptr);
             }
         }
         else
@@ -1516,7 +1496,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kAuto,
                                             vllm::Fp8KVCacheDataType::kFp8E4M3>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
-                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                q_ptr,
                 index_q_ptr,
                 index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1560,8 +1540,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr,
-                q_scale_ptr);
+                q_fp8_ptr);
             }
             else
             {
@@ -1571,7 +1550,7 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kAuto,
                                             vllm::Fp8KVCacheDataType::kAuto>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
-                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                q_ptr,
                 index_q_ptr,
                 index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
@@ -1615,8 +1594,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr,
-                q_scale_ptr);
+                q_fp8_ptr);
             }
         }
     });
@@ -1648,9 +1626,7 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch,
-    std::optional<aiter_tensor_t> q_fp8_out,
-    std::optional<aiter_tensor_t> q_scale)
+    bool skip_index_branch)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
@@ -1677,9 +1653,7 @@ void fused_qknorm_idxrqknorm(
                                                 k_scale,
                                                 v_scale,
                                                 asm_layout,
-                                                skip_index_branch,
-                                                q_fp8_out,
-                                                q_scale);
+                                                skip_index_branch);
 }
 
 } // namespace aiter
