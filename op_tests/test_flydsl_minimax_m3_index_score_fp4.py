@@ -11,7 +11,7 @@ tolerance is the fp8 test's and a mismatch is a bug, not a rounding difference.
 The quantizer is aiter's own `per_1x32_f4_quant` (RoundUp), the dequantizer
 `fp4_utils.mxfp4_to_f32` x `e8m0_to_f32`; neither is reimplemented here beyond
 chunking. e8m0 bytes 0 and 255 are outside the kernel's contract and are not
-generated (`quantize_mxfp4` clamps amax, as `indexer_fp4_scale_e8m0` does).
+generated (`quantize_mxfp4` asserts its scales stay within 1..254).
 """
 
 import argparse
@@ -31,7 +31,12 @@ from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, run_perftest
 from aiter.utility import fp4_utils
 
-from op_tests import test_flydsl_minimax_m3_index_score as fp8_test
+try:
+    from op_tests import test_flydsl_minimax_m3_index_score as fp8_test
+except ModuleNotFoundError as e:  # run as a script: only op_tests/ is on sys.path
+    if e.name != "op_tests":
+        raise
+    import test_flydsl_minimax_m3_index_score as fp8_test
 
 P, D = fp8_test.P, fp8_test.D
 ATOL, RTOL = fp8_test.ATOL, fp8_test.RTOL
@@ -545,6 +550,14 @@ def main(argv=None):
     if not torch.cuda.is_available() or get_gfx() not in DECODE_SUPPORTED_GFX:
         aiter.logger.warning("index score requires gfx950; skipping sweep")
         return 0
+    aiter.logger.info("mxfp4 decode index score: running correctness checks...")
+    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
+    if status != pytest.ExitCode.OK:
+        aiter.logger.error(
+            "mxfp4 decode index score: checks failed (pytest exit %s); skipping perf sweep",
+            int(status),
+        )
+        return 1
     rows = [
         test_score_fp4(f"B{B}_S{S}_H{H}_L{L}", B, S, H, [L] * B)
         for B, (S, H, L) in itertools.product(args.batch, args.mnk)
