@@ -872,9 +872,19 @@ class Gfx1250Bf16WavePipeline:
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
     @flyc.jit
-    def _stage_next(self, token_base, end, buffer):
-        if token_base + 128 < end:
+    def _stage_next(self, token_base, begin, end, buffer):
+        # The prologue stages the second page.
+        if (token_base != begin) & (token_base + 128 < end):
             self.mem.stage_bf16_page(token_base + 128, 1 - buffer)
+
+    @flyc.jit
+    def _wait(self, token_base, begin, end):
+        # The second page's K and V copies may stay in flight; a partial
+        # page's extra V copies only lengthen this wait.
+        if (token_base == begin) & (begin + 128 < end):
+            tdm_ops.tensor_wait(2)
+        else:
+            tdm_ops.tensor_wait(0)
 
     def _operand(self, base, offset):
         # Half-wave h holds eight-element chunks h and h + 2 of a 32-wide
@@ -895,14 +905,14 @@ class Gfx1250Bf16WavePipeline:
     def _page(self, token_base, begin, end, state, q_operands, uppers, bases, masked):
         """Consume half a page; ``masked`` applies the causal and window bounds."""
         t = self.t
-        # Unmasked scores are finite and the scale is nonnegative, so it
-        # commutes with the maximum and fuses into the exponent.
-        fused = not masked and t.softmax_scale >= 0
+        # A positive scale commutes with the maximum and fuses into the
+        # exponent; masked scores stay -inf.
+        fused = t.softmax_scale > 0
         scale = fx.Float32(t.softmax_scale * LOG2E)
         buffer = ((token_base - begin) // 128) % 2
-        tdm_ops.tensor_wait(0)
+        self._wait(token_base, begin, end)
         gpu.barrier()
-        self._stage_next(token_base, end, buffer)
+        self._stage_next(token_base, begin, end, buffer)
         # Selecting a precomputed base keeps every K/V load at a single base
         # register plus an immediate offset.
         kbase = (buffer == 0).select(bases[0][0], bases[0][1])
@@ -1058,6 +1068,9 @@ class Gfx1250Bf16WavePipeline:
             uppers.append(
                 unmasked_end + row // t.query_group_size - 8 * ctx.half - 64 * part
             )
+        # After the query loads, which the first page's QK waits for too.
+        if begin + 128 < end:
+            self.mem.stage_bf16_page(begin + 128, fx.Int32(1))
         pages = (end - begin) // 128
         split = (
             begin
