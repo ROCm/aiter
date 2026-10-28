@@ -139,6 +139,10 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
     MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK,
 )
+from aiter.ops.gemm_op_common import (
+    mxscale_bmm_groups_of_block,
+    mxscale_w_scale_block_cell,
+)
 from aiter_worker_limits import adopt_legacy_max_jobs
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -235,6 +239,8 @@ def _bmm_mfma_job(
     layout serves every M bucket."""
     params = parse_bmm_kernel_name(kernel_name)
     if params is None:
+        # The runtime runs the heuristic's pick for such a row.
+        print(f"  [WARN] Unknown FlyDSL BMM kernel name: {kernel_name}, skipping")
         return None
     return {
         "kernel_name": kernel_name,
@@ -245,8 +251,9 @@ def _bmm_mfma_job(
         "cu_num": 0,  # the gfx column names the arch
         "gfx": row.get("gfx", "").strip(),
         "b": b,
-        # A table from before the column holds only 128x128 rows (as at runtime).
-        "w_scale_block": row.get("w_scale_block", "128x128").strip(),
+        # A table from before the column, or a blank / 0 cell, holds 128x128
+        # rows (as the runtime loaders read it).
+        "w_scale_block": mxscale_w_scale_block_cell(row.get("w_scale_block")),
         "x_scale_transposed": x_scale_transposed,
         **params,
     }
@@ -334,14 +341,13 @@ def parse_csv(csv_path: str):
             continue
 
         if row.get("b", "").strip():  # a batched row (may be in a mixed table)
-            job = None
-            if kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
-                job = _bmm_mfma_job(
-                    row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
-                )
-            if job is None:
+            if not kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
                 batched_skipped.add(kernel_name)
-            elif job_identity(job) not in seen:
+                continue
+            job = _bmm_mfma_job(
+                row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
+            )
+            if job is not None and job_identity(job) not in seen:
                 seen.add(job_identity(job))
                 jobs.append(job)
             continue
@@ -353,9 +359,12 @@ def parse_csv(csv_path: str):
         gfx = row.get("gfx", "").strip()
         # Their kernels read the row's raw w_scale block: the mxfp8 table is
         # 1x32 (a row from before the column is one), the blockscale table's
-        # "mxfp8" rows 32x32 / 128x128 too.
+        # "mxfp8" rows 32x32 / 128x128 too (128x128 for a blank cell, as the
+        # runtime loader reads it).
         raw_scales = mxfp8_table or row.get("kernelId", "").strip() == "mxfp8"
-        mxfp8_block = (row.get("w_scale_block") or "1x32").strip()
+        mxfp8_block = mxscale_w_scale_block_cell(
+            row.get("w_scale_block"), "1x32" if mxfp8_table else "128x128"
+        )
         if raw_scales and (
             mxfp8_block not in MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK
             or (mxfp8_table and mxfp8_block != "1x32")
@@ -363,16 +372,19 @@ def parse_csv(csv_path: str):
             continue
 
         if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
-            # A 128-wide GEMM x_scale is column-major (blockscale), read by
-            # the transposed kernel, except at M = 1 where both coincide.
+            # Dispatch runs the row with the x_scale block that goes with its
+            # w_scale's: 1x128 with 128x128 (column-major, blockscale, read
+            # by the transposed kernel except at M = 1), else 1x32.
             layouts = (
                 (False, True)
-                if row.get("w_scale_block", "128x128").strip() == "128x128"
+                if mxscale_w_scale_block_cell(row.get("w_scale_block")) == "128x128"
                 else (False,)
             )
             for transposed in layouts:
                 job = _bmm_mfma_job(row, kernel_name, 1, n, k, transposed)
-                if job is not None and job_identity(job) not in seen:
+                if job is None:
+                    break
+                if job_identity(job) not in seen:
                     seen.add(job_identity(job))
                     jobs.append(job)
             continue
@@ -1008,11 +1020,12 @@ def _compile_bmm_mfma_to_cache(
     """Compile a gfx950 mxscale BMM through the runtime's own launch path, so
     run_bmm_a8w8_mxfp8_gfx950 hits this cache entry."""
     del kwargs
-    rows, cols = (int(v) for v in w_scale_block.split("x"))
-    if rows != cols:
-        raise ValueError(f"{kernel_name}: no AOT wiring for a {w_scale_block} w_scale")
+    rows, cols = mxscale_bmm_groups_of_block(w_scale_block)
+    # Rows run with 1 x cols x_scale blocks (column-major only for 1x128).
     with compile_only_env():
-        compile_bmm_a8w8_mxfp8_gfx950(kernel_name, b, n, k, rows, x_scale_transposed)
+        compile_bmm_a8w8_mxfp8_gfx950(
+            kernel_name, b, n, k, cols, rows, cols, x_scale_transposed
+        )
 
 
 def _compile_mxfp8_wmma_to_cache(
