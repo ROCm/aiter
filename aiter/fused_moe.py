@@ -1670,7 +1670,6 @@ def _fused_moe_impl(
             has_stage2_scatter=stage2_scatter is not None,
             has_activation_scales=a1_scale is not None or a2_scale is not None,
             has_num_local_tokens=num_local_tokens is not None,
-            has_a2_scale=a2_scale is not None,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -1733,10 +1732,6 @@ def _fused_moe_impl(
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     asm_mode = AsmMoeMode(metadata.flat)
-    if asm_mode is AsmMoeMode.POST_REDUCE and block_size_M != 256:
-        raise ValueError(
-            f"Post-reduction block_size_M={block_size_M} is incompatible: sorting requires 256-row tiles"
-        )
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
             FusedMoeRequest(
@@ -1849,16 +1844,9 @@ def _fused_moe_impl(
                 "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
                 "(only the layout-v2 scatter GEMM2 handles the masked aux sort)."
             )
-        if metadata.run_1stage:
-            # The sort's accumulate contract allocates the final [M, D] buffer.
-            # Q256 writes partials; its reducer overwrites that buffer, not atomics.
-            _atomic = True
-        else:
-            _stage2_kwargs = metadata.stage2.keywords
-            _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get(
-                "kernelName", ""
-            )
-            _atomic = parse_g2_kname_any(_kn2)["atomic"]
+        _stage2_kwargs = metadata.stage2.keywords
+        _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
+        _atomic = parse_g2_kname_any(_kn2)["atomic"]
         # BM16's adaptive sort already emits routes and zeroes the output without
         # quantizing. Keep the Opus crossover for the configured aux pipeline.
         sorting_ret = moe_sorting(
@@ -1965,6 +1953,7 @@ def _fused_moe_impl(
             M=M,
             device=topk_ids.device,
             doweight_stage1=doweight_stage1,
+            expert_mask=expert_mask,
         )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
@@ -2051,6 +2040,7 @@ def fused_moe_1stage(
     device=None,
     doweight_stage1: bool | None = None,
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
+    expert_mask: torch.Tensor | None = None,
 ):
     asm_mode = AsmMoeMode(flat)
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
@@ -2154,9 +2144,10 @@ def fused_moe_1stage(
                 raise ValueError("Q256 does not support caller-provided hidden scales")
             # The ASM stores one weighted BF16 row per token/topk slot.
             # These partials are consumed once by the FP32 reduction.
-            partials = torch.empty(
+            covers_all_slots = expert_mask is None and num_local_tokens is None
+            partials = (torch.empty if covers_all_slots else torch.zeros)(
                 (token_num, topk, model_dim),
-                dtype=dtypes.bf16,
+                dtype=moe_buf.dtype,
                 device=moe_buf.device,
             )
             aiter.fmoe_g1u1(
@@ -3496,7 +3487,6 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
-    has_a2_scale=False,
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
@@ -3803,51 +3793,22 @@ def get_2stage_cfgs(
                     "incomplete metadata"
                 )
 
-    if cfg is not None and cfg.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE:
-        post_reduce_supported = (
-            gfx == "gfx950"
-            and dtype == dtypes.bf16
-            and inter_dim == 256
-            and model_dim >= 512
-            and model_dim % 256 == 0
-            and 0 < topk <= min(127, expert)
-            and 0 < token < (1 << 24)
-            and q_dtype_a == dtypes.fp4x2
-            and q_dtype_w == dtypes.fp4x2
-            and q_type == QuantType.per_1x32
-            and q_dtype_a2 in (None, dtypes.fp4x2)
-            and activation == ActivationType.Silu
-            and use_g1u1
-            and gate_mode == GateMode.SEPARATED
-            and (gate_up_interleave is None or gate_up_interleave is False)
-            and opus_weights_shuffled
-            and not (
-                is_ep
-                or doweight_stage1
-                or hidden_pad
-                or intermediate_pad
-                or has_stage1_bias
-                or has_stage2_bias
-                or has_stage2_scatter
-                or has_num_local_tokens
-                # These producers requantize their hidden values internally.
-                or has_a2_scale
-                or swiglu_limit
-            )
-            and situ_beta == 1.0
-            and situ_linear_beta == 1.0
-            and cfg.get("run_1stage", False)
-            and cfg.get("block_m") == 256
-            and not (cfg.get("ksplit", 0) or cfg.get("xbf16", False))
+    if (
+        cfg is not None
+        and cfg.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE
+        and (
+            gate_mode != GateMode.SEPARATED
+            or gate_up_interleave is True
+            or not opus_weights_shuffled
         )
-        if not post_reduce_supported:
-            if config_file is not None:
-                raise ValueError("Unsupported post-reduction fused MoE configuration")
-            cfg = None
-            logger.warning(
-                "[fused_moe] discarding incompatible automatic post-reduction config; "
-                "using default heuristics"
-            )
+    ):
+        if config_file is not None:
+            raise ValueError("Post-reduction requires separated, shuffled weights")
+        cfg = None
+        logger.warning(
+            "[fused_moe] discarding post-reduction config for incompatible weight layout; "
+            "using default heuristics"
+        )
 
     if cfg is not None and _is_mxfp4_kname(kn1):
         parsed_g1 = _parse_mxfp4_g1_kname(kn1)
@@ -4173,7 +4134,6 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
             flat=cfg_flat,
-            output_aux=(AUX_SORT_OPUS if cfg_flat is AsmMoeMode.POST_REDUCE else False),
             **route_bucket_metadata,
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
@@ -4843,7 +4803,6 @@ def fused_moe_2stages(
         gate_up_interleave=getattr(w1, "gate_up_interleave", None),
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
-        has_a2_scale=a2_scale is not None,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
