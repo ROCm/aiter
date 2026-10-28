@@ -1403,6 +1403,9 @@ def build_module(
             flags_hip += [
                 "-mllvm -amdgpu-early-inline-all=true",
                 "-mllvm -amdgpu-function-calls=false",
+                # Newer LLVM won't inline across differing target features, as in CK-tile's
+                # target("no-packed-fp32-ops") kentry. The flag changes nothing on older LLVM.
+                "-mllvm -ignore-tti-inline-compatible=true",
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
