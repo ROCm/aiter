@@ -928,6 +928,115 @@ def _check_fused_cuda_graph_replay_safe(experts, topk, block_size):
     torch.testing.assert_close(fused[4], torch.zeros_like(fused[4]))
 
 
+# ---------------------------------------------------------------------------
+# BM16 inline-quant aux sort (`_adaptive_moe_sort`) with `num_local_tokens`.
+#
+# A caller that pads its rows (ATOM's CUDA-graph decode) routes the rows past
+# its real count to expert -1 and passes the count on device. Only the leading
+# rows may enter the sort, and the result must be what a sort over those rows
+# alone produces, with the pad rows' reverse_sorted routes at -1.
+# ---------------------------------------------------------------------------
+# (experts, topk, model_dim): Qwen3.8-Flash-Next TP1 and Kimi-K3 TP1/2.
+_INLINE_SORT_SHAPES = ((513, 11, 2560), (896, 16, 3584))
+
+
+def _run_inline_sort(topk_ids, topk_weights, experts, model_dim, num_local_tokens):
+    return fused_moe._adaptive_moe_sort(
+        topk_ids,
+        topk_weights,
+        experts,
+        topk_ids.shape[1],
+        16,
+        model_dim,
+        atomic=True,
+        emit_aux=True,
+        num_local_tokens=num_local_tokens,
+    )
+
+
+def _padded_routes(tokens, valid, experts, topk):
+    _, topk_ids, topk_weights = _make_fused_inputs(tokens, experts, topk)
+    topk_ids[valid:] = -1
+    topk_weights[valid:] = float("nan")
+    return topk_ids, topk_weights
+
+
+def _inline_sort_entries(result, pad_token):
+    """Routed entries; padding slots point at ``pad_token``."""
+    ids, weights, experts, num_valid = result[:4]
+    counts = torch.tensor([int(num_valid[0].item()), pad_token], dtype=torch.int32)
+    return _canonical_entries(ids, weights, experts, counts, 16)
+
+
+def _check_inline_sort_routes(result, tokens, valid, topk):
+    ids, _, _, num_valid, moe_buf, m_indices, reverse = result
+    assert int(num_valid[1].item()) == valid
+    torch.testing.assert_close(moe_buf, torch.zeros_like(moe_buf))
+    assert (reverse[valid * topk : tokens * topk] == -1).all()
+    routes = torch.arange(valid * topk, dtype=torch.int32, device="cuda")
+    slots = reverse[: valid * topk].long()
+    assert torch.equal(ids[slots] & 0x00FFFFFF, routes // topk)
+    assert torch.equal(ids[slots] >> 24, routes % topk)
+    assert torch.equal(m_indices[slots], routes // topk)
+    rows = m_indices[: int(num_valid[0].item())]
+    assert ((rows < valid) | (rows == tokens)).all()
+
+
+def _check_inline_sort_num_local_tokens(experts, topk, model_dim, tokens, valid):
+    topk_ids, topk_weights = _padded_routes(tokens, valid, experts, topk)
+    count = torch.tensor([valid], dtype=torch.int32, device="cuda")
+    result = _run_inline_sort(topk_ids, topk_weights, experts, model_dim, count)
+    _check_inline_sort_routes(result, tokens, valid, topk)
+    if valid == 0:
+        assert int(result[3][0].item()) == 0
+        return
+    ref = _run_inline_sort(
+        topk_ids[:valid].contiguous(),
+        topk_weights[:valid].contiguous(),
+        experts,
+        model_dim,
+        None,
+    )
+    assert _inline_sort_entries(result, tokens) == _inline_sort_entries(ref, valid)
+    assert int(result[3][0].item()) == int(ref[3][0].item())
+
+
+def _check_inline_sort_graph_replay(experts, topk, model_dim, tokens=32):
+    """A captured sort reads the count on every replay."""
+    topk_ids, topk_weights = _padded_routes(tokens, tokens, experts, topk)
+    count = torch.tensor([tokens], dtype=torch.int32, device="cuda")
+    _run_inline_sort(topk_ids, topk_weights, experts, model_dim, count)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = _run_inline_sort(topk_ids, topk_weights, experts, model_dim, count)
+    for valid in (tokens, 7, 1, 19):
+        padded, padded_weights = _padded_routes(tokens, valid, experts, topk)
+        topk_ids.copy_(padded)
+        topk_weights.copy_(padded_weights)
+        count.fill_(valid)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_inline_sort_routes(result, tokens, valid, topk)
+        ref = _run_inline_sort(
+            topk_ids[:valid].contiguous(),
+            topk_weights[:valid].contiguous(),
+            experts,
+            model_dim,
+            None,
+        )
+        assert _inline_sort_entries(result, tokens) == _inline_sort_entries(ref, valid)
+
+
+if _running_on_gfx950():
+    for E, topk, model_dim in _INLINE_SORT_SHAPES:
+        if not fused_moe._mxfp4_aux_instance_supported(E, topk, model_dim, 16, True):
+            continue
+        for tokens, valid in ((1, 1), (4, 0), (4, 3), (16, 5), (48, 47), (48, 48)):
+            _check_inline_sort_num_local_tokens(E, topk, model_dim, tokens, valid)
+        _check_inline_sort_graph_replay(E, topk, model_dim)
+        aiter.logger.info("inline-sort num_local_tokens OK: E=%d topk=%d", E, topk)
+
 if _running_on_gfx950():
     _check_fused_gate()
     _check_fused_gate_uses_runtime_arch()
