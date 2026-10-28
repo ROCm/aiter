@@ -18,6 +18,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_num_xcds
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from .tensor_shim import _run_compiled
@@ -33,13 +34,12 @@ K_TILE_GRAN = 32  # MFMA K-tile loop uses BLOCK_K // 32 stages
 
 _DEFAULT_STREAM = fx.Stream(None)
 
-NXCD = 8
 XCD_W = 8
 XCD_C_SMALL_K = 32
 XCD_C_LARGE_K = 120
 
 
-def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
+def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD):
     xy = fx.Int32(xy)
     cnXCD = fx.Int32(nXCD)
     cC = fx.Int32(C)
@@ -81,7 +81,8 @@ def _build_launcher(
     THREADS,
     XCD_C,
     XCD_W,
-    COMPACT=False,
+    COMPACT,
+    NXCD,
 ):
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
     smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
@@ -112,7 +113,9 @@ def _build_launcher(
             if fx.const_expr(XCD_C > 1):
                 grid_x = fx.Int32(fx.grid_dim.x)
                 raw_xy = fx.Int32(raw_b) * grid_x + fx.Int32(pid_mn)
-                tile_row, n_col = _xcd_remap(raw_xy, grid_x, N_BLOCKS, XCD_C, XCD_W)
+                tile_row, n_col = _xcd_remap(
+                    raw_xy, grid_x, N_BLOCKS, XCD_C, XCD_W, NXCD
+                )
                 tile_row = fx.Int32(fx.rocdl.readfirstlane(T.i32, tile_row))
                 block_n_idx = fx.Int32(fx.rocdl.readfirstlane(T.i32, n_col))
             else:
@@ -143,7 +146,7 @@ def _build_launcher(
             bm_tiles = grid_x // fx.Int32(N_BLOCKS)
             num_rows = bm_tiles * fx.Int32(fx.grid_dim.z)
             raw_xy = fx.Int32(raw_b) * grid_x + fx.Int32(pid_mn)
-            row, col = _xcd_remap(raw_xy, num_rows, N_BLOCKS, XCD_C, XCD_W)
+            row, col = _xcd_remap(raw_xy, num_rows, N_BLOCKS, XCD_C, XCD_W, NXCD)
             row = fx.Int32(fx.rocdl.readfirstlane(T.i32, row))
             col = fx.Int32(fx.rocdl.readfirstlane(T.i32, col))
 
@@ -210,9 +213,8 @@ def _build_launcher(
             uni_copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
             buffer_copy_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
 
-            thr_copy_s2r_A = fx.make_tiled_copy_A(
-                buffer_copy_128b, tiled_mma
-            ).get_slice(tid)
+            tiled_copy_s2r_A = fx.make_tiled_copy_A(uni_copy_128b, tiled_mma)
+            thr_copy_s2r_A = tiled_copy_s2r_A.get_slice(tid)
             thr_copy_g2r_B = fx.make_tiled_copy_B(
                 buffer_copy_128b, tiled_mma
             ).get_slice(tid)
@@ -252,7 +254,7 @@ def _build_launcher(
                         soffset=fx.Int32(a_next_k) * gA_k_stride,
                     )
                 if fx.const_expr(b_next_k is not None):
-                    b_fetch_slot = (b_read_slot + 2) % B_STAGES
+                    b_fetch_slot = (b_read_slot + B_STAGES - 1) % B_STAGES
                     fx.copy(
                         buffer_copy_128b,
                         thr_gB_k[None, None, None, 0],
@@ -492,7 +494,7 @@ def jagged_dense_bmm(
     else:
         grid_m = (max_seq_len + bmn - 1) // bmn
 
-    key = (N, K, bmn, bnn, block_k, nthreads, xcd_c, xcd_w, compact)
+    key = (N, K, bmn, bnn, block_k, nthreads, xcd_c, xcd_w, compact, get_num_xcds())
     launch_args = (
         C,
         A,
