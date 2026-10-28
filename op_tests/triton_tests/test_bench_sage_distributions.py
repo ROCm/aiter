@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import argparse
 import importlib.util
 import os
 import sys
 
 import pytest
 import torch
+
+from op_tests.triton_tests.attention.test_fav3_sage import fp8_max_diff_percentage
 
 """
 Unit coverage for bench_sage's `peaked` and `tiebreak` input distributions.
@@ -107,11 +108,8 @@ def test_tiebreak_keeps_its_own_reference_bound(bench):
     A tie resolved differently moves a whole output row, so reusing a neighbouring distribution's
     bound here would report breakage on the property the generator is built to create.
     """
-    bound = bench.fp8_max_diff_percentage(
-        argparse.Namespace(input_distribution="tiebreak")
-    )
+    bound = fp8_max_diff_percentage("tiebreak")
     others = [
-        bench.fp8_max_diff_percentage(argparse.Namespace(input_distribution=name))
-        for name in ("normal", "diffusion", "peaked")
+        fp8_max_diff_percentage(name) for name in ("normal", "diffusion", "peaked")
     ]
     assert bound > max(others), f"tiebreak {bound} vs {others}"

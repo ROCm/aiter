@@ -80,6 +80,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.triton_tests.attention.test_fav3_sage import (
     check_attention_outputs,
     compare_accuracy,
+    fp8_max_diff_percentage,
 )
 
 logging.getLogger().setLevel(logging.INFO)
@@ -1643,27 +1644,13 @@ def compute_accuracy_metrics(
     )
 
 
-def fp8_max_diff_percentage(args: argparse.Namespace) -> float:
-    # tiebreak diverges from the BF16 reference by construction, so closeness to BF16 is not the
-    # property under test; this bound is only a backstop against gross breakage.
-    if args.input_distribution == "tiebreak":
-        return 25.0
-    # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
-    if args.input_distribution in (
-        "transformer",
-        "sink",
-        "diffusion",
-        "kcommon",
-    ) or str(args.input_distribution).startswith("dump:"):
-        return 2.0
-    return 0.5
-
-
-def check_output_against_reference(
+def report_quality_against_reference(
     args: argparse.Namespace,
     current: torch.Tensor,
     reference: torch.Tensor,
 ) -> None:
+    # Quality is the second axis of the tradeoff this bench measures, so it is reported, not
+    # enforced. `--strict` turns it into a gate for local bisects; CI enforces it from the tests.
     if os.environ.get("DUMP_PROBE"):
         torch.save(
             {
@@ -1675,18 +1662,25 @@ def check_output_against_reference(
         print(f"[DUMP_PROBE] saved to {os.environ['DUMP_PROBE']}")
     n_nan = int(torch.isnan(current).sum().item())
     n_inf = int(torch.isinf(current).sum().item())
-    if n_nan or n_inf:
+    finite = not (n_nan or n_inf)
+    print(
+        f"[NAN-CHECK] {'PASS' if finite else 'FAIL'} kernel={args.kernel} "
+        f"nan={n_nan} inf={n_inf}"
+    )
+    compare_accuracy(current, reference)
+
+    if not args.strict:
+        return
+    if not finite:
         raise AssertionError(
             f"non-finite output from {args.kernel}: nan={n_nan}, inf={n_inf}"
         )
-    print(f"[NAN-CHECK] PASS kernel={args.kernel} (output finite)")
-    compare_accuracy(current, reference)
     if KERNEL_SPECS[args.kernel].quantized:
         check_attention_outputs(
             current,
             reference,
             fp8=True,
-            max_diff_percentage=fp8_max_diff_percentage(args),
+            max_diff_percentage=fp8_max_diff_percentage(args.input_distribution),
         )
     else:
         check_attention_outputs(current, reference, fp8=False)
@@ -1835,11 +1829,11 @@ def benchmark_single_case(
     )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
-    if args.compare_to_ref:
+    if args.report_quality:
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
-        check_output_against_reference(args, current_primary, ref_primary)
+        report_quality_against_reference(args, current_primary, ref_primary)
 
     total_flops = (
         2.0
@@ -1882,7 +1876,7 @@ def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> list[
         "sparseput": "sparse_throughput(TFLOPS)",
     }
 
-    if args.compare_to_ref:
+    if args.report_quality:
         return ["time(ms)"]
 
     if args.metric == "all":
@@ -2467,9 +2461,16 @@ def parse_args() -> argparse.Namespace:
         help="Reference kernel for accuracy metrics/checks. --kernel=all reports MAE/MaxE/Cosine against this reference.",
     )
     parser.add_argument(
+        "--report-quality",
         "--compare-to-ref",
+        dest="report_quality",
         action="store_true",
-        help="Run correctness checks against the selected --ref",
+        help="Report MAE/MaxE/Cosine against the selected --ref alongside the timing",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Make --report-quality fail the run when it exceeds its bound",
     )
 
     parser.add_argument(

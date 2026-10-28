@@ -353,6 +353,24 @@ def check_attention_outputs(
         )
 
 
+def fp8_max_diff_percentage(input_distribution: str) -> float:
+    # tiebreak diverges from the BF16 reference by construction, so closeness to BF16 is not the
+    # property under test; this bound is only a backstop against gross breakage.
+    if input_distribution == "tiebreak":
+        return 25.0
+    # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
+    if input_distribution in (
+        "transformer",
+        "sink",
+        "diffusion",
+        "kcommon",
+    ) or str(
+        input_distribution
+    ).startswith("dump:"):
+        return 2.0
+    return 0.5
+
+
 def input_helper(
     BATCH,
     HQ,
