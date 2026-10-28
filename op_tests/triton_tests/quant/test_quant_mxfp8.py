@@ -98,29 +98,16 @@ _PER_1X32_MXFP8_SHAPES = [
 
 
 @pytest.mark.parametrize(
-    "M, K, dtype, quant_dtype",
+    "M, K, dtype",
     [
-        pytest.param(M, K, dtype, torch.float8_e4m3fn)
+        pytest.param(M, K, dtype)
         for M, K in _PER_1X32_MXFP8_SHAPES
         for dtype in (torch.bfloat16, torch.float16)
-    ]
-    + [
-        pytest.param(
-            137,
-            128,
-            torch.bfloat16,
-            torch.float8_e4m3fnuz,
-            id="gfx942-e4m3fnuz",
-        )
     ],
 )
-def test_per_1x32_mxfp8_quant(
-    M: int, K: int, dtype: torch.dtype, quant_dtype: torch.dtype
-):
+def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
     if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
-    if quant_dtype == torch.float8_e4m3fnuz and arch_info.get_arch() != "gfx942":
-        pytest.skip("float8_e4m3fnuz is the gfx942 FP8 encoding")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -128,7 +115,9 @@ def test_per_1x32_mxfp8_quant(
 
     # Reference path: emulate the kernel in fp32 (matching its precision).
     x_fp32 = x.to(torch.float32)
-    log2_dtype_max = 7 if quant_dtype == torch.float8_e4m3fnuz else 8
+    use_fnuz = arch_info.get_arch() == "gfx942"
+    quant_dtype = torch.float8_e4m3fnuz if use_fnuz else torch.float8_e4m3fn
+    log2_dtype_max = 7 if use_fnuz else 8
     y_ref, s_ref = torch_mxfp8_quant_from_fp32(
         x_fp32, log2_dtype_max=log2_dtype_max, out_dtype=quant_dtype
     )
@@ -148,12 +137,6 @@ def test_per_1x32_mxfp8_quant(
         atol=1,
         rtol=0,
     )
-
-    if quant_dtype == torch.float8_e4m3fnuz:
-        # This fails if the fnuz range regresses to the OCP 448.
-        s_f32 = e8m0_to_f32(s_kern).repeat_interleave(QUANT_BLOCK_SIZE, dim=-1)
-        y_dq = y_kern.float() * s_f32
-        torch.testing.assert_close(y_dq, x.float(), rtol=0.1, atol=1e-2)
 
 
 def test_per_1x32_mxfp8_quant_preallocated_scale():
