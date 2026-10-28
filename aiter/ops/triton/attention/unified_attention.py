@@ -850,9 +850,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     elif params.spec_decode:
         # only the seqs with q rows behind them; the trailing pad seqs of a
         # DP-padded batch have none (and seqused_k == 0)
-        total_query_blocks = min(
-            NUM_SEQS, params.num_tokens // SEQLEN_Q
-        ) * triton.cdiv(SEQLEN_Q, BLOCK_Q)
+        total_query_blocks = min(NUM_SEQS, params.num_tokens // SEQLEN_Q) * triton.cdiv(
+            SEQLEN_Q, BLOCK_Q
+        )
     else:
         total_query_blocks = params.num_tokens // BLOCK_Q + NUM_SEQS
 
