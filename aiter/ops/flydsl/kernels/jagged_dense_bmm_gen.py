@@ -20,7 +20,6 @@ from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from ._buffer_utils import make_bounded_buffer_tensor
 from .tensor_shim import _run_compiled
 
 BLOCK_M = 128
@@ -173,9 +172,14 @@ def _build_launcher(
                 fx.get_layout(B),
             )
 
-            A_buf = make_bounded_buffer_tensor(A_g, fx.Int64(M_b * K * 2))
+            # Rows >= M_b fall outside num_records: loads read 0, stores drop.
+            A_buf = fx.rocdl.make_buffer_tensor(
+                A_g, num_records_bytes=fx.Int64(M_b) * fx.Int64(K * 2)
+            )
             B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
-            C_buf = make_bounded_buffer_tensor(C_g, fx.Int64(M_b * N * 2))
+            C_buf = fx.rocdl.make_buffer_tensor(
+                C_g, num_records_bytes=fx.Int64(M_b) * fx.Int64(N * 2)
+            )
 
             gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[
                 None, None, block_m_idx, None
