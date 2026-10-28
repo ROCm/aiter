@@ -98,21 +98,23 @@ ARG AITER_DIR=/opt/aiter
 # the runtime image, and changing them reruns only the compile steps.
 ARG AITER_BUILD_JOBS=64
 
-# Build options for MI350P
+# Build options. The defaults are MI350P's. For MI350X:
+#   --build-arg AITER_CU_NUM=256 --build-arg AITER_NUM_XCDS=8
 ARG AITER_GPU_ARCH=gfx950
 ARG AITER_CU_NUM=128
+ARG AITER_NUM_XCDS=4
 
 # Code generators run as subprocesses and `import aiter` for the XCD count. The
 # base image ships its own, older aiter in site-packages, which they would find
-# instead of /opt/aiter. Check up front that the merged tree is imported and 
-# yields MI350P's 4. The wheel build below sets the same PYTHONPATH and AITER_AOT_IMPORT.
+# instead of /opt/aiter. Check up front that the merged tree is imported and
+# yields the target's XCD count (MI350P: 4, MI350X: 8). The wheel build below sets the same PYTHONPATH and AITER_AOT_IMPORT.
 RUN cd "${AITER_DIR}" \
     && PYTHONPATH="${AITER_DIR}" AITER_AOT_IMPORT=1 \
        GPU_ARCHS="${AITER_GPU_ARCH}" CU_NUM="${AITER_CU_NUM}" \
        python3 -c "import aiter; from aiter.jit.utils.build_targets import build_num_xcds as n; \
 assert aiter.__file__.startswith('${AITER_DIR}/'), aiter.__file__; \
 print('aiter from', aiter.__file__, '- XCDs:', n('${AITER_GPU_ARCH}')); \
-assert n('${AITER_GPU_ARCH}') == 4"
+assert n('${AITER_GPU_ARCH}') == ${AITER_NUM_XCDS}"
 
 # FlyDSL AOT first, as its own layer: setup.py runs the same step again below and
 # finds the kernels already in the cache, so a CK/HIP failure does not redo it.

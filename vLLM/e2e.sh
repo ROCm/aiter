@@ -4,15 +4,23 @@
 #
 #   ./e2e.sh build             # build both images from ./Dockerfile
 #   ./e2e.sh build-fork        # build IMAGE_FORK: IMAGE_B + the vLLM fork's prefill dispatch
+#   ./e2e.sh build-eval        # build IMAGE_B and IMAGE_FORK, the images "eval" needs
 #   ./e2e.sh check             # preflight: images, vLLM all-reduce path, model
 #   ./e2e.sh run               # check, then the A/B benchmark, then the summary
 #   ./e2e.sh run3              # the same for the 3 arms in ARMS3 (needs build-fork)
 #   ./e2e.sh profile           # check, then one torch-profiled run per server
 #   ./e2e.sh smoke             # check, then only start each server, smoke-test it, stop it
+#   ./e2e.sh eval              # check, then the accuracy eval (lm-eval) of the arms in ARMS_EVAL
 #   ./e2e.sh summary <dir>     # summary table of a finished run
+#   ./e2e.sh eval-summary <dir> # accuracy table of a finished eval run
 #   ./e2e.sh all               # build + run
 #
 # Settings are environment variables, e.g. TPS="8" ./e2e.sh run. See below.
+# The defaults are for MI350P. On MI350X (8 XCDs, 256 CUs, 252 GiB):
+#   AITER_CU_NUM=256 AITER_NUM_XCDS=8 IMAGE_B=vllm-aiter-ar-mi350x \
+#     IMAGE_FORK=vllm-aiter-ar-prefill-mi350x ./e2e.sh build-eval
+#   IMAGE_FORK=vllm-aiter-ar-prefill-mi350x TPS="4 8" GPU_GIB=252 \
+#     GPU_MEM_UTIL=0.92 MAX_MODEL_LEN=16384 ./e2e.sh eval
 #
 # For every (TP, image) "run" starts one server, checks that it answers,
 # records which all-reduce path vLLM took, runs the benchmark scenarios and
@@ -42,6 +50,20 @@ ARMS=${ARMS:-"main,$IMAGE_A ar,$IMAGE_B"}
 # no stock-QuickReduce arm: vLLM's HIP QuickReduce is disabled on PCIe-only GPUs
 # above TP2 (it needs xGMI), as on this box.
 ARMS3=${ARMS3:-"base,$IMAGE_A fork,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=0 flyqr,$IMAGE_FORK"}
+# The accuracy eval: the same image with and without INT4 quick-reduce. exact
+# turns quick-reduce off, so every all-reduce is exact (aiter's CustomAllreduce,
+# FlyDSL one-shot included). flyqr is the image as built: the FlyDSL INT4 mesh/ring
+# serves plain all-reduce, and the quantized fused AR+RMSNorm serves its own
+# windows. Add a second exact arm (e.g. exact2) to measure run-to-run noise.
+ARMS_EVAL=${ARMS_EVAL:-"exact,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=NONE,AITER_QUICK_REDUCE_QUANTIZATION=NONE flyqr,$IMAGE_FORK"}
+# lm-eval settings for "eval". The concurrency sets the decode batch: one
+# DeepSeek V4 token is 14 KiB of all-reduce payload, so at 64 concurrent
+# requests a decode step moves up to 896 KiB, inside the FlyDSL INT4 mesh
+# window (from 384 KiB on gfx950/xGMI, 96 KiB on gfx950/PCIe at TP8).
+EVAL_TASKS=${EVAL_TASKS:-gsm8k}
+EVAL_FEWSHOT=${EVAL_FEWSHOT:-5}
+EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-64}
+EVAL_LIMIT=${EVAL_LIMIT:-}            # questions per task; empty = all (quick check: 100)
 # V4-Pro (~830 GiB) fits on 144 GiB GPUs only at TP=8; preflight rejects
 # TPs whose per-GPU weight share does not fit.
 TPS=${TPS:-8}
@@ -83,15 +105,28 @@ stop_server() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 
 cmd_build() {
     log "building $IMAGE_B (main + FlyDSL comm branch)"
-    docker build -t "$IMAGE_B" -f "$HERE/Dockerfile" "$HERE"
+    docker build -t "$IMAGE_B" $(build_args) -f "$HERE/Dockerfile" "$HERE"
     log "building $IMAGE_A (main only)"
-    docker build -t "$IMAGE_A" --build-arg WITH_ALLREDUCE=0 -f "$HERE/Dockerfile" "$HERE"
+    docker build -t "$IMAGE_A" $(build_args) --build-arg WITH_ALLREDUCE=0 -f "$HERE/Dockerfile" "$HERE"
+}
+
+# Target build options for ./Dockerfile; empty = its defaults (MI350P).
+build_args() {
+    [ -n "${AITER_CU_NUM:-}" ] && echo "--build-arg AITER_CU_NUM=$AITER_CU_NUM"
+    [ -n "${AITER_NUM_XCDS:-}" ] && echo "--build-arg AITER_NUM_XCDS=$AITER_NUM_XCDS"
+    return 0
 }
 
 cmd_build_fork() {
-    docker image inspect vllm-aiter-ar >/dev/null 2>&1 || die "vllm-aiter-ar missing: ./e2e.sh build"
-    log "building $IMAGE_FORK (vllm-aiter-ar + vLLM fork)"
-    docker build -t "$IMAGE_FORK" -f "$HERE/Dockerfile.vllm-fork" "$HERE"
+    docker image inspect "$IMAGE_B" >/dev/null 2>&1 || die "$IMAGE_B missing: ./e2e.sh build"
+    log "building $IMAGE_FORK ($IMAGE_B + vLLM fork)"
+    docker build -t "$IMAGE_FORK" --build-arg BASE="$IMAGE_B" -f "$HERE/Dockerfile.vllm-fork" "$HERE"
+}
+
+cmd_build_eval() {
+    log "building $IMAGE_B (main + FlyDSL comm branch)${AITER_CU_NUM:+, CU_NUM=$AITER_CU_NUM}"
+    docker build -t "$IMAGE_B" $(build_args) -f "$HERE/Dockerfile" "$HERE"
+    cmd_build_fork
 }
 
 # ---------------------------------------------------------------- check ----
@@ -134,6 +169,10 @@ cmd_check() {
         if [ "$fly" = 1 ]; then
             in_image "$image" sh -c 'AITER_AOT_IMPORT=1 python3 -c "from aiter.ops.flydsl import allreduce_policy"' \
                 || die "$tag: FlyDSL all-reduce does not import in $image"
+        fi
+        if [ "$MODE" = eval ]; then
+            in_image "$image" test -x /opt/lm-eval/bin/lm_eval \
+                || die "$tag: $image has no lm-eval: ./e2e.sh build-fork"
         fi
     done
 
@@ -327,6 +366,7 @@ run_one() {  # image tag tp [VAR=value...]
     case "$MODE" in
         profile) bench 60000 100 4 "$out" --profile || log "profile run FAILED" ;;
         bench) run_scenarios "$out" ;;
+        eval) run_eval "$out" ;;
         smoke) ;;
     esac
     record_ar_path "$out"   # again: the fused engines may log after warmup
@@ -346,6 +386,33 @@ run_scenarios() {  # out_dir
             fi
         done
     done
+}
+
+run_eval() {  # out_dir
+    # lm-eval runs in the server's container, against its completions API.
+    # Greedy (the tasks' defaults). The server may be offline; lm-eval needs the
+    # hub only for the datasets, cached per arm under CACHE_ROOT.
+    local out=$1
+    log "quick-reduce in the server: $(docker exec "$NAME" sh -c \
+        'echo "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=$VLLM_ROCM_QUICK_REDUCE_QUANTIZATION, VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=$VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL, AITER_FLY_AR=$AITER_FLY_AR"')"
+    log "eval $EVAL_TASKS, ${EVAL_FEWSHOT}-shot, concurrency $EVAL_CONCURRENCY${EVAL_LIMIT:+, limit $EVAL_LIMIT}"
+    docker exec \
+        -e HF_HUB_OFFLINE=0 -e HF_DATASETS_OFFLINE=0 -e HF_ALLOW_CODE_EVAL=1 \
+        "$NAME" /opt/lm-eval/bin/lm_eval \
+        --model local-completions \
+        --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/completions,num_concurrent=$EVAL_CONCURRENCY,max_retries=3,timeout=3600,tokenized_requests=False,tokenizer_backend=None" \
+        --tasks "$EVAL_TASKS" \
+        --num_fewshot "$EVAL_FEWSHOT" \
+        --batch_size 1 \
+        --seed 15 \
+        ${EVAL_LIMIT:+--limit "$EVAL_LIMIT"} \
+        --output_path /traces/lm_eval \
+        --log_samples \
+        >>"$out/eval.log" 2>&1 \
+        || { log "eval FAILED, see eval.log"; return 0; }
+    # Left where the container wrote it: the directory is root's, so the host
+    # user may not be able to move it.
+    log "eval done (traces/lm_eval): $(grep -E '^\|' "$out/eval.log" | grep -m2 -E 'exact_match|acc' | tr -s ' ' || true)"
 }
 
 cmd_run() {
@@ -368,6 +435,8 @@ cmd_run() {
     done
     if [ "$MODE" = profile ]; then
         log "traces under $RUN_DIR/*/traces"
+    elif [ "$MODE" = eval ]; then
+        run_py e2e_eval_summary.py "$RUN_DIR" | tee "$RUN_DIR/summary.md"
     else
         cmd_summary "$RUN_DIR" | tee "$RUN_DIR/summary.md"
     fi
@@ -381,9 +450,13 @@ run_py() {  # script.py dir: run a helper next to this script on a result dir
     if command -v python3 >/dev/null; then
         python3 "$HERE/$script" "$dir"
     else
-        # The server image has python3; the host may not.
+        # The server images have python3; the host may not. Any built one will do.
+        local image
+        for image in "$IMAGE_A" "$IMAGE_B" "$IMAGE_FORK"; do
+            docker image inspect "$image" >/dev/null 2>&1 && break
+        done
         docker run --rm --entrypoint "" -v "$HERE":/e2e:ro -v "$dir":/r \
-            "$IMAGE_A" python3 "/e2e/$script" /r
+            "$image" python3 "/e2e/$script" /r
     fi
 }
 
@@ -396,12 +469,15 @@ cmd_summary() {  # run_dir
 case "${1:-}" in
     build) cmd_build ;;
     build-fork) cmd_build_fork ;;
+    build-eval) cmd_build_eval ;;
     check) cmd_check ;;
     run) MODE=bench; cmd_run ;;
     run3) MODE=bench; ARMS=$ARMS3; cmd_run ;;
     profile) MODE=profile; cmd_run ;;
     smoke) MODE=smoke; cmd_run ;;
+    eval) MODE=eval; ARMS=$ARMS_EVAL; cmd_run ;;
     summary) cmd_summary "${2:-}" ;;
+    eval-summary) run_py e2e_eval_summary.py "${2:?usage: ./e2e.sh eval-summary <run dir>}" ;;
     all) cmd_build; MODE=bench; cmd_run ;;
-    *) sed -n '2,13p' "$0"; exit 1 ;;
+    *) sed -n '2,22p' "$0"; exit 1 ;;
 esac

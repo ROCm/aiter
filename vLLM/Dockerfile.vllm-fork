@@ -54,4 +54,14 @@ import vllm.envs as e, vllm._aiter_ops, vllm.distributed.device_communicators.qu
 print('fork overlay ok:', open('/opt/vllm-fork-ref').read().strip()); \
 assert e.VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL is True"
 
+# lm-eval for `e2e.sh eval`. Its own venv that sees the system packages: pip
+# adds only what is missing and never upgrades the torch or transformers that
+# vLLM runs with. Some images have no ensurepip, hence the virtualenv fallback.
+ARG LM_EVAL_VERSION=0.4.13
+RUN (python3 -m venv --system-site-packages /opt/lm-eval \
+     || { pip install virtualenv && python3 -m virtualenv --system-site-packages /opt/lm-eval; }) \
+    && /opt/lm-eval/bin/pip install "lm-eval[api]==${LM_EVAL_VERSION}" \
+    && /opt/lm-eval/bin/lm_eval --help >/dev/null \
+    && python3 -c "import vllm; print('vllm', vllm.__version__)"
+
 LABEL vllm.fork.ref="${VLLM_FORK_REF}" vllm.nightly.sha="${VLLM_NIGHTLY_SHA}"
