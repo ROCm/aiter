@@ -28,7 +28,7 @@ Per tile and wave (lane ``l``: ``g = l // 16``, ``s = l % 16``):
   scaleA. The fp8 B operand is NOT contiguous per lane: lane (g, s) holds Q head
   ``s``'s elements ``16g..16g+15`` in bytes 0..15 and ``64+16g..64+16g+15`` in
   bytes 16..31 (measured on gfx950).
-  scaleB is 1.0, so Q is used as stored; ``query_scale`` multiplies the logits.
+  scaleB is 1.0, so Q is used as stored.
 * QK, bf16 Q (reference path): the same K tile widened with
   ``v_cvt_scalef32_pk_bf16_fp4`` (the scale rides in the instruction) and four
   ``mfma_f32_16x16x32_bf16``. Q is never rounded.
@@ -106,7 +106,6 @@ def build_pa_decode_mxfp4(
     block_size: int,
     stage_pages: int,
     q_fp8: bool,
-    has_q_scale: bool,
     out_f16: bool,
     tile_depth: int = DEFAULT_TILE_DEPTH,
     direct: bool = False,
@@ -175,7 +174,6 @@ def build_pa_decode_mxfp4(
         vd_ptr: fx.Pointer,
         vs_ptr: fx.Pointer,
         block_tables_ptr: fx.Pointer,
-        q_scale_ptr: fx.Pointer,
         work_info_ptr: fx.Pointer,
         max_blocks_per_seq: fx.Int32,
         stride_q_row: fx.Int32,
@@ -337,10 +335,6 @@ def build_pa_decode_mxfp4(
                 q_b = _load_q(seq)
 
             scale_log2e = softmax_scale * fx.Float32(LOG2E)
-            if const_expr(has_q_scale):
-                scale_log2e = scale_log2e * fx.Float32(
-                    fx.ptr_load(_gptr(q_scale_ptr, fx.Float32, 4))
-                )
             gpu.barrier()  # staged pages
 
             kd = _gptr(kd_ptr, fx.Int32, 16)
@@ -650,7 +644,6 @@ def build_pa_decode_mxfp4(
         vd_ptr: fx.Pointer,
         vs_ptr: fx.Pointer,
         block_tables_ptr: fx.Pointer,
-        q_scale_ptr: fx.Pointer,
         work_info_ptr: fx.Pointer,
         max_blocks_per_seq: fx.Int32,
         stride_q_row: fx.Int32,
@@ -684,7 +677,6 @@ def build_pa_decode_mxfp4(
                 vd_ptr,
                 vs_ptr,
                 block_tables_ptr,
-                q_scale_ptr,
                 work_info_ptr,
                 max_blocks_per_seq,
                 stride_q_row,
