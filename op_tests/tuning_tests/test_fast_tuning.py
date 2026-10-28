@@ -966,6 +966,28 @@ class TestGfx942CsvTuner(unittest.TestCase):
         bench.interleaved.assert_not_called()
         write_table.assert_not_called()
 
+    def test_hipblaslt_baseline_uses_requested_output_dtype(self):
+        tuner = self._tuner()
+        tensor = mock.MagicMock()
+        tensor.__mul__.return_value = tensor
+        tensor.to.return_value = tensor
+        tensor.float.return_value = tensor
+        tensor.t.return_value = tensor
+        tensor.__matmul__.return_value = tensor
+
+        with (
+            mock.patch.object(tuner.torch, "manual_seed"),
+            mock.patch.object(tuner.torch, "randn", return_value=tensor),
+            mock.patch.object(tuner.torch, "empty") as empty,
+            mock.patch.object(tuner.ShapeBench, "time", return_value=1.0),
+            mock.patch("aiter.hipb_create_extension"),
+            mock.patch("aiter.ops.gradlib._hipb_mm"),
+        ):
+            tuner.ShapeBench(64, 64, 64, tuner.torch.float32, SimpleNamespace())
+
+        self.assertEqual(empty.call_count, 2)
+        self.assertEqual(empty.call_args_list[1].kwargs["dtype"], tuner.torch.float32)
+
     def test_report_only_does_not_query_gpu_architecture(self):
         tuner = self._tuner()
         argv = ["tune_gfx942_csv.py", "--report-only", "--table", "table.csv"]

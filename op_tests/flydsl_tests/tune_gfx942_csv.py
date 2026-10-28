@@ -391,7 +391,7 @@ class ShapeBench:
         self.reference = self.x.float() @ self.w.float().t()
         self.out = torch.empty((m, n), dtype=out_dtype, device="cuda")
         hipb_create_extension()
-        hipb_out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        hipb_out = torch.empty((m, n), dtype=out_dtype, device="cuda")
         self.hipb = lambda: _hipb_mm(
             self.x, self.w.t(), -1, hipb_out, None, None, None, None, False, False
         )
