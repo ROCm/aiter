@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 import aiter
+from aiter import logger
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.comms.all_reduce import all_reduce_free, all_reduce_init
@@ -22,10 +23,8 @@ HIDDEN = 2048
 EPS = 1e-6
 TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
-pytestmark = pytest.mark.skipif(
-    torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250",
-    reason="needs 4 gfx1250 GPUs",
-)
+SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250"
+pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx1250 GPUs")
 
 
 def _inputs(tokens, rank, device):
@@ -77,6 +76,17 @@ def _worker(rank, init_method):
     inboxes, calls = all_reduce_init(group, max(TOKENS) * HIDDEN * 2)
     failures = []
     try:
+        # First, while the inboxes are empty: the call numbers wrap from 2^30 to 1.
+        # Calls of 64 to 67 tokens, so that each call has new inputs.
+        calls[:-1].fill_(2**30 - 2)
+        for i in range(4):
+            x, residual, weight, *ref = _inputs(64 + i, rank, device)
+            outs = all_reduce_rmsnorm_quant(
+                x, residual, weight, EPS, True, i % 2 == 1, group, inboxes, calls
+            )
+            name = f"rank {rank} call {i} at the counter wrap"
+            failures += _compare(name, outs, *ref, tp.device_group)
+
         for quant in (False, True):
             for tokens, (x, residual, weight, *ref) in zip(TOKENS, cases):
                 outs = all_reduce_rmsnorm_quant(
@@ -116,3 +126,10 @@ def test_all_reduce_rmsnorm_quant():
         ]
         failures = [f for r in results for f in r.get(timeout=1800)]
     assert not failures, "\n".join(failures[:20])
+
+
+if __name__ == "__main__":  # CI runs the multi-GPU tests as scripts
+    if SKIP:
+        logger.warning("test_all_reduce_rmsnorm_quant skipped: needs 4 gfx1250 GPUs")
+    else:
+        test_all_reduce_rmsnorm_quant()
