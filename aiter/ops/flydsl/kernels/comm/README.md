@@ -218,7 +218,11 @@ the communicator uses the HIP quick-reduce fused kernel, the
 The fused path has its own policy tables in `allreduce_policy.py`:
 `FUSED_FAMILY_POLICIES` for the windows, and `FUSED_ONESHOT_LADDER`,
 `FUSED_MESH_ST_LADDER`, `FUSED_RING_ST_LADDER` and `FUSED_QR_ROW_ATOMS` for the
-configurations. Above the one-shot window, the exact path declines.
+configurations. Above the one-shot window, the exact path declines. A window
+may have no upper limit, as the one-shot's does on gfx950/PCIe. With
+quantization on, a payload in the mesh or the ring window runs quantized. Any
+other payload runs on the exact one-shot, because the quantized backend has no
+one-shot engine and declines it.
 
 The configuration ladders are read from
 `aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json` when
