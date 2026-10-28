@@ -98,6 +98,16 @@ No performance improvement is claimed by this rebuild. No other user's
 container, GPU clocks, firmware, or workload was modified. All validation uses
 private containers and directories.
 
+## Local kid namespace after the registry migration
+
+The current manifest and all three build-info tables use local kids 496–716 in
+the `a16w16/gfx1250/CU` namespace. The 221 records were matched one-to-one by full
+kernel configuration/symbol; the old global IDs cannot be converted by a single
+offset. Representative mappings are 21016→496, 21063→543, 21105→544,
+21177→596, 21208→612, 21316→715 and 21317→716. CO bytes, filenames and exported
+symbols are unchanged. IDs quoted in the earlier validation logs below refer to
+the historical global namespace used when those runs were performed.
+
 ## Requested ROCm dev-image launch verification
 
 A subsequent native-HIP test was performed on g21-10 in the exact

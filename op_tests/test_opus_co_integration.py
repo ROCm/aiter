@@ -368,7 +368,7 @@ def test_gfx1250_co_kernel_matches_torch(kid, _gfx1250_device, monkeypatch):
     _run_gfx1250_co_case(kid, _gfx1250_device)
 
 
-@pytest.mark.parametrize("kid", (21063, 21105, 21177, 21208, 21316, 21317))
+@pytest.mark.parametrize("kid", (543, 544, 596, 612, 715, 716))
 @pytest.mark.parametrize("case", ("tiny", "one_step", "ring_tail", "steady_tail"))
 @pytest.mark.parametrize("split_k", (0, 1))
 @pytest.mark.parametrize("pad", (0, 8))
