@@ -411,60 +411,77 @@ def _check_prepare_outputs(name, ref, out, b, shape):
 
 
 @torch.no_grad()
+@benchmark()
+def _benchmark_gdn_prepare_merge_precision(hg, h, use_exp2):
+    """Time one correlated-key case and enforce its numerical regression bound."""
+    shape = GDNShape(t=BT, hg=hg, h=h)
+    gen = torch.Generator(device="cuda").manual_seed(2026)
+    base = torch.randn(1, 1, hg, shape.k, device="cuda", generator=gen)
+    k = torch.nn.functional.normalize(
+        base
+        + 0.01 * torch.randn(1, shape.t, hg, shape.k, device="cuda", generator=gen),
+        dim=-1,
+    ).to(dtypes.bf16)
+    v = torch.randn(
+        1, shape.t, h, shape.v, device="cuda", dtype=dtypes.bf16, generator=gen
+    )
+    g = torch.full((1, shape.t, h), -1e-4, device="cuda")
+    beta = torch.full_like(g, 0.999)
+    ref = run_torch_gdn_prepare(
+        k, v, g, beta, use_exp2=use_exp2, output_dtype=dtypes.fp32
+    )
+    candidates = {
+        "prepare_flydsl": lambda: _run_flydsl_prepare(
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens=None,
+            use_exp2=use_exp2,
+            shape=shape,
+            prefill_metadata=None,
+        ),
+    }
+    flops, nbytes = _prepare_work(shape, 1, k.element_size(), use_exp2)
+    ret = {"gfx": get_gfx()}
+    for name, candidate in candidates.items():
+        out, us = run_perftest(candidate, num_iters=PERF_ITERS, num_warmup=PERF_WARMUP)
+        torch.testing.assert_close(out[2], ref[2], atol=1e-6, rtol=1e-5)
+        for tensor, actual, expected in zip(("w", "u"), out[:2], ref[:2]):
+            relative_rms = (
+                ((actual.float() - expected).square().mean() / expected.square().mean())
+                .sqrt()
+                .item()
+            )
+            assert relative_rms < MERGE_REL_RMS_TOL, (
+                f"merge_precision Hg={hg} H={h} exp2={use_exp2}: "
+                f"{tensor} relative RMS error {relative_rms} >= {MERGE_REL_RMS_TOL}"
+            )
+            ret[f"{name} {tensor} relative RMS"] = relative_rms
+        err = _check_prepare_outputs(name, ref, out, 1, shape)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def _run_merge_precision_sweep(use_exp2=(False, True)):
+    rows = [
+        _benchmark_gdn_prepare_merge_precision(hg, h, exp2)
+        for (hg, h), exp2 in itertools.product(((8, 24), (4, 12)), use_exp2)
+    ]
+    if rows:
+        _summarize("gdn_prepare_merge_precision", rows)
+
+
 def test_gdn_prepare_merge_precision():
-    """Correlated keys expose precision lost in off-diagonal inverse merges."""
+    """Pytest entry point for the same timed regression sweep used by the CLI."""
     if get_gfx() not in SUPPORTED_GFX:
         import pytest
 
         pytest.skip("FlyDSL GDN prepare requires gfx942 or gfx950")
-    for hg, h in ((8, 24), (4, 12)):
-        shape = GDNShape(t=BT, hg=hg, h=h)
-        gen = torch.Generator(device="cuda").manual_seed(2026)
-        base = torch.randn(1, 1, hg, shape.k, device="cuda", generator=gen)
-        k = torch.nn.functional.normalize(
-            base
-            + 0.01 * torch.randn(1, shape.t, hg, shape.k, device="cuda", generator=gen),
-            dim=-1,
-        ).to(dtypes.bf16)
-        v = torch.randn(
-            1, shape.t, h, shape.v, device="cuda", dtype=dtypes.bf16, generator=gen
-        )
-        g = torch.full((1, shape.t, h), -1e-4, device="cuda")
-        beta = torch.full_like(g, 0.999)
-
-        for use_exp2 in (False, True):
-            label = f"merge_precision Hg={hg} H={h} exp2={use_exp2}"
-            ref = run_torch_gdn_prepare(
-                k, v, g, beta, use_exp2=use_exp2, output_dtype=dtypes.fp32
-            )
-            out = _run_flydsl_prepare(
-                k,
-                v,
-                g,
-                beta,
-                cu_seqlens=None,
-                use_exp2=use_exp2,
-                shape=shape,
-                prefill_metadata=None,
-            )
-            torch.testing.assert_close(out[2], ref[2], atol=1e-6, rtol=1e-5)
-            for name, actual, expected in zip(("w", "u"), out[:2], ref[:2]):
-                relative_rms = (
-                    (
-                        (actual.float() - expected).square().mean()
-                        / expected.square().mean()
-                    )
-                    .sqrt()
-                    .item()
-                )
-                assert relative_rms < MERGE_REL_RMS_TOL, (
-                    f"{label}: {name} relative RMS error {relative_rms} "
-                    f">= {MERGE_REL_RMS_TOL}"
-                )
-                aiter.logger.info(
-                    "%s: %s relative RMS error %.6g", label, name, relative_rms
-                )
-            _check_prepare_outputs(label, ref, out, 1, shape)
+    _run_merge_precision_sweep()
 
 
 @benchmark()
@@ -1087,7 +1104,7 @@ def main():
         return
 
     _load_kernels()
-    test_gdn_prepare_merge_precision()
+    _run_merge_precision_sweep(args.use_exp2)
     _run_contract_checks()
 
     direct_rows = []
