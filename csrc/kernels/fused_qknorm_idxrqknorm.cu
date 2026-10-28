@@ -554,6 +554,15 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         {
             if(q_fp8_out != nullptr)
             {
+                // Saturate (+-inf too); the compares keep NaN a NaN.
+                const float fp8_max = fp8Max<opus::fp8_t>();
+#pragma unroll
+                for(int i = 0; i < kElemsPerLane; ++i)
+                {
+                    elems[i] = elems[i] > fp8_max    ? fp8_max
+                               : elems[i] < -fp8_max ? -fp8_max
+                                                     : elems[i];
+                }
                 storeCacheElems<scalar_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3>(
                     q_fp8_out + static_cast<int64_t>(token_idx) * nq * kHeadDim +
                         slot * kHeadDim + dim_base,

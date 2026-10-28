@@ -99,8 +99,8 @@ def fused_qknorm_idxrqknorm(
     #   no k_scale/v_scale.
     # index_cache_dtype="mxfp4": index_cache is whole contiguous pages; only the index-K write
     #   changes.
-    # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast (no clamp,
-    #   out of range is NaN), written instead of the bf16 q (as index_q_out).
+    # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast, saturating
+    #   (+-inf too; NaN stays NaN), written instead of the bf16 q (as index_q_out).
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"

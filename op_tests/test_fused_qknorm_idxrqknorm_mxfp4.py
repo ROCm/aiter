@@ -8,7 +8,7 @@ index K, main K and the raw V as uint8 pages of 128 tokens, ``[128 x 64 B e2m1][
 e8m0]`` (8704 B), the low nibble the even element. The judge is the "auto" mode of the SAME
 op: ``per_1x32_f4_quant`` (aiter's torch MXFP4 reference) applied to the rows "auto" writes
 is what the MXFP4 bytes must equal, bit for bit, and every other output must not move.
-An e4m3 ``q_out`` must equal ``bf16(q)`` cast to e4m3 (no clamp: out of range is NaN).
+An e4m3 ``q_out`` must equal ``bf16(q)`` cast to e4m3, saturating at its max.
 """
 
 import argparse
@@ -233,19 +233,26 @@ def test_views_into_one_pool():
 
 @benchmark()
 def test_q_fp8_out(dtype, kv, q_dtype):
-    """An e4m3 q_out gets bf16(q) cast to e4m3 (unit scale, no clamp: values beyond the e4m3
-    range become NaN) and replaces the bf16 q, as an e4m3 index_q_out does: the packed qkv
-    row is not written back either."""
+    """An e4m3 q_out gets bf16(q) cast to e4m3, unit scale and saturating (+-inf too, NaN
+    stays NaN), and replaces the bf16 q: the packed qkv row is not written back either.
+    """
     T = 300
     slots = slot_cases(T)["shuffled"][0]
     qkv, w, cs, pos = make_inputs(T, 1, dtype)
-    inputs = (qkv, w * 5000, cs, pos)  # the norm erases a scaled qkv; scale its weight
+    w = w * 5000  # the norm erases a scaled qkv, so scale its weight to pass 448
+    w[5], w[70] = float("inf"), float("nan")  # and put +-inf and NaN in two columns
+    inputs = (qkv, w, cs, pos)
     qkv = qkv.clone()
     q8 = torch.empty(T, NQ * HD, dtype=q_dtype)
     run_op(inputs, 1, slots, kv, 128, "auto", dtype, q_out=q8)
     q_ref = run_op(inputs, 1, slots, kv, 128, "auto", dtype)["q"]
-    assert (q_ref.float().abs() > FP8_MAX).any()  # some values are out of range
-    assert same(q8, q_ref.float().to(dtypes.fp8))
+    qf = q_ref.float()
+    assert (qf.abs() > FP8_MAX).any() and qf.isinf().any() and qf.isnan().any()
+    want, nan = qf.clamp(-FP8_MAX, FP8_MAX).to(dtypes.fp8), qf.isnan()
+    assert same(q8[~nan], want[~nan])
+    assert (
+        q8.view(dtypes.fp8)[nan].float().isnan().all()
+    )  # NaN stays NaN, its sign is free
     assert torch.equal(inputs[0], qkv)
     return {"result": "PASS"}
 
