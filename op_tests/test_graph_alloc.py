@@ -338,38 +338,52 @@ def test_flydsl_split_k_workspace_survives_graph_replay():
     from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
 
     device = torch.device("cuda:0")
-    stream = torch.cuda.Stream(device=device)
-    m, n, k = 312, 6288, 7168
-    a = torch.randn((m, k), dtype=torch.bfloat16, device=device)
-    b = torch.randn((n, k), dtype=torch.bfloat16, device=device) / k**0.5
-    out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    cases = (
+        (312, 6288, 7168, 320, 192, 7, 4, 4, "ft"),
+        (670, 3584, 7168, 256, 256, 4, 2, 4, "hti"),
+    )
+    for m, n, k, block_m, block_n, split_k, m_waves, n_waves, policy in cases:
+        stream = torch.cuda.Stream(device=device)
+        a = torch.randn((m, k), dtype=torch.bfloat16, device=device)
+        b = torch.randn((n, k), dtype=torch.bfloat16, device=device) / k**0.5
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
 
-    def launch():
-        return flydsl_hgemm(
-            a,
-            b,
+        def launch(
+            a=a,
+            b=b,
             out=out,
-            block_m=320,
-            block_n=192,
-            block_k=64,
-            stages=2,
-            split_k=7,
-            m_waves=4,
-            n_waves=4,
-            k_waves=1,
-            group_m=0,
-            policy="ft",
-        )
+            block_m=block_m,
+            block_n=block_n,
+            split_k=split_k,
+            m_waves=m_waves,
+            n_waves=n_waves,
+            policy=policy,
+        ):
+            return flydsl_hgemm(
+                a,
+                b,
+                out=out,
+                block_m=block_m,
+                block_n=block_n,
+                block_k=64,
+                stages=2,
+                split_k=split_k,
+                m_waves=m_waves,
+                n_waves=n_waves,
+                k_waves=1,
+                group_m=0,
+                policy=policy,
+            )
 
-    with torch.cuda.stream(stream):
-        launch()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
+        with torch.cuda.stream(stream):
             launch()
-    graph.replay()
-    graph.replay()
-    torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                launch()
+        graph.replay()
+        graph.replay()
+        torch.cuda.synchronize()
 
-    ref = torch.mm(a.float(), b.float().t())
-    error = (out.float() - ref).abs().max() / ref.abs().max().clamp(min=1e-8)
-    assert error.item() < 1e-2
+        ref = torch.mm(a.float(), b.float().t())
+        error = (out.float() - ref).abs().max() / ref.abs().max().clamp(min=1e-8)
+        assert error.item() < 1e-2

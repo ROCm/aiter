@@ -43,7 +43,6 @@ def _use_split_k_workspace(m, n, split_k, out_dtype, has_bias, half_tile):
         out_dtype is torch.bfloat16
         and split_k > 1
         and not has_bias
-        and not half_tile
         and split_k * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS
     )
 
@@ -1120,6 +1119,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     param: GemmA16W16Gfx950Param,
 ):
     is_split_k = param.is_split_k
+    atomic_split_k = is_split_k and not param.use_split_k_workspace
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
@@ -1141,7 +1141,7 @@ def gemm_a16w16_hti_gfx950_kernel(
         if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
         else elem_dtype
     )
-    if const_expr(is_split_k):
+    if const_expr(atomic_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
             block_n,
@@ -1185,12 +1185,13 @@ def gemm_a16w16_hti_gfx950_kernel(
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
+    workspace_buf = fx.rocdl.make_buffer_tensor(workspace, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
         bias_buf = None
 
-    if const_expr(is_split_k):
+    if const_expr(atomic_split_k):
         splitk_protocol.init(
             semaphore,
             signal,
@@ -1360,14 +1361,21 @@ def gemm_a16w16_hti_gfx950_kernel(
                         ),
                     )
                     global_offset = global_row * n + global_col
-                    write_cshuffle_vec_to_global(
-                        out,
-                        out_buf,
-                        global_offset,
-                        c_vec,
-                        is_split_k,
-                        param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                    )
+                    if const_expr(param.use_split_k_workspace):
+                        partial_offset = ks_idx * m * n + global_offset
+                        fx.ptr_store(
+                            c_vec,
+                            fx.get_iter(workspace_buf) + partial_offset,
+                        )
+                    else:
+                        write_cshuffle_vec_to_global(
+                            out,
+                            out_buf,
+                            global_offset,
+                            c_vec,
+                            is_split_k,
+                            param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                        )
 
     c00 = make_c_fragment(0, 0)
     c01 = make_c_fragment(0, 1)
@@ -1402,7 +1410,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     async_load_a_to_lds(0, 0, 0)
     async_load_b_to_lds(1, 0, 0)
     async_load_a_to_lds(1, 0, 0)
-    if const_expr(is_split_k):
+    if const_expr(atomic_split_k):
         splitk_protocol.zero_c()
         expected_signal = splitk_protocol.take_ticket(split_k)
         splitk_protocol.publish(expected_signal)
@@ -1519,7 +1527,8 @@ def gemm_a16w16_hti_gfx950_kernel(
         rocdl.s_barrier()
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
-        splitk_protocol.wait_until_initialized(expected_signal)
+        if const_expr(atomic_split_k):
+            splitk_protocol.wait_until_initialized(expected_signal)
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
         store_half_tile_to_global(1, 0)

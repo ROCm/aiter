@@ -140,7 +140,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
         self.assertFalse(
             _use_split_k_workspace(320, 6288, 7, torch.bfloat16, True, False)
         )
-        self.assertFalse(
+        self.assertTrue(
             _use_split_k_workspace(320, 6288, 7, torch.bfloat16, False, True)
         )
 
