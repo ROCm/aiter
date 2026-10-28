@@ -610,6 +610,7 @@ def test_gemm_a16w16_gfx942_split_k_buffers_do_not_retain_streams():
     x, w, ref = _inputs(256, 256, 2048)
     cfg = {"block_m": 64, "block_n": 64, "block_k": 64, "stages": 2, "split_k": 4}
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     y = gemm_a16w16(x, w.t(), layout="nt", user_kwargs=cfg, stream=stream)
     stream.synchronize()
     _assert_close(y, ref, "split-K on a transient stream")
