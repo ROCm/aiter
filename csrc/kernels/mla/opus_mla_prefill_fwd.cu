@@ -76,7 +76,7 @@ static void opus_mla_prefill_split_reduce(const opus_mla_prefill_split_args& spl
     const int S = split.num_splits;
     auto reduce = [&](auto parts) {
         constexpr int PARTS = decltype(parts)::value;
-        aiter::pa_decode_ps_reduce_hip_kernel<D_OUT, float, float, true, 512, 1, PARTS>
+        aiter::pa_decode_ps_reduce_hip_kernel<D_OUT, float, float, true, false, 512, 1, PARTS>
             <<<dim3(N, H, 1), 512, 0, stream>>>(reinterpret_cast<D_OUT*>(out->data_ptr()),
                                                 split.partial_sum,
                                                 split.partial_max,
@@ -92,7 +92,8 @@ static void opus_mla_prefill_split_reduce(const opus_mla_prefill_split_args& spl
                                                 S * H * 512,
                                                 512,
                                                 H * 512,
-                                                0);
+                                                0,
+                                                nullptr);
         HIP_CALL_LAUNCH(hipGetLastError());
     };
     [&]<int... I>(std::integer_sequence<int, I...>) {
