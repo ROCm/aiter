@@ -123,11 +123,32 @@ _ARCH_OVERRIDE_RE = re.compile(r"[a-z][a-z0-9_]*")
 _ARCH_SAFE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+:-]*")
 
 
+@functools.cache
+def get_config_cu_num() -> int | None:
+    """CU count that selects the ``<arch>/<cu_num>cu/`` config folders.
+
+    This is ``device_info.get_num_sms()``: ``chip_info.get_cu_num()`` (which
+    honors the ``CU_NUM`` env override and partition modes), the same value
+    the tuned CSV rows are keyed on. Returns ``None`` when the count cannot be
+    read, so loaders use only the CU-agnostic folders.
+    """
+    try:
+        from aiter.ops.triton.utils.device_info import get_num_sms
+
+        cu_num = get_num_sms()
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(cu_num, bool) or not isinstance(cu_num, int) or cu_num <= 0:
+        return None
+    return cu_num
+
+
 def resolve_config_dir(
     op: str,
     config_name: str,
     backend: str = "triton",
     arch: str | None = None,
+    cu_num: int | None = None,
 ) -> str:
     """Build the directory that holds one config family's JSON files.
 
@@ -156,6 +177,11 @@ def resolve_config_dir(
             -- for loaders that retry under another arch when the running one
             ships no tuned configs (e.g. MHC's documented gfx942 fallback).
             Must match ``[a-z][a-z0-9_]*`` when given.
+        cu_num: when given, build the CU-specific folder
+            ``<configs>/<arch>/<cu_num>cu/<backend>/<op>/<d_type>`` instead,
+            for configs tuned on one CU count (e.g. a gfx1250 DPX partition).
+            Must be a positive int. Loaders that support it probe this folder
+            first and fall back to the CU-agnostic one per file.
 
     Returns:
         The directory path (a plain ``str``). Existence is deliberately not
@@ -198,7 +224,11 @@ def resolve_config_dir(
     assert isinstance(dev, str) and _ARCH_SAFE_RE.fullmatch(
         dev
     ), f"arch_info.get_arch() returned a path-unsafe architecture: {dev!r}"
-    return f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/{op}/{_dtype_dir(config_name)}"
+    assert cu_num is None or (
+        isinstance(cu_num, int) and not isinstance(cu_num, bool) and cu_num > 0
+    ), f"cu_num must be a positive int, got {cu_num!r}"
+    arch_dir = dev if cu_num is None else f"{dev}/{cu_num}cu"
+    return f"{AITER_TRITON_CONFIGS_PATH}/{arch_dir}/{backend}/{op}/{_dtype_dir(config_name)}"
 
 
 def _axis_of(component: str) -> str:

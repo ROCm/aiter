@@ -143,19 +143,28 @@ def ordered(table):
     return {k: table[k] for k in sorted(table, key=rank)}
 
 
-def install(spec, backend, shape_nk, runs_dir):
+def install(spec, backend, shape_nk, runs_dir, cu_dir=False):
     ensure_repo_on_path()
     from aiter.ops.triton.utils import gemm_config_utils
     from aiter.ops.triton.utils._triton import arch_info
-    from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+    from aiter.ops.triton.utils.config_utils import (
+        get_config_cu_num,
+        load_config_json,
+        resolve_config_dir,
+    )
 
     arch = arch_info.get_arch()
     backend = backend or spec.default_backend(arch)
     winners = load_winners(runs_dir, arch, backend, spec, shape_nk)
     if not winners:
         sys.exit(f"no results for {spec.name} {backend} {shape_nk} in {runs_dir}")
+    cu_num = None
+    if cu_dir:
+        cu_num = get_config_cu_num()
+        if cu_num is None:
+            sys.exit("--cu-dir: the CU count of this device cannot be read")
 
-    seed_path, seed = seed_table(spec, backend, shape_nk)
+    seed_path, seed = seed_table(spec, backend, shape_nk, cu_num=cu_num)
     print(f"seeding from {seed_path}")
     # the loader walks the kernel's explicit bounds, else the M_BOUNDS of the file it picks
     bounds = spec.bounds or seed.get("M_BOUNDS") or gemm_config_utils.STANDARD_M_BOUNDS
@@ -176,7 +185,10 @@ def install(spec, backend, shape_nk, runs_dir):
             f"  M={winner.M:<6} {bucket:<12} {winner.record['us']:10.3f} us  {gain:<36} {json.dumps(table[bucket])}"
         )
 
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
+    config_dir = resolve_config_dir(
+        "gemm", spec.config_name, backend=backend, cu_num=cu_num
+    )
+    os.makedirs(config_dir, exist_ok=True)
     target = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"
     previous = Path(target).read_text() if os.path.exists(target) else None
     with open(target, "w") as f:
@@ -210,12 +222,18 @@ def main(argv=None):
     add_shape_args(parser, with_m=False)
     parser.add_argument("--backend", choices=("triton", "gluon"))
     parser.add_argument("--runs-dir", default=os.path.join(HERE, "runs"))
+    parser.add_argument(
+        "--cu-dir",
+        action="store_true",
+        help="install into <arch>/<cu_num>cu/ (this device's CU count) instead of <arch>/",
+    )
     args = parser.parse_args(argv)
     install(
         args.kernel,
         args.backend,
         shape_from_args(args, args.kernel.dims),
         args.runs_dir,
+        cu_dir=args.cu_dir,
     )
     return 0
 

@@ -18,6 +18,7 @@ logger = AiterTritonLogger()
 
 from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
+    get_config_cu_num,
     load_config_json,
     resolve_config_dir,
 )
@@ -35,6 +36,7 @@ def _get_gemm_config_cached(
     specialized_filename: str | None = None,
     backend: str = "triton",
     B: int | None = None,
+    cu_num: int | None = None,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
@@ -43,7 +45,9 @@ def _get_gemm_config_cached(
 
     Resolves from ``<arch>/<backend>/gemm/<d_type>/`` (prefix-less filenames,
     default named ``DEFAULT.json``). ``backend`` is declared by the caller and
-    defaults to ``"triton"``; there is no cross-backend fallback.
+    defaults to ``"triton"``; there is no cross-backend fallback. With
+    ``cu_num``, each file is first looked up in
+    ``<arch>/<cu_num>cu/<backend>/gemm/<d_type>/``.
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -59,12 +63,28 @@ def _get_gemm_config_cached(
     # <d_type>/ (no arch prefix, default named DEFAULT.json); the shared path
     # builder lives in resolve_config_dir().
     cfg_dir = resolve_config_dir("gemm", config_name, backend=backend)
+    # Configs tuned on one CU count live in <arch>/<cu_num>cu/ and win file by
+    # file; a file missing there comes from the CU-agnostic folder, the same
+    # way a tuned CSV row is matched on its exact cu_num.
+    cfg_dirs = [cfg_dir]
+    if cu_num is not None:
+        cfg_dirs.insert(
+            0, resolve_config_dir("gemm", config_name, backend=backend, cu_num=cu_num)
+        )
+
+    def _load_first(fname: str) -> dict | None:
+        for d in cfg_dirs:
+            config = load_config_json(f"{d}/{fname}", required=False)
+            if config is not None:
+                return config
+        return None
 
     # Load default config (must exist)
-    default_fpath = f"{cfg_dir}/DEFAULT.json"
-    config_dict = load_config_json(default_fpath, required=False)
+    config_dict = _load_first("DEFAULT.json")
     if config_dict is None:
-        raise AssertionError(f"Required config file doesn't exist: {default_fpath}")
+        raise AssertionError(
+            f"Required config file doesn't exist: {cfg_dir}/DEFAULT.json"
+        )
 
     # Specialized configs override the default; the first existing file wins.
     # A custom specialized_filename (fused kernels with multiple N dims)
@@ -79,9 +99,7 @@ def _get_gemm_config_cached(
 
     tuned_keys = set()
     for suffix in specialized_suffixes:
-        specialized_config = load_config_json(
-            f"{cfg_dir}/{config_name}-{suffix}.json", required=False
-        )
+        specialized_config = _load_first(f"{config_name}-{suffix}.json")
         if specialized_config is not None:
             tuned_keys = set(specialized_config)
             # A tuning-installed file holds only tuned buckets; DEFAULT.json serves the rest.
@@ -156,6 +174,10 @@ def get_gemm_config(
     5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
     6. Fall back to "any" if no bounds match
 
+    Each file in steps 1-3 is read from <arch>/<cu_num>cu/<backend>/gemm/<d_type>/
+    when it exists there (cu_num from get_config_cu_num()), else from
+    <arch>/<backend>/gemm/<d_type>/.
+
     Args:
         config_name: Name of the config (example - "GEMM-A16W16")
         M: M dimension of the GEMM
@@ -173,7 +195,15 @@ def get_gemm_config(
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename, backend, B
+        config_name,
+        M,
+        N,
+        K,
+        bounds,
+        specialized_filename,
+        backend,
+        B,
+        get_config_cu_num(),
     )
     return _copy_gemm_config(config), is_tuned
 

@@ -77,6 +77,11 @@ def parse_args(argv=None):
     )
     parser.add_argument("--runs-dir", default=os.path.join(HERE, "runs"))
     parser.add_argument(
+        "--cu-dir",
+        action="store_true",
+        help="install into <arch>/<cu_num>cu/ (write_best_configs.py --cu-dir)",
+    )
+    parser.add_argument(
         "--batch", type=int, default=100, help="configs per worker process"
     )
     parser.add_argument(
@@ -403,6 +408,8 @@ def install(spec, args, backend, gpu):
     if "B" in spec.dims:
         command += ["--B", str(args.B)]
     command += ["--backend", backend, "--runs-dir", args.runs_dir]
+    if args.cu_dir:
+        command.append("--cu-dir")
     print("\ninstalling:", " ".join(command[1:]), flush=True)
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
     return subprocess.run(command, env=env, check=False).returncode

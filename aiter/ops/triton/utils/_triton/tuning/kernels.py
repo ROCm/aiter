@@ -138,15 +138,25 @@ def resolve_installed(spec, shape, backend):
     )
 
 
-def seed_table(spec, backend, shape_nk):
-    """(path, table) to install into: this shape's own file, else a new DEFAULT_FALLBACK table."""
+def seed_table(spec, backend, shape_nk, cu_num=None):
+    """(path, table) to install into: this shape's own file (the <cu_num>cu/ one first when
+    cu_num is given), else a new DEFAULT_FALLBACK table."""
     from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
     config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
-    path = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"
-    table = load_config_json(path, required=False)
-    if table is not None:
-        return path, table
+    seed_dirs = [config_dir]
+    if cu_num is not None:
+        seed_dirs.insert(
+            0,
+            resolve_config_dir(
+                "gemm", spec.config_name, backend=backend, cu_num=cu_num
+            ),
+        )
+    for seed_dir in seed_dirs:
+        path = f"{seed_dir}/{specialized_filename(spec.config_name, shape_nk)}"
+        table = load_config_json(path, required=False)
+        if table is not None:
+            return path, table
     default_path = f"{config_dir}/DEFAULT.json"
     default = load_config_json(default_path, required=False)
     if default is None:

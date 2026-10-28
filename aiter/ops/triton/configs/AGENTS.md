@@ -15,7 +15,7 @@ rename or tune a config file.
    `json.load(open(...))`, function-attribute caches or paths built by hand
    (`f"{AITER_TRITON_CONFIGS_PATH}/..."`).
 3. Use the one layout below. There are no other config folders and no
-   fallback search.
+   fallback search, except the `<cu_num>cu/` folder below.
 4. Do not put the arch in a file name. The default file is `DEFAULT.json`.
 5. Move or rename files in a pure `git mv` commit. Change the contents in the
    next commit.
@@ -57,6 +57,23 @@ configs/gfx942/triton/mhc/mhc_fused_sinkhorn/MHC_FUSED_SINKHORN-C=128.json
 Two config names must not give the same `<d_type>`: `GEMM-FOO-BAR` and
 `GEMM-FOO_BAR` use the same folder.
 
+### CU-specific GEMM configs
+
+A GEMM config tuned on one CU count, for example a gfx1250 DPX partition
+with 96 CUs, goes in a `<cu_num>cu/` folder under the arch:
+
+```text
+configs/<arch>/<cu_num>cu/<backend>/gemm/<d_type>/<CONFIG_NAME>-<suffix>.json
+configs/gfx1250/96cu/gluon/gemm/gemm_a16w16/GEMM-A16W16-N=7168-K=256.json
+```
+
+`<cu_num>` is `get_config_cu_num()`, which is `chip_info.get_cu_num()` (the
+`CU_NUM` env var overrides it), the same value the tuned CSV rows are keyed
+on. `get_gemm_config()` reads each file (`DEFAULT.json` and the specialized
+files) from the `<cu_num>cu/` folder when it is there, else from the
+CU-agnostic folder. Put a file in `<cu_num>cu/` only when it was tuned on
+that CU count. Only the GEMM loader reads these folders.
+
 ## Loaders
 
 | Module | Functions |
@@ -77,12 +94,15 @@ have a `"dispatch"` list of rules
 (`{"config", "min_K", "min_N", "min_avg_rows_per_group"}`). The first rule
 that matches selects the config.
 
-- `resolve_config_dir(op, config_name, backend="triton", arch=None)` builds
-  the folder path. It does not search and does not check that files exist.
-  It checks each argument and fails with `AssertionError` on a bad value. The
-  caller sets `backend`: Gluon code passes `"gluon"`. Use `arch=` only for the
-  two allowed fallbacks: MHC uses gfx942 and Triton `fused_clamp_act_mul` uses
-  gfx950.
+- `resolve_config_dir(op, config_name, backend="triton", arch=None,
+  cu_num=None)` builds the folder path. It does not search and does not check
+  that files exist. It checks each argument and fails with `AssertionError`
+  on a bad value. The caller sets `backend`: Gluon code passes `"gluon"`. Use
+  `arch=` only for the two allowed fallbacks: MHC uses gfx942 and Triton
+  `fused_clamp_act_mul` uses gfx950. `cu_num=` builds the `<cu_num>cu/`
+  folder.
+- `get_config_cu_num()` returns the CU count for the `<cu_num>cu/` folders,
+  or `None` when it cannot be read. The result is cached.
 - `load_config_json(fpath, required=True)` raises `FileNotFoundError` with the
   path when a required file is missing. With `required=False` it returns
   `None`. The result is cached per path, also when the file is missing:
@@ -112,6 +132,9 @@ get_gemm_config(config_name, M, N=None, K=None, bounds=None,
    it does not have from `DEFAULT.json`.
 3. In the file it tries the `M_LEQ_<x>` keys in increasing order, then
    `"any"`.
+
+Steps 1 and 2 read each file from `<arch>/<cu_num>cu/<backend>/gemm/<d_type>/`
+first (see "CU-specific GEMM configs").
 
 `is_tuned` is `True` only when the bucket that matched comes from the
 specialized file. It is `False` for `"any"` and for a bucket from
