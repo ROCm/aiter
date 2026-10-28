@@ -608,8 +608,9 @@ def mp_tuner(
             f"[Task Grouping] Grouped {len(tasks)} tasks into {len(task_group)} groups by info_keys"
         )
 
-        # in_datas already has one entry per shape from the tuner;
-        # just verify cardinality matches and use it directly.
+        # in_datas has one entry per shape from the tuner, in task order; a
+        # shape without candidates has an entry (count 0) but no group.
+        in_datas = [data for data in in_datas if data[0] > 0]
         assert len(task_group) == len(
             in_datas
         ), f"shape_grouped: group count ({len(task_group)}) != in_datas count ({len(in_datas)})"

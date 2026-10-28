@@ -693,7 +693,10 @@ def _faulting_work_group(
 class TestMpTunerResubmission(unittest.TestCase):
     """mp_tuner's parent loop with an in-process pool."""
 
-    def run_tuner(self, names, work_group=_faulting_work_group, **kwargs):
+    def run_tuner(
+        self, names, work_group=_faulting_work_group, in_datas=None, **kwargs
+    ):
+        """``names`` are candidate names of one shape, or (shape, name) pairs."""
         import queue as queue_module
         from unittest import mock
 
@@ -705,7 +708,11 @@ class TestMpTunerResubmission(unittest.TestCase):
             tuner._TASK_START_TIMES, tuner._TASK_PIDS = start_times, pids
             return _FakePool(submissions)
 
-        tasks = [(("shape", name),) for name in names]
+        tasks = [
+            (name if isinstance(name, tuple) else ("shape", name),) for name in names
+        ]
+        if in_datas is None:
+            in_datas = [(len(tasks), None)]
         with (
             mock.patch.object(tuner.torch.cuda, "device_count", return_value=1),
             mock.patch.object(tuner.mp, "set_start_method"),
@@ -714,9 +721,7 @@ class TestMpTunerResubmission(unittest.TestCase):
             mock.patch.object(tuner, "work_group", work_group),
             mock.patch.object(tuner.time, "sleep"),
         ):
-            results = tuner.mp_tuner(
-                tasks, [(len(tasks), None)], 1, False, True, **kwargs
-            )
+            results = tuner.mp_tuner(tasks, in_datas, 1, False, True, **kwargs)
         self.managers_started = start.call_count
         return results, [[t[0][1] for t in group] for group in submissions]
 
@@ -761,6 +766,26 @@ class TestMpTunerResubmission(unittest.TestCase):
         )
         self.assertEqual(len(submissions), budget)
         self.assertIn("in a row", results[-1][4])
+
+    def test_a_shape_without_candidates_leaves_the_others_their_data(self):
+        names = [("s1", "a"), ("s1", "b"), ("s3", "c")]
+        datas = [(2, "s1 data"), (1, "s3 data")]
+        seen = []
+
+        def recording_work_group(gpu_map, fast, err, in_data, tasks, *rest):
+            shape = tasks[0][0][0]
+            seen.append((shape, in_data[1]))
+            return _faulting_work_group(gpu_map, fast, err, in_data, tasks, *rest)
+
+        for at in range(len(datas) + 1):
+            in_datas = datas[:at] + [(0, "s2 data")] + datas[at:]
+            seen.clear()
+            with self.subTest(empty_shape_at=at):
+                results, _ = self.run_tuner(
+                    names, work_group=recording_work_group, in_datas=in_datas
+                )
+                self.assertEqual([info for info, *_ in results], names)
+                self.assertEqual(seen, [("s1", "s1 data"), ("s3", "s3 data")])
 
 
 if __name__ == "__main__":
