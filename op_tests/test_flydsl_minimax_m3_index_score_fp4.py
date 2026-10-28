@@ -28,13 +28,10 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels import minimax_m3_index_score as fp8_kernel
 from aiter.ops.flydsl.kernels import minimax_m3_index_score_fp4 as kernel
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import benchmark, run_perftest
 from aiter.utility import fp4_utils
 
-try:
-    from op_tests import test_flydsl_minimax_m3_index_score as fp8_test
-except ImportError:  # run as a script from op_tests/
-    import test_flydsl_minimax_m3_index_score as fp8_test
+from op_tests import test_flydsl_minimax_m3_index_score as fp8_test
 
 P, D = fp8_test.P, fp8_test.D
 ATOL, RTOL = fp8_test.ATOL, fp8_test.RTOL
@@ -50,6 +47,7 @@ make_case, GEOM_POINTS, geom_id = (
     fp8_test.GEOM_POINTS,
     fp8_test.geom_id,
 )
+MATRIX = fp8_test.build_matrix()
 QCHUNK = 512  # pages quantized per torch call; the reference makes fp32 temporaries
 
 
@@ -144,9 +142,7 @@ def run_fp4(q, kd, ks, bt, seq, S, H, mb, **kw):
 # ---------------------------------------------------------------------------
 @requires_gfx950
 @pytest.mark.parametrize(
-    "case",
-    fp8_test.build_matrix(),
-    ids=[c[0].replace("fp8", "fp4") for c in fp8_test.build_matrix()],
+    "case", MATRIX, ids=[c[0].replace("fp8", "fp4") for c in MATRIX]
 )
 def test_matches_oracle(case, qdt):
     _, B, S, H, lens, kw = case
@@ -516,13 +512,7 @@ def test_score_fp4(case, B, S, H, lens):
     }
     for name, (run, kbytes) in cands.items():
         got, us = run_perftest(run, num_iters=10, num_rotate_args=1)
-        err = checkAllclose(
-            ref[torch.isfinite(ref)].float(),
-            got[torch.isfinite(ref)].float(),
-            atol=ATOL,
-            rtol=RTOL,
-            tol_err_ratio=0,
-        )
+        err = check_scores(got, ref)
         nbytes = kbytes + q.numel() * 2 + pages * S * H * 4
         ret.update(
             {
