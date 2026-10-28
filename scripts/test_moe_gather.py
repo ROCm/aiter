@@ -56,6 +56,79 @@ def routing(ids, wts, block_m_cap):
     return RoutingData(block_m, gscal, h, E_LOCAL, TOPK, ExptData(h, bufs[0], bufs[1], bufs[2])), gidx, sidx, gvalid, dst
  
  
+def routing_torch(ids, wts, block_m_cap):
+    """Pure-torch equivalent of routing() for reference/debugging."""
+    M = ids.shape[0]
+    n_gates = M * TOPK
+    block_m = max(16, min(triton.next_power_of_2(max(1, n_gates // E)), block_m_cap))
+    lo = RANK * E_LOCAL
+
+    flat_ids = ids.reshape(-1)
+    flat_wts = wts.reshape(-1)
+    gate_indices = torch.arange(n_gates, device=dev, dtype=torch.int32)
+
+    local_eid = (flat_ids - lo).int()
+    valid = (local_eid >= 0) & (local_eid < E_LOCAL)
+
+    # per-expert histogram
+    hist = torch.zeros(E_LOCAL, dtype=torch.int32, device=dev)
+    if valid.any():
+        hist.scatter_add_(0, local_eid[valid].long(), torch.ones(valid.sum(), dtype=torch.int32, device=dev))
+
+    # sort valid gates by local expert (stable preserves intra-expert order)
+    valid_gate_idx = gate_indices[valid]
+    valid_expert = local_eid[valid]
+    order = torch.argsort(valid_expert.long(), stable=True)
+    sorted_gate_idx = valid_gate_idx[order]
+    sorted_wts = flat_wts[valid.nonzero(as_tuple=True)[0][order]]
+
+    # pad each expert to a multiple of block_m
+    padded_hist = ((hist + block_m - 1) // block_m * block_m).int()
+    total_padded = padded_hist.sum().item()
+
+    gidx = torch.zeros(total_padded, dtype=torch.int32, device=dev)
+    gscal = torch.zeros(total_padded, device=dev, dtype=flat_wts.dtype)
+    gvalid_out = torch.zeros(total_padded, dtype=torch.bool, device=dev)
+
+    src_off, dst_off = 0, 0
+    for e in range(E_LOCAL):
+        cnt = hist[e].item()
+        pad = padded_hist[e].item()
+        if cnt > 0:
+            gidx[dst_off:dst_off + cnt] = sorted_gate_idx[src_off:src_off + cnt]
+            gscal[dst_off:dst_off + cnt] = sorted_wts[src_off:src_off + cnt]
+            gvalid_out[dst_off:dst_off + cnt] = True
+            if pad > cnt:
+                gidx[dst_off + cnt:dst_off + pad] = sorted_gate_idx[src_off + cnt - 1]
+        src_off += cnt
+        dst_off += pad
+
+    sidx = gidx.clone()
+    dst = gidx.clone()
+
+    # build ExptData buffers
+    token_offs_raw = torch.zeros(E_LOCAL + 1, dtype=torch.int32, device=dev)
+    token_offs_pad = torch.zeros(E_LOCAL + 1, dtype=torch.int32, device=dev)
+    token_offs_raw[1:] = torch.cumsum(hist, 0)
+    token_offs_pad[1:] = torch.cumsum(padded_hist, 0)
+    token_offs_raw = token_offs_raw[:E_LOCAL]
+    token_offs_pad = token_offs_pad[:E_LOCAL]
+
+    n_blocks_per_expert = padded_hist // block_m
+    total_blocks = n_blocks_per_expert.sum().item()
+    block_pid_map = torch.empty(total_blocks, dtype=torch.int32, device=dev)
+    blk_off = 0
+    for e in range(E_LOCAL):
+        n_blk = n_blocks_per_expert[e].item()
+        for b in range(n_blk):
+            block_pid_map[blk_off] = (e & 0xFFFF) | ((b & 0xFFFF) << 16)
+            blk_off += 1
+
+    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+    rd = RoutingData(block_m, gscal, hist, E_LOCAL, TOPK, expt_data)
+    return rd, gidx, sidx, gvalid_out, dst
+
+
 def moe(x, ids, wts, w1, w2, block_m_cap, in_kernel_gather):
     M = x.shape[0]
     rd, gidx, sidx, gvalid, dst = routing(ids, wts, block_m_cap)
