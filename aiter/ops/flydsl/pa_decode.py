@@ -17,6 +17,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.utility import dtypes
 
 from .kernels.pa_decode_kernel import (
     CLUSTER_PARTITIONS,
@@ -71,12 +72,11 @@ def launch_pa_decode_ps_reduce(
     query_seq_len: int,
     query_group_size: int,
     head_size: int,
-    partition_bound: int,
     max_partitions: int,
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor,
 ) -> None:
-    """Reduce packed partials; every sequence has at most ``partition_bound``."""
+    """Reduce packed partials; every sequence has at most ``max_partitions``."""
     props = torch.cuda.get_device_properties(output.device)
     if max_partitions > props.multi_processor_count:
         raise ImportError(
@@ -90,10 +90,13 @@ def launch_pa_decode_ps_reduce(
     batch, kv_heads = output.shape[0], output.shape[2]
     rows = query_seq_len * query_group_size
     # Exact bounds keep the register ladder short; above a wave a power of two
-    # bounds the specialization count.
-    partitions = min(partition_bound, max_partitions)
+    # bounds the specialization count. Per-sequence buffer bounds zero-fill
+    # partitions beyond the live count, so rounding past the bound is safe.
+    partitions = max_partitions
     if partitions > register_partitions:
-        partitions = min(max_partitions, 1 << (partitions - 1).bit_length())
+        partitions = min(
+            props.multi_processor_count, 1 << (partitions - 1).bit_length()
+        )
     # A per-sequence span <= INT32_MAX keeps every attempted byte offset,
     # including inactive partitions, below 2**32, so out-of-bounds reads
     # cannot wrap back into valid data.
@@ -246,7 +249,7 @@ def pa_decode(
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
     query_length=1. Positive ``sliding_window`` includes each query's own
-    position; 0 and -1 disable it.
+    position; nonpositive values disable it.
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
     calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
@@ -301,8 +304,6 @@ def pa_decode(
         raise NotImplementedError("pa_decode does not support ALiBi")
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
-    if sliding_window < -1:
-        raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
     if not isinstance(query_length, int):
         raise TypeError("query_length must be an int")
@@ -372,18 +373,13 @@ def pa_decode(
         )
 
     arch = get_gfx_runtime()
-    expected_fp8_dtype = {
-        "gfx942": torch.float8_e4m3fnuz,
-        "gfx950": torch.float8_e4m3fn,
-        "gfx1250": torch.float8_e4m3fn,
-    }.get(arch)
-    if expected_fp8_dtype is None:
+    if arch not in ("gfx942", "gfx950", "gfx1250"):
         raise NotImplementedError(
             f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
     is_bf16_kv = key_cache.dtype == torch.bfloat16
     kv_dtype = "bf16" if is_bf16_kv else "fp8"
-    expected_kv_dtype = torch.bfloat16 if is_bf16_kv else expected_fp8_dtype
+    expected_kv_dtype = torch.bfloat16 if is_bf16_kv else dtypes.fp8
     compute_type = key_cache.dtype if compute_type is None else compute_type
     if compute_type != expected_kv_dtype:
         raise NotImplementedError(
@@ -636,8 +632,9 @@ def pa_decode(
     pmax = max_logits
     psum = exp_sums
     pout = temporary_output
-    # Bound the reducer without shrinking the reusable plan or scratch.
-    partition_bound = min(
+    # Bound this call's partitions without shrinking the reusable plan or scratch.
+    max_partitions = min(
+        num_partitions,
         work_plan.capacity,
         max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
     )
@@ -646,7 +643,7 @@ def pa_decode(
         window_tiles = (
             sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
         ) // KV_COMPUTE_BLOCK + 1
-        partition_bound = min(partition_bound, window_tiles)
+        max_partitions = min(max_partitions, window_tiles)
     # gfx1250 tile kernels write final output for one-partition plans and for
     # plans with one task slot per sequence: single tasks store directly, and
     # sequences given slots freed by empty ones merge in their last-arriving
@@ -662,7 +659,7 @@ def pa_decode(
             or (
                 work_plan.capacity == num_seqs
                 and work_plan.arrival_counters is not None
-                and min(partition_bound, num_partitions) <= MERGE_PARTITIONS
+                and max_partitions <= MERGE_PARTITIONS
                 and head_dim <= MERGE_HEAD_DIM
             )
         )
@@ -674,17 +671,16 @@ def pa_decode(
     # stays within the plan's or the default two-per-CU budget. gfx1250 keeps
     # 15 clusters resident per 16 CUs (240 on 256 CUs) whatever their size;
     # later clusters run as a second wave, which is slower than the reducer.
-    cluster_partitions = min(partition_bound, num_partitions)
     cluster_merge = (
-        cluster_partitions
+        max_partitions
         if (
             _CLUSTER_MERGE
             and arch == "gfx1250"
             and not direct_output
             and sinks is None
             and output.stride() == query.stride()
-            and 2 <= cluster_partitions <= CLUSTER_PARTITIONS
-            and num_seqs * cluster_partitions
+            and 2 <= max_partitions <= CLUSTER_PARTITIONS
+            and num_seqs * max_partitions
             <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
             and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
             and head_dim <= MERGE_HEAD_DIM
@@ -854,8 +850,7 @@ def pa_decode(
             query_seq_len=query_length,
             query_group_size=query_group_size,
             head_size=head_dim,
-            partition_bound=partition_bound,
-            max_partitions=num_partitions,
+            max_partitions=max_partitions,
             stream=s,
             reduce_info=work_plan.reduce_info,
         )
