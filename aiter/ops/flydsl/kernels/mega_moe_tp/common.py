@@ -12,8 +12,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
@@ -217,8 +217,8 @@ def _dma(lds_addr, rs, voff, soff, nbytes, aux):
     )
 
 
-def dma16(lds_addr, rs, voff, soff, nt=False):
-    _dma(lds_addr, rs, voff, soff, 16, 2 if nt else 0)
+def dma16(lds_addr, rs, voff, soff, nt=False, aux=None):
+    _dma(lds_addr, rs, voff, soff, 16, aux if aux is not None else (2 if nt else 0))
 
 
 def dma4(lds_addr, rs, voff, soff, sys=False):
@@ -388,6 +388,21 @@ def now():
     )
 
 
+@flyc.jit
+def trace_mark(ctrl, base, k, tid, lead):
+    """Debug (trace builds): thread lead stores its CTA's s_memrealtime (low 32 bits) at
+    ctrl[base + bid * 64 + k]."""
+    if tid == i32(lead):
+        t = fx.Int32(now())
+        slot = i32(base) + i32(gpu.block_id("x")) * i32(64) + i32(k)
+        fx.generic_store(
+            gptr(fx.Int64(ctrl) + fx.Int64(slot * i32(4))),
+            t,
+            memory_order=MONO,
+            syncscope="agent",
+        )
+
+
 def before(cur, target):
     """cur has not reached target. Wrap-safe for int32 launch epochs (serial-number
     order: correct while every compared flag is within 2**31 launches of target)."""
@@ -399,17 +414,17 @@ def alive(t0):
 
 
 @flyc.jit
-def spin_lds_ge(L, off, target):
+def spin_lds_ge(L, off, target, nap=0):
     cur = lds_ld_acq(L, off)
     while cur < target:
-        rocdl.s_sleep(0)
+        rocdl.s_sleep(nap)
         cur = lds_ld_acq(L, off)
 
 
 @flyc.jit
-def spin0(L, lane, off, target):
+def spin0(L, lane, off, target, nap=0):
     if lane == i32(0):
-        spin_lds_ge(L, off, target)
+        spin_lds_ge(L, off, target, nap)
     rocdl.sched_barrier(0)
 
 

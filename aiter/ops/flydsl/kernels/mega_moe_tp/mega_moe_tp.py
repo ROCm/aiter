@@ -33,7 +33,9 @@ from .mega_moe_tp_config import (
     NCHLB_MAX,
     NCTA_MAX,
     NMETA_CAP,
+    SM_PART_BYTES,
     TN_MAX,
+    UL_MAX,
     gemm2_chunk_groups,
     gemm2_group_step,
     mega_moe_tp_consts,
@@ -50,6 +52,10 @@ __all__ = [
 LDS_LIMIT = 160 * 1024
 LB_PF_MAX = 1024
 AG8_MIN = 512
+AR2_MIN = 64
+# global tokens from which the small-M kernel runs (it falls back to the dynamic schedule's
+# fused units in-kernel when the G1 blocks do not fill the CTAs)
+SM_MIN = {"ag_rs": 1, "ar": 1}
 COMM_MODES = ("ag_rs", "ar")
 _ERR_NAMES = (
     (ERR_FLAG, "flag"),
@@ -77,6 +83,8 @@ class LaunchCfg:
     pf: bool = False
     lp: int = 0
     q: int = 0  # LB GEMM2 output split (0: the engine's lb_q)
+    sm: bool = False  # small-M schedule (smallm.py)
+    ar2: bool = False  # ar, LL route rows: two-shot all-reduce (else one-shot)
 
 
 # --- intra-node symmetric memory (hipIpc, via quick_allreduce_int4_ipc) ---------------
@@ -313,6 +321,20 @@ class MegaMoeTPEngine:
             )
         self.mode = comm_mode
         self.check = os.environ.get("AITER_MEGAMOE_TP_CHECK", "0") == "1"
+        # debug: per-CTA phase timestamps after the ctrl block (trace_dump)
+        # (2: the phase marks 0-9 only)
+        self.trace = {"1": 1, "2": 2}.get(os.environ.get("AITER_MEGAMOE_TP_TRACE", "0"), 0)
+        # small-M schedule (fp8 comm, fp4 activations) from SM_MIN global tokens (ag_rs / ar)
+        # up to the dynamic schedule's limit; AITER_MEGAMOE_TP_SMALLM: 0 off, "all" every
+        # dynamic-schedule batch
+        sm_env = os.environ.get("AITER_MEGAMOE_TP_SMALLM", "1")
+        self.sm_min = (
+            DYN_MAX + 1
+            if sm_env == "0"
+            else (
+                1 if sm_env == "all" else SM_MIN["ar" if comm_mode == "ar" else "ag_rs"]
+            )
+        )
         if schedule != "dynamic":
             raise ValueError(f'unknown schedule {schedule!r} (only "dynamic")')
         if act_dtype not in ("fp4", "fp8"):
@@ -352,7 +374,7 @@ class MegaMoeTPEngine:
         self._bind_weights(w1, w1_scale, w2, w2_scale)
 
         props = torch.cuda.get_device_properties(self.device)
-        self.n_cta = int(props.multi_processor_count)
+        self.n_cta = int(os.environ.get("AITER_MEGAMOE_TP_NCTA", props.multi_processor_count))  # (debug)
         if self.n_cta > NCTA_MAX:
             raise ValueError(f"at most {NCTA_MAX} CTAs (flag layout)")
         self.gfx = getattr(props, "gcnArchName", "").split(":")[0]
@@ -399,7 +421,11 @@ class MegaMoeTPEngine:
         self.tn_local = True
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
+        self.ctrl = torch.zeros(
+            CTRL_INTS + (NCTA_MAX * 64 if self.trace else 0),
+            dtype=torch.int32,
+            device=self.device,
+        )
         self.routes = torch.zeros(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
         )
@@ -415,12 +441,14 @@ class MegaMoeTPEngine:
         self.proutes = torch.zeros(
             (extra + 1, H), dtype=torch.bfloat16, device=self.device
         )
+        # (+ the small-M split-K GEMM1 partial sums)
         self.xg = torch.empty(
-            tot * topk * (inter_dim // 2 + inter_dim // 32 + 8),
+            tot * topk * (inter_dim // 2 + inter_dim // 32 + 8) + SM_PART_BYTES,
             dtype=torch.uint8,
             device=self.device,
         )
         self._cfgs: dict = {}
+        self._tail_cfgs: dict = {}
         self._launchers: dict = {}
         self._armed: set = set()
         self._args = (None, None)
@@ -568,38 +596,49 @@ class MegaMoeTPEngine:
             mt += 1
         return mt
 
+    def _sm_mt(self, tot: int) -> int:
+        # (debug: AITER_MEGAMOE_TP_SMMT "mt<=32,mt<=64,mt<=128,mt<=256")
+        m = [int(v) for v in os.environ.get("AITER_MEGAMOE_TP_SMMT", "1,2,2,3").split(",")]
+        return self._fit_mt(m[0] if tot <= 32 else m[1] if tot <= 64 else m[2] if tot <= 128 else m[3])
+
+    def _sm_fits(self, tot: int) -> bool:
+        # small-M: every CTA's G1 blocks (rounds of n_cta over all row chunks' inter
+        # blocks) fit its unit list
+        nch = self._chunks(self._sm_mt(tot))[1]
+        return nch * (self.I // 128) <= UL_MAX * self.n_cta
+
+    def _lb_ok(self, tot: int) -> bool:
+        return bool(self.lb_min) and tot >= self.lb_min
+
     def config(self, m: int) -> LaunchCfg:
         cfg = self._cfgs.get(m)
         if cfg is None:
             tot = m * self.tp
-            lb = bool(self.lb_min) and tot >= self.lb_min
             fp8 = not self.comm_bf16
-            tu = self._tuned(lb, tot)
-            if lb:
-                small = tot <= self.lb_small_max
-                # an explicit config field, else the tuned one, else the default
-                if ("mt_small" if small else "mt") in self._lb_set:
-                    tu.pop("mt", None)
-                if "npp" in self._lb_set and not small:
-                    tu.pop("npp", None)
-                if "q" in self._lb_set:
-                    tu.pop("q", None)
-                mt = next((n for t, n in self.lb_mt_table if tot <= t), self.lb_mt)
-                lp = tu.get("lp", 0 if tot <= LB_PF_MAX else 3)
-                q = tu.get("q", 0)
+            sm = (
+                tot >= self.sm_min
+                # (an explicit lb_min keeps its batches on the LB schedule)
+                and not ("min" in self._lb_set and self._lb_ok(tot))
+                and fp8
+                and not self.a8
+                and tot <= self.dyn_max
+                and self._sm_fits(tot)
+            )
+            if sm:
                 cfg = LaunchCfg(
-                    self._fit_mt(
-                        self._lb_mt_ok(tu.get("mt", self.lb_mt_small if small else mt)),
-                        lb=True,
-                    ),
-                    npp=self._fit_npp(tu.get("npp", 2 if small else self.lb_npp)),
-                    ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
-                    lb=True,
-                    pf=bool(tu.get("pf", tot <= LB_PF_MAX)),
-                    lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
-                    q=q if q in self._lb_q_valid else 0,
+                    self._sm_mt(tot),
+                    ll=True,
+                    llr=True,
+                    sm=True,
+                    # the one-shot all-reduce sends tp x the RS bytes: xGMI bound from
+                    # AR2_MIN tokens on
+                    ar2=self.ar
+                    and tot >= int(os.environ.get("AITER_MEGAMOE_TP_AR2MIN", AR2_MIN)),
                 )
+            elif self._lb_ok(tot):
+                cfg = self._lb_config(tot)
             elif tot <= self.dyn_max:
+                tu = self._tuned(False, tot)
                 cfg = LaunchCfg(
                     self._fit_mt(
                         tu.get("mt", 1 if tot <= 32 else 2 if tot <= 64 else 3)
@@ -616,8 +655,44 @@ class MegaMoeTPEngine:
             self._cfgs[m] = cfg
         return cfg
 
+    def tail_config(self, m: int) -> LaunchCfg:
+        """The launch config of a fused-tail forward (the tail runs on the LB schedule: a
+        small-M batch the LB schedule takes runs it there)"""
+        cfg = self.config(m)
+        if cfg.sm and self._lb_ok(m * self.tp):
+            cfg = self._tail_cfgs.get(m)
+            if cfg is None:
+                cfg = self._tail_cfgs[m] = self._lb_config(m * self.tp)
+        return cfg
+
+    def _lb_config(self, tot: int) -> LaunchCfg:
+        tu = self._tuned(True, tot)
+        small = tot <= self.lb_small_max
+        # an explicit config field, else the tuned one, else the default
+        if ("mt_small" if small else "mt") in self._lb_set:
+            tu.pop("mt", None)
+        if "npp" in self._lb_set and not small:
+            tu.pop("npp", None)
+        if "q" in self._lb_set:
+            tu.pop("q", None)
+        mt = next((n for t, n in self.lb_mt_table if tot <= t), self.lb_mt)
+        lp = tu.get("lp", 0 if tot <= LB_PF_MAX else 3)
+        q = tu.get("q", 0)
+        return LaunchCfg(
+            self._fit_mt(
+                self._lb_mt_ok(tu.get("mt", self.lb_mt_small if small else mt)),
+                lb=True,
+            ),
+            npp=self._fit_npp(tu.get("npp", 2 if small else self.lb_npp)),
+            ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
+            lb=True,
+            pf=bool(tu.get("pf", tot <= LB_PF_MAX)),
+            lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
+            q=q if q in self._lb_q_valid else 0,
+        )
+
     def _arll(self, cfg: LaunchCfg) -> bool:
-        return self.ar and cfg.ll and cfg.llr
+        return self.ar and cfg.ll and cfg.llr and not cfg.ar2
 
     def _ag8(self, cfg: LaunchCfg) -> bool:
         return self.ar and (self.ag_fp8 or cfg.ag8) and not self._arll(cfg)
@@ -661,6 +736,16 @@ class MegaMoeTPEngine:
                 tn_local=self.tn_local,
                 lbpf=cfg.pf,
                 lbp=cfg.lp,
+                trace=self.trace,
+                sm=cfg.sm,
+                ar2=cfg.ar2,
+                env=tuple(
+                    sorted(
+                        (k, v)
+                        for k, v in os.environ.items()
+                        if k.startswith("AITER_MEGAMOE_TP_")
+                    )
+                ),
             )
             self._launchers[self._key(cfg)] = fn
         return fn
@@ -746,7 +831,7 @@ class MegaMoeTPEngine:
             if self.tail_ok(m):
                 for on, tn in ((tail, 1), (tail_bf16, 2)):
                     if on:
-                        self._arm(dataclasses.replace(cfg, tn=tn), m)
+                        self._arm(dataclasses.replace(self.tail_config(m), tn=tn), m)
                         runs.append((m, tn))
         if not warmup:
             return
@@ -778,7 +863,7 @@ class MegaMoeTPEngine:
         return (
             self.mode == "ag_rs"
             and 0 < m <= min(TN_MAX, self.mmax)
-            and self.config(m).lb
+            and self.tail_config(m).lb
         )
 
     def _arm(self, cfg: LaunchCfg, m: int = 0) -> None:
@@ -878,7 +963,7 @@ class MegaMoeTPEngine:
                     "tail: ag_rs, the LB schedule, at most TN_MAX local tokens"
                 )
             self._check_tail(tail, m)
-            cfg = dataclasses.replace(cfg, tn=2 if bf16 else 1)
+            cfg = dataclasses.replace(self.tail_config(m), tn=2 if bf16 else 1)
         local_y = not self.ar or self._arll(cfg) or self._ag8(cfg)
         y = out if out is not None and local_y else self.y
         tptr = tuple(t.data_ptr() for t in tail) if tail is not None else ()
@@ -912,6 +997,10 @@ class MegaMoeTPEngine:
         return y
 
     __call__ = forward
+
+    def trace_dump(self) -> torch.Tensor:
+        """trace builds: [n_cta, 64] int32 timestamps (s_memrealtime, 10 ns) of the last launch"""
+        return self.ctrl[CTRL_INTS:].view(NCTA_MAX, 64)[: self.n_cta].clone()
 
     def clear_errors(self) -> None:
         self.ctrl[CTRL_ERR] = 0

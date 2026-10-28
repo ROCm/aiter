@@ -7,6 +7,8 @@ final sums, LL packets, comm wave roles and the per-launch init / finish."""
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
@@ -15,6 +17,7 @@ from flydsl.expr.typing import T
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _activation_mul_batch, _e8m0_from_amax
 from .common import (
+    trace_mark,
     ACQ,
     ACQ_REL,
     AUX_SC1,
@@ -51,7 +54,6 @@ from .common import (
     lds_ld_acq,
     lds_ld_i32,
     lds_st,
-    lds_st_rel,
     mxfp8x8,
     now,
     pack_bf16x8,
@@ -68,9 +70,9 @@ from .common import (
 )
 from .mega_moe_tp_config import (
     C_AGFREE,
+    C_AGALL,
     C_ARDY,
     C_BARCNT,
-    C_BARGEN,
     C_CDONE,
     C_CLAIM,
     C_CNT,
@@ -91,12 +93,14 @@ from .mega_moe_tp_config import (
     C_YAGM,
     CTRL_AGG,
     CTRL_AGX,
+    CTRL_INTS,
     CTRL_CLM,
     CTRL_EPB,
     CTRL_ERR,
     CTRL_LRDY,
     CTRL_SC,
     CTRL_XES,
+    DYN_MAX,
     ERR_CHUNK,
     ERR_COMM,
     ERR_FLAG,
@@ -122,9 +126,22 @@ from .mega_moe_tp_config import (
 
 def build_communication(kc: KernelCtx) -> dict:
     """The communication device functions of one instance (added to kc)."""
+    CNAP = int(os.environ.get("AITER_MEGAMOE_TP_CNAP", "4"))  # (debug)
+    PNAP = int(os.environ.get("AITER_MEGAMOE_TP_PNAP", "2"))  # (debug) push poll nap
+    TRACE_ = kc.TRACE and not kc.TRACE_LIGHT
+
+    def tm(a, lane, k):
+        if TRACE_:
+            trace_mark(a["ctrl"], CTRL_INTS, k, lane, i32(0))
+
+    def tme(a, tid, k):
+        """trace builds (also light): epilogue mark k by the calling wave's lane 0"""
+        if kc.TRACE_LIGHT:  # (the full trace keeps slots 40-63 for the G2 calls)
+            trace_mark(a["ctrl"], CTRL_INTS, k, tid, (tid // i32(64)) * i32(64))
     ACB, AG8, ARLL, CW, DLL, E, H, I = kc.get("ACB AG8 ARLL CW DLL E H I")
     L_CTL, L_DCNT, L_DPRE, L_DYN = kc.get("L_CTL L_DCNT L_DPRE L_DYN")
     L_INTER, L_INTERS, L_RIX, L_WT, MLL = kc.get("L_INTER L_INTERS L_RIX L_WT MLL")
+    (L_WSUM,) = kc.get("L_WSUM")
     MT, NBW, NCH, NCK, NMETA, NPC, NV = kc.get("MT NBW NCH NCK NMETA NPC NV")
     RG, SCAN_G, SCAN_IT, SI_STRIDE = kc.get("RG SCAN_G SCAN_IT SI_STRIDE")
     TMAX, TN, TOPK, TPC, VPL, XB, XLPR = kc.get("TMAX TN TOPK TPC VPL XB XLPR")
@@ -214,18 +231,16 @@ def build_communication(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def cbar(L, tid):
+        """barrier of the NW compute waves: C_BARCNT counts arrivals for the whole launch
+        (zeroed by init_lds), barrier k is passed at NW * (k + 1)"""
         wait_lgkm0()
         if (tid % i32(64)) == i32(0):
-            g = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
             old = lds_atomic_add(L, L_CTL + C_BARCNT * 4, 1, ACQ_REL)
-            if old == i32(NW - 1):
-                lds_st(L, L_CTL + C_BARCNT * 4, i32(0))
-                lds_st_rel(L, L_CTL + C_BARGEN * 4, g + i32(1))
-            else:
-                cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
-                while cur == g:
-                    rocdl.s_sleep(0)
-                    cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
+            target = (old // i32(NW) + i32(1)) * i32(NW)
+            cur = lds_ld_acq(L, L_CTL + C_BARCNT * 4)
+            while cur < target:
+                rocdl.s_sleep(0)
+                cur = lds_ld_acq(L, L_CTL + C_BARCNT * 4)
         rocdl.sched_barrier(0)
 
     def report(a, code):
@@ -278,12 +293,48 @@ def build_communication(kc: KernelCtx) -> dict:
     def _gather_scan(L, tid, a, expert, key, chunk=None):
         ids_addr, tw_addr, ttot = a["ids"], a["tw"], a["ttot"]
         cbar(L, tid)
-        if tid == i32(0):
-            lds_st(L, L_CTL + C_CNT * 4, i32(0))
-        cbar(L, tid)
+        if const_expr("rregs" not in a):  # (the atomic slot counter)
+            if tid == i32(0):
+                lds_st(L, L_CTL + C_CNT * 4, i32(0))
+            cbar(L, tid)
         n = ttot * i32(TOPK)
         rid = rsrc(ids_addr, n * i32(16 if MLL else 4))
-        if const_expr(MLL):
+        if const_expr("rregs" in a):  # the routes in registers (route_regs)
+            # deterministic order (wave-major, then the register layout): every CTA lists
+            # a chunk's routes alike (split-K GEMM1 pieces sum their partial rows)
+            # chunk cc of ce: the expert's routes of rank cc mod ce in that order (at most
+            # ceil(routes / ce) rows: the plan's ce = ceil(routes / rch) bounds a chunk by
+            # rch for any routing; token residues would not)
+            hits, run = [], i32(0)
+            for idx, e, wv, live in a["rregs"]:
+                hit = live & (e == expert)
+                pos, cnt = wave_rank(hit)
+                hits.append((hit, run + pos, idx, wv))
+                run = run + cnt
+            w = tid // i32(64)
+            if (tid % i32(64)) == i32(0):
+                lds_st(L, L_WSUM + w * i32(4), run)
+            cbar(L, tid)
+            base, tot = i32(0), i32(0)
+            for v in range_constexpr(NW):
+                cv = lds_ld_i32(L, L_WSUM + i32(v * 4))
+                base = base + (i32(v) < w).select(cv, i32(0))
+                tot = tot + cv
+            if const_expr(chunk is not None):
+                cc, ce, _ = chunk
+                tot = fx.max(tot - cc + ce - i32(1), i32(0)) // ce
+            # (every wave: its own later read of C_CNT sees it, no barrier)
+            if (tid % i32(64)) == i32(0):
+                lds_st(L, L_CTL + C_CNT * 4, tot)
+            for hit, pos, idx, wv in hits:
+                slot = base + pos
+                if const_expr(chunk is not None):
+                    hit = hit & ((slot % ce) == cc)
+                    slot = slot // ce
+                if hit & (slot < i32(TMAX)):
+                    lds_st(L, L_RIX + slot * i32(4), idx)
+                    lds_st(L, L_WT + slot * i32(4), wv)
+        elif const_expr(MLL):
             for i_ in range(tid, n, i32(NT)):
                 i = i32(i_)
                 pk = fx.Vector(bld(rid, i * i32(16), 0, V4I, 0))
@@ -323,10 +374,16 @@ def build_communication(kc: KernelCtx) -> dict:
                 e = g_ld_i32(fx.Int64(ids_addr) + fx.Int64(idx) * 4)
                 wv = g_ld_i32(fx.Int64(tw_addr) + fx.Int64(idx) * 4)
                 _gather_one(L, idx, (e == expert) & _in_chunk(idx, chunk), wv)
-        cbar(L, tid)
-        if tid == i32(0):
-            lds_st(L, L_CTL + C_GEXP * 4, key)
-        cbar(L, tid)
+        if const_expr("rregs" in a):
+            # (every wave stores the key before the one barrier: no reader sees it early)
+            if (tid % i32(64)) == i32(0):
+                lds_st(L, L_CTL + C_GEXP * 4, key)
+            cbar(L, tid)
+        else:
+            cbar(L, tid)
+            if tid == i32(0):
+                lds_st(L, L_CTL + C_GEXP * 4, key)
+            cbar(L, tid)
 
     @flyc.jit
     def zero_masked(L, lane, a, w0, nw):
@@ -341,7 +398,7 @@ def build_communication(kc: KernelCtx) -> dict:
         for b_ in range(lo + i32(w0 * 64), hi, i32(nw * 64)):
             i = i32(b_) + lane
             off = fx.min(i, n - i32(1)) * i32(16 if MLL else 4)
-            e = fx.Int32(bld(rid, off, 0, T.i32, 0))
+            e = fx.Int32(bld(rid, off, 0, T.i32, AUX_SC1))
             bal = fx.Int64(rocdl.ballot(T.i64, (i < hi) & masked(e)))
             if bal != 0:
                 for j_ in range(i32(0), i32(64), i32(1)):
@@ -581,10 +638,12 @@ def build_communication(kc: KernelCtx) -> dict:
             pk = recv_pkts(a, r_recv, row, a["mmax"], c0, vc)
             pend = ll_pending(a, lane, zip(pk, live))
         _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
+        tme(a, tid, 56)
         acc = [fx.Float32(0.0)] * 8
         for p in range_constexpr(MAX_TP):
             acc = sum_live(acc, ll_vals(pk[p]), i32(p) < a["tp"])
         _y_store(a, row, c0, v, acc)
+        tme(a, tid, 57)
 
     @flyc.jit
     def _y_store(a, row, c0, v, acc):
@@ -1060,6 +1119,8 @@ def build_communication(kc: KernelCtx) -> dict:
             q = fx.min(qb + i32(k) * qs, i32(NCHA - 1))
             if kl:
                 ag_chunk(L, lane, a, q, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes)
+            if const_expr(k == 0):
+                tm(a, lane, 50)
             if const_expr(k == NCHA - 1):
                 wait_lgkm0()
                 if lane == i32(0):
@@ -1070,7 +1131,11 @@ def build_communication(kc: KernelCtx) -> dict:
                         wait_vm(2 * TPC)
                     else:
                         wait_vm(0)
+                    if const_expr(k == 1):
+                        tm(a, lane, 51)
                     _ag_bump(a, lane, qb + i32(k - 1) * qs)
+                    if const_expr(k == 1):
+                        tme(a, lane, 62)
             rocdl.sched_barrier(0)
         wait_vm(0)
         if i32(NCHA - 1) < cnt:
@@ -1172,18 +1237,53 @@ def build_communication(kc: KernelCtx) -> dict:
             for p in range_constexpr(TPC):
                 bst(pkt, peer_rs(a, p, "off_ids", big), off, 0, AUX_SYS)
 
+    # routes per compute thread the dynamic schedule holds in registers (route_regs)
+    RIT = ceildiv(min(TMAX, DYN_MAX) * TOPK, NT)
+
     @flyc.jit
-    def meta_ll_wait(tid, a):
+    def route_regs(tid, a):
+        """(compute waves, dynamic schedule) every route of the launch, routes tid + k * NT
+        held in registers for the plan and the route gathers: [(idx, expert, weight bits,
+        live)]. MLL: waits for each packet (the meta all-gather); else reads the routing (ar:
+        the replicated input; ag_rs: the gathered rows, after ag_wait_meta)."""
         n = a["ttot"] * i32(TOPK)
-        rid = rsrc(a["ids"])
-        for i_ in range(tid, n, i32(NT)):
-            i = i32(i_)
-            t = fx.Int32(fx.Vector(bld(rid, i * i32(16), 0, V4I, AUX_SYS))[1])
-            t0 = now()
-            while (t != a["epoch"]) & alive(t0):
-                rocdl.s_sleep(1)
-                t = fx.Int32(fx.Vector(bld(rid, i * i32(16), 0, V4I, AUX_SYS))[1])
-            _report_if(a, t != a["epoch"], ERR_META)
+        nc = fx.max(n, i32(1)) - i32(1)
+        out = []
+        if const_expr(MLL):
+            rid = rsrc(a["ids"])
+            # (every packet's first load in flight together: one memory latency, not RIT)
+            pk0 = [
+                fx.Vector(
+                    bld(rid, fx.min(tid + i32(k * NT), nc) * i32(16), 0, V4I, AUX_SYS)
+                )
+                for k in range(RIT)
+            ]
+            for k in range_constexpr(RIT):
+                idx = tid + i32(k * NT)
+                live = idx < n
+                off = fx.min(idx, nc) * i32(16)
+                pk = pk0[k]
+                t0 = now()
+                while live & (fx.Int32(pk[1]) != a["epoch"]) & alive(t0):
+                    rocdl.s_sleep(1)
+                    pk = fx.Vector(bld(rid, off, 0, V4I, AUX_SYS))
+                _report_if(a, live & (fx.Int32(pk[1]) != a["epoch"]), ERR_META)
+                out.append((idx, fx.Int32(pk[0]), fx.Int32(pk[2]), live))
+        else:
+            rid = rsrc(a["ids"], n * i32(4))
+            rtw = rsrc(a["tw"], n * i32(4))
+            for k in range_constexpr(RIT):
+                idx = tid + i32(k * NT)
+                off = fx.min(idx, nc) * i32(4)
+                out.append(
+                    (
+                        idx,
+                        fx.Int32(bld(rid, off, 0, T.i32, 0)),
+                        fx.Int32(bld(rtw, off, 0, T.i32, 0)),
+                        idx < n,
+                    )
+                )
+        return out
 
     def _meta_pending(a, lane, epoch, own=False):
         rf = own_rs(a, "off_flag")
@@ -1220,6 +1320,33 @@ def build_communication(kc: KernelCtx) -> dict:
             f = fx.Int32(bld(rf, idx * i32(4), 0, T.i32, AUX_SYS))
             first = fx.min(first, ((cc < end) & before(f, epoch)).select(cc, end))
         return wave_red(first, lane, fx.min)
+
+    @flyc.jit
+    def _ag_trace_srcs(lane, a, epoch):
+        """trace builds: when chunk 0 of each source rank is flagged (slots 56 + src)"""
+        rf = own_rs(a, "off_flag")
+        for src in range_constexpr(TPC):
+            idx = i32(FLAG_AGQ) + i32(src)
+            f = fx.Int32(bld(rf, idx * i32(4), 0, T.i32, AUX_SYS))
+            t0 = now()
+            while before(f, epoch) & alive(t0):
+                f = fx.Int32(bld(rf, idx * i32(4), 0, T.i32, AUX_SYS))
+            trace_mark(a["ctrl"], CTRL_INTS, 58 + src, lane, lane)
+
+    @flyc.jit
+    def ag_ready_all(L, lane, a, epoch):
+        """(the AG helper, after its sends) poll every activation chunk's flags while the
+        memory system is idle -> C_AGALL (gives up after ~20 us: the A loader still waits
+        per chunk, and reports a missing chunk)"""
+        if const_expr(kc.TRACE_LIGHT):
+            _ag_trace_srcs(lane, a, epoch)
+        rdy = _ag_first_pending(lane, a, epoch, i32(0), NCH)
+        t0 = now()
+        while (rdy < i32(NCH)) & ((now() - t0) < fx.Int64(2000)):
+            rocdl.s_sleep(1)
+            rdy = _ag_first_pending(lane, a, epoch, rdy, NCH)
+        if (lane == i32(0)) & (rdy >= i32(NCH)):
+            lds_st(L, L_CTL + C_AGALL * 4, i32(1))
 
     @flyc.jit
     def ag_wait_chunk(L, lane, a, epoch, cc):
@@ -1273,11 +1400,11 @@ def build_communication(kc: KernelCtx) -> dict:
             own = fin_owned(a)
             v = (tid == i32(C_PULL)).select(i32(NV) - _ctpop(own), v)
             v = (tid == i32(C_FBITS)).select(i32((1 << NV) - 1) & (own ^ i32(-1)), v)
-            if const_expr(ARLL):
+            if const_expr(ARLL or FINI):
                 v = (tid == i32(C_PULL)).select(i32(NCK), v)
             lds_st(L, L_CTL + tid * i32(4), v)
 
-    def _dll_rows(a, t, c0, vc, P):
+    def _dll_rows(a, t, c0, vc, P, npc=NPC):
         rb = route_region_bytes(a["ttot"])
         r_routes = rsrc(a["routes"], rb)
         r_pr = rsrc(a["proutes"], i32(NPC - 1) * rb)
@@ -1285,19 +1412,36 @@ def build_communication(kc: KernelCtx) -> dict:
         for k in range_constexpr(TOPK):
             off = ((t * i32(TOPK) + i32(k)) * i32(H) + c0 + vc * i32(8)) * i32(2)
             out.append(fx.Vector(bld(r_routes, off, 0, V4I, AUX_SC1)))
-            for p in range_constexpr(1, NPC):
+            for p in range_constexpr(1, npc):
                 o2 = (i32(p) < P).select(i32(p - 1) * rb + off, i32(NPC) * rb)
                 out.append(fx.Vector(bld(r_pr, o2, 0, V4I, AUX_SC1)))
         return out
 
+    # (DLL) the compute waves push too once their units are done: 8 item streams per CTA
+    CPUSH = os.environ.get("AITER_MEGAMOE_TP_CPUSH", "1") == "1"
+    # (DLL ag_rs) the pushing waves then sum their share of this rank's (row, column chunk)
+    # finals, each polling its own packets (no chunk readiness poll + claim)
+    # (ar two-shot: each item's y rows to every rank, then its y flag)
+    FINI = (
+        DLL
+        and not ARLL
+        and not AG8
+        and not TN
+        and not lb
+        and os.environ.get("AITER_MEGAMOE_TP_FINI", "1") == "1"
+    )
+    NPUSH = 8 if CPUSH else 4
+
     def _dll_items(ws):
         nblk = i32(gpu.grid_dim.x)
-        return i32(gpu.block_id("x")) + i32(ws) * nblk, nblk * i32(4)
+        return i32(gpu.block_id("x")) + i32(ws) * nblk, nblk * i32(NPUSH)
 
     @flyc.jit
     def push_dll(L, tid, a, ws=0):
         lane = tid % i32(64)
-        spin0(L, lane, L_CTL + C_CDONE * 4, i32(1))
+        # (the helpers idle through the compute: a long nap leaves the SIMDs' issue / LDS
+        # to the compute waves)
+        spin0(L, lane, L_CTL + C_CDONE * 4, i32(1), CNAP)
         P = uni(lds_ld_acq(L, L_CTL + C_DYNP * 4))
         ttot = a["ttot"]
         it0, istep = _dll_items(ws)
@@ -1312,44 +1456,82 @@ def build_communication(kc: KernelCtx) -> dict:
             for j in range_constexpr(VPL):
                 v = lane + i32(j * 64)
                 vc = fx.min(v, i32(CW // 8 - 1))
-                live = [(v < i32(CW // 8)) & (i32(p) < P) for p in range(NPC)] * TOPK
-                if const_expr(TOPK * NPC <= 48):
-                    pk = _dll_rows(a, t, c0, vc, P)
-                    pend = ll_pending(a, lane, zip(pk, live))
-                    t0 = now()
-                    while (pend != i32(0)) & alive(t0):
-                        rocdl.s_sleep(8)
-                        pk = _dll_rows(a, t, c0, vc, P)
-                        pend = ll_pending(a, lane, zip(pk, live))
+                # (one inter piece, the small-M units: its TOPK rows only)
+                if P == i32(1):
+                    _push_one(L, tid, a, t, c0, v, vc, P, r_dst, prow, ws, 1)
                 else:
-                    pend = ll_pending(a, lane, zip(_dll_rows(a, t, c0, vc, P), live))
-                    t0 = now()
-                    while (pend != i32(0)) & alive(t0):
-                        rocdl.s_sleep(8)
-                        pend = ll_pending(
-                            a, lane, zip(_dll_rows(a, t, c0, vc, P), live)
-                        )
-                    pk = _dll_rows(a, t, c0, vc, P)
-                _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
-                acc = [fx.Float32(0.0)] * 8
-                for k in range_constexpr(TOPK):
-                    for p in range_constexpr(NPC):
-                        acc = sum_live(acc, ll_vals(pk[k * NPC + p]), i32(p) < P)
-                if const_expr(ARLL):
-                    for pr in range_constexpr(TPC):
-                        _push_store(
-                            a,
-                            peer_rs(a, pr, "off_part"),
-                            prow,
-                            c0,
-                            v,
-                            acc,
-                            v < i32(CW // 8),
-                        )
-                else:
-                    _push_store(a, r_dst, prow, c0, v, acc, v < i32(CW // 8))
+                    _push_one(L, tid, a, t, c0, v, vc, P, r_dst, prow, ws, NPC)
         if const_expr(ARLL):
             final_all_ll(tid, a, ws)
+        if const_expr(FINI):
+            final_own_ll(tid, a, ws)
+
+    @flyc.jit
+    def _push_one(L, tid, a, t, c0, v, vc, P, r_dst, prow, ws, npc):
+        """one push item column slice: the sum of its routes' npc piece rows -> owner"""
+        lane = tid % i32(64)
+        live = [(v < i32(CW // 8)) & (i32(p) < P) for p in range(npc)] * TOPK
+        if const_expr(TOPK * npc <= 48):
+            pk = _dll_rows(a, t, c0, vc, P, npc)
+            pend = ll_pending(a, lane, zip(pk, live))
+            t0 = now()
+            while (pend != i32(0)) & alive(t0):
+                rocdl.s_sleep(PNAP)
+                pk = _dll_rows(a, t, c0, vc, P, npc)
+                pend = ll_pending(a, lane, zip(pk, live))
+        else:
+            pend = ll_pending(
+                a, lane, zip(_dll_rows(a, t, c0, vc, P, npc), live)
+            )
+            t0 = now()
+            while (pend != i32(0)) & alive(t0):
+                rocdl.s_sleep(PNAP)
+                pend = ll_pending(
+                    a, lane, zip(_dll_rows(a, t, c0, vc, P, npc), live)
+                )
+            pk = _dll_rows(a, t, c0, vc, P, npc)
+        _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
+        tme(a, tid, i32(40) + i32(ws))
+        acc = [fx.Float32(0.0)] * 8
+        for k in range_constexpr(TOPK):
+            for p in range_constexpr(npc):
+                acc = sum_live(acc, ll_vals(pk[k * npc + p]), i32(p) < P)
+        if const_expr(ARLL):
+            for pr in range_constexpr(TPC):
+                _push_store(
+                    a,
+                    peer_rs(a, pr, "off_part"),
+                    prow,
+                    c0,
+                    v,
+                    acc,
+                    v < i32(CW // 8),
+                )
+        else:
+            _push_store(a, r_dst, prow, c0, v, acc, v < i32(CW // 8))
+        tme(a, tid, i32(48) + i32(ws))
+
+    @flyc.jit
+    def final_own_ll(tid, a, ws=0):
+        """(FINI) this rank's rows: items (column chunk, row) of the push streams"""
+        lane = tid % i32(64)
+        m = a["m"]
+        r_recv = own_rs(a, "off_part")
+        it0, istep = _dll_items(ws)
+        for it_ in range(it0, m * i32(NCK), istep):
+            it = i32(it_)
+            c = it // m
+            row = it - c * m
+            for j in range_constexpr(VPL):
+                v = lane + i32(j * 64)
+                vc = fx.min(v, i32(CW // 8 - 1))
+                _final_ll(tid, a, r_recv, row, c * i32(CW), v, vc)
+            if const_expr(ar):
+                # (its y rows landed on every rank: then the flag yag_wait polls)
+                wait_vm(0)
+                idx = i32(FLAG_YAG) + (c * i32(MAX_TP) + a["rank"]) * i32(NCTA_MAX) + row
+                for p in range_constexpr(TPC):
+                    _yag_post(a, p, idx, lane == i32(0))
 
     @flyc.jit
     def final_all_ll(tid, a, ws=0):

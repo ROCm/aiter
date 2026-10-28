@@ -50,6 +50,17 @@ is 16 * ``lb_mt`` rows (``"T1:N1,...,N"``: up to Ti tokens Ni), 16 * ``lb_mt_sma
 chunks per GEMM2 unit. Fields set explicitly take precedence; unset ones use the per-batch
 tuned configs (configs/mega_moe_tp_tuned.csv, ``AITER_CONFIG_MEGA_MOE_TP``; inside its tuned
 range), else the defaults (lb_min 256, lb_mt 5, lb_npp 2, lb_q 3).
+
+Small-M (fp8 comm, fp4 activations, 16 to 256 global tokens): the small-M kernel
+(kernels/mega_moe_tp/smallm.py) splits GEMM1 (inter blocks, evenly over the CTAs, the
+intermediate exported) from GEMM2 (output column shares over the full inter dim: contiguous
+w2 rows, one partial row per route) and evens the bytes per CTA; with fewer GEMM1 blocks
+than CTAs and few routes it runs the dynamic schedule's fused units in-kernel. ar batches
+from 128 tokens all-reduce in two shots (reduce-scatter, then the owners' rows to every
+rank). AITER_MEGAMOE_TP_SMALLM=0 disables it, "all" runs it from 1 token; batches from an
+explicit lb_min on stay on the LB schedule. A fused-tail forward of a small-M batch the LB
+schedule takes runs it there (as before; its y then differs in rounding from the plain
+forward's).
 """
 
 from __future__ import annotations
