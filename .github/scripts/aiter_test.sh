@@ -41,11 +41,14 @@ fi
 
 skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_mega_moe_tp.py"
     "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
+    # runs as its own CI step before this suite ("Mori smoke test" in aiter-test.yaml)
+    "op_tests/multigpu_tests/test_mori_smoke.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
@@ -209,6 +212,9 @@ for file in "${sharded_files[@]}"; do
             ;;
         op_tests/test_flydsl_pa_decode.py|op_tests/test_shuffle_out.py)
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_f4gemm.py)
+            test_cmd=(timeout 60m python3 "$file" --mode func)
             ;;
         op_tests/test_gemm_a6w6.py)
             {
