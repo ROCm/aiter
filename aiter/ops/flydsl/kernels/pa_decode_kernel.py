@@ -48,7 +48,6 @@ this module keeps the compilation API and launch wrappers.
 """
 
 import dataclasses
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -85,8 +84,6 @@ __all__ = [
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
 _GFX1250_PA_DECODE_CACHE = {}
-# Forces the gfx1250 BF16 page16 K/V ring depth (2, 3 or 4); 0 selects it.
-_KV_BUFFERS = int(os.environ.get("AITER_FLYDSL_PA_KV_BUFFERS", "0"))
 
 
 def _pa_decode_tile_kernel_name(
@@ -184,9 +181,8 @@ def compile_pa_decode_tile(
     ``kv_buffers=None`` gives gfx1250 BF16 page16 CTAs with one 16-row query
     tile a three-buffer K/V ring, so two tiles of page gathers stay in flight,
     when the grid needs at most two CTAs per CU and the ring's LDS keeps them
-    all resident. ``AITER_FLYDSL_PA_KV_BUFFERS`` or an explicit 2, 3 or 4
-    overrides that; shapes whose LDS cannot hold the ring keep the default
-    staging.
+    all resident. An explicit 2, 3 or 4 overrides that; shapes whose LDS
+    cannot hold the ring keep the default staging.
 
     Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
     Pages past the sequence are pinned to block 0; callers must leave the
@@ -214,8 +210,6 @@ def compile_pa_decode_tile(
                 and sliding_window == 0
                 else 1
             )
-        if kv_buffers is None:
-            kv_buffers = _KV_BUFFERS or None
         ctas = work_capacity * num_kv_heads * query_splits
         return compile_gfx1250_pa_decode(
             head_dim=head_dim,
