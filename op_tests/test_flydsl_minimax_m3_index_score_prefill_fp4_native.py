@@ -37,6 +37,7 @@ except ImportError:  # run as a script from op_tests/
 fp8_test = fp4_test.fp8_test
 requires_gfx950 = fp4_test.requires_gfx950
 SENTINEL, LOG2E, P, D = fp4_test.SENTINEL, fp4_test.LOG2E, fp4_test.P, fp4_test.D
+SUPPORTED_GFX = fp4_test.SUPPORTED_GFX
 qdt = fp4_test.qdt  # fixture, collected here
 
 
@@ -146,6 +147,17 @@ def test_default_entry_is_native_and_staged_is_opt_in(qdt):
     assert torch.equal(default[live], staged[live])
 
 
+@requires_gfx950
+@pytest.mark.parametrize("q_scale", [0.5, 3.0])
+def test_native_q_scale(qdt, q_scale):
+    """`q_scale` scales the scores (up to fp32 rounding of the factor folded into `sm_scale`)."""
+    c, kd, ks = fp4_test.fp4_prefill_case(2, 256, 3000)
+    plain = run_native(c, kd, ks, qdt)
+    got = run_native(c, kd, ks, qdt, q_scale=q_scale)
+    live = plain != SENTINEL
+    torch.testing.assert_close(got[live], plain[live] * q_scale, rtol=1e-6, atol=0)
+
+
 def _prefill_bytes(batch, q_len, ctx_len, k_row_bytes, q_elem_bytes):
     pairs, pages = fp8_test._prefill_work(batch, q_len, ctx_len)
     return (
@@ -203,8 +215,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if not torch.cuda.is_available() or get_gfx() != "gfx950":
-        aiter.logger.warning("requires gfx950; skipping")
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("requires %s; skipping", SUPPORTED_GFX)
         return 0
     aiter.logger.info("mxfp4 native prefill: running correctness checks...")
     status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
