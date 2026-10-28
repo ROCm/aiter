@@ -110,7 +110,7 @@ _GFX942_RECIPES = (
 )
 
 _CTX = SimpleNamespace()
-_STATS = SimpleNamespace(checks=0, err=0.0, known=0)
+_STATS = SimpleNamespace(checks=0, err=0.0)
 
 
 def _free_port():
@@ -841,16 +841,8 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
         AttentionScaleMode,
         mha_v4,
         mha_v4_packed,
-        quantize_mxfp6_k,
-        quantize_mxfp6_q,
     )
-    from aiter.ops.mha_v4_quant import (
-        mxfp4_v_view,
-        mxfp6_k_view,
-        mxfp6_v_tiles,
-        quantize_v_mxfp4_fp6_p,
-        quantize_v_mxfp6_fp6_p,
-    )
+    from aiter.ops.mha_v4_quant import mxfp4_v_view, mxfp6_k_view, mxfp6_v_tiles
 
     e8 = AttentionScaleMode.E8M0_PER_1X32
     softmax_scale = 0.125
@@ -890,32 +882,6 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
     )
     payloads, scales = _submit_roles(op, inputs)
     torch.cuda.synchronize()
-    label = f"rank {rank} v4-consumer {codec}"
-    # Strict transport check before the consumer runs: the transported packed
-    # bytes must equal the canonical packers' output.
-    exp_q, exp_q_scale = quantize_mxfp6_q(full[0], softmax_scale * math.log2(math.e))
-    _exact(payloads[0], exp_q.view(torch.uint8).flatten(), f"{label} Q payload")
-    _exact(scales[0].view_as(exp_q_scale), exp_q_scale, f"{label} Q scales")
-    exp_k, exp_k_scale = quantize_mxfp6_k(full[1])
-    _, logical_k_scales = mxfp6_k_view(exp_k, exp_k_scale, 1, valid_kv_len, hl)
-    _exact(
-        scales[1][: logical_k_scales.numel()].view_as(logical_k_scales),
-        logical_k_scales,
-        f"{label} K scales",
-    )
-    _check_v4_fp6_k_bytes(payloads[1], exp_k, logical_k_scales, f"{label} K")
-    if codec == "mxfp6_p":
-        exp_v, exp_v_scale = quantize_v_mxfp6_fp6_p(full[2])
-        _exact(
-            payloads[2],
-            exp_v.as_strided(payloads[2].shape, (1,)),
-            f"{label} V payload",
-        )
-    else:
-        exp_v, exp_v_scale = quantize_v_mxfp4_fp6_p(full[2])
-        v_bytes = hl * (((valid_kv_len + 127) // 128) * 128) * 64
-        _exact(payloads[2][:v_bytes], exp_v[:v_bytes], f"{label} V payload")
-    _exact(scales[2].view_as(exp_v_scale), exp_v_scale, f"{label} V scales")
     q = payloads[0].view(1, seq_full, hl, 96)
     q_scale = scales[0].view(1, seq_full, hl, 4)
     k, k_scale = mxfp6_k_view(payloads[1], scales[1], 1, valid_kv_len, hl)
@@ -961,29 +927,11 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
         softmax_scale=softmax_scale,
     )
     torch.cuda.synchronize()
-    # Known upstream defect: the gfx950 MHA V4 asm consumers
-    # fwd_hd128_mxfp6.co and fwd_hd128_f6f4.co give nondeterministic output when
-    # other work runs concurrently on the same GPU. For mxfp6 the cause is a
-    # no-op s_waitcnt vmcnt(63) before the V LDS barrier; for f6f4 the V
-    # buffer_load ... lds copies reach the publishing barrier with no VMEM wait.
-    # Transport bytes are checked strictly above.
-    known = False
-    if not torch.equal(out, canonical):
-        max_abs = (out.float() - canonical.float()).abs().max().item()
-        msg = (
-            f"{label}: fused != canonical, max abs {max_abs} "
-            f"(shape {tuple(out.shape)})"
-        )
-        assert os.environ.get("AITER_A2A_STRICT_V4_CONSUMER") != "1", msg
-        _STATS.known += 1
-        known = True
-        print(
-            "KNOWN-UPSTREAM mha_v4 asm consumer race, not failing "
-            f"(accuracy checks skipped, they read the same racy out): {msg}",
-            flush=True,
-        )
-    if known:
-        return op, lambda: _submit_roles(op, inputs)
+    label = f"rank {rank} v4-consumer {codec}"
+    assert torch.equal(out, canonical), (
+        f"{label}: fused != canonical, max abs "
+        f"{(out.float() - canonical.float()).abs().max().item()}"
+    )
     a, b = out.float().flatten(), ref.flatten()
     cos = (torch.dot(a, b) / (a.norm() * b.norm())).item()
     rel = ((a - b).norm() / b.norm()).item()
@@ -1383,7 +1331,7 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
                     _OVERSUBSCRIBED_BLOCKS,
                 )
             )
-        return rows, _STATS.checks, _STATS.known
+        return rows, _STATS.checks
     finally:
         try:
             ms.shmem_finalize()
@@ -1397,7 +1345,7 @@ def _run_world(world_size, recipes, sequences, heads_list, valid_kv_len):
         aiter.logger.warning(
             "requires %d visible GPUs, found %d; skipping", world_size, visible
         )
-        return [], 0, 0
+        return [], 0
     port = _free_port()
     with get_context("spawn").Pool(processes=world_size) as pool:
         results = pool.starmap(
@@ -1407,11 +1355,7 @@ def _run_world(world_size, recipes, sequences, heads_list, valid_kv_len):
                 for rank in range(world_size)
             ],
         )
-    return (
-        results[0][0],
-        sum(r[1] for r in results),
-        sum(r[2] for r in results),
-    )
+    return results[0][0], sum(checks for _, checks in results)
 
 
 def main():
@@ -1466,23 +1410,18 @@ def main():
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("attention A2A needs gfx942 or gfx950; skipping")
         return 0
-    rows, checks, known = [], 0, 0
+    rows, checks = [], 0
     for world_size in args.world_sizes:
-        world_rows, world_checks, world_known = _run_world(
+        world_rows, world_checks = _run_world(
             world_size, args.recipes, args.sequences, args.heads, args.valid_kv_len
         )
         rows += world_rows
         checks += world_checks
-        known += world_known
     df = pd.DataFrame(rows)
     aiter.logger.info(
         "attention A2A summary (markdown):\n%s", df.to_markdown(index=False)
     )
-    print(
-        f"completed rows={len(rows)} checks={checks} failures=0 "
-        f"known_upstream_mismatches={known}",
-        flush=True,
-    )
+    print(f"completed rows={len(rows)} checks={checks} failures=0", flush=True)
     return 0
 
 
