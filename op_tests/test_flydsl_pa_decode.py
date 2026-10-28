@@ -319,6 +319,20 @@ _FP8_CASES = _COMMON_CASES + [
             "pattern": "probability_tail",
         },
     ),
+    # One task slot per sequence: slots of the empty rows give the long row
+    # several tasks, which its last-arriving CTA merges across replays.
+    (
+        "mtp4-g16-page128-merge",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "capture": True,
+        },
+    ),
     # 60 rows pad the last wave's tile; GQA 8 puts two queries in each tile.
     (
         "mtp5-g12-page128",
