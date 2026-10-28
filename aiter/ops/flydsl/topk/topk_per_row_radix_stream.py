@@ -5,11 +5,9 @@
 
 import torch
 
-from ..kernels.tensor_shim import wave_size_of
-from ..kernels.topk.topk_launch import run_topk_launcher
+from ..kernels.tensor_shim import _run_compiled, wave_size_of
 from ..kernels.topk.topk_per_row_radix_stream import (
     build_topk_per_row_radix_stream_module,
-    build_topk_per_row_radix_stream_module_for_width,
     topk_per_row_radix_stream_block_threads,
     topk_per_row_radix_stream_lds_plan,
 )
@@ -82,7 +80,6 @@ def topk_per_row_radix_stream(
     row_lens: torch.Tensor | None,
     indices: torch.Tensor,
     k: int,
-    lds_budgets: tuple[int, int] | None = None,
 ) -> None:
     """Write each row's top-k column ids, in no promised order.
 
@@ -94,8 +91,6 @@ def topk_per_row_radix_stream(
         indices: ``[rows, k]`` int32, written in place. A row with fewer than
             ``k`` live columns is right-padded with -1.
         k: elements selected per row.
-        lds_budgets: the LDS the builds may claim, `_lds_budgets` of the
-            input's GPU; by default the current GPU's.
 
     Ties go to the smaller column. Few full-width rows are cut into slices that
     are selected apart and then merged, which returns the unsplit answer.
@@ -107,22 +102,15 @@ def topk_per_row_radix_stream(
     len_slot = row_len_slot(row_lens, scores.device)
     parts = _split_parts(rows, width, k, ragged)
     if parts == 1:
-        run_topk_launcher(
+        _run_compiled(
             # The block width follows the ROW COUNT and k, not the row width --
             # see the sweep behind `topk_per_row_radix_stream_block_threads`.
             # Costs a mean 1.001x against choosing per cell, where holding one
             # width costs 1.135x and a worst 2.03x.
-            build_topk_per_row_radix_stream_module_for_width(
+            build_topk_per_row_radix_stream_module(
                 k,
                 wave,
-                width,
-                # The direct terminal placement is measured and
-                # regression-tested at k=2048. Keep it there until the other k
-                # values have equivalent coverage rather than silently
-                # broadening their path.
-                terminal_ok=k == 2048,
                 block_threads=topk_per_row_radix_stream_block_threads(rows, k),
-                lds_budgets=lds_budgets,
                 # The deepest prefetch the budget allows is not the one that
                 # wins, and the budget has no term for the row count.
                 lds_plan=topk_per_row_radix_stream_lds_plan(rows, width, k),
@@ -145,13 +133,12 @@ def topk_per_row_radix_stream(
     # on opposite sides of the block-width rule and each has to ask it for itself.
     part_idx = torch.empty(rows, parts * k, dtype=torch.int32, device=scores.device)
     part_val = torch.empty(rows, parts * k, dtype=scores.dtype, device=scores.device)
-    run_topk_launcher(
+    _run_compiled(
         build_topk_per_row_radix_stream_module(
             k,
             wave,
             partial=True,
             block_threads=topk_per_row_radix_stream_block_threads(rows * parts, k),
-            lds_budgets=lds_budgets,
             # A slice, not the row: this stage runs one block per slice over a
             # slice's width, and the plan reads both.
             lds_plan=topk_per_row_radix_stream_lds_plan(
@@ -173,13 +160,12 @@ def topk_per_row_radix_stream(
     # answer is the unsplit answer rather than merely a valid one -- and it
     # writes those columns straight out, with no slot-to-column gather to undo
     # afterwards.
-    run_topk_launcher(
+    _run_compiled(
         build_topk_per_row_radix_stream_module(
             k,
             wave,
             labelled=True,
             block_threads=topk_per_row_radix_stream_block_threads(rows, k),
-            lds_budgets=lds_budgets,
             # The merge's rows are `parts * k` wide, not the input's.
             lds_plan=topk_per_row_radix_stream_lds_plan(rows, parts * k, k),
             full_rows=True,
