@@ -27,6 +27,9 @@ from aiter.ops.triton.gated_delta_net.fused_gdn_prefill_qkvz import (
     fused_gdn_prefill_qkvz,
     fused_gdn_prefill_qkvz_supported,
 )
+from aiter.ops.triton.gated_delta_net.fused_gdn_verify_qkvz import (
+    fused_gdn_verify_qkvz,
+)
 from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
     fused_rearrange_sigmoid_gated_delta_rule,
 )
@@ -50,6 +53,7 @@ __all__ = [
     "fused_gdn_decode_qkvz_supported",
     "fused_gdn_prefill_qkvz",
     "fused_gdn_prefill_qkvz_supported",
+    "fused_gdn_verify_qkvz",
     "fused_rearrange_sigmoid_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
 ]
