@@ -717,6 +717,80 @@ def _check_group_disagreement(rank, world_size, op_cls):
     _STATS.checks += 1
 
 
+def _expect_all_ranks_raise(name, rank, world_size, body, match):
+    """body must raise ValueError containing match on every rank (never hang)."""
+    failure = None
+    try:
+        body()
+        failure = "did not raise"
+    except ValueError as exc:
+        if match not in str(exc):
+            failure = f"wrong ValueError: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        failure = f"{type(exc).__name__}: {exc}"
+    flags = torch.zeros(world_size, dtype=torch.int32)
+    flags[rank] = failure is not None
+    dist.all_reduce(flags, group=_CTX.cpu_group)
+    failed = flags.nonzero().flatten().tolist()
+    if failed:
+        raise AssertionError(f"{name} failed on rank(s) {failed}: {failure}")
+    _STATS.checks += 1
+
+
+def _check_negative_construction(rank, world_size, op_cls):
+    """Misuse of group/rank/config/stream must raise on every rank, not hang."""
+    from aiter.ops.flydsl.attention_a2a_intranode import AttentionA2AIntraNodeOp
+
+    shape = (1, 64, 8, 128)
+    _expect_all_ranks_raise(
+        "group=None",
+        rank,
+        world_size,
+        lambda: AttentionA2AIntraNodeOp(
+            rank=rank, world_size=world_size, shape=shape, group=None
+        ),
+        "group is required",
+    )
+    _expect_all_ranks_raise(
+        "block_num disagreement",
+        rank,
+        world_size,
+        lambda: op_cls(
+            rank=rank,
+            world_size=world_size,
+            shape=shape,
+            block_num=128 if rank == 0 else 256,
+        ),
+        "disagree",
+    )
+    _expect_all_ranks_raise(
+        "swapped rank",
+        rank,
+        world_size,
+        lambda: op_cls(
+            rank=(rank + 1) % world_size, world_size=world_size, shape=shape
+        ),
+        "rank",
+    )
+    # Stream rule: a new trio on another stream must raise on role 0, before
+    # any launch, so every rank raises without desynchronizing.
+    op = op_cls(rank=rank, world_size=world_size, shape=shape)
+    x = torch.zeros(shape, dtype=torch.bfloat16, device=_CTX.device)
+    for role in range(3):
+        op.submit_role(role, x)
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream(device=_CTX.device)
+    _expect_all_ranks_raise(
+        "stream change between trios",
+        rank,
+        world_size,
+        lambda: op.submit_role(0, x, stream=side),
+        "one stream",
+    )
+    torch.cuda.synchronize()
+    dist.barrier(group=_CTX.cpu_group)
+
+
 def _check_e4m3_scale_rounding(
     op, rank, world_size, heads, sequence, device, v_input, quantize_fp8_rotated
 ):
@@ -1232,6 +1306,7 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
         _CTX.op_cls = functools.partial(AttentionA2AIntraNodeOp, group=cpu_group)
         _check_valid_kv_rejections(rank, world_size, _CTX.op_cls)
         _check_group_disagreement(rank, world_size, _CTX.op_cls)
+        _check_negative_construction(rank, world_size, _CTX.op_cls)
         for recipe, sequence, heads in itertools.product(
             recipes, sequences, heads_list
         ):

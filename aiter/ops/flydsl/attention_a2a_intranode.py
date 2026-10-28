@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import operator
+import os
 from typing import NamedTuple
 
 import flydsl.expr as fx
@@ -195,10 +196,15 @@ class AttentionA2AIntraNodeOp:
     Consumers must finish on that stream before the next call reusing their
     parity (two calls later); cross-stream consumers require an explicit join.
 
-    group is an optional torch.distributed ProcessGroup containing exactly the
-    MoRI participants. When given, construction verifies that all ranks agree on
-    the configuration and raises ValueError on every rank otherwise. When None,
-    no check is made and the caller must ensure ranks agree.
+    group is a required torch.distributed ProcessGroup containing exactly the
+    MoRI participants (size == world_size, group rank == rank). Construction
+    verifies that all ranks agree on the configuration and on the offsets of
+    every symmetric buffer, raising ValueError on every rank otherwise.
+    A role-0 submit on a different stream than the previous trio raises; use a
+    new op or join the streams.
+
+    Debug: AITER_A2A_SPIN_TIMEOUT_ITERS=N (default 0, off) makes each device
+    wait loop trap after N polls instead of hanging; part of the cache key.
     """
 
     def __init__(
@@ -215,10 +221,16 @@ class AttentionA2AIntraNodeOp:
         softmax_scale=None,
         hadamard=None,
         valid_kv_len=None,
-        group=None,
+        group,
     ):
         self._next_role = 0
         self._role_stream = None
+        spin_timeout_iters = int(os.environ.get("AITER_A2A_SPIN_TIMEOUT_ITERS", "0"))
+        if group is None:
+            raise ValueError(
+                "group is required: a torch.distributed ProcessGroup containing "
+                "exactly the MoRI participants"
+            )
         self.quant = quant is not None
         if self.quant:
             if isinstance(quant, str):
@@ -400,32 +412,39 @@ class AttentionA2AIntraNodeOp:
                     f"{unsupported or 'BF16 return'}"
                 )
         self.valid_kv_len = valid_kv_len
-        if group is not None:
-            # Must run before any symmetric allocation: mismatched configs
-            # would otherwise hang in the shmem barrier instead of raising.
-            if group.size() != world_size:
-                raise ValueError(
-                    f"group size {group.size()} != world_size {world_size}"
-                )
-            config = (
-                tuple(shape),
-                tuple(self.codecs),
-                self.quant,
-                bool(return_packed),
-                int(self.v_pack),
-                bool(self.hadamard),
-                valid_kv_len,
-                block_num,
-                warp_num_per_block,
-                q_multiplier,
-                world_size,
+        if rank != ms.shmem_mype() or world_size != ms.shmem_npes():
+            raise ValueError(
+                f"rank/world_size ({rank}/{world_size}) != MoRI "
+                f"PE/npes ({ms.shmem_mype()}/{ms.shmem_npes()})"
             )
-            configs = [None] * world_size
-            torch.distributed.all_gather_object(configs, config, group=group)
-            if any(c != configs[0] for c in configs):
-                raise ValueError(
-                    f"ranks disagree on AttentionA2AIntraNodeOp config: {configs}"
-                )
+        # Must run before any symmetric allocation: mismatched configs
+        # would otherwise hang in the shmem barrier instead of raising.
+        if group.size() != world_size:
+            raise ValueError(f"group size {group.size()} != world_size {world_size}")
+        if torch.distributed.get_rank(group) != rank:
+            raise ValueError(
+                f"rank {rank} != group rank {torch.distributed.get_rank(group)}"
+            )
+        config = (
+            tuple(shape),
+            tuple(self.codecs),
+            self.quant,
+            bool(return_packed),
+            int(self.v_pack),
+            bool(self.hadamard),
+            valid_kv_len,
+            block_num,
+            warp_num_per_block,
+            q_multiplier,
+            world_size,
+            spin_timeout_iters,
+        )
+        configs = [None] * world_size
+        torch.distributed.all_gather_object(configs, config, group=group)
+        if any(c != configs[0] for c in configs):
+            raise ValueError(
+                f"ranks disagree on AttentionA2AIntraNodeOp config: {configs}"
+            )
         role_sequences = (seq_full, valid_kv_len, valid_kv_len)
         role_numels = tuple(
             sequence * heads_local * shape[3] for sequence in role_sequences
@@ -641,8 +660,28 @@ class AttentionA2AIntraNodeOp:
             for ready_mem in self.reuse_mem_sets
         )
         ms.shmem_barrier_all()
+        # shmem_ptr_p2p translates by the offset from the local heap base, so
+        # divergent allocation order would silently address the wrong buffer.
+        sym = [("output", t) for outs in self.outputs_sets for t in outs]
+        sym += [("scale", t) for sc in self.scale_storage_sets for t in sc]
+        sym += [("v_partial", t) for t in self.v_partial_sets]
+        sym += [("v_partial_ready", t) for t in self.v_partial_ready_sets]
+        sym += [("xdb", self.xdb_mem)]
+        sym += [("reuse", t) for t in self.reuse_mem_sets]
+        base = sym[0][1].data_ptr()
+        offsets = [(n, t.data_ptr() - base) for n, t in sym]
+        all_offsets = [None] * world_size
+        torch.distributed.all_gather_object(all_offsets, offsets, group=group)
+        for i, mine in enumerate(offsets):
+            if any(o[i] != all_offsets[0][i] for o in all_offsets):
+                raise ValueError(
+                    f"symmetric buffer {i} ({mine[0]}) offset differs across ranks: "
+                    f"{[o[i][1] for o in all_offsets]}"
+                )
         self._epoch = 0
-        self._reuse_launch = make_attention_a2a_reuse_jit(rank=rank, npes=world_size)
+        self._reuse_launch = make_attention_a2a_reuse_jit(
+            rank=rank, npes=world_size, spin_timeout_iters=spin_timeout_iters
+        )
 
         role_count = 3
         self._jit_kwargs = tuple(
@@ -662,6 +701,7 @@ class AttentionA2AIntraNodeOp:
                 **({"v_pack": self.v_pack} if i == 2 else {}),
                 "q_multiplier": q_multiplier,
                 "fp8_fnuz": self.fp8_fnuz,
+                "spin_timeout_iters": spin_timeout_iters,
             }
             for i in range(role_count)
         )
@@ -699,8 +739,14 @@ class AttentionA2AIntraNodeOp:
         torch_stream = torch.cuda.current_stream() if stream is None else stream
         if input.device != self.device or torch_stream.device != self.device:
             raise ValueError("input and stream must use the owning device")
-        if role and self._role_stream != torch_stream.cuda_stream:
-            raise ValueError("all roles must use the same stream")
+        if (
+            self._role_stream is not None
+            and self._role_stream != torch_stream.cuda_stream
+        ):
+            raise ValueError(
+                "all trios must use one stream; cross-stream use requires "
+                "constructing a new op or joining the streams"
+            )
         self._role_stream = torch_stream.cuda_stream
         stream = Stream(torch_stream)
         parity = self._epoch % 2

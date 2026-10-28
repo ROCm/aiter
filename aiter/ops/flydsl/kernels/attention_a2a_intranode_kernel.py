@@ -63,7 +63,7 @@ def needs_split_v_exchange(v_pack, seq_len):
     return v_pack == AttentionPack.V_FOR_FP6_P and seq_len % 64 != 0
 
 
-def make_attention_a2a_reuse_jit(*, rank, npes):
+def make_attention_a2a_reuse_jit(*, rank, npes, spin_timeout_iters=0):
     """Gate parity reuse on stream-ordered consumer completion at every rank."""
 
     @flyc.kernel(known_block_size=[64, 1, 1])
@@ -106,7 +106,11 @@ def make_attention_a2a_reuse_jit(*, rank, npes):
                     ),
                     addr_ready_mem,
                 )
-                spin_until_ge_i64(fx.ptrtoint(fx.add_offset(ready, tid)), generation)
+                spin_until_ge_i64(
+                    fx.ptrtoint(fx.add_offset(ready, tid)),
+                    generation,
+                    max_iters=spin_timeout_iters,
+                )
                 fx.memory_fence(
                     ordering=fx.AtomicOrdering.Acquire,
                     syncscope=fx.rocdl.SyncScope.OneAs,
@@ -579,6 +583,7 @@ def make_attention_a2a_kernel(
     fp8_fnuz=False,
     partial_only=False,
     pc_reduce=False,
+    spin_timeout_iters=0,
 ):
     target_arch = current_target().arch
     native_fp6 = (
@@ -2079,7 +2084,9 @@ def make_attention_a2a_kernel(
                     ready_base,
                 )
                 spin_until_ge_i64(
-                    fx.ptrtoint(fx.add_offset(ready, slot)), partial_generation
+                    fx.ptrtoint(fx.add_offset(ready, slot)),
+                    partial_generation,
+                    max_iters=spin_timeout_iters,
                 )
                 fx.memory_fence(
                     ordering=fx.AtomicOrdering.Acquire,
@@ -2777,7 +2784,7 @@ def make_attention_a2a_kernel(
     return attention_a2a_single_push
 
 
-def make_attention_a2a_completion_kernel(*, rank, npes):
+def make_attention_a2a_completion_kernel(*, rank, npes, spin_timeout_iters=0):
     @flyc.kernel(known_block_size=[64, 1, 1])
     def completion(
         addr_xdb_mem: fx.Int64,
@@ -2834,7 +2841,9 @@ def make_attention_a2a_completion_kernel(*, rank, npes):
                     addr_xdb_mem,
                 )
                 spin_until_ge_i64(
-                    fx.ptrtoint(fx.add_offset(ready, tid)), generation - fx.Int64(1)
+                    fx.ptrtoint(fx.add_offset(ready, tid)),
+                    generation - fx.Int64(1),
+                    max_iters=spin_timeout_iters,
                 )
                 fx.memory_fence(
                     ordering=fx.AtomicOrdering.Acquire,
@@ -2863,6 +2872,7 @@ def make_attention_a2a_jit(
     q_multiplier=1.0,
     v4_amax=False,
     fp8_fnuz=False,
+    spin_timeout_iters=0,
 ):
     split_v_exchange = needs_split_v_exchange(v_pack, seq_len)
     pc_partial = v4_output == "v" and codec == "e4m3_pc" and v4_amax
@@ -2883,6 +2893,7 @@ def make_attention_a2a_jit(
         "q_multiplier": q_multiplier,
         "v4_amax": v4_amax,
         "fp8_fnuz": fp8_fnuz,
+        "spin_timeout_iters": spin_timeout_iters,
     }
     # The partial launch precedes the payload launch so no payload block waits
     # on a block of its own launch.
@@ -2892,7 +2903,9 @@ def make_attention_a2a_jit(
             make_attention_a2a_kernel(**common, partial_only=split_v_exchange)
         )
     payload_kernels.append(make_attention_a2a_kernel(**common, pc_reduce=pc_partial))
-    completion = make_attention_a2a_completion_kernel(rank=rank, npes=npes)
+    completion = make_attention_a2a_completion_kernel(
+        rank=rank, npes=npes, spin_timeout_iters=spin_timeout_iters
+    )
     # rank is compile-time so rank-dependent ownership (split frame, k_own_tiles,
     # last-rank padding, odd-rank scales, sender dword selection) folds; the cache
     # therefore grows with world size.
@@ -2913,6 +2926,7 @@ def make_attention_a2a_jit(
         q_multiplier,
         v4_amax,
         fp8_fnuz,
+        spin_timeout_iters,
         current_target().arch,
         os.environ.get("AITER_A2A_FP6_FORCE_SOFTWARE", "0") == "1",
         _JIT_CACHE_TAG,

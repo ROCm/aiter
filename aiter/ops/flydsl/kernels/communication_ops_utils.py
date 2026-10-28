@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith
 from flydsl.expr.rocdl import readfirstlane
 from flydsl.expr.typing import T
@@ -193,12 +194,29 @@ def load_v4i32_nt(base_i64, offset):
     return fx.generic_load(_ptr_plus(base_i64, offset, 4), count=4, nontemporal=True)
 
 
+def _device_trap():
+    # s_trap 2 is what llvm.trap lowers to on AMDGPU; it aborts the dispatch.
+    llvm.InlineAsmOp(None, [], "s_trap 2", "", has_side_effects=True)
+
+
 @flyc.jit
-def spin_until_ge_i64(addr_i64, val):
-    """Spin until a monotonic cross-device i64 flag is at least ``val``."""
+def spin_until_ge_i64(addr_i64, val, *, max_iters=0):
+    """Spin until a monotonic cross-device i64 flag is at least ``val``.
+
+    ``max_iters`` > 0 (compile-time, debug) traps the device after that many
+    polls so a missing producer fails instead of hanging; 0 emits no counter.
+    """
     cur = fx.Int64(load_i64_acquire(addr_i64))
-    while cur < fx.Int64(val):
-        cur = fx.Int64(load_i64_acquire(addr_i64))
+    if fx.const_expr(max_iters > 0):
+        polls = fx.Int32(0)
+        while cur < fx.Int64(val):
+            polls = polls + fx.Int32(1)
+            if polls >= fx.Int32(max_iters):
+                _device_trap()
+            cur = fx.Int64(load_i64_acquire(addr_i64))
+    else:
+        while cur < fx.Int64(val):
+            cur = fx.Int64(load_i64_acquire(addr_i64))
     return cur
 
 
