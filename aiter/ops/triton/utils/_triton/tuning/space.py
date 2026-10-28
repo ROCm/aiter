@@ -65,17 +65,20 @@ def config_tree(spec, backend, cu_num=None):
     cu_num is the --cu-dir scope: None is the default tree, a CU count is its <cu_num>cu/ tree,
     which must already have its own DEFAULT.json (the tuner never writes one).
     """
-    from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+    from aiter.ops.triton.utils.config_utils import resolve_config_dir
 
+    plain = resolve_config_dir("gemm", spec.config_name, backend=backend, cu_num=None)
+    if cu_num is None:
+        return plain
     config_dir = resolve_config_dir(
         "gemm", spec.config_name, backend=backend, cu_num=cu_num
     )
-    if cu_num is not None and (
-        load_config_json(f"{config_dir}/DEFAULT.json", required=False) is None
-    ):
+    # the same folder: the loader found no <cu_num>cu/ DEFAULT.json for the family
+    if config_dir == plain:
         raise SystemExit(
-            f"{config_dir}/DEFAULT.json does not exist: a <cu_num>cu/ tree needs its own "
-            "DEFAULT.json before it is tuned (copy the family's and say so in the commit)"
+            f"{spec.config_name} ({backend}) has no <arch>/{cu_num}cu/ tree: a <cu_num>cu/ "
+            "tree needs its own DEFAULT.json before it is tuned (copy the family's and say "
+            "so in the commit)"
         )
     return config_dir
 

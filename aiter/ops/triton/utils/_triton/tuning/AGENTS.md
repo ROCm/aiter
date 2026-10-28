@@ -32,9 +32,10 @@ here. Update this file in the same change as any behaviour change.
    `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
    allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
    gluon (gfx950 a8w8 blockscale `num_stages` is `NUM_STAGES`, at least 2).
-4. Results always install into `resolve_config_dir(op, config_name, backend)`, or with `--cu-dir`
-   into the `<cu_num>cu/` tree of the device's CU count (`space.config_tree`), which must already
-   have its own `DEFAULT.json`; the tuner never writes one. No export directory, no dry run.
+4. Results always install into the plain folder, `resolve_config_dir(..., cu_num=None)`, or with
+   `--cu-dir` into the `<cu_num>cu/` tree of the device's CU count (`space.config_tree`), which
+   must already have its own `DEFAULT.json`; the tuner never writes one. No export directory, no
+   dry run.
 5. The installed file is seeded with this shape's file if it exists (keeping every bucket it does
    not replace), else it starts with only `"DEFAULT_FALLBACK": true` and `DEFAULT.json`'s
    `M_BOUNDS`: never copy untuned buckets (another shape's or `DEFAULT.json`'s) into a shape file.
@@ -116,7 +117,6 @@ Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothin
     # then delete the test file configs/gfx1250/gluon/gemm/gemm_afp4wfp4_preshuffled/GEMM-AFP4WFP4_PRESHUFFLED-N=256-K=512.json
     # on a partition whose CU count is not the arch's default: the same sweep and verify with
     # --cu-dir (the <cu_num>cu/ tree needs its own DEFAULT.json first), then delete that file too
-    python3 -m pytest ../../../../../../op_tests/triton_tests/utils/test_gemm_config_cu_dir.py
 
 ## Do not
 

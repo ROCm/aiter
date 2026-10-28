@@ -87,18 +87,17 @@ These parts must work without PyTorch, for example with JAX-Triton. Flag:
 
 All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
 `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`.
-`<d_type>` is `config_name.lower().replace("-", "_")`. A GEMM family tuned on
-a CU count other than the arch's default can have its own tree,
-`configs/<arch>/<cu_num>cu/<backend>/gemm/<d_type>/`, with its own
+`<d_type>` is `config_name.lower().replace("-", "_")`. A family tuned on a
+CU count other than the arch's default can have its own tree,
+`configs/<arch>/<cu_num>cu/<backend>/<op>/<d_type>/`, with its own
 `DEFAULT.json` (for example `gfx1250/96cu/`). Flag:
 
 - A config file outside this layout, for example in `configs/gemm/` or at the
   top of `configs/`.
 - A `<cu_num>cu/` tree for the arch's default CU count, for example
   `gfx1250/192cu/`. The default count lives in the plain folder.
-- A `<cu_num>cu/` tree without `DEFAULT.json`, or for an op other than
-  `gemm`. Only `get_gemm_config()` reads these trees, and it reads a tree
-  whole or not at all.
+- A `<cu_num>cu/` folder without `DEFAULT.json`. The loaders read a tree
+  whole or not at all, and a folder without `DEFAULT.json` is not a tree.
 - An arch prefix in a file name in `configs/<arch>/...`. The default file must
   be `DEFAULT.json`.
 - A specialized file in a folder without `DEFAULT.json`, when the loader needs
@@ -194,9 +193,9 @@ This applies to Triton and Gluon. Flag:
   the only one.
 - A new arch or backend fallback chain in a loader. The only allowed fallbacks
   are MHC (gfx942) and Triton `fused_clamp_act_mul` (gfx950). Both use the
-  `arch=` argument. The GEMM loader's choice between the `<cu_num>cu/` tree
-  and the plain tree (`gemm_config_dir()`) is not a fallback chain: it reads
-  one tree whole.
+  `arch=` argument. The choice `resolve_config_dir()` makes between the
+  `<cu_num>cu/` tree and the plain folder is not a fallback chain: a loader
+  reads one tree whole.
 - A raw config list in `@triton.autotune`. Use `autotune_configs()`:
 
   ```python

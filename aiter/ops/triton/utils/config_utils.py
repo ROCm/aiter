@@ -125,6 +125,9 @@ _ARCH_SAFE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+:-]*")
 _CU_NUM = None  # the device's CU count, read once per process
 _CU_NUM_READ = False
 
+# resolve_config_dir(cu_num=DEVICE_CU_NUM): the tree of this device's CU count.
+DEVICE_CU_NUM = object()
+
 
 def get_config_cu_num() -> int | None:
     """CU count of the device, which selects the ``<arch>/<cu_num>cu/`` config
@@ -155,7 +158,7 @@ def resolve_config_dir(
     config_name: str,
     backend: str = "triton",
     arch: str | None = None,
-    cu_num: int | None = None,
+    cu_num=DEVICE_CU_NUM,
 ) -> str:
     """Build the directory that holds one config family's JSON files.
 
@@ -163,12 +166,13 @@ def resolve_config_dir(
     architecture, backend, op and family:
     ``<configs>/<arch>/<backend>/<op>/<d_type>``, with the ``<d_type>`` leaf
     derived by ``_dtype_dir()`` (``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``).
-    With ``cu_num`` it builds the tree of one CU count instead,
-    ``<configs>/<arch>/<cu_num>cu/<backend>/<op>/<d_type>``; whether that
-    tree is used is the GEMM loader's decision (``gemm_config_dir()``).
-    The path is deterministic: it is built, never probed for, and there is
-    no search across backends, so a family tuned only for the other backend
-    on this arch is never silently borrowed.
+    A family tuned on a CU count other than the arch's default has its own
+    tree, ``<configs>/<arch>/<cu_num>cu/<backend>/<op>/<d_type>``, which is
+    returned instead when ``cu_num`` (by default this device's count) has
+    that tree with a ``DEFAULT.json``. A tree is read whole or not at all.
+    Apart from that one probe the path is deterministic: it is built, never
+    searched for, and there is no search across backends, so a family tuned
+    only for the other backend on this arch is never silently borrowed.
 
     Args:
         op: op directory in the layout -- ``"gemm"``, ``"conv"``, ``"mhc"``,
@@ -187,14 +191,17 @@ def resolve_config_dir(
             -- for loaders that retry under another arch when the running one
             ships no tuned configs (e.g. MHC's documented gfx942 fallback).
             Must match ``[a-z][a-z0-9_]*`` when given.
-        cu_num: builds the ``<arch>/<cu_num>cu/`` tree of one CU count (a
-            GEMM family tuned on a partition size other than the arch's
-            default). Must be a positive ``int`` when given.
+        cu_num: the CU count whose ``<arch>/<cu_num>cu/`` tree is returned
+            when it has a ``DEFAULT.json``. Default ``DEVICE_CU_NUM``: this
+            device's count (``get_config_cu_num()``). ``None``: the plain
+            tree, whatever the device. An ``int`` must be positive. Kernels
+            and loaders use the default; the tuning scripts pass a scope.
 
     Returns:
-        The directory path (a plain ``str``). Existence is deliberately not
-        checked here; whether a given file inside it exists is the loader's
-        decision. The family default is ``<dir>/DEFAULT.json``: loading it
+        The directory path (a plain ``str``). Beyond the one ``DEFAULT.json``
+        probe that picks a CU tree, existence is not checked here; whether a
+        given file inside it exists is the loader's decision. The family
+        default is ``<dir>/DEFAULT.json``: loading it
         with ``load_config_json(path)`` raises ``FileNotFoundError`` naming
         this exact path when a required table is missing, while optional
         tables pass ``required=False`` and handle ``None``.
@@ -228,17 +235,26 @@ def resolve_config_dir(
     assert arch is None or (
         isinstance(arch, str) and _ARCH_OVERRIDE_RE.fullmatch(arch)
     ), f"arch override must match [a-z][a-z0-9_]* (e.g. 'gfx942'), got {arch!r}"
-    assert cu_num is None or (
-        type(cu_num) is int and cu_num > 0
+    assert (
+        cu_num is DEVICE_CU_NUM
+        or cu_num is None
+        or (type(cu_num) is int and cu_num > 0)
     ), f"cu_num must be a positive int, got {cu_num!r}"
     dev = arch if arch is not None else arch_info.get_arch()
     assert isinstance(dev, str) and _ARCH_SAFE_RE.fullmatch(
         dev
     ), f"arch_info.get_arch() returned a path-unsafe architecture: {dev!r}"
-    tree = dev if cu_num is None else f"{dev}/{cu_num}cu"
-    return (
-        f"{AITER_TRITON_CONFIGS_PATH}/{tree}/{backend}/{op}/{_dtype_dir(config_name)}"
-    )
+    family = f"{backend}/{op}/{_dtype_dir(config_name)}"
+    plain = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{family}"
+    if cu_num is DEVICE_CU_NUM:
+        cu_num = get_config_cu_num()
+    if cu_num is None:
+        return plain
+    cu_tree = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{cu_num}cu/{family}"
+    # a CU tree exists when it has its own DEFAULT.json; it is read whole or not at all
+    if load_config_json(f"{cu_tree}/DEFAULT.json", required=False) is None:
+        return plain
+    return cu_tree
 
 
 def _axis_of(component: str) -> str:
