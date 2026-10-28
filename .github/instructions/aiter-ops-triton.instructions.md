@@ -87,10 +87,14 @@ These parts must work without PyTorch, for example with JAX-Triton. Flag:
 
 All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
 `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`.
-`<d_type>` is `config_name.lower().replace("-", "_")`. Flag:
+`<d_type>` is `config_name.lower().replace("-", "_")`. A GEMM config tuned on
+one CU count can go in `configs/<arch>/<cu_num>cu/<backend>/gemm/<d_type>/`
+(for example `gfx1250/96cu/`). The GEMM loader reads it first. Flag:
 
 - A config file outside this layout, for example in `configs/gemm/` or at the
   top of `configs/`.
+- A `<cu_num>cu/` folder for an op other than `gemm`. Only the GEMM loader
+  reads these folders.
 - An arch prefix in a file name in `configs/<arch>/...`. The default file must
   be `DEFAULT.json`.
 - A specialized file in a folder without `DEFAULT.json`, when the loader needs
@@ -186,7 +190,8 @@ This applies to Triton and Gluon. Flag:
   the only one.
 - A new arch or backend fallback chain in a loader. The only allowed fallbacks
   are MHC (gfx942) and Triton `fused_clamp_act_mul` (gfx950). Both use the
-  `arch=` argument.
+  `arch=` argument. The GEMM loader's fallback from `<arch>/<cu_num>cu/` to
+  `<arch>/` is not an arch fallback.
 - A raw config list in `@triton.autotune`. Use `autotune_configs()`:
 
   ```python

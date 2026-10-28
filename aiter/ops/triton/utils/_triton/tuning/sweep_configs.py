@@ -80,7 +80,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--cu-dir",
         action="store_true",
-        help="install into <arch>/<cu_num>cu/ (write_best_configs.py --cu-dir)",
+        help="plan from and install into <arch>/<cu_num>cu/ (write_best_configs.py --cu-dir)",
     )
     parser.add_argument(
         "--batch", type=int, default=100, help="configs per worker process"
