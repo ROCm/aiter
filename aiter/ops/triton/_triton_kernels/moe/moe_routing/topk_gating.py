@@ -13,6 +13,7 @@ def _exact_sigmoid_biased_topk(
     bias_ptr,
     weights_ptr,
     ids_ptr,
+    num_valid_rows_ptr,  # [1] int32: rows at or past it route to -1
     stride_logits,
     stride_weights,
     stride_ids,
@@ -22,6 +23,7 @@ def _exact_sigmoid_biased_topk(
     TOPK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NEED_RENORM: tl.constexpr,
+    HAS_NUM_VALID_ROWS: tl.constexpr,
 ):
     """Match the gfx1250 HIP fp32/int32 sigmoid-gating contract."""
     row = tl.program_id(0)
@@ -64,6 +66,10 @@ def _exact_sigmoid_biased_topk(
         selected_weights *= norm_scale
     else:
         selected_weights *= routed_scaling
+    if HAS_NUM_VALID_ROWS:
+        pad = row >= tl.load(num_valid_rows_ptr)
+        selected_ids = tl.where(pad, -1, selected_ids)
+        selected_weights = tl.where(pad, 0.0, selected_weights)
 
     row_mask = row < n_rows
     tl.store(ids_ptr + row * stride_ids + slots, selected_ids, mask=row_mask)
