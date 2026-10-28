@@ -21,6 +21,8 @@ with two LDS buffers where capacity permits. One-partition plans can write
 final output directly; other plans use the shared partition reducer.
 BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
 with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
+Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
+using the 64-token pipeline.
 
 Logical layouts (not preshuffled):
 
@@ -560,7 +562,7 @@ def compile_gfx1250_pa_decode(
                 fx.Int32(task[2]),
                 fx.Int32(task[3]),
             )
-            if const_expr(t.bf16_packed):
+            if const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
