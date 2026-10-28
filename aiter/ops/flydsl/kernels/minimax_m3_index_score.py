@@ -49,7 +49,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import triton
 import triton.language as tl
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -996,9 +995,9 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                         fx.add_offset(fx.get_iter(s_buf), addr).store(m)
 
     # The body is shared; only the kernel signature differs (MXFP4 passes two
-    # cache views). It is rewritten here because FlyDSL rewrites only the source
-    # of the decorated kernel, and the body holds runtime `if`s.
-    score_body = ASTRewriter.transform(score_body)
+    # cache views). `flyc.jit` makes its runtime `if`s IR control flow, as in a
+    # kernel, which FlyDSL would not do for an undecorated helper.
+    score_body = flyc.jit(score_body)
     if mxfp4:
 
         @flyc.kernel(
@@ -1989,9 +1988,9 @@ def score_flydsl_fp4(
     work map and the score layout, is as in `score_flydsl`.
 
     `idx_q` is bf16 or e4m3 (`dtypes.fp8`), dispatched on its dtype. An e4m3 Q is
-    used as stored times `q_scale` (default 1.0: the plain cast the writer
-    produces); `q_scale` must be positive and is folded into the score
-    multiplier, like `sm_scale`.
+    scored as stored. `q_scale` (default 1.0) multiplies the scores for either Q
+    dtype; it must be positive and is folded into the score multiplier, like
+    `sm_scale`.
     """
     return _score(
         idx_q,
