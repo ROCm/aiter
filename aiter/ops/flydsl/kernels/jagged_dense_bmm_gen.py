@@ -7,7 +7,8 @@ For each group ``b`` over ``[seq_offsets[b], seq_offsets[b+1])``::
 
     Out[s:e, :] = Jagged[s:e, :] @ Dense[b] + Bias[b]
 
-Dense weight is host-pre-transposed to ``(B * N, K)``. Supports a uniform
+Dense is ``(B * N, K)`` (host-pre-transposed) or ``(B, K, N)`` (DENSE_KN:
+N-contiguous, transposed in registers). Supports a uniform
 grid launch with optional XCD remap, and a compact launch for skewed
 sequence lengths that maps each workgroup to its group on device.
 """
@@ -86,7 +87,8 @@ def _build_launcher(
     DENSE_KN,
 ):
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
-    N_WARPS = min(THREADS // 64, BLOCK_N // 16)
+    # DENSE_KN: >= 2 adjacent n per lane, so each B load is at least 32-bit.
+    N_WARPS = min(THREADS // 64, BLOCK_N // (32 if DENSE_KN else 16))
     M_WARPS = THREADS // 64 // N_WARPS
     B_REPS = BLOCK_N // (16 * N_WARPS)
     smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
@@ -381,6 +383,8 @@ def _build_launcher(
 
             thr_gBias = thr_copy_r2s_C.partition_S(gBias)
             if fx.const_expr(DENSE_KN):
+                # make_fragment_like(thr_gBias) divides by zero on the
+                # permuted stride-0 layout.
                 bias_frag = fx.make_fragment_like(mma_frag_C_retile)
             else:
                 bias_frag = fx.make_fragment_like(thr_gBias)
@@ -390,8 +394,6 @@ def _build_launcher(
                 bias_frag,
             )
             acc = mma_frag_C.load()
-            # Same element count, different logical shape: relabel the bias
-            # fragment so the add stays a flat vector op instead of broadcasting.
             bias = bias_frag.load()
             if fx.const_expr(DENSE_KN):
                 # The N permutation folds the n-reps into the copy's first
@@ -407,6 +409,8 @@ def _build_launcher(
                         for a in range(4)
                     ],
                 )
+            # Same element count, different logical shape: relabel the bias
+            # fragment so the add stays a flat vector op instead of broadcasting.
             bias = fx.Vector(bias, acc.shape, fx.BFloat16)
             mma_frag_C_bf16.store((acc + bias).to(fx.BFloat16))
 
@@ -538,6 +542,8 @@ def jagged_dense_bmm(
     # would silently drop the trailing N % block_n output columns.
     if bnn <= 0 or N % bnn != 0:
         raise ValueError(f"block_n={bnn} must be a positive divisor of N={N}")
+    if dense_kn and bnn % 32:
+        raise ValueError(f"3-D dense needs block_n % 32 == 0, got {bnn}")
     if block_k is None:
         block_k = BLOCK_K
     else:
