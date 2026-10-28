@@ -42,6 +42,11 @@ namespace aiter {
 #else
 #define MHC_BF16_MFMA 0
 #endif
+#if defined(__gfx950__)
+    static constexpr bool mhc_f32_fn_bf16_split = true;
+#else
+    static constexpr bool mhc_f32_fn_bf16_split = false;
+#endif
 #if MHC_BF16_MFMA || defined(__gfx1250__)
     static constexpr bool mhc_bf16_mma_avail = true;
 #else
@@ -587,6 +592,21 @@ namespace aiter {
             }
         };
 
+        // K0 + 4 sets bit 2, which the row mask can flip, so each 4-float run takes its own
+        // swizzle.
+        auto lds_read_fn_chunk_f32 = [&](float* s_fn_rd_ptr, float (&fn_raw)[repeat_n][8], int c) {
+            #pragma unroll
+            for (int n = 0; n < repeat_n; n++) {
+                int fn_row = n * mfma_n + lane_id % mfma_n;
+                int K0 = (c * mfma_k + lane_id / mfma_n) * 8;
+                int mask = (fn_row & 0xF) << fn_xor_shift;
+                *reinterpret_cast<fp32x4_t*>(fn_raw[n]) = *(reinterpret_cast<fp32x4_t*>(
+                    s_fn_rd_ptr + fn_row * tile_k + (K0 ^ mask)));
+                *reinterpret_cast<fp32x4_t*>(fn_raw[n] + 4) = *(reinterpret_cast<fp32x4_t*>(
+                    s_fn_rd_ptr + fn_row * tile_k + ((K0 + 4) ^ mask)));
+            }
+        };
+
 #define GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH)                                        \
         do {                                                                                      \
             if (n_idx == 0) {                                                                     \
@@ -614,17 +634,30 @@ namespace aiter {
             _Pragma("unroll")                                                                     \
             for (int c = 0; c < n_chunks_bf16; c++) {                                             \
                 float hi_raw[repeat_n][4], lo_raw[repeat_n][4];                                   \
-                lds_read_fn_chunk_bf16(s_fn_rd_ptr, hi_raw, lo_raw, c);                           \
+                float fn_raw[repeat_n][8];                                                        \
+                if constexpr (w_preshuffle_bf16) {                                                \
+                    lds_read_fn_chunk_bf16(s_fn_rd_ptr, hi_raw, lo_raw, c);                       \
+                } else {                                                                          \
+                    lds_read_fn_chunk_f32(s_fn_rd_ptr, fn_raw, c);                                \
+                }                                                                                 \
                 s_wait_all_dscnt(0_I);                                                            \
                 _Pragma("unroll")                                                                 \
                 for (int n = 0; n < repeat_n; n++) {                                              \
-                    /* Block-interleaved fn: the two fragments ARE the float runs. */             \
                     using f32x4_ = opus::vector_t<float, 4>;                                      \
                     using bf16x8_ = opus::vector_t<opus::bf16_t, 8>;                              \
-                    bf16x8_ fn_hi = __builtin_bit_cast(bf16x8_,                                   \
-                        *reinterpret_cast<f32x4_*>(hi_raw[n]));                                   \
-                    bf16x8_ fn_lo = __builtin_bit_cast(bf16x8_,                                   \
-                        *reinterpret_cast<f32x4_*>(lo_raw[n]));                                   \
+                    bf16x8_ fn_hi, fn_lo;                                                         \
+                    if constexpr (w_preshuffle_bf16) {                                            \
+                        /* Block-interleaved fn: the two fragments ARE the float runs. */         \
+                        fn_hi = __builtin_bit_cast(bf16x8_, *reinterpret_cast<f32x4_*>(hi_raw[n])); \
+                        fn_lo = __builtin_bit_cast(bf16x8_, *reinterpret_cast<f32x4_*>(lo_raw[n])); \
+                    } else {                                                                      \
+                        /* Must match mhc_shuffle_fn. */                                          \
+                        _Pragma("unroll")                                                         \
+                        for (int e = 0; e < 8; e++) {                                             \
+                            fn_hi[e] = opus::fp32_to_bf16(fn_raw[n][e]);                          \
+                            fn_lo[e] = opus::fp32_to_bf16(fn_raw[n][e] - opus::bf16_to_fp32(fn_hi[e])); \
+                        }                                                                         \
+                    }                                                                             \
                     v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi, x_bf[c], v_cf[n]);            \
                     v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo, x_bf[c], v_cf[n]);            \
                     __builtin_amdgcn_sched_barrier(0);                                            \
@@ -826,13 +859,9 @@ namespace aiter {
                 if constexpr (x_tdm) { lds_load_x_tile((k) + 2, (LDS_SLOT)); }                     \
             }                                                                                      \
         } while (0)
-        // w_preshuffle_bf16: bf16 hi/lo MFMA; otherwise fp32 MFMA. The bf16 body (and the
-        // gfx950-only mfma_f32_16x16x32_bf16 builtin) exists only in the gfx950 device
-        // pass; every other arch compiles the fp32 path unconditionally, so the flag is
-        // a no-op there (falls back to fp32).
 #if MHC_BF16_MFMA
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
-        if constexpr (w_preshuffle_bf16) {                                   \
+        if constexpr (w_preshuffle_bf16 || mhc_f32_fn_bf16_split) {          \
             GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH);           \
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
