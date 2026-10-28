@@ -769,5 +769,10 @@ def compile_gfx1250_pa_decode(
             cluster=(t.cluster_merge, 1, 1) if t.cluster_merge else None,
         )
 
+    if t.bf16_wave_query_tiles:
+        # Iterative ILP scheduling leaves fewer VGPR bank switches per page.
+        launch.compile_hints["llvm_options"] = {
+            "amdgpu-sched-strategy": "iterative-ilp"
+        }
     compiled = {"launch": launch, "kernel": pa_decode_tile_kernel}
     return _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)
