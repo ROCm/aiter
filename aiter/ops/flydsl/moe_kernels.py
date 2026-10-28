@@ -594,18 +594,15 @@ _A8W4_GFX942_CHIP_IDS = {0x74A5, 0x74B9}  # MI325X, MI325X VF (SR-IOV guests)
 @functools.cache
 def _a8w4_gfx942_chip_id(device: int) -> int:
     # sysfs rather than hipDeviceGetAttribute(PciChipId) from Python: the enum value
-    # is not a stable number (chip_info.py hardcodes 10019, which returns 0x200 on
-    # ROCm 7.2.4 / 7.13 / 7.14; PciChipId is 10020 there).
-    p = torch.cuda.get_device_properties(device)
-    path = (
-        f"/sys/bus/pci/devices/{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:"
-        f"{p.pci_device_id:02x}.0/device"
-    )
+    # is not a stable number (chip_info._get_pci_chip_id uses 10019 on HIP < 7.1,
+    # which returns 0x200 on ROCm 7.2.4 / 7.13 / 7.14; PciChipId is 10020 there).
+    from aiter.jit.utils.chip_info import get_pci_chip_id_sysfs
+
     try:
-        with open(path) as f:
-            return int(f.read(), 16)
+        return get_pci_chip_id_sysfs(device)
     except OSError:
-        return 0x74A5 if "MI325" in p.name else 0
+        # sysfs node unreadable: assume MI325X when the device name says so.
+        return 0x74A5 if "MI325" in torch.cuda.get_device_properties(device).name else 0
 
 
 def a8w4_gfx942_supported(device=None) -> bool:
