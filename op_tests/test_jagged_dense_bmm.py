@@ -15,7 +15,6 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
     _load_dispatch_table,
-    clear_skew_tile_map_cache,
     jagged_dense_bmm_dispatched,
     resolve_config,
     shape_id,
@@ -113,8 +112,6 @@ def test_jdbba(B, D, Kout, Mi, regime, dtype):
     L, N, K = d["L"], d["N"], d["K"]
     uniform = regime == "uniform"
     st = torch.cuda.current_stream()
-    if not uniform:
-        clear_skew_tile_map_cache()
 
     ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], N, dtype)
 
@@ -203,7 +200,6 @@ def test_jdbba_block_k(B, D, Kout, Mi, block_k, dtype):
 
 @benchmark()
 def test_jdbba_skew_varying_L(B, D, Kout, Mi, seed, dtype):
-    clear_skew_tile_map_cache()
     d = _build_inputs(
         B,
         D,
