@@ -19,17 +19,23 @@ Run:
     python op_tests/test_flydsl_minimax_m3_index_score_prefill_fp4.py
 """
 
+import argparse
+import itertools
 import sys
 
+import pandas as pd
 import pytest
 import torch
 
+import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels import (
     minimax_m3_index_score_prefill_fp4 as prefill_kernel,
 )
 from aiter.ops.msa_block_select import pa_sparse_block_score_prefill
 from aiter.ops.quant import per_1x32_f4_quant
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 
 try:
@@ -40,6 +46,7 @@ except ImportError:  # run as a script from op_tests/
 SENTINEL = fp8_test.SENTINEL
 LOG2E = fp8_test.LOG2E
 P, D = fp8_test.P, fp8_test.D
+SUPPORTED_GFX = ["gfx950"]  # the FlyDSL scorers and the dequant are built for gfx950
 requires_gfx950 = fp8_test.requires_gfx950
 both_routes = pytest.mark.parametrize("staged", [True, False], ids=["staged", "native"])
 QCHUNK = 512  # pages quantized per torch call; the reference makes fp32 temporaries
@@ -313,8 +320,63 @@ def test_prefill_rejections(staged):
             f(c["q_bf16"], kd, ks, c["bt"], workspace=ws)
 
 
-def main():
-    return int(pytest.main([__file__, "-q", "-p", "no:cacheprovider"]))
+@pytest.mark.skip(
+    reason="perf sweep: run via python op_tests/test_flydsl_minimax_m3_index_score_prefill_fp4.py"
+)
+@benchmark()
+def test_dequant_staging_perf(batch, ctx_len):
+    """The staged route's dequant launch alone (the native route has no such step;
+    the end-to-end comparison is the native test file's sweep)."""
+    c, kd, ks = fp4_prefill_case(batch, min(ctx_len, 128), ctx_len)
+    want = c["cache"][c["bt"].long().reshape(-1)]
+    staged, us = run_perftest(
+        lambda: prefill_kernel.dequant_pages_fp8(kd, ks, c["bt"], c["seq"], c["mb"]),
+        num_iters=10,
+        num_rotate_args=1,
+    )
+    err = checkAllclose(
+        want.float(), staged.float(), rtol=0, atol=0, msg="dequant staging"
+    )
+    assert err == 0, f"staging mismatch fraction {err}"
+    # e2m1 + e8m0 read and fp8 written per token; pure data movement, no FLOPs.
+    nbytes = batch * c["mb"] * P * (D // 2 + D // 32 + D)
+    return {
+        "gfx": get_gfx(),
+        "dequant us": us,
+        "dequant TB/s": nbytes / us / 1e6,
+        "dequant err": err,
+    }
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="MXFP4 staged prefill dequant sweep")
+    ap.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 4])
+    ap.add_argument("--ctx-len", type=int, nargs="*", default=[8192, 32768])
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("requires %s; skipping", SUPPORTED_GFX)
+        return 0
+    aiter.logger.info("mxfp4 staged prefill: running correctness checks...")
+    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
+    if status != pytest.ExitCode.OK:
+        aiter.logger.error(
+            "mxfp4 staged prefill: checks failed (pytest exit %s); skipping perf sweep",
+            int(status),
+        )
+        return 1
+    rows = [
+        test_dequant_staging_perf(b, c)
+        for b, c in itertools.product(args.batch, args.ctx_len)
+    ]
+    aiter.logger.info(
+        "mxfp4 dequant staging summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+    return 0
 
 
 if __name__ == "__main__":

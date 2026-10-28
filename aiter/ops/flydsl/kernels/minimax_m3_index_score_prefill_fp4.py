@@ -43,7 +43,7 @@ __all__ = ["alloc_score", "dequant_pages_fp8", "score_prefill_flydsl_fp4"]
 
 TOK_BLOCK = 32  # tokens one program dequantizes
 NUM_WARPS = 4
-FP8_MAX = tl.constexpr(448.0)
+FP8_MAX = tl.constexpr(torch.finfo(dtypes.fp8).max)  # 448 on gfx950 (e4m3fn)
 
 
 @triton.jit
