@@ -25,6 +25,7 @@ from ..kernels.topk.radix_topk_one_block import (
     _MAX_ROW_ELEMENTS,
     build_radix_topk_one_block_module,
 )
+from ..kernels.topk.topk_launch import run_topk_launcher
 from ..kernels.topk.topk_per_row_decode import (
     clear_topk_per_row_decode_workspace_cache as _clear_split_workspace_cache,
 )
@@ -634,7 +635,7 @@ def _decode_with_backend(
             full_rows=full_rows,
             exact_rows=full_rows and one_workgroup_rows_are_exact(width),
         )
-        _run_compiled(
+        run_topk_launcher(
             launcher,
             logits,
             starts,
@@ -737,7 +738,7 @@ def flydsl_radix_topk_one_block(
         arch=arch,
         packed_rows=packed_rows,
     )
-    _run_compiled(
+    run_topk_launcher(
         launcher,
         logits,
         row_starts,
