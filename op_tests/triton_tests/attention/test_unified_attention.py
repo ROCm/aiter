@@ -311,6 +311,7 @@ def ref_paged_attn(
     v_descale: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     causal: int = 1,
+    qq_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
@@ -358,6 +359,10 @@ def ref_paged_attn(
             mask |= sliding_window_mask
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
+        if qq_bias is not None:
+            # [query, query] bias on the keys that are this step's queries
+            context_len = kv_len - query_len
+            attn[:, :, context_len:] += qq_bias[:query_len, :query_len].float()
         if causal:
             attn.masked_fill_(mask, float("-inf"))
         if sinks is not None:
@@ -613,6 +618,7 @@ def test_triton_unified_attn(
     shuffled_kv_cache: bool,
     backend: str,  # "triton" | "gluon"
     v_head_size: int | None = None,
+    use_qq_bias: bool = False,
 ) -> None:
     v_head_size = head_size if v_head_size is None else v_head_size
     if backend == "gluon" and not _is_gluon_available():
@@ -622,7 +628,7 @@ def test_triton_unified_attn(
             q_dtype=q_dtype,
             kv_cache_dtype=kv_dtype,
             softcap=soft_cap,
-            use_qq_bias=False,
+            use_qq_bias=use_qq_bias,
             use_alibi_slopes=False,
             head_size=head_size,
             head_size_v=v_head_size,
@@ -676,6 +682,12 @@ def test_triton_unified_attn(
         use_out_scale=use_out_scale,
         device="cuda",
     )
+    qq_bias = None
+    if use_qq_bias:
+        assert len(set(query_lens)) == 1, "qq_bias needs equal query lengths"
+        qq_bias = torch.randn(
+            query_lens[0], query_lens[0], dtype=torch.float32, device="cuda"
+        )
 
     unified_attention(
         q=query,
@@ -696,6 +708,7 @@ def test_triton_unified_attn(
         v_descale=v_descale,
         sinks=sinks,
         output_scale=output_scale,
+        qq_bias=qq_bias,
         shuffled_kv_cache=shuffled_kv_cache,
         backend=backend,
     )
@@ -716,6 +729,7 @@ def test_triton_unified_attn(
         k_descale=k_descale,
         v_descale=v_descale,
         output_scale=output_scale,
+        qq_bias=qq_bias,
     )
 
     atol, rtol = 1.5e-2, 1e-2
@@ -860,4 +874,36 @@ def test_triton_unified_attn_single_segment(v_head_size):
         shuffled_kv_cache=False,
         backend="triton",
         v_head_size=v_head_size,
+    )
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # 3D: on gfx950 a BLOCK_M 64 tile holds 4 query positions, so 6 leaves
+        # padded rows
+        [(6, 1031), (6, 2000)],
+        # 2D: the gfx950 prefill tile holds 16 positions, so 264 leaves 8
+        [(264, 4096)] * 4,
+    ],
+)
+def test_triton_unified_attn_qq_bias(seq_lens):
+    test_triton_unified_attn(
+        seq_lens=seq_lens,
+        num_heads=(16, 1),
+        head_size=192,
+        sliding_window=None,
+        block_size=16,
+        soft_cap=None,
+        num_blocks=32768,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        use_q_descale=False,
+        use_kv_descale=False,
+        use_out_scale=False,
+        shuffled_kv_cache=False,
+        backend="triton",
+        v_head_size=128,
+        use_qq_bias=True,
     )
