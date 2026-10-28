@@ -754,12 +754,8 @@ class PaDecodeTraits:
         QCHUNK = (
             head_dim // NQCHUNK
         )  # 16-bit query elements per lane (8 for D128, 4 for D64, 12 for D192).
-        # D192 uses three 64-bit loads. Other loads are at most 128 bits, and
-        # larger chunks must not leave an unloaded tail.
-        assert is_bf16_kv or QCHUNK <= 8 or QCHUNK % 8 == 0 or QCHUNK == 12, (
-            f"head_dim {head_dim} is unsupported: head_dim//{NQCHUNK} ({QCHUNK}) must "
-            f"be <= 8, a multiple of 8, or 12"
-        )
+        # Multiples of 64 give four-element lane chunks. Use 64-bit loads
+        # when the chunk does not divide into full 128-bit loads.
         QLOAD_UNIT = min(8, QCHUNK) if QCHUNK % 8 == 0 or QCHUNK <= 8 else 4
         N_QLOADS = QCHUNK // QLOAD_UNIT
 

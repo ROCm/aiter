@@ -456,13 +456,6 @@ def _parse_args(argv=None):
         parser.error("--head-dim must be a multiple of 64 in [64, 1024]")
     args.value_dim = args.head_dim if args.value_dim is None else args.value_dim
     asymmetric = args.value_dim != args.head_dim
-    if (
-        args.kv_dtype == "fp8"
-        and args.head_dim != 64
-        and args.head_dim % 128
-        and not (asymmetric and args.head_dim == 192 and args.value_dim == 128)
-    ):
-        parser.error("FP8 --head-dim must be 64 or a multiple of 128")
     if args.value_dim % 64 or not 64 <= args.value_dim <= 1024:
         parser.error("--value-dim must be a multiple of 64 in [64, 1024]")
     if args.scale_mode is None:
@@ -590,14 +583,11 @@ def main(argv=None):
         )
     if args.value_dim != args.head_dim and arch not in ("gfx942", "gfx950"):
         raise ValueError("asymmetric PA decode tuning requires gfx942/gfx950")
-    if args.kv_dtype == "bf16":
-        if arch == "gfx1250":
-            if args.head_dim != 64 and args.head_dim % 128:
-                raise ValueError(
-                    "gfx1250 BF16 head-dim must be 64 or a multiple of 128"
-                )
-        elif args.query_dtype != "bf16" or not args.trans_v:
-            raise ValueError("BF16 KV requires BF16 queries and --trans-v 1 on gfx9")
+    if arch == "gfx1250":
+        if args.head_dim != 64 and args.head_dim % 128:
+            raise ValueError("gfx1250 head-dim must be 64 or a multiple of 128")
+    elif args.kv_dtype == "bf16" and (args.query_dtype != "bf16" or not args.trans_v):
+        raise ValueError("BF16 KV requires BF16 queries and --trans-v 1 on gfx9")
     if (
         args.max_partitions is not None
         and args.max_partitions > properties.multi_processor_count

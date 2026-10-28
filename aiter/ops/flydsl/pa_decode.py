@@ -196,8 +196,9 @@ def pa_decode(
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
-    Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
-    up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
+    Supports page sizes 16/64/128. On gfx942/gfx950, BF16 and FP8 head
+    dimensions are multiples of 64 up to 1024. gfx1250 supports 64 and
+    multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
     A non-transposed 4D key cache is not implemented.
 
@@ -363,31 +364,18 @@ def pa_decode(
         )
     vector_width = 8 if is_bf16_kv else 16
 
-    # Enforce tile Q-load constraints and the reducer's 1024-thread limit.
-    q_chunk = head_dim // 16
+    # Enforce the tile geometry and the reducer's 1024-thread limit.
     if not (
         64 <= head_dim <= 1024
         and head_dim % 64 == 0
-        and (
-            (is_bf16_kv and arch != "gfx1250")
-            or q_chunk <= 8
-            or q_chunk % 8 == 0
-            or (asymmetric_value and arch in ("gfx942", "gfx950") and q_chunk == 12)
-        )
+        and (arch != "gfx1250" or head_dim == 64 or head_dim % 128 == 0)
     ):
         raise NotImplementedError(
             f"pa_decode does not support head_dim={head_dim}; supported values "
             + (
-                "are multiples of 64 in [64, 1024] for BF16 KV"
-                if is_bf16_kv and arch != "gfx1250"
-                else (
-                    "are 64 and multiples of 128 in [128, 1024] for BF16 KV on gfx1250"
-                    if is_bf16_kv
-                    else (
-                        "are 64, multiples of 128 in [128, 1024], and qualified "
-                        "gfx942/gfx950 asymmetric D192/V128 for FP8 KV"
-                    )
-                )
+                "are multiples of 64 in [64, 1024] on gfx942/gfx950"
+                if arch != "gfx1250"
+                else "are 64 and multiples of 128 in [128, 1024] on gfx1250"
             )
         )
     if num_hgroups != head_dim // vector_width or hgroup_width != vector_width:

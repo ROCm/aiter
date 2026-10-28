@@ -49,6 +49,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.runtime.device import check_smem_capacity
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -246,6 +247,7 @@ def compile_pa_decode_tile(
         return cached
 
     traits = PaDecodeTraits.create(schedule)
+    check_smem_capacity(traits.total_bytes, architecture)
     # As in fmha_gfx950, expose scalar specialization data to FlyDSL's closure
     # cache walker: it cannot inspect the fields of a captured traits object.
     _pa_decode_cache_tag = (traits.cache_key, implementation_cache_tag())

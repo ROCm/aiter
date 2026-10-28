@@ -8,6 +8,7 @@ Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 
 import importlib.util
 from itertools import product
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -359,6 +360,92 @@ def test_gfx1250_value_width_dispatch(monkeypatch, value_dim):
         assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    "arch,group,per_token,accepted",
+    [
+        ("gfx942", 288, False, True),
+        ("gfx942", 304, False, False),
+        ("gfx950", 752, False, True),
+        ("gfx950", 768, False, False),
+        ("gfx942", 1024, True, False),
+        ("gfx950", 1024, True, False),
+    ],
+)
+def test_fp8_lds_capacity_before_storage(monkeypatch, arch, group, per_token, accepted):
+    """Reject oversized layouts before constructing storage or compiling kernels."""
+    kernel = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
+    monkeypatch.setattr(kernel, "_PA_DECODE_TILE_CACHE", {})
+
+    class StorageReached(Exception):
+        pass
+
+    def stop_at_storage(cls):
+        raise StorageReached("layout fits")
+
+    monkeypatch.setattr(kernel.fx, "struct", stop_at_storage)
+    error = StorageReached if accepted else RuntimeError
+    match = "layout fits" if accepted else "Shared Memory Overflow"
+    with pytest.raises(error, match=match):
+        kernel.compile_pa_decode_tile(
+            architecture=arch,
+            head_dim=192,
+            value_dim=128,
+            query_group_size=group,
+            block_size=64,
+            num_seqs=8,
+            num_kv_heads=1,
+            num_compute_units=304 if arch == "gfx942" else 256,
+            work_capacity=64,
+            num_partitions=8,
+            query_dtype="bf16",
+            kv_dtype="fp8",
+            per_token_kv=per_token,
+            query_length=8,
+            max_context_length=8192,
+            sliding_window=1,
+        )
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize(
+    "arch,head_dim,accepted",
+    [
+        ("gfx942", 320, True),
+        ("gfx950", 192, True),
+        ("gfx950", 960, True),
+        ("gfx1250", 64, True),
+        ("gfx1250", 192, False),
+        ("gfx1250", 320, False),
+    ],
+)
+def test_tuning_head_dimensions(monkeypatch, kv_dtype, arch, head_dim, accepted):
+    """CLI validation accepts gfx9 widths and retains the gfx1250 restriction."""
+    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
+    monkeypatch.setattr(tuning, "get_gfx_runtime", lambda: arch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=256),
+    )
+
+    class InputsReached(Exception):
+        pass
+
+    def stop_at_inputs(*args):
+        raise InputsReached("shape accepted")
+
+    monkeypatch.setattr(tuning, "_make_tuning_inputs", stop_at_inputs)
+    error = InputsReached if accepted else ValueError
+    match = "shape accepted" if accepted else "gfx1250 head-dim"
+    with pytest.raises(error, match=match):
+        tuning.main(["--kv-dtype", kv_dtype, "--head-dim", str(head_dim)])
+
+
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()
@@ -567,6 +654,23 @@ _ASYMMETRIC_GENERAL_CASES = [
     )
 ]
 _FP8_CASES = _COMMON_CASES + [
+    *[
+        (
+            f"head{dim}-mtp",
+            {
+                "head_dim": dim,
+                "query_length": 3,
+                "group_size": 8,
+                "kv_heads": 2,
+                "block_size": 64,
+                "max_partitions": 4,
+                "window": 128,
+                "sink_dtype": torch.float32,
+                "capture": dim in (192, 960),
+            },
+        )
+        for dim in (192, 320, 448, 576, 704, 832, 960)
+    ],
     *_ASYMMETRIC_GENERAL_CASES,
     *_ASYMMETRIC_MULTIHEAD_CASES,
     *_ASYMMETRIC_WINDOW_CASES,
@@ -1065,11 +1169,7 @@ def test_pa_decode(case, device, monkeypatch):
     if get_gfx_runtime() == "gfx1250":
         if case.get("invalid_input") in ("fp16-query", "plain-v"):
             pytest.skip("gfx1250 supports FP16 queries and plain BF16 V caches")
-        if (
-            case["kv_dtype"] == "bf16"
-            and case["head_dim"] % 128
-            and case["head_dim"] != 64
-        ):
+        if case["head_dim"] % 128 and case["head_dim"] != 64:
             pytest.skip("gfx1250 supports head_dim 64 or multiples of 128")
     query_length, kv_heads, group_size, head_dim, page, window = (
         case[name]
