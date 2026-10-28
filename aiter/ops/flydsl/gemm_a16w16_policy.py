@@ -14,6 +14,7 @@ from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
     GEMM_A16W16_DTYPE_FP32,
+    SPLIT_K_WORKSPACE_MAX_ELEMS,
     make_gemm_a16w16_param_and_validate,
 )
 from .kernels.gemm_a16w16_kernel_gfx1250 import LDS_PAD_A, LDS_PAD_B
@@ -275,7 +276,7 @@ def get_flydsl_a16w16_configs(
                 "use_half_tile_interleaved": False,
             }
         )
-    if m <= 280 and k % 4 == 0:
+    if k % 4 == 0 and 4 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
         configs.append(
             {
                 "block_m": 320,
@@ -305,7 +306,7 @@ def get_flydsl_a16w16_configs(
                 "use_half_tile_interleaved": False,
             }
         )
-    if m <= 256 and k % 7 == 0:
+    if k % 7 == 0 and 7 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
         for m_waves, n_waves in ((4, 2), (2, 4)):
             configs.append(
                 {
