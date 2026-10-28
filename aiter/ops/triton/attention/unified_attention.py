@@ -118,6 +118,9 @@ class _UAParams(NamedTuple):
     q_dtype: torch.dtype
     kv_cache_dtype: torch.dtype
     all_decode: bool  # max_seqlen_q == 1
+    # equal_seqlen_q and not all_decode: speculative-decode verify, every seq
+    # holds max_seqlen_q queries
+    spec_decode: bool
     shuffled_kv_cache: bool
     use_alibi_slopes: bool  # alibi_slopes is not None
     use_qq_bias: bool  # qq_bias is not None
@@ -250,6 +253,9 @@ def unified_attention(
     sinks=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    # every seq has the same query length (max_seqlen_q), e.g. speculative-decode
+    # verify; lets the kernels locate a query block without searching cu_seqlens_q
+    equal_seqlen_q: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
@@ -346,6 +352,11 @@ def unified_attention(
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
     ALL_DECODE = int(max_seqlen_q) == 1
+    # With equal_seqlen_q, seq i's queries are q rows [i, i + 1) * max_seqlen_q.
+    # Trailing pad seqs may have no rows behind them so long as their seqused_k
+    # is 0: the launches stop at the last seq with rows, and both kernels return
+    # on an empty KV before they touch q or out.
+    SPEC_DECODE = equal_seqlen_q and not ALL_DECODE
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
     else:
@@ -384,6 +395,7 @@ def unified_attention(
         q_dtype=q_dtype,
         kv_cache_dtype=kv_cache_dtype,
         all_decode=ALL_DECODE,
+        spec_decode=SPEC_DECODE,
         shuffled_kv_cache=shuffled_kv_cache,
         use_alibi_slopes=use_alibi_slopes,
         use_qq_bias=use_qq_bias,
@@ -854,8 +866,16 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
 
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
+    # spec decode launches the exact block count, so the kernel needs no search
+    SEQLEN_Q = int(params.max_seqlen_q) if params.spec_decode else 1
     if params.all_decode:
         total_query_blocks = NUM_SEQS
+    elif params.spec_decode:
+        # only the seqs with q rows behind them; the trailing pad seqs of a
+        # DP-padded batch have none (and seqused_k == 0)
+        total_query_blocks = min(NUM_SEQS, params.num_tokens // SEQLEN_Q) * triton.cdiv(
+            SEQLEN_Q, BLOCK_Q
+        )
     else:
         total_query_blocks = params.num_tokens // BLOCK_Q + NUM_SEQS
 
@@ -906,6 +926,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
         ALL_DECODE=params.all_decode,
+        SPEC_DECODE=params.spec_decode,
+        SEQLEN_Q=SEQLEN_Q,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         CAUSAL=params.causal,
         # useful for debugging when needed
@@ -934,8 +956,15 @@ def _unified_attention_3d_gfx1250(
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
 
+    # spec decode launches the exact block count, so the kernel needs no search
+    SEQLEN_Q = int(params.max_seqlen_q) if params.spec_decode else 1
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
+    elif params.spec_decode:
+        # only the seqs with q rows behind them, as in the 2d launch
+        total_num_q_blocks = min(
+            params.num_seqs, params.num_tokens // SEQLEN_Q
+        ) * triton.cdiv(SEQLEN_Q, config["BLOCK_Q"])
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
@@ -996,6 +1025,8 @@ def _unified_attention_3d_gfx1250(
         NUM_QUERY_HEADS=params.num_query_heads,
         NUM_KV_HEADS=params.num_kv_heads,
         ALL_DECODE=params.all_decode,
+        SPEC_DECODE=params.spec_decode,
+        SEQLEN_Q=SEQLEN_Q,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         SCALE_K_WIDTH=params.scale_k_width,

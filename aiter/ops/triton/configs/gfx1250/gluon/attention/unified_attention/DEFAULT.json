@@ -9,6 +9,7 @@
     ],
     "attn_3d": [
       "D",
+      "Q",
       "SHUF",
       "DT",
       "BS"
@@ -120,6 +121,24 @@
       "TILE_SIZE_MIN": 128,
       "TILE_SIZE_MAX": 128
     },
+    "D_GEQ_256.Q_LEQ_4.DT_bf16_bf16": {
+      "BLOCK_M": 32,
+      "num_warps": 1,
+      "waves_per_eu": 1,
+      "LOOP_VARIANT": 0,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_GEQ_256.DT_bf16_bf16": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "waves_per_eu": 1,
+      "LOOP_VARIANT": 0,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
     "any": {
       "BLOCK_M": 128,
       "num_warps": 4,
@@ -160,6 +179,12 @@
       "num_warps": 1,
       "num_stages": 2,
       "waves_per_eu": 2
+    },
+    "D_GEQ_256.Q_LEQ_4.SHUF.BS_LEQ_64.DT_bf16_bf16": {
+      "BLOCK_M": 32,
+      "num_warps": 1,
+      "num_stages": 2,
+      "waves_per_eu": 1
     },
     "any": {
       "BLOCK_M": 16,
