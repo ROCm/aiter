@@ -128,6 +128,19 @@ class GemmConfigPruner:
                 )
                 == (192, 128, 128, 2, 4)
             )
+            validated_half_tile_workspace = (
+                config["use_half_tile_interleaved"]
+                and config["block_m"] == 256
+                and config["block_n"] == 256
+                and config["block_k"] == 64
+                and config["stages"] == 2
+                and config["split_k"] > 1
+                and config["m_waves"] == 2
+                and config["n_waves"] == 4
+                and config["k_waves"] == 1
+                and config["group_m"] in (0, 4, 8, 16)
+                and config["split_k"] * self.m * self.n <= SPLIT_K_WORKSPACE_MAX_ELEMS
+            )
             near_cu_rect = (
                 iou >= 0.90 and tiles * 4 >= num_cus * 3 and tiles * 4 <= num_cus * 5
             )
@@ -142,6 +155,7 @@ class GemmConfigPruner:
                     or near_cu_rect
                     or validated_half_tile
                     or validated_grouped_half_tile
+                    or validated_half_tile_workspace
                 )
                 and tiles <= max_tiles
                 and config["split_k"] <= max_split_k
@@ -149,6 +163,7 @@ class GemmConfigPruner:
                     config["group_m"] == 0
                     or validated_half_tile
                     or validated_grouped_half_tile
+                    or validated_half_tile_workspace
                     or (
                         config["block_m"],
                         config["block_n"],
@@ -308,6 +323,23 @@ def get_flydsl_a16w16_configs(
                 "use_half_tile_interleaved": True,
             }
         )
+    for split_k in split_k_candidates[1:]:
+        if split_k * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
+            for group_m in (8, 16):
+                configs.append(
+                    {
+                        "block_m": 256,
+                        "block_n": 256,
+                        "block_k": 64,
+                        "stages": 2,
+                        "split_k": split_k,
+                        "m_waves": 2,
+                        "n_waves": 4,
+                        "k_waves": 1,
+                        "group_m": group_m,
+                        "use_half_tile_interleaved": True,
+                    }
+                )
     if m <= 320 and k % 5 == 0:
         configs.append(
             {

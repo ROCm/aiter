@@ -256,6 +256,14 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                 torch.bfloat16,
                 False,
             )
+            workspace_configs = policy.get_flydsl_a16w16_configs(
+                252,
+                20480,
+                7168,
+                torch.bfloat16,
+                torch.bfloat16,
+                False,
+            )
 
         assert not any(
             config["use_half_tile_interleaved"]
@@ -291,6 +299,20 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             )
             == (192, 128, 128, 2, 4, 4)
             for config in grouped_configs
+        )
+        assert any(
+            config["use_half_tile_interleaved"]
+            and (
+                config["block_m"],
+                config["block_n"],
+                config["block_k"],
+                config["split_k"],
+                config["m_waves"],
+                config["n_waves"],
+                config["group_m"],
+            )
+            == (256, 256, 64, 2, 2, 4, 8)
+            for config in workspace_configs
         )
 
     def test_large_m_full_search_keeps_wide_ragged_n_tiles(self):
