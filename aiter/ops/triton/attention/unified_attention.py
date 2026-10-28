@@ -51,10 +51,14 @@ except:  # noqa: E722
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 # gfx1250, short queries (speculative-decode verify, q_len = 1 + num_spec): the 3D
-# split-KV kernel beats the 2D one while the batch has at most this many query rows
-# (tokens * query heads) per CU; past that the 2D grid fills the GPU.
+# split-KV kernel beats the 2D one while it splits each sequence's KV at least this
+# many ways. A 2D program covers a whole GQA group of a sequence, so the 2D grid is
+# sequences * KV heads programs; one walk over the longest context bounds it. The 3D
+# kernel pays for its split in one-page tiles, partial outputs and a reduce. Measured
+# on Qwen3.5 (16 q / 2 kv heads, d 256, 4-token verify, 28k-token mean context):
+# 8 segments 2.2x faster, 4 segments 18-27% faster, 2 segments 1.5x slower.
 _GFX12_3D_MAX_SEQLEN_Q = 16
-_GFX12_3D_MAX_QUERY_ROWS_PER_CU = 8
+_GFX12_3D_MIN_SEGMENTS = 4
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -175,6 +179,28 @@ def _gfx950_split_params(params: _UAParams):
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
 
 
+def _gfx12_split_params(params: _UAParams):
+    """Size the split by the exact 3d grid of a spec-decode verify launch.
+
+    `num_2d_prgms` bounds the query blocks at the default BLOCK_Q plus one per
+    sequence, the search grid's slack. A spec-decode launch has exactly one row
+    of blocks per sequence at the 3d config's BLOCK_Q (one block for a 4-token
+    verify of a GQA-8 group), so the bound is 3x the grid and the split it
+    yields too narrow: a CUDA graph captured at 96 sequences split 2 ways, which
+    is slower than the 2d kernel, where 8 ways is 1.3-2.1x faster than 2d at
+    48-80 live sequences.
+    """
+    if not params.spec_decode:
+        return params
+    config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    block_q = block_m // params.num_queries_per_kv
+    num_q_blocks = min(
+        params.num_seqs, params.num_tokens // params.max_seqlen_q
+    ) * triton.cdiv(params.max_seqlen_q, block_q)
+    return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
+
+
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
@@ -190,18 +216,25 @@ def _gfx950_split_grid(params: _UAParams):
 
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     # if IS_DEVICE_ARCH_GFX12, use 3D for decode, and for short (spec-decode verify)
-    # queries while their rows are too few to fill the 2D grid; 2D otherwise.
+    # queries while the KV split is wide enough to pay for itself; 2D otherwise.
     if IS_DEVICE_ARCH_GFX12:
         if params.sliding_window > 0:
             return True
         if params.all_decode:
             return False
-        short_query_3d = (
-            params.max_seqlen_q <= _GFX12_3D_MAX_SEQLEN_Q
-            and params.num_tokens * params.num_query_heads
-            <= _GFX12_3D_MAX_QUERY_ROWS_PER_CU * params.num_sms
+        if params.max_seqlen_q > _GFX12_3D_MAX_SEQLEN_Q:
+            return True
+        gluon_3d = is_3d_gluon_available(params, backend)
+        if gluon_3d and params.spec_decode:
+            # The exact grid: 2d runs one program per query block and KV head, and
+            # past one per CU it fills the GPU and the split only adds traffic
+            # (192 sequences: 2d 25-35% faster than a 4-way split).
+            return _gfx12_split_params(params).num_2d_prgms > params.num_sms
+        # the split the 3d launch would make
+        split = get_unified_attention_config(
+            "kv_split", params, backend="gluon" if gluon_3d else "triton"
         )
-        return not short_query_3d
+        return split["NUM_SEGMENTS"] < _GFX12_3D_MIN_SEGMENTS
 
     # The gfx950 Gluon kernel is one kernel with a decode and a prefill grid,
     # and it owns its KV split, so decode and split batches take the 3d path
@@ -431,6 +464,8 @@ def unified_attention(
         split_params = params
         if use_gluon_3d and DEVICE_ARCH == "gfx950":
             split_params = _gfx950_split_params(params)
+        elif use_gluon_3d and DEVICE_ARCH == "gfx1250":
+            split_params = _gfx12_split_params(params)
         config = get_unified_attention_config(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
