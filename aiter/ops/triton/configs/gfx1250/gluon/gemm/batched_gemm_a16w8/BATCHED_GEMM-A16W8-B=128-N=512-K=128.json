@@ -1,5 +1,4 @@
 {
-    "DEFAULT_FALLBACK": true,
     "M_LEQ_1": {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 128,

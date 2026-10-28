@@ -977,6 +977,8 @@ _reduce_segments_repr = make_kernel_repr(
         "HEAD_SIZE",
         "V_HEAD_SIZE",
         "NUM_SEGMENTS_PER_SEQ",
+        "SEGMENT_BLOCK",
+        "BLOCK_D",
     ],
 )
 
@@ -1005,6 +1007,8 @@ def reduce_segments(
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
+    BLOCK_D: tl.constexpr = 0,  # head-dim slice per program (grid axis 2), 0 = all
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -1026,45 +1030,105 @@ def reduce_segments(
 
     # create masks for subsequent loads
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
-    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+    single_tile: tl.constexpr = (
+        SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ
     )
+    if single_tile:
+        segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
+            [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+        )
 
-    offs_vd = tl.arange(0, V_HEAD_SIZE_PADDED)
+    # BLOCK_D splits the head dim across grid axis 2, so a small batch still
+    # launches enough programs to keep the reduce bandwidth- not latency-bound.
+    if BLOCK_D == 0:
+        D_TILE: tl.constexpr = V_HEAD_SIZE_PADDED
+        offs_vd = tl.arange(0, V_HEAD_SIZE_PADDED)
+    else:
+        D_TILE: tl.constexpr = BLOCK_D
+        offs_vd = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     if V_HEAD_SIZE_PADDED != V_HEAD_SIZE:
         v_dim_mask = offs_vd < V_HEAD_SIZE
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
-    # load segment maxima
-    segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
-    )
-    segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    overall_max = tl.max(segm_max)
+    if single_tile:
+        # load segment maxima
+        segm_offset = (
+            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_head_idx * NUM_SEGMENTS_PER_SEQ
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        )
+        segm_max = tl.load(
+            segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
+        )
+        overall_max = tl.max(segm_max)
 
-    # load and rescale segment exp sums
-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
-    overall_expsum = tl.sum(segm_expsum)
+        # load and rescale segment exp sums
+        segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+        segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
+        overall_expsum = tl.sum(segm_expsum)
 
-    # load, rescale, and add segment attention outputs
-    segm_output_offset = (
-        query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * V_HEAD_SIZE_PADDED
-        + offs_vd[None, :]
-    )
-    segm_output = tl.load(
-        segm_output_ptr + segm_output_offset,
-        mask=segm_mask[:, None] & v_dim_mask[None, :],
-        other=0.0,
-    )
-    segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
-    acc_sum = tl.sum(segm_output, axis=0)
+        # load, rescale, and add segment attention outputs
+        segm_output_offset = (
+            query_token_idx.to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+            + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * V_HEAD_SIZE_PADDED
+            + offs_vd[None, :]
+        )
+        segm_output = tl.load(
+            segm_output_ptr + segm_output_offset,
+            mask=segm_mask[:, None] & v_dim_mask[None, :],
+            other=0.0,
+        )
+        segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
+        acc_sum = tl.sum(segm_output, axis=0)
+    else:
+        segm_base = (
+            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_head_idx * NUM_SEGMENTS_PER_SEQ
+        )
+        segm_output_base = query_token_idx.to(tl.int64) * (
+            num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED
+        ) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+        # Pass 1: the global max and exp-sum from the [S] statistics. Pass 2 then
+        # weights each output tile by a fixed factor, so its loads carry no
+        # loop-carried rescale and can be issued back to back.
+        offs_all = tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        all_mask = offs_all < act_num_segments
+        segm_max_all = tl.load(
+            segm_max_ptr + segm_base + offs_all, mask=all_mask, other=float("-inf")
+        )
+        overall_max = tl.max(segm_max_all)
+        segm_expsum_all = tl.load(
+            segm_expsum_ptr + segm_base + offs_all, mask=all_mask, other=0.0
+        )
+        overall_expsum = tl.sum(
+            segm_expsum_all * tl.math.exp2(segm_max_all - overall_max)
+        )
+
+        offs_s = tl.arange(0, SEGMENT_BLOCK)
+        acc_sum = tl.zeros([D_TILE], dtype=tl.float32)
+        for s0 in range(0, act_num_segments, SEGMENT_BLOCK):
+            segs = s0 + offs_s
+            segm_mask = segs < act_num_segments
+            weight = tl.math.exp2(
+                tl.load(
+                    segm_max_ptr + segm_base + segs,
+                    mask=segm_mask,
+                    other=float("-inf"),
+                )
+                - overall_max
+            )
+            segm_output = tl.load(
+                segm_output_ptr
+                + segm_output_base
+                + segs[:, None] * V_HEAD_SIZE_PADDED
+                + offs_vd[None, :],
+                mask=segm_mask[:, None] & v_dim_mask[None, :],
+                other=0.0,
+            )
+            acc_sum += tl.sum(segm_output * weight[:, None], axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 

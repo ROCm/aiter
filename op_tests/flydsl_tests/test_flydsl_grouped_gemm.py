@@ -18,14 +18,15 @@ DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
 per-kernel bench that times gemm1 and gemm2 in isolation
 (``--scenario kernel``), a tiny correctness check
 (``--scenario verify``), or a full sweep of every setting in a tuned-config
-CSV (``--scenario csv``; defaults to ``aiter/configs/tuned_grouped_fmoe.csv``,
-one benched case per row, override the file with ``--csv-path``).
+CSV (``--scenario csv``; defaults to all tuned gfx1250 grouped-MoE TP CSVs,
+one benched case per TP row, select a single file with ``--csv-path``).
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import sys
 from contextlib import nullcontext
@@ -141,7 +142,7 @@ def _torch_moe_ref(
     w2_packed: torch.Tensor,  # (E, K, I_pack) uint8
     w2_scale_raw: torch.Tensor,  # (E, K, I//32) uint8
     w2_bias: torch.Tensor,  # (E, K) fp32
-    topk_w: torch.Tensor,  # (T, topk) bf16
+    topk_w: torch.Tensor,  # (T, topk) fp32
     topk_id: torch.Tensor,  # (T, topk) int32
     *,
     data_format: str,
@@ -437,7 +438,6 @@ def _run_grouped_via_fused_moe(
 
     # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
     topk_id, topk_w = _make_topk(hidden, experts, topk)
-    topk_w = topk_w.to(torch.bfloat16)
 
     # ---- prep grouped GEMM inputs ----
     # Stage1 weight/scale/bias are rearranged to the physical GUGU layout;
@@ -524,7 +524,7 @@ def _run_grouped_via_fused_moe(
         from aiter.test_common import run_perftest
 
         out, us = run_perftest(
-            _call, num_warmup=warmup, num_iters=iters, testGraph=False
+            _call, num_warmup=warmup, num_iters=iters, testGraph=True
         )
     else:
         # Verify: validate the eager (graph-off) path; no timing.
@@ -623,7 +623,7 @@ def _rates(
     work: tuple[float, float], us: float | None
 ) -> tuple[float | None, float | None]:
     """Convert a (FLOPs, bytes) work estimate and microseconds to rates."""
-    if us is None or us <= 0:
+    if us is None or not math.isfinite(us) or us <= 0:
         return None, None
     flops, data_bytes = work
     return flops / us / 1e6, data_bytes / us / 1e3
@@ -727,6 +727,9 @@ def run_moe(
             data_format=data_format,
         )
         tflops, bandwidth = _rates(work["total"], us)
+        if tflops is None:
+            logger.warning("[bench %s] timing unavailable: %r us", tag, us)
+            us = tflops = bandwidth = float("nan")
         print(
             f"[bench {tag}] fused_moe end-to-end us = {us:.2f}, "
             f"FLOPS = {work['total'][0]:.0f}, TFLOPS = {tflops:.2f}, "
@@ -758,10 +761,19 @@ def run_moe(
             )
         else:
             for name, elapsed_us in (("gemm1", g1), ("gemm2", g2)):
-                if elapsed_us is None:
-                    print(f"[kernel-bench {tag}] {name}: n/a", flush=True)
-                    continue
                 tflops, bandwidth = _rates(work[name], elapsed_us)
+                if tflops is None:
+                    logger.warning(
+                        "[kernel-bench %s] %s timing unavailable: %r us",
+                        tag,
+                        name,
+                        elapsed_us,
+                    )
+                    elapsed_us = tflops = bandwidth = float("nan")
+                    if name == "gemm1":
+                        g1 = elapsed_us
+                    else:
+                        g2 = elapsed_us
                 print(
                     f"[kernel-bench {tag}] {name}: us = {elapsed_us:.2f}, "
                     f"FLOPS = {work[name][0]:.0f}, TFLOPS = {tflops:.2f}, "
@@ -836,6 +848,67 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
         model_dim=512,
         inter_dim=512,
         tol=VERIFY_TOL_A8W4,
+    )
+
+
+# Kimi-K3 at TP8 with every expert split 8 ways: inter_dim 3072 / 8 = 384 is a
+# multiple of 128 but not of 256.
+KIMI_K3_TP8_CSV_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "aiter",
+        "configs",
+        "model_configs",
+        "kimik3tp8_tuned_grouped_fmoe.csv",
+    )
+)
+
+
+def _kimi_k3_tp8_buckets() -> list[int]:
+    with open(KIMI_K3_TP8_CSV_PATH, newline="") as fh:
+        return sorted({int(row["token"]) for row in csv.DictReader(fh)})
+
+
+# Every token bucket of the Kimi-K3 TP8 table, so each row's tiles run once, then
+# 20000 (padded to 32768) and 131072, past the table: they take the default tiles,
+# and their routed buffers pass 2 GiB and 4 GiB. Nothing forces a config. JIT,
+# not run-only: the grouped-MoE AOT builds only the auxiliary kernels (the TDM
+# GEMM has no AOT wiring yet), so run-only cannot load the GEMM for any shape.
+@pytest.mark.parametrize("tokens", _kimi_k3_tp8_buckets() + [20000, 131072])
+def test_grouped_a4w4_situv2_kimi_k3_tp8_matches_torch_ref(tokens):
+    run_moe(
+        "a4w4",
+        experts=896,
+        tokens=tokens,
+        topk=16,
+        model_dim=3584,
+        inter_dim=384,
+        activation=ActivationType.Situv2,
+        use_bias=False,
+        check_aot_cache=False,
+    )
+
+
+# The same shape with a GEMM2 k-tile that 384 does not divide, as a tuned row or
+# AITER_TDM_TILE_K2 may pick: 256 runs one full tile and a 128-wide tail, 512 a
+# single ragged tile (K < tile_k). 20000 tokens are past the table, so the other
+# tiles are the defaults; an AITER_TDM_TILE_* override also sets num_buffers to 2
+# for both GEMMs, which GEMM2 clamps to its k-tile count anyway.
+@pytest.mark.parametrize("tile_k2", [256, 512])
+def test_grouped_a4w4_situv2_kimi_k3_tp8_k_tail_matches_torch_ref(tile_k2, monkeypatch):
+    monkeypatch.setenv("AITER_TDM_TILE_K2", str(tile_k2))
+    run_moe(
+        "a4w4",
+        experts=896,
+        tokens=20000,
+        topk=16,
+        model_dim=3584,
+        inter_dim=384,
+        activation=ActivationType.Situv2,
+        use_bias=False,
+        check_aot_cache=False,
     )
 
 
@@ -1013,17 +1086,16 @@ def set_data_format(data_format: str) -> None:
     logger.info("grouped GEMM data format: %s", data_format)
 
 
-# Default tuned-config CSV: <repo>/aiter/configs/tuned_grouped_fmoe.csv. Every
-# row is one grouped-MoE setting; the --scenario csv sweep runs them all.
-DEFAULT_CSV_PATH = os.path.normpath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "aiter",
-        "configs",
-        "tuned_grouped_fmoe.csv",
+# Sweep both default tuned-config CSVs unless --csv-path selects one file.
+DEFAULT_CSV_PATHS = [
+    os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "aiter", "configs", name)
     )
-)
+    for name in (
+        "tuned_grouped_fmoe.csv",
+        "model_configs/qwen3_5_397b_tuned_grouped_fmoe.csv",
+    )
+]
 
 
 def _csv_data_format(q_dtype_a: str) -> str:
@@ -1046,10 +1118,26 @@ def _csv_activation(act_type: str) -> ActivationType:
         return ActivationType.Swiglu
     if a == "ActivationType.Silu":
         return ActivationType.Silu
+    if a == "ActivationType.Situv2":
+        return ActivationType.Situv2
     raise ValueError(f"unsupported act_type in CSV: {act_type!r}")
 
 
 def run_csv_scenario(args) -> None:
+    """Sweep the requested CSV or all default tuned gfx1250 TP CSVs."""
+    csv_paths = [args.csv_path] if args.csv_path is not None else DEFAULT_CSV_PATHS
+    failures = []
+    for csv_path in csv_paths:
+        try:
+            _run_csv_file(args, csv_path)
+        except (AssertionError, OSError, ValueError) as exc:
+            failures.append((csv_path, str(exc)))
+            logger.exception("[csv] %s: FAILED", csv_path)
+    if failures:
+        raise AssertionError(f"CSV failures: {failures}")
+
+
+def _run_csv_file(args, csv_path: str) -> None:
     """Sweep every setting in a tuned_grouped_fmoe-style CSV.
 
     Each CSV row (token, model_dim, inter_dim, expert, topk, act_type,
@@ -1061,16 +1149,20 @@ def run_csv_scenario(args) -> None:
     correctness checked; one out-of-gate row is recorded rather than aborting
     the sweep.
     """
-    csv_path = args.csv_path or DEFAULT_CSV_PATH
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
     if not os.path.isfile(csv_path):
-        raise SystemExit(f"CSV not found: {csv_path}")
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    os.environ["AITER_CONFIG_GROUPED_FMOE"] = csv_path
+    # The lookup cache is keyed by workload, so invalidate it when switching CSVs.
+    grouped._find_grouped_config.cache_clear()
     print(f"[csv] sweeping settings from {csv_path}", flush=True)
 
     with open(csv_path, newline="") as fh:
         reader = csv.DictReader(fh)
         csv_rows = list(reader)
     if not csv_rows:
-        raise SystemExit(f"CSV has no data rows: {csv_path}")
+        raise ValueError(f"CSV has no data rows: {csv_path}")
 
     activation_override = None
     if args.act is not None:
@@ -1095,16 +1187,27 @@ def run_csv_scenario(args) -> None:
             print(f"[csv] row {idx}: skipped topk=-1 (EP row)", flush=True)
             continue
 
-        # The grouped kernels need K/inter >= 512 (tile_k=256 -> two K tiles).
-        if model_dim < 512 or inter_dim < 512:
+        # Both GEMMs need K to be a multiple of the 128-wide WMMA step; a tile_k
+        # that does not divide K runs a clamped last k-tile, so K needs no floor.
+        if model_dim % 128 or inter_dim % 128:
             print(
                 f"[csv] row {idx}: skipped model_dim={model_dim} "
-                f"inter_dim={inter_dim} (< 512 grouped-kernel floor)",
+                f"inter_dim={inter_dim} (not a multiple of 128)",
+                flush=True,
+            )
+            continue
+        # A gemm1 bias turns off gemm1's own requantization, and the stage-2
+        # quant that replaces it needs inter_dim % 256 == 0 (Kimi-K3 at TP8 has
+        # 384 and no bias).
+        if not args.no_bias and inter_dim % 256:
+            print(
+                f"[csv] row {idx}: skipped inter_dim={inter_dim} with a bias "
+                "(needs inter_dim % 256 == 0; pass --no-bias)",
                 flush=True,
             )
             continue
 
-        act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+        act = next(name for name, value in _ACT_BY_NAME.items() if value == activation)
         print(
             f"\n===== csv row {idx}: {data_format} {act} "
             f"tokens={tokens} model_dim={model_dim} inter_dim={inter_dim} "
@@ -1190,6 +1293,7 @@ def run_csv_scenario(args) -> None:
 
     summarize(rows)
     failed = [r for r in rows if not r["pass"]]
+    print(f"[csv] {csv_path}: {len(rows) - len(failed)}/{len(rows)} cases passed")
     if failed:
         details = "; ".join(
             f"row={r['row']} {r['data_format']} {r['act']} "
@@ -1225,7 +1329,7 @@ def main() -> None:
         "--csv-path",
         default=None,
         help="CSV of grouped-MoE settings to sweep with --scenario csv "
-        f"(default: {DEFAULT_CSV_PATH}). Each row is one case.",
+        "(default: all tuned gfx1250 TP CSVs). Each TP row is one case.",
     )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument("--experts", type=int, default=256)
