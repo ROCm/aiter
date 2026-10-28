@@ -514,7 +514,14 @@ def _flash_attn_forward(
     descale_v: torch.Tensor | None = None,
     sink: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    int,
+    int,
+    torch.Tensor | None,
+]:
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
@@ -624,6 +631,7 @@ def _flash_attn_forward(
     else:
         s_dmask = None
 
+    rng_state = None
     if _MHA_IMPL == "dao_ai":
         assert sink is None, "dao_ai impl does not support attention sink."
         assert (
@@ -633,7 +641,7 @@ def _flash_attn_forward(
             not IS_FP8
         ), "dao_ai impl does not support FP8. Use the default impl or FA3 path."
         if is_varlen:
-            o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
+            o, softmax_lse, s_dmask, rng_state = flash_attn_2.varlen_fwd(
                 q,
                 k,
                 v,
@@ -656,7 +664,7 @@ def _flash_attn_forward(
                 return_softmax=return_softmax,
             )
         else:
-            o, softmax_lse, s_dmask, _ = flash_attn_2.fwd(
+            o, softmax_lse, s_dmask, rng_state = flash_attn_2.fwd(
                 q,
                 k,
                 v,
@@ -790,7 +798,7 @@ def _flash_attn_forward(
             enable_fp_fusion=True,
         )
 
-    return o, softmax_lse, s_dmask, philox_seed, philox_offset
+    return o, softmax_lse, s_dmask, philox_seed, philox_offset, rng_state
 
 
 class _FlashAttnFunc(torch.autograd.Function):
@@ -823,7 +831,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
+        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset, rng_state = (
             _flash_attn_forward(
                 q,
                 k,
@@ -845,7 +853,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         )
 
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, sink)
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, sink, rng_state)
             ctx.philox_seed = philox_seed
             ctx.philox_offset = philox_offset
             ctx.dropout_p = dropout_p
@@ -861,7 +869,7 @@ class _FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
-        q, k, v, out, softmax_lse, sink = ctx.saved_tensors
+        q, k, v, out, softmax_lse, sink, rng_state = ctx.saved_tensors
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
@@ -894,6 +902,7 @@ class _FlashAttnFunc(torch.autograd.Function):
                 window_size_right=ctx.window_size[1],
                 softcap=0.0,
                 deterministic=ctx.deterministic,
+                rng_state=rng_state,
             )
         else:
             if _USE_FUSED_BWD_KERNEL:
@@ -1152,7 +1161,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
+        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset, rng_state = (
             _flash_attn_forward(
                 q,
                 k,
@@ -1176,7 +1185,15 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         )
         if is_grad:
             ctx.save_for_backward(
-                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, sink
+                q,
+                k,
+                v,
+                out_padded,
+                softmax_lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sink,
+                rng_state,
             )
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
@@ -1194,7 +1211,9 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, sink = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, sink, rng_state = (
+            ctx.saved_tensors
+        )
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
@@ -1232,6 +1251,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 window_size_right=ctx.window_size[1],
                 softcap=0.0,
                 deterministic=False,
+                rng_state=rng_state,
             )
         else:
             if _USE_FUSED_BWD_KERNEL:

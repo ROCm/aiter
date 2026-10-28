@@ -52,11 +52,20 @@ def dao_ai_impl():
 
 
 @pytest.mark.parametrize(
-    "batch,seqlen_q,seqlen_k,head_dim",
-    [(4, 113, 203, 59), (1, 256, 256, 64)],
+    "batch,seqlen_q,seqlen_k,head_dim,nheads_k",
+    [
+        (4, 113, 203, 40, 6),  # Catches the dK/dV regression from split specialization.
+        (4, 256, 512, 40, 1),  # MQA with more K tokens than Q tokens.
+        (4, 256, 512, 40, 2),  # GQA with more K tokens than Q tokens.
+        (4, 113, 203, 59, 6),
+        (1, 256, 256, 64, 6),
+        (4, 113, 203, 160, 1),  # MQA with a padded head dimension.
+    ],
 )
-def test_mha_dao_ai_causal_dropout_alibi_backward(batch, seqlen_q, seqlen_k, head_dim):
-    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
+@pytest.mark.parametrize("varlen", [False, True])
+def test_mha_dao_ai_causal_dropout_alibi_backward(
+    dao_ai_impl, batch, seqlen_q, seqlen_k, head_dim, nheads_k, varlen
+):
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
     if get_arch() != "gfx950":
@@ -65,49 +74,43 @@ def test_mha_dao_ai_causal_dropout_alibi_backward(batch, seqlen_q, seqlen_k, hea
     torch.manual_seed(0)
     heads = 6
     shape_q = (batch, seqlen_q, heads, head_dim)
-    shape_kv = (batch, seqlen_k, heads, head_dim)
+    shape_kv = (batch, seqlen_k, nheads_k, head_dim)
     q = torch.randn(shape_q, device="cuda", dtype=torch.float16, requires_grad=True)
     k = torch.randn(shape_kv, device="cuda", dtype=torch.float16, requires_grad=True)
     v = torch.randn(shape_kv, device="cuda", dtype=torch.float16, requires_grad=True)
-    slopes = torch.rand(batch, heads, device="cuda") * 0.3
+    slopes = torch.rand(batch, heads, device="cuda", dtype=torch.float32) * 0.3
     dropout_p = 0.17
 
     softmax_scale = head_dim**-0.5
-    out, lse, scores, rng_state = flash_attn_2.fwd(
-        q=q,
-        k=k,
-        v=v,
-        out=None,
-        alibi_slopes=slopes,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-        causal=True,
-        window_size_left=-1,
-        window_size_right=-1,
-        softcap=0.0,
-        return_softmax=True,
-    )
+    attn_kwargs = {
+        "alibi_slopes": slopes,
+        "dropout_p": dropout_p,
+        "softmax_scale": softmax_scale,
+        "causal": True,
+        "return_attn_probs": True,
+    }
+    if varlen:
+        cu_seqlens_q = (
+            torch.arange(batch + 1, device="cuda", dtype=torch.int32) * seqlen_q
+        )
+        cu_seqlens_k = (
+            torch.arange(batch + 1, device="cuda", dtype=torch.int32) * seqlen_k
+        )
+        out, scores = flash_attn_varlen_func(
+            q.reshape(-1, heads, head_dim),
+            k.reshape(-1, nheads_k, head_dim),
+            v.reshape(-1, nheads_k, head_dim),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            **attn_kwargs,
+        )
+        out = out.reshape(shape_q)
+    else:
+        out, scores = flash_attn_func(q, k, v, **attn_kwargs)
     do = torch.randn_like(out)
-    dq, dk, dv, _ = flash_attn_2.bwd(
-        dout=do,
-        q=q,
-        k=k,
-        v=v,
-        out=out,
-        softmax_lse=lse,
-        dq=None,
-        dk=None,
-        dv=None,
-        alibi_slopes=slopes,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-        causal=True,
-        window_size_left=-1,
-        window_size_right=-1,
-        softcap=0.0,
-        deterministic=True,
-        rng_state=rng_state,
-    )
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), do)
 
     bias = attn_bias_from_alibi_slopes(slopes, seqlen_q, seqlen_k, causal=True)
     out_ref, _, _ = attention_ref(
