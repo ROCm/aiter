@@ -2338,8 +2338,8 @@ def test_mxfp4_default_score_buffer_reads_as_minus_inf():
 
 @requires_gfx950
 def test_mxfp4_e4m3_q_scale_and_dtype_dispatch():
-    """`q_scale` multiplies the scores of an e4m3 query (default 1.0 = the plain cast),
-    a non-positive one is refused, and the dtype alone picks the variant."""
+    """`q_scale` multiplies the scores for an e4m3 and a bf16 query alike (default
+    1.0), a non-positive one is refused, and the dtype alone picks the variant."""
     B, S, H = 2, 4, 4
     q, cache8, bt, seq, mb = make_case(B, S, H, [513, 4096])
     q8, q_ref = q_for(q, "e4m3")
@@ -2351,6 +2351,9 @@ def test_mxfp4_e4m3_q_scale_and_dtype_dispatch():
     fin = torch.isfinite(base)
     assert torch.equal(torch.isneginf(half), torch.isneginf(base))
     assert torch.allclose(half[fin], 0.5 * base[fin], rtol=1e-6, atol=1e-6)
+    full_bf = run_fp4(q, kd, ks, bt, seq, S, H, mb)
+    half_bf = run_fp4(q, kd, ks, bt, seq, S, H, mb, q_scale=0.5)
+    assert torch.allclose(half_bf[fin], 0.5 * full_bf[fin], rtol=1e-6, atol=1e-6)
     for bad in (0.0, -1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="q_scale"):
             run_fp4(q8, kd, ks, bt, seq, S, H, mb, q_scale=bad)
