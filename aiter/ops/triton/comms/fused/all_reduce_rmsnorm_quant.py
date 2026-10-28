@@ -30,7 +30,7 @@ def all_reduce_rmsnorm_quant(
     """
     Returns out = RMSNorm(residual_out) and residual_out = all-reduce(x) + residual
     over the 4 ranks of ``group`` on gfx1250, with one kernel launch. All ranks get
-    the same bits. RCCL + add_rmsnorm is faster above 1024 tokens.
+    the same bits.
 
     Args:
         x, residual (torch.Tensor): bf16 (tokens, hidden). hidden is a power of 2

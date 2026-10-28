@@ -13,7 +13,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-_LINES = 64  # lines of one chunk: 2 for each lane of one wave
+_LINES = 64  # lines of a chunk: 2 for each lane of one wave
 _MAXIT = 20_000_000  # poll limit, some seconds: a peer can still be compiling
 _PROGRAMS = 2048  # receivers: more polling receivers can fill the GPU
 
@@ -39,11 +39,9 @@ def all_reduce_init(group, max_bytes):
     from aiter.dist.device_communicators.custom_all_reduce import _should_use_vmm
 
     assert get_arch() == "gfx1250" and dist.get_world_size(group) == 4
-    # As in the custom all-reduce: on gfx1250, hipIpc works from ROCm 7.14.
     assert not _should_use_vmm(True), "needs ROCm 7.14 or later for hipIpc"
     hip = ctypes.CDLL(find_loaded_library("libamdhip64"))
-    # A chunk is 64 lines of 16 bytes with 2 call counters. A row of the fused
-    # kernel also has 2 counters, and it can be 512 bytes: a chunk for each 512.
+    # A chunk of 64 lines of 16 bytes and 2 call counters for each 512 bytes of x.
     chunks = triton.cdiv(max_bytes, 8 * _LINES)
     size = ctypes.c_size_t(2 * 4 * chunks * _LINES * 16)  # 2 banks x 4 senders
     inbox = ctypes.c_void_p()
@@ -87,9 +85,8 @@ def all_reduce_free(group, inboxes):
 def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
     """
     Returns the sum of the bf16 tensor x over the 4 ranks of ``group`` on gfx1250,
-    with one kernel launch. All ranks get the same bits. For small tensors: RCCL
-    is faster from 6 MB. All ranks must make the same calls in the same order.
-    HIP graphs are supported.
+    with one kernel launch. All ranks get the same bits. All ranks must make the
+    same calls in the same order. HIP graphs are supported.
 
     Args:
         x (torch.Tensor): Contiguous bf16, 16-byte aligned, a multiple of 4

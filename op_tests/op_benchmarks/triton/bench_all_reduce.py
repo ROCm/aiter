@@ -53,7 +53,6 @@ def benchmark(args, rank, device, tp, inboxes, calls):
         line_arg="provider",
         line_vals=providers,
         line_names=providers,
-        styles=[("green", "-"), ("blue", "-"), ("red", "-")][: len(providers)],
         ylabel=unit,
         plot_name=get_caller_name_no_ext(),
         args={},

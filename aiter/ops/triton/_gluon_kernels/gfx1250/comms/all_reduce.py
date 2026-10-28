@@ -1,13 +1,7 @@
-"""All-reduce of bf16 data over 4 GPUs. A sender writes a chunk of x into the inbox
-of each peer as 16-byte lines of 2 units [value, value, value, tag]: 3 bf16 values
-and a 16-bit tag of the call number. A receiver waits until its lines carry the tag
-of the current call, then adds the 4 chunks. Even and odd calls use different banks,
-because a GPU can be one call ahead of a peer.
-
-Call numbers go from 1 to 2^30, then start at 1 again. The tag is call % 32768 + 1,
-never 0 (an empty inbox). Each use of a chunk writes all its units, so before the
-data comes, a unit in the bank of a call holds the call 2 uses of the chunk ago:
-15 bits of tag tell the 2 calls apart."""
+"""All-reduce of bf16 data over 4 GPUs in one kernel. A sender writes its chunk of x
+into the inbox of each peer as 16-byte lines of 2 units [value, value, value, tag]. A
+receiver waits until its lines carry the tag of the call, then adds the 4 chunks. Even
+and odd calls use 2 banks of the inbox: a GPU can be one call ahead of a peer."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -16,22 +10,11 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @gluon.jit
-def _lo(word):  # the low bf16 value of a word, as fp32
-    return (word << 16).to(gl.float32, bitcast=True)
-
-
-@gluon.jit
-def _hi(word):
-    return (word & -65536).to(gl.float32, bitcast=True)
-
-
-@gluon.jit
 def _lines(x, value, mask0, mask1, mask2, PLANE: gl.constexpr, counter):
     """Advances the call counter. Returns the call and the lines of 2 units [x[value],
-    x[value + PLANE], x[value + 2 PLANE], tag], with 0 for the values out of a mask.
-    For value [n, c], line h * n + i has the units of columns 2h and 2h + 1 of row i."""
+    x[value + PLANE], x[value + 2 PLANE], tag], with 0 for the values out of a mask."""
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
-    call = gl.load(counter) % (1 << 30) + 1
+    call = gl.load(counter) % (1 << 30) + 1  # 1 to 2^30
     # Buffer loads: a mask does not make a branch.
     v0 = gl.amd.cdna5.buffer_load(x, value, mask=mask0, other=0)
     v1 = gl.amd.cdna5.buffer_load(x, value + PLANE, mask=mask1, other=0)
@@ -41,9 +24,12 @@ def _lines(x, value, mask0, mask1, mask2, PLANE: gl.constexpr, counter):
     b0 = v0.to(gl.int16, bitcast=True).to(gl.int32) & 65535
     b1 = v1.to(gl.int16, bitcast=True).to(gl.int32) << 16
     b2 = v2.to(gl.int16, bitcast=True).to(gl.int32) & 65535
+    # Never 0 (an empty inbox). Before the data comes, a unit holds the call of 2 uses
+    # of the chunk ago: 15 bits tell the 2 calls apart.
     tag = call % 32768 + 1
     N: gl.constexpr = value.shape[0]
     H: gl.constexpr = value.shape[1] // 2  # lines of a row
+    # Line h * N + i has the units of columns 2h and 2h + 1 of row i.
     lines = gl.reshape(gl.join(b1 | b0, tag << 16 | b2), [N, H, 4])
     lines = gl.reshape(gl.permute(lines, (1, 0, 2)), [H * N, 4])
     return call, gl.convert_layout(lines, LINE, assert_trivial=True)
@@ -59,9 +45,17 @@ def _unit_words(lines):
 
 
 @gluon.jit
+def _values(lines):
+    """The 3 values of each unit as fp32. A word has 2 bf16 values, the low one first."""
+    lo, hi = _unit_words(lines)
+    v0 = (lo << 16).to(gl.float32, bitcast=True)
+    v1 = (lo & -65536).to(gl.float32, bitcast=True)
+    return v0, v1, (hi << 16).to(gl.float32, bitcast=True)
+
+
+@gluon.jit
 def _post(lines, inboxes, pos, mask, call, RANK: gl.constexpr, SLOT: gl.constexpr):
-    """Write the lines in the mask into the inbox of each peer, at pos in the slot of
-    this rank in the bank of the call."""
+    """Writes the lines in the mask to pos in the slot of this rank in each peer."""
     slot = (call % 2 * 4 + RANK) * SLOT
     for peer in gl.static_range(4):
         if peer != RANK:
@@ -71,7 +65,7 @@ def _post(lines, inboxes, pos, mask, call, RANK: gl.constexpr, SLOT: gl.constexp
 
 
 @gluon.jit
-def _poll(
+def _receive(
     inboxes,
     pos,
     mask,
@@ -82,14 +76,13 @@ def _poll(
     SLOT: gl.constexpr,
     MAXIT: gl.constexpr,
 ):
-    """Wait until the lines at pos in the mask of the 3 peers carry the tag of the
-    call. Returns the lines of ranks 0 to 3, mine for this rank. A line out of the
-    mask is 0 with the tag."""
+    """Waits until the lines at pos in the mask of the 3 peers carry the tag of the
+    call. Returns the 3 values of each unit, added over the 4 ranks in fp32."""
     WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     col = gl.arange(0, 4, layout=gl.SliceLayout(0, LINE))[None, :]
     tag = call % 32768 + 1
-    empty = col % 2 * (tag << 16)
+    empty = col % 2 * (tag << 16)  # a line out of the mask reads as 0 with the tag
     bank = call % 2 * 4 * SLOT
     inbox = gl.multiple_of(inboxes[RANK].to(gl.pointer_type(gl.int32)), 16)
     l0 = mine
@@ -125,7 +118,12 @@ def _poll(
 
     if late > 0:  # the poll timed out
         gl.atomic_add(err, 1)
-    return l0, l1, l2, l3
+    a0, a1, a2 = _values(l0)
+    b0, b1, b2 = _values(l1)
+    c0, c1, c2 = _values(l2)
+    d0, d1, d2 = _values(l3)
+    # Rank order, so that all ranks get the same bits.
+    return a0 + b0 + c0 + d0, a1 + b1 + c1 + d1, a2 + b2 + c2 + d2
 
 
 _all_reduce_repr = make_kernel_repr("_all_reduce_kernel", ["RANK", "LINES"])
@@ -145,17 +143,16 @@ def _all_reduce_kernel(
     SLOT: gl.constexpr,
     MAXIT: gl.constexpr,
 ):
-    """y = the sum of the n bf16 values of x over 4 ranks. A chunk is LINES lines.
-    Unit u of a chunk has the values u, U + u and 2U + u of the chunk (U = 2 LINES
-    units), so that the loads of x stay coalesced. Programs 0 to C-1 send the C
+    """y = the sum of the n values of x over the 4 ranks. Programs 0 to C-1 send the C
     chunks, one each: a load after a remote store waits for its ack. Programs C to
-    C+P-1 receive chunks p, p + P, ... (P = programs), so at most P receivers poll
-    and other kernels can still start. The GPU starts programs in order, so a
-    waiting receiver cannot block a sender."""
+    C+P-1 receive chunks p, p + P, ... (P = programs). The GPU starts programs in
+    order, so a waiting receiver cannot block a sender."""
     WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     num_chunks = gl.cdiv(n, 6 * LINES)
     pid = gl.program_id(0)
+    # Unit u of a chunk has the values u, U + u and 2U + u (U = 2 LINES units), so that
+    # the loads of x are coalesced.
     line = gl.arange(0, LINES, layout=gl.SliceLayout(1, WORDS))[:, None]
     pair = gl.arange(0, 2, layout=gl.SliceLayout(0, WORDS))[None, :]  # 2 units a line
     line4 = gl.arange(0, LINES, layout=gl.SliceLayout(1, LINE))[:, None]
@@ -181,17 +178,9 @@ def _all_reduce_kernel(
             )
             pos = 4 * (c * LINES + line4) + col4
             needed = 6 * c * LINES + 2 * line4 < n  # the line has values of x
-            l0, l1, l2, l3 = _poll(
+            s0, s1, s2 = _receive(
                 inboxes, pos, needed, call, lines, err, RANK, SLOT, MAXIT
             )
-            lo0, hi0 = _unit_words(l0)
-            lo1, hi1 = _unit_words(l1)
-            lo2, hi2 = _unit_words(l2)
-            lo3, hi3 = _unit_words(l3)
-            # Rank order in fp32, so that all ranks get the same bits.
-            s0 = _lo(lo0) + _lo(lo1) + _lo(lo2) + _lo(lo3)
-            s1 = _hi(lo0) + _hi(lo1) + _hi(lo2) + _hi(lo3)
-            s2 = _lo(hi0) + _lo(hi1) + _lo(hi2) + _lo(hi3)
             s0 = s0.to(gl.bfloat16)
             s1 = s1.to(gl.bfloat16)
             s2 = s2.to(gl.bfloat16)

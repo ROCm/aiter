@@ -1,37 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""All-reduce + residual add + RMSNorm (+ fp8 group quant). The receiver of a row
-holds the whole row, so it adds, normalizes and quantizes the row before it stores
-anything, as a GEMM epilogue does.
-
-A program sends or receives 3 rows (a triple). Unit c of a triple has value c of
-each of the 3 rows and the tag, so a triple of hidden values is hidden / 2 lines
-of 16 bytes. A lane holds 4 columns of each row, and a wave a group of 128 columns:
-the fp8 scale of a group is in one wave."""
+"""All-reduce + residual add + RMSNorm (+ fp8 group quant) over 4 GPUs in one kernel.
+A program moves 3 rows: unit c has column c of each row. A receiver holds the whole
+rows, so it adds, normalizes and quantizes them before it stores, as a GEMM epilogue
+does."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.gfx1250.comms.all_reduce import (
-    _hi,
     _lines,
-    _lo,
-    _poll,
     _post,
-    _unit_words,
+    _receive,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @gluon.jit
-def _columns(words):
-    """Words [2n, 2] of the lines as [n, 4]: line h * n + i has columns 2h and 2h + 1
-    of row i."""
+def _columns(v):
+    """The values [2N, 2] of the lines as [N, 4]: line h * N + i has columns 2h and
+    2h + 1 of row i."""
     ROW: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
-    N: gl.constexpr = words.shape[0] // 2
-    words = gl.permute(gl.reshape(words, [2, N, 2]), (1, 0, 2))
-    return gl.convert_layout(gl.reshape(words, [N, 4]), ROW, assert_trivial=True)
+    N: gl.constexpr = v.shape[0] // 2
+    v = gl.permute(gl.reshape(v, [2, N, 2]), (1, 0, 2))
+    return gl.convert_layout(gl.reshape(v, [N, 4]), ROW, assert_trivial=True)
 
 
 _all_reduce_rmsnorm_repr = make_kernel_repr(
@@ -61,19 +54,18 @@ def _all_reduce_rmsnorm_kernel(
     GEMMA: gl.constexpr,
     QUANT: gl.constexpr,
 ):
-    """Program t sends rows 3t to 3t + 2 of x. Programs T to T + P - 1 receive and
-    store triples p, p + P, ... (T triples, P = programs), so at most P receivers
-    poll. The rows from tokens on are 0 and are not stored."""
+    """Program t sends rows 3t to 3t + 2 of x. Programs T to T + P - 1 receive triples
+    p, p + P, ... (T triples, P = programs). Rows from tokens on are 0, not stored."""
+    # A lane has 4 columns of a row and a wave has 128: one fp8 group.
     ROW: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
-    N: gl.constexpr = HIDDEN // 4  # 4 columns of a row for each lane
+    N: gl.constexpr = HIDDEN // 4
     GROUPS: gl.constexpr = HIDDEN // 128
     triples = gl.cdiv(tokens, 3)
     pid = gl.program_id(0)
     lane = gl.arange(0, N, layout=gl.SliceLayout(1, ROW))[:, None]
     col = 4 * lane + gl.arange(0, 4, layout=gl.SliceLayout(0, ROW))[None, :]
-    # In the inbox, the 128 columns of a group are 64 lines: columns 4i and 4i + 1
-    # in line i, 4i + 2 and 4i + 3 in line 32 + i. Then a store of a wave writes
-    # 512 contiguous bytes.
+    # A group is 64 lines: columns 4i and 4i + 1 in line i, 4i + 2 and 4i + 3 in line
+    # 32 + i. Then a store of a wave writes 512 contiguous bytes.
     line = gl.arange(0, 2 * N, layout=gl.SliceLayout(1, ROW))[:, None]
     i = line % N
     pos = 64 * (i // 32) + 32 * (line // N) + i % 32
@@ -92,8 +84,7 @@ def _all_reduce_rmsnorm_kernel(
         # All lines of the triple on each call: no old tag can stay.
         _post(lines, inboxes, 2 * HIDDEN * pid + pos, line < 2 * N, call, RANK, SLOT)
     else:
-        # The weight is the same for all rows: load it once.
-        w = gl.amd.cdna5.buffer_load(weight, col).to(gl.float32)
+        w = gl.amd.cdna5.buffer_load(weight, col).to(gl.float32)  # once for all rows
         if GEMMA:
             w += 1.0
         for t in range(pid - triples, triples, programs):
@@ -116,7 +107,7 @@ def _all_reduce_rmsnorm_kernel(
             r2 = gl.amd.cdna5.buffer_load(
                 res, col + 2 * HIDDEN, mask=row + 2 < tokens, other=0
             )
-            l0, l1, l2, l3 = _poll(
+            s0, s1, s2 = _receive(
                 inboxes,
                 2 * HIDDEN * t + pos,
                 line < 2 * N,
@@ -127,25 +118,11 @@ def _all_reduce_rmsnorm_kernel(
                 SLOT,
                 MAXIT,
             )
-            lo0, hi0 = _unit_words(l0)
-            lo1, hi1 = _unit_words(l1)
-            lo2, hi2 = _unit_words(l2)
-            lo3, hi3 = _unit_words(l3)
-            lo0 = _columns(lo0)
-            hi0 = _columns(hi0)
-            lo1 = _columns(lo1)
-            hi1 = _columns(hi1)
-            lo2 = _columns(lo2)
-            hi2 = _columns(hi2)
-            lo3 = _columns(lo3)
-            hi3 = _columns(hi3)
-            # Rank order in fp32, then the residual, so that all ranks get the same
-            # bits.
-            s0 = _lo(lo0) + _lo(lo1) + _lo(lo2) + _lo(lo3) + r0.to(gl.float32)
-            s1 = _hi(lo0) + _hi(lo1) + _hi(lo2) + _hi(lo3) + r1.to(gl.float32)
-            s2 = _lo(hi0) + _lo(hi1) + _lo(hi2) + _lo(hi3) + r2.to(gl.float32)
-            # One reduction over the waves for the 3 rows, before the stores. After
-            # the reshape, join(join(a, b), join(c, d)) is [a, c, b, d].
+            # The residual last, in fp32: all ranks get the same bits.
+            s0 = _columns(s0) + r0.to(gl.float32)
+            s1 = _columns(s1) + r1.to(gl.float32)
+            s2 = _columns(s2) + r2.to(gl.float32)
+            # One sum over the waves for the 3 rows: the joins put row r at index r.
             sq = gl.join(gl.join(s0 * s0, s2 * s2), gl.join(s1 * s1, s2 * 0))
             sq = gl.sum(gl.sum(gl.reshape(sq, [N, 4, 4]), axis=1), axis=0)
             idx = gl.arange(0, 4, layout=sq.type.layout)
