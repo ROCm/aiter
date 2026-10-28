@@ -1515,12 +1515,7 @@ def _fused_moe_impl(
             raise ValueError(
                 "herd_topk requires K+1 candidate IDs and weights per token"
             )
-        if (
-            expert_mask is not None
-            or stage2_scatter is not None
-            or num_local_tokens is not None
-            or doweight_stage1
-        ):
+        if expert_mask is not None or stage2_scatter is not None or doweight_stage1:
             raise ValueError(
                 "HERD routing requires unmasked routes and doweight_stage1=False"
             )
@@ -1565,11 +1560,14 @@ def _fused_moe_impl(
         )
 
         if not herd_use_fused_drop():
+            # Pad rows past num_local_tokens leave as ids -1, which the grouped
+            # MoE route skips like any other unrouted row.
             topk_weight, topk_ids = herd_finalize_candidates(
                 topk_weight,
                 topk_ids,
                 E,
                 herd_routed_scaling_factor,
+                num_valid_rows=num_local_tokens,
             )
             herd_topk = 0
     quant_type = quant_remap.get(quant_type, quant_type)

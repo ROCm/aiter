@@ -33,7 +33,13 @@ def herd_finalize_candidates(
     candidate_ids: torch.Tensor,
     experts: int,
     routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop, renormalize and scale Top-(K+1) candidates down to K routes.
+
+    Rows at or past ``num_valid_rows`` (int32 on device) are padding: they stay
+    out of the batch popularity and get ids -1 and weights 0.
+    """
     rows, width = candidate_ids.shape
     topk = width - 1
     weights = torch.empty(
@@ -53,6 +59,7 @@ def herd_finalize_candidates(
         False,
         _K3_FINALIZE_THREADS if experts > 512 else _DEFAULT_FINALIZE_THREADS,
         torch.cuda.current_stream(candidate_ids.device),
+        num_valid_rows=num_valid_rows,
     )
     return weights, ids
 

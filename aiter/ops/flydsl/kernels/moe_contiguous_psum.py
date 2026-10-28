@@ -18,6 +18,7 @@ from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32
 
 from aiter.ops.flydsl.kernels.herd_topk import _kept_routes
+from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -747,11 +748,17 @@ def build_moe_route_psum_fused_module():
     return launch_route_psum_fused
 
 
-def build_moe_route_psum_herd_module(topk: int):
+def build_moe_route_psum_herd_module(topk: int, has_num_valid_rows: bool = False):
+    """HERD drop + route + prefix sum over Top-(K+1) candidates in one block.
+
+    `has_num_valid_rows`: rows at or past the device count `num_valid_rows[0]`
+    are padding -- left out of the batch popularity, their routes written as
+    DROPPED_ROUTE_ROW with weight 0, so they claim no grouped row. Their
+    candidates are never read. Without it `num_valid_rows` is unread."""
     kp1 = topk + 1
 
     @flyc.kernel(
-        name=f"moe_route_psum_herd_k{topk}",
+        name=f"moe_route_psum_herd_k{topk}" + ("_nv" if has_num_valid_rows else ""),
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def route_psum_herd_kernel(
@@ -767,10 +774,16 @@ def build_moe_route_psum_herd_module(topk: int):
         max_m: Int32,
         tile_m: Int32,
         routed_scaling_factor: fx.Float32,
+        num_valid_rows: fx.Pointer,
     ):
         tid = fx.Uint32(fx.thread_idx.x)
         tile_v = fx.Uint32(tile_m)
         tile_minus_1 = tile_v - 1
+        valid_tokens = fx.Uint32(tokens)
+        if const_expr(has_num_valid_rows):
+            valid_tokens = fx.Uint32(
+                fx.min(tokens, fx.Int32(ptr_buf_tensor(num_valid_rows)[fx.Uint32(0)]))
+            )
 
         lds = fx.SharedAllocator().allocate(_RoutePsumHerdStorage).peek()
         lds_pop = lds.pop.ptr
@@ -792,13 +805,18 @@ def build_moe_route_psum_herd_module(topk: int):
             lds_cnt[tid] = fx.Int32(0)
         gpu.barrier()
 
-        n_cand = fx.Uint32(tokens) * fx.Uint32(kp1)
+        n_cand = valid_tokens * fx.Uint32(kp1)
         for cand in range(tid, n_cand, MAX_EXPERTS_PER_BLOCK):
             e = ids_p[cand]
             fx.atomic_add(lds_pop + e, fx.Int32(1), syncscope="workgroup")
         gpu.barrier()
 
-        n_route = fx.Uint32(tokens) * fx.Uint32(topk)
+        n_route = valid_tokens * fx.Uint32(topk)
+        if const_expr(has_num_valid_rows):
+            n_all_routes = fx.Uint32(tokens) * fx.Uint32(topk)
+            for route in range(n_route + tid, n_all_routes, MAX_EXPERTS_PER_BLOCK):
+                rows_p[route] = fx.Int32(DROPPED_ROUTE_ROW)
+                w_p[route] = fx.Float32(0.0)
         for route in range(tid, n_route, MAX_EXPERTS_PER_BLOCK):
             token = route // fx.Uint32(topk)
             out_slot = fx.Int32(route - token * fx.Uint32(topk))
@@ -873,6 +891,7 @@ def build_moe_route_psum_herd_module(topk: int):
         max_m: fx.Int32,
         tile_m: fx.Int32,
         routed_scaling_factor: fx.Float32,
+        num_valid_rows: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         route_psum_herd_kernel(
@@ -888,6 +907,7 @@ def build_moe_route_psum_herd_module(topk: int):
             max_m,
             tile_m,
             routed_scaling_factor,
+            num_valid_rows,
         ).launch(
             grid=(1, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),

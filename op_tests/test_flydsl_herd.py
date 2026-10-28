@@ -123,7 +123,7 @@ def test_route_skips_unrouted_pad_rows(valid):
 def test_grouped_route_psum_reuses_kernel_across_batches(experts, topk):
     if get_gfx_runtime() not in ("gfx950", "gfx1250"):
         pytest.skip("requires gfx950 or gfx1250")
-    launch = _get_compiled_route_psum_herd(topk)
+    launch = _get_compiled_route_psum_herd(topk, False)
     cache_keys = None
     for tokens in (1, 16, 32, 64, 128):
         ids, values = _candidates(tokens, experts, topk)
@@ -140,11 +140,76 @@ def test_grouped_route_psum_reuses_kernel_across_batches(experts, topk):
         lower = starts[kept.long()]
         assert ((rows >= lower) & (rows < lower + hist[kept.long()])).all()
         assert rows.unique().numel() == tokens * topk
-        assert _get_compiled_route_psum_herd(topk) is launch
+        assert _get_compiled_route_psum_herd(topk, False) is launch
         if cache_keys is None:
             cache_keys = tuple(launch._mem_cache)
             assert len(cache_keys) == 1
         assert tuple(launch._mem_cache) == cache_keys
+
+
+def _pad_candidates(ids, values, count, unrouted):
+    """The candidates as a router under num_valid_rows leaves them: rows past
+    `count` routed to -1 with weight 0, or left as they are."""
+    ids, values = ids.clone(), values.clone()
+    if unrouted:
+        ids[count:] = -1
+        values[count:] = 0
+    return ids, values
+
+
+@pytest.mark.parametrize("experts,topk", [(128, 4), (256, 6)])
+@pytest.mark.parametrize("unrouted", [True, False])
+def test_grouped_route_psum_skips_pad_rows(experts, topk, unrouted):
+    """Rows past num_valid_rows stay out of the popularity and take no grouped
+    row whatever their candidates hold; the count is read on device."""
+    if get_gfx_runtime() not in ("gfx950", "gfx1250"):
+        pytest.skip("requires gfx950 or gfx1250")
+    from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
+
+    tokens = 64
+    ids, values = _candidates(tokens, experts, topk)
+    cand_ids, cand_values = ids.clone(), values.clone()
+    valid = torch.tensor([tokens], device="cuda", dtype=torch.int32)
+
+    def run():
+        return herd_route_psum_remap(
+            cand_ids, cand_values, experts, tokens, 32, 2.5, num_valid_rows=valid
+        )
+
+    run()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        counts, rows, psum, gather_weights = run()
+    for count in (tokens, 41, 0):
+        padded_ids, padded_values = _pad_candidates(ids, values, count, unrouted)
+        cand_ids.copy_(padded_ids)
+        cand_values.copy_(padded_values)
+        valid.fill_(count)
+        graph.replay()
+        if count:
+            kept, weights = _reference(ids[:count], values[:count], experts, 2.5)
+        else:
+            kept = ids.new_empty(0, topk)
+            weights = values.new_empty(0, topk)
+        hist = torch.bincount(kept.flatten().long(), minlength=experts)
+        padded = (hist + 31) // 32 * 32
+        starts = padded.cumsum(0) - padded
+        torch.testing.assert_close(counts.long(), hist, rtol=0, atol=0)
+        torch.testing.assert_close(psum.long(), starts + hist, rtol=0, atol=0)
+        torch.testing.assert_close(
+            gather_weights[:count], weights, rtol=2e-5, atol=1e-6
+        )
+        lower = starts[kept.long()]
+        real = rows[:count]
+        assert ((real >= lower) & (real < lower + hist[kept.long()])).all()
+        assert real.unique().numel() == count * topk
+        assert (rows[count:] == DROPPED_ROUTE_ROW).all()
+        assert (gather_weights[count:] == 0).all()
 
 
 @pytest.mark.parametrize("experts,topk", [(128, 4), (256, 6), (896, 16)])
@@ -317,19 +382,12 @@ def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, drop):
         torch.testing.assert_close(weights, values, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("tokens", [16, 128])
-def test_fused_moe_outputs_match_router_drop(monkeypatch, tokens):
-    if get_gfx_runtime() not in ("gfx950", "gfx1250"):
-        pytest.skip("HERD MoE supports gfx950 and gfx1250")
+def _moe_weights(experts, dim, generator):
+    """MXFP4 GUGU weights and the fused_moe arguments the HERD tests share."""
     from aiter import ActivationType, QuantType, benchmark_data_init
-    from aiter.fused_moe import fused_moe
     from aiter.ops.flydsl.moe_common import GateMode
     from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
     from aiter.utility import dtypes
-
-    monkeypatch.setenv("AITER_HERD_FUSED_DROP", "1")
-    experts, topk, dim = 128, 4, 512
-    generator = torch.Generator(device="cuda").manual_seed(2713)
 
     def weight(rows, gate_up):
         plain = (
@@ -360,6 +418,24 @@ def test_fused_moe_outputs_match_router_drop(monkeypatch, tokens):
         "quant_dtype_a": dtypes.fp8,
         "gate_mode": GateMode.INTERLEAVE.value,
     }
+    return w1, w2, kwargs
+
+
+def _logits_diff(actual, expected):
+    x, y = actual.float(), expected.float()
+    return float((x - y).square().sum() / (x.square().sum() + y.square().sum()))
+
+
+@pytest.mark.parametrize("tokens", [16, 128])
+def test_fused_moe_outputs_match_router_drop(monkeypatch, tokens):
+    if get_gfx_runtime() not in ("gfx950", "gfx1250"):
+        pytest.skip("HERD MoE supports gfx950 and gfx1250")
+    from aiter.fused_moe import fused_moe
+
+    monkeypatch.setenv("AITER_HERD_FUSED_DROP", "1")
+    experts, topk, dim = 128, 4, 512
+    generator = torch.Generator(device="cuda").manual_seed(2713)
+    w1, w2, kwargs = _moe_weights(experts, dim, generator)
     hidden = (
         torch.randn(
             tokens, dim, device="cuda", dtype=torch.bfloat16, generator=generator
@@ -389,11 +465,10 @@ def test_fused_moe_outputs_match_router_drop(monkeypatch, tokens):
     def check_output(actual):
         assert actual.shape == expected.shape and actual.dtype == expected.dtype
         assert torch.isfinite(actual).all()
-        x, y = actual.float(), expected.float()
         # GEMM2 uses bf16 atomic accumulation. Compare the repository's
         # logits_diff metric to avoid magnifying rounding near zero.
-        error = (x - y).square().sum() / (x.square().sum() + y.square().sum())
-        assert float(error) < 1e-4, f"HERD MoE logits_diff={float(error)}"
+        error = _logits_diff(actual, expected)
+        assert error < 1e-4, f"HERD MoE logits_diff={error}"
 
     check_output(run())
     stream = torch.cuda.Stream()
@@ -408,6 +483,67 @@ def test_fused_moe_outputs_match_router_drop(monkeypatch, tokens):
     check_output(result)
     monkeypatch.setenv("AITER_HERD_FUSED_DROP", "0")
     check_output(run())
+
+
+@pytest.mark.parametrize("drop", ["0", "1"])
+@pytest.mark.parametrize("unrouted", [True, False])
+def test_fused_moe_herd_skips_pad_rows(monkeypatch, drop, unrouted):
+    """fused_moe(herd_topk) under num_local_tokens: the real rows match a MoE
+    over them alone, the pad rows come out zero, and a replayed CUDA graph
+    follows each step's count."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("K+1 HERD candidates reach fused_moe only on gfx1250")
+    from aiter.fused_moe import fused_moe
+
+    monkeypatch.setenv("AITER_HERD_FUSED_DROP", drop)
+    experts, topk, dim, tokens = 128, 4, 512, 64
+    generator = torch.Generator(device="cuda").manual_seed(6938)
+    w1, w2, kwargs = _moe_weights(experts, dim, generator)
+    hidden = (
+        torch.randn(
+            tokens, dim, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        * 0.01
+    )
+    ids, values = _candidates(tokens, experts, topk)
+    cand_ids, cand_values = ids.clone(), values.clone()
+    valid = torch.tensor([tokens], device="cuda", dtype=torch.int32)
+
+    def run():
+        return fused_moe(
+            hidden,
+            w1,
+            w2,
+            cand_values,
+            cand_ids,
+            **kwargs,
+            herd_topk=topk,
+            herd_routed_scaling_factor=2.5,
+            num_local_tokens=valid,
+        )
+
+    run()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    for count in (tokens, 41, 0):
+        padded_ids, padded_values = _pad_candidates(ids, values, count, unrouted)
+        cand_ids.copy_(padded_ids)
+        cand_values.copy_(padded_values)
+        valid.fill_(count)
+        graph.replay()
+        assert torch.isfinite(result).all()
+        assert (result[count:] == 0).all(), f"count={count}: pad rows not zero"
+        if count:
+            kept, weights = _reference(ids[:count], values[:count], experts, 2.5)
+            expected = fused_moe(hidden[:count], w1, w2, weights, kept, **kwargs)
+            error = _logits_diff(result[:count], expected)
+            assert error < 1e-4, f"count={count}: HERD MoE logits_diff={error}"
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])

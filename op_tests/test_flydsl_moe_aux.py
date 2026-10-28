@@ -924,6 +924,8 @@ def test_route_psum_herd(tokens, E, topk, tile_m):
     masked = torch.full((E,), -99, dtype=I32)
     starts = torch.full((E,), -99, dtype=I32)
     psum = torch.full((E,), -99, dtype=I32)
+    # Unread without has_num_valid_rows; a null pointer stands in for it.
+    no_count = torch.empty(0, dtype=I32)
 
     def fn():
         launch(
@@ -939,6 +941,7 @@ def test_route_psum_herd(tokens, E, topk, tile_m):
             max_m,
             tile_m,
             scale,
+            ptr_arg(no_count),
             stream=torch.cuda.current_stream().cuda_stream,
         )
 
