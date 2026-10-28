@@ -61,6 +61,7 @@ from typing import Any
 import torch
 from gfx942_gemm_oracle import error_ratio
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
     CONFIG_DEFAULTS,
     GFX942_NUM_CUS,
@@ -305,7 +306,7 @@ def table_row(
 
 def device_metadata() -> tuple[str, str, int]:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return props.name, props.gcnArchName.split(":")[0], props.multi_processor_count
+    return props.name, get_gfx(), props.multi_processor_count
 
 
 # ---------------------------------------------------------------- candidates
@@ -714,6 +715,9 @@ def main() -> None:
     if args.report_only:
         print_table(args.table)
         return
+    gfx = get_gfx()
+    if gfx != "gfx942":
+        parser.error(f"tuning requires gfx942, got {gfx!r}")
     if args.shapes:
         shapes = read_shapes(args.shapes)
     elif None not in (args.M, args.N, args.K):
