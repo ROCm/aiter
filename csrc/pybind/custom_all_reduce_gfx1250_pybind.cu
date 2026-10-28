@@ -29,6 +29,17 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
     m.def("all_gather", &aiter::all_gather,
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("dim"), py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
+    m.def("fused_allreduce_rmsnorm", &aiter::fused_allreduce_rmsnorm,
+          py::arg("_fa"), py::arg("inp"), py::arg("res_inp"), py::arg("res_out"),
+          py::arg("out"), py::arg("w"), py::arg("eps"),
+          py::arg("reg_ptr"), py::arg("reg_bytes"),
+          py::arg("use_1stage"), py::arg("gemma_norm") = false);
+    m.def("fused_allreduce_rmsnorm_quant", &aiter::fused_allreduce_rmsnorm_quant,
+          py::arg("_fa"), py::arg("inp"), py::arg("res_inp"), py::arg("res_out"),
+          py::arg("out"), py::arg("scale_out"), py::arg("w"), py::arg("eps"),
+          py::arg("reg_ptr"), py::arg("reg_bytes"),
+          py::arg("use_1stage"), py::arg("gemma_norm") = false,
+          py::arg("bf16_out_ptr") = 0);
     m.def("p2p_bw_test", &aiter::p2p_bw_test,
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("unroll"), py::arg("threads"), py::arg("blocks"),

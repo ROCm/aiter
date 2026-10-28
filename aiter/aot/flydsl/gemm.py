@@ -76,8 +76,13 @@ def _flag(value) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes")
 
 
-def _blocks(w_scale_block: str) -> tuple[int, int]:
-    rows, cols = (int(v) for v in str(w_scale_block).strip().split("x"))
+def _blocks(w_scale_block: str, default: str) -> tuple[int, int]:
+    """(rows, cols) of a w_scale_block cell; a blank or 0 cell reads as
+    ``default``, as the runtime's loader of that table reads it."""
+    from aiter.ops.gemm_op_common import mxscale_w_scale_block_cell
+
+    cell = mxscale_w_scale_block_cell(w_scale_block, default)
+    rows, cols = (int(v) for v in cell.split("x"))
     return rows, cols
 
 
@@ -130,7 +135,7 @@ def _a8w8_mxfp8_bpreshuffle(job: dict) -> None:
     from aiter.utility import dtypes
 
     m, n, k = job["m"], job["n"], job["k"]
-    rows, cols = _blocks(job["w_scale_block"] or "1x32")
+    rows, cols = _blocks(job["w_scale_block"], "1x32")
     x_block = 128 if cols == 128 else 32
     gemm_a8w8_mxfp8_bpreshuffle(
         _empty(m, k, dtype=dtypes.fp8),
@@ -149,7 +154,7 @@ def _a8w8_blockscale_mxscale_bpreshuffle(job: dict) -> None:
     from aiter.utility import dtypes
 
     m, n, k = job["m"], job["n"], job["k"]
-    rows, cols = _blocks(job["w_scale_block"] or "128x128")
+    rows, cols = _blocks(job["w_scale_block"], "128x128")
     x_block = job["x_block"]
     gemm_a8w8_blockscale_bpreshuffle(
         _empty(m, k, dtype=dtypes.fp8),
@@ -165,7 +170,7 @@ def _batched_a8w8_mxscale_bpreshuffle(job: dict) -> None:
     from aiter.utility import dtypes
 
     b, m, n, k = job["b"], job["m"], job["n"], job["k"]
-    rows, cols = _blocks(job["w_scale_block"] or "128x128")
+    rows, cols = _blocks(job["w_scale_block"], "128x128")
     batched_gemm_a8w8_mxscale_bpreshuffle(
         _empty(m, b, k, dtype=dtypes.fp8),
         _empty(b, n, k, dtype=dtypes.fp8),
@@ -342,7 +347,7 @@ def _variants(table: Table, job: dict) -> list[dict]:
     blockscale GEMM, which pairs with the weight's (1x128 blockscale with
     128x128 blocks, 1x32 group32 with 32x32 and 1x32 ones)."""
     if table.caller is _a8w8_blockscale_mxscale_bpreshuffle:
-        _, cols = _blocks(job["w_scale_block"] or "128x128")
+        _, cols = _blocks(job["w_scale_block"], "128x128")
         return [{"x_block": 128 if cols == 128 else 32}]
     return [{}]
 

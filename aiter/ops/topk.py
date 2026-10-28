@@ -89,6 +89,7 @@ def _gfx1250_exact_sigmoid_topk(
     topk_ids: torch.Tensor,
     need_renorm: bool,
     routed_scaling_factor: float,
+    num_valid_rows: torch.Tensor | None,
 ) -> None:
     from .triton.moe.moe_routing.topk_gating import exact_sigmoid_biased_topk
 
@@ -99,6 +100,7 @@ def _gfx1250_exact_sigmoid_topk(
         topk_ids,
         need_renorm,
         routed_scaling_factor,
+        num_valid_rows,
     )
 
 
@@ -203,8 +205,7 @@ def topk_gating(
             f"correction_bias dtype {correction_bias.dtype} is not supported for "
             f"{gating_output.dtype} gating_output, expected one of {valid}"
         )
-    # The HERD kernels take no pad-row count.
-    if num_valid_rows is None and _use_flydsl_herd(
+    if _use_flydsl_herd(
         topk_weights, topk_indices, gating_output, correction_bias, score_func
     ):
         from .flydsl.herd_topk import herd_topk_gating
@@ -217,6 +218,7 @@ def topk_gating(
             need_renorm,
             routed_scaling_factor,
             score_func,
+            num_valid_rows,
         )
         return
     topk_gating_fwd(
@@ -343,10 +345,8 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
-    # The HERD and gfx1250 kernels take no pad-row count.
     if (
-        num_valid_rows is None
-        and num_expert_group == 1
+        num_expert_group == 1
         and topk_group == 1
         and _use_flydsl_herd(
             topk_weights,
@@ -366,11 +366,11 @@ def biased_grouped_topk(
             need_renorm,
             routed_scaling_factor,
             "sigmoid",
+            num_valid_rows,
         )
         return
     if (
-        num_valid_rows is None
-        and num_expert_group == 1
+        num_expert_group == 1
         and topk_group == 1
         and _can_use_gfx1250_exact_sigmoid_topk(
             gating_output,
@@ -386,6 +386,7 @@ def biased_grouped_topk(
             topk_ids,
             need_renorm,
             routed_scaling_factor,
+            num_valid_rows,
         )
     cu_num = get_cu_num()
     if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <opus/opus.hpp>
+#include <type_traits>
 
 // --- global->LDS async copy on a 64-bit flat address (GLOBAL_LOAD_LDS) ---
 //
@@ -88,6 +89,36 @@ global_load(const D* g_base, void* smem_base, const LayoutG&, const LayoutS& u_s
             *reinterpret_cast<const opus::vector_t<D, VEC>*>(src + g_delta);
 #endif
     });
+}
+
+// global -> VGPR, one issue per y-position of the layout (drop-in for opus::load(gmem, layout)).
+template <opus::index_t VEC,
+          class D,
+          class Layout,
+          std::enable_if_t<opus::is_layout_v<Layout>, bool> = true>
+__device__ inline auto global_load(const D* g_base, const Layout& u)
+{
+    constexpr opus::index_t N = opus::layout_load_traits<Layout, VEC>::r_elem.value;
+    const auto os             = opus::layout_to_offsets<VEC>(u);
+    opus::vector_t<D, VEC * N> r;
+    opus::static_for<N>([&](auto i) {
+        opus::set_slice(r,
+                        *reinterpret_cast<const opus::vector_t<D, VEC>*>(
+                            reinterpret_cast<const char*>(g_base) +
+                            static_cast<int64_t>(os[i.value]) * static_cast<int64_t>(sizeof(D))),
+                        opus::number<i.value * VEC>{},
+                        opus::number<(i.value + 1) * VEC>{});
+    });
+    return r;
+}
+
+// global -> VGPR at a plain element offset.
+template <opus::index_t VEC, class D>
+__device__ inline auto global_load(const D* g_base, opus::index_t os)
+{
+    return *reinterpret_cast<const opus::vector_t<D, VEC>*>(reinterpret_cast<const char*>(g_base) +
+                                                            static_cast<int64_t>(os) *
+                                                                static_cast<int64_t>(sizeof(D)));
 }
 
 __device__ void llvm_amdgcn_global_load_lds(__attribute__((address_space(1))) void* gptr,

@@ -31,6 +31,7 @@ import torch
 from flydsl.expr import const_expr, gpu, math, range_constexpr, rocdl
 
 from .kernels.mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
+from .kernels.tensor_shim import _run_compiled
 
 # Rows in a 16x16x32 MFMA tile. The A operand is indexed by ``lane % 16``
 # whatever M is, so the staged T tile carries whole 16-row tiles.
@@ -481,7 +482,8 @@ def hc_mix(x, down_packed, up_packed, *, split_k=None, up_waves=4, fuse_reduce=F
     # The fused path never touches T; P only fills the argument slot.
     t = p if fuse_reduce else torch.empty((m, r), device=x.device, dtype=x.dtype)
     out = torch.empty((m, k // 4), device=x.device, dtype=x.dtype)
-    _launch(
+    _run_compiled(
+        _launch,
         x,
         down_packed,
         up_packed,
@@ -496,5 +498,6 @@ def hc_mix(x, down_packed, up_packed, *, split_k=None, up_waves=4, fuse_reduce=F
         bool(fuse_reduce),
         stage,
         torch.cuda.current_stream(x.device),
+        specialization_key=(m, k, r, split_k, up_waves, bool(fuse_reduce), stage),
     )
     return out

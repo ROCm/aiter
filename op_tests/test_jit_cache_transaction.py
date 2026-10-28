@@ -845,6 +845,10 @@ class TestModuleBuildLock(unittest.TestCase):
 
 
 class TestBuildPublication(unittest.TestCase):
+    @staticmethod
+    def keys(*kids):
+        return {f"a16w16/gfx942/80/{kid}" for kid in kids}
+
     def setUp(self):
         environment = mock.patch.dict(os.environ, {"AITER_REBUILD": "0"})
         environment.start()
@@ -864,11 +868,12 @@ import json
 import os
 parser = argparse.ArgumentParser()
 parser.add_argument("--output_dir", required=True)
-parser.add_argument("--extra_kids", type=int, nargs="*", default=[])
+parser.add_argument("--extra_kernel_keys", nargs="*", default=[])
+parser.add_argument("--targets", nargs="*", default=[])
 args = parser.parse_args()
 path = os.path.join(args.output_dir, "compiled_kids_opus.json")
-kids = set(json.load(open(path))) if os.path.exists(path) else set()
-kids = sorted(kids | set(args.extra_kids) | {1})
+kids = {key for key in json.load(open(path)) if isinstance(key, str)} if os.path.exists(path) else set()
+kids = sorted(kids | set(args.extra_kernel_keys) | {"a16w16/gfx942/80/1"})
 with open(path, "w") as output:
     json.dump(kids, output)
 with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
@@ -958,8 +963,8 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             srcs=[],
             flags_extra_cc=[],
             flags_extra_hip=[],
-            blob_gen_cmd=f"{self.generator} --output_dir {{}} --extra_kids "
-            + " ".join(map(str, kids)),
+            blob_gen_cmd=f"{self.generator} --output_dir {{}} --extra_kernel_keys "
+            + " ".join(sorted(self.keys(*kids))),
             extra_include=[],
             extra_ldflags=[],
             verbose=False,
@@ -972,22 +977,28 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
     def test_successful_sidecar_survives_clear_build_and_seeds_next_build(self):
         self.build(7)
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {1, 7})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(1, 7)
+            )
         )
         self.core["AITER_REBUILD"] = 1
         self.build(9)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7, 9))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {1, 7, 9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(1, 7, 9)
+            )
         )
 
     def test_repeated_build_installs_new_kids_under_stable_target_name(self):
         self.build(7)
         self.build(9)
         self.assertEqual(self.ninja_targets, ["module_deepgemm_opus"] * 2)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7, 9))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(9)
+            )
         )
         self.assertEqual(self.compiler["JIT_EXTENSION_VERSIONER"].entries, {})
 
@@ -1000,15 +1011,19 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         with self.assertRaisesRegex(RuntimeError, "build .* failed"):
             self.build(9)
         self.assertFalse(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(9)
+            )
         )
         self.assertFalse(os.path.exists(os.path.join(self.op_dir, "build", "lock")))
         self.compiler["_write_ninja_file_and_build_library"] = original_ninja
         self.build(9)
         self.assertEqual(self.ninja_targets, ["module_deepgemm_opus"] * 2)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7, 9))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(9)
+            )
         )
 
     def test_interrupted_ninja_retry_releases_lock_and_recompiles(self):
@@ -1022,7 +1037,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.assertFalse(os.path.exists(os.path.join(self.op_dir, "build", "lock")))
         self.compiler["_write_ninja_file_and_build_library"] = original_ninja
         self.build(9)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7, 9))
 
     def test_deleted_build_output_is_recreated_for_identical_inputs(self):
         self.build(7)
@@ -1030,7 +1045,9 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.build(7)
         self.assertEqual(self.ninja_targets, ["module_deepgemm_opus"] * 2)
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(7)
+            )
         )
 
     def test_rebuild_level_two_removes_binary_but_keeps_objects_and_sidecar(self):
@@ -1043,14 +1060,16 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         def check_rebuild_state(**kwargs):
             self.assertFalse(os.path.exists(self.artifact))
             self.assertEqual(_read(sentinel), "object")
-            self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7})
+            self.assertEqual(set(json.loads(_read(self.sidecar))), self.keys(1, 7))
             return original_ninja(**kwargs)
 
         self.compiler["_write_ninja_file_and_build_library"] = check_rebuild_state
         self.build(9)
         self.assertEqual(_read(sentinel), "object")
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(9)
+            )
         )
 
     def test_codegen_failure_preserves_formatted_runtime_error_contract(self):
@@ -1063,7 +1082,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         )
         self.logger.error.assert_called_once()
         self.assertIn("failed jit build", self.logger.error.call_args.args[0])
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7))
 
     def test_module_without_codegen_does_not_require_a_generation(self):
         sources = ["user.cu"]
@@ -1092,9 +1111,11 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         ):
             self.build(9)
         self.core["_jit_compile"].assert_not_called()
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(7)
+            )
         )
 
     def test_failed_compile_does_not_advance_sidecar(self):
@@ -1103,9 +1124,11 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.core["_jit_compile"] = mock.Mock(side_effect=OSError("hipcc OOM"))
         with self.assertRaisesRegex(RuntimeError, "build .* failed"):
             self.build(9)
-        self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7})
+        self.assertEqual(set(json.loads(_read(self.sidecar))), self.keys(1, 7))
         self.assertFalse(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(7)
+            )
         )
 
     def test_publish_race_does_not_fail_build_or_skip_sidecar_update(self):
@@ -1121,9 +1144,11 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
 
         with mock.patch.object(jit_cache, "_replace", side_effect=peer_wins):
             self.build(9)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7, 9))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(9)
+            )
         )
         self.logger.warning.assert_called_once()
         self.logger.error.assert_not_called()
@@ -1140,9 +1165,11 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
 
         with mock.patch.object(jit_cache, "_replace", side_effect=fail_receipt):
             self.build(9)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7, 9))
         self.assertFalse(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(7)
+            )
         )
         self.logger.warning.assert_called_once()
         self.logger.error.assert_not_called()
@@ -1151,18 +1178,24 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.build(7)
         _write(self.sidecar, "[1, 7, 99]")
         self.assertFalse(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {99})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(99)
+            )
         )
         self.build(7)
         replacement = os.path.join(self.root, "replacement.so")
         _write(replacement, _read(self.artifact))
         jit_cache.atomic_copy(replacement, self.artifact)
         self.assertFalse(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(7)
+            )
         )
         os.remove(self.sidecar + ".receipt")
         self.assertFalse(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(7)
+            )
         )
 
     def load_tuner(self):
@@ -1192,6 +1225,10 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
 
         proxy.build_module = build
         self.tuner_core = proxy
+        registry = runpy.run_path(
+            str(JIT_CACHE_PATH.parents[3] / "csrc/opus_gemm/opus_gemm_common.py")
+        )
+        KernelKey = registry["KernelKey"]
         imports = {
             "aiter.jit": types.SimpleNamespace(core=proxy),
             "aiter.jit.utils.file_baton": types.SimpleNamespace(
@@ -1199,10 +1236,12 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             ),
             "aiter.jit.utils.jit_cache": jit_cache,
             "aiter.jit.utils.chip_info": types.SimpleNamespace(
-                get_gfx_runtime=lambda: "gfx942"
+                get_build_targets=lambda: [("gfx942", 80)]
             ),
             "opus_gemm_common": types.SimpleNamespace(
-                default_compiled_kids_for_arch=lambda _arches: {1}
+                KERNEL_REGISTRY=registry["KERNEL_REGISTRY"],
+                KernelKey=KernelKey,
+                default_compiled_keys=lambda gfx, cu: {KernelKey("a16w16", gfx, cu, 1)},
             ),
         }
         self.tuner_imports = imports
@@ -1212,16 +1251,21 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                 return imports[name]
             return builtins.__import__(name, *args, **kwargs)
 
+        self.tuner_namespace = {
+            "__builtins__": {**vars(builtins), "__import__": import_dependency},
+            "os": os,
+            "sys": sys,
+            "json": json,
+            "torch": types.SimpleNamespace(
+                cuda=types.SimpleNamespace(current_device=lambda: 0)
+            ),
+            "_device_arch_and_cu": lambda _device: ("gfx942", 80),
+            "_opus_sidecar_path": lambda: self.sidecar,
+        }
         tuner = _load_functions(
             JIT_CACHE_PATH.parents[3] / "csrc" / "opus_gemm" / "opus_gemm_tune.py",
             ["_ensure_kids_compiled"],
-            {
-                "__builtins__": {**vars(builtins), "__import__": import_dependency},
-                "os": os,
-                "sys": sys,
-                "json": json,
-                "_opus_sidecar_path": lambda: self.sidecar,
-            },
+            self.tuner_namespace,
         )["_ensure_kids_compiled"]
         return tuner, calls
 
@@ -1234,14 +1278,20 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             self.core["_jit_compile"] = mock.Mock(side_effect=OSError("hipcc OOM"))
             with self.assertRaisesRegex(RuntimeError, "subset-compile rebuild failed"):
                 tuner({9})
-            self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7})
+            self.assertEqual(set(json.loads(_read(self.sidecar))), self.keys(1, 7))
             self.core["_jit_compile"] = original_compile
             self.assertTrue(tuner({9}))
             self.assertFalse(tuner({9}))
         self.assertEqual(len(calls), 2)
-        self.assertTrue(all("--extra_kids 9" in command for command in calls))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {1, 7, 9})
+            all(
+                "--extra_kernel_keys a16w16/gfx942/80/9" in command for command in calls
+            )
+        )
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(1, 7, 9)
+            )
         )
 
     def test_tuner_forced_rebuild_runs_once_even_when_receipt_matches(self):
@@ -1303,20 +1353,32 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             self.assertEqual(os.environ["AITER_REBUILD"], "0")
         self.assertEqual(len(calls), 2)
 
-    def test_tuner_runtime_probe_fallback_respects_explicit_build_arches(self):
+    def test_tuner_requires_runtime_namespace_and_preserves_build_targets(self):
         self.build(7)
         tuner, calls = self.load_tuner()
-        self.tuner_imports["aiter.jit.utils.chip_info"].get_gfx_runtime = mock.Mock(
-            side_effect=RuntimeError("no rocminfo")
+        self.tuner_namespace["_device_arch_and_cu"] = mock.Mock(
+            side_effect=RuntimeError("no runtime gfx/CU")
         )
-        defaults = mock.Mock(
-            side_effect=lambda arches: {1} if arches == {"gfx942"} else {1, 200}
-        )
-        self.tuner_imports["opus_gemm_common"].default_compiled_kids_for_arch = defaults
-        with mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx942"}):
-            self.assertFalse(tuner({7}))
-        defaults.assert_called_once_with({"gfx942"})
+        with self.assertRaisesRegex(RuntimeError, "no runtime gfx/CU"):
+            tuner({7})
         self.assertEqual(calls, [])
+        self.assertEqual(set(json.loads(_read(self.sidecar))), self.keys(1, 7))
+
+        self.tuner_namespace["_device_arch_and_cu"] = lambda _device: ("gfx942", 80)
+        build_targets = mock.Mock(return_value=[("gfx950", 256)])
+        self.tuner_imports["aiter.jit.utils.chip_info"].get_build_targets = (
+            build_targets
+        )
+        with mock.patch.dict(os.environ), mock.patch.object(sys, "stderr"):
+            self.assertTrue(tuner({9}))
+        build_targets.assert_called_once_with()
+        self.assertEqual(len(calls), 1)
+        targets = shlex.split(calls[0])
+        targets = set(targets[targets.index("--targets") + 1 :])
+        self.assertEqual(
+            targets,
+            {"gfx942/80", "gfx942/228", "gfx942/304", "gfx950/128", "gfx950/256"},
+        )
 
     def test_tuner_interruption_restores_environment_and_releases_locks(self):
         self.build(7)
@@ -1352,7 +1414,9 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                     self.assertFalse(
                         os.path.exists(os.path.join(self.op_dir, "build", "lock"))
                     )
-                    self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7})
+                    self.assertEqual(
+                        set(json.loads(_read(self.sidecar))), self.keys(1, 7)
+                    )
 
     def test_tuner_module_lock_waiter_executes_its_own_request(self):
         self.build(7)  # A runtime builder's completed binary lacks kid 9.
@@ -1372,28 +1436,38 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.assertEqual(baton.try_acquire.call_count, 2)
         baton.wait.assert_called_once()
         baton.release.assert_called_once()
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7, 9))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(9)
+            )
         )
 
-    def test_tuner_metadata_failure_does_not_loop_or_fail_successful_compile(self):
+    def test_tuner_metadata_failure_rejects_unverified_compile(self):
         self.build(7)
         tuner, calls = self.load_tuner()
         self.core["publish_compiled_kids"] = mock.Mock(
             side_effect=PermissionError("metadata denied")
         )
-        with mock.patch.dict(os.environ), mock.patch.object(sys, "stderr"):
-            self.assertTrue(tuner({9}))
+        with (
+            mock.patch.dict(os.environ),
+            mock.patch.object(sys, "stderr"),
+            self.assertRaisesRegex(RuntimeError, "subset-compile rebuild failed"),
+        ):
+            tuner({9})
         self.assertEqual(len(calls), 1)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertFalse(os.path.exists(self.artifact))
+        self.assertEqual(set(json.loads(_read(self.sidecar))), self.keys(1, 7))
         self.assertFalse(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(9)
+            )
         )
 
     def restage(self, kid):
         return jit_cache.stage_blob_sources(
-            f"{self.generator} --output_dir {{}} --extra_kids {kid}",
+            f"{self.generator} --output_dir {{}} --extra_kernel_keys "
+            + " ".join(self.keys(kid)),
             self.op_dir,
             sys.executable,
             seed_files=[(self.sidecar, "compiled_kids_opus.json")],
@@ -1411,10 +1485,12 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         with self.assertRaisesRegex(RuntimeError, "build .* failed") as failure:
             self.build(9)
         self.assertIn("generation changed", str(failure.exception.__cause__))
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
-        self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7))
+        self.assertEqual(set(json.loads(_read(self.sidecar))), self.keys(1, 7))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(7)
+            )
         )
 
     def test_generation_change_during_binary_copy_rejects_install(self):
@@ -1432,9 +1508,11 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             self.assertRaisesRegex(RuntimeError, "build .* failed"),
         ):
             self.build(9)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(7)
+            )
         )
 
     def test_post_install_restage_cannot_relabel_binary_or_publish_wrong_sources(self):
@@ -1449,13 +1527,17 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
 
         with mock.patch.object(jit_cache, "_replace", side_effect=install_then_restage):
             self.build(9)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
-        self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7, 9))
+        self.assertEqual(set(json.loads(_read(self.sidecar))), self.keys(1, 7, 9))
         self.assertTrue(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(9)
+            )
         )
         self.assertFalse(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {11})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(11)
+            )
         )
         self.assertEqual(
             set(
@@ -1463,7 +1545,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                     _read(os.path.join(self.op_dir, "blob", "compiled_kids_opus.json"))
                 )
             ),
-            {1, 7},
+            self.keys(1, 7),
         )
         self.logger.warning.assert_called_once()
         self.logger.error.assert_not_called()
@@ -1472,7 +1554,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.build(7)
         original_replace = jit_cache._replace
         peer = os.path.join(self.root, "peer.so")
-        _write(peer, "[1, 11]")
+        _write(peer, json.dumps(sorted(self.keys(1, 11))))
 
         def replace_then_peer(source, destination, *args, **kwargs):
             result = original_replace(source, destination, *args, **kwargs)
@@ -1482,9 +1564,11 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
 
         with mock.patch.object(jit_cache, "_replace", side_effect=replace_then_peer):
             self.build(9)
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 11})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 11))
         self.assertFalse(
-            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+            jit_cache.compiled_kids_are_current(
+                self.sidecar, self.artifact, self.keys(9)
+            )
         )
         self.logger.warning.assert_called_once()
         self.logger.error.assert_not_called()
@@ -1508,14 +1592,14 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             backup_sidecar = os.path.join(
                 self.op_dir, backups[0], "compiled_kids_opus.json"
             )
-            self.assertEqual(set(json.loads(_read(backup_sidecar))), {1, 7})
+            self.assertEqual(set(json.loads(_read(backup_sidecar))), self.keys(1, 7))
             # The next locked codegen attempts recovery, but permission is still
             # denied. Neither recovery nor cleanup may destroy the last backup.
             self.restage(11)
             self.assertTrue(os.path.exists(backup_sidecar))
             jit_cache.cleanup_abandoned_blob_artifacts(self.op_dir, max_age_seconds=0)
             self.assertTrue(os.path.exists(backup_sidecar))
-        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.artifact))), self.keys(1, 7, 9))
         self.logger.warning.assert_called_once()
         self.logger.error.assert_not_called()
         # Recovery also works before this owner PID has exited.
@@ -1523,7 +1607,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.assertEqual(_transaction_artifacts(self.op_dir), [])
         self.assertEqual(
             set(json.loads(_read(os.path.join(blob, "compiled_kids_opus.json")))),
-            {1, 7},
+            self.keys(1, 7),
         )
 
 
@@ -1679,7 +1763,7 @@ class TestOpusRequestedKids(unittest.TestCase):
     def test_real_generator_accepts_valid_requests_and_rejects_filtered_requests(self):
         generator = JIT_CACHE_PATH.parents[3] / "csrc/opus_gemm/gen_instances.py"
         registry = runpy.run_path(str(generator.with_name("opus_gemm_common.py")))
-        bmm_kids = sorted(registry["BMM_MXSCALE_KIDS"])
+        bmm_kids = sorted(registry["get_registry"]("a8w8_mxscale_bmm", "gfx950", 256))
         co_kids = sorted(registry["GFX1250_4WAVE_CO_KIDS"])
         workspace_kid = min(registry["gfx1250_clusterlaunch_kernels_list"])
         runner = (
@@ -1690,20 +1774,42 @@ class TestOpusRequestedKids(unittest.TestCase):
             "cuda=types.SimpleNamespace(is_available=lambda: False)); "
             "runpy.run_path(sys.argv[0], run_name='__main__')"
         )
+        KernelKey = registry["KernelKey"]
+        bmm_keys = [
+            KernelKey("a8w8_mxscale_bmm", "gfx950", 256, kid) for kid in bmm_kids
+        ]
+        valid_key = KernelKey("a16w16", "gfx942", 80, 3)
+        invalid_key = KernelKey("a16w16", "gfx942", 80, 999999)
+        foreign_key = KernelKey("a16w16", "gfx950", 256, 6)
         cases = (
-            ("gfx942", [10006], [], True),
-            ("gfx942", [999999], [], False),
-            ("gfx942", [200], [], False),
-            ("gfx942", [200], ["--kernel_tag", "a16w16"], False),
-            ("gfx942", [10006], ["--kernel_tag", "a8w8"], False),
-            ("gfx950", bmm_kids, [], True),
-            ("gfx950", bmm_kids, ["--kernel_tag", "a8w8"], True),
-            ("gfx942", bmm_kids, [], False),
-            ("gfx1250", [workspace_kid, *co_kids], [], True),
+            ("gfx942/80", [valid_key], [], True),
+            ("gfx942/80", [invalid_key], [], False),
+            ("gfx942/80", [foreign_key], [], False),
+            ("gfx942/80", [foreign_key], ["--kernel_tag", "a16w16"], False),
+            # The default compile floor survives tag filtering. Select a valid
+            # non-default A16W16 kid to exercise request rejection instead.
+            (
+                "gfx950/256",
+                [KernelKey("a16w16", "gfx950", 256, 0)],
+                ["--kernel_tag", "a8w8"],
+                False,
+            ),
+            ("gfx950/256", bmm_keys, [], True),
+            ("gfx950/256", bmm_keys, ["--kernel_tag", "a8w8"], True),
+            ("gfx942/80", bmm_keys, [], False),
+            (
+                "gfx1250/256",
+                [
+                    KernelKey("a16w16", "gfx1250", 256, kid)
+                    for kid in [workspace_kid, *co_kids]
+                ],
+                [],
+                True,
+            ),
         )
-        for arch, kids, extra_args, accepted in cases:
+        for target, keys, extra_args, accepted in cases:
             with (
-                self.subTest(arch=arch, kids=kids, extra_args=extra_args),
+                self.subTest(target=target, keys=keys, extra_args=extra_args),
                 tempfile.TemporaryDirectory() as tmp,
             ):
                 sidecar = os.path.join(tmp, "compiled_kids.json")
@@ -1716,22 +1822,32 @@ class TestOpusRequestedKids(unittest.TestCase):
                         str(generator),
                         "--working_path",
                         tmp,
-                        "--extra_kids",
-                        *map(str, kids),
+                        "--targets",
+                        target,
+                        "--extra_kernel_keys",
+                        *(key.encode() for key in keys),
                         *extra_args,
                     ],
-                    env={**os.environ, "GPU_ARCHS": arch},
+                    env={**os.environ, "GPU_ARCHS": target.split("/")[0]},
                     capture_output=True,
                     text=True,
                     check=False,
                 )
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertTrue(set(kids) <= set(json.loads(_read(sidecar))))
+                    self.assertTrue(
+                        {key.encode() for key in keys}
+                        <= set(json.loads(_read(sidecar)))
+                    )
                     manifest = _read(os.path.join(tmp, "opus_gemm_manifest.h"))
-                    for name in {registry["kernels_list"][kid].name for kid in kids}:
+                    for name in {
+                        registry["get_registry"](key.family, key.gfx, key.cu_num)[
+                            key.kid
+                        ].name
+                        for key in keys
+                    }:
                         self.assertEqual(manifest.count(name + "("), 1, name)
-                    if arch == "gfx950":
+                    if target == "gfx950/256":
                         dispatch = _read(
                             os.path.join(tmp, "opus_bmm_mxscale_kid_dispatch.h")
                         )
@@ -1741,13 +1857,16 @@ class TestOpusRequestedKids(unittest.TestCase):
                         # pattern reads as kids and so reports 1 / 32 / 128 as
                         # spurious extras.
                         emitted = {
-                            int(kid) for kid in re.findall(r"\{\s*(\d+),\s*&", dispatch)
+                            (int(cu), int(kid))
+                            for cu, kid in re.findall(
+                                r"\{\s*\{\s*(\d+),\s*(\d+)\s*\},\s*&", dispatch
+                            )
                         }
-                        self.assertEqual(emitted, set(bmm_kids))
+                        self.assertEqual(emitted, {(256, kid) for kid in bmm_kids})
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(
-                        "cannot compile requested --extra_kids", result.stderr
+                        "requested local kernels are unavailable", result.stderr
                     )
                     self.assertEqual(_read(sidecar), "[]")
 

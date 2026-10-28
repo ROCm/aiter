@@ -85,6 +85,12 @@ def test_mxscale_x_scale_block_pairs_with_the_weights():
         assert gemm._variants(table, {**job, "w_scale_block": block}) == [
             {"x_block": 32}
         ]
+    # A blank cell, or the 0 a config merge fills a missing column with, holds
+    # 128x128 rows.
+    for blank in ("", "0"):
+        assert gemm._variants(table, {**job, "w_scale_block": blank}) == [
+            {"x_block": 128}
+        ]
 
 
 def _thrower(error):

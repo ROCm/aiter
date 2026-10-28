@@ -33,7 +33,11 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_a8w8_m32x8_supported,
+)
 from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    flash_attn_a16w16_m32x8_supported,
     supports_gqa_ratio,
 )
 from aiter.ops.mha import flash_attn_func, flash_attn_varlen_func
@@ -135,6 +139,9 @@ def _apply_sink(qk, sink):
 def run_torch_varlen(q, k, v, cu_q, cu_k, scale, causal, return_lse, sink, window_size):
     """PyTorch reference for varlen THD layout, per-batch.
 
+    Q/K/V may be any element dtype, 8-bit included: everything is upcast to fp32
+    here, so the reference sees exactly what the kernel dequantizes.
+
     Causal is routed through the local (sliding-window) mask: ``causal`` forces
     the effective right window to 0 while leaving the left window as given, so
     ``_local_mask(sq, sk, -1, 0)`` reproduces the pure-causal mask exactly.
@@ -170,6 +177,8 @@ def run_torch_varlen(q, k, v, cu_q, cu_k, scale, causal, return_lse, sink, windo
 
 def run_torch_batch(q, k, v, scale, causal, return_lse, sink, window_size):
     """PyTorch reference for batched BSHD layout, per-batch.
+
+    Q/K/V may be any element dtype, 8-bit included (see ``run_torch_varlen``).
 
     Loops over the batch so peak scratch stays at one ``[H_q, sq, sk]`` score
     matrix instead of ``[B, H_q, sq, sk]``. Causal is routed through the local
@@ -216,15 +225,14 @@ def _flops(shapes, H_q, d_qk, d_v, causal):
     return total
 
 
-def _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v, elem_size, return_lse):
-    """Q + K + V reads and O (+ LSE) writes. Ignores re-reads of K/V across
-    M-blocks, so this is the compulsory-traffic lower bound."""
-    n = (
-        tot_q * H_q * d_qk  # Q
-        + tot_k * H_kv * d_qk  # K
-        + tot_k * H_kv * d_v  # V
-        + tot_q * H_q * d_v  # O
-    ) * elem_size
+def _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v, elem_size, out_elem_size, return_lse):
+    """Q + K + V reads at ``elem_size`` and O (+ LSE) writes at ``out_elem_size``.
+    The a8w8 backend reads 1-byte Q/K/V but writes a bf16 O, so the two sizes are
+    tracked apart. Ignores re-reads of K/V across M-blocks, so this is the
+    compulsory-traffic lower bound."""
+    in_elems = tot_q * H_q * d_qk + tot_k * H_kv * d_qk + tot_k * H_kv * d_v
+    out_elems = tot_q * H_q * d_v
+    n = in_elems * elem_size + out_elems * out_elem_size
     if return_lse:
         n += tot_q * H_q * 4
     return n
@@ -336,9 +344,10 @@ def test_mha_flydsl_varlen(
     total_q, total_k = cu_q[-1], cu_k[-1]
     max_sq, max_sk = max(seqs_q), max(seqs_k)
 
-    q = torch.randn(total_q, H_q, d_qk, dtype=dtype, device=device)
-    k = torch.randn(total_k, H_kv, d_qk, dtype=dtype, device=device)
-    v = torch.randn(total_k, H_kv, d_v, dtype=dtype, device=device)
+    q_dtype, kv_dtype = dtype
+    q = _randn_as((total_q, H_q, d_qk), q_dtype, device)
+    k = _randn_as((total_k, H_kv, d_qk), kv_dtype, device)
+    v = _randn_as((total_k, H_kv, d_v), kv_dtype, device)
     cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device=device)
     cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=device)
 
@@ -351,14 +360,25 @@ def test_mha_flydsl_varlen(
     ref, ref_lses = ref_result if return_lse else (ref_result, None)
 
     candidates = {"flydsl": _call_varlen}
-    # Triton has no sink / sliding-window support here, so cross-check it only on
-    # plain configs; elsewhere its column stays nan.
-    if "triton" in kernels and not sink and tuple(window) == (-1, -1):
+    # Triton has no sink / sliding-window support here, and its 8-bit kernel wants
+    # descales ``_call_varlen_triton`` does not pass (plus its own hdim rule), so
+    # cross-check it only on plain 16-bit configs; elsewhere its column stays nan.
+    _b8_case = q_dtype in _B8_TORCH or kv_dtype in _B8_TORCH
+    if "triton" in kernels and not sink and tuple(window) == (-1, -1) and not _b8_case:
         candidates["triton"] = _call_varlen_triton
 
     flops = _flops(list(zip(seqs_q, seqs_k)), H_q, d_qk, d_v, causal)
+    _out_esize = 2 if q_dtype in _B8_TORCH else q.element_size()
     nbytes = _nbytes(
-        total_q, total_k, H_q, H_kv, d_qk, d_v, q.element_size(), return_lse
+        total_q,
+        total_k,
+        H_q,
+        H_kv,
+        d_qk,
+        d_v,
+        q.element_size(),
+        _out_esize,
+        return_lse,
     )
 
     ret = {"gfx": get_gfx()}
@@ -450,9 +470,10 @@ def test_mha_flydsl_batch(
     assert (d_qk, d_v) in SUPPORTED_D_QK_V, f"unsupported d_qk/d_v {(d_qk, d_v)}"
     assert H_q % H_kv == 0, f"nheads_q={H_q} must be a multiple of nheads_kv={H_kv}"
 
-    q = torch.randn(B, sq, H_q, d_qk, dtype=dtype, device=device)
-    k = torch.randn(B, sk, H_kv, d_qk, dtype=dtype, device=device)
-    v = torch.randn(B, sk, H_kv, d_v, dtype=dtype, device=device)
+    q_dtype, kv_dtype = dtype
+    q = _randn_as((B, sq, H_q, d_qk), q_dtype, device)
+    k = _randn_as((B, sk, H_kv, d_qk), kv_dtype, device)
+    v = _randn_as((B, sk, H_kv, d_v), kv_dtype, device)
 
     scale = 1.0 / math.sqrt(d_qk)
     sink_t = _make_sink(H_q, device) if sink else None
@@ -461,7 +482,18 @@ def test_mha_flydsl_batch(
     ref, ref_lse = ref_result if return_lse else (ref_result, None)
 
     flops = _flops([(sq, sk)] * B, H_q, d_qk, d_v, causal)
-    nbytes = _nbytes(B * sq, B * sk, H_q, H_kv, d_qk, d_v, q.element_size(), return_lse)
+    _out_esize = 2 if q_dtype in _B8_TORCH else q.element_size()
+    nbytes = _nbytes(
+        B * sq,
+        B * sk,
+        H_q,
+        H_kv,
+        d_qk,
+        d_v,
+        q.element_size(),
+        _out_esize,
+        return_lse,
+    )
 
     ret = {"gfx": get_gfx()}
     data, us = run_perftest(
@@ -703,6 +735,48 @@ def _shape_lists(args):
     return thd, bshd
 
 
+_B8_TORCH = (torch.float8_e4m3fn, torch.float8_e5m2)
+# dtypes.str2Dtype knows "fp8" (e4m3) but has no name for e5m2.
+_EXTRA_DTYPES = {"bf8": torch.float8_e5m2}
+
+
+def _one_dtype(name):
+    """One element-dtype name, e.g. ``bf16``/``fp16``/``fp8``/``bf8``."""
+    name = str(name).strip()
+    try:
+        return _EXTRA_DTYPES.get(name) or dtypes.str2Dtype(name)
+    except Exception as exc:
+        raise argparse.ArgumentTypeError(f"bad dtype {name!r}: {exc}") from exc
+
+
+def _backend_serves_dtypes(q_dtype, kv_dtype):
+    """Does the gfx1250 backend accept this (q, kv) dtype pair? Metadata only.
+
+    Ask the kernel's own gate rather than hardcoding a list here -- a pair the kernel
+    cannot express (today, q and kv differing) then reports as declined instead of
+    failing mid-run. The gate's dtype clause is hdim-independent, so one served hdim
+    stands in for all of them and the dtype axis can be filtered up front like the
+    hdim one."""
+    meta = torch.device("meta")
+    q = torch.empty(16, 8, 128, dtype=q_dtype, device=meta)
+    k = torch.empty(16, 2, 128, dtype=kv_dtype, device=meta)
+    v = torch.empty(16, 2, 128, dtype=kv_dtype, device=meta)
+    gate = (
+        flash_attn_a8w8_m32x8_supported
+        if q_dtype in _B8_TORCH
+        else flash_attn_a16w16_m32x8_supported
+    )
+    return bool(gate("varlen", q, k, v))
+
+
+def _randn_as(shape, dtype, device):
+    """``randn`` in ``dtype``; 8-bit has no randn, so round a scaled fp32 draw. The
+    0.3 keeps e4m3 well inside range so the fp8 error stays representative."""
+    if dtype in _B8_TORCH:
+        return (torch.randn(*shape, dtype=torch.float32, device=device) * 0.3).to(dtype)
+    return torch.randn(*shape, dtype=dtype, device=device)
+
+
 def _str2d_qk_v(v):
     """Parse a ``d_qk,d_v`` pair and check it against ``SUPPORTED_D_QK_V``."""
     pair = dtypes.str2tuple(v)
@@ -754,7 +828,7 @@ def check_routing_declines():
     v = torch.randn(L, H_kv, D, dtype=dtypes.bf16, device=dev)
 
     served = {}
-    real = fk.flydsl_flash_attn_varlen_func
+    real = fk.flydsl_flash_attn_varlen_fwd
 
     def spy(*a, **kw):
         out = real(*a, **kw)
@@ -763,11 +837,11 @@ def check_routing_declines():
 
     def ran_on_flydsl(**kw):
         served.clear()
-        fk.flydsl_flash_attn_varlen_func = spy
+        fk.flydsl_flash_attn_varlen_fwd = spy
         try:
             flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True, **kw)
         finally:
-            fk.flydsl_flash_attn_varlen_func = real
+            fk.flydsl_flash_attn_varlen_fwd = real
         return served.get("hit", False)
 
     assert ran_on_flydsl(), "baseline d64/64 should be served by m32x8"
@@ -792,13 +866,32 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         description="FlyDSL FMHA forward-prefill unit test & perf sweep (gfx1250).",
     )
+    _DEFAULT_DTYPES = [
+        dtypes.bf16,
+        dtypes.fp16,
+        torch.float8_e5m2,
+        torch.float8_e4m3fn,
+    ]
     parser.add_argument(
-        "-d",
-        "--dtype",
-        type=dtypes.str2Dtype,
+        "-dq",
+        "--dtype-q",
+        type=_one_dtype,
         nargs="*",
-        default=[dtypes.bf16, dtypes.fp16],
-        help="Element dtype (q/k/v share one).\n        e.g.: -d bf16",
+        default=_DEFAULT_DTYPES,
+        help="Q element dtypes.\n        e.g.: -dq bf16 fp8",
+    )
+    parser.add_argument(
+        "-dkv",
+        "--dtype-kv",
+        type=_one_dtype,
+        nargs="*",
+        default=None,
+        help=(
+            "KV element dtypes (V follows K); defaults to --dtype-q.\n"
+            "        Swept as the PRODUCT with --dtype-q, so pairs the backend\n"
+            "        declines (today, q != kv) are dropped with a log line.\n"
+            "        e.g.: -dq fp8 -dkv bf8"
+        ),
     )
     parser.add_argument(
         "-l",
@@ -965,7 +1058,7 @@ def main():
         axes = [
             [h for h in hdims if _flydsl_serves(*h)],
             shapes,
-            args.dtype,
+            served_dtypes,
             causals,
             lses,
             sinks,
@@ -989,6 +1082,18 @@ def main():
                 combo.append(a[j])
             picked.append(tuple(reversed(combo)))
         return picked
+
+    requested_dtypes = list(
+        itertools.product(args.dtype_q, args.dtype_kv or args.dtype_q)
+    )
+    served_dtypes = [d for d in requested_dtypes if _backend_serves_dtypes(*d)]
+    for d in requested_dtypes:
+        if d not in served_dtypes:
+            aiter.logger.info(
+                "skipping dtype pair q=%s kv=%s: declined by the backend", *d
+            )
+    if not served_dtypes:
+        raise SystemExit("no requested dtype pair is served by the backend")
 
     if "thd" in args.layout:
         rows = []

@@ -16,6 +16,24 @@ import pandas as pd
 TEST_GFX = "gfx942"
 
 
+class TestFlydslA8w8BpreshuffleCandidates(unittest.TestCase):
+
+    def test_async_copy_is_disabled_only_on_gfx942(self):
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+            kernels_list_942,
+            kernels_list_950,
+        )
+
+        self.assertFalse(
+            any(ki.use_async_copy for ki in kernels_list_942.values()),
+            "gfx942 cannot lower the 128-bit LDS-direct load used by async copy",
+        )
+        self.assertTrue(
+            any(ki.use_async_copy for ki in kernels_list_950.values()),
+            "gfx950 supports async copy and must keep those tuning candidates",
+        )
+
+
 class _StubTuner:
     """Lazy-init helper -- avoids importing aiter at module level."""
 

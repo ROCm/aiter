@@ -1,75 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""OPUS-based sparse paged prefill attention for DeepSeek-V4.
+"""Opus-pinned MLA sparse prefill entries, kept for existing callers.
 
-Two-region sparse scaled-dot-product attention over a paged prefix source
-(``unified_kv``) and a flat per-fwd extend source (``kv``), with a per-head
-softmax-denominator sink. The two regions share a single online-softmax
-accumulator, making the order region-invariant.
-
-The user-facing entry is :func:`pa_sparse_prefill_opus`, which dispatches on
-the running GPU. Both backends live in ``module_mla_v4_prefill_opus``:
-
-* ``gfx950`` -- :func:`pa_sparse_prefill_gfx950_opus_fwd`, kernel compiled
-  from source by the JIT.
-* ``gfx1250`` -- :func:`pa_sparse_prefill_gfx1250_opus_fwd`, kernel loaded
-  from the prebuilt code objects in ``hsa/gfx1250/mla_v4_opus/``.
-
-Constraints common to both:
-
-* Head dim ``D == 512``.
-* dtype ``bf16`` or ``fp16`` for Q/K/V/O; ``attn_sink`` is ``fp32``.
-  ``gfx1250`` builds only the ``bf16`` variant.
-* Every entry in ``kv_indices_prefix`` / ``kv_indices_extend`` must be a
-  valid row index into ``unified_kv`` / ``kv`` respectively. Empty CSR rows
-  (``kv_indptr[i] == kv_indptr[i+1]``) are allowed.
-
-See ``csrc/include/mla_v4_prefill_opus.h`` for the C++ API.
+New code should use :mod:`aiter.ops.mla_sparse_prefill`: ``mla_sparse_prefill`` and
+``mla_sparse_prefill_v4`` take the same arguments and also choose the backend.
 """
 
 import torch
 
-from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
-
-MD_NAME = "module_mla_v4_prefill_opus"
-
-SUPPORTED_ARCHS = ("gfx950", "gfx1250")
-
-
-def _dispatch(gfx: str, op_gfx950, op_gfx1250):
-    """Pick the backend for the running GPU.
-
-    gfx950 compiles the kernel from source. gfx1250 instead loads a prebuilt
-    code object (``hsa/gfx1250/mla_v4_opus/``), because its kernel needs
-    the CoExec scheduler from a custom LLVM build that release images do not
-    ship; see ``csrc/py_itfs_cu/mla_v4_prefill_opus_kernels.cu``.
-    """
-    if gfx == "gfx1250":
-        return op_gfx1250
-    if gfx == "gfx950":
-        return op_gfx950
-    raise RuntimeError(f"pa_sparse_prefill_opus supports {SUPPORTED_ARCHS}, got {gfx}")
+from .mla_sparse_prefill import _opus_sparse_prefill, _opus_sparse_prefill_v4
+from .opus.mla import (
+    opus_mla_v4_prefill_a8w8_gfx950_fwd as pa_sparse_prefill_fp8_gfx950_opus_fwd,
+)
+from .opus.mla import (
+    opus_mla_v4_prefill_a8w8_gfx1250_fwd as pa_sparse_prefill_fp8_gfx1250_opus_fwd,
+)
+from .opus.mla import (
+    opus_mla_v4_prefill_a16w16_gfx950_fwd as pa_sparse_prefill_gfx950_opus_fwd,
+)
+from .opus.mla import (
+    opus_mla_v4_prefill_a16w16_gfx1250_fwd as pa_sparse_prefill_gfx1250_opus_fwd,
+)
 
 
-@compile_ops(MD_NAME, develop=True)
-def pa_sparse_prefill_gfx950_opus_fwd(
-    q: torch.Tensor,
-    unified_kv: torch.Tensor,
-    kv_indices_prefix: torch.Tensor,
-    kv_indptr_prefix: torch.Tensor,
-    kv: torch.Tensor,
-    kv_indices_extend: torch.Tensor,
-    kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
-    out: torch.Tensor,
-    softmax_scale: float,
-) -> None: ...
-
-
-@compile_ops(MD_NAME, develop=True)
 def pa_sparse_prefill_gfx950_opus_split_fwd(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -85,38 +40,24 @@ def pa_sparse_prefill_gfx950_opus_split_fwd(
     out: torch.Tensor,
     softmax_scale: float,
     num_splits: int,
-) -> None: ...
-
-
-@compile_ops(MD_NAME, develop=True)
-def pa_sparse_prefill_gfx1250_opus_fwd(
-    q: torch.Tensor,
-    unified_kv: torch.Tensor,
-    kv_indices_prefix: torch.Tensor,
-    kv_indptr_prefix: torch.Tensor,
-    kv: torch.Tensor,
-    kv_indices_extend: torch.Tensor,
-    kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
-    out: torch.Tensor,
-    softmax_scale: float,
-) -> None: ...
-
-
-# Split-K by the unsplit grid's blocks (a token per 16 heads): fewer than the
-# CUs leave them idle through each token's serial key loop. Measured on MI355X
-# (256 CUs; 640 keys a token, H=16, perftest): 4 splits are best up to 120
-# blocks, none beyond.
-_KV_SPLIT_STEPS = ((120, 4),)
-
-
-def _auto_kv_splits(gfx: str, n: int, h: int) -> int:
-    """The split count for ``n`` tokens of ``h`` heads: host scalars only, so
-    a captured graph's choice is its shape's."""
-    if gfx != "gfx950" or h > 32:
-        return 1
-    blocks = n * -(-h // 16)
-    return next((s for limit, s in _KV_SPLIT_STEPS if blocks <= limit), 1)
+) -> None:
+    """:func:`pa_sparse_prefill_gfx950_opus_fwd` with split-K, in the former argument order."""
+    pa_sparse_prefill_gfx950_opus_fwd(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        out,
+        softmax_scale,
+        num_splits,
+        partial_o,
+        partial_max,
+        partial_sum,
+    )
 
 
 def _pa_sparse_prefill_opus_fake(
@@ -149,105 +90,8 @@ def pa_sparse_prefill_opus(
     out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
 ) -> torch.Tensor:
-    """Sparse prefill attention over two KV sources (paged ``unified_kv`` +
-    flat per-fwd ``kv``), backed by the OPUS gfx950 HIP kernel.
-
-    The trailing ``out`` keyword is an aiter-only convenience for callers
-    that want to reuse a pre-allocated output buffer; pass ``None`` (the
-    default) to have one allocated for you.
-
-    Args:
-      q:                 ``[T, H, D]`` bf16/fp16 query (T == N tokens).
-      unified_kv:        ``[total_pages, D]`` prefix source (paged history).
-      kv_indices_prefix: ``[total_prefix]`` int32 row indices into
-        ``unified_kv``, concatenated per token.
-      kv_indptr_prefix:  ``[T+1]`` int32 CSR row pointers.
-      kv:                ``[total_tokens, D]`` extend source (current fwd's
-        just-computed K).
-      kv_indices_extend: ``[total_extend]`` int32 row indices into ``kv``,
-        concatenated per token.
-      kv_indptr_extend:  ``[T+1]`` int32 CSR row pointers.
-      attn_sink:         ``[H]`` per-head softmax-denom bias.
-      softmax_scale:     float scalar applied to the QK^T scores.
-      out:               Optional ``[T, H, D]`` output buffer; allocated if
-        ``None``.
-      num_kv_splits:     split each token's keys (prefix, then extend) over
-        this many blocks (split 0 counting the sink), then fold them in a
-        second launch (pa_decode_ps_reduce): parallelism for few tokens.
-        1 (the unsplit kernel), or 2, 4, 8 on gfx950 with H <= 32. ``None``
-        picks it from the token count (``_auto_kv_splits``).
-
-    Returns:
-      ``out`` (``[T, H, D]`` same dtype as ``q``).
-    """
-    gfx = get_gfx_runtime()
-    fwd = _dispatch(
-        gfx, pa_sparse_prefill_gfx950_opus_fwd, pa_sparse_prefill_gfx1250_opus_fwd
-    )
-
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise RuntimeError(f"pa_sparse_prefill_opus expects fp16/bf16 q, got {q.dtype}")
-    if gfx == "gfx1250" and q.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"the gfx1250 code object only provides the bf16 variant, got {q.dtype}"
-        )
-    if unified_kv.dtype != q.dtype:
-        raise RuntimeError(
-            f"unified_kv dtype mismatch: unified_kv={unified_kv.dtype}, q={q.dtype}"
-        )
-    if kv.dtype != q.dtype:
-        raise RuntimeError(f"kv dtype mismatch: kv={kv.dtype}, q={q.dtype}")
-    if unified_kv.size(-1) != kv.size(-1):
-        raise RuntimeError(
-            f"head_dim mismatch: unified_kv={unified_kv.size(-1)}, kv={kv.size(-1)}"
-        )
-
-    if out is None:
-        out = torch.empty_like(q)
-    elif out.shape != q.shape or out.dtype != q.dtype:
-        raise RuntimeError(
-            f"out shape/dtype mismatch: got shape={tuple(out.shape)} dtype={out.dtype}, "
-            f"expected shape={tuple(q.shape)} dtype={q.dtype}"
-        )
-
-    if num_kv_splits is None:
-        num_kv_splits = _auto_kv_splits(gfx, *q.shape[:2])
-    elif num_kv_splits not in (1, 2, 4, 8):
-        # here: past it the kernel's check aborts the process; and a
-        # ValueError, a caller's error, not a configuration this GPU lacks
-        # (RuntimeError, which callers take as their cue to fall back)
-        raise ValueError(f"num_kv_splits must be 1, 2, 4 or 8, got {num_kv_splits}")
-    if num_kv_splits > 1:
-        if gfx != "gfx950" or q.size(1) > 32:
-            raise RuntimeError(
-                f"num_kv_splits > 1 runs on gfx950 with H <= 32, got {gfx} H={q.size(1)}"
-            )
-        n, h, d = q.shape
-        partial_o = torch.empty(
-            n, num_kv_splits, h, d, dtype=torch.float32, device=q.device
-        )
-        partial_max = torch.empty(
-            n, num_kv_splits, h, dtype=torch.float32, device=q.device
-        )
-        partial_sum = torch.empty_like(partial_max)
-        pa_sparse_prefill_gfx950_opus_split_fwd(
-            q,
-            unified_kv,
-            kv_indices_prefix,
-            kv_indptr_prefix,
-            kv,
-            kv_indices_extend,
-            kv_indptr_extend,
-            attn_sink,
-            partial_o,
-            partial_max,
-            partial_sum,
-            out,
-            float(softmax_scale),
-            int(num_kv_splits),
-        )
-        return out
-    fwd(
+    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill` on the opus backend."""
+    return _opus_sparse_prefill(
         q,
         unified_kv,
         kv_indices_prefix,
@@ -256,46 +100,10 @@ def pa_sparse_prefill_opus(
         kv_indices_extend,
         kv_indptr_extend,
         attn_sink,
+        softmax_scale,
         out,
-        float(softmax_scale),
+        num_kv_splits,
     )
-    return out
-
-
-@compile_ops(MD_NAME, develop=True)
-def pa_sparse_prefill_fp8_gfx950_opus_fwd(
-    q_nope: torch.Tensor,
-    q_rope: torch.Tensor,
-    unified_kv_nope: torch.Tensor,
-    unified_kv_rope: torch.Tensor,
-    kv_indices_prefix: torch.Tensor,
-    kv_indptr_prefix: torch.Tensor,
-    kv_nope: torch.Tensor,
-    kv_rope: torch.Tensor,
-    kv_indices_extend: torch.Tensor,
-    kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
-    out: torch.Tensor,
-    softmax_scale: float,
-) -> None: ...
-
-
-@compile_ops(MD_NAME, develop=True)
-def pa_sparse_prefill_fp8_gfx1250_opus_fwd(
-    q_nope: torch.Tensor,
-    q_rope: torch.Tensor,
-    unified_kv_nope: torch.Tensor,
-    unified_kv_rope: torch.Tensor,
-    kv_indices_prefix: torch.Tensor,
-    kv_indptr_prefix: torch.Tensor,
-    kv_nope: torch.Tensor,
-    kv_rope: torch.Tensor,
-    kv_indices_extend: torch.Tensor,
-    kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
-    out: torch.Tensor,
-    softmax_scale: float,
-) -> None: ...
 
 
 def _pa_sparse_prefill_fp8_opus_fake(
@@ -335,58 +143,8 @@ def pa_sparse_prefill_fp8_opus(
     softmax_scale: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sparse prefill attention with split fp8 NoPE and bf16 RoPE inputs.
-
-    The trailing ``out`` keyword is an aiter-only convenience for callers that
-    want to reuse a pre-allocated output buffer; pass ``None`` (the default) to
-    have one allocated for you.
-
-    Args:
-      q_nope:            ``[T, H, 512]`` fp8 query without positional encoding.
-      q_rope:            ``[T, H, 64]`` bf16 query RoPE encoding part.
-      unified_kv_nope:   ``[total_pages, 512]`` fp8 prefix KV NoPE source.
-      unified_kv_rope:   ``[total_pages, 64]`` bf16 prefix KV RoPE source.
-      kv_indices_prefix: ``[total_prefix]`` int32 row indices into the prefix
-        sources, concatenated per token.
-      kv_indptr_prefix:  ``[T+1]`` int32 CSR row pointers.
-      kv_nope:           ``[total_tokens, 512]`` fp8 extend KV NoPE source.
-      kv_rope:           ``[total_tokens, 64]`` bf16 extend KV RoPE source.
-      kv_indices_extend: ``[total_extend]`` int32 row indices into the extend
-        sources, concatenated per token.
-      kv_indptr_extend:  ``[T+1]`` int32 CSR row pointers.
-      attn_sink:         ``[H]`` fp32 per-head softmax-denom bias.
-      softmax_scale:     float scalar applied to the combined QK^T scores.
-      out:               Optional ``[T, H, 512]`` bf16 output buffer; allocated
-        if ``None``.
-
-    Returns:
-      ``out`` (``[T, H, 512]`` bf16).
-    """
-    gfx = get_gfx_runtime()
-    fwd = _dispatch(
-        gfx,
-        pa_sparse_prefill_fp8_gfx950_opus_fwd,
-        pa_sparse_prefill_fp8_gfx1250_opus_fwd,
-    )
-
-    if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
-        raise RuntimeError(
-            f"NoPE dtype mismatch: q_nope={q_nope.dtype}, "
-            f"unified_kv_nope={unified_kv_nope.dtype}, kv_nope={kv_nope.dtype}"
-        )
-    if q_rope.dtype != torch.bfloat16:
-        raise RuntimeError(f"q_rope must be bf16, got {q_rope.dtype}")
-
-    t, h = q_nope.shape[0], q_nope.shape[1]
-    if out is None:
-        out = torch.empty((t, h, 512), dtype=torch.bfloat16, device=q_nope.device)
-    elif out.shape != (t, h, 512) or out.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"out shape/dtype mismatch: got shape={tuple(out.shape)} dtype={out.dtype}, "
-            f"expected shape={(t, h, 512)} dtype={torch.bfloat16}"
-        )
-
-    fwd(
+    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill_v4` on the opus backend."""
+    return _opus_sparse_prefill_v4(
         q_nope,
         q_rope,
         unified_kv_nope,
@@ -398,10 +156,9 @@ def pa_sparse_prefill_fp8_opus(
         kv_indices_extend,
         kv_indptr_extend,
         attn_sink,
+        softmax_scale,
         out,
-        float(softmax_scale),
     )
-    return out
 
 
 __all__ = [

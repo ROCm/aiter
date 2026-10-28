@@ -6,12 +6,20 @@ import math
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.common.utils import (
+    fast_sigmoid,
+    l2norm,
+    sigmoid_log2,
+    sum_combine,
+)
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-_BLK_WARP_K: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 2], [1, 0])
+# [C, K] tiles: warps split the rows, so the l2norm row sums stay within a warp.
+_BLK_CK: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [2, 1], [1, 0])
 _BLK1: gl.constexpr = gl.BlockedLayout([1], [64], [2], [0])
-_BLK_CC: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [2, 1], [1, 0])
+# One whole C = 32 column per thread, for the gate's cumulative sum.
+_BLK_COL: gl.constexpr = gl.BlockedLayout([32, 1], [1, 64], [1, 2], [0, 1])
 
 _MMA_F16: gl.constexpr = gl.amd.AMDMFMALayout(
     version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[2, 1]
@@ -28,51 +36,15 @@ _B8_16: gl.constexpr = gl.DotOperandLayout(1, _MMA_B16, 8)
 _SH_A: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, [1, 0])
 _SH_B: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, [0, 1])
 _SH_CC_F: gl.constexpr = gl.SwizzledSharedLayout(1, 2, 8, [0, 1])
+_SH_ROWS: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+_SH_VEC: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
 
-
-@gluon.jit
-def _add(a, b):
-    return a + b
-
-
-@gluon.jit
-def _exp(x):
-    return gl.exp(x.to(gl.float32))
-
-
-@gluon.jit
-def _exp2(x):
-    return gl.exp2(x.to(gl.float32))
-
-
-@gluon.jit
-def _sigmoid(x):
-    return gl.extra.libdevice.fast_dividef(1.0, 1.0 + _exp(-x.to(gl.float32)))
-
-
-@gluon.jit
-def _l2norm(x):
-    f = x.to(gl.float32)
-    return f * gl.rsqrt(gl.sum(f * f, axis=1) + 1e-6)[:, None]
-
-
-@gluon.jit
-def _via_lds(x, shared: gl.constexpr, dot: gl.constexpr):
-    return gl.allocate_shared_memory(x.dtype, x.shape, shared, x).load(dot)
-
-
-@gluon.jit
-def _dot_f32(a, b_op, a_op: gl.constexpr, acc_layout: gl.constexpr, N: gl.constexpr):
-    return gl.amd.cdna4.mfma(
-        gl.convert_layout(a, a_op),
-        b_op,
-        gl.zeros([a.shape[0], N], gl.float32, acc_layout),
-    )
+_LOG2E = gl.constexpr(1.4426950408889634)
 
 
 _k1_prepare_repr = make_kernel_repr(
     "k1_prepare_gluon",
-    ["C", "K", "BC", "IS_VARLEN", "HAS_BIAS"],
+    ["C", "K", "BC", "IS_VARLEN", "HAS_BIAS", "STORE_BETA"],
 )
 
 
@@ -89,6 +61,7 @@ def k1_prepare_gluon(
     ws_kr,
     ws_gt,
     ws_inv_mqk,
+    ws_beta,
     cu_seqlens,
     chunk_indices,
     scale,
@@ -104,7 +77,10 @@ def k1_prepare_gluon(
     HAS_BIAS: gl.constexpr,
     CM_WS: gl.constexpr = "",
     CM_LOAD: gl.constexpr = ".cg",
+    STORE_BETA: gl.constexpr = False,
 ):
+    """FlashKDA K1 on gfx950, same workspace contract as the Triton prepare kernel.
+    ``STORE_BETA`` also writes ``sigmoid(beta)`` to ``ws_beta`` for the Gluon K2."""
     gl.static_assert(C == 32 and K == 128)
     NUM_DOUBLING: gl.constexpr = BC.bit_length() - 2
     NUM_MERGE: gl.constexpr = (C // BC).bit_length() - 1
@@ -132,8 +108,8 @@ def k1_prepare_gluon(
         return
     actual_len = gl.minimum(C, T_seq - t_off)
 
-    o_c = gl.arange(0, C, layout=gl.SliceLayout(1, _BLK_WARP_K))
-    o_k = gl.arange(0, K, layout=gl.SliceLayout(0, _BLK_WARP_K))
+    o_c = gl.arange(0, C, layout=gl.SliceLayout(1, _BLK_CK))
+    o_k = gl.arange(0, K, layout=gl.SliceLayout(0, _BLK_CK))
     o_k_v = gl.arange(0, K, layout=_BLK1)
     o_i_r = gl.arange(0, C, layout=gl.SliceLayout(1, _MMA_B16))
     o_i_c = gl.arange(0, C, layout=gl.SliceLayout(0, _MMA_B16))
@@ -152,48 +128,72 @@ def k1_prepare_gluon(
     b_k_raw = gl.amd.cdna4.buffer_load(
         ptr=k, offsets=qk_off, mask=m_ck, other=0.0, cache=CM_LOAD
     )
+
+    # One column per thread, so the gate's scan and row picks are in-thread.
+    o_c_col = gl.arange(0, C, layout=gl.SliceLayout(1, _BLK_COL))
+    o_k_col = gl.arange(0, K, layout=gl.SliceLayout(0, _BLK_COL))
+    g_off = (base * K + o_c_col[:, None].to(gl.int64) * (H * K) + o_k_col[None, :]).to(
+        gl.int32
+    )
+    # Masked: rows past the tensor's end are not clamped by hardware.
+    b_g = gl.amd.cdna4.buffer_load(
+        ptr=g_raw,
+        offsets=g_off,
+        mask=(o_c_col < actual_len)[:, None],
+        other=0.0,
+        cache=CM_LOAD,
+    ).to(gl.float32)
+    # sigmoid(e^A * (g + bias)) with -log2(e) * e^A folded into one scalar.
+    rate = gl.exp(gl.load(A_log + i_h).to(gl.float32)) * -_LOG2E
     if HAS_BIAS:
         bias = gl.amd.cdna4.buffer_load(
-            ptr=dt_bias, offsets=(i_h * K).to(gl.int32) + o_k
-        )[None, :]
+            ptr=dt_bias, offsets=(i_h * K).to(gl.int32) + o_k_col
+        )
+        b_z = b_g * rate + (bias * rate)[None, :]
+    else:
+        b_z = b_g * rate
+    # Tail rows get a zero gate, so the cumulative gate does not change after
+    # the last valid row. Rows C - 1 and C / 2 give the last and pivot values.
+    b_gate = gl.where(
+        o_c_col[:, None] < actual_len,
+        (lower_bound * _LOG2E) * sigmoid_log2(b_z),
+        0.0,
+    )
+    b_gcum_col = gl.associative_scan(b_gate, 0, sum_combine)
+    b_g_last_col = gl.sum(gl.where(o_c_col[:, None] == C - 1, b_gcum_col, 0.0), axis=0)
+    b_gp_col = gl.sum(gl.where(o_c_col[:, None] == C // 2, b_gcum_col, 0.0), axis=0)
+    # One LDS round trip (one barrier) for all three, not one conversion each.
+    s_gcum = gl.allocate_shared_memory(gl.float32, [C, K], _SH_ROWS, b_gcum_col)
+    s_g_last = gl.allocate_shared_memory(gl.float32, [K], _SH_VEC, b_g_last_col)
+    s_gp = gl.allocate_shared_memory(gl.float32, [K], _SH_VEC, b_gp_col)
+    b_gcum = s_gcum.load(_BLK_CK)
+    b_g_last = s_g_last.load(gl.SliceLayout(0, _BLK_CK))
+    b_gp = s_gp.load(gl.SliceLayout(0, _BLK_CK))
+    b_g_total = gl.exp2(b_g_last_col)
+    b_exp_g = gl.exp2(b_gcum)
 
-    b_g = gl.amd.cdna4.buffer_load(
-        ptr=g_raw, offsets=qk_off, mask=m_ck, other=0.0, cache=CM_LOAD
-    ).to(gl.float32)
-    if HAS_BIAS:
-        b_g = b_g + bias
-    b_A = gl.load(A_log + i_h)
-    b_gate = lower_bound * _sigmoid(_exp(b_A) * b_g)
-    log2_e: gl.constexpr = 1.4426950408889634
-    b_gcum = gl.associative_scan(b_gate, 0, _add) * log2_e
-    b_gcum = gl.where(m_ck, b_gcum, 0.0)
-
-    b_g_last = gl.sum(gl.where(o_c[:, None] == actual_len - 1, b_gcum, 0.0), axis=0)
-    b_g_total = _exp2(b_g_last)
-    b_exp_g = _exp2(b_gcum)
-
-    b_q = _l2norm(b_q_raw)
-    b_k = _l2norm(b_k_raw)
+    # Tail rows of q and k load as 0 and all factors below are finite, so the
+    # tail rows store as 0 without a mask.
+    b_q = l2norm(b_q_raw)
+    b_k = l2norm(b_k_raw)
 
     ws_idx = i_h * TOTAL_TILES + g_tile
     ck_off = (ws_idx * (C * K) + o_c[:, None].to(gl.int64) * K + o_k[None, :]).to(
         gl.int32
     )
     gl.amd.cdna4.buffer_store(
-        gl.where(m_ck, b_k * b_exp_g, 0.0).to(ws_kd.dtype.element_ty),
+        (b_k * b_exp_g).to(ws_kd.dtype.element_ty),
         ws_kd,
         ck_off,
         cache=CM_WS,
     )
     gl.amd.cdna4.buffer_store(
-        gl.where(m_ck, b_q * b_exp_g * scale, 0.0).to(ws_qd.dtype.element_ty),
+        (b_q * b_exp_g * scale).to(ws_qd.dtype.element_ty),
         ws_qd,
         ck_off,
         cache=CM_WS,
     )
-    b_kr_val = gl.where(m_ck, b_k * _exp2(b_g_last[None, :] - b_gcum), 0.0).to(
-        gl.bfloat16
-    )
+    b_kr_val = (b_k * gl.exp2(b_g_last[None, :] - b_gcum)).to(gl.bfloat16)
     gl.amd.cdna4.buffer_store(
         b_kr_val.to(ws_kr.dtype.element_ty), ws_kr, ck_off, cache=CM_WS
     )
@@ -204,7 +204,7 @@ def k1_prepare_gluon(
         cache=CM_WS,
     )
 
-    b_beta = _sigmoid(
+    b_beta = fast_sigmoid(
         gl.amd.cdna4.buffer_load(
             ptr=beta_raw,
             offsets=(base.to(gl.int32) + o_i_r * H),
@@ -212,41 +212,42 @@ def k1_prepare_gluon(
             other=0.0,
         ).to(gl.float32)
     )
+    if STORE_BETA:
+        gl.amd.cdna4.buffer_store(
+            b_beta, ws_beta, (ws_idx * C).to(gl.int32) + o_i_r, cache=CM_WS
+        )
 
-    o_mid = gl.minimum(C // 2, actual_len - 1)
-    b_gp = gl.sum(gl.where(o_c[:, None] == o_mid, b_gcum, 0.0), axis=0)
     b_gm = b_gcum - b_gp[None, :]
-    b_dec = _exp2(b_gm)
-    b_inc = _exp2(-b_gm)
-    b_k_piv = gl.where(m_ck, b_k * b_dec, 0.0).to(gl.bfloat16)
-    b_q_piv = gl.where(m_ck, b_q * b_dec * scale, 0.0).to(gl.bfloat16)
-    b_k_inv = gl.where(m_ck, b_k * b_inc, 0.0).to(gl.bfloat16)
+    b_dec = gl.exp2(b_gm)
+    b_inc = gl.exp2(-b_gm)
+    b_k_piv = (b_k * b_dec).to(gl.bfloat16)
+    b_q_piv = (b_q * b_dec * scale).to(gl.bfloat16)
+    b_k_inv = (b_k * b_inc).to(gl.bfloat16)
 
-    b_kinv_b = _via_lds(gl.permute(b_k_inv, 1, 0), _SH_B, _B8_16)
+    # All three operands go to LDS before any is read back: one barrier for all.
+    s_kinv = gl.allocate_shared_memory(
+        gl.bfloat16, [K, C], _SH_B, gl.permute(b_k_inv, 1, 0)
+    )
+    s_kpiv = gl.allocate_shared_memory(gl.bfloat16, [C, K], _SH_A, b_k_piv)
+    s_qpiv = gl.allocate_shared_memory(gl.bfloat16, [C, K], _SH_A, b_q_piv)
+    b_kinv_b = s_kinv.load(_B8_16)
 
     b_L = gl.amd.cdna4.mfma(
-        _via_lds(b_k_piv, _SH_A, _A8_16),
-        b_kinv_b,
-        gl.zeros([C, C], gl.float32, _MMA_B16),
+        s_kpiv.load(_A8_16), b_kinv_b, gl.zeros([C, C], gl.float32, _MMA_B16)
     )
     b_L = gl.where(o_i_r[:, None] > o_i_c[None, :], -b_L * b_beta[:, None], 0.0)
 
     b_Mqk = gl.amd.cdna4.mfma(
-        _via_lds(b_q_piv, _SH_A, _A8_16),
-        b_kinv_b,
-        gl.zeros([C, C], gl.float32, _MMA_B16),
+        s_qpiv.load(_A8_16), b_kinv_b, gl.zeros([C, C], gl.float32, _MMA_B16)
     )
     b_Mqk = gl.where(o_i_r[:, None] >= o_i_c[None, :], b_Mqk, 0.0)
 
-    o_r_cc = gl.arange(0, C, layout=gl.SliceLayout(1, _BLK_CC))
-    o_c_cc = gl.arange(0, C, layout=gl.SliceLayout(0, _BLK_CC))
-    cc_off_raw = (
-        ws_idx * (2 * C * C) + o_r_cc[:, None].to(gl.int64) * C + o_c_cc[None, :]
-    ).to(gl.int32)
+    # Stored from the MFMA layout; a wider-store conversion costs two barriers.
+    cc_base = (ws_idx * (2 * C * C)).to(gl.int32)
     gl.amd.cdna4.buffer_store(
-        gl.convert_layout(b_Mqk.to(ws_inv_mqk.dtype.element_ty), _BLK_CC),
+        b_Mqk.to(ws_inv_mqk.dtype.element_ty),
         ws_inv_mqk,
-        cc_off_raw + C * C,
+        cc_base + C * C + o_i_r[:, None] * C + o_i_c[None, :],
         cache=CM_WS,
     )
 
@@ -254,14 +255,42 @@ def k1_prepare_gluon(
         b_D = b_L
     else:
         b_D = gl.where(o_i_r[:, None] // BC == o_i_c[None, :] // BC, b_L, 0.0)
-    b_INV = gl.where(o_i_r[:, None] == o_i_c[None, :], 1.0, 0.0) + b_D
-    b_INV = gl.convert_layout(b_INV, _MMA_F16)
-    b_Dp = _dot_f32(b_D, _via_lds(b_D, _SH_CC_F, _BF16), _AF16, _MMA_F16, C)
-    for _ in gl.static_range(NUM_DOUBLING):
-        dp_b = _via_lds(b_Dp, _SH_CC_F, _BF16)
-        b_INV = b_INV + _dot_f32(b_INV, dp_b, _AF16, _MMA_F16, C)
-        b_Dp = _dot_f32(b_Dp, dp_b, _AF16, _MMA_F16, C)
+    # I + D; D is strictly lower triangular, so its diagonal is free for the 1s.
+    b_INV = gl.convert_layout(
+        gl.where(o_i_r[:, None] == o_i_c[None, :], 1.0, b_D), _MMA_F16
+    )
+    zero_cc = gl.zeros([C, C], gl.float32, _MMA_F16)
+    # Steps alternate between two buffer pairs, so the stores of a step do not
+    # overwrite what the previous step still reads.
+    s_a0 = gl.allocate_shared_memory(gl.float32, [C, C], _SH_CC_F)
+    s_b0 = gl.allocate_shared_memory(gl.float32, [C, C], _SH_CC_F)
+    s_a1 = gl.allocate_shared_memory(gl.float32, [C, C], _SH_CC_F)
+    s_b1 = gl.allocate_shared_memory(gl.float32, [C, C], _SH_CC_F)
+    s_a1.store(b_D)
+    b_Dp = gl.amd.cdna4.mfma(s_a1.load(_AF16), s_a1.load(_BF16), zero_cc)
+    for i in gl.static_range(NUM_DOUBLING):
+        if i % 2 == 0:
+            s_dp = s_a0
+            s_inv = s_b0
+        else:
+            s_dp = s_a1
+            s_inv = s_b1
+        s_dp.store(b_Dp)
+        s_inv.store(b_INV)
+        dp_b = s_dp.load(_BF16)
+        b_INV = gl.amd.cdna4.mfma(s_inv.load(_AF16), dp_b, b_INV)
+        b_Dp = gl.amd.cdna4.mfma(s_dp.load(_AF16), dp_b, zero_cc)
 
+    # The merge steps keep to fixed buffers: off and INV in the pair the doubling
+    # would use next, inner in the other pair.
+    if NUM_DOUBLING % 2 == 0:
+        s_off = s_a0
+        s_inv = s_b0
+        s_inner = s_a1
+    else:
+        s_off = s_a1
+        s_inv = s_b1
+        s_inner = s_a0
     w = BC
     for _ in gl.static_range(NUM_MERGE):
         ne_w = o_i_r[:, None] // w != o_i_c[None, :] // w
@@ -269,21 +298,24 @@ def k1_prepare_gluon(
             m_off = (o_i_r[:, None] // (2 * w) == o_i_c[None, :] // (2 * w)) & ne_w
         else:
             m_off = ne_w
-        b_off = gl.where(m_off, b_L, 0.0)
-        inner = _dot_f32(b_off, _via_lds(b_INV, _SH_CC_F, _BF16), _AF16, _MMA_F16, C)
-        b_INV = b_INV + _dot_f32(
-            b_INV, _via_lds(inner, _SH_CC_F, _BF16), _AF16, _MMA_F16, C
-        )
+        s_off.store(gl.where(m_off, b_L, 0.0))
+        s_inv.store(b_INV)
+        inner = gl.amd.cdna4.mfma(s_off.load(_AF16), s_inv.load(_BF16), zero_cc)
+        s_inner.store(inner)
+        b_INV = gl.amd.cdna4.mfma(s_inv.load(_AF16), s_inner.load(_BF16), b_INV)
         w = 2 * w
 
+    o_f_r = gl.arange(0, C, layout=gl.SliceLayout(1, _MMA_F16))
+    o_f_c = gl.arange(0, C, layout=gl.SliceLayout(0, _MMA_F16))
     gl.amd.cdna4.buffer_store(
-        gl.convert_layout(b_INV.to(ws_inv_mqk.dtype.element_ty), _BLK_CC),
+        b_INV.to(ws_inv_mqk.dtype.element_ty),
         ws_inv_mqk,
-        cc_off_raw,
+        cc_base + o_f_r[:, None] * C + o_f_c[None, :],
         cache=CM_WS,
     )
 
 
+# The warp count is fixed by the layouts above.
 _NUM_WARPS = math.prod(_MMA_F16.warps_per_cta)
 
 
@@ -302,6 +334,7 @@ def gluon_k1_prepare(
     ws_kr,
     ws_gt,
     ws_inv_mqk,
+    ws_beta,
     cu_seqlens,
     chunk_indices,
     scale,
@@ -316,7 +349,13 @@ def gluon_k1_prepare(
     B,
     CM_WS="",
     CM_LOAD=".cg",
+    num_warps=_NUM_WARPS,
+    waves_per_eu=0,
 ):
+    if num_warps != _NUM_WARPS:
+        raise ValueError(
+            f"k1_prepare_gluon is built for num_warps={_NUM_WARPS}, got {num_warps}"
+        )
     return _k1_fast[(TOTAL_TILES if cu_seqlens is not None else NT, B * H)](
         q=q,
         k=k,
@@ -329,6 +368,7 @@ def gluon_k1_prepare(
         ws_kr=ws_kr,
         ws_gt=ws_gt,
         ws_inv_mqk=ws_inv_mqk,
+        ws_beta=ws_beta,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
@@ -342,7 +382,9 @@ def gluon_k1_prepare(
         BC=BC,
         IS_VARLEN=cu_seqlens is not None,
         HAS_BIAS=dt_bias is not None,
+        STORE_BETA=ws_beta is not None,
         CM_WS=CM_WS,
         CM_LOAD=CM_LOAD,
-        num_warps=_NUM_WARPS,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )

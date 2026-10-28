@@ -45,7 +45,8 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                               aiter_tensor_t& moe_buf,
                               aiter_tensor_t& activation_quant,
                               aiter_tensor_t& activation_scale_token,
-                              int num_experts);
+                              int num_experts,
+                              std::optional<aiter_tensor_t> num_local_tokens = std::nullopt);
 
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================

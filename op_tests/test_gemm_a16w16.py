@@ -660,6 +660,33 @@ def test_gemm_out():
     return rows
 
 
+def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
+    """`torch.compile` of `tgemm.mm` whose weights and biases share one storage.
+
+    The op must not declare its inputs as mutated: functionalization then
+    clones the shared base storage and reads past the end of each bias view.
+    """
+    flat = torch.randn(layers * (n * k + n), dtype=dtypes.bf16, device="cuda") * 0.05
+    params = []
+    for i in range(layers):
+        base = i * (n * k + n)
+        params.append(flat[base : base + n * k].view(n, k))
+        params.append(flat[base + n * k : base + n * k + n])
+    x = torch.randn(m, k, dtype=dtypes.bf16, device="cuda")
+
+    def fn(x, *wb):
+        return [tgemm.mm(x, wb[2 * i], wb[2 * i + 1]) for i in range(layers)]
+
+    outs = torch.compile(fn, fullgraph=True)(x, *params)
+    refs = fn(x, *params)
+    rows = []
+    for i, (out, ref) in enumerate(zip(outs, refs)):
+        err = checkAllclose(ref, out, msg=f"compile packed layer {i}: ")
+        rows.append({"case": f"compile packed layer {i}", "err vs eager": err})
+    assert all(r["err vs eager"] == 0 for r in rows), rows
+    return rows
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -669,12 +696,13 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny", "out"],
+    choices=["normal", "skinny", "out", "compile"],
     default=["normal"],
     help="""Select test to run.
     e.g.: -t normal    # default
           or -t skinny
-          or -t out    # tgemm.mm(out=) on every backend""",
+          or -t out    # tgemm.mm(out=) on every backend
+          or -t compile    # torch.compile with weights/biases in one storage""",
 )
 parser.add_argument(
     "-d",
@@ -762,6 +790,8 @@ for test in args.test:
         df += ret
     elif test == "out":
         df += test_gemm_out()
+    elif test == "compile":
+        df += test_gemm_compile_packed_params()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)

@@ -141,6 +141,46 @@ _PRE_PR_HEURISTICS = {
 }
 
 
+# Former global IDs translated independently of the production selector.
+_LEGACY_TO_LOCAL = {
+    "gfx950": {
+        200: 6,
+        206: 12,
+        208: 14,
+        300: 30,
+        1200: 52,
+        1206: 58,
+        1208: 60,
+        1300: 76,
+    },
+    "gfx942": {
+        10000: 0,
+        10001: 1,
+        10200: 4,
+        10201: 5,
+        10203: 6,
+        10204: 7,
+        10205: 8,
+        10210: 9,
+        10213: 10,
+        10300: 12,
+        10301: 13,
+        10302: 14,
+        10303: 15,
+        10305: 16,
+    },
+    "gfx1250": {
+        20000: 0,
+        20003: 3,
+        20004: 4,
+        20005: 5,
+        20006: 6,
+        20007: 7,
+    },
+}
+_CU_BY_ARCH = {"gfx950": 256, "gfx942": 80, "gfx1250": 256}
+
+
 def _around(*boundaries: int) -> tuple[int, ...]:
     return tuple(
         sorted(
@@ -164,9 +204,10 @@ def test_python_heuristics_match_pre_pr_cpp_boundary_sweep():
         for M, N, K, has_bias, output in product(
             _M_SWEEP, _N_SWEEP, _K_SWEEP, (False, True), ("bf16", "fp32")
         ):
-            expected = reference(M, N, K, has_bias, output)
+            expected = _LEGACY_TO_LOCAL[arch][reference(M, N, K, has_bias, output)]
             actual = policy.select_a16w16_heuristic_kid(
                 arch=arch,
+                cu_num=_CU_BY_ARCH[arch],
                 M=M,
                 N=N,
                 K=K,
@@ -215,24 +256,16 @@ def _pre_pr_python_tuned_map(rows: pd.DataFrame) -> dict[tuple, dict]:
 
 
 def _pre_pr_codegen_tuned_map(rows: pd.DataFrame) -> dict[tuple, int]:
-    # opus_gemm_lookup.h had one arch-specific (M,N,K,outdtype) table. The
-    # generated entry carried a launcher pointer, represented here by its kid.
+    # Preserve the original arch-specific launcher-pointer table, with identity
+    # now supplied by the CSV's gfx/CU fields rather than inferred from an ID.
     result = {}
     for _, row in rows.iterrows():
         kid = int(row["solidx"])
-        kid_arches = [
-            arch
-            for arch in _PRE_PR_HEURISTICS
-            if get_kernel_instance(arch, "a16w16", kid) is not None
-        ]
-        assert kid_arches == [str(row["gfx"])]
-        key = (
-            kid_arches[0],
-            int(row["M"]),
-            int(row["N"]),
-            int(row["K"]),
-            str(row["outdtype"]),
-        )
+        arch = str(row["gfx"])
+        instance = get_kernel_instance(arch, "a16w16", kid, cu_num=int(row["cu_num"]))
+        assert instance is not None
+        assert instance.name == row["kernelName"]
+        key = (arch, int(row["M"]), int(row["N"]), int(row["K"]), str(row["outdtype"]))
         result[key] = kid
     return result
 
@@ -245,10 +278,10 @@ def _dtype(value: object) -> torch.dtype:
 
 
 _EXPECTED_GFX_KEY_FIXES = {
-    ("gfx950", 4096, 2048, 4096): ((21177, 0), (6401, 0)),
-    ("gfx950", 8192, 1024, 4096): ((21177, 0), (1401, 0)),
-    ("gfx950", 16384, 512, 4096): ((21177, 0), (1401, 0)),
-    ("gfx950", 16384, 512, 7168): ((21177, 0), (1401, 0)),
+    ("gfx950", 4096, 2048, 4096): (("gfx1250", 596, 0), ("gfx950", 136, 0)),
+    ("gfx950", 8192, 1024, 4096): (("gfx1250", 596, 0), ("gfx950", 93, 0)),
+    ("gfx950", 16384, 512, 4096): (("gfx1250", 596, 0), ("gfx950", 93, 0)),
+    ("gfx950", 16384, 512, 7168): (("gfx1250", 596, 0), ("gfx950", 93, 0)),
 }
 
 
@@ -290,11 +323,18 @@ def test_shipped_tuned_selection_diff_is_exhaustive(
 
         old_row = pre_pr_python[key[1:]]
         old_pair = (int(old_row["solidx"]), int(old_row["splitK"]))
-        if old_pair != pair:
-            assert str(old_row["gfx"]) != arch
-            assert get_kernel_instance(arch, "a16w16", old_pair[0]) is None
+        old_arch = str(old_row["gfx"])
+        if (old_arch, *old_pair) != (arch, *pair):
+            assert old_arch != arch
+            old_instance = get_kernel_instance(
+                old_arch, "a16w16", old_pair[0], cu_num=int(old_row["cu_num"])
+            )
+            current_instance = get_kernel_instance(
+                arch, "a16w16", pair[0], cu_num=int(fields["cu_num"])
+            )
+            assert old_instance.name != current_instance.name
             assert shape not in differences
-            differences[shape] = (old_pair, pair)
+            differences[shape] = ((old_arch, *old_pair), (arch, *pair))
 
         plan = policy.resolve_a16w16_tuned_candidate(
             arch=arch,
@@ -324,14 +364,14 @@ def test_shipped_tuned_selection_diff_is_exhaustive(
     (
         # Representative launch failures after the independent selector sweep.
         ("gfx950", 256, 1, 17, 130, False, torch.bfloat16, None),
-        ("gfx950", 256, 256, 256, 128, False, torch.bfloat16, (1300, 0)),
+        ("gfx950", 256, 256, 256, 128, False, torch.bfloat16, (76, 0)),
         ("gfx950", 256, 256, 256, 128, True, torch.bfloat16, None),
-        ("gfx1250", 256, 31, 127, 4098, False, torch.bfloat16, (20000, 1)),
-        ("gfx1250", 256, 32, 128, 4098, False, torch.bfloat16, (20007, 1)),
-        ("gfx942", 80, 256, 768, 7168, False, torch.bfloat16, (10200, 7)),
-        ("gfx942", 80, 257, 1024, 7168, False, torch.bfloat16, (10210, 4)),
-        ("gfx942", 80, 32, 1537, 2048, False, torch.bfloat16, (10303, 0)),
-        ("gfx942", 80, 32, 256, 1024, False, torch.float32, (10201, 8)),
+        ("gfx1250", 256, 31, 127, 4098, False, torch.bfloat16, (0, 1)),
+        ("gfx1250", 256, 32, 128, 4098, False, torch.bfloat16, (7, 1)),
+        ("gfx942", 80, 256, 768, 7168, False, torch.bfloat16, (4, 7)),
+        ("gfx942", 80, 257, 1024, 7168, False, torch.bfloat16, (9, 4)),
+        ("gfx942", 80, 32, 1537, 2048, False, torch.bfloat16, (15, 0)),
+        ("gfx942", 80, 32, 256, 1024, False, torch.float32, (5, 8)),
     ),
 )
 def test_untuned_shape_launch_resolution(
@@ -377,19 +417,19 @@ def test_untuned_shape_launch_resolution(
 @pytest.mark.parametrize(
     ("N", "requested", "expected"),
     (
-        (768, 10210, 10200),
-        (768, 10213, 10203),
-        (768, 10216, None),
-        (768, 10200, 10200),
-        (768, 10300, 10300),
-        (64, 10210, 10210),
-        (1024, 10213, 10213),
-        (2048, 10216, 10216),
+        (768, 9, 4),
+        (768, 10, 6),
+        (768, 11, None),
+        (768, 4, 4),
+        (768, 12, 12),
+        (64, 9, 9),
+        (1024, 10, 10),
+        (2048, 11, 11),
     ),
 )
 def test_gfx942_requested_kid_matches_pre_pr_generated_launcher(N, requested, expected):
     # main redirected the two paired BF16-workspace launchers and AITER_CHECKed
-    # 10216, which has no FP32-workspace sibling. ``None`` is that rejection at
+    # 11, which has no FP32-workspace sibling. ``None`` is that rejection at
     # policy time; unrelated gfx942 kids must remain unchanged.
     plan = policy.resolve_a16w16_tuned_candidate(
         arch="gfx942",

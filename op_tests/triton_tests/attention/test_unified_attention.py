@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import random
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -1010,4 +1012,109 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
         scale=scale,
         out_dtype=dtype,
     )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def _spec_verify_seq_lens(batch: int, max_query_len: int, seed: int):
+    """Verify-step batch: mixed query lengths up to 1 + num_spec, mixed contexts."""
+    rng = random.Random(seed)
+    return [
+        (rng.randint(1, max_query_len), rng.randint(max_query_len + 1, 3000))
+        for _ in range(batch)
+    ]
+
+
+@pytest.mark.parametrize(
+    "path, sliding_window", [("3d", None), ("2d", None), ("2d", 256), ("auto", None)]
+)
+@pytest.mark.parametrize("batch, seed", [(7, 0), (31, 1), (61, 2), (128, 3)])
+@pytest.mark.parametrize("max_query_len", [4, 8])
+@pytest.mark.parametrize("num_heads", [(16, 2), (16, 4), (16, 8), (16, 16)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@torch.inference_mode()
+def test_unified_attn_spec_verify_gfx1250(
+    path: str,
+    sliding_window: int | None,
+    batch: int,
+    seed: int,
+    max_query_len: int,
+    num_heads: tuple[int, int],
+    head_size: int,
+    monkeypatch,
+) -> None:
+    """Short multi-token queries (speculative-decode verify) on gfx1250: the 3D
+    split-KV kernel, where query rows of one block have different causal horizons
+    so a split segment can be partly or wholly past a row's horizon, and the 2D
+    kernel with a BLOCK_M sized to the query rows."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    if path != "auto":
+        monkeypatch.setattr(
+            sys.modules[unified_attention.__module__],
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    torch.manual_seed(seed)
+    seq_lens = _spec_verify_seq_lens(batch, max_query_len, seed)
+    block_size = 16
+    (
+        query,
+        key_cache,
+        value_cache,
+        shuffled_key_cache,
+        shuffled_value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=batch * (3000 // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+    unified_attention(
+        q=query,
+        k=shuffled_key_cache,
+        v=shuffled_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=True,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        soft_cap=None,
+        sinks=None,
+    )
+    assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
