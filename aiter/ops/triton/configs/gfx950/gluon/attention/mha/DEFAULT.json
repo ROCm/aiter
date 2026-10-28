@@ -4,56 +4,107 @@
       "BLOCK_M": 256,
       "BLOCK_N": 64,
       "waves_per_eu": 2,
-      "num_warps": 8
+      "num_warps": 8,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "pe": {
       "BLOCK_M": 128,
       "BLOCK_N": 32,
       "waves_per_eu": 2,
-      "num_warps": 4
+      "num_warps": 4,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "fp8": {
       "BLOCK_M": 128,
       "BLOCK_N": 64,
       "waves_per_eu": 2,
-      "num_warps": 4
+      "num_warps": 4,
+      "LAZY_RESCALE_THRESHOLD": 4.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "fp8_small_head": {
       "BLOCK_M": 128,
       "BLOCK_N": 128,
       "waves_per_eu": 2,
-      "num_warps": 4
+      "num_warps": 4,
+      "LAZY_RESCALE_THRESHOLD": 4.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "causal": {
       "BLOCK_M": 256,
       "BLOCK_N": 64,
       "waves_per_eu": 2,
-      "num_warps": 8
+      "num_warps": 8,
+      "LAZY_RESCALE_THRESHOLD": 0.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "causal_wide_min_seqlen_k": 4096,
     "causal_short": {
       "BLOCK_M": 128,
       "BLOCK_N": 64,
       "waves_per_eu": 2,
-      "num_warps": 4
+      "num_warps": 4,
+      "LAZY_RESCALE_THRESHOLD": 0.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
+    },
+    "causal_short_padded_head": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 32,
+      "waves_per_eu": 2,
+      "num_warps": 4,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "pe_narrow_v": {
       "BLOCK_M": 256,
       "BLOCK_N": 64,
       "waves_per_eu": 2,
-      "num_warps": 8
+      "num_warps": 8,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "wide_head": {
       "BLOCK_M": 128,
       "BLOCK_N": 32,
       "waves_per_eu": 2,
-      "num_warps": 4
+      "num_warps": 4,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "causal_window": {
       "BLOCK_M": 128,
       "BLOCK_N": 64,
       "waves_per_eu": 2,
-      "num_warps": 4
-    }
+      "num_warps": 4,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
+    },
+    "fp32": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 32,
+      "waves_per_eu": 2,
+      "num_warps": 4,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
+    },
+    "causal_small_head": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 8,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
+    },
+    "fp8_short": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 4,
+      "LAZY_RESCALE_THRESHOLD": 0.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
+    },
+    "fp8_lazy_min_seqlen_k": 2048
   }
 }

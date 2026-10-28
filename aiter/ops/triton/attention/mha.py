@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 from packaging.version import Version
+from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _attn_fwd as _gluon_attn_fwd,
@@ -48,7 +49,7 @@ _USE_FUSED_BWD_KERNEL = False
 
 def is_gluon_available() -> bool:
     """True when the Gluon MHA forward kernel can actually run on this device."""
-    if not _TRITON_GE_36:
+    if not _TRITON_GE_36 or not hasattr(gl, "map_elementwise"):
         return False
     arch = get_arch() or ""
     return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
@@ -205,7 +206,7 @@ def gluon_forward_unsupported_reason(
     if not is_gluon_available():
         return (
             f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
-            f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
+            f"Gluon map_elementwise support (arch={get_arch()!r}, triton={triton.__version__})"
         )
     if dropout_p and dropout_p != 0.0:
         return "Gluon MHA backend does not support dropout"
@@ -264,8 +265,8 @@ def _gluon_flash_attn_forward(
         q, k, v: query / key / value tensors (layout per the mode above).
         sm_scale: QK^T scale.
         causal: whether to apply a (bottom-right aligned) causal mask.
-        window_size: (left, right) local attention window. Only a left window is
-            supported, so right must be -1.
+        window_size: (left, right) local attention window. A zero right bound
+            selects causal attention. Positive right bounds require causal=True.
         return_lse: allocate and write the log-sum-exp. When False the kernel
             skips the LSE epilogue entirely.
         return_softmax: also write out the per-block softmax probabilities.
@@ -290,16 +291,23 @@ def _gluon_flash_attn_forward(
 
     assert is_gluon_available(), (
         f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
-        f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
+        f"Gluon map_elementwise support (arch={get_arch()!r}, triton={triton.__version__})"
     )
     assert q.shape[-1] == k.shape[-1], "q/k head_dim mismatch"
     # Unless q is pre-scaled, the kernel takes the row max of the unscaled scores,
     # which needs a nonnegative scale.
     assert sm_scale >= 0, f"Gluon MHA requires sm_scale >= 0 (got {sm_scale})"
 
-    if int(window_size[1]) != -1:
-        raise ValueError("window_size_right is not supported yet in the Gluon Backend")
-    sliding_window = _get_sliding_window_size(window_size)
+    right = int(window_size[1])
+    if right == 0:
+        causal = True
+    elif right != -1 and not (causal and right > 0):
+        raise ValueError("Gluon MHA requires right=-1, right=0, or causal attention")
+    sliding_window = max(int(window_size[0]), -1)
+    seqlen_k_max = int(max_seqlen_k) if varlen else k.shape[1]
+    if sliding_window >= seqlen_k_max - 1:
+        # This bound includes every key, even for the last query row.
+        sliding_window = -1
 
     IS_FP8 = types._is_fp8(q)
     FP8_MAX = torch.finfo(q.dtype).max if IS_FP8 else 0.0
@@ -323,11 +331,12 @@ def _gluon_flash_attn_forward(
     if config is None:
         config = _get_gluon_config(
             is_fp8=IS_FP8,
+            is_fp32=q.dtype == torch.float32,
             has_pe=pe_head_dim > 0,
             causal=causal,
             v_head_dim=v_head_dim,
             sliding_window=sliding_window,
-            seqlen_k=int(max_seqlen_k) if varlen else k.shape[1],
+            seqlen_k=seqlen_k_max,
         )
     config = dict(config)
     BLOCK_M = config.pop("BLOCK_M")
@@ -359,7 +368,10 @@ def _gluon_flash_attn_forward(
     # Pad to a vectorizable head dim
     head_size_og = v_head_dim
     if head_size_og % 8 != 0:
-        pad = 8 - head_size_og % 8
+        # FP8 needs 16 elements for 128-bit async copies. Keep already aligned
+        # heads unchanged: adding pad kernels to them costs more than it saves.
+        pad_multiple = 16 if IS_FP8 else 8
+        pad = (-head_size_og) % pad_multiple
         warnings.warn(
             f"Gluon MHA is padding q/k/v from head_dim {head_size_og} to "
             f"{head_size_og + pad} so the head-axis accesses vectorize. This costs "
@@ -392,12 +404,12 @@ def _gluon_flash_attn_forward(
     # not want LSE so the kernel can drop the epilogue store.
     if return_lse:
         if varlen:
-            softmax_lse = torch.zeros(
+            softmax_lse = torch.empty(
                 (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
             )
             lse_strides = (0, softmax_lse.stride(1), softmax_lse.stride(0))
         else:
-            softmax_lse = torch.zeros(
+            softmax_lse = torch.empty(
                 (batch, num_q_heads, seqlen_q), device=q.device, dtype=torch.float32
             )
             lse_strides = softmax_lse.stride()
@@ -436,7 +448,7 @@ def _gluon_flash_attn_forward(
         0 if pe_head_dim == 0 else max(triton.next_power_of_2(pe_head_dim), 16)
     )
     assert (pe_head_dim == 0 and BLOCK_DMODEL_PE_POW2 == 0) or (
-        v_head_dim == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2
+        head_size_og == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2
     ), "Positional encoding support requires NOPE and PE head sizes to be unpadded powers of 2."
     # fp8's 32x32x64 MFMA contracts 64 at a time.
     assert (not IS_FP8) or (
@@ -492,6 +504,9 @@ def _gluon_flash_attn_forward(
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
+    # Eager FP8 keeps runtime lengths and scale to avoid register spills.
+    # Other modes specialize them to simplify the dense pipeline.
+    specialize = not IS_FP8 or bool(config.get("LAZY_RESCALE_THRESHOLD"))
     _gluon_attn_fwd[grid](
         q,
         k,
@@ -503,11 +518,11 @@ def _gluon_flash_attn_forward(
         descale_k,
         descale_v,
         sink,
-        sm_scale,
+        gl.constexpr(sm_scale) if specialize else sm_scale,
         cu_seqlens_q,
         cu_seqlens_k,
-        seqlen_q,
-        seqlen_k,
+        gl.constexpr(seqlen_q) if specialize else seqlen_q,
+        gl.constexpr(seqlen_k) if specialize else seqlen_k,
         *q_strides,
         *k_strides,
         *v_strides,
@@ -537,10 +552,10 @@ def _gluon_flash_attn_forward(
         RETURN_SCORES=return_softmax,
         HEAD_STRIDE_ALIGN=head_stride_align,
         KV_STRIDE_ALIGN=kv_stride_align,
-        # fp8 keeps the per-tile scale: q is already fp8, so re-rounding q*scale back
-        # into fp8 would throw away far more than the multiply costs.  So does fp16:
-        # q*scale can overflow it where the fp32 scores would not.
-        SCALE_ON_Q=not IS_FP8 and q.dtype != torch.float16,
+        # FP16 can scale Q once when the multiplier cannot overflow its range.
+        # FP8 retains the scale in FP32 to avoid another low-precision conversion.
+        SCALE_ON_Q=not IS_FP8
+        and (q.dtype != torch.float16 or abs(sm_scale) <= math.log(2.0)),
         **config,
         enable_fp_fusion=True,
     )
