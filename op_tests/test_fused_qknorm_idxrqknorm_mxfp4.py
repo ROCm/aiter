@@ -8,7 +8,7 @@ index K, main K and the raw V as uint8 pages of 128 tokens, ``[128 x 64 B e2m1][
 e8m0]`` (8704 B), the low nibble the even element. The judge is the "auto" mode of the SAME
 op: ``per_1x32_f4_quant`` (aiter's torch MXFP4 reference) applied to the rows "auto" writes
 is what the MXFP4 bytes must equal, bit for bit, and every other output must not move.
-An e4m3 ``q_out`` must equal ``bf16(q)`` rounded to e4m3, saturating at its max.
+An e4m3 ``q_out`` must equal ``bf16(q)`` cast to e4m3 (no clamp: out of range is NaN).
 """
 
 import argparse
@@ -233,19 +233,19 @@ def test_views_into_one_pool():
 
 @benchmark()
 def test_q_fp8_out(dtype, kv, q_dtype):
-    """An e4m3 q_out gets bf16(q) rounded to e4m3 (unit scale, saturating) and replaces the
-    bf16 q, as an e4m3 index_q_out does: the packed qkv row is not written back either.
-    """
+    """An e4m3 q_out gets bf16(q) cast to e4m3 (unit scale, no clamp: values beyond the e4m3
+    range become NaN) and replaces the bf16 q, as an e4m3 index_q_out does: the packed qkv
+    row is not written back either."""
     T = 300
     slots = slot_cases(T)["shuffled"][0]
-    inputs = make_inputs(T, 1, dtype)
-    inputs[0][:8, : NQ * HD] *= 600.0  # some elements saturate
-    qkv = inputs[0].clone()
+    qkv, w, cs, pos = make_inputs(T, 1, dtype)
+    inputs = (qkv, w * 5000, cs, pos)  # the norm erases a scaled qkv; scale its weight
+    qkv = qkv.clone()
     q8 = torch.empty(T, NQ * HD, dtype=q_dtype)
     run_op(inputs, 1, slots, kv, 128, "auto", dtype, q_out=q8)
     q_ref = run_op(inputs, 1, slots, kv, 128, "auto", dtype)["q"]
-    want = q_ref.float().clamp(-FP8_MAX, FP8_MAX).to(dtypes.fp8)
-    assert same(q8, want)
+    assert (q_ref.float().abs() > FP8_MAX).any()  # some values are out of range
+    assert same(q8, q_ref.float().to(dtypes.fp8))
     assert torch.equal(inputs[0], qkv)
     return {"result": "PASS"}
 
