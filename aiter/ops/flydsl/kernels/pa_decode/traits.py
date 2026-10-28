@@ -770,6 +770,7 @@ class Gfx1250Traits:
 
     WAVE = 32
     NWARP = 4
+    BLOCK_THREADS = NWARP * WAVE
     FP8_MAX = 448.0
 
     @property
