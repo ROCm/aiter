@@ -93,6 +93,14 @@ def fused_qknorm_idxrqknorm(
     # (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k /
     # kv_cache_v are typically the key/value slices of a fused
     # [num_blocks, 2, block_size, num_kv_heads, head_dim] cache).
+    # MXFP4 pages are uint8, 8704 B per 128 tokens: [128 x 64 B e2m1][128 x 4 B e8m0].
+    # kv_cache_dtype="mxfp4": sparse insert only (pass skip_index_branch=True for a layer that
+    #   reuses another layer's top-k); K/V are [num_pages, num_kv_heads, 8704], block_size 128,
+    #   no k_scale/v_scale.
+    # index_cache_dtype="mxfp4": index_cache is whole contiguous pages; only the index-K write
+    #   changes.
+    # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3, saturating,
+    #   written instead of the bf16 q (as index_q_out).
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
