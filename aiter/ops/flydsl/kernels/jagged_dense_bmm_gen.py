@@ -14,8 +14,6 @@ skewed sequence lengths.
 
 from __future__ import annotations
 
-from collections import OrderedDict
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T
@@ -56,19 +54,10 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
     pos = local % cC
     xy_g_remap = chunk_idx * (cnXCD * cC) + xcd * cC + pos
 
-    if isinstance(num_rows, int):
-        total = num_rows * num_cols  # compile-time
-        period = nXCD * C  # compile-time
-        prefix = total - (total % period)  # largest [0,prefix) divisible by period
-        if fx.const_expr(prefix == total):
-            xy_g = xy_g_remap
-        else:
-            xy_g = (xy < fx.Int32(prefix)).select(xy_g_remap, xy)
-    else:
-        total = c_num_rows * c_num_cols  # runtime: total launched blocks
-        period = fx.Int32(nXCD * C)  # compile-time product
-        prefix = total - (total % period)  # runtime largest multiple of period <= total
-        xy_g = (xy < prefix).select(xy_g_remap, xy)
+    total = c_num_rows * c_num_cols
+    period = fx.Int32(nXCD * C)
+    prefix = total - (total % period)  # largest multiple of period <= total
+    xy_g = (xy < prefix).select(xy_g_remap, xy)
 
     tids_per_grp = cW * c_num_cols
     group_id = xy_g // tids_per_grp
@@ -81,8 +70,7 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
     return row, col
 
 
-_LAUNCHER_CACHE_MAX = 64  # skew compact keys include tot; bound growth
-_LAUNCHER_CACHE: OrderedDict = OrderedDict()
+_LAUNCHERS: dict = {}
 
 
 def _build_launcher(
@@ -92,15 +80,11 @@ def _build_launcher(
     BLOCK_N,
     BLOCK_K,
     THREADS,
-    BM_TILES,
-    N_GROUPS,
     XCD_C,
     XCD_W,
     COMPACT=False,
 ):
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
-    XCD_NUM_ROWS = BM_TILES * N_GROUPS
-    XCD_NUM_COLS = N_BLOCKS
     smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -139,13 +123,16 @@ def _build_launcher(
             seq_start = fx.Int32(rec[2])
             seq_end = fx.Int32(rec[3])
         else:
-            raw_xy = fx.Int32(raw_b) * fx.Int32(BM_TILES * N_BLOCKS) + fx.Int32(pid_mn)
-            row, col = _xcd_remap(raw_xy, XCD_NUM_ROWS, XCD_NUM_COLS, XCD_C, XCD_W)
+            grid_x = fx.Int32(fx.grid_dim.x)
+            bm_tiles = grid_x // fx.Int32(N_BLOCKS)
+            num_rows = bm_tiles * fx.Int32(fx.grid_dim.z)
+            raw_xy = fx.Int32(raw_b) * grid_x + fx.Int32(pid_mn)
+            row, col = _xcd_remap(raw_xy, num_rows, N_BLOCKS, XCD_C, XCD_W)
             row = fx.Int32(fx.rocdl.readfirstlane(T.i32, row))
             col = fx.Int32(fx.rocdl.readfirstlane(T.i32, col))
 
-            off_b = row // fx.Int32(BM_TILES)
-            block_m_idx = row % fx.Int32(BM_TILES)
+            off_b = row // bm_tiles
+            block_m_idx = row % bm_tiles
             block_n_idx = col
 
             seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
@@ -430,20 +417,6 @@ def _build_launcher(
     return _launch
 
 
-def _cache_get(key):
-    launch = _LAUNCHER_CACHE.get(key)
-    if launch is not None:
-        _LAUNCHER_CACHE.move_to_end(key)
-    return launch
-
-
-def _cache_put(key, launch):
-    _LAUNCHER_CACHE[key] = launch
-    _LAUNCHER_CACHE.move_to_end(key)
-    while len(_LAUNCHER_CACHE) > _LAUNCHER_CACHE_MAX:
-        _LAUNCHER_CACHE.popitem(last=False)
-
-
 def jagged_dense_bmm(
     C,
     A,
@@ -503,43 +476,16 @@ def jagged_dense_bmm(
             xcd_c = XCD_C_SMALL_K
     if xcd_w is None:
         xcd_w = 1 if xcd_c == 1 else XCD_W
-    bm = (max_seq_len + bmn - 1) // bmn
     nthreads = THREADS if threads is None else threads
     compact = tile_map is not None
 
     tmap = SEQ_OFFSETS if tile_map is None else tile_map
     tot = 0 if total_occ_tiles is None else int(total_occ_tiles)
 
-    key = (
-        N,
-        K,
-        bmn,
-        bnn,
-        block_k,
-        nthreads,
-        bm,
-        n_groups,
-        tot,
-        xcd_c,
-        xcd_w,
-        compact,
-    )
+    key = (N, K, bmn, bnn, block_k, nthreads, xcd_c, xcd_w, compact)
     launch_args = (C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream)
 
-    launch = _cache_get(key)
+    launch = _LAUNCHERS.get(key)
     if launch is None:
-        launch = _build_launcher(
-            N,
-            K,
-            bmn,
-            bnn,
-            block_k,
-            nthreads,
-            bm,
-            n_groups,
-            xcd_c,
-            xcd_w,
-            compact,
-        )
-        _cache_put(key, launch)
+        launch = _LAUNCHERS[key] = _build_launcher(*key)
     _run_compiled(launch, *launch_args)
