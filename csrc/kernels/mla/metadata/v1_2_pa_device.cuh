@@ -177,15 +177,15 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                             work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
 
                             // set reduce info
-                            if(lane_idx == 0)
+                            if(split_idx == 0)
                             {
-                                params.p_reduce_indptr[global_reduce_tile_idx + 1] =
+                                const int32_t reduce_tile_idx = global_reduce_tile_idx + qo_tile_idx;
+                                params.p_reduce_indptr[reduce_tile_idx + 1] =
                                     last_reduce_indptr + (qo_tile_idx + 1) * num_splits;
-                                params.p_reduce_final_map[global_reduce_tile_idx * 2] =
+                                params.p_reduce_final_map[reduce_tile_idx * 2] =
                                     work_info.qo_start;
-                                params.p_reduce_final_map[global_reduce_tile_idx * 2 + 1] =
+                                params.p_reduce_final_map[reduce_tile_idx * 2 + 1] =
                                     work_info.qo_end;
-                                global_reduce_tile_idx += 1;
                             }
 
                             if constexpr(Traits::kQoSplits)
@@ -209,7 +209,8 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                             work_info.partial_qo_loc = -1;
                         }
 
-                        p_work_info_set[num_works + qo_tile_idx] = work_info;
+                        if(split_idx == 0)
+                            p_work_info_set[num_works + qo_tile_idx] = work_info;
                     };
 
                     // record a work in work_info_set
@@ -256,6 +257,8 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                         }
                     }
 
+                    if(curr_n_split_idx > 0)
+                        global_reduce_tile_idx += num_qo_tiles;
                     num_works += num_qo_tiles;
 
                     // update state
