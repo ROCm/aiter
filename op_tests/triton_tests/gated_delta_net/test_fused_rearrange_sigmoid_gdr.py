@@ -333,3 +333,60 @@ def test_fused_rearrange_sigmoid_gdr_defer_spec_state(N: int, max_t: int):
             rtol=1e-4,
             atol=1e-5,
         )
+
+
+def _defer_inputs(num_tokens: int, idx: torch.Tensor, acc: list[int]) -> dict:
+    device = "cuda"
+    H, HV, K, V, dtype = 2, 6, 128, 128, torch.bfloat16
+    key_dim, value_dim = H * K, HV * V
+    return {
+        "A_log": torch.randn(HV, device=device, dtype=torch.float32) * 0.5,
+        "a": torch.randn(num_tokens, HV, device=device, dtype=dtype),
+        "b": torch.randn(num_tokens, HV, device=device, dtype=dtype),
+        "dt_bias": torch.randn(HV, device=device, dtype=torch.float32),
+        "qkv": torch.randn(
+            num_tokens, 2 * key_dim + value_dim, device=device, dtype=dtype
+        ),
+        "key_dim": key_dim,
+        "value_dim": value_dim,
+        "head_k_dim": K,
+        "head_v_dim": V,
+        "cu_seqlens": torch.tensor([0, num_tokens], device=device, dtype=torch.int32),
+        "ssm_state_indices": idx,
+        "num_accepted_tokens": torch.tensor(acc, device=device, dtype=torch.int32),
+        "use_qk_l2norm_in_kernel": True,
+    }
+
+
+@cuda_ok
+def test_fused_rearrange_sigmoid_gdr_defer_spec_state_no_record_slot():
+    # A row whose record slot is -1 keeps no records; nothing outside the
+    # state pool (here the slot just before it) is written.
+    torch.manual_seed(0)
+    HV, K, V = 6, 128, 128
+    pool = 0.1 * torch.randn(4, HV, V, K, device="cuda", dtype=torch.float32)
+    canary = pool[0].clone()
+    state_defer = pool[1:]
+    state_ref = state_defer.clone()
+    idx = torch.tensor([[1, -1]], device="cuda", dtype=torch.int32)
+    for _ in range(2):
+        common = _defer_inputs(2, idx, [1])
+        o_ref, _ = fused_rearrange_sigmoid_gated_delta_rule(
+            initial_state=state_ref, **common
+        )
+        o_defer, _ = fused_rearrange_sigmoid_gated_delta_rule(
+            initial_state=state_defer, defer_spec_state=True, **common
+        )
+        torch.testing.assert_close(o_defer.float(), o_ref.float(), rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(state_defer[1], state_ref[1], rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(pool[0], canary, rtol=0, atol=0)
+
+
+@cuda_ok
+def test_fused_rearrange_sigmoid_gdr_defer_spec_state_needs_record_column():
+    state = torch.zeros(2, 6, 128, 128, device="cuda", dtype=torch.float32)
+    idx = torch.tensor([[1]], device="cuda", dtype=torch.int32)
+    with pytest.raises(AssertionError, match="record slot"):
+        fused_rearrange_sigmoid_gated_delta_rule(
+            initial_state=state, defer_spec_state=True, **_defer_inputs(1, idx, [1])
+        )

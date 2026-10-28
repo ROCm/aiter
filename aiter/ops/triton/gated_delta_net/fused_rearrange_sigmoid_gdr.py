@@ -216,7 +216,8 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     first token in slot 0 of each ``ssm_state_indices`` row. It records the
     inputs of the other tokens in slot 1. The next step replays
     ``num_accepted_tokens - 1`` records onto slot 0. All spec-decode steps of a
-    request must use this mode. Nothing else can read the per-token slots.
+    request must use this mode. Nothing else can read the per-token slots. A
+    row whose slot 1 is -1 keeps no records, so it must accept one token.
     """
     # Spelled as raised ``AssertionError``s rather than ``assert`` statements,
     # keeping the type a caller may already handle while ``python -O`` can no
@@ -330,6 +331,8 @@ def fused_rearrange_sigmoid_gated_delta_rule(
             and ssm_state_indices.ndim == 2
         )
         max_query_len = ssm_state_indices.size(1)
+        # The kernel reads every row's record slot from column 1.
+        assert max_query_len >= 2, "defer_spec_state needs a record slot column"
         # Replay gives the per-token states only if the state is not rounded.
         assert initial_state.dtype == torch.float32
         record_size = (max_query_len - 1) * NV * (BK + BV + 2)

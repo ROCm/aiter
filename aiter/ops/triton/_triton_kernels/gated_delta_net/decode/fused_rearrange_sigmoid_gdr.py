@@ -152,14 +152,19 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         stash_idx = tl.load(
             ssm_state_indices + i_n * stride_indices_seq + stride_indices_tok
         ).to(tl.int64)
+        # A row without a record slot (-1) neither replays nor records; the
+        # clamp keeps its record pointer inside the state pool.
+        has_stash = stash_idx >= 0
         # Each program has its own records, so replay reads only its own data.
         p_stash = (
             h0
-            + stash_idx * stride_init_state_token
+            + tl.maximum(stash_idx, 0) * stride_init_state_token
             + (i_hv * tl.num_programs(1) + i_v) * STASH_W
         )
         stash_stride = HV * tl.num_programs(1) * STASH_W
-        num_replay = tl.load(num_accepted_tokens + i_n).to(tl.int32) - 1
+        num_replay = tl.where(
+            has_stash, tl.load(num_accepted_tokens + i_n).to(tl.int32) - 1, 0
+        )
         for i_r in range(num_replay):
             p_r = p_stash + i_r * stash_stride
             b_h = _gated_delta_rule_step(
@@ -202,10 +207,12 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         b_a = tl.load(p_a).to(tl.float32)
         if DEFER_SPEC_STATE and i_t > 0:
             p_r = p_stash + (i_t - 1) * stash_stride
-            tl.store(p_r + o_k, b_k.to(p_r.dtype.element_ty), mask=mask_k)
-            tl.store(p_r + BK + o_r, b_v.to(p_r.dtype.element_ty), mask=mask_v)
-            tl.store(p_r + BK + BV, b_a.to(p_r.dtype.element_ty))
-            tl.store(p_r + BK + BV + 1, b_b.to(p_r.dtype.element_ty))
+            tl.store(p_r + o_k, b_k.to(p_r.dtype.element_ty), mask=mask_k & has_stash)
+            tl.store(
+                p_r + BK + o_r, b_v.to(p_r.dtype.element_ty), mask=mask_v & has_stash
+            )
+            tl.store(p_r + BK + BV, b_a.to(p_r.dtype.element_ty), mask=has_stash)
+            tl.store(p_r + BK + BV + 1, b_b.to(p_r.dtype.element_ty), mask=has_stash)
 
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
