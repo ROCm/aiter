@@ -463,6 +463,33 @@ stable_region_words(int M, int K, int cap, bool keys_only, int nwide, bool reuse
     return bm > list ? bm : list;
 }
 
+// A stable launch of more than one block a CU goes without the region, so that
+// stable phase_c holds the LDS the default one does and keeps as many blocks
+// resident: at M=257, 131072 columns, k=2048 the region left one block a CU,
+// and the call 1.21x the default one; bare, 1.09x. The windowed emit's bitmaps
+// then go in the candidate arrays and in the wide-select buffers past a list of
+// cap entries; a launch is bare only where those waves take every row's
+// windows. The host sizes the launch from this and the kernel carves from it.
+__host__ __device__ inline int stable_win_bare_list(int cap) { return (cap + 3) & ~3; }
+__host__ __device__ inline int
+stable_win_bare_waves(int cap, bool keys_only, int nwide, bool reuse_wide, int nwaves)
+{
+    const int per  = 3 * STABLE_WIN_WORDS;
+    const int wide = wide_buffer_count(nwide, reuse_wide) * WIDE_WORDS;
+    if(wide < stable_win_bare_list(cap))
+        return 0;
+    const int n = (keys_only ? cap : 2 * cap) / per + (wide - stable_win_bare_list(cap)) / per;
+    return n < nwaves ? n : nwaves;
+}
+__host__ __device__ inline bool stable_win_bare(
+    int M, int pitch, int K, int cap, bool keys_only, int nwide, bool reuse_wide, int nwaves)
+{
+    const int nww  = stable_win_bare_waves(cap, keys_only, nwide, reuse_wide, nwaves);
+    const int nwin = stable_win_count(pitch);
+    return M > CU_COUNT && nww > 0 && nwin <= STABLE_WIN_MAX &&
+           nwin <= stable_win_per_wave(K) * nww;
+}
+
 template <bool RAGGED,
           bool WRITE_VALUES,
           bool REUSE_WIDE = false,
@@ -684,8 +711,74 @@ phase_c_select_contig(const float* __restrict__ input,
             uint32_t* s_region = s_dyn + (keys_only ? cap : 2 * cap) +
                                  wide_buffer_count(nwide, REUSE_WIDE) * WIDE_WORDS;
             const int nw = stable_bm_words((int)gridDim.x, K, cap, keys_only, nwide, REUSE_WIDE);
+            const int nwaves = (int)blockDim.x / WAVE_SIZE;
+            const bool bare  = stable_win_bare(
+                (int)gridDim.x, pitch, K, cap, keys_only, nwide, REUSE_WIDE, nwaves);
+            {
+                // The windowed emit, its window counts in s_hist, done with since the
+                // select. Its bitmaps go in the candidate arrays, which its scatter reads
+                // for the last time, and the list in this region; or the bitmaps here and
+                // the list in the wide-select buffers, also done with: whichever gives
+                // more waves a bitmap. Without the region, see stable_win_bare.
+                const int cand_words = keys_only ? cap : 2 * cap;
+                const int wide_words = wide_buffer_count(nwide, REUSE_WIDE) * WIDE_WORDS;
+                const int per_wave   = 3 * STABLE_WIN_WORDS;
+                int nww              = 0;
+                int nww_first        = 0;
+                uint32_t* win_bm     = nullptr;
+                uint32_t* win_rest   = nullptr;
+                uint32_t* win_list   = nullptr;
+                if(bare)
+                {
+                    nww       = stable_win_bare_waves(cap, keys_only, nwide, REUSE_WIDE, nwaves);
+                    nww_first = min(nww, cand_words / per_wave);
+                    win_bm    = s_dyn;
+                    win_list  = s_wide;
+                    win_rest  = s_wide + stable_win_bare_list(cap);
+                }
+                else
+                {
+                    const int region_words =
+                        stable_region_words((int)gridDim.x, K, cap, keys_only, nwide, REUSE_WIDE);
+                    if(c <= region_words && min(nwaves, cand_words / per_wave) > nww)
+                    {
+                        nww      = min(nwaves, cand_words / per_wave);
+                        win_bm   = s_dyn;
+                        win_list = s_region;
+                    }
+                    if(c <= wide_words && min(nwaves, region_words / per_wave) > nww)
+                    {
+                        nww      = min(nwaves, region_words / per_wave);
+                        win_bm   = s_region;
+                        win_list = s_wide;
+                    }
+                    nww_first = nww;
+                }
+                const int nwin = stable_win_count(len);
+                if(nw > 0 && nww > 0 && nwin <= STABLE_WIN_MAX &&
+                   nwin <= stable_win_per_wave(K) * nww)
+                {
+                    block_gather_by_window<WRITE_VALUES, NAN_HIGH>(c,
+                                                                   len,
+                                                                   nww,
+                                                                   nww_first,
+                                                                   row_start,
+                                                                   pivot,
+                                                                   eq_needed,
+                                                                   out,
+                                                                   val,
+                                                                   rif,
+                                                                   s_keys_ext,
+                                                                   win_bm,
+                                                                   win_rest,
+                                                                   win_list,
+                                                                   s_hist,
+                                                                   col_at);
+                    return;
+                }
+            }
             // In 64 bits: len + a window's columns overflows an int near INT32_MAX.
-            if(nw > 0 && (int64_t)len <= (int64_t)STABLE_BM_MAX_WINDOWS * 32 * nw)
+            if(!bare && nw > 0 && (int64_t)len <= (int64_t)STABLE_BM_MAX_WINDOWS * 32 * nw)
             {
                 block_gather_by_column<WRITE_VALUES, NAN_HIGH>(c,
                                                                len,
@@ -701,7 +794,7 @@ phase_c_select_contig(const float* __restrict__ input,
                                                                col_at);
                 return;
             }
-            const int lw       = stable_list_words(K, cap);
+            const int lw       = bare ? 0 : stable_list_words(K, cap);
             uint32_t* s_list   = lw > 0 ? s_region : s_hist;
             const int list_cap = lw > 0 ? lw : HIST_SLOTS;
             stable_collect<NAN_HIGH>(c, pivot, s_list, list_cap, &s_wgt, &s_weq, key_at, col_at);

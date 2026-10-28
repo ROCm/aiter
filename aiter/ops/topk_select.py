@@ -128,11 +128,11 @@ _NONDETERMINISTIC = frozenset({"plain"})
 # and `stream` those calls had: 32 rows of 2M at k=2048 took 401us on one
 # torch.randn seed of four and 65us on the others, against decode's 126us, and
 # 8 rows of 4M took 706us on every seed against 122us (MI355X). The stable emit
-# adds 17-20us on top. Up to it, over the 267 shapes of 1..4096 rows, 131072..1M
-# columns and k=512..2048 that change hands, three seeds each, it ran 0.71x of
-# them under tie='low' and 0.68x under `deterministic` (geomean); the closest
-# cells, 1..16 rows of 524288 at k=512, re-timed one process per run at
-# 0.99x-1.02x.
+# adds 10-20us on top there. Up to it, over the shapes of 1..4096 rows,
+# 131072..1M columns and k=512..2048 that change hands, three seeds each, it ran
+# 0.66x of `decode` under tie='low' (48 shapes, 0.83x at worst) and 0.67x of
+# `decode` and `stream` under `deterministic` (81 shapes, 1.01x at worst: 4096
+# rows of 524288 at k=512, against `stream`), geomean.
 _SAMPLED_STABLE_MAX_PITCH = 1 << 20
 # Order to fall back in when the shape rules name nothing that is available.
 # Streaming first because it takes a row length natively and scales with rows;

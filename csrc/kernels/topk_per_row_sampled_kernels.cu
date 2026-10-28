@@ -1420,12 +1420,21 @@ static void topk_fused_impl(const float* d_in,
     else
         launch_phase_b<RAGGED, false, false, 0>(d_in, M, pitch, ext, b, lp, s);
 
+    const bool bare = STABLE && stable_win_bare(M,
+                                                pitch,
+                                                K,
+                                                lp.cap,
+                                                lp.keys_only_c,
+                                                lp.nwide_c,
+                                                lp.reuse_wide_c,
+                                                lp.c_block / WAVE_SIZE);
     // The stable emit's own LDS lives past everything else phase_c holds.
     const size_t c_dyn_bytes =
         lp.c_dyn_bytes +
-        (STABLE ? sizeof(uint32_t) * (size_t)stable_region_words(
-                                         M, K, lp.cap, lp.keys_only_c, lp.nwide_c, lp.reuse_wide_c)
-                : 0);
+        (STABLE && !bare
+             ? sizeof(uint32_t) * (size_t)stable_region_words(
+                                      M, K, lp.cap, lp.keys_only_c, lp.nwide_c, lp.reuse_wide_c)
+             : 0);
     auto launch_phase_c = [&](auto reuse_tag) {
         constexpr bool REUSE = decltype(reuse_tag)::value;
         phase_c_select_contig<RAGGED, WRITE_VALUES, REUSE, NAN_HIGH, STABLE>

@@ -1022,12 +1022,19 @@ def _tie_heavy(rows, width, g):
 
 
 def _sampled_stable(x, rs, re, k, values=False, nan_high=False):
+    """The entry's stable mode, its outputs followed by guard slots it must not
+    touch."""
     rows, width = x.shape
-    idx = torch.empty(rows, k, dtype=torch.int32, device="cuda")
-    val = torch.empty(rows, k, device="cuda") if values else None
+    buf = torch.full((rows * k + 1024,), -7, dtype=torch.int32, device="cuda")
+    vbuf = torch.full((rows * k + 1024,), 7.0, device="cuda") if values else None
+    idx = buf[: rows * k].view(rows, k)
+    val = vbuf[: rows * k].view(rows, k) if values else None
     aiter.top_k_per_row_prefill_sampled(
         x, rs, re, idx, val, rows, width, 1, k, nan_high=nan_high, stable=True
     )
+    assert bool((buf[rows * k :] == -7).all()), "an index written past rows * k"
+    if values:
+        assert bool((vbuf[rows * k :] == 7.0).all()), "a value written past rows * k"
     return idx, val
 
 
@@ -1047,6 +1054,7 @@ def test_sampled_stable_contract():
     value."""
     rows, N = 8, _SAMPLED_N
     if not aiter.topk_sampled_supports(rows, N, _SAMPLED_K):
+        assert get_gfx() != "gfx950", "`sampled` has to serve this shape on gfx950"
         print("[sampled_stable] SKIP: `sampled` does not serve this shape here")
         return
     g = torch.Generator(device="cuda").manual_seed(3)
@@ -1064,6 +1072,19 @@ def test_sampled_stable_contract():
         idx = _sampled_stable(x, rs, re, k, nan_high=True)[0]
         ref = _stable_ref(x, rs, re, k, _nan_high_key)
         assert torch.equal(idx, ref), f"k={k}: nan_high"
+
+        # Past one block a CU the launch carries no stable region (300 rows:
+        # every wave a bitmap; 600: five of them).
+        for m in (300, 600):
+            xm = _tie_heavy(m, N, g)
+            ln = torch.randint(1, N + 1, (m,), generator=g, device="cuda")
+            sm = (torch.rand(m, generator=g, device="cuda") * (N - ln + 1)).int()
+            em = (sm + ln).int()
+            for nan_high, key in ((False, _sign_key), (True, _nan_high_key)):
+                got = _sampled_stable(xm, sm, em, k, nan_high=nan_high)[0]
+                assert torch.equal(
+                    got, _stable_ref(xm, sm, em, k, key)
+                ), f"k={k}: {m} rows, nan_high={nan_high}"
         assert torch.equal(idx, _per_row_stable(x, rs, re, k, True)), f"k={k}: FlyDSL"
 
         with _use_sampled(True):
