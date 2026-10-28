@@ -355,10 +355,16 @@
           ]
         },
         "hidden": {
+          "2048": {
+            "atoms_per_row": 1,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 32, "grid_cap": 128}
+            ]
+          },
           "4096": {
             "atoms_per_row": 2,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 128}
+              {"min_bytes": 0, "super_tile": 16, "grid_cap": 128}
             ]
           }
         }
@@ -372,7 +378,7 @@
         "default": {
           "rungs": [
             {"min_bytes": 0, "atoms": 2, "grid_cap": 8, "fanout": "peer", "split": 1},
-            {"min_bytes": "64 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1},
+            {"min_bytes": "48 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1},
             {"min_bytes": "384 KiB", "atoms": 2, "grid_cap": 32, "fanout": "peer", "split": 1}
           ]
         }
@@ -382,8 +388,16 @@
           "atoms_per_row": 2,
           "rungs": [
             {"min_bytes": 0, "super_tile": 1, "grid_cap": 128},
-            {"min_bytes": "896 KiB", "super_tile": 8, "grid_cap": 128}
+            {"min_bytes": "896 KiB", "super_tile": 8, "grid_cap": 64}
           ]
+        },
+        "hidden": {
+          "2048": {
+            "atoms_per_row": 1,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 8, "grid_cap": 32}
+            ]
+          }
         }
       },
       "ring": {
@@ -392,6 +406,15 @@
           "rungs": [
             {"min_bytes": 0, "super_tile": 32, "grid_cap": 128}
           ]
+        },
+        "hidden": {
+          "4096": {
+            "atoms_per_row": 2,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 8, "grid_cap": 128},
+              {"min_bytes": "24 MiB", "super_tile": 32, "grid_cap": 128}
+            ]
+          }
         }
       }
     },
@@ -408,8 +431,8 @@
         "hidden": {
           "7168": {
             "rungs": [
-              {"min_bytes": 0, "atoms": 1, "grid_cap": 256, "fanout": "peer", "split": 8},
-              {"min_bytes": "56 KiB", "atoms": 1, "grid_cap": 32, "fanout": "peer", "split": 1}
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 32, "fanout": "peer", "split": 8},
+              {"min_bytes": "84 KiB", "atoms": 1, "grid_cap": 32, "fanout": "peer", "split": 2}
             ]
           },
           "8192": {
@@ -422,10 +445,18 @@
       },
       "mesh": {
         "default": {
-          "atoms_per_row": 1,
+          "atoms_per_row": 2,
           "rungs": [
             {"min_bytes": 0, "super_tile": 8, "grid_cap": 32}
           ]
+        },
+        "hidden": {
+          "4096": {
+            "atoms_per_row": 1,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 8, "grid_cap": 64}
+            ]
+          }
         }
       },
       "ring": {
