@@ -8,8 +8,8 @@ For each group ``b`` over ``[seq_offsets[b], seq_offsets[b+1])``::
     Out[s:e, :] = Jagged[s:e, :] @ Dense[b] + Bias[b]
 
 Dense weight is host-pre-transposed to ``(B * N, K)``. Supports a uniform
-grid launch with optional XCD remap, and a compact ``TILE_MAP`` launch for
-skewed sequence lengths.
+grid launch with optional XCD remap, and a compact launch for skewed
+sequence lengths that maps each workgroup to its group on device.
 """
 
 from __future__ import annotations
@@ -94,34 +94,51 @@ def _build_launcher(
         B: fx.Tensor,  # dense  (B_groups * N, K) bf16 (pre-transposed, tall)
         BIAS: fx.Tensor,  # bias   (B_groups * N,)   bf16
         SEQ_OFFSETS: fx.Tensor,  # (B_groups + 1,) int32
-        TILE_MAP: fx.Tensor,  # compact: (total_occ_tiles, 4) int32 [off_b, m_idx, seq_start, seq_end]; else dummy
+        n_groups: fx.Int32,
+        search_steps: fx.Int32,  # compact: ceil(log2(n_groups)); else unused
         tiled_mma: fx.TiledMma,
         tiled_copy_g2s_A: fx.TiledCopy,
         tiled_copy_s2g_C: fx.TiledCopy,
     ):
         tid = fx.thread_idx.x
         pid_mn, _, raw_b = fx.block_idx
+        seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
+
+        def load_seq(i):
+            return fx.Int32(
+                buffer_ops.buffer_load(seq_rsrc, i, vec_width=1, is_scalar=True)
+            )
 
         if fx.const_expr(COMPACT):
-            tile_rsrc = buffer_ops.create_buffer_resource(TILE_MAP, max_size=True)
             if fx.const_expr(XCD_C > 1):
-                total_occ = fx.Int32(fx.grid_dim.x)
-                raw_xy = fx.Int32(raw_b) * total_occ + fx.Int32(pid_mn)
-                tile_row, n_col = _xcd_remap(raw_xy, total_occ, N_BLOCKS, XCD_C, XCD_W)
+                grid_x = fx.Int32(fx.grid_dim.x)
+                raw_xy = fx.Int32(raw_b) * grid_x + fx.Int32(pid_mn)
+                tile_row, n_col = _xcd_remap(raw_xy, grid_x, N_BLOCKS, XCD_C, XCD_W)
                 tile_row = fx.Int32(fx.rocdl.readfirstlane(T.i32, tile_row))
                 block_n_idx = fx.Int32(fx.rocdl.readfirstlane(T.i32, n_col))
             else:
                 tile_row = fx.Int32(pid_mn)
                 block_n_idx = fx.Int32(raw_b)
-            rec = fx.Vector(
-                buffer_ops.buffer_load(
-                    tile_rsrc, tile_row * fx.Int32(4), vec_width=4, is_scalar=True
-                )
-            )
-            off_b = fx.Int32(rec[0])
-            block_m_idx = fx.Int32(rec[1])
-            seq_start = fx.Int32(rec[2])
-            seq_end = fx.Int32(rec[3])
+            # Group g owns M-tile slots [f(g), f(g+1)) with
+            # f(g) = seq_offsets[g] // BLOCK_M + g: strictly increasing, and
+            # each group gets at least ceil(M_g / BLOCK_M) slots. Find the
+            # last g with f(g) <= tile_row; surplus slots fail start_m < M_b.
+            c_bm = fx.Int32(BLOCK_M)
+            c_one = fx.Int32(1)
+            for _, state in range(
+                fx.Int32(0),
+                search_steps,
+                c_one,
+                init=[fx.Int32(0), n_groups - c_one],
+            ):
+                lo, hi = state[0], state[1]
+                mid = (lo + hi + c_one) >> c_one
+                take = load_seq(mid) // c_bm + mid <= tile_row
+                results = yield [take.select(mid, lo), take.select(hi, mid - c_one)]
+            off_b = results[0]
+            seq_start = load_seq(off_b)
+            seq_end = load_seq(off_b + c_one)
+            block_m_idx = tile_row - (seq_start // c_bm + off_b)
         else:
             grid_x = fx.Int32(fx.grid_dim.x)
             bm_tiles = grid_x // fx.Int32(N_BLOCKS)
@@ -134,18 +151,8 @@ def _build_launcher(
             off_b = row // bm_tiles
             block_m_idx = row % bm_tiles
             block_n_idx = col
-
-            seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-            seq_start = fx.Int32(
-                buffer_ops.buffer_load(
-                    seq_rsrc, fx.Int32(off_b), vec_width=1, is_scalar=True
-                )
-            )
-            seq_end = fx.Int32(
-                buffer_ops.buffer_load(
-                    seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, is_scalar=True
-                )
-            )
+            seq_start = load_seq(off_b)
+            seq_end = load_seq(off_b + fx.Int32(1))
         M_b = seq_end - seq_start
         start_m = fx.Int32(block_m_idx) * fx.Int32(BLOCK_M)
 
@@ -357,10 +364,9 @@ def _build_launcher(
         B: fx.Tensor,
         BIAS: fx.Tensor,
         SEQ_OFFSETS: fx.Tensor,
-        TILE_MAP: fx.Tensor,
-        total_occ_tiles: int,
+        grid_m: int,
         n_groups: int,
-        max_seq_len: int,
+        search_steps: int,
         stream: fx.Stream = _DEFAULT_STREAM,
     ):
         n_warps_total = THREADS // 64
@@ -397,18 +403,18 @@ def _build_launcher(
 
         epi_smem_bytes = max(smem_bytes, BLOCK_M * BLOCK_N * 2)
 
-        bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
         if fx.const_expr(COMPACT):
-            grid = (total_occ_tiles, 1, N_BLOCKS)
+            grid = (grid_m, 1, N_BLOCKS)
         else:
-            grid = (bm * N_BLOCKS, 1, n_groups)
+            grid = (grid_m * N_BLOCKS, 1, n_groups)
         jdbba_kernel(
             C,
             A,
             B,
             BIAS,
             SEQ_OFFSETS,
-            TILE_MAP,
+            n_groups,
+            search_steps,
             tiled_mma,
             tiled_copy_g2s_A,
             tiled_copy_s2g_C,
@@ -433,8 +439,6 @@ def jagged_dense_bmm(
     block_n: int | None = None,
     block_k: int | None = None,
     threads: int | None = None,
-    tile_map=None,
-    total_occ_tiles: int | None = None,
 ):
     N = B.shape[0] // n_groups
     K = B.shape[1]
@@ -477,13 +481,25 @@ def jagged_dense_bmm(
     if xcd_w is None:
         xcd_w = 1 if xcd_c == 1 else XCD_W
     nthreads = THREADS if threads is None else threads
-    compact = tile_map is not None
-
-    tmap = SEQ_OFFSETS if tile_map is None else tile_map
-    tot = 0 if total_occ_tiles is None else int(total_occ_tiles)
+    compact = not uniform_seqlen
+    if compact:
+        # A.shape[0] >= L bounds the occupied M-tiles without a device readback.
+        grid_m = A.shape[0] // bmn + n_groups
+    else:
+        grid_m = (max_seq_len + bmn - 1) // bmn
 
     key = (N, K, bmn, bnn, block_k, nthreads, xcd_c, xcd_w, compact)
-    launch_args = (C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream)
+    launch_args = (
+        C,
+        A,
+        B,
+        BIAS,
+        SEQ_OFFSETS,
+        grid_m,
+        n_groups,
+        (n_groups - 1).bit_length(),
+        stream,
+    )
 
     launch = _LAUNCHERS.get(key)
     if launch is None:

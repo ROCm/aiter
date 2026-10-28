@@ -13,16 +13,14 @@ from __future__ import annotations
 
 import json
 import os
-import weakref
 from pathlib import Path
 
+import torch
 from flydsl.runtime.device import get_rocm_arch
 
-from .kernels.jagged_dense_bmm_gen import BLOCK_M, jagged_dense_bmm
-from .kernels.jdbba_skew_tile_map import build_tile_map_device_fused
+from .kernels.jagged_dense_bmm_gen import jagged_dense_bmm
 
 __all__ = [
-    "clear_skew_tile_map_cache",
     "jagged_dense_bmm_dispatched",
     "resolve_config",
     "shape_id",
@@ -31,17 +29,12 @@ __all__ = [
 _DISPATCH_TABLE: dict | None = None
 _DISPATCH_CACHE: dict[tuple, dict] = {}
 
-SKEW_COMPACT_MAX_GROUPS = 4096
 SKEW_COMPACT_XCD_C = 32
 SKEW_COMPACT_XCD_W = 8
-_SKEW_COMPACT_ENV = "FLYDSL_JDBBA_SKEW_COMPACT"
-_TILE_MAP_CACHE: dict[int, tuple] = {}
 
 _SCHEMA_DEFAULTS = {
     "xcd_c": None,
     "xcd_w": None,
-    "skew_xcd_c": None,
-    "skew_xcd_w": None,
     "block_k": None,
     "threads": None,
 }
@@ -106,19 +99,6 @@ def _coerce(v):
     return int(v)
 
 
-def clear_skew_tile_map_cache() -> None:
-    _TILE_MAP_CACHE.clear()
-
-
-def _skew_compact_enabled(*, uniform_seqlen: bool, n_groups: int) -> bool:
-    if uniform_seqlen or n_groups > SKEW_COMPACT_MAX_GROUPS:
-        return False
-    env = os.environ.get(_SKEW_COMPACT_ENV)
-    if env is None:
-        return True
-    return env.strip().lower() not in ("0", "false", "off", "no")
-
-
 _SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
 
 
@@ -126,30 +106,6 @@ def _skew_compact_xcd(n_groups: int, reduction_k: int) -> tuple[int | None, int 
     if n_groups > _SKEW_XCD_REMAP_SMALL_B_THRESHOLD or reduction_k >= 512:
         return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
     return None, None
-
-
-def _get_skew_tile_map(seq_offsets, n_groups: int, max_seq_len: int, block_m: int):
-    key = seq_offsets.data_ptr()
-    hit = _TILE_MAP_CACHE.get(key)
-    if (
-        hit is not None
-        and hit[0]() is seq_offsets
-        and hit[1] == block_m
-        and hit[4] == max_seq_len
-    ):
-        return hit[2], hit[3]
-    L = int(seq_offsets[-1].item())
-    tile_map, ub = build_tile_map_device_fused(
-        seq_offsets, n_groups, L, max_seq_len, block_m=block_m
-    )
-    _TILE_MAP_CACHE[key] = (
-        weakref.ref(seq_offsets),
-        block_m,
-        tile_map,
-        ub,
-        max_seq_len,
-    )
-    return tile_map, ub
 
 
 def _normalize_cfg(cfg: dict) -> dict:
@@ -248,13 +204,10 @@ def jagged_dense_bmm_dispatched(
         block_k=block_k,
     )
 
-    import flydsl.expr as fx
-
     if stream is None:
-        stream = fx.Stream(None)
+        stream = torch.cuda.current_stream(SEQ_OFFSETS.device)
 
-    if _skew_compact_enabled(uniform_seqlen=uniform_seqlen, n_groups=n_groups):
-        tile_map, ub = _get_skew_tile_map(SEQ_OFFSETS, n_groups, max_seq_len, BLOCK_M)
+    if not uniform_seqlen:
         sc_xcd_c, sc_xcd_w = _skew_compact_xcd(n_groups, reduction_k)
         return jagged_dense_bmm(
             C,
@@ -269,25 +222,6 @@ def jagged_dense_bmm_dispatched(
             xcd_w=sc_xcd_w,
             uniform_seqlen=False,
             block_k=cfg.get("block_k"),
-            tile_map=tile_map,
-            total_occ_tiles=ub,
-        )
-
-    skew_remap_on = (not uniform_seqlen) and output_n <= 256 and n_groups >= 1024
-    if skew_remap_on:
-        return jagged_dense_bmm(
-            C,
-            A,
-            B,
-            BIAS,
-            SEQ_OFFSETS,
-            n_groups,
-            max_seq_len,
-            stream=stream,
-            xcd_c=32,
-            xcd_w=8,
-            uniform_seqlen=False,
-            block_k=cfg.get("block_k"),
         )
 
     return jagged_dense_bmm(
@@ -299,9 +233,8 @@ def jagged_dense_bmm_dispatched(
         n_groups,
         max_seq_len,
         stream=stream,
-        xcd_c=cfg["xcd_c"] if uniform_seqlen else _coerce(cfg.get("skew_xcd_c")),
-        xcd_w=cfg["xcd_w"] if uniform_seqlen else _coerce(cfg.get("skew_xcd_w")),
-        uniform_seqlen=uniform_seqlen,
+        xcd_c=cfg["xcd_c"],
+        xcd_w=cfg["xcd_w"],
         block_k=cfg.get("block_k"),
-        threads=_coerce(cfg.get("threads")) if uniform_seqlen else None,
+        threads=_coerce(cfg.get("threads")),
     )
