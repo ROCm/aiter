@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import argparse
 import sys
 
 import torch
@@ -10,6 +9,7 @@ import triton
 
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
 from aiter.ops.triton.utils._triton import arch_info
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 try:
@@ -31,7 +31,18 @@ K3_LOWER_BOUND = -5.0
 
 
 def make_inputs(
-    B, T, H, D, dtype, device, paged, gate, num_accepted=0, fused=False, W=4
+    B,
+    T,
+    H,
+    D,
+    dtype,
+    device,
+    paged,
+    gate,
+    num_accepted=0,
+    fused=False,
+    W=4,
+    state_dtype=torch.float32,
 ):
     """K3 serves `full_k3`: raw q/k/g/beta, gate chain and l2norm fused in."""
     total_T = B * T
@@ -59,10 +70,10 @@ def make_inputs(
         A_log = dt_bias = None
 
     if paged:
-        state = torch.randn(total_T, H, D, D, dtype=torch.float32, device=device)
+        state = torch.randn(total_T, H, D, D, dtype=state_dtype, device=device)
         indices = torch.arange(total_T, device=device, dtype=torch.int32).view(B, T)
     else:
-        state = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+        state = torch.randn(B, H, D, D, dtype=state_dtype, device=device)
         indices = None
 
     if paged and num_accepted:
@@ -74,9 +85,11 @@ def make_inputs(
 
     extra = {}
     if fused:
+        # spec decoding keeps vLLM's W-2+T tap window, read from num_accepted-1
+        taps = W - 1 if accepted is None else W - 2 + T
         extra = {
             "conv_state": torch.randn(
-                state.shape[0], 3 * H * D, W - 1, dtype=dtype, device=device
+                state.shape[0], 3 * H * D, taps, dtype=dtype, device=device
             ),
             "conv_weight": torch.randn(3, W, H * D, dtype=torch.float32, device=device)
             * 0.1,
@@ -104,14 +117,27 @@ def make_inputs(
     }
 
 
-def traffic_bytes(B, T, H, D, dtype, paged, csu=False, BV=32, fused=False, W=4):
-    slab = H * D * D * 4
+def traffic_bytes(
+    B,
+    T,
+    H,
+    D,
+    dtype,
+    device,
+    paged,
+    csu=False,
+    BV=32,
+    fused=False,
+    W=4,
+    state_dtype=torch.float32,
+):
+    slab = H * D * D * torch.tensor([], dtype=state_dtype, device=device).element_size()
     if csu:
         record = H * (D // BV) * (2 * D + BV) * 4
         writes = B * (slab + (T - 1) * record)
     else:
         writes = B * T * slab if paged else B * slab
-    e = torch.tensor([], dtype=dtype).element_size()
+    e = torch.tensor([], dtype=dtype, device=device).element_size()
     per_tok = 3 * H * D * e + H * D * 4 + H * 4 + H * D * e
     if fused:
         per_tok += 3 * H * D * (W - 1) * e * 2 + H * D * e
@@ -190,6 +216,7 @@ def gluon_lines(args):
 
 def benchmark(args):
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+    state_dtype = torch.bfloat16 if args.state_dtype == "bf16" else torch.float32
     D = args.head_dim
 
     line_vals = []
@@ -238,6 +265,7 @@ def benchmark(args):
             args.gate,
             args.num_accepted,
             fused=args.fused,
+            state_dtype=state_dtype,
         )
         shared = dict(
             inputs,
@@ -252,7 +280,17 @@ def benchmark(args):
                 int(x) for x in provider.split(":")[1].split(",")
             )
             mem = traffic_bytes(
-                B, T, H, D, dtype, args.paged, csu=bool(csu), BV=bv, fused=args.fused
+                B,
+                T,
+                H,
+                D,
+                dtype,
+                args.device,
+                args.paged,
+                csu=bool(csu),
+                BV=bv,
+                fused=args.fused,
+                state_dtype=state_dtype,
             )
 
             def fn():
@@ -271,7 +309,9 @@ def benchmark(args):
                 )
 
         else:
-            mem = traffic_bytes(B, T, H, D, dtype, args.paged)
+            mem = traffic_bytes(
+                B, T, H, D, dtype, args.device, args.paged, state_dtype=state_dtype
+            )
 
             def fn():
                 fla_kda(**shared)
@@ -318,18 +358,19 @@ def report_spread(spread, line_vals, line_names, args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark KDA decode", allow_abbrev=False)
+    parser = get_parser(kernel_name="KDA decode")
     parser.add_argument("--batch_sizes", type=int, nargs="+", default=[4, 16, 64, 256])
     parser.add_argument("--seq_lens", type=int, nargs="+", default=[1, 4, 8])
     parser.add_argument("--num_heads", type=int, nargs="+", default=K3_NUM_HEADS)
     parser.add_argument("--head_dim", type=int, default=K3_HEAD_DIM)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"])
+    parser.add_argument("--state_dtype", default="fp32", choices=["fp32", "bf16"])
     parser.add_argument(
         "--gluon_configs",
         type=str,
         nargs="+",
-        default=["32,4,32"],
-        help="BV,NUM_WARPS,SK triples, one benchmark line each",
+        default=None,
+        help="BV,NUM_WARPS,SK triples, one benchmark line each (default per arch)",
     )
     parser.add_argument(
         "--num_buffers",
@@ -448,6 +489,10 @@ def parse_args():
 def run_bench(args):
     if arch_info.get_arch() not in ("gfx950", "gfx1250"):
         sys.exit(f"KDA gluon decode needs gfx950/gfx1250, got {arch_info.get_arch()}")
+    if args.gluon_configs is None:
+        # The gfx950 kernel holds the whole [V, K] state: BV == V.
+        gfx950 = arch_info.get_arch() == "gfx950"
+        args.gluon_configs = [f"{args.head_dim},4,16"] if gfx950 else ["32,4,32"]
     if "fla" in args.backends and not HAS_FLA:
         print("fla not importable -- dropping the upstream backend.")
         print("  PYTHONPATH=/path/to/flash-linear-attention to enable it")

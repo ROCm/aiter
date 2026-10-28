@@ -23,6 +23,7 @@ from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 _LOGGER = AiterTritonLogger()
 
@@ -95,8 +96,31 @@ def get_kernel_config_triton(m, n, k, routing_data):
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 1
     split_k = 1
+
+    # Entries carry no BLOCK_SIZE_M: block_m is the dispatch key, not a
+    # tunable, because routing fixes it for the layer.
+    arch = get_arch()
+    key = f"bm{block_m}_n{n}_k{k}"
+    tuned = get_moe_dispatch("A16W4", arch, "triton").get(key)
+    if tuned is not None:
+        config = {
+            "block_m": block_m,
+            "block_n": tuned["BLOCK_SIZE_N"],
+            "block_k": tuned["BLOCK_SIZE_K"],
+            "num_warps": tuned["num_warps"],
+            "num_stages": tuned["num_stages"],
+            "group_m": group_m,
+            "xcd_swizzle": xcd_swizzle,
+            "w_cache_modifier": w_cache_modifier,
+            "split_k": split_k,
+            "waves_per_eu": tuned.get("waves_per_eu", 0),
+            "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
+            "kpack": tuned.get("kpack", 1),
+        }
+        return config
+
+    num_stages = 1
     block_k = 256
 
     if block_m == 16:
@@ -139,7 +163,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "split_k": split_k,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
+        "kpack": 2 if arch == "gfx942" and block_m <= 32 else 1,
     }
     return ret
 
@@ -801,7 +825,7 @@ def moe_gemm_torch(
     # memory offsets
     if routing_data.n_expts_tot > 1:
         sizes = routing_data.expt_hist
-        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32)
+        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32, device=x.device)
         off[1:] = torch.cumsum(sizes, 0)
         offs = list(itertools.pairwise(off))
     else:

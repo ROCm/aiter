@@ -13,7 +13,6 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -336,6 +335,7 @@ def ref_masked_attention(
     q_scale=None,
     kv_scale=None,
     causal_diagonal=None,
+    fp8_p_scale=1.0,
 ):
     if is_fp8_q and q_scale is not None:
         scale *= q_scale
@@ -358,11 +358,13 @@ def ref_masked_attention(
     attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
     l = attn_weights_exp.sum(-1)
     if is_fp8_q:
-        attn_weights_fp8 = attn_weights_exp.to(dtypes.fp8)
+        attn_weights_fp8 = (attn_weights_exp * fp8_p_scale).to(dtypes.fp8)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
     out = out / l.transpose(0, 1).unsqueeze(-1)
+    if is_fp8_q:
+        out = out / fp8_p_scale
     if is_fp8_kvc and kv_scale is not None:
         out *= kv_scale
     return out.to(dtype), lse
@@ -599,6 +601,9 @@ def torch_mla_extend_split_kv(
     is_causal=True,
     q_scale=None,
     kv_scale=None,
+    fast_mode=True,
+    intra_batch_mode=False,
+    plan_dtypes=None,
 ):
 
     _num_page, page_size, _nhead_kv, _ = kvc_cache.shape
@@ -606,6 +611,8 @@ def torch_mla_extend_split_kv(
     dev = kvc_cache.device
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
+    if plan_dtypes is None:
+        plan_dtypes = (q.dtype, kvc_cache.dtype)
 
     if is_fp8_q:
         q = q.to(torch.float)
@@ -622,77 +629,19 @@ def torch_mla_extend_split_kv(
 
     io_transformed = False
     q_ratio = 1
-    if (
-        nheads == 16
-        or (get_gfx() == "gfx942" and nheads == 128 and is_fp8_q and is_fp8_kvc)
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 128
-            and is_fp8_q
-            and is_fp8_kvc
-            and is_experimental_enabled()
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads in (16, 32, 64)
-            and nheads * max_seqlen_q == 128
-            and is_fp8_q
-            and is_fp8_kvc
-            and is_experimental_enabled()
-        )
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 8
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 4
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads == 8
-            and not is_fp8_q
-            and not is_fp8_kvc
-            and max_seqlen_q == 2
-        )
-        or (
-            # fp8/fp8 PS GQA catch-all -- mirrors aiter/mla.py / asm_mla.cu
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and ((nheads == 32) or (nheads == 64) or (nheads == 128))
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads == 64
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 1
-        )
-        or (get_gfx() == "gfx950" and not is_fp8_q and not is_fp8_kvc)
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 96
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q <= 6
-        )
-        or (
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and nheads == 12
-            and nheads * max_seqlen_q <= 128
-        )
-    ):
-        # Natively support cases
-        pass
-    elif nheads in range(32, 128 + 1, 16):
-        # we use nhead=16 to simulate such cases by customized metadata
-        # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
+    # Read the head fold from the planner rules mla_decode_fwd and
+    # get_mla_metadata_v1 use, for the planner mode the metadata was built with.
+    fold_factor = aiter.get_mla_decode_shape_support(
+        nheads,
+        max_seqlen_q,
+        *plan_dtypes,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+    ).fold_factor
+    if fold_factor > 1:
+        # mla_decode_fwd views qo as (total_s * fold_factor, nheads // fold_factor)
         ori_nheads = nheads
-
-        fold_factor = nheads // 16
-        nheads = 16
+        nheads = nheads // fold_factor
         total_s = total_q * fold_factor
         if max_seqlen_q == 1:
             q_ratio = fold_factor
@@ -987,6 +936,9 @@ def torch_mla_split_kv_and_reduce(
     is_causal=True,
     q_scale=None,
     kv_scale=None,
+    fast_mode=True,
+    intra_batch_mode=False,
+    plan_dtypes=None,
 ):
     total_q, nhead, _ = q.shape
     partial_out, partial_lse, split_out, split_lse, io_transformed = (
@@ -1008,6 +960,9 @@ def torch_mla_split_kv_and_reduce(
             is_causal=is_causal,
             q_scale=q_scale,
             kv_scale=kv_scale,
+            fast_mode=fast_mode,
+            intra_batch_mode=intra_batch_mode,
+            plan_dtypes=plan_dtypes,
         )
     )
 
@@ -1078,6 +1033,8 @@ def torch_mla_extend_3buffer_split_kv_and_reduce(
     q_scale=None,
     kv_scale=None,
     scale_dim=4,
+    fast_mode=True,
+    intra_batch_mode=False,
 ):
 
     num_page = kvc_cache.shape[0]
@@ -1121,7 +1078,96 @@ def torch_mla_extend_3buffer_split_kv_and_reduce(
         is_causal,
         q_scale,
         kv_scale,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+        # mla_decode_fwd plans the byte KV buffer as fp8.
+        plan_dtypes=(q.dtype, dtypes.fp8),
     )
+
+
+# get_mla_metadata_v1 planner per mode: (fast_mode, intra_batch_mode).
+# fast -> v1_2, v1_0 -> the -nps default, v1_1 -> neither flag.
+MLA_METADATA_MODES = {
+    "fast": (True, False),
+    "v1_0": (False, True),
+    "v1_1": (False, False),
+}
+
+
+def _make_mla_metadata(
+    qo_indptr,
+    kv_indptr,
+    kv_last_page_lens,
+    nhead,
+    nhead_kv,
+    dtype,
+    kvtype,
+    page_size,
+    max_seqlen_qo,
+    decode_qlen,
+    max_split_per_batch,
+    non_persistent_mode=False,
+    causal=True,
+    is_cp_round_robin=False,
+    metadata_mode=None,
+    kv_granularity=None,
+):
+    if metadata_mode is None:
+        metadata_mode = "v1_0" if non_persistent_mode else "fast"
+    fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
+    if kv_granularity is None:
+        kv_granularity = max(
+            page_size,
+            32 if nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8 else 16,
+        )
+    names = (
+        "work_meta_data",
+        "work_indptr",
+        "work_info_set",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    )
+    info = aiter.get_mla_metadata_info_v1(
+        qo_indptr.numel() - 1,
+        max_seqlen_qo,
+        nhead,
+        dtype,
+        kvtype,
+        is_sparse=False,
+        fast_mode=fast_mode,
+        num_kv_splits=max_split_per_batch,
+        intra_batch_mode=intra_batch_mode,
+    )
+    metadata = {
+        name: torch.empty(shape, dtype=buffer_dtype, device=qo_indptr.device)
+        for name, (shape, buffer_dtype) in zip(names, info)
+    }
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_lens,
+        nhead // nhead_kv,
+        nhead_kv,
+        causal and not is_cp_round_robin,
+        metadata["work_meta_data"],
+        metadata["work_info_set"],
+        metadata["work_indptr"],
+        metadata["reduce_indptr"],
+        metadata["reduce_final_map"],
+        metadata["reduce_partial_map"],
+        page_size=page_size,
+        kv_granularity=kv_granularity,
+        max_seqlen_qo=int(max_seqlen_qo),
+        uni_seqlen_qo=decode_qlen,
+        fast_mode=fast_mode,
+        max_split_per_batch=max_split_per_batch,
+        intra_batch_mode=intra_batch_mode,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=kvtype,
+        is_cp_round_robin=is_cp_round_robin,
+    )
+    return metadata
 
 
 @benchmark()
@@ -1144,7 +1190,9 @@ def test_mla(
     scale_dim,
     return_lse,
     causal,
-    pad_batches,
+    metadata_mode=None,
+    kv_granularity=None,
+    pad_batches=0,
 ):
     ret = {}
 
@@ -1273,78 +1321,31 @@ def test_mla(
             (cu_num + batch_size - 1) // batch_size, max_split_per_batch
         )
 
-    (
-        (work_meta_data_size, work_meta_data_type),
-        (work_indptr_size, work_indptr_type),
-        (work_info_set_size, work_info_set_type),
-        (reduce_indptr_size, reduce_indptr_type),
-        (reduce_final_map_size, reduce_final_map_type),
-        (reduce_partial_map_size, reduce_partial_map_type),
-    ) = aiter.get_mla_metadata_info_v1(
-        batch_size,
-        max_seqlen_qo,
-        nhead,
-        dtype,
-        kvtype,
-        is_sparse=False,
-        fast_mode=bool(not non_persistent_mode),
-        num_kv_splits=max_split_per_batch,
-        intra_batch_mode=non_persistent_mode,
-    )
-
-    # aiter implementation
-    # the tensor's meaning please refer aiter/ops/attention.py
-    work_meta_data = torch.empty(
-        work_meta_data_size, dtype=work_meta_data_type, device="cuda"
-    )
-    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device="cuda")
-    work_info_set = torch.empty(
-        work_info_set_size,
-        dtype=work_info_set_type,
-        device="cuda",
-    )
-    reduce_indptr = torch.empty(
-        reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
-    )
-    reduce_final_map = torch.empty(
-        reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
-    )
-    reduce_partial_map = torch.empty(
-        reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
-    )
-
-    aiter.get_mla_metadata_v1(
+    if metadata_mode is None:
+        metadata_mode = "v1_0" if non_persistent_mode else "fast"
+    fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
+    metadata = _make_mla_metadata(
         qo_indptr,
         kv_indptr,
         kv_last_page_lens,
-        nhead // nhead_kv,
+        nhead,
         nhead_kv,
-        causal,
-        work_meta_data,
-        work_info_set,
-        work_indptr,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        page_size=page_size,
-        kv_granularity=max(
-            page_size,
-            # QH64 fp8/fp8 native PS kernel is a SUB_KV=32 partial producer; 16-token
-            # works trip its multi-pass path (see asm/mla_a8w8_qh64_ps*.py SUB_KV=32).
-            (
-                32
-                if (nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8)
-                else 16
-            ),
-        ),  # for qh32 kv split is disabled
-        max_seqlen_qo=int(max_seqlen_qo),
-        uni_seqlen_qo=decode_qlen if pad_batches == 0 else -1,
-        fast_mode=bool(not non_persistent_mode),
-        max_split_per_batch=max_split_per_batch,
-        intra_batch_mode=non_persistent_mode,
-        dtype_q_nope=dtype,
-        dtype_kv_nope=kvtype,
+        dtype,
+        kvtype,
+        page_size,
+        max_seqlen_qo,
+        decode_qlen if pad_batches == 0 else -1,
+        max_split_per_batch,
+        causal=causal,
+        metadata_mode=metadata_mode,
+        kv_granularity=kv_granularity,
     )
+    work_meta_data = metadata["work_meta_data"]
+    work_indptr = metadata["work_indptr"]
+    work_info_set = metadata["work_info_set"]
+    reduce_indptr = metadata["reduce_indptr"]
+    reduce_final_map = metadata["reduce_final_map"]
+    reduce_partial_map = metadata["reduce_partial_map"]
 
     if os.environ.get("DUMP_MLA_METADATA", ""):
         kv_gran = max(page_size, 16)
@@ -1460,7 +1461,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             kv_scale=kv_scale,
             causal=causal,
         )
@@ -1499,6 +1501,8 @@ def test_mla(
                     is_causal=causal,
                     q_scale=None,
                     kv_scale=kv_scale,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1538,7 +1542,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             return_lse=return_lse,
             causal=causal,
         )
@@ -1575,6 +1580,8 @@ def test_mla(
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
                     is_causal=causal,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1641,7 +1648,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             return_lse=return_lse,
             causal=causal,
         )
@@ -1687,6 +1695,8 @@ def test_mla(
                     is_causal=causal,
                     q_scale=q_scale,
                     kv_scale=kv_scale,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1762,7 +1772,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             causal=causal,
         )
 
@@ -1801,6 +1812,8 @@ def test_mla(
                     max_seqlen_q=max_seqlen_qo,
                     is_causal=causal,
                     scale_dim=scale_dim,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1926,6 +1939,253 @@ def test_mla(
     return ret
 
 
+def test_mla_v1_0_kv_tail():
+    # v1_0 folds a 1-4 key tail into the previous split. gfx942 plans 16 splits per
+    # row, so 17-20 keys end in one split at granularity 16; gfx950 plans
+    # seqlen // 196 splits, so 513-516 keys do at granularity 256. 16 and 512 keep
+    # their split count and are the controls.
+    gfx = get_gfx()
+    if gfx == "gfx942":
+        kv_granularity, ctx_lens = 16, [16, 17, 18, 19, 20]
+    elif gfx == "gfx950":
+        kv_granularity, ctx_lens = 256, [512, 513, 514, 515, 516]
+    else:
+        return
+    bad = {}
+    for ctx_len in ctx_lens:
+        ret = test_mla(
+            ctx_lens=ctx_len,
+            batch_size=1,
+            nhead=16,
+            kv_lora_rank=512,
+            qk_nope_head_dim=512,
+            qk_rope_head_dim=64,
+            v_head_dim=512,
+            dtype=dtypes.bf16,
+            kvtype=dtypes.bf16,
+            page_size=1,
+            varlen=False,
+            decode_qlen=1,
+            max_split_per_batch=32,
+            non_persistent_mode=True,
+            paged_layout="LEGACY",
+            scale_dim=16,
+            return_lse=False,
+            causal=True,
+            metadata_mode="v1_0",
+            kv_granularity=kv_granularity,
+        )
+        if ret["decode:err"] > 0.05:
+            bad[ctx_len] = ret["decode:err"]
+    assert not bad, (
+        f"v1_0 decode mismatches the reference at kv_granularity {kv_granularity}: "
+        + ", ".join(f"ctx_len {k} on {v:.1%} of outputs" for k, v in bad.items())
+    )
+
+
+_HEADS = 16
+_KV_LEN = 2048
+_KV_LORA_RANK = 512
+_ROPE_DIM = 64
+_HEAD_DIM = _KV_LORA_RANK + _ROPE_DIM
+_PAGE_SIZE = 1
+_SOFTMAX_SCALE = 1.0 / 16.0
+_FP8_MAX = 448.0
+
+
+def _make_case(*, long_tail: bool, nhead: int = _HEADS, q_len: int = 1):
+    query = torch.zeros((q_len, nhead, _HEAD_DIM), device="cuda", dtype=torch.float32)
+    query[..., _KV_LORA_RANK:] = 1.0
+    cache = torch.ones(
+        (_KV_LEN, _PAGE_SIZE, 1, _HEAD_DIM), device="cuda", dtype=torch.float32
+    )
+    cache[..., _KV_LORA_RANK:] = -1.75 if long_tail else 0.0
+    if long_tail:
+        cache[0, ..., _KV_LORA_RANK:] = 0.0
+    qo_indptr = torch.tensor([0, q_len], device="cuda", dtype=torch.int32)
+    kv_indptr = torch.tensor([0, _KV_LEN], device="cuda", dtype=torch.int32)
+    kv_indices = torch.arange(_KV_LEN, device="cuda", dtype=torch.int32)
+    last_pages = torch.ones(1, device="cuda", dtype=torch.int32)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    return (
+        query.to(dtypes.fp8),
+        cache.to(dtypes.fp8),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_pages,
+        scale,
+    )
+
+
+def _reference(query, cache, *, cp_world_size=1):
+    query = query.float()
+    cache = cache[:, 0].float()
+    outputs = [[], [], []]
+    rank_lses = []
+    for rank in range(cp_world_size):
+        local_cache = cache[rank::cp_world_size]
+        query_outputs = [[], [], []]
+        query_lses = []
+        for query_index in range(query.shape[0]):
+            visible_tokens = (
+                cache.shape[0] - query.shape[0] + query_index - rank
+            ) // cp_world_size + 1
+            for variant, (quantize, p_scale) in enumerate(
+                ((False, 1.0), (True, 1.0), (True, _FP8_MAX))
+            ):
+                output, lse = ref_masked_attention(
+                    query[query_index : query_index + 1],
+                    local_cache,
+                    local_cache[..., :_KV_LORA_RANK],
+                    _SOFTMAX_SCALE,
+                    torch.float32,
+                    is_fp8_q=quantize,
+                    causal_diagonal=visible_tokens - 1,
+                    fp8_p_scale=p_scale,
+                )
+                query_outputs[variant].append(output)
+                if variant == 0:
+                    query_lses.append(lse.transpose(0, 1))
+
+        for variant in range(3):
+            outputs[variant].append(torch.cat(query_outputs[variant]).flatten(0, 1))
+        rank_lses.append(torch.cat(query_lses).flatten())
+    rank_lses = torch.stack(rank_lses)
+    weights = torch.softmax(rank_lses, dim=0).unsqueeze(-1)
+    merged = tuple((torch.stack(values) * weights).sum(dim=0) for values in outputs)
+    return (*merged, torch.logsumexp(rank_lses, dim=0))
+
+
+def _run_aiter_rank(case, *, persistent, return_lse, cp_world_size, cp_rank):
+    query, cache, qo_indptr, kv_indptr, kv_indices, last_pages, scale = case
+    global_kv_indptr = kv_indptr if cp_world_size > 1 else None
+    if cp_world_size > 1:
+        kv_indices = kv_indices[cp_rank::cp_world_size].contiguous()
+        kv_indptr = torch.tensor(
+            [0, kv_indices.numel()], device=query.device, dtype=torch.int32
+        )
+    q_len, nhead = query.shape[:2]
+    output = torch.full(
+        (q_len, nhead, _KV_LORA_RANK),
+        float("nan"),
+        device=query.device,
+        dtype=torch.bfloat16,
+    )
+    metadata = {}
+    if persistent:
+        metadata = _make_mla_metadata(
+            qo_indptr,
+            kv_indptr,
+            last_pages,
+            nhead,
+            1,
+            query.dtype,
+            cache.dtype,
+            _PAGE_SIZE,
+            q_len,
+            q_len,
+            1,
+            is_cp_round_robin=cp_world_size > 1,
+        )
+    _, lse = aiter.mla.mla_decode_fwd(
+        query,
+        cache,
+        output,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_pages,
+        q_len,
+        _PAGE_SIZE,
+        1,
+        _SOFTMAX_SCALE,
+        q_scale=scale,
+        kv_scale=scale,
+        num_kv_splits=1,
+        return_lse=return_lse,
+        causal=True,
+        g_kv_indptr=global_kv_indptr,
+        cp_world_size=cp_world_size,
+        cp_rank=cp_rank,
+        **metadata,
+    )
+    torch.cuda.synchronize()
+    return output.flatten(0, 1).float(), (
+        lse.flatten().float() if lse is not None else None
+    )
+
+
+def _run_aiter(case, *, persistent, return_lse, cp_world_size):
+    results = [
+        _run_aiter_rank(
+            case,
+            persistent=persistent,
+            return_lse=return_lse,
+            cp_world_size=cp_world_size,
+            cp_rank=rank,
+        )
+        for rank in range(cp_world_size)
+    ]
+    if cp_world_size == 1:
+        return results[0]
+    rank_lses = torch.stack([result[1] for result in results])
+    lse = torch.logsumexp(rank_lses, dim=0)
+    weights = torch.exp(rank_lses - lse).unsqueeze(-1)
+    output = (torch.stack([result[0] for result in results]) * weights).sum(dim=0)
+    return output, lse
+
+
+def _max_abs_error(actual, expected):
+    return (actual - expected).abs().amax().item()
+
+
+def test_mla_fp8_softmax_underflow(
+    nhead=_HEADS,
+    q_len=1,
+    persistent=False,
+    return_lse=False,
+    cp_world_size=1,
+):
+    gfx = get_gfx()
+    if gfx != "gfx950":
+        print(f"Skipping: requires gfx950, got {gfx}")
+        return
+    if cp_world_size > 1:
+        persistent = True
+        return_lse = True
+    run_args = {
+        "persistent": persistent,
+        "return_lse": return_lse,
+        "cp_world_size": cp_world_size,
+    }
+    print(
+        f"Case: {nhead=}, {q_len=}, {persistent=}, {return_lse=}, {cp_world_size=}",
+        flush=True,
+    )
+    for long_tail in (False, True):
+        case = _make_case(long_tail=long_tail, nhead=nhead, q_len=q_len)
+        output, lse = _run_aiter(case, **run_args)
+        fp32, unscaled, scaled, expected_lse = _reference(
+            case[0], case[1], cp_world_size=cp_world_size
+        )
+        fp32_error = _max_abs_error(output, fp32)
+        unscaled_error = _max_abs_error(output, unscaled)
+        scaled_error = _max_abs_error(output, scaled)
+        print(
+            f"FP8 MLA softmax: {long_tail=}, out={output.mean().item():.6f}, "
+            f"{fp32_error=:.6f}, {unscaled_error=:.6f}, {scaled_error=:.6f}"
+        )
+        assert fp32_error < 0.03, f"Softmax numerator mass mismatch: {fp32_error=:g}"
+        if return_lse:
+            lse_error = _max_abs_error(lse, expected_lse)
+            print(f"LSE error: {lse_error=:.6f}")
+            assert lse_error < 0.03, f"LSE mismatch: {lse_error=:g}"
+        if long_tail:
+            assert _max_abs_error(scaled, fp32) < 0.03
+            assert _max_abs_error(unscaled, fp32) > 0.1
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -2043,6 +2303,16 @@ parser.add_argument(
     --varlen # True""",
 )
 parser.add_argument(
+    "-mm",
+    "--metadata_mode",
+    type=str,
+    choices=list(MLA_METADATA_MODES),
+    default=None,
+    help="""get_mla_metadata_v1 planner: fast (v1_2), v1_0 or v1_1.
+    Default: v1_0 with -nps, else fast.
+    e.g.: -mm v1_1""",
+)
+parser.add_argument(
     "-pl",
     "--paged_layout",
     type=str,
@@ -2087,52 +2357,97 @@ parser.add_argument(
     Non-zero runs the planner with uni_seqlen_qo=-1. Default: 0.
     e.g.: -pad 0 1""",
 )
-args = parser.parse_args()
-for nhead, decode_qlen in args.nhead:
-    df = []
-    for (
-        dtype,
-        kvtype,
-        ctx_len,
-        batch_size,
-        max_split_per_batch,
-        pad_batches,
-    ) in itertools.product(
-        args.dtype,
-        args.kv_dtype,
-        args.ctxLen,
-        args.batchSize,
-        args.max_split_per_batch,
-        args.pad_batches,
-    ):
-        if check_support(dtype, kvtype, nhead) and pad_batches < batch_size:
-            ret = test_mla(
-                ctx_len,
-                batch_size,
-                nhead,
-                args.kv_lora_rank,
-                args.qk_nope_head_dim,
-                args.qk_rope_head_dim,
-                args.v_head_dim,
-                dtype,
-                kvtype,
-                args.block_size,
-                varlen=args.varlen,
-                decode_qlen=decode_qlen,
-                max_split_per_batch=max_split_per_batch,
-                non_persistent_mode=args.non_persistent_mode,
-                paged_layout=args.paged_layout,
-                scale_dim=args.scale_dim,
-                return_lse=args.return_lse,
-                causal=args.causal,
-                pad_batches=pad_batches,
-            )
-            df.append(ret)
-    df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
+parser.add_argument(
+    "--softmax-underflow",
+    action="store_true",
+    help="Run gfx950 FP8 persistent/LSE/CP uniform/long-tail checks (KV=2048, split=1).",
+)
+parser.add_argument(
+    "--cp-world-size",
+    type=int,
+    choices=[1, 2],
+    default=1,
+    help="CP size for --softmax-underflow; CP=2 requires -n 16,4 or 32,4 and -lse.",
+)
 
-if __name__ == "__main__":
+
+def main():
+    args = parser.parse_args()
+    if args.softmax_underflow:
+        if not args.nhead or any(
+            (nhead, q_len) not in ((16, 1), (16, 4), (64, 1), (32, 4), (8, 4))
+            for nhead, q_len in args.nhead
+        ):
+            parser.error("For underflow, specify a supported head/query pair with -n")
+        if args.non_persistent_mode:
+            parser.error("Use test_mla.py for non-persistent underflow checks")
+        if args.cp_world_size > 1 and (
+            not args.return_lse
+            or any(nhead not in (16, 32) or q_len != 4 for nhead, q_len in args.nhead)
+        ):
+            parser.error("CP underflow requires -n 16,4 and/or 32,4 with -lse")
+        for nhead, q_len in args.nhead:
+            test_mla_fp8_softmax_underflow(
+                nhead=nhead,
+                q_len=q_len,
+                persistent=True,
+                return_lse=args.return_lse,
+                cp_world_size=args.cp_world_size,
+            )
+        return
+    if args.cp_world_size != 1:
+        parser.error("--cp-world-size is only supported with --softmax-underflow")
+    for nhead, decode_qlen in args.nhead:
+        df = []
+        for (
+            dtype,
+            kvtype,
+            ctx_len,
+            batch_size,
+            max_split_per_batch,
+            pad_batches,
+        ) in itertools.product(
+            args.dtype,
+            args.kv_dtype,
+            args.ctxLen,
+            args.batchSize,
+            args.max_split_per_batch,
+            args.pad_batches,
+        ):
+            if check_support(dtype, kvtype, nhead) and pad_batches < batch_size:
+                ret = test_mla(
+                    ctx_len,
+                    batch_size,
+                    nhead,
+                    args.kv_lora_rank,
+                    args.qk_nope_head_dim,
+                    args.qk_rope_head_dim,
+                    args.v_head_dim,
+                    dtype,
+                    kvtype,
+                    args.block_size,
+                    varlen=args.varlen,
+                    decode_qlen=decode_qlen,
+                    max_split_per_batch=max_split_per_batch,
+                    non_persistent_mode=args.non_persistent_mode,
+                    paged_layout=args.paged_layout,
+                    scale_dim=args.scale_dim,
+                    return_lse=args.return_lse,
+                    causal=args.causal,
+                    metadata_mode=args.metadata_mode
+                    or ("v1_0" if args.non_persistent_mode else "fast"),
+                    pad_batches=pad_batches,
+                )
+                df.append(ret)
+        df = pd.DataFrame(df)
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
     check_fold_seqlen_indptr_cuda_graph_capture()
     aiter.logger.info("_fold_seqlen_indptr cuda-graph capture: passed")
+    test_mla_v1_0_kv_tail()
+    aiter.logger.info("v1_0 KV tail end-to-end: passed")
+    return df if args.nhead else None
+
+
+if __name__ == "__main__":
+    df = main()
