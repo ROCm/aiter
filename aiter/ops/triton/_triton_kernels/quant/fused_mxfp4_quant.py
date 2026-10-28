@@ -50,9 +50,10 @@ def _hadamard32_op(y, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
 
 
 @triton.jit
-def _mxfp4_quant_hip_op(y, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
-    """The MXFP4 quant of per_1x32_f4_quant_hip: 1e-10 amax floor, RoundUp e8m0
-    scale (ceil_pow2(amax / 6)) and the gfx950 FP4 convert."""
+def _mxfp4_ceil_quant_op(y, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    """MXFP4 quant with a 1e-10 amax floor, the RoundUp e8m0 scale
+    ceil_pow2(amax / 6) and the gfx950 FP4 convert. Bit-identical to
+    per_1x32_f4_quant_hip on the same fp32 values."""
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // 32
     y = y.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, 32)
     amax = tl.maximum(tl.max(tl.abs(y), axis=-1, keep_dims=True), 1e-10)
@@ -389,7 +390,7 @@ def _fused_rms_gated_mxfp4_quant_kernel(
         tl.static_assert(MXFP4_QUANT_BLOCK_SIZE == 32)
         y = _hadamard32_op(y, BLOCK_SIZE_M, BLOCK_SIZE_N)
         y = y.to(x_ptr.type.element_ty).to(tl.float32)
-        y_fp4, bs_e8m0 = _mxfp4_quant_hip_op(y, BLOCK_SIZE_M, BLOCK_SIZE_N)
+        y_fp4, bs_e8m0 = _mxfp4_ceil_quant_op(y, BLOCK_SIZE_M, BLOCK_SIZE_N)
     else:
         y_fp4, bs_e8m0 = _mxfp4_quant_op(
             y, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
