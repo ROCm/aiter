@@ -109,19 +109,29 @@ def _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups: int) -> tuple[int, int]:
         raise TypeError(f"SEQ_OFFSETS must be int32, got {SEQ_OFFSETS.dtype}")
     if n_groups < 1:
         raise ValueError(f"n_groups must be >= 1, got {n_groups}")
-    if A.dim() != 2 or B.dim() != 2 or C.dim() != 2:
-        raise ValueError("A, B and C must be 2-D")
-    if B.shape[0] % n_groups:
-        raise ValueError(
-            f"B rows {B.shape[0]} are not a multiple of n_groups={n_groups}"
-        )
-    N, K = B.shape[0] // n_groups, B.shape[1]
+    if A.dim() != 2 or C.dim() != 2:
+        raise ValueError("A and C must be 2-D")
+    if B.dim() == 3:
+        if B.shape[0] != n_groups:
+            raise ValueError(f"B has {B.shape[0]} groups, n_groups={n_groups}")
+        K, N = B.shape[1], B.shape[2]
+    elif B.dim() == 2:
+        if B.shape[0] % n_groups:
+            raise ValueError(
+                f"B rows {B.shape[0]} are not a multiple of n_groups={n_groups}"
+            )
+        N, K = B.shape[0] // n_groups, B.shape[1]
+    else:
+        raise ValueError(f"B must be 2-D or 3-D, got {B.dim()}-D")
     if A.shape[1] != K:
         raise ValueError(f"A has K={A.shape[1]}, B has K={K}")
     if tuple(C.shape) != (A.shape[0], N):
         raise ValueError(f"C must be {(A.shape[0], N)}, got {tuple(C.shape)}")
-    if tuple(BIAS.shape) != (n_groups * N,):
-        raise ValueError(f"BIAS must be {(n_groups * N,)}, got {tuple(BIAS.shape)}")
+    if tuple(BIAS.shape) not in ((n_groups * N,), (n_groups, N)):
+        raise ValueError(
+            f"BIAS must be {(n_groups * N,)} or {(n_groups, N)}, "
+            f"got {tuple(BIAS.shape)}"
+        )
     if tuple(SEQ_OFFSETS.shape) != (n_groups + 1,):
         raise ValueError(
             f"SEQ_OFFSETS must be {(n_groups + 1,)}, got {tuple(SEQ_OFFSETS.shape)}"
@@ -152,10 +162,10 @@ def jagged_dense_bmm_dispatched(
             ``L >= SEQ_OFFSETS[-1]``, which is not checked; extra rows are not
             read. One group's rows of ``A`` and of ``C`` must each stay under
             4 GiB, the 32-bit buffer bound.
-        B: ``(n_groups * N, K)`` bf16 dense weights, one ``N x K`` panel per
-            group, i.e. ``dense.transpose(1, 2).reshape(-1, K)`` of a
-            ``(n_groups, K, N)`` tensor.
-        BIAS: ``(n_groups * N,)`` bf16.
+        B: bf16 dense weights, either ``(n_groups, K, N)`` or
+            ``(n_groups * N, K)``, the latter being
+            ``dense.transpose(1, 2).reshape(-1, K)`` of the former.
+        BIAS: ``(n_groups, N)`` or ``(n_groups * N,)`` bf16.
         SEQ_OFFSETS: ``(n_groups + 1,)`` int32 prefix sum of group lengths,
             read on the device only.
         max_seq_len: Uniform path: must be >= the longest group, which is
@@ -173,6 +183,7 @@ def jagged_dense_bmm_dispatched(
     if arch not in SUPPORTED_ARCHS:
         raise RuntimeError(f"jagged_dense_bmm supports {SUPPORTED_ARCHS}, not {arch}")
     output_n, reduction_k = _validate(C, A, B, BIAS, SEQ_OFFSETS, n_groups)
+    BIAS = BIAS.view(-1)
     if A.shape[0] == 0:
         return
     if uniform_seqlen and max_seq_len < 1:
