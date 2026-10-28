@@ -19,10 +19,12 @@ ARG AITER_DIR=/opt/aiter
 
 # 1 = merge the FlyDSL comm branch, 0 = baseline.
 ARG WITH_ALLREDUCE=1
-# Tip of users/vpietila/flydsl-fused-comm-kernels (PR 5670's branch): one-shot and
+# Tip of users/vpietila/flydsl-fused-comm-kernels : one-shot and
 # fused AR+RMSNorm, plus FlyDSLQuickAllReduce (aiter.dist...flydsl_backends),
-# which the vLLM fork needs. The older PR head 30a0caf5d lacks the latter.
-ARG B_ALLREDUCE=3c4adc5ea70af0b60e4d942bbb8b7ee19da3f7bf
+# which the vLLM fork needs. Includes cross-rank agreement on which FlyDSL
+# all-reduce to build, kernel preload at init (no module load inside graph
+# capture), the re-tuned PCIe ladders, and main up to PR 7067.
+ARG B_ALLREDUCE=b3328e381ba5338f4a0bf67331e759be2d2cd16b
 ARG B_ALLREDUCE_BRANCH=users/vpietila/flydsl-fused-comm-kernels
 
 # MI350P branches. Re-resolve with a forcing refspec: these get force-pushed,
@@ -37,11 +39,13 @@ ARG B_AOTFILTER=5193cf94a2a76c3b10a96f2036a6fd4a824a24a1  # relbers/flydsl-gemm-
 ARG B_FMOEACC=abbef9d36ee0614ce80c9f4c8db1f079b1a851d4    # relbers/fmoe-tuner-accuracy
 ARG B_TUNING=5e0e5998a86d7a4649d72c521feff39dbc9e9c4e     # mi350p-tuning
 
-ENV MAX_JOBS=6
+# Build parallelism for the AOT compile (FlyDSL kernels, then the CK/HIP modules).
+ARG AITER_BUILD_JOBS=64
+ENV AITER_MAX_JOBS=${AITER_BUILD_JOBS}
 
-# Bare "gfx950" means 256 CU -> 8 XCDs, baking the wrong die count into the
-# AOT kernels. MI350P is 128 CU -> 4.
-ENV AITER_GPU_TARGETS=gfx950:128
+# GPU targets - MI350P
+ARG AITER_GPU_ARCH=gfx950
+ARG AITER_CU_NUM=128
 
 # Merge commits need an identity; a clean image has none.
 ENV GIT_AUTHOR_NAME="aiter mi350p build" \
@@ -62,22 +66,15 @@ RUN cd "${AITER_DIR}" \
          git merge --no-edit "${B_ALLREDUCE}" ; \
        else echo "baseline: aiter main only"; fi
 
-# The four xcd_count branches first, then the rest.
-#
-# With WITH_ALLREDUCE=1 these steps stop on a modify/delete. The comm branch
-# deletes aiter/ops/flydsl/{,kernels/}quick_allreduce_int4.py and their
-# op_test, having rewritten that path under kernels/comm/; main modifies the
-# same three files in #6049. The branches carry main past that commit, so the
-# deletion and the edit meet. The three files are the comm branch's to
-# reconcile. Onto AITER_MAIN alone the eight merge with no conflict.
-RUN cd "${AITER_DIR}" && git merge --no-edit "${B_FLYDSLXCD}"
-RUN cd "${AITER_DIR}" && git merge --no-edit "${B_TRITONXCD}"
-RUN cd "${AITER_DIR}" && git merge --no-edit "${B_OPUSXCD}"
-RUN cd "${AITER_DIR}" && git merge --no-edit "${B_HIPXCD}"
-RUN cd "${AITER_DIR}" && git merge --no-edit "${B_ARCHCU}"
-RUN cd "${AITER_DIR}" && git merge --no-edit "${B_AOTFILTER}"
-RUN cd "${AITER_DIR}" && git merge --no-edit "${B_FMOEACC}"
-RUN cd "${AITER_DIR}" && git merge --no-edit "${B_TUNING}"
+# The four xcd_count branches first, then the rest. With the comm branch at its
+# current tip all eight merge with no conflict, so any conflict here is new and stops the build.
+# One layer: merge order is fixed, and the resulting SHA is recorded.
+RUN cd "${AITER_DIR}" \
+    && for sha in "${B_FLYDSLXCD}" "${B_TRITONXCD}" "${B_OPUSXCD}" "${B_HIPXCD}" \
+                  "${B_ARCHCU}" "${B_AOTFILTER}" "${B_FMOEACC}" "${B_TUNING}"; do \
+         echo "== merge ${sha}"; git merge --no-edit "${sha}"; \
+       done \
+    && git rev-parse HEAD | tee /opt/aiter-build-sha
 
 # ck_tile comes from this submodule (jit/core.py points CK_DIR at it). Without
 # it the build falls back to /opt/rocm's older copy and fails to compile.
@@ -91,7 +88,8 @@ RUN cd "${AITER_DIR}" && pip install -r requirements.txt && pip install pyyaml
 # the other. PREBUILD_KERNELS compiles kernels in rather than leaving them to
 # JIT on first request.
 RUN cd "${AITER_DIR}" \
-    && PREBUILD_KERNELS=1 AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=gfx950 \
+    && PREBUILD_KERNELS=1 AITER_USE_SYSTEM_TRITON=1 \
+       GPU_ARCHS="${AITER_GPU_ARCH}" CU_NUM="${AITER_CU_NUM}" \
     python3 setup.py bdist_wheel --dist-dir=dist \
     && ls -la dist/*.whl
 
