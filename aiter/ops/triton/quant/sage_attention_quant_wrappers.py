@@ -14,11 +14,9 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rotate_quantize_k_kernel,
     _rotate_quantize_q_kernel,
     sage_quant_kernel,
-    sage_quant_v_fp4_colmajor_kernel,
     sage_quant_v_kernel,
     sage_quant_v_mxfp4_colmajor_kernel,
 )
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 
 def _bshd_order(layout):
@@ -107,6 +105,11 @@ def sage_quant_mxfp4(
         num_stages=3,
         num_warps=8,
     )
+
+    # Deferred: importing aiter.ops.triton.moe runs its __init__, which eagerly builds the
+    # moe_wgrad autotune decorator. Only this function needs it, so keep it off the import path
+    # of every sage/MHA caller.
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
     downcast_func = downcast_to_mxfp
 
@@ -214,14 +217,14 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     return q_out, delta_s
 
 
-_F4F4_V_KPERM_CACHE = {}
+_FP4_COLMAJOR_V_KPERM_CACHE = {}
 
 
-def _f4f4_v_kperm(device):
-    """Cached int32 [64] 'meas' kv-column permutation for the f4f4 col-major V pack
+def _fp4_colmajor_v_kperm(device):
+    """Cached int32 [64] 'meas' kv-column permutation for the col-major FP4 V pack
     (col c holds kv-token kperm[c]). Built once per device so it is not recreated per
     call (and stays out of any CUDA-graph capture region)."""
-    kp = _F4F4_V_KPERM_CACHE.get(device)
+    kp = _FP4_COLMAJOR_V_KPERM_CACHE.get(device)
     if kp is None:
         s = torch.arange(64, device=device)
         j = s % 32
@@ -230,7 +233,7 @@ def _f4f4_v_kperm(device):
         kperm = torch.empty(64, dtype=torch.long, device=device)
         kperm[tau64] = s  # kperm[col] = tau64^{-1}(col)
         kp = kperm.to(torch.int32).contiguous()
-        _F4F4_V_KPERM_CACHE[device] = kp
+        _FP4_COLMAJOR_V_KPERM_CACHE[device] = kp
     return kp
 
 
@@ -252,62 +255,6 @@ def fp4_v_raw_buffer_size(batch, sequence, heads):
     )
 
 
-def sage_quant_v_f4f4(v, layout="bshd"):
-    """Pack per-channel FP4 V into a padded, slack-backed col-major LDS layout."""
-    if layout == "bshd":
-        b, kv_len, h_kv, head_dim = v.shape
-        v_tok = v.permute(0, 2, 1, 3)
-    elif layout == "bhsd":
-        b, h_kv, kv_len, head_dim = v.shape
-        v_tok = v
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
-
-    tile = FP4_V_TILE_TOKENS
-    assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
-    padded_kv_len = fp4_v_padded_sequence(kv_len)
-    nT = padded_kv_len // tile
-    amax = v_tok.abs().amax(dim=-2).to(torch.float32)
-    v_descale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax)).contiguous()
-    kperm = _f4f4_v_kperm(v.device)
-    buf = torch.empty(
-        fp4_v_raw_buffer_size(b, kv_len, h_kv),
-        dtype=torch.uint8,
-        device=v.device,
-    )
-    packed = buf[: b * h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN].view(
-        b, h_kv, nT * tile * FP4_V_PACKED_BYTES_PER_TOKEN
-    )
-    sage_quant_v_fp4_colmajor_kernel[(b * h_kv * nT * 8,)](
-        v_tok,
-        packed,
-        v_descale,
-        kperm,
-        v_tok.stride(0),
-        v_tok.stride(1),
-        v_tok.stride(2),
-        v_tok.stride(3),
-        packed.stride(0),
-        packed.stride(1),
-        v_descale.stride(0),
-        v_descale.stride(1),
-        h_kv,
-        nT,
-        kv_len,
-    )
-    v_fp4_view = torch.as_strided(
-        buf,
-        (b, kv_len, h_kv, 128),
-        (
-            h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
-            FP4_V_PACKED_BYTES_PER_TOKEN,
-            padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
-            1,
-        ),
-    )
-    return v_fp4_view, v_descale
-
-
 @torch.library.custom_op("aiter::pack_v_mxfp4_colmajor_raw", mutates_args=())
 def pack_v_mxfp4_colmajor_raw(
     value: torch.Tensor,
@@ -315,7 +262,7 @@ def pack_v_mxfp4_colmajor_raw(
     """Pack V into contiguous payload and ASM-order E8M0 scale buffers.
 
     Each 128-token tile contributes 512 scale bytes: four 32-token blocks times
-    128 channels, arranged in the gather order consumed by the F4F4/F6F4 kernels.
+    128 channels, arranged in the gather order consumed by the MXFP4/F6F4 kernels.
     """
     batch, sequence, heads, head_dim = value.shape
     if head_dim != 128 or not value.is_contiguous():
@@ -332,7 +279,7 @@ def pack_v_mxfp4_colmajor_raw(
     )
     value_bhsd = value.permute(0, 2, 1, 3)
     payload = raw[: batch * heads * tiles * 8192].view(batch, heads, tiles * 8192)
-    kperm = _f4f4_v_kperm(value.device)
+    kperm = _fp4_colmajor_v_kperm(value.device)
     sage_quant_v_mxfp4_colmajor_kernel[(batch * heads * tiles * 16,)](
         value_bhsd,
         payload,
