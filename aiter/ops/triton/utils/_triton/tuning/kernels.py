@@ -259,6 +259,55 @@ def batched_gemm_bf16(shape, backend):
 
 
 @kernel(
+    "FUSED-BF16-BMM-CAT-QUANT-PAD-MLA",
+    dims=("B", "M", "N", "K"),
+    backend_kwarg=False,
+)
+def fused_bf16_bmm_cat_quant_pad_mla(shape, backend):
+    """B: query heads per rank, N: kv_lora_rank, K: qk_nope_head_dim."""
+    import torch
+
+    from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
+        fused_bf16_bmm_cat_quant_pad_mla as fused,
+    )
+    from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+    from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import (
+        generate_inputs,
+        vllm_fp8_max,
+    )
+
+    B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
+    q_nope, w_uk_t, q_pe = generate_inputs(M, B, kv_lora=N, d_nope=K)
+    q_scale = torch.ones((), dtype=torch.float32, device="cuda")
+    # the asm MLA decode runs a multiple of 16 heads
+    padded_heads = cdiv(B, 16) * 16
+    out = torch.empty(
+        (M, padded_heads, N + q_pe.shape[-1]),
+        dtype=get_fp8_e4m3_dtype(),
+        device="cuda",
+    )
+    fp8_max = vllm_fp8_max()
+
+    def call(config, q_nope, w_uk_t, q_pe, q_scale, out):
+        return fused(
+            q_nope,
+            w_uk_t,
+            q_pe,
+            q_scale,
+            padded_heads,
+            out=out,
+            fp8_max=fp8_max,
+            config=config,
+        )
+
+    def should_skip(config):
+        block_sizes = (config[f"BLOCK_SIZE_{d}"] for d in "MNK")
+        return min(block_sizes) < 16  # tl.dot needs 16-wide tiles
+
+    return call, (q_nope, w_uk_t, q_pe, q_scale, out), should_skip
+
+
+@kernel(
     "GEMM-A16W16",
     gluon_archs=(
         "gfx1250",
