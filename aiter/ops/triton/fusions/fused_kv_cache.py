@@ -332,16 +332,16 @@ def _cat_and_cache_mla(
     """Shared launch for both entry points; pos=cos=sin=None is the NoPE form."""
     apply_rope = cos is not None
     if seg_page_size > 0:
-        assert DEVICE_ARCH == "gfx1250" and apply_rope, (
-            "seg-packed KV pages are only written by the gfx1250 gluon rope kernel"
-        )
+        assert (
+            DEVICE_ARCH == "gfx1250" and apply_rope
+        ), "seg-packed KV pages are only written by the gfx1250 gluon rope kernel"
         assert not shuffled_kv_cache, "seg-packed and shuffled KV layouts are exclusive"
-        assert kv_cache.dim() == 3 and kv_cache.shape[1] == 1, (
-            "seg-packed KV pages need a (tokens, 1, D) single-head kv_cache"
-        )
-        assert kv_cache.shape[0] % seg_page_size == 0, (
-            "seg-packed kv_cache must hold whole pages"
-        )
+        assert (
+            kv_cache.dim() == 3 and kv_cache.shape[1] == 1
+        ), "seg-packed KV pages need a (tokens, 1, D) single-head kv_cache"
+        assert (
+            kv_cache.shape[0] % seg_page_size == 0
+        ), "seg-packed kv_cache must hold whole pages"
 
     b, qh, d_nope = q_nope.shape
     b2, qh2, d_pe = q_pe.shape
