@@ -32,8 +32,10 @@ here. Update this file in the same change as any behaviour change.
    `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
    allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
    gluon (gfx950 a8w8 blockscale `num_stages` is `NUM_STAGES`, at least 2).
-4. Results always install into `resolve_config_dir(op, config_name, backend)`. No export directory,
-   no dry run.
+4. Results always install into the plain folder, `resolve_config_dir(..., cu_num=None)`, or with
+   `--cu-dir` into the `<cu_num>cu/` tree of the device's CU count (`space.config_tree`), which
+   must already have its own `DEFAULT.json`; the tuner never writes one. No export directory, no
+   dry run.
 5. The installed file is seeded with this shape's file if it exists (keeping every bucket it does
    not replace), else it starts with only `"DEFAULT_FALLBACK": true` and `DEFAULT.json`'s
    `M_BOUNDS`: never copy untuned buckets (another shape's or `DEFAULT.json`'s) into a shape file.
@@ -46,12 +48,17 @@ here. Update this file in the same change as any behaviour change.
    `DEFAULT.json` is never written, so its `any` never changes; only `M_LEQ_*` buckets are tuned;
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is
-   restored. Bucket collisions are resolved before writing (largest M wins).
+   restored. Bucket collisions are resolved before writing (largest M wins). With `--cu-dir`
+   every file named here is the CU tree's own (`DEFAULT.json`, seed, `any`, `M_BOUNDS`); nothing
+   is read from another tree.
 6. Data contracts: a kernel function returns `(call, inputs, should_skip)`; a result
-   record's fields are listed in the `harness.py` docstring; the plan JSON carries the family's
-   `bounds`; the worker prints `ready` and one line per candidate for the driver's watchdog;
-   the plan is kept per (arch, backend, kernel, shape) in the runs dir and the installer only
-   lets its candidates win; resume requires the same `--calls`/`--replays`; `config` in a record is the raw
+   record's fields are listed in the `harness.py` docstring and include `cu_num`, the device's CU
+   count; the plan JSON carries the family's `bounds`, `cu_num` and `cu_dir`; the worker prints
+   `ready` and one line per candidate for the driver's watchdog; the plan is kept per (arch,
+   backend, kernel, shape) in the runs dir and the installer only lets its candidates win; resume
+   requires the same `--calls`/`--replays` and no record timed on another CU count;
+   `write_best_configs.py --cu-dir` uses only records timed on this device's CU count (records
+   without `cu_num` are skipped); `config` in a record is the raw
    candidate. Keys a wrapper derives or clamps (`SPLITK_BLOCK_SIZE`, clamped `NUM_BUFFERS`,
    `GROUP_K`, CTAS-scaled tiles) are never recorded or written. Wrappers mutate their config
    dict, so every launch gets a deep copy; the only framework code that mutates a config is a
@@ -108,6 +115,8 @@ Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothin
     python3 sweep_configs.py gemm_afp4wfp4_preshuffle --all-buckets --N 256 --K 512 --gpu 0 1 2 3 --runs-dir /tmp/runs2
     python3 verify_configs.py gemm_afp4wfp4_preshuffle --M 64 --N 256 --K 512 --expect-tuned
     # then delete the test file configs/gfx1250/gluon/gemm/gemm_afp4wfp4_preshuffled/GEMM-AFP4WFP4_PRESHUFFLED-N=256-K=512.json
+    # on a partition whose CU count is not the arch's default: the same sweep and verify with
+    # --cu-dir (the <cu_num>cu/ tree needs its own DEFAULT.json first), then delete that file too
 
 ## Do not
 
@@ -115,5 +124,8 @@ Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothin
   exclusion heuristic.
 - Put an arch prefix on an installed file, write to the current directory, write `DEFAULT.json`,
   or copy untuned buckets into a shape file.
+- Write into a `<cu_num>cu/` tree without `--cu-dir`, create that tree's `DEFAULT.json`, or make
+  a tree for the count the plain folder was tuned on. Without `--cu-dir` the plain folder is
+  used, whatever the device's CU count.
 - Add tuned values to Python; `SEARCH_SPACE` is a search space, not a tuned value.
 - Run two drivers on one GPU.
