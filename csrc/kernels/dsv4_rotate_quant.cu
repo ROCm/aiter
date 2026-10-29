@@ -402,7 +402,7 @@ __global__ void hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__
 }
 
 #define ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(dim, fp4quant, vec_size, name)                      \
-    const int32_t m_block = vec_size * WARP_SIZE / dim; \
+    int32_t m_block = vec_size * WARP_SIZE / dim; \
     dim3 const grid((m + m_block - 1) / m_block);                              \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name, \
                                             [&] {                                                \
@@ -440,7 +440,7 @@ void rotate_activation_fp4quant(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     using DTYPE_O = opus::fp4_t;
     AITER_CHECK(scale.element_size() == 1, "scale element size must be 1");
@@ -502,7 +502,7 @@ void rotate_activation(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     opus::e8m0_t* scale_ptr = nullptr;
     if(dim == 128)
@@ -709,7 +709,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
 #define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_(dim, do_rotate_act, fp4quant, vec_size, name) \
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim"); \
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");              \
-    const int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
+    int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
     dim3 const grid((m + m_block - 1) / m_block);                                                   \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                   \
                                             [&] {                                                  \
@@ -786,7 +786,7 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     AITER_CHECK(scale.element_size() == 1, "scale element size must be 1");
     const int32_t groups_per_row = dim / group_size;
@@ -884,7 +884,7 @@ void rope_rotate_activation(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     constexpr int32_t vec_size = 16;
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim");
@@ -1067,7 +1067,7 @@ __global__ void rope_hadamard_rotate_activation_fp8quant_kernel(opus::fp8_t* __r
 #define ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL_(dim, do_rotate_act, vec_size, name)             \
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim"); \
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");                 \
-    const int32_t m_block = vec_size * WARP_SIZE / dim;                                              \
+    int32_t m_block = vec_size * WARP_SIZE / dim;                                              \
     dim3 const grid((m + m_block - 1) / m_block);                                                    \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                     \
                                             [&] {                                                    \
@@ -1138,7 +1138,7 @@ void rope_rotate_activation_fp8quant(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     if(dim == 128)
     {
@@ -1398,7 +1398,7 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
 #define NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL_(dim, do_rotate_act, fp4quant, vec_size, name) \
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim"); \
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");              \
-    const int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
+    int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
     dim3 const grid((m + m_block - 1) / m_block);                                                   \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                   \
                                             [&] {                                                  \
@@ -1515,7 +1515,7 @@ void rmsnorm_rope_rotate_activation_fp4quant_kvcache(aiter_tensor_t& kvcache,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     AITER_CHECK(scale.element_size() == 1, "scale element size must be 1");
     const int32_t groups_per_row = dim / group_size;
