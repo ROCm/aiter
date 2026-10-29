@@ -1251,9 +1251,11 @@ def launch_gemm_a8w4_tdm(
         # tiles can have n_acc as low as the tail itself, so clamp it to keep at
         # least one group for the interleaved part.
         FENCE_COVER_MMA = min(8, max(0, n_acc - sched_mma_group))
+        # Whole KSL1 rows before the reuse fence, separate from IGLP group size.
+        PREFENCE_MMA = 4
 
-        def mma_rows(wm_list, act, wt, sa_k, sb_k):
-            for i in range_constexpr(len(wm_list)):
+        def mma_rows(wm_list, act, wt, sa_k, sb_k, start=0, end=None):
+            for i in range_constexpr(start, len(wm_list) if end is None else end):
                 wm = wm_list[i]
                 for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
@@ -1398,9 +1400,24 @@ def launch_gemm_a8w4_tdm(
             num_outstanding_tdm=None,
             issue_fn=None,
             fence_fn=None,
+            pre_fence_rows=0,
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
             reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
+            if const_expr(pre_fence_rows > 0):
+                sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
+                mma_rows(
+                    FRONT,
+                    cur_rmem.a[:front_wm],
+                    cur_rmem.b,
+                    sa_k,
+                    sb_k,
+                    end=pre_fence_rows,
+                )
+                # Close the prefix region before the LDS-reuse fence. The
+                # suffix hints must not count these WMMAs a second time.
+                rocdl.sched_mfma(pre_fence_rows * wmma_n_rep)
+                rocdl.sched_barrier(0)
             if const_expr(issue_fn is not None):
                 # The carried operands may still be reading the LDS buffer
                 # that issue_fn recycles. Retire those reads before all waves
@@ -1415,7 +1432,14 @@ def launch_gemm_a8w4_tdm(
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
             sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-            mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
+            mma_rows(
+                FRONT,
+                cur_rmem.a[:front_wm],
+                cur_rmem.b,
+                sa_k,
+                sb_k,
+                start=pre_fence_rows,
+            )
             if const_expr(len(BACK) > 0):
                 mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
             if const_expr(reuse_cur_rmem):
@@ -1471,7 +1495,7 @@ def launch_gemm_a8w4_tdm(
                     previous = current
                 return counts
 
-            def emit_hints(ksl, tail_mfma=0):
+            def emit_hints(ksl, tail_mfma=0, pre_fence_mma=0):
                 has_next = ksl + 1 < kws or (
                     ksl + 1 == kws and next_stage_lds_addr is not None
                 )
@@ -1487,6 +1511,7 @@ def launch_gemm_a8w4_tdm(
                 # turning the complete A/B/scale prefetch into long LDS bursts.
                 mma_group = min(sched_mma_group, mma_total) if KWS > 1 else 1
                 first_group = min(sched_first_group, mma_total) if KWS > 1 else 1
+                assert 0 <= pre_fence_mma <= mma_total
                 remaining_mma = mma_total - first_group
                 remaining_slots = (
                     (remaining_mma + mma_group - 1) // mma_group
@@ -1509,10 +1534,14 @@ def launch_gemm_a8w4_tdm(
                 for i in range_constexpr(schedule_slots):
                     if const_expr(tdm_schedule[i] > 0):
                         rocdl.sched_vmem(tdm_schedule[i])
-                    # Compute the first MMA group before starting the DS reads.
-                    # STATE_DS must still cover all native reads so payload
-                    # loads cannot escape the intended scheduling groups.
-                    rocdl.sched_mfma(mma_groups[i])
+                    # Omit WMMAs already emitted before the fence, but retain
+                    # every DS group: STATE_DS still covers all native reads.
+                    group_mma = max(
+                        0,
+                        mma_groups[i] - max(0, pre_fence_mma - sum(mma_groups[:i])),
+                    )
+                    if const_expr(group_mma > 0):
+                        rocdl.sched_mfma(group_mma)
                     if const_expr(i == 0 and first_ds > 0):
                         rocdl.sched_dsrd(first_ds)
                     remaining_ds = future_schedule[i] - (first_ds if i == 0 else 0)
@@ -1542,6 +1571,20 @@ def launch_gemm_a8w4_tdm(
                     )
                 else:
                     next_rmem, load_nxt_fn = None, None
+                # Split whole WMMA rows on K256's issuing KSL1.
+                # Other shapes and drain steps keep their original schedule.
+                pre_fence_rows = (
+                    PREFENCE_MMA // wmma_n_rep
+                    if (
+                        a_is_fp4
+                        and kws == 2
+                        and ksl == 1
+                        and prefetch_kt is not None
+                        and PREFENCE_MMA % wmma_n_rep == 0
+                        and PREFENCE_MMA <= front_wm * wmma_n_rep
+                    )
+                    else 0
+                )
                 k_step(
                     rmem_slots[ksl % 2],
                     next_rmem,
@@ -1555,9 +1598,10 @@ def launch_gemm_a8w4_tdm(
                         else None
                     ),
                     fence_fn=(next_stage_fence_fn if const_expr(carries) else None),
+                    pre_fence_rows=pre_fence_rows,
                 )
-                # One region per k128: sched_group_barrier only partitions
-                # within a region, and only sched_barrier delimits one.
+                # The optional prefix has its own region. Keep all DS/TDM
+                # hints here, but omit all already-issued prefix WMMAs.
                 emit_hints(
                     ksl,
                     (
@@ -1569,6 +1613,7 @@ def launch_gemm_a8w4_tdm(
                         )
                         else 0
                     ),
+                    pre_fence_mma=pre_fence_rows * wmma_n_rep,
                 )
                 rocdl.sched_barrier(0)
 
