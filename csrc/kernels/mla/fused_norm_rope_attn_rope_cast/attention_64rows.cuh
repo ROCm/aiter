@@ -2615,6 +2615,16 @@ hipError_t run_fused_norm_rope_attn_rope_cast_small_heads(
         fused_norm_rope_attn_rope_cast_decode_reduce_kernel<Heads, 0, false, 32>
             <<<dim3(args.N, Heads / 16), 256, 0, stream>>>(args);
     }
+    // Keep 64-bit bases; narrow only independently checked data/scale offsets.
+    else if(fused_norm_rope_attn_rope_cast_fwd::kv_offsets_fit_u32(args))
+    {
+        if(raw_q)
+            fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, true, false, true, 32, true>
+                <<<dim3(args.N), 256, 0, stream>>>(args);
+        else
+            fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, false, false, false, 32, true>
+                <<<dim3(args.N), 256, 0, stream>>>(args);
+    }
     else if(raw_q)
         fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, true, false, true, 32>
             <<<dim3(args.N), 256, 0, stream>>>(args);

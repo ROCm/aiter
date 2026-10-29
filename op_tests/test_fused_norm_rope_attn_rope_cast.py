@@ -1906,9 +1906,12 @@ def _check_shared_kv_wave_boundary(
     capacity=1200,
     layout="padded",
     exercise_common=False,
+    splits=0,
+    output_only=False,
+    with_sink=True,
 ):
     kwargs, (expected, mx, lse) = two_source_inputs(
-        heads, layout, mode, wide=True, valid_indices=valid_indices
+        heads, layout, mode, wide=True, valid_indices=valid_indices, with_sink=with_sink
     )
     selected = (torch.arange(tokens, device="cuda") + 5) % kwargs["q"].shape[0]
     for key in ("q", "q_scale"):
@@ -1940,6 +1943,14 @@ def _check_shared_kv_wave_boundary(
         max_logits=torch.empty_like(mx),
         lse=torch.empty_like(lse),
     )
+    kwargs["num_splits"] = splits
+    if splits > 1:
+        count = tokens * splits * heads * 516
+        storage = torch.full((count + 8,), 0x5A5A5A5A, device="cuda", dtype=torch.int32)
+        kwargs["workspace"] = (
+            storage[4:-4].view(torch.float32).reshape(tokens, splits, heads, 516)
+        )
+        kwargs["workspace"].fill_(torch.nan)
     out = _call_v41(**kwargs)
     torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
     torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
@@ -1961,6 +1972,32 @@ def _check_shared_kv_wave_boundary(
             torch.testing.assert_close(
                 x.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
             )
+
+    if output_only:
+        call = dict(kwargs)
+        for key in ("debug_out", "max_logits", "lse"):
+            call.pop(key)
+        actual = _call_v41(**call)
+        assert actual[2:] == (None, None)
+        assert (
+            float((dequantize(*actual[:2]) - expected).norm() / expected.norm()) < 0.035
+        )
+        # Compare replay against the same output-only kernel's eager result.
+        refs = tuple(x.clone() for x in actual[:2])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _call_v41(**call)
+        for _ in range(2):
+            for x in actual[:2]:
+                x.view(torch.uint8).fill_(255)
+            call["workspace"].fill_(torch.nan)
+            graph.replay()
+            for x, ref in zip(actual[:2], refs):
+                torch.testing.assert_close(
+                    x.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
+                )
+            assert bool((storage[:4] == 0x5A5A5A5A).all())
+            assert bool((storage[-4:] == 0x5A5A5A5A).all())
 
     if exercise_common:
         # With 32-bit positions, omitted diagnostic outputs must agree with the
@@ -2080,10 +2117,9 @@ def check_native_split_integer_width_and_error_recovery(bad_splits):
         )
 
 
-def check_h64_prefill_address_width(wide_view, rows, prepared, tokens):
+def check_prefill_address_width(wide_view, rows, prepared, tokens, heads=64):
     # Exercise unsigned offsets beyond 2 GiB and the fallback beyond 4 GiB.
     # All four independently strided views must participate in the dispatch guard.
-    heads = 64
     row_stride = 2**30 + 4
     kwargs = {}
     for key in ("unified_kv", "unified_kv_scale", "kv", "kv_scale"):
@@ -2768,6 +2804,22 @@ def check_h32_split_head_tile_boundary(tokens, splits, mode):
     check_two_source_h64_causal_prefill(tokens, 512, mode, 32, splits)
 
 
+def check_h32_output_only_split_replay(tokens, splits, mode, layout, with_sink):
+    # Cover both sides of the wave reducer's CTA gate and all new split counts.
+    _check_shared_kv_wave_boundary(
+        tokens,
+        mode,
+        False,
+        True,
+        32,
+        2176,
+        layout,
+        splits=splits,
+        output_only=True,
+        with_sink=with_sink,
+    )
+
+
 def check_h16_long_list_auto_split(tokens, topk, mode):
     # Exercise the long-list policy with dense output/max/LSE checks around
     # the grid and allocated-row boundaries, including normalized raw Q.
@@ -2831,6 +2883,16 @@ def check_small_head_split_storage(heads, mode, splits):
 def run_contract_checks():
     """Run every correctness case during the same direct invocation used by CI."""
     checks = [
+        (
+            check_h32_output_only_split_replay,
+            [
+                ("tokens", [15, 16, 36, 48, 80, 127, 128]),
+                ("splits", [3, 5, 7]),
+                ("mode", ["raw", "prepared", "norm"]),
+                ("layout", ["interleaved", "padded"]),
+                ("with_sink", [False, True]),
+            ],
+        ),
         (
             check_h16_long_list_auto_split,
             [
@@ -3318,9 +3380,9 @@ def run_contract_checks():
             [("bad_splits", [4294967297, -4294967295])],
         ),
         (
-            check_h64_prefill_address_width,
+            check_prefill_address_width,
             [
-                ("tokens", [512, 2048]),
+                ("tokens,heads", [(512, 64), (2048, 64), (256, 32)]),
                 ("prepared", [False, True]),
                 ("rows", [3, 5]),
                 ("wide_view", ["unified_kv", "unified_kv_scale", "kv", "kv_scale"]),

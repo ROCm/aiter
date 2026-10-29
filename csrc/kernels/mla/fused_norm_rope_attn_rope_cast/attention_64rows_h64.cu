@@ -19,7 +19,7 @@ hipError_t run_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRopeCas
     return hipErrorInvalidValue;
 }
 
-template <int Heads>
+template <int Heads, int Splits = 4>
 __global__ __launch_bounds__(64) void fused_decode_wave_reduce(
     FusedNormRopeAttnRopeCastParams a)
 {
@@ -27,7 +27,7 @@ __global__ __launch_bounds__(64) void fused_decode_wave_reduce(
     using namespace opus;
     using namespace fused_norm_rope_attn_rope_cast_fwd;
     specialize_heads<Heads>(a);
-    a.num_splits = 4;
+    a.num_splits = Splits;
     a.debug_ptr = nullptr;
     a.lse_ptr   = nullptr;
     a.max_ptr   = nullptr;
@@ -44,10 +44,10 @@ __global__ __launch_bounds__(64) void fused_decode_wave_reduce(
     constexpr float LOG2_E = 1.44269504089f;
     constexpr int per_group = O_ELEMS<T> / PV_GROUPS<T>;
     vector_t<float, per_group> output{};
-    const auto* base = a.partial_ptr + int64_t(token) * 4 * Heads * 516;
+    const auto* base = a.partial_ptr + int64_t(token) * Splits * Heads * 516;
     constexpr int64_t split_stride = int64_t(Heads) * 516;
     float maximum = -__FLT_MAX__;
-    for(int s = 0; s < 4; ++s)
+    for(int s = 0; s < Splits; ++s)
     {
         const auto stats = *reinterpret_cast<const vector_t<float, 4>*>(base + s * split_stride +
                                                                         Heads * 512 + local_head * 4);
@@ -58,7 +58,7 @@ __global__ __launch_bounds__(64) void fused_decode_wave_reduce(
                                        : -__builtin_inff();
     const float final_max = fmaxf(maximum, sink);
     float denominator = 0.0f;
-    for(int s = 0; s < 4; ++s)
+    for(int s = 0; s < Splits; ++s)
     {
         const auto stats   = *reinterpret_cast<const vector_t<float, 4>*>(base + s * split_stride +
                                                                         Heads * 512 + local_head * 4);
@@ -82,8 +82,12 @@ __global__ __launch_bounds__(64) void fused_decode_wave_reduce(
 
 bool use_decode_wave_reduce(const FusedNormRopeAttnRopeCastParams& a)
 {
+    // Four channel slices per wave avoid LDS reduction on small split grids.
     const int64_t blocks = int64_t(a.N) * a.H / 16;
-    return (a.H == 32 || a.H == 64) && a.num_splits == 4 && blocks >= 32 && blocks < 256 &&
+    const bool supported_splits = a.num_splits == 4 ||
+                                  (a.H == 32 && (a.num_splits == 3 || a.num_splits == 5 ||
+                                                 a.num_splits == 7));
+    return (a.H == 32 || a.H == 64) && supported_splits && blocks >= 32 && blocks < 256 &&
            !a.debug_ptr && !a.lse_ptr && !a.max_ptr && !a.out_ptr;
 }
 
@@ -91,7 +95,23 @@ hipError_t launch_decode_wave_reduce(const FusedNormRopeAttnRopeCastParams& a, h
 {
     const dim3 grid(a.N, a.H / 16, 4);
     if(a.H == 32)
-        fused_decode_wave_reduce<32><<<grid, 64, 0, stream>>>(a);
+    {
+        switch(a.num_splits)
+        {
+        case 3:
+            fused_decode_wave_reduce<32, 3><<<grid, 64, 0, stream>>>(a);
+            break;
+        case 5:
+            fused_decode_wave_reduce<32, 5><<<grid, 64, 0, stream>>>(a);
+            break;
+        case 7:
+            fused_decode_wave_reduce<32, 7><<<grid, 64, 0, stream>>>(a);
+            break;
+        default:
+            fused_decode_wave_reduce<32><<<grid, 64, 0, stream>>>(a);
+            break;
+        }
+    }
     else
         fused_decode_wave_reduce<64><<<grid, 64, 0, stream>>>(a);
     return hipGetLastError();
