@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 
@@ -10,6 +12,20 @@ from aiter.ops.triton._triton_kernels.attention.block_lut import (
     block_attn_mask_to_lut_kernel,
 )
 from aiter.ops.triton._triton_kernels.attention.lse_merge import _lse_merge_kernel
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+
+# An arch without a measured entry gets a tile small enough to launch anywhere. On MI355X a sweep
+# of BLOCK_M 8-128 x num_warps 1-8 over the kv_splits shapes of mha_v4 found 16 x 4 within 2% of
+# each shape's best on average, and this fallback 8% behind it.
+_LSE_MERGE_FALLBACK = triton.Config({"BLOCK_M": 32}, num_warps=4)
+
+
+@functools.cache
+def _lse_merge_config() -> triton.Config:
+    """Resolved once per process: an arch without an entry warns on every lookup."""
+    return get_tuned_kernel_config(
+        "attention", "LSE_MERGE", "_lse_merge_kernel", _LSE_MERGE_FALLBACK
+    )
 
 
 def block_attn_mask_to_ragged_lut(
@@ -121,7 +137,8 @@ def lse_merge(
     if head_dim & (head_dim - 1):
         raise ValueError(f"head dimension must be a power of two, got {head_dim}")
 
-    block_m = 32
+    config = _lse_merge_config()
+    block_m = config.kwargs["BLOCK_M"]
     lse_strides = (lse.stride(0), lse.stride(1)) if lse is not None else (0, 0)
     _lse_merge_kernel[(triton.cdiv(sequence, block_m), heads, batch)](
         partial_out,
@@ -142,5 +159,5 @@ def lse_merge(
         BLOCK_M=block_m,
         HEAD_DIM=head_dim,
         WRITE_LSE=lse is not None,
-        num_warps=4,
+        num_warps=config.num_warps,
     )
