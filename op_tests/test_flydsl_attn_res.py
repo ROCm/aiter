@@ -34,8 +34,9 @@ _MAX_BLOCKS = 8
 _EPS = 1e-5
 _ATOL = 8e-2
 _RTOL = 3e-2
-# Measured cache-bypassed BF16 bandwidth floor from the PR (TB/s).
-_FLOOR_BW_TBPS = 6.26
+# Measured cache-bypassed BF16 bandwidth floor from the PR (TB/s). gfx942 has
+# no measured floor, so its efficiency column stays empty.
+_FLOOR_BW_TBPS = {"gfx950": 6.26}
 _BF16_ULP_REL = 3.863e-3
 _SUPPORTED_GFX = ("gfx942", "gfx950")
 
@@ -459,11 +460,13 @@ def benchmark_flydsl_attn_res(
     rows = k + 2 * int(has_delta) + int(write_block) + 1
     moved_bytes = rows * tokens * hidden_size * 2
     tbps = moved_bytes / (us * 1e-6) / 1e12
-    floor_us = moved_bytes / (_FLOOR_BW_TBPS * 1e12) * 1e6
+    gfx = get_gfx()
+    floor_bw = _FLOOR_BW_TBPS.get(gfx)
+    floor_us = moved_bytes / (floor_bw * 1e12) * 1e6 if floor_bw else None
     # ~4D (sumsq + dot) + 2D mix per source; optional output RMS ~4D.
     flops = tokens * hidden_size * (6 * k + 4 * int(apply_output_norm))
     return {
-        "gfx": get_gfx(),
+        "gfx": gfx,
         "D": hidden_size,
         "k": k,
         "has_delta": has_delta,
@@ -474,8 +477,8 @@ def benchmark_flydsl_attn_res(
         "us": round(us, 3),
         "TFLOPS": round(flops / us / 1e6, 2),
         "TB/s": round(tbps, 3),
-        "floor_us": round(floor_us, 3),
-        "efficiency": round(floor_us / us, 3),
+        "floor_us": round(floor_us, 3) if floor_us else None,
+        "efficiency": round(floor_us / us, 3) if floor_us else None,
         "err": err,
     }
 
