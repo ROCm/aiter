@@ -1120,3 +1120,121 @@ def test_unified_attn_spec_verify_gfx1250(
     )
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("path", ["3d", "2d", "auto"])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("query_len", [4, 16, 32])
+@pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("batch, num_pad", [(5, 0), (37, 3)])
+@torch.inference_mode()
+def test_unified_attn_equal_seqlen_q_gfx1250(
+    path: str,
+    shuffled_kv_cache: bool,
+    query_len: int,
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    batch: int,
+    num_pad: int,
+    monkeypatch,
+) -> None:
+    """equal_seqlen_q=True on gfx1250: the kernels index seq i's queries at rows
+    [i, i + 1) * max_seqlen_q instead of searching cu_seqlens_q. Covers one and
+    several query blocks a sequence (query_len * num_queries_per_kv against
+    BLOCK_M), both KV layouts, and trailing pad seqs as a DP-padded batch has
+    them: no query rows behind them and seqused_k == 0, which must neither
+    shift the real seqs' rows nor write past them."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    if path == "3d" and not shuffled_kv_cache:
+        pytest.skip("the gfx1250 3D Gluon kernel needs the shuffled KV cache")
+    if path == "auto" and not shuffled_kv_cache:
+        # short queries route to 3D, which without the shuffled cache is the Triton
+        # 3D kernel; it misses the reference here with or without equal_seqlen_q
+        pytest.skip("unshuffled short queries route to the Triton 3D kernel")
+    if path != "auto":
+        monkeypatch.setattr(
+            sys.modules[unified_attention.__module__],
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    rng = random.Random(batch * 1000 + query_len)
+    seq_lens = [(query_len, rng.randint(query_len, 3000)) for _ in range(batch)]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        _output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=batch * (3000 // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        shuffled_kv_cache=shuffled_kv_cache,
+        device="cuda",
+    )
+    num_tokens = batch * query_len
+    # Trailing pad seqs: cu_seqlens_q repeats the last offset, no KV, any block table.
+    cu_seqlens_q = torch.cat([cu_query_lens, cu_query_lens[-1:].repeat(num_pad)])
+    seqused_k = torch.cat(
+        [kv_lens, torch.zeros(num_pad, dtype=kv_lens.dtype, device=kv_lens.device)]
+    )
+    block_table = torch.cat([block_tables, block_tables[:1].repeat(num_pad, 1)])
+    # out is a view into a larger buffer: rows past the real tokens must stay intact.
+    sentinel = 7.0
+    out_buf = torch.full(
+        (num_tokens + (num_pad + 1) * query_len, num_heads[0], head_size),
+        sentinel,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = out_buf[:num_tokens]
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=shuffled_kv_cache,
+        equal_seqlen_q=True,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+    )
+    assert not output.isnan().any()
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+    assert (out_buf[num_tokens:] == sentinel).all(), "wrote past the real tokens"
