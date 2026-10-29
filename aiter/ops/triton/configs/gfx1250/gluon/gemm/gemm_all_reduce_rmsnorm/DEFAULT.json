@@ -1,0 +1,23 @@
+{
+    "M_LEQ_32": {
+        "ROWS": 4,
+        "BLOCK_N": 32,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4
+    },
+    "M_LEQ_128": {
+        "ROWS": 16,
+        "BLOCK_N": 32,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4
+    },
+    "any": {
+        "ROWS": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 128,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4
+    }
+}
