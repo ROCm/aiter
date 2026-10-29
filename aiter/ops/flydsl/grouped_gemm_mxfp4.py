@@ -155,6 +155,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
     rolled_drain=0,
+    layout_align_m=0,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -261,6 +262,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(lds_soa_load_interleave),
         persistent_workers,
         rolled_drain,
+        int(layout_align_m),
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
