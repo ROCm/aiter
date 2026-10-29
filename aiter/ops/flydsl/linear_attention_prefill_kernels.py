@@ -417,13 +417,20 @@ def _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata=None):
 
 
 def _resolve_adaptive_k5_metadata(
-    cu_seqlens, T, device, target_segments, *, lengths=None
+    cu_seqlens, T, device, target_segments, *, lengths=None, num_heads=None
 ):
-    """Resolve adaptive schedules without retaining cu_seqlens."""
+    """Resolve adaptive schedules without retaining cu_seqlens.
+
+    With ``num_heads`` set, also applies the blocked-path gate (positive lengths,
+    longest sequence >= ``_BLOCKED_MIN_CHUNKS`` chunks, bounded work ratio) on host
+    lengths before any schedule tensor is built, and returns None on rejection.
+    Host lengths and the verdict are cached on ``cu_seqlens``, so a warm call
+    does no device-to-host copy.
+    """
     if target_segments <= 0:
         raise ValueError("`target_segments` must be positive.")
-    if lengths is None:
-        lengths = _gdn_k5_sequence_lengths(cu_seqlens, T)
+    if lengths is not None:
+        lengths = tuple(lengths)
     if cu_seqlens is None:
         key = (device, T)
         if key in _DENSE_K5_OFFSETS:
@@ -435,11 +442,19 @@ def _resolve_adaptive_k5_metadata(
             if len(_DENSE_K5_OFFSETS) > _DENSE_K5_OFFSETS_MAX:
                 _DENSE_K5_OFFSETS.popitem(last=False)
         cu_seqlens = _DENSE_K5_OFFSETS[key]
-    cache_key = (64, 0, 0, T, lengths, target_segments)
+    cache_key = (64, 0, 0, T, target_segments, num_heads)
     version = _tensor_version(cu_seqlens)
     cached = getattr(cu_seqlens, _ADAPTIVE_K5_META_ATTR, None)
-    if cached is not None and cached[0] == cache_key and cached[1] == version:
-        schedule = cached[2]
+    hit = (
+        cached is not None
+        and cached[0] == cache_key
+        and cached[1] == version
+        and (lengths is None or cached[2] == lengths)
+    )
+    if hit:
+        lengths, schedule = cached[2], cached[3]
+        if schedule is None:
+            return None
         return GatedDeltaRulePrefillMetadata(
             layout=PrefillBatchLayout(
                 seq_lens_cpu=lengths,
@@ -449,17 +464,44 @@ def _resolve_adaptive_k5_metadata(
             ),
             schedule=schedule,
         )
-    metadata = build_gated_delta_rule_prefill_metadata(
-        lengths,
-        cu_seqlens=cu_seqlens,
-        block_chunks_per_seq=[
-            max(1, triton.cdiv(triton.cdiv(length, 64), target_segments))
-            for length in lengths
-        ],
-    )
+    if lengths is None:
+        lengths = _gdn_k5_sequence_lengths(cu_seqlens, T)
+    block_chunks_per_seq = [
+        max(1, triton.cdiv(triton.cdiv(length, 64), target_segments))
+        for length in lengths
+    ]
+    metadata = None
+    if num_heads is not None:
+        chunk_counts = [triton.cdiv(length, 64) for length in lengths]
+        total_blocks = sum(
+            triton.cdiv(count, size)
+            for count, size in zip(chunk_counts, block_chunks_per_seq)
+        )
+        if (
+            all(length > 0 for length in lengths)
+            and max(chunk_counts) >= _BLOCKED_MIN_CHUNKS
+            and total_blocks * num_heads
+            <= _BLOCKED_MAX_WORK_PER_CHUNK * max(chunk_counts)
+        ):
+            pass
+        else:
+            block_chunks_per_seq = None
+    if block_chunks_per_seq is not None:
+        metadata = build_gated_delta_rule_prefill_metadata(
+            lengths,
+            cu_seqlens=cu_seqlens,
+            block_chunks_per_seq=block_chunks_per_seq,
+        )
     try:
         object.__setattr__(
-            cu_seqlens, _ADAPTIVE_K5_META_ATTR, (cache_key, version, metadata.schedule)
+            cu_seqlens,
+            _ADAPTIVE_K5_META_ATTR,
+            (
+                cache_key,
+                version,
+                lengths,
+                metadata.schedule if metadata is not None else None,
+            ),
         )
     except (AttributeError, TypeError):
         pass
@@ -883,7 +925,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     else:
         si_i32 = None
 
-    # BV: tuned table, then hip LDS/CU rule; env override wins last.
     if is_varlen:
         _total_chunks, _max_seq_chunks = (
             host_chunk_meta
@@ -892,6 +933,84 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         )
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
+    if g is not None:
+        if _opt_check():
+            if g.device != k.device:
+                raise ValueError(
+                    f"FlyDSL K5 opt: g must be on k's device ({k.device}), "
+                    f"got {g.device}."
+                )
+            if g.dim() != 3:
+                raise ValueError(
+                    f"FlyDSL K5 opt: `g` must be 3-D, got shape {tuple(g.shape)}."
+                )
+            expected_g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
+            if tuple(g.shape) != expected_g_shape:
+                layout = (
+                    "head-major [B, H, T]" if g_head_major else "token-major [B, T, H]"
+                )
+                raise ValueError(
+                    f"FlyDSL K5 opt: `g` shape mismatch, expected "
+                    f"{expected_g_shape} for {layout} layout, got {tuple(g.shape)}."
+                )
+        if g.dtype != torch.float32:
+            g = g.to(torch.float32)
+        g = _as_contiguous(g)
+
+    if gk is not None:
+        gk = _as_contiguous(gk)
+        if g_log2_scaled:
+            gk = gk * _RCP_LN2
+
+    if (
+        B == 1
+        and use_g
+        and not use_gk
+        and K == V == 128
+        and BT == 64
+        and num_decodes == num_decode_tokens == 0
+        and not use_state_indices
+        and _total_chunks >= _BLOCKED_MIN_CHUNKS
+        and k.dtype == w.dtype == u.dtype == torch.bfloat16
+        and snapshot_bf16
+        and output_final_state
+        and save_new_value
+        and not inplace
+        and g_head_major
+        and use_exp2
+        and bf16_convert_trunc
+        and k.is_cuda
+        and _IS_GFX950
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        target_segments = _GDN_K5_TARGET_SEGMENTS
+        # K5 requires its own blocks when shared metadata uses scalar sizing.
+        adaptive_metadata = _resolve_adaptive_k5_metadata(
+            cu_seqlens,
+            T_flat,
+            k.device,
+            target_segments,
+            lengths=(
+                prefill_metadata.layout.seq_lens_cpu
+                if prefill_metadata is not None
+                else None
+            ),
+            num_heads=H,
+        )
+        if adaptive_metadata is not None:
+            return _chunk_gated_delta_rule_fwd_h_blocked(
+                k,
+                w,
+                u,
+                g,
+                initial_state,
+                cu_seqlens=cu_seqlens,
+                prefill_metadata=adaptive_metadata,
+                target_segments=target_segments,
+                state_dtype=resolved_state_dtype,
+            )
+
+    # BV: tuned table, then hip LDS/CU rule; env override wins last.
     BV = _tuned_bv(
         H=H,
         Hg=Hg,
@@ -964,81 +1083,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     fs_shape = (N, H, V, K) if output_final_state else None
     fs_dtype = resolved_state_dtype if output_final_state else None
     save_vn = save_new_value
-
-    if g is not None:
-        if _opt_check():
-            if g.device != k.device:
-                raise ValueError(
-                    f"FlyDSL K5 opt: g must be on k's device ({k.device}), "
-                    f"got {g.device}."
-                )
-            if g.dim() != 3:
-                raise ValueError(
-                    f"FlyDSL K5 opt: `g` must be 3-D, got shape {tuple(g.shape)}."
-                )
-            expected_g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
-            if tuple(g.shape) != expected_g_shape:
-                layout = (
-                    "head-major [B, H, T]" if g_head_major else "token-major [B, T, H]"
-                )
-                raise ValueError(
-                    f"FlyDSL K5 opt: `g` shape mismatch, expected "
-                    f"{expected_g_shape} for {layout} layout, got {tuple(g.shape)}."
-                )
-        if g.dtype != torch.float32:
-            g = g.to(torch.float32)
-        g = _as_contiguous(g)
-
-    if gk is not None:
-        gk = _as_contiguous(gk)
-        if g_log2_scaled:
-            gk = gk * _RCP_LN2
-
-    if (
-        B == 1
-        and use_g
-        and not use_gk
-        and K == V == 128
-        and BT == 64
-        and num_decodes == num_decode_tokens == 0
-        and not use_state_indices
-        and _total_chunks >= 128
-        and k.dtype == w.dtype == u.dtype == torch.bfloat16
-        and snapshot_bf16
-        and output_final_state
-        and save_new_value
-        and not inplace
-        and g_head_major
-        and use_exp2
-        and bf16_convert_trunc
-        and k.is_cuda
-        and _IS_GFX950
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        lengths = _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata)
-        chunk_counts = tuple(triton.cdiv(length, BT) for length in lengths)
-        if (
-            all(length > 0 for length in lengths)
-            and max(chunk_counts) >= _BLOCKED_MIN_CHUNKS
-        ):
-            target_segments = _GDN_K5_TARGET_SEGMENTS
-            # K5 requires its own blocks when shared metadata uses scalar sizing.
-            adaptive_metadata = _resolve_adaptive_k5_metadata(
-                cu_seqlens, T_flat, k.device, target_segments, lengths=lengths
-            )
-            total_blocks = adaptive_metadata.get_chunk_schedule(64).total_blocks
-            if total_blocks * H <= _BLOCKED_MAX_WORK_PER_CHUNK * max(chunk_counts):
-                return _chunk_gated_delta_rule_fwd_h_blocked(
-                    k,
-                    w,
-                    u,
-                    g,
-                    initial_state,
-                    cu_seqlens=cu_seqlens,
-                    prefill_metadata=adaptive_metadata,
-                    target_segments=target_segments,
-                    state_dtype=resolved_state_dtype,
-                )
 
     h = k.new_empty(h_shape, dtype=resolved_snapshot_dtype)
     v_new_buf = k.new_empty(vn_shape, dtype=vn_dtype)
