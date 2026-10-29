@@ -4,10 +4,9 @@
 """Graph-buffer registration must stay in step across ranks.
 
 On the registered capture path an fp32/fp16 all-reduce records both its input
-and its output (bf16 records the input only). gfx1250 records the input only,
-and nothing for a message its LL kernel takes, so it runs a larger shape.
-After capture, flush_graph_buffers exchanges each rank's list, and
-register_graph_buffers pairs buffer i with every peer's buffer i.
+and its output (bf16 records the input only). After capture,
+flush_graph_buffers exchanges each rank's list, and register_graph_buffers
+pairs buffer i with every peer's buffer i.
 
 register_graph_buffers used to also add each captured output to the map of
 eagerly registered outputs. A later capture consults that map before recording,
@@ -106,8 +105,7 @@ def _worker(tp_size, rankID, scenario, shape):
         graph1.replay()
         torch.cuda.synchronize()
         got1 = out1.cpu()
-        per_call = 1 if ca_comm._is_gfx1250 else 2
-        return {"counts": counts, "per_call": per_call, "out1": got1, "out2": got2}
+        return {"counts": counts, "out1": got1, "out2": got2}
     finally:
         destroy_dist_env()
 
@@ -141,10 +139,10 @@ def test_graph_buffer_reuse(tp_size, shape, scenario):
         assert (
             "error" not in r
         ), f"{tag} rank {i}: the second capture must register: {r['error']}"
-        expected = [r["per_call"]] * 2
-        assert (
-            r["counts"] == expected
-        ), f"{tag} rank {i}: recorded {r['counts']} graph buffers, expected {expected}"
+        assert r["counts"] == [
+            2,
+            2,
+        ], f"{tag} rank {i}: recorded {r['counts']} graph buffers, expected [2, 2]"
     total = tp_size * (tp_size + 1) // 2
     for i, r in enumerate(rets):
         for name, scale in (("out1", 1), ("out2", 2)):
@@ -178,10 +176,7 @@ if __name__ == "__main__":
 
     n_gpu = torch.cuda.device_count()
     tp_sizes = args.tp_size or [tp for tp in (2, 4, 8) if tp <= n_gpu]
-    # 4 MiB of fp32 is still within gfx1250's LL range, which records nothing.
-    gfx1250 = "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
-    shape = (256, 8192) if gfx1250 else (128, 8192)
     for tp_size in tp_sizes:
         for scenario in args.scenario:
-            ret = test_graph_buffer_reuse(tp_size, shape, scenario)
+            ret = test_graph_buffer_reuse(tp_size, (128, 8192), scenario)
             print(f"tp_size={tp_size} scenario={scenario}: {ret}")
