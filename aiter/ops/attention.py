@@ -1775,6 +1775,17 @@ def _get_mla_decode_shape_support_cached(
             f"mla_reduce_v1 has no ({p.kernel_num_heads} heads, "
             f"head_dim {v_head_dim}) case"
         )
+    # The stage-1 asm kernels and opus_mla_decode_fwd are built for the 512-element
+    # MLA latent row, however many reduce cases exist for other head dims (those
+    # serve prefill).
+    bad_v_dim = (asm_route or backend is MlaBackend.OPUS) and v_head_dim != 512
+    if bad_v_dim:
+        kernels = (
+            "opus_mla_decode_fwd only supports"
+            if backend is MlaBackend.OPUS
+            else f"{backend.value} decode kernels only support"
+        )
+        reasons.append(f"{kernels} v_head_dim 512, got {v_head_dim}")
     if ps1_folded:
         reasons.append(
             f"{backend.value} kernels read unfolded heads; planner {planner} folds "
@@ -1801,6 +1812,7 @@ def _get_mla_decode_shape_support_cached(
     if (
         (persistent and not planner_accepts)
         or (persistent and not p.reduce_supported)
+        or bad_v_dim
         or ps1_folded
         or hk_problems
         or opus_problems
