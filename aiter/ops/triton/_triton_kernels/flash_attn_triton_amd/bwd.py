@@ -3415,9 +3415,19 @@ def _bwd_causal_dkdv_phase(
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
 
-            # One sweep over Q. The element mask handles the causal edge and tails.
-            for m_block in tl.range(tl.cdiv(seqlen_q, BLOCK_M1), num_stages=1):
-                offs_m = m_block * BLOCK_M1 + tl.arange(0, BLOCK_M1)
+            # Causality caps the right window at zero. Skip Q blocks that
+            # cannot attend this K block; the element mask handles edge tiles.
+            start_m, num_m_blocks = _sliding_window_q_bounds(
+                start_n,
+                seqlen_q,
+                seqlen_k,
+                WINDOW_SIZE_LEFT,
+                0,
+                BLOCK_N1,
+                BLOCK_M1,
+            )
+            for m_block in tl.range(num_m_blocks, num_stages=1):
+                offs_m = start_m + m_block * BLOCK_M1 + tl.arange(0, BLOCK_M1)
                 valid_m = offs_m < seqlen_q
                 qT = tl.load(
                     q_base
@@ -3617,9 +3627,19 @@ def _bwd_causal_dq_phase(
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
             dq = tl.zeros([BLOCK_M2, HEAD_DIM_QK], dtype=tl.float32)
 
-            # One sweep over K. The element mask handles the causal edge and tails.
-            for n_block in tl.range(tl.cdiv(seqlen_k, BLOCK_N2), num_stages=1):
-                offs_n = n_block * BLOCK_N2 + tl.arange(0, BLOCK_N2)
+            # Causality caps the right window at zero. Skip K blocks that
+            # cannot attend this Q block; the element mask handles edge tiles.
+            start_n, num_n_blocks = _sliding_window_k_bounds(
+                start_m,
+                seqlen_q,
+                seqlen_k,
+                WINDOW_SIZE_LEFT,
+                0,
+                BLOCK_M2,
+                BLOCK_N2,
+            )
+            for n_block in tl.range(num_n_blocks, num_stages=1):
+                offs_n = start_n + n_block * BLOCK_N2 + tl.arange(0, BLOCK_N2)
                 valid_n = offs_n < seqlen_k
                 kT = tl.load(
                     K + offs_n[None, :] * stride_kn + offs_d_qk[:, None] * stride_kd,
@@ -3690,7 +3710,7 @@ def _bwd_causal_dq_phase(
     key=CAUSAL_AUTOTUNE_KEYS,
 )
 @triton.jit
-def bwd_kernel_fused_causal(  # grid = (nheads_k, ceil(max_seqlen_q, max_seqlen_k) / BLOCK_N1), batch)
+def bwd_kernel_fused_causal(
     Q,
     K,
     V,
@@ -3781,11 +3801,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, ceil(max_seqlen_q, max_seqlen_
     WINDOW_SIZE_RIGHT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
-    COMPUTE_DQ: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
 ):
     hkid = remap_xcd(tl.program_id(0), HK, NUM_XCD)
-    pid = tl.program_id(1)
+    phase_pid = tl.program_id(1)
+    pid = phase_pid // 2
     bid = tl.program_id(2)
 
     q_start = 0
@@ -3817,7 +3837,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, ceil(max_seqlen_q, max_seqlen_
     DV += bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
     GROUP_SIZE: tl.constexpr = HQ // HK
 
-    if COMPUTE_DQ:
+    if phase_pid % 2:
         _bwd_causal_dq_phase(
             Q=Q,
             K=K,
@@ -4790,11 +4810,12 @@ def attention_backward_triton_impl(
 
         arch = get_arch()
         num_xcd = 1 if arch.is_rdna else 8
+        phase_count = 2 if causal else 1
 
         def grid(META):
             return (
                 nheads_k,
-                ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
+                phase_count * ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
                 batch,
             )
 
@@ -4802,100 +4823,98 @@ def attention_backward_triton_impl(
 
             if DEBUG_TRITON:
                 print(f"bwd_kernel: grid = {grid}")
-            # Keep the two phases in separate compiled programs; the combined
-            # gfx950 program aborts for causal d59 MQA with dropout and ALiBi.
-            for compute_dq in (False, True):
-                bwd_kernel_fused_causal[grid](
-                    q,
-                    k,
-                    v,
-                    sm_scale,
-                    do,
-                    dq,
-                    dk,
-                    dv,
-                    softmax_lse,
-                    delta,
-                    stride_qb,
-                    stride_qh,
-                    stride_qm,
-                    stride_qd,
-                    stride_kb,
-                    stride_kh,
-                    stride_kn,
-                    stride_kd,
-                    stride_vb,
-                    stride_vh,
-                    stride_vn,
-                    stride_vd,
-                    stride_dqb,
-                    stride_dqh,
-                    stride_dqm,
-                    stride_dqd,
-                    stride_dkb,
-                    stride_dkh,
-                    stride_dkn,
-                    stride_dkd,
-                    stride_dvb,
-                    stride_dvh,
-                    stride_dvn,
-                    stride_dvd,
-                    stride_lse_b,
-                    stride_lse_h,
-                    stride_lse_m,
-                    stride_delta_b,
-                    stride_delta_h,
-                    stride_delta_m,
-                    stride_dob,
-                    stride_doh,
-                    stride_dom,
-                    stride_dod,
-                    stride_dropoutb,
-                    stride_dropouth,
-                    stride_dropoutm,
-                    stride_dropoutn,
-                    stride_descale_q_z,
-                    stride_descale_k_z,
-                    stride_descale_v_z,
-                    stride_az,
-                    stride_ah,
-                    nheads_q,
-                    nheads_k,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    seqused_q,
-                    seqused_k,  # Pass seqused tensors
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    dropout_mask,
-                    dropout_p,
-                    philox_seed,
-                    philox_offset,
-                    alibi_slopes,
-                    descale_q,
-                    descale_k,
-                    descale_v,
-                    HEAD_DIM_QK=HEAD_DIM_QK,
-                    HEAD_DIM_V=HEAD_DIM_V,
-                    ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
-                    ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
-                    ENABLE_DROPOUT=use_dropout,
-                    IS_VARLEN=IS_VARLEN,
-                    USE_ALIBI=use_alibi,
-                    USE_EXP2=use_exp2,
-                    IS_FP8=IS_FP8,
-                    FP8_MAX=FP8_MAX,
-                    USE_SEQUSED=(
-                        seqused_q is not None or seqused_k is not None
-                    ),  # Add flag for seqused
-                    USE_SLIDING_WINDOW=use_sliding_window,
-                    WINDOW_SIZE_LEFT=window_size_left,
-                    WINDOW_SIZE_RIGHT=window_size_right,
-                    DEBUG_TRITON=DEBUG_TRITON,
-                    DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
-                    COMPUTE_DQ=compute_dq,
-                    NUM_XCD=num_xcd,
-                )
+
+            # Alternate dK/dV and dQ programs within one launch.
+            bwd_kernel_fused_causal[grid](
+                q,
+                k,
+                v,
+                sm_scale,
+                do,
+                dq,
+                dk,
+                dv,
+                softmax_lse,
+                delta,
+                stride_qb,
+                stride_qh,
+                stride_qm,
+                stride_qd,
+                stride_kb,
+                stride_kh,
+                stride_kn,
+                stride_kd,
+                stride_vb,
+                stride_vh,
+                stride_vn,
+                stride_vd,
+                stride_dqb,
+                stride_dqh,
+                stride_dqm,
+                stride_dqd,
+                stride_dkb,
+                stride_dkh,
+                stride_dkn,
+                stride_dkd,
+                stride_dvb,
+                stride_dvh,
+                stride_dvn,
+                stride_dvd,
+                stride_lse_b,
+                stride_lse_h,
+                stride_lse_m,
+                stride_delta_b,
+                stride_delta_h,
+                stride_delta_m,
+                stride_dob,
+                stride_doh,
+                stride_dom,
+                stride_dod,
+                stride_dropoutb,
+                stride_dropouth,
+                stride_dropoutm,
+                stride_dropoutn,
+                stride_descale_q_z,
+                stride_descale_k_z,
+                stride_descale_v_z,
+                stride_az,
+                stride_ah,
+                nheads_q,
+                nheads_k,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,  # Pass seqused tensors
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_mask,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                alibi_slopes,
+                descale_q,
+                descale_k,
+                descale_v,
+                HEAD_DIM_QK=HEAD_DIM_QK,
+                HEAD_DIM_V=HEAD_DIM_V,
+                ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
+                ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
+                ENABLE_DROPOUT=use_dropout,
+                IS_VARLEN=IS_VARLEN,
+                USE_ALIBI=use_alibi,
+                USE_EXP2=use_exp2,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                USE_SEQUSED=(
+                    seqused_q is not None or seqused_k is not None
+                ),  # Add flag for seqused
+                USE_SLIDING_WINDOW=use_sliding_window,
+                WINDOW_SIZE_LEFT=window_size_left,
+                WINDOW_SIZE_RIGHT=window_size_right,
+                DEBUG_TRITON=DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                NUM_XCD=num_xcd,
+            )
         else:
             bwd_kernel_fused_noncausal[grid](
                 q,
