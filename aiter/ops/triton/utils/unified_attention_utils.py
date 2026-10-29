@@ -69,6 +69,8 @@ _AXIS_KIND = {
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
     "DT": "enum",  # (q dtype tag, kv dtype tag)
+    # 2d programs per CU, rounded up to a power of 2, so P bounds must be powers of 2
+    "P": "num",
 }
 
 
@@ -221,6 +223,7 @@ def _axis_values(
     block_size,
     q_dtype,
     kv_dtype,
+    programs_per_cu,
     num_queries_per_kv=1,
 ) -> dict:
     return {
@@ -232,7 +235,12 @@ def _axis_values(
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype)),
+        "P": programs_per_cu,
     }
+
+
+def _programs_per_cu(params) -> int:
+    return triton.next_power_of_2(triton.cdiv(params.num_2d_prgms, params.num_sms))
 
 
 def _load(op: str, backend, arch: str | None) -> tuple:
@@ -270,6 +278,7 @@ def _get_unified_attention_config_cached(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     block_size: int,
+    programs_per_cu: int,
     backend: str,
     arch: str | None,
     num_queries_per_kv: int = 1,
@@ -288,6 +297,7 @@ def _get_unified_attention_config_cached(
         block_size,
         q_dtype,
         kv_dtype,
+        programs_per_cu,
         num_queries_per_kv,
     )
     _, config = _lookup(table, axes, values)
@@ -324,6 +334,7 @@ def get_unified_attention_config(
         params.q_dtype,
         params.kv_cache_dtype,
         params.block_size,
+        _programs_per_cu(params),
         backend,
         arch,
         params.num_queries_per_kv,
@@ -345,6 +356,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.block_size,
         params.q_dtype,
         params.kv_cache_dtype,
+        _programs_per_cu(params),
         params.num_queries_per_kv,
     )
     key, config = _lookup(table, axes, values)

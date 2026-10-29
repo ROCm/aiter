@@ -83,7 +83,6 @@ class AttentionConfig:
     stride_v_cache_1: gl.constexpr
     stride_v_cache_2: gl.constexpr
     stride_v_cache_3: gl.constexpr
-    block_table_stride: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -119,7 +118,6 @@ class AttentionConfig:
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
-        block_table_stride,
     ):
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -230,7 +228,6 @@ class AttentionConfig:
         self.stride_v_cache_1 = gl.constexpr(stride_v_cache_1)
         self.stride_v_cache_2 = gl.constexpr(stride_v_cache_2)
         self.stride_v_cache_3 = gl.constexpr(stride_v_cache_3)
-        self.block_table_stride = gl.constexpr(block_table_stride)
 
 
 @aggregate
@@ -292,6 +289,7 @@ class TDMKVLoader:
     k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
     v_desc: gl.amd.gfx1250.tdm.tensor_descriptor
     kv_head_idx: gl.tensor
+    block_table_stride: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -304,6 +302,7 @@ class TDMKVLoader:
         k_desc,
         v_desc,
         kv_head_idx,
+        block_table_stride,
     ):
         self.cfg = cfg
         self.kv_cfg = kv_cfg
@@ -313,6 +312,7 @@ class TDMKVLoader:
         self.v_desc = v_desc
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
         self.kv_head_idx = kv_head_idx
+        self.block_table_stride = block_table_stride
 
     @gluon.jit
     def initialize(
@@ -321,6 +321,7 @@ class TDMKVLoader:
         value_cache_ptr,
         block_tables_ptr_shifted,
         kv_head_idx,
+        block_table_stride,
         REMOVE_INDIRECT_ACCESS,
     ):
         kv_cfg = TDMKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
@@ -387,6 +388,7 @@ class TDMKVLoader:
             k_desc,
             v_desc,
             kv_head_idx,
+            block_table_stride,
         )
 
     @gluon.jit
@@ -461,7 +463,7 @@ class TDMKVLoader:
             return i
         else:
             # return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.block_table_stride, other=0)
-            i = gl.minimum(i, self.cfg.block_table_stride - 1)
+            i = gl.minimum(i, self.block_table_stride - 1)
             return gl.load(self.block_tables_ptr_shifted + i)
 
     @gluon.jit
@@ -509,6 +511,7 @@ class TDMGatherKVLoader:
     k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
     v_desc: gl.amd.gfx1250.tdm.tensor_descriptor
     kv_head_idx: gl.tensor
+    block_table_stride: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -521,6 +524,7 @@ class TDMGatherKVLoader:
         k_desc,
         v_desc,
         kv_head_idx,
+        block_table_stride,
     ):
         self.cfg = cfg
         self.kv_cfg = kv_cfg
@@ -530,6 +534,7 @@ class TDMGatherKVLoader:
         self.v_desc = v_desc
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
         self.kv_head_idx = kv_head_idx
+        self.block_table_stride = block_table_stride
 
     @gluon.jit
     def initialize(
@@ -538,6 +543,7 @@ class TDMGatherKVLoader:
         value_cache_ptr,
         block_tables_ptr_shifted,
         kv_head_idx,
+        block_table_stride,
         REMOVE_INDIRECT_ACCESS,
     ):
         kv_cfg = TDMKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
@@ -584,6 +590,7 @@ class TDMGatherKVLoader:
             k_desc,
             v_desc,
             kv_head_idx,
+            block_table_stride,
         )
 
     @gluon.jit
@@ -649,7 +656,7 @@ class TDMGatherKVLoader:
             offs = i * self.cfg.NUM_KV_BLOCKS + gl.arange(
                 0, self.cfg.NUM_KV_BLOCKS, layout=self.kv_cfg.gather_ids_layout
             )
-            offs = offs % self.cfg.block_table_stride
+            offs = offs % self.block_table_stride
             # TODO: it is unlikely but do we have a risk of int32 overflow?
             return gl.load(self.block_tables_ptr_shifted + offs)
 
@@ -1842,7 +1849,10 @@ unified_attention_gluon_kernel_2d_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=unified_attention_gluon_kernel_2d_repr)
+@gluon.jit(
+    repr=unified_attention_gluon_kernel_2d_repr,
+    do_not_specialize=["block_table_stride", "num_seqs"],
+)
 def _unified_attention_gluon_kernel_2d(
     query_ptr,  # [num_tokens, num_query_heads, head_size]
     key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
@@ -1871,8 +1881,8 @@ def _unified_attention_gluon_kernel_2d(
     stride_v_cache_1: gl.constexpr,
     stride_v_cache_2: gl.constexpr,
     stride_v_cache_3: gl.constexpr,
-    block_table_stride: gl.constexpr,
-    num_seqs: gl.constexpr,
+    block_table_stride,
+    num_seqs,
     SCALE: gl.constexpr,
     NUM_QUERY_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
@@ -1944,7 +1954,6 @@ def _unified_attention_gluon_kernel_2d(
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
-        block_table_stride,
     )
 
     if SPEC_DECODE:
@@ -2075,6 +2084,7 @@ def _unified_attention_gluon_kernel_2d(
         value_cache_ptr,
         block_tables_ptr_shifted,
         kv_head_idx,
+        block_table_stride,
         REMOVE_INDIRECT_ACCESS,
     )
 
