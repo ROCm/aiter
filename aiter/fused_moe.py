@@ -862,10 +862,13 @@ def _stage2_honors_runtime_reduce_override(stage2: Callable) -> bool:
             "Runtime reduce overrides require a recognized FlyDSL stage2 "
             f"kernel, got {kernel_name!r}"
         )
-    # The a16w-mix launcher returns before the environment override. Both
-    # MXFP4 and INT4 follow only their configured kernel mode.
+    # The a16w-mix launcher returns before the environment override.
+    # MXFP4 and INT4 follow only their configured kernel mode. BF16 has no
+    # reduce epilogue and stays atomic, so AITER_FLYDSL_FORCE_REDUCE must
+    # not skip the output zero-init (the atomic would add into stale memory).
     return not (
-        parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") in ("fp4", "int4")
+        parsed.get("a_dtype") == "bf16"
+        and parsed.get("b_dtype") in ("fp4", "int4", "bf16")
     )
 
 

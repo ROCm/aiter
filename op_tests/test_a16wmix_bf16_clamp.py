@@ -204,6 +204,22 @@ def test_a16w16_kernel_names_are_registered():
     assert p2["mode"] == "atomic"
 
 
+def test_a16w16_force_reduce_stays_atomic(monkeypatch):
+    """BF16 stage2 has no reduce epilogue, so FORCE_REDUCE must keep the zero-init."""
+    import functools
+
+    from aiter.fused_moe import (
+        _flydsl_stage2_wrapper,
+        _stage2_honors_runtime_reduce_override,
+        _stage2_runtime_uses_route_reduce,
+    )
+
+    monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "1")
+    stage2 = functools.partial(_flydsl_stage2_wrapper, kernelName=_A16W16_S2)
+    assert not _stage2_honors_runtime_reduce_override(stage2)
+    assert not _stage2_runtime_uses_route_reduce(stage2, 4, 8192)
+
+
 def test_silu_mul_batch_shared_helper_is_unclamped():
     """mixed_moe clamps before calling silu_mul_batch; do not put the clamp in
     the shared helper (that would double-clamp mixed_moe)."""
