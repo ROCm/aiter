@@ -1330,9 +1330,10 @@ def _mhc_identity_pre(n: int, hc_mult: int, device) -> torch.Tensor:
     """(n, hc_mult) fp32 rows [1, 0, ..., 0]: the identity pre gate of one launch
     (n <= MHC_SEAM_MAX_T_PER_LAUNCH). Built once per device with
     MHC_SEAM_MAX_T_PER_LAUNCH rows and never replaced, so the identity costs no kernels
-    and a CUDA graph that captured a slice of it keeps reading live memory. Built per
-    call while a CUDA graph is being captured before the buffer exists (the cached
-    buffer must not be initialised inside a graph)."""
+    and a CUDA graph that captured a slice of it keeps reading live memory. The first
+    fill is synchronised once, so calls on other streams never read it half written.
+    Built per call while a CUDA graph is being captured before the buffer exists (the
+    cached buffer must not be initialised inside a graph)."""
     key = (str(device), hc_mult)
     buf = _MHC_IDENTITY_PRE.get(key)
     if buf is None:
@@ -1342,6 +1343,7 @@ def _mhc_identity_pre(n: int, hc_mult: int, device) -> torch.Tensor:
         buf[:, 0] = 1.0
         if capturing:
             return buf
+        torch.cuda.current_stream(device).synchronize()
         _MHC_IDENTITY_PRE[key] = buf
     return buf[:n]
 
@@ -1380,7 +1382,8 @@ def mhc_fused_post_pre_delayed_fake(
     m, hc_mult, hidden_size = residual.shape
     device = residual.device
     return (
-        torch.empty_like(residual),
+        # the op makes residual contiguous, so residual_out is contiguous too
+        torch.empty(residual.shape, dtype=residual.dtype, device=device),
         torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device),
         torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device),
         torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device),
@@ -1477,6 +1480,11 @@ def mhc_fused_post_pre_delayed(
     _mhc_seam_check("comb_res_mix", comb_res_mix, device, fp32, (m, hc_mult, hc_mult))
     if pre_mix is not None:
         _mhc_seam_check("pre_mix", pre_mix, device, fp32, *gate_shapes)
+    if sinkhorn_repeat < 1:
+        raise ValueError(
+            "mhc_fused_post_pre_delayed: sinkhorn_repeat must be >= 1, got "
+            f"{sinkhorn_repeat}"
+        )
     residual = residual.contiguous()
     sublayer_out = sublayer_out.contiguous()
     fn = fn.contiguous()

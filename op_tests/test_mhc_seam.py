@@ -38,13 +38,14 @@ untouched.
 Launch split, graphs and compile: T = 65536 + 37 (two launches, byte offsets past 2^31)
 with carried and identity pre gate against the same references; CUDA graphs captured at
 16 and 128 tokens replay bit-exact after that larger eager call (which must not free a
-buffer a graph reads); ``torch.compile(fullgraph=True, dynamic=True)`` equals eager bit for
-bit.
+buffer a graph reads); a graph captured with the identity gate while its cache is empty
+replays bit-exact; ``torch.compile(fullgraph=True, dynamic=True)`` equals eager bit for
+bit, also for a permuted (non-contiguous) residual.
 
 Guards: m = 0 gives empty results of the right shapes; hidden_size 4096 and 7168,
 hc_mult 2 and another arch raise NotImplementedError pointing to
 mhc_fused_post_pre_delayed_asm_supported; a tensor of the wrong shape or on the wrong
-device raises ValueError and of the wrong dtype TypeError, before any launch; a wrongly
+device, or sinkhorn_repeat < 1, raises ValueError and of the wrong dtype TypeError, before any launch; a wrongly
 shaped, typed or placed tensor passed to the ASM bindings directly fails a check in the C
 loader and raises RuntimeError (the process continues).
 """
@@ -584,6 +585,25 @@ def check_input_errors():
             "comb_res_mix has shape",
             call(comb_res_mix=inp["comb_res_mix"].reshape(m, HC * HC)),
         ),
+        "sinkhorn_repeat 0": (
+            ValueError,
+            "sinkhorn_repeat must be >= 1",
+            lambda: aiter.mhc_fused_post_pre_delayed(
+                inp["residual"],
+                inp["fn"],
+                inp["hc_scale"],
+                inp["hc_base"],
+                RMS_EPS,
+                HC_EPS,
+                HC_EPS,
+                POST_MULT,
+                0,
+                inp["pre_mix"],
+                inp["sublayer_out"],
+                inp["post_layer_mix"],
+                inp["comb_res_mix"],
+            ),
+        ),
     }
     failed = 0
     for name, (exc_type, expect, fn) in cases.items():
@@ -681,6 +701,41 @@ def check_graphs_and_launch_split(aiter_mhc, seed):
     return failed
 
 
+def check_graph_cold_identity(aiter_mhc, seed):
+    """A CUDA graph captured with the identity pre gate while the identity cache is
+    empty (the buffer is then built inside the capture) replays equal to eager, and the
+    capture leaves the cache empty. Returns the failure count."""
+    m = 16
+    inp = make_inputs(m, 5120, seed=seed + 5)
+    args = [inp[k] for k in SEAM_ARGS + GATE_ARGS]
+    eager = [t.clone() for t in seam_new(*args, None)]
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        seam_new(*args, inp["pre_mix"])  # warm-up that does not touch the identity
+    torch.cuda.current_stream().wait_stream(side)
+    aiter_mhc._MHC_IDENTITY_PRE.clear()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = seam_new(*args, None)
+    failed = 0
+    if aiter_mhc._MHC_IDENTITY_PRE:
+        aiter.logger.error("graph with a cold identity cache: capture filled the cache")
+        failed += 1
+    junk = [torch.full((65536, HC), float("nan")) for _ in range(16)]
+    graph.replay()
+    torch.cuda.synchronize()
+    if outputs_equal(out, eager):
+        aiter.logger.info("graph with a cold identity cache: replay equals eager")
+    else:
+        aiter.logger.error(
+            "graph with a cold identity cache: replay differs from eager"
+        )
+        failed += 1
+    del junk, graph
+    return failed
+
+
 def check_compile(seed):
     """torch.compile(fullgraph=True, dynamic=True) equals eager bit for bit. Returns the
     failure count."""
@@ -698,6 +753,25 @@ def check_compile(seed):
             else:
                 aiter.logger.error("compile m=%d identity_pre=%s differs", m, identity)
                 failed += 1
+    # a permuted (non-contiguous) residual: the op copies it, so the outputs are
+    # contiguous, and the fake must say so
+    inp = make_inputs(64, 5120, seed=seed + 7)
+    args = [inp[k] for k in SEAM_ARGS + GATE_ARGS]
+    args[0] = args[0].transpose(1, 2).contiguous().transpose(1, 2)
+    try:
+        same = outputs_equal(
+            compiled(*args, inp["pre_mix"]), seam_new(*args, inp["pre_mix"])
+        )
+    except Exception as exc:  # noqa: BLE001
+        aiter.logger.error(
+            "compile permuted residual: %s: %s", type(exc).__name__, str(exc)[:300]
+        )
+        same = False
+    if same:
+        aiter.logger.info("compile permuted residual equals eager")
+    else:
+        aiter.logger.error("compile permuted residual differs from eager")
+        failed += 1
     return failed
 
 
@@ -779,6 +853,7 @@ def main():
     failed += check_loader_errors(aiter_mhc)
     failed += check_input_errors()
     failed += check_compile(args.seed)
+    failed += check_graph_cold_identity(aiter_mhc, args.seed)
     failed += check_graphs_and_launch_split(aiter_mhc, args.seed)
     aiter.logger.info("test_mhc_seam: %d failure(s)", failed)
     return 1 if failed else 0
