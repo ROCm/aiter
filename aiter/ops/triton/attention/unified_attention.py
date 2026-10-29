@@ -13,7 +13,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
     get_dtype_str,
@@ -64,6 +64,16 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
 
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
+
+
+# Length-aware split work items per KV head dealt out in a row, per XCD. 16 per
+# XCD (128 on gfx950) measured best: 8 KV heads at 1 run per XCD lost ~10%.
+_LENGTH_AWARE_RUNS_PER_XCD = 16
+
+
+def _length_aware_seq_block(num_seqs: int) -> int:
+    """Lanes the length-aware split reads the batch's KV lengths in, per step."""
+    return min(256, max(64, triton.next_power_of_2(num_seqs)))
 
 
 def _is_gluon_available():
@@ -136,6 +146,37 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+
+
+def _length_aware_split_budget(config, params: _UAParams, num_segments: int):
+    """Segments per KV head the length-aware KV split shares out, or None when off.
+
+    A kv_split entry opts in with SPLIT_PROGRAMS_PER_CU, for batches where every
+    sequence fits one query block (decode, short verify queries). NUM_SEGMENTS
+    then only caps one sequence's split and sizes the partial buffers: each
+    sequence takes a share of num_sms * SPLIT_PROGRAMS_PER_CU working programs
+    by its KV length, read on the GPU (see seq_num_segments), so a CUDA graph
+    captured with the 1M max_seqlen_k bound still splits by the real lengths.
+    skip_reduce keeps the uniform split: its caller merges NUM_SEGMENTS slots.
+    """
+    per_cu = config.get("SPLIT_PROGRAMS_PER_CU")
+    if per_cu is None or num_segments == 1 or params.skip_reduce:
+        return None
+    if not params.all_decode and params.max_seqlen_q > _attn_3d_block_q(params):
+        return None
+    budget = max(1, params.num_sms * per_cu // params.num_kv_heads)
+    # the kernels sum the KV lengths in int32 and pack work-item counts in 16 bits
+    if params.num_seqs * params.max_seqlen_k >= 2**31:
+        return None
+    if budget + params.num_seqs >= 2**16:
+        return None
+    return budget
+
+
+def _attn_3d_block_q(params: _UAParams) -> int:
+    config = get_unified_attention_config("attn_3d", params, backend="triton")
+    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    return block_m // params.num_queries_per_kv
 
 
 def _gfx950_gluon_supported(params: _UAParams):
@@ -423,6 +464,11 @@ def unified_attention(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
         NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
+        split_budget = (
+            None
+            if use_gluon_3d
+            else _length_aware_split_budget(config, params, NUM_SEGMENTS)
+        )
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -488,6 +534,7 @@ def unified_attention(
                 segm_expsum,
                 NUM_SEGMENTS,
                 TILE_SIZE,
+                split_budget,
             )
 
         if NUM_SEGMENTS == 1:
@@ -520,6 +567,7 @@ def unified_attention(
                 segm_expsum,
                 NUM_SEGMENTS,
                 TILE_SIZE,
+                split_budget,
             )
     return out
 
@@ -668,6 +716,7 @@ def _unified_attention_3d_triton(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    split_budget=None,
 ):
     config = get_unified_attention_config("attn_3d", params, backend="triton")
     config["BLOCK_M"] = max(
@@ -680,10 +729,27 @@ def _unified_attention_3d_triton(
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
+    grid = (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
+    length_aware = {}
+    if split_budget is not None:
+        # one program per (sequence, segment) work item and KV head: the
+        # per-sequence floor shares sum to at most split_budget + num_seqs, and
+        # no sequence takes more than NUM_SEGMENTS. Items are dealt out in runs
+        # of ITEM_RUN, once per head; a multiple of the XCD count keeps every
+        # head of an item on one XCD, so they share its L2.
+        item_run = _LENGTH_AWARE_RUNS_PER_XCD * get_num_xcds()
+        num_items = min(split_budget + params.num_seqs, params.num_seqs * NUM_SEGMENTS)
+        num_items = triton.cdiv(num_items, item_run) * item_run
+        grid = (num_items * params.num_kv_heads, 1, 1)
+        length_aware = {
+            "split_budget": split_budget,
+            "LENGTH_AWARE_SPLIT": True,
+            "SEQ_BLOCK": _length_aware_seq_block(params.num_seqs),
+            "ITEM_RUN": item_run,
+            "num_tokens": params.num_tokens,
+        }
 
-    kernel_unified_attention_3d[
-        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
-    ](
+    kernel_unified_attention_3d[grid](
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
@@ -738,6 +804,7 @@ def _unified_attention_3d_triton(
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
+        **length_aware,
         **config,
         enable_fp_fusion=True,
     )
@@ -750,9 +817,23 @@ def _reduce_segments_triton(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    split_budget=None,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
+    length_aware = {}
+    if split_budget is not None:
+        # merge as many slots per step as a sequence of an even batch uses, so
+        # the usual merge is one step and only an outsized sequence loops
+        even_share = triton.cdiv(split_budget, params.num_seqs)
+        length_aware = {
+            "split_budget": split_budget,
+            "LENGTH_AWARE_SPLIT": True,
+            "SEQ_BLOCK": _length_aware_seq_block(params.num_seqs),
+            "LENGTH_AWARE_SEGMENT_BLOCK": min(
+                NUM_SEGMENTS, max(16, triton.next_power_of_2(even_share))
+            ),
+        }
     v_head_size_padded = triton.next_power_of_2(params.head_size_v)
     num_d_blocks = triton.cdiv(
         v_head_size_padded, config.get("BLOCK_D") or v_head_size_padded
@@ -778,6 +859,7 @@ def _reduce_segments_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         BLOCK_Q=None,
+        **length_aware,
         **config,
         enable_fp_fusion=True,
     )
