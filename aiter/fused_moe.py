@@ -271,8 +271,14 @@ kernel_bench_callable = None
 _PRESORTED_MOE = threading.local()
 # The only block size a presort is accepted for; other tile sizes re-sort.
 _PRESORTED_MOE_BLOCK_M = 16
+# Reasons a registration was ignored, so each one is logged only once.
+_PRESORTED_MOE_IGNORED = set()
 
 
+# Under torch.compile, dynamo defers this thread-local store until the graph has
+# run, so the compiled fused_moe ops would read the previous step's registration.
+# Running it eagerly (a graph break) keeps it ordered before its consumer.
+@torch.compiler.disable
 def register_presorted_moe(aux: dict | None) -> None:
     """Hand the next fused_moe call on this thread a precomputed BM=16 sort.
 
@@ -284,12 +290,13 @@ def register_presorted_moe(aux: dict | None) -> None:
     everything else, sorted_expert_ids with one entry per 16 sorted rows,
     sorted_weights and m_indices at least as long as sorted_token_ids,
     reverse_sorted with M * topk entries and num_valid_ids with 2. A
-    registration that does not match the call or breaks this layout is ignored,
-    and fused_moe runs its own sort.
+    registration that does not match the call or breaks this layout is ignored
+    (logged once per reason), and fused_moe runs its own sort.
 
     Set moe_buf_zeroed and moe_buf_ptr when the caller already zeroed the buffer
-    it will pass as ``output``; fused_moe then skips its own zeroing. Without
-    ``output`` fused_moe always zeroes the buffer it allocates. That
+    it will pass as ``output``; fused_moe then skips its own zeroing and launches
+    only the two GEMMs. Without ``output`` fused_moe always zeroes the buffer it
+    allocates, so the skipped sort launch is replaced by a fill. That
     decision is made in Python, so under CUDA graphs it is frozen at capture:
     the caller's zeroing must run on the current stream before fused_moe on
     every call and be captured in the same graph (e.g. inside the caller's
@@ -298,8 +305,12 @@ def register_presorted_moe(aux: dict | None) -> None:
     The next fused_moe consumes the registration on every path, whether or not
     it matches or is used, so a stale registration never applies to a later
     call. A caller that registers and then does not call fused_moe must clear it
-    with ``register_presorted_moe(None)``. It is only used when the call runs with block_m == 16 and without
-    expert_mask or num_local_tokens; other calls run fused_moe's own sort.
+    with ``register_presorted_moe(None)``. It is only used when the call runs
+    with block_m == 16 and without expert_mask or num_local_tokens; other calls
+    run fused_moe's own sort.
+
+    Under torch.compile this call runs eagerly, so it stays ordered before the
+    fused_moe that consumes it; a ``fullgraph=True`` compile rejects it instead.
     """
     _PRESORTED_MOE.aux = aux
 
@@ -308,6 +319,17 @@ def _pop_presorted_moe():
     aux = getattr(_PRESORTED_MOE, "aux", None)
     _PRESORTED_MOE.aux = None
     return aux
+
+
+def _presorted_moe_ignored(reason):
+    # A caller that, e.g., omits a key would otherwise lose the presort on every
+    # call without a trace.
+    if reason not in _PRESORTED_MOE_IGNORED:
+        _PRESORTED_MOE_IGNORED.add(reason)
+        logger.warning(
+            f"[fused_moe] registered presort ignored ({reason}); "
+            "fused_moe runs its own sort"
+        )
 
 
 def _match_presorted_moe(
@@ -321,23 +343,35 @@ def _match_presorted_moe(
     expert_mask=None,
     num_local_tokens=None,
 ):
-    if not aux or int(block_m) != _PRESORTED_MOE_BLOCK_M:
+    if not aux:
+        return None
+    if int(block_m) != _PRESORTED_MOE_BLOCK_M:
+        _presorted_moe_ignored(f"block_m={block_m}")
         return None
     # The presort has no expert mask applied and covers every row of topk_ids;
     # moe_sorting honors both, so a masked or row-limited call must re-sort.
     if expert_mask is not None or num_local_tokens is not None:
+        _presorted_moe_ignored("expert_mask or num_local_tokens is set")
         return None
-    if (
-        int(aux.get("topk_ids_ptr", 0)) != int(topk_ids.data_ptr())
+    for key, expected in (
+        ("topk_ids_ptr", topk_ids.data_ptr()),
         # sorted_weights were gathered from this tensor.
-        or int(aux.get("topk_weights_ptr", 0)) != int(topk_weight.data_ptr())
-        or int(aux.get("M", -1)) != int(topk_ids.shape[0])
-        or int(aux.get("block_m", -1)) != int(block_m)
-        or int(aux.get("num_experts", -1)) != int(num_experts)
-        or int(aux.get("topk", -1)) != int(topk)
+        ("topk_weights_ptr", topk_weight.data_ptr()),
+        ("M", topk_ids.shape[0]),
+        ("block_m", block_m),
+        ("num_experts", num_experts),
+        ("topk", topk),
     ):
+        if key not in aux:
+            _presorted_moe_ignored(f"no {key}")
+            return None
+        if int(aux[key]) != int(expected):
+            _presorted_moe_ignored(f"{key} does not match the call")
+            return None
+    if not _presorted_layout_ok(aux, topk_ids, topk, num_experts):
+        _presorted_moe_ignored("sort tensors break the BM=16 sort layout")
         return None
-    return aux if _presorted_layout_ok(aux, topk_ids, topk, num_experts) else None
+    return aux
 
 
 def _presorted_layout_ok(aux, topk_ids, topk, num_experts):
@@ -1939,6 +1973,8 @@ def _fused_moe_impl(
             f"kernel block size {metadata.block_m}"
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    if presorted_aux and not metadata.output_aux:
+        _presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
             FusedMoeRequest(
