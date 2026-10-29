@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""High-level FlyDSL Flash Attention APIs (gfx1201 / RDNA4).
+"""High-level FlyDSL Flash Attention APIs.
 
-Wraps the FlyDSL `flash_attn_func_gfx1201` kernel with:
+``flydsl_flash_attn_batch_fwd`` / ``flydsl_flash_attn_varlen_fwd`` dispatch by
+arch and dtype: gfx950 fp8 to ``kernels/fmha_gfx950``, gfx1250 bf16/f16 to the
+m32x8 prefill kernel, anything else ``None`` so the caller falls through to
+CK/Triton.
+
+``flydsl_flash_attn_func`` (gfx1201 / RDNA4) wraps the
+`flash_attn_func_gfx1201` kernel with:
   - Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz).
   - Automatic seq_len padding to the kernel's tile size (multiple of 128).
   - BSHD ([B, S, H, D]) input/output convention to match upstream
@@ -27,12 +33,35 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
-from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    TORCH_O_DTYPE as _A8W8_GFX1250_OUT_DTYPE,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_a8w8_m32x8_supported as flash_attn_a8w8_gfx1250_supported,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_batch_a8w8_m32x8 as flash_attn_batch_a8w8_gfx1250,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_varlen_a8w8_m32x8 as flash_attn_varlen_a8w8_gfx1250,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    flash_attn_a16w16_m32x8_supported as flash_attn_a16w16_gfx1250_supported,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    flash_attn_batch_m32x8 as flash_attn_batch_a16w16_gfx1250,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    flash_attn_varlen_m32x8 as flash_attn_varlen_a16w16_gfx1250,
+)
 
 __all__ = [
+    "flydsl_flash_attn_batch_fwd",
     "flydsl_flash_attn_func",
-    "flydsl_flash_attn_varlen_func",
+    "flydsl_flash_attn_varlen_bwd",
+    "flydsl_flash_attn_varlen_fwd",
 ]
 
 
@@ -208,7 +237,105 @@ def flydsl_flash_attn_func(
     return o_p
 
 
-def flydsl_flash_attn_varlen_func(
+def _check_out(out, q, v_hdim, out_dtype=None):
+    """Validate a caller-provided ``out`` tensor. ``out_dtype`` defaults to q's -- the
+    8-bit gfx1250 kernel writes bf16 output, so it passes its own."""
+    assert out is not None, "out must be provided"
+    assert torch.is_tensor(out), f"out must be a tensor, got {type(out).__name__}"
+    want_dtype = q.dtype if out_dtype is None else out_dtype
+    assert out.dtype == want_dtype, f"out dtype {out.dtype} != expected {want_dtype}"
+    assert out.device == q.device, f"out device {out.device} != q device {q.device}"
+    assert out.stride(-1) == 1, "out must have a contiguous last dimension"
+    want = (*tuple(q.shape[:-1]), v_hdim)
+    assert (
+        tuple(out.shape) == want
+    ), f"out shape {tuple(out.shape)} != expected {want} (v_hdim={v_hdim})"
+
+
+def _bshd_batch_stride_ok(t, seq_len):
+    """The BSHD kernels take no batch stride: they address batch b at
+    ``b * seq_len * stride_seq``. A view whose own batch stride differs from that
+    product (e.g. [S,B,H,D] storage permuted to [B,S,H,D]) reads the wrong rows, or
+    off the end. Irrelevant at batch 1, which never forms a nonzero batch offset."""
+    return t.shape[0] == 1 or t.stride(0) == seq_len * t.stride(1)
+
+
+_A8W8_GFX1250_IN_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _fp8_gfx950_supported(
+    q,
+    k,
+    v,
+    *,
+    softmax_scale,
+    dropout_p,
+    window_size,
+    bias,
+    alibi_slopes,
+    sink,
+    return_attn_probs,
+    block_table,
+    q_descale,
+    k_descale,
+    v_descale,
+    out,
+) -> bool:
+    """Gate for the gfx950 fp8 kernel.
+
+    It needs e4m3fn Q/K/V with per-tensor descales and a positive, finite
+    softmax scale, and writes bf16. Reject anything else so it falls through rather than
+    silently dropping the feature.
+    """
+    if q.dtype is not torch.float8_e4m3fn or q_descale is None:
+        return False
+
+    from .kernels.flash_attn_func_fp8_gfx950 import (
+        _is_valid_softmax_scale,
+        flydsl_flash_attn_fp8_supported,
+    )
+
+    if q.dim() not in (3, 4) or k.dim() != q.dim() or v.dim() != q.dim():
+        return False
+    if not (k.dtype == v.dtype == torch.float8_e4m3fn):
+        return False
+    if out is not None and (out.dtype != torch.bfloat16 or not out.is_contiguous()):
+        return False
+    if not (q.is_cuda and k.device == q.device and v.device == q.device):
+        return False
+    if any(
+        s is None
+        or not torch.is_tensor(s)
+        or s.dtype != torch.float32
+        or s.numel() != 1
+        or s.device != q.device
+        for s in (q_descale, k_descale, v_descale)
+    ):
+        return False
+    qk_hdim = q.shape[-1]
+    if not _is_valid_softmax_scale(softmax_scale):
+        return False
+    nq, nkv = q.shape[-2], k.shape[-2]
+    if not flydsl_flash_attn_fp8_supported(
+        q.device, nq, nkv, qk_hdim, v.shape[-1], dtype=q.dtype
+    ):
+        return False
+    return (
+        k.shape[-1] == qk_hdim
+        and nkv > 0
+        and nq % nkv == 0
+        and dropout_p == 0.0
+        and all(w < 0 for w in window_size[:2])
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and bias is None
+        and alibi_slopes is None
+        and sink is None
+        and block_table is None
+        and not return_attn_probs
+    )
+
+
+def flydsl_flash_attn_varlen_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -228,47 +355,299 @@ def flydsl_flash_attn_varlen_func(
     block_table=None,
     out=None,
     sink=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     """FlyDSL MHA forward, varlen THD layout.
 
     Returns the result if FlyDSL can handle this configuration,
     otherwise returns None so the caller falls through to Triton/CK.
     """
-    from ...jit.utils.chip_info import get_gfx
+    from ...jit.utils.chip_info import get_gfx_runtime
 
-    # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
-    # dropout, sliding window, paging, probs/deterministic) falls through to
-    # CK/Triton instead of being silently dropped.
-    supported = (
-        get_gfx() == "gfx1250"
-        and q.shape[-1] == 192
-        and v.shape[-1] == 128
-        and q.dtype == torch.bfloat16
-        and dropout_p == 0.0
-        and tuple(window_size[:2]) == (-1, -1)
-        and block_table is None
-        and bias is None
-        and alibi_slopes is None
-        and sink is None
-        and not deterministic
-        and not return_attn_probs
-    )
-    if not supported:
-        return None
+    gfxip = get_gfx_runtime()
+    if gfxip == "gfx950":
+        if (
+            q.dtype is torch.float8_e4m3fn
+            and q.dim() == 3
+            and _fp8_gfx950_supported(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                dropout_p=dropout_p,
+                window_size=window_size,
+                bias=bias,
+                alibi_slopes=alibi_slopes,
+                sink=sink,
+                return_attn_probs=return_attn_probs,
+                block_table=block_table,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                out=out,
+            )
+        ):
+            from .kernels.flash_attn_func_fp8_gfx950 import flydsl_flash_attn_fp8_func
 
-    # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
-    if out is None:
-        out = torch.empty_like(q[:, :, : v.shape[-1]])
-    return flash_attn_varlen_d192_gfx1250(
+            return flydsl_flash_attn_fp8_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_k,
+                cross_seqlen=max_seqlen_q != max_seqlen_k,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                out=out,
+                return_lse=return_lse,
+            )
+    elif gfxip == "gfx1250":
+        # 8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything
+        # else to a16w16, whose output follows the input.
+        _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
+        if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
+            return None
+        if any(t.stride(-1) != 1 for t in (q, k, v)):
+            return None
+        if (
+            sink is not None
+            and torch.is_tensor(sink)
+            and sink.dim() > 0
+            and sink.stride(-1) != 1
+        ):
+            return None
+        if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
+            return None
+        _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype
+        _supported = (
+            flash_attn_a8w8_gfx1250_supported
+            if _is_b8
+            else flash_attn_a16w16_gfx1250_supported
+        )
+        if not _supported(
+            "varlen",
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink,
+            block_table=block_table,
+            return_attn_probs=return_attn_probs,
+        ):
+            return None
+        if out is None:
+            out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=_out_dtype)
+        else:
+            _check_out(out, q, v.shape[-1], out_dtype=_out_dtype)
+        return (
+            flash_attn_varlen_a8w8_gfx1250
+            if _is_b8
+            else flash_attn_varlen_a16w16_gfx1250
+        )(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            out=out,
+            return_lse=return_lse,
+            sink=sink,
+        )
+
+    return None
+
+
+def flydsl_flash_attn_batch_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    return_lse: bool = False,
+    dropout_p: float = 0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    sink=None,
+    out=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+):
+    """FlyDSL MHA forward, batched BSHD ``[B, S, H, D]`` layout.
+
+    Routes gfx950 fp8 to the dual-wave kernel and gfx1250 bf16/f16 to the
+    dedicated BSHD m32x8 kernel (uniform ``seq_len``, no ``cu_seqlens`` —
+    CUDA-graph safe). Returns the result if FlyDSL can handle this
+    configuration, otherwise returns ``None`` so the caller falls through
+    to Triton/CK.
+    """
+    from ...jit.utils.chip_info import get_gfx_runtime
+
+    gfxip = get_gfx_runtime()
+    if gfxip == "gfx950":
+        if (
+            q.dtype is torch.float8_e4m3fn
+            and q.dim() == 4
+            and _fp8_gfx950_supported(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                dropout_p=dropout_p,
+                window_size=window_size,
+                bias=bias,
+                alibi_slopes=alibi_slopes,
+                sink=sink,
+                return_attn_probs=return_attn_probs,
+                block_table=None,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                out=out,
+            )
+        ):
+            from .kernels.flash_attn_func_fp8_gfx950 import flydsl_flash_attn_fp8_func
+
+            return flydsl_flash_attn_fp8_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                out=out,
+                return_lse=return_lse,
+            )
+    # deterministic is a backward-only flag (this forward is atomic-free), and
+    # flash_attn_func defaults it True -- gating on it would reject every request.
+    elif gfxip == "gfx1250" and q.dim() == 4:
+        _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
+        if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
+            return None
+        if any(t.stride(-1) != 1 for t in (q, k, v)):
+            return None
+        if (
+            sink is not None
+            and torch.is_tensor(sink)
+            and sink.dim() > 0
+            and sink.stride(-1) != 1
+        ):
+            return None
+        if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
+            return None
+        if not all(_bshd_batch_stride_ok(t, t.shape[1]) for t in (q, k, v)):
+            return None
+        if (
+            out is not None
+            and out.dim() == 4
+            and not _bshd_batch_stride_ok(out, out.shape[1])
+        ):
+            return None
+        _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype
+        _supported = (
+            flash_attn_a8w8_gfx1250_supported
+            if _is_b8
+            else flash_attn_a16w16_gfx1250_supported
+        )
+        if not _supported(
+            "batch",
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink,
+            block_table=None,
+            return_attn_probs=return_attn_probs,
+        ):
+            return None
+        if out is None:
+            out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=_out_dtype)
+        else:
+            _check_out(out, q, v.shape[-1], out_dtype=_out_dtype)
+        return (
+            flash_attn_batch_a8w8_gfx1250 if _is_b8 else flash_attn_batch_a16w16_gfx1250
+        )(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            out=out,
+            return_lse=return_lse,
+            sink=sink,
+        )
+
+    return None
+
+
+def flydsl_flash_attn_varlen_bwd(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+):
+    """FlyDSL MHA backward, varlen THD layout.
+
+    Returns ``(dq, dk, dv, softmax_d)`` to match ``mha_varlen_bwd`` and
+    ``fmha_v3_varlen_bwd``.  The gradients are the same tensors that were passed
+    in -- the kernel fills them in place -- and ``softmax_d`` is the ``[H, T]``
+    fp32 ``rowsum(dO*O)`` those two also return.
+
+    PRECONDITION: the caller has established this configuration is supported --
+    causal varlen THD self-attention, d_qk=192 / d_v=128, bf16, no GQA,
+    contiguous, ``[H, T]`` fp32 LSE, no dropout / sliding window / alibi / sink /
+    padded cu_seqlens, on gfx942.  The authoritative gate is
+    ``can_impl_fmha_bwd_flydsl`` inside ``_flash_attn_varlen_backward`` in
+    ``aiter/ops/mha.py``; the screened feature arguments are absent from this
+    signature precisely because that gate has already established they are unset,
+    leaving no configuration for this function to branch on.
+    """
+    dq, dk, dv, softmax_d = flash_attn_varlen_bwd_d192_gfx942(
+        dout,
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_k,
+        out,
+        softmax_lse,
+        cu_seqlens,
         max_seqlen_q,
         max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        out=out,
-        return_lse=return_lse,
+        softmax_scale,
+        dq=dq,
+        dk=dk,
+        dv=dv,
     )
+    return dq, dk, dv, softmax_d

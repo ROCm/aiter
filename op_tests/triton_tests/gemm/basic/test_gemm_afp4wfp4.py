@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import functools
+
 import pytest
 import torch
 import triton
 
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _get_config as _get_afp4wfp4_config,
+)
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
-)
-from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
-    gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
@@ -49,11 +51,11 @@ def generate_gemm_afp4wfp4_inputs(
 
     if layout[0] == "T":
         # 34 is two packed e2m1 values 0010 which is 1.0.
-        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
-        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
     else:
-        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
-        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
+        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
+        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
 
     if layout[1] == "N":
         w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
@@ -62,10 +64,7 @@ def generate_gemm_afp4wfp4_inputs(
         w_low = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
         w_high = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
 
-    x = (
-        x_high << 4 | x_low
-    )  # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
-    x = x.to(device="cuda")
+    x = x_high << 4 | x_low
 
     w = w_low | w_high << 4
     # Scale of 1.0 in e8m0, bias 127.
@@ -106,7 +105,7 @@ def generate_gemm_afp4wfp4_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype).cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
         out_dtype = (None,)
     else:
         out_dtype = dtype
@@ -131,8 +130,9 @@ def get_x_vals():
     x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
-    x_vals += [(2048, 8192, 4096)]
+    x_vals += [(2048, 7168, 16384), (2304, 24576, 1536)]
     x_vals += [(1, 256, 512), (16, 256, 256), (31, 7168, 4608)]  # M < 32 case
+    x_vals += [(v, 96, 5120) for v in (32, 128, 192, 256, 8000)]
     return x_vals
 
 
@@ -254,7 +254,7 @@ def test_gemm_afp4_wfp4(
         if impl == "triton":
             fn = triton_gemm_afp4wfp4
         elif impl == "gluon":
-            fn = gluon_gemm_afp4wfp4_CDNA4
+            fn = functools.partial(triton_gemm_afp4wfp4, backend="gluon")
         else:
             raise ValueError(f"Unknown implementation: {impl}")
         triton_out = fn(
@@ -269,6 +269,50 @@ def test_gemm_afp4_wfp4(
 
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
+
+    triton.testing.assert_close(torch_out, triton_out)
+
+
+@pytest.mark.parametrize("M, N, K", [(1, 10240, 8192), (64, 8192, 28672)])
+def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
+    dtype = torch.bfloat16
+    (
+        x,
+        w,
+        w_triton,
+        x_scales,
+        w_scales,
+        x_scales_triton,
+        w_scales_triton,
+        _out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(
+        M,
+        N,
+        K,
+        dtype,
+        layout="TN",
+        output=True,
+        shuffle_scales_fg=True,
+        shuffle_weight_fg=True,
+    )
+
+    # _get_config doubles K itself, so pass packed bytes as the wrapper does.
+    config, _ = _get_afp4wfp4_config(M, N, K // 2, True, backend="triton")
+    config = dict(config)
+    config["NUM_KSPLIT"] = 4
+
+    triton_out = gemm_afp4wfp4_preshuffle(
+        x,
+        w_triton,
+        x_scales_triton,
+        w_scales_triton,
+        dtype,
+        y,
+        config=config,
+    )
+
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     triton.testing.assert_close(torch_out, triton_out)
 

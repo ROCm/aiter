@@ -24,10 +24,12 @@ from flydsl.expr import (
     range_constexpr,
 )
 
+from ..kernels_common import LOG2E
+
 
 def _exp2_f32(x):
     """Evaluate exp2 directly; decay exponents are always non-positive."""
-    return fx.Float32(fx.rocdl.exp2(fx.Float32.ir_type, x.ir_value()))
+    return fx.exp2(x, fastmath="afn")
 
 
 WARP_SIZE = 64
@@ -65,7 +67,7 @@ def _mfma16_f32(a_f32x4, b_f32x4, c_f32x4):
 def _acc16_n4():
     """Return a zeroed four-tile accumulator."""
     frag = fx.make_rmem_tensor((4, 1, 4), fx.Float32)
-    frag.store(fx.Vector.filled(16, 0.0, fx.Float32))
+    frag.store(fx.full(16, 0.0, fx.Float32))
     return frag
 
 
@@ -226,7 +228,6 @@ def compile_gdn_prepare(
     remain in the natural-log domain.
     """
     assert BT == 64 and K == 128 and V == 128, "gdn_prepare targets the BT=64 main path"
-    LOG2E = 1.4426950408889634
 
     KS = K + 4
     VTS = BT + 4

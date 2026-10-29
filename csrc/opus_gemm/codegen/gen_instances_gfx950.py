@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""gfx950 codegen -- emit launchers for gfx950-targeted kid families.
-
-Free functions taking the parent opus_gemm_codegen instance as first arg.
-Self-registers each emit into codegen.common.EMIT_REGISTRY at import time.
-"""
+"""Generate gfx950 OPUS launchers."""
 
 import os
-from pathlib import Path
 
 from opus_gemm_common import OpusGemmInstance
 
@@ -15,11 +10,14 @@ from codegen.common import (
     WARP_SIZE,
     register_arch_map,
     register_emit,
+    splitk_workspace_type,
+    write_if_changed,
 )
 
 # ---------------- gfx950 arch-override maps ----------------
 
 PIPELINE_HEADER_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_pipeline_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
@@ -29,9 +27,18 @@ PIPELINE_HEADER_MAP = {
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh",
     "a8w8_mxscale_bmm_flatmm_splitk": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_blds": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_allwave": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "gfx950/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave8_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "gfx950/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave8_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "gfx950/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave8_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "gfx950/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_wave1_gfx950.cuh",
     "a8w8_mxscale_bmm_minterleave": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_fused": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_pipeline": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
     "a8w8_mxscale_bmm_mouter": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_mouter_tunable": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_wave8n2": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
@@ -48,6 +55,7 @@ PIPELINE_HEADER_MAP_4G_SAFE = {
 }
 
 TRAITS_HEADER_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_traits_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
@@ -57,9 +65,18 @@ TRAITS_HEADER_MAP = {
     "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a8w8_mxscale_bmm_flatmm_splitk": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_blds": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_allwave": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_minterleave": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_fused": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_pipeline": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_mouter": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_mouter_tunable": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_wave8n2": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
@@ -67,6 +84,7 @@ TRAITS_HEADER_MAP = {
 }
 
 KERNEL_FUNC_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_kernel",
     "a8w8_scale": "gemm_a8w8_scale_kernel",
     "a8w8_mxscale": "gemm_a8w8_scale_kernel",
     "a8w8": "gemm_a8w8_noscale_kernel",
@@ -76,10 +94,19 @@ KERNEL_FUNC_MAP = {
     "a16w16_persistent": "gemm_a16w16_persistent_kernel",
     "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
     "a8w8_mxscale_bmm_flatmm_splitk": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_blds": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_allwave": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel",
     "a8w8_mxscale_bmm_minterleave": "gemm_a8w8_mxscale_flatmm_minterleave_kernel",
     "a8w8_mxscale_bmm_fused": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
     # pipeline: default; the emit fn selects the real kernel per-kid from flags.
     "a8w8_mxscale_bmm_pipeline": "gemm_a8w8_scale_kernel",
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle": "gemm_a8w8_scale_kernel",
     "a8w8_mxscale_bmm_mouter": "gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel",
     "a8w8_mxscale_bmm_mouter_tunable": "gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel",
     "a8w8_mxscale_bmm_wave8n2": "gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel",
@@ -93,6 +120,7 @@ KERNEL_FUNC_MAP_4G_SAFE = {
 }
 
 TRAITS_NAME_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_traits_gfx950",
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8_mxscale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
@@ -102,9 +130,18 @@ TRAITS_NAME_MAP = {
     "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
     "a16w16_mono_tile": "opus_gemm_a16w16_mono_tile_traits_gfx950",
     "a8w8_mxscale_bmm_flatmm_splitk": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_tilen_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_blds": "opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_allwave": "opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_allwave_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "opus_gemm_a8w8_mxscale_bpreshuffle_wave8n4_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "opus_gemm_a8w8_mxscale_bpreshuffle_wavetm1_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "opus_gemm_a8w8_mxscale_bpreshuffle_wavetm1_blds_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "opus_gemm_a8w8_mxscale_bpreshuffle_wave1_traits_gfx950",
     "a8w8_mxscale_bmm_minterleave": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_fused": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_pipeline": "opus_gemm_a8w8_scale_traits_gfx950",
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle": "opus_gemm_a8w8_scale_bpreshuffle_traits_gfx950",
     "a8w8_mxscale_bmm_mouter": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_mouter_tunable": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_wave8n2": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
@@ -112,6 +149,7 @@ TRAITS_NAME_MAP = {
 }
 
 KARGS_NAME_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_compact_kargs_gfx950",
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
     "a8w8_mxscale": "opus_gemm_scale_kargs_gfx950",
     "a8w8": "opus_gemm_noscale_kargs_gfx950",
@@ -121,9 +159,18 @@ KARGS_NAME_MAP = {
     "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
     "a16w16_mono_tile": "opus_gemm_mono_tile_kargs_gfx950",
     "a8w8_mxscale_bmm_flatmm_splitk": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_blds": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_allwave": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_minterleave": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_fused": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_pipeline": "opus_gemm_scale_kargs_gfx950",
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle": "opus_gemm_scale_kargs_gfx950",
     "a8w8_mxscale_bmm_mouter": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_mouter_tunable": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_wave8n2": "opus_gemm_scale_splitk_kargs_gfx950",
@@ -142,10 +189,10 @@ def splitk_reduce_extra_device_instantiations():
     return (
         "// mmajor BMM reduce (a8w8_mxscale split-K launchers)\n"
         "template __global__ void opus_bmm_splitk_reduce_kernel<__bf16, 8, 128>(\n"
-        "    const opus_splitk_ws_handle*, __bf16*,\n"
+        "    const void*, __bf16*,\n"
         "    int, int, int, int, int, int, int, int);\n"
         "template __global__ void opus_bmm_splitk_reduce_kernel<float, 8, 128>(\n"
-        "    const opus_splitk_ws_handle*, float*,\n"
+        "    const void*, float*,\n"
         "    int, int, int, int, int, int, int, int);\n"
     )
 
@@ -633,7 +680,7 @@ def gen_persistent_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A16W16_TUNE_HOST_EXTRA,
+    A16W16_LAUNCH_HOST_EXTRA,
     **_unused,
 ):
     """gfx950 a16w16_persistent launcher emit. See gen_instances.opus_gemm_codegen._gen_persistent_instance."""
@@ -720,7 +767,7 @@ void
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
     std::optional<aiter_tensor_t> bias,
-    int /*splitK*/)   // persistent ignores splitK; shares tune-lookup slot signature
+    int /*splitK*/)   // persistent ignores splitK; shares launch-table signature
 {{{{
     int batch = XQ.size(0);
     int M = XQ.size(1);
@@ -752,8 +799,8 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
+    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_LAUNCH_HOST_EXTRA)
 
 
 def gen_scale_instance(
@@ -770,10 +817,10 @@ def gen_scale_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A8W8_SCALE_HOST_EXTRA,
+    A8W8_BLOCKSCALE_HOST_EXTRA,
     **_unused,
 ):
-    """gfx950 a8w8_scale launcher emit."""
+    """Emit the checked gfx950 A8W8 blockscale launcher."""
     _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
@@ -804,13 +851,48 @@ void
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> x_scale,
-    std::optional<aiter_tensor_t> w_scale)
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale)
 {{{{
+    AITER_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
+        "opus_gemm_a8w8_blockscale_launch: XQ/WQ/Y must be 3D");
+    AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
+        "opus_gemm_a8w8_blockscale_launch: expected fp8 XQ/WQ");
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32,
+        "opus_gemm_a8w8_blockscale_launch: expected fp32 Y");
+    AITER_CHECK(XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(),
+        "opus_gemm_a8w8_blockscale_launch: XQ/WQ must be K-contiguous "
+        "and Y must be contiguous");
     int batch = XQ.size(0);
     int M = XQ.size(1);
     int N = WQ.size(1);
     int K = XQ.size(2);
+    AITER_CHECK(batch >= 1 && WQ.size(0) == batch && Y.size(0) == batch,
+        "opus_gemm_a8w8_blockscale_launch: batch dimensions must match");
+    AITER_CHECK(WQ.size(2) == K && Y.size(1) == M && Y.size(2) == N,
+        "opus_gemm_a8w8_blockscale_launch: tensor shapes must be "
+        "[B,M,K], [B,N,K], [B,M,N]");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= {k.B_K},
+        "opus_gemm_a8w8_blockscale_launch: requires positive M/N and "
+        "K >= {k.B_K}");
+    AITER_CHECK(M % {k.GROUP_M} == 0 && N % {k.GROUP_N} == 0 &&
+                    K % {k.GROUP_K} == 0,
+        "opus_gemm_a8w8_blockscale_launch: M/N/K must be divisible by "
+        "scale groups ",
+        {k.GROUP_M}, "/", {k.GROUP_N}, "/", {k.GROUP_K});
+
+    // The pipeline primes two K tiles, then advances in pairs. Rejecting a
+    // one-tile or odd-tile launch here prevents a negative final tile and an
+    // out-of-range prefetch in device code.
+    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
+    AITER_CHECK(loops_ >= 2,
+        "opus_gemm_a8w8_blockscale_launch: ceil_div(K, B_K)=", loops_,
+        " must be >= 2 (K=", K, ", B_K=", {k.B_K}, ")");
+    AITER_CHECK(loops_ % 2 == 0,
+        "opus_gemm_a8w8_blockscale_launch: ceil_div(K, B_K)=", loops_,
+        " must be even (prefetch constraint)");
+    AITER_CHECK(K % 2 == 0,
+        "opus_gemm_a8w8_blockscale_launch: K must be even; got K=", K);
 
     using Traits = {k.name}_Traits<D_C>;
 
@@ -820,6 +902,31 @@ void
     int num_groups_m = M / GROUP_M;
     int num_groups_n = N / GROUP_N;
     int num_groups_k = K / GROUP_K;
+
+    AITER_CHECK(x_scale.dtype() == AITER_DTYPE_fp32 &&
+                    w_scale.dtype() == AITER_DTYPE_fp32,
+        "opus_gemm_a8w8_blockscale_launch: expects fp32 scales");
+    AITER_CHECK(x_scale.is_contiguous() && w_scale.is_contiguous(),
+        "opus_gemm_a8w8_blockscale_launch: expects contiguous scales");
+    AITER_CHECK(x_scale.device_id == XQ.device_id &&
+                    w_scale.device_id == XQ.device_id,
+        "opus_gemm_a8w8_blockscale_launch: scales must be on the XQ device");
+    const bool x_scale_2d = x_scale.dim() == 2 && batch == 1 &&
+        x_scale.size(0) == M && x_scale.size(1) == num_groups_k;
+    const bool x_scale_3d = x_scale.dim() == 3 &&
+        x_scale.size(0) == batch && x_scale.size(1) == M &&
+        x_scale.size(2) == num_groups_k;
+    const bool w_scale_2d = w_scale.dim() == 2 && batch == 1 &&
+        w_scale.size(0) == num_groups_n && w_scale.size(1) == num_groups_k;
+    const bool w_scale_3d = w_scale.dim() == 3 &&
+        w_scale.size(0) == batch && w_scale.size(1) == num_groups_n &&
+        w_scale.size(2) == num_groups_k;
+    AITER_CHECK(x_scale_2d || x_scale_3d,
+        "opus_gemm_a8w8_blockscale_launch: x_scale must be "
+        "[B,M,K/128], or [M,K/128] when B=1");
+    AITER_CHECK(w_scale_2d || w_scale_3d,
+        "opus_gemm_a8w8_blockscale_launch: w_scale must be "
+        "[B,N/128,K/128], or [N/128,K/128] when B=1");
 
     {kargs_name} kargs{{}};
     kargs.ptr_a = XQ.data_ptr();
@@ -836,8 +943,8 @@ void
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
 
-    kargs.ptr_sfa = x_scale.value().data_ptr();
-    kargs.ptr_sfb = w_scale.value().data_ptr();
+    kargs.ptr_sfa = x_scale.data_ptr();
+    kargs.ptr_sfb = w_scale.data_ptr();
     kargs.stride_sfa = num_groups_k;
     kargs.stride_sfb = num_groups_k;
     kargs.stride_sfa_batch = num_groups_m * num_groups_k;
@@ -854,85 +961,8 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(cg, k, kernel_func, kargs_name, A8W8_SCALE_HOST_EXTRA)
-
-    # "_mmajor" sibling: A(XQ)/Y are [M, batch, *] (dim0=M, dim1=batch) and
-    # x_scale is [M, batch, K/GROUP_K] (per-token M) so the DSV4 wo_a activation
-    # o=[num_tokens, n_groups, K] feeds in with NO caller-side transpose. Weight
-    # (WQ) and its scale (w_scale) stay batch-major [batch, N, K] /
-    # [batch, N/GROUP_N, K/GROUP_K]. Same kernel/traits; the launcher just reads
-    # A/Y/sfa strides from the tensors instead of hardcoding batch-major.
-    INSTANCE_IMPL_MMAJOR = f"""
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}_mmajor(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> x_scale,
-    std::optional<aiter_tensor_t> w_scale)
-{{{{
-    int M = XQ.size(0);
-    int batch = XQ.size(1);
-    int N = WQ.size(1);
-    int K = XQ.size(2);
-
-    int GROUP_N = {k.GROUP_N};
-    int GROUP_K = {k.GROUP_K};
-    int num_groups_n = N / GROUP_N;
-    int num_groups_k = K / GROUP_K;
-
-    {kargs_name} kargs{{}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.n = N;
-    kargs.k = K;
-    kargs.batch = batch;
-    // mmajor A/Y (dim0=M, dim1=batch); weight WQ stays batch-major.
-    kargs.stride_a = (int)XQ.stride(0);
-    kargs.stride_b = (int)WQ.stride(1);
-    kargs.stride_c = (int)Y.stride(0);
-    kargs.stride_a_batch = (int)XQ.stride(1);
-    kargs.stride_b_batch = (int)WQ.stride(0);
-    kargs.stride_c_batch = (int)Y.stride(1);
-
-    kargs.ptr_sfa = x_scale.value().data_ptr();
-    kargs.ptr_sfb = w_scale.value().data_ptr();
-    // x_scale mmajor [M, batch, num_groups_k]; w_scale batch-major.
-    kargs.stride_sfa = (int)x_scale.value().stride(0);
-    kargs.stride_sfa_batch = (int)x_scale.value().stride(1);
-    kargs.stride_sfb = num_groups_k;
-    kargs.stride_sfb_batch = num_groups_n * num_groups_k;
-
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block({k.BLOCK_SIZE});
-
-    auto stream = aiter::getCurrentHIPStream();
-    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
-
-}}}}
-#endif // launcher only on regular host pass
-"""
-    with open(os.path.join(cg.impl_path, f"{k.name}.cuh"), "a") as _f:
-        _f.write(INSTANCE_IMPL_MMAJOR)
-
-    for CDtype in k.output_dtypes:
-        host_decl_mmajor = (
-            f"template void\n"
-            f"{k.name}_mmajor<{CDtype}>(\n"
-            f"    aiter_tensor_t &XQ,\n"
-            f"    aiter_tensor_t &WQ,\n"
-            f"    aiter_tensor_t &Y{A8W8_SCALE_HOST_EXTRA});\n"
-        )
-        cg._host_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl_mmajor}
-        )
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
+    record_one_instantiation(cg, k, kernel_func, kargs_name, A8W8_BLOCKSCALE_HOST_EXTRA)
 
 
 def gen_noscale_instance_gfx950(
@@ -949,11 +979,10 @@ def gen_noscale_instance_gfx950(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     BIAS_HOST_VALIDATE,
-    A16W16_TUNE_TAGS,
+    A16W16_KID_DISPATCH_TAGS,
     **_unused,
 ):
-    """gfx950 noscale launcher emit: a16w16 split-barrier (bias-aware double-traits)
-    and a8w8 noscale (single traits). a8w8 falls through the else branch."""
+    """Emit a gfx950 A16W16 or A8W8 no-scale launcher."""
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
@@ -969,7 +998,9 @@ def gen_noscale_instance_gfx950(
         )
 
     min_k = 2 * k.B_K
-    k_check = f"""
+    shape_preamble = ""
+    if is_a16w16_split_barrier:
+        k_check = f"""
     int loops_ = (K + {k.B_K} - 1) / {k.B_K};
     AITER_CHECK(loops_ >= 2,
         "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
@@ -980,10 +1011,37 @@ def gen_noscale_instance_gfx950(
         "latent K-tail accumulation bug; pass an even K)");
     AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
 """
+    else:
+        shape_preamble = """
+    AITER_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
+        "opus_gemm_a8w8_launch: XQ/WQ/Y must be 3D");
+    AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
+        "opus_gemm_a8w8_launch: expected fp8 XQ/WQ");
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32,
+        "opus_gemm_a8w8_launch: expected fp32 Y");
+    AITER_CHECK(XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(),
+        "opus_gemm_a8w8_launch: XQ/WQ must be K-contiguous and Y must be "
+        "contiguous");
+"""
+        k_check = f"""
+    AITER_CHECK(batch >= 1 && WQ.size(0) == batch && Y.size(0) == batch,
+        "opus_gemm_a8w8_launch: batch dimensions must match");
+    AITER_CHECK(WQ.size(2) == K && Y.size(1) == M && Y.size(2) == N,
+        "opus_gemm_a8w8_launch: tensor shapes must be "
+        "[B,M,K], [B,N,K], [B,M,N]");
+    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
+    AITER_CHECK(loops_ >= 2,
+        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
+    AITER_CHECK(loops_ % 2 == 0,
+        "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
+    AITER_CHECK(K % 2 == 0,
+        "opus_gemm_a8w8_launch: K must be even; got K=", K);
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+"""
 
-    if k.kernel_tag in A16W16_TUNE_TAGS:
+    if k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
         extra_param = (
-            ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*splitK*/"
+            ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*split_k*/"
         )
     else:
         extra_param = ""
@@ -996,7 +1054,7 @@ def gen_noscale_instance_gfx950(
             + "    kargs.ptr_bias = ptr_bias_;\n"
             + "    kargs.stride_bias_batch = stride_bias_batch_;\n"
         )
-    elif k.kernel_tag in A16W16_TUNE_TAGS:
+    elif k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
         bias_kargs_block = (
             "    AITER_CHECK(!bias.has_value(),\n"
             '        "bias not supported on this a16w16 kid");\n'
@@ -1068,6 +1126,7 @@ void
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y{extra_param})
 {{{{
+{shape_preamble}
     int batch = XQ.size(0);
     int M = XQ.size(1);
     int N = WQ.size(1);
@@ -1097,9 +1156,9 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
-    if k.kernel_tag in A16W16_TUNE_TAGS:
+    if k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
         inst_extra_param = ",\n    std::optional<aiter_tensor_t>,\n    int"
     else:
         inst_extra_param = ""
@@ -1234,7 +1293,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     for CDtype in k.output_dtypes:
         host_decl = (
@@ -1272,7 +1331,7 @@ def gen_flatmm_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A16W16_TUNE_HOST_EXTRA,
+    A16W16_LAUNCH_HOST_EXTRA,
     **_unused,
 ):
     """gfx950 a16w16_flatmm launcher emit."""
@@ -1363,8 +1422,8 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
+    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_LAUNCH_HOST_EXTRA)
 
 
 def gen_flatmm_splitk_instance(
@@ -1381,11 +1440,19 @@ def gen_flatmm_splitk_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
-    A16W16_TUNE_HOST_EXTRA,
+    A16W16_WORKSPACE_LAUNCH_HOST_EXTRA,
     BIAS_HOST_VALIDATE,
     **_unused,
 ):
-    """gfx950 a16w16_flatmm_splitk launcher emit (uses ws_handle + reduce kernel call)."""
+    """Emit a gfx950 split-K launcher using a caller-owned typed workspace."""
+    workspace_dtype, _workspace_ptr_type, workspace_aiter_dtype = splitk_workspace_type(
+        k
+    )
+    if workspace_dtype != "fp32_t":
+        raise ValueError(
+            f"gfx950 kid {k.name} declares {workspace_dtype} workspace, but "
+            "the current gfx950 main/reduce kernels support fp32_t only"
+        )
     _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
@@ -1394,7 +1461,7 @@ def gen_flatmm_splitk_instance(
 template <typename D_C>
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, fp32_t, fp32_t, {da}>,
+    opus::tuple<{da}, {db}, {workspace_dtype}, fp32_t, {da}>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
     {k.WG_PER_CU},
@@ -1402,7 +1469,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     {has_oob_str}>;
 """
 
-    preamble = instance_impl_preamble()
+    preamble = instance_impl_preamble('\n#include "opus_gemm_common.cuh"')
     host_tu_split = instance_impl_host_tu_split(
         traits_header,
         pipeline_header,
@@ -1420,12 +1487,12 @@ void
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
+    aiter_tensor_t &workspace,
     std::optional<aiter_tensor_t> bias,
     int splitK)
 {{{{
     static_assert(std::is_same<D_C, fp32_t>::value,
-        "splitk main kernel uses fp32 workspace; D_C template param must be fp32_t "
-        "(Y can be bf16 or fp32; reduce kernel handles the cast / passthrough)");
+        "split_k launcher uses the fp32 launch specialization");
 
     int batch = XQ.size(0);
     int M = XQ.size(1);
@@ -1459,55 +1526,35 @@ void
         "need total_iters >= pfk*B_K = ", pfk * {k.B_K},
         " (pfk=", pfk, ")");
 
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    int padded_M    = num_tiles_m * {k.B_M};
-    int padded_N    = num_tiles_n * {k.B_N};
+    int num_tiles_m = 1 + (M - 1) / {k.B_M};
+    int num_tiles_n = 1 + (N - 1) / {k.B_N};
+    const size_t padded_M_size = opus_checked_extent_product(
+        {{static_cast<size_t>(num_tiles_m), static_cast<size_t>({k.B_M})}},
+        "{k.name}");
+    const size_t padded_N_size = opus_checked_extent_product(
+        {{static_cast<size_t>(num_tiles_n), static_cast<size_t>({k.B_N})}},
+        "{k.name}");
+    const size_t workspace_slice_numel = opus_checked_extent_product(
+        {{padded_M_size, padded_N_size}}, "{k.name}");
+    AITER_CHECK(padded_M_size <= static_cast<size_t>(std::numeric_limits<int>::max())
+                    && padded_N_size <= static_cast<size_t>(std::numeric_limits<int>::max())
+                    && workspace_slice_numel <= static_cast<size_t>(std::numeric_limits<int>::max()),
+        "{k.name}: padded workspace extents exceed 32-bit kernel stride limits");
+    int padded_M = static_cast<int>(padded_M_size);
+    int padded_N = static_cast<int>(padded_N_size);
 
-    // Per-stream workspace handle (process-global registry, mutex-protected
-    // in opus_gemm.cu). Replaces the prior `static thread_local` cache --
-    // under TBO two CPU threads drive two streams concurrently, and each
-    // captured graph must bake in its own buffer pointer. Eager: lazy-
-    // create. Capture: must be pre-warmed via
-    // aiter.opus_gemm_workspace_init() on the capture stream.
-    // (opus_splitk_ws_handle is already a complete type at this point via
-    // the traits header included at the top of this launcher .cuh.)
-    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
-
+    const size_t required_numel = opus_checked_extent_product(
+        {{static_cast<size_t>(split_k), static_cast<size_t>(batch),
+          workspace_slice_numel}},
+        "{k.name}");
+    void* workspace_ptr_ = opus_validate_workspace(
+        workspace, XQ, {workspace_aiter_dtype}, required_numel, 16, "{k.name}");
     auto stream = aiter::getCurrentHIPStream();
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
-    auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
-
-    size_t ws_bytes = (size_t)split_k * (size_t)batch
-                    * (size_t)padded_M * (size_t)padded_N * sizeof(float);
-    if (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes)
-    {{
-        AITER_CHECK(!capturing,
-            "splitk workspace grow inside HIP graph capture is not "
-            "supported (hipMalloc / hipFree are stream-capture-illegal). "
-            "Warm the cache once eagerly with the largest workspace before "
-            "capturing. Call aiter.opus_gemm_workspace_init() on the capture "
-            "stream first.");
-
-        void* new_ptr = nullptr;
-        const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-        size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-        HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
-        if (ws_handle_->ptr != nullptr)
-        {{
-            HIP_CALL(hipDeviceSynchronize());
-            HIP_CALL(hipFree(ws_handle_->ptr));
-        }}
-        ws_handle_->ptr = new_ptr;
-        ws_handle_->bytes = grow_bytes;
-    }}
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a         = XQ.data_ptr();
     kargs.ptr_b         = WQ.data_ptr();
-    kargs.ws_handle     = ws_handle_;
+    kargs.ptr_ws        = workspace_ptr_;
     kargs.ptr_c         = Y.data_ptr();
     kargs.ptr_bias      = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
@@ -1518,7 +1565,7 @@ void
     kargs.stride_c        = N;
     kargs.stride_a_batch  = XQ.stride(0);
     kargs.stride_b_batch  = WQ.stride(0);
-    kargs.stride_ws_batch = padded_M * padded_N;
+    kargs.stride_ws_batch = static_cast<int>(workspace_slice_numel);
     kargs.stride_c_batch  = M * N;
     kargs.stride_bias_batch = stride_bias_batch_;
 
@@ -1536,7 +1583,7 @@ void
         if (bias.has_value()) {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_,
+                    workspace_ptr_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const __bf16*>(ptr_bias_),
@@ -1544,7 +1591,7 @@ void
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_,
+                    workspace_ptr_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     nullptr, 0);
@@ -1553,7 +1600,7 @@ void
         if (bias.has_value()) {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_,
+                    workspace_ptr_,
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const float*>(ptr_bias_),
@@ -1561,7 +1608,7 @@ void
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_,
+                    workspace_ptr_,
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     nullptr, 0);
@@ -1571,8 +1618,14 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
+    record_one_instantiation(
+        cg,
+        k,
+        kernel_func,
+        kargs_name,
+        A16W16_WORKSPACE_LAUNCH_HOST_EXTRA,
+    )
 
 
 def _assert_m_align(k, tile_mult):
@@ -1605,6 +1658,44 @@ def _assert_m_align(k, tile_mult):
 # fused-reduce kid stays monolithic in opus_bmm.cu.
 _BMM_MXSCALE_SPLITK_LAUNCHER_BODY = r"""
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#ifndef OPUS_BMM_XCD_COUNTERS_DEFINED
+#define OPUS_BMM_XCD_COUNTERS_DEFINED
+#include <cstdlib>
+#include <map>
+#include <mutex>
+// Arrival counters for the same-XCD fused split-K, one int32 per (batch, tile).
+// Like FlyDSL, cache one buffer per (device, stream). Initialization and all
+// eager uses are ordered on that stream; another stream gets its own buffer.
+// The last split re-arms each counter, so subsequent launches need no memset.
+// Keep outgrown buffers alive: in-flight kernels or captured graphs may still
+// reference them. If this stream needs allocation during capture, return nullptr
+// for the workspace + reducer path. Warm up on the capture stream to use fusion.
+// Graphs sharing a buffer must replay in order, even on different replay streams.
+inline int* opus_bmm_xcd_counters(size_t n, hipStream_t stream)
+{
+  static const bool off = std::getenv("OPUS_BMM_NO_XCD_FUSE") != nullptr;
+  if (off) return nullptr;
+  struct Buf { int* p = nullptr; size_t capacity = 0; };
+  static std::mutex mu;
+  static std::map<int, std::map<hipStream_t, Buf>> bufs;
+  int dev = 0;
+  HIP_CALL(hipGetDevice(&dev));
+  std::lock_guard<std::mutex> lock(mu);
+  Buf& b = bufs[dev][stream];
+  if (b.capacity < n) {
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    HIP_CALL(hipStreamIsCapturing(stream, &capture));
+    if (capture != hipStreamCaptureStatusNone) return nullptr;
+    const size_t capacity = n > (size_t(1) << 14) ? n : (size_t(1) << 14);
+    int* p = nullptr;
+    HIP_CALL(hipMalloc(&p, capacity * sizeof(int)));
+    HIP_CALL(hipMemsetAsync(p, 0, capacity * sizeof(int), stream));
+    b.p = p;
+    b.capacity = capacity;
+  }
+  return b.p;
+}
+#endif
 // mmajor: O/Y are [M, batch, *] (dim0=M, dim1=batch); wo_a stays batch-major
 // [batch, N, K]. Caller (opus_bmm.cu switch) does dtype/arch/common checks.
 template <typename D_C>
@@ -1615,12 +1706,21 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
     int splitK)
 {
   using Traits = @@NAME@@_Traits;
   constexpr bool DIRECT_ONLY = @@DIRECT@@;
   constexpr bool PREFETCH_SCALE = @@PREFETCH@@;
   constexpr bool PRELOAD_SF_LDS = @@PRELOAD@@;
+  // Whether a scale panel is really staged in LDS, which is what carries the K
+  // bound below. The shuffle_scale layout reads both panels from global and compiles the
+  // panel (and its bound) out, so a shuffle_scale kid runs any K even with PRELOAD_SF_LDS
+  // set -- mirrors SF_LDS_A || SF_LDS_B in the wave8 pipeline.
+  constexpr bool SF_PANEL_IN_LDS = @@PANEL@@;
+  // The workspace (splitK>1) specialization carries its own preload flag: it
+  // normally inherits the kid, but may differ as a per-instance workaround.
+  constexpr bool SPLITK_PRELOAD_SF_LDS = @@SPLITK_PRELOAD@@;
 
   AITER_CHECK(splitK >= 1, "splitK must be >= 1");
   if constexpr (DIRECT_ONLY) {
@@ -1649,20 +1749,37 @@ void
               Traits::prefetch_k_iter, " K-tiles; K=", K,
               " gives total_iters=", total_iters, ", splitK=", split_k,
               ", last split loops=", last_loops);
+  if constexpr (SF_PANEL_IN_LDS) {
+    // Mirrors the kernel's own bail-out on the LDS scale panel: past this bound
+    // it returns without writing Y, which a caller cannot tell apart from a
+    // GEMM that produced zeros. iters_full is the largest per-split loop count,
+    // so it is the one that has to fit.
+    //
+    // The shuffled panel has its own, smaller bound: its B half is twice the
+    // plain panel's because shuffle_scale_b duplicates each byte. Checking the
+    // plain bound for a shuffled kid would leave a window where the launcher
+    // passes and the kernel returns zeros.
+    constexpr int SF_K_TILES_MAX = @@PANELMAX@@;
+    AITER_CHECK(iters_full <= SF_K_TILES_MAX,
+                "@@NAME@@ preloads the scale panel into LDS and so takes at "
+                "most ", SF_K_TILES_MAX,
+                " K-tiles per split; K=", K, " with splitK=", split_k,
+                " gives ", iters_full);
+  }
 
   const int num_tiles_m = (M + Traits::B_M - 1) / Traits::B_M;
   const int num_tiles_n = (N + Traits::B_N - 1) / Traits::B_N;
   const int padded_M = num_tiles_m * Traits::B_M;
   const int padded_N = num_tiles_n * Traits::B_N;
-  const size_t partial_bytes = (size_t)split_k * (size_t)batch
-                             * (size_t)padded_M * (size_t)padded_N * sizeof(float);
+  const size_t required_numel = (size_t)split_k * (size_t)batch
+                              * (size_t)padded_M * (size_t)padded_N;
 
   auto stream = aiter::getCurrentHIPStream();
 
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   kargs.split_k = split_k;
   kargs.stride_a = (int)O.stride(0);
@@ -1681,49 +1798,68 @@ void
   dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
   dim3 block_main(Traits::BLOCK_SIZE);
   if (no_split_k) {
+    AITER_CHECK(!workspace.has_value(),
+                "@@NAME@@ splitK == 1 does not use workspace");
     kargs.ptr_c = Y.data_ptr();
     kargs.stride_c = (int)Y.stride(0);
     kargs.stride_c_batch = (int)Y.stride(1);
     if (Y.dtype() == AITER_DTYPE_bf16) {
-      @@KERNEL@@<Traits, __bf16, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS>
+      @@KERNEL@@<Traits, __bf16, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
           <<<grid_main, block_main, 0, stream>>>(kargs);
     } else {
-      @@KERNEL@@<Traits, float, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS>
+      @@KERNEL@@<Traits, float, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
           <<<grid_main, block_main, 0, stream>>>(kargs);
     }
     return;
   }
 
   if constexpr (!DIRECT_ONLY) {
-    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
-    auto* ws_handle = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
+    AITER_CHECK(workspace.has_value(),
+                "@@NAME@@ splitK > 1 requires workspace");
+    void* workspace_ptr = opus_validate_workspace(
+        workspace.value(), O, AITER_DTYPE_fp32, required_numel, 16, "@@NAME@@");
+    kargs.ptr_ws = workspace_ptr;
 
-    const size_t ws_bytes = partial_bytes;
-    if (ws_handle->ptr == nullptr || ws_bytes > ws_handle->bytes) {
-      AITER_CHECK(!capturing,
-                  "splitk workspace grow inside HIP graph capture is not supported");
-      void* new_ptr = nullptr;
-      const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-      size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-      HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
-      if (ws_handle->ptr != nullptr) {
-        HIP_CALL(hipDeviceSynchronize());
-        HIP_CALL(hipFree(ws_handle->ptr));
+    // Same-XCD fused split-K: the splits reduce among themselves in the main
+    // kernel (see xcd_fused in the pipeline), so there is no reduce launch and
+    // no second pass over the workspace. Launched on the direct-output
+    // specialization, whose D_OUT the last split writes.
+    const size_t n_counters = (size_t)num_tiles_m * num_tiles_n * batch;
+    int* xcd_counters = @@XCD_FUSE@@ ? opus_bmm_xcd_counters(n_counters, stream) : nullptr;
+    if (xcd_counters) {
+      kargs.ptr_xcd_counters = xcd_counters;
+      kargs.ptr_c = Y.data_ptr();
+      kargs.stride_c = (int)Y.stride(0);
+      kargs.stride_c_batch = (int)Y.stride(1);
+      const int tiles_per_batch = num_tiles_m * num_tiles_n;
+      // Either form keeps a tile's splits on one XCD. @@XCD_SPLIT_IN_X@@ puts
+      // them in x, next to each other in dispatch order, the kernel recovering
+      // (tile, split) with divides by its compile-time split count; otherwise
+      // split is y, a whole grid row apart.
+      dim3 grid_xcd = @@XCD_SPLIT_IN_X@@
+          ? dim3((unsigned)((tiles_per_batch + 7) / 8 * 8 * split_k), 1u, (unsigned)batch)
+          : dim3((unsigned)((tiles_per_batch + 7) / 8 * 8), (unsigned)split_k,
+                 (unsigned)batch);
+      if (Y.dtype() == AITER_DTYPE_bf16) {
+        @@KERNEL@@<Traits, __bf16, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
+            <<<grid_xcd, block_main, 0, stream>>>(kargs);
+      } else {
+        @@KERNEL@@<Traits, float, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS@@SFMPACK@@>
+            <<<grid_xcd, block_main, 0, stream>>>(kargs);
       }
-      ws_handle->ptr = new_ptr;
-      ws_handle->bytes = grow_bytes;
+      return;
     }
-    kargs.ws_handle = ws_handle;
 
     // Pass all 4 template args explicitly (D_OUT=void: the split-K main kernel
     // writes an fp32 workspace, so its output dtype is irrelevant; the reduce
     // kernel casts to the runtime Y dtype). The fused host TU only sees a
     // no-default forward decl of @@KERNEL@@, so relying on the template's
     // default args here would fail overload resolution ("no matching function").
-    @@KERNEL@@<Traits, void, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS>
+    // The workspace specialization may use a lower-register-pressure scale
+    // path than this kid's tuned splitK=1 direct-output specialization, so it
+    // takes SPLITK_PRELOAD_SF_LDS rather than PRELOAD_SF_LDS. The trailing
+    // @@SFMPACK@@ args are unchanged: they describe the layout, not the split.
+    @@KERNEL@@<Traits, void, DIRECT_ONLY, PREFETCH_SCALE, SPLITK_PRELOAD_SF_LDS@@SFMPACK@@>
         <<<grid_main, block_main, 0, stream>>>(kargs);
 
     constexpr int REDUCE_VEC = 8;
@@ -1736,13 +1872,13 @@ void
     if (Y.dtype() == AITER_DTYPE_bf16) {
       opus_bmm_splitk_reduce_kernel<__bf16, REDUCE_VEC, REDUCE_BS>
           <<<grid_reduce, block_reduce, 0, stream>>>(
-              ws_handle, reinterpret_cast<__bf16*>(Y.data_ptr()),
+              workspace_ptr, reinterpret_cast<__bf16*>(Y.data_ptr()),
               split_k, M, N, batch, padded_M, padded_N,
               y_stride_c, y_stride_c_batch);
     } else {
       opus_bmm_splitk_reduce_kernel<float, REDUCE_VEC, REDUCE_BS>
           <<<grid_reduce, block_reduce, 0, stream>>>(
-              ws_handle, reinterpret_cast<float*>(Y.data_ptr()),
+              workspace_ptr, reinterpret_cast<float*>(Y.data_ptr()),
               split_k, M, N, batch, padded_M, padded_N,
               y_stride_c, y_stride_c_batch);
     }
@@ -1788,16 +1924,17 @@ def gen_bmm_mxscale_flatmm_splitk_instance(
 
     # Non-templated traits alias: fp32 split-K workspace is fixed; the workspace
     # tuple slot 4 (scale) is `unsigned char` for the e8m0 mxscale path.
+    ring_arg = f", {k.wave1_ring}" if k.wave1_ring else ""
     traits_aliases = f"""
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
     opus::tuple<{da}, {db}, fp32_t, fp32_t, unsigned char>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
-    {k.WG_PER_CU}>;
+    {k.WG_PER_CU}{ring_arg}>;
 """
 
-    preamble = instance_impl_preamble()
+    preamble = instance_impl_preamble('\n#include "opus_gemm_common.cuh"')
     host_tu_split = instance_impl_host_tu_split(
         traits_header,
         pipeline_header,
@@ -1811,36 +1948,113 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     # header that defines this kernel -- so the launcher body's <<<...>>> call
     # needs a visible declaration. On the non-fused device pass the pipeline
     # header (via splitk_reduce_gfx950.cuh) provides a compatible definition, so
-    # this is just a harmless redeclaration there. opus_splitk_ws_handle is a
-    # complete type in both passes via the included traits/pipeline header.
+    # this is just a harmless redeclaration there.
     reduce_fwd_decl = """
 template <typename D_OUT, int VEC, int BLOCK>
 __global__ void opus_bmm_splitk_reduce_kernel(
-    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    const void* __restrict__ workspace,
     D_OUT* __restrict__ out,
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
     int stride_c, int stride_c_batch);
 """
 
+    workspace_preload_sf = (
+        k.preload_sf if k.workspace_preload_sf is None else k.workspace_preload_sf
+    )
+    # @@SFMPACK@@ is an extra trailing template arg rather than its own constexpr
+    # bool so that pipelines that never heard of SFA_MPACK_GLOBAL emit
+    # byte-identical text. The wave8 kernel declares it, and its kids all spell
+    # it out: the fused host TU sees one forward decl per kid, so the parameter
+    # cannot carry a default there to fall back on.
+    # XCD_WGM rides along the same way, for the same reason.
+    sfmpack = ""
+    if kernel_func == "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel":
+        sfmpack = (
+            (", true" if k.mpack_sfa else ", false")
+            + f", {k.xcd_wgm}"
+            + (", true" if k.shuffle_scale else ", false")
+            + (", true" if k.sf_shuf_in_lds else ", false")
+        )
+    elif kernel_func == "gemm_a8w8_mxscale_flatmm_splitk_kernel":
+        # SHUFFLE_SCALE, then SF_SHUF_IN_LDS -- spelled on every kid of this kernel,
+        # not only the shuffled ones, because the forward decl carries no default
+        # and the parameter cannot be reached positionally otherwise. This string
+        # and the device instantiation's `mpack` must reach equally far.
+        sfmpack = (", true" if k.shuffle_scale else ", false") + (
+            ", true" if k.sf_shuf_in_lds else ", false"
+        )
+
     launcher = (
         _BMM_MXSCALE_SPLITK_LAUNCHER_BODY.replace("@@NAME@@", k.name)
         .replace("@@KERNEL@@", kernel_func)
+        .replace(
+            "@@XCD_FUSE@@",
+            (
+                "Traits::XCD_FUSE"
+                if kernel_func
+                in (
+                    "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+                    "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel",
+                    "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel",
+                )
+                else "false"
+            ),
+        )
+        .replace(
+            "@@XCD_SPLIT_IN_X@@",
+            (
+                "true"
+                if kernel_func == "gemm_a8w8_mxscale_bpreshuffle_wave1_kernel"
+                else "false"
+            ),
+        )
         .replace("@@DIRECT@@", "true" if k.direct_only else "false")
         .replace("@@PREFETCH@@", "true" if k.prefetch_scale else "false")
         .replace("@@PRELOAD@@", "true" if k.preload_sf else "false")
+        # A shuffled kid reads both panels from global and compiles the LDS panel
+        # and its K bound out -- unless sf_shuf_in_lds puts it back, which is why
+        # that term stands on its own rather than under preload_sf (a flatmm
+        # panel kid necessarily has preload_sf False, the two panels being
+        # alternative fills of the same LDS). Drop it and the kid skips the bound
+        # and returns a fast buffer of zeros.
+        .replace(
+            "@@PANEL@@",
+            (
+                "true"
+                if ((k.preload_sf and not k.shuffle_scale) or k.sf_shuf_in_lds)
+                else "false"
+            ),
+        )
+        .replace(
+            "@@PANELMAX@@",
+            (
+                "Traits::SF_SHUF_K_TILES_MAX"
+                if k.sf_shuf_in_lds
+                else (
+                    "Traits::SF_PRELOAD_K_MAX / Traits::B_K"
+                    if k.preload_sf
+                    # No panel: the bound is compiled out, and the wave1 traits
+                    # carry no panel geometry to name.
+                    else "0"
+                )
+            ),
+        )
+        .replace("@@SFMPACK@@", sfmpack)
+        .replace("@@SPLITK_PRELOAD@@", "true" if workspace_preload_sf else "false")
     )
 
     INSTANCE_IMPL = (
         f"{preamble}\n{host_tu_split}\n{reduce_fwd_decl}\n{traits_aliases}\n{launcher}"
     )
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     # Host instantiation(s): launcher templated on D_C; a single <fp32_t> stub.
     # (XQ/WQ/Y positional names in _make_host_decl map to O/wo_a/Y by type.)
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
         "\n    aiter_tensor_t &w_scale,"
+        "\n    std::optional<aiter_tensor_t> workspace,"
         "\n    int splitK"
     )
     for dtype in k.output_dtypes:
@@ -1861,25 +2075,45 @@ __global__ void opus_bmm_splitk_reduce_kernel(
     direct = "true" if k.direct_only else "false"
     prefetch = "true" if k.prefetch_scale else "false"
     preload = "true" if k.preload_sf else "false"
+    splitk_preload = "true" if workspace_preload_sf else "false"
+    # The wave8 kernel's four trailing params default, so they are only spelled
+    # out when a kid needs them -- and then all of them up to the last one used,
+    # since none can be reached positionally without the ones in front of it.
+    # This list must reach at least as far as @@SFMPACK@@ does above, or the
+    # launcher names a specialisation this TU never instantiated.
+    if kernel_func == "gemm_a8w8_mxscale_flatmm_splitk_kernel":
+        # Both, always -- see the matching note on `sfmpack` above.
+        mpack = (", true" if k.shuffle_scale else ", false") + (
+            ", true" if k.sf_shuf_in_lds else ", false"
+        )
+    elif k.mpack_sfa or k.xcd_wgm or k.shuffle_scale:
+        mpack = f", {'true' if k.mpack_sfa else 'false'}, {k.xcd_wgm}"
+        if k.shuffle_scale:
+            mpack += ", true"
+            if k.sf_shuf_in_lds:
+                mpack += ", true"
+    else:
+        mpack = ""
 
-    def _dev(dtype_tag, d_out, dir_flag, pfk_flag):
+    def _dev(dtype_tag, d_out, dir_flag, pfk_flag, preload_flag):
         decl = (
             f"template __global__ void {kernel_func}<\n"
-            f"    {k.name}_Traits, {d_out}, {dir_flag}, {pfk_flag}, {preload}>({kargs_name});\n"
+            f"    {k.name}_Traits, {d_out}, {dir_flag}, {pfk_flag}, "
+            f"{preload_flag}{mpack}>({kargs_name});\n"
         )
         cg._device_instantiations.append(
             {"kid_name": k.name, "dtype": dtype_tag, "device_decl": decl}
         )
 
-    _dev("bf16", "__bf16", direct, prefetch)
-    _dev("fp32", "float", direct, prefetch)
+    _dev("bf16", "__bf16", direct, prefetch, preload)
+    _dev("fp32", "float", direct, prefetch, preload)
     if not k.direct_only:
         # Split-K > 1 workspace path: host launches <Traits, void, DIRECT_ONLY,
-        # PREFETCH_SCALE, PRELOAD_SF_LDS>. DIRECT_ONLY is false here (direct kids
-        # never take the workspace path), but PREFETCH_SCALE / PRELOAD_SF_LDS must
-        # match the kid, else the <void, false, ...> instantiation is missing for
-        # prefetch/preload kids -> undefined symbol at load.
-        _dev("void", "void", "false", prefetch)
+        # PREFETCH_SCALE, SPLITK_PRELOAD_SF_LDS>. DIRECT_ONLY is false here
+        # (direct kids never take the workspace path).  The split-K preload flag
+        # normally inherits the kid, with a per-instance compiler workaround
+        # permitted by workspace_preload_sf.
+        _dev("void", "void", "false", prefetch, splitk_preload)
 
 
 _BMM_MXSCALE_MINTERLEAVE_LAUNCHER_BODY = r"""
@@ -1896,11 +2130,14 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
-    int /*splitK*/)
+    std::optional<aiter_tensor_t> workspace,
+    int splitK)
 {
   using Traits = @@NAME@@_Traits;
   constexpr bool SKIP_SCALE_WAIT = @@SKIP@@;
   constexpr int MI = 2;
+  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
+  AITER_CHECK(!workspace.has_value(), "@@NAME@@ does not use workspace");
 
   const int M = O.size(0);
   const int batch = O.size(1);
@@ -1922,7 +2159,7 @@ void
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   const int num_tiles_m = M / Traits::B_M;
   const int num_tiles_n = N / Traits::B_N;
@@ -2016,12 +2253,13 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     )
 
     INSTANCE_IMPL = f"{preamble}\n{host_tu_split}\n{traits_aliases}\n{launcher}"
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     # Host instantiation: launcher templated on D_C; single <fp32_t> stub.
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
         "\n    aiter_tensor_t &w_scale,"
+        "\n    std::optional<aiter_tensor_t> workspace,"
         "\n    int splitK"
     )
     for dtype in k.output_dtypes:
@@ -2093,13 +2331,21 @@ def _emit_bmm_specialized(
     specializations already emitted by the mouter family -- emitting them again
     under a different alias name would be a duplicate-symbol ODR violation).
     """
-    traits_aliases = _bmm_specialized_traits_alias(k, traits_name, da, db)
+    if k.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+        traits_aliases = (
+            f"using {k.name}_Traits = {traits_name}<"
+            f"{k.B_M}, {k.B_N}, {k.B_K}, {k.T_M}, {k.T_N}, {k.num_slots}, "
+            f"{str(k.cachectl_b == 2).lower()}, {str(k.early_b).lower()}>;"
+        )
+    else:
+        traits_aliases = _bmm_specialized_traits_alias(k, traits_name, da, db)
     INSTANCE_IMPL = f"{preamble}\n{host_tu_split}\n{traits_aliases}\n{launcher}"
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
         "\n    aiter_tensor_t &w_scale,"
+        "\n    std::optional<aiter_tensor_t> workspace,"
         "\n    int splitK"
     )
     for dtype in k.output_dtypes:
@@ -2139,9 +2385,11 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
     int @@SPLITK_ARG@@)
 {
   using Traits = @@NAME@@_Traits;
+  AITER_CHECK(!workspace.has_value(), "@@NAME@@ does not use workspace");
 """
 
 _BMM_SPEC_KARGS = r"""
@@ -2150,7 +2398,7 @@ _BMM_SPEC_KARGS = r"""
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   kargs.stride_a = (int)O.stride(0);
   kargs.stride_b = (int)wo_a.stride(1);
@@ -2169,10 +2417,100 @@ _BMM_SPEC_KARGS = r"""
   kargs.stride_c_batch = (int)Y.stride(1);
 """
 
+
+# Compact family: one runtime-dimension path with bounded K segments.
+_BMM_COMPACT_LAUNCHER_BODY = (
+    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + r"""  AITER_CHECK(splitK == 0 || splitK == 1, "@@NAME@@ requires splitK <= 1");
+  const int64_t M = O.size(0), batch = O.size(1), N = wo_a.size(1), K = O.size(2);
+  AITER_CHECK(M > 0 && M < 2048 && batch > 0 && batch <= 16 && N > 0 && N <= 2147483647 && K > 0 && K <= 2147483647,
+              "@@NAME@@ requires M in [1,2047], batch in [1,16], positive int32 N and K");
+  AITER_CHECK(N % 128 == 0 && N % Traits::B_N == 0 && K % Traits::B_K == 0,
+              "@@NAME@@ requires N aligned to 128 and B_N, and K aligned to B_K");
+  const int64_t output_bytes = Y.dtype() == AITER_DTYPE_bf16 ? 2 : 4;
+  AITER_CHECK(M*batch*K <= 2147483647 && N*K <= 2147483647 &&
+              M*batch*N*output_bytes <= 2147483647,
+              "@@NAME@@ requires A, each B batch, and Y byte spans to fit signed int32");
+  const int64_t scale_k = K / 128;
+  // Size-one dimensions do not contribute to addresses; contiguous PyTorch
+  // views may retain arbitrary strides on those axes after transpose/clone.
+  AITER_CHECK((M == 1 || O.stride(0) == batch*K) && (batch == 1 || O.stride(1) == K) &&
+              (batch == 1 || wo_a.stride(0) == N*K) && wo_a.stride(1) == K &&
+              (M == 1 || Y.stride(0) == batch*N) && (batch == 1 || Y.stride(1) == N) &&
+              (M == 1 || x_scale.stride(0) == batch*scale_k) && (batch == 1 || x_scale.stride(1) == scale_k) &&
+              (batch == 1 || w_scale.stride(0) == (N/128)*scale_k) && w_scale.stride(1) == scale_k,
+              "@@NAME@@ requires contiguous token-major A/scales/Y and contiguous preshuffled B");
+  AITER_CHECK(reinterpret_cast<uintptr_t>(O.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(wo_a.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(Y.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(x_scale.data_ptr()) % 4 == 0 &&
+              reinterpret_cast<uintptr_t>(w_scale.data_ptr()) % 4 == 0,
+              "@@NAME@@ requires 16-byte A/B/Y alignment and 4-byte scale alignment");
+"""
+    + r"""
+  auto stream = aiter::getCurrentHIPStream();
+
+  opus_bmm_compact_kargs_gfx950 kargs{};
+  kargs.ptr_a = O.data_ptr(); kargs.ptr_b = wo_a.data_ptr();
+  kargs.ptr_c = Y.data_ptr();
+  kargs.ptr_sfa = x_scale.data_ptr(); kargs.ptr_sfb = w_scale.data_ptr();
+  kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+"""
+    + r"""
+  const int tiles = (M + Traits::B_M - 1) / Traits::B_M * (N / Traits::B_N);
+  dim3 grid_main((tiles * batch + 7) / 8 * 8);
+  dim3 block_main(Traits::BLOCK_SIZE);
+  if (Y.dtype() == AITER_DTYPE_bf16)
+    @@KERNEL@@<Traits, __bf16><<<grid_main, block_main, 0, stream>>>(kargs);
+  else
+    @@KERNEL@@<Traits, float><<<grid_main, block_main, 0, stream>>>(kargs);
+}
+#endif
+"""
+)
+
+
+def gen_bmm_mxscale_compact_instance(
+    cg,
+    k,
+    pipeline_header,
+    traits_header,
+    kernel_func,
+    da,
+    db,
+    traits_name,
+    kargs_name,
+    kargs_template_vars,
+    instance_impl_preamble,
+    instance_impl_host_tu_split,
+    **_unused,
+):
+    _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
+    launcher = _BMM_COMPACT_LAUNCHER_BODY.replace("@@NAME@@", k.name).replace(
+        "@@KERNEL@@", kernel_func
+    )
+    _emit_bmm_specialized(
+        cg,
+        k,
+        kernel_func,
+        traits_name,
+        kargs_name,
+        da,
+        db,
+        instance_impl_preamble(),
+        instance_impl_host_tu_split(
+            traits_header, pipeline_header, tpl, kernel_func, fn
+        ),
+        launcher,
+        "",
+    )
+
+
 # ---- wave8n2 (kid 132) ----
 _BMM_WAVE8N2_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "/*splitK*/")
-    + r"""  const int M = O.size(0);
+    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + r"""  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
+  const int M = O.size(0);
   const int batch = O.size(1);
   const int N = wo_a.size(1);
   const int K = O.size(2);
@@ -2249,14 +2587,15 @@ def _cppbool(v):
 
 # ---- wave4m2_selfload (kids 134/142/148) ----
 _BMM_WAVE4M2_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "/*splitK*/")
-    + r"""  constexpr bool SKIP_SCALE_WAIT = @@SSW@@;
+    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + r"""  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
+  constexpr bool SKIP_SCALE_WAIT = @@SSW@@;
   constexpr bool PACK_SCALE_ON_DEMAND = @@PSOD@@;
   const int M = O.size(0);
   const int batch = O.size(1);
   const int N = wo_a.size(1);
   const int K = O.size(2);
-  constexpr int LOGICAL_B_M = Traits::B_M * 2;
+  constexpr int LOGICAL_B_M = Traits::B_M * @@MFAC@@;
   AITER_CHECK(M % LOGICAL_B_M == 0,
               "@@NAME@@ requires M % ", LOGICAL_B_M, " == 0, got ", M);
   AITER_CHECK(N % Traits::B_N == 0,
@@ -2288,7 +2627,7 @@ _BMM_WAVE4M2_LAUNCHER_BODY = (
 )
 
 
-def gen_bmm_mxscale_wave4m2_selfload_instance(
+def _gen_bmm_mxscale_wave4m2_family_instance(
     cg,
     k,
     pipeline_header,
@@ -2302,14 +2641,22 @@ def gen_bmm_mxscale_wave4m2_selfload_instance(
     instance_impl_preamble,
     instance_impl_host_tu_split,
     record_one_instantiation,
+    m_factor,
     **_unused,
 ):
+    """Self-contained split_k=1 launcher shared by the four-wave direct kernels.
+
+    m_factor is how many B_M row blocks one workgroup covers: 2 for the wave4m2
+    kernels, which stack two M phases, and 1 for the all-wave 2x2 grid, where
+    the four waves split a single tile.
+    """
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
     launcher = (
         _BMM_WAVE4M2_LAUNCHER_BODY.replace("@@NAME@@", k.name)
         .replace("@@KERNEL@@", kernel_func)
         .replace("@@SSW@@", _cppbool(k.skip_scale_wait))
         .replace("@@PSOD@@", _cppbool(k.pack_scale_on_demand))
+        .replace("@@MFAC@@", str(m_factor))
     )
     suffix = f", {_cppbool(k.skip_scale_wait)}, {_cppbool(k.pack_scale_on_demand)}"
     _emit_bmm_specialized(
@@ -2327,6 +2674,10 @@ def gen_bmm_mxscale_wave4m2_selfload_instance(
         launcher,
         suffix,
     )
+
+
+def gen_bmm_mxscale_wave4m2_selfload_instance(*args, **kwargs):
+    return _gen_bmm_mxscale_wave4m2_family_instance(*args, m_factor=2, **kwargs)
 
 
 # ---- mouter (kids 131/144) + mouter_tunable (kids 160/161) ----
@@ -2355,7 +2706,7 @@ _BMM_MOUTER_KARGS = r"""
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   const int num_tiles_m = M / Traits::B_M;
   const int num_tiles_n = N / Traits::B_N;
@@ -2397,7 +2748,8 @@ _BMM_MOUTER_TAIL = r"""  kargs.split_k = m_per_wg;
 """
 
 _BMM_MOUTER_LAUNCHER_BODY = (
-    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "/*splitK*/")
+    _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + '  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");\n'
     + _BMM_MOUTER_CHECKS
     + _BMM_MOUTER_KARGS
     + "  const int m_per_wg = (num_tiles_m >= 16) ? 2 : 1;\n"
@@ -2408,6 +2760,7 @@ _BMM_MOUTER_LAUNCHER_BODY = (
 # num_tiles_m]); reuses the same mouter kernel.
 _BMM_MOUTER_TUNABLE_LAUNCHER_BODY = (
     _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
+    + '  AITER_CHECK(splitK >= 1, "@@NAME@@ requires splitK >= 1");\n'
     + _BMM_MOUTER_CHECKS
     + _BMM_MOUTER_KARGS
     + "  int m_per_wg = splitK;\n"
@@ -2511,10 +2864,13 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
-    int /*splitK*/)
+    std::optional<aiter_tensor_t> workspace,
+    int splitK)
 {
   using Bf16Traits = @@NAME@@_Bf16Traits;
   using Fp32Traits = @@NAME@@_Fp32Traits;
+  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
+  AITER_CHECK(!workspace.has_value(), "@@NAME@@ does not use workspace");
   const int M = O.size(0);
   const int batch = O.size(1);
   const int N = wo_a.size(1);
@@ -2525,7 +2881,7 @@ void
               "@@NAME@@ requires N % ", Bf16Traits::B_N, " == 0, got ", N);
   AITER_CHECK(K % Bf16Traits::B_K == 0,
               "@@NAME@@ requires K % ", Bf16Traits::B_K, " == 0, got ", K);
-@@K1024_CHECK@@
+@@PRELOAD_CHECK@@
   opus_gemm_scale_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
@@ -2593,23 +2949,24 @@ def gen_bmm_mxscale_pipeline_instance(
 ):
     if k.preload_sf_lds:
         real_kernel = "gemm_a8w8_scale_preload_sf_kernel"
-    elif k.k1024_lb1:
-        real_kernel = "gemm_a8w8_scale_k1024_lb1_kernel"
-    elif k.k1024_only:
-        real_kernel = "gemm_a8w8_scale_k1024_kernel"
     else:
         real_kernel = "gemm_a8w8_scale_kernel"
 
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
-    k1024_check = ""
-    if k.k1024_only or k.k1024_lb1:
-        k1024_check = (
-            f'  AITER_CHECK(K == 1024, "{k.name} requires K == 1024, got ", K);\n'
+    preload_check = ""
+    if k.preload_sf_lds:
+        # The kernel returns without writing Y when K exceeds the LDS scale
+        # panel, which a caller reads as a GEMM that produced zeros. Check the
+        # traits bound here so it raises instead.
+        preload_check = (
+            "  AITER_CHECK(K <= Bf16Traits::SF_PRELOAD_K_MAX,\n"
+            f'              "{k.name} preloads the scale panel into LDS and '
+            'so requires K <= ", Bf16Traits::SF_PRELOAD_K_MAX, ", got ", K);\n'
         )
     launcher = (
         _BMM_PIPELINE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
         .replace("@@KERNEL@@", real_kernel)
-        .replace("@@K1024_CHECK@@", k1024_check)
+        .replace("@@PRELOAD_CHECK@@", preload_check)
     )
 
     traits_aliases = _bmm_pipeline_dual_traits_alias(k, traits_name)
@@ -2619,11 +2976,12 @@ def gen_bmm_mxscale_pipeline_instance(
     INSTANCE_IMPL = (
         f"{instance_impl_preamble()}\n{host_tu}\n{traits_aliases}\n{launcher}"
     )
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     host_extra = (
         ",\n    aiter_tensor_t &x_scale,"
         "\n    aiter_tensor_t &w_scale,"
+        "\n    std::optional<aiter_tensor_t> workspace,"
         "\n    int splitK"
     )
     for dtype in k.output_dtypes:
@@ -2663,6 +3021,7 @@ void
     aiter_tensor_t &Y,
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale,
+    std::optional<aiter_tensor_t> workspace,
     int splitK)
 {
   using Traits = @@NAME@@_Traits;
@@ -2704,7 +3063,7 @@ void
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
-  kargs.ws_handle = nullptr;
+  kargs.ptr_ws = nullptr;
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
   kargs.split_k = split_k;
   kargs.stride_a = (int)O.stride(0);
@@ -2723,53 +3082,40 @@ void
   dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
   dim3 block_main(Traits::BLOCK_SIZE);
   if (no_split_k) {
+    AITER_CHECK(!workspace.has_value(),
+                "@@NAME@@ splitK == 1 does not use workspace");
     kargs.ptr_c = Y.data_ptr();
     kargs.stride_c = (int)Y.stride(0);
     kargs.stride_c_batch = (int)Y.stride(1);
     if (Y.dtype() == AITER_DTYPE_bf16) {
-      @@KERNEL@@<Traits, __bf16, false, false, false>
+      @@KERNEL@@<Traits, __bf16, false, false, false, false, false>
           <<<grid_main, block_main, 0, stream>>>(kargs);
     } else {
-      @@KERNEL@@<Traits, float, false, false, false>
+      @@KERNEL@@<Traits, float, false, false, false, false, false>
           <<<grid_main, block_main, 0, stream>>>(kargs);
     }
     return;
   }
 
-  extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
-  hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-  HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-  const bool capturing = (capture_status != hipStreamCaptureStatusNone);
-  auto* ws_handle = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
-
   const size_t ws_bytes = counter_offset + counter_bytes;
-  if (ws_handle->ptr == nullptr || ws_bytes > ws_handle->bytes) {
-    AITER_CHECK(!capturing,
-                "splitk workspace grow inside HIP graph capture is not supported");
-    void* new_ptr = nullptr;
-    const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-    size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-    HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
-    if (ws_handle->ptr != nullptr) {
-      HIP_CALL(hipDeviceSynchronize());
-      HIP_CALL(hipFree(ws_handle->ptr));
-    }
-    ws_handle->ptr = new_ptr;
-    ws_handle->bytes = grow_bytes;
-  }
-  kargs.ws_handle = ws_handle;
+  const size_t required_numel = (ws_bytes + sizeof(float) - 1) / sizeof(float);
+  AITER_CHECK(workspace.has_value(),
+              "@@NAME@@ splitK > 1 requires workspace");
+  void* workspace_ptr = opus_validate_workspace(
+      workspace.value(), O, AITER_DTYPE_fp32, required_numel, 16, "@@NAME@@");
+  kargs.ptr_ws = workspace_ptr;
 
   kargs.ptr_c = Y.data_ptr();
   kargs.stride_c = (int)Y.stride(0);
   kargs.stride_c_batch = (int)Y.stride(1);
   kargs.counter_offset_bytes = counter_offset;
-  HIP_CALL(hipMemsetAsync(static_cast<char*>(ws_handle->ptr) + counter_offset,
+  HIP_CALL(hipMemsetAsync(static_cast<char*>(workspace_ptr) + counter_offset,
                           0, counter_bytes, stream));
   if (Y.dtype() == AITER_DTYPE_bf16) {
-    @@KERNEL@@<Traits, __bf16, false, false, false>
+    @@KERNEL@@<Traits, __bf16, false, false, false, false, false>
         <<<grid_main, block_main, 0, stream>>>(kargs);
   } else {
-    @@KERNEL@@<Traits, float, false, false, false>
+    @@KERNEL@@<Traits, float, false, false, false, false, false>
         <<<grid_main, block_main, 0, stream>>>(kargs);
   }
 }
@@ -2797,8 +3143,14 @@ def gen_bmm_mxscale_fused_instance(
     launcher = _BMM_FUSED_LAUNCHER_BODY.replace("@@NAME@@", k.name).replace(
         "@@KERNEL@@", kernel_func
     )
-    # host-only: device symbols <Traits, D_OUT, false, false, false> are shared
-    # with the standard flatmm split-K kid 0/32 (same traits) and emitted there.
+    # host-only: device symbols
+    # <Traits, D_OUT, false, false, false, false, false> are shared with the
+    # standard flatmm split-K kid 0/32 (same traits) and emitted there.
+    #
+    # _BMM_FUSED_LAUNCHER_BODY spells the trailing bools out in full at both
+    # launch sites, and must: under OPUS_FUSED_HOST_TU the impl header emits a
+    # bare forward declaration instead of including the pipeline header, so no
+    # default template argument is in scope.
     _emit_bmm_specialized(
         cg,
         k,
@@ -2807,7 +3159,7 @@ def gen_bmm_mxscale_fused_instance(
         kargs_name,
         da,
         db,
-        instance_impl_preamble(),
+        instance_impl_preamble('\n#include "opus_gemm_common.cuh"'),
         instance_impl_host_tu_split(
             traits_header, pipeline_header, tpl, kernel_func, fn
         ),
@@ -2852,11 +3204,71 @@ def _register_bmm_emit(kernel_tag, fn, launcher_tile_mult):
 _register_bmm_emit(
     "a8w8_mxscale_bmm_flatmm_splitk", gen_bmm_mxscale_flatmm_splitk_instance, 0
 )
+# bdirect: bpreshuffle with B skipping LDS (consumers buffer_load their own MFMA
+# B fragments); again only the traits alias differs.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
+# bdirect_tilen: bdirect forced onto the T_M=1 / T_N=2 consumer grid at B_M > 16,
+# which B_M == 16 gets on its own. A separate tag rather than a flag because the
+# traits alias emitter passes BLOCK_SIZE..WG_PER_CU only, so the grid has to
+# arrive baked into a named traits struct -- the same reason bdirect is a tag.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+    gen_bmm_mxscale_flatmm_splitk_instance,
+    0,
+)
+# blds: bpreshuffle keeping B's LDS staging, i.e. bdirect's traits with
+# B_DIRECT_REG left false. The control the family was missing -- it separates what
+# B's layout is worth from what skipping LDS is worth, which the bdirect tag
+# changes together.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_blds", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
+# allwave: blds with no producer waves -- all four stage A and B and all four
+# compute, on the 2x2 grid ALL_WAVE derives.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_allwave", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
+# wave8n4: eight all-compute waves over a 256x256 tile with direct-B, on a 2x4
+# grid. 256 MFMA per WG per K tile against the 64 every 4-wave kid here runs; the
+# tile only fits because eight waves cut the accumulator to 128 registers each.
+# The grid is 2x4 rather than the 4x2 this family started on because it halves
+# how many waves read each of B's bytes -- the one thing direct-B cannot share
+# through LDS. The 4x2 tag is gone; see kid192 in opus_gemm_common.py.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
+# wavetm1: T_M=1, the far end of the sweep, at the only B_M where it fits -- one
+# wave owns all B_M rows, and A stays in registers at 128 but not at 256. WAVES
+# follows BLOCK_SIZE, so this tag covers both the 1x8 (512 threads) and 1x4 (256)
+# grids, and it holds the fastest kid here.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
+# wavetm1_blds: the same kernel on traits that stage B through the LDS ring.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+    gen_bmm_mxscale_flatmm_splitk_instance,
+    0,
+)
+# wave1: one wave per workgroup, every operand global -> registers, no LDS and
+# no barrier -- the decode schedule. Shares the split-K launcher, fused tail
+# included.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_wave1", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
 _register_bmm_emit(
     "a8w8_mxscale_bmm_minterleave", gen_bmm_mxscale_minterleave_instance, 2
 )
 _register_bmm_emit("a8w8_mxscale_bmm_fused", gen_bmm_mxscale_fused_instance, 0)
 _register_bmm_emit("a8w8_mxscale_bmm_pipeline", gen_bmm_mxscale_pipeline_instance, 0)
+# The kid158 pipeline reading a preshuffled B. Same kernel, tile, wave grid, LDS
+# and quadrant schedule as the plain tag -- only the traits alias differs -- so a
+# diff against kid158 prices the preshuffle with nothing else moving.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle", gen_bmm_mxscale_pipeline_instance, 0
+)
 _register_bmm_emit("a8w8_mxscale_bmm_mouter", gen_bmm_mxscale_mouter_instance, 1)
 _register_bmm_emit(
     "a8w8_mxscale_bmm_mouter_tunable", gen_bmm_mxscale_mouter_tunable_instance, 1
@@ -2864,4 +3276,8 @@ _register_bmm_emit(
 _register_bmm_emit("a8w8_mxscale_bmm_wave8n2", gen_bmm_mxscale_wave8n2_instance, 1)
 _register_bmm_emit(
     "a8w8_mxscale_bmm_wave4m2_selfload", gen_bmm_mxscale_wave4m2_selfload_instance, 2
+)
+
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_compact", gen_bmm_mxscale_compact_instance, 0
 )

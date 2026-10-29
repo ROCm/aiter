@@ -319,27 +319,21 @@ When integrating CK tiles:
 
 ### Triton Kernel Development
 
-For Triton kernels:
+Triton and Gluon kernels follow the rules in
+[aiter/ops/triton/README.md](aiter/ops/triton/README.md#rules). The most
+important rules:
 
-1. **Use Appropriate Block Sizes**:
-   ```python
-   @triton.jit
-   def kernel(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
-       # Use BLOCK_SIZE between 128-1024 for AMD GPUs
-       pass
-   ```
-
-2. **Enable Software Pipelining**:
-   ```python
-   for blk_idx in tl.range(0, n_blocks, num_stages=2):  # Enable pipelining
-       data = tl.load(ptr + blk_idx * BLOCK_SIZE)
-   ```
-
-3. **Use Cache Modifiers**:
-   ```python
-   # For data that will be reused
-   x = tl.load(input_ptr, cache_modifier=".cg")  # Cache globally
-   ```
+1. Before you add a kernel, find kernels with the same or almost the same
+   function. Do not add a duplicate.
+2. Each kernel has a public wrapper, a unit test and a benchmark.
+3. Each launchable kernel has `repr=make_kernel_repr(...)`.
+4. Each kernel is in the correct folder, and its tuning values are in JSON
+   files in `aiter/ops/triton/configs/`, not in Python.
+5. Common code, such as activations, shuffles and config loading, comes from
+   the shared modules. Do not write local copies.
+6. Comments are short: one or two sentences.
+7. Docs, comments and PR descriptions use
+   [ASD-STE100](https://www.asd-ste100.org/) (Simplified Technical English).
 
 ---
 
@@ -398,6 +392,22 @@ Ensure your PR:
 * [ ] Updates documentation if needed
 * [ ] Includes performance benchmarks (for kernel changes)
 * [ ] Has a clear, descriptive title
+* [ ] Changes one kernel backend (see below)
+
+### One Backend Per PR
+
+A PR changes kernels of one backend only: Triton/Gluon, HIP, ASM, CK, OPUS or
+FlyDSL. Triton and Gluon count as one backend. Each backend has its own owners,
+tests and CI jobs, and a PR that mixes two waits on both. If the title
+automation puts two backend tags on your PR, split it.
+
+Work that spans backends becomes one PR per backend. When one part cannot
+merge without the other -- a kernel in one backend and the dispatch change in
+another, say -- open them as
+[stacked pull requests](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs):
+the second PR's branch starts from the first one's and targets it instead of
+`main`, so each is reviewed on its own and they merge in order. `gh stack`
+does the bookkeeping; from a fork, set the base branch by hand.
 
 ### PR Title Format
 
@@ -443,47 +453,39 @@ Examples:
 
 ### PR Description Template
 
-```markdown
-## Summary
-Brief description of changes
-
-## Motivation
-Why is this change needed?
-
-## Changes
-- Detailed list of changes
-- Impact on existing code
-
-## Performance (if applicable)
-| Configuration | Before | After | Improvement |
-|---------------|--------|-------|-------------|
-| ...           | ...    | ...   | ...         |
-
-## Testing
-- [ ] Unit tests added/updated
-- [ ] Performance benchmarks run
-- [ ] Tested on MI250X
-- [ ] Tested on MI300X
-
-## Documentation
-- [ ] Docstrings updated
-- [ ] User guide updated
-- [ ] Performance guide updated
-
-## Dependencies
-- [ ] No new third-party dependencies added
-- [ ] If new dependencies added, justification provided
-
-## Breaking Changes
-List any breaking changes and migration guide
-```
+GitHub automatically loads `.github/pull_request_template.md`. Complete its
+summary, motivation, changes, testing and PR Self-Review sections. Complete the
+performance, documentation, dependency and breaking-change sections when they
+apply, and state why when an expected item was not run or is not applicable.
 
 ### Code Review Process
 
-1. **Initial Review**: A maintainer will review within 3-5 business days
-2. **Feedback**: Address comments and push updates
-3. **Approval**: After approval, CI will run full test suite
-4. **Merge**: Once CI passes, a maintainer will merge
+Before requesting a human review, complete the **PR Self-Review** section in the
+pull request description for the current head revision. The automated comment
+asks one question selected from the files changed by the pull request. It also
+reports current Copilot findings, obvious code/test hygiene issues and the
+required baseline CI state.
+
+A pull request is ready for human review only when:
+
+* The pull request is no longer a draft.
+* The behavior, reason for the change and current revision are stated.
+* Validation evidence and anything still unverified are stated.
+* Kernel or performance changes include hardware, workload and before/after results.
+* The PR-specific question is answered.
+* Every changed `op_tests/` file has a stated, non-redundant purpose.
+* Current Copilot findings have a substantive author reply. Resolving the
+  conversation is recommended but does not block readiness.
+* Black, Ruff, repository dependency and Aiter Test Gate checks pass.
+
+Any new push invalidates the previous self-review until the author updates the
+reviewed revision and answers for the new head.
+
+1. **Self-review**: Complete PR Self-Review and required baseline CI
+2. **Initial Review**: A maintainer reviews a prepared pull request
+3. **Feedback**: Address comments and update the self-review after new pushes
+4. **Approval**: Obtain the required approval for the latest revision
+5. **Merge**: Once all required checks pass, a maintainer will merge
 
 If your PR is urgent or hasn't been reviewed, ping maintainers on the issue or PR.
 

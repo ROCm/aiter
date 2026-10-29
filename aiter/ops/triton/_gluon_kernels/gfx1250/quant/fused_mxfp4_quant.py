@@ -1,9 +1,12 @@
+from functools import partial
+
 import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n as _even_m_n
 
 
 # rms norm op copied from triton
@@ -149,8 +152,9 @@ _gluon_fused_rms_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["ROWS_PER_CTA"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="ROWS_PER_CTA", n="N1", block_n="BLOCK_SIZE_N"
+        ),
     }
 )
 @gluon.jit(repr=_gluon_fused_rms_mxfp4_quant_repr)
@@ -446,12 +450,15 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
-        "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,
-        "EVEN_M_N3": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N3"] % (args["BLOCK_SIZE_N3"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
+        ),
+        "EVEN_M_N2": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+        ),
+        "EVEN_M_N3": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N3", block_n="BLOCK_SIZE_N3"
+        ),
     }
 )
 @gluon.jit

@@ -59,6 +59,9 @@ def block_attn_mask_to_ragged_lut(
 
     # NOTE: Overallocating the LUT is a waste of memory, but the
     # alternative lut_count.sum(), will cause graph break with torch compile.
+    # TODO(sparse refresh): entries past the used range stay uninitialized, and an empty row's
+    # lut_start points at them. Kernels that speculatively read LUT[lut_start] before testing
+    # lut_count must clamp the derived offsets, as the FP8 prologue does, or this must be zeroed.
     max_count = batch * num_heads * num_q_blocks * num_kv_blocks
     kv_block_indices = torch.empty(max_count, dtype=torch.int32, device=device)
     block_attn_mask_to_lut_kernel(
