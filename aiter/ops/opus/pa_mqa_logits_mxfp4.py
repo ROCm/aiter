@@ -34,7 +34,7 @@ LAYOUTS (the caller's; nothing here touches the data). Every arch::
     q          [rows, H, D/2]  uint8 / fp4x2     weights          [rows, H]       bf16
     row_ends   [rows]          int32             query_start_loc  [seqs + 1]      int32
     block_tables [seqs, width] int32             out [rows, >= max_seq_len] fp32, or flat
-                                                     with out_offsets [rows] int64
+                                                     with out_offsets [rows] int32
 
 and per arch (the KV cache writer's; both have the same byte counts, so only the ndim tells
 them apart -- checked here, as nothing on device can)::
@@ -634,7 +634,7 @@ def mqa_logits_mxfp4(
 
     ``out=None`` allocates ``[rows, max_seq_len]`` fp32 filled with ``-inf`` (pass one to avoid a
     per-call allocation; pre-fill it only if something reads past the windows). With
-    ``out_offsets`` [rows] int64, ``out`` is flat and row r's logits start at ``out_offsets[r]``.
+    ``out_offsets`` [rows] int32, ``out`` is flat and row r's logits start at ``out_offsets[r]``.
     ``schedule`` must come from :func:`mqa_logits_mxfp4_schedule` with this ``cfg`` and these
     very ``query_start_loc`` / ``row_ends`` tensors.
     """
@@ -679,8 +679,8 @@ def mqa_logits_mxfp4(
     if out_offsets is not None:
         if out is None:
             raise ValueError("a flat out (out_offsets) must be passed in")
-        if out_offsets.dtype != torch.int64:
-            raise ValueError(f"out_offsets must be int64, got {out_offsets.dtype}")
+        if out_offsets.dtype != torch.int32:
+            raise ValueError(f"out_offsets must be int32, got {out_offsets.dtype}")
         if not inst.flat_out:
             raise ValueError(
                 f"instance {inst.name} does not write a flat out (out_offsets)"

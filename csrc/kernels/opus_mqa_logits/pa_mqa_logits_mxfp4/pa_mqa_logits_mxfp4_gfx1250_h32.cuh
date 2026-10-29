@@ -301,8 +301,9 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
                 w[r][h * PACK_W + jc.value] = (float)wv[jc.value] * weight_scale;
             });
         });
-        const long long base =
-            k.ptr_out_offsets ? k.ptr_out_offsets[row] : (long long)row * k.out_stride;
+        // An offset is >= 0: zero-extended, it needs no wait for its load here, as a sign would.
+        const long long base = k.ptr_out_offsets ? (long long)(unsigned)k.ptr_out_offsets[row]
+                                                 : (long long)row * k.out_stride;
         out_ptr[r]   = k.ptr_out + base;
         out_bytes[r] = (unsigned)(end > 0 ? end : 0) * (unsigned)sizeof(float);
     });

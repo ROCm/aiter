@@ -709,9 +709,9 @@ void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
     if (flat) {
         AITER_CHECK(in.flat_out,
                     "instance ", instance, " writes [rows, width] only, not out_offsets");
-        AITER_CHECK(out_offsets.dtype() == AITER_DTYPE_i64 && out_offsets.is_contiguous() &&
+        AITER_CHECK(out_offsets.dtype() == AITER_DTYPE_i32 && out_offsets.is_contiguous() &&
                         static_cast<int64_t>(out_offsets.numel()) >= rows,
-                    "out_offsets must be contiguous int64 with an entry a row");
+                    "out_offsets must be contiguous int32 with an entry a row");
         AITER_CHECK(out.is_contiguous(), "a flat out must be contiguous");
     } else {
         AITER_CHECK(out.dim() == 2 && out.size(0) >= rows && out.stride(1) == 1,
@@ -738,7 +738,7 @@ void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
     k.ptr_block_tables    = reinterpret_cast<const int*>(block_tables.data_ptr());
     k.ptr_weights         = weights.data_ptr();
     k.ptr_out             = reinterpret_cast<float*>(out.data_ptr());
-    k.ptr_out_offsets     = flat ? reinterpret_cast<const long long*>(out_offsets.data_ptr())
+    k.ptr_out_offsets     = flat ? reinterpret_cast<const int*>(out_offsets.data_ptr())
                                  : nullptr;
     k.ptr_query_start_loc = reinterpret_cast<const int*>(query_start_loc.data_ptr());
     k.ptr_row_ends        = reinterpret_cast<const int*>(row_ends.data_ptr());

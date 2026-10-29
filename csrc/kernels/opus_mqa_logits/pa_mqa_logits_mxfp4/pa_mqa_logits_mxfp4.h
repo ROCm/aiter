@@ -57,7 +57,7 @@ struct mqa_logits_mxfp4_kargs {
     const int* ptr_block_tables;              // [num_seqs, bt_stride]
     const void* ptr_weights;                  // [rows, H] bf16
     float* ptr_out;                           // [rows, out_stride], or flat with ptr_out_offsets
-    const long long* ptr_out_offsets;         // [rows] each row's first logit, or null
+    const int* ptr_out_offsets;               // [rows] each row's first logit, or null
     const int* ptr_query_start_loc;           // [num_seqs + 1]
     const int* ptr_row_ends;                  // [rows]
     const opus_mqa_cta_record* ptr_cta_info;  // Table only

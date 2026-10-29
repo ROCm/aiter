@@ -651,7 +651,7 @@ def check_rows(model):
             flat = None
             if cfg._instance.flat_out:
                 ends = rows.row_ends.long()
-                offs = torch.cumsum(ends, 0) - ends
+                offs = (torch.cumsum(ends, 0) - ends).int()
                 total = int(ends.sum())
                 flat = torch.full((total + 256,), float("nan"))  # the tail is a guard
                 launch(case, cfg, flat, schedule=schedule, out_offsets=offs)
@@ -970,6 +970,11 @@ def check_errors(model):
     }
     if not cfg._instance.flat_out:
         tries["out_offsets on an instance without a flat out"] = call(
+            out=torch.empty(rows.rows * rows.width),
+            out_offsets=torch.zeros(rows.rows, dtype=torch.int32),
+        )
+    else:
+        tries["int64 out_offsets"] = call(
             out=torch.empty(rows.rows * rows.width),
             out_offsets=torch.zeros(rows.rows, dtype=torch.int64),
         )
