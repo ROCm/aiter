@@ -51,9 +51,11 @@ except:  # noqa: E722
 
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
-# gfx1250, short queries (speculative-decode verify, q_len = 1 + num_spec): the 3D
-# split-KV kernel beats the 2D one while it splits each sequence's KV at least this
-# many ways. A 2D program covers a whole GQA group of a sequence, so the 2D grid is
+# gfx1250, short queries (speculative-decode verify, q_len = 1 + num_spec): at most
+# this many query tokens a sequence. Such a batch takes the 3D split-KV kernel while it
+# has at most the attn_3d entry's MAX_QUERY_ROWS_PER_CU query rows (tokens * query
+# heads) per CU; without one, while it splits each sequence's KV at least
+# _GFX12_3D_MIN_SEGMENTS ways. A 2D program covers a whole GQA group of a sequence, so the 2D grid is
 # sequences * KV heads programs; one walk over the longest context bounds it. The 3D
 # kernel pays for its split in one-page tiles, partial outputs and a reduce. Measured
 # on Qwen3.5 (16 q / 2 kv heads, d 256, 4-token verify, 28k-token mean context):
@@ -68,6 +70,16 @@ _GFX12_3D_MIN_SEGMENTS = 4
 # left to the deployment. Qwen3.5 d 256, 2 kv heads, 40k-190k-token contexts,
 # 19-32 live of 24/32 captured: 64 is 5-23% faster than the heuristic's 16-32.
 _GFX12_3D_SEGMENTS_FLOOR = int(os.environ.get("AITER_GFX12_MIN_SEGMENTS", "0"))
+# attn_3d config keys that steer use_2d_kernel on gfx1250 rather than the launch:
+# MAX_QUERY_ROWS_PER_CU sets the short-query bound above, and
+# PREFILL_MAX_2D_PRGMS / PREFILL_MIN_KV / PREFILL_MIN_KV_PER_PRGM opt an entry
+# into the 3D split for prefill over a long cached prefix (see use_2d_kernel).
+_GFX12_ROUTING_KEYS = (
+    "MAX_QUERY_ROWS_PER_CU",
+    "PREFILL_MAX_2D_PRGMS",
+    "PREFILL_MIN_KV",
+    "PREFILL_MIN_KV_PER_PRGM",
+)
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -197,11 +209,14 @@ def _gfx12_split_params(params: _UAParams):
     verify of a GQA-8 group), so the bound is 3x the grid and the split it
     yields too narrow: a CUDA graph captured at 96 sequences split 2 ways, which
     is slower than the 2d kernel, where 8 ways is 1.3-2.1x faster than 2d at
-    48-80 live sequences.
+    48-80 live sequences. An entry with a tuned MAX_QUERY_ROWS_PER_CU keeps the
+    split it was tuned with.
     """
     if not params.spec_decode:
         return params
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    if "MAX_QUERY_ROWS_PER_CU" in config:
+        return params
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
     block_q = block_m // params.num_queries_per_kv
     num_q_blocks = min(
@@ -223,16 +238,48 @@ def _gfx950_split_grid(params: _UAParams):
     return config["NUM_SEGMENTS"] > 1
 
 
+def _gfx12_2d_prgms(params: _UAParams):
+    """Programs the gfx1250 2D kernel would launch: KV heads x query blocks."""
+    config = get_unified_attention_config("attn_2d", params, backend="gluon")
+    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    block_q = block_m // params.num_queries_per_kv
+    return params.num_kv_heads * (params.num_tokens // block_q + params.num_seqs)
+
+
+def _gfx12_prefill_2d(params: _UAParams, route: dict):
+    """With few KV heads (TP) a prefill chunk can launch too few 2D programs to
+    fill the GPU, each streaming the whole prefix; the 3D kernel splits the KV
+    range instead. It pays while each of those programs has a long run of keys
+    to split, i.e. the prefix dominates the chunk."""
+    max_prgms = route.get("PREFILL_MAX_2D_PRGMS", 0)
+    if max_prgms == 0:
+        return True
+    prgms = _gfx12_2d_prgms(params)
+    min_kv = max(
+        route.get("PREFILL_MIN_KV", 0),
+        route.get("PREFILL_MIN_KV_PER_PRGM", 0) * prgms,
+    )
+    return prgms >= max_prgms or params.max_seqlen_k < min_kv
+
+
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     # if IS_DEVICE_ARCH_GFX12, use 3D for decode, and for short (spec-decode verify)
-    # queries while the KV split is wide enough to pay for itself; 2D otherwise.
+    # queries while their rows are too few to fill the 2D grid (a tuned rows cap)
+    # or the KV split is wide enough to pay for itself; 2D otherwise, unless the
+    # attn_3d entry opts prefill over a long cached prefix into the 3D split.
     if IS_DEVICE_ARCH_GFX12:
         if params.sliding_window > 0:
             return True
         if params.all_decode:
             return False
+        route = get_unified_attention_config("attn_3d", params, backend="gluon")
         if params.max_seqlen_q > _GFX12_3D_MAX_SEQLEN_Q:
-            return True
+            return _gfx12_prefill_2d(params, route)
+        rows_cap = route.get("MAX_QUERY_ROWS_PER_CU")
+        if rows_cap is not None:
+            return (
+                params.num_tokens * params.num_query_heads > rows_cap * params.num_sms
+            )
         gluon_3d = is_3d_gluon_available(params, backend)
         if gluon_3d and params.spec_decode:
             # The exact grid: 2d runs one program per query block and KV head, and
@@ -1006,6 +1053,8 @@ def _unified_attention_3d_gfx1250(
     QUERY_DTYPE = get_dtype_str(params.q_dtype)
     KV_CACHE_DTYPE = get_dtype_str(params.kv_cache_dtype)
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    for key in _GFX12_ROUTING_KEYS:
+        config.pop(key, None)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
