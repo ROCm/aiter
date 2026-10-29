@@ -1722,25 +1722,26 @@ def _moe_gemm_a8w4_decode(
         gl.amd.gfx1250.tdm.async_scatter(y_desc, dst, y_buffer)
         gl.amd.gfx1250.tdm.async_wait(0)
     else:
-        # TDM Store: accumulator → shared memory → global memory
+        # Store the accumulator straight from registers. The tile used to go
+        # registers -> LDS (ds_store) -> TDM store; on gfx1250 that TDM store
+        # can read stale LDS (16-byte chunks of the weight tile last loaded into
+        # the aliased w_buffer slot) despite s_wait_dscnt 0 + s_barrier before
+        # it, when 3-4 of these workgroups share a WGP. Under decode load that
+        # put garbage (up to ~1e38) into a few MoE rows per million calls.
         Y += start_m.to(index_type) * stride_y_m
-        y_buffer = gl.allocate_shared_memory(
-            Y.type.element_ty,
-            shape=[BLOCK_M, OUT_BLOCK_N],
-            layout=SHARED_LAYOUT_Y,
+        OUT_LAYOUT: gl.constexpr = out.type.layout
+        offs_y_m = block_id * BLOCK_M + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT)
         )
-        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=Y,
-            shape=(M, yN),
-            strides=(stride_y_m, stride_y_n),
-            block_shape=(BLOCK_M, OUT_BLOCK_N),
-            layout=SHARED_LAYOUT_Y,
+        offs_y_n = pid_n * OUT_BLOCK_N + gl.arange(
+            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT)
         )
-        y_buffer.store(out)
-        gl.amd.gfx1250.tdm.async_store(
-            y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        mask_y = (offs_y_m < M)[:, None] & (offs_y_n < yN)[None, :]
+        gl.store(
+            Y + offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n,
+            out,
+            mask=mask_y,
         )
-        gl.amd.gfx1250.tdm.async_wait(0)
 
 
 def _gather_idx_dtype(gather_indx):
