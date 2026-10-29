@@ -33,9 +33,10 @@ Tile size and number of splits (segments) are derived from the following paramet
 TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
 and the SPLIT_MIN_* floors; see compute_segment_params.
 A kv_split entry may add SPLIT_PROGRAMS_PER_CU to make the Triton 3D split
-length-aware: NUM_SEGMENTS then only caps one sequence's split, and each sequence
-takes its share of num_sms * SPLIT_PROGRAMS_PER_CU programs by its KV length on
-the GPU; see _length_aware_split_budget in attention/unified_attention.py.
+length-aware: each sequence takes its share of num_sms * SPLIT_PROGRAMS_PER_CU
+programs by its KV length on the GPU, capped by the segment count that
+SPLIT_SEGMENTS_PER_CU gives; calls the split does not cover keep the uniform
+NUM_SEGMENTS. See _length_aware_split in attention/unified_attention.py.
 """
 
 import copy
@@ -178,6 +179,7 @@ def compute_segment_params(config: dict, params) -> dict:
         return config
     small_split_max = config.pop("SMALL_SPLIT_MAX", None)
     per_cu = config.pop("SEGMENTS_PER_CU")
+    split_per_cu = config.pop("SPLIT_SEGMENTS_PER_CU", None)
     lo = config.pop("MIN_SEGMENTS", 1)
     cap = config.pop("MAX_SEGMENTS", None)
     tile_lo = config.pop("SEGMENT_TILE_MIN", 1)
@@ -193,20 +195,25 @@ def compute_segment_params(config: dict, params) -> dict:
     if cap is not None:
         limit = min(cap, limit)
 
-    budget = params.num_sms * per_cu
-    prgms = max(1, params.num_2d_prgms)
-    # this is specific to gfx950 gluon as the num waves depends on mfma dim there
-    if mfma_dim:
-        num_waves = max(
-            1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim
-        )
-        budget //= num_waves
-    share = triton.cdiv(budget, prgms)
-    if limit <= min_tiles or share < min_share:
-        segments = 1
-    else:
+    def num_segments(per_cu):
+        budget = params.num_sms * per_cu
+        prgms = max(1, params.num_2d_prgms)
+        # this is specific to gfx950 gluon as the num waves depends on mfma dim there
+        if mfma_dim:
+            num_waves = max(
+                1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim
+            )
+            budget //= num_waves
+        share = triton.cdiv(budget, prgms)
+        if limit <= min_tiles or share < min_share:
+            return 1
         claim = max(min(lo, limit), min(limit, max(1, share)))
-        segments = triton.next_power_of_2(claim)
+        return triton.next_power_of_2(claim)
+
+    segments = num_segments(per_cu)
+    if split_per_cu is not None:
+        # the length-aware split's cap; NUM_SEGMENTS stays the uniform split
+        config["SPLIT_NUM_SEGMENTS"] = num_segments(split_per_cu)
     if small_split_max is None:
         config["NUM_SEGMENTS"] = segments
     elif segments <= min(small_split_max, limit):

@@ -148,29 +148,34 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
 
 
-def _length_aware_split_budget(config, params: _UAParams, num_segments: int):
-    """Segments per KV head the length-aware KV split shares out, or None when off.
+def _length_aware_split(config, params: _UAParams):
+    """(split_budget, NUM_SEGMENTS) for the length-aware KV split, or None when off.
 
     A kv_split entry opts in with SPLIT_PROGRAMS_PER_CU, for batches where every
-    sequence fits one query block (decode, short verify queries). NUM_SEGMENTS
-    then only caps one sequence's split and sizes the partial buffers: each
-    sequence takes a share of num_sms * SPLIT_PROGRAMS_PER_CU working programs
-    by its KV length, read on the GPU (see seq_num_segments), so a CUDA graph
-    captured with the 1M max_seqlen_k bound still splits by the real lengths.
-    skip_reduce keeps the uniform split: its caller merges NUM_SEGMENTS slots.
+    sequence fits one query block (decode, short verify queries). Each sequence
+    takes a share of num_sms * SPLIT_PROGRAMS_PER_CU working programs by its KV
+    length, read on the GPU (see seq_num_segments), so a CUDA graph captured
+    with the 1M max_seqlen_k bound still splits by the real lengths.
+    NUM_SEGMENTS is then SPLIT_NUM_SEGMENTS, which only caps one sequence's
+    split; calls left out, skip_reduce included, keep the uniform NUM_SEGMENTS.
     """
     per_cu = config.get("SPLIT_PROGRAMS_PER_CU")
+    num_segments = config.get("SPLIT_NUM_SEGMENTS", config["NUM_SEGMENTS"])
     if per_cu is None or num_segments == 1 or params.skip_reduce:
+        return None
+    # tuned for bf16 Q; the config's bf16 dtype tag also covers fp16
+    if params.q_dtype != torch.bfloat16:
         return None
     if not params.all_decode and params.max_seqlen_q > _attn_3d_block_q(params):
         return None
     budget = max(1, params.num_sms * per_cu // params.num_kv_heads)
-    # the kernels sum the KV lengths in int32 and pack work-item counts in 16 bits
-    if params.num_seqs * params.max_seqlen_k >= 2**31:
+    # the kernels sum the KV lengths and round that up by budget in int32, and
+    # pack work-item counts in 16 bits
+    if params.num_seqs * params.max_seqlen_k + budget >= 2**31:
         return None
     if budget + params.num_seqs >= 2**16:
         return None
-    return budget
+    return budget, int(num_segments)
 
 
 def _attn_3d_block_q(params: _UAParams) -> int:
@@ -464,11 +469,10 @@ def unified_attention(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
         NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
-        split_budget = (
-            None
-            if use_gluon_3d
-            else _length_aware_split_budget(config, params, NUM_SEGMENTS)
-        )
+        split_budget = None
+        length_aware = None if use_gluon_3d else _length_aware_split(config, params)
+        if length_aware is not None:
+            split_budget, NUM_SEGMENTS = length_aware
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.

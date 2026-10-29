@@ -12,12 +12,14 @@ import triton
 
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
+    _length_aware_split,
     is_2d_gluon_available,
     unified_attention,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils.unified_attention_utils import get_unified_attention_config
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
@@ -784,6 +786,50 @@ def test_triton_unified_attn_3d_length_aware_split(
         start += q_len
         rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
         assert rel_err < 2e-2, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+
+
+def _gfx950_split(**overrides):
+    """gfx950 Triton kv_split config and params, Kimi-K3 draft decode at the 1M bound."""
+    p = {
+        "head_size": 64,
+        "head_size_v": 64,
+        "max_seqlen_q": 1,
+        "max_seqlen_k": 1 << 20,
+        "sliding_window": 0,
+        "shuffled_kv_cache": False,
+        "q_dtype": torch.bfloat16,
+        "kv_cache_dtype": e4m3_dtype,
+        "block_size": 128,
+        "num_sms": 256,
+        "num_seqs": 64,
+        "num_kv_heads": 2,
+        "num_queries_per_kv": 4,
+        "all_decode": True,
+        "skip_reduce": False,
+    }
+    p.update(overrides)
+    params = SimpleNamespace(**p, num_2d_prgms=p["num_seqs"] * p["num_kv_heads"])
+    config = get_unified_attention_config("kv_split", params, arch="gfx950")
+    return config, params
+
+
+def test_length_aware_split_scope() -> None:
+    """The length-aware entry leaves every call it does not split as before."""
+    config, params = _gfx950_split()
+    _, num_segments = _length_aware_split(config, params)
+    assert num_segments == config["SPLIT_NUM_SEGMENTS"] > config["NUM_SEGMENTS"]
+    # calls left out keep the uniform split of the head <= 128 entry
+    head_128, _ = _gfx950_split(head_size=128, head_size_v=128)
+    assert config["NUM_SEGMENTS"] == head_128["NUM_SEGMENTS"]
+    for left_out in ({"q_dtype": torch.float16}, {"skip_reduce": True}):
+        assert _length_aware_split(*_gfx950_split(**left_out)) is None
+    # head 64 only
+    head_32, _ = _gfx950_split(head_size=32, head_size_v=32)
+    assert "SPLIT_PROGRAMS_PER_CU" not in head_32
+    # the kernels round sum(seq_len) up by the budget in int32
+    edge = {"num_seqs": 1023, "num_kv_heads": 1}
+    assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=1 << 21))
+    assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=2_099_202)) is None
 
 
 @pytest.mark.parametrize(

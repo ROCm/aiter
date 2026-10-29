@@ -73,7 +73,8 @@ def find_seq_idx(
 def batch_segment_tokens(lens, seq_lens_ptr, num_seqs, split_budget, SEQ_BLOCK):
     """segment_tokens for the batch; lens holds the first SEQ_BLOCK lengths.
 
-    int32 is enough: the launcher keeps num_seqs * max_seqlen_k below 2**31.
+    int32 is enough: the launcher keeps num_seqs * max_seqlen_k + split_budget
+    below 2**31.
     """
     total = tl.sum(lens)
     for s0 in range(SEQ_BLOCK, num_seqs, SEQ_BLOCK):
