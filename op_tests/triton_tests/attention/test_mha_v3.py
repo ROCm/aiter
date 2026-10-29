@@ -7,7 +7,7 @@ import pytest
 import torch
 from einops import rearrange, repeat
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import ANY_FP8_ARCHS
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_func,
@@ -26,7 +26,7 @@ from aiter.test_mha_common import (
 )
 
 _arch = get_arch()
-_supports_fp8 = _arch in FP8_ARCHS
+_supports_fp8 = _arch in ANY_FP8_ARCHS
 
 SEED = 0
 
@@ -267,7 +267,7 @@ def test_flash_attn_kvcache(
     seqlen_new = (
         seqlen_q
         if seqlen_new_eq_seqlen_q
-        else torch.randint(1, seqlen_q + 1, (1,)).item()
+        else torch.randint(1, seqlen_q + 1, (1,), device=device).item()
     )
     if new_kv:
         k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
@@ -682,7 +682,7 @@ def test_flash_attn_kvcache_torch_compile(
         out_eager = out_eager[0]
     torch.cuda.synchronize()
 
-    compiled_fn = torch.compile(fn)
+    compiled_fn = torch.compile(fn, dynamic=False)
     k_cache_compiled = k_cache.clone()
     v_cache_compiled = v_cache.clone()
     out_compiled = compiled_fn(

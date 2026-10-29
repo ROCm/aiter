@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import re
 
 _MXMOE_NUMERIC_TOKENS = {
@@ -97,6 +98,11 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
 
 
 def _parse_mxfp4_g1_kname(kname: str) -> dict:
+    return dict(_parse_mxfp4_g1_kname_cached(kname))
+
+
+@functools.cache
+def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
     # Gate/up layout comes from the runtime gate_mode; the same config name
     # can compile both interleaved and separated GPU kernels.
     parsed = _tokenize_mxfp4_kname(kname, 1, _MXMOE_G1_FLAG_TOKENS)
@@ -122,6 +128,11 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
 
 
 def _parse_mxfp4_g2_kname(kname: str) -> dict:
+    return dict(_parse_mxfp4_g2_kname_cached(kname))
+
+
+@functools.cache
+def _parse_mxfp4_g2_kname_cached(kname: str) -> dict:
     parsed = _tokenize_mxfp4_kname(kname, 2, _MXMOE_G2_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
     atomic = "ATOMIC" in flags
@@ -154,6 +165,12 @@ def _is_mxfp4_kname(kname) -> bool:
 
 
 def parse_flydsl_v2_gemm2_kernel(name):
+    parsed = _parse_flydsl_v2_gemm2_kernel_cached(name)
+    return None if parsed is None else dict(parsed)
+
+
+@functools.cache
+def _parse_flydsl_v2_gemm2_kernel_cached(name):
     m = _FLYDSL_V2_GEMM2_RE.match(name or "")
     if not m:
         return None
