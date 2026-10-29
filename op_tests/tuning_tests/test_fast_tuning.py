@@ -1477,6 +1477,35 @@ class TestPowerTableSeparation(unittest.TestCase):
         self.assertEqual(list(merged["select"]), ["power", "latency"])
         self.assertEqual(list(merged["xbf16"]), [0, 0])
 
+    def test_prebuild_config_load_does_not_import_aiter_package(self):
+        import subprocess
+
+        script = """
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.environ["AITER_REPO"], "aiter"))
+os.environ["AITER_SELECT"] = "power"
+from jit import core
+
+assert "aiter" not in sys.modules
+path = core.AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE
+assert path
+assert "aiter" not in sys.modules
+"""
+        env = os.environ.copy()
+        env["AITER_REPO"] = str(REPO_ROOT)
+        env["AITER_SELECT"] = "power"
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

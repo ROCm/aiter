@@ -268,6 +268,21 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
 )
 
 
+def _runtime_power_overlay() -> bool:
+    """True when a running ``import aiter`` asked for the power-table overlay.
+
+    setup.py loads this file as ``jit.core`` and evaluates config properties
+    while building the wheel. Importing ``aiter.utility`` from that copy runs
+    ``aiter/__init__.py`` and requests ``module_aiter_core`` before the build
+    has registered it. The overlay only changes which CSV dispatch reads, so
+    the prebuild keeps the latency tables.
+    """
+    raw = os.environ.get("AITER_SELECT", "latency").strip().lower()
+    if raw not in {"power", "efficiency", "power_efficiency"}:
+        return False
+    return "aiter" in sys.modules
+
+
 class AITER_CONFIG:
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
@@ -518,9 +533,16 @@ class AITER_CONFIG:
             f"to their paths, separated by '{os.pathsep}'; this also skips the "
             f"model_configs/ scan.\n"
         )
-        from aiter.utility.power_configs import power_merge_conflict
+        # A latency table has no ``select`` column, and power_merge_conflict
+        # would return None. Skip the import in that case. setup.py loads this
+        # module as ``jit.core`` before the aiter package exists; importing
+        # ``aiter.utility`` from there runs aiter/__init__.py while
+        # module_aiter_core is still being registered.
+        conflict = None
+        if "select" in dup_rows.columns and "aiter" in sys.modules:
+            from aiter.utility.power_configs import power_merge_conflict
 
-        conflict = power_merge_conflict(dup_rows, dedup_keys)
+            conflict = power_merge_conflict(dup_rows, dedup_keys)
         if conflict:
             # Ranking these rows against each other would compare watts from
             # different clocks or caps, or energy against latency. Keep every
@@ -791,11 +813,16 @@ class AITER_CONFIG:
                 config_file = self.update_config_files(
                     tuned_files, tuned_file_name, env_name
                 )
-            from aiter.utility.power_configs import apply_power_overlay
+            # Overlay only at runtime. The wheel build evaluates these
+            # properties from ``jit.core`` with the aiter package not yet
+            # imported, and apply_power_overlay is a no-op unless
+            # AITER_SELECT asks for power.
+            if _runtime_power_overlay():
+                from aiter.utility.power_configs import apply_power_overlay
 
-            config_file = apply_power_overlay(
-                self, config_file, tuned_file_name, env_name
-            )
+                config_file = apply_power_overlay(
+                    self, config_file, tuned_file_name, env_name
+                )
         else:
             config_file = self.update_config_files(
                 config_env_file, tuned_file_name, env_name
