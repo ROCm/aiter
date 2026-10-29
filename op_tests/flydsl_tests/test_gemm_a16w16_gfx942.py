@@ -550,6 +550,22 @@ def test_gfx942_fallback_catalog_bounds_dynamic_m_configs():
     assert len(selected) <= len(g.FALLBACK_CATALOG)
 
 
+def test_gfx942_fallback_catalog_keeps_n336_down_projection_family():
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    config = g.gfx942_fallback_config(4000, 336, 10240)
+    keys = (
+        "block_m",
+        "block_n",
+        "block_k",
+        "split_k",
+        "m_waves",
+        "n_waves",
+        "k_waves",
+    )
+    assert tuple(config[key] for key in keys) == (128, 112, 128, 3, 4, 1, 1)
+
+
 @pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
 @pytest.mark.parametrize(
     "split_k",
