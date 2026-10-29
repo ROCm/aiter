@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -24,17 +25,16 @@ from aiter.ops.opus import (
 from aiter.ops.opus._arch import GFX1250, SUPPORTED_OPUS_ARCHES
 from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
 from csrc.opus_gemm.opus_gemm_common import (
-    BIAS_AWARE_KIDS,
     CO_KERNELS_JSON,
-    DEFAULT_COMPILED_KIDS_BY_ARCH,
+    DEFAULT_COMPILED_KIDS_BY_NAMESPACE,
     GFX1250_4WAVE_CO_KIDS,
-    NON_SPLITK_KIDS,
+    GFX1250_SPLITK_FUSE_KIDS,
     OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
-    SPLITK_KIDS,
     _load_co_kernels,
     co_image_path,
     get_kernel_instance,
     gfx1250_4wave_co_kernels_list,
+    group_kids,
     kernel_needs_external_workspace,
 )
 
@@ -46,7 +46,7 @@ def _co_plan(kid: int, **overrides):
         "N": 128,
         "K": 4096,
         "batch": 1,
-        "cu_num": 80,
+        "cu_num": 256,
         "has_bias": False,
         "input_dtype": torch.bfloat16,
         "output_dtype": torch.bfloat16,
@@ -55,6 +55,23 @@ def _co_plan(kid: int, **overrides):
     }
     arguments.update(overrides)
     return _get_cached_a16w16_launch_plan(**arguments)
+
+
+def _co_test_root() -> Path:
+    # CO symbols are cached per process in the host launcher. Run baseline and
+    # named candidates in separate pytest processes, never switch mid-process.
+    return Path(os.environ.get("OPUS_TEST_CO_ROOT", str(Path(CO_KERNELS_JSON).parent)))
+
+
+def _co_test_profile_dirs(root: Path) -> list[tuple[Path, str]]:
+    """Image directories plus their relative layout for combined/direct roots."""
+    if (root / "build_info.json").is_file():
+        return [(root, "")]
+    return [
+        (root / name, name)
+        for name in (GFX1250, f"{GFX1250}-a0")
+        if (root / name / "build_info.json").is_file()
+    ]
 
 
 def _runtime_arch() -> str | None:
@@ -72,8 +89,8 @@ def _representative_kids(kids) -> tuple[int, ...]:
 
 def _gfx1250_workspace_representatives() -> tuple[int, ...]:
     by_tag = {}
-    for kid in sorted(SPLITK_KIDS):
-        instance = get_kernel_instance(GFX1250, "a16w16", kid)
+    for kid in sorted(group_kids("SPLITK_KIDS", GFX1250, cu_num=256)):
+        instance = get_kernel_instance(GFX1250, "a16w16", kid, cu_num=256)
         if instance is not None:
             by_tag.setdefault(instance.kernel_tag, kid)
     return tuple(by_tag.values())
@@ -108,19 +125,30 @@ def _run_gfx1250_co_case(kid: int, device: torch.device | None = None) -> None:
         f"shape=({M},{N},{K})"
     )
 
-    generator = torch.Generator(device=device).manual_seed(kid)
-    A = torch.randn((M, K), device=device, dtype=torch.bfloat16, generator=generator)
-    B = torch.randn((N, K), device=device, dtype=torch.bfloat16, generator=generator)
+    # A0 bring-up runtimes may not provide working GPU RNG/reference kernels.
+    # This explicit mode keeps the same shapes and strong checks with CPU data
+    # generation/golden; the selected CO still executes on the real device.
+    cpu_reference = os.environ.get("OPUS_CO_CPU_REFERENCE") == "1"
+    random_device = "cpu" if cpu_reference else device
+    generator = torch.Generator(device=random_device).manual_seed(kid)
+    A_source = torch.randn(
+        (M, K), device=random_device, dtype=torch.bfloat16, generator=generator
+    )
+    B_source = torch.randn(
+        (N, K), device=random_device, dtype=torch.bfloat16, generator=generator
+    )
+    A, B = A_source.to(device), B_source.to(device)
     Y = torch.full((M, N), float("nan"), device=device, dtype=torch.bfloat16)
 
-    actual = opus_gemm(A, B, Y, kid=kid, split_k=0)
+    actual = opus_gemm(A, B, Y, family="a16w16", kid=kid, split_k=0)
     torch.cuda.synchronize(device)
     assert actual is Y, context
-    assert torch.isfinite(actual).all().item(), context
+    checked = actual.cpu() if cpu_reference else actual
+    assert torch.isfinite(checked).all().item(), context
 
-    reference = A.float() @ B.float().T
+    reference = A_source.float() @ B_source.float().T
     try:
-        torch.testing.assert_close(actual.float(), reference, rtol=0.03, atol=0.5)
+        torch.testing.assert_close(checked.float(), reference, rtol=0.03, atol=0.5)
     except AssertionError as error:
         raise AssertionError(f"{context}\n{error}") from error
 
@@ -128,16 +156,21 @@ def _run_gfx1250_co_case(kid: int, device: torch.device | None = None) -> None:
 def _run_gfx1250_co_override_case(available_kid: int, missing_kid: int) -> None:
     override_root = Path(os.environ["OPUS_GEN_CO_DIR"])
     missing_instance = gfx1250_4wave_co_kernels_list[missing_kid]
-    missing_image = override_root / GFX1250 / f"{missing_instance.name}.co"
+    missing_images = [
+        override_root / directory / f"{missing_instance.name}.co"
+        for directory in (GFX1250, f"{GFX1250}-a0", "")
+    ]
     try:
         _run_gfx1250_co_case(missing_kid)
     except RuntimeError as error:
-        if str(missing_image) not in str(error):
+        if not any(str(path) in str(error) for path in missing_images):
             raise AssertionError(
-                f"override lookup did not report expected path {missing_image}: {error}"
+                f"override lookup did not report a selected missing-image path {missing_images}: {error}"
             ) from error
     else:
-        raise AssertionError(f"override lookup unexpectedly found {missing_image}")
+        raise AssertionError(
+            f"override lookup unexpectedly found a missing image {missing_images}"
+        )
 
     _run_gfx1250_co_case(available_kid)
 
@@ -153,12 +186,16 @@ def test_co_manifest_uses_supported_architecture_keys():
 def test_gfx1250_co_registry_and_launch_contract():
     assert len(gfx1250_4wave_co_kernels_list) == 221
     assert GFX1250_4WAVE_CO_KIDS == frozenset(gfx1250_4wave_co_kernels_list)
-    assert min(GFX1250_4WAVE_CO_KIDS) == 21016
-    assert max(GFX1250_4WAVE_CO_KIDS) == 21317
-    assert GFX1250_4WAVE_CO_KIDS <= NON_SPLITK_KIDS
-    assert GFX1250_4WAVE_CO_KIDS <= DEFAULT_COMPILED_KIDS_BY_ARCH[GFX1250]
-    assert GFX1250_4WAVE_CO_KIDS.isdisjoint(SPLITK_KIDS)
-    assert GFX1250_4WAVE_CO_KIDS.isdisjoint(BIAS_AWARE_KIDS)
+    assert min(GFX1250_4WAVE_CO_KIDS) == 496
+    assert max(GFX1250_4WAVE_CO_KIDS) == 716
+    assert GFX1250_4WAVE_CO_KIDS <= group_kids("NON_SPLITK_KIDS", GFX1250, cu_num=256)
+    assert GFX1250_4WAVE_CO_KIDS <= DEFAULT_COMPILED_KIDS_BY_NAMESPACE[(GFX1250, 256)]
+    assert GFX1250_4WAVE_CO_KIDS.isdisjoint(
+        group_kids("SPLITK_KIDS", GFX1250, cu_num=256)
+    )
+    assert GFX1250_4WAVE_CO_KIDS.isdisjoint(
+        group_kids("BIAS_AWARE_KIDS", GFX1250, cu_num=256)
+    )
     assert {
         "a16w16_4wave_co",
         "a16w16_4wave_wl_co",
@@ -167,11 +204,13 @@ def test_gfx1250_co_registry_and_launch_contract():
 
     kid = min(GFX1250_4WAVE_CO_KIDS)
     assert (
-        get_kernel_instance(GFX1250, "a16w16", kid, torch.bfloat16)
-        is gfx1250_4wave_co_kernels_list[kid]
+        get_kernel_instance(GFX1250, "a16w16", kid, torch.bfloat16, cu_num=256)
+        == gfx1250_4wave_co_kernels_list[kid]
     )
-    assert get_kernel_instance(GFX1250, "a16w16", kid, torch.float32) is None
-    assert not kernel_needs_external_workspace(GFX1250, "a16w16", kid)
+    assert (
+        get_kernel_instance(GFX1250, "a16w16", kid, torch.float32, cu_num=256) is None
+    )
+    assert not kernel_needs_external_workspace(GFX1250, "a16w16", kid, cu_num=256)
 
     for split_k in (0, 1):
         plan = _co_plan(kid, split_k=split_k)
@@ -199,19 +238,22 @@ def test_gfx1250_co_registry_and_launch_contract():
     ),
 )
 def test_gfx1250_co_bmm_reaches_exact_launch(kid, split_k, entry, monkeypatch):
+    from aiter.ops.opus import dispatch
+
     calls = []
 
     def capture(XQ, WQ, Y, bias, workspace, launched_kid, launch_split_k):
         calls.append((XQ, WQ, Y, bias, workspace, launched_kid, launch_split_k))
 
-    monkeypatch.setattr(gemm_op_a16w16, "_device_arch_and_cu", lambda _: (GFX1250, 80))
+    monkeypatch.setattr(dispatch, "_device_arch_and_cu", lambda _: (GFX1250, 256))
+    monkeypatch.setattr(gemm_op_a16w16, "_device_arch_and_cu", lambda _: (GFX1250, 256))
     monkeypatch.setattr(gemm_op_a16w16, "_opus_gemm_a16w16_launch_raw", capture)
     A = torch.empty((2, 64, 512), device="meta", dtype=torch.bfloat16)
     B = torch.empty((2, 64, 512), device="meta", dtype=torch.bfloat16)
     Y = torch.empty((2, 64, 64), device="meta", dtype=torch.bfloat16)
 
     if entry == "opus_bmm":
-        actual = opus_bmm(A, B, Y, kid=kid, split_k=split_k)
+        actual = opus_bmm(A, B, Y, family="a16w16", kid=kid, split_k=split_k)
     else:
         actual = gemm_a16w16_opus(A, B, kernelId=kid, splitK=split_k, out=Y)
 
@@ -286,14 +328,118 @@ def test_gfx1250_co_assets_and_host_only_codegen(tmp_path, monkeypatch):
     assert codegen._device_instantiations == []
 
 
+def test_gfx1250_named_co_assets_and_placement():
+    root = (
+        _co_test_root()
+        if os.environ.get("OPUS_TEST_CO_ROOT")
+        else Path(CO_KERNELS_JSON).parent / "named_reg"
+    )
+    profiles = _co_test_profile_dirs(root)
+    assert profiles, f"no CO build_info found under combined/direct root {root}"
+    symbols = {kid: k.name for kid, k in gfx1250_4wave_co_kernels_list.items()}
+    for image_dir, _ in profiles:
+        build_info = json.loads((image_dir / "build_info.json").read_text())
+        assert {
+            entry["kid"]: entry["symbol"] for entry in build_info["kernels"]
+        } == symbols
+        for entry in build_info["kernels"]:
+            assert entry["pinning_mode"] == "named-register"
+            assert entry["kernarg_segment_size"] == 64
+            assert entry["ir_read_register"] > 0 and entry["ir_write_register"] > 0
+            assert entry["named_vgpr_tuples"]
+            assert entry["wmma_placement_checked"]
+            assert entry["wmma_dst_in_named_bank"] == entry["dis_wmma"] > 0
+            assert entry["vgpr_spill_count"] == entry["sgpr_spill_count"] == 0
+            assert (
+                entry["co_sha256"]
+                == hashlib.sha256(
+                    (image_dir / f"{entry['symbol']}.co").read_bytes()
+                ).hexdigest()
+            )
+
+
 @pytest.mark.parametrize(
     "kid",
     sorted(gfx1250_4wave_co_kernels_list),
     ids=lambda kid: f"kid-{kid}",
 )
 def test_gfx1250_co_kernel_matches_torch(kid, _gfx1250_device, monkeypatch):
-    monkeypatch.setenv("OPUS_GEN_CO_DIR", str(Path(CO_KERNELS_JSON).parent))
+    monkeypatch.setenv("OPUS_GEN_CO_DIR", str(_co_test_root()))
     _run_gfx1250_co_case(kid, _gfx1250_device)
+
+
+@pytest.mark.parametrize("kid", (543, 544, 596, 612, 715, 716))
+@pytest.mark.parametrize("case", ("tiny", "one_step", "ring_tail", "steady_tail"))
+@pytest.mark.parametrize("split_k", (0, 1))
+@pytest.mark.parametrize("pad", (0, 8))
+def test_gfx1250_named_co_bmm_and_graph(
+    kid, case, split_k, pad, _gfx1250_device, monkeypatch
+):
+    """Named tuples must survive ring loops and reinitialize on every launch.
+
+    Cover all three CO families, wave layouts, distinct batches, padded source
+    rows and both no-split spellings. Poisoning Y before each graph replay catches
+    missed stores as well as an accumulator that carries over from a prior run.
+    """
+    monkeypatch.setenv("OPUS_GEN_CO_DIR", str(_co_test_root()))
+    instance = gfx1250_4wave_co_kernels_list[kid]
+    if case == "tiny":
+        M = N = K = 1
+    else:
+        M = instance.B_M * instance.cluster_wg_m + 1
+        N = instance.B_N * instance.cluster_wg_n + 1
+        K = {
+            "one_step": instance.B_K - 1,
+            "ring_tail": instance.B_K * instance.num_slots + 1,
+            "steady_tail": instance.B_K * (2 * instance.num_slots + 1) + 1,
+        }[case]
+    context = f"kid={kid}, case={case}, split_k={split_k}, pad={pad}, M/N/K={M}/{N}/{K}"
+    cpu_reference = os.environ.get("OPUS_CO_CPU_REFERENCE") == "1"
+    random_device = "cpu" if cpu_reference else _gfx1250_device
+    generator = torch.Generator(device=random_device).manual_seed(kid + K)
+    A_source = torch.randn(
+        (2, M, K + pad),
+        device=random_device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    B_source = torch.randn(
+        (2, N, K + pad),
+        device=random_device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    # Transfer the complete padded buffers before slicing, preserving source
+    # row and batch strides even in CPU-golden mode.
+    A = A_source.to(_gfx1250_device)[..., :K]
+    B = B_source.to(_gfx1250_device)[..., :K]
+    Y = torch.full(
+        (2, M, N), float("nan"), device=_gfx1250_device, dtype=torch.bfloat16
+    )
+    reference = A_source[..., :K].float() @ B_source[..., :K].float().transpose(-1, -2)
+
+    for _ in range(3):
+        actual = opus_bmm(A, B, Y, kid=kid, split_k=split_k)
+    torch.cuda.synchronize(_gfx1250_device)
+    assert actual is Y, context
+    checked = Y.cpu() if cpu_reference else Y
+    assert torch.isfinite(checked).all().item(), context
+    torch.testing.assert_close(
+        checked.float(), reference, rtol=0.03, atol=0.5, msg=context
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        opus_bmm(A, B, Y, kid=kid, split_k=split_k)
+    for _ in range(3):
+        Y.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize(_gfx1250_device)
+        checked = Y.cpu() if cpu_reference else Y
+        assert torch.isfinite(checked).all().item(), context
+        torch.testing.assert_close(
+            checked.float(), reference, rtol=0.03, atol=0.5, msg=context
+        )
 
 
 def test_gfx1250_co_dir_override_matches_torch(_gfx1250_device, tmp_path):
@@ -301,12 +447,15 @@ def test_gfx1250_co_dir_override_matches_torch(_gfx1250_device, tmp_path):
     missing_kid = min(gfx1250_4wave_co_kernels_list)
     instance = gfx1250_4wave_co_kernels_list[kid]
     override_root = tmp_path / "co-root"
-    override_arch_dir = override_root / GFX1250
-    override_arch_dir.mkdir(parents=True)
-    shutil.copy2(
-        co_image_path(CO_KERNELS_JSON, instance),
-        override_arch_dir / f"{instance.name}.co",
-    )
+    profiles = _co_test_profile_dirs(_co_test_root())
+    assert profiles, f"no images under {_co_test_root()}"
+    for source_dir, relative in profiles:
+        override_image_dir = override_root / relative
+        override_image_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            source_dir / f"{instance.name}.co",
+            override_image_dir / f"{instance.name}.co",
+        )
 
     environment = os.environ.copy()
     environment["OPUS_GEN_CO_DIR"] = str(override_root)
@@ -357,6 +506,12 @@ def test_gfx1250_co_loader_rejects_duplicate_identity(tmp_path, duplicate):
 
 
 def test_gfx1250_tuner_selects_co_without_split_k(monkeypatch):
+    from aiter.ops.opus import _arch
+
+    # Candidate selection needs gfx1250's local table, independent of the host.
+    monkeypatch.setattr(_arch, "_device_arch_and_cu", lambda _: (GFX1250, 256))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.syspath_prepend(
         str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")
     )
@@ -368,7 +523,7 @@ def test_gfx1250_tuner_selects_co_without_split_k(monkeypatch):
 
     selected = _gfx1250_select_candidates(64, 128, 4096, 256)
     assert selected & GFX1250_4WAVE_CO_KIDS
-    assert selected.isdisjoint(range(27000, 30000))
+    assert selected.isdisjoint(GFX1250_SPLITK_FUSE_KIDS)
 
     instance = gfx1250_4wave_co_kernels_list[min(GFX1250_4WAVE_CO_KIDS)]
     assert candidate_splitK(64, 128, 4096, 1, 256, instance) == [0]

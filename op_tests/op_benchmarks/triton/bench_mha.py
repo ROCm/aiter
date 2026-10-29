@@ -369,7 +369,7 @@ def model_benchmark_configs(
             if config["num_key_value_heads"] is None
             else config["num_key_value_heads"]
         )
-        HEAD_DIM = config["hidden_size"] // HQ
+        HEAD_DIM = config.get("head_dim", config["hidden_size"] // HQ)
         if args.sq:
             b = args.b if args.b else 1
             causal = args.causal if args.causal is not None else True
@@ -434,7 +434,9 @@ def pad_rearrange_dropout_mask(
     batch_size = cu_seqlens_q.numel() - 1
 
     padded_dropout_mask = torch.ones(
-        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
+        (batch_size, num_q_heads, seqlen_q, seqlen_k),
+        device="cuda",
+        dtype=torch.float32,
     )
     for b in range(batch_size):
         start_q = cu_seqlens_q[b].item()
