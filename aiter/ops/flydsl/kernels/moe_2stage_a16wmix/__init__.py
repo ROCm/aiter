@@ -222,6 +222,8 @@ def flydsl_a16w4_gemm2(
 
     ``reuse_lds=True`` shares the A tile and atomic-epilogue scratch after
     the K-loop barrier. It is opt-in; existing calls retain their LDS allocation.
+    Only gfx942 MXFP4 weights with the atomic epilogue are qualified for reuse;
+    other architectures, weight formats and epilogues retain the default path.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")

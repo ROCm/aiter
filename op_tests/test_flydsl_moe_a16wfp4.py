@@ -17,7 +17,7 @@ This is the explicit FlyDSL-side test complementing the routed a16w4 rows of
 API.
 
 Run:
-    pytest op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py -q
+    python -m pytest op_tests/test_flydsl_moe_a16wfp4.py -q
 """
 
 import argparse
@@ -38,7 +38,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
     flydsl_a16w4_gemm1,
     flydsl_a16w4_gemm2,
@@ -46,7 +46,13 @@ from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
 )
 from aiter.ops.flydsl.moe_a16w4_policy import A16W4Tiles, get_a16w4_tuned_tiles
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+from aiter.ops.shuffle import (
+    pack_int8_to_packed_int4,
+    shuffle_scale_a16w4,
+    shuffle_scale_for_int4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 
@@ -312,6 +318,34 @@ def test_stage2_rejects_oversized_lds(block_m, tile_n, required):
             TILE_N=tile_n,
             TILE_K=128,
             rocm_arch="gfx942",
+            reuse_lds=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "arch,weight_dtype,epilog",
+    [
+        ("gfx950", "fp4", "atomic"),
+        ("gfx942", "bf16", "atomic"),
+        ("gfx942", "int4", "atomic"),
+        ("gfx942", "fp4", "reduce"),
+    ],
+)
+def test_stage2_reuse_rejects_unqualified_modes(arch, weight_dtype, epilog):
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import compile_gemm2_a16w4_port
+
+    with pytest.raises(NotImplementedError, match="gfx942 fp4 atomic"):
+        compile_gemm2_a16w4_port(
+            BM=32,
+            NE=8,
+            N_OUT=256,
+            D_INTER=384,
+            TILE_N=256,
+            TILE_K=128,
+            rocm_arch=arch,
+            w_dtype=weight_dtype,
+            epilog=epilog,
+            topk=6,
             reuse_lds=True,
         )
 
@@ -634,7 +668,7 @@ def benchmark_stage1_clamped_silu(
             if logical_inter:
                 assert (actual[:, logical_inter:] == 0).all().item()
             if limit == float("inf") and not activation_bf16:
-                candidate(act="silu", swiglu_limit=10.0)
+                candidate(act="silu", swiglu_limit=float("inf"))
                 torch.testing.assert_close(
                     output[valid_positions], actual, rtol=0, atol=0
                 )
@@ -901,6 +935,8 @@ def benchmark_moe_clamped_silu(
 @pytest.mark.parametrize("token", [1, 8, 33])
 @pytest.mark.parametrize("tile_m,reuse_lds", [(32, False), (32, True), (64, True)])
 def test_moe_clamped_silu(token, tile_m, reuse_lds):
+    if reuse_lds and get_gfx() != "gfx942":
+        pytest.skip("LDS reuse is qualified only on gfx942")
     result = benchmark_moe_clamped_silu(
         token,
         256,
@@ -915,6 +951,177 @@ def test_moe_clamped_silu(token, tile_m, reuse_lds):
     )
     aiter.logger.info(
         "Clamped SiLU full MoE summary (markdown):\n%s",
+        pd.DataFrame([result]).to_markdown(index=False),
+    )
+
+
+@_SKIP
+@pytest.mark.parametrize("token", [8, 32])
+def test_moe_csv_real_shape(token):
+    selected = get_a16w4_tuned_tiles(
+        token,
+        5120,
+        384,
+        288,
+        384,
+        6,
+        act="silu_clamped",
+        activation_bf16=True,
+        swiglu_limit=10.0,
+    )
+    if get_gfx() == "gfx942" and get_cu_num() == 304:
+        expected = A16W4Tiles(16, 64 if token == 8 else 128, 128, 256, 128, True)
+        assert selected == expected
+    else:
+        assert selected is None
+    result = benchmark_moe_clamped_silu(
+        token, 5120, 384, 384, 6, True, logical_inter=288
+    )
+    assert result["flydsl_csv err"] == 0
+    aiter.logger.info(
+        "Real-shape CSV dispatch summary (markdown):\n%s",
+        pd.DataFrame([result]).to_markdown(index=False),
+    )
+
+
+@benchmark()
+def benchmark_stage2_weight_formats(token, weight_dtype, tile_m):
+    model_dim, inter_dim, experts, topk = 256, 384, 8, 6
+    torch.manual_seed(47)
+    hidden = torch.randn((token, topk, inter_dim), dtype=dtypes.bf16, device="cuda")
+    weights = torch.randn(
+        (experts, model_dim, inter_dim), dtype=hidden.dtype, device=hidden.device
+    )
+    if weight_dtype == "fp4":
+        packed, scales, reference_weights = _pack_mxfp4_reference(weights)
+    elif weight_dtype == "int4":
+        integers = torch.randint(
+            -8, 8, weights.shape, dtype=torch.int8, device=hidden.device
+        )
+        group_scales = (
+            torch.randint(
+                1, 5, (experts, inter_dim // 32, model_dim), device=hidden.device
+            ).to(hidden.dtype)
+            / 4
+        )
+        packed = pack_int8_to_packed_int4(shuffle_weight(integers, (16, 16)))
+        scales = shuffle_scale_for_int4(group_scales)
+        reference_weights = (
+            (
+                integers.float().view(experts, model_dim, inter_dim // 32, 32)
+                * group_scales.transpose(1, 2).float().unsqueeze(-1)
+            )
+            .reshape_as(weights)
+            .to(hidden.dtype)
+        )
+    else:
+        assert weight_dtype == "bf16"
+        packed = shuffle_weight(weights, (16, 16))
+        scales = torch.empty(1, dtype=torch.uint8, device=hidden.device)
+        reference_weights = weights
+
+    scores = torch.randn((token, experts), device=hidden.device)
+    routing_ids = scores.topk(topk, dim=-1).indices.to(torch.int32)
+    routing_weights = torch.rand((token, topk), device=hidden.device)
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    sorted_ids, sorted_weights, sorted_experts, cumsum, _ = moe_sorting(
+        routing_ids, routing_weights, experts, model_dim, hidden.dtype, tile_m
+    )
+    sorted_size = sorted_experts.numel() * tile_m
+    valid_size = int(cumsum[0])
+    packed_ids = sorted_ids[:valid_size].long()
+    sorted_tokens = packed_ids & 0x00FFFFFF
+    sorted_slots = packed_ids >> 24
+    valid = sorted_tokens < token
+    valid_positions = torch.arange(valid_size, device=hidden.device)[valid]
+    assert valid_positions.numel() == token * topk
+    assert ((sorted_slots[valid] >= 0) & (sorted_slots[valid] < topk)).all().item()
+    intermediate = torch.zeros(
+        (sorted_size, inter_dim), dtype=hidden.dtype, device=hidden.device
+    )
+    intermediate[valid_positions] = hidden[sorted_tokens[valid], sorted_slots[valid]]
+    contributions = torch.zeros(
+        (token, topk, model_dim), dtype=torch.float32, device=hidden.device
+    )
+    for expert in range(experts):
+        token_ids, slots = torch.where(routing_ids == expert)
+        contributions[token_ids, slots] = (
+            hidden[token_ids, slots].float() @ reference_weights[expert].float().T
+        ) * routing_weights[token_ids, slots, None]
+    reference = contributions.sum(dim=1).to(hidden.dtype)
+    guard, canary = 64, -123.0
+    storage = torch.full(
+        (token * model_dim + 2 * guard,),
+        canary,
+        dtype=hidden.dtype,
+        device=hidden.device,
+    )
+    output = storage[guard:-guard].view(token, model_dim)
+    launch = functools.partial(
+        flydsl_a16w4_gemm2,
+        inter_sorted_bf16=intermediate,
+        w2_u8=packed,
+        w2_scale_u8=scales,
+        sorted_expert_ids=sorted_experts,
+        cumsum_tensor=cumsum,
+        sorted_token_ids=sorted_ids,
+        sorted_weights=sorted_weights,
+        flat_out=output,
+        M_logical=token,
+        max_sorted=sorted_size,
+        NE=experts,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=256,
+        tile_k=128,
+        w_dtype=weight_dtype,
+    )
+
+    def run(reuse_lds=False):
+        output.zero_()
+        return launch(reuse_lds=reuse_lds)
+
+    candidates = {"default": run}
+    if get_gfx() == "gfx942" and weight_dtype == "fp4":
+        candidates["lds_reuse"] = functools.partial(run, reuse_lds=True)
+    result = {"gfx": get_gfx()}
+    flops = 2 * token * topk * model_dim * inter_dim
+    nbytes = intermediate.nbytes + packed.nbytes + scales.nbytes + output.nbytes
+    rms = reference.float().square().mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
+    for name, candidate in candidates.items():
+        for initial in (0.0, 17.0):
+            output.fill_(initial)
+            actual = candidate()
+            torch.cuda.synchronize()
+            error = checkAllclose(
+                reference.float() / rms,
+                actual.float() / rms,
+                rtol=0.03,
+                atol=0.03,
+                msg=f"stage2 {weight_dtype}/{name}",
+            )
+            assert error == 0
+            assert torch.isfinite(actual).all().item()
+            assert (storage[:guard] == canary).all().item()
+            assert (storage[-guard:] == canary).all().item()
+        _, latency = run_perftest(candidate, num_rotate_args=1)
+        result[f"{name} us"] = latency
+        result[f"{name} TFLOPS"] = flops / latency / 1e6
+        result[f"{name} TB/s"] = nbytes / latency / 1e6
+        result[f"{name} err"] = error
+    return result
+
+
+@_SKIP
+@pytest.mark.parametrize("token", [1, 33])
+@pytest.mark.parametrize("tile_m", [16, 32])
+@pytest.mark.parametrize("weight_dtype", ["fp4", "int4", "bf16"])
+def test_stage2_weight_formats(token, tile_m, weight_dtype):
+    result = benchmark_stage2_weight_formats(token, weight_dtype, tile_m)
+    aiter.logger.info(
+        "GEMM2 dtype regression summary (markdown):\n%s",
         pd.DataFrame([result]).to_markdown(index=False),
     )
 

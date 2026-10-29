@@ -478,6 +478,14 @@ def compile_gemm2_a16w4_port(
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
     if epilog not in ("atomic", "reduce"):
         raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
+    if reuse_lds and (
+        str(rocm_arch).split(":", 1)[0] != "gfx942"
+        or w_dtype != "fp4"
+        or epilog != "atomic"
+    ):
+        raise NotImplementedError(
+            "LDS reuse is validated only for gfx942 fp4 atomic stage2"
+        )
     _use_reduce = epilog == "reduce"
     _topk = int(topk) if _use_reduce else 1
     if _use_reduce and _topk < 1:
@@ -510,14 +518,15 @@ def compile_gemm2_a16w4_port(
     else:
         _lds_bytes = _a_bytes + BM * TILE_N * 4
 
-    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+    if reuse_lds:
+        from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-    lds_capacity = get_lds_capacity_bytes(str(rocm_arch))
-    if _lds_bytes > lds_capacity:
-        raise NotImplementedError(
-            f"a16w4 gemm2 requires {_lds_bytes} LDS bytes, "
-            f"exceeding {rocm_arch} capacity {lds_capacity}"
-        )
+        lds_capacity = get_lds_capacity_bytes(str(rocm_arch))
+        if _lds_bytes > lds_capacity:
+            raise NotImplementedError(
+                f"a16w4 gemm2 requires {_lds_bytes} LDS bytes, "
+                f"exceeding {rocm_arch} capacity {lds_capacity}"
+            )
 
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
@@ -534,6 +543,10 @@ def compile_gemm2_a16w4_port(
     if _use_reduce:
         _name += f"_reduce_tk{_topk}"
 
+    @fx.struct
+    class SharedStorage:
+        raw: fx.Array[fx.Uint8, _lds_bytes, 16]
+
     @flyc.kernel(name=_name, known_block_size=[256, 1, 1])
     def gemm2_kernel(
         arg_a: fx.Int64,
@@ -547,9 +560,15 @@ def compile_gemm2_a16w4_port(
         i32_max_m_blocks: fx.Int32,
         arg_out: fx.Int64,
     ):
-        lds_raw_ptr = (
-            fx.SharedAllocator().allocate(fx.Array[fx.Uint8, _lds_bytes, 16]).peek().ptr
-        )
+        if const_expr(reuse_lds):
+            lds_raw_ptr = (
+                fx.SharedAllocator()
+                .allocate(fx.Array[fx.Uint8, _lds_bytes, 16])
+                .peek()
+                .ptr
+            )
+        else:
+            lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
         bx_i32 = fx.Int32(gpu.block_id("x"))
         lane = tx_i32 % fx.Int32(64)
