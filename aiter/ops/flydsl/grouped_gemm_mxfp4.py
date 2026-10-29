@@ -111,6 +111,9 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
     return num_waves
 
 
+_BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -131,6 +134,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     num_buffers=3,
     out_is_f16=0,
     a_is_fp4=0,
+    a_preshuffled=0,
     stage1_act=0,
     bias=None,
     swiglu_limit=7.0,
@@ -161,7 +165,29 @@ def flydsl_grouped_gemm_a8w4_masked(
 
     A positive persistent_workers bounds the grid independently of the routing
     buffer capacity. Workers traverse the live device-side tile range.
+    Preshuffled MXFP4 A uses logical (M/16, K/128, 4, 16, 32) tiles, with the
+    innermost 32 FP4 values packed into 16 bytes.
     """
+    if a_preshuffled and row_major_ascale:
+        raise ValueError("A-preshuffled GEMM requires M16K4 activation scales")
+    if a_preshuffled and not a_is_fp4:
+        raise ValueError("preshuffled A requires MXFP4 activations")
+    if a_preshuffled and (
+        K % 128
+        or contiguous_m % 16
+        or tile_m % 16
+        or tile_k % 128
+        or a_row_stride_bytes
+    ):
+        raise ValueError(
+            "preshuffled A requires M and tile_m divisible by 16, K and "
+            "tile_k divisible by 128, and no padded A row stride"
+        )
+    if a_preshuffled and stage1_quant_out and (N % 256 or tile_n % 64):
+        raise ValueError(
+            "preshuffled MXFP4 quant output requires N divisible by 256 "
+            "and tile_n divisible by 64"
+        )
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
     if stream is None:
@@ -173,7 +199,12 @@ def flydsl_grouped_gemm_a8w4_masked(
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     k_tiles = (K + tile_k - 1) // tile_k
     num_buffers = min(num_buffers, max(1, k_tiles))
-    has_bias = 1 if bias is not None else 0
+    if bias is None:
+        has_bias = 0
+    elif bias.dtype in _BIAS_MODE:
+        has_bias = _BIAS_MODE[bias.dtype]
+    else:
+        raise TypeError(f"bias must be bf16, fp32 or fp16, got {bias.dtype}")
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
     # These tensor arguments only supply base addresses, so normalize their
     # ranks without specializing the compiled callable on buffer shapes.
@@ -262,6 +293,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(lds_soa_load_interleave),
         persistent_workers,
         rolled_drain,
+        int(a_preshuffled),
         int(layout_align_m),
     )
     _run_compiled(
