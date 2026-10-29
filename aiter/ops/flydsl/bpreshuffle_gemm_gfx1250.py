@@ -163,8 +163,29 @@ def run_preshuffle_gemm_a8_gfx1250(
     gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
 
+    gemm_spec = (
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        nb,
+        cluster_m,
+        cluster_n,
+        False,  # is_mxscale
+        SCALE_BLOCK_SIZE,
+        split_k,
+        False,  # batched
+        0,  # preload_ks
+        False,  # a_preshuffle
+        False,  # a_scale_preshuffled
+        False,  # b_scale_32x32
+        False,  # k_tail
+    )
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
-    _launch_gemm_a8w8(
+    _run_compiled(
+        _launch_gemm_a8w8,
         _ptr_arg(gemm_out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
@@ -177,18 +198,10 @@ def run_preshuffle_gemm_a8_gfx1250(
         0,
         lda,
         ldc,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        out_is_f16,
-        nb,
-        cluster_m,
-        cluster_n,
-        False,
-        SCALE_BLOCK_SIZE,
-        split_k,
+        *gemm_spec[:14],
+        1,  # batch (runtime)
+        *gemm_spec[14:],
+        specialization_key=gemm_spec,
     )
     if partials is not None:
         dense = ldc == N
