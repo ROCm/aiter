@@ -2870,6 +2870,40 @@ def test_heterogeneous_moe_rejects_invalid_shared_contract(
         )
 
 
+@pytest.mark.parametrize("name", ["shared_w1", "shared_w2"])
+def test_heterogeneous_moe_rejects_output_overlapping_shared_weight(
+    weights: _Weights,
+    name: str,
+):
+    # The sort zeroes output before the shared stage reads its weights.
+    profile = _profile()
+    m = 4
+    hidden, _, _, all_weight, all_ids = _route_inputs(
+        profile, m, weights.routed_w1.device
+    )
+    kwargs = _common_kwargs(profile, weights.routed_s1, weights.routed_s2)
+    kwargs.update(
+        shared_w1=weights.shared_w1,
+        shared_w2=weights.shared_w2,
+        shared_w1_scale=weights.shared_s1,
+        shared_w2_scale=weights.shared_s2,
+        shared_expert_id=profile.shared_id,
+    )
+    model_dim = hidden.shape[1]
+    output = kwargs[name].view(-1).view(hidden.dtype)[: m * model_dim]
+
+    with pytest.raises(RuntimeError, match=f"output overlaps {name}"):
+        fused_moe(
+            hidden,
+            weights.routed_w1,
+            weights.routed_w2,
+            all_weight,
+            all_ids,
+            **kwargs,
+            output=output.view(m, model_dim),
+        )
+
+
 def test_a4w4_routed_fp8_shared_heterogeneous_path(
     monkeypatch: pytest.MonkeyPatch,
     a4_weights: _Weights,
