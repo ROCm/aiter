@@ -202,14 +202,25 @@ def mp_lock(
 
 
 def get_hip_version():
-    hipconfig_home = _rocm_executable("hipconfig") or "hipconfig"
+    hipconfig = _rocm_executable("hipconfig")
+    if hipconfig is None:
+        raise RuntimeError(
+            "Cannot find `hipconfig` on PATH, under ROCM_HOME/ROCM_PATH or in an "
+            "installed rocm-sdk-devel package. Set ROCM_PATH to the ROCm root."
+        )
     version = subprocess.run(
-        [hipconfig_home, "--version"],
+        [hipconfig, "--version"],
         capture_output=True,
         text=True,
         check=False,
     )
-    return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
+    words = version.stdout.split()
+    if not words:
+        raise RuntimeError(
+            f"`{hipconfig} --version` printed no version "
+            f"(exit code {version.returncode}): {version.stderr.strip()!r}"
+        )
+    return parse(words[-1].rstrip("-").replace("-", "+"))
 
 
 @lru_cache
