@@ -99,7 +99,8 @@ Results go to `runs/sweep-<arch>-<backend>-<kernel>-[B=..-]M=..-N=..-K=..jsonl` 
 (the exception; the sweep continues), `crashed` or `hung` (the worker died or stalled on it; the
 driver restarts the worker on the remaining configs). The baseline record carries `is_tuned`.
 The full field list is in the `harness.py` docstring. Re-running the same command skips configs that already have a record, provided `--calls` and
-`--replays` are unchanged (otherwise it refuses); `--fresh` discards them. The plan of each M is
+`--replays` are unchanged and no record was timed on another CU count (otherwise it refuses);
+`--fresh` discards them. The plan of each M is
 kept as `runs/plan-<arch>-<backend>-<kernel>-<shape>.json`, and only its candidates (plus the
 baseline) can win at install time. Ctrl-C kills the workers before the driver exits. `--batch` is the number of configs per worker process, `--stall` the
 seconds a worker may spend on one candidate (a huge tile can compile for minutes) before it is
@@ -119,6 +120,13 @@ ships an `any`: a copy of `DEFAULT.json`'s `any`, so an M above every tuned buck
 family fallback, never a small-M tile. `DEFAULT.json` is never written. Every swept M is then re-read
 through `get_gemm_config` and must come back `is_tuned`; if not, the previous file is put back and
 the command fails.
+`--cu-dir` tunes the `<cu_num>cu/` tree of this device's CU count (configs `AGENTS.md`, "CU
+trees"): the plan takes its keys from that tree's `DEFAULT.json`, the baseline is that tree's
+installed config, and the install writes into `configs/<arch>/<cu_num>cu/<backend>/gemm/<family>/`
+from the records timed on this device's CU count only. The tree must already have its own
+`DEFAULT.json`; the tuner never writes one. Pass `--cu-dir` only on a partition whose CU count is
+not the one the plain folder was tuned on; without it the plain folder is used, whatever the
+device's CU count.
 Config reads are cached per process, so restart Python to pick up a new file.
 
 ## Adding a kernel or a key
