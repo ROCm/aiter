@@ -729,7 +729,7 @@ static size_t get_smem_size_func()
 }
 
 // Dies a dispatch's workgroups are dealt over, round-robin, each behind its own
-// L2. Mirrors NON_DEFAULT_NUM_XCDS in aiter/jit/utils/build_targets.py: the SKUs
+// L2. Mirrors target_num_xcds in aiter/jit/utils/build_targets.py: the SKUs
 // below differ from the eight-die default, and are told apart by CU count since
 // they share a target with the full-size part.
 static uint32_t get_num_xcds_func()
