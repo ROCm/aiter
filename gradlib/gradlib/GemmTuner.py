@@ -156,8 +156,12 @@ class Gemm:
         verbose=False,
         rtol=None,
         atol=None,
+        policy=None,
     ):
+        from aiter.utility.selection_policy import LATENCY
+
         torch.cuda.empty_cache()
+        self.policy = LATENCY if policy is None else policy
         self.m = m
         self.k = k
         self.n = n
@@ -303,6 +307,7 @@ class Gemm:
             fast_mode == 1,
             timeout=self.timeout,
             verbose=self.verbose,
+            policy=self.policy,
         )
         if fast_mode == 1:
             self.hipb_gtimedf = self.save_topn_result(ret, fast_mode, "hipblaslt")
@@ -360,16 +365,9 @@ class Gemm:
 
     def run_solutions(self):
         self.run_fast_solutions()
-        from aiter.utility.tune_result import (
-            measure_all_accurate,
-            power_selection_enabled,
-        )
-
         # The fast screen keeps only topn by latency. A power winner can sit
         # outside that window, so the accurate pass has to time every solution.
-        self.topn = measure_all_accurate(
-            power_selection_enabled(), self.topn, len(self.hipb_sols)
-        )
+        self.topn = self.policy.accurate_count(self.topn, len(self.hipb_sols))
         self.functional_get_topn_fastest()
         rets = self.run_best_solutions()
         return rets
@@ -715,6 +713,7 @@ class GemmTuner(GemmCommonTuner):
                 num_warmup=self.num_warmup,
                 timeout=args.timeout,
                 verbose=args.verbose,
+                policy=self.policy_for(args),
             )
 
             ret.extend(gemmobj.run_solutions())
@@ -726,16 +725,7 @@ class GemmTuner(GemmCommonTuner):
         return ret
 
     def processResult(self, rets, fast_mode):
-        from aiter.utility.tune_result import (
-            power_columns,
-            power_selection_enabled,
-            sort_frame_for_selection,
-        )
-
-        select_power = power_selection_enabled()
         columns = list(self.columns)
-        if select_power and "watts" not in columns:
-            columns.append("watts")
         results = []
         for el in rets:
             info, us, err_ratio = el
@@ -767,23 +757,21 @@ class GemmTuner(GemmCommonTuner):
             )
             res_one.append(tflops)
             res_one.append(bw)
-            if select_power:
-                watts, _tflops_per_w = power_columns(el, tflops)
-                res_one.append(watts)
+            extra, _watt_text = self.policy.result_metrics(el, tflops)
+            for name, values in extra.items():
+                if name not in columns:
+                    columns.append(name)
+                res_one.extend(values)
 
             results.append(res_one)
         gtimedf = pd.DataFrame(results, columns=columns)
-        gtimedf = sort_frame_for_selection(gtimedf)
+        gtimedf = self.policy.sort_frame(gtimedf)
         return gtimedf
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         from collections import defaultdict
 
-        from aiter.utility.tune_result import (
-            power_selection_enabled,
-            sort_frame_for_selection,
-        )
-
+        policy = self.policy_for(args)
         grouped_rets = defaultdict(list)
 
         for el in rets:
@@ -808,7 +796,7 @@ class GemmTuner(GemmCommonTuner):
         best_gtimedfs = pd.DataFrame(columns=self.columns)
         for key, df in gtimedf_dic.items():
             gtimedf_dic[key] = df[df["err_ratio"] < args.errRatio]
-            best_gtimedf = sort_frame_for_selection(gtimedf_dic[key])
+            best_gtimedf = policy.sort_frame(gtimedf_dic[key])
 
             if len(gtimedf_dic[key]) == 0:
                 print(">>> No valid hipblaslt solutions found!", flush=True)
@@ -823,9 +811,9 @@ class GemmTuner(GemmCommonTuner):
             else:
                 best_gtimedfs = pd.concat([best_gtimedfs, resultdf1], ignore_index=True)
 
-            metric = "power" if power_selection_enabled() else "latency"
             print(
-                f"{key} >>> selected ({metric}) solution is \n {resultdf1}", flush=True
+                f"{key} >>> selected ({policy.name}) solution is \n {resultdf1}",
+                flush=True,
             )
         return best_gtimedfs
 

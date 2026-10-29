@@ -451,23 +451,20 @@ def _frame_keeping_watts(columns, results):
     return pd.DataFrame(results, columns=kept)
 
 
-def rank_moe_pairs(profile_df, select_power: bool):
-    """Rank paired MoE candidates.
+def rank_moe_pairs(profile_df, policy):
+    """Rank paired MoE candidates with the tune's selection policy.
 
-    Power mode orders by stage energy ``us1*watts1 + us2*watts2`` (stage 2
-    contributes only when it actually ran), using the shared selection key.
-    Latency mode orders by ``us``. Unmeasured rows sort last. ``rank`` 1 is
-    the winner for that ordering.
+    The pair cost is the policy's stage energy ``us1*watts1 + us2*watts2``
+    (stage 2 contributes only when it actually ran); its mean watts feed the
+    same frame order every tuner uses. ``rank`` 1 is the winner.
     """
-    from aiter.utility.tune_result import sort_by_energy_then_latency, stage_energy
-
     frame = profile_df.copy()
     us1 = _numeric_column(frame, "us1")
     us2 = _numeric_column(frame, "us2", default=0.0).fillna(0.0)
     watts1 = _numeric_column(frame, "watts1")
     watts2 = _numeric_column(frame, "watts2")
     energy = [
-        stage_energy(a, b) + stage_energy(c, d)
+        policy.pair_energy(a, b, c, d)
         for a, b, c, d in zip(us1, watts1, us2, watts2, strict=True)
     ]
     frame["energy"] = pd.Series(energy, index=frame.index).round(1)
@@ -480,11 +477,7 @@ def rank_moe_pairs(profile_df, select_power: bool):
     if "tflops" in frame.columns:
         tflops = pd.to_numeric(frame["tflops"], errors="coerce")
         frame["tflops_per_w"] = (tflops / mean_watts).round(6)
-    if select_power:
-        frame = sort_by_energy_then_latency(frame)
-    else:
-        frame = frame.sort_values("us", kind="mergesort", na_position="last")
-    frame = frame.reset_index(drop=True)
+    frame = policy.sort_frame(frame).reset_index(drop=True)
     frame.insert(0, "rank", range(1, len(frame) + 1))
     return frame
 
@@ -5389,9 +5382,7 @@ class FmoeTuner(TunerCommon):
         if len(all_tasks) > 0:
             ### shape_grouped should be False as multiple stages.
             # fast_mode here means "return every candidate"; it is the only
-            # timing pass, so power mode has to sample PPT on this call.
-            from aiter.utility.tune_result import power_selection_enabled
-
+            # timing pass, so it picks the winner.
             rets = mp_tuner(
                 all_tasks,
                 in_data,
@@ -5400,7 +5391,8 @@ class FmoeTuner(TunerCommon):
                 False,
                 timeout=args.timeout,
                 verbose=args.verbose,
-                measure_power=power_selection_enabled(getattr(args, "select", None)),
+                policy=self.policy_for(args),
+                final_timing=True,
             )
 
         # Identify failed cases
@@ -5494,14 +5486,12 @@ class FmoeTuner(TunerCommon):
         bests = []
         from collections import defaultdict
 
-        from aiter.utility.tune_result import power_selection_enabled
-
-        select_power = power_selection_enabled(getattr(args, "select", None))
-        if select_power and not getattr(args, "profile_file", ""):
-            tune_out = self.get_out_file(args.tune_file)
-            root, ext = os.path.splitext(tune_out)
-            args.profile_file = (root if ext else tune_out) + ".ranked.csv"
-            print(f"power ranking will be written to {args.profile_file}")
+        policy = self.policy_for(args)
+        if not getattr(args, "profile_file", ""):
+            ranked_file = policy.profile_file(self.get_out_file(args.tune_file))
+            if ranked_file:
+                args.profile_file = ranked_file
+                print(f"power ranking will be written to {args.profile_file}")
 
         ##group results by info[0](key)
         grouped_rets = defaultdict(list)
@@ -5639,18 +5629,7 @@ class FmoeTuner(TunerCommon):
             profileDF["_is_fused"] = (
                 profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
             )
-            from aiter.utility.tune_result import (
-                power_selection_enabled,
-                sort_by_energy_then_latency,
-            )
-
-            select_power = power_selection_enabled(getattr(args, "select", None))
-            if select_power and "watts" in profileDF.columns:
-                # Cost alone ties every unread sensor at infinity, and the
-                # following dedup would then keep arrival order.
-                profileDF = sort_by_energy_then_latency(profileDF)
-            else:
-                profileDF = profileDF.sort_values("us")
+            profileDF = policy.sort_frame(profileDF)
             profileDF = profileDF.drop_duplicates(
                 ["stage", "block_m", "flat", "nt", "v2", "_is_fused"], keep="first"
             ).drop(columns=["_is_fused"])
@@ -6127,40 +6106,20 @@ class FmoeTuner(TunerCommon):
                         f"(bm={nf_block_m}) us={us_nf_e2e}",
                         flush=True,
                     )
-                    from aiter.utility.tune_result import (
-                        efficiency_cost,
-                        power_selection_enabled,
-                    )
-
-                    if power_selection_enabled(getattr(args, "select", None)):
-                        from aiter.utility.package_power import record_package_watts
-
-                        device_index = torch.cuda.current_device()
-                        watts_flat = record_package_watts(
-                            _flat_seq, device_index=device_index
-                        )
-                        watts_nf = record_package_watts(
-                            _nf_seq, device_index=device_index
-                        )
-                        cost_flat = efficiency_cost(us_flat_e2e, watts_flat)
-                        cost_nf = efficiency_cost(us_nf_e2e, watts_nf)
+                    flat_e2e = {"us": us_flat_e2e}
+                    nf_e2e = {"us": us_nf_e2e}
+                    policy.record(flat_e2e, "watts", _flat_seq)
+                    policy.record(nf_e2e, "watts", _nf_seq)
+                    if "watts" in flat_e2e:
                         print(
-                            f"  e2e power: FLAT {watts_flat:.1f} W "
-                            f"cost={cost_flat:.1f}; non-FLAT {watts_nf:.1f} W "
-                            f"cost={cost_nf:.1f}",
+                            f"  e2e power: FLAT{policy.watt_text(flat_e2e['watts'])}; "
+                            f"non-FLAT{policy.watt_text(nf_e2e['watts'])}",
                             flush=True,
                         )
-                        drop_flat = (
-                            cost_flat != float("inf")
-                            and cost_nf != float("inf")
-                            and cost_flat > cost_nf
-                        )
-                    else:
-                        # Asymmetric override: only drop FLAT when non-FLAT truly
-                        # wins by a non-noise margin. Otherwise leave profileDF
-                        # untouched and let additive-fairness idxmin decide.
-                        margin_us = 0.5
-                        drop_flat = us_flat_e2e > us_nf_e2e + margin_us
+                    # Asymmetric override: only drop FLAT when non-FLAT truly
+                    # wins (by a non-noise margin for latency). Otherwise leave
+                    # profileDF untouched and let additive-fairness idxmin decide.
+                    drop_flat = policy.beats(flat_e2e, nf_e2e, latency_margin_us=0.5)
                     if drop_flat:
                         dropped = int(flat_mask.sum())
                         profileDF = profileDF[~flat_mask].copy()
@@ -6208,7 +6167,7 @@ class FmoeTuner(TunerCommon):
             profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
             profileDF["err1"] = profileDF["err1"].apply(lambda x: f"{x:.1%}")
             profileDF["err2"] = profileDF["err2"].apply(lambda x: f"{x:.1%}")
-            ranked = rank_moe_pairs(profileDF, select_power)
+            ranked = rank_moe_pairs(profileDF, policy)
             if args.profile_file != "":
                 if os.path.exists(args.profile_file):
                     old_df = pd.read_csv(args.profile_file)
@@ -6216,12 +6175,7 @@ class FmoeTuner(TunerCommon):
                     old_df = pd.DataFrame(columns=ranked.columns)
                 tmpprofileDF = pd.concat([old_df, ranked], ignore_index=True)
                 tmpprofileDF.to_csv(args.profile_file, index=False)
-            if select_power and ranked["energy"].notna().any():
-                best_one = ranked.iloc[0].copy()
-            else:
-                best_one = ranked.loc[
-                    pd.to_numeric(ranked["us"], errors="coerce").idxmin()
-                ].copy()
+            best_one = ranked.iloc[0].copy()
             latency_one = ranked.loc[
                 pd.to_numeric(ranked["us"], errors="coerce").idxmin()
             ]
@@ -6230,7 +6184,7 @@ class FmoeTuner(TunerCommon):
                 f"rank={best_one.get('rank', 1)} energy={best_one.get('energy', float('nan'))} "
                 f"tflops_per_w={best_one.get('tflops_per_w', float('nan'))}"
             )
-            if select_power:
+            if policy.measures_power:
                 for _, cand in ranked.head(5).iterrows():
                     print(
                         f"  rank {int(cand['rank'])}: energy={cand['energy']} "
@@ -6729,12 +6683,7 @@ class GroupedFmoeTuner(FmoeTuner):
                 _call, num_warmup=int(args.warmup), num_iters=int(args.iters)
             )
             us = round(float(us), 4)
-            from aiter.utility.tune_result import power_selection_enabled
-
-            if power_selection_enabled(getattr(args, "select", None)):
-                from aiter.utility.package_power import record_package_watts
-
-                candidate["watts"] = record_package_watts(_call)
+            self.policy_for(args).record(candidate, "watts", _call)
             return us
         finally:
             if old_config is None:
@@ -6758,9 +6707,7 @@ class GroupedFmoeTuner(FmoeTuner):
     def tune(self, untunedf, tunedf, args):
         self._require_supported_fast_scan(args)
         del tunedf
-        from aiter.utility.tune_result import power_selection_enabled
-
-        select_power = power_selection_enabled(getattr(args, "select", None))
+        policy = self.policy_for(args)
         # Refuse an output file that the write-back cannot keep blank-free
         # before timing anything.
         self._write_layout(self.get_out_file(args.tune_file))
@@ -6772,17 +6719,14 @@ class GroupedFmoeTuner(FmoeTuner):
                 try:
                     us = self._run_candidate(row, candidate, args)
                     candidate["us"] = us
-                    watts = candidate.get("watts", float("nan"))
-                    watt_text = f" watts={float(watts):.1f}" if select_power else ""
+                    watt_text = policy.watt_text(candidate.get("watts"))
                     print(
                         f"[grouped] token={row['token']} inter={row['inter_dim']} "
                         f"qa={row['q_dtype_a']} tile_m={candidate['tile_m']} "
                         f"us={us}{watt_text}",
                         flush=True,
                     )
-                    from aiter.utility.tune_result import candidate_beats
-
-                    if candidate_beats(best, candidate, select_power):
+                    if policy.beats(best, candidate):
                         best = candidate
                 except Exception as exc:  # noqa: BLE001
                     failures.append(f"tile_m={candidate['tile_m']}: {exc}")
@@ -7631,8 +7575,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         reference=None,
         num_warmup=None,
         num_iters=None,
-        measure_power=False,
+        final_timing=True,
     ):
+        """Time one pair. ``final_timing`` is False for a coarse screening pass,
+        whose time does not pick the winner."""
         from aiter.test_common import run_perftest
 
         ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
@@ -7758,13 +7704,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
         us = round(float(us), 4)
         if not math.isfinite(us) or us <= 0:
             raise RuntimeError(f"invalid MXFP4 validation time {us}")
-        if measure_power:
-            from aiter.utility.package_power import record_package_watts
-
-            candidate["watts"] = record_package_watts(
+        if final_timing:
+            self.policy_for(args).record(
+                candidate,
+                "watts",
                 lambda: self._port_e2e(
                     data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
-                )
+                ),
             )
         # The pair is timed as one unit, so the fused-MoE estimate in calculate()
         # is the right roofline for it. Untuned rows keep dtypes as strings, while
@@ -8350,6 +8296,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         plan = self._staged_candidate_plan(row)
         if not plan.pairs:
             return _mxfp4_failed_row(self.keys, row, "no pipeline-pair candidates")
+        policy = self.policy_for(args)
         m_est = self._m_est(row)
         small_batch = m_est < self._STAGED_SMALL_BATCH_M_EST
         if small_batch:
@@ -8417,16 +8364,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         ),
                         flush=True,
                     )
-                    if failure is None and (
-                        group_best is None or us < float(group_best["us"])
-                    ):
+                    if failure is None and policy.beats(group_best, candidate):
                         group_best = candidate
                 # Stop after a shortlist winner; fallback runs the whole group.
                 if group_best is not None:
                     break
-            if group_best is not None and (
-                best is None or float(group_best["us"]) < float(best["us"])
-            ):
+            if group_best is not None and policy.beats(best, group_best):
                 best = group_best
         if best is None:
             return _mxfp4_failed_row(self.keys, row, "FAILED: no valid staged pair")
@@ -8469,9 +8412,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             row, full_search=_mxfp4_search_mode(args) == "full"
         )
         fast_scan = bool(getattr(args, "fast_scan", False))
-        from aiter.utility.tune_result import power_selection_enabled
-
-        select_power = power_selection_enabled(getattr(args, "select", None))
+        policy = self.policy_for(args)
         best, failures, successful = None, [], []
 
         # Candidate kernels for one shape consume the same immutable inputs and
@@ -8523,17 +8464,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     reference=scan_reference,
                     num_warmup=accuracy_checks if fast_scan else None,
                     num_iters=scan_iters if fast_scan else None,
-                    measure_power=select_power and not fast_scan,
+                    final_timing=not fast_scan,
                 )
-                watts = candidate.get("watts", float("nan"))
-                try:
-                    watts_f = float(watts)
-                except (TypeError, ValueError):
-                    watts_f = float("nan")
                 watt_text = (
-                    f" watts={watts_f:.1f}"
-                    if math.isfinite(watts_f) and watts_f > 0
-                    else ""
+                    policy.watt_text(candidate["watts"]) if "watts" in candidate else ""
                 )
                 if not math.isfinite(float(us)) or us <= 0:
                     raise RuntimeError(f"invalid MXFP4 validation time {us}")
@@ -8543,9 +8477,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     f"us={us}{watt_text}",
                     flush=True,
                 )
-                from aiter.utility.tune_result import candidate_beats
-
-                if candidate_beats(best, candidate, select_power):
+                if policy.beats(best, candidate):
                     best = candidate
                 if fast_scan:
                     successful.append(candidate)
@@ -8564,18 +8496,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if timeout > 0:
                     signal.alarm(0)
         if fast_scan and successful:
-            from aiter.utility.tune_result import measure_all_accurate
-
             shortlist = max(1, int(getattr(args, "fast_scan_finalists", 5)))
-            finalist_count = measure_all_accurate(
-                select_power, shortlist, len(successful)
-            )
-            if select_power:
-                # A power winner can sit outside the latency shortlist, same as
-                # the hipBLASLt accurate pass timing every heuristic.
+            # A power winner can sit outside the latency shortlist, same as
+            # the hipBLASLt accurate pass timing every heuristic.
+            finalist_count = policy.accurate_count(shortlist, len(successful))
+            if finalist_count != min(shortlist, len(successful)):
                 print(
-                    f"[mxfp4-port] select=power: retiming all {finalist_count} "
-                    "accurate candidates",
+                    f"[mxfp4-port] select={policy.name}: retiming all "
+                    f"{finalist_count} accurate candidates",
                     flush=True,
                 )
             finalist_iters = _parse_fast_scan_iters(
@@ -8636,12 +8564,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         reference=scan_reference,
                         num_warmup=0,
                         num_iters=finalist_iters,
-                        measure_power=select_power,
                     )
                     if not math.isfinite(float(us)) or us <= 0:
                         raise RuntimeError(f"invalid MXFP4 validation time {us}")
-                    watts = candidate.get("watts", float("nan"))
-                    watt_text = f" watts={float(watts):.1f}" if select_power else ""
+                    watt_text = policy.watt_text(candidate.get("watts"))
                     print(
                         f"[mxfp4-port] finalist token={row['token']} "
                         f"{candidate['kernelName1']} + "
@@ -8669,32 +8595,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         signal.alarm(0)
             if retimed:
                 fastest_us = min(float(candidate["us"]) for candidate in retimed)
-                if select_power:
-                    from aiter.utility.tune_result import selection_rank
-
-                    ranked_finalists = sorted(
-                        retimed,
-                        key=lambda candidate: selection_rank(
-                            candidate["us"],
-                            candidate.get("watts", float("nan")),
-                            True,
-                        ),
-                    )
-                    best = ranked_finalists[0]
-                else:
-                    best = _select_mxfp4_finalist(retimed)
-                    ranked_finalists = [best] + sorted(
-                        (candidate for candidate in retimed if candidate is not best),
-                        key=lambda candidate: float(candidate["us"]),
-                    )
+                best = policy.best(retimed, latency_choice=_select_mxfp4_finalist)
+                ranked_finalists = [best] + sorted(
+                    (candidate for candidate in retimed if candidate is not best),
+                    key=policy.rank_of,
+                )
                 for rank, candidate in enumerate(ranked_finalists, start=1):
                     latency_us = float(candidate["us"])
                     accuracy_error = _candidate_accuracy_error(candidate)
                     normalized_difference = _normalized_latency_difference(
                         latency_us, fastest_us
                     )
-                    watts = candidate.get("watts", float("nan"))
-                    watt_text = f" watts={float(watts):.1f}" if select_power else ""
+                    watt_text = policy.watt_text(candidate.get("watts"))
                     print(
                         f"[mxfp4-port] finalist-summary rank={rank} "
                         f"selected={int(candidate is best)} "

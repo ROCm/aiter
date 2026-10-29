@@ -285,7 +285,11 @@ def sweep_case_row(
     *,
     gfx: str,
     cu_num: int,
+    policy=None,
 ) -> dict[str, Any] | None:
+    from aiter.utility.selection_policy import LATENCY
+
+    policy = LATENCY if policy is None else policy
     if case.K != 128 or case.V != 128 or case.BT != 64:
         print(f"{case_id:58s} skipped (kernel supports K=V=128, BT=64 only)")
         return None
@@ -295,39 +299,30 @@ def sweep_case_row(
         case, snapshot_dtype
     )
 
-    from aiter.utility.tune_result import power_selection_enabled, selection_rank
-
-    select_power = power_selection_enabled()
     times = {}
     watts = {}
     for bv in BV_CANDIDATES:
         if case.V % bv:
             continue
         times[bv] = bench_us(inputs, bv, warmup, iters)
-        if select_power:
-            from aiter.utility.package_power import record_package_watts
-
-            os.environ["FLYDSL_K5_OPT_BV"] = str(bv)
-            try:
-                watts[bv] = record_package_watts(lambda: k5(**inputs))
-            finally:
-                os.environ.pop("FLYDSL_K5_OPT_BV", None)
+        os.environ["FLYDSL_K5_OPT_BV"] = str(bv)
+        try:
+            policy.record(watts, bv, lambda: k5(**inputs))
+        finally:
+            os.environ.pop("FLYDSL_K5_OPT_BV", None)
 
     if not times:
         return None
 
     best = min(
-        times,
-        key=lambda bv: selection_rank(
-            times[bv], watts.get(bv, float("nan")), select_power
-        ),
+        times, key=lambda bv: policy.rank(times[bv], watts.get(bv, float("nan")))
     )
     rule = _hipeq_select_bv(
         torch.device("cuda:0"), case.H, total_chunks, max_seq_chunks
     )
     gain = (times[rule] - times[best]) / times[rule] * 100 if rule in times else 0.0
     cells = " ".join(f"{times.get(bv, float('nan')):8.1f}" for bv in BV_CANDIDATES)
-    if select_power:
+    if watts:
         cells += " " + " ".join(
             f"{watts.get(bv, float('nan')):8.1f}" for bv in BV_CANDIDATES
         )
@@ -344,7 +339,7 @@ def sweep_case_row(
         times[best],
         gfx=gfx,
         cu_num=cu_num,
-        watts=watts.get(best) if select_power else None,
+        watts=watts.get(best),
     )
 
 
@@ -493,11 +488,10 @@ class K5BvTuner(TunerCommon):
         if untunedf.empty:
             return []
 
+        policy = self.policy_for(args)
         if not hasattr(self, "_printed_tune_header"):
-            from aiter.utility.tune_result import power_selection_enabled
-
             watt_header = ""
-            if power_selection_enabled(getattr(args, "select", None)):
+            if policy.measures_power:
                 watt_header = " " + " ".join(f"W{bv:<7d}" for bv in BV_CANDIDATES)
             header = (
                 f"{'case':58s} {'chunks':>7s} "
@@ -519,6 +513,7 @@ class K5BvTuner(TunerCommon):
                 args.iters,
                 gfx=self._gfx,
                 cu_num=self._cu_num,
+                policy=policy,
             )
             if tuned_row is None:
                 continue
@@ -547,11 +542,6 @@ class K5BvTuner(TunerCommon):
         return frame.loc[:, columns].to_dict("records")
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
-        from aiter.utility.tune_result import (
-            power_selection_enabled,
-            sort_by_energy_then_latency,
-        )
-
         if isinstance(results, list):
             frame = pd.DataFrame(results)
             columns = [col for col in self.columns if col in frame.columns]
@@ -562,18 +552,11 @@ class K5BvTuner(TunerCommon):
         if isinstance(results, pd.DataFrame):
             if results.empty:
                 return results
-            watts = (
-                pd.to_numeric(results["watts"], errors="coerce")
-                if "watts" in results.columns
-                else None
-            )
-            if (
-                power_selection_enabled(getattr(args, "select", None))
-                and watts is not None
-            ):
-                results = sort_by_energy_then_latency(results)
-            else:
-                results = results.sort_values("us")
+            if "watts" in results.columns:
+                results = results.assign(
+                    watts=pd.to_numeric(results["watts"], errors="coerce")
+                )
+            results = self.policy_for(args).sort_frame(results)
             return results.drop_duplicates(subset=self.keys, keep="first").reset_index(
                 drop=True
             )

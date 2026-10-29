@@ -909,6 +909,7 @@ class TestMoePowerRanking(unittest.TestCase):
     def test_power_rank_orders_pairs_by_stage_energy(self):
         import pandas as pd
 
+        from aiter.utility.selection_policy import POWER
         from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
 
         pairs = pd.DataFrame(
@@ -945,7 +946,7 @@ class TestMoePowerRanking(unittest.TestCase):
                 },
             ]
         )
-        ranked = rank_moe_pairs(pairs, select_power=True)
+        ranked = rank_moe_pairs(pairs, POWER)
         # one_stage 55*500 = 27500, slower_cooler 50*400+20*400 = 28000,
         # fast_hot 40*700+20*700 = 42000.
         self.assertEqual(
@@ -962,6 +963,7 @@ class TestMoePowerRanking(unittest.TestCase):
     def test_latency_rank_ignores_energy_order(self):
         import pandas as pd
 
+        from aiter.utility.selection_policy import LATENCY
         from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
 
         pairs = pd.DataFrame(
@@ -982,13 +984,14 @@ class TestMoePowerRanking(unittest.TestCase):
                 },
             ]
         )
-        ranked = rank_moe_pairs(pairs, select_power=False)
+        ranked = rank_moe_pairs(pairs, LATENCY)
         self.assertEqual(list(ranked["kernelName1"]), ["fast", "slow"])
         self.assertEqual(int(ranked.iloc[0]["rank"]), 1)
 
     def test_unmeasured_power_sorts_last(self):
         import pandas as pd
 
+        from aiter.utility.selection_policy import POWER
         from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
 
         pairs = pd.DataFrame(
@@ -1004,7 +1007,7 @@ class TestMoePowerRanking(unittest.TestCase):
                 },
             ]
         )
-        ranked = rank_moe_pairs(pairs, select_power=True)
+        ranked = rank_moe_pairs(pairs, POWER)
         self.assertEqual(ranked.iloc[0]["kernelName1"], "measured")
         self.assertTrue(pd.isna(ranked.iloc[1]["energy"]))
 
@@ -1170,16 +1173,17 @@ class TestPowerSelectionGaps(unittest.TestCase):
     def test_latency_frame_does_not_gain_watts(self):
         import pandas as pd
 
-        from aiter.utility.tune_result import attach_power_columns
+        from aiter.utility.selection_policy import LATENCY, POWER
 
         frame = pd.DataFrame([{"us": 10.0, "tflops": 100.0}])
-        previous = os.environ.pop("AITER_SELECT", None)
-        try:
-            out = attach_power_columns(frame, [SimpleNamespace(watts=400.0)])
-        finally:
-            if previous is not None:
-                os.environ["AITER_SELECT"] = previous
-        self.assertNotIn("watts", out.columns)
+        results = [SimpleNamespace(watts=400.0)]
+        self.assertNotIn("watts", LATENCY.attach_columns(frame, results).columns)
+        self.assertEqual(
+            float(POWER.attach_columns(frame, results).iloc[0]["watts"]), 400.0
+        )
+        candidate = {"us": 1.0}
+        LATENCY.record(candidate, "watts", lambda: self.fail("latency measured"))
+        self.assertNotIn("watts", candidate)
 
     def test_selection_prefers_energy_over_tflops_per_watt(self):
         import pandas as pd
@@ -1265,6 +1269,8 @@ class TestPowerTableSeparation(unittest.TestCase):
 
         def stamp_stub():
             stub = SimpleNamespace(columns=["M", "us"], POWER_WATT_COLUMNS=("watts",))
+            stub.policy = TunerCommon.policy
+            stub.policy_for = lambda args: TunerCommon.policy_for(stub, args)
             stub.power_metrics = lambda df: TunerCommon.power_metrics(stub, df)
             stub._rows_with_finite_watts = (
                 lambda df: TunerCommon._rows_with_finite_watts(stub, df)
@@ -1312,17 +1318,109 @@ class TestPowerTableSeparation(unittest.TestCase):
         )
         self.assertNotIn("select", latency.columns)
 
-    def test_power_replay_uses_run_perftest_kwargs(self):
-        from aiter.utility.mp_tuner import replay_timed_call
+    def test_power_replay_launches_the_kernel_without_perftest_options(self):
+        from aiter.utility.package_power import kernel_call
 
-        def kernel(x):
-            raise AssertionError(f"kernel called directly with {x}")
+        calls = []
 
-        with mock.patch(
-            "aiter.test_common.run_perftest", return_value=("out", 1.0)
-        ) as perftest:
-            replay_timed_call(kernel, (1,), {"num_warmup": 10, "num_iters": 101})
-        perftest.assert_called_once_with(kernel, 1, num_warmup=10, num_iters=101)
+        def kernel(x, scale=1):
+            calls.append((x, scale))
+
+        call = kernel_call(
+            kernel,
+            (3,),
+            {
+                "num_warmup": 10,
+                "num_iters": 101,
+                "num_rotate_args": 0,
+                "testGraph": False,
+                "needTrace": False,
+                "use_cuda_event": False,
+                "profile_warm_iters": 1,
+                "scale": 2,
+            },
+        )
+        with mock.patch("aiter.test_common.run_perftest") as perftest:
+            call()
+            call()
+        perftest.assert_not_called()
+        self.assertEqual(calls, [(3, 2), (3, 2)])
+
+    def test_policy_owns_every_select_decision(self):
+        from aiter.utility.selection_policy import (
+            LATENCY,
+            POWER,
+            active_policy,
+            make_policy,
+            use_policy,
+        )
+
+        hot = {"us": 10.0, "watts": 1000.0}
+        cool = {"us": 20.0, "watts": 200.0}
+        self.assertIs(make_policy("efficiency"), POWER)
+        self.assertIs(make_policy(SimpleNamespace(select="latency")), LATENCY)
+        self.assertIs(make_policy(None), LATENCY)
+        self.assertTrue(POWER.beats(hot, cool))
+        self.assertFalse(LATENCY.beats(hot, cool))
+        # Latency noise floor: 0.4 us faster is not a win at a 0.5 us margin.
+        self.assertFalse(LATENCY.beats({"us": 10.0}, {"us": 9.6}, 0.5))
+        self.assertTrue(LATENCY.beats({"us": 10.0}, {"us": 9.4}, 0.5))
+        self.assertEqual(POWER.pair_energy(10.0, 100.0, 0.0, float("nan")), 1000.0)
+        self.assertEqual(POWER.accurate_count(5, 40), 40)
+        self.assertEqual(LATENCY.accurate_count(5, 40), 5)
+        self.assertIs(POWER.best([hot, cool], latency_choice=lambda c: c[0]), cool)
+        self.assertIs(LATENCY.best([cool, hot], latency_choice=lambda c: c[0]), cool)
+        self.assertIs(active_policy(), LATENCY)
+        with use_policy(POWER):
+            self.assertIs(active_policy(), POWER)
+        self.assertIs(active_policy(), LATENCY)
+
+    def test_mp_tuner_reads_the_activated_policy(self):
+        from aiter.utility import mp_tuner
+        from aiter.utility.selection_policy import POWER, use_policy
+
+        class PoolStarted(Exception):
+            pass
+
+        def run(fast_mode):
+            mp_tuner.mp_tuner([((("k",), 0),)], [(1, ())], 2, fast_mode=fast_mode)
+
+        # A single-file AITER_POWER_PATH is rejected only when this pass
+        # measures power, so the error shows which policy mp_tuner used.
+        with (
+            mock.patch.dict(os.environ, {"AITER_POWER_PATH": "/tmp/one_file"}),
+            mock.patch.object(mp_tuner.torch.cuda, "device_count", return_value=2),
+            mock.patch.object(mp_tuner, "_new_pool", side_effect=PoolStarted),
+        ):
+            with self.assertRaises(PoolStarted):
+                run(fast_mode=False)
+            with use_policy(POWER):
+                with self.assertRaises(ValueError):
+                    run(fast_mode=False)
+                with self.assertRaises(PoolStarted):
+                    run(fast_mode=True)
+
+    def test_tuners_do_not_decide_select_mode_themselves(self):
+        import re
+
+        tuner_files = [
+            REPO_ROOT / "aiter/utility/base_tuner.py",
+            REPO_ROOT / "aiter/utility/mp_tuner.py",
+            REPO_ROOT / "gradlib/gradlib/GemmTuner.py",
+            *sorted((REPO_ROOT / "csrc").rglob("*_tune.py")),
+        ]
+        forbidden = re.compile(
+            r"power_selection_enabled|select_power|record_package_watts|"
+            r"measure_package_watts|measure_kernel|selection_rank\(|"
+            r"candidate_beats\(|sort_frame_for_selection|"
+            r"os\.environ\[\"AITER_SELECT\"\]|os\.environ\.get\(\"AITER_SELECT\""
+        )
+        offenders = []
+        for path in tuner_files:
+            for number, line in enumerate(path.read_text().splitlines(), start=1):
+                if forbidden.search(line):
+                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{number}: {line}")
+        self.assertEqual(offenders, [], "\n".join(offenders))
 
     def test_select_power_requires_support_and_refuses_latency_gate(self):
         from aiter.utility.base_tuner import TunerCommon
@@ -1337,6 +1435,12 @@ class TestPowerTableSeparation(unittest.TestCase):
         )
         previous = os.environ.get("AITER_SELECT")
         try:
+            TunerCommon._apply_select(
+                stub,
+                SimpleNamespace(select="latency", compare=False, update_improved=False),
+            )
+            self.assertEqual(stub.policy.name, "latency")
+            self.assertEqual(os.environ.get("AITER_SELECT"), previous)
             with self.assertRaises(SystemExit) as unsupported:
                 TunerCommon._apply_select(
                     stub,
@@ -1505,6 +1609,97 @@ assert "aiter" not in sys.modules
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_power_sample_of_a_large_gemm_tracks_a_busy_gpu(self):
+        """Real sensor: the tuner's sample must see the kernel, not idle time."""
+        import time
+
+        import torch
+
+        from aiter.utility import package_power
+        from aiter.utility.selection_policy import POWER
+
+        if not torch.cuda.is_available():
+            self.skipTest("needs a GPU")
+        device = torch.cuda.current_device()
+        path = package_power.power_input_path(device)
+        if path is None or package_power._read_watts(path) is None:
+            self.skipTest("package power sensor (power1_input) is not readable")
+
+        idle = []
+        deadline = time.perf_counter() + 0.4
+        while time.perf_counter() < deadline:
+            watts = package_power._read_watts(path)
+            if watts is not None:
+                idle.append(watts)
+            time.sleep(0.005)
+        idle_w = sum(idle) / len(idle)
+
+        a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+        back_to_back = package_power.measure_package_watts(
+            lambda: torch.mm(a, b), device_index=device
+        )
+        timed_kwargs = {"num_warmup": 2, "num_iters": 101, "num_rotate_args": 0}
+        tuner_sample = POWER.measure_timed(
+            torch.mm, (a, b), timed_kwargs, device_index=device
+        )
+        print(
+            f"\npower check: idle={idle_w:.0f} W back_to_back={back_to_back:.0f} W "
+            f"tuner={tuner_sample:.0f} W"
+        )
+        self.assertGreater(tuner_sample, 1.5 * idle_w)
+        self.assertGreater(tuner_sample, 0.85 * back_to_back)
+
+    def test_prebuild_duplicate_shapes_resolve_without_aiter_package(self):
+        import subprocess
+        import tempfile
+
+        script = """
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.environ["AITER_REPO"], "aiter"))
+from jit import core
+
+try:
+    core.AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE
+except RuntimeError as exc:
+    assert "lowest 'us'" in str(exc), exc
+else:
+    raise AssertionError("duplicate shapes were not reported")
+assert "aiter" not in sys.modules
+"""
+        header = "gfx,cu_num,B,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio"
+        rows = [
+            "gfx942,304,16,1,1280,8192,78,0,111.9,slow,3.0,3000.0,0.0",
+            "gfx942,304,16,1,1280,8192,29,0,90.5,fast,3.5,3500.0,0.0",
+        ]
+        for select in ("latency", "power"):
+            with tempfile.TemporaryDirectory() as tmp:
+                paths = []
+                for index, row in enumerate(rows):
+                    path = os.path.join(tmp, f"bf16_tuned_batched_gemm_{index}.csv")
+                    with open(path, "w", encoding="ascii") as handle:
+                        handle.write(f"{header}\n{row}\n")
+                    paths.append(path)
+                env = os.environ.copy()
+                env["AITER_REPO"] = str(REPO_ROOT)
+                env["AITER_SELECT"] = select
+                env["AITER_CONFIG_BF16_BATCHED_GEMM"] = os.pathsep.join(paths)
+                result = subprocess.run(
+                    [sys.executable, "-c", script],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(REPO_ROOT),
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode, 0, select + result.stderr + result.stdout
+                )
+                with open(paths[0], encoding="ascii") as handle:
+                    self.assertNotIn("slow", handle.read())
 
 
 if __name__ == "__main__":

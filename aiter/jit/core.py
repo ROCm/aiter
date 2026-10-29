@@ -268,14 +268,14 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
 )
 
 
-def _runtime_power_overlay() -> bool:
-    """True when a running ``import aiter`` asked for the power-table overlay.
+def _runtime_power_selection() -> bool:
+    """True when a running ``import aiter`` asked for power tables (AITER_SELECT).
 
     setup.py loads this file as ``jit.core`` and evaluates config properties
     while building the wheel. Importing ``aiter.utility`` from that copy runs
     ``aiter/__init__.py`` and requests ``module_aiter_core`` before the build
-    has registered it. The overlay only changes which CSV dispatch reads, so
-    the prebuild keeps the latency tables.
+    has registered it. Power selection only changes which CSV rows dispatch
+    reads, so the prebuild keeps the latency tables and the latency dedup.
     """
     raw = os.environ.get("AITER_SELECT", "latency").strip().lower()
     if raw not in {"power", "efficiency", "power_efficiency"}:
@@ -567,21 +567,21 @@ class AITER_CONFIG:
         # power tune wrote watts. One unparseable cell (e.g. nan) leaves a
         # column textual in `comparable`, where "10.5" sorts before "9.5", so
         # coerce the ranking columns alone.
-        from aiter.utility.tune_result import sort_frame_for_selection
-
         ranked = comparable.assign(us=pd.to_numeric(merge_df["us"], errors="coerce"))
-        if "watts" in merge_df.columns:
-            ranked = ranked.assign(
-                watts=pd.to_numeric(merge_df["watts"], errors="coerce")
-            )
-        if "tflops_per_w" in merge_df.columns:
-            ranked = ranked.assign(
-                tflops_per_w=pd.to_numeric(merge_df["tflops_per_w"], errors="coerce")
-            )
+        power_rank = _runtime_power_selection() and (
+            "watts" in merge_df.columns or "tflops_per_w" in merge_df.columns
+        )
+        if power_rank:
+            from aiter.utility.tune_result import sort_frame_for_selection
+
+            for column in ("watts", "tflops_per_w"):
+                if column in merge_df.columns:
+                    ranked[column] = pd.to_numeric(merge_df[column], errors="coerce")
+            ranked = sort_frame_for_selection(ranked, True)
+        else:
+            ranked = ranked.sort_values("us", kind="stable")
         best_row_index = set(
-            sort_frame_for_selection(ranked)
-            .drop_duplicates(subset=dedup_keys, keep="first")
-            .index
+            ranked.drop_duplicates(subset=dedup_keys, keep="first").index
         )
 
         saved_files = []
@@ -608,13 +608,7 @@ class AITER_CONFIG:
                 saved_files.append(
                     f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
                 )
-        from aiter.utility.tune_result import power_selection_enabled
-
-        kept = (
-            "lowest package energy (us * watts)"
-            if power_selection_enabled() and "watts" in merge_df.columns
-            else "lowest 'us'"
-        )
+        kept = "lowest package energy (us * watts)" if power_rank else "lowest 'us'"
         if failed_files:
             outcome = (
                 f"Resolved by keeping best performing ({kept}) for each key, "
@@ -817,7 +811,7 @@ class AITER_CONFIG:
             # properties from ``jit.core`` with the aiter package not yet
             # imported, and apply_power_overlay is a no-op unless
             # AITER_SELECT asks for power.
-            if _runtime_power_overlay():
+            if _runtime_power_selection():
                 from aiter.utility.power_configs import apply_power_overlay
 
                 config_file = apply_power_overlay(

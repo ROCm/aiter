@@ -94,19 +94,6 @@ def _merge_error_ratio(current, observed):
     return max(current, observed)
 
 
-def replay_timed_call(func, args, kwargs):
-    """Re-run the kernel the way the timer did.
-
-    ``kwargs`` are ``run_perftest`` arguments (``num_warmup``, ``num_iters``,
-    and the rest). Calling ``func(*args, **kwargs)`` forwards those into the
-    kernel, which raises ``TypeError``. ``record_package_watts`` would turn
-    that into NaN and the tune would keep a latency winner labeled as power.
-    """
-    from aiter.test_common import run_perftest
-
-    return run_perftest(func, *args, **kwargs)
-
-
 def worker(
     gpu_id,
     info,
@@ -123,10 +110,13 @@ def worker(
     output_keys=None,
     _arg_key_list=None,
     catastrophic_check=True,
-    measure_power=False,
+    policy=None,
 ):
     from aiter.test_common import run_perftest
+    from aiter.utility.selection_policy import LATENCY
     from aiter.utility.tune_result import TuneResult
+
+    policy = LATENCY if policy is None else policy
 
     pid = mp.current_process().pid
     device = torch.device(f"cuda:{gpu_id}")
@@ -242,13 +232,8 @@ def worker(
         us = -1  # float("inf")
         max_err_ratio = 1.0
 
-    if measure_power and us not in (-1, 0) and us != float("inf") and res is not None:
-        from aiter.utility.package_power import record_package_watts
-
-        watts = record_package_watts(
-            lambda: replay_timed_call(func, args, kwargs),
-            device_index=gpu_id,
-        )
+    if us not in (-1, 0) and us != float("inf") and res is not None:
+        watts = policy.measure_timed(func, args, kwargs, device_index=gpu_id)
 
     return TuneResult(info, us, round(max_err_ratio, 4), watts)
 
@@ -260,7 +245,7 @@ def work_group(
     in_data,
     tasks,
     verbose=False,
-    measure_power=False,
+    policy=None,
 ):
     """Work group that processes a batch of related tasks."""
     group_task = [tasks] if not isinstance(tasks, list) else tasks
@@ -412,7 +397,7 @@ def work_group(
                 output_keys,
                 arg_key_list,
                 True,
-                measure_power,
+                policy,
             )
 
             # Run worker with explicit GPU ID
@@ -449,7 +434,8 @@ def mp_tuner(
     err_ratio=0.05,
     timeout=None,
     verbose=False,  # print verbose log
-    measure_power=None,
+    policy=None,
+    final_timing=None,
 ):
     """Multi-process tuner with GPU fault isolation.
 
@@ -465,22 +451,27 @@ def mp_tuner(
         shape_grouped: Group tasks by shape
         err_ratio: Error tolerance ratio
         timeout: Timeout in seconds for each task group (None = no timeout)
+        policy: SelectionPolicy for the run; None uses the one the tuner activated
+        final_timing: whether these times pick the winner (default: not fast_mode).
+            Only a final timing pass is power-sampled.
 
     Returns:
         List of (info, latency, error_ratio) tuples
     """
+    from aiter.utility.selection_policy import LATENCY, active_policy
+
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
-    if measure_power is None:
-        from aiter.utility.tune_result import power_selection_enabled
-
+    if policy is None:
+        policy = active_policy()
+    if final_timing is None:
         # fast_mode is the hipblaslt latency screen. The MoE tuner also sets it,
-        # and passes measure_power explicitly because that call is its only timing pass.
-        measure_power = (not fast_mode) and power_selection_enabled()
-    else:
-        measure_power = bool(measure_power)
+        # and passes final_timing because that call is its only timing pass.
+        final_timing = not fast_mode
+    if not final_timing:
+        policy = LATENCY
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
-    if measure_power and mp_num > 1:
+    if policy.measures_power and mp_num > 1:
         from aiter.utility.package_power import shared_power_override_rejected
 
         rejected = shared_power_override_rejected()
@@ -545,7 +536,7 @@ def mp_tuner(
                         in_datas[ref_data_index[k]],
                         task_group[k],
                         verbose,
-                        measure_power,
+                        policy,
                     ),
                 ),
             )
