@@ -210,6 +210,40 @@ docs='diff --git a/docs/ck.md b/docs/ck.md
 t "a standalone submodule repin selects HK20" "$(fams "$repin")" "submodule-repin"
 t "a repin with only docs alongside selects HK20" "$(fams "$repin$docs")" "submodule-repin"
 t "docs alone stay infra-only" "$(fams "$docs")" "infra-only"
+rules_of() {  # <diff text> <family> -> that family's rules
+  printf '%s' "$1" | python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+print(dict(triage.derive(triage.parse(sys.stdin.read()))).get(sys.argv[2], ""))' "$S" "$2"
+}
+flydsl='diff --git a/aiter/ops/flydsl/kernels/moe_gemm.py b/aiter/ops/flydsl/kernels/moe_gemm.py
+--- a/aiter/ops/flydsl/kernels/moe_gemm.py
++++ b/aiter/ops/flydsl/kernels/moe_gemm.py
+@@ -1 +1 @@
+-    scale = 1.0 / amax
++    scale = amax if store_divisor else 1.0 / amax
+'
+# is_kernel() skips FlyDSL, so flydsl-kernel is the only family that can carry A4 there.
+t "a FlyDSL kernel edit selects A4" \
+  "$(rules_of "$flydsl" flydsl-kernel | grep -ow A4)" "A4"
+
+# derive -> verdict -> card: a submodule path has no extension, so unless audit_card counts it
+# as a citation, a card that reports HK20 without the rule code (as SKILL.md requires) fails
+# with UNREPORTED-FIRE.
+card_problems() {  # <diff text> <verdict line> <finding line> -> problem kinds, or "none"
+  printf '%s' "$1" | python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+diff = sys.stdin.read()
+_, probs = triage.audit_card(sys.argv[3], sys.argv[2], "", "", diff)
+print(" ".join(k for k, _, _ in probs) or "none")' "$S" "$2" "$3"
+}
+v_red='HK20 FIRE -- 3rdparty/composable_kernel pinned to 2222222 which is on no ROCm/composable_kernel branch'
+v_inc='HK20 FIRE -- 3rdparty/composable_kernel could not verify 2222222: fetch failed'
+t "a red HK20 finding without the rule code reaches the card" \
+  "$(card_problems "$repin" "$v_red" $'\360\237\224\264 3rdparty/composable_kernel is pinned to 2222222, on no ROCm/composable_kernel branch')" "none"
+t "an inconclusive HK20 warning reaches the card" \
+  "$(card_problems "$repin" "$v_inc" $'⚠️ could not verify 3rdparty/composable_kernel at 2222222 (fetch failed)')" "none"
+t "an HK20 FIRE missing from the card is still caught" \
+  "$(card_problems "$repin" "$v_red" '')" "UNREPORTED-FIRE"
 
 echo "[mapping]"
 # MAPPING.md is generated; a family or rule added to derive() without regenerating it drifts.

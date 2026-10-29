@@ -27,7 +27,7 @@ disagreement between this file and the deriver is caught.
 | `tests-only`            | P2 HK6 |
 | `async-stream`          | G1 G1b |
 | `flydsl`                | D10 D10b D12 C5 |
-| `flydsl-kernel`         | A1 B8 D1 D8 D12 P6 C5 |
+| `flydsl-kernel`         | A1 A4 B8 D1 D8 D12 P6 C5 |
 | `downstream-op`         | E4 E5 A2 |
 | `codegen-buildtool`     | A1 D5 B6 |
 | `new-compile-op`        | D7 D6 |
