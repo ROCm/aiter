@@ -420,6 +420,7 @@ def _ep_reference(
     activation,
     beta,
     linear_beta,
+    swiglu_limit,
     dtype,
 ):
     """fp32 reference of this rank's experts on the same MXFP4 weights. The
@@ -448,6 +449,7 @@ def _ep_reference(
         quant_type=QuantType.per_1x32,
         a1_scale=a1_scale,
         w1_scale=w1_scale,
+        swiglu_limit=swiglu_limit,
         **situ,
     )
     a2_scale = None
@@ -579,15 +581,24 @@ def test_fmoe_ep_mxfp4(
     const_init=None,
     activation=ActivationType.Silu,
     situ_betas=(DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA),
+    swiglu_limit=None,
+    sentinel_col=True,
     check_aot=False,
     deployment=None,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}; activation Silu or Situv2
-    (with situ_betas, the Kimi-K3 betas by default).
+    (with situ_betas, the Kimi-K3 betas by default), Silu clamped at
+    swiglu_limit when one is given.
+
+    Real mode routes topk columns, then shared_E + 1 for the shared experts
+    and the sentinel that masks them on other ranks' tokens; sentinel_col=False
+    routes the topk columns alone, as a caller whose shared experts run outside
+    fused_moe (shared_E must be 0).
 
     check_aot runs fused_moe in FlyDSL run-only mode, so a kernel missing from
-    the AOT cache fails the case, and holds the result to logits_diff < 0.01.
+    the AOT cache fails the case, and holds a result checkAllclose finds
+    mismatches in to logits_diff < 0.01.
     deployment names the EP deployment the case reproduces.
 
     ep_mode selects how tokens/routing reach fused_moe:
@@ -737,6 +748,9 @@ def test_fmoe_ep_mxfp4(
         graph_bs = token // ep
         n_src = graph_bs * ep  # global source tokens (all EP ranks' pre-dispatch)
         trim_M = n_src
+        if not sentinel_col and shared_E:
+            raise ValueError("fused shared experts need the sentinel column")
+        n_extra = shared_E + 1 if sentinel_col else 0
 
         # ---------- Simulate MORI dispatch output ----------
         # Step 1: generate the `n_src` *source* tokens (what all EP ranks hold
@@ -763,18 +777,19 @@ def test_fmoe_ep_mxfp4(
         else:
             src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
         src_topk_ids = torch.empty(
-            (n_src, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+            (n_src, topk + n_extra), dtype=dtypes.i32, device="cuda"
         )
-        ns_ids, s_ids = src_topk_ids.split([topk, shared_E + 1], dim=1)
-        shared_expert_ids = [E + i for i in range(shared_E + 1)]
-        s_ids_list = [[fake_expertid] * (shared_E + 1)] * n_src
-        for i in range(ep_id, n_src, ep):
-            s_ids_list[i] = shared_expert_ids
-        s_ids[:] = torch.tensor(s_ids_list, dtype=dtypes.i32, device="cuda")
+        ns_ids, s_ids = src_topk_ids.split([topk, n_extra], dim=1)
+        if n_extra:
+            shared_expert_ids = [E + i for i in range(n_extra)]
+            s_ids_list = [[fake_expertid] * n_extra] * n_src
+            for i in range(ep_id, n_src, ep):
+                s_ids_list[i] = shared_expert_ids
+            s_ids[:] = torch.tensor(s_ids_list, dtype=dtypes.i32, device="cuda")
         src_topk_weights = torch.empty(
-            (n_src, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+            (n_src, topk + n_extra), dtype=dtypes.fp32, device="cuda"
         )
-        ns_wts, s_wts = src_topk_weights.split([topk, shared_E + 1], dim=1)
+        ns_wts, s_wts = src_topk_weights.split([topk, n_extra], dim=1)
         s_wts[:] = 0.1
         fused_topk(src_input, src_score, topk, True, ns_ids, ns_wts)
 
@@ -803,12 +818,12 @@ def test_fmoe_ep_mxfp4(
         input_[:total_recv] = recv_input
 
         total_topk_ids = torch.zeros(
-            (trim_M, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+            (trim_M, topk + n_extra), dtype=dtypes.i32, device="cuda"
         )
         total_topk_ids[:total_recv] = recv_topk_ids
 
         total_topk_weights = torch.zeros(
-            (trim_M, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+            (trim_M, topk + n_extra), dtype=dtypes.fp32, device="cuda"
         )
         total_topk_weights[:total_recv] = recv_topk_weights
 
@@ -858,6 +873,7 @@ def test_fmoe_ep_mxfp4(
         activation=activation,
         beta=beta,
         linear_beta=linear_beta,
+        swiglu_limit=swiglu_limit,
         dtype=dtype,
     )
     # Pinned as serving and the AOT replay pin it. Left to fused_moe, gfx950
@@ -919,6 +935,7 @@ def test_fmoe_ep_mxfp4(
         "quant_dtype_a": quant_dtype_a,
         "beta": beta,
         "linear_beta": linear_beta,
+        "swiglu_limit": swiglu_limit,
     }
     _msg = (
         f"{quant_label} {activation.name} ep={ep} token={token}"
@@ -996,24 +1013,26 @@ def test_fmoe_ep_mxfp4(
     abs_max = abs_err.max().item()
     rel_mean = (abs_err / (ref.float().abs() + 1e-6)).mean().item()
     logits_diff = _calc_diff(ref, out)
+    err = checkAllclose(
+        ref.to(dtypes.fp32), out.to(dtypes.fp32), atol=5e-2, rtol=5e-2, msg=_msg
+    )
 
     if check_aot or _gfx == "gfx1250":
-        # The a8w4 kernels quantize activations to fp8, so the reference (bf16
-        # activations) differs elementwise by more than atol/rtol=5e-2 even
-        # without EP. Use the grouped tests' cosine criterion instead
+        # The a8w4 kernels quantize activations to fp8 and the reference keeps
+        # bf16 ones, so many outputs miss atol/rtol=5e-2 even without EP. As in
+        # test_moe_2stage.py's strict check, a case checkAllclose finds
+        # mismatches in must meet the grouped tests' cosine criterion
         # (flydsl_tests/test_flydsl_grouped_gemm.py: logits_diff < 0.01).
         _logits_diff_tol = 0.01
-        err = logits_diff
-        _verdict = "PASSED" if logits_diff < _logits_diff_tol else "FAILED"
+        passed = err == 0 or logits_diff < _logits_diff_tol
         print(
-            f"[aiter] {_msg} logits_diff={logits_diff:.6f} "
-            f"(tol {_logits_diff_tol}) {_verdict}"
+            f"[aiter] {_msg} mismatch={err:.2%} logits_diff={logits_diff:.6f} "
+            f"(tol {_logits_diff_tol}) {'PASSED' if passed else 'FAILED'}"
         )
-        assert (
-            logits_diff < _logits_diff_tol
-        ), f"{_msg}: logits_diff={logits_diff} exceeds {_logits_diff_tol}"
-    else:
-        err = checkAllclose(ref, out, atol=5e-2, rtol=5e-2, msg=_msg)
+        assert passed, (
+            f"{_msg}: checkAllclose err={err}, logits_diff={logits_diff} "
+            f"exceeds {_logits_diff_tol}"
+        )
 
     summary_table.append(
         {
@@ -1021,6 +1040,7 @@ def test_fmoe_ep_mxfp4(
             "aot_check": check_aot,
             "quant": quant_label,
             "act": activation.name,
+            "swiglu_limit": swiglu_limit,
             "ep_mode": ep_mode,
             "routing": routing,
             "global_token": token,
@@ -1051,11 +1071,11 @@ _DEPLOYMENT_QUANTS = {"a8w4": "a8w4_mxfp4", "a4w4": "a4w4_mxfp4"}
 def _deployment_ep_args(call, ep_mode):
     """test_fmoe_ep_mxfp4 arguments whose fused_moe call is the deployment's:
     its local expert count, routing columns and mask length. Real mode routes
-    topk columns plus shared_E + 1 shared or masked ones, fake mode topk local
-    ones."""
+    the model's top_k columns, then the shared and sentinel ones when the call
+    runs shared experts; fake mode topk_cols local ones."""
     shared_E = call.fused_shared
     if ep_mode == "real":
-        topk, routable = call.topk_cols - shared_E - 1, call.physical_experts
+        topk, routable = call.model.top_k, call.physical_experts
     else:
         topk, routable = call.topk_cols, call.physical_experts // call.ep
     if not 1 <= topk <= routable:
@@ -1067,6 +1087,7 @@ def _deployment_ep_args(call, ep_mode):
         "topk": topk,
         "shared_E": shared_E,
         "ep": call.ep,
+        "sentinel_col": bool(shared_E),
     }
 
 
@@ -1301,13 +1322,14 @@ for test in args.test:
                     label,
                     m,
                     call.model.model_dim,
-                    call.model.inter_dim,
+                    call.inter_dim,
                     **ep_args,
                     ep_mode=args.ep_mode,
                     fake_ep_rank=args.fake_ep_rank,
                     const_init=args.const_init,
                     activation=act,
                     situ_betas=(call.model.situ_beta, call.model.situ_linear_beta),
+                    swiglu_limit=call.model.swiglu_limit or None,
                     check_aot=True,
                     deployment=call.id,
                 )

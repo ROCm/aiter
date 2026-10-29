@@ -36,7 +36,8 @@ tensor-parallel deployments, whose rank passes no mask but the split
 intermediate dim and the shared-expert handling its framework uses (FHMoE
 among them). Each deployment is replayed at every bucket's smallest and largest
 M up to that M, bisected as above, and reads the tuned tables serving reads; it
-needs no tuned row.
+needs no tuned row. Its calls pass the model's activation clamp, and its
+SiTUv2 betas join the generic ones.
 
 A row is compiled for the arch its ``gfx`` column names. With ``GPU_ARCHS``
 naming targets, as the wheel build sets it, only rows of those archs are
@@ -349,13 +350,27 @@ def parse_deployments(paths: Sequence[str], edges: bool = True) -> list[dict]:
     caller-side variant) of the deployment files ``paths``."""
     jobs = []
     for call in load_deployments(paths).fused_moe:
+        model = call.model
         shape = deployment_row(call)
         variants = _variants(shape)
         if not call.is_ep:
             # num_local_tokens is the count an EP dispatch received.
             variants = [v for v in variants if not v["local_tokens"]]
+        betas = (model.situ_beta, model.situ_linear_beta)
+        if model.activation == "Situv2" and betas not in {
+            (v["beta"], v["linear_beta"]) for v in variants
+        }:
+            variants += [
+                {**v, "beta": betas[0], "linear_beta": betas[1]}
+                for v in variants
+                if v["beta"] is None
+            ]
         for bucket, low, high in _buckets(call.max_tokens):
-            row = {**shape, "token": str(bucket)}
+            row = {
+                **shape,
+                "token": str(bucket),
+                "swiglu_limit": model.swiglu_limit or None,
+            }
             points = [low, high] if edges and low < high else [high]
             for index, variant in enumerate(variants):
                 for m in points:
@@ -530,6 +545,7 @@ def _replay(job: dict) -> None:
         "hidden_pad": _int(job["hidden_pad"]),
         "intermediate_pad": _int(job["intermediate_pad"]),
         "gate_mode": job["gate_mode"],
+        "swiglu_limit": job.get("swiglu_limit"),
     }
     shared_expert_id = _int(job["shared_expert_id"], -1)
     if shared_expert_id >= 0:
@@ -595,6 +611,8 @@ def _describe(job: dict) -> str:
         variant.append(f"bias={job['bias']}")
     if job["beta"] is not None:
         variant.append(f"beta={job['beta']:g}/{job['linear_beta']:g}")
+    if job.get("swiglu_limit"):
+        variant.append(f"swiglu_limit={job['swiglu_limit']:g}")
     if job["local_tokens"]:
         variant.append("num_local_tokens")
     if not job["clamp_shared"]:
