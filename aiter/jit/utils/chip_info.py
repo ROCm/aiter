@@ -190,25 +190,39 @@ def get_lds_capacity_bytes(gfx: str | None = None) -> int:
         raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
 
 
+# The answer for every device once it cannot depend on the device: rocminfo /
+# hipinfo reports one arch, rocminfo one CU count, or AITER_AOT_REPLAY / CU_NUM
+# names it. get_gfx_runtime() and get_cu_num() then skip reading the current
+# device (torch.cuda.current_device(), about 0.2 us a call). None on a mixed
+# node and when Torch answers instead of the tool.
+_node_gfx_runtime: str | None = None
+_node_cu_num: int | None = None
+
+
 def get_gfx_runtime() -> str:
     """Return the arch of the current HIP device.
 
     Answers from rocminfo, or hipinfo on Windows, when it reports one arch.
     When it is missing, prints no gfx name or reports a mixed node, reads the
     current device through Torch; GPU_ARCHS is not consulted. Cached per
-    device. Use for runtime dispatch (tuned kernels, code paths). Use get_gfx()
-    for build-time codegen (gen_instances, csrc module-level arch selection)
-    where no GPU may be available.
+    device, or once for the node when the tool reports one arch. Use for
+    runtime dispatch (tuned kernels, code paths). Use get_gfx() for build-time
+    codegen (gen_instances, csrc module-level arch selection) where no GPU may
+    be available.
 
     The exception is an AOT replay process (AITER_AOT_REPLAY=1, started by
     aiter.aot.flydsl.common.replay_env): it runs the runtime without a GPU for
     the one arch GPU_ARCHS names, which stands in for the live GPU there.
     """
+    if _node_gfx_runtime is not None:
+        return _node_gfx_runtime
     return _gfx_runtime(_runtime_device())
 
 
 @functools.cache
 def _gfx_runtime(device: int) -> str:
+    global _node_gfx_runtime
+    node_wide = True
     if os.getenv("AITER_AOT_REPLAY") == "1":
         targets = _parse_gpu_archs_env(os.getenv("GPU_ARCHS", ""))
         if len(targets) != 1:
@@ -226,6 +240,7 @@ def _gfx_runtime(device: int) -> str:
         if len(archs) == 1:
             gfx_arch = archs[0]
         else:
+            node_wide = False
             gfx_arch = _torch_gcn_arch(device)
             if gfx_arch is None:
                 if tool_error is not None:
@@ -242,10 +257,18 @@ def _gfx_runtime(device: int) -> str:
             f"Unknown GPU architecture: {gfx_arch}. "
             f"Supported architectures: {sorted(supported)}"
         )
+    if node_wide:
+        _node_gfx_runtime = gfx_arch
     return gfx_arch
 
 
-get_gfx_runtime.cache_clear = _gfx_runtime.cache_clear  # type: ignore[attr-defined]
+def _clear_gfx_runtime_cache() -> None:
+    global _node_gfx_runtime
+    _node_gfx_runtime = None
+    _gfx_runtime.cache_clear()
+
+
+get_gfx_runtime.cache_clear = _clear_gfx_runtime_cache  # type: ignore[attr-defined]
 
 
 def _parse_asic_revision(value: str) -> int:
@@ -438,18 +461,44 @@ def _device_cu_num(device: int) -> int:
     return cu_num
 
 
+def _node_wide_cu_num() -> int | None:
+    """CU_NUM, or rocminfo's CU count when every GPU reports the same one."""
+    cu_num = int(os.getenv("CU_NUM", "0"))
+    if cu_num == 0 and not IS_WINDOWS:
+        try:
+            counts = set(_parse_cu_num_rocminfo(_gpu_info_output()))
+        except Exception:  # noqa: BLE001 the custom op already reported or fell back
+            counts = set()
+        cu_num = counts.pop() if len(counts) == 1 else 0
+    return cu_num or None
+
+
 def get_cu_num() -> int:
-    """CU count of the current HIP device, cached per device."""
+    """CU count of the current HIP device, cached per device, or once for the node."""
+    if _node_cu_num is not None:
+        return _node_cu_num
     return _get_cu_num(_runtime_device())
 
 
 @functools.cache
 def _get_cu_num(device: int) -> int:
+    global _node_cu_num
     # `device` only keys the cache: the custom op reads the same current device.
-    return get_cu_num_custom_op()
+    cu_num = get_cu_num_custom_op()
+    # The op may run the other copy of this module (it is also imported as
+    # top-level `chip_info`), so uniformity is resolved here. That runs rocminfo,
+    # which a torch.compile trace cannot, so a trace keeps the per-device key.
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.compiler.is_compiling():
+        return cu_num
+    if _node_wide_cu_num() == cu_num:
+        _node_cu_num = cu_num
+    return cu_num
 
 
 def _clear_cu_num_cache() -> None:
+    global _node_cu_num
+    _node_cu_num = None
     _get_cu_num.cache_clear()
     _device_cu_num.cache_clear()
 

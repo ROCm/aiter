@@ -184,3 +184,53 @@ def test_uniform_node_does_not_touch_torch(device1_selected_empty_tool, monkeypa
         monkeypatch.setattr(torch.cuda, name, forbidden)
     assert chip_info.get_gfx_runtime() == "gfx950"
     assert chip_info.get_cu_num() == 256
+
+
+def test_uniform_node_stops_reading_the_current_device(
+    device1_selected_empty_tool, monkeypatch
+):
+    if chip_info.IS_WINDOWS:
+        pytest.skip("rocminfo-format output")
+    uniform = _MIXED_ROCMINFO.replace("gfx942", "gfx950").replace("304", "256")
+    _fake_tool_output(monkeypatch, uniform)
+    current = {"device": 1}
+    lookups = []
+
+    def current_device():
+        lookups.append(current["device"])
+        return current["device"]
+
+    monkeypatch.setattr(torch.cuda, "current_device", current_device)
+    assert (chip_info.get_gfx_runtime(), chip_info.get_cu_num()) == ("gfx950", 256)
+    # Every device has the answer the first call cached, so no call reads it again.
+    lookups.clear()
+    for device in (0, 1, 0):
+        current["device"] = device
+        assert (chip_info.get_gfx_runtime(), chip_info.get_cu_num()) == ("gfx950", 256)
+    assert lookups == []
+    # cache_clear() drops the node-wide answer, as dry_run() relies on.
+    _fake_tool_output(monkeypatch, uniform.replace("gfx950", "gfx942"))
+    assert chip_info.get_gfx_runtime() == "gfx942"
+
+
+def test_uniform_arch_with_mixed_cu_counts_stays_per_device(
+    device1_selected_empty_tool, monkeypatch
+):
+    # A partitioned node: one arch, but a CPX-mode GPU reports fewer CUs.
+    if chip_info.IS_WINDOWS:
+        pytest.skip("rocminfo-format output")
+    _fake_tool_output(
+        monkeypatch,
+        _MIXED_ROCMINFO.replace("gfx950", "gfx942").replace("256", "38"),
+    )
+    devices = {
+        0: SimpleNamespace(gcnArchName="gfx942", multi_processor_count=38),
+        1: SimpleNamespace(gcnArchName="gfx942", multi_processor_count=304),
+    }
+    current = {"device": 0}
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current["device"])
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: devices[i])
+    for device in (0, 1, 0, 1):
+        current["device"] = device
+        assert chip_info.get_gfx_runtime() == "gfx942"
+        assert chip_info.get_cu_num() == devices[device].multi_processor_count
