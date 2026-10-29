@@ -166,11 +166,15 @@ def _quantize_v_mxfp4_fp6_p_hip(
     """Pack MXFP4 V in the contraction order required by an FP6 P operand."""
 
 
-def _validate_hip_row_layout_impl(input: Tensor, operation: str) -> None:
+def _validate_hd128_last_dimension(input: Tensor, operation: str) -> None:
     if input.dim() < 1 or input.shape[-1] != 128 or input.stride(-1) != 1:
         raise ValueError(
             f"{operation} requires hd128 input with a contiguous last dimension"
         )
+
+
+def _validate_hip_row_layout_impl(input: Tensor, operation: str) -> None:
+    _validate_hd128_last_dimension(input, operation)
     if input.data_ptr() % 16:
         raise ValueError(f"{operation} input must start on a 16-byte boundary")
     if input.dim() == 4:
@@ -192,10 +196,16 @@ def _validate_hip_row_layout(input: Tensor, operation: str) -> None:
     _validate_hip_row_layout_impl(input, operation)
 
 
-def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, int]:
+def _validate_bshd_hd128(
+    input: Tensor, operation: str, hip_rows: bool = True
+) -> tuple[int, int, int, int]:
+    # The HIP producers read rows as 16-byte vectors; the Triton ones take any pointer and strides.
     if input.dim() != 4:
         raise ValueError(f"{operation} requires hd128 BSHD input")
-    _validate_hip_row_layout_impl(input, operation)
+    if hip_rows:
+        _validate_hip_row_layout_impl(input, operation)
+    else:
+        _validate_hd128_last_dimension(input, operation)
     return input.shape
 
 
@@ -580,7 +590,9 @@ def _quantize_mxfp6_k_raw_fake(
 @torch.library.custom_op("aiter::mha_v4_quantize_v_fp8", mutates_args=())
 def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     """Quantize hd128 BSHD V to FP8 with one FP32 scale per channel."""
-    batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "FP8 V quantization")
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(
+        input, "FP8 V quantization", hip_rows=False
+    )
     fp8_max = torch.finfo(dtypes.fp8).max
     scale_block_k = 256
     scale_blocks = triton.cdiv(sequence, scale_block_k)
@@ -689,7 +701,7 @@ def _quantize_v_mxfp4_fp6_p_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6", mutates_args=())
 def quantize_v_mxfp6(input: Tensor) -> tuple[Tensor, Tensor]:
     """Pack hd128 BSHD V into MXFP6 data and E8M0 scale views."""
-    _validate_bshd_hd128(input, "MXFP6 V quantization")
+    _validate_bshd_hd128(input, "MXFP6 V quantization", hip_rows=False)
     return pack_fp6_v_data_scale_views(input)
 
 

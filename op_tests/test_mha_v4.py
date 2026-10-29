@@ -647,11 +647,10 @@ _HIP_ROW_LAYOUT_QUANTIZERS = {
     "mxfp4_k": lambda x: quantize_mxfp4_k(x),
     "mxfp6_q": lambda x: quantize_mxfp6_q(x, 0.127),
     "mxfp6_k": lambda x: quantize_mxfp6_k(x),
-    "v_fp8": quantize_v_fp8,
     "v_mxfp4_fp6_p": quantize_v_mxfp4_fp6_p,
-    "v_mxfp6": quantize_v_mxfp6,
     "v_mxfp6_fp6_p": quantize_v_mxfp6_fp6_p,
 }
+_TRITON_V_QUANTIZERS = {"v_fp8": quantize_v_fp8, "v_mxfp6": quantize_v_mxfp6}
 _GFX942_STRIDED_QUANTIZERS = {"int8", "fp8", "fp8_rotated", "v_fp8"}
 _GFX942_DENSE_ROWS = {
     (AttentionFormat.FP8,) * 3,
@@ -694,6 +693,15 @@ def test_mha_v4_quantizers_read_strided_views_like_contiguous_input(
         assert _bitwise_equal(actual, expected)
 
 
+def _misaligned_bshd_view(layout, batch=1, sequence=128, heads=2):
+    """An hd128 BSHD view off the 16-byte grid, by its start pointer or its outer strides."""
+    row = 136 if layout == "misaligned_pointer" else 129
+    storage = torch.randn(
+        (batch, sequence, heads, row), device="cuda", dtype=torch.bfloat16
+    )
+    return storage[..., 1:129] if layout == "misaligned_pointer" else storage[..., :128]
+
+
 @parametrize("quantizer", list(_HIP_ROW_LAYOUT_QUANTIZERS))
 @parametrize(
     "layout,message",
@@ -705,14 +713,31 @@ def test_mha_v4_quantizers_read_strided_views_like_contiguous_input(
 def test_mha_v4_hip_quantizers_reject_unsupported_bshd_layouts(
     quantizer, layout, message
 ):
-    row = 136 if layout == "misaligned_pointer" else 129
-    storage = torch.randn((1, 128, 2, row), device="cuda", dtype=torch.bfloat16)
-    value = (
-        storage[..., 1:129] if layout == "misaligned_pointer" else storage[..., :128]
-    )
+    value = _misaligned_bshd_view(layout)
 
     with expect_raises(ValueError, match=message):
         _HIP_ROW_LAYOUT_QUANTIZERS[quantizer](value)
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
+@parametrize(
+    "quantizer",
+    [
+        param(
+            quantizer,
+            skip=get_gfx() != "gfx950" and quantizer not in _GFX942_STRIDED_QUANTIZERS,
+        )
+        for quantizer in _TRITON_V_QUANTIZERS
+    ],
+)
+@parametrize("layout", ["misaligned_pointer", "misaligned_outer_stride"])
+def test_mha_v4_triton_v_quantizers_accept_misaligned_bshd_views(quantizer, layout):
+    """The Triton V producers have no 16-byte row requirement, unlike the HIP ones."""
+    torch.manual_seed(43)
+    value = _misaligned_bshd_view(layout, batch=2, sequence=257, heads=3)
+    quantize = _TRITON_V_QUANTIZERS[quantizer]
+
+    assert _bitwise_equal(quantize(value), quantize(value.contiguous()))
 
 
 def test_mha_v4_rotated_fp8_rejects_noncontiguous_non_bshd_input():
