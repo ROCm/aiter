@@ -14,6 +14,7 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
+from ..tensor_shim import fast_jit
 from .combine import (
     CHUNK_ELEMS as _COMBINE_CHUNK_ELEMS,
 )
@@ -1266,6 +1267,8 @@ class MegaMoEGfx1250:
         # wire; 0 (and unread) on bf16.
         self._dispatch_sent_scales_ptr = 0
         self._total_recv = torch.zeros(1, dtype=torch.int32, device=device)
+        # Static views into the arena, built by the first _dispatch.
+        self._arena_views = None
         self._cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
         self._combine_output = torch.zeros(
             config.max_tokens_per_rank * config.hidden_dim,
@@ -1316,20 +1319,24 @@ class MegaMoEGfx1250:
                 quant_bits=_bits,
             )
             _lanes = _toks * _chunks * _COMBINE_CHUNK_ELEMS // 16
-            self._combine_variants[_bits] = _make_combine_fused_reduce(
-                experts_per_token=config.topk,
-                hidden_dim=config.hidden_dim,
-                block_num=512,
-                warp_num_per_block=_lanes // _WAVE_SIZE,
-                slot_stride_nbytes=config.combine_slot_stride_for(_bits),
-                quant_bits=_bits,
-                tokens_per_block=_toks,
-                chunks_per_iter=_chunks,
+            self._combine_variants[_bits] = fast_jit(
+                _make_combine_fused_reduce(
+                    experts_per_token=config.topk,
+                    hidden_dim=config.hidden_dim,
+                    block_num=512,
+                    warp_num_per_block=_lanes // _WAVE_SIZE,
+                    slot_stride_nbytes=config.combine_slot_stride_for(_bits),
+                    quant_bits=_bits,
+                    tokens_per_block=_toks,
+                    chunks_per_iter=_chunks,
+                )
             )
-        self._combine_sync = _make_combine_fused_sync(
-            rank=config.rank,
-            npes=config.world_size,
-            off_xdb_mem=self._arena.offset("cross_device_barrier"),
+        self._combine_sync = fast_jit(
+            _make_combine_fused_sync(
+                rank=config.rank,
+                npes=config.world_size,
+                off_xdb_mem=self._arena.offset("cross_device_barrier"),
+            )
         )
 
     def _build_tdm_dispatch(self, config: MegaMoEConfig, device) -> dict:
@@ -1753,19 +1760,30 @@ class MegaMoEGfx1250:
             stream,
             **reset_args,
         )
-        reverse_source_view = _from_gpu_ptr(
-            self._arena.local_ptr("recv_to_src_token"),
-            (self._config.max_recv,),
-            torch.int32,
-        )
+        # The arena never moves and these views depend on nothing else, so
+        # they are built once: each _from_gpu_ptr is a __cuda_array_interface__
+        # round trip through torch.as_tensor, four of them on every layer.
+        views = self._arena_views
+        if views is None:
+            views = self._arena_views = (
+                _from_gpu_ptr(
+                    self._arena.local_ptr("recv_to_src_token"),
+                    (self._config.max_recv,),
+                    torch.int32,
+                ),
+                self._recv_tokens(),
+                self._recv_weights(),
+                self._recv_indices(),
+            )
+        reverse_source_view, recv_tokens, recv_weights, recv_indices = views
         routing = Routing(
             token_count=token_count,
             reverse_source_view=reverse_source_view,
         )
         return (
-            self._recv_tokens(),
-            self._recv_weights(),
-            self._recv_indices(),
+            recv_tokens,
+            recv_weights,
+            recv_indices,
             self._total_recv,
             routing,
         )

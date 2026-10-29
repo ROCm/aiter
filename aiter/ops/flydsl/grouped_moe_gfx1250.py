@@ -16,7 +16,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.kernels.tensor_shim import fast_jit_result, ptr_arg
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
@@ -376,6 +376,7 @@ def _use_fused_quant_preshuffle(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_g2l_lut(max_experts: int = 512, clear_counter: bool = True):
     """Compile and cache the single-block FlyDSL g2l-LUT builder."""
     from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
@@ -1461,13 +1462,17 @@ def grouped_gemm_gfx1250_a8w4(
     can fall back to the generic MoE.
     """
 
+    # Read once per call: the "inputs" message below formats every argument, so
+    # building it eagerly cost host time on every layer even with debug off.
+    _dbg_on = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
+
     def _grouped_dbg(msg: str, stacklevel: int = 1):
-        if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        ):
+        if _dbg_on:
             import inspect
 
             frame = inspect.stack()[stacklevel]
@@ -1481,36 +1486,37 @@ def grouped_gemm_gfx1250_a8w4(
             return f"Tensor(shape={tuple(v.shape)}, dtype={v.dtype})"
         return repr(v)
 
-    _grouped_dbg(
-        "inputs: "
-        + ", ".join(
-            f"{k}={_fmt(v)}"
-            for k, v in [
-                ("hidden_states", hidden_states),
-                ("w1", w1),
-                ("w2", w2),
-                ("topk_weight", topk_weight),
-                ("topk_ids", topk_ids),
-                ("E", E),
-                ("model_dim", model_dim),
-                ("inter_dim", inter_dim),
-                ("dtype", dtype),
-                ("activation", activation),
-                ("quant_type", quant_type),
-                ("q_dtype_a", q_dtype_a),
-                ("q_dtype_w", q_dtype_w),
-                ("isG1U1", isG1U1),
-                ("doweight_stage1", doweight_stage1),
-                ("w1_scale", w1_scale),
-                ("w2_scale", w2_scale),
-                ("expert_mask", expert_mask),
-                ("hidden_pad", hidden_pad),
-                ("intermediate_pad", intermediate_pad),
-                ("bias1", bias1),
-                ("bias2", bias2),
-            ]
+    if _dbg_on:
+        _grouped_dbg(
+            "inputs: "
+            + ", ".join(
+                f"{k}={_fmt(v)}"
+                for k, v in [
+                    ("hidden_states", hidden_states),
+                    ("w1", w1),
+                    ("w2", w2),
+                    ("topk_weight", topk_weight),
+                    ("topk_ids", topk_ids),
+                    ("E", E),
+                    ("model_dim", model_dim),
+                    ("inter_dim", inter_dim),
+                    ("dtype", dtype),
+                    ("activation", activation),
+                    ("quant_type", quant_type),
+                    ("q_dtype_a", q_dtype_a),
+                    ("q_dtype_w", q_dtype_w),
+                    ("isG1U1", isG1U1),
+                    ("doweight_stage1", doweight_stage1),
+                    ("w1_scale", w1_scale),
+                    ("w2_scale", w2_scale),
+                    ("expert_mask", expert_mask),
+                    ("hidden_pad", hidden_pad),
+                    ("intermediate_pad", intermediate_pad),
+                    ("bias1", bias1),
+                    ("bias2", bias2),
+                ]
+            )
         )
-    )
     _grouped_dbg("enter grouped helper")
     # Main opt-in plus legacy kill switch.
     if not _use_grouped_gemm_enabled():
@@ -1520,7 +1526,7 @@ def grouped_gemm_gfx1250_a8w4(
         _grouped_dbg("AITER_DISABLE_GROUPED_A8W4 enabled; skip grouped mode")
         return None
     _is_ep = expert_mask is not None
-    if _is_ep:
+    if _is_ep and _dbg_on:
         _grouped_dbg(f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}")
     if hidden_pad != 0 or intermediate_pad != 0:
         hidden_pad = 0
@@ -1548,7 +1554,8 @@ def grouped_gemm_gfx1250_a8w4(
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
     q_dtype_w_key = dtypes.fp4x2 if w_is_mxfp4 else q_dtype_w
-    _grouped_dbg(f"eligible data_format={data_format}")
+    if _dbg_on:
+        _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None
     _gfx_env = ";".join(
@@ -1600,7 +1607,8 @@ def grouped_gemm_gfx1250_a8w4(
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
-        _grouped_dbg(f"using grouped CSV config: {cfg_row}")
+        if _dbg_on:
+            _grouped_dbg(f"using grouped CSV config: {cfg_row}")
     else:
         logger.info(
             "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
@@ -1773,6 +1781,7 @@ def grouped_gemm_gfx1250_a8w4(
 
 # --- Functions moved from moe_kernels.py for grouped gemm ---
 @functools.cache
+@fast_jit_result
 def _get_compiled_gather_reduce(
     model_dim: int,
     topk: int,
@@ -1799,6 +1808,7 @@ def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_route_maps():
     """Compile and cache the atomic route -> grouped-row map kernel."""
     from aiter.ops.flydsl.kernels.moe_route_maps import build_moe_route_maps_module
@@ -1807,6 +1817,7 @@ def _get_compiled_route_maps():
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_contiguous_psum():
     """Compile and cache the contiguous M-tile prefix-sum kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
@@ -1817,6 +1828,7 @@ def _get_compiled_contiguous_psum():
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_contiguous_psum_remap():
     """Compile and cache the contiguous prefix-sum + row-remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
@@ -1827,6 +1839,7 @@ def _get_compiled_contiguous_psum_remap():
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_route_psum_fused():
     """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
@@ -1912,6 +1925,7 @@ def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_contiguous_psum_remap_ep():
     """psum + remap fused with the gemm2 EP ep_rowmap build."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
@@ -2107,6 +2121,7 @@ def flydsl_moe_gather_reduce(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_scatter_copy(row_bytes: int):
     """Compile and cache the one-pass row scatter-copy kernel (per row width)."""
     from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
@@ -2164,6 +2179,7 @@ def flydsl_moe_scatter_copy_token(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_scatter_preshuffle_scale(
     row_bytes: int, wmma_rep: int, scale_k_per_tile: int, gather: bool = True
 ):
