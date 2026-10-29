@@ -47,7 +47,8 @@ Each algorithm has a tuning ladder per ``(arch, link, world_size)``:
 ``ONESHOT_LADDER``, ``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a
 tuple of rungs in ascending ``min_bytes`` order, and a payload runs on the last
 rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
-one engine per rung.
+one engine per rung. The mesh algorithm's fused add+RMSNorm path has its own ladder,
+``MESH_NORM_LADDER``, and runs on the plain mesh ladder where that has no row.
 """
 
 from __future__ import annotations
@@ -252,10 +253,12 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 
 # Mesh, ``TwoShotRung``.
 #
-#   xGMI  ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
-#         Block 512 from 4 MiB.
-#         gfx950: ST=8 b256, then b512 from 4 MiB for TP4 (ST=1) and TP8 (ST=8).
-#         TP2 stays on one rung.
+#   xGMI  gfx942: ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
+#           Block 512 from 4 MiB.
+#         gfx950: one b256 rung per TP.
+#           - TP2 ST=1 cap512
+#           - TP4 ST=1 cap1024 
+#           - TP8 ST=8 cap384:
 #   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
 #         TP8 ST=8 everywhere.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
@@ -275,15 +278,13 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
     ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=256),
     ),
     ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
     ),
     ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=384, block=256),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (
@@ -296,6 +297,21 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
     ("gfx950", "pcie", 8): (
         TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=512),
+    ),
+}
+
+# Mesh with the fused add+RMSNorm epilogue, ``TwoShotRung``. Every rank
+# normalises the whole payload in the all-gather lap. 
+# A platform with no row runs on its mesh ladder.
+#
+#   xGMI  gfx950 
+#           TP8: ST=1 b256 cap1024 over the whole window, at hidden 4096
+#           and 8192, with or without MXFP4. TP2 and TP4 have no row: their mesh
+#           rung is also the best fused one.
+MESH_NORM_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    ("gfx950", "xgmi", 8): (
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
     ),
 }
 
@@ -358,6 +374,25 @@ def mesh_st_ladder(
     """The mesh rungs for *(arch, link, world_size)*. *arch* defaults to this
     host's."""
     return _ladder(MESH_ST_LADDER, "mesh", arch, link, world_size)
+
+
+def mesh_norm_ladder(
+    *,
+    world_size: int,
+    link: str,
+    arch: str | None = None,
+    mesh: tuple[TwoShotRung, ...] | None = None,
+) -> tuple[TwoShotRung, ...]:
+    """The rungs of the mesh's fused add+RMSNorm for *(arch, link,
+    world_size)*: its row in ``MESH_NORM_LADDER``, or where there is none the
+    mesh ladder, *mesh* if given. *arch* defaults to this host's."""
+    arch = detect_arch() if arch is None else arch
+    rungs = MESH_NORM_LADDER.get((arch, link, int(world_size)))
+    if rungs is not None:
+        return rungs
+    if mesh is not None:
+        return mesh
+    return mesh_st_ladder(world_size=world_size, link=link, arch=arch)
 
 
 def ring_st_ladder(

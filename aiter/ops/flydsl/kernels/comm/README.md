@@ -127,7 +127,11 @@ levels:
    windows do not overlap. The one-shot is exact and runs in both modes. With quantization on, the mesh/ring takes those payloads first.
 2. Which configuration of that algorithm runs. Each algorithm has a tuning
    ladder for each arch, link type and world size: `ONESHOT_LADDER`,
-   `MESH_ST_LADDER` and `RING_ST_LADDER`.
+   `MESH_ST_LADDER` and `RING_ST_LADDER`. The fused add+RMSNorm has its own ladder,
+   `MESH_NORM_LADDER`, because its epilogue wants a different grid than the
+   plain all-reduce. A platform without a row there uses its `MESH_ST_LADDER`.
+   The fused engines are built on first use. This is a collective, so call
+   `compile_rmsnorm` on every rank before CUDA graph capture.
 
 ## Environment variables
 

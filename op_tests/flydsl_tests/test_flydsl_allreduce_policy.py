@@ -23,6 +23,7 @@ from aiter.dist.device_communicators.custom_all_reduce import (
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.allreduce_policy import (
+    mesh_norm_ladder,
     mesh_st_ladder,
     oneshot_ladder,
     ring_st_ladder,
@@ -176,7 +177,10 @@ def test_ladders_are_well_formed(cell):
     """
     link, ws, arch = cell
     kw = {"world_size": ws, "link": link, "arch": arch}
-    two_shot = [("mesh", mesh_st_ladder(**kw), SUPER_TILES)]
+    two_shot = [
+        ("mesh", mesh_st_ladder(**kw), SUPER_TILES),
+        ("mesh_norm", mesh_norm_ladder(**kw), SUPER_TILES),
+    ]
     if _row(*cell).window(RING, quantized=True) is not None:
         two_shot.append(("ring", ring_st_ladder(**kw), RING_SUPER_TILES))
     for name, rungs, valid_st in two_shot:
@@ -200,9 +204,20 @@ def test_ladders_are_well_formed(cell):
         assert r.block in SUPPORTED_BLOCKS, r
 
 
+def test_norm_ladder_rows_are_mesh_platforms():
+    """A fused RMSNorm row is where the mesh runs, and a platform without one
+    runs the fused RMSNorm on its mesh ladder."""
+    mesh = P.LADDERS[MESH]
+    assert set(P.MESH_NORM_LADDER) <= set(mesh)
+    for arch, link, ws in mesh:
+        kw = {"world_size": ws, "link": link, "arch": arch}
+        want = P.MESH_NORM_LADDER.get((arch, link, ws), mesh[(arch, link, ws)])
+        assert mesh_norm_ladder(**kw) == want
+
+
 def test_ladder_lookup_rejects_unknown_keys():
     """No fallback rungs: an unknown platform raises."""
-    for ladder in (oneshot_ladder, mesh_st_ladder, ring_st_ladder):
+    for ladder in (oneshot_ladder, mesh_st_ladder, mesh_norm_ladder, ring_st_ladder):
         with pytest.raises(P.NoPolicyError):
             ladder(world_size=4, link="pcie", arch="gfx942")
         with pytest.raises(ValueError):

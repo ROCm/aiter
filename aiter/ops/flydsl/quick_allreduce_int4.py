@@ -45,6 +45,7 @@ from .allreduce_host_shared import (
 from .allreduce_policy import (
     MIN_BATCH_BLOCKS,
     RS_INT6_MIN_WORLD,
+    mesh_norm_ladder,
     mesh_st_ladder,
     resolve_link,
     ring_st_ladder,
@@ -113,6 +114,10 @@ class _Algorithm:
     ag_codecs: tuple[str, ...]
     # ``(*, world_size, link, arch) -> (TwoShotRung, ...)``: the tuning ladder.
     st_ladder: Callable[..., tuple[TwoShotRung, ...]]
+    # ``(*, world_size, link, arch, mesh) -> (TwoShotRung, ...)``: the ladder
+    # of the fused add+RMSNorm, *mesh* where it has no tuned row; ``None`` for
+    # a schedule without one.
+    norm_ladder: Callable[..., tuple[TwoShotRung, ...]] | None = None
     # Trailing ``Int64`` kernel arguments before the grid size: the fused
     # RMSNorm's residual, residual_out, weight, MXFP4 out and scale pointers.
     # Plain launches pass zeros.
@@ -160,6 +165,7 @@ ALGORITHMS = {
         rs_codecs=MESH_CODECS,
         ag_codecs=MESH_CODECS,
         st_ladder=mesh_st_ladder,
+        norm_ladder=mesh_norm_ladder,
         norm_ptr_args=NORM_PTR_ARGS,
         has_divisor=True,
     ),
@@ -264,7 +270,8 @@ class QuickAllReduceInt4:
 
     ``link`` selects the tuning ladder and is detected from the KFD topology
     when not given. ``ladder`` replaces the tuning ladder of the policy, for
-    tests that run other configurations. Both schedules specialise their
+    tests that run other configurations, and ``norm_ladder`` does the same for
+    the fused add+RMSNorm of the mesh algorithm. Both schedules specialise their
     binary to this rank, so the JIT symbol carries an ``_r<n>_`` field.
     """
 
@@ -282,6 +289,7 @@ class QuickAllReduceInt4:
         ag_codec: str | None = None,
         link: str | None = None,
         ladder: tuple[TwoShotRung, ...] | None = None,
+        norm_ladder: tuple[TwoShotRung, ...] | None = None,
     ):
         check_world_size(world_size)
         if algorithm not in ALGORITHMS:
@@ -299,6 +307,14 @@ class QuickAllReduceInt4:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
             raise ValueError("ladder must have at least one rung")
+        if norm_ladder is None and algo.norm_ladder is not None:
+            # Untuned, the fused RMSNorm runs on this object's own ladder, so a
+            # ``ladder`` override reaches it too.
+            norm_ladder = algo.norm_ladder(
+                world_size=world_size, link=link, arch=arch, mesh=ladder
+            )
+        if norm_ladder is not None and not norm_ladder:
+            raise ValueError("norm_ladder must have at least one rung")
         inbox_flags, resolved_inbox = _resolve_inbox_flags(
             inbox_memory, world_size, link
         )
@@ -330,82 +346,24 @@ class QuickAllReduceInt4:
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
 
-        # One engine per distinct ``(super_tile, block)``, keyed that way in
-        # ``_by_cfg``. Each ``block`` also gets an ST=1 engine: _pick_cfg falls
-        # back to it when a payload has fewer tiles than the chosen super-tile,
-        # and the fallback has to share the rung's block -- a different tile
-        # size would change the tile count it was picked for. Engines are built
-        # in a fixed order because each does its own IPC handle exchange, which
-        # is a collective -- ranks disagreeing on the order would deadlock.
-        #
-        # The rungs go in first so an ST=1 that the ladder *sites* keeps its own
-        # cap. Only then is the fallback filled in, and at the smallest cap
-        # among its rungs rather than at the global default: the fallback fires
-        # only when a payload has fewer tiles than the super-tile it would
-        # otherwise take, so ``_grid_x`` there is bounded by that super-tile
-        # (<= 32) with a release fence, and by the chosen rung's own cap without
-        # one -- under 128 either way. Seeding it with the 1216 default instead
-        # built a 194 MiB inbox to launch at most 32 blocks into, and did it on
-        # every object ever constructed.
-        caps = {}
-        for r in ladder:
-            caps.setdefault((r.super_tile, r.block), r.grid_cap)
-        for b in {b for _st, b in list(caps)}:
-            caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
-        # The fused RMSNorm cannot run at a block whose atom is wider than a
-        # row (hidden=2048 needs BLOCK), and a ladder may use wider blocks only.
-        # An ST=1 engine at BLOCK is a ~2 MiB inbox, so the mesh always has one.
-        if algo.name == "mesh" and all(b != BLOCK for _st, b in caps):
-            caps[(1, BLOCK)] = min(caps.values())
         self._ladder = ladder
+        self._norm_ladder = norm_ladder
+        self._arch = arch
+        self._cu_count = cu_count
+        self._lds_capacity = lds_capacity
+        self._inbox_flags = inbox_flags
+        self._caps = self._engine_caps(ladder)
         self._by_cfg = {}
-        # Per engine, the arguments that rebuild its kernel, for the fused
-        # RMSNorm builds that ``norm_launch`` adds on first use.
+        # Per engine, the arguments that rebuild its kernel.
         self._build_kw = {}
+        # The fused RMSNorm's engines and their arguments, built by
+        # ``prepare_rmsnorm``, and the fused builds ``norm_launch`` adds to
+        # them on first use.
+        self._norm_by_cfg = None
+        self._norm_build_kw = {}
         self._norm_launch = {}
         try:
-            with torch.cuda.device(self._device_index):
-                for key in sorted(caps):
-                    st, b = key
-                    # A persistent kernel deadlocks if it launches more workgroups
-                    # than fit, and the ranks have to agree on the number: take the
-                    # minimum across the group so a heterogeneous node converges.
-                    grid = clamp_grid_cap(
-                        caps[key],
-                        arch=arch,
-                        world_size=self.world_size,
-                        super_tile=st,
-                        cu_count=cu_count,
-                        block=b,
-                    )
-                    shared_grid = torch.tensor(grid, dtype=torch.int64)
-                    dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
-                    build_kw = {
-                        "world_size": self.world_size,
-                        "rank": self.rank,
-                        "super_tile": st,
-                        "grid": int(shared_grid.item()),
-                        "inbox_memory": resolved_inbox,
-                        "rs_codec": rs_codec,
-                        "ag_codec": ag_codec,
-                        "block": b,
-                    }
-                    spec = algo.build(**build_kw)
-                    self._build_kw[key] = build_kw
-                    if spec["lds_bytes"] > lds_capacity:
-                        raise ValueError(
-                            f"{algorithm} (rs_codec={rs_codec}, ag_codec={ag_codec}) "
-                            f"at block={b} needs "
-                            f"{spec['lds_bytes']} B of LDS, over the "
-                            f"{lds_capacity} B {arch} has"
-                        )
-                    self._by_cfg[key] = _StEngine(
-                        spec=spec,
-                        group=self.group,
-                        rank=self.rank,
-                        world_size=self.world_size,
-                        inbox_flags=inbox_flags,
-                    )
+            self._build_engines(self._caps, self._by_cfg, self._build_kw)
         except Exception:
             self.close()
             raise
@@ -420,6 +378,94 @@ class QuickAllReduceInt4:
         self.rank_tile_bytes = primary.rank_tile_bytes
         self.wire_tile_bytes = primary.wire_tile_bytes
 
+    @staticmethod
+    def _engine_caps(ladder) -> dict[tuple[int, int], int]:
+        """The grid cap of each engine *ladder* needs, keyed
+        ``(super_tile, block)``.
+
+        One engine per distinct ``(super_tile, block)``. Each ``block`` also
+        gets an ST=1 engine: _select_cfg falls back to it when a payload has
+        fewer tiles than the chosen super-tile, and the fallback has to share
+        the rung's block -- a different tile size would change the tile count
+        it was picked for.
+
+        The rungs go in first so an ST=1 that the ladder *sites* keeps its own
+        cap. Only then is the fallback filled in, and at the smallest cap
+        among its rungs rather than at the global default: the fallback fires
+        only when a payload has fewer tiles than the super-tile it would
+        otherwise take, so ``_grid_x`` there is bounded by that super-tile
+        (<= 32) with a release fence, and by the chosen rung's own cap without
+        one -- under 128 either way. Seeding it with the 1216 default instead
+        built a 194 MiB inbox to launch at most 32 blocks into, and did it on
+        every object ever constructed.
+        """
+        caps = {}
+        for r in ladder:
+            caps.setdefault((r.super_tile, r.block), r.grid_cap)
+        for b in {b for _st, b in list(caps)}:
+            caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
+        return caps
+
+    def _build_engines(self, caps, engines, build_kws) -> None:
+        """Build an engine for each entry of *caps* into *engines*, and the
+        arguments that rebuild its kernel into *build_kws*.
+
+        Collective: each engine does its own IPC handle exchange, so the
+        engines are built in a fixed order -- ranks disagreeing on the order
+        would deadlock.
+        """
+        with torch.cuda.device(self._device_index):
+            for key in sorted(caps):
+                st, b = key
+                # A persistent kernel deadlocks if it launches more workgroups
+                # than fit, and the ranks have to agree on the number: take the
+                # minimum across the group so a heterogeneous node converges.
+                grid = clamp_grid_cap(
+                    caps[key],
+                    arch=self._arch,
+                    world_size=self.world_size,
+                    super_tile=st,
+                    cu_count=self._cu_count,
+                    block=b,
+                )
+                shared_grid = torch.tensor(grid, dtype=torch.int64)
+                dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=self.group)
+                build_kw = {
+                    "world_size": self.world_size,
+                    "rank": self.rank,
+                    "super_tile": st,
+                    "grid": int(shared_grid.item()),
+                    "inbox_memory": self.inbox_memory,
+                    "rs_codec": self.rs_codec,
+                    "ag_codec": self.ag_codec,
+                    "block": b,
+                }
+                spec = self._algo.build(**build_kw)
+                if spec["lds_bytes"] > self._lds_capacity:
+                    raise ValueError(
+                        f"{self.algorithm} (rs_codec={self.rs_codec}, "
+                        f"ag_codec={self.ag_codec}) at block={b} needs "
+                        f"{spec['lds_bytes']} B of LDS, over the "
+                        f"{self._lds_capacity} B {self._arch} has"
+                    )
+                build_kws[key] = build_kw
+                engines[key] = _StEngine(
+                    spec=spec,
+                    group=self.group,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    inbox_flags=self._inbox_flags,
+                )
+
+    def _engines(self) -> list[_StEngine]:
+        """Every engine this object holds, each once: the fused RMSNorm
+        shares those it has in common with the plain all-reduce."""
+        by_id = {}
+        for engines in (self._by_cfg, self._norm_by_cfg or {}):
+            for eng in engines.values():
+                by_id.setdefault(id(eng), eng)
+        return list(by_id.values())
+
     @property
     def inbox_bytes(self) -> int:
         """IPC inbox bytes this object holds on *this* rank, across every rung.
@@ -431,43 +477,38 @@ class QuickAllReduceInt4:
         large on its own and a sweep holding several tuning variants live at
         once is the realistic way to exhaust a device.
         """
-        return sum(eng.buf_bytes for eng in self._by_cfg.values())
-
-    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int]:
-        """``(super_tile, block)`` the ladder assigns to *live_bytes*.
-
-        Publishes per rank are ``num_tiles / ST * 2(N-1)`` and cost a full L2
-        writeback each, so a bigger payload wants a bigger ST -- but ST also
-        divides the block count, so it cannot simply be maximised. The rungs
-        and the measurements behind them are in ``MESH_ST_LADDER`` and
-        ``RING_ST_LADDER``.
-        """
-        rung = select_rung(self._ladder, live_bytes)
-        return (rung.super_tile, rung.block)
+        return sum(eng.buf_bytes for eng in self._engines())
 
     @staticmethod
     def _num_tiles(live_bytes: int, block: int) -> int:
         tile_bytes = int(block) * ATOMS * 16
         return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
 
-    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int], int]:
-        """Engine key for a *live_bytes* payload, and its tile count.
+    def _select_cfg(
+        self, ladder, engines, live_bytes: int
+    ) -> tuple[tuple[int, int], int]:
+        """Key in *engines*, built for *ladder*, of a *live_bytes* payload,
+        and its tile count.
 
         The ladder chooses the rung, which fixes the block and so the tile
         count; the tile count then only has to confirm there is a whole
         super-tile to take, falling back to the same block's ST=1 engine when
         there is not.
         """
-
-        want, b = self._ladder_cfg(live_bytes)
+        rung = select_rung(ladder, live_bytes)
+        want, b = rung.super_tile, rung.block
         num_tiles = self._num_tiles(live_bytes, b)
         if want == 1:
             st = 1
         elif self._batch_publishes:
             st = want if num_tiles >= want else 1
         else:
-            st = want if num_tiles > self._by_cfg[(want, b)].grid else 1
+            st = want if num_tiles > engines[(want, b)].grid else 1
         return (st, b), num_tiles
+
+    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int], int]:
+        """``_by_cfg`` key for a *live_bytes* payload, and its tile count."""
+        return self._select_cfg(self._ladder, self._by_cfg, live_bytes)
 
     def _grid_x(self, num_tiles: int, super_tile: int, grid: int) -> int:
         """Blocks to launch for *num_tiles* tiles under *super_tile*.
@@ -579,12 +620,13 @@ class QuickAllReduceInt4:
                 preload_launcher(eng.launch, *args)
 
     def norm_launch(self, cfg, hidden, eps, gemma_norm, latency=False, mxfp4=False):
-        """Fused add+RMSNorm variant of engine *cfg*; shares its inbox and colors."""
+        """Fused add+RMSNorm variant of the fused RMSNorm's engine *cfg*;
+        shares its inbox and colors."""
         key = (cfg, int(hidden), float(eps), bool(gemma_norm), bool(latency), mxfp4)
         launch = self._norm_launch.get(key)
         if launch is None:
             launch = self._algo.build(
-                **self._build_kw[cfg],
+                **self._norm_build_kw[cfg],
                 norm_hidden=key[1],
                 norm_eps=key[2],
                 gemma_norm=key[3],
@@ -608,12 +650,8 @@ class QuickAllReduceInt4:
         """Shape of the e8m0 ``mxfp4_scale`` buffer for ``rows x hidden``."""
         return mxfp4_scale_shape(rows, hidden)
 
-    def _norm_cfg(self, live_bytes: int, hidden: int) -> tuple[tuple[int, int], int]:
-        """Engine key and tile count for a fused-norm payload.
-
-        The ladder's pick, unless its block cannot hold a *hidden*-wide row, in
-        which case the ST=1 engine of the narrowest block that can.
-        """
+    def _check_norm_schedule(self) -> None:
+        """Raise unless this object's schedule has the fused RMSNorm."""
         if self.algorithm != "mesh" or (self.rs_codec, self.ag_codec) != (
             "int4",
             "int4",
@@ -623,17 +661,72 @@ class QuickAllReduceInt4:
                 f"{self.algorithm!r} with rs_codec={self.rs_codec!r}, "
                 f"ag_codec={self.ag_codec!r}"
             )
+
+    def _check_norm(self, live_bytes: int, hidden: int) -> None:
+        """Raise unless the fused RMSNorm can take *hidden* and *live_bytes*."""
+        self._check_norm_schedule()
         if not self.supports_rmsnorm(hidden, live_bytes):
             raise ValueError(
                 "fused RMSNorm needs a row that fits whole atoms in a tile "
                 f"and a payload under 2 GiB, got hidden={hidden}, "
                 f"{live_bytes} bytes"
             )
-        cfg, num_tiles = self._pick_cfg(live_bytes)
+
+    def prepare_rmsnorm(self) -> None:
+        """Build the engines of the fused add+RMSNorm, those of its ladder in
+        ``MESH_NORM_LADDER``.
+
+        Collective, as the constructor is: every rank calls it, and before
+        CUDA graph capture. ``compile_rmsnorm`` calls it, as does the first
+        ``allreduce_rmsnorm`` when neither ran. An engine whose configuration
+        the plain all-reduce already has is shared, not built again.
+        """
+        if self._norm_by_cfg is not None:
+            return
+        self._check_norm_schedule()
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "QuickAllReduceInt4: the fused RMSNorm's engines are built by "
+                "a collective and cannot be created under CUDA graph capture; "
+                "call compile_rmsnorm (or prepare_rmsnorm) first"
+            )
+        caps = self._engine_caps(self._norm_ladder)
+        # The fused RMSNorm cannot run at a block whose atom is wider than a row.
+        if all(b != BLOCK for _st, b in caps):
+            caps[(1, BLOCK)] = min(caps.values())
+        shared = [key for key, cap in caps.items() if self._caps.get(key) == cap]
+        engines = {key: self._by_cfg[key] for key in shared}
+        build_kws = {key: self._build_kw[key] for key in shared}
+        try:
+            self._build_engines(
+                {key: cap for key, cap in caps.items() if key not in engines},
+                engines,
+                build_kws,
+            )
+        except Exception:
+            for key, eng in engines.items():
+                if key not in shared:
+                    eng.close()
+            raise
+        self._norm_by_cfg = engines
+        self._norm_build_kw = build_kws
+
+    def _norm_cfg(self, live_bytes: int, hidden: int) -> tuple[tuple[int, int], int]:
+        """Key in ``_norm_by_cfg`` and tile count for a fused-norm payload.
+
+        The fused RMSNorm ladder's pick, unless its block cannot hold a
+        hidden-wide row, in which case the ST=1 engine of the narrowest block
+        that can. Needs ``prepare_rmsnorm``.
+        """
+        self._check_norm(live_bytes, hidden)
+        engines = self._norm_by_cfg
+        if engines is None:
+            raise RuntimeError("the fused RMSNorm needs prepare_rmsnorm first")
+        cfg, num_tiles = self._select_cfg(self._norm_ladder, engines, live_bytes)
         if rmsnorm_hidden_supported(hidden, cfg[1]):
             return cfg, num_tiles
         blocks = sorted(
-            b for (_st, b) in self._by_cfg if rmsnorm_hidden_supported(hidden, b)
+            b for (_st, b) in engines if rmsnorm_hidden_supported(hidden, b)
         )
         if not blocks:
             raise ValueError(
@@ -666,9 +759,10 @@ class QuickAllReduceInt4:
             stream: ``None`` uses the current PyTorch stream on this device.
         """
         live_bytes = int(hidden) * 2
-        self._norm_cfg(live_bytes, hidden)  # validates
+        self._check_norm(live_bytes, hidden)
         if mxfp4 and not self.supports_mxfp4:
             raise RuntimeError("fused MXFP4 quant needs gfx950")
+        self.prepare_rmsnorm()
         dev = torch.device("cuda", self._device_index)
         inp, out, residual, residual_out, weight = (
             torch.zeros(hidden, dtype=torch.bfloat16, device=dev) for _ in range(5)
@@ -687,7 +781,7 @@ class QuickAllReduceInt4:
             int(weight.data_ptr()),
             *(int(t.data_ptr()) for t in mxfp4_bufs),
         )
-        for cfg, eng in self._by_cfg.items():
+        for cfg, eng in self._norm_by_cfg.items():
             if not rmsnorm_hidden_supported(hidden, cfg[1]):
                 continue
             st, b = cfg
@@ -724,6 +818,10 @@ class QuickAllReduceInt4:
         ``residual_out = allreduce(inp) + residual`` and
         ``out = rmsnorm(residual_out, eps) * w`` with ``w = weight`` or
         ``1 + weight`` when ``gemma_norm``.
+
+        Runs on the engines of ``MESH_NORM_LADDER``. The first call builds
+        them, a collective that cannot be captured: under CUDA graph capture,
+        call ``compile_rmsnorm`` first.
 
         Args:
             inp: this rank's bf16 partial sum, ``rows x hidden`` elements.
@@ -797,7 +895,7 @@ class QuickAllReduceInt4:
             inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
         )
         hidden = int(weight.numel())
-        cfg, num_tiles = self._norm_cfg(live_bytes, hidden)
+        self._check_norm(live_bytes, hidden)
         if int(inp.numel()) % hidden != 0:
             raise ValueError("numel must be a multiple of hidden")
         for name, t in (
@@ -844,7 +942,9 @@ class QuickAllReduceInt4:
                 if not t.is_contiguous() or t.numel() < nbytes:
                     raise ValueError(f"{name} must be contiguous with {nbytes} bytes")
             mxfp4_ptrs = (int(mxfp4[0].data_ptr()), int(mxfp4[1].data_ptr()))
-        eng = self._by_cfg[cfg]
+        self.prepare_rmsnorm()
+        cfg, num_tiles = self._norm_cfg(live_bytes, hidden)
+        eng = self._norm_by_cfg[cfg]
         # One tile per workgroup at <= 2 workgroups per CU: occupancy is
         # free, so take the low-latency build.
         latency = cfg == (1, BLOCK) and num_tiles <= min(
@@ -868,16 +968,19 @@ class QuickAllReduceInt4:
         )
 
     def close(self):
-        engines = getattr(self, "_by_cfg", None)
-        if not engines:
+        if not getattr(self, "_by_cfg", None) and not getattr(
+            self, "_norm_by_cfg", None
+        ):
             return
         with torch.cuda.device(self._device_index):
             if getattr(self, "_has_launched", False):
                 torch.cuda.synchronize(self._device_index)
                 self._has_launched = False
-            for eng in engines.values():
+            for eng in self._engines():
                 eng.close()
-            engines.clear()
+            self._by_cfg.clear()
+            if self._norm_by_cfg is not None:
+                self._norm_by_cfg.clear()
 
     def __del__(self):
         try:

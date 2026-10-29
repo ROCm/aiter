@@ -13,6 +13,8 @@ case:
   (tight: the only difference is the bf16 rounding of the reduced sum that
   the fused kernel skips);
 * bitwise equality of ``out`` / ``residual_out`` across ranks;
+* where the fused RMSNorm has its own ladder, the same checks again on the
+  mesh ladder, so the fused builds of its super-tiles stay covered;
 * on gfx950, ``allreduce_rmsnorm_mxfp4``: the same ``out`` / ``residual_out``
   bit for bit, and fp4 bytes plus shuffled e8m0 scales equal to
   ``per_1x32_f4_quant_hip(out, shuffle=True)``.
@@ -43,6 +45,11 @@ from aiter.test_common import checkAllclose, run_perftest
 
 set_start_method("spawn", force=True)
 
+from aiter.ops.flydsl.allreduce_policy import (
+    mesh_norm_ladder,
+    mesh_st_ladder,
+    resolve_link,
+)
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import WORLD
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import mxfp4_scale_shape
 
@@ -60,7 +67,8 @@ TIGHT_ERR_RATIO = 0.01
 # (tokens, hidden, gemma_norm, inplace_residual). tokens=1 at hidden=2048 is a
 # single partial tile; 37 rows leave a partial last tile at every hidden. Up to
 # 512 tiles (16 MiB) on a 256-CU part run the ST=1 latency build; 1536x8192 and
-# 3072x4096 (768 tiles) the occupancy-pinned ST=1 build; larger ones ST=8.
+# 3072x4096 (768 tiles) the occupancy-pinned ST=1 build; larger ones ST=8 where
+# the ladder has it.
 _VALIDITY_CASES = [
     (1, 2048, False, False),
     (37, 2048, False, False),
@@ -134,7 +142,7 @@ def _unfused_mxfp4(fly, inp, res, weight, out, ar, res_t, q, q_s, *, gemma_norm)
     aiter.per_1x32_f4_quant_hip(out, shuffle=True)
 
 
-def _run_rank(rank, tp, init_method, cases, time_it):
+def _run_rank(rank, tp, init_method, cases, time_it, norm_ladder):
     import torch.distributed as dist
 
     from aiter.ops.flydsl import QuickAllReduceInt4
@@ -151,7 +159,12 @@ def _run_rank(rank, tp, init_method, cases, time_it):
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
     fly = QuickAllReduceInt4(
-        group=gloo, device=device, rank=rank, world_size=tp, min_bytes=0
+        group=gloo,
+        device=device,
+        rank=rank,
+        world_size=tp,
+        min_bytes=0,
+        norm_ladder=norm_ladder,
     )
     rows = []
     # compile_rmsnorm must cover every fused build the cases pick: a case that
@@ -198,12 +211,13 @@ def _run_rank(rank, tp, init_method, cases, time_it):
             dist.all_gather(gathered, res_out, group=group)
             same_res = all(torch.equal(g, gathered[0]) for g in gathered)
 
-            # The unfused all-reduce takes the ladder's pick. When the fused one
-            # falls back to another block (the ladder's block is wider than a
-            # row), the two quantize differently and only the SQNR check against
+            # The unfused all-reduce takes the mesh ladder's pick and the fused
+            # one its own ladder's. The block sets the tile and so the
+            # quantization; when the two differ, only the SQNR check against
             # the fp32 reference is meaningful.
             nbytes = inp.numel() * inp.element_size()
-            same_cfg = fly._pick_cfg(nbytes)[0] == fly._norm_cfg(nbytes, hidden)[0]
+            fused_cfg = fly._norm_cfg(nbytes, hidden)[0]
+            same_cfg = fly._pick_cfg(nbytes)[0][1] == fused_cfg[1]
 
             tag = f"rank {rank} {ntok}x{hidden} gemma={gemma_norm}"
             row = {
@@ -211,6 +225,7 @@ def _run_rank(rank, tp, init_method, cases, time_it):
                 "hidden": hidden,
                 "gemma": gemma_norm,
                 "inplace": inplace,
+                "fused_cfg": fused_cfg,
                 "sqnr_out_db": _sqnr_db(out.float(), ref_out.float()),
                 "sqnr_res_db": _sqnr_db(res_out.float(), ref_res.float()),
                 "err_out_vs_unfused": (
@@ -302,7 +317,7 @@ def _run_rank(rank, tp, init_method, cases, time_it):
     return rows
 
 
-def _spawn(tp, cases, *, time_it):
+def _spawn(tp, cases, *, time_it, norm_ladder=None):
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
     pool = Pool(processes=tp)
@@ -310,7 +325,7 @@ def _spawn(tp, cases, *, time_it):
         futs = [
             pool.apply_async(
                 _run_rank,
-                args=(rank, tp, init_method, cases, time_it),
+                args=(rank, tp, init_method, cases, time_it, norm_ladder),
             )
             for rank in range(tp)
         ]
@@ -367,6 +382,15 @@ def main():
     aiter.logger.info(
         "validity (rank 0):\n%s", pd.DataFrame(ranks[0]).to_markdown(index=False)
     )
+    link = resolve_link(None)
+    mesh = mesh_st_ladder(world_size=args.tp, link=link)
+    if mesh_norm_ladder(world_size=args.tp, link=link) != mesh:
+        ranks = _spawn(args.tp, _VALIDITY_CASES, time_it=False, norm_ladder=mesh)
+        _assert_valid(ranks, _VALIDITY_CASES)
+        aiter.logger.info(
+            "validity on the mesh ladder (rank 0):\n%s",
+            pd.DataFrame(ranks[0]).to_markdown(index=False),
+        )
 
     bench = []
     for pair in args.bench:
