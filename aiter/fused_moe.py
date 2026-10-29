@@ -48,6 +48,8 @@ from aiter.ops.flydsl.moe_common import (
     get_flydsl_activation_name,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
+    FLYDSL_V2_GEMM2_BK,
+    FLYDSL_V2_GEMM2_BN,
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
@@ -3107,6 +3109,11 @@ def _opus_stage2_fp8_enabled():
     return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
 
 
+# Compile-time model_dim cap of the layout-v2 gemm2; _mxmoe_cfg_shape_reason
+# rejects tuned rows above it.
+_FLYDSL_V2_GEMM2_HIDDEN_MAX = 8192
+
+
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -3258,6 +3265,7 @@ def _flydsl_v2_stage2_wrapper(
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else ("fp4" if _s2_fp4_scatter else "bf16"),
+        HIDDEN_MAX=_FLYDSL_V2_GEMM2_HIDDEN_MAX,
         bias=bias2,
         is_ep=expert_mask is not None,
         out_scale=target_scale,
@@ -3305,6 +3313,118 @@ def _flydsl_v2_stage2_wrapper(
             fp8_pitch_align=_fp8_pitch_align,
         )
     return out
+
+
+def _mxmoe_cfg_shape_reason(kernelName1, kernelName2, model_dim, inter_dim):
+    """Why this tuned (g1, g2) pair cannot run at (model_dim, inter_dim), or None.
+
+    The FlyDSL MoE kernels assert their tile/shape divisibility at compile time,
+    deep inside the launcher, which turns a stale or mis-keyed tuned CSV row into
+    a hard crash (during CUDA-graph capture it takes the whole server down). Run
+    the launchers' own host-side checks here so the caller can drop the config and
+    fall back to the default heuristics, the same way ``_opus_a8w4.cfg_is_supported``
+    does for Opus.
+    """
+    v2 = parse_flydsl_v2_gemm2_kernel(kernelName2)
+    # Native mxmoe gemm1: the launcher's _assert_supported (variant table, BN,
+    # k_wave / num_waves limits, K and N divisibility), plus two checks only
+    # compile_gemm1_a4w4_port makes: BK == 256 and at least kStages (2) K tiles
+    # per k_wave.
+    if _is_mxfp4_kname(kernelName1):
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import (
+            _assert_supported as _g1_assert_supported,
+        )
+
+        try:
+            p1 = _parse_mxfp4_g1_kname(kernelName1)
+        except (ValueError, KeyError) as e:
+            return f"native mxmoe gemm1 {kernelName1!r} is malformed: {e}"
+        bk1, k_wave = p1["BK"], p1["k_wave"]
+        if bk1 != 256:
+            return f"native mxmoe gemm1 {kernelName1!r} has unsupported BK={bk1}"
+        try:
+            _g1_assert_supported(
+                D_HIDDEN=model_dim,
+                D_INTER=inter_dim,
+                BM=p1["BM"],
+                use_nt=p1["use_nt"],
+                inline_quant=p1["inline_quant"],
+                prefetch_hidden=p1["prefetch_hidden"],
+                BN=p1["BN"],
+                BK=bk1,
+                a_dtype=p1["a_dtype"],
+                out_dtype=p1["out_dtype"],
+                act=p1["act"],
+                num_waves=p1["num_waves"],
+                native_scale_layout=native_scale_layout_for(p1["BM"], p1["out_dtype"]),
+                k_wave=k_wave,
+            )
+        except (NotImplementedError, ZeroDivisionError) as e:
+            # A zero BN in the name reaches a modulo before the BN check.
+            return f"native mxmoe gemm1 {kernelName1!r}: {e}"
+        if model_dim // bk1 < 2 * k_wave:
+            return (
+                f"native mxmoe gemm1 {kernelName1!r} needs "
+                f"2 * k_wave <= model_dim // {bk1}, got model_dim={model_dim} "
+                f"k_wave={k_wave}"
+            )
+    # Native mxmoe gemm2: the launcher's _assert_supported (BN/BK, K = inter_dim
+    # by BK, N = model_dim by BN, and the (BM, nt, epilog) variant table). An
+    # _f4out name runs the MXFP4 epilog only at BM128, where the bf16 epilog is
+    # supported too; elsewhere it falls back to the bf16 epilog, so check that.
+    if _is_mxfp4_kname(kernelName2):
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import (
+            _assert_supported as _g2_assert_supported,
+        )
+
+        try:
+            p2 = _parse_mxfp4_g2_kname(kernelName2)
+        except (ValueError, KeyError) as e:
+            return f"native mxmoe gemm2 {kernelName2!r} is malformed: {e}"
+        try:
+            _g2_assert_supported(
+                NE=0,
+                D_HIDDEN=model_dim,
+                D_INTER=inter_dim,
+                topk=0,
+                BM=p2["BM"],
+                use_nt=p2["use_nt"],
+                atomic=p2["atomic"],
+                mxfp4out=False,
+                cshuffle=p2["cshuffle"],
+                BN=p2["BN"],
+                BK=p2["BK"],
+            )
+        except NotImplementedError as e:
+            return f"native mxmoe gemm2 {kernelName2!r}: {e}"
+    # v2 layout gemm2 (mxmoe_dispatcher.mxfp4_moe_gemm2): its tile_n / tile_k
+    # allow-lists (first, so a zero tile cannot divide), K % tile_k, N % tile_n
+    # and N <= HIDDEN_MAX.
+    if v2 is not None:
+        if (
+            v2["tile_n"] not in FLYDSL_V2_GEMM2_BN
+            or v2["tile_k"] not in FLYDSL_V2_GEMM2_BK
+        ):
+            return (
+                f"gemm2 {kernelName2!r} needs tile_n in {FLYDSL_V2_GEMM2_BN} and "
+                f"tile_k in {FLYDSL_V2_GEMM2_BK}, got {v2['tile_n']}x{v2['tile_k']}"
+            )
+        if inter_dim % v2["tile_k"] != 0:
+            return (
+                f"gemm2 {kernelName2!r} needs inter_dim % {v2['tile_k']} == 0, "
+                f"got {inter_dim}"
+            )
+        if model_dim % v2["tile_n"] != 0:
+            return (
+                f"gemm2 {kernelName2!r} needs model_dim % {v2['tile_n']} == 0, "
+                f"got {model_dim}"
+            )
+        if model_dim > _FLYDSL_V2_GEMM2_HIDDEN_MAX:
+            return (
+                f"gemm2 {kernelName2!r} needs model_dim <= "
+                f"{_FLYDSL_V2_GEMM2_HIDDEN_MAX}, got {model_dim}"
+            )
+    return None
 
 
 def _make_mxfp4_metadata(
@@ -3749,8 +3869,13 @@ def get_2stage_cfgs(
                 )
 
     if cfg is not None and _is_mxfp4_kname(kn1):
-        parsed_g1 = _parse_mxfp4_g1_kname(kn1)
-        configured_act = parsed_g1["act"]
+        # A malformed name is a dropped row, not a crash at dispatch.
+        try:
+            parsed_g1 = _parse_mxfp4_g1_kname(kn1)
+            configured_act, malformed_g1 = parsed_g1["act"], None
+        except (ValueError, KeyError) as e:
+            parsed_g1 = configured_act = None
+            malformed_g1 = f"kernelName1 {kn1!r} is malformed: {e}"
         # Gelu/GeluTanh are real ActivationType values that MXMOE has no kernel
         # for. Folding them to "silu" would match a SiLU-tuned row and silently
         # run the wrong activation, so ask for a name that refuses instead.
@@ -3759,7 +3884,9 @@ def get_2stage_cfgs(
         except ValueError:
             expected_act = None
         reject_reason = None
-        if expected_act is None:
+        if malformed_g1 is not None:
+            reject_reason = malformed_g1
+        elif expected_act is None:
             reject_reason = f"no MXMOE kernel for activation {activation!r}"
         elif configured_act != expected_act:
             reject_reason = (
@@ -3815,6 +3942,20 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    if cfg is not None:
+        shape_reason = _mxmoe_cfg_shape_reason(
+            str(cfg.get("kernelName1", "") or "").strip(),
+            str(cfg.get("kernelName2", "") or "").strip(),
+            model_dim,
+            inter_dim,
+        )
+        if shape_reason is not None:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding tuned config for {keys}: {shape_reason}; "
+                "using default heuristics. The tuned row was most likely written "
+                "for a different inter_dim/model_dim than this runtime shape."
+            )
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     kernel_name1 = kn1 if cfg is not None else ""
     weights_shuffled = (

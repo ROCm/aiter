@@ -61,6 +61,11 @@ def native_scale_layout_for(BM: int, out_dtype: str) -> bool:
     return int(BM) == 16 and str(out_dtype).lower() == "fp4"
 
 
+# Tile sizes the layout-v2 gemm2 (kernels/mxmoe_dispatcher.mxfp4_moe_gemm2) builds.
+# The launcher and the tuned-row guard in fused_moe both check against these.
+FLYDSL_V2_GEMM2_BN = (128, 256, 512)
+FLYDSL_V2_GEMM2_BK = (128, 256)
+
 _FLYDSL_V2_GEMM2_RE = re.compile(
     r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce|scatter)"

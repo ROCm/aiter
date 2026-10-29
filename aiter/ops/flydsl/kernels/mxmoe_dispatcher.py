@@ -11,6 +11,7 @@ from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
 
+from ..mxfp4_kname import FLYDSL_V2_GEMM2_BK, FLYDSL_V2_GEMM2_BN
 from .mxfp4_gemm_common import _udiv
 from .mxmoe_gemm_v2 import (
     gemm2_body_v2,
@@ -842,10 +843,10 @@ def mxfp4_moe_gemm2(
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
     SBM = _norm_sbm(SBM, BM)
-    if BN not in (128, 256, 512):
-        raise AssertionError(f"BN must be one of (128, 256, 512), got {BN}")
-    if BK not in (128, 256):
-        raise AssertionError(f"BK must be one of (128, 256), got {BK}")
+    if BN not in FLYDSL_V2_GEMM2_BN:
+        raise AssertionError(f"BN must be one of {FLYDSL_V2_GEMM2_BN}, got {BN}")
+    if BK not in FLYDSL_V2_GEMM2_BK:
+        raise AssertionError(f"BK must be one of {FLYDSL_V2_GEMM2_BK}, got {BK}")
     # model_dim/hidden (gemm2 N-output) is a runtime arg; validate host-side (not compile-time).
     if D_HIDDEN % BN != 0:
         raise AssertionError(
