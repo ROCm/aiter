@@ -28,6 +28,8 @@ SUPPORTED_ARCHS = ("gfx942",)
 
 SKEW_COMPACT_XCD_C = 32
 SKEW_COMPACT_XCD_W = 8
+SKEW_COMPACT_KN_XCD_C_SMALL = 64
+SKEW_COMPACT_KN_XCD_W_SMALL = 16
 _SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
 
 _CFG_KEYS = ("xcd_c", "xcd_w", "block_k", "threads")
@@ -55,7 +57,11 @@ def shape_id(
     return f"B{n_groups}D{reduction_k}K{output_n}N{max_seq_len}"
 
 
-def _skew_compact_xcd(n_groups: int, reduction_k: int) -> tuple[int | None, int | None]:
+def _skew_compact_xcd(
+    n_groups: int, reduction_k: int, dense_kn: bool = False
+) -> tuple[int | None, int | None]:
+    if dense_kn and n_groups <= _SKEW_XCD_REMAP_SMALL_B_THRESHOLD and reduction_k < 512:
+        return SKEW_COMPACT_KN_XCD_C_SMALL, SKEW_COMPACT_KN_XCD_W_SMALL
     if n_groups > _SKEW_XCD_REMAP_SMALL_B_THRESHOLD or reduction_k >= 512:
         return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
     return None, None
@@ -202,7 +208,7 @@ def jagged_dense_bmm_dispatched(
         stream = torch.cuda.current_stream(A.device)
 
     if not uniform_seqlen:
-        sc_xcd_c, sc_xcd_w = _skew_compact_xcd(n_groups, reduction_k)
+        sc_xcd_c, sc_xcd_w = _skew_compact_xcd(n_groups, reduction_k, B.dim() == 3)
         return jagged_dense_bmm(
             C,
             A,
