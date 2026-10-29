@@ -572,8 +572,7 @@ def compile_gemm_fp8_8wave(
         lane_src_offset = (a_local_row * K + a_lane_k) * _elem_bytes
         slice_chunk_src_offsets = [
             [
-                lane_src_offset
-                + (half * BLOCK_M + chunk * 8) * K * _elem_bytes
+                lane_src_offset + (half * BLOCK_M + chunk * 8) * K * _elem_bytes
                 for chunk in range_constexpr(BLOCK_M // 64)
             ]
             for half in range_constexpr(2)
