@@ -108,13 +108,22 @@ def upstream_dispatch():
     )
 
 
-def test_case(m, seed, packed):
+def test_case(m, seed, packed, normalized=False):
     args, kwargs = inputs(m, seed=seed)
+    if normalized:
+        # Keep typical projection logits O(1), alongside the unscaled stress case.
+        args[4].mul_((4 * args[0].shape[-1]) ** -0.5)
+        args[5].mul_(10.0)
     call_args, options = call_inputs(args, kwargs, packed)
     assert _mhc_post_pre_gfx950_supported(*call_args, kwargs["norm_weight"], packed)
     saved_inputs = tuple(t.clone() for t in call_args)
     saved_norm = kwargs["norm_weight"].clone()
-    out = mhc_fused_post_pre(*call_args, **options)
+    with patch(
+        "aiter.ops.mhc._mhc_post_pre_gfx950",
+        wraps=mhc_api._mhc_post_pre_gfx950,
+    ) as implementation:
+        out = mhc_fused_post_pre(*call_args, **options)
+        assert implementation.call_count == 1
     check(out, reference(*args, **kwargs))
     saved_out = tuple(t.clone() for t in out)
     for got, want in zip(call_args, saved_inputs):
@@ -160,7 +169,10 @@ def test_case(m, seed, packed):
     graph.replay()
     torch.cuda.synchronize()
     check(captured, reference(*args, **kwargs))
-    print(f"m={m}, seed={seed}, packed={packed}: correctness/state/graph PASS")
+    print(
+        f"m={m}, seed={seed}, packed={packed}, normalized={normalized}: "
+        "correctness/state/graph PASS"
+    )
 
 
 def check_fallback(args, kwargs):
@@ -202,6 +214,24 @@ def test_fallbacks(seed):
     assert not _mhc_post_pre_gfx950_supported(x, *args[1:], kwargs["norm_weight"])
     check_fallback((x, *args[1:]), kwargs)
     check_fallback(args, {})
+    for dtype in (torch.bfloat16, torch.float16):
+        args, kwargs = inputs(8192, dtype=dtype, seed=seed)
+        call_args, options = call_inputs(args, kwargs, True)
+        if dtype == torch.float16:
+            assert not _mhc_post_pre_gfx950_supported(
+                *call_args, kwargs["norm_weight"], True
+            )
+            check_fallback(call_args, options)
+        else:
+            x = torch.empty((8192, 7168 + 8), dtype=dtype, device="cuda")[:, :7168]
+            x.copy_(args[0])
+            strided_args = (x, *call_args[1:])
+            assert not _mhc_post_pre_gfx950_supported(
+                *strided_args, kwargs["norm_weight"], True
+            )
+            check_fallback(strided_args, options)
+            assert not _mhc_post_pre_gfx950_supported(*call_args, None, True)
+            check_fallback(call_args, {"w_preshuffle_bf16": True})
     print("fallback shape/dtype/layout/no-norm equivalence PASS")
 
 
@@ -276,6 +306,16 @@ def error_metrics(actual, expected):
                 (delta > 1e-2 + 1e-2 * want.float().abs()).sum().item()
             ),
         }
+        if name == "next_residual" and got.dtype == want.dtype == torch.bfloat16:
+            got_bits = got.contiguous().view(torch.int16).to(torch.int32)
+            want_bits = want.contiguous().view(torch.int16).to(torch.int32)
+            # Signed-magnitude BF16 to a monotonic ULP index, with +/-0 at zero.
+            got_order = torch.where(got_bits < 0, -32768 - got_bits, got_bits)
+            want_order = torch.where(want_bits < 0, -32768 - want_bits, want_bits)
+            result[name]["bf16_bitwise_equal_fraction"] = (
+                (got_bits == want_bits).float().mean().item()
+            )
+            result[name]["bf16_max_ulp"] = (got_order - want_order).abs().max().item()
     return result
 
 
@@ -434,7 +474,8 @@ if __name__ == "__main__":
         for seed in args.seed:
             for m in args.m:
                 for packed in ((False, True) if m == 64 else (True,)):
-                    test_case(m, seed, packed)
+                    for normalized in (False, True):
+                        test_case(m, seed, packed, normalized)
         test_fallbacks(args.seed[0])
         test_hardware_exclusions(args.seed[0])
         for m in args.m:
