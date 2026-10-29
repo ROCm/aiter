@@ -47,12 +47,13 @@ from opus_gemm_common import (
 
 
 def _registry_arch(gfx: str) -> str:
-    """Kernel-family key for KERNEL_REGISTRY lookups.
+    """Kernel-family name used for every target this script returns.
 
-    gfx1250-strict (MI450 A0) shares the gfx1250 kernel family, so registry
-    lookups normalize to gfx1250 -- mirroring chip_info._detect_native. The
-    returned build target keeps the gfx1250-strict spelling, so hipcc still
-    compiles for gfx1250-strict (mach 0xeb); only the registry key is folded.
+    gfx1250-strict (MI450 A0) shares the gfx1250 kernel family, as in
+    chip_info._detect_native. The targets feed only the registry lookups, the
+    route selection, KernelKey/compiled_kids and the OPUS_BUILD_HAS_* macros,
+    which all key on the family; hipcc still gets --offload-arch=gfx1250-strict
+    from GPU_ARCHS.
     """
     return "gfx1250" if gfx == "gfx1250-strict" else gfx
 
@@ -62,10 +63,12 @@ def _build_targets_standalone(explicit_targets=()):
         targets = []
         for value in explicit_targets:
             gfx, cu = value.split("/")
-            targets.append((gfx.split(":", 1)[0].strip().lower(), int(cu)))
+            targets.append(
+                (_registry_arch(gfx.split(":", 1)[0].strip().lower()), int(cu))
+            )
         return sorted(set(targets))
     explicit_arches = [
-        gfx.strip().lower()
+        _registry_arch(gfx.strip().lower())
         for gfx in os.getenv("GPU_ARCHS", "native").split(";")
         if gfx.strip() and gfx.strip().lower() != "native"
     ]
@@ -93,7 +96,7 @@ def _build_targets_standalone(explicit_targets=()):
     )
     mod = importlib.util.module_from_spec(mod_spec)
     mod_spec.loader.exec_module(mod)
-    targets = set(mod.get_build_targets())
+    targets = {(_registry_arch(gfx), cu) for gfx, cu in mod.get_build_targets()}
     for gfx, _cu in tuple(targets):
         targets.update(
             (gfx, cu)
