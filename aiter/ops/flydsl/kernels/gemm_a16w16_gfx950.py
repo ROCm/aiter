@@ -26,7 +26,7 @@ from .gemm_a16w16_gfx950_utils import (
     transposed_contiguous_idx,
     wait_vmcnt_and_barrier,
 )
-from .kernels_common import run_cached
+from .kernels_common import run_cached, set_slp_vectorize_once_used
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -1366,6 +1366,7 @@ gemm_a16w16_gfx950.compile_hints = {
         "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     },
 }
+set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 
 
 @functools.cache
