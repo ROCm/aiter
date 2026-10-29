@@ -40,6 +40,115 @@ def test_preshuffle_flat_buffers_stay_below_4gib():
         _check_preshuffle_flat_buffer_capacity(16, 65536, 65536, 1, 1, 2)
 
 
+@pytest.mark.parametrize(
+    "m, n, k, kernel_name, backend",
+    [
+        # Kimi-K3's 6144x7168 M=8192 row, which padded-M lookup returns for
+        # every M > 8192.
+        (65536, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "flydsl"),
+        (65537, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "ck"),
+        # Past M=174592 the bf16 output, padded to 256 rows, reaches 2 GiB and
+        # CK writes wrong rows, so the FlyDSL launcher raises instead.
+        (174592, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "ck"),
+        (174593, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "flydsl"),
+        # The 57344x8192 M=8192 row on main: the output is past 2 GiB here.
+        (65537, 57344, 8192, "256x128x128_F8_F8_B16_1x2x0x2_default", "flydsl"),
+    ],
+)
+@pytest.mark.parametrize("stride", [1, 2], ids=["dense", "strided"])
+def test_flydsl_bpreshuffle_row_falls_back_to_ck_above_m_max(
+    monkeypatch, m, n, k, kernel_name, backend, stride
+):
+    from aiter.ops.flydsl import gemm_kernels
+
+    row = {
+        "libtype": "flydsl",
+        "splitK": 0,
+        "kernelName": f"flydsl_bpreshuflle_{kernel_name}",
+    }
+    # Meta tensors stand in for activations and outputs of several GiB. A
+    # K-strided XQ (a view of every other column) and row-strided scale views
+    # must reach CK made contiguous.
+    xq = torch.empty((m, k * stride), device="meta", dtype=dtypes.fp8)[:, ::stride]
+    wq = torch.empty((n, k), device="meta", dtype=dtypes.fp8)
+    x_scale, w_scale = (
+        torch.empty((rows, stride), device="meta", dtype=torch.float32)[:, :1]
+        for rows in (m, n)
+    )
+    out = torch.empty((m, n), device="meta", dtype=torch.bfloat16)
+    seen = []
+
+    def fake_flydsl(*args, **kwargs):
+        seen.append("flydsl")
+
+    def fake_ck(XQ, WQ, x_scale, w_scale, Y, splitK=0):
+        assert all(t.is_contiguous() for t in (XQ, WQ, x_scale, w_scale))
+        seen.append("ck")
+        return Y
+
+    # gfx1250 routes every kernel name to its WMMA backend before the M-limit check.
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(gemm_kernels, "flydsl_preshuffle_gemm_a8", fake_flydsl)
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
+
+    got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+
+    assert gemm_kernels.PRESHUFFLE_M_MAX == 65536
+    assert seen == [backend]
+    assert got is out
+
+
+@pytest.mark.parametrize(
+    "m, n, k, kernel_name, backend",
+    [
+        # Kimi-K3's 2112x7168 M=1 row; 7168 = 7 * 1024 but 8192 is not.
+        (1, 2112, 7168, "16x64x512_F8_F8_B16_1x2x0x2_default_ks7", "flydsl"),
+        (1, 2112, 8192, "16x64x512_F8_F8_B16_1x2x0x2_default_ks7", "ck"),
+        # K/split_k must also stay a multiple of tile_k.
+        (1, 2112, 7040, "16x64x512_F8_F8_B16_1x2x0x2_default_ks2", "ck"),
+        (1, 2112, 8192, "16x64x512_F8_F8_B16_1x2x0x2_default_ks4", "flydsl"),
+        # Oversized M with an incompatible padded K must not reach CK, whose
+        # output is wrong past 2 GiB: the FlyDSL error is raised instead.
+        (175000, 6144, 7232, "128x256x128_F8_F8_B16_1x2x4x2_default", "flydsl"),
+        (65537, 6144, 7232, "128x256x128_F8_F8_B16_1x2x4x2_default", "ck"),
+    ],
+)
+@pytest.mark.parametrize("stride", [1, 2], ids=["dense", "strided"])
+def test_flydsl_bpreshuffle_split_k_falls_back_to_ck_when_k_not_divisible(
+    monkeypatch, m, n, k, kernel_name, backend, stride
+):
+    from aiter.ops.flydsl import gemm_kernels
+
+    row = {"kernelName": f"flydsl_bpreshuflle_{kernel_name}"}
+    xq = torch.empty((m, k), device="meta", dtype=dtypes.fp8)
+    wq = torch.empty((n, k), device="meta", dtype=dtypes.fp8)
+    # Row-strided scale views, e.g. backing[:, :1], must reach CK made contiguous.
+    x_scale, w_scale = (
+        torch.empty((rows, stride), device="meta", dtype=torch.float32)[:, :1]
+        for rows in (m, n)
+    )
+    out = torch.empty((m, n), device="meta", dtype=torch.bfloat16)
+    seen = []
+
+    def fake_ck(XQ, WQ, x_scale, w_scale, Y, splitK=0):
+        assert x_scale.is_contiguous() and w_scale.is_contiguous()
+        seen.append("ck")
+        return Y
+
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(
+        gemm_kernels,
+        "flydsl_preshuffle_gemm_a8",
+        lambda *args, **kwargs: seen.append("flydsl"),
+    )
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
+
+    got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+
+    assert seen == [backend]
+    assert got is out
+
+
 def test_two_wave_vgpr_estimate_uses_128_threads():
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
         _estimate_max_wpe,
