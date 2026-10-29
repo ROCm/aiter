@@ -310,6 +310,23 @@ def test_prefill_rejections(staged):
         f(c["q_bf16"].half(), kd, ks, c["bt"])
     with pytest.raises(ValueError, match="16-byte aligned"):
         f(bad_rows, kd, ks, c["bt"])
+    # A strided `seq_lens` view must be refused before any launch reads it.
+    seq_strided = torch.stack([c["seq"], c["seq"]], dim=1)[:, 0]
+    assert seq_strided.stride() == (2,)
+    with pytest.raises(ValueError, match="seq_lens"):
+        prefill_kernel.score_prefill_flydsl_fp4(
+            c["q_bf16"],
+            kd,
+            ks,
+            c["bt"],
+            c["cu"],
+            seq_strided,
+            c["prefix"],
+            c["max_q"],
+            c["max_seq"],
+            1.0 / LOG2E,
+            staged=staged,
+        )
     for bad in (0.0, -1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="q_scale"):
             f(c["q8"], kd, ks, c["bt"], q_scale=bad)
@@ -435,7 +452,14 @@ def test_native_q_scale(qdt, q_scale):
     plain = run_native(c, kd, ks, qdt)
     got = run_native(c, kd, ks, qdt, q_scale=q_scale)
     live = plain != SENTINEL
-    torch.testing.assert_close(got[live], plain[live] * q_scale, rtol=1e-6, atol=0)
+    err = checkAllclose(
+        (plain[live] * q_scale).float(),
+        got[live].float(),
+        rtol=1e-6,
+        atol=0,
+        msg="q_scale",
+    )
+    assert err == 0, f"q_scale mismatch fraction {err}"
 
 
 def _prefill_bytes(batch, q_len, ctx_len, k_row_bytes, q_elem_bytes):
@@ -458,20 +482,51 @@ def test_native_perf(batch, q_len, ctx_len):
     fp4_row = D // 2 + D // 32  # e2m1 data + e8m0 scales per token
     # name -> (run, K bytes per token, Q bytes per element). TB/s counts the traffic
     # each route needs at best; the staged route's extra fp8 round trip is not in it.
+    # Every candidate scores into its own preallocated, sentinel-filled buffer, so the
+    # timed region is the scorer alone (no allocation or fill launch).
+    heads, rows = c["q8"].shape[1], c["q8"].shape[0]
+    outs = {
+        n: fp8_test.prefill_alloc_score(rows, heads, c["mb"], "cuda")
+        for n in ("fp8", "staged", "native", "native_q8")
+    }
+    for o in outs.values():
+        o.fill_(SENTINEL)
+    args = (c["cu"], c["seq"], c["prefix"], c["max_q"], c["max_seq"], 1.0 / LOG2E)
     cands = {
-        "fp8": (lambda: fp8_test.run_prefill(c), D, 2),
+        "fp8": (
+            lambda: score_prefill_flydsl(
+                c["q_bf16"], c["cache"], c["bt"], *args, out=outs["fp8"]
+            ),
+            D,
+            2,
+        ),
         "staged": (
-            lambda: run_prefill_fp4(c, kd, ks, staged=True),
+            lambda: prefill_kernel.score_prefill_flydsl_fp4(
+                c["q_bf16"], kd, ks, c["bt"], *args, out=outs["staged"], staged=True
+            ),
             fp4_row,
             2,
         ),
-        "native": (lambda: run_native(c, kd, ks), fp4_row, 2),
-        "native_q8": (lambda: run_native(c, kd, ks, "e4m3"), fp4_row, 1),
+        "native": (
+            lambda: score_prefill_flydsl(
+                c["q_bf16"], kd, c["bt"], *args, out=outs["native"], k_scale=ks
+            ),
+            fp4_row,
+            2,
+        ),
+        "native_q8": (
+            lambda: score_prefill_flydsl(
+                c["q8"], kd, c["bt"], *args, out=outs["native_q8"], k_scale=ks
+            ),
+            fp4_row,
+            1,
+        ),
     }
     pairs, _ = fp8_test._prefill_work(batch, q_len, ctx_len)
     flops = 2 * pairs * P * D
     for name, (run, k_row, q_elem) in cands.items():
         got, us = run_perftest(run, num_iters=10, num_rotate_args=1)
+        assert got.data_ptr() == outs[name].data_ptr()
         err = checkAllclose(
             ref[live].float(), got[live].float(), rtol=0, atol=0, msg=f"{name}: prefill"
         )

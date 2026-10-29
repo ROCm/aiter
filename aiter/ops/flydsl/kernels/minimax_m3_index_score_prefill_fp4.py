@@ -259,6 +259,10 @@ def score_prefill_flydsl_fp4(
     _validate_cache(k_data, k_scale, dev)
     _validate_tensor(block_table, "block_table", (torch.int32,), 2, dev)
     _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, dev)
+    # The dequant launch reads `seq_lens + b` without a stride, and runs before the
+    # fp8 scorer's own check, so a strided view must be refused here.
+    if seq_lens.stride() != (1,):
+        raise ValueError("seq_lens: expected a contiguous vector")
     if not isinstance(max_seq_len, int) or max_seq_len < 1:
         raise ValueError(f"max_seq_len must be a positive int, got {max_seq_len}")
     batch = cu_seqlens_q.shape[0] - 1
