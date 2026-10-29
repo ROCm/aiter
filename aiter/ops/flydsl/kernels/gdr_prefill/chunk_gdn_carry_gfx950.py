@@ -238,7 +238,8 @@ def compile_chunk_gdn_carry(
             _store_c(cp, entry_first, seed, tid)
         gpu.barrier()
 
-        # Empty requests still prefetch one map.
+        # Empty requests still prefetch one map. When end == first + 1 the
+        # prefetched maps[end - 1] is uninitialized but never used (empty loop).
         seed_block = (first < end).select(first, fx.Int32(0))
         first_a = _prefetch_a(maps, seed_block, fx.Int32(0), tid)
         for block, carried_a in range(first, end - 1, fx.Int32(1), init=[first_a]):

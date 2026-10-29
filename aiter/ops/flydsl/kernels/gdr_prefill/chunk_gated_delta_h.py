@@ -631,10 +631,16 @@ def compile_chunk_gated_delta_h(
 
         c_zero = fx.Int64(0)
         c_one = fx.Int64(1)
-        nt_idx = fx.Int64(NT)
+        # The last block's map is never consumed (carry covers blocks first..end-2,
+        # emit seeds from entry), so build_map skips its chunks and epilogue store.
+        if const_expr(phase == PHASE_BUILD_MAP):
+            loop_nt = last_block.select(fx.Int32(0), NT)
+        else:
+            loop_nt = NT
+        nt_idx = fx.Int64(loop_nt)
 
         # Empty requests would prefetch beyond the input despite clamping.
-        has_work = NT > 0
+        has_work = loop_nt > 0
         if has_work:
             _store_w_rows(_load_w_rows())
             _store_k_pairs(_load_k_pairs())
@@ -987,7 +993,12 @@ def compile_chunk_gated_delta_h(
         # -- Epilogue -- acc_val is already f32x4 with element i at K offset i,
         # so the final state stores as one buffer_store_dwordx4.
         if const_expr(STORE_FINAL_STATE):
-            write_final = last_block if BLOCK_ENTRY_SEED else fx.Int32(1) == 1
+            if const_expr(phase == PHASE_BUILD_MAP):
+                write_final = last_block == False
+            elif const_expr(BLOCK_ENTRY_SEED):
+                write_final = last_block
+            else:
+                write_final = fx.Int32(1) == 1
             if write_final:
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for slot in range_constexpr(N_REPEAT):
