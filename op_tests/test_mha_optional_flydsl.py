@@ -72,6 +72,11 @@ def _dispatcher(name, *, available, flydsl=None, triton=None):
         "get_gfx": lambda: "gfx1151",
         "is_gfx1250_asm_supported": lambda: False,
     }
+    helper = _top_level_node("_flydsl_varlen_ck_only_feature", ast.FunctionDef)
+    exec(  # noqa: S102 - compiles one helper parsed from this local module
+        compile(ast.Module(body=[helper], type_ignores=[]), str(MHA_PATH), "exec"),
+        namespace,
+    )
     node = _top_level_node(name, ast.FunctionDef)
     exec(  # noqa: S102 - compiles one function parsed from this local module
         compile(ast.Module(body=[node], type_ignores=[]), str(MHA_PATH), "exec"),

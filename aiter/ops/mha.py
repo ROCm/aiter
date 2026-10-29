@@ -3680,6 +3680,93 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
 
 
+def _varlen_descale_reject_reason(q, k, v, **gate_kwargs) -> str:
+    """Why the FlyDSL FP8 varlen path cannot honor q/k/v_descale for this call.
+
+    The reason comes from the FlyDSL FP8 gate itself so the two never drift.
+    """
+    from .flydsl.fmha_kernels import _fp8_gfx950_reject_reason
+
+    reason = _fp8_gfx950_reject_reason(q, k, v, **gate_kwargs)
+    if reason is None:
+        reason = (
+            "q/k/v must be 3D [total_tokens, heads, head_dim]"
+            if q.dim() != 3
+            else "unsupported varlen configuration"
+        )
+    return reason
+
+
+# FP8 varlen with q/k/v_descale: FlyDSL FP8 vs the CK descale route, causal,
+# 12 and 24 heads, gfx950 (MI355X) GPU timings from PR #6266:
+# - qk/v head_dim 192/128: FlyDSL 1.33-1.61x of CK in GPU kernel time on square
+#   prefills of 512-8192 tokens, 2.0x with 1024 q tokens over a 4096-token KV.
+#   End to end the route spends about 10-15 us more host time per eager call than
+#   CK, so a 512-token square prefill at 24 heads ran 0.94x.
+# - 128/128: CK is 1-15% faster on square prefills and when q_len <= 256. FlyDSL is
+#   1.07-11.5x faster when q_len >= 512 attends to a longer KV (a prefix) and the
+#   call has at most 2048 q tokens; with 4096 q tokens 24 heads drop to 0.85-1.03x.
+# Re-timed at 8-128 heads, mixed-length batches and the dense batch layout:
+# - 128/128 tracks heads * q tokens: FlyDSL 1.19-2.4x up to 65536 (2048 tokens at
+#   32 heads), 0.88-0.99x in GPU kernel time at 81920-131072 (2048 tokens at
+#   40-64 heads over a 4096- or 8192-token KV).
+# - FlyDSL launches every sequence at max_seqlen_q and pays a fixed cost per tile,
+#   so many short sequences favor CK: 128x16, 64x32 and 64x64 square batches ran
+#   0.49-0.95x, 8x32 at 128 heads 0.71x, and one long sequence next to 20-192 short
+#   ones 0.55-0.99x. Calls with at most 384 sequences * heads, or >= 256 q tokens per
+#   sequence, and at most 16x max_seqlen_q padding were all 0.98x or better.
+_FLYDSL_FP8_DESCALE_HD128_MIN_Q_LEN = 512
+_FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS = 2048
+_FLYDSL_FP8_DESCALE_HD128_MAX_HEAD_TOKENS = 65536
+_FLYDSL_FP8_DESCALE_ANY_LEN_MAX_SEQ_HEADS = 384
+_FLYDSL_FP8_DESCALE_MIN_AVG_Q_LEN = 256
+_FLYDSL_FP8_DESCALE_MAX_PADDING = 16
+
+
+def _flydsl_varlen_ck_only_feature(
+    logits_soft_cap, cu_seqlens_q_padded, cu_seqlens_k_padded
+) -> str | None:
+    """A requested varlen feature flydsl_flash_attn_varlen_fwd cannot express.
+
+    Its gate already rejects dropout, window/sink, bias/alibi, block_table and
+    return_attn_probs; soft-cap and padded cu_seqlens never reach it.
+    """
+    if logits_soft_cap != 0.0:
+        return f"logits_soft_cap is not supported, got {logits_soft_cap}"
+    if cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None:
+        return "padded cu_seqlens (cu_seqlens_q/k_padded) are not supported"
+    return None
+
+
+def _prefer_flydsl_fp8_descale(q, v, max_seqlen_q, max_seqlen_k, num_seqs) -> bool:
+    """Whether a descaled FP8 call should try FlyDSL before CK.
+
+    q is varlen ``[total_q, heads, head_dim]`` or dense ``[B, S, heads, head_dim]``;
+    ``num_seqs`` is the batch size. Only host-side metadata is read.
+    """
+    num_heads = q.shape[-2]
+    total_q = q.shape[:-2].numel()
+    # Every sequence launches max_seqlen_q rows: short or heavily padded batches
+    # spend most FlyDSL tiles on masked rows (see the timings above).
+    if num_seqs * max_seqlen_q > _FLYDSL_FP8_DESCALE_MAX_PADDING * total_q:
+        return False
+    if (
+        num_seqs * num_heads > _FLYDSL_FP8_DESCALE_ANY_LEN_MAX_SEQ_HEADS
+        and total_q < _FLYDSL_FP8_DESCALE_MIN_AVG_Q_LEN * num_seqs
+    ):
+        return False
+    head_dims = (q.shape[-1], v.shape[-1])
+    if head_dims == (192, 128):
+        return True
+    if head_dims == (128, 128):
+        return (
+            max_seqlen_k > max_seqlen_q >= _FLYDSL_FP8_DESCALE_HD128_MIN_Q_LEN
+            and total_q <= _FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS
+            and total_q * num_heads <= _FLYDSL_FP8_DESCALE_HD128_MAX_HEAD_TOKENS
+        )
+    return False
+
+
 def flash_attn_varlen_func(
     q,
     k,
@@ -3775,13 +3862,47 @@ def flash_attn_varlen_func(
     descales = (q_descale, k_descale, v_descale)
     has_any_descale = any(descale is not None for descale in descales)
     has_all_descales = all(descale is not None for descale in descales)
+
+    ck_only_feature = _flydsl_varlen_ck_only_feature(
+        logits_soft_cap, cu_seqlens_q_padded, cu_seqlens_k_padded
+    )
+    # The FlyDSL FP8 kernel is forward-only and returns no autograd node, so a
+    # descaled call that needs grads keeps main's CK route (FlashAttnVarlenFunc).
+    descale_needs_grad = (
+        has_all_descales
+        and torch.is_grad_enabled()
+        and any(t.requires_grad for t in (q, k, v))
+    )
+
+    def descale_reject_reason():
+        if ck_only_feature is not None:
+            return ck_only_feature
+        if descale_needs_grad:
+            return "the FlyDSL FP8 kernel has no backward, but q/k/v require grad"
+        if not _FLYDSL_AVAILABLE:
+            return "flydsl is not installed"
+        return _varlen_descale_reject_reason(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink_ptr,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            out=out,
+            cu_seqlens=(cu_seqlens_q, cu_seqlens_k),
+        )
+
     if has_any_descale and not has_all_descales:
         raise ValueError(
             "FP8 attention requires q_descale, k_descale, and v_descale together"
-        )
-    if has_all_descales and not ENABLE_CK:
-        raise RuntimeError(
-            "prequantized FP8 attention with descales requires ENABLE_CK=1"
         )
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
@@ -3855,13 +3976,34 @@ def flash_attn_varlen_func(
             v_descale,
         )
 
+    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
+    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
+    # the path so a sink-token request is never silently dropped.
+    # Per-tensor Q/K/V descales: shapes where FlyDSL FP8 beats CK try it first
+    # (see _prefer_flydsl_fp8_descale); the rest, and anything FlyDSL declines,
+    # take the CK path, which also consumes the descales. Without CK, FlyDSL is
+    # the only backend that honors descales, so always try it. Features FlyDSL
+    # cannot express (soft-cap, padded cu_seqlens) never take the FlyDSL route.
+    # Only e4m3fn descale calls may reach FlyDSL: its non-fp8 kernels would drop
+    # the descales, so other dtypes keep main's CK route (or the no-CK raise).
+    # Calls that need grads skip it too (see descale_needs_grad).
+    try_flydsl = _FLYDSL_AVAILABLE and (
+        not has_all_descales
+        or (
+            not descale_needs_grad
+            and q.dtype == torch.float8_e4m3fn
+            and (
+                not ENABLE_CK
+                or _prefer_flydsl_fp8_descale(
+                    q, v, max_seqlen_q, max_seqlen_k, cu_seqlens_q.numel() - 1
+                )
+            )
+        )
+    )
     if (
-        _FLYDSL_AVAILABLE
-        and not has_all_descales
+        try_flydsl
         and (len(window_size) < 3 or window_size[2] == 0)
-        and cu_seqlens_q_padded is None
-        and cu_seqlens_k_padded is None
-        and logits_soft_cap == 0.0
+        and ck_only_feature is None
     ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
 
@@ -3885,9 +4027,21 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         if _flydsl_result is not None:
             return _flydsl_result
+
+    if has_all_descales and not ENABLE_CK:
+        # The Triton fallback below does not take descales; running it would
+        # silently drop the scales and return wrong results. CK consumes descales.
+        raise RuntimeError(
+            "prequantized FP8 attention with descales requires ENABLE_CK=1 when "
+            "the FlyDSL FP8 path cannot serve the call "
+            f"({descale_reject_reason()})"
+        )
 
     if not ENABLE_CK:
         from .triton.attention.mha import (
@@ -4255,6 +4409,29 @@ def flash_attn_fp8_pertensor_func(
     softmax_scale=None,
     sink_ptr=None,
 ):
+    # Dense e4m3fn calls take the FlyDSL FP8 kernel where it beats CK (see
+    # _prefer_flydsl_fp8_descale); it returns None for anything it cannot serve.
+    if (
+        _FLYDSL_AVAILABLE
+        and q.dtype == torch.float8_e4m3fn
+        and _prefer_flydsl_fp8_descale(q, v, q.shape[1], k.shape[1], q.shape[0])
+    ):
+        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
+
+        _flydsl_result = flydsl_flash_attn_batch_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        if _flydsl_result is not None:
+            return _flydsl_result
     if not ENABLE_CK and sink_ptr is None:
         from .triton.attention.mha_v3 import (
             flash_attn_func as flash_attn_func_v3_triton,
