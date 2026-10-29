@@ -1279,9 +1279,7 @@ def _grouped_a8w4_tdm_moe(
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
             a_row_index=(
-                stage2_scatter.compact_ep_rowmap
-                if _compact and _prequantized
-                else None
+                stage2_scatter.compact_ep_rowmap if _compact and _prequantized else None
             ),
             a_index_bound=(
                 int(stage2_scatter.world_size) * int(stage2_scatter.max_tokens_per_rank)
@@ -1331,9 +1329,7 @@ def _grouped_a8w4_tdm_moe(
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
             a_row_index=(
-                stage2_scatter.compact_ep_rowmap
-                if _compact and _prequantized
-                else None
+                stage2_scatter.compact_ep_rowmap if _compact and _prequantized else None
             ),
             a_index_bound=(
                 int(stage2_scatter.world_size) * int(stage2_scatter.max_tokens_per_rank)

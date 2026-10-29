@@ -242,9 +242,7 @@ def compile_tdm_compact_plan(
         )
     # Dense rows ship (gen16 << 16) | count, so a count must fit 16 bits; one
     # source's count toward an expert is at most its token count.
-    use_tag = (
-        not use_sparse and row_dwords % 32 == 0 and _tag_fits(max_routes, topk)
-    )
+    use_tag = not use_sparse and row_dwords % 32 == 0 and _tag_fits(max_routes, topk)
     if not use_sparse and not use_tag and row_dwords != segs:
         raise ValueError(f"padded hist row {row_dwords} needs the tagged protocol")
     if max_routes % 4 == 0:

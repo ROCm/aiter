@@ -80,6 +80,7 @@ def _compact_dispatch_schedule(world_size: int, topk: int):
         return _DISPATCH_COMPACT_EP4_TOPK9
     return _DISPATCH_COMPACT
 
+
 _DISPATCH_TDM_SCHEDULES = {
     (4, 7168, 8): _DISPATCH_EP4_TDM,
     (4, 7168, 6): _DISPATCH_EP4_TDM,

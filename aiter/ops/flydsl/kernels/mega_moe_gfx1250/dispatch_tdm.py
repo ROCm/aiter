@@ -847,9 +847,7 @@ def _make_dispatch_tdm(
                             # token's payload slot, so a separate per-route
                             # row_to_token write and its global clear barrier are
                             # redundant.
-                            slot = (
-                                fx.Int32(rank) * fx.Int32(max_tok_per_rank) + tok
-                            )
+                            slot = fx.Int32(rank) * fx.Int32(max_tok_per_rank) + tok
                             seen_peers = fx.Int32(0)
                             owner = fx.Int32(1)
                             if const_expr(route_parallel):
@@ -866,13 +864,11 @@ def _make_dispatch_tdm(
                                         owner,
                                     )
 
-                            def ship_payload(dest_pe):
+                            def ship_payload(dest_pe, slot):
                                 TDM.tdm_store(
                                     TDM.tdm_group0(
                                         my_tile,
-                                        fx.Int64(
-                                            window.lsa_ptr(dest_pe, off_out_tok)
-                                        )
+                                        fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
                                         + fx.Int64(slot) * fx.Int64(row_stride),
                                     ),
                                     g_payload_store,
@@ -899,26 +895,23 @@ def _make_dispatch_tdm(
                                     )
                                 if const_expr(route_parallel):
                                     if live_k & (owner != 0):
-                                        ship_payload(dest_pe)
+                                        ship_payload(dest_pe, slot)
                                 else:
                                     if live_k & first_peer:
-                                        ship_payload(dest_pe)
-                                if live_k:
-                                    if lane == k:
-                                        buffer_store(
-                                            fx.Vector.from_elements(
-                                                [packed_meta, wt_bits],
-                                                dtype=fx.Int32,
-                                            ),
-                                            create_buffer_resource_from_addr(
-                                                fx.Int64(
-                                                    window.lsa_ptr(
-                                                        dest_pe, off_ep_rowmap
-                                                    )
-                                                )
-                                            ),
-                                            dest_tok * 2,
-                                        )
+                                        ship_payload(dest_pe, slot)
+                                if live_k & (lane == k):
+                                    buffer_store(
+                                        fx.Vector.from_elements(
+                                            [packed_meta, wt_bits],
+                                            dtype=fx.Int32,
+                                        ),
+                                        create_buffer_resource_from_addr(
+                                            fx.Int64(
+                                                window.lsa_ptr(dest_pe, off_ep_rowmap)
+                                            )
+                                        ),
+                                        dest_tok * 2,
+                                    )
                         elif const_expr(compact_plan):
                             for k in range_constexpr(topk):
                                 bit = arith.constant(1 << k)

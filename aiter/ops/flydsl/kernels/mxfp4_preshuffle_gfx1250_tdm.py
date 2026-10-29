@@ -25,9 +25,11 @@ from .gemm_common_gfx1250 import (
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
-    pipeline_fence as pipeline_fence_impl,
     situv2_consts,
     workgroup_barrier,
+)
+from .gemm_common_gfx1250 import (
+    pipeline_fence as pipeline_fence_impl,
 )
 from .kernels_common import ceildiv
 from .mega_moe_gfx1250.tdm_gather_shim import (
@@ -801,12 +803,18 @@ def launch_gemm_a8w4_tdm(
             if a_preshuffled:
                 raise ValueError("indexed A gather does not support preshuffled A")
             if tdm_as_in_prologue:
-                raise ValueError("indexed A gather does not support the A-scale prologue")
+                raise ValueError(
+                    "indexed A gather does not support the A-scale prologue"
+                )
             if HAS_K_TAIL:
-                raise ValueError("indexed A gather requires K to be a multiple of tile_k")
+                raise ValueError(
+                    "indexed A gather requires K to be a multiple of tile_k"
+                )
             if not row_major_ascale:
                 raise ValueError("indexed A gather requires row-major A-scale")
-            if waves[0] != waves[2] or (set(waves[0]) & (set(waves[1]) | set(waves[3]))):
+            if waves[0] != waves[2] or (
+                set(waves[0]) & (set(waves[1]) | set(waves[3]))
+            ):
                 raise ValueError(
                     "indexed A gather needs A and A-scale on the same waves, "
                     f"disjoint from B: A={waves[0]} SA={waves[2]} "
@@ -814,7 +822,9 @@ def launch_gemm_a8w4_tdm(
                 )
             owners = waves[0]
             if owners != tuple(range(owners[0], owners[-1] + 1)):
-                raise ValueError(f"owner waves must be a contiguous range, got {owners}")
+                raise ValueError(
+                    f"owner waves must be a contiguous range, got {owners}"
+                )
             gather_seg = tile_m // len(owners)
             if gather_seg % 8:
                 raise ValueError(f"gather segment {gather_seg} is not a multiple of 8")
@@ -1116,9 +1126,7 @@ def launch_gemm_a8w4_tdm(
             return pred
 
         idx_i32 = fx.recast_iter(i32_ptr, arg_a_row_index)
-        lds_gather = tensor_view(
-            fx.recast_iter(p8_shared, base_ptr), (1, 16), (16, 1)
-        )
+        lds_gather = tensor_view(fx.recast_iter(p8_shared, base_ptr), (1, 16), (16, 1))
         # Gather row ids are invariant across K tiles and shared by A and
         # A-scale: each lane loads one row of its wave's segment once, and the
         # K loop only reads them back with readlane. Reloading 8 scalar ids per
