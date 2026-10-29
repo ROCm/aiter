@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 from typing import NamedTuple
 
 import torch
@@ -11,6 +12,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla_reduce as _sparse_mla_reduce_gfx950,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8 import (
+    sparse_mla_fp8,
 )
 from aiter.ops.triton.attention.pa_decode_sparse import (
     _PREFILL_MIN_ROWS,
@@ -297,6 +301,48 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
     if fmt == "bf16":
         raise ValueError("dot_precision='fp8' needs an fp8 cache.")
     return True
+
+
+def _fp8_fast_path_ok(
+    arch,
+    fmt,
+    fp8_dots,
+    has_extra,
+    skip_reduce,
+    d_qk,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    num_heads,
+    cache,
+    block_size,
+    q,
+    out,
+    buffer_ok,
+):
+    """The fp8_scalar cache with fp8 dots in the 512-wide, rope-inside geometry
+    (DeepSeek-V4) runs _gluon_kernels/.../sparse_mla_fp8.py. Everything else, and
+    the options it does not take (the two-loop, skip_reduce, a padded page pitch),
+    keeps the kernel below. AITER_SPARSE_MLA_FP8_FAST=0 turns it off."""
+    if os.environ.get("AITER_SPARSE_MLA_FP8_FAST", "1") == "0":
+        return False
+    return (
+        arch == "gfx950"
+        and fmt == "fp8_scalar"
+        and fp8_dots
+        and not has_extra
+        and not skip_reduce
+        and d_qk == 512
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+        and num_heads in (8, 16, 32, 64, 128)
+        and block_size == 1
+        and cache.ndim == 2
+        and cache.stride(0) == 512
+        and cache.stride(1) == 1
+        and q.stride(2) == 1
+        and out.stride(2) == 1
+        and buffer_ok
+    )
 
 
 _DSV4_ROW = 448 + 2 * 64 + 8  # 584 B: fp8 nope | bf16 rope | 8 B UE8M0 trailer
@@ -806,6 +852,38 @@ def sparse_mla_fwd(
         if return_lse
         else torch.empty(1, dtype=torch.float32, device=q.device)
     )
+
+    if _fp8_fast_path_ok(
+        arch,
+        fmt,
+        fp8_dots,
+        has_extra,
+        skip_reduce,
+        d_qk,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        num_heads,
+        cache,
+        block_size,
+        q,
+        out,
+        use_buffer_load and idx_use_buffer_load,
+    ):
+        sparse_mla_fp8(
+            q,
+            q_scale,
+            cache,
+            scl.reshape(1).to(torch.float32),
+            kv_indptr,
+            kv_indices,
+            softmax_scale,
+            out,
+            lse=lse if return_lse else None,
+            attn_sink=attn_sink if has_sink else None,
+            has_invalid=has_invalid,
+            kv_splits=kv_splits,
+        )
+        return out, (lse if return_lse else None)
 
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
