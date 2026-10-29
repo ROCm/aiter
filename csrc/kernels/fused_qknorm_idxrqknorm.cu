@@ -1044,8 +1044,10 @@ static void fused_qknorm_idxrqknorm_impl(
                         "sparse insert mode expects index_cache_dtype='auto', fp8 or mxfp4");
             if(mxfp4_index_cache)
             {
-                AITER_CHECK(index_cache->dtype() == AITER_DTYPE_u8,
-                            "mxfp4 sparse insert mode requires a uint8 index_cache");
+                AITER_CHECK(index_cache->dtype() == AITER_DTYPE_u8 &&
+                                index_cache->numel() % kFp4PageBytes == 0,
+                            "mxfp4 sparse insert mode requires a uint8 index_cache of whole "
+                            "8704 B pages");
             }
             else if(fp8_index_cache)
             {
@@ -1114,6 +1116,12 @@ static void fused_qknorm_idxrqknorm_impl(
                         "kv_cache_dtype='mxfp4' keeps its scales in the pages: no k_scale/v_scale");
         }
 
+        // Whether the index cache holds `tokens` rows (whole 8704 B pages for mxfp4).
+        const auto index_holds = [&](int64_t tokens) {
+            return mxfp4_index_cache
+                       ? index_cache->numel() / kFp4PageBytes * kFp4PageTokens >= tokens
+                       : index_cache->numel() >= tokens * kHeadDim;
+        };
         if(mxfp4_kv_cache)
         {
             // [num_pages, num_kv_heads, 8704] uint8 per side: one page of kFp4PageTokens
@@ -1135,6 +1143,11 @@ static void fused_qknorm_idxrqknorm_impl(
             k_s_head  = kv_cache_k->stride(1);
             v_s_block = kv_cache_v->stride(0);
             v_s_head  = kv_cache_v->stride(1);
+            if(process_index)
+            {
+                AITER_CHECK(index_holds(kv_cache_k->size(0) * block_size),
+                            "index_cache must contain at least num_blocks * block_size rows");
+            }
         }
         else if(asm_layout)
         {
@@ -1174,11 +1187,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 // mode and includes gaps belonging to the opposite K/V side. It
                 // therefore cannot define the independently mapped index-cache
                 // capacity. As with slot_mapping, callers own bounds validity.
-                AITER_CHECK(index_cache->numel() %
-                                    (mxfp4_index_cache ? kFp4PageBytes : kHeadDim) ==
-                                0,
-                            "index_cache must contain contiguous 128-element rows "
-                            "(whole 8704 B pages for mxfp4)");
+                AITER_CHECK(index_cache->numel() % kHeadDim == 0,
+                            "index_cache must contain contiguous 128-element rows");
             }
             // strides unused in asm_layout (kernel computes SHUFFLE offsets directly).
             if(fp8_kv_per_token)
@@ -1219,11 +1229,7 @@ static void fused_qknorm_idxrqknorm_impl(
                         "num_kv_heads, 128] with contiguous head_dim");
             if(process_index)
             {
-                AITER_CHECK(mxfp4_index_cache
-                                ? index_cache->numel() / kFp4PageBytes * kFp4PageTokens >=
-                                      kv_cache_k->size(0) * block_size
-                                : index_cache->numel() >=
-                                      kv_cache_k->size(0) * block_size * kHeadDim,
+                AITER_CHECK(index_holds(kv_cache_k->size(0) * block_size),
                             "index_cache must contain at least num_blocks * block_size * 128 elements");
             }
             k_s_block = kv_cache_k->stride(0);

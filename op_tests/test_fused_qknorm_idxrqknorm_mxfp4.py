@@ -8,7 +8,7 @@ index K, main K and the raw V as uint8 pages of 128 tokens, ``[128 x 64 B e2m1][
 e8m0]`` (8704 B), the low nibble the even element. The judge is the "auto" mode of the SAME
 op: ``per_1x32_f4_quant`` (aiter's torch MXFP4 reference) applied to the rows "auto" writes
 is what the MXFP4 bytes must equal, bit for bit, and every other output must not move.
-An e4m3 ``q_out`` must equal ``bf16(q)`` cast to e4m3, saturating at its max.
+An e4m3 ``q_out`` must equal the input-dtype q cast to e4m3, saturating at its max.
 """
 
 import argparse
@@ -33,7 +33,6 @@ SUPPORTED_GFX = ["gfx950"]
 NQ, NIQ, HD, ROT = 16, 1, 128, 64  # MiniMax-M3 TP4
 PAGE_BYTES = 128 * (64 + 4)
 SENTINEL = 0xA5
-FP8_MAX = torch.finfo(dtypes.fp8).max
 DEFAULT_DTYPES = [dtypes.bf16, dtypes.fp16]
 DEFAULT_TOKENS = [1, 7, 300, 1031]
 DEFAULT_PERF_TOKENS = [1, 32, 128, 1024, 4096, 16384]
@@ -233,11 +232,14 @@ def test_views_into_one_pool():
 
 @benchmark()
 def test_q_fp8_out(dtype, kv, q_dtype):
-    """An e4m3 q_out gets bf16(q) cast to e4m3, unit scale and saturating (+-inf too, NaN
+    """An e4m3 q_out gets the input-dtype q cast to e4m3, unit scale and saturating (+-inf too, NaN
     stays NaN), and replaces the bf16 q: the packed qkv row is not written back either.
     """
     T = 300
     slots = slot_cases(T)["shuffled"][0]
+    fp8_max = torch.finfo(
+        dtypes.fp8
+    ).max  # not at import: dtypes.fp8 is uint8 off gfx94x/950
     qkv, w, cs, pos = make_inputs(T, 1, dtype)
     w = w * 5000  # the norm erases a scaled qkv, so scale its weight to pass 448
     w[5], w[70] = float("inf"), float("nan")  # and put +-inf and NaN in two columns
@@ -247,8 +249,8 @@ def test_q_fp8_out(dtype, kv, q_dtype):
     run_op(inputs, 1, slots, kv, 128, "auto", dtype, q_out=q8)
     q_ref = run_op(inputs, 1, slots, kv, 128, "auto", dtype)["q"]
     qf = q_ref.float()
-    assert (qf.abs() > FP8_MAX).any() and qf.isinf().any() and qf.isnan().any()
-    want, nan = qf.clamp(-FP8_MAX, FP8_MAX).to(dtypes.fp8), qf.isnan()
+    assert (qf.abs() > fp8_max).any() and qf.isinf().any() and qf.isnan().any()
+    want, nan = qf.clamp(-fp8_max, fp8_max).to(dtypes.fp8), qf.isnan()
     assert same(q8[~nan], want[~nan])
     assert (
         q8.view(dtypes.fp8)[nan].float().isnan().all()
@@ -343,15 +345,49 @@ def test_reference_scale_rule_is_the_hip_rule():
 def rejection_call(case):
     """One mxfp4 index-cache call that is (or, for "good", is not) a contract violation."""
     T, dtype = 32, torch.bfloat16
+    slots = torch.arange(T, dtype=torch.int64)
+    kv, bs = ("mxfp4", 128) if case.startswith("kv_mxfp4") else ("auto", 16)
+    if case == "kv_mxfp4_few_index_pages":
+        slots += 200  # two kv pages, one index page
     ic = {
         "not_uint8": torch.zeros(1, 128, HD, dtype=dtype),
         "partial_page": torch.zeros(PAGE_BYTES + 128, dtype=torch.uint8),
+        "kv_mxfp4_small_index": torch.zeros(128, dtype=torch.uint8),
+        "kv_mxfp4_few_index_pages": torch.zeros(PAGE_BYTES, dtype=torch.uint8),
     }.get(case)
     run_op(
-        make_inputs(T, 1, dtype), 1, torch.arange(T, dtype=torch.int64), "auto", 16,
-        "mxfp4", dtype, ic=ic, skip_index=case == "skip_index_branch",
+        make_inputs(T, 1, dtype), 1, slots, kv, bs, "mxfp4", dtype,
+        ic=ic, skip_index=case == "skip_index_branch",
     )  # fmt: skip
     torch.cuda.synchronize()
+
+
+def test_mxfp4_needs_gfx950():
+    """Off gfx950 opus converts to fp4 as zeros, so mxfp4 caches must be refused up front."""
+    import aiter.ops.fused_qknorm_idxrqknorm as op
+
+    runtime = op.get_gfx_runtime
+    op.get_gfx_runtime = lambda: "gfx942"
+    try:
+        for kv, bs, index in (("auto", 16, "mxfp4"), ("mxfp4", 128, "auto")):
+            slots = torch.arange(32, dtype=torch.int64)
+            try:
+                run_op(
+                    make_inputs(32, 1, torch.bfloat16),
+                    1,
+                    slots,
+                    kv,
+                    bs,
+                    index,
+                    torch.bfloat16,
+                )
+            except RuntimeError as e:
+                assert "gfx950" in str(e)
+            else:
+                raise AssertionError(f"kv={kv} index={index} accepted on gfx942")
+    finally:
+        op.get_gfx_runtime = runtime
+    aiter.logger.info("test_mxfp4_needs_gfx950: PASS")
 
 
 @benchmark()
@@ -422,11 +458,19 @@ def sweep(dtype_list, tokens, perf_tokens):
     test_zero_and_extreme_rows()
     test_pages_dequantize_to_the_reference()
     test_reference_scale_rule_is_the_hip_rule()
+    test_mxfp4_needs_gfx950()
     summary(
         "rejections",
         [
             test_rejections(c)
-            for c in ("good", "not_uint8", "partial_page", "skip_index_branch")
+            for c in (
+                "good",
+                "not_uint8",
+                "partial_page",
+                "skip_index_branch",
+                "kv_mxfp4_small_index",
+                "kv_mxfp4_few_index_pages",
+            )
         ],
     )
     summary(
@@ -455,6 +499,7 @@ for _fn in (
     test_zero_and_extreme_rows,
     test_pages_dequantize_to_the_reference,
     test_reference_scale_rule_is_the_hip_rule,
+    test_mxfp4_needs_gfx950,
     test_rejections,
     test_write_perf,
 ):

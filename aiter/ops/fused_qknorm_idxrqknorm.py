@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_gfx_runtime
 
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE = True
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q = True
@@ -107,6 +108,10 @@ def fused_qknorm_idxrqknorm(
             if _is_fp8_e4m3_tensor(index_cache) or _is_fp8_e4m3_tensor(index_q_out)
             else "auto"
         )
+
+    # opus has no fp4 conversion off gfx950: it would silently write zeros.
+    if "mxfp4" in (kv_cache_dtype, index_cache_dtype) and get_gfx_runtime() != "gfx950":
+        raise RuntimeError("fused_qknorm_idxrqknorm mxfp4 caches require gfx950")
 
     use_fp8_kv_cache = (
         kv_cache_k is not None
