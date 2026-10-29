@@ -13,7 +13,12 @@ from flydsl.runtime.device import get_rocm_arch
 
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
-from .dispatch import DispatchSlot, emit_dispatch_group, emit_dispatch_plan
+from .dispatch import (
+    DispatchSlot,
+    _derive_next_fanout_pairs,
+    emit_dispatch_group,
+    emit_dispatch_plan,
+)
 from .quant import emit_per_1x32_mx_fp4_group, emit_per_1x32_mx_fp8_group
 
 
@@ -67,6 +72,18 @@ def compile_mega_moe_prepare(
     assert model_dim % 32 == 0
     assert chunk_rows > 0
     assert tile_state_stride > 0
+    parallel_fanout = quant_mode == "fp8" and (npes, epr, topk, model_dim) == (
+        8,
+        48,
+        6,
+        5120,
+    )
+    # The first quant CTA may compute next-launch metadata after its finite
+    # quant work, but only when the whole grid fits a resident CU cohort.
+    # Larger grids retain immediate specialist retirement for forward progress.
+    defer_fanout_to_quant = (
+        parallel_fanout and quant_blocks > 0 and launch_grid <= quant_cu_capacity
+    )
 
     @fx.struct
     class SharedStorage:
@@ -79,6 +96,8 @@ def compile_mega_moe_prepare(
         f"_qcu{quant_blocks}qcap{quant_cu_capacity}{quant_suffix}"
         "_fov_runtime_dyn"
         f"_tss{tile_state_stride}_v13"
+        f"{'_pf1_pg1' if parallel_fanout else ''}"
+        f"{'_qfo1' if defer_fanout_to_quant else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
@@ -144,7 +163,40 @@ def compile_mega_moe_prepare(
                             quant_in, quant_out, quant_scale, group_id
                         )
 
-        # Quant CTAs are independent specialists.  They must retire as soon as
+        if const_expr(defer_fanout_to_quant):
+            if quant_producer & (quant_slot == fx.Int32(0)):
+                if tid == fx.Int32(0):
+                    comm_ops.wait_i32_until_equals(epoch_gate, gate_epoch)
+                fx.barrier()
+                comm_ops.fence_system_acquire()
+                parity_lane = fx.Int32(0)
+                expected_lane = fx.Int32(0)
+                lane = tid & fx.Int32(63)
+                if lane == fx.Int32(0):
+                    parity_lane = comm_ops.load_i32_system(addr_parity, fx.Int32(0))
+                    expected_lane = comm_ops.load_i32_system(addr_expected, parity_lane)
+                quant_parity = fx.Int32(fx.rocdl.readfirstlane(T.i32, parity_lane))
+                quant_expected = fx.Int32(fx.rocdl.readfirstlane(T.i32, expected_lane))
+                if tid == fx.Int32(0):
+                    count_done = disp_ptr(DispatchSlot.COUNT_DONE)
+                    comm_ops.wait_i32_until_equals(
+                        count_done + fx.Int64(quant_parity) * 4, quant_expected
+                    )
+                fx.barrier()
+                comm_ops.fence_system_acquire()
+                _derive_next_fanout_pairs(
+                    disp_ptr(DispatchSlot.COUNT_MATRIX),
+                    disp_ptr(DispatchSlot.FANOUT_PAIR_CONFIG),
+                    quant_parity,
+                    lane,
+                    num_waves=num_waves,
+                    npes=npes,
+                    epr=epr,
+                    total_experts=total_experts,
+                    total_segments=total_segments,
+                )
+
+        # Other quant CTAs are independent specialists and retire as soon as
         # their quant groups drain instead of entering prepare's epoch/barrier
         # protocol.  The queued quant CTAs can then immediately occupy CUs
         # released by owner/group CTAs.
@@ -227,6 +279,8 @@ def compile_mega_moe_prepare(
                     group_phase_base=group_phase_base,
                     payload_chunk_rows=chunk_rows,
                     tile_state_stride=tile_state_stride,
+                    parallel_fanout=parallel_fanout,
+                    defer_fanout_to_quant=defer_fanout_to_quant,
                 )
             if producer:
                 emit_dispatch_group(

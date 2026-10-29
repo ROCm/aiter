@@ -158,6 +158,13 @@ def compile_mega_moe_stage1(
     if work_shards is not None:
         WORK_SHARDS = int(work_shards)
     assert WORK_SHARDS in (1, 2, 4, 8)
+    PIN_FINAL_A = (
+        compact_dispatch and model_dim == 5120 and inter_dim == 2304
+        and fuse_npes == 8 and experts_per_rank == 48 and fuse_topk == 6
+        and fuse_mtpr >= 8192 and sort_block_m == 128 and tile_n == 512
+        and NUM_WAVES == 8 and pipe_weights and async_a_copy
+        and a_dtype == "fp8" and out_dtype == "fp8"
+    )
 
     a_lds_size = sort_block_m * A_K_STEP_BYTES
     a_lds_i32 = a_lds_size // 4
@@ -276,6 +283,7 @@ def compile_mega_moe_stage1(
         f"_ev{EPI_EVEC}b"
         f"{'_fc' if FAST_COPY else ''}"
         f"{'_kp2' if PAIR_K else ''}"
+        f"{'_rfa' if PIN_FINAL_A else ''}"
         # Kept in the name so a bounds-checked build never reuses a cached
         # unbounded kernel, or the reverse.
         f"{'_bc1' if bounds_check else ''}"
@@ -544,6 +552,7 @@ def compile_mega_moe_stage1(
             row_map_rsrc=srcmap_rsrc,
             source_rows=source_rows,
             a_dtype=a_dtype, out_dtype=out_dtype,
+            pin_final_a_base=PIN_FINAL_A,
             swiglu_limit=swiglu_limit,
             act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         )
