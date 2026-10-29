@@ -713,6 +713,16 @@ def _grouped_a8w4_tdm_moe(
     _ep_nvt = None
     _fuse_ep_route_quant = False
     ep_rowmap = None
+    # Small TP batches: one workgroup counts, scans and remaps every route, in
+    # place of the counter fill, route and psum-remap launches; it runs where the
+    # psum is built below.
+    _fused_tp_route = (
+        not _compact
+        and not _is_ep
+        and not enable_ep_scatter
+        and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+        and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+    )
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -797,7 +807,7 @@ def _grouped_a8w4_tdm_moe(
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
             )
-    else:
+    elif not _fused_tp_route:
         _fuse_ep_route_quant = False
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
         ep_rowmap = None
@@ -837,6 +847,10 @@ def _grouped_a8w4_tdm_moe(
         psum = stage2_scatter.compact_psum
     elif _fuse_ep_route_quant:
         psum = None
+    elif _fused_tp_route:
+        _masked_m, topids_to_rows, psum = fused_route_psum_remap(
+            topk_ids, E, max_m, _align_m
+        )
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
         # every workgroup re-derives the (E,) prefix in LDS, so this launch
@@ -922,6 +936,10 @@ def _grouped_a8w4_tdm_moe(
     # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
     # shape, so nothing downstream could tell which one it was handed.
     src_a1_scale = a1_scale
+    if src_a1_scale is not None and src_a1_scale.dtype == torch.float8_e8m0fnu:
+        # MoRI preserves the typed E8M0 scale from the sender. FlyDSL reads
+        # exponent bytes; reinterpret their storage without converting values.
+        src_a1_scale = src_a1_scale.view(torch.uint8)
 
     # Pre-quantized activation: an MX payload plus its e8m0 row is what a
     # quantizing EP dispatch delivers, and it is also aiter's standing meaning
@@ -1839,10 +1857,11 @@ def _get_compiled_route_psum_fused():
 
 
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
-# grid-stride, so a larger count is correct but stops being worth fusing.
+# grid-stride, so a larger count is correct but stops being worth fusing; on
+# gfx1250 the split launches catch up at about 2.5K routes.
 # EXPERTS is a hard limit, enforced below: the scan and the LDS route counter
 # are both one slot per lane.
-_FUSED_ROUTE_PSUM_MAX_NUMEL = 4096
+_FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
 _FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
 
 

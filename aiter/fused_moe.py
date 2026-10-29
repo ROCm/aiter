@@ -311,6 +311,7 @@ def _adaptive_moe_sort(
     emit_aux=False,
     skip_quant=False,
     moebuf_dtype=dtypes.bf16,
+    num_local_tokens=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -365,6 +366,7 @@ def _adaptive_moe_sort(
         D_INTER=1,  # (void)D_INTER in the sort path; unused
         MB=BM,
         prologue=0 if BM == 16 or skip_quant else 1,
+        num_local_tokens=num_local_tokens,
     )
     std = (sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
     if emit_aux:
@@ -488,7 +490,6 @@ def _mxfp4_inline_sort_unsupported(
     topk_ids,
     *,
     gate_mode,
-    num_local_tokens,
     expert_mask,
     bias1,
     bias2,
@@ -523,7 +524,6 @@ def _mxfp4_inline_sort_unsupported(
     if bias2 is not None and not metadata.stage2_has_bias:
         return "stage2 kernel does not support bias2"
     for name, value in (
-        ("num_local_tokens", num_local_tokens),
         ("expert_mask", expert_mask),
         ("a1_scale", a1_scale),
         ("a2_scale", a2_scale),
@@ -591,6 +591,8 @@ def _moe_sorting_impl(
             num_experts, topk, model_dim, block_size, accumulate
         )
         and _MOE_SORT_BACKEND not in ("opus", "ck")
+        # only the BM16 (prologue 0) sort reads num_local_tokens
+        and (num_local_tokens is None or block_size == 16)
     ):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
@@ -606,6 +608,7 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            num_local_tokens=num_local_tokens,
         )
 
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
@@ -858,8 +861,8 @@ def _stage2_honors_runtime_reduce_override(stage2: Callable) -> bool:
             "Runtime reduce overrides require a recognized FlyDSL stage2 "
             f"kernel, got {kernel_name!r}"
         )
-    # The a16w-mix launcher returns before the environment override. MXFP4
-    # always atomically scatters; INT4 follows only its configured kernel mode.
+    # The a16w-mix launcher returns before the environment override. Both
+    # MXFP4 and INT4 follow only their configured kernel mode.
     return not (
         parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") in ("fp4", "int4")
     )
@@ -873,12 +876,8 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
         parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
         if parsed is None:
             return False
-        # a16w4 (bf16 A x mxfp4 W) down-proj only supports atomic scatter into a
-        # pre-zeroed buffer; the ported gemm2 launcher ignores the kernelName's
-        # mode, so a "reduce"-named a16w4 config must still get accumulate=True
-        # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here.
-        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") == "fp4":
-            return False
+        # The a16w-mix launcher honors explicit atomic/reduce table modes for
+        # both MXFP4 and INT4; sorting must allocate the matching output layout.
         return parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
@@ -1675,7 +1674,6 @@ def _fused_moe_impl(
             w2_scale,
             topk_ids,
             gate_mode=gate_mode,
-            num_local_tokens=num_local_tokens,
             expert_mask=expert_mask,
             bias1=bias1,
             bias2=bias2,
