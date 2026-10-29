@@ -62,6 +62,7 @@ _SEP = "."
 
 _AXIS_KIND = {
     "D": "num",  # head_size
+    "G": "num",  # num_queries_per_kv, the query heads sharing a KV head (GQA group)
     "Q": "num",  # max_seqlen_q; Q_LEQ_1 is decode
     "BS": "num",  # block_size, the KV page size
     "SW": "bool",  # sliding_window > 0
@@ -220,9 +221,11 @@ def _axis_values(
     block_size,
     q_dtype,
     kv_dtype,
+    num_queries_per_kv=1,
 ) -> dict:
     return {
         "D": head_size,
+        "G": num_queries_per_kv,
         "Q": max_seqlen_q,
         "BS": block_size,
         "SW": sliding_window > 0,
@@ -269,6 +272,7 @@ def _get_unified_attention_config_cached(
     block_size: int,
     backend: str,
     arch: str | None,
+    num_queries_per_kv: int = 1,
 ) -> dict:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
@@ -284,6 +288,7 @@ def _get_unified_attention_config_cached(
         block_size,
         q_dtype,
         kv_dtype,
+        num_queries_per_kv,
     )
     _, config = _lookup(table, axes, values)
     return compute_tile_params(config, block_size)
@@ -321,6 +326,7 @@ def get_unified_attention_config(
         params.block_size,
         backend,
         arch,
+        params.num_queries_per_kv,
     )
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
@@ -339,6 +345,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.block_size,
         params.q_dtype,
         params.kv_cache_dtype,
+        params.num_queries_per_kv,
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(
