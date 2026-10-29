@@ -41,6 +41,10 @@ def _top_p_small_k_kernel(
     # last survivor, which keeps the index in range
     last = tl.max(tl.where(keep, offs, -1), axis=0)
     idx = tl.where(idx == BLOCK, last, idx)
+    # nothing survived (a NaN or non-positive top_p, which a row of NaN
+    # probabilities gives after the fast path renormalizes it): element 0, so
+    # the index stays in [0, K) whatever the row holds
+    idx = tl.where(idx < 0, 0, idx)
     tl.store(out_ptr + row, idx.to(tl.int32))
 
 

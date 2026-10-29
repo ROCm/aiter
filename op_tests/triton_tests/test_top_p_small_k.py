@@ -44,3 +44,27 @@ def test_degenerate_rows_stay_in_range():
     top_p = torch.full((8,), 0.9, device="cuda")
     out = top_p_sampling_small_k(probs, top_p)
     assert ((out >= 0) & (out < 20)).all()
+
+
+def test_nan_rows_and_top_p_stay_in_range():
+    # a NaN row (the fast path then divides top_p by a NaN sum), a row with one
+    # NaN, and NaN / zero / negative top_p: no element survives the top-p test
+    probs = torch.rand((6, 20), dtype=torch.float32, device="cuda")
+    probs[0] = float("nan")
+    probs[1, 3] = float("nan")
+    top_p = torch.tensor(
+        [0.9, 0.9, float("nan"), 0.0, -1.0, 0.9], dtype=torch.float32, device="cuda"
+    )
+    out = top_p_sampling_small_k(probs, top_p)
+    assert ((out >= 0) & (out < 20)).all(), out.tolist()
+
+
+def test_fast_path_nan_row_gathers_in_range(monkeypatch):
+    # the crash this guards: the fast path's gather from the top-k indices with
+    # the small-k kernel's local index, on a row of NaN probabilities
+    monkeypatch.setattr(sampling, "_SMALL_K_TOPP", True)
+    probs = torch.rand((4, VOCAB), dtype=torch.float32, device="cuda").softmax(-1)
+    probs[2] = float("nan")
+    out = sampling.top_k_top_p_sampling_from_probs(probs, None, None, 20, None, 0.95)
+    torch.cuda.synchronize()
+    assert out.shape == (4,), out.shape
