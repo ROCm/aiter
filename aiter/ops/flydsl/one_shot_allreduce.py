@@ -998,7 +998,16 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
             and fused_split_enabled()
         ):
             tokens = int(live_bytes) // (int(hidden) * 2)
-            split = self._attn_ladder_split(tokens, int(nvb))
+            # iter010(night2): pass the real ``hidden`` so the iter009 H-aware
+            # branch actually drives the router/acc_agg path. Omitting it (the
+            # bug this fixes) left the ladder on its 7168 default, so wide models
+            # fell to _split_geom_for's nearest-split resolution: at H=8192 the
+            # mid-band resolved split=8 instead of the iter009-measured-optimal
+            # split=16 (runs/iter009_hsplit_8192_pow2.json: 16 is 7-9% faster
+            # than 8 at T4/8/16, and at T16 it flips a 1.06x cdr LOSS into a
+            # 1.03x win). H=7168 is byte-identical (default already 7168), so
+            # Kimi-K3 ships unchanged and the 72/72 gate is untouched.
+            split = self._attn_ladder_split(tokens, int(nvb), int(hidden))
             if split == 7:
                 # iter050: split=7's fast decode geometry is atoms=1 (block=128).
                 # The rung's default atoms=2 would make _split_geom_for resolve
