@@ -60,6 +60,7 @@ from aiter.ops.flydsl.moe_common import (
     get_flydsl_activation_name,
 )
 from aiter.ops.flydsl.moe_kernels import (
+    _run_moe_reduction,
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_stage1_kernels,
@@ -583,6 +584,8 @@ _GEN_DATA_1STAGE_KEYS = [
     "fc1_smooth_scale",  # 16
     "fc2_smooth_scale",  # 17
     "a1_scale_t",  # 18
+    "w1_scale_shuffled",  # 19
+    "w2_scale_shuffled",  # 20
 ]
 
 
@@ -1632,14 +1635,24 @@ class FmoeTuner(TunerCommon):
         kernel_name="",
         topk=2,
         dtype=dtypes.bf16,
+        flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     ):
-        moe_buf = torch.zeros(
-            (a1.shape[0], a1.shape[1]),
+        post_reduce = AsmMoeMode(flat) is AsmMoeMode.POST_REDUCE
+        token_num, model_dim = hidden_states.shape
+        moe_buf = (torch.empty if post_reduce else torch.zeros)(
+            (token_num, model_dim) if post_reduce else (a1.shape[0], a1.shape[1]),
             dtype=dtype,
-            device="cuda",
+            device=a1.device,
         )
+        if post_reduce:
+            partials = torch.empty(
+                (token_num, topk, model_dim), dtype=dtype, device=a1.device
+            )
+            producer_output = partials.view(token_num, -1)
+        else:
+            producer_output = moe_buf
         aiter.fmoe_g1u1(
-            moe_buf,
+            producer_output,
             a1,
             w1,
             w2,
@@ -1655,6 +1668,10 @@ class FmoeTuner(TunerCommon):
             fc2_smooth_scale=fc2_smooth_scale,
             activation=activation,
         )
+        if post_reduce:
+            _run_moe_reduction(
+                partials, moe_buf, token_num, topk, model_dim, streaming_loads=True
+            )
         return moe_buf
 
     @staticmethod
@@ -2308,6 +2325,8 @@ class FmoeTuner(TunerCommon):
         )
         fc1_smooth_scale = None
         fc2_smooth_scale = None
+        w1_scale_shuffled = None
+        w2_scale_shuffled = None
         if q_type == QuantType.per_1x32:
             a1_scale = moe_mxfp4_sort(
                 a1_scale,
@@ -2318,6 +2337,11 @@ class FmoeTuner(TunerCommon):
             )
             w1_scale = w1_scale.view(expert, -1)
             w2_scale = w2_scale.view(expert, -1)
+            if q_dtype_a == q_dtype_w == dtypes.fp4x2:
+                w1_qt_shffle = shuffle_weight(w1_qt, layout=(16, 16))
+                w2_qt_shffle = shuffle_weight(w2_qt, layout=(16, 16))
+                w1_scale_shuffled = fp4_utils.e8m0_shuffle(_data["w1_scale"])
+                w2_scale_shuffled = fp4_utils.e8m0_shuffle(_data["w2_scale"])
 
         return {
             "input": input,
@@ -2339,6 +2363,8 @@ class FmoeTuner(TunerCommon):
             "fc1_smooth_scale": fc1_smooth_scale,
             "fc2_smooth_scale": fc2_smooth_scale,
             "a1_scale_t": a1_scale_t,
+            "w1_scale_shuffled": w1_scale_shuffled,
+            "w2_scale_shuffled": w2_scale_shuffled,
         }
 
     @staticmethod
@@ -2958,25 +2984,42 @@ class FmoeTuner(TunerCommon):
         if asm_1stage_csv_path and os.path.exists(asm_1stage_csv_path):
             _df = pd.read_csv(asm_1stage_csv_path)
             asm_1stage_flat = _manifest_flat_by_kernel(_df)
-        fmoe_func = FmoeTuner.get_1stage_fmoe_func(
-            q_type, q_dtype_a, act_type, use_g1u1, doweight_stage1
+        fmoe_func = (
+            FmoeTuner.get_1stage_fmoe_func(
+                q_type, q_dtype_a, act_type, use_g1u1, doweight_stage1
+            )
+            if q_type != QuantType.per_1x32
+            else None
         )
-        if fmoe_func is None:
+        if fmoe_func is None and q_type != QuantType.per_1x32:
             return task_1stage
         for tile_m, tile_n, smf in asm_kernels_1stage:
             if inter_dim % tile_n != 0 or smf != 0:
                 continue
 
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
-                # Only no_sort/emsort consume raw topk. Post-reduce entries need
-                # a reduction and are not candidates for this direct-output tuner.
+                # Only no_sort/emsort consume raw topk. Post-reduce candidates
+                # time the sorted-input producer and its reduction together.
                 flat_flag = int(asm_1stage_flat.get(el, AsmMoeMode.SORTED))
                 asm_mode = AsmMoeMode(flat_flag)
                 if asm_mode is AsmMoeMode.POST_REDUCE:
+                    if (
+                        q_type != QuantType.per_1x32
+                        or q_dtype_a != dtypes.fp4x2
+                        or q_dtype_w != dtypes.fp4x2
+                        or dtype != dtypes.bf16
+                        or inter_dim != tile_n
+                    ):
+                        continue
+                    candidate_func = FmoeTuner.run_1stage_fmoe_g1u1
+                    _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 9, 19, 20, 17]
+                elif fmoe_func is None:
                     continue
-                if not asm_mode.requires_host_sort:
+                elif not asm_mode.requires_host_sort:
+                    candidate_func = fmoe_func
                     _data_idx = [0, 1, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
                 else:
+                    candidate_func = fmoe_func
                     _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
                 _data_names = [_GEN_DATA_1STAGE_KEYS[i] for i in _data_idx]
                 task_1stage.append(
@@ -2997,7 +3040,7 @@ class FmoeTuner(TunerCommon):
                             use_g1u1,
                             tile_m,
                         ),
-                        fmoe_func,
+                        candidate_func,
                         (
                             _data_names,
                             q_type,
@@ -3007,7 +3050,9 @@ class FmoeTuner(TunerCommon):
                             topk,
                             dtype,
                         ),
-                        {},
+                        {"flat": asm_mode}
+                        if asm_mode is AsmMoeMode.POST_REDUCE
+                        else {},
                         (
                             FmoeTuner.torch_moe_blockscale
                             if q_type == QuantType.per_1x128
@@ -3037,7 +3082,9 @@ class FmoeTuner(TunerCommon):
                                     "w2_qt",
                                     "topk_weights",
                                     "topk_ids",
-                                    "a1_scale",
+                                    "a1_scale_t"
+                                    if asm_mode is AsmMoeMode.POST_REDUCE
+                                    else "a1_scale",
                                     "w1_scale",
                                     "w2_scale",
                                 ],
@@ -5605,7 +5652,9 @@ class FmoeTuner(TunerCommon):
             profileDF["run_1stage"] = 0
             profileDF["xbf16"] = 0
             profileDF["flat"] = AsmMoeMode.SORTED.value
-            profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
+            profileDF = pd.concat(
+                [profileDF, asm_1stage_profileDF], axis=0, ignore_index=True
+            )
             if len(profileDF) == 0:
                 print(
                     f"no valid candidate found for {key}, please check the time or errRatio in all result file running with --profile_file"
@@ -5699,7 +5748,11 @@ class FmoeTuner(TunerCommon):
                     # v2 pairs also fuse fp4-quant+sort into gemm1 -> skip.
                     is_fp4 = profileDF["kernelName1"].astype(str).str.endswith("_fp4")
                     is_v2 = profileDF["v2"].astype(int) == 1
-                    add_qs = ~is_fp4 & ~is_v2
+                    add_qs = (
+                        ~is_fp4
+                        & ~is_v2
+                        & (profileDF["flat"] != AsmMoeMode.POST_REDUCE.value)
+                    )
                     profileDF.loc[add_qs, "us1"] = (
                         profileDF.loc[add_qs, "us1"]
                         + profileDF.loc[add_qs, "us_quant_sort"]
