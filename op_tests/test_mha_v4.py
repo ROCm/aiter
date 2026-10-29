@@ -1540,8 +1540,9 @@ def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
     q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    # The gfx950 BF16 sparse row's 256x128 geometry.
-    mask = torch.ones((1, 4, 8), device="cuda", dtype=torch.bool)
+    mask = torch.ones(
+        (1, 1024 // 256, 1024 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+    )
     formats = (AttentionFormat.MXFP4,) * 3
 
     assert torch.equal(
