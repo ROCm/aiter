@@ -17,7 +17,6 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.utility.graph_alloc import persistent_alloc
 
 from ..communication_ops_utils import (
@@ -32,6 +31,7 @@ from .radix_topk_one_block import (
     build_radix_topk_one_block_module,
 )
 from .topk_common import _row_length
+from .topk_launch import run_topk_launcher
 
 _BLOCK_THREADS = 1024
 _MAX_PARTS = 16
@@ -71,8 +71,11 @@ def build_topk_per_row_decode_module(
     wave_size: int,
     arch: str,
     packed_rows: bool = False,
+    full_rows: bool = False,
 ):
     """Build the decode kernel; the grid is rows * num_parts CTAs.
+
+    full_rows: every row is `width` long and seq_lens is not read.
 
     gfx942 intentionally reuses the wave64 one-block body with
     _LONG_RADIX_DEFAULT. The standalone one-block arch allowlist is a
@@ -100,6 +103,7 @@ def build_topk_per_row_decode_module(
             f"topk_per_row_decode_k{k}_w{wave_size}"
             f"_v{int(write_values)}_s{int(stable)}"
             f"{'_packed' if packed_rows else ''}"
+            f"{'_full' if full_rows else ''}"
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
@@ -125,7 +129,7 @@ def build_topk_per_row_decode_module(
 
         # Row geometry, all CTA-uniform. A row takes more parts only while each
         # keeps part_elements, so every part is longer than k.
-        full_len = _row_length(row, seq_lens, width, next_n)
+        full_len = _row_length(row, seq_lens, width, next_n, full_rows)
         active_parts = one
         for i in range_constexpr(len(_PART_OPTIONS)):
             option = fx.Int32(_PART_OPTIONS[i])
@@ -330,7 +334,9 @@ def launch_topk_per_row_decode(
     num_cus: int,
     stream: torch.cuda.Stream,
     packed_rows: bool,
+    full_rows: bool = False,
 ) -> None:
+    """`full_rows`: every row is `width` long; `seq_lens` is a placeholder."""
     parts = topk_per_row_decode_parts(rows, width, k, num_cus, stable)
     if parts == 1:
         launcher = build_radix_topk_one_block_module(
@@ -343,8 +349,9 @@ def launch_topk_per_row_decode(
             wave_size=wave_size,
             arch=arch,
             packed_rows=packed_rows,
+            full_rows=full_rows,
         )
-        _run_compiled(
+        run_topk_launcher(
             launcher,
             logits,
             row_starts,
@@ -365,11 +372,12 @@ def launch_topk_per_row_decode(
         wave_size=wave_size,
         arch=arch,
         packed_rows=packed_rows,
+        full_rows=full_rows,
     )
     partial_indices, partial_values, counters = _get_workspace(
         indices.device, stream.cuda_stream, rows, parts * k
     )
-    _run_compiled(
+    run_topk_launcher(
         launcher,
         logits,
         row_starts,
