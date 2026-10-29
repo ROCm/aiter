@@ -1635,9 +1635,9 @@ class TunerCommon:
                 "bound. Keep the GPU otherwise idle."
             )
         with use_policy(self.policy):
-            return self._run(args, fast_mode)
+            return self._run_selected(args, fast_mode)
 
-    def _run(self, args, fast_mode=False):
+    def _run_selected(self, args, fast_mode=False):
         self.pre_process(args)
 
         # Resolve --run_config: can be False, True (no file), or a file path string.

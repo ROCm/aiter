@@ -177,12 +177,12 @@ def candidates(tokens: int, intermediate_size: int):
             yield IQ2RGlm53Config("prefill", grid, "prefill", 0, chunks)
 
 
-def time_us(calls, warmup: int, iters: int) -> float:
-    """Time per call of a CUDA graph that runs ``calls`` in turn.
+def capture_graph(calls):
+    """A CUDA graph that runs ``calls`` in turn.
 
-    The graph is replayed until at least ``iters`` calls have run; serving
-    captures decode batches, so host launch overhead (several launches on the
-    prefill path) is excluded.
+    Serving captures decode batches, so timing and power both replay this
+    graph and exclude host launch overhead (several launches on the prefill
+    path).
     """
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -194,9 +194,19 @@ def time_us(calls, warmup: int, iters: int) -> float:
     with torch.cuda.graph(graph):
         for call in calls:
             call()
-    for _ in range(-(-warmup // len(calls))):
+    return graph
+
+
+def time_us(calls, warmup: int, iters: int) -> float:
+    """Time per call of a CUDA graph that runs ``calls`` in turn."""
+    return time_graph(capture_graph(calls), len(calls), warmup, iters)
+
+
+def time_graph(graph, calls_per_replay: int, warmup: int, iters: int) -> float:
+    """Time per call; the graph is replayed until at least ``iters`` calls ran."""
+    for _ in range(-(-warmup // calls_per_replay)):
         graph.replay()
-    replays = -(-iters // len(calls))
+    replays = -(-iters // calls_per_replay)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -204,7 +214,7 @@ def time_us(calls, warmup: int, iters: int) -> float:
         graph.replay()
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1e3 / (replays * len(calls))
+    return start.elapsed_time(end) * 1e3 / (replays * calls_per_replay)
 
 
 class IQ2RGlm53Tuner(TunerCommon):
@@ -340,20 +350,17 @@ class IQ2RGlm53Tuner(TunerCommon):
                 if reference is None:
                     reference = shape.output.clone()
                     tolerance = 1e-2 * reference.float().abs().max().item()
-                us = self._time(shape, config, args)
-                tflops, tbps = self.calculate((info, us, 0.0))
-                from aiter.utility.tune_result import TuneResult
-
                 calls = [
                     functools.partial(self._run, shape, config, *call)
                     for call in shape.calls
                 ]
+                graph = capture_graph(calls)
+                us = time_graph(graph, len(calls), args.warmup, args.iters)
+                tflops, tbps = self.calculate((info, us, 0.0))
+                from aiter.utility.tune_result import TuneResult
 
-                def replay(calls=calls):
-                    for call in calls:
-                        call()
-
-                watts = self.policy_for(args).measure(replay)
+                watts = self.policy_for(args).measure(graph.replay)
+                del graph
                 watt_text = (
                     f", {watts:.1f} W" if math.isfinite(watts) and watts > 0 else ""
                 )

@@ -1346,6 +1346,81 @@ class TestPowerTableSeparation(unittest.TestCase):
         perftest.assert_not_called()
         self.assertEqual(calls, [(3, 2), (3, 2)])
 
+    def test_power_window_keeps_few_calls_in_flight(self):
+        from aiter.utility import package_power
+
+        log = []
+
+        class Event:
+            def __init__(self):
+                self.index = len(log)
+
+            def record(self):
+                log.append(("record", self.index))
+
+            def synchronize(self):
+                log.append(("wait", self.index))
+
+        in_flight = package_power._InFlight()
+        in_flight._event = Event
+        for _ in range(10):
+            in_flight.mark()
+        waits = [index for kind, index in log if kind == "wait"]
+        records = [index for kind, index in log if kind == "record"]
+        depth = package_power._InFlight.DEPTH
+        self.assertEqual(len(records), 10)
+        # Each wait is on the call DEPTH launches back, so the GPU never drains.
+        self.assertEqual(len(waits), 10 - depth)
+        self.assertEqual(len(in_flight._events), depth)
+
+        # A 10 us call gets one event per SPAN_S of work, not one per launch.
+        log.clear()
+        sparse = package_power._InFlight(10e-6)
+        sparse._event = Event
+        every = int(package_power._InFlight.SPAN_S / 10e-6)
+        for _ in range(every * 3):
+            sparse.mark()
+        self.assertEqual(len([kind for kind, _ in log if kind == "record"]), 3)
+
+    def test_a16w16_hands_its_policy_to_hipblaslt(self):
+        from csrc.gemm_a16w16 import gemm_a16w16_tune
+
+        tuner = gemm_a16w16_tune.GemmA16W16Tuner.__new__(
+            gemm_a16w16_tune.GemmA16W16Tuner
+        )
+        seen = {}
+
+        class FakeGemm:
+            def __init__(self, *args, **kwargs):
+                seen.update(kwargs)
+
+            def run_solutions(self):
+                return []
+
+            def cleanup(self):
+                pass
+
+        ds = {
+            "M": 1,
+            "N": 128,
+            "K": 128,
+            "bias": False,
+            "dtype": "torch.bfloat16",
+            "outdtype": "torch.bfloat16",
+            "scaleAB": False,
+            "bpreshuffle": False,
+        }
+        args = SimpleNamespace(
+            select="power", mp=1, errRatio=0.05, profile_file="", timeout=0, verbose=0
+        )
+        with (
+            mock.patch.object(gemm_a16w16_tune, "HipblasltGemm", FakeGemm),
+            mock.patch.object(tuner, "get_gfx", return_value="gfx950"),
+            mock.patch.object(tuner, "get_cu_num", return_value=256),
+        ):
+            tuner._run_hipblaslt(ds, args)
+        self.assertEqual(seen["policy"].name, "power")
+
     def test_policy_owns_every_select_decision(self):
         from aiter.utility.selection_policy import (
             LATENCY,

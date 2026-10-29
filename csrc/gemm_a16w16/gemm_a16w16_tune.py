@@ -898,6 +898,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             verbose=args.verbose,
             rtol=rtol,
             atol=atol,
+            policy=self.policy_for(args),
         )
         rets = gemmobj.run_solutions()
         gemmobj.cleanup()
