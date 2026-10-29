@@ -45,9 +45,10 @@ SHAPES = {"full": (512, 32, 4, None), "sliding": (256, 32, 16, 1024)}
 # Rounding P to FNUZ (half-step 2**-4 relative) costs a single row about 5%.
 TOLERANCE = 0.04
 ROW_TOLERANCE = 0.1
-# One-token sequences at the decode boundaries, plus a (0, 0) padding entry.
-DECODE_QUERY_LENS = [1] * 8 + [0]
-DECODE_KV_LENS = [1, 65, 1023, 1024, 1025, 2047, 4097, 8192, 0]
+# One-token sequences at the decode boundaries and one without keys, plus a
+# (0, 0) padding entry.
+DECODE_QUERY_LENS = [1] * 9 + [0]
+DECODE_KV_LENS = [1, 65, 1023, 1024, 1025, 2047, 4097, 8192, 0, 0]
 
 
 def q8(x):
@@ -223,11 +224,17 @@ def row_max(ref, query_lens):
     return peak
 
 
+def zero_rows(ref):
+    """(token, head) rows whose reference is zero, such as a query that sees
+    no key."""
+    return ref.float().abs().amax(dim=2) == 0
+
+
 def allowed_err(want, query_lens):
-    """The largest error allowed at each element. A row whose reference is
-    zero, such as a query that sees no key, must be zero."""
+    """The largest error allowed at each element; none in a zero row."""
     cap = TOLERANCE * want.float().abs().max().item()
     allowed = (ROW_TOLERANCE * row_max(want, query_lens)).clamp(max=cap)
+    allowed[zero_rows(want)] = 0
     return allowed.clamp(min=torch.finfo(torch.float32).tiny)
 
 
@@ -237,7 +244,10 @@ def err_ratio(want, got, query_lens):
     return ((got.float() - want.float()).abs() / allowed).max().item()
 
 
-def compare(want, got, query_lens, name):
+def compare(want, got, query_lens, name, log=True):
+    """A query row whose reference is zero must be exactly zero, and every
+    other element within allowed_err."""
+    assert (got[zero_rows(want)] == 0).all(), f"{name}: a zero row is not zero"
     allowed = allowed_err(want, query_lens)
     err = checkAllclose(
         want.float() / allowed,
@@ -246,9 +256,19 @@ def compare(want, got, query_lens, name):
         atol=1,
         tol_err_ratio=0,
         msg=name,
+        printLog=log,
     )
     assert err == 0, f"{name}: {err:.3%} elements exceed the allowed error"
     return err
+
+
+def assert_rejected(want, got, query_lens, name):
+    """A deliberately corrupted output must fail `compare`."""
+    try:
+        compare(want, got, query_lens, name, log=False)
+    except AssertionError:
+        return
+    raise AssertionError(f"the comparison accepted {name}")
 
 
 def assert_same(a, b, name):
@@ -324,9 +344,7 @@ def test_decode(shape, page, layout):
     # them must still fail the comparison.
     lost = case["out"].clone()
     lost[6:8] = 0
-    assert (
-        err_ratio(want, lost, DECODE_QUERY_LENS) > 1
-    ), "the comparison accepted zeroed long-context rows"
+    assert_rejected(want, lost, DECODE_QUERY_LENS, "zeroed long-context rows")
     return ret
 
 
@@ -377,8 +395,9 @@ def test_no_visible_key(shape, path):
         case["block_table"][i, :used] = table[i, :used]
     candidates = {"flydsl": flydsl_candidate(case, kv_lens)}
     ret = measure(candidates, case, want, query_lens, kv_lens)
-    blind = query_lens[0] - kv_lens[0]
-    assert (case["out"][:blind] == 0).all(), "a query that sees no key is not zero"
+    leaked = case["out"].clone()
+    leaked[0, 0, 0] = 0.01
+    assert_rejected(want, leaked, query_lens, "0.01 in a row that sees no key")
     return ret
 
 
@@ -449,8 +468,9 @@ def test_splitk_combine(shape, splits):
 
 @benchmark()
 def test_prefill_splits(shape, page, chunk, splits):
-    """A lone prefix chunk whose KV range splits across workgroups, merged by
-    the prefill combine; None takes the planner's count."""
+    """A lone chunk whose KV range splits across workgroups, merged by the
+    prefill combine; None takes the planner's count. A chunk with more queries
+    than keys leaves its first rows with no key in any split."""
     query_lens, kv_lens = [chunk[0]], [chunk[1]]
     case = make_case(query_lens, kv_lens, shape, page)
     case["softmax_scale"] = 1.0
@@ -848,7 +868,7 @@ def main():
             itertools.product(
                 args.shape,
                 args.page,
-                [(16, 1500), (37, 4096), (300, 3000), (320, 1024)],
+                [(16, 1500), (37, 4096), (300, 3000), (320, 1024), (64, 20)],
                 [None, 3, 8],
             ),
         ),
