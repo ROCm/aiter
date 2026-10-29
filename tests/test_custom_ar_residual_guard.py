@@ -58,8 +58,8 @@ def test_unbounded_pairs_fuse_up_to_the_custom_ar_cap(monkeypatch, key):
 
 @pytest.mark.parametrize(
     "key",
-    [("gfx950", 2), ("gfx90a", 8), ("gfx1250", 8), (None, 8)],
-    ids=["gfx950-tp2", "gfx90a-tp8", "gfx1250-tp8", "unknown-tp8"],
+    [("gfx942", 3), ("gfx90a", 8), ("gfx1250", 8), (None, 8)],
+    ids=["gfx942-tp3", "gfx90a-tp8", "gfx1250-tp8", "unknown-tp8"],
 )
 def test_unmeasured_pairs_never_fuse(monkeypatch, key):
     assert key not in car._AR_RESIDUAL_MAX_BYTES

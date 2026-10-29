@@ -219,14 +219,15 @@ _GFX1250_LL_MAX_BYTES = 4 * 1024 * 1024
 
 # Max input bytes custom_all_reduce_residual fuses, per (arch, TP); None = no
 # limit. Larger inputs and unlisted pairs fall back to all-reduce + add.
-# Measured on MI300X (gfx942) and MI355X (gfx950).
+# Timed end to end on CUDA graphs on MI300X (gfx942) and MI355X (gfx950).
 _AR_RESIDUAL_MAX_BYTES = {
     ("gfx942", 2): 10 * 1024 * 1024,
     ("gfx942", 4): 14 * 1024 * 1024,
     ("gfx942", 6): None,
     ("gfx942", 8): None,
+    ("gfx950", 2): None,
     ("gfx950", 4): None,
-    # Not measured; plain all-reduce faults at TP6 on 1-stage sizes.
+    # The fallback, plain all-reduce, faults at TP6 below 80 KiB, on main too.
     ("gfx950", 6): None,
     ("gfx950", 8): None,
 }
