@@ -396,6 +396,13 @@ def parse_csv(csv_path: str):
             continue
 
         if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
+            if kernel_name.startswith(f"{BMM_MX32_WMMA_NAME_PREFIX}_"):
+                # gfx1250 batched mxfp8_32, run at B = 1 with a row-major 1x32 x_scale
+                job = _bmm_mx32_job(row, kernel_name, 1, n, k)
+                if job is not None and job_identity(job) not in seen:
+                    seen.add(job_identity(job))
+                    jobs.append(job)
+                continue
             # Dispatch runs the row with the x_scale block that goes with its
             # w_scale's: 1x128 with 128x128 (column-major, blockscale, read
             # by the transposed kernel except at M = 1), else 1x32.
