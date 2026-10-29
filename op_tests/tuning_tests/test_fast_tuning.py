@@ -1042,6 +1042,48 @@ class TestGfx942CsvTuner(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
 
+    def test_aot_jobs_cover_tuned_rows_and_fallback_catalog(self):
+        from aiter.aot.flydsl import gemm as aot
+
+        table = REPO_ROOT / "aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv"
+        jobs = aot.parse_csv(str(table))
+        names = {job["kernel_name"] for job in jobs}
+        expected = set()
+        with table.open(newline="") as handle:
+            for row in csv.DictReader(handle):
+                _, job = aot._gfx942_aot_job(row, aot.parse_tuned_config(row))
+                expected.add(job["kernel_name"])
+        fallback_configs = aot.gfx942_fallback_catalog_configs()
+        fallback_configs.extend(
+            aot.gfx942_fallback_config(m, n, 64) for m in (32, 64) for n in (32, 64)
+        )
+        for config in fallback_configs:
+            for out_dtype in ("bf16", "fp32"):
+                row = {
+                    "M": config["block_m"],
+                    "N": config["block_n"],
+                    "K": 2 * config["block_k"] * config["split_k"],
+                    "out_dtype": out_dtype,
+                }
+                _, job = aot._gfx942_aot_job(row, config)
+                expected.add(job["kernel_name"])
+
+        self.assertEqual(names, expected)
+        self.assertEqual(len(jobs), len(names))
+        self.assertTrue(all(job["kind"] == "a16w16_gfx942" for job in jobs))
+
+    def test_aot_dispatches_gfx942_jobs_to_gfx942_compiler(self):
+        from aiter.aot.flydsl import gemm as aot
+
+        table = REPO_ROOT / "aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv"
+        job = aot.parse_csv(str(table))[0]
+        with mock.patch.object(aot, "_compile_a16w16_gfx942_to_cache") as compile_job:
+            result = aot.compile_one_config(**job)
+
+        self.assertIsNotNone(result["compile_time"])
+        compile_job.assert_called_once()
+        self.assertEqual(compile_job.call_args.kwargs["target_gfx"], "gfx942")
+
 
 if __name__ == "__main__":
     unittest.main()

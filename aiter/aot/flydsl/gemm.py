@@ -12,6 +12,7 @@ way as runtime JIT config lookup.
 
 Supported kernel families:
   - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
+  - ``gemm_a16w16_gfx942_*``                  gfx942 A16W16 GEMM kernels
   - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
@@ -48,6 +49,7 @@ from contextlib import nullcontext
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.compiler.protocol import cache_signature
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -81,6 +83,28 @@ from aiter.ops.flydsl.gemm_kernels import (
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     parse_kernel_name as parse_mxscale_preshuffle_kernel_name,
+)
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    CONFIG_DEFAULTS as GFX942_CONFIG_DEFAULTS,
+)
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    SPLIT_K_MAX_TILES as GFX942_SPLIT_K_MAX_TILES,
+)
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    TUNED_CONFIG_COLUMNS as GFX942_CONFIG_COLUMNS,
+)
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    _dynamic_tensor_arg as _dynamic_tensor_arg_gfx942,
+)
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    fallback_catalog_configs as gfx942_fallback_catalog_configs,
+)
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    gemm_a16w16_gfx942,
+    gfx942_fallback_config,
+    make_gemm_a16w16_gfx942_kernel_name,
+    make_gemm_a16w16_gfx942_param,
+    parse_tuned_config,
 )
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
@@ -134,6 +158,7 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE,
     AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
+    AITER_CONFIGS.AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
     AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE,
@@ -233,8 +258,74 @@ def _bmm_mfma_job(
     }
 
 
+def _gfx942_aot_job(row: dict, config: dict) -> tuple[tuple, dict]:
+    config = {**GFX942_CONFIG_DEFAULTS, **config}
+    out_dtype = row.get("out_dtype", "bf16").strip()
+    atomic_bf16 = (
+        out_dtype == "bf16" and config["split_k"] > 1 and not config["split_k_reduce"]
+    )
+    out_dtype_id = (
+        GEMM_A16W16_DTYPE_FP32
+        if out_dtype == "fp32" or atomic_bf16
+        else GEMM_A16W16_DTYPE_BF16
+    )
+    param = make_gemm_a16w16_gfx942_param(
+        in_dtype_id=GEMM_A16W16_DTYPE_BF16,
+        out_dtype_id=out_dtype_id,
+        **config,
+    )
+    job = {
+        "kernel_name": make_gemm_a16w16_gfx942_kernel_name(param),
+        "kind": "a16w16_gfx942",
+        "m": int(row["M"]),
+        "n": int(row["N"]),
+        "k": int(row["K"]),
+        "cu_num": int(row.get("cu_num", "304")),
+        "gfx": row.get("gfx", "gfx942").strip(),
+        "out_dtype": out_dtype,
+        **{name: config[name] for name in GFX942_CONFIG_COLUMNS},
+    }
+    return cache_signature(param), job
+
+
+def _parse_gfx942_csv(csv_path: str) -> list[dict]:
+    jobs = []
+    seen = set()
+    with open(csv_path, newline="") as handle:
+        for row in csv.DictReader(handle):
+            signature, job = _gfx942_aot_job(row, parse_tuned_config(row))
+            if signature not in seen:
+                seen.add(signature)
+                jobs.append(job)
+
+    fallback_configs = gfx942_fallback_catalog_configs()
+    fallback_configs.extend(
+        gfx942_fallback_config(m, n, 64) for m in (32, 64) for n in (32, 64)
+    )
+    for config in fallback_configs:
+        for out_dtype in ("bf16", "fp32"):
+            row = {
+                "gfx": "gfx942",
+                "cu_num": "304",
+                "M": str(config["block_m"]),
+                "N": str(config["block_n"]),
+                "K": str(2 * config["block_k"] * config["split_k"]),
+                "out_dtype": out_dtype,
+            }
+            signature, job = _gfx942_aot_job(row, config)
+            if signature not in seen:
+                seen.add(signature)
+                jobs.append(job)
+    return jobs
+
+
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
+    with open(csv_path, newline="") as handle:
+        columns = set(csv.DictReader(handle).fieldnames or ())
+    if {"gfx", "cu_num", "out_dtype", "pingpong"} <= columns:
+        return _parse_gfx942_csv(csv_path)
+
     jobs = []
     seen = set()
     batched_skipped = set()
@@ -514,6 +605,97 @@ def _compile_hgemm_to_cache(
         )
         run_cached(
             gemm_a16w16_gfx950,
+            *dispatch_args,
+            constexpr_param=param,
+            compiler=flyc.compile,
+            dispatch_args=dispatch_args,
+        )
+
+
+def _compile_a16w16_gfx942_to_cache(
+    *,
+    out_dtype: str,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    split_k: int,
+    m_waves: int,
+    n_waves: int,
+    k_waves: int,
+    group_m: int,
+    async_load_bytes: int,
+    buffered_load: bool,
+    direct_store: bool,
+    pingpong: bool,
+    split_k_reduce: bool,
+    target_gfx: str,
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    if target_gfx != "gfx942":
+        raise ValueError(f"The gfx942 A16W16 kernel got target {target_gfx!r}")
+    atomic_bf16 = out_dtype == "bf16" and split_k > 1 and not split_k_reduce
+    kernel_out_dtype = (
+        torch.float32 if out_dtype == "fp32" or atomic_bf16 else torch.bfloat16
+    )
+    param = make_gemm_a16w16_gfx942_param(
+        in_dtype_id=GEMM_A16W16_DTYPE_BF16,
+        out_dtype_id=(
+            GEMM_A16W16_DTYPE_FP32
+            if kernel_out_dtype is torch.float32
+            else GEMM_A16W16_DTYPE_BF16
+        ),
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        split_k=split_k,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        k_waves=k_waves,
+        group_m=group_m,
+        async_load_bytes=async_load_bytes,
+        buffered_load=buffered_load,
+        direct_store=direct_store,
+        pingpong=pingpong,
+        split_k_reduce=split_k_reduce,
+    )
+
+    with compile_only_env():
+        dev = torch.device("cpu")
+        extent = 8
+        a = torch.empty((1, extent), device=dev, dtype=torch.bfloat16)
+        b = torch.empty((extent, extent), device=dev, dtype=torch.bfloat16).t()
+        out = torch.empty((1, extent), device=dev, dtype=kernel_out_dtype)
+        semaphore = torch.zeros(
+            (GFX942_SPLIT_K_MAX_TILES,),
+            device=dev,
+            dtype=torch.int32 if split_k_reduce else torch.int64,
+        )
+        signal = torch.zeros((GFX942_SPLIT_K_MAX_TILES,), device=dev, dtype=torch.int32)
+        workspace = (
+            torch.empty((extent,), device=dev, dtype=torch.float32)
+            if split_k_reduce
+            else signal
+        )
+        stream = fx.Stream(0)
+        dispatch_args = (
+            _dynamic_tensor_arg_gfx942(out, 1),
+            _dynamic_tensor_arg_gfx942(a, 1),
+            _dynamic_tensor_arg_gfx942(b, 0),
+            semaphore,
+            signal,
+            workspace,
+            split_k,
+            param,
+            stream,
+        )
+        run_cached(
+            gemm_a16w16_gfx942,
             *dispatch_args,
             constexpr_param=param,
             compiler=flyc.compile,
@@ -1124,7 +1306,9 @@ def compile_one_config(
     t0 = time.time()
     try:
         tensor_context = (
-            nullcontext() if kind in ("hgemm", "a16w16_gfx1250") else FakeTensorMode()
+            nullcontext()
+            if kind in ("hgemm", "a16w16_gfx942", "a16w16_gfx1250")
+            else FakeTensorMode()
         )
         with (
             override_env("FLYDSL_GPU_ARCH", aot_arch),
@@ -1134,6 +1318,10 @@ def compile_one_config(
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
+            elif kind == "a16w16_gfx942":
+                a16w16_kwargs = dict(kwargs)
+                a16w16_kwargs["target_gfx"] = aot_arch
+                _compile_a16w16_gfx942_to_cache(**a16w16_kwargs)
             elif kind == "a16w16_gfx1250":
                 a16w16_kwargs = dict(kwargs)
                 a16w16_kwargs["target_gfx"] = aot_arch
