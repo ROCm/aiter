@@ -127,12 +127,11 @@ def _reduce_split_k(
 ):
     """Sum the split-K partial tiles in the split that arrives last.
 
-    Each split stores its fp32 partial tile in fragment order (128-bit,
-    lane-interleaved, coalesced), bumps the tile's arrival counter, and the
-    last split to arrive sums every partial. Partials are written and read with
-    sc0 sc1 so they are coherent across XCDs without agent-scope fences: those
-    lower to a full L2 writeback/invalidate that would evict every workgroup's
-    A/B reuse. Returns (owns_tile, is_last) for the epilogue.
+    Each split stores its fp32 partial tile with system-coherent sc0|sc1, drains
+    vmcnt, then bumps an agent-scope arrival counter. The last arrival therefore
+    follows every completed partial store and reloads them with the same scope.
+    This avoids an agent fence, whose full L2 writeback/invalidate would evict
+    every workgroup's A/B reuse. Returns (owns_tile, is_last) for the epilogue.
     """
     n_vec4 = const_expr(fx.size(frag_C.shape).unpack() // 4)
     tile_id = fx.block_idx.x
@@ -157,6 +156,7 @@ def _reduce_split_k(
             fx.make_view(fx.get_iter(frag_C), frag_chunks),
             ws[None, tid_mn, None, ks_idx, tile_id],
         )
+    # Complete the system-coherent partial store before publishing arrival.
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     if tid == 0:
@@ -180,6 +180,7 @@ def _reduce_split_k(
     is_last = fx.Int32(fx.ptr_load(smem_flag)) == split_k - 1
     owns_tile = owns_tile & is_last
     if is_last:
+        # Every arrival has published; reload all partials with the store scope.
         peer = fx.make_fragment_like(frag_C)
         peer_chunks = fx.make_view(fx.get_iter(peer), frag_chunks)
         frag_C.fill(0.0)
@@ -506,6 +507,8 @@ def gemm_a16w16_gfx942_kernel(
 
     expected_signal = None
     if const_expr(is_split_k):
+        # SplitKProtocol relies on y=0 workgroups being dispatched first.
+        # Stream ordering keeps one launch at a time on each buffer set.
         splitk_protocol.zero_c()
         expected_signal = splitk_protocol.take_ticket(split_k)
         splitk_protocol.publish(expected_signal)

@@ -121,6 +121,57 @@ def test_gemm_a16w16_gfx942_split_k(out_dtype):
     _assert_close(y, ref, f"split-K out={out_dtype}")
 
 
+@pytest.mark.parametrize("split_k_reduce", [False, True], ids=["atomic", "workspace"])
+def test_gemm_a16w16_gfx942_split_k_eight_modes(split_k_reduce):
+    _require_gfx942()
+    m, n, k = 512, 512, 4096
+    x, w, ref = _inputs(m, n, k)
+    y = gemm_a16w16(
+        x,
+        w.t(),
+        out_dtype=torch.bfloat16,
+        user_kwargs={
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 8,
+            "split_k_reduce": split_k_reduce,
+            "m_waves": 2,
+            "n_waves": 2,
+        },
+    )
+    torch.cuda.synchronize()
+    _assert_close(y, ref, f"split_k=8 reduce={split_k_reduce}")
+
+
+def test_gemm_a16w16_gfx942_split_k_tile_limit():
+    _require_gfx942()
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    m, n, k = 1024, 1024, 256
+    cfg = {
+        "block_m": 32,
+        "block_n": 32,
+        "block_k": 64,
+        "stages": 2,
+        "split_k": 2,
+        "split_k_reduce": True,
+        "m_waves": 2,
+        "n_waves": 2,
+    }
+    assert (m // cfg["block_m"]) * (n // cfg["block_n"]) == g.SPLIT_K_MAX_TILES
+    assert g.shape_error(m, n, k, cfg) is None
+    x, w, ref = _inputs(m, n, k)
+    y = gemm_a16w16(x, w.t(), user_kwargs=cfg)
+    torch.cuda.synchronize()
+    _assert_close(y, ref, "maximum split-K tile count")
+
+    error = g.shape_error(32, 32800, k, cfg)
+    assert error is not None
+    assert "more than 1024" in error
+
+
 @pytest.mark.parametrize("stages", [1, 2])
 @pytest.mark.parametrize("split_k", [2, 3, 4])
 def test_gemm_a16w16_gfx942_buffered_split_k(split_k, stages):
