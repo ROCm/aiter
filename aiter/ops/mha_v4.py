@@ -1484,8 +1484,8 @@ def mha_v4(
     scales stay global. For BF16, BF16/FP8, INT8/FP8 and FP8/FP8 operands wherever MHA v4
     exports their LSE (gfx950 today), without ``block_mask`` or ``seqlens_k``. The ranges are
     equal when the count divides the key length; otherwise the last one takes the remainder,
-    which needs operands that take per-batch key lengths (BF16 and BF16/FP8), and the other
-    recipes need a count that divides it.
+    which needs operands that take per-batch key lengths (all four on gfx950), and any others
+    need a count that divides it.
     """
     if return_lse:
         _check_lse_capable(q_format, v_format)

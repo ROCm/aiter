@@ -1453,7 +1453,9 @@ def test_mha_v4_kv_splits_match_the_unsplit_call(
 
     assert torch.equal(mha_v4(q, k, v, *formats, kv_splits=splits), actual)
     assert split[0] < unsplit[0] * 1.1 + 1e-3, (split, unsplit)
-    assert split[1] < unsplit[1] + 2e-2, (split, unsplit)
+    # The split moves the LSE error by noise on the order of the recipe's own quantization error
+    # (~0.003 nats for BF16, 0.2-0.6 for INT8 and FP8 Q/K), so it is bounded relative to it.
+    assert split[1] < unsplit[1] * 1.1 + 2e-2, (split, unsplit)
 
 
 def test_mha_v4_kv_splits_auto_fills_one_wave():
@@ -1559,12 +1561,6 @@ def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
         param({"kv_splits": 0}, ValueError, "positive int", id="zero"),
         param({"kv_splits": "many"}, ValueError, "positive int", id="string"),
         param(
-            {"kv_splits": 3, "formats": (AttentionFormat.FP8,) * 3},
-            ValueError,
-            "divide the key length",
-            id="fp8-non-divisor",
-        ),
-        param(
             {"kv_splits": 1025},
             ValueError,
             "at most the key length",
@@ -1612,6 +1608,19 @@ def test_mha_v4_kv_splits_rejects_what_it_cannot_split(kwargs, error, match):
             kwargs[name] = kwargs[name].cuda()
     with expect_raises(error, match=match):
         mha_v4(q, q, q, *formats, **kwargs)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_need_a_divisor_without_per_batch_key_lengths():
+    """Every recipe kv_splits takes has per-batch key lengths on gfx950, so a row without them is
+    simulated: its last range has no way to end short, and a count must divide the keys.
+    """
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    formats = (AttentionFormat.FP8,) * 3
+    with patched_attr(mha_v4_module, "_varlen_capable", lambda *formats: False):
+        with expect_raises(ValueError, match="divide the key length"):
+            mha_v4(q, q, q, *formats, kv_splits=3)
+        assert mha_v4(q, q, q, *formats, kv_splits=4).shape == q.shape
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
