@@ -2944,6 +2944,10 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
     """Select available kernels from the family/gfx/CU table."""
     family = family.strip().lower()
     gfx = gfx.split(":", 1)[0].strip().lower()
+    # gfx1250-strict (A0) shares the gfx1250 kernel family in the registry;
+    # callers keep the gfx1250-strict spelling in KernelKey (compile target).
+    if gfx == "gfx1250-strict":
+        gfx = "gfx1250"
     tables = KERNEL_REGISTRY.get(family, {}).get(gfx, {})
     if not tables:
         return {}
@@ -2991,7 +2995,8 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
 
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
     """Select the default compile set from the current CU table."""
-    defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((gfx, cu_num), ())
+    lookup_gfx = "gfx1250" if gfx == "gfx1250-strict" else gfx
+    defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
     return {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)

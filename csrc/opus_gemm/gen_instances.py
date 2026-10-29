@@ -1391,7 +1391,7 @@ if __name__ == "__main__":
         KernelKey(family, gfx, cu, kid): instance
         for gfx, cu in targets
         for family, arches in KERNEL_REGISTRY.items()
-        if gfx in arches
+        if _registry_arch(gfx) in arches
         for kid, instance in get_registry(family, gfx, cu).items()
     }
     csv_keys = set()
@@ -1463,7 +1463,9 @@ if __name__ == "__main__":
         parser.error(
             f"requested local kernels are unavailable: {sorted(key.encode() for key in missing)}"
         )
-    target_arches = {gfx for gfx, cu in targets}
+    # OPUS_BUILD_HAS_* tells C which kernel family is compiled; A0 compiles
+    # the gfx1250 family, so emit GFX1250 (not an invalid hyphenated STRICT name).
+    target_arches = {_registry_arch(gfx) for gfx, cu in targets}
     Path(args.working_path).mkdir(parents=True, exist_ok=True)
     write_if_changed(
         os.path.join(args.working_path, "opus_build_archs.h"),
