@@ -180,8 +180,20 @@
       "num_stages": 2,
       "waves_per_eu": 2
     },
+    "D_GEQ_256.Q_LEQ_1.SHUF.BS_LEQ_64.DT_bf16_bf16": {
+      "BLOCK_M": 16,
+      "num_warps": 1,
+      "num_stages": 2,
+      "waves_per_eu": 1
+    },
     "D_GEQ_256.Q_LEQ_4.SHUF.BS_LEQ_64.DT_bf16_bf16": {
       "BLOCK_M": 32,
+      "num_warps": 1,
+      "num_stages": 2,
+      "waves_per_eu": 1
+    },
+    "D_GEQ_256.Q_LEQ_8.SHUF.BS_LEQ_64.DT_bf16_bf16": {
+      "BLOCK_M": 64,
       "num_warps": 1,
       "num_stages": 2,
       "waves_per_eu": 1
