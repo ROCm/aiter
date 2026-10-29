@@ -104,6 +104,60 @@ def check_asm_decode_rejects_unsupported_widths():
         )
 
 
+def check_bf16_gqa32_merges_only_written_splits() -> None:
+    """bf16 gqa32 decode with more KV splits than a row's KV fills: stage 2 must
+    merge only the splits stage 1 wrote. The split buffers come from torch.empty,
+    so they are pre-filled with NaN to make an unwritten split visible."""
+    batch_size, nhead, num_kv_splits = 260, 32, 5
+    kv_lora_rank, qk_rope_head_dim = 512, 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    # 17-63 tokens per row: one or two 32-token tiles, never all 5 splits.
+    kv_lens = torch.randint(17, 64, (batch_size,), dtype=torch.int)
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+    total_kv = int(kv_indptr[-1])
+    kv_indices = torch.randperm(total_kv, dtype=torch.int)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    q = torch.randn((batch_size, nhead, qk_head_dim), dtype=torch.bfloat16)
+    kv_buffer = torch.randn((total_kv, 1, 1, qk_head_dim), dtype=torch.bfloat16)
+    sm_scale = 1.0 / qk_head_dim**0.5
+
+    ref, _ = torch_mla_extend(
+        q,
+        kv_buffer.view(total_kv, 1, qk_head_dim),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        torch.bfloat16,
+    )
+
+    for shape in (
+        (batch_size, num_kv_splits, nhead, kv_lora_rank),
+        (batch_size, num_kv_splits, nhead, 1),
+    ):
+        torch.full(shape, float("nan"), dtype=torch.float)
+    out = torch.empty((batch_size, nhead, kv_lora_rank), dtype=torch.bfloat16)
+    aiter.mla.mla_decode_fwd(
+        q,
+        kv_buffer,
+        out,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        1,
+        sm_scale=sm_scale,
+        num_kv_splits=num_kv_splits,
+    )
+    assert torch.isfinite(out).all(), "merged a split that stage 1 never wrote"
+    checkAllclose(ref.float(), out.float(), msg="bf16 gqa32 short-KV multi-split")
+    cal_diff(ref, out, "bf16 gqa32 short-KV multi-split")
+
+
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
@@ -1006,6 +1060,8 @@ def main():
     if get_gfx() in ("gfx942", "gfx950"):
         check_asm_decode_rejects_unsupported_widths()
         aiter.logger.info("mla_decode_stage1_asm_fwd width checks: passed")
+        check_bf16_gqa32_merges_only_written_splits()
+        aiter.logger.info("bf16 gqa32 short-KV multi-split merge: passed")
 
     for nhead, decode_qlen in args.nhead:
         df = []
