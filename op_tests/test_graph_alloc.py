@@ -94,7 +94,7 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     sid = s.cuda_stream
     sites = {
         "preshuffle_split_k": _get_preshuffle_split_buffers(dev, s),
-        "a16w16_gfx950": get_split_k_buffers(s, dev),
+        "a16w16_gfx950": get_split_k_buffers(s, dev, 1),
         "a16w16_gfx1250": _split_k_counters(dev, s),
         "a16w16_asm": _get_semaphore_workspace_keyed(dev, sid),
         "a8w8_zero_bias": get_zero_bias_buf_keyed(dev, sid, 64),
@@ -148,6 +148,27 @@ def test_capture_scoped_cache_keeps_capture_built_buffers_private():
         eager.sum()  # keep the graph non-empty
 
 
+@pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE or torch.cuda.device_count() < 2,
+    reason="needs torch 2.10+ and two GPUs",
+)
+def test_capture_scoped_cache_checks_the_target_device_not_the_current_one():
+    """A builder for cuda:1 called while cuda:0 is current must see cuda:1's
+    capture, since its zero fill is recorded on cuda:1's capturing stream."""
+    target = torch.device("cuda:1")
+
+    @capture_scoped_cache
+    def zeros(device):
+        with persistent_alloc(device):
+            return torch.zeros(256, dtype=torch.int64, device=device)
+
+    with torch.cuda.device(target), torch.cuda.graph(torch.cuda.CUDAGraph()):
+        with torch.cuda.device(0):
+            captured = zeros(target)
+        captured.sum()
+    assert zeros(target) is not captured, "eager got the capture-built buffer"
+
+
 # Mirrors vLLM's DeepSeek-V4.1 CSA attention on ROCm: multi-stream overlap runs
 # only inside graph capture, so the indexer weights_proj GEMM (bf16 [M, 5120] x
 # [5120, 32], split-K 8) first runs on an aux stream mid-capture, at each capture
@@ -156,6 +177,7 @@ def test_capture_scoped_cache_keeps_capture_built_buffers_private():
 _SPLIT_K_FIRST_USE_IN_CAPTURE = """
 import torch
 from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+from aiter.test_common import checkAllclose
 from aiter.utility.graph_alloc import persistent_alloc
 
 dev = torch.device("cuda:0")
@@ -189,10 +211,12 @@ for m in sizes:
 graphs[sizes[1]].replay()  # before the graph that recorded the zero fill
 graphs[sizes[0]].replay()
 torch.cuda.synchronize()
+# Tolerances of test_flydsl_hgemm._atol_rtol for bf16, K=5120, split_k=8.
+atol, rtol = 2e-1 * (5120 / 8192) ** 0.5 * 8, 2e-1
 for m in sizes:
-    ref = xs[m].float() @ w.float().t()
-    err = ((outs[m].float() - ref).abs().max() / ref.abs().max()).item()
-    assert err < 3e-2, (m, err)
+    ref = (xs[m].float() @ w.float().t()).to(torch.bfloat16)
+    err = checkAllclose(ref.float(), outs[m].float(), rtol=rtol, atol=atol, printLog=False)
+    assert err == 0, (m, err)
 print("OK")
 """
 

@@ -49,19 +49,28 @@ def persistent_alloc(device: torch.device):
         yield
 
 
-def _capture_id() -> int | None:
-    """ID of the graph capture the current stream is part of, or None."""
-    if not torch.cuda.is_current_stream_capturing():
-        return None
+def _target_stream(args) -> int:
+    """Handle of the stream a cached builder's fill runs on: an explicit stream
+    argument, else the current stream of its device argument (a torch.device, or
+    an int device ordinal in first position), not the ambient current device."""
+    for arg in args:
+        if isinstance(arg, torch.cuda.Stream):
+            return arg.cuda_stream
+    device = next((a for a in args if isinstance(a, torch.device)), None)
+    if device is None and args and isinstance(args[0], int):
+        device = args[0]
+    return torch.cuda.current_stream(device).cuda_stream
+
+
+def _capture_id(stream: int) -> int | None:
+    """ID of the graph capture ``stream`` is part of, or None."""
     status, capture_id = ctypes.c_int(0), ctypes.c_ulonglong(0)
     err = load_hip_runtime().hipStreamGetCaptureInfo(
-        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
-        ctypes.byref(status),
-        ctypes.byref(capture_id),
+        ctypes.c_void_p(stream), ctypes.byref(status), ctypes.byref(capture_id)
     )
     if err != 0:
         raise RuntimeError(f"hipStreamGetCaptureInfo failed with error {err}")
-    return capture_id.value
+    return capture_id.value if status.value != 0 else None
 
 
 def capture_scoped_cache(fn):
@@ -84,7 +93,7 @@ def capture_scoped_cache(fn):
         eager = cache.get((None, *args))
         if eager is not None:
             return eager
-        key = (_capture_id(), *args)
+        key = (_capture_id(_target_stream(args)), *args)
         buf = cache.get(key)
         if buf is None:
             buf = cache[key] = fn(*args)
