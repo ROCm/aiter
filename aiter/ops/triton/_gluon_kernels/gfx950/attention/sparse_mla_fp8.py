@@ -347,7 +347,7 @@ def _sparse_mla_fp8_narrow(
     lse_ptr, part_ptr, ml_ptr, indptr_ptr, idx_ptr, sink_ptr, num_heads, sm_scale_log2, NSPLIT,
     G: gl.constexpr, GM: gl.constexpr, SPLIT: gl.constexpr, LAZY: gl.constexpr,
     Q_BF16: gl.constexpr, HAS_SINK: gl.constexpr, HAS_LSE: gl.constexpr, HAS_INVALID: gl.constexpr,
-    BIG: gl.constexpr,
+    BIG: gl.constexpr, STAGES: gl.constexpr,
     QK_L: gl.constexpr, PV_L: gl.constexpr, GA_L: gl.constexpr, KV_SH: gl.constexpr,
     VV_SH: gl.constexpr, PV_SH: gl.constexpr, KWP: gl.constexpr, PV_SCALED: gl.constexpr,
 ):
@@ -380,7 +380,10 @@ def _sparse_mla_fp8_narrow(
         c_row = q_s * (k_scale * sm_scale_log2)
 
     kv0 = gl.allocate_shared_memory(gl.uint8, [BN, 512], KV_SH)
-    kv1 = gl.allocate_shared_memory(gl.uint8, [BN, 512], KV_SH)
+    if STAGES == 2:
+        kv1 = gl.allocate_shared_memory(gl.uint8, [BN, 512], KV_SH)
+    else:
+        kv1 = kv0
     p_smem = gl.allocate_shared_memory(gl.uint8, [GM, BN], p_sh)
     a_smem = gl.allocate_shared_memory(gl.float32, [GM], a_sh)
 
@@ -394,12 +397,24 @@ def _sparse_mla_fp8_narrow(
 
     rid = _rows(idx_row, kb, n, kg, HAS_INVALID)
     _gather(kv0, kv_ptr, rid, cg, BIG)
-    rid = _rows(idx_row, kb + BN, n, kg, HAS_INVALID)
+    if STAGES == 2:
+        rid = _rows(idx_row, kb + BN, n, kg, HAS_INVALID)
     if not Q_BF16:
         q_dot = _q_fp8(q_ptr, q_stride0, q_stride1, row, h0, G, GM, q_op)
         c_row = gl.full([GM], 1.0, gl.float32, gl.SliceLayout(1, QK_L)) * (gl.load(q_scale_ptr) * k_scale * sm_scale_log2)
 
-    for it in range(0, gl.cdiv(nt, 2)):
+    if STAGES == 1:
+        # one tile buffer: half the LDS, so more workgroups per CU hide the
+        # gather latency instead of a prefetched tile (aiter's _async_buffers)
+        for t in range(0, nt):
+            gl.amd.cdna4.async_copy.wait_group(0)  # tile t landed (+ barrier)
+            rid = _rows(idx_row, kb + (t + 1) * BN, n, kg, HAS_INVALID)
+            acc, m_i, l_acc = _narrow_tile(
+                kv0, p_smem, a_smem, q_dot, c_row, acc, m_i, l_acc, start + kb + t * BN, kb + t * BN,
+                end_s, kcol, idx_row, QK_L, PV_L, VV_SH, PV_SH, GM, BN, KWP, PV_SCALED, LAZY, HAS_INVALID)
+            gl.barrier()  # every wave is done reading the buffer
+            _gather(kv0, kv_ptr, rid, cg, BIG)
+    for it in range(0, gl.cdiv(nt, 2) if STAGES == 2 else 0):
         t = it * 2
         gl.amd.cdna4.async_copy.wait_group(0)  # tile t landed (+ barrier)
         _gather(kv1, kv_ptr, rid, cg, BIG)
@@ -565,7 +580,7 @@ def _num_cus(device):
 
 def sparse_mla_fp8(q, q_scale, cache_u8, kv_scale, kv_indptr, kv_indices, softmax_scale, out,
                    lse=None, attn_sink=None, has_invalid=False, kv_splits=None, max_keys=None,
-                   lazy=8, waves=4, heads_per_prog=None):
+                   lazy=8, waves=4, heads_per_prog=None, stages=None, wpe=None):
     """q [C, H, 512] fp8 (+ scalar q_scale) or bf16; cache_u8 [rows, 512] fp8
     bytes; kv_scale [1] f32; out [C, H, >= 512] bf16; lse [C, H] f32 or None.
     H in {8, 16, 32, 64, 128}."""
@@ -601,10 +616,16 @@ def sparse_mla_fp8(q, q_scale, cache_u8, kv_scale, kv_indptr, kv_indices, softma
         ml = torch.empty((C, kv_splits, H, 2), dtype=torch.float32, device=q.device)
     else:
         part = ml = kv_scale
+    if stages is None:
+        # 16-row tiles fit 4 waves/SIMD in registers (~144 VGPRs); with enough
+        # workgroups, one tile buffer and 4 workgroups per CU beat a prefetched
+        # tile at 2 (16 heads prefill 86.2 -> 82.0 us). 32-row tiles spill there.
+        big = G <= 16 and C * hblk * kv_splits >= 4 * cus
+        stages, wpe = (1, 4) if big else (2, 2)
     _sparse_mla_fp8_narrow[(C, hblk, kv_splits)](
         qv, q.stride(0), q.stride(1), qs, cache_u8, kv_scale, out, out.stride(0), out.stride(1),
         lse_t, part, ml, kv_indptr, kv_indices, sink, H, sm2, kv_splits,
-        G=G, SPLIT=split, num_warps=waves, waves_per_eu=2, **common, **L)
+        G=G, SPLIT=split, STAGES=stages, num_warps=waves, waves_per_eu=wpe or 2, **common, **L)
     if split:
         _sparse_mla_fp8_reduce[(C, H)](
             part, ml, sink, kv_scale, out, out.stride(0), out.stride(1), lse_t, H, kv_splits,
