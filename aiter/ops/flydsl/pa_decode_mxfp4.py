@@ -19,7 +19,6 @@ from .kernels.kernels_common import ceildiv
 from .kernels.pa_decode.traits import KV_COMPUTE_BLOCK, max_tiles_per_task
 from .kernels.pa_decode_mxfp4_kernel import (
     DATA_BYTES,
-    DEFAULT_TILE_DEPTH,
     HEAD_DIM,
     MAX_STAGED_PAGES,
     PAGE_STAGE_ALIGN,
@@ -63,7 +62,7 @@ def _check_view(name, t, device, tail, block_size, kv_heads):
 
 def pa_decode_mxfp4(
     output: torch.Tensor,  # [num_seqs, num_query_heads, 128] bf16/f16
-    query: torch.Tensor,  # [num_seqs, num_query_heads, 128] float8_e4m3fn or bf16
+    query: torch.Tensor,  # [num_seqs, num_query_heads, 128] float8_e4m3fn
     k_data: torch.Tensor,  # uint8 [pages, kv_heads, block_size, 64]
     k_scale: torch.Tensor,  # uint8 [pages, kv_heads, block_size, 4]  (e8m0)
     v_data: torch.Tensor,  # uint8 [pages, kv_heads, block_size, 64]
@@ -77,14 +76,11 @@ def pa_decode_mxfp4(
     temporary_output: torch.Tensor | None = None,
     work_plan: PADecodePlan | None = None,
     max_context_length: int | None = None,
-    tile_depth: int = DEFAULT_TILE_DEPTH,
-    direct_output: bool | None = None,
     max_partitions: int | None = None,
 ) -> None:
     """Decode one query token per sequence over an MXFP4 paged K/V cache.
 
-    ``query`` is float8_e4m3fn, used as stored (scale 1). A bfloat16 query takes
-    the reference path that widens K to bf16 and never rounds Q.
+    ``query`` is float8_e4m3fn, used as stored (scale 1).
 
     Each of the four views carries its own page and head stride (bytes); data
     strides must be multiples of 16. Pages outside ``[0, pages)`` are not
@@ -96,16 +92,20 @@ def pa_decode_mxfp4(
     ``[kv_heads, capacity, group_size(, 128)]``. ``max_context_length`` bounds the
     scheduling, as in ``pa_decode``.
 
-    With ``work_plan=None`` no plan is built: tasks follow from the block index
-    (``max_partitions`` splits per sequence, default ``2 * CUs // num_seqs``), so
-    nothing is specialized on ``num_seqs``. Every context must be at most
+    With ``work_plan=None`` no plan is built: each sequence is one task that
+    writes its row directly (``max_partitions`` may only be 1), so nothing is
+    specialized on ``num_seqs``. Every context must be at most
     ``max_context_length`` (default: the block-table capacity); a longer one is
-    silently truncated.
+    silently truncated, and a context-0 row is zero-filled. With a plan whose
+    ``max_partitions`` is 1 the row is written directly too, and a context-0 row
+    is left unwritten.
     """
     if work_plan is not None and not isinstance(work_plan, PADecodePlan):
         raise TypeError("work_plan must be a PADecodePlan or None")
     if work_plan is not None and max_partitions is not None:
         raise ValueError("max_partitions applies to the plan-free form only")
+    if max_partitions not in (None, 1):
+        raise NotImplementedError("the plan-free form runs one task per sequence")
     arch = get_gfx_runtime()
     if arch != "gfx950":
         raise NotImplementedError(f"pa_decode_mxfp4 supports gfx950, got {arch}")
@@ -132,15 +132,11 @@ def pa_decode_mxfp4(
         )
     if output.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f"output must be bf16/f16, got {output.dtype}")
-    q_fp8 = query.dtype == torch.float8_e4m3fn
-    if not q_fp8 and query.dtype != torch.bfloat16:
-        raise TypeError(f"query must be float8_e4m3fn or bf16, got {query.dtype}")
-    if not q_fp8 and output.dtype != torch.bfloat16:
-        raise TypeError("the bf16-query path writes bf16")
+    if query.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"query must be float8_e4m3fn, got {query.dtype}")
     if query.stride(2) != 1 or output.stride(2) != 1:
         raise ValueError("query and output need a contiguous head_dim axis")
-    elem = query.element_size()
-    if (query.stride(0) * elem) % 16 or (query.stride(1) * elem) % 16:
+    if query.stride(0) % 16 or query.stride(1) % 16:
         raise ValueError("query row and head strides must be multiples of 16 bytes")
 
     num_seqs, num_q_heads, _ = query.shape
@@ -209,24 +205,12 @@ def pa_decode_mxfp4(
         )
         task_tiles = 0
     else:
-        max_tiles = max(1, ceildiv(schedule_context, KV_COMPUTE_BLOCK))
-        if max_partitions is None:
-            cus = torch.cuda.get_device_properties(dev).multi_processor_count
-            max_partitions = max(1, (2 * cus) // num_seqs)
-        if max_partitions < 1:
-            raise ValueError("max_partitions must be positive")
-        max_partitions = min(max_partitions, max_tiles)
-        task_tiles = ceildiv(max_tiles, max_partitions)
-        parts = ceildiv(max_tiles, task_tiles)
-        capacity = num_seqs * parts
+        task_tiles = max(1, ceildiv(schedule_context, KV_COMPUTE_BLOCK))
+        parts = 1
+        capacity = num_seqs
         tile_bound = task_tiles
-    if direct_output is None:
-        direct_output = parts == 1
-    elif direct_output and parts != 1:
-        raise ValueError(
-            "direct_output needs one task per sequence (max_partitions == 1), "
-            f"got {parts}"
-        )
+    # One task per sequence: the CTA writes the normalized row itself.
+    direct_output = parts == 1
     if direct_output and (
         (output.stride(0) * output.element_size()) % 16
         or (output.stride(1) * output.element_size()) % 16
@@ -240,8 +224,9 @@ def pa_decode_mxfp4(
     )
     if stage_pages > MAX_STAGED_PAGES:
         raise NotImplementedError(
-            f"a task can own {pages} pages; raise max_partitions so a task owns at "
-            f"most {MAX_STAGED_PAGES} (block_size {block_size})"
+            f"a task can own {pages} pages; a task may own at most "
+            f"{MAX_STAGED_PAGES} (block_size {block_size}); use a plan with more "
+            "max_partitions"
         )
 
     expected = (num_kv_heads, capacity, group_size)
@@ -268,16 +253,10 @@ def pa_decode_mxfp4(
         group_size=group_size,
         block_size=block_size,
         stage_pages=stage_pages,
-        q_fp8=q_fp8,
         out_f16=output.dtype == torch.float16,
-        tile_depth=tile_depth,
         direct=direct_output,
         tiles_per_task=task_tiles,
-        parts=parts if work_plan is None else 0,
     )
-    reduce_info = None
-    if work_plan is None and not direct_output:
-        reduce_info = torch.empty((num_seqs, 2), dtype=torch.int32, device=dev)
     out_dt = fx.Float16 if output.dtype == torch.float16 else fx.BFloat16
     with torch.cuda.device(dev):
         stream = torch.cuda.current_stream(dev)
@@ -286,7 +265,7 @@ def pa_decode_mxfp4(
             ptr_arg(output if direct_output else max_logits, fx.Float32),
             ptr_arg(output if direct_output else exp_sums, fx.Float32),
             ptr_arg(output if direct_output else temporary_output, out_dt),
-            ptr_arg(query.view(torch.uint8) if q_fp8 else query, fx.Uint8),
+            ptr_arg(query.view(torch.uint8), fx.Uint8),
             ptr_arg(k_data, fx.Uint8),
             ptr_arg(k_scale, fx.Uint8),
             ptr_arg(v_data, fx.Uint8),
@@ -311,7 +290,7 @@ def pa_decode_mxfp4(
             output.stride(0),
             output.stride(1),
             ptr_arg(context_lengths, fx.Int32),
-            ptr_arg(block_tables if reduce_info is None else reduce_info, fx.Int32),
+            ptr_arg(block_tables, fx.Int32),  # unused reduce-info slot
             capacity,
             num_kv_heads,
             stream,
@@ -344,7 +323,5 @@ def pa_decode_mxfp4(
             head_size=HEAD_DIM,
             max_partitions=reduce_partitions,
             stream=stream,
-            reduce_info=(
-                work_plan.reduce_info if work_plan is not None else reduce_info
-            ),
+            reduce_info=work_plan.reduce_info,
         )
