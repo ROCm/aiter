@@ -1304,6 +1304,7 @@ def topk_select(
                 abort_when_nan_found=abort_when_nan_found,
                 tie=tie,
                 deterministic=deterministic,
+                max_row_len=max_row_len,
             )
 
     if end is None:
