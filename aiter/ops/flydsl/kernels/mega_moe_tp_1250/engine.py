@@ -5,7 +5,9 @@ paths (small / mid / big M) and launches."""
 
 from __future__ import annotations
 
+import csv
 import dataclasses
+import functools
 import os
 
 import flydsl.expr as fx
@@ -32,11 +34,25 @@ __all__ = ["MegaMoeTP1250Engine", "default_launch_cfg"]
 AR_TWO_MIN = int(os.environ.get("MEGA_AR_TWO_MIN", "512"))
 
 
-def default_launch_cfg(tokens: int, model_dim: int = 4096) -> LaunchCfg:
-    """The launch config of a batch of (global) tokens: its dispatch path and tiles
-    (MEGA_CFG="field=value,..." overrides LaunchCfg fields, for experiments)."""
-    cfg = _default_launch_cfg(tokens, model_dim)
-    ov = os.environ.get("MEGA_CFG", "")
+TUNED_CSV = os.path.join(os.path.dirname(__file__), "tuned_mega_moe_tp.csv")
+
+
+@functools.cache
+def _tuned_rows() -> dict:
+    """(model_dim, experts, inter per rank, tp, tokens) -> override string, from
+    tuned_mega_moe_tp.csv (columns: model_dim,experts,inter,tp,tokens,cfg; cfg in the
+    MEGA_CFG syntax, fields separated by ';')"""
+    rows = {}
+    if os.path.exists(TUNED_CSV):
+        with open(TUNED_CSV) as f:
+            for row in csv.DictReader(f):
+                key = tuple(int(row[k]) for k in ("model_dim", "experts", "inter", "tp", "tokens"))
+                rows[key] = row["cfg"].replace(";", ",")
+    return rows
+
+
+def _apply(cfg: LaunchCfg, ov: str) -> LaunchCfg:
+    """overrides "field=value,..." (g1.tile_m=128: a GemmCfg field)"""
     for f in filter(None, ov.split(",")):
         k, v = f.split("=")
         if "." in k:  # g1.tile_m=128: a GemmCfg field
@@ -46,6 +62,16 @@ def default_launch_cfg(tokens: int, model_dim: int = 4096) -> LaunchCfg:
         else:
             cfg = dataclasses.replace(cfg, **{k: type(getattr(cfg, k))(int(v))})
     return cfg
+
+
+def default_launch_cfg(tokens: int, model_dim: int = 4096, shape=None) -> LaunchCfg:
+    """The launch config of a batch of (global) tokens: its dispatch path and tiles,
+    then the tuned row of shape = (experts, inter per rank, tp) at these tokens if
+    tuned_mega_moe_tp.csv has one, then MEGA_CFG="field=value,..." (experiments)."""
+    cfg = _default_launch_cfg(tokens, model_dim)
+    if shape is not None:
+        cfg = _apply(cfg, _tuned_rows().get((model_dim, *shape, tokens), ""))
+    return _apply(cfg, os.environ.get("MEGA_CFG", ""))
 
 
 def _default_launch_cfg(tokens: int, model_dim: int = 4096) -> LaunchCfg:
@@ -207,7 +233,7 @@ class MegaMoeTP1250Engine:
             out = self.y[:m]
         if m == 0:
             return out
-        cfg = cfg or self.cfg_fn(m * self.tp, self.H)
+        cfg = cfg or self.cfg_fn(m * self.tp, self.H, (self.E, self.Ip, self.tp))
         x = x.contiguous()
         ids = topk_ids.to(torch.int32).contiguous()
         tw = topk_weights.to(torch.float32).contiguous()
@@ -280,7 +306,7 @@ class MegaMoeTP1250Engine:
                 self.y_ar = torch.empty((self.mmax * self.tp, self.H), dtype=torch.bfloat16,
                                         device=self.device)
             out = self.y_ar[:T]
-        cfg = cfg or self.cfg_fn(T, self.H)
+        cfg = cfg or self.cfg_fn(T, self.H, (self.E, self.Ip, self.tp))
         # rs_wt (MEGA_RS_WT=0: off): the rows peers read written through at system scope
         # instead of a system-scope cache writeback before their signal (-10~55 us)
         cfg = dataclasses.replace(cfg, ar=True, rs_pull=False, ag_split=False,

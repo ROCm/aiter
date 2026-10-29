@@ -172,6 +172,8 @@ def compile_mega_moe_tp_1250(
     wrep2 = g2.tile_m // g2.m_warp // 16
     stage1_act = ACTS[act]
     LDS_BYTES = {6: 50, 5: 60, 4: 72, 3: 100, 2: 158, 1: 300}[cfg.cta_per_cu] * 1024  # of 320 KB per CU
+    if not cfg.expert_hint:  # no resident psum copy: the GEMM arena gets the rest of the CU's share
+        LDS_BYTES = (320 * 1024 // cfg.cta_per_cu - 16) // 1024 * 1024
     # LDS of the routing phases (inside the GEMM arena: phases never overlap)
     L_HIST = 0
     L_SCAN0 = L_HIST + E * 4
@@ -283,7 +285,9 @@ def compile_mega_moe_tp_1250(
     if TS:
         name += "_ts"
     Q_LDS = LDS_BYTES  # the claimed task's broadcast word
-    LEXP = LDS_BYTES + 16  # [E] psum (expert ends) for the tasks' expert bisect
+    # [E] psum (expert ends) for the tasks' expert bisect, past the GEMM arena; without the
+    # hint only the scan writes it, in the arena (the routing phase's)
+    LEXP = LDS_BYTES + 16 if cfg.expert_hint else 4 * E * 4
     lds_slot = {}
 
     def lds_arena(n):
@@ -430,7 +434,7 @@ def compile_mega_moe_tp_1250(
             bid = fx.Int32(gpu.block_id("x"))
             wave = uni(tid // WAVE)
             lane = tid % WAVE
-            lptr = fx.SharedAllocator().allocate(LDS_BYTES + 16 + E * 4, alignment=1024)._ptr
+            lptr = fx.SharedAllocator().allocate(LDS_BYTES + 16 + (E * 4 if EHINT else 0), alignment=1024)._ptr
             lds_slot["ptr"] = lptr
             L = uni(fx.Int32(fx.ptrtoint(lptr)))
             peers = [p0, p1, p2, p3, p4, p5, p6, p7]
