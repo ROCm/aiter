@@ -511,15 +511,18 @@ void all_gather_lastdim_add(fptr_t _fa,
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     if(inp.dtype() != AITER_DTYPE_bf16 && inp.dtype() != AITER_DTYPE_fp16)
         throw std::runtime_error("all_gather_lastdim_add supports bfloat16 and float16 only");
-    if(inp.dim() != 2)
-        throw std::runtime_error("all_gather_lastdim_add supports 2D tensors only");
+    if(inp.dim() != 2 || !inp.is_contiguous())
+        throw std::runtime_error("all_gather_lastdim_add needs a contiguous 2D inp");
+    if(reinterpret_cast<uintptr_t>(inp.data_ptr()) % 16 != 0)
+        throw std::runtime_error("all_gather_lastdim_add: inp must be 16-byte aligned");
     int64_t rows = inp.size(0);
     int64_t last_dim_size = inp.size(-1);
     auto check_full = [&](const aiter_tensor_t& t, const char* name) {
         if(t.dim() != 2 || t.size(0) != rows || t.size(1) != last_dim_size * fa->world_size_ ||
-           t.dtype() != inp.dtype())
+           t.dtype() != inp.dtype() || t.device_id != inp.device_id || !t.is_contiguous())
             throw std::runtime_error(std::string("all_gather_lastdim_add: ") + name +
-                                     " must be [rows, n * world_size] with inp's dtype");
+                                     " must be contiguous [rows, n * world_size] with inp's "
+                                     "dtype and device");
         if(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 != 0)
             throw std::runtime_error(std::string("all_gather_lastdim_add: ") + name +
                                      " must be 16-byte aligned");

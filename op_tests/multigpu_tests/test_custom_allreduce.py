@@ -116,6 +116,25 @@ def _run_all_gather_lastdim_add_case(
     ca = get_tp_group().device_communicator.ca_comm
     msg = f"test_all_gather_lastdim_add: rank={rankID} {shape=} {dtype=} {withGraph=}"
 
+    if case_idx == 0 and not withGraph:
+        assert ca.should_custom_ag_lastdim_add(x), msg
+        assert not ca.should_custom_ag_lastdim_add(x.float()), msg
+        assert not ca.should_custom_ag_lastdim_add(x[:, :4]), msg
+        assert not ca.should_custom_ag_lastdim_add(x.view(-1)), msg
+        flat = torch.empty(add_b.numel() + 1, dtype=dtype, device="cuda")
+        misaligned = flat[1:].view(full)
+        bad = {
+            "alias": {"add_b": add_b, "out": add_b},
+            "misaligned out": {"add_b": add_b, "out": misaligned},
+            "wrong shape": {"add_b": add_b[:, :-8]},
+        }
+        for tag, kw in bad.items():
+            try:
+                ca.all_gather_lastdim_add(x, **kw)
+            except AssertionError:
+                continue
+            raise AssertionError(f"{msg} accepted {tag}")
+
     def check(out, out_b, shards, tag):
         gathered = torch.cat(shards, dim=-1)
         err = checkAllclose(
