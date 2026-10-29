@@ -1126,6 +1126,7 @@ def test_adaptive_control_unwarmed_capture(card):
 
     warm = torch.cuda.Stream()
     warm_cases = [inputs(rows, 10 + i) for i in range(calls)]
+    warm.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warm):
         decode(*warm_cases[0])
     check(warm_cases[0], "eager warm-up")
@@ -1149,6 +1150,7 @@ def test_adaptive_control_unwarmed_capture(card):
     graph_c = capture(early, c_cases)
     poison(early)
     eager = inputs(rows, 70)
+    early.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(early):
         decode(*eager)
     check(eager, "eager launch before the first replay")
