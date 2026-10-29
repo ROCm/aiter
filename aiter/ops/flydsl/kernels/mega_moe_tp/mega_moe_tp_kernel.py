@@ -25,11 +25,12 @@ from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _e8m0_from_amax
 from .common import (
     AUX_SYS,
+    DEADLINE,
     MAX_TP,
     V4I,
-    alive,
     amax,
     before,
+    before_end,
     bf16x8_to_f32,
     bld,
     bst,
@@ -50,8 +51,8 @@ from .common import (
     lds_ld_acq,
     lds_ld_i32,
     lds_st,
-    now,
     pack_bf16x8,
+    peer_deadline,
     rsrc,
     sum_live,
     uni,
@@ -74,6 +75,7 @@ from .mega_moe_tp_config import (
     C_TURN,
     C_UN,
     C_XW,
+    CTRL_ERR,
     CTRL_TNC,
     ERR_YAG,
     FLAG_TN,
@@ -443,6 +445,8 @@ def compile_mega_moe_tp(
         off_sall: fx.Int64,
     ):
         a = dict(locals())
+        a["wait_ticks"] = fx.Int64(DEADLINE)
+        a["wait_end"] = peer_deadline(ctrl + fx.Int64(CTRL_ERR * 4), a["wait_ticks"])
         tid = fx.Int32(gpu.thread_id("x"))
         assert layout_tag and name
         lds = fx.SharedAllocator().allocate(Shared).peek()
@@ -937,6 +941,8 @@ def compile_bigm_kernel(
         def ca(i):
             return ctrl + fx.Int64(i * i32(4))
 
+        wait_end = peer_deadline(ca(i32(C_ERR)), DEADLINE)
+
         def wp(name):  # local window address of a region
             return wb + a["off_" + name]
 
@@ -1018,8 +1024,7 @@ def compile_bigm_kernel(
                     slot = fx.Int64(sig_slot(dc, p, i32(q)))
                     tgt = sig_base(p, q) + n
                     cur = g_ld_sys(slot)
-                    t0 = now()
-                    while before(cur, tgt) & alive(t0):
+                    while before(cur, tgt) & before_end(wait_end):
                         rocdl.s_sleep(2)
                         cur = g_ld_sys(slot)
                     if before(

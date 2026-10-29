@@ -19,12 +19,14 @@ from ..kernels_common import LOG2E, ceildiv
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .common import (
     AUX_SYS,
+    DEADLINE,
     MAX_TP,
     amax,
     before,
     bf16x8_to_f32,
     bld,
     bst,
+    deadline_in,
     f32_bits_add,
     g_or_agent,
     g_st_sys,
@@ -35,6 +37,7 @@ from .common import (
     lds_ld_i32,
     lds_st,
     pack_bf16x8,
+    peer_deadline,
     poll_sys_ge,
     rsrc,
     sum_live,
@@ -105,8 +108,8 @@ def compile_sp_rs_norm(
         lds_st(L, off, fx.Float32(v).bitcast(fx.Int32))
 
     @flyc.jit
-    def wait_epoch(a, addr):
-        cur = poll_sys_ge(addr, a["epoch"], 1)
+    def wait_epoch(a, addr, end):
+        cur = poll_sys_ge(addr, a["epoch"], end=end, nap=1)
         if before(cur, a["epoch"]):
             g_or_agent(fx.Int64(a["ctrl"]) + fx.Int64(i32(ERR * 4)), i32(1))
 
@@ -157,7 +160,7 @@ def compile_sp_rs_norm(
             if tid < i32(ZT):
                 r = rt * i32(ZT) + tid
                 addr = fx.Int64(a["ctrl"]) + fx.Int64((i32(NB) + r) * i32(4))
-                wait_epoch(a, addr)
+                wait_epoch(a, addr, deadline_in(a["wait_ticks"]))
             gpu.barrier()
 
             def step(acc, kc, bvs, row):
@@ -230,7 +233,7 @@ def compile_sp_rs_norm(
                 if lane == i32(0):
                     g_st_sys(zflag(a, rt, ks), a["epoch"])
                 if lane < KS:
-                    wait_epoch(a, zflag(a, rt, lane))
+                    wait_epoch(a, zflag(a, rt, lane), deadline_in(a["wait_ticks"]))
             gpu.barrier()
             for rl_ in range(ks + w * KS, i32(ZT), KS * i32(NTH // 64)):
                 router_row(a, lane, rt, i32(rl_), KS)
@@ -421,7 +424,7 @@ def compile_sp_rs_norm(
                 + fx.Int64((tid * i32(NB) + src_cta) * i32(4))
             )
             if tid != a["rank"]:
-                wait_epoch(a, addr)
+                wait_epoch(a, addr, a["wait_end"])
         gpu.barrier()
 
     @flyc.jit
@@ -558,6 +561,8 @@ def compile_sp_rs_norm(
             "ids": ids,
             "tw": tw,
             "zp": zp,
+            "wait_ticks": fx.Int64(DEADLINE),
+            "wait_end": peer_deadline(ctrl + fx.Int64(ERR * 4), DEADLINE),
         }
         if tid < i32(4):
             lds_st(L, tid * i32(4), i32(0))

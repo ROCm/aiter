@@ -412,8 +412,21 @@ def before(cur, target):
     return (cur - target) < i32(0)
 
 
-def alive(t0):
-    return (now() - t0) < fx.Int64(DEADLINE)
+def deadline_in(ticks):
+    """The deadline ``ticks`` (s_memrealtime) from now: a wait on this rank's own CTAs."""
+    return now() + fx.Int64(ticks)
+
+
+def peer_deadline(err_addr, ticks):
+    """The launch's deadline for its waits on peer ranks, taken once at kernel entry:
+    ``ticks`` from now, or now if the sticky error word at ``err_addr`` is set (an
+    earlier launch timed out; the ranks are out of step until reset())."""
+    err = g_ld_rel(err_addr, "agent")
+    return uni64(now() + (err != i32(0)).select(fx.Int64(0), fx.Int64(ticks)))
+
+
+def before_end(end):
+    return (now() - end) < fx.Int64(0)
 
 
 @flyc.jit
@@ -432,10 +445,9 @@ def spin0(L, lane, off, target):
 
 
 @flyc.jit
-def poll_sys_ge(addr, target, nap=2):
+def poll_sys_ge(addr, target, *, end, nap=2):
     cur = g_ld_sys(addr)
-    t0 = now()
-    while before(cur, target) & alive(t0):
+    while before(cur, target) & before_end(end):
         rocdl.s_sleep(nap)
         cur = g_ld_sys(addr)
     return cur

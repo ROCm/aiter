@@ -474,7 +474,7 @@ class MegaMoeTP:
     def check_errors(self) -> None:
         """Raise RuntimeError (and clear) if a wait gave up since the last check."""
         if self._bigm is not None and self._bigm.poll_errors():
-            self._bigm.clear_errors()
+            self.clear_errors()
             raise RuntimeError(
                 "MegaMoeTP: a big-M wait on a peer gave up (results invalid)"
             )
