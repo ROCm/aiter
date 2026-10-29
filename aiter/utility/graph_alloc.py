@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import ctypes
 import functools
 from contextlib import contextmanager
 
 import torch
 from packaging.version import Version
+
+from aiter.jit.utils.hip_runtime import load_hip_runtime
 
 # Before 2.10 the allocator scans captures_underway in registration order, so
 # the graph pool wins and use_mem_pool is ignored inside a capture. Parsed, not
@@ -44,3 +47,49 @@ def persistent_alloc(device: torch.device):
         )
     with torch.cuda.use_mem_pool(_persistent_pool(index), device=index):
         yield
+
+
+def _capture_id() -> int | None:
+    """ID of the graph capture the current stream is part of, or None."""
+    if not torch.cuda.is_current_stream_capturing():
+        return None
+    status, capture_id = ctypes.c_int(0), ctypes.c_ulonglong(0)
+    err = load_hip_runtime().hipStreamGetCaptureInfo(
+        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+        ctypes.byref(status),
+        ctypes.byref(capture_id),
+    )
+    if err != 0:
+        raise RuntimeError(f"hipStreamGetCaptureInfo failed with error {err}")
+    return capture_id.value
+
+
+def capture_scoped_cache(fn):
+    """``functools.cache`` for scratch buffers a kernel initializes, e.g. zeroed
+    semaphores built with ``torch.zeros`` under ``persistent_alloc``.
+
+    Inside a capture the initializing kernel is recorded into that graph instead
+    of running, so the buffer holds whatever the memory held before until the
+    graph replays. Sharing it with eager launches or other graphs would run them
+    on that garbage (a split-K ticket protocol then spins forever), so a buffer
+    first built inside a capture is cached for that capture only: the graph that
+    initializes it is the only one that uses it, and it re-initializes the
+    buffer on every replay before using it. Buffers built eagerly are already
+    initialized and are shared with captures as before.
+    """
+    cache = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args):
+        eager = cache.get((None, *args))
+        if eager is not None:
+            return eager
+        key = (_capture_id(), *args)
+        buf = cache.get(key)
+        if buf is None:
+            buf = cache[key] = fn(*args)
+        return buf
+
+    wrapper.eager_cached = lambda *args: cache.get((None, *args))
+    wrapper.cache_clear = cache.clear
+    return wrapper
