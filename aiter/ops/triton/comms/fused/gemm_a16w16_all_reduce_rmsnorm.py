@@ -104,11 +104,11 @@ def gemm_a16w16_all_reduce_rmsnorm(
         SLOT=slot,
         MAXIT=_MAXIT,
         GEMMA=gemma,
-        SHARED_A=shared_a,
-        SHARED_B=shared_b,
-        WMMA=wmma,
-        OPERAND_A=operand_a,
-        OPERAND_B=operand_b,
+        SHARED_LAYOUT_A=shared_a,
+        SHARED_LAYOUT_B=shared_b,
+        WMMA_LAYOUT=wmma,
+        OPERAND_LAYOUT_A=operand_a,
+        OPERAND_LAYOUT_B=operand_b,
         num_warps=num_warps,
     )
     return out, residual_out
