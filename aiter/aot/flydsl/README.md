@@ -395,8 +395,10 @@ compiling, and the case fails.
   (MXFP4 a8w4 / a4w4, Silu / SiTUv2), at each `-m` token count up to the
   deployment's `max_tokens`. `--deployments` points it at other files,
   `--deployment-id <glob>` picks deployments by id, `--ep-mode fake` routes
-  every token locally. It runs first among the test's defaults, before the other
-  tests JIT-compile in the same process.
+  every token locally. A `--deployments` or `--deployment-id` that selects no
+  case on this GPU fails; with neither, a GPU no default deployment targets is
+  skipped. It runs first among the test's defaults, before the other tests
+  JIT-compile in the same process.
 
 Full flow:
 

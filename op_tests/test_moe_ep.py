@@ -1310,6 +1310,7 @@ for test in args.test:
         if gpu_arch not in ("gfx950", "gfx1250"):
             print(f"skip {test}: mxfp4 requires gfx950/gfx1250, got {gpu_arch}")
             continue
+        n_cases = 0
         for call, label, act in _aot_ep_deployments(
             args.deployments, args.deployment_id
         ):
@@ -1333,6 +1334,21 @@ for test in args.test:
                     check_aot=True,
                     deployment=call.id,
                 )
+                n_cases += 1
+        if not n_cases:
+            where = (
+                f"for {gpu_arch} with {get_cu_num()} CUs "
+                f"at -m {' '.join(map(str, args.token))}"
+            )
+            # The default files have nothing for some GPUs; a selection given
+            # on the command line must check something.
+            if args.deployment_id or args.deployments != DEFAULT_DEPLOYMENTS:
+                raise RuntimeError(
+                    f"{test}: --deployments/--deployment-id select no EP "
+                    f"deployment case {where}; list the ids with "
+                    "python -m aiter.aot.flydsl.deployments"
+                )
+            print(f"skip {test}: no EP deployment case {where}")
     elif test == "test_fmoe_16_bit":
         print("test test_fmoe 16 bit")
         # print("\ng1u0 no quant")
