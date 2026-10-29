@@ -1028,8 +1028,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 else:
                     kernelName = "None"
             tflops, bw = self.calculate(el)
-            from aiter.utility.tune_result import power_columns, power_selection_enabled
-
             key_dict = dict(zip(self.keys, keys))
             metrics = {
                 "libtype": [libtype],
@@ -1041,11 +1039,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 "tflops": [tflops],
                 "bw": [bw],
             }
-            watt_text = ""
-            if power_selection_enabled():
-                watts, tflops_per_w = power_columns(el, tflops)
-                metrics["watts"] = [watts]
-                watt_text = f", watts={watts} W, tflops_per_w={tflops_per_w} TFLOPS/W"
+            extra, watt_text = self.policy.result_metrics(el, tflops)
+            metrics.update(extra)
             if len(results) == self.topk:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is "

@@ -342,25 +342,18 @@ class IQ2RGlm53Tuner(TunerCommon):
                     tolerance = 1e-2 * reference.float().abs().max().item()
                 us = self._time(shape, config, args)
                 tflops, tbps = self.calculate((info, us, 0.0))
-                from aiter.utility.tune_result import (
-                    TuneResult,
-                    power_selection_enabled,
-                )
+                from aiter.utility.tune_result import TuneResult
 
-                watts = float("nan")
-                if power_selection_enabled(getattr(args, "select", None)):
-                    from aiter.utility.package_power import record_package_watts
+                calls = [
+                    functools.partial(self._run, shape, config, *call)
+                    for call in shape.calls
+                ]
 
-                    calls = [
-                        functools.partial(self._run, shape, config, *call)
-                        for call in shape.calls
-                    ]
+                def replay(calls=calls):
+                    for call in calls:
+                        call()
 
-                    def replay(calls=calls):
-                        for call in calls:
-                            call()
-
-                    watts = record_package_watts(replay)
+                watts = self.policy_for(args).measure(replay)
                 watt_text = (
                     f", {watts:.1f} W" if math.isfinite(watts) and watts > 0 else ""
                 )

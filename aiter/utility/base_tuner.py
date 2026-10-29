@@ -17,6 +17,7 @@ import torch
 from aiter import dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
 from aiter.jit.utils.chip_info import gfx_from_cu_num
+from aiter.utility.selection_policy import LATENCY, make_policy, use_policy
 
 INVALID_TIME = -1
 
@@ -77,6 +78,8 @@ class TunerCommon:
     # Opt in per tuner. A tuner that only ranks by latency must not stamp
     # select=power, including ones whose post-pass keeps a kernel for its speed.
     SUPPORTS_POWER_SELECT = False
+    # Every latency-or-power decision goes through this. ``--select`` sets it.
+    policy = LATENCY
     # Columns that count as a real package-power measurement. MoE's tuned row
     # uses ``watts`` (the stage-energy mean); stage columns stay on the profile.
     POWER_WATT_COLUMNS = ("watts",)
@@ -254,16 +257,18 @@ class TunerCommon:
         )
         self.parser.add_argument(
             "--select",
-            default=os.environ.get("AITER_SELECT", "latency"),
+            default="latency",
             help="How to pick the winner among kernels that pass errRatio. "
             "'latency' (default) keeps the lowest us. "
             "'power' (experimental; aliases: efficiency, power_efficiency) "
             "ranks by package energy (us * PPT watts), measured from the GPU PPT "
             "sysfs node (power1_input) over AITER_POWER_WINDOW_S seconds "
-            "(default 0.4) on the accurate pass only. It adds no latency "
+            "(default 0.4) while the kernel launches back to back, on the "
+            "accurate pass only. It adds no latency "
             "bound, and the score is an isolated replay under the clock and "
             "power cap in effect, so the winner can change in another model "
-            "or power-management state. Also set by AITER_SELECT. "
+            "or power-management state. AITER_SELECT does not set this; it "
+            "only picks the tables dispatch loads at runtime. "
             "PPT is the whole package, so the GPU should otherwise be idle. "
             "Use --shape_grouped so every candidate for a shape is measured "
             "on the same GPU. AITER_POWER_PATH overrides the hwmon file; "
@@ -285,7 +290,7 @@ class TunerCommon:
                 f"unknown --select {getattr(args, 'select', None)!r}; use latency or power"
             )
         args.select = select
-        os.environ["AITER_SELECT"] = select
+        self.policy = make_policy(select)
         if select == "power":
             if not self.SUPPORTS_POWER_SELECT:
                 self.parser.error(
@@ -300,6 +305,11 @@ class TunerCommon:
                 )
             self._redirect_power_output(args)
         return select
+
+    def policy_for(self, args):
+        """The selection policy for this call; ``args.select`` wins when present."""
+        select = getattr(args, "select", None)
+        return self.policy if select is None else make_policy(select)
 
     def _redirect_power_output(self, args):
         """Send a power tune of a shipped table to aiter/configs/power_configs/.
@@ -395,14 +405,11 @@ class TunerCommon:
         A shape whose watts are missing was ranked by latency. Labeling it
         ``select=power`` would publish that latency pick as a power result.
         """
-        from aiter.utility.tune_result import (
-            POWER_ROW_COLUMNS,
-            SELECT_COLUMN,
-            power_selection_enabled,
-        )
+        from aiter.utility.tune_result import POWER_ROW_COLUMNS, SELECT_COLUMN
 
-        if not isinstance(results, pd.DataFrame) or not power_selection_enabled(
-            getattr(args, "select", None)
+        if (
+            not isinstance(results, pd.DataFrame)
+            or not self.policy_for(args).measures_power
         ):
             return results
         results = self.power_metrics(results)
@@ -507,10 +514,8 @@ class TunerCommon:
         if "_tag" in merge_df.columns:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
             dedup_keys = self.keys + ["_tag"]
-        from aiter.utility.tune_result import sort_frame_for_selection
-
         merge_df = (
-            sort_frame_for_selection(merge_df)
+            self.policy.sort_frame(merge_df)
             .drop_duplicates(subset=dedup_keys, keep="first")
             .reset_index(drop=True)
         )
@@ -736,21 +741,16 @@ class TunerCommon:
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
-        from aiter.utility.tune_result import (
-            TuneResult,
-            attach_power_columns,
-            power_selection_enabled,
-            selection_rank,
-        )
+        from aiter.utility.tune_result import TuneResult
 
         rets = list(rets)
-        select_power = power_selection_enabled(getattr(args, "select", None))
+        policy = self.policy_for(args)
         if args.profile_file != "":
             if args.verbose:
                 logger.info(f"saving profile to {args.profile_file}")
             profile_rets = sorted(rets, key=itemgetter(0))
             profiledf = self.power_metrics(
-                attach_power_columns(self.result_to_df(profile_rets), profile_rets)
+                policy.attach_columns(self.result_to_df(profile_rets), profile_rets)
             )
             if os.path.exists(args.profile_file):
                 old_df = _read_csv(args.profile_file)
@@ -775,10 +775,7 @@ class TunerCommon:
 
         for info_key, time_list in grouped_results:
             tol_err_ratio = args.errRatio
-            sorted_time = sorted(
-                time_list,
-                key=lambda x: selection_rank(x[1], x[3], select_power),
-            )
+            sorted_time = sorted(time_list, key=lambda x: policy.rank(x[1], x[3]))
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio, watts)
                 for info_ex, us, max_err_ratio, watts in sorted_time
@@ -805,7 +802,7 @@ class TunerCommon:
                     TuneResult((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)
                 ]
             bestConfigs.extend(best_config)
-        resultdf = attach_power_columns(self.result_to_df(bestConfigs), bestConfigs)
+        resultdf = policy.attach_columns(self.result_to_df(bestConfigs), bestConfigs)
         return resultdf
 
     def _summary_shape_keys(self) -> "list[str]":
@@ -1637,6 +1634,10 @@ class TunerCommon:
                 "errRatio by package energy (us * PPT watts) with no latency "
                 "bound. Keep the GPU otherwise idle."
             )
+        with use_policy(self.policy):
+            return self._run(args, fast_mode)
+
+    def _run(self, args, fast_mode=False):
         self.pre_process(args)
 
         # Resolve --run_config: can be False, True (no file), or a file path string.
@@ -1928,8 +1929,6 @@ class GemmCommonTuner(TunerCommon):
             else:
                 kernelName = str(resolved)
             tflops, bw = self.calculate(el)
-            from aiter.utility.tune_result import power_columns, power_selection_enabled
-
             key_dict = dict(zip(self.keys, keys))
             metrics = {
                 "kernelId": [kernelId],
@@ -1940,11 +1939,8 @@ class GemmCommonTuner(TunerCommon):
                 "tflops": [tflops],
                 "bw": [bw],
             }
-            watt_text = ""
-            if power_selection_enabled():
-                watts, tflops_per_w = power_columns(el, tflops)
-                metrics["watts"] = [watts]
-                watt_text = f", {watts=} W, {tflops_per_w=} TFLOPS/W"
+            extra, watt_text = self.policy.result_metrics(el, tflops)
+            metrics.update(extra)
             if len(results) == self.topk:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s{watt_text}"

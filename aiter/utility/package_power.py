@@ -220,8 +220,40 @@ def shared_power_override_rejected() -> str | None:
     return None
 
 
-def record_package_watts(fn, device_index: int | None = None) -> float:
-    """Sample PPT for fn. Returns NaN when the sensor cannot be read."""
+def _perftest_option_names() -> frozenset:
+    import inspect
+
+    from aiter.test_common import run_perftest
+
+    params = inspect.signature(run_perftest).parameters
+    return frozenset(
+        name
+        for name, param in params.items()
+        if param.kind is inspect.Parameter.KEYWORD_ONLY
+    )
+
+
+def kernel_call(func, args, kwargs):
+    """The kernel launch the timer measured, without the ``run_perftest`` options.
+
+    ``mp_tuner`` tasks carry ``run_perftest`` options (``num_warmup``,
+    ``num_iters``, and the rest) in the same kwargs as the kernel's own. The
+    kernel must not receive them, and replaying ``run_perftest`` itself would
+    spend most of the power window in profiler setup with the GPU idle.
+    """
+    options = _perftest_option_names()
+    kernel_kwargs = {k: v for k, v in (kwargs or {}).items() if k not in options}
+    args = tuple(args or ())
+    return lambda: func(*args, **kernel_kwargs)
+
+
+def measure_kernel(call, device_index: int | None = None) -> float:
+    """Mean package watts while ``call`` launches back to back.
+
+    This is the one place a tune reads package power. ``call`` launches the
+    kernel the timer measured and nothing else; NaN means the sensor could not
+    be read or the call raised.
+    """
     if device_index is None:
         try:
             import torch
@@ -230,7 +262,7 @@ def record_package_watts(fn, device_index: int | None = None) -> float:
         except Exception:  # noqa: BLE001
             device_index = 0
     try:
-        return float(measure_package_watts(fn, device_index=device_index))
+        return float(measure_package_watts(call, device_index=device_index))
     except Exception as exc:  # noqa: BLE001
         logger.warning("package power measurement failed: %s", exc)
         return float("nan")

@@ -30,6 +30,11 @@ def normalize_select(value) -> str:
 
 
 def power_selection_enabled(explicit=None) -> bool:
+    """Whether runtime dispatch loads power tables (``AITER_SELECT``).
+
+    Only ``jit/core`` and ``power_configs`` read this. A tuner asks its
+    ``SelectionPolicy`` instead.
+    """
     raw = (
         explicit if explicit is not None else os.environ.get("AITER_SELECT", "latency")
     )
@@ -178,13 +183,11 @@ class TuneResult(tuple):
 
 
 def attach_power_columns(df, results):
-    """Add watts on a power tune. Latency frames stay unchanged.
+    """Add each result's watts as a column. Only the power policy calls this.
 
     ``tflops_per_w`` is added later by ``TunerCommon.power_metrics``, so a
     tuner with its own formula (MoE stage energy) is not overwritten here.
     """
-    if not power_selection_enabled():
-        return df
     if df is None or not hasattr(df, "columns"):
         return df
     if len(df) != len(list(results)):
@@ -206,15 +209,13 @@ def attach_power_columns(df, results):
     return df
 
 
-def sort_frame_for_selection(df, select_power=None):
+def sort_frame_for_selection(df, select_power: bool):
     """Order rows so the preferred kernel is first.
 
     Power mode uses ``us * watts`` (the same key as ``selection_rank``). A
     frame that recorded ``tflops_per_w`` and not watts falls back to that
     column. Latency mode, and a power frame with neither column, uses ``us``.
     """
-    if select_power is None:
-        select_power = power_selection_enabled()
     if select_power and "watts" in df.columns and df["watts"].notna().any():
         return sort_by_energy_then_latency(df)
     if (
