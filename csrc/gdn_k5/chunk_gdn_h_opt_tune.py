@@ -287,9 +287,9 @@ def sweep_case_row(
     cu_num: int,
     policy=None,
 ) -> dict[str, Any] | None:
-    from aiter.utility.selection_policy import LATENCY
+    from aiter.utility.selection_policy import active_policy
 
-    policy = LATENCY if policy is None else policy
+    policy = active_policy() if policy is None else policy
     if case.K != 128 or case.V != 128 or case.BT != 64:
         print(f"{case_id:58s} skipped (kernel supports K=V=128, BT=64 only)")
         return None

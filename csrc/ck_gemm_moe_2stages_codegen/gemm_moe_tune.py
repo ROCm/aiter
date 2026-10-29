@@ -8361,6 +8361,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
                             f"validation failed: {failure}"
                             if failure is not None
                             else f"us={us}"
+                            + (
+                                policy.watt_text(candidate["watts"])
+                                if "watts" in candidate
+                                else ""
+                            )
                         ),
                         flush=True,
                     )

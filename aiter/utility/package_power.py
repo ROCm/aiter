@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Package power from the same hwmon file rocm-smi -P reads (power1_input, label PPT)."""
 
+import collections
 import ctypes
 import glob
 import logging
@@ -184,12 +185,17 @@ def measure_package_watts(
 
     fn()
     _sync_cuda()
+    started = time.perf_counter()
+    fn()
+    _sync_cuda()
+    in_flight = _InFlight(time.perf_counter() - started)
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
     deadline = time.perf_counter() + seconds
     try:
         while time.perf_counter() < deadline:
             fn()
+            in_flight.mark()
     finally:
         _sync_cuda()
         stop.set()
@@ -197,6 +203,43 @@ def measure_package_watts(
     if not samples:
         return float("nan")
     return sum(samples) / len(samples)
+
+
+class _InFlight:
+    """Keep a bounded amount of work queued on the GPU.
+
+    An unbounded queue of large graph replays crashes some kernels (IQ2R MoE)
+    inside the HIP runtime. Recording an event after every launch costs host
+    time that starves short kernels, so one event covers about ``SPAN_S`` of
+    work, sized from one synchronized call, and the loop waits on the event
+    ``DEPTH`` back so the GPU never drains.
+    """
+
+    DEPTH = 4
+    SPAN_S = 200e-6
+
+    def __init__(self, call_s: float = 0.0):
+        self._events = collections.deque()
+        self._every = max(1, int(self.SPAN_S / call_s)) if call_s > 0 else 1
+        self._calls = 0
+        try:
+            import torch
+
+            self._event = torch.cuda.Event if torch.cuda.is_available() else None
+        except Exception:  # noqa: BLE001
+            self._event = None
+
+    def mark(self) -> None:
+        if self._event is None:
+            return
+        self._calls += 1
+        if self._calls % self._every:
+            return
+        done = self._event()
+        done.record()
+        self._events.append(done)
+        if len(self._events) > self.DEPTH:
+            self._events.popleft().synchronize()
 
 
 def _sync_cuda() -> None:

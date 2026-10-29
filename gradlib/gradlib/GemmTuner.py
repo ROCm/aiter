@@ -158,10 +158,10 @@ class Gemm:
         atol=None,
         policy=None,
     ):
-        from aiter.utility.selection_policy import LATENCY
+        from aiter.utility.selection_policy import active_policy
 
         torch.cuda.empty_cache()
-        self.policy = LATENCY if policy is None else policy
+        self.policy = active_policy() if policy is None else policy
         self.m = m
         self.k = k
         self.n = n
