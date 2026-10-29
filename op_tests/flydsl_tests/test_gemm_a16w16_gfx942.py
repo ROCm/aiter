@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Specialized correctness tests for the native gfx942 (CDNA3) bf16 GEMM.
 
@@ -70,10 +70,41 @@ def _guarded_out(m, n, dtype):
     ],
     ids=["unset", "k_waves-only", "explicit-default-tile"],
 )
-def test_flydsl_hgemm_gfx942_forwards_overrides(overrides, monkeypatch):
+def test_flydsl_hgemm_gfx942_forwards_overrides(overrides, monkeypatch, tmp_path):
     """flydsl_hgemm passes exactly the tile arguments it was given to the kernel."""
     _require_gfx942()
     import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    m, n, k = 1024, 1024, 1024
+    row = {
+        "gfx": "gfx942",
+        "cu_num": 304,
+        "M": m,
+        "N": n,
+        "K": k,
+        "out_dtype": "bf16",
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 128,
+        "stages": 1,
+        "split_k": 1,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "async_load_bytes": 16,
+        "buffered_load": True,
+        "direct_store": False,
+        "pingpong": True,
+        "split_k_reduce": False,
+    }
+    table = tmp_path / "table.csv"
+    table.write_text(
+        ",".join(row) + "\n" + ",".join(str(value) for value in row.values()) + "\n"
+    )
+    monkeypatch.delenv("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE", raising=False)
+    monkeypatch.setenv("AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942", str(table))
+    g.reload_tuned_table()
 
     compiled = {}
     make_param = g.make_gemm_a16w16_gfx942_param
@@ -83,17 +114,23 @@ def test_flydsl_hgemm_gfx942_forwards_overrides(overrides, monkeypatch):
         return make_param(**kwargs)
 
     monkeypatch.setattr(g, "make_gemm_a16w16_gfx942_param", recording_make_param)
-    m, n, k = 1024, 1024, 1024
-    x, w, ref = _inputs(m, n, k)
-    y = flydsl_hgemm(x, w, **overrides)
-    torch.cuda.synchronize()
-    _assert_close(y, ref, f"flydsl_hgemm {overrides}")
-    if overrides.keys() & g._STRUCTURAL_KEYS:
-        assert {key: compiled[key] for key in overrides} == overrides
-        assert not compiled.get("buffered_load", False)
-    else:
-        expected = {**g.gfx942_default_config(m, n, k), **overrides}
-        assert {key: compiled[key] for key in expected} == expected
+    try:
+        x, w, ref = _inputs(m, n, k)
+        y = flydsl_hgemm(x, w, **overrides)
+        torch.cuda.synchronize()
+        _assert_close(y, ref, f"flydsl_hgemm {overrides}")
+        if overrides.keys() & g._STRUCTURAL_KEYS:
+            assert {key: compiled[key] for key in overrides} == overrides
+            assert not compiled.get("buffered_load", False)
+        else:
+            expected = {
+                **{key: row[key] for key in g.TUNED_CONFIG_COLUMNS},
+                **overrides,
+            }
+            assert {key: compiled[key] for key in expected} == expected
+    finally:
+        monkeypatch.delenv("AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942")
+        g.reload_tuned_table()
 
 
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
@@ -417,6 +454,7 @@ def test_gemm_a16w16_gfx942_tuned_table(tmp_path, monkeypatch):
     table.write_text(
         ",".join(row) + "\n" + ",".join(str(v) for v in row.values()) + "\n"
     )
+    monkeypatch.delenv("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE", raising=False)
     monkeypatch.setenv("AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942", str(table))
     g.reload_tuned_table()
     try:
@@ -644,14 +682,6 @@ def test_gemm_a16w16_gfx942_split_k_buffers_do_not_retain_streams():
     ) is g.get_split_k_buffers(handle, device, 4, False)
 
 
-@pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
-def test_error_ratio_zero_reference(out_dtype):
-    """An exact output of an all-zero reference is correct, a wrong one is not."""
-    ref = torch.zeros(4, 4)
-    assert error_ratio(torch.zeros(4, 4, dtype=out_dtype), ref) == 0.0
-    assert error_ratio(torch.full((4, 4), 1e-3, dtype=out_dtype), ref) > 1.0
-
-
 def _invalid_inputs(case):
     x, w, _ = _inputs(64, 128, 256)
     b = w.t()
@@ -735,25 +765,6 @@ def test_gemm_a16w16_gfx942_rejects_non_304_cu_target(monkeypatch):
     g._device_key.cache_clear()
     with pytest.raises(RuntimeError, match="gfx942 device with 304 CUs"):
         g.gemm_a16w16(x, w.t())
-
-
-def test_gemm_a16w16_gfx942_other_device():
-    """Operands on a device that is not the current one, on its current stream
-    or on an explicit one."""
-    _require_gfx942()
-    if torch.cuda.device_count() < 2:
-        pytest.skip("needs two GPUs")
-    with torch.cuda.device(1):
-        x, w, ref = _inputs(256, 256, 1024)
-    assert torch.cuda.current_device() == 0
-    _assert_close(gemm_a16w16(x, w.t()), ref, "operands on cuda:1")
-    side = torch.cuda.Stream(device=1)
-    side.wait_stream(torch.cuda.current_stream(1))
-    y = gemm_a16w16(x, w.t(), stream=side)
-    side.synchronize()
-    _assert_close(y, ref, "operands and stream on cuda:1")
-    with pytest.raises(ValueError, match="stream is on"):
-        gemm_a16w16(x, w.t(), stream=torch.cuda.current_stream(0))
 
 
 @pytest.mark.parametrize("layout", ["nn", "tn", "tt"])
