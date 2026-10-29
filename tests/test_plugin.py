@@ -37,7 +37,12 @@ class _Provider:
 
 @pytest.fixture(autouse=True)
 def _clean_plugin_state(monkeypatch):
-    for name in ("AITER_PLUGINS", "AITER_PLUGIN_DISABLE", "AITER_PLUGIN_FORCE"):
+    for name in (
+        "AITER_PLUGINS",
+        "AITER_PLUGIN_DISABLE",
+        "AITER_PLUGIN_FORCE",
+        "AITER_PLUGIN_ENABLE",
+    ):
         monkeypatch.delenv(name, raising=False)
     plugin._reset_for_testing()
     yield
@@ -106,6 +111,7 @@ def test_decline_or_select_error_uses_visible_native_fallback(monkeypatch, outco
                 raise outcome
 
     provider = Provider("aklr")
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -123,6 +129,7 @@ def test_decline_or_select_error_uses_visible_native_fallback(monkeypatch, outco
 
 def test_selected_candidate_records_provenance(monkeypatch):
     provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -143,6 +150,7 @@ def test_selected_candidate_records_provenance(monkeypatch):
 
 def test_aiter_signature_is_enforced_before_provider_selection(monkeypatch):
     provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -166,6 +174,7 @@ def test_run_error_propagates_without_native_fallback(monkeypatch):
         run=fail,
     )
     provider = _Provider("aklr", candidate)
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -182,6 +191,7 @@ def test_run_error_propagates_without_native_fallback(monkeypatch):
 def test_provider_arbitration_is_deterministic(monkeypatch):
     zebra = _Provider("zebra", _candidate("zebra", 200))
     alpha = _Provider("alpha", _candidate("alpha", 100))
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "alpha, zebra")
     monkeypatch.setattr(
         plugin,
         "_entry_points",
@@ -198,6 +208,7 @@ def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
     incompatible = _Provider("old")
     incompatible.api_version = plugin.API_VERSION + 1
     good = _Provider("good", _candidate("good"))
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "good")
     monkeypatch.setattr(plugin.logger, "warning", lambda *args: warnings.append(args))
     monkeypatch.setattr(
         plugin,
@@ -234,3 +245,41 @@ def test_force_and_per_op_disable_are_explicit(monkeypatch):
     monkeypatch.setenv("AITER_PLUGIN_DISABLE", "other.op, test.add")
     assert add(2, 3) == 5
     assert plugin.last_decision().reason == "op-disabled"
+
+
+def test_installed_provider_is_not_enabled_by_default(monkeypatch):
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    native_calls = []
+    add = _route_add(native_calls)
+
+    assert add(2, 3) == 5
+    assert native_calls == [(2, 3)]
+    assert provider.select_calls == 0
+    assert plugin.last_decision().reason == "provider-not-enabled"
+
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    assert add(2, 3) == 100
+    assert provider.select_calls == 1
+    assert plugin.last_decision().route == "provider"
+
+
+def test_non_candidate_return_falls_back_to_native(monkeypatch):
+    class Garbage(_Provider):
+        def select(self, op, args, kwargs):
+            return 42
+
+    provider = Garbage("aklr")
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    native_calls = []
+    add = _route_add(native_calls)
+
+    assert add(2, 3) == 5
+    assert native_calls == [(2, 3)]
+    assert plugin.last_decision().reason == "invalid-candidate"
+    assert plugin.last_decision().provider == "aklr"

@@ -1,7 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Experimental interface for out-of-tree AITER kernel providers."""
+"""Experimental interface for out-of-tree AITER kernel providers.
+
+Ownership boundary:
+- AITER owns the op contract (signatures, versions), the execution rules
+  (isolation, fallback, no-fallback-after-run), and observable provenance.
+- Providers own their kernels, their qualification evidence, and their
+  lifecycle; ``KernelCandidate.qualification`` is self-reported provenance,
+  not an AITER certification.
+- Frameworks and users own enablement: installing a provider never makes it
+  the default. A provider serves only when explicitly enabled
+  (``AITER_PLUGIN_ENABLE``) or forced (``AITER_PLUGIN_FORCE``).
+"""
 
 from __future__ import annotations
 
@@ -62,7 +73,12 @@ class KernelCandidate:
 
 
 class KernelProvider(Protocol):
-    """Contract implemented by an out-of-tree provider entry point."""
+    """Contract implemented by an out-of-tree provider entry point.
+
+    Entry points must target a provider instance or a zero-argument
+    factory returning a provider. Anything with a ``select`` attribute is
+    treated as an instance, so a class object is never called.
+    """
 
     name: str
     api_version: int
@@ -135,14 +151,21 @@ def _dispatch(
         return _run_native(op, native, args, kwargs, disabled_reason)
 
     forced_provider = os.getenv("AITER_PLUGIN_FORCE")
+    enabled = _enabled_providers()
     eligible = [
         record
         for record in _providers()
-        if (not forced_provider or record.provider.name == forced_provider)
+        if (forced_provider or record.provider.name in enabled)
+        and (not forced_provider or record.provider.name == forced_provider)
         and _supports(record.provider, op)
     ]
     if not eligible:
-        reason = "forced-provider-unavailable" if forced_provider else "no-provider"
+        if forced_provider:
+            reason = "forced-provider-unavailable"
+        elif _providers() and not enabled:
+            reason = "provider-not-enabled"
+        else:
+            reason = "no-provider"
         return _run_native(op, native, args, kwargs, reason)
 
     bound = contract.bind(*args, **kwargs)
@@ -166,11 +189,14 @@ def _dispatch(
         if candidate is None:
             declined = True
             continue
-        if candidate.provider != provider.name:
+        if (
+            not isinstance(candidate, KernelCandidate)
+            or candidate.provider != provider.name
+        ):
             logger.warning(
-                "Provider %s returned a candidate owned by %s",
+                "Provider %s returned an invalid candidate (owned by %s)",
                 provider.name,
-                candidate.provider,
+                getattr(candidate, "provider", type(candidate).__name__),
             )
             return _run_native(
                 op, native, args, kwargs, "invalid-candidate", provider.name
@@ -218,6 +244,15 @@ def _disabled_reason(op: Op) -> str | None:
     if op.name in disabled_ops:
         return "op-disabled"
     return None
+
+
+def _enabled_providers() -> frozenset[str]:
+    """Providers allowed to serve; installing a provider never enables it."""
+    return frozenset(
+        name.strip()
+        for name in os.getenv("AITER_PLUGIN_ENABLE", "").split(",")
+        if name.strip()
+    )
 
 
 def _supports(provider: KernelProvider, op: Op) -> bool:
