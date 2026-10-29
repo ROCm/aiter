@@ -377,6 +377,20 @@ def benchmark_case(m, seed, packed, force_fused):
                     "mean_us": float(us),
                 }
             )
+    # Untimed non-saturating validation for each comparator. Keep the timing
+    # distribution unchanged, but make small projection errors observable here.
+    args[4].mul_((4 * args[0].shape[-1]) ** -0.5)
+    args[5].mul_(10.0)
+    if packed:
+        call_args[4].copy_(mhc_shuffle_fn(args[4]))
+    normalized_reference = reference(*args, **kwargs)
+    normalized_outputs = {}
+    for implementation in ("upstream", "optimized"):
+        guard = upstream_dispatch() if implementation == "upstream" else nullcontext()
+        with guard:
+            normalized_output = mhc_fused_post_pre(*call_args, **options)
+            check(normalized_output, normalized_reference)
+            normalized_outputs[implementation] = normalized_output
     medians = {
         name: statistics.median(
             row["mean_us"] for row in rows if row["implementation"] == name
@@ -404,6 +418,13 @@ def benchmark_case(m, seed, packed, force_fused):
         },
         "optimized_vs_upstream_errors": error_metrics(
             outputs["optimized"], outputs["upstream"]
+        ),
+        "non_saturating_reference_errors": {
+            name: error_metrics(out, normalized_reference)
+            for name, out in normalized_outputs.items()
+        },
+        "non_saturating_optimized_vs_upstream_errors": error_metrics(
+            normalized_outputs["optimized"], normalized_outputs["upstream"]
         ),
     }
 
@@ -437,6 +458,10 @@ def benchmark_cases(ms, seed, output_path):
         "scope": "same-process current upstream dispatch vs adapted full public call, matched flags per row",
         "input_distribution": "seeded normal synthetic inputs; FP32 scale/base multiplied by 0.1",
         "reference": "PyTorch FP32 math with contract BF16 residual/output rounding",
+        "error_distributions": {
+            "reference_errors": "timed stress inputs: unscaled normal fn, hc_scale/base normal * 0.1",
+            "non_saturating_reference_errors": "untimed: normal fn / sqrt(4H), hc_scale normal, base normal * 0.1; post/comb normal O(1)",
+        },
         "prepacking": "mhc_shuffle_fn outside timing for both implementations in explicit packed mode",
         "timing": "3 alternating-order cycles; 101 event-timed calls per cycle; 2 warmups; fixed inputs",
         "files_sha256": {
