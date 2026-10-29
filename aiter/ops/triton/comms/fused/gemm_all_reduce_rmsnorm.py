@@ -99,6 +99,7 @@ def gemm_all_reduce_rmsnorm(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         NUM_BUFFERS=num_buffers,
+        N_FIRST=config["N_FIRST"],
         SLOT=slot,
         MAXIT=_MAXIT,
         GEMMA=gemma,

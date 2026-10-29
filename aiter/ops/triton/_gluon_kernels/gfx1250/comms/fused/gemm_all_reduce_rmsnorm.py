@@ -35,6 +35,7 @@ def _gemm_post(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    N_FIRST: gl.constexpr,
     SLOT: gl.constexpr,
     SHARED_A: gl.constexpr,
     SHARED_B: gl.constexpr,
@@ -45,23 +46,29 @@ def _gemm_post(
     """Computes tile pid of y and writes it to the inbox of each rank. The tile has
     block m (3 ROWS rows) and columns BLOCK_N n to BLOCK_N n + BLOCK_N - 1."""
     ROW: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
-    pid_m = pid % blocks
-    pid_n = pid // blocks
+    if N_FIRST:
+        # The programs of a block take its column tiles in turn: the divisor is a
+        # constant, so the first load does not wait for a division.
+        pid_n = pid % (HIDDEN // BLOCK_N)
+        pid_m = pid // (HIDDEN // BLOCK_N)
+    else:
+        pid_m = pid % blocks
+        pid_n = pid // blocks
     # The tile has 4 row tiles of ROWS rows: the 4th one is 0 and is not posted.
     row = 3 * ROWS * pid_m
-    a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=x + row * K,
-        shape=(gl.minimum(tokens - row, 3 * ROWS), K),
-        strides=(K, 1),
-        block_shape=(4 * ROWS, BLOCK_K),
-        layout=SHARED_A,
-    )
     b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=w + pid_n * BLOCK_N * K,
         shape=(BLOCK_N, K),
         strides=(K, 1),
         block_shape=(BLOCK_N, BLOCK_K),
         layout=SHARED_B,
+    )
+    a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=x + row * K,
+        shape=(gl.minimum(tokens - row, 3 * ROWS), K),
+        strides=(K, 1),
+        block_shape=(4 * ROWS, BLOCK_K),
+        layout=SHARED_A,
     )
     a_buffer = gl.allocate_shared_memory(
         gl.bfloat16, [NUM_BUFFERS, 4 * ROWS, BLOCK_K], SHARED_A
@@ -70,9 +77,12 @@ def _gemm_post(
         gl.bfloat16, [NUM_BUFFERS, BLOCK_N, BLOCK_K], SHARED_B
     )
     NUM_K: gl.constexpr = K // BLOCK_K
+    # The W tile first: its descriptor does not depend on the token count.
     for i in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_load(a_desc, [0, i * BLOCK_K], a_buffer.index(i))
         gl.amd.gfx1250.tdm.async_load(b_desc, [0, i * BLOCK_K], b_buffer.index(i))
+        gl.amd.gfx1250.tdm.async_load(a_desc, [0, i * BLOCK_K], a_buffer.index(i))
+    # The compiler cannot move the address math of the K loop above the loads.
+    gl.amd.hint.sched_barrier()
 
     # Line i of row j of a row tile has the units of columns 2i and 2i + 1.
     LINES: gl.constexpr = ROWS * BLOCK_N // 2
@@ -87,8 +97,8 @@ def _gemm_post(
         if k + NUM_BUFFERS - 1 < NUM_K:
             nxt = (k + NUM_BUFFERS - 1) % NUM_BUFFERS
             at = (k + NUM_BUFFERS - 1) * BLOCK_K
-            gl.amd.gfx1250.tdm.async_load(a_desc, [0, at], a_buffer.index(nxt))
             gl.amd.gfx1250.tdm.async_load(b_desc, [0, at], b_buffer.index(nxt))
+            gl.amd.gfx1250.tdm.async_load(a_desc, [0, at], a_buffer.index(nxt))
         # K tile k has landed when only the later tiles are in flight.
         if NUM_K - 1 - k < NUM_BUFFERS - 1:
             gl.amd.gfx1250.tdm.async_wait(2 * (NUM_K - 1 - k))
@@ -255,7 +265,17 @@ def _receive_norm(
 
 _gemm_all_reduce_rmsnorm_repr = make_kernel_repr(
     "_gemm_all_reduce_rmsnorm_kernel",
-    ["RANK", "HIDDEN", "K", "ROWS", "BLOCK_N", "BLOCK_K", "NUM_BUFFERS", "GEMMA"],
+    [
+        "RANK",
+        "HIDDEN",
+        "K",
+        "ROWS",
+        "BLOCK_N",
+        "BLOCK_K",
+        "NUM_BUFFERS",
+        "N_FIRST",
+        "GEMMA",
+    ],
 )
 
 
@@ -280,6 +300,7 @@ def _gemm_all_reduce_rmsnorm_kernel(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    N_FIRST: gl.constexpr,
     SLOT: gl.constexpr,
     MAXIT: gl.constexpr,
     GEMMA: gl.constexpr,
@@ -312,6 +333,7 @@ def _gemm_all_reduce_rmsnorm_kernel(
             BLOCK_N,
             BLOCK_K,
             NUM_BUFFERS,
+            N_FIRST,
             SLOT,
             SHARED_A,
             SHARED_B,
