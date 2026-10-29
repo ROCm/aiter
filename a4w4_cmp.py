@@ -44,7 +44,7 @@ parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 parser.add_argument("M", type=int)
 parser.add_argument("N", type=int)
 parser.add_argument("K", type=int)
-parser.add_argument("--order", default="asm,tdm,compute", help="comma list of compute,asm,tdm")
+parser.add_argument("--order", default="tdm,asm,compute", help="comma list of compute,asm,tdm")
 parser.add_argument("--idle", type=float, default=2.0, help="seconds idle before each kernel")
 parser.add_argument(
     "--init",

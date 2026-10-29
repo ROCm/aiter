@@ -1414,11 +1414,11 @@ def launch_gemm_a8w4_tdm(
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
             reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
-            if const_expr(issue_fn is not None):
-                # The carried operands may still be reading the LDS buffer
-                # that issue_fn recycles. Retire those reads before all waves
-                # rendezvous at the REUSE fence; waiting at the MMA is too late.
-                rocdl.s_wait_dscnt(0)
+            # if const_expr(issue_fn is not None):
+            #     # The carried operands may still be reading the LDS buffer
+            #     # that issue_fn recycles. Retire those reads before all waves
+            #     # rendezvous at the REUSE fence; waiting at the MMA is too late.
+            #     rocdl.s_wait_dscnt(0)
             if const_expr(fence_fn is not None):
                 fence_fn()
             elif const_expr(num_outstanding_tdm is not None):
@@ -1585,26 +1585,32 @@ def launch_gemm_a8w4_tdm(
                 rocdl.sched_mfma(1)
                 rocdl.sched_dsrd(2)
                 rocdl.sched_mfma(1)
-                rocdl.sched_dsrd(4)
+                rocdl.sched_dsrd(3)
                 rocdl.sched_mfma(1)
-                rocdl.sched_dsrd(4)
+                rocdl.sched_dsrd(3)
                 rocdl.sched_mfma(1)
-                rocdl.sched_dsrd(4)
+                rocdl.sched_dsrd(3)
                 rocdl.sched_mfma(1)
-                rocdl.sched_dsrd(4)
+                rocdl.sched_dsrd(3)
                 rocdl.sched_mfma(1)
-                rocdl.sched_dsrd(4)
+                rocdl.sched_dsrd(3)
                 rocdl.sched_mfma(1)
-                rocdl.sched_dsrd(4)
+                rocdl.sched_dsrd(3)
                 rocdl.sched_mfma(1)
-                rocdl.sched_dsrd(4)
+                rocdl.sched_dsrd(3)
                 # The k128 issues 36 DS reads (16 A + 16 B b128 + 4 scale); an
                 # unclaimed read is hoisted ahead of every group.
                 rocdl.sched_mfma(1)
-                rocdl.sched_dsrd(4)
+                rocdl.sched_dsrd(3)
                 rocdl.sched_mfma(1)
-                rocdl.sched_dsrd(4)
-                rocdl.sched_mfma(8)
+                rocdl.sched_dsrd(3)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(3)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(3)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(3)
+                rocdl.sched_mfma(5)
 
                 rocdl.sched_barrier(0)
                 next_fenced = (
@@ -1612,12 +1618,17 @@ def launch_gemm_a8w4_tdm(
                     and next_stage_lds_addr is not None
                     and (next_stage_fence_fn is not None or next_stage_wait is not None)
                 )
-                if const_expr(not next_fenced):
-                    rocdl.s_wait_dscnt(0)
+                # if const_expr(not next_fenced):
+                #     rocdl.s_wait_dscnt(0)
                 rocdl.sched_barrier(0)
 
         # Skip padding tiles; uniform across every workgroup and cluster.
         if has_work:
+            llvm_dialect.InlineAsmOp(
+                res=None, operands_=[],
+                asm_string="s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1",
+                constraints="", has_side_effects=True, is_align_stack=False,
+            )
             if const_expr(enable_ep_scatter):
                 # Each lane carries one destination row in each vector. A wave32
                 # vector covers four 8-row scatter passes; larger M tiles use

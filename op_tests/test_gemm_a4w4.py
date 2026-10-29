@@ -142,7 +142,7 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     xq, xs = quant(x, quant_dtype=dtypes.fp4x2, scale_layout_m32k4=True)
     candidates = {
         "tuned": lambda: gemm_a4w4(xq, wq, xs, ws, dtype=dtype),
-        "asm": lambda: gemm_mxfp4_asm(xq, wq, xs, ws, dtype=dtype, a_preshuffle=False),
+        "asm": lambda: gemm_mxfp4_asm(xq, wq, xs, ws, dtype=dtype, a_preshuffle=True),
     }
     if os.environ.get("AITER_GEMM_A4W4_TDM") == "1" and _FLYDSL_AVAILABLE:
         # The grouped-MoE TDM pipeline as a dense GEMM; it quantizes A itself
