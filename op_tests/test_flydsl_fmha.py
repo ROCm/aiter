@@ -2132,6 +2132,71 @@ def test_public_varlen_partial_descales_raise(monkeypatch, dtype):
         flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True, q_descale=s)
 
 
+@pytest.mark.parametrize(
+    "dtype, kernel_kind",
+    [
+        (torch.bfloat16, "a16w16"),
+        (torch.float16, "a16w16"),
+        (torch.float8_e4m3fn, "a8w8"),
+    ],
+)
+def test_gfx1250_descale_decision_follows_main(monkeypatch, dtype, kernel_kind):
+    """gfx1250 varlen/batch entries decline descales only for 8-bit Q/K/V, as on main.
+
+    bf16/fp16 calls with descales still reach the a16w16 kernel; 8-bit calls with
+    descales return None so the a8w8 kernel never drops them. Kernel entries are
+    stubbed to raise a sentinel, so this runs on any arch (no gfx1250 needed).
+    """
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import fmha_kernels
+
+    class _ReachedKernel(Exception):
+        pass
+
+    reached = []
+
+    def _sentinel(name):
+        def _entry(*args, **kwargs):
+            reached.append(name)
+            raise _ReachedKernel
+
+        return _entry
+
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx1250")
+    for layout in ("varlen", "batch"):
+        for kind in ("a16w16", "a8w8"):
+            entry = f"flash_attn_{layout}_{kind}_gfx1250"
+            monkeypatch.setattr(fmha_kernels, entry, _sentinel(f"{layout}_{kind}"))
+    L, H, D = 128, 4, 128
+    q, k, v = (torch.empty(L, H, D, dtype=dtype) for _ in range(3))
+    s = torch.ones(1, dtype=torch.float32)
+    descales = {"q_descale": s, "k_descale": s, "v_descale": s}
+    cu = torch.tensor([0, L], dtype=torch.int32)
+    qb, kb, vb = (t.unsqueeze(0) for t in (q, k, v))
+
+    def varlen(**kw):
+        return fmha_kernels.flydsl_flash_attn_varlen_fwd(
+            q, k, v, cu, cu, L, L, causal=True, **kw
+        )
+
+    def batch(**kw):
+        return fmha_kernels.flydsl_flash_attn_batch_fwd(qb, kb, vb, causal=True, **kw)
+
+    for layout, call in (("varlen", varlen), ("batch", batch)):
+        reached.clear()
+        with pytest.raises(_ReachedKernel):
+            call()
+        assert reached == [f"{layout}_{kernel_kind}"]
+        reached.clear()
+        if kernel_kind == "a8w8":
+            assert call(**descales) is None
+            assert reached == []
+        else:
+            with pytest.raises(_ReachedKernel):
+                call(**descales)
+            assert reached == [f"{layout}_a16w16"]
+
+
 def _stub_varlen_backends(monkeypatch):
     """Stub the CK and FlyDSL varlen entries; return the list of backends called."""
     from aiter.ops import mha as mha_module
