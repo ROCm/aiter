@@ -7,9 +7,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ..tensor_shim import _run_compiled, ptr_buf_tensor
@@ -36,7 +34,7 @@ class _LdsF32View:
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, pair_k, pin_final_a_base):
+    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -188,17 +186,9 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             for ni in range(NUM_ACC_N)
         ]
         final_off = (last & 1) * fx.Int32(a_lds_i32)
-        if const_expr(pin_final_a_base):
-            # Keep final-K LDS addresses out of the loop-carried live range.
-            # Tied empty asm preserves the value without a memory clobber or
-            # changing any ready/acquire/barrier edge.
-            final_off = fx.Int32(llvm.inline_asm(
-                T.i32, [final_off.ir_value()], "", "=v,0",
-                has_side_effects=True,
-            ))
 
         def final_a_load(mi, ks, _base=final_off):
-            return a_s2r.load_operand(a_buf, mi, ks, _base)
+            return a_s2r.load_operand(a_buf, mi, ks, _base, narrow_copy=narrow_final_a)
 
         if const_expr(async_a_copy):
             sb = [
@@ -301,7 +291,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
-    act="silu", situ_beta=1.0, situ_linear_beta=1.0, pin_final_a_base=False):
+    act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -363,7 +353,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input, pair_k, pin_final_a_base)
+            trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile

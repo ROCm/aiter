@@ -270,7 +270,16 @@ class AS2RLoader:
         self._is_fp4 = a_dtype == "fp4"
         assert self._is_fp4 or a_dtype == "fp8"
 
-    def _load_16b(self, lds_src, i32_off):
+    def _load_16b(self, lds_src, i32_off, narrow_copy=False):
+        if const_expr(narrow_copy):
+            # Recast the aligned base before applying element offsets; a byte
+            # offset would lose the alignment required by the Int32 iterator.
+            i32_base = fx.recast_iter(fx.Int32, lds_src.ptr)
+            ptr_off = fx.add_offset(i32_base, fx.make_int_tuple(i32_off))
+            src = fx.make_view(ptr_off, fx.make_layout(4, 1))
+            fragment = fx.make_rmem_tensor(4, fx.Int32)
+            fx.copy(fx.make_copy_atom(fx.UniversalCopy(32), fx.Int32), src, fragment)
+            return Vec(fragment.load())
         # add_offset+recast preserves the LDS address space.
         byte_off = i32_off * fx.Int32(4)
         ptr_off = fx.add_offset(lds_src.ptr, fx.make_int_tuple(byte_off))
@@ -278,7 +287,7 @@ class AS2RLoader:
         v = fx.make_view(i8_iter, fx.make_layout(16, 1)).load()
         return Vec(v).bitcast(fx.Int32)
 
-    def load_operand(self, lds_src, mi, ksub, base_i32=0):
+    def load_operand(self, lds_src, mi, ksub, base_i32=0, narrow_copy=False):
         """Load one K=128 A operand; FP4 uses one 16B chunk and FP8 uses two."""
         row = fx.Int32(mi * 16) + fx.Int32(self._lane % 16)
         row_i32 = row * fx.Int32(self._k_step_bytes // 4) + fx.Int32(base_i32)
@@ -291,10 +300,14 @@ class AS2RLoader:
             return col
 
         col_lo = klane4 + fx.Int32(ksub * (16 if self._is_fp4 else 32))
-        lo = self._load_16b(lds_src, row_i32 + _c(col_lo)).bitcast(fx.Int64)
+        lo = self._load_16b(lds_src, row_i32 + _c(col_lo), narrow_copy).bitcast(
+            fx.Int64
+        )
         if const_expr(self._is_fp4):
             return Vec(lo).bitcast(fx.Int32)
-        hi = self._load_16b(lds_src, row_i32 + _c(col_lo + 16)).bitcast(fx.Int64)
+        hi = self._load_16b(lds_src, row_i32 + _c(col_lo + 16), narrow_copy).bitcast(
+            fx.Int64
+        )
         return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
             fx.Int32
         )
