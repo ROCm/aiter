@@ -486,15 +486,43 @@ jobs:
     needs: [detect_aiter_test_scope, check-signal, build_aiter_wheels]
     outputs:
       shard_count: 8
+      selected_count: ${{ steps.select.outputs.selected_count }}
       standard_matrix: ${{ steps.standard_matrix.outputs.matrix }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The selector diffs the PR merge against its base parent, so it
+          # needs that merge commit and its history, not the head commit.
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Select Aiter tests from the PR diff
+        id: select
+        env:
+          # Flip to 'false' only once .github/scripts/audit_aiter_selection.py
+          # reports no missed failure over the agreed window. Until then the
+          # selection is computed and reported, and CI runs the full suite.
+          DRY_RUN: "true"
+          FULL_SUITE: ${{ github.event_name != 'pull_request'
+                          || contains(github.event.pull_request.labels.*.name, 'ci:aiter-full') }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${FULL_SUITE}" = true ]; then
+            args+=(--all)
+          else
+            args+=(--merge-ref HEAD)
+          fi
+          if [ "${DRY_RUN}" = true ]; then
+            args+=(--dry-run)
+          fi
+          python3 .github/scripts/select_aiter_tests.py "${args[@]}"
 
       - name: Split Aiter Tests (8 shards)
-        run: ./.github/scripts/split_tests.sh --shards 8 --test-type aiter
+        run: |
+          ./.github/scripts/split_tests.sh --shards 8 --test-type aiter \
+            --select-file selected_aiter_tests.list
 
       - name: Build standard test matrix
         id: standard_matrix
@@ -610,9 +638,12 @@ jobs:
           fi
 
   standard:
+    # selected_count is 0 only when the selector proved nothing in this diff
+    # reaches a test in this suite. It is never 0 while DRY_RUN is 'true'.
     if: >-
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
-      github.event.action != 'labeled'
+      github.event.action != 'labeled' &&
+      needs.split_aiter_tests.outputs.selected_count != '0'
     name: Standard Tests (1 GPU)
     needs: [detect_aiter_test_scope, build_aiter_wheels, split_aiter_tests, prepare_triton_wheel, ci_config]
     env:

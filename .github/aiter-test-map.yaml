@@ -1,0 +1,349 @@
+# Ownership map for op_tests that only `import aiter`.
+#
+# aiter/__init__.py re-exports ~60 modules with `import *`, so these tests
+# depend on everything in the import graph. This table says what each one
+# actually exercises, so .github/scripts/select_aiter_tests.py can map a diff
+# to them. Tests that resolve through the import graph are NOT listed here.
+#
+# Generated draft -- every entry needs an owner's review before trusting it.
+# A bare-import test missing from this file makes CI run the full suite and
+# fail the consistency check in tests/test_aiter_test_map.py.
+#
+# `owns`: paths whose change selects this test. `cpu_only: true` marks tests
+# that drive no GPU op (they are selected only by their own change).
+
+tests:
+  op_tests/test_activation.py:
+    owns:
+      - aiter/ops/activation.py
+  op_tests/test_aiter_add.py:
+    owns:
+      - aiter/ops/aiter_operator.py
+  op_tests/test_aiter_addInp.py:
+    owns:
+      - aiter/ops/aiter_operator.py
+  op_tests/test_aiter_sigmoid.py:
+    owns:
+      - aiter/ops/aiter_operator.py
+  op_tests/test_asm_guard.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_batch_prefill.py:
+    owns:
+      - aiter/ops/mha.py
+      - aiter/ops/quant.py
+  op_tests/test_batched_gemm_a8w8.py:
+    owns:
+      - aiter/ops/batched_gemm_op_a8w8.py
+  op_tests/test_causal_conv1d_update.py:
+    owns:
+      - aiter/ops/causal_conv1d_update.py
+  op_tests/test_concat_cache_mla.py:
+    owns:
+      - aiter/ops/cache.py
+      - aiter/ops/rope.py
+  op_tests/test_cpp_extension_rocm_headers.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_dsv4_rotate_quant.py:
+    owns:
+      - aiter/ops/quant.py
+  op_tests/test_dtype_parser.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_flydsl_dcp_topk_merge.py:
+    owns:
+      - aiter/ops/flydsl/dcp_topk_merge.py
+      - aiter/ops/topk.py
+  op_tests/test_fmha_fwd_mxfp8_asm.py:
+    owns:
+      - aiter/ops/mha.py
+      - aiter/test_mha_common.py
+  op_tests/test_fmha_fwd_with_sink_asm.py:
+    owns:
+      - aiter/ops/mha.py
+  op_tests/test_fmha_fwd_with_sink_varlen_asm.py:
+    owns:
+      - aiter/ops/mha.py
+  op_tests/test_fused_kv_norm_rope_group_quant.py:
+    owns:
+      - aiter/ops/fused_qk_norm_rope_cache_quant.py
+  op_tests/test_fused_qk_norm.py:
+    owns:
+      - aiter/ops/fused_qk_rmsnorm_group_quant.py
+      - aiter/ops/rmsnorm.py
+  op_tests/test_fused_qk_norm_mrope_cache_quant.py:
+    owns:
+      - aiter/ops/fused_qk_norm_mrope_cache_quant.py
+      - aiter/ops/fused_qk_norm_rope_cache_quant.py
+      - aiter/ops/quant.py
+  op_tests/test_fused_qk_norm_rope_1way_perhead.py:
+    owns:
+      - aiter/ops/fused_qk_norm_rope_cache_quant.py
+  op_tests/test_fused_qk_norm_rope_2way_perhead.py:
+    owns:
+      - aiter/ops/fused_qk_norm_rope_cache_quant.py
+      - aiter/ops/quant.py
+  op_tests/test_fused_qk_norm_rope_cache_quant.py:
+    owns:
+      - aiter/ops/cache.py
+      - aiter/ops/fused_qk_norm_rope_cache_quant.py
+      - aiter/ops/quant.py
+  op_tests/test_fused_qk_rmsnorm_per_token_quant.py:
+    owns:
+      - aiter/ops/enum.py
+      - aiter/ops/fused_qk_rmsnorm_group_quant.py
+      - aiter/ops/rmsnorm.py
+  op_tests/test_gdr_decode_packed_bf16.py:
+    owns:
+      - aiter/ops/gdr_decode_packed_bf16.py
+  op_tests/test_hipblaslt_lifecycle.py:
+    owns:
+      - aiter/ops/gradlib.py
+  op_tests/test_indexer_k_quant_and_cache.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_jit_arch_guard.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_jit_cache_transaction.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_kvcache.py:
+    owns:
+      - aiter/ops/cache.py
+      - aiter/ops/quant.py
+  op_tests/test_kvcache_blockscale.py:
+    owns:
+      - aiter/ops/cache.py
+      - aiter/ops/quant.py
+  op_tests/test_layernorm2d.py:
+    owns:
+      - aiter/ops/norm.py
+  op_tests/test_layernorm2dFusedAddQuant.py:
+    owns:
+      - aiter/ops/norm.py
+      - aiter/ops/quant.py
+  op_tests/test_metadata.py:
+    owns:
+      - aiter/ops/attention.py
+  op_tests/test_mha_optional_flydsl.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_mha_varlen_large_kv.py:
+    owns:
+      - aiter/ops/mha.py
+  op_tests/test_mixed_mxfp_manifests.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_mla_ltx.py:
+    owns:
+      - aiter/mla.py
+      - aiter/ops/attention.py
+  op_tests/test_mla_persistent.py:
+    owns:
+      - aiter/mla.py
+      - aiter/ops/attention.py
+  op_tests/test_mla_persistent_round_robin.py:
+    owns:
+      - aiter/mla.py
+      - aiter/ops/attention.py
+  op_tests/test_mla_prefill_ps.py:
+    owns:
+      - aiter/mla.py
+      - aiter/ops/attention.py
+      - aiter/ops/quant.py
+  op_tests/test_mla_reduce.py:
+    owns:
+      - aiter/ops/attention.py
+  op_tests/test_mla_sparse.py:
+    owns:
+      - aiter/mla.py
+      - aiter/ops/attention.py
+  op_tests/test_mla_v40_persistent.py:
+    owns:
+      - aiter/mla.py
+      - aiter/ops/attention.py
+      - aiter/ops/enum.py
+  op_tests/test_moeTopkSoftmax.py:
+    owns:
+      - aiter/fused_moe.py
+      - aiter/ops/moe_op.py
+      - aiter/ops/topk.py
+  op_tests/test_moe_scatter_reduce.py:
+    owns:
+      - aiter/ops/moe_mxfp4_aux.py
+  op_tests/test_mxfp4_moe_aux_codegen.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_opus_a16w16_registry.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_opus_co_builder.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_opus_co_profile.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_pa_block_id_truncation.py:
+    owns:
+      - aiter/ops/attention.py
+      - aiter/ops/quant.py
+  op_tests/test_pa_decode_bf16_asm.py:
+    owns:
+      - aiter/ops/attention.py
+  op_tests/test_pa_mtp.py:
+    owns:
+      - aiter/ops/attention.py
+      - aiter/ops/quant.py
+      - aiter/paged_attn.py
+  op_tests/test_pa_ragged.py:
+    owns:
+      - aiter/ops/attention.py
+      - aiter/ops/quant.py
+  op_tests/test_pa_ragged_experimental.py:
+    owns:
+      - aiter/ops/attention.py
+  op_tests/test_pa_v1.py:
+    owns:
+      - aiter/ops/attention.py
+      - aiter/ops/quant.py
+      - aiter/paged_attn.py
+  op_tests/test_pretune.py:
+    cpu_only: true
+    owns: []
+  op_tests/test_ps_metadata_sizing.py:
+    owns:
+      - aiter/ops/attention.py
+  op_tests/test_quant.py:
+    owns:
+      - aiter/ops/enum.py
+      - aiter/ops/quant.py
+  op_tests/test_rmsnorm2dFusedAddQuant.py:
+    owns:
+      - aiter/ops/enum.py
+      - aiter/ops/quant.py
+      - aiter/ops/rmsnorm.py
+  op_tests/test_rope.py:
+    owns:
+      - aiter/ops/pos_encoding.py
+      - aiter/ops/rope.py
+  op_tests/test_smoothquant.py:
+    owns:
+      - aiter/ops/quant.py
+  op_tests/test_split_gdr_update.py:
+    owns:
+      - aiter/ops/fused_split_gdr_update.py
+  op_tests/test_topk_row_prefill.py:
+    owns:
+      - aiter/ops/topk.py
+  op_tests/test_vsa_sparse_attention.py:
+    owns:
+      - aiter/ops/vsa_sparse_attention.py
+  op_tests/tuning_tests/test_csv_validation.py:
+    owns:
+      - aiter/configs/
+  op_tests/tuning_tests/test_fhmoe_tuner.py:
+    owns:
+      - aiter/fhmoe.py
+      - aiter/fhmoe_contract.py
+
+# hsa/<arch>/<dir>/ -> tests. Hand-maintained: ASM kernels are not in any
+# import graph. Directory list below is from hsa/gfx950/.
+hsa: {}
+#   a16w8gemm:
+#   bf16gemm:
+#   f4f6gemm:
+#   f4gemm:
+#   f6f4gemm:
+#   f6gemm:
+#   fmha_v3_bwd:
+#   fmha_v3_fwd:
+#   fmha_v4_fwd:
+#   fmoe:
+#   fmoe_2stages:
+#   fp8gemm_blockscale:
+#   i8gemm:
+#   mla:
+#   mla_opus:
+#   mla_v4:
+#   pa:
+#   reduce:
+#   topksoftmax:
+
+# Tuned-config files name an op, not a test. Each regex is matched against the
+# config's basename; a config matching no rule makes CI run the full suite.
+# Generated draft -- needs an owner's review.
+tuned_configs:
+  "a4w4":
+    - op_tests/test_gemm_a4w4.py
+  "a4w6":
+    - op_tests/test_gemm_a4w6.py
+  "a6w4":
+    - op_tests/test_gemm_a6w4.py
+  "a6w6":
+    - op_tests/test_gemm_a6w6.py
+  "a8w8":
+    - op_tests/test_batched_gemm_a8w8.py
+    - op_tests/test_batched_gemm_a8w8_mxscale_bpreshuffle.py
+    - op_tests/test_gemm_a8w8.py
+    - op_tests/test_gemm_a8w8_blockscale.py
+    - op_tests/test_gemm_a8w8_blockscale_bpreshuffle_out.py
+    - op_tests/test_gemm_a8w8_blockscale_cktile_aq_rowmajor.py
+    - op_tests/test_gemm_a8w8_blockscale_fallback.py
+    - op_tests/test_gemm_a8w8_bpreshuffle_out.py
+    - op_tests/test_gemm_a8w8_bpreshuffle_pad_k.py
+    - op_tests/test_gemm_a8w8_mxfp8_bpreshuffle.py
+    - op_tests/test_opus_a8w8_bmm.py
+    - op_tests/test_opus_a8w8_interface.py
+  "attention":
+    - op_tests/test_flydsl_hstu_attention.py
+    - op_tests/test_flydsl_hstu_attention_bwd.py
+    - op_tests/test_flydsl_linear_attention.py
+    - op_tests/test_flydsl_linear_attention_prefill.py
+    - op_tests/test_vsa_sparse_attention.py
+  "batched":
+    - op_tests/test_batched_gemm_a8w8.py
+    - op_tests/test_batched_gemm_a8w8_mxscale_bpreshuffle.py
+    - op_tests/test_batched_gemm_bf16.py
+    - op_tests/test_flydsl_batched_gemm.py
+  "bf16":
+    - op_tests/test_batched_gemm_bf16.py
+    - op_tests/test_gdr_decode_packed_bf16.py
+    - op_tests/test_pa_decode_bf16_asm.py
+  "blockscale":
+    - op_tests/test_gemm_a8w8_blockscale.py
+    - op_tests/test_gemm_a8w8_blockscale_bpreshuffle_out.py
+    - op_tests/test_gemm_a8w8_blockscale_cktile_aq_rowmajor.py
+    - op_tests/test_gemm_a8w8_blockscale_fallback.py
+    - op_tests/test_kvcache_blockscale.py
+    - op_tests/test_moe_blockscale.py
+  "bpreshuffle":
+    - op_tests/test_batched_gemm_a8w8_mxscale_bpreshuffle.py
+    - op_tests/test_gemm_a8w8_blockscale_bpreshuffle_out.py
+    - op_tests/test_gemm_a8w8_bpreshuffle_out.py
+    - op_tests/test_gemm_a8w8_bpreshuffle_pad_k.py
+    - op_tests/test_gemm_a8w8_mxfp8_bpreshuffle.py
+  "moe":
+    - op_tests/test_fhmoe.py
+    - op_tests/test_flydsl_moe_a16wfp4.py
+    - op_tests/test_flydsl_moe_aux.py
+    - op_tests/test_flydsl_moe_gfx942.py
+    - op_tests/test_moe.py
+    - op_tests/test_moeTopkSoftmax.py
+    - op_tests/test_moe_2stage.py
+    - op_tests/test_moe_a16w16_default_dispatch.py
+    - op_tests/test_moe_blockscale.py
+    - op_tests/test_moe_dp_share_expert.py
+    - op_tests/test_moe_ep.py
+    - op_tests/test_moe_glm5_fp4_ep_dispatch.py
+    - op_tests/test_moe_local_expert_ids.py
+    - op_tests/test_moe_mxfp4_inter_dim_dispatch.py
+    - op_tests/test_moe_mxfp8_passthrough.py
+    - op_tests/test_moe_route_rows.py
+    - op_tests/test_moe_scatter_reduce.py
+    - op_tests/test_moe_sorting.py
+    - op_tests/test_moe_sorting_mxfp4.py
+    - op_tests/test_moe_tkw1.py
+    - op_tests/test_moe_topk_gating.py
+    - op_tests/test_mxfp4_moe_aux_codegen.py
