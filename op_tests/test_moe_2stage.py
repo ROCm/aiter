@@ -1879,6 +1879,36 @@ def test_presorted_moe_layout_mismatch():
     )
 
 
+def test_presorted_moe_output_overlap():
+    """A presort is ignored when output overlaps one of its sort tensors.
+
+    The stages zero or write output while still reading the sort tensors, so
+    the call must fall back to fused_moe's own sort. No MoE kernel launch.
+    """
+    fm = aiter.fused_moe
+    M, E, topk, model_dim = 4, 8, 2, 8
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = _presorted_aux_stub(ids, weights, E)
+
+    def match(output):
+        return fm._match_presorted_moe(
+            aux, ids, weights, block_m=16, num_experts=E, topk=topk, output=output
+        )
+
+    own = torch.empty((M, model_dim), dtype=dtypes.bf16)
+    assert match(own) is not None, "a presort with a separate output was rejected"
+    for key in fm._PRESORTED_MOE_SORT_KEYS:
+        t = aux[key]
+        backing = torch.empty(t.nbytes + M * model_dim * 2, dtype=torch.uint8)
+        aux[key] = backing[: t.nbytes].view(t.dtype)
+        # a contiguous output that starts inside the sort tensor
+        inside = backing[t.nbytes - 2 :][: M * model_dim * 2].view(dtypes.bf16)
+        assert match(inside.view(M, model_dim)) is None, f"output overlapping {key}"
+        aux[key] = t
+    aiter.logger.info("moe_2stage: presorted MoE output-overlap contract passed")
+
+
 def test_presorted_moe_block_m():
     """Only a BM=16 presort is accepted; another block_m falls back to fused_moe's sort.
 
@@ -2358,6 +2388,7 @@ else:
         _case_iters.append(_iter_legacy_cases())
     test_presorted_moe_wrapper_error()
     test_presorted_moe_block_m()
+    test_presorted_moe_output_overlap()
     test_presorted_moe_masked_call()
     test_presorted_moe_layout_mismatch()
     test_presorted_moe_ignored_is_logged()
