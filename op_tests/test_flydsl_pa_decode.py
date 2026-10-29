@@ -782,6 +782,7 @@ def test_pa_decode_unowned_kv_rows(
     Padded block-table lanes read block 0 and the last page's tail past the
     context is read as is. Both may hold NaN (a recycled page, a checkpoint
     image); P is zero there but 0 * NaN is NaN in PV.
+    ``mask_unowned_kv=False`` skips the masking and matches it on clean input.
     """
     if get_gfx_runtime() == "gfx1250":
         pytest.skip("gfx1250 pipelines still require finite unowned V rows")
@@ -827,7 +828,7 @@ def test_pa_decode_unowned_kv_rows(
     )
     plan = pa.plan_pa_decode(context, kv_heads, query_length=query_length)
 
-    def run(fill):
+    def run(fill, mask_unowned_kv=True):
         k, v = key.clone(), value.clone()
         ks = None if key_scale is None else key_scale.clone()
         vs = None if value_scale is None else value_scale.clone()
@@ -862,6 +863,7 @@ def test_pa_decode_unowned_kv_rows(
             value_scale=vs,
             work_plan=plan,
             max_context_length=max(lengths),
+            mask_unowned_kv=mask_unowned_kv,
         )
         return output
 
@@ -871,3 +873,5 @@ def test_pa_decode_unowned_kv_rows(
     tol = 5e-3 if kv == "bf16" else 2.5e-2
     torch.testing.assert_close(poisoned.float(), reference, atol=tol, rtol=tol)
     assert torch.equal(poisoned, clean)
+    if fill == "nan":
+        assert torch.equal(run("zero", mask_unowned_kv=False), clean)

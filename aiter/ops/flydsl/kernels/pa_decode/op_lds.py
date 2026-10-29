@@ -504,6 +504,8 @@ class PaDecodeKVLoader:
         P is zero there, but a NaN or infinite V scale still makes P * scale
         NaN. ``remaining`` counts valid tokens from the vector's first element.
         """
+        if const_expr(not self.traits.mask_unowned_kv):
+            return scales
         zero = fx.Float32(0.0)
         return fx.Vector.from_elements(
             [
@@ -557,9 +559,10 @@ class PaDecodeKVLoader:
                 + self.ctx.rgroup * MFMA_MNK
                 + self.ctx.lane16
             )
-            in_context = tile_tok < tile_valid
-            k_scale_scalar = in_context.select(k_scale_scalar, fx.Float32(0.0))
-            v_scale_scalar = in_context.select(v_scale_scalar, fx.Float32(0.0))
+            if const_expr(self.traits.mask_unowned_kv):
+                in_context = tile_tok < tile_valid
+                k_scale_scalar = in_context.select(k_scale_scalar, fx.Float32(0.0))
+                v_scale_scalar = in_context.select(v_scale_scalar, fx.Float32(0.0))
             slot = tile_tok * self.traits.f32
             self.lds.store(
                 self.traits.sKScale_off + buf_off + slot,
@@ -736,8 +739,14 @@ class PaDecodeKVLoader:
             for i in range_constexpr(self.traits.NVOPS)
         ]
 
-    @flyc.jit
     def tail_masks(self, tile_valid):
+        """V byte masks for mask_v_chunk; None when masking is disabled."""
+        if const_expr(not self.traits.mask_unowned_kv):
+            return None
+        return self._tail_masks(tile_valid)
+
+    @flyc.jit
+    def _tail_masks(self, tile_valid):
         # Only a sequence's last tile holds tokens at or past its context.
         masks = fx.full(self.traits.NVOPS, -1, fx.Int64)
         if tile_valid < self.traits.TILE_TOK:
@@ -757,7 +766,10 @@ class PaDecodeKVLoader:
 
         Their probabilities are exactly zero, but those rows may be pinned
         block-0 pages or unwritten tails holding NaN, and 0 * NaN is NaN in PV.
+        Disabled by ``mask_unowned_kv=False``, which returns ``v_ops`` as is.
         """
+        if const_expr(not self.traits.mask_unowned_kv):
+            return v_ops
         v = self._mask_v_chunk(
             fx.Vector.from_elements(
                 [v_ops[i] for i in range_constexpr(self.traits.NVOPS)],
