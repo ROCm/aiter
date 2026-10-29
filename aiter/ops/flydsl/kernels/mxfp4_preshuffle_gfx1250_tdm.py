@@ -1067,7 +1067,7 @@ def launch_gemm_a8w4_tdm(
 
         LdsAddr = namedtuple("LdsAddr", "a b sa sb")
 
-        def payload_lds_base(addr):
+        def lds_base(addr):
             # Hide the stage constant from address reassociation. Otherwise
             # LLVM can fold it into every load and materialize many full VGPR
             # addresses instead of one base plus DS offset immediates.
@@ -1085,13 +1085,13 @@ def launch_gemm_a8w4_tdm(
 
         def calc_payload_bases(slot):
             return (
-                payload_lds_base(
+                lds_base(
                     stC_idx
                     + A_LDS_OFF
                     + fx.Index(slot) * A_LDS_STAGE
                     + fx.index_cast(T.index, lds_a_lane_off)
                 ),
-                payload_lds_base(
+                lds_base(
                     stC_idx
                     + B_LDS_OFF
                     + fx.Index(slot) * B_LDS_STAGE
@@ -1099,32 +1099,37 @@ def launch_gemm_a8w4_tdm(
                 ),
             )
 
-        # Reuse constant-stage bases across iterations of the unrolled ring.
-        payload_bases = [calc_payload_bases(s) for s in range_constexpr(num_buffers)]
-
-        def calc_lds_addr(slot):
-            """Calculate the lane-specific LDS bases for one stage buffer."""
-            slot_idx = fx.Index(slot)
-            if const_expr(isinstance(slot, int)):
-                a_base, b_base = payload_bases[slot]
-            else:
-                a_base, b_base = calc_payload_bases(slot)
-            return LdsAddr(
-                a=a_base,
-                b=b_base,
-                sa=(
+        def calc_scale_bases(slot):
+            return (
+                lds_base(
                     stC_idx
                     + SA_LDS_OFF
-                    + slot_idx * SA_LDS_STAGE
+                    + fx.Index(slot) * SA_LDS_STAGE
                     + fx.index_cast(T.index, lds_sa_lane_off)
                 ),
-                sb=(
+                lds_base(
                     stC_idx
                     + SB_LDS_OFF
-                    + slot_idx * SB_LDS_STAGE
+                    + fx.Index(slot) * SB_LDS_STAGE
                     + fx.index_cast(T.index, lds_sb_lane_off)
                 ),
             )
+
+        # Materialize each constant-stage base in the prologue. KSL/operand
+        # offsets stay in DS immediates instead of rebuilding scale addresses
+        # inside the unrolled ring. Runtime-stage paths keep their fallback.
+        payload_bases = [calc_payload_bases(s) for s in range_constexpr(num_buffers)]
+        scale_bases = [calc_scale_bases(s) for s in range_constexpr(num_buffers)]
+
+        def calc_lds_addr(slot):
+            """Get the lane-specific LDS bases for one stage buffer."""
+            if const_expr(isinstance(slot, int)):
+                a_base, b_base = payload_bases[slot]
+                sa_base, sb_base = scale_bases[slot]
+            else:
+                a_base, b_base = calc_payload_bases(slot)
+                sa_base, sb_base = calc_scale_bases(slot)
+            return LdsAddr(a=a_base, b=b_base, sa=sa_base, sb=sb_base)
 
         def load_a(base, wm, ksl):
             off = (
@@ -1283,10 +1288,18 @@ def launch_gemm_a8w4_tdm(
                         )
 
         DS_A = 2 if a_is_fp4 else 4
-        DS_B = 2
+        # FP4 WMMA spans N32: load_b joins two halves, each with two b128 reads.
+        DS_B = 4 if a_is_fp4 else 2
         sb_pairs = output_n_rep // 2
         sa_pairs = (wmma_m_rep + 1) // 2
-        BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
+        # Packed scale b32 reads merge pairwise into native ds_load_2addr.
+        # Keep a conservative scalar-read count for the alternate A-scale
+        # addressing paths, where pairing is not guaranteed.
+        SA_DS = (
+            sa_pairs if row_major_ascale or tdm_as_in_prologue else ceildiv(sa_pairs, 2)
+        )
+        SB_DS = ceildiv(sb_pairs, 2)
+        BS_DS = wmma_n_rep * DS_B + SB_DS + SA_DS
         STATE_DS = wmma_m_rep * DS_A + BS_DS
 
         SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
@@ -1462,8 +1475,10 @@ def launch_gemm_a8w4_tdm(
                 has_next = ksl + 1 < kws or (
                     ksl + 1 == kws and next_stage_lds_addr is not None
                 )
-                if const_expr(ksl == 0):
-                    rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
+                if const_expr(ksl == 0 and not rmem_preloaded):
+                    # Initial operands must be loaded before their first MMA.
+                    # A carried slot needs no leading DS group.
+                    rocdl.sched_dsrd(STATE_DS)
                 # Keep one normal group for the LDS/TDM scheduling slots. Small
                 # tiles can have no more MFMAs than the requested fence tail.
                 tail_mfma = min(tail_mfma, max(0, n_acc - sched_mma_group))
@@ -1494,8 +1509,9 @@ def launch_gemm_a8w4_tdm(
                 for i in range_constexpr(schedule_slots):
                     if const_expr(tdm_schedule[i] > 0):
                         rocdl.sched_vmem(tdm_schedule[i])
-                    # Compute with the current slot before refilling the other
-                    # slot, whose scales were just read by the previous k128.
+                    # Compute the first MMA group before starting the DS reads.
+                    # STATE_DS must still cover all native reads so payload
+                    # loads cannot escape the intended scheduling groups.
                     rocdl.sched_mfma(mma_groups[i])
                     if const_expr(i == 0 and first_ds > 0):
                         rocdl.sched_dsrd(first_ds)
