@@ -9,7 +9,7 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from ..jit.utils.chip_info import get_gfx, get_gfx_runtime
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
 
@@ -343,8 +343,6 @@ def biased_grouped_topk(
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_valid_rows: torch.Tensor | None = None,  # see topk_gating
 ):
-    token_num = gating_output.shape[0]
-    num_experts = gating_output.shape[1]
     if (
         num_expert_group == 1
         and topk_group == 1
@@ -388,34 +386,19 @@ def biased_grouped_topk(
             routed_scaling_factor,
             num_valid_rows,
         )
-    cu_num = get_cu_num()
-    if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
-        return biased_grouped_topk_hip(
-            gating_output,
-            correction_bias,
-            topk_weights,
-            topk_ids,
-            num_expert_group,
-            topk_group,
-            need_renorm,
-            routed_scaling_factor,
-            num_valid_rows,
-        )
-    else:
-        topk = topk_ids.shape[1]
-        assert need_renorm, "Renormalization is required for moe_fused_gate."
-        return moe_fused_gate(
-            gating_output,
-            correction_bias,
-            topk_weights,
-            topk_ids,
-            num_expert_group,
-            topk_group,
-            topk,
-            n_share_experts_fusion=0,
-            routed_scaling_factor=routed_scaling_factor,
-            num_valid_rows=num_valid_rows,
-        )
+    # Not moe_fused_gate: it leaves routed_scaling_factor to the caller, as in
+    # sglang, and measured slower than this kernel at every row count.
+    return biased_grouped_topk_hip(
+        gating_output,
+        correction_bias,
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        need_renorm,
+        routed_scaling_factor,
+        num_valid_rows,
+    )
 
 
 # this one copied from sglang
