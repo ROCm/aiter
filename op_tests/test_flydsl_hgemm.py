@@ -410,7 +410,7 @@ def main():
     )
     args = parser.parse_args()
     wanted = set(args.mnk)
-    if wanted == set(_default_mnk()):
+    if wanted == set(parser.get_default("mnk")):
         check_shape_limits()
         check_input_span()
         check_strided_out()

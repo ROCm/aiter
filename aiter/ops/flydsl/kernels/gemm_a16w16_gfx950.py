@@ -1487,6 +1487,14 @@ def get_split_k_buffers(stream, device, split_k):
     return semaphore, signal
 
 
+def _is_strided_view(tensor):
+    rows, cols = tensor.shape
+    row_stride, col_stride = tensor.stride()
+    packed_row_major = col_stride == 1 and row_stride == cols
+    packed_col_major = row_stride == 1 and col_stride == rows
+    return not (packed_row_major or packed_col_major)
+
+
 def _span_bytes(tensor):
     last = sum(
         (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
@@ -1639,9 +1647,13 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
-    # A and B are read through flat buffer descriptors with i32 offsets.
+    # A and B are read through flat buffer descriptors with i32 offsets. The shape
+    # check bounds packed operands; a strided view (e.g. a column slice) spans more.
     for name, operand in (("A", a), ("B", b)):
-        if operand.numel() and _span_bytes(operand) >= GFX950_FLAT_BUFFER_LIMIT_BYTES:
+        if (
+            _is_strided_view(operand)
+            and _span_bytes(operand) >= GFX950_FLAT_BUFFER_LIMIT_BYTES
+        ):
             raise ValueError(
                 f"{name} must span less than 4 GiB; got shape={tuple(operand.shape)} "
                 f"and stride={operand.stride()}"
