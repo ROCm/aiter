@@ -14,10 +14,10 @@ from unittest.mock import patch
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops import mhc as mhc_api
 from aiter.ops.mhc import (
     _mhc_post_pre_gfx950_supported,
     mhc_fused_post_pre,
-    mhc_pack_fn_gfx950,
     mhc_shuffle_fn,
 )
 from aiter.test_common import checkAllclose, run_perftest
@@ -95,67 +95,94 @@ def check(actual, expected):
         torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-2)
 
 
-def test_case(m, seed):
-    args, kwargs = inputs(m, seed=seed)
-    assert _mhc_post_pre_gfx950_supported(*args, kwargs["norm_weight"])
-    packed = torch.empty_like(args[4], dtype=torch.int32)
-    mhc_pack_fn_gfx950(packed, args[4])
-    torch.testing.assert_close(
-        packed, mhc_shuffle_fn(args[4], arch="gfx950"), rtol=0, atol=0
+def call_inputs(args, kwargs, packed):
+    call_args = (*args[:4], mhc_shuffle_fn(args[4]) if packed else args[4], *args[5:])
+    return call_args, dict(kwargs, w_preshuffle_bf16=packed)
+
+
+def upstream_dispatch():
+    return patch(
+        "aiter.ops.mhc._mhc_post_pre_gfx950_supported",
+        new=lambda *args, **kwargs: False,
     )
-    saved_inputs = tuple(t.clone() for t in args)
+
+
+def test_case(m, seed, packed):
+    args, kwargs = inputs(m, seed=seed)
+    call_args, options = call_inputs(args, kwargs, packed)
+    assert _mhc_post_pre_gfx950_supported(*call_args, kwargs["norm_weight"], packed)
+    saved_inputs = tuple(t.clone() for t in call_args)
     saved_norm = kwargs["norm_weight"].clone()
-    out = mhc_fused_post_pre(*args, **kwargs)
+    out = mhc_fused_post_pre(*call_args, **options)
     check(out, reference(*args, **kwargs))
     saved_out = tuple(t.clone() for t in out)
-    for got, want in zip(args, saved_inputs):
+    for got, want in zip(call_args, saved_inputs):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     torch.testing.assert_close(kwargs["norm_weight"], saved_norm, rtol=0, atol=0)
 
     # New weights in the same allocation must be read on the next call.
     args[4].mul_(0.5)
     args[0].add_(0.1)
+    if packed:
+        call_args[4].copy_(mhc_shuffle_fn(args[4]))
     for repeat in (1, 7, 20):
-        options = dict(
-            kwargs,
-            sinkhorn_repeat=repeat,
-            hc_post_mult_value=2.0,
-            rms_eps=3e-6,
-            norm_eps=2e-6,
+        variants = {
+            "sinkhorn_repeat": repeat,
+            "hc_post_mult_value": 2.0,
+            "rms_eps": 3e-6,
+            "norm_eps": 2e-6,
+        }
+        check(
+            mhc_fused_post_pre(*call_args, **options, **variants),
+            reference(*args, **kwargs, **variants),
         )
-        check(mhc_fused_post_pre(*args, **options), reference(*args, **options))
+    # Both supported post_mix ranks describe the same values.
+    post_2d = (*call_args[:2], call_args[2].squeeze(-1), *call_args[3:])
+    check(mhc_fused_post_pre(*post_2d, **options), reference(*args, **kwargs))
     for got, want in zip(out, saved_out):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
-    # Capture only after all JIT compilation has finished.
+    # Capture only after all JIT compilation has finished. Refresh caller-packed
+    # weights outside capture, in their original allocation, before replay.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        mhc_fused_post_pre(*args, **kwargs)
+        mhc_fused_post_pre(*call_args, **options)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        captured = mhc_fused_post_pre(*args, **kwargs)
+        captured = mhc_fused_post_pre(*call_args, **options)
     args[4].mul_(0.75)
     args[1].add_(0.05)
+    if packed:
+        call_args[4].copy_(mhc_shuffle_fn(args[4]))
     graph.replay()
     torch.cuda.synchronize()
     check(captured, reference(*args, **kwargs))
-    print(f"m={m}, seed={seed}: correctness/state/graph PASS")
+    print(f"m={m}, seed={seed}, packed={packed}: correctness/state/graph PASS")
 
 
 def check_fallback(args, kwargs):
-    assert not _mhc_post_pre_gfx950_supported(*args, kwargs.get("norm_weight"))
-    # Disable the new branch to call the unmodified upstream dispatch. Check its
-    # existing behavior rather than impose a new layout or precision contract.
-    with patch(
-        "aiter.ops.mhc._mhc_post_pre_gfx950_supported",
-        new=lambda *args, **kwargs: False,
-    ):
-        expected = mhc_fused_post_pre(*args, **kwargs)
-    actual = mhc_fused_post_pre(*args, **kwargs)
-    for got, want in zip(actual, expected):
-        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    # Compare existing outputs or ValueError behavior exactly; unsupported Gluon
+    # requests can raise, while large-M unfused dispatch precedes backend choice.
+    with upstream_dispatch():
+        try:
+            expected = mhc_fused_post_pre(*args, **kwargs)
+        except ValueError as error:
+            expected_error = str(error)
+        else:
+            expected_error = None
+    if expected_error is not None:
+        try:
+            mhc_fused_post_pre(*args, **kwargs)
+        except ValueError as error:
+            assert str(error) == expected_error
+        else:
+            raise AssertionError("expected the upstream ValueError")
+    else:
+        actual = mhc_fused_post_pre(*args, **kwargs)
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 def test_fallbacks(seed):
@@ -165,55 +192,103 @@ def test_fallbacks(seed):
         (64, 7168, torch.float16),
     ):
         args, kwargs = inputs(m, hidden, dtype, seed)
+        assert not _mhc_post_pre_gfx950_supported(*args, kwargs["norm_weight"])
         check_fallback(args, kwargs)
     args, kwargs = inputs(64, seed=seed)
     # Native post/pre uses x.stride(0); the inner stride remains one.
     x = torch.empty((64, 7168 + 8), dtype=args[0].dtype, device="cuda")[:, :7168]
     x.copy_(args[0])
+    assert not _mhc_post_pre_gfx950_supported(x, *args[1:], kwargs["norm_weight"])
     check_fallback((x, *args[1:]), kwargs)
     check_fallback(args, {})
     print("fallback shape/dtype/layout/no-norm equivalence PASS")
 
 
+def test_routing(m, seed):
+    args, kwargs = inputs(m, seed=seed)
+    for packed in (False, True):
+        call_args, options = call_inputs(args, kwargs, packed)
+        for force_fused in (False, True):
+            for backend in (None, "hip", "gluon"):
+                config = dict(options, force_fused=force_fused, backend=backend)
+                selected = (
+                    not force_fused and backend != "gluon" and (m == 64 or packed)
+                )
+                with patch(
+                    "aiter.ops.mhc._mhc_post_pre_gfx950",
+                    wraps=mhc_api._mhc_post_pre_gfx950,
+                ) as implementation:
+                    if selected:
+                        check(
+                            mhc_fused_post_pre(*call_args, **config),
+                            reference(*args, **kwargs),
+                        )
+                    else:
+                        check_fallback(call_args, config)
+                    assert implementation.call_count == int(selected), config
+    print(f"m={m}: precision/force_fused/backend routing PASS")
+
+
 def test_small_values(seed):
-    for amplitude in (0.0, 1e-5):
-        args, kwargs = inputs(64, seed=seed)
-        args[0].mul_(amplitude)
-        args[1].mul_(amplitude)
-        args[5].fill_(0.1 if amplitude else 0.0)
-        args[6].fill_(0.01 if amplitude else 0.0)
-        check(mhc_fused_post_pre(*args, **kwargs), reference(*args, **kwargs))
+    for packed in (False, True):
+        for amplitude in (0.0, 1e-5):
+            args, kwargs = inputs(64, seed=seed)
+            args[0].mul_(amplitude)
+            args[1].mul_(amplitude)
+            args[5].fill_(0.1 if amplitude else 0.0)
+            args[6].fill_(0.01 if amplitude else 0.0)
+            call_args, options = call_inputs(args, kwargs, packed)
+            check(mhc_fused_post_pre(*call_args, **options), reference(*args, **kwargs))
     print("zero/near-zero finite RMSNorm and epsilon checks PASS")
 
 
-def benchmark_case(m, seed):
+def error_metrics(actual, expected):
+    result = {}
+    for name, got, want in zip(
+        ("post", "comb", "layer_output", "next_residual"), actual, expected
+    ):
+        delta = (got.float() - want.float()).abs()
+        result[name] = {
+            "max_abs": delta.max().item(),
+            "rms_abs": delta.square().mean().sqrt().item(),
+            "max_relative_floor_1e_minus_6": (
+                delta / want.float().abs().clamp_min(1e-6)
+            )
+            .max()
+            .item(),
+            "outside_public_tolerance": int(
+                (delta > 1e-2 + 1e-2 * want.float().abs()).sum().item()
+            ),
+        }
+    return result
+
+
+def benchmark_case(m, seed, packed, force_fused):
     args, kwargs = inputs(m, seed=seed)
+    call_args, options = call_inputs(args, kwargs, packed)
+    options.update(force_fused=force_fused, backend="hip")
     expected = reference(*args, **kwargs)
     rows = []
+    outputs = {}
     for cycle in range(3):
         order = (
             ("upstream", "optimized") if cycle % 2 == 0 else ("optimized", "upstream")
         )
         for position, implementation in enumerate(order):
             guard = (
-                patch(
-                    "aiter.ops.mhc._mhc_post_pre_gfx950_supported",
-                    new=lambda *args, **kwargs: False,
-                )
-                if implementation == "upstream"
-                else nullcontext()
+                upstream_dispatch() if implementation == "upstream" else nullcontext()
             )
             with guard:
                 for _ in range(2):
-                    output = mhc_fused_post_pre(*args, **kwargs)
+                    output = mhc_fused_post_pre(*call_args, **options)
                 torch.cuda.synchronize()
                 check(output, expected)
                 if m == 64:
-                    # One captured public call includes all kernels, weight
-                    # packing where applicable, and the four returned outputs.
+                    # One captured complete public call. Explicit caller weight
+                    # prepacking is outside timing for both implementations.
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
-                        output = mhc_fused_post_pre(*args, **kwargs)
+                        output = mhc_fused_post_pre(*call_args, **options)
                     _, us = run_perftest(
                         graph.replay,
                         num_iters=101,
@@ -225,8 +300,8 @@ def benchmark_case(m, seed):
                 else:
                     output, us = run_perftest(
                         mhc_fused_post_pre,
-                        *args,
-                        **kwargs,
+                        *call_args,
+                        **options,
                         num_iters=101,
                         num_warmup=2,
                         num_rotate_args=1,
@@ -235,10 +310,10 @@ def benchmark_case(m, seed):
                     method = "cuda_events_graph_disabled"
                 torch.cuda.synchronize()
                 check(output, expected)
+                if cycle == 0:
+                    outputs[implementation] = tuple(t.clone() for t in output)
             rows.append(
                 {
-                    "m": m,
-                    "seed": seed,
                     "cycle": cycle + 1,
                     "position": position + 1,
                     "implementation": implementation,
@@ -255,15 +330,35 @@ def benchmark_case(m, seed):
     return {
         "m": m,
         "seed": seed,
+        "mode": ("prepacked_hilo" if packed else "fp32")
+        + ("_force_fused" if force_fused else "_default"),
+        "flags": {
+            "w_preshuffle_bf16": packed,
+            "force_fused": force_fused,
+            "backend": "hip",
+            "res_preshuffle": False,
+        },
+        "optimized_specialization": not force_fused and (m == 64 or packed),
         "cycles": rows,
         "median_us": medians,
         "speedup": medians["upstream"] / medians["optimized"],
         "latency_reduction_pct": 100 * (1 - medians["optimized"] / medians["upstream"]),
+        "reference_errors": {
+            name: error_metrics(out, expected) for name, out in outputs.items()
+        },
+        "optimized_vs_upstream_errors": error_metrics(
+            outputs["optimized"], outputs["upstream"]
+        ),
     }
 
 
 def benchmark_cases(ms, seed, output_path):
-    records = [benchmark_case(m, seed) for m in ms]
+    records = [
+        benchmark_case(m, seed, packed, force_fused)
+        for m in ms
+        for packed in (False, True)
+        for force_fused in ((False, True) if m == 8192 else (False,))
+    ]
     repo = Path(__file__).resolve().parents[1]
     paths = (
         "aiter/ops/mhc.py",
@@ -279,8 +374,10 @@ def benchmark_cases(ms, seed, output_path):
         "gfx": get_gfx_runtime(),
         "torch": torch.__version__,
         "hip": torch.version.hip,
-        "scope": "same-process current upstream dispatch vs optimized full public call",
+        "scope": "same-process current upstream dispatch vs adapted full public call, matched flags per row",
         "input_distribution": "seeded normal synthetic inputs; FP32 scale/base multiplied by 0.1",
+        "reference": "PyTorch FP32 math with contract BF16 residual/output rounding",
+        "prepacking": "mhc_shuffle_fn outside timing for both implementations in explicit packed mode",
         "timing": "3 alternating-order cycles; 101 event-timed calls per cycle; 2 warmups; fixed inputs",
         "files_sha256": {
             name: hashlib.sha256((repo / name).read_bytes()).hexdigest()
@@ -294,7 +391,9 @@ def benchmark_cases(ms, seed, output_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-m", type=int, nargs="+", default=[64, 8192])
+    parser.add_argument(
+        "-m", type=int, nargs="+", choices=(64, 8192), default=[64, 8192]
+    )
     parser.add_argument("--seed", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument(
         "--benchmark-json",
@@ -307,8 +406,11 @@ if __name__ == "__main__":
     else:
         for seed in args.seed:
             for m in args.m:
-                test_case(m, seed)
+                for packed in ((False, True) if m == 64 else (True,)):
+                    test_case(m, seed, packed)
         test_fallbacks(args.seed[0])
+        for m in args.m:
+            test_routing(m, args.seed[0])
         test_small_values(args.seed[0])
         if args.benchmark_json:
             benchmark_cases(args.m, args.seed[0], args.benchmark_json)

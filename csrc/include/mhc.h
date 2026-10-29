@@ -83,7 +83,6 @@ void mhc_fused_post_pre_gemm_sqrsum(aiter_tensor_t& gemm_out_mul,    // (split_k
                                     int w_preshuffle_bf16 = 0,
                                     int res_preshuffle = 0); // shuffled residuals require gfx1250
 // gfx950 post/pre specialization. All buffers are owned by the current call.
-void mhc_pack_fn_gfx950(aiter_tensor_t& out, aiter_tensor_t& fn);
 void mhc_post_project_gfx950(aiter_tensor_t& projection,
                              aiter_tensor_t& sq,
                              aiter_tensor_t& next_residual,

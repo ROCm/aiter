@@ -50,38 +50,6 @@ __device__ __forceinline__ float col_sum(float x)
 }
 
 using bf8 = unsigned short __attribute__((ext_vector_type(8)));
-__device__ __forceinline__ unsigned short bf16_rn(float x)
-{
-    unsigned u = __float_as_uint(x);
-    if((u & 0x7fffffffU) > 0x7f800000U)
-        return (u >> 16) | 0x40U;
-    return (u + 0x7fffU + ((u >> 16) & 1U)) >> 16;
-}
-
-__global__ void
-pack_kb8(const float* __restrict__ in, uint4* __restrict__ out, int blocks, int k8, int stride)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if(i >= blocks)
-        return;
-    const int n = i / k8, k = (i % k8) * 8;
-    const float4 a   = *reinterpret_cast<const float4*>(in + n * stride + k);
-    const float4 b   = *reinterpret_cast<const float4*>(in + n * stride + k + 4);
-    const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-    unsigned h[4], l[4];
-#pragma unroll
-    for(int j = 0; j < 4; ++j)
-    {
-        const unsigned h0 = bf16_rn(v[2 * j]), h1 = bf16_rn(v[2 * j + 1]);
-        const unsigned l0 = bf16_rn(v[2 * j] - __uint_as_float(h0 << 16));
-        const unsigned l1 = bf16_rn(v[2 * j + 1] - __uint_as_float(h1 << 16));
-        h[j]              = h0 | (h1 << 16);
-        l[j]              = l0 | (l1 << 16);
-    }
-    out[2 * i]     = make_uint4(h[0], h[1], h[2], h[3]);
-    out[2 * i + 1] = make_uint4(l[0], l[1], l[2], l[3]);
-}
-
 __device__ __forceinline__ float rounded_cross_row_sum_4(float value, int lane)
 {
     value += __builtin_bit_cast(
@@ -778,20 +746,6 @@ void check_tensor(const aiter_tensor_t& t,
                 "mHC gfx950: tensor pointer must be 16-byte aligned");
 }
 } // namespace
-
-void mhc_pack_fn_gfx950(aiter_tensor_t& out, aiter_tensor_t& fn)
-{
-    const HipDeviceGuard guard(fn.device_id);
-    AITER_CHECK(get_gpu_arch() == "gfx950", "mHC packed producer requires gfx950");
-    check_tensor(fn, AITER_DTYPE_fp32, fn.device_id, {24, 28672});
-    check_tensor(out, AITER_DTYPE_i32, fn.device_id, {24, 28672});
-#if defined(__gfx950__) || !defined(__HIP_DEVICE_COMPILE__)
-    constexpr int blocks = 24 * (28672 / 8);
-    mhc_gfx950::pack_kb8<<<(blocks + 255) / 256, 256, 0, getCurrentHIPStream()>>>(
-        static_cast<const float*>(fn.ptr), static_cast<uint4*>(out.ptr), blocks, 28672 / 8, 28672);
-    HIP_CALL_LAUNCH(hipGetLastError());
-#endif
-}
 
 void mhc_post_project_gfx950(aiter_tensor_t& projection,
                              aiter_tensor_t& sq,

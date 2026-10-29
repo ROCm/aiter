@@ -8,7 +8,6 @@
 PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     MHC_PYBIND;
-    m.def("mhc_pack_fn_gfx950", &aiter::mhc_pack_fn_gfx950, py::arg("out"), py::arg("fn"));
     m.def("mhc_post_project_gfx950",
           &aiter::mhc_post_project_gfx950,
           py::arg("projection"),

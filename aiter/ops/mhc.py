@@ -988,10 +988,6 @@ def _mhc_fused_post_pre_gluon(
 
 
 @compile_ops("module_mhc", develop=True)
-def mhc_pack_fn_gfx950(out: Tensor, fn: Tensor) -> None: ...
-
-
-@compile_ops("module_mhc", develop=True)
 def mhc_post_project_gfx950(
     projection: Tensor,
     sq: Tensor,
@@ -1033,18 +1029,19 @@ def _mhc_post_pre_gfx950_supported(
     scale: Tensor,
     base: Tensor,
     norm_weight: Tensor | None,
+    w_preshuffle_bf16: bool = False,
 ) -> bool:
-    # Only the measured BF16 plain-layout configurations select this path.
+    # Only the supported BF16 plain-layout configurations select this path.
     # Other shapes, dtypes and views keep the existing dispatch.
     m = layer_input.shape[0]
-    if m not in (64, 8192) or norm_weight is None:
+    if norm_weight is None or not (m == 64 or (m == 8192 and w_preshuffle_bf16)):
         return False
     expected = (
         (layer_input, (m, 7168), torch.bfloat16),
         (residual, (m, 4, 7168), torch.bfloat16),
         (post_mix, (m, 4, 1) if post_mix.ndim == 3 else (m, 4), torch.float32),
         (comb_mix, (m, 4, 4), torch.float32),
-        (fn, (24, 28672), torch.float32),
+        (fn, (24, 28672), torch.int32 if w_preshuffle_bf16 else torch.float32),
         (scale, (3,), torch.float32),
         (base, (24,), torch.float32),
         (norm_weight, (7168,), torch.bfloat16),
@@ -1075,6 +1072,7 @@ def _mhc_post_pre_gfx950(
     repeats: int,
     norm_weight: Tensor,
     norm_eps: float,
+    w_preshuffle_bf16: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     m = layer_input.shape[0]
     splits = 56 if m == 64 else 4
@@ -1088,7 +1086,7 @@ def _mhc_post_pre_gfx950(
     out = torch.empty_like(layer_input)
     post_mix = post_mix.reshape(m, 4)
     if m == 64:
-        # Preserve the native FP32 decode producer.
+        # Preserve the native producer and the caller's projection precision.
         mhc_fused_post_pre_gemm_sqrsum(
             projection,
             sq,
@@ -1101,18 +1099,17 @@ def _mhc_post_pre_gfx950(
             16,
             32,
             32,
+            w_preshuffle_bf16=int(w_preshuffle_bf16),
         )
     else:
-        # Pack the current weights on every invocation, including graph replay.
-        packed_fn = torch.empty_like(fn, dtype=torch.int32)
-        mhc_pack_fn_gfx950(packed_fn, fn)
+        # Consume the caller's explicit mhc_shuffle_fn layout on every call.
         mhc_post_project_gfx950(
             projection_pad,
             sq,
             next_residual,
             layer_input,
             residual,
-            packed_fn,
+            fn,
             post_mix,
             comb_mix,
         )
@@ -1181,9 +1178,11 @@ def mhc_fused_post_pre(
 
     Both flags are boolean, default to False, and are controlled independently.
 
-    On gfx950, BF16 plain-layout calls with M=64 or 8192, hidden size 7168,
-    four residual streams and RMSNorm use the row-fused finalizer. The M=8192
-    path also packs the current FP32 weights and fuses post with projection.
+    On gfx950, BF16 plain-layout calls with hidden size 7168, four residual
+    streams and RMSNorm can use the row-fused finalizer. This applies to M=64
+    in either projection mode, and M=8192 with explicit w_preshuffle_bf16=True
+    and fn from mhc_shuffle_fn. The latter also fuses post with projection. Default
+    FP32 prefill and explicit force_fused requests keep the existing paths.
     Unsupported tensor layouts and dtypes keep the existing implementation.
 
     A shuffled residual (gfx1250, 0 < m < the fused bound) of a hidden size in
@@ -1211,7 +1210,7 @@ def mhc_fused_post_pre(
     if (
         arch == "gfx950"
         and backend in (None, "hip")
-        and not w_preshuffle_bf16
+        and not force_fused
         and not res_preshuffle
         and sinkhorn_repeat > 0
         and _mhc_post_pre_gfx950_supported(
@@ -1223,6 +1222,7 @@ def mhc_fused_post_pre(
             hc_scale,
             hc_base,
             norm_weight,
+            w_preshuffle_bf16,
         )
     ):
         return _mhc_post_pre_gfx950(
@@ -1240,6 +1240,7 @@ def mhc_fused_post_pre(
             sinkhorn_repeat,
             norm_weight,
             norm_eps,
+            w_preshuffle_bf16,
         )
 
     # At the shared bound the input is already in ordinary layout.
