@@ -991,6 +991,8 @@ def gemm_a16w16(
     Setting a tile or pipeline key (``_STRUCTURAL_KEYS``) also drops that
     config's pipeline flags and split-K, so the caller's tile runs the async
     pipeline without split-K unless ``user_kwargs`` sets them too.
+    Padded row strides are supported when each operand's base address and row
+    stride preserve the kernel's 16-byte global-load alignment.
     """
     if bias is not None:
         raise NotImplementedError("gfx942 GEMM bias fusion is not implemented yet")
@@ -1018,6 +1020,13 @@ def gemm_a16w16(
             "the nt layout needs a row-major (a.stride(1) == 1) and b column-major "
             f"(b.stride(0) == 1); got strides {a.stride()} and {b.stride()}"
         )
+    for name, tensor, leading_dim in (("a", a, 0), ("b", b, 1)):
+        row_stride_bytes = tensor.stride(leading_dim) * tensor.element_size()
+        if tensor.data_ptr() % 16 != 0 or row_stride_bytes % 16 != 0:
+            raise ValueError(
+                f"{name} must have a 16-byte-aligned base address and row stride; "
+                f"got address {tensor.data_ptr():#x} and {row_stride_bytes} bytes"
+            )
 
     current = torch.cuda.current_stream()
     if stream is None:

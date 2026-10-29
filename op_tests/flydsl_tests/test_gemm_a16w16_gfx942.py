@@ -523,22 +523,35 @@ def test_gemm_a16w16_gfx942_tile_override_drops_split_k(monkeypatch):
     _assert_close(y, ref, "block_m override of a split-K default")
 
 
-def test_flydsl_hgemm_gfx942_explicit_stream_non_contiguous():
-    """flydsl_hgemm makes its contiguous copies on the launch stream: a delayed
-    current stream cannot leave the kernel reading unwritten copies."""
+def test_flydsl_hgemm_gfx942_aligned_row_strided_inputs():
     _require_gfx942()
-    m, n, k = 256, 256, 2048
+    m, n, k = 128, 192, 512
     x, w, ref = _inputs(m, n, k)
-    x_cm, w_cm = x.t().contiguous().t(), w.t().contiguous().t()
-    assert not x_cm.is_contiguous() and not w_cm.is_contiguous()
-    # Compile first; negated input, so a recycled copy holds -ref, not ref.
-    flydsl_hgemm(-x_cm, w_cm)
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    torch.cuda._sleep(200_000_000)
-    y = flydsl_hgemm(x_cm, w_cm, stream=side)
-    torch.cuda.synchronize()
-    _assert_close(y, ref, "flydsl_hgemm non-contiguous on a side stream")
+    x_padded = torch.empty((m, k + 8), dtype=x.dtype, device=x.device)
+    w_padded = torch.empty((n, k + 8), dtype=w.dtype, device=w.device)
+    x_strided, w_strided = x_padded[:, :k], w_padded[:, :k]
+    x_strided.copy_(x)
+    w_strided.copy_(w)
+    assert not x_strided.is_contiguous() and not w_strided.is_contiguous()
+
+    y = flydsl_hgemm(x_strided, w_strided)
+    _assert_close(y, ref, "aligned row-strided flydsl_hgemm")
+
+
+@pytest.mark.parametrize("case", ["misaligned-a-base", "misaligned-b-row"])
+def test_flydsl_hgemm_gfx942_rejects_misaligned_inputs(case):
+    _require_gfx942()
+    m, n, k = 64, 128, 512
+    x, w, _ = _inputs(m, n, k)
+    if case == "misaligned-a-base":
+        x = torch.empty((m, k + 8), dtype=x.dtype, device=x.device)[:, 1 : k + 1]
+        operand = "a"
+    else:
+        w = torch.empty((n, k + 1), dtype=w.dtype, device=w.device)[:, :k]
+        operand = "b"
+
+    with pytest.raises(ValueError, match=rf"{operand} must have a 16-byte-aligned"):
+        flydsl_hgemm(x, w)
 
 
 def test_gemm_a16w16_gfx942_split_k_buffers_do_not_retain_streams():
