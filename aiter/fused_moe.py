@@ -2915,8 +2915,15 @@ def _mxfp4_a4w4_stage1_fw(
         and a1_scale is not None
     )
     if p1["a_dtype"] == "fp8" or prequantized:
+        # Already quantized: hand the kernel its input directly. This must be
+        # checked before inline_quant, which fp8 a_dtype also sets.
         a_quant = hidden_states
         a_scale = a1_scale
+    elif inline_quant:
+        # gemm1 quantizes straight into LDS; the global staging buffers are unread,
+        # exactly like a_scale_sorted_shuffled in _mxfp4_a4w4_stage1.
+        a_quant = _empty_u8(device)
+        a_scale = _empty_u8(device)
     else:
         a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
         a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
