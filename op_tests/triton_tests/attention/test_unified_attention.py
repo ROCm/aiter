@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
@@ -547,6 +548,242 @@ def test_triton_unified_attn_3d(
         )
         <= tol_err_ratio
     )
+
+
+@pytest.mark.parametrize("captured_max_seqlen_k", [False, True])
+@torch.inference_mode()
+def test_triton_unified_attn_3d_long_kv(captured_max_seqlen_k: bool) -> None:
+    """Split-KV verify on the Kimi-K3 DSpark draft shape (head dim 64, bf16 Q, fp8 KV).
+
+    max_seqlen_k is the real maximum (20000) or the 1M bound a CUDA graph captures.
+    """
+    if DEVICE_ARCH not in ("gfx950", "gfx1250"):
+        pytest.skip(f"skip {DEVICE_ARCH}")
+    torch.cuda.empty_cache()
+    seq_lens = [(4, 20000), (4, 9000), (4, 300), (4, 13000)]
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=1024,
+        block_size=128,
+        head_size=64,
+        num_heads=(8, 2),
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=1 << 20 if captured_max_seqlen_k else max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    # Long-KV rows average many tokens and stay small (|out| <= ~0.03 at 20k KV), so
+    # a fixed atol would pass all-zero rows. Bound each request's relative L2 error
+    # instead: gfx950 measures ~0.0025, and dropping one 64-token KV tile gives ~0.06.
+    start = 0
+    for q_len, kv_len in seq_lens:
+        out_rows = output[start : start + q_len].float()
+        ref_rows = ref_output[start : start + q_len].float()
+        start += q_len
+        rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
+        assert rel_err < 2e-2, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+
+
+def _length_aware_seq_lens(batch: str, query_len: int):
+    if batch in ("skewed", "skewed_300"):
+        # one long request among short ones, as a long-context draft batch; 300
+        # requests take more than one step over seq_lens in the kernels
+        rng = random.Random(7)
+        short = [
+            rng.randint(200, 3000) for _ in range(31 if batch == "skewed" else 299)
+        ]
+        return [(query_len, 120_000)] + [(query_len, kv) for kv in short]
+    return [(query_len, 8192)] * 32
+
+
+@pytest.mark.parametrize(
+    "batch, num_heads, max_query_len, use_sinks",
+    [
+        (batch, *shape)
+        for shape in [
+            ((8, 2), 4, False),  # Kimi-K3 DSpark draft verify
+            ((8, 2), 1, False),
+            ((8, 1), 1, True),  # GPT-OSS TP8 full-attention decode
+        ]
+        for batch in ["skewed", "uniform"]
+    ]
+    + [("skewed_300", (8, 2), 1, False)],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_3d_length_aware_split(
+    batch: str,
+    num_heads: tuple[int, int],
+    max_query_len: int,
+    use_sinks: bool,
+    monkeypatch,
+) -> None:
+    """Length-aware KV split (kv_split SPLIT_PROGRAMS_PER_CU), head dim 64 bf16-Q / fp8-KV.
+
+    max_seqlen_k is the 1M bound a CUDA graph captures, so the grid's segment
+    count only knows the batch size; each sequence must take its own share of
+    the segments from seqused_k, and the reduce must merge exactly those.
+    """
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("the length-aware kv_split entry is tuned for gfx950")
+    torch.cuda.empty_cache()
+    block_size = 128
+    seq_lens = _length_aware_seq_lens(batch, max_query_len)
+    max_blocks = max(triton.cdiv(kv, block_size) for _, kv in seq_lens)
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        _,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=max_blocks * len(seq_lens),
+        block_size=block_size,
+        head_size=64,
+        num_heads=num_heads,
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+    )
+
+    # record the split the launcher picks
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    launch_3d = module._unified_attention_3d_triton
+
+    def spy(params, *args):
+        launches.append(args[3:])  # NUM_SEGMENTS, TILE_SIZE, split_budget
+        return launch_3d(params, *args)
+
+    monkeypatch.setattr(module, "_unified_attention_3d_triton", spy)
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=1 << 20,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks if use_sinks else None,
+    )
+
+    # the split is length-aware, and the per-sequence counts (the kernels'
+    # seq_num_segments) differ from the cap the grid was sized for
+    assert len(launches) == 1, "expected the 3D split-KV path"
+    num_segments, _, split_budget = launches[0]
+    assert num_segments > 1 and split_budget is not None
+    kv = [k for _, k in seq_lens]
+    segment_tokens = max(triton.cdiv(sum(kv), split_budget), 1)
+    used = [min(max(k // segment_tokens, 1), num_segments) for k in kv]
+    assert sum(used) <= split_budget + len(kv)
+    if batch != "uniform":
+        assert used[0] > max(used[1:]) and min(used) < num_segments, used
+    else:
+        assert len(set(used)) == 1 and used[0] < num_segments, used
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sinks=sinks if use_sinks else None,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    # relative L2 per request, as in test_triton_unified_attn_3d_long_kv: a dropped
+    # or doubly merged segment moves it far past the bound
+    start = 0
+    for q_len, kv_len in seq_lens:
+        out_rows = output[start : start + q_len].float()
+        ref_rows = ref_output[start : start + q_len].float()
+        start += q_len
+        rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
+        assert rel_err < 2e-2, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
 
 
 @pytest.mark.parametrize(
