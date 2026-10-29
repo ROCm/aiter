@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+#
+# BASE + lm-eval, for `e2e.sh eval` on an image that has none (the aiter-main baseline).
+#
+#   docker build -t vllm-aiter-main-eval --build-arg BASE=vllm-aiter-main -f Dockerfile.lm-eval .
+#
+# Only adds the lm-eval venv, the same one Dockerfile.vllm-fork installs; the
+# aiter and vLLM in BASE are untouched.
+
+ARG BASE=vllm-aiter-main
+FROM ${BASE}
+
+ARG LM_EVAL_VERSION=0.4.13
+RUN (python3 -m venv --system-site-packages /opt/lm-eval \
+     || { pip install virtualenv && python3 -m virtualenv --system-site-packages /opt/lm-eval; }) \
+    && /opt/lm-eval/bin/pip install "lm-eval[api]==${LM_EVAL_VERSION}" \
+    && /opt/lm-eval/bin/lm_eval --help >/dev/null \
+    && python3 -c "import vllm; print('vllm', vllm.__version__)"

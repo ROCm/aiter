@@ -4,7 +4,7 @@
 #
 #   ./e2e.sh build             # build both images from ./Dockerfile
 #   ./e2e.sh build-fork        # build IMAGE_FORK: IMAGE_B + the vLLM fork's prefill dispatch
-#   ./e2e.sh build-eval        # build IMAGE_B and IMAGE_FORK, the images "eval" needs
+#   ./e2e.sh build-eval        # build IMAGE_B, IMAGE_FORK and IMAGE_A_EVAL, the images "eval" needs
 #   ./e2e.sh check             # preflight: images, vLLM all-reduce path, model
 #   ./e2e.sh run               # check, then the A/B benchmark, then the summary
 #   ./e2e.sh run3              # the same for the 3 arms in ARMS3 (needs build-fork)
@@ -38,6 +38,7 @@ CACHE_ROOT=${CACHE_ROOT:-$HOME/.cache/vllm-e2e}
 IMAGE_A=${IMAGE_A:-vllm-aiter-main}   # baseline: aiter main
 IMAGE_B=${IMAGE_B:-vllm-aiter-ar}     # aiter main + FlyDSL comm branch
 IMAGE_FORK=${IMAGE_FORK:-vllm-aiter-ar-prefill}   # IMAGE_B + the vLLM fork
+IMAGE_A_EVAL=${IMAGE_A_EVAL:-vllm-aiter-main-eval}   # IMAGE_A + lm-eval (build-eval)
 # The arms to compare: "tag,image[,VAR=value...]" separated by spaces. Each arm
 # gets its own server; VAR=value overrides the image's environment for that arm.
 # The first arm is the reference the summary's deltas are against. Tags are \w+.
@@ -50,8 +51,11 @@ ARMS=${ARMS:-"main,$IMAGE_A ar,$IMAGE_B"}
 # no stock-QuickReduce arm: vLLM's HIP QuickReduce is disabled on PCIe-only GPUs
 # above TP2 (it needs xGMI), as on this box.
 ARMS3=${ARMS3:-"base,$IMAGE_A fork,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=0 flyqr,$IMAGE_FORK"}
-# The accuracy eval: the same image with and without INT4 quick-reduce, plus a
-# third arm. exact turns quick-reduce off, so every all-reduce is exact (aiter's
+# The accuracy eval. base is the baseline: aiter main without the FlyDSL comm branch
+# (IMAGE_A plus lm-eval), stock all-reduce, quick-reduce off; it is the reference the
+# deltas are against, so the summary answers "did the aiter changes move accuracy".
+# Then the fork image with and without INT4 quick-reduce, plus a third arm.
+# exact turns quick-reduce off, so every all-reduce is exact (aiter's
 # CustomAllreduce, FlyDSL one-shot included). flyqr is the image as built: the
 # FlyDSL INT4 mesh/ring serves plain all-reduce, and the quantized fused AR+RMSNorm
 # serves its own windows. flyqr_floor is flyqr with the mesh floor raised to
@@ -70,7 +74,7 @@ ARMS3=${ARMS3:-"base,$IMAGE_A fork,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL
 # decode step (896 KiB at 64 tokens). Payloads from the plain one-shot's 1216 KiB
 # to 8 MiB are served by the stock path, as with the HIP kernel.
 EVAL_FLOOR_BYTES=${EVAL_FLOOR_BYTES:-8388608}
-ARMS_EVAL=${ARMS_EVAL:-"exact,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=NONE,AITER_QUICK_REDUCE_QUANTIZATION=NONE flyqr,$IMAGE_FORK flyqr_floor,$IMAGE_FORK,AITER_FLY_AR_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES,AITER_FLY_AR_FUSED_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES"}
+ARMS_EVAL=${ARMS_EVAL:-"base,$IMAGE_A_EVAL,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=NONE,AITER_QUICK_REDUCE_QUANTIZATION=NONE exact,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=NONE,AITER_QUICK_REDUCE_QUANTIZATION=NONE flyqr,$IMAGE_FORK flyqr_floor,$IMAGE_FORK,AITER_FLY_AR_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES,AITER_FLY_AR_FUSED_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES"}
 # lm-eval settings for "eval". The concurrency sets the decode batch: one
 # DeepSeek V4 token is 14 KiB of all-reduce payload, so at 64 concurrent
 # requests a decode step moves up to 896 KiB, inside the FlyDSL INT4 mesh
@@ -91,6 +95,7 @@ FUSE_SHARED_EXPERTS=${FUSE_SHARED_EXPERTS:-0}
 GPUS=${GPUS:-}                        # default 0..TP-1
 PORT=${PORT:-8001}
 READY_TIMEOUT=${READY_TIMEOUT:-7200}
+START_RETRIES=${START_RETRIES:-2}      # restarts of a server that died at startup with an OOM
 # "input:output:concurrencies". The first one is the recipe's prefill-heavy
 # case. The decode-heavy cases are where the small all-reduce payloads are.
 SCENARIOS=${SCENARIOS:-"60000:100:1,4 1024:1024:1,4,16,64 8192:1024:4,16"}
@@ -141,10 +146,17 @@ cmd_build_fork() {
     docker build -t "$IMAGE_FORK" --build-arg BASE="$IMAGE_B" -f "$HERE/Dockerfile.vllm-fork" "$HERE"
 }
 
+cmd_build_eval_base() {
+    docker image inspect "$IMAGE_A" >/dev/null 2>&1 || die "$IMAGE_A missing: ./e2e.sh build"
+    log "building $IMAGE_A_EVAL ($IMAGE_A + lm-eval)"
+    docker build -t "$IMAGE_A_EVAL" --build-arg BASE="$IMAGE_A" -f "$HERE/Dockerfile.lm-eval" "$HERE"
+}
+
 cmd_build_eval() {
     log "building $IMAGE_B (main + FlyDSL comm branch)${AITER_CU_NUM:+, CU_NUM=$AITER_CU_NUM}"
     docker build -t "$IMAGE_B" $(build_args) -f "$HERE/Dockerfile" "$HERE"
     cmd_build_fork
+    cmd_build_eval_base
 }
 
 # ---------------------------------------------------------------- check ----
@@ -304,6 +316,11 @@ start_server() {  # image tag tp out_dir [VAR=value...]
     docker logs -f "$NAME" >"$out/server.log" 2>&1 &
 }
 
+gpu_mem() {  # file: used/free VRAM per GPU, if amd-smi is there
+    command -v amd-smi >/dev/null || return 0
+    amd-smi metric -m 2>/dev/null | grep -E "GPU:|USED_VRAM|FREE_VRAM" | paste - - - >"$1" || true
+}
+
 wait_ready() {
     local t=0
     until curl -sf "localhost:$PORT/health" >/dev/null; do
@@ -373,12 +390,25 @@ run_one() {  # image tag tp [VAR=value...]
     local out="$RUN_DIR/${tag}_tp${tp}"
     mkdir -p "$out"
     log "=== $tag TP=$tp${*:+ [$*]} ($image $(docker image inspect -f '{{.Id}}' "$image" | cut -c8-19))"
-    stop_server
-    start_server "$image" "$tag" "$tp" "$out" "$@"
-    if ! wait_ready; then
+    # A server can die at startup with a CUDA OOM while loading the weights when
+    # something outside it holds memory on one GPU (seen: ~38 GiB on a single rank,
+    # a different one each time). Retry those; any other startup failure is final.
+    local attempt=1
+    while :; do
         stop_server
+        gpu_mem "$out/gpu_mem_start$attempt.txt"
+        start_server "$image" "$tag" "$tp" "$out" "$@"
+        wait_ready && break
+        stop_server
+        gpu_mem "$out/gpu_mem_failed$attempt.txt"   # still used with no server up = not ours
+        if [ "$attempt" -le "$START_RETRIES" ] && grep -q "OutOfMemoryError" "$out/server.log"; then
+            log "startup OOM (attempt $attempt), GPU memory in gpu_mem_failed$attempt.txt; retrying"
+            mv "$out/server.log" "$out/server.failed$attempt.log"
+            attempt=$((attempt + 1))
+            continue
+        fi
         return 0
-    fi
+    done
     smoke "$out" || log "smoke request FAILED"
     record_ar_path "$out"
     case "$MODE" in
@@ -488,6 +518,7 @@ case "${1:-}" in
     build) cmd_build ;;
     build-fork) cmd_build_fork ;;
     build-eval) cmd_build_eval ;;
+    build-eval-base) cmd_build_eval_base ;;
     check) cmd_check ;;
     run) MODE=bench; cmd_run ;;
     run3) MODE=bench; ARMS=$ARMS3; cmd_run ;;
