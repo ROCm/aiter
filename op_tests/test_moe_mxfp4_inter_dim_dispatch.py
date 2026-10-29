@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Dispatch-only coverage for non-256-aligned MXFP4 MoE shapes."""
+"""Dispatch and native-gemm2 coverage for non-256-aligned MXFP4 MoE shapes."""
 
 import functools
+import importlib
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +13,11 @@ import torch
 import aiter
 import aiter.fused_moe as fused_moe_module
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import cktile_moe_stage2, get_2stage_cfgs
+from aiter.fused_moe import (
+    _mxmoe_cfg_shape_reason,
+    cktile_moe_stage2,
+    get_2stage_cfgs,
+)
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale
@@ -273,6 +279,217 @@ def test_shuffle_scale_standard_layout_initializes_padding(dtype, src_value, pad
     assert padded[0, 0].item() == src_value
     padded[0, 0] = pad_value
     assert torch.all(padded == pad_value)
+
+
+# Tuned MXMOE rows whose kernels cannot run the runtime shape. Kimi-K3 TP=8 has
+# model_dim 3584 and inter_dim 384, which only a BK=128 gemm2 contracts.
+_MXMOE_G1 = "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_situv2"
+_MXMOE_G1_BN256 = "flydsl_mxmoe_g1_a4w4_16x256x256_situv2"
+_MXMOE_G1_BOGUS = "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_situv2_bogus"
+_MXMOE_G1_BN0 = "flydsl_mxmoe_g1_a4w4_16x0x256_f16in_situv2"
+_MXMOE_G2_BK128 = "flydsl_mxmoe_g2_a4w4_16x256x128_atomic"
+_MXMOE_G2_BK256 = "flydsl_mxmoe_g2_a4w4_16x256x256_atomic"
+_V2_G2_K128 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16"
+_V2_G2_K256 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_atomic_sbm16"
+_V2_G2_N256 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_sbm16"
+
+
+@pytest.mark.parametrize(
+    ("kn1", "kn2", "model_dim", "inter_dim", "reason"),
+    [
+        # Valid rows are kept.
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 384, None),
+        (_MXMOE_G1, _MXMOE_G2_BK256, 3584, 512, None),
+        (_MXMOE_G1, _V2_G2_K128, 3584, 384, None),
+        ("", _V2_G2_N256, 3584, 384, None),
+        # Native gemm1 (_MXMOE_G1 is BN=128, BK=256): BK must be 256, K = model_dim
+        # by BK with 2..32 K tiles, and N = 2 * inter_dim by BN.
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3712, 384, "D_HIDDEN (K) % 256"),
+        (_MXMOE_G1, "", 8448, 384, "at most 32 K tiles"),
+        (_MXMOE_G1, "", 256, 384, "2 * k_wave <= model_dim // 256"),
+        ("flydsl_mxmoe_g1_a4w4_16x128x128_f16in_situv2", "", 3584, 384, "BK=128"),
+        (_MXMOE_G1, "", 3584, 320, None),
+        (_MXMOE_G1_BN256, "", 3584, 320, "2*D_INTER (N_OUT) % 256"),
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 320, "multiple of 128"),
+        # Native gemm1 launcher limits: k_wave > 1 only at BM32 non-inline, BN64
+        # only at BM32 A4W4 non-inline, and the (BM, nt, inline) variant table.
+        ("flydsl_mxmoe_g1_a4w4_16x256x256_f16in_kw2_situv2", "", 3584, 384, "BM32"),
+        ("flydsl_mxmoe_g1_a4w4_32x256x256_kw2_situv2", "", 3584, 384, None),
+        ("flydsl_mxmoe_g1_a4w4_16x64x256_f16in_nt_situv2", "", 3584, 384, "BN64"),
+        ("flydsl_mxmoe_g1_a4w4_16x256x256_situv2", "", 3584, 384, "variant"),
+        # Native gemm2: inter_dim must be a multiple of its BK, model_dim of its
+        # BN, BN must be 256, and (BM, nt, epilog) must be a compiled variant.
+        (_MXMOE_G1, _MXMOE_G2_BK256, 3584, 384, "multiple of 256"),
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 448, "multiple of 128"),
+        ("", _MXMOE_G2_BK128, 3584, 448, "multiple of 128"),
+        ("", _MXMOE_G2_BK128, 3712, 384, "model_dim) % 256"),
+        ("", "flydsl_mxmoe_g2_a4w4_16x128x128_atomic", 3584, 384, "BN=128"),
+        ("", "flydsl_mxmoe_g2_a4w4_128x256x128_atomic", 3584, 384, "variant"),
+        ("", "flydsl_mxmoe_g2_a4w4_128x256x128_cshuffle", 3584, 384, None),
+        ("", "flydsl_mxmoe_g2_a4w4_16x256x128", 3584, 384, "variant"),
+        # _f4out falls back to the bf16 epilog off BM128, which BM32 lacks.
+        ("", "flydsl_mxmoe_g2_a4w4_128x256x256_f4out", 7168, 512, None),
+        ("", "flydsl_mxmoe_g2_a4w4_32x256x256_f4out", 7168, 512, "variant"),
+        # A malformed name is a dropped row, not a ValueError.
+        ("", "flydsl_mxmoe_g2_a4w4_16x256x128_atomic_bogus", 3584, 384, "malformed"),
+        ("", "flydsl_mxmoe_g2_a4w4_16x256x128_atomic_f4out", 3584, 384, "malformed"),
+        # The same for gemm1: an unknown token, a missing tile, an A dtype the
+        # name grammar lacks, and a gemm2 name in the gemm1 column.
+        (_MXMOE_G1_BOGUS, "", 3584, 384, "malformed"),
+        ("flydsl_mxmoe_g1_a4w4_f16in_situv2", "", 3584, 384, "malformed"),
+        ("flydsl_mxmoe_g1_a6w4_16x128x256_situv2", "", 3584, 384, "malformed"),
+        (_MXMOE_G2_BK128, _MXMOE_G2_BK128, 3584, 384, "malformed"),
+        # A zero BN parses but is not a tile; it must not divide by zero.
+        (_MXMOE_G1_BN0, "", 3584, 384, "16x0x256"),
+        # Layout-v2 gemm2: K = inter_dim by tile_k and N = model_dim by tile_n,
+        # with N capped by the launcher's HIDDEN_MAX.
+        (_MXMOE_G1, _V2_G2_K256, 3584, 384, "inter_dim % 256"),
+        ("", _V2_G2_N256, 3712, 384, "model_dim % 256"),
+        ("", _V2_G2_K128, 8192, 384, None),
+        ("", _V2_G2_K128, 8448, 384, "model_dim <= 8192"),
+        # Tiles outside the launcher's allow-lists are dropped before any modulo:
+        # a zero tile parses but must not divide, and BK=64 divides 384 but the
+        # launcher builds only BK 128/256.
+        ("", _V2_G2_K128.replace("x128x128", "x128x0"), 3584, 384, "tile_k in"),
+        ("", _V2_G2_K128.replace("x128x128", "x0x128"), 3584, 384, "tile_n in"),
+        ("", _V2_G2_K128.replace("x128x128", "x128x64"), 3584, 384, "tile_k in"),
+        ("", _V2_G2_K128.replace("x128x128", "x64x128"), 3584, 384, "tile_n in"),
+    ],
+)
+def test_mxmoe_cfg_shape_reason(kn1, kn2, model_dim, inter_dim, reason):
+    got = _mxmoe_cfg_shape_reason(kn1, kn2, model_dim, inter_dim)
+    if reason is None:
+        assert got is None, got
+    else:
+        assert got is not None and reason in got, got
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    ("kernel_name1", "kernel_name2", "kept"),
+    [
+        (_MXMOE_G1, _MXMOE_G2_BK128, True),
+        (_MXMOE_G1, _MXMOE_G2_BK256, False),
+        (_MXMOE_G1_BOGUS, _MXMOE_G2_BK128, False),
+        (_MXMOE_G1_BN0, _MXMOE_G2_BK128, False),
+    ],
+)
+def test_stale_tuned_mxmoe_row_is_discarded(
+    monkeypatch, kernel_name1, kernel_name2, kept
+):
+    """A tuned row whose gemm2 cannot contract inter_dim, or whose gemm1 name is
+    malformed, falls back to the default heuristics instead of failing at
+    dispatch or compile time; a valid row is kept."""
+    token, model_dim, inter_dim, experts, topk = 8, 3584, 384, 896, 16
+    key = (
+        fused_moe_module.get_gfx_runtime(),
+        fused_moe_module.get_cu_num(),
+        token,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        str(ActivationType.Situv2),
+        str(dtypes.bf16),
+        str(dtypes.fp4x2),
+        str(dtypes.fp4x2),
+        str(QuantType.per_1x32),
+        True,
+        False,
+    )
+    cfg = {
+        "block_m": 16,
+        "ksplit": 0,
+        "kernelName1": kernel_name1,
+        "kernelName2": kernel_name2,
+        "run_1stage": False,
+    }
+    monkeypatch.setattr(fused_moe_module, "cfg_2stages", ({key: cfg}, {}))
+    warnings = []
+    monkeypatch.setattr(
+        fused_moe_module.logger,
+        "warning",
+        lambda message: warnings.append(str(message)),
+    )
+    get_2stage_cfgs.cache_clear()
+    try:
+        meta = get_2stage_cfgs(
+            token,
+            model_dim,
+            inter_dim,
+            experts,
+            topk,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            True,
+            ActivationType.Situv2,
+            False,
+            0,
+            0,
+            is_shuffled=True,
+            gate_mode=GateMode.SEPARATED,
+            opus_weights_shuffled=True,
+        )
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+    used = (meta.stage2.keywords or {}).get("kernelName2")
+    discarded = any(
+        "discarding tuned config" in w or "discarding MXMOE config" in w
+        for w in warnings
+    )
+    assert (used == kernel_name2) == kept, used
+    assert discarded != kept, warnings
+
+
+# Native MXMOE a4w4 gemm2 on the GPU, CI-visible: CI does not collect
+# op_tests/flydsl_tests/test_flydsl_moe.py, so one case per gemm2 path (BK, epilog,
+# K padding, f4out intermediate) is called from that module here, keeping the data,
+# reference and tolerances in one place. Its full 25-case variant matrix costs
+# about 5 minutes of FlyDSL compile on a cold cache, so it still runs only there.
+_SKIP_NATIVE_G2 = pytest.mark.skipif(
+    get_gfx() != "gfx950" or importlib.util.find_spec("flydsl") is None,
+    reason="gfx950 FlyDSL required for the native MXFP4 gemm2",
+)
+
+
+def _flydsl_moe_cases():
+    return importlib.import_module("op_tests.flydsl_tests.test_flydsl_moe")
+
+
+@_SKIP_NATIVE_G2
+@pytest.mark.parametrize(
+    "block_m, flags, token, padded",
+    [
+        (16, "_atomic", 8, False),  # the Kimi-K3 tuned row
+        (16, "_atomic", 8, True),
+        (64, "_atomic_nt", 64, True),
+        (32, "_cshuffle", 32, True),
+    ],
+)
+def test_native_gemm2_bk128(monkeypatch, block_m, flags, token, padded):
+    """Kimi-K3 TP=8 (inter_dim 384) on BK=128 native gemm2 epilogs, unpadded or
+    pre-padded to 512 with w2.inter_real=384, vs layout-v2 and torch."""
+    _flydsl_moe_cases().test_mxmoe_native_gemm2_bk128(
+        monkeypatch, block_m=block_m, flags=flags, token=token, padded=padded
+    )
+
+
+@_SKIP_NATIVE_G2
+@pytest.mark.parametrize("flags", ["", "_cshuffle", "_atomic"])
+def test_native_gemm2_bk256_padded(monkeypatch, flags):
+    """BK=256 on weights pre-padded 384 -> 512: the padding K half is skipped."""
+    _flydsl_moe_cases().test_mxmoe_native_gemm2_bk256_padded(monkeypatch, flags=flags)
+
+
+@_SKIP_NATIVE_G2
+@pytest.mark.parametrize("flags", ["", "_f4out"])
+def test_native_gemm2_bm128_bk128_matches_bk256(monkeypatch, flags):
+    """Non-atomic BM=128 gemm2, BF16 and MXFP4 (f4out) intermediates: BK=128 vs
+    BK=256 and torch."""
+    _flydsl_moe_cases().test_mxmoe_native_gemm2_bk128_vs_bk256(monkeypatch, flags=flags)
 
 
 if __name__ == "__main__":

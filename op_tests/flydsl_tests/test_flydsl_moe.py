@@ -4,7 +4,9 @@
 """FlyDSL MOE a8w4 (fp8 activation, fp4 weight, GUI shuffle) regression tests.
 
 Covers stage2 tile_k auto-resolve for non-256-aligned inter_dim (e.g. DSV4
-inter=640) and FlyDSL stage2 / E2E with GUI preshuffle on gfx950.
+inter=640) and FlyDSL stage2 / E2E with GUI preshuffle on gfx950. Also covers
+the native MXMOE a4w4 gemm2 at BK=128 and on pre-padded (``w2.inter_real``)
+weights, for every variant the native gemm2 accepts.
 
 Usage:
     pytest op_tests/flydsl_tests/test_flydsl_moe.py -q
@@ -17,10 +19,19 @@ import os
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
+import aiter.fused_moe as fused_moe_module
+from aiter import ActivationType, QuantType, dtypes, get_torch_quant
+from aiter.fused_moe import (
+    fused_moe,
+    fused_topk,
+    moe_sorting,
+    torch_moe_stage1,
+    torch_moe_stage2,
+)
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.moe_kernels import (
     pick_flydsl_stage2_tile_k,
     resolve_flydsl_stage2_tile_k,
@@ -947,3 +958,223 @@ def test_flydsl_e2e_a8w4_situv2(inter_dim, seed, gate_mode):
     _check_close(
         d["ref_stage2"].float(), out.float(), f"situv2_{gate_mode}_e2e_i{inter_dim}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Native MXMOE a4w4 gemm2: BK=128 and pre-padded (w2.inter_real) weights.
+#
+# Every case runs fused_moe with a forced (gemm1, gemm2) kernel pair. The baseline
+# runs the same gemm1 with another gemm2 on the same inputs, so only gemm2
+# differs; the torch reference quantizes both activations to MXFP4 like the
+# kernels. The MXMOE aux kernels are codegen'd per (E, topk, model_dim), so the
+# shapes are production ones.
+# ---------------------------------------------------------------------------
+
+# Kimi-K3 TP=8: inter_dim 384 is not a multiple of 256, so only BK=128 contracts
+# it unpadded. Pre-padded checkpoints carry inter_dim 512 with w2.inter_real=384.
+_KIMI_K3 = {"E": 896, "topk": 16, "model_dim": 3584, "inter_dim": 384}
+# Kimi-K2.5 TP=4: the only kind of shape with the MXFP4 (f4out) intermediate.
+_KIMI_K25 = {"E": 385, "topk": 9, "model_dim": 7168, "inter_dim": 512}
+
+
+def _mxmoe_g1(block_m):
+    # Only block_m 16 has the inline-quant (f16in) gemm1.
+    if block_m == 16:
+        return "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_situv2"
+    return f"flydsl_mxmoe_g1_a4w4_{block_m}x256x256_situv2"
+
+
+def _mxmoe_quant(w):
+    q, scale = get_torch_quant(Q_TYPE)(w, quant_dtype=dtypes.fp4x2)
+    q = q.view(*w.shape[:-1], w.shape[-1] // 2)
+    scale = scale.view(*w.shape[:-1], w.shape[-1] // 32)
+    rows = scale.shape[0] * scale.shape[1]
+    shuffled = (
+        shuffle_weight(q.view(dtypes.fp4x2), (16, 16)),
+        e8m0_shuffle(scale.view(rows, -1)).view(*scale.shape[:2], -1),
+    )
+    return q, scale, shuffled
+
+
+def _mxmoe_run(monkeypatch, d, w1, w2, kn2, block_m, inter_real=None):
+    _, _, (w1_q, w1_scale) = _mxmoe_quant(w1)
+    _, _, (w2_q, w2_scale) = _mxmoe_quant(w2)
+    if inter_real is not None:
+        w2_q.inter_real = inter_real
+    metadata = fused_moe_module._make_mxfp4_metadata(
+        _mxmoe_g1(block_m), kn2, GateMode.SEPARATED, 0, block_m=block_m
+    )
+    monkeypatch.setattr(fused_moe_module, "get_2stage_cfgs", lambda *a, **k: metadata)
+    out = fused_moe(
+        d["x"],
+        w1_q,
+        w2_q,
+        d["topk_weights"],
+        d["topk_ids"],
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        quant_type=Q_TYPE,
+        activation=ActivationType.Situv2,
+        doweight_stage1=False,
+    )
+    torch.cuda.synchronize()
+    return out
+
+
+def _mxmoe_data(shape, token, seed=0):
+    torch.manual_seed(seed)
+    E, topk, model_dim, inter_dim = (
+        shape["E"],
+        shape["topk"],
+        shape["model_dim"],
+        shape["inter_dim"],
+    )
+    dev, dtype = "cuda", dtypes.bf16
+    x = torch.randn((token, model_dim), dtype=dtype, device=dev) / 10
+    w1 = torch.randn((E, 2 * inter_dim, model_dim), dtype=dtype, device=dev) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device=dev) / 10
+    gating = torch.randn((token, E), dtype=dtype, device=dev)
+    topk_weights, topk_ids = fused_topk(x, gating, topk, True)
+    return {
+        "x": x,
+        "w1": w1,
+        "w2": w2,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+    }
+
+
+def _mxmoe_ref(d, shape, token):
+    torch_quant = get_torch_quant(Q_TYPE)
+    w1_q, w1_scale, _ = _mxmoe_quant(d["w1"])
+    w2_q, w2_scale, _ = _mxmoe_quant(d["w2"])
+    a1_q, a1_scale = torch_quant(d["x"], quant_dtype=dtypes.fp4x2)
+    out1 = torch_moe_stage1(
+        a1_q,
+        w1_q,
+        w2_q,
+        d["topk_weights"],
+        d["topk_ids"],
+        dtype=dtypes.bf16,
+        activation=ActivationType.Situv2,
+        quant_type=Q_TYPE,
+        a1_scale=a1_scale,
+        w1_scale=w1_scale,
+        doweight=False,
+    )
+    a2_q, a2_scale = torch_quant(out1, quant_dtype=dtypes.fp4x2)
+    return torch_moe_stage2(
+        a2_q.view(token, shape["topk"], -1),
+        w1_q,
+        w2_q,
+        d["topk_weights"],
+        d["topk_ids"],
+        dtype=dtypes.bf16,
+        quant_type=Q_TYPE,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        doweight=True,
+    )
+
+
+def _pad_inter(w1, w2, inter_dim, padded):
+    pad = padded - inter_dim
+    gate, up = w1.chunk(2, dim=1)
+    w1 = torch.cat([F.pad(gate, (0, 0, 0, pad)), F.pad(up, (0, 0, 0, pad))], dim=1)
+    return w1, F.pad(w2, (0, pad))
+
+
+@_SKIP_GFX950_FLYDSL
+@pytest.mark.parametrize(
+    "block_m, flags, token",
+    [
+        (16, "_atomic", 8),
+        (16, "_atomic_nt", 8),
+        (32, "_atomic", 32),
+        (32, "_atomic_nt", 32),
+        (64, "_atomic", 64),
+        (64, "_atomic_nt", 64),
+        (128, "", 256),
+        (32, "_cshuffle", 32),
+        (64, "_cshuffle", 64),
+        (128, "_cshuffle", 256),
+    ],
+)
+@pytest.mark.parametrize("padded", [False, True])
+def test_mxmoe_native_gemm2_bk128(monkeypatch, block_m, flags, token, padded):
+    """Every native gemm2 variant at BK=128 against the layout-v2 gemm2.
+
+    Kimi-K3 TP=8 (inter_dim 384), unpadded and pre-padded to 512 with
+    w2.inter_real=384, where the last K tile is all padding and must be skipped.
+    """
+    shape = _KIMI_K3
+    d = _mxmoe_data(shape, token)
+    ref = _mxmoe_ref(d, shape, token)
+    v2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{block_m}x128x128_atomic_sbm{block_m}"
+    baseline = _mxmoe_run(monkeypatch, d, d["w1"], d["w2"], v2, block_m)
+
+    w1, w2, inter_real = d["w1"], d["w2"], None
+    if padded:
+        inter_real = shape["inter_dim"]
+        w1, w2 = _pad_inter(w1, w2, inter_real, 512)
+    kn2 = f"flydsl_mxmoe_g2_a4w4_{block_m}x256x128{flags}"
+    out = _mxmoe_run(monkeypatch, d, w1, w2, kn2, block_m, inter_real=inter_real)
+
+    label = f"{kn2}{'_padded' if padded else ''}"
+    # Same gemm1 output: only gemm2's accumulation order differs.
+    _check_close(baseline, out, f"{label} vs v2", atol=1e-2, rtol=1e-2, max_err_ratio=0)
+    _check_close(ref, out, f"{label} vs ref", atol=5e-2, rtol=5e-2, max_err_ratio=0.01)
+
+
+@_SKIP_GFX950_FLYDSL
+@pytest.mark.parametrize("flags", ["", "_cshuffle", "_atomic"])
+def test_mxmoe_native_gemm2_bk256_padded(monkeypatch, flags):
+    """BK=256 on weights pre-padded 384 -> 512: the second K half of the last tile
+    is padding and must be skipped (it used to reach the MFMA as None)."""
+    shape, block_m = _KIMI_K3, (128 if flags != "_atomic" else 16)
+    token = 256 if block_m == 128 else 8
+    d = _mxmoe_data(shape, token)
+    ref = _mxmoe_ref(d, shape, token)
+    v2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{block_m}x128x128_atomic_sbm{block_m}"
+    baseline = _mxmoe_run(monkeypatch, d, d["w1"], d["w2"], v2, block_m)
+    w1, w2 = _pad_inter(d["w1"], d["w2"], shape["inter_dim"], 512)
+    kn2 = f"flydsl_mxmoe_g2_a4w4_{block_m}x256x256{flags}"
+    out = _mxmoe_run(monkeypatch, d, w1, w2, kn2, block_m, inter_real=384)
+    _check_close(baseline, out, f"{kn2} vs v2", atol=1e-2, rtol=1e-2, max_err_ratio=0)
+    _check_close(ref, out, f"{kn2} vs ref", atol=5e-2, rtol=5e-2, max_err_ratio=0.01)
+
+
+@_SKIP_GFX950_FLYDSL
+@pytest.mark.parametrize("flags", ["", "_f4out"])
+def test_mxmoe_native_gemm2_bk128_vs_bk256(monkeypatch, flags):
+    """Non-atomic BM=128 gemm2, BF16 and MXFP4 (f4out) intermediates, BK=128 vs BK=256.
+
+    Kimi-K2.5 TP=4 (inter_dim 512), the shape class that takes the f4out
+    intermediate. Both BK split the same K, so the outputs should match.
+    """
+    shape, block_m, token = _KIMI_K25, 128, 256
+    if flags == "_f4out":
+        monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", "1")
+    d = _mxmoe_data(shape, token)
+    kn2 = "flydsl_mxmoe_g2_a4w4_128x256x{}" + flags
+    baseline = _mxmoe_run(monkeypatch, d, d["w1"], d["w2"], kn2.format(256), block_m)
+    out = _mxmoe_run(monkeypatch, d, d["w1"], d["w2"], kn2.format(128), block_m)
+    _check_close(
+        baseline,
+        out,
+        kn2.format(128) + " vs BK256",
+        atol=1e-2,
+        rtol=1e-2,
+        max_err_ratio=0,
+    )
+    if not flags:
+        # The f4out intermediate is lossy by design, so only BF16 is held to the ref.
+        ref = _mxmoe_ref(d, shape, token)
+        _check_close(
+            ref,
+            out,
+            kn2.format(128) + " vs ref",
+            atol=5e-2,
+            rtol=5e-2,
+            max_err_ratio=0.01,
+        )
