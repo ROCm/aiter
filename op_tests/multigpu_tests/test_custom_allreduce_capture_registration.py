@@ -199,7 +199,7 @@ def test_capture_registration(tp_size, shape, scenario):
     at_init, _, _, expected = SCENARIOS[scenario]
     tag = f"{tp_size=} {scenario=}"
     disabled = all(r["disabled"] for r in rets)
-    # No veto to exercise: gfx1250 and the VMM transport never register
+    # No veto to exercise: the VMM and symm_mem transports never register
     # captured inputs, and a platform may ignore expandable_segments. Every
     # rank must also see exactly the allocator state the scenario set up.
     exercised = not disabled and all(

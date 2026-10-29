@@ -433,6 +433,185 @@ def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
     )
 
 
+_POOL_SENTINEL = 0xA5
+
+
+def _gfx1250_graph_registration(rank, tp_size, iterations, distributed_init_method):
+    from aiter.dist.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+        _expandable_segments_enabled,
+    )
+
+    torch.set_num_threads(1)
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        "gloo", world_size=tp_size, rank=rank, init_method=distributed_init_method
+    )
+    ca_comm = None
+    try:
+        ca_comm = CustomAllreduce(dist.group.WORLD, device)
+        assert not ca_comm.disabled, "The graph registration regression requires it"
+        # Only the IPC transport can map a peer's captured buffer.
+        expect_registered = not (
+            ca_comm._use_vmm or ca_comm._use_symm_mem or _expandable_segments_enabled()
+        )
+        dtype, hidden, rows, eps = torch.bfloat16, 4096, 1536, 1e-6
+        # 1 MiB takes the LL kernel; 12 MiB is above its range, so the rest take
+        # the kernels that read peers' inputs. 1536 rows split for TP 2/4/6/8.
+        srcs = {
+            "ll": torch.zeros(128, hidden, dtype=dtype, device=device),
+            "ar": torch.zeros(rows, hidden, dtype=dtype, device=device),
+            "rs": torch.zeros(rows, hidden, dtype=dtype, device=device),
+            "ag": torch.zeros(256, hidden, dtype=dtype, device=device),
+            "rms": torch.zeros(rows, hidden, dtype=dtype, device=device),
+        }
+        residual = torch.zeros(rows, hidden, dtype=dtype, device=device)
+        weight = torch.ones(hidden, dtype=dtype, device=device)
+        assert all(ca_comm.should_custom_ar(srcs[k]) for k in ("ll", "ar", "rms"))
+        assert ca_comm.should_custom_rs(srcs["rs"], 0)
+        assert ca_comm.should_custom_ag(srcs["ag"])
+
+        def run(inputs, rs_out):
+            ll = ca_comm.custom_all_reduce(inputs["ll"])
+            ar = ca_comm.custom_all_reduce(inputs["ar"])
+            ca_comm.custom_reduce_scatter(inputs["rs"], rs_out, 0)
+            ag = ca_comm.custom_all_gather(inputs["ag"], 0)
+            rms, res = ca_comm.custom_fused_ar_rms(
+                inputs["rms"], residual, weight, eps, False
+            )
+            return [ll, ar, rs_out, ag, rms, res]
+
+        rs_eager = torch.empty(rows // tp_size, hidden, dtype=dtype, device=device)
+        # Warm up the eager path before capturing its graph variant.
+        run(srcs, rs_eager)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with ca_comm.capture():
+            with torch.cuda.graph(graph, stream=stream):
+                # A kernel writes each input inside the graph, as in a model.
+                graph_outs = run(
+                    {k: v.mul(1) for k, v in srcs.items()},
+                    torch.empty_like(rs_eager),
+                )
+            registered = ca_comm.enable_register_for_capturing
+            recorded = ca_comm._ops_get_graph_buffer_count(ca_comm._ptr)
+        torch.cuda.current_stream().wait_stream(stream)
+        assert registered == expect_registered, (
+            f"{rank=}: capture() chose registered={registered}, expected "
+            f"{expect_registered} (vmm={ca_comm._use_vmm}, "
+            f"symm_mem={ca_comm._use_symm_mem})"
+        )
+        # One buffer for each collective that reads peers' inputs; LL none.
+        assert recorded == (4 if registered else 0), f"{rank=}: {recorded=}"
+
+        try:
+            pool = ca_comm._pool["input"].tensor
+        except (AttributeError, RuntimeError):
+            pool = None  # raw allocation: rely on the recorded count alone
+        head = rows * hidden * 2
+        generator = torch.Generator().manual_seed(2026)
+        names = ["ll", "ar", "rs", "ag", "rms", "res"]
+        for iteration in range(iterations):
+            full = {
+                k: torch.randint(
+                    -8, 9, (tp_size, *v.shape), generator=generator, dtype=torch.int16
+                )
+                for k, v in srcs.items()
+            }
+            for k, v in srcs.items():
+                v.copy_(full[k][rank])
+            residual.copy_(
+                torch.randint(-8, 9, residual.shape, generator=generator).to(dtype)
+            )
+            for out in graph_outs:
+                out.fill_(float("nan"))
+            results, staged = {}, {}
+            for mode in ("graph", "eager"):
+                if pool is not None:
+                    pool[:head].fill_(_POOL_SENTINEL)
+                torch.cuda.synchronize()
+                dist.barrier()
+                if mode == "graph":
+                    graph.replay()
+                    outs = graph_outs
+                else:
+                    outs = run(srcs, rs_eager)
+                torch.cuda.synchronize()
+                if pool is not None:
+                    staged[mode] = not bool((pool[:head] == _POOL_SENTINEL).all())
+                results[mode] = [o.clone() for o in outs]
+                dist.barrier()
+            context = f"{rank=} {tp_size=} {iteration=}"
+            if pool is not None:
+                # The registered graph stages nothing; copy-in and eager do.
+                assert staged["graph"] == (not registered), f"{context}: {staged=}"
+                assert staged["eager"], f"{context}: {staged=}"
+
+            sums = {
+                k: full[k].sum(dim=0, dtype=torch.float32) for k in ("ll", "ar", "rs")
+            }
+            shard = rows // tp_size
+            refs = {
+                "ll": sums["ll"],
+                "ar": sums["ar"],
+                "rs": sums["rs"][rank * shard : (rank + 1) * shard],
+                "ag": full["ag"].reshape(-1, hidden).float(),
+                "res": full["rms"].sum(dim=0, dtype=torch.float32)
+                + residual.float().cpu(),
+            }
+            for name, got, eager in zip(names, results["graph"], results["eager"]):
+                msg = f"{context} {name}"
+                # Same kernel either way, so the graph matches eager bit for bit.
+                torch.testing.assert_close(
+                    got, eager, rtol=0, atol=0, msg=lambda m, msg=msg: f"{msg}\n{m}"
+                )
+                if name in refs:
+                    torch.testing.assert_close(
+                        got,
+                        refs[name].to(device, dtype),
+                        rtol=0,
+                        atol=0,
+                        msg=lambda m, msg=msg: f"{msg} vs reference\n{m}",
+                    )
+        if rank == 0:
+            logger.info(
+                "gfx1250 graph registration regression passed: TP%d, registered=%s, "
+                "%d graph buffers, %d rounds",
+                tp_size,
+                registered,
+                recorded,
+                iterations,
+            )
+        # All ranks must finish reading peer buffers before any are freed.
+        dist.barrier()
+    finally:
+        if ca_comm is not None:
+            ca_comm.close()
+        dist.destroy_process_group()
+
+
+def test_gfx1250_graph_registration_regression(tp_size, iterations=10):
+    # On the IPC transport a captured gfx1250 collective that reads peers'
+    # inputs (unroll4 all-reduce, reduce-scatter, all-gather, fused all-reduce
+    # + RMSNorm) binds its input in place instead of staging it in the pool;
+    # the LL all-reduce never stages. Every other transport keeps copy-in.
+    if not _is_gfx1250():
+        return
+    torch.multiprocessing.spawn(
+        _gfx1250_graph_registration,
+        args=(
+            tp_size,
+            iterations,
+            get_distributed_init_method(get_ip(), get_open_port()),
+        ),
+        nprocs=tp_size,
+        join=True,
+    )
+
+
 # Custom-AR size cutoff (bytes). Mirrors _DEFAULT_CAR_MAX_SIZE in
 # aiter/dist/device_communicators/custom_all_reduce.py and honors the same
 # AITER_CUSTOM_AR_MAX_SIZE override. Inputs at or below this run on the custom
@@ -514,8 +693,8 @@ parser.add_argument(
 parser.add_argument(
     "--regression",
     action="store_true",
-    help="run only the correctness checks: tail (eager and graph), LL128 and "
-    "gfx1250 LL mixed sizes",
+    help="run only the correctness checks: tail (eager and graph), LL128, "
+    "gfx1250 LL mixed sizes and gfx1250 graph registration",
 )
 parser.add_argument(
     "--iterations",
@@ -556,6 +735,7 @@ if __name__ == "__main__":
                 if tp <= args.tp_size:
                     test_allreduce_ll128_mixed_size_regression(tp)
             test_allreduce_ll_gfx1250_mixed_size_regression(args.tp_size)
+            test_gfx1250_graph_registration_regression(args.tp_size)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"

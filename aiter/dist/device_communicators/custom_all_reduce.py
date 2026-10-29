@@ -796,9 +796,8 @@ class _GFX1250BufferProxy:
         raise KeyError(key)
 
     def flush_graph_buffers(self, ar_ptr):
-        # TODO: full CUDA graph support on gfx1250 requires VMM-based
-        # exchange for graph-captured buffers. For now, graph capture
-        # is not supported on gfx1250 — log a warning.
+        # The VMM transport cannot export captured buffers, so __init__ keeps
+        # it on the copy-in path and nothing is recorded; warn if anything was.
         count = self._ca._ops_get_graph_buffer_count(ar_ptr)
         if count > 0:
             logger.warning(
@@ -1131,16 +1130,13 @@ class CustomAllreduce:
             return
 
         self.disabled = False
-        # gfx1250 (MI450) cannot register CUDA-graph-captured buffers across
-        # ranks yet: cross-rank graph-buffer exchange is unimplemented for both
-        # gfx1250 transports (VMM fd exchange, and IPC graph-meta ops). The
-        # "registered" capture path bakes raw input pointers that peers would
-        # dereference at replay without ever being registered → GPU page fault
-        # on the first graph replay (e.g. V4 TP=2 decode). Force the copy-in
-        # "unreg" path during capture, which routes through the pre-registered
-        # pool (exchanged at init, address-stable across replays). Keyed on the
-        # kernel (arch), so both VMM and IPC gfx1250 paths use copy-in.
-        if self._is_gfx1250:
+        # Only the IPC transport, which never spans nodes, can map a peer's
+        # CUDA-graph-captured buffer: the VMM and symm_mem transports cannot
+        # export a tensor from PyTorch's caching allocator. On those, capture
+        # takes the copy-in path, which stages each input in the pool exchanged
+        # at init. Keyed on the transport, not the arch: gfx1250 on IPC
+        # registers captured inputs like the old arch does.
+        if self._use_vmm or self._use_symm_mem or not self._same_node:
             enable_register_for_capturing = False
         # PyTorch expandable_segments hands out VMM-managed pointers that cannot
         # be exported via hipIpcGetMemHandle (issue #4174). The classic IPC
@@ -1148,9 +1144,7 @@ class CustomAllreduce:
         # it would fail. Force the copy-in path, which stages into the plain
         # hipMalloc input pool (IPC-exportable). The VMM transport does its own
         # pointer exchange and is unaffected, so only guard the IPC path.
-        self._register_for_capturing_requested = (
-            enable_register_for_capturing and not self._is_gfx1250
-        )
+        self._register_for_capturing_requested = enable_register_for_capturing
         if (
             not self._use_vmm
             and not self._use_symm_mem
@@ -1469,12 +1463,13 @@ class CustomAllreduce:
         else:
             meta_size = self._meta_size() + max_size * 2
         # Wire the pool's graph helpers to the kernel-matching ops so that
-        # flush_graph_buffers() during capture never reinterpret_casts a gfx1250
-        # `fa` through the old-arch graph ops. Graph-buffer registration itself
-        # stays disabled on gfx1250 (copy-in path → count is always 0).
+        # flush_graph_buffers() after capture never reinterpret_casts a gfx1250
+        # `fa` through the old-arch graph ops.
         pool_kwargs = {}
         if self._is_gfx1250:
             pool_kwargs["graph_count_fn"] = self._ops_get_graph_buffer_count
+            pool_kwargs["graph_ipc_meta_fn"] = ops.get_graph_buffer_ipc_meta_gfx1250
+            pool_kwargs["graph_register_fn"] = ops.register_graph_buffers_gfx1250_ipc
         # Create IPC buffer pool and allocate all named buffers.
         self._pool = IPCBufferPool(self.device, self.group, **pool_kwargs)
         self._pool.create("meta", meta_size, uncached=True)
@@ -1631,7 +1626,7 @@ class CustomAllreduce:
     def register_input_buffer(self, inp: torch.Tensor):
         """Register an external tensor as an IPC input buffer."""
         # No-op on symm_mem: it cannot share an external tensor (see
-        # _SymmMemBufferProxy.get_external_ipc_meta), and gfx1250 always
+        # _SymmMemBufferProxy.get_external_ipc_meta), and symm_mem always
         # reduces through the copy-in pool, which never looks up an externally
         # registered buffer. Callers that register anyway, such as ATOM's
         # signal tensor, keep working.
@@ -1786,8 +1781,13 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
-        elif registered_input and torch.cuda.is_current_stream_capturing():
-            # The registered path records the output for export at flush too.
+        elif (
+            registered_input
+            and not self._is_gfx1250
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # The old-arch registered path records the output for export at
+            # flush too. gfx1250 reads only its peers' inputs.
             self._capture_registered(out)
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
@@ -1924,9 +1924,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                # gfx1250 cannot register graph buffers cross-rank (see
-                # enable_register_for_capturing note in __init__); use the
-                # copy-in path so capture/replay reads the pre-registered pool.
+                # Peers read the input in place if capture() agreed on the
+                # registered path; otherwise it is staged in the pre-registered
+                # pool (see enable_register_for_capturing in __init__).
                 return self.reduce_scatter(
                     input, output, dim, registered=self._capture_registered(input)
                 )
@@ -2024,9 +2024,9 @@ class CustomAllreduce:
 
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                # gfx1250 cannot register graph buffers cross-rank (see
-                # enable_register_for_capturing note in __init__); use the
-                # copy-in path so capture/replay reads the pre-registered pool.
+                # Peers read the input in place if capture() agreed on the
+                # registered path; otherwise it is staged in the pre-registered
+                # pool (see enable_register_for_capturing in __init__).
                 if self._capture_registered(inp):
                     out = self.all_gather_reg(inp.view(view_dtype), dim=dim)
                 else:
