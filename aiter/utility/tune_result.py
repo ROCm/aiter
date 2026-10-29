@@ -215,11 +215,7 @@ def sort_frame_for_selection(df, select_power=None):
     """
     if select_power is None:
         select_power = power_selection_enabled()
-    if (
-        select_power
-        and "watts" in df.columns
-        and df["watts"].notna().any()
-    ):
+    if select_power and "watts" in df.columns and df["watts"].notna().any():
         return sort_by_energy_then_latency(df)
     if (
         select_power
