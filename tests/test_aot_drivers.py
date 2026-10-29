@@ -1,5 +1,6 @@
 """AOT driver coverage: MLA config wiring and PA-Gluon's GPU worker policy."""
 
+import contextlib
 import inspect
 import pathlib
 import sys
@@ -152,8 +153,10 @@ class FlyDSLMoeDeploymentTest(unittest.TestCase):
                     self.assertEqual(get_padded_M(low), bucket)
                     self.assertEqual(get_padded_M(high), bucket)
 
-    def _load_edited(self, edit):
-        """Load a copy of the default deployment file after ``edit``."""
+    @staticmethod
+    @contextlib.contextmanager
+    def _edited(edit):
+        """The path of a copy of the default deployment file after ``edit``."""
         import json
         import tempfile
 
@@ -165,7 +168,14 @@ class FlyDSLMoeDeploymentTest(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(document, f)
             f.flush()
-            return deployments.load([f.name])
+            yield f.name
+
+    def _load_edited(self, edit):
+        """Load a copy of the default deployment file after ``edit``."""
+        from aiter.aot.flydsl import deployments
+
+        with self._edited(edit) as path:
+            return deployments.load([path])
 
     @staticmethod
     def _rank_call(deployment):
@@ -222,6 +232,48 @@ class FlyDSLMoeDeploymentTest(unittest.TestCase):
                     for passed in local_tokens
                 }
                 self.assertEqual(callers[deployment.id], expected)
+
+    def test_deployment_jobs_pass_model_activation(self):
+        from aiter.aot.flydsl import moe
+
+        def edit(document):
+            models = document["models"]
+            models["kimi-k3-betas"] = dict(
+                models["kimi-k3"], situ_beta=2.0, situ_linear_beta=17.0
+            )
+            for deployment in document["fused_moe"]:
+                if deployment["model"] == "kimi-k3":
+                    deployment["model"] = "kimi-k3-betas"
+
+        with self._edited(edit) as path:
+            jobs = moe.parse_deployments([path])
+        activations = {}
+        for job in jobs:
+            activations.setdefault(job["deployment"].split("/")[0], set()).add(
+                (job["swiglu_limit"], job["beta"], job["linear_beta"])
+            )
+        # DeepSeek-V4-Pro's clamp reaches every call; SiLU takes no betas.
+        self.assertEqual(activations["deepseek-v4-pro"], {(10.0, None, None)})
+        self.assertEqual(activations["glm-5.3-flash"], {(None, None, None)})
+        # A model's own SiTUv2 betas join the generic ones.
+        generic = {(None, None), (1.0, 1.0), (4.0, 25.0)}
+        self.assertEqual(
+            activations["kimi-k3-betas"],
+            {(None, *betas) for betas in generic | {(2.0, 17.0)}},
+        )
+
+        first = {}
+        for job in jobs:
+            first.setdefault(job["deployment"], job)
+        with (
+            patch.object(moe, "_caller_inputs", return_value={}),
+            patch("aiter.fused_moe._fused_moe_impl") as fused,
+            patch("aiter.fhmoe._fhmoe_impl") as fhmoe,
+        ):
+            moe._replay(first["deepseek-v4-pro/gfx950/a8w4/tp8"])
+            moe._replay(first["deepseek-v4-pro/gfx950/a8w4/tp8-fhmoe"])
+        self.assertEqual(fused.call_args.kwargs["swiglu_limit"], 10.0)
+        self.assertEqual(fhmoe.call_args.kwargs["swiglu_limit"], 10.0)
 
     def test_tensor_parallel_derivation(self):
         from aiter.aot.flydsl import moe
@@ -341,6 +393,7 @@ class FlyDSLMoeDeploymentTest(unittest.TestCase):
                 situ_beta=4.0
             ),
             "missing keys": lambda d: d["mega_moe"][0].pop("max_tokens_per_rank"),
+            "cu_num must be one of": lambda d: d["mega_moe"][0].update(cu_num=304),
             "differs from its other definition": lambda d: d["models"][
                 "kimi-k3"
             ].update(top_k=8),

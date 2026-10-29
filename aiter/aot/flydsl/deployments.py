@@ -41,6 +41,8 @@ ACTIVATIONS = ("Silu", "Situv2", "Swiglu")
 # does under TP.
 SHARED_EXPERT_MODES = ("separate", "fused", "fhmoe")
 _SECTION_ARCHS = {"fused_moe": ("gfx950", "gfx1250"), "mega_moe": ("gfx950",)}
+# mega_moe.py builds MI355X's bundles, whose launch geometry follows its CUs.
+_SECTION_CU_NUMS = {"mega_moe": (256,)}
 _SECTION_ACTIVATIONS = {"fused_moe": ACTIVATIONS, "mega_moe": ("Silu", "Situv2")}
 _MODEL_ID = re.compile(r"[a-z0-9][a-z0-9.\-]*")
 
@@ -277,11 +279,15 @@ def _expand(section: str, where: str, path: str, entry, models: dict) -> list:
         _fail(where, f"unknown model {entry['model']!r}")
     _choice(where, "activation", model.activation, _SECTION_ACTIVATIONS[section])
     gfx = _choice(where, "gfx", entry["gfx"], _SECTION_ARCHS[section])
+    cu_num = _int(where, "cu_num", entry["cu_num"])
+    cu_nums = _SECTION_CU_NUMS.get(section)
+    if cu_nums and cu_num not in cu_nums:
+        _fail(where, f"cu_num must be one of {list(cu_nums)}, got {cu_num}")
     common = {
         "path": path,
         "model": model,
         "gfx": gfx,
-        "cu_num": _int(where, "cu_num", entry["cu_num"]),
+        "cu_num": cu_num,
         "source": _text(where, "source", entry["source"]),
     }
     fused_moe = section == "fused_moe"

@@ -98,7 +98,8 @@ lists those deployments too.
 
 Each deployment replays at the smallest and largest M of every
 `get_padded_M` bucket up to `max_tokens`, bisected as for rows, with the
-caller's default gate/up layout and the SiTUv2 betas a row would get. An EP
+caller's default gate/up layout, the model's `swiglu_limit`, and the SiTUv2
+betas a row would get plus the model's own. An EP
 deployment replays with its mask, with and without `num_local_tokens` (MORI
 dispatch passes it, the all-gather path does not). A deployment reads the
 tuned tables serving reads (`AITER_CONFIG_FMOE`, `AITER_CONFIG_GROUPED_FMOE`,
@@ -138,7 +139,7 @@ a list, and expand to every combination:
 
 | Field | Meaning |
 | --- | --- |
-| `model`, `gfx`, `cu_num` | the model; the GPU (`fused_moe`: gfx950 or gfx1250, `mega_moe`: gfx950) |
+| `model`, `gfx`, `cu_num` | the model; the GPU (`fused_moe`: gfx950 or gfx1250, `mega_moe`: MI355X, i.e. gfx950 with 256 CUs) |
 | `quant` | `a8w4` or `a4w4`: MXFP4 (per_1x32) weights with FP8 or FP4 activations |
 | `ep` | EP size (`fused_moe`: default 1, no EP), the world size for MegaMoE |
 | `tp` | `fused_moe` only: TP size of the experts, default 1. The experts split over TP or over EP, not both |
@@ -176,7 +177,8 @@ of your own may name the default file's models without repeating them.
 Unknown or missing fields, experts that do not split over EP or an
 intermediate dim that does not split over TP, TP and EP together, redundant
 experts without EP, fusing a model without shared experts, FHMoE with EP or
-with more than one shared expert, or an id listed twice fail the load.
+with more than one shared expert, a `mega_moe` GPU other than MI355X, or an id
+listed twice fail the load.
 
 To add a deployment:
 
