@@ -297,7 +297,7 @@ def prepare_pa_decode_plan(
     with torch.cuda.device(query.device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("prepare_pa_decode_plan must run before graph capture")
-        kernel_causal = resolve_causal(causal, query_length, sliding_window)
+        kernel_causal = resolve_causal(causal, query_length)
         properties = torch.cuda.get_device_properties(query.device)
         num_cu = properties.multi_processor_count
         limit = num_cu if max_partitions is None else max_partitions
@@ -472,8 +472,6 @@ def _parse_args(argv=None):
         parser.error("context lengths must include all query tokens and fit in int32")
     if args.sliding_window < -1:
         parser.error("--sliding-window must be -1, 0 or positive")
-    if args.non_causal and args.sliding_window > 0:
-        parser.error("--non-causal does not support --sliding-window")
     if args.device < 0:
         parser.error("--device must be nonnegative")
     return args

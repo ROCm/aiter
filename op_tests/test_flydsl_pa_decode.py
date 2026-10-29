@@ -114,14 +114,12 @@ def _reference(
         offsets = tokens % page_size
         keys, values = key[pages, :, offsets], value[pages, :, offsets]
         scores = torch.einsum("qhgd,khd->qhgk", queries[seq], keys) * dim**-0.5
-        visible = (
-            length - query_length + 1 + positions
-            if causal
-            else torch.full_like(positions, length)
-        )
-        masked = tokens[None, :] >= visible[:, None]
+        # Row i sits at key position length - query_length + i.
+        distance = (length - query_length + positions)[:, None] - tokens[None, :]
+        masked = distance < 0 if causal else torch.zeros_like(distance, dtype=bool)
         if window > 0:
-            masked |= tokens[None, :] < (visible - window)[:, None]
+            # A non-causal window is two-sided: |distance| < window.
+            masked |= (distance if causal else distance.abs()) >= window
         scores.masked_fill_(masked[:, None, None, :], float("-inf"))
         denominator = torch.logsumexp(scores, dim=-1, keepdim=True)
         if sinks is not None:
@@ -130,7 +128,7 @@ def _reference(
             )
         probs = torch.exp(scores - denominator)
         # Empty query rows have no attention mass, including with -inf sinks.
-        probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
+        probs.masked_fill_(masked.all(dim=-1)[:, None, None, None], 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
     return output.reshape_as(query)
 
@@ -313,6 +311,54 @@ _NONCAUSAL_CASES = [
         "noncausal-q1",
         {"causal": False, "group_size": 8, "block_size": 64, "max_partitions": 2},
     ),
+    (
+        "noncausal-q1-window",
+        {
+            "causal": False,
+            "group_size": 8,
+            "block_size": 64,
+            "window": 100,
+            "lengths": (0, 1, 99, 100, 101, 1027),
+            "max_partitions": 2,
+        },
+    ),
+    # Two-sided windows keep each row's causal left edge. Lengths straddle
+    # W + query_length - 1, where the oldest row first loses keys, and tile edges.
+    (
+        "noncausal-window-q5-g4-d64",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "window": 300,
+            "lengths": (0, 1, 255, 300, 304, 305, 557, 1029, 3000),
+            "max_partitions": 4,
+            "sink_dtype": torch.float32,
+        },
+    ),
+    # DFlash2 drafter geometry: GQA 4, head 128, window 2048, blocks of 8 and 16.
+    *[
+        (
+            f"noncausal-window2048-q{query_length}-page{page}",
+            {
+                "causal": False,
+                "query_length": query_length,
+                "kv_heads": 2,
+                "group_size": 4,
+                "block_size": page,
+                "window": 2048,
+                "lengths": tuple(
+                    length + query_length for length in (2047, 2048, 2303, 2304)
+                )
+                + (1, 9000),
+                "max_partitions": 8,
+            },
+        )
+        for query_length, page in ((8, 128), (16, 16))
+    ],
 ]
 _FP8_NONCAUSAL_CASES = _NONCAUSAL_CASES + [
     # One-hot tokens cover contexts shorter than the block exactly.
@@ -343,6 +389,60 @@ _FP8_NONCAUSAL_CASES = _NONCAUSAL_CASES + [
             "max_partitions": 64,
             "budget": 4096,
             "mtp4_fused": True,
+        },
+    ),
+    # Two KV heads keep a windowed MTP4 plan's query rows fused.
+    (
+        "noncausal-window-q4-g16-mtp4-fused",
+        {
+            "causal": False,
+            "query_length": 4,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "window": 300,
+            "lengths": (65 * 256 + 3, 1, 256, 257, 259, 515),
+            "max_partitions": 64,
+            "budget": 4096,
+            "mtp4_fused": True,
+        },
+    ),
+    # One-hot tokens mark the keys each row sees, so a window edge one token off,
+    # or one shared by the block, fails. Window 3 ends before the newest row.
+    *[
+        (
+            f"noncausal-window{window}-q5-one-hot",
+            {
+                "causal": False,
+                "query_length": 5,
+                "kv_heads": 2,
+                "group_size": 4,
+                "head_dim": 64,
+                "block_size": 16,
+                "window": window,
+                "lengths": lengths,
+                "max_partitions": 3,
+                "pattern": "one_hot_token",
+            },
+        )
+        for window, lengths in (
+            (3, (1, 2, 3, 5, 7, 17, 260)),
+            (300, (4, 5, 6, 298, 299, 303, 304, 305, 600, 1029)),
+        )
+    ],
+    # Random keys hide a few edge keys of a 2048-key window; one-hot ones do not.
+    (
+        "noncausal-window2048-q16-one-hot",
+        {
+            "causal": False,
+            "query_length": 16,
+            "kv_heads": 2,
+            "group_size": 4,
+            "block_size": 16,
+            "window": 2048,
+            "lengths": (2062, 2063, 2064, 2318, 2319, 2320, 4111),
+            "max_partitions": 8,
+            "pattern": "one_hot_token",
         },
     ),
 ]
@@ -450,6 +550,21 @@ _BF16_CASES = _COMMON_CASES + [
             "capture": True,
         },
     ),
+    # A window narrower than the block ends W - 1 keys after each row.
+    (
+        "noncausal-window3-q5",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "window": 3,
+            "lengths": (1, 2, 5, 7, 260, 1029),
+            "max_partitions": 3,
+        },
+    ),
     (
         "loose-bound",
         {
@@ -555,6 +670,18 @@ _PIPE_CASES = [
             "causal": False,
             "query_length": 4,
             "lengths": (0, 1, 3, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "one_hot_token",
+        },
+    ),
+    (
+        "d256-page64-q4-noncausal-window",
+        {
+            **_PIPE_BASE,
+            "causal": False,
+            "query_length": 4,
+            "window": 70,
+            "lengths": (0, 1, 3, 65, 72, 73, 257, 2049),
             "max_partitions": 4,
             "pattern": "one_hot_token",
         },
@@ -945,50 +1072,3 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
-
-
-def test_pa_decode_noncausal_contract(device):
-    """causal=False reuses single-query kernels and rejects sliding windows."""
-    from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
-
-    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    common = {
-        "head_dim": 128,
-        "query_group_size": 8,
-        "block_size": 64,
-        "num_seqs": 2,
-        "num_kv_heads": 1,
-        "num_compute_units": 256,
-        "work_capacity": 4,
-        "query_dtype": "bf16",
-        "kv_dtype": "bf16",
-    }
-
-    def key(**kwargs):
-        return PaDecodeSchedule.select(**common, **kwargs).cache_key
-
-    assert key(causal=False) == key()
-    assert key(query_length=4, causal=False) != key(query_length=4)
-    with pytest.raises(NotImplementedError, match="sliding windows"):
-        key(query_length=4, sliding_window=128, causal=False)
-
-    context = torch.full((2,), 8, dtype=torch.int32, device=device)
-    plan = pa.plan_pa_decode(context, 1, max_partitions=1)
-    empty = torch.empty(0, device=device)
-    for options, error in (
-        ({"causal": False, "sliding_window": 128}, NotImplementedError),
-        ({"causal": 0}, TypeError),
-    ):
-        with pytest.raises(error, match="causal"):
-            pa.pa_decode(
-                empty,
-                empty,
-                empty,
-                empty,
-                context,
-                empty,
-                1.0,
-                4,
-                work_plan=plan,
-                **options,
-            )

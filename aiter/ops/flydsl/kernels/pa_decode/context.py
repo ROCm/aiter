@@ -121,9 +121,11 @@ class PaDecodeContext:
 
     def init_causal_offsets(self):
         # Distance to the newest query keeps causal bounds tile-relative.
-        if const_expr(not self.traits.causal):
+        # It also places the window's left edge, which is the same for both modes.
+        zero = [0 for _m in range_constexpr(self.traits.M_TILES)]
+        if const_expr(not self.traits.causal and self.traits.sliding_window == 0):
             # Every query row of a non-causal block sees the whole context.
-            self.causal_offset = [0 for _m in range_constexpr(self.traits.M_TILES)]
+            self.causal_offset = zero
         elif const_expr(self.traits.QUERIES_PER_CTA == 1):
             self.causal_offset = [
                 self.traits.query_length - 1 - self.query_begin
@@ -142,3 +144,15 @@ class PaDecodeContext:
                 self.causal_offset = [
                     (offset > 0).select(offset, 0) for offset in self.causal_offset
                 ]
+        # A non-causal window reaches W - 1 keys past each row, so it ends at the
+        # context unless the block is longer than the window.
+        if const_expr(self.traits.causal):
+            self.upper_offset = self.causal_offset
+        elif const_expr(0 < self.traits.sliding_window < self.traits.query_length):
+            reach = self.traits.sliding_window - 1
+            self.upper_offset = [
+                (offset > reach).select(offset - reach, 0)
+                for offset in self.causal_offset
+            ]
+        else:
+            self.upper_offset = zero

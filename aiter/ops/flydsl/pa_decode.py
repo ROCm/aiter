@@ -226,7 +226,9 @@ def pa_decode(
     position; 0 and -1 disable it.
     ``causal=False`` drops the causal mask: all query_length rows of a sequence
     attend to all ``context_lengths[i]`` keys, e.g. a bidirectional draft block
-    whose own keys are already cached. It does not support sliding windows.
+    whose own keys are already cached. Its sliding window is two-sided: the row
+    at position p sees key k when |p - k| < sliding_window, the definition of
+    FlashAttention's ``window_size=(W - 1, W - 1)``.
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
     calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
@@ -281,7 +283,7 @@ def pa_decode(
         raise TypeError("query_length must be an int")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
-    resolve_causal(causal, query_length, sliding_window)
+    resolve_causal(causal, query_length)
 
     required_tensors = (
         ("output", output),

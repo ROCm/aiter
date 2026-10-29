@@ -37,7 +37,7 @@ def d256_pipe(
 
     Uniform query length; rows = query_length * query_group_size fit two
     16-row M-tiles that share one K/V stream. Packed caches support both V
-    layouts, per-tensor/per-token scales and causal sliding windows.
+    layouts, per-tensor/per-token scales and sliding windows.
     """
     return (
         "gfx95" in arch
@@ -95,12 +95,10 @@ def _bf16_lds_bytes(head_dim, query_rows, block_size):
     return qp_bytes + max_sum_bytes + 4 * pages_per_chunk * 4
 
 
-def resolve_causal(causal, query_length, sliding_window):
-    """Validate ``causal``; one query row sees the whole context either way."""
+def resolve_causal(causal, query_length):
+    """Validate ``causal``; one query row sees the same keys either way."""
     if not isinstance(causal, bool):
         raise TypeError("causal must be a bool")
-    if not causal and sliding_window > 0:
-        raise NotImplementedError("causal=False does not support sliding windows")
     return causal or query_length == 1
 
 
@@ -145,7 +143,7 @@ class PaDecodeSchedule:
             raise ValueError("work_capacity must be positive")
         if not trans_k:
             raise NotImplementedError("Non-transposed key cache is not implemented")
-        causal = resolve_causal(causal, query_length, sliding_window)
+        causal = resolve_causal(causal, query_length)
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
         if kv_dtype not in ("fp8", "bf16"):
