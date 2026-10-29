@@ -964,11 +964,13 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
-def get_pa_metadata_info_v1(
-    batch_size: int,
-    num_head_k: int = 1,
-):
+def get_pa_metadata_info_v1(batch_size: int, num_head_k: int = 1):
     """
+    Allocate PA metadata buffers. Batches from 513 to 32768 reserve an internal
+    work-info scratch tail for parallel planning when KV heads divide the CU
+    count. Existing smaller buffers remain usable through the serial fallback.
+    Only records before work_indptr[-1] are attention tasks.
+
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
@@ -985,6 +987,13 @@ def get_pa_metadata_info_v1(
     tile_cnt = batch_size
     max_work = (tile_cnt + cu_num - 1) * num_head_k
     max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
+
+    if (
+        512 < batch_size <= 32768
+        and 1 <= num_head_k <= cu_num
+        and cu_num % num_head_k == 0
+    ):
+        max_work += batch_size + 2 * ((batch_size + 511) // 512)
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs
@@ -1031,9 +1040,17 @@ def get_pa_metadata_v1(
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
-            fast_mode: default=True. Whether user wants metadata become as fast as possible. Note that fast
-                       mode may lead to bad overall performance.
+            fast_mode: default=True. Uses parallel generation for dense, single-Q-tile inputs
+                       with page size 16 (block_size=kv_granularity=16), up to 32768 requests and
+                       the full CU worker budget. False, other page sizes or configurations, or
+                       buffers without the extra scratch space (see get_pa_metadata_info_v1) use
+                       the serial generator with identical metadata. Valid inputs require consistent
+                       indptrs, context lengths and positive Q lengths. Empty contexts have no
+                       attention work in the parallel path; callers own their outputs.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
+            max_split_per_batch: Global worker budget:
+                       negative uses the CU count, otherwise min(CUs, batch * value).
+                       The budget must be positive and divisible by the KV-head count.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.
