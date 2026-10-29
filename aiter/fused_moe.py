@@ -4,6 +4,7 @@
 import functools
 import os
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -263,6 +264,135 @@ def _fused_decode_sort_quant(
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
 
+# Optional BM=16 sort metadata from a caller's fused route+sort kernel (e.g.
+# SGLang's radix-4 router), registered on the calling thread immediately before
+# fused_moe. CUDA-graph replay does not re-enter Python, so a captured fused_moe
+# keeps whichever sort launches it was captured with.
+_PRESORTED_MOE = threading.local()
+# The only block size a presort is accepted for; other tile sizes re-sort.
+_PRESORTED_MOE_BLOCK_M = 16
+
+
+def register_presorted_moe(aux: dict | None) -> None:
+    """Hand the next fused_moe call on this thread a precomputed BM=16 sort.
+
+    ``aux`` holds the sort outputs (sorted_token_ids, sorted_weights,
+    sorted_expert_ids, num_valid_ids, m_indices, reverse_sorted) and the keys
+    they were computed for (topk_ids_ptr, topk_weights_ptr, M, block_m,
+    num_experts, topk). The sort outputs must use aiter's BM=16 sort layout:
+    contiguous tensors on topk_ids' device, fp32 sorted_weights and int32
+    everything else, sorted_expert_ids with one entry per 16 sorted rows,
+    sorted_weights and m_indices at least as long as sorted_token_ids,
+    reverse_sorted with M * topk entries and num_valid_ids with 2. A
+    registration that does not match the call or breaks this layout is ignored,
+    and fused_moe runs its own sort.
+
+    Set moe_buf_zeroed and moe_buf_ptr when the caller already zeroed the buffer
+    it will pass as ``output``; fused_moe then skips its own zeroing. Without
+    ``output`` fused_moe always zeroes the buffer it allocates. That
+    decision is made in Python, so under CUDA graphs it is frozen at capture:
+    the caller's zeroing must run on the current stream before fused_moe on
+    every call and be captured in the same graph (e.g. inside the caller's
+    route+sort kernel), or replays accumulate into a stale buffer.
+
+    The next fused_moe consumes the registration on every path, whether or not
+    it matches or is used, so a stale registration never applies to a later
+    call. A caller that registers and then does not call fused_moe must clear it
+    with ``register_presorted_moe(None)``. It is only used when the call runs with block_m == 16 and without
+    expert_mask or num_local_tokens; other calls run fused_moe's own sort.
+    """
+    _PRESORTED_MOE.aux = aux
+
+
+def _pop_presorted_moe():
+    aux = getattr(_PRESORTED_MOE, "aux", None)
+    _PRESORTED_MOE.aux = None
+    return aux
+
+
+def _match_presorted_moe(
+    aux,
+    topk_ids,
+    topk_weight,
+    *,
+    block_m,
+    num_experts,
+    topk,
+    expert_mask=None,
+    num_local_tokens=None,
+):
+    if not aux or int(block_m) != _PRESORTED_MOE_BLOCK_M:
+        return None
+    # The presort has no expert mask applied and covers every row of topk_ids;
+    # moe_sorting honors both, so a masked or row-limited call must re-sort.
+    if expert_mask is not None or num_local_tokens is not None:
+        return None
+    if (
+        int(aux.get("topk_ids_ptr", 0)) != int(topk_ids.data_ptr())
+        # sorted_weights were gathered from this tensor.
+        or int(aux.get("topk_weights_ptr", 0)) != int(topk_weight.data_ptr())
+        or int(aux.get("M", -1)) != int(topk_ids.shape[0])
+        or int(aux.get("block_m", -1)) != int(block_m)
+        or int(aux.get("num_experts", -1)) != int(num_experts)
+        or int(aux.get("topk", -1)) != int(topk)
+    ):
+        return None
+    return aux if _presorted_layout_ok(aux, topk_ids, topk, num_experts) else None
+
+
+def _presorted_layout_ok(aux, topk_ids, topk, num_experts):
+    """Whether the six sort tensors match the layout the aux-sort kernels read.
+
+    The stages size their intermediates from sorted_token_ids.numel() (max_sorted)
+    and index sorted_weights and m_indices by sorted row, sorted_expert_ids by
+    16-row block and reverse_sorted by route. num_valid_ids[0] (padded rows) is
+    read by every stage; [1] (valid tokens) only by the valid-token-count GEMM2,
+    which this path never enables, but every aiter sort emits both.
+    """
+    try:
+        ids = aux["sorted_token_ids"]
+        weights = aux["sorted_weights"]
+        experts = aux["sorted_expert_ids"]
+        num_valid = aux["num_valid_ids"]
+        m_indices = aux["m_indices"]
+        reverse = aux["reverse_sorted"]
+    except KeyError:
+        return False
+    device = topk_ids.device
+    i32 = dtypes.i32
+    for t, dtype in (
+        (ids, i32),
+        (weights, dtypes.fp32),
+        (experts, i32),
+        (num_valid, i32),
+        (m_indices, i32),
+        (reverse, i32),
+    ):
+        if (
+            not isinstance(t, torch.Tensor)
+            # The stages take lengths from shape[0], so a reshaped buffer would
+            # be sized by its first dimension only.
+            or t.ndim != 1
+            or t.dtype != dtype
+            or t.device != device
+            or not t.is_contiguous()
+        ):
+            return False
+    max_sorted = ids.numel()
+    # Worst case for a BM=16 sort, as aiter's own sort allocates: every route
+    # plus BM - 1 padding rows per active expert. Smaller cannot hold all routings.
+    M = topk_ids.shape[0]
+    BM = _PRESORTED_MOE_BLOCK_M
+    capacity = -(-(M * topk + min(num_experts, M * topk) * (BM - 1)) // BM) * BM
+    return (
+        max_sorted >= capacity
+        and experts.numel() * _PRESORTED_MOE_BLOCK_M == max_sorted
+        and weights.numel() >= max_sorted
+        and m_indices.numel() >= max_sorted
+        and reverse.numel() == topk_ids.shape[0] * topk
+        and num_valid.numel() >= 2
+    )
+
 
 # FLAT 1stage asm kernels ingest raw topk_ids / topk_weights through the
 # sorted_* kernarg slots and accumulate via global_atomic_pk_add_bf16, so
@@ -381,6 +511,7 @@ def _adaptive_moe_sort(
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
 #     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
+#     caller presort (register_presorted_moe)   yes        zeroed here unless caller did
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -1491,6 +1622,9 @@ def _fused_moe_impl(
     _stage2_override: Callable | None = None,
     _enforce_metadata_block_size: bool = False,
 ) -> torch.Tensor:
+    # Consume a caller's presort first, so every path (including early returns
+    # and errors) clears it.
+    presorted_aux = _pop_presorted_moe()
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
@@ -1933,32 +2067,75 @@ def _fused_moe_impl(
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        # BM16's adaptive sort already emits routes and zeroes the output without
-        # quantizing. Keep the Opus crossover for the configured aux pipeline.
-        sorting_ret = moe_sorting(
+        presorted = _match_presorted_moe(
+            presorted_aux,
             topk_ids,
             topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            expert_mask,
-            num_local_tokens,
-            return_local_topk_ids=need_local_topk_ids,
-            accumulate=_atomic and not runtime_stage2_reduce,
-            output_aux=metadata.output_aux,
-            output=output,
+            block_m=block_size_M,
+            num_experts=global_E,
+            topk=topk,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
         )
-        (
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            sort_m_indices,
-            sort_reverse_sorted,
-        ) = sorting_ret[:7]
-        local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+        if presorted is not None:
+            sorted_ids = presorted["sorted_token_ids"]
+            sorted_weights = presorted["sorted_weights"]
+            sorted_expert_ids = presorted["sorted_expert_ids"]
+            num_valid_ids = presorted["num_valid_ids"]
+            sort_m_indices = presorted["m_indices"]
+            sort_reverse_sorted = presorted["reverse_sorted"]
+            if _atomic and not runtime_stage2_reduce:
+                # Atomic GEMM2 faults on a destination that is not 16-byte aligned
+                # (as the adaptive sort guards), so an underaligned caller output
+                # gets a fresh moe_buf and _return_output copies back.
+                in_place = output is not None and output.data_ptr() % 16 == 0
+                moe_buf = (
+                    output
+                    if in_place
+                    else torch.empty(
+                        (M, model_dim), dtype=dtype, device=topk_ids.device
+                    )
+                )
+                # Atomic GEMM2 needs a zeroed destination; skip the zeroing only
+                # if the caller zeroed this exact output. A buffer allocated here
+                # can reuse a freed block at the same address, so always zero it.
+                if not (
+                    in_place
+                    and presorted.get("moe_buf_zeroed")
+                    and int(presorted.get("moe_buf_ptr", 0)) == output.data_ptr()
+                ):
+                    moe_buf.zero_()
+            else:
+                moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
+            local_topk_ids = None
+        else:
+            # BM16's adaptive sort already emits routes and zeroes the output
+            # without quantizing. Keep the Opus crossover for the configured aux
+            # pipeline.
+            sorting_ret = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                return_local_topk_ids=need_local_topk_ids,
+                accumulate=_atomic and not runtime_stage2_reduce,
+                output_aux=metadata.output_aux,
+                output=output,
+            )
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_m_indices,
+                sort_reverse_sorted,
+            ) = sorting_ret[:7]
+            local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
     elif fused_sort_quant:
         (
             sorted_ids,
