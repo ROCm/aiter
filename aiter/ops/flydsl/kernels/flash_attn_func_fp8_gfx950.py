@@ -117,6 +117,24 @@ def _fp8_config_reason(
     return None
 
 
+def _fp8_flat_elems_reason(q, k, v, packed: bool) -> str | None:
+    """Why a launch would overflow the int32 flat dim, or None if it fits.
+
+    Dense batches launch once per entry, so only one entry has to fit; packed
+    varlen tensors have no batch to divide.
+    """
+    out_elems = q.numel() // q.shape[-1] * v.shape[-1]
+    per_launch = 1 if packed else max(q.shape[0], 1)
+    largest = max(q.numel(), k.numel(), v.numel(), out_elems) // per_launch
+    if largest < _FP8_MAX_FLAT_ELEMS:
+        return None
+    return (
+        "fp8 flattens Q/K/V/O and packs the dynamic dim as int32, so no tensor "
+        f"may reach {_FP8_MAX_FLAT_ELEMS} elements per launch; got q={q.numel()}, "
+        f"k={k.numel()}, v={v.numel()}, out={out_elems}"
+    )
+
+
 def flydsl_flash_attn_fp8_supported(
     device: torch.device,
     num_heads: int,
@@ -346,6 +364,14 @@ def flydsl_flash_attn_fp8_func(
             f"flydsl_flash_attn_fp8_func: q/k/v must be float8_e4m3fn, got {q.dtype!r}"
         )
 
+    # Dense launches take the batch from q (also the per-entry split below); a
+    # smaller k/v batch would be read past its end.
+    if q.dim() == 4 and not (q.shape[0] == k.shape[0] == v.shape[0]):
+        raise ValueError(
+            f"flydsl_flash_attn_fp8_func: q/k/v batch sizes must match, got "
+            f"{q.shape[0]}/{k.shape[0]}/{v.shape[0]}"
+        )
+
     _auto_splits = num_kv_splits is None
     if _auto_splits:
         num_kv_splits = 1
@@ -356,13 +382,10 @@ def flydsl_flash_attn_fp8_func(
     _out_elems = q.numel() // q.shape[-1] * v.shape[-1]
     if max(q.numel(), k.numel(), v.numel(), _out_elems) >= _FP8_MAX_FLAT_ELEMS:
         _packed = cu_seqlens_q is not None or cu_seqlens_kv is not None or q.dim() != 4
-        if _packed or q.shape[0] == 1:
+        _reason = _fp8_flat_elems_reason(q, k, v, _packed)
+        if _reason is not None:
             raise NotImplementedError(
-                "flydsl_flash_attn_fp8_func: fp8 flattens Q/K/V/O and packs the dynamic "
-                f"dim as int32, so no tensor may reach {_FP8_MAX_FLAT_ELEMS} elements; "
-                f"got q={q.numel()}, k={k.numel()}, v={v.numel()}, out={_out_elems}. "
-                "Shorten the sequence "
-                "or use bf16."
+                f"flydsl_flash_attn_fp8_func: {_reason}. Shorten the sequence or use bf16."
             )
         kw = {
             "softmax_scale": softmax_scale,
@@ -437,6 +460,26 @@ def flydsl_flash_attn_fp8_func(
     if not varlen and cu_seqlens_kv is not None:
         raise ValueError(
             "flydsl_flash_attn_fp8_func: cu_seqlens_q required when cu_seqlens_kv is given"
+        )
+
+    for name, cu in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_kv", cu_seqlens_kv)):
+        if cu is not None and (
+            cu.device != q.device or cu.dtype != torch.int32 or not cu.is_contiguous()
+        ):
+            raise ValueError(
+                f"flydsl_flash_attn_fp8_func: {name} must be a contiguous int32 tensor "
+                f"on {q.device}, got {cu.dtype} on {cu.device}"
+            )
+    if varlen and (
+        cu_seqlens_q.dim() != 1
+        or cu_seqlens_kv.dim() != 1
+        or cu_seqlens_q.numel() < 2
+        or cu_seqlens_q.numel() != cu_seqlens_kv.numel()
+    ):
+        raise ValueError(
+            "flydsl_flash_attn_fp8_func: cu_seqlens_q/cu_seqlens_kv must be 1-D [B+1] "
+            f"with B >= 1 and equal lengths, got {tuple(cu_seqlens_q.shape)} and "
+            f"{tuple(cu_seqlens_kv.shape)}"
         )
 
     if varlen:
@@ -577,6 +620,10 @@ def flydsl_flash_attn_fp8_func(
             raise ValueError(
                 f"flydsl_flash_attn_fp8_func: fp8 output must be bf16, got {out.dtype}"
             )
+        elif out.device != q.device:
+            raise ValueError(
+                f"flydsl_flash_attn_fp8_func: out must be on {q.device}, got {out.device}"
+            )
         elif not out.is_contiguous():
             raise ValueError(
                 "flydsl_flash_attn_fp8_func: out must be contiguous, got strides "
@@ -595,6 +642,10 @@ def flydsl_flash_attn_fp8_func(
             elif lse.dtype != torch.float32:
                 raise ValueError(
                     f"flydsl_flash_attn_fp8_func: lse must be float32, got {lse.dtype}"
+                )
+            elif lse.device != q.device:
+                raise ValueError(
+                    f"flydsl_flash_attn_fp8_func: lse must be on {q.device}, got {lse.device}"
                 )
             elif not lse.is_contiguous():
                 raise ValueError(
