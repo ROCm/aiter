@@ -360,35 +360,6 @@ def _build_launcher(
                     )
                 fx.gpu.barrier()
 
-            n_tiles = K // BLOCK_K
-            fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
-            fx.copy(
-                b_copy,
-                thr_gB_k[None, None, None, 0],
-                b_dst(0),
-            )
-            if fx.const_expr(n_tiles > 1):
-                fx.copy(
-                    b_copy,
-                    thr_gB_k[None, None, None, 0],
-                    b_dst(1),
-                    soffset=fx.Int32(1) * gB_k_stride,
-                )
-            mma_frag_C.fill(0)
-            fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
-            fx.gpu.barrier()
-
-            for k_tile in fx.range_constexpr(n_tiles):
-                a_slot = k_tile % 2
-                b_slot = k_tile % B_STAGES
-                a_next = k_tile + 1 if k_tile + 1 < n_tiles else None
-                b_next = (
-                    (k_tile + B_STAGES - 1)
-                    if (k_tile + B_STAGES - 1) < n_tiles
-                    else None
-                )
-                run_pipeline_stage(a_slot, b_slot, a_next_k=a_next, b_next_k=b_next)
-
             mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
             thr_copy_r2s_C = fx.make_tiled_copy_C(
                 fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16), tiled_mma
@@ -407,7 +378,22 @@ def _build_launcher(
                 thr_gBias,
                 bias_frag,
             )
-            acc = mma_frag_C.load()
+
+            n_tiles = K // BLOCK_K
+            fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
+            fx.copy(
+                b_copy,
+                thr_gB_k[None, None, None, 0],
+                b_dst(0),
+            )
+            if fx.const_expr(n_tiles > 1):
+                fx.copy(
+                    b_copy,
+                    thr_gB_k[None, None, None, 0],
+                    b_dst(1),
+                    soffset=fx.Int32(1) * gB_k_stride,
+                )
+            acc_shape = mma_frag_C.shape.to_py_value()
             bias = bias_frag.load()
             if fx.const_expr(DENSE_KN):
                 # The N permutation folds the n-reps into the copy's first
@@ -423,10 +409,23 @@ def _build_launcher(
                         for a in range(4)
                     ],
                 )
-            # Same element count, different logical shape: relabel the bias
-            # fragment so the add stays a flat vector op instead of broadcasting.
-            bias = fx.Vector(bias, acc.shape, fx.BFloat16)
-            mma_frag_C_bf16.store(_f32_to_bf16_rne(acc + bias))
+            mma_frag_C.store(fx.Vector(bias, acc_shape, fx.BFloat16).to(fx.Float32))
+            fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
+            fx.gpu.barrier()
+
+            for k_tile in fx.range_constexpr(n_tiles):
+                a_slot = k_tile % 2
+                b_slot = k_tile % B_STAGES
+                a_next = k_tile + 1 if k_tile + 1 < n_tiles else None
+                b_next = (
+                    (k_tile + B_STAGES - 1)
+                    if (k_tile + B_STAGES - 1) < n_tiles
+                    else None
+                )
+                run_pipeline_stage(a_slot, b_slot, a_next_k=a_next, b_next_k=b_next)
+
+            acc = mma_frag_C.load()
+            mma_frag_C_bf16.store(_f32_to_bf16_rne(acc))
 
             sC = fx.make_view(
                 fx.get_dyn_shared(fx.BFloat16),
