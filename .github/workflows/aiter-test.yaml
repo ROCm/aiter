@@ -152,7 +152,7 @@ jobs:
     if: >-
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
       needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
-    runs-on: build-only-aiter
+    runs-on: build-only-aiter-vultr-mi325
     needs: [detect_aiter_test_scope, check-signal, ci_config]
     permissions:
       id-token: write
