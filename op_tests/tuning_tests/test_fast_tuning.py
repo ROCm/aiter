@@ -1382,6 +1382,38 @@ class TestPowerTableSeparation(unittest.TestCase):
             sparse.mark()
         self.assertEqual(len([kind for kind, _ in log if kind == "record"]), 3)
 
+    def test_launch_bound_window_is_scaled_to_kernel_power(self):
+        import math
+        import time
+
+        from aiter.utility import package_power
+
+        active = package_power.active_watts
+        self.assertEqual(active(500.0, 300.0, 1.0), 500.0)
+        self.assertAlmostEqual(active(400.0, 300.0, 0.5), 500.0)
+        self.assertTrue(math.isnan(active(310.0, 300.0, 0.05)))
+        self.assertEqual(active(400.0, None, 0.5), 400.0)
+
+        def launch():
+            # Host-bound: 1 ms of host time per "launch" of a 0.5 ms kernel.
+            time.sleep(0.001)
+
+        with (
+            mock.patch.object(package_power, "power_input_path", return_value="x"),
+            mock.patch.object(package_power, "_read_watts", return_value=400.0),
+            mock.patch.object(package_power, "idle_watts", return_value=300.0),
+            mock.patch.object(package_power, "_sync_cuda"),
+            mock.patch.object(package_power._InFlight, "mark"),
+        ):
+            raw = package_power.measure_package_watts(launch, seconds=0.1)
+            corrected = package_power.measure_package_watts(
+                launch, seconds=0.1, kernel_us=500.0
+            )
+        self.assertEqual(raw, 400.0)
+        # busy is about 0.5, so 300 + (400 - 300) / 0.5 = 500.
+        self.assertGreater(corrected, 430.0)
+        self.assertLess(corrected, 620.0)
+
     def test_a16w16_hands_its_policy_to_hipblaslt(self):
         from csrc.gemm_a16w16 import gemm_a16w16_tune
 

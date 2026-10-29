@@ -359,7 +359,9 @@ class IQ2RGlm53Tuner(TunerCommon):
                 tflops, tbps = self.calculate((info, us, 0.0))
                 from aiter.utility.tune_result import TuneResult
 
-                watts = self.policy_for(args).measure(graph.replay)
+                watts = self.policy_for(args).measure(
+                    graph.replay, kernel_us=us * len(calls)
+                )
                 del graph
                 watt_text = (
                     f", {watts:.1f} W" if math.isfinite(watts) and watts > 0 else ""

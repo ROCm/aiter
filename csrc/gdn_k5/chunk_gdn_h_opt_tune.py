@@ -307,7 +307,7 @@ def sweep_case_row(
         times[bv] = bench_us(inputs, bv, warmup, iters)
         os.environ["FLYDSL_K5_OPT_BV"] = str(bv)
         try:
-            policy.record(watts, bv, lambda: k5(**inputs))
+            policy.record(watts, bv, lambda: k5(**inputs), kernel_us=times[bv])
         finally:
             os.environ.pop("FLYDSL_K5_OPT_BV", None)
 

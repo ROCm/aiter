@@ -233,7 +233,9 @@ def worker(
         max_err_ratio = 1.0
 
     if us not in (-1, 0) and us != float("inf") and res is not None:
-        watts = policy.measure_timed(func, args, kwargs, device_index=gpu_id)
+        watts = policy.measure_timed(
+            func, args, kwargs, device_index=gpu_id, kernel_us=us
+        )
 
     return TuneResult(info, us, round(max_err_ratio, 4), watts)
 
