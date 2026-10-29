@@ -1264,9 +1264,7 @@ class TestPowerTableSeparation(unittest.TestCase):
         from aiter.utility.base_tuner import TunerCommon
 
         def stamp_stub():
-            stub = SimpleNamespace(
-                columns=["M", "us"], POWER_WATT_COLUMNS=("watts",)
-            )
+            stub = SimpleNamespace(columns=["M", "us"], POWER_WATT_COLUMNS=("watts",))
             stub.power_metrics = lambda df: TunerCommon.power_metrics(stub, df)
             stub._rows_with_finite_watts = (
                 lambda df: TunerCommon._rows_with_finite_watts(stub, df)
@@ -1320,7 +1318,9 @@ class TestPowerTableSeparation(unittest.TestCase):
         def kernel(x):
             raise AssertionError(f"kernel called directly with {x}")
 
-        with mock.patch("aiter.test_common.run_perftest", return_value=("out", 1.0)) as perftest:
+        with mock.patch(
+            "aiter.test_common.run_perftest", return_value=("out", 1.0)
+        ) as perftest:
             replay_timed_call(kernel, (1,), {"num_warmup": 10, "num_iters": 101})
         perftest.assert_called_once_with(kernel, 1, num_warmup=10, num_iters=101)
 
@@ -1376,9 +1376,7 @@ class TestPowerTableSeparation(unittest.TestCase):
         self.assertEqual(float(frame.iloc[0]["watts"]), 400.0)
         dropped = GroupedFmoeTuner.__new__(GroupedFmoeTuner)
         dropped.columns = ["token", "us"]
-        kept = dropped.post_process(
-            [{"token": 1, "us": 2.0, "watts": 500.0}], None
-        )
+        kept = dropped.post_process([{"token": 1, "us": 2.0, "watts": 500.0}], None)
         self.assertEqual(float(kept.iloc[0]["watts"]), 500.0)
 
     def test_power_tune_of_shipped_table_writes_to_power_configs(self):
