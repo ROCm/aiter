@@ -43,9 +43,6 @@ MHA_V4_MXFP4_V_BUFFER_SLACK_BYTES = FP4_V_BUFFER_SLACK_BYTES
 # Measured on gfx950: 1023 trailing V-scale bytes still fault, 1024 do not, whatever the shape.
 MHA_V4_MXFP4_K_SCALE_SLACK_BYTES = 4
 MHA_V4_MXFP4_V_SCALE_SLACK_BYTES = 2 * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
-# The ASM Q-scale gather is an unguarded global load covering a whole 256-row query tile, so a
-# partial final tile addresses rows past the logical sequence.
-MHA_V4_QUERY_TILE_ROWS = 256
 # K scales are gathered per KV tile with a two-tile producer lead, so the last tiles address rows
 # past the sequence even when it is already tile-aligned.
 MHA_V4_KV_TILE_ROWS = 128
@@ -303,20 +300,14 @@ def block_scale_storage(
     return storage[:elements].view(batch, sequence, heads, blocks)
 
 
-def query_block_scale(
-    input: Tensor, batch: int, sequence: int, heads: int, blocks: int
-) -> Tensor:
-    """Per-row Q-scale view backed by a padded 256-row query tile."""
-    return block_scale_storage(
-        input, batch, sequence, heads, blocks, MHA_V4_QUERY_TILE_ROWS
-    )
-
-
 def _plain_block_scale(input: Tensor) -> Tensor:
     """One E8M0 scale per 32-element block, without the gather padding.
 
-    Used where the consumer addresses scales within the logical sequence, and by the fakes, which
-    only have to agree on shape and dtype.
+    Safe for Q and K because both are gathered through a buffer descriptor whose num_records is
+    the logical extent, so the pipelines' deliberate overshoot past the sequence end -- a whole
+    256-row query tile, a two-tile K lead -- is clamped in hardware and returns zero without
+    touching memory. FP4 K and V still pad, and keep their own checks. Also used by the fakes,
+    which only have to agree on shape and dtype.
     """
     batch, sequence, heads, head_dim = input.shape
     return input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
@@ -325,9 +316,9 @@ def _plain_block_scale(input: Tensor) -> Tensor:
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_q", mutates_args=())
 def quantize_mxfp8_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     """Rotate and quantize hd128 BSHD Q to MXFP8 data and E8M0 block scales."""
-    batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "MXFP8 quantization")
+    _validate_bshd_hd128(input, "MXFP8 quantization")
     quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
-    scale = query_block_scale(input, batch, sequence, heads, head_dim // 32)
+    scale = _plain_block_scale(input)
     rotate_activation_mxfp8_quant(
         quantized, scale, input, multiplier, _or_empty(input, None)
     )
@@ -366,7 +357,7 @@ def quantize_mxfp4_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     quantized = input.new_empty(
         (batch, sequence, heads, head_dim // 2), dtype=torch.uint8
     )
-    scale = query_block_scale(input, batch, sequence, heads, head_dim // 32)
+    scale = _plain_block_scale(input)
     rotate_activation_mxfp4_quant(quantized, scale, input, multiplier)
     return quantized, scale
 
@@ -493,7 +484,7 @@ def quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     quantized = input.new_empty(
         (batch, sequence, heads, head_dim // 32 * 24), dtype=torch.uint8
     )
-    scale = query_block_scale(input, batch, sequence, heads, head_dim // 32)
+    scale = _plain_block_scale(input)
     rotate_activation_mxfp6_quant(quantized, scale, input, multiplier)
     return quantized, scale
 
@@ -625,7 +616,7 @@ def _mxfp4_v_buffers(
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_fp6_p_raw", mutates_args=())
 def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Pack MXFP4 V in the token order consumed by the FP6-P F4F4 kernel."""
+    """Pack MXFP4 V in the token order consumed by the FP6-P kernels."""
     batch, sequence, heads, _ = _validate_bshd_hd128(
         input, "MXFP4 V-for-FP6-P quantization"
     )

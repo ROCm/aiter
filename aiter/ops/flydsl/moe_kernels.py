@@ -2049,8 +2049,9 @@ def _flydsl_moe_stage2_impl(
 
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
         # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4). Default atomic-scatters
-        # into the caller's moe_sorting-zeroed `out`. a16wi4 mode=reduce writes
-        # unique [M*topk,H] rows then moe_reduce. Tiles from the kernelName (like
+        # into the caller's moe_sorting-zeroed `out`. Explicit mode=reduce writes
+        # unique [M*topk,H] rows then moe_reduce for both weight formats. Tiles
+        # come from the kernelName (like
         # a4w4/a8w4). a16wi4 W2 uses the OLD-kernel int4 layout
         # (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) + (E,G//2,N,2) bf16 scale.
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
@@ -2080,7 +2081,7 @@ def _flydsl_moe_stage2_impl(
         )
         _epilog = "atomic"
         gemm2_out = out
-        if b_dtype == "int4" and mode == "reduce":
+        if mode == "reduce":
             _epilog = "reduce"
             gemm2_out = torch.empty(
                 (M_logical * int(topk), model_dim),
@@ -2484,6 +2485,15 @@ def _get_compiled_topids_to_rows():
     return build_moe_topids_to_rows_module()
 
 
+@functools.lru_cache(maxsize=128)
+def _get_compiled_topids_to_rows_lds(n_buckets: int):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_lds_module,
+    )
+
+    return build_moe_topids_to_rows_lds_module(n_buckets)
+
+
 @functools.cache
 def _get_compiled_topids_to_rows_g2l(weight_dtype: str):
     from aiter.ops.flydsl.kernels.moe_route_maps import (
@@ -2664,7 +2674,24 @@ def flydsl_moe_topids_to_rows(
             torch.cuda.current_stream(),
         )
     else:
-        topids_to_rows_kernel = _get_compiled_topids_to_rows()
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+        from aiter.ops.flydsl.kernels.moe_route_maps import (
+            MAX_TP_ROUTE_BUCKETS,
+            tp_route_min_routes,
+        )
+
+        # Keep small calls and wave64 paths unchanged. Wider expert sets
+        # require more routes to amortize their per-workgroup histogram sweeps.
+        use_lds = (
+            get_gfx_runtime() == "gfx1250"
+            and 0 < int(E) <= MAX_TP_ROUTE_BUCKETS
+            and numel >= tp_route_min_routes(int(E))
+        )
+        topids_to_rows_kernel = (
+            _get_compiled_topids_to_rows_lds(int(E))
+            if use_lds
+            else _get_compiled_topids_to_rows()
+        )
         _dispatch_compiled(
             topids_to_rows_kernel,
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),

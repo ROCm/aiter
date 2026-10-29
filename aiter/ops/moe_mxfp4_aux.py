@@ -133,6 +133,7 @@ def mxfp4_moe_sort(
     D_INTER: int,
     MB: int,
     prologue: int,
+    num_local_tokens: Tensor | None = None,
 ) -> None: ...
 
 

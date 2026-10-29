@@ -2371,6 +2371,34 @@ namespace py = pybind11;
           py::arg("is_decode"));                 \
     m.def("topk_use_mulblocks", &topk_use_mulblocks, py::arg("numRows"), py::arg("stride0"));
 
+#define TOP_K_PER_ROW_SAMPLED_PYBIND             \
+    AITER_SET_STREAM_PYBIND;                      \
+    m.def("top_k_per_row_prefill_sampled",       \
+          &top_k_per_row_prefill_sampled,        \
+          py::arg("logits"),                     \
+          py::arg("rowStarts"),                  \
+          py::arg("rowEnds"),                    \
+          py::arg("indices"),                    \
+          py::arg("values"),                     \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt,   \
+          py::arg("ragged")    = true,           \
+          py::arg("nan_high")  = false);         \
+    m.def("topk_sampled_workspace_size",         \
+          &topk_sampled_workspace_size,          \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"));                         \
+    m.def("topk_sampled_supports",               \
+          &topk_sampled_supports,                \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"),                          \
+          py::arg("device_id") = -1);
+
 #define MLA_METADATA_PYBIND                              \
     AITER_SET_STREAM_PYBIND;                             \
     m.def("get_mla_decode_head_plan_v1",                 \
@@ -2516,11 +2544,30 @@ namespace py = pybind11;
           py::arg("rowEnds")   = std::nullopt,    \
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1,               \
-          py::arg("workspace") = std::nullopt);   \
+          py::arg("workspace") = std::nullopt,    \
+          py::arg("nan_high")  = false);          \
+    m.def("topk_plain_use_mulblocks",             \
+          &topk_plain_use_mulblocks,              \
+          py::arg("numRows"),                     \
+          py::arg("stride0"),                     \
+          py::arg("k"),                           \
+          py::arg("ragged"));                     \
     m.def("topk_plain_workspace_size",            \
           &topk_plain_workspace_size,             \
           py::arg("numRows"),                     \
           py::arg("stride0"),                     \
+          py::arg("k"));                          \
+    m.def("topk_plain_width",                     \
+          &topk_plain_width,                      \
+          py::arg("name"));                       \
+    m.def("topk_plain_uses_radix",                \
+          &topk_plain_uses_radix,                 \
+          py::arg("width"),                       \
+          py::arg("k"));                          \
+    m.def("topk_plain_reads_pitch",               \
+          &topk_plain_reads_pitch,                \
+          py::arg("numRows"),                     \
+          py::arg("width"),                       \
           py::arg("k"));
 
 #define RMSNORM_QUANT_PYBIND                 \
@@ -2812,7 +2859,8 @@ namespace py = pybind11;
           py::arg("D_HIDDEN"),                \
           py::arg("D_INTER"),                 \
           py::arg("MB"),                      \
-          py::arg("prologue"));               \
+          py::arg("prologue"),                \
+          py::arg("num_local_tokens") = std::nullopt); \
     m.def("mxfp4_moe_quant",                  \
           &mxfp4_moe_quant_kernel,            \
           py::arg("a_input"),                 \

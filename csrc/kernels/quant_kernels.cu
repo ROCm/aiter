@@ -670,7 +670,7 @@ __global__ void initializeScale(float *d_data, int size, float value)
     }
 }
 
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16, bool check_tail = false>
 __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __restrict__ input,
                                                              const int32_t cols)
 {
@@ -690,6 +690,24 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
     auto buffer_i = opus::make_gmem<DTYPE_I>(ptr_i, oob_i * sizeof(DTYPE_I));
 
+    // Only the per-tensor non-dword-aligned path needs scalar row-tail loads.
+    auto load_vec = [&](size_t index) {
+        if constexpr(check_tail)
+        {
+            const size_t offset = index * vec_size_i;
+            if(offset + vec_size_i > static_cast<size_t>(cols))
+            {
+                vec_i tail{};
+#pragma unroll
+                for(int j = 0; j < vec_size_i; ++j)
+                    if(offset + j < static_cast<size_t>(cols))
+                        tail[j] = ptr_i[offset + j];
+                return tail;
+            }
+        }
+        return load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, index * vec_size_i);
+    };
+
     // double load core loop start
     const int32_t num_elems_tail = cols % vec_size_i;
     const int32_t num_vecs       = (cols + vec_size_i - 1) / vec_size_i;
@@ -699,7 +717,10 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     size_t vec_stride = BlockSize;
     if(vec_idx < num_vecs)
     {
-        vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
+        if constexpr(check_tail)
+            vec_cur = load_vec(vec_idx);
+        else
+            vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
     }
 
     float absMax = 0.f;
@@ -708,7 +729,10 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
         vec_i vec_nxt;
         for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
         {
-            vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
+            if constexpr(check_tail)
+                vec_nxt = load_vec(vec_idx);
+            else
+                vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
             for(size_t j = 0; j < vec_size_i; j++)
             {
                 absMax = max(absMax, abs(static_cast<float>(vec_cur[j])));
@@ -759,6 +783,20 @@ data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ inpu
 }
 
 template <typename DTYPE_I, typename DTYPE_O>
+__global__ void
+data_to_scale_tail_kernel(float* __restrict__ scale,
+                          const DTYPE_I* __restrict__ input,
+                          const int cols)
+{
+    auto res        = data_to_per_row_scale<DTYPE_I, DTYPE_O, 0, true>(input, cols);
+    float row_scale = std::get<0>(res);
+    if(threadIdx.x == 0)
+    {
+        atomicMaxFloat(scale, row_scale);
+    }
+}
+
+template <typename DTYPE_I, typename DTYPE_O, bool check_tail = false>
 __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
                                   const DTYPE_I* __restrict__ input,
                                   const float* __restrict__ scale,
@@ -788,6 +826,45 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
     auto buffer_i = opus::make_gmem<DTYPE_I>(ptr_i, oob_i * sizeof(DTYPE_I));
     auto buffer_o = opus::make_gmem<DTYPE_STORE>(ptr_o, oob_o * sizeof(DTYPE_STORE));
 
+    // Only the per-tensor non-dword-aligned path needs scalar row-tail loads.
+    auto load_vec = [&](size_t index) {
+        if constexpr(check_tail)
+        {
+            const size_t offset = index * vec_size_i;
+            if(offset + vec_size_i > static_cast<size_t>(cols))
+            {
+                vec_i tail{};
+#pragma unroll
+                for(int j = 0; j < vec_size_i; ++j)
+                    if(offset + j < static_cast<size_t>(cols))
+                        tail[j] = ptr_i[offset + j];
+                return tail;
+            }
+        }
+        return load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, index * vec_size_i);
+    };
+
+    auto store_vec = [&](const vec_i& vec, size_t index) {
+        if constexpr(check_tail)
+        {
+            static_assert(std::is_same_v<DTYPE_O, opus::fp8_t> ||
+                          std::is_same_v<DTYPE_O, opus::i8_t>);
+            const size_t offset = index * vec_size_i;
+            if(offset + vec_size_i > static_cast<size_t>(cols))
+            {
+                // Keep the same FP8 saturation and int8 conversion as store_vector.
+                const auto converted = scaled_cast<DTYPE_O>(vec, inverted_scale);
+#pragma unroll
+                for(int j = 0; j < vec_size_i; ++j)
+                    if(offset + j < static_cast<size_t>(cols))
+                        ptr_o[offset + j] = converted[j];
+                return;
+            }
+        }
+        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(
+            buffer_o, vec, index * vec_size_o, inverted_scale);
+    };
+
     // double load core loop start
     const int32_t num_elems_tail = cols % vec_size_i;
     const int32_t num_vecs       = (cols + vec_size_i - 1) / vec_size_i;
@@ -800,19 +877,33 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
     size_t vec_stride = BlockSize;
     if(vec_idx < num_vecs)
     {
-        vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
+        if constexpr(check_tail)
+            vec_cur = load_vec(vec_idx);
+        else
+            vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
     }
 
     for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
     {
-        vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
-        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
+        if constexpr(check_tail)
+            vec_nxt = load_vec(vec_idx);
+        else
+            vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
+        if constexpr(check_tail)
+            store_vec(vec_cur, vec_idx - vec_stride);
+        else
+            store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(
+                buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
         vec_cur = vec_nxt;
     }
 
     if(vec_idx - vec_stride < num_vecs)
     {
-        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
+        if constexpr(check_tail)
+            store_vec(vec_cur, vec_idx - vec_stride);
+        else
+            store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(
+                buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
     }
     // double load core loop end
 }
@@ -861,6 +952,15 @@ __global__ void scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                     const int cols)
 {
     scaled_quant_impl<DTYPE_I>(out, input, scale, cols);
+}
+
+template <typename DTYPE_I, typename DTYPE_O>
+__global__ void scaled_quant_tail_kernel(DTYPE_O* __restrict__ out,
+                                         const DTYPE_I* __restrict__ input,
+                                         const float* __restrict__ scale,
+                                         const int cols)
+{
+    scaled_quant_impl<DTYPE_I, DTYPE_O, true>(out, input, scale, cols);
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
@@ -1106,22 +1206,36 @@ void static_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
     {
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
-                reinterpret_cast<input_dtype*>(input.data_ptr()),
-                reinterpret_cast<float*>(scale.data_ptr()),
-                cols);
+            if(cols % 4 == 0)
+                aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            else
+                aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
         });
     }
     else if(out.dtype() == AITER_DTYPE_i8)
     {
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<opus::i8_t*>(out.data_ptr()),
-                reinterpret_cast<input_dtype*>(input.data_ptr()),
-                reinterpret_cast<float*>(scale.data_ptr()),
-                cols);
+            if(cols % 4 == 0)
+                aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::i8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            else
+                aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::i8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
         });
     }
     else
@@ -1182,13 +1296,26 @@ void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
-                reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
-                reinterpret_cast<input_dtype*>(input.data_ptr()),
-                reinterpret_cast<float*>(scale.data_ptr()),
-                cols);
+            if(cols % 4 == 0)
+            {
+                aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            }
+            else
+            {
+                aiter::data_to_scale_tail_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            }
         });
     }
     else if(out.dtype() == AITER_DTYPE_i8)
@@ -1197,13 +1324,26 @@ void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
-                reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<opus::i8_t*>(out.data_ptr()),
-                reinterpret_cast<input_dtype*>(input.data_ptr()),
-                reinterpret_cast<float*>(scale.data_ptr()),
-                cols);
+            if(cols % 4 == 0)
+            {
+                aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::i8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            }
+            else
+            {
+                aiter::data_to_scale_tail_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::i8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            }
         });
     }
     else
@@ -2489,6 +2629,7 @@ __device__ void store_zero_mx_quant_moe_sort_row(
     const int32_t scaleN_valid,
     const int scale_k,
     const int num_thread_per_group,
+    const bool route_valid,
     const int64_t offset_base,
     const int cols)
 {
@@ -2496,6 +2637,12 @@ __device__ void store_zero_mx_quant_moe_sort_row(
     {
         int addr    = aiter::mx_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k);
         scale[addr] = 0;
+    }
+    // A sorting sentinel (topk_id == topk) names no route: its token may be a
+    // real one under a num_local_tokens count, so offset_base can lie past `out`.
+    if(!route_valid)
+    {
+        return;
     }
     const int64_t row_bytes = std::is_same_v<DTYPE_O, opus::fp4_t> ? cols / 2 : cols;
     uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
@@ -2600,11 +2747,12 @@ __global__ void fused_mx_quant_moe_sort_kernel(
 
             int64_t offset_base = topk == 1 ? (int64_t)(token_idx) : (int64_t)(token_idx * topk + topk_id);
             const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
+            const bool route_valid = topk == 1 || topk_id < topk;
             // A shared row (one per token, quantized by each of its routes) only
             // ever receives the token's own bytes, so its writers agree; zeroing
             // it for one zero-weight route would race the token's other routes.
-            if(route_owns_row && sorted_weights != nullptr &&
-               sorted_weights[sorted_row] == 0.0f)
+            if(!route_valid || (route_owns_row && sorted_weights != nullptr &&
+                                sorted_weights[sorted_row] == 0.0f))
             {
                 store_zero_mx_quant_moe_sort_row<DTYPE_O, thread_data_size>(
                     out,
@@ -2614,6 +2762,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                     scaleN_valid,
                     scale_k,
                     num_thread_per_group,
+                    route_valid,
                     offset_base,
                     cols);
                 continue;
