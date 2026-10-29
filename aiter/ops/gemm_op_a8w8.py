@@ -144,6 +144,12 @@ def gemm_a8w8_bpreshuffle_cktile(
 ) -> Tensor: ...
 
 
+def _ck_bpreshuffle_output_fits(m: int, n: int, out_elem_bytes: int) -> bool:
+    """CK bpreshuffle addresses C, padded to its M tile (at most 256 rows), with
+    signed 32-bit byte offsets and writes wrong rows without error from 2 GiB."""
+    return -(-m // 256) * 256 * n * out_elem_bytes < 1 << 31
+
+
 @functools.cache
 def _parse_flydsl_kernel_name(kernel_name: str):
     """Parse a flydsl kernelName into ``(tile_m, tile_n, tile_k, async_copy,
@@ -193,12 +199,33 @@ def gemm_a8w8_bpreshuffle_flydsl(
             XQ, WQ, x_scale, w_scale, Out, kernel_name
         )
 
-    from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+    from .flydsl.gemm_kernels import PRESHUFFLE_M_MAX, flydsl_preshuffle_gemm_a8
 
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
     tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split = parsed
+    # The launcher raises for M > PRESHUFFLE_M_MAX (the padded-M lookup serves
+    # every M > 8192 with the M=8192 row when N > 4096) and for a K the tuned
+    # split-K or tile_k does not divide (e.g. _ks7 on K=7168 padded to 8192).
+    # Fall back to CK for those, but not past CK's own output limit, where it
+    # writes wrong rows without an error and the FlyDSL error is the better one.
+    m, k = XQ.shape[0], XQ.shape[-1]
+    launcher_rejects = (
+        m > PRESHUFFLE_M_MAX or k % k_split != 0 or (k // k_split) % tk != 0
+    )
+    if launcher_rejects and _ck_bpreshuffle_output_fits(
+        m, WQ.shape[0], Out.element_size()
+    ):
+        # CK reads every operand, scales included, through raw contiguous
+        # pointers; keep the FlyDSL path's normalization.
+        return gemm_a8w8_bpreshuffle_ck(
+            XQ.contiguous(),
+            WQ.contiguous(),
+            x_scale.contiguous(),
+            w_scale.contiguous(),
+            Out,
+        )
 
     flydsl_preshuffle_gemm_a8(
         XQ.contiguous(),
