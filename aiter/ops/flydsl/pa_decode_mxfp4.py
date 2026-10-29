@@ -319,8 +319,9 @@ def pa_decode_mxfp4(
         if direct_output:
             return
         output_5d = output.reshape(num_seqs, 1, num_kv_heads, group_size, HEAD_DIM)
-        partition_bound = min(
-            capacity if work_plan is not None else parts,
+        reduce_partitions = min(
+            parts,
+            capacity,
             max(1, ceildiv(schedule_context, KV_COMPUTE_BLOCK)),
         )
         launch_pa_decode_ps_reduce(
@@ -341,8 +342,7 @@ def pa_decode_mxfp4(
             query_seq_len=1,
             query_group_size=group_size,
             head_size=HEAD_DIM,
-            partition_bound=partition_bound,
-            max_partitions=parts,
+            max_partitions=reduce_partitions,
             stream=stream,
             reduce_info=(
                 work_plan.reduce_info if work_plan is not None else reduce_info
