@@ -314,8 +314,9 @@ def _adaptive_moe_sort(
     output=None,
     num_local_tokens=None,
 ):
-    # The BM16 sort zeroes moe_buf with 16-byte stores, so an underaligned
-    # caller buffer gets a fresh one and _return_output copies back.
+    # The BM16 sort zeroes moe_buf with 16-byte stores (stricter than the 4 bytes
+    # atomic GEMM2 needs, see _moe_sorting_impl), so an underaligned caller
+    # buffer gets a fresh one and _return_output copies back.
     if output is not None and output.data_ptr() % 16:
         output = None
     device = topk_ids.device
@@ -691,6 +692,11 @@ def _moe_sorting_impl(
     #    output_aux scatter, which writes every output row itself): caller owns
     #    the intermediate; allocate a placeholder here.
     # A caller buffer can stand in: the sort kernel zeroes what it is handed.
+    # Atomic GEMM2 accumulates with 4-byte atomics, so a buffer at an odd bf16
+    # element faults the GPU queue; it gets a fresh one and _return_output
+    # copies back.
+    if output is not None and output.data_ptr() % 4:
+        output = None
     if accumulate or (expert_mask is not None and not output_aux):
         moe_buf = (
             output
@@ -801,7 +807,9 @@ def _flydsl_moe_sorting(
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
     # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
-    # As in _moe_sorting_impl, a caller buffer can stand in.
+    # As in _moe_sorting_impl, a caller buffer can stand in if 4-byte aligned.
+    if output is not None and output.data_ptr() % 4:
+        output = None
     if (expert_mask is not None) or accumulate:
         moe_buf = (
             output

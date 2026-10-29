@@ -1715,6 +1715,13 @@ def test_output_buffer_contract():
     pool = torch.zeros((2 * token, model_dim), dtype=dtype)
     pool[:token] = hidden
     assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
+    # A view one bf16 element into its allocation is only 2-byte aligned, which
+    # the atomic GEMM2 cannot accumulate into (it faulted the GPU queue): such a
+    # buffer is still filled, through a fresh one and a copy.
+    odd_pool = torch.full((token * model_dim + 1,), float("nan"), dtype=dtype)
+    odd = odd_pool[1:].view(token, model_dim)
+    assert fused_moe(*args, output=odd) is odd, "2-byte-aligned output not returned"
+    assert torch.equal(odd, ref), "2-byte-aligned output does not hold the result"
 
     check_overlap = aiter.fused_moe._validate_output_buffer_no_overlap
     # A strided scale view reaches past its logical nbytes: scale_pool[::2] holds
