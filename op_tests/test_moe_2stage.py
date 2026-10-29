@@ -1403,10 +1403,15 @@ def test_presorted_moe_hook():
     passes a caller-zeroed output as SGLang does) share one routing whose presort
     is built beforehand, so only fused_moe is timed, and both presorted calls are
     checked element-wise against the own sort at every batch. The summary table
-    has one row per batch and us/TFLOPS/TB/s/err columns per candidate. Then the contract: a reused-address moe_buf is zeroed,
-    an underaligned output is copied back, and a registration that does not match
-    the call is ignored and still consumed, so it never leaks into a later call,
-    even when fused_moe exits before sorting.
+    has one row per batch with us/TFLOPS/TB/s per timed candidate, "ref err"
+    (test_fmoe's logits_diff vs the torch reference) for moe_sorting and
+    presorted, and "own err" (diff vs the own sort on the timed routing) for both
+    presorted calls. Its eager summed kernel time does not rank the two presorted
+    calls (a GPU idle gap before GEMM1 skews it); graph replay does. Then the
+    contract: a reused-address moe_buf is zeroed, an underaligned output is
+    copied back, and a registration that does not match the call is ignored and
+    still consumed, so it never leaks into a later call, even when fused_moe
+    exits before sorting.
     """
     global fused_moe
     fm = aiter.fused_moe
@@ -1566,8 +1571,8 @@ def test_presorted_moe_hook():
                         assert sort_calls, f"token={token}: BM=16 aux path did not sort"
                     # test_fmoe compares with the torch reference and fails when
                     # checkAllclose misses and logits_diff (1 - cosine similarity,
-                    # recorded as err) exceeds 0.01.
-                    row[f"{name} err"] = ret["logits_diff"]
+                    # recorded as ref err) exceeds 0.01.
+                    row[f"{name} ref err"] = ret["logits_diff"]
                     gc.collect()
                     torch.cuda.empty_cache()
 
@@ -1581,11 +1586,12 @@ def test_presorted_moe_hook():
                 aux = presort(topk_ids, topk_weights)
                 out = presorted(aux, hidden, topk_weights, topk_ids, buf)
                 check_close(own, out, f"token={token} presorted")
+                row["presorted own err"] = calc_diff(own, out)
                 aux_zeroed = presort(topk_ids, topk_weights, moe_buf=buf)
                 out = caller_zeroed(aux_zeroed, hidden, topk_weights, topk_ids, buf)
                 assert out is buf, f"token={token}: caller output not used"
                 check_close(own, out, f"token={token} presorted output=")
-                row["presorted output= err"] = calc_diff(own, out)
+                row["presorted output= own err"] = calc_diff(own, out)
                 # num_rotate_args=1: run_perftest otherwise times deep copies of
                 # its tensor arguments, whose topk_ids no longer match the
                 # registered presort, so the call would fall back to moe_sorting.
