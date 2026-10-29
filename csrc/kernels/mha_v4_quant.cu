@@ -53,17 +53,19 @@ __device__ float swap_thread_data(float data)
 }
 
 // Remove K's per-(batch, head, channel) token mean. Softmax is shift-invariant in a component
-// shared by every key, but quantization noise is not. No-op when `mean` is null, and for the rows
-// past `m` that pad out a block: their mean_row lands past the (batch, heads) mean.
+// shared by every key, but quantization noise is not. No-op when `mean` is null.
 template <int vec_size, int dim, typename floatxvec_t>
 __device__ inline void subtract_k_mean(floatxvec_t& af,
                                        float const* __restrict__ mean,
                                        const int32_t row,
-                                       const int32_t m,
                                        const int32_t lane,
                                        const int32_t heads,
-                                       const int32_t seq_heads)
+                                       const int32_t seq_heads,
+                                       const int32_t m)
 {
+    // The input load is bounded by m_oob, but this is a raw pointer: the last partial block would
+    // read a mean row past the end. Out-of-range lanes are discarded by the row < m store and amax
+    // guards, and the rotation's inter-thread butterfly never spans rows, so skipping is exact.
     if(mean == nullptr || row >= m)
         return;
     const int32_t mean_row = (row / seq_heads) * heads + (row % heads);
@@ -107,7 +109,7 @@ __global__ void hadamard_rotate_activation_hd128_kernel(DTYPE_I* __restrict__ ou
         af[i] = static_cast<float>(a[i]);
 
     // K-smoothing: remove the per-(batch, head, channel) token mean before rotating.
-    subtract_k_mean<vec_size, dim>(af, mean, row, m, lane, heads, seq_heads);
+    subtract_k_mean<vec_size, dim>(af, mean, row, lane, heads, seq_heads, m);
 
     constexpr int intra_thread_loop = __builtin_ctz(vec_size);
     opus::static_for<intra_thread_loop>([&](auto i) {
@@ -197,7 +199,7 @@ __global__ void hadamard_rotate_activation_mxfp8_quant_kernel(
     for(int i = 0; i < vec_size; i++)
         af[i] = static_cast<float>(a[i]);
 
-    subtract_k_mean<vec_size, dim>(af, mean, row, m, lane, heads, seq_heads);
+    subtract_k_mean<vec_size, dim>(af, mean, row, lane, heads, seq_heads, m);
 
     constexpr int intra_thread_loop = __builtin_ctz(vec_size);
     opus::static_for<intra_thread_loop>([&](auto i) {
@@ -292,7 +294,7 @@ __global__ void hadamard_rotate_activation_mxfp6_quant_kernel(
     for(int i = 0; i < vec_size; i++)
         af[i] = static_cast<float>(a[i]);
 
-    subtract_k_mean<vec_size, dim>(af, mean, row, m, lane, heads, sequence * heads);
+    subtract_k_mean<vec_size, dim>(af, mean, row, lane, heads, sequence * heads, m);
 
     constexpr int intra_thread_loop = __builtin_ctz(vec_size);
     opus::static_for<intra_thread_loop>([&](auto i) {
@@ -503,7 +505,7 @@ __global__ void hadamard_rotate_activation_mxfp4_quant_kernel(
     for(int i = 0; i < vec_size; i++)
         af[i] = static_cast<float>(a[i]);
 
-    subtract_k_mean<vec_size, dim>(af, mean, row, m, lane, heads, sequence * heads);
+    subtract_k_mean<vec_size, dim>(af, mean, row, lane, heads, sequence * heads, m);
 
     constexpr int intra_thread_loop = __builtin_ctz(vec_size);
     opus::static_for<intra_thread_loop>([&](auto i) {

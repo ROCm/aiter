@@ -8,6 +8,7 @@ from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_flatten_mxfp4_quant,
     fused_reduce_act_mul_and_mxfp4_quant,
     fused_reduce_rms_mxfp4_quant,
+    fused_rms_gated_mxfp4_quant,
     fused_rms_mxfp4_quant,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -19,6 +20,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     mxfp4_to_f32,
 )
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from op_tests.triton_tests.utils.types import with_default_dtype
 
 
 def rmsnorm(input, weight, eps=1e-6):
@@ -239,6 +241,73 @@ def test_fused_rms_quant(
     torch.testing.assert_close(y1_fp32_torch, y1_fp32_triton)
 
 
+def torch_rms_gated(x, weight, z, eps, group_size, norm_before_gate, activation):
+    x = x.to(torch.float32)
+    z = z.to(torch.float32)
+    act = F.sigmoid if activation == "sigmoid" else F.silu
+    if not norm_before_gate:
+        x = x * act(z)
+    xg = x.view(x.shape[0], -1, group_size)
+    y = xg * torch.rsqrt(xg.pow(2).mean(dim=-1, keepdim=True) + eps)
+    y = y.view_as(x) * weight.to(torch.float32).repeat(x.shape[1] // group_size)
+    if norm_before_gate:
+        y = y * act(z)
+    return y
+
+
+@pytest.mark.parametrize("M", [1, 1000])
+@pytest.mark.parametrize("N, group_size", [(3072, 128), (256, None), (4096, None)])
+@pytest.mark.parametrize(
+    "norm_before_gate, activation, dtype, transpose_scale",
+    [
+        (True, "sigmoid", torch.bfloat16, True),
+        (False, "silu", torch.float16, False),
+    ],
+)
+def test_fused_rms_gated_mxfp4_quant(
+    M: int,
+    N: int,
+    group_size,
+    norm_before_gate: bool,
+    activation: str,
+    dtype,
+    transpose_scale: bool,
+):
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
+    G = N if group_size is None else group_size
+    x = torch.randn((M, N), dtype=dtype, device="cuda")
+    z = torch.randn((M, N), dtype=dtype, device="cuda")
+    w = torch.randn(G, dtype=dtype, device="cuda")
+
+    y_torch = torch_rms_gated(x, w, z, 1e-6, G, norm_before_gate, activation)
+    y_fp4_torch, y_scales_torch = torch_dynamic_mxfp4_quant(
+        y_torch.to(dtype).to(torch.float32)
+    )
+    y_fp4, y_scales = fused_rms_gated_mxfp4_quant(
+        x,
+        w,
+        z,
+        1e-6,
+        norm_before_gate=norm_before_gate,
+        activation=activation,
+        group_size=group_size,
+        transpose_scale=transpose_scale,
+    )
+
+    assert y_fp4.shape == (M, N // 2) and y_scales.shape == (M, N // 32)
+    assert y_scales.stride() == ((1, M) if transpose_scale else (N // 32, 1))
+    # A one-ulp difference in the rounded activation can move an element
+    # that sits on an E2M1 rounding boundary to the neighbouring code.
+    ref = convert_mxfp4_to_fp32(y_fp4_torch, y_scales_torch)
+    out = convert_mxfp4_to_fp32(y_fp4, y_scales)
+    mismatched = (ref != out).sum().item()
+    assert mismatched <= max(1, ref.numel() // 100_000), mismatched
+    torch.testing.assert_close(ref, out, atol=0.5, rtol=0.5)
+
+
 def run_torch_reduce_act_mul_mxfp4_group_quant(x, x2, activation, dtype, shuffle):
     x = x.to(torch.float32)
     d = x.shape[-1] // 2
@@ -280,12 +349,12 @@ def generate_fused_reduce_act_mul_mxfp4_group_quant(
     N2: int = 1,
 ):
     if SPK == 1:
-        x = torch.randn((M, N1 * 2), dtype=dtype).cuda() / 10
+        x = torch.randn((M, N1 * 2), dtype=dtype, device="cuda") / 10
     else:
-        x = torch.randn((SPK, M, N1 * 2), dtype=torch.float32).cuda() / 10
+        x = torch.randn((SPK, M, N1 * 2), dtype=torch.float32, device="cuda") / 10
     x2 = None
     if SPK > 1:
-        x2 = torch.randn((SPK, M, N2), dtype=torch.float32).cuda() / 10
+        x2 = torch.randn((SPK, M, N2), dtype=torch.float32, device="cuda") / 10
 
     return x, x2
 
@@ -365,6 +434,28 @@ def test_fused_reduce_act_mul_mxfp4_group_quant(
 
     torch.testing.assert_close(y_q_triton, y_q_torch)
     torch.testing.assert_close(y_s_triton, y_s_torch)
+
+
+def test_fused_reduce_act_mul_mxfp4_group_quant_dtype_none():
+    """With dtype=None, y2 has the dtype of x2, not the default dtype."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
+    x, x2 = generate_fused_reduce_act_mul_mxfp4_group_quant(32, 256, SPK=4, N2=256)
+    _, y2_torch = run_torch_reduce_act_mul_mxfp4_group_quant(
+        x, x2, "silu", dtype=x2.dtype, shuffle=False
+    )
+
+    # x2 is float32, the usual default dtype. A float64 default makes the test
+    # fail if y2 takes the default dtype.
+    with with_default_dtype(torch.float64):
+        _, y2_triton = fused_reduce_act_mul_and_mxfp4_quant(
+            x, activation="silu", x2=x2, dtype=None
+        )
+
+    assert y2_triton.dtype == x2.dtype
+    torch.testing.assert_close(y2_triton, y2_torch)
 
 
 def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat16):

@@ -708,9 +708,11 @@ def _resolve_raw_recipe(
         kind = _RawRecipeKind.FP8
     elif q_format == AttentionFormat.MXFP4:
         if v_format != AttentionFormat.MXFP4:
+            # Retired, not pending: the MXFP4-Q/FP8-V row was dropped from the manifest, and no
+            # other V has ever had one.
             raise NotImplementedError(
-                "raw preprocessing is not implemented yet for "
-                f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
+                "MHA v4 MXFP4 Q/K requires MXFP4 V; no other V row exists "
+                f"(got Q={q_format.name}, K={k_format.name}, V={v_format.name})"
             )
         kind = _RawRecipeKind.MXFP4
     elif q_format == AttentionFormat.MXFP6:
@@ -1079,11 +1081,19 @@ def _check_lse_capable() -> None:
 # (q_format, v_format) rows whose code object consumes the seqlens_k kernarg. Every dense source
 # carries the load, but only these objects were rebuilt with it; the rest would silently attend
 # over the full padded key length, so they are rejected rather than left to return a wrong answer.
+# (FP8, FP8) covers both the fp8 and mxfp8 objects, which differ only by scale mode.
 _VARLEN_CAPABLE_QV = frozenset(
     {
         (AttentionFormat.BF16, AttentionFormat.BF16),
         (AttentionFormat.BF16, AttentionFormat.FP8_E4M3),
         (AttentionFormat.BF16, AttentionFormat.FP8_E4M3_FNUZ),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.MXFP6),
+        (AttentionFormat.INT8, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.FP8_E4M3),
     }
 )
 
@@ -1091,10 +1101,14 @@ _VARLEN_CAPABLE_QV = frozenset(
 def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
     """Reject per-batch key lengths on rows whose code object ignores them."""
     arch = get_gfx()
-    if arch != "gfx950" or (q_format, v_format) not in _VARLEN_CAPABLE_QV:
+    if arch != "gfx950":
+        raise NotImplementedError(
+            f"MHA v4 per-batch key lengths are not implemented on {arch} yet"
+        )
+    if (q_format, v_format) not in _VARLEN_CAPABLE_QV:
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented for "
-            f"Q={q_format.name} V={v_format.name} on {arch} yet"
+            f"Q={q_format.name} V={v_format.name} yet"
         )
 
 
@@ -1157,8 +1171,16 @@ def mha_v4_packed(
     Pass the ragged LUT triple to select the sorted-sparse row; omit all three
     tensors for dense. The work table is built inside the sparse custom op.
     With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
-    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``. Only rows whose
-    manifest lse column is 1 can write it; the launcher refuses the others.
+    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max`` over the scores the
+    kernel actually computed, i.e. the QUANTIZED scores. Its error tracks the row max at
+    each format's score precision: about 0.001 nats for BF16 Q/K, but 36 (MXFP6) and 153
+    (MXFP4) against 1418 nats of range. That is harmless when merging ring-attention
+    chunks produced by the SAME recipe, where a chunk whose row max sits far above its
+    peers carries an exponentially larger merge weight. Do not use it as an absolute
+    quantity (entropy, perplexity) or to merge chunks across DIFFERENT recipes, where the
+    per-recipe biases stop cancelling.
+    Only rows whose manifest lse column is 1 can write it; the launcher refuses the
+    others.
 
     block_tile names the (q_tile, kv_tile) geometry the LUT was built for; it
     defaults to this call's own operands' geometry, since gfx950's rows no longer
@@ -1214,7 +1236,7 @@ def mha_v4_packed(
     if seqlens_k is not None:
         if kv_block_indices is not None:
             raise NotImplementedError(
-                "block-sparse MHA v4 does not accept per-batch key lengths yet"
+                "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
             )
         _check_varlen_capable(q_format, v_format)
         if seqlens_k.dtype != torch.int32 or seqlens_k.device != q.device:
@@ -1328,6 +1350,7 @@ def _launch_mxfp4_coalesced(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
@@ -1359,6 +1382,7 @@ def _launch_mxfp4_coalesced(
         lse=lse,
         return_lse=lse is not None,
         v_pack=resolved_v_pack,
+        seqlens_k=seqlens_k,
     )
 
 
@@ -1374,21 +1398,11 @@ def _launch_mxfp4_coalesced_fake(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
-    del (
-        q,
-        q_descale,
-        k_data,
-        k_descale,
-        v_data,
-        v_descale,
-        v_format,
-        v_pack,
-        softmax_scale,
-        lse,
-    )
-    del out
+    del q, q_descale, k_data, k_descale, v_data, v_descale, out
+    del v_format, v_pack, softmax_scale, seqlens_k, lse
 
 
 @torch.library.custom_op("aiter::mha_v4_launch_mxfp6_v3", mutates_args=("out", "lse"))
@@ -1405,6 +1419,7 @@ def _launch_mxfp6(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
@@ -1436,6 +1451,7 @@ def _launch_mxfp6(
         lse=lse,
         return_lse=lse is not None,
         v_pack=resolved_v_pack,
+        seqlens_k=seqlens_k,
     )
 
 
@@ -1453,10 +1469,11 @@ def _launch_mxfp6_fake(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, q_descale, k_raw, k_descale_raw, v_data, v_descale
-    del sequence_k, heads, v_format, v_pack, softmax_scale, lse
+    del sequence_k, heads, v_format, v_pack, softmax_scale, seqlens_k, lse
     del out
 
 
@@ -1505,6 +1522,10 @@ def _restore_k_mean_in_lse(
     if lse is None or k_mean is None:
         return lse
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    # k_mean carries one row per KV head, and under GQA query head j reads KV head j // ratio.
+    heads_q, heads_k = q.shape[2], k_mean.shape[1]
+    if heads_q != heads_k:
+        k_mean = k_mean.repeat_interleave(heads_q // heads_k, dim=1)
     lse += torch.einsum("bshd,bhd->bhs", q, k_mean.to(q.dtype)).float() * scale
     return lse
 
@@ -1576,12 +1597,18 @@ def mha_v4(
     per query head; K/V addressing uses the GQA ratio. A row may select nothing:
     an all-False row is a no-op that writes a zero output tile.
     With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
-    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
+    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max`` over the scores the
+    kernel actually computed, i.e. the QUANTIZED scores. Its error tracks the row max at
+    each format's score precision: about 0.001 nats for BF16 Q/K, but 36 (MXFP6) and 153
+    (MXFP4) against 1418 nats of range. That is harmless when merging ring-attention
+    chunks produced by the SAME recipe, where a chunk whose row max sits far above its
+    peers carries an exponentially larger merge weight. Do not use it as an absolute
+    quantity (entropy, perplexity) or to merge chunks across DIFFERENT recipes, where the
+    per-recipe biases stop cancelling.
     """
     if return_lse:
         _check_lse_capable()
-    # Checked here as well as in mha_v4_packed: the MXFP4 and MXFP6 recipes return through their
-    # own launchers, which never forward seqlens_k.
+    # Checked before quantization so the MX paths fail here, not inside their own launcher.
     if seqlens_k is not None:
         if block_mask is not None:
             raise NotImplementedError(
@@ -1692,6 +1719,7 @@ def mha_v4(
                 int(v_format),
                 int(recipe.v_pack),
                 softmax_scale,
+                seqlens_k,
             )
         else:
             k_view = mxfp4_k_view(k_quantized, k_descale)
@@ -1724,6 +1752,7 @@ def mha_v4(
                 int(v_format),
                 int(recipe.v_pack),
                 softmax_scale,
+                seqlens_k,
             )
         else:
             k_view, k_descale_view = mxfp6_k_view(

@@ -21,6 +21,69 @@ MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
 LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
 BF16_LDS_LIMIT_BYTES = 64 * 1024
+PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
+D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
+
+
+def d256_pipe(
+    arch,
+    kv_dtype,
+    head_dim,
+    block_size,
+    query_length,
+    query_group_size,
+) -> bool:
+    """gfx950 FP8 head 256, page 16/64, <= two M-tiles.
+
+    Uniform query length; rows = query_length * query_group_size fit two
+    16-row M-tiles that share one K/V stream. Packed caches support both V
+    layouts, per-tensor/per-token scales and causal sliding windows.
+    """
+    return (
+        "gfx95" in arch
+        and kv_dtype == "fp8"
+        and head_dim == 256
+        and block_size in (16, 64)
+        and query_length * query_group_size <= D256_PIPE_MAX_ROWS
+    )
+
+
+def max_tiles_per_task(num_seqs, work_capacity, num_partitions, max_context_length):
+    """Host bound on the KV tiles one dense planned task owns.
+
+    A sequence's task count is at least min(tiles, num_partitions) and the plan
+    spends work_capacity - num_seqs extra tasks in proportion to tiles.
+    """
+    max_tiles = -(-max_context_length // KV_COMPUTE_BLOCK)
+    extra = work_capacity - num_seqs
+    by_budget = -(-num_seqs * max_tiles // extra) if extra > 0 else max_tiles
+    return min(max_tiles, max(-(-max_tiles // num_partitions), by_budget))
+
+
+def stage_page_capacity(
+    num_seqs,
+    work_capacity,
+    num_partitions,
+    max_context_length,
+    block_size,
+    sliding_window=0,
+    query_length=1,
+) -> int:
+    """Page ids to stage per task, or 0 to keep table reads in the tile loop."""
+    if sliding_window > 0:
+        # Planning apportions the visible MTP window union, rather than the
+        # whole context. Its unaligned tile bound also bounds staged ids.
+        window_tiles = (
+            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+        ) // KV_COMPUTE_BLOCK + 1
+        max_context_length = min(max_context_length, window_tiles * KV_COMPUTE_BLOCK)
+    tiles = max_tiles_per_task(
+        num_seqs, work_capacity, num_partitions, max_context_length
+    )
+    pages = tiles * (KV_COMPUTE_BLOCK // block_size)
+    if pages > PAGE_ID_STAGE_LIMIT:
+        return 0
+    return max(256, 1 << max(pages - 1, 0).bit_length())
 
 
 def _bf16_lds_bytes(head_dim, query_rows, block_size):
@@ -63,12 +126,15 @@ class PaDecodeSchedule:
         query_splits: int | None = None,
         max_context_length: int | None = None,
         sliding_window: int = 0,
+        trans_k: bool = True,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
             raise TypeError("work_capacity must be a positive int")
         if work_capacity < 1:
             raise ValueError("work_capacity must be positive")
+        if not trans_k:
+            raise NotImplementedError("Non-transposed key cache is not implemented")
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
         if kv_dtype not in ("fp8", "bf16"):
@@ -185,18 +251,51 @@ class PaDecodeSchedule:
         TOTAL_ROWS = query_length * query_group_size
         CTA_ROWS = QUERIES_PER_CTA * query_group_size
         M_TILES = (CTA_ROWS + MFMA_MNK - 1) // MFMA_MNK
-        WIDE_FP8_MFMA = (
-            TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
+        MTP4_FUSED = (
+            TUNED_PER_TOKEN
+            and query_length in (3, 4)
+            and query_group_size == 16
+            and M_TILES == 4
         )
-        MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
         BUFFER_KV = (
             kv_buffer_u32 and MTP4_FUSED and wide_kv_addressing and block_size == 128
         )
 
+        # K is consumed once per tile: a nontemporal load keeps those lines from
+        # evicting V, which is still being merged in L2. V prefetch only stays
+        # live if the page-id load is not on the same in-order vmcnt chain, so
+        # the host-bounded page list is staged in LDS before the tile loop.
+        D256_PIPE = d256_pipe(
+            arch,
+            kv_dtype,
+            head_dim,
+            block_size,
+            query_length,
+            query_group_size,
+        )
+        # Splitting would change the CTA's rows and re-read K/V per split.
+        assert (
+            not D256_PIPE or query_splits == 1
+        ), "the head-256 page-16/64 pipe keeps all query rows in one CTA"
+        stage_pages = 0
+        if D256_PIPE and max_context_length is not None:
+            stage_pages = stage_page_capacity(
+                num_seqs,
+                work_capacity,
+                num_partitions,
+                max_context_length,
+                block_size,
+                sliding_window,
+                query_length,
+            )
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
-            TUNED_PER_TOKEN and QUERIES_PER_CTA == 1 and 8 <= query_group_size <= 16
-        ) or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
+            D256_PIPE
+            or (
+                TUNED_PER_TOKEN and QUERIES_PER_CTA == 1 and 8 <= query_group_size <= 16
+            )
+            or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
+        )
         # Keep the tuned page/scale layout selection separate from V prefetch.
         PER_TOKEN_M1 = (
             prefetch_v
@@ -246,6 +345,8 @@ class PaDecodeSchedule:
             batch_first_plan_grid,
             sliding_window,
             kv_dtype,
+            D256_PIPE,
+            stage_pages,
         )
         return cls(
             cache_key=cache_key,
@@ -279,6 +380,8 @@ class PaDecodeTraits:
     prefetch_v: bool
     batch_first_plan_grid: bool
     buffer_plan_output: bool
+    D256_PIPE: bool
+    stage_page_capacity: int
 
     # Element formats and instruction policy.
     FP8: type
@@ -344,6 +447,7 @@ class PaDecodeTraits:
     sKScale_off: int
     sVScale_off: int
     sVScaleMax_off: int
+    sPages_off: int
     total_bytes: int
 
     def o_slot(self, m: int, vh: int) -> int:
@@ -378,6 +482,8 @@ class PaDecodeTraits:
             batch_first_plan_grid,
             sliding_window,
             kv_dtype,
+            D256_PIPE,
+            stage_page_capacity,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
         is_bf16_kv = kv_dtype == "bf16"
@@ -440,25 +546,33 @@ class PaDecodeTraits:
             and single_tile_plan == prefetch_v
         )
         # K128 consumes four K32 packs without changing cache/LDS layouts.
-        WIDE_FP8_MFMA = (
+        # Only the per-token MTP shape also takes the fused schedule.
+        PER_TOKEN_WIDE = (
             TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
         )
+        WIDE_FP8_MFMA = PER_TOKEN_WIDE or D256_PIPE
         PACK_K = BF16_PACK_K if is_bf16_kv else FP8_PACK_K
         MFMA_K = 128 if WIDE_FP8_MFMA else PACK_K
         PACKS_PER_MFMA = MFMA_K // PACK_K
-        MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
+        MTP4_FUSED = PER_TOKEN_WIDE and M_TILES == 4
         MTP4_PREFETCH_V = MTP4_FUSED and (
             block_size == 16 or not wide_kv_addressing or BUFFER_KV
         )
         TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
         PAGE16_VPIPE = prefetch_v and block_size == 16
-        REUSE_KV_PAGES = PER_TOKEN_M1
+        REUSE_KV_PAGES = PER_TOKEN_M1 or (D256_PIPE and per_token_kv)
         SCALES_BEFORE_CURRENT_V = (
             WIDE_FP8_MFMA and PER_TOKEN_M1 and (block_size == 16 or not trans_v)
         )
         # Scale before masking to avoid -inf * 0 and a second mask.
-        M1_SCALE_BEFORE_MASK = REUSE_KV_PAGES or is_bf16_kv
-        P_BUFFERS = M_TILES if MTP4_FUSED else 2 if TUNE_PAGE128 and M_TILES == 3 else 1
+        M1_SCALE_BEFORE_MASK = PER_TOKEN_M1 or D256_PIPE or is_bf16_kv
+        # The d256 pipe gives each M-tile a private P and Lsum slot so one barrier
+        # publishes all of them.
+        P_BUFFERS = (
+            M_TILES
+            if MTP4_FUSED or D256_PIPE
+            else 2 if TUNE_PAGE128 and M_TILES == 3 else 1
+        )
         # PV uses V=A, P=B: output [head-dim, query-row=lane16].
         NWARP = 4  # 4 waves / CTA
         TILE_TOK = KV_COMPUTE_BLOCK
@@ -553,6 +667,9 @@ class PaDecodeTraits:
             NWARP_PAD * f32 if per_token_kv else 0
         )  # m-independent: one cross-warp slot
         total_bytes = sVScaleMax_off + sVScaleMax_bytes
+        # Page ids for the task's tiles, one i32 each, staged before the loop.
+        sPages_off = total_bytes
+        total_bytes += stage_page_capacity * 4
 
         return cls(
             cache_key=cache_key,
@@ -570,6 +687,8 @@ class PaDecodeTraits:
             prefetch_v=prefetch_v,
             batch_first_plan_grid=batch_first_plan_grid,
             buffer_plan_output=buffer_plan_output,
+            D256_PIPE=D256_PIPE,
+            stage_page_capacity=stage_page_capacity,
             FP8=FP8,
             FP8_MAX=FP8_MAX,
             Q_DTYPE=Q_DTYPE,
@@ -629,5 +748,238 @@ class PaDecodeTraits:
             sKScale_off=sKScale_off,
             sVScale_off=sVScale_off,
             sVScaleMax_off=sVScaleMax_off,
+            sPages_off=sPages_off,
             total_bytes=total_bytes,
         )
+
+
+@dataclass(frozen=True)
+class Gfx1250Traits:
+    head_dim: int
+    query_group_size: int
+    block_size: int
+    softmax_scale: float
+    query_dtype: str
+    per_token_kv: bool
+    query_length: int
+    trans_v: bool
+    sliding_window: int
+    compute_dtype: str = "fp8"
+    direct_output: bool = False
+    query_splits: int = 1
+
+    WAVE = 32
+    NWARP = 4
+    BLOCK_THREADS = NWARP * WAVE
+    FP8_MAX = 448.0
+
+    @property
+    def bf16_packed(self):
+        # Page16 gathers one vector-8 page per wave. Page128 keeps resident
+        # Q/accumulator registers bounded and two pages within LDS.
+        return (
+            self.bf16
+            and self.trans_v
+            and self.head_dim in (64, 128, 256)
+            and (
+                self.block_size == 16
+                or (
+                    self.block_size == 128 and (self.head_dim <= 128 or self.rows <= 32)
+                )
+            )
+        )
+
+    @property
+    def bf16_page16_packed(self):
+        return self.bf16_packed and self.block_size == 16
+
+    @property
+    def bf16_page128_packed(self):
+        return self.bf16_packed and self.block_size == 128
+
+    @property
+    def TOKENS(self):
+        # Page-sized transfers amortize page/scale staging and softmax exchange.
+        # Windowed rows retain 64-token normalization for FP8 accuracy.
+        return (
+            128
+            if self.bf16_page128_packed
+            or (
+                self.packed_lds
+                and self.head_dim in (128, 256)
+                and self.block_size >= 128
+                and self.sliding_window == 0
+            )
+            else 64
+        )
+
+    @property
+    def bf16(self):
+        return self.compute_dtype == "bf16"
+
+    @property
+    def elem_bytes(self):
+        return 2 if self.bf16 else 1
+
+    @property
+    def chunk(self):
+        return 16 // self.elem_bytes
+
+    @property
+    def kv_dtype(self):
+        return fx.BFloat16 if self.bf16 else fx.Uint8
+
+    @property
+    def rows(self):
+        return self.query_length * self.query_group_size // self.query_splits
+
+    @property
+    def m_tiles(self):
+        return (self.rows + 15) // 16
+
+    @property
+    def q_stride(self):
+        return self.head_dim * self.elem_bytes + 16
+
+    @property
+    def q_tiles(self):
+        # The widest BF16 MTP tile fits by staging one query tile at a time.
+        full = self.m_tiles * 16 * self.q_stride
+        return (
+            1 if full + self.kv_stride + self.p_bytes + 576 > 327680 else self.m_tiles
+        )
+
+    @property
+    def q_bytes(self):
+        return 0 if self.bf16_page128_packed else self.q_tiles * 16 * self.q_stride
+
+    @property
+    def fp8_multi_tile(self):
+        # Bound resident Q/output fragments: D128 fits four query tiles,
+        # D256 fits two. Both reuse K/V operands in their staged LDS layout;
+        # page16 and windowed attention retain 64-token chunks.
+        # A one-token window does not amortize resident operand setup.
+        return (
+            not self.bf16
+            and self.head_dim in (128, 256)
+            and self.block_size >= 16
+            and self.sliding_window != 1
+            and 2 <= self.m_tiles
+            and self.m_tiles * self.head_dim <= 512
+        )
+
+    @property
+    def packed_lds(self):
+        # FP8 cache layout is independent of scalar or per-token scales.
+        # Each wave gathers 16-token V chunks from either cache layout;
+        # page16 has the same byte order with or without the singleton axis.
+        # Plain D128/page64 single-M tiles retain the faster padded pipeline.
+        # Multiple query tiles reuse packed chunks and K128 WMMA without
+        # fetching K/V again for each query tile.
+        return (
+            not self.bf16
+            and self.head_dim in (128, 256)
+            and self.block_size >= 16
+            and (self.m_tiles == 1 or self.fp8_multi_tile)
+            and (
+                self.trans_v
+                or self.head_dim != 128
+                or self.block_size != 64
+                or self.m_tiles != 1
+            )
+        )
+
+    @property
+    def k_bytes(self):
+        if self.bf16_packed:
+            return self.TOKENS * self.head_dim * self.elem_bytes
+        return self.TOKENS * (self.head_dim if self.packed_lds else self.q_stride)
+
+    @property
+    def v_stride(self):
+        return self.TOKENS * self.elem_bytes + 16
+
+    @property
+    def v_bytes(self):
+        if self.bf16_packed:
+            return self.TOKENS * self.head_dim * self.elem_bytes
+        return self.head_dim * (self.TOKENS if self.packed_lds else self.v_stride)
+
+    @property
+    def kv_stride(self):
+        return (
+            self.k_bytes
+            + self.v_bytes
+            + (0 if self.bf16_packed else 2 * self.TOKENS * 4)
+        )
+
+    @property
+    def p_bytes(self):
+        return 16 * self.v_stride
+
+    @property
+    def async_page(self):
+        # Two packed buffers overlap page DMA with QK/softmax/PV. Keep these
+        # measured specializations separate from windowed and single-M D128 tiles.
+        return (
+            self.packed_lds
+            and (self.head_dim == 256 or self.fp8_multi_tile)
+            and self.block_size == 128
+            and self.sliding_window == 0
+        )
+
+    @property
+    def page16_async_scales(self):
+        # Each wave copies one page's contiguous FP32 token scales into LDS.
+        return (
+            self.packed_lds
+            and self.block_size == 16
+            and self.per_token_kv
+            and self.sliding_window == 0
+        )
+
+    @property
+    def buffers(self):
+        if self.packed_lds:
+            # Multi-tile 64-token chunks overlap gathered pages or windowed
+            # staging just like the 128-token asynchronous page path.
+            return (
+                2
+                if self.async_page or self.block_size == 16 or self.fp8_multi_tile
+                else 1
+            )
+        return (
+            2 if self.q_bytes + 2 * self.kv_stride + self.p_bytes + 576 <= 327680 else 1
+        )
+
+    @property
+    def p_offset(self):
+        return self.q_bytes + self.buffers * self.kv_stride
+
+    @property
+    def stats_offset(self):
+        return self.p_offset + self.p_bytes
+
+    @property
+    def total_bytes(self):
+        return self.stats_offset + 576
+
+    @property
+    def use_tdm(self):
+        # Packed FP8 tiles retain the cache layout for TDM transfers. Other
+        # per-token D128+ tiles also benefit from scalar address generation.
+        # BF16 descriptors fit D64–512; row padding requires a power-of-two
+        # interval <= 1024 bytes.
+        return (
+            (
+                self.bf16
+                or self.packed_lds
+                or (self.per_token_kv and self.head_dim >= 128)
+            )
+            and self.head_dim * self.elem_bytes <= 1024
+            and self.head_dim & (self.head_dim - 1) == 0
+        )
+
+    @property
+    def q_dtype(self):
+        return fx.BFloat16 if self.query_dtype == "bf16" else fx.Float16

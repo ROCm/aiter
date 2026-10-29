@@ -11,16 +11,14 @@ import os
 
 import triton
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 logger = AiterTritonLogger()
 
 from aiter.ops.triton.utils.config_utils import (
-    AITER_TRITON_CONFIGS_PATH,
     USE_LRU_CACHE,
-    _dtype_dir,
     load_config_json,
+    resolve_config_dir,
 )
 
 
@@ -65,13 +63,9 @@ def _get_tuned_kernel_entry(
     Do NOT use this directly — the entry is the shared cached object, so
     ``get_tuned_kernel_config()`` copies it before handing it out.
     """
-    arch = arch_info.get_arch()
-    # Nested layout of configs/CLAUDE.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json,
-    # <d_type> being the config name lowercased with dashes folded to underscores.
-    dtype_dir = _dtype_dir(config_name)
-    config_path = (
-        f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/{op}/{dtype_dir}/DEFAULT.json"
-    )
+    # Nested layout of configs/AGENTS.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json, or
+    # the <arch>/<cu_num>cu/ tree of this device's CU count (resolve_config_dir()).
+    config_path = f"{resolve_config_dir(op, config_name, backend=backend)}/DEFAULT.json"
     published = load_config_json(config_path, required=False) or {}
     return config_path, published.get(kernel_name)
 
@@ -82,6 +76,7 @@ def get_tuned_kernel_config(
     kernel_name: str,
     fallback: triton.Config,
     backend: str = "triton",
+    warn_on_miss: bool = True,
 ) -> triton.Config:
     """The tile pinned for this device, or ``fallback`` where none is published.
 
@@ -96,6 +91,8 @@ def get_tuned_kernel_config(
         kernel_name: Key of the kernel's entry within the config file.
         fallback: Config to register when this device has no published entry.
         backend: ``"triton"`` or ``"gluon"``.
+        warn_on_miss: Log a warning when no entry is published. Pass ``False``
+            where a miss is expected, e.g. a lookup keyed by shape.
     """
     try:
         config_path, entry = _get_tuned_kernel_entry(
@@ -113,6 +110,8 @@ def get_tuned_kernel_config(
         )
         return fallback
     if not entry:
+        if not warn_on_miss:
+            return fallback
         logger.warning(
             "No tuned Triton config for kernel '%s' in '%s'; using fallback %s",
             kernel_name,

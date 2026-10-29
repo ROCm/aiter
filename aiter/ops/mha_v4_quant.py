@@ -629,7 +629,7 @@ def _mxfp4_v_buffers(
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_fp6_p_raw", mutates_args=())
 def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Pack MXFP4 V in the token order consumed by the FP6-P F4F4 kernel."""
+    """Pack MXFP4 V in the token order consumed by the FP6-P kernels."""
     batch, sequence, heads, _ = _validate_bshd_hd128(
         input, "MXFP4 V-for-FP6-P quantization"
     )

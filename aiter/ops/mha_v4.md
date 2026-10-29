@@ -11,10 +11,15 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Each sparse row declares the KV tiles per sequence it can traverse (`lut_max`);
   the launcher refuses longer sequences instead of overrunning a staged LUT.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
-- Per-batch key lengths via `seqlens_k`, on the dense GFX950 `BF16 Q/K` rows only. Every other
-  recipe, architecture, and the sorted-sparse path reject it.
+- Per-batch key lengths via `seqlens_k`, on every dense GFX950 row. Entries clamp to the padded
+  key extent, and a null pointer lets one object serve dense and varlen. Sorted sparse and GFX942
+  reject it.
 - Log-sum-exp via `return_lse` on GFX950, wherever the selected manifest row declares `lse`, which
   today is every dense and every sparse row. GFX942 rejects it until its exported value is measured.
+  The value is the log-sum-exp of the *quantized* scores, so its error tracks the row max at each
+  format's score precision (~0.001 nats for BF16 Q/K, 36 for MXFP6, 153 for MXFP4, against 1418
+  nats of range): safe for merging same-recipe ring chunks, wrong as an absolute quantity or across
+  mixed recipes.
 - No backward, dropout, RNG state, causal, or Q-side varlen support yet.
 
 Supported GFX950 recipes. Every recipe is available in both dense and sorted-sparse mode with the
@@ -181,6 +186,11 @@ Quantizer/layout changes additionally
 require byte-level checks at aligned and ragged sequence lengths, eager/fullgraph parity, allocator
 churn, and downstream-consumer coverage. Kernel performance changes require the relevant retained
 model captures and balanced multi-GPU target-shape benchmarks.
+
+`_VARLEN_CAPABLE_QV` is a claim about the deployed dense objects, keyed on `(q_format, v_format)`
+alone -- a new object for an already-claimed pair inherits the claim without being rebuilt, and
+answers stay plausible because the feature is simply ignored. The suite disassembles every claimed
+row rather than trusting the table. LSE is claimed per row instead, by the manifest's `lse` column.
 
 Key implementation locations:
 
