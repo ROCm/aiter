@@ -224,10 +224,15 @@ def test_hipb_grouped_scratch_reuse_across_streams():
         torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_hipb_grouped_compile_schema_and_execution():
-    schema = str(torch.ops.aiter.hipb_grouped_mm.default._schema)
-    assert "Tensor(a3!) out" in schema
+def _assert_only_out_is_mutable(op):
+    schema = str(op.default._schema)
     assert schema.endswith("-> ()")
+    assert schema.count("!") == 1
+    assert "Tensor(a3!) out" in schema
+
+
+def test_hipb_grouped_compile_schema_and_execution():
+    _assert_only_out_is_mutable(torch.ops.aiter.hipb_grouped_mm)
 
     counts = [4, 4]
     a = torch.randn(8, 32, device="cuda", dtype=torch.float16)
@@ -241,6 +246,27 @@ def test_hipb_grouped_compile_schema_and_execution():
 
     out = torch.empty(8, 48, device="cuda", dtype=torch.float16)
     actual = run_grouped(a, b, offsets, out)
+    expected = torch.cat(
+        [chunk @ b[index] for index, chunk in enumerate(torch.split(a, counts))]
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_hipb_multistream_compile_schema_and_execution():
+    _assert_only_out_is_mutable(torch.ops.aiter.hipb_multistream_mm)
+
+    counts = [4, 4]
+    a = torch.randn(8, 32, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(2, 32, 48, device="cuda", dtype=torch.bfloat16)
+    offsets = _offsets(counts)
+
+    @torch.compile(fullgraph=True)
+    def run_multistream(a, b, offsets, out):
+        hipb_multistream_mm(a, b, offsets, out)
+        return out
+
+    out = torch.empty(8, 48, device="cuda", dtype=torch.bfloat16)
+    actual = run_multistream(a, b, offsets, out)
     expected = torch.cat(
         [chunk @ b[index] for index, chunk in enumerate(torch.split(a, counts))]
     )
@@ -443,6 +469,38 @@ def test_multistream_honors_float32_output(monkeypatch):
     returned = grouped_gemm(a, b, offsets, out=caller_out)
     assert returned is caller_out
     torch.testing.assert_close(caller_out, actual, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("in_dtype", "out_dtype", "a_value", "b_value", "expected_value"),
+    (
+        (torch.float16, torch.float32, 100.0, 100.0, 640000.0),
+        (torch.float32, torch.float16, 65536.0, 1.0 / 1024.0, 4096.0),
+    ),
+)
+@pytest.mark.parametrize("provide_out", (False, True))
+def test_grouped_gemm_refuses_lossy_hipblaslt_cast(
+    monkeypatch, in_dtype, out_dtype, a_value, b_value, expected_value, provide_out
+):
+    counts = [8, 0, 16]
+    a = torch.full((24, 64), a_value, device="cuda", dtype=in_dtype)
+    b = torch.full((3, 64, 96), b_value, device="cuda", dtype=in_dtype)
+    offsets = _offsets(counts)
+    expected = torch.full((24, 96), expected_value, device="cuda", dtype=out_dtype)
+
+    def run(backend):
+        monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", backend)
+        if provide_out:
+            caller_out = torch.empty_like(expected)
+            returned = grouped_gemm(a, b, offsets, out=caller_out)
+            assert returned is caller_out
+            return caller_out
+        return grouped_gemm(a, b, offsets, out_dtype=out_dtype)
+
+    with pytest.raises(ValueError, match="does not support"):
+        run("hipblaslt")
+    for backend in ("triton", "multistream", "auto"):
+        torch.testing.assert_close(run(backend), expected, rtol=0, atol=0)
 
 
 def test_auto_backend_falls_back_to_triton(monkeypatch):

@@ -207,18 +207,18 @@ def _grouped_gemm_hipblaslt(
     )
     counts = cu_seqlens.contiguous()
     requested_dtype = _grouped_output_dtype(work_a, work_b, out, out_dtype)
-    # Grouped hipBLASLt has FP16 algorithms. BF16 and FP32 queries do not, so a
-    # requested FP32 output is computed in the input dtype and cast. BF16 is
-    # submitted as requested and raises when the library has no algorithm.
-    compute_dtype = (
-        requested_dtype
-        if requested_dtype in (torch.float16, torch.bfloat16)
-        else work_a.dtype
-    )
-    if work_a.dtype != compute_dtype or work_b.dtype != compute_dtype:
-        work_a = work_a.to(dtype=compute_dtype)
-        work_b = work_b.to(dtype=compute_dtype)
-    result_dtype = compute_dtype
+    # Grouped hipBLASLt has no mixed-dtype algorithm. Casting before the GEMM
+    # overflows values that the requested dtype can still represent, and auto
+    # would not fall back because the call succeeds. Reject the combination
+    # first. A same-dtype query that the library cannot run still raises later.
+    if work_a.dtype != work_b.dtype or work_a.dtype != requested_dtype:
+        raise ValueError(
+            "grouped hipBLASLt does not support "
+            f"{work_a.dtype} x {work_b.dtype} -> {requested_dtype}"
+        )
+    if bias is not None and bias.dtype != requested_dtype:
+        raise ValueError("grouped hipBLASLt bias dtype must match the output dtype")
+    result_dtype = requested_dtype
 
     if A_is_transposed:
         if scatter_idx is not None:
@@ -245,7 +245,7 @@ def _grouped_gemm_hipblaslt(
         counts,
         work_out,
         A_is_transposed,
-        (bias.to(dtype=result_dtype).contiguous() if bias is not None else None),
+        (bias.contiguous() if bias is not None else None),
     )
 
     if out is None:
