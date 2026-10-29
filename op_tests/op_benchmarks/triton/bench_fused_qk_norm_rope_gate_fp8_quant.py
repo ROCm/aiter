@@ -41,11 +41,11 @@ def get_x_vals(args):
 def balanced_cu_seqlens(total_tokens, requested_sequences, device):
     num_sequences = min(total_tokens, requested_sequences)
     base, remainder = divmod(total_tokens, num_sequences)
-    lengths = torch.full((num_sequences,), base, dtype=torch.int32)
+    lengths = torch.full((num_sequences,), base, dtype=torch.int32, device=device)
     lengths[:remainder] += 1
-    cu_seqlens = torch.zeros(num_sequences + 1, dtype=torch.int32)
+    cu_seqlens = torch.zeros(num_sequences + 1, dtype=torch.int32, device=device)
     torch.cumsum(lengths, dim=0, out=cu_seqlens[1:])
-    return cu_seqlens.to(device)
+    return cu_seqlens
 
 
 def benchmark_fused_qkv(tokens, metric, args, **_):

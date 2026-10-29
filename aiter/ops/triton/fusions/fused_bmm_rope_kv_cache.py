@@ -447,7 +447,8 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         - q_nope_zeros_out: Zero output, shape (num_decode_toks_for_zeros, QH, kv_lora_rank).
 
     The function also updates kv_cache in-place. The gfx950 FP8 prefill route uses
-    QH=8, KH=1, K=192, N=512 and RoPE dim=64. Other shapes use the generic route.
+    QH=8, KH=1, K=192, N=512 and RoPE dim=64. It requires 11072 to 32768
+    query tokens and no decode tokens. Other inputs use the generic route.
     This route requires contiguous weights and a dense query layout. Query rows
     can also be interleaved by head, with an optional trailing RoPE part.
     """
@@ -526,10 +527,11 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
 
     prefill_config = None
     if config is None:
-        # These prefill configs require FP8 outputs and bounded local strides.
+        # Use the prefill configs only for large pure-prefill calls.
+        # Small or unsupported calls keep the generic config.
         use_prefill = (
             arch_info.get_arch() == "gfx950"
-            and 32 < M <= 32768
+            and 11072 <= M <= 32768
             and qh == 8
             and kh == 1
             and N == 512
@@ -537,6 +539,7 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
             and group_size == 128
             and d_pe == qk_rope_head_dim == 64
             and b_slot == b == bk
+            and num_decode_toks_for_zeros == 0
             and transpose_bm
             and q_out_dtype == torch.float8_e4m3fn
             and w_k.dtype == torch.float8_e4m3fn
