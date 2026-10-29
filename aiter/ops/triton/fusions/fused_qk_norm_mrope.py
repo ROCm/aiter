@@ -70,9 +70,10 @@ def fused_qk_norm_mrope(
     k_out = torch.empty((num_tokens, k.shape[1]), dtype=k.dtype, device=k.device)
     _LOGGER.info("FUSED_QK_NORM_MROPE: T=%d Hq=%d Hk=%d", num_tokens, q_heads, k_heads)
 
-    # A program does one head row per wave. The rows of token t are its Q heads, then its K heads.
+    # One row per wave. The rows of token t are its Q heads, then its K heads.
     num_rows = num_tokens * (q_heads + k_heads)
-    fused_qk_norm_mrope_gfx1250[(triton.cdiv(num_rows, config["num_warps"]),)](
+    block_m = config["num_warps"]
+    fused_qk_norm_mrope_gfx1250[(triton.cdiv(num_rows, block_m),)](
         q,
         k,
         q_weight,
@@ -92,8 +93,8 @@ def fused_qk_norm_mrope(
         K_HEADS=k_heads,
         SECTION_H=mrope_section[1],
         SECTION_W=mrope_section[2],
-        ROWS=config["num_warps"],
-        num_warps=config["num_warps"],
-        **get_fused_qk_norm_mrope_layouts(config["num_warps"]),
+        BLOCK_M=block_m,
+        num_warps=block_m,
+        **get_fused_qk_norm_mrope_layouts(block_m),
     )
     return q_out, k_out

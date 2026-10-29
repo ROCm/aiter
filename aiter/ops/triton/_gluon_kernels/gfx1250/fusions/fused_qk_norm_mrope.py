@@ -16,7 +16,7 @@ ROPE_HALF = gl.constexpr(32)  # rotary_dim 64: two Neox halves
 
 @functools.cache
 def get_fused_qk_norm_mrope_layouts(num_warps):
-    # Each wave holds one row: 8 values per lane for the norm, 1 per lane for each rope half.
+    # One row per wave: 8 values per lane for the norm, 1 value per lane for the RoPE halves.
     return {
         "row_layout": gl.BlockedLayout(
             [1, HEAD_DIM // 32], [1, 32], [num_warps, 1], [1, 0]
@@ -26,7 +26,7 @@ def get_fused_qk_norm_mrope_layouts(num_warps):
 
 
 _fused_qk_norm_mrope_repr = make_kernel_repr(
-    "fused_qk_norm_mrope_gfx1250", ["Q_HEADS", "K_HEADS", "ROWS"]
+    "fused_qk_norm_mrope_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M"]
 )
 
 
@@ -42,113 +42,106 @@ def fused_qk_norm_mrope_gfx1250(
     q_out_ptr,
     k_out_ptr,
     num_rows,
-    q_stride,
-    k_stride,
-    positions_stride,
-    cos_stride,
+    stride_q,
+    stride_k,
+    stride_positions,
+    stride_cos,
     EPS: gl.constexpr,
     Q_HEADS: gl.constexpr,
     K_HEADS: gl.constexpr,
     SECTION_H: gl.constexpr,
     SECTION_W: gl.constexpr,
-    ROWS: gl.constexpr,
+    BLOCK_M: gl.constexpr,
     row_layout: gl.constexpr,
     rope_layout: gl.constexpr,
 ):
+    # Row m of the T * HEADS rows is head m % HEADS of token m // HEADS, Q heads first.
     HEADS: gl.constexpr = Q_HEADS + K_HEADS
-    rows_of_row: gl.constexpr = gl.SliceLayout(1, row_layout)
-    rows_of_rope: gl.constexpr = gl.SliceLayout(1, rope_layout)
-
-    # Row r is head r % HEADS of token r // HEADS, Q heads first.
-    r = gl.program_id(0) * ROWS + gl.arange(0, ROWS, layout=rows_of_row)
-    t = r // HEADS
-    h = r % HEADS
-    is_q = h < Q_HEADS
-    valid = r < num_rows
-    in_off = gl.where(
-        is_q, t * q_stride + h * HEAD_DIM, t * k_stride + (h - Q_HEADS) * HEAD_DIM
+    pid_m = gl.program_id(0)
+    offs_m = pid_m * BLOCK_M + gl.arange(
+        0, BLOCK_M, layout=gl.SliceLayout(1, row_layout)
     )
-    out_off = gl.where(
+    offs_n = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, row_layout))
+    token = offs_m // HEADS
+    head = offs_m % HEADS
+    is_q = head < Q_HEADS
+    mask_m = offs_m < num_rows
+    offs_x = gl.where(
         is_q,
-        t * (Q_HEADS * HEAD_DIM) + h * HEAD_DIM,
-        t * (K_HEADS * HEAD_DIM) + (h - Q_HEADS) * HEAD_DIM,
+        token * stride_q + head * HEAD_DIM,
+        token * stride_k + (head - Q_HEADS) * HEAD_DIM,
+    )
+    offs_out = gl.where(
+        is_q,
+        token * (Q_HEADS * HEAD_DIM) + head * HEAD_DIM,
+        token * (K_HEADS * HEAD_DIM) + (head - Q_HEADS) * HEAD_DIM,
     )
 
-    # Issue every load before the reduction: the row, its two rope halves, the positions, cos and sin.
-    d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, row_layout))
-    in_row = gl.where(gl.expand_dims(is_q, 1), q_ptr, k_ptr) + gl.expand_dims(in_off, 1)
-    x = gl.load(in_row + gl.expand_dims(d, 0), mask=gl.expand_dims(valid, 1), other=0.0)
+    # Every load comes before the first wait: the row and its weight, the RoPE halves, the positions.
+    x_row = gl.where(is_q, q_ptr, k_ptr) + offs_x
+    x = gl.load(x_row[:, None] + offs_n[None, :], mask=mask_m[:, None], other=0.0)
     w = gl.where(
-        gl.expand_dims(is_q, 1),
-        gl.expand_dims(gl.load(q_weight_ptr + d), 0),
-        gl.expand_dims(gl.load(k_weight_ptr + d), 0),
+        is_q[:, None],
+        gl.load(q_weight_ptr + offs_n)[None, :],
+        gl.load(k_weight_ptr + offs_n)[None, :],
     )
 
-    i = gl.arange(0, ROPE_HALF, layout=gl.SliceLayout(0, rope_layout))
-    rq = gl.expand_dims(gl.convert_layout(is_q, rows_of_rope), 1)
-    rt = gl.convert_layout(t, rows_of_rope)
-    rv = gl.convert_layout(valid, rows_of_rope)
-    rope_in = gl.where(rq, q_ptr, k_ptr) + gl.expand_dims(
-        gl.convert_layout(in_off, rows_of_rope), 1
+    # The same rows in the RoPE layout: columns [0, 32) and [32, 64).
+    offs_r = gl.arange(0, ROPE_HALF, layout=gl.SliceLayout(0, rope_layout))
+    token_r = gl.convert_layout(token, gl.SliceLayout(1, rope_layout))
+    is_q_r = gl.convert_layout(is_q, gl.SliceLayout(1, rope_layout))
+    mask_r = gl.convert_layout(mask_m, gl.SliceLayout(1, rope_layout))
+    x_row_r = gl.convert_layout(x_row, gl.SliceLayout(1, rope_layout))
+    x_lo = gl.load(x_row_r[:, None] + offs_r[None, :], mask=mask_r[:, None], other=0.0)
+    x_hi = gl.load(
+        x_row_r[:, None] + ROPE_HALF + offs_r[None, :], mask=mask_r[:, None], other=0.0
     )
-    x1 = gl.load(rope_in + gl.expand_dims(i, 0), mask=gl.expand_dims(rv, 1), other=0.0)
-    x2 = gl.load(
-        rope_in + ROPE_HALF + gl.expand_dims(i, 0),
-        mask=gl.expand_dims(rv, 1),
-        other=0.0,
+    w_lo = gl.where(
+        is_q_r[:, None],
+        gl.load(q_weight_ptr + offs_r)[None, :],
+        gl.load(k_weight_ptr + offs_r)[None, :],
     )
-    w1 = gl.where(
-        rq,
-        gl.expand_dims(gl.load(q_weight_ptr + i), 0),
-        gl.expand_dims(gl.load(k_weight_ptr + i), 0),
-    )
-    w2 = gl.where(
-        rq,
-        gl.expand_dims(gl.load(q_weight_ptr + ROPE_HALF + i), 0),
-        gl.expand_dims(gl.load(k_weight_ptr + ROPE_HALF + i), 0),
+    w_hi = gl.where(
+        is_q_r[:, None],
+        gl.load(q_weight_ptr + ROPE_HALF + offs_r)[None, :],
+        gl.load(k_weight_ptr + ROPE_HALF + offs_r)[None, :],
     )
 
-    # Frequency i takes the H position, the W position or the T position (interleaved sections).
-    pos_t = gl.expand_dims(gl.load(positions_ptr + rt, mask=rv, other=0), 1)
-    pos_h = gl.expand_dims(
-        gl.load(positions_ptr + positions_stride + rt, mask=rv, other=0), 1
+    # Frequency i uses the H position, the W position or the T position (interleaved sections).
+    pos_t = gl.load(positions_ptr + token_r, mask=mask_r, other=0)
+    pos_h = gl.load(positions_ptr + stride_positions + token_r, mask=mask_r, other=0)
+    pos_w = gl.load(
+        positions_ptr + 2 * stride_positions + token_r, mask=mask_r, other=0
     )
-    pos_w = gl.expand_dims(
-        gl.load(positions_ptr + 2 * positions_stride + rt, mask=rv, other=0), 1
+    use_h = (offs_r % 3 == 1) & (offs_r < 3 * SECTION_H)
+    use_w = (offs_r % 3 == 2) & (offs_r < 3 * SECTION_W)
+    pos = gl.where(
+        use_h[None, :],
+        pos_h[:, None],
+        gl.where(use_w[None, :], pos_w[:, None], pos_t[:, None]),
     )
-    use_h = gl.expand_dims((i % 3 == 1) & (i < 3 * SECTION_H), 0)
-    use_w = gl.expand_dims((i % 3 == 2) & (i < 3 * SECTION_W), 0)
-    pos = gl.where(use_h, pos_h, gl.where(use_w, pos_w, pos_t))
-    cos = gl.load(cos_ptr + pos * cos_stride + gl.expand_dims(i, 0))
-    sin = gl.load(sin_ptr + pos * cos_stride + gl.expand_dims(i, 0))
+    cos = gl.load(cos_ptr + pos * stride_cos + offs_r[None, :])
+    sin = gl.load(sin_ptr + pos * stride_cos + offs_r[None, :])
 
-    # Gemma RMSNorm: x / rms(x) * (1 + w). Values [64, 256) are done.
+    # Gemma RMSNorm: x / rms(x) * (1 + w). Columns [64, 256) are done.
     x = x.to(gl.float32)
     rstd = gl.rsqrt(gl.sum(x * x, axis=1) / HEAD_DIM + EPS)
-    y = x * gl.expand_dims(rstd, 1) * (w.to(gl.float32) + 1.0)
-    out_row = gl.where(gl.expand_dims(is_q, 1), q_out_ptr, k_out_ptr) + gl.expand_dims(
-        out_off, 1
-    )
+    y = (x * rstd[:, None] * (w.to(gl.float32) + 1.0)).to(q_out_ptr.dtype.element_ty)
+    out_row = gl.where(is_q, q_out_ptr, k_out_ptr) + offs_out
     gl.store(
-        out_row + gl.expand_dims(d, 0),
-        y.to(q_out_ptr.dtype.element_ty),
-        mask=gl.expand_dims(valid, 1) & gl.expand_dims(d >= 2 * ROPE_HALF, 0),
+        out_row[:, None] + offs_n[None, :],
+        y,
+        mask=mask_m[:, None] & (offs_n >= 2 * ROPE_HALF)[None, :],
     )
 
-    # Neox rotation of values [0, 64), from the same normalized values.
-    s = gl.expand_dims(gl.convert_layout(rstd, rows_of_rope), 1)
-    y1 = x1.to(gl.float32) * s * (w1.to(gl.float32) + 1.0)
-    y2 = x2.to(gl.float32) * s * (w2.to(gl.float32) + 1.0)
-    rope_out = gl.where(rq, q_out_ptr, k_out_ptr) + gl.expand_dims(
-        gl.convert_layout(out_off, rows_of_rope), 1
-    )
+    # Neox RoPE of columns [0, 64), from the same normalized values.
+    rstd_r = gl.convert_layout(rstd, gl.SliceLayout(1, rope_layout))[:, None]
+    y_lo = x_lo.to(gl.float32) * rstd_r * (w_lo.to(gl.float32) + 1.0)
+    y_hi = x_hi.to(gl.float32) * rstd_r * (w_hi.to(gl.float32) + 1.0)
+    rope_lo = (y_lo * cos - y_hi * sin).to(q_out_ptr.dtype.element_ty)
+    rope_hi = (y_hi * cos + y_lo * sin).to(q_out_ptr.dtype.element_ty)
+    out_row_r = gl.convert_layout(out_row, gl.SliceLayout(1, rope_layout))
+    gl.store(out_row_r[:, None] + offs_r[None, :], rope_lo, mask=mask_r[:, None])
     gl.store(
-        rope_out + gl.expand_dims(i, 0),
-        (y1 * cos - y2 * sin).to(q_out_ptr.dtype.element_ty),
-        mask=gl.expand_dims(rv, 1),
-    )
-    gl.store(
-        rope_out + ROPE_HALF + gl.expand_dims(i, 0),
-        (y2 * cos + y1 * sin).to(q_out_ptr.dtype.element_ty),
-        mask=gl.expand_dims(rv, 1),
+        out_row_r[:, None] + ROPE_HALF + offs_r[None, :], rope_hi, mask=mask_r[:, None]
     )
