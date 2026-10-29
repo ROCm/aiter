@@ -125,8 +125,9 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
     typename KvsgWin::descriptor kvsg_d0 = kvsg_win.make_descriptor();
     kvg_d0.set_tile_dim1(T::TILE_PAGES);    // gather mode: tile_dim1 = valid indices
     kvsg_d0.set_tile_dim1(T::TILE_PAGES);
-    // The pool's last 8-row page: every gathered id is clamped to it.
-    [[maybe_unused]] const opus::u32_t last_page = (opus::u32_t)(k.kv_rows / T::PAGE_ROWS) - 1u;
+    // The pool's last whole 8-row page within a 32-bit row: every gathered id is clamped to it.
+    [[maybe_unused]] const opus::u32_t last_page =
+        (k.kv_last_row - (T::PAGE_ROWS - 1)) / T::PAGE_ROWS;
     const opus::u64_t kv_g  = reinterpret_cast<opus::u64_t>(k.ptr_kv);
     const opus::u64_t kvs_g = reinterpret_cast<opus::u64_t>(k.ptr_kv_scale);
     // Tile t of the chunk into ring slot `slot`. Nothing is issued past the chunk -- the wait below

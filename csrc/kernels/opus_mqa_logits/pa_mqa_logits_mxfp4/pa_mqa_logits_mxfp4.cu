@@ -753,8 +753,8 @@ void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
     k.weight_scale        = weight_scale;
     k.cta_target          = cta_target;
     k.prefill_parts       = prefill_parts;
-    k.kv_rows             = static_cast<int>(
-        std::min<int64_t>(static_cast<int64_t>(kv_cache.numel()) / TOKEN_BYTES, INT32_MAX));
+    k.kv_last_row         = static_cast<unsigned>(  // keys past 2^32 are never addressed (4.)
+        std::min<int64_t>(static_cast<int64_t>(kv_cache.numel()) / TOKEN_BYTES, 1LL << 32) - 1);
 
     HipDeviceGuard guard(q.device_id);
     HIP_CALL_LAUNCH(in.launch(mode, k, grid, aiter::getCurrentHIPStream()));

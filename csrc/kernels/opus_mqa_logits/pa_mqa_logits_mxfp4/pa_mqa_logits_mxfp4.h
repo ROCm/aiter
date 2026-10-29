@@ -69,7 +69,7 @@ struct mqa_logits_mxfp4_kargs {
     float weight_scale;
     int cta_target;                           // Free: the split's target CTA count
     int prefill_parts;                        // Prefill: pieces a group is cut into
-    int kv_rows;                              // keys in the KV plane (capped at INT_MAX)
+    unsigned kv_last_row;                     // the KV plane's last key a 32-bit row reaches
 };
 static_assert(sizeof(mqa_logits_mxfp4_kargs) == 128, "kargs past 128 B are not preloaded");
 
