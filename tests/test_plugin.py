@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from inspect import signature
 from typing import Any
 
 import pytest
+import torch
 
+import aiter
 from aiter import plugin
 
 
@@ -283,3 +286,89 @@ def test_non_candidate_return_falls_back_to_native(monkeypatch):
     assert native_calls == [(2, 3)]
     assert plugin.last_decision().reason == "invalid-candidate"
     assert plugin.last_decision().provider == "aklr"
+
+
+def test_routed_ops_register_the_public_contract():
+    assert aiter.rmsnorm.__aiter_plugin_op__ == plugin.Op("rmsnorm", 1)
+    assert aiter.pertoken_quant.__aiter_plugin_op__ == plugin.Op("pertoken_quant", 1)
+    assert list(signature(aiter.rmsnorm).parameters) == [
+        "out",
+        "input",
+        "weight",
+        "epsilon",
+        "gemma_norm",
+    ]
+    assert list(signature(aiter.pertoken_quant).parameters) == [
+        "x",
+        "scale",
+        "x_scale",
+        "scale_dtype",
+        "quant_dtype",
+        "dtypeMax",
+    ]
+
+
+def test_pertoken_quant_stays_native_by_default(monkeypatch):
+    monkeypatch.setattr(plugin, "_entry_points", lambda: ())
+    x = torch.tensor([[-1.0, 2.0], [0.5, -3.0]])
+
+    y, y_scale = aiter.pertoken_quant(x, quant_dtype=torch.int8)
+
+    amax = x.abs().amax(dim=-1, keepdim=True)
+    scale = amax / 127
+    assert torch.equal(y, (x / scale).to(torch.int8))
+    assert torch.equal(y_scale, scale.to(torch.float32))
+    decision = plugin.last_decision()
+    assert decision.route == "native"
+    assert decision.reason == "no-provider"
+
+
+def test_pertoken_quant_provider_serves_when_enabled(monkeypatch):
+    seen = []
+
+    class Serving(_Provider):
+        def select(self, op, args, kwargs):
+            seen.append((op, args, dict(kwargs)))
+            return self.selected
+
+    provider = Serving("aklr", _candidate("aklr", result=(7, 0.5)))
+    provider.op_versions = {"pertoken_quant": {1}}
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    x = torch.tensor([[1.0, -2.0]])
+
+    y, y_scale = aiter.pertoken_quant(x, quant_dtype=torch.int8)
+
+    assert (y, y_scale) == (7, 0.5)
+    assert seen == [
+        (
+            plugin.Op("pertoken_quant", 1),
+            (x, None, None, torch.float32, torch.int8, None),
+            {},
+        )
+    ]
+    decision = plugin.last_decision()
+    assert decision.route == "provider"
+    assert decision.provider == "aklr"
+    assert decision.kernel_id == "kernel-1"
+
+
+def test_rmsnorm_provider_serves_without_gpu(monkeypatch):
+    # A served call never reaches the native ROCm kernel, so CPU tensors are
+    # enough to prove the routed path: if native ran, it would fail on CPU.
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"rmsnorm": {1}}
+    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    out = torch.zeros(2, 4)
+
+    aiter.rmsnorm(out, torch.rand(2, 4), torch.ones(4), 1e-6)
+
+    assert provider.select_calls == 1
+    decision = plugin.last_decision()
+    assert decision.route == "provider"
+    assert decision.provider == "aklr"

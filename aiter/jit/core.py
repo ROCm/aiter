@@ -2222,6 +2222,10 @@ def compile_ops(
             def ctypes_custom_wrapper(*args, **kwargs):
                 return ctypes_wrapper(*args, **kwargs)
 
+            # The guard's closure hides the stub's signature; point __wrapped__
+            # at it so inspect.signature() (and aiter.plugin.route's contract
+            # capture) sees the public signature instead of (*args, **kwargs).
+            ctypes_custom_wrapper.__wrapped__ = func
             return ctypes_custom_wrapper
 
         elif ffi_type == "pybind":
@@ -2519,6 +2523,8 @@ def compile_ops(
             def custom_wrapper(*args, **kwargs):
                 return wrapper(*args, **kwargs)
 
+            # Same as the ctypes branch above: expose the stub's signature.
+            custom_wrapper.__wrapped__ = func
             return custom_wrapper
 
         else:

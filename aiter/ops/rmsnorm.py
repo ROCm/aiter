@@ -7,6 +7,7 @@ from torch import Tensor
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 from .quant import get_dtype_max
 
 # opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
@@ -637,6 +638,7 @@ def rmsnorm_quant(
     """
 
 
+@_route(op="rmsnorm", version=1)
 @compile_ops("module_rmsnorm_quant", develop=True)
 def rmsnorm(
     out: Tensor,
