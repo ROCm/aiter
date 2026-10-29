@@ -83,10 +83,7 @@ from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
     compile_mxfp8_8wave_gemm,
     parse_mxfp8_8wave_kernel_name,
 )
-from aiter.ops.flydsl.gemm_kernels import (
-    SPLIT_K_SEMAPHORE_MAX_LEN,
-    get_flydsl_hgemm_kernel_params,
-)
+from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     parse_kernel_name as parse_mxscale_preshuffle_kernel_name,
 )
@@ -95,6 +92,7 @@ from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_FP16,
     GEMM_A16W16_DTYPE_FP32,
     _dynamic_tensor_arg,
+    alloc_split_k_buffers,
     gemm_a16w16_gfx950,
     make_gemm_a16w16_param_and_validate,
 )
@@ -557,12 +555,8 @@ def _compile_hgemm_to_cache(
         ).t()
         out = torch.empty((1, representative_extent), device=dev, dtype=torch_out_dtype)
         bias = torch.empty((representative_extent,), device=dev, dtype=torch_dtype)
-        semaphore = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int32
-        )
-        signal = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int32
-        )
+        # The runtime allocator, so the cache key cannot drift from inference.
+        semaphore, signal = alloc_split_k_buffers(dev)
         stream = fx.Stream(0)
         a_arg = _dynamic_tensor_arg(a, 1)
         b_arg = _dynamic_tensor_arg(b, 0)
