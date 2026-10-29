@@ -1258,9 +1258,10 @@ static void fused_qknorm_idxrqknorm_impl(
         }
     }
 
+    const bool q_is_fp8 = q_out.has_value() && (q_out->dtype() == AITER_DTYPE_fp8 ||
+                                                q_out->dtype() == AITER_DTYPE_u8);
     if(q_out.has_value())
     {
-        const bool q_is_fp8 = q_out->dtype() == AITER_DTYPE_fp8 || q_out->dtype() == AITER_DTYPE_u8;
         AITER_CHECK(!q_is_fp8 || insert_kv, "fp8 q_out requires the insert mode (kv caches)");
         AITER_CHECK(q_out->is_gpu() && q_out->is_contiguous() &&
                         (q_out->dtype() == qkv.dtype() || q_is_fp8),
@@ -1294,9 +1295,6 @@ static void fused_qknorm_idxrqknorm_impl(
         opus::fp8_t* index_q_fp8_ptr =
             index_q_is_fp8 ? reinterpret_cast<opus::fp8_t*>(index_q_out->data_ptr())
                            : nullptr;
-        const bool q_is_fp8 =
-            q_out.has_value() &&
-            (q_out->dtype() == AITER_DTYPE_fp8 || q_out->dtype() == AITER_DTYPE_u8);
         T* q_ptr = (!q_is_fp8 && q_out.has_value()) ? reinterpret_cast<T*>(q_out->data_ptr())
                                                     : nullptr;
         opus::fp8_t* q_fp8_ptr =

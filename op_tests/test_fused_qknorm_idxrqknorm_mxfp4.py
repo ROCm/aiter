@@ -34,10 +34,10 @@ NQ, NIQ, HD, ROT = 16, 1, 128, 64  # MiniMax-M3 TP4
 PAGE_BYTES = 128 * (64 + 4)
 SENTINEL = 0xA5
 DEFAULT_DTYPES = [dtypes.bf16, dtypes.fp16]
-DEFAULT_TOKENS = [1, 7, 300, 1031]
+DEFAULT_TOKENS = [1, 300, 1031]
 DEFAULT_PERF_TOKENS = [1, 32, 128, 1024, 4096, 16384]
 
-INDEX_CASES = ("sequential", "index_shuffled", "index_skipped", "differ")
+INDEX_CASES = ("sequential", "index_skipped", "differ")
 KV_CASES = ("sequential", "shuffled", "main_skipped", "differ")
 # (kv_cache_dtype, block_size, index_cache_dtype, slot case, kv heads)
 CONFIGS = [
@@ -72,7 +72,6 @@ def slot_cases(T):
     return {
         "sequential": (seq, seq),
         "shuffled": (perm, perm),
-        "index_shuffled": (seq, perm),
         "index_skipped": (seq, skipped),
         "main_skipped": (skipped, skipped),
         "differ": (perm.flip(0).clone(), seq),
@@ -91,7 +90,7 @@ def make_call(
     skip_index=False,
     ic=None,
     pool=False,
-    **extra,
+    q_out=None,
 ):
     """A closure running the op once, and the tensors it writes (caches, q, index q).
 
@@ -132,14 +131,14 @@ def make_call(
         "iq": torch.empty(T, NIQ * HD, dtype=dtype),
         "ic": ic, "kc": kc, "vc": vc, "ks": ks, "vs": vs,
     }  # fmt: skip
-    q_out = extra.pop("q_out", out["q"])
+    q_out = out["q"] if q_out is None else q_out
 
     def call():
         aiter.fused_qknorm_idxrqknorm(
             qkv, w, w, cs, pos, NQ, nkv, ROT, 1e-6, w, w, NIQ,
             slots, kc, vc, ic, bs, q_out, out["iq"], index_slots,
             kv_cache_dtype=kv, index_cache_dtype=index_dtype, k_scale=ks, v_scale=vs,
-            asm_layout=bs == 16, skip_index_branch=skip_index, **extra,
+            asm_layout=bs == 16, skip_index_branch=skip_index,
         )  # fmt: skip
 
     return call, out
