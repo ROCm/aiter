@@ -48,6 +48,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx942_mainloop import (
@@ -930,9 +931,14 @@ def reload_tuned_table() -> None:
 
 
 @functools.cache
-def _device_key(device_index: int) -> tuple[str, int]:
-    props = torch.cuda.get_device_properties(device_index)
-    return props.gcnArchName.split(":")[0], props.multi_processor_count
+def _device_key() -> tuple[str, int]:
+    gfx, cu_num = get_gfx_runtime(), get_cu_num()
+    if gfx != "gfx942" or cu_num != GFX942_NUM_CUS:
+        raise RuntimeError(
+            "gfx942 GEMM requires a gfx942 device with 304 CUs; "
+            f"got {gfx!r} with {cu_num} CUs"
+        )
+    return gfx, cu_num
 
 
 def gfx942_tuned_config(
@@ -945,12 +951,8 @@ def gfx942_tuned_config(
     """The tuned-table config for this exact shape and device, or None."""
     if os.getenv("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE", "0") == "1":
         return None
-    index = (
-        torch.cuda.current_device()
-        if device is None or device.index is None
-        else device.index
-    )
-    gfx, cu_num = _device_key(index)
+    del device  # Aiter assumes a homogeneous node; shared helpers key the target.
+    gfx, cu_num = _device_key()
     cfg = _load_tuned_table(tuned_table_path()).get(
         (gfx, cu_num, m, n, k, tuned_out_dtype_name(out_dtype))
     )
@@ -1007,6 +1009,7 @@ def gemm_a16w16(
     device = a.device
     if device.type != "cuda" or b.device != device:
         raise ValueError(f"a and b must be on one GPU (got {device} and {b.device})")
+    _device_key()
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
         raise TypeError(f"gfx942 kernel is bf16-only (got {a.dtype} and {b.dtype})")
     m, k = a.shape

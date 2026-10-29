@@ -630,6 +630,17 @@ def test_gemm_a16w16_gfx942_rejects_invalid_inputs(case, error):
         gemm_a16w16(layout="nt", out_dtype=torch.bfloat16, **_invalid_inputs(case))
 
 
+def test_gemm_a16w16_gfx942_rejects_non_304_cu_target(monkeypatch):
+    _require_gfx942()
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    x, w, _ = _inputs(64, 128, 256)
+    monkeypatch.setattr(g, "get_cu_num", lambda: 228)
+    g._device_key.cache_clear()
+    with pytest.raises(RuntimeError, match="gfx942 device with 304 CUs"):
+        g.gemm_a16w16(x, w.t())
+
+
 def test_gemm_a16w16_gfx942_other_device():
     """Operands on a device that is not the current one, on its current stream
     or on an explicit one."""

@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
@@ -181,7 +181,7 @@ def flydsl_hgemm(
         }.items()
         if value is not None
     }
-    gfx = get_gfx()
+    gfx = get_gfx_runtime()
     if gfx == "gfx942":
         return gemm_a16w16_gfx942(
             a,

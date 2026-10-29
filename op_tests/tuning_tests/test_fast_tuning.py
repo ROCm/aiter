@@ -994,12 +994,14 @@ class TestGfx942CsvTuner(unittest.TestCase):
 
         with (
             mock.patch.object(sys, "argv", argv),
-            mock.patch.object(tuner, "get_gfx") as get_gfx,
+            mock.patch.object(tuner, "get_gfx_runtime") as get_gfx_runtime,
+            mock.patch.object(tuner, "get_cu_num") as get_cu_num,
             mock.patch.object(tuner, "print_table") as print_table,
         ):
             tuner.main()
 
-        get_gfx.assert_not_called()
+        get_gfx_runtime.assert_not_called()
+        get_cu_num.assert_not_called()
         print_table.assert_called_once_with(Path("table.csv"))
 
     def test_non_gfx942_is_rejected_before_benchmark_construction(self):
@@ -1008,7 +1010,27 @@ class TestGfx942CsvTuner(unittest.TestCase):
 
         with (
             mock.patch.object(sys, "argv", argv),
-            mock.patch.object(tuner, "get_gfx", return_value="gfx950"),
+            mock.patch.object(tuner, "get_gfx_runtime", return_value="gfx950"),
+            mock.patch.object(tuner, "get_cu_num", return_value=304),
+            mock.patch.object(
+                tuner,
+                "ShapeBench",
+                side_effect=AssertionError("benchmark constructed"),
+            ),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            tuner.main()
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_non_304_cu_gfx942_is_rejected_before_benchmark_construction(self):
+        tuner = self._tuner()
+        argv = ["tune_gfx942_csv.py", "--M", "64", "--N", "64", "--K", "64"]
+
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(tuner, "get_gfx_runtime", return_value="gfx942"),
+            mock.patch.object(tuner, "get_cu_num", return_value=228),
             mock.patch.object(
                 tuner,
                 "ShapeBench",
