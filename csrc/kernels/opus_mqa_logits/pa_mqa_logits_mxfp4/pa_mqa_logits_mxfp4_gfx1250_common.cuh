@@ -167,7 +167,8 @@ __device__ inline bool mqa_assign(const mqa_logits_mxfp4_kargs& k, int lane, mqa
                     b = lo;
                 }
                 const int tiles = __builtin_amdgcn_readfirstlane(e > 0 ? (e + TK - 1) / TK : 0);
-                const int start = part * tiles / parts, count = (part + 1) * tiles / parts - start;
+                const int start = part_point(part, tiles, parts),
+                          count = part_point(part + 1, tiles, parts) - start;
                 if (count <= 0) return false;
                 set(b, g, 1, 0, start, count);
                 return true;
@@ -190,8 +191,8 @@ __device__ inline bool mqa_assign(const mqa_logits_mxfp4_kargs& k, int lane, mqa
                     const int j0 = gs - carry - __builtin_amdgcn_readlane(excl, l);
                     const int j  = groups_of(sn) - 1 - j0;
                     const int tiles = __builtin_amdgcn_readfirstlane(group_tiles(sr, sn, j));
-                    const int start = part * tiles / parts;
-                    const int count = (part + 1) * tiles / parts - start;
+                    const int start = part_point(part, tiles, parts);
+                    const int count = part_point(part + 1, tiles, parts) - start;
                     if (count <= 0) return false;
                     set(base + l, sr, sn, j, start, count);
                     return true;

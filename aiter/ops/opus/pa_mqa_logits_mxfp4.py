@@ -100,6 +100,7 @@ _CANDIDATE_PREFILL_ROWS = 16384
 _PREFILL_ROUNDS = 8
 _PREFILL_MIN_WALK = 16
 _CAND_MAX_WALK = 32
+_MAX_PREFILL_PARTS = 65536  # the kernels' 32-bit split (part_point) needs parts <= 2^16
 
 # Per arch: the ndim of q_scale / kv_scale / kv_cache, and kv_cache's page-rows dim. gfx950's are
 # MFMA-permuted (4-D, kv_cache [pages, 4, page_size, 16]); gfx1250's natural (3-D).
@@ -595,9 +596,14 @@ def _prefill_parts(inst: _Instance, groups: int, width_tiles: int) -> int:
     groups = max(1, groups)
     if inst.gather:
         rounds = max(1, -(-groups * width_tiles // (_CAND_MAX_WALK * resident)))
-        return max(1, rounds * resident // groups)
+        return max(1, min(rounds * resident // groups, _MAX_PREFILL_PARTS))
     return max(
-        1, min(_PREFILL_ROUNDS * resident // groups, width_tiles // _PREFILL_MIN_WALK)
+        1,
+        min(
+            _PREFILL_ROUNDS * resident // groups,
+            width_tiles // _PREFILL_MIN_WALK,
+            _MAX_PREFILL_PARTS,
+        ),
     )
 
 

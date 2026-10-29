@@ -719,8 +719,10 @@ void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
                         static_cast<int64_t>(cta_info.numel()) >= grid * RECORD_INTS,
                     "a Table launch over ", grid, " slots needs that many records");
     else
-        AITER_CHECK(cta_target >= 1 && prefill_parts >= 1,
-                    "cta_target / prefill_parts must be >= 1");
+        AITER_CHECK(cta_target >= 1 && prefill_parts >= 1 &&
+                        prefill_parts <= ol::MAX_PREFILL_PARTS,
+                    "cta_target must be >= 1 and prefill_parts in [1, ", ol::MAX_PREFILL_PARTS,
+                    "]");
     AITER_CHECK(grid >= 0 && tpb_shift >= 0 && tpb_shift <= ol::MAX_TPB_SHIFT,
                 "bad grid / tpb_shift");
     if (rows == 0 || grid == 0) return;

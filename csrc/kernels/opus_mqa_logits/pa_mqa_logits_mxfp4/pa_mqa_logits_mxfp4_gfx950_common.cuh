@@ -122,8 +122,8 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
                     const int j  = groups_of(sn) - 1 - j0;
                     const int e  = __builtin_amdgcn_readfirstlane(k.row_ends[last_row(sr, sn, j)]);
                     const int tiles = tiles_of(e);
-                    const int start = part * tiles / parts;
-                    const int count = (part + 1) * tiles / parts - start;
+                    const int start = part_point(part, tiles, parts);
+                    const int count = part_point(part + 1, tiles, parts) - start;
                     if (count <= 0) return false;
                     set(base + l, sr, sn, j, start, count, e);
                     return true;

@@ -74,6 +74,8 @@ namespace opus_logits {
 
 // A table entry names at most 2^MAX_TPB_SHIFT 64-key tiles (kargs.tpb_shift).
 constexpr int MAX_TPB_SHIFT = 15;
+// Prefill cuts a group into at most this many parts: part_point's 32-bit split needs it.
+constexpr int MAX_PREFILL_PARTS = 65536;
 
 enum mqa_logits_mode : int {
     SCHED_TABLE   = 0,
