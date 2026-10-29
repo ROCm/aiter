@@ -1,9 +1,26 @@
 python3 - <<'PY' || exit 1
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+import subprocess
+import sys
 
-installed = version("flydsl")
+wheel = Path("flydsl-0.3.3.dev882-cp312-cp312-linux_x86_64.whl")
+try:
+    installed = version("flydsl")
+except PackageNotFoundError:
+    if not wheel.is_file():
+        raise SystemExit(f"FlyDSL is not installed and local wheel is missing: {wheel}")
+    print(f"FlyDSL not found; installing local wheel: {wheel}", flush=True)
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)],
+        check=True,
+    )
+    installed = version("flydsl")
 if installed != "0.3.3.dev882":
-    raise SystemExit(f"Expected flydsl==0.3.3.dev882, found {installed}")
+    raise SystemExit(
+        f"Expected flydsl==0.3.3.dev882, found {installed}. "
+        f"Install locally with: python3 -m pip install --no-deps ./{wheel}"
+    )
 PY
 
 export AITER_FLYDSL_MMA_FIRST_GROUP=4
