@@ -57,8 +57,13 @@ def _rows(idx_row, k, n, kg, HAS_INVALID: gl.constexpr):
 
 
 @gluon.jit
-def _gather(dst, kv_ptr, rid, cg):
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(dst, kv_ptr, rid[:, None] * 512 + cg[None, :])
+def _gather(dst, kv_ptr, rid, cg, BIG: gl.constexpr):
+    if BIG:
+        # pools past 2 GB: per-lane 64-bit addresses (buffer offsets are i32)
+        gl.amd.cdna4.async_copy.global_load_to_shared(
+            dst, kv_ptr + rid.to(gl.int64)[:, None] * 512 + cg[None, :])
+    else:
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(dst, kv_ptr, rid[:, None] * 512 + cg[None, :])
     gl.amd.cdna4.async_copy.commit_group()
 
 
@@ -159,11 +164,11 @@ def _wide_step(t, start, end, kvt, kv_nx, p_smem, a_smem, q_dot, q_sc, k_sc, p_s
                acc, m_i, l_i, rid, kv_ptr, idx_row, kg, cg, kcol,
                qk_l: gl.constexpr, pv_l: gl.constexpr, k_op: gl.constexpr,
                p_op: gl.constexpr, v_op: gl.constexpr, BN: gl.constexpr,
-               LAZY: gl.constexpr, HAS_INVALID: gl.constexpr):
+               LAZY: gl.constexpr, HAS_INVALID: gl.constexpr, BIG: gl.constexpr):
     HB: gl.constexpr = BN // 2
     LOG2_PS: gl.constexpr = 8.807354922057604 - LAZY
     gl.amd.cdna4.async_copy.wait_group(0)  # tile t landed (+ the barrier before its reads)
-    _gather(kv_nx, kv_ptr, rid, cg)
+    _gather(kv_nx, kv_ptr, rid, cg, BIG)
     rid = _rows(idx_row, (t + 2) * BN, end - start, kg, HAS_INVALID)
 
     S0 = _qk_half(kvt, 0, q_dot, q_sc, k_sc, k_op, qk_l)
@@ -200,7 +205,7 @@ def _sparse_mla_fp8_wide(
     q_ptr, q_stride0, q_stride1, q_scale_ptr, kv_ptr, ks_ptr, out_ptr, out_stride0, out_stride1,
     lse_ptr, indptr_ptr, idx_ptr, sink_ptr, num_heads, sm_scale_log2,
     LAZY: gl.constexpr, Q_BF16: gl.constexpr, HAS_SINK: gl.constexpr, HAS_LSE: gl.constexpr,
-    HAS_INVALID: gl.constexpr,
+    HAS_INVALID: gl.constexpr, BIG: gl.constexpr,
 ):
     NW: gl.constexpr = 4
     H: gl.constexpr = 64
@@ -265,7 +270,7 @@ def _sparse_mla_fp8_wide(
 
     n_tiles = gl.cdiv(n, BN)
     rid = _rows(idx_row, 0, n, kg, HAS_INVALID)
-    _gather(kv0, kv_ptr, rid, cg)
+    _gather(kv0, kv_ptr, rid, cg, BIG)
     rid = _rows(idx_row, BN, n, kg, HAS_INVALID)
     if not Q_BF16:
         # behind the first gather instead of ahead of the row-id -> gather chain
@@ -277,11 +282,11 @@ def _sparse_mla_fp8_wide(
         acc, m_i, l_i, rid = _wide_step(
             t, start, end, kv0, kv1, p_smem, a_smem, q_dot, q_sc, k_sc, p_sc, v_sc, c_row,
             acc, m_i, l_i, rid, kv_ptr, idx_row, kg, cg, kcol,
-            qk_l, pv_l, k_op, p_op, v_op, BN, LAZY, HAS_INVALID)
+            qk_l, pv_l, k_op, p_op, v_op, BN, LAZY, HAS_INVALID, BIG)
         acc, m_i, l_i, rid = _wide_step(
             t + 1, start, end, kv1, kv0, p_smem, a_smem, q_dot, q_sc, k_sc, p_sc, v_sc, c_row,
             acc, m_i, l_i, rid, kv_ptr, idx_row, kg, cg, kcol,
-            qk_l, pv_l, k_op, p_op, v_op, BN, LAZY, HAS_INVALID)
+            qk_l, pv_l, k_op, p_op, v_op, BN, LAZY, HAS_INVALID, BIG)
     gl.amd.cdna4.async_copy.wait_group(0)
     _finish(acc, m_i, l_i, row, h0, num_heads, k_scale, sink_ptr, out_ptr, out_stride0, out_stride1,
             lse_ptr, H, HAS_SINK, HAS_LSE, LOG2_PS, qk_l, pv_l)
@@ -342,6 +347,7 @@ def _sparse_mla_fp8_narrow(
     lse_ptr, part_ptr, ml_ptr, indptr_ptr, idx_ptr, sink_ptr, num_heads, sm_scale_log2, NSPLIT,
     G: gl.constexpr, GM: gl.constexpr, SPLIT: gl.constexpr, LAZY: gl.constexpr,
     Q_BF16: gl.constexpr, HAS_SINK: gl.constexpr, HAS_LSE: gl.constexpr, HAS_INVALID: gl.constexpr,
+    BIG: gl.constexpr,
     QK_L: gl.constexpr, PV_L: gl.constexpr, GA_L: gl.constexpr, KV_SH: gl.constexpr,
     VV_SH: gl.constexpr, PV_SH: gl.constexpr, KWP: gl.constexpr, PV_SCALED: gl.constexpr,
 ):
@@ -387,7 +393,7 @@ def _sparse_mla_fp8_narrow(
     acc = gl.zeros([GM, 512], gl.float32, PV_L)
 
     rid = _rows(idx_row, kb, n, kg, HAS_INVALID)
-    _gather(kv0, kv_ptr, rid, cg)
+    _gather(kv0, kv_ptr, rid, cg, BIG)
     rid = _rows(idx_row, kb + BN, n, kg, HAS_INVALID)
     if not Q_BF16:
         q_dot = _q_fp8(q_ptr, q_stride0, q_stride1, row, h0, G, GM, q_op)
@@ -396,13 +402,13 @@ def _sparse_mla_fp8_narrow(
     for it in range(0, gl.cdiv(nt, 2)):
         t = it * 2
         gl.amd.cdna4.async_copy.wait_group(0)  # tile t landed (+ barrier)
-        _gather(kv1, kv_ptr, rid, cg)
+        _gather(kv1, kv_ptr, rid, cg, BIG)
         rid = _rows(idx_row, kb + (t + 2) * BN, n, kg, HAS_INVALID)
         acc, m_i, l_acc = _narrow_tile(
             kv0, p_smem, a_smem, q_dot, c_row, acc, m_i, l_acc, start + kb + t * BN, kb + t * BN,
             end_s, kcol, idx_row, QK_L, PV_L, VV_SH, PV_SH, GM, BN, KWP, PV_SCALED, LAZY, HAS_INVALID)
         gl.amd.cdna4.async_copy.wait_group(0)
-        _gather(kv0, kv_ptr, rid, cg)
+        _gather(kv0, kv_ptr, rid, cg, BIG)
         rid = _rows(idx_row, kb + (t + 3) * BN, n, kg, HAS_INVALID)
         acc, m_i, l_acc = _narrow_tile(
             kv1, p_smem, a_smem, q_dot, c_row, acc, m_i, l_acc, start + kb + (t + 1) * BN,
@@ -509,21 +515,43 @@ def _narrow_layouts(G, NW):
                 KWP=kwp, PV_SCALED=scaled)
 
 
-def fp8_num_splits(num_queries, head_blocks, max_keys, cus):
-    """Split-K count, from a sweep on MI355X decode (16 and 64 heads, 640 and 2048
-    keys per row): fill the machine up to 8 splits while there are fewer
-    workgroups than CUs. From 32 workgroups on, the combine costs as much as a
-    short split saves, so keep at least 8 tiles per split there (64 workgroups:
-    4 splits at 32 tiles, none at 10)."""
-    wg = max(1, num_queries * head_blocks)
+def _pow2_floor(x):
+    return 1 << (max(1, int(x)).bit_length() - 1)
+
+
+def fp8_narrow_plan(num_queries, num_heads, keys, cus):
+    """(heads per program, splits) for _sparse_mla_fp8_narrow, from sweeps on
+    MI355X decode (8..128 heads, 640 / 1152 / 2048 keys per row).
+
+    More programs fill the machine; two ways to get them. Fewer heads per
+    program re-gathers every key H/G times; split-K only adds a combine.
+    Long rows (>= 24 tiles): the largest G and split, looking for a program per
+    CU with >= 4 tiles per split, then >= 2, up to 16 splits (128 heads b1:
+    G = 8 x 16 splits, 12.9 us vs 16.4 at G = 32 x 8).
+    Short rows: shrink G first (largest G with a program per CU, else 8), then
+    split up to 8, >= 2.5 tiles per split from 32 programs on."""
+    tiles = max(1, math.ceil(keys / 64))
+    gs = [g for g in (32, 16, 8) if num_heads % g == 0]
+    if tiles >= 24:
+        for floor in (4, 2):
+            for G in gs:
+                wg = num_queries * num_heads // G
+                ns = min(16, _pow2_floor(max(1, cus // wg)), _pow2_floor(tiles // floor))
+                if wg * ns >= cus:
+                    return G, ns
+        G = gs[-1]
+        wg = num_queries * num_heads // G
+        return G, min(16, _pow2_floor(max(1, cus // wg)), _pow2_floor(tiles // 2))
+    fill = [g for g in gs if num_queries * num_heads // g >= cus]
+    G = fill[0] if fill else gs[-1]
+    wg = num_queries * num_heads // G
     if wg >= cus:
-        return 1
-    tiles = max(1, math.ceil(max_keys / 64))
-    ns = min(8, 1 << ((cus // wg).bit_length() - 1))
-    if wg >= 32:
-        while ns > 1 and tiles / ns < 8:
-            ns //= 2
-    return max(1, min(ns, tiles))
+        return G, 1
+    ns = min(8, _pow2_floor(cus // wg))
+    floor = 2.5 if wg >= 32 else 0
+    while ns > 1 and tiles / ns < floor:
+        ns //= 2
+    return G, max(1, min(ns, tiles))
 
 
 _CUS = {}
@@ -537,7 +565,7 @@ def _num_cus(device):
 
 def sparse_mla_fp8(q, q_scale, cache_u8, kv_scale, kv_indptr, kv_indices, softmax_scale, out,
                    lse=None, attn_sink=None, has_invalid=False, kv_splits=None, max_keys=None,
-                   lazy=8, waves=4):
+                   lazy=8, waves=4, heads_per_prog=None):
     """q [C, H, 512] fp8 (+ scalar q_scale) or bf16; cache_u8 [rows, 512] fp8
     bytes; kv_scale [1] f32; out [C, H, >= 512] bf16; lse [C, H] f32 or None.
     H in {8, 16, 32, 64, 128}."""
@@ -550,19 +578,23 @@ def sparse_mla_fp8(q, q_scale, cache_u8, kv_scale, kv_indptr, kv_indices, softma
     lse_t = lse if lse is not None else kv_scale
     sm2 = softmax_scale * LOG2E
     common = dict(LAZY=lazy, Q_BF16=q_bf16, HAS_SINK=attn_sink is not None,
-                  HAS_LSE=lse is not None, HAS_INVALID=has_invalid)
+                  HAS_LSE=lse is not None, HAS_INVALID=has_invalid,
+                  BIG=cache_u8.numel() >= 2**31)
     if H % 64 == 0 and kv_splits in (None, 1) and C * (H // 64) >= cus:
         _sparse_mla_fp8_wide[(C, H // 64)](
             qv, q.stride(0), q.stride(1), qs, cache_u8, kv_scale, out, out.stride(0), out.stride(1),
             lse_t, kv_indptr, kv_indices, sink, H, sm2, num_warps=4, waves_per_eu=2, **common)
         return
-    G = min(32, H)
+    # the average row length is known on the host: reading the max off
+    # kv_indptr would sync and launch two kernels per call
+    keys = max_keys if max_keys is not None else kv_indices.numel() / max(1, C)
+    G, ns = fp8_narrow_plan(C, H, keys, cus)
+    if heads_per_prog is not None:
+        G = heads_per_prog
+    if kv_splits is None:
+        kv_splits = ns
     L = _narrow_layouts(G, waves)
     hblk = H // G
-    if kv_splits is None:
-        if max_keys is None:
-            max_keys = int((kv_indptr[1:] - kv_indptr[:-1]).max())
-        kv_splits = fp8_num_splits(C, hblk, max_keys, cus)
     split = kv_splits > 1
     if split:
         part = torch.empty((C, kv_splits, H, 512), dtype=torch.float32, device=q.device)

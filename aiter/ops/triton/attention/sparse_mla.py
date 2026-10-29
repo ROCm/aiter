@@ -867,7 +867,7 @@ def sparse_mla_fwd(
         block_size,
         q,
         out,
-        use_buffer_load and idx_use_buffer_load,
+        idx_use_buffer_load,
     ):
         sparse_mla_fp8(
             q,
