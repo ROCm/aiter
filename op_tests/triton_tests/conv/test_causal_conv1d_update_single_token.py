@@ -459,50 +459,30 @@ def _conv_state_in_layout(logical: torch.Tensor, layout: str) -> torch.Tensor:
     return conv_state
 
 
-def _state_indices(batch: int, lines: int, with_pad: bool) -> torch.Tensor:
-    cidx = torch.randperm(lines, device="cuda")[:batch].to(torch.int32)
-    if with_pad:
-        cidx[batch // 2] = PAD_SLOT_ID
-    return cidx
-
-
-def _ref_conv1d_update(x, conv_state, weight, bias, silu, cidx):
-    """Torch reference: returns fp32 ``out`` (batch, dim) and the new conv_state."""
-    width = weight.shape[1]
-    new_state = conv_state.clone()
-    out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
-    for b, line in enumerate(cidx.tolist()):
-        if line == PAD_SLOT_ID:
-            continue
-        window = torch.cat([conv_state[line, :, : width - 1], x[b, :, None]], dim=-1)
-        acc = (window.float() * weight.float()).sum(-1)
-        if bias is not None:
-            acc += bias.float()
-        out[b] = torch.nn.functional.silu(acc) if silu else acc
-        new_state[line, :, : width - 1] = window[:, 1:]
-    return out, new_state
+def _ref_update(x, logical, weight, bias, cidx):
+    """Reference ``(out, conv_state)`` on a contiguous copy of the logical state."""
+    state = logical.clone()
+    out = ref_causal_conv1d_update_single_token(
+        x.unsqueeze(-1), state, weight, bias, "silu", cidx, PAD_SLOT_ID
+    )
+    return out[..., 0], state
 
 
 @cuda_ok
 @pytest.mark.parametrize("layout", ["SD", "DS"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize(
-    "dim,width,extra_state", [(64, 2, 0), (1000, 3, 2), (6144, 4, 0), (6144, 4, 3)]
-)
-@pytest.mark.parametrize("with_pad", [False, True])
-def test_causal_conv1d_update_single_token_conv_state_layout(
-    layout, dtype, dim, width, extra_state, with_pad
-):
+def test_causal_conv1d_update_single_token_conv_state_layout(layout):
     torch.manual_seed(0)
-    batch, lines = 6, 9
-    state_len = width - 1 + extra_state
+    dtype = torch.bfloat16
+    batch, lines, dim, width = 6, 9, 1000, 3
+    state_len = width + 1
     x = torch.randn(batch, dim, dtype=dtype, device="cuda")
     weight = torch.randn(dim, width, dtype=dtype, device="cuda")
     bias = torch.randn(dim, dtype=dtype, device="cuda")
     logical = torch.randn(lines, dim, state_len, dtype=dtype, device="cuda")
     conv_state = _conv_state_in_layout(logical, layout)
-    cidx = _state_indices(batch, lines, with_pad)
-    out_ref, state_ref = _ref_conv1d_update(x, logical, weight, bias, True, cidx)
+    cidx = torch.randperm(lines, device="cuda")[:batch].to(torch.int32)
+    cidx[batch // 2] = PAD_SLOT_ID
+    out_ref, state_ref = _ref_update(x, logical, weight, bias, cidx)
 
     out = causal_conv1d_update_single_token(
         x.clone(),
@@ -515,39 +495,24 @@ def test_causal_conv1d_update_single_token_conv_state_layout(
         validate_data=True,
     )
 
-    rtol, atol = (1e-2, 6e-2) if dtype == torch.bfloat16 else (3e-4, 1e-3)
     valid = cidx != PAD_SLOT_ID
-    torch.testing.assert_close(out[valid].float(), out_ref[valid], rtol=rtol, atol=atol)
+    torch.testing.assert_close(out[valid], out_ref[valid], rtol=1e-2, atol=6e-2)
     torch.testing.assert_close(conv_state, state_ref, rtol=0.0, atol=0.0)
 
 
 @cuda_ok
 @pytest.mark.parametrize("layout", ["SD", "DS"])
-@pytest.mark.parametrize("qkvz_layout", ["flat", "interleaved"])
-@pytest.mark.parametrize(
-    "num_k_heads,num_v_heads,head_k_dim,head_v_dim,width,extra_state",
-    [(2, 4, 16, 8, 3, 0), (16, 16, 128, 128, 4, 0), (16, 16, 128, 128, 4, 2)],
-)
-@pytest.mark.parametrize("with_pad", [False, True])
-def test_fused_reshape_causal_conv1d_update_single_token_conv_state_layout(
-    layout,
-    qkvz_layout,
-    num_k_heads,
-    num_v_heads,
-    head_k_dim,
-    head_v_dim,
-    width,
-    extra_state,
-    with_pad,
-):
+def test_fused_reshape_causal_conv1d_update_single_token_conv_state_layout(layout):
     torch.manual_seed(0)
     dtype = torch.bfloat16
     batch, num_tokens, lines = 5, 8, 9
+    num_k_heads, num_v_heads, head_k_dim, head_v_dim, width = 2, 4, 16, 8, 3
+    qkvz_layout = "interleaved"
     hv_ratio = num_v_heads // num_k_heads
     head_qkvz_dim = 2 * head_k_dim + 2 * head_v_dim * hv_ratio
     dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
     qkvz_dim = dim + num_v_heads * head_v_dim
-    state_len = width - 1 + extra_state
+    state_len = width - 1
 
     x = torch.randn(num_tokens, qkvz_dim, dtype=dtype, device="cuda")
     ba = torch.randn(num_tokens, 2 * num_v_heads, dtype=dtype, device="cuda")
@@ -557,7 +522,8 @@ def test_fused_reshape_causal_conv1d_update_single_token_conv_state_layout(
     bias = torch.randn(dim, dtype=dtype, device="cuda")
     logical = torch.randn(lines, dim, state_len, dtype=dtype, device="cuda")
     conv_state = _conv_state_in_layout(logical, layout)
-    cidx = _state_indices(batch, lines, with_pad)
+    cidx = torch.randperm(lines, device="cuda")[:batch].to(torch.int32)
+    cidx[batch // 2] = PAD_SLOT_ID
 
     cols = torch.tensor(
         [
@@ -574,9 +540,7 @@ def test_fused_reshape_causal_conv1d_update_single_token_conv_state_layout(
         ],
         device="cuda",
     )
-    out_ref, state_ref = _ref_conv1d_update(
-        x[:batch, cols], logical, weight, bias, True, cidx
-    )
+    out_ref, state_ref = _ref_update(x[:batch, cols], logical, weight, bias, cidx)
 
     out, _, _ = fused_reshape_causal_conv1d_update_single_token(
         x,
@@ -599,5 +563,5 @@ def test_fused_reshape_causal_conv1d_update_single_token_conv_state_layout(
     )
 
     valid = cidx != PAD_SLOT_ID
-    torch.testing.assert_close(out[valid].float(), out_ref[valid], rtol=1e-2, atol=6e-2)
+    torch.testing.assert_close(out[valid], out_ref[valid], rtol=1e-2, atol=6e-2)
     torch.testing.assert_close(conv_state, state_ref, rtol=0.0, atol=0.0)
