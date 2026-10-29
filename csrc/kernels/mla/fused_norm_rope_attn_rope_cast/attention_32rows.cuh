@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 // Private device helpers for attention_32rows.cu.
 #pragma once
-#include "params.hpp"
+#include "dispatch.hpp"
 
 // Tile traits and common device helpers for BF16 QK/PV and FP8 QK with BF16 PV.
 // Adapted from AITER cbda2884f5b54aa10f32ca4ab43dafac08c9d8db.

@@ -3,8 +3,7 @@
 // HIP device kernels and launches for 32-row/shared-KV attention and legacy/BF16 paths.
 // Public ctypes entrypoints and tensor validation are in fused_norm_rope_attn_rope_cast.cu.
 #include "attention_32rows.cuh"
-#include "dispatch_policy.hpp"
-#include "params.hpp"
+#include "dispatch.hpp"
 #include "q_norm.cuh"
 #include <cmath>
 #include <hip/hip_runtime.h>

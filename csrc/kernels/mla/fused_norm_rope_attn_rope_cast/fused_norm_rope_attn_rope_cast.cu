@@ -6,8 +6,7 @@
 
 // The error bridge requires aiter_hip_common.h, included by aiter_tensor.h.
 #include "aiter_ctypes_error.h"
-#include "dispatch_policy.hpp"
-#include "params.hpp"
+#include "dispatch.hpp"
 #include <algorithm>
 #include <climits>
 #include <cmath>

@@ -13,8 +13,7 @@ The public Python API is `aiter/ops/fused_norm_rope_attn_rope_cast.py`.
 | `attention_64rows_h32.cu` | Shared 32-head FP8 path for H32. |
 | `attention_64rows_h64.cu` | H64 attention, shared split reducers, and the host dispatcher. |
 | `attention_64rows_h128.cu` | H128 instantiations compiled independently from H64. |
-| `params.hpp` | KV layout descriptions, both internal argument structures and launch declarations; no device pipeline definitions. |
-| `dispatch_policy.hpp` | Shared performance selection rules. |
+| `dispatch.hpp` | KV layouts, internal arguments, launch declarations and shared performance selection rules; no device pipeline definitions. |
 | `q_norm.cuh` | 16-byte-aligned Q loads and RMSNorm helpers shared by both attention implementations. |
 
 `32rows` / `64rows` means KV rows per tile. The h16/h32/h64/h128 translation
@@ -30,7 +29,7 @@ The BF16 path remains available through
 raw BF16 Q before FP8 QK. The upstream helper attribution stays in the source.
 
 The entrypoint first tries the 64-row/split dispatcher; otherwise it launches
-the 32-row implementation. The selection rules stay in `dispatch_policy.hpp`.
+the 32-row implementation. The selection rules stay in `dispatch.hpp`.
 The entrypoint does not include either device implementation header.
 
 The module has six HIP translation units. H64 and H128 remain separate so
@@ -73,7 +72,7 @@ Run the same command as CI:
 python op_tests/test_fused_norm_rope_attn_rope_cast.py
 ```
 
-Direct execution runs 3,230 correctness cases, including ragged inputs,
+Direct execution runs 3,301 correctness cases, including ragged inputs,
 BF16/FP8 modes, prepared/raw/normalized Q, graph replay, dispatch boundaries,
 storage offsets and invalid arguments. It then runs the public-API benchmark
 matrix against an independent Torch reference and prints Markdown tables.
@@ -135,3 +134,9 @@ outputs continue to use the general reducer.
 H16 automatic split selection uses the existing work and grid limit directly,
 including non-power-of-two counts. Other head counts retain power-of-two
 rounding. Explicit split requests and the 32-split limit are unchanged.
+
+The H16 kernel traverses prefix and extend tiles in one pipeline. Each source
+keeps its own 64-row tail mask, data/scale strides and row bounds. The source
+tag follows prefetched rows across the boundary, avoiding a second pipeline
+startup and the barrier between the sources. H32 split dispatch can reuse this
+head tile; query math, FP32 softmax sums and split/output policy are unchanged.

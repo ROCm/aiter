@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
-#include "dispatch_policy.hpp"
+#include "dispatch.hpp"
 #include "q_norm.cuh"
 
 #include <hip/hip_runtime.h>
 
-#include "params.hpp"
 #include <bit>
 #include <opus/opus.hpp>
 
@@ -2483,7 +2482,7 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_
 
 // Eligibility and constants for the bounded packed-row specialization.
 // Semantic eligibility for prefill specializations. T/capacity performance
-// thresholds live separately in dispatch_policy.hpp.
+// thresholds live separately in dispatch.hpp.
 namespace fused_norm_rope_attn_rope_cast_fwd {
 
 constexpr int packed_data_bytes  = 512;

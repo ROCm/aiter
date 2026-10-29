@@ -134,25 +134,21 @@ prepare_q(const FusedNormRopeAttnRopeCastParams& a, V& q, int token, int lane, i
 
 // Based on opus/mla_v41_prefill_a8w8_16mx1_16nx4.hpp; retain FP32 softmax sums and safe CSR loads.
 template <class Traits, class VQ, class VO>
-__device__ __attribute__((always_inline)) void accumulate(const void* kv_ptr,
-                                                          const void* kv_scale_ptr,
-                                                          int rows,
-                                                          int stride,
-                                                          int scale_stride,
-                                                          const int* kv_indices,
-                                                          int page_idx_begin,
-                                                          int valid_kv_len,
-                                                          char* smem_kv,
-                                                          char* smem_ml,
-                                                          char* smem_p,
-                                                          char* smem_sum,
-                                                          const VQ& v_q,
-                                                          int scale_q,
-                                                          VO& v_o,
-                                                          typename Traits::D_ACC& m_row,
-                                                          typename Traits::D_ACC& l_row,
-                                                          float& true_max,
-                                                          typename Traits::D_ACC temperature_scale)
+__device__ __attribute__((always_inline)) void accumulate(
+    const FusedNormRopeAttnRopeCastParams& a,
+    fused_norm_rope_attn_rope_cast_fwd::CsrRange prefix,
+    fused_norm_rope_attn_rope_cast_fwd::CsrRange extend,
+    char* smem_kv,
+    char* smem_ml,
+    char* smem_p,
+    char* smem_sum,
+    const VQ& v_q,
+    int scale_q,
+    VO& v_o,
+    typename Traits::D_ACC& m_row,
+    typename Traits::D_ACC& l_row,
+    float& true_max,
+    typename Traits::D_ACC temperature_scale)
 {
     using namespace opus;
     using T      = opus::remove_cvref_t<Traits>;
@@ -160,17 +156,18 @@ __device__ __attribute__((always_inline)) void accumulate(const void* kv_ptr,
     using D_PV   = typename T::D_PV;
     using D_ACC  = typename T::D_ACC;
 
-    const int num_kv_tiles = (uint32_t(valid_kv_len) + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
+    // Round each source separately so its tail lanes stay masked.
+    const int prefix_len   = prefix.end - prefix.begin;
+    const int extend_len   = extend.end - extend.begin;
+    const int prefix_tiles = (uint32_t(prefix_len) + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
+    const int extend_tiles = (uint32_t(extend_len) + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
+    const int num_kv_tiles = prefix_tiles + extend_tiles;
     if(num_kv_tiles <= 0)
         return;
 
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-
-    auto p_kv         = reinterpret_cast<const D_ATTN*>(kv_ptr);
-    auto p_kv_scale   = reinterpret_cast<const D_ATTN*>(kv_scale_ptr);
-    auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     auto s_sum = make_smem(reinterpret_cast<D_ACC*>(smem_sum));
     auto s_m   = make_smem(reinterpret_cast<D_ACC*>(smem_ml));
@@ -194,15 +191,25 @@ __device__ __attribute__((always_inline)) void accumulate(const void* kv_ptr,
     constexpr index_t s_len = vector_traits<typename decltype(mfma0)::vtype_c>::size();
     auto v_p_warps          = reinterpret_cast<vector_t<D_PV, s_len>*>(&v_p);
 
+    struct KvPage
+    {
+        int id;
+        bool extend;
+    };
     const int key_in_tile = warp_id * T::W_N + lane_id % T::W_N;
     auto load_kv_page     = [&](int tile_idx) {
-        const uint32_t offset = uint32_t(tile_idx) * T::KV_TILE_SIZE + key_in_tile;
-        return load(g_kv_indices,
-                    offset < uint32_t(valid_kv_len) ? offset : uint32_t(valid_kv_len - 1))[0];
+        const bool from_extend = extend_len > 0 && tile_idx >= prefix_tiles;
+        const int length = from_extend ? extend_len : prefix_len;
+        const int begin = from_extend ? extend.begin : prefix.begin;
+        const auto* indices = from_extend ? a.kv_indices_extend : a.kv_indices_prefix;
+        auto g_indices = make_gmem(indices + begin, length * sizeof(int));
+        const int local_tile = tile_idx - (from_extend ? prefix_tiles : 0);
+        const uint32_t offset = uint32_t(local_tile) * T::KV_TILE_SIZE + key_in_tile;
+        const int id = load(g_indices, offset < uint32_t(length) ? offset : uint32_t(length - 1))[0];
+        return KvPage{id, from_extend};
     };
-    auto kv_offset       = [&](int token_idx) { return static_cast<int64_t>(token_idx) * stride; };
-    auto kv_scale_offset = [&](int token_idx) {
-        return static_cast<int64_t>(token_idx) * scale_stride;
+    auto is_live = [&](KvPage page) {
+        return uint32_t(page.id) < uint32_t(page.extend ? a.extend_rows : a.prefix_rows);
     };
 
     const int kblk        = lane_id / T::W_M;
@@ -210,24 +217,32 @@ __device__ __attribute__((always_inline)) void accumulate(const void* kv_ptr,
     const u32_t scale_sh0 = 8 * (kblk / 2);
     const u32_t scale_sh1 = scale_sh0 + 16;
 
-    auto data = [&](int id) {
-        return uint32_t(id) < uint32_t(rows)
-                   ? p_kv + kv_offset(id)
-                   : reinterpret_cast<const D_ATTN*>(
-                         fused_norm_rope_attn_rope_cast_fwd::safe_kv.data);
-    };
-    const bool packed =
-        reinterpret_cast<uintptr_t>(kv_scale_ptr) == reinterpret_cast<uintptr_t>(kv_ptr) + 512 &&
-        scale_stride == stride;
-    auto scales = [&](int id) {
-        return packed ? data(id) + 512
-                      : (uint32_t(id) < uint32_t(rows)
-                             ? p_kv_scale + kv_scale_offset(id)
+    auto data = [&](KvPage page) {
+        const auto* ptr = reinterpret_cast<const D_ATTN*>(page.extend ? a.kv_ptr : a.unified_kv_ptr);
+        const int stride = page.extend ? a.stride_kv_extend : a.stride_kv_prefix;
+        return is_live(page) ? ptr + int64_t(page.id) * stride
                              : reinterpret_cast<const D_ATTN*>(
-                                   fused_norm_rope_attn_rope_cast_fwd::safe_kv.scales));
+                                   fused_norm_rope_attn_rope_cast_fwd::safe_kv.data);
     };
-    int kv_page = load_kv_page(0);
-    int live    = uint32_t(kv_page) < uint32_t(rows);
+    const bool prefix_packed =
+        reinterpret_cast<uintptr_t>(a.unified_kv_scale_ptr) ==
+            reinterpret_cast<uintptr_t>(a.unified_kv_ptr) + 512 &&
+        a.stride_kv_scale_prefix == a.stride_kv_prefix;
+    const bool extend_packed =
+        reinterpret_cast<uintptr_t>(a.kv_scale_ptr) == reinterpret_cast<uintptr_t>(a.kv_ptr) + 512 &&
+        a.stride_kv_scale_extend == a.stride_kv_extend;
+    auto scales = [&](KvPage page) {
+        const bool packed = page.extend ? extend_packed : prefix_packed;
+        const auto* ptr =
+            reinterpret_cast<const D_ATTN*>(page.extend ? a.kv_scale_ptr : a.unified_kv_scale_ptr);
+        const int stride = page.extend ? a.stride_kv_scale_extend : a.stride_kv_scale_prefix;
+        return packed ? data(page) + 512
+                      : (is_live(page) ? ptr + int64_t(page.id) * stride
+                                       : reinterpret_cast<const D_ATTN*>(
+                                             fused_norm_rope_attn_rope_cast_fwd::safe_kv.scales));
+    };
+    auto kv_page = load_kv_page(0);
+    int live     = is_live(kv_page);
     s_waitcnt_vmcnt(0_I);
     auto v_k   = load_values<T>(data(kv_page), u_rk);
     auto v_scl = load16(scales(kv_page));
@@ -269,13 +284,16 @@ __device__ __attribute__((always_inline)) void accumulate(const void* kv_ptr,
         });
         store_v_swizzled<T>(s_kv, v_k_bf16, u_sk, lane_id);
 
-        const int next_live = uint32_t(kv_page) < uint32_t(rows);
+        const int next_live = is_live(kv_page);
         v_k                 = load_values<T>(data(kv_page), u_rk);
         v_scl               = load16(scales(kv_page));
         kv_page             = load_kv_page(tile_idx + 2);
 
         constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
-        attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, warp_id, lane_id);
+        const bool from_extend = extend_len > 0 && tile_idx >= prefix_tiles;
+        const int current_length = from_extend ? extend_len : prefix_len;
+        const int current_tile = tile_idx - (from_extend ? prefix_tiles : 0);
+        attn_mask_oob_score<T>(v_s, current_length, current_tile, warp_id, lane_id);
         if(__builtin_amdgcn_ballot_w64(!live))
             static_for<s_len>([&](auto i) {
                 const int src = (lane_id / 16) * 4 + i.value;
@@ -362,35 +380,10 @@ __global__ __launch_bounds__(256, 2) void fused_norm_rope_attn_rope_cast_h16_ker
     float m = -__FLT_MAX__, l = 0.0f, true_max = -__builtin_inff();
     constexpr float LOG2_E = 1.44269504089f, LN_2 = 0.69314718056f;
     const auto p = fused::csr_range<E, Split>(a, false, token);
-    small::accumulate<T>(a.unified_kv_ptr,
-                         a.unified_kv_scale_ptr,
-                         a.prefix_rows,
-                         a.stride_kv_prefix,
-                         a.stride_kv_scale_prefix,
-                         a.kv_indices_prefix,
-                         p.begin,
-                         p.end - p.begin,
-                         kv_smem,
-                         max_smem,
-                         p_smem,
-                         sum_smem,
-                         q,
-                         scale_q,
-                         output,
-                         m,
-                         l,
-                         true_max,
-                         a.softmax_scale * LOG2_E);
-    __builtin_amdgcn_s_barrier();
     const auto e = fused::csr_range<E, Split>(a, true, token);
-    small::accumulate<T>(a.kv_ptr,
-                         a.kv_scale_ptr,
-                         a.extend_rows,
-                         a.stride_kv_extend,
-                         a.stride_kv_scale_extend,
-                         a.kv_indices_extend,
-                         e.begin,
-                         e.end - e.begin,
+    small::accumulate<T>(a,
+                         p,
+                         e,
                          kv_smem,
                          max_smem,
                          p_smem,
