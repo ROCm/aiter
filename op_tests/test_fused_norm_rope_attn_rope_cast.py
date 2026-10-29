@@ -3539,7 +3539,7 @@ def main():
         choices=range(33),
         nargs="+",
         default=[0],
-        help="0: public API auto selection; 1..32: explicit split count (prefill: 0/1)",
+        help="0: public API auto selection; 1..32: explicit split count",
     )
     options = parser.parse_args()
     if (
@@ -3581,11 +3581,6 @@ def main():
         options.layout,
         options.splits,
     ):
-        if stage == "prefill" and splits > 1:
-            aiter.logger.warning(
-                "prefill supports splits=0/1; skipping splits=%s", splits
-            )
-            continue
         rows.append(
             test_fused_norm_rope_attn_rope_cast(
                 batch,
