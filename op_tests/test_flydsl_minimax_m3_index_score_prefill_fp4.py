@@ -339,6 +339,34 @@ def test_prefill_rejections(staged):
             f(c["q_bf16"], kd, ks, c["bt"], workspace=ws)
 
 
+@requires_gfx950
+def test_staged_rejects_strided_seq_lens_before_staging(monkeypatch):
+    """The dequant launch reads `seq_lens + b` without a stride; a strided view has to
+    be refused before that launch is enqueued, not by the scorer after it."""
+    c, kd, ks = fp4_prefill_case(2, 128, 1000)
+    seq_strided = torch.stack([c["seq"], c["seq"]], dim=1)[:, 0]
+    assert seq_strided.stride() == (2,)
+
+    def staging_launched(*a, **kw):
+        raise AssertionError("dequant staging launched before seq_lens was validated")
+
+    monkeypatch.setattr(prefill_kernel, "dequant_pages_fp8", staging_launched)
+    with pytest.raises(ValueError, match="seq_lens"):
+        prefill_kernel.score_prefill_flydsl_fp4(
+            c["q_bf16"],
+            kd,
+            ks,
+            c["bt"],
+            c["cu"],
+            seq_strided,
+            c["prefix"],
+            c["max_q"],
+            c["max_seq"],
+            1.0 / LOG2E,
+            staged=True,
+        )
+
+
 def run_native(c, kd, ks, qdt="bf16", **kw):
     """The fp8 prefill kernel's MXFP4 path, called directly (no route selection)."""
     heads = c["q8"].shape[1]
