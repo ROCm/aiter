@@ -712,6 +712,7 @@ def _grouped_a8w4_tdm_moe(
     _ep_nvr = None
     _ep_nvt = None
     _fuse_ep_route_quant = False
+    _route_psum_fused = False
     ep_rowmap = None
     # Small TP batches: one workgroup counts, scans and remaps every route, in
     # place of the counter fill, route and psum-remap launches; it runs where the
@@ -809,8 +810,20 @@ def _grouped_a8w4_tdm_moe(
             )
     elif not _fused_tp_route:
         _fuse_ep_route_quant = False
-        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
         ep_rowmap = None
+        # Small batches (decode): one workgroup routes, scans and remaps, in place
+        # of the counter fill, moe_route and contiguous_psum_remap (same outputs).
+        _route_psum_fused = (
+            int(token_num) * int(topk) <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+            and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+        )
+        if _route_psum_fused:
+            # Same alignment as contiguous_psum_remap below.
+            _masked_m, topids_to_rows, psum = fused_route_psum_remap(
+                topk_ids, E, max_m, _align_m
+            )
+        else:
+            _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
     # EP gemm2-fused scatter: the ep_rowmap was allocated (and sentinel-filled by
     # the route kernel) above; build the scatter params dict for contiguous_psum_remap.
     ep_scatter_params = None
@@ -871,7 +884,7 @@ def _grouped_a8w4_tdm_moe(
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             "route_max_m": int(max_m),
         }
-    else:
+    elif not _route_psum_fused:
         # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
         # start aligned only to tile_m would let a gemm2 tile cross an expert
         # boundary (see the divisibility check above).
