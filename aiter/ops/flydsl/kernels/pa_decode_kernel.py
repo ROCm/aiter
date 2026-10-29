@@ -503,6 +503,8 @@ def compile_gfx1250_pa_decode(
     merges P-way after a cluster barrier. Every sequence must have at most P
     tasks. In both modes a sequence's single task stores final rows directly,
     and empty sequences clear their rows.
+    ``merge_partitions`` partial storage must be eight-byte aligned for its
+    device-scope atomic accesses; the host wrapper falls back for offset views.
     """
     if query_splits not in (1, 2, 4) or query_length % query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")

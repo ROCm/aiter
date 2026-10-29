@@ -262,7 +262,8 @@ def pa_decode(
     directly. So do plans with one task slot per sequence (capacity equal to
     the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
     that still own several tasks merge them in the tile kernel using the plan's
-    arrival counters. Otherwise, when P = min(partition bound, max_partitions)
+    arrival counters when partial scratch is eight-byte aligned. Otherwise,
+    when P = min(partition bound, max_partitions)
     is in [2, 16], P CTAs per sequence fit the plan capacity or two per CU,
     and the sequences times KV heads stay within 15 per 16 CUs (head_dim <=
     512), each sequence's tasks run as one cluster of P workgroups that merges
@@ -661,6 +662,13 @@ def pa_decode(
                 and work_plan.arrival_counters is not None
                 and max_partitions <= MERGE_PARTITIONS
                 and head_dim <= MERGE_HEAD_DIM
+                # Last-arriver partials use naturally aligned 64-bit atomics.
+                # Internal torch allocations are aligned; supplied contiguous
+                # views may have only element alignment.
+                and (
+                    pout is None
+                    or (isinstance(pout, torch.Tensor) and pout.data_ptr() % 8 == 0)
+                )
             )
         )
     )
