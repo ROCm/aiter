@@ -19,6 +19,7 @@ resources module docstring: divergence is detected by the host-side digest, not 
 from __future__ import annotations
 
 import logging
+import types
 
 from aiter.gemm_fusion.catalog import Contract, register_variant
 from aiter.gemm_fusion.errpage import GLOBAL_PAGE_BYTES, SHARE_GLOBAL
@@ -27,7 +28,7 @@ from aiter.gemm_fusion.plan import Plan, WindowReq
 from aiter.gemm_fusion.resources import SHARED_KEY, round_up
 
 from . import large_rt as lrt
-from . import specs
+from . import r18_gemm, specs
 from .jit import LARGE_SRC, _sha, build_large, large_defs, src_abi, src_pad_m
 from .small_rt import stream_handle
 
@@ -135,6 +136,7 @@ LARGE_SRC_SHA = {
     "r11": "9874fe1ecb3b6a997523c96210a960434179c8eab84fffc00537170d49836643",
     "r12": "6b47263546d9189457b3d584fe8219e542a0cd32b19d1a32306c2fda015a7f38",  # R12 (abi 3) + LG_TAG_EARLY / LG_POLL_BATCH (r12b) + the NaN fill folded into quiet_ready, LG_QR_WGS (r12c) + qr_wgs in the launch args / lg_abi_info_v2 (r12d), derived from r11
     "r13": "03d6c758c75665d26f8f3928e6e31520c816ed701efb8b2e09cdc2ea3dfb2b3a",  # R16 (abi 4 = LG_COMM_ABI_VERSION 5): per-launch m_real (lg_launch_v3, tag with m_real), derived from r12; r13g = r13 with the item-epilogue data flow of r12 untouched (ISA clean, byte-identical to r12 at m == M)
+    "r18": "46b49e5cd87362987ed26e927077576aa06509df60599248210afb91c38691dc",  # R18 route B (abi 4 = the r13 ABI, LG_COMM_ABI_VERSION 5): large/r18-put = r13 + lg_put_v1 + lg_put_launch_v1; its GEMM is large/r17 (jit.R17_SRC_SHA)
 }
 
 
@@ -191,7 +193,9 @@ class SpQkvLarge(Plan):
         # the quiet_ready workgroup count the DEVICE image is built with (r12c / r12d: LG_QR_WGS, 64 by default); the host library reports its own through lg_abi_info_v2 and the
         # attach refuses a mismatch. r11 has no such knob.
         self.qr_wgs = (
-            int(self.params.get("qr_wgs", 64)) if self.src in ("r12", "r13") else None
+            int(self.params.get("qr_wgs", 64))
+            if self.src in ("r12", "r13", "r18")
+            else None
         )
         self.pad_m = src_pad_m(
             "large", self.src
@@ -199,6 +203,14 @@ class SpQkvLarge(Plan):
         self.last_m_real = (
             self.M
         )  # the rows of the latest launch: the default row count of recv_view / reuse_view
+        # R18 route B (src r18): the FlyDSL dst-map GEMM (large/r17) writes S, then large/r18-put's put kernel + r13's quiet_ready (lg_put_launch_v1): the r6x n / half_first split of the GEMM does not exist
+        # (one put per peer, one S slab per destination), so the plan is n = 1 / half_first 0; `tile` pins the GEMM tile config (jit.R18_TILES id), absent = the wave rule per launch M
+        self.r18 = self.src == "r18"
+        self.tile = self.params.get("tile")
+        if self.r18 and (self.n != 1 or self.half_first != 0):
+            raise ContractError(
+                f"r18 (route B) is the n=1 / half_first 0 plan (one put per peer), got n={self.n}, half_first={self.half_first}"
+            )
         self.F = _F[self.mode]
         self.owner = f"sp_qkv.large/{self.mode}/M{self.M}"
         self.build_key = (
@@ -307,6 +319,8 @@ class SpQkvLarge(Plan):
             got = sc[self.owner] = lrt.LargeContext(
                 lib, C.c_void_p(h), self.M, self.F, res.rank
             )
+            if self.r18:
+                self._r18_attach(res, got, S)
             if (
                 self.abi >= 3
             ):  # attach the per-comm ERR/STEP page (+ the device-resident peer-ERR table) once per context, before the first launch
@@ -365,6 +379,95 @@ class SpQkvLarge(Plan):
                 res.set_init(self.owner, hooks["init"])
         self._ctx = got
         return got
+
+    def _r18_attach(self, res, got, S):
+        """R18 route B, ONCE per owner at attach (outside capture): check that the image has the put entry, build the GEMM runner and COMPILE every tile a launch could use (FlyDSL compiles at the
+        first compile_preshuffle_gemm / launch: it must not happen in a graph capture), remember the local address of the S window the GEMM writes.
+        """
+        if getattr(got.lib, "lg_put_launch_v1", None) is None:
+            raise RuntimeError(
+                f"{self.owner}: src r18 needs the large/r18-put build (the host library exports no lg_put_launch_v1)"
+            )
+        gemm = r18_gemm.R18Gemm(self.mode)
+        tiles = (
+            {self.tile}
+            if self.tile
+            else {r18_gemm.tile_for(m, gemm.N) for m in range(1, self.M + 1)}
+        )
+        gemm.warm(tiles, device=f"cuda:{res.device}")
+        res.__dict__.setdefault("_sp_qkv_r18", {})[self.owner] = types.SimpleNamespace(
+            gemm=gemm, s_local=int(S.local), views={}, tiles=tuple(sorted(tiles))
+        )
+
+    def _r18(self, res):
+        st = res.__dict__.get("_sp_qkv_r18", {}).get(self.owner)
+        if st is None:
+            raise RuntimeError(
+                f"{self.owner}: the r18 state is not attached (call prepare() / _context(res) first)"
+            )
+        return st
+
+    def _run_r18(
+        self,
+        res,
+        c,
+        x,
+        w,
+        x_scale,
+        w_scale,
+        m_real,
+        call_id,
+        stream,
+    ):
+        """R18 route B launch: (1) the FlyDSL dst-map GEMM of x and w into S[4][m_real][F] (srows = its launch M = m_real) on the launch stream, (2) lg_put_launch_v1 = the put kernel + quiet_ready
+        (M = m_real) on the SAME stream handle, then the receiver reads R as for r13. Stream: the GEMM runs on the CURRENT torch stream, so a torch stream other than the current is entered for it and
+        a raw handle that is not the current stream is refused (the S slab must be complete when the put kernel starts: one stream, the kernel boundary).
+        """
+        import contextlib
+
+        import torch
+
+        from . import inputs
+
+        if call_id is None:
+            raise ContractError(
+                f"{self.owner}: an R12 (abi {self.abi}) plan needs run(call_id=...): the 31-bit decision key of (site, tokens, vid, n_fused)"
+            )
+        inputs.check_call_id(self.owner, call_id)
+        if not x.is_contiguous():
+            raise ContractError(
+                f"{self.owner}: the FlyDSL GEMM of a src r18 plan takes a contiguous activation, got strides ({x.stride(0)}, {x.stride(1)})"
+            )
+        st = self._r18(res)
+        tile = self.tile or r18_gemm.tile_for(m_real, st.gemm.N)
+        if tile not in st.tiles:
+            raise RuntimeError(
+                f"{self.owner}: tile {tile} was not compiled at attach ({st.tiles})"
+            )
+        th = stream_handle(stream)
+        scope = contextlib.nullcontext()
+        if stream is not None and th.value != stream_handle(None).value:
+            if not hasattr(stream, "cuda_stream"):
+                raise ContractError(
+                    f"{self.owner}: the FlyDSL GEMM runs on the current torch stream but the comm launch was asked for the raw stream handle {th.value:#x}: pass the torch stream (or None) so both run on one stream"
+                )
+            scope = torch.cuda.stream(stream)
+        with scope:
+            cur = stream_handle(None)
+            if cur.value != th.value:
+                raise ContractError(
+                    f"{self.owner}: the GEMM stream {cur.value:#x} != the comm stream {th.value:#x} (one stream)"
+                )
+            s_flat = st.views.get(m_real)
+            if (
+                s_flat is None
+            ):  # one CAI view per real m (no copy, no allocation of device memory; cached for the graphs captured at this m)
+                s_flat = st.views[m_real] = torch.as_tensor(
+                    lrt._Va(st.s_local, (4 * m_real * self.F,)),
+                    device=f"cuda:{res.device}",
+                ).view(torch.bfloat16)
+            st.gemm.launch(tile, s_flat, x, w, x_scale, w_scale, m_real)
+            c.put_launch(m_real, int(call_id), th, m_real)
 
     @staticmethod
     def accepts_launch_m(params, bucket_m: int, m: int) -> bool:
@@ -426,7 +529,9 @@ class SpQkvLarge(Plan):
         self._check_inputs(
             x, x_scale, w_scale, w, M=m_real
         )  # at capture once, in eager every call; a graph replay runs no Python
-        if (
+        if self.r18:
+            self._run_r18(res, c, x, w, x_scale, w_scale, m_real, call_id, stream)
+        elif (
             self.abi >= 3
         ):  # R12: the tag E = (STEP << 32) | call_id; the launch is GEMM + quiet_ready (which includes the best-effort NaN fill under ERR)
             if call_id is None:

@@ -43,7 +43,7 @@ SRC_SHA = {
     "r20": "447ac3ff8700ad20430bd961faadcc7b2299c1956cb57ff0baa44f0e8d216174",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
     "r21": "c9cc70d9c5e3c9c52dc8bcf21ebf4cb82ff719f526de3fe5074f0b464151474b",  # R13 MP128 (abi 3, SM_MP 128, 8 MiB Rx view), derived from r20
     "r22": "39ef475a36e0ef2a676f7c6262a0f194b48ca29d26864f0a5f8ae26461984a10",  # R14 tuned MP128 (abi 3, SM_MP 128, B-quad / BN128 / 3-slot Rx: 4 MiB view), derived from r21
-    "r23": "b6f49374a8d26e4b1dea81ca08c8abf6beab97ff49a96fc5b54ff15a859a827b",  # R14 MP256 v1 (abi 3, SM_MP 256, BM256 GEMM, 2 iterations per WG, 3-slot Rx 6.75 / 7.5 MiB: 8 MiB view), derived from r22
+    "r23": "1dc9148a7ded2245f3ea33405af626a58b664611071234cc725e9fa0e9b4daa3",  # R14 MP256 v1 (abi 3, SM_MP 256, BM256 GEMM, 2 iterations per WG, 3-slot Rx 6.75 / 7.5 MiB: 8 MiB view), derived from r22
 }
 # analytic geometry (mirrors sm_abi_v2.h; cross-checked against sm_info_v1 after build)
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2560}

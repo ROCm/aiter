@@ -1094,6 +1094,9 @@ void sm_ran_v3(const SmDev* __restrict__ blk, SmRanArgsV3 ka) {
 #if SM_TEST_ADD_BEFORE_RETIRE
         if (tid == 0 && ok) release_tagged(a, static_cast<int>(d), rank, par, E);   // NEGATIVE CONTROL
 #endif
+#if SM_PUSH_XITER
+        if (itr == SM_ITERS - 1u)                                           // r23 L1: only the LAST iteration waits for its stores here (they must be retired before the release). An intermediate iteration goes straight on: the next
+#endif                                                                      // iteration's P loads are issued while this iteration's stores are still draining (one overlapped vmcnt(0) at its entry covers both); flags / tags / bytes unchanged
         __builtin_amdgcn_s_waitcnt(0x0);                                    // EVERY wave: vmcnt(0) (push stores retired) BEFORE the barrier, all exec paths
         if (tid == 0) SM_STAMP(rec, 25);
         mori::cco::impl::syncThreads();

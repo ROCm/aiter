@@ -384,5 +384,12 @@ need(
     and "float pk[SM_SK_CFG][3][NPP][8], ws[3][8], as_[2];" in body,
     "push live-set options (opt-in, default 0, push role only): PASSTRIP (2 sub-trips of one pass, pk 144 -> 72, second trip skipped when its pass is dead) and WS_LATE (Wscale in a short trip after the decision); the default path text is the unchanged #else branch",
 )
+need(
+    "#define SM_PUSH_XITER 0" in abi
+    and "#if SM_PUSH_XITER\n        if (itr == SM_ITERS - 1u)" in k
+    and k.count("(push stores retired) BEFORE the barrier") == 1
+    and "release_tagged(a, static_cast<int>(d), rank, par, E);" in body,
+    "L1 SM_PUSH_XITER (default 0): only the LAST push iteration waits for its stores at the iteration end (before the release); intermediate iterations pipeline the next iteration's P loads under the store drain; flags/tags/release unchanged",
+)
 print("ALL PASS" if not fails else f"FAILED: {len(fails):d}")
 sys.exit(1 if fails else 0)

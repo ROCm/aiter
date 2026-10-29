@@ -113,7 +113,7 @@ def load_driver(path: str, abi: int = 2):
         lib.lg_drain_v1.restype = i32
         lib.lg_drain_v1.argtypes = [vp, vp]
         if (
-            abi == 4
+            abi >= 4
         ):  # r13 (LG_COMM_ABI_VERSION 5): lg_launch_v2 is kept (m_real = M); lg_launch_v3 adds the real rows right before the stream
             lib.lg_launch_v3.restype = i32
             lib.lg_launch_v3.argtypes = [
@@ -131,6 +131,13 @@ def load_driver(path: str, abi: int = 2):
                 u32,
                 vp,
             ]
+        if (
+            abi == 4
+        ):  # R18 route B (src r18 = large/r18-put, the r13 ABI): the put kernel + r13's quiet_ready launcher; ONLY an r18-put host build exports it (compiled when the ABI header defines LG_ENTRY_PUT)
+            put = getattr(lib, "lg_put_launch_v1", None)
+            if put is not None:
+                put.restype = i32
+                put.argtypes = [vp, u32, u64, u32, u32, vp]
         return lib
     lib.lg_attach_v1.restype = vp
     lib.lg_attach_v1.argtypes = [
@@ -277,6 +284,24 @@ class LargeContext:
     def __init__(self, lib, h, M, F, rank):
         self.lib, self.h, self.M, self.F, self.rank = lib, h, M, F, rank
         self.budget_us = 0  # per-wait poll budget (us) passed to every launch; 0 = the kernel default (50 ms). Set by the plan from FusionResources.wait_budget_us.
+
+    def put_launch(self, srows, call_id, stream, m_real, budget_us=None):
+        """R18 route B: lg_put_launch_v1(h, srows, poll_budget_us, call_id, m_real, stream) = the put kernel (one put per peer of the S slab written by the r17 GEMM + the self-slab copy) and then
+        r13's quiet_ready with M = m_real, two kernels on `stream`. srows = the ROWS per S slab = the GEMM's launch M (m_real <= srows <= the plan bucket M); the driver refuses srows outside
+        that range (-106), a bad m_real (-105), a missing ERR/STEP page (-110) and an image without the put entry (-111).
+        """
+        if not 0 <= call_id < CALL_ID_LIMIT:
+            raise ValueError(f"call_id {call_id} must be in [0, 2^31)")
+        if not 1 <= m_real <= min(self.M, LG_M_REAL_MAX):
+            raise ValueError(f"m_real {m_real} must be in [1, M={self.M}]")
+        if not m_real <= srows <= self.M:
+            raise ValueError(f"srows {srows} must be in [m_real={m_real}, M={self.M}]")
+        budget = self.budget_us if budget_us is None else budget_us
+        rc = self.lib.lg_put_launch_v1(self.h, srows, budget, call_id, m_real, stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"lg_put_launch_v1 rc={rc} (srows={srows}, m_real={m_real})"
+            )
 
     def init_control(self):
         rc = self.lib.lg_init_control_v1(self.h)

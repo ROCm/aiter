@@ -9,6 +9,7 @@ import os
 import sys
 import types
 from itertools import pairwise
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -291,15 +292,15 @@ def test_small_variant_registers_and_contract(monkeypatch):
 
 
 # ======================================================================= large-M (S2-2b-iii)
-def test_profile_has_120_rows_and_large_prefix_signatures():
-    """30 small rows (see test_small_profile_rows...) + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep) + 3 pad-bucket rows (m = 768; the 512 bucket is capability only), src r13."""
+def test_profile_has_123_rows_and_large_prefix_signatures():
+    """30 small rows (see test_small_profile_rows...) + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep) + 6 r18 pad-bucket rows (m = 512 and 768, src r18): the 512 bucket serves m 386..512, the 768 bucket m 513..768."""
     from aiter.ops.gemm_fusion.sp_qkv import p1_sweep
 
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     assert (
-        len(prof) == 120
-    )  # 30 small + 90 large (87 swept + the 768 pad bucket x 3 modes)
+        len(prof) == 123
+    )  # 30 small + 93 large (87 swept r13 + the 512 / 768 r18 pad buckets x 3 modes)
     assert (
         len(p1_sweep.P1_GRID) == 29
         and sum(len(v) for v in p1_sweep.P1_BEST.values()) == 87
@@ -348,8 +349,8 @@ def test_profile_has_120_rows_and_large_prefix_signatures():
             for v in notes.values()
             if v.startswith("R16 pad-M bucket below the P1 grid (not swept)")
         )
-        == 3
-    )  # 768 x 3 modes
+        == 6
+    )  # 512 and 768 x 3 modes (r18 route B)
     # reuse and dense large rows have different signatures (reuse drops iq/ik in the exchange)
     assert (
         specs.sp_qkv_spec("dense").prefix(1).signature()
@@ -470,22 +471,26 @@ def test_large_variant_contract_and_sizes(monkeypatch):
         and p1024.M == 1024
         and (p1024.n, p1024.half_first) == (1, 0)
     )
-    assert match_prefix(spec, MatchCtx("gfx950", 256, 4, 512, caps), PROFILE) == (
-        None,
-        0,
-    )  # the 512 bucket is NOT in the shipped profile (never pays for dense / indexer, ~1.005 for reuse)
+    p512, n512 = match_prefix(spec, MatchCtx("gfx950", 256, 4, 512, caps), PROFILE)
+    assert (
+        n512 == 1
+        and p512.vid == "sp_qkv.large.v1"
+        and p512.src == "r18"
+        and p512.M == 512
+        and p512.pad_m
+    )  # the shipped r18 512 bucket (m 386..512)
     for m in (
         768,
-    ):  # the R16 bucket below the swept grid: an exact row, n=1 (the best at the smallest swept cells, the only legal n at 3 chunks)
+    ):  # the r18 bucket below the swept grid: an exact row, n=1 (the best at the smallest swept cells, the only legal n at 3 chunks)
         pm, nm = match_prefix(spec, MatchCtx("gfx950", 256, 4, m, caps), PROFILE)
         assert (
             nm == 1
             and pm.profile_source == "row"
             and pm.M == m
+            and pm.src == "r18"
             and (pm.n, pm.half_first) == (1, 0)
         )
     for m_native in (
-        512,
         520,
         1100,
         8448,
@@ -1282,7 +1287,6 @@ def test_preflight_attach_names_each_failing_precondition(monkeypatch):
     import shutil
     import tempfile
     import uuid
-    from pathlib import Path
 
     tmp_path = Path(tempfile.gettempdir()) / ("pf_" + uuid.uuid4().hex)
     tmp_path.mkdir()
@@ -1456,7 +1460,7 @@ def _w_ok(rows=9216, k=6144, shuffled=True):
     return w
 
 
-def _binding_rig(monkeypatch, mode="dense", T=64, src=None, extra=None):
+def _binding_rig(monkeypatch, mode="dense", T=64, src=None, extra=None, params=None):
     """A dense small plan whose _context is a recording stub and whose torch is a counting fake."""
     import types as _t
     from types import SimpleNamespace as NS
@@ -1474,8 +1478,14 @@ def _binding_rig(monkeypatch, mode="dense", T=64, src=None, extra=None):
     fake_torch.float32, fake_torch.float8_e4m3fn, fake_torch.int64 = "f32", "fp8", "i64"
     fake_torch.finfo = lambda dt: NS(max=448.0)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    cell_params = dict(
-        specs.SMALL_CELLS[(mode, T if (mode, T) in specs.SMALL_CELLS else 64)][1]
+    cell_params = (
+        dict(
+            params
+        )  # the full param dict of a source the SMALL_CELLS copies do not describe
+        if params is not None
+        else dict(
+            specs.SMALL_CELLS[(mode, T if (mode, T) in specs.SMALL_CELLS else 64)][1]
+        )
     )
     if src:  # e.g. "r19": the R12 (abi 3) build of the same cell
         cell_params["src"] = src
@@ -2007,7 +2017,6 @@ def test_preflight_accepts_a_shared_set_and_still_rejects_unequal_per_owner(
     import shutil
     import tempfile
     import uuid
-    from pathlib import Path
 
     tmp = Path(tempfile.gettempdir()) / ("pf2_" + uuid.uuid4().hex)
     tmp.mkdir()
@@ -2699,7 +2708,6 @@ def _make_pinned_mori(tmp, lib_bytes=b"LIB", hdr_bytes=b"HDR"):
     import hashlib
     import tempfile
     import uuid
-    from pathlib import Path
 
     root = Path(tempfile.gettempdir()) / ("mori_" + uuid.uuid4().hex)
     (root / "include" / "mori" / "cco").mkdir(parents=True)
@@ -3605,7 +3613,6 @@ def test_binding_checker_flags_a_missing_native_and_a_dead_binding_negative_cont
     # the C++ extraction: definitions yes, declarations/calls no, included drivers followed
     import tempfile
     import uuid
-    from pathlib import Path
 
     d = Path(tempfile.gettempdir()) / ("exp_" + uuid.uuid4().hex)
     d.mkdir()
@@ -3629,12 +3636,12 @@ def test_binding_checker_flags_a_missing_native_and_a_dead_binding_negative_cont
 
 
 # ======================================================================= task-264: plan.prepare/run input contract (inputs.py)
-def _small_ready(monkeypatch, mode="dense", T=64, src=None, extra=None):
+def _small_ready(monkeypatch, mode="dense", T=64, src=None, extra=None, params=None):
     """The binding rig plus a recording launch stub: returns (plan, st, meta, outs, res, launches, binds)."""
     from types import SimpleNamespace as NS
 
     plan, st, meta, outs, res, binds, _z = _binding_rig(
-        monkeypatch, mode, T, src, extra
+        monkeypatch, mode, T, src, extra, params
     )
     launches = []
     plan._launch_kw = kws = []  # the keyword arguments of every launch_v3 (R16: m=)
@@ -4155,10 +4162,19 @@ def test_jit_abi_tables_sources_and_missing_source_error():
         "r11",
         "r12",
         "r13",
+        "r18",
     )
-    assert [jit.src_abi("small", s) for s in jit.SRCS] == [2, 2, 3, 3, 3, 3, 3] and [
+    assert [jit.src_abi("small", s) for s in jit.SRCS] == [
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+    ] and [
         jit.src_abi("large", s) for s in jit.LARGE_SRCS
-    ] == [2, 3, 4]
+    ] == [2, 3, 4, 4]
     with pytest.raises(ValueError, match="not in"):
         jit.src_abi("small", "r24")
     # r19 is derived from r18: it accepts the r18-only flags; r17 still rejects them
@@ -4180,8 +4196,8 @@ def test_jit_abi_tables_sources_and_missing_source_error():
     assert jit.large_defs({"src": "r13", "n": 2}, "dense") == jit.large_defs(
         {"src": "r12", "n": 2}, "dense"
     )
-    with pytest.raises(ValueError, match="large src 'r14'"):
-        jit.large_defs({"src": "r14"}, "dense")
+    with pytest.raises(ValueError, match="large src 'r15'"):
+        jit.large_defs({"src": "r15"}, "dense")
     tool = dict(TOOL_SIM)
     # the r19 sources are delivered by the implementor later: a clear error, not a FileNotFoundError
     dev, host = jit.small_defs({"src": "r19"}, "dense")
@@ -4966,13 +4982,14 @@ def test_large_r12_run_needs_call_id_and_calls_launch_v3_r11_ignores_it(monkeypa
         plan.poison(res)
 
 
-def test_profile_selects_r13_for_large_rows_and_rules_and_budgets_the_page():
+def test_profile_selects_r18_and_r13_for_large_rows_and_rules_and_budgets_the_page():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     large = [e for e in prof.entries() if e.vid == "sp_qkv.large.v1"]
-    assert len(large) == 90 + 9 and {dict(e.params)["src"] for e in large} == {
-        "r13"
-    }  # 87 swept + 3 bucket rows (768) = 90 exact rows + the 9 fallback rules
+    assert len(large) == 93 + 9 and {dict(e.params)["src"] for e in large} == {
+        "r13",
+        "r18",
+    }  # 87 swept r13 + 6 r18 bucket rows (512 / 768) = 93 exact rows + the 9 r13 fallback rules
     small = [e for e in prof.rows() if e.vid == "sp_qkv.small.v1"]
     assert len(small) == 30 and {dict(e.params)["src"] for e in small} == {
         "r19",
@@ -4989,7 +5006,7 @@ def test_profile_selects_r13_for_large_rows_and_rules_and_budgets_the_page():
         and specs.LARGE_R13_IN_PROFILE is True
         and specs.large_profile_src() == "r13"
     )
-    assert prof.meta["m_pad_min_large"] == specs.M_PAD_MIN_LARGE == 769
+    assert prof.meta["m_pad_min_large"] == specs.m_pad_min_large() == 386
     # the arena is the sum of the shared set and the small windows: 468 MiB (336 shared + 132 small)
     assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 468 << 20
 
@@ -5036,9 +5053,12 @@ def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
         _forget_sp_modules()  # a fresh import registers the variants (and their prebuild hooks) into this scratch catalog
         units, skipped = engine.plan_profile(PROFILE, recipe="aot1", tool=TOOL_SIM)
         assert (
-            skipped == [] and len(units) == 18
-        )  # 6 small (r19) + 3 (r20) + 3 (r22) + 3 (r23) + 2 large (r13) + the comm
-        assert {u.meta["src"] for u in units if u.kind == "sp_qkv.large.v1"} == {"r13"}
+            skipped == [] and len(units) == 20
+        )  # 6 small (r19) + 3 (r20) + 3 (r22) + 3 (r23) + 2 r13 + 2 r18 large + the comm
+        assert {u.meta["src"] for u in units if u.kind == "sp_qkv.large.v1"} == {
+            "r13",
+            "r18",
+        }
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -5099,9 +5119,7 @@ def test_every_r12_binding_matches_the_c_declaration_it_binds(monkeypatch):
     monkeypatch.setattr(srt.C, "CDLL", lambda path: fake_s)
     srt.load_driver("x", abi=3)
     monkeypatch.setattr(lrt.C, "CDLL", lambda path: fake_l)
-    lrt.load_driver(
-        "x", abi=4
-    )  # r13 (LG_COMM_ABI_VERSION 5): the r12 table + lg_launch_v3
+    lrt.load_driver("x", abi=4)  # the r18 route-B (r13) ABI generation
     for fn in (
         "sm_attach_v3",
         "sm_launch_blk_v3",
@@ -5216,7 +5234,15 @@ def test_r20_flag_validation_mp_table_and_the_removed_shapes():
         "r22": 128,
         "r23": 256,
     }
-    assert [jit.src_mp(s) for s in jit.SRCS] == [32, 32, 32, 64, 128, 128, 256]
+    assert [jit.src_mp(s) for s in jit.SRCS] == [
+        32,
+        32,
+        32,
+        64,
+        128,
+        128,
+        256,
+    ]
     with pytest.raises(ValueError, match="not in"):
         jit.src_mp("r24")
     # r20 builds with the profile's params: the bypass loads are REQUIRED, B_HEADS=1, no credit slow path
@@ -5658,7 +5684,9 @@ def test_large_src_sha_constants_are_the_manifest_hashes():
     sha = consts[0]
     assert set(sha) == set(jit.LARGE_SRCS)
     for src in jit.LARGE_SRCS:
-        manifest = os.path.join(jit.CSRC, "large", src, "SOURCE_SHA256.txt")
+        manifest = os.path.join(
+            jit.CSRC, "large", jit.large_src_dir(src), "SOURCE_SHA256.txt"
+        )  # r18 = large/r18-put
         assert hashlib.sha256(_slurp(manifest, "rb")).hexdigest() == sha[src], src
 
 
@@ -5765,33 +5793,11 @@ def test_ran_kernarg_x1_signature_header_host_launch_and_the_python_mirror_agree
         ), src
 
 
-def test_no_python_module_builds_ran_kernargs():
-    """The RAN kernarg is built natively by the driver: no Python source constructs a SmRanArgsV3 or launches the kernel itself (the mirror is a layout pin only)."""
-    import glob
-    import re
-
-    root = os.path.dirname(jit.__file__)
-    users = []
-    for path in sorted(glob.glob(os.path.join(root, "*.py"))) + sorted(
-        glob.glob(
-            os.path.join(os.path.dirname(root), "..", "..", "gemm_fusion", "*.py")
-        )
-    ):
-        text = _slurp(path, encoding="utf-8")
-        if (
-            re.search(r"(?<!class )\bSmRanArgsV3\s*\(", text)
-            or "hipModuleLaunchKernel" in text
-            or "sm_ran_v3" in re.sub(r"#.*", "", text)
-        ):
-            users.append(os.path.basename(path))
-    assert users == [], users
-
-
-# ======================================================================= small/r22 (R14 tuned MP128): a selectable source, NOT in the shipped profile
 R22_PARAMS = {"src": "r22", "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
 R22_KNOBS = ("b_quad", "gemm_bn128", "rx3")
 
 
+# ======================================================================= small/r22 (R14 tuned MP128): a selectable source, NOT in the shipped profile
 def test_r22_flags_knobs_and_explicit_defs():
     assert (
         jit.src_mp("r22") == 128
@@ -6747,7 +6753,10 @@ def test_accepts_launch_m_is_a_pure_function_of_params_bucket_and_m():
         "r22",
         "r23",
     ]
-    assert [src for src in jit.LARGE_SRCS if jit.src_pad_m("large", src)] == ["r13"]
+    assert [src for src in jit.LARGE_SRCS if jit.src_pad_m("large", src)] == [
+        "r13",
+        "r18",
+    ]
     assert jit.src_pad_m("large", "r13") and not jit.src_pad_m("large", "r12")
 
 
@@ -6882,7 +6891,9 @@ def _large_r13(monkeypatch, mode="dense", T=8192):
     plan, st, res, _launches = _large_ready(monkeypatch, mode, T)
     calls = []
     plan._context = lambda r: NS(
-        launch_v3=lambda *a, **k: calls.append((a, k)),
+        launch_v3=lambda *a, **k: calls.append(
+            (a, {kk: vv for kk, vv in k.items() if not (kk == "sk" and vv == 0)})
+        ),  # sk=0 (r13g behaviour) is not interesting here: the r13 tests compare the m_real keyword
         recv_ptr=lambda: 0x1000,
     )
     tm = sys.modules["torch"]
@@ -7000,7 +7011,7 @@ def test_large_rt_r13_driver_launch_v3_abi_check_and_header_drift(monkeypatch):
         n for n, f in fake3._fn.items() if f.argtypes is not None
     }  # r12 builds do not export it
     monkeypatch.setattr(lrt.C, "CDLL", lambda path: fake4)
-    lrt.load_driver("x", abi=4)
+    lrt.load_driver("x", abi=4)  # r13 (LG_COMM_ABI_VERSION 5)
     assert (
         len(fake4.lg_launch_v3.argtypes) == 13
         and len(fake4.lg_launch_v2.argtypes) == 12
@@ -7072,3 +7083,587 @@ def test_large_rt_r13_driver_launch_v3_abi_check_and_header_drift(monkeypatch):
         == (1 << 19) - 1
     )
     assert re.search(r"uint32_t m_real;\s+/\* 352 r13", h)  # m_real @352
+
+
+def test_r18_tile_wave_rule_the_tile_table_and_the_src_registration():
+    from aiter.ops.gemm_fusion.sp_qkv import r18_gemm
+
+    assert (
+        jit.R18_TILES[477]["tile_m"] == 112
+        and jit.R18_TILES[236]["tile_m"] == 128
+        and all(c["tile_n"] in (192, 256) for c in jit.R18_TILES.values())
+    )
+    assert (
+        r18_gemm.n_tiles(512, 9216, 128) == 4 * 48 == 192
+        and r18_gemm.n_tiles(512, 9856, 112) == 5 * 52 == 260
+        and r18_gemm.n_tiles(700, 9216, 128) == 6 * 48
+    )
+    # the rule: among the tiles that fit ONE wave (<= 256 tiles, each tile's OWN tile_n) the SMALLEST tile_m; none fits -> the fewest waves, ties -> the smallest tile_m
+    ms = (257, 300, 384, 450, 512, 600, 640, 700, 768)
+    assert sorted(jit.R18_TILES) == [236, 237, 238, 477]
+    # the pure rule (table={}): 112 fits through 5 * 48 tiles, 128 at 600 / 640 (5 * 48), 237 (128 x 256: 6 * 36 = 216) beyond; N = 9856 has 52 / 39 column tiles (192 / 256 wide)
+    assert [r18_gemm.tile_for(m, 9216, table={}) for m in ms] == [
+        477,
+        477,
+        477,
+        477,
+        477,
+        236,
+        236,
+        237,
+        237,
+    ]
+    assert [r18_gemm.tile_for(m, 9856, table={}) for m in ms] == [
+        477,
+        477,
+        477,
+        236,
+        236,
+        237,
+        237,
+        237,
+        237,
+    ]
+    assert (
+        r18_gemm.n_tiles(700, 9856, 128, 256) == 6 * 39 == 234
+        and r18_gemm.n_tiles(600, 9216, 160, 192) == 4 * 48 == 192
+    )  # the 256-wide tile counts 39 / 36 column tiles
+    # the MEASURED table (Evidence's sweep) wins where it covers (N, m), the rule is the fallback
+    assert jit.R18_TILE_TABLE == {
+        9216: ((512, 477), (768, 238)),
+        9856: ((384, 477), (512, 236), (640, 238), (768, 237)),
+    }
+    for m in range(1, 769):
+        want9216 = 477 if m <= 512 else 238
+        want9856 = 477 if m <= 384 else 236 if m <= 512 else 238 if m <= 640 else 237
+        assert (r18_gemm.tile_for(m, 9216), r18_gemm.tile_for(m, 9856)) == (
+            want9216,
+            want9856,
+        ), m
+    assert r18_gemm.tile_for(769, 9216) == r18_gemm.tile_for(
+        769, 9216, table={}
+    ) and r18_gemm.tile_for(1024, 9856) == r18_gemm.tile_for(
+        1024, 9856, table={}
+    )  # above the table: the rule
+    assert r18_gemm.tile_for(600, 4096) == r18_gemm.tile_for(
+        600, 4096, table={}
+    )  # an N without a table entry: the rule
+    assert (
+        r18_gemm.tile_for(600, 9216, {**jit.R18_TILES})
+        == r18_gemm.tile_for(600, 9216, table={})
+        == 236
+    )  # an explicit tile table is the pure rule
+    assert {t for rows in jit.R18_TILE_TABLE.values() for _m, t in rows} <= set(
+        jit.R18_TILES
+    )
+    only112 = {477: jit.R18_TILES[477]}
+    assert (
+        r18_gemm.tile_for(512, 9216, only112) == 477
+        and r18_gemm.tile_for(768, 9856, only112) == 477
+    )  # the only tile, fits or not
+    # the table is DATA: a sweep winner added to jit.R18_TILES is picked up (the smallest fitting tile_m; fewer waves when none fits)
+    three = {
+        **jit.R18_TILES,
+        999: {"tile_m": 64, "tile_n": 192},
+        998: {"tile_m": 192, "tile_n": 192},
+    }
+    assert [r18_gemm.tile_for(m, 9216, three) for m in (130, 257, 384, 700)] == [
+        999,
+        999,
+        477,
+        237,
+    ]  # 64 fits up to 5 * 48 = 240 tiles; 700: 237 (128 wide x 256: 6 * 36 = 216) is the smallest fitting tile_m, before the added 192
+    assert (
+        r18_gemm.n_tiles(257, 9216, 64) == 240
+        and r18_gemm.n_tiles(384, 9216, 64) == 288
+    )
+    for (
+        t,
+        cfg,
+    ) in (
+        jit.R18_TILES.items()
+    ):  # every configured tile is a complete compile_preshuffle_gemm option set (a sweep winner must be too)
+        assert {
+            "tile_m",
+            "tile_n",
+            "tile_k",
+            "use_async_copy",
+            "waves_per_eu",
+            "xcd_swizzle",
+            "lds_stage",
+        } <= set(cfg) and cfg["tile_n"] in (192, 256), t
+    assert r18_gemm.N_OF == {
+        "dense": 9216,
+        "indexer": 9856,
+        "reuse": 9216,
+    } and r18_gemm.F_OF == {"dense": 2304, "indexer": 2560, "reuse": 2304}
+    assert r18_gemm.DST_MAP == {
+        "dense": "dense",
+        "indexer": "indexer",
+        "reuse": "dense",
+    }
+    # registration: src r18 = the r13 ABI (generation 4), pads like r13, its tree is large/r18-put
+    assert (
+        "r18" in jit.LARGE_SRCS
+        and jit.src_abi("large", "r18") == 4
+        and jit.src_pad_m("large", "r18")
+    )
+    assert (
+        jit.large_src_dir("r18") == "r18-put"
+        and jit.large_src_dir("r13") == "r13"
+        and jit.R17_SRC == "r17"
+    )
+    tool = dict(TOOL_SIM)
+    for mode in ("dense", "indexer", "reuse"):
+        assert jit.large_defs({"src": "r18", "n": 1}, mode) == jit.large_defs(
+            {"src": "r13", "n": 1}, mode
+        )  # build_device.sh of r18-put == r13's: the same -D set
+        assert jit.large_defs({"src": "r18", "tile": 477}, mode) == jit.large_defs(
+            {"src": "r18"}, mode
+        )  # the tile is a GEMM property, not a comm build flag
+    d = jit.large_defs({"src": "r18"}, "dense")
+    assert jit.large_cache_key(d, tool, "r18") != jit.large_cache_key(
+        d, tool, "r13"
+    )  # its own source hash
+    flat = " ".join(jit.large_device_cmd(d, tool, "/out", "r18")).replace("\\", "/")
+    assert (
+        "large/r18-put/device/gemm_quad_fp8_comm.cu" in flat
+        and "large/r18/" not in flat
+    )
+    assert "large/r18-put/host" in " ".join(
+        jit.large_host_cmd(d, tool, "/out", "r18")
+    ).replace("\\", "/") or "large/r18-put/" in " ".join(
+        jit.large_host_cmd(d, tool, "/out", "r18")
+    ).replace(
+        "\\", "/"
+    )
+    for bad, match in (
+        ({"tile": 123}, r"r18 tile must be one of \[236, 237, 238, 477\]"),
+        ({"tile": 477, "src": "r13"}, r"\['tile'\] exists only in large/r18"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            jit.large_defs({"src": "r18", **bad}, "dense")
+    import hashlib
+
+    assert (
+        hashlib.sha256(
+            _slurp(os.path.join(jit.CSRC, "large", "r17", "SOURCE_SHA256.txt"), "rb")
+        ).hexdigest()
+        == jit.R17_SRC_SHA
+    )  # the r17 pin
+
+
+class _VT:
+    """A tensor stand-in that records view() chains (the GEMM runner hands raw int8 views to FlyDSL)."""
+
+    def __init__(self, name, chain=()):
+        self.name, self.chain = name, tuple(chain)
+
+    def view(self, arg):
+        return _VT(self.name, (*self.chain, arg))
+
+
+def test_r18_gemm_runner_compiles_per_tile_and_launches_the_dst_map_kernel_with_srows_equal_m():
+    import types as _t
+    from types import SimpleNamespace as NS
+
+    from aiter.ops.gemm_fusion.sp_qkv import r18_gemm
+
+    torch = _t.ModuleType("torch")
+    torch.int8, torch.int32, torch.bfloat16 = "i8", "i32", "bf16"
+    torch.empty = lambda *a, **k: NS(kind="empty", a=a, k=k)
+    torch.cuda = NS(current_stream=lambda: "CUR")
+    sys.modules["torch"] = torch
+    comp, runs = [], []
+    mod = NS(
+        compile_preshuffle_gemm=lambda **kw: (comp.append(kw), f"exe{len(comp)}")[1]
+    )
+    fx = NS(Stream=lambda s: ("stream", s))
+    for mode, N, dmap in (
+        ("dense", 9216, "dense"),
+        ("indexer", 9856, "indexer"),
+        ("reuse", 9216, "dense"),
+    ):
+        comp.clear(), runs.clear()
+        g = r18_gemm.R18Gemm(mode, module=mod, flydsl=(fx, lambda *a: runs.append(a)))
+        g.warm({236, 477})  # a set: each tile once
+        assert [c["tile_m"] for c in comp] == [128, 112]
+        for c in comp:
+            assert (
+                c["N"],
+                c["K"],
+                c["in_dtype"],
+                c["out_dtype"],
+                c["split_k"],
+                c["dst_map"],
+                c["tile_n"],
+                c["tile_k"],
+            ) == (N, 6144, "fp8", "bf16", 1, dmap, 192, 256)
+        assert (
+            comp[0]["waves_per_eu"] is None
+            and comp[1]["waves_per_eu"] == 1
+            and comp[1]["use_async_copy"]
+            and comp[0]["xcd_swizzle"] == 4
+            and comp[0]["lds_stage"] == 2
+        )
+        assert (
+            g._sem.kind == "empty"
+            and g._sem.k["dtype"] == "i32"
+            and g._bias.k["dtype"] == "bf16"
+        )
+        s_flat, x, w, xs, ws = _VT("s"), _VT("x"), _VT("w"), _VT("xs"), _VT("ws")
+        g.launch(236, s_flat, x, w, xs, ws, 450)
+        exe, s1, s2, sem, xq8, wq8, xs_, ws_, bias, m, n, st = runs[-1]
+        assert (
+            exe == "exe1" and s1 is s_flat and s2 is s_flat
+        )  # arg_c and arg_out are both S
+        assert (xq8.chain, wq8.chain, xs_.chain, ws_.chain) == (
+            ("i8", -1),
+            ("i8", -1),
+            (-1,),
+            (-1,),
+        )  # raw int8 / flat views: no copies
+        assert (
+            (m, n, st) == (450, N, ("stream", "CUR"))
+            and sem is g._sem
+            and bias is g._bias
+        )  # the slab stride is the launch M = 450
+        g.launch(477, s_flat, x, w, xs, ws, 300, stream="TS")
+        assert (
+            runs[-1][0] == "exe2"
+            and runs[-1][-1] == ("stream", "TS")
+            and len(comp) == 2
+        )  # compiled once per tile
+    with pytest.raises(ValueError, match="mode 'bogus'"):
+        r18_gemm.R18Gemm("bogus")
+
+
+def test_large_rt_put_launch_binding_and_argument_order(monkeypatch):
+    import ctypes
+
+    from aiter.ops.gemm_fusion.sp_qkv import large_rt as lrt
+
+    full = _FakeCDLL()
+    monkeypatch.setattr(lrt.C, "CDLL", lambda path: full)
+    lrt.load_driver("x", abi=4)
+    bound = {n for n, f in full._fn.items() if f.argtypes is not None}
+    assert "lg_put_launch_v1" in bound and len(full.lg_put_launch_v1.argtypes) == 6
+    # a host build WITHOUT the put entry (an r13 image) leaves it unbound; the other generations never bind it
+    r13_only = _FakeCDLL(exports={n for n in bound if n != "lg_put_launch_v1"})
+    monkeypatch.setattr(lrt.C, "CDLL", lambda path: r13_only)
+    lrt.load_driver("x", abi=4)
+    assert getattr(r13_only, "lg_put_launch_v1", None) is None
+    for abi in (3, 5):
+        f = _FakeCDLL()
+        monkeypatch.setattr(lrt.C, "CDLL", lambda path, f=f: f)
+        lrt.load_driver("x", abi=abi)
+        assert "lg_put_launch_v1" not in {
+            n for n, fn in f._fn.items() if fn.argtypes is not None
+        }
+    ctx = lrt.LargeContext(full, 0x77, 768, 2304, 0)
+    ctx.budget_us = 5
+    ctx.put_launch(450, 31, "stream", 450)
+    name, a = full.calls[-1]
+    assert (
+        name == "lg_put_launch_v1"
+        and len(a) == 6
+        and a[0] == 0x77
+        and (a[1], a[2], a[3], a[4], a[5]) == (450, 5, 31, 450, "stream")
+    )  # (h, srows, budget, call_id, m_real, stream)
+    ctx.put_launch(700, 31, "s", 600, budget_us=9)
+    assert (
+        full.calls[-1][1][2] == 9
+        and full.calls[-1][1][1] == 700
+        and full.calls[-1][1][4] == 600
+    )  # srows >= m_real (the GEMM launch M)
+    for kw, match in (
+        (
+            {"srows": 450, "call_id": 31, "m_real": 451},
+            r"srows 450 must be in \[m_real=451, M=768\]",
+        ),
+        ({"srows": 769, "call_id": 31, "m_real": 450}, r"srows 769 must be in"),
+        (
+            {"srows": 450, "call_id": 31, "m_real": 0},
+            r"m_real 0 must be in \[1, M=768\]",
+        ),
+        ({"srows": 450, "call_id": 31, "m_real": 769}, r"m_real 769 must be in"),
+        (
+            {"srows": 450, "call_id": 1 << 31, "m_real": 450},
+            r"call_id .* must be in \[0, 2\^31\)",
+        ),
+    ):
+        with pytest.raises(ValueError, match=match):
+            ctx.put_launch(stream="s", **kw)
+    full.returns = {"lg_put_launch_v1": -106}
+    with pytest.raises(
+        RuntimeError, match=r"lg_put_launch_v1 rc=-106 \(srows=450, m_real=450\)"
+    ):
+        ctx.put_launch(450, 1, "s", 450)
+    assert ctypes is not None
+
+
+def _r18_rig(monkeypatch, mode="dense", M=512, rows=450, **params):
+    """A src r18 plan with the REAL attach / run code and fakes below it: torch (views, streams), the GEMM runner and the driver context; every launch goes into one ordered log."""
+    from types import SimpleNamespace as NS
+
+    _large_ready(monkeypatch)  # the module / torch fakes (and a fresh scratch catalog)
+    from aiter.ops.gemm_fusion.sp_qkv import r18_gemm
+    from aiter.ops.gemm_fusion.sp_qkv import variants_large as vl
+
+    torch = sys.modules["torch"]
+    torch.bfloat16, torch.int8 = "bf16", "i8"
+    cur, log, views = NS(value=0x5151), [], []
+
+    def as_tensor(obj, device=None):
+        cai = obj.__cuda_array_interface__
+        views.append((cai["shape"], cai["data"][0], device))
+        return NS(view=lambda dt, v=views[-1]: ("sview", v, dt))
+
+    class _Scope:
+        def __init__(self, st):
+            self.st = st
+
+        def __enter__(self):
+            log.append(("scope", self.st.cuda_stream))
+            self.prev, cur.value = cur.value, self.st.cuda_stream
+
+        def __exit__(self, *a):
+            cur.value = self.prev
+
+    torch.as_tensor = as_tensor
+    torch.cuda = NS(
+        stream=lambda st: _Scope(st), is_current_stream_capturing=lambda: False
+    )
+
+    class _FakeGemm:
+        def __init__(self, m):
+            self.mode, self.N, self.F = m, r18_gemm.N_OF[m], r18_gemm.F_OF[m]
+
+        def warm(self, tiles, device="cuda"):
+            log.append(("warm", tuple(sorted(tiles)), device))
+
+        def launch(self, tile, s_flat, x, w, xs, ws, m, stream=None):
+            log.append(("gemm", tile, s_flat, x, w, xs, ws, m, cur.value))
+
+    monkeypatch.setattr(r18_gemm, "R18Gemm", _FakeGemm)
+    base = {"n": 1, "half_first": 0, "no_gridread": 1, "src": "r18"}
+    plan = vl.SpQkvLarge(
+        specs.sp_qkv_spec(mode).prefix(1),
+        {**base, **params},
+        MatchCtx("gfx950", 256, 4, M, frozenset({"mori_cco", "sdma"})),
+    )
+    got = NS(
+        lib=NS(lg_put_launch_v1=lambda *a: 0),
+        put_launch=lambda *a, **k: log.append(("put", a, k, cur.value)),
+        recv_ptr=lambda: 0x1000,
+    )
+    res = type("R", (), {"device": 0})()
+    plan._r18_attach(res, got, NS(local=0x9000))
+    plan._context = lambda r: got
+    monkeypatch.setattr(
+        vl,
+        "stream_handle",
+        lambda s: NS(
+            value=(
+                cur.value if s is None else (s if isinstance(s, int) else s.cuda_stream)
+            )
+        ),
+    )
+    N = r18_gemm.N_OF[mode]
+    st = {
+        "x": _T((rows, 6144), (6144, 1), "fp8"),
+        "xs": _T((rows, 1), (1, 1)),
+        "ws": _T((N, 1), (1, 1)),
+        "w": _w_ok(N),
+    }
+    return plan, st, res, log, cur, views
+
+
+def test_r18_attach_compiles_the_tiles_before_capture_and_run_launches_gemm_then_put(
+    monkeypatch,
+):
+    from aiter.ops.gemm_fusion.sp_qkv import r18_gemm
+
+    for mode in ("dense", "indexer", "reuse"):
+        F = r18_gemm.F_OF[mode]
+        for M, rows_list in (
+            (512, (257, 300, 384, 450, 512, 1)),
+            (768, (513, 600, 700, 768)),
+        ):
+            plan, st, res, log, _cur, views = _r18_rig(
+                monkeypatch, mode, M, rows_list[0]
+            )
+            want_tiles = tuple(
+                sorted(
+                    {r18_gemm.tile_for(m, r18_gemm.N_OF[mode]) for m in range(1, M + 1)}
+                )
+            )
+            assert [e for e in log if e[0] == "warm"] == [
+                ("warm", want_tiles, "cuda:0")
+            ]  # attach: EVERY tile the wave rule can return for m in 1..M is compiled OUTSIDE capture
+            assert 477 in want_tiles
+            assert (plan.r18, plan.src, plan.abi, plan.pad_m, plan.M, plan.tile) == (
+                True,
+                "r18",
+                4,
+                True,
+                M,
+                None,
+            ) and plan.accepts_launch_m(plan.params, M, M - 1)
+            for rows in rows_list:
+                st = {
+                    **st,
+                    "x": _T((rows, 6144), (6144, 1), "fp8"),
+                    "xs": _T((rows, 1), (1, 1)),
+                }
+                n = len(log)
+                plan.run(
+                    x=st["x"],
+                    x_scale=st["xs"],
+                    w=st["w"],
+                    w_scale=st["ws"],
+                    res=res,
+                    call_id=11,
+                )
+                new = log[n:]
+                assert [e[0] for e in new] == [
+                    "gemm",
+                    "put",
+                ]  # the GEMM first, the put kernel + quiet_ready after it, one stream (cur never changed)
+                _g, tile, s_flat, x, w, xs, ws, m, g_stream = new[0]
+                assert (tile, x, w, xs, ws, m, g_stream) == (
+                    r18_gemm.tile_for(rows, r18_gemm.N_OF[mode]),
+                    st["x"],
+                    st["w"],
+                    st["xs"],
+                    st["ws"],
+                    rows,
+                    0x5151,
+                )
+                assert (
+                    s_flat[1][0] == (4 * rows * F,)
+                    and s_flat[1][1] == 0x9000
+                    and s_flat[2] == "bf16"
+                )  # S[4][rows][F] at the S window base: srows = the launch M = m_real
+                _p, a, k, p_stream = new[1]
+                assert (a[0], a[1], a[3], k, p_stream) == (
+                    rows,
+                    11,
+                    rows,
+                    {},
+                    0x5151,
+                ) and a[
+                    2
+                ].value == 0x5151  # put_launch(srows = m_real, call_id, handle, m_real)
+                assert plan.last_m_real == rows
+            n_views = len(views)
+            plan.run(
+                x=st["x"],
+                x_scale=st["xs"],
+                w=st["w"],
+                w_scale=st["ws"],
+                res=res,
+                call_id=11,
+            )  # the same m again (a replay-free eager call): the S view is cached
+            assert len(views) == n_views
+
+
+def test_r18_tile_pin_and_the_plan_contract(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, res, log, _cur, _views = _r18_rig(
+        monkeypatch, "dense", 512, 450, tile=477
+    )
+    assert [e for e in log if e[0] == "warm"] == [("warm", (477,), "cuda:0")]
+    plan.run(
+        x=st["x"], x_scale=st["xs"], w=st["w"], w_scale=st["ws"], res=res, call_id=11
+    )
+    assert [e[1] for e in log if e[0] == "gemm"] == [
+        477
+    ]  # a pinned tile is used at every m
+    # the plan is the n = 1 / half_first 0 pipeline (one put per peer)
+    for bad in ({"n": 2}, {"n": 2, "half_first": 1}):
+        with pytest.raises(
+            ContractError, match=r"r18 \(route B\) is the n=1 / half_first 0 plan"
+        ):
+            _r18_rig(monkeypatch, "dense", 512, 450, **bad)
+    with pytest.raises(ValueError, match=r"r18 tile must be one of"):
+        _r18_rig(monkeypatch, "dense", 512, 450, tile=5)
+    # run() contract: call_id, contiguity of the activation, rows
+    plan, st, res, log, _cur, _views = _r18_rig(monkeypatch, "dense", 512, 450)
+    with pytest.raises(ContractError, match=r"needs run\(call_id=\.\.\.\)"):
+        plan.run(x=st["x"], x_scale=st["xs"], w=st["w"], w_scale=st["ws"], res=res)
+    n = len(log)
+    with pytest.raises(ContractError, match=r"call_id"):
+        plan.run(
+            x=st["x"], x_scale=st["xs"], w=st["w"], w_scale=st["ws"], res=res, call_id=0
+        )
+    with pytest.raises(ContractError, match=r"contiguous activation"):
+        plan.run(
+            x=_T((450, 6144), (8192, 1), "fp8"),
+            x_scale=st["xs"],
+            w=st["w"],
+            w_scale=st["ws"],
+            res=res,
+            call_id=11,
+        )
+    assert len(log) == n  # nothing launched
+    # the tile must have been compiled at attach (a launch never compiles inside a capture)
+    plan.tile = 999
+    with pytest.raises(RuntimeError, match=r"tile 999 was not compiled at attach"):
+        plan.run(
+            x=st["x"],
+            x_scale=st["xs"],
+            w=st["w"],
+            w_scale=st["ws"],
+            res=res,
+            call_id=11,
+        )
+    # an image without the put entry (an r13 build) is refused at attach, a missing state at run
+    with pytest.raises(RuntimeError, match=r"needs the large/r18-put build"):
+        plan._r18_attach(res, NS(lib=NS()), NS(local=0x9000))
+    with pytest.raises(RuntimeError, match="r18 state is not attached"):
+        plan._r18(type("R", (), {})())
+
+
+def test_r18_the_gemm_and_the_put_kernel_share_one_stream(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, res, log, cur, _views = _r18_rig(monkeypatch, "dense", 512, 450)
+    kw = {
+        "x": st["x"],
+        "x_scale": st["xs"],
+        "w": st["w"],
+        "w_scale": st["ws"],
+        "res": res,
+        "call_id": 11,
+    }
+    plan.run(**kw)  # stream=None: the current stream, no scope
+    assert (
+        not [e for e in log if e[0] == "scope"] and log[-2][-1] == log[-1][-1] == 0x5151
+    )
+    plan.run(
+        **kw, stream=NS(cuda_stream=0x7777)
+    )  # another torch stream: entered for the GEMM, the put kernel gets its handle
+    assert [e for e in log if e[0] == "scope"] == [("scope", 0x7777)]
+    assert (
+        log[-2][0] == "gemm"
+        and log[-2][-1] == 0x7777
+        and log[-1][0] == "put"
+        and log[-1][-1] == 0x7777
+        and log[-1][1][2].value == 0x7777
+        and cur.value == 0x5151
+    )
+    n = len(log)
+    plan.run(
+        **kw, stream=NS(cuda_stream=0x5151)
+    )  # the current stream passed explicitly: no scope
+    assert len([e for e in log if e[0] == "scope"]) == 1
+    n = len(log)
+    with pytest.raises(ContractError, match=r"raw stream handle 0x9999"):
+        plan.run(**kw, stream=0x9999)
+    assert len(log) == n

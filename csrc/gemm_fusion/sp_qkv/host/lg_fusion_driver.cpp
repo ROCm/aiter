@@ -87,6 +87,13 @@ void* lg_attach_v1(uint32_t rank, uint32_t M, void* comm, const void* devcomm, v
         std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=entry rank=%u symbol=%s err=%d (%s)\n", rank, fn.name, static_cast<int>(e), hipGetErrorString(e));
         hipModuleUnload(c->mod); delete c; return nullptr;
     }
+#ifdef LG_ENTRY_PUT                                        // r18-put image: the put kernel entry (additive; r13 images do not define the macro)
+    if (const hipError_t e = hipModuleGetFunction(&c->fput, c->mod, LG_ENTRY_PUT); e != hipSuccess) {
+        diag[0] = 7; diag[1] = static_cast<uint64_t>(e); diag[2] = 99;
+        std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=entry rank=%u symbol=%s err=%d (%s)\n", rank, LG_ENTRY_PUT, static_cast<int>(e), hipGetErrorString(e));
+        hipModuleUnload(c->mod); delete c; return nullptr;
+    }
+#endif
     gf::flush_sticky();
     return c;
 }
@@ -169,6 +176,14 @@ int32_t lg_abi_info_v2(uint64_t* out9) {
     if (lg_abi_info_v1(out9) != 0) return -1;
     out9[8] = LG_QR_WGS;
     return 0;
+}
+#endif
+#ifdef LG_ENTRY_PUT
+// r18-put (route B): after the r17 flydsl GEMM has written S[4][srows][F] on `stream`: lg_put_v1 (poster + self copy) then r13 quiet_ready (unchanged). srows = rows per S slab (the GEMM launch M, m_real <= srows <= bucket M).
+int32_t lg_put_launch_v1(void* h, uint32_t srows, uint64_t poll_budget_us, uint32_t call_id, uint32_t m_real, void* stream) {
+    auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
+    gf::DeviceScope scope(lg_dev(c)); if (!scope.ok()) return -2;
+    return lg_put_launch(h, srows, poll_budget_us, call_id, m_real, stream);
 }
 #endif
 int32_t lg_report_v1(void* h, uint64_t* out10) {

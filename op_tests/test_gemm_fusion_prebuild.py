@@ -129,7 +129,7 @@ def _plan(recipe="aot1", **kw):
 
 
 # ======================================================================= enumeration
-def test_profile_enumeration_dedupes_to_9_small_2_large_1_comm(jit_root):
+def test_profile_enumeration_dedupes_to_9_small_4_large_1_comm(jit_root):
     units, skipped = _plan()
     assert skipped == []
     by_kind = {}
@@ -137,22 +137,24 @@ def test_profile_enumeration_dedupes_to_9_small_2_large_1_comm(jit_root):
         by_kind.setdefault(u.kind, []).append(u)
     assert {k: len(v) for k, v in by_kind.items()} == {
         "sp_qkv.small.v1": 15,  # 6 r19 owners (the 15 P2 rows copy m=16 params: no new unit) + 3 r20 (MP64) + 3 r22 (MP128) + 3 r23 (MP256) owners
-        "sp_qkv.large.v1": 2,
+        "sp_qkv.large.v1": 4,  # the 2 r13 grid builds (dense + indexer; reuse shares dense) + the 2 r18 route-B builds of the shipped 512 / 768 bucket rows
         "gf_comm": 1,
-    }  # 114 rows + 24 rules -> 15 small builds
-    assert sum(len(u.tasks) for u in units) == 15 * 5 + 2 * 2 + 1
+    }  # 123 rows + 24 rules -> 20 builds
+    assert sum(len(u.tasks) for u in units) == 15 * 5 + 4 * 2 + 1
     device = [
         t for u in units for t in u.tasks if t.name in ("sm_gemm", "sm_ran", "lg_gemm")
     ]
     assert (
-        len(device) == 32  # 15 small owners x 2 device TUs + 2 large
-    )  # 15 small + 2 large device TUs: the whole device compile work of the model
+        len(device) == 34  # 15 small owners x 2 device TUs + 2 r13 + 2 r18 large
+    )  # 15 small + 4 large device TUs: the whole device compile work of the model
     modes = sorted(u.label.split()[0] for u in by_kind["sp_qkv.large.v1"])
     assert modes == [
         "dense",
+        "dense",
         "indexer",
-    ]  # the 3 reuse rows share the dense build (same -D set, same key)
-    assert len({u.dirname for u in units}) == 18
+        "indexer",
+    ]  # the 3 reuse rows share the dense build of their src (same -D set, same key)
+    assert len({u.dirname for u in units}) == 20
 
 
 def test_row_mode_recovery_and_unknown_rows_are_skipped_not_errors(jit_root):
@@ -162,17 +164,17 @@ def test_row_mode_recovery_and_unknown_rows_are_skipped_not_errors(jit_root):
     modes = sorted((r.vid.split(".")[1], pb.row_mode(r)) for r in prof.rows())
     from collections import Counter
 
-    # 30 small rows (6 tuned + 15 P2 + 3 r20 + 3 r22 + 3 r23 bucket rows, 10 per mode) and 90 large rows (30 per mode): the mode is recovered from the signature for rows AND rules
+    # 30 small rows (6 tuned + 15 P2 + 3 r20 + 3 r22 + 3 r23 bucket rows, 10 per mode) and 93 large rows (31 per mode): the mode is recovered from the signature for rows AND rules
     assert Counter(m for v, m in modes if v == "small") == {
         "dense": 10,
         "indexer": 10,
         "reuse": 10,
     }
     assert Counter(m for v, m in modes if v == "large") == {
-        "dense": 30,
-        "indexer": 30,
-        "reuse": 30,
-    }  # 29 swept (1024..8192) + the 768 pad bucket
+        "dense": 31,
+        "indexer": 31,
+        "reuse": 31,
+    }  # 29 swept (1024..8192) + the 512 and 768 r18 route-B buckets
     assert Counter(pb.row_mode(r) for r in prof.rules()) == {
         "dense": 8,  # per mode: 3 chunks-mod-4 large layers + 5 small ranges (r19 1..16, r19 17..32, r20 33..64, r22 65..128, r23 129..255)
         "indexer": 8,
@@ -199,7 +201,7 @@ def test_filters_and_profile_errors(jit_root):
     assert (
         _plan(arch="gfx942")[0] == []
     )  # no row of that arch: nothing to build, no error
-    assert len(_plan(arch="gfx950", cu=256, world=4)[0]) == 18
+    assert len(_plan(arch="gfx950", cu=256, world=4)[0]) == 20
     assert _plan(cu=304)[0] == []
     with pytest.raises(ProfileError):
         engine.plan_profile("/no/such/profile.json", tool=TOOL)
@@ -386,12 +388,12 @@ def test_execute_builds_everything_once_then_everything_is_cached(jit_root):
     units, _ = _plan()
     r = FakeRunner()
     rep = engine.execute(units, jobs=4, runner=r)
-    assert sorted(u.status for u in rep.units) == ["built"] * 18
+    assert sorted(u.status for u in rep.units) == ["built"] * 20
     for u in units:
         assert os.path.exists(u.ok_path), u.dirname
         assert os.path.exists(os.path.join(u.final, "build-command.txt"))
     n = len(r.calls)
-    assert n > 30  # 20 device TUs (+unbundle steps) and the host/link/comm commands
+    assert n > 30  # 34 device TUs (+unbundle steps) and the host/link/comm commands
     # no temporary directory and no lock is left behind
     left = [
         d
@@ -400,7 +402,7 @@ def test_execute_builds_everything_once_then_everything_is_cached(jit_root):
     ]
     assert left == [] and os.listdir(os.path.join(jit_root, ".locks")) == []
     rep2 = engine.execute(units, jobs=4, runner=r)
-    assert [u.status for u in rep2.units] == ["cached"] * 18 and len(
+    assert [u.status for u in rep2.units] == ["cached"] * 20 and len(
         r.calls
     ) == n  # idempotent: no compiler runs
     assert (
@@ -499,12 +501,12 @@ def test_prebuild_profile_api_returns_keys_wraps_errors_and_is_idempotent(
     monkeypatch.setattr(jit, "toolchain", lambda: TOOL)
     keys = gf.prebuild_profile(PROFILE, jobs=4)
     assert (
-        len(keys) == 18
+        len(keys) == 20
         and all(
             k.split("/")[0] in ("sp_qkv.small.v1", "sp_qkv.large.v1", "gf_comm")
             for k in keys
         )
-        and len(set(keys)) == 18
+        and len(set(keys)) == 20
     )
     assert gf.prebuild_profile.last_report.wall_s >= 0
     n = len(fake.calls)
@@ -547,14 +549,14 @@ def test_two_processes_split_the_units_and_nothing_is_built_twice(jit_root):
         for n, rep in out.items()
     }
     assert (
-        built["a"] + built["b"] == 18
+        built["a"] + built["b"] == 20
     )  # every unit built exactly once across the two processes
     assert (
         built["a"] > 0 and built["b"] > 0
     )  # demand-driven claiming split the work instead of one process taking all
-    assert waited["a"] == 18 - built["a"] and waited["b"] == 18 - built["b"]
-    # the device compile commands ran exactly once per TU in total (32 hipcc commands), not once per process
-    assert sum(1 for c in shared.calls if os.path.basename(c[0]) == "hipcc") == 32
+    assert waited["a"] == 20 - built["a"] and waited["b"] == 20 - built["b"]
+    # the device compile commands ran exactly once per TU in total (34 hipcc commands), not once per process
+    assert sum(1 for c in shared.calls if os.path.basename(c[0]) == "hipcc") == 34
 
 
 def test_a_stale_lock_is_stolen_a_fresh_one_is_waited_for(jit_root):
@@ -744,7 +746,7 @@ def test_cli_list_prints_the_plan_without_running_a_compiler(jit_root, capsys):
     out = capsys.readouterr().out
     assert (
         out.count("sp_qkv.small.v1") == 15
-        and out.count("sp_qkv.large.v1") == 2
+        and out.count("sp_qkv.large.v1") == 4
         and "gf_comm" in out
         and "SKIPPED" not in out
     )

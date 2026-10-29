@@ -427,10 +427,10 @@ def test_KEY_every_profile_key_of_the_shipped_profile_has_a_distinct_nonzero_cal
         1020,
     } <= tokens  # ... the r20 (MP64) rule over local m 33..64 (tokens 4 m = 132..256), the r22 (MP128) rule over 65..128 (260..512), the r23 (MP256) rule over 129..255 (516..1020) ...
     assert (
-        3072 in tokens and 2048 not in tokens
-    )  # ... the 768 large pad bucket below the swept grid (an exact row); the 512 bucket is capability only ...
+        3072 in tokens and 2048 in tokens
+    )  # ... both r18 large pad buckets below the swept grid (exact rows) ...
     assert not (
-        {1028, 2048, 2052, 3076, 4092} & tokens
+        {1028, 2052, 3076, 4092} & tokens
     )  # ... and nothing off the 256 grid of the exact rows / rules (bucket_for_m pads those: the pad universe below)
     assert {
         4096,
@@ -440,10 +440,10 @@ def test_KEY_every_profile_key_of_the_shipped_profile_has_a_distinct_nonzero_cal
     } <= tokens  # ... and the m values the range rules add (m = 1024..8192 step 256, tokens = 4 m)
     n_entries = len({(k[2], k[1], k[3]) for k in keys})
     # the key has no mode: dense and indexer at the same token count are the same key (a site is one mode). 256 small token counts (every local m 1..256: the exact rows plus
-    # the r19 rules over 1..16 / 17..32, the MP64 rule over 33..64, the MP128 rule over 65..128, the MP256 rule over 129..255 and its bucket row at 256) + 30 large (m = 1024..8192 step 256 and the 768 pad bucket)
+    # the r19 rules over 1..16 / 17..32, the MP64 rule over 33..64, the MP128 rule over 65..128, the MP256 rule over 129..255 and its bucket row at 256) + 31 large (m = 1024..8192 step 256 and the two r18 pad buckets 512 / 768)
     assert (
         len(keys) == n_entries * len(MODEL_SITES + DRAFT_SITES)
-        and n_entries == 256 + 30
+        and n_entries == 256 + 31
     )
     rep = callid.check_profile_call_ids(prof, MODEL_SITES + DRAFT_SITES, world=4)
     assert (
@@ -1515,23 +1515,23 @@ def test_the_pad_m_key_universe_covers_every_real_m_a_bucket_can_serve(monkeypat
     clear_profile_cache()
     prof = profmod.load_profile(
         PROFILE
-    )  # the shipped layout: r13 large buckets 768 / 1024 .. 8192 with the per-row floors (768: 700 / 600 / 513, 1024: 769)
+    )  # the shipped layout: r18 large buckets 512 / 768 (floors 386 / 513) + the r13 1024 .. 8192 rows (1024: 769)
     sites = MODEL_SITES + DRAFT_SITES
     keys, unresolved = callid.profile_call_id_keys(prof, sites, world=4, pad_m=True)
     assert unresolved == []
     tokens = {k[1] for k in keys}
-    # small: every m 1..256 (buckets); large: every real m a bucket serves, in the UNION over the modes (reuse from 513, indexer from 600, dense from 700) -> m 513..8192
-    assert tokens == {4 * m for m in range(1, 257)} | {4 * m for m in range(513, 8193)}
-    assert len(tokens) == 256 + (8192 - 513 + 1) == 7936
-    assert {k[2] for k in keys if k[1] >= 4 * 513} == {LG_VID} and {
-        k[3] for k in keys if k[1] >= 4 * 513
+    # small: every m 1..256 (buckets); large: every real m a bucket serves, in the UNION over the modes (the r18 512 bucket from 386, the 768 from 513, then 1024..8192) -> m 386..8192
+    assert tokens == {4 * m for m in range(1, 257)} | {4 * m for m in range(386, 8193)}
+    assert len(tokens) == 256 + (8192 - 386 + 1) == 8063
+    assert {k[2] for k in keys if k[1] >= 4 * 386} == {LG_VID} and {
+        k[3] for k in keys if k[1] >= 4 * 386
     } == {1}
     assert {k[2] for k in keys if k[1] <= 1024} == {SM_VID} and {
         k[3] for k in keys if k[1] <= 1024
     } == {2}
     # per token count the 31-bit ids are distinct with the hash ids (the global check is impossible over ~500k keys and was never needed) ...
     rep = callid.check_profile_call_ids(prof, sites, world=4, pad_m=True)
-    assert rep.ok and rep.keys == len(keys) == 7936 * len(sites)
+    assert rep.ok and rep.keys == len(keys) == 8063 * len(sites)
     # ... but the HASH ids collide on the 19 tag bits of the r13 launches (~ n_tokens x pairs / 2^19 expected) and one has a zero low field: r13 needs tag-unique ids
     rep = callid.check_profile_call_ids(
         prof, sites, world=4, pad_m=True, tag_bits=19, tag_vids=(LG_VID,)
@@ -1545,6 +1545,9 @@ def test_the_pad_m_key_universe_covers_every_real_m_a_bucket_can_serve(monkeypat
     )
     assert rep.ok and rep.keys == len(keys)
     # the r12 layout (rollback / A/B): exact large rows only (grid + the 768 bucket), and the hash ids pass the same checks (r12 tags carry the whole call_id)
+    monkeypatch.setattr(
+        specs, "LARGE_R18_IN_PROFILE", False
+    )  # the r18 buckets are the outer layout
     monkeypatch.setattr(specs, "LARGE_R13_IN_PROFILE", False)
     from aiter.ops.gemm_fusion.sp_qkv import gen_profile
 

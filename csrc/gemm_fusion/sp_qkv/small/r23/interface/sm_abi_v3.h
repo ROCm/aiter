@@ -201,6 +201,11 @@ static_assert(sizeof(void*) == 8, "64-bit");
 // r23 push live-set options (Evidence attribution: the indexer spill is the PUSH role, pk[SK][3][2][8] = 144 floats + ws 24; IK-targeted changes cannot help). Opt-in, default 0, push role only:
 //  SM_PUSH_PASSTRIP: per-pass sub-trips (pk 72 floats; +1 P-load round trip per iteration, its loads overlap the retire of the first stores).
 //  SM_PUSH_WS_LATE: Wscale loaded in its own short trip after the decision (-24 floats during the P loads; +~0.8 us).
+//  SM_PUSH_XITER (L1, R18 r5; default 0, push role only, meaningful at SM_ITERS >= 2; recommended with SM_PUSH_PASSTRIP=1): cross-iteration pipelining. The end-of-iteration `vmcnt(0)` (push stores retired) is kept only after the LAST
+//   iteration (it must precede the release); an intermediate iteration issues the next iteration's P loads while its own stores are still draining. Protocol-neutral: same flags, tags, one release, same bytes.
+#ifndef SM_PUSH_XITER
+#define SM_PUSH_XITER 0
+#endif
 #ifndef SM_PUSH_PASSTRIP
 #define SM_PUSH_PASSTRIP 0
 #endif

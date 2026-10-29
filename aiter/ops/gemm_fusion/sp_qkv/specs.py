@@ -124,24 +124,31 @@ def small_cell_params(mode: str, T: int) -> dict:
 # which replaced r21 (SM_MP 128, nh=2, its Rx needs an 8 MiB arena view; still selectable, SMALL_R21_IN_PROFILE). The MP256 slot serves local m 129..255 (T 516..1020) with ONE range
 # rule per mode and no exact row (the default capture list pads to T = 256, 512 at most): r23 (SM_MP 256, 3-slot Rx in an 8 MiB view) {nh 1, b_quad 1, rx3 1, gemm_bn128 0, pfk 4,
 # p_nt 2, push_passtrip 1} (SMALL_R23_IN_PROFILE) plus its bucket row at m=256. So every local m 1..256 fuses on the small plans (pad-M buckets 1, 2, 4, 8, 12, 16, 32, 64, 128, 256); local m
-# 257..8192 pads into the large r13 buckets (768 from its per-mode pad_min 700 / 600 / 513, 1024 from 769, then every multiple of 256); m 257..512 and 513..pad_min-1 of the 768 bucket are native, and m > 8192 is native.
+# 257..8192 pads into the large r18 buckets (512 from its floor 386, 768 from 513, 1024 from 769, then every multiple of 256); m 257..385 is native, and m > 8192 is native.
 SMALL_P2_M = (1, 2, 4, 8, 12)
 # R16 pad-M, the large buckets (match.bucket_for_m): a real local m is padded into the first exact large row >= m (the bucket) only from that row's floor on: the row's own pad_min, else the
-# profile field m_pad_min_large (M_PAD_MIN_LARGE). Evidence's floors on the r13 profile with the 512 / 768 / 1024 buckets (two windows, worst B/C vs native):
-#   bucket 512 : never pays for dense (0.958 even at m=512 exact) / indexer (0.979); reuse only ~1.005 from m=450 up; n=2 is worse  -> NOT in the shipped profile (capability kept below);
-#   bucket 768 : dense >= 1.0 from m=700 (1.015), indexer from 600 (1.016), reuse from 513 (1.022)                                  -> shipped, per-mode pad_min 700 / 600 / 513;
-#   bucket 1024: every mode >= 1.0 at m=769 (dense 1.025, indexer / reuse ~1.19)                                                      -> shipped, pad_min 769.
-# Result: m 257..512 native (all modes), 513..699 native for dense, 513..599 for indexer, then 768 / 1024 / ceil 256 up to 8192; 8193+ native.
-# The shipped profile rows carry their own pad_min, so m_pad_min_large only matters for rows WITHOUT one (the rows from 1280 up): 769 = no row without its own floor pads below the
-# 1024 bucket's range (and, were a row's pad_min removed, it would stop padding below 769).
-M_PAD_MIN_LARGE = 769
+# profile field m_pad_min_large (m_pad_min_large()). SHIPPED (LARGE_R18_IN_PROFILE on): the r18 route-B bucket rows carry their own floors, 386 (bucket 512) / 513 (bucket 768) in every mode
+# (Evidence's route-B timing: B/C >= 1.0 from m 386 in the 512 bucket and from 513 in the 768 bucket), and the profile field is 386; m 257..385 is native.
+# R13 ROLLBACK layout (LARGE_R18_IN_PROFILE off), for the record: Evidence's floors on the r13 profile with the 512 / 768 / 1024 buckets (two windows, worst B/C vs native):
+#   bucket 512 : never pays for dense (0.958 even at m=512 exact) / indexer (0.979); reuse only ~1.005 from m=450 up; n=2 is worse  -> NOT in the r13 layout (capability kept below);
+#   bucket 768 : dense >= 1.0 from m=700 (1.015), indexer from 600 (1.016), reuse from 513 (1.022)                                  -> the r13 layout ships it with per-mode pad_min 700 / 600 / 513;
+#   bucket 1024: every mode >= 1.0 at m=769 (dense 1.025, indexer / reuse ~1.19)                                                      -> shipped, pad_min 769 in both layouts.
+# Both layouts carry pad_min on the bucket and 1024 rows, so m_pad_min_large only matters for rows WITHOUT one (from 1280 up): 386 shipped / 769 in the r13 layout.
+M_PAD_MIN_LARGE = 769  # the r13 rollback field (specs.m_pad_min_large() returns LARGE_R18_M_PAD_MIN_LARGE = 386 for the shipped r18 layout)
+
+
+def m_pad_min_large() -> int:
+    """The profile field m_pad_min_large of the profile being generated: 386 for the shipped r18 layout, 769 in the r13 rollback layout (gen_profile reads the flag at call time)."""
+    return LARGE_R18_M_PAD_MIN_LARGE if LARGE_R18_IN_PROFILE else M_PAD_MIN_LARGE
+
+
 # The large buckets BELOW the swept grid (p1_sweep.P1_GRID = 1024..8192 step 256): local m -> (n, half_first), same for the three modes. NOT swept: n = 1 / half_first = 0 is the best at
 # the smallest swept cells (m=1024 and 1280, every mode, p1_sweep.P1_BEST) and the only legal puts_per_peer at 3 chunks (n must divide the chunk count; n=3 exists only as quarter-first at
 # 8 chunks); 2 chunks would also allow n=2, which Evidence measured worse at 512. The CAPABILITY (both buckets) is kept; LARGE_PAD_BUCKETS_IN_PROFILE selects what the profile ships.
 LARGE_PAD_BUCKETS = {512: (1, 0), 768: (1, 0)}
 LARGE_PAD_BUCKETS_IN_PROFILE = (
     768,
-)  # 512 dropped: it never pays for dense / indexer and only ~1.005 for reuse (see above)
+)  # the r13 ROLLBACK set (not shipped while LARGE_R18_IN_PROFILE is on: the r18 layout ships 512 and 768); 512 dropped: it never pays for dense / indexer and only ~1.005 for reuse (see above)
 # Per-mode floors (row.pad_min) of the buckets below / at the start of the grid, from the Evidence numbers above. The 512 entries are the capability's floors if it is switched on: dense /
 # indexer never pay (floor = 512: exact m only), reuse from 450.
 LARGE_BUCKET_PAD_MIN = {
@@ -149,6 +156,54 @@ LARGE_BUCKET_PAD_MIN = {
     "indexer": {512: 512, 768: 600, 1024: 769},
     "reuse": {512: 450, 768: 513, 1024: 769},
 }
+
+# R18 route B (src r18; SHIPPED): the large buckets as the THREE-kernel pipeline GEMM (large/r17 FlyDSL dst-map GEMM, writes S with srows = the launch M) + put kernel + r13's
+# quiet_ready (large/r18-put, lg_put_launch_v1), receiver as r13. ON (gen_profile reads it at CALL time): the profile ships, per mode, a row at each
+# bucket of LARGE_R18_BUCKETS (default both 512 and 768; the plan serves every real m up to its bucket by pad-M: m 386..512 use the 512 bucket, 513..768 the 768 bucket) with src r18
+# {n 1, half_first 0, no_gridread 1} (no `tile`: the wave rule r18_gemm.tile_for picks the FlyDSL tile per launch M; a row can pin it with "tile": 477 | 236) and the floors below
+# (every mode; from Evidence's timing: route the fused path where B/C >= 1.0 in both windows). The 1024.. grid rows stay r13.
+LARGE_R18_IN_PROFILE = True
+LARGE_R18_SRC = "r18"
+LARGE_R18_BUCKETS = (512, 768)
+LARGE_R18_BUCKET_PAD_MIN = {
+    512: 386,
+    768: 513,
+}  # pad_min, all modes (Evidence's sweep: B/C >= 1.02 from m 386 in the 512 bucket, >= 1.03 from 513 in the 768 bucket)
+LARGE_R18_M_PAD_MIN_LARGE = 386  # the profile field m_pad_min_large of an r18 profile
+
+
+def large_pad_buckets_in_profile() -> tuple[int, ...]:
+    """The large buckets below the swept grid the profile being generated ships: both 512 and 768 in the shipped r18 route-B layout; (768,) in the r13 rollback layout."""
+    if LARGE_R18_IN_PROFILE:
+        return tuple(sorted(LARGE_R18_BUCKETS))
+    return LARGE_PAD_BUCKETS_IN_PROFILE
+
+
+def large_bucket_params(m: int) -> dict:
+    """The plan params of a below-grid bucket row: r13g's n=1 plan or the r18 route-B plan (the shipped layout; same n / half_first 0 / no_gridread 1)."""
+    n, half_first = LARGE_PAD_BUCKETS[m]
+    if LARGE_R18_IN_PROFILE and m in LARGE_R18_BUCKETS:
+        return {
+            "n": n,
+            "half_first": half_first,
+            "no_gridread": 1,
+            "src": LARGE_R18_SRC,
+        }
+    return {
+        "n": n,
+        "half_first": half_first,
+        "no_gridread": 1,
+        "src": large_profile_src(),
+    }
+
+
+def large_bucket_pad_min(mode: str, m: int) -> int:
+    """Row pad_min of a bucket (512 / 768 / 1024) of the profile being generated: the r18 route-B floors (512 / 768) or Evidence's per-mode r13 floors (1024)."""
+    if LARGE_R18_IN_PROFILE and m in LARGE_R18_BUCKET_PAD_MIN:
+        return LARGE_R18_BUCKET_PAD_MIN[m]
+    return LARGE_BUCKET_PAD_MIN[mode][m]
+
+
 SMALL_R20_ROW_M = (64,)
 SMALL_R20_RULE_M = (33, 64)  # (m_min, m_max), every m (m_multiple 1)
 SMALL_R20_SRC = "r20"
@@ -190,7 +245,7 @@ _NATIVE_NOTE_R23_ONLY = "no fused path (T 260..512): native by design in this la
 _NATIVE_NOTE_R21_ON = "no fused path (T 516..1020): native by design; the small kernels end at m=128 (r21 MP128, nh=2: 1.10-1.42x of native over T 260..512, GPU58 tick-free X1 timing), the large path starts at m=1024"
 _NATIVE_NOTE_R22_ON = "no fused path (T 516..1020): native by design; the small kernels end at m=128 (r22 MP128 {nh 1, BN64, p_nt 2, push_passtrip 1}: T512 B/C 1.28-1.33x of native (55.7 / 56.5 / 55.6 us; 1.23-1.28x before passtrip, 1.19-1.23x before p_nt) vs r21 nh=2 at 1.09-1.16x, GPU58 timing, all gates passed), the large path starts at m=1024"
 _NATIVE_NOTE_R21_OFF = "no fused path (T 260..1020, incl. the default capture bucket T=512): native by design; the small kernels end at m=64, the large path starts at m=1024 (r21 MP128 is not selected in this layout)"
-NATIVE_M_RANGES = ()  # the SHIPPED layout (r22 + r23 on): every local m 1..255 fuses (local m 257..512 and up to the 768 bucket's per-mode pad_min - 1 are native; above them the large buckets 768 / 1024 / ... pad)
+NATIVE_M_RANGES = ()  # the SHIPPED layout (r22 + r23 on): every local m 1..255 fuses (local m 257..385 is native; above it the large r18 buckets 512 / 768 and the r13 1024.. rows pad)
 
 
 def native_m_ranges() -> tuple[dict, ...]:

@@ -45,7 +45,7 @@
     }
   },
   "wait_budget_us": 5000000,
-  "m_pad_min_large": 769,
+  "m_pad_min_large": 386,
   "generated_by": {
     "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
     "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
@@ -1026,17 +1026,34 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
+      "m": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r18"
+      },
+      "cell": "dense_T2048",
+      "pad_min": 386,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 386..512 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
       "m": 768,
       "vid": "sp_qkv.large.v1",
       "params": {
         "n": 1,
         "half_first": 0,
         "no_gridread": 1,
-        "src": "r13"
+        "src": "r18"
       },
       "cell": "dense_T3072",
-      "pad_min": 700,
-      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 700..768 pad into it (Evidence floors)"
+      "pad_min": 513,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 513..768 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
     },
     {
       "sig": "0fd134d47bb1534f",
@@ -1481,17 +1498,34 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
+      "m": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r18"
+      },
+      "cell": "indexer_T2048",
+      "pad_min": 386,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 386..512 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
       "m": 768,
       "vid": "sp_qkv.large.v1",
       "params": {
         "n": 1,
         "half_first": 0,
         "no_gridread": 1,
-        "src": "r13"
+        "src": "r18"
       },
       "cell": "indexer_T3072",
-      "pad_min": 600,
-      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 600..768 pad into it (Evidence floors)"
+      "pad_min": 513,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 513..768 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
     },
     {
       "sig": "1f5973865d6bcd73",
@@ -1935,17 +1969,34 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
+      "m": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r18"
+      },
+      "cell": "reuse_T2048",
+      "pad_min": 386,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 386..512 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
       "m": 768,
       "vid": "sp_qkv.large.v1",
       "params": {
         "n": 1,
         "half_first": 0,
         "no_gridread": 1,
-        "src": "r13"
+        "src": "r18"
       },
       "cell": "reuse_T3072",
       "pad_min": 513,
-      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 513..768 pad into it (Evidence floors)"
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 513..768 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
     }
   ],
   "rules": [
@@ -2271,7 +2322,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 768,
+      "m_min": 512,
       "m_max": 8192,
       "m_multiple": 256,
       "vid": "sp_qkv.large.v1",
@@ -2289,7 +2340,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 768,
+      "m_min": 512,
       "m_max": 8192,
       "m_multiple": 512,
       "vid": "sp_qkv.large.v1",
@@ -2307,7 +2358,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 768,
+      "m_min": 512,
       "m_max": 8192,
       "m_multiple": 1024,
       "vid": "sp_qkv.large.v1",
@@ -2325,7 +2376,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 768,
+      "m_min": 512,
       "m_max": 8192,
       "m_multiple": 256,
       "vid": "sp_qkv.large.v1",
@@ -2343,7 +2394,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 768,
+      "m_min": 512,
       "m_max": 8192,
       "m_multiple": 512,
       "vid": "sp_qkv.large.v1",
@@ -2361,7 +2412,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 768,
+      "m_min": 512,
       "m_max": 8192,
       "m_multiple": 1024,
       "vid": "sp_qkv.large.v1",
@@ -2379,7 +2430,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 768,
+      "m_min": 512,
       "m_max": 8192,
       "m_multiple": 256,
       "vid": "sp_qkv.large.v1",
@@ -2397,7 +2448,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 768,
+      "m_min": 512,
       "m_max": 8192,
       "m_multiple": 512,
       "vid": "sp_qkv.large.v1",
@@ -2415,7 +2466,7 @@
       "arch": "gfx950",
       "cu": 256,
       "world": 4,
-      "m_min": 768,
+      "m_min": 512,
       "m_max": 8192,
       "m_multiple": 1024,
       "vid": "sp_qkv.large.v1",

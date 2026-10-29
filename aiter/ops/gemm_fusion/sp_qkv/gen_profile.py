@@ -2,10 +2,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Generate aiter/configs/gemm_fusion/minimax_m3_sp4_gfx950_v1.json from specs.py (signatures computed, never hand-typed).
 Run: python -m aiter.ops.gemm_fusion.sp_qkv.gen_profile [out.json]   (pure Python; works without torch/GPU)
-Rows: exact (sig, arch=gfx950, cu=256, world=4, m): the 6 small cells (T64/T128, src r19) and 87 large cells, one per (mode, local m = 1024..8192 step 256) with that
-cell's best (n, half_first) from the P1 sweep (p1_sweep.py, src r12).
+Rows: exact (sig, arch=gfx950, cu=256, world=4, m): the 30 small rows (m <= 256, src r19 / r20 / r22 / r23), the 87 large grid rows (one per mode x local m = 1024..8192
+step 256, each cell's best (n, half_first) from the P1 sweep, src r13) and the shipped r18 route-B bucket rows (m = 512 and 768, src r18: the 512 bucket serves real m 386..512,
+the 768 bucket 513..768); LARGE_R18_IN_PROFILE off generates the r13 rollback layout instead.
 Rules (P1): the "chunks mod 4 classes" fallback family (9 rules, see aiter.gemm_fusion.profile): consulted only where no exact row exists; none exists on the grid, so they
-document the default for any other m % 256 == 0 in range.
+document the default for any other m % 256 == 0 in range (m_min = the lowest shipped large bucket: 512 shipped, 768 in the r13 rollback layout).
 """
 
 from __future__ import annotations
@@ -98,7 +99,7 @@ RULE_M_MIN, RULE_M_MAX, RULE_M_BASE = (
     768,
     8192,
     256,
-)  # 768 = the lowest large bucket of the shipped profile (specs.LARGE_PAD_BUCKETS_IN_PROFILE)
+)  # RULE_M_MIN = the lowest large bucket of the r13 rollback layout (768 = specs.LARGE_PAD_BUCKETS_IN_PROFILE); build_large_rules() uses the layout's own lowest bucket (512 shipped)
 
 
 def _plan_valid(mode, params, m):
@@ -158,17 +159,12 @@ def build_large_rows():
                     f"P1 sweep best; replaces the r11-era tuned (n={old['n']}, half_first={old['half_first']})"
                 )
             if m in specs.LARGE_BUCKET_PAD_MIN[mode]:
-                row["pad_min"] = specs.LARGE_BUCKET_PAD_MIN[mode][m]
+                row["pad_min"] = specs.large_bucket_pad_min(mode, m)
             rows.append(row)
         # R16: the buckets below the swept grid that the profile ships (specs.LARGE_PAD_BUCKETS_IN_PROFILE: 768): not swept, params from specs.LARGE_PAD_BUCKETS (see there)
-        for m in specs.LARGE_PAD_BUCKETS_IN_PROFILE:
-            n, half_first = specs.LARGE_PAD_BUCKETS[m]
-            params = {
-                "n": n,
-                "half_first": half_first,
-                "no_gridread": 1,
-                "src": specs.large_profile_src(),
-            }
+        for m in specs.large_pad_buckets_in_profile():
+            params = specs.large_bucket_params(m)
+            n, half_first = params["n"], params["half_first"]
             assert _plan_valid(mode, params, m), (mode, m, params)
             rows.append(
                 {
@@ -180,10 +176,10 @@ def build_large_rows():
                     "vid": LARGE_VID,
                     "params": params,
                     "cell": f"{mode}_T{WORLD * m}",
-                    "pad_min": specs.LARGE_BUCKET_PAD_MIN[mode][m],
+                    "pad_min": specs.large_bucket_pad_min(mode, m),
                     "note": (
                         f"R16 pad-M bucket below the P1 grid (not swept): n={n}, half_first={half_first} = the best at the smallest swept cells; "
-                        f"real m {specs.LARGE_BUCKET_PAD_MIN[mode][m]}..{m} pad into it (Evidence floors)"
+                        f"real m {specs.large_bucket_pad_min(mode, m)}..{m} pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
                     ),
                 }
             )
@@ -205,6 +201,9 @@ def build_large_rules():
     """Range rules for local m = 1024..8192: the chunks-mod-4 fallback family, one layer per m_multiple and mode (9 rules). Every assignment is validated against the real
     plan constructor at every m it covers."""
     rules = []
+    rule_m_min = min(
+        specs.large_pad_buckets_in_profile() or (1024,)
+    )  # the lowest large bucket of the profile being generated (shipped: 512; the r13 rollback: 768)
     for mode in ("dense", "indexer", "reuse"):
         sp = specs.sp_qkv_spec(mode).prefix(1)  # GEMM + SPExchange only
         for step, n in FALLBACK_LAYERS:
@@ -214,7 +213,7 @@ def build_large_rules():
                 "no_gridread": 1,
                 "src": specs.large_profile_src(),
             }
-            for m in range(-(-RULE_M_MIN // step) * step, RULE_M_MAX + 1, step):
+            for m in range(-(-rule_m_min // step) * step, RULE_M_MAX + 1, step):
                 assert _plan_valid(mode, params, m), (mode, step, m, params)
             rules.append(
                 {
@@ -222,7 +221,7 @@ def build_large_rules():
                     "arch": ARCH,
                     "cu": CU,
                     "world": WORLD,
-                    "m_min": RULE_M_MIN,
+                    "m_min": rule_m_min,
                     "m_max": RULE_M_MAX,
                     "m_multiple": step,
                     "vid": LARGE_VID,
@@ -283,18 +282,24 @@ def window_budget():
 WAIT_BUDGET_US = 5_000_000
 
 
+def arena_bytes(budget: dict) -> int:
+    """The arena of a window budget: the shared S / R / C / page set + every small owner's two windows (see FusionResources: ONE registered arena)."""
+    return sum(budget["shared"].values()) + sum(budget["small_window_sizes"])
+
+
 def build_profile():
+    budget = window_budget()
     return {
         "profile": "minimax_m3_sp4_gfx950_v1",
-        "window_budget": window_budget(),
+        "window_budget": budget,
         # Large-M per-WAIT poll budget in microseconds (credit wait, arrival wait, group waits): a per-launch kernel ARGUMENT, BAKED into a captured graph's argument
         # block at capture time (resolve before capture). 5 s: the r11 kernel default of 50 ms is shorter than plausible cold-start / host skew between ranks in a serving
         # engine (a clean first call poisoned at the natural ~213 ms cold-start skew; Evidence 05055ac9); keep the PG timeout > ~3 x budget + recover; the cost of a large value is only failure-detection latency (a dead peer holds the stream for up to ~2-3 budgets). AITER_GEMM_FUSION_WAIT_BUDGET_US
         # overrides it for tuning only. Small-M uses an iteration count (20,000,000) instead and is not affected.
         "wait_budget_us": WAIT_BUDGET_US,
-        # R16 pad-M: the smallest real local m a large plan is padded into a bucket for (aiter.gemm_fusion.match.bucket_for_m) when its row has no pad_min of its own; the 768 rows carry
-        # 700 / 600 / 513 (dense / indexer / reuse) and the 1024 rows 769 (Evidence's floors), so this only matters for the rows from 1280 up
-        "m_pad_min_large": specs.M_PAD_MIN_LARGE,
+        # R16 pad-M: the smallest real local m a large plan is padded into a bucket for (aiter.gemm_fusion.match.bucket_for_m) when its row has no pad_min of its own; the r18
+        # bucket rows carry 386 / 513 and the 1024 rows 769, so this only matters for the rows from 1280 up
+        "m_pad_min_large": specs.m_pad_min_large(),
         "generated_by": {
             "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
             "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
@@ -308,23 +313,26 @@ def build_profile():
 
 
 def main(argv=None):
-    argv = argv or sys.argv[1:]
-    out = (
-        argv[0]
-        if argv
-        else os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "..",
-            "configs",
-            "gemm_fusion",
-            "minimax_m3_sp4_gfx950_v1.json",
-        )
+    """python op_tests/gen_gemm_fusion_profile.py [OUT.json]: write a profile. No argument = the shipped profile
+    (aiter/configs/gemm_fusion/minimax_m3_sp4_gfx950_v1.json)."""
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="gen_gemm_fusion_profile")
+    ap.add_argument("out", nargs="?", default=None)
+    ns = ap.parse_args(sys.argv[1:] if argv is None else argv)
+    out = ns.out or os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "configs",
+        "gemm_fusion",
+        "minimax_m3_sp4_gfx950_v1.json",
     )
+    doc = build_profile()
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(build_profile(), f, indent=2, sort_keys=False)
+        json.dump(doc, f, indent=2, sort_keys=False)
         f.write("\n")
     print("wrote", os.path.abspath(out))
 

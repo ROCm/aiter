@@ -36,7 +36,7 @@ CSRC = os.path.abspath(
     os.path.join(_HERE, "..", "..", "..", "..", "csrc", "gemm_fusion", "sp_qkv")
 )
 SRCS = ("r17", "r18", "r19", "r20", "r21", "r22", "r23")
-LARGE_SRCS = ("r11", "r12", "r13")
+LARGE_SRCS = ("r11", "r12", "r13", "r18")
 R18_FAMILY = (
     "r18",
     "r19",
@@ -47,7 +47,15 @@ R18_FAMILY = (
 )  # r19 is derived from r18 (design card r2 D-1 path A), r20 from r19: they accept the r18-only flags (r20: see small_defs for what it refuses)
 # kernel ABI generation of a source: 2 = the shipped drivers (poison words, pointers baked in the device block); 3 = R12 (per-launch kernargs, per-comm ERR/STEP page,
 # call_id tags). Plans of abi 3 take `call_id` in run(), carry the global page request and register no per-plan poison hooks.
-SMALL_ABI = {"r17": 2, "r18": 2, "r19": 3, "r20": 3, "r21": 3, "r22": 3, "r23": 3}
+SMALL_ABI = {
+    "r17": 2,
+    "r18": 2,
+    "r19": 3,
+    "r20": 3,
+    "r21": 3,
+    "r22": 3,
+    "r23": 3,
+}
 # padded rows per source (SM_MP): r17-r19 cover local m 1..32 (T <= 128); r21 / r22 (MP128) cover m 1..128, r23 (MP256) m 1..256; r20 (R13 MP64) covers m 1..64 (decode T up to 256: the profile uses it for m 33..64)
 SMALL_MP = {
     "r17": 32,
@@ -59,11 +67,27 @@ SMALL_MP = {
     "r23": 256,
 }
 # large: 2 = r11 (per-plan poison word), 3 = r12 (LG_COMM_ABI_VERSION 4: per-comm ERR/STEP page, call_id tags), 4 = r13 (LG_COMM_ABI_VERSION 5: + the real m_real per launch, lg_launch_v3)
-LARGE_ABI = {"r11": 2, "r12": 3, "r13": 4}
+LARGE_ABI = {
+    "r11": 2,
+    "r12": 3,
+    "r13": 4,
+    "r18": 4,
+}  # r18 = large/r18-put: the r13 ABI (LG_COMM_ABI_VERSION 5, LgCommArgsV4 360 B) + lg_put_v1
 # R16 pad-M (scheme 2: "the kernel only gets the valid m; the padded m only selects the kernel / plan"): sources whose LAUNCH accepts any real local m <= the bucket M the
 # binding / plan was made for. small: sm_launch_blk_v3m(..., m, ...) (r19 / r20 / r22 / r23; r21 and the abi 2 sources only launch their bound M); large: lg_launch_v3(..., m_real, ...) (r13, ABI 5)
 SMALL_PAD_M = ("r19", "r20", "r22", "r23")
-LARGE_PAD_M = ("r13",)
+# Sources that can be BUILT but have NO plan (none at the moment).
+SMALL_BUILD_ONLY: tuple[str, ...] = ()
+LARGE_PAD_M = ("r13", "r18")
+# R18 route B (src "r18"): the plan launches the large/r17 FlyDSL GEMM (destination-major BF16 epilogue into S) and then large/r18-put's lg_put_launch_v1 (put kernel + r13's quiet_ready). The comm
+# image / driver tree of the source named "r18" is large/r18-put; the GEMM source (a FlyDSL Python kernel, compiled by FlyDSL at first use, not by hipcc) is large/r17.
+LARGE_SRC_DIR = {"r18": "r18-put"}
+R17_SRC = "r17"
+
+
+def large_src_dir(src: str) -> str:
+    """The directory name under csrc/gemm_fusion/sp_qkv/large/ of a large source (r18 = large/r18-put)."""
+    return LARGE_SRC_DIR.get(src, src)
 
 
 def src_pad_m(kind: str, src: str) -> bool:
@@ -90,6 +114,8 @@ def src_mp(src: str) -> int:
 
 def _source_sha(kind: str, src: str) -> str:
     """sha256 of <kind>/<src>/SOURCE_SHA256.txt; a clear BuildError while a source (r19 / r12) has not been delivered yet."""
+    if kind == "large":
+        src = large_src_dir(src)
     path = os.path.join(CSRC, kind, src, "SOURCE_SHA256.txt")
     if not os.path.exists(path):
         raise BuildError(
@@ -157,6 +183,7 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
         "ik_seq",
         "push_passtrip",
         "push_ws_late",
+        "tile",
     }
     extra = set(params) - allowed
     if extra:
@@ -273,7 +300,7 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
             raise ValueError(f"{src} {bad} must be 0 or 1")
         if src == "r23" and (vals["rx3"] != 1 or vals["b_quad"] != 1):
             raise ValueError(
-                "r23 (MP256) requires rx3=1 and b_quad=1 (4 Rx slots would need 9.4 MB > 8 MiB; sm_abi_v3.h #error); gemm_bn128 is optional (default 0)"
+                f"{src} (MP256) requires rx3=1 and b_quad=1 (4 Rx slots would need 9.4 MB > 8 MiB; sm_abi_v3.h #error); gemm_bn128 is optional (default 0)"
             )
         abi += [
             f"-DSM_B_QUAD={vals['b_quad']}",
@@ -284,10 +311,10 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
             # BM256 GEMM prefetch depth: LDS = PFK x (A 32 KiB + B 8 KiB (BN64) / 16 KiB (BN128)) <= 160 KiB: BN64 PFK 3 (120 KiB) or 4 (160 KiB, the default), BN128 PFK 3 (144 KiB, default)
             pfk = int(params.get("pfk", 3 if vals["gemm_bn128"] else 4))
             if pfk not in (3, 4):
-                raise ValueError(f"r23 pfk must be 3 or 4, got {pfk}")
+                raise ValueError(f"{src} pfk must be 3 or 4, got {pfk}")
             if vals["gemm_bn128"] and pfk == 4:
                 raise ValueError(
-                    "r23 gemm_bn128=1 with pfk=4 needs 4 x 48 KiB = 192 KiB of LDS > the 160 KiB per CU"
+                    f"{src} gemm_bn128=1 with pfk=4 needs 4 x 48 KiB = 192 KiB of LDS > the 160 KiB per CU"
                 )
             abi.append(f"-DSM_GEMM_PFK={pfk}")
     abi += ik_abi  # r23 SM_IK_SEQ: device AND host (the RAN grid is a compile-time host constant)
@@ -307,6 +334,59 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
     ]
     # host gets every ABI-affecting switch (grid / thread count / ntiles are compile-time in sm_abi_v2.h)
     return dev, abi
+
+
+# FlyDSL GEMM tile configs of the r18 plans (large/r17 compile_preshuffle_gemm options; ids = the aiter a8w8 bpreshuffle tuned names of microbench_r17.py): 477 = flydsl_bpreshuflle_112x192x256_F8_F8_B16_1x1x4x2,
+# 236 = flydsl_bpreshuflle_128x192x256_F8_F8_B16_1x0x4x2, 238 = 160x192x128, 237 = 128x256x128 (BN 256: the wave rule uses each tile's OWN tile_n). More tiles are added here when Evidence's sweep names them (the wave rule is r18_gemm.tile_for).
+R18_TILES = {
+    477: {
+        "tile_m": 112,
+        "tile_n": 192,
+        "tile_k": 256,
+        "use_async_copy": True,
+        "waves_per_eu": 1,
+        "xcd_swizzle": 4,
+        "lds_stage": 2,
+    },
+    236: {
+        "tile_m": 128,
+        "tile_n": 192,
+        "tile_k": 256,
+        "use_async_copy": True,
+        "waves_per_eu": None,
+        "xcd_swizzle": 4,
+        "lds_stage": 2,
+    },
+    # Evidence's sweep winners (flydsl a8w8 bpreshuffle kernels_list options: async copy 1, waves_per_eu 0 = unset, xcd_swizzle 4, lds_stage 2, scheduler on); tile_k 128, K 6144 = 48 steps
+    238: {
+        "tile_m": 160,
+        "tile_n": 192,
+        "tile_k": 128,
+        "use_async_copy": True,
+        "waves_per_eu": None,
+        "xcd_swizzle": 4,
+        "lds_stage": 2,
+        "enable_scheduler": True,
+    },
+    237: {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "use_async_copy": True,
+        "waves_per_eu": None,
+        "xcd_swizzle": 4,
+        "lds_stage": 2,
+        "enable_scheduler": True,
+    },
+}
+# MEASURED tile per (N, launch M) from Evidence's sweep (us in the comment): per N, ascending (m_max, tile id) pairs, the first with m <= m_max wins; outside the table (other N, m above the last bound)
+# r18_gemm.tile_for falls back to the wave rule. 600 / 9216: 238 45.2; 700 / 9216: 238 46.3 vs 237 47.5; 600 / 9856: 238 49.6; 700 / 9856: 237 53.1.
+R18_TILE_TABLE = {
+    9216: ((512, 477), (768, 238)),
+    9856: ((384, 477), (512, 236), (640, 238), (768, 237)),
+}
+# sha256 of large/r17/SOURCE_SHA256.txt (the FlyDSL dst-map GEMM the r18 plans were integrated against; the generated flydsl_dstmap_gemm.py itself is byte-compared by its own static check)
+R17_SRC_SHA = "c6beda30ccc63b6b0fa6e78cd979920c6b5a798eef6ae7392228768d05bb26ff"
 
 
 def _sha(path: str) -> str:
@@ -730,6 +810,8 @@ def large_defs(params: dict, mode: str) -> list[str]:
         "tag_early",
         "poll_batch",
         "qr_wgs",
+        "sk",
+        "tile",
     }
     extra = set(params) - allowed
     if extra:
@@ -739,12 +821,23 @@ def large_defs(params: dict, mode: str) -> list[str]:
     ng = int(params.get("no_gridread", 1))
     if ng not in (0, 1, 2):
         raise ValueError("no_gridread")
+    # r18 (route B): `tile` pins the FlyDSL GEMM tile config (R18_TILES id: 477 = 112x192, 236 = 128x192) of the plan; absent = the wave rule picks it per launch M (r18_gemm.tile_for). It is a
+    # property of the GEMM (compiled by FlyDSL), not a -D of the comm build: it does not change the build key.
+    if "tile" in params:
+        if params.get("src", LARGE_SRC) != "r18":
+            raise ValueError("['tile'] exists only in large/r18 (src=r18)")
+        if params["tile"] not in R18_TILES:
+            raise ValueError(
+                f"r18 tile must be one of {sorted(R18_TILES)}, got {params['tile']!r}"
+            )
     # r12b knobs (large/r12 only; the header defaults are 1, build_device.sh passes 1): tag_early = LG_TAG_EARLY (0|1: arrival tag stored in the first-put batch),
     # poll_batch = LG_POLL_BATCH (0|1|2: target + ERR loaded back-to-back; 2 = ERR every 8th iteration), qr_wgs = LG_QR_WGS (1|64: quiet_ready workgroups, the NaN fill folded in). Passed EXPLICITLY for r12 so an A/B is a different build key and a
     # header default change cannot move a build silently; r11 has no such knobs.
     knobs = [k for k in ("tag_early", "poll_batch", "qr_wgs") if k in params]
-    if knobs and params.get("src", LARGE_SRC) not in ("r12", "r13"):
-        raise ValueError(f"{knobs} exist only in large/r12 and r13 (src=r12 | r13)")
+    if knobs and params.get("src", LARGE_SRC) not in ("r12", "r13", "r18"):
+        raise ValueError(
+            f"{knobs} exist only in large/r12, r13 and r18 (src=r12 | r13 | r18)"
+        )
     tag_early, poll_batch = int(params.get("tag_early", 1)), int(
         params.get("poll_batch", 1)
     )
@@ -780,7 +873,7 @@ def large_defs(params: dict, mode: str) -> list[str]:
         "-DLG_NEGCTRL_ISO=0",
         "-DLG_ISO_DELAY_ITERS=0",
     ]
-    if params.get("src", LARGE_SRC) in ("r12", "r13"):
+    if params.get("src", LARGE_SRC) in ("r12", "r13", "r18"):
         defs += [
             f"-DLG_TAG_EARLY={tag_early}",
             f"-DLG_POLL_BATCH={poll_batch}",
@@ -802,7 +895,7 @@ def large_cache_key(
 def large_device_cmd(
     defs: list[str], tool: dict[str, str], out: str, src: str | None = None
 ) -> list[str]:
-    ldir = os.path.join(CSRC, "large", src or LARGE_SRC)
+    ldir = os.path.join(CSRC, "large", large_src_dir(src or LARGE_SRC))
     flags = defs + [
         f"-I{os.path.join(ldir, 'device')}",
         f"-I{os.path.join(ldir, 'interface')}",
@@ -829,7 +922,7 @@ def large_device_cmd(
 def large_host_cmd(
     defs: list[str], tool: dict[str, str], out: str, src: str | None = None
 ) -> list[str]:
-    ldir = os.path.join(CSRC, "large", src or LARGE_SRC)
+    ldir = os.path.join(CSRC, "large", large_src_dir(src or LARGE_SRC))
     hostdefs = [
         d
         for d in defs
