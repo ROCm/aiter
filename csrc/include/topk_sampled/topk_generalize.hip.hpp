@@ -819,7 +819,7 @@ phase_c_select_contig(const float* __restrict__ input,
                 s_keys_ext, c, p, e_all, eq_needed, row_start, rif, out, val, s_mm);
         };
         if(whole_row)
-            block_gather_in_order<WRITE_VALUES, NAN_HIGH>(
+            block_gather_in_order<WRITE_VALUES, NAN_HIGH, true>(
                 len, row_start, pivot, ngt, eq_needed, out, val, s_mm, [&](int j) {
                     return row_keys4<NAN_HIGH>(rif, j, len);
                 });

@@ -873,7 +873,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
         }
         __syncthreads();
         if constexpr(STABLE)
-            block_gather_in_order<WRITE_VALUES, NAN_HIGH>(
+            block_gather_in_order<WRITE_VALUES, NAN_HIGH, true>(
                 len, row_start, pivot, ngt, k_out - ngt, out, out_val, s_amm, [&](int j) {
                     return row_keys4<NAN_HIGH>(row, j, len);
                 });
