@@ -53,9 +53,10 @@ _SMALL_D_ROWS_PER_WG = 1
 _SOURCE_PREFETCH_IN_FLIGHT = 3
 # Changing this constant requires _build_attn_res.cache_clear().
 _SOURCE_GROUP_SIZE = 2
-# "auto" uses VALU DPP for one-wave rows and shuffle_xor for multi-wave
-# rows. "swizzle" / "dpp" force one path for A/B. Changing this constant
-# requires _build_attn_res.cache_clear().
+# Selects the butterfly in ``_wave_reduce_add_f32``, which only the
+# red_slots > 8 finish reduce still uses. "auto" resolves to "dpp" for one-wave
+# rows and "swizzle" otherwise. Changing this constant requires
+# _build_attn_res.cache_clear().
 _WAVE_REDUCE_MODE = "auto"
 _LOG2E = math.log2(math.e)
 _DPP_QUAD_XOR1 = 0xB1
@@ -128,11 +129,11 @@ def _dpp_row_f32(
 
 
 def _wave_reduce_to_one_lane_f32(value, fastmath):
-    """Wave64 sum for consumers where a single lane reads the total.
+    """Wave64 sum via a ``row_shr`` cascade into ``row_bcast``.
 
-    Callers that only store from one lane do not need the broadcast,
-    so this walks a ``row_shr`` cascade into ``row_bcast`` and reads
-    lane 63 into an SGPR, which every lane can then use.
+    Lane 63 holds the total; ``readlane`` moves it into an SGPR, so the
+    result is wave-uniform and every lane can consume it without a
+    broadcast.
     """
     reduced = value
     for dpp_ctrl in (
@@ -269,8 +270,8 @@ def _build_attn_res(
     group_size = _SOURCE_GROUP_SIZE if red_slots > 1 else 1
     num_groups = (num_sources + group_size - 1) // group_size
     if _WAVE_REDUCE_MODE == "auto":
-        # One-wave rows have no real LDS traffic, so DPP replaces ds_swizzle.
-        # Multi-wave rows still handshake through LDS; DPP lost wall time there.
+        # One-wave rows reduce through the one-lane cascade and never reach
+        # the butterfly; the mode only names the kernel.
         wave_reduce_mode = "dpp" if red_slots == 1 else "swizzle"
     elif _WAVE_REDUCE_MODE in ("swizzle", "dpp"):
         wave_reduce_mode = _WAVE_REDUCE_MODE
@@ -372,14 +373,14 @@ def _build_attn_res(
 
         def block_reduce_add2(sumsq_local, dot_local, buf, slot):
             if const_expr(red_slots == 1):
-                return wave_reduce_add(sumsq_local), wave_reduce_add(dot_local)
+                return store_reduce_add(sumsq_local), store_reduce_add(dot_local)
             store_pair_partials(sumsq_local, dot_local, slot, buf)
             fx.gpu.barrier()
             return finish_pair_reduce(slot, buf)
 
         def block_reduce_add(value, buf, slot):
             if const_expr(red_slots == 1):
-                return wave_reduce_add(value)
+                return store_reduce_add(value)
 
             # Keep this structurally aligned with the pair reduce. The output
             # RMSNorm epilogue has one payload, so reducing a dummy zero through
