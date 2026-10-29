@@ -157,10 +157,13 @@ def describe(cfg: dict[str, Any]) -> str:
 
 def graph_time_us(fn, iters: int, warmup: int, batch: int) -> float:
     """GPU time per launch with Python submission gaps removed."""
-    fn()  # Compile/JIT before capture.
-    torch.cuda.synchronize()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        fn()  # Compile and initialize state owned by the capture stream.
+    capture_stream.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=capture_stream):
         for _ in range(batch):
             fn()
     for _ in range(warmup):

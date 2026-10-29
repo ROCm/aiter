@@ -988,6 +988,36 @@ class TestGfx942CsvTuner(unittest.TestCase):
         self.assertEqual(empty.call_count, 2)
         self.assertEqual(empty.call_args_list[1].kwargs["dtype"], tuner.torch.float32)
 
+    def test_graph_timer_warms_and_captures_on_the_same_stream(self):
+        tuner = self._tuner()
+        fn = mock.Mock()
+        current_stream = mock.Mock()
+        capture_stream = mock.Mock()
+        graph = mock.Mock()
+        start, end = mock.Mock(), mock.Mock()
+        start.elapsed_time.return_value = 12.0
+
+        with (
+            mock.patch.object(
+                tuner.torch.cuda, "current_stream", return_value=current_stream
+            ),
+            mock.patch.object(tuner.torch.cuda, "Stream", return_value=capture_stream),
+            mock.patch.object(tuner.torch.cuda, "stream") as stream_context,
+            mock.patch.object(tuner.torch.cuda, "CUDAGraph", return_value=graph),
+            mock.patch.object(tuner.torch.cuda, "graph") as graph_context,
+            mock.patch.object(tuner.torch.cuda, "Event", side_effect=(start, end)),
+            mock.patch.object(tuner.torch.cuda, "synchronize"),
+        ):
+            elapsed = tuner.graph_time_us(fn, iters=2, warmup=1, batch=3)
+
+        capture_stream.wait_stream.assert_called_once_with(current_stream)
+        stream_context.assert_called_once_with(capture_stream)
+        capture_stream.synchronize.assert_called_once()
+        graph_context.assert_called_once_with(graph, stream=capture_stream)
+        self.assertEqual(fn.call_count, 4)
+        self.assertEqual(graph.replay.call_count, 3)
+        self.assertEqual(elapsed, 2000.0)
+
     def test_report_only_does_not_query_gpu_architecture(self):
         tuner = self._tuner()
         argv = ["tune_gfx942_csv.py", "--report-only", "--table", "table.csv"]
