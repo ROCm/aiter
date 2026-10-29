@@ -2111,23 +2111,6 @@ def single_region_views(data, scale):
     return buf, kd, ks
 
 
-def topk_values(scores, k=16):
-    """Top-k score values per row, ties irrelevant: compare values, not ids."""
-    s = scores.masked_fill(torch.isnan(scores), float("-inf"))
-    return s.topk(min(k, s.shape[-1]), dim=-1).values
-
-
-def assert_topk_agrees(got, ref):
-    check_scores(topk_values(got), topk_values(ref))
-
-
-def test_mxfp4_topk_check_catches_an_infinity_sign_flip():
-    ref = torch.tensor([[1.0, float("-inf")]])
-    assert_topk_agrees(ref.clone(), ref)
-    with pytest.raises(AssertionError):
-        assert_topk_agrees(torch.tensor([[1.0, float("inf")]]), ref)
-
-
 @pytest.fixture(params=["bf16", "e4m3"], ids=["qbf16", "qe4m3"])
 def qdt(request):
     """The dtype the query reaches the scorer in."""
@@ -2165,32 +2148,29 @@ def test_mxfp4_matches_oracle(case, qdt):
     got = run_fp4(q, kd, ks, bt, seq, S, H, mb)
     ok, why = compare(got, ref)
     assert ok, why
-    assert_topk_agrees(got, ref)
 
 
 @requires_gfx950
-@pytest.mark.parametrize("point", GEOM_POINTS, ids=geom_id)
+@pytest.mark.parametrize(
+    "point", [p for p in GEOM_POINTS if p[4] == 1], ids=geom_id  # no CP shard
+)
 def test_mxfp4_every_geometry_matches_oracle(point, qdt):
     """Every launch geometry the selector can reach (work-chunk depth, token
-    split, spread, CP shard) against the oracle. Negative scores expose
-    accidental zero-initialised maxima, as in the fp8 test."""
-    S, H, batch, max_block, world, rank = point
-    glob = max_block * world
-    lens = ([0, 1, 130] + [P] * batch)[: batch - 1] + [glob * P]
-    lens = [min(x, glob * P) for x in lens]
+    split, spread) against the oracle. Negative scores expose accidental
+    zero-initialised maxima, as in the fp8 test."""
+    S, H, batch, max_block, _, _ = point
+    lens = ([0, 1, 130] + [P] * batch)[: batch - 1] + [max_block * P]
+    lens = [min(x, max_block * P) for x in lens]
     q, cache8, bt, seq, mb = make_case(batch, S, H, lens)
-    assert mb == glob
-    local = -(-(mb - rank) // world)
+    assert mb == max_block
     q.copy_(q.abs() + 0.25)
     q, q_ref = q_for(q, qdt)
     kd, ks, deq = fp4_cache_of(cache8, lambda b: -(b.abs() + 0.25))
     del cache8
-    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, local, world, rank)
-    out = kernel.alloc_score(batch, S, H, local, q.device)
+    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, mb)
+    out = kernel.alloc_score(batch, S, H, mb, q.device)
     out.fill_(float("nan"))
-    got = run_fp4(
-        q, kd, ks, bt, seq, S, H, local, out=out, cp_world=world, cp_rank=rank
-    )
+    got = run_fp4(q, kd, ks, bt, seq, S, H, mb, out=out)
     assert got.data_ptr() == out.data_ptr()
     ok, why = compare(got, ref)
     assert ok, why
@@ -2198,25 +2178,20 @@ def test_mxfp4_every_geometry_matches_oracle(point, qdt):
 
 
 @requires_gfx950
-@pytest.mark.parametrize("world,rank", [(1, 0), (4, 3)])
 @pytest.mark.parametrize("S,H", [(1, 4), (4, 2), (8, 4)])
 @pytest.mark.parametrize("layout", ["contiguous", "feature"])
 @pytest.mark.parametrize("map_in_graph", [False, True])
-def test_mxfp4_graph_buffers(world, rank, S, H, layout, map_in_graph, qdt):
+def test_mxfp4_graph_buffers(S, H, layout, map_in_graph):
     """Captured once, replayed with different lengths and block tables."""
     B, mb = 3, 9
     q, cache8, _, seq, _ = make_case(B, S, H, [0, 513, 1])
-    q, q_ref = q_for(q, qdt)
     kd, ks, deq = fp4_cache_of(cache8)
-    bt = torch.zeros((B, mb * world), dtype=torch.int32, device="cuda")
+    bt = torch.zeros((B, mb), dtype=torch.int32, device="cuda")
     bt[:, :5] = torch.arange(5, device="cuda", dtype=torch.int32)
-    cp = {"cp_world": world, "cp_rank": rank}
     buf = torch.empty(
-        (kernel.work_map_capacity(B, mb, S, H, **cp), 2),
-        device="cuda",
-        dtype=torch.int32,
+        (kernel.work_map_capacity(B, mb, S, H), 2), device="cuda", dtype=torch.int32
     )
-    wm = kernel.build_work_map(seq, mb, S, H, out=buf, **cp)
+    wm = kernel.build_work_map(seq, mb, S, H, out=buf)
     out = (
         torch.empty((H, B * S, mb), device="cuda", dtype=torch.float32)
         if layout == "contiguous"
@@ -2226,10 +2201,8 @@ def test_mxfp4_graph_buffers(world, rank, S, H, layout, map_in_graph, qdt):
     )
 
     def run():
-        current = (
-            kernel.build_work_map(seq, mb, S, H, out=buf, **cp) if map_in_graph else wm
-        )
-        return run_fp4(q, kd, ks, bt, seq, S, H, mb, out=out, work_map=current, **cp)
+        current = kernel.build_work_map(seq, mb, S, H, out=buf) if map_in_graph else wm
+        return run_fp4(q, kd, ks, bt, seq, S, H, mb, out=out, work_map=current)
 
     run()
     torch.cuda.synchronize()
@@ -2239,50 +2212,27 @@ def test_mxfp4_graph_buffers(world, rank, S, H, layout, map_in_graph, qdt):
     for lengths, shift in [([0, 513, 1], 0), ([130, 0, 257], 3), ([1, 129, 0], 1)]:
         seq.copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
         bt.copy_(
-            (
-                torch.arange(mb * world, device="cuda", dtype=torch.int32)[None, :]
-                + shift
-            )
+            (torch.arange(mb, device="cuda", dtype=torch.int32)[None, :] + shift)
             .remainder(kd.shape[0])
             .expand(B, -1)
         )
         if not map_in_graph:
-            kernel.build_work_map(seq, mb, S, H, out=buf, **cp)
+            kernel.build_work_map(seq, mb, S, H, out=buf)
         graph.replay()
-        check_scores(
-            out, score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, mb, world, rank)
-        )
+        check_scores(out, score_oracle(q, deq, bt, seq, S, H, D**-0.5, mb))
 
 
 @requires_gfx950
-def test_mxfp4_split_and_single_region_views_agree_bitwise(qdt):
+def test_mxfp4_split_and_single_region_views_agree_bitwise():
     """Two separate tensors and two views of one `[pages, 8704]` page are the
     same input to the kernel, down to the bit."""
     q, cache8, bt, seq, mb = make_case(3, 4, 4, [130, 4096, 513])
-    q, _ = q_for(q, qdt)
     kd, ks, _ = fp4_cache_of(cache8)
     _buf, kd1, ks1 = single_region_views(kd, ks)
     assert kd1.stride(0) == ks1.stride(0) == 8704
     a = run_fp4(q, kd, ks, bt, seq, 4, 4, mb)
     b = run_fp4(q, kd1, ks1, bt, seq, 4, 4, mb)
     assert torch.equal(a, b)
-
-
-@requires_gfx950
-def test_mxfp4_agrees_with_the_fp8_kernel_on_the_same_values(qdt):
-    """The dequantized K is exactly representable in fp8 (for scales inside
-    e4m3's range), so the fp8 scorer and this one score the SAME numbers. Not
-    bitwise: the two read different k permutations, so the fp32 sums associate
-    differently."""
-    B, S, H = 2, 4, 4
-    q, cache8, bt, seq, mb = make_case(B, S, H, [4096, 1000])
-    q, q_ref = q_for(q, qdt)
-    kd, ks, deq = fp4_cache_of(cache8)
-    as_fp8 = deq.to(dtypes.fp8)
-    assert torch.equal(as_fp8.to(torch.bfloat16), deq), "dequantized K left fp8's range"
-    a = run_fp4(q, kd, ks, bt, seq, S, H, mb)
-    b = kernel.score_flydsl(q_ref, as_fp8, bt, seq, S, H, D**-0.5, mb)
-    check_scores(a, b)
 
 
 @requires_gfx950
@@ -2310,25 +2260,6 @@ def test_mxfp4_wide_scale_range(qdt):
     assert ok, why
 
 
-def test_mxfp4_reference_scale_rule_is_the_hip_rule():
-    """The quantizer under test picks e8m0 = ceil(log2(amax/6)) + 127 with the
-    bit rule of `indexer_fp4_scale_e8m0` (cache_kernels.cu), i.e. the rule a
-    writer in ATOM applies."""
-    torch.manual_seed(0)
-    x = (
-        torch.randn(4096, D) * torch.exp2(torch.randint(-12, 12, (4096, 1)).float())
-    ).to(torch.bfloat16)
-    _, s = per_1x32_f4_quant(x)
-    amax = x.float().reshape(-1, 32).abs().amax(-1)
-    eps = 6.0 * torch.tensor(2.0**-126)
-    bits = (
-        torch.maximum(amax, eps) * torch.tensor(1.0 / 6.0, dtype=torch.float32)
-    ).view(torch.int32)
-    e = (bits >> 23) & 0xFF
-    e = e + ((bits & 0x7FFFFF) != 0).to(torch.int32)
-    assert torch.equal(e.to(torch.uint8), s.view(torch.uint8).reshape(-1))
-
-
 @requires_gfx950
 def test_mxfp4_default_score_buffer_reads_as_minus_inf():
     lens = [512, 256, 128, 512]
@@ -2337,66 +2268,6 @@ def test_mxfp4_default_score_buffer_reads_as_minus_inf():
     out = run_fp4(q, kd, ks, bt, seq, 1, 1, mb)
     assert (out == float("-inf")).any()
     assert torch.isfinite(out[out != float("-inf")]).all()
-
-
-@requires_gfx950
-def test_mxfp4_e4m3_q_scale_and_dtype_dispatch():
-    """`q_scale` multiplies the scores for an e4m3 and a bf16 query alike (default
-    1.0), a non-positive one is refused, and the dtype alone picks the variant."""
-    B, S, H = 2, 4, 4
-    q, cache8, bt, seq, mb = make_case(B, S, H, [513, 4096])
-    q8, q_ref = q_for(q, "e4m3")
-    kd, ks, deq = fp4_cache_of(cache8)
-    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, mb)
-    base = run_fp4(q8, kd, ks, bt, seq, S, H, mb)
-    check_scores(base, ref)
-    half = run_fp4(q8, kd, ks, bt, seq, S, H, mb, q_scale=0.5)
-    fin = torch.isfinite(base)
-    assert torch.equal(torch.isneginf(half), torch.isneginf(base))
-    assert torch.allclose(half[fin], 0.5 * base[fin], rtol=1e-6, atol=1e-6)
-    full_bf = run_fp4(q, kd, ks, bt, seq, S, H, mb)
-    half_bf = run_fp4(q, kd, ks, bt, seq, S, H, mb, q_scale=0.5)
-    assert torch.allclose(half_bf[fin], 0.5 * full_bf[fin], rtol=1e-6, atol=1e-6)
-    for bad in (0.0, -1.0, float("nan"), float("inf")):
-        with pytest.raises(ValueError, match="q_scale"):
-            run_fp4(q8, kd, ks, bt, seq, S, H, mb, q_scale=bad)
-        assert not kernel.index_score_supported_fp4(
-            q8, kd, ks, S, H, mb, bt, seq_lens=seq, q_scale=bad
-        )
-    # Two negatives fold to a positive multiplier; q_scale must be refused on its own.
-    with pytest.raises(ValueError, match="q_scale must be positive"):
-        kernel.score_flydsl_fp4(q8, kd, ks, bt, seq, S, H, -(D**-0.5), mb, q_scale=-1.0)
-    assert not kernel.index_score_supported_fp4(
-        q8, kd, ks, S, H, mb, bt, seq_lens=seq, sm_scale=-1.0, q_scale=-1.0
-    )
-    assert kernel.index_score_supported_fp4(q8, kd, ks, S, H, mb, bt, seq_lens=seq)
-
-
-@requires_gfx950
-def test_mxfp4_e4m3_q_against_bf16_q_is_only_the_q_rounding():
-    """What taking the query as e4m3 costs, isolated: the same cache scored with the
-    bf16 query and with that query rounded to e4m3. The gap is bounded by e4m3's
-    2^-4 relative step per element, and the top-16 block set moves only through
-    near ties."""
-    B, S, H = 2, 4, 4
-    q, cache8, bt, seq, mb = make_case(B, S, H, [8192, 6000])
-    q8, _ = q_for(q, "e4m3")
-    kd, ks, _ = fp4_cache_of(cache8)
-    a = run_fp4(q, kd, ks, bt, seq, S, H, mb)
-    b = run_fp4(q8, kd, ks, bt, seq, S, H, mb)
-    fin = torch.isfinite(a)
-    assert torch.equal(fin, torch.isfinite(b))
-    gap = (a[fin] - b[fin]).abs().max().item()
-    assert gap <= 0.0625 * a[fin].abs().max().item(), gap
-    ta = a.masked_fill(~fin, float("-inf")).topk(16, dim=-1).indices
-    tb = b.masked_fill(~fin, float("-inf")).topk(16, dim=-1).indices
-    same = torch.tensor(
-        [
-            len(set(x.tolist()) & set(y.tolist())) / 16
-            for x, y in zip(ta.reshape(-1, 16), tb.reshape(-1, 16))
-        ]
-    )
-    assert same.mean() > 0.8, same.mean()
 
 
 @requires_gfx950

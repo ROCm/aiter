@@ -1690,22 +1690,22 @@ def _validate_metadata(
     return batch, geom
 
 
-def _supported(
+def index_score_supported(
     idx_q,
     cache,
-    k_scale,
-    S,
-    H,
-    max_block,
+    S: int,
+    H: int,
+    max_block: int,
     block_table,
+    *,
     seq_lens,
-    sm_scale,
-    q_scale,
-    out,
-    work_map,
+    sm_scale=1.0,
+    out=None,
+    work_map=None,
+    k_scale=None,
     **cp,
 ) -> bool:
-    """Metadata-only predicate sharing the entry points' validation.
+    """Metadata-only predicate sharing the entry point's validation.
 
     It has to answer for everything `score_flydsl` would reject, or a
     dispatcher that trusts it routes here and takes a raise instead of a
@@ -1729,46 +1729,10 @@ def _supported(
             k_scale=k_scale,
             **cp,
         )
-        scaled = sm_scale * q_scale * LOG2E
-        return (
-            q_scale > 0
-            and math.isfinite(scaled)
-            and 2**-149 <= scaled <= (2 - 2**-23) * 2**127
-        )
+        scaled = sm_scale * LOG2E
+        return math.isfinite(scaled) and 2**-149 <= scaled <= (2 - 2**-23) * 2**127
     except (AttributeError, IndexError, TypeError, ValueError, ZeroDivisionError):
         return False
-
-
-def index_score_supported(
-    idx_q,
-    cache,
-    S: int,
-    H: int,
-    max_block: int,
-    block_table,
-    *,
-    seq_lens,
-    sm_scale=1.0,
-    out=None,
-    work_map=None,
-    **cp,
-) -> bool:
-    """Metadata-only predicate for `score_flydsl`."""
-    return _supported(
-        idx_q,
-        cache,
-        None,
-        S,
-        H,
-        max_block,
-        block_table,
-        seq_lens,
-        sm_scale,
-        1.0,
-        out,
-        work_map,
-        **cp,
-    )
 
 
 def index_score_supported_fp4(
@@ -1782,26 +1746,22 @@ def index_score_supported_fp4(
     *,
     seq_lens,
     sm_scale=1.0,
-    q_scale=1.0,
     out=None,
     work_map=None,
-    **cp,
 ) -> bool:
     """Metadata-only predicate for `score_flydsl_fp4`."""
-    return _supported(
+    return index_score_supported(
         idx_q,
         k_data,
-        k_scale,
         S,
         H,
         max_block,
         block_table,
-        seq_lens,
-        sm_scale,
-        q_scale,
-        out,
-        work_map,
-        **cp,
+        seq_lens=seq_lens,
+        sm_scale=sm_scale,
+        out=out,
+        work_map=work_map,
+        k_scale=k_scale,
     )
 
 
@@ -1841,22 +1801,32 @@ def alloc_score(batch, S, H, max_block, device):
     )
 
 
-def _score(
+def score_flydsl(
     idx_q,
     cache,
-    k_scale,
     block_table,
     seq_lens,
     S,
     H,
     sm_scale,
-    q_scale,
     max_block,
-    out,
-    work_map,
-    cp_world,
-    cp_rank,
+    out=None,
+    work_map=None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    k_scale=None,
 ):
+    """Host entry point.
+
+    `cp_world`/`cp_rank` shard the blocks round robin: this rank owns
+    `block % cp_world == cp_rank`, so its logical block p is global block
+    `p * cp_world + cp_rank`. The global id addresses the block table and
+    positions the causal mask; the score is stored at the local p, giving the
+    compacted [H, tokens, ceil(blocks/world)] shard the CP selector reads.
+
+    `k_scale` selects the MXFP4 cache (see `score_flydsl_fp4`): `cache` is then its
+    data view and `idx_q` may also be e4m3.
+    """
     import torch
 
     mxfp4 = k_scale is not None
@@ -1876,16 +1846,9 @@ def _score(
     )
     if block_table is None or seq_lens is None:
         raise ValueError("block_table and seq_lens are required")
-    # Not implied by the folded multiplier: sm_scale = q_scale = -1 folds positive.
-    if not q_scale > 0:
-        raise ValueError("q_scale must be positive")
-    scaled = sm_scale * q_scale * LOG2E
+    scaled = sm_scale * LOG2E
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
-        raise ValueError(
-            "sm_scale * q_scale * LOG2E must be finite and positive in FP32"
-            if mxfp4
-            else "sm_scale * LOG2E must be finite and positive in FP32"
-        )
+        raise ValueError("sm_scale * LOG2E must be finite and positive in FP32")
     q_fp8 = idx_q.dtype == dtypes.fp8
     if mxfp4:
         geom = {**geom, "nt_k": MXFP4_K_CACHE}
@@ -1900,10 +1863,7 @@ def _score(
     if work_map is None:
         work_map = _make_map(seq_lens, max_block, geom, batch * chunks)
     if mxfp4:
-        k_args = (
-            ptr_arg(cache, fx.Uint8),
-            ptr_arg(k_scale, fx.Uint8),
-        )
+        k_args = (ptr_arg(cache, fx.Uint8), ptr_arg(k_scale, fx.Uint8))
         k_strides = (cache.stride(0), k_scale.stride(0))
     else:
         k_args = (ptr_arg(cache, fx.Float8E4M3FN),)
@@ -1931,46 +1891,6 @@ def _score(
     return out
 
 
-def score_flydsl(
-    idx_q,
-    cache,
-    block_table,
-    seq_lens,
-    S,
-    H,
-    sm_scale,
-    max_block,
-    out=None,
-    work_map=None,
-    cp_world: int = 1,
-    cp_rank: int = 0,
-):
-    """Host entry point.
-
-    `cp_world`/`cp_rank` shard the blocks round robin: this rank owns
-    `block % cp_world == cp_rank`, so its logical block p is global block
-    `p * cp_world + cp_rank`. The global id addresses the block table and
-    positions the causal mask; the score is stored at the local p, giving the
-    compacted [H, tokens, ceil(blocks/world)] shard the CP selector reads.
-    """
-    return _score(
-        idx_q,
-        cache,
-        None,
-        block_table,
-        seq_lens,
-        S,
-        H,
-        sm_scale,
-        1.0,
-        max_block,
-        out,
-        work_map,
-        cp_world,
-        cp_rank,
-    )
-
-
 def score_flydsl_fp4(
     idx_q,
     k_data,
@@ -1983,35 +1903,25 @@ def score_flydsl_fp4(
     max_block,
     out=None,
     work_map=None,
-    cp_world: int = 1,
-    cp_rank: int = 0,
-    q_scale: float = 1.0,
 ):
     """`score_flydsl` for an MXFP4 index cache.
 
     `k_data [pages, 128, 64]` and `k_scale [pages, 128, 4]` are uint8 views with
     their own page strides (two tensors, or two views of one `[128 x 64 B
-    data][128 x 4 B scale]` page); everything else, including the CP shard, the
-    work map and the score layout, is as in `score_flydsl`.
-
-    `idx_q` is bf16 or e4m3 (`dtypes.fp8`), dispatched on its dtype. An e4m3 Q is
-    scored as stored. `q_scale` (default 1.0) multiplies the scores for either Q
-    dtype; it must be positive and is folded into the score multiplier, like
-    `sm_scale`.
+    data][128 x 4 B scale]` page); the work map and the score layout are as in
+    `score_flydsl`. `idx_q` is bf16 or e4m3 (`dtypes.fp8`), dispatched on its
+    dtype; an e4m3 Q is scored as stored.
     """
-    return _score(
+    return score_flydsl(
         idx_q,
         k_data,
-        k_scale,
         block_table,
         seq_lens,
         S,
         H,
         sm_scale,
-        q_scale,
         max_block,
-        out,
-        work_map,
-        cp_world,
-        cp_rank,
+        out=out,
+        work_map=work_map,
+        k_scale=k_scale,
     )
