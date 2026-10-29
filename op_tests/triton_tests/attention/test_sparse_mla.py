@@ -346,3 +346,93 @@ def test_sparse_mla_rope_free(fmt, dots, tol, H, C, topk, ragged, pool):
         rope=0,
         dot_precision=dots,
     )
+
+
+def _reference_sink_lse(q, kvf, indices, indptr, sm_scale, sink):
+    """f32 attention with -1 sentinels dropped and an optional sink; (out, lse)."""
+    outs, lses = [], []
+    for c in range(q.shape[0]):
+        ii = indices[indptr[c] : indptr[c + 1]].long()
+        ii = ii[ii >= 0]
+        kvs = kvf[ii]
+        s = torch.einsum("hd,td->ht", q[c].float(), kvs) * sm_scale
+        if sink is not None:
+            s = torch.cat([s, sink[:, None]], 1)
+        if s.shape[1] == 0:  # no key and no sink
+            outs.append(torch.zeros(q.shape[1], kvf.shape[1], device=q.device))
+            lses.append(torch.full((q.shape[1],), float("-inf"), device=q.device))
+            continue
+        m = s.max(1).values
+        p = torch.exp(s - m[:, None])
+        den = p.sum(1)
+        outs.append(p[:, : ii.numel()] @ kvs / den[:, None])
+        lses.append(m + torch.log(den))
+    return torch.stack(outs), torch.stack(lses)
+
+
+@pytest.mark.parametrize("H", [8, 16, 32, 64, 128])
+@pytest.mark.parametrize("q_fp8", [True, False], ids=["q_fp8", "q_bf16"])
+@pytest.mark.parametrize(
+    "C,opts",
+    [
+        (8, {}),
+        (8, {"has_invalid": True, "return_lse": True, "sink": True}),
+        (8, {"kv_splits": 3, "sink": True}),
+        (300, {"block": 64, "return_lse": True}),
+    ],
+    ids=["plain", "invalid_lse_sink", "splits3", "block_lse_wide"],
+)
+def test_fp8_fast_path(H, q_fp8, C, opts):
+    """fp8_scalar 512-wide with fp8 dots (sparse_mla_fp8.py): every option it takes,
+    both kernels (C=300 runs the 64-head one at H >= 64), and empty rows -> 0."""
+    _skip_unless_supported("fp8", "tensor")
+    sm = KV_LORA**-0.5
+    g = torch.Generator(device="cpu").manual_seed(H + C)
+    pool = 1 << 15
+    q = torch.randn(C, H, KV_LORA, dtype=torch.bfloat16, device="cuda") * 0.125
+    kv = torch.randn(pool, KV_LORA, dtype=torch.bfloat16, device="cuda") * 0.125
+    lens = torch.randint(0, 700, (C,), generator=g)
+    lens[0] = 0  # an empty row
+    rows = [torch.randperm(pool, generator=g)[: int(n)].to(torch.int32) for n in lens]
+    if opts.get("has_invalid"):
+        for r in rows:
+            r[torch.rand(r.numel(), generator=g) < 0.2] = -1
+    idx = torch.cat(rows).cuda()
+    ptr = torch.zeros(C + 1, dtype=torch.int32)
+    ptr[1:] = lens.cumsum(0)
+    ptr = ptr.cuda()
+    cache, ks = quantize_flat_fp8(kv)
+    kvf = dequant_flat_fp8(cache, ks)
+    sink = torch.randn(H, device="cuda") if opts.get("sink") else None
+    qq, qs = q, None
+    if q_fp8:
+        qs = (q.float().abs().amax() / FP8_MAX).reshape(1)
+        qq = (q.float() / qs).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+    cache_in = cache.view(FP8_DTYPE)
+    if opts.get("block"):
+        cache_in = cache_in.view(-1, opts["block"], KV_LORA)
+    out, lse = sparse_mla_fwd(
+        qq,
+        cache_in,
+        ptr,
+        idx,
+        sm,
+        kv_scale=ks,
+        qk_rope_head_dim=0,
+        q_scale=qs,
+        dot_precision="fp8",
+        attn_sink=sink,
+        return_lse=opts.get("return_lse", False),
+        kv_splits=opts.get("kv_splits"),
+        has_invalid=opts.get("has_invalid", False),
+    )
+    qd = qq.float() * qs if q_fp8 else q.float()
+    ref, ref_lse = _reference_sink_lse(qd, kvf, idx, ptr, sm, sink)
+    assert not out.isnan().any()
+    assert (out[0] == 0).all(), "a row with no key comes out 0"
+    e = rel_err(out[1:], ref[1:])
+    assert e < 7e-2, f"H={H} C={C} {opts}: rel-err {e:.3e}"
+    if opts.get("return_lse"):
+        fin = torch.isfinite(ref_lse)
+        assert torch.equal(torch.isinf(lse), torch.isinf(ref_lse))
+        assert (lse[fin] - ref_lse[fin]).abs().max() < 5e-2
