@@ -42,7 +42,7 @@ from pathlib import Path
 
 import torch
 
-HARNESS_VERSION = 1
+HARNESS_VERSION = 2
 ROWS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 KS = (256, 512, 1024, 2048, 4096)
 DIAG_WIDTHS = (4096, 8192, 16384, 20000, 32768, 65536, 131072, 262144, 524288, 1048576)
@@ -276,9 +276,13 @@ class Arms:
         if arm in ("adaptive", "single"):
             return self.host.is_flydsl_top_k_per_row_decode_supported(*a, None)
         if arm == "oneblock":
-            return self.host._is_flydsl_radix_topk_one_block_supported(
-                x, None, sl, out, None, cell.rows, x.stride(0), x.stride(1),
-                cell.k, is_decode=True, next_n=1,
+            # Whether the kernel launches here, not whether main routes to it:
+            # main's allow-list leaves gfx942 out, and main_pick keeps it.
+            sig = self.host._tensor_signature
+            return self.host._is_flydsl_radix_topk_one_block_call_supported(
+                sig(x), None, sig(sl), sig(out), 1, cell.rows, x.stride(0),
+                x.stride(1), cell.k, None, True,
+                self.host._FLYDSL_TOPK_ONE_BLOCK_ARCHES[0],
             )  # fmt: skip
         return True
 
@@ -308,7 +312,10 @@ class Arms:
             return "single"
         if backend != topk.BACKEND_DEFAULT:
             raise RuntimeError(f"main's dispatch picked {backend!r}")
-        if self.supported("oneblock", x, sl, out, cell):
+        if self.host._is_flydsl_radix_topk_one_block_supported(
+            x, None, sl, out, None, cell.rows, x.stride(0), x.stride(1),
+            cell.k, is_decode=True, next_n=1,
+        ):  # fmt: skip
             return "oneblock"
         return "hip"
 
