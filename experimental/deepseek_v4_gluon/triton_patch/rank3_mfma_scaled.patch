@@ -1,0 +1,168 @@
+diff --git a/lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp b/lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp
+index 76ae72a..4a4bda9 100644
+--- a/lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp
++++ b/lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp
+@@ -1703,7 +1703,14 @@ LinearLayout chooseScaledMfmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,
+   // For mxfp4, these 32 elements are consecutive, so only 1 scale element
+   // is required. But for mxfp6/mxfp8, there are 2 16-consecutive elements
+   // blocks, so 2 scale elements are required.
+-  int32_t kSize = dotOperandShape[1];
++  //
++  // With a batch dimension (rank 3) the scales are [B, M, K / 32] and
++  // [B, N, K / 32]: the per-tile layout below covers the two trailing dims,
++  // and the batch dim follows the MFMA dot operand layout's: size-1 register
++  // and lane bases, warps along it slowest (getMatrixOrder).
++  assert((rank == 2 || rank == 3) && "expected a 2D or batched 3D scale");
++  bool hasBatchDim = rank == 3;
++  int32_t kSize = dotOperandShape[rank - 1];
+ 
+   std::vector<std::vector<int32_t>> registerBase;
+   std::vector<std::vector<int32_t>> laneBase;
+@@ -1735,22 +1742,41 @@ LinearLayout chooseScaledMfmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,
+   SmallVector<StringAttr> outDimNames = standardOutDimNames(ctx, rank);
+   LinearLayout tileLayout({{kRegister, registerBase}, {kLane, laneBase}},
+                           {outDimNames[order[0]], outDimNames[order[1]]});
++  if (hasBatchDim) {
++    tileLayout *= LinearLayout::identity1D(1, kRegister, outDimNames[order[2]]);
++    tileLayout *= LinearLayout::identity1D(1, kLane, outDimNames[order[2]]);
++  }
+ 
++  unsigned warpsM = warpsPerCTA[rank - 2];
++  unsigned warpsN = warpsPerCTA[rank - 1];
+   SmallVector<unsigned> warpsPerCTANew =
+-      (dotOperandIdx == 1)
+-          ? SmallVector<unsigned>{warpsPerCTA[1], warpsPerCTA[0]}
+-          : SmallVector<unsigned>{warpsPerCTA[0], warpsPerCTA[1]};
++      (dotOperandIdx == 1) ? SmallVector<unsigned>{warpsN, warpsM}
++                           : SmallVector<unsigned>{warpsM, warpsN};
+ 
+   SmallVector<unsigned> warpOrder = (dotOperandIdx == 1)
+                                         ? SmallVector<unsigned>{0, 1}
+                                         : SmallVector<unsigned>{1, 0};
++  if (hasBatchDim) {
++    // the batch dim leads the shape and is the slowest warp dim
++    warpsPerCTANew.insert(warpsPerCTANew.begin(), warpsPerCTA[0]);
++    for (unsigned &o : warpOrder)
++      o += 1;
++    warpOrder.push_back(0);
++  }
+ 
+   LinearLayout warpLayout =
+       identityStandardND(kWarp, warpsPerCTANew, warpOrder);
+-  LinearLayout ctaLayout = tileLayout.transposeOuts(outDimNames) *
+-                           warpLayout.transposeOuts(outDimNames);
++  // combineCtaCgaWithShape adds the repeats' register bases in the out-dim
++  // order: the matrix dims' as for rank 2, then the batch's, outermost (the
++  // dot operands' order, which the scaled MFMA lowering reads the scales in:
++  // [batch][non-K][K])
++  SmallVector<StringAttr> repDims(outDimNames.begin(), outDimNames.end());
++  if (hasBatchDim)
++    repDims = {outDimNames[1], outDimNames[2], outDimNames[0]};
++  LinearLayout ctaLayout =
++      tileLayout.transposeOuts(repDims) * warpLayout.transposeOuts(repDims);
+ 
+-  auto cgaLayout = CGAEncodingAttr::get1CTALayout(ctx, 2);
++  auto cgaLayout = CGAEncodingAttr::get1CTALayout(ctx, rank);
+   auto finalLay = combineCtaCgaWithShape(ctaLayout, cgaLayout, dotOperandShape);
+   return finalLay;
+ }
+diff --git a/python/test/gluon/test_core.py b/python/test/gluon/test_core.py
+index 446454b..5f00691 100644
+--- a/python/test/gluon/test_core.py
++++ b/python/test/gluon/test_core.py
+@@ -1744,6 +1744,95 @@ def test_amd_mfma_scaled(M, N, K, a_type, b_type, has_scale, device='cuda'):
+     assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
+ 
+ 
++@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
++@pytest.mark.parametrize("BATCH, M, N, K", [(4, 32, 32, 128)])
++@pytest.mark.parametrize("a_type, b_type", [("e2m1", "e4m3"), ("e4m3", "e4m3"), ("e2m1", "e2m1")])
++@pytest.mark.parametrize("has_scale", [True, False])
++@pytest.mark.parametrize("warps", [(4, 1, 1), (2, 2, 1)])
++def test_amd_mfma_scaled_batched(BATCH, M, N, K, a_type, b_type, has_scale, warps, device='cuda'):
++    """Rank-3 mfma_scaled: an independent scaled matmul a batch index (with
++    warps [4, 1, 1], one a warp)."""
++
++    @gluon.jit
++    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr,  #
++               BATCH: ttgl.constexpr, M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr,  #
++               a_type: tl.constexpr, b_type: tl.constexpr, WARPS: ttgl.constexpr):
++        K_A: tl.constexpr = K // (2 if a_type == "e2m1" else 1)
++        K_B: tl.constexpr = K // (2 if b_type == "e2m1" else 1)
++        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
++                                                             warps_per_cta=WARPS)
++        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
++        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=16)
++        a_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(a_layout, [BATCH, M, K // 32])
++        b_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(b_layout, [BATCH, N, K // 32])
++        ld: ttgl.constexpr = ttgl.BlockedLayout([1, 1, 8], [1, 8, 8], [4, 1, 1], [2, 1, 0])
++
++        ob = ttgl.arange(0, BATCH, layout=ttgl.SliceLayout(1, ttgl.SliceLayout(2, ld)))[:, None, None]
++        om = ttgl.arange(0, M, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(2, ld)))[None, :, None]
++        oka = ttgl.arange(0, K_A, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(1, ld)))[None, None, :]
++        a = ttgl.load(a_ptr + (ob * M + om) * K_A + oka)
++        a = ttgl.convert_layout(a, a_layout)
++        okb = ttgl.arange(0, K_B, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(2, ld)))[None, :, None]
++        on = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(1, ld)))[None, None, :]
++        b = ttgl.load(b_ptr + (ob * K_B + okb) * N + on)
++        b = ttgl.convert_layout(b, b_layout)
++
++        a_scale = None
++        if a_scale_ptr is not None:
++            sm = ttgl.arange(0, M, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(2, ld)))[None, :, None]
++            sk = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(1, ld)))[None, None, :]
++            a_scale = ttgl.convert_layout(ttgl.load(a_scale_ptr + (ob * M + sm) * (K // 32) + sk), a_scale_layout)
++        b_scale = None
++        if b_scale_ptr is not None:
++            sn = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(2, ld)))[None, :, None]
++            sk = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(1, ld)))[None, None, :]
++            b_scale = ttgl.convert_layout(ttgl.load(b_scale_ptr + (ob * N + sn) * (K // 32) + sk), b_scale_layout)
++
++        zero = ttgl.zeros([BATCH, M, N], dtype=ttgl.float32, layout=mfma_layout)
++        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, a_type, b, b_scale, b_type, zero)
++        c = ttgl.convert_layout(c, ld)
++        oc = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(1, ld)))[None, None, :]
++        ttgl.store(out_ptr + (ob * M + om) * N + oc, c)
++
++    def _operand(operand, m, n, dtype):
++        if dtype == 'e4m3':
++            v = torch.randint(20, 40, (m, n), dtype=torch.uint8)
++            return v, v.view(torch.float8_e4m3fn).to(torch.float32)
++        assert dtype == 'e2m1'
++        v = MXFP4Tensor(size=(m, n)).random()
++        return v.to_packed_tensor(1 if operand == 0 else 0), v.to(torch.float32)
++
++    def _scale(operand, m, k):
++        s = MXScaleTensor(size=(m, k // 32)).random(1 / 32, 32)
++        ref = s.to(torch.float32).repeat_interleave(32, dim=1)
++        return s.data, (ref.T.contiguous() if operand == 1 else ref)
++
++    torch.manual_seed(0)
++    a, a_ref, b, b_ref, sa, sa_ref, sb, sb_ref = [], [], [], [], [], [], [], []
++    for _ in range(BATCH):
++        x, xr = _operand(0, M, K, a_type)
++        y, yr = _operand(1, K, N, b_type)
++        a.append(x), a_ref.append(xr), b.append(y), b_ref.append(yr)
++        s, sr = _scale(0, M, K)
++        t, tr = _scale(1, N, K)
++        sa.append(s), sa_ref.append(sr), sb.append(t), sb_ref.append(tr)
++    a, b = torch.stack(a).to(device), torch.stack(b).to(device)
++    a_ref, b_ref = [x.to(device) for x in a_ref], [y.to(device) for y in b_ref]
++    sa_ref, sb_ref = [s.to(device) for s in sa_ref], [t.to(device) for t in sb_ref]
++    out = torch.empty((BATCH, M, N), dtype=torch.float32, device=device)
++    if has_scale:
++        sa, sb = torch.stack(sa).to(device), torch.stack(sb).to(device)
++        compiled = kernel[(1, )](out, a, b, sa, sb, BATCH, M, N, K, a_type, b_type, warps, num_warps=4)
++        out_ref = torch.stack([(x * s) @ (y * t) for x, s, y, t in zip(a_ref, sa_ref, b_ref, sb_ref)])
++    else:
++        compiled = kernel[(1, )](out, a, b, None, None, BATCH, M, N, K, a_type, b_type, warps, num_warps=4)
++        out_ref = torch.stack([x @ y for x, y in zip(a_ref, b_ref)])
++    # fp32 summation order (MFMA vs the reference GEMM) on dot products whose terms
++    # reach ~1e4 x the result: a tolerance scaled to the output's magnitude
++    torch.testing.assert_close(out, out_ref, atol=1e-6 * out_ref.abs().max().item(), rtol=1e-5)
++    assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
++
++
+ def test_math_fast_expf():
+ 
+     @gluon.jit
