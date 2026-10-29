@@ -2534,7 +2534,8 @@ def _flash_attn_backward(
 
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # a left size of 0 is a window too, it keeps only the diagonal
+    swa = (window_size_left >= 0) or (window_size_right > 0)
 
     # only 1 block when sk <= 256, thus deterministic
     is_950_1block = (
@@ -2554,9 +2555,11 @@ def _flash_attn_backward(
         ret &= not deterministic or is_950_1block
         ret &= nhead_q % nhead_k == 0
         ret &= (
-            (hdim_q > 64 and hdim_q <= 128) or (hdim_q == 192 and hdim_v == 128)
+            (hdim_q > 64 and hdim_q <= 128 and hdim_q == hdim_v)
+            or (hdim_q == 192 and hdim_v == 128)
         ) and hdim_q % 8 == 0
-        ret &= not swa
+        # sliding window kernels are hd128 only
+        ret &= not swa or hdim_q <= 128
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
@@ -3352,7 +3355,8 @@ def _flash_attn_varlen_backward(
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= (hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0) or hdim_q == 256
-        ret &= not swa
+        # sliding window kernels are hd128 only
+        ret &= not swa or hdim_q <= 128
         if hdim_q == 256:
             ret &= not causal
             ret &= nhead_q == nhead_k

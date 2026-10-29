@@ -285,7 +285,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     // 0: no mask
     // 1: top-left triangular
     // 2: bottom-right triangular
-    // 3: window mask
+    // 3: window mask (top-left window on gfx950)
+    // 4: bottom-right window mask (gfx950 only)
     // -1: unsupported (e.g., ck generic mask)
     auto asm_mask_type = [&]() {
         if(a.mask_type == static_cast<ck_tile::index_t>(mask_enum::no_mask))
@@ -308,6 +309,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             else if(a.window_size_left == -1 && a.window_size_right == -1)
             {
                 return 0;
+            }
+            else if(arch_id == "gfx950" &&
+                    a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_bottom_right))
+            {
+                return 4;
             }
             else
             {
@@ -652,7 +658,14 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         dqdkdv_args.split_stride  = a.is_deterministic ? dq_acc_plane : 0;
     }
 
-    if(mt == 3)
+    if(arch_id == "gfx950" && (mt == 3 || mt == 4))
+    {
+        // the gfx950 window kernels take the FA style left/right (negative is unbounded) and
+        // align the window to each batch themselves
+        dqdkdv_args.mask_y = a.window_size_left;
+        dqdkdv_args.mask_x = a.window_size_right;
+    }
+    else if(mt == 3)
     {
 #if !ENABLE_CK
         bool is_top_left = (a.mask_type == static_cast<int>(mask_enum::mask_top_left) ||
