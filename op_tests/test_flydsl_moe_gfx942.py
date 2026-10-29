@@ -33,7 +33,12 @@ from aiter.fused_moe_registry import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.flydsl.fused_moe_gfx942 import Config, _gateup_output, get_tune_space
+from aiter.ops.flydsl.fused_moe_gfx942 import (
+    Config,
+    _gateup_output,
+    _Problem,
+    get_tune_space,
+)
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     gemm2_8x1_compact as compact,
 )
@@ -264,6 +269,10 @@ def test_config_strings():
         except ValueError:
             continue
         raise AssertionError(f"accepted invalid config {invalid!r}")
+    batch1 = _Problem(1, 8, 256, 512, 512, 128, 2, "no")
+    assert Config.from_string("16_16_16_False").unsupported_reason(batch1) is None
+    for tile in ("32_16_16_False", "16_16_32_False", "16_128_64_False"):
+        assert Config.from_string(tile).unsupported_reason(batch1), tile
 
 
 def route(hidden, experts, topk, routing):

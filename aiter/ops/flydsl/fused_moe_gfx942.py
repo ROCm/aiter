@@ -88,7 +88,8 @@ class Config:
         if self.use_batch1_algorithm and not 2 <= problem.batch <= 8:
             return "direct decoding requires 2 to 8 tokens"
         # Batch 1 runs the batch-1 kernels for any tile; tune it only as 16_16_16.
-        if not self.use_prefill and problem.batch == 1 and self.BLOCK_N != 16:
+        tile = (self.BLOCK_M, self.BLOCK_N, self.BLOCK_K)
+        if not self.use_prefill and problem.batch == 1 and tile != (16, 16, 16):
             return "batch 1 uses the 16_16_16 config"
         if self.down_path != "default":
             if self.BLOCK_M != 64:
@@ -296,7 +297,7 @@ def _run_prefill(
         sorted_weights,
         sorted_expert_ids,
         num_valid_ids,
-        cur_out,
+        _,
         _,
         loc_ids,
     ) = moe_sorting(
@@ -309,7 +310,14 @@ def _run_prefill(
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
+        # sorted_sum writes every output row, so the sort need not clear one.
+        accumulate=False,
         output_aux=AUX_SORT_OPUS,
+    )
+    cur_out = torch.empty(
+        [problem.batch, problem.model_dim],
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
