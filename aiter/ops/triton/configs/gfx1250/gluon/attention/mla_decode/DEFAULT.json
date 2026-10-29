@@ -32,7 +32,7 @@
       "H_LEQ_64.B_LEQ_32.KV_LEQ_131072": {
         "BLOCK_M": 64,
         "num_warps": 4,
-        "NUM_SEGMENTS_PER_SEQ": 8,
+        "NUM_SEGMENTS_PER_SEQ": 16,
         "num_stages": 3,
         "TDM_PARTIAL_STORE": 1,
         "Q_FROM_LDS": 1,
@@ -43,7 +43,7 @@
       "H_LEQ_64.B_LEQ_128.KV_LEQ_32768": {
         "BLOCK_M": 64,
         "num_warps": 4,
-        "NUM_SEGMENTS_PER_SEQ": 2,
+        "NUM_SEGMENTS_PER_SEQ": 4,
         "num_stages": 3,
         "TDM_PARTIAL_STORE": 1,
         "Q_FROM_LDS": 1,
