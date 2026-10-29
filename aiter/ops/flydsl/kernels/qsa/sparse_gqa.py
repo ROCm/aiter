@@ -70,23 +70,15 @@ _TINY_SPLITS = 128
 _NARROW_HEAD_DIM = 128
 _DECODE_BANDS_NARROW = (4, 16)
 _DECODE_BANDS_WIDE = (2, 12)
+# Finite floor for an empty LSE, the initial running max, and a masked
+# score. The kernel is compiled with fastmath "fast", which includes ninf,
+# so a real -inf operand is poison and a compare against it can fold away.
+# 1e20 sits far below any bf16 QK score this kernel scales.
 _LSE_EMPTY = -1.0e20
 
 
 def _idiv(a, b):
     return fx.Int32(fx.Uint32(a) // fx.Uint32(b))
-
-
-def _neg_inf():
-    return Float32(float("-inf"))
-
-
-def _exp2(x):
-    """Approximate ``v_exp_f32`` for the log2-space online softmax.
-
-    The running-max scale and the probabilities both use this intrinsic.
-    """
-    return Float32(fx.rocdl.exp2(Float32.ir_type, x.ir_value()))
 
 
 def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
@@ -822,7 +814,7 @@ def build_qsa_sparse_gqa_module(
                     )
                 )
         init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
-        init_acc.append(Float32(float("-inf")))
+        init_acc.append(Float32(_LSE_EMPTY))
         init_acc.append(Float32(0.0))
 
         def tile_body(safe_phys, page_off_i, live, state):
@@ -890,13 +882,7 @@ def build_qsa_sparse_gqa_module(
                         k_store_frag = fx.make_fragment_like(k_dst)
                         fx.memref_store_vec(k_vec, k_store_frag)
                         fx.copy(lds_copy, k_store_frag, k_dst)
-            if const_expr(token_major_v):
-                fx.rocdl.s_waitcnt(lgkmcnt=0)
-                # s_barrier has no stable export. gpu.barrier adds a fence
-                # this waitcnt already ordered.
-                fx.rocdl.s_barrier()
-            else:
-                gpu.barrier()
+            gpu.barrier()
 
             # V rounds issued ahead of QK, so their latency lands under the
             # MFMA block. Every round in flight costs 4 VGPRs, so when V
@@ -1003,10 +989,7 @@ def build_qsa_sparse_gqa_module(
                     )
                     store_amd_v4(a0, lo)
                     store_amd_v4(a1, hi)
-                fx.rocdl.s_waitcnt(lgkmcnt=0)
-                # s_barrier has no stable export. gpu.barrier adds a fence
-                # this waitcnt already ordered.
-                fx.rocdl.s_barrier()
+                gpu.barrier()
             elif const_expr(use_k32):
                 store_elem = (
                     (col % Int32(32)) * Int32(4)
@@ -1114,7 +1097,7 @@ def build_qsa_sparse_gqa_module(
 
             m_prev = Float32(state[out_chunks])
             l_prev = Float32(state[out_chunks + 1])
-            tile_max = _neg_inf()
+            tile_max = Float32(_LSE_EMPTY)
             scores = []
             score_lives = []
             live_bits = Int64(0)
@@ -1134,7 +1117,7 @@ def build_qsa_sparse_gqa_module(
                             != zero
                         )
                     score = qk_accs[ng][i] * softmax_scale_log2
-                    score = score_live.select(score, _neg_inf())
+                    score = score_live.select(score, Float32(_LSE_EMPTY))
                     sc.append(score)
                     lives.append(score_live)
                     tile_max = fx.max(tile_max, score)
@@ -1145,11 +1128,10 @@ def build_qsa_sparse_gqa_module(
             tile_peer = fx.gpu.shuffle_xor(tile_max, 16, 64)
             tile_max = fx.max(tile_max, tile_peer)
             m_new = fx.max(m_prev, tile_max)
-            alpha = _exp2(m_prev - m_new)
-            # No mass yet: -inf - -inf is NaN, and a zero denominator has
-            # nothing to carry. A finite max with a positive denominator
-            # keeps the exp2 result.
-            alpha = ((m_prev == _neg_inf()) | (l_prev == Float32(0.0))).select(
+            alpha = fxmath.exp2(m_prev - m_new)
+            # An empty history stays at the floor, and exp2(floor - floor)
+            # is 1. A zero denominator has nothing to carry.
+            alpha = ((m_prev == Float32(_LSE_EMPTY)) | (l_prev == Float32(0.0))).select(
                 Float32(0.0), alpha
             )
             p_sum = Float32(0.0)
@@ -1158,7 +1140,7 @@ def build_qsa_sparse_gqa_module(
                 probs = []
                 for i in range_constexpr(4):
                     p = score_lives[ng][i].select(
-                        _exp2(scores[ng][i] - m_new), Float32(0.0)
+                        fxmath.exp2(scores[ng][i] - m_new), Float32(0.0)
                     )
                     p_sum = p_sum + p
                     if const_expr(decode_tr_pv):
@@ -1199,10 +1181,15 @@ def build_qsa_sparse_gqa_module(
                     Float32,
                 )
             next_acc = []
-            # D=128 decode miscompiles the first unrolled 16x16x16 PV MFMA:
-            # that chunk is NaN or about 1e36 and every later chunk matches.
-            # One unused MFMA occupies the bad slot. Decode never reads this
-            # scratch; the store only keeps the call from being deleted.
+            # D=128 decode on gfx950 miscompiles the first unrolled 16x16x16
+            # PV MFMA under AMD clang 23.0.0git 46fcb339, HIP 7.14.60850,
+            # torch 2.12.0+rocm7.14.0, FlyDSL 0.4.0. That chunk is NaN or
+            # about 1e36 and every later chunk matches. One unused MFMA
+            # occupies the bad slot. Decode never reads this scratch; the
+            # store only keeps the call from being deleted.
+            # test_paged_gqa_d128_decode_matches_oracle fails if it is
+            # removed while this compiler stands. The scratch is the extra
+            # v_mfma_f32_16x16x16_bf16 in that kernel's ISA.
             if const_expr(decode_tr_pv and head_dim == 128):
                 junk = pv_mfma(
                     fx.Vector.filled(4, 0.0, BFloat16),
@@ -1396,7 +1383,9 @@ def build_qsa_sparse_gqa_module(
 
         den = zero_f
         for j in range_constexpr(merge_per_lane):
-            w = (lses[j] > Float32(_LSE_EMPTY)).select(_exp2(lses[j] - lse_max), zero_f)
+            w = (lses[j] > Float32(_LSE_EMPTY)).select(
+                fxmath.exp2(lses[j] - lse_max), zero_f
+            )
             weights[lane + Int32(j * 64)] = w
             den = den + w
         for sh in (32, 16, 8, 4, 2, 1):

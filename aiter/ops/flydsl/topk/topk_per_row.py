@@ -361,9 +361,10 @@ def flydsl_top_k_per_row_decode(
     ``arch`` is the GPU this kernel is built for. Callers that already know it
     pass it: the QSA wheel build has no device to probe. Omitted, it is the
     live GPU.
-    ``finite_only`` never selects a ``-inf`` column: a row with fewer than k
-    finite values returns those in column order, then -1. Only the
-    one-workgroup kernel (``plane_width`` up to 20000) has it.
+    ``finite_only`` never selects a nonfinite column (NaN, +inf, or -inf):
+    a row with fewer than k finite values returns those in column order,
+    then -1. Only the one-workgroup kernel (``plane_width`` up to 20000)
+    has it.
     Before CUDAGraph capture, warm the split path on the capture stream so its
     stream-local arrival counter is allocated and initialized.
     """
