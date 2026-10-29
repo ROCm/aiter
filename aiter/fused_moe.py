@@ -420,27 +420,50 @@ def _address_span(tensor):
     nbytes counts logical elements only, so a strided view such as pool[::2]
     would under-report its reach; kernels that honor the strides read up to
     the last element's address. The interval is conservative: it also covers
-    the gaps between strided elements.
+    the gaps between strided elements. torch rejects negative strides, so no
+    element sits below data_ptr().
     """
     start = tensor.data_ptr()
-    # Fast path: a contiguous tensor spans exactly nbytes. Most inputs are
-    # contiguous, and this keeps the per-call check cheap in eager mode.
     if tensor.is_contiguous():
         return (start, start + tensor.nbytes) if tensor.nbytes else None
     if tensor.numel() == 0:
         return None
-    low = high = 0
-    for size, stride in zip(tensor.shape, tensor.stride()):
-        if stride < 0:
-            low += (size - 1) * stride
-        else:
-            high += (size - 1) * stride
-    itemsize = tensor.element_size()
-    return start + low * itemsize, start + (high + 1) * itemsize
+    reach = sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return start, start + (reach + 1) * tensor.element_size()
 
 
-def _validate_output_buffer_no_overlap(output, **inputs):
+def _validate_output_buffer_no_overlap(output, inputs, extra_args=()):
+    """Raise if output shares a byte with any tensor the MoE stages read.
+
+    inputs maps names to tensors or None. The tensor values of the extra_args
+    dicts count too: FHMoE passes its shared-expert weights and scales there.
+    output must be contiguous, as _validate_output_buffer_metadata enforces.
+    """
     if output is None:
+        return
+    for extra in extra_args:
+        if extra:
+            inputs = {
+                **inputs,
+                **{n: v for n, v in extra.items() if isinstance(v, torch.Tensor)},
+            }
+    # Every eager fused_moe(output=) call pays for this, so screen each input
+    # with the cheapest test first. An input starting at or past output's end
+    # cannot reach it (see _address_span), nor can a contiguous one ending at or
+    # before output's start. Strided inputs and possible hits take the exact
+    # check below.
+    start = output.data_ptr()
+    end = start + output.nbytes
+    for tensor in inputs.values():
+        if tensor is not None:
+            ptr = tensor.data_ptr()
+            if ptr < end and (
+                ptr + tensor.nbytes > start or not tensor.is_contiguous()
+            ):
+                break
+    else:
         return
     output_span = _address_span(output)
     if output_span is None:
@@ -448,12 +471,8 @@ def _validate_output_buffer_no_overlap(output, **inputs):
     # Accumulate mode zeroes the output rows at sort time, before the stages read
     # any input, and atomic GEMM2 then writes into them while still reading.
     for name, tensor in inputs.items():
-        if tensor is None:
-            continue
-        span = _address_span(tensor)
-        if span is None:
-            continue
-        if output_span[0] < span[1] and span[0] < output_span[1]:
+        span = None if tensor is None else _address_span(tensor)
+        if span is not None and output_span[0] < span[1] and span[0] < output_span[1]:
             raise RuntimeError(
                 f"output overlaps {name}, which moe_sorting zeroes before the MoE "
                 "stages read it"
@@ -1597,31 +1616,27 @@ def _fused_moe_impl(
     _validate_output_buffer_metadata(
         output, (M, model_dim), dtype, hidden_states.device
     )
-    # Skip building the kwargs (and the extras dict) when there is no output.
+    # Skip building the inputs dict when there is no output.
     if output is not None:
         _validate_output_buffer_no_overlap(
             output,
-            hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
-            topk_weight=topk_weight,
-            topk_ids=topk_ids,
-            expert_mask=expert_mask,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            num_local_tokens=num_local_tokens,
-            bias1=bias1,
-            bias2=bias2,
-            # FHMoE passes its shared-expert weights and scales through here.
-            **{
-                name: value
-                for extra in (_stage1_extra_args, _stage2_extra_args)
-                if extra
-                for name, value in extra.items()
-                if isinstance(value, torch.Tensor)
+            {
+                "hidden_states": hidden_states,
+                "w1": w1,
+                "w2": w2,
+                "topk_weight": topk_weight,
+                "topk_ids": topk_ids,
+                "expert_mask": expert_mask,
+                "w1_scale": w1_scale,
+                "w2_scale": w2_scale,
+                "a1_scale": a1_scale,
+                "a2_scale": a2_scale,
+                "num_local_tokens": num_local_tokens,
+                "bias1": bias1,
+                "bias2": bias2,
             },
+            # FHMoE passes its shared-expert weights and scales through these.
+            (_stage1_extra_args, _stage2_extra_args),
         )
     if herd_topk:
         from aiter.ops.flydsl.herd_topk import (

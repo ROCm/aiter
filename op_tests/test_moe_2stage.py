@@ -1686,6 +1686,7 @@ def test_output_buffer_contract():
     pool[:token] = hidden
     assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
 
+    check_overlap = aiter.fused_moe._validate_output_buffer_no_overlap
     # A strided scale view reaches past its logical nbytes: scale_pool[::2] holds
     # 8 rows (16 KiB) yet its expert 7 row starts at byte 28672, and the kernels
     # honor stride(0). An output over that row must be rejected.
@@ -1694,16 +1695,41 @@ def test_output_buffer_contract():
     row = scale_pool[14].view(dtype)[:model_dim].view(1, model_dim)
     assert row.data_ptr() >= strided_scale.data_ptr() + strided_scale.nbytes
     try:
-        aiter.fused_moe._validate_output_buffer_no_overlap(row, w1_scale=strided_scale)
+        check_overlap(row, {"w1_scale": strided_scale})
     except RuntimeError:
         pass
     else:
         raise AssertionError("output overlapping a strided w1_scale view was accepted")
     # Memory past the view's last element stays legal.
-    aiter.fused_moe._validate_output_buffer_no_overlap(
+    check_overlap(
         scale_pool[15].view(dtype)[:model_dim].view(1, model_dim),
-        w1_scale=strided_scale,
+        {"w1_scale": strided_scale},
     )
+
+    # The check clears most inputs from data_ptr/nbytes alone before the exact
+    # span test; probe each edge of that screen around one output row.
+    flat = torch.zeros(4 * model_dim, dtype=dtype)
+    out_row = flat[model_dim : 2 * model_dim].view(1, model_dim)
+    for described, tensor, overlaps in (
+        ("an input covering output from below", flat[: 3 * model_dim], True),
+        ("an input starting inside output", flat[2 * model_dim - 1 :], True),
+        ("an input ending where output starts", flat[:model_dim], False),
+        ("an input starting where output ends", flat[2 * model_dim :], False),
+        ("an empty input inside output", flat[model_dim + 1 : model_dim + 1], False),
+    ):
+        try:
+            check_overlap(out_row, {"x": tensor})
+        except RuntimeError:
+            assert overlaps, f"{described} was rejected"
+        else:
+            assert not overlaps, f"{described} was accepted"
+    # Tensors in the stage extra-arg dicts (FHMoE shared weights) count as inputs.
+    try:
+        check_overlap(out_row, {}, ({"shared_expert_id": 0, "shared_w1": flat}, None))
+    except RuntimeError as e:
+        assert "shared_w1" in str(e), e
+    else:
+        raise AssertionError("output overlapping an extra-arg tensor was accepted")
 
     stage2_scatter = Stage2ScatterContext(
         arena_handle=0,
