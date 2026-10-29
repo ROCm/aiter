@@ -157,28 +157,6 @@ _IS_GFX950 = _GFX_ARCH.startswith("gfx950")
 
 _GDN_K5_TARGET_SEGMENTS = 8
 
-# Blocked-path scratch (maps, carry entries) is never returned to the caller, so it
-# is reused across calls. Reuse is only stream-ordered on the stream that allocated it.
-_BLOCKED_SCRATCH_MAX = 16
-_BLOCKED_SCRATCH = OrderedDict()
-
-
-def _blocked_scratch(device, blocks, H, packed_v, K, stream):
-    key = (device, blocks, H, packed_v, K)
-    cached = _BLOCKED_SCRATCH.get(key)
-    if cached is not None and cached[0] == stream:
-        _BLOCKED_SCRATCH.move_to_end(key)
-        return cached[1], cached[2]
-    maps = torch.empty((blocks, H, packed_v, K), device=device, dtype=torch.float32)
-    entry = torch.empty(
-        (blocks, H, K, packed_v - K), device=device, dtype=torch.float32
-    )
-    _BLOCKED_SCRATCH[key] = (stream, maps, entry)
-    _BLOCKED_SCRATCH.move_to_end(key)
-    if len(_BLOCKED_SCRATCH) > _BLOCKED_SCRATCH_MAX:
-        _BLOCKED_SCRATCH.popitem(last=False)
-    return maps, entry
-
 
 def _flydsl_run_only() -> bool:
     return flydsl_runtime_env.run_only
@@ -1322,7 +1300,10 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
     bv = 64
     H, V = u.shape[1], u.shape[-1]
     stream = torch.cuda.current_stream(k.device)
-    maps_buf, entry_buf = _blocked_scratch(k.device, blocks, H, K + V, K, stream)
+    # Per-call allocation: the caching allocator reuses it safely in stream order and
+    # framework memory profiling sees it.
+    maps_buf = torch.empty((blocks, H, K + V, K), device=k.device, dtype=torch.float32)
+    entry_buf = torch.empty((blocks, H, K, V), device=k.device, dtype=torch.float32)
     g32 = _as_fp32_contig(g) if g is not None else None
     maps = _build_chunk_gdn_block_maps(
         k,
