@@ -163,7 +163,7 @@ def compile_mega_moe_prepare(
                             quant_in, quant_out, quant_scale, group_id
                         )
 
-        if const_expr(defer_fanout_to_quant):
+        if const_expr(defer_fanout_to_quant):  # noqa: SIM102 - preserve DSL staging
             if quant_producer & (quant_slot == fx.Int32(0)):
                 if tid == fx.Int32(0):
                     comm_ops.wait_i32_until_equals(epoch_gate, gate_epoch)
