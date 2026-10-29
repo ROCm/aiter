@@ -1,0 +1,3 @@
+gfx,cu_num,token,hidden_dim,inter_dim,logical_inter,experts,topk,swiglu_limit,act,activation_bf16,w_dtype,w_layout,block_m,stage1_n,stage1_k,stage2_n,stage2_k,reuse_lds
+gfx942,304,8,5120,384,288,384,6,10.0,silu_clamped,1,fp4,standard,16,64,128,256,128,1
+gfx942,304,32,5120,384,288,384,6,10.0,silu_clamped,1,fp4,standard,16,128,128,256,128,1

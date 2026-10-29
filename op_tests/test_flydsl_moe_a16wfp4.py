@@ -27,7 +27,7 @@ import itertools
 import pandas as pd
 import pytest
 import torch
-import torch.nn.functional as functional
+from torch.nn import functional
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
@@ -42,7 +42,9 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
     flydsl_a16w4_gemm1,
     flydsl_a16w4_gemm2,
+    flydsl_a16w4_moe,
 )
+from aiter.ops.flydsl.moe_a16w4_policy import A16W4Tiles, get_a16w4_tuned_tiles
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -54,10 +56,323 @@ _SKIP = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("activation_bf16", [False, True])
+def test_compile_stage1_forwards_activation_bf16(monkeypatch, activation_bf16):
+    from flydsl.runtime import device
+
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import gemm1
+
+    monkeypatch.setattr(device, "get_rocm_arch", lambda: "gfx942")
+    monkeypatch.setattr(gemm1, "compile_gemm1_a16w4_port", lambda **kwargs: kwargs)
+    options = {"activation_bf16": True} if activation_bf16 else {}
+    compiled = moe_kernels.compile_flydsl_moe_stage1(
+        model_dim=5120,
+        inter_dim=384,
+        experts=384,
+        topk=6,
+        tile_m=32,
+        tile_n=128,
+        tile_k=256,
+        doweight_stage1=False,
+        a_dtype="bf16",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        act="silu_clamped",
+        **options,
+    )
+    assert compiled["activation_bf16"] is activation_bf16
+    assert compiled["act"] == "silu_clamped"
+
+
+@pytest.mark.parametrize(
+    "a_dtype,b_dtype,act,activation_bf16,message",
+    [
+        ("bf16", "fp4", "silu", True, "activation_bf16 requires silu_clamped"),
+        ("fp8", "fp4", "silu_clamped", False, "silu_clamped requires bf16 A"),
+        ("bf16", "fp8", "silu_clamped", True, "silu_clamped requires bf16 A"),
+    ],
+)
+def test_compile_stage1_rejects_unsupported_rounding(
+    a_dtype, b_dtype, act, activation_bf16, message
+):
+    from aiter.ops.flydsl.moe_kernels import compile_flydsl_moe_stage1
+
+    with pytest.raises(ValueError, match=message):
+        compile_flydsl_moe_stage1(
+            model_dim=5120,
+            inter_dim=384,
+            experts=384,
+            topk=6,
+            tile_m=32,
+            tile_n=128,
+            tile_k=256,
+            doweight_stage1=False,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype="bf16",
+            act=act,
+            activation_bf16=activation_bf16,
+        )
+
+
+@pytest.mark.parametrize(
+    "act,activation_bf16,limit",
+    [
+        ("silu", False, None),
+        ("silu_clamped", False, 10.0),
+        ("silu_clamped", True, 10.0),
+    ],
+)
+def test_runtime_stage1_forwards_activation_bf16(
+    monkeypatch, act, activation_bf16, limit
+):
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.kernels import moe_2stage_a16wmix
+
+    captured = {}
+
+    def capture_launch(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(moe_2stage_a16wmix, "flydsl_a16w4_gemm1", capture_launch)
+    options = {"activation_bf16": True} if activation_bf16 else {}
+    output = moe_kernels.flydsl_moe_stage1(
+        a=torch.empty((1, 5120), dtype=torch.bfloat16, device="cpu"),
+        w1=torch.empty((2, 768, 2560), dtype=torch.uint8, device="cpu"),
+        sorted_token_ids=torch.zeros(32, dtype=torch.int32, device="cpu"),
+        sorted_expert_ids=torch.zeros(1, dtype=torch.int32, device="cpu"),
+        num_valid_ids=torch.ones(1, dtype=torch.int32, device="cpu"),
+        tile_m=32,
+        tile_n=128,
+        tile_k=256,
+        a_dtype="bf16",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        act=act,
+        swiglu_limit=limit,
+        **options,
+    )
+    assert captured["activation_bf16"] is activation_bf16
+    assert captured["act"] == act
+    assert captured["swiglu_limit"] == (float("inf") if limit is None else limit)
+    assert output is captured["inter_sorted_bf16"]
+    assert output.shape == (32, 384)
+
+
+@pytest.mark.parametrize("limit", [None, 0.0, -1.0, float("nan")])
+def test_runtime_stage1_rejects_invalid_clamp(limit):
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+    with pytest.raises(ValueError, match="silu_clamped requires swiglu_limit > 0"):
+        flydsl_moe_stage1(
+            None,
+            None,
+            None,
+            None,
+            None,
+            a_dtype="bf16",
+            b_dtype="fp4",
+            act="silu_clamped",
+            activation_bf16=True,
+            swiglu_limit=limit,
+        )
+
+
+def test_a16w4_policy_csv_validation(tmp_path):
+    from aiter.ops.flydsl import moe_a16w4_policy as policy
+
+    path = tmp_path / "tiles.csv"
+    assert policy._load_tuned_tiles(path) == {}
+    source = (
+        policy.Path(policy.__file__).resolve().parents[2]
+        / "configs"
+        / "tuned_flydsl_moe_a16w4.csv"
+    ).read_text(encoding="utf-8")
+    path.write_text(source, encoding="utf-8")
+    assert policy._load_tuned_tiles(path) == policy._TUNED_TILES
+    path.write_text(
+        source.rstrip("\r\n") + "\n" + source.splitlines()[1] + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Duplicate"):
+        policy._load_tuned_tiles(path)
+    path.write_text(source.replace("silu_clamped", "silu"), encoding="utf-8")
+    with pytest.raises(ValueError, match="semantics"):
+        policy._load_tuned_tiles(path)
+
+
+def test_a16w4_policy_decode_entry_and_boundaries(monkeypatch):
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import moe_a16w4_policy as policy
+
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 304)
+    for token_num in (7, 8, 9, 31, 32, 33, 1024, 4096):
+        selected = policy.get_a16w4_tuned_tiles(
+            token_num,
+            5120,
+            384,
+            288,
+            384,
+            6,
+            act="silu_clamped",
+            activation_bf16=True,
+            swiglu_limit=10.0,
+        )
+        expected = None
+        if token_num == 8:
+            expected = policy.A16W4Tiles(16, 64, 128, 256, 128, True)
+        elif token_num == 32:
+            expected = policy.A16W4Tiles(16, 128, 128, 256, 128, True)
+        assert selected == expected
+
+
+def test_a16w4_policy_preserves_unvalidated_fallback(monkeypatch):
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import moe_a16w4_policy as policy
+
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 304)
+    monkeypatch.setattr(policy, "_TUNED_TILES", {})
+    assert (
+        policy.get_a16w4_tuned_tiles(
+            8,
+            5120,
+            384,
+            288,
+            384,
+            6,
+            act="silu_clamped",
+            activation_bf16=True,
+            swiglu_limit=10.0,
+        )
+        is None
+    )
+
+
+def test_a16w4_policy_matches_full_shape_and_semantics(monkeypatch):
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import moe_a16w4_policy as policy
+
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 304)
+    tiles = policy.A16W4Tiles(16, 64, 128, 256, 128)
+    monkeypatch.setattr(
+        policy,
+        "_TUNED_TILES",
+        {("gfx942", 304, 8, 5120, 384, 288, 384, 6, 10.0): tiles},
+    )
+    arguments = {
+        "token_num": 8,
+        "model_dim": 5120,
+        "inter_dim": 384,
+        "logical_inter_dim": 288,
+        "experts": 384,
+        "topk": 6,
+        "act": "silu_clamped",
+        "activation_bf16": True,
+        "swiglu_limit": 10.0,
+    }
+    assert policy.get_a16w4_tuned_tiles(**arguments) == tiles
+    for changes in (
+        {"token_num": 7},
+        {"token_num": 9},
+        {"model_dim": 4096},
+        {"inter_dim": 512},
+        {"logical_inter_dim": 384},
+        {"experts": 128},
+        {"topk": 8},
+        {"swiglu_limit": 7.0},
+        {"activation_bf16": False},
+        {"act": "silu"},
+        {"w_dtype": "int4"},
+        {"w_layout": "guinterleave"},
+    ):
+        assert policy.get_a16w4_tuned_tiles(**(arguments | changes)) is None
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    assert policy.get_a16w4_tuned_tiles(**arguments) is None
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 80)
+    assert policy.get_a16w4_tuned_tiles(**arguments) is None
+
+
+@pytest.mark.parametrize(
+    "block_m,tile_n,required", [(128, 256, 131072), (256, 128, 131072)]
+)
+def test_stage2_rejects_oversized_lds(block_m, tile_n, required):
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import compile_gemm2_a16w4_port
+
+    with pytest.raises(NotImplementedError, match=f"requires {required} LDS bytes"):
+        compile_gemm2_a16w4_port(
+            BM=block_m,
+            NE=384,
+            N_OUT=5120,
+            D_INTER=384,
+            TILE_N=tile_n,
+            TILE_K=128,
+            rocm_arch="gfx942",
+            reuse_lds=True,
+        )
+
+
+def test_stage2_lds_variants_have_distinct_cache_keys():
+    from flydsl.compiler.jit_function import _jit_function_cache_key
+
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import compile_gemm2_a16w4_port
+
+    keys = []
+    for reuse in (False, True):
+        launcher = compile_gemm2_a16w4_port(
+            BM=32,
+            NE=384,
+            N_OUT=5120,
+            D_INTER=384,
+            TILE_N=256,
+            TILE_K=128,
+            rocm_arch="gfx942",
+            reuse_lds=reuse,
+        )
+        keys.append(_jit_function_cache_key(launcher.func))
+    assert keys[0] != keys[1]
+
+
 def _cos_diff(x, y):
     x, y = x.double(), y.double()
     denom = (x * x + y * y).sum()
     return float(1 - 2 * (x * y).sum() / denom)
+
+
+def _quantize_mxfp4_by_expert(weight):
+    experts, rows, columns = weight.shape
+    packed = torch.empty(
+        (experts, rows, columns // 2), dtype=torch.uint8, device=weight.device
+    )
+    scales = torch.empty(
+        (experts, rows, columns // 32), dtype=torch.uint8, device=weight.device
+    )
+    quantize = aiter.get_torch_quant(QuantType.per_1x32)
+    for expert in range(experts):
+        expert_packed, expert_scales = quantize(
+            weight[expert], quant_dtype=dtypes.fp4x2
+        )
+        packed[expert].copy_(expert_packed.view(torch.uint8).reshape(rows, -1))
+        scales[expert].copy_(expert_scales.view(torch.uint8).reshape(rows, -1))
+    return packed.view(dtypes.fp4x2), scales.flatten(0, 1).view(dtypes.fp8_e8m0)
+
+
+@_SKIP
+def test_mxfp4_reference_chunking_is_exact():
+    torch.manual_seed(31)
+    weight = torch.randn((4, 256, 384), dtype=torch.bfloat16, device="cuda")
+    expected, expected_scales = aiter.get_torch_quant(QuantType.per_1x32)(
+        weight, quant_dtype=dtypes.fp4x2
+    )
+    actual, actual_scales = _quantize_mxfp4_by_expert(weight)
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(
+        actual_scales.view(torch.uint8), expected_scales.view(torch.uint8)
+    )
 
 
 @_SKIP
@@ -82,9 +397,9 @@ def test_flydsl_a16wfp4_situv2_e2e(
     score = torch.randn((token, E), dtype=dtype, device="cuda")
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
 
-    tq = aiter.get_torch_quant(QuantType.per_1x32)
-    w1_qt, w1_scale = tq(w1, quant_dtype=dtypes.fp4x2)
-    w2_qt, w2_scale = tq(w2, quant_dtype=dtypes.fp4x2)
+    w1_qt, w1_scale = _quantize_mxfp4_by_expert(w1)
+    w2_qt, w2_scale = _quantize_mxfp4_by_expert(w2)
+    del w1, w2
     w1_qt = w1_qt.view(E, inter_dim * 2, model_dim // 2)
     w2_qt = w2_qt.view(E, model_dim, inter_dim // 2)
     w1_scale_e = w1_scale.view(E, inter_dim * 2, model_dim // 32)
@@ -350,19 +665,17 @@ def test_stage1_clamped_silu(token, activation_bf16):
 
 def _pack_mxfp4_reference(weight):
     experts, rows, columns = weight.shape
-    packed, scales = aiter.get_torch_quant(QuantType.per_1x32)(
-        weight, quant_dtype=dtypes.fp4x2
-    )
+    packed, scales = _quantize_mxfp4_by_expert(weight)
     packed = packed.view(experts, rows, columns // 2)
     scales = scales.view(experts, rows, columns // 32)
-    dequantized = (
-        (
-            mxfp4_to_f32(packed).view(experts, rows, -1, 32)
-            * e8m0_to_f32(scales).unsqueeze(-1)
+    dequantized = torch.empty_like(weight, dtype=torch.bfloat16)
+    for expert in range(experts):
+        dequantized[expert].copy_(
+            (
+                mxfp4_to_f32(packed[expert]).view(rows, -1, 32)
+                * e8m0_to_f32(scales[expert]).unsqueeze(-1)
+            ).reshape(rows, columns)
         )
-        .reshape_as(weight)
-        .to(torch.bfloat16)
-    )
     return (
         shuffle_weight_a16w4(packed, 16, False),
         shuffle_scale_a16w4(scales.flatten(0, 1), experts, False),
@@ -398,6 +711,7 @@ def benchmark_moe_clamped_silu(
     tile_m=32,
     tile_n=128,
     tile_k=256,
+    reuse_lds=False,
 ):
     """Full routed TP-local MoE, including sorting, both GEMMs and output zeroing.
 
@@ -485,9 +799,68 @@ def benchmark_moe_clamped_silu(
             tile_m=tile_m,
             tile_n=256,
             tile_k=128,
+            reuse_lds=reuse_lds,
         )
 
-    candidates = {"flydsl_moe": run_flydsl}
+    candidates = {
+        "flydsl_moe": run_flydsl,
+        "flydsl_dispatch": functools.partial(
+            flydsl_a16w4_moe,
+            hidden_states=hidden,
+            w1=packed1.view(torch.uint8),
+            w2=packed2.view(torch.uint8),
+            w1_scale=scales1.view(torch.uint8),
+            w2_scale=scales2.view(torch.uint8),
+            topk_ids=routing_ids,
+            topk_weights=routing_weights,
+            swiglu_limit=10.0,
+            logical_inter_dim=logical_inter or inter_dim,
+            activation_bf16=activation_bf16,
+            out=output,
+            intermediate=intermediate,
+            tiles=A16W4Tiles(tile_m, tile_n, tile_k, 256, 128, reuse_lds),
+        ),
+    }
+    automatic_tiles = get_a16w4_tuned_tiles(
+        token,
+        model_dim,
+        inter_dim,
+        logical_inter or inter_dim,
+        experts,
+        topk,
+        act="silu_clamped",
+        activation_bf16=activation_bf16,
+        swiglu_limit=10.0,
+    ) or A16W4Tiles(32, 128, 256, 256, 128)
+    automatic_rows = (
+        moe_sorting(
+            routing_ids,
+            routing_weights,
+            experts,
+            model_dim,
+            dtype,
+            automatic_tiles.block_m,
+        )[2].numel()
+        * automatic_tiles.block_m
+    )
+    automatic_intermediate = torch.empty(
+        (automatic_rows, inter_dim), dtype=dtype, device=hidden.device
+    )
+    candidates["flydsl_csv"] = functools.partial(
+        flydsl_a16w4_moe,
+        hidden_states=hidden,
+        w1=packed1.view(torch.uint8),
+        w2=packed2.view(torch.uint8),
+        w1_scale=scales1.view(torch.uint8),
+        w2_scale=scales2.view(torch.uint8),
+        topk_ids=routing_ids,
+        topk_weights=routing_weights,
+        swiglu_limit=10.0,
+        logical_inter_dim=logical_inter or inter_dim,
+        activation_bf16=activation_bf16,
+        out=output,
+        intermediate=automatic_intermediate,
+    )
     result = {"gfx": get_gfx()}
     flops = 6 * token * topk * model_dim * inter_dim
     active_experts = routing_ids.unique().numel()
@@ -526,8 +899,20 @@ def benchmark_moe_clamped_silu(
 
 @_SKIP
 @pytest.mark.parametrize("token", [1, 8, 33])
-def test_moe_clamped_silu(token):
-    result = benchmark_moe_clamped_silu(token, 256, 384, 8, 6, True, logical_inter=288)
+@pytest.mark.parametrize("tile_m,reuse_lds", [(32, False), (32, True), (64, True)])
+def test_moe_clamped_silu(token, tile_m, reuse_lds):
+    result = benchmark_moe_clamped_silu(
+        token,
+        256,
+        384,
+        8,
+        6,
+        True,
+        logical_inter=288,
+        tile_m=tile_m,
+        tile_k=128,
+        reuse_lds=reuse_lds,
+    )
     aiter.logger.info(
         "Clamped SiLU full MoE summary (markdown):\n%s",
         pd.DataFrame([result]).to_markdown(index=False),

@@ -459,6 +459,7 @@ def compile_gemm2_a16w4_port(
     rocm_arch,
     epilog="atomic",
     topk=1,
+    reuse_lds=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
@@ -504,11 +505,24 @@ def compile_gemm2_a16w4_port(
     _a_bytes = BM * KH_TILE_BYTES
     if _use_reduce:
         _lds_bytes = max(_a_bytes, BM * TILE_N * 2)
+    elif reuse_lds:
+        _lds_bytes = max(_a_bytes, BM * TILE_N * 4)
     else:
         _lds_bytes = _a_bytes + BM * TILE_N * 4
 
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+    lds_capacity = get_lds_capacity_bytes(str(rocm_arch))
+    if _lds_bytes > lds_capacity:
+        raise NotImplementedError(
+            f"a16w4 gemm2 requires {_lds_bytes} LDS bytes, "
+            f"exceeding {rocm_arch} capacity {lds_capacity}"
+        )
+
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
+    if reuse_lds and not _use_reduce:
+        _name += "_ldsreuse"
     if b_cache_mod != 2:
         _name += f"_bcm{b_cache_mod}"
     if xcd_swizzle > 0:
@@ -519,10 +533,6 @@ def compile_gemm2_a16w4_port(
         _name += "_persist"
     if _use_reduce:
         _name += f"_reduce_tk{_topk}"
-
-    @fx.struct
-    class SharedStorage:
-        raw: fx.Array[fx.Uint8, _lds_bytes, 16]
 
     @flyc.kernel(name=_name, known_block_size=[256, 1, 1])
     def gemm2_kernel(
@@ -537,7 +547,9 @@ def compile_gemm2_a16w4_port(
         i32_max_m_blocks: fx.Int32,
         arg_out: fx.Int64,
     ):
-        lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
+        lds_raw_ptr = (
+            fx.SharedAllocator().allocate(fx.Array[fx.Uint8, _lds_bytes, 16]).peek().ptr
+        )
         tx_i32 = fx.Int32(gpu.thread_id("x"))
         bx_i32 = fx.Int32(gpu.block_id("x"))
         lane = tx_i32 % fx.Int32(64)
