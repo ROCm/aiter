@@ -3050,9 +3050,11 @@ class FmoeTuner(TunerCommon):
                             topk,
                             dtype,
                         ),
-                        {"flat": asm_mode}
-                        if asm_mode is AsmMoeMode.POST_REDUCE
-                        else {},
+                        (
+                            {"flat": asm_mode}
+                            if asm_mode is AsmMoeMode.POST_REDUCE
+                            else {}
+                        ),
                         (
                             FmoeTuner.torch_moe_blockscale
                             if q_type == QuantType.per_1x128
@@ -3082,9 +3084,11 @@ class FmoeTuner(TunerCommon):
                                     "w2_qt",
                                     "topk_weights",
                                     "topk_ids",
-                                    "a1_scale_t"
-                                    if asm_mode is AsmMoeMode.POST_REDUCE
-                                    else "a1_scale",
+                                    (
+                                        "a1_scale_t"
+                                        if asm_mode is AsmMoeMode.POST_REDUCE
+                                        else "a1_scale"
+                                    ),
                                     "w1_scale",
                                     "w2_scale",
                                 ],
