@@ -452,6 +452,79 @@ def _gemm_a16w16(
     return result
 
 
+# AITER_GEMM_FAST_LAUNCH=1: eager host fast path for `tgemm.mm`.
+#
+# The default path goes through the `aiter::gemm_a16w16` custom op (a Python
+# impl behind the torch dispatcher), reads AITER_TUNE_GEMM from the
+# environment per call, rebuilds the string-keyed lru_cache key, and so on.
+# Outside torch.compile tracing the op adds nothing, so the fast path calls
+# the same implementation directly and memoises the backend choice per shape
+# key; the backend and its config are exactly what `get_GEMM_A16W16_config`
+# returns.  The Triton backend then takes its own fast path (see
+# aiter/ops/triton/gemm/basic/gemm_a16w16.py).
+_FAST_LAUNCH = os.environ.get("AITER_GEMM_FAST_LAUNCH", "0") == "1"
+_SAVE_GEMM = int(os.environ.get("AITER_TUNE_GEMM", "0"))
+_fast_solutions: dict = {}
+
+
+def _gemm_a16w16_fast(
+    A: Tensor,
+    B: Tensor,
+    bias: Tensor | None,
+    otype: torch.dtype | None,
+    scale_a: Tensor | None,
+    scale_b: Tensor | None,
+    scale_c: Tensor | None,
+    out: Tensor | None,
+) -> Tensor:
+    """`_gemm_a16w16` for 2-D inputs, with the backend choice memoised."""
+    if A.dim() != 2 or _SAVE_GEMM:
+        return _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
+    bpreshuffle = getattr(B, "is_shuffled", None) is True
+    m, k = A.shape
+    n = B.shape[0]
+    otype = otype if otype is not None else A.dtype
+    if out is not None and out.dtype != otype:
+        raise ValueError(f"gemm_a16w16: out is {out.dtype} but otype is {otype}")
+    scaled = scale_a is not None or scale_b is not None
+    key = (m, n, k, bias is not None, A.dtype, otype, scaled, bpreshuffle)
+    sol = _fast_solutions.get(key)
+    if sol is None:
+        config = get_GEMM_A16W16_config(
+            M=m,
+            N=n,
+            K=k,
+            bias=bias is not None,
+            dtype=str(A.dtype),
+            otype=str(otype),
+            scaleAB=scaled,
+            bpreshuffle=bpreshuffle,
+        )
+        sol = (solMap[config["libtype"]], config["solidx"], config)
+        _fast_solutions[key] = sol
+    solfunc, solution_idx, config = sol
+    out_2d = None if out is None else out.view(-1, n)
+    result = solfunc(
+        A,
+        B,
+        solution_idx,
+        bias,
+        otype,
+        scale_a,
+        scale_b,
+        scale_c,
+        bpreshuffle,
+        config=config,
+        out=out_2d,
+    )
+    assert (
+        out_2d is None or result.data_ptr() == out_2d.data_ptr()
+    ), f"the {config['libtype']} gemm did not write into out="
+    if result.dtype != otype:
+        result = result.to(otype)
+    return result
+
+
 def _result_buffer(
     out: Tensor | None, m: int, n: int, dtype: torch.dtype, device: torch.device
 ) -> Tensor:
@@ -796,6 +869,11 @@ class TunedGemm:
         out: Tensor | None = None,
     ):
         """``out``: write the result there (`gemm_a16w16_out`) and return it."""
+        if _FAST_LAUNCH and not torch.compiler.is_compiling():
+            result = _gemm_a16w16_fast(
+                inp, weights, bias, otype, scale_a, scale_b, scale_c, out
+            )
+            return result if out is None else out
         if out is None:
             return gemm_a16w16(
                 inp,

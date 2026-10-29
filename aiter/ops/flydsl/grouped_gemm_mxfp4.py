@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
 
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from .kernels.tensor_shim import ptr_arg
+from .kernels.tensor_shim import fast_jit, ptr_arg
 
 _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
@@ -97,6 +98,13 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
     return num_waves
 
 
+@functools.cache
+def _launch_gemm_a8w4_tdm():
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+
+    return fast_jit(launch_gemm_a8w4_tdm)
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -147,7 +155,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     A positive persistent_workers bounds the grid independently of the routing
     buffer capacity. Workers traverse the live device-side tile range.
     """
-    from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+    launch_gemm_a8w4_tdm = _launch_gemm_a8w4_tdm()
 
     if stream is None:
         stream = torch.cuda.current_stream()

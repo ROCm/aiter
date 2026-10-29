@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+import inspect
 import os
 import threading
 from abc import ABC, abstractmethod
@@ -13,6 +15,8 @@ import numpy as np
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
+from flydsl.compiler.jit_argument import PointerJitArg as _PointerJitArg
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
@@ -349,6 +353,163 @@ def _preload_compiled(exe, *args):
                 os.environ.pop("COMPILE_ONLY", None)
             else:
                 os.environ["COMPILE_ONLY"] = old_compile_only
+
+
+# --- Host fast path for @flyc.jit launchers -------------------------------------
+#
+# ``JitFunction.__call__`` rebuilds its full cache key on every launch: an
+# ``inspect`` bind with defaults, a globals-drift check, a re-read of the
+# cache-invalidating environment and one JitArgument wrapper (and signature) per
+# runtime argument. For the 40-60 argument MoE launchers that is tens of
+# microseconds of host time per kernel, paid on every eager prefill layer.
+#
+# ``FastJitLauncher`` keeps a per-launcher map from a cheap specialization key to
+# the pre-built ``CallState`` FlyDSL made for that key, and dispatches straight
+# through it, which is all JitFunction's own cache hit does once its key is built.
+# The key holds exactly what FlyDSL's key varies on at a call site: every
+# Constexpr / Type[...] value (type-tagged), and per runtime argument its type,
+# plus for a torch tensor (dtype, ndim, unit-stride axis) and for a pointer its
+# cache signature. The first launch of each key goes through FlyDSL's normal
+# path (compile or cache hit, full checks, one execution), so the compiled
+# artifact and the kernel arguments are the ones the slow path would use.
+# Not honoured after the first launch of a key: later changes to FLYDSL_* cache
+# environment variables or to the launcher's static compile_hints; a
+# thread-local compile-hints overlay or COMPILE_ONLY falls back to the slow path.
+# AITER_FLYDSL_FAST_LAUNCH=1 enables it.
+AITER_FLYDSL_FAST_LAUNCH = os.environ.get("AITER_FLYDSL_FAST_LAUNCH", "0") == "1"
+
+
+class FastJitLauncher:
+    """Callable stand-in for a ``@flyc.jit`` launcher with a cheap cache hit."""
+
+    __slots__ = (
+        "_const_idx",
+        "_defaults",
+        "_index",
+        "_names",
+        "_runtime_idx",
+        "_states",
+        "jit_function",
+    )
+
+    def __init__(self, jit_function):
+        from flydsl.compiler.jit_argument import is_type_param_annotation
+        from flydsl.expr.typing import Constexpr
+
+        self.jit_function = jit_function
+        jit_function._ensure_sig()
+        if jit_function._has_self_param:
+            raise TypeError("FastJitLauncher does not wrap bound-method launchers")
+        params = list(jit_function._sig.parameters.values())
+        self._names = tuple(p.name for p in params)
+        self._index = {p.name: i for i, p in enumerate(params)}
+        self._defaults = tuple(p.default for p in params)
+        const_idx, runtime_idx = [], []
+        for i, p in enumerate(params):
+            ann = p.annotation
+            if p.kind not in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+                raise TypeError(f"FastJitLauncher: unsupported parameter {p}")
+            const = ann is not p.empty and (
+                Constexpr.is_constexpr_annotation(ann) or is_type_param_annotation(ann)
+            )
+            (const_idx if const else runtime_idx).append(i)
+        self._const_idx = tuple(const_idx)
+        self._runtime_idx = tuple(runtime_idx)
+        self._states = {}
+
+    def __getattr__(self, name):
+        if name in FastJitLauncher.__slots__:
+            raise AttributeError(name)
+        return getattr(self.jit_function, name)
+
+    def _full_args(self, args, kwargs):
+        n = len(self._names)
+        if len(args) > n:
+            raise TypeError(f"too many positional arguments ({len(args)} > {n})")
+        if not kwargs and len(args) == n:
+            return args
+        full = list(args) + list(self._defaults[len(args) :])
+        index = self._index
+        for name, value in kwargs.items():
+            i = index[name]
+            if i < len(args):
+                raise TypeError(f"multiple values for argument {name!r}")
+            full[i] = value
+        empty = inspect.Parameter.empty
+        for i in range(len(args), n):
+            if full[i] is empty:
+                raise TypeError(f"missing argument {self._names[i]!r}")
+        return tuple(full)
+
+    def __call__(self, *args, **kwargs):
+        if "COMPILE_ONLY" in os.environ or CompilationContext.get_compile_hints():
+            return self.jit_function(*args, **kwargs)
+        full = self._full_args(args, kwargs)
+        key = [(type(full[i]), full[i]) for i in self._const_idx]
+        append = key.append
+        tensor = torch.Tensor
+        for i in self._runtime_idx:
+            a = full[i]
+            ta = type(a)
+            if isinstance(a, tensor):
+                stride = a.stride()
+                if 1 not in stride:
+                    # No unit-stride axis: let FlyDSL raise its own error.
+                    return self.jit_function(*full)
+                append((ta, a.dtype, len(stride), stride.index(1)))
+            elif isinstance(a, _PointerJitArg):
+                append((ta, a.element_type, a.alignment, a.address_space))
+            else:
+                append(ta)
+        try:
+            key = tuple(key)
+            state = self._states.get(key)
+        except TypeError:  # unhashable Constexpr value
+            return self.jit_function(*full)
+        if state is not None:
+            return state(full)
+        # First launch of this key: FlyDSL's own path, unchanged (compile or
+        # cache hit, every check, one execution). Then keep the CallState that
+        # path built for the key, which is what its own cache hits dispatch to.
+        result = self.jit_function(*full)
+        state = self._lookup_state(full)
+        if state is not None:
+            self._states[key] = state
+        return result
+
+    def _lookup_state(self, full):
+        jf = self.jit_function
+        try:
+            bound = jf._sig.bind(*full)
+            bound.apply_defaults()
+            flydsl_key = jf._build_full_cache_key(
+                bound.arguments, effective_hints=jf._effective_compile_hints()
+            )
+            return jf._call_state_cache.get(flydsl_key)
+        except Exception:  # noqa: BLE001  private FlyDSL API moved: stay slow
+            return None
+
+
+def fast_jit(launcher):
+    """Wrap a ``@flyc.jit`` launcher in :class:`FastJitLauncher` (idempotent)."""
+    if not AITER_FLYDSL_FAST_LAUNCH or isinstance(launcher, FastJitLauncher):
+        return launcher
+    from flydsl.compiler.jit_function import JitFunction
+
+    if not isinstance(launcher, JitFunction):
+        return launcher
+    return FastJitLauncher(launcher)
+
+
+def fast_jit_result(getter):
+    """Decorate a launcher getter so the launcher it returns goes through
+    ``fast_jit``. Put it under ``functools.cache`` so the wrapper is cached."""
+
+    @functools.wraps(getter)
+    def wrapper(*args, **kwargs):
+        return fast_jit(getter(*args, **kwargs))
+
+    return wrapper
 
 
 def _to_raw(v):

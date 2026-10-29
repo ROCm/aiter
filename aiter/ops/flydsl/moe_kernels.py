@@ -13,6 +13,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled as _dispatch_compiled,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
+    fast_jit_result,
     ptr_arg,
 )
 
@@ -2427,6 +2428,7 @@ def flydsl_moe_stage2(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_fused_route_quant_scatter(
     model_dim: int,
     topk: int,
@@ -2455,6 +2457,7 @@ def _get_compiled_fused_route_quant_scatter(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_fused_route_quant_scatter_st_ksplit(
     model_dim: int,
     topk: int,
@@ -2478,6 +2481,7 @@ def _get_compiled_fused_route_quant_scatter_st_ksplit(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_topids_to_rows():
     from aiter.ops.flydsl.kernels.moe_route_maps import build_moe_topids_to_rows_module
 
@@ -2485,6 +2489,7 @@ def _get_compiled_topids_to_rows():
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_topids_to_rows_g2l(weight_dtype: str):
     from aiter.ops.flydsl.kernels.moe_route_maps import (
         build_moe_topids_to_rows_g2l_module,
@@ -2494,6 +2499,7 @@ def _get_compiled_topids_to_rows_g2l(weight_dtype: str):
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_route_g2l_fused(weight_dtype: str):
     from aiter.ops.flydsl.kernels.moe_route_maps import (
         build_moe_route_g2l_fused_module,
@@ -2503,6 +2509,7 @@ def _get_compiled_route_g2l_fused(weight_dtype: str):
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_route_g2l_lds(weight_dtype: str, direct_mask: bool = False):
     from aiter.ops.flydsl.kernels.moe_route_maps import (
         build_moe_route_g2l_lds_module,
@@ -2904,6 +2911,7 @@ def flydsl_moe_fused_route_quant_scatter(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_fused_route_psum_quant_scatter(
     model_dim: int,
     topk: int,
@@ -3121,6 +3129,7 @@ def flydsl_moe_fused_ep_route_quant_compact(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_fused_quant_preshuffle(
     feat_dim: int,
     wmma_rep: int,
@@ -3163,6 +3172,7 @@ def token_multidest_eligible(token_num: int, topk: int) -> bool:
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_token_multidest_compact_quant(
     feat_dim: int,
     wmma_rep: int,
@@ -3185,6 +3195,7 @@ def _get_compiled_token_multidest_compact_quant(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_token_multidest_quant(
     feat_dim: int,
     wmma_rep: int,
@@ -3208,6 +3219,7 @@ def _get_compiled_token_multidest_quant(
 
 
 @functools.cache
+@fast_jit_result
 def _get_compiled_fused_quant_preshuffle_route_ksplit(
     feat_dim: int,
     wmma_rep: int,

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
 
@@ -39,6 +41,293 @@ def _is_gluon_available():
         return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
     except Exception:  # noqa: BLE001
         return False
+
+
+_GLUON_MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
+_GLUON_DEPTH_SLACK = {"compute_bound": 2}
+
+
+def _gluon_plan(
+    M,
+    N,
+    K,
+    x_strides,
+    w_strides,
+    elem_bits,
+    kernel_type,
+    config,
+    create_shared_layouts,
+    create_wmma_layouts,
+):
+    """Kernel, grid and launch parameters of the non-persistent gluon GEMM.
+
+    ``w_strides`` are those of the (K, N) view the kernel reads, i.e. ``w.T``.
+    Returns ``(kernel, grid, constexprs, num_warps, waves_per_eu)``; the
+    constexprs exclude ``activation``/``USE_ACTIVATION``/``ADD_BIAS``.
+    """
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+        _KERNEL_MAP,
+    )
+
+    if config is None:
+        config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
+
+    kernel_type_from_config = config.pop("kernel_type", None)
+    if kernel_type_from_config is not None:
+        kernel_type = kernel_type_from_config
+
+    BLOCK_M = config["BLOCK_M"]
+    BLOCK_N = config["BLOCK_N"]
+    BLOCK_K = config["BLOCK_K"]
+    NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
+    num_warps = config["num_warps"]
+    waves_per_eu = config.get("waves_per_eu", 0)
+
+    num_k_tiles = triton.cdiv(K, BLOCK_K)
+
+    if kernel_type_from_config is None:
+        depth_cap = num_k_tiles - _GLUON_DEPTH_SLACK.get(kernel_type, 0)
+        if depth_cap < _GLUON_MIN_BUFFERS[kernel_type]:
+            needed = _GLUON_MIN_BUFFERS[kernel_type] + _GLUON_DEPTH_SLACK.get(
+                kernel_type, 0
+            )
+            _LOGGER.warning(
+                "GEMM_A16W16 [gluon/gfx1250]: kernel_type='%s' needs "
+                "num_k_tiles>=%s but num_k_tiles=%s (K=%s, BLOCK_K=%s); "
+                "defaults to kernel_type='bandwidth_bound'.",
+                kernel_type,
+                needed,
+                num_k_tiles,
+                K,
+                BLOCK_K,
+            )
+            kernel_type = "bandwidth_bound"
+            depth_cap = num_k_tiles
+    else:
+        depth_cap = num_k_tiles - _GLUON_DEPTH_SLACK.get(kernel_type, 0)
+
+    NUM_BUFFERS = min(NUM_BUFFERS, depth_cap)
+
+    if x_strides[1] == 1:
+        layout = "T"
+    elif x_strides[0] == 1:
+        layout = "N"
+    else:
+        raise ValueError(
+            f"x must be contiguous in at least one dimension, got strides {tuple(x_strides)}"
+        )
+
+    if w_strides[1] == 1:
+        layout += "T"
+    elif w_strides[0] == 1:
+        layout += "N"
+    else:
+        raise ValueError(
+            f"w must be contiguous in at least one dimension, got strides {tuple(w_strides)}"
+        )
+
+    wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
+    shared_a, shared_b = create_shared_layouts(
+        BLOCK_M, BLOCK_N, BLOCK_K, layout, elem_bits
+    )
+
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
+
+    meta = {
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_N": BLOCK_N,
+        "BLOCK_K": BLOCK_K,
+        "NUM_BUFFERS": NUM_BUFFERS,
+        "LAYOUT": layout,
+        "SHARED_LAYOUT_A": shared_a,
+        "SHARED_LAYOUT_B": shared_b,
+        "WMMA_LAYOUT": wmma_layout,
+        "OPERAND_LAYOUT_A": operand_a,
+        "OPERAND_LAYOUT_B": operand_b,
+    }
+    return _KERNEL_MAP[kernel_type], grid, meta, num_warps, waves_per_eu
+
+
+# ---------------------------------------------------------------------------
+# AITER_GEMM_FAST_LAUNCH=1: host fast path for the eager gfx1250 gluon GEMM.
+#
+# The default path pays, per call, two torch custom-op dispatches, a JSON
+# round trip of the config, the config lookup + copy, a rebuild of five gluon
+# layout objects (~35 us: PaddedSharedLayout.with_identity_for is slow), and
+# JITFunction.run (env-backed knob reads, binder, hashing a specialization
+# that holds those layout objects, str(options), ...).
+#
+# The fast path computes the plan once per (shape, strides, dtypes, kernel
+# type, bias) and binds the compiled kernel once per Triton specialization.
+# The specialization is still computed every call by Triton's own binder, so
+# the kernel picked is exactly the one JITFunction.run would pick; only the
+# constexpr part (fixed by the plan) is left out of the lookup key.  Anything
+# the fast path does not cover (config/activation/skip_reduce/persistent/
+# explicit backend, non-2D, torch.compile tracing, Triton pre-run or
+# stage-inspection hooks) takes the default path.
+# ---------------------------------------------------------------------------
+_FAST_LAUNCH = os.environ.get("AITER_GEMM_FAST_LAUNCH", "0") == "1"
+
+# Leading runtime (non-constexpr) parameters of both gluon a16w16 kernels.
+_GLUON_RUNTIME_ARGS = (
+    "a_ptr",
+    "b_ptr",
+    "c_ptr",
+    "bias_ptr",
+    "M",
+    "N",
+    "K",
+    "stride_am",
+    "stride_ak",
+    "stride_bk",
+    "stride_bn",
+    "stride_cm",
+    "stride_cn",
+)
+_N_RT = len(_GLUON_RUNTIME_ARGS)
+
+# pkey -> (fn, grid, constexpr tail, num_warps, waves_per_eu, binder, device)
+_gluon_fast_plans = {}
+# (pkey, runtime specialization) -> CompiledKernel
+_gluon_fast_kernels = {}
+
+_fast_rt = None
+
+
+def _fast_runtime():
+    global _fast_rt
+    if _fast_rt is None:
+        from triton import knobs
+        from triton.runtime.driver import driver
+
+        _fast_rt = (knobs, driver.active)
+    return _fast_rt
+
+
+def _build_gluon_fast_plan(x, w, M, N, K, has_bias, kernel_type):
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+        _KERNEL_MAP,
+        create_shared_layouts,
+        create_wmma_layouts,
+    )
+
+    # The same checks, in the same order, as the default path.
+    assert _is_gluon_available()
+    assert x.shape[1] == w.shape[1], (
+        f"x is (M, K)={tuple(x.shape)} and w is "
+        f"(N, K)={tuple(w.shape)}, K must match"
+    )
+    assert x.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"Activations (x) must be fp16 or bf16, got {x.dtype}"
+    assert w.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
+    assert (
+        kernel_type in _KERNEL_MAP
+    ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
+
+    wt = w.T
+    fn, grid, meta, num_warps, waves_per_eu = _gluon_plan(
+        M,
+        N,
+        K,
+        x.stride(),
+        wt.stride(),
+        x.element_size() * 8,
+        kernel_type,
+        None,
+        create_shared_layouts,
+        create_wmma_layouts,
+    )
+    meta["activation"] = None
+    meta["USE_ACTIVATION"] = False
+    meta["ADD_BIAS"] = has_bias
+    names = tuple(fn.arg_names)
+    if names[:_N_RT] != _GLUON_RUNTIME_ARGS or set(names[_N_RT:]) != set(meta):
+        return None
+    tail = tuple(meta[n] for n in names[_N_RT:])
+    _knobs, drv = _fast_runtime()
+    device = drv.get_current_device()
+    binder = fn.device_caches[device][4]
+    return (fn, grid, tail, num_warps, waves_per_eu, binder, device)
+
+
+def _gemm_a16w16_gluon_fast(x, w, bias, dtype, y, kernel_type):
+    """Default-path-equivalent gluon launch; None means "use the default path"."""
+    if x.dim() != 2 or w.dim() != 2:
+        return None
+    M, K = x.shape
+    N = w.shape[0]
+    xs = x.stride()
+    ws = w.stride()
+    pkey = (M, N, K, w.shape[1], xs, ws, x.dtype, w.dtype, kernel_type, bias is None)
+    plan = _gluon_fast_plans.get(pkey)
+    if plan is None:
+        plan = _build_gluon_fast_plan(x, w, M, N, K, bias is not None, kernel_type)
+        if plan is None:
+            return None
+        _gluon_fast_plans[pkey] = plan
+    fn, grid, tail, num_warps, waves_per_eu, binder, device = plan
+
+    knobs, drv = _fast_runtime()
+    rt = knobs.runtime
+    if fn.pre_run_hooks or rt.add_stages_inspection_hook is not None:
+        return None
+    if drv.get_current_device() != device:
+        return None
+
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+    ys = y.stride()
+    # w is passed for its w.T view: the kernel only sees the data pointer (and
+    # the storage, for buffer ops), which the two share; strides are w.T's.
+    args = (x, w, y, bias, M, N, K, xs[0], xs[1], ws[1], ws[0], ys[0], ys[1]) + tail
+
+    # Same options JITFunction.run passes to the binder.
+    debug = fn.debug or rt.debug
+    instrumentation_mode = knobs.compilation.instrumentation_mode
+    fpsan = knobs.compilation.fpsan_homomorphic_casts
+    _, specialization, _ = binder(
+        *args,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+        debug=debug,
+        instrumentation_mode=instrumentation_mode,
+        fpsan_homomorphic_casts=fpsan,
+    )
+    kkey = (pkey, tuple(specialization[:_N_RT]), debug, instrumentation_mode, fpsan)
+    kernel = _gluon_fast_kernels.get(kkey)
+    if kernel is None:
+        # First sighting: the regular launch, which compiles or finds the
+        # kernel in Triton's own cache, and hands it back for reuse.
+        kernel = fn[grid](*args, num_warps=num_warps, waves_per_eu=waves_per_eu)
+        if kernel is not None:
+            _gluon_fast_kernels[kkey] = kernel
+        return y
+
+    not_present = object()
+    for (name, _), (val, globals_dict) in fn.used_global_vals.items():
+        if globals_dict.get(name, not_present) != val:
+            raise RuntimeError(
+                f"Global variable {name} has changed since we compiled this kernel"
+            )
+    stream = drv.get_current_stream(device)
+    kernel.run(
+        grid[0],
+        grid[1],
+        1,
+        stream,
+        kernel.function,
+        kernel.packed_metadata,
+        kernel.launch_metadata(grid, stream, *args),
+        rt.launch_enter_hook,
+        rt.launch_exit_hook,
+        *args,
+    )
+    return y
 
 
 def gemm_a16w16_fake_tensor(
@@ -374,74 +663,23 @@ def gemm_a16w16_(
         M, K = x.shape
         N, _ = w.shape
 
-        if config is None:
-            config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
-
-        kernel_type_from_config = config.pop("kernel_type", None)
-        if kernel_type_from_config is not None:
-            kernel_type = kernel_type_from_config
-
-        BLOCK_M = config["BLOCK_M"]
-        BLOCK_N = config["BLOCK_N"]
-        BLOCK_K = config["BLOCK_K"]
-        NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
-        num_warps = config["num_warps"]
-        waves_per_eu = config.get("waves_per_eu", 0)
-
-        num_k_tiles = triton.cdiv(K, BLOCK_K)
-        _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
-        _DEPTH_SLACK = {"compute_bound": 2}
-
-        if kernel_type_from_config is None:
-            depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
-            if depth_cap < _MIN_BUFFERS[kernel_type]:
-                needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
-                _LOGGER.warning(
-                    "GEMM_A16W16 [gluon/gfx1250]: kernel_type='%s' needs "
-                    "num_k_tiles>=%s but num_k_tiles=%s (K=%s, BLOCK_K=%s); "
-                    "defaults to kernel_type='bandwidth_bound'.",
-                    kernel_type,
-                    needed,
-                    num_k_tiles,
-                    K,
-                    BLOCK_K,
-                )
-                kernel_type = "bandwidth_bound"
-                depth_cap = num_k_tiles
-        else:
-            depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
-
-        NUM_BUFFERS = min(NUM_BUFFERS, depth_cap)
-
         w = w.T
 
-        if x.stride(1) == 1:
-            layout = "T"
-        elif x.stride(0) == 1:
-            layout = "N"
-        else:
-            raise ValueError(
-                f"x must be contiguous in at least one dimension, got strides {x.stride()}"
-            )
-
-        if w.stride(1) == 1:
-            layout += "T"
-        elif w.stride(0) == 1:
-            layout += "N"
-        else:
-            raise ValueError(
-                f"w must be contiguous in at least one dimension, got strides {w.stride()}"
-            )
+        kernel, grid, meta, num_warps, waves_per_eu = _gluon_plan(
+            M,
+            N,
+            K,
+            x.stride(),
+            w.stride(),
+            x.element_size() * 8,
+            kernel_type,
+            config,
+            create_shared_layouts,
+            create_wmma_layouts,
+        )
 
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(
-            BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8
-        )
-
-        grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
         _LOGGER.info(
             "GEMM_A16W16 [gluon, non-persistent]: x=%s w=%s",
@@ -449,7 +687,7 @@ def gemm_a16w16_(
             w.shape,
         )
 
-        _KERNEL_MAP[kernel_type][grid](
+        kernel[grid](
             x,
             w,
             y,
@@ -463,16 +701,7 @@ def gemm_a16w16_(
             w.stride(1),
             y.stride(0),
             y.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            NUM_BUFFERS=NUM_BUFFERS,
-            LAYOUT=layout,
-            SHARED_LAYOUT_A=shared_a,
-            SHARED_LAYOUT_B=shared_b,
-            WMMA_LAYOUT=wmma_layout,
-            OPERAND_LAYOUT_A=operand_a,
-            OPERAND_LAYOUT_B=operand_b,
+            **meta,
             activation=_get_activation_from_str(activation) if activation else None,
             USE_ACTIVATION=activation is not None,
             ADD_BIAS=(bias is not None),
@@ -593,6 +822,19 @@ def gemm_a16w16(
     # pass a placeholder when a preallocated y already fixes the output dtype).
     if not isinstance(dtype, torch.dtype):
         dtype = torch.bfloat16
+    if (
+        _FAST_LAUNCH
+        and not config
+        and activation is None
+        and not skip_reduce
+        and backend is None
+        and not persistent
+        and _is_gluon_available()
+        and not torch.compiler.is_compiling()
+    ):
+        y_fast = _gemm_a16w16_gluon_fast(x, w, bias, dtype, y, kernel_type)
+        if y_fast is not None:
+            return y_fast
     config_hashable = serialize_dict(config) if config else None
     return gemm_a16w16_(
         x,

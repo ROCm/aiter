@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
 from typing import NamedTuple
 
 import torch
@@ -59,6 +60,14 @@ _GLUON_REDUCE_MAX_SEGMENTS = 8
 # 8 segments 2.2x faster, 4 segments 18-27% faster, 2 segments 1.5x slower.
 _GFX12_3D_MAX_SEQLEN_Q = 16
 _GFX12_3D_MIN_SEGMENTS = 4
+# Opt-in floor on the gfx1250 gluon 3d KV split (decode and spec-decode verify).
+# The split is sized from the launch's program count, so a CUDA graph captured
+# at a batch wider than the live sequences (DP padding) splits too few ways.
+# A floor pays off on long contexts and costs on short ones, which the split
+# cannot tell apart under a graph (max_seqlen_k is the model's max), so it is
+# left to the deployment. Qwen3.5 d 256, 2 kv heads, 40k-190k-token contexts,
+# 19-32 live of 24/32 captured: 64 is 5-23% faster than the heuristic's 16-32.
+_GFX12_3D_SEGMENTS_FLOOR = int(os.environ.get("AITER_GFX12_MIN_SEGMENTS", "0"))
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -470,6 +479,18 @@ def unified_attention(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
         NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
+        if (
+            _GFX12_3D_SEGMENTS_FLOOR > 1
+            and use_gluon_3d
+            and DEVICE_ARCH == "gfx1250"
+            and NUM_SEGMENTS < _GFX12_3D_SEGMENTS_FLOOR
+        ):
+            # never more segments than KV tiles in the longest context
+            tiles = triton.cdiv(int(max_seqlen_k), CONFIG_TILE_SIZE)
+            NUM_SEGMENTS = max(
+                NUM_SEGMENTS,
+                triton.next_power_of_2(min(_GFX12_3D_SEGMENTS_FLOOR, tiles)),
+            )
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
