@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import os
 import pathlib
 import shutil
 import subprocess
@@ -93,10 +94,16 @@ def test_metadata_only_run_keeps_an_existing_aiter_meta(tmp_path):
     (tmp_path / "aiter_meta").mkdir()
     (tmp_path / "aiter_meta" / "keep").touch()
 
+    env = dict(os.environ)
+    if sys.platform == "win32":
+        # The Windows ROCm probe imports aiter/jit/utils/cpp_extension.py, which
+        # this copy lacks. Triton-only skips the probe; aiter_meta/ is kept either way.
+        env["AITER_TRITON_ONLY"] = "1"
     run = subprocess.run(
         [sys.executable, "setup.py", "egg_info", "--egg-base", str(tmp_path)],
         check=False,
         cwd=tmp_path,
+        env=env,
         capture_output=True,
         text=True,
     )
