@@ -789,7 +789,7 @@ void mhc_pack_fn_gfx950(aiter_tensor_t& out, aiter_tensor_t& fn)
     constexpr int blocks = 24 * (28672 / 8);
     mhc_gfx950::pack_kb8<<<(blocks + 255) / 256, 256, 0, getCurrentHIPStream()>>>(
         static_cast<const float*>(fn.ptr), static_cast<uint4*>(out.ptr), blocks, 28672 / 8, 28672);
-    HIP_CALL(hipGetLastError());
+    HIP_CALL_LAUNCH(hipGetLastError());
 #endif
 }
 
@@ -828,7 +828,7 @@ void mhc_post_project_gfx950(aiter_tensor_t& projection,
             hidden,
             hidden,
             splits);
-    HIP_CALL(hipGetLastError());
+    HIP_CALL_LAUNCH(hipGetLastError());
 #endif
 }
 
@@ -915,7 +915,7 @@ void mhc_finalize_gfx950(aiter_tensor_t& post,
                                                                         post_mult,
                                                                         repeats);
     }
-    HIP_CALL(hipGetLastError());
+    HIP_CALL_LAUNCH(hipGetLastError());
 #endif
 }
 } // namespace aiter
