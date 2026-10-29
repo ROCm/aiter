@@ -34,18 +34,12 @@ from .kernels.pa_decode_reduce import (
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
 
-_FP8_KV_DTYPES = {
-    "gfx942": torch.float8_e4m3fnuz,
-    "gfx950": torch.float8_e4m3fn,
-    "gfx1250": torch.float8_e4m3fn,
-}
 
-
-def _kv_dtype_name(arch: str, dtype: torch.dtype) -> str | None:
-    """``"bf16"``, ``"fp8"`` (the arch's FP8 format) or None if unsupported."""
+def _kv_dtype_name(dtype: torch.dtype) -> str | None:
+    """``"bf16"``, ``"fp8"`` (``dtypes.fp8``, as ``pa_decode`` requires) or None."""
     if dtype == torch.bfloat16:
         return "bf16"
-    return "fp8" if dtype == _FP8_KV_DTYPES.get(arch) else None
+    return "fp8" if dtype == dtypes.fp8 else None
 
 
 def _default_workgroup_budget(
@@ -58,7 +52,7 @@ def _default_workgroup_budget(
     query_group_size: int,
     sliding_window: int,
 ) -> int:
-    kv_name = _kv_dtype_name(arch, kv_dtype)
+    kv_name = _kv_dtype_name(kv_dtype)
     one_cta_per_cu = (
         kv_name is not None
         and sliding_window <= 0
@@ -91,7 +85,7 @@ def pa_decode_nhd_max_query_length(
     if device.type != "cuda":
         return 0
     arch = get_gfx_runtime()
-    kv_name = _kv_dtype_name(arch, kv_dtype)
+    kv_name = _kv_dtype_name(kv_dtype)
     if kv_name is None:
         return 0
     return nhd_max_query_length(arch, kv_name, head_dim, block_size, query_group_size)
