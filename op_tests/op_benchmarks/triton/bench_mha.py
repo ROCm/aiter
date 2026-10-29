@@ -663,8 +663,10 @@ def run_benchmark(run: BenchRun):
                 "Skipping: sliding window needs -impl dao_ai (or an fp8 dtype)."
             )
             return 0
-        if is_gluon and window_size_right >= 0:
-            warnings.warn("Skipping: Gluon backend does not support a right window.")
+        if is_gluon and window_size_right > 0 and not causal:
+            warnings.warn(
+                "Skipping: Gluon backend does not support a positive right window without causal masking."
+            )
             return 0
         if (fused or dtype == "fp8") and (has_pe or run.sink):
             warnings.warn("Skipping: PE or sink not supported with fused bwd / fp8.")
@@ -674,6 +676,8 @@ def run_benchmark(run: BenchRun):
         if is_gluon and (is_bwd or is_decode):
             warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
             return 0
+        # Each dtype in a sweep needs its own input tensors.
+        torch_dtype = arg_to_torch_dtype.get(dtype, torch_dtype)
         mha_set_use_fused_bwd_kernel(fused)
         make_fn = get_make_fn(function, dtype, run.backend)
 
