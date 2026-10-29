@@ -1723,12 +1723,12 @@ def test_output_buffer_contract():
     assert fused_moe(*args, output=odd) is odd, "2-byte-aligned output not returned"
     assert torch.equal(odd, ref), "2-byte-aligned output does not hold the result"
     # The same through the FlyDSL sort (AITER_USE_FLYDSL_MOE_SORTING=1), whose
-    # launcher raised on such a buffer.
+    # launcher raised on such a buffer. AITER_USE_CK_MOE_SORTING=1 would take
+    # precedence, so it is forced off here too.
     fm = aiter.fused_moe
-    real_use_flydsl, real_flydsl_sort = (
-        fm._USE_FLYDSL_MOE_SORTING,
-        fm._flydsl_moe_sorting,
-    )
+    real_use_ck = fm._USE_CK_MOE_SORTING
+    real_use_flydsl = fm._USE_FLYDSL_MOE_SORTING
+    real_flydsl_sort = fm._flydsl_moe_sorting
     flydsl_sorts = []
 
     def counting_flydsl_sort(*a, **kw):
@@ -1736,6 +1736,7 @@ def test_output_buffer_contract():
         return real_flydsl_sort(*a, **kw)
 
     try:
+        fm._USE_CK_MOE_SORTING = False
         fm._USE_FLYDSL_MOE_SORTING = True
         fm._flydsl_moe_sorting = counting_flydsl_sort
         flydsl_ref = fused_moe(*args)
@@ -1746,6 +1747,7 @@ def test_output_buffer_contract():
             odd, flydsl_ref
         ), "FlyDSL sort: output does not hold the result"
     finally:
+        fm._USE_CK_MOE_SORTING = real_use_ck
         fm._USE_FLYDSL_MOE_SORTING = real_use_flydsl
         fm._flydsl_moe_sorting = real_flydsl_sort
 
