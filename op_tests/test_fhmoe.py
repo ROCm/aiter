@@ -2834,10 +2834,14 @@ def test_fhmoe_aot_replay_forwards_caller_choices(
         ("scale_shape", "Expected preshuffled shared_w1_scale shape"),
     ),
 )
+# _fhmoe enters the custom op without fused_moe's wrapper, whose own except would
+# drop the presort even if _fhmoe_impl's did not.
+@pytest.mark.parametrize("entry", ("fused_moe", "_fhmoe"))
 def test_heterogeneous_moe_rejects_invalid_shared_contract(
     weights: _Weights,
     case: str,
     message: str,
+    entry: str,
 ):
     profile = _profile()
     hidden, _, _, all_weight, all_ids = _route_inputs(
@@ -2861,14 +2865,17 @@ def test_heterogeneous_moe_rejects_invalid_shared_contract(
 
     # A rejected call still consumes a registered presort, so it cannot apply to
     # a later call on reused routing buffers.
+    import aiter.fhmoe as fhmoe_module
+
     aiter.fused_moe.register_presorted_moe({"topk_ids_ptr": all_ids.data_ptr()})
+    call = fused_moe if entry == "fused_moe" else fhmoe_module._fhmoe
     with pytest.raises(ValueError, match=message):
-        fused_moe(
-            hidden,
-            weights.routed_w1,
-            weights.routed_w2,
-            all_weight,
-            all_ids,
+        call(
+            hidden_states=hidden,
+            w1=weights.routed_w1,
+            w2=weights.routed_w2,
+            topk_weight=all_weight,
+            topk_ids=all_ids,
             **kwargs,
         )
     assert aiter.fused_moe._pop_presorted_moe() is None, "presort survived the error"
