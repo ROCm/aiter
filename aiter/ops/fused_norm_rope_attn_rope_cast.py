@@ -475,12 +475,18 @@ def _fused_norm_rope_attn_rope_cast_with_debug(
             if grid <= 4:
                 work_splits = max(work_splits, capacity // (t * 128))
             limit = min(32, max(1, 256 // grid), work_splits)
-            if h == 16 and is_decode:
+            if h == 16:
                 tile_splits = (kv_indices_prefix.numel() + t * 64 - 1) // (t * 64)
                 if kv_indices_extend is not None:
                     tile_splits += (kv_indices_extend.numel() + t * 64 - 1) // (t * 64)
-                if 1 < tile_splits <= min(16, 256 // grid):
+                if is_decode and 1 < tile_splits <= min(16, 256 // grid):
                     limit = tile_splits
+                # Long lists amortize a second resident CTA per CU. Avoid extra
+                # partials when fewer splits give the same longest tile loop.
+                if grid >= 64 and capacity >= t * 1536:
+                    limit = min(32, max(1, 512 // grid), work_splits)
+                    tiles_per_split = (tile_splits + limit - 1) // limit
+                    limit = (tile_splits + tiles_per_split - 1) // tiles_per_split
             # Avoid partial-output traffic on H64 grids that already have
             # enough independent requests for these short lists.
             if h == 64 and t >= 128 and capacity < t * 1024:
