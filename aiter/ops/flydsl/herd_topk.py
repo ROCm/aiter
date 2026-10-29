@@ -3,6 +3,8 @@
 
 """HERD routing orchestration with FlyDSL candidate selection + finalize."""
 
+import os
+
 import torch
 
 from .kernels.herd_topk import build_herd_finalize_module
@@ -17,6 +19,93 @@ _HERD_MAX_TOKENS = 128
 _DEFAULT_FINALIZE_THREADS = 256
 _K3_CANDIDATE_THREADS = 256
 _K3_FINALIZE_THREADS = 1024
+
+
+def herd_use_fused_drop() -> bool:
+    value = os.environ.get("AITER_HERD_FUSED_DROP", "1")
+    if value not in ("0", "1"):
+        raise ValueError(f"AITER_HERD_FUSED_DROP must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def herd_finalize_candidates(
+    candidate_values: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    experts: int,
+    routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop, renormalize and scale Top-(K+1) candidates down to K routes.
+
+    Rows at or past ``num_valid_rows`` (int32 on device) are padding: they stay
+    out of the batch popularity and get ids -1 and weights 0.
+    """
+    rows, width = candidate_ids.shape
+    topk = width - 1
+    weights = torch.empty(
+        (rows, topk), dtype=torch.float32, device=candidate_ids.device
+    )
+    ids = torch.empty((rows, topk), dtype=torch.int32, device=candidate_ids.device)
+    _run_finalize(
+        candidate_ids,
+        candidate_values,
+        weights,
+        ids,
+        rows,
+        experts,
+        topk,
+        True,
+        routed_scaling_factor,
+        False,
+        _K3_FINALIZE_THREADS if experts > 512 else _DEFAULT_FINALIZE_THREADS,
+        torch.cuda.current_stream(candidate_ids.device),
+        num_valid_rows=num_valid_rows,
+    )
+    return weights, ids
+
+
+def herd_topk_candidates(
+    candidate_values, candidate_ids, logits, correction_bias, score_func
+):
+    rows, experts = logits.shape
+    width = candidate_ids.shape[1]
+    stream = torch.cuda.current_stream(logits.device)
+    packed = logits.contiguous()
+    if score_func == "sigmoid":
+        if correction_bias is None or correction_bias.shape != (experts,):
+            raise ValueError(
+                "sigmoid candidates require one correction bias per expert"
+            )
+        _run_sigmoid_candidate(
+            packed,
+            correction_bias,
+            candidate_ids,
+            candidate_values,
+            rows,
+            experts,
+            width,
+            _K3_CANDIDATE_THREADS,
+            stream,
+        )
+    elif score_func == "softmax":
+        from ..moe_op import topk_softmax
+
+        token_expert_ids = torch.empty_like(candidate_ids)
+        topk_softmax(candidate_values, candidate_ids, token_expert_ids, packed, True)
+    elif score_func == "sqrtsoftplus":
+        from ..topk import topk_gating_fwd
+
+        topk_gating_fwd(
+            candidate_values,
+            candidate_ids,
+            packed,
+            correction_bias,
+            False,
+            1.0,
+            score_func,
+        )
+    else:
+        raise ValueError(f"unsupported candidate score_func={score_func!r}")
 
 
 def _run_sigmoid_candidate(
@@ -36,6 +125,7 @@ def _run_sigmoid_candidate(
         wave_size_of(packed_gating.device.index),
         block_threads=block_threads,
         forced_blocks=False,
+        tie_low=True,
         score_mode="sigmoid_bias",
         bias_bf16=correction_bias.dtype == torch.bfloat16,
         score_bf16=packed_gating.dtype == torch.bfloat16,
@@ -66,6 +156,7 @@ def _run_finalize(
     round_to_bf16: bool,
     block_threads: int,
     stream: torch.cuda.Stream,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None:
     finalize_launch = build_herd_finalize_module(
         topk,
@@ -73,6 +164,7 @@ def _run_finalize(
         bool(need_renorm),
         round_to_bf16,
         block_threads=block_threads,
+        has_num_valid_rows=num_valid_rows is not None,
     )
     _run_compiled(
         finalize_launch,
@@ -80,6 +172,8 @@ def _run_finalize(
         candidate_values,
         topk_weights,
         topk_ids,
+        # Unread without a count; any tensor stands in for the argument.
+        num_valid_rows if num_valid_rows is not None else candidate_ids,
         int(topk_weights.stride(0)),
         int(topk_ids.stride(0)),
         rows,
@@ -101,6 +195,10 @@ def _profile(score_func: str, experts: int, topk: int) -> str | None:
         _MINIMAX_M3_TOPK,
     ):
         return "minimax_m3"
+    if (score_func, experts, topk) == ("softmax", 128, 4):
+        return "gpt_oss"
+    if (score_func, experts, topk) == ("sqrtsoftplus", 256, 6):
+        return "dsv4_flash"
     return None
 
 
@@ -108,8 +206,9 @@ def _unsupported_reason(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     score_func: str,
+    need_renorm: bool = True,
 ) -> str | None:
     if gating_output.dim() != 2:
         return f"gating_output must be 2-D, got {tuple(gating_output.shape)}"
@@ -133,13 +232,18 @@ def _unsupported_reason(
         return f"topk_ids must be int32 [{rows}, {topk}]"
     if topk_weights.stride(1) != 1 or topk_ids.stride(1) != 1:
         return "Top-K outputs must have inner stride 1"
-    if correction_bias.shape != (experts,):
-        return f"correction_bias must have shape [{experts}]"
-    if correction_bias.dtype not in (torch.float32, torch.bfloat16):
-        return f"unsupported correction_bias dtype {correction_bias.dtype}"
-    if correction_bias.stride(0) != 1:
-        return "correction_bias must be contiguous"
-    tensors = (topk_weights, topk_ids, gating_output, correction_bias)
+    tensors = (topk_weights, topk_ids, gating_output)
+    if profile == "gpt_oss":
+        if not need_renorm or (correction_bias is not None and correction_bias.numel()):
+            return "softmax HERD requires renormalization and no correction bias"
+    else:
+        if correction_bias is None or correction_bias.shape != (experts,):
+            return f"correction_bias must have shape [{experts}]"
+        if correction_bias.dtype not in (torch.float32, torch.bfloat16):
+            return f"unsupported correction_bias dtype {correction_bias.dtype}"
+        if correction_bias.stride(0) != 1:
+            return "correction_bias must be contiguous"
+        tensors += (correction_bias,)
     if not all(t.is_cuda for t in tensors):
         return "every tensor must be on the GPU"
     if len({t.device for t in tensors}) != 1:
@@ -153,8 +257,9 @@ def herd_topk_gating_supported(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     score_func: str,
+    need_renorm: bool = True,
 ) -> bool:
     return (
         _unsupported_reason(
@@ -163,6 +268,7 @@ def herd_topk_gating_supported(
             gating_output,
             correction_bias,
             score_func,
+            need_renorm,
         )
         is None
     )
@@ -176,11 +282,14 @@ def herd_topk_gating(
     need_renorm: bool,
     routed_scaling_factor: float,
     score_func: str,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None:
     """Apply Top-(K+1), batch popularity, and min-unique drop.
 
     Output routes are canonicalized to ascending expert id, matching the
-    Triton HERD output contract.
+    Triton HERD output contract. Rows at or past `num_valid_rows` (int32 on
+    device) are padding: they stay out of the batch popularity and get ids -1
+    and weights 0.
     """
     reason = _unsupported_reason(
         topk_weights,
@@ -188,6 +297,7 @@ def herd_topk_gating(
         gating_output,
         correction_bias,
         score_func,
+        need_renorm,
     )
     if reason is not None:
         raise ValueError(f"[FlyDSL HERD Top-K] {reason}")
@@ -208,6 +318,25 @@ def herd_topk_gating(
     kp1 = topk + 1
     candidate_ids = torch.empty((rows, kp1), dtype=torch.int32, device=device)
     candidate_values = torch.empty((rows, kp1), dtype=torch.float32, device=device)
+    if profile == "gpt_oss":
+        herd_topk_candidates(
+            candidate_values, candidate_ids, packed_gating, None, score_func
+        )
+        _run_finalize(
+            candidate_ids,
+            candidate_values,
+            topk_weights,
+            topk_ids,
+            rows,
+            experts,
+            topk,
+            True,
+            routed_scaling_factor,
+            False,
+            _DEFAULT_FINALIZE_THREADS,
+            stream,
+        )
+        return
     if profile == "kimi_k3":
         _run_sigmoid_candidate(
             packed_gating,
@@ -233,6 +362,7 @@ def herd_topk_gating(
             False,
             _K3_FINALIZE_THREADS,
             stream,
+            num_valid_rows,
         )
         return
 
@@ -263,4 +393,5 @@ def herd_topk_gating(
         False,
         finalize_threads,
         stream,
+        num_valid_rows,
     )

@@ -182,6 +182,11 @@ AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_bpreshuffle_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_mxscale_bpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_abpreshuffle_tuned_gemm.csv",
@@ -378,6 +383,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE,
+            "a4w4_mxscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
@@ -525,7 +538,15 @@ class AITER_CONFIG:
         dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
         if not dedup_keys:
             return
-        duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
+
+        def as_numbers(column):
+            values = pd.to_numeric(column, errors="coerce")
+            written = column.astype(str).str.strip() != ""
+            return values if values[written].notna().all() else column
+
+        # Numeric columns compare as numbers, so 256 and 256.0 are one shape.
+        comparable = merge_df.apply(as_numbers)
+        duplicated_mask = comparable.duplicated(subset=dedup_keys, keep=False)
         if not duplicated_mask.any():
             return
 
@@ -548,9 +569,13 @@ class AITER_CONFIG:
                 + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
             )
 
-        # Auto-dedup: globally determine best row (lowest 'us') per shape
+        # Auto-dedup: globally determine best row (lowest 'us') per shape. One
+        # unparseable us cell (e.g. nan) leaves the column textual in
+        # `comparable`, where "10.5" sorts before "9.5", so coerce it alone.
+        us = pd.to_numeric(merge_df["us"], errors="coerce")
         best_row_index = set(
-            merge_df.sort_values("us", kind="stable")
+            comparable.assign(us=us)
+            .sort_values("us", kind="stable")
             .drop_duplicates(subset=dedup_keys, keep="first")
             .index
         )
@@ -618,7 +643,9 @@ class AITER_CONFIG:
             single = path_list[0] if path_list else None
             if single and os.path.exists(single):
                 try:
-                    df = pd.read_csv(single)
+                    # As text, like the merge below, so a dedup rewrite keeps
+                    # every cell as written.
+                    df = pd.read_csv(single, dtype=str, keep_default_na=False)
                 except (OSError, UnicodeError, ValueError, pd.errors.ParserError):
                     # This path previously handed the file back unread, so an
                     # unparseable CSV surfaced from the op's own loader. Keep
@@ -644,7 +671,10 @@ class AITER_CONFIG:
                 logger.info(f"path {i + 1}: {path} (not exist)")
                 continue
 
-            df = pd.read_csv(path)
+            # Kept as text so the merged file reproduces every cell as written:
+            # parsed, a column with a blank cell turns 64 into 64.0, which
+            # readers that take integers from the text reject.
+            df = pd.read_csv(path, dtype=str, keep_default_na=False)
             source_pairs.append((path, df))
 
         if not source_pairs:
@@ -669,9 +699,10 @@ class AITER_CONFIG:
                         # a cu_num stay distinguishable after the merge.
                         from aiter.jit.utils.chip_info import gfx_from_cu_num
 
-                        df[c] = df["cu_num"].map(gfx_from_cu_num)
+                        cu_num = pd.to_numeric(df["cu_num"], errors="coerce")
+                        df[c] = cu_num.map(gfx_from_cu_num)
                     else:
-                        df[c] = _FILL_DEFAULTS.get(c, 0)
+                        df[c] = str(_FILL_DEFAULTS.get(c, 0))
             source_pairs[i] = (path, df[all_cols])
 
         non_empty = [df for _, df in source_pairs if not df.empty]
@@ -794,7 +825,9 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 # is COMPILED, which for a prebuilt wheel is the build tree's aiter_meta/ (a
 # directory setup.py deletes when it is done). Only an import-time value knows
 # where the files ended up after install. The C++ loader prefers this env var
-# over the macro, so an explicit user override still wins.
+# over the macro. The CO loader resolves the current HIP device's ASIC Revision:
+# A0 uses this root's gfx1250-a0 directory, B0+ uses gfx1250. A direct profile
+# override is accepted only when the ELF processor matches the detected stepping.
 OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
 os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
 
@@ -2176,6 +2209,16 @@ def _pybind_develop_hooks():
     return _pybind_develop_hooks_cache
 
 
+def _develop_arg(a, convert, tensor_cls):
+    """`a` as a develop=True pybind op takes it: a tensor converted, and so is
+    every tensor of a list (a std::vector<aiter_tensor_t> argument)."""
+    if isinstance(a, tensor_cls):
+        return convert(a)
+    if isinstance(a, (list, tuple)) and any(isinstance(x, tensor_cls) for x in a):
+        return [convert(x) if isinstance(x, tensor_cls) else x for x in a]
+    return a
+
+
 def compile_ops(
     _md_name: str,
     fc_name: str | None = None,
@@ -2481,12 +2524,10 @@ def compile_ops(
                             ),
                         )
 
-                    args = tuple(
-                        convert(a) if isinstance(a, tensor_cls) else a for a in args
-                    )
+                    args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
                     if kwargs:
                         kwargs = {
-                            k: convert(v) if isinstance(v, tensor_cls) else v
+                            k: _develop_arg(v, convert, tensor_cls)
                             for k, v in kwargs.items()
                         }
 

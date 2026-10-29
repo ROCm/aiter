@@ -95,7 +95,76 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
         default="throughput",
         help="metric to plot",
     )
+
+    parser.add_argument(
+        "--graph-warmup-iters",
+        type=positive_int,
+        default=3,
+        help="do_bench_aiter_triton: untimed iterations before the CUDA graph is captured",
+    )
+    parser.add_argument(
+        "--graph-warmup-replays",
+        type=positive_int,
+        default=3,
+        help="do_bench_aiter_triton: untimed graph replays before the timed ones",
+    )
+    parser.add_argument(
+        "--graph-kernels-per-graph",
+        type=positive_int,
+        default=1000,
+        help="do_bench_aiter_triton: kernel calls captured per CUDA graph",
+    )
+    parser.add_argument(
+        "--graph-num-replays",
+        type=positive_int,
+        default=10,
+        help="do_bench_aiter_triton: timed graph replays",
+    )
+    parser.add_argument(
+        "--rot-bufs-min-pool-len",
+        type=positive_int,
+        default=4,
+        help="rotating buffers minimum pool length",
+    )
+    parser.add_argument(
+        "--rot-bufs-target-mb",
+        type=positive_int,
+        default=256,
+        help="rotating buffers target size in MB",
+    )
+    parser.add_argument(
+        "--rot-bufs-print-info",
+        action="store_true",
+        default=False,
+        help="Print rotating buffers pool info (pool length, per-set and total bytes)",
+    )
+
     return parser
+
+
+def get_do_bench_graph_kwargs(args: argparse.Namespace) -> dict:
+    """do_bench_aiter_triton kwargs from the --graph-* flags added by get_parser()."""
+    return {
+        "warmup_iters": args.graph_warmup_iters,
+        "warmup_replays": args.graph_warmup_replays,
+        "kernels_per_graph": args.graph_kernels_per_graph,
+        "num_replays": args.graph_num_replays,
+    }
+
+
+def get_rot_bufs_kwargs(args: argparse.Namespace) -> dict:
+    """generate_rotating_buffers_pool kwargs from the --rot-bufs-* flags and added by get_parser().
+    Note: max_pool_len is set to --graph-kernels-per-graph
+    """
+    return {
+        "target_mb": args.rot_bufs_target_mb,
+        "min_pool_len": args.rot_bufs_min_pool_len,
+        "print_info": args.rot_bufs_print_info,
+        # By default keep the rotating buffer pool length <= graph_kernels_per_graph
+        # Otherwise, in case per-set bytes are too small, then covering target_mb might
+        # blow up the pool_len. This is not ideal for capturing graph
+        "max_pool_len": args.graph_kernels_per_graph,
+    }
 
 
 def get_ff_args(
