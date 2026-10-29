@@ -1426,7 +1426,7 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
 
         kv_mask = (t_mask & (pid_slot >= 0))[:, None]
         k_scale_rcprl = (1 / k_scale).to(tl.float32)
-        for pid_hk in range(0, QH // QH_PER_KH):
+        for pid_hk in range(QH // QH_PER_KH):
             k_pe_base = (
                 k_pe_ptr + offs_t64[:, None] * k_pe_stride_b + pid_hk * k_pe_stride_h
             )
