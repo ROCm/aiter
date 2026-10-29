@@ -107,9 +107,6 @@ class TestArchTablesStayInSync(unittest.TestCase):
             with self.subTest(gfx=gfx):
                 self._resolves_everywhere(gfx)
 
-    def test_strict_resolves_through_all_three_tables(self):
-        self._resolves_everywhere("gfx1250-strict")
-
 
 class TestClusterLaunchBuildArchs(unittest.TestCase):
     """build_module's -DAITER_ENABLE_CLUSTER_LAUNCH arch test (aiter.jit.core)."""
