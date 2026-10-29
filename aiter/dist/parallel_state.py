@@ -1180,9 +1180,15 @@ class GroupCoordinator:
         input_size = input_.size()
 
         is_last_dim = dim == input_.dim() - 1
-        can_use_custom = use_custom and (
-            dim == 0
-            or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+        ca_comm = self.device_communicator.ca_comm
+        can_use_custom = (
+            use_custom
+            # No custom all-gather kernel for this group size (6 ranks).
+            and (ca_comm is None or ca_comm._has_gather_scatter_kernel())
+            and (
+                dim == 0
+                or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+            )
         )
 
         if can_use_custom:

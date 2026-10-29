@@ -4870,7 +4870,7 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
             reduce_scatter_split_first_dim<T, 2>
                 <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
             break;
-        default: printf("reduce_scatter world_size error!\n");
+        default: throw std::runtime_error("reduce_scatter world_size error");
         }
         break;
     }
@@ -4896,7 +4896,7 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
         case 8: LAUNCH_LAST(8); break;
         case 4: LAUNCH_LAST(4); break;
         case 2: LAUNCH_LAST(2); break;
-        default: printf("reduce_scatter world_size error!\n");
+        default: throw std::runtime_error("reduce_scatter world_size error");
         }
 #undef LAUNCH_LAST
         break;
@@ -4922,12 +4922,12 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
         case 8: LAUNCH_MID(8); break;
         case 4: LAUNCH_MID(4); break;
         case 2: LAUNCH_MID(2); break;
-        default: printf("reduce_scatter world_size error!\n");
+        default: throw std::runtime_error("reduce_scatter world_size error");
         }
 #undef LAUNCH_MID
         break;
     }
-    default: printf("reduce_scatter split_dim error!\n");
+    default: throw std::runtime_error("reduce_scatter split_dim error");
     }
 }
 
@@ -4960,7 +4960,7 @@ void dispatchAllGather(
                 allgather_naive<T, 2>
                     <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
                 break;
-            default: printf("allgather world_size error\n");
+            default: throw std::runtime_error("allgather world_size error");
             }
         }
         else
@@ -4983,7 +4983,7 @@ void dispatchAllGather(
                 allgather_vec<T, 2>
                     <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
                 break;
-            default: printf("allgather world_size error\n");
+            default: throw std::runtime_error("allgather world_size error");
             }
         }
     }
@@ -5007,7 +5007,7 @@ void dispatchAllGather(
             allgather_lastdim<T, 2><<<grid, block, 0, stream>>>(
                 ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
             break;
-        default: printf("allgather world_size error\n");
+        default: throw std::runtime_error("allgather world_size error");
         }
     }
 }

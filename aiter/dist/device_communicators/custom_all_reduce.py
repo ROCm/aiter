@@ -1714,6 +1714,16 @@ class CustomAllreduce:
         """Batch-register graph-captured buffer addresses."""
         self._pool.flush_graph_buffers(self._ptr)
 
+    # Group sizes the all-gather, all-gatherv and reduce-scatter kernels are
+    # built for off gfx1250; the all-reduce also runs at 6.
+    _GATHER_SCATTER_WORLD_SIZES: ClassVar[tuple[int, ...]] = (2, 4, 8)
+
+    def _has_gather_scatter_kernel(self) -> bool:
+        return (
+            self._is_gfx1250
+            or self.world_size in CustomAllreduce._GATHER_SCATTER_WORLD_SIZES
+        )
+
     def _fits_custom_ar_size(self, inp: torch.Tensor, prefill_support: bool = False):
         if self.disabled:
             return False
@@ -1803,7 +1813,7 @@ class CustomAllreduce:
         return self._fits_custom_ar_size(inp, prefill_support)
 
     def should_custom_ag(self, inp: torch.Tensor):
-        if self.disabled:
+        if self.disabled or not self._has_gather_scatter_kernel():
             return False
         inp_size = inp.numel() * inp.element_size()
         if inp_size % 16 != 0:
@@ -1919,7 +1929,7 @@ class CustomAllreduce:
             expected to route to an external lib in that case.
             (last/mid-dim kernels have naive fallbacks built in.)
         """
-        if not self.should_custom_ar(inp):
+        if not self._has_gather_scatter_kernel() or not self.should_custom_ar(inp):
             return False
         ndim = inp.dim()
         if dim < 0:
@@ -2106,11 +2116,11 @@ class CustomAllreduce:
         one launch and one rank barrier. Each output is a contiguous
         `[sum(sizes), ...]` of its input's dtype.
 
-        None where one launch cannot take them -- the gfx1250 path, too many
-        tensors, rows not a multiple of 4 bytes, a non-contiguous input, more
-        than the registered pool holds -- or where NCCL is the faster (more
-        than `_ALL_GATHERV_BYTES_PER_RANK` times the group's size a rank), so
-        the caller gathers another way.
+        None where one launch cannot take them -- the gfx1250 path, a group
+        size with no kernel, too many tensors, rows not a multiple of 4 bytes,
+        a non-contiguous input, more than the registered pool holds -- or where
+        NCCL is the faster (more than `_ALL_GATHERV_BYTES_PER_RANK` times the
+        group's size a rank), so the caller gathers another way.
         Every condition reads only what all ranks share (row widths, `sizes`),
         so all ranks decide alike.
 
@@ -2119,6 +2129,8 @@ class CustomAllreduce:
         otherwise.
         """
         if self._ops_all_gather is not None:
+            return None
+        if not self._has_gather_scatter_kernel():
             return None
         if not 0 < len(inps) <= self._ALL_GATHERV_MAX:
             return None
