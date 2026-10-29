@@ -825,8 +825,12 @@ def test_decode_mixed_node():
     mixed = AssertionError("GPUs on this node differ in CU count")
     # Every importer of `get_cu_num` shares its cache, so clear it to reach the probe.
     chip_info.get_cu_num.cache_clear()
+    # The adaptive kernel's scan is laid out for wave64; the other two run anywhere.
+    backends = (None, topk.BACKEND_SINGLE)
+    if wave_size_of(torch.cuda.current_device()) == 64:
+        backends += (topk.BACKEND_ADAPTIVE,)
     with mock.patch.object(chip_info, "get_cu_num_custom_op", side_effect=mixed):
-        for backend in (None, topk.BACKEND_SINGLE, topk.BACKEND_ADAPTIVE):
+        for backend in backends:
             out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
             flydsl_decode_host._decode_with_backend(
                 logits,
