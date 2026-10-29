@@ -365,14 +365,14 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
-    # 256, the only argument accepted before plans recorded their size, still
-    # suits gfx1250's default 128-token plans.
+    # An explicit argument restates the plan's partition size.
     (
         "graph-workspace",
         {
             "query_length": 4,
             "max_partitions": 7,
             "capture": True,
+            "partition": 256,
             "partition_argument": 256,
         },
     ),
@@ -586,9 +586,8 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
     elif invalid == "partition-size":
         options["context_partition_size"] = 512
     elif invalid == "partition-mismatch":
-        # Only the legacy 256 may differ from the plan's size.
-        plan = pa.plan_pa_decode(rest[0], 1, context_partition_size=256)
-        options["context_partition_size"] = 128
+        # gfx1250 plans default to 128-token partitions.
+        options["context_partition_size"] = 256
     elif invalid == "vector16-k":
         key = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=query.device)
     elif invalid == "vector16-v":

@@ -17,7 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
-from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_kernel import compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan, context_partition_sizes
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
@@ -202,8 +202,7 @@ def pa_decode(
     The work plan sets the context partition size. Plans support 256 tokens on
     all targets and 128 tokens on gfx1250; new plans default to 128 on gfx1250
     and 256 on gfx942/gfx950. ``context_partition_size`` may restate the plan's
-    size. 256, the only value accepted before plans recorded a size, remains
-    valid with any plan.
+    size.
 
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
@@ -355,10 +354,7 @@ def pa_decode(
                 f"pa_decode supports context_partition_size in {supported_sizes} "
                 f"on {arch}, got {context_partition_size}"
             )
-        if context_partition_size not in (
-            KV_COMPUTE_BLOCK,
-            work_plan.context_partition_size,
-        ):
+        if context_partition_size != work_plan.context_partition_size:
             raise ValueError(
                 "context_partition_size must match work_plan.context_partition_size"
             )
