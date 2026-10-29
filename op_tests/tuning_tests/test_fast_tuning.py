@@ -1097,6 +1097,12 @@ class TestPowerSelectionGaps(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
         }
         final_names = []
 
