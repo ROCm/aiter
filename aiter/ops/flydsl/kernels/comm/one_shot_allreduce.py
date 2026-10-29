@@ -40,6 +40,7 @@ from ...allreduce_policy import (
     SUPPORTED_SPLITS,
     SUPPORTED_WORLDS,
 )
+from .one_shot_allreduce_attn_res import OneShotAttnResEpilogue
 from .one_shot_allreduce_rmsnorm import OneShotRMSNormEpilogue
 from .quick_allreduce_fusions import check_fusion_args, make_row_io
 from .transport import (
@@ -189,13 +190,24 @@ def make_one_shot_allreduce_kernel(
     hidden: int | None = None,
     h_pad: int | None = None,
     split: int = 1,
+    nvb: int | None = None,
+    write_bank: bool = False,
+    out_norm: bool = True,
+    acc_cache: bool = False,
+    outnorm_merge: bool = False,
 ):
-    """Build the one-shot all-reduce, plain or fused with residual-add + RMSNorm.
+    """Build the one-shot all-reduce, plain or fused with residual-add + RMSNorm
+    (``fusion="rmsnorm"``) or with the Kimi-K3 attention-residual aggregation
+    (``fusion="attn_res"``, see ``one_shot_allreduce_attn_res``).
 
     ``split`` (fused only) spreads each token row over that many workgroups;
-    see ``one_shot_allreduce_rmsnorm``.
+    see ``one_shot_allreduce_rmsnorm``. ``nvb``, ``write_bank`` and
+    ``out_norm`` are the AttnRes build's bank depth, snapshot and output norm.
     """
-    check_fusion_args(fusion, hidden, h_pad)
+    # attn_res shares the fused row geometry, so it is checked as one.
+    check_fusion_args("rmsnorm" if fusion == "attn_res" else fusion, hidden, h_pad)
+    if fusion != "attn_res" and nvb is not None:
+        raise ValueError("nvb is only meaningful for fusion='attn_res'")
     split = int(split)
     if split not in SUPPORTED_SPLITS:
         raise ValueError(f"split must be one of {SUPPORTED_SPLITS}, got {split!r}")
@@ -224,6 +236,23 @@ def make_one_shot_allreduce_kernel(
 
     if fusion == "none":
         epilogue = _PlainEpilogue(block=block, atoms=atoms)
+    elif fusion == "attn_res":
+        if nvb is None:
+            raise ValueError("fusion='attn_res' requires nvb")
+        epilogue = OneShotAttnResEpilogue(
+            hidden=hidden,
+            h_pad=h_pad,
+            split=split,
+            atoms=atoms,
+            block=block,
+            grid=grid,
+            n_colors=INBOX_BUFFERS,
+            nvb=nvb,
+            write_bank=write_bank,
+            out_norm=out_norm,
+            acc_cache=acc_cache,
+            outnorm_merge=outnorm_merge,
+        )
     else:
         epilogue = OneShotRMSNormEpilogue(
             hidden=hidden,
@@ -263,7 +292,8 @@ def make_one_shot_allreduce_kernel(
     # passed as zeros) in a plain build rather than being appended to a second
     # kernel; a plain epilogue never reads them, so only five unused kernargs
     # remain in a plain build. ``xchg_ptr`` is the split build's exchange
-    # state, and 0 (never read) in every other build.
+    # state, and 0 (never read) in every other build. ``bank_ptr``, ``cw_ptr``,
+    # ``bank_nb`` and ``score_eps`` are the AttnRes build's, 0 elsewhere.
     @flyc.kernel(known_block_size=[block, 1, 1])
     def one_shot_allreduce(
         rank: fx.Int32,
@@ -279,6 +309,12 @@ def make_one_shot_allreduce_kernel(
         w_ptr: fx.Int64,
         eps: fx.Float32,
         xchg_ptr: fx.Int64,
+        bank_ptr: fx.Int64,
+        cw_ptr: fx.Int64,
+        bank_nb: fx.Int32,
+        score_eps: fx.Float32,
+        score_ptr: fx.Int64,
+        ms_ptr: fx.Int64,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
@@ -327,6 +363,12 @@ def make_one_shot_allreduce_kernel(
             eps=eps,
             xchg_ptr=xchg_ptr,
             wrap=_wrap,
+            bank_ptr=bank_ptr,
+            cw_ptr=cw_ptr,
+            bank_nb=bank_nb,
+            score_eps=score_eps,
+            score_ptr=score_ptr,
+            ms_ptr=ms_ptr,
         )
         # Bare names, not ``ep.<hook>(...)``: the rewriter takes a method call
         # inside a runtime loop or branch as a possible mutation of its base
@@ -537,6 +579,12 @@ def make_one_shot_allreduce_kernel(
         w_ptr: fx.Int64,
         eps: fx.Float32,
         xchg_ptr: fx.Int64,
+        bank_ptr: fx.Int64,
+        cw_ptr: fx.Int64,
+        bank_nb: fx.Int32,
+        score_eps: fx.Float32,
+        score_ptr: fx.Int64,
+        ms_ptr: fx.Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         one_shot_allreduce(
@@ -553,6 +601,12 @@ def make_one_shot_allreduce_kernel(
             w_ptr,
             eps,
             xchg_ptr,
+            bank_ptr,
+            cw_ptr,
+            bank_nb,
+            score_eps,
+            score_ptr,
+            ms_ptr,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 

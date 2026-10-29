@@ -37,6 +37,7 @@ from .allreduce_policy import (
     AllReduceAlgorithm,
     OneShotRung,
     fused_oneshot_ladder,
+    fused_split_enabled,
     oneshot_ladder,
     resolve_family_policy,
     resolve_fused_policy,
@@ -80,6 +81,11 @@ def resolve_fused_oneshot_max_bytes(
         world_size=int(world_size), arch=arch, link=link
     ).window(AllReduceAlgorithm.OneShot, quantized=False)
     return 0 if window is None else window.inclusive_range()[1]
+
+
+#: The AttnRes-only kernel arguments (bank, cw, bank rows per token, score eps)
+#: as every build that does not read them passes them.
+_NO_ATTN_RES_ARGS = (Int64(0), Int64(0), Int32(0), Float32(0.0), Int64(0), Int64(0))
 
 
 class OneShotAllReduce:
@@ -237,6 +243,8 @@ class OneShotAllReduce:
             Int64(0),
             Float32(0.0),
             Int64(0),
+            # The AttnRes build's bank, cw, bank rows per token and score eps.
+            *_NO_ATTN_RES_ARGS,
             stream,
         )
 
@@ -704,6 +712,7 @@ class OneShotAllReduceRMSNorm:
             Int64(w_ptr),
             Float32(float(eps)),
             Int64(int(eng._xchg)),
+            *_NO_ATTN_RES_ARGS,
             stream,
         )
 
@@ -850,3 +859,372 @@ class OneShotAllReduceRMSNorm:
         except Exception:  # noqa: BLE001
             # Destructors must not raise, especially during interpreter shutdown.
             return
+
+
+class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
+    """One-shot all-reduce fused with Kimi-K3's attention-residual aggregation.
+
+    Per token row ``t`` (``ar`` is the all-reduce, ``v_j`` the bank rows
+    ``bank[t, 0..nvb-1]`` and the new prefix):
+
+        prefix_out = bf16(prefix_in + bf16(ar))
+        score_j    = dot(v_j, cw) / sqrt(mean(v_j^2) + score_eps)
+        w          = softmax(score)                 (global max first)
+        mix        = sum_j w_j * v_j
+        out        = bf16(mix * rsqrt(mean(mix^2) + out_eps) * ow)   (ow given)
+                   = bf16(mix)                                        (ow None)
+        bank[t, nvb] = prefix_out                   (write_bank)
+
+    which is SGLang's ``attn_res_hip`` with ``addend`` = the all-reduce. It
+    takes the RMSNorm class's ladder and geometry with every rung unsplit (one
+    workgroup per row). Each ``(nvb, write_bank, out_norm)`` is its own binary
+    and engine, built lazily -- a collective, which TP ranks enter in lockstep
+    with the same shapes.
+    """
+
+    def __init__(self, **kwargs):
+        # SILOTIGER-1277: a split>1 build is legal only for the acc_cache path
+        # (the epilogue raises otherwise). Pin it here and every allreduce_attn_res
+        # call with bank_acc builds the split kernel; without a split pin the
+        # engine is unsplit as before.
+        split = kwargs.get("split")
+        if split is not None and int(split) not in SUPPORTED_SPLITS:
+            raise ValueError(f"split must be one of {SUPPORTED_SPLITS}, got {split!r}")
+        # SILOTIGER-1277 iter004: when split is NOT explicitly pinned, the
+        # acc_cache path auto-selects split per (tokens, nvb) from the measured
+        # decode ladder (``_attn_ladder_split``) under AITER_FLY_AR_FUSED_SPLIT=1;
+        # an explicit pin (used by the correctness tests) still forces that split
+        # at every T.
+        self._split_pinned = split is not None
+        kwargs.setdefault("split", 1)
+        hiddens = kwargs.pop("hiddens", ())
+        if hiddens:
+            raise ValueError(
+                "OneShotAllReduceAttnRes builds per (hidden, nvb) on first use; "
+                "pass no hiddens"
+            )
+        if kwargs.get("atoms") is None and kwargs.get("block") is None:
+            # Measured TP2 on MI355X at hidden 7168 (one token row per
+            # workgroup): atoms=2 (448 threads) is 1-12% faster than the two
+            # separate kernels at every T in 1..64 and nvb in {4, 8}; atoms=1
+            # (896 threads) loses at T <= 8 with nvb=8 -- twice the waves to
+            # reduce the 2*(nvb+1) row sums over.
+            kwargs["atoms"] = 2
+        super().__init__(**kwargs)
+
+    @staticmethod
+    def _attn_ladder_split(tokens: int, nvb: int) -> int:
+        """Decode split for the acc_cache attn_res epilogue at (tokens, nvb),
+        TP8/gfx950/H=7168 (SILOTIGER-1277 iter003/iter004 measurements).
+
+        The split epilogue parallelises the ~8us per-token fused epilogue over
+        ``split`` workgroups; it wins while the GPU is occupancy-starved and
+        loses once the wire volume (``split*tokens`` workgroups) saturates:
+          nvb>=8: split=14 wins at T<=4; for T in [5,18] the single-barrier merge
+                  epilogue (iter010 triple-join, shipped on for every split>1)
+                  makes the narrower split=7 FASTER -- its cross-WG join has half
+                  the writers (split*n_waves), so the atomic-join cost that grows
+                  with token count at split=14 (epilogue 3.1->3.46us T4->T8) stays
+                  flat at split=7 (~3.1us), winning -2..-3.6% of the fused op at
+                  T6-T12 (-0.38us/-3.6% @T8), tie at T16 (SILOTIGER-1277 iter050,
+                  runs/iter050_crossover_tp8.json). Hand to cdr_2stage past T18.
+          nvb==4: cdr+agg is cheaper (agg is cheap at nvb=4) so the band is
+                  narrower -- split wins to T<=8, cdr at T>=16. The acc_cache
+                  merge epilogue is nvb-INDEPENDENT (bank depth is in the
+                  producer scalar), so the same split=14->split=7 crossover at
+                  T5 holds: split=14 for T<=4, split=7 for T5-8 (-2.6..-3.5%,
+                  iter050 runs/iter050_nvb4_crossover_tp8.json), else unsplit.
+        Legal splits>1 at H=7168 are 2, 7, 14 (a split=16 slice would be a
+        sub-wave tile). nvb<4 is uncharacterised -> unsplit.
+        """
+        if nvb >= 8:
+            if tokens <= 4:
+                return 14
+            return 7 if tokens <= 18 else 1
+        if nvb >= 4:
+            if tokens <= 4:
+                return 14
+            return 7 if tokens <= 8 else 1
+        return 1
+
+    @staticmethod
+    def _attn_ladder_merge(tokens: int, split: int, out_norm: bool) -> bool:
+        """Single-barrier out-norm (SILOTIGER-1277 iter010) on/off at (tokens,
+        split), TP8/gfx950/H=7168. The out-norm's sum(mix^2) is formed from the
+        prefix dot/sq plus one extra joined word cross=sum(pv*acc), with the
+        sum(acc^2) term supplied as a producer full-row scalar -- so it joins the
+        SAME three words as the two-barrier path but in ONE barrier, saving an
+        xGMI round-trip at NO extra atomic cost. Measured net WIN at every decode
+        T (-0.5..-0.64us, -3.6% @T16 .. -7.4% @T1, split=14 nvb=8), so enable it
+        across the whole split band (``tokens`` is already capped by the split
+        ladder; this just requires split>1 and the output norm)."""
+        return bool(out_norm) and split > 1
+
+    def _attn_key(self, hidden: int, live_bytes: int, nvb: int, write_bank, out_norm,
+                  acc_cache=False):
+        rung = select_rung(self._ladder(hidden), live_bytes)
+        # SILOTIGER-1277 iter004: auto-select the decode split by live bytes when
+        # the caller did not pin one. Only the acc_cache build may split (the
+        # epilogue raises otherwise) and only under the AITER_FLY_AR_FUSED_SPLIT
+        # opt-in; everything else stays unsplit, as before.
+        outnorm_merge = False
+        if (
+            not self._split_pinned
+            and acc_cache
+            and fused_split_enabled()
+        ):
+            tokens = int(live_bytes) // (int(hidden) * 2)
+            split = self._attn_ladder_split(tokens, int(nvb))
+            if split == 7:
+                # iter050: split=7's fast decode geometry is atoms=1 (block=128).
+                # The rung's default atoms=2 would make _split_geom_for resolve
+                # split=7 to atoms=2 (block=64), which is SLOWER than split=14 --
+                # so the mid-band hand-off needs atoms=1 pinned to realize the win.
+                rung = dataclasses.replace(rung, split=split, atoms=1)
+            else:
+                rung = dataclasses.replace(rung, split=split)
+            # iter010: fold join point 2 into join point 1 at low T (same opt-in).
+            outnorm_merge = self._attn_ladder_merge(tokens, split, bool(out_norm))
+        base = self._cfg_key(hidden, rung)
+        return base + (int(nvb), bool(write_bank), bool(out_norm), bool(acc_cache),
+                       bool(outnorm_merge))
+
+    def _build_attn(self, key) -> None:
+        (hidden, atoms, grid, fanout, h_pad, split, nvb, write_bank, out_norm,
+         acc_cache, outnorm_merge) = key
+        spec = make_one_shot_allreduce_kernel(
+            world_size=self.world_size,
+            atoms=atoms,
+            grid=grid,
+            inbox_memory=self.inbox_memory,
+            fanout=fanout,
+            rank=self.rank,
+            fusion="attn_res",
+            hidden=hidden,
+            h_pad=h_pad,
+            split=split,
+            nvb=nvb,
+            write_bank=write_bank,
+            out_norm=out_norm,
+            acc_cache=acc_cache,
+            outnorm_merge=outnorm_merge,
+        )
+        with torch.cuda.device(self._device_index):
+            self._by_cfg[key] = (
+                _StEngine(
+                    spec=spec,
+                    group=self.group,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    inbox_flags=self._inbox_flags,
+                ),
+                spec,
+            )
+
+    def _check_attn(
+        self, inp, prefix_in, bank, nvb, cw, ow, out, prefix_out, write_bank
+    ):
+        hidden = int(inp.shape[-1])
+        bf16 = {"inp": inp, "prefix_in": prefix_in, "bank": bank, "out": out}
+        bf16["prefix_out"] = prefix_out
+        if ow is not None:
+            bf16["ow"] = ow
+        for name, t in list(bf16.items()) + [("cw", cw)]:
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(f"OneShotAllReduceAttnRes requires a Tensor for {name}")
+            want = torch.float32 if name == "cw" else torch.bfloat16
+            if t.dtype != want:
+                raise ValueError(f"{name} must be {want}, got {t.dtype}")
+            if not t.is_cuda or t.device.index != self._device_index:
+                raise ValueError(f"{name} must be on cuda:{self._device_index}")
+            if not t.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+            if int(t.data_ptr()) % 16 != 0:
+                raise ValueError(f"{name} must be 16-byte aligned")
+        tokens = int(inp.numel()) // hidden
+        if inp.dim() != 2 or bank.dim() != 3:
+            raise ValueError("inp must be (T, hidden) and bank (T, NB, hidden)")
+        if tuple(bank.shape[::2]) != (tokens, hidden):
+            raise ValueError(
+                f"bank {tuple(bank.shape)} does not match inp {tuple(inp.shape)}"
+            )
+        n_rows = int(bank.shape[1])
+        if not 1 <= int(nvb) <= n_rows - (1 if write_bank else 0):
+            raise ValueError(
+                f"nvb={nvb} does not fit a bank of {n_rows} rows"
+                + (" with the snapshot row" if write_bank else "")
+            )
+        if cw.numel() != hidden or (ow is not None and ow.numel() != hidden):
+            raise ValueError("cw and ow must have hidden elements")
+        for name, t in (
+            ("prefix_in", prefix_in),
+            ("out", out),
+            ("prefix_out", prefix_out),
+        ):
+            if tuple(t.shape) != tuple(inp.shape):
+                raise ValueError(f"{name} must have the input's shape")
+        live_bytes = int(inp.numel()) * 2
+        if not self.is_beneficial(live_bytes):
+            raise ValueError(
+                f"OneShotAllReduceAttnRes got a {live_bytes} B payload, above the "
+                f"{self.max_bytes} B ceiling; pass max_bytes to override"
+            )
+        check_fused_aliasing(inp, prefix_in, out, prefix_out, live_bytes)
+        return hidden, live_bytes, n_rows
+
+    def precompute_bank_scores(self, bank, cw, nvb, score_eps):
+        """Public: (T, nvb) fp32 bank scores to pass to
+        :meth:`allreduce_attn_res` as ``bank_scores`` (SILOTIGER-1277). Compute
+        once per (bank, cw); reuse across all-reduces that share the bank."""
+        return self._precompute_bank_scores(
+            bank, cw, int(nvb), int(bank.shape[-1]), float(score_eps)
+        )
+
+    def precompute_bank_acc(self, bank, cw, nvb, score_eps):
+        """Public: Kevin Mi's acc-cache (sglang#44988 bank_partial_hip.cuh)
+        ported to aiter (SILOTIGER-1277). Returns ``(acc, ms)``:
+          ms[t]  = (m, sum, accsq): m = max_r s_r over the bank rows, sum = sum_r
+                   exp(s_r - m), accsq = sum_h acc[t,h]^2; (T, 3) fp32. accsq
+                   (iter010) feeds the single-barrier out-norm so sum(acc^2) is
+                   never joined across workgroups; m/sum are columns 0/1 as before.
+          acc[t] = sum_r exp(s_r - m) * bank[t, r]; (T, hidden) fp32.
+        where s_r = dot(bank[t,r], cw) / sqrt(mean(bank[t,r]^2) + score_eps).
+        The fused read then folds ONLY the new row against these, never reading
+        the bank VALUES. Normalised to the BANK's max m (NOT the global max); the
+        read renormalises by exp(m - m') when the stream raises the max -- the
+        exact order of Kevin's kernel, so the softmax is the same math.
+        Compute once per (bank, cw); SGLang does it one layer ahead on the route
+        sort's spare workgroups (overlapped, ~free)."""
+        hidden = int(bank.shape[-1])
+        v = bank[:, :nvb, :].to(torch.float32)              # (T, nvb, H)
+        cwf = cw.to(torch.float32).view(1, 1, hidden)
+        dot = (v * cwf).sum(dim=-1)                          # (T, nvb)
+        meansq = (v * v).sum(dim=-1) * (1.0 / hidden)
+        scores = dot * torch.rsqrt(meansq + float(score_eps))  # (T, nvb)
+        m = scores.max(dim=-1, keepdim=True).values          # (T, 1) bank max
+        w = torch.exp(scores - m)                            # (T, nvb)
+        s = w.sum(dim=-1, keepdim=True)                      # (T, 1)
+        acc = torch.einsum("tr,trh->th", w, v)               # (T, H) fp32
+        # SILOTIGER-1277 iter010: accsq = sum_h acc^2 per token, a full-row
+        # scalar the producer is already positioned to form (acc is in hand and
+        # AR-independent). The single-barrier out-norm epilogue reads it directly
+        # so it never has to join sum(acc^2) across workgroups -- the out-norm's
+        # sum of squares then needs only ONE extra joined word (cross=sum(pv*acc))
+        # on top of the prefix dot/sq, i.e. the SAME word count as the two-barrier
+        # path but one fewer barrier -> a net win at every decode T (not just the
+        # low-T tiles the 4-word variant was limited to).
+        accsq = (acc * acc).sum(dim=-1, keepdim=True)        # (T, 1) fp32
+        ms = torch.cat([m, s, accsq], dim=-1).contiguous()   # (T, 3)
+        return acc.contiguous(), ms
+
+    def _precompute_bank_scores(self, bank, cw, nvb, hidden, score_eps):
+        """fp32 (T, nvb) softmax scores for the bank rows (SILOTIGER-1277).
+
+        The bank rows are pre-existing context -- not products of this
+        all-reduce -- so their score ``dot(v_j, cw) / sqrt(mean(v_j^2) +
+        score_eps)`` can be computed once here instead of block-reduced in the
+        fused epilogue for every launch. Returned contiguous (T, nvb) fp32.
+
+        Math matches the kernel: bank values are cast bf16->fp32, cw is fp32,
+        ``mean = sum(v^2) / hidden``. The reduction order differs from the
+        kernel's reassoc tree, so this is validated bit-for-bit by the op_test
+        gate (<= 1 ulp vs Triton), not assumed.
+        """
+        tokens = int(bank.shape[0])
+        v = bank[:, :nvb, :].to(torch.float32)  # (T, nvb, hidden)
+        cwf = cw.to(torch.float32).view(1, 1, hidden)
+        dot = (v * cwf).sum(dim=-1)  # (T, nvb)
+        meansq = (v * v).sum(dim=-1) * (1.0 / hidden)
+        scores = dot * torch.rsqrt(meansq + score_eps)
+        return scores.contiguous()
+
+    def allreduce_attn_res(
+        self,
+        inp,
+        prefix_in,
+        bank,
+        nvb: int,
+        cw,
+        ow,
+        score_eps: float,
+        out_eps: float,
+        *,
+        out=None,
+        prefix_out=None,
+        write_bank: bool = False,
+        bank_scores=None,
+        bank_acc=None,
+        stream=None,
+    ):
+        """``(out, prefix_out)``; both are allocated when not supplied.
+
+        ``bank_scores`` (SILOTIGER-1277): optional caller-precomputed (T, nvb)
+        fp32 bank softmax scores. When the bank is reused across calls (it is
+        context, not a product of this all-reduce) the caller computes these
+        once with :meth:`precompute_bank_scores` and passes them in, keeping the
+        reduction out of the fused op's hot path. When ``None`` they are
+        computed here (convenient, but on the critical path).
+
+        ``bank_acc`` (SILOTIGER-1277, Kevin Mi acc-cache): optional ``(acc, ms)``
+        from :meth:`precompute_bank_acc`. When given, the fused read NEVER touches
+        bank values -- it folds only the new row against the cached weighted bank
+        sum. Selects the ``acc_cache`` build (its own binary). Takes precedence
+        over ``bank_scores``."""
+        if out is None:
+            out = torch.empty_like(inp)
+        if prefix_out is None:
+            prefix_out = torch.empty_like(prefix_in)
+        hidden, live_bytes, n_rows = self._check_attn(
+            inp, prefix_in, bank, nvb, cw, ow, out, prefix_out, write_bank
+        )
+        acc_cache = bank_acc is not None
+        key = self._attn_key(hidden, live_bytes, nvb, write_bank, ow is not None,
+                             acc_cache=acc_cache)
+        if key not in self._by_cfg:
+            self._build_attn(key)
+        eng, spec = self._by_cfg[key]
+        ptrs = tuple(
+            int(t.data_ptr()) if t is not None else 0
+            for t in (inp, out, prefix_in, prefix_out, ow)
+        )
+        args = self._launch_args(
+            eng, spec, ptrs, out_eps, stream, hidden=hidden, live_bytes=live_bytes
+        )
+        # Bank-norm cache (SILOTIGER-1277): the nvb bank rows are pre-existing
+        # context, not products of this all-reduce, so their softmax score
+        # (dot(v_j, cw) / sqrt(mean(v_j^2) + score_eps)) does not depend on the
+        # reduced row. Precompute the nvb bank scores here once, in fp32, and
+        # pass them in; the fused epilogue then only block-reduces the new
+        # prefix row (2 words) instead of every bank row (2*(nvb+1) words),
+        # dropping the cross-wave join from 2*(nvb+1)+1 to 3. The math is
+        # unchanged -- the softmax still takes the global max before exp.
+        #
+        # acc-cache (Kevin Mi port): when bank_acc=(acc, ms) is given, the read
+        # never touches bank values; score_ptr carries acc (T,H fp32), the extra
+        # ms_ptr carries (m, sum, accsq) (T,3 fp32; iter010). Otherwise score_ptr carries the
+        # (T, nvb) scores and ms_ptr is 0.
+        if acc_cache:
+            acc, ms = bank_acc
+            score_data, ms_data = int(acc.data_ptr()), int(ms.data_ptr())
+        else:
+            if bank_scores is None:
+                bank_scores = self._precompute_bank_scores(
+                    bank, cw, nvb, hidden, float(score_eps)
+                )
+            score_data, ms_data = int(bank_scores.data_ptr()), 0
+        # The RMSNorm launch passes zeros for the AttnRes arguments; swap in
+        # this call's (they sit just before the stream).
+        tail = len(_NO_ATTN_RES_ARGS) + 1
+        args = args[:-tail] + (
+            Int64(int(bank.data_ptr())),
+            Int64(int(cw.data_ptr())),
+            Int32(n_rows),
+            Float32(float(score_eps)),
+            Int64(score_data),
+            Int64(ms_data),
+            args[-1],
+        )
+        self._has_launched = True
+        with torch.cuda.device(self._device_index):
+            _run_compiled(eng.launch, *args)
+        return out, prefix_out

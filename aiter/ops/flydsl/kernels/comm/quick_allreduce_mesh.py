@@ -41,6 +41,7 @@ from ...allreduce_policy import (
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
 )
+from .quick_allreduce_attn_res import MeshAttnResEpilogue
 from .quick_allreduce_codec import (
     _clamp_fp16_overflow,
     _codec_dequant,
@@ -195,8 +196,12 @@ def make_quick_allreduce_mesh_kernel(
     mxfp4: bool = False,
     low_latency: bool = False,
     rank: int,
+    # Build parameters of the AttnRes epilogue (``nvb``, ``bank_nb``,
+    # ``write_bank``, ``out_norm``); ignored by every other fusion.
+    attn_res: dict | None = None,
 ):
     check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
+    attn_res = dict(attn_res or {})
     if low_latency and (fusion == "none" or super_tile != 1):
         raise ValueError("low_latency needs a fused build with super_tile=1")
     if world_size not in SUPPORTED_WORLDS:
@@ -214,6 +219,18 @@ def make_quick_allreduce_mesh_kernel(
 
     if fusion == "none":
         epilogue = QuickReducePlainEpilogue(block=block, world_size=world_size)
+    elif fusion == "attn_res":
+        if mxfp4 or low_latency:
+            raise ValueError(
+                "the AttnRes epilogue has no MXFP4 or low-latency build"
+            )
+        epilogue = MeshAttnResEpilogue(
+            hidden=hidden,
+            h_pad=h_pad,
+            block=block,
+            world_size=world_size,
+            **attn_res,
+        )
     else:
         epilogue = MeshRMSNormEpilogue(
             hidden=hidden,
