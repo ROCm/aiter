@@ -1680,6 +1680,49 @@ def test_mha_v4_kv_splits_merge_addresses_past_2_31_elements(sequence, heads, sp
     assert torch.equal(lse[0], partial_lse[-1])
 
 
+@parametrize("write_lse", [True, False])
+def test_mha_v4_kv_splits_merge_skips_empty_ranges(write_lse):
+    """A range with no valid keys for a row has LSE -inf and must carry no weight, whatever its
+    partial output holds. mha_v4 gives every range real keys, so its tests never reach this.
+    Range 1 is empty for every row, some rows are empty in range 0 alone, and some in every
+    range, which must give a 0 output and LSE -inf rather than NaN. 77 rows leave a partial tile.
+    """
+    torch.manual_seed(67)
+    batch, splits, heads, sequence = 2, 3, 2, 77
+    partial_out = torch.randn(
+        (batch * splits, sequence, heads, 128), device="cuda", dtype=torch.bfloat16
+    )
+    partial_lse = torch.randn((batch * splits, heads, sequence), device="cuda") * 4
+    partial_lse[1::splits] = float("-inf")
+    partial_out[1::splits] = 1e4
+    partial_lse[0::splits, :, :10] = float("-inf")
+    partial_lse[:, :, 20:25] = float("-inf")
+    partial_lse[splits : 2 * splits, 1, 40:42] = float("-inf")
+    out = torch.full((batch, sequence, heads, 128), float("nan"), device="cuda")
+    out = out.to(torch.bfloat16)
+    lse = torch.full((batch, heads, sequence), float("nan"), device="cuda")
+
+    lse_merge(partial_out, partial_lse, out, lse if write_lse else None)
+
+    split_lse = partial_lse.view(batch, splits, heads, sequence)
+    reference_lse = torch.logsumexp(split_lse, dim=1)
+    reached = torch.isfinite(reference_lse)
+    weight = torch.where(
+        reached.unsqueeze(1), torch.exp(split_lse - reference_lse.unsqueeze(1)), 0.0
+    )
+    reference = torch.einsum(
+        "bihs,bishd->bshd",
+        weight,
+        partial_out.float().view(batch, splits, sequence, heads, 128),
+    )
+    assert not out.isnan().any()
+    assert (out.permute(0, 2, 1, 3)[~reached] == 0).all()
+    torch.testing.assert_close(out.float(), reference, atol=1e-2, rtol=1e-2)
+    if write_lse:
+        assert torch.equal(lse[~reached], reference_lse[~reached])
+        torch.testing.assert_close(lse[reached], reference_lse[reached])
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
 def test_mha_v4_lse_is_gated_off_gfx950():
     """gfx942 carries the epilogue, but its exported value has never been measured.
