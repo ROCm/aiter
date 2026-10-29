@@ -621,6 +621,9 @@ def get_gemm2_kernels_list(
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = {k: copy.deepcopy(v) for k, v in gemm2_kernels_dict[tag].items()}
+    if tag == "a8w8_gfx950" and Adtype in ("I8", "i8"):
+        # The KVec8 instances need the single-rate FP8 MFMA, which int8 does not have on gfx950.
+        kernels_list = {k: v for k, v in kernels_list.items() if not v.KVec8}
     for kernel in kernels_list.values():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.Nswizzle = Nswizzle

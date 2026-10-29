@@ -199,9 +199,13 @@ def shuffle_weight(
         # BK does not change the layout, so a K that is a multiple of the K vector can use
         # one vector as BK.
         BK = K
-    elif x.shape[-1] % K != 0 and not use_int4 and x.shape[-1] % (K // 2) == 0:
-        # A K that is a multiple of half a K vector is laid out in half-width vectors.
-        # The KVec8 MoE kernels read this layout.
+    elif (
+        x.shape[-1] % K != 0
+        and x.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        and x.shape[-1] % (K // 2) == 0
+    ):
+        # An FP8 K that is a multiple of half a K vector is laid out in half-width vectors.
+        # Only the KVec8 FP8 MoE kernels read this layout.
         K //= 2
         BK = K
     assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"

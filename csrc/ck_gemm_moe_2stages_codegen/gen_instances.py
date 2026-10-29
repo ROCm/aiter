@@ -583,23 +583,27 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
         && {Quant} == quant)
     {{
         // An inter_dim that is not a multiple of 16 uses the KVec8 instances.
-        if (inter_dim % 16 != 0)
+        // They need the single-rate FP8 MFMA, so int8 does not have them.
+        if constexpr (ck::is_same_v<{A0DataType}, F8>)
         {{
-            if (block_m == 32)
+            if (inter_dim % 16 != 0)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 64, 32, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
-            }}
-            if (block_m == 64)
-            {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 64, 32, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
-            }}
-            if (block_m == 128)
-            {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 32, 4, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
-            }}
-            if (block_m == 256)
-            {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 32, 4, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+                if (block_m == 32)
+                {{
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 64, 32, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+                }}
+                if (block_m == 64)
+                {{
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 64, 32, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+                }}
+                if (block_m == 128)
+                {{
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 32, 4, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+                }}
+                if (block_m == 256)
+                {{
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 64, 32, 4, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, true, true>;
+                }}
             }}
         }}
         // The 128-wide N tiles need a model_dim that is a multiple of 128.

@@ -14,8 +14,8 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.shuffle import shuffle_weight
 
 pytestmark = pytest.mark.skipif(
-    get_gfx() != "gfx950",
-    reason="Exercises the gfx950 per-tensor FP8 CK stage-2 K padding",
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="Exercises the gfx942 and gfx950 per-tensor FP8 CK MoE dispatch",
 )
 
 # FP8 activations alone give about 0.05 relative error. A wrong kernel is far above it.
@@ -94,8 +94,9 @@ def test_per_tensor_fp8_aligned_inter_dim(
 
 
 @pytest.mark.parametrize("tokens", [33])
-@pytest.mark.parametrize("model_dim", [4096])
-@pytest.mark.parametrize("inter_dim", [64, 192, 384, 640, 896])
+# 2880 is a hidden size that is not a multiple of 128, as in gpt-oss.
+@pytest.mark.parametrize("model_dim", [2880, 4096])
+@pytest.mark.parametrize("inter_dim", [64, 88, 176, 192, 352, 384, 640, 896])
 @pytest.mark.parametrize("experts", [32])
 @pytest.mark.parametrize("topk", [4])
 @pytest.mark.parametrize("block_m", [32, 64, 128])
@@ -103,7 +104,7 @@ def test_per_tensor_fp8_unaligned_inter_dim(
     tokens, model_dim, inter_dim, experts, topk, block_m
 ):
     # None of these shapes is a multiple of 256, the K of the largest stage-2 tile.
-    # 384 is the TP4 shard of Qwen3-235B-A22B-FP8, which could not be served before.
+    # 88, 176, 352 and 384 are TP shards of DiffusionGemma-26B-A4B and Qwen3-235B-A22B.
     err = compute_relative_error(tokens, model_dim, inter_dim, experts, topk, block_m)
     assert (
         err < RELATIVE_ERROR_TOLERANCE
