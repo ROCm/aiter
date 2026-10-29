@@ -315,7 +315,10 @@ def make_k_sliced_lds_layout(rows, block_k, k_waves):
     512 elements. With ``k_waves=1`` this is ``make_lds_layout``.
     """
     block_k_w = block_k // k_waves
-    assert (rows * block_k_w) % 512 == 0
+    if (rows * block_k_w) % 512:
+        raise ValueError(
+            "each K-sliced LDS sub-tile must span a multiple of 512 elements"
+        )
     swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
     return fx.make_composed_layout(
         swizzle,

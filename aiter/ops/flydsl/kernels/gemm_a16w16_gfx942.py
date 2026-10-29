@@ -76,6 +76,8 @@ GFX942_NUM_CUS = 304  # MI300X CUs: workgroups per round in the cost model
 CPOL_SC0_SC1 = 1 | 16
 # Split-K semaphore and signal slots per launch: one per output tile.
 SPLIT_K_MAX_TILES = 1024
+# AMD buffer resource descriptors encode the accessible byte count in 32 bits.
+FLAT_BUFFER_LIMIT_BYTES = 1 << 32
 
 # Config keys: the make_gemm_a16w16_gfx942_param arguments except the dtypes
 # (set by gemm_a16w16) and the MFMA shape (fixed on gfx942), with their
@@ -634,6 +636,23 @@ def _dynamic_tensor_arg(tensor, leading_dim):
     )
 
 
+def _tensor_span_bytes(tensor: torch.Tensor) -> int:
+    if tensor.numel() == 0:
+        return 0
+    last_offset = sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return (last_offset + 1) * tensor.element_size()
+
+
+def _check_flat_buffer_capacity(name: str, size: int) -> None:
+    if size >= FLAT_BUFFER_LIMIT_BYTES:
+        raise ValueError(
+            f"gfx942 GEMM {name} buffer spans {size} bytes; "
+            "flat buffer descriptors require fewer than 4 GiB"
+        )
+
+
 @functools.cache
 def get_split_k_buffers(stream_handle: int, device, split_k, split_k_reduce):
     """Split-K tile semaphores and signals, one set per split_k and split_k_reduce.
@@ -1098,6 +1117,18 @@ def gemm_a16w16(
                 f"(got shape {list(out.shape)}, strides {out.stride()})"
             )
 
+    on_stream = (
+        contextlib.nullcontext() if stream == current else torch.cuda.stream(stream)
+    )
+    if m == 0 or n == 0:
+        with on_stream:
+            if out is None:
+                out = torch.empty((m, n), dtype=out_dtype, device=device)
+        return out.view(m, n)
+
+    _check_flat_buffer_capacity("A", _tensor_span_bytes(a))
+    _check_flat_buffer_capacity("B", _tensor_span_bytes(b))
+
     # Param defaults, overlaid by the shape's tuned-table row (else the
     # cost-model fallback), then by any caller overrides.
     kwargs = dict(CONFIG_DEFAULTS)
@@ -1134,12 +1165,21 @@ def gemm_a16w16(
         raise ValueError(error)
     param = make_gemm_a16w16_gfx942_param(**kwargs)
 
+    kernel_out_bytes = (
+        m * n * (4 if kwargs["out_dtype_id"] == GEMM_A16W16_DTYPE_FP32 else 2)
+    )
+    _check_flat_buffer_capacity("output", kernel_out_bytes)
+    workspace_elems = None
+    if split_k_reduce:
+        num_tiles = ((m + param.block_m - 1) // param.block_m) * (
+            (n + param.block_n - 1) // param.block_n
+        )
+        workspace_elems = num_tiles * split_k * param.block_m * param.block_n
+        _check_flat_buffer_capacity("split-K workspace", workspace_elems * 4)
+
     # Allocate on the launch stream, so the caching allocator orders reuse of
     # these buffers after the kernel, and copy back on it. Entering the stream
     # context costs ~8 us of host time, so it is skipped when already current.
-    on_stream = (
-        contextlib.nullcontext() if stream == current else torch.cuda.stream(stream)
-    )
     with on_stream:
         if out is None:
             out = torch.empty((m, n), dtype=out_dtype, device=device)
@@ -1153,11 +1193,8 @@ def gemm_a16w16(
         )
         if split_k_reduce:
             # Partial tiles of every split; the last split of a tile reduces them.
-            num_tiles = ((m + param.block_m - 1) // param.block_m) * (
-                (n + param.block_n - 1) // param.block_n
-            )
             workspace = torch.empty(
-                (num_tiles * split_k * param.block_m * param.block_n,),
+                (workspace_elems,),
                 dtype=torch.float32,
                 device=device,
             )

@@ -642,6 +642,39 @@ def test_gemm_a16w16_gfx942_rejects_invalid_inputs(case, error):
         gemm_a16w16(layout="nt", out_dtype=torch.bfloat16, **_invalid_inputs(case))
 
 
+@pytest.mark.parametrize("m,n", [(0, 64), (64, 0), (0, 0)])
+def test_gemm_a16w16_gfx942_empty_output(m, n):
+    _require_gfx942()
+    k = 128
+    x = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
+    w = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+
+    actual = gemm_a16w16(x, w.t(), out=out)
+
+    assert actual.data_ptr() == out.data_ptr()
+    assert actual.shape == (m, n)
+
+
+def test_gemm_a16w16_gfx942_rejects_flat_buffers_at_4_gib():
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    padded = torch.empty((2, 12))[:, :8]
+    assert g._tensor_span_bytes(padded) == 20 * padded.element_size()
+    g._check_flat_buffer_capacity("A", g.FLAT_BUFFER_LIMIT_BYTES - 1)
+    with pytest.raises(ValueError, match="fewer than 4 GiB"):
+        g._check_flat_buffer_capacity("A", g.FLAT_BUFFER_LIMIT_BYTES)
+
+
+def test_gfx942_k_sliced_layout_rejects_invalid_subtile():
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942_mainloop import (
+        make_k_sliced_lds_layout,
+    )
+
+    with pytest.raises(ValueError, match="multiple of 512 elements"):
+        make_k_sliced_lds_layout(rows=1, block_k=64, k_waves=1)
+
+
 def test_gemm_a16w16_gfx942_rejects_non_304_cu_target(monkeypatch):
     _require_gfx942()
     import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
