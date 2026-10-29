@@ -657,8 +657,22 @@ struct CodecFP8 : public CodecBase
 
             // Derive scales
             int decoding_scale = packed_mul<T>(wmax, kScaleFactor);
-            int encoding_scale = packed_add<T>(decoding_scale, kScaleEpsilon);
-            encoding_scale     = packed_rcp<T>(encoding_scale);
+            int encoding_scale;
+            if constexpr(std::is_same<T, __hip_bfloat16>::value)
+            {
+                // Adding a fixed epsilon only on the encoding side attenuates
+                // small BF16 inputs (twice in this two-shot collective). Keep
+                // the scales reciprocal, with a floor solely to make the
+                // reciprocal finite for zero/subnormal scales. 0x0080 is the
+                // smallest normal BF16; its reciprocal is representable.
+                constexpr int kMinNormalScale = 0x00800080;
+                encoding_scale = packed_max<T>(decoding_scale, kMinNormalScale);
+            }
+            else
+            {
+                encoding_scale = packed_add<T>(decoding_scale, kScaleEpsilon);
+            }
+            encoding_scale = packed_rcp<T>(encoding_scale);
 
             // Apply scales to get quantized values
             for(int i = 0; i < 4; i++)
