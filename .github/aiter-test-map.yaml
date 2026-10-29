@@ -248,28 +248,19 @@ tests:
       - aiter/fhmoe.py
       - aiter/fhmoe_contract.py
 
-# hsa/<arch>/<dir>/ -> tests. Hand-maintained: ASM kernels are not in any
-# import graph. Directory list below is from hsa/gfx950/.
+# hsa/<arch>/<family>/ -> tests, for the families the selector cannot derive.
+#
+# It reads `hsa/codegen.py -m <family>` out of each JIT module's blob_gen_cmd
+# and follows that module to its Python consumer, which covers 24 of the 27
+# families on disk. Only the three below declare no codegen command, so only
+# they need an entry here; an unmapped family runs the full suite.
 hsa: {}
-#   a16w8gemm:
-#   bf16gemm:
-#   f4f6gemm:
-#   f4gemm:
-#   f6f4gemm:
-#   f6gemm:
-#   fmha_v3_bwd:
-#   fmha_v3_fwd:
-#   fmha_v4_fwd:
-#   fmoe:
-#   fmoe_2stages:
-#   fp8gemm_blockscale:
-#   i8gemm:
-#   mla:
 #   mla_opus:
-#   mla_v4:
-#   pa:
-#   reduce:
-#   topksoftmax:
+#     - op_tests/<test that exercises the Opus MLA decode ASM kernels>
+#   topk_per_row_decode:
+#     - op_tests/test_topk_per_row.py
+#   topk_per_row_prefill:
+#     - op_tests/test_topk_per_row.py
 
 # Tuned-config files name an op, not a test. Each regex is matched against the
 # config's basename; a config matching no rule makes CI run the full suite.

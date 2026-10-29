@@ -99,7 +99,13 @@ IGNORED_FILES = {"LICENSE", ".gitignore"}
 TRITON_SRC = "aiter/ops/triton/"
 
 # Headers are resolved against these, longest-prefix first, like the build does.
-INCLUDE_DIRS = ("csrc/include", "csrc", "csrc/kernels", "csrc/py_itfs_ck", "csrc/cpp_itfs")
+INCLUDE_DIRS = (
+    "csrc/include",
+    "csrc",
+    "csrc/kernels",
+    "csrc/py_itfs_ck",
+    "csrc/cpp_itfs",
+)
 
 
 def list_tests():
@@ -230,7 +236,9 @@ def bare_import_tests():
     out = set()
     for test in list_tests():
         text = (ROOT / test).read_text(encoding="utf-8", errors="ignore")
-        mods = set(re.findall(r"^\s*(?:from|import)\s+(aiter[A-Za-z0-9_.]*)", text, re.M))
+        mods = set(
+            re.findall(r"^\s*(?:from|import)\s+(aiter[A-Za-z0-9_.]*)", text, re.M)
+        )
         if not mods - generic:
             out.add(test)
     return out
@@ -252,7 +260,7 @@ def resolve_includes(path):
     for match in re.finditer(r'#\s*include\s+"([^"]+)"', text):
         target = match.group(1)
         for base in (str(Path(path).parent),) + INCLUDE_DIRS:
-            cand = (ROOT / base / target)
+            cand = ROOT / base / target
             if cand.is_file():
                 found.add(cand.resolve().relative_to(ROOT.resolve()).as_posix())
                 break
@@ -283,13 +291,40 @@ def csrc_to_modules():
 
 
 @cache
+def hsa_to_modules():
+    """hsa/<arch>/<family>/ -> JIT modules, from each module's blob_gen_cmd.
+
+    A module that compiles ASM kernels names its family on the codegen command
+    line ("hsa/codegen.py -m mla"), which is the same declaration the build
+    itself relies on. 24 of the 27 families on disk are covered; the rest fall
+    back to the map's `hsa:` section.
+    """
+    config = json.loads((ROOT / JIT_CONFIG).read_text(encoding="utf-8"))
+    owners = defaultdict(set)
+    for module, cfg in config.items():
+        for family in re.findall(
+            r"codegen\.py\s+-m\s+([a-z0-9_]+)", str(cfg.get("blob_gen_cmd", ""))
+        ):
+            owners[family].add(module)
+    return dict(owners)
+
+
+@cache
 def module_to_wrappers():
-    """JIT module name -> aiter/ops/*.py files that declare @compile_ops for it."""
+    """JIT module name -> the aiter Python files that drive it.
+
+    @compile_ops("module_x") is the common declaration, but the ASM modules are
+    loaded by name instead -- MD_NAME = "module_mla_asm", or a
+    build_ctypes_module("module_mla_asm") call -- so any file quoting the name
+    counts as a consumer.
+    """
+    names = set(json.loads((ROOT / JIT_CONFIG).read_text(encoding="utf-8")))
     owners = defaultdict(set)
     for path in source_files():
         text = (ROOT / path).read_text(encoding="utf-8", errors="ignore")
-        for module in re.findall(r'@compile_ops\(\s*"([A-Za-z0-9_]+)"', text):
-            owners[module].add(path)
+        for module in re.findall(r'["\']([A-Za-z0-9_]+)["\']', text):
+            if module in names:
+                owners[module].add(path)
     return dict(owners)
 
 
@@ -300,7 +335,15 @@ def module_to_wrappers():
 
 def changed_files(merge_ref):
     """Compare the checked-out PR merge to its base parent."""
-    cmd = ["git", "diff", "--name-only", "--no-renames", "-z", merge_ref + "^1", merge_ref]
+    cmd = [
+        "git",
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        merge_ref + "^1",
+        merge_ref,
+    ]
     out = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=True)
     return [path for path in out.stdout.split("\0") if path]
 
@@ -371,12 +414,20 @@ def select(diff):
             hits = reached(wrappers)
             why = f"JIT modules {sorted(modules)} and their tests"
         elif path.startswith(HSA):
-            parts = path[len(HSA):].split("/")
+            parts = path[len(HSA) :].split("/")
             family = parts[1] if len(parts) > 1 else None
-            hits = set(hsa_map.get(family) or [])
+            modules = hsa_to_modules().get(family, set())
+            wrappers = set()
+            for module in modules:
+                wrappers |= module_to_wrappers().get(module, set())
+            hits = reached(wrappers) if wrappers else set()
+            why = f"hsa family '{family}' via {sorted(modules)}"
+            if not hits:
+                # No codegen declaration, or none of its modules has a wrapper.
+                hits = set(hsa_map.get(family) or [])
+                why = f"hsa family '{family}' from the map"
             if not hits:
                 raise RuntimeError(f"{path}: hsa family '{family}' is not mapped")
-            why = f"hsa family '{family}'"
         elif path.startswith(TRITON_SRC):
             # A .py resolves through the import graph; a tuned config names no
             # consumer, and a kernel no op_test imports directly is still
