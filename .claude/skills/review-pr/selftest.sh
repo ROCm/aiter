@@ -184,6 +184,38 @@ printf 'Review (advisory): \342\232\240 NEEDS WORK\n\342\232\240 a reported find
 rc=0; python3 "$S/triage.py" independent "$tmp/independent.txt" "$tmp/card.md" >/dev/null 2>&1 || rc=$?
 t "a silent downgrade is rejected" "$rc" "1"
 
+echo "[derive]"
+# Families for a synthetic diff, run through the shipping parse() + derive().
+fams() {  # <diff text> -> space-separated family names
+  printf '%s' "$1" | python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+print(" ".join(f for f, _ in triage.derive(triage.parse(sys.stdin.read()))))' "$S"
+}
+repin='diff --git a/3rdparty/composable_kernel b/3rdparty/composable_kernel
+--- a/3rdparty/composable_kernel
++++ b/3rdparty/composable_kernel
+@@ -1 +1 @@
+-Subproject commit 1111111111111111111111111111111111111111
++Subproject commit 2222222222222222222222222222222222222222
+'
+docs='diff --git a/docs/ck.md b/docs/ck.md
+--- a/docs/ck.md
++++ b/docs/ck.md
+@@ -1 +1 @@
+-old note
++bumped CK for the new kernel
+'
+# 3rdparty/ is INFRA: if the repin is not seen first, both of these return infra-only and HK20
+# is never selected.
+t "a standalone submodule repin selects HK20" "$(fams "$repin")" "submodule-repin"
+t "a repin with only docs alongside selects HK20" "$(fams "$repin$docs")" "submodule-repin"
+t "docs alone stay infra-only" "$(fams "$docs")" "infra-only"
+
+echo "[mapping]"
+# MAPPING.md is generated; a family or rule added to derive() without regenerating it drifts.
+t "MAPPING.md matches \`triage.py mapping\`" \
+  "$(python3 "$S/triage.py" mapping | diff -q - "$S/MAPPING.md" >/dev/null && echo same || echo drift)" "same"
+
 echo "[watchdog]"
 # The watchdog is the one guard that cannot be tested by running it: `issue_comment` workflows
 # only ever run from the default branch, so GitHub will not execute that job until this merges.

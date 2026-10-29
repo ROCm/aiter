@@ -1054,20 +1054,19 @@ def derive(files, title="", raw_diff=""):
     INFRA = (".github/", "docs/", "3rdparty/", "third_party/", ".gitignore",
              "requirements", "README", "CONTRIBUTING", ".gitmodules",
              "setup.py", "conftest.py", "pyproject.toml", "hsa/")
+    # 3rdparty/ is INFRA, so a repin has to be seen before either shortcut below: otherwise a
+    # standalone repin, or one that only touches docs alongside, returns NONE and HK20 never runs.
+    repin = any(p.startswith("3rdparty/") and any(l.startswith("Subproject commit") for l in f["add"])
+                for p, f in files.items())
+    if repin:
+        hit("submodule-repin", "HK20")
     if paths and all(p.startswith(INFRA) or p.endswith((".md", ".txt", ".cfg", ".toml"))
                      or "/docs/" in p for p in paths):
-        return [("infra-only", "NONE")]
+        return t or [("infra-only", "NONE")]
     # Pure submodule / version-pointer bump: subproject commit lines and nothing else
-    _has_submodule_repin = any(
-        p.startswith("3rdparty/") and any("Subproject commit" in ln for ln in f["add"])
-        for p, f in files.items())
     if add and all(re.match(r"^(Subproject commit|[0-9a-f]{40}$|.*version.*=)", l.strip())
                    for l in add.splitlines() if l.strip()):
-        if _has_submodule_repin:
-            return [("version-bump", "HK20")]
-        return [("version-bump", "NONE")]
-    if _has_submodule_repin:
-        hit("submodule-repin", "HK20")
+        return t or [("version-bump", "NONE")]
 
     if any(f["new"] and (p.startswith("csrc/kernels/") or "/triton/" in p or "_gluon_kernels/" in p)
            for p, f in files.items()):
