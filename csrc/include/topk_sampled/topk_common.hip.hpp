@@ -735,6 +735,10 @@ __device__ __forceinline__ void stable_place(uint32_t k,
 // Two vectors in flight per lane: phase_c inlines this twice next to its other
 // emitters, and four put one instantiation past its 64-VGPR budget into scratch.
 constexpr int STABLE_ROW_LOADS = 2;
+// The row goes by in chunks of this many vectors, each counted and then placed,
+// and the emit stops at the chunk that fills both quotas: a row with a long tie
+// at the pivot is done in its first chunk instead of counted whole first.
+constexpr int STABLE_ROW_CHUNK_VECS = 8192;
 
 // keys4 for a row in global memory, bounds-checked like block_gather_stream's
 // loads so a row of any width is read whole.
@@ -748,7 +752,7 @@ __device__ __forceinline__ opus::u32x4_t row_keys4(const float* __restrict__ row
                          sortable_key<NAN_HIGH>(v[3])};
 }
 
-template <bool WRITE_VALUES, bool NAN_ONE, typename Keys4Fn>
+template <bool WRITE_VALUES, bool NAN_ONE, bool CHUNKED = false, typename Keys4Fn>
 __device__ __forceinline__ void block_gather_in_order(int len,
                                                       int idx_base,
                                                       uint32_t pivot,
@@ -759,106 +763,232 @@ __device__ __forceinline__ void block_gather_in_order(int len,
                                                       uint32_t* __restrict__ s_wtot,
                                                       Keys4Fn keys4)
 {
-    static_assert(!(NAN_ONE && WRITE_VALUES), "NAN_ONE is instantiated for indices only");
-    nan_one_remap<NAN_ONE>(pivot, ngt, eq_needed);
-    const int lane     = threadIdx.x & (WAVE_SIZE - 1);
-    const int wid      = threadIdx.x / WAVE_SIZE;
-    const int nwaves   = blockDim.x / WAVE_SIZE;
-    const int n4       = n4_cover(len);
-    const int steps    = (n4 + WAVE_SIZE - 1) / WAVE_SIZE;
-    const int run      = (steps + nwaves - 1) / nwaves * WAVE_SIZE;
-    const int v0       = min(wid * run, n4);
-    const int v1       = min(v0 + run, n4);
-    constexpr int SPAN = STABLE_ROW_LOADS * WAVE_SIZE;
+    if constexpr(!CHUNKED)
+    {
+        static_assert(!(NAN_ONE && WRITE_VALUES), "NAN_ONE is instantiated for indices only");
+        nan_one_remap<NAN_ONE>(pivot, ngt, eq_needed);
+        const int lane     = threadIdx.x & (WAVE_SIZE - 1);
+        const int wid      = threadIdx.x / WAVE_SIZE;
+        const int nwaves   = blockDim.x / WAVE_SIZE;
+        const int n4       = n4_cover(len);
+        const int steps    = (n4 + WAVE_SIZE - 1) / WAVE_SIZE;
+        const int run      = (steps + nwaves - 1) / nwaves * WAVE_SIZE;
+        const int v0       = min(wid * run, n4);
+        const int v1       = min(v0 + run, n4);
+        constexpr int SPAN = STABLE_ROW_LOADS * WAVE_SIZE;
 
-    unsigned cg = 0, ce = 0;
-    for(int jb = v0; jb < v1; jb += SPAN)
-    {
-        opus::u32x4_t kv[STABLE_ROW_LOADS];
-#pragma unroll
-        for(int u = 0; u < STABLE_ROW_LOADS; u++)
+        unsigned cg = 0, ce = 0;
+        for(int jb = v0; jb < v1; jb += SPAN)
         {
-            const int j = jb + u * WAVE_SIZE + lane;
-            kv[u]       = j < v1 ? keys4(j) : opus::u32x4_t{0u, 0u, 0u, 0u};
-        }
+            opus::u32x4_t kv[STABLE_ROW_LOADS];
 #pragma unroll
-        for(int u = 0; u < STABLE_ROW_LOADS; u++)
-        {
-            const int j = jb + u * WAVE_SIZE + lane;
-#pragma unroll
-            for(int e = 0; e < FP32_EPT; e++)
+            for(int u = 0; u < STABLE_ROW_LOADS; u++)
             {
-                const bool has   = j < v1 && j * FP32_EPT + e < len;
-                const uint32_t k = nan_one_key<NAN_ONE>(kv[u][e]);
-                cg += (has && k > pivot) ? 1u : 0u;
-                ce += (has && k == pivot) ? 1u : 0u;
+                const int j = jb + u * WAVE_SIZE + lane;
+                kv[u]       = j < v1 ? keys4(j) : opus::u32x4_t{0u, 0u, 0u, 0u};
+            }
+#pragma unroll
+            for(int u = 0; u < STABLE_ROW_LOADS; u++)
+            {
+                const int j = jb + u * WAVE_SIZE + lane;
+#pragma unroll
+                for(int e = 0; e < FP32_EPT; e++)
+                {
+                    const bool has   = j < v1 && j * FP32_EPT + e < len;
+                    const uint32_t k = nan_one_key<NAN_ONE>(kv[u][e]);
+                    cg += (has && k > pivot) ? 1u : 0u;
+                    ce += (has && k == pivot) ? 1u : 0u;
+                }
             }
         }
-    }
-    // Lane 0's inclusive suffix is the wave's total.
-    const uint32_t tg = wave_suffix_sum(cg);
-    const uint32_t te = wave_suffix_sum(ce);
-    if(lane == 0)
-    {
-        s_wtot[wid]                       = tg;
-        s_wtot[MAX_WAVES_PER_BLOCK + wid] = te;
-    }
-    __syncthreads();
-    unsigned bg = 0, be = 0;
-    for(int w = 0; w < wid; w++)
-    {
-        bg += s_wtot[w];
-        be += s_wtot[MAX_WAVES_PER_BLOCK + w];
-    }
-    __syncthreads(); // s_wtot is the caller's again
+        // Lane 0's inclusive suffix is the wave's total.
+        const uint32_t tg = wave_suffix_sum(cg);
+        const uint32_t te = wave_suffix_sum(ce);
+        if(lane == 0)
+        {
+            s_wtot[wid]                       = tg;
+            s_wtot[MAX_WAVES_PER_BLOCK + wid] = te;
+        }
+        __syncthreads();
+        unsigned bg = 0, be = 0;
+        for(int w = 0; w < wid; w++)
+        {
+            bg += s_wtot[w];
+            be += s_wtot[MAX_WAVES_PER_BLOCK + w];
+        }
+        __syncthreads(); // s_wtot is the caller's again
 
-    for(int jb = v0; jb < v1; jb += SPAN)
-    {
-        // Wave-uniform: every selected element of this run is placed.
-        if(bg >= (unsigned)ngt && be >= (unsigned)eq_needed)
-            break;
-        opus::u32x4_t kv[STABLE_ROW_LOADS];
-#pragma unroll
-        for(int u = 0; u < STABLE_ROW_LOADS; u++)
+        for(int jb = v0; jb < v1; jb += SPAN)
         {
-            const int j = jb + u * WAVE_SIZE + lane;
-            kv[u]       = j < v1 ? keys4(j) : opus::u32x4_t{0u, 0u, 0u, 0u};
+            // Wave-uniform: every selected element of this run is placed.
+            if(bg >= (unsigned)ngt && be >= (unsigned)eq_needed)
+                break;
+            opus::u32x4_t kv[STABLE_ROW_LOADS];
+#pragma unroll
+            for(int u = 0; u < STABLE_ROW_LOADS; u++)
+            {
+                const int j = jb + u * WAVE_SIZE + lane;
+                kv[u]       = j < v1 ? keys4(j) : opus::u32x4_t{0u, 0u, 0u, 0u};
+            }
+#pragma unroll
+            for(int u = 0; u < STABLE_ROW_LOADS; u++)
+            {
+                const int j = jb + u * WAVE_SIZE + lane;
+                uint32_t k[FP32_EPT];
+                bool has[FP32_EPT];
+                uint32_t lg = 0, le = 0;
+#pragma unroll
+                for(int e = 0; e < FP32_EPT; e++)
+                {
+                    has[e] = j < v1 && j * FP32_EPT + e < len;
+                    k[e]   = nan_one_key<NAN_ONE>(kv[u][e]);
+                    lg += (has[e] && k[e] > pivot) ? 1u : 0u;
+                    le += (has[e] && k[e] == pivot) ? 1u : 0u;
+                }
+                // At most 4 per lane, 256 per step: both counts fit a half each. Lane 0's
+                // inclusive suffix is the step's total, so total minus a lane's own suffix
+                // is what the lanes to its left hold.
+                const uint32_t s    = wave_suffix_sum(lg | (le << 16));
+                const uint32_t tot  = (uint32_t)__builtin_amdgcn_readfirstlane((int)s);
+                const uint32_t left = tot - s;
+                unsigned g          = bg + (left & 0xFFFFu);
+                unsigned q          = be + (left >> 16);
+#pragma unroll
+                for(int e = 0; e < FP32_EPT; e++)
+                {
+                    if(!has[e])
+                        continue;
+                    stable_place<WRITE_VALUES>(
+                        k[e], pivot, g, q, eq_needed, idx_base + j * FP32_EPT + e, out, out_val);
+                    g += k[e] > pivot ? 1u : 0u;
+                    q += k[e] == pivot ? 1u : 0u;
+                }
+                bg += tot & 0xFFFFu;
+                be += tot >> 16;
+            }
         }
-#pragma unroll
-        for(int u = 0; u < STABLE_ROW_LOADS; u++)
+    }
+    else
+    {
+        static_assert(!(NAN_ONE && WRITE_VALUES), "NAN_ONE is instantiated for indices only");
+        nan_one_remap<NAN_ONE>(pivot, ngt, eq_needed);
+        const int lane     = threadIdx.x & (WAVE_SIZE - 1);
+        const int wid      = threadIdx.x / WAVE_SIZE;
+        const int nwaves   = blockDim.x / WAVE_SIZE;
+        const int n4       = n4_cover(len);
+        constexpr int SPAN = STABLE_ROW_LOADS * WAVE_SIZE;
+        // Block-uniform: the selected keys of the chunks already placed.
+        unsigned done_g = 0, done_e = 0;
+        const int chunk = CHUNKED ? STABLE_ROW_CHUNK_VECS : n4;
+        for(int c0 = 0; c0 < n4; c0 += chunk)
         {
-            const int j = jb + u * WAVE_SIZE + lane;
-            uint32_t k[FP32_EPT];
-            bool has[FP32_EPT];
-            uint32_t lg = 0, le = 0;
-#pragma unroll
-            for(int e = 0; e < FP32_EPT; e++)
+            const int c1    = min(c0 + chunk, n4);
+            const int steps = (c1 - c0 + WAVE_SIZE - 1) / WAVE_SIZE;
+            const int run   = (steps + nwaves - 1) / nwaves * WAVE_SIZE;
+            const int v0    = min(c0 + wid * run, c1);
+            const int v1    = min(v0 + run, c1);
+
+            unsigned cg = 0, ce = 0;
+            for(int jb = v0; jb < v1; jb += SPAN)
             {
-                has[e] = j < v1 && j * FP32_EPT + e < len;
-                k[e]   = nan_one_key<NAN_ONE>(kv[u][e]);
-                lg += (has[e] && k[e] > pivot) ? 1u : 0u;
-                le += (has[e] && k[e] == pivot) ? 1u : 0u;
-            }
-            // At most 4 per lane, 256 per step: both counts fit a half each. Lane 0's
-            // inclusive suffix is the step's total, so total minus a lane's own suffix
-            // is what the lanes to its left hold.
-            const uint32_t s    = wave_suffix_sum(lg | (le << 16));
-            const uint32_t tot  = (uint32_t)__builtin_amdgcn_readfirstlane((int)s);
-            const uint32_t left = tot - s;
-            unsigned g          = bg + (left & 0xFFFFu);
-            unsigned q          = be + (left >> 16);
+                opus::u32x4_t kv[STABLE_ROW_LOADS];
 #pragma unroll
-            for(int e = 0; e < FP32_EPT; e++)
-            {
-                if(!has[e])
-                    continue;
-                stable_place<WRITE_VALUES>(
-                    k[e], pivot, g, q, eq_needed, idx_base + j * FP32_EPT + e, out, out_val);
-                g += k[e] > pivot ? 1u : 0u;
-                q += k[e] == pivot ? 1u : 0u;
+                for(int u = 0; u < STABLE_ROW_LOADS; u++)
+                {
+                    const int j = jb + u * WAVE_SIZE + lane;
+                    kv[u]       = j < v1 ? keys4(j) : opus::u32x4_t{0u, 0u, 0u, 0u};
+                }
+#pragma unroll
+                for(int u = 0; u < STABLE_ROW_LOADS; u++)
+                {
+                    const int j = jb + u * WAVE_SIZE + lane;
+#pragma unroll
+                    for(int e = 0; e < FP32_EPT; e++)
+                    {
+                        const bool has   = j < v1 && j * FP32_EPT + e < len;
+                        const uint32_t k = nan_one_key<NAN_ONE>(kv[u][e]);
+                        cg += (has && k > pivot) ? 1u : 0u;
+                        ce += (has && k == pivot) ? 1u : 0u;
+                    }
+                }
             }
-            bg += tot & 0xFFFFu;
-            be += tot >> 16;
+            // Lane 0's inclusive suffix is the wave's total.
+            const uint32_t tg = wave_suffix_sum(cg);
+            const uint32_t te = wave_suffix_sum(ce);
+            if(lane == 0)
+            {
+                s_wtot[wid]                       = tg;
+                s_wtot[MAX_WAVES_PER_BLOCK + wid] = te;
+            }
+            __syncthreads();
+            unsigned bg = done_g, be = done_e;
+            for(int w = 0; w < nwaves; w++)
+            {
+                const unsigned wg = s_wtot[w], we = s_wtot[MAX_WAVES_PER_BLOCK + w];
+                bg += w < wid ? wg : 0u;
+                be += w < wid ? we : 0u;
+                done_g += wg;
+                done_e += we;
+            }
+            __syncthreads(); // s_wtot is the caller's again
+
+            for(int jb = v0; jb < v1; jb += SPAN)
+            {
+                // Wave-uniform: every selected element of this run is placed.
+                if(bg >= (unsigned)ngt && be >= (unsigned)eq_needed)
+                    break;
+                opus::u32x4_t kv[STABLE_ROW_LOADS];
+#pragma unroll
+                for(int u = 0; u < STABLE_ROW_LOADS; u++)
+                {
+                    const int j = jb + u * WAVE_SIZE + lane;
+                    kv[u]       = j < v1 ? keys4(j) : opus::u32x4_t{0u, 0u, 0u, 0u};
+                }
+#pragma unroll
+                for(int u = 0; u < STABLE_ROW_LOADS; u++)
+                {
+                    const int j = jb + u * WAVE_SIZE + lane;
+                    uint32_t k[FP32_EPT];
+                    bool has[FP32_EPT];
+                    uint32_t lg = 0, le = 0;
+#pragma unroll
+                    for(int e = 0; e < FP32_EPT; e++)
+                    {
+                        has[e] = j < v1 && j * FP32_EPT + e < len;
+                        k[e]   = nan_one_key<NAN_ONE>(kv[u][e]);
+                        lg += (has[e] && k[e] > pivot) ? 1u : 0u;
+                        le += (has[e] && k[e] == pivot) ? 1u : 0u;
+                    }
+                    // At most 4 per lane, 256 per step: both counts fit a half each. Lane 0's
+                    // inclusive suffix is the step's total, so total minus a lane's own suffix
+                    // is what the lanes to its left hold.
+                    const uint32_t s    = wave_suffix_sum(lg | (le << 16));
+                    const uint32_t tot  = (uint32_t)__builtin_amdgcn_readfirstlane((int)s);
+                    const uint32_t left = tot - s;
+                    unsigned g          = bg + (left & 0xFFFFu);
+                    unsigned q          = be + (left >> 16);
+#pragma unroll
+                    for(int e = 0; e < FP32_EPT; e++)
+                    {
+                        if(!has[e])
+                            continue;
+                        stable_place<WRITE_VALUES>(k[e],
+                                                   pivot,
+                                                   g,
+                                                   q,
+                                                   eq_needed,
+                                                   idx_base + j * FP32_EPT + e,
+                                                   out,
+                                                   out_val);
+                        g += k[e] > pivot ? 1u : 0u;
+                        q += k[e] == pivot ? 1u : 0u;
+                    }
+                    bg += tot & 0xFFFFu;
+                    be += tot >> 16;
+                }
+            }
+            if(done_g >= (unsigned)ngt && done_e >= (unsigned)eq_needed)
+                break;
         }
     }
 }

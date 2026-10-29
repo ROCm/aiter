@@ -1073,6 +1073,29 @@ def test_sampled_stable_contract():
         ref = _stable_ref(x, rs, re, k, _nan_high_key)
         assert torch.equal(idx, ref), f"k={k}: nan_high"
 
+        # Rows that fall back, their candidates past the cap: a few values, one
+        # value, +-0 only, and zeros with k / 2 ones across the row. The fallback
+        # emits them in column order, by chunks; only the last needs every chunk.
+        few = torch.randint(0, 6, (rows, N), generator=g, device="cuda").float()
+        zero = torch.zeros(rows, N, device="cuda")
+        signs = torch.rand(rows, N, generator=g, device="cuda") < 0.5
+        ones_at = torch.rand(rows, N, generator=g, device="cuda").argsort(dim=1)[
+            :, : k // 2
+        ]
+        spread = zero.scatter(1, ones_at, 1.0)
+        full = _bounds(rows, N)
+        for name, xf in (
+            ("few values", few),
+            ("one value", torch.ones(rows, N, device="cuda")),
+            ("+-0", torch.where(signs, zero, -zero)),
+            ("ones across zeros", spread),
+        ):
+            for nan_high, key in ((False, _sign_key), (True, _nan_high_key)):
+                got = _sampled_stable(xf, *full, k, nan_high=nan_high)[0]
+                assert torch.equal(
+                    got, _stable_ref(xf, *full, k, key)
+                ), f"k={k}: fallback rows, {name}, nan_high={nan_high}"
+
         # Past one block a CU the launch carries no stable region (300 rows:
         # every wave a bitmap; 600: five of them).
         for m in (300, 600):
