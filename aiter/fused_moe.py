@@ -273,6 +273,14 @@ _PRESORTED_MOE = threading.local()
 _PRESORTED_MOE_BLOCK_M = 16
 # Reasons a registration was ignored, so each one is logged only once.
 _PRESORTED_MOE_IGNORED = set()
+_PRESORTED_MOE_SORT_KEYS = (
+    "sorted_token_ids",
+    "sorted_weights",
+    "sorted_expert_ids",
+    "num_valid_ids",
+    "m_indices",
+    "reverse_sorted",
+)
 
 
 # Under torch.compile, dynamo defers this thread-local store until the graph has
@@ -342,6 +350,7 @@ def _match_presorted_moe(
     topk,
     expert_mask=None,
     num_local_tokens=None,
+    output=None,
 ):
     if not aux:
         return None
@@ -371,6 +380,12 @@ def _match_presorted_moe(
     if not _presorted_layout_ok(aux, topk_ids, topk, num_experts):
         _presorted_moe_ignored("sort tensors break the BM=16 sort layout")
         return None
+    # The stages zero or write output while still reading the sort tensors.
+    if output is not None and any(
+        _bytes_overlap(output, aux[k]) for k in _PRESORTED_MOE_SORT_KEYS
+    ):
+        _presorted_moe_ignored("output overlaps the sort tensors")
+        return None
     return aux
 
 
@@ -384,12 +399,9 @@ def _presorted_layout_ok(aux, topk_ids, topk, num_experts):
     which this path never enables, but every aiter sort emits both.
     """
     try:
-        ids = aux["sorted_token_ids"]
-        weights = aux["sorted_weights"]
-        experts = aux["sorted_expert_ids"]
-        num_valid = aux["num_valid_ids"]
-        m_indices = aux["m_indices"]
-        reverse = aux["reverse_sorted"]
+        ids, weights, experts, num_valid, m_indices, reverse = (
+            aux[k] for k in _PRESORTED_MOE_SORT_KEYS
+        )
     except KeyError:
         return False
     device = topk_ids.device
@@ -567,14 +579,18 @@ def _validate_output_buffer_metadata(output, shape, dtype, device):
         )
 
 
+def _bytes_overlap(a, b):
+    return (
+        a.data_ptr() < b.data_ptr() + b.nbytes
+        and b.data_ptr() < a.data_ptr() + a.nbytes
+    )
+
+
 def _validate_output_buffer_no_overlap(output, hidden_states):
     if output is None:
         return
     # Accumulate mode zeroes the output rows before stage1 reads hidden_states.
-    if (
-        output.data_ptr() < hidden_states.data_ptr() + hidden_states.nbytes
-        and hidden_states.data_ptr() < output.data_ptr() + output.nbytes
-    ):
+    if _bytes_overlap(output, hidden_states):
         raise RuntimeError(
             "output overlaps hidden_states, which moe_sorting zeroes before stage1 "
             "reads it"
@@ -2124,6 +2140,7 @@ def _fused_moe_impl(
             topk=topk,
             expert_mask=expert_mask,
             num_local_tokens=num_local_tokens,
+            output=output,
         )
         if presorted is not None:
             sorted_ids = presorted["sorted_token_ids"]
