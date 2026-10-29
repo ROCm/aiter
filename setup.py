@@ -40,6 +40,53 @@ FLYDSL_REQUIRES = [] if IS_WINDOWS else [FLYDSL_VERSION]
 AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1"
 
 
+def _is_metadata_only(argv=None):
+    """Whether setup.py was asked only for metadata (or to clean), not a build.
+
+    The command line is split by setuptools' own parser, so an option value
+    (`--output-dir build`) is never read as a command, and every command counts:
+    `clean --all bdist_wheel` still builds a wheel. A command line it cannot parse
+    is treated as a build, which stages as before rather than shipping a wheel
+    without aiter_meta.
+    """
+    argv = sys.argv if argv is None else argv
+    if len(argv) < 2:
+        return True
+    from setuptools.dist import Distribution
+    from setuptools.errors import BaseError
+
+    class _Probe(Distribution):
+        # Detect display options (--version, --author-email, ...) instead of
+        # printing them. option_order spells them with dashes.
+        def handle_display_options(self, option_order):
+            names = set(self.display_option_names)
+            return any(opt.replace("-", "_") in names for opt, _ in option_order)
+
+        def _show_help(self, *args, **kwargs):
+            pass
+
+    probe = _Probe()
+    probe.script_args = list(argv[1:])
+    try:
+        run_commands = probe.parse_command_line()
+    except BaseError:
+        return False
+    # setup() runs no command when parsing stopped for a display option or
+    # --help, global or per command.
+    if not run_commands:
+        return True
+    return set(probe.commands) <= {"egg_info", "dist_info", "clean"}
+
+
+# pip's PEP 517 flow runs setup.py twice: once for metadata (`dist_info`) and
+# once for the real build. `dist_info` never puts aiter/ on sys.path, so every
+# use of `jit`/`core` below has to be guarded by this, not just the imports.
+# Metadata also skips everything that installs packages or writes into the
+# checkout. The Windows ROCm probe still runs: it only reads, and it picks
+# install_requires, which the metadata must report as the build does.
+METADATA_ONLY = _is_metadata_only()
+
+
 def has_rocm_toolchain():
     """Whether a ROCm install the JIT can build against was found."""
     sys.path.insert(0, os.path.join(this_dir, "aiter", "jit", "utils"))
@@ -67,7 +114,7 @@ def is_develop_mode():
     return False
 
 
-if not AITER_TRITON_ONLY and not IS_WINDOWS and is_develop_mode():
+if not METADATA_ONLY and not AITER_TRITON_ONLY and not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
 
@@ -125,8 +172,10 @@ def _torch_version_below(min_version):
         return False
 
 
-_triton_info = _is_triton_installed()
-if _torch_version_below("2.9.1"):
+_triton_info = None if METADATA_ONLY else _is_triton_installed()
+if METADATA_ONLY:
+    pass  # metadata needs no triton, and installing one reaches the network
+elif _torch_version_below("2.9.1"):
     print(
         f"[aiter] torch < 2.9.1 detected, triton reinstall skipped for compatibility"
         f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}."
@@ -190,35 +239,23 @@ def prepare_packaging():
     write_install_mode()
 
 
-if is_develop_mode():
+# Only a run that stages aiter_meta/ removes it at the end; metadata-only and
+# develop runs leave an existing one alone.
+STAGED_AITER_META = False
+if METADATA_ONLY:
+    # Metadata needs no package data, so aiter_meta/ is not staged for it.
+    packages = ["aiter"]
+elif is_develop_mode():
     packages = ["aiter"]
     write_install_mode()
 else:
     prepare_packaging()
+    STAGED_AITER_META = True
     packages = ["aiter_meta", "aiter"]
 
 
-def _is_metadata_only():
-    _skip = frozenset(
-        {
-            "egg_info",
-            "dist_info",
-            "clean",
-            "--version",
-            "--name",
-            "--fullname",
-            "--author",
-            "--author-email",
-            "--url",
-            "--license",
-            "--classifiers",
-        }
-    )
-    return len(sys.argv) < 2 or sys.argv[1] in _skip
-
-
 # Defer heavy imports until build time
-if not _is_metadata_only() and not AITER_TRITON_ONLY:
+if not METADATA_ONLY and not AITER_TRITON_ONLY:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
@@ -295,7 +332,7 @@ def get_exclude_ops():
     return exclude_ops
 
 
-if PREBUILD_KERNELS != 0:
+if PREBUILD_KERNELS != 0 and not METADATA_ONLY:
     has_torch = True
     try:
         import torch as _
@@ -556,5 +593,5 @@ setup(
     distclass=ForcePlatlibDistribution,
 )
 
-if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+if STAGED_AITER_META and os.path.isdir("aiter_meta"):
     shutil.rmtree("aiter_meta")
