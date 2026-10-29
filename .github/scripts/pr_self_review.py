@@ -19,6 +19,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -654,15 +655,14 @@ def render(result: Result) -> str:
     return "\n".join(lines)
 
 
-def upsert_comment(api: GitHub, number: int, body: str) -> str:
+def upsert_comment(api: GitHub, number: int, body: str, own_login: str) -> str:
     comments = api.pages(f"issues/{number}/comments")
     existing = next(
         (
             comment
             for comment in comments
             if MARKER in (comment.get("body") or "")
-            and ((comment.get("user") or {}).get("login") or "").lower()
-            == "github-actions[bot]"
+            and ((comment.get("user") or {}).get("login") or "").lower() == own_login
         ),
         None,
     )
@@ -679,7 +679,9 @@ def upsert_comment(api: GitHub, number: int, body: str) -> str:
     return response.get("html_url") or ""
 
 
-def post_status(api: GitHub, sha: str, result: Result, url: str) -> None:
+def post_status(
+    api: GitHub, sha: str, result: Result, url: str, own_login: str
+) -> None:
     state = result.state()
     if result.mode == "shadow":
         description = f"shadow: {len(result.blocking)} blocker(s), CI {'pending' if result.ci_pending else 'complete'}"
@@ -695,8 +697,7 @@ def post_status(api: GitHub, sha: str, result: Result, url: str) -> None:
             status
             for status in statuses
             if status.get("context") == STATUS_CONTEXT
-            and ((status.get("creator") or {}).get("login") or "").lower()
-            == "github-actions[bot]"
+            and ((status.get("creator") or {}).get("login") or "").lower() == own_login
         ),
         None,
     )
@@ -719,6 +720,23 @@ def post_status(api: GitHub, sha: str, result: Result, url: str) -> None:
     )
 
 
+def writer_token(env: Mapping[str, str]) -> str:
+    """Write calls prefer the PAT: the org policy keeps GITHUB_TOKEN read-only,
+    so comments and commit statuses must go through AITER_BOT_TOKEN."""
+    return env.get("AITER_BOT_TOKEN") or env.get("GH_TOKEN", "")
+
+
+def resolve_own_login(api: GitHub) -> str:
+    """Login of the token owner, used to recognize our own sticky comment and
+    commit status. Falls back to github-actions[bot] when the query fails."""
+    try:
+        viewer = api.graphql("query { viewer { login } }", {})
+    except APIError:
+        return "github-actions[bot]"
+    login = (viewer.get("viewer") or {}).get("login") or ""
+    return login.strip().lower() or "github-actions[bot]"
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -729,7 +747,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     repo = os.environ.get("GITHUB_REPOSITORY", "ROCm/aiter")
-    token = os.environ.get("GH_TOKEN", "")
+    token = writer_token(os.environ)
     mode = os.environ.get("SELF_REVIEW_MODE", "shadow").strip().lower()
     if mode not in {"shadow", "enforce"}:
         raise SystemExit(f"invalid SELF_REVIEW_MODE={mode!r}")
@@ -753,10 +771,19 @@ def main(argv: list[str]) -> int:
     body = render(result)
     print(body)
     if args.apply:
-        url = upsert_comment(api, number, body)
+        own_login = resolve_own_login(api)
+        url = ""
+        try:
+            url = upsert_comment(api, number, body, own_login)
+        except APIError as exc:
+            if mode == "enforce":
+                raise
+            print(
+                f"::warning title=PR Self-Review sticky comment::shadow mode could not write comment: {exc}"
+            )
         # PR checks and branch protection are attached to the PR head commit.
         try:
-            post_status(api, result.head_sha, result, url or result.pr_url)
+            post_status(api, result.head_sha, result, url or result.pr_url, own_login)
         except APIError as exc:
             if mode == "enforce":
                 raise
