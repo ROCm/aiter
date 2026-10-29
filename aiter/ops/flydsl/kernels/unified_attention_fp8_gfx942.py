@@ -62,6 +62,16 @@ def _rows(tensor, base):
     )
 
 
+def _index(coord, layout):
+    return fx.Int32(fx.get_scalar(fx.crd2idx(coord, layout)))
+
+
+def _owned(layout, tv, lane, value=0):
+    """`layout` at the tile coordinate of value `value` that `lane` holds in
+    the thread-value layout `tv`."""
+    return _index((lane, value), fx.composition(layout, tv))
+
+
 def _buffer_load(rows, index, dtype, count):
     """`count` values of `dtype` at element `index` of a `_rows` view."""
     atom = fx.make_copy_atom(_BUFFER_COPY[count * dtype.width](), dtype)
@@ -338,6 +348,13 @@ def build_unified_attention_fp8_gfx942_module(
         scale: fx.Float32,
     ):
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
+        tiled = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
+        # Lane ownership of the atom's A (m, k), B (n, k) and C (m, n) tiles.
+        tv_a, tv_b, tv_c = (
+            tiled.tv_layout_A_tiled,
+            tiled.tv_layout_B_tiled,
+            tiled.tv_layout_C_tiled,
+        )
         tid = fx.Int32(gpu.thread_id("x"))
         lane = tid % 64
         wave = tid // 64
@@ -414,20 +431,31 @@ def build_unified_attention_fp8_gfx942_module(
                     plow = pfirst_pos - wleft
                     pstart = (plow > 0).select(plow, fx.Int32(0)) // pn
                     pend = (plast_pos + pn) // pn
-                    pqtok = ptile * tokens + wave * tpw + c // group
+                    # Query column n of the B and C tiles is token n // group of
+                    # this wave's tpw tokens, at head n % group.
+                    q_token = fx.make_layout((16, (group, tpw)), (0, (0, 1)))
+                    q_row = fx.make_layout((16, (group, tpw)), (0, (1, num_q_heads)))
+                    pqtok = ptile * tokens + wave * tpw + _owned(q_token, tv_c, lane)
                     pqpos = pqbase + pqtok
-                    # Q and O rows from the tile's first token at head
-                    # kvh * group; lane (c, g) adds its token and head.
+                    # Q and O rows from the tile's first token at head kvh * group.
                     prow0 = (fx.Int64(pq0) + fx.Int64(ptile * tokens)) * num_q_heads
                     prow0 = prow0 + fx.Int64(kvh * group)
-                    prow = (wave * tpw + c // group) * num_q_heads + c % group
-                    # A token past the sequence loads the tile's first token.
-                    psafe = (pqtok < pqlen).select(prow, c % group)
+                    prow = wave * tpw * num_q_heads + _owned(q_row, tv_c, lane)
+                    # Q^T is the B tile. A token past the sequence loads the
+                    # tile's first token.
+                    q_elem = fx.make_layout(
+                        ((group, tpw), 32), ((dim, num_q_heads * dim), 1)
+                    )
+                    q_first = fx.make_layout(((group, tpw), 32), ((dim, 0), 1))
+                    pq_lane = (pqtok < pqlen).select(
+                        wave * tpw * num_q_heads * dim + _owned(q_elem, tv_b, lane),
+                        _owned(q_first, tv_b, lane),
+                    )
                     pq_rows = _rows(Q, prow0 * dim)
                     pq_frag = [
-                        _buffer_load(
-                            pq_rows, psafe * dim + ks * 32 + g * 8, fx.Int32, 2
-                        ).bitcast(fx.Int64)[0]
+                        _buffer_load(pq_rows, pq_lane + ks * 32, fx.Int32, 2).bitcast(
+                            fx.Int64
+                        )[0]
                         for ks in range(ksteps)
                     ]
 
@@ -438,6 +466,17 @@ def build_unified_attention_fp8_gfx942_module(
                     plast_blk = fx.max(pend - 1, fx.Int32(0))
                     vslot = fx.Int32(rocdl.readfirstlane(T.i32, wave)) * (pn // 4)
                     vslot = vslot // page_size
+
+                    # K staging: each thread copies 16 depth bytes, depth first,
+                    # 4096 bytes a round; round i starts at key i * 4096 // dim.
+                    k_key = fx.make_layout((dim // 16, 4096 // dim), (0, 1))
+                    k_depth = fx.make_layout((dim // 16, 4096 // dim), (16, 0))
+                    # V staging, for the register transpose: lane (c, g) of
+                    # wave w copies 16 depth bytes of key 4 * key4 + g.
+                    v_shape = ((16, 4), 4, (lpr, pn // 16))
+                    v_key4 = fx.make_layout(v_shape, ((0, 0), pn // 16, (0, 1)))
+                    v_key = fx.make_layout(v_shape, ((0, 1), 4 * (pn // 16), (0, 4)))
+                    v_depth = fx.make_layout(v_shape, ((dim // 16, 0), 0, (16, 0)))
 
                     def p_clamp(block):
                         return fx.min(block, plast_blk)
@@ -488,8 +527,8 @@ def build_unified_attention_fp8_gfx942_module(
                             _buffer_load(
                                 k_rows[kslot[i]],
                                 src(
-                                    (tid * 16 + i * 4096) // dim,
-                                    (tid * 16 + i * 4096) % dim,
+                                    _index(tid, k_key) + i * 4096 // dim,
+                                    _index(tid, k_depth),
                                     k_strides[1],
                                 ),
                                 fx.Int32,
@@ -501,8 +540,8 @@ def build_unified_attention_fp8_gfx942_module(
                             _buffer_load(
                                 v_rows,
                                 src(
-                                    (wave * (pn // 16) + idx // lpr) * 4 + g,
-                                    c * (dim // 16) + idx % lpr * 16,
+                                    _index((lane, wave, idx), v_key),
+                                    _index((lane, wave, idx), v_depth),
                                     v_strides[1],
                                 ),
                                 fx.Int32,
@@ -523,10 +562,13 @@ def build_unified_attention_fp8_gfx942_module(
 
                     def p_commit(chunks):
                         for i in range_constexpr(k_loads):
-                            flat = tid * 16 + i * 4096
                             _store(
                                 buf,
-                                _k_offset(flat // dim, flat % dim, dim),
+                                _k_offset(
+                                    _index(tid, k_key) + i * 4096 // dim,
+                                    _index(tid, k_depth),
+                                    dim,
+                                ),
                                 chunks[i],
                                 16,
                             )
@@ -535,9 +577,11 @@ def build_unified_attention_fp8_gfx942_module(
                             vval = fx.Vector(chunks[k_loads + idx])
                             for wi in range_constexpr(4):
                                 words.append(vval[wi])
-                                key4s.append(wave * (pn // 16) + idx // lpr)
+                                key4s.append(_index((lane, wave, idx), v_key4))
+                                # After the transpose, lane g's word wi holds
+                                # depth 4 * wi + g of four keys.
                                 depths.append(
-                                    c * (dim // 16) + idx % lpr * 16 + wi * 4 + g
+                                    _index((lane, wave, idx), v_depth) + wi * 4 + g
                                 )
                         transpose_store(words, pvt, key4s, depths, pn)
 
@@ -703,6 +747,9 @@ def build_unified_attention_fp8_gfx942_module(
                         )
 
                     if pqtok < pqlen:
+                        # O^T is the C tile: the lane holds depths pdepth + 0..3
+                        # of each 16-deep block.
+                        pdepth = _owned(fx.make_layout((16, 16), (1, 0)), tv_c, lane)
                         if psplits == 1:
                             # A row that saw no key has l == 0 and writes zeros.
                             p_l = fx.Float32(presult[1])
@@ -716,7 +763,7 @@ def build_unified_attention_fp8_gfx942_module(
                                 ]
                                 _buffer_store(
                                     po_rows,
-                                    prow * dim + db * 16 + g * 4,
+                                    prow * dim + db * 16 + pdepth,
                                     fx.Vector.from_elements(words, fx.Int32),
                                 )
                         else:
@@ -731,7 +778,7 @@ def build_unified_attention_fp8_gfx942_module(
                             for db in range_constexpr(dblocks):
                                 _buffer_store(
                                     pp_rows,
-                                    plane + db * 16 + g * 4,
+                                    plane + db * 16 + pdepth,
                                     fx.Vector(presult[db + 2]) * vs4,
                                 )
                             if g == 0:
@@ -763,19 +810,23 @@ def build_unified_attention_fp8_gfx942_module(
                     dstart + (dtotal - 1 - dstart) // splits * splits,
                     fx.max(dtotal - 1, fx.Int32(0)),
                 )
-                # Q and O rows from head kvh * group; lane c holds head
-                # c % group. MFMA rows past the group repeat its heads; only
+                # Q and O rows from head kvh * group: query column n is head
+                # n % group. Columns past the group repeat its heads; only
                 # c < group store.
                 drow0 = (fx.Int64(dq0) * num_q_heads + fx.Int64(kvh * group)) * dim
-                drow = c % group * dim
+                d_head = fx.make_layout((16, (group, 16 // group)), (0, (1, 0)))
                 # K and Q share a depth order: k-step 2j + h covers depths
                 # 64j + 16g + 8h .. +8, so each lane loads 16 contiguous bytes.
+                dq_elem = fx.make_layout(
+                    ((group, 16 // group), (8, 4)), ((dim, 0), (1, 16))
+                )
                 dq_rows = _rows(Q, drow0)
+                dq_lane = _owned(dq_elem, tv_b, lane)
                 dq_frag = []
                 for j in range_constexpr(kchunks):
-                    qv = _buffer_load(
-                        dq_rows, drow + j * 64 + g * 16, fx.Int32, 4
-                    ).bitcast(fx.Int64)
+                    qv = _buffer_load(dq_rows, dq_lane + j * 64, fx.Int32, 4).bitcast(
+                        fx.Int64
+                    )
                     dq_frag += [qv[0], qv[1]]
 
                 def d_clamp(block):
@@ -787,11 +838,21 @@ def build_unified_attention_fp8_gfx942_module(
                     # Scalar: a vector load would queue behind the K/V loads.
                     return fx.Int32(fx.memref_load(BT, (dseq, block * NK // page_size)))
 
+                # K is the A tile: the lane holds key dk_key of each 16-key
+                # half, in Q's depth order.
+                dk_key = _owned(fx.make_layout((16, 32), (1, 0)), tv_a, lane)
+                dk_depth = _owned(
+                    fx.make_layout((16, (8, 4)), (0, (1, 16))), tv_a, lane
+                )
+                # V^T is PV's A tile: row m is depth 16m of a 256-deep chunk, and
+                # its reduction runs over keys in S^T's row order.
+                dv_key = fx.make_layout((16, (4, 2, 4)), (0, (1, 16, 4)))
+                dv_depth = _owned(fx.make_layout((16, 32), (16, 0)), tv_a, lane)
+
                 # Decode-only launches load K and V non-temporal (each key is
                 # read once); in a unified launch the hint measured slower
                 # beside the prefill tiles.
                 def d_load_k(block, page):
-                    # Lane (c, g) holds keys c and 16 + c.
                     # Widen before multiplying: a token stride that fits in i32
                     # still overflows the product (token 16 * 2**27 == 2**31).
                     base = fx.Int64(page) * k_strides[0] + fx.Int64(kvh) * k_strides[2]
@@ -800,8 +861,9 @@ def build_unified_attention_fp8_gfx942_module(
                         _load(
                             kp,
                             base
-                            + fx.Int64(tok + half * 16 + c) * fx.Int64(k_strides[1])
-                            + fx.Int64(j * 64 + g * 16),
+                            + fx.Int64(tok + half * 16 + dk_key)
+                            * fx.Int64(k_strides[1])
+                            + fx.Int64(j * 64 + dk_depth),
                             fx.Int32,
                             16,
                             count=4,
@@ -812,13 +874,11 @@ def build_unified_attention_fp8_gfx942_module(
                     ]
 
                 def d_load_v(block, page):
-                    # Lane (c, g) holds keys 4g + t and 16 + 4g + t at depths
-                    # 256m + 16c .. +16.
                     base = fx.Int64(page) * v_strides[0] + fx.Int64(kvh) * v_strides[2]
                     chunks = []
                     for half in range_constexpr(2):
                         for t in range_constexpr(4):
-                            key = block * NK + half * 16 + g * 4 + t
+                            key = block * NK + _owned(dv_key, tv_a, lane, t + 4 * half)
                             # Past dklen, reload a valid key: stale FNUZ bytes can be
                             # NaN, and a zero probability does not cancel a NaN.
                             key = (key < dklen).select(key, block * NK)
@@ -829,7 +889,7 @@ def build_unified_attention_fp8_gfx942_module(
                                         base
                                         + fx.Int64(key & (page_size - 1))
                                         * fx.Int64(v_strides[1])
-                                        + fx.Int64(m * 256 + c * 16),
+                                        + fx.Int64(m * 256 + dv_depth),
                                         fx.Int32,
                                         16,
                                         count=4,
@@ -968,12 +1028,17 @@ def build_unified_attention_fp8_gfx942_module(
                         [d_m, d_l] + d_o + [d_page_ahead] + d_k_ahead + d_v_ahead
                     )
 
+                # O^T is the C tile, with V^T's rows: row r of depth block
+                # 16m + e is depth 256m + 16r + e.
+                d_out = fx.make_layout((16, 16), (16, 0))
+                dhead = _owned(d_head, tv_c, lane)
+
                 def d_rows(norm):
-                    """(depth, four scaled values) per output chunk: row 4g + i
-                    of depth block 16m + e is depth 256m + 16(4g + i) + e."""
+                    """(depth, four scaled values) per output chunk: C value i
+                    of depth blocks 16m + 4e4 .. 16m + 4e4 + 3."""
                     return [
                         (
-                            m * 256 + (g * 4 + i) * 16 + e4 * 4,
+                            m * 256 + _owned(d_out, tv_c, lane, i) + e4 * 4,
                             [
                                 fx.Vector(dresult[2 + m * 16 + e4 * 4 + k])[i] * norm
                                 for k in range(4)
@@ -994,7 +1059,7 @@ def build_unified_attention_fp8_gfx942_module(
                         )
                         * stride,
                     )
-                    dlane = c % group * splits * stride
+                    dlane = dhead * splits * stride
                     for depth, vals in d_rows(vscale):
                         _buffer_store(
                             dp_rows,
@@ -1021,7 +1086,7 @@ def build_unified_attention_fp8_gfx942_module(
                         ]
                         _buffer_store(
                             do_rows,
-                            drow + depth,
+                            dhead * dim + depth,
                             fx.Vector.from_elements(words, fx.Int32),
                         )
 
@@ -1104,6 +1169,10 @@ def build_unified_attention_fp8_gfx942_combine_module(dim, num_q_heads, prefill=
     @flyc.kernel(known_block_size=(64, 1, 1))
     def combine(Part: fx.Tensor, O: fx.Tensor, CuQ: fx.Tensor, num_splits: fx.Int32):
         lane = fx.Int32(gpu.thread_id("x"))
+        # Each lane owns 4 * vecs consecutive floats of a row.
+        _, row_tv = fx.make_layout_tv(
+            fx.make_layout(64, 1), fx.make_layout(4 * vecs, 1)
+        )
         head = fx.Int32(gpu.block_id("x"))
         y = fx.Int32(gpu.block_id("y"))
         if const_expr(prefill):
@@ -1140,7 +1209,10 @@ def build_unified_attention_fp8_gfx942_combine_module(dim, num_q_heads, prefill=
                 os_.append(
                     [
                         _buffer_load(
-                            part_rows, base + lane * (4 * vecs) + 4 * i, fx.Float32, 4
+                            part_rows,
+                            base + _index((lane, 4 * i), row_tv),
+                            fx.Float32,
+                            4,
                         )
                         for i in range(vecs)
                     ]
@@ -1181,7 +1253,9 @@ def build_unified_attention_fp8_gfx942_combine_module(dim, num_q_heads, prefill=
                 ]
             o_rows = _rows(O, (q0 * num_q_heads + fx.Int64(head)) * dim)
             _buffer_store(
-                o_rows, lane * (4 * vecs), fx.Vector.from_elements(words, fx.Int32)
+                o_rows,
+                _index((lane, 0), row_tv),
+                fx.Vector.from_elements(words, fx.Int32),
             )
 
     @flyc.jit
