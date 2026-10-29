@@ -18,6 +18,7 @@ import pytest
 import torch
 
 pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
+pytest.importorskip("mori.cco", reason="MegaMoE's kernels import mori's cco")
 
 from aiter import ActivationType, QuantType
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
