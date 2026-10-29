@@ -32,13 +32,17 @@ def route_reference(ids, experts, max_m, initial=None):
     ids = ids.to(device="cpu", dtype=torch.int64).flatten()
     counts = torch.bincount(ids[ids >= 0], minlength=experts)
     start = (
-        torch.zeros(experts, dtype=torch.int64)
+        torch.zeros(experts, dtype=torch.int64, device="cpu")
         if initial is None
         else initial.cpu().long()
     )
-    expected = [torch.full((int((ids < 0).sum()),), -1, dtype=torch.int64)]
+    expected = [
+        torch.full((int((ids < 0).sum()),), -1, dtype=torch.int64, device="cpu")
+    ]
     for e in range(experts):
-        expected.append(e * max_m + torch.arange(start[e], start[e] + counts[e]))
+        expected.append(
+            e * max_m + torch.arange(start[e], start[e] + counts[e], device="cpu")
+        )
     return (counts + start).int(), torch.cat(expected).sort().values
 
 
@@ -115,6 +119,84 @@ def test_route_rows_graph_and_counter(experts, tokens, topk, distribution):
         graph.replay()
         torch.cuda.synchronize()
         check_routes(ids, counts, rows, experts, max_m, initial)
+
+
+@pytest.mark.parametrize(
+    "experts", [1, 129, 512, 513, 768, 896, 1024, 1536, 2048, 4096]
+)
+def test_tp_route_capacity_and_boundary(experts, monkeypatch):
+    """Exercise both sides of the capacity-dependent public dispatch gate."""
+    if not torch.cuda.is_available() or get_gfx() != "gfx1250":
+        pytest.skip("gfx1250 TP histogram dispatch required")
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        MAX_ROUTE_BUCKETS,
+        tp_route_bucket_capacity,
+        tp_route_min_routes,
+    )
+
+    capacity = tp_route_bucket_capacity(experts)
+    assert experts <= capacity <= 4096 and capacity % 256 == 0
+    assert MAX_ROUTE_BUCKETS == 512  # EP scratch remains unchanged.
+    boundary = tp_route_min_routes(experts)
+    selected = []
+    getter = moe_kernels._get_compiled_topids_to_rows_lds
+
+    def record(n):
+        selected.append(n)
+        return getter(n)
+
+    monkeypatch.setattr(moe_kernels, "_get_compiled_topids_to_rows_lds", record)
+    for routes in (boundary - 1, boundary, boundary + 1):
+        ids = make_ids(routes, 1, experts, "dropped")
+        initial = torch.arange(experts, dtype=torch.int32, device="cuda") % 4
+        counter = initial.clone()
+        selected.clear()
+        counts, rows = moe_kernels.flydsl_moe_topids_to_rows(
+            ids, experts, routes + 4, counter=counter
+        )
+        check_routes(ids, counts, rows, experts, routes + 4, initial)
+        assert bool(selected) == (routes >= boundary)
+
+
+@pytest.mark.parametrize("experts", [513, 896, 1024, 1536, 2048, 4096, 4097])
+def test_wide_tp_route_changed_graph_inputs(experts):
+    """Real top-16 IDs, then all dropped/hot inputs and changed preset offsets."""
+    if not torch.cuda.is_available() or get_gfx() != "gfx1250":
+        pytest.skip("gfx1250 TP routing required")
+    from aiter.ops.flydsl.kernels.moe_route_maps import tp_route_min_routes
+
+    routes = tp_route_min_routes(experts) if experts <= 4096 else 4096
+    tokens = (routes + 15) // 16
+    ids = torch.rand(tokens, experts, device="cuda").topk(16, dim=1).indices.int()
+    initial = torch.zeros(experts, dtype=torch.int32, device="cuda")
+    counter = initial.clone()
+    max_m = ids.numel() + 4
+
+    def call():
+        counter.copy_(initial)
+        return flydsl_moe_topids_to_rows(ids, experts, max_m, counter=counter)
+
+    counts, out = call()
+    check_routes(ids, counts, out, experts, max_m, initial)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        counts, out = call()
+    for value in (-7, experts - 1, -1, 0):
+        ids.fill_(value)
+        initial.fill_(3)
+        out.fill_(-98765)
+        graph.replay()
+        torch.cuda.synchronize()
+        check_routes(ids, counts, out, experts, max_m, initial)
+
+
+def test_tp_route_capacity_rejects_invalid_experts():
+    from aiter.ops.flydsl.kernels.moe_route_maps import tp_route_bucket_capacity
+
+    for experts in (-1, 0, 4097):
+        with pytest.raises(ValueError, match="bucket count out of range"):
+            tp_route_bucket_capacity(experts)
 
 
 def main():

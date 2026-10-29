@@ -2676,17 +2676,16 @@ def flydsl_moe_topids_to_rows(
     else:
         from aiter.jit.utils.chip_info import get_gfx_runtime
         from aiter.ops.flydsl.kernels.moe_route_maps import (
-            BLOCK_THREADS,
-            MAX_ROUTE_BUCKETS,
+            MAX_TP_ROUTE_BUCKETS,
+            tp_route_min_routes,
         )
 
-        # Keep small calls and wave64 paths unchanged. Each 256-bucket sweep
-        # adds histogram work; amortize it across at least four route blocks.
+        # Keep small calls and wave64 paths unchanged. Wider expert sets
+        # require more routes to amortize their per-workgroup histogram sweeps.
         use_lds = (
             get_gfx_runtime() == "gfx1250"
-            and 0 < int(E) <= MAX_ROUTE_BUCKETS
-            and numel
-            >= 4 * ((int(E) + BLOCK_THREADS - 1) // BLOCK_THREADS) * BLOCK_THREADS
+            and 0 < int(E) <= MAX_TP_ROUTE_BUCKETS
+            and numel >= tp_route_min_routes(int(E))
         )
         topids_to_rows_kernel = (
             _get_compiled_topids_to_rows_lds(int(E))

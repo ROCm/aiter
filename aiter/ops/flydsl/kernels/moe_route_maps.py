@@ -26,6 +26,26 @@ MAX_G2L_EXPERTS = 512
 # The per-block LDS counter array is sized to this; the dispatcher falls back to
 # the plain device-atomic kernel when the local bucket count (E) exceeds it.
 MAX_ROUTE_BUCKETS = 512
+# Ordinary TP histograms have a private allocation, independent of EP scratch.
+# Bound their size to 16 KiB; larger expert sets retain the original router.
+MAX_TP_ROUTE_BUCKETS = 4096
+
+
+def tp_route_bucket_capacity(n_buckets: int) -> int:
+    if not 0 < n_buckets <= MAX_TP_ROUTE_BUCKETS:
+        raise ValueError(f"LDS route bucket count out of range: {n_buckets}")
+    return max(
+        MAX_ROUTE_BUCKETS,
+        ((n_buckets + BLOCK_THREADS - 1) // BLOCK_THREADS) * BLOCK_THREADS,
+    )
+
+
+def tp_route_min_routes(n_buckets: int) -> int:
+    """Amortize extra histogram sweeps for wide, diffuse expert sets."""
+    tp_route_bucket_capacity(n_buckets)
+    sweeps = (n_buckets + BLOCK_THREADS - 1) // BLOCK_THREADS
+    return BLOCK_THREADS * sweeps * max(4, 2 * sweeps)
+
 
 # ``topids_to_rows`` value for a route that owns no grouped row: an EP route to a
 # non-local expert or in the dead-tail padding, or a route to expert -1 (a pad
@@ -193,8 +213,17 @@ def build_moe_topids_to_rows_lds_module(n_buckets: int):
     an expert remains unspecified, as in the original device-atomic kernel.
     The caller still supplies the initialized global counters.
     """
-    if not 0 < n_buckets <= MAX_ROUTE_BUCKETS:
-        raise ValueError(f"LDS route bucket count out of range: {n_buckets}")
+    capacity = tp_route_bucket_capacity(n_buckets)
+
+    if capacity == MAX_ROUTE_BUCKETS:
+        storage = _RouteCntStorage
+    else:
+
+        @fx.struct
+        class TpRouteCntStorage:
+            cnt: fx.Array[fx.Int32, capacity, 16]
+
+        storage = TpRouteCntStorage
 
     @flyc.kernel(name="moe_route_lds", known_block_size=[BLOCK_THREADS, 1, 1])
     def route_kernel(
@@ -206,7 +235,7 @@ def build_moe_topids_to_rows_lds_module(n_buckets: int):
     ):
         tid = fx.Uint32(fx.thread_idx.x)
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + tid
-        counts = fx.SharedAllocator().allocate(_RouteCntStorage).peek().cnt.ptr
+        counts = fx.SharedAllocator().allocate(storage).peek().cnt.ptr
         for b in range(tid, fx.Uint32(n_buckets), BLOCK_THREADS):
             counts[fx.Uint32(b)] = fx.Int32(0)
         gpu.barrier()
