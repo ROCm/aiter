@@ -680,6 +680,18 @@ jobs:
           echo "AITER_TEST=$(cat aiter_shard_${{ matrix.shard_idx }}.list)" >> $GITHUB_ENV
           echo "$AITER_TEST"
 
+      - name: Decide whether the sweeps narrow for this run
+        run: |
+          # Per-PR runs narrow the shape sweeps of the files listed in
+          # aiter_test.sh's ci_smoke_tests. Every other event -- the nightly
+          # schedule, a push to main, a manual dispatch -- keeps the full sweep,
+          # so nothing a PR run skips goes unexercised for more than a day.
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            echo "AITER_CI_SMOKE=1" >> "$GITHUB_ENV"
+          else
+            echo "AITER_CI_SMOKE=0" >> "$GITHUB_ENV"
+          fi
+
       - name: Restore Aiter wheel cache
         id: restore_aiter_wheel
         continue-on-error: true
@@ -790,6 +802,7 @@ jobs:
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -e AITER_TEST="${AITER_TEST}" \
+          -e AITER_CI_SMOKE="${AITER_CI_SMOKE}" \
           -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \

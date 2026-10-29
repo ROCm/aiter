@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import os
 
 import torch
 import triton
@@ -824,6 +825,7 @@ parser.add_argument(
           or --kv_cache_dtypes fp8""",
 )
 
+
 mrope_sections_dict = {64: [12, 10, 10], 128: [24, 20, 20], 256: [48, 40, 40]}
 
 # MRoPE sections for partial rotary: sum(section) == rotary_dim / 2
@@ -832,8 +834,26 @@ mrope_partial_sections_dict = {
     (128, 32): [4, 6, 6],  # head_size=128, rotary_dim=32, sum=16
 }
 
+
+def _apply_ci_smoke(args):
+    """Narrow the sweep when AITER_CI_SMOKE is set, for per-PR CI runs.
+
+    aiter-test.yaml sets it for pull_request events only; the nightly
+    schedule, pushes to main and manual dispatches leave it unset and keep
+    the full sweep. Only dimensions that do not pick a kernel narrow.
+
+    Dropping a token count here loses no parameter value: every other swept
+    value still appears in some case, only their combinations shrink. Keep the
+    shortest and longest.
+    """
+    if os.getenv("AITER_CI_SMOKE") == "1":
+        args.token = [3, 1257]
+        print(f"AITER_CI_SMOKE=1: narrowing --token to {args.token}", flush=True)
+    return args
+
+
 if __name__ == "__main__":
-    args = parser.parse_args()
+    args = _apply_ci_smoke(parser.parse_args())
     test_return_kv_flags = [True, False]
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
     page_sizes = [16]  # Test two page sizes for shuffle layout
