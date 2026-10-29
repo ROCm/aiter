@@ -28,6 +28,13 @@ from op_tests.triton_tests.attention.mha_test_utils import (
 )
 
 
+@pytest.fixture(params=[False, True])
+def FUSED(request):
+    mha_set_use_fused_bwd_kernel(request.param)
+    yield request.param
+    mha_set_use_fused_bwd_kernel(False)
+
+
 def _test_mha_impl(
     BATCH: int,
     SEQLEN_Q: int,
@@ -387,13 +394,13 @@ def test_mha_int64_strides(
     def _generate_input(
         batch: int, seqlen: int, nheads: int, dim_size: int, large_stride: bool = False
     ) -> torch.Tensor:
-        seqlens = torch.full((batch,), seqlen)
+        seqlens = torch.full((batch,), seqlen, device="cuda")
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32, device="cuda"),
                 seqlens.cumsum(dim=0, dtype=torch.int32),
             ]
-        ).to(device="cuda")
+        )
         total_seqlen = cu_seqlens[-1].item()
 
         if large_stride:
@@ -468,7 +475,6 @@ def _test_mha_varlen_impl(
 ):
     skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
-    torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -721,7 +727,6 @@ def test_mha_varlen_return_lse_softmax(
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward(
     BATCH: int,
     SEQLEN_Q: int,
@@ -743,7 +748,6 @@ def test_mha_backward(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -884,7 +888,6 @@ def test_mha_dao_ai_backward_head_size(
 @pytest.mark.parametrize("NUM_K_HEADS", [8])
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [False])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward_sbhd_do(
     BATCH: int,
     SEQLEN_Q: int,
@@ -908,7 +911,6 @@ def test_mha_backward_sbhd_do(
 
     torch.cuda.empty_cache()
     torch.manual_seed(42)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -954,7 +956,6 @@ def test_mha_backward_sbhd_do(
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward_varlen(
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -976,7 +977,6 @@ def test_mha_backward_varlen(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -1087,21 +1087,29 @@ def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
     NUM_HEADS, HEAD_SZ = 4, 128
     seqlens = [300, 250]
     total = sum(seqlens)
-    u = torch.nn.functional.normalize(torch.randn(HEAD_SZ, device="cuda"), dim=0)
+    u = torch.nn.functional.normalize(
+        torch.randn(HEAD_SZ, device="cuda", dtype=torch.float32), dim=0
+    )
     a = 34.0  # q . k ~ -a^2, so logits ~ -a^2 / sqrt(HEAD_SZ) ~ -102
-    q = (-a * u + 0.5 * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda")).to(
-        torch.bfloat16
-    )
-    k = (a * u + 0.5 * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda")).to(
-        torch.bfloat16
-    )
+    q = (
+        -a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    k = (
+        a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
     v = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
     do = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
     q.requires_grad = True
     k.requires_grad = True
     v.requires_grad = True
     cu_seqlens = torch.tensor(
-        [0, *torch.tensor(seqlens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+        [0, *torch.tensor(seqlens, device="cuda").cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
     )
 
     if bwd_mode is None:

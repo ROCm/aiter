@@ -258,7 +258,7 @@ def _fused_gemm_a8w8_blockscale_split_cat(
                 c1_ptr
                 + stride_c1_m * offs_c1_m[:, None]
                 + stride_c1_n * offs_c1_n[None, :]
-                + stride_c1_k * pid_k
+                + stride_c1_k * pid_k.to(tl.int64)
             )
             c1_mask = (offs_c1_m[:, None] < M) & (offs_c1_n[None, :] < N)
             tl.store(c1_ptrs, c, mask=c1_mask)
@@ -528,7 +528,7 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
                 c1_ptr
                 + stride_c1_m * offs_c1_m[:, None]
                 + stride_c1_n * offs_c1_n[None, :]
-                + stride_c1_k * pid_k
+                + stride_c1_k * pid_k.to(tl.int64)
             )
             c1_mask = (offs_c1_m[:, None] < M) & (offs_c1_n[None, :] < N)
             tl.store(c1_ptrs, c, mask=c1_mask)
@@ -599,7 +599,7 @@ def _fused_gemm_a8w8_blockscale_split_cat_reduce(
     offs_k = tl.arange(0, MAX_KSPLIT)
     c_ptrs = (
         c_ptr
-        + (offs_k[:, None, None] * stride_c_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_k)
         + (offs_m[None, :, None] * stride_c_m)
         + (offs_n[None, None, :] * stride_c_n)
     )
