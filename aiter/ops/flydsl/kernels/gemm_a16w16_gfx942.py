@@ -659,10 +659,13 @@ def get_split_k_buffers(stream_handle: int, device, split_k, split_k_reduce):
 
     Also one per stream, since launches on two streams may overlap. Keyed by
     the raw stream handle (``cuda_stream``), so no stream object is kept alive.
-    PyTorch recycles a fixed pool of handles per device, which bounds the sets
-    of its streams; a stream reusing a destroyed stream's handle inherits its
-    idle set. Sets (8-12 KB each) are never evicted: a captured CUDA graph
-    keeps using their addresses.
+    PyTorch pooled streams recycle a bounded set of handles; external streams
+    can add one set per distinct handle. A reused handle inherits its idle set.
+    Sets (8-12 KB each) are never evicted because a captured CUDA graph keeps
+    using their addresses.
+
+    Before graph capture, callers must run the operation once on the capture
+    stream so allocation and the one-time zeroing happen outside the graph.
 
     Zeroed once, never reset by the host. Atomic split-K (``SplitKProtocol``)
     never resets its 64-bit tickets: each launch advances them by split_k,

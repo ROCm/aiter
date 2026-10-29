@@ -155,7 +155,12 @@ def flydsl_hgemm(
     the shape's tuned-table row (else the cost-model fallback), and the set
     ones are passed as ``user_kwargs`` to its ``gemm_a16w16``. Elsewhere they
     take ``_HGEMM_DEFAULT_TILE``. gfx942 has no main-loop unroll variant, so it
-    validates ``policy`` but ignores it.
+    validates ``policy`` but ignores it, and does not support ``bias``.
+
+    On gfx942, a partial tile override keeps unspecified block dimensions,
+    wave counts and ``group_m`` from the selected tuned or fallback config.
+    Setting a tile or pipeline key resets its pipeline flags and split-K before
+    applying the override.
     """
 
     if policy not in ("ft", "ht", "hti"):
