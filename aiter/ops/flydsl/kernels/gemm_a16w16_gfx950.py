@@ -1293,10 +1293,18 @@ def gemm_a16w16_gfx950(
     )
 
 
+@functools.cache
+def _gemm_a16w16_gfx950_param_for(items):
+    # Building the param struct coerces every field through FlyDSL's typing
+    # layer, which costs more host time than the launch itself; it depends
+    # only on the config, so one struct per config serves every M.
+    return make_gemm_a16w16_gfx950_param(**dict(items))
+
+
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     result = None
     try:
-        result = make_gemm_a16w16_gfx950_param(**kwargs)
+        result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
         return None
     split_k = kwargs.get("split_k", 1)

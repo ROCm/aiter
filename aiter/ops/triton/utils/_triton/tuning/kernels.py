@@ -844,3 +844,40 @@ def gemm_afp8wfp8_preshuffle(shape, backend):
         )  # clusters only there
 
     return call, (x, w_kernel, x_scales_kernel, w_scales, y), should_skip
+
+
+@kernel("GEMM-AFP8WFP8_A32_W1X32", bits=(8, 8), backend_kwarg=False)
+def gemm_afp8wfp8_a32_w1x32(shape, backend):
+    import torch
+
+    from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8 as gemm
+    from op_tests.triton_tests.gemm.basic.test_gemm_afp8wfp8 import generate_inputs
+
+    M, N, K = shape["M"], shape["N"], shape["K"]
+    x, w, _, _, x_scales, _ = generate_inputs(M, N, K, x_scale_group_size=32)
+    # MXFP8: one E8M0 weight scale per 1x32 block (the generator makes 128x128)
+    w_scales = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8, device=x.device)
+    y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+
+    def call(config, x, w, x_scales, w_scales, y):
+        return gemm(
+            x,
+            w,
+            x_scales,
+            w_scales,
+            dtype=torch.bfloat16,
+            y=y,
+            config=config,
+            x_scale_group_size=32,
+            w_scale_group_size=(1, 32),
+        )
+
+    def should_skip(config):
+        if config["BLOCK_SIZE_K"] < 64:
+            return True  # the kernel asserts BLOCK_SIZE_K >= 64
+        if config["NUM_KSPLIT"] == 1:
+            # the split-K reduce keys are unused without split-K
+            return config["FUSED_SPLITK"] or config["REDUCE_BLOCK_SIZE_M"] != 32
+        return False
+
+    return call, (x, w, x_scales, w_scales, y), should_skip
