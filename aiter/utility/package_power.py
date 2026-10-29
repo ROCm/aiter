@@ -6,6 +6,7 @@ import collections
 import ctypes
 import glob
 import logging
+import math
 import os
 import threading
 import time
@@ -160,18 +161,28 @@ def _read_watts(path: str) -> float | None:
 
 
 def measure_package_watts(
-    fn, seconds: float | None = None, device_index: int = 0
+    fn,
+    seconds: float | None = None,
+    device_index: int = 0,
+    kernel_us: float | None = None,
 ) -> float:
-    """Run fn until `seconds` elapse and return the mean package power in watts.
+    """Run fn until `seconds` elapse and return package power in watts.
 
     The timed GEMM loop in the tuner is often shorter than the PPT update, so callers
     that rank by power should pass a window of a few hundred milliseconds.
+
+    Without ``kernel_us`` this is the mean reading over the window. With it,
+    the reading is the power while the kernel runs: launching ``fn`` from
+    Python can leave the GPU idle between calls, and a kernel whose launch
+    costs more host time than its GPU time would otherwise read close to idle
+    and look efficient. See ``active_watts``.
     """
     if seconds is None:
         seconds = float(os.environ.get("AITER_POWER_WINDOW_S", "0.4"))
     path = power_input_path(device_index)
     if path is None or seconds <= 0:
         return float("nan")
+    idle_w = idle_watts(path) if kernel_us is not None else None
 
     samples: list[float] = []
     stop = threading.Event()
@@ -189,20 +200,104 @@ def measure_package_watts(
     fn()
     _sync_cuda()
     in_flight = _InFlight(time.perf_counter() - started)
+    calls = 0
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
-    deadline = time.perf_counter() + seconds
+    window_start = time.perf_counter()
+    deadline = window_start + seconds
     try:
         while time.perf_counter() < deadline:
             fn()
+            calls += 1
             in_flight.mark()
     finally:
         _sync_cuda()
+        window_s = time.perf_counter() - window_start
         stop.set()
         thread.join()
     if not samples:
         return float("nan")
-    return sum(samples) / len(samples)
+    mean_w = sum(samples) / len(samples)
+    if kernel_us is None:
+        return mean_w
+    if in_flight.wait_s > SATURATED_WAIT * window_s:
+        # The loop had to wait for the GPU, so the queue never ran dry. The
+        # timed us can undercount a sustained window (clocks settle lower),
+        # which would otherwise read as idle time.
+        return mean_w
+    return active_watts(mean_w, idle_w, calls * kernel_us * 1e-6 / window_s)
+
+
+# Below this GPU-busy fraction the window is mostly idle and scaling the
+# reading up would mostly amplify sensor noise.
+MIN_BUSY = 0.2
+# At or above this the window kept the GPU busy and the reading stands.
+FULL_BUSY = 0.95
+# Waiting on the GPU for this share of the window means launches outran it.
+SATURATED_WAIT = 0.02
+_idle_watts: dict[str, float] = {}
+
+
+def active_watts(mean_w: float, idle_w: float | None, busy: float) -> float:
+    """Package power while the kernel runs, from a window that was ``busy`` busy.
+
+    The window's energy is idle power for the whole window plus the kernel's
+    extra power while it ran, so ``mean = idle + busy * (active - idle)``.
+    NaN when the window was too idle to tell, which ranks the kernel as
+    unmeasured.
+    """
+    if not math.isfinite(busy) or busy <= 0:
+        return float("nan")
+    if busy >= FULL_BUSY or idle_w is None:
+        return mean_w
+    if busy < MIN_BUSY:
+        logger.warning(
+            "package power: the GPU was busy %.0f%% of the window "
+            "(launch-bound), so this kernel's power is not recorded",
+            busy * 100,
+        )
+        return float("nan")
+    return idle_w + (mean_w - idle_w) / busy
+
+
+def idle_watts(path: str) -> float | None:
+    """Package power between launches, read once per process and sensor.
+
+    Between back-to-back launches the GPU stays awake at high clocks, which
+    on MI355X reads ~300 W against ~240 W fully idle. A loop of one-element
+    kernels reproduces that state, so it is the baseline the launch gaps are
+    charged at; a fully idle baseline would overstate short kernels.
+    ``AITER_POWER_IDLE_W`` overrides the reading.
+    """
+    override = os.environ.get("AITER_POWER_IDLE_W", "").strip()
+    if override:
+        return float(override)
+    if path not in _idle_watts:
+        try:
+            import torch
+
+            device = torch.cuda.current_device()
+            tick = torch.zeros(1, device=f"cuda:{device}")
+        except Exception:  # noqa: BLE001
+            return None
+        samples = []
+        end = time.perf_counter() + 0.3
+        next_read = 0.0
+        while time.perf_counter() < end:
+            tick.add_(0)
+            now = time.perf_counter()
+            if now >= next_read:
+                watts = _read_watts(path)
+                if watts is not None:
+                    samples.append(watts)
+                next_read = now + 0.005
+        _sync_cuda()
+        # Drop the first third while the clocks ramp.
+        samples = samples[len(samples) // 3 :]
+        if not samples:
+            return None
+        _idle_watts[path] = sum(samples) / len(samples)
+    return _idle_watts[path]
 
 
 class _InFlight:
@@ -222,6 +317,7 @@ class _InFlight:
         self._events = collections.deque()
         self._every = max(1, int(self.SPAN_S / call_s)) if call_s > 0 else 1
         self._calls = 0
+        self.wait_s = 0.0
         try:
             import torch
 
@@ -239,7 +335,17 @@ class _InFlight:
         done.record()
         self._events.append(done)
         if len(self._events) > self.DEPTH:
+            started = time.perf_counter()
             self._events.popleft().synchronize()
+            self.wait_s += time.perf_counter() - started
+
+
+def _positive(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def _sync_cuda() -> None:
@@ -290,12 +396,16 @@ def kernel_call(func, args, kwargs):
     return lambda: func(*args, **kernel_kwargs)
 
 
-def measure_kernel(call, device_index: int | None = None) -> float:
-    """Mean package watts while ``call`` launches back to back.
+def measure_kernel(
+    call, device_index: int | None = None, kernel_us: float | None = None
+) -> float:
+    """Package watts while ``call`` launches back to back.
 
     This is the one place a tune reads package power. ``call`` launches the
-    kernel the timer measured and nothing else; NaN means the sensor could not
-    be read or the call raised.
+    kernel the timer measured and nothing else. ``kernel_us`` is that call's
+    timed GPU time; with it the reading is corrected for host launch gaps
+    (``active_watts``). NaN means the sensor could not be read, the call
+    raised, or the window was too idle to tell.
     """
     if device_index is None:
         try:
@@ -305,7 +415,11 @@ def measure_kernel(call, device_index: int | None = None) -> float:
         except Exception:  # noqa: BLE001
             device_index = 0
     try:
-        return float(measure_package_watts(call, device_index=device_index))
+        return float(
+            measure_package_watts(
+                call, device_index=device_index, kernel_us=_positive(kernel_us)
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("package power measurement failed: %s", exc)
         return float("nan")

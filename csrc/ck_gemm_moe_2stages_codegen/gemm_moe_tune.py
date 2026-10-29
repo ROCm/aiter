@@ -6108,8 +6108,8 @@ class FmoeTuner(TunerCommon):
                     )
                     flat_e2e = {"us": us_flat_e2e}
                     nf_e2e = {"us": us_nf_e2e}
-                    policy.record(flat_e2e, "watts", _flat_seq)
-                    policy.record(nf_e2e, "watts", _nf_seq)
+                    policy.record(flat_e2e, "watts", _flat_seq, kernel_us=us_flat_e2e)
+                    policy.record(nf_e2e, "watts", _nf_seq, kernel_us=us_nf_e2e)
                     if "watts" in flat_e2e:
                         print(
                             f"  e2e power: FLAT{policy.watt_text(flat_e2e['watts'])}; "
@@ -6683,7 +6683,7 @@ class GroupedFmoeTuner(FmoeTuner):
                 _call, num_warmup=int(args.warmup), num_iters=int(args.iters)
             )
             us = round(float(us), 4)
-            self.policy_for(args).record(candidate, "watts", _call)
+            self.policy_for(args).record(candidate, "watts", _call, kernel_us=us)
             return us
         finally:
             if old_config is None:
@@ -7711,6 +7711,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 lambda: self._port_e2e(
                     data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
                 ),
+                kernel_us=us,
             )
         # The pair is timed as one unit, so the fused-MoE estimate in calculate()
         # is the right roofline for it. Untuned rows keep dtypes as strings, while

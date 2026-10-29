@@ -91,15 +91,21 @@ class SelectionPolicy:
         """How many accuracy-qualified candidates the accurate pass times."""
         return measure_all_accurate(self.measures_power, shortlist, qualified)
 
-    def measure(self, call, device_index=None) -> float:
-        """Package watts while ``call`` replays back to back. NaN when not measured."""
+    def measure(self, call, device_index=None, kernel_us=None) -> float:
+        """Package watts while ``call`` runs. NaN when not measured.
+
+        ``kernel_us`` is the timed GPU time of one ``call``; pass it so the
+        sample discounts host launch gaps between calls.
+        """
         return float("nan")
 
-    def measure_timed(self, func, args, kwargs, device_index=None) -> float:
+    def measure_timed(
+        self, func, args, kwargs, device_index=None, kernel_us=None
+    ) -> float:
         """Package watts for a kernel the timer ran as ``run_perftest(func, *args, **kwargs)``."""
         return float("nan")
 
-    def record(self, target: dict, key, call, device_index=None) -> None:
+    def record(self, target: dict, key, call, device_index=None, kernel_us=None):
         """Store the power sample for ``call`` under ``target[key]`` when measuring.
 
         Latency mode leaves ``target`` untouched, so a latency result frame
@@ -129,18 +135,24 @@ class PowerSelectionPolicy(SelectionPolicy):
     name = "power"
     measures_power = True
 
-    def measure(self, call, device_index=None) -> float:
+    def measure(self, call, device_index=None, kernel_us=None) -> float:
         from aiter.utility.package_power import measure_kernel
 
-        return measure_kernel(call, device_index=device_index)
+        return measure_kernel(call, device_index=device_index, kernel_us=kernel_us)
 
-    def measure_timed(self, func, args, kwargs, device_index=None) -> float:
+    def measure_timed(
+        self, func, args, kwargs, device_index=None, kernel_us=None
+    ) -> float:
         from aiter.utility.package_power import kernel_call
 
-        return self.measure(kernel_call(func, args, kwargs), device_index=device_index)
+        return self.measure(
+            kernel_call(func, args, kwargs),
+            device_index=device_index,
+            kernel_us=kernel_us,
+        )
 
-    def record(self, target: dict, key, call, device_index=None) -> None:
-        target[key] = self.measure(call, device_index=device_index)
+    def record(self, target: dict, key, call, device_index=None, kernel_us=None):
+        target[key] = self.measure(call, device_index=device_index, kernel_us=kernel_us)
 
     def attach_columns(self, frame, results):
         return attach_power_columns(frame, results)
