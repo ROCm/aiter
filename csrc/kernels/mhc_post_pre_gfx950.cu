@@ -758,6 +758,9 @@ void mhc_post_project_gfx950(aiter_tensor_t& projection,
 {
     const HipDeviceGuard guard(x.device_id);
     AITER_CHECK(get_gpu_arch() == "gfx950", "mHC packed producer requires gfx950");
+    AITER_CHECK(get_num_cu_func() == 256 && getenv("HSA_CU_MASK") == nullptr &&
+                    getenv("ROC_GLOBAL_CU_MASK") == nullptr,
+                "mHC gfx950 tuning requires an unmasked 256-CU device");
     constexpr int m = 8192, hidden = 7168, splits = 4;
     check_tensor(x, AITER_DTYPE_bf16, x.device_id, {m, hidden});
     check_tensor(residual, AITER_DTYPE_bf16, x.device_id, {m, 4, hidden});
@@ -804,6 +807,9 @@ void mhc_finalize_gfx950(aiter_tensor_t& post,
 {
     const HipDeviceGuard guard(out.device_id);
     AITER_CHECK(get_gpu_arch() == "gfx950", "mHC finalizer requires gfx950");
+    AITER_CHECK(get_num_cu_func() == 256 && getenv("HSA_CU_MASK") == nullptr &&
+                    getenv("ROC_GLOBAL_CU_MASK") == nullptr,
+                "mHC gfx950 tuning requires an unmasked 256-CU device");
     const int m = out.size(0), splits = m == 64 ? 56 : 4;
     AITER_CHECK((m == 64 || m == 8192) && repeats > 0,
                 "mHC gfx950: unsupported row count or Sinkhorn iterations");

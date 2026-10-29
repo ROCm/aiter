@@ -6,6 +6,7 @@
 import argparse
 import hashlib
 import json
+import os
 import statistics
 from contextlib import nullcontext
 from pathlib import Path
@@ -13,7 +14,7 @@ from unittest.mock import patch
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops import mhc as mhc_api
 from aiter.ops.mhc import (
     _mhc_post_pre_gfx950_supported,
@@ -229,6 +230,21 @@ def test_routing(m, seed):
     print(f"m={m}: precision/force_fused/backend routing PASS")
 
 
+def test_hardware_exclusions(seed):
+    args, kwargs = inputs(64, seed=seed)
+    # Probe the eligibility predicate only: no unsupported launch is executed.
+    with patch("aiter.ops.mhc.get_cu_num", return_value=128):
+        assert not _mhc_post_pre_gfx950_supported(*args, kwargs["norm_weight"])
+    with patch("aiter.ops.mhc.get_cu_num", return_value=256):
+        for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK"):
+            for value in ("", "0x1"):
+                with patch.dict(os.environ, {name: value}):
+                    assert not _mhc_post_pre_gfx950_supported(
+                        *args, kwargs["norm_weight"]
+                    )
+    print("CU count and mask eligibility exclusions PASS")
+
+
 def test_small_values(seed):
     for packed in (False, True):
         for amplitude in (0.0, 1e-5):
@@ -372,6 +388,10 @@ def benchmark_cases(ms, seed, output_path):
     result = {
         "gpu": torch.cuda.get_device_name(),
         "gfx": get_gfx_runtime(),
+        "cu_count": get_cu_num(),
+        "cu_masks": {
+            name: os.environ.get(name) for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        },
         "torch": torch.__version__,
         "hip": torch.version.hip,
         "scope": "same-process current upstream dispatch vs adapted full public call, matched flags per row",
@@ -401,14 +421,22 @@ if __name__ == "__main__":
         help="also run the paired benchmark and write its raw results",
     )
     args = parser.parse_args()
-    if get_gfx_runtime() != "gfx950":
-        print("SKIP: optimized cases require gfx950")
+    if (
+        get_gfx_runtime() != "gfx950"
+        or get_cu_num() != 256
+        or any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    ):
+        print("SKIP: optimized cases require an unmasked 256-CU gfx950 device")
     else:
         for seed in args.seed:
             for m in args.m:
                 for packed in ((False, True) if m == 64 else (True,)):
                     test_case(m, seed, packed)
         test_fallbacks(args.seed[0])
+        test_hardware_exclusions(args.seed[0])
         for m in args.m:
             test_routing(m, args.seed[0])
         test_small_values(args.seed[0])

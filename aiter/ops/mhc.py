@@ -3,6 +3,7 @@
 
 import functools
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -1031,7 +1032,12 @@ def _mhc_post_pre_gfx950_supported(
     norm_weight: Tensor | None,
     w_preshuffle_bf16: bool = False,
 ) -> bool:
-    # Only the supported BF16 plain-layout configurations select this path.
+    # Fixed launch tuning is qualified only for an unmasked 256-CU device.
+    if get_cu_num() != 256 or any(
+        os.environ.get(name) is not None
+        for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+    ):
+        return False
     # Other shapes, dtypes and views keep the existing dispatch.
     m = layer_input.shape[0]
     if norm_weight is None or not (m == 64 or (m == 8192 and w_preshuffle_bf16)):
@@ -1178,7 +1184,8 @@ def mhc_fused_post_pre(
 
     Both flags are boolean, default to False, and are controlled independently.
 
-    On gfx950, BF16 plain-layout calls with hidden size 7168, four residual
+    On unmasked 256-CU gfx950 devices, BF16 plain-layout calls with hidden size
+    7168, four residual
     streams and RMSNorm can use the row-fused finalizer. This applies to M=64
     in either projection mode, and M=8192 with explicit w_preshuffle_bf16=True
     and fn from mhc_shuffle_fn. The latter also fuses post with projection. Default
