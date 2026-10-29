@@ -48,6 +48,8 @@ SHAPES = [
     (129, 6144, 512, 5),  # MiniMax-M3 (INTER 384 pads to 512)
     (129, 6144, 768, 5),  # MiniMax-M3
     (129, 6144, 1536, 5),  # MiniMax-M3 TP=2
+    (128, 6144, 768, 4),  # MiniMax-M3 shared expert not fused, TP=4
+    (128, 6144, 1536, 4),  # MiniMax-M3 shared expert not fused, TP=2
     (256, 3072, 256, 8),  # MiniMax-M2.5 TP=6
     (256, 3072, 512, 8),  # MiniMax-M2.5 (INTER 384 pads to 512)
     (256, 7168, 256, 8),  # DSV3/Kimi-K2 E256
@@ -55,11 +57,19 @@ SHAPES = [
     (384, 7168, 256, 8),  # Kimi-K2 TP=8
     (512, 4096, 512, 10),  # Qwen3.5 TP=1
     (513, 4096, 512, 11),  # Qwen3.5 shared-expert variant
+    (513, 8192, 256, 11),  # Qwen3.8 TP=8 (shared-expert variant)
+    (513, 2560, 768, 11),  # Qwen3.8-Flash-Next TP=1 (INTER 640 pads to 768)
     (512, 2048, 512, 10),  # Qwen3-Coder-Next TP=1
     (256, 6144, 2048, 8),  # GLM-5.3 TP=1
     (256, 6144, 3072, 6),  # Inkling TP=1
     (384, 6144, 2048, 8),  # MiMo-V2.5-Pro TP=1
     (288, 4096, 2048, 8),  # GLM-5.3-Flash / Step-3.5-Flash TP=1 aux key
+    (288, 4096, 1024, 8),  # GLM-5.3-Flash TP=2
+    (288, 4096, 512, 8),  # GLM-5.3-Flash TP=4
+    (288, 4096, 256, 8),  # GLM-5.3-Flash TP=8
+    (289, 4096, 1024, 9),  # GLM-5.3-Flash TP=2 shared-expert variant
+    (289, 4096, 512, 9),  # GLM-5.3-Flash TP=4 shared-expert variant
+    (289, 4096, 256, 9),  # GLM-5.3-Flash TP=8 shared-expert variant
 ]
 
 
@@ -147,7 +157,8 @@ AUX_SORT_ONLY_ZI_PARAMS = """    int            M,
     int32_t*       m_indices,
     void*          bf16_zero_ptr,
     void*          bf16_zero_ws_ptr,
-    long long      workspace_bytes"""
+    long long      workspace_bytes,
+    const int32_t* num_local_tokens"""
 
 AUX_SORT_ONLY_PARAMS = """    int            M,
     const int32_t* topk_ids,
@@ -157,7 +168,8 @@ AUX_SORT_ONLY_PARAMS = """    int            M,
     int32_t*       cumsum,
     int32_t*       reverse_sorted,
     float*         sorted_weights,
-    int32_t*       m_indices"""
+    int32_t*       m_indices,
+    const int32_t* num_local_tokens"""
 
 AUX_QUANT_PARAMS = """    int            M,
     const void*    a_input,
@@ -221,7 +233,7 @@ def _aux_sort_only_zi_body(ne, topk, mb, h):
         f"            cumsum, reverse_sorted, sorted_weights,\n"
         f"            m_indices,\n"
         f"            reinterpret_cast<__hip_bfloat16*>(bf16_zero_ptr),\n"
-        f"            bf16_zero_ws_ptr, workspace_bytes);"
+        f"            bf16_zero_ws_ptr, workspace_bytes, num_local_tokens);"
     )
 
 
@@ -232,7 +244,7 @@ def _aux_sort_only_body(ne, topk, mb, h):
         f"            stream, M,\n"
         f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
         f"            cumsum, reverse_sorted, sorted_weights,\n"
-        f"            m_indices);"
+        f"            m_indices, num_local_tokens);"
     )
 
 

@@ -12,6 +12,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.core import get_asm_dir
 from aiter.ops.gemm_op_a6w6 import (
+    _ceil,
     _select_gemm_a6w6_kernel,
     dequant_mxfp6_torch,
     gemm_a6w6_asm,
@@ -30,21 +31,23 @@ pd.set_option("display.max_colwidth", 30)
 SPECIALIZED_CASES = (
     (
         (9450, 5120, 5120),
-        "aiter_a6w6_m9472_n5120_k5120_m82",
+        "_ZN5aiter44f6gemm_bf16_per1x32Fp6_m9472_n5120_k5120_m82E",
         "f6gemm_dmabig_kernel_func",
     ),
     (
         (9450, 13824, 5120),
-        "aiter_a6w6_m9472_n13824_k5120_m82",
+        "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n13824_k5120_m82E",
         "f6gemm_dmabig_kernel_func",
     ),
     (
         (9450, 5120, 13824),
-        "aiter_a6w6_m9472_n5120_k13824_m82",
+        "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n5120_k13824_m82E",
         "f6gemm_dmabig_allk_kernel_func",
     ),
 )
 SPECIALIZED_SQUARE_KERNEL = SPECIALIZED_CASES[0][1]
+DMABIG_DS_KERNEL = "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g32_dscaleE"
+DMABIG_DS_SWZ0_KERNEL = "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscaleE"
 
 
 @perftest(num_iters=5)
@@ -153,13 +156,57 @@ def test_specialized_dispatch_matches_safe_kernel(
     assert torch.equal(actual[:M, :N], baseline[:M, :N])
 
 
+@pytest.mark.parametrize(
+    "shape,baseline_kernel,candidate_kernel",
+    (
+        (
+            (257, 513, 129),
+            "f6gemm_dmabig_swz0_kernel_func",
+            DMABIG_DS_SWZ0_KERNEL,
+        ),
+        ((513, 784, 1152), "f6gemm_dmabig_kernel_func", DMABIG_DS_KERNEL),
+        (
+            (256, 256, 6273),
+            "f6gemm_dmabig_swz0_kernel_func",
+            DMABIG_DS_SWZ0_KERNEL,
+        ),
+    ),
+)
+@torch.no_grad()
+def test_direct_scale_dmabig_matches_current_fallback_bitwise(
+    shape, baseline_kernel, candidate_kernel
+):
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("A6W6 assembly requires gfx950")
+    M, N, K = shape
+    padM = _ceil(M, 256)
+    padN = _ceil(N, 256)
+    padK = _ceil(K, 128)
+    torch.manual_seed(M + N + K)
+    x = torch.randn((M, K), dtype=torch.bfloat16)
+    w = torch.randn((N, K), dtype=torch.bfloat16)
+    A, A_scale = quant_mxfp6_gemm(x)
+    B, B_scale = quant_mxfp6_gemm(w)
+    baseline = torch.empty((padM, padN), dtype=torch.bfloat16)
+    actual = torch.empty_like(baseline)
+    gemm_a6w6_asm(A, B, A_scale, B_scale, baseline, padK, baseline_kernel)
+    gemm_a6w6_asm(A, B, A_scale, B_scale, actual, padK, candidate_kernel)
+    assert torch.equal(actual.view(torch.int16), baseline.view(torch.int16))
+
+
 def test_manifest_excludes_shape_guarded_kernels_from_incompatible_sweeps():
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("A6W6 manifest ships only for gfx950")
     small = _manifest_kernel_names(257, 513, 129)
-    assert not any("a6w6_m9472_" in name for name in small)
+    assert not any("f6gemm_bf16_per1x32Fp6_m9472_" in name for name in small)
     square = _manifest_kernel_names(9450, 5120, 5120)
     assert SPECIALIZED_SQUARE_KERNEL in square
-    assert "aiter_a6w6_m9472_n13824_k5120_m82" not in square
-    assert "aiter_a6w6_m9472_n5120_k13824_m82" not in square
+    assert "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n13824_k5120_m82E" not in square
+    assert "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n5120_k13824_m82E" not in square
 
 
 @torch.no_grad()
@@ -181,7 +228,11 @@ def test_specialized_kernel_rejects_incompatible_physical_shape():
         gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, SPECIALIZED_SQUARE_KERNEL)
 
 
-def main():
+def main() -> int:
+    pytest_result = pytest.main([__file__, "-q"])
+    if pytest_result != pytest.ExitCode.OK:
+        return int(pytest_result)
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
@@ -237,7 +288,7 @@ def main():
 
         if get_gfx() != "gfx950":
             aiter.logger.info("--all-kernels requires gfx950; skipping")
-            return
+            return 0
     results = []
     for dtype in args.dtype:
         for m, n, k in args.shape:
@@ -252,7 +303,8 @@ def main():
     aiter.logger.info(
         "gemm_a6w6 summary (markdown):\n%s", frame.to_markdown(index=False)
     )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
