@@ -72,6 +72,49 @@ def opus_mla_decode_supported(fp8: bool, nhead: int, max_seqlen_q: int) -> int:
     """1 if :func:`opus_mla_decode_fwd` has a build for ``nhead`` x ``max_seqlen_q``."""
 
 
+# Flat-row decode (opus_mla_decode_flat.cu); aiter/ops/opus/mla_flat.py drives both.
+
+
+@compile_ops(DECODE_MD_NAME, ffi_type="ctypes")
+def opus_mla_decode_flat_plan(
+    kv_indptr: torch.Tensor,  # [B+1] int32, host, rank-local
+    q_len: int,
+    num_heads: int,
+    num_workers: int,
+    balance: bool,
+    num_xcd: int,
+    item_cap: int,
+    max_units: int,
+    plan: torch.Tensor,  # int32, host: [num_workers+1 | item_cap*8 | max_units*4]
+    stats: torch.Tensor,  # int32 [2], host: work items, merge units
+) -> None: ...
+
+
+@compile_ops(DECODE_MD_NAME, ffi_type="ctypes")
+def opus_mla_decode_flat_fwd(
+    q: torch.Tensor,  # [total_q, H, 576] fp8
+    kv: torch.Tensor,  # [total_tokens, 576] fp8, page_size == 1
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    work_indptr: torch.Tensor,  # plan sections, on the GPU
+    work_info: torch.Tensor,
+    unit_info: torch.Tensor,
+    o_accum: torch.Tensor,  # [item_cap * 128, 512] bf16
+    lse_accum: torch.Tensor,  # [item_cap * 128] fp32
+    out: torch.Tensor,  # [total_q, H, 512] bf16
+    lse: torch.Tensor,  # [total_q, H] fp32
+    q_scale: torch.Tensor,  # float[1] per-tensor descale
+    kv_scale: torch.Tensor,  # float[1] per-tensor descale
+    softmax_scale: float,
+    causal: bool,
+    g_kv_indptr: torch.Tensor | None,  # round-robin CP: GLOBAL kv_indptr
+    cp_world_size: int,
+    cp_rank: int,
+    deep_reduce: bool,
+) -> None: ...
+
+
 # ---------------------------------------------------------------------------
 # Sparse prefill
 # ---------------------------------------------------------------------------
