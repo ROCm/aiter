@@ -669,8 +669,10 @@ def build_gemm(kc: KernelCtx) -> dict:
         nxt=None,
         aoff=None,
         sdd=False,
+        odd=False,
     ):
-        """sdd: (k-steps from 0, even NKS) a k-step pair's scale dwords loaded once"""
+        """sdd: (k-steps from 0, even NKS) a k-step pair's scale dwords loaded once;
+        odd: [gi_lo, gi_hi) may hold an odd number of groups"""
         MTE = MT if mte is None else mte
         sdd = sdd and NKS % 2 == 0 and nxt is None
         # the intermediate's first k-step in LDS (aoff: it holds the whole inter dim)
@@ -801,8 +803,8 @@ def build_gemm(kc: KernelCtx) -> dict:
                 )
             )
 
-        def groups(gi0):
-            for j in range_constexpr(GPI):
+        def groups(gi0, nj=GPI):
+            for j in range_constexpr(nj):
                 gi = gi0 + i32(j)
                 acc = [zero] * (4 * MTE)
                 s0 = s1 = None
@@ -926,7 +928,15 @@ def build_gemm(kc: KernelCtx) -> dict:
             if const_expr(progress is not None):  # noqa: SIM102
                 if i32(gi0_) + i32(GPI) >= g_hi:
                     progress()
-            groups(i32(gi0_))
+            if const_expr(GPI > 1 and odd):
+                # (an odd group range: its last group alone, the ring prefetches past it
+                # clamped to its last k-step)
+                if i32(gi0_) + i32(1) < g_hi:
+                    groups(i32(gi0_))
+                else:
+                    groups(i32(gi0_), 1)
+            else:
+                groups(i32(gi0_))
         wait_vm(0)
         if const_expr(not DLL):  # noqa: SIM102
             if signal:

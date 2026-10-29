@@ -132,7 +132,8 @@ def build_smallm(kc: KernelCtx) -> dict:
     SDD2 = os.environ.get("AITER_MEGAMOE_TP_SDD", "1") == "1"
     # the dynamic schedule's fused units while the G1 blocks fill under DYN_HI / 256 of
     # the CTAs (debug: AITER_MEGAMOE_TP_DYNHI)
-    DYN_HI = int(os.environ.get("AITER_MEGAMOE_TP_DYNHI", "192"))
+    # (128: never, given more than C / 2 blocks; measured: the small-M units win)
+    DYN_HI = int(os.environ.get("AITER_MEGAMOE_TP_DYNHI", "128"))
     # split-K pieces (ascending): the K steps of a piece a multiple of the B interleave
     IL1 = nsk * KCS // math.gcd(nsk, KCS)
     SKS = [s for s in (2, 3, 4, 6, 12) if KS1 % s == 0 and (KS1 // s) % IL1 == 0]
@@ -154,6 +155,10 @@ def build_smallm(kc: KernelCtx) -> dict:
     assert GPC % (nsk2 * KS2 // math.gcd(nsk2, KS2) // KS2) == 0
     # G1 block bytes / G2 share bytes (2 * 128 * H vs H / NCK * I weights)
     D = max(1, round(256 * NCK / I))
+    # (debug) the early-share cap per CTA without an extra block
+    D = int(os.environ.get("AITER_MEGAMOE_TP_SMD", str(D)))
+    # (debug) the rest run in single groups (else whole shares of GPC groups)
+    RGU = GPC if os.environ.get("AITER_MEGAMOE_TP_G2G", "1") == "1" else 1
 
     def smc(a, j, bank):
         return ctrl_at(a, i32(CTRL_SMC) + (bank * i32(NCHLB_MAX) + j) * i32(G1C_STRIDE))
@@ -293,12 +298,13 @@ def build_smallm(kc: KernelCtx) -> dict:
             xr = eh - bh * rr
             sh = e1 + xh * bh + fx.min(xh, xr)
             th = sh + bh + (xh < xr).select(i32(1), i32(0))
-            rest = ng2 - e1 - eh
+            # (G2G: the rest in groups, GPC per share: the last ones' finer spread)
+            rest = (ng2 - e1 - eh) * i32(RGU)
             b2 = rest // C
             x2 = rest - b2 * C
             # (the remainder shares first to the CTAs without the early remainder)
             xo = hb.select((x - x1 + C) % C, x)
-            s2 = e1 + eh + xo * b2 + fx.min(xo, x2)
+            s2 = (e1 + eh) * i32(RGU) + xo * b2 + fx.min(xo, x2)
             t2 = s2 + b2 + (xo < x2).select(i32(1), i32(0))
             r0s = lo.select(s1, hb.select(sh, i32(0)))
             r0t = lo.select(t1, hb.select(th, i32(0)))
@@ -467,7 +473,7 @@ def build_smallm(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def _sm_g2(L, tid, a, j, c0, c1, bank, piece, qg, ev):
-        """GEMM2 of row chunk j over its RS column chunks [c0, c1): the whole inter dim
+        """GEMM2 of row chunk j over its column groups [c0, c1): the whole inter dim
         (qg 1), else its inter piece of KS2 / QF k-steps (partial route region piece)"""
         mark(tid, a, 28)
         tnow(tid, a, ev)
@@ -497,10 +503,11 @@ def build_smallm(kc: KernelCtx) -> dict:
                 fx.Boolean(False),
                 KS2,
                 i32(0),
-                c0 * i32(GPC),
-                c1 * i32(GPC),
+                c0,
+                c1,
                 pre=pre,
                 sdd=SDD2,
+                odd=RGU > 1,
             )
         else:
             gemm2(
@@ -514,10 +521,11 @@ def build_smallm(kc: KernelCtx) -> dict:
                 fx.Boolean(False),
                 KS2 // QF,
                 piece,
-                c0 * i32(GPC),
-                c1 * i32(GPC),
+                c0,
+                c1,
                 pre=pre,
                 aoff=piece * i32(KS2 // QF),
+                odd=RGU > 1,
             )
         cbar(L, tid)
         mark(tid, a, 15)
@@ -526,14 +534,17 @@ def build_smallm(kc: KernelCtx) -> dict:
     @flyc.jit
     def _sm_run(L, tid, a, s0, s1, bank, run):
         """the G2 shares [s0, s1) (share s: segment s // NCK = (row chunk, inter piece of
-        qg), its RS column chunk s % NCK): one GEMM2 per segment"""
+        qg), its RS column chunk s % NCK; run 1 in units of 1 / RGU share): one GEMM2 per
+        segment"""
+        U = RGU if run == 1 else 1
+        NU = NCK * U
         qg = lds_ld_i32(L, L_CTL + C_DYNP * 4)
-        g0 = s0 // i32(NCK)
-        ng = (s1 > s0).select((s1 + i32(NCK - 1)) // i32(NCK) - g0, i32(0))
+        g0 = s0 // i32(NU)
+        ng = (s1 > s0).select((s1 + i32(NU - 1)) // i32(NU) - g0, i32(0))
         for k_ in range(i32(0), ng, i32(1)):
             g = g0 + i32(k_)
-            c0 = fx.max(s0, g * i32(NCK)) - g * i32(NCK)
-            c1 = fx.min(s1, (g + i32(1)) * i32(NCK)) - g * i32(NCK)
+            c0 = (fx.max(s0, g * i32(NU)) - g * i32(NU)) * i32(GPC // U)
+            c1 = (fx.min(s1, (g + i32(1)) * i32(NU)) - g * i32(NU)) * i32(GPC // U)
             j = g // qg
             ev = i32(40 + 12 * run) + fx.min(i32(k_), i32(3)) * i32(3)
             _sm_g2(L, tid, a, j, c0, c1, bank, g - j * qg, qg, ev)

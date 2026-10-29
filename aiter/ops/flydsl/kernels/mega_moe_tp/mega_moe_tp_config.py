@@ -334,7 +334,7 @@ def kernel_config(
     HB = (
         bool(sm)
         and os.environ.get("AITER_MEGAMOE_TP_HB", "1") == "1"
-        and MT <= 2  # (MT 3: the halves run at half the bytes per us, measured)
+        and (MT <= 2 or os.environ.get("AITER_MEGAMOE_TP_HB3", "0") == "1")  # (MT 3: the halves run at half the bytes per us, measured)
         and (KCS * 2) <= H // 128
         and (H // 128 // 2) % (nsk * KCS // math.gcd(nsk, KCS)) == 0
     )

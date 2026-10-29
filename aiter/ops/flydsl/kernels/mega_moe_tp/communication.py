@@ -1114,6 +1114,38 @@ def build_communication(kc: KernelCtx) -> dict:
         xs_bytes = a["ttot"] * i32(H // 32)
         rx = [peer_rs(a, p, "off_x", x_bytes) for p in range(TPC)]
         rs = [peer_rs(a, p, "off_xs", xs_bytes) for p in range(TPC)]
+        args = (L, lane, a, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes, qb, qs, cnt)
+        if const_expr(AGPAR):
+            # (more chunks per sender: the sequential stores-bump pipeline gets chunk 0's
+            # flag out before the later chunks' stores land)
+            if (ag_split(a) > i32(1)) & (cnt <= i32(AGPMAX)):
+                _ag_send_par(*args)
+            else:
+                _ag_send_seq(*args)
+        else:
+            _ag_send_seq(*args)
+
+    @flyc.jit
+    def _ag_send_par(L, lane, a, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes, qb, qs, cnt):
+        """(split: one row, cnt <= AGPMAX chunks) all chunks' stores, one wait, then every
+        chunk's count (lane k: chunk k) and the completing ones' flags in parallel"""
+        for k in range_constexpr(NCHA):
+            if i32(k) < cnt:
+                q = fx.min(qb + i32(k) * qs, i32(NCHA - 1))
+                ag_chunk(L, lane, a, q, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes)
+        wait_lgkm0()
+        if lane == i32(0):
+            lds_atomic_add(L, L_CTL + C_AGFREE * 4, 1, REL)
+        wait_vm(0)
+        if lane < cnt:
+            q = fx.min(qb + lane * qs, i32(NCHA - 1))
+            ga = ctrl_at(a, i32(CTRL_AGG) + q * i32(LRDY_STRIDE))
+            if g_add_agent(ga, 1) + i32(1) == fx.max(a["m"], i32(1)):
+                g_st_sys(ga, i32(0))
+                _ag_flag(a, q)
+
+    @flyc.jit
+    def _ag_send_seq(L, lane, a, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes, qb, qs, cnt):
         for k in range_constexpr(NCHA):
             kl = i32(k) < cnt
             q = fx.min(qb + i32(k) * qs, i32(NCHA - 1))
@@ -1164,14 +1196,40 @@ def build_communication(kc: KernelCtx) -> dict:
         hi = (S > i32(1)).select(lo + m, i32(gpu.grid_dim.x))
         return ceildiv(hi - x, i32(N_XCD)) - ceildiv(lo - x, i32(N_XCD))
 
+    # (debug) split all-gather (one row per sender CTA): the chunk's m senders count
+    # straight into the rank counter (one atomic round trip less than per XCD first)
+    AGDIR = os.environ.get("AITER_MEGAMOE_TP_AGDIR", "1") == "1"
+    # (debug) split all-gather: all of a sender's chunks stored, then their counts at once
+    AGPAR = AGDIR and os.environ.get("AITER_MEGAMOE_TP_AGPAR", "1") == "1"
+    AGPMAX = int(os.environ.get("AITER_MEGAMOE_TP_AGPMAX", "3"))
+
     @flyc.jit
     def _ag_bump(a, lane, q):
         if lane == i32(0):
-            x = i32(gpu.block_id("x")) % i32(N_XCD)
-            xa = ctrl_at(a, i32(CTRL_AGX) + (q * i32(N_XCD) + x) * i32(LRDY_STRIDE))
-            if g_add_agent(xa, 1) + i32(1) == _ag_senders(a, q, x):
-                g_st_sys(xa, i32(0))
-                _ag_bump_rank(a, q)
+            if const_expr(AGDIR):
+                if ag_split(a) > i32(1):
+                    ga = ctrl_at(a, i32(CTRL_AGG) + q * i32(LRDY_STRIDE))
+                    if g_add_agent(ga, 1) + i32(1) == fx.max(a["m"], i32(1)):
+                        g_st_sys(ga, i32(0))
+                        _ag_flag(a, q)
+                else:
+                    _ag_bump_xcd(a, q)
+            else:
+                _ag_bump_xcd(a, q)
+
+    @flyc.jit
+    def _ag_bump_xcd(a, q):
+        x = i32(gpu.block_id("x")) % i32(N_XCD)
+        xa = ctrl_at(a, i32(CTRL_AGX) + (q * i32(N_XCD) + x) * i32(LRDY_STRIDE))
+        if g_add_agent(xa, 1) + i32(1) == _ag_senders(a, q, x):
+            g_st_sys(xa, i32(0))
+            _ag_bump_rank(a, q)
+
+    @flyc.jit
+    def _ag_flag(a, q):
+        idx = i32(FLAG_AGQ) + q * i32(MAX_TP) + a["rank"]
+        for p in range_constexpr(TPC):
+            bst(a["epoch"], peer_rs(a, p, "off_flag"), idx * i32(4), 0, AUX_SYS)
 
     @flyc.jit
     def _ag_bump_rank(a, q):
@@ -1366,7 +1424,10 @@ def build_communication(kc: KernelCtx) -> dict:
     def finish(tid, a, epoch):
         if tid == i32(0):
             bid = i32(gpu.block_id("x"))
-            g_st_sys(ctrl_at(a, i32(CTRL_EPB) + bid), epoch)
+            # (every CTA slot of the next launch, whatever its grid: this CTA's and the
+            # ones past the grid that map to it)
+            for b_ in range(bid, i32(NCTA_MAX), i32(gpu.grid_dim.x)):
+                g_st_sys(ctrl_at(a, i32(CTRL_EPB) + i32(b_)), epoch)
             x = bid % i32(N_XCD)
             nx = ceildiv(i32(gpu.grid_dim.x) - x, i32(N_XCD))
             xc = ctrl_at(a, i32(CTRL_XES) + x * i32(LRDY_STRIDE))

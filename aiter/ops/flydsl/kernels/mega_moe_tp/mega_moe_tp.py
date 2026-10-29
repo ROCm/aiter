@@ -53,6 +53,8 @@ LDS_LIMIT = 160 * 1024
 LB_PF_MAX = 1024
 AG8_MIN = 512
 AR2_MIN = 64
+# small-M persistent grid for <= 8 / 16 / 32 tokens (0: every CU)
+SMNC = "224,232,240"
 # global tokens from which the small-M kernel runs (it falls back to the dynamic schedule's
 # fused units in-kernel when the G1 blocks do not fill the CTAs)
 SM_MIN = {"ag_rs": 1, "ar": 1}
@@ -85,6 +87,7 @@ class LaunchCfg:
     q: int = 0  # LB GEMM2 output split (0: the engine's lb_q)
     sm: bool = False  # small-M schedule (smallm.py)
     ar2: bool = False  # ar, LL route rows: two-shot all-reduce (else one-shot)
+    nc: int = 0  # (small-M, few tokens) persistent CTAs of the launch (0: all)
 
 
 # --- intra-node symmetric memory (hipIpc, via quick_allreduce_int4_ipc) ---------------
@@ -601,6 +604,14 @@ class MegaMoeTPEngine:
         m = [int(v) for v in os.environ.get("AITER_MEGAMOE_TP_SMMT", "1,2,2,3").split(",")]
         return self._fit_mt(m[0] if tot <= 32 else m[1] if tot <= 64 else m[2] if tot <= 128 else m[3])
 
+    def _sm_nc(self, tot: int) -> int:
+        # few tokens: a smaller persistent grid (measured faster: the HBM stays saturated
+        # and the per-launch sync / all-gather counting has fewer participants); 0: all CUs
+        # (debug: AITER_MEGAMOE_TP_SMNC "ctas<=8,ctas<=16,ctas<=32")
+        n = [int(v) for v in os.environ.get("AITER_MEGAMOE_TP_SMNC", SMNC).split(",")]
+        nc = n[0] if tot <= 8 else n[1] if tot <= 16 else n[2] if tot <= 32 else 0
+        return 0 if nc <= 0 or nc >= self.n_cta else nc
+
     def _sm_fits(self, tot: int) -> bool:
         # small-M: every CTA's G1 blocks (rounds of n_cta over all row chunks' inter
         # blocks) fit its unit list
@@ -634,6 +645,7 @@ class MegaMoeTPEngine:
                     # AR2_MIN tokens on
                     ar2=self.ar
                     and tot >= int(os.environ.get("AITER_MEGAMOE_TP_AR2MIN", AR2_MIN)),
+                    nc=self._sm_nc(tot),
                 )
             elif self._lb_ok(tot):
                 cfg = self._lb_config(tot)
@@ -916,7 +928,7 @@ class MegaMoeTPEngine:
             *(ptr(t) for t in (tail or (None, None, None))),
             self._qall.offset,
             self._sall.offset,
-            self.n_cta,
+            cfg.nc or self.n_cta,
         )
 
     def _check_out(self, out, rows: int) -> None:
