@@ -559,10 +559,11 @@ def test_fmoe(
         logger.error(
             "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
         )
+    flops = token * model_dim * inter_dim * 3 * topk * 2
     err = checkAllclose(
         out2_ref,
         out2_ck,
-        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        msg=f"ck_moe_2stages:{us2:>8.2f} us, {flops/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -610,7 +611,11 @@ def test_fmoe(
     )
     # calc_diff turns an inf element into NaN, which no threshold catches.
     out_non_finite = not out_buf.isfinite().all().item()
-    out_err = checkAllclose(out2_ref, out_buf, msg="ck_moe_2stages output=")
+    out_err = checkAllclose(
+        out2_ref.to(dtypes.fp32),
+        out_buf.to(dtypes.fp32),
+        msg="ck_moe_2stages output=",
+    )
     out_logits_diff = calc_diff(out2_ref, out_buf)
     out_failed = (
         out_ret is not out_buf
@@ -640,11 +645,36 @@ def test_fmoe(
         output=out_buf,
         **_fused_moe_kwargs,
     )
+    # Bytes one call moves: activations in and out, routing, and the weights,
+    # scales and biases of the experts the tokens are routed to.
+    routed_experts = topk_ids.unique().numel()
+    expert_bytes = sum(
+        t.nbytes
+        for t in (
+            w1_qt_aiter,
+            w2_qt_aiter,
+            w1_scale_aiter,
+            w2_scale_aiter,
+            exp_bias1_aiter,
+            exp_bias2_aiter,
+        )
+        if t is not None
+    )
+    out_nbytes = (
+        input.nbytes
+        + out_buf.nbytes
+        + topk_weights.nbytes
+        + topk_ids.nbytes
+        + expert_bytes * routed_experts // E
+    )
 
     return {
         "us": us2,
         "logits_diff": float(logits_diff),
         "output us": out_us,
+        "output TFLOPS": flops / out_us / 1e6,
+        "output TB/s": out_nbytes / out_us / 1e6,
+        "output err": out_err,
         "output logits_diff": float(out_logits_diff),
     }
 
