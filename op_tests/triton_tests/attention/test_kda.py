@@ -881,6 +881,19 @@ def test_state_dtype_guards(get_config):
             fused_recurrent_kda(
                 q=q, k=k, v=v, g=g, beta=beta, initial_state=h0.bfloat16()
             )
+        # an unused bf16 state_out must not make the fp32 scratch bf16-resident
+        o, ht = fused_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            state_out=to_vk(h0).bfloat16(),
+            output_final_state=False,
+            inplace_final_state=False,
+        )
+        assert ht is None
+        assert_close("o", naive_recurrent_kda(q, k, v, g, beta)[0], o)
 
 
 @bf16_state_only

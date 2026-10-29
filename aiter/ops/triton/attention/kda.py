@@ -193,7 +193,13 @@ def fused_recurrent_kda(
         avg_T = max(1, T // max(1, N))
     else:
         avg_T = T
-    state_ref = initial_state if initial_state is not None else state_out
+    # state_out sets the dtype only when it receives the final state
+    if initial_state is not None:
+        state_ref = initial_state
+    elif output_final_state and not inplace_final_state:
+        state_ref = state_out
+    else:
+        state_ref = None
     bf16_resident = (
         state_ref is not None and state_ref.dtype == torch.bfloat16 and T > 1
     )
