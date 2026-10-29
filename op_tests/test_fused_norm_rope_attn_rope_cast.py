@@ -1456,7 +1456,6 @@ def check_two_source_h64_causal_prefill(
         q_is_rotated=mode == "prepared",
         q_norm=mode == "norm",
         norm_eps=0.125,
-        is_decode=splits > 1,
         num_splits=splits,
         workspace=workspace,
         debug_out=debug,
@@ -1604,14 +1603,13 @@ def check_two_source_index_storage_offset(heads, mode, offset, valid_indices):
         )
 
 
-def check_fp8_decode_dense(heads, layout, mode, splits, valid_indices, with_sink):
+def check_fp8_split_dense(heads, layout, mode, splits, valid_indices, with_sink):
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, layout, mode, True, with_sink, valid_indices
     )
     debug = torch.empty_like(kwargs["q"], dtype=torch.float32)
     out = _call_v41(
         **kwargs,
-        is_decode=True,
         num_splits=splits,
         debug_out=debug,
         max_logits=torch.empty_like(mx),
@@ -1654,7 +1652,6 @@ def check_fp8_decode_ring_view(heads, splits, sources):
         "cos": torch.ones(1, 32, device="cuda", dtype=torch.bfloat16),
         "sin": torch.zeros(1, 32, device="cuda", dtype=torch.bfloat16),
         "positions": torch.zeros(1, device="cuda", dtype=torch.int32),
-        "is_decode": True,
         "num_splits": splits,
         "debug_out": debug,
         "max_logits": mx,
@@ -1676,11 +1673,10 @@ def check_fp8_decode_ring_view(heads, splits, sources):
     )
 
 
-def check_fp8_decode_graph_replay(heads, mode):
+def check_fp8_split_graph_replay(heads, mode):
     kwargs, (_, mx, lse) = two_source_inputs(heads, "padded", mode, True, True, True)
     t = kwargs["q"].shape[0]
     kwargs.update(
-        is_decode=True,
         num_splits=4,
         workspace=torch.empty(t, 4, heads, 516, device="cuda"),
         out=torch.empty(t, heads // 8, 4096, device="cuda", dtype=torch.float8_e4m3fn),
@@ -1720,19 +1716,11 @@ def check_fp8_decode_graph_replay(heads, mode):
     torch.cuda.current_stream().wait_stream(stream)
 
 
-def check_fp8_decode_contract(bad):
+def check_fp8_split_contract(bad):
     kwargs, _ = two_source_inputs(mode="prepared")
     t, h, _ = kwargs["q"].shape
-    kwargs.update(is_decode=True, num_splits=2)
-    if bad == "phase":
-        kwargs["is_decode"] = False
-    elif bad == "prefill_workspace":
-        kwargs.update(
-            is_decode=False,
-            num_splits=0,
-            workspace=torch.empty(t, 2, h, 516, device="cuda"),
-        )
-    elif bad == "count":
+    kwargs.update(num_splits=2)
+    if bad == "count":
         kwargs["num_splits"] = 33
     elif bad == "fraction":
         kwargs["num_splits"] = 1.5
@@ -1754,7 +1742,30 @@ def check_fp8_decode_contract(bad):
         _call_v41(**kwargs)
 
 
-def check_fp8_prefill_auto_split(heads, mode):
+def check_fp8_explicit_workspace(heads, mode, splits):
+    kwargs, (expected, mx, lse) = two_source_inputs(heads, "padded", mode, True)
+    tokens = kwargs["q"].shape[0]
+    workspace = torch.full((tokens, splits, heads, 516), torch.nan, device="cuda")
+    kwargs.update(
+        num_splits=splits,
+        workspace=workspace,
+        debug_out=torch.empty_like(expected),
+        max_logits=torch.empty_like(mx),
+        lse=torch.empty_like(lse),
+    )
+    with patch(
+        "aiter.ops.fused_norm_rope_attn_rope_cast._fused_norm_rope_attn_rope_cast_fwd",
+        wraps=fused_v41_fwd,
+    ) as native:
+        out = _call_v41(**kwargs)
+        assert native.call_args.args[23] == splits
+        assert native.call_args.args[24] is workspace
+    torch.testing.assert_close(kwargs["debug_out"], expected, rtol=0.02, atol=0.008)
+    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
+
+
+def check_fp8_auto_split(heads, mode):
     kwargs, (expected, mx, lse) = two_source_inputs(heads, "padded", mode, True)
     kwargs.update(
         debug_out=torch.empty_like(expected),
@@ -1780,7 +1791,7 @@ def check_fp8_prefill_auto_split(heads, mode):
         torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
 
 
-def check_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices, splits):
+def check_fp8_split_auto_and_poisoned_workspace(heads, mode, valid_indices, splits):
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, "padded", mode, True, False, valid_indices
     )
@@ -1788,7 +1799,6 @@ def check_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices, spl
     # Automatic dispatch must handle spare index-buffer capacity and ragged rows.
     out = _call_v41(
         **kwargs,
-        is_decode=True,
         debug_out=debug,
         max_logits=torch.empty_like(mx),
         lse=torch.empty_like(lse),
@@ -1810,7 +1820,6 @@ def check_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices, spl
         workspace.fill_(torch.nan)
         out = _call_v41(
             **kwargs,
-            is_decode=True,
             num_splits=splits,
             workspace=workspace,
             debug_out=debug,
@@ -1823,7 +1832,7 @@ def check_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices, spl
         assert torch.isposinf(out[3]).all()
 
 
-def check_fp8_decode_large_grid_replay(heads, mode, valid_indices, layout, splits):
+def check_fp8_split_large_grid_replay(heads, mode, valid_indices, layout, splits):
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, layout, mode, True, True, valid_indices
     )
@@ -1853,7 +1862,6 @@ def check_fp8_decode_large_grid_replay(heads, mode, valid_indices, layout, split
     lse = lse.repeat(repeats, 1)[:target_tokens]
     t = kwargs["q"].shape[0]
     kwargs.update(
-        is_decode=True,
         num_splits=splits,
         workspace=(
             torch.full((t, splits, heads, 516), torch.nan, device="cuda")
@@ -1893,15 +1901,14 @@ def check_fp8_decode_large_grid_replay(heads, mode, valid_indices, layout, split
                 )
 
 
-def check_shared_kv_wave_boundaries(tokens, mode, valid_indices, is_decode, heads):
-    _check_shared_kv_wave_boundary(tokens, mode, valid_indices, is_decode, heads)
+def check_shared_kv_wave_boundaries(tokens, mode, valid_indices, heads):
+    _check_shared_kv_wave_boundary(tokens, mode, valid_indices, heads)
 
 
 def _check_shared_kv_wave_boundary(
     tokens,
     mode,
     valid_indices,
-    is_decode,
     heads,
     capacity=1200,
     layout="padded",
@@ -1938,7 +1945,6 @@ def _check_shared_kv_wave_boundary(
     kwargs["kv_indices_prefix"] = padded
     expected, mx, lse = [x.index_select(0, selected) for x in (expected, mx, lse)]
     kwargs.update(
-        is_decode=is_decode,
         debug_out=torch.empty_like(expected),
         max_logits=torch.empty_like(mx),
         lse=torch.empty_like(lse),
@@ -2049,34 +2055,34 @@ def _check_shared_kv_wave_boundary(
 
 def check_h64_common_prefill_contract(tokens, mode, layout, valid_indices):
     _check_shared_kv_wave_boundary(
-        tokens, mode, valid_indices, False, 64, layout=layout, exercise_common=True
+        tokens, mode, valid_indices, 64, layout=layout, exercise_common=True
     )
 
 
 def check_mid_batch_attention_routes(tokens, heads, mode, layout):
     # Include empty/invalid rows and spare CSR capacity in both Q/output paths.
     _check_shared_kv_wave_boundary(
-        tokens, mode, False, True, heads, 640, layout, exercise_common=True
+        tokens, mode, False, heads, 640, layout, exercise_common=True
     )
 
 
 def check_mid_batch_attention_capacity(tokens, heads, capacity, mode):
     _check_shared_kv_wave_boundary(
-        tokens, mode, True, True, heads, capacity, "interleaved", exercise_common=True
+        tokens, mode, True, heads, capacity, "interleaved", exercise_common=True
     )
 
 
 def check_h64_large_prefill_capacity(tokens, capacity, mode, layout, valid_indices):
     # Spare CSR allocation must not turn padding into attended keys at the route boundary.
     _check_shared_kv_wave_boundary(
-        tokens, mode, valid_indices, False, 64, capacity, layout, exercise_common=True
+        tokens, mode, valid_indices, 64, capacity, layout, exercise_common=True
     )
 
 
 def check_h128_large_shared_kv_capacity(tokens, capacity, mode, layout, valid_indices):
     # Check ragged rows and unused CSR capacity on both sides of the shared-KV threshold.
     _check_shared_kv_wave_boundary(
-        tokens, mode, valid_indices, False, 128, capacity, layout, exercise_common=True
+        tokens, mode, valid_indices, 128, capacity, layout, exercise_common=True
     )
 
 
@@ -2409,7 +2415,6 @@ def make_benchmark_inputs(
         "attn_sink": sink,
         "q_is_rotated": mode in ("rotated", "prepared"),
         "q_norm": mode == "norm",
-        "is_decode": stage == "decode",
     }
 
 
@@ -2633,7 +2638,6 @@ def check_norm_subnormal_products(api, heads, tokens, splits, capacity):
             "kv_indptr_extend": torch.arange(
                 tokens + 1, device="cuda", dtype=torch.int32
             ),
-            "is_decode": splits > 1,
             "num_splits": splits,
             "cos": cos,
             "sin": sin,
@@ -2720,13 +2724,13 @@ def check_csr_capacity_limit(api, source):
     run(saved)
 
 
-def check_decode_optional_statistics(heads, mode, splits, valid_indices):
+def check_split_optional_statistics(heads, mode, splits, valid_indices):
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, "padded", mode, True, True, valid_indices
     )
     tokens = kwargs["q"].shape[0]
     workspace = torch.empty(tokens, splits, heads, 516, device="cuda")
-    kwargs.update(is_decode=True, num_splits=splits, workspace=workspace)
+    kwargs.update(num_splits=splits, workspace=workspace)
     for option in ("output", "max_logits", "lse", "debug_out"):
         call = dict(kwargs)
         if option != "output":
@@ -2773,7 +2777,7 @@ def check_decode_small_grid_output(heads, mode, splits, valid_indices):
         if splits > 1
         else None
     )
-    kwargs.update(is_decode=True, num_splits=splits, workspace=workspace)
+    kwargs.update(num_splits=splits, workspace=workspace)
     actual = _call_v41(**kwargs)
     error = (dequantize(*actual[:2]) - expected).norm() / expected.norm().clamp_min(
         1e-30
@@ -2810,7 +2814,6 @@ def check_h32_short_list_capacity(tokens, capacity, mode, layout):
         tokens,
         mode,
         False,
-        True,
         32,
         capacity,
         layout,
@@ -2825,7 +2828,6 @@ def check_h32_output_only_split_replay(tokens, splits, mode, layout, with_sink):
         tokens,
         mode,
         False,
-        True,
         32,
         2176,
         layout,
@@ -2865,7 +2867,6 @@ def check_small_head_split_storage(heads, mode, splits):
     kwargs["q"] = view
     t = q.shape[0]
     kwargs.update(
-        is_decode=True,
         num_splits=splits,
         out=buffer((t, heads // 8, 4096), torch.float8_e4m3fn, 16),
         out_scale=buffer((t, heads // 8, 128), torch.float8_e8m0fnu, 1),
@@ -2898,6 +2899,14 @@ def check_small_head_split_storage(heads, mode, splits):
 def run_contract_checks():
     """Run every correctness case during the same direct invocation used by CI."""
     checks = [
+        (
+            check_fp8_explicit_workspace,
+            [
+                ("heads", [16, 32, 64, 128]),
+                ("mode", ["raw", "prepared", "norm"]),
+                ("splits", [2, 7]),
+            ],
+        ),
         (
             check_h32_short_list_capacity,
             [
@@ -2966,7 +2975,7 @@ def run_contract_checks():
             ],
         ),
         (
-            check_decode_optional_statistics,
+            check_split_optional_statistics,
             [
                 ("heads", [64, 128]),
                 ("mode", ["raw", "norm", "prepared"]),
@@ -3235,7 +3244,7 @@ def run_contract_checks():
             ],
         ),
         (
-            check_fp8_decode_dense,
+            check_fp8_split_dense,
             [
                 ("with_sink", [False, True]),
                 ("valid_indices", [False, True]),
@@ -3254,21 +3263,19 @@ def run_contract_checks():
             ],
         ),
         (
-            check_fp8_decode_graph_replay,
+            check_fp8_split_graph_replay,
             [("mode", ["raw", "prepared", "norm"]), ("heads", [16, 32, 64, 128])],
         ),
         (
-            check_fp8_prefill_auto_split,
+            check_fp8_auto_split,
             [("heads", [16, 32, 64, 128]), ("mode", ["raw", "prepared", "norm"])],
         ),
         (
-            check_fp8_decode_contract,
+            check_fp8_split_contract,
             [
                 (
                     "bad",
                     [
-                        "phase",
-                        "prefill_workspace",
                         "count",
                         "fraction",
                         "workspace_shape",
@@ -3280,7 +3287,7 @@ def run_contract_checks():
             ],
         ),
         (
-            check_fp8_decode_auto_and_poisoned_workspace,
+            check_fp8_split_auto_and_poisoned_workspace,
             [
                 ("splits", [4, 32]),
                 ("valid_indices", [False, True]),
@@ -3289,7 +3296,7 @@ def run_contract_checks():
             ],
         ),
         (
-            check_fp8_decode_large_grid_replay,
+            check_fp8_split_large_grid_replay,
             [
                 ("splits", [1, 2, 4]),
                 ("layout", ["interleaved", "separate", "padded"]),
@@ -3302,7 +3309,6 @@ def run_contract_checks():
             check_shared_kv_wave_boundaries,
             [
                 ("heads", [64, 128]),
-                ("is_decode", [False, True]),
                 ("valid_indices", [False, True]),
                 ("mode", ["raw", "prepared"]),
                 (

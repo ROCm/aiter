@@ -322,7 +322,6 @@ def fused_norm_rope_attn_rope_cast(
     q_is_rotated: bool = True,
     q_norm: bool = False,
     norm_eps: float = 1e-6,
-    is_decode: bool = False,
     num_splits: int = 0,
     workspace: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -335,7 +334,8 @@ def fused_norm_rope_attn_rope_cast(
     address rows of that source. Invalid indices are masked. CSR pointers must
     be monotonic and within their index-buffer capacity. Padding outside the
     live CSR ranges is not read. Each index buffer is limited to 1,073,741,567
-    elements. Both sources contribute to one softmax.
+    elements. Both sources contribute to one softmax. The caller encodes
+    causality and accessible KV rows in the CSR; the operator takes no phase flag.
 
     Values and scales need unit channel stride and a positive, 4-byte-aligned
     row stride covering their width. Row strides may differ between all four
@@ -369,8 +369,8 @@ def fused_norm_rope_attn_rope_cast(
     ``num_splits=0`` automatically chooses a split count for both prefill and
     decode from host-visible batch and index capacities, without reading
     device CSR pointers. Set ``num_splits=1`` to force the single-kernel path.
-    ``is_decode=True`` enables explicit counts 2..32 and caller-supplied
-    workspace for tuning. Counts above one launch FP8 partial attention
+    Explicit counts 2..32 and caller-supplied workspace are supported for
+    either phase. Counts above one launch FP8 partial attention
     followed by FP32 reduction and the fused
     output transform. Q preparation remains fused into each partial kernel.
     Split attention changes FP32 summation order. Sink is applied once during
@@ -379,7 +379,8 @@ def fused_norm_rope_attn_rope_cast(
     Optional ``workspace`` is disjoint, contiguous FP32 ``[T,num_splits,H,516]``
     scratch with opaque contents. It holds partial accumulators, not KV.
     When omitted it is allocated for split attention. For allocation-free
-    calls, provide it with ``is_decode=True`` and an explicit split count.
+    calls, provide it with an explicit split count. With automatic selection,
+    its shape must match the selected count for the current input capacities.
     No workspace is used with one split.
 
     All tensors must be on q.device. Output buffers must be contiguous and
@@ -411,7 +412,6 @@ def fused_norm_rope_attn_rope_cast(
         q_is_rotated=q_is_rotated,
         q_norm=q_norm,
         norm_eps=norm_eps,
-        is_decode=is_decode,
         num_splits=num_splits,
         workspace=workspace,
     )
@@ -443,7 +443,6 @@ def _fused_norm_rope_attn_rope_cast_with_debug(
     q_is_rotated: bool = True,
     q_norm: bool = False,
     norm_eps: float = 1e-6,
-    is_decode: bool = False,
     num_splits: int = 0,
     workspace: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -455,12 +454,8 @@ def _fused_norm_rope_attn_rope_cast_with_debug(
     t, h, d = q.shape
     if h not in (16, 32, 64, 128) or d != 512:
         raise ValueError("two-source FP8 attention requires H16/H32/H64/H128 and D512")
-    if type(is_decode) is not bool:
-        raise ValueError("is_decode must be bool")
     if type(num_splits) is not int or not 0 <= num_splits <= 32:
         raise ValueError("num_splits must be an integer in [0,32]")
-    if not is_decode and (num_splits not in (0, 1) or workspace is not None):
-        raise ValueError("split workspace and num_splits > 1 require is_decode=True")
     if num_splits == 0:
         num_splits = 1
         if t:
@@ -479,7 +474,7 @@ def _fused_norm_rope_attn_rope_cast_with_debug(
                 tile_splits = (kv_indices_prefix.numel() + t * 64 - 1) // (t * 64)
                 if kv_indices_extend is not None:
                     tile_splits += (kv_indices_extend.numel() + t * 64 - 1) // (t * 64)
-                if is_decode and 1 < tile_splits <= min(16, 256 // grid):
+                if 1 < tile_splits <= min(16, 256 // grid):
                     limit = tile_splits
                 # Long lists amortize a second resident CTA per CU. Avoid extra
                 # partials when fewer splits give the same longest tile loop.

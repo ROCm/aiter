@@ -98,17 +98,21 @@ and scale-validation fixes above must not be taken as proof of its cause.
 
 ## Automatic split selection
 
-The default `num_splits=0` uses the same batch/grid and index-capacity rules
-for prefill and decode. Small prefill batches can use split attention; large
-grids retain the single-kernel paths. `num_splits=1` explicitly selects one
-kernel. Explicit multi-split counts and caller-supplied workspace continue
-to require `is_decode=True`; automatic prefill allocates its own scratch.
-This changes prefill scheduling without changing the decode rules or CSR
-semantics. It is not an ATOM end-to-end performance claim.
+The two-source FP8 API has no `is_decode` argument. The caller encodes
+causality and accessible KV rows in each source's CSR. Decode and prefill
+remain distinct when building those inputs, including ring updates.
 
-## Small decode split reduction
+The default `num_splits=0` selects splits from batch size, head count and
+index-buffer capacities, including the H16 small-grid rule. `num_splits=1`
+selects one kernel; explicit counts 2..32 work in either phase. A caller may
+reuse disjoint, contiguous FP32 workspace `[T, num_splits, H, 516]` for split
+attention. With automatic selection its shape must match the selected count.
+One split does not accept workspace. This API change does not alter native
+kernel arguments or CSR masking.
 
-Output-only decode uses parallel split statistics on small grids. The smallest
+## Small-grid split reduction
+
+Output-only split attention uses parallel split statistics on small grids. The smallest
 grids distribute each head across a CTA; larger split=8 grids keep coalesced
 partial reads and divide the output dimensions across four CTAs. These reducers
 share the existing partial layout and are instantiated once for both head counts.
