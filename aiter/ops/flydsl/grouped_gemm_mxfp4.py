@@ -16,6 +16,16 @@ _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
 
 
+def _flat_span(t: torch.Tensor) -> torch.Tensor:
+    """1-D view from t's first element to its last. A row-strided view (the
+    compact plan's A scales, read with a_scale_row_stride_bytes) cannot
+    .view(-1), and the kernel only takes its base address anyway."""
+    if t.is_contiguous():
+        return t.view(-1)
+    span = 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+    return t.as_strided((span,), (1,))
+
+
 def _select_bool_env(name: str, csv_value: int) -> int:
     """Select a strict 0/1 environment override or the CSV setting."""
     value = os.environ.get(name)
@@ -285,7 +295,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         out.view(-1),
         ptr_arg(a),
         ptr_arg(w),
-        a_scales.view(torch.int32).view(-1),
+        _flat_span(a_scales.view(torch.int32)),
         w_scales.view(torch.int32).view(-1),
         contiguous_m,
         stream,
