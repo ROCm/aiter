@@ -69,7 +69,11 @@ def scores(results):
 def per_question(samples_path):
     """{metric label: {doc_id: score}} from an lm-eval samples file."""
     out = {}
-    for line in samples_path.read_text().splitlines():
+    # Split on "\n" only: str.splitlines() also breaks at U+2028 and friends, which
+    # lm-eval writes unescaped inside the generated text, cutting a record in two.
+    for line in samples_path.read_text(encoding="utf-8").split("\n"):
+        if not line:
+            continue
         s = json.loads(line)
         for metric in s.get("metrics", []):
             if isinstance(s.get(metric), (int, float)):

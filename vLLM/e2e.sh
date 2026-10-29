@@ -50,12 +50,27 @@ ARMS=${ARMS:-"main,$IMAGE_A ar,$IMAGE_B"}
 # no stock-QuickReduce arm: vLLM's HIP QuickReduce is disabled on PCIe-only GPUs
 # above TP2 (it needs xGMI), as on this box.
 ARMS3=${ARMS3:-"base,$IMAGE_A fork,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=0 flyqr,$IMAGE_FORK"}
-# The accuracy eval: the same image with and without INT4 quick-reduce. exact
-# turns quick-reduce off, so every all-reduce is exact (aiter's CustomAllreduce,
-# FlyDSL one-shot included). flyqr is the image as built: the FlyDSL INT4 mesh/ring
-# serves plain all-reduce, and the quantized fused AR+RMSNorm serves its own
-# windows. Add a second exact arm (e.g. exact2) to measure run-to-run noise.
-ARMS_EVAL=${ARMS_EVAL:-"exact,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=NONE,AITER_QUICK_REDUCE_QUANTIZATION=NONE flyqr,$IMAGE_FORK"}
+# The accuracy eval: the same image with and without INT4 quick-reduce, plus a
+# third arm. exact turns quick-reduce off, so every all-reduce is exact (aiter's
+# CustomAllreduce, FlyDSL one-shot included). flyqr is the image as built: the
+# FlyDSL INT4 mesh/ring serves plain all-reduce, and the quantized fused AR+RMSNorm
+# serves its own windows. flyqr_floor is flyqr with the mesh floor raised to
+# EVAL_FLOOR_BYTES, above a decode step's payload, so decode stays exact (the
+# one-shot) and only larger payloads (prefill) are INT4. The fused window has its
+# own floor, raised as well: the fused AR+RMSNorm is DeepSeek V4's main decode
+# all-reduce, and its default mesh window (from 128 KiB at TP8/PCIe) would
+# otherwise still quantize decode. The ring window starts at 24 MiB (none on xGMI),
+# far above decode, so its floor is left alone: raising it past the mesh window's
+# end would open a gap. Add a second exact arm (e.g. exact2) to measure
+# run-to-run noise.
+# 8 MiB is the HIP quick-reduce's own floor for INT4 at TP8 (_QR_MIN_SIZE in
+# aiter/dist/device_communicators/quick_all_reduce.py: the (float16, 8) row, which
+# applies to bf16 too, as AITER_QUICK_REDUCE_CAST_BF16_TO_FP16 defaults to 1), so
+# this arm quantizes the same payloads the HIP kernel would. It is far above a
+# decode step (896 KiB at 64 tokens). Payloads from the plain one-shot's 1216 KiB
+# to 8 MiB are served by the stock path, as with the HIP kernel.
+EVAL_FLOOR_BYTES=${EVAL_FLOOR_BYTES:-8388608}
+ARMS_EVAL=${ARMS_EVAL:-"exact,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=NONE,AITER_QUICK_REDUCE_QUANTIZATION=NONE flyqr,$IMAGE_FORK flyqr_floor,$IMAGE_FORK,AITER_FLY_AR_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES,AITER_FLY_AR_FUSED_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES"}
 # lm-eval settings for "eval". The concurrency sets the decode batch: one
 # DeepSeek V4 token is 14 KiB of all-reduce payload, so at 64 concurrent
 # requests a decode step moves up to 896 KiB, inside the FlyDSL INT4 mesh
@@ -397,7 +412,7 @@ run_eval() {  # out_dir
     # hub only for the datasets, cached per arm under CACHE_ROOT.
     local out=$1
     log "quick-reduce in the server: $(docker exec "$NAME" sh -c \
-        'echo "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=$VLLM_ROCM_QUICK_REDUCE_QUANTIZATION, VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=$VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL, AITER_FLY_AR=$AITER_FLY_AR"')"
+        'echo "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=$VLLM_ROCM_QUICK_REDUCE_QUANTIZATION, VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=$VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL, AITER_FLY_AR=$AITER_FLY_AR, AITER_FLY_AR_MESH_MIN_BYTES=${AITER_FLY_AR_MESH_MIN_BYTES:-default}, AITER_FLY_AR_FUSED_MESH_MIN_BYTES=${AITER_FLY_AR_FUSED_MESH_MIN_BYTES:-default}"')"
     log "eval $EVAL_TASKS, ${EVAL_FEWSHOT}-shot, concurrency $EVAL_CONCURRENCY${EVAL_LIMIT:+, limit $EVAL_LIMIT}"
     docker exec \
         -e HF_HUB_OFFLINE=0 -e HF_DATASETS_OFFLINE=0 -e HF_ALLOW_CODE_EVAL=1 \
