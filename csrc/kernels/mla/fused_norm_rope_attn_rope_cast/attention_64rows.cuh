@@ -1192,13 +1192,14 @@ __device__ inline void compute_pv(char* smem,
 template <class T, class V>
 __device__ inline void mask_tail_tile(V& v_s, int valid_rows, int lane_id)
 {
-    using D_ACC        = typename T::D_ACC;
-    const int lane_row = lane_id / T::W_N * ACC_PER_TILE<T>;
+    using D_ACC              = typename T::D_ACC;
+    constexpr D_ACC infinity = opus::numeric_limits<D_ACC>::infinity();
+    const int lane_row       = lane_id / T::W_N * ACC_PER_TILE<T>;
     opus::static_for<T::GEMM0_E_N>([&](auto e) {
         const int rel = valid_rows - 1 - e.value * T::W_N - lane_row;
         opus::static_for<ACC_PER_TILE<T>>([&](auto j) {
             constexpr int idx = e.value * ACC_PER_TILE<T> + j.value;
-            v_s[idx]          = rel < j.value ? -opus::numeric_limits<D_ACC>::infinity() : v_s[idx];
+            v_s[idx]          = rel < j.value ? -infinity : v_s[idx];
         });
     });
 }
@@ -1267,12 +1268,13 @@ __device__ inline void softmax_op(VS& v_s,
     }
     else if constexpr(OP == RED + 2)
     {
+        constexpr D_ACC infinity = numeric_limits<D_ACC>::infinity();
         st.all_below =
             __builtin_amdgcn_ballot_w64(((st.row_max - m_row) <= RESCALE_THRESHOLD ||
-                                         st.row_max == -numeric_limits<D_ACC>::infinity())) ==
+                                         st.row_max == -infinity)) ==
             __builtin_amdgcn_read_exec();
         st.row_max = st.all_below ? m_row : max(m_row, st.row_max);
-        st.neg_max = st.row_max == -numeric_limits<D_ACC>::infinity() ? D_ACC(0) : -st.row_max;
+        st.neg_max = st.row_max == -infinity ? D_ACC(0) : -st.row_max;
     }
     else if constexpr(OP < SM_CAST_OP<T>)
     {
@@ -1959,14 +1961,15 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
 
         if constexpr(CHECKED)
         {
-            auto* flags     = reinterpret_cast<const int*>(smem + T::smem_bytes()) + CUR * 68;
-            const bool full = flags[64] && flags[65] && flags[66] && flags[67] && valid_rows >= 64;
+            constexpr auto infinity = numeric_limits<typename T::D_ACC>::infinity();
+            auto* flags             = reinterpret_cast<const int*>(smem + T::smem_bytes()) + CUR * 68;
+            const bool full         = flags[64] && flags[65] && flags[66] && flags[67] && valid_rows >= 64;
             if(!full)
                 static_for<S_ELEMS<T>>([&](auto i) {
                     constexpr int e = i.value / ACC_PER_TILE<T>, j = i.value % ACC_PER_TILE<T>;
                     const int row = e * T::W_N + lane_id / T::W_N * ACC_PER_TILE<T> + j;
                     if(row >= valid_rows || !flags[row])
-                        v_s[CUR][i.value] = -numeric_limits<typename T::D_ACC>::infinity();
+                        v_s[CUR][i.value] = -infinity;
                 });
         }
         else if(valid_rows < T::KV_TILE_SIZE)
@@ -2172,14 +2175,16 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
         q_pending = false;
     };
 
+    constexpr D_ACC infinity      = numeric_limits<D_ACC>::infinity();
+    constexpr D_ACC lowest        = numeric_limits<D_ACC>::lowest();
     constexpr D_ACC LOG2_E        = 1.44269504089f;
     const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
 
     v_o_t<T> v_o;
     clear(v_o);
-    D_ACC m_row    = numeric_limits<D_ACC>::lowest();
+    D_ACC m_row    = lowest;
     D_ACC l_row    = D_ACC(0.0f);
-    D_ACC true_max = -numeric_limits<D_ACC>::infinity();
+    D_ACC true_max = -infinity;
 
     attention_segment<T, CHECKED, false, CONTINUOUS, Split>(kargs,
                                                             kargs.unified_kv_ptr,
@@ -2268,7 +2273,7 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
         reinterpret_cast<D_ACC*>(
             kargs.lse_ptr)[static_cast<int64_t>(q_token_idx) * kargs.stride_lse_n + head] =
             l_row > D_ACC(0.0f) ? (m_row + __builtin_amdgcn_logf(l_row)) * LN_2
-                                : numeric_limits<D_ACC>::infinity();
+                                : infinity;
     }
 
     if((PV_GROUPS<T> == T::NUM_WARPS || warp_id < PV_GROUPS<T>) && kargs.max_ptr && lane_id < 16 &&
@@ -2278,7 +2283,7 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     auto g_attn_sink    = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr),
                                  has_sink ? kargs.H * sizeof(D_ACC) : 0);
     const D_ACC sink_log2 =
-        has_sink ? load(g_attn_sink, head)[0] * LOG2_E : -numeric_limits<D_ACC>::infinity();
+        has_sink ? load(g_attn_sink, head)[0] * LOG2_E : -infinity;
     const D_ACC m_final = max(m_row, sink_log2);
     const D_ACC alpha   = __builtin_amdgcn_exp2f(m_row - m_final);
     const D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
