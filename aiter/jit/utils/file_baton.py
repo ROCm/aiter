@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # mypy: allow-untyped-defs
-import fcntl
 import logging
 import multiprocessing
 import os
@@ -11,6 +10,11 @@ import sys
 import tempfile
 import time
 
+if sys.platform == "win32":
+    fcntl = None
+else:
+    import fcntl
+
 logger = logging.getLogger("aiter")
 _GUARD_PROTOCOL = b"flock\n"
 
@@ -18,9 +22,9 @@ _GUARD_PROTOCOL = b"flock\n"
 def _pid_namespace():
     """Identity of this process's PID namespace, e.g. ``pid:[4026532567]``.
 
-    Containers get distinct namespaces even when they share the host's network
-    (and therefore its hostname), which is exactly the case pid+host cannot
-    tell apart. Empty string where the kernel does not expose it.
+    PID and UTS namespaces are independent of the network namespace. Containers
+    can share a hostname while using distinct PID namespaces. Empty string
+    where the kernel does not expose it.
     """
     try:
         return os.readlink("/proc/self/ns/pid")
@@ -55,18 +59,21 @@ class FileBaton:
     ``pid`` + host alone is not an identity. Two cases where it is ambiguous,
     both of which deadlock a build in practice:
 
-    * **Containers sharing the host network** (``docker run --network host``,
-      the normal way to run a tuner) report the *host's* hostname while keeping
-      their own PID namespace, and every container has a pid 1 and low worker
-      pids. A lock leaked by a killed container therefore looks alive to the
-      next one, forever -- and with a host-mounted build cache it survives
-      restarts, so the wedge is permanent until someone deletes the file.
+    * **Containers sharing a hostname**, for example through ``--uts=host``,
+      can keep separate PID namespaces with overlapping worker pids. A lock
+      leaked by one container can therefore look alive in the next one.
     * **PID reuse** after the holder dies, on any host.
 
     The namespace id and start time disambiguate identity. New-format holders
     also retain a kernel ``flock`` for the full build: process death releases
     it automatically, while a paused process keeps it, so cross-namespace
     recovery never has to guess from a heartbeat timeout.
+
+    POSIX cache filesystems must support hard links, atomic replacement and
+    flock shared by all cache users. Cross-host caches require distributed
+    locking (e.g. NFSv3 with NLM or NFSv4), not ``nolock`` or
+    ``local_lock=flock|all``. See docs/jit_cache.md for upgrade and cleanup
+    requirements. Windows retains O_EXCL acquisition and PID-based recovery.
     """
 
     def __init__(
@@ -105,7 +112,22 @@ class FileBaton:
         # caller's normal retry loop observe that ownership.
         if self.fd is not None:
             return True
+        if fcntl is None:
+            return self._try_acquire_windows()
         return self._publish_lock()
+
+    def _try_acquire_windows(self):
+        """Retain the pre-flock O_EXCL + pid/hostname protocol on Windows."""
+        try:
+            self.fd = os.open(self.lock_file_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+        try:
+            os.write(self.fd, f"{os.getpid()}\n{socket.gethostname()}\n".encode())
+            os.fsync(self.fd)
+        except OSError:
+            pass
+        return True
 
     def _publish_lock(self, replace=False):
         """Publish a fully prepared lock, optionally replacing a stale one."""
@@ -175,9 +197,9 @@ class FileBaton:
 
         Returns:
             True if the holder released the lock normally (its work is done).
-            False if a stale lock was broken and this instance atomically took
-            its place — the caller should retry ``try_acquire()`` and redo the
-            work, since no holder ever finished it.
+            False if a stale lock was broken — the caller should retry
+            ``try_acquire()`` and redo the work. POSIX recovery already owns
+            the replacement; Windows callers must acquire it on retry.
         """
         logger.info(
             f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
@@ -185,21 +207,11 @@ class FileBaton:
         )
         while True:
             if not os.path.exists(self.lock_file_path):
-                # Normal release removes the lock while holding this guard.
-                # Wait for that operation to finish before reporting success.
-                # A persistent recovery-guard pathname is harmless; flock tells us
-                # whether a guarded operation is actually active.
-                sfd = self._try_acquire_steal_guard()
-                if sfd is None:
-                    time.sleep(self.wait_seconds)
-                    continue
-                try:
-                    completed = not os.path.exists(self.lock_file_path)
-                finally:
-                    self._release_steal_guard(sfd)
-                if completed:
-                    return True
-                continue
+                # POSIX stale recovery uses os.replace(), so it never exposes
+                # an absent path. Normal release has already finished the work
+                # before unlinking. A leftover/unwritable .steal must not turn
+                # that completion into an infinite wait (also on Windows).
+                return True
             if self._is_stale() and self._try_break_stale():
                 logger.warning(
                     f"[pid={os.getpid()}] broke stale lock at "
@@ -211,6 +223,18 @@ class FileBaton:
     def release(self):
         """Release the baton and remove its file."""
         if self.fd is None:
+            return
+        if fcntl is None:
+            # Windows cannot unlink the open descriptor. Preserve the legacy
+            # release order, with an ownership check before closing it.
+            owns_path = self._owns_lock_path()
+            os.close(self.fd)
+            self.fd = None
+            if owns_path:
+                try:
+                    os.remove(self.lock_file_path)
+                except FileNotFoundError:
+                    pass
             return
 
         # Serialize the verify+unlink step with stale replacement. Without this
@@ -419,13 +443,13 @@ class FileBaton:
             # None identifies an inaccessible pre-flock orphan. New locks are
             # published mode 0666, so a protocol=flock record never takes this
             # legacy fallback.
-            return self._owner_flock_released() is not False
+            return fcntl is None or self._owner_flock_released() is not False
         if protocol == "flock":
             # For new-format locks the kernel-held lifetime lock is the
             # authority across PID/UTS namespaces and hosts sharing an NFS
             # cache. It remains held while a process is paused and is released
             # automatically on process exit.
-            return self._owner_flock_released() is True
+            return fcntl is not None and self._owner_flock_released() is True
         if host != socket.gethostname():
             # Legacy locks have no cross-host liveness signal, so never steal
             # one from a different host.
@@ -453,6 +477,8 @@ class FileBaton:
         can mistake the handoff for a successfully completed build. The guard's
         pathname may persist, but a crashed process cannot leave its flock held.
         """
+        if fcntl is None:
+            return self._try_break_stale_windows()
         sfd = self._try_acquire_steal_guard()
         if sfd is None:
             return False
@@ -463,3 +489,25 @@ class FileBaton:
             return False
         finally:
             self._release_steal_guard(sfd)
+
+    def _try_break_stale_windows(self):
+        """Use the legacy exclusive sidecar while rechecking a dead PID."""
+        steal_path = self.lock_file_path + ".steal"
+        try:
+            sfd = os.open(steal_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+        try:
+            if os.path.exists(self.lock_file_path) and self._is_stale():
+                try:
+                    os.remove(self.lock_file_path)
+                except FileNotFoundError:
+                    pass
+                return True
+            return False
+        finally:
+            os.close(sfd)
+            try:
+                os.remove(steal_path)
+            except FileNotFoundError:
+                pass

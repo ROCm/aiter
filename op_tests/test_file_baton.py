@@ -2,20 +2,48 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Regression tests for JIT file-baton stale-owner detection."""
 
-import fcntl
+import importlib.util
 import os
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from aiter.jit.utils.file_baton import FileBaton
+# FileBaton has no GPU dependencies. Load the real module directly so this
+# suite can also run on Windows and CPU-only Linux without importing torch.
+_BATON_PATH = Path(__file__).resolve().parents[1] / "aiter/jit/utils/file_baton.py"
+_spec = importlib.util.spec_from_file_location("file_baton_under_test", _BATON_PATH)
+file_baton = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = file_baton
+_spec.loader.exec_module(file_baton)
+FileBaton = file_baton.FileBaton
+fcntl = file_baton.fcntl
 
 
+@unittest.skipIf(fcntl is None, "POSIX flock tests")
 class TestFileBaton(unittest.TestCase):
+
+    def test_unsupported_hardlinks_leave_no_published_or_temporary_lock(self):
+        import errno
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "build.lock")
+            baton = FileBaton(path)
+            for publish in (baton.try_acquire, baton._try_acquire_steal_guard):
+                with mock.patch.object(
+                    file_baton.os,
+                    "link",
+                    side_effect=OSError(errno.EOPNOTSUPP, "hard links"),
+                ), self.assertRaises(OSError):
+                    publish()
+                self.assertIsNone(baton.fd)
+                self.assertEqual(os.listdir(directory), [])
 
     def test_unreadable_live_process_start_time_is_not_stale(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -27,7 +55,7 @@ class TestFileBaton(unittest.TestCase):
             with (
                 mock.patch.object(baton, "_pid_alive", return_value=True),
                 mock.patch(
-                    "aiter.jit.utils.file_baton._process_start_time",
+                    "file_baton_under_test._process_start_time",
                     return_value="",
                 ),
             ):
@@ -56,7 +84,7 @@ class TestFileBaton(unittest.TestCase):
 
             breaker = FileBaton(path, wait_seconds=0, stale_grace_seconds=-1)
             with mock.patch(
-                "aiter.jit.utils.file_baton.os.replace",
+                "file_baton_under_test.os.replace",
                 side_effect=OSError("simulated death before publication"),
             ), self.assertRaises(OSError):
                 breaker.wait()
@@ -117,7 +145,7 @@ class TestFileBaton(unittest.TestCase):
             self.assertTrue(holder.try_acquire())
 
             with mock.patch(
-                "aiter.jit.utils.file_baton._pid_namespace",
+                "file_baton_under_test._pid_namespace",
                 return_value="pid:[different]",
             ):
                 self.assertFalse(waiter._is_stale())
@@ -144,7 +172,7 @@ class TestFileBaton(unittest.TestCase):
             holder.fd = None
 
             with mock.patch(
-                "aiter.jit.utils.file_baton._pid_namespace",
+                "file_baton_under_test._pid_namespace",
                 return_value="pid:[different]",
             ):
                 self.assertTrue(waiter._is_stale())
@@ -159,7 +187,7 @@ class TestFileBaton(unittest.TestCase):
             self.assertTrue(holder.try_acquire())
 
             with mock.patch(
-                "aiter.jit.utils.file_baton.socket.gethostname",
+                "file_baton_under_test.socket.gethostname",
                 return_value="another-container-hostname",
             ):
                 self.assertFalse(waiter._is_stale())
@@ -205,7 +233,7 @@ class TestFileBaton(unittest.TestCase):
             old_umask = os.umask(0o077)
             try:
                 with mock.patch(
-                    "aiter.jit.utils.file_baton.os.link", side_effect=checked_link
+                    "file_baton_under_test.os.link", side_effect=checked_link
                 ):
                     self.assertTrue(baton.try_acquire())
                     guard = baton._try_acquire_steal_guard()
@@ -231,7 +259,7 @@ class TestFileBaton(unittest.TestCase):
                 return real_open(candidate, flags, *args, **kwargs)
 
             with mock.patch(
-                "aiter.jit.utils.file_baton.os.open",
+                "file_baton_under_test.os.open",
                 side_effect=deny_legacy_probe,
             ):
                 self.assertTrue(baton._is_stale())
@@ -258,10 +286,139 @@ class TestFileBaton(unittest.TestCase):
             with open(path + ".steal", "w"):
                 pass
 
+            old = time.time() - 120
+            os.utime(path + ".steal", (old, old))
             baton = FileBaton(path, stale_grace_seconds=-1)
             self.assertIsNone(baton._try_acquire_steal_guard())
             with open(path + ".steal", "rb") as legacy_guard:
                 self.assertEqual(legacy_guard.read(), b"")
+
+
+class TestCompletedBaton(unittest.TestCase):
+    def test_absent_lock_with_legacy_guard_is_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "build.lock")
+            with open(path + ".steal", "w"):
+                pass
+            with mock.patch.object(
+                file_baton.time, "sleep", side_effect=AssertionError("wait must finish")
+            ):
+                self.assertTrue(FileBaton(path).wait())
+            # Completion must neither migrate nor remove an ambiguous guard.
+            self.assertTrue(os.path.exists(path + ".steal"))
+
+    def test_absent_lock_with_unwritable_guard_is_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "build.lock")
+            guard_path = path + ".steal"
+            with open(guard_path, "w"):
+                pass
+            os.chmod(guard_path, 0o644)
+            real_open = os.open
+
+            def open_as_cache_peer(candidate, flags, *args, **kwargs):
+                if candidate == guard_path:
+                    raise PermissionError("legacy guard owned by another cache UID")
+                return real_open(candidate, flags, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    file_baton.os, "open", side_effect=open_as_cache_peer
+                ),
+                mock.patch.object(
+                    file_baton.time,
+                    "sleep",
+                    side_effect=AssertionError("wait must finish"),
+                ),
+            ):
+                self.assertTrue(FileBaton(path).wait())
+
+
+class TestWindowsFallback(unittest.TestCase):
+    def setUp(self):
+        # On Linux this exercises the same fallback; on Windows it is native.
+        patcher = mock.patch.object(file_baton, "fcntl", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_acquire_contend_release_and_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "build.lock")
+            holder, waiter = FileBaton(path), FileBaton(path)
+            self.assertTrue(holder.try_acquire())
+            try:
+                self.assertFalse(waiter.try_acquire())
+                self.assertFalse(waiter._is_stale())
+                self.assertEqual(len(Path(path).read_text().splitlines()), 2)
+                self.assertTrue(FileBaton._pid_alive(os.getpid()))
+            finally:
+                holder.release()
+            self.assertTrue(waiter.wait())
+            self.assertFalse(os.path.exists(path))
+
+    def test_dead_owner_is_recovered_and_reacquired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "build.lock")
+            # A child exits without release(), leaving a real dead-owner lock.
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    """
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('baton_child', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.fcntl = None
+assert module.FileBaton(sys.argv[2]).try_acquire()
+""",
+                    str(_BATON_PATH),
+                    path,
+                ],
+                check=True,
+                timeout=10,
+            )
+            baton = FileBaton(path, wait_seconds=0)
+            self.assertFalse(baton.wait())
+            self.assertTrue(baton.try_acquire())
+            baton.release()
+            self.assertFalse(os.path.exists(path + ".steal"))
+
+    def test_empty_orphan_uses_legacy_grace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "build.lock")
+            Path(path).touch()
+            baton = FileBaton(path, stale_grace_seconds=-1)
+            self.assertFalse(baton.wait())
+            self.assertTrue(baton.try_acquire())
+            baton.release()
+
+    def test_flock_record_is_not_stolen_without_flock_support(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "build.lock")
+            Path(path).write_text("123\nremote\nnamespace\nstart\nflock\n")
+            self.assertFalse(FileBaton(path)._is_stale())
+
+    @unittest.skipUnless(sys.platform == "win32", "requires native Windows imports")
+    def test_windows_module_import_does_not_require_fcntl(self):
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import importlib.util, sys
+sys.platform = 'win32'
+sys.modules['fcntl'] = None
+spec = importlib.util.spec_from_file_location('baton_windows', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert module.fcntl is None
+""",
+                str(_BATON_PATH),
+            ],
+            check=True,
+            timeout=10,
+        )
 
 
 if __name__ == "__main__":
