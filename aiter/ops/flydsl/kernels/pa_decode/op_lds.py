@@ -12,7 +12,7 @@ from flydsl.expr.typing import ReductionOp, T
 
 from .. import dpp_utils
 from ..kernels_common import create_llvm_ptr
-from ..tensor_shim import _to_raw, buf_base_i64, ptr_buf_tensor
+from ..tensor_shim import buf_base_i64, ptr_buf_tensor
 from ..utils import rcp_f32
 from .traits import MFMA_MNK
 
@@ -768,7 +768,7 @@ class Gfx1250Memory:
         # instruction converts eight FP32 values into two packed dwords.
         return fx.Vector(
             fx.rocdl.cvt_scalef32_pk8_fp8_f32(
-                T.i32x2, _to_raw(values), _to_raw(fx.Float32(1.0))
+                T.i32x2, fx.as_ir_value(values), fx.as_ir_value(fx.Float32(1.0))
             )
         )
 
@@ -1243,8 +1243,8 @@ class Gfx1250Memory:
         key_base = buf_base_i64(ctx.key_cache_ptr)
         value_base = buf_base_i64(ctx.value_cache_ptr)
         # K cache has contiguous 16-byte head-dimension chunks.
-        for i in range_constexpr(t.TOKENS * t.head_dim // t.chunk // 128):
-            chunk = ctx.tid + i * 128
+        for i in range_constexpr(t.TOKENS * t.head_dim // t.chunk // t.BLOCK_THREADS):
+            chunk = ctx.tid + i * t.BLOCK_THREADS
             token = chunk // (t.head_dim // t.chunk)
             d = (chunk % (t.head_dim // t.chunk)) * t.chunk
             absolute = token_base + token
@@ -1267,8 +1267,8 @@ class Gfx1250Memory:
             )
 
         # Both supported V layouts have contiguous 16-byte token chunks.
-        for i in range_constexpr(t.head_dim * (t.TOKENS // t.chunk) // 128):
-            chunk = ctx.tid + i * 128
+        for i in range_constexpr(t.head_dim * (t.TOKENS // t.chunk) // t.BLOCK_THREADS):
+            chunk = ctx.tid + i * t.BLOCK_THREADS
             d = chunk // (t.TOKENS // t.chunk)
             token = (chunk % (t.TOKENS // t.chunk)) * t.chunk
             absolute = token_base + token
