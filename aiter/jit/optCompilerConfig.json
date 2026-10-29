@@ -142,7 +142,8 @@
     "module_custom_all_reduce": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce_ext.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

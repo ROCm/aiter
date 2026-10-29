@@ -314,17 +314,21 @@ DINLINE P* get_tmp_buf(volatile Signal* sg)
     return (P*)(((Signal*)sg) + 1);
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankData* _input_dp,
-                                                                           RankData* _output_dp,
-                                                                           RankSignals sg,
+// HAS_RESIDUAL adds residual (identical on every rank) to the reduced value
+// after it has rounded to T, matching all-reduce followed by a separate add.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool HAS_RESIDUAL = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage_naive(RankData* _input_dp,
+                                     RankData* _output_dp,
+                                     RankSignals sg,
 #ifndef USE_ROCM
-                                                                           volatile
+                                     volatile
 #endif
-                                                                           Signal* self_sg,
-                                                                           T* __restrict__ result,
-                                                                           int rank,
-                                                                           int size)
+                                     Signal* self_sg,
+                                     T* __restrict__ result,
+                                     int rank,
+                                     int size,
+                                     const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -367,8 +371,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
             int gather_from_rank = ((rank + i) % ngpus);
             if(gather_from_rank == ngpus - 1 || idx < part)
             {
-                int dst_idx           = gather_from_rank * part + idx;
-                ((P*)result)[dst_idx] = tmps[i][idx];
+                int dst_idx = gather_from_rank * part + idx;
+                P reduced   = tmps[i][idx];
+                if constexpr(HAS_RESIDUAL)
+                    packed_assign_add<T, pack_size>(reduced, ((const P*)residual)[dst_idx]);
+                ((P*)result)[dst_idx] = reduced;
             }
         }
     }
@@ -376,17 +383,20 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
 
 #define THREAD_NUM 512
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _input_dp,
-                                                                     RankData* _output_dp,
-                                                                     RankSignals sg,
+// HAS_RESIDUAL: see cross_device_reduce_2stage_naive.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool HAS_RESIDUAL = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_1stage(RankData* _input_dp,
+                               RankData* _output_dp,
+                               RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+                               volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result,
-                                                                     int rank,
-                                                                     int size)
+                               Signal* self_sg,
+                               T* __restrict__ result,
+                               int rank,
+                               int size,
+                               const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -457,6 +467,16 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
                     acc[j] += upcast_s(vg[j]);
             }
 
+            if constexpr(HAS_RESIDUAL)
+            {
+                // Round the reduced value to T before the add, like the
+                // 2-stage kernels and all-reduce followed by a separate add.
+                P res = ((const P*)residual)[cur_idx];
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    acc[j] = upcast_s(downcast_s<T>(acc[j])) + upcast_s(res[j]);
+            }
+
             // store result
             P out;
 #pragma unroll
@@ -483,17 +503,24 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool has_tail = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _input_dp,
-                                                                     RankData* _output_dp,
-                                                                     RankSignals sg,
+// HAS_RESIDUAL: see cross_device_reduce_2stage_naive.
+template <typename T,
+          int ngpus,
+          bool is_broadcast_reg_outptr = false,
+          bool has_tail                = false,
+          bool HAS_RESIDUAL            = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage(RankData* _input_dp,
+                               RankData* _output_dp,
+                               RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+                               volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result,
-                                                                     int rank,
-                                                                     int size)
+                               Signal* self_sg,
+                               T* __restrict__ result,
+                               int rank,
+                               int size,
+                               const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     constexpr int tnum_gpu  = THREAD_NUM / ngpus;
@@ -579,8 +606,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     // ranks.
     for(int idx = tid; idx < largest_part; idx += stride)
     {
-        int dst_idx           = (warp_id + rank) % ngpus * part + idx;
-        ((P*)result)[dst_idx] = tmps[warp_id][idx];
+        int dst_idx = (warp_id + rank) % ngpus * part + idx;
+        P reduced   = tmps[warp_id][idx];
+        if constexpr(HAS_RESIDUAL)
+            packed_assign_add<T, pack_size>(reduced, ((const P*)residual)[dst_idx]);
+        ((P*)result)[dst_idx] = reduced;
     }
 }
 
@@ -4592,6 +4622,16 @@ class CustomAllreduce
 #undef LAUNCH_LL128_UNROLL2
     }
 
+    // 1-/2-stage crossover of the use_new kernels. Neither is set when the peers
+    // are not fully connected.
+    void select_ar_stage(size_t bytes, bool& call_1stage, bool& call_2stage) const
+    {
+        call_1stage =
+            world_size_ == 2 || (full_nvlink_ && ((world_size_ <= 4 && bytes < 160 * 1024) ||
+                                                  (world_size_ <= 8 && bytes < 80 * 1024)));
+        call_2stage = !call_1stage && full_nvlink_;
+    }
+
     template <typename T>
     void allreduce(hipStream_t stream,
                    T* input,
@@ -4691,24 +4731,9 @@ class CustomAllreduce
         std::string arch    = dev_prop.gcnArchName;
         bool use_write_mode = false;
 
-        int blocks       = 16;
-        bool call_1stage = false;
-        bool call_2stage = false;
-        if(world_size_ == 2)
-        {
-            call_1stage = true;
-        }
-        else if(full_nvlink_)
-        {
-            if((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
-            {
-                call_1stage = true;
-            }
-            else
-            {
-                call_2stage = true;
-            }
-        }
+        int blocks = 16;
+        bool call_1stage, call_2stage;
+        select_ar_stage(bytes, call_1stage, call_2stage);
         if(call_1stage)
         {
             blocks = std::min(kMaxBlocks,
@@ -4830,6 +4855,76 @@ class CustomAllreduce
     }
 #undef REDUCE_CASE
 #undef KL
+}
+
+// allreduce plus a residual that is identical on every rank. Same 1-/2-stage
+// crossover as allreduce, without its LL and write-mode variants.
+template <typename T>
+void allreduce_residual(hipStream_t stream,
+                        T* input,
+                        T* output,
+                        const T* residual,
+                        int size,
+                        int threads = 512)
+{
+    auto d = 16 / sizeof(T);
+    if(size % d != 0)
+        throw std::runtime_error(
+            "custom allreduce residual requires input length to be multiple of " +
+            std::to_string(d));
+
+    // The residual kernels write only to the local output, never to peer outputs.
+    RankData* input_ptrs = get_buffer_RD(stream, input);
+
+    auto bytes = size * sizeof(T);
+    size /= d;
+
+    bool call_1stage, call_2stage;
+    select_ar_stage(bytes, call_1stage, call_2stage);
+    if(!call_1stage && !call_2stage)
+        throw std::runtime_error("allreduce_residual requires fully connected peers");
+    int per_rank = call_1stage ? size : size / world_size_;
+    int blocks =
+        std::min(kMaxBlocks, (per_rank + (threads / world_size_) - 1) / (threads / world_size_));
+
+#define KL_RES(ngpus, name, ...)                                    \
+name<T, ngpus, false, __VA_ARGS__><<<blocks, threads, 0, stream>>>( \
+    input_ptrs, nullptr, sg_, self_sg_, output, rank_, size, residual)
+
+    // The warp-split kernels need THREAD_NUM % ngpus == 0 (not TP6) and, for
+    // 2-stage, the same pack count on every rank; the rest go naive. TP6 does
+    // not instantiate the warp-split kernels. TP2 is always 1-stage
+    // (select_ar_stage), so it instantiates only that kernel.
+#define RESIDUAL_CASE(ngpus)                                        \
+case ngpus: {                                                       \
+    if constexpr(ngpus == 2)                                        \
+        KL_RES(ngpus, cross_device_reduce_1stage, true);            \
+    else if constexpr(ngpus == 6)                                   \
+        KL_RES(ngpus, cross_device_reduce_2stage_naive, true);      \
+    else if(call_2stage && bytes % (ngpus * 16) != 0)               \
+        KL_RES(ngpus, cross_device_reduce_2stage_naive, true);      \
+    else if(call_1stage)                                            \
+        KL_RES(ngpus, cross_device_reduce_1stage, true);            \
+    else if(size % THREAD_NUM != 0)                                 \
+        KL_RES(ngpus, cross_device_reduce_2stage, true, true);      \
+    else                                                            \
+        KL_RES(ngpus, cross_device_reduce_2stage, false, true);     \
+    break;                                                          \
+}
+
+    switch(world_size_)
+    {
+        RESIDUAL_CASE(2)
+        RESIDUAL_CASE(4)
+        RESIDUAL_CASE(6)
+        RESIDUAL_CASE(8)
+    default:
+        throw std::runtime_error("custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+                                 "gpus = " +
+                                 std::to_string(world_size_));
+    }
+#undef RESIDUAL_CASE
+#undef KL_RES
 }
 
 // reduce_scatter dispatch. Python wrapper is responsible for:

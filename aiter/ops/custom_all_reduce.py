@@ -36,6 +36,17 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_residual(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    residual: torch.Tensor,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
     inp: torch.Tensor,

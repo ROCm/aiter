@@ -38,6 +38,12 @@ void all_reduce(fptr_t _fa,
                 bool open_fp8_quant,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
+void all_reduce_residual(fptr_t _fa,
+                         const aiter_tensor_t& inp,
+                         const aiter_tensor_t& out,
+                         const aiter_tensor_t& residual,
+                         int64_t reg_inp_ptr,
+                         int64_t reg_inp_bytes);
 // reduce_scatter dispatcher. (m, n, k, split_dim) describe the canonical
 // shape the Python wrapper collapsed the input to:
 //   split_dim = 0 (kFirst): only `k` (= numel) used
