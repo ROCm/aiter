@@ -55,6 +55,8 @@ void all_reduce_residual(fptr_t _fa,
     }
 
     void* actual_inp = inp.data_ptr();
+    // As in all_reduce: a registered input (graph mode) writes to peer outputs.
+    bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
     if(reg_inp_ptr != 0)
     {
         if(data_bytes > reg_inp_bytes)
@@ -70,7 +72,8 @@ void all_reduce_residual(fptr_t _fa,
                                   reinterpret_cast<DTYPE*>(actual_inp),                \
                                   reinterpret_cast<DTYPE*>(out.data_ptr()),            \
                                   reinterpret_cast<const DTYPE*>(residual.data_ptr()), \
-                                  numel)
+                                  numel,                                               \
+                                  is_broadcast_reg_outptr)
     switch(dtype)
     {
     case AITER_DTYPE_fp32: DISPATCH_AR_RESIDUAL(opus::fp32_t); break;

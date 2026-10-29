@@ -1876,12 +1876,15 @@ class CustomAllreduce:
     ):
         """Out-of-place all reduce followed by ``+ residual``.
 
-        ``residual`` must be identical on every rank. Uses the same 1-/2-stage
-        crossover as all_reduce.
+        ``residual`` must be identical on every rank. Uses the same kernel
+        switches as all_reduce, except LL.
         """
         assert residual.shape == inp.shape, "residual must match the input shape"
         if out is None:
             out = torch.empty_like(inp)
+        elif registered_input and torch.cuda.is_current_stream_capturing():
+            # Write mode records the output for export at flush, as in all_reduce.
+            self._capture_registered(out)
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         assert is_weak_contiguous(residual), "residual tensor is not weak-contiguous"
         if self._ops_all_reduce_residual is None:
