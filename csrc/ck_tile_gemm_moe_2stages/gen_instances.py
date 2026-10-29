@@ -101,7 +101,7 @@ torch::Tensor
     int KBatch = k_batch.has_value() ? k_batch.value() : 1;
     int stride_A = K;
     int stride_B = K;
-    int stride_C = KBatch > 1 ? N : N / {2 if (k.stage == 1 and k.ActOP != "relu2") else 1}; //gemm1 gate+up need / 2; relu2 is gate-only (non-gated), needs full-width N.
+    int stride_C = {"N" if self.is_split_k else f'KBatch > 1 ? N : N / {2 if (k.stage == 1 and k.ActOP != "relu2") else 1}'}; //gemm1 gate+up need / 2; relu2 is gate-only (non-gated), needs full-width N; split-k writes raw gate|up at any k_batch.
     void *sorted_weights_ptr = topk_weight.has_value() ? topk_weight.value().data_ptr() : nullptr;
 
     {{INSTANCE_CONTENT}}
