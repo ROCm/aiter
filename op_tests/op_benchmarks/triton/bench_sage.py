@@ -19,6 +19,7 @@ import triton
 
 import aiter
 from aiter.ops.mha import (
+    flash_attn_fp8_pertensor_func,
     flash_attn_func,
 )
 from aiter.ops.mha_v4 import (
@@ -32,6 +33,7 @@ from aiter.ops.mha_v4 import (
     scale_modes_for_formats,
 )
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_HD256,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -40,13 +42,16 @@ from aiter.ops.mha_v4_quant import (
     quantize_fp8_rotated,
     quantize_int8,
     quantize_mxfp4_k,
+    quantize_mxfp4_k_hd256,
     quantize_mxfp4_q,
+    quantize_mxfp4_q_hd256,
     quantize_mxfp6_k,
     quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
+    quantize_v_mxfp4_fp6_p_hd256,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
@@ -88,10 +93,24 @@ logger = logging.getLogger(__name__)
 
 
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale = quantize_mxfp4_k(key)
+    # MXFP4 is the one recipe with an hd256 object; its producers are separate entry points
+    # rather than a head-dim argument, so pick the trio the same way mha_v4's raw path does.
+    if query.shape[-1] == MHA_V4_HD256:
+        quant_q, quant_k, quant_v = (
+            quantize_mxfp4_q_hd256,
+            quantize_mxfp4_k_hd256,
+            quantize_v_mxfp4_fp6_p_hd256,
+        )
+    else:
+        quant_q, quant_k, quant_v = (
+            quantize_mxfp4_q,
+            quantize_mxfp4_k,
+            quantize_v_mxfp4_fp6_p,
+        )
+    q_fp4, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale = quant_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
+    v_raw, v_scale = quant_v(value)
     v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
@@ -174,6 +193,9 @@ KERNEL_SPECS = {
     ),
     "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
     "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
+    # FMHA v3 per-tensor FP8, the quantized counterpart to the aiter_bf16 baseline. Select it
+    # explicitly; at d=256 it is the one non-MXFP4 row that runs at all.
+    "aiter_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True),
     "mha4_bf16": _mha_v4_spec(
         (2.0, 2.0, 2.0), quantized=False, supports_block_sparse=True
     ),
@@ -1295,6 +1317,41 @@ def make_kernel_runner(
             dropout_p=0.0,
             causal=args.causal,
             return_attn_probs=False,
+        )
+
+    if args.kernel == "aiter_fp8":
+        # Plain per-tensor FP8, deliberately unrotated: xDiT's AITER_FP8 Hadamard-rotates Q/K,
+        # so these two are not the same preprocessing and their accuracy is not comparable.
+        def _fp8_v3(q, k, v):
+            q_fp8, q_descale = quantize_fp8(q)
+            k_fp8, k_descale = quantize_fp8(k)
+            v_fp8, v_descale = quantize_fp8(v)
+            return flash_attn_fp8_pertensor_func(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                causal=args.causal,
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            return lambda: _fp8_v3(q_bshd, k_bshd, v_bshd)
+
+        q_fp8, q_descale = quantize_fp8(q_bshd)
+        k_fp8, k_descale = quantize_fp8(k_bshd)
+        v_fp8, v_descale = quantize_fp8(v_bshd)
+        return lambda: flash_attn_fp8_pertensor_func(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            causal=args.causal,
+            softmax_scale=softmax_scale,
         )
 
     if args.kernel == "mha4_bf16":
