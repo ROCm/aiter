@@ -121,8 +121,9 @@ def _use_flydsl_herd(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     score_func: str,
+    need_renorm: bool = True,
 ) -> bool:
     """Whether this call matches an opt-in HERD model profile."""
     if not _FLYDSL_USE_HERD:
@@ -130,7 +131,7 @@ def _use_flydsl_herd(
     if gating_output.dim() != 2:
         return False
     tokens = gating_output.shape[0]
-    if get_gfx() not in ("gfx950", "gfx1250", "gfx1250-strict") or not (
+    if get_gfx() != "gfx950" or not (
         _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
     ):
         return False
@@ -143,6 +144,7 @@ def _use_flydsl_herd(
         gating_output,
         correction_bias,
         score_func,
+        need_renorm,
     )
 
 
@@ -205,8 +207,13 @@ def topk_gating(
             f"correction_bias dtype {correction_bias.dtype} is not supported for "
             f"{gating_output.dtype} gating_output, expected one of {valid}"
         )
-    if _use_flydsl_herd(
-        topk_weights, topk_indices, gating_output, correction_bias, score_func
+    if num_shared_experts == 0 and _use_flydsl_herd(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        score_func,
+        need_renorm,
     ):
         from .flydsl.herd_topk import herd_topk_gating
 
@@ -352,6 +359,7 @@ def biased_grouped_topk(
             gating_output,
             correction_bias,
             "sigmoid",
+            need_renorm,
         )
     ):
         from .flydsl.herd_topk import herd_topk_gating
@@ -1453,17 +1461,48 @@ def _top_k_per_row_decode_packed(
     # row of this view is the buffer itself, a row's start added in-kernel.
     view = flat.as_strided((num_rows, flat.numel()), (0, 1))
     if _should_use_flydsl_topk_decode(
-        view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
+        view,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        0,
+        1,
+        k,
+        stable,
+        values,
         width=plane_width,
-    ):  # fmt: skip
+    ):
         return flydsl_topk.flydsl_top_k_per_row_decode(
-            view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
-            row_starts=row_starts, plane_width=plane_width,
-        )  # fmt: skip
+            view,
+            next_n,
+            seq_lens,
+            indices,
+            num_rows,
+            0,
+            1,
+            k,
+            stable,
+            values,
+            row_starts=row_starts,
+            plane_width=plane_width,
+        )
     return flydsl_topk.flydsl_radix_topk_one_block(
-        view, row_starts, seq_lens, indices, values, num_rows, 0, 1, k, stable,
-        is_decode=True, next_n=next_n, plane_width=plane_width, packed_rows=True,
-    )  # fmt: skip
+        view,
+        row_starts,
+        seq_lens,
+        indices,
+        values,
+        num_rows,
+        0,
+        1,
+        k,
+        stable,
+        is_decode=True,
+        next_n=next_n,
+        plane_width=plane_width,
+        packed_rows=True,
+    )
 
 
 def flydsl_dcp_topk_merge(

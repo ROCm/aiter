@@ -97,6 +97,9 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
     return num_waves
 
 
+_BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -181,7 +184,12 @@ def flydsl_grouped_gemm_a8w4_masked(
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     k_tiles = (K + tile_k - 1) // tile_k
     num_buffers = min(num_buffers, max(1, k_tiles))
-    has_bias = 1 if bias is not None else 0
+    if bias is None:
+        has_bias = 0
+    elif bias.dtype in _BIAS_MODE:
+        has_bias = _BIAS_MODE[bias.dtype]
+    else:
+        raise TypeError(f"bias must be bf16, fp32 or fp16, got {bias.dtype}")
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
     # These tensor arguments only supply base addresses, so normalize their
     # ranks without specializing the compiled callable on buffer shapes.
