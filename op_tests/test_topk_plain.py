@@ -2,13 +2,19 @@
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import gc
+import os
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.ops.topk_plain import topk_plain
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.topk_plain import (
+    topk_plain,
+    topk_plain_batches_ragged_rows,
+    topk_plain_reads_pitch,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -88,6 +94,123 @@ def run_topk_case(batch_size, hiddensize, topk, largest, dtype):
     }
 
 
+def test_strided_rows():
+    """Rows that are not dense, through both forms, with stride0 left at -1 and
+    given explicitly: padded rows (a column slice of a wider tensor) and
+    broadcast rows (stride 0). With the values asked for, the uniform form
+    reads no row pitch of its own, and a padded row used to be read as the
+    start of the next one."""
+    failures = []
+    for m, n, k in ((64, 8192, 2048), (8, 32768, 2048), (64, 4096, 16)):
+        torch.manual_seed(0)
+        x = torch.randn(m, n, dtype=dtypes.fp32)
+        layouts = {
+            "padded": torch.zeros(m, n + 64, dtype=dtypes.fp32)[:, :n].copy_(x),
+            "broadcast": x[:1].expand(m, n),
+        }
+        for name, src in layouts.items():
+            for ranged in (False, True):
+                for stride0 in (-1, src.stride(0)):
+                    if ranged:
+                        lens = torch.randint(k, n + 1, (m,), dtype=dtypes.i32)
+                        starts = torch.zeros(m, dtype=dtypes.i32)
+                        ends = lens
+                    else:
+                        lens = torch.full((m,), n, dtype=dtypes.i32)
+                        starts = ends = torch.tensor([], dtype=dtypes.i32)
+                    ids = torch.full((m, k), -1, dtype=dtypes.i32)
+                    vals = torch.empty(m, k, dtype=dtypes.fp32)
+                    topk_plain(src, ids, vals, k, True, starts, ends, stride0, 1)
+                    masked = src.clone()
+                    for r, e in enumerate(lens.tolist()):
+                        masked[r, e:] = float("-inf")
+                    ref = torch.topk(masked, k, dim=1).values.sort(dim=1).values
+                    got = src.gather(1, ids.long().clamp_min(0)).sort(dim=1).values
+                    if not torch.equal(got, ref):
+                        failures.append(
+                            f"{name} {'ranged' if ranged else 'uniform'} "
+                            f"stride0={stride0} {m}x{n} k={k}"
+                        )
+    for label in failures:
+        aiter.logger.error("STRIDED ROWS FAILED: %s", label)
+    return failures
+
+
+def test_uniform_pitch():
+    """Uniform rows at a pitch past their width, indices only: read in place
+    where `topk_plain_reads_pitch` says so, copied first elsewhere, and right
+    either way -- on both sides of each one-block kernel's reach and of one row
+    per CU, at a pitch that misaligns every other row. On gfx950 the answer is
+    also held to those kernels' reach."""
+    failures = []
+    k = 2048
+    num_cu = torch.cuda.get_device_properties(0).multi_processor_count
+    overridden = "TOPK_FORCE_PATH" in os.environ or "TOPK_DISPATCH_FACTOR" in os.environ
+    for m in (8, 256, 3000):
+        for n in (2049, 16383, 16384, 22529, 81920, 81921, 131840, 131841):
+            in_place = bool(topk_plain_reads_pitch(m, n, k))
+            if get_gfx() == "gfx950" and not overridden:
+                expected = n <= 80 * 1024 or (m >= num_cu and n <= 128 * 1024 + 768)
+                if in_place != expected:
+                    failures.append(f"{m}x{n}: reads the pitch {in_place}")
+            for pad in (64, 1):
+                torch.manual_seed(m + n + pad)
+                src = torch.randn(m, n + pad, dtype=dtypes.fp32)[:, :n]
+                ref = torch.topk(src, k, dim=1).values.sort(dim=1).values
+                for nan_high in (False, True):
+                    label = f"{m}x{n} pitch {n + pad} nan_high={nan_high}"
+                    ids = torch.full((m, k), -1, dtype=dtypes.i32)
+                    topk_plain(src, ids, None, k, True, nan_high=nan_high)
+                    torch.cuda.synchronize()
+                    before = torch.cuda.memory_allocated()
+                    torch.cuda.reset_peak_memory_stats()
+                    topk_plain(src, ids, None, k, True, nan_high=nan_high)
+                    torch.cuda.synchronize()
+                    grew = torch.cuda.max_memory_allocated() - before
+                    got = src.gather(1, ids.long().clamp_min(0)).sort(dim=1).values
+                    if not torch.equal(got, ref):
+                        failures.append(f"{label}: wrong selection")
+                    # Where the rows dwarf the radix scratch, a copy shows.
+                    copied = grew >= src.numel() * src.element_size()
+                    if m * n >= 1 << 24 and copied == in_place:
+                        failures.append(f"{label}: in place {in_place}, grew {grew} B")
+                del src, ref
+    for label in failures:
+        aiter.logger.error("UNIFORM PITCH FAILED: %s", label)
+    return failures
+
+
+def test_values_optional():
+    """`topk_out=None` runs where `topk_plain_batches_ragged_rows` holds and raises
+    TypeError everywhere else, rather than reaching the C++ check, which aborts
+    the process."""
+    failures = []
+    n, k = 8192, 2048
+    ids = torch.empty(4, k, dtype=dtypes.i32)
+    refused = (
+        ("bf16", torch.randn(4, n, dtype=dtypes.bf16), True, k),
+        ("largest=False", torch.randn(4, n, dtype=dtypes.fp32), False, k),
+        ("block-sort shape", torch.randn(4, n, dtype=dtypes.fp32), True, 16),
+    )
+    for label, x, largest_, k_ in refused:
+        try:
+            topk_plain(x, ids[:, :k_].contiguous(), None, k_, largest_)
+            failures.append(f"{label}: accepted topk_out=None")
+        except TypeError:
+            pass
+    x = torch.randn(4, n, dtype=dtypes.fp32)
+    if not topk_plain_batches_ragged_rows(n, k):
+        failures.append(f"{n} wide k={k} is expected to take topk_out=None")
+    else:
+        topk_plain(x, ids, None, k, True)
+        ref = torch.topk(x, k, dim=1).values.sort(dim=1).values
+        if not torch.equal(x.gather(1, ids.long()).sort(dim=1).values, ref):
+            failures.append("topk_out=None: wrong selection")
+    for label in failures:
+        aiter.logger.error("VALUES OPTIONAL FAILED: %s", label)
+    return failures
+
+
 BATCH_SIZES = [3072]
 HIDDENSIZES = [3072, 4096, 8192, 16384, 32768, 65536, 131072]
 TOPKS = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
@@ -95,6 +218,12 @@ largest = True
 
 
 def main():
+    bad = test_strided_rows()
+    assert not bad, f"strided rows: {len(bad)} failed: {bad}"
+    bad = test_uniform_pitch()
+    assert not bad, f"uniform pitch: {len(bad)} failed: {bad}"
+    bad = test_values_optional()
+    assert not bad, f"values optional: {len(bad)} failed: {bad}"
     rows = []
     for batch_size in BATCH_SIZES:
         for hiddensize in HIDDENSIZES:

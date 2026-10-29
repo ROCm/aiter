@@ -37,6 +37,10 @@ SEARCH_SPACE = {
     "B_SCALE_TDM": [True, False],
     "kpack": [1, 2],
     "persistent": [True, False],
+    "N_FIRST": [False, True],
+    "FUSED_SPLITK": [False, True],
+    "REDUCE_BLOCK_SIZE_M": [32],
+    "REDUCE_BLOCK_SIZE_N": [32],
 }
 
 # Families that spell a key differently share its table row and shape rules;

@@ -331,27 +331,29 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
     {
         PL selfv = *reinterpret_cast<const PL*>(&in[2 * pk]);
         AL acc;
-#pragma unroll
-        for(int j = 0; j < LP; ++j)
-            acc[j] = upcast_s(selfv[j]);
 
-        for(int r = 1; r < ngpus; ++r)
+        // Sum in rank order, with the local value at its own rank, so every
+        // receiver rounds the same element the same way.
+        for(int r = 0; r < ngpus; ++r)
         {
-            int                   peer = (rank + r) % ngpus;
-            volatile LLPackedMsg* src  = myBase + (size_t)peer * slot;
-            uint32_t d0, f0, d1, f1;
-            do
+            PL pv = selfv;
+            if(r != rank)
             {
-                ll_load_b128(
-                    reinterpret_cast<const uint32_t*>(const_cast<LLPackedMsg*>(&src[pk])),
-                    d0, f0, d1, f1);
-            } while(f0 != flag || f1 != flag);
+                volatile LLPackedMsg* src = myBase + (size_t)r * slot;
+                uint32_t d0, f0, d1, f1;
+                do
+                {
+                    ll_load_b128(
+                        reinterpret_cast<const uint32_t*>(const_cast<LLPackedMsg*>(&src[pk])),
+                        d0, f0, d1, f1);
+                } while(f0 != flag || f1 != flag);
 
-            const uint32_t w[2] = {d0, d1};
-            PL             pv   = *reinterpret_cast<const PL*>(w);
+                const uint32_t w[2] = {d0, d1};
+                pv                  = *reinterpret_cast<const PL*>(w);
+            }
 #pragma unroll
             for(int j = 0; j < LP; ++j)
-                acc[j] += upcast_s(pv[j]);
+                acc[j] = r == 0 ? upcast_s(pv[j]) : acc[j] + upcast_s(pv[j]);
         }
 
         PL ov;
@@ -435,8 +437,8 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        // Sum in rank order so every rank gets the same bits.
+        ptrs[i] = (const P*)_input_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     int aligned_size = (size / unroll) * unroll;
@@ -925,8 +927,8 @@ __global__ void __launch_bounds__(512, 1) rs_gfx1250_split_first_dim(
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int idx = tid; idx < range; idx += stride)
@@ -967,8 +969,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_lastdim_naive(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const T*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const T*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1004,8 +1006,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_lastdim(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1052,8 +1054,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim_naive(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const T*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const T*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1090,8 +1092,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)

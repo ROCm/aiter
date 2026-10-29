@@ -993,6 +993,22 @@ def test_grouped_a4w4_situv2_kimi_k3_tp8_k_tail_matches_torch_ref(tile_k2, monke
     )
 
 
+@pytest.mark.parametrize("tokens", [1, 16])
+def test_grouped_swiglu_m3_tp_decode(tokens):
+    # MiniMax-M3 per-rank TP4 shape (128 routed + 1 shared expert, top-5) at
+    # decode, where the TP path routes all tokens in one fused launch.
+    run_moe(
+        "a4w4",
+        experts=129,
+        tokens=tokens,
+        topk=5,
+        model_dim=6144,
+        inter_dim=768,
+        activation=ActivationType.Swiglu,
+        check_aot_cache=False,
+    )
+
+
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)

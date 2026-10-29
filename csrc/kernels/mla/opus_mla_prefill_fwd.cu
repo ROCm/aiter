@@ -4,7 +4,8 @@
 // Launchers of the opus MLA sparse prefill kernels, bound to Python through the torch-free
 // ctypes C ABI (aiter_tensor_t* + trailing hipStream_t):
 //   gfx950  -- v4: kernels compiled from opus/mla_v4_prefill_*.hpp;
-//              v4.1: a prebuilt code object in hsa/gfx950/mla_opus/.
+//              v4.1: 16mx1_16nx4 compiled from opus/mla_v41_prefill_a8w8_16mx1_16nx4.hpp,
+//              16mx4_64nx1 a prebuilt code object in hsa/gfx950/mla_opus/.
 //   gfx1250 -- v4: prebuilt code objects in hsa/gfx1250/mla_opus/.
 
 #include "aiter_tensor.h"
@@ -14,7 +15,7 @@
 #include "aiter_hip_common.h"
 
 #include "../../cpp_itfs/pa/pa_ps.cuh"
-#include "opus/mla_v41_prefill_kargs.h"
+#include "opus/mla_v41_prefill_a8w8_16mx1_16nx4.hpp"
 #include "opus/mla_v4_prefill_a16w16_16mx1_16nx4.hpp"
 #include "opus/mla_v4_prefill_a16w16_16mx8_32nx1.hpp"
 #include "opus/mla_v4_prefill_a8w8_16mx1_16nx4.hpp"
@@ -557,18 +558,15 @@ OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_
 
 namespace {
 
-// Launch geometry of the 16mx4_64nx1 code objects: one workgroup covers one
-// query token and Q_TILE_SIZE * T_M query heads.
-constexpr int kGfx1250QTileSize   = 16;
+// Launch geometry of the code objects: a workgroup of four wave32s covers one query token and
+// kGfx1250Heads<tile> (Q_TILE_SIZE * T_M) query heads.
 constexpr int kGfx1250NumWarps    = 4;
 constexpr int kGfx1250WarpSize    = 32; // wave32 on gfx1250
 constexpr int kGfx1250BlockSize   = kGfx1250NumWarps * kGfx1250WarpSize;
-constexpr int kGfx1250HeadsPerBlk = kGfx1250QTileSize * kGfx1250NumWarps;
+constexpr int kGfx1250Heads16mx1  = 16;
+constexpr int kGfx1250Heads32mx1  = 32;
+constexpr int kGfx1250Heads16mx4  = 64;
 constexpr int kGfx1250MaxClusterY = 2;
-
-// Narrow-head variants: T_M=1, so heads per workgroup is Q_TILE_SIZE alone.
-constexpr int kGfx1250Heads16mx1 = 16;
-constexpr int kGfx1250Heads32mx1 = 32;
 
 // fp8 split-precision head layout.
 constexpr int kGfx1250DNopePadded = 512;
@@ -577,13 +575,13 @@ constexpr int kGfx1250DHead       = 512;
 
 // Each symbol name is its code object's file stem plus an optional `_cyN`, `_split` for split-K,
 // and `_kernel`.
-constexpr const char* kGfx1250A16W16Co =
+constexpr const char* kGfx1250A16W16Co16mx4 =
     "mla_opus/opus_mla_v4_prefill_a16w16_16mx4_64nx1.co";
 constexpr const char* kGfx1250A16W16Co16mx1 =
     "mla_opus/opus_mla_v4_prefill_a16w16_16mx1_16nx4.co";
 constexpr const char* kGfx1250A16W16Co32mx1 =
     "mla_opus/opus_mla_v4_prefill_a16w16_32mx1_16nx4.co";
-constexpr const char* kGfx1250A8W8Co =
+constexpr const char* kGfx1250A8W8Co16mx4 =
     "mla_opus/opus_mla_v4_prefill_a8w8_16mx4_64nx1.co";
 constexpr const char* kGfx1250A8W8Co16mx1 =
     "mla_opus/opus_mla_v4_prefill_a8w8_16mx1_16nx4.co";
@@ -666,7 +664,7 @@ void gfx1250_dispatch(const char* co_16mx1,
     if(H <= kGfx1250Heads32mx1)
         return gfx1250_launch(
             stem(co_32mx1), co_32mx1, kargs, split, ceil_div(H, kGfx1250Heads32mx1), 1, stream);
-    const int num_h_blocks = ceil_div(H, kGfx1250HeadsPerBlk);
+    const int num_h_blocks = ceil_div(H, kGfx1250Heads16mx4);
     const int cluster_y    = gfx1250_pick_cluster_y(num_h_blocks);
     gfx1250_launch(stem(co_16mx4) + "_cy" + std::to_string(cluster_y),
                    co_16mx4,
@@ -773,7 +771,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
     gfx1250_dispatch(
-        kGfx1250A16W16Co16mx1, kGfx1250A16W16Co32mx1, kGfx1250A16W16Co, args, split, stream);
+        kGfx1250A16W16Co16mx1, kGfx1250A16W16Co32mx1, kGfx1250A16W16Co16mx4, args, split, stream);
     if(num_splits > 1)
         opus_mla_prefill_split_reduce<__hip_bfloat16>(split, args.attn_sink_ptr, out, N, H, stream);
 }
@@ -913,23 +911,31 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q_nope->device_id);
-    gfx1250_dispatch(kGfx1250A8W8Co16mx1, kGfx1250A8W8Co32mx1, kGfx1250A8W8Co, args, split, stream);
+    gfx1250_dispatch(
+        kGfx1250A8W8Co16mx1, kGfx1250A8W8Co32mx1, kGfx1250A8W8Co16mx4, args, split, stream);
     if(num_splits > 1)
         opus_mla_prefill_split_reduce<__hip_bfloat16>(split, args.attn_sink_ptr, out, N, H, stream);
 }
 
 // ============================================================================
-// gfx950 MLA v4.1: prebuilt code object
+// gfx950 MLA v4.1
 // ============================================================================
 
 namespace {
 
-// Built by csrc/kernels/mla/opus/build_co.sh; a workgroup covers one token and 64 heads.
-constexpr const char* kV41A8W8Co = "mla_opus/opus_mla_v41_prefill_a8w8_16mx4_64nx1.co";
-constexpr int kV41HeadsPerBlk    = 64;
-constexpr int kV41BlockSize      = 256;
-constexpr int kV41DHead          = 512;
-constexpr int kV41DScale         = kV41DHead / 32;
+template <bool SPLIT = false>
+using V41Traits16mx1 =
+    opus_mla_v41_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t, SPLIT>;
+using V41Traits16mx4 =
+    opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>;
+
+// A workgroup covers one token and Q_TILE_SIZE * T_M heads. 16mx1_16nx4 serves H <= 16; the
+// 16mx4_64nx1 code object is built by csrc/kernels/mla/opus/build_co.sh.
+constexpr int kV41Heads16mx1          = V41Traits16mx1<>::Q_TILE_SIZE * V41Traits16mx1<>::T_M;
+constexpr int kV41Heads16mx4          = V41Traits16mx4::Q_TILE_SIZE * V41Traits16mx4::T_M;
+constexpr const char* kV41A8W8Co16mx4 = "mla_opus/opus_mla_v41_prefill_a8w8_16mx4_64nx1.co";
+constexpr int kV41DHead               = 512;
+constexpr int kV41DScale              = kV41DHead / 32;
 
 bool v41_is_e8m0(const aiter_tensor_t* t)
 {
@@ -1085,28 +1091,49 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
 
-    if(num_splits > 1)
+    const opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs> split_kargs{kargs, split};
+    if(H <= kV41Heads16mx1)
     {
-        opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs> split_kargs{kargs, split};
-        size_t arg_size = sizeof(split_kargs);
-        static AiterAsmKernel impl("opus_mla_v41_prefill_a8w8_16mx4_64nx1_split_kernel",
-                                   kV41A8W8Co);
-        impl.launch_kernel({&split_kargs,
-                            &arg_size,
-                            N,
-                            ceil_div(H, kV41HeadsPerBlk),
-                            num_splits,
-                            kV41BlockSize,
-                            1,
-                            1,
-                            stream});
+        const dim3 grid(N, ceil_div(H, kV41Heads16mx1), num_splits);
+        auto launch = [&](auto traits, const auto& args) {
+            using Traits = decltype(traits);
+            opus_mla_v41_prefill_a8w8_16mx1_16nx4_kernel<Traits>
+                <<<grid, Traits::BLOCK_SIZE, 0, stream>>>(args);
+        };
+        if(num_splits > 1)
+            launch(V41Traits16mx1<true>{}, split_kargs);
+        else
+            launch(V41Traits16mx1<>{}, kargs);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    }
+    else
+    {
+        auto launch = [&](AiterAsmKernel& impl, auto args) {
+            size_t arg_size = sizeof(args);
+            impl.launch_kernel({&args,
+                                &arg_size,
+                                N,
+                                ceil_div(H, kV41Heads16mx4),
+                                num_splits,
+                                V41Traits16mx4::BLOCK_SIZE,
+                                1,
+                                1,
+                                stream});
+        };
+        if(num_splits > 1)
+        {
+            static AiterAsmKernel impl("opus_mla_v41_prefill_a8w8_16mx4_64nx1_split_kernel",
+                                       kV41A8W8Co16mx4);
+            launch(impl, split_kargs);
+        }
+        else
+        {
+            static AiterAsmKernel impl("opus_mla_v41_prefill_a8w8_16mx4_64nx1_kernel",
+                                       kV41A8W8Co16mx4);
+            launch(impl, kargs);
+        }
+    }
+    if(num_splits > 1)
         opus_mla_prefill_split_reduce<__hip_bfloat16>(
             split, kargs.attn_sink_ptr, out, N, H, stream);
-        return;
-    }
-
-    size_t arg_size = sizeof(kargs);
-    static AiterAsmKernel impl("opus_mla_v41_prefill_a8w8_16mx4_64nx1_kernel", kV41A8W8Co);
-    impl.launch_kernel(
-        {&kargs, &arg_size, N, ceil_div(H, kV41HeadsPerBlk), 1, kV41BlockSize, 1, 1, stream});
 }
