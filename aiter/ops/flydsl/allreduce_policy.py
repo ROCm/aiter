@@ -111,7 +111,7 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx950",
         link="xgmi",
         world_size=2,
-        oneshot=Window(0, 64 * MiB),
+        oneshot=Window(0, 4 * MiB),
         mesh=Window(512 * KiB, None),
         ring=None,
     ),
