@@ -1242,18 +1242,26 @@ def mha_v4_kv_splits(
     sequence with few heads leaves most CUs idle: [1, 4352, 3] fills 51 of MI355X's 256.
     The CU count is the device's own, so each SKU and partition mode gets its own split.
     Splitting the keys into n ranges folded into the batch multiplies the grid by n at the cost
-    of a merge pass. This takes the largest n that still fits the grid in one wave and leaves
-    each range at least _MHA_V4_MIN_KV_SPLIT_TOKENS keys; a grid that already fills the GPU
-    gets 1, since further splits only add work-groups and merge traffic. n must also divide the
-    key length unless `ragged`, for operands whose dense row takes per-batch key lengths: the
-    last range then takes the remainder.
+    of a merge pass. This takes the largest n that divides the key length, still fits the grid
+    in one wave and leaves each range at least _MHA_V4_MIN_KV_SPLIT_TOKENS keys; a grid that
+    already fills the GPU gets 1, since further splits only add work-groups and merge traffic.
+    Only with no such divisor, at batch 1 and when `ragged` (operands whose dense row takes
+    per-batch key lengths), does it take the largest n that fits and let the last range take
+    the remainder.
     """
     work_groups = batch * query_heads * -(-query_length // _MHA_V4_Q_TILE)
     cus = torch.cuda.get_device_properties(device).multi_processor_count
     most = min(cus // max(work_groups, 1), key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS)
     for splits in range(most, 1, -1):
-        if ragged or key_length % splits == 0:
+        if key_length % splits == 0:
             return splits
+    # A remainder builds seqlens_k with two kernels per call (~3 us replayed, ~14 us of host
+    # time), and past batch 1 the ranges stop being a view of K and V, whose copy costs more than
+    # splitting gains. On MI355X a divisor above half the fit was faster both replayed and eager;
+    # below half, replayed BF16 gained up to 17 us from the extra splits, but eager calls and
+    # replayed FP8 still favoured the divisor.
+    if ragged and batch == 1:
+        return max(most, 1)
     return 1
 
 
@@ -1486,6 +1494,11 @@ def mha_v4(
     equal when the count divides the key length; otherwise the last one takes the remainder,
     which needs operands that take per-batch key lengths (all four on gfx950), and any others
     need a count that divides it.
+    ``"auto"`` minimizes device time, so it is meant for HIP-graph-replayed or torch.compile'd
+    callers. A split adds ~35 us of host time per eager call (more with a remainder), mostly the
+    merge's Triton launch, and at the short sequences it targets an eager call is already bound
+    by host time: BF16/FP8 on MI355X at [1, 4352, 3, 128] took 40 us replayed at 4 splits
+    against 61 us unsplit, but 105 us eager against 66 us.
     """
     if return_lse:
         _check_lse_capable(q_format, v_format)

@@ -1460,7 +1460,7 @@ def test_mha_v4_kv_splits_match_the_unsplit_call(
 
 
 def test_mha_v4_kv_splits_auto_fills_one_wave():
-    """The grid grows to the CU count and no further, in a count that divides the keys."""
+    """The grid grows to the CU count and no further, in a count that divides the keys if any."""
     with _patched_cu_count(256):
         # 3 heads x 17 query tiles is 51 work-groups: 5 fit, but 4352 splits evenly into 4.
         assert mha_v4_kv_splits(1, 4352, 3, 4352) == 4
@@ -1472,10 +1472,13 @@ def test_mha_v4_kv_splits_auto_fills_one_wave():
         # Ranges stay at least 512 keys long.
         assert mha_v4_kv_splits(1, 256, 1, 1536) == 3
         assert mha_v4_kv_splits(1, 256, 1, 1000) == 1
-        # Operands that take per-batch key lengths need no divisor: the last range takes the rest.
-        assert mha_v4_kv_splits(1, 4352, 3, 4352, ragged=True) == 5
+        # Operands that take per-batch key lengths still prefer a divisor, and only at batch 1
+        # fall back to letting the last range take the rest.
+        assert mha_v4_kv_splits(1, 4352, 3, 4352, ragged=True) == 4
         assert mha_v4_kv_splits(1, 4352, 3, 4349, ragged=True) == 5
         assert mha_v4_kv_splits(1, 256, 1, 1000, ragged=True) == 1
+        assert mha_v4_kv_splits(2, 4352, 1, 4352, ragged=True) == 4
+        assert mha_v4_kv_splits(2, 4352, 1, 4349, ragged=True) == 1
 
 
 @parametrize(
