@@ -46,8 +46,10 @@ from aiter.ops.flydsl.kernels.gdr_prefill import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter_worker_limits import adopt_legacy_max_jobs
 
-# Matches the MI355X device query; a device reporting another count JIT-compiles on first use.
-AOT_NUM_XCDS = 8
+# XCD counts of gfx950 parts (MI350P: 4, MI355X: 8). NUM_XCDS is a compile-time
+# kwarg and part of the cache key, so each count is a separate job. A failed device
+# query makes runtime fall back to 1 (identity order); that is not prebuilt.
+AOT_NUM_XCDS_VARIANTS = (4, 8)
 CHUNK_GDN_H_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_opt"
 
@@ -144,8 +146,8 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 continue
 
             indices = _USE_STATE_INDICES if (use_h0 and store_fs) else (False,)
-            for BV, g_head_major, use_state_indices in itertools.product(
-                bvs, _G_HEAD_MAJOR, indices
+            for BV, g_head_major, use_state_indices, num_xcds in itertools.product(
+                bvs, _G_HEAD_MAJOR, indices, AOT_NUM_XCDS_VARIANTS
             ):
                 job = {
                     "kernel_name": _KERNEL_NAME,
@@ -164,6 +166,7 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                     "state_bf16": state_bf16,
                     "g_head_major": g_head_major,
                     "use_state_indices": use_state_indices,
+                    "num_xcds": num_xcds,
                     **_FIXED_SWITCHES,
                 }
                 key = job_identity(job)
@@ -198,6 +201,7 @@ def _compile_to_cache(
     g_head_major: bool,
     use_state_indices: bool,
     bf16_convert_trunc: bool,
+    num_xcds: int,
     **kwargs,
 ):
     del kwargs
@@ -266,7 +270,7 @@ def _compile_to_cache(
         SCHED_GFX942=arch.startswith("gfx942"),
         G_HEAD_MAJOR=g_head_major,
         BF16_CONVERT_TRUNC=bf16_convert_trunc,
-        NUM_XCDS=AOT_NUM_XCDS,
+        NUM_XCDS=num_xcds,
     )
 
     with compile_only_env():
@@ -302,7 +306,7 @@ def _format_shape_str(job: dict) -> str:
         f"snapshot_bf16={job.get('snapshot_bf16')} "
         f"state_bf16={job.get('state_bf16')} "
         f"is_varlen={job.get('is_varlen')} use_h0={job.get('use_h0')} "
-        f"store_fs={job.get('store_fs')}"
+        f"store_fs={job.get('store_fs')} num_xcds={job.get('num_xcds')}"
     )
 
 

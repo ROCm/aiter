@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import os
 import sys
 import time
@@ -30,8 +31,10 @@ from aiter.ops.flydsl.kernels.gdr_prefill.chunk_gdn_carry_gfx950 import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-# Matches the MI355X device query; a device reporting another count JIT-compiles on first use.
-AOT_NUM_XCDS = 8
+# XCD counts of gfx950 parts (MI350P: 4, MI355X: 8); NUM_XCDS is in the cache key,
+# so each count is a separate job. A failed device query makes runtime fall back to
+# 1 (identity order); that is not prebuilt.
+AOT_NUM_XCDS_VARIANTS = (4, 8)
 
 CHUNK_GDN_BLOCKED_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_blocked"
@@ -98,7 +101,8 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                     "cu_num": cu_num,
                 },
             )
-            for job in candidates:
+            for base, num_xcds in itertools.product(candidates, AOT_NUM_XCDS_VARIANTS):
+                job = {**base, "num_xcds": num_xcds}
                 key = job_identity(job)
                 if key not in seen:
                     seen.add(key)
@@ -107,7 +111,9 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
     return jobs
 
 
-def _compile_build_map_to_cache(*, arch: str, H: int, Hg: int, **kwargs) -> None:
+def _compile_build_map_to_cache(
+    *, arch: str, H: int, Hg: int, num_xcds: int, **kwargs
+) -> None:
     del kwargs
 
     import torch
@@ -155,7 +161,7 @@ def _compile_build_map_to_cache(*, arch: str, H: int, Hg: int, **kwargs) -> None
         BF16_CONVERT_TRUNC=True,
         PHASE="build_map",
         BLOCK_ENTRY_SEED=False,
-        NUM_XCDS=AOT_NUM_XCDS,
+        NUM_XCDS=num_xcds,
     )
     with compile_only_env():
         _run_compiled(
@@ -186,7 +192,7 @@ def _compile_build_map_to_cache(*, arch: str, H: int, Hg: int, **kwargs) -> None
 
 
 def _compile_emit_to_cache(
-    *, arch: str, H: int, Hg: int, state_bf16: bool, **kwargs
+    *, arch: str, H: int, Hg: int, state_bf16: bool, num_xcds: int, **kwargs
 ) -> None:
     del kwargs
 
@@ -241,7 +247,7 @@ def _compile_emit_to_cache(
         BF16_CONVERT_TRUNC=True,
         PHASE="emit",
         BLOCK_ENTRY_SEED=True,
-        NUM_XCDS=AOT_NUM_XCDS,
+        NUM_XCDS=num_xcds,
     )
     with compile_only_env():
         _run_compiled(
@@ -272,7 +278,13 @@ def _compile_emit_to_cache(
 
 
 def _compile_carry_to_cache(
-    *, arch: str, H: int, use_initial_state: bool, state_bf16: bool = False, **kwargs
+    *,
+    arch: str,
+    H: int,
+    use_initial_state: bool,
+    num_xcds: int,
+    state_bf16: bool = False,
+    **kwargs,
 ) -> None:
     del arch, kwargs
 
@@ -294,7 +306,7 @@ def _compile_carry_to_cache(
         H=H,
         use_initial_state=use_initial_state,
         STATE_DTYPE_BF16=state_bf16,
-        NUM_XCDS=AOT_NUM_XCDS,
+        NUM_XCDS=num_xcds,
     )
     with compile_only_env():
         _run_compiled(
@@ -317,7 +329,7 @@ def _format_shape_str(job: dict[str, Any]) -> str:
     state_bf16 = job.get("state_bf16")
     return (
         f"chunk_gdn_blocked phase={phase} H={h} Hg={hg} use_h0={use_h0} "
-        f"state_bf16={state_bf16}"
+        f"state_bf16={state_bf16} num_xcds={job.get('num_xcds')}"
     )
 
 
