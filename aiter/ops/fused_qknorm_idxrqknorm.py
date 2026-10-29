@@ -21,6 +21,10 @@ _FP8_E4M3_DTYPES = tuple(
 )
 
 
+# Targets with opus::fp32_to_fp8 (opus.hpp).
+_FP8_CVT_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250")
+
+
 def _is_fp8_e4m3_tensor(t: Tensor | None) -> bool:
     return t is not None and t.dtype in _FP8_E4M3_DTYPES
 
@@ -109,9 +113,16 @@ def fused_qknorm_idxrqknorm(
             else "auto"
         )
 
-    # opus has no fp4 conversion off gfx950: it would silently write zeros.
+    # opus has no fp4 conversion off gfx950 and no fp8 conversion on gfx1100/gfx115x: the
+    # stores would silently write zeros.
     if "mxfp4" in (kv_cache_dtype, index_cache_dtype) and get_gfx_runtime() != "gfx950":
         raise RuntimeError("fused_qknorm_idxrqknorm mxfp4 caches require gfx950")
+    if (
+        q_out is not None
+        and q_out.dtype != qkv.dtype
+        and get_gfx_runtime() not in _FP8_CVT_GFX
+    ):
+        raise RuntimeError(f"an fp8 q_out requires one of {_FP8_CVT_GFX}")
 
     use_fp8_kv_cache = (
         kv_cache_k is not None

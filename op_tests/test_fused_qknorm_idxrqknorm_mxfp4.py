@@ -136,7 +136,7 @@ def make_call(
     def call():
         aiter.fused_qknorm_idxrqknorm(
             qkv, w, w, cs, pos, NQ, nkv, ROT, 1e-6, w, w, NIQ,
-            slots, kc, vc, ic, bs, q_out, out["iq"], index_slots,
+            slots, out["kc"], out["vc"], out["ic"], bs, q_out, out["iq"], index_slots,
             kv_cache_dtype=kv, index_cache_dtype=index_dtype, k_scale=ks, v_scale=vs,
             asm_layout=bs == 16, skip_index_branch=skip_index,
         )  # fmt: skip
@@ -342,51 +342,56 @@ def test_reference_scale_rule_is_the_hip_rule():
 
 
 def rejection_call(case):
-    """One mxfp4 index-cache call that is (or, for "good", is not) a contract violation."""
+    """One mxfp4 call that is (or, for "good", is not) a contract violation."""
     T, dtype = 32, torch.bfloat16
     slots = torch.arange(T, dtype=torch.int64)
     kv, bs = ("mxfp4", 128) if case.startswith("kv_mxfp4") else ("auto", 16)
-    if case == "kv_mxfp4_few_index_pages":
-        slots += 200  # two kv pages, one index page
+    if case in ("kv_mxfp4_few_index_pages", "kv_mxfp4_v_pages"):
+        slots += 200  # two kv pages
     ic = {
         "not_uint8": torch.zeros(1, 128, HD, dtype=dtype),
         "partial_page": torch.zeros(PAGE_BYTES + 128, dtype=torch.uint8),
         "kv_mxfp4_small_index": torch.zeros(128, dtype=torch.uint8),
         "kv_mxfp4_few_index_pages": torch.zeros(PAGE_BYTES, dtype=torch.uint8),
     }.get(case)
-    run_op(
+    call, out = make_call(
         make_inputs(T, 1, dtype), 1, slots, kv, bs, "mxfp4", dtype,
         ic=ic, skip_index=case == "skip_index_branch",
     )  # fmt: skip
+    if case == "kv_mxfp4_v_pages":
+        out["vc"] = out["vc"][:1]  # one V page for two K pages
+    call()
     torch.cuda.synchronize()
 
 
-def test_mxfp4_needs_gfx950():
-    """Off gfx950 opus converts to fp4 as zeros, so mxfp4 caches must be refused up front."""
+def test_arch_guards():
+    """Where opus converts to fp4/fp8 as zeros, those stores must be refused up front."""
     import aiter.ops.fused_qknorm_idxrqknorm as op
 
+    T, bf16 = 32, torch.bfloat16
+    slots = torch.arange(T, dtype=torch.int64)
+    q8 = torch.empty(T, NQ * HD, dtype=dtypes.fp8)
     runtime = op.get_gfx_runtime
-    op.get_gfx_runtime = lambda: "gfx942"
     try:
-        for kv, bs, index in (("auto", 16, "mxfp4"), ("mxfp4", 128, "auto")):
-            slots = torch.arange(32, dtype=torch.int64)
+        for gfx, kv, bs, index, q_out, msg in (
+            ("gfx942", "auto", 16, "mxfp4", None, "gfx950"),
+            ("gfx942", "mxfp4", 128, "auto", None, "gfx950"),
+            ("gfx1100", "auto", 128, "auto", q8, "fp8 q_out"),
+        ):
+            op.get_gfx_runtime = lambda gfx=gfx: gfx
             try:
                 run_op(
-                    make_inputs(32, 1, torch.bfloat16),
-                    1,
-                    slots,
-                    kv,
-                    bs,
-                    index,
-                    torch.bfloat16,
+                    make_inputs(T, 1, bf16), 1, slots, kv, bs, index, bf16, q_out=q_out
                 )
             except RuntimeError as e:
-                assert "gfx950" in str(e)
+                assert msg in str(e), e
             else:
-                raise AssertionError(f"kv={kv} index={index} accepted on gfx942")
+                raise AssertionError(
+                    f"accepted on {gfx}: {kv} {index} {q_out is not None}"
+                )
     finally:
         op.get_gfx_runtime = runtime
-    aiter.logger.info("test_mxfp4_needs_gfx950: PASS")
+    aiter.logger.info("test_arch_guards: PASS")
 
 
 @benchmark()
@@ -457,7 +462,7 @@ def sweep(dtype_list, tokens, perf_tokens):
     test_zero_and_extreme_rows()
     test_pages_dequantize_to_the_reference()
     test_reference_scale_rule_is_the_hip_rule()
-    test_mxfp4_needs_gfx950()
+    test_arch_guards()
     summary(
         "rejections",
         [
@@ -469,6 +474,7 @@ def sweep(dtype_list, tokens, perf_tokens):
                 "skip_index_branch",
                 "kv_mxfp4_small_index",
                 "kv_mxfp4_few_index_pages",
+                "kv_mxfp4_v_pages",
             )
         ],
     )
@@ -498,7 +504,7 @@ for _fn in (
     test_zero_and_extreme_rows,
     test_pages_dequantize_to_the_reference,
     test_reference_scale_rule_is_the_hip_rule,
-    test_mxfp4_needs_gfx950,
+    test_arch_guards,
     test_rejections,
     test_write_perf,
 ):

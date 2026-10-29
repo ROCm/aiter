@@ -1135,10 +1135,11 @@ static void fused_qknorm_idxrqknorm_impl(
                         "mxfp4 kv_cache_k/kv_cache_v must be uint8 CUDA tensors");
             AITER_CHECK(kv_cache_k->dim() == 3 && kv_cache_k->size(1) == nkv &&
                             kv_cache_k->size(2) == kFp4PageBytes && kv_cache_k->stride(2) == 1 &&
-                            kv_cache_v->dim() == 3 && kv_cache_v->size(1) == nkv &&
+                            kv_cache_v->dim() == 3 && kv_cache_v->size(0) == kv_cache_k->size(0) &&
+                            kv_cache_v->size(1) == nkv &&
                             kv_cache_v->size(2) == kFp4PageBytes && kv_cache_v->stride(2) == 1,
                         "mxfp4 kv_cache_k/kv_cache_v must be [num_pages, num_kv_heads, 8704] "
-                        "with a contiguous last dim");
+                        "with the same num_pages and a contiguous last dim");
             k_s_block = kv_cache_k->stride(0);
             k_s_head  = kv_cache_k->stride(1);
             v_s_block = kv_cache_v->stride(0);
