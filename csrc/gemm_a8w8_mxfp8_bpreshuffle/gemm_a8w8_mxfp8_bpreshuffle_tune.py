@@ -24,6 +24,10 @@ split-K neighbours), and a row's kernelId names the backend that runs it,
         --mxscale_table \\
         -i <shapes with a w_scale_block column> \\
         -o aiter/configs/model_configs/dsv4_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv
+
+On gfx1250 --mxscale_table times the mxfp8_128 kernels the 2-D dispatch runs
+(flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common, row-major A) on 128x128
+shapes, and a row's kernelId is the kernel's id in that list.
 """
 
 from typing import Any, ClassVar
@@ -174,6 +178,29 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
     )
 
 
+def gfx1250_candidates(m, n, k):
+    """(kernelId, kernel) of the gfx1250 mxfp8_128 kernels the 2-D dispatch can
+    run for the shape (row-major A)."""
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        kernel_fits_shape,
+        kernels_list,
+    )
+
+    return [
+        (kernel_id, ki)
+        for kernel_id, ki in kernels_list.items()
+        if not ki.a_preshuffle and kernel_fits_shape(ki, m, n, k)
+    ]
+
+
+def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8_128_bpreshuffle_flydsl
+
+    return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
+        x, weight_shuffle, x_scale, w_scale, out, {"kernelName": kernel_name}
+    )
+
+
 class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
@@ -299,9 +326,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
     def tune(self, untunedf, tunedf, args):
         gfx = self.get_gfx()
-        if gfx != "gfx950":
+        if gfx not in ("gfx950", "gfx1250"):
             logger.warning(
-                f"gemm_a8w8_mxfp8_bpreshuffle tuner covers gfx950 only, got {gfx}"
+                f"gemm_a8w8_mxfp8_bpreshuffle tuner covers gfx950 and gfx1250, got {gfx}"
             )
             return []
         cu_num = self.get_cu_num()
@@ -321,6 +348,13 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 f"w_scale block {coarse} is tuned for gemm_a8w8_blockscale_"
                 f"bpreshuffle only: pass --mxscale_table"
             )
+        if gfx == "gfx1250" and (
+            not self._mxscale_table or set(untunedf["w_scale_block"]) != {"128x128"}
+        ):
+            raise ValueError(
+                "gfx1250 tunes the mxfp8_128 kernels of gemm_a8w8_blockscale_"
+                "bpreshuffle's table only: pass --mxscale_table and 128x128 shapes"
+            )
         seeds = self._bmm_seeds() if self._mxscale_table else {}
         for i in range(len(untunedf)):
             M = int(untunedf.loc[i, "M"])
@@ -329,17 +363,19 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             block = str(untunedf.loc[i, "w_scale_block"])
             info_keys = (gfx, cu_num, M, N, K, block)
             # One pass per pipeline of the block, in their order.
-            cands = [
-                (kernel_id, ki)
-                for pipe in PIPELINES_BY_W_SCALE_BLOCK[block]
-                for kernel_id, ki in pipe.kernels_list.items()
-                if pipe.fits(ki, M, N, K)
-            ]
-            runs = [
-                (kernel_id, ki.split_k, ki.name, run_gemm_flydsl)
-                for kernel_id, ki in cands
-            ]
-            if self._mxscale_table:
+            cands = (
+                gfx1250_candidates(M, N, K)
+                if gfx == "gfx1250"
+                else [
+                    (kernel_id, ki)
+                    for pipe in PIPELINES_BY_W_SCALE_BLOCK[block]
+                    for kernel_id, ki in pipe.kernels_list.items()
+                    if pipe.fits(ki, M, N, K)
+                ]
+            )
+            run_fn = run_gemm_flydsl_gfx1250 if gfx == "gfx1250" else run_gemm_flydsl
+            runs = [(kernel_id, ki.split_k, ki.name, run_fn) for kernel_id, ki in cands]
+            if self._mxscale_table and gfx == "gfx950":
                 near = [
                     name
                     for mm, name in seeds.get((N, K, block), ())
@@ -402,7 +438,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             keys, kernelId, splitK, kernelName, libtype = info
             if time in (self.INVALID_TIME, self.INF_TIME):
                 kernelName = "None"
-            elif getattr(self, "_mxscale_table", False):
+            elif getattr(self, "_mxscale_table", False) and keys[0] == "gfx950":
+                # gfx1250 rows keep their kernels_list id, as the table's do.
                 kernelId = (
                     MXSCALE_BMM_KERNEL_ID
                     if kernelId >= KERNEL_ID_BASE_BMM
