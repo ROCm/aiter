@@ -3,7 +3,8 @@
 """Driver: sweep the full search space for one kernel and shape, then install the winners.
 
 Per M:   plan            harness.py --plan: load defaults, generate combinations, prune
-         check_settings  records can only be resumed when they were timed the same way
+         check_settings  records can only be resumed when they were timed the same way, on
+                         the same CU count
          sweep           harness.py --configs ...: the candidates are dealt round-robin to the
                          GPUs, one serial worker per GPU, with crash and hang recovery
          final_round     with several GPUs: re-time the baseline and the ten fastest on the first
@@ -15,6 +16,8 @@ Then:    install         write_best_configs.py: select winners, merge buckets, v
 --all-buckets sweeps every M bucket of the family up to TOP_BUCKET_M (8192); the installer
 sets "any" to a copy of DEFAULT.json's "any". The driver never imports torch or aiter: every
 step is a subprocess that sees HIP_VISIBLE_DEVICES=<gpu>. It resumes from the records in --runs-dir.
+--cu-dir plans from and installs into the <arch>/<cu_num>cu/ tree of this device's CU count;
+without it the default tree is used, whatever the device's CU count.
 """
 
 import argparse
@@ -77,6 +80,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--runs-dir", default=os.path.join(HERE, "runs"))
     parser.add_argument(
+        "--cu-dir",
+        action="store_true",
+        help="plan from and install into <arch>/<cu_num>cu/, the tree of this device's CU "
+        "count; only on a partition whose CU count is not the arch's default",
+    )
+    parser.add_argument(
         "--batch", type=int, default=100, help="configs per worker process"
     )
     parser.add_argument(
@@ -107,21 +116,23 @@ def parse_args(argv=None):
     return args
 
 
-def worker_command(spec, shape, backend, extra):
+def worker_command(spec, shape, backend, extra, cu_dir=False):
     command = [sys.executable, os.path.join(HERE, "harness.py"), spec.name]
     for d in spec.dims:
         command += [f"--{d}", str(shape[d])]
     if backend:
         command += ["--backend", backend]
+    if cu_dir:
+        command.append("--cu-dir")
     return command + extra
 
 
-def plan(spec, shape, backend, gpu, runs_dir, timeout):
+def plan(spec, shape, backend, gpu, runs_dir, timeout, cu_dir=False):
     """Ask the worker for the space; keep the plan under a name unique to arch, backend, kernel and shape."""
     fd, space_file = tempfile.mkstemp(prefix="plan-", suffix=".json", dir=runs_dir)
     os.close(fd)
     command = worker_command(
-        spec, shape, backend, ["--plan", "--space-out", space_file]
+        spec, shape, backend, ["--plan", "--space-out", space_file], cu_dir
     )
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
     try:
@@ -160,6 +171,7 @@ def all_bucket_ms(spec, args, gpu):
         gpu,
         args.runs_dir,
         args.setup_timeout,
+        args.cu_dir,
     )
     ms = [b for b in first["bounds"] if b <= TOP_BUCKET_M]
     print(f"all buckets: M = {ms}", flush=True)
@@ -184,16 +196,23 @@ def print_plan(plan_, shape):
     )
 
 
-def check_settings(out, args):
-    """Records can only be resumed when they were timed the same way."""
-    ready = next((r for r in iter_records(out) if r["status"] == "ready"), None)
-    if ready is None:
+def check_settings(out, args, cu_num=None):
+    """Records can only be resumed when they were timed the same way, on the same CU count."""
+    ready = [r for r in iter_records(out) if r["status"] == "ready"]
+    if not ready:
         return
-    recorded = (ready["calls"], ready["replays"], ready.get("cold_mb"))
+    recorded = (ready[0]["calls"], ready[0]["replays"], ready[0].get("cold_mb"))
     if recorded != (args.calls, args.replays, args.cold_mb):
         sys.exit(
             f"{out} was timed with calls={recorded[0]} replays={recorded[1]} cold_mb={recorded[2]}; "
             "rerun with the same settings or --fresh"
+        )
+    # records from before cu_num was recorded resume; a --cu-dir install skips them
+    other = sorted({r.get("cu_num") for r in ready} - {None, cu_num})
+    if other:
+        sys.exit(
+            f"{out} was timed on {other} CUs, this device has {cu_num}; "
+            "use another --runs-dir or --fresh"
         )
 
 
@@ -282,6 +301,7 @@ def run_batch(spec, shape, backend, batch, out, gpu, args):
             "--out",
             out,
         ],
+        args.cu_dir,
     )
     outcome = run_worker(command, env, log_path, args.stall, args.setup_timeout)
     if outcome in ("finished", "cancelled"):
@@ -403,6 +423,8 @@ def install(spec, args, backend, gpu):
     if "B" in spec.dims:
         command += ["--B", str(args.B)]
     command += ["--backend", backend, "--runs-dir", args.runs_dir]
+    if args.cu_dir:
+        command.append("--cu-dir")
     print("\ninstalling:", " ".join(command[1:]), flush=True)
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
     return subprocess.run(command, env=env, check=False).returncode
@@ -416,7 +438,13 @@ def main(argv=None):
     for M in args.M or all_bucket_ms(spec, args, gpus[0]):
         shape = shape_from_args(args, spec.dims, M)
         plan_ = plan(
-            spec, shape, args.backend, gpus[0], args.runs_dir, args.setup_timeout
+            spec,
+            shape,
+            args.backend,
+            gpus[0],
+            args.runs_dir,
+            args.setup_timeout,
+            args.cu_dir,
         )
         backend = plan_["backend"]
         print_plan(plan_, shape)
@@ -424,7 +452,7 @@ def main(argv=None):
         out = results_path(args.runs_dir, plan_["arch"], backend, spec.name, shape)
         if args.fresh:
             discard(out)
-        check_settings(out, args)
+        check_settings(out, args, plan_.get("cu_num"))
         print(f"  results: {out}", flush=True)
         candidates = [None] + plan_["configs"]  # None is the installed baseline
         sweep(spec, shape, backend, candidates, out, gpus, args)
