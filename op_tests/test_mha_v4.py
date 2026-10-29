@@ -60,6 +60,7 @@ from aiter.ops.mha_v4_quant import (
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
 )
+from aiter.ops.triton.attention.utils import lse_merge
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
     fp6_k_raw_buffer_sizes,
@@ -1647,6 +1648,33 @@ def test_mha_v4_kv_splits_compile_parity(formats):
 
     assert torch.equal(eager[0], compiled[0])
     assert torch.equal(eager[1], compiled[1])
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="~10 GB of gfx942/gfx950 memory")
+@parametrize(
+    "sequence,heads,splits",
+    [
+        param(65536, 64, 5, id="splits-past-2^31"),
+        param(147456, 128, 1, id="partial-past-2^31"),
+    ],
+)
+def test_mha_v4_kv_splits_merge_addresses_past_2_31_elements(sequence, heads, splits):
+    """An explicit split count can put the last partial, or one partial alone, past 2^31
+    elements. All weight sits on the last range, so the merge must return it exactly; an offset
+    computed in 32 bits reads before the buffer and faults instead."""
+    partial_out = torch.zeros(
+        (splits, sequence, heads, 128), device="cuda", dtype=torch.bfloat16
+    )
+    partial_lse = torch.full((splits, heads, sequence), float("-inf"), device="cuda")
+    partial_out[-1].normal_()
+    partial_lse[-1] = 0.5
+    out = torch.empty((1, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty((1, heads, sequence), device="cuda")
+
+    lse_merge(partial_out, partial_lse, out, lse)
+
+    assert torch.equal(out[0], partial_out[-1])
+    assert torch.equal(lse[0], partial_lse[-1])
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
