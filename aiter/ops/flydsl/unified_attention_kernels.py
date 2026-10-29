@@ -26,7 +26,6 @@ from __future__ import annotations
 from functools import cache
 
 import torch
-from flydsl.utils import env as flydsl_env
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -201,10 +200,21 @@ def _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
     )
 
 
+def _run_only() -> bool:
+    """FLYDSL_RUNTIME_RUN_ONLY as FlyDSL's own parser reads it.
+
+    ``flydsl.utils.env`` is not a stable API in FlyDSL 0.4.0, which has no
+    stable accessor for this option; recheck this read when the pin moves.
+    """
+    from flydsl.utils import env
+
+    return env.runtime.run_only
+
+
 def _prebuilt_ok(k, v, num_kv_heads, block_size) -> bool:
     """FLYDSL_RUNTIME_RUN_ONLY=1 loads prebuilt kernels and never compiles,
     so serve only the K/V strides AOT enumerates; others go to Triton."""
-    if not flydsl_env.runtime.run_only:
+    if not _run_only():
         return True
     strides = k.stride()[:3] + v.stride()[:3]
     return any(
