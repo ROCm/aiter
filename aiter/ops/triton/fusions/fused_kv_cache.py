@@ -64,6 +64,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
     q_nope_prestored: bool = False,
+    seg_page_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -124,6 +125,7 @@ def fused_qk_rope_cat_and_cache_mla(
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
     q_nope_prestored: bool = False,
+    seg_page_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -149,6 +151,10 @@ def fused_qk_rope_cat_and_cache_mla(
       ``q_out`` is not None, a single KV head (KH==1, i.e. MLA), and the
       gfx1250 pure-decode MLA path; q_pe/KV results are bit-identical to the
       full path.
+    - seg_page_size: When > 0 (gfx1250 only, KH == 1), kv_cache is written as
+      seg-packed pages of that many tokens, each [tokens x D1 nope | tokens x
+      D2 rope], the layout of the gfx1250 asm MLA decode kernel. q_out may then
+      be a strided view of a padded buffer.
 
     Models without a rotary embedding use fused_qk_cat_and_cache_mla instead.
 
@@ -191,6 +197,7 @@ def fused_qk_rope_cat_and_cache_mla(
         shuffled_kv_cache,
         upcast_operand,
         q_nope_prestored,
+        seg_page_size,
     )
 
 
@@ -320,9 +327,21 @@ def _cat_and_cache_mla(
     shuffled_kv_cache: bool,
     upcast_operand: bool,
     q_nope_prestored: bool = False,
+    seg_page_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Shared launch for both entry points; pos=cos=sin=None is the NoPE form."""
     apply_rope = cos is not None
+    if seg_page_size > 0:
+        assert DEVICE_ARCH == "gfx1250" and apply_rope, (
+            "seg-packed KV pages are only written by the gfx1250 gluon rope kernel"
+        )
+        assert not shuffled_kv_cache, "seg-packed and shuffled KV layouts are exclusive"
+        assert kv_cache.dim() == 3 and kv_cache.shape[1] == 1, (
+            "seg-packed KV pages need a (tokens, 1, D) single-head kv_cache"
+        )
+        assert kv_cache.shape[0] % seg_page_size == 0, (
+            "seg-packed kv_cache must hold whole pages"
+        )
 
     b, qh, d_nope = q_nope.shape
     b2, qh2, d_pe = q_pe.shape
@@ -500,14 +519,17 @@ def _cat_and_cache_mla(
             SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
             HAVE_K_SCALE=(k_scale is not None and apply_scale),
             UPCAST_OPERAND=upcast_operand,
+            SEG_PAGE_SIZE=seg_page_size,
             num_warps=1,
         )
         return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
+    extra_kernel_kwargs = {}
     if DEVICE_ARCH == "gfx1250":
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+        extra_kernel_kwargs["SEG_PAGE_SIZE"] = seg_page_size
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
 
@@ -565,6 +587,7 @@ def _cat_and_cache_mla(
         UPCAST_OPERAND=upcast_operand,
         APPLY_ROPE=apply_rope,
         num_warps=1,
+        **extra_kernel_kwargs,
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out

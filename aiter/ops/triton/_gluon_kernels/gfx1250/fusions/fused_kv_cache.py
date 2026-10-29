@@ -128,8 +128,29 @@ def _store_mla_kv_cache(
     SCALE_K_WIDTH_ROPE: gl.constexpr,
     L_NOPE: gl.constexpr,
     L_PE: gl.constexpr,
+    SEG_PAGE_SIZE: gl.constexpr = 0,
 ):
-    if SHUFFLED_KV_CACHE:
+    if SEG_PAGE_SIZE > 0:
+        # Seg-packed pages of SEG_PAGE_SIZE tokens: all nope rows, then all
+        # rope rows. Single KV head, unit last-dim stride.
+        seg_page = pid_t_slot // SEG_PAGE_SIZE
+        seg_row = pid_t_slot % SEG_PAGE_SIZE
+        kv_cache_base = kv_cache_ptr + seg_page * SEG_PAGE_SIZE * kv_cache_stride_b
+        kv_cache_nope_offs = seg_row * BLOCK_D_nope + d_nope_offs
+        kv_cache_pe_offs = (
+            SEG_PAGE_SIZE * BLOCK_D_nope + seg_row * BLOCK_D_pe + d_pe_offs
+        )
+        gl.amd.cdna4.buffer_store(
+            k_nope.to(kv_cache_ptr.dtype.element_ty),
+            ptr=kv_cache_base,
+            offsets=kv_cache_nope_offs.to(gl.int32),
+        )
+        gl.amd.cdna4.buffer_store(
+            k_pe.to(kv_cache_ptr.dtype.element_ty),
+            ptr=kv_cache_base,
+            offsets=kv_cache_pe_offs.to(gl.int32),
+        )
+    elif SHUFFLED_KV_CACHE:
         if kv_cache_ptr.dtype.element_ty == gl.bfloat16:
             # BF16
             K_WIDTH: gl.constexpr = 8
@@ -420,6 +441,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     HAVE_K_SCALE: gl.constexpr = False,
     UPCAST_OPERAND: gl.constexpr = False,
     APPLY_ROPE: gl.constexpr = True,
+    SEG_PAGE_SIZE: gl.constexpr = 0,
 ):
     # Accepted only to keep the signature aligned with the Triton kernel; the
     # TDM cos/sin staging below has no NoPE variant.
@@ -633,6 +655,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 SCALE_K_WIDTH_ROPE,
                 L_NOPE,
                 L_PE,
+                SEG_PAGE_SIZE,
             )
 
         # OUTPUT block at tail (after the kv-store path): both stores via
@@ -741,6 +764,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     SCALE_K_WIDTH_ROPE,
                     L_NOPE,
                     L_PE,
+                    SEG_PAGE_SIZE,
                 )
 
 
@@ -1590,6 +1614,7 @@ def _qpe_htile_kernel(
     SCALE_K_WIDTH_ROPE: gl.constexpr = 4,
     HAVE_K_SCALE: gl.constexpr = False,
     UPCAST_OPERAND: gl.constexpr = False,
+    SEG_PAGE_SIZE: gl.constexpr = 0,
 ):
     # 2D tile layout over [BLOCK_H heads, BLOCK_D_pe], and its 1D slices.
     L_T_PE: gl.constexpr = _tile_blocked_layout(BLOCK_H, BLOCK_D_pe)
@@ -1773,5 +1798,6 @@ def _qpe_htile_kernel(
                 SCALE_K_WIDTH_ROPE,
                 L_NOPE_1D,
                 L_PE_1D,
+                SEG_PAGE_SIZE,
             )
         gl.amd.gfx1250.tdm.async_wait(0)
