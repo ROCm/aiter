@@ -2768,6 +2768,12 @@ def check_h32_split_head_tile_boundary(tokens, splits, mode):
     check_two_source_h64_causal_prefill(tokens, 512, mode, 32, splits)
 
 
+def check_h16_long_list_auto_split(tokens, topk, mode):
+    # Exercise the long-list policy with dense output/max/LSE checks around
+    # the grid and allocated-row boundaries, including normalized raw Q.
+    check_two_source_h64_causal_prefill(tokens, topk, mode, 16, 0)
+
+
 def check_h32_auto_split_boundary(tokens, mode):
     check_two_source_h64_causal_prefill(tokens, 2048, mode, 32, 0)
 
@@ -2825,6 +2831,31 @@ def check_small_head_split_storage(heads, mode, splits):
 def run_contract_checks():
     """Run every correctness case during the same direct invocation used by CI."""
     checks = [
+        (
+            check_h16_long_list_auto_split,
+            [
+                ("mode", ["raw", "prepared", "norm"]),
+                (
+                    "tokens,topk",
+                    [
+                        (63, 2048),
+                        (64, 2048),
+                        (65, 2048),
+                        (127, 2048),
+                        (128, 2048),
+                        (129, 2048),
+                        (255, 2048),
+                        (256, 2048),
+                        (257, 2048),
+                        (128, 1919),
+                        (128, 1920),
+                        (256, 1919),
+                        (256, 1920),
+                        (256, 4096),
+                    ],
+                ),
+            ],
+        ),
         (
             check_h32_auto_split_boundary,
             [
