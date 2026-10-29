@@ -90,6 +90,8 @@ C_SMODE = 74
 C_SMLAST = 67
 # the G1 block a CTA without one prefetches (schedule.pf_unit)
 C_SMPF = 75
+# (ROT) the chunk-table rotation: the plan's chunk j is the table's (j + C_JSH) % chunks
+C_JSH = 69
 
 
 def build_smallm(kc: KernelCtx) -> dict:
@@ -159,6 +161,16 @@ def build_smallm(kc: KernelCtx) -> dict:
     D = int(os.environ.get("AITER_MEGAMOE_TP_SMD", str(D)))
     # (debug) the rest run in single groups (else whole shares of GPC groups)
     RGU = GPC if os.environ.get("AITER_MEGAMOE_TP_G2G", "1") == "1" else 1
+    # (debug) the plan's chunk order starts at the last expert's chunks when it has several
+    # (the shared expert: every token's): its GEMM1 blocks in the first round, all CTAs in
+    # step, so the reads of one weight block by its row chunks meet in L2
+    ROT = os.environ.get("AITER_MEGAMOE_TP_ROT", "1") == "1"
+
+    def _rot(L, j):
+        if const_expr(ROT):
+            nun = fx.max(lds_ld_i32(L, L_CTL + C_NCH * 4), i32(1))
+            return (j + lds_ld_i32(L, L_CTL + C_JSH * 4)) % nun
+        return j
 
     def smc(a, j, bank):
         return ctrl_at(a, i32(CTRL_SMC) + (bank * i32(NCHLB_MAX) + j) * i32(G1C_STRIDE))
@@ -193,6 +205,14 @@ def build_smallm(kc: KernelCtx) -> dict:
         if tid == i32(0):
             lds_st(L, L_CTL + C_SMODE * 4, i32(1))
             nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
+            if const_expr(ROT):
+                last = lds_ld_i32(L, L_DCH + fx.max(nun - i32(1), i32(0)) * i32(4))
+                ce_l = last.shrui(i32(16)) & i32(0xFF)
+                lds_st(
+                    L,
+                    L_CTL + C_JSH * 4,
+                    ((nun > i32(0)) & (ce_l > i32(1))).select(nun - ce_l, i32(0)),
+                )
             C = i32(gpu.grid_dim.x)
             x = _xcd_rank(C)
             nb = nun * i32(KS2)
@@ -248,17 +268,18 @@ def build_smallm(kc: KernelCtx) -> dict:
                 bu = u // sk
                 piece = u - bu * sk
                 jr = bu // i32(KS2)
+                bk = bu - jr * i32(KS2)
                 jc = j0 + k
                 lo_b = fx.max(b0, jc * i32(KS2))
                 hi_b = fx.min(b0 + q, (jc + i32(1)) * i32(KS2))
                 one = (cont == fx.Boolean(False)) | xtra
-                j = one.select(jr, jc)
+                j = _rot(L, one.select(jr, jc))
                 ul = L_CTL + (i32(C_UL) + k * i32(4)) * i32(4)
                 lds_st(L, ul, lds_ld_i32(L, L_DCH + j * i32(4)))
                 lds_st(
                     L,
                     ul + i32(4),
-                    one.select(bu - jr * i32(KS2), lo_b - jc * i32(KS2)) * i32(128)
+                    one.select(bk, lo_b - jc * i32(KS2)) * i32(128)
                     + ph.select((p % i32(2)) * i32(64), i32(0)),
                 )
                 lds_st(
@@ -427,7 +448,9 @@ def build_smallm(kc: KernelCtx) -> dict:
                 out=_part_store(uid, sk),
             )
         else:  # (the static K loop of the whole K dim)
-            gemm1(L, tid, a, e, i0, icnt // i32(128), half=icnt == i32(64))
+            gemm1(
+                L, tid, a, e, i0, icnt // i32(128), half=icnt == i32(64), dup=ce > i32(1)
+            )
         mark(tid, a, 14)
         if u == i32(0):
             mark(tid, a, 26)
@@ -508,6 +531,7 @@ def build_smallm(kc: KernelCtx) -> dict:
                 pre=pre,
                 sdd=SDD2,
                 odd=RGU > 1,
+                dup=ce > i32(1),
             )
         else:
             gemm2(
@@ -526,6 +550,7 @@ def build_smallm(kc: KernelCtx) -> dict:
                 pre=pre,
                 aoff=piece * i32(KS2 // QF),
                 odd=RGU > 1,
+                dup=ce > i32(1),
             )
         cbar(L, tid)
         mark(tid, a, 15)
@@ -545,9 +570,9 @@ def build_smallm(kc: KernelCtx) -> dict:
             g = g0 + i32(k_)
             c0 = (fx.max(s0, g * i32(NU)) - g * i32(NU)) * i32(GPC // U)
             c1 = (fx.min(s1, (g + i32(1)) * i32(NU)) - g * i32(NU)) * i32(GPC // U)
-            j = g // qg
+            jp = g // qg
             ev = i32(40 + 12 * run) + fx.min(i32(k_), i32(3)) * i32(3)
-            _sm_g2(L, tid, a, j, c0, c1, bank, g - j * qg, qg, ev)
+            _sm_g2(L, tid, a, _rot(L, jp), c0, c1, bank, g - jp * qg, qg, ev)
 
     @flyc.jit
     def sm_compute(L, tid, a):
@@ -567,9 +592,9 @@ def build_smallm(kc: KernelCtx) -> dict:
         if const_expr(DPF):
             pf = lds_ld_i32(L, L_CTL + C_SMPF * 4)
             if pf >= i32(0):
-                j = pf // i32(KS2)
-                ent = lds_ld_i32(L, L_DCH + j * i32(4))
-                kc.pf_unit(L, tid, a, ent & i32(0xFFFF), (pf - j * i32(KS2)) * i32(128), i32(128), False)
+                jp = pf // i32(KS2)
+                ent = lds_ld_i32(L, L_DCH + _rot(L, jp) * i32(4))
+                kc.pf_unit(L, tid, a, ent & i32(0xFFFF), (pf - jp * i32(KS2)) * i32(128), i32(128), False)
         for run in range_constexpr(2):
             _sm_run(
                 L,

@@ -128,6 +128,8 @@ def build_communication(kc: KernelCtx) -> dict:
     """The communication device functions of one instance (added to kc)."""
     CNAP = int(os.environ.get("AITER_MEGAMOE_TP_CNAP", "4"))  # (debug)
     PNAP = int(os.environ.get("AITER_MEGAMOE_TP_PNAP", "2"))  # (debug) push poll nap
+    # (debug) the routing packets polled all together (else one after another)
+    RPOLL = os.environ.get("AITER_MEGAMOE_TP_RPOLL", "1") == "1"
     TRACE_ = kc.TRACE and not kc.TRACE_LIGHT
 
     def tm(a, lane, k):
@@ -1115,6 +1117,11 @@ def build_communication(kc: KernelCtx) -> dict:
         rx = [peer_rs(a, p, "off_x", x_bytes) for p in range(TPC)]
         rs = [peer_rs(a, p, "off_xs", xs_bytes) for p in range(TPC)]
         args = (L, lane, a, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes, qb, qs, cnt)
+        if const_expr(AGWR and MLL):
+            # (the routing packets of every rank landed here first: the all-gather's
+            # stores would delay them on the links / at the receivers' memory)
+            if ag_split(a) > i32(1):
+                spin0(L, lane, L_CTL + C_RLAND * 4, i32(1))
         if const_expr(AGPAR):
             # (more chunks per sender: the sequential stores-bump pipeline gets chunk 0's
             # flag out before the later chunks' stores land)
@@ -1202,6 +1209,8 @@ def build_communication(kc: KernelCtx) -> dict:
     # (debug) split all-gather: all of a sender's chunks stored, then their counts at once
     AGPAR = AGDIR and os.environ.get("AITER_MEGAMOE_TP_AGPAR", "1") == "1"
     AGPMAX = int(os.environ.get("AITER_MEGAMOE_TP_AGPMAX", "3"))
+    # (debug) split all-gather: sent once this rank's routing landed
+    AGWR = os.environ.get("AITER_MEGAMOE_TP_AGWR", "0") == "1"
 
     @flyc.jit
     def _ag_bump(a, lane, q):
@@ -1307,7 +1316,40 @@ def build_communication(kc: KernelCtx) -> dict:
         n = a["ttot"] * i32(TOPK)
         nc = fx.max(n, i32(1)) - i32(1)
         out = []
-        if const_expr(MLL):
+        if const_expr(MLL and RPOLL):
+            rid = rsrc(a["ids"])
+
+            def ld_all():
+                return [
+                    fx.Vector(
+                        bld(rid, fx.min(tid + i32(k * NT), nc) * i32(16), 0, V4I, AUX_SYS)
+                    )
+                    for k in range(RIT)
+                ]
+
+            def pending(pks):
+                p = i32(0)
+                for k in range_constexpr(RIT):
+                    live = (tid + i32(k * NT)) < n
+                    p = p | (live & (fx.Int32(pks[k][1]) != a["epoch"])).select(
+                        i32(1), i32(0)
+                    )
+                return p
+
+            # (all of a thread's packets polled together each round: the wait is the
+            # last arrival plus one memory latency, not one latency per late packet)
+            pks = ld_all()
+            pend = pending(pks)
+            t0 = now()
+            while (pend != i32(0)) & alive(t0):
+                rocdl.s_sleep(1)
+                pks = ld_all()
+                pend = pending(pks)
+            _report_if(a, pend != i32(0), ERR_META)
+            for k in range_constexpr(RIT):
+                idx = tid + i32(k * NT)
+                out.append((idx, fx.Int32(pks[k][0]), fx.Int32(pks[k][2]), idx < n))
+        elif const_expr(MLL):
             rid = rsrc(a["ids"])
             # (every packet's first load in flight together: one memory latency, not RIT)
             pk0 = [

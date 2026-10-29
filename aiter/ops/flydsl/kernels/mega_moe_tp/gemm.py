@@ -90,6 +90,11 @@ def build_gemm(kc: KernelCtx) -> dict:
     AUX_A = int(os.environ.get("AITER_MEGAMOE_TP_AUXA", str(AUX_SC1)))  # (debug)
     # (small-M GEMM1) the k-step pair's scale dwords loaded once (with the even step)
     SDD = kc.SM and os.environ.get("AITER_MEGAMOE_TP_SDD", "1") == "1"
+    # (debug) the weight streams' non-temporal hint
+    BNT = os.environ.get("AITER_MEGAMOE_TP_BNT", "1") == "1"
+    # (debug) an expert's weights read by several row chunks: cacheable loads
+    _dupc = os.environ.get("AITER_MEGAMOE_TP_DUPC", "1")  # 1 / g1 / g2 / 0
+    DUPC1, DUPC2 = _dupc in ("1", "g1"), _dupc in ("1", "g2")
     # (HB) half block: 64 columns of GEMM1, wave w: columns 32 (w % 2), K half w // 2
     KH = KS1 // 2
     NCH, NCK, NSC_BLK, RG, SI_STRIDE = kc.get("NCH NCK NSC_BLK RG SI_STRIDE")
@@ -117,34 +122,47 @@ def build_gemm(kc: KernelCtx) -> dict:
         return i32(1)
 
     @flyc.jit
-    def _gemm1_disp(L, tid, a, expert, i0, nnb, mte=None, kr=None, out=None):
+    def _gemm1_disp(L, tid, a, expert, i0, nnb, mte=None, kr=None, out=None, bnt=True):
         if const_expr(npp > 1 and kr is None):
             if (nnb % i32(npp)) == i32(0):
-                _gemm1(L, tid, a, expert, i0, nnb, npp, mte)
+                _gemm1(L, tid, a, expert, i0, nnb, npp, mte, bnt=bnt)
             else:
-                _gemm1(L, tid, a, expert, i0, nnb, 1, mte)
+                _gemm1(L, tid, a, expert, i0, nnb, 1, mte, bnt=bnt)
         else:
-            _gemm1(L, tid, a, expert, i0, nnb, 1, mte, kr, out)
+            _gemm1(L, tid, a, expert, i0, nnb, 1, mte, kr, out, bnt=bnt)
 
     @flyc.jit
-    def gemm1(L, tid, a, expert, i0, nnb, rows=None, kr=None, out=None, half=None):
+    def _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, bnt):
+        if const_expr(HB and half is not None):
+            if half:
+                _gemm1h(L, tid, a, expert, i0, bnt=bnt)
+            else:
+                _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt)
+        elif const_expr(MTSKIP and rows is not None):
+            if uni(rows) <= i32(3 * 16):
+                _gemm1_disp(L, tid, a, expert, i0, nnb, 3, bnt=bnt)
+            else:
+                _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt)
+        else:
+            _gemm1_disp(L, tid, a, expert, i0, nnb, None, kr, out, bnt=bnt)
+
+    @flyc.jit
+    def gemm1(
+        L, tid, a, expert, i0, nnb, rows=None, kr=None, out=None, half=None, dup=None
+    ):
         """kr: (k0, nk) only k-steps [k0, k0 + nk) of the K dim (nk a multiple of the
         k-step interleave, 4); out: the per-group epilogue (default: act + MXFP4 to
         L_INTER), called as out(L, lane, w, a, accs, grp, P, MTE); half (HB): a 64-column
-        half block instead (nnb unused)"""
+        half block instead (nnb unused); dup: the expert's weights read by several row
+        chunks: cacheable loads (their concurrent reads meet in L2), else non-temporal"""
         nnb = uni(nnb)
-        if const_expr(HB and half is not None):
-            if half:
-                _gemm1h(L, tid, a, expert, i0)
-            else:
-                _gemm1_disp(L, tid, a, expert, i0, nnb)
-        elif const_expr(MTSKIP and rows is not None):
-            if uni(rows) <= i32(3 * 16):
-                _gemm1_disp(L, tid, a, expert, i0, nnb, 3)
-            else:
-                _gemm1_disp(L, tid, a, expert, i0, nnb)
+        if const_expr(dup is None or not BNT or not DUPC1):
+            _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, BNT)
         else:
-            _gemm1_disp(L, tid, a, expert, i0, nnb, None, kr, out)
+            if dup:
+                _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, False)
+            else:
+                _gemm1_any(L, tid, a, expert, i0, nnb, rows, kr, out, half, True)
         wait_vm(0)
         cbar(L, tid)
 
@@ -226,7 +244,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             )
 
     @flyc.jit
-    def _gemm1(L, tid, a, expert, i0, nnb, P, MTE=None, kr=None, out=None):
+    def _gemm1(L, tid, a, expert, i0, nnb, P, MTE=None, kr=None, out=None, bnt=True):
         MTE = MT if MTE is None else MTE
         lane, w, rw, rws, vs, vsl, sg0, su0 = _g1_operands(tid, a, expert, i0)
         ring = uni(L + i32(L_RING) + w * i32(nsk * SLOT))
@@ -255,7 +273,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             slot = ring + i32(slot_idx * SLOT)
             so = _g1_so(pas, kk)
             for t in range_constexpr(4):
-                dma16(slot + i32(t * 1024), rw, vs[t], so, nt=True)
+                dma16(slot + i32(t * 1024), rw, vs[t], so, nt=bnt)
             if not (sdd and odd):
                 sso = _g1_sso(pas, kk)
                 dma4(slot + i32(4096), rws, vsl, sg0 + sso)
@@ -318,7 +336,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + C_QBASE * 4 + w * i32(4), qend)
 
     @flyc.jit
-    def _gemm1h(L, tid, a, expert, i0):
+    def _gemm1h(L, tid, a, expert, i0, bnt=True):
         """(HB) GEMM1 of a 64-column half block: wave w the 32 columns 32 (w % 2) over the
         K half w // 2 (KH k-steps; buffer q holds both halves' A chunks), the second pair's
         accumulators added through LDS (its own B ring), act + MXFP4 by the first pair"""
@@ -336,7 +354,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             slot = ring + i32(slot_idx * SLOT)
             so = _g1_so(i32(0), kk)
             for t in range_constexpr(4):
-                dma16(slot + i32(t * 1024), rw, vs[t], so, nt=True)
+                dma16(slot + i32(t * 1024), rw, vs[t], so, nt=bnt)
             if not (SDD and odd):
                 sso = _g1_sso(i32(0), kk)
                 dma4(slot + i32(4096), rws, vsl, sg0 + sso)
@@ -609,7 +627,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 e * i32(H * (I // 2))
                 + (n0 + i32(t * 16)) * i32(I // 2)
                 + k * i32(1024),
-                nt=True,
+                nt=BNT,
             )
         for p in range_constexpr(2):
             rb = (e * i32(H) + n0 + i32(p * 32)) // i32(32)
@@ -624,6 +642,7 @@ def build_gemm(kc: KernelCtx) -> dict:
     def gemm2(
         L, tid, a, expert, ks0, r0, rows, signal, NKS, pidx, gi_lo=None, *args, **kw
     ):
+        dup = kw.pop("dup", None)
         g = functools.partial(
             _gemm2,
             L,
@@ -640,13 +659,24 @@ def build_gemm(kc: KernelCtx) -> dict:
             *args,
             **kw,
         )
-        if const_expr(MTSKIP):
-            if uni(rows) <= i32(3 * 16):
-                g(mte=3)
+
+        def run(bnt):
+            if const_expr(MTSKIP):
+                if uni(rows) <= i32(3 * 16):
+                    g(mte=3, bnt=bnt)
+                else:
+                    g(bnt=bnt)
             else:
-                g()
+                g(bnt=bnt)
+
+        # (dup: as gemm1's)
+        if const_expr(dup is None or not BNT or not DUPC2):
+            run(BNT)
         else:
-            g()
+            if dup:
+                run(False)
+            else:
+                run(True)
 
     @flyc.jit
     def _gemm2(
@@ -670,6 +700,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         aoff=None,
         sdd=False,
         odd=False,
+        bnt=True,
     ):
         """sdd: (k-steps from 0, even NKS) a k-step pair's scale dwords loaded once;
         odd: [gi_lo, gi_hi) may hold an odd number of groups"""
@@ -764,7 +795,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             slot = ring + i32(slot_idx * SLOT)
             for t in range_constexpr(4):
                 dma16(
-                    slot + i32(t * 1024), rw, lane * i32(16), _w2_off(n0, t, k), nt=True
+                    slot + i32(t * 1024), rw, lane * i32(16), _w2_off(n0, t, k), nt=bnt
                 )
             for p in range_constexpr(0 if (sdd and odd) else 2):
                 rb = (e * i32(H) + n0 + i32(p * 32)) // i32(32)
