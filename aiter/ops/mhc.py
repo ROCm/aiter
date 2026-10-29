@@ -987,6 +987,155 @@ def _mhc_fused_post_pre_gluon(
     )
 
 
+@compile_ops("module_mhc", develop=True)
+def mhc_pack_fn_gfx950(out: Tensor, fn: Tensor) -> None: ...
+
+
+@compile_ops("module_mhc", develop=True)
+def mhc_post_project_gfx950(
+    projection: Tensor,
+    sq: Tensor,
+    next_residual: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    packed_fn: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_mhc", develop=True)
+def mhc_finalize_gfx950(
+    post: Tensor,
+    comb: Tensor,
+    out: Tensor,
+    projection: Tensor,
+    sq: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    norm_eps: float,
+    post_mult: float,
+    repeats: int,
+) -> None: ...
+
+
+def _mhc_post_pre_gfx950_supported(
+    layer_input: Tensor,
+    residual: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    norm_weight: Tensor | None,
+) -> bool:
+    # Only the measured BF16 plain-layout configurations select this path.
+    # Other shapes, dtypes and views keep the existing dispatch.
+    m = layer_input.shape[0]
+    if m not in (64, 8192) or norm_weight is None:
+        return False
+    expected = (
+        (layer_input, (m, 7168), torch.bfloat16),
+        (residual, (m, 4, 7168), torch.bfloat16),
+        (post_mix, (m, 4, 1) if post_mix.ndim == 3 else (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (fn, (24, 28672), torch.float32),
+        (scale, (3,), torch.float32),
+        (base, (24,), torch.float32),
+        (norm_weight, (7168,), torch.bfloat16),
+    )
+    return all(
+        tensor.is_cuda
+        and tensor.device == layer_input.device
+        and tuple(tensor.shape) == shape
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tensor.data_ptr() % 16 == 0
+        for tensor, shape, dtype in expected
+    )
+
+
+def _mhc_post_pre_gfx950(
+    layer_input: Tensor,
+    residual: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    post_mult: float,
+    repeats: int,
+    norm_weight: Tensor,
+    norm_eps: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    m = layer_input.shape[0]
+    splits = 56 if m == 64 else 4
+    device = layer_input.device
+    projection_pad = torch.empty((splits, m, 32), dtype=torch.float32, device=device)
+    projection = projection_pad[:, :, :24]
+    sq = torch.empty((splits, m), dtype=torch.float32, device=device)
+    next_residual = torch.empty_like(residual)
+    post = torch.empty((m, 4, 1), dtype=torch.float32, device=device)
+    comb = torch.empty((m, 4, 4), dtype=torch.float32, device=device)
+    out = torch.empty_like(layer_input)
+    post_mix = post_mix.reshape(m, 4)
+    if m == 64:
+        # Preserve the native FP32 decode producer.
+        mhc_fused_post_pre_gemm_sqrsum(
+            projection,
+            sq,
+            next_residual,
+            layer_input,
+            residual,
+            post_mix,
+            comb_mix,
+            fn,
+            16,
+            32,
+            32,
+        )
+    else:
+        # Pack the current weights on every invocation, including graph replay.
+        packed_fn = torch.empty_like(fn, dtype=torch.int32)
+        mhc_pack_fn_gfx950(packed_fn, fn)
+        mhc_post_project_gfx950(
+            projection_pad,
+            sq,
+            next_residual,
+            layer_input,
+            residual,
+            packed_fn,
+            post_mix,
+            comb_mix,
+        )
+    mhc_finalize_gfx950(
+        post,
+        comb,
+        out,
+        projection_pad,
+        sq,
+        scale,
+        base,
+        next_residual,
+        norm_weight,
+        rms_eps,
+        pre_eps,
+        sink_eps,
+        norm_eps,
+        post_mult,
+        repeats,
+    )
+    return post, comb, out, next_residual
+
+
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_fake)
 def mhc_fused_post_pre(
     layer_input: torch.Tensor,
@@ -1032,6 +1181,11 @@ def mhc_fused_post_pre(
 
     Both flags are boolean, default to False, and are controlled independently.
 
+    On gfx950, BF16 plain-layout calls with M=64 or 8192, hidden size 7168,
+    four residual streams and RMSNorm use the row-fused finalizer. The M=8192
+    path also packs the current FP32 weights and fuses post with projection.
+    Unsupported tensor layouts and dtypes keep the existing implementation.
+
     A shuffled residual (gfx1250, 0 < m < the fused bound) of a hidden size in
     ``MHC_GLUON_POST_PRE_HIDDEN_SIZES`` runs the gfx1250 Gluon kernels
     (``aiter.ops.triton.fusions.mhc.mhc_post_pre``) and uses ``MHC_RES_KS_GLUON``
@@ -1053,6 +1207,40 @@ def mhc_fused_post_pre(
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     res_preshuffle = res_preshuffle and mhc_res_shuffle_enabled(m, arch)
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
+
+    if (
+        arch == "gfx950"
+        and backend in (None, "hip")
+        and not w_preshuffle_bf16
+        and not res_preshuffle
+        and sinkhorn_repeat > 0
+        and _mhc_post_pre_gfx950_supported(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+        )
+    ):
+        return _mhc_post_pre_gfx950(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
 
     # At the shared bound the input is already in ordinary layout.
     if not force_fused and not res_preshuffle and m >= fused_m_upper_bound:
