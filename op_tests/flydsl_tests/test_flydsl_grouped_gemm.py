@@ -359,6 +359,8 @@ def _run_grouped_via_fused_moe(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     use_bias: bool = True,
+    bias_dtype: torch.dtype = torch.float32,
+    bias_column_pattern: bool = False,
     bench: bool = False,
     kernel_bench: bool = False,
     seed: int = 0,
@@ -366,8 +368,13 @@ def _run_grouped_via_fused_moe(
     iters: int = 101,
     data_init: str = "uniform",
     scale_init: str = "auto",
+    num_valid_tokens: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
+
+    ``num_valid_tokens``: rows at or past it are padding, routed as the router
+    leaves them under ``num_valid_rows`` (expert -1, weight 0) and passed as
+    ``num_local_tokens``. The reference covers the real rows and is 0 past them.
 
     Stage1 weights are always laid out GUGU (gate/up row-interleaved) paired
     with ``GateMode.INTERLEAVE``, which is the only layout the TDM grouped
@@ -422,7 +429,20 @@ def _run_grouped_via_fused_moe(
         generator=generator,
     )
     if use_bias:
-        if data_init == "constant":
+        if bias_column_pattern:
+            # Exact binary fractions vary across experts, lanes and N tiles.
+            # A missing tile offset or wrong bias dtype cannot hide behind a
+            # constant bias, and the reference uses these same logical values.
+            expert_bias = torch.arange(experts, dtype=torch.float32)[:, None] / 8
+            bias1 = (
+                expert_bias
+                + torch.arange(2 * inter, dtype=torch.float32)[None, :] / 512
+                + 0.25
+            )
+            bias2 = (
+                expert_bias + torch.arange(K, dtype=torch.float32)[None, :] / 256 + 0.5
+            )
+        elif data_init == "constant":
             bias1 = torch.full((experts, 2 * inter), 0.5)
             bias2 = torch.full((experts, K), 0.5)
         else:
@@ -430,6 +450,7 @@ def _run_grouped_via_fused_moe(
                 torch.randn((experts, 2 * inter), generator=generator) * 1e-3
             ).float()
             bias2 = (torch.randn((experts, K), generator=generator) * 1e-3).float()
+        bias1, bias2 = bias1.to(bias_dtype), bias2.to(bias_dtype)
     else:
         bias1 = torch.zeros((experts, 2 * inter))
         bias2 = torch.zeros((experts, K))
@@ -438,6 +459,12 @@ def _run_grouped_via_fused_moe(
 
     # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
     topk_id, topk_w = _make_topk(hidden, experts, topk)
+    real = tokens if num_valid_tokens is None else num_valid_tokens
+    num_local_tokens = None
+    if num_valid_tokens is not None:
+        topk_id[real:] = -1
+        topk_w[real:] = 0
+        num_local_tokens = torch.tensor([real], dtype=torch.int32)
 
     # ---- prep grouped GEMM inputs ----
     # Stage1 weight/scale/bias are rearranged to the physical GUGU layout;
@@ -491,6 +518,7 @@ def _run_grouped_via_fused_moe(
             swiglu_limit=swiglu_limit,
             beta=situ_beta,
             linear_beta=situ_linear_beta,
+            num_local_tokens=num_local_tokens,
         )
 
     torch.cuda.synchronize()
@@ -533,16 +561,17 @@ def _run_grouped_via_fused_moe(
 
     # Reference always uses GGUU logical inputs (layouts are numerically
     # equivalent; only physical packing differs).
-    ref = _torch_moe_ref(
-        hidden,
+    ref = torch.zeros_like(out)
+    ref[:real] = _torch_moe_ref(
+        hidden[:real],
         w1_logical,
         w1_scale_raw,
         bias1,
         w2_logical,
         w2_scale_raw,
         bias2,
-        topk_w,
-        topk_id,
+        topk_w[:real],
+        topk_id[:real],
         data_format=data_format,
         activation=activation,
         swiglu_limit=swiglu_limit,
@@ -645,6 +674,8 @@ def run_moe(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     use_bias: bool = True,
+    bias_dtype: torch.dtype = torch.float32,
+    bias_column_pattern: bool = False,
     tol: float = VERIFY_TOL_A4W4,
     raise_on_fail: bool = True,
     bench: bool = False,
@@ -687,6 +718,8 @@ def run_moe(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             use_bias=use_bias,
+            bias_dtype=bias_dtype,
+            bias_column_pattern=bias_column_pattern,
             bench=bench,
             kernel_bench=kernel_bench,
             seed=seed,
@@ -808,6 +841,74 @@ def test_grouped_a4w4_swiglu_matches_torch_ref():
     )
 
 
+@pytest.mark.parametrize("valid", [64, 41, 0])
+def test_route_gives_minus_one_routes_no_row(valid):
+    """The TP route kernel indexes its per-expert counter through a raw
+    pointer: a route to expert -1 must not reach it, and takes
+    DROPPED_ROUTE_ROW."""
+    _require_gfx1250()
+    from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_topids_to_rows
+
+    experts, topk, tokens = 256, 6, 64
+    max_m = tokens * topk
+    ids = torch.rand(tokens, experts).topk(topk, dim=1).indices.to(torch.int32)
+    ids[valid:] = -1
+    # The counter starts one element into its buffer, so a -1 route reaching
+    # the atomic lands in guard[0] instead of in someone else's memory.
+    guard = torch.zeros(experts + 1, dtype=torch.int32)
+    counts, rows = flydsl_moe_topids_to_rows(ids, experts, max_m, counter=guard[1:])
+    assert int(guard[0]) == 0, "a -1 route reached the per-expert counter"
+    hist = torch.bincount(ids[:valid].flatten().long(), minlength=experts)
+    assert torch.equal(counts.long(), hist)
+    assert (rows[valid:] == DROPPED_ROUTE_ROW).all()
+    expert = ids[:valid].long()
+    slot = rows[:valid].long() - expert * max_m
+    assert ((slot >= 0) & (slot < hist[expert])).all()
+    assert rows[:valid].unique().numel() == valid * topk
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+def test_grouped_skips_pad_rows_routed_to_minus_one(data_format, compact, monkeypatch):
+    """Rows past num_local_tokens arrive routed to expert -1, as the router
+    leaves them under num_valid_rows. The token-multidest quant (TP batches of
+    64+ tokens) must give them no grouped row: they come out 0, and the real
+    rows come out as they do when every row is real."""
+    _require_gfx1250()
+    from aiter.ops.flydsl import moe_kernels
+
+    getter = "_get_compiled_token_multidest_" + (
+        "compact_quant" if compact else "quant"
+    )
+    original = getattr(moe_kernels, getter)
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(moe_kernels, getter, counted)
+    if compact:
+        # The compact-scale variant otherwise starts at 1024+ tokens.
+        monkeypatch.setenv("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS", "64")
+    tokens, valid = 128, 77
+    shape = {
+        "experts": 64,
+        "tokens": tokens,
+        "topk": 6,
+        "model_dim": 512,
+        "inter_dim": 512,
+        "data_format": data_format,
+    }
+    full, _, _, _ = _run_grouped_via_fused_moe(**shape)
+    out, _, _, _ = _run_grouped_via_fused_moe(**shape, num_valid_tokens=valid)
+    assert calls, f"the quant did not take {getter}"
+    assert (out[valid:] == 0).all(), "pad rows are not zero"
+    ld = _logits_diff(out[:valid], full[:valid])
+    assert ld < 1e-6, f"real rows differ from the all-real run: logits_diff={ld:.4e}"
+
+
 def test_situv2_activation_matches_torch():
     torch.manual_seed(0)
     gate = torch.randn(4, 32)
@@ -891,6 +992,55 @@ def test_grouped_a4w4_situv2_kimi_k3_tp8_matches_torch_ref(tokens):
     )
 
 
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+def test_kimi_tp_route_histogram_public_path(data_format, monkeypatch):
+    """Wide expert dispatch changes only routing, through the real fused_moe API."""
+    _require_gfx1250()
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_module,
+    )
+
+    selected = []
+    getter = moe_kernels._get_compiled_topids_to_rows_lds
+
+    def counted(experts):
+        selected.append(experts)
+        return getter(experts)
+
+    monkeypatch.setattr(moe_kernels, "_get_compiled_topids_to_rows_lds", counted)
+    if data_format == "a8w4":
+        monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    else:
+        monkeypatch.delenv("AITER_FORCE_A8W4", raising=False)
+    shape = {
+        "experts": 896,
+        "tokens": 513,
+        "topk": 16,
+        "model_dim": 3584,
+        "inter_dim": 384,
+        "data_format": data_format,
+        "activation": ActivationType.Situv2,
+        "use_bias": False,
+        "seed": 19,
+        "data_init": "uniform",
+        "scale_init": "auto",
+    }
+    result, reference, _, _ = _run_grouped_via_fused_moe(**shape)
+    assert 896 in selected, "wide ordinary-TP histogram was not reached"
+    assert _logits_diff(result, reference) < LOGITS_DIFF_TOL
+
+    # Compare with the real original route kernel, not a mocked GEMM. The
+    # fixture recreates identical seeded inputs and all downstream operations.
+    original_router = build_moe_topids_to_rows_module()
+    monkeypatch.setattr(
+        moe_kernels, "_get_compiled_topids_to_rows_lds", lambda experts: original_router
+    )
+    baseline, baseline_ref, _, _ = _run_grouped_via_fused_moe(**shape)
+    torch.testing.assert_close(reference, baseline_ref, rtol=0, atol=0)
+    torch.testing.assert_close(result, baseline, rtol=0, atol=0)
+
+
 # The same shape with a GEMM2 k-tile that 384 does not divide, as a tuned row or
 # AITER_TDM_TILE_K2 may pick: 256 runs one full tile and a 128-wide tail, 512 a
 # single ragged tile (K < tile_k). 20000 tokens are past the table, so the other
@@ -908,6 +1058,22 @@ def test_grouped_a4w4_situv2_kimi_k3_tp8_k_tail_matches_torch_ref(tile_k2, monke
         inter_dim=384,
         activation=ActivationType.Situv2,
         use_bias=False,
+        check_aot_cache=False,
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 16])
+def test_grouped_swiglu_m3_tp_decode(tokens):
+    # MiniMax-M3 per-rank TP4 shape (128 routed + 1 shared expert, top-5) at
+    # decode, where the TP path routes all tokens in one fused launch.
+    run_moe(
+        "a4w4",
+        experts=129,
+        tokens=tokens,
+        topk=5,
+        model_dim=6144,
+        inter_dim=768,
+        activation=ActivationType.Swiglu,
         check_aot_cache=False,
     )
 
@@ -1196,13 +1362,15 @@ def _run_csv_file(args, csv_path: str) -> None:
                 flush=True,
             )
             continue
-        # A gemm1 bias turns off gemm1's own requantization, and the stage-2
-        # quant that replaces it needs inter_dim % 256 == 0 (Kimi-K3 at TP8 has
-        # 384 and no bias).
-        if not args.no_bias and inter_dim % 256:
+        # Bias does not disable the fused requant epilogue. Only explicitly
+        # selecting the standalone quant path imposes its 256-column bound.
+        disable_requant = os.environ.get(
+            "AITER_FLYDSL_DISABLE_GEMM1_REQUANT", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        if disable_requant and inter_dim % 256:
             print(
-                f"[csv] row {idx}: skipped inter_dim={inter_dim} with a bias "
-                "(needs inter_dim % 256 == 0; pass --no-bias)",
+                f"[csv] row {idx}: skipped inter_dim={inter_dim} without fused "
+                "requant (needs inter_dim % 256 == 0)",
                 flush=True,
             )
             continue
