@@ -21,6 +21,7 @@
 #define AITER_NO_TORCH_TYPES
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <type_traits>
 
 #include "aiter_dispatch.h"
@@ -31,6 +32,7 @@
 #include "opus/opus.hpp"
 #include "aiter_opus_plus.h"
 #include "quant_utils.cuh"
+#include "quant_amax_floor.h"
 #include "mx_quant_utils.h"  // fp_f32_to_e8m0_scale (MX RoundUp E8M0 block scale)
 #include "rope/rope_common.h"
 
@@ -94,10 +96,6 @@ activation_strides_logical_3d(const aiter_tensor_t& t, int64_t num_heads, int64_
 
 namespace {
 using mrope_utils::vec_t;
-
-// Minimum absmax used when computing FP8 KV scales to avoid division by zero when
-// activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
-static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
 
 // Per-wave LDS scratch the coarse Q path uses to gather a head's e8m0 scale run
 // into the one lane that carries it, so the inline scale rides in the same store
@@ -401,7 +399,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
         float k_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+            float const warp_max_safe = fmaxf(warp_max, aiter::kAmaxFloor);
             k_scale_val               = warp_max_safe / dtype_max;
             int64_t scale_offset =
                 block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
@@ -430,7 +428,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
         float v_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+            float const warp_max_safe = fmaxf(warp_max, aiter::kAmaxFloor);
             v_scale_val               = warp_max_safe / dtype_max;
             int64_t scale_offset =
                 block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
@@ -787,7 +785,7 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            float const block_max_safe = fmaxf(block_max, aiter::kAmaxFloor);
             k_scale_val                = block_max_safe / dtype_max;
             inv_scale_val              = dtype_max / block_max_safe;
             int64_t scale_offset       = block_idx * num_heads_k + headIdx;
@@ -831,7 +829,7 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
                 else
                 {
                     k_scale_val   = k_scale_global;
-                    inv_scale_val = 1.0f / fmaxf(k_scale_global, kFp8KvQuantAbsmaxFloorF32);
+                    inv_scale_val = 1.0f / fmaxf(k_scale_global, aiter::kAmaxFloor);
                 }
             }
             else
@@ -873,7 +871,7 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            float const block_max_safe = fmaxf(block_max, aiter::kAmaxFloor);
             v_scale_val                = block_max_safe / dtype_max;
             inv_scale_val              = dtype_max / block_max_safe;
             int64_t scale_offset       = block_idx * num_heads_k + headIdx;
@@ -940,7 +938,7 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
                 else
                 {
                     v_scale_val   = v_scale_global;
-                    inv_scale_val = 1.0f / fmaxf(v_scale_global, kFp8KvQuantAbsmaxFloorF32);
+                    inv_scale_val = 1.0f / fmaxf(v_scale_global, aiter::kAmaxFloor);
                 }
             }
             else
@@ -2699,7 +2697,7 @@ __global__ void qk_partial_amax_to_perhead_scale_kernel(
     {
         constexpr float fp8_max = 240.0f;
         float* out             = is_q ? q_scale : k_scale;
-        out[b * H + h]         = fmaxf(sm[0], 1e-8f) / fp8_max;
+        out[b * H + h]         = fmaxf(sm[0], aiter::kAmaxFloor) / fp8_max;
     }
 }
 
@@ -3281,7 +3279,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 int64_t block_size,
                                                 int64_t x,
                                                 int64_t rotary_dim,
-                                                bool v_norm)
+                                                bool v_norm,
+                                                std::optional<aiter_tensor_t> q_out_fp8,
+                                                std::optional<aiter_tensor_t> per_tensor_q_scale)
 {
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
@@ -3291,6 +3291,47 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     AITER_CHECK(k_cache.stride(k_cache.dim() - 1) == 1 &&
                     v_cache.stride(v_cache.dim() - 1) == 1,
                 "k_cache/v_cache innermost (head_size) dim must be contiguous");
+    // --- Validate optional fp8 Q output ---
+    const bool has_q_out_fp8 = q_out_fp8.has_value();
+    const bool has_q_scale   = per_tensor_q_scale.has_value();
+    AITER_CHECK(has_q_out_fp8 == has_q_scale,
+                "q_out_fp8 and per_tensor_q_scale must be provided together");
+
+    if(has_q_out_fp8)
+    {
+        const auto& q_fp8   = *q_out_fp8;
+        const auto& q_scale = *per_tensor_q_scale;
+
+        CHECK_INPUT(q_fp8);
+        CHECK_INPUT(q_scale);
+        CHECK_TYPE(q_fp8, AITER_DTYPE_fp8);
+        CHECK_TYPE(q_scale, AITER_DTYPE_fp32);
+        AITER_CHECK(q_fp8.device_id == qkv.device_id && q_scale.device_id == qkv.device_id,
+                    "q_out_fp8 and per_tensor_q_scale must be on the same GPU as qkv");
+        AITER_CHECK(num_tokens >= 0 && num_heads_q > 0 && head_size > 0,
+                    "num_tokens must be non-negative and num_heads_q/head_size must be positive");
+
+        const size_t tokens = static_cast<size_t>(num_tokens);
+        const size_t heads  = static_cast<size_t>(num_heads_q);
+        const size_t dim    = static_cast<size_t>(head_size);
+        AITER_CHECK(tokens == 0 || heads <= std::numeric_limits<size_t>::max() / tokens,
+                    "num_tokens * num_heads_q overflows size_t");
+        const size_t token_heads = tokens * heads;
+        AITER_CHECK(token_heads == 0 || dim <= std::numeric_limits<size_t>::max() / token_heads,
+                    "num_tokens * num_heads_q * head_size overflows size_t");
+        const size_t required_q_elements = token_heads * dim;
+        AITER_CHECK(q_fp8.numel() >= required_q_elements,
+                    "q_out_fp8 must contain at least ",
+                    required_q_elements,
+                    " elements, got ",
+                    q_fp8.numel());
+        AITER_CHECK(q_scale.numel() == 1,
+                    "per_tensor_q_scale must contain exactly one element, got ",
+                    q_scale.numel());
+        AITER_CHECK(k_cache.dtype() == AITER_DTYPE_fp8,
+                    "q_out_fp8 is supported only with an fp8 KV cache");
+    }
+
     HipDeviceGuard device_guard(qkv.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     auto kv_cache_dtype      = k_cache.dtype();
@@ -3298,6 +3339,11 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     AITER_CHECK(positions.dim() == 1, "positions must be 1D");
     float per_tensor_k_scale_ = *reinterpret_cast<float*>(per_tensor_k_scale.data_ptr());
     float per_tensor_v_scale_ = *reinterpret_cast<float*>(per_tensor_v_scale.data_ptr());
+    // Optional fp8 Q output (static per-tensor scale). When q_out_fp8 is absent the
+    // kernel writes only bf16 q_out; the scale is unused in that case.
+    const bool quant_q = has_q_out_fp8;
+    const float* per_tensor_q_scale_ptr =
+        quant_q ? reinterpret_cast<const float*>(per_tensor_q_scale->data_ptr()) : nullptr;
     // K/V cache indexing is stride-aware in block/token/head (innermost head_size
     // assumed contiguous), so most future KV layout changes need no change here.
     int64_t k_cache_block_stride = k_cache.stride(0);
@@ -3369,6 +3415,10 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                 ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(
                                       v_out.value().data_ptr())
                                 : nullptr;
+                        mrope_utils::fp8e4m3fn* q_out_fp8_ptr =
+                            quant_q ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(
+                                          q_out_fp8.value().data_ptr())
+                                    : nullptr;
                         mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fn>(
                             reinterpret_cast<T*>(qkv.data_ptr()),
                             reinterpret_cast<T*>(qw.data_ptr()),
@@ -3403,7 +3453,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_head_stride,
                             v_cache_token_stride,
                             v_cache_head_stride,
-                            v_norm);
+                            v_norm,
+                            q_out_fp8_ptr,
+                            per_tensor_q_scale_ptr);
                     }
                     else
                     {
@@ -3417,6 +3469,10 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                 ? reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(
                                       v_out.value().data_ptr())
                                 : nullptr;
+                        mrope_utils::fp8e4m3fnuz* q_out_fp8_ptr =
+                            quant_q ? reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(
+                                          q_out_fp8.value().data_ptr())
+                                    : nullptr;
                         mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fnuz>(
                             reinterpret_cast<T*>(qkv.data_ptr()),
                             reinterpret_cast<T*>(qw.data_ptr()),
@@ -3451,7 +3507,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_head_stride,
                             v_cache_token_stride,
                             v_cache_head_stride,
-                            v_norm);
+                            v_norm,
+                            q_out_fp8_ptr,
+                            per_tensor_q_scale_ptr);
                     }
                 }
                 else
@@ -4005,7 +4063,7 @@ __global__ void v_amax_to_descale_kernel(const float* __restrict__ v_amax,
     if(idx >= num_heads) return;
     constexpr float fp8_max = 240.0f;
     v_descale[b * num_heads + idx] =
-        fmaxf(v_amax[b * num_heads + idx], 1e-8f) / fp8_max;
+        fmaxf(v_amax[b * num_heads + idx], aiter::kAmaxFloor) / fp8_max;
 }
 
 template <typename T, int TILE_T, int HEAD_SIZE>
@@ -4672,7 +4730,7 @@ namespace aiter {
       // group max is always >= floor. Guards the e8m0 scale against a zero/near-zero
       // group amax (zero activations under CG warmup / pad / invalid slots) with no
       // extra op at the scale call site.
-      float thread_max = kFp8KvQuantAbsmaxFloorF32;
+      float thread_max = aiter::kAmaxFloor;
       if (is_nope_thread) {
         if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
           #pragma unroll
@@ -5347,7 +5405,7 @@ namespace aiter {
           // rotated PE as bf16 into the separate q_rope_out (Q-PE NOT quantized).
           // Floor applied after the rescale, which is where it was when the amax was
           // taken on the normalized vector.
-          float thread_max = fmaxf(amax_raw * q_rms_scale, kFp8KvQuantAbsmaxFloorF32);
+          float thread_max = fmaxf(amax_raw * q_rms_scale, aiter::kAmaxFloor);
           // Group-amax over the Q_REDUCE-lane group. DPP, not __shfl_xor: on gfx1250
           // __shfl_xor lowers to ds_bpermute_b32 through the LDS crossbar plus an
           // s_wait_dscnt, while the DPP form folds the lane move into the v_max
@@ -5742,7 +5800,7 @@ namespace aiter {
             // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
             const E8m0BlockScale s =
                 fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(
-                    fmaxf(amax_norm, kFp8KvQuantAbsmaxFloorF32));
+                    fmaxf(amax_norm, aiter::kAmaxFloor));
             // Every lane of a group writes it, not just lane 0 of the group.
             // amax_raw is butterfly-reduced over `off < reduce_thread_size`, so
             // s.byte is group-uniform, and group_id = tid/reduce_thread_size is
@@ -5920,7 +5978,7 @@ namespace aiter {
         // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
         const E8m0BlockScale qs_scale =
             fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(
-                fmaxf(amax_norm, kFp8KvQuantAbsmaxFloorF32));
+                fmaxf(amax_norm, aiter::kAmaxFloor));
         const float factor = q_rms_scale * qs_scale.inv_scale();  // x_in -> fp8 (rstd folded)
 
         query_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;

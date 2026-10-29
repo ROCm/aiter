@@ -54,6 +54,30 @@ void all_gather(fptr_t _fa,
                 int64_t dim,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
+void fused_allreduce_rmsnorm(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             const aiter_tensor_t& res_inp,
+                             const aiter_tensor_t& res_out,
+                             const aiter_tensor_t& out,
+                             const aiter_tensor_t& w,
+                             double eps,
+                             int64_t reg_ptr,
+                             int64_t reg_bytes,
+                             bool use_1stage,
+                             bool gemma_norm);
+void fused_allreduce_rmsnorm_quant(fptr_t _fa,
+                                   const aiter_tensor_t& inp,
+                                   const aiter_tensor_t& res_inp,
+                                   const aiter_tensor_t& res_out,
+                                   const aiter_tensor_t& out,
+                                   const aiter_tensor_t& scale_out,
+                                   const aiter_tensor_t& w,
+                                   double eps,
+                                   int64_t reg_ptr,
+                                   int64_t reg_bytes,
+                                   bool use_1stage,
+                                   bool gemma_norm,
+                                   int64_t bf16_out_ptr);
 void p2p_bw_test(fptr_t _fa,
                   const aiter_tensor_t& inp,
                   const aiter_tensor_t& out,
@@ -69,7 +93,7 @@ void reduce_scatter(fptr_t _fa,
                     int64_t split_dim,
                     int64_t reg_ptr, int64_t reg_bytes);
 void dispose(fptr_t _fa);
-int64_t meta_size();
+int64_t meta_size(int64_t world_size);
 // register_input/output_buffer receive direct device pointers per rank.
 void register_input_buffer(fptr_t _fa,
                            int64_t self_ptr,
