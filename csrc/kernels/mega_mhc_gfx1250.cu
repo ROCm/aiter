@@ -201,29 +201,34 @@ __device__ __host__ constexpr int row_offset(int r)
     return r * C::KC + r / C::PAD_ROWS * PAD;
 }
 
-// MXFP8 output of the normalized rows. Codes are [T][H] E4M3. E8M0 scales use
-// the gfx1250 MXFP8 GEMM A-scale layout (m32k4, the bytes of
+// MXFP8 output of the normalized rows. Codes are [T][H] E4M3. By default E8M0
+// scales use the gfx1250 MXFP8 GEMM A-scale layout (m32k4, the bytes of
 // aiter.ops.shuffle.shuffle_mxfp8fp4_scale): byte (m / 32) * H + (g / 4) * 128
 // + (m % 32) * 4 + g % 4 for global row m and group32 g. Rows from T up to a
-// multiple of 32 hold 0x7F (2^0). Four adjacent lanes hold the eight-column
-// vectors of one group; a 16-lane row holds the four groups of a 128-column
-// block when the columns start at a multiple of 128.
+// multiple of 32 hold 0x7F (2^0). With row_major they are [T][H / 32], byte
+// m * (H / 32) + g, as on gfx950, with no padding rows. Four adjacent lanes
+// hold the eight-column vectors of one group; a 16-lane row holds the four
+// groups of a 128-column block when the columns start at a multiple of 128.
 struct Mxfp8Out
 {
     using codes_t = opus::vector_t<unsigned, 2>;
     opus::gmem<uint8_t> codes, scales;
     int tokens, hidden;
+    bool row_major;
 
-    __device__ Mxfp8Out(uint8_t* q, uint8_t* e, int tokens_, int hidden_)
+    __device__ Mxfp8Out(uint8_t* q, uint8_t* e, int tokens_, int hidden_, bool row_major_)
         : codes(opus::make_gmem<uint8_t>(q, tokens_ * hidden_)),
-          scales(opus::make_gmem<uint8_t>(e, (tokens_ + 31) / 32 * 32 * (hidden_ / 32))),
+          scales(opus::make_gmem<uint8_t>(
+              e, (row_major_ ? tokens_ : (tokens_ + 31) / 32 * 32) * (hidden_ / 32))),
           tokens(tokens_),
-          hidden(hidden_)
+          hidden(hidden_),
+          row_major(row_major_)
     {
     }
     __device__ int scale_byte(int m, int g) const
     {
-        return (m / 32) * hidden + (g / 4) * 128 + (m % 32) * 4 + g % 4;
+        return row_major ? m * (hidden / 32) + g
+                         : (m / 32) * hidden + (g / 4) * 128 + (m % 32) * 4 + g % 4;
     }
     // Exponent byte of a group from each lane's maximum unrounded magnitude:
     // ceil_pow2(amax / 448) of the rounded BF16 norm, as in the gfx950 kernels
@@ -267,22 +272,38 @@ struct Mxfp8Out
             (odd ? valid1 : valid0) ? (m + odd) * hidden + col - odd * 8 : DEAD8);
     }
     // Exponents e[0..3] of rows m + [0, 4) of group g; rows with valid[u]
-    // false hold the padding value. Packed: lane c % 16 == 0 gathers lanes +4, +8, +12
-    // into one 16-byte store. Otherwise the first lane of each group stores
-    // its bytes.
+    // false hold the padding value. Packed: lane c % 16 == 0 gathers lanes +4, +8, +12,
+    // groups g..g + 3, into one 16-byte m32k4 store, or with row_major one
+    // 4-byte store per valid row (H % 128 == 0 keeps it aligned). Otherwise the
+    // first lane of each group stores its bytes.
     __device__ void store_scales(const int* e, const bool* valid, int c, int m, int g, bool packed)
     {
+        auto gather = [](int v) {
+            return static_cast<unsigned>(v) | __builtin_amdgcn_mov_dpp(v, 0x104, 15, 15, false) << 8 |
+                   __builtin_amdgcn_mov_dpp(v, 0x108, 15, 15, false) << 16 |
+                   __builtin_amdgcn_mov_dpp(v, 0x10c, 15, 15, false) << 24;
+        };
+        if(packed && row_major)
+        {
+            // Each row's word is built and stored on its own: an element of a
+            // packed vector passed through store_vector_nbytes stored row m's
+            // word for all four rows.
+#pragma unroll
+            for(int u = 0; u < 4; ++u)
+            {
+                const opus::vector_t<uint8_t, 4> word =
+                    __builtin_bit_cast(opus::vector_t<uint8_t, 4>, gather(e[u]));
+                store_vector_nbytes<uint8_t, uint8_t, 4, 4>(
+                    scales, word, c % 16 == 0 && valid[u] ? scale_byte(m + u, g) : DEAD8);
+            }
+            return;
+        }
         if(packed)
         {
             opus::vector_t<unsigned, 4> chunk;
 #pragma unroll
             for(int u = 0; u < 4; ++u)
-            {
-                const int v = valid[u] ? e[u] : 0x7F;
-                chunk[u]    = v | __builtin_amdgcn_mov_dpp(v, 0x104, 15, 15, false) << 8 |
-                           __builtin_amdgcn_mov_dpp(v, 0x108, 15, 15, false) << 16 |
-                           __builtin_amdgcn_mov_dpp(v, 0x10c, 15, 15, false) << 24;
-            }
+                chunk[u] = gather(valid[u] ? e[u] : 0x7F);
             store_vector_nbytes<uint8_t, uint8_t, 16, 16>(
                 scales,
                 __builtin_bit_cast(opus::vector_t<uint8_t, 16>, chunk),
@@ -299,9 +320,11 @@ struct Mxfp8Out
         }
     }
     // Threads i0, i0 + stride, ... set the padding rows of groups
-    // [g0, g0 + groups).
+    // [g0, g0 + groups). The row-major layout has none.
     __device__ void fill_padding(int g0, int groups, int i0, int stride)
     {
+        if(row_major)
+            return;
         const int pad = ((tokens + 31) / 32 * 32 - tokens) * groups;
         for(int i = i0; i < pad; i += stride)
         {
@@ -362,7 +385,8 @@ __device__ __forceinline__ void tiles(char* smem,
                                       int res_row0,
                                       int res_rows,
                                       uint8_t* quant_out,
-                                      uint8_t* quant_scale)
+                                      uint8_t* quant_scale,
+                                      bool scale_row_major)
 {
 #if defined(__gfx1250__)
     constexpr int WAVES = C::WAVES, THREADS = C::THREADS, KC = C::KC, STAGES = C::STAGES;
@@ -964,7 +988,7 @@ __device__ __forceinline__ void tiles(char* smem,
         __syncthreads();
     };
 
-    Mxfp8Out quant(quant_out, quant_scale, res_rows, hidden);
+    Mxfp8Out quant(quant_out, quant_scale, res_rows, hidden, scale_row_major);
     // Threads [t0, t0 + nthr) normalize columns [col0, col0 + ncols) of every
     // tile row. The collapse comes from LDS (staged column lds0) or layer_input.
     // A thread takes units of U rows of one 8-column vector, so it reads the
@@ -1295,7 +1319,8 @@ __global__ __launch_bounds__(C::THREADS, 1) void mega_mhc_kernel(const bf16* res
                                                                  int sinkhorn_repeat,
                                                                  int tail_token0,
                                                                  uint8_t* quant_out,
-                                                                 uint8_t* quant_scale)
+                                                                 uint8_t* quant_scale,
+                                                                 bool scale_row_major)
 {
 #if defined(__gfx1250__)
     using T = std::conditional_t<std::is_void_v<TAIL>, C, TAIL>;
@@ -1337,7 +1362,8 @@ __global__ __launch_bounds__(C::THREADS, 1) void mega_mhc_kernel(const bf16* res
                                                 0,
                                                 tokens,
                                                 quant_out,
-                                                quant_scale);
+                                                quant_scale,
+                                                scale_row_major);
     }
     else if constexpr(!std::is_void_v<TAIL>)
     {
@@ -1374,7 +1400,8 @@ __global__ __launch_bounds__(C::THREADS, 1) void mega_mhc_kernel(const bf16* res
             static_cast<int>(first),
             tokens,
             quant_out,
-            quant_scale);
+            quant_scale,
+            scale_row_major);
     }
 #endif
 }
@@ -1426,7 +1453,8 @@ void launch(int body_blocks,
             bool identity_pre,
             aiter_tensor_t& quant_out,
             aiter_tensor_t& quant_scale,
-            bool mxfp8)
+            bool mxfp8,
+            bool scale_row_major)
 {
     constexpr int H = C::H;
     AITER_CHECK(residual.is_gpu() && residual.dim() == 3 && residual.size(1) == 4,
@@ -1458,8 +1486,11 @@ void launch(int body_blocks,
     {
         AITER_CHECK(h % 128 == 0, "Mega-MHC mxfp8 on gfx1250 needs H divisible by 128");
         check_tensor(quant_out, residual, AITER_DTYPE_fp8, t * h, "quant_out");
-        check_tensor(
-            quant_scale, residual, AITER_DTYPE_u8, (t + 31) / 32 * 32 * (h / 32), "quant_scale");
+        check_tensor(quant_scale,
+                     residual,
+                     AITER_DTYPE_u8,
+                     (scale_row_major ? t : (t + 31) / 32 * 32) * (h / 32),
+                     "quant_scale");
     }
     if(has_post)
     {
@@ -1532,7 +1563,8 @@ void launch(int body_blocks,
                                           sinkhorn_repeat,                                   \
                                           tail_token0,                                       \
                                           static_cast<uint8_t*>(quant_out.data_ptr()),       \
-                                          static_cast<uint8_t*>(quant_scale.data_ptr()))
+                                          static_cast<uint8_t*>(quant_scale.data_ptr()),     \
+                                          scale_row_major)
 #define DISPATCH(MX)                  \
     if(has_post)                      \
     {                                 \
@@ -1593,7 +1625,8 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
                       bool res_preshuffle,
                       aiter_tensor_t& quant_out,
                       aiter_tensor_t& quant_scale,
-                      bool mxfp8)
+                      bool mxfp8,
+                      bool scale_row_major)
 {
     using namespace gfx1250_mhc;
     auto run = [&]<class C, class TAIL = void, bool COMPACT = C::PROTO == DISTRIBUTED>(
@@ -1626,7 +1659,8 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
                                  identity_pre,
                                  quant_out,
                                  quant_scale,
-                                 mxfp8);
+                                 mxfp8,
+                                 scale_row_major);
     };
     // A template lambda, so the generic module discards the tuned variants.
     auto select = [&]<int H, bool SHUF>() {

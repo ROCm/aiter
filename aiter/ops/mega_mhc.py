@@ -167,6 +167,7 @@ def _native_launcher(hidden):
         variant: int,
         mxfp8: bool,
         res_preshuffle: bool,
+        scale_row_major: bool,
     ) -> None: ...
 
     launch.__name__ = f"_mega_mhc_stream_{suffix}"
@@ -402,6 +403,7 @@ def mega_mhc(
     w_preshuffle_bf16: bool = False,
     out_dtype: str = "bf16",
     res_preshuffle: bool = False,
+    scale_row_major: bool = False,
 ):
     """Delayed post/pre/RMSNorm seam, returning (R, post, comb, norm, next_pre).
 
@@ -431,6 +433,10 @@ def mega_mhc(
     * gfx1250: (pad32(T), H/32) in the gfx1250 MXFP8 GEMM A-scale layout, that
       is the bytes of aiter.ops.shuffle.shuffle_mxfp8fp4_scale. Padding rows
       hold 0x7F. H must be divisible by 128.
+
+    scale_row_major=True makes gfx1250 write the gfx950 layout, (T, H/32)
+    row-major with no padding rows, for consumers that read row-major A-scales,
+    such as the group32 GEMM with 32x32 weight scales. gfx950 already writes it.
 
     Quantization uses the rounded BF16 norm and group32 power-of-two scales,
     ceil_pow2(max(amax, 1e-10) / 448), matching FlyDSL Mega-MHC. Reinterpret
@@ -521,7 +527,8 @@ def mega_mhc(
         if out_dtype == "mxfp8":
             quant_out = torch.empty((t, h), device=device, dtype=torch.float8_e4m3fn)
             # gfx1250 pads rows to 32 for the m32k4 GEMM A-scale layout.
-            scale_rows = (t + 31) // 32 * 32 if arch == "gfx1250" else t
+            m32k4 = arch == "gfx1250" and not scale_row_major
+            scale_rows = (t + 31) // 32 * 32 if m32k4 else t
             quant_scale = torch.empty(
                 (scale_rows, h // 32), device=device, dtype=torch.uint8
             )
@@ -566,5 +573,6 @@ def mega_mhc(
             _STREAM_VARIANTS.index(variant),
             out_dtype == "mxfp8",
             res_preshuffle,
+            scale_row_major,
         )
     return residual_out, post_out, comb_out, layer_input, next_pre

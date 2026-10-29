@@ -38,5 +38,6 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("identity_pre"),
           py::arg("variant"),
           py::arg("mxfp8"),
-          py::arg("res_preshuffle"));
+          py::arg("res_preshuffle"),
+          py::arg("scale_row_major"));
 }

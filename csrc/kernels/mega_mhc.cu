@@ -2624,7 +2624,8 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    bool identity_pre,
                    int variant,
                    bool mxfp8,
-                   bool res_preshuffle)
+                   bool res_preshuffle,
+                   bool scale_row_major)
 {
     {
         const HipDeviceGuard guard(residual.device_id);
@@ -2659,7 +2660,8 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                              res_preshuffle,
                              quant_out,
                              quant_scale,
-                             mxfp8);
+                             mxfp8,
+                             scale_row_major);
             return;
         }
     }

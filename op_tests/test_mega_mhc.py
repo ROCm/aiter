@@ -149,15 +149,16 @@ def ref_mxfp8(norm):
     return q, (exponent + 127).to(torch.uint8)
 
 
-def check(out, reference):
+def check(out, reference, scale_row_major=False):
     torch.testing.assert_close(out[0], reference[0], rtol=1.6e-2, atol=1e-5)
     norm = out[3]
     if isinstance(norm, tuple):
         norm, q, scale = norm
         assert norm.dtype == torch.bfloat16
         assert q.dtype == torch.float8_e4m3fn and q.shape == norm.shape
-        # gfx1250 writes the m32k4 GEMM A-scale layout with rows padded to 32.
-        m32k4 = get_gfx_runtime() == "gfx1250"
+        # gfx1250 writes the m32k4 GEMM A-scale layout with rows padded to 32,
+        # unless asked for the row-major layout gfx950 always writes.
+        m32k4 = get_gfx_runtime() == "gfx1250" and not scale_row_major
         rows = (norm.shape[0] + 31) // 32 * 32 if m32k4 else norm.shape[0]
         assert scale.dtype == torch.uint8 and scale.shape == (rows, norm.shape[1] // 32)
         assert all(t.is_contiguous() and t.device == norm.device for t in (q, scale))
@@ -214,10 +215,17 @@ class _BenchmarkBackend:
     """Call one backend with its native weights and shared scratch."""
 
     def __init__(
-        self, name, scalar_args, out_dtype="bf16", workspace=None, res_preshuffle=False
+        self,
+        name,
+        scalar_args,
+        out_dtype="bf16",
+        workspace=None,
+        res_preshuffle=False,
+        scale_row_major=False,
     ):
         self.name = name
         self.res_preshuffle = res_preshuffle
+        self.scale_row_major = scale_row_major
         self.backend = backend_function(name)
         self.scalar_args = scalar_args
         self.out_dtype = out_dtype
@@ -241,6 +249,8 @@ class _BenchmarkBackend:
             kw["w_preshuffle_bf16"] = True
             if self.res_preshuffle:
                 kw["res_preshuffle"] = True
+            if self.scale_row_major:
+                kw["scale_row_major"] = True
         if self.name != "triton":
             kw["out_dtype"] = self.out_dtype
         return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
@@ -286,11 +296,13 @@ def benchmark_mega_mhc(
     out_dtype="bf16",
     check_only=False,
     res_preshuffle=False,
+    scale_row_major=False,
 ):
     """Check one M/H/mode/dtype combination and return its backend results.
 
     res_preshuffle passes HIP a shuffled residual (gfx1250); the residual it
     returns is unshuffled outside the timed calls before the checks.
+    scale_row_major asks HIP for row-major MXFP8 scales (affects gfx1250).
     """
     args, kw, reference = case(m, hidden_size, mode, seed)
     result = {"status": "PASS"}
@@ -327,12 +339,15 @@ def benchmark_mega_mhc(
             residual = shuffle_residual(tensors[0]) if shuffled else tensors[0]
             backend_tensors = (residual, fn_packed, *tensors[2:])
             workspace = prepare_mega_mhc(args[0].device, m, hidden_size)
-        caller = _BenchmarkBackend(name, args[4:], out_dtype, workspace, shuffled)
+        row_major = name == "hip" and scale_row_major
+        caller = _BenchmarkBackend(
+            name, args[4:], out_dtype, workspace, shuffled, row_major
+        )
 
-        def check_backend(out, shuffled=shuffled):
+        def check_backend(out, shuffled=shuffled, row_major=row_major):
             if shuffled:
                 out = (unshuffle_residual(out[0]), *out[1:])
-            check(out, reference)
+            check(out, reference, row_major)
 
         out = caller(*backend_tensors)
         check_backend(out)
@@ -405,6 +420,11 @@ def main():
         "--res-preshuffle",
         action="store_true",
         help="HIP reads and returns the ks=32 shuffled residual (gfx1250)",
+    )
+    parser.add_argument(
+        "--scale-row-major",
+        action="store_true",
+        help="HIP writes row-major [T, H/32] MXFP8 scales (gfx1250; gfx950 always)",
     )
     parser.add_argument("--seed", type=int, default=0, help="shared input seed")
     parser.add_argument(
@@ -486,6 +506,7 @@ def main():
                 dtype,
                 args.check_only,
                 args.res_preshuffle,
+                args.scale_row_major,
             )
         )
     columns = ["m", "hidden_size", "mode", "out_dtype"]

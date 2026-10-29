@@ -14,7 +14,8 @@ namespace aiter {
 // Scratch may be reused on the same stream, never concurrently across streams.
 // MXFP8 instantiations also write quant_out (E4M3) and quant_scale (uint8 E8M0
 // bytes); BF16 instantiations ignore them. The rounded BF16 layer_input is kept.
-// gfx950 writes [T, H / 32] scales; gfx1250 writes the m32k4 layout.
+// gfx950 writes [T, H / 32] scales; gfx1250 writes the m32k4 layout, or
+// [T, H / 32] with scale_row_major (gfx950 ignores the flag).
 // variant indexes the tuning table; mxfp8 selects the output instantiation.
 // res_preshuffle (gfx1250 only): residual and residual_out use the
 // mhc_res_shuffle layout with ks=32.
@@ -47,11 +48,13 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    bool identity_pre,
                    int variant,
                    bool mxfp8,
-                   bool res_preshuffle);
+                   bool res_preshuffle,
+                   bool scale_row_major);
 
 // gfx1250 kernels (mega_mhc_gfx1250.cu), reached through mega_mhc_bf16. With mxfp8,
 // quant_out is [T, H] E4M3 and quant_scale holds E8M0 bytes in the gfx1250 MXFP8
-// GEMM A-scale layout (m32k4, [pad32(T), H / 32]).
+// GEMM A-scale layout (m32k4, [pad32(T), H / 32]), or row-major [T, H / 32]
+// with scale_row_major.
 void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
                       aiter_tensor_t& post_out,
                       aiter_tensor_t& comb_out,
@@ -81,5 +84,6 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
                       bool res_preshuffle,
                       aiter_tensor_t& quant_out,
                       aiter_tensor_t& quant_scale,
-                      bool mxfp8);
+                      bool mxfp8,
+                      bool scale_row_major);
 } // namespace aiter
