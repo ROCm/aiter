@@ -514,7 +514,18 @@ def test_paged_attn_per_token_quant(
 
 
 # Archs that have a PA-DECODE config file. Add an arch here when it gets one.
-_ARCHS = ("gfx942", "gfx950", "gfx1250")
+_ARCHS = (
+    "gfx942",
+    "gfx950",
+    "gfx1100",
+    "gfx1101",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+    "gfx1250",
+)
+_TDM_NUM_WARPS = (1, 2, 4, 8)  # the kernel builds warp bases for these only
 _PAGES = (16, 64, 128)
 _MAX_NUM_STAGES = 2  # 3 or more hangs the GPU on gfx1250
 
@@ -537,6 +548,7 @@ def test_pa_decode_config_is_valid(arch):
     config = _config(arch)
     assert config, f"no PA-DECODE config for {arch}"
     for rule in config.get("dispatch", {}).values():
+        assert rule.get("tdm_num_warps") in (None, *_TDM_NUM_WARPS)
         if "split_target_programs" in rule:
             assert {"split_max_partitions", "split_sizes"} <= set(rule)
             # The default size means "do not split".
