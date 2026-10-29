@@ -671,8 +671,32 @@ def case_validation(shape, wt, ctx, S):
         lambda: new_layer(shape, wt, ctx, "ag_rs", 4096, bigm_min_tokens=0),
         "max_local_tokens=4096 without the big-M path",
     )
-    layer = new_layer(shape, wt, ctx, "ag_rs", max_local("ag_rs", shape, wt))
+    expect_raise(
+        lambda: new_layer(
+            shape, wt, ctx, "ag_rs", 64, wait_timeout_ms=0 if ctx.rank == 0 else 2000
+        ),
+        "wait_timeout_ms=0 on rank 0 only",
+    )
+    expect_raise(
+        lambda: new_layer(shape, wt, ctx, "ag_rs", 64, wait_timeout_ms=1000 + ctx.rank),
+        "wait_timeout_ms different on every rank",
+    )
+    expect_raise(
+        lambda: SpRsNorm(
+            shape.model_dim,
+            64 * ctx.world,
+            SPRS_EPS,
+            device=ctx.device,
+            wait_timeout_ms=1000 + ctx.rank,
+        ),
+        "SpRsNorm wait_timeout_ms different on every rank",
+    )
+    # 30 000 ms = 3e9 s_memrealtime ticks, past 2**31: the kernels take it as an int64
+    layer = new_layer(
+        shape, wt, ctx, "ag_rs", max_local("ag_rs", shape, wt), wait_timeout_ms=30_000
+    )
     c = make_case(shape, wt, ctx, "ag_rs", 8 * ctx.world, "random", 5)
+    check(call(layer, c).clone(), c, RTOL, "wait_timeout_ms=30000")
     x, w, ids = c.x, c.w, c.ids
     expect_raise(lambda: layer(x.float(), w, ids), "fp32 hidden states")
     expect_raise(
@@ -708,34 +732,89 @@ def case_checked(shape, wt, ctx, S):
         os.environ.pop("AITER_MEGAMOE_TP_CHECK", None)
 
 
-def _late_call(layer, c: Case, ctx, late_s: float) -> int:
-    """One call that rank 1 enters late_s seconds after the others; the watchdog code
-    (max over ranks)."""
-    layer.clear_errors()
+# "late rank": the wait_timeout_ms of its layers
+LATE_LIMIT_MS = 250
+
+
+def _late_call(run, poll, ctx, late_s: float) -> tuple[int, float]:
+    """run() with rank 1 entering it late_s seconds after the others: the watchdog code
+    (max over ranks) and rank 0's seconds in the call."""
+    dist.barrier()
     if ctx.rank == 1:
         time.sleep(late_s)
-    layer(c.x, c.w, c.ids)
+    t0 = time.perf_counter()
+    run()
     torch.cuda.synchronize()
-    flags = torch.tensor([layer.poll_errors()], device=c.x.device)
-    dist.all_reduce(flags, op=dist.ReduceOp.MAX)
-    return int(flags[0])
+    took = time.perf_counter() - t0 if ctx.rank == 0 else 0.0
+    t = torch.tensor([float(poll()), took], device=ctx.device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return int(t[0]), float(t[1])
+
+
+def _late_rank(what, ctx, run, poll, reset, checked):
+    """Rank 1 half a limit late: no watchdog error. 4 limits late: an error, rank 0 giving
+    up after about one limit (one deadline per launch, not one per wait). 4 limits late
+    again, the error not cleared: rank 0 gives up at once. Then reset() recovers."""
+    limit = LATE_LIMIT_MS / 1000
+    err, _ = _late_call(run, poll, ctx, limit / 2)
+    if err:
+        raise CaseFailure(
+            f"{what}: watchdog error {err} with rank 1 {limit / 2} s late"
+        )
+    for again, bound in ((False, 1.5 * limit), (True, limit / 2)):
+        err, took = _late_call(run, poll, ctx, 4 * limit)
+        if not err or took > bound:
+            raise CaseFailure(
+                f"{what}: rank 1 {4 * limit} s late{' again' if again else ''}: watchdog "
+                f"error {err}, rank 0 in the call {took:.3f} s (want an error within "
+                f"{bound} s; limit {limit} s)"
+            )
+    reset()
+    checked()
+
+
+def _late_rank_layer(shape, wt, ctx, mode):
+    layer = new_layer(
+        shape, wt, ctx, mode, max_local(mode, shape, wt), wait_timeout_ms=LATE_LIMIT_MS
+    )
+    c = make_case(shape, wt, ctx, mode, 8 * ctx.world, "random", 16)
+    check(call(layer, c).clone(), c, RTOL, f"{mode}: call before the late rank")
+    _late_rank(
+        mode,
+        ctx,
+        lambda: layer(c.x, c.w, c.ids),
+        layer.poll_errors,
+        layer.reset,
+        lambda: check(call(layer, c).clone(), c, RTOL, f"{mode}: call after reset()"),
+    )
+    layer.close()
 
 
 def case_late_rank(shape, wt, ctx, S):
-    """Rank 1 enters a call late: within the wait timeout (AITER_MEGAMOE_TP_WAIT_TIMEOUT_MS,
-    default 2 s) the call succeeds, past it the watchdog fires; reset() recovers."""
-    limit = int(os.environ.get("AITER_MEGAMOE_TP_WAIT_TIMEOUT_MS", "2000")) / 1000
-    layer = new_layer(shape, wt, ctx, "ag_rs", max_local("ag_rs", shape, wt))
-    c = make_case(shape, wt, ctx, "ag_rs", 8 * ctx.world, "random", 16)
-    check(call(layer, c).clone(), c, RTOL, "call before the late rank")
-    if _late_call(layer, c, ctx, limit / 2):
-        raise CaseFailure(
-            f"watchdog error with rank 1 {limit / 2} s late (limit {limit} s)"
-        )
-    if not _late_call(layer, c, ctx, limit + 0.5):
-        raise CaseFailure(f"no watchdog error with rank 1 {limit + 0.5} s late")
-    layer.reset()
-    check(call(layer, c).clone(), c, RTOL, "call after reset()")
+    """Rank 1 enters calls late (_late_rank), with wait_timeout_ms=LATE_LIMIT_MS: both
+    comm modes, then SpRsNorm."""
+    for mode in MODES:
+        _late_rank_layer(shape, wt, ctx, mode)
+    # 4 rows per CTA (one CTA per CU, 256 on MI355X), each a wait on every peer
+    tokens = 1024 * ctx.world
+    op = SpRsNorm(
+        shape.model_dim,
+        tokens,
+        SPRS_EPS,
+        device=ctx.device,
+        wait_timeout_ms=LATE_LIMIT_MS,
+    )
+    inputs = sp_rs_norm_inputs(shape.model_dim, tokens, False, 3000)
+
+    def checked():
+        out, res_out = op(*inputs[:3])
+        torch.cuda.synchronize()
+        check_sp_rs_norm(op, inputs, out, res_out)
+
+    checked()
+    _late_rank(
+        "SpRsNorm", ctx, lambda: op(*inputs[:3]), op.poll_errors, op.reset, checked
+    )
 
 
 # Distributed state lives here, out of the @benchmark signatures, so the summary

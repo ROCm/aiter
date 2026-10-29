@@ -309,8 +309,10 @@ class MegaMoeTPBigM:
         opts=None,
         act="swiglu",
         ygather=False,
+        wait_ticks,
     ):
         self.H, self.I, self.E, self.K = hidden, inter, experts, topk
+        self.wait_ticks = wait_ticks  # the waits' limit (s_memrealtime ticks)
         self.K1, self.NE = topk + 1, experts + 1
         self.tp = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
@@ -612,9 +614,9 @@ class MegaMoeTPBigM:
 
     def _run(self, launch, args):
         if launch not in self._ready:
-            # compile (or load) on every rank first: the kernel's waits on peers have a
-            # watchdog (2 s by default), a launch must not start while a peer is still
-            # compiling
+            # compile (or load) on every rank first: the kernel's waits on peers give up
+            # wait_ticks after the launch starts, a launch must not start while a peer is
+            # still compiling
             _bigm_cached(launch, args)
             torch.cuda.synchronize()
             dist.barrier(group=self.sd.group)
@@ -807,6 +809,7 @@ class MegaMoeTPBigM:
                 self.rank,
                 m,
                 self._ucap(T),
+                self.wait_ticks,
                 self.cu,
                 torch.cuda.current_stream(),
             ),

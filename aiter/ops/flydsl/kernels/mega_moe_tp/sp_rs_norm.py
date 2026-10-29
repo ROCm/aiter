@@ -19,7 +19,6 @@ from ..kernels_common import LOG2E, ceildiv
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .common import (
     AUX_SYS,
-    DEADLINE,
     MAX_TP,
     amax,
     before,
@@ -44,7 +43,7 @@ from .common import (
     uni,
     wave_red,
 )
-from .mega_moe_tp import SymmetricArena
+from .mega_moe_tp import SymmetricArena, wait_timeout_ticks
 
 __all__ = ["SpRsNorm"]
 
@@ -528,6 +527,7 @@ def compile_sp_rs_norm(
         ids: fx.Int64,
         tw: fx.Int64,
         zp: fx.Int64,
+        wait_ticks: fx.Int64,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         lds = fx.SharedAllocator().allocate(Shared).peek()
@@ -561,8 +561,8 @@ def compile_sp_rs_norm(
             "ids": ids,
             "tw": tw,
             "zp": zp,
-            "wait_ticks": fx.Int64(DEADLINE),
-            "wait_end": peer_deadline(ctrl + fx.Int64(ERR * 4), DEADLINE),
+            "wait_ticks": wait_ticks,
+            "wait_end": peer_deadline(ctrl + fx.Int64(ERR * 4), wait_ticks),
         }
         if tid < i32(4):
             lds_st(L, tid * i32(4), i32(0))
@@ -602,6 +602,7 @@ def compile_sp_rs_norm(
         ids: fx.Int64,
         tw: fx.Int64,
         zp: fx.Int64,
+        wait_ticks: fx.Int64,
         stream: fx.Stream,
     ):
         sp_rs_norm_kernel(
@@ -630,6 +631,7 @@ def compile_sp_rs_norm(
             ids,
             tw,
             zp,
+            wait_ticks,
         ).launch(grid=(NB, 1, 1), block=(NTH, 1, 1), stream=stream)
 
     return launch
@@ -642,8 +644,10 @@ class SpRsNorm:
     residual), w: bf16 [H]; out / res_out: bf16 [T, H], rows rank*m:(rank+1)*m written.
     router = (E, topk, scale, shared_w) at construction; forward(router=(wg, bias, ids,
     tw)): wg bf16 [E, H], bias fp32 [E], ids int32 / tw fp32 [>= m, topk + 1] (the last
-    column is the shared expert E). A collective like MegaMoeTP (see its contract): a wait
-    that times out sets error_flag(); reset() (collective) restarts the state.
+    column is the shared expert E). A collective like MegaMoeTP (see its contract): the
+    waits on peer ranks give up wait_timeout_ms (the same on every rank) after a launch
+    starts, which sets error_flag(); later launches skip those waits until reset()
+    (collective) restarts the state.
     """
 
     def __init__(
@@ -656,6 +660,7 @@ class SpRsNorm:
         router=None,
         gemma: bool = True,
         logit_bf16: bool = True,
+        wait_timeout_ms: int = 2000,
     ):
         device = torch.device(device if device is not None else "cuda")
         if device.index is None:
@@ -683,6 +688,7 @@ class SpRsNorm:
             bad.append("router experts in (128, 256) and 0 < topk < 64")
         if bad:
             raise ValueError(f"SpRsNorm h{self.H} tp{self.tp}: need " + ", ".join(bad))
+        self._wait_ticks = wait_timeout_ticks(wait_timeout_ms, group)
         self._xbank = self.tp * mmax * self.H
         arena = SymmetricArena(group=group, device=device)
         self._x = arena.reserve("x", (2 * self._xbank,), torch.uint8)
@@ -793,6 +799,7 @@ class SpRsNorm:
             m,
             *rt,
             self._zp.data_ptr(),
+            self._wait_ticks,
         )
         if fn not in self._armed:
             if torch.cuda.is_current_stream_capturing():

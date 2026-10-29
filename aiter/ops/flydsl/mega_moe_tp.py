@@ -18,11 +18,13 @@ Contract:
 * The kernel is persistent (one CTA per CU, CTAs and ranks spin on each other): it
   needs the whole GPU. Do not run it concurrently with other kernels (other streams,
   other processes, CU-masked / partitioned GPUs).
-* A wait that times out (2 s; ``AITER_MEGAMOE_TP_WAIT_TIMEOUT_MS``, read at import) sets a
-  sticky bit and the launch's output is invalid. ``error_flag()`` is that bit as a device
-  tensor (copy it asynchronously, e.g. every N steps); ``check_errors()`` synchronizes and
-  raises; ``reset()`` (collective) restarts the cross-rank state, which a timed-out launch
-  leaves inconsistent.
+* A launch's waits on peer ranks give up ``wait_timeout_ms`` (2 s by default) after it
+  starts: a timeout sets a sticky bit and the launch's output is invalid. ``error_flag()``
+  is that bit as a device tensor (copy it asynchronously, e.g. every N steps);
+  ``check_errors()`` synchronizes and raises; ``reset()`` (collective) restarts the
+  cross-rank state, which a timed-out launch leaves inconsistent. While the bit is set,
+  later launches skip their waits on peers (their outputs are invalid too); clearing it
+  without ``reset()`` leaves the ranks out of step.
 * The returned tensors (``out=None``, ar outputs, the fused tail's rows) are views of
   internal buffers, valid until the next forward of this instance; pass ``out=`` to keep
   the output.
@@ -133,6 +135,10 @@ class MegaMoeTPConfig:
     # max_local_tokens is an upper bound: without a big-M path, lowered to what the small
     # engine holds (MegaMoeTP.max_local_tokens) instead of raising
     fit_max_local: bool = False
+    # how long a launch's waits on peer ranks may take, in ms from the launch's start: it
+    # must cover how late a peer can reach the launch plus the launch's own run time; the
+    # same on every rank (checked at construction)
+    wait_timeout_ms: int = 2000
 
 
 class MegaMoeTP:
@@ -229,6 +235,7 @@ class MegaMoeTP:
             group=group,
             device=device,
             fit_max_local=fit,
+            wait_timeout_ms=cfg.wait_timeout_ms,
         )
         if big_ok and bmin is None and self.engine.mmax < cfg.max_local_tokens:
             self.bigm_m = self.engine.mmax + 1
@@ -352,6 +359,7 @@ class MegaMoeTP:
                 ygather=cfg.comm_mode == "ar",
                 # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 otherwise)
                 opts={"AITER_BIGM_R8": "0"} if cfg.comm_dtype == "bf16" else None,
+                wait_ticks=self.engine.wait_ticks,
             )
         return self._bigm
 
