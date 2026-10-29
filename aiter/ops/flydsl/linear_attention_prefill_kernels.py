@@ -317,6 +317,10 @@ _DENSE_K5_OFFSETS = OrderedDict()
 # margin and bounds scratch. Blocked loses on balanced two-sequence splits
 # under ~96 chunks ([4064,4065], [3000,5129]), wins from 97.
 _BLOCKED_MIN_CHUNKS = 96
+# Floor on per-sequence block size: keeps short sequences in a mixed batch from
+# fragmenting into many tiny blocks, so each sequence's partition depends only on
+# its own length.
+_BLOCKED_MIN_BLOCK_CHUNKS = 12
 _BLOCKED_MAX_WORK_PER_CHUNK = 6
 
 
@@ -467,7 +471,10 @@ def _resolve_adaptive_k5_metadata(
     if lengths is None:
         lengths = _gdn_k5_sequence_lengths(cu_seqlens, T)
     block_chunks_per_seq = [
-        max(1, triton.cdiv(triton.cdiv(length, 64), target_segments))
+        max(
+            _BLOCKED_MIN_BLOCK_CHUNKS,
+            triton.cdiv(triton.cdiv(length, 64), target_segments),
+        )
         for length in lengths
     ]
     metadata = None
