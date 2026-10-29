@@ -35,8 +35,8 @@ backend does: sparse_gqa_fwd_interface_triton when no request has a prefix,
 else sparse_gqa_fwd_interface_triton_ck over the packed full-context K/V.
 
 Usage:
-    python op_tests/test_flydsl_qsa_attention.py
-    python op_tests/test_flydsl_qsa_attention.py -c prefill_12000 -g 12 6 3
+    python op_tests/test_flydsl_qsa_sparse_prefill.py
+    python op_tests/test_flydsl_qsa_sparse_prefill.py -c prefill_12000 -g 12 6 3
 """
 
 import argparse
@@ -53,8 +53,8 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.qsa import attention as qsa_attention
-from aiter.ops.flydsl.kernels.qsa.attention import qsa_sparse_attention_flydsl
+from aiter.ops.flydsl import qsa_sparse_prefill as flydsl_prefill
+from aiter.ops.qsa import qsa_sparse_prefill
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -588,7 +588,7 @@ def test_qsa_sparse_attention(case, heads):
     # Both run as the SGLang QSA backend calls them; each allocates its output.
     candidates = {
         "flydsl": (
-            qsa_sparse_attention_flydsl,
+            qsa_sparse_prefill,
             (q, k, v, indices),
             {
                 "query_lens": query_lens,
@@ -657,9 +657,9 @@ def test_qsa_graph_replay(case, heads):
     stream, graph = torch.cuda.Stream(), torch.cuda.CUDAGraph()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        qsa_sparse_attention_flydsl(q, k, v, indices, out=out, **kwargs)
+        qsa_sparse_prefill(q, k, v, indices, out=out, **kwargs)
         with torch.cuda.graph(graph, stream=stream):
-            qsa_sparse_attention_flydsl(q, k, v, indices, out=out, **kwargs)
+            qsa_sparse_prefill(q, k, v, indices, out=out, **kwargs)
 
     def replay(selected, label):
         with torch.cuda.stream(stream):
@@ -676,11 +676,11 @@ def test_qsa_graph_replay(case, heads):
         )
 
     errors = [replay(second, "replay")]
-    arena = qsa_attention._arenas[(q.device, stream.cuda_stream)]
+    arena = flydsl_prefill._arenas[(q.device, stream.cuda_stream)]
     generation, scratch = arena.generation, [b.data_ptr() for b in arena.buffers]
     growth_lens, growth_prefix = CASES[growth][:2]
     with torch.cuda.stream(stream):
-        qsa_sparse_attention_flydsl(
+        qsa_sparse_prefill(
             *make_inputs(growth, heads, generator),
             query_lens=growth_lens,
             prefix_lens=growth_prefix,
@@ -703,7 +703,7 @@ def test_qsa_graph_replay(case, heads):
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "qsa_sparse_attention_flydsl unsupported on %s; skipping", get_gfx()
+            "qsa_sparse_prefill unsupported on %s; skipping", get_gfx()
         )
         return
 
@@ -743,7 +743,7 @@ def main():
             for case, group in itertools.product(selected, args.group)
         ]
         aiter.logger.info(
-            "qsa_sparse_attention_flydsl %s summary (markdown):\n%s",
+            "qsa_sparse_prefill %s summary (markdown):\n%s",
             suite,
             pd.DataFrame(df).to_markdown(index=False),
         )

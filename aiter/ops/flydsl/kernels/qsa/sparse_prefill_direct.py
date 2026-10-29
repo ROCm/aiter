@@ -29,8 +29,8 @@ import numpy as np
 import torch
 from flydsl.expr import rocdl
 
-from . import attention_direct_packed as packed
-from .attention_common import (
+from . import sparse_prefill_direct_packed as packed
+from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
     _buffer_words,
@@ -45,8 +45,8 @@ from .attention_common import (
     _uniform,
     platform,
 )
-from .attention_direct_packed import _enabled, _load, _output
-from .attention_prepare import allocate_scratch, upload
+from .sparse_prefill_direct_packed import _enabled, _load, _output
+from .sparse_prefill_prepare import allocate_scratch, upload
 
 
 def _load_key(resource, offset, lane):
@@ -455,7 +455,7 @@ def _body(
     )
 
 
-@flyc.kernel(name="attention_direct_bf16_d256")
+@flyc.kernel(name="sparse_prefill_direct_bf16_d256")
 def _kernel(
     Q: fx.Tensor,
     K: fx.Tensor,

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""One-call gfx942 BF16 D256 QSA sparse attention; plans and scratch are private.
+"""QSA sparse prefill on gfx942: BF16 D256 sparse attention over packed K/V.
 
-Each call recovers the selected four-token blocks (FlyDSL K1-K3),
-routes every query tile to the FlyDSL union kernel (queries of a tile share one
-compact block list with exact per-query membership) or to the FlyDSL direct
-kernel (one query per wave over its own blocks), and writes O in place.
+Public entry for the ``sparse_prefill_*`` kernels in ``kernels/qsa/``. Each call
+recovers the selected four-token blocks (FlyDSL K1-K3), routes every query tile to
+the union kernel (queries of a tile share one compact block list with exact
+per-query membership) or to the direct kernel (one query per wave over its own
+blocks), and writes O in place. Plans and scratch are private.
 """
 
 import math
@@ -19,10 +20,10 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from . import attention_direct as direct
-from . import attention_prepare as prepare
-from . import attention_union as union
-from .attention_common import (
+from .kernels.qsa import sparse_prefill_direct as direct
+from .kernels.qsa import sparse_prefill_prepare as prepare
+from .kernels.qsa import sparse_prefill_union as union
+from .kernels.qsa.sparse_prefill_common import (
     ARENA_GROWTH_PERCENT,
     SCRATCH_ALIGN,
     UNION_SCRATCH_LIMIT,
@@ -30,7 +31,7 @@ from .attention_common import (
     platform,
 )
 
-__all__ = ["qsa_sparse_attention_flydsl"]
+__all__ = ["flydsl_qsa_sparse_prefill"]
 
 # Kernels use unsigned 32-bit buffer byte offsets; the 1 MiB margin keeps out-of-range
 # sentinels plus their lane offsets from wrapping.
@@ -207,7 +208,7 @@ _lock = threading.RLock()
 _device = None
 
 
-def qsa_sparse_attention_flydsl(
+def flydsl_qsa_sparse_prefill(
     q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=None, out=None
 ):
     """Return QSA sparse attention for BF16 Q[M,H,256] and K/V[N,HK,256].

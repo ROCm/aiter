@@ -24,7 +24,7 @@ from flydsl.expr import rocdl
 
 from aiter.jit.utils.chip_info import get_cu_num
 
-from .attention_common import _buffer, _buffer_words, _min, _uniform, platform
+from .sparse_prefill_common import _buffer, _buffer_words, _min, _uniform, platform
 
 THREADS = 256
 INT_MAX = 2**31 - 1
@@ -239,7 +239,7 @@ def _recover_row(
                 fx.atomic_or(dense + (visible >> 2), bit, syncscope="agent")
 
 
-@flyc.kernel(name="qsa_recover_scatter", known_block_size=[THREADS, 1, 1])
+@flyc.kernel(name="sparse_prefill_recover_scatter", known_block_size=[THREADS, 1, 1])
 def _recover_kernel(
     INDICES: fx.Tensor,
     POSITIONS: fx.Tensor,
@@ -311,7 +311,7 @@ def _recover_launch(
         ).launch(grid=((ROWS + 3) // 4, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
-@flyc.kernel(name="qsa_compact", known_block_size=[THREADS, 1, 1])
+@flyc.kernel(name="sparse_prefill_compact", known_block_size=[THREADS, 1, 1])
 def _compact_kernel(
     DENSE: fx.Tensor,
     BLOCKS: fx.Tensor,
@@ -664,7 +664,7 @@ def _masks(
                     MASKS[masks + query * 4] = fx.Int16(bits)
 
 
-@flyc.kernel(name="qsa_order_masks", known_block_size=[THREADS, 1, 1])
+@flyc.kernel(name="sparse_prefill_order_masks", known_block_size=[THREADS, 1, 1])
 def _order_masks_kernel(
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,

@@ -3,7 +3,7 @@
 """gfx942 D256 multi-query/multi-head QSA sparse attention with exact membership.
 
 The LDS, QK/PV MFMA and staggered pipeline come from a dense BM128/BN64 D256
-attention kernel (see attention_common). Q/O rows and sparse masks differ.
+attention kernel (see sparse_prefill_common). Q/O rows and sparse masks differ.
 """
 
 import math
@@ -13,7 +13,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import rocdl
 
-from .attention_common import (
+from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
     _buffer_words,
@@ -552,7 +552,7 @@ def _body(
     _stage_end()
 
 
-@flyc.kernel(name="attention_union_bf16_d256", known_block_size=[THREADS, 1, 1])
+@flyc.kernel(name="sparse_prefill_union_bf16_d256", known_block_size=[THREADS, 1, 1])
 def _kernel(
     Q: fx.Tensor,
     K: fx.Tensor,

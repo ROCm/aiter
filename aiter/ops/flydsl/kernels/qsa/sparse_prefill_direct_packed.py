@@ -13,7 +13,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import rocdl
 
-from .attention_common import (
+from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
     _buffer_store_words,
@@ -190,7 +190,7 @@ def _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK):
         )
 
 
-@flyc.kernel(name="attention_pack_kv_bf16_d256")
+@flyc.kernel(name="sparse_prefill_pack_kv_bf16_d256")
 def _pack(
     K: fx.Tensor,
     V: fx.Tensor,
@@ -204,7 +204,7 @@ def _pack(
     _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK)
 
 
-@flyc.kernel(name="attention_pack_kv_bf16_d256")
+@flyc.kernel(name="sparse_prefill_pack_kv_gated_bf16_d256")
 def _pack_gated(
     K: fx.Tensor,
     V: fx.Tensor,
@@ -530,7 +530,7 @@ def _body(
     )
 
 
-@flyc.kernel(name="attention_direct_bf16_d256")
+@flyc.kernel(name="sparse_prefill_direct_packed_bf16_d256")
 def _kernel(
     Q: fx.Tensor,
     K: fx.Tensor,
