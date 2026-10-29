@@ -1396,14 +1396,14 @@ def test_route_workspace_token_capacity():
 def test_presorted_moe_hook():
     """register_presorted_moe() lets a caller's BM=16 route+sort replace fused_moe's.
 
-    Kimi-K3 A4W4 TP=8 decode (BM=16 aux sort). test_fmoe runs each batch with
-    fused_moe's own sort (moe_sorting) and with a presort built once per routing
-    and registered before every fused_moe call (presorted), both against the
-    torch reference; the presorted run must never reach moe_sorting. A third
-    candidate (presorted output=) times the call as SGLang makes it, with a
-    caller-zeroed output, and is checked element-wise against the own sort at
-    every batch. The summary table has one row per batch and us/TFLOPS/TB/s/err
-    columns per candidate. Then the contract: a reused-address moe_buf is zeroed,
+    Kimi-K3 A4W4 TP=8 decode (BM=16 aux sort). test_fmoe checks each batch with
+    fused_moe's own sort (moe_sorting) and with a registered presort (presorted)
+    against the torch reference; the presorted run must never reach moe_sorting.
+    The timed candidates (moe_sorting, presorted, and presorted output=, which
+    passes a caller-zeroed output as SGLang does) share one routing whose presort
+    is built beforehand, so only fused_moe is timed, and both presorted calls are
+    checked element-wise against the own sort at every batch. The summary table
+    has one row per batch and us/TFLOPS/TB/s/err columns per candidate. Then the contract: a reused-address moe_buf is zeroed,
     an underaligned output is copied back, and a registration that does not match
     the call is ignored and still consumed, so it never leaks into a later call,
     even when fused_moe exits before sorting.
@@ -1442,16 +1442,10 @@ def test_presorted_moe_hook():
         sort_calls.append(1)
         return real_sorting(*a, **kw)
 
-    # The caller's router emits the sort once per routing, before fused_moe, so
-    # the presort is built on the first call (test_fmoe's untimed warmup) and only
-    # registered on the timed ones.
-    presorts = {}
-
+    # Accuracy only: test_fmoe times rotated copies of its inputs, so the presort
+    # is built inside each call here and test_fmoe's timings are not used.
     def presorted_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kw):
-        key = (topk_ids.data_ptr(), topk_weights.data_ptr())
-        if key not in presorts:
-            presorts[key] = presort(topk_ids, topk_weights)
-        fm.register_presorted_moe(presorts[key])
+        fm.register_presorted_moe(presort(topk_ids, topk_weights))
         return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kw)
 
     torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
@@ -1500,11 +1494,27 @@ def test_presorted_moe_hook():
         diff = calc_diff(ref, out)
         assert diff < 1e-4, f"{what}: diff {diff}"
 
+    # The timed calls. As SGLang makes them, the router's sort (and its zeroing
+    # of the output fused_moe accumulates into) runs before fused_moe, so neither
+    # is timed; a caller-zeroed buffer just accumulates across the timed calls.
+    def own_sort(aux, hidden, topk_weights, topk_ids, buf):
+        return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+
+    def presorted(aux, hidden, topk_weights, topk_ids, buf):
+        fm.register_presorted_moe(aux)
+        return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+
     def caller_zeroed(aux, hidden, topk_weights, topk_ids, buf):
         fm.register_presorted_moe(aux)
         return real_fused_moe(
             hidden, w1, w2, topk_weights, topk_ids, output=buf, **kwargs
         )
+
+    timed = {
+        "moe_sorting": own_sort,
+        "presorted": presorted,
+        "presorted output=": caller_zeroed,
+    }
 
     candidates = {"moe_sorting": real_fused_moe, "presorted": presorted_fused_moe}
     rows = []
@@ -1533,7 +1543,6 @@ def test_presorted_moe_hook():
                     # test_fmoe calls this module's fused_moe.
                     fused_moe = fn
                     sort_calls.clear()
-                    presorts.clear()
                     torch.manual_seed(token)
                     ret = test_fmoe(
                         dtype=dtype,
@@ -1555,10 +1564,6 @@ def test_presorted_moe_hook():
                         assert not sort_calls, f"token={token}: presort unused"
                     else:
                         assert sort_calls, f"token={token}: BM=16 aux path did not sort"
-                    us = ret["us"]
-                    row[f"{name} us"] = us
-                    row[f"{name} TFLOPS"] = flops / us / 1e6
-                    row[f"{name} TB/s"] = nbytes / us / 1e6
                     # test_fmoe compares with the torch reference and fails when
                     # checkAllclose misses and logits_diff (1 - cosine similarity,
                     # recorded as err) exceeds 0.01.
@@ -1566,26 +1571,37 @@ def test_presorted_moe_hook():
                     gc.collect()
                     torch.cuda.empty_cache()
 
-                # As SGLang calls it: the router's sort and its zeroing of the
-                # output fused_moe accumulates into both run before fused_moe, so
-                # neither is timed; the buffer only accumulates across the timed
-                # calls. A fresh call is checked element-wise against fused_moe's
-                # own sort, which test_fmoe checked against the torch reference.
-                name = "presorted output="
+                # On these inputs both presorted calls must match fused_moe's own
+                # sort element-wise (a differential check; test_fmoe above is the
+                # torch-reference one, on its own inputs).
                 hidden, topk_weights, topk_ids = route(token)
-                own = real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
                 buf = torch.zeros((token, model_dim), dtype=dtype)
-                aux = presort(topk_ids, topk_weights, moe_buf=buf)
-                args = (aux, hidden, topk_weights, topk_ids, buf)
+                own = own_sort(None, hidden, topk_weights, topk_ids, buf)
                 sort_calls.clear()
-                out = caller_zeroed(*args)
-                assert out is buf and not sort_calls, f"token={token}: presort unused"
-                check_close(own, out, f"token={token} {name}")
-                row[f"{name} err"] = calc_diff(own, out)
-                _, us = run_perftest(caller_zeroed, *args)
-                row[f"{name} us"] = us
-                row[f"{name} TFLOPS"] = flops / us / 1e6
-                row[f"{name} TB/s"] = nbytes / us / 1e6
+                aux = presort(topk_ids, topk_weights)
+                out = presorted(aux, hidden, topk_weights, topk_ids, buf)
+                check_close(own, out, f"token={token} presorted")
+                aux_zeroed = presort(topk_ids, topk_weights, moe_buf=buf)
+                out = caller_zeroed(aux_zeroed, hidden, topk_weights, topk_ids, buf)
+                assert out is buf, f"token={token}: caller output not used"
+                check_close(own, out, f"token={token} presorted output=")
+                row["presorted output= err"] = calc_diff(own, out)
+                # num_rotate_args=1: run_perftest otherwise times deep copies of
+                # its tensor arguments, whose topk_ids no longer match the
+                # registered presort, so the call would fall back to moe_sorting.
+                for name, fn in timed.items():
+                    reg = aux_zeroed if name == "presorted output=" else aux
+                    sort_calls.clear()
+                    _, us = run_perftest(
+                        fn, reg, hidden, topk_weights, topk_ids, buf, num_rotate_args=1
+                    )
+                    sorted_ = bool(sort_calls)
+                    assert sorted_ == (
+                        name == "moe_sorting"
+                    ), f"token={token}: {name} timed with moe_sorting={sorted_}"
+                    row[f"{name} us"] = us
+                    row[f"{name} TFLOPS"] = flops / us / 1e6
+                    row[f"{name} TB/s"] = nbytes / us / 1e6
                 rows.append(row)
     finally:
         fused_moe = real_fused_moe
