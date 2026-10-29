@@ -164,6 +164,7 @@ def _build_mesh(
     h_pad=None,
     mxfp4=False,
     low_latency=False,
+    attn_res=None,
 ):
     if rs_codec != ag_codec:
         raise ValueError(
@@ -183,6 +184,7 @@ def _build_mesh(
         h_pad=h_pad,
         mxfp4=mxfp4,
         low_latency=low_latency,
+        attn_res=attn_res,
     )
 
 
