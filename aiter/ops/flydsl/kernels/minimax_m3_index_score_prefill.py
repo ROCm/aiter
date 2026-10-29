@@ -33,7 +33,7 @@ An MXFP4 index cache (e2m1 pages plus one e8m0 byte per 32 elements, passed as
 `score_prefill_flydsl(..., k_scale=...)`) is read natively by the same builder
 (`k_fp4`): the page stays MXFP4 through LDS and is fed to the scaled MFMA as the fp4
 A operand with the e8m0 byte as block scale; the e4m3 Q option (`q_fp8`) belongs to
-that path. Layout and contract: `minimax_m3_index_score_fp4_cache`.
+that path. Layout and contract: `_validate_cache`.
 
 Layout contract: this kernel and the decode scorer read the SAME cache and so
 must agree on the k-axis map. The shape constants come from that module rather
@@ -75,17 +75,16 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     _validate_tensor,
     bf16_dwords_to_fp8,
 )
-from aiter.ops.flydsl.kernels.minimax_m3_index_score_fp4_cache import (
-    DATA_BYTES,
-    SCALE_BYTES,
-    _validate_cache,
-)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_copy_atom,
     ptr_arg,
     ptr_buf_tensor,
 )
+
+# MXFP4 index-cache layout, per token: packed e2m1 bytes and e8m0 scale bytes.
+DATA_BYTES = HEAD_DIM // 2
+SCALE_BYTES = HEAD_DIM // 32
 
 # Query rows one CTA scores. The tunable this kernel exists for; see the header
 # for why it is the dial onto arithmetic intensity and what bounds it.
@@ -1558,6 +1557,40 @@ def alloc_score(total_q: int, heads: int, max_block: int, device):
     )
 
 
+def _validate_cache(k_data, k_scale, device):
+    """Shapes, dtypes and strides of the two MXFP4 views. Contents (block ids inside
+    the pool, e8m0 not 0/255) are a caller contract."""
+    import torch
+
+    _validate_tensor(k_data, "k_data", (torch.uint8,), 3, device, 16, False)
+    _validate_tensor(k_scale, "k_scale", (torch.uint8,), 3, device, 4, False)
+    if k_data.shape[1:] != (PAGE, DATA_BYTES) or k_data.shape[0] > 0x7FFFFFFF:
+        raise ValueError("k_data: expected [pages, 128, 64] uint8 with int32 page IDs")
+    if k_scale.shape != (k_data.shape[0], PAGE, SCALE_BYTES):
+        raise ValueError(
+            "k_scale: expected [pages, 128, 4] uint8, same pages as k_data"
+        )
+    if k_data.stride(1) != DATA_BYTES or k_data.stride(2) != 1:
+        raise ValueError(
+            f"k_data: tokens must be packed (stride(1) {DATA_BYTES}, stride(2) 1), "
+            f"got {k_data.stride()}"
+        )
+    if k_scale.stride(1) != SCALE_BYTES or k_scale.stride(2) != 1:
+        raise ValueError(
+            f"k_scale: tokens must be packed (stride(1) {SCALE_BYTES}, stride(2) 1), "
+            f"got {k_scale.stride()}"
+        )
+    # A page stride below the view's own extent makes successive pages overlap.
+    if k_data.stride(0) < PAGE * DATA_BYTES or k_data.stride(0) % 16:
+        raise ValueError(
+            f"k_data: page stride must be a multiple of 16 B and >= {PAGE * DATA_BYTES}"
+        )
+    if k_scale.stride(0) < PAGE * SCALE_BYTES or k_scale.stride(0) % 4:
+        raise ValueError(
+            f"k_scale: page stride must be a multiple of 4 B and >= {PAGE * SCALE_BYTES}"
+        )
+
+
 def score_prefill_flydsl(
     idx_q,
     cache,
@@ -1570,14 +1603,12 @@ def score_prefill_flydsl(
     sm_scale,
     out=None,
     k_scale=None,
-    q_scale=1.0,
 ):
     """Block scores for a ragged prefill batch.
 
     With `k_scale` the cache is MXFP4 and read natively: `cache` is then the e2m1
     view `[pages, 128, 64]` uint8, `k_scale` the e8m0 view `[pages, 128, 4]` uint8
-    (layout and contract: `minimax_m3_index_score_fp4_cache`), `idx_q` may also be
-    e4m3, and `q_scale` (positive) is folded into `sm_scale`.
+    (see `_validate_cache`), and `idx_q` may also be e4m3.
 
     Shapes, dtypes, strides and the launch bounds are checked here. The ragged
     arrays' CONTENTS are a caller contract, as they are for the decode scorer:
@@ -1638,10 +1669,10 @@ def score_prefill_flydsl(
         # so the scale must be order-preserving: for a negative one
         # `max(dot) * scale` is not `max(dot * scale)` and every score is silently
         # the wrong block's. Decode states the same contract.
-    scaled = sm_scale * q_scale * LOG2E
+    scaled = sm_scale * LOG2E
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
         raise ValueError(
-            f"sm_scale * q_scale * LOG2E must be finite and positive in FP32, got {scaled}"
+            f"sm_scale * LOG2E must be finite and positive in FP32, got {scaled}"
         )
     scaled_f32 = float(scaled)
     if heads < 1:
@@ -1771,3 +1802,33 @@ def score_prefill_flydsl(
             torch.cuda.current_stream(idx_q.device).cuda_stream,
         )
     return out
+
+
+def score_prefill_flydsl_fp4(
+    idx_q,
+    k_data,
+    k_scale,
+    block_table,
+    cu_seqlens_q,
+    seq_lens,
+    prefix_lens,
+    max_query_len,
+    max_seq_len,
+    sm_scale,
+    out=None,
+):
+    """`score_prefill_flydsl` over an MXFP4 index cache given as its two views
+    (`k_data` `[pages, 128, 64]` e2m1, `k_scale` `[pages, 128, 4]` e8m0)."""
+    return score_prefill_flydsl(
+        idx_q,
+        k_data,
+        block_table,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        max_query_len,
+        max_seq_len,
+        sm_scale,
+        out=out,
+        k_scale=k_scale,
+    )

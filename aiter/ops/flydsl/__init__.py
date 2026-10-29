@@ -169,7 +169,7 @@ _LAZY_IMPORTS = {
         "score_prefill_flydsl",
     ),
     "minimax_m3_index_score_prefill_fp4_flydsl": (
-        ".kernels.minimax_m3_index_score_prefill_fp4",
+        ".kernels.minimax_m3_index_score_prefill",
         "score_prefill_flydsl_fp4",
     ),
     # Its own, not the decode scorer's: prefill's output is
