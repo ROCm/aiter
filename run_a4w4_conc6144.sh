@@ -1,3 +1,11 @@
+python3 - <<'PY' || exit 1
+from importlib.metadata import version
+
+installed = version("flydsl")
+if installed != "0.3.3.dev882":
+    raise SystemExit(f"Expected flydsl==0.3.3.dev882, found {installed}")
+PY
+
 export AITER_FLYDSL_MMA_FIRST_GROUP=4
 export AITER_FLYDSL_MMA_GROUP=4
 export AITER_FLYDSL_DS_FIRST_N=8
