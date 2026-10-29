@@ -1638,7 +1638,7 @@ def test_presorted_moe_wrapper_error():
     custom op (which normally consumes the registration) runs, on both the
     routed and the FHMoE (shared-expert) paths. CommFusedMoeRuntime.run, which
     calls _fused_moe_impl directly, must drop it too when it rejects its
-    arguments. No kernel launches, so CPU-only.
+    arguments. Rejected before any MoE kernel launches.
     """
     from aiter.ops.comm_fused_moe_runtime import (
         CommFusedMoeRuntime,
@@ -1827,7 +1827,7 @@ def test_presorted_moe_block_m():
 
     kimik3_a4w4_tuned_fmoe.csv also routes BM=32 tiles through the aux-sort path,
     so a registration labelled block_m=32 that matches the call must still be
-    ignored. CPU-only: checks the matcher fused_moe uses, no kernel launch.
+    ignored. Checks the matcher fused_moe uses; no MoE kernel launches.
     """
     fm = aiter.fused_moe
     M, E, topk = 4, 8, 2
@@ -1850,7 +1850,7 @@ def test_presorted_moe_masked_call():
 
     The presort covers every row of topk_ids with no expert mask, while
     moe_sorting honors both, so such calls must fall back to moe_sorting.
-    CPU-only: checks the matcher fused_moe uses, no kernel launch.
+    Checks the matcher fused_moe uses; no MoE kernel launches.
     """
     fm = aiter.fused_moe
     M, E, topk = 4, 8, 2
@@ -1869,6 +1869,86 @@ def test_presorted_moe_masked_call():
     mask = torch.ones((E,), dtype=torch.int32)
     assert match(expert_mask=mask) is None, "presort used with expert_mask"
     aiter.logger.info("moe_2stage: presorted MoE masked-call contract passed")
+
+
+def test_presorted_moe_ignored_is_logged():
+    """A registration fused_moe ignores is logged once per reason, naming it.
+
+    A caller whose aux omits a key (here topk_weights_ptr) would otherwise lose
+    the presort on every call with nothing to show for it. Checks the matcher
+    fused_moe uses; no MoE kernel launches.
+    """
+    fm = aiter.fused_moe
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = _presorted_aux_stub(ids, weights, E)
+    del aux["topk_weights_ptr"]
+
+    class Collect(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    collect = Collect()
+    fm._PRESORTED_MOE_IGNORED.clear()
+    fm.logger.addHandler(collect)
+    try:
+        for _ in range(3):
+            assert (
+                fm._match_presorted_moe(
+                    aux, ids, weights, block_m=16, num_experts=E, topk=topk
+                )
+                is None
+            ), "a presort without topk_weights_ptr was accepted"
+    finally:
+        fm.logger.removeHandler(collect)
+    ignored = [m for m in collect.messages if "registered presort ignored" in m]
+    assert len(ignored) == 1, f"expected one log line, got {ignored}"
+    assert "no topk_weights_ptr" in ignored[0], ignored[0]
+    aiter.logger.info("moe_2stage: presorted MoE ignored-registration log passed")
+
+
+def test_presorted_moe_compile_order():
+    """Under torch.compile each registration still reaches the next consumer.
+
+    dynamo defers a traced thread-local store until its graph has run, so a
+    compiled loop of register + MoE layer would hand every layer the previous
+    step's last registration. A stand-in custom op consumes it the way
+    fused_moe_ does; no MoE kernel launches.
+    """
+    fm = aiter.fused_moe
+    seen = []
+
+    @torch.library.custom_op("aiter_test::consume_presort", mutates_args=())
+    def consume(x: torch.Tensor) -> torch.Tensor:
+        aux = fm._pop_presorted_moe()
+        seen.append(aux and aux["layer"])
+        return x + 1
+
+    @consume.register_fake
+    def _(x):
+        return torch.empty_like(x)
+
+    def layers(x):
+        for layer in range(3):
+            fm.register_presorted_moe({"layer": layer})
+            x = consume(x)
+        return x
+
+    compiled = torch.compile(layers, backend="aot_eager")
+    try:
+        for _ in range(2):
+            seen.clear()
+            compiled(torch.zeros(4))
+            assert seen == [0, 1, 2], f"registrations reached layers as {seen}"
+    finally:
+        fm.register_presorted_moe(None)
+        torch._dynamo.reset()
+    aiter.logger.info("moe_2stage: presorted MoE torch.compile order passed")
 
 
 def test_bm16_tiled_scale_boundary():
@@ -2223,6 +2303,8 @@ else:
     test_presorted_moe_block_m()
     test_presorted_moe_masked_call()
     test_presorted_moe_layout_mismatch()
+    test_presorted_moe_ignored_is_logged()
+    test_presorted_moe_compile_order()
     if get_gfx() == "gfx950":
         test_presorted_moe_hook()
     else:
