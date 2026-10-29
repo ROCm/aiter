@@ -605,6 +605,7 @@ def _grouped_a8w4_tdm_moe(
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
+    num_valid_routes=None,
     stage2_scatter: Stage2ScatterContext | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
@@ -809,7 +810,16 @@ def _grouped_a8w4_tdm_moe(
                 .to(device=device, dtype=torch.int32)
                 .contiguous()
             )
-            _ep_nvr = (_ep_nvt * int(topk)).contiguous()
+            # A caller-precomputed `num_local_tokens * topk` (one per forward,
+            # not one multiply per MoE layer); derived here when absent.
+            if num_valid_routes is not None:
+                _ep_nvr = (
+                    num_valid_routes.reshape(-1)[:1]
+                    .to(device=device, dtype=torch.int32)
+                    .contiguous()
+                )
+            else:
+                _ep_nvr = (_ep_nvt * int(topk)).contiguous()
         # Small batches (decode): one workgroup routes, scans and remaps, in place
         # of the counter fill, moe_route and contiguous_psum_remap (same outputs).
         _route_psum_fused = (
@@ -1438,6 +1448,7 @@ def grouped_gemm_gfx1250_a8w4(
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
     a1_scale: torch.Tensor | None = None,
+    num_valid_routes: torch.Tensor | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1742,6 +1753,7 @@ def grouped_gemm_gfx1250_a8w4(
             data_format=data_format,
             expert_mask=expert_mask,
             num_local_tokens=num_local_tokens,
+            num_valid_routes=num_valid_routes,
             stage2_scatter=stage2_scatter,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
