@@ -20,6 +20,8 @@ SPLIT_K_SEMAPHORE_MAX_LEN = 2048
 # Int32 words between two tiles' split-K counters: one 128-byte line each, so the
 # tiles' arrivals do not serialize on a shared line.
 SPLIT_K_COUNTER_STRIDE = 32
+# Float32 slot offset past any workspace (validation keeps it under 2**31 bytes).
+_PAST_WORKSPACE = (1 << 30) - 4
 
 
 def wait_vmcnt_and_barrier(vmcnt=0):
@@ -97,8 +99,9 @@ class SplitKReduction:
         self.counter_ptr = _global_sync_ptr(
             semaphore, tile_idx * SPLIT_K_COUNTER_STRIDE, fx.Int32
         )
+        # Bounds-checked: a slot past the workspace drops stores and reads zero.
         self.slots = fx.logical_divide(
-            fx.rocdl.make_buffer_tensor(workspace, max_size=True),
+            fx.rocdl.make_buffer_tensor(workspace, max_size=False),
             fx.make_layout(1, 1),
         )
         self.flag_ptr = flag_ptr
@@ -109,13 +112,19 @@ class SplitKReduction:
             fx.rocdl.BufferCopy128b(self.SC1), fx.Float32
         )
 
-    def _slot(self, ks, group):
-        offset = self.tile_base + ks * self.TILE_ELEMS
-        return fx.slice(
-            self.slots, (None, offset + (group * self.THREADS + self.tid) * 4)
+    def _slot(self, ks, group, live=None):
+        offset = (
+            self.tile_base
+            + ks * self.TILE_ELEMS
+            + (group * self.THREADS + self.tid) * 4
         )
+        if const_expr(live is not None):
+            offset = live(group).select(offset, fx.Int32(_PAST_WORKSPACE))
+        return fx.slice(self.slots, (None, offset))
 
-    def store_partial(self, frags):
+    def store_partial(self, frags, live=None):
+        """Store the fp32 partial; ``live(group)``, if given, skips groups that
+        hold only rows past M."""
         group = 0
         for frag in frags:
             for i in range_constexpr(fx.size(frag.shape).unpack() // 4):
@@ -125,7 +134,7 @@ class SplitKReduction:
                         [frag[i * 4 + e] for e in range_constexpr(4)], fx.Float32
                     )
                 )
-                fx.copy(self.copy_atom, vec, self._slot(self.ks_idx, group))
+                fx.copy(self.copy_atom, vec, self._slot(self.ks_idx, group, live))
                 group += 1
 
     @flyc.jit
@@ -150,16 +159,27 @@ class SplitKReduction:
         gpu.barrier()
         return fx.ptr_load(self.flag_ptr) != 0
 
-    def accumulate(self, frag, first_group, init_frag):
+    def accumulate(self, frag, first_group, init_frag, own_split=None, live=None):
         """Set ``frag`` to init + every split's partial, in split order;
-        ``init_frag`` writes the bias (or zero) into ``frag``."""
+        ``init_frag`` writes the bias (or zero) into ``frag``. With ``own_split``
+        (this split's index, a constant), this split's partial is taken from
+        ``frag`` instead of being read back. ``live(group)`` skips padding groups."""
+        groups = fx.size(frag.shape).unpack() // 4
+        if const_expr(own_split is not None):
+            own = [frag[j] for j in range_constexpr(groups * 4)]
         init_frag()
         for ks in range_constexpr(self.SPLIT_K):
-            for i in range_constexpr(fx.size(frag.shape).unpack() // 4):
-                partial = fx.make_rmem_tensor(4, fx.Float32)
-                fx.copy(self.copy_atom, self._slot(ks, first_group + i), partial)
-                for e in range_constexpr(4):
-                    frag[i * 4 + e] = frag[i * 4 + e] + partial[e]
+            for i in range_constexpr(groups):
+                if const_expr(ks == own_split):
+                    for e in range_constexpr(4):
+                        frag[i * 4 + e] = frag[i * 4 + e] + own[i * 4 + e]
+                else:
+                    partial = fx.make_rmem_tensor(4, fx.Float32)
+                    fx.copy(
+                        self.copy_atom, self._slot(ks, first_group + i, live), partial
+                    )
+                    for e in range_constexpr(4):
+                        frag[i * 4 + e] = frag[i * 4 + e] + partial[e]
 
 
 def make_lds_layout(rows, block_k):

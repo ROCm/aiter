@@ -8,6 +8,8 @@ from typing import Any
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
@@ -28,10 +30,36 @@ from .gemm_a16w16_gfx950_utils import (
     wait_vmcnt_and_barrier,
 )
 from .kernels_common import run_cached
+from .tensor_shim import buf_base_i64
 
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
 GEMM_A16W16_DTYPE_FP16 = 3
+# Split-K tiles at least this large keep their own partial in registers and skip
+# rows past M in the partial traffic; smaller ones gain nothing from it.
+SPLIT_K_TRIM_MIN_TILE_ELEMS = 1024
+
+
+def load_kernargs_up_front(tensors, scalars):
+    """Load the tensors' base addresses and the Int32 scalar arguments together.
+
+    The scalars pass through an empty asm that also uses the base addresses, so
+    every later use of them waits for all of these kernarg loads at once: one
+    scalar round trip before the first global load instead of two. Returns the
+    scalars.
+    """
+    n = len(scalars)
+    ptrs = [fx.as_ir_value(buf_base_i64(t)) for t in tensors]
+    struct = ir.Type.parse("!llvm.struct<(" + ", ".join(["i32"] * n) + ")>")
+    op = llvm.InlineAsmOp(
+        struct,
+        [fx.as_ir_value(v) for v in scalars] + ptrs,
+        "",
+        ",".join(["=s"] * n + [str(i) for i in range(n)] + ["s"] * len(ptrs)),
+        has_side_effects=True,
+    )
+    i32 = ir.IntegerType.get_signless(32)
+    return tuple(fx.Int32(llvm.extractvalue(i32, op.res, [i])) for i in range(n))
 
 
 def c_lds_elems(block_m, block_n, k_waves, out_data_bytes, is_split_k):
@@ -483,6 +511,12 @@ def gemm_a16w16_gfx950_kernel(
         if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
         else elem_dtype
     )
+    m, n, k, working_k = load_kernargs_up_front(
+        (a, b, out)
+        + ((semaphore, workspace) if const_expr(param.split_k > 1) else ())
+        + ((bias,) if const_expr(param.has_bias) else ()),
+        (m, n, k, working_k),
+    )
     tid = fx.thread_idx.x
     threads_per_k_slice = param.m_waves * param.n_waves * GFX950_WAVE_SIZE
     tid_in_k_slice = tid % threads_per_k_slice
@@ -492,8 +526,17 @@ def gemm_a16w16_gfx950_kernel(
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
-    bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    ks_idx = fx.block_idx.y
+    if const_expr(param.group_m <= 0):
+        # Grid (n tiles, m tiles, splits): the same dispatch order as the linear
+        # tile id, without dividing it by num_pid_n.
+        bid_n = fx.block_idx.x
+        bid_m = fx.block_idx.y
+        ks_idx = fx.block_idx.z
+        tile_idx = bid_m * num_pid_n + bid_n
+    else:
+        bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
+        ks_idx = fx.block_idx.y
+        tile_idx = fx.block_idx.x
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
@@ -537,7 +580,7 @@ def gemm_a16w16_gfx950_kernel(
             workspace,
             fx.recast_iter(fx.Int32, smem_c + block_m * block_n),
             tid_in_k_slice,
-            fx.block_idx.x,
+            tile_idx,
             ks_idx,
         )
 
@@ -781,17 +824,38 @@ def gemm_a16w16_gfx950_kernel(
         # state that must be yielded.
         store_partial = splitk_reduction.store_partial
         accumulate = splitk_reduction.accumulate
+
+        # Tiles this large are worth trimming the reduction's memory traffic:
+        # skip rows past M and keep this split's own partial in registers.
+        trim = block_m * block_n >= SPLIT_K_TRIM_MIN_TILE_ELEMS
+
+        def group_live(group):
+            # Groups are 4 rows of one column; skip the ones entirely past M.
+            return block_m_offset + fx.get_scalar(thr_mma_cRow[group * 4]) < m
+
+        live = group_live if const_expr(trim) else None
+
+        def reduce_tile():
+            if const_expr(trim):
+                # One copy per split index, so this split's partial comes from
+                # registers and is added in its place without per-element selects.
+                for own_split in range_constexpr(param.split_k):
+                    if ks_idx == own_split:
+                        accumulate(frag_C, 0, init_frag_C, own_split, live)
+            else:
+                accumulate(frag_C, 0, init_frag_C)
+
         if const_expr(is_slice_k):
             if k_wave_idx == 0:
-                store_partial((frag_C,))
+                store_partial((frag_C,), live)
         else:
-            store_partial((frag_C,))
+            store_partial((frag_C,), live)
         if splitk_reduction.arrive():
             if const_expr(is_slice_k):
                 if k_wave_idx == 0:
-                    accumulate(frag_C, 0, init_frag_C)
+                    reduce_tile()
             else:
-                accumulate(frag_C, 0, init_frag_C)
+                reduce_tile()
             store_c_tile_to_global()
     else:
         if const_expr(not is_slice_k):
@@ -839,6 +903,12 @@ def gemm_a16w16_hti_gfx950_kernel(
         if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
         else elem_dtype
     )
+    m, n, k, working_k = load_kernargs_up_front(
+        (a, b, out)
+        + ((semaphore, workspace) if const_expr(param.split_k > 1) else ())
+        + ((bias,) if const_expr(param.has_bias) else ()),
+        (m, n, k, working_k),
+    )
     tid = fx.thread_idx.x
     wid = tid // GFX950_WAVE_SIZE
     num_pid_m = (m + block_m - 1) // block_m
@@ -846,8 +916,17 @@ def gemm_a16w16_hti_gfx950_kernel(
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
-    bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    ks_idx = fx.block_idx.y
+    if const_expr(param.group_m <= 0):
+        # Grid (n tiles, m tiles, splits): the same dispatch order as the linear
+        # tile id, without dividing it by num_pid_n.
+        bid_n = fx.block_idx.x
+        bid_m = fx.block_idx.y
+        ks_idx = fx.block_idx.z
+        tile_idx = bid_m * num_pid_n + bid_n
+    else:
+        bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
+        ks_idx = fx.block_idx.y
+        tile_idx = fx.block_idx.x
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
@@ -891,7 +970,7 @@ def gemm_a16w16_hti_gfx950_kernel(
             workspace,
             fx.recast_iter(fx.Int32, smem_c + block_m * block_n),
             tid,
-            fx.block_idx.x,
+            tile_idx,
             ks_idx,
         )
 
@@ -1287,7 +1366,11 @@ def gemm_a16w16_gfx950(
         tiled_mma,
         param,
     ).launch(
-        grid=(num_pid_m * num_pid_n, split_k, 1),
+        grid=(
+            (num_pid_n, num_pid_m, split_k)
+            if const_expr(param.group_m <= 0)
+            else (num_pid_m * num_pid_n, split_k, 1)
+        ),
         block=(param.block_threads, 1, 1),
         stream=stream,
     )
