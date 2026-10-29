@@ -18,10 +18,12 @@
 //
 // The caller owes what the device cannot check:
 //   1. row_ends does not decrease along a sequence's rows (a CTA runs its last row's window);
-//   2. row_ends[r] <= the logits width and <= what block_tables[b] covers;
+//   2. row_ends[r] <= the logits width and <= what block_tables[b] covers (the width, a row's
+//      logits addressed in 32 bits, is under 2^30: the config checks that);
 //   3. query_start_loc[-1] <= rows; rows past it are neither read nor written;
 //   4. a page's offset in the cache fits 32 bits: on gfx950 its byte offset (page id x 4 KiB, so
-//      the kv_cache a call reads is at most 4 GiB), on gfx1250 its plane row (page id x page rows).
+//      the kv_cache a call reads is under 4 GiB: the launch checks that), on gfx1250 its plane
+//      row (page id x page rows).
 #pragma once
 #include "aiter_tensor.h"
 #include <hip/hip_runtime.h>
@@ -67,8 +69,9 @@ struct mqa_logits_mxfp4_kargs {
     float weight_scale;
     int cta_target;                           // Free: the split's target CTA count
     int prefill_parts;                        // Prefill: pieces a group is cut into
+    int kv_rows;                              // keys in the KV plane (capped at INT_MAX)
 };
-static_assert(sizeof(mqa_logits_mxfp4_kargs) == 120);
+static_assert(sizeof(mqa_logits_mxfp4_kargs) == 128, "kargs past 128 B are not preloaded");
 
 namespace opus_logits {
 
@@ -99,6 +102,7 @@ struct mqa_logits_instance {
     int tile_keys;        // the KV tile, the Table builder's block_k
     int modes;            // bit m: schedule mode m is compiled
     int flat_out;         // reads out_offsets
+    int64_t max_kv_bytes; // the largest kv_cache the kernels address (0: no limit)
     hipError_t (*launch)(int mode, const mqa_logits_mxfp4_kargs& k, int grid, hipStream_t stream);
     hipError_t (*occupancy)(int mode, int* ctas_per_cu);
 };

@@ -292,6 +292,15 @@ __device__ inline void permlane_head_reduce2(float& o0, float& o1, float v0, flo
     o1 = std::bit_cast<float>(r1[0]) + std::bit_cast<float>(r1[1]);
 }
 
+// A page's byte offset from kv_cache: the product in unsigned 32 bits, handed to the buffer ops
+// as the int they take. A buffer offset is unsigned, so this reaches the whole 4 GiB the launcher
+// allows; a signed product would overflow from 2 GiB on.
+template<class T>
+__device__ inline int kv_page_offset(int page_id) {
+    return static_cast<int>(static_cast<unsigned>(page_id) *
+                            static_cast<unsigned>(T::KV_PAGE_BYTES));
+}
+
 // Q: natural [T][head][D/2]; lane L reads 16 B at
 // head(mi * MMA_M + L % 32) * 64 + (kt * K_CHUNKS + L / 32) * 16. Un-coalesced: Q is loaded once
 // in the prologue, so the layout stays natural.

@@ -47,8 +47,9 @@ them apart -- checked here, as nothing on device can)::
 Only ``out[r, c]`` for ``c < row_ends[r]`` is written; rows past ``query_start_loc[-1]`` (CUDAGraph
 padding) are untouched. The caller owes what the kernel cannot check: ``row_ends`` does not
 decrease along a sequence, ``row_ends[r] <= max_seq_len`` and within the sequence's table, and a
-page's offset fits 32 bits -- on gfx950 its byte offset (page id x 4 KiB: a ``kv_cache`` of at most
-4 GiB), on gfx1250 its row (page id x ``page_size``).
+page's offset fits 32 bits -- on gfx950 its byte offset (page id x 4 KiB: a ``kv_cache`` under
+4 GiB, which the launch checks), on gfx1250 its row (page id x ``page_size``). ``max_seq_len`` is
+under 2^30 (a row's logits are addressed in 32 bits); the config checks it.
 
 NaN: relu is IEEE ``maximum``. A logit is NaN exactly where a key's or the row's E8M0 scales hold
 0xFF, or a weight is NaN or Inf (the kernels compute relu as max_num and put the NaN back from the
@@ -101,6 +102,7 @@ _PREFILL_ROUNDS = 8
 _PREFILL_MIN_WALK = 16
 _CAND_MAX_WALK = 32
 _MAX_PREFILL_PARTS = 65536  # the kernels' 32-bit split (part_point) needs parts <= 2^16
+_MAX_SEQ_LEN = 1 << 30  # a row's logits are bounded by a 32-bit byte count (4 B a key)
 
 # Per arch: the ndim of q_scale / kv_scale / kv_cache, and kv_cache's page-rows dim. gfx950's are
 # MFMA-permuted (4-D, kv_cache [pages, 4, page_size, 16]); gfx1250's natural (3-D).
@@ -456,6 +458,11 @@ def _config(
     )
     if min(bounds) < 1:
         raise ValueError("every bound must be >= 1")
+    if max_seq_len >= _MAX_SEQ_LEN:
+        raise ValueError(
+            f"max_seq_len must be under {_MAX_SEQ_LEN} (a row's logits are addressed in 32 "
+            f"bits), got {max_seq_len}"
+        )
     arch = _device_arch(dev)
     if (arch, heads) in _ELSEWHERE:
         raise ValueError(_ELSEWHERE[arch, heads])

@@ -193,6 +193,8 @@ constexpr mqa_logits_instance entry() {
             .tile_keys      = T::KV_TILE_SIZE,
             .modes          = K::modes,
             .flat_out       = 0,
+            // a page's byte offset from kv_cache is 32 bits (a 0xffffffff-byte buffer resource)
+            .max_kv_bytes   = 0xffffffff,
             .launch         = K::launch,
             .occupancy      = K::occupancy};
 }

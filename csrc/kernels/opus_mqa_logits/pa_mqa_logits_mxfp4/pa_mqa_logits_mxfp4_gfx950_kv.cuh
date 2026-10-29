@@ -164,7 +164,7 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
             opus::static_for<KT>([&](auto ktc) {
                 constexpr int kt = ktc.value;
                 auto v = opus::load<T::KV_GRP_BYTES>(
-                    g_kv, u_kv + page_id * T::KV_PAGE_BYTES + kt * T::STRIDE_KV_KTILE +
+                    g_kv, u_kv + kv_page_offset<T>(page_id) + kt * T::STRIDE_KV_KTILE +
                               nt * T::STRIDE_KV_NTILE);
                 opus::set_slice(kv[nt][kt], v, opus::number<0>{}, opus::number<T::KV_GRP_BYTES>{});
             });

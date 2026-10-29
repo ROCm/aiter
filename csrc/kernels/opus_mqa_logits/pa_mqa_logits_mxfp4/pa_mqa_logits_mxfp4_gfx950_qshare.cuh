@@ -163,7 +163,7 @@ void qshare_kernel(mqa_logits_mxfp4_kargs k) {
                 constexpr int chunk = ic.value * T::ISSUE_WAVES * T::ASYNC_WAVE_BYTES;
                 opus::async_load<T::ASYNC_VEC_BYTES>(
                     g_kv, reinterpret_cast<void*>(dst + chunk), async_lane_off,
-                    page_id * T::KV_PAGE_BYTES + async_wave_off + chunk);
+                    kv_page_offset<T>(page_id) + async_wave_off + chunk);
             });
         }
         D_BYTE* sdst = reinterpret_cast<D_BYTE*>(smem_buf) + scale_stage_byte(tile);

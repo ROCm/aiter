@@ -125,6 +125,8 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
     typename KvsgWin::descriptor kvsg_d0 = kvsg_win.make_descriptor();
     kvg_d0.set_tile_dim1(T::TILE_PAGES);    // gather mode: tile_dim1 = valid indices
     kvsg_d0.set_tile_dim1(T::TILE_PAGES);
+    // The pool's last 8-row page: every gathered id is clamped to it.
+    [[maybe_unused]] const opus::u32_t last_page = (opus::u32_t)(k.kv_rows / T::PAGE_ROWS) - 1u;
     const opus::u64_t kv_g  = reinterpret_cast<opus::u64_t>(k.ptr_kv);
     const opus::u64_t kvs_g = reinterpret_cast<opus::u64_t>(k.ptr_kv_scale);
     // Tile t of the chunk into ring slot `slot`. Nothing is issued past the chunk -- the wait below
@@ -137,8 +139,14 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
         if (t >= tile_count) return;
         const opus::u32_t stage = (opus::u32_t)(slot * T::LDS_STAGE_BYTES);
         if constexpr (T::GATHER) {
+            // The last tile's ids run past the row's window into slots the caller may have
+            // padded with anything; clamped into the pool, each reads a real page, whose keys
+            // are then never stored. Unsigned, so a negative id clamps too.
             int ids[T::TILE_PAGES];
-            opus::static_for<T::TILE_PAGES>([&](auto i) { ids[i.value] = wds[i.value]; });
+            opus::static_for<T::TILE_PAGES>([&](auto i) {
+                const opus::u32_t id = (opus::u32_t)wds[i.value];
+                ids[i.value] = (int)(id < last_page ? id : last_page);
+            });
             auto gd = kvg_d0;
             gd.set_lds_addr((opus::u32_t)kv_lds_base + stage);
             gd.groups23.group2 = opus::impl::tdm_sgpr4{ids[0], ids[1], ids[2], ids[3]};

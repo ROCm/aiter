@@ -690,6 +690,9 @@ void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
                     kv_scale.numel() == kv_cache.numel() / TOKEN_BYTES * SCALE_BYTES,
                 "kv_cache must be whole ", TOKEN_BYTES, "-byte keys and kv_scale ", SCALE_BYTES,
                 " bytes a key; got ", kv_cache.numel(), " and ", kv_scale.numel());
+    AITER_CHECK(in.max_kv_bytes == 0 || static_cast<int64_t>(kv_cache.numel()) <= in.max_kv_bytes,
+                "instance ", instance, " (", in.arch, ") addresses a kv_cache of at most ",
+                in.max_kv_bytes, " bytes; got ", kv_cache.numel());
     AITER_CHECK(block_tables.dtype() == AITER_DTYPE_i32 && block_tables.dim() == 2 &&
                     block_tables.stride(1) == 1,
                 "block_tables must be int32 [num_seqs, width] with unit column stride");
@@ -750,6 +753,8 @@ void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
     k.weight_scale        = weight_scale;
     k.cta_target          = cta_target;
     k.prefill_parts       = prefill_parts;
+    k.kv_rows             = static_cast<int>(
+        std::min<int64_t>(static_cast<int64_t>(kv_cache.numel()) / TOKEN_BYTES, INT32_MAX));
 
     HipDeviceGuard guard(q.device_id);
     HIP_CALL_LAUNCH(in.launch(mode, k, grid, aiter::getCurrentHIPStream()));
