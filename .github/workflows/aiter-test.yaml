@@ -503,7 +503,7 @@ jobs:
           import json
           import os
 
-          runners = [("linux-aiter-mi35x-1", "MI35X")]
+          runners = [("linux-aiter-vultr-mi325-1", "MI35X")]
           if os.environ["GITHUB_REF"] == "refs/heads/main":
               runners.append(("linux-aiter-oci-mi300x-1", "MI300X"))
 
@@ -631,7 +631,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Network preflight before Aiter test artifact downloads
-        if: ${{ startsWith(runner.name, 'linux-aiter-mi35x-1-') }}
+        if: ${{ startsWith(runner.name, 'linux-aiter-vultr-mi325-1-') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -734,7 +734,7 @@ jobs:
           path: triton_wheels
 
       - name: Speedtest after Aiter test cache or artifact download failure
-        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-vultr-mi325-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -984,7 +984,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           missing=0
-          runners=(linux-aiter-mi35x-1)
+          runners=(linux-aiter-vultr-mi325-1)
           if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             runners+=(linux-aiter-oci-mi300x-1)
           fi
@@ -1280,7 +1280,7 @@ jobs:
     # Tuned operator perf regression check.
     # - PR: pull last main baseline CSV, compare current shard's CSV, warn-only
     # - push to main / workflow_dispatch: publish current CSV as next baseline
-    # Only consumes csv from linux-aiter-mi35x-1 runner to avoid cross-arch noise.
+    # Only consumes csv from linux-aiter-vultr-mi325-1 runner to avoid cross-arch noise.
     name: Tuned Op Bench
     if: >-
       always() &&
@@ -1299,7 +1299,7 @@ jobs:
         timeout-minutes: 15
         continue-on-error: true
         with:
-          pattern: standard-test-log-linux-aiter-mi35x-1-shard-*
+          pattern: standard-test-log-linux-aiter-vultr-mi325-1-shard-*
           path: /tmp/logs/
 
       - name: Locate current tuned_op_bench.csv
@@ -1433,7 +1433,7 @@ jobs:
               'commit': os.environ['GITHUB_SHA'],
               'ref': os.environ['GITHUB_REF'],
               'event': os.environ['GITHUB_EVENT_NAME'],
-              'runner_pool': 'linux-aiter-mi35x-1',
+              'runner_pool': 'linux-aiter-vultr-mi325-1',
               'gpu_arch_list': os.environ.get('GPU_ARCH_LIST', ''),
               'ran_at': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
           }
