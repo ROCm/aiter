@@ -1896,6 +1896,11 @@ def _fused_moe_impl(
         )
         local_topk_ids = None
     else:
+        sort_output = output if asm_mode.requires_host_sort else None
+        if asm_mode is AsmMoeMode.POST_REDUCE:
+            # The reducer overwrites the final output, including masked rows.
+            # An empty buffer also suppresses the sort's EP zero-fill.
+            sort_output = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
         sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
@@ -1907,9 +1912,10 @@ def _fused_moe_impl(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             return_local_topk_ids=need_local_topk_ids,
-            accumulate=not runtime_stage2_reduce,
+            accumulate=not runtime_stage2_reduce
+            and asm_mode is not AsmMoeMode.POST_REDUCE,
             flat=asm_mode,
-            output=output if asm_mode.requires_host_sort else None,
+            output=sort_output,
         )
         if need_local_topk_ids:
             (
@@ -1925,6 +1931,12 @@ def _fused_moe_impl(
                 sorting_ret
             )
             local_topk_ids = None
+        if asm_mode is AsmMoeMode.POST_REDUCE:
+            moe_buf = (
+                output
+                if output is not None
+                else torch.empty((M, model_dim), dtype=dtype, device=topk_ids.device)
+            )
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
@@ -4462,8 +4474,6 @@ def get_2stage_cfgs(
             _a_type = "fp4"
         else:
             _a_type = "fp8"
-        _fp8_inter = q_dtype_a2 == dtypes.fp8 and _a_type == "fp4"
-        _a2_type = "fp8" if _fp8_inter else _a_type
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
@@ -4480,7 +4490,7 @@ def get_2stage_cfgs(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
         _base_kn2 = flydsl_kernel_name(
-            2, _a2_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
         )
         kn1 = f"{_base_kn1}{_s1_sfx}"
         kn2 = f"{_base_kn2}{_s2_sfx}"
@@ -4511,7 +4521,6 @@ def get_2stage_cfgs(
                 activation=activation,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
-                out_dtype="fp8" if _fp8_inter else None,
             ),
             functools.partial(
                 _flydsl_stage2_wrapper,
@@ -4524,7 +4533,6 @@ def get_2stage_cfgs(
             False,
             has_bias=enable_bias,
             stage2_has_bias=enable_bias,
-            fuse_quant="fp8" if _fp8_inter else "",
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
