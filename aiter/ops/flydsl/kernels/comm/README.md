@@ -136,6 +136,10 @@ levels:
    inside a HIP graph capture. The RMSNorm epsilon is a launch argument, so it 
    does not select a binary.
    `compile_rmsnorm(hidden)` does the same after construction, on every rank.
+   The fused epilogue reduces a row inside one workgroup, so a tile must hold
+   whole rows. A row that never divides the default 8-atom tile, such as
+   hidden 6144, runs on a 12-atom tile (`tile_atoms_for`). That tile splits
+   only across TP 2 and 4, and its engines have their own IPC inbox.
 
 ## Environment variables
 

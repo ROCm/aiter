@@ -52,7 +52,6 @@ from .allreduce_policy import (
     ring_st_ladder,
 )
 from .kernels.comm.allreduce_shared import (
-    ATOMS,
     BLOCK,
     QUANT_MIN_PAYLOAD_BYTES,
     SUPPORTED_BLOCKS,
@@ -62,14 +61,17 @@ from .kernels.comm.allreduce_shared import (
     select_rung,
 )
 from .kernels.comm.quick_allreduce_int4 import (
+    DEFAULT_ATOMS,
     DEFAULT_DIVISOR,
     MESH_CODECS,
     SUPER_TILES,
     clamp_grid_cap,
     latency_max_tiles,
     make_quick_allreduce_int4_kernel,
+    max_payload_bytes,
+    mesh_lds_bytes,
     mxfp4_scale_shape,
-    rmsnorm_hidden_supported,
+    tile_atoms_for,
 )
 from .kernels.comm.quick_allreduce_int4_ring import (
     AG_CODECS,
@@ -362,10 +364,10 @@ class QuickAllReduceInt4:
         self._by_cfg = {}
         # Per engine, the arguments that rebuild its kernel.
         self._build_kw = {}
-        # The fused RMSNorm's engines and their arguments, built by
-        # ``compile_rmsnorm``, and the fused builds ``norm_launch`` adds to
-        # them on first use.
-        self._norm_by_cfg = None
+        # The fused RMSNorm's engines and their arguments, keyed by tile width
+        # and then like ``_by_cfg``, built by ``compile_rmsnorm``, and the
+        # fused builds ``norm_launch`` adds to them on first use.
+        self._norm_by_atoms = {}
         self._norm_build_kw = {}
         self._norm_launch = {}
         # Row widths whose fused builds are all compiled and loaded.
@@ -416,9 +418,12 @@ class QuickAllReduceInt4:
             caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
         return caps
 
-    def _build_engines(self, caps, engines, build_kws) -> None:
+    def _build_engines(
+        self, caps, engines, build_kws, tile_atoms: int = DEFAULT_ATOMS
+    ) -> None:
         """Build an engine for each entry of *caps* into *engines*, and the
-        arguments that rebuild its kernel into *build_kws*.
+        arguments that rebuild its kernel into *build_kws*. *tile_atoms*
+        other than the default is the fused RMSNorm's wide tile (mesh only).
 
         Collective: each engine does its own IPC handle exchange, so the
         engines are built in a fixed order -- ranks disagreeing on the order
@@ -438,6 +443,8 @@ class QuickAllReduceInt4:
                     cu_count=self._cu_count,
                     block=b,
                 )
+                if tile_atoms != DEFAULT_ATOMS:
+                    grid = min(grid, self._lds_resident_grid(b, tile_atoms))
                 shared_grid = torch.tensor(grid, dtype=torch.int64)
                 dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=self.group)
                 build_kw = {
@@ -450,6 +457,8 @@ class QuickAllReduceInt4:
                     "ag_codec": self.ag_codec,
                     "block": b,
                 }
+                if tile_atoms != DEFAULT_ATOMS:
+                    build_kw["tile_atoms"] = tile_atoms
                 spec = self._algo.build(**build_kw)
                 if spec["lds_bytes"] > self._lds_capacity:
                     raise ValueError(
@@ -467,11 +476,25 @@ class QuickAllReduceInt4:
                     inbox_flags=self._inbox_flags,
                 )
 
+    def _lds_resident_grid(self, block: int, tile_atoms: int) -> int:
+        """Largest persistent grid whose workgroups all fit in the CUs' LDS,
+        counting the fused RMSNorm's partial sums."""
+        wg_lds = mesh_lds_bytes(
+            world_size=self.world_size,
+            block=block,
+            codec=self.rs_codec,
+            tile_atoms=tile_atoms,
+            fuse_norm=True,
+        )
+        per_cu = max(1, self._lds_capacity // wg_lds)
+        # A multiple of 8 keeps the flag prefix 64 B aligned at every TP size.
+        return max(8, (per_cu * self._cu_count) // 8 * 8)
+
     def _engines(self) -> list[_StEngine]:
         """Every engine this object holds, each once: the fused RMSNorm
         shares those it has in common with the plain all-reduce."""
         by_id = {}
-        for engines in (self._by_cfg, self._norm_by_cfg or {}):
+        for engines in (self._by_cfg, *self._norm_by_atoms.values()):
             for eng in engines.values():
                 by_id.setdefault(id(eng), eng)
         return list(by_id.values())
@@ -490,12 +513,12 @@ class QuickAllReduceInt4:
         return sum(eng.buf_bytes for eng in self._engines())
 
     @staticmethod
-    def _num_tiles(live_bytes: int, block: int) -> int:
-        tile_bytes = int(block) * ATOMS * 16
+    def _num_tiles(live_bytes: int, block: int, tile_atoms: int = DEFAULT_ATOMS) -> int:
+        tile_bytes = int(block) * int(tile_atoms) * 16
         return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
 
     def _select_cfg(
-        self, ladder, engines, live_bytes: int
+        self, ladder, engines, live_bytes: int, tile_atoms: int = DEFAULT_ATOMS
     ) -> tuple[tuple[int, int], int]:
         """Key in *engines*, built for *ladder*, of a *live_bytes* payload,
         and its tile count.
@@ -507,7 +530,7 @@ class QuickAllReduceInt4:
         """
         rung = select_rung(ladder, live_bytes)
         want, b = rung.super_tile, rung.block
-        num_tiles = self._num_tiles(live_bytes, b)
+        num_tiles = self._num_tiles(live_bytes, b, tile_atoms)
         if want == 1:
             st = 1
         elif self._batch_publishes:
@@ -634,13 +657,13 @@ class QuickAllReduceInt4:
                 preload_launcher(eng.launch, *args)
 
     def norm_launch(self, cfg, hidden, gemma_norm, latency=False, mxfp4=False):
-        """Fused add+RMSNorm variant of the fused RMSNorm's engine *cfg*;
-        shares its inbox and colors."""
+        """Fused add+RMSNorm variant of the fused RMSNorm's engine *cfg* at
+        *hidden*'s tile width; shares its inbox and colors."""
         key = (cfg, int(hidden), bool(gemma_norm), bool(latency), bool(mxfp4))
         launch = self._norm_launch.get(key)
         if launch is None:
             launch = self._algo.build(
-                **self._norm_build_kw[cfg],
+                **self._norm_build_kw[self._tile_atoms(hidden)][cfg],
                 norm_hidden=key[1],
                 gemma_norm=key[2],
                 norm_latency=key[3],
@@ -649,14 +672,25 @@ class QuickAllReduceInt4:
             self._norm_launch[key] = launch
         return launch
 
-    @staticmethod
-    def supports_rmsnorm(hidden: int, nbytes: int) -> bool:
+    def _tile_atoms(self, hidden: int) -> int | None:
+        """Tile width of the fused RMSNorm at *hidden*, ``None`` if no block
+        holds the row.
+        """
+        for b in SUPPORTED_BLOCKS:
+            tile_atoms = tile_atoms_for(hidden, self.world_size, b)
+            if tile_atoms is not None:
+                return tile_atoms
+        return None
+
+    def supports_rmsnorm(self, hidden: int, nbytes: int) -> bool:
         """Whether ``allreduce_rmsnorm`` can take this row width and payload."""
         # Atom byte offsets travel in the signed 32-bit soffset.
-        return (
-            any(rmsnorm_hidden_supported(hidden, b) for b in SUPPORTED_BLOCKS)
-            and nbytes < 1 << 31
-        )
+        limits = [
+            max_payload_bytes(tile_atoms, b)
+            for b in SUPPORTED_BLOCKS
+            if (tile_atoms := tile_atoms_for(hidden, self.world_size, b)) is not None
+        ]
+        return bool(limits) and int(nbytes) <= min(limits)
 
     @staticmethod
     def mxfp4_scale_shape(rows: int, hidden: int) -> tuple[int, int]:
@@ -681,8 +715,9 @@ class QuickAllReduceInt4:
         if not self.supports_rmsnorm(hidden, live_bytes):
             raise ValueError(
                 "fused RMSNorm needs a row that fits whole atoms in a tile "
-                f"and a payload under 2 GiB, got hidden={hidden}, "
-                f"{live_bytes} bytes"
+                "split across the ranks, and a payload whose atom offsets fit "
+                f"the signed 32-bit soffset, got hidden={hidden}, "
+                f"{live_bytes} bytes at world_size={self.world_size}"
             )
 
     def compile_rmsnorm(self, hidden: int) -> None:
@@ -710,8 +745,7 @@ class QuickAllReduceInt4:
                 f"rmsnorm_hidden=({hidden},) to the constructor, or call "
                 f"compile_rmsnorm({hidden}) on every rank before the capture"
             )
-        if self._norm_by_cfg is None:
-            self._build_norm_engines()
+        self._build_norm_engines(hidden)
         # Raises if no engine has a block that holds the row.
         self._norm_cfg(hidden * 2, hidden)
         variants = [
@@ -720,8 +754,8 @@ class QuickAllReduceInt4:
             for mxfp4 in ((False, True) if self.supports_mxfp4 else (False,))
         ]
         with torch.cuda.device(self._device_index):
-            for cfg, eng in self._norm_by_cfg.items():
-                if not rmsnorm_hidden_supported(hidden, cfg[1]):
+            for cfg, eng in self._norm_by_atoms[self._tile_atoms(hidden)].items():
+                if tile_atoms_for(hidden, self.world_size, cfg[1]) is None:
                     continue
                 args = self._launch_args(
                     eng, 0, 0, None, live_bytes=0, num_tiles=0, norm_ptrs=()
@@ -734,54 +768,78 @@ class QuickAllReduceInt4:
                         preload_launcher(launch, *args)
         self._rmsnorm_hidden.add(hidden)
 
-    def _build_norm_engines(self) -> None:
-        """Build the engines of the fused add+RMSNorm, those of its ladder in
-        ``MESH_NORM_LADDER``. Collective, as the constructor is. An engine whose
-        configuration the plain all-reduce already has is shared, not built
-        again."""
+    def _build_norm_engines(self, hidden: int) -> None:
+        """Build the engines of the fused add+RMSNorm at *hidden*'s tile
+        width that are not built yet, those of its ladder in
+        ``MESH_NORM_LADDER``. Collective, as the constructor is.
+
+        At the default width an engine whose configuration the plain
+        all-reduce already has is shared, not built again.
+        """
+        tile_atoms = self._tile_atoms(hidden)
         caps = self._engine_caps(self._norm_ladder)
-        # The fused RMSNorm cannot run at a block whose atom is wider than a row.
-        if all(b != BLOCK for _st, b in caps):
-            caps[(1, BLOCK)] = min(caps.values())
-        shared = [key for key, cap in caps.items() if self._caps.get(key) == cap]
-        engines = {key: self._by_cfg[key] for key in shared}
-        build_kws = {key: self._build_kw[key] for key in shared}
+        if tile_atoms == DEFAULT_ATOMS:
+            # The fused RMSNorm cannot run at a block whose atom is wider
+            # than a row.
+            if all(b != BLOCK for _st, b in caps):
+                caps[(1, BLOCK)] = min(caps.values())
+            shared = [key for key, cap in caps.items() if self._caps.get(key) == cap]
+        else:
+            fits = [
+                b
+                for b in SUPPORTED_BLOCKS
+                if tile_atoms_for(hidden, self.world_size, b) == tile_atoms
+            ]
+            wide = {key: cap for key, cap in caps.items() if key[1] in fits}
+            if not wide:
+                wide[(1, BLOCK if BLOCK in fits else fits[0])] = min(caps.values())
+            caps, shared = wide, []
+        engines = self._norm_by_atoms.setdefault(tile_atoms, {})
+        build_kws = self._norm_build_kw.setdefault(tile_atoms, {})
+        for key in shared:
+            engines.setdefault(key, self._by_cfg[key])
+            build_kws.setdefault(key, self._build_kw[key])
+        built, built_kws = {}, {}
         try:
             self._build_engines(
                 {key: cap for key, cap in caps.items() if key not in engines},
-                engines,
-                build_kws,
+                built,
+                built_kws,
+                tile_atoms=tile_atoms,
             )
         except Exception:
-            for key, eng in engines.items():
-                if key not in shared:
-                    eng.close()
+            for eng in built.values():
+                eng.close()
             raise
-        self._norm_by_cfg = engines
-        self._norm_build_kw = build_kws
+        engines.update(built)
+        build_kws.update(built_kws)
 
     def _norm_cfg(self, live_bytes: int, hidden: int) -> tuple[tuple[int, int], int]:
-        """Key in ``_norm_by_cfg`` and tile count for a fused-norm payload.
+        """Key in the fused RMSNorm's engines at *hidden*'s tile width, and
+        tile count, for a fused-norm payload.
 
         The fused RMSNorm ladder's pick, unless its block cannot hold a
         hidden-wide row, in which case the ST=1 engine of the narrowest block
         that can. Needs ``compile_rmsnorm``.
         """
         self._check_norm(live_bytes, hidden)
-        engines = self._norm_by_cfg
-        if engines is None:
+        tile_atoms = self._tile_atoms(hidden)
+        engines = self._norm_by_atoms.get(tile_atoms)
+        if not engines:
             raise RuntimeError("the fused RMSNorm needs compile_rmsnorm first")
-        cfg, num_tiles = self._select_cfg(self._norm_ladder, engines, live_bytes)
-        if rmsnorm_hidden_supported(hidden, cfg[1]):
-            return cfg, num_tiles
-        blocks = sorted(
-            b for (_st, b) in engines if rmsnorm_hidden_supported(hidden, b)
-        )
+
+        def _holds(b):
+            return tile_atoms_for(hidden, self.world_size, b) is not None
+
+        # A wide tile has no engines at the blocks that cannot hold the row.
+        if _holds(select_rung(self._norm_ladder, live_bytes).block):
+            return self._select_cfg(self._norm_ladder, engines, live_bytes, tile_atoms)
+        blocks = sorted(b for (_st, b) in engines if _holds(b))
         if not blocks:
             raise ValueError(
                 f"no engine of this object has a block that supports hidden={hidden}"
             )
-        return (1, blocks[0]), self._num_tiles(live_bytes, blocks[0])
+        return (1, blocks[0]), self._num_tiles(live_bytes, blocks[0], tile_atoms)
 
     def allreduce_rmsnorm(
         self,
@@ -811,7 +869,7 @@ class QuickAllReduceInt4:
             inp: this rank's bf16 partial sum, ``rows x hidden`` elements.
             residual: bf16 residual, same number of elements as ``inp``.
             weight: bf16 RMSNorm weight of ``hidden`` elements; hidden must
-                be 2048, 4096, 8192 or 16384.
+                be 2048, 4096, 8192 or 16384, or 6144 at world_size 2 or 4.
             eps: RMSNorm epsilon.
             out: bf16 output for the normed rows, same size as ``inp``.
             residual_out: bf16 output for ``allreduce(inp) + residual``; may
@@ -928,7 +986,7 @@ class QuickAllReduceInt4:
             mxfp4_ptrs = (int(mxfp4[0].data_ptr()), int(mxfp4[1].data_ptr()))
         self.compile_rmsnorm(hidden)
         cfg, num_tiles = self._norm_cfg(live_bytes, hidden)
-        eng = self._norm_by_cfg[cfg]
+        eng = self._norm_by_atoms[self._tile_atoms(hidden)][cfg]
         # One tile per workgroup at <= 2 workgroups per CU: occupancy is
         # free, so take the low-latency build.
         latency = cfg == (1, BLOCK) and num_tiles <= min(
@@ -957,9 +1015,8 @@ class QuickAllReduceInt4:
         )
 
     def close(self):
-        if not getattr(self, "_by_cfg", None) and not getattr(
-            self, "_norm_by_cfg", None
-        ):
+        norm_by_atoms = getattr(self, "_norm_by_atoms", None) or {}
+        if not getattr(self, "_by_cfg", None) and not any(norm_by_atoms.values()):
             return
         with torch.cuda.device(self._device_index):
             if getattr(self, "_has_launched", False):
@@ -968,8 +1025,7 @@ class QuickAllReduceInt4:
             for eng in self._engines():
                 eng.close()
             self._by_cfg.clear()
-            if self._norm_by_cfg is not None:
-                self._norm_by_cfg.clear()
+            norm_by_atoms.clear()
 
     def __del__(self):
         try:
