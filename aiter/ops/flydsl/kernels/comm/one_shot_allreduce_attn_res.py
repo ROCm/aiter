@@ -145,7 +145,7 @@ def _xchg_join_triple(
     dot_word, sq_word, cross_word,
     dot_part, sq_part, cross_part,
     dot_prev, sq_prev, cross_prev,
-    n_writers, tid, poll_n=None,
+    n_writers, tid,
 ):
     """Single-barrier join of the split AttnRes out-norm path (SILOTIGER-1277
     iter010): the prefix dot (signed), prefix sq, and cross=sum(pv*acc) (signed)
@@ -161,17 +161,6 @@ def _xchg_join_triple(
     every decode T. Like ``_xchg_join_dot_sq`` all atomics are issued first and
     all words polled after, in one function body, to dodge the back-to-back
     separate-join miscompile."""
-    # SILOTIGER-1277 iter052 collapse-feasibility probe: ``poll_n`` is a
-    # TRACE-TIME Python int (None -> n_writers = the shipped barrier). PERF ONLY
-    # (the probe arms give the WRONG numerics -- never gated). Default unchanged.
-    #   poll_n == 0  (env=1): keep the atomics, SKIP the cross-WG WAIT loops ->
-    #     isolates the cross-WG barrier WAIT. fused(norm)-fused(poll0)==wait cost.
-    #   poll_n == -1 (env=2): skip the atomics AND loads entirely, return each
-    #     WG's own wave partial -> removes the whole HBM cross-WG join.
-    #     fused(poll0)-fused(poll-1)==the HBM atomic-issue+readback cost.
-    poll_n = n_writers if poll_n is None else poll_n
-    if poll_n == -1:
-        return (dot_part, sq_part, cross_part, dot_prev, sq_prev, cross_prev)
     if (tid & fx.Int32(WAVE - 1)) == fx.Int32(0):
         fx.atomic_add(
             dot_word,
@@ -192,32 +181,29 @@ def _xchg_join_triple(
         dot_word, dtype=fx.Int64,
         memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
     )
-    if poll_n != 0:
-        while xchg_arrivals(curd - dot_prev) != fx.Int64(poll_n):
-            curd = fx.generic_load(
-                dot_word, dtype=fx.Int64,
-                memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
-            )
+    while xchg_arrivals(curd - dot_prev) != fx.Int64(n_writers):
+        curd = fx.generic_load(
+            dot_word, dtype=fx.Int64,
+            memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+        )
     curs = fx.generic_load(
         sq_word, dtype=fx.Int64,
         memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
     )
-    if poll_n != 0:
-        while xchg_arrivals(curs - sq_prev) != fx.Int64(poll_n):
-            curs = fx.generic_load(
-                sq_word, dtype=fx.Int64,
-                memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
-            )
+    while xchg_arrivals(curs - sq_prev) != fx.Int64(n_writers):
+        curs = fx.generic_load(
+            sq_word, dtype=fx.Int64,
+            memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+        )
     curc = fx.generic_load(
         cross_word, dtype=fx.Int64,
         memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
     )
-    if poll_n != 0:
-        while xchg_arrivals(curc - cross_prev) != fx.Int64(poll_n):
-            curc = fx.generic_load(
-                cross_word, dtype=fx.Int64,
-                memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
-            )
+    while xchg_arrivals(curc - cross_prev) != fx.Int64(n_writers):
+        curc = fx.generic_load(
+            cross_word, dtype=fx.Int64,
+            memory_order=fx.AtomicOrdering.Monotonic, syncscope=rocdl.SyncScope.AgentOneAs,
+        )
     return (
         xchg_total_signed(curd - dot_prev, n_writers),
         xchg_total(curs - sq_prev),
@@ -478,13 +464,6 @@ class OneShotAttnResEpilogue:
             #     term is the producer's full-row accsq scalar (no join).
             self.n_streams = 3 if self.out_norm else 2
             self.n_writers = split * self.n_waves
-            # iter052 collapse-feasibility probe (PERF ONLY, default off): when
-            # set, the cross-WG join wait loops are skipped at trace time so the
-            # fused latency excludes the join barrier (see ``_xchg_join_triple``).
-            _probe = os.environ.get("AITER_FLY_AR_COLLAPSE_PROBE")
-            self.join_poll_n = (
-                0 if _probe == "1" else -1 if _probe == "2" else self.n_writers
-            )
             xchg_clamp_units(self.n_writers)
             self.n_groups = grid // split
             self.xchg_prev_off = (
@@ -904,7 +883,6 @@ class _BoundOneShotAttnRes:
                 state[0], state[3], state[6],
                 epi.n_writers,
                 self.tid,
-                epi.join_poll_n,
             )
             with fx.fastmath("afn"):
                 prefix_score = total_dot * fmath.rsqrt(
