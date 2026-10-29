@@ -213,7 +213,6 @@ def make_quick_allreduce_int4_kernel(
     block: int = BLOCK,
     rank: int,
     norm_hidden: int | None = None,
-    norm_eps: float = 1e-6,
     gemma_norm: bool = False,
     norm_latency: bool = False,
     norm_mxfp4: bool = False,
@@ -225,7 +224,8 @@ def make_quick_allreduce_int4_kernel(
     ``out = rmsnorm(residual_out) * weight`` (``1 + weight`` with
     ``gemma_norm``), the contract of vLLM's ``fused_add_rms_norm``. It needs
     the INT4 codec and a ``hidden`` for which ``rmsnorm_hidden_supported``
-    holds at ``block``.
+    holds at ``block``. The RMSNorm epsilon is the runtime ``norm_eps``
+    argument, so one build serves every epsilon.
 
     ``norm_mxfp4`` additionally quantizes the bf16 ``out`` to MXFP4 the way
     ``per_1x32_f4_quant_hip(out, shuffle=True)`` does: packed fp4x2
@@ -324,7 +324,6 @@ def make_quick_allreduce_int4_kernel(
         ROWS_PER_TILE = ATOMS // ATOMS_PER_ROW
         SCALE_N = mxfp4_scale_shape(1, norm_hidden)[1]
         INV_HIDDEN = 1.0 / float(norm_hidden)
-        EPS = float(norm_eps)
         # Atoms whose loads issue together. LLVM cannot hoist a load above
         # the previous atom's store (in place, residual is residual_out), so
         # this is the epilogue's memory-level parallelism; larger groups
@@ -362,6 +361,7 @@ def make_quick_allreduce_int4_kernel(
         weight_ptr: Int64,
         mxfp4_ptr: Int64,
         mxfp4_scale_ptr: Int64,
+        norm_eps: Float32,
         n_blocks: Int32,
         divisor: Float32 = Float32(DEFAULT_DIVISOR),  # noqa: B008
     ):
@@ -696,9 +696,7 @@ def make_quick_allreduce_int4_kernel(
                             total = total + fx.Float32(
                                 fx.ptr_load(red_ptr + (w * ATOMS + row))
                             )
-                        rstd = fmath.rsqrt(
-                            total * fx.Float32(INV_HIDDEN) + fx.Float32(EPS)
-                        )
+                        rstd = fmath.rsqrt(total * fx.Float32(INV_HIDDEN) + norm_eps)
                     x = xs[i].bitcast(fx.BFloat16).to(fx.Float32)
                     w = ws[i].bitcast(fx.BFloat16).to(fx.Float32)
                     if const_expr(gemma_norm):
@@ -1070,6 +1068,7 @@ def make_quick_allreduce_int4_kernel(
         weight_ptr: Int64,
         mxfp4_ptr: Int64,
         mxfp4_scale_ptr: Int64,
+        norm_eps: Float32,
         grid_x: Int32,
         divisor: Float32 = DEFAULT_DIVISOR,
         stream: Stream = Stream(None),  # noqa: B008
@@ -1087,6 +1086,7 @@ def make_quick_allreduce_int4_kernel(
             weight_ptr,
             mxfp4_ptr,
             mxfp4_scale_ptr,
+            norm_eps,
             grid_x,
             divisor,
             value_attrs=value_attrs,

@@ -15,6 +15,9 @@ case:
 * bitwise equality of ``out`` / ``residual_out`` across ranks;
 * where the fused RMSNorm has its own ladder, the same checks again on the
   mesh ladder, so the fused builds of its super-tiles stay covered;
+* the first fused call inside a HIP graph capture, with no eager call
+  before it: every fused binary of a hidden declared in ``rmsnorm_hidden`` is
+  captured in one graph, at an epsilon other than the default;
 * on gfx950, ``allreduce_rmsnorm_mxfp4``: the same ``out`` / ``residual_out``
   bit for bit, and fp4 bytes plus shuffled e8m0 scales equal to
   ``per_1x32_f4_quant_hip(out, shuffle=True)``.
@@ -92,10 +95,10 @@ def _sqnr_db(got: torch.Tensor, ref: torch.Tensor) -> float:
     return float(10.0 * torch.log10(pow_ / mse))
 
 
-def _ref_add_rmsnorm(ar, res, weight, gemma_norm):
+def _ref_add_rmsnorm(ar, res, weight, gemma_norm, eps=EPS):
     z = ar.float() + res.float()
     w = weight.float() + 1.0 if gemma_norm else weight.float()
-    rstd = torch.rsqrt(z.pow(2).mean(dim=-1, keepdim=True) + EPS)
+    rstd = torch.rsqrt(z.pow(2).mean(dim=-1, keepdim=True) + eps)
     return (z * rstd * w).to(torch.bfloat16), z.to(torch.bfloat16)
 
 
@@ -165,13 +168,11 @@ def _run_rank(rank, tp, init_method, cases, time_it, norm_ladder):
         world_size=tp,
         min_bytes=0,
         norm_ladder=norm_ladder,
+        rmsnorm_hidden=tuple(sorted({c[1] for c in cases})),
     )
     rows = []
-    # compile_rmsnorm must cover every fused build the cases pick: a case that
-    # adds one to the cache compiled it on its first call.
-    for hidden, gemma_norm in sorted({(c[1], c[2]) for c in cases}):
-        for mxfp4 in (False, True) if fly.supports_mxfp4 else (False,):
-            fly.compile_rmsnorm(hidden, EPS, gemma_norm=gemma_norm, mxfp4=mxfp4)
+    # The constructor must prepare every fused build the cases pick: a case
+    # that adds one to the cache compiled it on its first call.
     warmed = set(fly._norm_launch)
     try:
         for ntok, hidden, gemma_norm, inplace in cases:
@@ -310,7 +311,7 @@ def _run_rank(rank, tp, init_method, cases, time_it, norm_ladder):
             rows.append(row)
             dist.barrier(group=group)
         if set(fly._norm_launch) != warmed:
-            raise AssertionError("a case compiled a fused build compile_rmsnorm missed")
+            raise AssertionError("a case compiled a fused build rmsnorm_hidden missed")
     finally:
         fly.close()
         dist.destroy_process_group()
@@ -338,6 +339,188 @@ def _spawn(tp, cases, *, time_it, norm_ladder=None):
     finally:
         pool.join()
     return ranks
+
+CAPTURE_HIDDEN = 4096
+CAPTURE_TOKENS = (37, 3072)
+CAPTURE_EPS = 0.5
+
+
+def _capture_first_rank(rank, tp, init_method, norm_ladder):
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        world_size=tp,
+        rank=rank,
+        device_id=device,
+    )
+    gloo = dist.new_group(backend="gloo")
+    group = dist.group.WORLD
+    fly = QuickAllReduceInt4(
+        group=gloo,
+        device=device,
+        rank=rank,
+        world_size=tp,
+        min_bytes=0,
+        norm_ladder=norm_ladder,
+        rmsnorm_hidden=(CAPTURE_HIDDEN,),
+    )
+    res = {"capture_error": None, "rows": []}
+    try:
+        built = set(fly._norm_launch)
+        res["unloaded"] = sum(not launcher_loaded(fly._norm_launch[k]) for k in built)
+        calls = []
+        for ntok in CAPTURE_TOKENS:
+            for gemma_norm in (False, True):
+                for mxfp4 in (False, True) if fly.supports_mxfp4 else (False,):
+                    gen = torch.Generator().manual_seed(1234 + rank + ntok)
+                    inp = (torch.randn((ntok, CAPTURE_HIDDEN), generator=gen) * 0.1).to(
+                        device=device, dtype=torch.bfloat16
+                    )
+                    shared = torch.Generator().manual_seed(99 + ntok)
+                    resid = torch.randn((ntok, CAPTURE_HIDDEN), generator=shared).to(
+                        device=device, dtype=torch.bfloat16
+                    )
+                    weight = (
+                        torch.randn((CAPTURE_HIDDEN,), generator=shared) * 0.2
+                        + (0.0 if gemma_norm else 1.0)
+                    ).to(device=device, dtype=torch.bfloat16)
+                    ref_ar = inp.float()
+                    dist.all_reduce(ref_ar, group=group)
+                    calls.append(
+                        {
+                            "tokens": ntok,
+                            "gemma": gemma_norm,
+                            "mxfp4": mxfp4,
+                            "args": (inp, resid, weight),
+                            "out": torch.empty_like(inp),
+                            "res_out": torch.empty_like(inp),
+                            "q": _mxfp4_buffers(ntok, CAPTURE_HIDDEN, device),
+                            "ref": _ref_add_rmsnorm(
+                                ref_ar, resid, weight, gemma_norm, CAPTURE_EPS
+                            ),
+                        }
+                    )
+        torch.cuda.synchronize()
+
+        def _call(c):
+            inp, resid, weight = c["args"]
+            if c["mxfp4"]:
+                fly.allreduce_rmsnorm_mxfp4(
+                    inp,
+                    resid,
+                    weight,
+                    CAPTURE_EPS,
+                    c["out"],
+                    c["res_out"],
+                    *c["q"],
+                    gemma_norm=c["gemma"],
+                )
+            else:
+                fly.allreduce_rmsnorm(
+                    inp,
+                    resid,
+                    weight,
+                    CAPTURE_EPS,
+                    c["out"],
+                    c["res_out"],
+                    gemma_norm=c["gemma"],
+                )
+
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                for c in calls:
+                    _call(c)
+        except Exception as exc:  # noqa: BLE001 -- reported, and ends the test
+            res["capture_error"] = f"{type(exc).__name__}: {exc}"
+        errors = [None] * tp
+        dist.all_gather_object(errors, res["capture_error"], group=gloo)
+        # Replay only if every rank captured: the graph launches peers' kernels.
+        if not any(errors):
+            graph.replay()
+            torch.cuda.synchronize()
+            for c in calls:
+                ref_out, ref_res = c["ref"]
+                row = {
+                    "tokens": c["tokens"],
+                    "gemma": c["gemma"],
+                    "mxfp4": c["mxfp4"],
+                    "sqnr_out_db": _sqnr_db(c["out"].float(), ref_out.float()),
+                    "sqnr_res_db": _sqnr_db(c["res_out"].float(), ref_res.float()),
+                    "mxfp4_equal": None,
+                }
+                if c["mxfp4"]:
+                    ref_q, ref_s = aiter.per_1x32_f4_quant_hip(c["out"], shuffle=True)
+                    live = _live_scale_idx(c["tokens"], CAPTURE_HIDDEN, device)
+                    q, q_s = c["q"]
+                    row["mxfp4_equal"] = torch.equal(
+                        q, ref_q.view(torch.uint8)
+                    ) and torch.equal(
+                        q_s.flatten()[live], ref_s.view(torch.uint8).flatten()[live]
+                    )
+                res["rows"].append(row)
+        res["compiled_in_capture"] = len(set(fly._norm_launch) - built)
+
+        # A width that was never prepared cannot be prepared under capture.
+        inp = torch.zeros((1, 2 * CAPTURE_HIDDEN), dtype=torch.bfloat16, device=device)
+        weight = torch.zeros(2 * CAPTURE_HIDDEN, dtype=torch.bfloat16, device=device)
+        res["unprepared_error"] = None
+        try:
+            with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+                fly.allreduce_rmsnorm(
+                    inp, inp.clone(), weight, CAPTURE_EPS, inp.clone(), inp.clone()
+                )
+        except RuntimeError as exc:
+            res["unprepared_error"] = str(exc)
+        dist.barrier(group=gloo)
+    finally:
+        fly.close()
+        dist.destroy_process_group()
+    return res
+
+
+def test_first_call_in_capture(tp, norm_ladder=None):
+    """The first fused call is inside a graph capture."""
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with Pool(processes=tp) as pool:
+        futs = [
+            pool.apply_async(
+                _capture_first_rank, args=(rank, tp, init_method, norm_ladder)
+            )
+            for rank in range(tp)
+        ]
+        ranks = [
+            f.get(timeout=float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600")))
+            for f in futs
+        ]
+    fails = []
+    for rank, r in enumerate(ranks):
+        where = f"rank {rank}"
+        if r["capture_error"]:
+            fails.append(f"{where}: capture failed: {r['capture_error']}")
+        if r["unloaded"]:
+            fails.append(f"{where}: {r['unloaded']} fused builds not loaded at init")
+        if r["compiled_in_capture"]:
+            fails.append(f"{where}: the capture built {r['compiled_in_capture']}")
+        if not r["unprepared_error"] or "rmsnorm_hidden" not in r["unprepared_error"]:
+            fails.append(f"{where}: unprepared hidden under capture did not raise")
+        for row in r["rows"]:
+            for key in ("sqnr_out_db", "sqnr_res_db"):
+                if row[key] < SQNR_MIN_DB:
+                    fails.append(f"{where} {row}: {key} < {SQNR_MIN_DB}")
+            if row["mxfp4_equal"] is False:
+                fails.append(f"{where} {row}: MXFP4 differs")
+    if fails:
+        raise AssertionError("; ".join(fails))
+    return ranks[0]["rows"]
 
 
 def _assert_valid(ranks, cases):
@@ -384,12 +567,23 @@ def main():
     )
     link = resolve_link(None)
     mesh = mesh_st_ladder(world_size=args.tp, link=link)
-    if mesh_norm_ladder(world_size=args.tp, link=link) != mesh:
+    own_ladder = mesh_norm_ladder(world_size=args.tp, link=link) != mesh
+    if own_ladder:
         ranks = _spawn(args.tp, _VALIDITY_CASES, time_it=False, norm_ladder=mesh)
         _assert_valid(ranks, _VALIDITY_CASES)
         aiter.logger.info(
             "validity on the mesh ladder (rank 0):\n%s",
             pd.DataFrame(ranks[0]).to_markdown(index=False),
+        )
+    for ladder, label in (
+        (None, ""),
+        *(((mesh, " on the mesh ladder"),) if own_ladder else ()),
+    ):
+        rows = test_first_call_in_capture(args.tp, norm_ladder=ladder)
+        aiter.logger.info(
+            "first call in capture%s (rank 0):\n%s",
+            label,
+            pd.DataFrame(rows).to_markdown(index=False),
         )
 
     bench = []

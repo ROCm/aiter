@@ -257,7 +257,7 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 #           Block 512 from 4 MiB.
 #         gfx950: one b256 rung per TP.
 #           - TP2 ST=1 cap512
-#           - TP4 ST=1 cap1024 
+#           - TP4 ST=1 cap1024
 #           - TP8 ST=8 cap384:
 #   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
 #         TP8 ST=8 everywhere.
@@ -301,10 +301,10 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
 }
 
 # Mesh with the fused add+RMSNorm epilogue, ``TwoShotRung``. Every rank
-# normalises the whole payload in the all-gather lap. 
+# normalises the whole payload in the all-gather lap.
 # A platform with no row runs on its mesh ladder.
 #
-#   xGMI  gfx950 
+#   xGMI  gfx950
 #           TP8: ST=1 b256 cap1024 over the whole window, at hidden 4096
 #           and 8192, with or without MXFP4. TP2 and TP4 have no row: their mesh
 #           rung is also the best fused one.

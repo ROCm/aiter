@@ -38,6 +38,7 @@ from .allreduce_host_shared import (
     check_payload,
     check_world_size,
     kernel_symbol,
+    launcher_loaded,
     payload_probes,
     preload_launcher,
     require_arch,
@@ -119,8 +120,9 @@ class _Algorithm:
     # a schedule without one.
     norm_ladder: Callable[..., tuple[TwoShotRung, ...]] | None = None
     # Trailing ``Int64`` kernel arguments before the grid size: the fused
-    # RMSNorm's residual, residual_out, weight, MXFP4 out and scale pointers.
-    # Plain launches pass zeros.
+    # RMSNorm's residual, residual_out, weight, MXFP4 out and scale pointers,
+    # then its ``Float32`` epsilon. Plain launches pass zeros. A schedule
+    # without the fused RMSNorm has none of them.
     norm_ptr_args: int = 0
     # Whether the kernel takes the shared ``divisor`` as its last argument.
     has_divisor: bool = False
@@ -273,6 +275,9 @@ class QuickAllReduceInt4:
     tests that run other configurations, and ``norm_ladder`` does the same for
     the fused add+RMSNorm of the mesh algorithm. Both schedules specialise their
     binary to this rank, so the JIT symbol carries an ``_r<n>_`` field.
+
+    ``rmsnorm_hidden`` lists the row widths ``allreduce_rmsnorm`` will be
+    called with.
     """
 
     def __init__(
@@ -290,6 +295,7 @@ class QuickAllReduceInt4:
         link: str | None = None,
         ladder: tuple[TwoShotRung, ...] | None = None,
         norm_ladder: tuple[TwoShotRung, ...] | None = None,
+        rmsnorm_hidden: tuple[int, ...] = (),
     ):
         check_world_size(world_size)
         if algorithm not in ALGORITHMS:
@@ -357,13 +363,17 @@ class QuickAllReduceInt4:
         # Per engine, the arguments that rebuild its kernel.
         self._build_kw = {}
         # The fused RMSNorm's engines and their arguments, built by
-        # ``prepare_rmsnorm``, and the fused builds ``norm_launch`` adds to
+        # ``compile_rmsnorm``, and the fused builds ``norm_launch`` adds to
         # them on first use.
         self._norm_by_cfg = None
         self._norm_build_kw = {}
         self._norm_launch = {}
+        # Row widths whose fused builds are all compiled and loaded.
+        self._rmsnorm_hidden = set()
         try:
             self._build_engines(self._caps, self._by_cfg, self._build_kw)
+            for hidden in sorted({int(h) for h in rmsnorm_hidden}):
+                self.compile_rmsnorm(hidden)
         except Exception:
             self.close()
             raise
@@ -537,6 +547,7 @@ class QuickAllReduceInt4:
         live_bytes,
         num_tiles,
         norm_ptrs=None,
+        norm_eps: float = 0.0,
         divisor: float = DEFAULT_DIVISOR,
     ):
         if stream is None:
@@ -552,6 +563,7 @@ class QuickAllReduceInt4:
             Int64(int(eng._gpu_peer_ptrs)),
             Int64(int(eng._colors)),
             *(Int64(p) for p in self._norm_ptrs(norm_ptrs)),
+            *((Float32(norm_eps),) if self._algo.norm_ptr_args else ()),
             Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
             *((Float32(divisor),) if self._algo.has_divisor else ()),
             stream,
@@ -573,6 +585,7 @@ class QuickAllReduceInt4:
         live_bytes: int,
         launch=None,
         norm_ptrs=None,
+        norm_eps: float = 0.0,
         divisor: float = DEFAULT_DIVISOR,
     ) -> None:
         num_tiles = max(1, (live_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
@@ -584,6 +597,7 @@ class QuickAllReduceInt4:
             live_bytes=live_bytes,
             num_tiles=num_tiles,
             norm_ptrs=norm_ptrs,
+            norm_eps=norm_eps,
             divisor=divisor,
         )
         # A launch may still be using the raw HIP allocations when Python drops
@@ -619,19 +633,18 @@ class QuickAllReduceInt4:
                 args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
                 preload_launcher(eng.launch, *args)
 
-    def norm_launch(self, cfg, hidden, eps, gemma_norm, latency=False, mxfp4=False):
+    def norm_launch(self, cfg, hidden, gemma_norm, latency=False, mxfp4=False):
         """Fused add+RMSNorm variant of the fused RMSNorm's engine *cfg*;
         shares its inbox and colors."""
-        key = (cfg, int(hidden), float(eps), bool(gemma_norm), bool(latency), mxfp4)
+        key = (cfg, int(hidden), bool(gemma_norm), bool(latency), bool(mxfp4))
         launch = self._norm_launch.get(key)
         if launch is None:
             launch = self._algo.build(
                 **self._norm_build_kw[cfg],
                 norm_hidden=key[1],
-                norm_eps=key[2],
-                gemma_norm=key[3],
-                norm_latency=key[4],
-                norm_mxfp4=key[5],
+                gemma_norm=key[2],
+                norm_latency=key[3],
+                norm_mxfp4=key[4],
             )["launch"]
             self._norm_launch[key] = launch
         return launch
@@ -672,24 +685,60 @@ class QuickAllReduceInt4:
                 f"{live_bytes} bytes"
             )
 
-    def prepare_rmsnorm(self) -> None:
-        """Build the engines of the fused add+RMSNorm, those of its ladder in
-        ``MESH_NORM_LADDER``.
+    def compile_rmsnorm(self, hidden: int) -> None:
+        """Eager-JIT and preload every fused build ``allreduce_rmsnorm`` can pick
+        for hidden, without launching any.
 
-        Collective, as the constructor is: every rank calls it, and before
-        CUDA graph capture. ``compile_rmsnorm`` calls it, as does the first
-        ``allreduce_rmsnorm`` when neither ran. An engine whose configuration
-        the plain all-reduce already has is shared, not built again.
+        Collective the first time, when it builds the engines: every rank calls
+        it, outside CUDA graph capture. The constructor calls it for each width
+        in ``rmsnorm_hidden``, and the first eager ``allreduce_rmsnorm`` at an
+        unprepared width does too.
+
+        Args:
+            hidden: row width; 2048, 4096, 8192 or 16384, or 6144 at
+                world_size 2 or 4.
         """
-        if self._norm_by_cfg is not None:
+        hidden = int(hidden)
+        if hidden in self._rmsnorm_hidden:
             return
-        self._check_norm_schedule()
+        self._check_norm(hidden * 2, hidden)
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "QuickAllReduceInt4: the fused RMSNorm's engines are built by "
-                "a collective and cannot be created under CUDA graph capture; "
-                "call compile_rmsnorm (or prepare_rmsnorm) first"
+                f"QuickAllReduceInt4: the fused RMSNorm at hidden={hidden} is "
+                "not prepared, and preparing it builds IPC engines and compiles "
+                "kernels, which cannot run under CUDA graph capture; pass "
+                f"rmsnorm_hidden=({hidden},) to the constructor, or call "
+                f"compile_rmsnorm({hidden}) on every rank before the capture"
             )
+        if self._norm_by_cfg is None:
+            self._build_norm_engines()
+        # Raises if no engine has a block that holds the row.
+        self._norm_cfg(hidden * 2, hidden)
+        variants = [
+            (gemma_norm, mxfp4)
+            for gemma_norm in (False, True)
+            for mxfp4 in ((False, True) if self.supports_mxfp4 else (False,))
+        ]
+        with torch.cuda.device(self._device_index):
+            for cfg, eng in self._norm_by_cfg.items():
+                if not rmsnorm_hidden_supported(hidden, cfg[1]):
+                    continue
+                args = self._launch_args(
+                    eng, 0, 0, None, live_bytes=0, num_tiles=0, norm_ptrs=()
+                )
+                for latency in (True, False) if cfg == (1, BLOCK) else (False,):
+                    for gemma_norm, mxfp4 in variants:
+                        launch = self.norm_launch(
+                            cfg, hidden, gemma_norm, latency, mxfp4
+                        )
+                        preload_launcher(launch, *args)
+        self._rmsnorm_hidden.add(hidden)
+
+    def _build_norm_engines(self) -> None:
+        """Build the engines of the fused add+RMSNorm, those of its ladder in
+        ``MESH_NORM_LADDER``. Collective, as the constructor is. An engine whose
+        configuration the plain all-reduce already has is shared, not built
+        again."""
         caps = self._engine_caps(self._norm_ladder)
         # The fused RMSNorm cannot run at a block whose atom is wider than a row.
         if all(b != BLOCK for _st, b in caps):
@@ -716,12 +765,12 @@ class QuickAllReduceInt4:
 
         The fused RMSNorm ladder's pick, unless its block cannot hold a
         hidden-wide row, in which case the ST=1 engine of the narrowest block
-        that can. Needs ``prepare_rmsnorm``.
+        that can. Needs ``compile_rmsnorm``.
         """
         self._check_norm(live_bytes, hidden)
         engines = self._norm_by_cfg
         if engines is None:
-            raise RuntimeError("the fused RMSNorm needs prepare_rmsnorm first")
+            raise RuntimeError("the fused RMSNorm needs compile_rmsnorm first")
         cfg, num_tiles = self._select_cfg(self._norm_ladder, engines, live_bytes)
         if rmsnorm_hidden_supported(hidden, cfg[1]):
             return cfg, num_tiles
@@ -733,73 +782,6 @@ class QuickAllReduceInt4:
                 f"no engine of this object has a block that supports hidden={hidden}"
             )
         return (1, blocks[0]), self._num_tiles(live_bytes, blocks[0])
-
-    def compile_rmsnorm(
-        self,
-        hidden: int,
-        eps: float,
-        *,
-        gemma_norm: bool = False,
-        mxfp4: bool = False,
-        stream=None,
-    ) -> None:
-        """Eager-JIT every fused build ``allreduce_rmsnorm`` can pick for ``hidden``.
-
-        Without this the first ``allreduce_rmsnorm`` call of each build pays its
-        FlyDSL compile: the low-latency and the occupancy-pinned build of an
-        ST=1 engine, and the pinned build of an ST>1 engine, are separate
-        binaries. Each is launched once on a zero one-row payload, so every rank
-        must call this with the same arguments.
-
-        Args:
-            hidden: row width; see ``supports_rmsnorm``.
-            eps: RMSNorm epsilon of the calls to warm.
-            gemma_norm: warm the ``1 + weight`` builds.
-            mxfp4: warm the ``allreduce_rmsnorm_mxfp4`` builds (gfx950).
-            stream: ``None`` uses the current PyTorch stream on this device.
-        """
-        live_bytes = int(hidden) * 2
-        self._check_norm(live_bytes, hidden)
-        if mxfp4 and not self.supports_mxfp4:
-            raise RuntimeError("fused MXFP4 quant needs gfx950")
-        self.prepare_rmsnorm()
-        dev = torch.device("cuda", self._device_index)
-        inp, out, residual, residual_out, weight = (
-            torch.zeros(hidden, dtype=torch.bfloat16, device=dev) for _ in range(5)
-        )
-        mxfp4_bufs = ()
-        if mxfp4:
-            mxfp4_bufs = (
-                torch.empty(hidden // 2, dtype=torch.uint8, device=dev),
-                torch.empty(
-                    mxfp4_scale_shape(1, hidden), dtype=torch.uint8, device=dev
-                ),
-            )
-        norm_ptrs = (
-            int(residual.data_ptr()),
-            int(residual_out.data_ptr()),
-            int(weight.data_ptr()),
-            *(int(t.data_ptr()) for t in mxfp4_bufs),
-        )
-        for cfg, eng in self._norm_by_cfg.items():
-            if not rmsnorm_hidden_supported(hidden, cfg[1]):
-                continue
-            st, b = cfg
-            for latency in (True, False) if (st, b) == (1, BLOCK) else (False,):
-                self._launch_eng(
-                    eng,
-                    inp,
-                    out,
-                    stream,
-                    live_bytes=live_bytes,
-                    launch=self.norm_launch(
-                        cfg, hidden, eps, gemma_norm, latency, mxfp4
-                    ),
-                    norm_ptrs=norm_ptrs,
-                )
-        # The dummy tensors go out of scope here; the launches may be on a
-        # stream other than the one that allocated them.
-        torch.cuda.synchronize(self._device_index)
 
     def allreduce_rmsnorm(
         self,
@@ -819,9 +801,11 @@ class QuickAllReduceInt4:
         ``out = rmsnorm(residual_out, eps) * w`` with ``w = weight`` or
         ``1 + weight`` when ``gemma_norm``.
 
-        Runs on the engines of ``MESH_NORM_LADDER``. The first call builds
-        them, a collective that cannot be captured: under CUDA graph capture,
-        call ``compile_rmsnorm`` first.
+        Runs on the engines of ``MESH_NORM_LADDER``. A call may be inside a
+        CUDA graph capture, the first one included, if *hidden* is prepared:
+        given in the constructor's ``rmsnorm_hidden``, or by an earlier
+        ``compile_rmsnorm`` or eager call. An eager call prepares it, which is
+        a collective the first time.
 
         Args:
             inp: this rank's bf16 partial sum, ``rows x hidden`` elements.
@@ -942,7 +926,7 @@ class QuickAllReduceInt4:
                 if not t.is_contiguous() or t.numel() < nbytes:
                     raise ValueError(f"{name} must be contiguous with {nbytes} bytes")
             mxfp4_ptrs = (int(mxfp4[0].data_ptr()), int(mxfp4[1].data_ptr()))
-        self.prepare_rmsnorm()
+        self.compile_rmsnorm(hidden)
         cfg, num_tiles = self._norm_cfg(live_bytes, hidden)
         eng = self._norm_by_cfg[cfg]
         # One tile per workgroup at <= 2 workgroups per CU: occupancy is
@@ -950,15 +934,20 @@ class QuickAllReduceInt4:
         latency = cfg == (1, BLOCK) and num_tiles <= min(
             eng.grid, self._latency_max_tiles
         )
+        launch = self.norm_launch(cfg, hidden, gemma_norm, latency, mxfp4 is not None)
+        if torch.cuda.is_current_stream_capturing() and not launcher_loaded(launch):
+            raise RuntimeError(
+                f"QuickAllReduceInt4: fused build {kernel_symbol(launch)} is not "
+                "loaded, and loading it cannot run under CUDA graph capture"
+            )
         self._launch_eng(
             eng,
             inp,
             out,
             stream,
             live_bytes=live_bytes,
-            launch=self.norm_launch(
-                cfg, hidden, eps, gemma_norm, latency, mxfp4 is not None
-            ),
+            launch=launch,
+            norm_eps=float(eps),
             norm_ptrs=(
                 int(residual.data_ptr()),
                 int(residual_out.data_ptr()),

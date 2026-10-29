@@ -130,8 +130,12 @@ levels:
    `MESH_ST_LADDER` and `RING_ST_LADDER`. The fused add+RMSNorm has its own ladder,
    `MESH_NORM_LADDER`, because its epilogue wants a different grid than the
    plain all-reduce. A platform without a row there uses its `MESH_ST_LADDER`.
-   The fused engines are built on first use. This is a collective, so call
-   `compile_rmsnorm` on every rank before CUDA graph capture.
+   Pass the row widths the fused call will use in the constructor's
+   `rmsnorm_hidden`. The constructor then builds the fused engines and compiles
+   and loads every fused binary of each width, so the first fused call can be
+   inside a HIP graph capture. The RMSNorm epsilon is a launch argument, so it 
+   does not select a binary.
+   `compile_rmsnorm(hidden)` does the same after construction, on every rank.
 
 ## Environment variables
 
