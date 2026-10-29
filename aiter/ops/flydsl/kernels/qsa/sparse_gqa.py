@@ -37,7 +37,12 @@ from flydsl.expr import (
 from flydsl.expr import math as fxmath
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-from aiter.ops.flydsl.kernels.kernels_common import LOG2E, kernel_signature
+from aiter.ops.flydsl.kernels.kernels_common import (
+    LOG2E,
+    ceildiv,
+    div_nonneg,
+    kernel_signature,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
 
 # 256 CUs on gfx950 times four BN32 prefill workgroups each. Unlike the decode
@@ -75,10 +80,6 @@ _DECODE_BANDS_WIDE = (2, 12)
 # so a real -inf operand is poison and a compare against it can fold away.
 # 1e20 sits far below any bf16 QK score this kernel scales.
 _LSE_EMPTY = -1.0e20
-
-
-def _idiv(a, b):
-    return fx.Int32(fx.Uint32(a) // fx.Uint32(b))
 
 
 def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
@@ -132,7 +133,7 @@ def _launch_config(
         block_n, threads = 32, 128
         target_splits = max(1, _PREFILL_WGS // base_programs)
 
-    tiles = max(1, (n_sel + block_n - 1) // block_n)
+    tiles = max(1, ceildiv(n_sel, block_n))
     max_useful_splits = 1 << (tiles.bit_length() - 1)
     return block_n, threads, min(max_useful_splits, target_splits)
 
@@ -208,10 +209,10 @@ def _paged_gqa_lds_bytes(
     offset = 0
     align = 1
     for size, field_align in fields:
-        offset = (offset + field_align - 1) // field_align * field_align
+        offset = ceildiv(offset, field_align) * field_align
         offset += size
         align = max(align, field_align)
-    return (offset + align - 1) // align * align
+    return ceildiv(offset, align) * align
 
 
 def _paged_gqa_lds_reason(lds_bytes: int, use_k32: bool) -> str | None:
@@ -450,7 +451,7 @@ def build_qsa_sparse_gqa_module(
         wave = Int32(thread_coord[0].unpack())
         lane = Int32(thread_coord[1].unpack())
         lane_m = lane % Int32(16)
-        lane_kg = _idiv(lane, Int32(16))
+        lane_kg = div_nonneg(lane, Int32(16))
 
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
@@ -574,21 +575,21 @@ def build_qsa_sparse_gqa_module(
             # Match the live AMD prefill K LDS lowering. Each lane owns one
             # token and one 8xbf16 vector; D chunks are permuted in 4x4
             # groups while bits 5:6 of tid XOR the 128-bit bank address.
-            d_chunk = _idiv(d0, Int32(8))
+            d_chunk = div_nonneg(d0, Int32(8))
             owner = d_chunk % Int32(col_owners)
             store_tid = n_tok + owner * Int32(block_n)
-            rest = _idiv(d_chunk, Int32(col_owners))
-            group = _idiv(rest, Int32(k_quarter_radix))
+            rest = div_nonneg(d_chunk, Int32(col_owners))
+            group = div_nonneg(rest, Int32(k_quarter_radix))
             quarter = rest % Int32(k_quarter_radix)
             base_bytes = store_tid * Int32(16)
-            base_bytes = base_bytes ^ _idiv(store_tid & Int32(0x60), Int32(2))
+            base_bytes = base_bytes ^ div_nonneg(store_tid & Int32(0x60), Int32(2))
             base_bytes = base_bytes ^ (group * Int32(64))
             byte_offset = (
                 base_bytes
                 + group * Int32(k_group_slot)
                 + quarter * Int32(k_quarter_stride)
             )
-            return _idiv(byte_offset, Int32(2))
+            return div_nonneg(byte_offset, Int32(2))
 
         def amd_decode_k_elem(n_tok, d0):
             # Live AMD decode K (BN16, 8 KiB): one 16-byte unit per
@@ -597,18 +598,18 @@ def build_qsa_sparse_gqa_module(
             # are that one rotation seen through a 256-thread gather; in
             # flattened form the image depends only on the tile, so any lane
             # count that tiles ``block_n`` fills the same LDS bytes.
-            flat = _idiv(d0, Int32(8)) * Int32(block_n) + n_tok
-            return (flat ^ _idiv(flat, Int32(block_n * 2))) * Int32(8)
+            flat = div_nonneg(d0, Int32(8)) * Int32(block_n) + n_tok
+            return (flat ^ div_nonneg(flat, Int32(block_n * 2))) * Int32(8)
 
         def amd_decode_v_pack(n_tok, d0):
             # Live AMD decode V (BN16, 8 KiB): the same flattening at 8-byte
             # granularity with the half-chunk as the fastest axis, rotated by
             # ``i ^ (i >> 6)``. Reproduces the published ``A``, ``A^8``,
             # ``(A^64)+4096``, ``(A^0x48)+4096`` quartet at 256 threads.
-            d_chunk = _idiv(d0, Int32(8))
-            half = _idiv(d0 % Int32(8), Int32(4))
+            d_chunk = div_nonneg(d0, Int32(8))
+            half = div_nonneg(d0 % Int32(8), Int32(4))
             vflat = (d_chunk * Int32(block_n) + n_tok) * Int32(2) + half
-            return (vflat ^ _idiv(vflat, Int32(block_n * 4))) * Int32(4)
+            return (vflat ^ div_nonneg(vflat, Int32(block_n * 4))) * Int32(4)
 
         def amd_k_off(n_tok, d0):
             return (
@@ -647,14 +648,9 @@ def build_qsa_sparse_gqa_module(
             scan_partial = storage.partial.view(fx.make_layout(num_waves, 1))
 
         def _scan_last_valid(partial):
-            span = _idiv(n_sel + Int32(block_threads - 1), Int32(block_threads))
+            span = div_nonneg(n_sel + Int32(block_threads - 1), Int32(block_threads))
             none = Int32(-1)
-            for _i, state in range(
-                fx.Int64(0),
-                fx.Int64(span),
-                fx.Int64(1),
-                init=[none],
-            ):
+            for _i, state in range(0, span, 1, init=[none]):
                 mine = Int32(state[0])
                 col_i = tid + Int32(_i) * Int32(block_threads)
                 in_width = col_i < n_sel
@@ -664,7 +660,7 @@ def build_qsa_sparse_gqa_module(
             val = Int32(scan_state)
             for sh in (32, 16, 8, 4, 2, 1):
                 peer = fx.gpu.shuffle_xor(val, sh, 64)
-                val = (val > peer).select(val, peer)
+                val = fx.max(val, peer)
             # Every lane of the wave holds the same max, so the store is uniform.
             partial[wave] = val
             gpu.barrier()
@@ -672,18 +668,15 @@ def build_qsa_sparse_gqa_module(
             for w in range_constexpr(num_waves):
                 if const_expr(w > 0):
                     other = Int32(partial[Int32(w)])
-                    last = (last > other).select(last, other)
+                    last = fx.max(last, other)
             return last + one
 
         @flyc.jit
         def _row_valid_cols():
             cols = zero
             if n_sel > zero:
-                last_tok = indices[row, n_sel - one]
                 cols = n_sel
-                if last_tok >= zero:
-                    cols = n_sel
-                else:
+                if indices[row, n_sel - one] < zero:
                     cols = _scan_last_valid(scan_partial)
             return cols
 
@@ -691,16 +684,16 @@ def build_qsa_sparse_gqa_module(
             row_cols = n_sel
         else:
             row_cols = _row_valid_cols()
-        total_tiles = _idiv(n_sel + Int32(block_n - 1), Int32(block_n))
-        tile_start = _idiv(split * total_tiles, Int32(n_splits))
-        tile_end = _idiv((split + one) * total_tiles, Int32(n_splits))
-        row_tiles = _idiv(row_cols + Int32(block_n - 1), Int32(block_n))
-        tile_end = (tile_end < row_tiles).select(tile_end, row_tiles)
+        total_tiles = div_nonneg(n_sel + Int32(block_n - 1), Int32(block_n))
+        tile_start = div_nonneg(split * total_tiles, Int32(n_splits))
+        tile_end = div_nonneg((split + one) * total_tiles, Int32(n_splits))
+        row_tiles = div_nonneg(row_cols + Int32(block_n - 1), Int32(block_n))
+        tile_end = fx.min(tile_end, row_tiles)
         col_start = tile_start * Int32(block_n)
         col_end_unclamped = tile_end * Int32(block_n)
-        col_end = (col_end_unclamped < row_cols).select(col_end_unclamped, row_cols)
+        col_end = fx.min(col_end_unclamped, row_cols)
         col = tid % Int32(block_n)
-        chunk_owner = _idiv(tid, Int32(block_n))
+        chunk_owner = div_nonneg(tid, Int32(block_n))
 
         def tile_column(tile_i32):
             """This lane's column in ``tile_i32``, clamped to stay in bounds.
@@ -719,7 +712,7 @@ def build_qsa_sparse_gqa_module(
 
         def logical_page_of(tok):
             safe_tok = (tok >= zero).select(tok, zero)
-            lp = _idiv(safe_tok, page)
+            lp = div_nonneg(safe_tok, page)
             return lp, safe_tok - lp * page
 
         def load_page(tok):
@@ -994,7 +987,7 @@ def build_qsa_sparse_gqa_module(
                 store_elem = (
                     (col % Int32(32)) * Int32(4)
                     + chunk_owner * Int32(128)
-                    + _idiv(col, Int32(32)) * Int32(32 * head_dim)
+                    + div_nonneg(col, Int32(32)) * Int32(32 * head_dim)
                 )
                 # Byte address of this lane's V slot. ptrtoint includes the
                 # kv symbol base; an offset from LDS 0 matches only while
@@ -1211,7 +1204,7 @@ def build_qsa_sparse_gqa_module(
                             src_n = (
                                 Int32(ng * 16)
                                 + lane_kg * Int32(4)
-                                + _idiv(lane_m, Int32(4))
+                                + div_nonneg(lane_m, Int32(4))
                             )
                             src_d = d_base + (lane_m % Int32(4)) * Int32(4)
                             src = fx.make_view(
@@ -1229,17 +1222,17 @@ def build_qsa_sparse_gqa_module(
                             src_n = (
                                 Int32(ng * 16)
                                 + lane_kg * Int32(4)
-                                + _idiv(lane_m, Int32(4))
+                                + div_nonneg(lane_m, Int32(4))
                             )
                             src_d = d_base + (lane_m % Int32(4)) * Int32(4)
                             src_off = (
                                 Int32(v_elem_off)
                                 + src_d % Int32(4)
                                 + (src_n % Int32(32)) * Int32(4)
-                                + _idiv(src_d, Int32(8)) * Int32(128)
-                                + (_idiv(src_d, Int32(4)) % Int32(2))
+                                + div_nonneg(src_d, Int32(8)) * Int32(128)
+                                + (div_nonneg(src_d, Int32(4)) % Int32(2))
                                 * Int32(16 * head_dim)
-                                + _idiv(src_n, Int32(32)) * Int32(32 * head_dim)
+                                + div_nonneg(src_n, Int32(32)) * Int32(32 * head_dim)
                             )
                             src = fx.make_view(
                                 k_arr.ptr + src_off, fx.make_layout(4, 1)
@@ -1282,9 +1275,9 @@ def build_qsa_sparse_gqa_module(
         n_tiles = tile_end - tile_start
         n_tiles = (tile_end > tile_start).select(n_tiles, zero)
         for tile64, state in range(
-            fx.Int64(0),
-            fx.Int64(n_tiles),
-            fx.Int64(1),
+            0,
+            n_tiles,
+            1,
             init=init_acc + [tok0, tok1, phys0],
         ):
             t = Int32(tile64)
