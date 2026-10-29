@@ -123,10 +123,19 @@ def flops(shape):
     return 2.0 * shape.get("B", 1) * shape["M"] * shape["N"] * shape["K"]
 
 
-def resolve_installed(spec, shape, backend):
-    """The installed config for this shape (raw JSON bucket) and is_tuned, through the real loader."""
+# resolve_installed(cu_num=_DEVICE_CU): what the wrapper's config=None path reads on this device
+_DEVICE_CU = object()
+
+
+def resolve_installed(spec, shape, backend, cu_num=_DEVICE_CU):
+    """The installed config for this shape (raw JSON bucket) and is_tuned, through the real loader.
+
+    cu_num is the tree: by default what the wrapper's config=None path reads on this device;
+    None the default tree; a CU count its <cu_num>cu/ tree (the --cu-dir install scope).
+    """
     from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
+    scope = {} if cu_num is _DEVICE_CU else {"cu_num": cu_num}
     return get_gemm_config(
         spec.config_name,
         shape["M"],
@@ -135,14 +144,31 @@ def resolve_installed(spec, shape, backend):
         bounds=spec.bounds,
         backend=backend,
         B=shape.get("B"),
+        **scope,
     )
 
 
-def seed_table(spec, backend, shape_nk):
-    """(path, table) to install into: this shape's own file, else a new DEFAULT_FALLBACK table."""
-    from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+def installed_baseline(spec, shape, backend, keys, cu_num=None):
+    """The installed config of the tree a sweep installs into (cu_num as in resolve_installed)
+    -> (config with only the family's keys, is_tuned, dropped keys, explicit). explicit: the
+    launch must pass this config, because the wrapper's config=None path reads another tree on
+    this device, or keys had to be dropped."""
+    installed, is_tuned = resolve_installed(spec, shape, backend, cu_num=cu_num)
+    config = {k: v for k, v in installed.items() if k in keys}
+    dropped = sorted(k for k in installed if k not in keys)
+    explicit = bool(dropped) or installed != resolve_installed(spec, shape, backend)[0]
+    return config, is_tuned, dropped, explicit
 
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
+
+def seed_table(spec, backend, shape_nk, cu_num=None):
+    """(path, table) to install into: this shape's own file, else a new DEFAULT_FALLBACK table,
+    both in the tree cu_num picks (space.config_tree): nothing is read from another tree.
+    """
+    from space import config_tree
+
+    from aiter.ops.triton.utils.config_utils import load_config_json
+
+    config_dir = config_tree(spec, backend, cu_num)
     path = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"
     table = load_config_json(path, required=False)
     if table is not None:
@@ -157,15 +183,16 @@ def seed_table(spec, backend, shape_nk):
     }
 
 
-def family_bounds(spec, backend, shape_nk):
+def family_bounds(spec, backend, shape_nk, cu_num=None):
     """The M bounds the loader walks for this shape: the kernel's explicit bounds, else the
-    served file's M_BOUNDS, else the standard list."""
+    served file's M_BOUNDS (in the tree cu_num picks), else the standard list."""
     from aiter.ops.triton.utils.gemm_config_utils import STANDARD_M_BOUNDS
 
     if spec.bounds:
         return tuple(spec.bounds)
     return tuple(
-        seed_table(spec, backend, shape_nk)[1].get("M_BOUNDS") or STANDARD_M_BOUNDS
+        seed_table(spec, backend, shape_nk, cu_num)[1].get("M_BOUNDS")
+        or STANDARD_M_BOUNDS
     )
 
 
