@@ -21,6 +21,10 @@ Slices (rows 1..512, k 256..4096, stable 0/1 unless noted):
   A4  buffer 128K/256K/1M, each row uniform in [4K, W]
   B   the cases #6329 published, k=2048
 
+--bound sets the adaptive arm's max_row_len: `width` (default) is the buffer
+width, a caller that knows no tighter bound; `live` is the cell's longest live
+row. Each record carries the bound it ran with; keep the modes in separate files.
+
   python op_tests/op_benchmarks/flydsl/bench_topk_per_row_decode.py --list
   python op_tests/op_benchmarks/flydsl/bench_topk_per_row_decode.py \\
       --slice A1 --rows 4 --k 2048 --out a1.jsonl
@@ -286,12 +290,10 @@ class Arms:
             )  # fmt: skip
         return True
 
-    def call(self, arm, x, sl, out, cell):
+    def call(self, arm, x, sl, out, cell, bound):
         topk, s = self.topk, bool(cell.stable)
         if arm == "adaptive":
-            return lambda: self._backend(
-                x, sl, out, cell, topk.BACKEND_ADAPTIVE, cell.width
-            )
+            return lambda: self._backend(x, sl, out, cell, topk.BACKEND_ADAPTIVE, bound)
         if arm == "single":
             return lambda: self._backend(x, sl, out, cell, topk.BACKEND_SINGLE)
         if arm == "oneblock":
@@ -342,10 +344,20 @@ def environment() -> dict:
     }
 
 
-def run_cell(arms: Arms, cell: Cell, arm_names, seed=0, rotate=0, timers=("t1", "t2")):
+def run_cell(
+    arms: Arms,
+    cell: Cell,
+    arm_names,
+    seed=0,
+    rotate=0,
+    timers=("t1", "t2"),
+    bound_mode="width",
+):
     """One record per arm, arms in an order rotated by `rotate`."""
     arms.host.clear_topk_per_row_decode_workspace_cache()
     x, sl = make_inputs(cell, seed)
+    # From the host-side lengths, so reading the bound costs no device sync.
+    bound = cell.width if bound_mode == "width" else max(live_lengths(cell, seed))
     probe = torch.empty(cell.rows, cell.k, dtype=torch.int32, device="cuda")
     pick = arms.main_pick(x, sl, probe, cell)
     order = (
@@ -355,11 +367,12 @@ def run_cell(arms: Arms, cell: Cell, arm_names, seed=0, rotate=0, timers=("t1", 
     recs = []
     for arm in order:
         rec = {**asdict(cell), "seed": seed, "arm": arm, "main_pick": pick}
+        rec["bound"] = bound
         out = torch.full((cell.rows, cell.k), -2, dtype=torch.int32, device="cuda")
         if not arms.supported(arm, x, sl, out, cell):
             recs.append({**rec, "supported": False})
             continue
-        call = arms.call(arm, x, sl, out, cell)
+        call = arms.call(arm, x, sl, out, cell, bound)
         saved = arms.topk._FLYDSL_TOPK_DECODE_DISABLED
         arms.topk._FLYDSL_TOPK_DECODE_DISABLED = arm == "hip"
         t0 = time.perf_counter()
@@ -411,6 +424,12 @@ def main(argv=None):
     ap.add_argument("--profiles", nargs="+", default=None, help="e.g. full u16384")
     ap.add_argument("--arms", nargs="+", default=list(ARMS), choices=ARMS)
     ap.add_argument("--timers", nargs="+", default=["t1", "t2"], choices=("t1", "t2"))
+    ap.add_argument(
+        "--bound",
+        choices=("width", "live"),
+        default="width",
+        help="adaptive's max_row_len: the buffer width, or the cell's longest live row",
+    )
     ap.add_argument("--rounds", type=int, default=1)
     # main's stable kernels run up to 2x slower on some draws; with 3 seeds two slow
     # draws already move the median.
@@ -441,7 +460,13 @@ def main(argv=None):
             for i, cell in enumerate(todo):
                 for j, seed in enumerate(args.seeds):
                     for rec in run_cell(
-                        arms, cell, args.arms, seed, i + j + rnd, args.timers
+                        arms,
+                        cell,
+                        args.arms,
+                        seed,
+                        i + j + rnd,
+                        args.timers,
+                        args.bound,
                     ):
                         rec["round"] = rnd
                         bad += rec["supported"] and not rec["correct"]
