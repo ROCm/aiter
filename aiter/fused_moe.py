@@ -402,18 +402,50 @@ def _validate_output_buffer_metadata(output, shape, dtype, device):
         )
 
 
-def _validate_output_buffer_no_overlap(output, hidden_states):
+def _address_span(tensor):
+    """Return the [start, end) byte range a strided tensor can touch.
+
+    nbytes counts logical elements only, so a strided view such as pool[::2]
+    would under-report its reach; kernels that honor the strides read up to
+    the last element's address. The interval is conservative: it also covers
+    the gaps between strided elements.
+    """
+    start = tensor.data_ptr()
+    # Fast path: a contiguous tensor spans exactly nbytes. Most inputs are
+    # contiguous, and this keeps the per-call check cheap in eager mode.
+    if tensor.is_contiguous():
+        return (start, start + tensor.nbytes) if tensor.nbytes else None
+    if tensor.numel() == 0:
+        return None
+    low = high = 0
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        if stride < 0:
+            low += (size - 1) * stride
+        else:
+            high += (size - 1) * stride
+    itemsize = tensor.element_size()
+    return start + low * itemsize, start + (high + 1) * itemsize
+
+
+def _validate_output_buffer_no_overlap(output, **inputs):
     if output is None:
         return
-    # Accumulate mode zeroes the output rows before stage1 reads hidden_states.
-    if (
-        output.data_ptr() < hidden_states.data_ptr() + hidden_states.nbytes
-        and hidden_states.data_ptr() < output.data_ptr() + output.nbytes
-    ):
-        raise RuntimeError(
-            "output overlaps hidden_states, which moe_sorting zeroes before stage1 "
-            "reads it"
-        )
+    output_span = _address_span(output)
+    if output_span is None:
+        return
+    # Accumulate mode zeroes the output rows at sort time, before the stages read
+    # any input, and atomic GEMM2 then writes into them while still reading.
+    for name, tensor in inputs.items():
+        if tensor is None:
+            continue
+        span = _address_span(tensor)
+        if span is None:
+            continue
+        if output_span[0] < span[1] and span[0] < output_span[1]:
+            raise RuntimeError(
+                f"output overlaps {name}, which moe_sorting zeroes before the MoE "
+                "stages read it"
+            )
 
 
 def _return_output(ret, output):
@@ -1138,8 +1170,8 @@ def fused_moe(
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
     # Optional [M, model_dim] destination for the result, to save the caller a
-    # copy. Must be contiguous, match shape/dtype/device and not overlap
-    # hidden_states, or the call raises; when given it is what gets returned.
+    # copy. Must be contiguous, match shape/dtype/device and not overlap any
+    # input tensor, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
@@ -1551,7 +1583,32 @@ def _fused_moe_impl(
     _validate_output_buffer_metadata(
         output, (M, model_dim), dtype, hidden_states.device
     )
-    _validate_output_buffer_no_overlap(output, hidden_states)
+    # Skip building the kwargs (and the extras dict) when there is no output.
+    if output is not None:
+        _validate_output_buffer_no_overlap(
+            output,
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weight=topk_weight,
+            topk_ids=topk_ids,
+            expert_mask=expert_mask,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            num_local_tokens=num_local_tokens,
+            bias1=bias1,
+            bias2=bias2,
+            # FHMoE passes its shared-expert weights and scales through here.
+            **{
+                name: value
+                for extra in (_stage1_extra_args, _stage2_extra_args)
+                if extra
+                for name, value in extra.items()
+                if isinstance(value, torch.Tensor)
+            },
+        )
     if herd_topk:
         from aiter.ops.flydsl.herd_topk import (
             herd_finalize_candidates,
