@@ -713,6 +713,7 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a16w16_16mx8_32nx1.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a8w8_16mx1_16nx4.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a8w8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v41_prefill_a8w4_16mx1_16nx4.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v41_prefill_a8w8_16mx1_16nx4.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_kargs.h'",

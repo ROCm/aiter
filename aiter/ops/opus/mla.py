@@ -179,3 +179,25 @@ def opus_mla_v41_prefill_a8w8_gfx950_fwd(
     partial_max: torch.Tensor | None = None,  # [N, num_splits, H] fp32
     partial_sum: torch.Tensor | None = None,  # [N, num_splits, H] fp32
 ) -> None: ...
+
+
+@compile_ops(PREFILL_MD_NAME, ffi_type="ctypes")
+def opus_mla_v41_prefill_a8w4_gfx950_fwd(
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    unified_kv: torch.Tensor,
+    unified_kv_scale: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scale: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,  # [H] fp32
+    out: torch.Tensor,
+    softmax_scale: float,
+    num_splits: int = 1,
+    partial_o: torch.Tensor | None = None,  # [N, num_splits, H, 512] fp32
+    partial_max: torch.Tensor | None = None,  # [N, num_splits, H] fp32
+    partial_sum: torch.Tensor | None = None,  # [N, num_splits, H] fp32
+) -> None: ...
