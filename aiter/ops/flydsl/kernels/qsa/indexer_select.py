@@ -28,7 +28,7 @@ from flydsl.expr import (
     range_constexpr,
 )
 
-from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
+from aiter.ops.flydsl.kernels.kernels_common import div_nonneg, kernel_signature
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
 from aiter.ops.flydsl.kernels.topk.topk_common import _warp_inclusive_prefix_i32
 
@@ -95,8 +95,16 @@ _SCORE_HEADS = (4, 8)
 _SCORE_SCALE = _D**-0.5
 
 
-def _idiv(a, b):
-    return fx.Int32(fx.Uint32(a) // fx.Uint32(b))
+def _compressed_span(qpos, slen):
+    """Compressed blocks this query can see, before the column cap.
+
+    ``qpos + 1`` counts the query token; context length does not. Both
+    lengths are non-negative.
+    """
+    return fx.min(
+        div_nonneg(qpos + Int32(1), Int32(_R)),
+        div_nonneg(slen, Int32(_R)),
+    )
 
 
 def _neg_inf():
@@ -110,7 +118,7 @@ def _block_exclusive_count(flag, tid, wave_size, num_waves, wave_totals):
     waves before its own, so the scan costs one barrier.
     """
     lane = tid % Int32(wave_size)
-    wave = _idiv(tid, Int32(wave_size))
+    wave = div_nonneg(tid, Int32(wave_size))
     inclusive = _warp_inclusive_prefix_i32(flag, lane, wave_size)
     # Every lane stores its wave's total, read from the last lane, so the
     # store needs no runtime branch in this plain helper.
@@ -179,11 +187,9 @@ def build_qsa_indexer_emit_module(page_size: int, wave_size: int):
         safe_req = valid_req.select(req, zero)
         qpos = query_positions[row]
         slen = valid_req.select(context_lens[safe_req], zero)
-        vis_q = _idiv(qpos + one, Int32(_R))
-        vis_s = _idiv(slen, Int32(_R))
-        visible = (vis_q < vis_s).select(vis_q, vis_s)
+        visible = _compressed_span(qpos, slen)
         take = (tid < visible) & (tid < n_columns) & valid_req
-        logical_page = _idiv(take.select(tid, zero), Int32(page_size))
+        logical_page = div_nonneg(take.select(tid, zero), Int32(page_size))
         phys = page_table[safe_req, logical_page]
         take = take & (phys >= zero) & (phys < n_cache_blocks)
         flag = take.select(one, zero)
@@ -273,7 +279,7 @@ def build_qsa_pack_valid_blocks_module(page_size: int, wave_size: int):
         block = block_ids[row, tid]
         in_range = valid_req & (block >= zero) & (block < n_columns)
         safe_block = in_range.select(block, zero)
-        logical_page = _idiv(safe_block, Int32(page_size))
+        logical_page = div_nonneg(safe_block, Int32(page_size))
         phys = page_table[safe_req, logical_page]
         phys_live = (phys >= zero) & (phys < n_cache_blocks)
         keep = in_range & phys_live
@@ -442,10 +448,10 @@ def build_qsa_indexer_decode_scores_module(
         zero = Int32(0)
         one = Int32(1)
         page = Int32(page_size)
-        wave = _idiv(tid, Int32(64))
+        wave = div_nonneg(tid, Int32(64))
         lane = tid - wave * Int32(64)
         lane_m = lane % Int32(16)
-        lane_kg = _idiv(lane, Int32(16))
+        lane_kg = div_nonneg(lane, Int32(16))
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
         # A buffer resource is wave-uniform, so a per-lane wide row would
@@ -489,10 +495,7 @@ def build_qsa_indexer_decode_scores_module(
         safe_req = valid_req.select(req, zero)
         qpos = query_positions[row]
         slen = valid_req.select(context_lens[safe_req], zero)
-        vis_q = _idiv(qpos + one, Int32(_R))
-        vis_s = _idiv(slen, Int32(_R))
-        visible = (vis_q < vis_s).select(vis_q, vis_s)
-        visible = (visible < n_columns).select(visible, n_columns)
+        visible = fx.min(_compressed_span(qpos, slen), n_columns)
 
         if (tile == zero) & (tid == zero):
             row_lens[row] = valid_req.select(visible, zero)
@@ -502,7 +505,7 @@ def build_qsa_indexer_decode_scores_module(
         # such tiles, so they must not cost a full gather and MFMA each.
         if tile * Int32(block_n) < visible:
             qh = tid % Int32(head_pad)
-            q_chunk = _idiv(tid, Int32(head_pad))
+            q_chunk = div_nonneg(tid, Int32(head_pad))
             q_live = qh < Int32(n_heads)
             safe_qh = q_live.select(qh, zero)
             q_row = fx.logical_divide(fx.slice(q_buf, (row, safe_qh, None)), vec_layout)
@@ -518,11 +521,11 @@ def build_qsa_indexer_decode_scores_module(
                     q_lds[qh, d0 + Int32(i)] = qv.to(BFloat16)
 
             col = tid % Int32(block_n)
-            chunk = _idiv(tid, Int32(block_n))
+            chunk = div_nonneg(tid, Int32(block_n))
             score_col = tile * Int32(block_n) + col
             col_live = (score_col < n_columns) & (score_col < visible) & valid_req
             safe_col = col_live.select(score_col, zero)
-            logical_page = _idiv(safe_col, page)
+            logical_page = div_nonneg(safe_col, page)
             off = safe_col - logical_page * page
             phys = page_table[safe_req, logical_page]
             phys_live = (phys >= zero) & (phys < n_cache_blocks)
@@ -741,16 +744,22 @@ def build_qsa_indexer_prefill_scores_module(
         n_cache_blocks: Int32,
         tiles_per_wg: Int32,
     ):
-        # Row tiles vary fastest, so workgroups resident together share
-        # column tiles: the same K, many Q tiles. Each workgroup scores
-        # tiles_per_wg consecutive column tiles with one Q staging.
+        # Row tiles vary fastest, so one column group's K is reused across
+        # its row tiles. Consecutive workgroup ids are dealt across the 8
+        # XCDs, so that reuse is every 8th row tile on each XCD.
+        # xcd_remap_bx_by group 8, which would keep a contiguous run of row
+        # tiles on one XCD, was slower on gfx950 at M=512, cold, packed and
+        # wide. Row-fast then remap, microseconds: L=8192 28.53/29.18 and
+        # 28.96/29.44; L=32768 43.75/46.06 and 43.90/46.48. The launch stays
+        # (row tiles, column groups). Each workgroup scores tiles_per_wg
+        # consecutive column tiles with one Q staging.
         row_tile = fx.block_idx.x
         tile0 = fx.block_idx.y * tiles_per_wg
         tid = fx.thread_idx.x
         zero = Int32(0)
         one = Int32(1)
         page = Int32(page_size)
-        wave = _idiv(tid, Int32(64))
+        wave = div_nonneg(tid, Int32(64))
         lane = tid - wave * Int32(64)
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
@@ -818,10 +827,7 @@ def build_qsa_indexer_prefill_scores_module(
             safe_req = req_live.select(req, zero)
             qpos = query_positions[safe_row]
             slen = context_lens[safe_req]
-            vis_q = _idiv(qpos + one, Int32(_R))
-            vis_s = _idiv(slen, Int32(_R))
-            visible = (vis_q < vis_s).select(vis_q, vis_s)
-            visible = (visible < n_columns).select(visible, n_columns)
+            visible = fx.min(_compressed_span(qpos, slen), n_columns)
             visible = req_live.select(visible, zero)
             visible_lds[tid] = visible
             req_lds[tid] = req_live.select(req, Int32(-1))
@@ -836,9 +842,9 @@ def build_qsa_indexer_prefill_scores_module(
         for r in range_constexpr(block_m):
             v = visible_lds[Int32(r)]
             rq = req_lds[Int32(r)]
-            tile_visible = (v > tile_visible).select(v, tile_visible)
+            tile_visible = fx.max(v, tile_visible)
             req_lo = ((rq >= zero) & (rq < req_lo)).select(rq, req_lo)
-            req_hi = (rq > req_hi).select(rq, req_hi)
+            req_hi = fx.max(rq, req_hi)
 
         # As in the one-row scorer: skip tiles no row of this block can see.
         if tile0 * Int32(block_n) < tile_visible:
@@ -851,7 +857,7 @@ def build_qsa_indexer_prefill_scores_module(
                     v_r = (req_lds[Int32(r_r)] == cur).select(
                         visible_lds[Int32(r_r)], zero
                     )
-                    req_visible = (v_r > req_visible).select(v_r, req_visible)
+                    req_visible = fx.max(v_r, req_visible)
                 if tile0 * Int32(block_n) < req_visible:
                     # Q is staged once per request and reused by every tile
                     # this workgroup scores; the first K gather's barrier
@@ -863,9 +869,11 @@ def build_qsa_indexer_prefill_scores_module(
                     # does not own and would retile the global load.
                     for qpart_r in range_constexpr(q_vectors_per_thread):
                         qlinear_r = tid + Int32(qpart_r * block_threads)
-                        qrow_local_r = _idiv(qlinear_r, Int32(n_heads * vec_chunks))
+                        qrow_local_r = div_nonneg(
+                            qlinear_r, Int32(n_heads * vec_chunks)
+                        )
                         qrem_r = qlinear_r - qrow_local_r * Int32(n_heads * vec_chunks)
-                        qhead_r = _idiv(qrem_r, Int32(vec_chunks))
+                        qhead_r = div_nonneg(qrem_r, Int32(vec_chunks))
                         qd_chunk_r = qrem_r - qhead_r * Int32(vec_chunks)
                         qrow_r = row_tile * Int32(block_m) + qrow_local_r
                         qrow_live_r = qrow_r < rows
@@ -886,22 +894,22 @@ def build_qsa_indexer_prefill_scores_module(
                             q_lds[qrow_local_r, qhead_r, qd0_r + Int32(iq_r)] = qv_r.to(
                                 BFloat16
                             )
-                    tile_end = _idiv(req_visible + Int32(block_n - 1), Int32(block_n))
-                    tile_end = (tile_end < tile0 + tiles_per_wg).select(
-                        tile_end, tile0 + tiles_per_wg
+                    tile_end = div_nonneg(
+                        req_visible + Int32(block_n - 1), Int32(block_n)
                     )
+                    tile_end = fx.min(tile_end, tile0 + tiles_per_wg)
                     # The tile loop's names carry _t, for the same reason.
                     for cur_tile in range(tile0, tile_end, one):
                         tile_t = Int32(cur_tile)
                         for part_t in range_constexpr(k_vectors_per_thread):
                             linear_t = tid + Int32(part_t * block_threads)
-                            col_t = _idiv(linear_t, Int32(vec_chunks))
+                            col_t = div_nonneg(linear_t, Int32(vec_chunks))
                             d_chunk_t = linear_t - col_t * Int32(vec_chunks)
                             score_col_t = tile_t * Int32(block_n) + col_t
                             # req_visible is within n_columns and the context.
                             col_live_t = score_col_t < req_visible
                             safe_col_t = col_live_t.select(score_col_t, zero)
-                            logical_page_t = _idiv(safe_col_t, page)
+                            logical_page_t = div_nonneg(safe_col_t, page)
                             off_t = safe_col_t - logical_page_t * page
                             phys_t = page_table[cur, logical_page_t]
                             phys_live_t = (phys_t >= zero) & (phys_t < n_cache_blocks)
@@ -1105,12 +1113,9 @@ def build_qsa_indexer_active_columns_module():
             safe_req = valid_req.select(req, zero)
             qpos = query_positions[row]
             slen = valid_req.select(context_lens[safe_req], zero)
-            vis_q = _idiv(qpos + one, Int32(_R))
-            vis_s = _idiv(slen, Int32(_R))
-            visible = (vis_q < vis_s).select(vis_q, vis_s)
-            visible = (visible < n_columns).select(visible, n_columns)
+            visible = fx.min(_compressed_span(qpos, slen), n_columns)
             visible = valid_req.select(visible, zero)
-            local = (visible > local).select(visible, local)
+            local = fx.max(visible, local)
             results = yield [local]
         out[zero] = results
 
