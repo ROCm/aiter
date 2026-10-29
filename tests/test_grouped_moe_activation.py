@@ -14,6 +14,16 @@ from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
 
 
 class GroupedActivationTest(unittest.TestCase):
+    def setUp(self):
+        # The merged runtime also uses a fused route/psum path. Stub dispatch
+        # itself so CPU test pointers can never reach a GPU kernel.
+        self.enterContext(patch.object(grouped, "_run_compiled"))
+        self.enterContext(patch.object(moe_kernels, "_dispatch_compiled"))
+        self.enterContext(patch("torch.cuda.current_stream", return_value=0))
+        self.enterContext(
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU access"))
+        )
+
     def test_dispatch_buffers_and_benchmark_callables(self):
         for flag in ("0", "1"):
             for apre in (0, 1):

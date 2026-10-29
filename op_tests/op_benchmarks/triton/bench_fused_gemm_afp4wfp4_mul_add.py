@@ -1,5 +1,6 @@
+import functools
+
 import torch
-import triton
 
 from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     fused_gemm_afp4wfp4_mul_add,
@@ -11,6 +12,8 @@ from op_tests.op_benchmarks.triton.bench_fused_gemm_commons import (
     run_fused_benchmark,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -24,7 +27,15 @@ kernel_label = "fused_gemm_afp4wfp4_mul_add"
 shape = "(N=7168, K=256)"
 
 
-def bench_fn(M: int, N: int, K: int, metric: str, **kwargs):
+def bench_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    **kwargs,
+):
     """
     Single-shape timing of the fused AFP4WFP4 GEMM + mul_add via its
     public wrapper.
@@ -46,21 +57,11 @@ def bench_fn(M: int, N: int, K: int, metric: str, **kwargs):
     """
     c_dtype = torch.bfloat16
 
-    # FP4 branch (non-preshuffled). ``output=True`` pre-allocates ``y_fp4``. With
-    # shuffles off the ``_triton`` returns equal the plain ones; we pass the
-    # ``_triton`` set to mirror the test's wrapper call exactly, so the plain
-    # ``w`` / scale returns are unused here.
-    (
-        x_fp4,
-        _,
-        w_fp4_triton,
-        _,
-        _,
-        x_fp4_scale_triton,
-        w_fp4_scale_triton,
-        _,
-        y_fp4,
-    ) = generate_gemm_afp4wfp4_inputs(
+    # FP4 branch (non-preshuffled). ``output=True`` pre-allocates ``y``. With
+    # shuffles off the shuffled returns equal the plain ones, so the plain
+    # ``w``/unshuffled-scale returns are dropped ("_") here.
+    _p_gen_fp4 = functools.partial(
+        generate_gemm_afp4wfp4_inputs,
         M,
         N,
         K,
@@ -70,37 +71,43 @@ def bench_fn(M: int, N: int, K: int, metric: str, **kwargs):
         shuffle_scales_fg=False,
         shuffle_weight_fg=False,
     )
+    # (x, w, w_shuffed, x_scales, w_scales, x_scales_shuffled, w_scales_shuffled, out_dtype, y)
+    _out_vals_keys_fp4 = ["x", "_", "w", "_", "_", "x_scales", "w_scales", "_", "y"]
+
     # mul/add operands: full (M, N) tensors (default operand case).
-    a, b = make_mul_add_ab(M, N, c_dtype, a_kind="tensor", b_kind="tensor")
+    _p_gen_mul_add = functools.partial(
+        make_mul_add_ab, M, N, c_dtype, a_kind="tensor", b_kind="tensor"
+    )
+    _out_vals_keys_mul_add = ["a", "b"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen_fp4, _p_gen_mul_add],
+        [_out_vals_keys_fp4, _out_vals_keys_mul_add],
+        **kwargs_rot_bufs,
+    )
+
+    kernel_fn = functools.partial(
+        fused_gemm_afp4wfp4_mul_add, dtype=c_dtype, fuse_type=0
+    )
 
     flops = 2.0 * M * N * K  # single fused output
-    # bytes moved, summed as numel() * element_size() per tensor; the (M, N)
-    # mul/add tensors and the output are all counted.
+    # bytes moved, derived from M/N/K. x/w are e2m1, packed two values per
+    # byte (K // 2 wide); the mx scale tensors keep their own numel (one scale
+    # per 32 K-elements, which doesn't reduce to a clean M/N/K product). The
+    # (M, N) mul/add tensors and the output are all counted.
+    buf0 = rot_bufs[0]
+    a, b = buf0["a"], buf0["b"]
     mem = (
-        x_fp4.numel() * x_fp4.element_size()
-        + w_fp4_triton.numel() * w_fp4_triton.element_size()
-        + x_fp4_scale_triton.numel() * x_fp4_scale_triton.element_size()
-        + w_fp4_scale_triton.numel() * w_fp4_scale_triton.element_size()
-        + (a.numel() * a.element_size() if isinstance(a, torch.Tensor) else 0)
-        + (b.numel() * b.element_size() if isinstance(b, torch.Tensor) else 0)
-        + y_fp4.numel() * y_fp4.element_size()
+        (M * K // 2) * buf0["x"].element_size()
+        + (N * K // 2) * buf0["w"].element_size()
+        + buf0["x_scales"].numel() * buf0["x_scales"].element_size()
+        + buf0["w_scales"].numel() * buf0["w_scales"].element_size()
+        + ((M * N) * a.element_size() if isinstance(a, torch.Tensor) else 0)
+        + ((M * N) * b.element_size() if isinstance(b, torch.Tensor) else 0)
+        + (M * N) * buf0["y"].element_size()
     )
 
-    ms = triton.testing.do_bench(
-        lambda: fused_gemm_afp4wfp4_mul_add(
-            x_fp4,
-            w_fp4_triton,
-            x_fp4_scale_triton,
-            w_fp4_scale_triton,
-            a,
-            b,
-            dtype=c_dtype,
-            y=y_fp4,
-            fuse_type=0,
-        ),
-        warmup=25,
-        rep=100,
-    )
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
     return metric_to_scalar(metric, ms, flops, mem)
 
