@@ -40,9 +40,11 @@ _THIRD_THRESHOLD = 5
 _RUNNING_ABOVE = 6
 _RUNNING_EQUAL = 7
 # -inf's first-pass bucket. `_f32_to_ord` sends NaN to the top key, so no
-# other value shares it.
+# other value shares it. `finite_only` remaps +inf and NaN onto -inf's
+# descending key before this bucket is taken, so they share it too.
 _NEG_INF_BUCKET = 3
-_NEG_INF_BITS = -8388608  # 0xFF800000
+# Descending key of -inf: `_f32_to_ord(-inf) ^ 0x80000000`.
+_NEG_INF_KEY = 0x007FFFFF
 
 
 def one_workgroup_rows_are_exact(width: int) -> bool:
@@ -75,10 +77,11 @@ def build_topk_per_row_decode_one_workgroup_module(
     instructions and branches -- unexplained. `topk_select` only routes k >= 1024
     to widths this kernel serves, which is the side that gains.
 
-    finite_only: a row with fewer than k finite values returns those, in
-    column order, then -1, so no -inf column is selected. A row with at
-    least k is the same top-k as without it. The first pass's histogram
-    already counts -inf, so a row that needs no packing pays one LDS read."""
+    finite_only: never select a nonfinite column (NaN, +inf, or -inf). A row
+    with fewer than k finite values returns those, in column order, then -1.
+    A row with at least k returns the same top-k as if the nonfinites were
+    -inf. +inf and NaN join -inf's histogram bucket, so a row that needs no
+    packing pays one LDS read."""
     if exact_rows and not full_rows:
         raise ValueError("exact_rows is a full-rows build; pass full_rows=True")
     if wave_size not in (32, 64):
@@ -173,7 +176,10 @@ def build_topk_per_row_decode_one_workgroup_module(
             return True if exact_rows else col < row_len
 
         def ordered_key(value):
-            return _f32_to_ord(value) ^ sign_bit
+            key = _f32_to_ord(value) ^ sign_bit
+            if const_expr(finite_only):
+                key = fx.math.isfinite(value).select(key, fx.Int32(_NEG_INF_KEY))
+            return key
 
         def high_bucket(value):
             return ordered_key(value).shrui(fx.Int32(21))
@@ -627,7 +633,8 @@ def build_topk_per_row_decode_one_workgroup_module(
         def finish_finite(scan, metadata, row_indices, row_values):
             """Write the row's finite columns in order, then -1 up to k.
 
-            Called only when the row has fewer than k of them."""
+            Called only when the row has fewer than k of them. -inf, +inf,
+            and NaN stay unselected."""
             running = zero
             num_steps = (row_vectors + block_threads - one) // block_threads
             for step in range(zero, num_steps, one):
@@ -639,9 +646,7 @@ def build_topk_per_row_decode_one_workgroup_module(
                 flags = fx.make_rmem_tensor(_VEC, fx.Int32)
                 for lane_idx in range_constexpr(_VEC):
                     col = col_base + lane_idx
-                    finite = rvals[lane_idx].bitcast(fx.Int32) != fx.Int32(
-                        _NEG_INF_BITS
-                    )
+                    finite = fx.math.isfinite(rvals[lane_idx])
                     keep = active_vector & (col < row_len) & finite
                     flags[lane_idx] = keep.select(one, zero)
                 local = flags[0] + flags[1] + flags[2] + flags[3]

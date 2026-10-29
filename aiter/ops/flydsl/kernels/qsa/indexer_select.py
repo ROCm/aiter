@@ -27,7 +27,6 @@ from flydsl.expr import (
     gpu,
     range_constexpr,
 )
-from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
@@ -116,7 +115,7 @@ def _block_exclusive_count(flag, tid, wave_size, num_waves, wave_totals):
     # Every lane stores its wave's total, read from the last lane, so the
     # store needs no runtime branch in this plain helper.
     wave_total = Int32(
-        fx.rocdl.ds_bpermute(T.i32, Int32((wave_size - 1) * 4), inclusive)
+        gpu.shuffle_idx(inclusive, Int32(wave_size - 1), Int32(wave_size))
     )
     wave_totals[wave] = wave_total
     gpu.barrier()
@@ -856,7 +855,12 @@ def build_qsa_indexer_prefill_scores_module(
                 if tile0 * Int32(block_n) < req_visible:
                     # Q is staged once per request and reused by every tile
                     # this workgroup scores; the first K gather's barrier
-                    # publishes it.
+                    # publishes it. The fill stays a thread-linear copy of
+                    # the whole (row, head, d) tile, eight bf16 at a time.
+                    # partition_A is the MFMA A fragment each lane later
+                    # reads from this LDS, so it does not name this store:
+                    # storing through it would skip elements that fragment
+                    # does not own and would retile the global load.
                     for qpart_r in range_constexpr(q_vectors_per_thread):
                         qlinear_r = tid + Int32(qpart_r * block_threads)
                         qrow_local_r = _idiv(qlinear_r, Int32(n_heads * vec_chunks))
