@@ -6,6 +6,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -63,6 +64,19 @@ def is_metadata_only(tmp_path_factory):
 )
 def test_metadata_only_classifies_every_command(is_metadata_only, argv, expected):
     assert is_metadata_only(argv) is expected
+
+
+def test_classifier_falls_back_without_setuptools_base_error(
+    is_metadata_only, monkeypatch
+):
+    """setuptools < 59.0.1 has no BaseError; an unknown option still means a build."""
+    import setuptools.dist  # noqa: F401  loaded before setuptools.errors is hidden
+
+    monkeypatch.setitem(
+        sys.modules, "setuptools.errors", types.ModuleType("setuptools.errors")
+    )
+    assert is_metadata_only(["setup.py", "bdist_wheel", "--no-such-option"]) is False
+    assert is_metadata_only(["setup.py", "egg_info"]) is True
 
 
 def test_metadata_only_run_keeps_an_existing_aiter_meta(tmp_path):

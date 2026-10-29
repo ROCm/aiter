@@ -53,7 +53,13 @@ def _is_metadata_only(argv=None):
     if len(argv) < 2:
         return True
     from setuptools.dist import Distribution
-    from setuptools.errors import BaseError
+
+    try:
+        from setuptools.errors import BaseError
+    except ImportError:
+        # setuptools < 59.0.1, where BaseError is not yet an alias of this. The
+        # name always resolves: importing setuptools has imported its distutils.
+        from distutils.errors import DistutilsError as BaseError
 
     class _Probe(Distribution):
         # Detect display options (--version, --author-email, ...) instead of
