@@ -3,8 +3,6 @@
 
 """HERD routing orchestration with FlyDSL candidate selection + finalize."""
 
-import os
-
 import torch
 
 from .kernels.herd_topk import build_herd_finalize_module
@@ -19,13 +17,6 @@ _HERD_MAX_TOKENS = 128
 _DEFAULT_FINALIZE_THREADS = 256
 _K3_CANDIDATE_THREADS = 256
 _K3_FINALIZE_THREADS = 1024
-
-
-def herd_use_fused_drop() -> bool:
-    value = os.environ.get("AITER_HERD_FUSED_DROP", "1")
-    if value not in ("0", "1"):
-        raise ValueError(f"AITER_HERD_FUSED_DROP must be 0 or 1, got {value!r}")
-    return value == "1"
 
 
 def herd_finalize_candidates(
