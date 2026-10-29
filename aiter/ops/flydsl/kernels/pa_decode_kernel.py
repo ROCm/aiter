@@ -21,6 +21,8 @@ with two LDS buffers where capacity permits. One-partition plans can write
 final output directly; other plans use the shared partition reducer.
 BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
 with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
+Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
+using the 64-token pipeline.
 
 Logical layouts (not preshuffled):
 
@@ -501,7 +503,7 @@ def compile_gfx1250_pa_decode(
         direct_output=direct_output,
     )
 
-    @flyc.kernel(name=kernel_name, known_block_size=(128, 1, 1))
+    @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
         pmax: fx.Pointer,
         psum: fx.Pointer,
@@ -560,15 +562,15 @@ def compile_gfx1250_pa_decode(
                 fx.Int32(task[2]),
                 fx.Int32(task[3]),
             )
-            if const_expr(t.bf16_packed):
+            if const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
             output = fx.recast_iter(t.q_dtype, pout)
             tid = fx.Int32(gpu.thread_id("x"))
-            for i in range_constexpr((t.rows * t.head_dim + 127) // 128):
-                index = i * 128 + tid
+            for i in range_constexpr(-(-t.rows * t.head_dim // t.BLOCK_THREADS)):
+                index = i * t.BLOCK_THREADS + tid
                 if index < t.rows * t.head_dim:
                     row, d = index // t.head_dim, index % t.head_dim
                     kv_query = fx.Int32(gpu.block_id("y"))
@@ -634,7 +636,7 @@ def compile_gfx1250_pa_decode(
                 kv_heads * t.query_splits,
                 1,
             ),
-            block=(128, 1, 1),
+            block=(t.BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 

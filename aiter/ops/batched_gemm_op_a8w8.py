@@ -18,7 +18,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
-from .gemm_op_common import mxscale_w_scale_block
+from .gemm_op_common import mxscale_bmm_groups_of_block, mxscale_w_scale_block
 from .opus.policy import (
     resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
 )
@@ -320,6 +320,29 @@ def batched_gemm_a8w8_mxscale(
     return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
 
 
+@functools.lru_cache(maxsize=1024)
+def _opus_bpreshuffle_kid(
+    g: int, m: int, n: int, k: int, w_scale_block: str, dtype, gfx: str, cu_num: int
+) -> int | None:
+    """OPUS's preshuffled kid for a shape, or None if none runs it. The pick
+    depends on M, so each M is searched once; the kid is passed on, so OPUS
+    does not search again."""
+    from .opus.policy import _heuristic_mxscale_bmm_bpreshuffle_kid
+
+    group_n, group_k = mxscale_bmm_groups_of_block(w_scale_block)
+    return _heuristic_mxscale_bmm_bpreshuffle_kid(
+        g,
+        m,
+        n,
+        k,
+        group_size=group_k,
+        group_n=group_n,
+        output_dtype=dtype,
+        gfx=gfx,
+        cu_num=cu_num,
+    )
+
+
 # Same family, preshuffled weight.
 def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     x: Tensor,
@@ -332,7 +355,9 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
 
     The preshuffle table holds both backends' kernels -- each row names the
     faster of opus and flydsl for its shape and w_scale block -- so the row's
-    libtype picks the backend. A shape without a row runs flydsl's heuristic.
+    libtype picks the backend. A shape without a row runs flydsl's heuristic,
+    or for 1x32 on gfx950 OPUS's, when one of its kids runs the shape.
+    gfx950's flydsl writes bf16 only, so another output runs OPUS there too.
     """
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
@@ -351,15 +376,27 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
         gfx=gfx,
         cu_num=cu_num,
     )
-    libtype = (
-        cfg["libtype"]
-        if cfg is not None
-        else ("opus" if w_scale_block == "1x32" and gfx == "gfx950" else "flydsl")
-    )
+    libtype = cfg["libtype"] if cfg is not None else "flydsl"
+    kid = None
+    if (
+        libtype == "flydsl"
+        and gfx == "gfx950"
+        and (dtype != dtypes.bf16 or (cfg is None and w_scale_block == "1x32"))
+    ):
+        # OPUS where one of its kids runs the shape (N a multiple of 16, K of
+        # 128, bf16 or fp32 out).
+        kid = _opus_bpreshuffle_kid(g, m, n, k, w_scale_block, dtype, gfx, cu_num)
+        if kid is not None:
+            libtype, cfg = "opus", None
+        elif dtype != dtypes.bf16:
+            raise NotImplementedError(
+                f"no preshuffled {w_scale_block} mxscale BMM writes {dtype} at "
+                f"B:{g}, M:{m}, N:{n}, K:{k} on gfx950: no OPUS kid runs it, and "
+                "flydsl writes bf16 only"
+            )
 
     if libtype == "opus":
         from .opus.gemm_op_a8w8 import bmm_a8w8_mxscale_opus_bpreshuffle
-        from .opus.policy import mxscale_bmm_groups_of_block
 
         group_n, group_k = mxscale_bmm_groups_of_block(w_scale_block)
 
@@ -372,7 +409,7 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
             w_scale,
             None,
             dtype=dtype,
-            kernelId=int(cfg["kernelId"]) if cfg is not None else None,
+            kernelId=int(cfg["kernelId"]) if cfg is not None else kid,
             splitK=int(cfg["splitK"]) if cfg is not None else None,
             group_size=group_k,
             group_n=group_n,
@@ -432,12 +469,17 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
 
     The arch and the w_scale block select the kernels:
 
-    * gfx950, 1x32: OPUS, with weight scales [G,N,K/32] and activation
-      scales [M,G,K/32]. Requires N divisible by 16 and K divisible by 128.
+    * gfx950, 1x32: weight scales [G,N,K/32] and activation scales
+      [M,G,K/32]. The tuned row's libtype, opus or flydsl; OPUS off the table
+      where one of its kids runs the shape (N a multiple of 16, K of 128),
+      else flydsl's heuristic.
     * gfx950, 32x32 or 128x128: the tuned row's libtype, opus or flydsl,
       whichever was faster at that shape; flydsl's heuristic off the table.
       DeepSeek-V4.1's original wo_a weight (32x32) and V4's (128x128) both run
       as is.
+    * gfx950, any block: flydsl writes bf16 only, so another output runs
+      OPUS (bf16 or fp32 out), even over a tuned flydsl row, and raises
+      NotImplementedError where no OPUS kid runs the shape.
     * gfx1250, 128x128: flydsl.
     * gfx1250, 32x32 or 1x32: flydsl's batched mxfp8_32 GEMM. A 32x32
       w_scale is read raw; a 1x32 one is [G, N, K/32] holding

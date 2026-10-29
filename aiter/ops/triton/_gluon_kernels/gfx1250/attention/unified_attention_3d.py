@@ -1456,9 +1456,11 @@ class AttentionProgram:
     @gluon.jit
     def softmax_part0(self, S, M):
         m_ij = gl.maximum(M, gl.max(S, axis=1))
-        # m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        p = gl.exp2(S - m_ij[:, None])
-        alpha = gl.exp2(M - m_ij)
+        # A row can see no key in this segment when q_len > 1 (a segment past
+        # its causal horizon); shift it by 0 so p and alpha are 0, not NaN.
+        m_shift = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        p = gl.exp2(S - m_shift[:, None])
+        alpha = gl.exp2(M - m_shift)
         return p, alpha, m_ij
 
     # @gluon.jit
@@ -2324,6 +2326,23 @@ def _unified_attention_gluon_kernel_3d(
         S = S * qk_factor
 
         S = pgm.apply_softcap(S)
+        if not cfg.ALL_DECODE:
+            # With q_len > 1 the rows of a query block have different causal
+            # horizons, so a tile before the last can hold keys past an early
+            # row's horizon. Decode has one query per block and skips this.
+            tile_offset = (
+                j * cfg.TILE_SIZE
+                + gl.arange(
+                    0,
+                    cfg.TILE_SIZE,
+                    layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT),
+                )[None, :]
+            )
+            S = gl.where(
+                tile_offset < pgm.context_len + pgm.query_pos_qk + 1,
+                S,
+                float("-inf"),
+            )
         if need_addtional_mask:
             seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
             S = pgm.apply_addtional_mask_qk(
@@ -2378,7 +2397,9 @@ def _unified_attention_gluon_kernel_3d(
     S = S * qk_factor
 
     S = pgm.apply_softcap(S)
-    seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
+    seq_mask = (seq_offset < pgm.context_len + pgm.query_pos_qk + 1) & (
+        pgm.tile_end > pgm.tile_start
+    )
     S = gl.where(seq_mask, S, float("-inf"))
     if need_addtional_mask:
         S = pgm.apply_addtional_mask_qk(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
