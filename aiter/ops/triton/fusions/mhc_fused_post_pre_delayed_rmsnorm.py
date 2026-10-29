@@ -8,6 +8,7 @@ RMSNorm in two Triton launches. See the kernel module for the math and structure
 import torch
 import triton
 
+from aiter import dtypes
 from aiter.ops.triton._triton_kernels.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     _mhc_fused_post_pre_delayed_rmsnorm_main_kernel,
     _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel,
@@ -35,8 +36,9 @@ def mhc_fused_post_pre_delayed_rmsnorm(
     norm_eps: float = 1e-6,
     *,
     residual_out: torch.Tensor | None = None,
+    quant_mxfp8: bool = False,
     config: dict | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     """Fused delayed mHC seam.
 
     Args:
@@ -52,12 +54,18 @@ def mhc_fused_post_pre_delayed_rmsnorm(
             otherwise ``residual`` is projected as is and returned.
         norm_weight: (H,) RMSNorm weight applied to the collapse; norm_eps its epsilon.
         residual_out: optional (T, 4, H) bf16 buffer for the new residual.
+        quant_mxfp8: when True the normalised layer_input is additionally emitted as
+            group32 UE8M0 mxfp8 inside the reduce kernel, bit-identical to a standalone
+            ``quantize_fp8`` on the bf16 layer_input, so the attn/ffn-input GEMM can skip
+            its own quant. Extends the return with (layer_input_fp8, layer_input_scale).
         config: optional launch config dict; loaded from the per-arch tuned configs
             (``get_mhc_fused_post_pre_delayed_rmsnorm_config``) when ``None``.
 
     Returns:
         (residual_out, post_mix (T, 4, 1), comb_mix (T, 4, 4), layer_input (T, H) bf16,
-         next_pre_mix (T, 4)); the gates are fp32.
+         next_pre_mix (T, 4)); the gates are fp32. When ``quant_mxfp8`` is True, two more
+         tensors follow: layer_input_fp8 (T, H) fp8 and layer_input_scale (T, H // 32)
+         float8_e8m0fnu.
     """
     assert (
         residual.dim() == 3
@@ -106,7 +114,28 @@ def mhc_fused_post_pre_delayed_rmsnorm(
     comb_out = torch.empty(T, 4, 4, dtype=torch.float32, device=device)
     next_pre = torch.empty(T, 4, dtype=torch.float32, device=device)
     layer_input = torch.empty(T, H, dtype=torch.bfloat16, device=device)
+    if quant_mxfp8:
+        assert H % 32 == 0, "mxfp8 emit needs H divisible by the group size 32"
+        layer_input_fp8 = torch.empty(T, H, dtype=dtypes.fp8, device=device)
+        layer_input_scale = torch.empty(
+            T, H // 32, dtype=torch.float8_e8m0fnu, device=device
+        )
+        # placeholder pointer args for the reduce kernel's unused-branch slots
+        fp8_arg = layer_input_fp8
+        scale_arg = layer_input_scale.view(torch.uint8)
+    else:
+        fp8_arg = scale_arg = layer_input  # unused when QUANT_MXFP8 is False
     if T == 0:
+        if quant_mxfp8:
+            return (
+                residual_out,
+                post_out,
+                comb_out,
+                layer_input,
+                next_pre,
+                layer_input_fp8,
+                layer_input_scale,
+            )
         return residual_out, post_out, comb_out, layer_input, next_pre
 
     if config is None:
@@ -146,6 +175,8 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         comb_out,
         layer_input,
         norm_weight,
+        fp8_arg,
+        scale_arg,
         rms_eps,
         hc_pre_eps,
         hc_sinkhorn_eps,
@@ -155,6 +186,17 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         NUM_KSPLIT=config["NUM_KSPLIT"],
         NUM_SINKHORN_ITERS=int(sinkhorn_repeat),
         BLOCK_C=config["BLOCK_C"],
+        QUANT_MXFP8=quant_mxfp8,
         num_warps=config["reduce_num_warps"],
     )
+    if quant_mxfp8:
+        return (
+            residual_out,
+            post_out,
+            comb_out,
+            layer_input,
+            next_pre,
+            layer_input_fp8,
+            layer_input_scale,
+        )
     return residual_out, post_out, comb_out, layer_input, next_pre

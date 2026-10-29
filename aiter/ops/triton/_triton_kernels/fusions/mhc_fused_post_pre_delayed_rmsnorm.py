@@ -27,11 +27,29 @@ gates (Sinkhorn with the hardware reciprocal) and applies the RMSNorm to the sta
 collapse in place.
 """
 
+import torch
 import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice
 
+from aiter import dtypes
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+# Optional mxfp8 emission of the normalised layer_input, bit-identical to the
+# downstream `quantize_fp8` (group32, UE8M0, ceil_pow2(max(amax, 1e-10) / 448)):
+# the attn/ffn-input GEMM reads (fp8, e8m0 scale) and skips its own quant.
+_FP8_DTYPE = dtypes.fp8
+FP8_MAX: tl.constexpr = tl.constexpr(torch.finfo(_FP8_DTYPE).max)
+FP8_TL_DTYPE: tl.constexpr = tl.constexpr(
+    tl.float8e4b8 if _FP8_DTYPE is torch.float8_e4m3fnuz else tl.float8e4nv
+)
+AMAX_FLOOR: tl.constexpr = tl.constexpr(1e-10)
+
+
+@triton.jit
+def _ceil_pow2_code(value):
+    bits = value.to(tl.uint32, bitcast=True)
+    return (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(tl.uint32)
 
 
 @triton.jit
@@ -222,7 +240,7 @@ def _mhc_fused_post_pre_delayed_rmsnorm_main_kernel(
 
 _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel_repr = make_kernel_repr(
     "_mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel",
-    ["H", "NUM_KSPLIT", "NUM_SINKHORN_ITERS", "BLOCK_C"],
+    ["H", "NUM_KSPLIT", "NUM_SINKHORN_ITERS", "BLOCK_C", "QUANT_MXFP8"],
 )
 
 
@@ -236,6 +254,8 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
     comb_out_ptr,  # (T, 4, 4) fp32
     layer_input_ptr,  # (T, H) bf16, rescaled in place
     norm_w_ptr,  # (H,) norm weight
+    layer_input_fp8_ptr,  # (T, H) fp8 e4m3            [QUANT_MXFP8]
+    layer_input_scale_ptr,  # (T, H // 32) uint8 e8m0   [QUANT_MXFP8]
     rms_eps,
     hc_pre_eps,
     hc_sinkhorn_eps,
@@ -245,6 +265,7 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
     NUM_KSPLIT: tl.constexpr,
     NUM_SINKHORN_ITERS: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    QUANT_MXFP8: tl.constexpr,
 ):
     """Grid (T,): one program per token."""
     tl.static_assert(H % BLOCK_C == 0, "the norm loop has no column mask")
@@ -308,4 +329,19 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
         xp = layer_input_ptr + t * H + rc
         xv = tl.load(xp).to(tl.float32)
         w = tl.load(norm_w_ptr + rc).to(tl.float32)
-        tl.store(xp, ((xv * rstd_n) * w).to(tl.bfloat16))
+        xb = ((xv * rstd_n) * w).to(tl.bfloat16)
+        tl.store(xp, xb)
+        if QUANT_MXFP8:
+            # Quantise the bf16-rounded row exactly as the downstream
+            # `quantize_fp8` would when it reloads layer_input: group32 amax of
+            # the bf16 value, ceil_pow2(max(amax, 1e-10) / 448) UE8M0 code.
+            xg = xb.to(tl.float32).reshape(BLOCK_C // 32, 32)
+            amax = tl.maximum(tl.max(tl.abs(xg), 1), AMAX_FLOOR)
+            code = _ceil_pow2_code(amax * (1.0 / FP8_MAX))
+            qscale = (code << 23).to(tl.float32, bitcast=True)
+            q = tl.minimum(tl.maximum(xg / qscale[:, None], -FP8_MAX), FP8_MAX).to(
+                FP8_TL_DTYPE
+            )
+            tl.store(layer_input_fp8_ptr + t * H + rc, tl.reshape(q, (BLOCK_C,)))
+            gc = c0 // 32 + tl.arange(0, BLOCK_C // 32)
+            tl.store(layer_input_scale_ptr + t * (H // 32) + gc, code.to(tl.uint8))
