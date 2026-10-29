@@ -201,7 +201,7 @@ struct opus_mla_v41_prefill_a8w4_16mx1_16nx4_traits {
     static constexpr int GEMM1_E_N = D_HEAD_SIZE / (W_N * T_N);
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K_PV;
 
-    // Prefix QK in f16; lane group g holds 32-dim chunks 4i + g.
+    // Prefix QK in bf16; lane group g holds 32-dim chunks 4i + g.
     static constexpr int PREFIX_CHUNK  = 32;
     static constexpr int PREFIX_CHUNKS = D_HEAD_SIZE / (PREFIX_CHUNK * (WARP_SIZE / W_N));
 
@@ -209,7 +209,7 @@ struct opus_mla_v41_prefill_a8w4_16mx1_16nx4_traits {
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
-    // 16-bit V tile staged row per key: bf16 for the extend, f16 for the prefix.
+    // bf16 V tile staged row per key.
     static constexpr int SMEM_KV_PAD = 16;
     static constexpr int SMEM_KV_ROW = D_HEAD_SIZE + SMEM_KV_PAD;
 
@@ -219,7 +219,7 @@ struct opus_mla_v41_prefill_a8w4_16mx1_16nx4_traits {
     }
 };
 
-// a8w4_16mx4_64nx1: 16mx4_64nx1 with an NVFP4 prefix pool (e2m1, an e4m3 scale per 16), whose QK and PV run in f16.
+// a8w4_16mx4_64nx1: 16mx4_64nx1 with an NVFP4 prefix pool (e2m1, an e4m3 scale per 16), whose QK and PV run in bf16.
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int NUM_WARPS_ = 4,
@@ -301,7 +301,7 @@ struct opus_mla_v41_prefill_a8w4_16mx4_64nx1_traits {
     static constexpr int smem_p_bytes   = NUM_WARPS * Q_TILE_SIZE * KV_TILE_SIZE * sizeof(D_PV);
     static constexpr int smem_fac_bytes = NUM_WARPS * Q_TILE_SIZE * sizeof(D_ACC);
 
-    // Prefix: each wave dequantizes its 16 keys into one of two 16-bit tiles of smem_v_row rows; lane group g holds
+    // Prefix: each wave dequantizes its 16 keys into one of two bf16 tiles of smem_v_row rows; lane group g holds
     // 32-dim chunks 4i + g of its key.
     static constexpr int PREFIX_CHUNK  = 32;
     static constexpr int PREFIX_CHUNKS = D_HEAD_SIZE / (PREFIX_CHUNK * (WARP_SIZE / W_N));

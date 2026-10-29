@@ -1,5 +1,5 @@
 // build_co.sh flags: -mllvm -enable-post-misched=1 -mllvm -amdgpu-early-inline-all=false -mllvm -amdgpu-function-calls=true
-// The kernel is tuned with post-RA scheduling on and without early inlining (2%, 15 VGPRs).
+// The kernel is tuned with post-RA scheduling on and without early inlining (2.5%).
 #include <hip/hip_runtime.h>
 
 #include "mla_v41_prefill_a8w4_16mx4_64nx1.hpp"

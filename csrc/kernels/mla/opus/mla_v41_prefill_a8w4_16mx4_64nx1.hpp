@@ -1164,17 +1164,15 @@ __device__ void attention_segment(const void* kv_ptr, const void* kv_scale_ptr,
 
 // ------------------------------------------------------------------------------------ prefix (NVFP4)
 
-// The prefix runs QK and PV in f16 on tiles of dequantized keys, one smem_v_row row per key: e2m1 times an e4m3 scale is
-// exact in f16 and takes a cvt and a v_pk_mul_f16 per pair. Key bits 2 and 3 swap the 16 B halves of each 32 B piece,
-// conflict-free for the dequant writes, the QK row reads and the PV tr reads.
-template<class T> struct f16_traits : T { using D_PV = opus::fp16_t; };
+// The prefix runs QK and PV in bf16 on tiles of dequantized keys, one smem_v_row row per key. Key bits 2 and 3 swap
+// the 16 B halves of each 32 B piece, conflict-free for the dequant writes, the QK row reads and the PV tr reads.
 template<class T, int SLOT> constexpr int tile_base = SLOT * T::smem_v_bytes;
 template<class T> constexpr int PREFIX_STEPS = T::D_HEAD_SIZE / T::W_K_QK_PREFIX;
 template<class T> constexpr int PQK_STEPS    = T::GEMM0_E_N * PREFIX_STEPS<T>;
 
 // Prefix registers: Q in a0.., a ring of K operands above the ones.
 constexpr int PK_AGPRS     = 4;
-constexpr int PK_DEPTH     = 16;
+constexpr int PK_DEPTH     = 4;
 constexpr int PQ_AGPR_BASE = 0;
 template<class T> constexpr int PK_AGPR_BASE = ONES_AGPR_BASE<T> + PK_AGPRS;
 // A tile's dequant, folded into the PV: per chunk a scale op, 16 pair ops (a store after every 4th) and a reload op.
@@ -1231,11 +1229,10 @@ __device__ inline auto make_layout_sk_chunk(int warp_id, int lane_id) {
         opus::unfold_p_coord(sk_dim, opus::tuple{warp_id, lane_id % T::W_N, lane_id / T::W_N}));
 }
 
-// Q of the wave's 16 heads from its staged fp8 bricks as f16 MFMA operands: step s takes dims 64(s / 2) + 16g + 8(s % 2)
-// + [0, 8), the order the QK reads K in. Each head is scaled by 2^-e of its largest block exponent e to fit f16, which
-// head_scale undoes on the scores.
+// Q of the wave's 16 heads from its staged fp8 bricks as bf16 MFMA operands: step s takes dims 64(s / 2) + 16g
+// + 8(s % 2) + [0, 8), the order the QK reads K in.
 template<class T, class VQS>
-__device__ inline auto prefix_read_q(char* smem_q, const VQS& q_scale_row, int warp_id, int lane_id, float& head_scale) {
+__device__ inline auto prefix_read_q(char* smem_q, const VQS& q_scale_row, int warp_id, int lane_id) {
     using namespace opus;
     using D_PV = typename T::D_PV;
     using q_op_t = vector_t<D_PV, T::W_K_QK_PREFIX * T::W_M / T::WARP_SIZE>;
@@ -1246,12 +1243,6 @@ __device__ inline auto prefix_read_q(char* smem_q, const VQS& q_scale_row, int w
     const int wq = h % T::NUM_WARPS;
     auto s_q = make_smem(reinterpret_cast<typename T::D_ATTN*>(smem_q));
     const auto qs = std::bit_cast<vector_t<u32_t, T::D_SCALE_SIZE / 4>>(q_scale_row);
-    u32_t e_max = 0;
-    static_for<T::D_SCALE_SIZE>([&](auto b) {
-        const u32_t e = __builtin_amdgcn_ubfe(qs[b.value / 4], 8 * (b.value % 4), 8);
-        e_max = e > e_max ? e : e_max;
-    });
-    head_scale = std::bit_cast<float>(e_max << 23);
     array<q_op_t, PREFIX_STEPS<T>> v_q;
     static_for<PREFIX_STEPS<T> / 2>([&](auto tt) {
         constexpr int t = tt.value;
@@ -1259,13 +1250,12 @@ __device__ inline auto prefix_read_q(char* smem_q, const VQS& q_scale_row, int w
                      + 64 * (t % 2) + 16 * g;
         const auto w = std::bit_cast<vector_t<u32_t, 4>>(load<16>(s_q, os));
         const u32_t e_blk = __builtin_amdgcn_ubfe(qs[t / 2], 16 * (t % 2) + 8 * (g / 2), 8);
-        const int e = static_cast<int>(e_blk - e_max) + 127;
-        const float sc = std::bit_cast<float>(max(e, 0) << 23);
+        const float sc = std::bit_cast<float>(e_blk << 23);
         vector_t<D_PV, 16> qb;
         auto* qb_pk = reinterpret_cast<vector_t<D_PV, 2>*>(&qb);
         static_for<4>([&](auto d) {
-            qb_pk[2 * d.value + 0] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp8(w[d.value], sc, false);
-            qb_pk[2 * d.value + 1] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp8(w[d.value], sc, true);
+            qb_pk[2 * d.value + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[d.value], sc, false);
+            qb_pk[2 * d.value + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[d.value], sc, true);
         });
         v_q[2 * t]     = pin_agpr<PQ_AGPR_BASE + 2 * t * PK_AGPRS>(slice(qb, number<0>{}, number<8>{}));
         v_q[2 * t + 1] = pin_agpr<PQ_AGPR_BASE + (2 * t + 1) * PK_AGPRS>(slice(qb, number<8>{}, number<16>{}));
@@ -1275,13 +1265,12 @@ __device__ inline auto prefix_read_q(char* smem_q, const VQS& q_scale_row, int w
 
 // Stage t: QK(t) on tile CUR, softmax(t), then PV(t) with the dequant of tile t + 1 into tile 1 - CUR folded into its
 // MFMA gaps, each consumed chunk reloaded for tile t + 2; past B2 it prefetches the K operands of QK(t + 1).
-template<class T0, class SQ, class VQS>
+template<class T, class SQ, class VQS>
 __device__ void prefix_segment(const void* kv_ptr, const void* kv_scale_ptr, int stride_kv_page, int stride_kv_scale_page,
                                const int* kv_indices, int page_idx_begin, int valid_kv_len, char* smem,
-                               const SQ& stage_q, const VQS& q_scale_row, v_o_t<T0>& v_o,
-                               typename T0::D_ACC& m_row, typename T0::D_ACC& l_row, typename T0::D_ACC temperature_scale_q) {
+                               const SQ& stage_q, const VQS& q_scale_row, v_o_t<T>& v_o,
+                               typename T::D_ACC& m_row, typename T::D_ACC& l_row, typename T::D_ACC temperature_scale) {
     using namespace opus;
-    using T = f16_traits<T0>;
     using D_ATTN = typename T::D_ATTN;
     using D_PV   = typename T::D_PV;
     using D_ACC  = typename T::D_ACC;
@@ -1305,6 +1294,8 @@ __device__ void prefix_segment(const void* kv_ptr, const void* kv_scale_ptr, int
 
     const int swz = tile_swz<T>(lane_id);
     const int g   = lane_id / T::W_N;
+    // The lane's 16 B of chunk 0, so a reload is one row address per page plus an immediate per chunk.
+    const auto* p_kv_g = p_kv + g * T::VEC_KV;
     const auto u_rk = make_layout_rk_fp4<T>(lane_id);
     // Dequant stores: the lane's first piece, its two 16 B halves swizzled, plus compile-time piece offsets.
     const auto u_sk = make_layout_sk_chunk<T>(warp_id, lane_id);
@@ -1327,11 +1318,12 @@ __device__ void prefix_segment(const void* kv_ptr, const void* kv_scale_ptr, int
     // Raw rows of the tile being dequantized: 4 chunks of 16 B and the 32 B scale row.
     vector_t<D_ATTN, T::PREFIX_CHUNKS * T::VEC_KV> v_k;
     vector_t<D_ATTN, T::D_PREFIX_SCALE_SIZE> v_scl;
-    vector_t<D_PV, 2> dq_sc[T::PREFIX_CHUNKS][2];
+    vector_t<float, 2> dq_sc[T::PREFIX_CHUNKS][2];
     vector_t<D_PV, T::PREFIX_CHUNK> dq_kc[T::PREFIX_CHUNKS];
-    // Dequant op N of the tile into tile SLOT, from chunk N / 18: op 0 forms its two e4m3 block scales as f16 pairs (byte
-    // pairs b0, b0, b1, b1), op 1 + p converts pair p and stores the 16 B half after every 4th, op 17 reloads the chunk's
-    // bytes (and a scale half after chunks 1 and 3) from page.
+    // Dequant op N of the tile into tile SLOT, from chunk N / 18: op 0 forms its two e4m3 block scales as f32 pairs (byte
+    // pairs b0, b0, b1, b1: a v_pk_*_f32 with op_sel:[0,1] can read 0 next to a running MFMA), op 1 + p converts pair p
+    // and stores the 16 B half after every 4th, op 17 reloads the chunk's bytes (and a scale half after chunks 1 and 3)
+    // from page.
     auto dq_op = [&](auto slot, auto n, int page) {
         constexpr int SLOT = decltype(slot)::value;
         constexpr int I    = decltype(n)::value / DQ_CHUNK_OPS;
@@ -1341,13 +1333,14 @@ __device__ void prefix_segment(const void* kv_ptr, const void* kv_scale_ptr, int
         if constexpr (J == 0) {
             const auto s_w = std::bit_cast<vector_t<u32_t, T::D_PREFIX_SCALE_SIZE / 4>>(v_scl);
             const int sb = static_cast<int>(__builtin_amdgcn_perm(s_w[2 * I + 1], s_w[2 * I], scale_sel));
-            dq_sc[I][0] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp8(sb, 1.0f, false);
-            dq_sc[I][1] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp8(sb, 1.0f, true);
+            dq_sc[I][0] = __builtin_amdgcn_cvt_pk_f32_fp8(sb, false);
+            dq_sc[I][1] = __builtin_amdgcn_cvt_pk_f32_fp8(sb, true);
         } else if constexpr (J <= DQ_PAIRS) {
             constexpr int P = J - 1;
             const auto k_w = std::bit_cast<vector_t<u32_t, T::PREFIX_CHUNKS * DWORDS>>(v_k);
-            const auto f = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(k_w[I * DWORDS + P / 4], 1.0f, P % 4);
-            reinterpret_cast<vector_t<D_PV, 2>*>(&dq_kc[I])[P] = f * dq_sc[I][P / (2 * DWORDS)];
+            const auto f = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(k_w[I * DWORDS + P / 4], 1.0f, P % 4);
+            reinterpret_cast<vector_t<D_PV, 2>*>(&dq_kc[I])[P] =
+                __builtin_convertvector(f * dq_sc[I][P / (2 * DWORDS)], vector_t<D_PV, 2>);
             if constexpr (P % 4 == 3) {
                 constexpr int Q = P / 4;
                 auto s_tile = make_smem(reinterpret_cast<D_PV*>(smem + tile_base<T, SLOT>));
@@ -1356,8 +1349,8 @@ __device__ void prefix_segment(const void* kv_ptr, const void* kv_scale_ptr, int
                          sk_half[Q % 2] + (sk_imm[PIECE] - sk_imm[0]));
             }
         } else {
-            const auto* row = p_kv + static_cast<int64_t>(page) * stride_kv_page;
-            set_slice(v_k, global_load<T::VEC_KV>(row, (I * (T::WARP_SIZE / T::W_N) + g) * T::VEC_KV),
+            const auto* row = p_kv_g + static_cast<int64_t>(page) * stride_kv_page;
+            set_slice(v_k, global_load<T::VEC_KV>(row, I * (T::WARP_SIZE / T::W_N) * T::VEC_KV),
                       number<I * T::VEC_KV>{}, number<(I + 1) * T::VEC_KV>{});
             if constexpr (I % 2 == 1) {
                 const auto* srow = p_scale + static_cast<int64_t>(page) * stride_kv_scale_page;
@@ -1391,9 +1384,7 @@ __device__ void prefix_segment(const void* kv_ptr, const void* kv_scale_ptr, int
     int kv_page = page_of(2);
     s_waitcnt_vmcnt(0_I);
     __builtin_amdgcn_s_barrier();
-    float head_scale;
-    const auto v_q = prefix_read_q<T>(smem + tile_base<T, 1>, q_scale_row, warp_id, lane_id, head_scale);
-    const D_ACC temperature_scale = temperature_scale_q * head_scale;
+    const auto v_q = prefix_read_q<T>(smem + tile_base<T, 1>, q_scale_row, warp_id, lane_id);
     static_for<DQ_OPS>([&](auto n) { dq_op(0_I, n, page1); });
     s_waitcnt_lgkmcnt(0_I);
     __builtin_amdgcn_s_barrier();
