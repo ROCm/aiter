@@ -170,6 +170,15 @@
       "TILE_SIZE_MIN": 128,
       "TILE_SIZE_MAX": 128
     },
+    "D_GEQ_256.DT_fp8_fp8": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "waves_per_eu": 1,
+      "LOOP_VARIANT": 1,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 128,
+      "TILE_SIZE_MAX": 128
+    },
     "any": {
       "BLOCK_M": 128,
       "num_warps": 4,
