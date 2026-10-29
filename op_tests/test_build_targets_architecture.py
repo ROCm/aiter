@@ -85,7 +85,7 @@ class TestRuntimeArchitecture(unittest.TestCase):
         with (
             mock.patch.object(self.chip_info, "IS_WINDOWS", True),
             mock.patch.object(
-                self.chip_info, "_detect_native", return_value=["gfx942"]
+                self.chip_info, "_gpu_info_archs", return_value=["gfx942"]
             ),
             mock.patch.object(
                 self.torch.cuda, "get_device_properties"
@@ -101,11 +101,13 @@ class TestRuntimeArchitecture(unittest.TestCase):
             mock.patch.object(self.chip_info, "IS_WINDOWS", True),
             mock.patch.object(
                 self.chip_info,
-                "_detect_native",
+                "_gpu_info_archs",
                 side_effect=RuntimeError("hipinfo missing"),
             ),
             mock.patch.object(self.torch.version, "hip", "6.3"),
             mock.patch.object(self.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(self.torch.cuda, "device_count", return_value=1),
+            mock.patch.object(self.torch.cuda, "current_device", return_value=0),
             mock.patch.object(
                 self.torch.cuda, "get_device_properties", return_value=properties
             ) as get_properties,
@@ -113,30 +115,15 @@ class TestRuntimeArchitecture(unittest.TestCase):
             self.assertEqual(self.chip_info.get_gfx_runtime(), "gfx1151")
         get_properties.assert_called_once_with(0)
 
-    def test_linux_runtime_errors_are_not_fallbacks(self):
-        with (
-            mock.patch.object(self.chip_info, "IS_WINDOWS", False),
-            mock.patch.object(
-                self.chip_info,
-                "_detect_native",
-                side_effect=RuntimeError("hipinfo error"),
-            ),
-            mock.patch.object(
-                self.torch.cuda, "get_device_properties"
-            ) as get_properties,
-            self.assertRaisesRegex(RuntimeError, "hipinfo error"),
-        ):
-            self.chip_info.get_gfx_runtime()
-        get_properties.assert_not_called()
-
-    def test_windows_without_hip_or_device_rethrows_detector_error(self):
-        for hip, available in ((None, True), ("6.3", False)):
-            with self.subTest(hip=hip, available=available):
+    def test_without_hip_or_device_rethrows_detector_error(self):
+        for windows in (True, False):
+            for hip, available in ((None, True), ("6.3", False)):
                 with (
-                    mock.patch.object(self.chip_info, "IS_WINDOWS", True),
+                    self.subTest(windows=windows, hip=hip, available=available),
+                    mock.patch.object(self.chip_info, "IS_WINDOWS", windows),
                     mock.patch.object(
                         self.chip_info,
-                        "_detect_native",
+                        "_gpu_info_archs",
                         side_effect=RuntimeError("hipinfo missing"),
                     ),
                     mock.patch.object(self.torch.version, "hip", hip),
@@ -146,10 +133,10 @@ class TestRuntimeArchitecture(unittest.TestCase):
                     mock.patch.object(
                         self.torch.cuda, "get_device_properties"
                     ) as get_properties,
-                    self.assertRaisesRegex(RuntimeError, "hipinfo missing"),
                 ):
-                    self.chip_info.get_gfx_runtime()
-                get_properties.assert_not_called()
+                    with self.assertRaisesRegex(RuntimeError, "hipinfo missing"):
+                        self.chip_info.get_gfx_runtime()
+                    get_properties.assert_not_called()
 
     def test_aot_replay_answers_its_gpu_archs_target_without_detection(self):
         with (
@@ -157,7 +144,7 @@ class TestRuntimeArchitecture(unittest.TestCase):
                 os.environ, {"AITER_AOT_REPLAY": "1", "GPU_ARCHS": "gfx942"}
             ),
             mock.patch.object(
-                self.chip_info, "_detect_native", return_value=["gfx950"]
+                self.chip_info, "_gpu_info_archs", return_value=["gfx950"]
             ) as detect,
         ):
             self.assertEqual(self.chip_info.get_gfx_runtime(), "gfx942")
@@ -181,11 +168,11 @@ class TestRuntimeArchitecture(unittest.TestCase):
             with self.subTest(detector_result=detector_result):
                 detect = (
                     mock.patch.object(
-                        self.chip_info, "_detect_native", return_value=detector_result
+                        self.chip_info, "_gpu_info_archs", return_value=detector_result
                     )
                     if isinstance(detector_result, list)
                     else mock.patch.object(
-                        self.chip_info, "_detect_native", side_effect=detector_result
+                        self.chip_info, "_gpu_info_archs", side_effect=detector_result
                     )
                 )
                 with (
@@ -194,6 +181,10 @@ class TestRuntimeArchitecture(unittest.TestCase):
                     mock.patch.object(self.torch.version, "hip", "6.3"),
                     mock.patch.object(
                         self.torch.cuda, "is_available", return_value=True
+                    ),
+                    mock.patch.object(self.torch.cuda, "device_count", return_value=1),
+                    mock.patch.object(
+                        self.torch.cuda, "current_device", return_value=0
                     ),
                     mock.patch.object(
                         self.torch.cuda,

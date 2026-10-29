@@ -42,16 +42,96 @@ def _gpu_info_output() -> str:
     return result.stdout
 
 
+def _gfx_from_text(text: str) -> str | None:
+    match = re.search(r"\b(gfx\w+)\b", text, re.IGNORECASE)
+    return match.group(1).lower() if match else None
+
+
+def _runtime_device() -> int:
+    """The HIP device runtime queries answer for, without initializing HIP.
+
+    torch's current device once torch has initialized HIP. Before that torch
+    cannot have selected another device, so device 0.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_initialized():
+        return 0
+    return torch.cuda.current_device()
+
+
+def _device_properties(device: int):
+    """Properties of a HIP device as torch reports them, as base_tuner reads."""
+    import torch
+
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_properties(device)
+
+
+def _torch_gcn_arch(device: int) -> str | None:
+    """Arch of a live HIP device. rocminfo can abort with empty stdout."""
+    try:
+        props = _device_properties(device)
+        if props is None:
+            return None
+        name = getattr(props, "gcnArchName", "")
+    except Exception:  # noqa: BLE001 device probing must allow CPU-only environments
+        return None
+    return _gfx_from_text(str(name))
+
+
+def _torch_cu_num(device: int) -> int | None:
+    try:
+        props = _device_properties(device)
+        if props is None:
+            return None
+        cu = torch_processor_count_to_cu(
+            str(props.gcnArchName), int(props.multi_processor_count)
+        )
+    except Exception:  # noqa: BLE001 device probing must allow CPU-only environments
+        return None
+    return cu if cu > 0 else None
+
+
+@functools.lru_cache(maxsize=1)
+def _gpu_info_archs() -> list[str]:
+    """Every distinct GPU arch rocminfo / hipinfo reports, in order."""
+    archs: list[str] = []
+    # rocminfo: "Name: gfx942"; hipinfo: "gcnArchName: gfx1200". ISA names
+    # ("Name: amdgcn-amd-amdhsa--gfx9-4-generic") are not device archs.
+    for match in re.finditer(
+        r"^\s*(?:Name|gcnArchName):\s*(gfx\w+)",
+        _gpu_info_output(),
+        re.IGNORECASE | re.MULTILINE,
+    ):
+        arch = match.group(1).lower()
+        if arch not in archs:
+            archs.append(arch)
+    return archs
+
+
 @functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
+    tool_error = None
     try:
-        # rocminfo: "Name: gfx942"; hipinfo: "gcnArchName: gfx1200"
-        for line in _gpu_info_output().splitlines():
-            match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
-            if match:
-                return [match.group(1).lower()]
-    except Exception as e:
-        raise RuntimeError(f"Get GPU arch from {_GPU_INFO_TOOL} failed: {e}") from e
+        archs = _gpu_info_archs()
+    except Exception as e:  # noqa: BLE001 a missing tool falls back like empty output
+        archs, tool_error = [], e
+    if archs:
+        return archs[:1]
+    # GPU_ARCHS is a build target, not the running GPU; get_gfx() reads it.
+    arch = _torch_gcn_arch(_runtime_device())
+    if arch:
+        logger.warning(
+            "%s returned no gfx arch; using %s from the live device",
+            _GPU_INFO_TOOL,
+            arch,
+        )
+        return [arch]
+    if tool_error is not None:
+        raise RuntimeError(
+            f"Get GPU arch from {_GPU_INFO_TOOL} failed: {tool_error}"
+        ) from tool_error
     raise RuntimeError(f"No gfx arch found in {_GPU_INFO_TOOL} output.")
 
 
@@ -110,19 +190,25 @@ def get_lds_capacity_bytes(gfx: str | None = None) -> int:
         raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
 
 
-@functools.lru_cache(maxsize=1)
 def get_gfx_runtime() -> str:
-    """Return the live GPU arch, using Torch if Windows hipinfo is unavailable.
+    """Return the arch of the current HIP device.
 
-    Unlike get_gfx(), ignores GPU_ARCHS -- always detects the actual running
-    GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
-    code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
-    csrc module-level arch selection) where no GPU may be available.
+    Answers from rocminfo, or hipinfo on Windows, when it reports one arch.
+    When it is missing, prints no gfx name or reports a mixed node, reads the
+    current device through Torch; GPU_ARCHS is not consulted. Cached per
+    device. Use for runtime dispatch (tuned kernels, code paths). Use get_gfx()
+    for build-time codegen (gen_instances, csrc module-level arch selection)
+    where no GPU may be available.
 
     The exception is an AOT replay process (AITER_AOT_REPLAY=1, started by
     aiter.aot.flydsl.common.replay_env): it runs the runtime without a GPU for
     the one arch GPU_ARCHS names, which stands in for the live GPU there.
     """
+    return _gfx_runtime(_runtime_device())
+
+
+@functools.cache
+def _gfx_runtime(device: int) -> str:
     if os.getenv("AITER_AOT_REPLAY") == "1":
         targets = _parse_gpu_archs_env(os.getenv("GPU_ARCHS", ""))
         if len(targets) != 1:
@@ -132,18 +218,24 @@ def get_gfx_runtime() -> str:
             )
         gfx_arch = targets[0]
     else:
+        tool_error = None
         try:
-            gfx_arch = _detect_native()[0]
-        except RuntimeError:
-            if not IS_WINDOWS:
-                raise
-            import torch
-
-            if torch.version.hip is None or not torch.cuda.is_available():
-                raise
-            gfx_arch = (
-                torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
-            )
+            archs = _gpu_info_archs()
+        except Exception as e:  # noqa: BLE001 a missing tool falls back to Torch
+            archs, tool_error = [], e
+        if len(archs) == 1:
+            gfx_arch = archs[0]
+        else:
+            gfx_arch = _torch_gcn_arch(device)
+            if gfx_arch is None:
+                if tool_error is not None:
+                    raise RuntimeError(
+                        f"Get GPU arch from {_GPU_INFO_TOOL} failed: {tool_error}"
+                    ) from tool_error
+                raise RuntimeError(
+                    f"No gfx arch for device {device} in {_GPU_INFO_TOOL} "
+                    f"output (archs {archs}) and no HIP device visible to Torch."
+                )
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
@@ -151,6 +243,9 @@ def get_gfx_runtime() -> str:
             f"Supported architectures: {sorted(supported)}"
         )
     return gfx_arch
+
+
+get_gfx_runtime.cache_clear = _gfx_runtime.cache_clear  # type: ignore[attr-defined]
 
 
 def _parse_asic_revision(value: str) -> int:
@@ -304,30 +399,62 @@ def _parse_cu_num_rocminfo(output: str) -> list[int]:
 def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
-        if IS_WINDOWS:
-            import torch
+        cu_num = _device_cu_num(_runtime_device())
+    return cu_num
 
-            props = torch.cuda.get_device_properties(0)
-            gfx = props.gcnArchName.split(":", 1)[0]
-            return torch_processor_count_to_cu(gfx, props.multi_processor_count)
+
+@functools.cache
+def _device_cu_num(device: int) -> int:
+    """CU count of a HIP device: rocminfo's when every GPU agrees, else Torch's.
+
+    hipinfo has no CU parser, so Windows always reads the device through Torch.
+    """
+    gpu_compute_units: list[int] = []
+    tool_error: Exception | None = None
+    if not IS_WINDOWS:
         try:
-            output = _gpu_info_output()
-            gpu_compute_units = _parse_cu_num_rocminfo(output)
+            gpu_compute_units = _parse_cu_num_rocminfo(_gpu_info_output())
         except Exception as e:  # noqa: BLE001  blanket catch is intentional here
+            tool_error = e
+        if len(set(gpu_compute_units)) == 1:
+            return gpu_compute_units[0]
+    cu_num = _torch_cu_num(device)
+    if cu_num is None:
+        if tool_error is not None:
             raise RuntimeError(
-                f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {e!s}"
-            )
-        if not gpu_compute_units:
-            raise RuntimeError(f"No GPU Compute Unit found in {_GPU_INFO_TOOL} output.")
-        assert len(set(gpu_compute_units)) == 1
-        cu_num = gpu_compute_units[0]
+                f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {tool_error!s}"
+            ) from tool_error
+        raise RuntimeError(
+            f"No GPU compute unit for device {device} in {_GPU_INFO_TOOL} output "
+            f"(parsed {gpu_compute_units}) or from Torch."
+        )
+    if not IS_WINDOWS:
+        logger.warning(
+            "%s did not report one GPU compute-unit count; using %s from device %d",
+            _GPU_INFO_TOOL,
+            cu_num,
+            device,
+        )
     return cu_num
 
 
-@functools.lru_cache(maxsize=1)
-def get_cu_num():
-    cu_num = get_cu_num_custom_op()
-    return cu_num
+def get_cu_num() -> int:
+    """CU count of the current HIP device, cached per device."""
+    return _get_cu_num(_runtime_device())
+
+
+@functools.cache
+def _get_cu_num(device: int) -> int:
+    # `device` only keys the cache: the custom op reads the same current device.
+    return get_cu_num_custom_op()
+
+
+def _clear_cu_num_cache() -> None:
+    _get_cu_num.cache_clear()
+    _device_cu_num.cache_clear()
+
+
+get_cu_num.cache_clear = _clear_cu_num_cache  # type: ignore[attr-defined]
 
 
 def get_build_targets() -> list[tuple[str, int]]:
