@@ -2732,6 +2732,8 @@ def _mxfp4_a4w4_stage2(
     device,
     use_nt=False,
     cshuffle=False,
+    BN=256,
+    BK=256,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
 ):
     _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
@@ -2775,6 +2777,8 @@ def _mxfp4_a4w4_stage2(
                 D_INTER_REAL=inter_real,
                 topk=topk,
                 xcd_swizzle=_xcd2,
+                BN=BN,
+                BK=BK,
             )
             # scatter_reduce fully overwrites each output row -> write the caller's
             # buffer directly (avoids a redundant (M, D_HIDDEN) D2D copy at the end).
@@ -2824,6 +2828,8 @@ def _mxfp4_a4w4_stage2(
         D_INTER_REAL=inter_real,
         topk=topk,
         xcd_swizzle=_xcd2,
+        BN=BN,
+        BK=BK,
     )
 
     if atomic:
@@ -3059,6 +3065,8 @@ def _mxfp4_a4w4_stage2_fw(
         device=device,
         use_nt=cfg["use_nt"],
         cshuffle=cfg["cshuffle"],
+        BN=cfg["BN"],
+        BK=cfg["BK"],
         inter_real=inter_real,
     )
 

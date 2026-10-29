@@ -332,7 +332,9 @@ def kas_c_k1_for(k):
 
 
 def kbs_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    # Same ceil as kas_c_k1_for: e8m0_shuffle pads the B scales to groups of 8
+    # columns too, so a floor drops the tail scale tile when k % 256 != 0.
+    return ((k // 32) + 7) // 8
 
 
 def kbs_stride_n0_dw_for(k):
