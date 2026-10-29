@@ -40,6 +40,20 @@ XCD_C_SMALL_K = 32
 XCD_C_LARGE_K = 120
 
 
+def _f32_to_bf16_rne(x):
+    """fp32 -> bf16, round to nearest even, with no NaN check.
+
+    A NaN input must have a zero low 16 bits (bf16-derived or the hardware
+    default NaN). Any other NaN can round into Inf.
+    """
+    n = x.numel
+    bits = x.bitcast(fx.Int32)
+    rounded = bits + 0x7FFF + ((bits >> 16) & 1)
+    halves = rounded.bitcast(fx.Int16)
+    hi = halves.shuffle(halves, list(range(1, 2 * n, 2)))
+    return fx.Vector(hi.bitcast(fx.BFloat16), x.shape, fx.BFloat16)
+
+
 def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD):
     xy = fx.Int32(xy)
     cnXCD = fx.Int32(nXCD)
@@ -412,7 +426,7 @@ def _build_launcher(
             # Same element count, different logical shape: relabel the bias
             # fragment so the add stays a flat vector op instead of broadcasting.
             bias = fx.Vector(bias, acc.shape, fx.BFloat16)
-            mma_frag_C_bf16.store((acc + bias).to(fx.BFloat16))
+            mma_frag_C_bf16.store(_f32_to_bf16_rne(acc + bias))
 
             sC = fx.make_view(
                 fx.get_dyn_shared(fx.BFloat16),
