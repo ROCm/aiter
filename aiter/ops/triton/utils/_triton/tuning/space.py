@@ -37,6 +37,10 @@ SEARCH_SPACE = {
     "B_SCALE_TDM": [True, False],
     "kpack": [1, 2],
     "persistent": [True, False],
+    "N_FIRST": [False, True],
+    "FUSED_SPLITK": [False, True],
+    "REDUCE_BLOCK_SIZE_M": [32],
+    "REDUCE_BLOCK_SIZE_N": [32],
 }
 
 # Families that spell a key differently share its table row and shape rules;
@@ -55,15 +59,39 @@ class UnknownConfigKey(Exception):
     pass
 
 
-def load_defaults(spec, backend):
+def config_tree(spec, backend, cu_num=None):
+    """The config directory a sweep plans from and installs into.
+
+    cu_num is the --cu-dir scope: None is the default tree, a CU count is its <cu_num>cu/ tree,
+    which must already have its own DEFAULT.json (the tuner never writes one).
+    """
+    from aiter.ops.triton.utils.config_utils import resolve_config_dir
+
+    plain = resolve_config_dir("gemm", spec.config_name, backend=backend, cu_num=None)
+    if cu_num is None:
+        return plain
+    config_dir = resolve_config_dir(
+        "gemm", spec.config_name, backend=backend, cu_num=cu_num
+    )
+    # the same folder: the loader found no <cu_num>cu/ DEFAULT.json for the family
+    if config_dir == plain:
+        raise SystemExit(
+            f"{spec.config_name} ({backend}) has no <arch>/{cu_num}cu/ tree: a <cu_num>cu/ "
+            "tree needs its own DEFAULT.json before it is tuned (copy the family's and say "
+            "so in the commit)"
+        )
+    return config_dir
+
+
+def load_defaults(spec, backend, cu_num=None):
     """Keys and buckets of the family's DEFAULT.json -> (keys, buckets, default_path).
 
     The keys are the union over all buckets, in file order. M_BOUNDS, _note and friends are
-    not buckets.
+    not buckets. cu_num picks the tree, as in config_tree.
     """
-    from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+    from aiter.ops.triton.utils.config_utils import load_config_json
 
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
+    config_dir = config_tree(spec, backend, cu_num)
     default_path = f"{config_dir}/DEFAULT.json"
     table = load_config_json(default_path, required=False)
     if table is None:
@@ -73,12 +101,12 @@ def load_defaults(spec, backend):
     return keys, buckets, default_path
 
 
-def default_values(spec, backend, M, keys, buckets):
+def default_values(spec, backend, M, keys, buckets, cu_num=None):
     """The DEFAULT.json bucket the loader picks for M, filled up with keys only other buckets have."""
     from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
     values, _ = get_gemm_config(
-        spec.config_name, M, bounds=spec.bounds, backend=backend
+        spec.config_name, M, bounds=spec.bounds, backend=backend, cu_num=cu_num
     )
     for key in keys:
         if key not in values:
@@ -212,10 +240,11 @@ def exceeds_lds(config, spec, arch, backend):
     return buffers * tile_bytes > _LDS_CAP_BYTES.get(arch, 64 * 1024)
 
 
-def build_space(spec, shape, backend, arch, kernel_should_skip):
-    """All configs to benchmark for one shape, plus a report of how the space was built."""
-    keys, buckets, default_path = load_defaults(spec, backend)
-    defaults = default_values(spec, backend, shape["M"], keys, buckets)
+def build_space(spec, shape, backend, arch, kernel_should_skip, cu_num=None):
+    """All configs to benchmark for one shape, plus a report of how the space was built.
+    cu_num picks the tree whose DEFAULT.json gives the keys (config_tree)."""
+    keys, buckets, default_path = load_defaults(spec, backend, cu_num)
+    defaults = default_values(spec, backend, shape["M"], keys, buckets, cu_num)
     values, pinned = candidate_values(spec, backend, keys, defaults, default_path)
 
     def shape_filtered(allow_oversized_tiles):
