@@ -15,6 +15,7 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from ..buffer_ops import buffer_store, create_buffer_resource_from_addr
 from ..quant_utils import emit_mx_e8m0_scale
 from .config import WAVE as WAVE_W
 from .config import DEADLINE, LINE, SYNC_FLAG, SYNC_GS, SYNC_TOP
@@ -55,6 +56,19 @@ def uni(v):
 def rdlane(v, j):
     """Lane j's copy of an i32 (readlane; j an int or a wave-uniform i32)."""
     return fx.Int32(rocdl.readlane(T.i32, fx.Int32(v), j))
+
+
+# gfx12 buffer cache policy: scope SYS (bits 4:3) -> the store writes through to
+# system coherence; once the store counter retires it a peer reads it over xGMI
+# without a system-scope writeback of the whole cache
+CPOL_SYS = 3 << 3
+
+
+def st_sys_wt(base, off, v):
+    """System-scope write-through store of v (a vector / scalar) at base + off (base
+    wave-uniform: the buffer descriptor's, off a per-lane byte offset)."""
+    rsrc = create_buffer_resource_from_addr(uni64(base).ir_value())
+    buffer_store(v, rsrc, fx.Int32(off), cache_modifier=CPOL_SYS, offset_is_bytes=True)
 
 
 def uni64(v):

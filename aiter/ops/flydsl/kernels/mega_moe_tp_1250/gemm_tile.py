@@ -167,6 +167,8 @@ def make_gemm_a8w4_tdm_task(
     q8_rows=0,
     expert_given=0,
     a_wait=0,
+    b_k=0,
+    b_n=0,
 ):
     """Build the per-tile body of the grouped A8W4 TDM GEMM (all arguments are
     compile-time). Returns ``(gemm_task, block, kernel name)``: with ``persistent_workers`` the
@@ -222,6 +224,17 @@ def make_gemm_a8w4_tdm_task(
     K_TILES = ceildiv(K, tile_k)
     KWS_TAIL = (K - (K_TILES - 1) * tile_k) // WMMA_K
     HAS_K_TAIL = KWS_TAIL != KWS
+    # B (the weights) narrower than the K / N the tile runs (an inter dim that is not a
+    # multiple of 128, e.g. DSv4.1's 576 per TP4 rank): b_k < K: B rows hold b_k
+    # values, the last k-tile's B loads clamp to the rest (TDM zero-fills past it);
+    # b_n < N: B has b_n rows per expert, the tiles past them are not read. The B
+    # scales stay K / 32 columns (the caller pads them), so the tail k-blocks scale
+    # to ~0 whatever lands in LDS
+    B_K = b_k or K
+    assert B_K <= K and B_K % 64 == 0 and B_K > (K_TILES - 1) * tile_k
+    B_TAIL_BYTES = (B_K - (K_TILES - 1) * tile_k) // 2 * 16 if B_K < K else None
+    ANY_TAIL = HAS_K_TAIL or B_TAIL_BYTES is not None
+    assert b_n % 32 == 0
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
@@ -275,6 +288,8 @@ def make_gemm_a8w4_tdm_task(
         q8_rows,
         expert_given,
         a_wait,
+        b_k,
+        b_n,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -495,7 +510,7 @@ def make_gemm_a8w4_tdm_task(
         wait_err: fx.Int64,
     ):
         A_KROW = K // A_PACK
-        Kp16 = (K // 2) * 16
+        Kp16 = (B_K // 2) * 16  # a B row group's bytes (16 rows x B_K fp4)
         K4 = K // 4
 
         tid = fx.thread_idx.x
@@ -571,8 +586,8 @@ def make_gemm_a8w4_tdm_task(
                     hi = go_right.select(hi, mid)
                 expert = lo
         eb64 = fx.Int64(expert)
-        B_BATCH_ROWS = n64 // 16
-        N_SUPERS = ceildiv(n64, 32)
+        B_BATCH_ROWS = (fx.Int64(b_n) if b_n else n64) // 16
+        N_SUPERS = ceildiv(fx.Int64(b_n) if b_n else n64, 32)
         # Compact dest rows arrive on the dispatch wire's padded pitch, so the A
         # row stride is not K bytes and the scale row stride is not K/128 dwords.
         A_GROW = a_row_stride_bytes if a_row_stride_bytes else A_KROW
@@ -765,6 +780,7 @@ def make_gemm_a8w4_tdm_task(
             split_inner=False,
             target_jobs=None,
             cache_modifier=0,
+            tail_bytes=None,
         ):
             split_i = split_inner and len(wv) > 1
             if const_expr(len(wv) > 1):
@@ -786,7 +802,7 @@ def make_gemm_a8w4_tdm_task(
                 (seg, inner_seg),
                 (g_stride, 1),
             )
-            ext = None if oob is None else oob - wave_outer_off
+            ext = None if oob is None else fx.max(oob - wave_outer_off, fx.Int32(0))
             pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
             atom = fx.rocdl.make_tdm_atom(
                 gt,
@@ -807,7 +823,9 @@ def make_gemm_a8w4_tdm_task(
             # last tile keeps the first KWS_TAIL/KWS of its inner extent. The
             # extent is relative to this wave's base, which imm_offset bumps.
             tail_ext = None
-            if const_expr(HAS_K_TAIL and k_adv):
+            if const_expr(tail_bytes is not None):
+                tail_ext = tail_bytes - wave_inner_off
+            elif const_expr(HAS_K_TAIL and k_adv):
                 tail_ext = inner * KWS_TAIL // KWS - wave_inner_off
             (jobs if target_jobs is None else target_jobs).append(
                 Job(
@@ -845,7 +863,7 @@ def make_gemm_a8w4_tdm_task(
             gB_base,
             b_off0,
             Kp16,
-            None,
+            None if not b_n else (fx.Int32(b_n) - fx.Int32(blk_n)) // 16,
             PACK_TK * 16,
             tile_n // 16,
             on_i32=False,
@@ -856,6 +874,7 @@ def make_gemm_a8w4_tdm_task(
             wv=waves[1],
             wg_mask=b_mcast_mask,
             cache_modifier=tdm_b_th,
+            tail_bytes=B_TAIL_BYTES,
         )
         if const_expr(row_major_ascale and tdm_as_in_prologue):
             # The compact wire is row-major with a padded global row pitch.
@@ -930,7 +949,7 @@ def make_gemm_a8w4_tdm_task(
             gSB_base,
             sb_off0,
             SB_OUTER_STRIDE,
-            None,
+            None if not b_n else (fx.Int32(b_n) - fx.Int32(blk_n)) // 32,
             SC_INNER,
             SB_SUPERS,
             on_i32=True,
@@ -959,7 +978,7 @@ def make_gemm_a8w4_tdm_task(
             # compile time, a loop kt selects it with one scalar compare.
             static_kt = isinstance(kt, int)
             is_tail = None
-            if const_expr(HAS_K_TAIL):
+            if const_expr(ANY_TAIL):
                 is_tail = (
                     kt == K_TILES - 1 if static_kt else fx.Int32(kt) == K_TILES - 1
                 )

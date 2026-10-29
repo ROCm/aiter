@@ -32,10 +32,10 @@ __all__ = ["MegaMoeTP1250Engine", "default_launch_cfg"]
 AR_TWO_MIN = int(os.environ.get("MEGA_AR_TWO_MIN", "512"))
 
 
-def default_launch_cfg(tokens: int) -> LaunchCfg:
+def default_launch_cfg(tokens: int, model_dim: int = 4096) -> LaunchCfg:
     """The launch config of a batch of (global) tokens: its dispatch path and tiles
     (MEGA_CFG="field=value,..." overrides LaunchCfg fields, for experiments)."""
-    cfg = _default_launch_cfg(tokens)
+    cfg = _default_launch_cfg(tokens, model_dim)
     ov = os.environ.get("MEGA_CFG", "")
     for f in filter(None, ov.split(",")):
         k, v = f.split("=")
@@ -48,7 +48,7 @@ def default_launch_cfg(tokens: int) -> LaunchCfg:
     return cfg
 
 
-def _default_launch_cfg(tokens: int) -> LaunchCfg:
+def _default_launch_cfg(tokens: int, model_dim: int = 4096) -> LaunchCfg:
     # weights read once per launch at small M: a streaming TDM temporal hint on the B
     # loads (gemm_tile tdm_b_th; 1 / 3 / 4 / 6 alike) is -5~8% at 16..512 tokens;
     # at 8 and from 8192 (an expert's weights re-read by its m-tiles) it costs
@@ -59,12 +59,15 @@ def _default_launch_cfg(tokens: int) -> LaunchCfg:
              else GemmCfg(tile_m=16, tile_n=256))
         # G2 (N = H) in wider tiles: half the tasks, so half the per-task fixed cost
         # (prologue, epilogue) a persistent CTA pays serially; 1024 wide at 64 tokens
-        g2 = GemmCfg(tile_m=16, tile_n=1024 if tokens == 64 else 512, num_buffers=2, b_th=th)
+        # 2 CTAs per CU with 1024-wide G2 tiles: at 64 tokens; for H5120 (DSv4.1) also
+        # at 16 / 128 / 256 (-1~6%; H4096: +1~2% at 128 / 256)
+        wide = tokens == 64 or (model_dim >= 5120 and tokens in (16, 128, 256))
+        g2 = GemmCfg(tile_m=16, tile_n=1024 if wide else 512, num_buffers=2, b_th=th)
         # tuned (TP4, scripts/tune_mm.py): 2 CTAs per CU up to 64 tokens (cheaper
         # grid syncs, few tiles anyway), 3 from 128 (more weight streams in flight);
         # every CTA counts the routes itself (no barrier 1), static task order
         return LaunchCfg(
-            "small", g, g2, cta_per_cu=2 if tokens == 64 else 3, place_rpw=1, dyn=False,
+            "small", g, g2, cta_per_cu=2 if wide else 3, place_rpw=1, dyn=False,
             local_hist=True,
             df2=tokens <= 128,  # G2 -> RS by m-tile counts (no barrier 4; wide G2 tiles)
             df0=tokens <= 64,  # placement -> G1 by expert counts (no barrier 2)
@@ -85,11 +88,9 @@ def _default_launch_cfg(tokens: int) -> LaunchCfg:
         # needs 2 CTAs per CU
         g2 = GemmCfg(tile_m=tm, tile_n=512, tile_k=128, num_buffers=2 if tokens <= 1024 else 3,
                      b_th=th)
-        # 512: every CTA counts the routes (no barrier 1), G1 by expert counts (no
-        # barrier 2), static task order (-4%)
-        sm = tokens <= 512
+        # (local_hist + df0 + static order: -4% at 512 for H4096 / E256, +3% for DSv4.1)
         return LaunchCfg("mid", gs, g2, cta_per_cu=3 if tokens <= 1024 else 2,
-                         place_rpw=1 if tokens <= 512 else 4, local_hist=sm, df0=sm, dyn=not sm)
+                         place_rpw=1 if tokens <= 512 else 4)
     if tokens <= 8192:
         return LaunchCfg("mid", g, g, cta_per_cu=2, place_rpw=16, rs_pull=q8, rs_q8=q8)
     return LaunchCfg("big", g, g, cta_per_cu=2, place_rpw=32, rs_pull=True, rs_q8=q8)
@@ -123,9 +124,15 @@ class MegaMoeTP1250Engine:
     ):
         if not 1 <= world_size <= MAX_TP:
             raise ValueError(f"tp {world_size} not in [1, {MAX_TP}]")
-        if model_dim % 1024 or inter_dim % 128:
-            raise ValueError(f"h{model_dim} i{inter_dim}: need h % 1024, i % 128")
+        if model_dim % 1024 or inter_dim % 64:
+            raise ValueError(f"h{model_dim} i{inter_dim}: need h % 1024, i % 64")
         self.rank, self.tp = int(rank), int(world_size)
+        # an inter dim off the 128 grid (DSv4.1: 576 per TP4 rank) runs as I (the next
+        # multiple of 128) with the weights at their own Ip: w1 [E, 2 Ip, H / 2],
+        # w2 [E, H, Ip / 2] (preshuffled as is, nothing read past Ip); only w2's e8m0
+        # scales are padded to I / 32 columns (with 0: the tail k-blocks scale to ~0)
+        self.Ip = inter_dim
+        inter_dim = (inter_dim + 127) // 128 * 128
         self.H, self.I, self.E, self.K = model_dim, inter_dim, experts, topk
         self.mmax = int(max_local_tokens)
         self.act = activation
@@ -186,6 +193,7 @@ class MegaMoeTP1250Engine:
                 act=self.act,
                 n_cu=self.n_cu,
                 cfg=cfg,
+                Ip=self.Ip,
             )[0]
             self._launchers[cfg] = fn
         return fn
@@ -199,7 +207,7 @@ class MegaMoeTP1250Engine:
             out = self.y[:m]
         if m == 0:
             return out
-        cfg = cfg or self.cfg_fn(m * self.tp)
+        cfg = cfg or self.cfg_fn(m * self.tp, self.H)
         x = x.contiguous()
         ids = topk_ids.to(torch.int32).contiguous()
         tw = topk_weights.to(torch.float32).contiguous()
@@ -272,8 +280,11 @@ class MegaMoeTP1250Engine:
                 self.y_ar = torch.empty((self.mmax * self.tp, self.H), dtype=torch.bfloat16,
                                         device=self.device)
             out = self.y_ar[:T]
-        cfg = cfg or self.cfg_fn(T)
+        cfg = cfg or self.cfg_fn(T, self.H)
+        # rs_wt (MEGA_RS_WT=0: off): the rows peers read written through at system scope
+        # instead of a system-scope cache writeback before their signal (-10~55 us)
         cfg = dataclasses.replace(cfg, ar=True, rs_pull=False, ag_split=False,
+                                  rs_wt=os.environ.get("MEGA_RS_WT", "1") == "1",
                                   ar_two=cfg.ar_two or T > AR_TWO_MIN)
         return self.forward(x, topk_weights, topk_ids, out=out, cfg=cfg, _m_override=True)
 

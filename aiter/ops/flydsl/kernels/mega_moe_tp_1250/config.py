@@ -131,6 +131,13 @@ class LaunchCfg:
     # AR + local_hist: every token quantized once at the start (under the routing
     # count; placement copies the rows) instead of per route (6x the x reads)
     q_once: bool = False
+    # small AR: no placement phase; each G1 task builds its own m-tile's A rows (its
+    # expert's routes in token order, quantized from x) and n-tile 0 writes their rpos
+    self_place: bool = False
+    # AR: the rows peers read (RS partials, two-step Y's reduced rows) by system-scope
+    # write-through stores, so their signal needs no system-scope writeback (a whole
+    # cache flush: ~30 us at 1024 tokens of DSv4.1)
+    rs_wt: bool = False
 
     @property
     def align_m(self) -> int:
