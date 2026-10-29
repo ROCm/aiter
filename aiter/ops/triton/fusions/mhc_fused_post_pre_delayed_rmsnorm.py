@@ -8,6 +8,7 @@ RMSNorm in two Triton launches. See the kernel module for the math and structure
 import torch
 import triton
 
+from aiter import dtypes
 from aiter.ops.triton._triton_kernels.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     _mhc_fused_post_pre_delayed_rmsnorm_main_kernel,
     _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel,
@@ -36,6 +37,7 @@ def mhc_fused_post_pre_delayed_rmsnorm(
     *,
     residual_out: torch.Tensor | None = None,
     config: dict | None = None,
+    quant_out: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused delayed mHC seam.
 
@@ -54,10 +56,14 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         residual_out: optional (T, 4, H) bf16 buffer for the new residual.
         config: optional launch config dict; loaded from the per-arch tuned configs
             (``get_mhc_fused_post_pre_delayed_rmsnorm_config``) when ``None``.
+        quant_out: also quantize the layer input for a native FP8 GEMM: group32
+            MXFP8 (``dtypes.fp8`` with (T, H // 32) uint8 E8M0 codes), from the
+            BF16 rounding the layer input is stored as.
 
     Returns:
         (residual_out, post_mix (T, 4, 1), comb_mix (T, 4, 4), layer_input (T, H) bf16,
-         next_pre_mix (T, 4)); the gates are fp32.
+         next_pre_mix (T, 4)); the gates are fp32. With ``quant_out``, layer_input is
+        ``(bf16, fp8, uint8 scale)``.
     """
     assert (
         residual.dim() == 3
@@ -106,8 +112,15 @@ def mhc_fused_post_pre_delayed_rmsnorm(
     comb_out = torch.empty(T, 4, 4, dtype=torch.float32, device=device)
     next_pre = torch.empty(T, 4, dtype=torch.float32, device=device)
     layer_input = torch.empty(T, H, dtype=torch.bfloat16, device=device)
+    if quant_out:
+        assert H % 32 == 0, f"group32 quantization needs H % 32 == 0, got H={H}"
+        quant = torch.empty(T, H, dtype=dtypes.fp8, device=device)
+        quant_scale = torch.empty(T, H // 32, dtype=torch.uint8, device=device)
+    else:
+        quant = quant_scale = layer_input  # unused
+    outputs = (layer_input, quant, quant_scale) if quant_out else layer_input
     if T == 0:
-        return residual_out, post_out, comb_out, layer_input, next_pre
+        return residual_out, post_out, comb_out, outputs, next_pre
 
     if config is None:
         config = get_mhc_fused_post_pre_delayed_rmsnorm_config(T)
@@ -151,10 +164,14 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         norm_eps,
+        quant,
+        quant_scale,
         H=H,
         NUM_KSPLIT=config["NUM_KSPLIT"],
         NUM_SINKHORN_ITERS=int(sinkhorn_repeat),
         BLOCK_C=config["BLOCK_C"],
+        QUANT=quant_out,
+        FP8_MAX=float(torch.finfo(dtypes.fp8).max),
         num_warps=config["reduce_num_warps"],
     )
-    return residual_out, post_out, comb_out, layer_input, next_pre
+    return residual_out, post_out, comb_out, outputs, next_pre

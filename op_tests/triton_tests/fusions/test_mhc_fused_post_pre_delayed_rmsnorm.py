@@ -6,6 +6,7 @@
 import pytest
 import torch
 
+from aiter import dtypes
 from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     mhc_fused_post_pre_delayed_rmsnorm,
 )
@@ -138,3 +139,58 @@ def test_mhc_fused_post_pre_delayed_rmsnorm_empty():
         norm_weight=w,
     )
     assert R.shape == (0, 4, 5120) and li.shape == (0, 5120) and pre_o.shape == (0, 4)
+
+
+def ref_mxfp8_group32(x):
+    """Group32 MXFP8 of a BF16 tensor: E8M0 scale = ceil_pow2(amax / FP8 max),
+    amax floored at 1e-10; values x / scale, RNE to FP8. Returns (fp8, uint8)."""
+    fp8 = dtypes.fp8
+    fp8_max = torch.finfo(fp8).max
+    g = x.float().view(*x.shape[:-1], -1, 32)
+    amax = g.abs().amax(-1).clamp_min(1e-10)
+    bits = (amax * (1.0 / fp8_max)).view(torch.int32)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    scale = (code << 23).view(torch.float32)
+    q = (g / scale.unsqueeze(-1)).clamp(-fp8_max, fp8_max).to(fp8)
+    return q.view(x.shape), code.to(torch.uint8)
+
+
+@pytest.mark.parametrize("mode", ["post", "no_post"])
+@pytest.mark.parametrize("T", [1, 17, 192, 3000])
+def test_mhc_fused_post_pre_delayed_rmsnorm_quant_out(T, mode):
+    residual, y, fn, hc_scale, hc_base, post, comb, pre, w = make_inputs(T, 5120)
+    kw = {"norm_weight": w}
+    if mode == "post":
+        kw.update(sublayer_out=y, post_layer_mix=post, comb_res_mix=comb)
+    plain = mhc_fused_post_pre_delayed_rmsnorm(
+        residual, fn, hc_scale, hc_base, *ARGS, pre_mix=pre, **kw
+    )
+    quant = mhc_fused_post_pre_delayed_rmsnorm(
+        residual, fn, hc_scale, hc_base, *ARGS, pre_mix=pre, quant_out=True, **kw
+    )
+    li, q, s = quant[3]
+    # quant_out only adds outputs: everything else is the plain launch's, bit for bit
+    torch.testing.assert_close(li, plain[3], rtol=0, atol=0)
+    for got, want in zip(quant[:3] + quant[4:], plain[:3] + plain[4:]):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    ref_q, ref_s = ref_mxfp8_group32(li)
+    assert q.dtype == dtypes.fp8 and q.shape == (T, 5120)
+    assert s.dtype == torch.uint8 and s.shape == (T, 5120 // 32)
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(s, ref_s)
+
+
+def test_mhc_fused_post_pre_delayed_rmsnorm_quant_out_empty():
+    residual, _, fn, hc_scale, hc_base, _, _, pre, w = make_inputs(0, 5120)
+    out = mhc_fused_post_pre_delayed_rmsnorm(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        *ARGS,
+        pre_mix=pre,
+        norm_weight=w,
+        quant_out=True,
+    )
+    li, q, s = out[3]
+    assert li.shape == (0, 5120) and q.shape == (0, 5120) and s.shape == (0, 160)

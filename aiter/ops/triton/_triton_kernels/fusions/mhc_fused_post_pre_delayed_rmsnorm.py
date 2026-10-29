@@ -241,13 +241,23 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
     hc_sinkhorn_eps,
     hc_post_mult,
     norm_eps,
+    quant_ptr,  # (T, H) fp8 copy of the layer input                  [QUANT]
+    quant_scale_ptr,  # (T, H // 32) uint8 E8M0 exponent codes          [QUANT]
     H: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     NUM_SINKHORN_ITERS: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    QUANT: tl.constexpr = False,
+    FP8_MAX: tl.constexpr = 448.0,
 ):
-    """Grid (T,): one program per token."""
+    """Grid (T,): one program per token.
+
+    With QUANT the normed row is also written as FP8 with one E8M0 scale per 32
+    columns, quantized from its BF16 rounding: ceil-pow2 scale of amax / FP8_MAX
+    (amax floored at 1e-10), the group32 MXFP8 a native FP8 GEMM reads.
+    """
     tl.static_assert(H % BLOCK_C == 0, "the norm loop has no column mask")
+    tl.static_assert(not QUANT or BLOCK_C % 32 == 0, "quant groups are 32 columns")
     KSPLIT_POW2: tl.constexpr = triton.next_power_of_2(NUM_KSPLIT)
     t = tl.program_id(0).to(tl.int64)
     ks = tl.arange(0, KSPLIT_POW2)
@@ -308,4 +318,23 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
         xp = layer_input_ptr + t * H + rc
         xv = tl.load(xp).to(tl.float32)
         w = tl.load(norm_w_ptr + rc).to(tl.float32)
-        tl.store(xp, ((xv * rstd_n) * w).to(tl.bfloat16))
+        y = ((xv * rstd_n) * w).to(tl.bfloat16)
+        tl.store(xp, y)
+        if QUANT:
+            g = tl.reshape(y.to(tl.float32), (BLOCK_C // 32, 32))
+            amax = tl.maximum(tl.max(tl.abs(g), 1), 1e-10)
+            bits = (amax * (1.0 / FP8_MAX)).to(tl.uint32, bitcast=True)
+            code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(tl.uint32)
+            scale = (code << 23).to(tl.float32, bitcast=True)
+            q = tl.minimum(tl.maximum(g / scale[:, None], -FP8_MAX), FP8_MAX)
+            tl.store(
+                quant_ptr + t * H + rc,
+                tl.reshape(q, (BLOCK_C,)).to(quant_ptr.dtype.element_ty),
+            )
+            tl.store(
+                quant_scale_ptr
+                + t * (H // 32)
+                + c0 // 32
+                + tl.arange(0, BLOCK_C // 32),
+                code.to(tl.uint8),
+            )
