@@ -4,22 +4,22 @@
 """Check mHC post/pre values, current inputs, output ownership and graph replay."""
 
 import argparse
-from contextlib import nullcontext
 import hashlib
 import json
-from pathlib import Path
 import statistics
+from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.mhc import (
     _mhc_post_pre_gfx950_supported,
     mhc_fused_post_pre,
     mhc_pack_fn_gfx950,
     mhc_shuffle_fn,
 )
-from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import checkAllclose, run_perftest
 
 
