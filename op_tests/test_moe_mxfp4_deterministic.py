@@ -5,7 +5,9 @@
 A token's output must be bitwise the same whatever the batch it is in and from
 run to run, including across the token counts where the default changes its
 kernels, tiles or activation dtype, and it must be as accurate as the
-default, which also uses MXFP4 activations from 256 tokens.
+default. Separated gate/up weights use MXFP4 activations, which the default
+also uses from 256 tokens; gate/up-interleaved weights use MXFP8 activations,
+as the default does from 256 tokens.
 
 Run:
     pytest op_tests/test_moe_mxfp4_deterministic.py -q
@@ -37,7 +39,7 @@ def _cos_diff(x, y):
     return float(1 - 2 * (x * y).sum() / denom)
 
 
-def _problem(M, model_dim, inter_dim, E, topk, bias=True):
+def _problem(M, model_dim, inter_dim, E, topk, bias=True, interleaved=False):
     dtype = dtypes.bf16
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -59,12 +61,13 @@ def _problem(M, model_dim, inter_dim, E, topk, bias=True):
         "w2_qt": w2_qt,
         "w1_scale": w1_scale,
         "w2_scale": w2_scale,
-        "w1": shuffle_weight_a16w4(w1_qt, 16, False),
+        "w1": shuffle_weight_a16w4(w1_qt, 16, interleaved),
         "w2": shuffle_weight_a16w4(w2_qt, 16, False),
-        "w1_scale_s": shuffle_scale_a16w4(w1_scale, E, False),
+        "w1_scale_s": shuffle_scale_a16w4(w1_scale, E, interleaved),
         "w2_scale_s": shuffle_scale_a16w4(w2_scale, E, False),
         "bias1": None,
         "bias2": None,
+        "gate_mode": GateMode.INTERLEAVE if interleaved else GateMode.SEPARATED,
     }
     if bias:
         p["bias1"] = torch.randn((E, inter_dim * 2), dtype=torch.float32, device="cuda")
@@ -83,7 +86,7 @@ def _run(p, rows, activation, deterministic, **kwargs):
         w2_scale=p["w2_scale_s"],
         quant_type=QuantType.per_1x32,
         activation=activation,
-        gate_mode=GateMode.SEPARATED.value,
+        gate_mode=p["gate_mode"].value,
         bias1=p["bias1"],
         bias2=p["bias2"],
         deterministic=deterministic,
@@ -169,6 +172,31 @@ def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk):
 
 
 @_SKIP
+@pytest.mark.parametrize(
+    "model_dim,inter_dim,E,topk",
+    [(1024, 512, 32, 4), (3072, 3072, 32, 4), (3072, 3072, 128, 4)],
+)
+def test_deterministic_mxfp8_interleaved_swiglu_bias(model_dim, inter_dim, E, topk):
+    """Gate/up-interleaved weights (gpt-oss in SGLang) run with MXFP8 activations;
+    the stage-1 bias stays in [gate.., up..] order."""
+    limit = 7.0
+    p = _problem(_M, model_dim, inter_dim, E, topk, interleaved=True)
+    out = _run(p, slice(None), ActivationType.Swiglu, True, swiglu_limit=limit)
+    assert not out.isnan().any().item(), "deterministic output contains NaN"
+    ref = _reference(
+        p, _M, model_dim, inter_dim, E, topk, ActivationType.Swiglu, swiglu_limit=limit
+    )
+    # The default also quantizes the activations to MXFP8 at this token count.
+    default = _run(p, slice(None), ActivationType.Swiglu, False, swiglu_limit=limit)
+    ld = _cos_diff(ref.float(), out.float())
+    ld_default = _cos_diff(ref.float(), default.float())
+    assert (
+        ld <= ld_default * 1.1 + 1e-5
+    ), f"cos/logits_diff vs the bf16 reference {ld:.3e}, default {ld_default:.3e}"
+    _check_batch_invariant(p, out, ActivationType.Swiglu, swiglu_limit=limit)
+
+
+@_SKIP
 @pytest.mark.parametrize("M", [1, 8, 64, 300])
 def test_deterministic_zero_routing_weights(M):
     """Routes with zero weight must not change a token's result: half the tokens
@@ -207,7 +235,11 @@ def test_deterministic_rejects_unsupported():
     p = _problem(8, 1024, 512, E, 4, bias=False)
 
     def call(interleaved=False, in_dtype=dtypes.bf16, **kw):
-        args = {"activation": ActivationType.Swiglu, "deterministic": True}
+        args = {
+            "activation": ActivationType.Swiglu,
+            "deterministic": True,
+            "gate_mode": GateMode.SEPARATED.value,
+        }
         args.update(kw)
         return fused_moe(
             p["inp"].to(in_dtype),
@@ -218,7 +250,6 @@ def test_deterministic_rejects_unsupported():
             w1_scale=shuffle_scale_a16w4(p["w1_scale"], E, interleaved),
             w2_scale=p["w2_scale_s"],
             quant_type=QuantType.per_1x32,
-            gate_mode=GateMode.SEPARATED.value,
             **args,
         )
 
@@ -232,6 +263,12 @@ def test_deterministic_rejects_unsupported():
         call(in_dtype=dtypes.fp16)
     with pytest.raises(NotImplementedError, match="interleaved"):
         call(interleaved=True)
+    with pytest.raises(NotImplementedError, match="interleaved weights MXFP8"):
+        call(
+            interleaved=True,
+            gate_mode=GateMode.INTERLEAVE.value,
+            quant_dtype_a=dtypes.fp4x2,
+        )
     with pytest.raises(NotImplementedError, match="block_size_M"):
         call(block_size_M=128)
     with pytest.raises(NotImplementedError, match="stage-2 activation dtype"):

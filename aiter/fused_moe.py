@@ -1131,12 +1131,14 @@ def fused_moe(
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
     ``deterministic=True`` gives bitwise the same output for a token whatever the
-    batch, and from run to run: MXFP4 activations at every token count, the
+    batch, and from run to run: one activation dtype at every token count, the
     FlyDSL kernels with one K structure for every token count, no split-K, and
     the non-atomic reduce epilogue in stage 2 (the top-k partials are summed in
     a fixed order). It is supported on gfx950 for MXFP4 weights
-    (``QuantType.per_1x32``, separated gate/up, preshuffled) with SwiGLU, bf16
-    output, without expert parallelism.
+    (``QuantType.per_1x32``, preshuffled) with SwiGLU, bf16 output, without
+    expert parallelism. Gate/up-interleaved weights run with MXFP8 activations
+    (the precision the default uses from 256 tokens), separated ones with MXFP4
+    activations; ``quant_dtype_a`` can pick either for its matching layout.
 
     Supplying any shared tensor (or ``shared_expert_id``) requires all four
     shared weight/scale tensors and dispatches through the gfx950 FHMoE path.
@@ -1540,11 +1542,23 @@ def _fused_moe_impl(
         q_dtype_a = _q_dtype_a
 
     if deterministic:
+        # The default picks the activation dtype by token count (bf16, then fp4
+        # or fp8 above a bound), which would make results depend on the batch.
+        # Deterministic mode quantizes the activations to one dtype at every
+        # token count, per 1x32 block within a token's row, so a row's result
+        # does not depend on the other rows: MXFP8 for gate/up-interleaved
+        # weights, MXFP4 for separated ones, unless quant_dtype_a picks one.
+        if quant_dtype_a is not None:
+            q_dtype_a = quant_dtype_a
+        elif gate_mode == GateMode.INTERLEAVE:
+            q_dtype_a = dtypes.fp8
+        else:
+            q_dtype_a = dtypes.fp4x2
         _check_deterministic_supported(
             dtype=dtype,
             quant_type=quant_type,
             q_dtype_w=q_dtype_w,
-            q_dtype_a=q_dtype_a if quant_dtype_a is not None else None,
+            q_dtype_a=q_dtype_a,
             q_dtype_a2=quant_dtype_a2,
             activation=activation,
             gate_mode=gate_mode,
@@ -1562,12 +1576,6 @@ def _fused_moe_impl(
             hidden_pad=hidden_pad,
             has_bias2=bias2 is not None,
         )
-        # The default picks the activation dtype by token count (bf16, then
-        # fp4 above a bound), which would make results depend on the batch.
-        # Deterministic mode quantizes the activations to MXFP4 at every token
-        # count: the quantization is per 1x32 block within a token's row, so a
-        # row's result does not depend on the other rows.
-        q_dtype_a = dtypes.fp4x2
 
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
@@ -1709,7 +1717,7 @@ def _fused_moe_impl(
 
     if deterministic:
         metadata = _deterministic_metadata(
-            M, activation, dtype, quant_type, hidden_pad, intermediate_pad
+            M, activation, dtype, quant_type, hidden_pad, intermediate_pad, q_dtype_a
         )
     else:
         metadata = _resolve_metadata()
@@ -3424,6 +3432,9 @@ def _check_deterministic_supported(
     has_bias2,
 ):
     """Raise NotImplementedError naming what fused_moe(deterministic=True) cannot run."""
+    layout = {True: "gate/up-interleaved", False: "separated"}.get(
+        gate_up_interleave, "untagged"
+    )
     unsupported = [
         why
         for bad, why in (
@@ -3432,12 +3443,15 @@ def _check_deterministic_supported(
                 f"weights other than MXFP4 ({quant_type!s}, {q_dtype_w})",
             ),
             (
-                q_dtype_a is not None and q_dtype_a != dtypes.fp4x2,
-                f"activation dtype {q_dtype_a} (MXFP4 only)",
+                q_dtype_a not in (dtypes.fp4x2, dtypes.fp8),
+                f"activation dtype {q_dtype_a} (MXFP4 or MXFP8 only)",
             ),
             (
-                q_dtype_a2 is not None and q_dtype_a2 != dtypes.fp4x2,
-                f"stage-2 activation dtype {q_dtype_a2} (MXFP4 only)",
+                q_dtype_a2 is not None and q_dtype_a2 != q_dtype_a,
+                (
+                    f"stage-2 activation dtype {q_dtype_a2} (must match the stage-1 "
+                    f"activation dtype {q_dtype_a})"
+                ),
             ),
             (dtype != dtypes.bf16, f"output dtype {dtype} (bf16 only)"),
             (
@@ -3446,12 +3460,18 @@ def _check_deterministic_supported(
                 activation != ActivationType.Swiglu,
                 f"activation {activation!s} (SwiGLU only)",
             ),
-            (gate_mode != GateMode.SEPARATED, f"gate_mode={gate_mode.value!r}"),
             (
+                # The MXFP4-activation kernels take the separated preshuffle, the
+                # MXFP8-activation (a8w4) kernels the gate/up-interleaved one.
                 not _flydsl_mxfp4_layout_is_compatible(
-                    dtypes.fp4x2, gate_mode, gate_up_interleave
+                    q_dtype_a, gate_mode, gate_up_interleave
+                )
+                or (q_dtype_a == dtypes.fp8) != (gate_mode == GateMode.INTERLEAVE),
+                (
+                    f"{layout} weights with gate_mode={gate_mode.value!r} and "
+                    f"{q_dtype_a} activations (separated weights take MXFP4 "
+                    "activations, gate/up-interleaved weights MXFP8)"
                 ),
-                "gate/up-interleaved weights (the separated preshuffle only)",
             ),
             (
                 not (is_shuffled and is_g1u1 and not doweight_stage1),
@@ -3465,8 +3485,11 @@ def _check_deterministic_supported(
             ),
             (
                 block_size_M is not None
-                and int(block_size_M) != _deterministic_block_m(tokens),
-                f"block_size_M={block_size_M} (uses {_deterministic_block_m(tokens)})",
+                and int(block_size_M) != _deterministic_block_m(tokens, q_dtype_a),
+                (
+                    f"block_size_M={block_size_M} "
+                    f"(uses {_deterministic_block_m(tokens, q_dtype_a)})"
+                ),
             ),
             (
                 # Stage 1 splits the hidden dimension into two K waves of 256-wide
@@ -3490,12 +3513,15 @@ def _check_deterministic_supported(
         )
 
 
-def _deterministic_block_m(tokens: int) -> int:
-    return 32 if tokens <= 1024 else (64 if tokens <= 2048 else 128)
+def _deterministic_block_m(tokens: int, q_dtype_a=None) -> int:
+    block_m = 32 if tokens <= 1024 else (64 if tokens <= 2048 else 128)
+    # At tile_m 32 the a8w4 (MXFP8-activation) stage 1 with tile_n 128 gives a
+    # different result from run to run on gfx950, so that path starts at 64.
+    return max(block_m, 64) if q_dtype_a == dtypes.fp8 else block_m
 
 
 def _deterministic_metadata(
-    tokens, activation, dtype, quant_type, hidden_pad, intermediate_pad
+    tokens, activation, dtype, quant_type, hidden_pad, intermediate_pad, q_dtype_a
 ):
     """FlyDSL v1 MXFP4 kernels with one K structure for every token count.
 
@@ -3509,9 +3535,17 @@ def _deterministic_metadata(
     """
     from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
-    block_m = _deterministic_block_m(tokens)
-    kn1 = f"flydsl_moe1_afp4_wfp4_bf16_t{block_m}x128x256_w2"
-    kn2 = f"flydsl_moe2_afp4_wfp4_bf16_t{block_m}x128x256_reduce"
+    block_m = _deterministic_block_m(tokens, q_dtype_a)
+    if q_dtype_a == dtypes.fp8:
+        # The a8w4 stage-1 kernels read gate/up-interleaved weights (_gui). The
+        # tile width only splits the output columns, so a row's K reduction is
+        # the same at both widths; the wider tile is faster from tile_m 128.
+        tile_n = 128 if block_m <= 64 else 256
+        kn1 = f"flydsl_moe1_afp8_wfp4_bf16_t{block_m}x{tile_n}x256_w2_gui"
+        kn2 = f"flydsl_moe2_afp8_wfp4_bf16_t{block_m}x128x256_reduce"
+    else:
+        kn1 = f"flydsl_moe1_afp4_wfp4_bf16_t{block_m}x128x256_w2"
+        kn2 = f"flydsl_moe2_afp4_wfp4_bf16_t{block_m}x128x256_reduce"
     for kn in (kn1, kn2):
         params = get_flydsl_kernel_params(kn)
         if params is None or params.get("k_batch", 1) != 1:
@@ -4921,7 +4955,8 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
-                sorted_weights=sorted_weights,
+                # As for MXFP4 below: the row is shared by the token's routes.
+                sorted_weights=None if deterministic else sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
 
