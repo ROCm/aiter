@@ -193,21 +193,12 @@ def _batched_gemm_afp4_wfp4_kernel(
         )
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            # Load scales, masking OOB when K is not aligned to BLOCK_SIZE_K.
-            # OOB scales could contain 0xFF (NaN in e8m0) which propagates
-            # through dot_scaled even when the corresponding data is zero.
-            if EVEN_K:
-                a_scales = tl.load(a_scale_ptrs)
-                b_scales = tl.load(b_scale_ptrs)
-            else:
-                scale_mask = offs_scale_k[None, :] < (
-                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-                )
-                a_scales = tl.load(a_scale_ptrs, mask=scale_mask, other=127)
-                b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
+            a_scales = tl.load(a_scale_ptrs)
+            b_scales = tl.load(b_scale_ptrs)
+            # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
+            # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
