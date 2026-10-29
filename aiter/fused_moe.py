@@ -299,6 +299,21 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
+def _alloc_aux_sort_buffers(M, num_experts, topk, block_m, device):
+    """Outputs of the moe_aux sort kernels, sized for the worst-case padding."""
+    active = min(num_experts, M * topk)
+    max_sorted = -(-(M * topk + active * (block_m - 1)) // block_m) * block_m
+    return (
+        max_sorted,
+        torch.empty(max_sorted, dtype=dtypes.i32, device=device),
+        torch.empty(max_sorted // block_m, dtype=dtypes.i32, device=device),
+        torch.empty(2, dtype=dtypes.i32, device=device),
+        torch.empty(max_sorted, dtype=dtypes.fp32, device=device),
+        torch.empty(M * topk, dtype=dtypes.i32, device=device),
+        torch.empty(max_sorted, dtype=dtypes.i32, device=device),
+    )
+
+
 def _adaptive_moe_sort(
     topk_ids,
     topk_weights,
@@ -316,15 +331,15 @@ def _adaptive_moe_sort(
     device = topk_ids.device
     M = topk_ids.shape[0]
     BM = block_size
-    active = min(num_experts, M * topk)
-    max_sorted = (((M * topk + active * (BM - 1)) + BM - 1) // BM) * BM
-
-    sorted_token_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    sorted_expert_ids = torch.empty(max_sorted // BM, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
-    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
-    m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    (
+        _,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        sorted_weights,
+        reverse_sorted,
+        m_indices,
+    ) = _alloc_aux_sort_buffers(M, num_experts, topk, BM, device)
     moe_buf = (
         torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
         if atomic
