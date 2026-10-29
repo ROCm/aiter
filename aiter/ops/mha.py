@@ -2552,6 +2552,8 @@ def _flash_attn_backward(
         ret &= bias is None
         ret &= dbias is None
         ret &= dropout_p == 0.0
+        # the v3 kernels take no sink, so d_sink would be left unwritten
+        ret &= sink is None and d_sink is None
         ret &= not deterministic or is_950_1block
         ret &= nhead_q % nhead_k == 0
         ret &= (
@@ -3351,6 +3353,8 @@ def _flash_attn_varlen_backward(
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
+        # the v3 kernels take no sink, so d_sink would be left unwritten
+        ret &= sink is None and d_sink is None
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
@@ -3359,6 +3363,7 @@ def _flash_attn_varlen_backward(
         ret &= not swa or hdim_q <= 128
         if hdim_q == 256:
             ret &= not causal
+            ret &= window_size_left == -1 and window_size_right == -1
             ret &= nhead_q == nhead_k
             ret &= q.dtype == dtypes.bf16
 
