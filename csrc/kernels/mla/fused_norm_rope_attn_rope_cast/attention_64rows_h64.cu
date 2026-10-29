@@ -84,9 +84,10 @@ bool use_decode_wave_reduce(const FusedNormRopeAttnRopeCastParams& a)
 {
     // Four channel slices per wave avoid LDS reduction on small split grids.
     const int64_t blocks = int64_t(a.N) * a.H / 16;
-    const bool supported_splits = a.num_splits == 4 ||
-                                  (a.H == 32 && (a.num_splits == 3 || a.num_splits == 5 ||
-                                                 a.num_splits == 7));
+    const bool supported_splits =
+        a.num_splits == 4 ||
+        (a.H == 32 && (a.num_splits == 2 || a.num_splits == 3 || a.num_splits == 5 ||
+                      a.num_splits == 7));
     return (a.H == 32 || a.H == 64) && supported_splits && blocks >= 32 && blocks < 256 &&
            !a.debug_ptr && !a.lse_ptr && !a.max_ptr && !a.out_ptr;
 }
@@ -98,6 +99,9 @@ hipError_t launch_decode_wave_reduce(const FusedNormRopeAttnRopeCastParams& a, h
     {
         switch(a.num_splits)
         {
+        case 2:
+            fused_decode_wave_reduce<32, 2><<<grid, 64, 0, stream>>>(a);
+            break;
         case 3:
             fused_decode_wave_reduce<32, 3><<<grid, 64, 0, stream>>>(a);
             break;

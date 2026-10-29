@@ -2117,7 +2117,7 @@ def check_native_split_integer_width_and_error_recovery(bad_splits):
         )
 
 
-def check_prefill_address_width(wide_view, rows, prepared, tokens, heads=64):
+def check_prefill_address_width(wide_view, rows, prepared, tokens, heads=64, topk=1024):
     # Exercise unsigned offsets beyond 2 GiB and the fallback beyond 4 GiB.
     # All four independently strided views must participate in the dispatch guard.
     row_stride = 2**30 + 4
@@ -2135,7 +2135,7 @@ def check_prefill_address_width(wide_view, rows, prepared, tokens, heads=64):
             view = torch.empty(rows, width, device="cuda", dtype=torch.uint8)
         view.fill_(127 if scale else 0x38)
         kwargs[key] = view.view(torch.float8_e8m0fnu if scale else torch.float8_e4m3fn)
-    for source, count in (("prefix", 1024), ("extend", 128)):
+    for source, count in (("prefix", topk), ("extend", 128)):
         kwargs[f"kv_indices_{source}"] = torch.full(
             (tokens * count,), rows - 1, device="cuda", dtype=torch.int32
         )
@@ -2804,6 +2804,21 @@ def check_h32_split_head_tile_boundary(tokens, splits, mode):
     check_two_source_h64_causal_prefill(tokens, 512, mode, 32, splits)
 
 
+def check_h32_short_list_capacity(tokens, capacity, mode, layout):
+    # The same CSR rows must be valid on both sides of the source-loop policy.
+    _check_shared_kv_wave_boundary(
+        tokens,
+        mode,
+        False,
+        True,
+        32,
+        capacity,
+        layout,
+        exercise_common=True,
+        splits=1,
+    )
+
+
 def check_h32_output_only_split_replay(tokens, splits, mode, layout, with_sink):
     # Cover both sides of the wave reducer's CTA gate and all new split counts.
     _check_shared_kv_wave_boundary(
@@ -2884,10 +2899,19 @@ def run_contract_checks():
     """Run every correctness case during the same direct invocation used by CI."""
     checks = [
         (
+            check_h32_short_list_capacity,
+            [
+                ("tokens", [128, 256, 1024]),
+                ("capacity", [1023, 1024, 1025]),
+                ("mode", ["raw", "rotated", "prepared", "norm"]),
+                ("layout", ["separate", "interleaved", "padded"]),
+            ],
+        ),
+        (
             check_h32_output_only_split_replay,
             [
                 ("tokens", [15, 16, 36, 48, 80, 127, 128]),
-                ("splits", [3, 5, 7]),
+                ("splits", [2, 3, 5, 7]),
                 ("mode", ["raw", "prepared", "norm"]),
                 ("layout", ["interleaved", "padded"]),
                 ("with_sink", [False, True]),
@@ -3382,7 +3406,15 @@ def run_contract_checks():
         (
             check_prefill_address_width,
             [
-                ("tokens,heads", [(512, 64), (2048, 64), (256, 32)]),
+                (
+                    "tokens,heads,topk",
+                    [
+                        (512, 64, 1024),
+                        (2048, 64, 1024),
+                        (256, 32, 1024),
+                        (256, 32, 512),
+                    ],
+                ),
                 ("prepared", [False, True]),
                 ("rows", [3, 5]),
                 ("wide_view", ["unified_kv", "unified_kv_scale", "kv", "kv_scale"]),

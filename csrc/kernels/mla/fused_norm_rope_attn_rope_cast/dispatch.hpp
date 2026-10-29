@@ -197,6 +197,12 @@ constexpr bool prefer_h128_64row(int tokens, int64_t capacity)
            (tokens > 64 && tokens <= 1024 && has_capacity(tokens, capacity, 512));
 }
 
+// A short list amortizes less of the second source's pipeline startup.
+constexpr bool prefer_h32_continuous_sources(int tokens, int64_t capacity)
+{
+    return capacity <= int64_t(tokens) * 1024;
+}
+
 constexpr bool prefer_h32_split_head_tile16(int tokens, int splits)
 {
     return splits > 1 && int64_t(tokens) * splits * 2 <= 256;

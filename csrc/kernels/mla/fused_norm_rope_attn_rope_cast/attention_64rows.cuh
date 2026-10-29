@@ -2618,7 +2618,17 @@ hipError_t run_fused_norm_rope_attn_rope_cast_small_heads(
     // Keep 64-bit bases; narrow only independently checked data/scale offsets.
     else if(fused_norm_rope_attn_rope_cast_fwd::kv_offsets_fit_u32(args))
     {
-        if(raw_q)
+        const int64_t capacity = int64_t(args.prefix_capacity) + args.extend_capacity;
+        if(fused_norm_rope_attn_rope_cast_policy::prefer_h32_continuous_sources(args.N, capacity))
+        {
+            if(raw_q)
+                fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, true, true, true, 32, true>
+                    <<<dim3(args.N), 256, 0, stream>>>(args);
+            else
+                fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, false, true, false, 32, true>
+                    <<<dim3(args.N), 256, 0, stream>>>(args);
+        }
+        else if(raw_q)
             fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, true, false, true, 32, true>
                 <<<dim3(args.N), 256, 0, stream>>>(args);
         else
