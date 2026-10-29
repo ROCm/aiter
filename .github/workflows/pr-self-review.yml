@@ -46,7 +46,11 @@ jobs:
 
       - name: Evaluate author self-review, Copilot findings, hygiene and required CI
         env:
+          # The org policy keeps the workflow GITHUB_TOKEN read-only; the sticky
+          # comment and commit status therefore use the aiter-bot PAT, matching
+          # the aiter-review-bot workflow.
           GH_TOKEN: ${{ github.token }}
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr }}
           WORKFLOW_HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
           WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}

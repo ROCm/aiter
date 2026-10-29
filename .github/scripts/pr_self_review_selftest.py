@@ -53,7 +53,10 @@ class RequestAPI:
         return self.responses.get(path, [])
 
     def graphql(self, query: str, variables: dict[str, Any]) -> Any:
-        return self.responses.get("graphql", {})
+        response = self.responses.get("graphql", {})
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class PRSelfReviewSelftest(unittest.TestCase):
@@ -285,13 +288,37 @@ class PRSelfReviewSelftest(unittest.TestCase):
             "creator": {"login": "github-actions[bot]"},
         }
         matching = RequestAPI({"commits/head/statuses?per_page=100": [status]})
-        gate.post_status(matching, "head", result, "https://example/comment")
+        gate.post_status(
+            matching, "head", result, "https://example/comment", "github-actions[bot]"
+        )
         self.assertEqual(len(matching.requests), 1)
 
         status["creator"] = {"login": "attacker"}
         spoof = RequestAPI({"commits/head/statuses?per_page=100": [status]})
-        gate.post_status(spoof, "head", result, "https://example/comment")
+        gate.post_status(
+            spoof, "head", result, "https://example/comment", "github-actions[bot]"
+        )
         self.assertEqual(spoof.requests[-1][1], "POST")
+
+    def test_status_write_recognizes_pat_owned_status(self) -> None:
+        result = gate.Result(
+            head_sha="head",
+            pr_url="https://example/pr/1",
+            draft=False,
+            mode="shadow",
+            question="Why?",
+            ci={name: "pending" for name in gate.REQUIRED_CHECKS},
+        )
+        status = {
+            "context": gate.STATUS_CONTEXT,
+            "state": "success",
+            "description": "shadow: 0 blocker(s), CI pending",
+            "target_url": "https://example/comment",
+            "creator": {"login": "Aiter-Bot"},
+        }
+        api = RequestAPI({"commits/head/statuses?per_page=100": [status]})
+        gate.post_status(api, "head", result, "https://example/comment", "aiter-bot")
+        self.assertEqual(len(api.requests), 1)
 
     def test_sticky_comment_rejects_spoof_and_skips_noop(self) -> None:
         body = "report " + gate.MARKER
@@ -311,7 +338,10 @@ class PRSelfReviewSelftest(unittest.TestCase):
             return spoof.responses.get(path)
 
         spoof.request = spoof_request
-        self.assertEqual(gate.upsert_comment(spoof, 1, body), "https://example/new")
+        self.assertEqual(
+            gate.upsert_comment(spoof, 1, body, "github-actions[bot]"),
+            "https://example/new",
+        )
         self.assertEqual(spoof.requests[-1][1], "POST")
 
         existing = RequestAPI(
@@ -327,9 +357,48 @@ class PRSelfReviewSelftest(unittest.TestCase):
             }
         )
         self.assertEqual(
-            gate.upsert_comment(existing, 1, body), "https://example/existing"
+            gate.upsert_comment(existing, 1, body, "github-actions[bot]"),
+            "https://example/existing",
         )
         self.assertEqual(existing.requests, [])
+
+    def test_pat_owned_comment_is_updated_not_reposted(self) -> None:
+        body = "report v2 " + gate.MARKER
+        api = RequestAPI(
+            {
+                "issues/1/comments": [
+                    {
+                        "id": 11,
+                        "body": "report v1 " + gate.MARKER,
+                        "html_url": "https://example/old",
+                        "user": {"login": "aiter-bot"},
+                    }
+                ],
+                "issues/comments/11": {"html_url": "https://example/updated"},
+            }
+        )
+        self.assertEqual(
+            gate.upsert_comment(api, 1, body, "aiter-bot"),
+            "https://example/updated",
+        )
+        self.assertEqual(api.requests[-1][1], "PATCH")
+
+    def test_resolve_own_login_falls_back_when_viewer_fails(self) -> None:
+        viewer = RequestAPI({"graphql": {"viewer": {"login": "Aiter-Bot"}}})
+        self.assertEqual(gate.resolve_own_login(viewer), "aiter-bot")
+
+        failing = RequestAPI({"graphql": gate.APIError("viewer query failed")})
+        self.assertEqual(gate.resolve_own_login(failing), "github-actions[bot]")
+
+    def test_writer_token_prefers_pat_but_falls_back_to_github_token(self) -> None:
+        self.assertEqual(
+            gate.writer_token({"AITER_BOT_TOKEN": "pat", "GH_TOKEN": "gh"}), "pat"
+        )
+        self.assertEqual(
+            gate.writer_token({"AITER_BOT_TOKEN": "", "GH_TOKEN": "gh"}), "gh"
+        )
+        self.assertEqual(gate.writer_token({"GH_TOKEN": "gh"}), "gh")
+        self.assertEqual(gate.writer_token({}), "")
 
 
 if __name__ == "__main__":
