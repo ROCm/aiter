@@ -721,9 +721,11 @@ def _grouped_a8w4_tdm_moe(
     ep_rowmap = None
     # Small TP batches: one workgroup counts, scans and remaps every route, in
     # place of the counter fill, route and psum-remap launches; it runs where the
-    # psum is built below.
+    # psum is built below. HERD routes carry K+1 candidates per row and are
+    # dropped to K by herd_route_psum_remap, which this kernel does not do.
     _fused_tp_route = (
-        not _compact
+        not herd_topk
+        and not _compact
         and not _is_ep
         and not enable_ep_scatter
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
