@@ -1980,6 +1980,22 @@ class CustomAllreduce:
             )
         return out
 
+    def should_custom_ag_lastdim_add(self, inp: torch.Tensor) -> bool:
+        """Whether all_gather_lastdim_add can run on this [rows, n] shard."""
+        if self.disabled or self._ops_all_gather_lastdim_add is None:
+            return False
+        if self.world_size not in (2, 4, 8):
+            return False
+        if not (self.world_size == 2 or self.fully_connected):
+            return False
+        if inp.dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if inp.dim() != 2 or not inp.is_contiguous():
+            return False
+        if inp.shape[1] % 8 != 0 or inp.data_ptr() % 16 != 0:
+            return False
+        return inp.numel() * inp.element_size() <= self.max_size
+
     def all_gather_lastdim_add(
         self,
         inp: torch.Tensor,
@@ -1992,9 +2008,10 @@ class CustomAllreduce:
         capture with enable_register_for_capturing, inp is read in place
         (capture registers it); otherwise it is staged into the registered
         input pool first."""
-        if self._ops_all_gather_lastdim_add is None:
-            raise NotImplementedError(
-                "all_gather_lastdim_add is not supported on gfx1250"
+        if self.disabled or self._ops_all_gather_lastdim_add is None:
+            raise RuntimeError(
+                "all_gather_lastdim_add is unavailable on this communicator; "
+                "check should_custom_ag_lastdim_add first"
             )
         assert inp.dim() == 2, "all_gather_lastdim_add only supports 2D tensors"
         assert inp.is_contiguous(), "all_gather_lastdim_add expects a contiguous inp"
@@ -2011,6 +2028,14 @@ class CustomAllreduce:
                 f"all_gather_lastdim_add expects contiguous {shape} add/out "
                 f"tensors with inp's dtype ({inp.dtype}) and device ({inp.device})"
             )
+        for t in (inp, add_b, add_c, out):
+            assert (
+                t is None or t.data_ptr() % 16 == 0
+            ), "all_gather_lastdim_add expects 16-byte aligned tensors"
+        assert out.data_ptr() not in (
+            add_b.data_ptr(),
+            add_c.data_ptr() if add_c is not None else None,
+        ), "all_gather_lastdim_add does not support out aliasing add_b or add_c"
         registered = (
             self._IS_CAPTURING
             and torch.cuda.is_current_stream_capturing()

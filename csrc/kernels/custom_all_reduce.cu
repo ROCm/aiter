@@ -509,12 +509,28 @@ void all_gather_lastdim_add(fptr_t _fa,
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    int64_t last_dim_size = inp.size(-1);
-    if(inp.dtype() != AITER_DTYPE_bf16)
-        throw std::runtime_error("all_gather_lastdim_add supports bfloat16 only");
-    if(inp.dim() != 2 || out.dim() != 2 || add_b.dim() != 2 ||
-       (add_c.has_value() && add_c->dim() != 2))
+    if(inp.dtype() != AITER_DTYPE_bf16 && inp.dtype() != AITER_DTYPE_fp16)
+        throw std::runtime_error("all_gather_lastdim_add supports bfloat16 and float16 only");
+    if(inp.dim() != 2)
         throw std::runtime_error("all_gather_lastdim_add supports 2D tensors only");
+    int64_t rows = inp.size(0);
+    int64_t last_dim_size = inp.size(-1);
+    auto check_full = [&](const aiter_tensor_t& t, const char* name) {
+        if(t.dim() != 2 || t.size(0) != rows || t.size(1) != last_dim_size * fa->world_size_ ||
+           t.dtype() != inp.dtype())
+            throw std::runtime_error(std::string("all_gather_lastdim_add: ") + name +
+                                     " must be [rows, n * world_size] with inp's dtype");
+        if(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 != 0)
+            throw std::runtime_error(std::string("all_gather_lastdim_add: ") + name +
+                                     " must be 16-byte aligned");
+    };
+    check_full(out, "out");
+    check_full(add_b, "add_b");
+    if(add_c.has_value())
+        check_full(*add_c, "add_c");
+    if(out.data_ptr() == add_b.data_ptr() ||
+       (add_c.has_value() && out.data_ptr() == add_c->data_ptr()))
+        throw std::runtime_error("all_gather_lastdim_add: out must not alias add_b or add_c");
     void* src = inp.data_ptr();
     if(reg_ptr != 0)
     {
@@ -526,14 +542,25 @@ void all_gather_lastdim_add(fptr_t _fa,
             (void*)reg_ptr, inp.data_ptr(), data_bytes, hipMemcpyDeviceToDevice, stream));
         src = (void*)reg_ptr;
     }
-    fa->dispatchAllGatherLastDimAdd<opus::bf16_t>(
-        stream,
-        reinterpret_cast<opus::bf16_t*>(src),
-        reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
-        inp.numel(),
-        last_dim_size,
-        reinterpret_cast<const opus::bf16_t*>(add_b.data_ptr()),
-        add_c.has_value() ? reinterpret_cast<const opus::bf16_t*>(add_c->data_ptr()) : nullptr);
+    const void* c = add_c.has_value() ? add_c->data_ptr() : nullptr;
+    if(inp.dtype() == AITER_DTYPE_bf16)
+        fa->dispatchAllGatherLastDimAdd<opus::bf16_t>(
+            stream,
+            reinterpret_cast<opus::bf16_t*>(src),
+            reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+            inp.numel(),
+            last_dim_size,
+            reinterpret_cast<const opus::bf16_t*>(add_b.data_ptr()),
+            reinterpret_cast<const opus::bf16_t*>(c));
+    else
+        fa->dispatchAllGatherLastDimAdd<opus::fp16_t>(
+            stream,
+            reinterpret_cast<opus::fp16_t*>(src),
+            reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
+            inp.numel(),
+            last_dim_size,
+            reinterpret_cast<const opus::fp16_t*>(add_b.data_ptr()),
+            reinterpret_cast<const opus::fp16_t*>(c));
 }
 
 void all_gather_unreg(fptr_t _fa,

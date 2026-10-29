@@ -665,7 +665,7 @@ if __name__ == "__main__":
         rows += test_allreduce_custom(
             args.tp_size, 1, l_shape, dtype, withGraph=with_graph
         )
-    if "all_gather_lastdim_add" in args.op and dtype == dtypes.bf16:
+    if "all_gather_lastdim_add" in args.op and dtype in (dtypes.bf16, dtypes.fp16):
         # [rows, n] per-rank shards; Kimi-K3 TP8 uses n=896 (up-proj) and the
         # vocab shard for logits.
         ag_shapes = (
