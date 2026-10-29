@@ -143,13 +143,18 @@ def _mxfp4_scale_from_amax(amax):
 
 
 @triton.jit
-def _mxfp4_ceil_scale_from_amax(amax):
+def _mxfp4_ceil_scale_from_amax(amax, MAX_SCALE_E8M0: tl.constexpr = 254):
     """E8M0 2^ceil(log2(amax / 6)) and its reciprocal, so no value saturates.
-    Exact, from the exponent bits."""
+    Exact, from the exponent bits. A MAX_SCALE_E8M0 below 254 caps the E8M0;
+    values past 6 times the capped scale then saturate."""
     # An all-zero block still gets a normal scale, 2^-126.
     ratio = tl.maximum(amax, 6.0 * (2**-126)) * (1.0 / 6.0)
     # Adding 0x7FFFFF carries into the exponent unless the mantissa is zero.
     bs_e8m0 = (ratio.to(tl.uint32, bitcast=True) + 0x7FFFFF) >> 23
+    # No finite amax goes past 253, so 254 leaves the scale (and the NaN 255 of
+    # an inf / NaN amax) as is.
+    if MAX_SCALE_E8M0 < 254:
+        bs_e8m0 = tl.minimum(bs_e8m0, MAX_SCALE_E8M0)
     quant_scale = ((254 - bs_e8m0) << 23).to(tl.float32, bitcast=True)
     return bs_e8m0.to(tl.uint8), quant_scale
 
@@ -162,6 +167,8 @@ def _mxfp4_quant_op(
     MXFP4_QUANT_BLOCK_SIZE,
     SCALING_MODE: tl.constexpr = 0,
     USE_ASM: tl.constexpr = False,
+    ROUNDING_MODE: tl.constexpr = 0,
+    MAX_SCALE_E8M0: tl.constexpr = 254,
 ):
     """
     Converts given x (in fp32) to mxfp4 format.
@@ -169,6 +176,8 @@ def _mxfp4_quant_op(
     SCALING_MODE: 0 is "even" (_mxfp4_scale_from_amax), 1 is "ceil"
     (_mxfp4_ceil_scale_from_amax).
     USE_ASM: see _mxfp4_pack_op.
+    ROUNDING_MODE: E2M1 ties go to nearest even (0) or away from zero (1).
+    MAX_SCALE_E8M0: cap on the "ceil" scale, see _mxfp4_ceil_scale_from_amax.
 
     """
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
@@ -176,10 +185,11 @@ def _mxfp4_quant_op(
     # Calculate scale
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
     if SCALING_MODE == 0:
+        tl.static_assert(MAX_SCALE_E8M0 == 254, "MAX_SCALE_E8M0 needs SCALING_MODE=1")
         bs_e8m0, quant_scale = _mxfp4_scale_from_amax(amax)
     else:
         tl.static_assert(SCALING_MODE == 1)
-        bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(amax)
+        bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(amax, MAX_SCALE_E8M0)
 
     # Compute quantized x
     qx = x * quant_scale
@@ -189,6 +199,7 @@ def _mxfp4_quant_op(
         BLOCK_SIZE_M,
         MXFP4_QUANT_BLOCK_SIZE,
         USE_ASM,
+        ROUNDING_MODE,
     )
 
     return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
@@ -201,14 +212,21 @@ def _mxfp4_pack_op(
     BLOCK_SIZE_M: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     USE_ASM: tl.constexpr = False,
+    ROUNDING_MODE: tl.constexpr = 0,
 ):
     """Round normalized FP32 values to E2M1 and pack adjacent columns.
     USE_ASM opts in to the gfx950 instruction where there is one; the default
-    is the bit arithmetic."""
+    is the bit arithmetic. ROUNDING_MODE: see _mxfp4_pack_bits."""
+    tl.static_assert(
+        not USE_ASM or ROUNDING_MODE == 0,
+        "USE_ASM only rounds ties to nearest even (ROUNDING_MODE=0)",
+    )
     if USE_ASM and is_hip_cdna4():
         x_fp4 = _mxfp4_pack_cvt(qx, BLOCK_SIZE_N, BLOCK_SIZE_M)
     else:
-        x_fp4 = _mxfp4_pack_bits(qx, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE)
+        x_fp4 = _mxfp4_pack_bits(
+            qx, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE, ROUNDING_MODE
+        )
     return x_fp4
 
 
@@ -237,8 +255,11 @@ def _mxfp4_pack_bits(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    ROUNDING_MODE: tl.constexpr = 0,
 ):
-    """Round normalized FP32 values to E2M1 and pack adjacent columns."""
+    """Round normalized FP32 values to E2M1 and pack adjacent columns.
+    ROUNDING_MODE: ties go to nearest even (0, as v_cvt_scalef32_pk_fp4_f32)
+    or away from zero (1)."""
     EXP_BIAS_FP32: tl.constexpr = 127
     EXP_BIAS_FP4: tl.constexpr = 1
     EBITS_F32: tl.constexpr = 8
@@ -271,10 +292,16 @@ def _mxfp4_pack_bits(
     denorm_mask_int: tl.constexpr = denorm_exp << MBITS_F32
     denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int, tl.float32, bitcast=True)
 
-    denormal_x = qx_fp32 + denorm_mask_float
-    denormal_x = denormal_x.to(tl.uint32, bitcast=True)
-    denormal_x -= denorm_mask_int
-    denormal_x = denormal_x.to(tl.uint8)
+    if ROUNDING_MODE == 0:
+        # The FPU's round to nearest even settles the ties of this add.
+        denormal_x = qx_fp32 + denorm_mask_float
+        denormal_x = denormal_x.to(tl.uint32, bitcast=True)
+        denormal_x -= denorm_mask_int
+        denormal_x = denormal_x.to(tl.uint8)
+    else:
+        tl.static_assert(ROUNDING_MODE == 1)
+        # Codes 0, 1 and 2 are 0, 0.5 and 1; the ties 0.25 and 0.75 go up.
+        denormal_x = (qx_fp32 >= 0.25).to(tl.uint8) + (qx_fp32 >= 0.75).to(tl.uint8)
 
     # Normal numbers
     normal_x = qx
@@ -284,7 +311,11 @@ def _mxfp4_pack_bits(
     val_to_add = ((EXP_BIAS_FP4 - EXP_BIAS_FP32) << MBITS_F32) + (1 << 21) - 1
     normal_x += val_to_add
     # rounding bias part 2
-    normal_x += mant_odd
+    if ROUNDING_MODE == 0:
+        normal_x += mant_odd
+    else:
+        # The bias is then exactly half a step, so a tie always carries.
+        normal_x += 1
     # take the bits!
     normal_x = normal_x >> (MBITS_F32 - MBITS_FP4)
     normal_x = normal_x.to(tl.uint8)

@@ -284,6 +284,48 @@ def test_qsa_fp4_writer_is_exact_on_the_grid_and_close_off_it():
     assert per_row.mean() < 0.15
 
 
+def test_qsa_fp4_writer_rounds_ties_away_from_zero():
+    from aiter.ops.qsa import FP4_GROUP
+
+    torch.manual_seed(2)
+    rows = 64
+    ties = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device="cuda")
+    up = torch.tensor([0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+    pick = torch.randint(0, len(ties), (rows, 1, 128), device="cuda")
+    sign = torch.randint(0, 2, (rows, 1, 128), device="cuda") * 2.0 - 1.0
+    values, expected = ties[pick] * sign, up[pick] * sign
+    # 6 fixes each group's exponent, so every other value is a tie.
+    values[..., ::FP4_GROUP] = expected[..., ::FP4_GROUP] = 6.0
+    exponent = torch.randint(-20, 20, (rows, 1, 4), device="cuda")
+    magnitude = torch.exp2(exponent.float()).repeat_interleave(FP4_GROUP, -1)
+    cache, scale = _store("fp4", (values * magnitude).bfloat16(), 4)
+    assert torch.equal(scale.view(-1, 1, 4)[:rows].long(), exponent + 127)
+    torch.testing.assert_close(
+        _dequant("fp4", cache, scale).view(-1, 1, 128)[:rows],
+        expected * magnitude,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_qsa_fp4_writer_caps_the_scale_for_the_fp16_decode():
+    # E8M0 240 (2^113) is the largest scale the readers decode exactly.
+    top = 6.0 * 2.0**113
+    values = torch.zeros(2, 1, 128, device="cuda")
+    values[0, 0, :32] = top
+    values[0, 0, 32:35] = torch.tensor([4 * top, -4 * top, top / 2])
+    values[1, 0, 64:80] = torch.tensor(E2M1 + tuple(-x for x in E2M1)) * 2.0**-90
+    values = values.bfloat16()
+    cache, scale = _store("fp4", values, 4)
+    assert scale.view(-1, 4)[0, :2].tolist() == [240, 240]
+    torch.testing.assert_close(
+        _dequant("fp4", cache, scale).view(-1, 1, 128)[:2],
+        values.float().clamp(-top, top),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_qsa_writer_rejects_bad_slots_and_planes():
     from aiter.ops.qsa import FP8_DTYPE, qsa_cache_row_layout, qsa_store_quantized_rows
 

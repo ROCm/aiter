@@ -12,6 +12,7 @@ each GROUP dims, rounded up so that no value clips.
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _qsa_store_rows_fp8_repr = make_kernel_repr(
@@ -63,22 +64,6 @@ _qsa_sparse_paged_gqa_repr = make_kernel_repr(
         "KV_FP8",
     ],
 )
-
-
-@triton.jit
-def _e2m1_code(y):
-    """Nearest E2M1 code (sign in bit 3) of `y`, already scaled into [-6, 6]."""
-    a = tl.abs(y)
-    code = (
-        (a >= 0.25).to(tl.int32)
-        + (a >= 0.75).to(tl.int32)
-        + (a >= 1.25).to(tl.int32)
-        + (a >= 1.75).to(tl.int32)
-        + (a >= 2.5).to(tl.int32)
-        + (a >= 3.5).to(tl.int32)
-        + (a >= 5.0).to(tl.int32)
-    )
-    return code | tl.where(y < 0, 8, 0)
 
 
 @triton.jit
@@ -190,30 +175,34 @@ def _qsa_store_rows_fp4_kernel(
     slot = slot.to(tl.int64)
     HALF: tl.constexpr = HEAD_DIM // 2
     GROUPS: tl.constexpr = HEAD_DIM // GROUP
-    pairs = tl.arange(0, HALF)
-    source = values_ptr + row * stride_value_row + head * stride_value_head
-    even = tl.load(source + 2 * pairs).to(tl.float32)
-    odd = tl.load(source + 2 * pairs + 1).to(tl.float32)
-    pair_max = tl.maximum(tl.abs(even), tl.abs(odd))
-    group_max = tl.max(tl.reshape(pair_max, (GROUPS, GROUP // 2)), axis=1)
-    # Round the exponent up so that the group maximum is at most 6. The cap
-    # keeps E8M0 <= 240 for the FP16 decode in the readers.
-    exponent = tl.ceil(tl.log2(tl.maximum(group_max, 1.0e-30) / 6.0))
-    exponent = tl.clamp(exponent, -127.0, 113.0)
-    inverse = tl.reshape(
-        tl.broadcast_to(tl.exp2(-exponent)[:, None], (GROUPS, GROUP // 2)), (HALF,)
+    dims = tl.arange(0, HEAD_DIM)
+    x = tl.load(
+        values_ptr + row * stride_value_row + head * stride_value_head + dims[None, :]
+    ).to(tl.float32)
+    # Ties away from zero match ATOM's cache bytes. The E8M0 cap of 240 is
+    # what the readers' FP16 decode needs.
+    packed, exponents = _mxfp4_quant_op(
+        x,
+        HEAD_DIM,
+        1,
+        GROUP,
+        SCALING_MODE=1,
+        ROUNDING_MODE=1,
+        MAX_SCALE_E8M0=240,
     )
-    packed = _e2m1_code(even * inverse) | (_e2m1_code(odd * inverse) << 4)
     tl.store(
-        cache_ptr + slot * stride_cache_slot + head * stride_cache_head + pairs,
-        packed.to(tl.uint8),
+        cache_ptr
+        + slot * stride_cache_slot
+        + head * stride_cache_head
+        + tl.arange(0, HALF),
+        tl.reshape(packed, (HALF,)),
     )
     tl.store(
         scale_ptr
         + slot * stride_scale_slot
         + head * stride_scale_head
         + tl.arange(0, GROUPS),
-        (exponent + 127.0).to(tl.int32).to(tl.uint8),
+        tl.reshape(exponents, (GROUPS,)),
     )
 
 
