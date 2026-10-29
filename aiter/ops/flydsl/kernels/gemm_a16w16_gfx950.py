@@ -26,7 +26,7 @@ from .gemm_a16w16_gfx950_utils import (
     transposed_contiguous_idx,
     wait_vmcnt_and_barrier,
 )
-from .kernels_common import run_cached
+from .kernels_common import run_cached, set_slp_vectorize_once_used
 
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
@@ -1354,6 +1354,9 @@ def gemm_a16w16_gfx950(
         block=(param.block_threads, 1, 1),
         stream=stream,
     )
+
+
+set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 
 
 @functools.cache
