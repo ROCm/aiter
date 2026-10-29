@@ -1415,7 +1415,6 @@ def _attn_fwd(
     SCALE_ON_Q: gl.constexpr = False,
     num_warps: gl.constexpr = 4,
 ):
-    gl.static_assert(not (IS_FP8 and BLOCK_DMODEL_PE > 0), "fp8 takes no PE slice")
     cfg = MhaConfig(
         BLOCK_M,
         BLOCK_N,
