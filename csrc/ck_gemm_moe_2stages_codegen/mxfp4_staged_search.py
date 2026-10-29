@@ -9,6 +9,7 @@ from typing import Any, TypeVar
 
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
+    _parse_mxfp4_g2_kname,
     parse_flydsl_v2_gemm2_kernel,
 )
 
@@ -103,6 +104,7 @@ def reference_consumer_order(
 ) -> tuple[GEMM2StageCandidate, ...]:
     consumers = []
     for candidate in candidates:
+        # Native mxmoe GEMM2s are screened and validated but never the reference.
         cfg = parse_flydsl_v2_gemm2_kernel(candidate.identity.kernel_name)
         if cfg is None or cfg["epilog"] != "atomic":
             continue
@@ -210,11 +212,9 @@ def _source_pair(
     gemm1 = GEMM1CandidateIdentity(str(row["kernelName1"]))
     gemm2 = GEMM2ExecutionIdentity(str(row["kernelName2"]))
     parsed_gemm1 = _parse_mxfp4_g1_kname(gemm1.kernel_name)
-    parsed_gemm2 = parse_flydsl_v2_gemm2_kernel(gemm2.kernel_name)
-    if parsed_gemm2 is None:
-        raise ValueError("GEMM2 must be layout-v2 for staged MXFP4 search")
+    gemm2_block_m, accumulation_mode = _parse_gemm2(gemm2.kernel_name)
     block_m = int(row["block_m"])
-    if parsed_gemm1["BM"] != block_m or parsed_gemm2["tile_m"] != block_m:
+    if parsed_gemm1["BM"] != block_m or gemm2_block_m != block_m:
         raise ValueError(
             "pipeline pair block_m does not match its GEMM1 and GEMM2 identities"
         )
@@ -225,11 +225,6 @@ def _source_pair(
         raise ValueError(
             f"GEMM1 BM{block_m} violates the derived input quantization contract"
         )
-    accumulation_mode = (
-        AccumulationMode.ATOMIC
-        if parsed_gemm2["epilog"] == "atomic"
-        else AccumulationMode.NON_ATOMIC
-    )
     return _SourcePair(
         row=row,
         key=PipelinePairKey(gemm1, gemm2),
@@ -266,10 +261,28 @@ def _shape_activation(shape_row: Mapping[str, Any]) -> str:
     raise ValueError(f"unsupported MXFP4 activation: {activation!r}")
 
 
+def _parse_gemm2(kernel_name: str) -> tuple[int, AccumulationMode]:
+    """(block_m, accumulation mode) of a layout-v2 or native mxmoe GEMM2 name."""
+    parsed_v2 = parse_flydsl_v2_gemm2_kernel(kernel_name)
+    if parsed_v2 is not None:
+        block_m, atomic = parsed_v2["tile_m"], parsed_v2["epilog"] == "atomic"
+    else:
+        try:
+            parsed_native = _parse_mxfp4_g2_kname(kernel_name)
+        except ValueError as exc:
+            raise ValueError(
+                "GEMM2 must be layout-v2 or native mxmoe for staged MXFP4 search"
+            ) from exc
+        block_m, atomic = parsed_native["BM"], parsed_native["atomic"]
+    mode = AccumulationMode.ATOMIC if atomic else AccumulationMode.NON_ATOMIC
+    return block_m, mode
+
+
 def _validate_gemm2_contract(kernel_name: str, block_m: int) -> None:
     parsed_v2 = parse_flydsl_v2_gemm2_kernel(kernel_name)
     if parsed_v2 is None:
-        raise ValueError("GEMM2 must be layout-v2 for staged MXFP4 search")
+        _validate_native_gemm2_contract(kernel_name)
+        return
     for field, expected in (
         ("a_dtype", "fp4"),
         ("b_dtype", "fp4"),
@@ -281,6 +294,17 @@ def _validate_gemm2_contract(kernel_name: str, block_m: int) -> None:
             )
     if parsed_v2["sort_block_m"] != block_m:
         raise ValueError("GEMM2 sort block_m must match the pipeline block_m")
+
+
+def _validate_native_gemm2_contract(kernel_name: str) -> None:
+    # The a4w4 name fixes fp4 A/B, and a native GEMM2 sorts by its own BM, which
+    # _source_pair already matched to the pipeline block_m.
+    parsed = _parse_mxfp4_g2_kname(kernel_name)
+    if parsed["mxfp4out"]:
+        raise ValueError("GEMM2 out_dtype must be bf16 for staged MXFP4 search")
+    if parsed["splitk"]:
+        # The native stage2 dispatch ignores kSplitK, so it would run unsplit.
+        raise ValueError("GEMM2 split-K is unsupported by staged MXFP4 search")
 
 
 def _group_candidate_plan(

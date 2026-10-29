@@ -751,6 +751,123 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertTrue(result["kernelName1"].startswith("FAILED:"))
 
 
+def _runtime_has_native_bk128_gemm2():
+    # The native BK=128 gemm2 lands with the runtime shape guard (#6264).
+    from aiter import fused_moe
+
+    return hasattr(fused_moe, "_mxmoe_cfg_shape_reason")
+
+
+_NEEDS_NATIVE_BK128 = unittest.skipUnless(
+    _runtime_has_native_bk128_gemm2(), "needs the native BK=128 mxfp4 gemm2 (#6264)"
+)
+
+
+class TestMxfp4CandidateRows(unittest.TestCase):
+    @staticmethod
+    def _native_g2(model_dim, inter_dim):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
+        row = {
+            "token": 1,
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
+            "expert": 896,
+            "topk": 16,
+            "act_type": "ActivationType.Situv2",
+        }
+        with mock.patch("builtins.print"):
+            cands = tuner._candidate_rows(row)
+        return {
+            (c["kernelName1"], c["kernelName2"])
+            for c in cands
+            if c["kernelName2"].startswith("flydsl_mxmoe_g2_")
+        }
+
+    @_NEEDS_NATIVE_BK128
+    def test_kimi_k3_proposes_native_bk128_gemm2(self):
+        # inter_dim 384 is not a multiple of 256, so only the BK=128 native
+        # gemm2 contracts it; the shipped Kimi-K3 token=1 row uses this pair.
+        pairs = self._native_g2(3584, 384)
+        self.assertIn(
+            (
+                "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_situv2",
+                "flydsl_mxmoe_g2_a4w4_16x256x128_atomic",
+            ),
+            pairs,
+        )
+        self.assertTrue(all("x256x128_atomic" in kn2 for _, kn2 in pairs), pairs)
+
+    def test_native_gemm2_skipped_when_inter_dim_is_not_bk_aligned(self):
+        self.assertEqual(self._native_g2(3584, 320), set())
+
+    def test_native_gemm2_proposed_only_with_the_bk128_runtime(self):
+        # Without #6264 the tuner proposes no native gemm2, so nothing changes.
+        if not _runtime_has_native_bk128_gemm2():
+            self.assertEqual(self._native_g2(3584, 384), set())
+
+    def test_staged_search_parses_native_gemm2_names(self):
+        from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
+            AccumulationMode,
+            _parse_gemm2,
+            _validate_gemm2_contract,
+        )
+
+        atomic, plain = AccumulationMode.ATOMIC, AccumulationMode.NON_ATOMIC
+        self.assertEqual(
+            _parse_gemm2("flydsl_mxmoe_g2_a4w4_16x256x128_atomic"), (16, atomic)
+        )
+        self.assertEqual(_parse_gemm2("flydsl_mxmoe_g2_a4w4_128x256x256"), (128, plain))
+        _validate_gemm2_contract("flydsl_mxmoe_g2_a4w4_16x256x128_atomic", 16)
+        with self.assertRaises(ValueError):
+            _parse_gemm2("not_a_gemm2_kernel")
+
+    @_NEEDS_NATIVE_BK128
+    def test_staged_plan_accepts_native_gemm2_for_kimi_k3(self):
+        # The default (staged) search plans every _candidate_rows pair, so the
+        # native BK=128 gemm2 must be a legal staged pair, not a ValueError.
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+        from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
+            AccumulationMode,
+            GEMM2ScreeningKey,
+        )
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
+        tuner._configuration = {"swiglu_limit": None}
+        row = {
+            "token": 1,
+            "model_dim": 3584,
+            "inter_dim": 384,
+            "expert": 896,
+            "topk": 16,
+            "act_type": "ActivationType.Situv2",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
+        }
+        with mock.patch("builtins.print"):
+            cands = tuner._candidate_rows(row)
+            plan = tuner._staged_candidate_plan(row)
+        self.assertEqual(len(plan.pairs), len(cands))
+        native = (
+            "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_situv2",
+            "flydsl_mxmoe_g2_a4w4_16x256x128_atomic",
+        )
+        self.assertIn(
+            native,
+            {(p.key.gemm1.kernel_name, p.key.gemm2.kernel_name) for p in plan.pairs},
+        )
+        groups = {group.key: group for group in plan.gemm2_groups}
+        atomic16 = groups[GEMM2ScreeningKey(16, AccumulationMode.ATOMIC)]
+        self.assertIn(native[1], {c.identity.kernel_name for c in atomic16.candidates})
+
+
 class TestGlm53TunedArtifact(unittest.TestCase):
     def test_token_one_row_matches_validated_coupled_winner(self):
         config = REPO_ROOT / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"

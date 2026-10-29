@@ -7227,9 +7227,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         raise ValueError(f"no MXMOE GEMM1 kernel for activation {act_type!r}")
 
     @staticmethod
-    def _g2_kname(bm, use_nt, epilog):
-        # flydsl_mxmoe_g2_a4w4_<BM>x256x256[_atomic[_nt] | _f4out | _cshuffle].
-        name = f"flydsl_mxmoe_g2_a4w4_{bm}x256x256"
+    def _g2_kname(bm, use_nt, epilog, bk=256):
+        # flydsl_mxmoe_g2_a4w4_<BM>x256x<BK>[_atomic[_nt] | _f4out | _cshuffle];
+        # token order must match _parse_mxfp4_g2_kname in mxfp4_kname.py.
+        name = f"flydsl_mxmoe_g2_a4w4_{bm}x256x{bk}"
         if epilog == "atomic":
             name += "_atomic" + ("_nt" if use_nt else "")
         elif epilog == "nonatomic_mxfp4":
@@ -7260,6 +7261,48 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return cand
 
+    # Native gemm2 variants proposed next to the layout family: BK=128 with the
+    # atomic epilog, the one that contracts inter_dim like 384 (Kimi-K3 TP=8)
+    # that BK=256 cannot. BM128 has no atomic native gemm2, so the kernel's own
+    # _assert_supported drops it.
+    _G2_NATIVE_BK = 128
+    _G2_NATIVE_EPILOG = "atomic"
+
+    def _g2_native_knames(self, row: dict[str, Any], kn1: str, bm: int) -> list[str]:
+        """Native gemm2 names for this (gemm1, block_m) the kernel and runtime accept."""
+        try:
+            from aiter.fused_moe import _mxmoe_cfg_shape_reason
+        except ImportError:
+            # Without the runtime shape guard (#6264) the native BK=128 gemm2 does
+            # not exist either, so there is nothing to propose.
+            return []
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import _assert_supported
+
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        out = []
+        for use_nt in (False, True):
+            try:
+                _assert_supported(
+                    NE=ne,
+                    D_HIDDEN=h,
+                    D_INTER=e,
+                    topk=int(row["topk"]),
+                    BM=bm,
+                    use_nt=use_nt,
+                    atomic=True,
+                    mxfp4out=False,
+                    BK=self._G2_NATIVE_BK,
+                )
+            except NotImplementedError:
+                continue
+            kn2 = self._g2_kname(
+                bm, use_nt, self._G2_NATIVE_EPILOG, bk=self._G2_NATIVE_BK
+            )
+            # Never propose a pair that get_2stage_cfgs would discard at runtime.
+            if _mxmoe_cfg_shape_reason(kn1, kn2, h, e) is None:
+                out.append(kn2)
+        return out
+
     def _candidate_rows(
         self, row: dict[str, Any], full_search: bool = False
     ) -> list[dict[str, Any]]:
@@ -7267,12 +7310,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         for g1 in self._g1_variants(row, full_search=full_search):
             bm = g1["bm"]
             kn1 = self._g1_kname(**g1)
-            # a4w4 pairs flydsl_mxmoe_g1_* with flydsl_moe2_layout_* only. The
-            # native flydsl_mxmoe_g2_a4w4_* family is deliberately not proposed:
-            # its BK=256 contraction requires D_INTER % 256 == 0, so it cannot
-            # serve inter_dim like 384, and the layout family covers the same
-            # tile space with the sort_block_m contract the port's intermediate
-            # needs. Only native SBM==tile_m==bm variants are used; re-tiling
+            # a4w4 pairs flydsl_mxmoe_g1_* with flydsl_moe2_layout_* and with the
+            # native BK=128 atomic flydsl_mxmoe_g2_a4w4_* gemm2 (_g2_native_knames).
+            # Native BK=256 is not proposed: it needs inter_dim % 256 == 0 and the
+            # layout family covers that tile space. Every gemm2 keeps the
+            # SBM==tile_m==bm contract the port's intermediate needs; re-tiling
             # (tile_m < bm) is not supported by that layout.
             for kn2v, kp in get_flydsl_stage2_v2_kernels(
                 "fp4",
@@ -7285,6 +7327,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if kp["tile_m"] != bm:
                     continue
                 cands.append(self._candidate_row(row, bm, kn1, kn2v))
+            for kn2 in self._g2_native_knames(row, kn1, bm):
+                cands.append(self._candidate_row(row, bm, kn1, kn2))
         return cands
 
     def _staged_candidate_plan(self, row: "dict[str, object]") -> "StagedSearchPlan":
