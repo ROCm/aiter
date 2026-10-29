@@ -1,0 +1,28 @@
+{
+  "any": {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 8,
+    "num_stages": 2,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 32,
+    "cache_modifier": null,
+    "ROPE_BLOCK_T": 8,
+    "N_INNER": 8,
+    "M_PER_CTA": 2,
+    "PERM_N": 1,
+    "K_TAIL": 64,
+    "B_PF": 1,
+    "AQH": 0,
+    "LPIN": 0,
+    "IL_R": 0,
+    "IL_U": 8,
+    "ILB_NUM": 3,
+    "ILB_DEN": 2,
+    "XCD_COLOC": 1,
+    "LDB": 1,
+    "CONST_GRID_MN": false
+  }
+}
