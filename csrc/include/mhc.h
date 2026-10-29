@@ -7,12 +7,13 @@
 #include <hip/hip_runtime.h>
 
 namespace aiter {
-void mhc_pre_gemm_sqrsum(aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m, hc_mult3)
-                         aiter_tensor_t& sqrsum, // (split_k, m) / (m)
-                         aiter_tensor_t& x,      // (m, hc_hidden_size)
-                         aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size) fp32; packed int32 when w_preshuffle_bf16
-                         int tile_k = 128,
-                         int w_preshuffle_bf16 = 0);
+void mhc_pre_gemm_sqrsum(
+    aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m, hc_mult3)
+    aiter_tensor_t& sqrsum, // (split_k, m) / (m)
+    aiter_tensor_t& x,      // (m, hc_hidden_size)
+    aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size) fp32; packed int32 when w_preshuffle_bf16
+    int tile_k            = 128,
+    int w_preshuffle_bf16 = 0);
 void mhc_pre_big_fuse(aiter_tensor_t& post_mix,        // (m, hc_mult)
                       aiter_tensor_t& comb_mix,        // (m, hc_mult * hc_mult)
                       aiter_tensor_t& layer_input,     // (m, hidden_size)
@@ -28,7 +29,7 @@ void mhc_pre_big_fuse(aiter_tensor_t& post_mix,        // (m, hc_mult)
                       int sinkhorn_repeat      = 20,
                       // 1: residual is in the pre-shuffled resS[k/KS][head][row][k%KS]
                       // layout written by mhc_fused_post_pre_gemm_sqrsum.
-                      int res_preshuffle       = 0);
+                      int res_preshuffle = 0);
 void mhc_pre_big_fuse_rmsnorm(aiter_tensor_t& post_mix,        // (m, hc_mult)
                               aiter_tensor_t& comb_mix,        // (m, hc_mult * hc_mult)
                               aiter_tensor_t& out,             // (m, hidden_size)
@@ -46,13 +47,13 @@ void mhc_pre_big_fuse_rmsnorm(aiter_tensor_t& post_mix,        // (m, hc_mult)
                               int sinkhorn_repeat      = 20,
                               // 1: residual is in the pre-shuffled
                               // resS[k/KS][head][row][k%KS] layout.
-                              int res_preshuffle       = 0);
+                              int res_preshuffle = 0);
 void mhc_post(aiter_tensor_t& out,            // (m, hc_mult, hidden_size)
               aiter_tensor_t& x,              // (m, hidden_size)
               aiter_tensor_t& residual,       // (m, hc_mult, hidden_size)
               aiter_tensor_t& post_layer_mix, // (m, hc_mult)
               aiter_tensor_t& comb_res_mix,   // (m, hc_mult, hc_mult)
-              int store_nt                    = -1);
+              int store_nt = -1);
 // Optimized mhc_post launch on raw device pointers (used by fused AR+MHC split epilogue).
 void launch_mhc_post_raw(hipStream_t stream,
                          AiterDtype dtype,
@@ -66,22 +67,21 @@ void launch_mhc_post_raw(hipStream_t stream,
                          int x_stride,
                          int residual_stride,
                          int store_nt = -1);
-void mhc_fused_post_pre_gemm_sqrsum(
-    aiter_tensor_t& gemm_out_mul,    // (split_k, m, hc_mult3)
-    aiter_tensor_t& gemm_out_sqrsum, // (split_k, m)
-    aiter_tensor_t& next_residual,   // (m, hc_mult, hidden_size)
-    aiter_tensor_t& layer_input,     // (m, hidden_size)
-    aiter_tensor_t& residual_in,     // (m, hc_mult, hidden_size)
-    aiter_tensor_t& post_layer_mix,  // (m, hc_mult)
-    aiter_tensor_t& comb_res_mix,    // (m, hc_mult, hc_mult)
-    aiter_tensor_t& fn,              // (hc_mult3, hc_mult * hidden_size) fp32; packed int32
-                                     // when w_preshuffle_bf16
-    int tile_m                       = 16,
-    int tile_n                       = 32,
-    int tile_k                       = 32,
-    // Independent compute and residual-layout controls.
-    int w_preshuffle_bf16           = 0,
-    int res_preshuffle              = 0); // shuffled residuals require gfx1250
+void mhc_fused_post_pre_gemm_sqrsum(aiter_tensor_t& gemm_out_mul,    // (split_k, m, hc_mult3)
+                                    aiter_tensor_t& gemm_out_sqrsum, // (split_k, m)
+                                    aiter_tensor_t& next_residual,   // (m, hc_mult, hidden_size)
+                                    aiter_tensor_t& layer_input,     // (m, hidden_size)
+                                    aiter_tensor_t& residual_in,     // (m, hc_mult, hidden_size)
+                                    aiter_tensor_t& post_layer_mix,  // (m, hc_mult)
+                                    aiter_tensor_t& comb_res_mix,    // (m, hc_mult, hc_mult)
+                                    aiter_tensor_t& fn, // (hc_mult3, hc_mult * hidden_size) fp32;
+                                                        // packed int32 when w_preshuffle_bf16
+                                    int tile_m = 16,
+                                    int tile_n = 32,
+                                    int tile_k = 32,
+                                    // Independent compute and residual-layout controls.
+                                    int w_preshuffle_bf16 = 0,
+                                    int res_preshuffle = 0); // shuffled residuals require gfx1250
 // gfx950 post/pre specialization. All buffers are owned by the current call.
 void mhc_pack_fn_gfx950(aiter_tensor_t& out, aiter_tensor_t& fn);
 void mhc_post_project_gfx950(aiter_tensor_t& projection,

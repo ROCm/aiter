@@ -4,6 +4,11 @@
 """Check mHC post/pre values, current inputs, output ownership and graph replay."""
 
 import argparse
+from contextlib import nullcontext
+import hashlib
+import json
+from pathlib import Path
+import statistics
 from unittest.mock import patch
 
 import torch
@@ -136,17 +141,17 @@ def test_case(m, seed):
     graph.replay()
     torch.cuda.synchronize()
     check(captured, reference(*args, **kwargs))
-    _, latency_us = run_perftest(mhc_fused_post_pre, *args, **kwargs)
-    print(
-        f"m={m}, seed={seed}: correctness/state/graph PASS; full call {latency_us:.6f} us"
-    )
+    print(f"m={m}, seed={seed}: correctness/state/graph PASS")
 
 
 def check_fallback(args, kwargs):
     assert not _mhc_post_pre_gfx950_supported(*args, kwargs.get("norm_weight"))
     # Disable the new branch to call the unmodified upstream dispatch. Check its
     # existing behavior rather than impose a new layout or precision contract.
-    with patch("aiter.ops.mhc._mhc_post_pre_gfx950_supported", return_value=False):
+    with patch(
+        "aiter.ops.mhc._mhc_post_pre_gfx950_supported",
+        new=lambda *args, **kwargs: False,
+    ):
         expected = mhc_fused_post_pre(*args, **kwargs)
     actual = mhc_fused_post_pre(*args, **kwargs)
     for got, want in zip(actual, expected):
@@ -170,10 +175,132 @@ def test_fallbacks(seed):
     print("fallback shape/dtype/layout/no-norm equivalence PASS")
 
 
+def test_small_values(seed):
+    for amplitude in (0.0, 1e-5):
+        args, kwargs = inputs(64, seed=seed)
+        args[0].mul_(amplitude)
+        args[1].mul_(amplitude)
+        args[5].fill_(0.1 if amplitude else 0.0)
+        args[6].fill_(0.01 if amplitude else 0.0)
+        check(mhc_fused_post_pre(*args, **kwargs), reference(*args, **kwargs))
+    print("zero/near-zero finite RMSNorm and epsilon checks PASS")
+
+
+def benchmark_case(m, seed):
+    args, kwargs = inputs(m, seed=seed)
+    expected = reference(*args, **kwargs)
+    rows = []
+    for cycle in range(3):
+        order = (
+            ("upstream", "optimized") if cycle % 2 == 0 else ("optimized", "upstream")
+        )
+        for position, implementation in enumerate(order):
+            guard = (
+                patch(
+                    "aiter.ops.mhc._mhc_post_pre_gfx950_supported",
+                    new=lambda *args, **kwargs: False,
+                )
+                if implementation == "upstream"
+                else nullcontext()
+            )
+            with guard:
+                for _ in range(2):
+                    output = mhc_fused_post_pre(*args, **kwargs)
+                torch.cuda.synchronize()
+                check(output, expected)
+                if m == 64:
+                    # One captured public call includes all kernels, weight
+                    # packing where applicable, and the four returned outputs.
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        output = mhc_fused_post_pre(*args, **kwargs)
+                    _, us = run_perftest(
+                        graph.replay,
+                        num_iters=101,
+                        num_warmup=2,
+                        num_rotate_args=1,
+                        use_cuda_event=True,
+                    )
+                    method = "cuda_graph_events"
+                else:
+                    output, us = run_perftest(
+                        mhc_fused_post_pre,
+                        *args,
+                        **kwargs,
+                        num_iters=101,
+                        num_warmup=2,
+                        num_rotate_args=1,
+                        use_cuda_event=True,
+                    )
+                    method = "cuda_events_graph_disabled"
+                torch.cuda.synchronize()
+                check(output, expected)
+            rows.append(
+                {
+                    "m": m,
+                    "seed": seed,
+                    "cycle": cycle + 1,
+                    "position": position + 1,
+                    "implementation": implementation,
+                    "method": method,
+                    "mean_us": float(us),
+                }
+            )
+    medians = {
+        name: statistics.median(
+            row["mean_us"] for row in rows if row["implementation"] == name
+        )
+        for name in ("upstream", "optimized")
+    }
+    return {
+        "m": m,
+        "seed": seed,
+        "cycles": rows,
+        "median_us": medians,
+        "speedup": medians["upstream"] / medians["optimized"],
+        "latency_reduction_pct": 100 * (1 - medians["optimized"] / medians["upstream"]),
+    }
+
+
+def benchmark_cases(ms, seed, output_path):
+    records = [benchmark_case(m, seed) for m in ms]
+    repo = Path(__file__).resolve().parents[1]
+    paths = (
+        "aiter/ops/mhc.py",
+        "csrc/kernels/mhc_post_pre_gfx950.cu",
+        "csrc/kernels/mhc_kernels.cu",
+        "csrc/include/mhc.h",
+        "csrc/pybind/mhc_pybind.cu",
+        "aiter/jit/optCompilerConfig.json",
+        "op_tests/test_mhc_post_pre_gfx950.py",
+    )
+    result = {
+        "gpu": torch.cuda.get_device_name(),
+        "gfx": get_gfx_runtime(),
+        "torch": torch.__version__,
+        "hip": torch.version.hip,
+        "scope": "same-process current upstream dispatch vs optimized full public call",
+        "input_distribution": "seeded normal synthetic inputs; FP32 scale/base multiplied by 0.1",
+        "timing": "3 alternating-order cycles; 101 event-timed calls per cycle; 2 warmups; fixed inputs",
+        "files_sha256": {
+            name: hashlib.sha256((repo / name).read_bytes()).hexdigest()
+            for name in paths
+        },
+        "results": records,
+    }
+    Path(output_path).write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result, indent=2))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-m", type=int, nargs="+", default=[64, 8192])
     parser.add_argument("--seed", type=int, nargs="+", default=[0, 1, 2])
+    parser.add_argument(
+        "--benchmark-json",
+        type=Path,
+        help="also run the paired benchmark and write its raw results",
+    )
     args = parser.parse_args()
     if get_gfx_runtime() != "gfx950":
         print("SKIP: optimized cases require gfx950")
@@ -182,3 +309,6 @@ if __name__ == "__main__":
             for m in args.m:
                 test_case(m, seed)
         test_fallbacks(args.seed[0])
+        test_small_values(args.seed[0])
+        if args.benchmark_json:
+            benchmark_cases(args.m, args.seed[0], args.benchmark_json)
