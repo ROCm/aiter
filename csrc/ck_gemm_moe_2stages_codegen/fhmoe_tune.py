@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import os
 import re
 import tempfile
@@ -9,6 +10,7 @@ from typing import Any, ClassVar
 import pandas as pd
 import torch
 
+import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fhmoe import _use_fhmoe_wrappers
 from aiter.fused_moe import _fused_moe_impl, fused_moe, fused_topk, get_padded_M
@@ -32,7 +34,17 @@ from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import (
     FmoeTuner,
     cosine_diff_compare,
     tensor_compare_diagnostics,
+    torch_dynamic_mxfp8_quant,
 )
+
+
+def closest_reference_cosine_diff_compare(refs, res, msg="", printLog=True):
+    # compare_fn only sees the reference and the result, so an output with more
+    # than one valid reference gets them all, stacked on dim 0, and is judged
+    # against the closest.
+    return min(
+        cosine_diff_compare(ref, res, msg=msg, printLog=printLog) for ref in refs
+    )
 
 
 class FhmoeTuner(TunerCommon):
@@ -574,12 +586,16 @@ class FhmoeTuner(TunerCommon):
         topk_weights,
         topk_ids,
         shape,
+        quantize_fp32=False,
     ):
-        """Homogeneous torch refs for routed FP4 and shared FP8, then summed.
+        """Homogeneous torch refs for routed experts and shared FP8, then summed.
 
         Matches the tuner launch: same tensors, no swiglu_limit (the candidate
-        path does not pass one). Activation quant is fused in the kernel;
-        FmoeTuner's a8w4 ref also leaves a1_scale=None.
+        path does not pass one). Rows whose q_dtype_a is MXFP8 quantize the
+        hidden states and the stage-1 result to MXFP8, so the reference does
+        too. A fused-quant stage 1 (kernelName1 ending in _fp8) quantizes its
+        fp32 result; the unfused path quantizes it after rounding to dtype.
+        Other activation dtypes are not modeled; they keep bf16.
         """
         hidden = FhmoeTuner._to_ref_device(hidden)
         w1_qt = FhmoeTuner._to_ref_device(w1_qt)
@@ -605,6 +621,19 @@ class FhmoeTuner(TunerCommon):
         activation = shape["act_type"]
         quant_type = shape["q_type"]
         doweight_stage1 = bool(shape["doweight_stage1"])
+        quantize_mxfp8 = shape["q_dtype_a"] == dtypes.fp8
+        stage1_dtype = dtypes.fp32 if quantize_mxfp8 and quantize_fp32 else dtype
+
+        a1_scale = None
+        if quantize_mxfp8:
+            a1_bytes, a1_scale = torch_dynamic_mxfp8_quant(hidden)
+            hidden = a1_bytes.view(dtypes.fp8)
+
+        def quantize_a2(ref1):
+            if not quantize_mxfp8:
+                return ref1, None
+            a2_bytes, a2_scale = torch_dynamic_mxfp8_quant(ref1)
+            return a2_bytes.view(dtypes.fp8), a2_scale
 
         ref1 = FmoeTuner.run_torch_moe_stage1(
             hidden,
@@ -612,21 +641,22 @@ class FhmoeTuner(TunerCommon):
             w2_qt,
             routed_w,
             routed_ids,
-            None,
+            a1_scale,
             w1_scale_qt,
-            dtype=dtype,
+            dtype=stage1_dtype,
             activation=activation,
             quant_type=quant_type,
             doweight_stage1=doweight_stage1,
             topk=routed_ids.shape[1],
         )
+        a2, a2_scale = quantize_a2(ref1)
         routed = FmoeTuner.run_torch_moe_stage2(
-            ref1,
+            a2,
             w1_qt,
             w2_qt,
             routed_w,
             routed_ids,
-            None,
+            a2_scale,
             w2_scale_qt,
             dtype=dtype,
             quant_type=quant_type,
@@ -638,27 +668,47 @@ class FhmoeTuner(TunerCommon):
             shared_w2_qt,
             shared_w,
             shared_ids,
-            None,
+            a1_scale,
             shared_w1_scale_qt,
-            dtype=dtype,
+            dtype=stage1_dtype,
             activation=activation,
             quant_type=quant_type,
             doweight_stage1=doweight_stage1,
             topk=1,
         )
+        shared_a2, shared_a2_scale = quantize_a2(shared_ref1)
         shared = FmoeTuner.run_torch_moe_stage2(
-            shared_ref1,
+            shared_a2,
             shared_w1_qt,
             shared_w2_qt,
             shared_w,
             shared_ids,
-            None,
+            shared_a2_scale,
             shared_w2_scale_qt,
             dtype=dtype,
             quant_type=quant_type,
             doweight_stage1=doweight_stage1,
         )
         return routed + shared
+
+    @staticmethod
+    def _warn_unquantized_reference(shape, label):
+        if shape["q_dtype_a"] != dtypes.fp8:
+            aiter.logger.warning(
+                f"FHMoE {label}: the reference keeps fp4 activations in bf16, so "
+                "outputs are checked against an unquantized reference"
+            )
+
+    @staticmethod
+    def run_torch_fhmoe_refs(*args):
+        """run_torch_fhmoe stacked for closest_reference_cosine_diff_compare: the
+        stage-1 result quantized after rounding to dtype, then, for MXFP8
+        activations, quantized from fp32 as a fused-quant stage 1 does."""
+        shape = args[-1]
+        refs = [FhmoeTuner.run_torch_fhmoe(*args)]
+        if shape["q_dtype_a"] == dtypes.fp8:
+            refs.append(FhmoeTuner.run_torch_fhmoe(*args, quantize_fp32=True))
+        return torch.stack(refs)
 
     def _fhmoe_tune_tasks(self, untunedf, args):
         measure_kwargs = {
@@ -683,6 +733,7 @@ class FhmoeTuner(TunerCommon):
             )
             if not pairs:
                 continue
+            self._warn_unquantized_reference(shape, info)
             for block_m, kn1, kn2 in pairs:
                 tasks.append(
                     (
@@ -692,13 +743,13 @@ class FhmoeTuner(TunerCommon):
                         FhmoeTuner._run_fhmoe_mp,
                         (list(self._FHMOE_MP_DATA_KEYS), shape, kn1, kn2, block_m),
                         measure_kwargs,
-                        FhmoeTuner.run_torch_fhmoe,
+                        FhmoeTuner.run_torch_fhmoe_refs,
                         (list(self._FHMOE_REF_DATA_KEYS), shape),
                         {},
                         None,
                         0.01,
                         0.01,
-                        cosine_diff_compare,
+                        closest_reference_cosine_diff_compare,
                     )
                 )
             in_datas.append((len(pairs), ()))
@@ -722,6 +773,7 @@ class FhmoeTuner(TunerCommon):
                 f"{self._csv_cell(shape['q_type'])}, "
                 f"{self._csv_cell(shape['gate_mode'])})"
             )
+            self._warn_unquantized_reference(shape, f"run_config {shape_str}")
             allowed_err_ratio, allowed_err_ratio_desc = (
                 self._get_run_config_err_ratio_limit(row, args)
             )
@@ -764,10 +816,12 @@ class FhmoeTuner(TunerCommon):
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                 )
-                ref = self.run_torch_fhmoe(
+                reference = functools.partial(
+                    self.run_torch_fhmoe,
                     *[data[k] for k in self._FHMOE_REF_DATA_KEYS],
                     shape,
                 )
+                ref = reference()
                 if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
                     diag = tensor_compare_diagnostics(ref, out)
                     status = (
@@ -775,8 +829,19 @@ class FhmoeTuner(TunerCommon):
                         f"{diag}"
                     )
                 else:
-                    err_ratio = cosine_diff_compare(
-                        ref, out, msg=f"run_config {shape_str}"
+                    err_ratio = cosine_diff_compare(ref, out, printLog=False)
+                    if (
+                        err_ratio > allowed_err_ratio
+                        and shape["q_dtype_a"] == dtypes.fp8
+                    ):
+                        # A fused-quant stage 1 quantizes its fp32 result where the
+                        # reference above rounds it to dtype first.
+                        ref_fp32 = reference(quantize_fp32=True)
+                        err_fp32 = cosine_diff_compare(ref_fp32, out, printLog=False)
+                        if err_fp32 < err_ratio:
+                            ref, err_ratio = ref_fp32, err_fp32
+                    aiter.logger.info(
+                        f"run_config {shape_str} cosine_diff={err_ratio:.6g}"
                     )
                     if err_ratio <= allowed_err_ratio:
                         status = "ok"

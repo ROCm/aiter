@@ -138,6 +138,64 @@ class TestFhmoeTuneTasks(unittest.TestCase):
         self.assertEqual(in_datas, [(len(pairs), ())] * len(df))
         self.assertEqual({task[0][0][2] for task in tasks}, set(df["token"]))
 
+    def test_every_task_judges_against_the_closest_reference(self):
+        mod = _tune_module()
+        pairs = [(16, "k1a_fp8", "k2a"), (16, "k1a", "k2a")]
+        with (
+            mock.patch.object(mod.FhmoeTuner, "_kernel_pairs", return_value=pairs),
+            _quiet(),
+        ):
+            tasks, _ = _tuner()._fhmoe_tune_tasks(_catalogue().iloc[:1], _tune_args())
+        for task in tasks:
+            self.assertIs(task[6], mod.FhmoeTuner.run_torch_fhmoe_refs)
+            self.assertIs(task[-1], mod.closest_reference_cosine_diff_compare)
+
+
+class TestFhmoeReferences(unittest.TestCase):
+    def _refs(self, q_dtype_a):
+        mod = _tune_module()
+        shape = dict(_shape(), q_dtype_a=q_dtype_a)
+        calls = []
+
+        def fake_ref(*args, quantize_fp32=False):
+            calls.append(quantize_fp32)
+            return torch.full((2, 3), float(quantize_fp32))
+
+        with mock.patch.object(mod.FhmoeTuner, "run_torch_fhmoe", fake_ref):
+            refs = mod.FhmoeTuner.run_torch_fhmoe_refs("hidden", shape)
+        return refs, calls
+
+    def test_mxfp8_activations_stack_both_quantization_points(self):
+        refs, calls = self._refs(_tune_module().dtypes.fp8)
+        self.assertEqual(calls, [False, True])
+        self.assertEqual(tuple(refs.shape), (2, 2, 3))
+
+    def test_fp4_activations_keep_one_reference(self):
+        refs, calls = self._refs(_tune_module().dtypes.fp4x2)
+        self.assertEqual(calls, [False])
+        self.assertEqual(tuple(refs.shape), (1, 2, 3))
+
+    def test_only_an_unquantized_reference_warns(self):
+        mod = _tune_module()
+        for q_dtype_a, warns in (
+            (mod.dtypes.fp8, False),
+            (mod.dtypes.fp4x2, True),
+        ):
+            with (
+                self.subTest(q_dtype_a=q_dtype_a),
+                mock.patch.object(mod.aiter.logger, "warning") as warning,
+            ):
+                shape = dict(_shape(), q_dtype_a=q_dtype_a)
+                mod.FhmoeTuner._warn_unquantized_reference(shape, "row")
+                self.assertEqual(warning.called, warns)
+
+    def test_compare_takes_the_closest_reference(self):
+        compare = _tune_module().closest_reference_cosine_diff_compare
+        res = torch.randn(4, 32)
+        refs = torch.stack([-res, res])
+        self.assertEqual(compare(refs, res, printLog=False), 0.0)
+        self.assertEqual(compare(refs[:1], res, printLog=False), 2.0)
+
 
 class TestFhmoeOwnedRows(unittest.TestCase):
     def test_only_mxfp4_weight_rows_are_kept(self):
