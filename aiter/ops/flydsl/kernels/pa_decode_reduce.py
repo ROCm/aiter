@@ -8,14 +8,10 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-from .tensor_shim import buf_base_i64, buf_copy_load, ptr_buf_tensor
-from .utils import rcp_f32, udiv_const, urem_const
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
-_DTYPE_MAP = {
-    "f32": fx.Float32,
-    "f16": fx.Float16,
-    "bf16": fx.BFloat16,
-}
+from .tensor_shim import _FX_ELEM, buf_base_i64, buf_copy_load, ptr_buf_tensor
+from .utils import rcp_f32, udiv_const, urem_const
 
 WAVE = 64
 # Above this partition bound the CTA reduces in LDS; at most DUAL_REGISTER
@@ -32,12 +28,13 @@ def _shuffle_offsets(parts):
 
 def _fast_div(value, magic):
     """floor(value / d) for magic = ceil(2**30 / d), exact while value * d <= 2**30."""
-    return fx.Int32((fx.Int64(value) * fx.Int64(magic)) >> fx.Int64(30))
+    return fx.Int32((fx.Int64(value) * fx.Int64(magic)) >> 30)
 
 
 @lru_cache(maxsize=256)
 def compile_pa_decode_ps_reduce(
     *,
+    architecture: str | None = None,
     max_context_partition_num: int,
     head_size: int,
     output_dtype_str: str,
@@ -56,12 +53,12 @@ def compile_pa_decode_ps_reduce(
     is at most INT32_MAX bytes: a per-sequence buffer bound zero-fills
     inactive partitions without reading adjacent sequences or NaN padding.
 
-    NP <= 64 builds a register-only CTA: lane p owns partition p's statistics
-    and a CTA-uniform count branch selects one unrolled rung. NP > 64 builds a
-    dual-mode CTA of ``parallel_groups`` partition groups. Up to 32 live
-    partitions, group 0 runs the register ladder; above, wave 0 publishes the
-    softmax weights to LDS, each group sums a contiguous chunk and group 0
-    adds the partials.
+    NP up to the wave size builds a register-only CTA: lane p owns partition
+    p's statistics and a CTA-uniform count branch selects one unrolled rung.
+    Larger bounds build a dual-mode CTA of ``parallel_groups`` partition groups.
+    Up to 32 live partitions, group 0 runs the register ladder; above, wave 0
+    publishes the softmax weights to LDS, each group sums a contiguous chunk
+    and group 0 adds the partials.
 
     ``pairs`` gives each lane two adjacent bf16/f16 elements (D % 128 == 0, a
     four-byte aligned base and even strides); output stores stay scalar.
@@ -72,6 +69,12 @@ def compile_pa_decode_ps_reduce(
     Sinks are per-head zero-value logits: include them in the shared maximum
     and add their denominator mass once.
     """
+    architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    if architecture not in ("gfx942", "gfx950", "gfx1250"):
+        raise NotImplementedError(f"PA decode reducer does not support {architecture}")
+    wave = 32 if architecture == "gfx1250" else WAVE
+    register_partitions = min(REGISTER_PARTITIONS, wave)
+    max_cta_waves = MAX_CTA_WAVES * WAVE // wave
     partitions = max_context_partition_num
     if partitions < 1:
         raise ValueError(
@@ -82,28 +85,28 @@ def compile_pa_decode_ps_reduce(
             f"head_size must be a multiple of 64 in [64, 1024], got {head_size}"
         )
     for dtype_str in (output_dtype_str, logits_dtype_str, sink_dtype_str):
-        if dtype_str not in _DTYPE_MAP:
+        if dtype_str not in ("f32", "f16", "bf16"):
             raise ValueError(f"Unsupported FlyDSL dtype: {dtype_str!r}")
     if query_group_size <= 0:
         raise ValueError(f"query_group_size must be positive, got {query_group_size}")
     if pairs and (head_size % 128 or logits_dtype_str not in ("bf16", "f16")):
         raise ValueError("pairs requires D % 128 == 0 and bf16/f16 logits")
     elems = 2 if pairs else 1
-    group_waves = head_size // elems // WAVE
-    dual = partitions > REGISTER_PARTITIONS
+    group_waves = head_size // elems // wave
+    dual = partitions > register_partitions
     groups = parallel_groups
     if groups < 1 or groups & (groups - 1):
         raise ValueError(f"parallel_groups must be a power of two, got {groups}")
     if groups > 1 and not dual:
-        raise ValueError("parallel_groups > 1 requires NP > 64")
-    if groups * group_waves > MAX_CTA_WAVES:
+        raise ValueError(f"parallel_groups > 1 requires NP > {register_partitions}")
+    if groups * group_waves > max_cta_waves:
         raise ValueError(f"{groups} groups of {group_waves} waves exceed the CTA")
     if num_xcds < 0:
         raise ValueError(f"num_xcds must be nonnegative, got {num_xcds}")
 
-    output_dtype = _DTYPE_MAP[output_dtype_str]
-    logits_dtype = _DTYPE_MAP[logits_dtype_str]
-    sink_dtype = _DTYPE_MAP[sink_dtype_str]
+    output_dtype = _FX_ELEM[output_dtype_str]
+    logits_dtype = _FX_ELEM[logits_dtype_str]
+    sink_dtype = _FX_ELEM[sink_dtype_str]
     log2e = 1.4426950408889634
 
     low_rungs = high_rungs = dual_rungs = lds_rungs = ()
@@ -114,7 +117,7 @@ def compile_pa_decode_ps_reduce(
         low_rungs = (1, 2, 4, 8)
         high_rungs = tuple(r for r in (16, 32) if r < partitions) + (partitions,)
     else:
-        block = [WAVE, group_waves * groups, 1]
+        block = [wave, group_waves * groups, 1]
         dual_rungs = (1, 2, 4, 8, 16, DUAL_REGISTER_PARTITIONS)
         # Group g owns partitions [g * R, (g + 1) * R) for the selected rung R.
         # Above 32 live partitions the first rung covers up to 64.
@@ -128,16 +131,29 @@ def compile_pa_decode_ps_reduce(
     # would otherwise hoist above the count branch; issuing rung 2's loads in
     # reverse keeps them inside it.
     reverse_pair = not dual and partitions > 32
-    # Groups tile whole 64-slot weight chunks, so their slots stay in range.
-    weight_chunks = -(-partitions // WAVE)
+    # Groups tile whole wave-sized weight chunks, so their slots stay in range.
+    weight_chunks = -(-partitions // wave)
 
     @fx.struct
     class SharedStorage:
-        weights: fx.Array[fx.Float32, weight_chunks * WAVE, 16]
+        weights: fx.Array[fx.Float32, weight_chunks * wave, 16]
         partials: fx.Array[fx.Float32, max(1, (groups - 1) * head_size), 16]
 
-    @flyc.kernel(known_block_size=block)
-    def pa_decode_ps_reduce_kernel(
+    kernel_name = (
+        f"pa_decode_reduce_kernel_o{output_dtype_str}_d{head_size}"
+        f"_np{partitions}_gqa{query_group_size}"
+    )
+    if use_sinks:
+        kernel_name += "_sinks"
+    if pairs:
+        kernel_name += "_pairs"
+    if groups > 1:
+        kernel_name += f"_g{groups}"
+    if num_xcds:
+        kernel_name += f"_xcd{num_xcds}"
+
+    @flyc.kernel(name=kernel_name, known_block_size=block)
+    def pa_decode_reduce_kernel(
         output_ptr: fx.Pointer,
         exp_sums_ptr: fx.Pointer,
         max_logits_ptr: fx.Pointer,
@@ -191,8 +207,8 @@ def compile_pa_decode_ps_reduce(
         neg_inf = fx.Float32(float("-inf"))
         c_log2e = fx.Float32(log2e)
         zero_i = fx.Int32(0)
-        c_wave = fx.Int32(WAVE)
-        lane = fx.thread_idx.x & fx.Int32(WAVE - 1)
+        c_wave = fx.Int32(wave)
+        lane = fx.thread_idx.x & fx.Int32(wave - 1)
         group_idx = urem_const(row_idx, query_group_size)
         query_idx = udiv_const(row_idx, query_group_size)
         output_base = (
@@ -233,7 +249,7 @@ def compile_pa_decode_ps_reduce(
 
         def _zero():
             if fx.const_expr(pairs):
-                return fx.Vector.filled(2, 0.0, fx.Float32)
+                return fx.full(2, 0.0, fx.Float32)
             return zero_f
 
         def _load_logits(part, unit):
@@ -261,8 +277,8 @@ def compile_pa_decode_ps_reduce(
                 output[offset] = acc.to(output_dtype)
 
         def _lane_stats(chunk):
-            # Lane l owns partition l + 64 * chunk; part_count <= NP.
-            part = lane + fx.Int32(chunk * WAVE)
+            # Lane l owns partition l + wave * chunk; part_count <= NP.
+            part = lane + fx.Int32(chunk * wave)
             live = part < part_count
             offset = (
                 stats_seq_offset
@@ -319,10 +335,13 @@ def compile_pa_decode_ps_reduce(
             logits = [None] * rung
             for part in order:
                 logits[part] = _load_logits(fx.Int32(part), unit)
-            (weight,) = _softmax_weights([part_sum], [part_max], _shuffle_offsets(rung))
+            # Wave32 reductions broadcast statistics to every output lane,
+            # including lanes without a live partition.
+            offsets = _shuffle_offsets(wave if architecture == "gfx1250" else rung)
+            (weight,) = _softmax_weights([part_sum], [part_max], offsets)
             acc = _zero()
             for part in fx.range_constexpr(rung):
-                part_weight = fx.gpu.shuffle_idx(weight, part, WAVE)
+                part_weight = fx.gpu.shuffle_idx(weight, part, wave)
                 # Preserve increasing-part order and separate multiply/add rounding.
                 acc = acc + _to_f32(logits[part]) * part_weight
             return acc
@@ -359,7 +378,7 @@ def compile_pa_decode_ps_reduce(
             if fx.const_expr(partitions <= 8):
                 acc = _reduce_register(partitions, unit)
             else:
-                if part_count > fx.Int32(8):
+                if part_count > 8:
                     acc = _top_first(high_rungs, _reduce_register, unit)
                 else:
                     acc = _top_first(low_rungs, _reduce_register, unit)
@@ -383,10 +402,10 @@ def compile_pa_decode_ps_reduce(
                         sums.append(part_sum)
                         maxes.append(part_max)
                     chunk_weights = _softmax_weights(
-                        sums, maxes, _shuffle_offsets(WAVE)
+                        sums, maxes, _shuffle_offsets(wave)
                     )
                     for chunk in fx.range_constexpr(weight_chunks):
-                        weights[lane + fx.Int32(chunk * WAVE)] = chunk_weights[chunk]
+                        weights[lane + fx.Int32(chunk * wave)] = chunk_weights[chunk]
                 fx.gpu.barrier()
 
                 def _group_sum(rung, unit):
@@ -418,8 +437,8 @@ def compile_pa_decode_ps_reduce(
                             if fx.const_expr(pairs):
                                 acc = acc + fx.Vector.from_elements(
                                     [
-                                        fx.Float32(partials[other - 1, unit * 2]),
-                                        fx.Float32(partials[other - 1, unit * 2 + 1]),
+                                        partials[other - 1, unit * 2],
+                                        partials[other - 1, unit * 2 + 1],
                                     ],
                                     dtype=fx.Float32,
                                 )
@@ -463,7 +482,7 @@ def compile_pa_decode_ps_reduce(
     ):
         query_rows = query_seq_len * fx.Int32(query_group_size)
         num_ctas = batch_size * num_kv_heads * query_rows
-        pa_decode_ps_reduce_kernel(
+        pa_decode_reduce_kernel(
             output,
             exp_sums,
             max_logits,
@@ -496,5 +515,5 @@ def compile_pa_decode_ps_reduce(
 
     return {
         "launch": launch_pa_decode_ps_reduce_kernel,
-        "kernel": pa_decode_ps_reduce_kernel,
+        "kernel": pa_decode_reduce_kernel,
     }

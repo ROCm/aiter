@@ -7,12 +7,14 @@ from functools import lru_cache
 
 import torch
 
-from ..kernels.tensor_shim import _run_compiled, wave_size_of
+from ..kernels.tensor_shim import wave_size_of
+from ..kernels.topk.topk_launch import run_topk_launcher
 from ..kernels.topk.topk_per_row_small_k import (
     build_topk_per_row_small_k_module,
     lds_limit,
     topk_per_row_small_k_shape,
 )
+from .row_lens import row_len_slot
 
 # The row bound fixes the register tile, so it is a compile-time constant.
 # Bucketing to powers of two keeps a serving run to a couple of compilations.
@@ -54,7 +56,7 @@ def topk_per_row_small_k_serves(k: int, width: int, wave_size: int) -> str | Non
 
 def _unsupported_reason(
     scores: torch.Tensor,
-    row_lens: torch.Tensor,
+    row_lens: torch.Tensor | None,
     indices: torch.Tensor,
     k: int,
 ) -> str | None:
@@ -68,20 +70,22 @@ def _unsupported_reason(
     if scores.stride(1) != 1:
         return "scores must have inner stride 1"
     rows, width = scores.shape
-    if row_lens.shape != (rows,) or row_lens.dtype != torch.int32:
+    if row_lens is not None and (
+        row_lens.shape != (rows,) or row_lens.dtype != torch.int32
+    ):
         return f"row_lens must be int32 [{rows}], got {tuple(row_lens.shape)}"
     if indices.shape != (rows, k) or indices.dtype != torch.int32:
         return f"indices must be int32 [{rows}, {k}], got {tuple(indices.shape)}"
     if indices.stride(1) != 1:
         return "indices must have inner stride 1"
-    if not (scores.is_cuda and row_lens.is_cuda and indices.is_cuda):
+    if not all(t.is_cuda for t in (scores, row_lens, indices) if t is not None):
         return "every tensor must be on the GPU"
     return topk_per_row_small_k_serves(k, width, wave_size_of(scores.device.index))
 
 
 def topk_per_row_small_k_supported(
     scores: torch.Tensor,
-    row_lens: torch.Tensor,
+    row_lens: torch.Tensor | None,
     indices: torch.Tensor,
     k: int,
 ) -> bool:
@@ -95,8 +99,13 @@ def topk_per_row_small_k_supported(
 
 
 @lru_cache(maxsize=64)
-def _plan(k: int, width: int, wave_size: int, forced_blocks: bool):
-    """The launcher for one (k, row-width) shape."""
+def _plan(k: int, width: int, wave_size: int, forced_blocks: bool, full_rows: bool):
+    """The launcher for one (k, row-width) shape.
+
+    `full_rows` compiles the width in as every row's length, so the kernel
+    reads no length tensor. It costs no extra plan -- the width is already
+    the key -- only a build per exact width rather than per bucket.
+    """
     reason = topk_per_row_small_k_serves(k, width, wave_size)
     if reason is not None:
         raise ValueError(f"[FlyDSL topk_per_row_small_k] {reason}")
@@ -109,12 +118,13 @@ def _plan(k: int, width: int, wave_size: int, forced_blocks: bool):
         # worth 1.07x at 4096 columns rising to 1.29x at 16384. Keyword so every
         # call lands on one `cache` entry.
         forced_blocks=forced_blocks,
+        fixed_row_len=width if full_rows else 0,
     )
 
 
 def topk_per_row_small_k(
     scores: torch.Tensor,
-    row_lens: torch.Tensor,
+    row_lens: torch.Tensor | None,
     indices: torch.Tensor,
     k: int,
     init_blocks: int = 0,
@@ -125,7 +135,8 @@ def topk_per_row_small_k(
     Args:
         scores: ``[rows, width]`` float32, inner stride 1.
         row_lens: ``[rows]`` int32; columns at or past a row's length are
-            invisible to it.
+            invisible to it. None makes every row full-width, and then no
+            length tensor is read at all.
         indices: ``[rows, k]`` int32, written in place. A row with fewer than
             ``k`` live columns is right-padded with -1.
         init_blocks: leading columns forced into the selection.
@@ -138,13 +149,18 @@ def topk_per_row_small_k(
     """
     rows, width = scores.shape
     launcher = _plan(
-        k, width, wave_size_of(scores.device.index), bool(init_blocks or local_blocks)
+        k,
+        width,
+        wave_size_of(scores.device.index),
+        bool(init_blocks or local_blocks),
+        row_lens is None,
     )
-    _run_compiled(
+    run_topk_launcher(
         launcher,
         scores,
-        row_lens,
+        row_len_slot(row_lens, scores.device),
         indices,
+        width,
         int(init_blocks),
         int(local_blocks),
         rows,

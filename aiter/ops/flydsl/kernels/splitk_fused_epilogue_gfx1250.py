@@ -37,6 +37,7 @@ def emit_fused_splitk_epilogue(
     mn_oob,
     flat_tile,
     bounded_m=False,
+    n_oob=None,
 ):
     """Reduce disjoint row ranges using all of a tile's split-K workgroups.
 
@@ -75,16 +76,30 @@ def emit_fused_splitk_epilogue(
     # Each scratch plane holds only the rotated peer rows, including on an M
     # tail; the output descriptor discards the invalid logical rows.
     partial_out = partial_base + fx.Int64(split_idx) * plane
-    layout = fx.make_layout((peer_m, c_lds_row), (c_lds_row, 1))
-    dst = fx.Tensor(fx.make_view(partial_out, layout))
-    store = fx.rocdl.make_tdm_atom(
-        dst,
-        [peer_m, tile_n],
-        strides=[fx.Int64(tile_n), None],
-        num_warps=block // 32,
-        cache_modifier=CPOL_STORE_DEVICE,
+    out_tile = (peer_m, c_lds_row)
+    dst = fx.Tensor(
+        fx.make_view(
+            partial_out, fx.make_layout((peer_m, tile_n), (fx.Int64(tile_n), 1))
+        )
     )
-    fx.copy(store, fx.Tensor(fx.make_view(lds_partial, layout)), dst)
+    store, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+        fx.rocdl.TensorStore(cache_modifier=CPOL_STORE_DEVICE),
+        dst,
+        fx.make_layout(out_tile, (c_lds_row, 1)),
+        out_tile,
+        num_warps=block // 32,
+    )
+    out_blk = fx.zipped_divide(out_coord, out_tile)[None, (0, None)]
+    lds_box = fx.Tensor(
+        fx.make_view(
+            lds_partial,
+            fx.make_layout((out_tile, 1), ((c_lds_row, 1), peer_m * c_lds_row)),
+        )
+    )
+    tOs, tOg = fx.rocdl.cdna5.tdm_partition(
+        store, fx.rocdl.wave_id(), fx.make_layout(block // 32, 1), lds_box, out_blk
+    )
+    fx.copy(store, tOs[None, 0], tOg[None, 0])
     fx.rocdl.tdm_ops.tensor_wait(0)
     cluster.cluster_barrier()
 
@@ -95,7 +110,7 @@ def emit_fused_splitk_epilogue(
     )
     remaining = mn_oob - reduce_row
     valid_rows = (remaining > 0).select(remaining, fx.Int32(0))
-    if const_expr(lean and bounded_m):
+    if const_expr(lean and bounded_m and n_oob is None):
         output_buffer = ptr_buf_tensor(
             output_base,
             elem,
@@ -128,13 +143,11 @@ def emit_fused_splitk_epilogue(
         ]
 
     def _local(batch, u):
-        return fx.Vector(
-            fx.ptr_load(
-                lds_partial
-                + (peer_m + row0 + (batch * unroll + u) * rows_per_iter) * c_lds_row
-                + col,
-                result_type=T.vec(vec, partial_elem.ir_type),
-            )
+        return fx.ptr_load(
+            lds_partial
+            + (peer_m + row0 + (batch * unroll + u) * rows_per_iter) * c_lds_row
+            + col,
+            result_type=T.vec(vec, partial_elem.ir_type),
         )
 
     for batch in range(reduce_m // (rows_per_iter * unroll)):
@@ -189,6 +202,17 @@ def emit_fused_splitk_epilogue(
             row = row0 + (batch * unroll + u) * rows_per_iter
             if const_expr(not lean):
                 fx.ptr_store(acc.to(elem), lds_out + row * c_lds_row + col)
+            elif const_expr(n_oob is not None):
+                if row < valid_rows:
+                    if col + vec <= n_oob:
+                        fx.ptr_store(acc.to(elem), output_base + row * ldc64 + col)
+                    else:
+                        for j in range_constexpr(vec):
+                            if col + j < n_oob:
+                                fx.ptr_store(
+                                    acc[j].to(elem),
+                                    output_base + row * ldc64 + col + j,
+                                )
             elif const_expr(bounded_m):
                 buf_copy_store(
                     output_buffer,
@@ -202,13 +226,32 @@ def emit_fused_splitk_epilogue(
 
     if const_expr(not lean):
         workgroup_barrier(use_cluster=False)
-        out_layout = fx.make_layout((reduce_m, c_lds_row), (c_lds_row, 1))
-        tile_out = fx.Tensor(fx.make_view(output_base, out_layout))
-        store_atom = fx.rocdl.make_tdm_atom(
+        out_tile2 = (reduce_m, c_lds_row)
+        # The view carries the store's bounds, so the N clamp has to live here.
+        out_n = tile_n if n_oob is None else fx.max(0, fx.min(n_oob, tile_n))
+        tile_out = fx.Tensor(
+            fx.make_view(output_base, fx.make_layout((valid_rows, out_n), (ldc64, 1)))
+        )
+        store_atom, out_coord2 = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorStore(),
             tile_out,
-            [valid_rows, tile_n],
-            strides=[ldc64, None],
+            fx.make_layout(out_tile2, (c_lds_row, 1)),
+            out_tile2,
             num_warps=block // 32,
         )
-        fx.copy(store_atom, fx.Tensor(fx.make_view(lds_out, out_layout)), tile_out)
+        out_blk2 = fx.zipped_divide(out_coord2, out_tile2)[None, (0, None)]
+        lds_box2 = fx.Tensor(
+            fx.make_view(
+                lds_out,
+                fx.make_layout((out_tile2, 1), ((c_lds_row, 1), reduce_m * c_lds_row)),
+            )
+        )
+        tO2s, tO2g = fx.rocdl.cdna5.tdm_partition(
+            store_atom,
+            fx.rocdl.wave_id(),
+            fx.make_layout(block // 32, 1),
+            lds_box2,
+            out_blk2,
+        )
+        fx.copy(store_atom, tO2s[None, 0], tO2g[None, 0])
         fx.rocdl.tdm_ops.tensor_wait(0)

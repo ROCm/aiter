@@ -176,8 +176,8 @@ def uni(v):
 def uni64(v):
     v = fx.Int64(v)
     lo = uni(fx.Int32(v & fx.Int64(0xFFFFFFFF)))
-    hi = uni(fx.Int32(v >> fx.Int64(32)))
-    return (fx.Int64(hi) << fx.Int64(32)) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
+    hi = uni(fx.Int32(v >> 32))
+    return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
 
 
 # Buffer resources from raw (peer / arena) addresses plus per-lane byte offsets
@@ -250,14 +250,14 @@ def fp4_pack(vals, qs):
 
 
 def fp8x4_pack(f, qs):
-    zero = fx.Vector.filled(2, 0, fx.Int16)
+    zero = fx.full(2, 0, fx.Int16)
     w = rocdl.cvt_scalef32_pk_fp8_f32(
         T.vec(2, T.i16), _u(zero), _u(f[0]), _u(f[1]), _u(qs), False
     )
     w = rocdl.cvt_scalef32_pk_fp8_f32(
         T.vec(2, T.i16), w, _u(f[2]), _u(f[3]), _u(qs), True
     )
-    return fx.Int32(fx.Vector(w).bitcast(fx.Int32)[0])
+    return fx.Vector(w).bitcast(fx.Int32)[0]
 
 
 def fp8x4_unpack(d, sc):
@@ -297,6 +297,7 @@ def scales4(e8i):
 
 
 def bf16_bits(f):
+    # Preserve the packed conversion's code generation on gfx950.
     return fx.Int32(
         fx.Vector.from_elements([fx.Float32(f).to(fx.BFloat16)], fx.BFloat16).bitcast(
             fx.Int16
@@ -337,7 +338,7 @@ def wave_red(v, lane, op):
 def wave_rank(hit):
     b = fx.Int64(rocdl.ballot(T.i64, hit))
     lo = i32(b & fx.Int64(0xFFFFFFFF))
-    hi = i32(b >> fx.Int64(32))
+    hi = i32(b >> 32)
     below = rocdl.mbcnt_lo(T.i32, _u(lo), _u(i32(0)))
     below = i32(rocdl.mbcnt_hi(T.i32, _u(hi), below))
     return below, _ctpop(lo) + _ctpop(hi)
@@ -361,7 +362,7 @@ def swap32(x, y):
 
 
 def widen(v4):
-    z = fx.Vector.filled(4, 0, fx.Int32)
+    z = fx.full(4, 0, fx.Int32)
     return fx.Vector(v4).shuffle(z, list(range(8)))
 
 
