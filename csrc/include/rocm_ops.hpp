@@ -610,7 +610,9 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                        \
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
-          py::arg("gemma_norm") = false);                                            \
+          py::arg("gemma_norm")    = false,                                          \
+          py::arg("num_norm_rows") = static_cast<int64_t>(-1),                       \
+          py::arg("skip_residual") = false);                                         \
     m.def("fused_allreduce_rmsnorm_pad",                                             \
           &aiter::fused_allreduce_rmsnorm_pad,                                       \
           py::arg("_fa"),                                                            \

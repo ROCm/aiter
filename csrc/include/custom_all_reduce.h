@@ -86,7 +86,9 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              int64_t reg_ptr,
                              int64_t reg_bytes,
                              bool use_1stage,
-                             bool gemma_norm = false);
+                             bool gemma_norm       = false,
+                             int64_t num_norm_rows = -1,
+                             bool skip_residual    = false);
 void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  const aiter_tensor_t& inp,
                                  const aiter_tensor_t& res_inp,

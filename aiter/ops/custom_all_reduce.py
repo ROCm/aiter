@@ -104,6 +104,8 @@ def fused_allreduce_rmsnorm(
     reg_bytes: int,
     use_1stage: bool,
     gemma_norm: bool = False,
+    num_norm_rows: int = -1,
+    skip_residual: bool = False,
 ) -> None: ...
 
 

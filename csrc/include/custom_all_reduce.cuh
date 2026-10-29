@@ -1494,7 +1494,10 @@ DINLINE void smemReduceSum(float* smem_addr)
  * input case n dim should be divided by 4096 with dtype bf16
  * and should be divided by 2048 with dtype fp32
  * */
-template <typename T, int tnum, int n_loop, bool GEMMA_NORM = false>
+// ROW_OPTS=false keeps the plain path (residual add, every row normalized).
+// ROW_OPTS=true skips the residual add if skip_residual and normalizes only the
+// first norm_rows rows; residual_out still gets every row.
+template <typename T, int tnum, int n_loop, bool GEMMA_NORM = false, bool ROW_OPTS = false>
 __global__ void __launch_bounds__(tnum, 1)
     local_device_load_rmsnorm_naive(RankSignals sg,
                                     T* __restrict__ residual_inp,
@@ -1504,7 +1507,9 @@ __global__ void __launch_bounds__(tnum, 1)
                                     float eps,
                                     int rank,
                                     int m,
-                                    int n)
+                                    int n,
+                                    int norm_rows      = std::numeric_limits<int>::max(),
+                                    bool skip_residual = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1514,28 +1519,52 @@ __global__ void __launch_bounds__(tnum, 1)
 
     for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
-        float square_sum = 0.0f;
+        const bool do_norm = !ROW_OPTS || bid < norm_rows;
+        float square_sum   = 0.0f;
         A rms_inp_f32[n_loop];
         P w_arr[n_loop];
 #pragma unroll
         for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-            int read_idx        = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-            P reduce_out_pack   = tmps[read_idx];
-            P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
-            w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
+            int read_idx      = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
+            P reduce_out_pack = tmps[read_idx];
+            P residual_inp_pack;
+            if(!ROW_OPTS || !skip_residual)
+                residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+            if constexpr(!ROW_OPTS)
+                w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
             A reduce_pack;
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                float res_inp          = upcast_s(residual_inp_pack[i]);
-                float ar_out           = upcast_s(reduce_out_pack[i]);
-                float rms_inp          = res_inp + ar_out;
+                float rms_inp = upcast_s(reduce_out_pack[i]);
+                if(!ROW_OPTS || !skip_residual)
+                    rms_inp += upcast_s(residual_inp_pack[i]);
                 rms_inp_f32[n_iter][i] = rms_inp;
                 reduce_pack[i]         = rms_inp * rms_inp;
             }
-            square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+            if constexpr(ROW_OPTS)
+            {
+                // Write residual_out here so rows that skip the norm still get it.
+                if(do_norm)
+                {
+                    w_arr[n_iter] =
+                        *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
+                    square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+                }
+                P rmsnorm_inp;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                    rmsnorm_inp[i] = downcast_s<T>(rms_inp_f32[n_iter][i]);
+                *(reinterpret_cast<P*>(residual_out) + read_idx) = rmsnorm_inp;
+            }
+            else
+            {
+                square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+            }
         }
+        if(!do_norm)
+            continue;
         smem[threadIdx.x] = square_sum;
         __syncthreads();
         smemReduceSum<tnum>(&smem[0]);
@@ -1549,16 +1578,17 @@ __global__ void __launch_bounds__(tnum, 1)
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                float x_f32     = rms_inp_f32[n_iter][i];
-                float w_f32     = upcast_s(w_arr[n_iter][i]);
+                float x_f32 = rms_inp_f32[n_iter][i];
+                float w_f32 = upcast_s(w_arr[n_iter][i]);
                 if constexpr(GEMMA_NORM)
                     w_f32 += 1.0f;
                 rmsnorm_inp[i]  = downcast_s<T>(x_f32);
                 rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
             }
             int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-            *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
-            *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
+            *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+            if constexpr(!ROW_OPTS)
+                *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
         }
     }
 }
@@ -1567,7 +1597,8 @@ __global__ void __launch_bounds__(tnum, 1)
  * block size can be 256 and 512
  * corresponding 2048 and 4096 elem per block
  * */
-template <typename T, int tnum, int n_loop, bool GEMMA_NORM = false>
+// ROW_OPTS: see local_device_load_rmsnorm_naive.
+template <typename T, int tnum, int n_loop, bool GEMMA_NORM = false, bool ROW_OPTS = false>
 __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals sg,
                                                                      T* __restrict__ residual_inp,
                                                                      T* __restrict__ residual_out,
@@ -1577,20 +1608,23 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                                                                      int rank,
                                                                      int m,
                                                                      int n,
-                                                                     int out_hidden_dim)
+                                                                     int out_hidden_dim,
+                                                                     int norm_rows = std::numeric_limits<int>::max(),
+                                                                     bool skip_residual = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
-    int in_pack_count       = n / pack_size;
-    int out_pack_count      = out_hidden_dim / pack_size;
-    int tail_pack_count     = out_pack_count - in_pack_count;
+    int in_pack_count   = n / pack_size;
+    int out_pack_count  = out_hidden_dim / pack_size;
+    int tail_pack_count = out_pack_count - in_pack_count;
 
     for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
-        float square_sum = 0.0f;
+        const bool do_norm = !ROW_OPTS || bid < norm_rows;
+        float square_sum   = 0.0f;
         A rms_inp_f32[n_loop];
         P w_arr[n_loop];
 #pragma unroll
@@ -1598,23 +1632,46 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
         {
             if(n_iter * tnum + threadIdx.x < in_pack_count)
             {
-                int read_idx        = bid * in_pack_count + n_iter * tnum + threadIdx.x;
-                P reduce_out_pack   = tmps[read_idx];
-                P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
-                w_arr[n_iter]       = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+                int read_idx      = bid * in_pack_count + n_iter * tnum + threadIdx.x;
+                P reduce_out_pack = tmps[read_idx];
+                P residual_inp_pack;
+                if(!ROW_OPTS || !skip_residual)
+                    residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+                if constexpr(!ROW_OPTS)
+                    w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
                 A reduce_pack;
 #pragma unroll
                 for(int i = 0; i < pack_size; ++i)
                 {
-                    float ar_out           = upcast_s(reduce_out_pack[i]);
-                    float res_inp          = upcast_s(residual_inp_pack[i]);
-                    float rms_inp          = ar_out + res_inp;
+                    float rms_inp = upcast_s(reduce_out_pack[i]);
+                    if(!ROW_OPTS || !skip_residual)
+                        rms_inp += upcast_s(residual_inp_pack[i]);
                     rms_inp_f32[n_iter][i] = rms_inp;
                     reduce_pack[i]         = rms_inp * rms_inp;
                 }
-                square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+                if constexpr(ROW_OPTS)
+                {
+                    // Write residual_out here so rows that skip the norm still get it.
+                    if(do_norm)
+                    {
+                        w_arr[n_iter] =
+                            *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+                        square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+                    }
+                    P rmsnorm_inp;
+#pragma unroll
+                    for(int i = 0; i < pack_size; ++i)
+                        rmsnorm_inp[i] = downcast_s<T>(rms_inp_f32[n_iter][i]);
+                    *(reinterpret_cast<P*>(residual_out) + read_idx) = rmsnorm_inp;
+                }
+                else
+                {
+                    square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+                }
             }
         }
+        if(!do_norm)
+            continue;
         smem[threadIdx.x] = square_sum;
         __syncthreads();
         smemReduceSum<tnum>(&smem[0]);
@@ -1630,8 +1687,8 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
 #pragma unroll
                 for(int i = 0; i < pack_size; ++i)
                 {
-                    float x_f32     = rms_inp_f32[n_iter][i];
-                    float w_f32     = upcast_s(w_arr[n_iter][i]);
+                    float x_f32 = rms_inp_f32[n_iter][i];
+                    float w_f32 = upcast_s(w_arr[n_iter][i]);
                     if constexpr(GEMMA_NORM)
                         w_f32 += 1.0f;
                     rmsnorm_inp[i]  = downcast_s<T>(x_f32);
@@ -1640,7 +1697,8 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                 int read_idx         = bid * in_pack_count + n_iter * tnum + threadIdx.x;
                 int output_write_idx = bid * out_pack_count + n_iter * tnum + threadIdx.x;
                 *(reinterpret_cast<P*>(results) + output_write_idx) = rmsnorm_rslt;
-                *(reinterpret_cast<P*>(residual_out) + read_idx)    = rmsnorm_inp;
+                if constexpr(!ROW_OPTS)
+                    *(reinterpret_cast<P*>(residual_out) + read_idx) = rmsnorm_inp;
             }
         }
         for(int tail_offset = threadIdx.x; tail_offset < tail_pack_count; tail_offset += blockDim.x)
@@ -2906,7 +2964,9 @@ __global__ void __launch_bounds__(1024, 1)
                                    int size,
                                    int hidden_dim,
                                    float eps,
-                                   T* __restrict__ bf16_output = nullptr)
+                                   T* __restrict__ bf16_output = nullptr,
+                                   int norm_rows      = std::numeric_limits<int>::max(),
+                                   bool skip_residual = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -2971,18 +3031,30 @@ __global__ void __launch_bounds__(1024, 1)
         idx += gridDim.x * hidden_dim, tidx += gridDim.x)
     {
         P vec = tmps[rank][idx / pack_size];
-        P res = *reinterpret_cast<P*>(residual_inp + idx);
-#pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-        {
-            vec[v] += res[v];
-        }
-        *reinterpret_cast<P*>(residual_out + idx) = vec;
+        // Add the residual in fp32 and normalize that sum, as the 1-stage kernel
+        // does; only residual_out is rounded to T.
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
             acc[v] = upcast_s(vec[v]);
         }
+        if(!skip_residual)
+        {
+            P res = *reinterpret_cast<P*>(residual_inp + idx);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                acc[v] += upcast_s(res[v]);
+            }
+        }
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            vec[v] = downcast_s<T>(acc[v]);
+        }
+        *reinterpret_cast<P*>(residual_out + idx) = vec;
+        if(tidx >= norm_rows)
+            continue;
         ar_fusion_epilogue<P, A, T, OutT, pack_size, GEMMA_NORM>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out,
             /*active=*/true, bf16_output);
@@ -3003,11 +3075,15 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              int hidden_dim,
                                              float eps,
                                              hipStream_t stream,
-                                             T* bf16_output = nullptr)
+                                             T* bf16_output     = nullptr,
+                                             int num_norm_rows  = -1,
+                                             bool skip_residual = false)
 {
     constexpr int PACK_SIZE = 16 / sizeof(T);
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
     int token_num           = size / hidden_dim;
+    // num_norm_rows < 0 normalizes every row.
+    int norm_rows = (num_norm_rows < 0 || num_norm_rows > token_num) ? token_num : num_norm_rows;
     dim3 threadsPerBlock(BLOCK_SIZE);
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
@@ -3025,7 +3101,9 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                                             size,
                                                             hidden_dim,
                                                             eps,
-                                                            bf16_output);
+                                                            bf16_output,
+                                                            norm_rows,
+                                                            skip_residual);
 }
 
 // Per-group quant variant of the 2-stage kernel.
@@ -5158,6 +5236,13 @@ void dispatchAllGatherV(hipStream_t stream,
     }
 }
 
+// Max rows for the single-kernel 2-stage fused AR+RMSNorm. It runs one block
+// per row with the grid capped at kMaxBlocks, so above kMaxBlocks rows blocks
+// loop over rows and reduce-scatter + local RMSNorm is faster. MI355X TP4,
+// bf16, hidden 7168: 1.08-1.10x at <= 80 rows, 0.94x at 88, 0.79x at 8192.
+// TP2/TP8 use the TP4 value until measured.
+static constexpr int kFusedArRms2StageMaxRows = kMaxBlocks;
+
 template <typename T>
 void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    T* input,
@@ -5171,8 +5256,18 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    int n,
                                    int out_n,
                                    bool use_1stage,
-                                   bool gemma_norm = false)
+                                   bool gemma_norm    = false,
+                                   int num_norm_rows  = -1,
+                                   bool skip_residual = false)
 {
+    // The 1-stage kernel always adds the residual and normalizes every row.
+    if(use_1stage && (skip_residual || (num_norm_rows >= 0 && num_norm_rows < m)))
+    {
+        throw std::runtime_error("fused allreduce rmsnorm: skip_residual and num_norm_rows < m "
+                                 "require use_1stage=false");
+    }
+    if(num_norm_rows < 0 || num_norm_rows > m)
+        num_norm_rows = m;
     auto d   = 16 / sizeof(T);
     int size = m * n;
     if(size % d != 0)
@@ -5244,6 +5339,32 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         return;                                                                            \
     }
 
+    // Single-kernel 2-stage fused AR+RMSNorm: each block owns complete tokens
+    // in both stages, so RMSNorm folds into the allgather. Other shapes take
+    // reduce-scatter + local RMSNorm below. The block must be whole 32-lane
+    // groups: ar_fusion_epilogue_block_reduce drops a partial one.
+    const int fused_block_size = n / pack_size;
+    const bool use_fused_2stage =
+        !use_1stage && out_n == n && input_hidden_dim == n && m <= kFusedArRms2StageMaxRows &&
+        fused_block_size >= world_size_ && fused_block_size % world_size_ == 0 &&
+        fused_block_size % 32 == 0 && fused_block_size <= 1024;
+    if(use_fused_2stage)
+    {
+        fusedAllReduceRMSNorm2Stage<T>(stream,
+                                       ptrs,
+                                       residual_inp,
+                                       residual_out,
+                                       output,
+                                       weight,
+                                       eps,
+                                       size,
+                                       n,
+                                       gemma_norm,
+                                       num_norm_rows,
+                                       skip_residual);
+        return;
+    }
+
     // step 1, run reduce-scatter + allgather cross device save
     dim3 block(512);
     int block_num = ((size / world_size_) + 512 - 1) / 512;
@@ -5270,212 +5391,67 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
 
 #undef MAYBE_DISPATCH_1S_KERNEL
 
-    // step 2, run allgather local device load + rmsnorm
-    int n_bytes  = n * sizeof(T);
-    auto setGrid = [&](int naive_grid_size, const void* kernel_ptr) {
-        int occupancy;
-        hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel_ptr, block.x, 0);
-        grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
-    };
-
-#define launch_fused_allreduce_rmsnorm_pad(template_kernel, gemma_template_kernel)                            \
-    do                                                                                 \
-    {                                                                                  \
-        if(gemma_norm)                                                                 \
-        {                                                                              \
-            auto kernel_ptr = reinterpret_cast<const void*>(gemma_template_kernel);     \
-            setGrid(naive_grid_size, kernel_ptr);                                      \
-            gemma_template_kernel<<<grid, block, 0, stream>>>(                         \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n); \
-        }                                                                              \
-        else                                                                           \
-        {                                                                              \
-            auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);           \
-            setGrid(naive_grid_size, kernel_ptr);                                      \
-            template_kernel<<<grid, block, 0, stream>>>(                               \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n); \
-        }                                                                              \
-    } while(0)
-
-#define launch_fused_allreduce_rmsnorm(template_kernel, gemma_template_kernel)                         \
-    do                                                                          \
-    {                                                                           \
-        if(gemma_norm)                                                          \
-        {                                                                       \
-            auto kernel_ptr = reinterpret_cast<const void*>(gemma_template_kernel); \
-            setGrid(naive_grid_size, kernel_ptr);                               \
-            gemma_template_kernel<<<grid, block, 0, stream>>>(                  \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
-        }                                                                       \
-        else                                                                    \
-        {                                                                       \
-            auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);    \
-            setGrid(naive_grid_size, kernel_ptr);                               \
-            template_kernel<<<grid, block, 0, stream>>>(                        \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
-        }                                                                       \
-    } while(0)
-
-    // n_packs = number of vectorized elements per row
-    constexpr int ar_pack_size = 16 / sizeof(T);
-    int n_packs                = n / ar_pack_size;
-    if(out_n != n)
-    {
-        if(n_packs >= 256)
-        {
-            int n_loop          = (n_packs + 511) / 512;
-            int naive_grid_size = m;
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 1, false>), (local_device_load_rmsnorm<T, 512, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 2, false>), (local_device_load_rmsnorm<T, 512, 2, true>));
-                break;
-            case 3:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 3, false>), (local_device_load_rmsnorm<T, 512, 3, true>));
-                break;
-            case 4:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 4, false>), (local_device_load_rmsnorm<T, 512, 4, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm pad: n too large, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-        else if(n_packs >= 64)
-        {
-            block.x             = 256;
-            int n_loop          = (n_packs + 255) / 256;
-            int naive_grid_size = m;
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 256, 1, false>), (local_device_load_rmsnorm<T, 256, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 256, 2, false>), (local_device_load_rmsnorm<T, 256, 2, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm pad: n too large for tnum=256, m=" +
-                    std::to_string(m) + " n=" + std::to_string(n) +
-                    " n_loop=" + std::to_string(n_loop));
-            }
-        }
-        else
-        {
-            throw std::runtime_error(
-                "fused allreduce rmsnorm pad: n too small, m=" + std::to_string(m) +
-                " n=" + std::to_string(n) + " n_packs=" + std::to_string(n_packs) +
-                " (need n_packs >= 64, i.e. n >= " + std::to_string(64 * ar_pack_size) + ")");
-        }
-        return;
-    }
-    // Choose tnum (block size, must be power of 2) and n_loop
-    // local_device_load_rmsnorm handles bounds check for n_packs < tnum * n_loop
-    if(n_packs >= 256)
-    {
-        // tnum=512, n_loop = ceil(n_packs / 512)
-        int n_loop          = (n_packs + 511) / 512;
-        int naive_grid_size = m;
-        if(n_packs == 512 * n_loop)
-        {
-            // exact fit -> use naive (no bounds check, slightly faster)
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 1, false>), (local_device_load_rmsnorm_naive<T, 512, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 2, false>), (local_device_load_rmsnorm_naive<T, 512, 2, true>));
-                break;
-            case 3:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 3, false>), (local_device_load_rmsnorm_naive<T, 512, 3, true>));
-                break;
-            case 4:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 4, false>), (local_device_load_rmsnorm_naive<T, 512, 4, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-        else
-        {
-            // non-exact -> use bounds-checked version
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 1, false>), (local_device_load_rmsnorm<T, 512, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 2, false>), (local_device_load_rmsnorm<T, 512, 2, true>));
-                break;
-            case 3:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 3, false>), (local_device_load_rmsnorm<T, 512, 3, true>));
-                break;
-            case 4:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 4, false>), (local_device_load_rmsnorm<T, 512, 4, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-    }
-    else if(n_packs >= 64)
-    {
-        block.x             = 256;
-        int n_loop          = (n_packs + 255) / 256;
-        int naive_grid_size = m;
-        if(n_packs == 256 * n_loop)
-        {
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 1, false>), (local_device_load_rmsnorm_naive<T, 256, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 2, false>), (local_device_load_rmsnorm_naive<T, 256, 2, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm: n too large for tnum=256, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-        else
-        {
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 256, 1, false>), (local_device_load_rmsnorm<T, 256, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 256, 2, false>), (local_device_load_rmsnorm<T, 256, 2, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm: n too large for tnum=256, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-    }
+    // step 2, run allgather local device load + rmsnorm. Plain callers use the
+    // ROW_OPTS=false kernels (main's code path).
+    if(skip_residual || num_norm_rows < m)
+        localRMSNorm<T, true>(stream,
+                              residual_inp,
+                              residual_out,
+                              output,
+                              weight,
+                              eps,
+                              m,
+                              n,
+                              out_n,
+                              gemma_norm,
+                              num_norm_rows,
+                              skip_residual,
+                              num_cu);
     else
-    {
-        throw std::runtime_error(
-            "fused allreduce rmsnorm: n too small, m=" + std::to_string(m) +
-            " n=" + std::to_string(n) + " n_packs=" + std::to_string(n_packs) +
-            " (need n_packs >= 64, i.e. n >= " + std::to_string(64 * ar_pack_size) + ")");
-    }
-
-#undef launch_fused_allreduce_rmsnorm_pad
+        localRMSNorm<T, false>(stream,
+                               residual_inp,
+                               residual_out,
+                               output,
+                               weight,
+                               eps,
+                               m,
+                               n,
+                               out_n,
+                               gemma_norm,
+                               num_norm_rows,
+                               skip_residual,
+                               num_cu);
 }
+
+// Defined after the class, so that the instances AITER_CUSTOM_AR_EXT_INSTANCES
+// declares extern compile only in custom_all_reduce_ext.cu.
+template <typename T>
+void fusedAllReduceRMSNorm2Stage(hipStream_t stream,
+                                 RankData* ptrs,
+                                 T* residual_inp,
+                                 T* residual_out,
+                                 T* output,
+                                 T* weight,
+                                 float eps,
+                                 int size,
+                                 int n,
+                                 bool gemma_norm,
+                                 int num_norm_rows,
+                                 bool skip_residual);
+template <typename T, bool ROW_OPTS>
+void localRMSNorm(hipStream_t stream,
+                  T* residual_inp,
+                  T* residual_out,
+                  T* output,
+                  T* weight,
+                  float eps,
+                  int m,
+                  int n,
+                  int out_n,
+                  bool gemma_norm,
+                  int num_norm_rows,
+                  bool skip_residual,
+                  uint32_t num_cu);
 
 template <typename T, typename QT>
 void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
@@ -5987,6 +5963,214 @@ void dispatchAllReduceMhcPostSplit(hipStream_t stream,
     }
 }
 };
+
+template <typename T>
+void CustomAllreduce::fusedAllReduceRMSNorm2Stage(hipStream_t stream,
+                                                  RankData* ptrs,
+                                                  T* residual_inp,
+                                                  T* residual_out,
+                                                  T* output,
+                                                  T* weight,
+                                                  float eps,
+                                                  int size,
+                                                  int n,
+                                                  bool gemma_norm,
+                                                  int num_norm_rows,
+                                                  bool skip_residual)
+{
+    using Launcher = decltype(&allreduce_fusion_kernel_2stage_launcher<T, T, 2>);
+    Launcher launcher;
+#define FUSED_2STAGE_LAUNCHER(NGPUS)                                         \
+    (gemma_norm ? allreduce_fusion_kernel_2stage_launcher<T, T, NGPUS, true> \
+                : allreduce_fusion_kernel_2stage_launcher<T, T, NGPUS, false>)
+    switch(world_size_)
+    {
+    case 8: launcher = FUSED_2STAGE_LAUNCHER(8); break;
+    case 4: launcher = FUSED_2STAGE_LAUNCHER(4); break;
+    case 2: launcher = FUSED_2STAGE_LAUNCHER(2); break;
+    default:
+        throw std::runtime_error("fused allreduce rmsnorm: unsupported world_size=" +
+                                 std::to_string(world_size_));
+    }
+#undef FUSED_2STAGE_LAUNCHER
+    launcher(ptrs,
+             sg_,
+             self_sg_,
+             rank_,
+             residual_inp,
+             residual_out,
+             output,
+             weight,
+             nullptr,
+             size,
+             n,
+             eps,
+             stream,
+             nullptr,
+             num_norm_rows,
+             skip_residual);
+}
+
+// ROW_OPTS selects the local RMSNorm kernels' row options (skip_residual,
+// num_norm_rows < m); every launch passes them, ROW_OPTS=false kernels ignore them.
+template <typename T, bool ROW_OPTS>
+void CustomAllreduce::localRMSNorm(hipStream_t stream,
+                                   T* residual_inp,
+                                   T* residual_out,
+                                   T* output,
+                                   T* weight,
+                                   float eps,
+                                   int m,
+                                   int n,
+                                   int out_n,
+                                   bool gemma_norm,
+                                   int num_norm_rows,
+                                   bool skip_residual,
+                                   uint32_t num_cu)
+{
+    dim3 block(512);
+    dim3 grid;
+    auto setGrid = [&](int naive_grid_size, const void* kernel_ptr) {
+        int occupancy;
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel_ptr, block.x, 0);
+        grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
+    };
+    auto launch_local_rmsnorm = [&](auto kernel, int naive_grid_size, auto... dims) {
+        setGrid(naive_grid_size, reinterpret_cast<const void*>(kernel));
+        hipLaunchKernelGGL(kernel,
+                           grid,
+                           block,
+                           0,
+                           stream,
+                           sg_,
+                           residual_inp,
+                           residual_out,
+                           output,
+                           weight,
+                           eps,
+                           rank_,
+                           m,
+                           n,
+                           dims...,
+                           num_norm_rows,
+                           skip_residual);
+    };
+#define LAUNCH_LOCAL_RMSNORM(KERNEL, TNUM, NLOOP, ...)                    \
+do                                                                        \
+{                                                                         \
+    if(gemma_norm)                                                        \
+        launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, true, ROW_OPTS>,      \
+                             naive_grid_size __VA_OPT__(, ) __VA_ARGS__); \
+    else                                                                  \
+        launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, false, ROW_OPTS>,     \
+                             naive_grid_size __VA_OPT__(, ) __VA_ARGS__); \
+} while(0)
+
+    // n_packs = number of vectorized elements per row
+    constexpr int ar_pack_size = 16 / sizeof(T);
+    int n_packs                = n / ar_pack_size;
+    if(out_n != n)
+    {
+        if(n_packs >= 256)
+        {
+            int n_loop          = (n_packs + 511) / 512;
+            int naive_grid_size = m;
+            switch(n_loop)
+            {
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 1, out_n); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 2, out_n); break;
+            case 3: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 3, out_n); break;
+            case 4: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 4, out_n); break;
+            default:
+                throw std::runtime_error(
+                    "fused allreduce rmsnorm pad: n too large, m=" + std::to_string(m) +
+                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
+            }
+        }
+        else if(n_packs >= 64)
+        {
+            // 64 <= n_packs < 256 is one pass of 256 threads (n_loop 1).
+            block.x             = 256;
+            int naive_grid_size = m;
+            LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 1, out_n);
+        }
+        else
+        {
+            throw std::runtime_error(
+                "fused allreduce rmsnorm pad: n too small, m=" + std::to_string(m) +
+                " n=" + std::to_string(n) + " n_packs=" + std::to_string(n_packs) +
+                " (need n_packs >= 64, i.e. n >= " + std::to_string(64 * ar_pack_size) + ")");
+        }
+        return;
+    }
+    // Choose tnum (block size, must be power of 2) and n_loop
+    // local_device_load_rmsnorm handles bounds check for n_packs < tnum * n_loop
+    if(n_packs >= 256)
+    {
+        // tnum=512, n_loop = ceil(n_packs / 512)
+        int n_loop          = (n_packs + 511) / 512;
+        int naive_grid_size = m;
+        if(n_packs == 512 * n_loop)
+        {
+            // exact fit -> use naive (no bounds check, slightly faster)
+            switch(n_loop)
+            {
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 1); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 2); break;
+            case 3: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 3); break;
+            case 4: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 4); break;
+            default:
+                throw std::runtime_error(
+                    "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
+                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
+            }
+        }
+        else
+        {
+            // non-exact -> use bounds-checked version
+            switch(n_loop)
+            {
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 1, out_n); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 2, out_n); break;
+            case 3: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 3, out_n); break;
+            case 4: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 4, out_n); break;
+            default:
+                throw std::runtime_error(
+                    "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
+                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
+            }
+        }
+    }
+    else if(n_packs >= 64)
+    {
+        // 64 <= n_packs < 256 is one pass of 256 threads (n_loop 1) and never
+        // an exact fit, so it takes the bounds-checked kernel.
+        block.x             = 256;
+        int naive_grid_size = m;
+        LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 1, out_n);
+    }
+    else
+    {
+        throw std::runtime_error(
+            "fused allreduce rmsnorm: n too small, m=" + std::to_string(m) +
+            " n=" + std::to_string(n) + " n_packs=" + std::to_string(n_packs) +
+            " (need n_packs >= 64, i.e. n >= " + std::to_string(64 * ar_pack_size) + ")");
+    }
+
+#undef LAUNCH_LOCAL_RMSNORM
+}
+
+// These instances compile only in csrc/kernels/custom_all_reduce_ext.cu, in
+// parallel with custom_all_reduce.cu, which sees them as extern.
+#define AITER_CUSTOM_AR_EXT_INSTANCES(EXTERN, T)                                       \
+    EXTERN template void CustomAllreduce::fusedAllReduceRMSNorm2Stage<T>(               \
+        hipStream_t, RankData*, T*, T*, T*, T*, float, int, int, bool, int, bool);      \
+    EXTERN template void CustomAllreduce::localRMSNorm<T, true>(                        \
+        hipStream_t, T*, T*, T*, T*, float, int, int, int, bool, int, bool, uint32_t);
+AITER_CUSTOM_AR_EXT_INSTANCES(extern, opus::fp32_t)
+AITER_CUSTOM_AR_EXT_INSTANCES(extern, opus::fp16_t)
+AITER_CUSTOM_AR_EXT_INSTANCES(extern, opus::bf16_t)
+
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:

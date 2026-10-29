@@ -15,7 +15,9 @@
  * limitations under the License.
  */
 // Instances split out of custom_all_reduce.cu so that they compile in parallel
-// with it: the residual all-reduce (HAS_RESIDUAL kernels).
+// with it: the residual all-reduce (HAS_RESIDUAL kernels), and the row-option
+// local RMSNorm and single-kernel 2-stage fused AR+RMSNorm that
+// custom_all_reduce.cuh declares extern (AITER_CUSTOM_AR_EXT_INSTANCES).
 #include "custom_all_reduce.cuh"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
@@ -82,5 +84,9 @@ void all_reduce_residual(fptr_t _fa,
     }
 #undef DISPATCH_AR_RESIDUAL
 }
+
+AITER_CUSTOM_AR_EXT_INSTANCES(, opus::fp32_t)
+AITER_CUSTOM_AR_EXT_INSTANCES(, opus::fp16_t)
+AITER_CUSTOM_AR_EXT_INSTANCES(, opus::bf16_t)
 
 } // namespace aiter

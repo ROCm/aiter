@@ -2236,9 +2236,38 @@ class CustomAllreduce:
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
         emit_bf16: bool = False,
+        num_norm_rows: int = -1,
+        skip_residual: bool = False,
     ):
         valid_dim = w.numel()
-        if not self.can_fuse_ar_rms(inp, valid_dim, out_hidden_dim or inp.shape[-1]):
+        rows = inp.numel() // inp.shape[-1]
+        # Width of the output the call writes, including one it allocates below;
+        # a padded width takes the pad kernel, which has no row options.
+        out_dim = (
+            out.shape[-1] if out is not None else (out_hidden_dim or inp.shape[-1])
+        )
+        if skip_residual or 0 <= num_norm_rows < rows:
+            # Only the plain 2-stage kernels implement these options.
+            if self._is_gfx1250:
+                raise ValueError(
+                    "skip_residual and num_norm_rows < rows are not supported on gfx1250"
+                )
+            if use_1stage:
+                raise ValueError(
+                    "skip_residual and num_norm_rows < rows require use_1stage=False"
+                )
+            if (
+                post_per_token_quant
+                or inp.shape[-1] != valid_dim
+                or out_dim != valid_dim
+            ):
+                raise ValueError(
+                    "skip_residual and num_norm_rows are not supported with "
+                    "quant or padded fused allreduce rmsnorm"
+                )
+        # Check the width the call writes: a padded caller-provided out takes the
+        # pad kernel, which gfx1250 does not have.
+        if not self.can_fuse_ar_rms(inp, valid_dim, out_dim):
             raise RuntimeError(
                 "gfx1250 fused_ar_rms needs a contiguous, unpadded row of at most "
                 "1024 16-byte packs"
@@ -2251,7 +2280,6 @@ class CustomAllreduce:
         reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
             if out is None:
-                out_dim = out_hidden_dim or inp.shape[-1]
                 out = torch.empty(
                     inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device
                 )
@@ -2269,6 +2297,8 @@ class CustomAllreduce:
                     reg_bytes,
                     use_1stage,
                     gemma_norm,
+                    # The gfx1250 op has no row options.
+                    *(() if self._is_gfx1250 else (num_norm_rows, skip_residual)),
                 )
             else:
                 ops.fused_allreduce_rmsnorm_pad(
@@ -2330,6 +2360,10 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
+        residual_out: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        num_norm_rows: int = -1,
+        skip_residual: bool = False,
     ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -2339,37 +2373,53 @@ class CustomAllreduce:
                 return self.fused_ar_rms(
                     input,
                     residual_inp,
+                    res_out=residual_out,
+                    out=out,
                     w=weight,
                     eps=eps,
                     registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
+                    num_norm_rows=num_norm_rows,
+                    skip_residual=skip_residual,
                 )
             else:
+                # Warmup: hand back the caller's buffers, as the eager and
+                # captured calls do, so their shapes (e.g. num_norm_rows rows
+                # of out) carry through. Zero them, as the allocated ones are.
                 out_dim = out_hidden_dim or input.shape[-1]
-                return (
-                    torch.zeros(
+                if out is None:
+                    out = torch.zeros(
                         input.shape[:-1] + (out_dim,),
                         dtype=input.dtype,
                         device=input.device,
-                    ),
-                    torch.zeros(
+                    )
+                else:
+                    out.zero_()
+                if residual_out is None:
+                    residual_out = torch.zeros(
                         input.shape[:-1] + (weight.numel(),),
                         dtype=input.dtype,
                         device=input.device,
-                    ),
-                )
+                    )
+                else:
+                    residual_out.zero_()
+                return out, residual_out
         else:
             return self.fused_ar_rms(
                 input,
                 residual_inp,
+                res_out=residual_out,
+                out=out,
                 w=weight,
                 eps=eps,
                 registered=False,
                 use_1stage=use_1stage,
                 out_hidden_dim=out_hidden_dim,
                 gemma_norm=gemma_norm,
+                num_norm_rows=num_norm_rows,
+                skip_residual=skip_residual,
             )
 
     def custom_fused_ar_rms_packed_input(
