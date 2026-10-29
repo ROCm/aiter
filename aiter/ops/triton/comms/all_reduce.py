@@ -4,7 +4,6 @@ import torch
 import torch.distributed as dist
 import triton
 
-from aiter.dist.cuda_wrapper import find_loaded_library
 from aiter.ops.triton._gluon_kernels.gfx1250.comms.all_reduce import (
     _all_reduce_kernel,
 )
@@ -16,14 +15,7 @@ _LOGGER = AiterTritonLogger()
 _LINES = 64  # lines of a chunk: 2 for each lane of one wave
 _MAXIT = 20_000_000  # poll limit, some seconds: a peer can still be compiling
 _PROGRAMS = 2048  # receivers: more polling receivers can fill the GPU
-
-
-class _IpcHandle(ctypes.Structure):  # hipIpcMemHandle_t
-    _fields_ = [("data", ctypes.c_byte * 64)]
-
-
-def _check(err):
-    assert err == 0, f"HIP error {err}"
+_POOLS = {}  # the IPC pool of each inbox, by its address: the pool owns the inbox
 
 
 def all_reduce_init(group, max_bytes):
@@ -36,50 +28,41 @@ def all_reduce_init(group, max_bytes):
         tuple: The inbox addresses of ranks 0 to 3, and the int32 call counters
         of this rank. calls[-1] counts the polls that timed out.
     """
-    from aiter.dist.device_communicators.custom_all_reduce import _should_use_vmm
+    from aiter.dist.device_communicators.custom_all_reduce import (
+        IPCBufferPool,
+        _loaded_hip_runtime,
+        _should_use_vmm,
+    )
 
     assert get_arch() == "gfx1250" and dist.get_world_size(group) == 4
     assert not _should_use_vmm(True), "needs ROCm 7.14 or later for hipIpc"
-    hip = ctypes.CDLL(find_loaded_library("libamdhip64"))
     # A chunk of 64 lines of 16 bytes and 2 call counters for each 512 bytes of x.
     chunks = triton.cdiv(max_bytes, 8 * _LINES)
-    size = ctypes.c_size_t(2 * 4 * chunks * _LINES * 16)  # 2 banks x 4 senders
-    inbox = ctypes.c_void_p()
-    handle = _IpcHandle()
-    _check(hip.hipMalloc(ctypes.byref(inbox), size))
-    _check(hip.hipMemset(inbox, 0, size))  # 0 is never a call number
-    _check(hip.hipIpcGetMemHandle(ctypes.byref(handle), inbox))
+    size = 2 * 4 * chunks * _LINES * 16  # 2 banks x 4 senders
+    device = torch.device("cuda", torch.cuda.current_device())
+    pool = IPCBufferPool(device, group)
+    # Cached memory (hipMalloc): the polls are slower on uncached memory.
+    inbox = pool.create("inbox", size, raw_cached=True)
+    err = _loaded_hip_runtime().hipMemset(
+        ctypes.c_void_p(inbox.data_ptr), 0, ctypes.c_size_t(size)
+    )
+    assert err == 0, f"hipMemset failed: {err}"  # 0 is never a tag
     torch.cuda.synchronize()
-
-    handles = [None] * 4
-    dist.all_gather_object(handles, bytes(handle), group=group)
-    inboxes = []
-    for rank, h in enumerate(handles):
-        if rank == dist.get_rank(group):
-            inboxes.append(inbox.value)
-            continue
-        peer = ctypes.c_void_p()
-        h = _IpcHandle.from_buffer_copy(h)
-        _check(hip.hipIpcOpenMemHandle(ctypes.byref(peer), h, 1))
-        inboxes.append(peer.value)
-
-    device = torch.cuda.current_device()
+    inboxes = tuple(pool.open_peer_buffers("inbox"))
+    _POOLS[inboxes[dist.get_rank(group)]] = pool
     calls = torch.zeros(2 * chunks + 1, dtype=torch.int32, device=device)
-    return tuple(inboxes), calls
+    return inboxes, calls
 
 
 def all_reduce_free(group, inboxes):
     """Unmaps the peer inboxes and frees the inbox of this rank. All ranks must
     call it."""
-    hip = ctypes.CDLL(find_loaded_library("libamdhip64"))
-    rank = dist.get_rank(group)
+    pool = _POOLS.pop(inboxes[dist.get_rank(group)])
     torch.cuda.synchronize()
     dist.barrier(group=group)
-    for r, address in enumerate(inboxes):
-        if r != rank:
-            _check(hip.hipIpcCloseMemHandle(ctypes.c_void_p(address)))
+    pool.close_peer_buffers()
     dist.barrier(group=group)  # no peer uses the inbox of this rank now
-    _check(hip.hipFree(ctypes.c_void_p(inboxes[rank])))
+    pool.close()
 
 
 def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:

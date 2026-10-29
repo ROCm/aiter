@@ -2,6 +2,8 @@
   "schema": {
     "attn_2d": [
       "D",
+      "Q",
+      "P",
       "SW",
       "SKLT",
       "DT"
@@ -20,6 +22,42 @@
     ]
   },
   "attn_2d": {
+    "D_LEQ_64.Q_LEQ_2.P_LEQ_8.SW.DT_bf16_bf16": {
+      "BLOCK_M": 16,
+      "num_warps": 1,
+      "MFMA_DIM": 16,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 1,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_LEQ_64.Q_LEQ_4.P_LEQ_8.SW.DT_bf16_bf16": {
+      "BLOCK_M": 32,
+      "num_warps": 2,
+      "MFMA_DIM": 16,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 1,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_LEQ_64.Q_LEQ_8.P_LEQ_8.SW.DT_bf16_bf16": {
+      "BLOCK_M": 64,
+      "num_warps": 4,
+      "MFMA_DIM": 16,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 1,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_LEQ_64.Q_LEQ_16.P_LEQ_8.SW.DT_bf16_bf16": {
+      "BLOCK_M": 128,
+      "num_warps": 8,
+      "MFMA_DIM": 16,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 1,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
     "D_LEQ_64.SW": {
       "BLOCK_M": 128,
       "num_warps": 4,

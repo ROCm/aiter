@@ -15,7 +15,9 @@ rename or tune a config file.
    `json.load(open(...))`, function-attribute caches or paths built by hand
    (`f"{AITER_TRITON_CONFIGS_PATH}/..."`).
 3. Use the one layout below. There are no other config folders and no
-   fallback search.
+   fallback search. The only addition is a `<cu_num>cu/` tree for a family
+   tuned on a CU count other than the arch's default (see
+   [CU trees](#cu-trees)).
 4. Do not put the arch in a file name. The default file is `DEFAULT.json`.
 5. Move or rename files in a pure `git mv` commit. Change the contents in the
    next commit.
@@ -57,11 +59,44 @@ configs/gfx942/triton/mhc/mhc_fused_sinkhorn/MHC_FUSED_SINKHORN-C=128.json
 Two config names must not give the same `<d_type>`: `GEMM-FOO-BAR` and
 `GEMM-FOO_BAR` use the same folder.
 
+### CU trees
+
+The plain `<arch>/` folders hold the configs of the CU count the arch was
+tuned on. A family tuned on another CU count, for example a 96-CU
+partition, goes in its own tree under the arch, with its own
+`DEFAULT.json`. The tree has the layout of the plain folder:
+
+```text
+configs/<arch>/<cu_num>cu/<backend>/<op>/<d_type>/DEFAULT.json
+configs/<arch>/<cu_num>cu/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
+configs/gfx1250/96cu/gluon/gemm/gemm_a16w16/GEMM-A16W16-N=7168-K=256.json
+configs/gfx1250/96cu/gluon/moe/a8w4/DEFAULT.json
+```
+
+- `resolve_config_dir()` returns the CU tree when `get_config_cu_num()`
+  matches a tree that has a `DEFAULT.json`, else the plain folder. Every
+  loader goes through it, so every family can have a CU tree.
+  `get_config_cu_num()` is `chip_info.get_cu_num()`: the `CU_NUM` env
+  override, else the device. No CU count means the default: an unreadable
+  count, a missing tree and a GEMM sweep without `--cu-dir` all mean the
+  plain folder.
+- A CU tree is complete on its own. A loader reads it like the plain folder:
+  `DEFAULT.json`, then the specialized files. No file is read across trees:
+  a shape without a file in the CU tree gets the CU tree's `DEFAULT.json`,
+  not the plain shape file. A `<cu_num>cu/` folder without `DEFAULT.json` is
+  not a tree and is ignored.
+- Never make a tree for the count the plain folder was tuned on. That
+  count reads the plain folder.
+- To start a tree, copy the family's `DEFAULT.json` into it, byte identical,
+  and say so in the commit message. For a GEMM family, then tune with
+  `sweep_configs.py --cu-dir` on a partition with that CU count; the install
+  writes only into that tree. Replace the copy with measured values.
+
 ## Loaders
 
 | Module | Functions |
 | ------ | --------- |
-| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `select_leq_config` |
+| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `select_leq_config`, `get_config_cu_num` |
 | `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `clamp_num_buffers`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` |
 | `utils/conv_config_utils.py` | `get_conv_config` and the shape-key helpers |
@@ -77,12 +112,17 @@ have a `"dispatch"` list of rules
 (`{"config", "min_K", "min_N", "min_avg_rows_per_group"}`). The first rule
 that matches selects the config.
 
-- `resolve_config_dir(op, config_name, backend="triton", arch=None)` builds
-  the folder path. It does not search and does not check that files exist.
-  It checks each argument and fails with `AssertionError` on a bad value. The
-  caller sets `backend`: Gluon code passes `"gluon"`. Use `arch=` only for the
-  two allowed fallbacks: MHC uses gfx942 and Triton `fused_clamp_act_mul` uses
-  gfx950.
+- `resolve_config_dir(op, config_name, backend="triton", arch=None, cu_num=DEVICE_CU_NUM)`
+  builds the folder path: the `<cu_num>cu/` tree of the device's CU count
+  when that tree has a `DEFAULT.json`, else the plain folder. Beyond that
+  one probe it does not search and does not check that files exist. It
+  checks each argument and fails with `AssertionError` on a bad value. The
+  caller sets `backend`: Gluon code passes `"gluon"`. Use `arch=` only for
+  the two allowed fallbacks: MHC uses gfx942 and Triton `fused_clamp_act_mul`
+  uses gfx950. `cu_num=None` is the plain folder; an `int` is that count's
+  tree. Only the tuning scripts pass `cu_num`.
+- `get_config_cu_num()` returns the device's CU count, or `None` when it
+  cannot be read. It reads the count once per process; `CU_NUM` overrides it.
 - `load_config_json(fpath, required=True)` raises `FileNotFoundError` with the
   path when a required file is missing. With `required=False` it returns
   `None`. The result is cached per path, also when the file is missing:
@@ -93,9 +133,6 @@ that matches selects the config.
   more than one axis, use `axes=("M", "N")` and keys such as
   `M_LEQ_32.N_LEQ_1024`.
 
-`tuned_config_utils._get_tuned_kernel_entry()` still builds its path by hand.
-Move it to `resolve_config_dir()` when you change it.
-
 ## GEMM
 
 ```python
@@ -104,9 +141,11 @@ get_gemm_config(config_name, M, N=None, K=None, bounds=None,
     -> (config, is_tuned)
 ```
 
-1. It reads `<arch>/<backend>/gemm/<d_type>/DEFAULT.json`. This file must
-   exist.
-2. It uses a specialized file if one matches: `<CONFIG_NAME>-B=..-N=..-K=..`,
+1. `resolve_config_dir()` picks the tree: the `<arch>/<cu_num>cu/` tree of
+   the device's CU count when that tree has a `DEFAULT.json`, else
+   `<arch>/<backend>/gemm/<d_type>/`. It reads that tree's `DEFAULT.json`.
+   This file must exist.
+2. It uses a specialized file of the same tree if one matches: `<CONFIG_NAME>-B=..-N=..-K=..`,
    then `<CONFIG_NAME>-N=..-K=..`, or `<CONFIG_NAME>-<specialized_filename>`.
    A specialized file with `"DEFAULT_FALLBACK": true` gets the buckets that
    it does not have from `DEFAULT.json`.
@@ -225,7 +264,8 @@ in lowercase (`mhc_fused_sinkhorn`).
 2. Add `<arch>/<backend>/<op>/<d_type>/DEFAULT.json`.
 3. Add specialized files next to it, with the `<CONFIG_NAME>-` prefix, for
    example `GEMM-A16W16-N=256-K=7168.json`. For GEMM, run the tuning scripts
-   in `utils/_triton/tuning/`. They write the file into this folder.
+   in `utils/_triton/tuning/`. They write the file into this folder, or with
+   `--cu-dir` into the `<cu_num>cu/` tree of the device's CU count.
 4. Move tuning values that are still in Python into the JSON.
 5. Test on the target arch. Make sure that the config loads, that `is_tuned`
    is `True` for each tuned M and that the results do not change. For GEMM,
