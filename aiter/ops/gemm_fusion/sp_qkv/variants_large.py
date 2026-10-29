@@ -29,7 +29,15 @@ from aiter.gemm_fusion.resources import SHARED_KEY, round_up
 
 from . import large_rt as lrt
 from . import r18_gemm, specs
-from .jit import LARGE_SRC, _sha, build_large, large_defs, src_abi, src_pad_m
+from .jit import (
+    LARGE_SRC,
+    _sha,
+    build_large,
+    large_defs,
+    large_m_max,
+    src_abi,
+    src_pad_m,
+)
 from .small_rt import stream_handle
 
 log = logging.getLogger("aiter.gemm_fusion")
@@ -52,7 +60,7 @@ def large_window_bytes(mode: str, M: int) -> int:
     return round_up(need)
 
 
-def preflight_attach(res, owner: str, M: int, wins, built):
+def preflight_attach(res, owner: str, M: int, wins, built, m_max: int = 8192):
     """Bounded checks of everything lg_attach_v1 needs, each raising a message that names the precondition (so a failure never
     reduces to 'attach failed'): finalized, queue count, devcomm facts, hsaco file + sha, window handles/pointers, rank/M ranges.
     """
@@ -62,9 +70,9 @@ def preflight_attach(res, owner: str, M: int, wins, built):
         raise RuntimeError(
             f"preflight {owner}: SP rank {res.rank} outside 0..3 (r11 kernels: rank == lsaRank; the HIP device index is separate)"
         )
-    if M % 256 or not 256 <= M <= 8192:
+    if M % 256 or not 256 <= M <= m_max:
         raise RuntimeError(
-            f"preflight {owner}: M={M} must be a multiple of 256 in [256, 8192]"
+            f"preflight {owner}: M={M} must be a multiple of 256 in [256, {m_max}]"
         )
     info = getattr(res, "devcomm_info", None)
     if info:
@@ -137,7 +145,10 @@ LARGE_SRC_SHA = {
     "r12": "6b47263546d9189457b3d584fe8219e542a0cd32b19d1a32306c2fda015a7f38",  # R12 (abi 3) + LG_TAG_EARLY / LG_POLL_BATCH (r12b) + the NaN fill folded into quiet_ready, LG_QR_WGS (r12c) + qr_wgs in the launch args / lg_abi_info_v2 (r12d), derived from r11
     "r13": "03d6c758c75665d26f8f3928e6e31520c816ed701efb8b2e09cdc2ea3dfb2b3a",  # R16 (abi 4 = LG_COMM_ABI_VERSION 5): per-launch m_real (lg_launch_v3, tag with m_real), derived from r12; r13g = r13 with the item-epilogue data flow of r12 untouched (ISA clean, byte-identical to r12 at m == M)
     "r18": "46b49e5cd87362987ed26e927077576aa06509df60599248210afb91c38691dc",  # R18 route B (abi 4 = the r13 ABI, LG_COMM_ABI_VERSION 5): large/r18-put = r13 + lg_put_v1 + lg_put_launch_v1; its GEMM is large/r17 (jit.R17_SRC_SHA)
+    "r19": "332532a0946dd06228d4cf6ca3c0c65e083bcf24cf101bddde6cbb9fb9401200",  # ROUTE A (abi 6 = LG_COMM_ABI_VERSION 7 / LgCommArgsV6): r13 + 64 chunks, 14-bit m_real / 18-bit call_id tag, [4][64] control image
 }
+# ROUTE A: the large/r19 manifest is frozen by implementor-lg (15 files, sha256sum -c clean, R19 STATIC ALL PASS).
+LARGE_SRC_SHA_PENDING: tuple[str, ...] = ()
 
 
 @register_variant(
@@ -153,7 +164,9 @@ LARGE_SRC_SHA = {
         m_multiple=256,
         mutates=(),
     ),
-    source_sha=";".join(f"{k}={v}" for k, v in LARGE_SRC_SHA.items()),
+    source_sha=";".join(
+        f"{k}={v}" for k, v in LARGE_SRC_SHA.items() if k not in LARGE_SRC_SHA_PENDING
+    ),
 )
 class SpQkvLarge(Plan):
     n_stages = 1
@@ -167,9 +180,11 @@ class SpQkvLarge(Plan):
         self.mode = specs.mode_of(spec)
         self.M = ctx.m
         large_defs(self.params, self.mode)  # validates params
-        if self.M % 256 or not 256 <= self.M <= 8192:
+        self.src = self.params.get("src", LARGE_SRC)
+        _m_max = large_m_max(self.src)
+        if self.M % 256 or not 256 <= self.M <= _m_max:
             raise ContractError(
-                f"sp_qkv.large.v1 needs local M multiple of 256 in [256, 8192], got {self.M}"
+                f"sp_qkv.large.v1 needs local M multiple of 256 in [256, {_m_max}], got {self.M}"
             )
         self.n = int(self.params.get("n", 1))
         self.half_first = int(self.params.get("half_first", 0))
@@ -186,7 +201,6 @@ class SpQkvLarge(Plan):
                 )
             if self.half_first == 1 and self.n == 1:
                 raise ContractError("half-first needs n >= 2")
-        self.src = self.params.get("src", LARGE_SRC)
         self.abi = src_abi(
             "large", self.src
         )  # 2 = r11 (per-plan poison word); 3 = r12 (per-comm ERR/STEP page, call_id tags; the best-effort NaN fill is folded into quiet_ready, no separate node)
@@ -194,7 +208,7 @@ class SpQkvLarge(Plan):
         # attach refuses a mismatch. r11 has no such knob.
         self.qr_wgs = (
             int(self.params.get("qr_wgs", 64))
-            if self.src in ("r12", "r13", "r18")
+            if self.src in ("r12", "r13", "r18", "r19")
             else None
         )
         self.pad_m = src_pad_m(
@@ -291,7 +305,7 @@ class SpQkvLarge(Plan):
                 wins[self.owner + "/C"],
             )
             preflight_attach(
-                res, self.owner, self.M, wins, built
+                res, self.owner, self.M, wins, built, m_max=large_m_max(self.src)
             )  # bounded, pure-Python, names the failing precondition before the driver call
             diag = (C.c_uint64 * 8)()
             h = lib.lg_attach_v1(
@@ -317,7 +331,7 @@ class SpQkvLarge(Plan):
                     f"devcomm_info={getattr(res, 'devcomm_info', None)}"
                 )
             got = sc[self.owner] = lrt.LargeContext(
-                lib, C.c_void_p(h), self.M, self.F, res.rank
+                lib, C.c_void_p(h), self.M, self.F, res.rank, abi=self.abi
             )
             if self.r18:
                 self._r18_attach(res, got, S)

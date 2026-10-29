@@ -40,18 +40,39 @@ LG_COMM_ABI_VERSION_V3 = 4
 # R16 (r13): LgCommArgsV4 = V3 + {m_real @352, pad4 @356}: 360 bytes, LG_COMM_ABI_VERSION 5; the tag is E = (STEP << 32) | ((m_real - 1) << 19) | (call_id & 0x7FFFF)
 LG_COMM_ARGS_V4_BYTES = 360
 LG_COMM_ABI_VERSION_V4 = 5
-LG_TAG_CALL_BITS = 19  # the low bits of call_id that reach the tag (lg_comm_abi_v4.h LG_TAG_*): the static call_id uniqueness check must hold on these
-LG_TAG_M_SHIFT = 19
-LG_M_REAL_MAX = 8192  # (m_real - 1) must fit the 13 bits above the call_id field
+LG_TAG_CALL_BITS_R13 = 19  # r13 / r18 (ABI 5): the low bits of call_id that reach the tag (lg_comm_abi_v4.h LG_TAG_*)
+LG_TAG_M_SHIFT_R13 = 19
+LG_TAG_CALL_BITS = (
+    18  # ABI current (r19 / ABI 7): the tag word is 14-bit m_real + 18-bit call_id
+)
+LG_TAG_M_SHIFT = 18
+LG_M_REAL_MAX = 16384  # max across the ABI generations (r19: 14 bits of m_real); the per-generation bound is LG_M_REAL_MAX_BY_GEN
+# ROUTE A (large/r19, abi 6): LG_COMM_ABI_VERSION 7 and LgCommArgsV6 (SAME 360 B layout as V4: the m_real/pad words keep their offsets); the 32-bit tag word is
+# repartitioned to 14-bit m_real / 18-bit call_id, M <= 16384 (64 chunks) and the control image is [4][64]. The host launch surface is r13's (lg_launch_v3, no
+# split-K entry): the tag/control changes are device-side, so Python binds the gen-4 surface. ABI 7 does not express the 352 B V3 attribution layout.
+LG_COMM_ARGS_V6_BYTES = 360
+LG_COMM_ABI_VERSION_V6 = 7
+LG_TAG_CALL_BITS_R19 = 18
+LG_TAG_M_SHIFT_R19 = 18
+LG_M_REAL_MAX_R19 = 16384
 _LG_ABI_BY_GEN = {
     3: (LG_COMM_ABI_VERSION_V3, LG_COMM_ARGS_V3_BYTES),
     4: (LG_COMM_ABI_VERSION_V4, LG_COMM_ARGS_V4_BYTES),
+    6: (LG_COMM_ABI_VERSION_V6, LG_COMM_ARGS_V6_BYTES),
 }  # python ABI generation (jit.LARGE_ABI) -> (LG_COMM_ABI_VERSION, sizeof(LgCommArgs))
+# m_real bound of a generation (the tag's m_real field width): r11/r12/r13/r18 = 13 bits (8192), r19 = 14 bits (16384)
+LG_M_REAL_MAX_BY_GEN = {3: 8192, 4: 8192, 6: LG_M_REAL_MAX_R19}
 LG_GF_PEERS_BYTES = 32
 LG_CTAG_OFF, LG_ATAG_OFF = (
     3072,
     3104,
 )  # in the C window; reset by lg_init_control_v1 (zeroes the whole C image)
+# lg_abi_info_v2 out[5] / out[6]: the control-image ctag/atag offsets of a generation; r19's [4][64] image moves them (ABI 7 reports 3712 / 3744)
+LG_CTAG_ATAG_BY_GEN = {
+    3: (LG_CTAG_OFF, LG_ATAG_OFF),
+    4: (LG_CTAG_OFF, LG_ATAG_OFF),
+    6: (3712, 3744),
+}
 CALL_ID_LIMIT = 1 << 31
 
 
@@ -61,7 +82,7 @@ def load_driver(path: str, abi: int = 2):
     build's LG_QR_WGS) for the runtime's static checks."""
     lib = C.CDLL(path)
     vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
-    if abi in (3, 4):
+    if abi in (3, 4, 5, 6):
         lib.lg_attach_v1.restype = vp
         lib.lg_attach_v1.argtypes = [
             u32,
@@ -267,10 +288,9 @@ def check_abi_info(got: dict, qr_wgs: int, gen: int = 3) -> None:
         "err_off": errpage.ERR_OFF,
         "step_off": errpage.STEP_OFF,
         "diag_off": errpage.DIAG_OFF,
-        "ctag_off": LG_CTAG_OFF,
-        "atag_off": LG_ATAG_OFF,
         "peers_bytes": LG_GF_PEERS_BYTES,
     }
+    want["ctag_off"], want["atag_off"] = LG_CTAG_ATAG_BY_GEN[gen]
     bad = {k: (got.get(k), v) for k, v in want.items() if got.get(k) != v}
     if bad:
         raise RuntimeError(f"large driver ABI mismatch (got, expected): {bad}")
@@ -281,8 +301,10 @@ def check_abi_info(got: dict, qr_wgs: int, gen: int = 3) -> None:
 
 
 class LargeContext:
-    def __init__(self, lib, h, M, F, rank):
+    def __init__(self, lib, h, M, F, rank, abi: int = 4):
         self.lib, self.h, self.M, self.F, self.rank = lib, h, M, F, rank
+        self.abi = int(abi)
+        self.m_real_max = LG_M_REAL_MAX_BY_GEN.get(self.abi, LG_M_REAL_MAX)
         self.budget_us = 0  # per-wait poll budget (us) passed to every launch; 0 = the kernel default (50 ms). Set by the plan from FusionResources.wait_budget_us.
 
     def put_launch(self, srows, call_id, stream, m_real, budget_us=None):
@@ -292,7 +314,7 @@ class LargeContext:
         """
         if not 0 <= call_id < CALL_ID_LIMIT:
             raise ValueError(f"call_id {call_id} must be in [0, 2^31)")
-        if not 1 <= m_real <= min(self.M, LG_M_REAL_MAX):
+        if not 1 <= m_real <= min(self.M, self.m_real_max):
             raise ValueError(f"m_real {m_real} must be in [1, M={self.M}]")
         if not m_real <= srows <= self.M:
             raise ValueError(f"srows {srows} must be in [m_real={m_real}, M={self.M}]")
@@ -361,7 +383,7 @@ class LargeContext:
         if (
             m_real is not None
         ):  # R16 pad-M (r13): the real rows of this launch; 1 <= m_real <= the bucket M the plan was built for (the driver refuses others with -105)
-            if not 1 <= m_real <= min(self.M, LG_M_REAL_MAX):
+            if not 1 <= m_real <= min(self.M, self.m_real_max):
                 raise ValueError(f"m_real {m_real} must be in [1, M={self.M}]")
             rc = self.lib.lg_launch_v3(
                 self.h,

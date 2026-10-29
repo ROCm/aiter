@@ -83,12 +83,15 @@ def check_call_ids(
     tag_bits: int | None = None,
     tag_vids: Iterable[str] | None = None,
     per_tokens: bool = False,
+    tag_bits_by_token: dict[int, int] | Callable[[int], int | None] | None = None,
 ) -> CallIdReport:
     """Static uniqueness check over a set of keys (duplicates of the SAME key are one key, never a collision).
     per_tokens (R16): only keys of ONE token count can meet in a handshake (one forward pass), so require distinct ids within each token count instead of across the whole set (over the
     pad-M universe of every real m, global 31-bit uniqueness is impossible: ~480k keys collide ~50 times by the birthday bound, and was never needed).
     tag_bits (R16, large r13: 19): ALSO require the low tag_bits of the ids of the keys whose variant is in tag_vids (default: all) to be distinct per token count and non-zero: the r13
-    tag carries only those bits of call_id next to the real rows."""
+    tag carries only those bits of call_id next to the real rows.
+    tag_bits_by_token (ROUTE A): the tag width is per TOKEN COUNT instead (r13/r18 19 low bits, r19 18: a profile may carry both families, one family per token count); a dict or a
+    tokens -> width callable; None skips that token count."""
     distinct = sorted({tuple(k) for k in keys})
     by_id: dict[int, list[CallKey]] = {}
     for k in distinct:
@@ -103,13 +106,24 @@ def check_call_ids(
         if len(ks) > 1:
             rep.collisions[cid] = ks
     rep.zero_id = list(by_id.get(0, []))
-    if tag_bits is not None:
-        mask = (1 << tag_bits) - 1
+    if tag_bits is not None or tag_bits_by_token is not None:
         vids = None if tag_vids is None else set(tag_vids)
+
+        def _bits(tokens: int) -> int | None:
+            if tag_bits_by_token is None:
+                return tag_bits
+            if callable(tag_bits_by_token):
+                return tag_bits_by_token(tokens)
+            return tag_bits_by_token.get(tokens, tag_bits)
+
         by_low: dict[tuple[int, int], list[CallKey]] = {}
         for cid, ks in by_id.items():
             for k in ks:
                 if vids is None or k[2] in vids:
+                    bits = _bits(k[1])
+                    if bits is None:
+                        continue
+                    mask = (1 << bits) - 1
                     by_low.setdefault((k[1], cid & mask), []).append(k)
         for (tokens, low), ks in sorted(by_low.items()):
             if low == 0:
@@ -120,7 +134,10 @@ def check_call_ids(
 
 
 def tag_unique_ids(
-    keys: Iterable[CallKey], key_fn: KeyFn = decision_key, tag_bits: int = 19
+    keys: Iterable[CallKey],
+    key_fn: KeyFn = decision_key,
+    tag_bits: int = 19,
+    tag_bits_by_token: dict[int, int] | Callable[[int], int | None] | None = None,
 ) -> dict[CallKey, int]:
     """call_ids whose LOW tag_bits are distinct and non-zero within every token count BY CONSTRUCTION (R16, large r13): low = 1 + the ordinal of (site, vid, n_fused) in the sorted
     set of distinct triples, the high bits from key_fn (so the id stays a 31-bit key with the hash's entropy above the tag field). Rank-uniform (a pure function of the key set,
@@ -128,16 +145,26 @@ def tag_unique_ids(
     """
     distinct = sorted({tuple(k) for k in keys})
     triples = sorted({(k[0], k[2], k[3]) for k in distinct})
-    if len(triples) >= (1 << tag_bits):
+
+    def _bits(tokens: int) -> int:
+        if tag_bits_by_token is None:
+            return tag_bits
+        if callable(tag_bits_by_token):
+            got = tag_bits_by_token(tokens)
+            return tag_bits if got is None else got
+        return tag_bits_by_token.get(tokens, tag_bits)
+
+    narrowest = min({_bits(k[1]) for k in distinct} or {tag_bits})
+    if len(triples) >= (1 << narrowest):
         raise ValueError(
-            f"{len(triples)} (site, vid, n_fused) triples do not fit {tag_bits} tag bits"
+            f"{len(triples)} (site, vid, n_fused) triples do not fit {narrowest} tag bits"
         )
     ordinal = {t: i + 1 for i, t in enumerate(triples)}
-    mask = (1 << tag_bits) - 1
-    return {
-        k: ((key_fn(*k) & ~mask) & 0x7FFFFFFF) | ordinal[(k[0], k[2], k[3])]
-        for k in distinct
-    }
+    out = {}
+    for k in distinct:
+        mask = (1 << _bits(k[1])) - 1
+        out[k] = ((key_fn(*k) & ~mask) & 0x7FFFFFFF) | ordinal[(k[0], k[2], k[3])]
+    return out
 
 
 def profile_call_id_keys(
@@ -204,6 +231,7 @@ def check_profile_call_ids(
     pad_m: bool = False,
     tag_vids: Iterable[str] | None = None,
     per_tokens: bool | None = None,
+    tag_bits_by_token: dict[int, int] | Callable[[int], int | None] | None = None,
 ) -> CallIdReport:
     """The KEY gate: all keys of one profile x the model's fused sites map to distinct non-zero call_ids. Logs every collision. R16: tag_bits=19 also checks the low bits per token
     count (large r13 tags); pad_m=True covers every real m a bucket can serve."""
@@ -216,13 +244,21 @@ def check_profile_call_ids(
         per_tokens=(
             pad_m if per_tokens is None else per_tokens
         ),  # the pad-M universe is checked per token count
+        tag_bits_by_token=tag_bits_by_token,
     )
     rep.unresolved = unresolved
     for (tokens, low), ks in rep.low_collisions.items():
+        bits = tag_bits
+        if bits is None and tag_bits_by_token is not None:
+            bits = (
+                tag_bits_by_token(tokens)
+                if callable(tag_bits_by_token)
+                else tag_bits_by_token.get(tokens)
+            )
         log.error(
             "event=call_id low_collision tokens=%d low%d=%d keys=%s: fusion refused for sites %s",
             tokens,
-            tag_bits,
+            bits or 0,
             low,
             ks,
             sorted({k[0] for k in ks}),

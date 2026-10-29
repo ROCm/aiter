@@ -301,13 +301,24 @@ def test_profile_has_123_rows_and_large_prefix_signatures():
     assert (
         len(prof) == 123
     )  # 30 small + 93 large (87 swept r13 + the 512 / 768 r18 pad buckets x 3 modes)
-    assert (
-        len(p1_sweep.P1_GRID) == 29
-        and sum(len(v) for v in p1_sweep.P1_BEST.values()) == 87
+    assert len(p1_sweep.P1_MEASURED_M) == 29
+    assert p1_sweep.P1_EXTENDED_M == (
+        9216,
+        10240,
+        11264,
+        12288,
+        13312,
+        14336,
+        15360,
+        16384,
     )
+    assert (
+        len(p1_sweep.P1_GRID) == 37
+    )  # the r19 band BECOMES rows only with the alternate profile flag
+    assert sum(len(v) for v in p1_sweep.P1_BEST.values()) == 61 * 3
     for mode in specs.MODES:
         sig = specs.sp_qkv_spec(mode).prefix(1).signature()
-        for m in p1_sweep.P1_GRID:
+        for m in p1_sweep.P1_MEASURED_M:
             n, hf = p1_sweep.P1_BEST[mode][m]
             r = prof.lookup(sig, "gfx950", 256, 4, m)
             # the large rows select the r13 kernels explicitly (src r13: R16 per-launch m_real); r11 / r12 stay selectable per row for the A/B; F0 only (no_gridread)
@@ -4163,6 +4174,7 @@ def test_jit_abi_tables_sources_and_missing_source_error():
         "r12",
         "r13",
         "r18",
+        "r19",
     )
     assert [jit.src_abi("small", s) for s in jit.SRCS] == [
         2,
@@ -4174,7 +4186,7 @@ def test_jit_abi_tables_sources_and_missing_source_error():
         3,
     ] and [
         jit.src_abi("large", s) for s in jit.LARGE_SRCS
-    ] == [2, 3, 4, 4]
+    ] == [2, 3, 4, 4, 6]
     with pytest.raises(ValueError, match="not in"):
         jit.src_abi("small", "r24")
     # r19 is derived from r18: it accepts the r18-only flags; r17 still rejects them
@@ -4196,8 +4208,8 @@ def test_jit_abi_tables_sources_and_missing_source_error():
     assert jit.large_defs({"src": "r13", "n": 2}, "dense") == jit.large_defs(
         {"src": "r12", "n": 2}, "dense"
     )
-    with pytest.raises(ValueError, match="large src 'r15'"):
-        jit.large_defs({"src": "r15"}, "dense")
+    with pytest.raises(ValueError, match="large src 'r99'"):
+        jit.large_defs({"src": "r99"}, "dense")
     tool = dict(TOOL_SIM)
     # the r19 sources are delivered by the implementor later: a clear error, not a FileNotFoundError
     dev, host = jit.small_defs({"src": "r19"}, "dense")
@@ -6756,6 +6768,7 @@ def test_accepts_launch_m_is_a_pure_function_of_params_bucket_and_m():
     assert [src for src in jit.LARGE_SRCS if jit.src_pad_m("large", src)] == [
         "r13",
         "r18",
+        "r19",
     ]
     assert jit.src_pad_m("large", "r13") and not jit.src_pad_m("large", "r12")
 
@@ -7070,12 +7083,12 @@ def test_large_rt_r13_driver_launch_v3_abi_check_and_header_drift(monkeypatch):
     )
     assert (
         int(re.search(r"#define LG_TAG_CALLID_BITS (\d+)u", h).group(1))
-        == lrt.LG_TAG_CALL_BITS
+        == lrt.LG_TAG_CALL_BITS_R13
         == 19
     )
     assert (
         int(re.search(r"#define LG_TAG_M_SHIFT (\d+)u", h).group(1))
-        == lrt.LG_TAG_M_SHIFT
+        == lrt.LG_TAG_M_SHIFT_R13
         == 19
     )
     assert (
@@ -7667,3 +7680,102 @@ def test_r18_the_gemm_and_the_put_kernel_share_one_stream(monkeypatch):
     with pytest.raises(ContractError, match=r"raw stream handle 0x9999"):
         plan.run(**kw, stream=0x9999)
     assert len(log) == n
+
+
+# ======================================================================= ROUTE A: r19 (ABI 7) capability, opt-in alternate profile
+def test_r19_large_source_is_registered_with_abi_gen_6_and_a_vendored_build():
+    from aiter.ops.gemm_fusion.sp_qkv import variants_large as vl
+
+    assert "r19" in jit.LARGE_SRCS and jit.LARGE_ABI["r19"] == 6
+    assert jit.src_abi("large", "r19") == 6
+    assert jit.large_m_max("r19") == 16384 and jit.large_m_max("r13") == 8192
+    assert jit.src_pad_m("large", "r19")
+    assert jit.large_src_dir("r19") == "r19"
+    assert (
+        vl.LARGE_SRC_SHA["r19"]
+        == "332532a0946dd06228d4cf6ca3c0c65e083bcf24cf101bddde6cbb9fb9401200"
+    )
+    assert jit.large_defs({"src": "r19", "n": 4}, "dense") == jit.large_defs(
+        {"src": "r13", "n": 4}, "dense"
+    )
+    tool = dict(TOOL_SIM)
+    dev = " ".join(
+        jit.large_device_cmd(
+            jit.large_defs({"src": "r19"}, "dense"), tool, "/out", "r19"
+        )
+    ).replace("\\", "/")
+    host = " ".join(
+        jit.large_host_cmd(jit.large_defs({"src": "r19"}, "dense"), tool, "/out", "r19")
+    )
+    assert "large/r19/device" in dev and "-fconstexpr-steps=20000000" in dev
+    assert "-fconstexpr-steps" not in host
+    assert "-fconstexpr-steps" not in " ".join(
+        jit.large_device_cmd(
+            jit.large_defs({"src": "r13"}, "dense"), tool, "/out", "r13"
+        )
+    )
+    assert jit.large_cache_key(
+        jit.large_defs({"src": "r13"}, "dense"), tool, "r13"
+    ) != jit.large_cache_key(jit.large_defs({"src": "r19"}, "dense"), tool, "r19")
+    with pytest.raises(ValueError, match="large src 'r99'"):
+        jit.large_defs({"src": "r99"}, "dense")
+
+
+def test_r19_plan_accepts_m_up_to_16384_and_pads():
+    from aiter.gemm_fusion.match import ContractError, MatchCtx
+    from aiter.ops.gemm_fusion.sp_qkv import variants_large as vl
+
+    caps = frozenset({"mori_cco", "sdma"})
+    spec = specs.sp_qkv_spec("indexer").prefix(1)
+
+    def mk(m, n=4):
+        return vl.SpQkvLarge(
+            spec,
+            {"n": n, "half_first": 0, "no_gridread": 1, "src": "r19"},
+            MatchCtx("gfx950", 256, 4, m, caps),
+        )
+
+    for m, n in ((256, 1), (8192, 4), (9216, 4), (10240, 4), (16384, 4)):
+        plan = mk(m, n)
+        assert (plan.M, plan.abi, plan.qr_wgs, plan.pad_m) == (m, 6, 64, True)
+    with pytest.raises(ContractError, match=r"\[256, 16384\]"):
+        mk(16640)
+    assert vl.SpQkvLarge.accepts_launch_m({"src": "r19"}, 16384, 1)
+    assert not vl.SpQkvLarge.accepts_launch_m({"src": "r19"}, 16384, 0)
+    assert vl.large_window_bytes("dense", 16384) == 306184192
+    assert vl.large_window_bytes("indexer", 16384) == 339738624
+    assert vl.large_window_bytes("reuse", 16384) == 306184192
+
+
+def test_r19_large_rt_abi7_constants_and_driver_binding(monkeypatch):
+    from aiter.gemm_fusion import errpage
+    from aiter.ops.gemm_fusion.sp_qkv import large_rt as lrt
+
+    assert lrt._LG_ABI_BY_GEN[6] == (7, 360)
+    assert (lrt.LG_COMM_ABI_VERSION_V6, lrt.LG_COMM_ARGS_V6_BYTES) == (7, 360)
+    assert (lrt.LG_TAG_CALL_BITS, lrt.LG_TAG_M_SHIFT) == (18, 18)
+    assert lrt.LG_M_REAL_MAX == 16384
+    assert lrt.LG_M_REAL_MAX_BY_GEN[6] == 16384
+    assert lrt.LG_CTAG_ATAG_BY_GEN[6] == (3712, 3744)
+    good = {
+        "abi": 7,
+        "args_bytes": 360,
+        "err_off": errpage.ERR_OFF,
+        "step_off": errpage.STEP_OFF,
+        "diag_off": errpage.DIAG_OFF,
+        "ctag_off": 3712,
+        "atag_off": 3744,
+        "peers_bytes": 32,
+        "qr_wgs": 64,
+    }
+    lrt.check_abi_info(good, 64, gen=6)
+    with pytest.raises(RuntimeError, match="ABI mismatch"):
+        lrt.check_abi_info({**good, "ctag_off": 3072, "atag_off": 3104}, 64, gen=6)
+    fake = _FakeCDLL()
+    monkeypatch.setattr(lrt.C, "CDLL", lambda path: fake)
+    lrt.load_driver("x", abi=6)
+    bound = {n for n, f in fake._fn.items() if f.argtypes is not None}
+    assert "lg_launch_v3" in bound and "lg_abi_info_v2" in bound
+    assert "lg_launch_v4" not in bound and "lg_swin_bytes_v1" not in bound
+    assert lrt.LargeContext(None, None, 16384, 2560, 0, abi=6).m_real_max == 16384
+    assert lrt.LargeContext(None, None, 8192, 2304, 0, abi=4).m_real_max == 8192

@@ -18,6 +18,10 @@
 //      Every entry point below runs in a DeviceScope of the comm's HIP device (ccoComm::hipDev, NOT the SP rank), restores the caller's device
 //      on exit, and flushes the sticky HIP last-error; lg_launch_v1 / lg_init_control_v1 / lg_report_v1 / lg_drain_v1 are scoped wrappers of the
 //      unmodified Phase-1 functions.
+//   D8 (r19, LG_COMM_ABI_VERSION >= 7; the older generations are unchanged): no new entry points. `LgCommArgsCurrent` maps to the ABI-7 struct
+//      (LgCommArgsV6, the r13 360 B layout) and lg_attach_v1's M bound is LG_MAX_CHUNKS*LG_CHUNK_ROWS (8192 for the r11..r18 headers, 16384 for
+//      large/r19). lg_abi_info_v1 reports the ABI-7 tag offsets (CTAG 3712 / ATAG 3744 for r19) from the tree's header, so a runtime must consume
+//      them rather than the r13 literals.
 #include "lg_comm_driver.cpp"
 #include "sha256_image.hpp"
 #include "gf_device_scope.hpp"
@@ -49,11 +53,11 @@ void* lg_attach_v1(uint32_t rank, uint32_t M, void* comm, const void* devcomm, v
                    const char* hsaco_path, const char* expected_hsaco_sha256_hex, uint32_t sdma_queues, uint64_t* diag) {
     uint64_t scratch[8]; if (!diag) diag = scratch;
     for (int i = 0; i < 8; ++i) diag[i] = 0;
-    if (rank > 3u || M == 0 || M % 256u || M > 8192u || sdma_queues != 1u || !comm || !devcomm || !S || !R || !C || !Sva || !Rva || !Cva || !hsaco_path || !expected_hsaco_sha256_hex) {
+    if (rank > 3u || M == 0 || M % 256u || M > LG_MAX_CHUNKS * LG_CHUNK_ROWS || sdma_queues != 1u || !comm || !devcomm || !S || !R || !C || !Sva || !Rva || !Cva || !hsaco_path || !expected_hsaco_sha256_hex) {
         const void* a[10] = {comm, devcomm, S, R, C, Sva, Rva, Cva, hsaco_path, expected_hsaco_sha256_hex};
         diag[0] = 1; for (int i = 0; i < 10; ++i) if (!a[i]) diag[1] |= (1ull << i);
         diag[2] = rank; diag[3] = M; diag[4] = sdma_queues;
-        std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=args rank=%u M=%u Q=%u nullmask=0x%llx\n", rank, M, sdma_queues, static_cast<unsigned long long>(diag[1]));
+        std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=args rank=%u M=%u Q=%u nullmask=0x%llx (M must be a multiple of 256 and <= LG_MAX_CHUNKS*LG_CHUNK_ROWS)\n", rank, M, sdma_queues, static_cast<unsigned long long>(diag[1]));
         return nullptr;
     }
     if (!sm_image_matches(hsaco_path, expected_hsaco_sha256_hex)) { diag[0] = 2; std::fprintf(stderr, "LG_ATTACH rc=FAIL stage=image_hash (%s)\n", hsaco_path); return nullptr; }   // H-3: exact-image gate BEFORE any module action
@@ -132,8 +136,10 @@ int32_t lg_launch_v1(void* h, const void* A, const void* W, const float* Ascale,
     return lg_comm_launch(h, A, W, Ascale, Wscale, strideA, poll_iterations, poll_budget_us, puts_per_peer, half_first, stream);
 }
 #else
-#if LG_COMM_ABI_VERSION >= 5
-using LgCommArgsCurrent = LgCommArgsV4;   // r13+: the ABI-current launch-args struct
+#if LG_COMM_ABI_VERSION >= 7
+using LgCommArgsCurrent = LgCommArgsV6;   // r19 (ABI 7): r13's 360 B layout extended to M <= 16384 (14-bit m_real / 18-bit call_id tag, C window [4][64])
+#elif LG_COMM_ABI_VERSION >= 5
+using LgCommArgsCurrent = LgCommArgsV4;   // r13 / r18 (ABI 5): the 360 B m_real layout
 #else
 using LgCommArgsCurrent = LgCommArgsV3;   // r12 (ABI 4)
 #endif
@@ -162,6 +168,7 @@ int32_t lg_launch_v3(void* h, const void* A, const void* W, const float* Ascale,
     return lg_comm_launch(h, A, W, Ascale, Wscale, strideA, poll_iterations, poll_budget_us, puts_per_peer, half_first, call_id, m_real, stream);
 }
 #endif
+
 // lg_abi_info_v2 (r12c): lg_abi_info_v1's 8 words + out[8] = LG_QR_WGS of THIS host build (quiet_ready workgroups the launcher starts); the device image enforces the same value at launch (args.qr_wgs), so a mismatch is a CONFIG error; the runtime may also
 // compare out[8] with the qr_wgs it built the image with and refuse at attach.
 // out[0] = LG_COMM_ABI_VERSION, out[1] = sizeof(the ABI-current args struct: LgCommArgsV3 for ABI 4, LgCommArgsV4 for ABI >= 5), out[2] = ERR off, out[3] = STEP off, out[4] = DIAG off (relative to the page base), out[5] = ctag off, out[6] = atag off (C window), out[7] = sizeof(LgGfPeers)

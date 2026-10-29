@@ -36,7 +36,7 @@ CSRC = os.path.abspath(
     os.path.join(_HERE, "..", "..", "..", "..", "csrc", "gemm_fusion", "sp_qkv")
 )
 SRCS = ("r17", "r18", "r19", "r20", "r21", "r22", "r23")
-LARGE_SRCS = ("r11", "r12", "r13", "r18")
+LARGE_SRCS = ("r11", "r12", "r13", "r18", "r19")
 R18_FAMILY = (
     "r18",
     "r19",
@@ -72,13 +72,16 @@ LARGE_ABI = {
     "r12": 3,
     "r13": 4,
     "r18": 4,
-}  # r18 = large/r18-put: the r13 ABI (LG_COMM_ABI_VERSION 5, LgCommArgsV4 360 B) + lg_put_v1
+    "r19": 6,
+}  # r18 = large/r18-put: the r13 ABI (LG_COMM_ABI_VERSION 5, LgCommArgsV4 360 B) + lg_put_v1;
+# 6 = r19 (ROUTE A, LG_COMM_ABI_VERSION 7 / LgCommArgsV6 360 B: M <= 16384 / 64 chunks, 14-bit m_real + 18-bit call_id in the tag word,
+# [4][64] control image; the host launch surface stays r13's lg_launch_v3)
 # R16 pad-M (scheme 2: "the kernel only gets the valid m; the padded m only selects the kernel / plan"): sources whose LAUNCH accepts any real local m <= the bucket M the
 # binding / plan was made for. small: sm_launch_blk_v3m(..., m, ...) (r19 / r20 / r22 / r23; r21 and the abi 2 sources only launch their bound M); large: lg_launch_v3(..., m_real, ...) (r13, ABI 5)
 SMALL_PAD_M = ("r19", "r20", "r22", "r23")
 # Sources that can be BUILT but have NO plan (none at the moment).
 SMALL_BUILD_ONLY: tuple[str, ...] = ()
-LARGE_PAD_M = ("r13", "r18")
+LARGE_PAD_M = ("r13", "r18", "r19")
 # R18 route B (src "r18"): the plan launches the large/r17 FlyDSL GEMM (destination-major BF16 epilogue into S) and then large/r18-put's lg_put_launch_v1 (put kernel + r13's quiet_ready). The comm
 # image / driver tree of the source named "r18" is large/r18-put; the GEMM source (a FlyDSL Python kernel, compiled by FlyDSL at first use, not by hipcc) is large/r17.
 LARGE_SRC_DIR = {"r18": "r18-put"}
@@ -88,6 +91,15 @@ R17_SRC = "r17"
 def large_src_dir(src: str) -> str:
     """The directory name under csrc/gemm_fusion/sp_qkv/large/ of a large source (r18 = large/r18-put)."""
     return LARGE_SRC_DIR.get(src, src)
+
+
+# ROUTE A (local m <= 16384): r19 raises the per-source M limit to 16384 (= 64 chunks); every other large source keeps r13's 8192 (32 chunks).
+LARGE_M_MAX = {"r19": 16384}
+
+
+def large_m_max(src: str) -> int:
+    """The largest local M (multiple of 256) a large plan of `src` accepts: 16384 for the r19 extension (64 chunks), else 8192 (32 chunks)."""
+    return LARGE_M_MAX.get(src, 8192)
 
 
 def src_pad_m(kind: str, src: str) -> bool:
@@ -834,9 +846,14 @@ def large_defs(params: dict, mode: str) -> list[str]:
     # poll_batch = LG_POLL_BATCH (0|1|2: target + ERR loaded back-to-back; 2 = ERR every 8th iteration), qr_wgs = LG_QR_WGS (1|64: quiet_ready workgroups, the NaN fill folded in). Passed EXPLICITLY for r12 so an A/B is a different build key and a
     # header default change cannot move a build silently; r11 has no such knobs.
     knobs = [k for k in ("tag_early", "poll_batch", "qr_wgs") if k in params]
-    if knobs and params.get("src", LARGE_SRC) not in ("r12", "r13", "r18"):
+    if knobs and params.get("src", LARGE_SRC) not in (
+        "r12",
+        "r13",
+        "r18",
+        "r19",
+    ):
         raise ValueError(
-            f"{knobs} exist only in large/r12, r13 and r18 (src=r12 | r13 | r18)"
+            f"{knobs} exist only in large/r12, r13, r18 and r19 (src=r12 | r13 | r18 | r19)"
         )
     tag_early, poll_batch = int(params.get("tag_early", 1)), int(
         params.get("poll_batch", 1)
@@ -873,7 +890,7 @@ def large_defs(params: dict, mode: str) -> list[str]:
         "-DLG_NEGCTRL_ISO=0",
         "-DLG_ISO_DELAY_ITERS=0",
     ]
-    if params.get("src", LARGE_SRC) in ("r12", "r13", "r18"):
+    if params.get("src", LARGE_SRC) in ("r12", "r13", "r18", "r19"):
         defs += [
             f"-DLG_TAG_EARLY={tag_early}",
             f"-DLG_POLL_BATCH={poll_batch}",
@@ -908,6 +925,10 @@ def large_device_cmd(
         "-fno-fast-math",
         "--offload-arch=gfx950",
     ]
+    if (
+        src or LARGE_SRC
+    ) == "r19":  # r19: the ABI-7 proof layers L1/L2 need clang's raised constexpr step budget (device cmd only)
+        flags.append("-fconstexpr-steps=20000000")
     return [
         tool["hipcc"],
         *flags,

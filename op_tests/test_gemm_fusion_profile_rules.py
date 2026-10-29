@@ -2256,3 +2256,52 @@ def test_the_r18_single_bucket_profiles_and_the_flag_combinations(
             if r["vid"] == "sp_qkv.large.v1" and r["m"] < 1024
         }
     ) == [(768, 513)]
+
+
+# ======================================================================= ROUTE A alternate profile (opt-in path)
+def test_r19_alternate_profile_generates_the_measured_layout_and_the_default_stays_unchanged(
+    tmp_path, monkeypatch, sp_qkv_catalog
+):
+    import hashlib
+
+    shipped = (
+        Path(__file__).resolve().parents[1]
+        / "aiter"
+        / "configs"
+        / "gemm_fusion"
+        / "minimax_m3_sp4_gfx950_v1.json"
+    )
+    alt = (
+        Path(__file__).resolve().parents[1]
+        / "aiter"
+        / "configs"
+        / "gemm_fusion"
+        / "minimax_m3_sp4_gfx950_v1_r19.json"
+    )
+    assert (
+        hashlib.sha256(shipped.read_bytes()).hexdigest()
+        == "0f90d1cd84fb252a3392454439e03c49907114f7e288e25b53d288a3725514a9"
+    )
+    assert (
+        hashlib.sha256(alt.read_bytes()).hexdigest()
+        == "80dc9887e0ce07c6d63ac39cface07fbd29648875f901a1101a514bc3378cbfd"
+    )
+    assert specs.LARGE_R19_IN_PROFILE is False
+    default_out = tmp_path / "default.json"
+    gen_profile.main([str(default_out)])
+    assert (
+        hashlib.sha256(default_out.read_bytes()).hexdigest()
+        == "0f90d1cd84fb252a3392454439e03c49907114f7e288e25b53d288a3725514a9"
+    )
+    alt_out = tmp_path / "alt.json"
+    gen_profile.main([str(alt_out), "--large-r19"])
+    assert (
+        hashlib.sha256(alt_out.read_bytes()).hexdigest()
+        == "80dc9887e0ce07c6d63ac39cface07fbd29648875f901a1101a514bc3378cbfd"
+    )
+    # the temporary enable is restored: the default flag and the default generator are unchanged afterwards
+    assert specs.LARGE_R19_IN_PROFILE is False
+    assert len(json.loads(alt_out.read_text(encoding="utf-8"))["rows"]) == 147
+    assert json.loads(alt_out.read_text(encoding="utf-8"))["extended_large"][
+        "measured"
+    ].startswith("Gate-3")

@@ -774,3 +774,26 @@ def test_build_comm_goes_through_the_rank_safe_engine_and_builds_once(
     assert (
         len(fake.calls) == 1
     )  # one compile for four callers (the others waited on the lock / found it cached)
+
+
+# ======================================================================= ROUTE A alternate profile units
+def test_r19_alternate_profile_adds_the_two_large_build_units(jit_root, monkeypatch):
+    import json
+
+    from aiter.ops.gemm_fusion.sp_qkv import gen_profile, specs
+
+    monkeypatch.setattr(specs, "LARGE_R19_IN_PROFILE", True)
+    doc = json.loads(json.dumps(gen_profile.build_profile()))
+    from aiter.gemm_fusion.profile import parse_profile
+
+    prof = parse_profile(doc)
+    units, skipped = engine.plan_profile(prof, recipe="aot1", tool=TOOL)
+    assert skipped == [] and len(units) == 22
+    by_kind = {}
+    for u in units:
+        by_kind.setdefault(u.kind, []).append(u)
+    assert len(by_kind["sp_qkv.large.v1"]) == 6
+    device = [
+        t for u in units for t in u.tasks if t.name in ("sm_gemm", "sm_ran", "lg_gemm")
+    ]
+    assert len(device) == 36

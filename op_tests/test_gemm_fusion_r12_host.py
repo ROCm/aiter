@@ -1558,3 +1558,25 @@ def test_the_pad_m_key_universe_covers_every_real_m_a_bucket_can_serve(monkeypat
     }
     rep = callid.check_profile_call_ids(p12, sites, world=4, pad_m=True)
     assert rep.ok and rep.keys == 286 * len(sites)
+
+
+# ======================================================================= ROUTE A: per-token tag widths
+def test_r19_tag_width_18_and_low_18_collision_refusal():
+    from aiter.gemm_fusion import callid
+
+    vid = "sp_qkv.large.v1"
+    fixed = {
+        ("a", 36864, vid, 1): (1 << 18) | 5,
+        ("b", 36864, vid, 1): (2 << 18) | 5,
+        ("c", 32768, vid, 1): (1 << 18) | 5,
+        ("d", 32768, vid, 1): (2 << 18) | 5,
+    }
+    key_fn = lambda *k: fixed[k]
+    bits = {36864: 18, 32768: 19}
+    rep = callid.check_call_ids(
+        fixed, key_fn, tag_bits_by_token=bits, tag_vids=(vid,), per_tokens=True
+    )
+    assert not rep.ok and set(rep.low_collisions) == {(36864, 5)}
+    assert callid.check_call_ids(
+        fixed, key_fn, tag_bits=19, tag_vids=(vid,), per_tokens=True
+    ).ok

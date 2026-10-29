@@ -118,7 +118,7 @@ def small_cell_params(mode: str, T: int) -> dict:
 # ---- small-M coverage beyond the two tuned cells (T64 = m16, T128 = m32) -----------------------------------------------------------------------------------------------
 # R13 P2: the decode buckets below T=64 (ATOM's default capture list pads to T = 4, 8, 16, 32, 48 -> local m = 1, 2, 4, 8, 12) run on r19 with a COPY of their mode's m=16
 # params (same build, same owner / windows / context: no new unit, no new window). R13 MP64 (r20, SM_MP 64) serves local m 33..64: an exact row at m=64 (T=256, the default
-# captured bucket) and a range rule over 33..64 (any padded T = 4 m in 132..256, e.g. a custom capture list or an eager step). r20 has ONE push shape (the r15-r18 shape switches
+# captured bucket) and a range rule over 33..64 (any padded T = 4 m in 132..256, e.g. a custom capture list or an eager step). r20 has ONE push shape (the previous-generation shape switches
 # do not exist), requires rx_bypass=1 in every mode and B_HEADS=1; reuse keeps reuse_no_idx=0 (untuned). The MP128 slot serves local m 65..128 (an exact row at m=128 = T=512, the
 # default captured bucket, and a range rule over 65..128): r22 (tuned MP128, SM_MP 128, 3-slot Rx in ONE 4 MiB view) {nh 1, b_quad 1, gemm_bn128 0, rx3 1} (SMALL_R22_IN_PROFILE),
 # which replaced r21 (SM_MP 128, nh=2, its Rx needs an 8 MiB arena view; still selectable, SMALL_R21_IN_PROFILE). The MP256 slot serves local m 129..255 (T 516..1020) with ONE range
@@ -514,4 +514,57 @@ def large_profile_src() -> str:
 
 def large_cell_params(mode: str, T: int) -> dict:
     """The profile params of a large cell: the tuned plan params plus the kernel source the profile selects."""
-    return {**LARGE_CELLS[(mode, T)][1], "src": large_profile_src()}
+    _vid, params = large_cells()[(mode, T)]
+    src = LARGE_R19_SRC if (mode, T) in LARGE_R19_CELLS else large_profile_src()
+    return {**params, "src": src}
+
+
+# ROUTE A (local m <= 16384): the extended band on large/r19 (ABI 7). Flag off = the pre-r19 layout (rollback is one flag); the flag is read at
+# profile-generation time, so the shipped JSON is generated with it on.
+LARGE_R13_M_MAX = 8192
+LARGE_R19_IN_PROFILE = False  # SHIPPING DEFAULT: the r19 capability is opt-in; the alternate profile ..._r19.json is generated with the flag temporarily on
+LARGE_R19_SRC = "r19"
+LARGE_R19_M_MAX = 16384
+# exact-row stride of the extended band: 1024 local rows keeps chunks = M/256 a multiple of 4 -> n=4 (and n=1/2) legal everywhere and the GEMM/put
+# overlap available; the 256-step grid would leave odd chunks (33, 35, ...) with n=1 only (no overlap). Rows at 9216..16384 step 1024 = 8 per mode.
+LARGE_R19_GRID_STRIDE = 1024
+# window-budget cells of the extended band (T = 4 * M): merged by large_cells() only while the flag is on, so the rolled-back budget stays 9 large owners.
+# Only the LARGEST extended plan needs a budget cell: indexer F=2560 / M=16384 -> 324 MiB; the dense / reuse M=16384 windows are 292 MiB and fit in the same
+# shared S / R. One cell keeps the owner model exact: large owners 9 -> 10, max_windows 58 -> 61 (= 2*15 + 3*10 + 1).
+LARGE_R19_CELLS = {
+    ("indexer", 65536): (
+        "sp_qkv.large.v1",
+        {"n": 4, "half_first": 0, "no_gridread": 1},
+    ),
+}
+# the tag field of the large launches: r13 / r18 keep the 13-bit m_real + 19-bit call_id tag, r19 repartitions it to 14-bit m_real + 18-bit call_id
+LARGE_TAG_BITS = {"r11": 19, "r12": 19, "r13": 19, "r18": 19, "r19": 18}
+
+
+def large_tag_bits(src: str) -> int:
+    """The low call_id tag bits of a large source's launches (the profile's static key check must hold on them, per token count)."""
+    return LARGE_TAG_BITS.get(src, 19)
+
+
+def large_cells() -> dict:
+    """(mode, T) -> (vid, params) cells the window budget uses: the legacy nine cells, plus the r19 T=65536 cell while LARGE_R19_IN_PROFILE is on."""
+    out = dict(LARGE_CELLS)
+    if LARGE_R19_IN_PROFILE:
+        out.update(LARGE_R19_CELLS)
+    return out
+
+
+def large_row_src(m: int) -> str:
+    """The kernel source of a large exact row: r19 in the extended band while the flag is on, else the layout's large source (r13 / r12)."""
+    if LARGE_R19_IN_PROFILE and m > LARGE_R13_M_MAX:
+        return LARGE_R19_SRC
+    return large_profile_src()
+
+
+def large_r19_grid_m() -> tuple[int, ...]:
+    """The extended-band exact-row M values for the CURRENT stride: 9216..16384 step 1024 (or 8448..16384 step 256 for the Evidence A/B)."""
+    return tuple(
+        m
+        for m in range(LARGE_R13_M_MAX + 256, LARGE_R19_M_MAX + 1, 256)
+        if m % LARGE_R19_GRID_STRIDE == 0
+    )
