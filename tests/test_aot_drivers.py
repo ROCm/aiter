@@ -1,8 +1,11 @@
 """AOT driver coverage: config wiring, cache signatures, and GPU worker policy."""
 
 import inspect
+import os
 import pathlib
+import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import nullcontext
 from unittest.mock import MagicMock, call, patch
@@ -14,6 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
 import torch
 
 from aiter.aot import asm_mla_decode_fwd as driver
+from aiter.jit.utils.chip_info import get_gfx
 from csrc.cpp_itfs import utils as cpp_itfs_utils
 from csrc.cpp_itfs.mla import asm_mla_decode_fwd as compile_module
 
@@ -133,6 +137,67 @@ class FlydslGemmAotTest(unittest.TestCase):
                             _flydsl_cache_key(gemm_kernel.gemm_a16w16_gfx950, drifted),
                             runtime_key,
                         )
+
+
+# The documented AOT -> run-only flow, in two fresh processes so the second one
+# can only hit the disk cache. RUN_ONLY raises on a miss instead of compiling.
+_HGEMM_SPLIT_K = (1, 7)
+_HGEMM_AOT = f"""
+from aiter.aot.flydsl.gemm import _compile_hgemm_to_cache
+for split_k in {_HGEMM_SPLIT_K}:
+    _compile_hgemm_to_cache(
+        m=8, n=1536, k=7168, dtype="bf16", out_dtype="bf16",
+        block_m=128, block_n=128, block_k=64, stages=2, split_k=split_k,
+        m_waves=2, n_waves=2, k_waves=1, group_m=0,
+        use_half_tile_interleaved=False, has_bias=False, target_gfx="gfx950",
+    )
+"""
+_HGEMM_RUN_ONLY = f"""
+import torch
+from aiter.ops.flydsl import flydsl_hgemm
+from aiter.test_common import checkAllclose
+a = torch.ones((8, 7168), device="cuda", dtype=torch.bfloat16)
+w = torch.ones((1536, 7168), device="cuda", dtype=torch.bfloat16)
+ref = (a.float() @ w.float().t()).to(torch.bfloat16)
+for split_k in {_HGEMM_SPLIT_K}:
+    out = torch.empty((8, 1536), device="cuda", dtype=torch.bfloat16)
+    y = flydsl_hgemm(
+        a, w, out=out, block_m=128, block_n=128, block_k=64, stages=2,
+        split_k=split_k, m_waves=2, n_waves=2, k_waves=1,
+    )
+    assert y.data_ptr() == out.data_ptr()
+    err = checkAllclose(
+        ref.float(), out.float(), rtol=0, atol=0, msg=f"hgemm split_k={{split_k}}"
+    )
+    assert err == 0, f"split_k={{split_k}}: mismatch ratio {{err}}"
+"""
+
+
+@_needs_flydsl
+class FlydslGemmAotCacheReuseTest(unittest.TestCase):
+    def setUp(self):
+        if not torch.cuda.is_available() or get_gfx() != "gfx950":
+            self.skipTest("needs a gfx950 GPU")
+
+    def test_a16w16_aot_cache_serves_a_run_only_process(self):
+        """A fresh RUN_ONLY process must load AOT-built A16W16 kernels, not miss."""
+        with tempfile.TemporaryDirectory() as cache_dir:
+            env = dict(os.environ, FLYDSL_RUNTIME_CACHE_DIR=cache_dir)
+            env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+            for name, code, extra_env in (
+                ("AOT", _HGEMM_AOT, {}),
+                ("RUN_ONLY", _HGEMM_RUN_ONLY, {"FLYDSL_RUNTIME_RUN_ONLY": "1"}),
+            ):
+                proc = subprocess.run(
+                    [sys.executable, "-c", code],
+                    cwd=_REPO_ROOT,
+                    env={**env, **extra_env},
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0, f"{name}:\n{proc.stderr[-4000:]}")
 
 
 class PaGluonProcessLimitTest(unittest.TestCase):
