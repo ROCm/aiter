@@ -7,6 +7,8 @@ Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 """
 
 import importlib.util
+import subprocess
+import sys
 from itertools import product
 
 import pytest
@@ -92,6 +94,24 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         graph.replay()
         check(plan, values)
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        "PADecodePlan",
+        "pa_decode_default_workgroup_budget",
+        "pa_decode_nhd_max_query_length",
+        "plan_pa_decode",
+        "prepare_pa_decode_plan",
+    ],
+)
+def test_pa_decode_export_import_order(first):
+    """Loading a sibling export first must not leave ``pa_decode`` a module."""
+    code = (
+        f"from aiter.ops.flydsl import {first}, pa_decode; assert callable(pa_decode)"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 _NHD_CONFIG = {

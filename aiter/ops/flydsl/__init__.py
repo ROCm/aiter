@@ -4,6 +4,7 @@
 """FlyDSL -- high-performance GPU kernels implemented using FlyDSL."""
 
 from importlib import import_module
+from types import ModuleType
 
 import flydsl as _flydsl
 from packaging.version import Version
@@ -251,4 +252,9 @@ def __getattr__(name: str):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
     value = getattr(import_module(module_name, __name__), attr_name)
     globals()[name] = value
+    # Importing a submodule binds it on this package, shadowing an export of the
+    # same name (``pa_decode``). Drop those bindings so the export loads instead.
+    for export in _LAZY_IMPORTS.keys() & globals().keys():
+        if isinstance(globals()[export], ModuleType):
+            del globals()[export]
     return value
