@@ -1299,11 +1299,17 @@ def mla_decode_fwd(
         # Per-batch valid KV split count writeback buffer. Always allocated (and
         # passed to stage1) so the asm kernel has a valid destination; whether
         # stage2 actually uses it is gated by use_valid_split_count_reduce.
-        # Initialized to num_kv_splits so a min() against it is a no-op until the
-        # kernel overwrites it with the real (smaller) valid count.
-        valid_split_count = torch.full(
-            (bs,), num_kv_splits, dtype=dtypes.i32, device=device
-        )
+        # Only the gfx1250 packed kernel receives this pointer, and
+        # use_valid_split_count_reduce (its decode_flags bit0) enables the
+        # writeback. Seed the upper bound so an entry no kernel wrote means
+        # "all splits valid" to stage2's min(). At one split the flag is 0 and
+        # stage2 does not read the buffer, so skip the fill.
+        if num_kv_splits > 1:
+            valid_split_count = torch.full(
+                (bs,), num_kv_splits, dtype=dtypes.i32, device=device
+            )
+        else:
+            valid_split_count = torch.empty((bs,), dtype=dtypes.i32, device=device)
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
         require_gfx1250_asm("mla_decode_stage1_asm_fwd")
