@@ -53,17 +53,13 @@ GFX_CU_NUM_MAP = {
 }
 
 
-# XCD counts for SKUs that differ from the eight-XCD default.
-NON_DEFAULT_NUM_XCDS = {
-    ("gfx950", 128): 4,  # MI350P
-    ("gfx942", 80): 4,  # MI308X
-    ("gfx942", 228): 6,  # MI300A
-}
-DEFAULT_NUM_XCDS = 8
-
-
-def target_num_xcds(gfx: str, cu_num: int, default: int = DEFAULT_NUM_XCDS) -> int:
-    return NON_DEFAULT_NUM_XCDS.get((gfx, int(cu_num)), default)
+def target_num_xcds(gfx: str, cu_num: int, default: int = 8) -> int:
+    # XCD counts for SKUs that differ from the eight-XCD default.
+    return {
+        ("gfx950", 128): 4,  # MI350P
+        ("gfx942", 80): 4,  # MI308X
+        ("gfx942", 228): 6,  # MI300A
+    }.get((gfx, int(cu_num)), default)
 
 
 @functools.cache
@@ -77,7 +73,7 @@ def build_num_xcds(gfx: str) -> int:
     for target_gfx, target_cu in get_build_targets():
         if target_gfx == gfx:
             return target_num_xcds(gfx, target_cu)
-    return DEFAULT_NUM_XCDS
+    return 8
 
 
 def torch_processor_count_to_cu(gfx: str, processor_count: int) -> int:
