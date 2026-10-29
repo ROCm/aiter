@@ -1126,6 +1126,11 @@ def fused_moe(
     quant_dtype_a2: torch.dtype | None = None,
     # False explicitly selects unclamped shared-expert SiLU semantics.
     clamp_shared: bool = True,
+    # Optional [1] int32 device tensor equal to num_local_tokens * topk,
+    # precomputed by the caller once per forward so the gfx1250 grouped path
+    # does not launch that multiply in every MoE layer. Read only with
+    # num_local_tokens; None derives it as before.
+    num_valid_routes: torch.Tensor | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1268,6 +1273,7 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        num_valid_routes=num_valid_routes,
     )
 
 
@@ -1310,6 +1316,7 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    num_valid_routes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1371,6 +1378,7 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    num_valid_routes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1414,6 +1422,7 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        num_valid_routes=num_valid_routes,
     )
 
 
@@ -1448,6 +1457,7 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    num_valid_routes: torch.Tensor | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1556,6 +1566,7 @@ def _fused_moe_impl(
             bias2=bias2,
             swiglu_limit=swiglu_limit,
             num_local_tokens=num_local_tokens,
+            num_valid_routes=num_valid_routes,
             situ_beta=1.0 if beta is None else float(beta),
             situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             stage2_scatter=stage2_scatter,
