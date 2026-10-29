@@ -1156,6 +1156,9 @@ def gemm_a16w16_hti_gfx950_kernel(
     rocdl.sched_barrier(0)
     if wid // n_waves == 1:
         rocdl.s_barrier()
+        # One barrier ahead, this group's next barrier releases the first group to
+        # read stage 0: retire its copies.
+        rocdl.s_waitcnt(vmcnt=0)
     rocdl.sched_barrier(0)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
@@ -1230,6 +1233,10 @@ def gemm_a16w16_hti_gfx950_kernel(
     consume(c10, a1, b0, True)
     rocdl.s_barrier()
     b0 = load_b_fragment(0, 1)
+    if wid // n_waves == 1:
+        # As in the prologue: the next barrier releases the first group to read the
+        # stage 1 A half 0. The newer B half 1 and A half 1 copies may stay in flight.
+        rocdl.s_waitcnt(vmcnt=half_ldg_b_iters + half_ldg_a_iters)
     rocdl.s_barrier()
     consume(c11, a1, b1, True)
     wait_vmcnt_and_barrier(0)
