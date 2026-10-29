@@ -10,16 +10,16 @@ from functools import cache, lru_cache
 import torch
 
 from csrc.opus_gemm.opus_gemm_common import (
-    BIAS_AWARE_KIDS,
     GFX942_BF16WS_EXACT_N,
     GFX942_EVEN_LOOP_SPLITK_TAGS,
     GFX942_MAX_AUTO_SPLIT_K,
     GFX942_MIN_ITERS_PER_SPLIT,
-    SPLITK_KIDS,
+    OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
     OpusGemmInstance,
     a8w8_mxscale_flatmm_prefetch_k_iter,
     a16w16_flatmm_prefetch_k_iter,
     get_kernel_instance,
+    group_kids,
 )
 
 from ._arch import GFX942, GFX950, GFX1250
@@ -192,13 +192,7 @@ def _build_a16w16_workspace_spec(
     N: int,
 ) -> WorkspaceSpec | None:
     """Build workspace metadata from the already-resolved registry instance."""
-    needs_workspace = resolved_kid in SPLITK_KIDS
-    declares_workspace = instance.splitk_workspace_dtype is not None
-    if needs_workspace != declares_workspace:
-        raise RuntimeError(
-            "inconsistent OPUS a16w16 workspace registry for "
-            f"{registry_arch} kid {resolved_kid}"
-        )
+    needs_workspace = instance.splitk_workspace_dtype is not None
     if not needs_workspace:
         return None
 
@@ -305,9 +299,14 @@ def _build_a16w16_launch_plan(
             f"OPUS a16w16 requires bf16 XQ/WQ, got input dtype {input_dtype}"
         )
 
-    instance = get_kernel_instance(registry_arch, "a16w16", resolved_kid, output_dtype)
+    instance = get_kernel_instance(
+        registry_arch, "a16w16", resolved_kid, output_dtype, cu_num=cu_num
+    )
     if instance is None:
-        if get_kernel_instance(registry_arch, "a16w16", resolved_kid) is None:
+        if (
+            get_kernel_instance(registry_arch, "a16w16", resolved_kid, cu_num=cu_num)
+            is None
+        ):
             raise ValueError(
                 f"OPUS kid {resolved_kid} is not an a16w16 kernel for "
                 f"runtime arch {registry_arch}"
@@ -321,7 +320,7 @@ def _build_a16w16_launch_plan(
             f"OPUS kid {resolved_kid} requires M <= {instance.max_m}; got M={M}"
         )
 
-    needs_workspace = resolved_kid in SPLITK_KIDS
+    needs_workspace = instance.splitk_workspace_dtype is not None
     if instance.kernel_tag in _GFX1250_CO_TAGS and requested_split_k > 1:
         raise ValueError(
             f"gfx1250 CO kid {resolved_kid} does not support split-K; "
@@ -347,7 +346,9 @@ def _build_a16w16_launch_plan(
             f"OPUS kid {resolved_kid} is incompatible with "
             f"shape (batch={batch}, M={M}, N={N}, K={K})"
         )
-    if has_bias and resolved_kid not in BIAS_AWARE_KIDS:
+    if has_bias and resolved_kid not in group_kids(
+        "BIAS_AWARE_KIDS", registry_arch, cu_num=cu_num
+    ):
         raise ValueError(f"OPUS kid {resolved_kid} does not support bias")
     if has_bias and instance.kernel_tag == _GFX1250_FUSED_SPLITK_TAG:
         raise ValueError(
@@ -454,22 +455,30 @@ _A8W8_BLOCKSCALE_FAMILY = "a8w8_blockscale"
 _A8W8_BPRESHUFFLE_FAMILY = "a8w8_blockscale_bpreshuffle"
 _A8W8_MXSCALE_BMM_FAMILY = "a8w8_mxscale_bmm"
 
+# Derived, not restated. This used to be a second hand-kept copy of the tag list
+# in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY, and the two drifted the moment the
+# preshuffled-B families were added: get_kernel_instance consults the catalog's
+# copy first and rejected every preshuffled kid as "no registered OPUS kernel",
+# so adding the tags here alone changed nothing and the failure pointed at a
+# missing kernel rather than a missing list entry.
+#
+# Union across arches: this set is only used to answer "is this kid an MXFP8
+# BMM kernel at all", and the arch check has already happened in
+# get_kernel_instance by the time it is consulted.
 _A8W8_MXSCALE_BMM_TAGS = frozenset(
-    {
-        "a8w8_mxscale_bmm_flatmm_splitk",
-        "a8w8_mxscale_bmm_fused",
-        "a8w8_mxscale_bmm_minterleave",
-        "a8w8_mxscale_bmm_mouter",
-        "a8w8_mxscale_bmm_mouter_tunable",
-        "a8w8_mxscale_bmm_pipeline",
-        "a8w8_mxscale_bmm_wave8n2",
-        "a8w8_mxscale_bmm_wave4m2_selfload",
-    }
+    tag
+    for arch_families in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.values()
+    for tag in arch_families.get(_A8W8_MXSCALE_BMM_FAMILY, ())
 )
+# The preshuffled-B bdirect/blds kids run the same flatmm split-K kernel and
+# launcher as flatmm_splitk, so they take its FP32 partials workspace too.
 _A8W8_MXSCALE_BMM_WORKSPACE_TAGS = frozenset(
     {
         "a8w8_mxscale_bmm_flatmm_splitk",
         "a8w8_mxscale_bmm_fused",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
     }
 )
 _A8W8_MXSCALE_BMM_PREFETCH_TAGS = _A8W8_MXSCALE_BMM_WORKSPACE_TAGS | frozenset(
@@ -591,9 +600,13 @@ def _require_registered_kid_cached(
     family: str,
     resolved_kid: int,
     output_dtype: torch.dtype,
+    cu_num: int,
 ) -> int:
     """Validate one A8W8 registry entry and cache successful lookups."""
-    if get_kernel_instance(arch, family, resolved_kid, output_dtype) is None:
+    if (
+        get_kernel_instance(arch, family, resolved_kid, output_dtype, cu_num=cu_num)
+        is None
+    ):
         raise ValueError(
             "no registered OPUS kernel for "
             f"(arch={arch!r}, family={family!r}, kid={resolved_kid}, "
@@ -608,13 +621,16 @@ def _require_registered_kid(
     family: str,
     kid: object,
     output_dtype: torch.dtype,
+    cu_num: int,
 ) -> int:
     """Normalize a kid and require the matching A8W8 registry entry."""
     try:
         resolved_kid = int(kid)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"OPUS {family} kid must be an integer, got {kid!r}") from exc
-    return _require_registered_kid_cached(arch, family, resolved_kid, output_dtype)
+    return _require_registered_kid_cached(
+        arch, family, resolved_kid, output_dtype, cu_num
+    )
 
 
 def _build_a8w8_mxscale_bmm_plan(
@@ -627,6 +643,7 @@ def _build_a8w8_mxscale_bmm_plan(
     N: int,
     K: int,
     split_k: int,
+    cu_num: int,
 ) -> A8W8MxscaleBMMPlan:
     """Resolve one MXFP8 BMM kid, ABI split-K and FP32 workspace."""
     registry_arch = str(arch).lower().split(":", 1)[0]
@@ -639,6 +656,7 @@ def _build_a8w8_mxscale_bmm_plan(
         _A8W8_MXSCALE_BMM_FAMILY,
         resolved_kid,
         output_dtype,
+        cu_num=cu_num,
     )
     if instance is None:
         raise ValueError(
@@ -658,6 +676,25 @@ def _build_a8w8_mxscale_bmm_plan(
             f"got {requested_split_k}"
         )
     abi_split_k = max(1, requested_split_k)
+    if tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+        if not (
+            0 < M < 2048
+            and 0 < batch <= 16
+            and 0 < N <= (1 << 31) - 1
+            and 0 < K <= (1 << 31) - 1
+        ):
+            raise ValueError(
+                f"OPUS compact kid {resolved_kid} requires M in [1,2047], "
+                "batch in [1,16], positive int32 N and K"
+            )
+        if N % 128:
+            raise ValueError(f"OPUS compact kid {resolved_kid} requires N % 128 == 0")
+        output_bytes = 2 if output_dtype == torch.bfloat16 else 4
+        if max(M * batch * K, N * K, M * batch * N * output_bytes) > (1 << 31) - 1:
+            raise ValueError(
+                f"OPUS compact kid {resolved_kid} requires byte spans to fit signed int32"
+            )
+
     if min(M, batch, N, K) <= 0:
         raise ValueError(
             "OPUS BMM requires positive M, batch, N and K; "
@@ -678,8 +715,6 @@ def _build_a8w8_mxscale_bmm_plan(
         raise ValueError(
             f"OPUS BMM kid {resolved_kid} requires K % {k_align} == 0; got K={K}"
         )
-    if (instance.k1024_only or instance.k1024_lb1) and K != 1024:
-        raise ValueError(f"OPUS BMM kid {resolved_kid} requires K == 1024; got K={K}")
     if instance.direct_only and abi_split_k != 1:
         raise ValueError(f"OPUS BMM kid {resolved_kid} requires split_k <= 1")
 
@@ -748,10 +783,12 @@ def _get_cached_a8w8_mxscale_bmm_plan(
     N: int,
     K: int,
     split_k: int,
+    cu_num: int,
 ) -> A8W8MxscaleBMMPlan:
     """Return a scalar-only cached MXFP8 BMM launch plan."""
     return _build_a8w8_mxscale_bmm_plan(
         arch=arch,
+        cu_num=cu_num,
         kid=kid,
         output_dtype=output_dtype,
         M=M,

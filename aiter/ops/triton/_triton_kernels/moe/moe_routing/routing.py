@@ -9,19 +9,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
     _expt_data_compute_stage2,
     _expt_data_compute_stage2_fused,
 )
+from aiter.ops.triton._triton_kernels.moe.moe_routing.utils import keyed_add
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-
-@triton.jit
-def _keyed_add(x, y):
-
-    # we keep the key in the upper 16 bits of a uint32:
-    key_mask: tl.constexpr = 0xFFFF0000
-
-    kx = x & key_mask
-    ky = y & key_mask
-    z = tl.where(kx == ky, x + y - kx, y)
-    return z
 
 
 @triton.jit
@@ -78,7 +67,7 @@ def _routing_compute_indx(
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
-        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
         gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn)
@@ -94,7 +83,7 @@ def _routing_compute_indx(
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
-        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
         gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn, mask=mask)
@@ -156,7 +145,7 @@ def _routing_compute_indx_fused(
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
-        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
         gates = tl.load(TokensStart + expert)
@@ -171,7 +160,7 @@ def _routing_compute_indx_fused(
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
-        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
         gates = tl.load(TokensStart + expert, mask=mask)
