@@ -62,11 +62,11 @@ def herd_topk_candidates(
     width = candidate_ids.shape[1]
     stream = torch.cuda.current_stream(logits.device)
     packed = logits.contiguous()
-    if score_func == "sigmoid":
-        if correction_bias is None or correction_bias.shape != (experts,):
-            raise ValueError(
-                "sigmoid candidates require one correction bias per expert"
-            )
+    if score_func == "sigmoid" and (
+        correction_bias is None or correction_bias.shape != (experts,)
+    ):
+        raise ValueError("sigmoid candidates require one correction bias per expert")
+    if score_func == "sigmoid" and wave_size_of(logits.device.index) == 64:
         _run_sigmoid_candidate(
             packed,
             correction_bias,
@@ -83,7 +83,9 @@ def herd_topk_candidates(
 
         token_expert_ids = torch.empty_like(candidate_ids)
         topk_softmax(candidate_values, candidate_ids, token_expert_ids, packed, True)
-    elif score_func == "sqrtsoftplus":
+    elif score_func in ("sigmoid", "sqrtsoftplus"):
+        # The FlyDSL sigmoid selector ballots over a 64-lane wave, so wave32
+        # GPUs take the HIP top-k gating kernel sqrtsoftplus always uses.
         from ..topk import topk_gating_fwd
 
         topk_gating_fwd(
