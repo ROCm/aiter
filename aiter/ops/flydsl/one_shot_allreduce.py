@@ -913,9 +913,24 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
         super().__init__(**kwargs)
 
     @staticmethod
-    def _attn_ladder_split(tokens: int, nvb: int) -> int:
-        """Decode split for the acc_cache attn_res epilogue at (tokens, nvb),
-        TP8/gfx950/H=7168 (SILOTIGER-1277 iter003/iter004 measurements).
+    def _attn_ladder_split(tokens: int, nvb: int, hidden: int = 7168) -> int:
+        """Decode split for the acc_cache attn_res epilogue at (tokens, nvb,
+        hidden), TP8/gfx950 (SILOTIGER-1277 iter003/iter004/iter009 measurements).
+
+        H-AWARE (iter009): the split values {7,14} below are H=7168 divisors
+        (the shipped Kimi-K3 width); at any other hidden width neither divides,
+        so the pre-iter009 ladder fell back to UNSPLIT and the fused epilogue
+        lost to cdr for wide models (iter008: 0.92x @H=8192,T16). The epilogue
+        is occupancy-starved (1 WG/token, serial in the H-wide reduction) and
+        wins by width-slicing over ``split`` workgroups, so off the Kimi width
+        we pick the largest LEGAL slice -- the biggest SUPPORTED_SPLITS divisor
+        of ``hidden`` whose slice stays >=512 cols (one-wave tile). Measured
+        H=8192 nvb8 (runs/iter009_hsplit_8192_pow2.json): split=16 recovers the
+        fused win to 1.69x @T4 / 1.32x @T8 / 1.03x @T16 vs cdr (vs the 0.92x
+        unsplit loss); split=2 is too coarse (1.08x LOSS, 4096-wide slices).
+        Widths other than {7168,8192} use the same geometric largest-legal rule
+        for the low-T band (perf UNMEASURED there; the split kernel's
+        correctness is still gated per split by test_flydsl verify).
 
         The split epilogue parallelises the ~8us per-token fused epilogue over
         ``split`` workgroups; it wins while the GPU is occupancy-starved and
@@ -937,15 +952,24 @@ class OneShotAllReduceAttnRes(OneShotAllReduceRMSNorm):
         Legal splits>1 at H=7168 are 2, 7, 14 (a split=16 slice would be a
         sub-wave tile). nvb<4 is uncharacterised -> unsplit.
         """
-        if nvb >= 8:
-            if tokens <= 4:
-                return 14
-            return 7 if tokens <= 18 else 1
-        if nvb >= 4:
-            if tokens <= 4:
-                return 14
-            return 7 if tokens <= 8 else 1
-        return 1
+        if hidden == 7168:
+            if nvb >= 8:
+                if tokens <= 4:
+                    return 14
+                return 7 if tokens <= 18 else 1
+            if nvb >= 4:
+                if tokens <= 4:
+                    return 14
+                return 7 if tokens <= 8 else 1
+            return 1
+        # Non-Kimi widths (iter009): largest legal width-slice for the
+        # occupancy-starved low-T band; hand to cdr (unsplit) once the token
+        # count saturates the wire or the bank is too shallow to characterise.
+        if nvb < 4 or tokens > 16:
+            return 1
+        legal = [s for s in SUPPORTED_SPLITS
+                 if s > 1 and hidden % s == 0 and hidden // s >= 512]
+        return max(legal) if legal else 1
 
     @staticmethod
     def _attn_ladder_merge(tokens: int, split: int, out_norm: bool) -> bool:
