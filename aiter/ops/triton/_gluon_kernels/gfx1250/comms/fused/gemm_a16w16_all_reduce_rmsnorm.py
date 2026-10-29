@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GEMM + all-reduce + residual add + RMSNorm over 4 GPUs in one kernel. y = x W^T of
-a rank is a partial sum: the norm needs the sum of the 4. A GEMM program posts its tile
-of y to the inbox of each rank in the units of the fused all-reduce, so y never goes to
-memory, and a receiver adds and normalizes 3 rows as the fused all-reduce does."""
+"""The bf16 GEMM of gemm_a16w16 + all-reduce + residual add + RMSNorm over 4 GPUs in one
+kernel. y = x W^T (bf16 x and W) of a rank is a partial sum: the norm needs the sum of
+the 4. A GEMM program posts its tile of y to the inbox of each rank in the units of the
+fused all-reduce, so y never goes to memory, and a receiver adds and normalizes 3 rows
+as the fused all-reduce does."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -263,8 +264,8 @@ def _receive_norm(
                     gl.amd.cdna5.buffer_store(y.to(gl.bfloat16), out, at)
 
 
-_gemm_all_reduce_rmsnorm_repr = make_kernel_repr(
-    "_gemm_all_reduce_rmsnorm_kernel",
+_gemm_a16w16_all_reduce_rmsnorm_repr = make_kernel_repr(
+    "_gemm_a16w16_all_reduce_rmsnorm_kernel",
     [
         "RANK",
         "HIDDEN",
@@ -279,8 +280,10 @@ _gemm_all_reduce_rmsnorm_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_gemm_all_reduce_rmsnorm_repr, do_not_specialize=["tokens", "programs"])
-def _gemm_all_reduce_rmsnorm_kernel(
+@gluon.jit(
+    repr=_gemm_a16w16_all_reduce_rmsnorm_repr, do_not_specialize=["tokens", "programs"]
+)
+def _gemm_a16w16_all_reduce_rmsnorm_kernel(
     x,
     w,
     residual,

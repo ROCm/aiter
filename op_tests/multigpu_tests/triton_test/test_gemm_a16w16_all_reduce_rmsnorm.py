@@ -12,8 +12,8 @@ from aiter import logger
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.comms.all_reduce import all_reduce_free, all_reduce_init
-from aiter.ops.triton.comms.fused.gemm_all_reduce_rmsnorm import (
-    gemm_all_reduce_rmsnorm,
+from aiter.ops.triton.comms.fused.gemm_a16w16_all_reduce_rmsnorm import (
+    gemm_a16w16_all_reduce_rmsnorm,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.utils._triton import arch_info
@@ -85,14 +85,14 @@ def _worker(rank, init_method):
         calls[:-1].fill_(2**30 - 2)
         for i in range(4):
             x, w, residual, weight, *ref = _inputs(64 + i, rank, device)
-            outs = gemm_all_reduce_rmsnorm(
+            outs = gemm_a16w16_all_reduce_rmsnorm(
                 x, w, residual, weight, EPS, True, group, inboxes, calls
             )
             name = f"rank {rank} call {i} at the counter wrap"
             failures += _compare(name, outs, *ref, tp.device_group)
 
         for tokens, (x, w, residual, weight, *ref) in zip(TOKENS, cases):
-            outs = gemm_all_reduce_rmsnorm(
+            outs = gemm_a16w16_all_reduce_rmsnorm(
                 x, w, residual, weight, EPS, True, group, inboxes, calls
             )
             name = f"rank {rank} tokens {tokens}"
@@ -102,7 +102,9 @@ def _worker(rank, init_method):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             outs = [
-                gemm_all_reduce_rmsnorm(x, w, r, wt, EPS, True, group, inboxes, calls)
+                gemm_a16w16_all_reduce_rmsnorm(
+                    x, w, r, wt, EPS, True, group, inboxes, calls
+                )
                 for x, w, r, wt, _, _ in cases
             ]
         for _ in range(10):
@@ -118,7 +120,7 @@ def _worker(rank, init_method):
     return failures
 
 
-def test_gemm_all_reduce_rmsnorm():
+def test_gemm_a16w16_all_reduce_rmsnorm():
     ensure_spawn_method()
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     with mp.Pool(processes=WORLD_SIZE) as pool:
@@ -131,6 +133,8 @@ def test_gemm_all_reduce_rmsnorm():
 
 if __name__ == "__main__":  # CI runs the multi-GPU tests as scripts
     if SKIP:
-        logger.warning("test_gemm_all_reduce_rmsnorm skipped: needs 4 gfx1250 GPUs")
+        logger.warning(
+            "test_gemm_a16w16_all_reduce_rmsnorm skipped: needs 4 gfx1250 GPUs"
+        )
     else:
-        test_gemm_all_reduce_rmsnorm()
+        test_gemm_a16w16_all_reduce_rmsnorm()

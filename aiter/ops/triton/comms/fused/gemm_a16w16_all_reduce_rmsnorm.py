@@ -5,8 +5,8 @@ import torch
 import torch.distributed as dist
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx1250.comms.fused.gemm_all_reduce_rmsnorm import (
-    _gemm_all_reduce_rmsnorm_kernel,
+from aiter.ops.triton._gluon_kernels.gfx1250.comms.fused.gemm_a16w16_all_reduce_rmsnorm import (
+    _gemm_a16w16_all_reduce_rmsnorm_kernel,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
     create_shared_layouts,
@@ -21,7 +21,7 @@ _HIDDEN = {}  # the hidden size of each state, by the address of its calls tenso
 _ROW_PROGRAMS = 512  # receivers: more polling receivers can fill the GPU
 
 
-def gemm_all_reduce_rmsnorm(
+def gemm_a16w16_all_reduce_rmsnorm(
     x: torch.Tensor,
     w: torch.Tensor,
     residual: torch.Tensor,
@@ -34,8 +34,9 @@ def gemm_all_reduce_rmsnorm(
 ):
     """
     Returns out = RMSNorm(residual_out) and residual_out = all-reduce(x @ w.T) +
-    residual over the 4 ranks of ``group`` on gfx1250, with one kernel launch. All
-    ranks get the same bits.
+    residual over the 4 ranks of ``group`` on gfx1250, with one kernel launch. x @ w.T
+    is the bf16 GEMM of ``gemm_a16w16``, and the all-reduce + RMSNorm is the one of
+    ``all_reduce_rmsnorm_quant``. All ranks get the same bits.
 
     Args:
         x (torch.Tensor): bf16 (tokens, K), the input of this rank. K is a multiple
@@ -56,7 +57,7 @@ def gemm_all_reduce_rmsnorm(
     assert weight.is_contiguous()
     assert hidden >= 256 and hidden & (hidden - 1) == 0
     config, _ = get_gemm_config(
-        "GEMM-ALL-REDUCE-RMSNORM", tokens, hidden, k, backend="gluon"
+        "GEMM-A16W16-ALL-REDUCE-RMSNORM", tokens, hidden, k, backend="gluon"
     )
     rows, block_n, block_k = config["ROWS"], config["BLOCK_N"], config["BLOCK_K"]
     num_buffers, num_warps = config["NUM_BUFFERS"], config["num_warps"]
@@ -72,14 +73,14 @@ def gemm_all_reduce_rmsnorm(
     assert 2 * hidden * triples <= slot, "x is larger than max_bytes"
     assert triples <= calls.numel() - 1
 
-    _LOGGER.info("GEMM_ALL_REDUCE_RMSNORM [gluon]: x=%s w=%s", x.shape, w.shape)
+    _LOGGER.info("GEMM_A16W16_ALL_REDUCE_RMSNORM [gluon]: x=%s w=%s", x.shape, w.shape)
 
     out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=x.device)
     residual_out = torch.empty_like(out)
     wmma, operand_a, operand_b = create_wmma_layouts(num_warps)
     shared_a, shared_b = create_shared_layouts(4 * rows, block_n, block_k, "TN")
     programs = min(triples, _ROW_PROGRAMS)
-    _gemm_all_reduce_rmsnorm_kernel[(tiles + programs,)](
+    _gemm_a16w16_all_reduce_rmsnorm_kernel[(tiles + programs,)](
         x,
         w,
         residual,

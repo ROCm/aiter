@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Gluon GEMM + all-reduce + add + RMSNorm in one kernel against the Gluon GEMM and
-then the Gluon all-reduce + RMSNorm, and against the Gluon GEMM, RCCL and
-add_rmsnorm, on 4 gfx1250 GPUs. The time is the slowest rank, in a HIP graph."""
+"""Gluon bf16 GEMM (a16w16) + all-reduce + add + RMSNorm in one kernel against the Gluon
+gemm_a16w16 and then the Gluon all-reduce + RMSNorm, and against the Gluon gemm_a16w16,
+RCCL and add_rmsnorm, on 4 gfx1250 GPUs. The time is the slowest rank, in a HIP graph.
+"""
 
 import multiprocessing as mp
 
@@ -18,8 +19,8 @@ from aiter.ops.triton.comms.all_reduce import all_reduce_free, all_reduce_init
 from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant import (
     all_reduce_rmsnorm_quant,
 )
-from aiter.ops.triton.comms.fused.gemm_all_reduce_rmsnorm import (
-    gemm_all_reduce_rmsnorm,
+from aiter.ops.triton.comms.fused.gemm_a16w16_all_reduce_rmsnorm import (
+    gemm_a16w16_all_reduce_rmsnorm,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.utils._triton import arch_info
@@ -67,7 +68,7 @@ def benchmark(args, rank, device, tp, fused_state, ar_state):
             rmsnorm2d_fwd_with_add(out, y, res, res_out, weight, EPS, True, 0)
 
         fns = {
-            "fused": lambda x, w, res: gemm_all_reduce_rmsnorm(
+            "fused": lambda x, w, res: gemm_a16w16_all_reduce_rmsnorm(
                 x, w, res, weight, EPS, True, group, *fused_state
             ),
             "gemm_gluon_ar": lambda x, w, res: all_reduce_rmsnorm_quant(
