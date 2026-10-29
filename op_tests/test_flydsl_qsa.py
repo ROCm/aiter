@@ -268,7 +268,12 @@ def test_wide_cache_layout_spans_past_4gib():
 
 
 def test_wide_cold_rotation_reads_distinct_pages():
-    """Cold wide timing keeps the span and gives each call its own pages."""
+    """Cold wide timing keeps the span and reads a different page each call.
+
+    The replicas share one allocation, so the storage base is one pointer.
+    Each replica's ``data_ptr`` is that base plus its pitch. The wide gather
+    uses ``data_ptr``, not the storage base.
+    """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
     device = torch.device("cuda")
@@ -313,6 +318,14 @@ def test_wide_cold_rotation_reads_distinct_pages():
         pointers.append(copy.data_ptr())
     if len(set(pointers)) != 4:
         raise AssertionError(f"rotated pages alias: {pointers}")
+    bases = {copy.untyped_storage().data_ptr() for copy in rotated}
+    if len(bases) != 1:
+        raise AssertionError(f"wide replicas allocated separate pools: {bases}")
+    step = pointers[1] - pointers[0]
+    if step <= 0 or any(pointers[i] - pointers[0] != i * step for i in range(4)):
+        raise AssertionError(
+            f"rotated page addresses are not one pitch apart: {pointers}"
+        )
     del rotated
 
     seen = []
