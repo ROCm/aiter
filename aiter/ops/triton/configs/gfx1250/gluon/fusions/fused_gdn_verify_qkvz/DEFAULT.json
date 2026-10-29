@@ -2,6 +2,7 @@
     "any": {
         "num_warps": 16,
         "KL": 16,
-        "KS": 8
+        "KS": 8,
+        "chunk_num_warps": 4
     }
 }

@@ -4,9 +4,13 @@
 """Fused Gated DeltaNet speculative-verify step on ReplaySSM state, for gfx1250.
 
 One launch replaces the verify chain ``causal_conv1d_update -> gating ->
-ReplaySSM -> gated RMSNorm``."""
+ReplaySSM -> gated RMSNorm``. Two kernels: ``_fused_gdn_verify_chunk`` runs the
+window in chunk form (the state's products on WMMA, never the state itself),
+and ``_fused_gdn_verify`` runs it token by token on the rebuilt state, for the
+shapes that the first does not take."""
 
 import torch
+import triton
 
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
@@ -25,6 +29,37 @@ def _get_config(num_seqs: int) -> dict:
     config_dir = resolve_config_dir("fusions", _CONFIG_NAME, backend="gluon")
     configs = load_config_json(f"{config_dir}/DEFAULT.json")
     return select_leq_config(configs, num_seqs, prefix="S_LEQ_")
+
+
+# LDS a chunk-form program may plan for (of 320 KB): the checkpoints, records,
+# window rows and readouts of the group, before the compiler's scratch.
+_CHUNK_LDS_BUDGET = 240 * 1024
+
+
+def _chunk_kernel_fits(head_k_dim, head_v_dim, ratio, max_query_len, cap, num_warps):
+    """Whether ``_fused_gdn_verify_chunk`` takes the shape: the window's q|k rows
+    fill one 16-row WMMA tile, the record keys at least one 16-column tile, the
+    waves split V, and the group's checkpoints and records fit in LDS."""
+    t_p2 = triton.next_power_of_2(max_query_len)
+    cap_p2 = triton.next_power_of_2(cap)
+    k, v = head_k_dim, head_v_dim
+    lds = (
+        ratio * k * (v + 8) * 2  # checkpoints, bf16
+        + 2 * ratio * cap_p2 * (k + 8) * 2  # k and u records, bf16
+        + 16 * (k + 4) * 4  # the q|k rows, fp32
+        + 16 * ratio * v * 4  # q S0 and k S0, fp32
+        + 4 * t_p2 * ratio * v * 2  # v rows, residuals, readouts, bf16
+    )
+    return (
+        k == v
+        and k % 32 == 0
+        and v % (16 * num_warps) == 0
+        and ratio & (ratio - 1) == 0
+        and 2 * t_p2 <= 16
+        and cap_p2 >= 16
+        and num_warps in (4, 8)
+        and lds <= _CHUNK_LDS_BUDGET
+    )
 
 
 def fused_gdn_verify_qkvz(
@@ -94,12 +129,16 @@ def fused_gdn_verify_qkvz(
     Limits: gfx1250 only. ``K = V = 128`` and ``VH`` is a multiple of ``KH``. ``CAP``
     must hold two windows. The rows of the projections and the records, ``out``,
     ``conv_weight`` and the 1-D operands other than ``conv_state_indices`` must be
-    contiguous. The config is tuned for Qwen3.5-35B-A3B (head ratio 2, a window of 4
-    tokens, 16 records). Larger head ratios, windows and record buffers need more
-    registers and LDS. Measure them against the separate kernels first.
+    contiguous. The chunk-form kernel takes power-of-2 head ratios, windows of up to
+    8 tokens and at least 9 records while the group's checkpoints and records fit
+    in LDS; other shapes run token by token. The config is tuned for
+    Qwen3.5-35B-A3B (head ratio 2, a window of 4 tokens, 16 records) at 1 to 512
+    sequences. The chunk form sums in another order than the token loop, so the
+    two agree to the bf16 rounding of the outputs, not bitwise.
     """
     from aiter.ops.triton._gluon_kernels.gfx1250.gated_delta_net.fused_gdn_verify_qkvz import (
         _fused_gdn_verify,
+        _fused_gdn_verify_chunk,
     )
 
     _, v_heads, head_k_dim, head_v_dim = checkpoint.shape
@@ -142,7 +181,15 @@ def fused_gdn_verify_qkvz(
     config = _get_config(seqs)
     has_bias = conv_bias is not None
     rk, ru, rg = record_k.stride(), record_u.stride(), record_g.stride()
-    _fused_gdn_verify[(seqs * k_heads,)](
+    num_warps, kl, ks = config["num_warps"], config["KL"], config["KS"]
+    # The chunk-form kernel where it fits, else the token-loop kernel.
+    kernel, tile_args = _fused_gdn_verify, {"KL": kl, "KS": ks}
+    chunk_warps = config.get("chunk_num_warps", 0)
+    if chunk_warps and _chunk_kernel_fits(
+        head_k_dim, head_v_dim, ratio, max_query_len, cap, chunk_warps
+    ):
+        kernel, num_warps, tile_args = _fused_gdn_verify_chunk, chunk_warps, {}
+    kernel[(seqs * k_heads,)](
         query_start_loc,
         slot_idx,
         conv_state_indices,
@@ -187,11 +234,10 @@ def fused_gdn_verify_qkvz(
         RATIO=ratio,
         T_MAX=max_query_len,
         CAP=cap,
-        NW=config["num_warps"],
-        KL=config["KL"],
-        KS=config["KS"],
+        NW=num_warps,
+        **tile_args,
         PAD_SLOT_ID=pad_slot_id,
         HAS_BIAS=has_bias,
-        num_warps=config["num_warps"],
+        num_warps=num_warps,
     )
     return out
