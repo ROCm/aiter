@@ -188,6 +188,7 @@ def launch_gemm_a8w4_tdm(
     persistent_workers: Constexpr[int] = 0,
     rolled_drain: Constexpr[int] = 0,
     a_preshuffled: Constexpr[int] = 0,
+    layout_align_m: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -274,6 +275,7 @@ def launch_gemm_a8w4_tdm(
         num_buffers,
         a_is_fp4,
         a_preshuffled,
+        layout_align_m,
         n_experts,
         stage1_act,
         has_bias,
@@ -444,6 +446,9 @@ def launch_gemm_a8w4_tdm(
 
     _afp = "fp4" if a_is_fp4 else "fp8"
     _a_layout = "_apre" if a_preshuffled else ""
+    # Rows per expert alignment of the shared contiguous layout; > tile_m enables the gap-tile skip.
+    layout_align_m = int(layout_align_m) if int(layout_align_m) > tile_m else 0
+    _lalign = f"_la{layout_align_m}" if layout_align_m else ""
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     assert has_bias in (0, 1, 2, 3), "has_bias: 0 none, 1 bf16, 2 fp32, 3 fp16"
@@ -480,7 +485,7 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_lalign}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -585,6 +590,17 @@ def launch_gemm_a8w4_tdm(
                 lo = go_right.select(mid + 1, lo)
                 hi = go_right.select(hi, mid)
             expert = lo
+        if const_expr(layout_align_m > tile_m and cluster_m == 1 and cluster_n == 1):
+            # The layout aligns each expert to layout_align_m rows, a multiple of
+            # tile_m, so a tile can lie wholly in the gap between the previous
+            # expert's last valid row and this expert's aligned start. The bisect
+            # assigns such a tile to the next expert; skip it instead of
+            # computing padding rows nobody reads.
+            prev_e = (expert > 0).select(expert - 1, 0)
+            prev_e = (prev_e < n_experts).select(prev_e, n_experts - 1)
+            prev_end = (expert > 0).select(tile_map[prev_e], 0)
+            seg_start = (prev_end + (layout_align_m - 1)) // layout_align_m * layout_align_m
+            has_work = has_work & (blk_m >= seg_start)
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)

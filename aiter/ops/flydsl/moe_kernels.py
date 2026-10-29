@@ -3185,6 +3185,10 @@ _TOKEN_MULTIDEST_MIN_TOKENS = 64
 # Every destination costs a buffer descriptor held live across the store pass,
 # so the saving stops being free once they crowd the register budget.
 _TOKEN_MULTIDEST_MAX_TOPK = 8
+# EP8 keeps topk 16, but most routes are remote. Only the env-gated drop
+# variant may use that many destinations: a live descriptor per dropped route
+# is what blows the register budget.
+_EP_TOKEN_MULTIDEST_MAX_TOPK = 16
 
 
 def token_multidest_eligible(token_num: int, topk: int) -> bool:
@@ -3230,6 +3234,7 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
+    skip_dropped: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3242,6 +3247,7 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
+        skip_dropped=skip_dropped,
     )
 
 
@@ -3496,13 +3502,28 @@ def flydsl_moe_fused_quant_preshuffle(
             row_starts_i32 = masked_m
             route_max_m_arg = 1
         token_num = numel // int(source_topk) if source_topk > 0 else 0
+        # EP passes num_valid_routes, which the plain path refuses. The drop
+        # variant is safe there only when the token count is static: CUDA-graph
+        # capture must keep the route-indexed kernel. Default off.
+        ep_multidest = (
+            num_valid_routes is not None
+            and row_to_token is None
+            and os.environ.get("AITER_FLYDSL_EP_TOKEN_MULTIDEST", "0")
+            in ("1", "true", "True")
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        multidest_max_topk = (
+            _EP_TOKEN_MULTIDEST_MAX_TOPK
+            if ep_multidest
+            else _TOKEN_MULTIDEST_MAX_TOPK
+        )
         use_token_multidest = (
             not prequantized
             and not payload_preshuffled
             and not remap_rows
             and not fuse_ep_psum
-            and num_valid_routes is None
-            and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
+            and (num_valid_routes is None or ep_multidest)
+            and 1 < int(source_topk) <= multidest_max_topk
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
             and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
             in ("1", "true", "True")
@@ -3551,6 +3572,7 @@ def flydsl_moe_fused_quant_preshuffle(
                     feat_dim, wmma_rep, quant_mode, md_ksplit
                 ),
                 ksplit=md_ksplit,
+                skip_dropped=ep_multidest,
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
             _dispatch_compiled(

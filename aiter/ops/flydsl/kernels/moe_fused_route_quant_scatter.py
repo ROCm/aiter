@@ -348,7 +348,10 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         row_addr = c.payload_base + payload_row * payload_bytes_per_row
         dst_payload.append(
             buffer_ops.create_buffer_resource_from_addr(
-                row_addr, num_records_bytes=payload_records
+                row_addr,
+                num_records_bytes=getattr(
+                    dst, "payload_num_records", payload_records
+                ),
             )
         )
 
@@ -2111,6 +2114,7 @@ def build_moe_token_multidest_quant_module(
     quant_mode: str = "fp4",
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
     ksplit: int = 1,
+    skip_dropped: bool = False,
 ):
     """Quantize each token once and scatter the result to its ``topk`` routed rows.
 
@@ -2169,6 +2173,7 @@ def build_moe_token_multidest_quant_module(
         f"{'_scpk' if scale_pack_dwords else ''}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
+        f"{'_drop' if skip_dropped else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -2279,22 +2284,50 @@ def build_moe_token_multidest_quant_module(
             route0 = token_eff * fx.Int32(topk)
             # Scalar loads: the route is wave-uniform, and landing each row in
             # an SGPR is what keeps its destination descriptor uniform too.
-            rows, any_live = _token_multidest_live_rows(
-                [
-                    fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
-                    for k in range_constexpr(topk)
+            raw_rows = [
+                fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
+                for k in range_constexpr(topk)
+            ]
+            if const_expr(skip_dropped):
+                # An EP route owned by another rank carries DROPPED_ROUTE_ROW.
+                # Its payload takes a zero-length descriptor and its scale dword
+                # lands past _SCALE_RSRC_MAX_BYTES, so the hardware drops both.
+                mapped = [r >= c0_i32 for r in raw_rows]
+                any_live = mapped[0]
+                for flag in mapped[1:]:
+                    any_live = any_live | flag
+                token_live = valid & any_live
+                pay_records = token_live.select(
+                    fx.Int32(payload_bytes_per_row), c0_i32
+                )
+                rows = [
+                    fx.Uint32(m.select(r, c0_i32)) for r, m in zip(raw_rows, mapped)
                 ]
-            )
-            token_live = valid & any_live
-            pay_records = token_live.select(fx.Int32(payload_bytes_per_row), c0_i32)
+                scales = [
+                    m.select(
+                        _token_multidest_scale_base(
+                            row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
+                        ),
+                        fx.Uint32(fx.Int32(0x20000000)),
+                    )
+                    for row, m in zip(rows, mapped)
+                ]
+                pay_recs = [m.select(pay_records, c0_i32) for m in mapped]
+            else:
+                rows, any_live = _token_multidest_live_rows(raw_rows)
+                token_live = valid & any_live
+                pay_records = token_live.select(
+                    fx.Int32(payload_bytes_per_row), c0_i32
+                )
+                scales = [
+                    _token_multidest_scale_base(
+                        row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
+                    )
+                    for row in rows
+                ]
+                pay_recs = [pay_records for _ in rows]
             # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
             scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
-            scales = [
-                _token_multidest_scale_base(
-                    row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
-                )
-                for row in rows
-            ]
 
             block_in_wave = lane // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
@@ -2333,7 +2366,10 @@ def build_moe_token_multidest_quant_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=lane_in_block == c0_i32,
-                payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
+                payload_dests=[
+                    SimpleNamespace(payload_row_i32=row, payload_num_records=nrec)
+                    for row, nrec in zip(rows, pay_recs)
+                ],
                 # Scale destinations; the payload keeps its own list above.
                 dests=[
                     SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
