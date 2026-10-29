@@ -53,13 +53,17 @@ GFX_CU_NUM_MAP = {
 }
 
 
-def target_num_xcds(gfx: str, cu_num: int, default: int = 8) -> int:
+def target_num_xcds(gfx: str, cu_num: int) -> int:
     # XCD counts for SKUs that differ from the eight-XCD default.
-    return {
+    non_standard_xcds = {
         ("gfx950", 128): 4,  # MI350P
         ("gfx942", 80): 4,  # MI308X
         ("gfx942", 228): 6,  # MI300A
-    }.get((gfx, int(cu_num)), default)
+    }
+    target = (gfx, int(cu_num))
+    if target not in non_standard_xcds:
+        return 8
+    return non_standard_xcds[target]
 
 
 @functools.cache
