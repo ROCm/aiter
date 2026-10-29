@@ -848,6 +848,7 @@ def _window_sequence_heads(
     s_seq,
     s_dim,
     s_tok,
+    stride_ci,
     pad_slot_id,
     c0,
     o_seg,
@@ -864,7 +865,7 @@ def _window_sequence_heads(
     # Load sequence scalars first, then state and x rows
     a = tl.load(qsl_ptr + seq, mask=in_range, other=0)
     L = tl.load(qsl_ptr + seq + 1, mask=in_range, other=0) - a
-    slot = tl.load(ci_ptr + seq, mask=in_range, other=pad_slot_id)
+    slot = tl.load(ci_ptr + seq * stride_ci, mask=in_range, other=pad_slot_id)
     init = tl.load(hi_ptr + seq, mask=in_range, other=0).to(tl.int1)
     live = in_range & (L > 0) & (slot != pad_slot_id)
     cl = tl.arange(0, BD)
@@ -945,6 +946,7 @@ def _causal_conv1d_fwd_split_qkv_window_kernel(
     s_seq,
     s_dim,
     s_tok,
+    stride_ci,
     pad_slot_id,
     n_tiles,
     n_head_programs,
@@ -983,6 +985,7 @@ def _causal_conv1d_fwd_split_qkv_window_kernel(
                 s_seq,
                 s_dim,
                 s_tok,
+                stride_ci,
                 pad_slot_id,
                 c0,
                 (seg * T).to(tl.int64) * KD,

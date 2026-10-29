@@ -108,6 +108,7 @@ def _check(
     preserve_input_dtype=True,
     with_bias=False,
     activation="silu",
+    strided_ci=False,
     seed=0,
 ):
     n_slots = n_slots or max(16, 2 * len(seqlens))
@@ -125,6 +126,9 @@ def _check(
         state_dtype,
         seed,
     )
+    if strided_ci:
+        # Odd entries hold other sequences' slots, so a unit-stride read is caught
+        ci = torch.stack([ci, ci.roll(1)], dim=1).flatten()[::2]
     bias = (
         torch.randn((x.shape[0],), dtype=torch.float32, device="cuda") * 0.1
         if with_bias
@@ -236,6 +240,13 @@ def test_qwen3_next_dims(k_dim, v_dim, w_dtype, with_bias):
     )
 
 
+@pytest.mark.parametrize("window", ["1", "0"])
+def test_strided_cache_indices(monkeypatch, window):
+    # cache_indices with stride 2 (e.g. indices[::2]) on both kernels.
+    monkeypatch.setenv("AITER_CONV1D_SPLIT_QKV_WINDOW", window)
+    _check([257, 3, 40, 1], [True, False, True, True], strided_ci=True)
+
+
 @pytest.mark.parametrize("activation", [None, "silu"])
 def test_activation(activation):
     _check([257, 3], [True, False], activation=activation)
@@ -274,12 +285,13 @@ def test_2d_tiled_kernel_kimi_k3_shapes(monkeypatch, seqlens, has_init, row_extr
 @pytest.mark.parametrize("opt_out", [False, True])
 def test_window_kernel_selection(monkeypatch, opt_out):
     # x with unit channel stride selects the sliding-window kernel; AITER_CONV1D_SPLIT_QKV_WINDOW=0 turns it off.
-    if opt_out:
-        monkeypatch.setenv("AITER_CONV1D_SPLIT_QKV_WINDOW", "0")
+    monkeypatch.setenv("AITER_CONV1D_SPLIT_QKV_WINDOW", "0" if opt_out else "1")
     spy = _LaunchSpy(conv_prefill._causal_conv1d_fwd_split_qkv_window_kernel)
     monkeypatch.setattr(conv_prefill, "_causal_conv1d_fwd_split_qkv_window_kernel", spy)
     _check([700, 33], [True, False])
-    assert spy.launches == (0 if opt_out else 1)
+    # Archs without a window config (e.g. gfx942) use the 2D-tiled kernel
+    has_config = conv_prefill.has_conv_config(conv_prefill._WINDOW_CONFIG_NAME)
+    assert spy.launches == (0 if opt_out or not has_config else 1)
 
 
 def test_token_contiguous_x_uses_2d_kernel(monkeypatch):

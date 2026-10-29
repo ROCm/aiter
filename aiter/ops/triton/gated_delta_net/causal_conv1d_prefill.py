@@ -375,6 +375,8 @@ def _window_config(x, weight, conv_states, k_dim, v_dim) -> dict | None:
         or not has_conv_config(_WINDOW_CONFIG_NAME)
         or weight.dim() != 2
         or weight.shape[1] != 4
+        # Taps are loaded as contiguous [dim, 4] rows
+        or not weight.is_contiguous()
         or x.stride(0) != 1
         # State must hold x exactly
         or conv_states.dtype not in (x.dtype, torch.float32)
@@ -421,8 +423,6 @@ def _causal_conv1d_split_qkv_window(
         cache_indices = torch.arange(n_seq, dtype=torch.int32, device=x.device)
     if has_initial_state is None:
         has_initial_state = torch.zeros(n_seq, dtype=torch.bool, device=x.device)
-    if not weight.is_contiguous():
-        weight = weight.contiguous()
 
     # Smallest sequence-start vector that fits, up to SEQ_VEC
     config["SEQ_VEC"] = min(config["SEQ_VEC"], max(16, triton.next_power_of_2(n_seq)))
@@ -451,6 +451,7 @@ def _causal_conv1d_split_qkv_window(
         conv_states.stride(0),
         conv_states.stride(1),
         conv_states.stride(2),
+        cache_indices.stride(0),
         pad_slot_id,
         n_tiles,
         n_head_programs,
