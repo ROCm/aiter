@@ -17,8 +17,8 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
-from .kernels.pa_decode_kernel import compile_pa_decode_tile
-from .kernels.pa_decode_plan import PADecodePlan
+from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_plan import PADecodePlan, context_partition_sizes
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     DUAL_REGISTER_PARTITIONS,
@@ -70,7 +70,7 @@ def launch_pa_decode_ps_reduce(
             f"{props.multi_processor_count} partitions"
         )
     arch = get_gfx_runtime()
-    wave = props.warp_size
+    wave = 32 if arch == "gfx1250" else 64
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = 1024 // wave
     batch, kv_heads = output.shape[0], output.shape[2]
@@ -199,9 +199,11 @@ def pa_decode(
 ) -> None:
     """Decode FP8 or BF16 K/V using planned context partitions.
 
-    ``context_partition_size`` defaults to the work plan's partition size.
-    Plans support 256 tokens on all targets and 128 tokens on gfx1250.
-    New plans default to 128 on gfx1250 and 256 on gfx942/gfx950.
+    The work plan sets the context partition size. Plans support 256 tokens on
+    all targets and 128 tokens on gfx1250; new plans default to 128 on gfx1250
+    and 256 on gfx942/gfx950. ``context_partition_size`` may restate the plan's
+    size. 256, the only value accepted before plans recorded a size, remains
+    valid with any plan.
 
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
@@ -263,14 +265,6 @@ def pa_decode(
     """
     if not isinstance(work_plan, PADecodePlan):
         raise TypeError("work_plan must be a PADecodePlan")
-    if context_partition_size is None:
-        context_partition_size = work_plan.context_partition_size
-    if type(context_partition_size) is not int:
-        raise TypeError("context_partition_size must be an int")
-    if context_partition_size != work_plan.context_partition_size:
-        raise ValueError(
-            "context_partition_size must match work_plan.context_partition_size"
-        )
     if query_scale is not None:
         raise NotImplementedError(
             "pa_decode does not support externally quantized FP8 queries"
@@ -352,6 +346,23 @@ def pa_decode(
         raise NotImplementedError(
             f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
+    if context_partition_size is not None:
+        if type(context_partition_size) is not int:
+            raise TypeError("context_partition_size must be an int")
+        supported_sizes = context_partition_sizes(arch)
+        if context_partition_size not in supported_sizes:
+            raise NotImplementedError(
+                f"pa_decode supports context_partition_size in {supported_sizes} "
+                f"on {arch}, got {context_partition_size}"
+            )
+        if context_partition_size not in (
+            KV_COMPUTE_BLOCK,
+            work_plan.context_partition_size,
+        ):
+            raise ValueError(
+                "context_partition_size must match work_plan.context_partition_size"
+            )
+    context_partition_size = work_plan.context_partition_size
     is_bf16_kv = key_cache.dtype == torch.bfloat16
     kv_dtype = "bf16" if is_bf16_kv else "fp8"
     expected_kv_dtype = torch.bfloat16 if is_bf16_kv else dtypes.fp8

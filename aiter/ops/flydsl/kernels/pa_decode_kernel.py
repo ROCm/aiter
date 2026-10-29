@@ -14,15 +14,16 @@ BF16 K/V use vector-8 caches and native BF16 Q/K/P/V MFMA operands, with
 f32 softmax state and accumulation. BF16 KV does not use quantization scales.
 
 gfx1250 uses wave32 WMMA with native FP8 Q/P conversion or BF16 operands.
-Its four waves process 64- or 128-token compute tiles within each 256-token
-plan tile. Packed FP8 D128/D256 full-attention paths use K128 WMMA; other
-FP8 paths use K64 and BF16 uses K32. Supported layouts use TDM K/V transfers,
-with two LDS buffers where capacity permits. One-partition plans can write
-final output directly; other plans use the shared partition reducer.
-BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
-with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
-Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
-using the 64-token pipeline.
+Its four waves process 64- or 128-token compute tiles within each 128- or
+256-token plan partition. Packed FP8 D128/D256 full-attention paths use K128
+WMMA; other FP8 paths use K64 and BF16 uses K32. Supported layouts use TDM K/V
+transfers, with two LDS buffers where capacity permits. One-partition plans can
+write final output directly; other plans use the shared partition reducer.
+BF16 page128 caches at D64/D128/D256 use a packed-page pipeline with resident Q
+and fused PV accumulation; D256 is limited to 32 query rows, and plain V caches
+require D64/D128 with two to four query tiles. Page16 BF16 caches at these
+dimensions retain vector-8 packing in LDS while using the 64-token pipeline.
+Both V layouts are gathered into the same packed LDS order.
 
 Logical layouts (not preshuffled):
 
@@ -68,6 +69,7 @@ from .pa_decode.traits import (
     PaDecodeSchedule,
     PaDecodeTraits,
 )
+from .pa_decode_plan import context_partition_sizes
 
 __all__ = [
     "FP8_PACK_K",
@@ -142,7 +144,7 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     direct_output: bool = False,
     trans_k: bool = True,
-    context_partition_size: int | None = None,
+    context_partition_size: int,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -168,6 +170,9 @@ def compile_pa_decode_tile(
     slot's byte span fits signed i32, retaining the dtype's 2-byte alignment.
 
     ``work_capacity`` is a positive host integer matching the work plan.
+    ``context_partition_size`` must equal the work plan's partition size. It has
+    no default because launches cannot detect a mismatch: plan records count
+    partitions, so a different size silently skips or repeats context.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
     ``trans_k=False`` is not implemented.
@@ -185,8 +190,16 @@ def compile_pa_decode_tile(
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
-    if context_partition_size is None:
-        context_partition_size = 128 if architecture == "gfx1250" else KV_COMPUTE_BLOCK
+    if architecture not in ("gfx942", "gfx950", "gfx1250"):
+        raise NotImplementedError(f"PA decode does not support {architecture}")
+    supported_sizes = context_partition_sizes(architecture)
+    if type(context_partition_size) is not int:
+        raise TypeError("context_partition_size must be an int")
+    if context_partition_size not in supported_sizes:
+        raise NotImplementedError(
+            f"{architecture} supports context_partition_size in {supported_sizes}, "
+            f"got {context_partition_size}"
+        )
     if architecture == "gfx1250":
         if direct_output and num_partitions != 1:
             raise ValueError("direct_output requires a one-partition plan")
@@ -220,10 +233,6 @@ def compile_pa_decode_tile(
             query_splits=query_splits,
             context_partition_size=context_partition_size,
         )
-    if architecture not in ("gfx942", "gfx950"):
-        raise NotImplementedError(f"PA decode does not support {architecture}")
-    if context_partition_size != KV_COMPUTE_BLOCK:
-        raise NotImplementedError("128-token context partitions require gfx1250")
     if direct_output:
         raise NotImplementedError("direct_output requires gfx1250")
     schedule = PaDecodeSchedule.select(
@@ -465,11 +474,10 @@ def compile_gfx1250_pa_decode(
     compute_dtype="fp8",
     direct_output=False,
     query_splits=1,
-    context_partition_size=128,
+    context_partition_size,
 ):
-    if type(context_partition_size) is not int or context_partition_size not in (
-        128,
-        256,
+    if type(context_partition_size) is not int or (
+        context_partition_size not in context_partition_sizes("gfx1250")
     ):
         raise ValueError("gfx1250 context_partition_size must be 128 or 256")
     if query_splits not in (1, 2, 3, 4) or query_length % query_splits:

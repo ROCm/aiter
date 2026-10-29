@@ -17,9 +17,14 @@ DEFAULT_MAX_BATCH_SIZE = 4096
 _PLAN_SCAN_LDS_BYTES = 512
 
 
+def context_partition_sizes(architecture: str) -> tuple[int, ...]:
+    """Supported plan partition sizes in tokens; new plans use the first."""
+    return (128, 256) if architecture == "gfx1250" else (256,)
+
+
 @cache
 def compile_pa_decode_plan(
-    batch, capacity, max_parts, sliding_window, query_length, context_partition_size=256
+    batch, capacity, max_parts, sliding_window, query_length, context_partition_size
 ):
     """Allocate packed tasks with one block-wide scan, without GPU readback."""
     threads = max(64, min(1024, 1 << (capacity - 1).bit_length()))
@@ -158,6 +163,8 @@ class PADecodePlan:
     ``work_info`` is [capacity, 4]: sequence, begin/end absolute context partition,
     original context length. Ranges are half-open and cover the MTP union.
     ``reduce_info`` is [batch, 2]: first packed task, actual task count.
+    ``context_partition_size`` gives the token count of each partition; omitted,
+    it is the default for ``work_info``'s device, as for new plans.
     """
 
     work_info: torch.Tensor
@@ -167,7 +174,15 @@ class PADecodePlan:
     sliding_window: int = 0
     query_length: int = 1
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE
-    context_partition_size: int = 256
+    context_partition_size: int | None = None
+
+    def __post_init__(self):
+        if self.context_partition_size is None:
+            properties = torch.cuda.get_device_properties(self.work_info.device)
+            arch = properties.gcnArchName.split(":", 1)[0]
+            object.__setattr__(
+                self, "context_partition_size", context_partition_sizes(arch)[0]
+            )
 
     @property
     def capacity(self) -> int:
@@ -185,7 +200,7 @@ class PADecodePlan:
         if type(self.context_partition_size) is not int:
             raise TypeError("plan context_partition_size must be an int")
         arch = properties.gcnArchName.split(":", 1)[0]
-        supported_sizes = (128, 256) if arch == "gfx1250" else (256,)
+        supported_sizes = context_partition_sizes(arch)
         if self.context_partition_size not in supported_sizes:
             raise ValueError(
                 f"plan context_partition_size must be in {supported_sizes} on {arch}"
@@ -264,7 +279,7 @@ def plan_pa_decode(
     properties = torch.cuda.get_device_properties(dev)
     if context_partition_size is None:
         context_partition_size = (
-            (128 if properties.gcnArchName.split(":", 1)[0] == "gfx1250" else 256)
+            context_partition_sizes(properties.gcnArchName.split(":", 1)[0])[0]
             if plan is None
             else plan.context_partition_size
         )

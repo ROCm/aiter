@@ -28,6 +28,7 @@ def device(monkeypatch):
     return torch.device("cuda")
 
 
+@pytest.mark.parametrize("partition", [None, 256])
 @pytest.mark.parametrize(
     "batch,max_parts,budget,window,query_length",
     [
@@ -39,9 +40,11 @@ def device(monkeypatch):
         (4096, None, 8192, 0, 1),
     ],
 )
-def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
+def test_pa_decode_plan(
+    device, batch, max_parts, budget, window, query_length, partition
+):
     """Packed tasks cover every visible tile and remain valid after graph refresh."""
-    from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
+    from aiter.ops.flydsl.kernels.pa_decode_plan import PADecodePlan, plan_pa_decode
 
     def check(plan, lengths):
         info = plan.reduce_info.cpu().tolist()
@@ -79,8 +82,18 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         2,
         max_partitions=max_parts,
         workgroup_budget=budget,
+        context_partition_size=partition,
         sliding_window=window,
         query_length=query_length,
+    )
+    # New and hand-built plans share the architecture's default partition size.
+    default = 128 if get_gfx_runtime() == "gfx1250" else 256
+    assert plan.context_partition_size == (partition or default)
+    assert (
+        PADecodePlan(
+            plan.work_info, plan.reduce_info, 2, plan.max_partitions
+        ).context_partition_size
+        == default
     )
     check(plan, lengths)
     pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
@@ -218,6 +231,20 @@ _COMMON_CASES = [
             "sink_dtype": torch.float32,
         },
     ),
+    # gfx1250 defaults to 128-token plans; explicit 256-token windowed plans
+    # start tasks mid-sequence at 256-token boundaries.
+    (
+        "window-cp256",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+            "window": 257,
+            "lengths": (0, 1, 255, 256, 257, 1027, 4099),
+            "partition": 256,
+        },
+    ),
     (
         "head1024",
         {
@@ -274,6 +301,35 @@ _FP8_CASES = _COMMON_CASES + [
         "default-cap",
         {"group_size": 16, "block_size": 128, "max_partitions": None},
     ),
+    # Dense D128/page128 with 17-64 query rows exchanges every query tile's
+    # softmax statistics together; QL3/G8 pads its second tile.
+    *[
+        (
+            f"batched-softmax-mtp{length}-g{group}",
+            {
+                "query_length": length,
+                "kv_heads": 2,
+                "group_size": group,
+                "block_size": 128,
+                "max_partitions": 7,
+                "sink_dtype": torch.float32,
+                "fp8_batched_softmax": True,
+            },
+        )
+        for length, group in ((4, 16), (3, 8))
+    ],
+    (
+        "batched-softmax-cp256",
+        {
+            "query_length": 4,
+            "group_size": 8,
+            "block_size": 128,
+            "max_partitions": 3,
+            "lengths": (0, 1, 255, 256, 257, 1027, 4099),
+            "partition": 256,
+            "fp8_batched_softmax": True,
+        },
+    ),
 ]
 _BF16_CASES = _COMMON_CASES + [
     (
@@ -309,7 +365,17 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
-    ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
+    # 256, the only argument accepted before plans recorded their size, still
+    # suits gfx1250's default 128-token plans.
+    (
+        "graph-workspace",
+        {
+            "query_length": 4,
+            "max_partitions": 7,
+            "capture": True,
+            "partition_argument": 256,
+        },
+    ),
     (
         "loose-bound",
         {
@@ -344,6 +410,59 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for dim in (256, 128)
     ],
+    # gfx1250 gathers plain V into the packed chunks used by transposed V:
+    # page16 at D64/D128/D256 and page128 D64/D128 with two to four query tiles.
+    *[
+        (
+            f"plain-v-page16-head{dim}",
+            {
+                "trans_v": False,
+                "head_dim": dim,
+                "block_size": 16,
+                "max_partitions": 4,
+                "bf16_packed": True,
+            },
+        )
+        for dim in (64, 128, 256)
+    ],
+    *[
+        (
+            f"plain-v-page128-head{dim}-mtp{length}-g{group}",
+            {
+                "trans_v": False,
+                "query_length": length,
+                "group_size": group,
+                "head_dim": dim,
+                "block_size": 128,
+                "max_partitions": 4,
+                "bf16_packed": True,
+            },
+        )
+        for dim, length, group in ((64, 4, 8), (128, 3, 16), (128, 4, 16))
+    ],
+    (
+        "plain-v-page128-window",
+        {
+            "trans_v": False,
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+            "window": 257,
+            "sink_dtype": torch.float32,
+            "bf16_packed": True,
+        },
+    ),
+    # One query tile retains padded plain-V staging.
+    (
+        "plain-v-page128-decode",
+        {
+            "trans_v": False,
+            "block_size": 128,
+            "max_partitions": 4,
+            "bf16_packed": False,
+        },
+    ),
 ]
 # FP8 head 256, page 64, plain V, uniform query length with at most 32 query
 # rows: the gfx950 pipe, for per-tensor and per-token scales. A plan-independent
@@ -439,6 +558,9 @@ _INVALID_CASES = [
     ),
     ("vector16-k", ValueError, "key_cache shape must be"),
     ("vector16-v", ValueError, "transposed value_cache shape must be"),
+    ("partition-type", TypeError, "context_partition_size must be an int"),
+    ("partition-size", NotImplementedError, "supports context_partition_size"),
+    ("partition-mismatch", ValueError, "must match work_plan.context_partition_size"),
 ]
 
 
@@ -459,6 +581,14 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
             key_scale=torch.ones(1, dtype=torch.float32, device=query.device),
             value_scale=torch.ones(1, dtype=torch.float32, device=query.device),
         )
+    elif invalid == "partition-type":
+        options["context_partition_size"] = 256.0
+    elif invalid == "partition-size":
+        options["context_partition_size"] = 512
+    elif invalid == "partition-mismatch":
+        # Only the legacy 256 may differ from the plan's size.
+        plan = pa.plan_pa_decode(rest[0], 1, context_partition_size=256)
+        options["context_partition_size"] = 128
     elif invalid == "vector16-k":
         key = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=query.device)
     elif invalid == "vector16-v":
@@ -483,9 +613,10 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
 def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256):
     """Zero K and one-hot V in channel (token // tokens_per_channel) % dim.
 
-    With 256 tokens per channel each tile owns one output channel, so a task
-    that drops or repeats a tile changes that channel's mean. With one, a row's
-    output marks exactly the tokens it sees, and zero K keeps FP8 P exact.
+    With 256 tokens per channel, each 256-token span owns one output channel,
+    so a task that drops or repeats any 128- or 256-token plan partition changes
+    that channel's mean. With one, a row's output marks exactly the tokens it
+    sees, and zero K keeps FP8 P exact.
     Scales are explicit because a zero K must not reach the quantizer.
     """
     dim, page = value.shape[-1], value.shape[2]
@@ -518,6 +649,17 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         assert pipe == (arch == "gfx950")
         if pipe:
             assert (staged > 0) == (case["staged"] is not False)
+
+
+def _check_gfx1250_policy(case, plan, compiled):
+    """Pin gfx1250 cases to the plan's partition size and their staging path."""
+    from aiter.ops.flydsl.kernels.pa_decode_kernel import _GFX1250_PA_DECODE_CACHE
+
+    traits = next(t for t, c in _GFX1250_PA_DECODE_CACHE.items() if c is compiled)
+    assert traits.context_partition_size == plan.context_partition_size
+    for name in ("fp8_batched_softmax", "bf16_packed"):
+        if case[name] is not None:
+            assert getattr(traits, name) == case[name]
 
 
 @pytest.mark.parametrize(
@@ -582,6 +724,10 @@ def test_pa_decode(case, device, monkeypatch):
             "wide": False,
             "pipe": False,
             "staged": None,
+            "partition": None,
+            "partition_argument": None,
+            "fp8_batched_softmax": None,
+            "bf16_packed": None,
         },
         **case,
     )
@@ -599,6 +745,10 @@ def test_pa_decode(case, device, monkeypatch):
             and case["head_dim"] != 64
         ):
             pytest.skip("gfx1250 supports head_dim 64 or multiples of 128")
+    elif case["kv_dtype"] == "bf16" and not case["trans_v"]:
+        pytest.skip(f"{arch} BF16 requires a transposed value cache")
+    elif case.get("invalid_input") == "partition-mismatch":
+        pytest.skip(f"{arch} supports only 256-token partitions")
     query_length, kv_heads, group_size, dim, page, window = (
         case[name]
         for name in (
@@ -674,6 +824,7 @@ def test_pa_decode(case, device, monkeypatch):
         "value_scale": value_scale,
         "sinks": sinks,
         "sliding_window": window,
+        "context_partition_size": case["partition_argument"],
         "max_context_length": (
             None
             if case["max_context"] is None
@@ -690,6 +841,7 @@ def test_pa_decode(case, device, monkeypatch):
         kv_heads,
         max_partitions=case["max_partitions"],
         workgroup_budget=case["budget"],
+        context_partition_size=case["partition"],
         query_length=query_length,
         sliding_window=window,
     )
@@ -697,12 +849,13 @@ def test_pa_decode(case, device, monkeypatch):
         _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch)
         return
 
-    compile_kwargs = []
+    compile_kwargs, compiled = [], []
     compile_tile = pa.compile_pa_decode_tile
 
     def spy_tile(**kwargs):
         compile_kwargs.append(kwargs)
-        return compile_tile(**kwargs)
+        compiled.append(compile_tile(**kwargs))
+        return compiled[-1]
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
 
@@ -737,6 +890,8 @@ def test_pa_decode(case, device, monkeypatch):
     launch()
     check()
     _check_pipe_policy(pa, case, arch, compile_kwargs)
+    if arch == "gfx1250":
+        _check_gfx1250_policy(case, plan, compiled[-1])
     if case["capture"]:
         # Compile/allocate before capture; replay must observe changed query data.
         capture_stream = torch.cuda.Stream()

@@ -899,7 +899,9 @@ class Gfx1250Traits:
         # The widest BF16 MTP tile fits by staging one query tile at a time.
         full = self.m_tiles * 16 * self.q_stride
         return (
-            1 if full + self.kv_stride + self.p_bytes + 576 > 327680 else self.m_tiles
+            1
+            if full + self.kv_stride + self.p_bytes + self.stats_bytes > 327680
+            else self.m_tiles
         )
 
     @property
@@ -976,7 +978,13 @@ class Gfx1250Traits:
 
     @property
     def fp8_batched_softmax(self):
-        return self.fp8_multi_tile and self.head_dim == 128 and self.async_page
+        # Its masks omit sliding windows; async_page also excludes them today.
+        return (
+            self.fp8_multi_tile
+            and self.head_dim == 128
+            and self.async_page
+            and self.sliding_window == 0
+        )
 
     @property
     def async_page(self):
@@ -1010,7 +1018,10 @@ class Gfx1250Traits:
                 else 1
             )
         return (
-            2 if self.q_bytes + 2 * self.kv_stride + self.p_bytes + 576 <= 327680 else 1
+            2
+            if self.q_bytes + 2 * self.kv_stride + self.p_bytes + self.stats_bytes
+            <= 327680
+            else 1
         )
 
     @property
@@ -1022,8 +1033,13 @@ class Gfx1250Traits:
         return self.p_offset + self.p_bytes
 
     @property
+    def stats_bytes(self):
+        # Each P tile exchanges FP32 maxima and sums for 16 rows x 4 waves.
+        return self.p_tiles * 512 + 64
+
+    @property
     def total_bytes(self):
-        return self.stats_offset + self.p_tiles * 512 + 64
+        return self.stats_offset + self.stats_bytes
 
     @property
     def use_tdm(self):

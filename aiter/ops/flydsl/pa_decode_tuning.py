@@ -49,12 +49,21 @@ def _cache_geometry(key_cache):
 class _PADecodeAutotuneResources:
     """Prepare candidate plans and graphs outside FlyDSL's timed replay."""
 
-    def __init__(self, query, args, options, max_partitions, max_batch_size=None):
+    def __init__(
+        self,
+        query,
+        args,
+        options,
+        max_partitions,
+        max_batch_size=None,
+        context_partition_size=None,
+    ):
         self.query = query
         self.args = args
         self.options = options
         self.max_partitions = max_partitions
         self.max_batch_size = max_batch_size
+        self.context_partition_size = context_partition_size
         self.outputs = {}
         self.graphs = {}
         self.plans = {}
@@ -88,6 +97,7 @@ class _PADecodeAutotuneResources:
             max_partitions=self.max_partitions,
             max_batch_size=self.max_batch_size,
             workgroup_budget=workgroup_budget,
+            context_partition_size=self.context_partition_size,
             sliding_window=self.options["sliding_window"],
             query_length=query_length,
         )
@@ -199,6 +209,7 @@ def _validate_pa_decode_config(arguments):
         "sink_dtype",
         "sliding_window",
         "max_partitions",
+        "context_partition_size",
         "num_cu",
         "implementation",
     ],
@@ -219,6 +230,7 @@ def _pa_decode_autotuner(
     sink_dtype,
     sliding_window,
     max_partitions,
+    context_partition_size,
     num_cu,
     implementation,
     resources,
@@ -260,6 +272,7 @@ def prepare_pa_decode_plan(
     sliding_window: int = 0,
     max_partitions: int | None = None,
     max_batch_size: int | None = None,
+    context_partition_size: int | None = None,
     max_context_length: int | None = None,
     tune: bool = False,
     config_dir: str | Path | None = None,
@@ -280,6 +293,8 @@ def prepare_pa_decode_plan(
     and takes precedence over the environment's cache-directory override.
     ``max_batch_size`` sets the planner's batch cap (default 4096); the returned
     plan retains it for refreshes. Larger batches must fit the device's LDS.
+    ``context_partition_size`` is passed to ``plan_pa_decode`` and partitions
+    the tuning cache; it defaults to the size of new plans on this device.
 
     A 4D ``key_cache`` is not implemented. Cache by attention geometry and
     execution modes. Tensor strides, total KV cache pages, block-table padding,
@@ -303,6 +318,7 @@ def prepare_pa_decode_plan(
             num_kv_heads,
             max_partitions=limit,
             max_batch_size=max_batch_size,
+            context_partition_size=context_partition_size,
             sliding_window=sliding_window,
             query_length=query_length,
         )
@@ -327,6 +343,7 @@ def prepare_pa_decode_plan(
             options,
             limit,
             default_plan.max_batch_size,
+            default_plan.context_partition_size,
         )
 
         arch = get_gfx_runtime()
@@ -348,6 +365,7 @@ def prepare_pa_decode_plan(
             "sink_dtype": None if sinks is None else str(sinks.dtype),
             "sliding_window": default_plan.sliding_window,
             "max_partitions": limit,
+            "context_partition_size": default_plan.context_partition_size,
             "num_cu": num_cu,
             "implementation": _tuning_cache_tag(),
             "resources": resources,
@@ -381,6 +399,7 @@ def prepare_pa_decode_plan(
             max_partitions=limit,
             max_batch_size=default_plan.max_batch_size,
             workgroup_budget=budget,
+            context_partition_size=default_plan.context_partition_size,
             sliding_window=default_plan.sliding_window,
             query_length=query_length,
         )
@@ -430,6 +449,12 @@ def _parse_args(argv=None):
         "--sink-dtype", choices=("none", "bf16", "fp16", "fp32"), default="none"
     )
     parser.add_argument("--max-partitions", type=_positive_int)
+    parser.add_argument(
+        "--context-partition-size",
+        type=int,
+        choices=(128, 256),
+        help="Plan partition tokens (default: 128 on gfx1250, 256 elsewhere).",
+    )
     parser.add_argument("--device", type=int, default=0, help="Visible GPU index.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -541,6 +566,7 @@ def _make_tuning_inputs(args, device, kv_dtype):
         "sliding_window": args.sliding_window,
         "max_partitions": args.max_partitions,
         "max_batch_size": args.max_batch_size,
+        "context_partition_size": args.context_partition_size,
         "max_context_length": max_length,
     }
 
@@ -590,7 +616,9 @@ def main(argv=None):
     cache_file = _get_pa_decode_autotuner(arch, args.output_dir)._cache_file
     print(f"Saved configuration to {cache_file}")
     print(
-        f"Selected plan capacity={plan.capacity}, max partitions={plan.max_partitions}"
+        f"Selected plan capacity={plan.capacity}, "
+        f"max partitions={plan.max_partitions}, "
+        f"context partition size={plan.context_partition_size}"
     )
 
 
