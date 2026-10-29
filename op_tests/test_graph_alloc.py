@@ -148,8 +148,11 @@ def test_capture_scoped_cache_keeps_capture_built_buffers_private():
         eager.sum()  # keep the graph non-empty
 
 
-# Runs in a subprocess: on failure the GEMM spins forever, and only a process
-# kill gets the GPU back.
+# Mirrors vLLM's DeepSeek-V4.1 CSA attention on ROCm: multi-stream overlap runs
+# only inside graph capture, so the indexer weights_proj GEMM (bf16 [M, 5120] x
+# [5120, 32], split-K 8) first runs on an aux stream mid-capture, at each capture
+# size. Runs in a subprocess: on failure the GEMM spins forever, and only a
+# process kill gets the GPU back.
 _SPLIT_K_FIRST_USE_IN_CAPTURE = """
 import torch
 from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
@@ -158,28 +161,38 @@ from aiter.utility.graph_alloc import persistent_alloc
 dev = torch.device("cuda:0")
 cfg = dict(block_m=32, block_n=32, block_k=128, stages=5, split_k=8,
            m_waves=2, n_waves=2, k_waves=1, group_m=0, policy="ft")
-a = torch.randn(64, 8192, dtype=torch.bfloat16, device=dev)
-b = torch.randn(4096, 8192, dtype=torch.bfloat16, device=dev)
-ref = a.float() @ b.float().t()
-flydsl_hgemm(a, b, **cfg)  # compile and cache the eager stream's semaphores
-stream = torch.cuda.Stream(dev)
+w = torch.randn(32, 5120, dtype=torch.bfloat16, device=dev)
+sizes = (1024, 512)  # captured largest first, as vLLM does
+xs = {m: torch.randn(m, 5120, dtype=torch.bfloat16, device=dev) for m in sizes}
+flydsl_hgemm(xs[sizes[0]], w, **cfg)  # eager warmup: default stream only
+torch.cuda.synchronize()
+
+capture, aux = torch.cuda.Stream(dev), torch.cuda.Stream(dev)
 # Freed memory is recycled without clearing, as on a GPU that ran something
-# before: make the capture stream's next semaphore allocation start dirty.
-with torch.cuda.stream(stream), persistent_alloc(dev):
+# before: make the aux stream's next semaphore allocation start dirty.
+with torch.cuda.stream(aux), persistent_alloc(dev):
     torch.full((1 << 16,), 7, dtype=torch.int64, device=dev)
 torch.cuda.synchronize()
-graphs, outs = [], []
-for _ in range(2):
+
+graphs, outs = {}, {}
+for m in sizes:
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g, stream=stream):
-        outs.append(flydsl_hgemm(a, b, **cfg))
-    graphs.append(g)
-graphs[1].replay()  # before the graph that recorded the semaphore zero fill
-graphs[0].replay()
+    fork, join = torch.cuda.Event(), torch.cuda.Event()
+    with torch.cuda.graph(g, stream=capture):
+        fork.record()
+        with torch.cuda.stream(aux):
+            fork.wait()
+            outs[m] = flydsl_hgemm(xs[m], w, **cfg)
+            join.record()
+        join.wait()
+    graphs[m] = g
+graphs[sizes[1]].replay()  # before the graph that recorded the zero fill
+graphs[sizes[0]].replay()
 torch.cuda.synchronize()
-for out in outs:
-    err = ((out.float() - ref).abs().max() / ref.abs().max()).item()
-    assert err < 3e-2, err
+for m in sizes:
+    ref = xs[m].float() @ w.float().t()
+    err = ((outs[m].float() - ref).abs().max() / ref.abs().max()).item()
+    assert err < 3e-2, (m, err)
 print("OK")
 """
 
