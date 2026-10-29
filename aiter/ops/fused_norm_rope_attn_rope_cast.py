@@ -483,7 +483,7 @@ def _fused_norm_rope_attn_rope_cast_with_debug(
                     limit = tile_splits
                 # Long lists amortize a second resident CTA per CU. Avoid extra
                 # partials when fewer splits give the same longest tile loop.
-                if grid >= 64 and capacity >= t * 1536:
+                if grid >= 64 and capacity >= t * 2048:
                     limit = min(32, max(1, 512 // grid), work_splits)
                     tiles_per_split = (tile_splits + limit - 1) // limit
                     limit = (tile_splits + tiles_per_split - 1) // tiles_per_split
