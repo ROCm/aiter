@@ -367,8 +367,9 @@ __device__ __attribute__((always_inline)) void attn_pv(
     __builtin_amdgcn_s_barrier();
 }
 
-// Prefix QK runs in bf16 with lane (r = lane % 16, g = lane / 16) holding 32-dim chunks c = 4i + g of row r for both
-// Q and K, so step 4i + t of the 16x16x32 MFMA takes dims 32c + 8t + [0, 8).
+// The prefix runs QK and PV in f16: e2m1 times an e4m3 scale is exact in f16. Lane (r = lane % 16, g = lane / 16) holds
+// 32-dim chunks c = 4i + g of row r for both Q and K, so step 4i + t of the 16x16x32 MFMA takes dims 32c + 8t + [0, 8).
+template<class T> struct f16_traits : T { using D_PV = opus::fp16_t; };
 
 template<class T>
 __device__ inline auto make_layout_rk_fp4(int lane_id) {
@@ -406,40 +407,52 @@ __device__ inline auto make_layout_sk_chunk(int warp_id, int lane_id) {
         opus::unfold_p_coord(sk_dim, opus::tuple{warp_id, lane_id % T::W_N, lane_id / T::W_N}));
 }
 
-// MXFP8 -> bf16: chunk i is one E8M0 block, byte i of scale_q.
+// MXFP8 -> f16 of row lane % 16: chunk i is one E8M0 block, byte i of the lane's MFMA scales. The row is scaled by 2^-e
+// of its largest block exponent e to fit f16, which head_scale undoes on the scores.
 template<class T, class V>
-__device__ inline auto dequant_q_bf16(const V& v_q, int scale_q) {
+__device__ inline auto dequant_q_f16(const V& v_q, char* smem_q, int lane_id, float& head_scale) {
     using namespace opus;
     using D_PV = typename T::D_PV;
     constexpr index_t q_len = vector_traits<V>::size();
+    auto s_qs = make_smem(reinterpret_cast<u32_t*>(smem_q + T::Q_TILE_SIZE * T::D_HEAD_SIZE));
+    const auto qs = load<4>(s_qs, (lane_id % T::W_M) * (T::D_SCALE_SIZE / 4));
+    u32_t e_max = 0;
+    static_for<T::D_SCALE_SIZE>([&](auto b) {
+        const u32_t e = __builtin_amdgcn_ubfe(qs[b.value / 4], 8 * (b.value % 4), 8);
+        e_max = e > e_max ? e : e_max;
+    });
+    head_scale = std::bit_cast<float>(e_max << 23);
+    const auto scale_q = static_cast<u32_t>(mx_scales(qs, mx_scale_sel(lane_id / T::W_M)));
     const auto q_w = std::bit_cast<vector_t<u32_t, q_len / 4>>(v_q);
     vector_t<D_PV, q_len> v_qb;
     auto* qb_pk = reinterpret_cast<vector_t<D_PV, 2>*>(&v_qb);
     static_for<q_len / 4>([&](auto d) {
         constexpr int i = d.value / (T::PREFIX_CHUNK / 4);
-        const float scale = std::bit_cast<float>(__builtin_amdgcn_ubfe(static_cast<u32_t>(scale_q), 8 * i, 8) << 23);
-        qb_pk[d.value * 2 + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(q_w[d.value], scale, false);
-        qb_pk[d.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(q_w[d.value], scale, true);
+        const int e = static_cast<int>(__builtin_amdgcn_ubfe(scale_q, 8 * i, 8) - e_max) + 127;
+        const float scale = std::bit_cast<float>(max(e, 0) << 23);
+        qb_pk[d.value * 2 + 0] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp8(q_w[d.value], scale, false);
+        qb_pk[d.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp8(q_w[d.value], scale, true);
     });
     return v_qb;
 }
 
-// NVFP4 -> bf16 of chunk I, exact. scale_sel lays its two e4m3 scales out as b0, b0, b1, b1 so each fills a pair: a
-// v_pk_*_f32 with op_sel:[0,1] can read 0 while a v_mfma_f32_16x16x32_bf16 runs on the SIMD.
+// NVFP4 -> f16 of chunk I: scale_sel lays its two e4m3 scales out as b0, b0, b1, b1, so each converts to the f16 pair a
+// v_pk_mul_f16 takes.
 template<class T, int I, class VK, class VS>
-__device__ inline auto dequant_kv_chunk_bf16(const VK& v_k, const VS& v_scl, opus::u32_t scale_sel) {
+__device__ inline auto dequant_kv_chunk_f16(const VK& v_k, const VS& v_scl, opus::u32_t scale_sel) {
     using namespace opus;
     using D_PV = typename T::D_PV;
     constexpr int DWORDS = T::PREFIX_CHUNK / 8;
     const auto k_w = std::bit_cast<vector_t<u32_t, vector_traits<VK>::size() / 4>>(v_k);
     const auto s_w = std::bit_cast<vector_t<u32_t, vector_traits<VS>::size() / 4>>(v_scl);
     const int sb = static_cast<int>(__builtin_amdgcn_perm(s_w[2 * I + 1], s_w[2 * I], scale_sel));
-    const vector_t<float, 2> sc[2] = {__builtin_amdgcn_cvt_pk_f32_fp8(sb, false), __builtin_amdgcn_cvt_pk_f32_fp8(sb, true)};
+    const vector_t<D_PV, 2> sc[2] = {__builtin_amdgcn_cvt_scalef32_pk_f16_fp8(sb, 1.0f, false),
+                                     __builtin_amdgcn_cvt_scalef32_pk_f16_fp8(sb, 1.0f, true)};
     vector_t<D_PV, T::PREFIX_CHUNK> v_kc;
     auto* kc_pk = reinterpret_cast<vector_t<D_PV, 2>*>(&v_kc);
     static_for<DWORDS * 4>([&](auto p) {  // byte p % 4 of dword p / 4
-        const auto f = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(k_w[I * DWORDS + p.value / 4], 1.0f, p.value % 4);
-        kc_pk[p.value] = __builtin_convertvector(f * sc[p.value / (2 * DWORDS)], vector_t<D_PV, 2>);
+        kc_pk[p.value] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(k_w[I * DWORDS + p.value / 4], 1.0f, p.value % 4)
+                       * sc[p.value / (2 * DWORDS)];
     });
     return v_kc;
 }
@@ -526,11 +539,12 @@ __device__ __attribute__((always_inline)) void mla_v41_prefill_accum(
     }
 }
 
-template<class T, class VO>
+template<class T0, class VO>
 __device__ __attribute__((always_inline)) void mla_v41_prefill_accum_nvfp4(
         const kv_segment& seg, int kv_page, char* smem_kv, char* smem_ml, char* smem_p, char* smem_q,
-        VO& v_o, typename T::D_ACC& m_row, typename T::D_ACC& l_row, typename T::D_ACC temperature_scale) {
+        VO& v_o, typename T0::D_ACC& m_row, typename T0::D_ACC& l_row, typename T0::D_ACC temperature_scale_q) {
     using namespace opus;
+    using T = f16_traits<T0>;
     using D_ATTN = typename T::D_ATTN;
     using D_PV = typename T::D_PV;
     using D_ACC = typename T::D_ACC;
@@ -546,7 +560,7 @@ __device__ __attribute__((always_inline)) void mla_v41_prefill_accum_nvfp4(
     auto p_kv_scale = reinterpret_cast<const D_ATTN*>(seg.kv_scale);
     auto s_kv       = make_smem(reinterpret_cast<D_PV*>(smem_kv));
 
-    // QK^T in bf16 with K straight from the dequantized chunk in registers.
+    // QK^T with K straight from the dequantized chunk in registers.
     auto mfma0 = make_mfma<D_PV, D_PV, D_ACC>(
         number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_QK_PREFIX>{}, mfma_adaptor_swap_ab{});
     typename decltype(mfma0)::vtype_c v_s;
@@ -560,21 +574,23 @@ __device__ __attribute__((always_inline)) void mla_v41_prefill_accum_nvfp4(
     auto v_scl = global_load<T::D_PREFIX_SCALE_SIZE>(p_kv_scale + static_cast<int64_t>(kv_page) * seg.stride_kv_scale, 0);
     kv_page = load_kv_page<T>(seg, 1, warp_id, lane_id);
     const int g = lane_id / T::W_M;
-    const auto v_qb = dequant_q_bf16<T>(read_q_smem<T>(smem_q, lane_id, 2 * g, 2 * g + 1), read_q_scale_smem<T>(smem_q, lane_id));
+    float head_scale;
+    const auto v_qb = dequant_q_f16<T>(read_q_smem<T>(smem_q, lane_id, 2 * g, 2 * g + 1), smem_q, lane_id, head_scale);
+    const D_ACC temperature_scale = temperature_scale_q * head_scale;
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         // Before the K loads, so a wait forced by a broadcast v_pk_* operand pairing with it leaves them in flight.
         const int next_page = kv_page;
         kv_page = load_kv_page<T>(seg, tile_idx + 2, warp_id, lane_id);
 
-        // ──── Per chunk: dequantize K, GEMM0 S += Q·Kᵀ (bf16), stage it in the V tile ────
+        // ──── Per chunk: dequantize K, GEMM0 S += Q·Kᵀ (f16), stage it in the V tile ────
         constexpr index_t k_step = vector_traits<typename decltype(mfma0)::vtype_a>::size();
         constexpr int STEPS  = T::PREFIX_CHUNK / k_step;
         constexpr int PIECES = T::PREFIX_CHUNK / T::VEC_KV;
         clear(v_s);
         static_for<T::PREFIX_CHUNKS>([&](auto i) {
             constexpr int I = decltype(i)::value;
-            const auto v_kc = dequant_kv_chunk_bf16<T, I>(v_k, v_scl, scale_sel);
+            const auto v_kc = dequant_kv_chunk_f16<T, I>(v_k, v_scl, scale_sel);
             static_for<STEPS>([&](auto t) {
                 constexpr int s = I * STEPS + t.value;
                 v_s = mfma0(slice(v_qb, number<s * k_step>{}, number<(s + 1) * k_step>{}),

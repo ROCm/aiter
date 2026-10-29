@@ -262,7 +262,7 @@ _ANY_COUNT = tuple(range(2, _MAX_KV_SPLITS + 1))
 
 # (arch, kernel) -> fit. gfx950 fit on MI355X over topk 384-4096, N 8-768, H 16-128 and
 # 1-32 splits; gfx1250 over topk 512-4096, N 8-256, H 16-128 and 1-32 splits. v41_a8w4
-# reuses the v41_a8w8 16mx1 fit.
+# reuses the v41_a8w8 fits.
 _KV_SPLIT_FIT = {
     ("gfx950", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 90, 0.043),
     ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.012),
@@ -271,6 +271,7 @@ _KV_SPLIT_FIT = {
     ("gfx950", "v41_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
     ("gfx950", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 90, 0.025),
     ("gfx950", "v41_a8w4_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
+    ("gfx950", "v41_a8w4_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 90, 0.025),
     ("gfx1250", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 0, 0.10),
     ("gfx1250", "v4_a16w16_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
     ("gfx1250", "v4_a16w16_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 150, 0.06),
@@ -285,9 +286,7 @@ def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
     serves ``h`` heads, as the launcher picks it."""
     if gfx == "gfx1250":
         tile = "16mx1_16nx4" if h <= 16 else "32mx1_16nx4" if h <= 32 else "16mx4_64nx1"
-    elif kernel == "v41_a8w4":
-        tile = "16mx1_16nx4"
-    elif kernel == "v41_a8w8":
+    elif kernel in ("v41_a8w8", "v41_a8w4"):
         tile = "16mx1_16nx4" if h <= 16 else "16mx4_64nx1"
     else:
         tile = "16mx1_16nx4" if h <= 32 else "16mx8_32nx1"

@@ -5,7 +5,7 @@
 // ctypes C ABI (aiter_tensor_t* + trailing hipStream_t):
 //   gfx950  -- v4: kernels compiled from opus/mla_v4_prefill_*.hpp;
 //              v4.1: 16mx1_16nx4 compiled from opus/mla_v41_prefill_a8w{8,4}_16mx1_16nx4.hpp,
-//              a8w8 16mx4_64nx1 a prebuilt code object in hsa/gfx950/mla_opus/.
+//              16mx4_64nx1 prebuilt code objects in hsa/gfx950/mla_opus/.
 //   gfx1250 -- v4: prebuilt code objects in hsa/gfx1250/mla_opus/.
 
 #include "aiter_tensor.h"
@@ -933,11 +933,12 @@ using V41A8W4Traits16mx1 =
 using V41Traits16mx4 =
     opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>;
 
-// A workgroup covers one token and Q_TILE_SIZE * T_M heads. 16mx1_16nx4 serves a8w8 H <= 16 and
-// every a8w4 H; the 16mx4_64nx1 code object is built by csrc/kernels/mla/opus/build_co.sh.
+// A workgroup covers one token and Q_TILE_SIZE * T_M heads: 16mx1_16nx4 for H <= 16, else
+// 16mx4_64nx1, whose code objects are built by csrc/kernels/mla/opus/build_co.sh.
 constexpr int kV41Heads16mx1          = V41Traits16mx1<>::Q_TILE_SIZE * V41Traits16mx1<>::T_M;
 constexpr int kV41Heads16mx4          = V41Traits16mx4::Q_TILE_SIZE * V41Traits16mx4::T_M;
 constexpr const char* kV41A8W8Co16mx4 = "mla_opus/opus_mla_v41_prefill_a8w8_16mx4_64nx1.co";
+constexpr const char* kV41A8W4Co16mx4 = "mla_opus/opus_mla_v41_prefill_a8w4_16mx4_64nx1.co";
 constexpr int kV41DHead               = 512;
 constexpr int kV41DScale              = kV41DHead / 32;
 constexpr int kV41DScaleFp4           = kV41DHead / 16;
@@ -1103,7 +1104,7 @@ void opus_mla_v41_prefill_gfx950_fwd(aiter_tensor_t* q,
     HipDeviceGuard guard(q->device_id);
 
     const opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs> split_kargs{kargs, split};
-    if(A8W4 || H <= kV41Heads16mx1)
+    if(H <= kV41Heads16mx1)
     {
         const dim3 grid(N, ceil_div(H, kV41Heads16mx1), num_splits);
         auto launch = [&](auto traits, const auto& args) {
@@ -1138,16 +1139,19 @@ void opus_mla_v41_prefill_gfx950_fwd(aiter_tensor_t* q,
                                 1,
                                 stream});
         };
+        constexpr const char* co = A8W4 ? kV41A8W4Co16mx4 : kV41A8W8Co16mx4;
         if(num_splits > 1)
         {
-            static AiterAsmKernel impl("opus_mla_v41_prefill_a8w8_16mx4_64nx1_split_kernel",
-                                       kV41A8W8Co16mx4);
+            static AiterAsmKernel impl(A8W4 ? "opus_mla_v41_prefill_a8w4_16mx4_64nx1_split_kernel"
+                                            : "opus_mla_v41_prefill_a8w8_16mx4_64nx1_split_kernel",
+                                       co);
             launch(impl, split_kargs);
         }
         else
         {
-            static AiterAsmKernel impl("opus_mla_v41_prefill_a8w8_16mx4_64nx1_kernel",
-                                       kV41A8W8Co16mx4);
+            static AiterAsmKernel impl(A8W4 ? "opus_mla_v41_prefill_a8w4_16mx4_64nx1_kernel"
+                                            : "opus_mla_v41_prefill_a8w8_16mx4_64nx1_kernel",
+                                       co);
             launch(impl, kargs);
         }
     }
