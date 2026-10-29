@@ -72,7 +72,7 @@ Run the same command as CI:
 python op_tests/test_fused_norm_rope_attn_rope_cast.py
 ```
 
-Direct execution runs 3,301 correctness cases, including ragged inputs,
+Direct execution runs 3,657 correctness cases, including ragged inputs,
 BF16/FP8 modes, prepared/raw/normalized Q, graph replay, dispatch boundaries,
 storage offsets and invalid arguments. It then runs the public-API benchmark
 matrix against an independent Torch reference and prints Markdown tables.
@@ -135,12 +135,34 @@ instantiations live with the shared reducers in `attention_64rows_h64.cu`; this
 keeps their extra code out of the H32 attention translation unit. Diagnostic
 outputs continue to use the general reducer.
 
-H16 automatic split selection uses the existing work and grid limit directly,
-including non-power-of-two counts. Other head counts retain power-of-two
-rounding. Explicit split requests and the 32-split limit are unchanged.
+H16/H32 automatic split selection uses the work and grid limits directly,
+including non-power-of-two counts. H64/H128 retain power-of-two rounding. Explicit split requests and the 32-split limit are unchanged.
 
 The H16 kernel traverses prefix and extend tiles in one pipeline. Each source
 keeps its own 64-row tail mask, data/scale strides and row bounds. The source
 tag follows prefetched rows across the boundary, avoiding a second pipeline
 startup and the barrier between the sources. H32 split dispatch can reuse this
 head tile; query math, FP32 softmax sums and split/output policy are unchanged.
+
+## Long and short sparse lists
+
+H16 allows a 512-CTA budget for grids of at least 64 queries with at least
+2,048 allocated KV indices per query. Fewer splits are selected when they
+give the same longest 64-row tile loop. This amortizes a second resident CTA
+while limiting partial-output traffic.
+
+H32 single-split attention uses unsigned 32-bit row offsets after checking
+both sources and their independent data/scale strides. Bases remain 64-bit;
+views whose full address span exceeds the guard use the original wide-offset
+path. Within the bounded path, lists with at most 1,024 allocated indices per
+query traverse prefix and extend in one pipeline, retaining independent tails.
+The host policy is in `dispatch.hpp`.
+
+The H32 output-only wave reducer also supports 2, 3, 5 and 7 splits within
+the existing 32–255 output-head-block gate. It uses four channel slices without
+LDS and preserves the compact partial layout. Raw Q preparation stays fused.
+
+Shared-KV attention here shares KV across heads of one query. Attention CTAs
+still select one query token; there is no explicit KV tile sharing across
+different query tokens. A common allocation can produce ordinary cache reuse,
+which depends on the actual CSR indices and physical KV layout.
