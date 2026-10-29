@@ -1730,7 +1730,11 @@ def _supported(
             **cp,
         )
         scaled = sm_scale * q_scale * LOG2E
-        return math.isfinite(scaled) and 2**-149 <= scaled <= (2 - 2**-23) * 2**127
+        return (
+            q_scale > 0
+            and math.isfinite(scaled)
+            and 2**-149 <= scaled <= (2 - 2**-23) * 2**127
+        )
     except (AttributeError, IndexError, TypeError, ValueError, ZeroDivisionError):
         return False
 
@@ -1872,6 +1876,9 @@ def _score(
     )
     if block_table is None or seq_lens is None:
         raise ValueError("block_table and seq_lens are required")
+    # Not implied by the folded multiplier: sm_scale = q_scale = -1 folds positive.
+    if not q_scale > 0:
+        raise ValueError("q_scale must be positive")
     scaled = sm_scale * q_scale * LOG2E
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
         raise ValueError(

@@ -2118,11 +2118,14 @@ def topk_values(scores, k=16):
 
 
 def assert_topk_agrees(got, ref):
-    a, b = topk_values(got), topk_values(ref)
-    fin = torch.isfinite(b)
-    assert torch.equal(torch.isfinite(a), fin)
-    err = (a[fin] - b[fin]).abs()
-    assert bool((err <= ATOL + RTOL * b[fin].abs()).all())
+    check_scores(topk_values(got), topk_values(ref))
+
+
+def test_mxfp4_topk_check_catches_an_infinity_sign_flip():
+    ref = torch.tensor([[1.0, float("-inf")]])
+    assert_topk_agrees(ref.clone(), ref)
+    with pytest.raises(AssertionError):
+        assert_topk_agrees(torch.tensor([[1.0, float("inf")]]), ref)
 
 
 @pytest.fixture(params=["bf16", "e4m3"], ids=["qbf16", "qe4m3"])
@@ -2360,6 +2363,12 @@ def test_mxfp4_e4m3_q_scale_and_dtype_dispatch():
         assert not kernel.index_score_supported_fp4(
             q8, kd, ks, S, H, mb, bt, seq_lens=seq, q_scale=bad
         )
+    # Two negatives fold to a positive multiplier; q_scale must be refused on its own.
+    with pytest.raises(ValueError, match="q_scale must be positive"):
+        kernel.score_flydsl_fp4(q8, kd, ks, bt, seq, S, H, -(D**-0.5), mb, q_scale=-1.0)
+    assert not kernel.index_score_supported_fp4(
+        q8, kd, ks, S, H, mb, bt, seq_lens=seq, sm_scale=-1.0, q_scale=-1.0
+    )
     assert kernel.index_score_supported_fp4(q8, kd, ks, S, H, mb, bt, seq_lens=seq)
 
 
@@ -2493,6 +2502,7 @@ def test_score_mxfp4(case, B, S, H, lens, kwargs):
     wm = kernel.build_work_map(seq, mb, S, H, out=buf)
     pages = sum((L + P - 1) // P for L in lens)
     flops = 2 * pages * P * D * S * H
+    cache8 = deq.to(dtypes.fp8)  # prepared here so only the scorers are timed
     cands = {
         "fp4": (
             lambda: run_fp4(q, kd, ks, bt, seq, S, H, mb, work_map=wm),
@@ -2500,7 +2510,7 @@ def test_score_mxfp4(case, B, S, H, lens, kwargs):
         ),
         "fp8": (
             lambda: kernel.score_flydsl(
-                q, deq.to(dtypes.fp8), bt, seq, S, H, D**-0.5, mb, work_map=wm
+                q, cache8, bt, seq, S, H, D**-0.5, mb, work_map=wm
             ),
             pages * P * D,
         ),
