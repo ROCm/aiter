@@ -249,12 +249,18 @@ class Arms:
     """One callable per arm, plus the arm main's dispatch would pick."""
 
     def __init__(self):
+        from aiter.jit.utils.chip_info import get_gfx_runtime
         from aiter.ops import topk
+        from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
         from aiter.ops.flydsl.topk import topk_per_row as host
 
         self.topk, self.host = topk, host
         params = inspect.signature(host._decode_with_backend).parameters
         self._takes_bound = "max_row_len" in params
+        # The adaptive arm is forced past the gate, which never picks it on a
+        # wave32 card; its scan is laid out for wave64. A card without bands
+        # still runs it, since the bench is what fits them.
+        self._wave64 = get_warp_size(get_gfx_runtime()) == 64
 
     def _backend(self, x, sl, out, cell, backend, bound=None):
         extra = (bound,) if self._takes_bound else ()
@@ -265,6 +271,8 @@ class Arms:
 
     def supported(self, arm, x, sl, out, cell) -> bool:
         a = (x, 1, sl, out, cell.rows, x.stride(0), x.stride(1), cell.k)
+        if arm == "adaptive" and not self._wave64:
+            return False
         if arm in ("adaptive", "single"):
             return self.host.is_flydsl_top_k_per_row_decode_supported(*a, None)
         if arm == "oneblock":
