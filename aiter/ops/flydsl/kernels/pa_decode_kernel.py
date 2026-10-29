@@ -503,7 +503,7 @@ def compile_gfx1250_pa_decode(
         direct_output=direct_output,
     )
 
-    @flyc.kernel(name=kernel_name, known_block_size=(128, 1, 1))
+    @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
         pmax: fx.Pointer,
         psum: fx.Pointer,
@@ -569,8 +569,8 @@ def compile_gfx1250_pa_decode(
         elif const_expr(t.direct_output):
             output = fx.recast_iter(t.q_dtype, pout)
             tid = fx.Int32(gpu.thread_id("x"))
-            for i in range_constexpr((t.rows * t.head_dim + 127) // 128):
-                index = i * 128 + tid
+            for i in range_constexpr(-(-t.rows * t.head_dim // t.BLOCK_THREADS)):
+                index = i * t.BLOCK_THREADS + tid
                 if index < t.rows * t.head_dim:
                     row, d = index // t.head_dim, index % t.head_dim
                     kv_query = fx.Int32(gpu.block_id("y"))
@@ -636,7 +636,7 @@ def compile_gfx1250_pa_decode(
                 kv_heads * t.query_splits,
                 1,
             ),
-            block=(128, 1, 1),
+            block=(t.BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
