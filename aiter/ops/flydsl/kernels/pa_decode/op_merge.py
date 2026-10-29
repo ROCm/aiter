@@ -298,8 +298,10 @@ class Gfx1250ClusterMerge:
             for p in range_constexpr(t.cluster_merge)
         ]
         lane_elem = lane * elems
+        # Contiguous scratch can start at an offset, and final output heads
+        # can have odd strides. Both buffers guarantee only element alignment.
         vector = fx.PointerType.get(
-            t.q_dtype.ir_type, fx.AddressSpace.Global, elems * t.q_dtype.width // 8
+            t.q_dtype.ir_type, fx.AddressSpace.Global, t.q_dtype.width // 8
         )
 
         def load_values(i):
