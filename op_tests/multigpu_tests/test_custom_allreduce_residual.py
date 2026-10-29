@@ -121,9 +121,17 @@ def test_all_reduce_residual(tp, m, n, dtype):
     # All-reduce rounds to dtype, then the add rounds again; both stages must
     # match this, not a single rounding of the fp32 sum plus residual.
     ref = (reduced.to(dtype).float() + residual.float()).to(dtype).float()
-    candidates = {
-        "fused": lambda inp: (ca.custom_all_reduce_residual(inp, residual),),
-    }
+    candidates = {}
+    if ca.should_fuse_ar_residual(x):
+        candidates["fused"] = lambda inp: (
+            ca.custom_all_reduce_residual(inp, residual),
+        )
+    else:
+        assert (
+            ca.custom_all_reduce_residual(x, residual) is None
+        ), "custom_all_reduce_residual fused a size its guard declines"
+    # The kernel itself at every size, including those the API declines.
+    candidates["kernel"] = lambda inp: (ca.all_reduce_residual(inp, residual),)
     # The path the model ran before: custom all-reduce, then a separate add.
     # Skipped at TP6, where plain 1-stage all-reduce faults: THREAD_NUM / 6
     # leaves threads 510-511 reading a seventh rank's (null) pointer.
@@ -462,6 +470,13 @@ def check_capture_paths(ca):
         )
         assert not out.any() and not res_out.any(), "warmup left out unzeroed"
 
+    if not ca.should_fuse_ar_residual(residual):
+        aiter.logger.warning(
+            "custom_all_reduce_residual declines %s at TP%d; skipping its capture checks",
+            tuple(residual.shape),
+            ca.world_size,
+        )
+        return
     if not ca.enable_register_for_capturing:
         aiter.logger.warning("registered capture path off; skipping the #4174 check")
         return

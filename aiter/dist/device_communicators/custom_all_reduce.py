@@ -16,6 +16,7 @@
 """
 
 import ctypes
+import functools
 import os
 import pickle
 from contextlib import contextmanager
@@ -31,6 +32,7 @@ import aiter as ops
 from aiter import logger
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.utils import env_flag
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.utility.dtypes import fp8
 
 from .rocm_version import get_rocm_version
@@ -214,6 +216,29 @@ _IPC_MIN_ROCM = (7, 14)
 # gfx1250 all-reduces up to this size take the LL kernel (kLLArMaxBytes in
 # custom_all_reduce_gfx1250.cuh).
 _GFX1250_LL_MAX_BYTES = 4 * 1024 * 1024
+
+# Max input bytes custom_all_reduce_residual fuses, per (arch, TP); None = no
+# limit. Larger inputs and unlisted pairs fall back to all-reduce + add.
+# Measured on MI300X (gfx942) and MI355X (gfx950).
+_AR_RESIDUAL_MAX_BYTES = {
+    ("gfx942", 2): 10 * 1024 * 1024,
+    ("gfx942", 4): 14 * 1024 * 1024,
+    ("gfx942", 6): None,
+    ("gfx942", 8): None,
+    ("gfx950", 4): None,
+    # Not measured; plain all-reduce faults at TP6 on 1-stage sizes.
+    ("gfx950", 6): None,
+    ("gfx950", 8): None,
+}
+
+
+@functools.cache
+def _runtime_gfx() -> str | None:
+    """The live GPU arch, or None if unknown (never fused)."""
+    try:
+        return get_gfx_runtime()
+    except (KeyError, RuntimeError):
+        return None
 
 
 # Default custom-AR size cutoff (bytes): inputs at or below this run on the
@@ -1781,6 +1806,14 @@ class CustomAllreduce:
             or inp.numel() * inp.element_size() > _GFX1250_LL_MAX_BYTES
         )
 
+    def should_fuse_ar_residual(self, inp: torch.Tensor) -> bool:
+        """Whether custom_all_reduce_residual beats all-reduce + add here."""
+        key = (_runtime_gfx(), self.world_size)
+        if key not in _AR_RESIDUAL_MAX_BYTES:
+            return False
+        max_bytes = _AR_RESIDUAL_MAX_BYTES[key]
+        return max_bytes is None or inp.numel() * inp.element_size() <= max_bytes
+
     @property
     def has_old_arch_fused_kernels(self) -> bool:
         """Whether the per-group / MXFP4 quant and qk-norm fused kernels can run.
@@ -1900,12 +1933,14 @@ class CustomAllreduce:
         self, input: torch.Tensor, residual: torch.Tensor
     ) -> torch.Tensor | None:
         # None when custom allreduce is disabled, has no residual kernel
-        # (gfx1250), or the input is not contiguous (the kernels read it densely)
+        # (gfx1250), the input is not contiguous (the kernels read it densely),
+        # or fusing is not faster here (_AR_RESIDUAL_MAX_BYTES)
         if (
             self.disabled
             or self._ops_all_reduce_residual is None
             or not self.should_custom_ar(input)
             or not input.is_contiguous()
+            or not self.should_fuse_ar_residual(input)
         ):
             return None
         if self._IS_CAPTURING:

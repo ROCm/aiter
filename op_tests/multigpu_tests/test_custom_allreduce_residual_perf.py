@@ -135,6 +135,8 @@ def test_ar_residual(tp, m, n, dtype):
         )
     numel = m * n
     ret = {"gfx": get_gfx()}
+    if "fuses" in _RANK_STATE:
+        ret["fuses"] = _RANK_STATE["fuses"](x)
     for name, (make, ref) in candidates.items():
         us, err = run_case(make, x, [ref], [(0, 0)])
         adds = tp if name != "ar" else tp - 1  # reduce adds (+ residual add)
@@ -210,6 +212,10 @@ def sweep(rank, tp, graph, ar_cases, rms_cases, dtype, init_method, result_path)
         ca = CustomAllreduce(dist.group.WORLD, torch.device(f"cuda:{rank}"))
         assert not ca.disabled, "requires custom allreduce"
         _RANK_STATE.update(ca=ca, graph=graph, graphs=graphs)
+        if hasattr(ca, "should_fuse_ar_residual"):
+            # Time "fused" at every size; "fuses" says whether the API would.
+            _RANK_STATE["fuses"] = ca.should_fuse_ar_residual
+            ca.should_fuse_ar_residual = lambda inp: True
         ar_rows = [test_ar_residual(tp, m, n, dtype) for m, n in ar_cases]
         rms_rows = [test_ar_rms_rows(tp, *case, dtype) for case in rms_cases]
         torch.cuda.synchronize()
