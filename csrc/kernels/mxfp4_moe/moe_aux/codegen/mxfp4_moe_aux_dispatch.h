@@ -38,7 +38,8 @@ using SortQuantFn = void (*)(
     void*          a_quant,
     void*          a_scale,
     int32_t*       m_indices,
-    void*          bf16_zero_ptr);
+    void*          bf16_zero_ptr,
+    int            input_stride);
 
 using Sort3StageFn = void (*)(
     hipStream_t stream,

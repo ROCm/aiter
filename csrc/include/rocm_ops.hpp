@@ -2909,7 +2909,13 @@ namespace py = pybind11;
           py::arg("TOPK"),                         \
           py::arg("D_HIDDEN"),                     \
           py::arg("MB"),                           \
-          py::arg("zero_init"));
+          py::arg("zero_init"));                   \
+    m.def("_mxfp4_moe_sort_quant_fp8_is_supported", \
+          &mxfp4_moe_sort_quant_fp8_is_supported,   \
+          py::arg("NE"),                            \
+          py::arg("TOPK"),                          \
+          py::arg("D_HIDDEN"),                      \
+          py::arg("MB"));
 
 #define MLA_HK_V32_PYBIND               \
     m.def("hk_mla_v32_decode_fwd",      \
