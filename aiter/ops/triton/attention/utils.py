@@ -116,6 +116,10 @@ def lse_merge(
             f"out {tuple(out.shape)} into its batch"
         )
     splits = partial_out.shape[0] // batch
+    if splits < 1:
+        raise ValueError(
+            f"partial_out {tuple(partial_out.shape)} holds no key range to merge"
+        )
     if partial_lse.shape != (partial_out.shape[0], heads, sequence):
         raise ValueError(
             f"partial_lse must be [batch * splits, heads, Sq] = "

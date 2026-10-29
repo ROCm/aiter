@@ -1723,6 +1723,15 @@ def test_mha_v4_kv_splits_merge_skips_empty_ranges(write_lse):
         torch.testing.assert_close(lse[reached], reference_lse[reached])
 
 
+def test_mha_v4_kv_splits_merge_rejects_zero_ranges():
+    """Zero partials fold evenly into any batch, and would merge to a silent 0 output."""
+    partial_out = torch.empty((0, 16, 2, 128), device="cuda", dtype=torch.bfloat16)
+    partial_lse = torch.empty((0, 2, 16), device="cuda")
+    out = torch.empty((1, 16, 2, 128), device="cuda", dtype=torch.bfloat16)
+    with expect_raises(ValueError, match="no key range"):
+        lse_merge(partial_out, partial_lse, out)
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
 def test_mha_v4_lse_is_gated_off_gfx950():
     """gfx942 carries the epilogue, but its exported value has never been measured.
