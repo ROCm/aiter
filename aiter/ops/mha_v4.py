@@ -1336,11 +1336,8 @@ def _fold_key_ranges(t: Tensor, splits: int) -> Tensor:
     """
     step = t.shape[1] // splits
     span = t.shape[1] - (splits - 1) * step
-    ranges = t.as_strided(
-        (t.shape[0], splits, span, *t.shape[2:]),
-        (t.stride(0), step * t.stride(1), *t.stride()[1:]),
-        t.storage_offset(),
-    )
+    # unfold rather than as_strided: Dynamo cannot trace the storage_offset() the latter needs.
+    ranges = t.unfold(1, span, step).movedim(-1, 2)
     return ranges.reshape(-1, span, *t.shape[2:])
 
 
