@@ -63,12 +63,12 @@ def _launch(
         cache,
     )
 
-    # A program does one head row per wave. The rows of token t are its Q heads, then its K heads.
+    # One row per wave. The rows of token t are its Q heads, then its K heads.
     num_rows = num_tokens * (q_heads + k_heads)
-    fused_qk_norm_mrope_gfx1250[(triton.cdiv(num_rows, config["num_warps"]),)](
+    block_m = config["num_warps"]
+    fused_qk_norm_mrope_gfx1250[(triton.cdiv(num_rows, block_m),)](
         q,
         k,
-        v,
         q_weight,
         k_weight,
         positions,
@@ -76,27 +76,28 @@ def _launch(
         sin,
         q_out,
         k_out,
-        k_cache,
-        v_cache,
-        slot_mapping,
         num_rows,
-        slot_mapping.shape[0],
         q.stride(0),
         k.stride(0),
-        v.stride(0),
         positions.stride(0),
         cos.stride(0),
+        v,
+        slot_mapping,
+        v.stride(0),
+        slot_mapping.shape[0],
+        k_cache,
+        v_cache,
         EPS=eps,
         Q_HEADS=q_heads,
         K_HEADS=k_heads,
         SECTION_H=mrope_section[1],
         SECTION_W=mrope_section[2],
-        ROWS=config["num_warps"],
+        BLOCK_M=block_m,
         CACHE=cache,
-        BLOCK=k_cache.shape[3] if cache else 1,
+        BLOCK_SIZE=k_cache.shape[3] if cache else 1,
         X=k_cache.shape[4] if cache else 1,
-        num_warps=config["num_warps"],
-        **get_fused_qk_norm_mrope_layouts(config["num_warps"]),
+        num_warps=block_m,
+        **get_fused_qk_norm_mrope_layouts(block_m),
     )
     return q_out, k_out
 
@@ -166,19 +167,18 @@ def fused_qk_norm_mrope_cache(
 ):
     """``fused_qk_norm_mrope``, and the K and V rows into the paged KV cache.
 
-    The cache has the shuffled layout of ``reshape_and_cache(asm_layout=True)``: value d
-    of K head h of the token in slot s goes to k_cache[s // block, h, d // x, s % block,
+    The cache has the layout of ``reshape_and_cache(asm_layout=True)``: value d of
+    K head h of the token in slot s goes to k_cache[s // block, h, d // x, s % block,
     d % x], and of V to v_cache[s // block, h, (s % block) // x, d, s % x].
-    A token with a negative slot is not written.
 
     Args:
-        q, k, positions, cos, sin, mrope_section: as in ``fused_qk_norm_mrope``.
+        q, k, q_weight, k_weight, eps, positions, cos, sin, mrope_section: as in
+            ``fused_qk_norm_mrope``.
         v: [T, Hk * 256] bf16. Rows can be strided.
-        q_weight, k_weight, eps: as in ``fused_qk_norm_mrope``.
-        k_cache: [blocks, Hk, 256 // x, block, x] contiguous, dtype of q. x * 2 bytes = 16 bytes.
-        v_cache: [blocks, Hk, block // x, 256, x] contiguous, dtype of q.
+        k_cache: [blocks, Hk, 256 // x, block, x], contiguous, dtype of q, x values in 16 bytes.
+        v_cache: [blocks, Hk, block // x, 256, x], contiguous, dtype of q.
         slot_mapping: [S] int32 or int64. Token t < S goes to slot slot_mapping[t].
-            Tokens t >= S are padding: they are not written.
+            Tokens with t >= S or a negative slot are padding: they are not written.
 
     Returns:
         q_out [T, Hq * 256] and k_out [T, Hk * 256], contiguous.
