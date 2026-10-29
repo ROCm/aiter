@@ -203,7 +203,7 @@ def _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
 def _run_only() -> bool:
     """FLYDSL_RUNTIME_RUN_ONLY as FlyDSL's own parser reads it.
 
-    ``flydsl.utils.env`` is not a stable API in FlyDSL 0.4.0, which has no
+    ``flydsl.utils.env`` is not a stable API in FlyDSL 0.4.1, which has no
     stable accessor for this option; recheck this read when the pin moves.
     """
     from flydsl.utils import env
