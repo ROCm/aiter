@@ -1281,6 +1281,44 @@ def test_adaptive_nan_ranks_first(card):
     print("[adaptive_nan_ranks_first] PASS")
 
 
+def test_adaptive_nan_ties_stable(card):
+    """More NaNs than k, of mixed sign and payload: a stable call keeps the
+    smallest columns, because every NaN ties with every other.
+
+    `test_adaptive_nan_ranks_first` plants fewer NaNs than k, so every NaN is
+    selected and their order among themselves never shows."""
+    del card  # one shape, forced onto the adaptive kernel; run_adaptive gates the card
+    rows, width, top_k = 1, 65536, 256
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    # (first k columns, next k): in each pair the later block's raw bits outrank
+    # the earlier block's. -0x400000 is -qNaN 0xFFC00000.
+    for early, late in ((0x7FC00000, -0x400000), (0x7FC00000, 0x7FC00001)):
+        torch.manual_seed(0)
+        logits = torch.randn(rows, width, device="cuda")
+        # Written through an int view, so the exact NaN bits land.
+        logits.view(torch.int32)[:, :top_k] = early
+        logits.view(torch.int32)[:, top_k : 2 * top_k] = late
+        indices = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *logits.stride(),
+            top_k,
+            True,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+        torch.cuda.synchronize()
+        want = torch.arange(top_k, device="cuda").expand(rows, top_k)
+        pair = f"{early & 0xFFFFFFFF:#x} then {late & 0xFFFFFFFF:#x}"
+        assert torch.equal(indices.long(), want), f"stable NaN ties broken: {pair}"
+    print("[adaptive_nan_ties_stable] PASS")
+
+
 def stable_reference(masked: torch.Tensor, top_k: int) -> torch.Tensor:
     """The k largest per row in ascending column order, ties to the smallest column.
 
@@ -2226,6 +2264,7 @@ def run_adaptive():
     test_adaptive_row_past_width(card)
     test_adaptive_bound_below_rows(card)
     test_adaptive_nan_ranks_first(card)
+    test_adaptive_nan_ties_stable(card)
     test_adaptive_ordered_early_stop(card)
     test_adaptive_compact_cells(card)
 

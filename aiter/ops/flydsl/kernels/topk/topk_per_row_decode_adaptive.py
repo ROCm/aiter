@@ -59,6 +59,7 @@ from typing import Any, Literal
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import (
+    arith,
     const_expr,
     gpu,
     range_constexpr,
@@ -587,6 +588,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         c_bins_i32 = fx.Int32(num_buckets)
         c_sign_bit = fx.Int32(-2147483648)
         c_nan_turn = fx.Int32(0x7FFFFF)  # keys from -inf past the -NaNs
+        c_nan_key = fx.Int32(0xFFFFFD)  # every NaN keys at or below; +inf one above
         c_row_ws = fx.Int32(CONTROL_ROW_SLOTS)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -762,7 +764,12 @@ def create_topk_per_row_decode_adaptive_kernel(
             # The wrapping add rotates the -NaNs, which twiddle past -inf, round to
             # the top, so every NaN ranks above +inf as torch.topk ranks it.
             bits = val.bitcast(fx.Int32)
-            return (bits ^ ~((bits >> 31) | c_sign_bit)) + c_nan_turn
+            key = (bits ^ ~((bits >> 31) | c_sign_bit)) + c_nan_turn
+            if const_expr(ordered):
+                # torch.topk ties every NaN, so a stable call breaks NaN ties by
+                # column; distinct keys would rank them by sign and payload.
+                key = fx.Int32(arith.maxui(key.ir_value(), c_nan_key.ir_value()))
+            return key
 
         def bucket_for_key(key, start_bit: int):
             return (key.shrui(fx.Int32(start_bit))) & fx.Int32(num_buckets - 1)
