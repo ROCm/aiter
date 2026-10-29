@@ -822,34 +822,35 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////
-// XCD-lane planner.
+// XCD-column planner.
 //
 // The GPU hands workgroup i to XCD (i % num_xcd) and work_indptr forces workgroup order to equal
-// work-slot order, so the workgroups form num_xcd lanes of C = num_cu/num_xcd rows each, one lane
-// per XCD hence per L2, and the work slots walk that grid row by row, lane-fast.
+// work-slot order, so the workgroups form num_xcd lanes of rows = num_cu/num_xcd each, one lane
+// per XCD hence per L2: workgroup wg is row wg / num_xcd of lane wg % num_xcd.
 //
 // The qo tiles of one (batch, kv-fragment) read byte-identical KV, so they have to share a lane
 // for the second and later ones to hit L2. kn_get_mla_metadata_v1_2 emits them on consecutive
 // work slots, i.e. on num_xcd different XCDs. Reordering its greedy emission cannot fix that
 // reliably: the distance between a batch's tiles comes out of the payload packing, i.e. out of
 // the kv lengths, so it only lands on a multiple of num_xcd by luck. Here the placement is
-// constructed instead: split each batch into F(b) fragments, enumerate the (batch, fragment)
-// groups, deal them round-robin to lanes, and give each lane's groups their tiles. Affinity then
-// holds for any batch count and any kv length.
+// constructed instead: every T = qo_tiles consecutive rows of a lane form a column, and a column
+// runs each fragment it is given on all T of its workgroups, tile t on its t-th row. The T tiles
+// of a fragment then stream the same KV side by side on one XCD.
 //
-// Balance: a lane gets every num_xcd-th group so lanes differ by at most one group, and the
-// fragment counts are nudged up until the group total is a multiple of num_xcd, which makes the
-// deal exact. Splitting finer is payload-neutral (it only adds reduce partials).
+// Balance: the batches form one stream, each taking the per-work overhead and then its kv blocks,
+// and column c takes the stream between c * bpc and (c + 1) * bpc, so a batch is split only where
+// a column fills up. A fragment that carries a batch over from the previous column pays one more
+// overhead, so every column carries between bpc - overhead and bpc + overhead, the same ceiling
+// as a CU of kn_get_mla_metadata_v1_2 (payload = bpc + overhead). The workgroups of a column all
+// get the same kv blocks, so they come out as even as the columns, however uneven the kv lengths
+// are. Columns are numbered lane-fast (column c is on lane c % num_xcd), so a plan that fills
+// only the first columns still spreads over every XCD.
 //
-// The placement is closed form, which is what keeps this cheap: group g belongs to lane
-// g % num_xcd as that lane's (g / num_xcd)-th group, a lane spreads its w_r works evenly over the
-// rows so row k starts at j0(r, k) = ceil(k * w_r / rows), and the work slot of lane-local work j
-// is then (works emitted by workgroups before num_xcd*k + r) + j - j0(r, k) with
-// k = j * rows / w_r. So the plan is built warp-parallel into small LDS tables and every output
-// array is filled warp-parallel from them, rather than by a serial cursor walk over the works.
+// A batch's place on the stream is a prefix sum, so the whole plan (cut, column counts,
+// prefixes, work_indptr, the works themselves) is filled warp-parallel from small LDS tables.
 //
 // Only correct for the configuration the host gates on: uniform qo seqlen (so T and qo_tile_size
-// are the same for every batch), dense, qk_batch_ratio == 1.
+// are the same for every batch), T <= rows, dense, qk_batch_ratio == 1.
 /////////////////////////////////////////////////////////////////////////////////////////////
 
 // Exclusive prefix sum of val(0), ..., val(n-1) into p_out[0, n), one warp; n need not be a
@@ -888,26 +889,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     const int32_t rows        = num_cu / num_xcd;
     const int32_t kv_gran     = params.kv_granularity;
     const int32_t page_size   = params.page_size;
-    // Upper bound on the group count, so the group -> batch map can be sized on the host:
-    // F(b) <= max(1, ceil(blocks_b / bpf) + nudge/num_batches + 1), and sum_b blocks_b / bpf is
-    // at most eff_splits <= num_splits by the definition of bpf. See the fragment loop below.
-    const int32_t max_groups = params.num_splits + 2 * num_batches + num_xcd;
+    const int32_t overhead    = params.fixed_over_head_num_blocks;
 
     extern __shared__ uint8_t p_smem[];
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
     int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : num_batches);
-    // The plan. Everything the emission needs is a plain LDS read: the fragment count per batch,
-    // its prefix (so a group knows its batch and fragment index), the reduce-slot prefix, the
-    // group -> batch map, the per-lane work count, the per-(lane, row) first-work table and the
-    // per-workgroup work prefix (which is work_indptr itself).
-    int32_t* p_lds_frags =
-        reinterpret_cast<int32_t*>(p_lds_seqlens_kv + (Traits::kLdsBatchInfo ? num_batches : 0));
-    int32_t* p_lds_cum_frags   = p_lds_frags + num_batches;
-    int32_t* p_lds_cum_splits  = p_lds_cum_frags + num_batches;
-    int32_t* p_lds_group_batch = p_lds_cum_splits + num_batches;
-    int32_t* p_lds_lane_works  = p_lds_group_batch + max_groups;
-    int32_t* p_lds_j0          = p_lds_lane_works + num_xcd;
-    int32_t* p_lds_wb          = p_lds_j0 + num_xcd * (rows + 1);
 
     QoState qo_state(
         params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
@@ -926,6 +912,28 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
         (num_batches > 0) ? mla_v12_num_qo_tiles<Traits>(params, qo_state, 0) : 1;
     const int32_t qo_tile_size =
         (num_batches > 0) ? integer_divide_ceil(qo_state.get_seqlen(0), qo_tiles) : 1;
+
+    // Columns of qo_tiles rows; rows past the last whole column of a lane get no work. Every
+    // fragment but a batch's first opens a column, so there are at most num_batches + num_cols - 1
+    // (batch, fragment) groups.
+    const int32_t cols_per_lane = rows / qo_tiles;
+    const int32_t num_cols      = num_xcd * cols_per_lane;
+    const int32_t max_groups    = num_batches + num_cols;
+
+    // The plan. Everything the emission needs is a plain LDS read: per batch the fragment count,
+    // its prefix (so a group knows its batch and fragment index), the reduce-slot prefix, the
+    // first fragment's column and size; the group -> batch map; per column its group count and
+    // its first group; and the per-workgroup work prefix (which is work_indptr itself).
+    int32_t* p_lds_frags =
+        reinterpret_cast<int32_t*>(p_lds_seqlens_kv + (Traits::kLdsBatchInfo ? num_batches : 0));
+    int32_t* p_lds_cum_frags    = p_lds_frags + num_batches;
+    int32_t* p_lds_cum_splits   = p_lds_cum_frags + num_batches;
+    int32_t* p_lds_start_col    = p_lds_cum_splits + num_batches;
+    int32_t* p_lds_first_blocks = p_lds_start_col + num_batches;
+    int32_t* p_lds_group_batch  = p_lds_first_blocks + num_batches;
+    int32_t* p_lds_col_groups   = p_lds_group_batch + max_groups;
+    int32_t* p_lds_col_first    = p_lds_col_groups + num_cols;
+    int32_t* p_lds_wb           = p_lds_col_first + num_cols;
 
     // kv blocks of a batch, and the extent the fragments are cut out of
     auto kv_len_of = [&](const int32_t bid) -> int32_t {
@@ -957,72 +965,89 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                        kv_len_of(bid) - kv_tail_trim, kv_gran, params.kv_granularity_log2));
     };
 
-    // Same budget kn_get_mla_metadata_v1_2 packs against: it uses
+    // Same budget kn_get_mla_metadata_v1_2 packs a CU against: it uses
     // payload = ceil(sum_blocks, eff_splits) + overhead and then blocks_per_cu = payload -
     // overhead, i.e. blocks_per_cu IS ceil(sum_blocks, eff_splits). sum_blocks already carries
-    // the per-work overhead, so subtracting it again here would collapse bpf to 1 and explode
-    // the fragment count (overhead is 16 for page_size == 1, not 1).
+    // the per-work overhead, so subtracting it again here would collapse bpc to 1 and explode
+    // the fragment count (overhead is 16 for page_size == 1, not 1). Every workgroup of a column
+    // runs one tile of each fragment on it, so this per-workgroup budget is also the column's,
+    // and since sum_blocks counts every batch qo_tiles times, about eff_splits / qo_tiles
+    // columns fill up.
     const int32_t eff_splits = mla_v12_effective_splits(params, sum_blocks);
-    const int32_t bpf        = max(1, integer_divide_ceil(sum_blocks, eff_splits));
+    const int32_t bpc        = max(1, integer_divide_ceil(sum_blocks, eff_splits));
 
-    // F(b): the fragment count the payload budget implies, nudged up until the group total is a
-    // multiple of num_xcd so the round-robin deal over lanes comes out exact. The nudge is spread
-    // over the batches that exist and rounded back through the slice size `per`, which is what
-    // keeps every fragment non-empty: F = ceil(blocks, per) puts the last fragment's start
-    // strictly inside the extent. The total below is then what the batches actually took -- a
-    // phantom group would send a lane past the last batch and scatter LDS and reduce_indptr out
-    // of bounds.
-    int32_t raw_groups = 0;
-    for(int32_t b = lane_idx; b < num_batches; b += opus::get_warp_size())
+    // p_lds_col_first doubles as the difference array of the per-column group counts until those
+    // are scanned out of it.
+    int32_t* p_lds_col_diff = p_lds_col_first;
+    for(int32_t c = lane_idx; c < num_cols; c += opus::get_warp_size())
     {
-        const int32_t f = integer_divide_ceil(blocks_of(b), bpf);
-        p_lds_frags[b]  = f;
-        raw_groups += f;
+        p_lds_col_diff[c] = 0;
     }
-    raw_groups = aiter::warpReduce<aiter::AddFunctor, int32_t, opus::get_warp_size()>(raw_groups);
 
-    const int32_t nudge      = (num_batches > 0) ? ((num_xcd - raw_groups % num_xcd) % num_xcd) : 0;
-    const int32_t nudge_base = (num_batches > 0) ? (nudge / num_batches) : 0;
-    const int32_t nudge_rem  = (num_batches > 0) ? (nudge % num_batches) : 0;
+    __syncthreads();
+
+    // Cut the batch stream into columns. Each batch's stream offset lands in p_lds_start_col and
+    // is replaced there by the same lane with the batch's first column. The batch's kv blocks
+    // span columns s..e; the first fragment ends at column s's edge and the middle ones hold
+    // exactly bpc blocks. Stream past the last column (only rounding can put any there) goes to
+    // the last fragment on the last column, so nothing runs off the end.
+    mla_v12_warp_exclusive_scan(p_lds_start_col, num_batches, [&](const int32_t b) {
+        return split_blocks_of(b) + overhead;
+    });
+    const int32_t last_col = num_cols - 1;
     for(int32_t b = lane_idx; b < num_batches; b += opus::get_warp_size())
     {
-        const int32_t nb   = split_blocks_of(b);
-        const int32_t want = max(1, p_lds_frags[b] + nudge_base + ((b < nudge_rem) ? 1 : 0));
-        const int32_t per  = max(1, integer_divide_ceil(nb, want));
-        p_lds_frags[b]     = max(1, integer_divide_ceil(nb, per));
+        const int32_t left    = split_blocks_of(b);
+        const int32_t x0      = p_lds_start_col[b] + overhead;
+        const int32_t s       = opus::min(x0 / bpc, last_col);
+        const int32_t e       = opus::min((x0 + left - 1) / bpc, last_col);
+        const int32_t frags   = e - s + 1;
+        p_lds_start_col[b]    = s;
+        p_lds_first_blocks[b] = (frags == 1) ? left : ((s + 1) * bpc - x0);
+        p_lds_frags[b]        = frags;
+        atomicAdd(&p_lds_col_diff[s], 1);
+        if(e + 1 < num_cols)
+        {
+            atomicAdd(&p_lds_col_diff[e + 1], -1);
+        }
+    }
+
+    __syncthreads();
+
+    // Column group counts: a batch adds one group to each column it covers. The scan is
+    // exclusive and each lane adds back its own entry, so no barrier is needed in between.
+    mla_v12_warp_exclusive_scan(
+        p_lds_col_groups, num_cols, [&](const int32_t c) { return p_lds_col_diff[c]; });
+    for(int32_t c = lane_idx; c < num_cols; c += opus::get_warp_size())
+    {
+        p_lds_col_groups[c] += p_lds_col_diff[c];
     }
 
     __syncthreads();
 
     // Group prefix (group -> batch / fragment index) and reduce-slot prefix. The latter is the
     // canonical batch-major order, which is what makes reduce_indptr come out monotone with every
-    // fragment agreeing without talking to the others, and its total is the tail value.
-    const int32_t total_groups =
-        min(mla_v12_warp_exclusive_scan(
-                p_lds_cum_frags, num_batches, [&](const int32_t b) { return p_lds_frags[b]; }),
-            max_groups);
+    // fragment agreeing without talking to the others, and its total is the tail value. Groups
+    // are numbered in stream order and the stream visits the columns in order, so the groups of
+    // column c are the ones after those of all earlier columns.
+    const int32_t total_groups = mla_v12_warp_exclusive_scan(
+        p_lds_cum_frags, num_batches, [&](const int32_t b) { return p_lds_frags[b]; });
     const int32_t total_splits =
         mla_v12_warp_exclusive_scan(p_lds_cum_splits, num_batches, [&](const int32_t b) {
             const int32_t fb = p_lds_frags[b];
             return (fb > 1) ? (fb * qo_tiles) : 0;
         });
+    mla_v12_warp_exclusive_scan(
+        p_lds_col_first, num_cols, [&](const int32_t c) { return p_lds_col_groups[c]; });
 
     for(int32_t b = lane_idx; b < num_batches; b += opus::get_warp_size())
     {
         const int32_t g0 = p_lds_cum_frags[b];
-        const int32_t g1 = min(g0 + p_lds_frags[b], max_groups);
+        const int32_t g1 = g0 + p_lds_frags[b];
         for(int32_t g = g0; g < g1; ++g)
         {
             p_lds_group_batch[g] = b;
         }
-    }
-
-    // works this lane owns: ceil((total_groups - r) / num_xcd) groups, qo_tiles works each
-    if(lane_idx < num_xcd)
-    {
-        const int32_t g =
-            (total_groups > lane_idx) ? integer_divide_ceil(total_groups - lane_idx, num_xcd) : 0;
-        p_lds_lane_works[lane_idx] = g * qo_tiles;
     }
 
     // reduce_indptr past the last qo tile. The emission below only writes [1, tot_qo_tiles], so
@@ -1036,26 +1061,16 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
     __syncthreads();
 
-    // j0[r][k]: first of lane r's works that row k emits, spreading w_r works over `rows` rows.
-    for(int32_t r = 0; r < num_xcd; ++r)
-    {
-        const int32_t wr = p_lds_lane_works[r];
-        for(int32_t k = lane_idx; k <= rows; k += opus::get_warp_size())
-        {
-            p_lds_j0[r * (rows + 1) + k] = integer_divide_ceil(k * wr, rows);
-        }
-    }
-
-    __syncthreads();
-
     // Works emitted by the workgroups before wg -- work_indptr, and the offset the emission adds
-    // its lane-local work index to. Workgroups past row `rows` (only reachable when num_xcd does
-    // not divide num_cu) get nothing. The extra entry at num_cu holds the total.
+    // a group's position in its column to. Workgroup wg is row k = wg / num_xcd of lane
+    // wg % num_xcd, i.e. row k % qo_tiles of column (k / qo_tiles) * num_xcd + wg % num_xcd, and
+    // runs one work per group of that column. Rows past the last whole column, and workgroups
+    // past row `rows` (only reachable when num_xcd does not divide num_cu), get nothing. The
+    // extra entry at num_cu holds the total.
     mla_v12_warp_exclusive_scan(p_lds_wb, num_cu + 1, [&](const int32_t wg) {
-        const int32_t r   = wg % num_xcd;
-        const int32_t k   = wg / num_xcd;
-        const int32_t* j0 = p_lds_j0 + r * (rows + 1);
-        return ((wg < num_cu) && (k < rows)) ? (j0[k + 1] - j0[k]) : 0;
+        const int32_t i = (wg / num_xcd) / qo_tiles;
+        return ((wg < num_cu) && (i < cols_per_lane)) ? p_lds_col_groups[i * num_xcd + wg % num_xcd]
+                                                      : 0;
     });
     if(lane_idx == 0)
     {
@@ -1077,33 +1092,32 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     // One lane per (batch, kv fragment) group; each walks that group's qo tiles.
     for(int32_t g = lane_idx; g < total_groups; g += opus::get_warp_size())
     {
-        const int32_t r    = g % num_xcd;
-        const int32_t m    = g / num_xcd;
-        const int32_t wr   = p_lds_lane_works[r];
         const int32_t b    = p_lds_group_batch[g];
         const int32_t fb   = p_lds_frags[b];
         const int32_t frag = g - p_lds_cum_frags[b];
+        const int32_t col  = p_lds_start_col[b] + frag;
+        // the group's place in its column's run, the same on each of the column's workgroups
+        const int32_t pos  = g - p_lds_col_first[col];
+        const int32_t r    = col % num_xcd;
+        const int32_t row0 = (col / num_xcd) * qo_tiles;
 
-        // same slicing as the fragment loop above, and the last fragment closes out the blocks
-        // past the trimmed extent
+        // same slicing as the column cut above, and the last fragment closes out the blocks past
+        // the trimmed extent
         const int32_t nb     = blocks_of(b);
-        const int32_t per    = integer_divide_ceil(split_blocks_of(b), fb);
-        const int32_t bstart = frag * per;
-        const int32_t bend   = (frag == fb - 1) ? nb : opus::min(bstart + per, nb);
+        const int32_t first  = p_lds_first_blocks[b];
+        const int32_t bstart = (frag == 0) ? 0 : (first + (frag - 1) * bpc);
+        const int32_t bend   = (frag == fb - 1) ? nb : opus::min(first + frag * bpc, nb);
 
         const int32_t kv_begin      = kv_begin_of(b);
         const int32_t kv_end        = kv_begin + kv_len_of(b);
         const int32_t qo_begin      = qo_state.get_begin(b);
         const int32_t qo_limit      = qo_state.get_end(b);
         const int32_t splits_before = p_lds_cum_splits[b];
-        const int32_t* p_j0         = p_lds_j0 + r * (rows + 1);
 
         for(int32_t tile = 0; tile < qo_tiles; ++tile)
         {
-            // lane-local work index -> row -> work slot
-            const int32_t j        = m * qo_tiles + tile;
-            const int32_t k        = (j * rows) / wr;
-            const int32_t work_idx = p_lds_wb[k * num_xcd + r] + j - p_j0[k];
+            // tile -> the column's row -> work slot
+            const int32_t work_idx = p_lds_wb[(row0 + tile) * num_xcd + r] + pos;
 
             const int32_t gti = b * qo_tiles + tile;
             const int32_t r0  = splits_before + ((fb > 1) ? (tile * fb) : 0);
@@ -1223,16 +1237,16 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
     const int32_t chunk_with_kv = chunk_that_fits(qo_bytes + kv_bytes);
     const int32_t chunk_no_kv   = chunk_that_fits(qo_bytes);
 
-    // The XCD planner keeps its whole plan in LDS on top of the per-batch info: three per-batch
-    // arrays, the group -> batch map, and the per-lane / per-(lane, row) / per-workgroup tables.
-    // It is the only path that reads these, so nothing else has to reserve for them.
-    const int32_t xcd_rows = (params.num_xcd > 0) ? (params.num_cu / params.num_xcd) : 0;
+    // The XCD planner keeps its whole plan in LDS on top of the per-batch info: five per-batch
+    // arrays, the group -> batch map, and the per-column / per-workgroup tables. It is the only
+    // path that reads these, so nothing else has to reserve for them. The column count is
+    // num_cu / qo_tiles at most; num_cu bounds it for any qo_tiles.
     const int32_t xcd_bytes =
         static_cast<int32_t>(sizeof(int32_t)) *
-        (3 * params.num_batches +                                        // frags + both prefixes
-         (params.num_splits + 2 * params.num_batches + params.num_xcd) + // group -> batch
-         params.num_xcd * (xcd_rows + 2) +                               // j0 table + lane works
-         (params.num_cu + 1));                                           // work prefix
+        (5 * params.num_batches +               // frags, both prefixes, first column and size
+         (params.num_batches + params.num_cu) + // group -> batch
+         2 * params.num_cu +                    // column group counts + first groups
+         (params.num_cu + 1));                  // work prefix
     if(params.xcd_lane_works && kQoSplits && !kIsSparse && (params.qk_batch_ratio == 1) &&
        (params.num_xcd > 1) && (params.num_cu >= params.num_xcd) &&
        (qo_bytes + kv_bytes + xcd_bytes <= lds_size))
