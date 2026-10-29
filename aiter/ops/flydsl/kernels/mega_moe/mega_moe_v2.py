@@ -355,9 +355,14 @@ class MegaMoEV2:
         self.bind_weights(w1, w1_scale, w2, w2_scale)
 
     def preload_aot_bundles(self):
-        """Load the paired Stage1 and Stage2 production bundles."""
+        """Load the paired Stage1 and Stage2 production bundles, and the small- and
+        large-input kernels when this instance built them."""
         self.preload_stage1_bundle()
         self.preload_stage2_bundle()
+        for runtime in self._small_m_runtimes:
+            runtime.preload_aot_bundle()
+        if self._large_m is not None:
+            self._large_m.preload_aot_bundle()
 
     def _build_fused_stage1(self, w1, w1_scale):
         from .mega_moe_prepare import (

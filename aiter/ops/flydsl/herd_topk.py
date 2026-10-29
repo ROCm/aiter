@@ -66,6 +66,7 @@ def _run_finalize(
     round_to_bf16: bool,
     block_threads: int,
     stream: torch.cuda.Stream,
+    num_valid_rows: torch.Tensor | None,
 ) -> None:
     finalize_launch = build_herd_finalize_module(
         topk,
@@ -73,6 +74,7 @@ def _run_finalize(
         bool(need_renorm),
         round_to_bf16,
         block_threads=block_threads,
+        has_num_valid_rows=num_valid_rows is not None,
     )
     _run_compiled(
         finalize_launch,
@@ -80,6 +82,8 @@ def _run_finalize(
         candidate_values,
         topk_weights,
         topk_ids,
+        # Unread without a count; any tensor stands in for the argument.
+        num_valid_rows if num_valid_rows is not None else candidate_ids,
         int(topk_weights.stride(0)),
         int(topk_ids.stride(0)),
         rows,
@@ -176,11 +180,14 @@ def herd_topk_gating(
     need_renorm: bool,
     routed_scaling_factor: float,
     score_func: str,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None:
     """Apply Top-(K+1), batch popularity, and min-unique drop.
 
     Output routes are canonicalized to ascending expert id, matching the
-    Triton HERD output contract.
+    Triton HERD output contract. Rows at or past `num_valid_rows` (int32 on
+    device) are padding: they stay out of the batch popularity and get ids -1
+    and weights 0.
     """
     reason = _unsupported_reason(
         topk_weights,
@@ -233,6 +240,7 @@ def herd_topk_gating(
             False,
             _K3_FINALIZE_THREADS,
             stream,
+            num_valid_rows,
         )
         return
 
@@ -263,4 +271,5 @@ def herd_topk_gating(
         False,
         finalize_threads,
         stream,
+        num_valid_rows,
     )

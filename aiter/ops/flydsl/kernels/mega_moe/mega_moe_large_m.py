@@ -19,7 +19,6 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8, ds_bpermute
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from mori.shmem import mori_shmem_create_tensor
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -36,7 +35,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .mega_moe_fused_gemm import (
     AddrBuffer,
@@ -59,6 +58,7 @@ from .mega_moe_stage1 import _validate_dispatch_capacity
 from .mega_moe_stage2 import _fp8_scale_for_leader, _stage2_lds_bytes
 
 __all__ = ["LargeMRuntime"]
+from .quant import _get_launcher as _get_quant_launcher
 from .quant import per_1x32_mx_quant
 
 
@@ -1915,7 +1915,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     fused_combine_args, sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2, b_nt=-1, work_shards=4, payload_chunk_rows=384,
-    swiglu_limit=0.0, fused_g2_chunk=1):
+    swiglu_limit=0.0, fused_g2_chunk=1, preload=False):
     if len(fused_args) != 14:
         raise ValueError("fused Stage2 needs (mtile_ctr, 13 Stage2 runtime addresses)")
     mtile_ctr, s2_args = fused_args[0], tuple(fused_args[1:])
@@ -1933,7 +1933,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         b_nt=b_nt, work_shards=int(work_shards), payload_chunk_rows=payload_chunk_rows,
         swiglu_limit=swiglu_limit, fused_g2_chunk=int(fused_g2_chunk),
     )
-    _run_compiled(
+    # preload: compile and load without dispatching (AOT bundles).
+    (_preload_compiled if preload else _run_compiled)(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
         tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
         addr_parity, addr_expected, fx.Int64(int(mtile_ctr)), *[fx.Int64(int(v)) for v in s2_args],
@@ -2208,7 +2209,7 @@ class LargeMRuntime:
         self._active_config = config
         return config
 
-    def _run_fused_stage1(self, x, wts, scales, topk_ids, stream, config: MegaMoEConfig):
+    def _run_fused_stage1(self, x, wts, scales, topk_ids, stream, config: MegaMoEConfig, *, preload=False):
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
         elif hasattr(stream, "cuda_stream"):
@@ -2249,7 +2250,7 @@ class LargeMRuntime:
             use_tile_resource=s1.use_tile_resource,
             waves_per_eu_hint=s1.waves_per_eu_hint, b_nt=s1.b_nt,
             work_shards=s1.work_shards, payload_chunk_rows=s1.payload_chunk_rows,
-            swiglu_limit=self.swiglu_limit, **fused_kw)
+            swiglu_limit=self.swiglu_limit, preload=preload, **fused_kw)
         # fmt: on
         self._s1_active_tile_m = s1.sort_block_m
 
@@ -2297,10 +2298,9 @@ class LargeMRuntime:
         self._fused_comb_ctr_arena = self._s1_op._sym(
             (self.state_slots, 4), torch.int32
         )
-        self._tok_ready_arena = mori_shmem_create_tensor(
+        self._tok_ready_arena = self._s1_op._sym(
             (self.state_slots, self.mtpr + 8), torch.int32
         )
-        self._tok_ready_arena.zero_()
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
         self._p2p_tok_ready_by_slot = [
@@ -2349,6 +2349,24 @@ class LargeMRuntime:
             "fused_g2_chunk": LARGE_M_G2_CHUNK,
         }
         return s1, kw
+
+    def preload_aot_bundle(self):
+        """Load the quant and persistent kernels without GPU dispatch."""
+        stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
+        # Two rows: a unit dimension would record a stride signature real inputs never match.
+        rows = 2
+        x_bf16 = torch.empty((rows, self.model_dim), dtype=torch.bfloat16, device=self.dev)
+        x_q = torch.empty((rows, self.model_dim), dtype=torch.float8_e4m3fn, device=self.dev)
+        scales = torch.empty((rows, self._s1_scale_dim), dtype=torch.uint8, device=self.dev)
+        quant_blocks = (rows * self._s1_scale_dim + 63) // 64
+        _preload_compiled(
+            _get_quant_launcher(self.model_dim, "fp8"), x_bf16, x_q, scales, rows, quant_blocks, stream
+        )
+        wts = torch.empty((rows, self.topk), dtype=torch.float32, device=self.dev)
+        topk_ids = torch.empty((rows, self.topk), dtype=torch.int32, device=self.dev)
+        self._run_fused_stage1(
+            x_q, wts, scales, topk_ids, stream, self._select_config(self.mtpr), preload=True
+        )
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
         run_tokens = int(x_bf16.shape[0])

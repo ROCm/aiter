@@ -30,10 +30,11 @@ from ..flydsl_dispatch_combine_intranode_op import (
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .mega_moe_fused_gemm import (
     SMALL_M_FIXED_SLOT_MAX_MTPR,
+    TOKEN_BUCKETS,
     AddrBuffer,
     MegaMoEConfig,
     _buffer_load,
@@ -1377,7 +1378,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2,
-    b_nt=-1, swiglu_limit=0.0):
+    b_nt=-1, swiglu_limit=0.0, preload=False):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -1388,7 +1389,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
         b_nt=b_nt, swiglu_limit=swiglu_limit,
     )
-    _run_compiled(
+    # preload: compile and load without dispatching (AOT bundles).
+    (_preload_compiled if preload else _run_compiled)(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, out_scale,
         tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
         addr_parity, addr_expected, stream,
@@ -1627,6 +1629,43 @@ class SmallMRuntime:
         self._active_config = config
         return config
 
+    def _launch(self, config: MegaMoEConfig, run_tokens, x_bf16, topk_ids, wts, stream, *, preload=False):
+        stage1, stage2 = config.stage1, config.stage2
+        assert config.p2p_quant == "none" and stage2.block_m == stage1.sort_block_m
+        fused = (stage2.block_n, stage2.block_k, int(self.max_recv), self._reducers)
+        op = self._s1_op
+        # fmt: off
+        self._s1_mega(
+            self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
+            op.tile_row_base, op.sorted_expert_ids, self._s1_osd, fx.Int32(self._s1_nvm),
+            fx.Int64(self._s1_disp.data_ptr()), fx.Int32(run_tokens), fx.Int64(x_bf16.data_ptr()),
+            fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(x_bf16.data_ptr()),
+            fx.Int64(self._s1_epoch_parity.data_ptr()), fx.Int64(self._s1_epoch_expected.data_ptr()),
+            stream, model_dim=self.model_dim, inter_dim=self.inter_dim, rank=self.rank,
+            experts_per_rank=self.epr, fuse_npes=self.world_size, fuse_topk=self.topk,
+            fuse_cap=self._s1_cap, fuse_mtpr=self.mtpr, fuse_scale_dim=self._s1_scale_dim,
+            fused=fused, num_cu=self._s1_num_cu,
+            sort_block_m=stage1.sort_block_m, tile_n=stage1.tile_n, tile_k=stage1.tile_k,
+            num_waves=stage1.num_waves, grid_mult=min(stage1.grid_mult, 2),
+            pipe_weights=stage1.pipe_weights,
+            mfma_amajor=stage1.mfma_amajor, swizzle_a=stage1.swizzle_a,
+            async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
+            use_tile_resource=stage1.use_tile_resource,
+            waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit, preload=preload)
+        # fmt: on
+
+    def preload_aot_bundle(self):
+        """Load the kernel of every token bucket this runtime selects, without GPU dispatch."""
+        stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
+        x_bf16, wts, topk_ids = self._idle_inputs
+        seen = set()
+        for bucket in (b for b in TOKEN_BUCKETS if b <= self.mtpr):
+            config = self._select_config(bucket)
+            if (config.stage1, config.stage2) in seen:
+                continue
+            seen.add((config.stage1, config.stage2))
+            self._launch(config, 1, x_bf16, topk_ids, wts, stream, preload=True)
+
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
@@ -1651,29 +1690,7 @@ class SmallMRuntime:
             stream = fx.Stream(stream.cuda_stream)
         # Ranks may use different token buckets in one call; an idle rank uses the 1-token bucket.
         config = self._select_config(max(run_tokens, 1))
-        stage1, stage2 = config.stage1, config.stage2
-        assert config.p2p_quant == "none" and stage2.block_m == stage1.sort_block_m
-        fused = (stage2.block_n, stage2.block_k, int(self.max_recv), self._reducers)
-        op = self._s1_op
-        # fmt: off
-        self._s1_mega(
-            self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
-            op.tile_row_base, op.sorted_expert_ids, self._s1_osd, fx.Int32(self._s1_nvm),
-            fx.Int64(self._s1_disp.data_ptr()), fx.Int32(run_tokens), fx.Int64(x_bf16.data_ptr()),
-            fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(x_bf16.data_ptr()),
-            fx.Int64(self._s1_epoch_parity.data_ptr()), fx.Int64(self._s1_epoch_expected.data_ptr()),
-            stream, model_dim=self.model_dim, inter_dim=self.inter_dim, rank=self.rank,
-            experts_per_rank=self.epr, fuse_npes=self.world_size, fuse_topk=self.topk,
-            fuse_cap=self._s1_cap, fuse_mtpr=self.mtpr, fuse_scale_dim=self._s1_scale_dim,
-            fused=fused, num_cu=self._s1_num_cu,
-            sort_block_m=stage1.sort_block_m, tile_n=stage1.tile_n, tile_k=stage1.tile_k,
-            num_waves=stage1.num_waves, grid_mult=min(stage1.grid_mult, 2),
-            pipe_weights=stage1.pipe_weights,
-            mfma_amajor=stage1.mfma_amajor, swizzle_a=stage1.swizzle_a,
-            async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
-            use_tile_resource=stage1.use_tile_resource,
-            waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit)
-        # fmt: on
+        self._launch(config, run_tokens, x_bf16, topk_ids, wts, stream)
         cfg = self.comb_cfg
         out_tok = (
             self.comb_op.shmem_comb_out_tok.view(torch.int8)[: self.mtpr * cfg.combine_token_bytes]
