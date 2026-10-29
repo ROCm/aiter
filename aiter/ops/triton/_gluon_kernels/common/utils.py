@@ -202,3 +202,18 @@ def consume_k_block(
         a_cur = a_nxt
         b_cur = b_nxt
     return gl.amd.gfx1250.wmma(a_cur, b_cur, acc)
+
+
+@gluon.jit
+def swizzled_tile_coords(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M: gl.constexpr):
+    """Map a 1D tile id to (pid_m, pid_n), grouped over GROUP_SIZE_M rows for L2 reuse.
+
+    Gluon-native on purpose: the triton.jit pid_grid helper keeps the coordinates in VGPRs inside a
+    gluon kernel, which adds readfirstlane traffic and extra LDS waits to the inner loop.
+    """
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    first_pid_m = (tile_id // num_pid_in_group) * GROUP_SIZE_M
+    group_m = gl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_m)
+    pid_n = (tile_id % num_pid_in_group) // group_m
+    return pid_m, pid_n
