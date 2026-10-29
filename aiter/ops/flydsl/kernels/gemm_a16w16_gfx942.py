@@ -673,6 +673,45 @@ PINGPONG_PIPELINE = {
     "async_load_bytes": 16,
     "pingpong": True,
 }
+# (block_m, block_n, block_k, split_k, m_waves, n_waves, k_waves).
+# Bounding the runtime catalogue bounds JIT fan-out for dynamic shapes. The
+# tuner still searches the complete candidate space above.
+FALLBACK_CATALOG = (
+    (32, 32, 64, 1, 2, 2, 1),
+    (32, 32, 64, 4, 2, 2, 1),
+    (32, 32, 128, 8, 2, 2, 1),
+    (64, 64, 64, 1, 2, 2, 1),
+    (64, 64, 128, 3, 2, 2, 1),
+    (64, 64, 128, 4, 2, 2, 1),
+    (64, 128, 64, 1, 2, 2, 1),
+    (64, 128, 128, 1, 2, 2, 1),
+    (64, 128, 128, 2, 2, 2, 1),
+    (64, 128, 128, 4, 2, 2, 1),
+    (128, 128, 64, 1, 2, 2, 1),
+    (128, 128, 128, 1, 2, 2, 1),
+    (128, 192, 64, 1, 2, 2, 1),
+)
+
+
+def fallback_catalog_configs() -> list[dict]:
+    configs = []
+    for bm, bn, bk, sk, mw, nw, kw in FALLBACK_CATALOG:
+        configs.append(
+            {
+                "block_m": bm,
+                "block_n": bn,
+                "block_k": bk,
+                "split_k": sk,
+                "m_waves": mw,
+                "n_waves": nw,
+                "k_waves": kw,
+                "group_m": 4,
+                "split_k_reduce": sk > 1,
+                "direct_store": False,
+                **PINGPONG_PIPELINE,
+            }
+        )
+    return configs
 
 
 def pingpong_fill_cost_us(
@@ -831,9 +870,15 @@ def fallback_eligible(n: int, cfg: dict) -> bool:
 
 @functools.cache
 def _fallback_config(m: int, n: int, k: int, out_dtype_id: int) -> dict:
-    for _, cfg in pingpong_candidates(m, n, k):
+    ranked = []
+    for order, cfg in enumerate(fallback_catalog_configs()):
+        tiles = -(-m // cfg["block_m"]) * -(-n // cfg["block_n"])
+        if cfg["split_k"] > 1 and tiles * cfg["split_k"] > GFX942_NUM_CUS:
+            continue
         if fallback_eligible(n, cfg) and config_is_valid(m, n, k, cfg, out_dtype_id):
-            return cfg
+            ranked.append((model_cost_us(m, n, k, cfg), order, cfg))
+    if ranked:
+        return min(ranked, key=lambda item: item[:2])[2]
     # Fewer than two block_k=64 tiles: the async pipeline, which needs one.
     return {
         "block_m": 32 if m <= 32 else 64,
@@ -851,8 +896,7 @@ def _fallback_config(m: int, n: int, k: int, out_dtype_id: int) -> dict:
 def gfx942_fallback_config(
     m: int, n: int, k: int, out_dtype: torch.dtype = torch.bfloat16
 ) -> dict:
-    """Config for a shape that is not in the tuned table: the cheapest valid,
-    ``fallback_eligible`` pingpong config under ``model_cost_us``."""
+    """Cheapest valid config from the bounded runtime catalogue."""
     out_dtype_id = (
         GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else GEMM_A16W16_DTYPE_BF16
     )

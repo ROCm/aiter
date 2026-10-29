@@ -449,6 +449,18 @@ def test_gemm_a16w16_gfx942_fallback(m, n, k, monkeypatch):
     _assert_close(y, ref, f"fallback M{m} N{n} K{k}")
 
 
+def test_gfx942_fallback_catalog_bounds_dynamic_m_configs():
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    catalog = {tuple(sorted(config.items())) for config in g.fallback_catalog_configs()}
+    selected = {
+        tuple(sorted(g.gfx942_fallback_config(m, 2112, 7168).items()))
+        for m in [*range(1, 129), *range(136, 4097, 8)]
+    }
+    assert selected <= catalog
+    assert len(selected) <= len(g.FALLBACK_CATALOG)
+
+
 @pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
 @pytest.mark.parametrize(
     "split_k",
