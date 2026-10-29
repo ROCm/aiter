@@ -39,10 +39,12 @@ Launch (4x gfx1250; every env knob below is already the script's default):
     # The per-kernel table needs HIP's classic graph path: on the default one
     # the ROCm torch profiler (roctracer) pins the names on the wrong kernels
     # once the graph has a parallel branch (stage1_fused=true), and loses more
-    # kernel records. --profile_table 1 (the default) therefore restarts each
-    # rank with DEBUG_HIP_GRAPH_CLASSIC_PATH=1 when --stage1_fused 1, unless
-    # that is already set. It costs ~1% end to end; --profile_table 0 or
-    # DEBUG_HIP_GRAPH_CLASSIC_PATH=0 times the default path.
+    # kernel records. The classic path, though, times ~1% slower. So with
+    # --stage1_fused 1, --profile_table 1 (the default) runs two passes: each
+    # rank first restarts with DEBUG_HIP_GRAPH_CLASSIC_PATH=1 to profile only,
+    # then restarts again on the default path to time and verify. Setting
+    # DEBUG_HIP_GRAPH_CLASSIC_PATH yourself keeps it to one pass on that path;
+    # =0 drops the kernel table, which that path would mislabel.
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
            --stage1_fused --dispatch_wire --combine --combine_quant
@@ -59,9 +61,11 @@ generated weights, never drawn independently.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
+import tempfile
 import time
 
 import pandas as pd
@@ -111,6 +115,11 @@ QUANT_KEYS = ["a8w4_mxfp4", "a4w4_mxfp4"]
 # add_data_init_args' --scale-init default. Kept here so main() can tell whether
 # the caller asked for a scale distribution this test cannot honour.
 _DEFAULT_SCALE_INIT = "constant"
+
+# Internal: which pass of a split profile/time run this process is (see main()),
+# and where rank 0 of the profiling pass left its kernel tables.
+_PASS_ENV = "_BENCH_MEGA_MOE_PASS"
+_PROFILE_FILE_ENV = "_BENCH_MEGA_MOE_PROFILE_FILE"
 
 
 def _import_mori_comm():
@@ -486,7 +495,15 @@ class Dist:
         self.world = int(os.environ["WORLD_SIZE"])
         self.local_rank = int(os.environ["LOCAL_RANK"])
         if not dist.is_initialized():
-            dist.init_process_group(backend="gloo")
+            # A split run's passes share one torchrun store; a per-pass key
+            # prefix keeps the later pass off the gloo keys the earlier one left.
+            store, _, _ = next(dist.rendezvous("env://"))
+            dist.init_process_group(
+                backend="gloo",
+                store=dist.PrefixStore(os.environ.get(_PASS_ENV, "single"), store),
+                rank=self.rank,
+                world_size=self.world,
+            )
         torch.cuda.set_device(self.local_rank)
 
     def bcast_uid(self, uid):
@@ -836,26 +853,18 @@ class DeviceMoEPipeline:
         torch.cuda.synchronize()
         self.comm.barrier()
 
-    # ---- perf: torch.profiler breakdown + graph-replay wall-clock ---- #
-    def bench(self, warmup=5, iters=10, prof_replays=3):
+    # ---- perf: graph-replay wall-clock + torch.profiler breakdown ---- #
+    def bench(self, warmup=5, iters=10):
         """Time the ONE-graph N-layer dispatch->gemm->combine chain. The graph
         already contains all N layers, so ONE replay is one full chain; `iters` of
         them are timed individually after `warmup` untimed ones.
-        Returns (stats, prof_us) with stats = {min, median, mean, max} in us.
+        Returns stats = {min, median, mean, max} in us.
 
         - a sample is the host wall-clock of one graph replay (one sync after; not
           cuda.Event). For a GPU-bound MoE chain this ~= GPU time.
         - min is the closest to an undisturbed replay, median to the steady state
           of a GPU held at full load; the two drifting apart is what a straggler
-          rank or a throttled clock looks like, hence both are reported.
-        - torch.profiler over `prof_replays` replays for the per-op breakdown.
-
-        NOTE: this ROCm torch build reports self_device_time_total == 0 for every
-        event (verified even for a plain matmul), so torch.profiler cannot give a
-        device-time number here; it is kept for the per-op (CPU-side) breakdown.
-        If a future build populates device time, prof_us below becomes > 0."""
-        import time
-
+          rank or a throttled clock looks like, hence both are reported."""
         assert iters >= 1, f"--iters must time at least one replay, got {iters}"
 
         for _ in range(warmup):
@@ -873,17 +882,29 @@ class DeviceMoEPipeline:
         self.comm.barrier()
 
         samples.sort()
-        stats = {
+        return {
             "min": samples[0],
             "median": samples[len(samples) // 2],
             "mean": sum(samples) / len(samples),
             "max": samples[-1],
         }
 
-        # torch.profiler breakdown over CUDA-graph replays: roctracer/kineto does
-        # surface the per-kernel timeline inside the graph on this build, so we
-        # profile the actual graph (matches the measured per-layer wall) instead of
-        # a separate eager pass.
+    def profile(self, warmup=5, prof_replays=3):
+        """torch.profiler over `prof_replays` graph replays, after `warmup`
+        untimed ones, for the per-kernel breakdown. roctracer/kineto does surface
+        the per-kernel timeline inside the graph on this build, so this profiles
+        the actual graph (matches the measured per-layer wall) instead of a
+        separate eager pass. Returns prof_us.
+
+        NOTE: this ROCm torch build reports self_device_time_total == 0 for every
+        event (verified even for a plain matmul), so torch.profiler cannot give a
+        device-time number here; it is kept for the per-op (CPU-side) breakdown.
+        If a future build populates device time, prof_us below becomes > 0."""
+        for _ in range(warmup):
+            self.graph.replay()
+        torch.cuda.synchronize()
+        self.comm.barrier()
+
         with tprof.profile(
             activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]
         ) as prof:
@@ -892,8 +913,7 @@ class DeviceMoEPipeline:
             torch.cuda.synchronize()
         self.comm.barrier()
         self._prof = prof
-        prof_us = sum(_event_device_us(e) for e in prof.key_averages())
-        return stats, prof_us
+        return sum(_event_device_us(e) for e in prof.key_averages())
 
     def final_output(self):
         self.graph.replay()
@@ -1092,7 +1112,7 @@ def _stage2_overlap_rate(kernel_rows, idim):
 
     gemm2 is matched by its K{idim} contraction, which is what separates it from
     gemm1's K{hidden}. Returns None if any kernel the formula needs is absent, so
-    a run without --profile_table simply carries no rate."""
+    a run without kernel tables simply carries no rate."""
 
     def total_us(rows, match):
         hits = [r["avg_us"] for r in rows if match(r["kernel"])]
@@ -1168,21 +1188,60 @@ def _emit_table(name, rows, max_col_width=120):
     print_json_table(name, rows)
 
 
+def _reexec():
+    """Restart this rank in a fresh interpreter with the current os.environ.
+    Same pid, so torchrun keeps tracking the rank."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+
+
+def _hand_off_to_timing_pass(dist_ctx, kernel_rows, prof_us):
+    """End the classic-path profiling pass: rank 0 parks its kernel tables in a
+    temp file, then every rank restarts on the default graph path to time."""
+    if dist_ctx.rank == 0:
+        fd, path = tempfile.mkstemp(prefix="bench_mega_moe_prof_", suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"kernel_rows": kernel_rows, "prof_us": prof_us}, f)
+        os.environ[_PROFILE_FILE_ENV] = path
+    dist_ctx.shutdown()
+    os.environ[_PASS_ENV] = "time"
+    del os.environ["DEBUG_HIP_GRAPH_CLASSIC_PATH"]
+    _reexec()
+
+
+def _take_profiling_pass_results():
+    """(kernel_rows, prof_us) the profiling pass left for this rank; only rank 0
+    gets any."""
+    path = os.environ.pop(_PROFILE_FILE_ENV, None)
+    if path is None:
+        return {}, {}
+    with open(path) as f:
+        data = json.load(f)
+    os.remove(path)
+    return data["kernel_rows"], data["prof_us"]
+
+
 # Driver
 def main():
     args = _parse_args()
     # HIP reads its debug flags once, when the runtime starts, and importing
-    # aiter has already started it -- so the flag only takes in a fresh
-    # interpreter. Same pid, so torchrun keeps tracking the rank. Only the
-    # stage1_fused graph has the parallel branch that gets mislabelled, so the
-    # other runs keep timing the default path.
+    # aiter has already started it -- so the graph path only changes in a fresh
+    # interpreter. Only the stage1_fused graph has the parallel branch that gets
+    # mislabelled, so only it is split: a "profile" pass on the classic path,
+    # then a "time" pass on the default one. Every other run is one "single"
+    # pass on whatever path the environment picks.
     if (
         args.profile_table
         and args.stage1_fused
+        and _PASS_ENV not in os.environ
         and "DEBUG_HIP_GRAPH_CLASSIC_PATH" not in os.environ
     ):
+        os.environ[_PASS_ENV] = "profile"
         os.environ["DEBUG_HIP_GRAPH_CLASSIC_PATH"] = "1"
-        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+        _reexec()
+    run_pass = os.environ.get(_PASS_ENV, "single")
+    profile_pass = run_pass == "profile"
     dist_ctx = Dist()
     dev = torch.device("cuda", dist_ctx.local_rank)
     # Set, not setdefault: the wire has to match this, so a stale environment
@@ -1216,6 +1275,10 @@ def main():
     data_dist = resolve_data_init(args.data_init)
 
     classic_graph = os.environ.get("DEBUG_HIP_GRAPH_CLASSIC_PATH") == "1"
+    # The default graph path mislabels the stage1_fused graph's kernels, and
+    # stage2_overlap_rate is read off those names, so neither is taken there.
+    labels_ok = classic_graph or not spec["stage1_fused"]
+    run_profiler = bool(args.profile_table) and run_pass != "time" and labels_ok
     if dist_ctx.rank == 0:
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
@@ -1228,15 +1291,28 @@ def main():
             f"gate={spec['gate_mode'].name} fused_shared_experts={n_shared} "
             f"expert_balance={expert_balance} data_init={data_dist} "
             f"seed={args.seed} gfx={get_gfx()} "
-            f"hip_graph={'classic' if classic_graph else 'default'}",
+            f"hip_graph={'classic' if classic_graph else 'default'} pass={run_pass}",
             flush=True,
         )
-        if classic_graph:
+        if profile_pass:
+            print(
+                "# note: profiling pass on the HIP classic graph path, which labels "
+                "the kernel table right; timing and accuracy follow on the default "
+                "path in a fresh process",
+                flush=True,
+            )
+        elif classic_graph:
             print(
                 "# note: HIP classic graph path (DEBUG_HIP_GRAPH_CLASSIC_PATH=1) "
                 "labels the kernel table right but times ~1% slower than the "
-                "default path -- --profile_table 0 or "
-                "DEBUG_HIP_GRAPH_CLASSIC_PATH=0 times that one",
+                "default path -- unset it to time the default path",
+                flush=True,
+            )
+        elif run_pass == "single" and args.profile_table and not labels_ok:
+            print(
+                "# note: kernel table and stage2_overlap_rate skipped -- the default "
+                "HIP graph path mislabels the stage1_fused graph's kernels; unset "
+                "DEBUG_HIP_GRAPH_CLASSIC_PATH to profile on the classic path",
                 flush=True,
             )
         if list(args.scale_init) != [_DEFAULT_SCALE_INIT]:
@@ -1298,7 +1374,11 @@ def main():
     modes = resolve_combine_modes(args.combine)
     summary_rows = []
     outputs = {}
-    kernel_rows = {}  # per mode, kept for the stage-2 overlap rate below
+    # Per mode, kept for the stage-2 overlap rate below; the time pass inherits
+    # them from the profile pass.
+    kernel_rows, prof_us_by_mode = {}, {}
+    if run_pass == "time":
+        kernel_rows, prof_us_by_mode = _take_profiling_pass_results()
     for combine_mode in modes:
         if dist_ctx.rank == 0 and len(modes) > 1:
             print(f"# ---- combine={combine_mode} ----", flush=True)
@@ -1321,32 +1401,31 @@ def main():
         )
         pipe.setup(x0)
         pipe.capture(x0)
-        stats, prof_us = pipe.bench(
-            warmup=args.warmup, iters=args.iters, prof_replays=args.prof_replays
-        )
-        # Aggregate perf across ranks (collective calls -> run on every rank, and
-        # the dict is built in the same order everywhere so the allreduces stay in
-        # step).
-        stats = {k: dist_ctx.allreduce_avg_float(v) for k, v in stats.items()}
-        per_layer_us = stats["median"] / n_layers
-        prof_us = dist_ctx.allreduce_avg_float(prof_us)
-        _run_distributed_smi_replay(
-            pipe, dist_ctx, stats["median"], n_layers, combine_mode
-        )
-        # Aggregate unconditionally, print only on request: bench() profiles the
-        # replays either way and this is one gather of a ~20-entry dict, while
-        # stage2_overlap_rate is a result the summary should carry whether or not
-        # anyone asked for the per-kernel table. Collective, so every rank calls
-        # it -- which is also why it must stay outside the --profile_table guard
-        # rather than being duplicated on both sides of it.
-        tbl = _aggregate_prof_table(
-            pipe._prof,
-            dist_ctx,
-            per_layer_denom=args.prof_replays * n_layers,
-        )
-        if dist_ctx.rank == 0 and tbl is not None:
-            kernel_rows[combine_mode] = tbl["rows"]
-        if args.profile_table:
+        if not profile_pass:
+            stats = pipe.bench(warmup=args.warmup, iters=args.iters)
+            # Aggregate perf across ranks (collective calls -> run on every rank,
+            # and the dict is built in the same order everywhere so the
+            # allreduces stay in step).
+            stats = {k: dist_ctx.allreduce_avg_float(v) for k, v in stats.items()}
+            per_layer_us = stats["median"] / n_layers
+            _run_distributed_smi_replay(
+                pipe, dist_ctx, stats["median"], n_layers, combine_mode
+            )
+        if run_profiler:
+            # The profile pass has not replayed the graph yet, so it warms up here.
+            prof_us = pipe.profile(
+                warmup=args.warmup if profile_pass else 0,
+                prof_replays=args.prof_replays,
+            )
+            prof_us_by_mode[combine_mode] = dist_ctx.allreduce_avg_float(prof_us)
+            # Collective, so every rank calls it; only rank 0 gets the table.
+            tbl = _aggregate_prof_table(
+                pipe._prof,
+                dist_ctx,
+                per_layer_denom=args.prof_replays * n_layers,
+            )
+            if dist_ctx.rank == 0 and tbl is not None:
+                kernel_rows[combine_mode] = tbl["rows"]
             # Save a chrome/perfetto timeline per rank so the actual kernel
             # timeline (and any gaps) can be inspected directly. Opt-in
             # (--save_trace): the export can stall multi-rank graph-profile runs,
@@ -1367,16 +1446,6 @@ def main():
             # kernel mix, so merging them into a single table would compare rows
             # that never ran in the same pipeline.
             if dist_ctx.rank == 0 and tbl is not None:
-                if (
-                    spec["stage1_fused"]
-                    and os.environ.get("DEBUG_HIP_GRAPH_CLASSIC_PATH") != "1"
-                ):
-                    print(
-                        f"# note: {combine_mode} kernel names are unreliable -- the "
-                        "compact plan's side stream makes the profiler mislabel "
-                        "graph kernels; rerun with DEBUG_HIP_GRAPH_CLASSIC_PATH=1",
-                        flush=True,
-                    )
                 if not tbl["summary"][0]["events_complete"]:
                     print(
                         f"# note: {combine_mode} profiler lost kernel records -- avg_us "
@@ -1388,40 +1457,42 @@ def main():
                 _emit_table(
                     f"mega_moe kernel profile summary [{combine_mode}]", tbl["summary"]
                 )
-
-        # Replay once more for the accuracy snapshot while the graph is still
-        # alive; teardown below frees it.
-        if args.acc_verify:
-            outputs[combine_mode] = pipe.final_output().float()
-        summary_rows.append(
-            {
-                "quant_type": args.quant_type,
-                "combine": combine_mode,
-                "dispatch": spec["dispatch_backend"],
-                "stage1_fused": spec["stage1_fused"],
-                "data_init": data_dist,
-                "seed": args.seed,
-                "world_size": dist_ctx.world,
-                "tokens_per_rank": ct,
-                "experts": E,
-                "topk": topk,
-                "fused_shared_experts": n_shared,
-                "hidden": hdim,
-                "intermediate": idim,
-                "layers": n_layers,
-                "warmup": args.warmup,
-                "iters": args.iters,
-                "min_us": stats["min"],
-                "mean_us": stats["mean"],
-                "median_us": stats["median"],
-                "max_us": stats["max"],
-                "per_layer_us": per_layer_us,
-                "prof_device_us": prof_us if prof_us > 0 else None,
-            }
-        )
+        if not profile_pass:
+            # Replay once more for the accuracy snapshot while the graph is still
+            # alive; teardown below frees it.
+            if args.acc_verify:
+                outputs[combine_mode] = pipe.final_output().float()
+            summary_rows.append(
+                {
+                    "quant_type": args.quant_type,
+                    "combine": combine_mode,
+                    "dispatch": spec["dispatch_backend"],
+                    "stage1_fused": spec["stage1_fused"],
+                    "data_init": data_dist,
+                    "seed": args.seed,
+                    "world_size": dist_ctx.world,
+                    "tokens_per_rank": ct,
+                    "experts": E,
+                    "topk": topk,
+                    "fused_shared_experts": n_shared,
+                    "hidden": hdim,
+                    "intermediate": idim,
+                    "layers": n_layers,
+                    "warmup": args.warmup,
+                    "iters": args.iters,
+                    "min_us": stats["min"],
+                    "mean_us": stats["mean"],
+                    "median_us": stats["median"],
+                    "max_us": stats["max"],
+                    "per_layer_us": per_layer_us,
+                    "prof_device_us": prof_us_by_mode.get(combine_mode) or None,
+                }
+            )
         pipe.teardown()
         del pipe
         torch.cuda.empty_cache()
+    if profile_pass:
+        _hand_off_to_timing_pass(dist_ctx, kernel_rows, prof_us_by_mode)
 
     # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
     # ONE reference for every mode: the modes differ only in how combine moves the
@@ -1471,7 +1542,8 @@ def main():
         if base_median:
             for row in summary_rows:
                 row["speedup_vs_base"] = base_median / row["median_us"]
-        # Needs both modes' kernel tables, so it only exists under --profile_table.
+        # Needs both modes' kernel tables, so it only exists when they were
+        # profiled on a graph path that labels them right.
         # It describes what fused did with base's stage 2, so it belongs on the
         # fused row; base is the 0.0 baseline it is measured against.
         overlap = _stage2_overlap_rate(kernel_rows, idim)
