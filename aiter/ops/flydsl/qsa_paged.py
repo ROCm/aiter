@@ -36,7 +36,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .kernels.kernels_common import LOG2E, get_warp_size
+from .kernels.kernels_common import LOG2E, ceildiv, get_warp_size
 from .kernels.qsa.indexer_select import (
     _D,
     _DECODE_MAX_ROWS,
@@ -263,8 +263,8 @@ def _indexer_rows_scorer_layout(
     if row_bounded:
         return False, 1
 
-    row_tiles = (rows + 15) // 16
-    col_tiles = (live_columns + _ROWS_BLOCK_N - 1) // _ROWS_BLOCK_N
+    row_tiles = ceildiv(rows, 16)
+    col_tiles = ceildiv(live_columns, _ROWS_BLOCK_N)
     tile_work = row_tiles * col_tiles
     tiles_per_wg = 1
     if (
@@ -279,8 +279,7 @@ def _indexer_rows_scorer_layout(
         tiles_per_wg = _ROWS_SCORER_TILES_PER_WG
     while (
         tiles_per_wg > 1
-        and row_tiles * ((col_tiles + tiles_per_wg - 1) // tiles_per_wg)
-        < _ROWS_SCORER_MIN_WORKGROUPS
+        and row_tiles * ceildiv(col_tiles, tiles_per_wg) < _ROWS_SCORER_MIN_WORKGROUPS
     ):
         tiles_per_wg //= 2
     return False, tiles_per_wg
@@ -485,7 +484,7 @@ def qsa_indexer_score_and_select(
     if scores is None:
         scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
     row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
-    score_tiles = (n_columns + score_block_n - 1) // score_block_n
+    score_tiles = ceildiv(n_columns, score_block_n)
     # numel() is the packed page. A vLLM layer view pads the page stride,
     # so the bytes the descriptor has to cover are the span.
     wide_cache = span_bytes(k_cache) > (1 << 32)
@@ -499,7 +498,7 @@ def qsa_indexer_score_and_select(
             layout_columns,
             row_bounded=row_bounded,
         )
-        col_tiles = (n_columns + _ROWS_BLOCK_N - 1) // _ROWS_BLOCK_N
+        col_tiles = ceildiv(n_columns, _ROWS_BLOCK_N)
         tile_rows = 16 // n_heads if fold_heads else 16
         _run_compiled(
             _prefill_scores_plan(
@@ -518,8 +517,8 @@ def qsa_indexer_score_and_select(
             int(context_lens.shape[0]),
             float(score_scale),
             int(k_cache.shape[0]),
-            (m + tile_rows - 1) // tile_rows,
-            (col_tiles + tiles_per_wg - 1) // tiles_per_wg,
+            ceildiv(m, tile_rows),
+            ceildiv(col_tiles, tiles_per_wg),
             tiles_per_wg,
             torch.cuda.current_stream(q.device),
         )
@@ -692,6 +691,7 @@ def qsa_indexer_block_ids(
     score_scale: float = _SCORE_SCALE,
     heads: tuple[int, ...] = _SCORE_HEADS,
     scores: torch.Tensor | None = None,
+    _return_empty_geometry: bool = False,
 ) -> torch.Tensor:
     """Write indexer ``block_ids [M, 512]`` from paged compressed K.
 
@@ -732,17 +732,17 @@ def qsa_indexer_block_ids(
             f"page_table has {int(page_table.shape[0])} request rows for "
             f"{int(context_lens.shape[0])} context lengths"
         )
-    if out is None:
-        out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
-    elif out.shape != (m, _K) or out.dtype != torch.int32:
+    if out is not None and (out.shape != (m, _K) or out.dtype != torch.int32):
         raise ValueError(f"out must be int32 [{m}, {_K}], got {tuple(out.shape)}")
-    elif not out.is_contiguous():
+    if out is not None and not out.is_contiguous():
         raise ValueError("out must be contiguous")
     if scores is not None:
         _check_indexer_score_workspace(
             scores, m, int(page_table.shape[1]) * int(k_cache.shape[1])
         )
-    tensors = (q, k_cache, page_table, token_to_req, query_positions, context_lens, out)
+    tensors = (q, k_cache, page_table, token_to_req, query_positions, context_lens)
+    if out is not None:
+        tensors = tensors + (out,)
     if scores is not None:
         tensors = tensors + (scores,)
     if any(not t.is_cuda for t in tensors):
@@ -759,7 +759,13 @@ def qsa_indexer_block_ids(
         or page_table.shape[0] == 0
         or page_table.shape[1] == 0
     ):
+        if _return_empty_geometry:
+            return None, True
+        if out is None:
+            out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
         return out.fill_(-1)
+    if out is None:
+        out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
     q = q.contiguous()
     # Leave k_cache strided. contiguous() would copy a vLLM layer view into
     # every captured decode graph.
@@ -818,6 +824,8 @@ def qsa_indexer_block_ids(
             row_bounded=row_bounded,
             scores=scores,
         )
+    if _return_empty_geometry:
+        return out, False
     return out
 
 
@@ -1142,8 +1150,11 @@ def qsa_layer(
         score_scale, softmax_scale: see above.
 
     A span past 4 GiB on a cache selects the wide gather compile. An empty
-    query, cache, or page table writes ``-1`` block ids and a zero ``out``
-    and does not launch. Paged GQA gathers the token ids it is given and does not
+    query writes a zero ``out`` and does not launch paged GQA. An empty
+    indexer cache or index page table has no selected blocks, but expand
+    still emits the causal tail and paged GQA gathers it from the GQA cache.
+    An empty GQA cache or KV page table writes a zero ``out`` and does not
+    launch paged GQA. Paged GQA gathers the token ids it is given and does not
     check that they are causal. It allocates its own split partials on a
     multi-split launch. The block ids are the selection for this call.
     Sigmoid and partial RoPE stay outside this call.
@@ -1171,17 +1182,37 @@ def qsa_layer(
         extra["heads"] = (int(q_indexer.shape[1]),)
     if score_scale is not None:
         extra["score_scale"] = score_scale
-    block_ids = qsa_indexer_block_ids(
-        q_indexer,
-        index_k_cache,
-        index_page_table,
-        token_to_req,
-        query_positions,
-        context_lens,
-        out=block_ids,
-        scores=scores,
-        **extra,
-    )
+    if block_ids is None:
+        block_ids, empty_indexer = qsa_indexer_block_ids(
+            q_indexer,
+            index_k_cache,
+            index_page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            scores=scores,
+            _return_empty_geometry=True,
+            **extra,
+        )
+    else:
+        empty_indexer = False
+        block_ids = qsa_indexer_block_ids(
+            q_indexer,
+            index_k_cache,
+            index_page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out=block_ids,
+            scores=scores,
+            **extra,
+        )
+    if empty_indexer:
+        # No compressed group is selected. The expand kernel does not read
+        # group ids when this axis is zero, but still emits the causal tail.
+        block_ids = torch.empty(
+            (q_indexer.shape[0], 0), dtype=torch.int32, device=q_indexer.device
+        )
     indices = _expand_block_ids(
         block_ids,
         query_positions,
