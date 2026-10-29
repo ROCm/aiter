@@ -17,23 +17,23 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter import logger
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
-    NUM_GRID_GROUPS,
-    build_hstu_attention_bwd_dvdk,
-    validate_hstu_attention_bwd,
-)
-from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_dq import (
-    build_hstu_attention_bwd_dq,
-)
-from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fused_pp import (
     balanced_tile_groups,
+    build_hstu_attention_bwd,
     build_hstu_attention_bwd_dq_reduce,
-    build_hstu_attention_bwd_fused_pp,
     build_partial_offsets,
     build_reduce_map,
     reduce_blocks_per_seq,
     slot_rows,
     span_scratch_rows,
-    validate_hstu_attention_bwd_fused_pp,
+    validate_hstu_attention_bwd,
+)
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fallback_dq import (
+    build_hstu_attention_bwd_dq,
+)
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fallback_dvdk import (
+    NUM_GRID_GROUPS,
+    build_hstu_attention_bwd_dvdk,
+    validate_hstu_attention_bwd_fallback,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd import (
     build_hstu_attention_fwd,
@@ -500,19 +500,18 @@ def _validate_bwd_inputs(
     return batch, num_heads, head_dim, hidden_dim, dtype_str
 
 
-# dV/dK owns KV rows; dQ owns query rows. Each single-writer kernel has an
-# independent tuned configuration.
-# CSV tags identify the fused dV+dK kernel and the dQ kernel.
+# The default backward is the fused dV/dK/dQ ping-pong kernel: all three
+# gradients in one KV-owned pass, with dQ as a split-K partial that `dq_reduce`
+# then sums. It runs whenever its gate accepts the shape and its scratch fits;
+# AITER_HSTU_BWD_FUSED=0 or `fused=False` opts out.
+#
+# Everything else -- fp16, gfx950, head_dim != 64, a contextual prefix, more
+# heads than the reduction serves, explicit fallback tiles, or a scratch that
+# does not fit -- runs the fallback pair: dV/dK owns KV rows, dQ owns query
+# rows, and each single-writer kernel has an independent tuned configuration.
+# CSV tags identify the three kernels.
 _BWD_KERNEL_DVDK = "dvdk"
 _BWD_KERNEL_DQ = "dq"
-# The fused dV/dK/dQ ping-pong kernel. It produces all three gradients in one
-# KV-owned pass, with dQ as a split-K partial that `dq_reduce` then sums, so it
-# replaces BOTH kernels above rather than either one.
-#
-# Opt-in only: reached when a tuned CSV row carries this discriminator, via
-# AITER_HSTU_BWD_FUSED=1, or via an explicit `fused=True`. It is never a
-# fallback -- a shape with no such row keeps the `dvdk` + `dq` pair, which is
-# the only path that covers fp16, head_dim != 64 and gfx950.
 _BWD_KERNEL_FUSED = "fused"
 _BWD_KERNELS = (
     _BWD_KERNEL_DVDK,
@@ -528,8 +527,8 @@ _BWD_FUSED_TILES = {
     "num_waves": 8,
     "waves_per_eu": 2,
 }
-# Fraction of free device memory the fp32 split-K scratch may claim. The
-# remainder has to cover the reduction's carry and torch's own allocator slack.
+# Fraction of the reachable memory (`_fused_scratch_budget`) the fp32 split-K
+# scratch and its carry may claim; the remainder is torch's allocator slack.
 _BWD_FUSED_MEM_BUDGET = 0.8
 
 _BWD_CSV_COLUMNS: list[str] = [
@@ -723,7 +722,7 @@ def _get_bwd_default_config(
             "waves_per_eu": waves_per_eu,
         }
         try:
-            validate_hstu_attention_bwd(
+            validate_hstu_attention_bwd_fallback(
                 1,
                 head_dim,
                 hidden_dim,
@@ -841,13 +840,19 @@ def _resolve_bwd_fused_config(
 ) -> dict | None:
     """The fused kernel's config for this problem, or None to use dvdk + dq.
 
-    `fused` is the caller's explicit request: None defers to the tuned CSV and
-    AITER_HSTU_BWD_FUSED, True *requires* the fused path and re-raises the gate's
-    error rather than falling back, False never uses it. True exists because the
-    CSV/env paths degrade to the shipping kernels silently, which is how a
-    benchmark ends up timing a kernel it did not ask for.
+    `fused` is the caller's explicit request: None uses the fused kernel
+    wherever its gate accepts the shape (unless AITER_HSTU_BWD_FUSED=0), True
+    *requires* it and re-raises the gate's error rather than falling back, False
+    never uses it. True exists because the default degrades to the fallback pair
+    silently, which is how a benchmark ends up timing a kernel it did not ask
+    for.
     """
     if fused is False:
+        return None
+    if fused is None and os.environ.get("AITER_HSTU_BWD_FUSED", "").lower() in (
+        "0",
+        "false",
+    ):
         return None
 
     tuned_config = _get_bwd_tuned_config(
@@ -862,19 +867,11 @@ def _resolve_bwd_fused_config(
         contextual_seq_len=contextual_seq_len,
         has_targets=has_targets,
     )
-    requested = (
-        fused is True
-        or bool(tuned_config)
-        or os.environ.get("AITER_HSTU_BWD_FUSED", "") in ("1", "true")
-    )
-    if not requested:
-        return None
-
-    # The env/explicit paths supply the one tile this kernel is specialized for;
-    # a tuned row brings its own and has to match the gate anyway.
+    # A tuned row brings its own tile and has to match the gate anyway; explicit
+    # tiles are the fallback pair's, so any that differ fail the gate below.
     config = {**_BWD_FUSED_TILES, **tuned_config, **custom_config}
     try:
-        validate_hstu_attention_bwd_fused_pp(
+        validate_hstu_attention_bwd(
             num_heads,
             head_dim,
             hidden_dim,
@@ -890,9 +887,27 @@ def _resolve_bwd_fused_config(
     except ValueError as exc:
         if fused is True:
             raise
-        logger.warning("hstu bwd fused not applicable, using dvdk + dq: %s", exc)
+        logger.debug("hstu bwd fused not applicable, using dvdk + dq: %s", exc)
         return None
     return config
+
+
+def _fused_scratch_budget(device: torch.device) -> float:
+    """Bytes the split-K scratch and carry may plan for on `device`.
+
+    Free device memory plus the cached segments with nothing live in them,
+    which an allocation can reuse whole or the allocator can hand back. The free
+    pieces of a partly-used segment are neither: they fit the scratch only if a
+    single piece already does, and they never return to the driver.
+    """
+    free, _total = torch.cuda.mem_get_info(device)
+    stats = torch.cuda.memory_stats(device)
+    releasable = (
+        stats.get("reserved_bytes.all.current", 0)
+        - stats.get("allocated_bytes.all.current", 0)
+        - stats.get("inactive_split_bytes.all.current", 0)
+    )
+    return (free + max(releasable, 0)) * _BWD_FUSED_MEM_BUDGET
 
 
 def _plan_fused_groups(
@@ -918,10 +933,17 @@ def _plan_fused_groups(
     traffic, which exists only at G > 1 and costs 2*(G-1) passes over L*H*D
     fp32.
 
-    Memory is settled by ATTEMPTING, not by predicting: `mem_get_info` misses
-    the caching allocator's free blocks, and counting those back still misses
-    their fragmentation, while the scratch is one large contiguous block. So:
-    estimate, try, and on OOM release the cache and step G up.
+    Memory is settled by ATTEMPTING, not by predicting: the estimate below
+    cannot see how the reachable memory is laid out, while the scratch is one
+    large contiguous block. So: estimate, try, and on OOM release the cache and
+    step G up.
+
+    The estimate has to stay on the safe side, because a failed attempt is far
+    from free: the allocator first releases every whole cached segment --
+    including the previous call's scratch, the one block this call could have
+    reused -- and the planner then reallocates it, several hundred ms per call
+    at deployment sizes. Hence `_fused_scratch_budget` ignores the free pieces
+    of partly-used segments.
 
     `empty_cache()` is deliberately NOT on the fast path. It hands the scratch
     back to the driver, so the next call could not reuse it.
@@ -946,11 +968,7 @@ def _plan_fused_groups(
     if groups != "auto":
         candidates = [int(groups)]
     else:
-        free, _total = torch.cuda.mem_get_info(device)
-        cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(
-            device
-        )
-        budget = (free + cached) * _BWD_FUSED_MEM_BUDGET
+        budget = _fused_scratch_budget(device)
         first = next(
             (g for g in range(1, n_kv_tiles + 1) if _plan(g)[2] <= budget),
             n_kv_tiles,
@@ -985,8 +1003,9 @@ def _plan_fused_groups(
         return g, spans, dq_part, dq_carry
 
     raise MemoryError(
-        f"hstu bwd fused: no kv-chunking in 1..{n_kv_tiles} fits -- the "
-        f"smallest pass still needs {_plan(n_kv_tiles)[2] / 1e9:.1f} GB "
+        f"hstu bwd fused: no kv-chunking in {candidates[0]}..{candidates[-1]} "
+        f"fits -- the smallest pass still needs "
+        f"{_plan(candidates[-1])[2] / 1e9:.1f} GB "
         f"({last_error})"
     )
 
@@ -1065,7 +1084,7 @@ def _make_bwd_fused_runners(
     if launch_stream.device != device:
         raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
 
-    fused_launcher = build_hstu_attention_bwd_fused_pp(
+    fused_launcher = build_hstu_attention_bwd(
         num_heads,
         head_dim,
         hidden_dim,
@@ -1297,14 +1316,19 @@ def flydsl_hstu_attention_bwd(
     """HSTU attention backward: returns (dq, dk, dv).
 
     Recomputes `Z = alpha * Q * K^T`, then applies the mask, SiLU derivative,
-    and `1/N` normalization. dV/dK share one score pass; dQ uses a second pass.
+    and `1/N` normalization.
 
-    `fused` opts into the single-pass dV/dK/dQ kernel, which is gated to
-    gfx942 / bf16 / head_dim == hidden_dim == 64. None defers to the tuned CSV
-    and AITER_HSTU_BWD_FUSED; True requires it and raises if the shape is
-    outside the gate; False never uses it. The fused path trades a large fp32
-    split-K scratch for the latency win, so `fused_groups` chunks the kv tiles
-    into passes over one reused buffer ("auto" picks the smallest G that fits).
+    The default kernel computes dV, dK and dQ in one pass. It is specialized for
+    gfx942 / bf16 / head_dim == hidden_dim == 64 / no contextual prefix and its
+    own tile, and trades a large fp32 split-K scratch for the latency win, so
+    `fused_groups` chunks the kv tiles into passes over one reused buffer
+    ("auto" picks the smallest G that fits). Any other shape, explicit tile
+    overrides, or a scratch that does not fit run the fallback pair instead,
+    which computes dV/dK in one kernel and dQ in a second.
+
+    `fused` overrides the choice: None picks as above (AITER_HSTU_BWD_FUSED=0
+    forces the fallback), True requires the single-pass kernel and raises
+    instead of falling back, False always uses the fallback pair.
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q,

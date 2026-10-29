@@ -41,8 +41,8 @@ from aiter.ops.flydsl.hstu_attention import (
     flydsl_hstu_attention_bwd,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import validate_hstu_attention_bwd
-from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fused_pp import (
-    validate_hstu_attention_bwd_fused_pp,
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fallback_dvdk import (
+    validate_hstu_attention_bwd_fallback,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -389,6 +389,9 @@ def test_validate_bwd_inputs_rejects_cpu_tensors():
 
 
 @requires_cuda
+# False pins the fallback pair; None is the default dispatch, which runs the
+# fused kernel for the bf16 / 64-dim cases on gfx942.
+@pytest.mark.parametrize("fused", [False, None])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "batch,heads,attn_dim,hidden_dim,max_seq_len",
@@ -401,7 +404,7 @@ def test_validate_bwd_inputs_rejects_cpu_tensors():
     ],
 )
 def test_flydsl_bwd_dense_causal_shapes(
-    batch, heads, attn_dim, hidden_dim, max_seq_len, dtype
+    batch, heads, attn_dim, hidden_dim, max_seq_len, dtype, fused
 ):
     alpha = 1.0 / attn_dim * 10000
 
@@ -422,21 +425,22 @@ def test_flydsl_bwd_dense_causal_shapes(
         max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
     )
     dq, dk, dv = flydsl_hstu_attention_bwd(
-        max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0
-    )
+        max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0,
+        fused=fused,
+    )  # fmt: skip
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
 # --------------------------------------------------------------------------- #
-# Fused dV/dK/dQ kernel (opt-in, split-K dQ + reduction)
+# Fused dV/dK/dQ kernel (the default; split-K dQ + reduction)
 #
 # The fused kernel hard-gates gfx942 / bf16 / head_dim == hidden_dim == 64 and
-# the (256, 16, 8) tile, so everything here is skipped elsewhere and the dvdk +
-# dq pair above stays the only path the rest of the suite exercises.
+# the (256, 16, 8) tile, so everything here is skipped elsewhere. The cases
+# above mostly sit outside that gate and so exercise the fallback pair.
 #
-# `fused=True` rather than the env var or a tuned row: both of those degrade to
-# the shipping kernels SILENTLY when the gate rejects a shape, which would make
-# these cases pass while testing something else entirely.
+# `fused=True` rather than the default: the default degrades to the fallback
+# pair SILENTLY when the gate rejects a shape, which would make these cases
+# pass while testing something else entirely.
 #
 # Inputs come from `build_bwd_inputs` at sparsity 0.95, so most sequences span
 # several of the fused kernel's 256-row kv tiles, which is what exercises the
@@ -500,6 +504,33 @@ def test_flydsl_bwd_fused_identity_perm():
         n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0, fused=True
     )
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+@requires_fused
+@pytest.mark.parametrize("target_size", [0, 300])
+def test_flydsl_bwd_fused_unsorted(target_size):
+    """sort_by_length=False compiles the kernel without the permutation.
+
+    The permutation only reassigns sequences to workgroups, so both orders must
+    agree EXACTLY; b=32 is a multiple of NUM_GRID_GROUPS, so the sorted run
+    really takes the balanced deal rather than the identity.
+    """
+    b, h, n, d = (_FUSED_CASE[key] for key in ("b", "h", "n", "d"))
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d, target_size)
+
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0)
+    unsorted = flydsl_hstu_attention_bwd(*args, fused=True, sort_by_length=False)
+    assert_grads_close(*unsorted, dq_ref, dk_ref, dv_ref)
+    for name, got, ref in zip(
+        ("dq", "dk", "dv"),
+        unsorted,
+        flydsl_hstu_attention_bwd(*args, fused=True, sort_by_length=True),
+    ):
+        assert torch.equal(got, ref), f"{name} depends on sort_by_length"
 
 
 @requires_fused
@@ -705,7 +736,7 @@ def test_flydsl_bwd_fused_many_heads(h):
 def test_bwd_fused_gate_rejects_too_many_heads():
     """A head count whose reduction row exceeds a workgroup is gated out."""
     with pytest.raises(ValueError, match="dq_reduce needs"):
-        validate_hstu_attention_bwd_fused_pp(
+        validate_hstu_attention_bwd(
             80, 64, 64, True, 0, 0, False, 1.0, "bf16", 1024,
             block_m=256, block_n=16, num_waves=8, waves_per_eu=2, arch="gfx942",
         )  # fmt: skip
@@ -749,9 +780,17 @@ def test_bwd_fused_oom_retry_releases_failed_attempt(monkeypatch):
 
 
 @requires_fused
-def test_flydsl_bwd_fused_env_dispatch(monkeypatch):
-    """AITER_HSTU_BWD_FUSED=1 routes autograd's backward to the fused kernel,
-    and a shape outside its gate falls back to the (correct) split pair."""
+@pytest.mark.parametrize(
+    "env,d,expect_fused",
+    [
+        (None, 64, True),  # the default inside the gate
+        (None, 128, False),  # outside the gate: the fallback pair
+        ("0", 64, False),  # the opt-out
+    ],
+)
+def test_flydsl_bwd_default_dispatch(monkeypatch, env, d, expect_fused):
+    """Autograd's backward runs the fused kernel wherever its gate accepts the
+    shape, and the (correct) fallback pair elsewhere or when opted out."""
     calls = []
     real = hstu_kernels._make_bwd_fused_runners
 
@@ -760,23 +799,73 @@ def test_flydsl_bwd_fused_env_dispatch(monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(hstu_kernels, "_make_bwd_fused_runners", spy)
-    monkeypatch.setenv("AITER_HSTU_BWD_FUSED", "1")
+    if env is None:
+        monkeypatch.delenv("AITER_HSTU_BWD_FUSED", raising=False)
+    else:
+        monkeypatch.setenv("AITER_HSTU_BWD_FUSED", env)
 
-    for d, expect_fused in ((64, True), (128, False)):
-        b, h, n = 8, 2, 512
-        alpha = 1.0 / d * 10000
-        q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
-        dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
-            n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
-        )
-        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v)]
-        out = flydsl_hstu_attention(
-            n, alpha, *leaves, seq_offsets, True, num_targets, 0, 0
-        )
-        calls.clear()
-        out.backward(dout)
-        assert bool(calls) == expect_fused, f"head_dim={d}: fused calls {calls}"
-        assert_grads_close(*(t.grad for t in leaves), dq_ref, dk_ref, dv_ref)
+    b, h, n = 8, 2, 512
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v)]
+    out = flydsl_hstu_attention(n, alpha, *leaves, seq_offsets, True, num_targets, 0, 0)
+    out.backward(dout)
+    assert bool(calls) == expect_fused, f"head_dim={d}: fused calls {calls}"
+    assert_grads_close(*(t.grad for t in leaves), dq_ref, dk_ref, dv_ref)
+
+
+@requires_fused
+def test_flydsl_bwd_explicit_tiles_use_fallback(monkeypatch):
+    """Explicit tiles are the fallback pair's knobs, so the default honours
+    them there instead of failing the fused gate."""
+    calls = []
+    real = hstu_kernels._make_bwd_fused_runners
+
+    def spy(*args, **kwargs):
+        calls.append(args[2].shape)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(hstu_kernels, "_make_bwd_fused_runners", spy)
+    b, h, n, d = (_FUSED_CASE[key] for key in ("b", "h", "n", "d"))
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    dq, dk, dv = flydsl_hstu_attention_bwd(
+        n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0,
+        block_m=64, block_n=32, num_waves=4,
+    )  # fmt: skip
+    assert not calls
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+def test_fused_scratch_budget_ignores_split_free_blocks(monkeypatch):
+    """Free pieces of partly-used segments do not count toward the scratch.
+
+    Counting them made the planner try a G whose scratch could not be placed;
+    the allocator then released the previous call's reusable scratch before
+    failing, and every call paid a full reallocation.
+    """
+    gib = 1 << 30
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda device=None: (10 * gib, 192 * gib)
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_stats",
+        lambda device=None: {
+            "reserved_bytes.all.current": 100 * gib,
+            "allocated_bytes.all.current": 30 * gib,
+            "inactive_split_bytes.all.current": 50 * gib,
+        },
+    )
+    budget = hstu_kernels._fused_scratch_budget(torch.device("cuda"))
+    # 10 free + (100 - 30 - 50) whole cached segments.
+    assert budget == pytest.approx(30 * gib * hstu_kernels._BWD_FUSED_MEM_BUDGET)
 
 
 def test_bwd_tuned_csv_accepts_fused_discriminator(tmp_path):
@@ -881,7 +970,7 @@ def test_bwd_default_config_validates(arch, kernel, head_dim, hidden_dim):
     config = hstu_kernels._get_bwd_default_config(
         kernel, head_dim=head_dim, hidden_dim=hidden_dim, arch=arch
     )
-    validate_hstu_attention_bwd(
+    validate_hstu_attention_bwd_fallback(
         1,
         head_dim,
         hidden_dim,
@@ -906,9 +995,9 @@ def test_bwd_validation_honors_arch_argument():
     """
     config = {"block_m": 128, "block_n": 32, "num_waves": 4, "waves_per_eu": 0}
     args = (1, 128, 16, True, 0, 0, False, 1.0, "bf16", 512)
-    validate_hstu_attention_bwd(*args, arch="gfx942", **config)
+    validate_hstu_attention_bwd_fallback(*args, arch="gfx942", **config)
     with pytest.raises(ValueError, match="dO DMA tile"):
-        validate_hstu_attention_bwd(*args, arch="gfx950", **config)
+        validate_hstu_attention_bwd_fallback(*args, arch="gfx950", **config)
 
 
 # --------------------------------------------------------------------------- #

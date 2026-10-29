@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL query-owned HSTU backward kernel for dQ.
+"""FlyDSL query-owned HSTU backward kernel for dQ (fallback path).
+
+Paired with `hstu_attention_bwd_fallback_dvdk`; see that module for when the
+pair runs instead of `hstu_attention_bwd`.
 
 Each program owns query rows and streams KV tiles:
 
@@ -21,8 +24,8 @@ import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
-    validate_hstu_attention_bwd,
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fallback_dvdk import (
+    validate_hstu_attention_bwd_fallback,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
     _LOG2E,
@@ -46,7 +49,7 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
 )
 
 # Both backward kernels accept the same problem and tile shapes.
-validate_hstu_attention_bwd_dq = validate_hstu_attention_bwd
+validate_hstu_attention_bwd_dq = validate_hstu_attention_bwd_fallback
 
 
 # Small-head tiles defer the SiLU derivative until dS construction. This overlaps

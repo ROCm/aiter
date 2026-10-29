@@ -6,12 +6,12 @@
 Times two backends on identical bf16 inputs and reports the speedup of one
 over the other:
 
-  ``split``   the pair -- the KV-owned dV/dK kernel, then a second pass for
-              dQ. The only path that covers fp16, head_dim != 64 and gfx950, so
-              it is the baseline and the fallback.
-  ``fused``   the single-pass dV/dK/dQ kernel, which emits dQ as a split-K
-              partial per KV tile and sums it with a reduction kernel. Gated to
-              gfx942 / bf16 / head_dim == hidden_dim == 64.
+  ``split``   the fallback pair -- the KV-owned dV/dK kernel, then a second
+              pass for dQ. The only path that covers fp16, head_dim != 64 and
+              gfx950, so it is the baseline.
+  ``fused``   the default single-pass dV/dK/dQ kernel, which emits dQ as a
+              split-K partial per KV tile and sums it with a reduction kernel.
+              Gated to gfx942 / bf16 / head_dim == hidden_dim == 64.
 
 Before timing, every cell checks that the two backends' gradients agree.
 
@@ -412,7 +412,10 @@ def _isa_worker(num_heads, target_size):
     _torch.cuda.synchronize()
 
     out = {}
-    for label, pattern in (("fused", "*fused_pp*"), ("dq_reduce", "*dq_reduce*")):
+    for label, pattern in (
+        ("fused", "*hstu_attention_bwd_kernel*"),
+        ("dq_reduce", "*dq_reduce*"),
+    ):
         hits = sorted(glob.glob(os.path.join(dump_dir, pattern, "22_final_isa.s")))
         out[label] = _parse_isa(hits[-1]) if hits else {}
     print("ISA_JSON " + json.dumps(out), flush=True)
