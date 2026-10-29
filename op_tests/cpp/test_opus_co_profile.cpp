@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
     fs::create_directories(work / "combined" / "gfx1250");
     fs::create_directories(work / "flat-a0");
     const auto base = work / "combined";
-    const std::string symbol = "kid_21016_same_symbol";
+    const std::string symbol = "kid_496_same_symbol";
     const auto a0 = select_image(base.string(), "gfx1250", 0, symbol);
     const auto b0 = select_image(base.string(), "gfx1250", 1, symbol);
     assert(a0.path == (base / "gfx1250-a0" / (symbol + ".co")).string());
