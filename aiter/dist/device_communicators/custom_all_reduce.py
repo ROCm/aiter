@@ -138,6 +138,13 @@ def _ipc_base_ptr(data_ptr: int) -> int:
 # hip/driver_types.h: hipPointer_attribute
 _HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR = 11
 
+
+class _HipIpcMemHandle(ctypes.Structure):
+    """hipIpcMemHandle_t, which hipIpcOpenMemHandle takes by value."""
+
+    _fields_ = [("reserved", ctypes.c_byte * 64)]
+
+
 _hip_rt = None
 
 
@@ -160,6 +167,12 @@ def _loaded_hip_runtime():
                 ctypes.c_void_p,
             ]
             rt.hipIpcGetMemHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            rt.hipIpcOpenMemHandle.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                _HipIpcMemHandle,
+                ctypes.c_uint,
+            ]
+            rt.hipIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
         _hip_rt = rt
     return _hip_rt or None
 
@@ -621,6 +634,7 @@ class IPCBufferPool:
         self._store_key_prefix = f"aiter_ipc/p{IPCBufferPool._pool_seq}/g{ranks_tag}"
         IPCBufferPool._pool_seq += 1
         self._ipc_seq = 0
+        self._peer_bases: list[int] = []  # mapped by open_peer_buffers
 
     @staticmethod
     def _assert_pure_tcp_store(store) -> None:
@@ -685,6 +699,39 @@ class IPCBufferPool:
         """Broadcast IPC handles for the named buffer across all ranks."""
         buf = self._buffers[key]
         return self._broadcast_ipc(buf.data_ptr)
+
+    def open_peer_buffers(self, key: str) -> list[int]:
+        """Map the named buffer of every rank into this process.
+
+        Returns the address of the buffer of each rank, by rank: this rank's own
+        buffer, and the peers' buffers mapped with hipIpcOpenMemHandle. All ranks
+        must call it. close_peer_buffers unmaps the peers' buffers.
+        """
+        handles, offsets = self.get_ipc_meta(key)
+        rt = _loaded_hip_runtime()
+        ptrs = []
+        for rank, (handle, offset) in enumerate(zip(handles, offsets)):
+            if rank == self._rank:
+                ptrs.append(self._buffers[key].data_ptr)
+                continue
+            h = _HipIpcMemHandle.from_buffer_copy(handle.numpy().tobytes())
+            base = ctypes.c_void_p()
+            # 1 is hipIpcMemLazyEnablePeerAccess.
+            err = rt.hipIpcOpenMemHandle(ctypes.byref(base), h, 1)
+            if err != 0:
+                raise RuntimeError(f"hipIpcOpenMemHandle of rank {rank} failed: {err}")
+            self._peer_bases.append(base.value)
+            ptrs.append(base.value + offset)
+        return ptrs
+
+    def close_peer_buffers(self):
+        """Unmap the peers' buffers that open_peer_buffers mapped."""
+        rt = _loaded_hip_runtime()
+        for base in self._peer_bases:
+            err = rt.hipIpcCloseMemHandle(ctypes.c_void_p(base))
+            if err != 0:
+                raise RuntimeError(f"hipIpcCloseMemHandle failed: {err}")
+        self._peer_bases = []
 
     # ---- Graph mode: external buffer IPC meta ----
 
