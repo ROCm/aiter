@@ -390,7 +390,8 @@ def _adaptive_moe_sort(
 #
 #     path                                      in-place?  why?
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
-#     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
+#     ... + output not 4-byte aligned           no         atomic GEMM2 uses 4-byte atomics
+#     opus / ck / flydsl sort + reduce (non-EP) yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
 #     adaptive-aux sort (a4w4, atomic)          yes        output is the atomic moe_buf
 #     ... + output not 16-byte aligned          no         the sort zeroes it with 16-byte stores

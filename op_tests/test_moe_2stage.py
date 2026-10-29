@@ -1722,6 +1722,32 @@ def test_output_buffer_contract():
     odd = odd_pool[1:].view(token, model_dim)
     assert fused_moe(*args, output=odd) is odd, "2-byte-aligned output not returned"
     assert torch.equal(odd, ref), "2-byte-aligned output does not hold the result"
+    # The same through the FlyDSL sort (AITER_USE_FLYDSL_MOE_SORTING=1), whose
+    # launcher raised on such a buffer.
+    fm = aiter.fused_moe
+    real_use_flydsl, real_flydsl_sort = (
+        fm._USE_FLYDSL_MOE_SORTING,
+        fm._flydsl_moe_sorting,
+    )
+    flydsl_sorts = []
+
+    def counting_flydsl_sort(*a, **kw):
+        flydsl_sorts.append(1)
+        return real_flydsl_sort(*a, **kw)
+
+    try:
+        fm._USE_FLYDSL_MOE_SORTING = True
+        fm._flydsl_moe_sorting = counting_flydsl_sort
+        flydsl_ref = fused_moe(*args)
+        odd.fill_(float("nan"))
+        assert fused_moe(*args, output=odd) is odd, "FlyDSL sort: output not returned"
+        assert flydsl_sorts, "the FlyDSL sort did not run"
+        assert torch.equal(
+            odd, flydsl_ref
+        ), "FlyDSL sort: output does not hold the result"
+    finally:
+        fm._USE_FLYDSL_MOE_SORTING = real_use_flydsl
+        fm._flydsl_moe_sorting = real_flydsl_sort
 
     check_overlap = aiter.fused_moe._validate_output_buffer_no_overlap
     # A strided scale view reaches past its logical nbytes: scale_pool[::2] holds
