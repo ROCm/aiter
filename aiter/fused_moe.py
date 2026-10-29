@@ -4970,7 +4970,8 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    if _is_a16w4_port:
+    # Fused-quant stage1 kernels also allocate their own output.
+    if _is_a16w4_port or metadata.fuse_quant:
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -5068,7 +5069,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        None if metadata.fuse_quant else a2,
+        a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
