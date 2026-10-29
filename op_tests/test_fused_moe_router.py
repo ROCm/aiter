@@ -1513,10 +1513,10 @@ def test_shared_supported_gate():
 def test_cfg_topk_matches_stock(ep, n_shared):
     """The tuned-config key must be the one the unfused path would build.
 
-    Stock takes topk from `topk_ids.shape[1]`, which the caller widens by the
-    shared slots and, under EP + shared fusion, one fake slot; `get_2stage_cfgs`
-    then strips the fake slot back off. This path builds `topk_ids` itself, so
-    `_cfg_topk` has to re-add what the strip removes.
+    Stock passes `topk_ids.shape[1]` to the lookup unchanged, and the caller
+    widens it by the shared slots and, under EP + shared fusion, one sentinel
+    slot. This path builds `topk_ids` itself, so `_cfg_topk` has to rebuild
+    that width.
     """
     from aiter.fused_moe import _cfg_topk
 

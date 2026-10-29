@@ -2142,7 +2142,9 @@ FUSED_MOE_ROUTER_MAX_EXPERTS = 512  # 2 * BlockSize
 def _cfg_topk(topk: int, n_shared: int, expert_mask: torch.Tensor | None) -> int:
     """Tuned-config topk key: the width the unfused path would look up.
 
-    get_2stage_cfgs strips the EP fake slot back off, so add it here.
+    The unfused path keys the lookup on the `topk_ids` width the caller
+    allocates: routed plus shared slots, plus one sentinel slot under EP with
+    shared fusion.
     """
     return topk + n_shared + int(expert_mask is not None and n_shared > 0)
 
@@ -2239,8 +2241,9 @@ def fused_moe_router_supported(
     call and has to be re-checked on every forward.
 
     Args:
-        global_num_experts: the gating width. Pass it when known so this agrees
-            with :func:`fused_moe_router` by construction, not by shape math.
+        global_num_experts: the gating width. Pass it with `expert_mask`; if
+            omitted, it is derived assuming the mask holds
+            global_expert + num_fused_shared_experts + 1 entries.
     """
     # global_E is the gating row stride. The shape fallbacks below are exact
     # only while num_redundant_experts == 0. The mask spans every emitted id --
