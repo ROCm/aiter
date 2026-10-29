@@ -61,7 +61,14 @@ LGC = {
     "STAMP": 65536,
     "BYTES": 8192,
 }
-PLANS = ((1, 0), (2, 0), (4, 0), (2, 1), (4, 1), (3, 2))  # (NP, HG): n1 / n2 / n4 / n2h / n4h / n3q
+PLANS = (
+    (1, 0),
+    (2, 0),
+    (4, 0),
+    (2, 1),
+    (4, 1),
+    (3, 2),
+)  # (NP, HG): n1 / n2 / n4 / n2h / n4h / n3q
 
 
 def read_header():
@@ -72,9 +79,15 @@ def read_header():
 def parse_defines(text):
     """name -> literal int for the plain `#define NAME <int>[u]` macros (expressions are handled by name where needed)."""
     out = {}
-    for m in re.finditer(r"^#define\s+([A-Z0-9_]+)\s+([0-9]+)u?\s*(?:/\*.*)?$", text, re.M):
+    for m in re.finditer(
+        r"^#define\s+([A-Z0-9_]+)\s+([0-9]+)u?\s*(?:/\*.*)?$", text, re.MULTILINE
+    ):
         out[m.group(1)] = int(m.group(2))
-    for m in re.finditer(r"^#define\s+([A-Z0-9_]+)\s+0x([0-9A-Fa-f]+)u?\s*(?:/\*.*)?$", text, re.M):
+    for m in re.finditer(
+        r"^#define\s+([A-Z0-9_]+)\s+0x([0-9A-Fa-f]+)u?\s*(?:/\*.*)?$",
+        text,
+        re.MULTILINE,
+    ):
         out[m.group(1)] = int(m.group(2), 16)
     return out
 
@@ -85,7 +98,7 @@ def check_header(text):
 
     def need(name, want):
         nonlocal ok
-        m = re.search(r"^#define\s+%s\s+([0-9]+)u?" % re.escape(name), text, re.M)
+        m = re.search(rf"^#define\s+{re.escape(name)}\s+([0-9]+)u?", text, re.MULTILINE)
         got = int(m.group(1)) if m else None
         if got != want:
             print(f"FAIL header: {name} = {got}, expected {want}")
@@ -96,13 +109,15 @@ def check_header(text):
     need("LG_MAX_CHUNKS", 64)
     need("LG_TAG_CALLID_BITS", TAG_CALLID_BITS)
     need("LG_TAG_M_SHIFT", TAG_M_SHIFT)
-    m = re.search(r"^#define\s+LG_TAG_CALLID_MASK\s+0x([0-9A-Fa-f]+)u?", text, re.M)
+    m = re.search(
+        r"^#define\s+LG_TAG_CALLID_MASK\s+0x([0-9A-Fa-f]+)u?", text, re.MULTILINE
+    )
     if not m or int(m.group(1), 16) != TAG_CALLID_MASK:
         print("FAIL header: LG_TAG_CALLID_MASK")
         ok = False
     d = parse_defines(text)
     for key, want in LGC.items():
-        macro = "LGC_%s_OFF" % key if key != "BYTES" else "LGC_BYTES"
+        macro = f"LGC_{key}_OFF" if key != "BYTES" else "LGC_BYTES"
         if macro not in d:
             continue
         if d[macro] != want:
@@ -117,10 +132,16 @@ def check_header(text):
     if "LgCommArgsV6" not in text or "LG_MREAL(a) ((a).m_real)" not in text:
         print("FAIL: the args struct / LG_MREAL(m_real) is missing")
         ok = False
-    if re.search(r"^#define\s+LG_R13_ARGS", text, re.M):
-        print("FAIL: the removed r13 LG_R13_ARGS knob is still referenced in the ABI header")
+    if re.search(r"^#define\s+LG_R13_ARGS", text, re.MULTILINE):
+        print(
+            "FAIL: the removed r13 LG_R13_ARGS knob is still referenced in the ABI header"
+        )
         ok = False
-    print("PASS header (ABI 7, chunks 64, tag 18/14, args 360 B with m_real@352)" if ok else "FAILED header")
+    print(
+        "PASS header (ABI 7, chunks 64, tag 18/14, args 360 B with m_real@352)"
+        if ok
+        else "FAILED header"
+    )
     return ok
 
 
@@ -148,8 +169,10 @@ def check_layout():
         "PSTAMP(u64[3][16])": (LGC["PSTAMP"], 3 * 16 * 8),
     }
     ok = True
-    spans = sorted((start, start + size, name) for name, (start, size) in ranges.items())
-    for (s0, e0, n0), (s1, e1, n1) in zip(spans, spans[1:]):
+    spans = sorted(
+        (start, start + size, name) for name, (start, size) in ranges.items()
+    )
+    for (s0, e0, n0), (s1, e1, n1) in itertools.pairwise(spans):
         if s1 < e0:
             print(f"FAIL layout: {n0} [{s0},{e0}) overlaps {n1} [{s1},{e1})")
             ok = False
@@ -157,18 +180,32 @@ def check_layout():
         if end > LGC["BYTES"]:
             print(f"FAIL layout: {name} ends at {end} > LGC_BYTES {LGC['BYTES']}")
             ok = False
-    exp = {"DONE": 512, "STATE": 1536, "LOCK": 2560, "FOLD_CNT": 2620, "REPORT": 2624, "POSTCNT": 2688, "CTAG": 3712, "ATAG": 3744}
+    exp = {
+        "DONE": 512,
+        "STATE": 1536,
+        "LOCK": 2560,
+        "FOLD_CNT": 2620,
+        "REPORT": 2624,
+        "POSTCNT": 2688,
+        "CTAG": 3712,
+        "ATAG": 3744,
+    }
     for k, v in exp.items():
         if LGC[k] != v:
             print(f"FAIL layout: LGC_{k}_OFF = {LGC[k]}, expected {v}")
             ok = False
     if LGC["STATE"] != LGC["DONE"] + 4 * n * 4:
-        print("FAIL layout: DONE does not end exactly at STATE (done[4][64] must not collide)")
+        print(
+            "FAIL layout: DONE does not end exactly at STATE (done[4][64] must not collide)"
+        )
         ok = False
     if LGC["LOCK"] != LGC["STATE"] + 4 * n * 4 or LGC["REPORT"] < LGC["LOCK"] + 64:
         print("FAIL layout: STATE/LOCK/REPORT partition")
         ok = False
-    if LGC["POSTCNT"] != LGC["REPORT"] + 64 or LGC["CTAG"] != LGC["POSTCNT"] + 4 * n * 4:
+    if (
+        LGC["POSTCNT"] != LGC["REPORT"] + 64
+        or LGC["CTAG"] != LGC["POSTCNT"] + 4 * n * 4
+    ):
         print("FAIL layout: POSTCNT/CTAG partition")
         ok = False
     if LGC["ATAG"] != LGC["CTAG"] + 32:
@@ -182,7 +219,11 @@ def check_layout():
         ok = False
     for start, end, name in spans:
         print(f"  {name:22s} [{start:6d},{end:6d})  {end - start:5d} B")
-    print("PASS control layout (arrays disjoint, protocol words unmoved)" if ok else "FAILED control layout")
+    print(
+        "PASS control layout (arrays disjoint, protocol words unmoved)"
+        if ok
+        else "FAILED control layout"
+    )
     return ok
 
 
@@ -214,9 +255,15 @@ def check_tag():
                 print(f"FAIL tag: m_real field wrong m={m} c={c}")
                 ok = False
     if tag_low(M_MAX, TAG_CALLID_MASK) != 0xFFFFFFFF:
-        print("FAIL tag: the maximal (m_real, call_id) does not fill the 32-bit tag word")
+        print(
+            "FAIL tag: the maximal (m_real, call_id) does not fill the 32-bit tag word"
+        )
         ok = False
-    print("PASS tag packing (E = (STEP<<32)|((m_real-1)<<18)|call_id[17:0]; injective over 1..16384 x 18 bits)" if ok else "FAILED tag packing")
+    print(
+        "PASS tag packing (E = (STEP<<32)|((m_real-1)<<18)|call_id[17:0]; injective over 1..16384 x 18 bits)"
+        if ok
+        else "FAILED tag packing"
+    )
     return ok
 
 
@@ -262,7 +309,7 @@ def grid_items_x(chunks, items_chunk):
 
 
 def select_item_r6x(t, chunks, np, indexer):
-    items, _items_chunk, xtra = constants(indexer)
+    _items, _items_chunk, xtra = constants(indexer)
     cpp = chunks // np
     per_g = cpp * (xtra + NPEER * NPD)
     rn = per_g * np
@@ -283,7 +330,7 @@ def select_item_r6x(t, chunks, np, indexer):
 
 
 def r6x_order_ok(chunks, np, indexer):
-    items, items_chunk, xtra = constants(indexer)
+    _items, items_chunk, _xtra = constants(indexer)
     seen_n = set()
     seen_q = set()
     seen_k = set()
@@ -292,7 +339,7 @@ def r6x_order_ok(chunks, np, indexer):
     pk_cnt = [[0] * 20 for _ in range(4)]
     cpp = chunks // np
     for t in range(grid_items_x(chunks, items_chunk)):
-        kind, xchunk, dslot, nloc, nsel = select_item_r6x(t, chunks, np, indexer)
+        kind, xchunk, dslot, nloc, _nsel = select_item_r6x(t, chunks, np, indexer)
         if xchunk < 0 or xchunk >= chunks:
             return False
         g = xchunk // cpp
@@ -340,7 +387,7 @@ def r6x_order_ok(chunks, np, indexer):
         return False
     for d in (1, 2, 3):
         for g in range(np):
-            if arr[d][g] != r6x_group_items(chunks, np, items):
+            if arr[d][g] != r6x_group_items(chunks, np, _items):
                 return False
     return True
 
@@ -354,7 +401,7 @@ def grid_items_h(chunks, np, hg, items_chunk):
 
 
 def select_item_r7(t, chunks, np, indexer):
-    items, _items_chunk, xtra = constants(indexer)
+    _items, _items_chunk, xtra = constants(indexer)
     cpp = chunks // np
     g0 = cpp * (xtra + 2 * NPEER * NPD)
     gn = cpp * (xtra + NPEER * NPD)
@@ -495,7 +542,9 @@ def legal_plans():
 
 def r9_want(chunks, g):
     R9_QC, R9_G1 = 2, 1
-    return R9_QC * NPD * 4 if g == 0 else ([R9_QC, R9_G1, chunks - R9_QC - R9_G1][g]) * NPD
+    return (
+        R9_QC * NPD * 4 if g == 0 else ([R9_QC, R9_G1, chunks - R9_QC - R9_G1][g]) * NPD
+    )
 
 
 def grid_items_q(chunks):
@@ -532,7 +581,14 @@ def r9_order_ok(chunks):
     arr = [[0] * 3 for _ in range(4)]
     for t in range(grid_items_q(chunks)):
         kind, xchunk, dslot, nloc, nsel = select_item_r9(t, chunks)
-        if xchunk < 0 or xchunk >= chunks or dslot < 0 or dslot > NPEER or nloc < 0 or nloc >= NPD:
+        if (
+            xchunk < 0
+            or xchunk >= chunks
+            or dslot < 0
+            or dslot > NPEER
+            or nloc < 0
+            or nloc >= NPD
+        ):
             return False
         dst = dslot + 1 if dslot < NPEER else 0
         g = 0 if xchunk < R9_QC else (1 if xchunk < R9_QC + R9_G1 else 2)
@@ -589,7 +645,11 @@ def check_order_and_live():
             if not good:
                 print(f"FAIL order: chunks={chunks} NP={NP} HG={HG} indexer={indexer}")
                 ok = False
-    print(f"PASS item order (r6x/r7/r9 mirrors) for {n_plans} (chunks, plan) pairs x both builds" if ok else "FAILED item order")
+    print(
+        f"PASS item order (r6x/r7/r9 mirrors) for {n_plans} (chunks, plan) pairs x both builds"
+        if ok
+        else "FAILED item order"
+    )
     ok2 = True
     n_live = 0
     for chunks, NP, HG in legal_plans():
@@ -597,7 +657,11 @@ def check_order_and_live():
         if not live_ok(NP, HG, chunks):
             print(f"FAIL live rows: chunks={chunks} NP={NP} HG={HG}")
             ok2 = False
-    print(f"PASS live rows for {n_live} (chunks, plan) pairs x every m_real 1..chunks*256" if ok2 else "FAILED live rows")
+    print(
+        f"PASS live rows for {n_live} (chunks, plan) pairs x every m_real 1..chunks*256"
+        if ok2
+        else "FAILED live rows"
+    )
     return ok and ok2
 
 
@@ -606,7 +670,26 @@ def check_address_model():
     ok = True
     for F in (2304, 2560):
         for m_real, srows in itertools.product(
-            (1, 17, 256, 257, 300, 384, 450, 512, 585, 700, 768, 1024, 2049, 8192, 8193, 16000, 16383, 16384),
+            (
+                1,
+                17,
+                256,
+                257,
+                300,
+                384,
+                450,
+                512,
+                585,
+                700,
+                768,
+                1024,
+                2049,
+                8192,
+                8193,
+                16000,
+                16383,
+                16384,
+            ),
             (None, 16384),
         ):
             if srows is None:
@@ -618,10 +701,16 @@ def check_address_model():
                 for src in range(4):
                     dst_off = src * 2 * m_real * F
                     nbytes = 2 * m_real * F
-                    src_off = src * 2 * srows * F if src == dst_rank else dst_rank * 2 * srows * F
+                    src_off = (
+                        src * 2 * srows * F
+                        if src == dst_rank
+                        else dst_rank * 2 * srows * F
+                    )
                     lo, hi = dst_rank * 2 * srows * F, (dst_rank + 1) * 2 * srows * F
                     if not (lo <= src_off and src_off + nbytes <= hi):
-                        print(f"FAIL address: source leaves slab F={F} m_real={m_real} srows={srows}")
+                        print(
+                            f"FAIL address: source leaves slab F={F} m_real={m_real} srows={srows}"
+                        )
                         ok = False
                     spans.append((dst_off, dst_off + nbytes))
                 spans.sort()
@@ -634,7 +723,11 @@ def check_address_model():
                 if pos != 4 * 2 * m_real * F:
                     print(f"FAIL address: R not tiled exactly F={F} m_real={m_real}")
                     ok = False
-    print("PASS address model (R tile [4*m_real, F] tiled exactly once, sources inside their S slabs)" if ok else "FAILED address model")
+    print(
+        "PASS address model (R tile [4*m_real, F] tiled exactly once, sources inside their S slabs)"
+        if ok
+        else "FAILED address model"
+    )
     return ok
 
 
@@ -648,7 +741,11 @@ def manifest_files():
         for f in files:
             full = os.path.join(base, f)
             rel = os.path.relpath(full, ROOT).replace(os.sep, "/")
-            if rel == "SOURCE_SHA256.txt" or "__pycache__" in rel or rel.endswith(".pyc"):
+            if (
+                rel == "SOURCE_SHA256.txt"
+                or "__pycache__" in rel
+                or rel.endswith(".pyc")
+            ):
                 continue
             out.append(rel)
     return sorted(out)
@@ -697,11 +794,15 @@ def check_manifest():
 # =============================== H. geometry ===============================
 def print_geometry():
     print("geometry (informational): r13-style item count / grid / 256-block rounds")
-    print(f"  {'M':>6} {'chunks':>6} {'dense items':>11} {'rounds':>6} {'index items':>11} {'rounds':>6}")
+    print(
+        f"  {'M':>6} {'chunks':>6} {'dense items':>11} {'rounds':>6} {'index items':>11} {'rounds':>6}"
+    )
     for M in (1024, 2048, 4096, 8192, 10240, 12288, 16384):
         c = M // CHUNK_ROWS
         di, ii = 36 * c, 41 * c
-        print(f"  {M:>6} {c:>6} {di:>11} {-(-(di + 1) // 256):>6} {ii:>11} {-(-(ii + 1) // 256):>6}")
+        print(
+            f"  {M:>6} {c:>6} {di:>11} {-(-(di + 1) // 256):>6} {ii:>11} {-(-(ii + 1) // 256):>6}"
+        )
 
 
 def main(argv):

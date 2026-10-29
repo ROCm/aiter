@@ -7693,7 +7693,7 @@ def test_r19_large_source_is_registered_with_abi_gen_6_and_a_vendored_build():
     assert jit.large_src_dir("r19") == "r19"
     assert (
         vl.LARGE_SRC_SHA["r19"]
-        == "332532a0946dd06228d4cf6ca3c0c65e083bcf24cf101bddde6cbb9fb9401200"
+        == "4126ae5e764bb01d7e334d44649e4820705df0c6924e19bc95f3a79a42913178"
     )
     assert jit.large_defs({"src": "r19", "n": 4}, "dense") == jit.large_defs(
         {"src": "r13", "n": 4}, "dense"

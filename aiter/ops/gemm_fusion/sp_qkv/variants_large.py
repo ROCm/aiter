@@ -145,7 +145,7 @@ LARGE_SRC_SHA = {
     "r12": "6b47263546d9189457b3d584fe8219e542a0cd32b19d1a32306c2fda015a7f38",  # R12 (abi 3) + LG_TAG_EARLY / LG_POLL_BATCH (r12b) + the NaN fill folded into quiet_ready, LG_QR_WGS (r12c) + qr_wgs in the launch args / lg_abi_info_v2 (r12d), derived from r11
     "r13": "03d6c758c75665d26f8f3928e6e31520c816ed701efb8b2e09cdc2ea3dfb2b3a",  # R16 (abi 4 = LG_COMM_ABI_VERSION 5): per-launch m_real (lg_launch_v3, tag with m_real), derived from r12; r13g = r13 with the item-epilogue data flow of r12 untouched (ISA clean, byte-identical to r12 at m == M)
     "r18": "46b49e5cd87362987ed26e927077576aa06509df60599248210afb91c38691dc",  # R18 route B (abi 4 = the r13 ABI, LG_COMM_ABI_VERSION 5): large/r18-put = r13 + lg_put_v1 + lg_put_launch_v1; its GEMM is large/r17 (jit.R17_SRC_SHA)
-    "r19": "332532a0946dd06228d4cf6ca3c0c65e083bcf24cf101bddde6cbb9fb9401200",  # ROUTE A (abi 6 = LG_COMM_ABI_VERSION 7 / LgCommArgsV6): r13 + 64 chunks, 14-bit m_real / 18-bit call_id tag, [4][64] control image
+    "r19": "4126ae5e764bb01d7e334d44649e4820705df0c6924e19bc95f3a79a42913178",  # ROUTE A (abi 6 = LG_COMM_ABI_VERSION 7 / LgCommArgsV6): r13 + 64 chunks, 14-bit m_real / 18-bit call_id tag, [4][64] control image
 }
 # ROUTE A: the large/r19 manifest is frozen by implementor-lg (15 files, sha256sum -c clean, R19 STATIC ALL PASS).
 LARGE_SRC_SHA_PENDING: tuple[str, ...] = ()
