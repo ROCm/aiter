@@ -42,8 +42,10 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.flydsl import linear_attention_prefill_kernels as _k5_mod
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+    _BLOCKED_MIN_CHUNKS,
     _flydsl_run_only,
     chunk_gated_delta_rule_fwd_h_flydsl_opt,
 )
@@ -53,7 +55,12 @@ from aiter.ops.prefill_batch_metadata import (
 from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_opt_vk,
 )
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    assertAllclose,
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
 
 # HIP/C++ K5 (chunk_gated_delta_rule_fwd_h.cu), JIT-compiled on first call.
 try:
@@ -497,9 +504,7 @@ def _make_inputs(case: PrefillArgs, context_lens, *, stable_coupling=False):
     return k, w_orig, u_orig, w_c, u_c, g, h0, cu_seqlens
 
 
-def _build_prefill_metadata(
-    context_lens, cu_seqlens, chunk_size: int = 64, build_blocks: bool = False
-):
+def _build_prefill_metadata(context_lens, cu_seqlens, chunk_size: int = 64):
     """Prebuild the GDR chunk schedule a serving stack builds once per forward
     pass. Skipping it makes each wrapper rediscover the chunk counts with a
     blocking D2H copy. None for dense shapes, where the wrappers read the batch
@@ -511,7 +516,6 @@ def _build_prefill_metadata(
         list(context_lens),
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
-        build_blocks=build_blocks,
     )
 
 
@@ -669,7 +673,7 @@ def test_chunk_gdn_prefill_h_blocked(context_lens, mode, state_dtype, init_state
         h0 = None  # exercises the use_initial_state=False specialization
     # Production and oracle gates use log2 and natural-log scales, respectively.
     g_log2 = g * math.log2(math.e)
-    metadata = _build_prefill_metadata(context_lens, cu, build_blocks=True)
+    metadata = _build_prefill_metadata(context_lens, cu)
     ref_h, ref_vn, ref_fs = ref_chunk_gated_delta_rule_fwd_h(
         k,
         w_orig,
@@ -709,24 +713,45 @@ def test_chunk_gdn_prefill_h_blocked(context_lens, mode, state_dtype, init_state
     if h0 is not None:
         nbytes += h0.numel() * h0.element_size()
     ret = {"gfx": get_gfx_runtime()}
+    # The gate needs every request non-empty and a long-enough sequence; a row that
+    # silently fell back to serial would not test the blocked kernels.
+    expect_blocked = all(n > 0 for n in context_lens) and (
+        ceildiv(max(context_lens), case.BT) >= _BLOCKED_MIN_CHUNKS
+    )
     for name, fn in candidates.items():
-        (h, vn, fs), us = run_perftest(fn)
+        blocked_calls = []
+        orig_blocked = _k5_mod._chunk_gated_delta_rule_fwd_h_blocked
+
+        def spy(*args, _calls=blocked_calls, _orig=orig_blocked, **kwargs):
+            _calls.append(1)
+            return _orig(*args, **kwargs)
+
+        _k5_mod._chunk_gated_delta_rule_fwd_h_blocked = spy
+        try:
+            (h, vn, fs), us = run_perftest(fn)
+        finally:
+            _k5_mod._chunk_gated_delta_rule_fwd_h_blocked = orig_blocked
+        assert bool(blocked_calls) == expect_blocked, (
+            f"{tag}: expected {'blocked' if expect_blocked else 'serial'} path, "
+            f"got {'blocked' if blocked_calls else 'serial'}"
+        )
+        # Mismatches above the allowed ratio raise; err is the mismatch ratio.
         err = max(
-            checkAllclose(
+            assertAllclose(
                 ref_h.to(dtypes.fp32),
                 h.to(dtypes.fp32),
                 rtol=2e-2,
                 atol=2e-2,
                 msg=f"{tag}: K5 h snapshots",
             ),
-            checkAllclose(
+            assertAllclose(
                 ref_vn.to(dtypes.fp32),
                 _normalize_opt_v_new(vn).to(dtypes.fp32),
                 rtol=2e-2,
                 atol=2e-2,
                 msg=f"{tag}: K5 v_new",
             ),
-            checkAllclose(
+            assertAllclose(
                 ref_fs.to(dtypes.fp32),
                 fs.to(dtypes.fp32),
                 rtol=2e-2,
