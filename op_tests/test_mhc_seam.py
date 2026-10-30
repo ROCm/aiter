@@ -63,9 +63,10 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 HC = 4
 HC3 = 2 * HC + HC * HC
-# DeepSeek-V4.1-Flash config.json: rms_norm_eps (also the RMSNorm of layer_input),
-# hc_eps (pre and Sinkhorn), post mult, Sinkhorn
-RMS_EPS, HC_EPS, POST_MULT, SINKHORN = 1e-20, 1e-6, 2.0, 20
+# rms_eps (also the RMSNorm of layer_input), hc_pre_eps, hc_sinkhorn_eps, post mult,
+# Sinkhorn repeats. DeepSeek-V4.1-Flash uses 1e-20, 1e-6, 1e-6, 2.0, 20; the eps values
+# here are distinct and large enough to move the gates, so swapped arguments fail.
+RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, POST_MULT, SINKHORN = 1e-2, 1e-3, 1e-4, 2.0, 20
 
 torch.set_default_device("cuda")
 
@@ -87,7 +88,7 @@ def make_inputs(m, hidden_size, seed=0, fn_scale=2e-3):
         "sublayer_out": randn(m, hidden_size, s=0.5).to(dtypes.bf16),
         "post_layer_mix": rand(m, HC, 1) * POST_MULT,
         "comb_res_mix": comb.contiguous(),
-        "pre_mix": rand(m, HC) + HC_EPS,
+        "pre_mix": rand(m, HC) + HC_PRE_EPS,
         "fn": randn(HC3, HC * hidden_size, s=fn_scale),
         "hc_scale": 0.5 + rand(3),
         "hc_base": randn(HC3, s=0.5),
@@ -124,16 +125,16 @@ def _gates_ref(residual_out, fn, hc_scale, hc_base, dtype):
     fn, hc_scale, hc_base = fn.to(dtype), hc_scale.to(dtype), hc_base.to(dtype)
     xf = residual_out.flatten(1).to(dtype)
     mixes = (xf @ fn.t()) * torch.rsqrt(xf.square().mean(-1, keepdim=True) + RMS_EPS)
-    pre = torch.sigmoid(mixes[:, :HC] * hc_scale[0] + hc_base[:HC]) + HC_EPS
+    pre = torch.sigmoid(mixes[:, :HC] * hc_scale[0] + hc_base[:HC]) + HC_PRE_EPS
     post = torch.sigmoid(mixes[:, HC : 2 * HC] * hc_scale[1] + hc_base[HC : 2 * HC])
     post = post * POST_MULT
     comb = mixes[:, 2 * HC :].view(-1, HC, HC) * hc_scale[2]
     comb = comb + hc_base[2 * HC :].view(1, HC, HC)
-    comb = torch.softmax(comb, dim=-1) + HC_EPS
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + HC_EPS)
+    comb = torch.softmax(comb, dim=-1) + HC_SINKHORN_EPS
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + HC_SINKHORN_EPS)
     for _ in range(SINKHORN - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + HC_EPS)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + HC_EPS)
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + HC_SINKHORN_EPS)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + HC_SINKHORN_EPS)
     return post.unsqueeze(-1), comb, pre
 
 
@@ -198,8 +199,8 @@ def seam_new(residual, sublayer_out, post, comb, fn, hc_scale, hc_base, pre_mix)
         hc_scale,
         hc_base,
         RMS_EPS,
-        HC_EPS,
-        HC_EPS,
+        HC_PRE_EPS,
+        HC_SINKHORN_EPS,
         POST_MULT,
         SINKHORN,
         pre_mix,
@@ -230,8 +231,8 @@ def seam_triton_rmsnorm(
         hc_scale,
         hc_base,
         RMS_EPS,
-        HC_EPS,
-        HC_EPS,
+        HC_PRE_EPS,
+        HC_SINKHORN_EPS,
         POST_MULT,
         SINKHORN,
         pre_mix,
@@ -254,8 +255,8 @@ def seam_aiter_unfused(residual, sublayer_out, post, comb, fn, hc_scale, hc_base
         hc_scale,
         hc_base,
         RMS_EPS,
-        HC_EPS,
-        HC_EPS,
+        HC_PRE_EPS,
+        HC_SINKHORN_EPS,
         POST_MULT,
         SINKHORN,
     )
@@ -476,7 +477,7 @@ def check_loader_errors(aiter_mhc):
         inp["pre_mix"],
     )
     gates_out = (torch.empty(m, HC, 1), torch.empty(m, HC, HC), torch.empty(m, HC))
-    gate_consts = (RMS_EPS, HC_EPS, HC_EPS, POST_MULT, SINKHORN, HC * 5120)
+    gate_consts = (RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, POST_MULT, SINKHORN, HC * 5120)
     cases = {
         "gates: hc_scale (4,)": (
             "hc_scale dim 0",
@@ -594,8 +595,8 @@ def check_input_errors():
                 inp["hc_scale"],
                 inp["hc_base"],
                 RMS_EPS,
-                HC_EPS,
-                HC_EPS,
+                HC_PRE_EPS,
+                HC_SINKHORN_EPS,
                 POST_MULT,
                 0,
                 inp["pre_mix"],
