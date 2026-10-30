@@ -234,7 +234,8 @@
       "BLOCK_M": 16,
       "num_warps": 2,
       "num_stages": 2,
-      "waves_per_eu": 2
+      "waves_per_eu": 2,
+      "SPLIT_RUNS_PER_XCD": 16
     }
   },
   "reduce": {
@@ -253,6 +254,7 @@
       "num_stages": 1,
       "waves_per_eu": 2,
       "num_warps": 2,
+      "SPLIT_SEGMENT_BLOCK_MIN": 16,
       "SMALL_SPLIT_MAX": 2,
       "MIN_SEGMENTS": 1,
       "SEGMENTS_PER_CU": 4,

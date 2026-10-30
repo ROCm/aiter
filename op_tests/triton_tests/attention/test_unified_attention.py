@@ -823,8 +823,16 @@ def test_length_aware_split_scope() -> None:
     # calls left out keep the uniform split of the head <= 128 entry
     head_128, _ = _gfx950_split(head_size=128, head_size_v=128)
     assert config["NUM_SEGMENTS"] == head_128["NUM_SEGMENTS"]
-    for left_out in ({"q_dtype": torch.float16}, {"skip_reduce": True}):
-        assert _length_aware_split(*_gfx950_split(**left_out)) is None
+    for left_out in (
+        {"q_dtype": torch.float16},
+        {"skip_reduce": True},
+        {"head_size": 32, "head_size_v": 64},
+        {"head_size": 64, "head_size_v": 32},
+    ):
+        fallback, fallback_params = _gfx950_split(**left_out)
+        assert _length_aware_split(fallback, fallback_params) is None
+        assert fallback["NUM_SEGMENTS"] == head_128["NUM_SEGMENTS"]
+        assert fallback["TILE_SIZE"] == head_128["TILE_SIZE"]
     # head 64 only
     head_32, _ = _gfx950_split(head_size=32, head_size_v=32)
     assert "SPLIT_PROGRAMS_PER_CU" not in head_32
