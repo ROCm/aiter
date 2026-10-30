@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-// Tuned gfx950 kernels and the portable gfx950/gfx942 fallback.
+// Tuned gfx950 kernels and the portable gfx950/gfx942 fallback. gfx1250
+// dispatches to mega_mhc_gfx1250.cu.
 // API, scratch ownership, and capture requirements: aiter/ops/mega_mhc.py.
 #define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
@@ -2622,8 +2623,49 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    bool has_post,
                    bool identity_pre,
                    int variant,
-                   bool mxfp8)
+                   bool mxfp8,
+                   bool res_preshuffle,
+                   bool scale_row_major)
 {
+    {
+        const HipDeviceGuard guard(residual.device_id);
+        if(get_gpu_arch() == "gfx1250")
+        {
+            mega_mhc_gfx1250(residual_out,
+                             post_out,
+                             comb_out,
+                             layer_input,
+                             next_pre,
+                             residual,
+                             fn_packed,
+                             hc_scale,
+                             hc_base,
+                             pre_mix,
+                             sublayer_out,
+                             post_mix,
+                             comb_mix,
+                             norm_weight,
+                             partials,
+                             counters,
+                             rms_eps,
+                             hc_pre_eps,
+                             hc_sinkhorn_eps,
+                             hc_post_mult,
+                             norm_eps,
+                             sinkhorn_repeat,
+                             split_k,
+                             has_post,
+                             identity_pre,
+                             variant,
+                             res_preshuffle,
+                             quant_out,
+                             quant_scale,
+                             mxfp8,
+                             scale_row_major);
+            return;
+        }
+    }
+    AITER_CHECK(!res_preshuffle, "Mega-MHC res_preshuffle requires gfx1250");
     auto launch = [&]<int H, int VARIANT, bool MXFP8>() {
         launch_mega_mhc<H, VARIANT, MXFP8>(residual_out,
                                            post_out,
