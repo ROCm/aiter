@@ -90,6 +90,12 @@ from aiter.ops.shuffle import (
 )
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.cos_diff import (
+    COS_DIFF_THRESHOLD,
+    as_rows,
+    combined_cos_diff,
+    rowwise_enabled,
+)
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import _is_accelerator_error, mp_tuner
@@ -137,7 +143,8 @@ TUNE_MOE_EXPERT_BALANCE = (
     os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
 
-COS_DIFF_THRESHOLD = 1e-1
+# COS_DIFF_THRESHOLD is imported from aiter.utility.cos_diff above, so the
+# threshold and the metric judged against it stay defined in one place.
 
 
 _TUNE_EXCLUDE_KERNEL_PATTERNS = [
@@ -192,9 +199,11 @@ def _a16w_sorted_cos(ref, res, msg="", printLog=True):
     valid = (ref.abs().sum(dim=1) > 0).nonzero(as_tuple=True)[0]
     if valid.numel() == 0:
         return 1.0
-    x = ref[valid].double().flatten()
-    y = res[:n][valid].double().flatten()
+    ref_rows = ref[valid].double()
+    res_rows = res[:n][valid].double()
+    x, y = ref_rows.flatten(), res_rows.flatten()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    cos_diff = combined_cos_diff(ref_rows, res_rows, cos_diff)
     if printLog:
         tag = "passed~" if cos_diff < COS_DIFF_THRESHOLD else "failed!"
         print(f"{msg}[cosine_diff={cos_diff:.6f} {tag}]")
@@ -302,6 +311,31 @@ def _to_f64_flat(t):
     return t.double().flatten()
 
 
+def _to_f64_rows(t):
+    """Same decode as ``_to_f64_flat``, then one row per trailing vector.
+
+    ``as_rows`` keeps the last dimension as the feature axis, so a fused
+    stage-1 tensor ``[token, topk, inter]`` is scored per route. Collapsing
+    only ``shape[0]`` would score a whole token. Rank below 2 returns None
+    and the caller falls back, rather than inventing a feature axis.
+
+    fp4x2 is unpacked along its last axis before that split. The packed
+    width is two codes per byte, not the route's feature axis, and
+    ``fp4x2.double()`` faults the queue.
+    """
+    if t.dim() < 2:
+        return None
+    if t.dtype == dtypes.fp4x2:
+        b = t.contiguous().view(torch.uint8)
+        lut = torch.tensor(_E2M1_LUT, device=b.device, dtype=torch.float64)
+        t = torch.stack(
+            [lut[(b & 0xF).long()], lut[((b >> 4) & 0xF).long()]], dim=-1
+        ).flatten(-2)
+    else:
+        t = t.double()
+    return as_rows(t)
+
+
 def cosine_diff_compare(ref, res, msg="", printLog=True):
     from aiter import logger
 
@@ -312,6 +346,10 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
     cos_diff = (
         1 - 2 * (x * y).sum() / torch.clamp((x * x + y * y).sum(), min=1e-12)
     ).item()
+    if rowwise_enabled():
+        # Decoded only when asked for: these are full float64 copies of both
+        # tensors, on top of the two _to_f64_flat already made.
+        cos_diff = combined_cos_diff(_to_f64_rows(ref), _to_f64_rows(res), cos_diff)
     if printLog:
         if cos_diff < COS_DIFF_THRESHOLD:
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[32mpassed~\033[0m]")
