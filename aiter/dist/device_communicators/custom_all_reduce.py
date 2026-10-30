@@ -217,6 +217,21 @@ _IPC_MIN_ROCM = (7, 14)
 # custom_all_reduce_gfx1250.cuh).
 _GFX1250_LL_MAX_BYTES = 4 * 1024 * 1024
 
+
+@functools.cache
+def _gfx1250_ll_disabled() -> bool:
+    """AITER_CUSTOM_AR_DISABLE_LL, read as CustomAllreduce::ll_enabled reads it."""
+    value = os.environ.get("AITER_CUSTOM_AR_DISABLE_LL")
+    return value in ("1", "true", "yes", "on", "TRUE", "YES", "ON")
+
+
+# Per-rank reduced-shard staging of gfx1250's two-stage fused all-reduce +
+# RMSNorm (kArRmsShardBytes in custom_all_reduce_gfx1250.cuh): it bounds that
+# path at this times the world size.
+_GFX1250_AR_RMS_SHARD_BYTES = 32 * 1024 * 1024
+# Above this RCCL plus a separate RMSNorm beats the two-stage kernels (TP4).
+_GFX1250_AR_RMS_MAX_BYTES = 128 * 1024 * 1024
+
 # Max input bytes custom_all_reduce_residual fuses, per (arch, TP); None = no
 # limit. Larger inputs and unlisted pairs fall back to all-reduce + add.
 # Timed end to end on CUDA graphs on MI300X (gfx942) and MI355X (gfx950).
@@ -1249,6 +1264,7 @@ class CustomAllreduce:
         # custom kernels; larger ones fall back to RCCL. Overridable via
         # AITER_CUSTOM_AR_MAX_SIZE (capped at the registered pool size == max_size).
         self._car_max_size = _resolve_car_max_size(max_size)
+        self._car_max_size_set = os.environ.get(_CAR_MAX_SIZE_ENV, "").strip() != ""
         # Custom-AR lower size bound (bytes): inputs at or below this fall back
         # to RCCL. Default 0 (no lower bound). Overridable via
         # AITER_CUSTOM_AR_MIN_SIZE. Custom AR runs only in (min, max].
@@ -1795,11 +1811,43 @@ class CustomAllreduce:
         """Whether fused_ar_rms beats all-reduce followed by RMSNorm here."""
         if not self.can_fuse_ar_rms(inp, hidden_dim, out_hidden_dim):
             return False
-        # The gfx1250 fused kernel syncs through the barrier. In the LL range,
-        # the LL all-reduce plus a separate RMSNorm is faster.
+        # In the LL range gfx1250 fuses into the LL all-reduce kernel. Without
+        # LL the fused kernel syncs through the barrier, and the plain
+        # all-reduce plus a separate RMSNorm is faster there.
         return (
             not self._is_gfx1250
+            or not _gfx1250_ll_disabled()
             or inp.numel() * inp.element_size() > _GFX1250_LL_MAX_BYTES
+        )
+
+    def fuses_ar_rms_large(self, inp: torch.Tensor, hidden_dim: int) -> bool:
+        """Whether gfx1250's two-stage fused all-reduce + RMSNorm takes ``inp``
+        past the custom-AR size cutoff.
+
+        The cutoff (64 MiB by default) predates that path; the path itself is
+        bounded by its reduced-shard staging and by the registered buffer it
+        copies the input into. An explicit AITER_CUSTOM_AR_MAX_SIZE still
+        applies. Mirrors the two-stage choice in
+        CustomAllreduce::fused_allreduce_rmsnorm.
+        """
+        if not self._is_gfx1250 or self.disabled:
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        packs = hidden_dim * inp.element_size() // 16
+        return (
+            self.world_size in (4, 6, 8)
+            and self.fully_connected
+            and inp_size % 16 == 0
+            and inp_size > self._car_min_size
+            and self._car_max_size > 0
+            and (not self._car_max_size_set or inp_size <= self._car_max_size)
+            and inp_size <= self.max_size
+            and inp_size <= _GFX1250_AR_RMS_SHARD_BYTES * self.world_size
+            and inp_size <= _GFX1250_AR_RMS_MAX_BYTES
+            and hidden_dim >= 6144
+            and packs % self.world_size == 0
+            and inp.is_contiguous()
+            and self.can_fuse_ar_rms(inp, hidden_dim, hidden_dim)
         )
 
     def should_fuse_ar_residual(self, inp: torch.Tensor) -> bool:
@@ -2405,7 +2453,9 @@ class CustomAllreduce:
         skip_residual: bool = False,
     ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
-        if self.disabled or not self.should_custom_ar(input):
+        if self.disabled or not (
+            self.should_custom_ar(input) or self.fuses_ar_rms_large(input, weight.numel())
+        ):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
@@ -2526,7 +2576,10 @@ class CustomAllreduce:
         emit_bf16: bool = False,
     ):
         # when custom allreduce is disabled, this will be None
-        if self.disabled or not self.should_custom_ar(input, prefill_support):
+        if self.disabled or not (
+            self.should_custom_ar(input, prefill_support)
+            or self.fuses_ar_rms_large(input, weight.numel())
+        ):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
