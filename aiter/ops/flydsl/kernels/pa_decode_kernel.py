@@ -21,6 +21,8 @@ with two LDS buffers where capacity permits. One-partition plans can write
 final output directly; other plans use the shared partition reducer.
 BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
 with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
+Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
+using the 64-token pipeline.
 
 Logical layouts (not preshuffled):
 
@@ -138,6 +140,7 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     direct_output: bool = False,
     trans_k: bool = True,
+    mask_unowned_kv: bool = True,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -171,9 +174,14 @@ def compile_pa_decode_tile(
     are absent and query/output strides match. Other tasks write packed partials
     for the shared reducer, which applies sinks once.
 
-    Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
-    Pages past the sequence are pinned to block 0; callers must leave the
-    unwritten tail of the last owned page finite. ``wide_kv_addressing`` protects
+    Pages past the sequence are pinned to block 0 and the unwritten tail of the
+    last owned page is read as is. On gfx942/gfx950 with ``mask_unowned_kv``
+    (the default), a sequence's last tile zeroes V bytes and K/V scales at or
+    past its context before PV, so those rows may hold anything, including NaN
+    (``0 * NaN == NaN`` in PV MFMA). ``mask_unowned_kv=False`` skips that
+    masking and restores the caller contract that those V bytes and scales
+    remain finite. The gfx1250 pipelines ignore the flag and always require it.
+    ``wide_kv_addressing`` protects
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
     and permits unsigned buffer offsets instead of i64.
     """
@@ -236,6 +244,7 @@ def compile_pa_decode_tile(
         max_context_length=max_context_length,
         sliding_window=sliding_window,
         trans_k=trans_k,
+        mask_unowned_kv=mask_unowned_kv,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
     if cached is not None:
@@ -501,7 +510,7 @@ def compile_gfx1250_pa_decode(
         direct_output=direct_output,
     )
 
-    @flyc.kernel(name=kernel_name, known_block_size=(128, 1, 1))
+    @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
         pmax: fx.Pointer,
         psum: fx.Pointer,
@@ -560,15 +569,15 @@ def compile_gfx1250_pa_decode(
                 fx.Int32(task[2]),
                 fx.Int32(task[3]),
             )
-            if const_expr(t.bf16_packed):
+            if const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
             output = fx.recast_iter(t.q_dtype, pout)
             tid = fx.Int32(gpu.thread_id("x"))
-            for i in range_constexpr((t.rows * t.head_dim + 127) // 128):
-                index = i * 128 + tid
+            for i in range_constexpr(-(-t.rows * t.head_dim // t.BLOCK_THREADS)):
+                index = i * t.BLOCK_THREADS + tid
                 if index < t.rows * t.head_dim:
                     row, d = index // t.head_dim, index % t.head_dim
                     kv_query = fx.Int32(gpu.block_id("y"))
@@ -634,7 +643,7 @@ def compile_gfx1250_pa_decode(
                 kv_heads * t.query_splits,
                 1,
             ),
-            block=(128, 1, 1),
+            block=(t.BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 

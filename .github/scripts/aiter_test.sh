@@ -47,6 +47,8 @@ skip_tests=(
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
+    # runs as its own CI step before this suite ("Mori smoke test" in aiter-test.yaml)
+    "op_tests/multigpu_tests/test_mori_smoke.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
@@ -98,7 +100,7 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py)
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_hipb_grouped_gemm.py)
             # These files contain pytest-style test functions and intentionally
             # have no script entry point; direct execution would only import them.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
@@ -120,8 +122,8 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec env MORI_SHMEM_HEAP_SIZE=40G \
                         torchrun --standalone --nproc_per_node=8 "$test_file" \
-                        --combine fused --dispatch_backend flydsl \
-                        --stage1_fused 1 --layers 2 --acc_verify 1
+                        --stage1_fused false --stage2_fused true \
+                        --layers 2 --acc_verify 1
                 '
                 _ "$file"
             )

@@ -10,7 +10,10 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+from aiter.ops.flydsl.kernels.kernels_common import (
+    ceildiv,
+    set_slp_vectorize_once_used,
+)
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 
 
@@ -564,4 +567,4 @@ def compile_fp8_gemm_8w(
             },
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
 
-    return launch_gemm
+    return set_slp_vectorize_once_used(launch_gemm, False)

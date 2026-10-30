@@ -36,7 +36,7 @@ AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
 # kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
 # to enable it.
 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
-    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
+    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "1"))
 )
 
 _PRELOAD_COMPILE_LOCK = threading.RLock()
