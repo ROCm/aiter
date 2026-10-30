@@ -4,13 +4,14 @@ applyTo: "aiter/ops/flydsl/**,aiter/ops/*.py,op_tests/**/*flydsl*.py,op_tests/fl
 
 # AITER FlyDSL / ops wrappers — PR review rules
 
-Open and apply these in-repo skills. They are the FlyDSL review contract; this
-file does not repeat them.
+Open and apply these skills. They are the FlyDSL review contract; this file
+does not repeat them. The FlyDSL authoring and cleanup skills are maintained
+upstream in ROCm/FlyDSL, not in this repository.
 
 | Change | Read |
 |---|---|
-| New or changed `@flyc.kernel` / `@flyc.jit` body, layouts, copy/MMA, LDS | `.claude/skills/flydsl-kernel-authoring/SKILL.md` |
-| Migration off legacy IR (`ArithValue`, `fx.Index`, `buffer_ops`, raw dialects, `SmemPtr`), helper reuse, `_run_compiled` | `.claude/skills/flydsl-kernel-code-cleanup/SKILL.md` |
+| New or changed `@flyc.kernel` / `@flyc.jit` body, layouts, copy/MMA, LDS | [`flydsl-kernel-authoring`](https://github.com/ROCm/FlyDSL/blob/main/.claude/skills/flydsl-kernel-authoring/SKILL.md) (ROCm/FlyDSL) |
+| Migration off legacy IR (`ArithValue`, `fx.Index`, `buffer_ops`, raw dialects, `SmemPtr`), helper reuse, `_run_compiled` | [`kernel-code-cleanup`](https://github.com/ROCm/FlyDSL/blob/main/.claude/skills/kernel-code-cleanup/SKILL.md) (ROCm/FlyDSL) |
 | A FlyDSL test (`op_tests/**/*flydsl*.py`, `op_tests/flydsl_tests/**`) or any new FlyDSL test suite | `.claude/skills/aiter-op-test/SKILL.md` |
 
 Judge the kernel against aiter's pinned FlyDSL in `requirements.txt`, not a
