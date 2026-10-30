@@ -1633,6 +1633,7 @@ def _fused_moe_impl(
             stage2_scatter=stage2_scatter,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
+            output=output,
         )
 
     if grouped_a8w4_out is not None:
