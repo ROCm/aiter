@@ -39,8 +39,10 @@ from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
 
 from .fmha_buffer_managers import (
@@ -109,6 +111,40 @@ def _zero_slot(base, size, num_splits, split_stride, tid):
                 + (tid % fx.Int32(rem)) * fx.Int32(16)
             )
             fx.ptr_store(_ir(zero), _lds_ptr_b128(tail))
+
+
+_S_BUFFER_WIDTHS = (16, 8, 4, 1)  # words one is_scalar buffer_load can take
+
+
+def s_buffer_load(ptr, offset, size, dtype=fx.Int32, *, num_records_bytes=None):
+    """``size`` ``dtype`` elements from ``ptr[offset]``, landing in SGPRs.
+
+    Mind the units: ``offset`` (runtime) and ``size`` (compile-time) count ELEMENTS,
+    ``num_records_bytes`` counts BYTES, so an N-entry ``Int32`` table bounds at ``N * 4``.
+    That bound is the descriptor's: an access at or past it reads 0 instead of faulting.
+    Pass it when ``offset`` can run off the table; ``None`` leaves it unbounded.
+
+    One issue carries 1/4/8/16 words, so ``size`` is cut greedily into pieces that FIT --
+    nothing past it is read. LLVM spends one ``s_add_co_i32`` per extra piece rather than
+    using the SMEM immediate field (``soffset_bytes`` would ask for it, but ``is_scalar``
+    rejects it). Returns a python list, indexable at trace time.
+    """
+    assert size >= 1, f"size must be positive, got {size}"
+    assert dtype.width == 32, f"s_buffer_load handles 4-byte elements, got {dtype.width}"
+    # kernel tensor args arrive as memrefs; get_iter is the pointer behind one.
+    base = ptr if isinstance(ptr, fx.Pointer) else fx.get_iter(ptr)
+    rsrc = buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(fx.ptrtoint(base)), num_records_bytes=num_records_bytes
+    )
+    base = fx.Int32(offset)
+    out, taken = [], 0
+    while taken < size:
+        width = next(w for w in _S_BUFFER_WIDTHS if w <= size - taken)
+        word = buffer_ops.buffer_load(rsrc, base + taken, vec_width=width, is_scalar=True)
+        raw = [word] if width == 1 else [Vec(word)[i] for i in range(width)]
+        out += raw if dtype is fx.Int32 else [v.bitcast(dtype) for v in raw]
+        taken += width
+    return out
 
 
 def _bare_barrier():

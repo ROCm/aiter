@@ -739,13 +739,11 @@ def _build_managers(
             KManager16bV2(
                 qk_hdim=qk_hdim,
                 n_block=n_block,
-                num_waves=NUM_WAVES,
                 elem_dtype=kv_dtype,
             ),
             VManager16bV2(
                 v_hdim=v_hdim,
                 n_block=n_block,
-                num_waves=NUM_WAVES,
                 elem_dtype=kv_dtype,
             ),
         )
@@ -760,13 +758,11 @@ def _build_managers(
         KManager16bV1(
             qk_hdim=qk_hdim,
             n_block=n_block,
-            num_waves=NUM_WAVES,
             elem_dtype=kv_dtype,
         ),
         VManager16bV1(
             v_hdim=v_hdim,
             n_block=n_block,
-            num_waves=NUM_WAVES,
             elem_dtype=kv_dtype,
         ),
     )
@@ -2334,10 +2330,10 @@ def kv_split_bytes(qk_hdim, v_hdim, n_block, kv_dtype):
     k_cls = KManager16bV2 if USE_TDM_LOADER else KManager16bV1
     v_cls = VManager16bV2 if USE_TDM_LOADER else VManager16bV1
     k_mgr = k_cls(
-        qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=kv_dtype
+        qk_hdim=qk_hdim, n_block=n_block, elem_dtype=kv_dtype
     )
     v_mgr = v_cls(
-        v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=kv_dtype
+        v_hdim=v_hdim, n_block=n_block, elem_dtype=kv_dtype
     )
     return (
         k_mgr.get_lds_size_in_byte() // KV_LDS_SPLITS,

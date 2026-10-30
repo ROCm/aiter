@@ -41,7 +41,10 @@ Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf as _scf
 from flydsl.expr import rocdl
+from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.rocdl.cdna5 import (
     TensorLoad,
     TensorStore,
@@ -50,6 +53,9 @@ from flydsl.expr.rocdl.cdna5 import (
 )
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.tdm_gather_shim import (
+    make_tensor_gather_descriptor,
+)
 
 from ..kernels_common import create_llvm_ptr
 from ..tensor_shim import _to_raw as _ir
@@ -168,8 +174,8 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 # K/V staging: row-major PADDED LDS + the two global->LDS transports
 #
 # Both K/V manager families stage a ``[n_block, hdim]`` tile into plain ROW-MAJOR LDS
-# with a per-row pad: element ``(row, col)`` lives at ``row*row_bytes + col*2``, where
-# ``row_elems = hdim + pad_elems`` (K pads 8 elems / 16 B, V 16 elems / 32 B) is sized to
+# with a per-row pad: element ``(row, col)`` lives at ``row*padded_row_bytes + col*2``, where
+# ``padded_row_elems = hdim + pad_elems`` (K pads 8 elems / 16 B, V 16 elems / 32 B) is sized to
 # keep the WMMA ``ds_load`` / ``ds_load_tr16`` fetch bank-conflict-free. Everything
 # downstream of LDS -- ``ds_load_ptrs``, the fragment plan, the fragment reads -- is
 # therefore layout-only and lives ONCE, in the V1 base classes; V2 inherits it untouched.
@@ -293,7 +299,26 @@ class TdmCopyDescriptor(BufferOpDescriptor):
             fx.copy(*view)
 
 
-def _warp_band(*, bases, n_block, row_bytes, producer_warp, num_producer_warps):
+GATHER_ROWS = {32: 8, 16: 16}  # row indices per issue, by index width in bits
+GATHER_INDEX_BITS = 32
+
+
+class TdmGatherCopyDescriptor(BufferOpDescriptor):
+    """A list of TDM gather descriptors (the paged transport); on ``tensorcnt``."""
+
+    kind = "tdm"
+
+    def __init__(self, descs):
+        self.descs = descs
+        self.asynccnt = 0
+        self.tensorcnt = len(descs)
+
+    def async_load(self):
+        for desc in self.descs:
+            tdm_ops.tensor_load_gather(desc)
+
+
+def _warp_band(*, bases, n_block, padded_row_bytes, producer_warp, num_producer_warps):
     """Which rows of the tile this producer wave owns, and where they land in LDS.
 
     Wave ``producer_warp`` (0..num_producer_warps-1, RUNTIME) copies the dense band
@@ -316,7 +341,7 @@ def _warp_band(*, bases, n_block, row_bytes, producer_warp, num_producer_warps):
         )
     r0 = producer_warp * fx.Int32(num_rows)
     lds_base = base + (producer_warp % fx.Int32(warps_per_split)) * fx.Int32(
-        num_rows * row_bytes
+        num_rows * padded_row_bytes
     )
     return lds_base, r0, num_rows
 
@@ -326,7 +351,7 @@ def _async_band_descriptor(
     bases,
     n_block,
     hdim,
-    row_bytes,
+    padded_row_bytes,
     elem_dtype,
     ptr_x,
     stride_seq,
@@ -355,7 +380,7 @@ def _async_band_descriptor(
     lds_base, band_r0, num_rows = _warp_band(
         bases=bases,
         n_block=n_block,
-        row_bytes=row_bytes,
+        padded_row_bytes=padded_row_bytes,
         producer_warp=ctx.producer_warp,
         num_producer_warps=ctx.num_producer_warps,
     )
@@ -379,7 +404,7 @@ def _async_band_descriptor(
         ) * elem_bytes
         gptr = create_llvm_ptr(base_i64 + fx.Int64(g_base), address_space=1)
         lds_ptr = create_llvm_ptr(
-            lds_base + band_row * fx.Int32(row_bytes) + chunk * fx.Int32(_CHUNK_BYTES),
+            lds_base + band_row * fx.Int32(padded_row_bytes) + chunk * fx.Int32(_CHUNK_BYTES),
             address_space=3,
         )
         for c in fx.range_constexpr(hdim // _WR_TILE_HD):
@@ -430,7 +455,7 @@ def _tdm_load_views(
     the >1 path has never been exercised, and ``tdm_partition`` addresses past the tile if the
     warp coord does not match ``num_warps``.
     """
-    row_elems = hdim + pad_elems
+    padded_row_elems = hdim + pad_elems
     off = fx.Int64(row0) * fx.Int64(stride_seq) + fx.Int64(head) * fx.Int64(stride_head)
     base_iter = fx.get_iter(ptr_x)
     lds_ptr_ty = fx.PointerType.get(
@@ -446,7 +471,7 @@ def _tdm_load_views(
     for c0, w in _pow2_segments(hdim):
         gbase = fx.add_offset(base_iter, off + fx.Int64(c0))
         tile = (num_rows, w)
-        lds_strides = (row_elems, 1)
+        lds_strides = (padded_row_elems, 1)
         g_view = fx.Tensor(
             fx.make_view(gbase, fx.make_layout((valid, w), (stride_seq, 1)))
         )
@@ -480,7 +505,7 @@ def _tdm_band_descriptor(
     n_block,
     hdim,
     pad_elems,
-    row_bytes,
+    padded_row_bytes,
     ptr_x,
     stride_seq,
     stride_head,
@@ -497,7 +522,7 @@ def _tdm_band_descriptor(
     lds_base, band_r0, num_rows = _warp_band(
         bases=bases,
         n_block=n_block,
-        row_bytes=row_bytes,
+        padded_row_bytes=padded_row_bytes,
         producer_warp=ctx.producer_warp,
         num_producer_warps=ctx.num_producer_warps,
     )
@@ -517,6 +542,119 @@ def _tdm_band_descriptor(
             num_warps=1,
         )
     )
+
+
+def _tdm_gather_band_descriptor(
+    *,
+    bases,
+    n_block,
+    hdim,
+    pad_elems,
+    padded_row_bytes,
+    ptr_x,
+    stride_seq,
+    stride_head,
+    head,
+    row0,
+    valid,
+    ctx,
+    elem_dtype,
+    page_indices,
+    page_size,
+    num_pool_rows,
+    sentinel_row,
+):
+    """This wave's band of a ``[n_block, hdim]`` tile, gathered from a PAGED K/V pool.
+
+    Pages are contiguous, so the pool is a token-indexed table: token row is
+    ``page_indices[p] * page_size + off`` at any page size, and ``stride_seq`` is the
+    per-token stride. Rows past ``valid`` take ``sentinel_row``, which must be IN RANGE
+    (gather defines OOB only for non-decreasing indices, ISA 4.10.3.2, and a page table
+    is permuted) and FINITE (a NaN reaches O through ``P == 0`` under fast math, so pool
+    row 0 will not do -- its page may never have been written).
+    """
+    gather_rows = GATHER_ROWS[GATHER_INDEX_BITS]
+    elem_bytes = _width_params(elem_dtype)[0]
+    padded_row_elems = hdim + pad_elems
+    lds_base, band_r0, num_rows = _warp_band(
+        bases=bases,
+        n_block=n_block,
+        padded_row_bytes=padded_row_bytes,
+        producer_warp=ctx.producer_warp,
+        num_producer_warps=ctx.num_producer_warps,
+    )
+    _assert_multiple("band rows", num_rows, gather_rows)
+    assert page_size & (page_size - 1) == 0, f"page_size {page_size} is not a power of two"
+    rows_left = fx.max(valid - band_r0, fx.Int32(0))
+    lds_span = num_rows * padded_row_bytes
+    lds_view = fx.Tensor(
+        fx.make_view(_lds_ptr_b128(lds_base), fx.make_layout(lds_span, 1))
+    )
+    # A band starts at a multiple of num_rows, so it never straddles a page when
+    # page_size >= num_rows, and is page-aligned when page_size <= num_rows.
+    if page_size <= num_rows:
+        band_off = None
+    else:
+        band_off = (row0 + band_r0) & fx.Int32(page_size - 1)
+
+    def _phys_row(j):
+        if band_off is None:
+            page = page_indices[j // page_size]
+            return page * fx.Int32(page_size) + fx.Int32(j % page_size)
+        return page_indices[0] * fx.Int32(page_size) + band_off + fx.Int32(j)
+
+    # Interior tiles are fully valid (valid == n_block there), so one scalar test skips
+    # the whole per-row select chain and only the tail tile pays. Raw scf.IfOp on
+    # purpose: the idiomatic @flyc.jit init-then-reassign form lowers to predicated
+    # selects and skips nothing -- 176.6 vs 167.4 us at page_size=1, sq=4096.
+    _i32 = ir.IntegerType.get_signless(32)
+    _band_if = _scf.IfOp(
+        fx.as_ir_value(rows_left >= fx.Int32(num_rows)),
+        [_i32] * num_rows,
+        has_else=True,
+    )
+    with ir.InsertionPoint(_band_if.then_block):
+        _scf.YieldOp([fx.as_ir_value(_phys_row(j)) for j in range(num_rows)])
+    with ir.InsertionPoint(_band_if.else_block):
+        _scf.YieldOp(
+            [
+                fx.as_ir_value(
+                    (fx.Int32(j) < rows_left).select(_phys_row(j), sentinel_row)
+                )
+                for j in range(num_rows)
+            ]
+        )
+    row_index = [fx.Int32(r) for r in _band_if.results]
+
+    descs = []
+    for c0, w in _pow2_segments(hdim):
+        col_bytes = c0 * elem_bytes
+        for op in range(num_rows // gather_rows):
+            rows = [row_index[op * gather_rows + t] for t in range(gather_rows)]
+            descs.append(
+                make_tensor_gather_descriptor(
+                    global_ptr=ptr_x,
+                    lds_memref=lds_view,
+                    row_indices=rows,
+                    row_width=w,
+                    tensor_dim0=w,
+                    tensor_dim1=num_pool_rows,
+                    stride=stride_seq,
+                    elem_bytes=elem_bytes,
+                    pad_interval=w,
+                    pad_amount=padded_row_elems - w,
+                    index_size=GATHER_INDEX_BITS,
+                    gather_tile_dim1=gather_rows,
+                    lds_byte_offset=fx.Index(
+                        op * gather_rows * padded_row_bytes + col_bytes
+                    ),
+                    global_byte_offset=fx.Int64(head)
+                    * fx.Int64(stride_head)
+                    * fx.Int64(elem_bytes)
+                    + fx.Int64(col_bytes),
+                )
+            )
+    return TdmGatherCopyDescriptor(descs)
 
 
 class _AsyncTransport:
@@ -544,7 +682,7 @@ class _AsyncTransport:
             bases=_as_bases(ptr_lds),
             n_block=self.n_block,
             hdim=self.hdim,
-            row_bytes=self.row_bytes,
+            padded_row_bytes=self.padded_row_bytes,
             elem_dtype=self.elem_dtype,
             ptr_x=ptr_src,
             stride_seq=stride_seq,
@@ -559,11 +697,6 @@ class _AsyncTransport:
 class _TdmTransport:
     """global->LDS by TDM (the V2 transport). Mixed in FRONT of a base manager, so it
     overrides ``load_descriptor`` and inherits the entire LDS read side."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        if self.num_waves != _DEFAULT_NUM_WAVES:
-            raise NotImplementedError("V2 TDM loader assumes 8 waves")
 
     def load_descriptor(
         self,
@@ -584,7 +717,7 @@ class _TdmTransport:
             n_block=self.n_block,
             hdim=self.hdim,
             pad_elems=self.pad_elems,
-            row_bytes=self.row_bytes,
+            padded_row_bytes=self.padded_row_bytes,
             ptr_x=ptr_src,
             stride_seq=stride_seq,
             stride_head=stride_head,
@@ -593,6 +726,50 @@ class _TdmTransport:
             valid=valid,
             ctx=ctx,
             elem_dtype=self.elem_dtype,
+        )
+
+
+class _TdmGatherTransport:
+    """global->LDS by TDM GATHER, for a paged K/V pool. Mixed in front of a base manager
+    like ``_TdmTransport``; paging changes only which global rows a tile comes from, so
+    the whole LDS read side is inherited."""
+
+    def load_descriptor(
+        self,
+        *,
+        ptr_lds,
+        ptr_src,
+        stride_seq,
+        stride_head,
+        head,
+        row0,
+        valid,
+        ctx,
+        page_indices,
+        page_size,
+        num_pool_rows,
+        sentinel_row,
+    ):
+        """This wave's band of one tile. ``row0`` is a SEQUENCE-relative token, not a
+        pool row -- the page table absorbs the base."""
+        return _tdm_gather_band_descriptor(
+            bases=_as_bases(ptr_lds),
+            n_block=self.n_block,
+            hdim=self.hdim,
+            pad_elems=self.pad_elems,
+            padded_row_bytes=self.padded_row_bytes,
+            ptr_x=ptr_src,
+            stride_seq=stride_seq,
+            stride_head=stride_head,
+            head=head,
+            row0=row0,
+            valid=valid,
+            ctx=ctx,
+            elem_dtype=self.elem_dtype,
+            page_indices=page_indices,
+            page_size=page_size,
+            num_pool_rows=num_pool_rows,
+            sentinel_row=sentinel_row,
         )
 
 
@@ -892,7 +1069,6 @@ class KManager16bV1(_AsyncTransport):
         *,
         qk_hdim,
         n_block=_DEFAULT_N_BLOCK,
-        num_waves=_DEFAULT_NUM_WAVES,
         elem_dtype=fx.BFloat16,
     ):
         self.elem_dtype = elem_dtype
@@ -907,10 +1083,9 @@ class KManager16bV1(_AsyncTransport):
             )
         self.qk_hdim = qk_hdim  # compile-time
         self.n_block = n_block  # compile-time
-        self.num_waves = num_waves  # compile-time
         self.pad_elems = _AB_PAD_BYTES // self.elem_bytes
-        self.row_elems = qk_hdim + self.pad_elems  # padded LDS row stride (elems)
-        self.row_bytes = self.row_elems * self.elem_bytes
+        self.padded_row_elems = qk_hdim + self.pad_elems  # padded LDS row stride (elems)
+        self.padded_row_bytes = self.padded_row_elems * self.elem_bytes
 
     @property
     def hdim(self):
@@ -919,7 +1094,7 @@ class KManager16bV1(_AsyncTransport):
 
     def get_lds_size_in_byte(self):
         """LDS bytes for one n_block x qk_hdim K block (one ping-pong buffer)."""
-        return self.n_block * self.row_bytes
+        return self.n_block * self.padded_row_bytes
 
     # ------------------------------------------------------------------
     # ``load_descriptor(*, ptr_lds, ptr_src, stride_seq, stride_head, head, row0, valid,
@@ -942,7 +1117,7 @@ class KManager16bV1(_AsyncTransport):
         return [
             _lds_ptr_b128(
                 base
-                + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
+                + (lane_idx % _WMMA_M) * fx.Int32(self.padded_row_bytes)
                 + (lane_idx // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
             )
             for base in _as_bases(ptr_lds)
@@ -977,7 +1152,7 @@ class KManager16bV1(_AsyncTransport):
             for dt in range(NDT):
                 for sub in range(self.loads_per_frag):
                     imm = (
-                        kv_local * _WMMA_M * self.row_bytes
+                        kv_local * _WMMA_M * self.padded_row_bytes
                         + (dt * self.wmma_k + sub * (self.wmma_k // 2))
                         * self.elem_bytes
                         + lds_imm_offset
@@ -1027,7 +1202,6 @@ class VManager16bV1(_AsyncTransport):
         *,
         v_hdim,
         n_block=_DEFAULT_N_BLOCK,
-        num_waves=_DEFAULT_NUM_WAVES,
         elem_dtype=fx.BFloat16,
     ):
         self.elem_dtype = elem_dtype
@@ -1040,10 +1214,9 @@ class VManager16bV1(_AsyncTransport):
             )
         self.v_hdim = v_hdim  # compile-time
         self.n_block = n_block  # compile-time
-        self.num_waves = num_waves  # compile-time
         self.pad_elems = _V_PAD_ELEMS
-        self.row_elems = v_hdim + _V_PAD_ELEMS  # padded LDS row stride (elems)
-        self.row_bytes = self.row_elems * self.elem_bytes
+        self.padded_row_elems = v_hdim + _V_PAD_ELEMS  # padded LDS row stride (elems)
+        self.padded_row_bytes = self.padded_row_elems * self.elem_bytes
 
     @property
     def hdim(self):
@@ -1052,7 +1225,7 @@ class VManager16bV1(_AsyncTransport):
 
     def get_lds_size_in_byte(self):
         """LDS bytes for one ``n_block`` x ``v_hdim`` V block (one ping-pong buffer)."""
-        return self.n_block * self.row_bytes
+        return self.n_block * self.padded_row_bytes
 
     # ``load_descriptor`` comes from the transport mixin; see ``KManager16bV1`` for the
     # argument contract (``ptr_src`` is the V tensor here).
@@ -1080,7 +1253,7 @@ class VManager16bV1(_AsyncTransport):
         return [
             create_llvm_ptr(
                 base
-                + lane_kv * fx.Int32(self.row_bytes)
+                + lane_kv * fx.Int32(self.padded_row_bytes)
                 + lane_d * fx.Int32(self.elem_bytes),
                 address_space=3,
             )
@@ -1116,7 +1289,7 @@ class VManager16bV1(_AsyncTransport):
                 split, kt_local = divmod(kt, kt_per_split)
                 for sub in range(self.loads_per_frag):
                     imm = (
-                        (kt_local * self.wmma_k + sub * _WMMA_M) * self.row_bytes
+                        (kt_local * self.wmma_k + sub * _WMMA_M) * self.padded_row_bytes
                         + dt * _WMMA_M * self.elem_bytes
                         + lds_imm_offset
                     )
@@ -1178,16 +1351,16 @@ class QManager16bV2:
         self.k_tiles = qk_hdim // self.wmma_k
         self.rows_per_warp = _WMMA_M * q_tiles_per_wave  # this wave's Q rows (32)
         self.block_m = self.rows_per_warp * num_waves  # 256
-        self.row_elems = qk_hdim + _AB_PAD_BYTES // self.elem_bytes
-        self.row_bytes = self.row_elems * self.elem_bytes
+        self.padded_row_elems = qk_hdim + _AB_PAD_BYTES // self.elem_bytes
+        self.padded_row_bytes = self.padded_row_elems * self.elem_bytes
         # lds_tiles is accepted for signature-compat with V1; V2 has no ring.
 
     def get_lds_size_in_byte(self):
-        return self.block_m * self.row_bytes
+        return self.block_m * self.padded_row_bytes
 
     def warp_lds_size_in_byte(self):
         """LDS bytes of ONE wave's private Q region; the caller strides ``ptr_lds_warp`` by it."""
-        return self.rows_per_warp * self.row_bytes
+        return self.rows_per_warp * self.padded_row_bytes
 
     def load_q_to_vgpr_part1(
         self,
@@ -1242,7 +1415,7 @@ class QManager16bV2:
         for c0, w in _pow2_segments(self.qk_hdim):
             gbase = fx.add_offset(base_iter, off + fx.Int64(c0))
             tile = (num_seq, num_head, w)
-            lds_strides = (num_head * self.row_elems, self.row_elems, 1)
+            lds_strides = (num_head * self.padded_row_elems, self.padded_row_elems, 1)
             g_view = fx.Tensor(
                 fx.make_view(
                     gbase,
@@ -1290,7 +1463,7 @@ class QManager16bV2:
         lane = self._lane_idx
         lane_base = (
             self._warp_region
-            + (lane % _WMMA_M) * fx.Int32(self.row_bytes)
+            + (lane % _WMMA_M) * fx.Int32(self.padded_row_bytes)
             + (lane // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
         )
         base = _lds_ptr_b128(lane_base)
@@ -1298,7 +1471,7 @@ class QManager16bV2:
         for qt in range(self.q_tiles_per_wave):
             for tile in range(self.k_tiles):
                 imm_lo = (
-                    qt * _WMMA_M * self.row_bytes + tile * self.wmma_k * self.elem_bytes
+                    qt * _WMMA_M * self.padded_row_bytes + tile * self.wmma_k * self.elem_bytes
                 )
                 imm_hi = imm_lo + 2 * _CHUNK_BYTES  # next group: 32 B either width
                 p_lo = base if imm_lo == 0 else fx.add_offset(base, imm_lo)
@@ -1322,6 +1495,15 @@ class KManager16bV2(_TdmTransport, KManager16bV1):
 class VManager16bV2(_TdmTransport, VManager16bV1):
     """V loader, TDM transport. As ``KManager16bV2``: everything but the global->LDS copy
     is ``VManager16bV1``'s, including the 32 B row pad and the transpose read."""
+
+
+class KManager16bPaged(_TdmGatherTransport, KManager16bV1):
+    """K loader, paged (TDM gather) transport. Same inherit-and-override shape as the V2
+    pair: only ``load_descriptor`` differs from ``KManager16bV2``."""
+
+
+class VManager16bPaged(_TdmGatherTransport, VManager16bV1):
+    """V loader, paged (TDM gather) transport."""
 
 
 # ============================================================================
@@ -1598,17 +1780,17 @@ class OManager16bV2:
         self.d_tiles = v_hdim // _WMMA_M
         self.rows_per_warp = _WMMA_M * q_tiles_per_wave  # 32
         self.block_m = self.rows_per_warp * num_waves  # 256
-        self.row_elems = (
+        self.padded_row_elems = (
             v_hdim + _O_PAD_ELEMS
         )  # padded; the pad rides as dropped columns
-        self.row_bytes = self.row_elems * self.elem_bytes
+        self.padded_row_bytes = self.padded_row_elems * self.elem_bytes
 
     def get_lds_size_in_byte(self):
-        return self.num_waves * self.rows_per_warp * self.row_bytes
+        return self.num_waves * self.rows_per_warp * self.padded_row_bytes
 
     def warp_lds_size_in_byte(self):
         """LDS bytes of ONE wave's private O region; the caller strides ``ptr_lds_warp`` by it."""
-        return self.rows_per_warp * self.row_bytes
+        return self.rows_per_warp * self.padded_row_bytes
 
     def store_o_to_vram(
         self,
@@ -1636,12 +1818,12 @@ class OManager16bV2:
             )
         gqa = self.gqa_ratio
         warp_region = ptr_lds_warp
-        tile_lds = warp_region + fx.Int32(qtile * _WMMA_M * self.row_bytes)
+        tile_lds = warp_region + fx.Int32(qtile * _WMMA_M * self.padded_row_bytes)
 
         # (1) Accumulator -> row-major LDS, one b128 per d-tile.
         lane_base = (
             tile_lds
-            + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
+            + (lane_idx % _WMMA_M) * fx.Int32(self.padded_row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
         )
         base_ptr = _lds_ptr_b128(lane_base)
@@ -1676,8 +1858,8 @@ class OManager16bV2:
                 + fx.Int64(kv_head) * fx.Int64(stride_o_head)
             )
             gbase = fx.add_offset(fx.get_iter(ptr_O), off)
-            tile = (_WMMA_M, self.row_elems)
-            lds_strides = (self.row_elems, 1)
+            tile = (_WMMA_M, self.padded_row_elems)
+            lds_strides = (self.padded_row_elems, 1)
             g_view = fx.Tensor(
                 fx.make_view(
                     gbase,
@@ -1713,8 +1895,8 @@ class OManager16bV2:
                 + fx.Int64(head0) * fx.Int64(stride_o_head)
             )
             gbase = fx.add_offset(fx.get_iter(ptr_O), off)
-            tile = (num_seq, heads_per_tile, self.row_elems)
-            lds_strides = (heads_per_tile * self.row_elems, self.row_elems, 1)
+            tile = (num_seq, heads_per_tile, self.padded_row_elems)
+            lds_strides = (heads_per_tile * self.padded_row_elems, self.padded_row_elems, 1)
             g_view = fx.Tensor(
                 fx.make_view(
                     gbase,
@@ -1778,18 +1960,18 @@ class OManager16bV3:
         self.d_tiles = v_hdim // _WMMA_M
         self.rows_per_warp = _WMMA_M * q_tiles_per_wave
         self.block_m = self.rows_per_warp * num_waves
-        self.row_elems = v_hdim + _O_PAD_ELEMS  # PADDED (conflict-free ds_store)
-        self.row_bytes = self.row_elems * self.elem_bytes
+        self.padded_row_elems = v_hdim + _O_PAD_ELEMS  # PADDED (conflict-free ds_store)
+        self.padded_row_bytes = self.padded_row_elems * self.elem_bytes
         self.chunks_per_row = v_hdim // self.chunk_elems  # b128 chunks per row
         self.num_rounds = (_WMMA_M * self.chunks_per_row) // _WAVE_SIZE
         self._pending = []  # per-qtile (tile_lds, base_row)
 
     def get_lds_size_in_byte(self):
-        return self.num_waves * self.rows_per_warp * self.row_bytes
+        return self.num_waves * self.rows_per_warp * self.padded_row_bytes
 
     def warp_lds_size_in_byte(self):
         """LDS bytes of ONE wave's private O region; the caller strides ``ptr_lds_warp`` by it."""
-        return self.rows_per_warp * self.row_bytes
+        return self.rows_per_warp * self.padded_row_bytes
 
     def store_o_to_vram(
         self,
@@ -1818,12 +2000,12 @@ class OManager16bV3:
         if len(o_frags) != self.d_tiles:
             raise ValueError(f"expected {self.d_tiles} O frags; got {len(o_frags)}")
         warp_region = ptr_lds_warp
-        tile_lds = warp_region + fx.Int32(qtile * _WMMA_M * self.row_bytes)
+        tile_lds = warp_region + fx.Int32(qtile * _WMMA_M * self.padded_row_bytes)
 
         # (1) Per call: cvt fp32->bf16 + compute LDS write pointers (no issue yet). Stash.
         lane_base = (
             tile_lds
-            + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
+            + (lane_idx % _WMMA_M) * fx.Int32(self.padded_row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
         )
         base_ptr = _lds_ptr_b128(lane_base)
@@ -1916,7 +2098,7 @@ class OManager16bV3:
             d = d_chunk * fx.Int32(self.chunk_elems)
             lds_src = (
                 warp_region
-                + srow * fx.Int32(self.row_bytes)
+                + srow * fx.Int32(self.padded_row_bytes)
                 + d_chunk * fx.Int32(_CHUNK_BYTES)
             )
             pr = warp_base + srow
