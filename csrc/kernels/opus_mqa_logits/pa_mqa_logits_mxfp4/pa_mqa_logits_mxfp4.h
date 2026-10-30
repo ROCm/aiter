@@ -162,23 +162,32 @@ void mqa_logits_mxfp4_build_schedule(aiter_tensor_t& query_start_loc,
                                      int num_ctas,
                                      int cta_resident);
 
-// The tensors lead: compile_ops gives an op whose first argument is not a tensor a dummy one,
-// allocated every call.
-void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
-                             aiter_tensor_t& q_scale,
-                             aiter_tensor_t& kv_cache,
-                             aiter_tensor_t& kv_scale,
-                             aiter_tensor_t& weights,
-                             aiter_tensor_t& block_tables,
-                             aiter_tensor_t& query_start_loc,
-                             aiter_tensor_t& row_ends,
-                             aiter_tensor_t& cta_info,
-                             aiter_tensor_t& out,
-                             aiter_tensor_t& out_offsets,
+// One launch, from addresses and the scalars the kernels read: the Python wrapper checks the
+// tensors, since a tensor descriptor apiece costs more host time than the launch itself (it runs
+// once a layer). cta_info is read in Table mode only; out_offsets == 0 means a [rows, out_stride]
+// out. kv_bytes is the kv_cache's size; stream is the hipStream_t to launch on.
+void mqa_logits_mxfp4_launch(int64_t q,
+                             int64_t q_scale,
+                             int64_t kv_cache,
+                             int64_t kv_scale,
+                             int64_t weights,
+                             int64_t block_tables,
+                             int64_t query_start_loc,
+                             int64_t row_ends,
+                             int64_t cta_info,
+                             int64_t out,
+                             int64_t out_offsets,
+                             int64_t kv_bytes,
+                             int rows,
+                             int num_seqs,
+                             int bt_stride,
+                             int out_stride,
                              int instance,
-                             int mode,
+                             int schedule_mode,
                              float weight_scale,
                              int tpb_shift,
                              int cta_target,
                              int prefill_parts,
-                             int grid);
+                             int grid,
+                             int device,
+                             int64_t stream);
