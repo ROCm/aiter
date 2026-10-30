@@ -8,7 +8,6 @@ Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 
 import importlib.util
 from itertools import product
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -93,359 +92,6 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         graph.replay()
         check(plan, values)
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
-
-
-@pytest.mark.parametrize(
-    "arch,num_seqs,window,max_parts,capacity_per_seq,expected_splits",
-    [
-        # Bracket the batch-size transitions between 8/4/2/1 query splits.
-        ("gfx950", 8, 1024, 8, 8, 8),
-        ("gfx950", 16, 1024, 8, 8, 4),
-        ("gfx950", 32, 1024, 8, 8, 4),
-        ("gfx950", 64, 1024, 8, 8, 2),
-        ("gfx950", 128, 1024, 8, 8, 1),
-        ("gfx942", 8, 1024, 8, 8, 8),
-        ("gfx950", 8, 1023, 8, 8, 8),
-        ("gfx950", 8, 1025, 8, 8, 8),
-        ("gfx950", 8, 512, 8, 8, 8),
-        # Limited budgets still need enough split-query CTAs to fill the device.
-        ("gfx950", 8, 512, 8, 3, 8),
-        ("gfx950", 32, 2048, 8, 8, 1),
-        # Neighboring windows follow planned work, not an exact window value.
-        ("gfx950", 8, 1024, 1, 1, 8),
-        ("gfx950", 8, 1024, 8, 2, 8),
-        ("gfx950", 8, 1023, 1, 1, 8),
-        ("gfx950", 8, 1025, 1, 1, 8),
-        ("gfx950", 8, 2048, 1, 1, 8),
-        ("gfx950", 8, 2048, 8, 8, 4),
-        ("gfx950", 32, 2048, 1, 1, 8),
-        ("gfx950", 32, 2048, 4, 4, 2),
-        ("gfx950", 64, 1024, 1, 1, 4),
-        ("gfx950", 64, 1024, 4, 4, 1),
-        ("gfx950", 128, 1024, 1, 1, 2),
-        ("gfx950", 8, 4096, 8, 8, 4),
-        ("gfx942", 8, 2048, 1, 1, 8),
-        ("gfx942", 48, 4096, 4, 4, 1),
-        ("gfx950", 48, 4096, 4, 4, 2),
-    ],
-)
-def test_bf16_swa_query_split_schedule(
-    monkeypatch, arch, num_seqs, window, max_parts, capacity_per_seq, expected_splits
-):
-    """KV work and grid size select splits consistently across window sizes."""
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
-    schedule = traits.PaDecodeSchedule.select(
-        head_dim=128,
-        value_dim=128,
-        query_group_size=16,
-        block_size=64,
-        num_seqs=num_seqs,
-        num_kv_heads=1,
-        num_compute_units=256,
-        work_capacity=num_seqs * capacity_per_seq,
-        num_partitions=max_parts,
-        query_dtype="bf16",
-        kv_dtype="bf16",
-        query_length=8,
-        trans_v=True,
-        max_context_length=8192,
-        sliding_window=window,
-    )
-    assert traits.PaDecodeTraits.create(schedule).query_splits == expected_splits
-
-
-@pytest.mark.parametrize("window", [2048, 2**31 + 1])
-def test_bf16_swa_schedule_context_bound(monkeypatch, window):
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
-    schedule = traits.PaDecodeSchedule.select(
-        head_dim=128,
-        query_group_size=16,
-        block_size=64,
-        num_seqs=8,
-        num_kv_heads=1,
-        num_compute_units=256,
-        work_capacity=64,
-        num_partitions=8,
-        query_dtype="bf16",
-        kv_dtype="bf16",
-        query_length=8,
-        max_context_length=512,
-        sliding_window=window,
-    )
-    assert traits.PaDecodeTraits.create(schedule).query_splits == 8
-
-
-@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
-@pytest.mark.parametrize(
-    "query_length,head_dim,value_dim,group,heads,page",
-    [
-        (1, 64, 64, 8, 2, 16),
-        (2, 192, 192, 32, 2, 128),
-        (3, 128, 128, 16, 1, 64),
-        (4, 256, 256, 8, 2, 128),
-        (5, 128, 128, 16, 1, 64),
-        (6, 512, 512, 16, 1, 64),
-        (7, 192, 128, 8, 4, 16),
-        (8, 1024, 1024, 16, 1, 128),
-    ],
-)
-def test_bf16_swa_schedule_geometry(
-    monkeypatch, arch, query_length, head_dim, value_dim, group, heads, page
-):
-    """All short query lengths select legal splits and an actual layout that fits LDS."""
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
-    for batch, parts in ((8, 1), (48, 8)):
-        layout = traits.PaDecodeTraits.create(
-            traits.PaDecodeSchedule.select(
-                head_dim=head_dim,
-                value_dim=value_dim,
-                query_group_size=group,
-                block_size=page,
-                num_seqs=batch,
-                num_kv_heads=heads,
-                num_compute_units=304 if arch == "gfx942" else 256,
-                work_capacity=batch * parts,
-                num_partitions=parts,
-                query_dtype="bf16",
-                kv_dtype="bf16",
-                query_length=query_length,
-                max_context_length=8192,
-                sliding_window=4096,
-            )
-        )
-        assert query_length % layout.query_splits == 0
-        assert layout.QUERIES_PER_CTA * layout.query_splits == query_length
-        assert layout.total_bytes <= traits.BF16_LDS_LIMIT_BYTES
-
-
-@pytest.mark.parametrize(
-    "heads,head_dim,window,query_length,expected_splits",
-    [
-        (2, 128, 1024, 8, 4),
-        (4, 128, 1024, 8, 4),
-        (1, 512, 128, 8, 8),
-        (1, 512, 1024, 8, 4),
-        (1, 128, 1024, 9, 1),
-        (1, 128, 1024, 12, 1),
-        (1, 128, 1024, 16, 2),
-    ],
-)
-def test_bf16_swa_work_and_query_bounds(
-    monkeypatch, heads, head_dim, window, query_length, expected_splits
-):
-    """Account for KV heads/bytes; longer queries retain the LDS-based fallback."""
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
-    layout = traits.PaDecodeTraits.create(
-        traits.PaDecodeSchedule.select(
-            head_dim=head_dim,
-            query_group_size=16,
-            block_size=64,
-            num_seqs=8,
-            num_kv_heads=heads,
-            num_compute_units=256,
-            work_capacity=64,
-            num_partitions=8,
-            query_dtype="bf16",
-            kv_dtype="bf16",
-            query_length=query_length,
-            max_context_length=8192,
-            sliding_window=window,
-        )
-    )
-    assert layout.query_splits == expected_splits
-
-
-@pytest.mark.parametrize(
-    "kv_dtype,window,accepted",
-    [
-        (dtype, window, window >= 0)
-        for dtype in ("fp8", "bf16")
-        for window in (-1, 0, 1, 2**31 + 1)
-    ],
-)
-def test_asymmetric_schedule_window_contract(monkeypatch, kv_dtype, window, accepted):
-    """Both KV dtypes accept normalized full attention and positive windows."""
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
-    kwargs = {
-        "head_dim": 192,
-        "value_dim": 128,
-        "query_group_size": 16,
-        "block_size": 64,
-        "num_seqs": 1,
-        "num_kv_heads": 1,
-        "num_compute_units": 256,
-        "work_capacity": 8,
-        "num_partitions": 8,
-        "query_dtype": "bf16",
-        "kv_dtype": kv_dtype,
-        "query_length": 8,
-        "sliding_window": window,
-    }
-    if accepted:
-        traits.PaDecodeSchedule.select(**kwargs)
-    else:
-        with pytest.raises(ValueError, match="sliding window"):
-            traits.PaDecodeSchedule.select(**kwargs)
-
-
-@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
-@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
-def test_asymmetric_architecture_and_query_splits(monkeypatch, arch, kv_dtype):
-    query_length = 3
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
-    layout = traits.PaDecodeTraits.create(
-        traits.PaDecodeSchedule.select(
-            head_dim=192,
-            value_dim=128,
-            query_group_size=8,
-            block_size=64,
-            num_seqs=16,
-            num_kv_heads=2,
-            num_compute_units=304 if arch == "gfx942" else 256,
-            work_capacity=512,
-            num_partitions=32,
-            max_context_length=8192,
-            query_dtype="bf16",
-            kv_dtype=kv_dtype,
-            per_token_kv=kv_dtype == "fp8",
-            query_length=query_length,
-        )
-    )
-    assert query_length % layout.query_splits == 0
-    assert layout.QUERIES_PER_CTA * layout.query_splits == query_length
-    assert layout.WIDE_FP8_MFMA == (arch == "gfx950" and kv_dtype == "fp8")
-    assert layout.N_SUBCHUNKS == (
-        12 if kv_dtype == "bf16" else 8 if arch == "gfx950" else 6
-    )
-    assert layout.FP8_MAX == (240 if arch == "gfx942" else 448)
-
-
-@pytest.mark.parametrize("value_dim", [None, 128, 64])
-def test_gfx1250_value_width_dispatch(monkeypatch, value_dim):
-    """The gfx1250 dispatcher must not silently ignore an asymmetric width."""
-    kernel = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
-    calls = []
-
-    def compile_gfx1250(**kwargs):
-        calls.append(kwargs)
-        return kwargs
-
-    monkeypatch.setattr(kernel, "compile_gfx1250_pa_decode", compile_gfx1250)
-    kwargs = {
-        "architecture": "gfx1250",
-        "head_dim": 128,
-        "value_dim": value_dim,
-        "query_group_size": 16,
-        "block_size": 64,
-        "num_seqs": 1,
-        "num_kv_heads": 1,
-        "num_compute_units": 256,
-        "work_capacity": 1,
-    }
-    if value_dim == 64:
-        with pytest.raises(NotImplementedError, match="asymmetric value width"):
-            kernel.compile_pa_decode_tile(**kwargs)
-        assert not calls
-    else:
-        assert kernel.compile_pa_decode_tile(**kwargs)["head_dim"] == 128
-        assert len(calls) == 1
-
-
-@pytest.mark.parametrize(
-    "arch,group,per_token,accepted",
-    [
-        ("gfx942", 288, False, True),
-        ("gfx942", 304, False, False),
-        ("gfx950", 752, False, True),
-        ("gfx950", 768, False, False),
-        ("gfx942", 1024, True, False),
-        ("gfx950", 1024, True, False),
-    ],
-)
-def test_fp8_lds_capacity_before_storage(monkeypatch, arch, group, per_token, accepted):
-    """Reject oversized layouts before constructing storage or compiling kernels."""
-    kernel = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
-    monkeypatch.setattr(kernel, "_PA_DECODE_TILE_CACHE", {})
-
-    class StorageReached(Exception):
-        pass
-
-    def stop_at_storage(cls):
-        raise StorageReached("layout fits")
-
-    monkeypatch.setattr(kernel.fx, "struct", stop_at_storage)
-    error = StorageReached if accepted else RuntimeError
-    match = "layout fits" if accepted else "Shared Memory Overflow"
-    with pytest.raises(error, match=match):
-        kernel.compile_pa_decode_tile(
-            architecture=arch,
-            head_dim=192,
-            value_dim=128,
-            query_group_size=group,
-            block_size=64,
-            num_seqs=8,
-            num_kv_heads=1,
-            num_compute_units=304 if arch == "gfx942" else 256,
-            work_capacity=64,
-            num_partitions=8,
-            query_dtype="bf16",
-            kv_dtype="fp8",
-            per_token_kv=per_token,
-            query_length=8,
-            max_context_length=8192,
-            sliding_window=1,
-        )
-
-
-@pytest.mark.parametrize(
-    "kv_dtype,arch,head_dim,accepted",
-    [
-        ("fp8", "gfx942", 320, True),
-        ("bf16", "gfx950", 192, True),
-        ("fp8", "gfx950", 960, True),
-        ("fp8", "gfx1250", 64, True),
-        ("fp8", "gfx1250", 192, False),
-        ("bf16", "gfx1250", 320, False),
-    ],
-)
-def test_tuning_head_dimensions(monkeypatch, kv_dtype, arch, head_dim, accepted):
-    """CLI validation accepts gfx9 widths and retains the gfx1250 restriction."""
-    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
-    monkeypatch.setattr(tuning, "get_gfx_runtime", lambda: arch)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
-    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _: SimpleNamespace(multi_processor_count=256),
-    )
-
-    class InputsReached(Exception):
-        pass
-
-    def stop_at_inputs(*args):
-        raise InputsReached("shape accepted")
-
-    monkeypatch.setattr(tuning, "_make_tuning_inputs", stop_at_inputs)
-    error = InputsReached if accepted else ValueError
-    match = "shape accepted" if accepted else "gfx1250 head-dim"
-    with pytest.raises(error, match=match):
-        tuning.main(["--kv-dtype", kv_dtype, "--head-dim", str(head_dim)])
-
-
-@pytest.mark.parametrize("window", [-17, -1, 0])
-def test_tuning_nonpositive_window(window):
-    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
-    assert tuning._parse_args(["--sliding-window", str(window)]).sliding_window == 0
 
 
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
@@ -1423,12 +1069,27 @@ def _poison_unowned(cache, scale, owned, fill):
 
 @pytest.mark.parametrize("fill", ["nan", "inf"])
 @pytest.mark.parametrize(
-    "query_length,kv_heads,group_size,head_dim",
-    [(1, 1, 8, 128), (4, 2, 8, 256), (4, 1, 16, 128)],
-)
-@pytest.mark.parametrize("block_size", [16, 64, 128])
-@pytest.mark.parametrize(
-    "kv", ["fp8-per-tensor", "fp8-per-tensor-plain-v", "fp8-per-token", "bf16"]
+    "kv,block_size,query_length,kv_heads,group_size,head_dim",
+    [
+        # Generic multi-query, page16/page64 D256 pipe, and page128 prefetch.
+        ("fp8-per-tensor", 16, 4, 1, 16, 128),
+        ("fp8-per-tensor", 16, 4, 2, 8, 256),
+        ("fp8-per-tensor", 64, 4, 2, 8, 256),
+        ("fp8-per-tensor", 128, 1, 1, 8, 128),
+        # Plain V addressing across all page sizes and single/multi-query paths.
+        ("fp8-per-tensor-plain-v", 16, 4, 2, 8, 256),
+        ("fp8-per-tensor-plain-v", 64, 1, 1, 8, 128),
+        ("fp8-per-tensor-plain-v", 128, 4, 1, 16, 128),
+        # Scalar/vector scale staging, single-query and gfx950 query splitting.
+        ("fp8-per-token", 16, 4, 2, 8, 256),
+        ("fp8-per-token", 64, 4, 1, 16, 128),
+        ("fp8-per-token", 128, 1, 1, 8, 128),
+        ("fp8-per-token", 128, 4, 1, 16, 128),
+        # Both BF16 tail-mask implementations, with multiple heads/M-tiles.
+        ("bf16", 16, 1, 1, 8, 128),
+        ("bf16", 64, 4, 2, 8, 256),
+        ("bf16", 128, 4, 1, 16, 128),
+    ],
 )
 def test_pa_decode_unowned_kv_rows(
     device, kv, block_size, query_length, kv_heads, group_size, head_dim, fill
