@@ -16,19 +16,25 @@ from aiter.fused_moe import get_2stage_cfgs, get_padded_M
 EXPERTS = 65
 TOPK = 9
 
+# The tuned rows still select the order-dependent ``atomic`` epilogue; dispatch
+# rewrites that to its deterministic ``reduce`` sibling (see
+# _apply_mxfp4_stage2_determinism_policy), so stage2 resolves to the reduce name.
 DECODE = (
     "flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2_fp4",
+    "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2",
     "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2",
     32,
 )
 PREFILL_16K = (
     "flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w3_bnt0_fp4",
     "flydsl_moe2_layout_afp4_wfp4_bf16_t64x256x128_atomic_persist_sbm64",
+    "flydsl_moe2_layout_afp4_wfp4_bf16_t64x256x128_reduce_persist_sbm64",
     64,
 )
 PREFILL_32K = (
     "flydsl_moe1_afp4_wfp4_bf16_t128x128x256_bnt0_fp4",
     "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_sbm128",
+    "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128",
     128,
 )
 
@@ -85,9 +91,13 @@ def test_ep4_tiers_use_fused_fp4_stage1(gfx950_dispatch, m, tier, expected):
         opus_weights_shuffled=True,
         is_ep=True,
     )
-    stage1, stage2, block_m = expected
+    stage1, tuned_stage2, stage2, block_m = expected
     assert meta.stage1.keywords["kernelName"] == stage1
     assert meta.stage2.keywords["kernelName"] == stage2
+    assert any(
+        row["kernelName2"] == tuned_stage2
+        for row in importlib.import_module("aiter.fused_moe").cfg_2stages[0].values()
+    )
     assert meta.fuse_quant == "fp4"
     assert meta.block_m == block_m
 
