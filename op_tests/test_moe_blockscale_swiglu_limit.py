@@ -216,22 +216,37 @@ def test_limit_5_uses_the_epilogue():
     assert int(meta.ksplit or 0) == 0
 
 
-def test_missing_swiglu_limit_row_warns(monkeypatch):
-    tuned = (
+def _swiglu_limit_csv():
+    return (
         __import__("pathlib").Path(__file__).resolve().parents[1]
         / "aiter/configs/model_configs/a8w8_blockscale_tuned_swiglu_limit_fmoe_gfx942.csv"
     )
-    monkeypatch.setenv("AITER_CONFIG_FMOE_SWIGLU_LIMIT", str(tuned))
+
+
+def _capture_warnings(monkeypatch):
     messages = []
     monkeypatch.setattr(
         "aiter.fused_moe.logger.warning",
         lambda msg, *args, **kwargs: messages.append(str(msg)),
     )
-    # Token 32 keeps this shape on the epilogue. Token 1 still split-Ks
-    # because one token does not fill the GPU.
+    return messages
+
+
+def test_tuned_cohere_row_uses_the_epilogue(monkeypatch):
+    monkeypatch.setenv("AITER_CONFIG_FMOE_SWIGLU_LIMIT", str(_swiglu_limit_csv()))
+    messages = _capture_warnings(monkeypatch)
     meta = _dispatch(32, 2048, 768, 128, 8, 5.0)
-    assert meta.run_1stage is False
+    assert not int(meta.run_1stage or 0)
     assert int(meta.ksplit or 0) == 0
+    assert "_swiglustep_" in meta.stage1.keywords["kernelName"]
+    assert not any("no row" in msg for msg in messages)
+
+
+def test_missing_swiglu_limit_row_warns(monkeypatch):
+    monkeypatch.setenv("AITER_CONFIG_FMOE_SWIGLU_LIMIT", str(_swiglu_limit_csv()))
+    messages = _capture_warnings(monkeypatch)
+    # Token 16 is not one of the tuned buckets (1, 32, 1024, 8192).
+    _dispatch(16, 2048, 768, 128, 8, 5.0)
     assert any("no row" in msg for msg in messages)
 
 
