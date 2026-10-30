@@ -13,6 +13,7 @@ from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
+from ..tensor_shim import _run_compiled
 from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
     _i32_buffer,
@@ -371,7 +372,7 @@ def build_pa_mqa_logits_fp4_module(
                 return scales
 
             def _issue_nt_mfmas(kv_list_in, kvs_scales_per_nt, nt):
-                zero = fx.Vector.filled(4, 0.0, fx.Float32)
+                zero = fx.full(4, 0.0, fx.Float32)
                 accs = [zero] * m_tiles
                 for k_tile in range_constexpr(k_tiles):
                     b_frag = fx.make_rmem_tensor(4, fx.Int32)
@@ -393,7 +394,7 @@ def build_pa_mqa_logits_fp4_module(
                 return accs
 
             def _post_process_nt(accs, nt, c_i32_arg):
-                zero = fx.Vector.filled(4, 0.0, fx.Float32)
+                zero = fx.full(4, 0.0, fx.Float32)
                 ni_warp = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
                 token_base = (chunk_start + c_i32_arg) * fx.Int32(
                     block_k
@@ -735,12 +736,13 @@ def flydsl_pa_mqa_logits_fp4(
     if stream is None:
         stream = torch.cuda.current_stream()
 
-    launcher(
+    _run_compiled(
+        launcher,
         out,
         q_fp4,
         q_scale,
-        kv_cache,
-        kv_scale,
+        kv_cache.as_strided((1,), (1,)),
+        kv_scale.as_strided((1,), (1,)),
         block_tables,
         weights,
         cta_info,
