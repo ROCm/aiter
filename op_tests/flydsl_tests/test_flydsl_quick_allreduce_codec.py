@@ -36,8 +36,6 @@ if _REPO_ROOT not in sys.path:
 import pytest
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
-
 pytest.importorskip("flydsl")
 
 import flydsl.compiler as flyc
@@ -45,6 +43,7 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import BLOCK, make_pack_storage
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_codec import (
     CODECS,
@@ -61,7 +60,6 @@ from aiter.ops.flydsl.kernels.comm.quick_allreduce_codec import (
     scale_slot_of,
     thread_lane,
 )
-from aiter.jit.utils.chip_info import get_gfx
 
 ARCH = get_gfx()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
