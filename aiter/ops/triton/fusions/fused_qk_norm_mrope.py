@@ -17,11 +17,13 @@ from aiter.ops.triton.utils.config_utils import (
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+# One config per op: the cache write keeps the row kernel faster up to a larger row count.
 _CONFIG_NAME = "FUSED_QK_NORM_MROPE"
+_CACHE_CONFIG_NAME = "FUSED_QK_NORM_MROPE_CACHE"
 
 
-def _get_config(num_rows: int) -> dict:
-    config_dir = resolve_config_dir("fusions", _CONFIG_NAME, backend="gluon")
+def _get_config(config_name: str, num_rows: int) -> dict:
+    config_dir = resolve_config_dir("fusions", config_name, backend="gluon")
     configs = load_config_json(f"{config_dir}/DEFAULT.json")
     return select_leq_config(configs, num_rows, prefix="ROWS_LEQ_")
 
@@ -53,12 +55,11 @@ def _launch(
     assert cos.shape[1] == ROPE_HALF.value and cos.stride(1) == 1
     assert sin.stride() == cos.stride()
     num_rows = num_tokens * (q_heads + k_heads)
-    config = _get_config(num_rows)
+    config = _get_config(_CACHE_CONFIG_NAME if cache else _CONFIG_NAME, num_rows)
 
     q_out = torch.empty((num_tokens, q.shape[1]), dtype=q.dtype, device=q.device)
     k_out = torch.empty((num_tokens, k.shape[1]), dtype=k.dtype, device=k.device)
-    # The cache write makes the row kernel faster up to a larger row count.
-    tdm = config["TDM_CACHE"] if cache else config["TDM"]
+    tdm = config["TDM"]
     _LOGGER.info(
         "FUSED_QK_NORM_MROPE: T=%d Hq=%d Hk=%d cache=%s TDM=%s",
         num_tokens,
