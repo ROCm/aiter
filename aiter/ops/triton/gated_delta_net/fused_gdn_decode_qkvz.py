@@ -55,6 +55,8 @@ _SUPPORTED_RATIOS = (1, 2, 3, 4)
 # register-resident tile does. See notes/gdn-perf-matrix.md.
 _LARGE_BATCH = 128
 _CONV_WIDTH = 4
+# projected_ba may be [KS, T, 2*VH] fp32 split-K partials (summed in the kernel).
+SUPPORTS_BA_SPLITK_PARTIALS = True
 
 
 def _uses_ratio_generic_kernel(
@@ -215,8 +217,10 @@ def fused_gdn_decode_qkvz_supported(
     group_width = 2 * head_k_dim + 2 * (v_heads // k_heads) * head_v_dim
     if projected_qkvz.shape != (tokens, k_heads * group_width):
         return False, f"packed qkvz layout mismatch: {tuple(projected_qkvz.shape)}"
-    if projected_ba.shape != (tokens, 2 * v_heads):
+    if projected_ba.shape[-2:] != (tokens, 2 * v_heads) or projected_ba.dim() > 3:
         return False, f"packed ba layout mismatch: {tuple(projected_ba.shape)}"
+    if projected_ba.dim() == 3 and projected_ba.dtype is not torch.float32:
+        return False, "split-K ba partials must be fp32"
     if conv_state.shape[2] != _CONV_WIDTH - 1 or conv_weight.shape != (
         channels,
         _CONV_WIDTH,
@@ -230,7 +234,9 @@ def fused_gdn_decode_qkvz_supported(
 
     if ssm_state.dtype not in (torch.float32, torch.bfloat16):
         return False, f"ssm_state must be fp32 or bf16, got {ssm_state.dtype}"
-    bf16_args = (projected_qkvz, projected_ba, conv_state, conv_weight, conv_bias)
+    bf16_args = (projected_qkvz, conv_state, conv_weight, conv_bias)
+    if projected_ba.dim() == 2:
+        bf16_args += (projected_ba,)
     if not all(t.dtype is torch.bfloat16 for t in bf16_args):
         return False, "packed projections, conv state/weight/bias must be bf16"
     if A_log.shape != (v_heads,) or A_log.dtype is not torch.float32:
@@ -314,7 +320,7 @@ def fused_gdn_decode_qkvz_supported(
         qkvz_layout == "flat",
         query_start_loc is not None,
         ssm_state.dtype,
-        _strided_rows(projected_qkvz, projected_ba),
+        _strided_rows(projected_qkvz, projected_ba) or projected_ba.dim() == 3,
     )
     if not generic and not (conv_state.is_contiguous() and ssm_state.is_contiguous()):
         return False, (
@@ -356,9 +362,10 @@ def fused_gdn_decode_qkvz(
             ``in_proj_qkvz`` output (``ratio = VH // KH``, 1 to 4). Split
             internally; no separate split kernel.
         projected_ba: [T, 2*VH] bf16, packed ``in_proj_ba`` output (betas then a's
-            per key-head group). Token rows of both may be strided (each row dense),
-            e.g. column views of one GEMM that produces qkvz and ba together; that
-            runs the ratio-generic kernel.
+            per key-head group), or [KS, T, 2*VH] fp32 split-K partials of it,
+            summed here. Token rows of both may be strided (each row dense), e.g.
+            column views of one GEMM that produces qkvz and ba together. Partials
+            and strided rows run the ratio-generic kernel.
         conv_state: [N, channels, 3] bf16, rolling conv window. **Mutated in place.**
         ssm_state: [N, VH, VD, KD] fp32 or bf16, delta-rule state. **Mutated in
             place.** The update runs in fp32 either way; a bf16 state runs the
@@ -470,7 +477,7 @@ def fused_gdn_decode_qkvz(
         flat,
         query_start_loc is not None,
         ssm_state.dtype,
-        _strided_rows(projected_qkvz, projected_ba),
+        _strided_rows(projected_qkvz, projected_ba) or projected_ba.dim() == 3,
     ):
         # Ratio-generic kernel at every batch size; the bands below hardcode
         # ratio 2, the interleaved layout, dense pools and rows and an fp32 state.
@@ -491,7 +498,8 @@ def fused_gdn_decode_qkvz(
             *conv_state.stride(),
             ssm_state.stride(0),
             projected_qkvz.stride(0),
-            projected_ba.stride(0),
+            projected_ba.stride(-2),
+            projected_ba.stride(0) if projected_ba.dim() == 3 else 0,
             k_heads,
             v_heads,
             head_k_dim,
@@ -509,6 +517,7 @@ def fused_gdn_decode_qkvz(
             HAS_QSL=has_qsl,
             REG_EPILOGUE=has_fp8,
             NUM_BUFFERS=num_buffers,
+            BA_KSPLIT=projected_ba.shape[0] if projected_ba.dim() == 3 else 1,
             num_warps=num_warps,
         )
     elif tokens >= _LARGE_BATCH:
