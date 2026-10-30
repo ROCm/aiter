@@ -528,14 +528,19 @@ def pa_decode(
             )
 
     if mxfp4:
-        if (
-            query_length != 1
-            or sliding_window
-            or sinks is not None
-            or compute_type not in (None, torch.uint8)
-        ):
+        if query_length != 1:
             raise NotImplementedError(
-                "MXFP4 KV supports query_length 1, no sliding window and no sinks"
+                f"MXFP4 KV supports query_length 1, got {query_length}"
+            )
+        if sliding_window:
+            raise NotImplementedError(
+                f"MXFP4 KV supports no sliding window, got sliding_window={sliding_window}"
+            )
+        if sinks is not None:
+            raise NotImplementedError("MXFP4 KV supports no sinks, got sinks")
+        if compute_type not in (None, torch.uint8):
+            raise NotImplementedError(
+                f"MXFP4 KV takes compute_type None or torch.uint8, got {compute_type}"
             )
         return _pa_decode_mxfp4(
             output,

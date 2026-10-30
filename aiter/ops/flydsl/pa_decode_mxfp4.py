@@ -23,6 +23,18 @@ def pa_decode_mxfp4(
 ):
     """``pa_decode`` with ``query_length`` 1. ``max_partitions`` may only be 1, and
     only without a ``work_plan``."""
+    # Knobs of earlier revisions of this entry: pa_decode would only say "unexpected
+    # keyword argument".
+    for name, why in (
+        ("tile_depth", "the tile is fixed by the shared pa_decode kernel"),
+        (
+            "direct_output",
+            "a task that is the whole row writes it directly (work_plan=None or a "
+            "plan with max_partitions 1)",
+        ),
+    ):
+        if name in kwargs:
+            raise NotImplementedError(f"pa_decode_mxfp4 no longer takes {name}: {why}")
     if max_partitions not in (None, 1) or (work_plan and max_partitions):
         raise ValueError("max_partitions may only be 1, and only without a work_plan")
     pa_decode(

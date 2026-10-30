@@ -145,6 +145,17 @@ def _make_inputs(
     return query, key, value, table, context
 
 
+def _mxfp4_dequant(pool):
+    """f32 [pages, heads, 128, 128] of a pool of MXFP4 pages (see ``_mxfp4_pages``)."""
+    pages, heads, _ = pool.shape
+    data = pool[..., : 128 * 64].reshape(-1, 64).clone()
+    scale = pool[..., 128 * 64 :].reshape(-1, 4)
+    dequant = fp4_utils.mxfp4_to_f32(data) * fp4_utils.e8m0_to_f32(
+        scale
+    ).repeat_interleave(32, dim=-1)
+    return dequant.reshape(pages, heads, 128, 128)
+
+
 def _mxfp4_pages(x):
     """x [pages, kv_heads, 128, 128] -> (page pool, f32 dequantization).
 
@@ -643,7 +654,10 @@ _MXFP4_INVALID_CASES = [
     ("17-heads", NotImplementedError, "1..16 query heads"),
     ("sinks", NotImplementedError, "no sinks"),
     ("sliding-window", NotImplementedError, "no sliding window"),
-    ("query-length-2", NotImplementedError, "query_length 1"),
+    ("query-length-2", NotImplementedError, "query_length 1, got 2"),
+    ("compute-type", NotImplementedError, "compute_type None or torch.uint8"),
+    ("removed-tile-depth", NotImplementedError, "no longer takes tile_depth"),
+    ("removed-direct-output", NotImplementedError, "no longer takes direct_output"),
     ("plan-free-strides", ValueError, "output needs the query's strides"),
     ("oversized-task", ValueError, "PAGE_ID_STAGE_LIMIT"),
     ("max-partitions-2", ValueError, "max_partitions may only be 1"),
@@ -1047,6 +1061,8 @@ def run_pa_decode_rejects(kv, invalid, error, match):
         options["sliding_window"] = 256
     elif invalid == "query-length-2":
         query_length = 2
+    elif invalid == "compute-type":
+        options["compute_type"] = torch.float8_e4m3fn
     elif invalid == "plan-free-strides":
         output = torch.empty(4, 32, 128, dtype=torch.bfloat16, device=DEVICE)[:, :16]
     elif invalid == "oversized-task":
@@ -1087,9 +1103,14 @@ def run_pa_decode_rejects(kv, invalid, error, match):
         options["work_plan"] = pa.plan_pa_decode(
             context, 1, max_partitions=int(invalid[-1]), sliding_window=256
         )
-    if invalid == "max-partitions-2":
+    if invalid == "max-partitions-2" or invalid.startswith("removed-"):
+        legacy = (
+            {"max_partitions": 2}
+            if invalid == "max-partitions-2"
+            else {invalid[len("removed-") :].replace("-", "_"): 1}
+        )
         call = lambda: entry.pa_decode_mxfp4(
-            output, query, kd, ks, vd, vs, context, table, 1.0, max_partitions=2
+            output, query, kd, ks, vd, vs, context, table, 1.0, **legacy
         )
     else:
         call = lambda: pa.pa_decode(
@@ -1319,10 +1340,7 @@ def run_pa_decode_mxfp4_extreme_scales(q_exp, k_byte, k_codes, v_codes):
         for token, code in enumerate(codes):
             data.view(1, 1, 128, 64)[..., token, :] = code
         scale.view(1, 1, 128, 4)[..., : len(codes), :] = exponent
-        dequant = fp4_utils.mxfp4_to_f32(
-            data.reshape(-1, 64).clone()
-        ) * fp4_utils.e8m0_to_f32(scale.reshape(-1, 4)).repeat_interleave(32, dim=-1)
-        return pool, dequant.reshape(1, 1, 128, 128)
+        return pool, _mxfp4_dequant(pool)
 
     (key_pool, logical_key), (value_pool, logical_value) = (
         page(k_codes, k_byte),
@@ -1351,6 +1369,60 @@ def run_pa_decode_mxfp4_extreme_scales(q_exp, k_byte, k_codes, v_codes):
         query, logical_key, logical_value, table, context, 1, 0, None
     )
     assert torch.isfinite(reference).all() and reference.abs().max() > 0.1
+    return {"gfx": get_gfx_runtime(), "err": _check_output(output, reference)}
+
+
+@benchmark()
+def run_pa_decode_mxfp4_short_bound():
+    """max_context_length below the context: the page ids past the staged window
+    come from the block table.
+
+    313 pages against a bound of 128 tokens stage 256 ids, and a one-partition plan
+    with a strided output (the reducer path; the direct path drops tiles past the
+    staged window) owns all of them. K is 0, so the softmax is uniform, and V is 1
+    only on logical pages 256 and up: the output is the share of those tokens
+    (0.18) unless their pages are mapped through the table.
+    """
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    pages, length = 313, 40000
+    table = torch.randperm(pages, dtype=torch.int32, device=DEVICE)[None]
+    key_pool = torch.zeros(
+        pages, 1, 128 * 64 + 128 * 4, dtype=torch.uint8, device=DEVICE
+    )
+    value_pool = torch.zeros_like(key_pool)
+    key_pool[..., 128 * 64 :] = value_pool[..., 128 * 64 :] = 127
+    value_pool[table[0, 256:].long(), :, : 128 * 64] = 0x22
+    kd, ks = _mxfp4_views(key_pool)
+    vd, vs = _mxfp4_views(value_pool)
+    query = torch.ones(1, 16, 128, device=DEVICE).to(_E4M3)
+    context = torch.tensor([length], dtype=torch.int32, device=DEVICE)
+    padded = torch.full((1, 32, 128), float("nan"), dtype=torch.bfloat16, device=DEVICE)
+    output = padded[:, :16]
+    pa.pa_decode(
+        output,
+        query,
+        kd,
+        vd,
+        context,
+        table,
+        128**-0.5,
+        1,
+        key_scale=ks,
+        value_scale=vs,
+        work_plan=pa.plan_pa_decode(context, 1, max_partitions=1),
+        max_context_length=128,
+    )
+    reference = _reference(
+        query,
+        _mxfp4_dequant(key_pool),
+        _mxfp4_dequant(value_pool),
+        table,
+        context,
+        1,
+        0,
+        None,
+    )
+    assert reference.mean() > 0.1
     return {"gfx": get_gfx_runtime(), "err": _check_output(output, reference)}
 
 
@@ -1507,10 +1579,11 @@ def _sweeps(arch, kv_dtypes):
             _unowned_skip_reason(kv, block_size, query_length, head_dim, arch)
         ),
     )
-    one_task, extreme_scales = [], []
+    one_task, extreme_scales, short_bound = [], [], []
     if "mxfp4" in kv_dtypes and arch == "gfx950":
         one_task = [("mxfp4-one-task-per-row", ())]
         extreme_scales = _EXTREME_SCALE_CASES
+        short_bound = [("mxfp4-short-bound", ())]
     return [
         ("pa_decode", run_pa_decode, decode),
         (
@@ -1532,6 +1605,7 @@ def _sweeps(arch, kv_dtypes):
             run_pa_decode_mxfp4_extreme_scales,
             extreme_scales,
         ),
+        ("pa_decode MXFP4 short bound", run_pa_decode_mxfp4_short_bound, short_bound),
     ]
 
 

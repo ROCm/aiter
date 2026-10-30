@@ -726,14 +726,29 @@ class PaDecodeKVLoader:
             )
         }
 
+    @flyc.jit
     def mx_pages(self, tt):
-        """The two page ids of tile ``tt`` (wave-uniform), from the LDS-staged list."""
-        rel = (tt - self.ctx.part_start) * (
+        """The two page ids of tile ``tt`` (wave-uniform): the pair staged in LDS, or
+        the block table past the staged window (``max_context_length`` below the
+        context). ``tt`` is not before ``part_start``."""
+        first = tt * (self.traits.TILE_TOK // self.traits.block_size)
+        rel = first - self.ctx.part_start * (
             self.traits.TILE_TOK // self.traits.block_size
         )
-        ids = self.lds.load(self.traits.sPages_off + rel * 4, fx.Int32, 2)
+        # The LDS read stays in bounds whatever rel is; past the window it is replaced.
+        cap = self.traits.stage_page_capacity
+        ids = self.lds.load(
+            self.traits.sPages_off + fx.min(rel, cap - 2) * 4, fx.Int32, 2
+        )
+        p0 = fx.Int32(ids[0])
+        p1 = fx.Int32(ids[1])
+        # Even rel and an even capacity: both ids of the pair are in or out together.
+        if rel >= cap:
+            p0 = self._table_page(first)
+            p1 = self._table_page(first + 1)
         return [
-            fx.Int32(fx.rocdl.readfirstlane(T.i32, ids[i])) for i in range_constexpr(2)
+            fx.Int32(fx.rocdl.readfirstlane(T.i32, p0)),
+            fx.Int32(fx.rocdl.readfirstlane(T.i32, p1)),
         ]
 
     def mx_base(self, pages):
