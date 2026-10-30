@@ -4,6 +4,7 @@
 """Generic FlyDSL paged decode correctness test and perf sweep.
 
 Run with: python3 op_tests/test_flydsl_pa_decode.py [-k fp8 bf16 mxfp4]
+CI also runs it as `python3 -m pytest -q`, which collects the test_* functions at the end.
 """
 
 import argparse
@@ -857,7 +858,7 @@ def _check_unsupported_input(s, invalid, error, match):
 
 
 @benchmark()
-def test_pa_decode_plan(batch, max_parts, budget, window, query_length):
+def run_pa_decode_plan(batch, max_parts, budget, window, query_length):
     """Packed tasks cover every visible tile and remain valid after graph refresh.
 
     The planner is a host-side graph-safe kernel with no roofline, so it is
@@ -918,7 +919,7 @@ def test_pa_decode_plan(batch, max_parts, budget, window, query_length):
 
 
 @benchmark()
-def test_pa_decode(name, geometry):
+def run_pa_decode(name, geometry):
     """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks."""
     s = _prepare(geometry)
     case, pa, query, window = s.case, s.pa, s.query, s.case["window"]
@@ -1012,7 +1013,7 @@ def test_pa_decode(name, geometry):
 
 
 @benchmark()
-def test_pa_decode_rejects(kv, invalid, error, match):
+def run_pa_decode_rejects(kv, invalid, error, match):
     """Unsupported inputs raise the documented error before any kernel compiles."""
     if kv == "bf16":
         _check_unsupported_input(_prepare({"lengths": (1,)}), invalid, error, match)
@@ -1082,7 +1083,7 @@ def test_pa_decode_rejects(kv, invalid, error, match):
 
 
 @benchmark()
-def test_pa_decode_unowned_kv_rows(
+def run_pa_decode_unowned_kv_rows(
     kv, block_size, query_length, kv_heads, group_size, head_dim, fill
 ):
     """Rows no sequence owns contribute exactly zero, even when NaN or Inf.
@@ -1216,7 +1217,7 @@ def test_pa_decode_unowned_kv_rows(
 
 
 @benchmark()
-def test_pa_decode_mxfp4_one_task_per_row():
+def run_pa_decode_mxfp4_one_task_per_row():
     """Plan-free, one-partition plan and the pa_decode_mxfp4 entry run the same task.
 
     A strided output cannot be written directly and takes the reducer; a context-0
@@ -1368,13 +1369,139 @@ def _skipping(arch, cases, reason):
     return kept
 
 
-def main():
+def _unsupported():
+    """Why pa_decode cannot run here, or None."""
     arch = get_gfx_runtime()
     if not torch.cuda.is_available() or arch not in SUPPORTED_GFX:
-        aiter.logger.warning("pa_decode unsupported on %s; skipping", arch)
-        return
+        return f"pa_decode unsupported on {arch}"
     if importlib.util.find_spec("flydsl") is None:
-        aiter.logger.warning("FlyDSL is not installed; skipping")
+        return "FlyDSL is not installed"
+    return None
+
+
+def _plan_sweep():
+    return (
+        "pa_decode plan",
+        run_pa_decode_plan,
+        [(f"plan-{'-'.join(map(str, c))}", c) for c in _PLAN_CASES],
+    )
+
+
+def _sweeps(arch, kv_dtypes):
+    """(title, benchmark fn, cases) for the KV cache dtypes, gated on this arch."""
+    num_cu = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    decode = _skipping(
+        arch,
+        [(name, (name, geometry)) for name, geometry in _decode_cases(kv_dtypes)],
+        lambda name, geometry: _skip_reason(geometry, arch, num_cu),
+    )
+    rejects = []
+    if "bf16" in kv_dtypes:
+        # gfx1250 serves FP16 queries and plain BF16 V caches, so it rejects neither.
+        rejects += [
+            ("bf16", *c)
+            for c in _INVALID_CASES
+            if arch != "gfx1250" or c[0] not in ("fp16-query", "plain-v")
+        ]
+    if "mxfp4" in kv_dtypes and arch == "gfx950":
+        rejects += [("mxfp4", *c) for c in _MXFP4_INVALID_CASES]
+    elif "mxfp4" in kv_dtypes:
+        aiter.logger.warning("%s: skipping MXFP4 cases, which run on gfx950", arch)
+    unowned = _skipping(
+        arch,
+        [
+            (
+                "unowned-" + "-".join(map(str, (kv, block_size, *geometry, fill))),
+                (kv, block_size, *geometry, fill),
+            )
+            for kv, block_size, geometry, fill in product(
+                [kv for kv in _UNOWNED_KV if kv.split("-")[0] in kv_dtypes],
+                [16, 64, 128],
+                _UNOWNED_GEOMETRIES,
+                ["nan", "inf"],
+            )
+        ],
+        lambda kv, block_size, query_length, kv_heads, group_size, head_dim, fill: (
+            _unowned_skip_reason(kv, block_size, query_length, head_dim, arch)
+        ),
+    )
+    one_task = []
+    if "mxfp4" in kv_dtypes and arch == "gfx950":
+        one_task = [("mxfp4-one-task-per-row", ())]
+    return [
+        ("pa_decode", run_pa_decode, decode),
+        (
+            "pa_decode rejected inputs",
+            run_pa_decode_rejects,
+            [
+                (f"{kv}-{invalid}", (kv, invalid, error, match))
+                for kv, invalid, error, match in rejects
+            ],
+        ),
+        ("pa_decode unowned KV rows", run_pa_decode_unowned_kv_rows, unowned),
+        (
+            "pa_decode MXFP4 one task per row",
+            run_pa_decode_mxfp4_one_task_per_row,
+            one_task,
+        ),
+    ]
+
+
+def _run(sweeps):
+    """Run every non-empty sweep once; returns (case count, failures)."""
+    failures, total = [], 0
+    # The reference is FP32; a TF32 matmul would loosen it.
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for title, test, cases in sweeps:
+            if cases:
+                total += _sweep(title, test, cases, failures)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    return total, failures
+
+
+def _failure_report(failures, total):
+    lines = "\n".join(f"  [{t}] {tag}\n        {exc}" for t, tag, exc in failures)
+    return f"pa_decode: {len(failures)} of {total} cases FAILED\n{lines}"
+
+
+def _run_as_test(what, sweeps):
+    """Shared body of the pytest-collected tests: same sweeps, same checks."""
+    import unittest
+
+    why = _unsupported()
+    if why:
+        raise unittest.SkipTest(why)
+    total, failures = _run(sweeps())
+    if not total:
+        raise unittest.SkipTest(f"no {what} case runs on {get_gfx_runtime()}")
+    assert not failures, _failure_report(failures, total)
+
+
+# `python3 -m pytest op_tests/test_flydsl_pa_decode.py` (what CI runs) collects only
+# these zero-argument functions; the argument-taking run_* sweeps are not tests.
+def test_pa_decode_plan():
+    _run_as_test("plan", lambda: [_plan_sweep()])
+
+
+def test_pa_decode_fp8():
+    _run_as_test("FP8", lambda: _sweeps(get_gfx_runtime(), ["fp8"]))
+
+
+def test_pa_decode_bf16():
+    _run_as_test("BF16", lambda: _sweeps(get_gfx_runtime(), ["bf16"]))
+
+
+def test_pa_decode_mxfp4():
+    _run_as_test("MXFP4", lambda: _sweeps(get_gfx_runtime(), ["mxfp4"]))
+
+
+def main():
+    why = _unsupported()
+    if why:
+        aiter.logger.warning("%s; skipping", why)
         return
 
     parser = argparse.ArgumentParser(
@@ -1391,83 +1518,9 @@ def main():
         help="KV cache dtypes to sweep (default: all)",
     )
     args = parser.parse_args()
-    # The reference is FP32; a TF32 matmul would loosen it.
-    torch.backends.cuda.matmul.allow_tf32 = False
-    num_cu = torch.cuda.get_device_properties(DEVICE).multi_processor_count
-    failures, total = [], 0
-
-    total += _sweep(
-        "pa_decode plan",
-        test_pa_decode_plan,
-        [(f"plan-{'-'.join(map(str, c))}", c) for c in _PLAN_CASES],
-        failures,
-    )
-    decode = _skipping(
-        arch,
-        [(name, (name, geometry)) for name, geometry in _decode_cases(args.kv)],
-        lambda name, geometry: _skip_reason(geometry, arch, num_cu),
-    )
-    total += _sweep("pa_decode", test_pa_decode, decode, failures)
-
-    rejects = []
-    if "bf16" in args.kv:
-        # gfx1250 serves FP16 queries and plain BF16 V caches, so it rejects neither.
-        rejects += [
-            ("bf16", *c)
-            for c in _INVALID_CASES
-            if arch != "gfx1250" or c[0] not in ("fp16-query", "plain-v")
-        ]
-    if "mxfp4" in args.kv and arch == "gfx950":
-        rejects += [("mxfp4", *c) for c in _MXFP4_INVALID_CASES]
-    elif "mxfp4" in args.kv:
-        aiter.logger.warning("%s: skipping MXFP4 cases, which run on gfx950", arch)
-    total += _sweep(
-        "pa_decode rejected inputs",
-        test_pa_decode_rejects,
-        [
-            (f"{kv}-{invalid}", (kv, invalid, error, match))
-            for kv, invalid, error, match in rejects
-        ],
-        failures,
-    )
-
-    unowned = _skipping(
-        arch,
-        [
-            (
-                "unowned-" + "-".join(map(str, (kv, block_size, *geometry, fill))),
-                (kv, block_size, *geometry, fill),
-            )
-            for kv, block_size, geometry, fill in product(
-                [kv for kv in _UNOWNED_KV if kv.split("-")[0] in args.kv],
-                [16, 64, 128],
-                _UNOWNED_GEOMETRIES,
-                ["nan", "inf"],
-            )
-        ],
-        lambda kv, block_size, query_length, kv_heads, group_size, head_dim, fill: (
-            _unowned_skip_reason(kv, block_size, query_length, head_dim, arch)
-        ),
-    )
-    total += _sweep(
-        "pa_decode unowned KV rows", test_pa_decode_unowned_kv_rows, unowned, failures
-    )
-
-    if "mxfp4" in args.kv and arch == "gfx950":
-        total += _sweep(
-            "pa_decode MXFP4 one task per row",
-            test_pa_decode_mxfp4_one_task_per_row,
-            [("mxfp4-one-task-per-row", ())],
-            failures,
-        )
-
+    total, failures = _run([_plan_sweep(), *_sweeps(get_gfx_runtime(), args.kv)])
     if failures:
-        aiter.logger.error(
-            "pa_decode: %d of %d cases FAILED\n%s",
-            len(failures),
-            total,
-            "\n".join(f"  [{t}] {tag}\n        {exc}" for t, tag, exc in failures),
-        )
+        aiter.logger.error(_failure_report(failures, total))
         sys.exit(1)
     aiter.logger.info("pa_decode: all %d cases passed", total)
 
