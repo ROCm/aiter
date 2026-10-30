@@ -2,14 +2,25 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import itertools
 import math
+import os
+import subprocess
+import sys
+import tempfile
+from functools import partial
+from unittest import mock
 
 import pandas as pd
 import torch
 
 import aiter
+import aiter.ops.fused_qknorm_idxrqknorm as op
 from aiter import dtypes
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.quant import per_1x32_f4_quant
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.utility import fp4_utils
 
 HEAD_DIM = 128
 
@@ -486,6 +497,7 @@ def check_close(actual, expected, *, msg: str, rtol: float, atol: float):
     err = checkAllclose(actual.float(), expected.float(), msg=msg, rtol=rtol, atol=atol)
     if err != 0:
         raise AssertionError(f"{msg} mismatch ratio: {err}")
+    return err
 
 
 def fp8_cache_dtype() -> torch.dtype | None:
@@ -1707,7 +1719,13 @@ def run_fused_qknorm_idxrqknorm(
     mode: str,
     use_index_slot_mapping: bool,
     use_fp8_kv_cache: bool,
+    kv_dtype: str | None = None,
+    index_dtype: str | None = None,
+    q_dtype: torch.dtype | None = None,
+    index_pages: torch.Tensor | None = None,
 ):
+    """kv_dtype="mxfp4", index_dtype ("auto", "fp8", "mxfp4"), q_dtype (e4m3) and
+    index_pages (an mxfp4 index cache to write into) override what `mode` implies."""
     qkv = case["qkv"].clone()
     if mode == "inplace":
         aiter.fused_qknorm_idxrqknorm(
@@ -1735,11 +1753,22 @@ def run_fused_qknorm_idxrqknorm(
     use_fp8_index_cache = (
         use_fp8_kv_cache and not use_unit_scale_kv_cache
     ) or mode == "asm_layout_fp8_index"
+    if index_dtype is not None:
+        use_fp8_index_cache = index_dtype == "fp8"
     q_out, index_q_out, kv_cache, index_cache = make_insert_outputs(
         case,
         kv_cache_dtype=kv_cache_dtype,
         index_cache_dtype=dtypes.fp8 if use_fp8_index_cache else None,
     )
+    if q_dtype is not None:
+        q_out = torch.empty_like(q_out, dtype=q_dtype)
+    if index_dtype == "mxfp4":  # whole 8704 B pages
+        index_cache = index_pages
+        if index_cache is None:
+            pages = math.ceil(case["num_blocks"] * case["block_size"] / 128)
+            index_cache = torch.full(
+                (pages, MXFP4_PAGE), MXFP4_PAD, dtype=torch.uint8, device="cuda"
+            )
     if use_asm_layout:
         # SHUFFLE caches (separate K/V) for the page-16 asm layout.
         kv_cache_k, kv_cache_v = make_shuffle_caches(
@@ -1748,6 +1777,13 @@ def run_fused_qknorm_idxrqknorm(
     else:
         # page-128: the op takes separate K/V caches -> use the key/value slices
         # of the fused [nb, 2, bs, nkv, hd] tensor (views, so gather still works).
+        if kv_dtype == "mxfp4":  # K and V pages as views of one pool
+            kv_cache = torch.full(
+                (case["num_blocks"], 2, case["num_kv_heads"], MXFP4_PAGE),
+                MXFP4_PAD,
+                dtype=torch.uint8,
+                device="cuda",
+            )
         kv_cache_k = kv_cache[:, 0]
         kv_cache_v = kv_cache[:, 1]
     index_slot_mapping = case["index_slot_mapping"] if use_index_slot_mapping else None
@@ -1760,7 +1796,7 @@ def run_fused_qknorm_idxrqknorm(
     k_scale = None
     v_scale = None
     use_pertoken = "pertoken" in mode
-    kv_cache_dtype_arg = "auto"
+    kv_cache_dtype_arg = kv_dtype or "auto"
     if use_fp8_kv_cache:
         if use_unit_scale_kv_cache:
             # SGLang MiniMax-M3 contract: direct BF16 -> FP8 cast, no scale buffer.
@@ -1771,9 +1807,10 @@ def run_fused_qknorm_idxrqknorm(
             kv_cache_dtype_arg = "fp8_e4m3"
         else:
             raise AssertionError(f"unknown fp8 kv-cache contract for mode={mode}")
-    index_cache_dtype_arg = "fp8" if use_fp8_index_cache else "auto"
+    index_cache_dtype_arg = index_dtype or ("fp8" if use_fp8_index_cache else "auto")
 
-    aiter.fused_qknorm_idxrqknorm(
+    call = partial(
+        aiter.fused_qknorm_idxrqknorm,
         qkv,
         case["q_norm_weight"],
         case["k_norm_weight"],
@@ -1799,7 +1836,9 @@ def run_fused_qknorm_idxrqknorm(
         k_scale=k_scale,
         v_scale=v_scale,
         asm_layout=use_asm_layout,
+        skip_index_branch="skip_index" in mode,
     )
+    call()  # `call` is returned too: the op alone, on these buffers, for timing
     return (
         q_out,
         index_q_out_arg,
@@ -1810,6 +1849,8 @@ def run_fused_qknorm_idxrqknorm(
         v_scale,
         kv_cache_k,
         kv_cache_v,
+        qkv,
+        call,
     )
 
 
@@ -1839,6 +1880,15 @@ def test_fused_qknorm_idxrqknorm(
             "num_index_heads": num_index_heads,
             "status": "skipped",
         }
+
+    if mode in MXFP4_MODES:
+        return check_mxfp4(
+            mode, dtype, num_tokens, block_size, rotary_dim, use_fp8_kv_cache
+        )
+    if mode == "mxfp4_scale_rule":
+        return {"err": check_mxfp4_scale_rule(num_tokens)}
+    if mode == "mxfp4_reject":
+        return {"err": check_mxfp4_reject()}
 
     case = make_case(
         dtype=dtype,
@@ -1904,6 +1954,7 @@ def test_fused_qknorm_idxrqknorm(
             v_scale,
             kv_cache_k,
             kv_cache_v,
+            *_,
         ) = result
         check_close(q_out, refs["q"], msg=f"{msg}(q_out)", rtol=rtol, atol=atol)
         if num_index_heads > 0:
@@ -2028,6 +2079,257 @@ def test_fused_qknorm_idxrqknorm(
     }
 
 
+# MXFP4 caches and an e4m3 q_out (gfx950). The judge is this op's own "auto" mode on the
+# same case: an MXFP4 page must hold, bit for bit, per_1x32_f4_quant of the rows "auto" writes,
+# an e4m3 q_out the "auto" q clamped and cast, and every other output must equal "auto"'s.
+MXFP4_PAGE = 128 * (64 + 4)  # [128 tokens x 64 B e2m1][128 tokens x 4 B e8m0]
+MXFP4_PAD = 0xA5  # fills the pages first: a byte the op must not touch stays this
+INDEX_CASES = ("sequential", "index_skipped", "differ")
+KV_CASES = ("sequential", "shuffled", "main_skipped", "differ")
+ALL_INDEX = ("auto", "fp8", "mxfp4")
+# mode -> (kv_dtype, index dtypes, slot cases, kv head counts). The page layout and an fp8
+# main K/V come from the mode name as for the other modes; q_fp8 gives the op an e4m3 q_out.
+MXFP4_MODES = {
+    "asm_layout_mxfp4": (None, ALL_INDEX, INDEX_CASES, (1,)),
+    "asm_layout_fp8_pertoken_mxfp4": (None, ALL_INDEX, INDEX_CASES, (1,)),
+    "mxfp4_kv": ("mxfp4", ALL_INDEX, KV_CASES, (1, 2)),
+    "mxfp4_kv_skip_index": ("mxfp4", ("auto",), ("shuffled",), (1,)),
+    "q_fp8_out": (None, ("auto",), ("shuffled",), (1,)),
+    "mxfp4_kv_q_fp8_out": ("mxfp4", ("auto",), ("shuffled",), (1,)),
+}
+MXFP4 = [*MXFP4_MODES, "mxfp4_scale_rule", "mxfp4_reject"]
+ROW_BYTES = {"auto": 2 * HEAD_DIM, "fp8": HEAD_DIM, "mxfp4": 68}
+# AITER_CHECK aborts the process instead of raising: a contract violation runs in a child
+REJECT_CHILD = (
+    "import sys, torch, aiter; a, kw = torch.load(sys.argv[1]); "
+    "aiter.fused_qknorm_idxrqknorm(*a, **kw); torch.cuda.synchronize()"
+)
+
+
+def check_bytes(actual, expected, msg: str):
+    return check_close(
+        actual.view(torch.uint8), expected.view(torch.uint8), msg=msg, rtol=0, atol=0
+    )
+
+
+def mxfp4_slots(case: dict, name: str):
+    """(main slots, index slots) of a slot case; -1 marks a skipped token."""
+    seq = torch.arange(case["qkv"].size(0), dtype=torch.int64, device="cuda")
+    skipped = case["slot_mapping"].clone()
+    skipped[::3] = -1
+    return {
+        "sequential": (seq, seq),
+        "shuffled": (case["slot_mapping"],) * 2,
+        "index_skipped": (seq, skipped),
+        "main_skipped": (skipped, skipped),
+        "differ": (case["slot_mapping"], case["index_slot_mapping"]),
+    }[name]
+
+
+def mxfp4_pages(auto: torch.Tensor, slots: torch.Tensor, nh: int, pages: int):
+    """The `pages` x `nh` MXFP4 pages the write must leave, from the rows an "auto" write
+    put at `slots` (rows of `auto` are indexed by slot); the other bytes stay MXFP4_PAD.
+    """
+    want = torch.full(
+        (pages, nh, MXFP4_PAGE), MXFP4_PAD, dtype=torch.uint8, device="cuda"
+    )
+    ok = slots[slots >= 0]
+    if ok.numel() == 0:  # per_1x32_f4_quant cannot take zero rows
+        return want
+    rows = auto.reshape(-1, nh, HEAD_DIM)[ok]
+    q, s = per_1x32_f4_quant(rows.reshape(-1, HEAD_DIM))
+    data = q.view(torch.uint8).reshape(-1, nh, 64)
+    scale = s.view(torch.uint8).reshape(-1, 4)[: ok.numel() * nh].reshape(-1, nh, 4)
+    # An all-zero group: per_1x32_f4_quant gives e8m0 0, outside what the fp4 score kernel
+    # supports; the op's rule (indexer_fp4_scale_e8m0 in cache_kernels.cu) clamps amax to eps
+    # and gives 1. Data bytes are 0 either way.
+    zero = rows.float().reshape(-1, nh, 4, 32).abs().amax(-1) == 0
+    scale = torch.where(zero & (scale == 0), torch.ones_like(scale), scale)
+    strides = (nh * MXFP4_PAGE, MXFP4_PAGE)
+    d = torch.as_strided(want, (pages, nh, 128, 64), (*strides, 64, 1))
+    sc = torch.as_strided(want, (pages, nh, 128, 4), (*strides, 4, 1), 128 * 64)
+    d[ok // 128, :, ok % 128] = data
+    sc[ok // 128, :, ok % 128] = scale
+    return want
+
+
+def mxfp4_dequant(data: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    f = fp4_utils.mxfp4_to_f32(data.reshape(-1, 64).clone())
+    return f * fp4_utils.e8m0_to_f32(scale.reshape(-1, 4)).repeat_interleave(32, -1)
+
+
+def check_mxfp4(mode, dtype, num_tokens, block_size, rotary_dim, use_fp8_kv_cache):
+    kv_dtype, index_dtypes, slot_cases, nkvs = MXFP4_MODES[mode]
+    q_fp8 = "q_fp8" in mode
+    run = partial(
+        run_fused_qknorm_idxrqknorm,
+        mode=mode,
+        use_index_slot_mapping=True,
+        use_fp8_kv_cache=use_fp8_kv_cache,
+    )
+    new_case = partial(
+        make_case,
+        dtype=dtype,
+        num_tokens=num_tokens,
+        block_size=block_size,
+        num_index_heads=1,
+        rotary_dim=rotary_dim,
+    )
+    ret, err = {"gfx": get_gfx()}, 0
+    for nkv, slot_case in itertools.product(nkvs, slot_cases):
+        case = new_case(num_kv_heads=nkv)
+        case["slot_mapping"], case["index_slot_mapping"] = mxfp4_slots(case, slot_case)
+        # a zero row (amax 0, the eps clamp), a half-zero row and an outlier in the index K
+        ik = case["qkv"][:, -HEAD_DIM:]
+        ik[0] = 0
+        ik[2:3, ::2] = 0
+        ik[3:4, 5] = 3e4
+        if q_fp8:  # the norm erases a scaled qkv: scale its weight to pass the e4m3 max
+            w = case["q_norm_weight"] * 5000
+            w[5], w[70] = float("inf"), float("nan")
+            case["q_norm_weight"] = w
+        (bq, biq, _, bic, _, bks, bvs, bkc, bvc, *_), _ = run(case, index_dtype="auto")
+        if kv_dtype == "mxfp4":
+            pages = case["num_blocks"]
+            bkc, bvc = (
+                mxfp4_pages(b, case["slot_mapping"], nkv, pages) for b in (bkc, bvc)
+            )
+        variants = [{"index_dtype": i} for i in index_dtypes]
+        if q_fp8:
+            variants = [
+                {"index_dtype": "auto", "q_dtype": q} for q in (dtypes.fp8, torch.uint8)
+            ]
+        for v in variants:
+            idx = v["index_dtype"]
+            (q, iq, _, ic, _, ks, vs, kc, vc, qkv, call), _ = run(
+                case, kv_dtype=kv_dtype, **v
+            )
+            wic = bic
+            if idx == "mxfp4":
+                wic = mxfp4_pages(bic, case["index_slot_mapping"], 1, ic.shape[0])
+            elif idx == "fp8":
+                wic = bic.to(dtypes.fp8)
+            pairs = [("q_out", q, bq), ("k_scale", ks, bks), ("v_scale", vs, bvs)]
+            pairs += [("kv_cache_k", kc, bkc), ("kv_cache_v", vc, bvc)]
+            pairs += [("index_cache", ic, wic.reshape(ic.shape))]
+            if "skip_index" not in mode:  # the skipped index q is left uninitialised
+                pairs += [("index_q_out", iq, biq)]
+            if q_fp8:  # the "auto" q clamped to +-max and cast, NaN stays NaN
+                qf, fp8_max = bq.float(), torch.finfo(dtypes.fp8).max
+                assert (
+                    (qf.abs() > fp8_max).any() and qf.isinf().any() and qf.isnan().any()
+                )
+                nan = qf.isnan()
+                assert q.view(dtypes.fp8)[nan].float().isnan().all()
+                want = qf.clamp(-fp8_max, fp8_max).to(dtypes.fp8).view(torch.uint8)
+                pairs[0] = ("q_out", q, torch.where(nan, q.view(torch.uint8), want))
+                pairs += [("qkv", qkv, case["qkv"])]  # not written back either
+            for name, got, want in pairs:
+                if got is not None:
+                    msg = f"{mode} {idx} {slot_case} {name}: "
+                    err = max(err, check_bytes(got, want, msg))
+            if slot_case == slot_cases[0] and nkv == nkvs[0] and not q_fp8:
+                _, us = run_perftest(call, num_iters=50, num_warmup=50)  # the op alone
+                kv_row = ROW_BYTES[kv_dtype or ("fp8" if use_fp8_kv_cache else "auto")]
+                nbytes = case["qkv"].nbytes + q.nbytes + iq.nbytes
+                nbytes += num_tokens * (2 * nkv * kv_row + ROW_BYTES[idx])
+                ret[f"{idx} us"] = us
+                ret[f"{idx} TB/s"] = nbytes / us / 1e6
+    if mode == "asm_layout_mxfp4":
+        # Rewriting a slot replaces all 68 bytes (b over a, same pages), and the pages read
+        # back the way a consumer addresses them (data at token * 64, scale at 128 * 64 +
+        # token * 4) dequantize to the reference quantization.
+        a, b = new_case(num_kv_heads=1, seed=1), new_case(num_kv_heads=1, seed=2)
+        for c in (a, b):
+            c["slot_mapping"], c["index_slot_mapping"] = mxfp4_slots(c, "sequential")
+        pages = run(a, index_dtype="mxfp4")[0][3]
+        run(b, index_dtype="mxfp4", index_pages=pages)
+        ref, n = run(b, index_dtype="auto")[0][3], pages.shape[0]
+        want = mxfp4_pages(ref, b["index_slot_mapping"], 1, n)
+        err = max(err, check_bytes(pages, want.view(n, -1), "rewritten slots: "))
+        kd = torch.as_strided(pages, (n, 128, 64), (MXFP4_PAGE, 64, 1))
+        ks = torch.as_strided(pages, (n, 128, 4), (MXFP4_PAGE, 4, 1), 128 * 64)
+        q, s = per_1x32_f4_quant(ref.reshape(-1, HEAD_DIM)[:num_tokens])
+        s = s.view(torch.uint8).reshape(-1, 4)[:num_tokens]
+        got = mxfp4_dequant(kd, ks)[:num_tokens]
+        assert torch.equal(got, mxfp4_dequant(q.view(torch.uint8), s))
+    return {**ret, "err": err}
+
+
+def check_mxfp4_scale_rule(num_tokens: int):
+    """per_1x32_f4_quant, the judge above, against the bit-level definition of the HIP e8m0
+    rule (indexer_fp4_scale_e8m0 in cache_kernels.cu): ceil(log2(max(amax, eps) / 6)).
+    """
+    torch.manual_seed(0)
+    mag = torch.exp2(torch.randint(-12, 12, (num_tokens, 1), device="cuda").float())
+    x = (torch.randn(num_tokens, HEAD_DIM, device="cuda") * mag).to(torch.bfloat16)
+    s = per_1x32_f4_quant(x)[1].view(torch.uint8).reshape(-1)
+    amax = x.float().reshape(-1, 32).abs().amax(-1)
+    bits = (amax.clamp(min=6.0 * 2.0**-126) * (1.0 / 6.0)).view(torch.int32)
+    e = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    return check_bytes(s[: e.numel()], e.to(torch.uint8), "e8m0 rule: ")
+
+
+def check_mxfp4_reject():
+    """Each contract violation is refused ("good" shows the harness is sound). Returns 0:
+    there is no numeric error, the expected refusal happened."""
+    bf16, zeros8 = torch.bfloat16, partial(
+        torch.zeros, dtype=torch.uint8, device="cuda"
+    )
+    case = partial(
+        make_case, dtype=bf16, num_tokens=32, num_kv_heads=1, num_index_heads=1
+    )
+    run = partial(
+        run_fused_qknorm_idxrqknorm, use_index_slot_mapping=True, use_fp8_kv_cache=False
+    )
+    # the op call (a partial) of a valid page-16 / mxfp4 main K/V / e4m3 q_out configuration
+    page16 = run(case(block_size=16), mode="asm_layout", index_dtype="mxfp4")[0][-1]
+    kv = run(
+        case(block_size=128), mode="mxfp4_kv", kv_dtype="mxfp4", index_dtype="mxfp4"
+    )[0][-1]
+    q8 = run(case(block_size=128), mode="q_fp8_out", q_dtype=dtypes.fp8)[0][-1]
+    # name -> (call, {positional index: replacement}, kwargs); 14 is V, 15 the index cache
+    cases = {
+        "good": (page16, {}, {}),
+        "not_uint8": (
+            page16,
+            {15: torch.zeros(1, 128, HEAD_DIM, dtype=bf16, device="cuda")},
+            {},
+        ),
+        "partial_page": (page16, {15: zeros8(MXFP4_PAGE + 128)}, {}),
+        "skip_index_branch": (page16, {}, {"skip_index_branch": True}),
+        "kv_mxfp4_small_index": (kv, {15: zeros8(128)}, {}),
+        "kv_mxfp4_few_index_pages": (kv, {15: zeros8(MXFP4_PAGE)}, {}),
+        "kv_mxfp4_v_pages": (kv, {14: kv.args[14][:1]}, {}),
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, (call, edits, kwargs) in cases.items():
+            args = [edits.get(i, a) for i, a in enumerate(call.args)]
+            path = os.path.join(tmp, name)
+            torch.save((args, {**call.keywords, **kwargs}), path)
+            cmd = [sys.executable, "-c", REJECT_CHILD, path]
+            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if name == "good":
+                assert r.returncode == 0, r.stderr[-500:]
+            else:
+                assert r.returncode != 0, name
+                assert "mxfp4" in r.stderr or "index" in r.stderr, r.stderr[-500:]
+    # Where opus converts to fp4/fp8 as zeros the wrapper raises: fake the arch
+    for call, gfx, msg in (
+        (page16, "gfx942", "gfx950"),
+        (kv, "gfx942", "gfx950"),
+        (q8, "gfx1100", "fp8 q_out"),
+    ):
+        with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
+            try:
+                call()
+            except RuntimeError as e:
+                assert msg in str(e), e
+            else:
+                raise AssertionError(f"accepted on {gfx}: {call.keywords}")
+    return 0
+
+
 DEFAULT_CASES = [
     ("insert", "bf16", 1, 16, 64, 4),
     ("insert", "bf16", 17, 16, 64, 4),
@@ -2053,6 +2355,21 @@ DEFAULT_CASES = [
     ("asm_layout_fp8_pertoken", "fp16", 19, 16, 96, 4),
     ("asm_layout_fp8_pertoken_uint8", "bf16", 17, 16, 64, 4),
 ]
+DEFAULT_CASES += [
+    (mode, dtype_name, num_tokens, 16 if mode.startswith("asm_layout") else 128, 64, 1)
+    for mode in MXFP4_MODES
+    for dtype_name in ("bf16", "fp16")
+    for num_tokens in (1, 300, 1031, 16384)
+] + [
+    ("mxfp4_scale_rule", "bf16", 4096, 128, 64, 1),
+    ("mxfp4_reject", "bf16", 32, 16, 64, 1),
+]
+if get_gfx() != "gfx950":
+    aiter.logger.warning(
+        "mxfp4 caches and the e4m3 q_out are tested on gfx950 only, not %s: skipping",
+        get_gfx(),
+    )
+    DEFAULT_CASES = [case for case in DEFAULT_CASES if case[0] not in MXFP4]
 
 l_mode = [
     "insert",
@@ -2066,6 +2383,7 @@ l_mode = [
     "fp8_kv_cache_pertoken_uint8",
     "asm_layout_fp8_pertoken",
     "asm_layout_fp8_pertoken_uint8",
+    *MXFP4,
 ]
 l_dtype = ["fp16", "bf16"]
 
@@ -2202,6 +2520,7 @@ if args.minimax_benchmark:
     )
 
 df = []
+mxfp4_rows = []
 for (
     mode,
     dtype_name,
@@ -2218,7 +2537,7 @@ for (
         rotary_dim=rotary_dim,
         num_index_heads=num_index_heads,
     )
-    df.append(ret)
+    (mxfp4_rows if mode in MXFP4 else df).append(ret)
 
 df = pd.DataFrame(df)
 if args.minimax_tp4:
@@ -2246,3 +2565,8 @@ elif args.minimax_benchmark:
 else:
     df_md = df.to_markdown(index=False)
     aiter.logger.info("fused_qknorm_idxrqknorm summary (markdown):\n%s", df_md)
+    if mxfp4_rows:
+        df_md = pd.DataFrame(mxfp4_rows).to_markdown(index=False)
+        aiter.logger.info(
+            "fused_qknorm_idxrqknorm mxfp4 summary (markdown):\n%s", df_md
+        )
