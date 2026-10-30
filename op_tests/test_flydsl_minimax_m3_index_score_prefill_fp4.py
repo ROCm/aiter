@@ -13,16 +13,18 @@ x `e8m0_to_f32` dequantizes, and aiter's `pa_sparse_block_score_prefill` (plus t
 FlyDSL kernel) scores the dequantized values as fp8 -- nothing from the kernel under
 test. e8m0 bytes 0 and 255 are outside its contract and are not generated.
 
-Run:
-    python op_tests/test_flydsl_minimax_m3_index_score_prefill_fp4.py
+Run (exits nonzero if any check fails):
+    python op_tests/test_flydsl_minimax_m3_index_score_prefill_fp4.py [--case SUBSTR ...] [--no-perf]
 """
 
 import argparse
 import itertools
+import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pandas as pd
-import pytest
 import torch
 
 import aiter
@@ -36,17 +38,22 @@ from aiter.ops.msa_block_select import pa_sparse_block_score_prefill
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
+from op_tests.test_flydsl_minimax_m3_index_score import (
+    GEOM_SHAPES,
+    LOG2E,
+    PREFILL_SHAPES,
+    SENTINEL,
+    D,
+    P,
+    _prefill_work,
+    aiter_scores,
+    assert_matches_aiter,
+    make_prefill_case,
+    prefill_alloc_score,
+    run_prefill,
+)
 
-try:
-    from op_tests import test_flydsl_minimax_m3_index_score as fp8_test
-except ImportError:  # run as a script from op_tests/
-    import test_flydsl_minimax_m3_index_score as fp8_test
-
-SENTINEL = fp8_test.SENTINEL
-LOG2E = fp8_test.LOG2E
-P, D = fp8_test.P, fp8_test.D
 SUPPORTED_GFX = ["gfx950"]  # the FlyDSL scorers are built for gfx950
-requires_gfx950 = fp8_test.requires_gfx950
 QCHUNK = 512  # pages quantized per torch call; the reference makes fp32 temporaries
 
 
@@ -96,12 +103,6 @@ def single_region_views(data, scale):
     return kd, ks
 
 
-@pytest.fixture(params=["bf16", "e4m3"], ids=["qbf16", "qe4m3"])
-def qdt(request):
-    """The dtype the query reaches the scorer in."""
-    return request.param
-
-
 # ---------------------------------------------------------------------------
 # Prefill. Two independent judges on the SAME dequantized values: aiter's
 # `pa_sparse_block_score_prefill` and the fp8 FlyDSL prefill scorer, both fed
@@ -114,7 +115,7 @@ def fp4_prefill_case(batch, q_len, ctx_len, heads=1, seed=0):
     """A fp8 prefill case whose cache is re-quantized to MXFP4. Returns the
     case (cache = the dequantized values as fp8, for the judges) and the two
     MXFP4 views."""
-    c = fp8_test.make_prefill_case(batch, q_len, ctx_len, heads, seed)
+    c = make_prefill_case(batch, q_len, ctx_len, heads, seed)
     kd, ks, deq = fp4_cache_of(c["cache"])
     as_fp8 = deq.to(dtypes.fp8)
     assert torch.equal(as_fp8.to(torch.bfloat16), deq), "left e4m3's exact range"
@@ -126,7 +127,7 @@ def run_fp4(c, kd, ks, qdt="bf16", out=None):
     (the case's query came from e4m3, so both are the same numbers)."""
     heads, rows = c["q8"].shape[1], c["q8"].shape[0]
     if out is None:
-        out = fp8_test.prefill_alloc_score(rows, heads, c["mb"], "cuda")
+        out = prefill_alloc_score(rows, heads, c["mb"], "cuda")
         out.fill_(SENTINEL)
     score_prefill_flydsl_fp4(
         c["q_bf16"] if qdt == "bf16" else c["q8"],
@@ -189,7 +190,7 @@ def mixed_lengths_case():
 
 # The fp8 cases' shapes, plus short-context / long-query ones and a multi-request
 # chunk with a long prefix.
-SHAPES = fp8_test.PREFILL_SHAPES + [
+SHAPES = PREFILL_SHAPES + [
     (1, 8192, 8192),
     (1, 7000, 7000),
     (2, 4096, 20000),
@@ -198,49 +199,39 @@ SHAPES = fp8_test.PREFILL_SHAPES + [
 ]
 
 
-@requires_gfx950
-@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: f"b{s[0]}_q{s[1]}_ctx{s[2]}")
-def test_prefill_matches_aiter_and_fp8_kernel(shape, qdt):
+def check_prefill_matches_aiter_and_fp8_kernel(shape, qdt):
     c, kd, ks = fp4_prefill_case(*shape)
-    ref, live = fp8_test.aiter_scores(c)
+    ref, live = aiter_scores(c)
     got = run_fp4(c, kd, ks, qdt)
-    fp8_test.assert_matches_aiter(got, ref, live, f"{shape}")
-    assert torch.equal(got[live], fp8_test.run_prefill(c)[live])
+    assert_matches_aiter(got, ref, live, f"{shape}")
+    assert torch.equal(got[live], run_prefill(c)[live])
 
 
-@requires_gfx950
-@pytest.mark.parametrize(
-    "shape", fp8_test.GEOM_SHAPES, ids=lambda s: f"b{s[0]}_q{s[1]}_ctx{s[2]}"
-)
-def test_prefill_every_geometry(shape, qdt):
+def check_prefill_every_geometry(shape, qdt):
     c, kd, ks = fp4_prefill_case(*shape)
-    ref, live = fp8_test.aiter_scores(c)
-    fp8_test.assert_matches_aiter(run_fp4(c, kd, ks, qdt), ref, live, f"{shape}")
+    ref, live = aiter_scores(c)
+    assert_matches_aiter(run_fp4(c, kd, ks, qdt), ref, live, f"{shape}")
 
 
-@requires_gfx950
-def test_prefill_two_heads(qdt):
+def check_prefill_two_heads(qdt):
     c, kd, ks = fp4_prefill_case(2, 256, 3000, heads=2)
-    ref, live = fp8_test.aiter_scores(c)
-    fp8_test.assert_matches_aiter(run_fp4(c, kd, ks, qdt), ref, live, "heads=2")
+    ref, live = aiter_scores(c)
+    assert_matches_aiter(run_fp4(c, kd, ks, qdt), ref, live, "heads=2")
 
 
-@requires_gfx950
-@pytest.mark.parametrize("ctx", [1, 127, 128, 129, 1000, 4097])
-def test_prefill_ragged_tails(ctx):
+def check_prefill_ragged_tails(ctx):
     """Lengths off a page boundary: the tail of the last page holds whatever the
     cache holds, and must not reach a live score."""
     c, kd, ks = fp4_prefill_case(3, min(ctx, 128), ctx)
-    ref, live = fp8_test.aiter_scores(c)
-    fp8_test.assert_matches_aiter(run_fp4(c, kd, ks), ref, live, f"ctx={ctx}")
+    ref, live = aiter_scores(c)
+    assert_matches_aiter(run_fp4(c, kd, ks), ref, live, f"ctx={ctx}")
 
 
-@requires_gfx950
-def test_prefill_scale_extremes(qdt):
+def check_prefill_scale_extremes(qdt):
     """Per-token magnitudes spread over 2^-3 .. 2^3, so the e8m0 bytes walk across
     the window e4m3 can still hold exactly: the scale really is applied per lane
     group and per token, not once."""
-    c = fp8_test.make_prefill_case(2, 256, 3000)
+    c = make_prefill_case(2, 256, 3000)
     span = torch.randint(-3, 4, (c["cache"].shape[0], P, 1), device="cuda")
     k = c["cache"].to(torch.bfloat16) * (2.0 ** span.to(torch.bfloat16))
     kd, ks, deq = quantize_mxfp4(k)
@@ -248,12 +239,11 @@ def test_prefill_scale_extremes(qdt):
     assert torch.equal(as_fp8.to(torch.bfloat16), deq), "left e4m3's exact range"
     assert ks.min() < ks.max() - 6
     c = dict(c, cache=as_fp8)
-    ref, live = fp8_test.aiter_scores(c)
-    fp8_test.assert_matches_aiter(run_fp4(c, kd, ks, qdt), ref, live, "scales")
+    ref, live = aiter_scores(c)
+    assert_matches_aiter(run_fp4(c, kd, ks, qdt), ref, live, "scales")
 
 
-@requires_gfx950
-def test_prefill_ragged_batch_and_garbage_tails(qdt):
+def check_prefill_ragged_batch_and_garbage_tails(qdt):
     """Unequal lengths, and the bytes past each request's end overwritten with 0xFF
     (e8m0 255 and NaN-ish nibbles): live scores do not move."""
     c, kd, ks = fp4_prefill_case(3, 128, 1500)
@@ -271,19 +261,17 @@ def test_prefill_ragged_batch_and_garbage_tails(qdt):
     poisoned = run_fp4(c, kd2, ks2, qdt)
     live = base != SENTINEL
     assert torch.equal(base[live], poisoned[live])
-    ref, ref_live = fp8_test.aiter_scores(c)
-    fp8_test.assert_matches_aiter(base, ref, ref_live, "ragged lengths")
+    ref, ref_live = aiter_scores(c)
+    assert_matches_aiter(base, ref, ref_live, "ragged lengths")
 
 
-@requires_gfx950
-def test_prefill_mixed_query_lengths_and_trailing_empty_request(qdt):
+def check_prefill_mixed_query_lengths_and_trailing_empty_request(qdt):
     c, kd, ks, ref, live = mixed_lengths_case()
     got = run_fp4(c, kd, ks, qdt)
-    fp8_test.assert_matches_aiter(got, ref, live, "mixed lengths + trailing empty")
+    assert_matches_aiter(got, ref, live, "mixed lengths + trailing empty")
 
 
-@requires_gfx950
-def test_prefill_e4m3_q_strided_and_single_region():
+def check_prefill_e4m3_q_strided_and_single_region():
     """A strided e4m3 query (rows and heads padded, as a packed qkv output would hand
     it over) and single-region pages (data and scale views of one [pages, 8704]
     buffer) score like the plain inputs, bit for bit."""
@@ -299,30 +287,67 @@ def test_prefill_e4m3_q_strided_and_single_region():
     assert torch.equal(plain, run_fp4(c, kd1, ks1, "e4m3"))
 
 
-@requires_gfx950
-def test_prefill_rejections():
+def expect_value_error(what, fn, *args, match=None):
+    """`fn(*args)` must raise ValueError (whose message contains `match`)."""
+    try:
+        fn(*args)
+    except ValueError as e:
+        assert match is None or match in str(e), f"{what}: wrong message: {e}"
+        return
+    raise AssertionError(f"{what}: no ValueError")
+
+
+def check_prefill_rejections():
     c, kd, ks = fp4_prefill_case(1, 128, 1000)
     args = (c["cu"], c["seq"], c["prefix"], c["max_q"], c["max_seq"], 1.0 / LOG2E)
     f = score_prefill_flydsl_fp4
     bad_rows = torch.zeros(128, 1, D + 8, dtype=dtypes.fp8, device="cuda")[:, :, :D]
-    with pytest.raises(ValueError):
-        f(c["q_bf16"], kd.view(torch.int8), ks, c["bt"], *args)
-    with pytest.raises(ValueError):
-        f(c["q_bf16"], kd, ks[:, :, :2], c["bt"], *args)
-    with pytest.raises(ValueError, match="block_table"):
-        f(c["q_bf16"], kd, ks, c["bt"][:, :2], *args)
-    with pytest.raises(ValueError):  # fp16 is neither bf16 nor e4m3
-        f(c["q_bf16"].half(), kd, ks, c["bt"], *args)
-    with pytest.raises(ValueError, match="16-byte aligned"):
-        f(bad_rows, kd, ks, c["bt"], *args)
+    expect_value_error(
+        "int8 k_data", f, c["q_bf16"], kd.view(torch.int8), ks, c["bt"], *args
+    )
+    expect_value_error(
+        "narrow k_scale", f, c["q_bf16"], kd, ks[:, :, :2], c["bt"], *args
+    )
+    expect_value_error(
+        "narrow block_table",
+        f,
+        c["q_bf16"],
+        kd,
+        ks,
+        c["bt"][:, :2],
+        *args,
+        match="block_table",
+    )
+    # fp16 is neither bf16 nor e4m3
+    expect_value_error("fp16 q", f, c["q_bf16"].half(), kd, ks, c["bt"], *args)
+    expect_value_error(
+        "misaligned q rows",
+        f,
+        bad_rows,
+        kd,
+        ks,
+        c["bt"],
+        *args,
+        match="16-byte aligned",
+    )
     seq_strided = torch.stack([c["seq"], c["seq"]], dim=1)[:, 0]
     assert seq_strided.stride() == (2,)
-    with pytest.raises(ValueError, match="seq_lens"):
-        f(c["q_bf16"], kd, ks, c["bt"], c["cu"], seq_strided, *args[2:])
+    expect_value_error(
+        "strided seq_lens",
+        f,
+        c["q_bf16"],
+        kd,
+        ks,
+        c["bt"],
+        c["cu"],
+        seq_strided,
+        *args[2:],
+        match="seq_lens",
+    )
 
 
 def _prefill_bytes(batch, q_len, ctx_len, k_row_bytes, q_elem_bytes):
-    pairs, pages = fp8_test._prefill_work(batch, q_len, ctx_len)
+    pairs, pages = _prefill_work(batch, q_len, ctx_len)
     return (
         pages * P * k_row_bytes  # K, read once at best
         + batch * q_len * D * q_elem_bytes  # Q
@@ -330,20 +355,17 @@ def _prefill_bytes(batch, q_len, ctx_len, k_row_bytes, q_elem_bytes):
     )
 
 
-@pytest.mark.skip(
-    reason="perf sweep: run via python op_tests/test_flydsl_minimax_m3_index_score_prefill_fp4.py"
-)
 @benchmark()
-def test_prefill_fp4_perf(batch, q_len, ctx_len):
+def bench_prefill_fp4(batch, q_len, ctx_len):
     c, kd, ks = fp4_prefill_case(batch, q_len, ctx_len)
-    ref, live = fp8_test.aiter_scores(c)
+    ref, live = aiter_scores(c)
     ret = {"gfx": get_gfx()}
     fp4_row = D // 2 + D // 32  # e2m1 data + e8m0 scales per token
     # Every candidate scores into its own preallocated, sentinel-filled buffer, so the
     # timed region is the scorer alone (no allocation or fill launch).
     heads, rows = c["q8"].shape[1], c["q8"].shape[0]
     outs = {
-        n: fp8_test.prefill_alloc_score(rows, heads, c["mb"], "cuda")
+        n: prefill_alloc_score(rows, heads, c["mb"], "cuda")
         for n in ("fp8", "fp4", "fp4_q8")
     }
     for o in outs.values():
@@ -373,7 +395,7 @@ def test_prefill_fp4_perf(batch, q_len, ctx_len):
             1,
         ),
     }
-    pairs, _ = fp8_test._prefill_work(batch, q_len, ctx_len)
+    pairs, _ = _prefill_work(batch, q_len, ctx_len)
     flops = 2 * pairs * P * D
     for name, (run, k_row, q_elem) in cands.items():
         got, us = run_perftest(run, num_iters=10, num_rotate_args=1)
@@ -391,8 +413,68 @@ def test_prefill_fp4_perf(batch, q_len, ctx_len):
     return ret
 
 
+QDTS = ["bf16", "e4m3"]  # the dtype the query reaches the scorer in
+
+
+def build_cases():
+    """(name, check, args): one row per case; the same set the pytest matrix had."""
+    cases = []
+    for shape, qdt in itertools.product(SHAPES, QDTS):
+        name = f"b{shape[0]}_q{shape[1]}_ctx{shape[2]}_{qdt}"
+        cases.append(
+            (
+                f"matches_aiter_and_fp8_kernel_{name}",
+                check_prefill_matches_aiter_and_fp8_kernel,
+                (shape, qdt),
+            )
+        )
+    for shape, qdt in itertools.product(GEOM_SHAPES, QDTS):
+        name = f"b{shape[0]}_q{shape[1]}_ctx{shape[2]}_{qdt}"
+        cases.append(
+            (f"every_geometry_{name}", check_prefill_every_geometry, (shape, qdt))
+        )
+    for qdt in QDTS:
+        cases.append((f"two_heads_{qdt}", check_prefill_two_heads, (qdt,)))
+    for ctx in [1, 127, 128, 129, 1000, 4097]:
+        cases.append((f"ragged_tails_ctx{ctx}", check_prefill_ragged_tails, (ctx,)))
+    for qdt in QDTS:
+        cases.append((f"scale_extremes_{qdt}", check_prefill_scale_extremes, (qdt,)))
+        cases.append(
+            (
+                f"ragged_batch_and_garbage_tails_{qdt}",
+                check_prefill_ragged_batch_and_garbage_tails,
+                (qdt,),
+            )
+        )
+        cases.append(
+            (
+                f"mixed_query_lengths_trailing_empty_{qdt}",
+                check_prefill_mixed_query_lengths_and_trailing_empty_request,
+                (qdt,),
+            )
+        )
+    cases.append(
+        (
+            "e4m3_q_strided_and_single_region",
+            check_prefill_e4m3_q_strided_and_single_region,
+            (),
+        )
+    )
+    cases.append(("rejections", check_prefill_rejections, ()))
+    return cases
+
+
 def parse_args(argv=None):
-    ap = argparse.ArgumentParser(description="MXFP4 prefill index score sweep")
+    ap = argparse.ArgumentParser(description="MXFP4 prefill index score checks + sweep")
+    ap.add_argument(
+        "--case",
+        nargs="*",
+        default=None,
+        help="run only the correctness cases whose name contains one of these",
+    )
+    ap.add_argument(
+        "--no-perf", action="store_true", help="correctness cases only, no perf table"
+    )
     ap.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 4])
     ap.add_argument("--q-len", type=int, nargs="*", default=[512, 4096])
     ap.add_argument("--ctx-len", type=int, nargs="*", default=[8192, 32768])
@@ -405,21 +487,38 @@ def main(argv=None):
         aiter.logger.warning("requires %s; skipping", SUPPORTED_GFX)
         return 0
     aiter.logger.info("mxfp4 prefill: running correctness checks...")
-    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
-    if status != pytest.ExitCode.OK:
+    rows = []
+    for name, check, cargs in build_cases():
+        if args.case is not None and not any(k in name for k in args.case):
+            continue
+        try:
+            check(*cargs)
+            rows.append({"case": name, "status": "PASS", "detail": ""})
+        except (AssertionError, RuntimeError, ValueError) as e:  # list every failure
+            rows.append({"case": name, "status": "FAIL", "detail": repr(e)[:200]})
+    if rows:
+        aiter.logger.info(
+            "mxfp4 prefill checks (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
+    else:
+        aiter.logger.warning("Empty selection; no checks executed")
+    failed = [r["case"] for r in rows if r["status"] != "PASS"]
+    if failed:
         aiter.logger.error(
-            "mxfp4 prefill: checks failed (pytest exit %s); skipping perf sweep",
-            int(status),
+            "mxfp4 prefill: %d of %d checks failed: %s", len(failed), len(rows), failed
         )
         return 1
-    rows = [
-        test_prefill_fp4_perf(b, q, c)
+    if args.no_perf:
+        return 0
+    perf = [
+        bench_prefill_fp4(b, q, c)
         for b, q, c in itertools.product(args.batch, args.q_len, args.ctx_len)
         if q <= c
     ]
     aiter.logger.info(
         "mxfp4 prefill summary (markdown):\n%s",
-        pd.DataFrame(rows).to_markdown(index=False),
+        pd.DataFrame(perf).to_markdown(index=False),
     )
     return 0
 
