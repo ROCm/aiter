@@ -51,3 +51,4 @@ gfx1250,256,4096,36864,7168,asm,0,0,148.9218,_ZN5aiter44f4gemm_bf16_mxfp4_BpreSh
 gfx1250,256,8192,36864,7168,asm,0,0,321.0282,_ZN5aiter44f4gemm_bf16_mxfp4_BpreShuffle_256x256_4x4_psE,13485.82,2384.4,0.0
 gfx1250,256,16384,36864,7168,flydsl,12268,1,651.577,flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm4_cn4,13288.77,2165.1,0.0
 gfx1250,256,32768,36864,7168,flydsl,12268,1,1278.0524,flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm4_cn4,13549.76,2097.78,0.0
+gfx1250,256,16384,16384,16384,flydsl,12268,1,0,flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm4_cn4,0,0,0

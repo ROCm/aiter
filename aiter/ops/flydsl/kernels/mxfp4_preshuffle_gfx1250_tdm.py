@@ -342,6 +342,13 @@ def launch_gemm_a8w4_tdm(
     inline_zero_acc = all((bool(a_is_fp4), bool(a_preshuffled), tmnk256_wpmn2_b4,
                            cluster_m == 1, bool(next_stage_on),
                            K // tile_k > num_buffers))
+    # Interleave M16 blocks only on the v80-compatible GEMM1 layout.
+    # Other shapes and stages retain their original row mapping and loop.
+    interleaved_m_rows = all((inline_zero_acc, stage1_act == 1,
+                              bool(stage1_quant_out), cluster_n == 4,
+                              not row_major_ascale, not tdm_as_in_prologue,
+                              K % tile_k == 0))
+    M_ROW_STEP = 32 if interleaved_m_rows else 16
     # Keep the complex guard out of the nested task's rewritten bytecode.
     use_early_wave_sched = a_is_fp4 and a_preshuffled and tmnk256_wpmn2_b4
     fp4_prefill = use_spec_prefill_opt and cluster_m > 1
@@ -1130,7 +1137,7 @@ def launch_gemm_a8w4_tdm(
                     )
                     fx.copy(job.atom, job.gt, destination)
 
-        wmb = wave_m * warp_tile_m
+        wmb = wave_m * (16 if interleaved_m_rows else warp_tile_m)
         wnb = wave_n * warp_tile_n
 
         # Split each region's offset into a lane-varying base, which keepalive
@@ -1147,7 +1154,11 @@ def launch_gemm_a8w4_tdm(
         lds_sa_lane_off = (
             (wave_m * warp_tile_m + sa_lane) * SA_KDW * 4
             if row_major_ascale
-            else wave_m * (AS_INNER * 4) + sa_lane * 4
+            else (
+                (wave_m * 16 + lane16 + (lane // 16) * 32) * 4
+                if interleaved_m_rows
+                else wave_m * (AS_INNER * 4) + sa_lane * 4
+            )
         )
         # One full-wave load covers both 16-column halves of an N32 scale
         # super-row. WMMA opsel_a selects lane 0:15 or 16:31 for each wn.
@@ -1229,9 +1240,9 @@ def launch_gemm_a8w4_tdm(
 
         def load_a(base, wm, ksl):
             off = (
-                wm * 16 * A_ROW_B + ksl * 1024
+                wm * M_ROW_STEP * A_ROW_B + ksl * 1024
                 if a_preshuffled
-                else wm * 16 * A_LDS_ROW + ksl * A_KSTEP
+                else wm * M_ROW_STEP * A_LDS_ROW + ksl * A_KSTEP
             )
             if const_expr(a_is_fp4):
                 return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
@@ -1264,7 +1275,12 @@ def launch_gemm_a8w4_tdm(
             return load_half(wn)
 
         def load_sa(base, sm, ksl, kt):
-            off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
+            # Select two interleaved M16 blocks from the unchanged scale layout.
+            off = (
+                ((sm // 2) * AS_INNER + (sm % 2) * 64 + ksl * 128) * 4
+                if interleaved_m_rows
+                else (ksl * wmma_m_rep + sm * 2) * 16 * 4
+            )
             if const_expr(row_major_ascale and tdm_as_in_prologue):
                 as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
                 row = wave_m * warp_tile_m + sa_lane + sm * SA_ROWS_PER_LOAD
@@ -1322,369 +1338,6 @@ def launch_gemm_a8w4_tdm(
             for cf in c_frags:
                 cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
 
-        front_wm = (wmma_m_rep + 1) // 2
-        FRONT = list(range(front_wm))
-        BACK = list(range(front_wm, wmma_m_rep))
-        ready_prefix_wm = min(1, front_wm) if resident_ring_addresses else 0
-        # Give carried LDS operands a pure WMMA tail before their next use.
-        carry_closing_mma = 8 if resident_ring_addresses else 0
-
-        # WMMA held back as a closing pure-MFMA group, covering the next k128's
-        # REUSE fence; the prefetch reads interleave evenly over the rest. Narrow
-        # tiles can have n_acc as low as the tail itself, so clamp it to keep at
-        # least one group for the interleaved part.
-        FENCE_COVER_MMA = min((21 if resident_ring_addresses else 25) if use_spec_prefill_opt else 8, max(0, n_acc - sched_mma_group))
-
-        def mma_rows(wm_list, act, wt, sa_k, sb_k, initialize_acc=False):
-            for i in range_constexpr(len(wm_list)):
-                wm = wm_list[i]
-                for wn_raw in range_constexpr(wmma_n_rep):
-                    wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
-                    idx = wm * wmma_n_rep + wn
-                    scale_a = sb_k[wn if a_is_fp4 else wn // 2]
-                    scale_b = sa_k[wm // 2]
-                    if const_expr(a_is_fp4):
-                        wt_value = wt[wn].load()
-                        act_value = act[i].load()
-                        c_frags[idx].store(
-                            rocdl.wmma_scale_f32_32x16x128_f4(
-                                T.vec(16, T.f32),
-                                wt_value.ir_value(),
-                                act_value.ir_value(),
-                                (_raw(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
-                                 if const_expr(initialize_acc) else c_frags[idx].load().ir_value()),
-                                scale_a,
-                                scale_b,
-                                scaleAType=0,
-                                scaleBType=wm % 2,
-                            )
-                        )
-                    else:
-                        fx.gemm(
-                            wmma_atoms[wn % 2][wm % 2],
-                            c_frags[idx],
-                            wt[wn],
-                            act[i],
-                            c_frags[idx],
-                            scale_a=scale_a,
-                            scale_b=scale_b,
-                        )
-
-        DS_A = 2 if a_is_fp4 else 4
-        DS_B = (4 if a_is_fp4 and a_preshuffled and tmnk256_wpmn2_b4 else 2)
-        sb_pairs = output_n_rep // 2
-        sa_pairs = (wmma_m_rep + 1) // 2
-        BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
-        STATE_DS = wmma_m_rep * DS_A + BS_DS
-
-        SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
-        RmemSlot = namedtuple("RmemSlot", "a b sa sb")
-
-        def make_rmem_slot(slot_idx):
-            """Registers holding one k128 of A/B/scales, like c_frags.
-
-            The k-tile loop is a runtime scf.for, so the tile boundary cannot
-            carry a Python value and this state must live in fixed rmem. A
-            width-1 rmem vector leaves a poison lane under SSA promotion, and
-            tile_m=16 gives wmma_m_rep == 1, so a scale slot is at least 2 wide.
-            """
-            a = [
-                fx.make_rmem_tensor(ACT_NDW, fx.Int32)
-                for _ in range_constexpr(wmma_m_rep)
-            ]
-            b = [
-                fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
-                for _ in range_constexpr(wmma_n_rep)
-            ]
-            if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
-                slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
-                assert slot_width <= 128
-                slot_base = ((64 if slot_idx == 0 else 128) if resident_ring_addresses else
-                             (576 if pinned_fp4_prefill else 768) + slot_idx * 128)
-                reg = slot_base
-                for wm in range_constexpr(wmma_m_rep):
-                    fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
-                    reg += ACT_NDW
-                if const_expr(resident_ring_addresses):
-                    reg = 768 if slot_idx == 0 else 832
-                for wn in range_constexpr(wmma_n_rep):
-                    fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
-                    reg += WMMA_VECTOR_DWORDS
-                assert reg <= ((832 if slot_idx == 0 else 896)
-                               if resident_ring_addresses else slot_base + 128)
-            sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
-            sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
-            if const_expr(resident_ring_addresses):
-                assert SA_WIDTH == SB_WIDTH == 4
-                fx.set_register(sa, register_class=fx.rocdl.VGPR, start=16 + slot_idx * 8)
-                fx.set_register(sb, register_class=fx.rocdl.VGPR, start=20 + slot_idx * 8)
-            return RmemSlot(a=a, b=b, sa=sa, sb=sb)
-
-        # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
-        # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
-        rmem_slots = [make_rmem_slot(i) for i in range_constexpr(2)]
-        alternate_b1 = None
-        if const_expr(resident_ring_addresses):
-            extra_b1 = [fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
-                        for _ in range_constexpr(2)]
-            for wn in range_constexpr(2):
-                fx.set_register(extra_b1[wn], register_class=fx.rocdl.VGPR,
-                                start=896 + wn * WMMA_VECTOR_DWORDS)
-            alternate_b1 = RmemSlot(a=rmem_slots[1].a,
-                b=extra_b1 + rmem_slots[1].b[2:],
-                sa=rmem_slots[1].sa, sb=rmem_slots[1].sb)
-        ring_addresses = ([calc_lds_addr(i, i) for i in range_constexpr(num_buffers)]
-                          if const_expr(resident_ring_addresses) else None)
-
-        def load_lds_data(slot, lds_addr, ksl, kt, interleaved_lds_load=False):
-            """Load one k128 from precomputed LDS bases into ``slot``."""
-            if const_expr(not interleaved_lds_load):
-                # Preserve the legacy instruction order for a clean A/B test.
-                sb_v = [
-                    load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)
-                ]
-                sa_v = [
-                    load_sa(lds_addr.sa, sm, ksl, kt)
-                    for sm in range_constexpr(sa_pairs)
-                ]
-                slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
-                slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-                for wm in range_constexpr(wmma_m_rep):
-                    slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
-                for wn in range_constexpr(wmma_n_rep):
-                    slot.b[wn].store(load_b(lds_addr.b, wn, ksl))
-            else:
-                # Planar LDS keeps all A stages and all B stages in disjoint
-                # contiguous regions. Alternate their reads so neither the
-                # instruction stream nor a scheduler group concentrates on one
-                # LDS segment. All bounds are compile-time, so this emits no
-                # runtime branch even when the A/B repetition counts differ.
-                def load_scales():
-                    sa_v = []
-                    sb_v = []
-                    for i in range_constexpr(max(sa_pairs, sb_pairs)):
-                        if const_expr(i < sa_pairs):
-                            sa_v.append(load_sa(lds_addr.sa, i, ksl, kt))
-                        if const_expr(i < sb_pairs):
-                            sb_v.append(load_sb(lds_addr.sb, i, ksl))
-                    slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-                    slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
-
-                if const_expr(not pinned_fp4_prefill):
-                    load_scales()
-                for i in range_constexpr(max(wmma_m_rep, wmma_n_rep)):
-                    if const_expr(i < wmma_m_rep):
-                        slot.a[i].store(load_a(lds_addr.a, i, ksl))
-                    if const_expr(i < wmma_n_rep):
-                        slot.b[i].store(load_b(lds_addr.b, i, ksl))
-                if const_expr(pinned_fp4_prefill):
-                    load_scales()
-
-        def k_step(
-            cur_rmem,
-            next_rmem=None,
-            load_nxt_fn=None,
-            num_outstanding_tdm=None,
-            issue_fn=None,
-            fence_fn=None,
-            initialize_acc=False,
-        ):
-            """Compute one k128 while optionally loading the next LDS slot."""
-            reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
-            split_ready = all((bool(ready_prefix_wm), KWS == 2,
-                               issue_fn is not None, fence_fn is None,
-                               num_outstanding_tdm is not None, not reuse_cur_rmem))
-            prefix_wm = ready_prefix_wm if split_ready else 0
-            if const_expr(issue_fn is not None):
-                # The carried operands may still be reading the LDS buffer
-                # that issue_fn recycles. Retire those reads before all waves
-                # rendezvous at the REUSE fence; waiting at the MMA is too late.
-                rocdl.s_wait_dscnt(0)
-            if const_expr(split_ready):
-                # Retire this wave's producer operations before announcing readiness.
-                pipeline_fence_signal(outstanding=num_outstanding_tdm)
-                prefix_sa, prefix_sb = cur_rmem.sa.load(), cur_rmem.sb.load()
-                mma_rows(FRONT[:prefix_wm], cur_rmem.a[:prefix_wm],
-                         cur_rmem.b, prefix_sa, prefix_sb, initialize_acc)
-                rocdl.sched_mfma(prefix_wm * wmma_n_rep)
-                rocdl.sched_barrier(0)
-                # Reuse and next LDS loads remain after every wave's arrival.
-                pipeline_fence_wait()
-            elif const_expr(fence_fn is not None):
-                fence_fn()
-            elif const_expr(num_outstanding_tdm is not None):
-                pipeline_fence(outstanding=num_outstanding_tdm)
-            if const_expr(issue_fn is not None):
-                issue_fn()
-            if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
-                load_nxt_fn()
-            sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-            mma_rows(FRONT[prefix_wm:], cur_rmem.a[prefix_wm:front_wm],
-                     cur_rmem.b, sa_k, sb_k, initialize_acc)
-            if const_expr(len(BACK) > 0):
-                mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k, initialize_acc)
-            if const_expr(reuse_cur_rmem):
-                load_nxt_fn()
-
-        def compute_ktile(
-            buf,
-            kt,
-            prefetch_kt,
-            rmem_preloaded=False,
-            next_stage_buf=None,
-            my_jobs=None,
-            next_stage_wait=None,
-            next_stage_fence_fn=None,
-            interleaved_lds_load=False,
-            initialize_acc=False,
-            kws=KWS,
-        ):
-            """Compute one k-tile, carrying one k128 of A/B/scales across tiles.
-
-            ``kt`` selects the current tile's resident A-scale slice.
-            ``kws`` is the tile's k128 count, KWS_TAIL on a ragged last tile.
-            ``rmem_preloaded`` says this tile's subtile-0 A/B/scales are already
-            in rmem slot 0, put there by the previous tile's last k128, so the
-            tile top skips loading them.
-            ``next_stage_buf`` is the next tile's LDS buffer, whose subtile 0 is
-            loaded during this tile's last k128 -- so the tile boundary no longer
-            exposes those ds_reads. ``next_stage_wait`` is the tensorcnt that fences
-            ``next_stage_buf``, emitted at that last k128 instead of by the caller
-            at the tile top; pass None only when an earlier fence already covers it.
-
-            ``my_jobs`` only reaches ``issue``, which falls back to filtering
-            ``jobs`` by wave owner itself; it is unused when ``prefetch_kt`` is
-            None.
-            """
-
-            lds_addr = (ring_addresses[buf] if const_expr(resident_ring_addresses)
-                        else calc_lds_addr(buf))
-            next_stage_lds_addr = (
-                (ring_addresses[next_stage_buf] if const_expr(resident_ring_addresses)
-                 else calc_lds_addr(next_stage_buf, 1))
-                if const_expr(next_stage_buf is not None)
-                else None
-            )
-            tile_rmem = rmem_slots
-            if const_expr(resident_ring_addresses and buf % 2 == 1):
-                # B1 from the preceding tile can still be read by WMMA.
-                tile_rmem = [rmem_slots[0], alternate_b1]
-            rocdl.sched_barrier(0)
-
-            def do_issue():
-                issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
-
-            def spread(total, slots, delay=False):
-                counts = []
-                previous = 0
-                for slot in range_constexpr(slots):
-                    current = ((slot + 1) * total + (0 if delay else slots - 1)) // slots
-                    counts.append(current - previous)
-                    previous = current
-                return counts
-
-            def emit_hints(ksl, tail_mfma=0):
-                has_next = ksl + 1 < kws or (
-                    ksl + 1 == kws and next_stage_lds_addr is not None
-                )
-                if const_expr(ksl == 0):
-                    rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
-                # Keep one normal group for the LDS/TDM scheduling slots. Small
-                # tiles can have no more MFMAs than the requested fence tail.
-                tail_mfma = min(tail_mfma, max(0, n_acc - sched_mma_group))
-                mma_total = n_acc - tail_mfma
-                if const_expr(ready_prefix_wm and KWS == 2
-                              and prefetch_kt is not None and ksl + 1 == kws):
-                    mma_total -= ready_prefix_wm * wmma_n_rep
-                # K256 needs grouping to limit VGPR-bank switches without
-                # turning the complete A/B/scale prefetch into long LDS bursts.
-                # The two carried k128 phases use different operand slots.
-                phase_group = (2 if ksl == 0 else 4) if resident_ring_addresses else sched_mma_group
-                mma_group = min(phase_group, mma_total) if KWS > 1 else 1
-                first_group = min(sched_first_group, mma_total) if KWS > 1 else 1
-                remaining_mma = mma_total - first_group
-                remaining_slots = (
-                    (remaining_mma + mma_group - 1) // mma_group
-                    if remaining_mma > 0
-                    else 0
-                )
-                mma_groups = [first_group] + [
-                    min(mma_group, remaining_mma - i * mma_group)
-                    for i in range_constexpr(remaining_slots)
-                ]
-                schedule_slots = len(mma_groups)
-                future_schedule = spread(STATE_DS if has_next else 0, schedule_slots, use_spec_prefill_opt)
-                # Spread the tail issue's TDMs over the WMMA groups: one burst
-                # would block the MFMA pipe for its whole descriptor setup.
-                tdm_schedule = spread(
-                    TDM_PER if (prefetch_kt is not None and ksl + 1 == kws) else 0,
-                    schedule_slots,
-                )
-                first_ds = min((8 if resident_ring_addresses else 5) if use_spec_prefill_opt else sched_ds_first, future_schedule[0])
-                for i in range_constexpr(schedule_slots):
-                    if const_expr(tdm_schedule[i] > 0):
-                        rocdl.sched_vmem(tdm_schedule[i])
-                    if const_expr(i == 0 and first_ds > 0):
-                        rocdl.sched_dsrd(first_ds)
-                    rocdl.sched_mfma(mma_groups[i])
-                    remaining_ds = future_schedule[i] - (first_ds if i == 0 else 0)
-                    if const_expr(remaining_ds > 0):
-                        rocdl.sched_dsrd(remaining_ds)
-                # Closing on an MFMA group is what covers the next k128's fence,
-                # so it must come out of mma_total; reordering slots does not.
-                if const_expr(tail_mfma > 0):
-                    rocdl.sched_mfma(tail_mfma)
-
-            if const_expr(not rmem_preloaded):
-                load_lds_data(tile_rmem[0], lds_addr, 0, kt, interleaved_lds_load)
-            for ksl in range_constexpr(kws):
-                is_last = ksl + 1 == kws
-                carries = is_last and next_stage_lds_addr is not None
-                # At most one prefetch per k128: the next subtile of this tile,
-                # or -- on the last one -- the next tile's subtile 0, into slot 0.
-                if const_expr(not is_last):
-                    next_rmem = tile_rmem[(ksl + 1) % 2]
-                    load_nxt_fn = lambda n=next_rmem, k=ksl + 1: load_lds_data(
-                        n, lds_addr, k, kt, interleaved_lds_load
-                    )
-                elif const_expr(carries):
-                    next_rmem = tile_rmem[0]
-                    load_nxt_fn = lambda n=next_rmem: load_lds_data(
-                        n, next_stage_lds_addr, 0, kt + 1, interleaved_lds_load
-                    )
-                else:
-                    next_rmem, load_nxt_fn = None, None
-                k_step(
-                    tile_rmem[ksl % 2],
-                    next_rmem,
-                    load_nxt_fn,
-                    num_outstanding_tdm=(
-                        next_stage_wait if const_expr(carries) else None
-                    ),
-                    issue_fn=(
-                        do_issue
-                        if const_expr(prefetch_kt is not None and is_last)
-                        else None
-                    ),
-                    fence_fn=(next_stage_fence_fn if const_expr(carries) else None),
-                    initialize_acc=initialize_acc and ksl == 0,
-                )
-                # One region per k128: sched_group_barrier only partitions
-                # within a region, and only sched_barrier delimits one.
-                emit_hints(
-                    ksl,
-                    (
-                        FENCE_COVER_MMA
-                        if (
-                            tile_m > 32
-                            and not is_last
-                            and (next_stage_lds_addr is not None or use_spec_prefill_opt)
-                        )
-                        else (carry_closing_mma if is_last and next_stage_lds_addr is not None else 0)
-                    ),
-                )
-                rocdl.sched_barrier(0)
-
         # Skip padding tiles; uniform across every workgroup and cluster.
         if has_work:
             if const_expr(use_early_wave_sched):
@@ -1734,7 +1387,7 @@ def launch_gemm_a8w4_tdm(
                 # latency is likewise covered by the mainloop.
                 _rm_weight_rows = []
                 for wm in range_constexpr(wmma_m_rep):
-                    _weight_row = wmb + wm * 16 + lane16
+                    _weight_row = wmb + wm * M_ROW_STEP + lane16
                     _weight_valid = _weight_row < mn_oob
                     _weight_safe_row = _weight_valid.select(_weight_row, fx.Int32(0))
                     _weight_bits = fx.Int32(
@@ -1758,7 +1411,386 @@ def launch_gemm_a8w4_tdm(
                 if full_cluster:
                     cluster_sync()
 
-            def run_mainloop(interleaved_lds_load):
+            def run_mainloop(interleaved_lds_load, m_reps=None):
+                # All waves select the same coverage before entering the K loop.
+                front_wm = (wmma_m_rep + 1) // 2
+                active_m_rep = wmma_m_rep if m_reps is None else m_reps
+                compute_n_acc = active_m_rep * wmma_n_rep
+                FRONT = list(range(front_wm))
+                BACK = list(range(front_wm, active_m_rep))
+                ready_prefix_wm = min(1, front_wm) if resident_ring_addresses else 0
+                # Give carried LDS operands a pure WMMA tail before their next use.
+                carry_closing_mma = 8 if resident_ring_addresses else 0
+
+                # WMMA held back as a closing pure-MFMA group, covering the next k128's
+                # REUSE fence; the prefetch reads interleave evenly over the rest. Narrow
+                # tiles can have compute_n_acc as low as the tail itself, so clamp it to keep at
+                # least one group for the interleaved part.
+                FENCE_COVER_MMA = min((21 if resident_ring_addresses else 25) if use_spec_prefill_opt else 8, max(0, compute_n_acc - sched_mma_group))
+
+                def mma_rows(wm_list, act, wt, sa_k, sb_k, initialize_acc=False):
+                    for i in range_constexpr(len(wm_list)):
+                        wm = wm_list[i]
+                        for wn_raw in range_constexpr(wmma_n_rep):
+                            wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
+                            idx = wm * wmma_n_rep + wn
+                            scale_a = sb_k[wn if a_is_fp4 else wn // 2]
+                            scale_b = sa_k[wm // 2]
+                            if const_expr(a_is_fp4):
+                                wt_value = wt[wn].load()
+                                act_value = act[i].load()
+                                c_frags[idx].store(
+                                    rocdl.wmma_scale_f32_32x16x128_f4(
+                                        T.vec(16, T.f32),
+                                        wt_value.ir_value(),
+                                        act_value.ir_value(),
+                                        (_raw(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
+                                         if const_expr(initialize_acc) else c_frags[idx].load().ir_value()),
+                                        scale_a,
+                                        scale_b,
+                                        scaleAType=0,
+                                        scaleBType=wm % 2,
+                                    )
+                                )
+                            else:
+                                fx.gemm(
+                                    wmma_atoms[wn % 2][wm % 2],
+                                    c_frags[idx],
+                                    wt[wn],
+                                    act[i],
+                                    c_frags[idx],
+                                    scale_a=scale_a,
+                                    scale_b=scale_b,
+                                )
+
+                DS_A = 2 if a_is_fp4 else 4
+                DS_B = (4 if a_is_fp4 and a_preshuffled and tmnk256_wpmn2_b4 else 2)
+                sb_pairs = output_n_rep // 2
+                sa_pairs = (active_m_rep + 1) // 2
+                BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
+                STATE_DS = active_m_rep * DS_A + BS_DS
+
+                SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
+                RmemSlot = namedtuple("RmemSlot", "a b sa sb")
+
+                def make_rmem_slot(slot_idx):
+                    """Registers holding one k128 of A/B/scales, like c_frags.
+
+                    The k-tile loop is a runtime scf.for, so the tile boundary cannot
+                    carry a Python value and this state must live in fixed rmem. A
+                    width-1 rmem vector leaves a poison lane under SSA promotion, and
+                    tile_m=16 gives wmma_m_rep == 1, so a scale slot is at least 2 wide.
+                    """
+                    a = [
+                        fx.make_rmem_tensor(ACT_NDW, fx.Int32)
+                        for _ in range_constexpr(wmma_m_rep)
+                    ]
+                    b = [
+                        fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
+                        for _ in range_constexpr(wmma_n_rep)
+                    ]
+                    if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
+                        slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
+                        assert slot_width <= 128
+                        slot_base = ((64 if slot_idx == 0 else 128) if resident_ring_addresses else
+                                     (576 if pinned_fp4_prefill else 768) + slot_idx * 128)
+                        reg = slot_base
+                        for wm in range_constexpr(wmma_m_rep):
+                            fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
+                            reg += ACT_NDW
+                        if const_expr(resident_ring_addresses):
+                            reg = 768 if slot_idx == 0 else 832
+                        for wn in range_constexpr(wmma_n_rep):
+                            fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
+                            reg += WMMA_VECTOR_DWORDS
+                        assert reg <= ((832 if slot_idx == 0 else 896)
+                                       if resident_ring_addresses else slot_base + 128)
+                    sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
+                    sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
+                    if const_expr(resident_ring_addresses):
+                        assert SA_WIDTH == SB_WIDTH == 4
+                        fx.set_register(sa, register_class=fx.rocdl.VGPR, start=16 + slot_idx * 8)
+                        fx.set_register(sb, register_class=fx.rocdl.VGPR, start=20 + slot_idx * 8)
+                    return RmemSlot(a=a, b=b, sa=sa, sb=sb)
+
+                # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
+                # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
+                rmem_slots = [make_rmem_slot(i) for i in range_constexpr(2)]
+                alternate_b1 = None
+                if const_expr(resident_ring_addresses):
+                    extra_b1 = [fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
+                                for _ in range_constexpr(2)]
+                    for wn in range_constexpr(2):
+                        fx.set_register(extra_b1[wn], register_class=fx.rocdl.VGPR,
+                                        start=896 + wn * WMMA_VECTOR_DWORDS)
+                    alternate_b1 = RmemSlot(a=rmem_slots[1].a,
+                        b=extra_b1 + rmem_slots[1].b[2:],
+                        sa=rmem_slots[1].sa, sb=rmem_slots[1].sb)
+                ring_addresses = ([calc_lds_addr(i, i) for i in range_constexpr(num_buffers)]
+                                  if const_expr(resident_ring_addresses) else None)
+
+                def load_lds_data(slot, lds_addr, ksl, kt, interleaved_lds_load=False):
+                    """Load one k128 from precomputed LDS bases into ``slot``."""
+                    if const_expr(interleaved_m_rows and active_m_rep == 8
+                                  and not SUPPORT_EXPLICIT_VGPR_PARTITION):
+                        rocdl.sched_barrier(0)
+                    if const_expr(interleaved_m_rows and active_m_rep in (6, 7)):
+                        # Shorter bodies need the v80 scale-slot retirement dependency.
+                        llvm_dialect.InlineAsmOp(
+                            None, [],
+                            f"s_wait_alu depctr_va_vdst({8 if active_m_rep == 6 else 0})",
+                            "", has_side_effects=True, is_align_stack=False,
+                        )
+                    if const_expr(not interleaved_lds_load):
+                        # Preserve the legacy instruction order for a clean A/B test.
+                        sb_v = [
+                            load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)
+                        ]
+                        sa_v = [
+                            load_sa(lds_addr.sa, sm, ksl, kt)
+                            for sm in range_constexpr(sa_pairs)
+                        ]
+                        slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
+                        slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
+                        for wm in range_constexpr(active_m_rep):
+                            slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
+                        for wn in range_constexpr(wmma_n_rep):
+                            slot.b[wn].store(load_b(lds_addr.b, wn, ksl))
+                    else:
+                        # Planar LDS keeps all A stages and all B stages in disjoint
+                        # contiguous regions. Alternate their reads so neither the
+                        # instruction stream nor a scheduler group concentrates on one
+                        # LDS segment. All bounds are compile-time, so this emits no
+                        # runtime branch even when the A/B repetition counts differ.
+                        def load_scales():
+                            sa_v = []
+                            sb_v = []
+                            for i in range_constexpr(max(sa_pairs, sb_pairs)):
+                                if const_expr(i < sa_pairs):
+                                    sa_v.append(load_sa(lds_addr.sa, i, ksl, kt))
+                                if const_expr(i < sb_pairs):
+                                    sb_v.append(load_sb(lds_addr.sb, i, ksl))
+                            slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
+                            slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
+
+                        if const_expr(not pinned_fp4_prefill):
+                            load_scales()
+                        for i in range_constexpr(max(active_m_rep, wmma_n_rep)):
+                            if const_expr(i < active_m_rep):
+                                slot.a[i].store(load_a(lds_addr.a, i, ksl))
+                            if const_expr(i < wmma_n_rep):
+                                slot.b[i].store(load_b(lds_addr.b, i, ksl))
+                        if const_expr(pinned_fp4_prefill):
+                            load_scales()
+                    if const_expr(interleaved_m_rows and active_m_rep == 8
+                                  and not SUPPORT_EXPLICIT_VGPR_PARTITION):
+                        rocdl.sched_barrier(0)
+
+                def k_step(
+                    cur_rmem,
+                    next_rmem=None,
+                    load_nxt_fn=None,
+                    num_outstanding_tdm=None,
+                    issue_fn=None,
+                    fence_fn=None,
+                    initialize_acc=False,
+                ):
+                    """Compute one k128 while optionally loading the next LDS slot."""
+                    reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
+                    split_ready = all((bool(ready_prefix_wm), KWS == 2,
+                                       issue_fn is not None, fence_fn is None,
+                                       num_outstanding_tdm is not None, not reuse_cur_rmem))
+                    prefix_wm = ready_prefix_wm if split_ready else 0
+                    if const_expr(issue_fn is not None):
+                        # The carried operands may still be reading the LDS buffer
+                        # that issue_fn recycles. Retire those reads before all waves
+                        # rendezvous at the REUSE fence; waiting at the MMA is too late.
+                        rocdl.s_wait_dscnt(0)
+                    if const_expr(split_ready):
+                        # Retire this wave's producer operations before announcing readiness.
+                        pipeline_fence_signal(outstanding=num_outstanding_tdm)
+                        prefix_sa, prefix_sb = cur_rmem.sa.load(), cur_rmem.sb.load()
+                        mma_rows(FRONT[:prefix_wm], cur_rmem.a[:prefix_wm],
+                                 cur_rmem.b, prefix_sa, prefix_sb, initialize_acc)
+                        rocdl.sched_mfma(prefix_wm * wmma_n_rep)
+                        rocdl.sched_barrier(0)
+                        # Reuse and next LDS loads remain after every wave's arrival.
+                        pipeline_fence_wait()
+                    elif const_expr(fence_fn is not None):
+                        fence_fn()
+                    elif const_expr(num_outstanding_tdm is not None):
+                        pipeline_fence(outstanding=num_outstanding_tdm)
+                    if const_expr(issue_fn is not None):
+                        issue_fn()
+                    if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
+                        load_nxt_fn()
+                    sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
+                    mma_rows(FRONT[prefix_wm:], cur_rmem.a[prefix_wm:front_wm],
+                             cur_rmem.b, sa_k, sb_k, initialize_acc)
+                    if const_expr(len(BACK) > 0):
+                        mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k, initialize_acc)
+                    if const_expr(reuse_cur_rmem):
+                        load_nxt_fn()
+
+                def compute_ktile(
+                    buf,
+                    kt,
+                    prefetch_kt,
+                    rmem_preloaded=False,
+                    next_stage_buf=None,
+                    my_jobs=None,
+                    next_stage_wait=None,
+                    next_stage_fence_fn=None,
+                    interleaved_lds_load=False,
+                    initialize_acc=False,
+                    kws=KWS,
+                ):
+                    """Compute one k-tile, carrying one k128 of A/B/scales across tiles.
+
+                    ``kt`` selects the current tile's resident A-scale slice.
+                    ``kws`` is the tile's k128 count, KWS_TAIL on a ragged last tile.
+                    ``rmem_preloaded`` says this tile's subtile-0 A/B/scales are already
+                    in rmem slot 0, put there by the previous tile's last k128, so the
+                    tile top skips loading them.
+                    ``next_stage_buf`` is the next tile's LDS buffer, whose subtile 0 is
+                    loaded during this tile's last k128 -- so the tile boundary no longer
+                    exposes those ds_reads. ``next_stage_wait`` is the tensorcnt that fences
+                    ``next_stage_buf``, emitted at that last k128 instead of by the caller
+                    at the tile top; pass None only when an earlier fence already covers it.
+
+                    ``my_jobs`` only reaches ``issue``, which falls back to filtering
+                    ``jobs`` by wave owner itself; it is unused when ``prefetch_kt`` is
+                    None.
+                    """
+
+                    lds_addr = (ring_addresses[buf] if const_expr(resident_ring_addresses)
+                                else calc_lds_addr(buf))
+                    next_stage_lds_addr = (
+                        (ring_addresses[next_stage_buf] if const_expr(resident_ring_addresses)
+                         else calc_lds_addr(next_stage_buf, 1))
+                        if const_expr(next_stage_buf is not None)
+                        else None
+                    )
+                    tile_rmem = rmem_slots
+                    if const_expr(resident_ring_addresses and buf % 2 == 1):
+                        # B1 from the preceding tile can still be read by WMMA.
+                        tile_rmem = [rmem_slots[0], alternate_b1]
+                    rocdl.sched_barrier(0)
+
+                    def do_issue():
+                        issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
+
+                    def spread(total, slots, delay=False):
+                        counts = []
+                        previous = 0
+                        for slot in range_constexpr(slots):
+                            current = ((slot + 1) * total + (0 if delay else slots - 1)) // slots
+                            counts.append(current - previous)
+                            previous = current
+                        return counts
+
+                    def emit_hints(ksl, tail_mfma=0):
+                        has_next = ksl + 1 < kws or (
+                            ksl + 1 == kws and next_stage_lds_addr is not None
+                        )
+                        if const_expr(ksl == 0):
+                            rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
+                        # Keep one normal group for the LDS/TDM scheduling slots. Small
+                        # tiles can have no more MFMAs than the requested fence tail.
+                        tail_mfma = min(tail_mfma, max(0, compute_n_acc - sched_mma_group))
+                        mma_total = compute_n_acc - tail_mfma
+                        if const_expr(ready_prefix_wm and KWS == 2
+                                      and prefetch_kt is not None and ksl + 1 == kws):
+                            mma_total -= ready_prefix_wm * wmma_n_rep
+                        # K256 needs grouping to limit VGPR-bank switches without
+                        # turning the complete A/B/scale prefetch into long LDS bursts.
+                        # The two carried k128 phases use different operand slots.
+                        phase_group = (2 if ksl == 0 else 4) if resident_ring_addresses else sched_mma_group
+                        mma_group = min(phase_group, mma_total) if KWS > 1 else 1
+                        first_group = min(sched_first_group, mma_total) if KWS > 1 else 1
+                        remaining_mma = mma_total - first_group
+                        remaining_slots = (
+                            (remaining_mma + mma_group - 1) // mma_group
+                            if remaining_mma > 0
+                            else 0
+                        )
+                        mma_groups = [first_group] + [
+                            min(mma_group, remaining_mma - i * mma_group)
+                            for i in range_constexpr(remaining_slots)
+                        ]
+                        schedule_slots = len(mma_groups)
+                        future_schedule = spread(STATE_DS if has_next else 0, schedule_slots, use_spec_prefill_opt)
+                        # Spread the tail issue's TDMs over the WMMA groups: one burst
+                        # would block the MFMA pipe for its whole descriptor setup.
+                        tdm_schedule = spread(
+                            TDM_PER if (prefetch_kt is not None and ksl + 1 == kws) else 0,
+                            schedule_slots,
+                        )
+                        first_ds = min((8 if resident_ring_addresses else 5) if use_spec_prefill_opt else sched_ds_first, future_schedule[0])
+                        for i in range_constexpr(schedule_slots):
+                            if const_expr(tdm_schedule[i] > 0):
+                                rocdl.sched_vmem(tdm_schedule[i])
+                            if const_expr(i == 0 and first_ds > 0):
+                                rocdl.sched_dsrd(first_ds)
+                            rocdl.sched_mfma(mma_groups[i])
+                            remaining_ds = future_schedule[i] - (first_ds if i == 0 else 0)
+                            if const_expr(remaining_ds > 0):
+                                rocdl.sched_dsrd(remaining_ds)
+                        # Closing on an MFMA group is what covers the next k128's fence,
+                        # so it must come out of mma_total; reordering slots does not.
+                        if const_expr(tail_mfma > 0):
+                            rocdl.sched_mfma(tail_mfma)
+
+                    if const_expr(not rmem_preloaded):
+                        load_lds_data(tile_rmem[0], lds_addr, 0, kt, interleaved_lds_load)
+                    for ksl in range_constexpr(kws):
+                        is_last = ksl + 1 == kws
+                        carries = is_last and next_stage_lds_addr is not None
+                        # At most one prefetch per k128: the next subtile of this tile,
+                        # or -- on the last one -- the next tile's subtile 0, into slot 0.
+                        if const_expr(not is_last):
+                            next_rmem = tile_rmem[(ksl + 1) % 2]
+                            load_nxt_fn = lambda n=next_rmem, k=ksl + 1: load_lds_data(
+                                n, lds_addr, k, kt, interleaved_lds_load
+                            )
+                        elif const_expr(carries):
+                            next_rmem = tile_rmem[0]
+                            load_nxt_fn = lambda n=next_rmem: load_lds_data(
+                                n, next_stage_lds_addr, 0, kt + 1, interleaved_lds_load
+                            )
+                        else:
+                            next_rmem, load_nxt_fn = None, None
+                        k_step(
+                            tile_rmem[ksl % 2],
+                            next_rmem,
+                            load_nxt_fn,
+                            num_outstanding_tdm=(
+                                next_stage_wait if const_expr(carries) else None
+                            ),
+                            issue_fn=(
+                                do_issue
+                                if const_expr(prefetch_kt is not None and is_last)
+                                else None
+                            ),
+                            fence_fn=(next_stage_fence_fn if const_expr(carries) else None),
+                            initialize_acc=initialize_acc and ksl == 0,
+                        )
+                        # One region per k128: sched_group_barrier only partitions
+                        # within a region, and only sched_barrier delimits one.
+                        emit_hints(
+                            ksl,
+                            (
+                                FENCE_COVER_MMA
+                                if (
+                                    tile_m > 32
+                                    and not is_last
+                                    and (next_stage_lds_addr is not None or use_spec_prefill_opt)
+                                )
+                                else (carry_closing_mma if is_last and next_stage_lds_addr is not None else 0)
+                            ),
+                        )
+                        rocdl.sched_barrier(0)
+
                 # Post-compute wins for decode and for shallow pipelines: at
                 # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
                 if const_expr(tile_m <= 32 or num_buffers <= 2):
@@ -1959,618 +1991,643 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(peel_last):
                         compute_drain_tile(PRE - 1, False, kws=KWS_TAIL)
 
-            # This is a compile-time selection. The interleaved version has one
-            # mainloop body and no wave-parity branch.
-            run_mainloop(bool(interleaved_lds_load_on))
-
-            accs = []
-            output_fragments_per_acc = WMMA_N // 16
-            for idx in range_constexpr(n_acc):
-                acc = Vec(c_frags[idx].load())
-                for fragment in range_constexpr(output_fragments_per_acc):
-                    accs.append(
-                        Vec.from_elements(
-                            [acc[fragment * 8 + i] for i in range_constexpr(8)],
-                            fx.Float32,
-                        ).ir_value()
-                    )
-            # The epilogue restages C in this arena. Draining our own tensorcnt
-            # suffices: peer multicast loads are pairwise matched with ours.
-            pipeline_fence(outstanding=0)
-            is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
-            STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
-            # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
-            # rows one b128 writes all hit one bank -- 16-way. +16 cols spreads
-            # them to 4-way, the b128 floor. Pad cols never reach global.
-            STORE_PAD = (
-                c_lds_pad_elems
-                if const_expr(enable_ep_scatter)
-                else (16 if not stage1_act else 0)
-            )
-            STORE_PITCH = STORE_N + STORE_PAD
-            neg_limit = fx.Float32(0.0) - f32_swiglu_limit
-            is_swiglu = stage1_act == 2
-            is_situv2 = stage1_act == 3
-            # Uniform across the tile, so fold the betas once here rather than
-            # per element. Only materialised on the SiTUv2 path.
-            situ_c = (
-                situv2_consts(f32_situ_beta, f32_situ_linear_beta)
-                if const_expr(is_situv2)
-                else None
-            )
-            oc = fx.Float16 if out_is_f16 else fx.BFloat16
-
-            # -- Activate + stage to LDS --
-            if const_expr(stage1_quant_out and stage1_act):
-                # Fused activation + MX quant; payload to LDS, scale to global.
-                i32_ptr_g = fx.PointerType.get(
-                    elem_ty=fx.Int8.ir_type,
-                    address_space=fx.AddressSpace.Global,
-                    alignment=1,
+            def emit_common_epilogue():
+                accs = []
+                output_fragments_per_acc = WMMA_N // 16
+                for idx in range_constexpr(n_acc):
+                    acc = Vec(c_frags[idx].load())
+                    for fragment in range_constexpr(output_fragments_per_acc):
+                        accs.append(
+                            Vec.from_elements(
+                                [acc[fragment * 8 + i] for i in range_constexpr(8)],
+                                fx.Float32,
+                            ).ir_value()
+                        )
+                # The epilogue restages C in this arena. Draining our own tensorcnt
+                # suffices: peer multicast loads are pairwise matched with ours.
+                pipeline_fence(outstanding=0)
+                is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
+                STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
+                # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
+                # rows one b128 writes all hit one bank -- 16-way. +16 cols spreads
+                # them to 4-way, the b128 floor. Pad cols never reach global.
+                STORE_PAD = (
+                    c_lds_pad_elems
+                    if const_expr(enable_ep_scatter)
+                    else (16 if not stage1_act else 0)
                 )
-                scale_ptr = fx.recast_iter(i32_ptr_g, arg_quant_scale)
-                is_kgrp0 = fx.Int32(kgrp) == 0
-                # i32_n is the pre-activation gate+up width; the quantized
-                # output has half as many columns and one scale dword per K128.
-                q_dst_scale_dwpr = i32_n // 256
-                scale_rsrc = create_buffer_resource_from_addr(
-                    fx.ptrtoint(scale_ptr),
-                    num_records_bytes=(
-                        fx.Int64(i32_m) * fx.Int64(q_dst_scale_dwpr) * 4
-                    ).ir_value(),
+                STORE_PITCH = STORE_N + STORE_PAD
+                neg_limit = fx.Float32(0.0) - f32_swiglu_limit
+                is_swiglu = stage1_act == 2
+                is_situv2 = stage1_act == 3
+                # Uniform across the tile, so fold the betas once here rather than
+                # per element. Only materialised on the SiTUv2 path.
+                situ_c = (
+                    situv2_consts(f32_situ_beta, f32_situ_linear_beta)
+                    if const_expr(is_situv2)
+                    else None
                 )
+                oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
-                v2i32_ty = T.vec(2, T.i32)
-                N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
-
-                def quant_byte_offset(row, col):
-                    if const_expr(a_preshuffled):
-                        # TDM reads dense LDS tiles. Stage each K32 slab as
-                        # contiguous M16 x 16B, without row padding.
-                        return (
-                            (row // 16) * 16 * STORE_N
-                            + (col // 16) * 256
-                            + (row % 16) * 16
-                            + col % 16
-                        )
-                    return row * STORE_N + col
-
-                for wm in range_constexpr(wmma_m_rep):
-                    # A 16-row block entirely past this expert's valid rows has its
-                    # output OOB-clamped away, so skip its work. Wave-uniform, so
-                    # this costs one scalar branch instead of per-lane masking.
-                    if wmb + wm * 16 < mn_oob:
-                        row_rel = wmb + wm * 16 + lane16
-                        row_i32 = fx.Int32(blk_m + row_rel)
-                        # quant_wmma_rep is tunable, so QUANT_ROWS_PER_TILE is
-                        # not necessarily a power of two (for example, six
-                        # WMMA rows produce a 96-row tile). Derive the common
-                        # equal-warp layout directly; retain exact arithmetic
-                        # for configurations whose GEMM1/GEMM2 row shapes differ.
-                        scale_tile = (
-                            m_tile * m_warp + wave_m
-                            if QUANT_ROWS_PER_TILE == warp_tile_m
-                            else row_i32 // QUANT_ROWS_PER_TILE
-                        )
-                        row_in_tile = (
-                            wm * 16 + lane16
-                            if QUANT_ROWS_PER_TILE == warp_tile_m
-                            else row_i32 - scale_tile * QUANT_ROWS_PER_TILE
-                        )
-                        wmma_row = row_in_tile >> 4
-                        scale_lane = row_in_tile & 15
-                        row_valid = row_rel < mn_oob
-
-                        e8m0_bytes = []
-                        mx_blk_is = []
-                        for mx_blk in range_constexpr(N_MX_BLKS):
-                            # Gather (gate, up) pairs for this MX block.
-                            pairs = []
-                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
-                                wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                acc = Vec(accs[wm * output_n_rep + wn])
-                                for p in range_constexpr(4):
-                                    pairs.append((acc[2 * p], acc[2 * p + 1]))
-
-                            if const_expr(is_situv2):
-                                all_vals = batched_situv2(
-                                    pairs,
-                                    consts=situ_c,
-                                    range_constexpr=range_constexpr,
-                                )
-                            else:
-                                # Clamp successive slices without extending every pair's live range.
-                                activation_chunk = (4 if quant_gemm1_prefill and resident_ring_addresses
-                                                    else len(pairs))
-                                all_vals = []
-                                for act_begin in range_constexpr(0, len(pairs), activation_chunk):
-                                    all_vals += batched_silu_swiglu(
-                                        pairs[act_begin:act_begin + activation_chunk],
-                                        swiglu=is_swiglu,
-                                        limit_f32=f32_swiglu_limit,
-                                        neg_limit_f32=neg_limit,
-                                        range_constexpr=range_constexpr,
-                                    )
-
-                            scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
-                                all_vals,
-                                wave_size=WAVE,
-                                dtype=(
-                                    MxDtype.FP4_E2M1
-                                    if is_fp4_quant
-                                    else MxDtype.FP8_E4M3
-                                ),
-                            )
-                            mx_col = blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
-                            mx_blk_i = fx.Int32(mx_col) >> 6
-                            e8m0_bytes.append(e8m0_byte)
-                            mx_blk_is.append(mx_blk_i)
-
-                            if const_expr(is_fp4_quant):
-                                # Each kgrp owns four activated values per wn.
-                                # Pair two local wn fragments to fill one pk8
-                                # conversion, then store each packed 4-value half
-                                # directly. Only the block amax crosses kgrps.
-                                for half in range_constexpr(WN_PER_MX_BLOCK // 2):
-                                    sub_wn0 = half * 2
-                                    sub_wn1 = sub_wn0 + 1
-                                    wn0 = mx_blk * WN_PER_MX_BLOCK + sub_wn0
-                                    wn1 = wn0 + 1
-                                    src = Vec.from_elements(
-                                        all_vals[sub_wn0 * 4 : sub_wn0 * 4 + 4]
-                                        + all_vals[sub_wn1 * 4 : sub_wn1 * 4 + 4],
-                                        fx.Float32,
-                                    )
-                                    packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
-                                        src.to(fx.BFloat16).ir_value(),
-                                        scale_f32,
-                                        i32_ty=T.i32,
-                                    )
-                                    col_fp4_0 = (wnb + wn0 * 16) // 4 + kgrp * 2
-                                    col_fp4_1 = (wnb + wn1 * 16) // 4 + kgrp * 2
-                                    lds_store_b16(
-                                        stC_idx,
-                                        quant_byte_offset(row_rel, col_fp4_0),
-                                        packed_i32,
-                                    )
-                                    lds_store_b16(
-                                        stC_idx,
-                                        quant_byte_offset(row_rel, col_fp4_1),
-                                        packed_i32 >> fx.Int32(16),
-                                    )
-                            else:
-                                for half in range_constexpr(WN_PER_MX_BLOCK // 2):
-                                    src = Vec.from_elements(
-                                        all_vals[half * 8 : half * 8 + 8],
-                                        fx.Float32,
-                                    )
-                                    packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
-                                        src.ir_value(),
-                                        scale_f32,
-                                        v2i32_ty=v2i32_ty,
-                                        rocdl=rocdl,
-                                    )
-                                    for sub in range_constexpr(2):
-                                        sub_wn = half * 2 + sub
-                                        wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                        packed_i32 = fx.Vector(packed_v2i32)[sub]
-                                        col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
-                                        lds_store_b32(
-                                            stC_idx,
-                                            row_rel * STORE_N + col_fp8,
-                                            Vec.from_elements([packed_i32], fx.Int32),
-                                        )
-
-                        # A warp owns aligned pairs of adjacent Scale bytes.
-                        scale_store_bytes = (2 if quant_gemm1_prefill and N_MX_BLKS % 2 == 0
-                                             and warp_tile_n % 128 == 0 else 1)
-                        for mx_blk in range_constexpr(0, N_MX_BLKS, scale_store_bytes):
-                            scale_dw = mx_blk_is[mx_blk] >> 2
-                            byte_in_dw = mx_blk_is[mx_blk] & 3
-                            dst_byte = (
-                                ((scale_tile * q_dst_scale_dwpr + scale_dw)
-                                 * quant_wmma_rep + wmma_row) * 16 + scale_lane
-                            ) * 4 + byte_in_dw
-                            packed = (fx.Int16(_pack_bytes_i32(e8m0_bytes[mx_blk:mx_blk + 2]))
-                                      if scale_store_bytes == 2 else fx.Int8(e8m0_bytes[mx_blk]))
-                            scale_value = row_valid.select(
-                                packed, fx.Int16(0) if scale_store_bytes == 2 else fx.Int8(0))
-                            # Non-owner lanes are OOB-masked; byte offsets must
-                            # not be rescaled when the store becomes b16.
-                            buffer_store(scale_value, scale_rsrc, dst_byte,
-                                         mask=is_kgrp0, offset_is_bytes=True)
-            else:
-                # bf16/f16 activation (or passthrough) -> stage to LDS.
-                if const_expr(has_bias):
-                    bias_ptr_type = fx.PointerType.get(
-                        elem_ty=out_elem,
-                        address_space=fx.AddressSpace.Global,
-                        alignment=2,
-                    )
-                    bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
-                if const_expr(enable_ep_scatter):
-                    _wf_rows = _rm_weight_rows
-
-                def _biased_acc(wm, wn, col_rel):
-                    acc = Vec(accs[wm * output_n_rep + wn])
-                    if const_expr(has_bias):
-                        acc = acc + (
-                            fx.ptr_load(
-                                bias_map + expert * i32_n + blk_n + col_rel,
-                                result_type=T.vec(8, out_elem),
-                            )
-                        ).to(fx.Float32)
-                    return acc
-
-                if const_expr(ep_quant_bits):
-                    # MX staging. The per-32 block amax is reduced across the kgrp
-                    # lane pair by the shuffle_xor(16) inside
-                    # emit_amax_e8m0_native_scale, so quantization has to happen HERE,
-                    # in registers: once the values reach LDS they are scattered by
-                    # column and can no longer be reduced.
-                    _v2i32_ty = T.vec(2, T.i32)
-                    _mx_dt = (
-                        MxDtype.FP8_E4M3 if ep_quant_bits == 8 else MxDtype.FP4_E2M1
-                    )
-                    _n_mx_blks = output_n_rep // WN_PER_MX_BLOCK_EP
-                    # Whole dwords only: a warp owning a byte count that is not a
-                    # multiple of four starts mid-dword, and a wider store would
-                    # reach into the next warp's scales.
-                    _e8m0_pack_dwords = _n_mx_blks // 4 if _n_mx_blks % 4 == 0 else 0
-                    _is_kgrp0 = fx.Int32(kgrp) == 0
-                    _p8_scale = fx.PointerType.get(
+                # -- Activate + stage to LDS --
+                if const_expr(stage1_quant_out and stage1_act):
+                    # Fused activation + MX quant; payload to LDS, scale to global.
+                    i32_ptr_g = fx.PointerType.get(
                         elem_ty=fx.Int8.ir_type,
-                        address_space=fx.AddressSpace.Shared,
+                        address_space=fx.AddressSpace.Global,
                         alignment=1,
                     )
-                    _scale_lds = fx.recast_iter(_p8_scale, base_ptr)
-                    for wm in range_constexpr(wmma_m_rep):
-                        row_rel = wmb + wm * 16 + lane16
-                        _wf = _wf_rows[wm]
-                        _row_byte = row_rel * _lds_row_bytes
-                        _e8m0_blks = []
-                        for mx_blk in range_constexpr(_n_mx_blks):
-                            _vals = []
-                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
-                                wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
-                                col_rel = wnb + wn * 16 + kgrp * 8
-                                acc = _biased_acc(wm, wn, col_rel)
-                                # Weight before quantizing: combine sums
-                                # unweighted. It cannot ride the cvt scale
-                                # operand instead -- v_cvt_scalef32 takes only
-                                # the exponent of that f32, so a weight that is
-                                # not a power of two would be rounded to one.
-                                # Measured: folding it there costs 0.180 -> 0.292
-                                # logits_diff over 8 layers at 16k tokens/rank.
-                                for i in range_constexpr(8):
-                                    _vals.append(acc[i] * _wf)
-                            _scale_f32, _e8m0 = emit_amax_e8m0_native_scale(
-                                _vals, wave_size=WAVE, dtype=_mx_dt
+                    scale_ptr = fx.recast_iter(i32_ptr_g, arg_quant_scale)
+                    is_kgrp0 = fx.Int32(kgrp) == 0
+                    # i32_n is the pre-activation gate+up width; the quantized
+                    # output has half as many columns and one scale dword per K128.
+                    q_dst_scale_dwpr = i32_n // 256
+                    scale_rsrc = create_buffer_resource_from_addr(
+                        fx.ptrtoint(scale_ptr),
+                        num_records_bytes=(
+                            fx.Int64(i32_m) * fx.Int64(q_dst_scale_dwpr) * 4
+                        ).ir_value(),
+                    )
+
+                    v2i32_ty = T.vec(2, T.i32)
+                    N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
+
+                    def quant_byte_offset(row, col):
+                        if const_expr(a_preshuffled):
+                            # TDM reads dense LDS tiles. Stage each K32 slab as
+                            # contiguous M16 x 16B, without row padding.
+                            return (
+                                (row // 16) * 16 * STORE_N
+                                + (col // 16) * 256
+                                + (row % 16) * 16
+                                + col % 16
                             )
-                            _e8m0_blks.append(_e8m0)
-                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
-                                wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
-                                col_rel = wnb + wn * 16 + kgrp * 8
-                                _src8 = Vec.from_elements(
-                                    _vals[sub_wn * 8 : sub_wn * 8 + 8],
-                                    fx.Float32,
-                                ).ir_value()
-                                # col_rel is a multiple of 8, so the byte column
-                                # lands 8-aligned on the fp8 wire and 4-aligned
-                                # on the fp4 one.
-                                if const_expr(ep_quant_bits == 8):
-                                    lds_store_b64(
-                                        stC_idx,
-                                        _row_byte + col_rel,
-                                        emit_cvt_scalef32_pk8_fp8_f32(
-                                            _src8,
-                                            _scale_f32,
-                                            v2i32_ty=_v2i32_ty,
-                                            rocdl=rocdl,
-                                        ),
-                                    )
-                                else:
-                                    lds_store_b32(
-                                        stC_idx,
-                                        _row_byte + col_rel // 2,
-                                        Vec.from_elements(
-                                            [
-                                                emit_cvt_scalef32_pk8_fp4_f32(
-                                                    _src8,
-                                                    _scale_f32,
-                                                    i32_ty=T.i32,
-                                                    rocdl=rocdl,
-                                                )
-                                            ],
-                                            fx.Int32,
-                                        ),
-                                    )
-                        # Both kgrp lanes hold the same block scales; one stores.
-                        # This row's e8m0 bytes are contiguous -- block b sits at
-                        # wnb/32 + b -- so they go out as whole dwords instead of
-                        # one masked byte store per block. Each warp owns
-                        # warp_tile_n/32 bytes starting at a multiple of that, so
-                        # a dword store stays inside this warp's own run.
-                        _sc_byte = (
-                            row_rel * _lds_scale_row_bytes
-                            + wnb // EP_SCALE_BLOCK
-                            + _ep_scale_lds_off
-                        )
-                        if _is_kgrp0:
-                            if const_expr(_e8m0_pack_dwords):
-                                for dw in range_constexpr(_e8m0_pack_dwords):
-                                    _packed = _pack_bytes_i32(
-                                        _e8m0_blks[dw * 4 : dw * 4 + 4]
-                                    )
-                                    lds_store_b32(
-                                        stC_idx,
-                                        _sc_byte + dw * 4,
-                                        Vec.from_elements([_packed], fx.Int32),
-                                    )
-                            else:
-                                for mx_blk in range_constexpr(_n_mx_blks):
-                                    fx.ptr_store(
-                                        _e8m0_blks[mx_blk],
-                                        _scale_lds + (_sc_byte + mx_blk),
-                                    )
-                else:
+                        return row * STORE_N + col
+
                     for wm in range_constexpr(wmma_m_rep):
-                        row_rel = wmb + wm * 16 + lane16
-                        for wn in range_constexpr(output_n_rep):
-                            col_rel = wnb + wn * 16 + kgrp * 8
-                            acc = _biased_acc(wm, wn, col_rel)
-                            if const_expr(stage1_act):
+                        # A 16-row block entirely past this expert's valid rows has its
+                        # output OOB-clamped away, so skip its work. Wave-uniform, so
+                        # this costs one scalar branch instead of per-lane masking.
+                        if wmb + wm * M_ROW_STEP < mn_oob:
+                            row_rel = wmb + wm * M_ROW_STEP + lane16
+                            row_i32 = fx.Int32(blk_m + row_rel)
+                            # quant_wmma_rep is tunable, so QUANT_ROWS_PER_TILE is
+                            # not necessarily a power of two (for example, six
+                            # WMMA rows produce a 96-row tile). Derive the common
+                            # equal-warp layout directly; retain exact arithmetic
+                            # for configurations whose GEMM1/GEMM2 row shapes differ.
+                            scale_tile = (
+                                m_tile * m_warp + wave_m
+                                if QUANT_ROWS_PER_TILE == warp_tile_m and not interleaved_m_rows
+                                else row_i32 // QUANT_ROWS_PER_TILE
+                            )
+                            row_in_tile = (
+                                wm * 16 + lane16
+                                if QUANT_ROWS_PER_TILE == warp_tile_m and not interleaved_m_rows
+                                else row_i32 - scale_tile * QUANT_ROWS_PER_TILE
+                            )
+                            wmma_row = row_in_tile >> 4
+                            scale_lane = row_in_tile & 15
+                            row_valid = row_rel < mn_oob
+
+                            e8m0_bytes = []
+                            mx_blk_is = []
+                            for mx_blk in range_constexpr(N_MX_BLKS):
+                                # Gather (gate, up) pairs for this MX block.
+                                pairs = []
+                                for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
+                                    wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                    acc = Vec(accs[wm * output_n_rep + wn])
+                                    for p in range_constexpr(4):
+                                        pairs.append((acc[2 * p], acc[2 * p + 1]))
+
                                 if const_expr(is_situv2):
-                                    act_vals = [
-                                        fused_situv2_elem(
-                                            acc[2 * p],
-                                            acc[2 * p + 1],
-                                            consts=situ_c,
-                                        )
-                                        for p in range_constexpr(4)
-                                    ]
+                                    all_vals = batched_situv2(
+                                        pairs,
+                                        consts=situ_c,
+                                        range_constexpr=range_constexpr,
+                                    )
                                 else:
-                                    act_vals = [
-                                        fused_silu_swiglu_elem(
-                                            acc[2 * p],
-                                            acc[2 * p + 1],
+                                    # Clamp successive slices without extending every pair's live range.
+                                    activation_chunk = (4 if quant_gemm1_prefill and resident_ring_addresses
+                                                        else len(pairs))
+                                    all_vals = []
+                                    for act_begin in range_constexpr(0, len(pairs), activation_chunk):
+                                        all_vals += batched_silu_swiglu(
+                                            pairs[act_begin:act_begin + activation_chunk],
                                             swiglu=is_swiglu,
                                             limit_f32=f32_swiglu_limit,
                                             neg_limit_f32=neg_limit,
+                                            range_constexpr=range_constexpr,
                                         )
-                                        for p in range_constexpr(4)
-                                    ]
-                                hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
-                                lds_store_b64(
-                                    stC_idx,
-                                    (row_rel * STORE_N + col_rel // 2) * 2,
-                                    hv.bitcast(fx.Int32).ir_value(),
+
+                                scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
+                                    all_vals,
+                                    wave_size=WAVE,
+                                    dtype=(
+                                        MxDtype.FP4_E2M1
+                                        if is_fp4_quant
+                                        else MxDtype.FP8_E4M3
+                                    ),
                                 )
-                            else:
-                                if const_expr(enable_ep_scatter):
-                                    # Weight the row BEFORE truncating to bf16; the
-                                    # combine kernel does an unweighted sum.
-                                    _wf = _wf_rows[wm]
-                                    hv = Vec.from_elements(
-                                        [acc[i] * _wf for i in range_constexpr(8)],
-                                        fx.Float32,
-                                    ).to(oc)
+                                mx_col = blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
+                                mx_blk_i = fx.Int32(mx_col) >> 6
+                                e8m0_bytes.append(e8m0_byte)
+                                mx_blk_is.append(mx_blk_i)
+
+                                if const_expr(is_fp4_quant):
+                                    # Each kgrp owns four activated values per wn.
+                                    # Pair two local wn fragments to fill one pk8
+                                    # conversion, then store each packed 4-value half
+                                    # directly. Only the block amax crosses kgrps.
+                                    for half in range_constexpr(WN_PER_MX_BLOCK // 2):
+                                        sub_wn0 = half * 2
+                                        sub_wn1 = sub_wn0 + 1
+                                        wn0 = mx_blk * WN_PER_MX_BLOCK + sub_wn0
+                                        wn1 = wn0 + 1
+                                        src = Vec.from_elements(
+                                            all_vals[sub_wn0 * 4 : sub_wn0 * 4 + 4]
+                                            + all_vals[sub_wn1 * 4 : sub_wn1 * 4 + 4],
+                                            fx.Float32,
+                                        )
+                                        packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
+                                            src.to(fx.BFloat16).ir_value(),
+                                            scale_f32,
+                                            i32_ty=T.i32,
+                                        )
+                                        col_fp4_0 = (wnb + wn0 * 16) // 4 + kgrp * 2
+                                        col_fp4_1 = (wnb + wn1 * 16) // 4 + kgrp * 2
+                                        lds_store_b16(
+                                            stC_idx,
+                                            quant_byte_offset(row_rel, col_fp4_0),
+                                            packed_i32,
+                                        )
+                                        lds_store_b16(
+                                            stC_idx,
+                                            quant_byte_offset(row_rel, col_fp4_1),
+                                            packed_i32 >> fx.Int32(16),
+                                        )
                                 else:
-                                    hv = Vec.from_elements(
-                                        [acc[i] for i in range_constexpr(8)], fx.Float32
-                                    ).to(oc)
-                                hv_i32 = hv.bitcast(fx.Int32).ir_value()
-                                lds_store_b128(
-                                    stC_idx,
-                                    (row_rel * STORE_PITCH + col_rel) * 2,
-                                    hv_i32,
-                                )
+                                    for half in range_constexpr(WN_PER_MX_BLOCK // 2):
+                                        src = Vec.from_elements(
+                                            all_vals[half * 8 : half * 8 + 8],
+                                            fx.Float32,
+                                        )
+                                        packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
+                                            src.ir_value(),
+                                            scale_f32,
+                                            v2i32_ty=v2i32_ty,
+                                            rocdl=rocdl,
+                                        )
+                                        for sub in range_constexpr(2):
+                                            sub_wn = half * 2 + sub
+                                            wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                            packed_i32 = fx.Vector(packed_v2i32)[sub]
+                                            col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
+                                            lds_store_b32(
+                                                stC_idx,
+                                                row_rel * STORE_N + col_fp8,
+                                                Vec.from_elements([packed_i32], fx.Int32),
+                                            )
 
-            # -- Shared LDS -> global --
-            # dscnt-only barrier: the store reads LDS, not the e8m0 scales still
-            # in flight, so their storecnt wait moves past the store below.
-            if const_expr(stage1_quant_out and stage1_act):
-                rocdl.s_wait_dscnt(0)
-                rocdl.s_barrier_signal(-1)
-                rocdl.s_barrier_wait(-1)
-            else:
-                workgroup_barrier()
-            if const_expr(enable_ep_scatter):
-                # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
-                # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
-                # are padded to a pow2 so perRankSize divides by the slot stride
-                # exactly -- which lets (pe, slot) fold into ONE row index
-                # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
-                # measured in-kernel from the lsa_ptr stride. Each wave issues the
-                # gather-stores for its row groups, 8 rows per instruction.
-                # Quantized rows are addressed in bytes, so a 4-bit element just
-                # halves the row length; the scale plane rides a second store.
-                elem_bytes = 1 if ep_quant_bits else 2
-                _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
-                _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
-                _stride_elems = ep_slot_stride_bytes // elem_bytes
-                _GRP = SCATTER_GROUP_ROWS
-                _ngrp = scatter_groups
-                _pr = _ep_lsa1 - _ep_lsa0
-                _K = fx.Int32(_pr // fx.Int64(ep_slot_stride_bytes))
-                # OOB row-index bound: valid idx = pe*K+slot < world*K (world<=256,
-                # slot<K); dropped/padding rows use this index so the HW drops them.
-                _oob = _K * fx.Int32(ep_world_size)
-                _comb_ptr_ty = fx.PointerType.get(
-                    T.i8 if ep_quant_bits else T.i16,
-                    address_space=fx.AddressSpace.Global,
-                    alignment=16,
-                )
-                _comb_iter = fx.inttoptr(
-                    _comb_ptr_ty,
-                    _ep_lsa0 + fx.Int64(ep_combine_input_offset),
-                )
-                _comb_view = tensor_view(
-                    _comb_iter, (_oob, _row_elems), (_stride_elems, 1)
-                )
-                _lds_c = tensor_view(
-                    fx.recast_iter(fx.Int8 if ep_quant_bits else oc, base_ptr),
-                    (tile_m, _lds_row_elems),
-                    (_lds_row_elems, 1),
-                )
-                if const_expr(ep_quant_bits):
-                    # Byte column of this tile in the payload plane: one byte per
-                    # element on the fp8 wire, half that on fp4.
-                    _elem_div = 8 // ep_quant_bits
-                    _gboff = blk_n64 // _elem_div
-                    # The scale plane starts one payload plane into the slot; blk_n
-                    # is a multiple of tile_n, itself a multiple of the scale block,
-                    # so the tile's scale run starts whole.
-                    _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
+                            # A warp owns aligned pairs of adjacent Scale bytes.
+                            scale_store_bytes = (2 if quant_gemm1_prefill and N_MX_BLKS % 2 == 0
+                                                 and warp_tile_n % 128 == 0 else 1)
+                            for mx_blk in range_constexpr(0, N_MX_BLKS, scale_store_bytes):
+                                scale_dw = mx_blk_is[mx_blk] >> 2
+                                byte_in_dw = mx_blk_is[mx_blk] & 3
+                                dst_byte = (
+                                    ((scale_tile * q_dst_scale_dwpr + scale_dw)
+                                     * quant_wmma_rep + wmma_row) * 16 + scale_lane
+                                ) * 4 + byte_in_dw
+                                packed = (fx.Int16(_pack_bytes_i32(e8m0_bytes[mx_blk:mx_blk + 2]))
+                                          if scale_store_bytes == 2 else fx.Int8(e8m0_bytes[mx_blk]))
+                                scale_value = row_valid.select(
+                                    packed, fx.Int16(0) if scale_store_bytes == 2 else fx.Int8(0))
+                                # Non-owner lanes are OOB-masked; byte offsets must
+                                # not be rescaled when the store becomes b16.
+                                buffer_store(scale_value, scale_rsrc, dst_byte,
+                                             mask=is_kgrp0, offset_is_bytes=True)
                 else:
-                    _gboff = blk_n * elem_bytes
-                _passes = scatter_passes
-                # Compute all of this wave's destination indices lane-wise.
-                # The old LDS path scalarized each row first and consequently
-                # expanded signed / and % once per descriptor row.
-                _scatter_idx_lanes = []
-                for scatter_vector in range_constexpr(scatter_dst_vectors):
-                    _rm_dst_lane = _rm_dst_lanes[scatter_vector]
-                    _dst_pe_lane = _rm_dst_lane // fx.Int32(ep_destination_stride)
-                    _dst_slot_lane = _rm_dst_lane % fx.Int32(ep_destination_stride)
-                    _scatter_idx_lane = _dst_pe_lane * _K + _dst_slot_lane
-                    _scatter_keep_lane = _scatter_lane_valids[scatter_vector] & (
-                        _rm_dst_lane >= fx.Int32(0)
-                    )
-                    _scatter_idx_lanes.append(
-                        _scatter_keep_lane.select(_scatter_idx_lane, _oob)
-                    )
+                    # bf16/f16 activation (or passthrough) -> stage to LDS.
+                    if const_expr(has_bias):
+                        bias_ptr_type = fx.PointerType.get(
+                            elem_ty=out_elem,
+                            address_space=fx.AddressSpace.Global,
+                            alignment=2,
+                        )
+                        bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
+                    if const_expr(enable_ep_scatter):
+                        _wf_rows = _rm_weight_rows
 
-                def issue_scatter_group(group, scatter_vector, vector_pass):
-                    base_row = group * fx.Int32(_GRP)
-                    row_indices = []
-                    for i in range_constexpr(_GRP):
-                        src_lane = fx.Int32(vector_pass * _GRP + i)
-                        row_indices.append(
-                            fx.Int32(
-                                rocdl.readlane(
-                                    T.i32,
-                                    _raw(_scatter_idx_lanes[scatter_vector]),
-                                    _raw(src_lane),
+                    def _biased_acc(wm, wn, col_rel):
+                        acc = Vec(accs[wm * output_n_rep + wn])
+                        if const_expr(has_bias):
+                            acc = acc + (
+                                fx.ptr_load(
+                                    bias_map + expert * i32_n + blk_n + col_rel,
+                                    result_type=T.vec(8, out_elem),
+                                )
+                            ).to(fx.Float32)
+                        return acc
+
+                    if const_expr(ep_quant_bits):
+                        # MX staging. The per-32 block amax is reduced across the kgrp
+                        # lane pair by the shuffle_xor(16) inside
+                        # emit_amax_e8m0_native_scale, so quantization has to happen HERE,
+                        # in registers: once the values reach LDS they are scattered by
+                        # column and can no longer be reduced.
+                        _v2i32_ty = T.vec(2, T.i32)
+                        _mx_dt = (
+                            MxDtype.FP8_E4M3 if ep_quant_bits == 8 else MxDtype.FP4_E2M1
+                        )
+                        _n_mx_blks = output_n_rep // WN_PER_MX_BLOCK_EP
+                        # Whole dwords only: a warp owning a byte count that is not a
+                        # multiple of four starts mid-dword, and a wider store would
+                        # reach into the next warp's scales.
+                        _e8m0_pack_dwords = _n_mx_blks // 4 if _n_mx_blks % 4 == 0 else 0
+                        _is_kgrp0 = fx.Int32(kgrp) == 0
+                        _p8_scale = fx.PointerType.get(
+                            elem_ty=fx.Int8.ir_type,
+                            address_space=fx.AddressSpace.Shared,
+                            alignment=1,
+                        )
+                        _scale_lds = fx.recast_iter(_p8_scale, base_ptr)
+                        for wm in range_constexpr(wmma_m_rep):
+                            row_rel = wmb + wm * M_ROW_STEP + lane16
+                            _wf = _wf_rows[wm]
+                            _row_byte = row_rel * _lds_row_bytes
+                            _e8m0_blks = []
+                            for mx_blk in range_constexpr(_n_mx_blks):
+                                _vals = []
+                                for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
+                                    wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
+                                    col_rel = wnb + wn * 16 + kgrp * 8
+                                    acc = _biased_acc(wm, wn, col_rel)
+                                    # Weight before quantizing: combine sums
+                                    # unweighted. It cannot ride the cvt scale
+                                    # operand instead -- v_cvt_scalef32 takes only
+                                    # the exponent of that f32, so a weight that is
+                                    # not a power of two would be rounded to one.
+                                    # Measured: folding it there costs 0.180 -> 0.292
+                                    # logits_diff over 8 layers at 16k tokens/rank.
+                                    for i in range_constexpr(8):
+                                        _vals.append(acc[i] * _wf)
+                                _scale_f32, _e8m0 = emit_amax_e8m0_native_scale(
+                                    _vals, wave_size=WAVE, dtype=_mx_dt
+                                )
+                                _e8m0_blks.append(_e8m0)
+                                for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
+                                    wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
+                                    col_rel = wnb + wn * 16 + kgrp * 8
+                                    _src8 = Vec.from_elements(
+                                        _vals[sub_wn * 8 : sub_wn * 8 + 8],
+                                        fx.Float32,
+                                    ).ir_value()
+                                    # col_rel is a multiple of 8, so the byte column
+                                    # lands 8-aligned on the fp8 wire and 4-aligned
+                                    # on the fp4 one.
+                                    if const_expr(ep_quant_bits == 8):
+                                        lds_store_b64(
+                                            stC_idx,
+                                            _row_byte + col_rel,
+                                            emit_cvt_scalef32_pk8_fp8_f32(
+                                                _src8,
+                                                _scale_f32,
+                                                v2i32_ty=_v2i32_ty,
+                                                rocdl=rocdl,
+                                            ),
+                                        )
+                                    else:
+                                        lds_store_b32(
+                                            stC_idx,
+                                            _row_byte + col_rel // 2,
+                                            Vec.from_elements(
+                                                [
+                                                    emit_cvt_scalef32_pk8_fp4_f32(
+                                                        _src8,
+                                                        _scale_f32,
+                                                        i32_ty=T.i32,
+                                                        rocdl=rocdl,
+                                                    )
+                                                ],
+                                                fx.Int32,
+                                            ),
+                                        )
+                            # Both kgrp lanes hold the same block scales; one stores.
+                            # This row's e8m0 bytes are contiguous -- block b sits at
+                            # wnb/32 + b -- so they go out as whole dwords instead of
+                            # one masked byte store per block. Each warp owns
+                            # warp_tile_n/32 bytes starting at a multiple of that, so
+                            # a dword store stays inside this warp's own run.
+                            _sc_byte = (
+                                row_rel * _lds_scale_row_bytes
+                                + wnb // EP_SCALE_BLOCK
+                                + _ep_scale_lds_off
+                            )
+                            if _is_kgrp0:
+                                if const_expr(_e8m0_pack_dwords):
+                                    for dw in range_constexpr(_e8m0_pack_dwords):
+                                        _packed = _pack_bytes_i32(
+                                            _e8m0_blks[dw * 4 : dw * 4 + 4]
+                                        )
+                                        lds_store_b32(
+                                            stC_idx,
+                                            _sc_byte + dw * 4,
+                                            Vec.from_elements([_packed], fx.Int32),
+                                        )
+                                else:
+                                    for mx_blk in range_constexpr(_n_mx_blks):
+                                        fx.ptr_store(
+                                            _e8m0_blks[mx_blk],
+                                            _scale_lds + (_sc_byte + mx_blk),
+                                        )
+                    else:
+                        for wm in range_constexpr(wmma_m_rep):
+                            row_rel = wmb + wm * M_ROW_STEP + lane16
+                            for wn in range_constexpr(output_n_rep):
+                                col_rel = wnb + wn * 16 + kgrp * 8
+                                acc = _biased_acc(wm, wn, col_rel)
+                                if const_expr(stage1_act):
+                                    if const_expr(is_situv2):
+                                        act_vals = [
+                                            fused_situv2_elem(
+                                                acc[2 * p],
+                                                acc[2 * p + 1],
+                                                consts=situ_c,
+                                            )
+                                            for p in range_constexpr(4)
+                                        ]
+                                    else:
+                                        act_vals = [
+                                            fused_silu_swiglu_elem(
+                                                acc[2 * p],
+                                                acc[2 * p + 1],
+                                                swiglu=is_swiglu,
+                                                limit_f32=f32_swiglu_limit,
+                                                neg_limit_f32=neg_limit,
+                                            )
+                                            for p in range_constexpr(4)
+                                        ]
+                                    hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
+                                    lds_store_b64(
+                                        stC_idx,
+                                        (row_rel * STORE_N + col_rel // 2) * 2,
+                                        hv.bitcast(fx.Int32).ir_value(),
+                                    )
+                                else:
+                                    if const_expr(enable_ep_scatter):
+                                        # Weight the row BEFORE truncating to bf16; the
+                                        # combine kernel does an unweighted sum.
+                                        _wf = _wf_rows[wm]
+                                        hv = Vec.from_elements(
+                                            [acc[i] * _wf for i in range_constexpr(8)],
+                                            fx.Float32,
+                                        ).to(oc)
+                                    else:
+                                        hv = Vec.from_elements(
+                                            [acc[i] for i in range_constexpr(8)], fx.Float32
+                                        ).to(oc)
+                                    hv_i32 = hv.bitcast(fx.Int32).ir_value()
+                                    lds_store_b128(
+                                        stC_idx,
+                                        (row_rel * STORE_PITCH + col_rel) * 2,
+                                        hv_i32,
+                                    )
+
+                # -- Shared LDS -> global --
+                # dscnt-only barrier: the store reads LDS, not the e8m0 scales still
+                # in flight, so their storecnt wait moves past the store below.
+                if const_expr(stage1_quant_out and stage1_act):
+                    rocdl.s_wait_dscnt(0)
+                    rocdl.s_barrier_signal(-1)
+                    rocdl.s_barrier_wait(-1)
+                else:
+                    workgroup_barrier()
+                if const_expr(enable_ep_scatter):
+                    # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
+                    # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
+                    # are padded to a pow2 so perRankSize divides by the slot stride
+                    # exactly -- which lets (pe, slot) fold into ONE row index
+                    # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
+                    # measured in-kernel from the lsa_ptr stride. Each wave issues the
+                    # gather-stores for its row groups, 8 rows per instruction.
+                    # Quantized rows are addressed in bytes, so a 4-bit element just
+                    # halves the row length; the scale plane rides a second store.
+                    elem_bytes = 1 if ep_quant_bits else 2
+                    _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
+                    _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
+                    _stride_elems = ep_slot_stride_bytes // elem_bytes
+                    _GRP = SCATTER_GROUP_ROWS
+                    _ngrp = scatter_groups
+                    _pr = _ep_lsa1 - _ep_lsa0
+                    _K = fx.Int32(_pr // fx.Int64(ep_slot_stride_bytes))
+                    # OOB row-index bound: valid idx = pe*K+slot < world*K (world<=256,
+                    # slot<K); dropped/padding rows use this index so the HW drops them.
+                    _oob = _K * fx.Int32(ep_world_size)
+                    _comb_ptr_ty = fx.PointerType.get(
+                        T.i8 if ep_quant_bits else T.i16,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=16,
+                    )
+                    _comb_iter = fx.inttoptr(
+                        _comb_ptr_ty,
+                        _ep_lsa0 + fx.Int64(ep_combine_input_offset),
+                    )
+                    _comb_view = tensor_view(
+                        _comb_iter, (_oob, _row_elems), (_stride_elems, 1)
+                    )
+                    _lds_c = tensor_view(
+                        fx.recast_iter(fx.Int8 if ep_quant_bits else oc, base_ptr),
+                        (tile_m, _lds_row_elems),
+                        (_lds_row_elems, 1),
+                    )
+                    if const_expr(ep_quant_bits):
+                        # Byte column of this tile in the payload plane: one byte per
+                        # element on the fp8 wire, half that on fp4.
+                        _elem_div = 8 // ep_quant_bits
+                        _gboff = blk_n64 // _elem_div
+                        # The scale plane starts one payload plane into the slot; blk_n
+                        # is a multiple of tile_n, itself a multiple of the scale block,
+                        # so the tile's scale run starts whole.
+                        _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
+                    else:
+                        _gboff = blk_n * elem_bytes
+                    _passes = scatter_passes
+                    # Compute all of this wave's destination indices lane-wise.
+                    # The old LDS path scalarized each row first and consequently
+                    # expanded signed / and % once per descriptor row.
+                    _scatter_idx_lanes = []
+                    for scatter_vector in range_constexpr(scatter_dst_vectors):
+                        _rm_dst_lane = _rm_dst_lanes[scatter_vector]
+                        _dst_pe_lane = _rm_dst_lane // fx.Int32(ep_destination_stride)
+                        _dst_slot_lane = _rm_dst_lane % fx.Int32(ep_destination_stride)
+                        _scatter_idx_lane = _dst_pe_lane * _K + _dst_slot_lane
+                        _scatter_keep_lane = _scatter_lane_valids[scatter_vector] & (
+                            _rm_dst_lane >= fx.Int32(0)
+                        )
+                        _scatter_idx_lanes.append(
+                            _scatter_keep_lane.select(_scatter_idx_lane, _oob)
+                        )
+
+                    def issue_scatter_group(group, scatter_vector, vector_pass):
+                        base_row = group * fx.Int32(_GRP)
+                        row_indices = []
+                        for i in range_constexpr(_GRP):
+                            src_lane = fx.Int32(vector_pass * _GRP + i)
+                            row_indices.append(
+                                fx.Int32(
+                                    rocdl.readlane(
+                                        T.i32,
+                                        _raw(_scatter_idx_lanes[scatter_vector]),
+                                        _raw(src_lane),
+                                    )
                                 )
                             )
-                        )
-                    # Geometry is explicit because traced layout leaves are not
-                    # Python integers suitable for the descriptor bitfields.
-                    desc = make_tensor_gather_descriptor(
-                        _comb_view,
-                        _lds_c,
-                        row_indices,
-                        row_width=_lds_row_elems,
-                        tensor_dim0=_row_elems,
-                        tensor_dim1=_oob.ir_value(),
-                        stride=_stride_elems,
-                        elem_bytes=elem_bytes,
-                        index_size=32,
-                        lds_byte_offset=fx.index_cast(
-                            T.index,
-                            base_row * fx.Int32(_lds_row_elems * elem_bytes),
-                        ),
-                        global_byte_offset=_gboff,
-                    )
-                    tensor_store_gather(desc)
-                    if const_expr(ep_quant_bits):
-                        # Same rows and slot stride as the payload store; only the
-                        # plane base and the row width differ.
-                        desc_s = make_tensor_gather_descriptor(
+                        # Geometry is explicit because traced layout leaves are not
+                        # Python integers suitable for the descriptor bitfields.
+                        desc = make_tensor_gather_descriptor(
                             _comb_view,
                             _lds_c,
                             row_indices,
-                            row_width=_lds_scale_row_bytes,
-                            tensor_dim0=EP_SCALE_ROW_BYTES,
+                            row_width=_lds_row_elems,
+                            tensor_dim0=_row_elems,
                             tensor_dim1=_oob.ir_value(),
                             stride=_stride_elems,
-                            elem_bytes=1,
+                            elem_bytes=elem_bytes,
                             index_size=32,
                             lds_byte_offset=fx.index_cast(
                                 T.index,
-                                fx.Int32(_ep_scale_lds_off)
-                                + base_row * fx.Int32(_lds_scale_row_bytes),
+                                base_row * fx.Int32(_lds_row_elems * elem_bytes),
                             ),
-                            global_byte_offset=_gboff_s,
+                            global_byte_offset=_gboff,
                         )
-                        tensor_store_gather(desc_s)
+                        tensor_store_gather(desc)
+                        if const_expr(ep_quant_bits):
+                            # Same rows and slot stride as the payload store; only the
+                            # plane base and the row width differ.
+                            desc_s = make_tensor_gather_descriptor(
+                                _comb_view,
+                                _lds_c,
+                                row_indices,
+                                row_width=_lds_scale_row_bytes,
+                                tensor_dim0=EP_SCALE_ROW_BYTES,
+                                tensor_dim1=_oob.ir_value(),
+                                stride=_stride_elems,
+                                elem_bytes=1,
+                                index_size=32,
+                                lds_byte_offset=fx.index_cast(
+                                    T.index,
+                                    fx.Int32(_ep_scale_lds_off)
+                                    + base_row * fx.Int32(_lds_scale_row_bytes),
+                                ),
+                                global_byte_offset=_gboff_s,
+                            )
+                            tensor_store_gather(desc_s)
 
-                # Let every wave issue its own groups directly. This avoids
-                # cloning every descriptor behind a wave-selection branch.
-                for scatter_pass in range_constexpr(_passes):
-                    group = wave + fx.Int32(scatter_pass * num_waves)
-                    scatter_vector = scatter_pass // SCATTER_PASSES_PER_VECTOR
-                    vector_pass = scatter_pass % SCATTER_PASSES_PER_VECTOR
-                    if const_expr(_ngrp % num_waves):
-                        if group < fx.Int32(_ngrp):
+                    # Let every wave issue its own groups directly. This avoids
+                    # cloning every descriptor behind a wave-selection branch.
+                    for scatter_pass in range_constexpr(_passes):
+                        group = wave + fx.Int32(scatter_pass * num_waves)
+                        scatter_vector = scatter_pass // SCATTER_PASSES_PER_VECTOR
+                        vector_pass = scatter_pass % SCATTER_PASSES_PER_VECTOR
+                        if const_expr(_ngrp % num_waves):
+                            if group < fx.Int32(_ngrp):
+                                issue_scatter_group(group, scatter_vector, vector_pass)
+                        else:
                             issue_scatter_group(group, scatter_vector, vector_pass)
+                    tdm_ops.tensor_wait(0)
+                else:
+                    if const_expr(stage1_act):
+                        out_divisor = 4 if is_fp4_quant else 2
+                        out_stride = i32_n // out_divisor
+                        out_col_off = blk_n64 // out_divisor
                     else:
-                        issue_scatter_group(group, scatter_vector, vector_pass)
-                tdm_ops.tensor_wait(0)
+                        out_stride = c_stride
+                        out_col_off = c_inner_off
+                    if const_expr(stage1_quant_out and stage1_act):
+                        oc_store = fx.Int8
+                        c_iter = fx.recast_iter(fx.Int8, arg_c)
+                    else:
+                        oc_store = oc
+                        c_iter = fx.recast_iter(oc, arg_c)
+                    if const_expr(a_preshuffled and stage1_quant_out and stage1_act):
+                        # M is allocated in complete M16 blocks. The final block's
+                        # padding rows are unused, so transfer whole K32/M16 slabs.
+                        c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
+                        gtC = tensor_view(
+                            c_iter + c_off_rt,
+                            (tile_m // 16, STORE_N * 16),
+                            (out_stride * 16, 1),
+                        )
+                        atomC = make_tdm_store(gtC, (mn_oob + 15) // 16, out_stride * 16)
+                        src = tensor_view(
+                            fx.recast_iter(oc_store, base_ptr),
+                            (tile_m // 16, STORE_N * 16),
+                            (STORE_N * 16, 1),
+                        )
+                        fx.copy(atomC, src, gtC)
+                    else:
+                        c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
+                        if const_expr(STORE_PAD == 0):
+                            gtC = tensor_view(
+                                c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
+                            )
+                            atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                            src = tensor_view(
+                                fx.recast_iter(oc_store, base_ptr),
+                                (tile_m, STORE_N),
+                                (STORE_N, 1),
+                            )
+                        else:
+                            # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
+                            # extent clamps the inner axis to STORE_N so the pad never lands.
+                            gtC = tensor_view(
+                                c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
+                            )
+                            atomC = fx.rocdl.make_tdm_atom(
+                                gtC,
+                                [mn_oob, STORE_N],
+                                strides=[out_stride, None],
+                                num_warps=num_waves,
+                            )
+                            src = tensor_view(
+                                fx.recast_iter(oc_store, base_ptr),
+                                (tile_m, STORE_PITCH),
+                                (STORE_PITCH, 1),
+                            )
+                        fx.copy(atomC, src, gtC)
+                    if const_expr(stage1_quant_out and stage1_act):
+                        rocdl.s_wait_storecnt(0)
+                    tdm_ops.tensor_wait(0)
+
+            # Keep the v80 six/seven bodies adjacent and emit the output tail once.
+            if const_expr(interleaved_m_rows and not SUPPORT_EXPLICIT_VGPR_PARTITION):
+                if fx.Boolean(llvm_dialect.intr_expect(
+                    ((4 * M_ROW_STEP < mn_oob) & (7 * M_ROW_STEP >= mn_oob)).ir_value(),
+                    fx.Boolean(True).ir_value(),
+                )):
+                    if 6 * M_ROW_STEP >= mn_oob:
+                        run_mainloop(bool(interleaved_lds_load_on), m_reps=6)
+                    else:
+                        run_mainloop(bool(interleaved_lds_load_on), m_reps=7)
+                else:
+                    if 4 * M_ROW_STEP >= mn_oob:
+                        run_mainloop(bool(interleaved_lds_load_on), m_reps=4)
+                    else:
+                        run_mainloop(bool(interleaved_lds_load_on), m_reps=8)
+            elif const_expr(interleaved_m_rows):
+                if 4 * M_ROW_STEP >= mn_oob:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=4)
+                elif 7 * M_ROW_STEP < mn_oob:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=8)
+                elif 6 * M_ROW_STEP >= mn_oob:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=6)
+                else:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=7)
             else:
-                if const_expr(stage1_act):
-                    out_divisor = 4 if is_fp4_quant else 2
-                    out_stride = i32_n // out_divisor
-                    out_col_off = blk_n64 // out_divisor
-                else:
-                    out_stride = c_stride
-                    out_col_off = c_inner_off
-                if const_expr(stage1_quant_out and stage1_act):
-                    oc_store = fx.Int8
-                    c_iter = fx.recast_iter(fx.Int8, arg_c)
-                else:
-                    oc_store = oc
-                    c_iter = fx.recast_iter(oc, arg_c)
-                if const_expr(a_preshuffled and stage1_quant_out and stage1_act):
-                    # M is allocated in complete M16 blocks. The final block's
-                    # padding rows are unused, so transfer whole K32/M16 slabs.
-                    c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
-                    gtC = tensor_view(
-                        c_iter + c_off_rt,
-                        (tile_m // 16, STORE_N * 16),
-                        (out_stride * 16, 1),
-                    )
-                    atomC = make_tdm_store(gtC, (mn_oob + 15) // 16, out_stride * 16)
-                    src = tensor_view(
-                        fx.recast_iter(oc_store, base_ptr),
-                        (tile_m // 16, STORE_N * 16),
-                        (STORE_N * 16, 1),
-                    )
-                    fx.copy(atomC, src, gtC)
-                else:
-                    c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-                    if const_expr(STORE_PAD == 0):
-                        gtC = tensor_view(
-                            c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
-                        )
-                        atomC = make_tdm_store(gtC, mn_oob, out_stride)
-                        src = tensor_view(
-                            fx.recast_iter(oc_store, base_ptr),
-                            (tile_m, STORE_N),
-                            (STORE_N, 1),
-                        )
-                    else:
-                        # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
-                        # extent clamps the inner axis to STORE_N so the pad never lands.
-                        gtC = tensor_view(
-                            c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
-                        )
-                        atomC = fx.rocdl.make_tdm_atom(
-                            gtC,
-                            [mn_oob, STORE_N],
-                            strides=[out_stride, None],
-                            num_warps=num_waves,
-                        )
-                        src = tensor_view(
-                            fx.recast_iter(oc_store, base_ptr),
-                            (tile_m, STORE_PITCH),
-                            (STORE_PITCH, 1),
-                        )
-                    fx.copy(atomC, src, gtC)
-                if const_expr(stage1_quant_out and stage1_act):
-                    rocdl.s_wait_storecnt(0)
-                tdm_ops.tensor_wait(0)
+                run_mainloop(bool(interleaved_lds_load_on))
+            emit_common_epilogue()
 
         if const_expr(persistent_workers > 0):
             # Every wave must retire the output store before another wave

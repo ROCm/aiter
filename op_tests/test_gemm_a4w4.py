@@ -111,10 +111,23 @@ def run_gemm_asm(
     return out
 
 
-def _test_gemm_gfx1250(dtype, M, N, K):
+def _preshuffle_a_pair128(xq):
+    """Row-major ``[M, K/2]`` fp4x2 A in the FlyDSL compute kernel's ``a_preshuffle``
+    layout: the bytes of ``[M/2, K/256, 2, 128]``, each row pair interleaved per 128-byte
+    K chunk. This differs from the ASM F4GEMM A preshuffle (16x16 tiles)."""
+    x = xq.view(torch.uint8)
+    m, kp = x.shape
+    out = x.view(m // 2, 2, kp // 128, 128).permute(0, 2, 1, 3).contiguous()
+    return out.view(m, kp).view(xq.dtype)
+
+
+def _test_gemm_gfx1250(dtype, M, N, K, fyd_apre=0):
     """gemm_a4w4 as ATOM calls it on gfx1250: the weight and the activation scale in the
     32x4 layout, the activation quantized straight into it. ``tuned`` is the public op, so
-    it runs the backend the tuned CSV (or the FlyDSL fallback) picks for this shape."""
+    it runs the backend the tuned CSV (or the FlyDSL fallback) picks for this shape.
+    With ``fyd_apre``, both take A preshuffled the way each kernel reads it: ``tuned`` is
+    then the tuned FlyDSL compute kernel (row pairs interleaved per 128-byte K chunk) and
+    ``asm`` the ASM A+B preshuffle kernel (16x16 tiles, as B)."""
     # Importing aiter.ops.flydsl needs flydsl itself, so only a FlyDSL run may import it.
     from aiter.ops.gemm_op_a4w4 import (
         _FLYDSL_AVAILABLE,
@@ -153,6 +166,54 @@ def _test_gemm_gfx1250(dtype, M, N, K):
             f"M={M} N={N} K={K}: expected a FlyDSL "
             f"{'compute' if want_compute else 'general'} kernel, got {config[1] or 'asm'}"
         )
+    if fyd_apre:
+        candidates = {}
+        # The B-only tuned row is reused; only the A layout and a_preshuffle change.
+        kernel = None
+        if _FLYDSL_AVAILABLE and config[0] == "flydsl":
+            from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+                parse_a4w4_kernel_name,
+                run_gemm_a4w4_mxscale_bpreshuffle_gfx1250,
+            )
+
+            kernel = parse_a4w4_kernel_name(config[1])
+        if (
+            kernel
+            and kernel["compute_bound"]
+            and kernel["tile_k"] == 256
+            and M % 2 == 0
+        ):
+            xq_pre = _preshuffle_a_pair128(xq)
+
+            def run_tuned_apre():
+                out = torch.empty((M, N), dtype=dtype)
+                return run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
+                    xq_pre, wq, xs, ws, out, config[1], a_preshuffle=True
+                )
+
+            candidates["tuned"] = run_tuned_apre
+        else:
+            aiter.logger.warning(
+                "--fyd_apre 1: no FlyDSL run for M=%s N=%s K=%s, it needs a FlyDSL "
+                "compute kernel with tile_k=256 and an even M; the tuned pick is %s",
+                M,
+                N,
+                K,
+                config[1] or "asm",
+            )
+        if M % 16 == 0:
+            xq_asm_pre = shuffle_weight(xq, layout=(16, 16))
+            candidates["asm"] = lambda: gemm_mxfp4_asm(
+                xq_asm_pre, wq, xs, ws, dtype=dtype, a_preshuffle=True
+            )
+        else:
+            aiter.logger.warning(
+                "--fyd_apre 1: no asm run for M=%s N=%s K=%s, the ASM A preshuffle "
+                "needs M divisible by 16",
+                M,
+                N,
+                K,
+            )
     ret = {
         "gfx": get_gfx(),
         "tuned kernel": config[1] if config[0] == "flydsl" else "asm",
@@ -172,9 +233,9 @@ def _test_gemm_gfx1250(dtype, M, N, K):
 
 
 @benchmark()
-def test_gemm(dtype, M, N, K):
+def test_gemm(dtype, M, N, K, fyd_apre=0):
     if get_gfx() == "gfx1250":
-        return _test_gemm_gfx1250(dtype, M, N, K)
+        return _test_gemm_gfx1250(dtype, M, N, K, fyd_apre)
     ret = {}
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
@@ -249,6 +310,15 @@ def tuned_shapes():
         return []  # no tuned shapes on this install
     table = table[(table["gfx"] == get_gfx()) & (table["cu_num"] == get_cu_num())]
     return sorted(set(table[["M", "N", "K"]].itertuples(index=False, name=None)))
+
+
+def _fyd_apre_modes(v):
+    """``--fyd_apre`` value: 0, 1 or a comma list such as 0,1."""
+    modes = dtypes.str2tuple(v)
+    modes = modes if isinstance(modes, tuple) else (modes,)
+    if not modes or not set(modes) <= {0, 1}:
+        raise argparse.ArgumentTypeError(f"expected 0, 1 or 0,1, got {v!r}")
+    return modes
 
 
 def main():
@@ -365,9 +435,25 @@ def main():
     off-grid M it lacks.
     e.g.: --csv aiter/configs/model_configs/dsr1_a4w4_mxscale_bpreshuffle_tuned_gemm.csv""",
     )
+    parser.add_argument(
+        "--fyd_apre",
+        type=_fyd_apre_modes,
+        default=(0,),
+        metavar="0|1|0,1",
+        help="""gfx1250 A layout, one result row per value.
+    0: the tuned op and ASM on a row-major A (B-only preshuffle).
+    1: A+B preshuffle, A preshuffled the way each kernel reads it. The tuned FlyDSL
+    compute kernel takes row pairs interleaved per 128-byte K chunk and shares the
+    tuned row of 0, which must name a compute kernel with tile_k=256. ASM takes 16x16
+    tiles, as B, and needs M divisible by 16.
+    e.g.: --fyd_apre 1
+          --fyd_apre 0,1""",
+    )
     args = parser.parse_args()
 
     gfx1250 = get_gfx() == "gfx1250"
+    if 1 in args.fyd_apre and not gfx1250:
+        parser.error("--fyd_apre 1 runs gfx1250 kernels")
     if args.csv is not None:
         if not os.path.exists(args.csv):
             raise FileNotFoundError(f"CSV file not found: {args.csv}")
@@ -392,8 +478,9 @@ def main():
     df = []
     for dtype in args.dtype:
         for m, n, k in shapes:
-            ret = test_gemm(dtype, m, n, k)
-            df.append(ret)
+            for fyd_apre in args.fyd_apre:
+                ret = test_gemm(dtype, m, n, k, fyd_apre)
+                df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)

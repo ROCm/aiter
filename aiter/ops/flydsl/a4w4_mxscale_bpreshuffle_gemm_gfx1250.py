@@ -6,7 +6,8 @@
 ``A [M, K / 2]`` and ``B [N, K / 2]`` are packed fp4x2 (E2M1); ``B`` is 16x16
 preshuffled (``shuffle_weight``). Both E8M0 block scales are 32x4 shuffled
 (``shuffle_mxfp8fp4_scale``) and shaped ``[pad32(rows), K / 32]``, the layout the
-gfx1250 ASM F4GEMM reads too. A is row-major (no A preshuffle).
+gfx1250 ASM F4GEMM reads too. A is row-major, except that a compute kernel with
+tile_k=256 also takes ``a_preshuffle``: row pairs interleaved per 128-byte K chunk.
 """
 
 from __future__ import annotations
@@ -264,12 +265,18 @@ def a4w4_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool:
 
 
 def _launch_specialization(
-    cfg: dict, M: int, cluster_m: int, out_is_f16: int, bounded_m: bool | None
+    cfg: dict,
+    M: int,
+    cluster_m: int,
+    out_is_f16: int,
+    bounded_m: bool | None,
+    a_preshuffle: bool = False,
 ):
     """(launcher, constexpr arguments) of a kernel config for this M.
 
     ``bounded_m`` is the compute kernel's masked-M variant, needed when M does not fill
-    whole tiles; None derives it from M."""
+    whole tiles; None derives it from M. ``a_preshuffle`` selects the compute kernel's
+    row-pair A layout."""
     tile_m, tile_n, tile_k = cfg["tile_m"], cfg["tile_n"], cfg["tile_k"]
     m_warp, n_warp, nb = cfg["m_warp"], cfg["n_warp"], cfg["num_buffers"]
     split_k, cluster_n = cfg["split_k"], cfg["cluster_n"]
@@ -282,7 +289,7 @@ def _launch_specialization(
             cluster_m,
             cluster_n,
             split_k,
-            False,  # a_preshuffle
+            bool(a_preshuffle),
             split_k > 1,  # fused_splitk
             bounded_m,
         )
@@ -342,6 +349,7 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
     B_scale: Tensor,
     Out: Tensor,
     kernel_name: str,
+    a_preshuffle: bool = False,
 ) -> Tensor:
     """``Out = dequant(A) @ dequant(B).T`` on the FlyDSL kernel named by a tuned
     row; writes into ``Out`` ([M, N] bf16 / fp16) and returns it.
@@ -349,6 +357,10 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
     A: ``[M, K / 2]`` fp4x2, B: ``[N, K / 2]`` fp4x2 16x16-preshuffled,
     A_scale / B_scale: e8m0 ``[pad32(M), K / 32]`` / ``[pad32(N), K / 32]`` in 32x4
     shuffled storage.
+
+    ``a_preshuffle`` (compute kernels with tile_k=256 and an even M only): A holds the
+    bytes of ``[M / 2, K / 256, 2, 128]`` -- each row pair interleaved per 128-byte K
+    chunk -- in the same ``[M, K / 2]`` buffer. The scales keep their layout.
     """
     cfg = parse_a4w4_kernel_name(kernel_name)
     if cfg is None:
@@ -382,6 +394,13 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
     err = a4w4_launch_error(cfg, M, N, K)
     if err is not None:
         raise RuntimeError(f"[FlyDSL gfx1250 a4w4] {kernel_name!r}: {err}")
+    if a_preshuffle and not (
+        cfg["compute_bound"] and cfg["tile_k"] == 256 and M % 2 == 0
+    ):
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 a4w4] {kernel_name!r}: a_preshuffle needs a compute "
+            f"kernel with tile_k=256 and an even M, got M={M}"
+        )
     cluster_m = a4w4_fit_cluster_m(cfg, M)
     if A.stride(1) != 1 or Out.stride(1) != 1:
         raise RuntimeError("[FlyDSL gfx1250 a4w4] A and Out rows must be contiguous")
@@ -442,7 +461,7 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
         _ptr_arg(Out),
     )
     launch, specialization = _launch_specialization(
-        cfg, M, cluster_m, out_is_f16, bounded_m=None
+        cfg, M, cluster_m, out_is_f16, bounded_m=None, a_preshuffle=a_preshuffle
     )
     _run_compiled(
         launch, *runtime_args, *specialization, specialization_key=specialization
