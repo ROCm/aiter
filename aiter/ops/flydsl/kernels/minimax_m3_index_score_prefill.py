@@ -266,7 +266,7 @@ def kernel_name(g, k_fp4=False, q_fp8=False) -> str:
     here, `contig_k` included: two layouts compile to different stores and must
     not share a name."""
     if k_fp4:
-        name = f"m3_index_score_prefill_fp4d_q{g['tile_q']}{'_qf8' if q_fp8 else ''}"
+        name = f"m3_index_score_prefill_fp4_q{g['tile_q']}{'_qf8' if q_fp8 else ''}"
         name += f"_L{g['pages_per_wave']}_klds"
     else:
         name = f"m3_index_score_prefill_q{g['tile_q']}_fp8"
@@ -1311,8 +1311,9 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False):
                         store_run(base + fx.Int32(j + 1 - PPW), runs)
                         runs = []
 
-    # The kernel's argument list is its ABI, so the fp8 one stays exactly as it was and
-    # the MXFP4 one adds the scale view; both run `score_body`.
+    # The argument list is the kernel's ABI: the fp8 kernel takes (q, k, score, ...) and
+    # the MXFP4 kernel adds the scale view `arg_ks` (and its block stride) after k. Both
+    # run `score_body`.
     if k_fp4:
 
         @flyc.kernel(

@@ -14,7 +14,7 @@ FlyDSL kernel) scores the dequantized values as fp8 -- nothing from the kernel u
 test. e8m0 bytes 0 and 255 are outside its contract and are not generated.
 
 Run (exits nonzero if any check fails):
-    python op_tests/test_flydsl_minimax_m3_index_score_prefill_fp4.py [--case SUBSTR ...] [--no-perf]
+    python op_tests/test_flydsl_minimax_m3_index_score_prefill_fp4.py [--case SUBSTR ...]
 """
 
 import argparse
@@ -47,7 +47,6 @@ from op_tests.test_flydsl_minimax_m3_index_score import (
     P,
     _prefill_work,
     aiter_scores,
-    assert_matches_aiter,
     make_prefill_case,
     prefill_alloc_score,
     run_prefill,
@@ -55,6 +54,19 @@ from op_tests.test_flydsl_minimax_m3_index_score import (
 
 SUPPORTED_GFX = ["gfx950"]  # the FlyDSL scorers are built for gfx950
 QCHUNK = 512  # pages quantized per torch call; the reference makes fp32 temporaries
+
+
+def check_equal(got, ref, what):
+    """Bit-exact comparison, reported through aiter's `checkAllclose`."""
+    err = checkAllclose(ref.float(), got.float(), rtol=0, atol=0, msg=f"{what}: ")
+    assert err == 0, f"{what}: mismatch fraction {err}"
+
+
+def check_scores(got, ref, live, what):
+    """Every live slot was written and equals `ref`, bit for bit."""
+    unwritten = int((live & (got == SENTINEL)).sum())
+    assert unwritten == 0, f"{what}: {unwritten} live slots left unwritten"
+    check_equal(got[live], ref[live], what)
 
 
 # ---------------------------------------------------------------------------
@@ -203,20 +215,20 @@ def check_prefill_matches_aiter_and_fp8_kernel(shape, qdt):
     c, kd, ks = fp4_prefill_case(*shape)
     ref, live = aiter_scores(c)
     got = run_fp4(c, kd, ks, qdt)
-    assert_matches_aiter(got, ref, live, f"{shape}")
-    assert torch.equal(got[live], run_prefill(c)[live])
+    check_scores(got, ref, live, f"{shape}")
+    check_equal(got[live], run_prefill(c)[live], f"{shape}: fp8 kernel")
 
 
 def check_prefill_every_geometry(shape, qdt):
     c, kd, ks = fp4_prefill_case(*shape)
     ref, live = aiter_scores(c)
-    assert_matches_aiter(run_fp4(c, kd, ks, qdt), ref, live, f"{shape}")
+    check_scores(run_fp4(c, kd, ks, qdt), ref, live, f"{shape}")
 
 
 def check_prefill_two_heads(qdt):
     c, kd, ks = fp4_prefill_case(2, 256, 3000, heads=2)
     ref, live = aiter_scores(c)
-    assert_matches_aiter(run_fp4(c, kd, ks, qdt), ref, live, "heads=2")
+    check_scores(run_fp4(c, kd, ks, qdt), ref, live, "heads=2")
 
 
 def check_prefill_ragged_tails(ctx):
@@ -224,13 +236,14 @@ def check_prefill_ragged_tails(ctx):
     cache holds, and must not reach a live score."""
     c, kd, ks = fp4_prefill_case(3, min(ctx, 128), ctx)
     ref, live = aiter_scores(c)
-    assert_matches_aiter(run_fp4(c, kd, ks), ref, live, f"ctx={ctx}")
+    check_scores(run_fp4(c, kd, ks), ref, live, f"ctx={ctx}")
 
 
 def check_prefill_scale_extremes(qdt):
     """Per-token magnitudes spread over 2^-3 .. 2^3, so the e8m0 bytes walk across
     the window e4m3 can still hold exactly: the scale really is applied per lane
-    group and per token, not once."""
+    group and per token, not once. Bytes outside that window have no fp8 judge:
+    see `check_prefill_scale_bytes_beyond_e4m3`."""
     c = make_prefill_case(2, 256, 3000)
     span = torch.randint(-3, 4, (c["cache"].shape[0], P, 1), device="cuda")
     k = c["cache"].to(torch.bfloat16) * (2.0 ** span.to(torch.bfloat16))
@@ -240,7 +253,49 @@ def check_prefill_scale_extremes(qdt):
     assert ks.min() < ks.max() - 6
     c = dict(c, cache=as_fp8)
     ref, live = aiter_scores(c)
-    assert_matches_aiter(run_fp4(c, kd, ks, qdt), ref, live, "scales")
+    check_scores(run_fp4(c, kd, ks, qdt), ref, live, "scales")
+
+
+E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]  # magnitudes of the 3 low code bits
+# e8m0 bytes below 119 and above 133 leave e4m3's exact range for K, so aiter's fp8
+# scorer cannot judge them; 119 and 133 are the edge, 127 is 2^0.
+WIDE_BYTES = [100, 110, 118, 119, 127, 133, 134, 140, 150]
+
+
+def check_prefill_scale_bytes_beyond_e4m3(qdt):
+    """e8m0 bytes the e4m3 oracle cannot hold (< 119 and > 133). The cache is built
+    straight from e2m1 codes and one scale byte per token, and the expected scores
+    are an fp64 dequantisation computed here, value = e2m1 * 2^(byte - 127), then
+    `max over live tokens of dot(K, Q)` -- nothing from the kernel or the quantizer.
+    Q holds +-2^-2..2^1, so every dot is a sum of multiples of 2^-3 and exact in fp32
+    in any order: the comparison is bit for bit."""
+    c = make_prefill_case(1, 128, 1000)
+    heads, rows = c["q8"].shape[1], c["q8"].shape[0]
+    g = torch.Generator(device="cuda").manual_seed(1)
+    q = 2.0 ** torch.randint(-2, 2, (rows, heads, D), device="cuda", generator=g)
+    q8 = (q * (1 - 2 * torch.randint(0, 2, q.shape, device="cuda", generator=g))).to(
+        dtypes.fp8
+    )
+    npages = c["bt"].numel()
+    kd = torch.randint(0, 256, (npages, P, D // 2), device="cuda", generator=g).to(
+        torch.uint8
+    )
+    byte = torch.tensor(WIDE_BYTES, dtype=torch.uint8, device="cuda")
+    ks = byte[torch.arange(npages * P, device="cuda") % len(WIDE_BYTES)]
+    ks = ks.view(npages, P, 1).expand(npages, P, D // 32).contiguous()
+    assert ks.min() < 119 and ks.max() > 133
+    # fp64 dequantisation: low nibble is the even element, bit 3 is the sign
+    code = torch.stack([kd & 0xF, kd >> 4], dim=-1).reshape(npages, P, D).long()
+    mag = torch.tensor(E2M1, dtype=torch.float64, device="cuda")[code & 7]
+    val = torch.where(code & 8 != 0, -mag, mag)
+    val = val * 2.0 ** (ks.double() - 127).repeat_interleave(32, dim=-1)
+    # expected[h, r, p] = max over t with p*P + t <= prefix + r of dot(K, Q) * 1
+    pos = (c["prefix"][0] + torch.arange(rows, device="cuda")).view(1, rows, 1, 1)
+    gpos = (torch.arange(c["mb"] * P, device="cuda")).view(1, 1, c["mb"], P)
+    dots = torch.einsum("rhd,pld->hrpl", q8.double(), val[c["bt"][0].long()])
+    ref = dots.masked_fill(gpos > pos, -float("inf")).amax(dim=-1).float()
+    c = dict(c, q8=q8, q_bf16=q8.float().bfloat16())
+    check_scores(run_fp4(c, kd, ks, qdt), ref, torch.isfinite(ref), "wide scale bytes")
 
 
 def check_prefill_ragged_batch_and_garbage_tails(qdt):
@@ -260,15 +315,15 @@ def check_prefill_ragged_batch_and_garbage_tails(qdt):
                 ks2[page, first_dead:] = 0xFF
     poisoned = run_fp4(c, kd2, ks2, qdt)
     live = base != SENTINEL
-    assert torch.equal(base[live], poisoned[live])
+    check_equal(poisoned[live], base[live], "garbage tails")
     ref, ref_live = aiter_scores(c)
-    assert_matches_aiter(base, ref, ref_live, "ragged lengths")
+    check_scores(base, ref, ref_live, "ragged lengths")
 
 
 def check_prefill_mixed_query_lengths_and_trailing_empty_request(qdt):
     c, kd, ks, ref, live = mixed_lengths_case()
     got = run_fp4(c, kd, ks, qdt)
-    assert_matches_aiter(got, ref, live, "mixed lengths + trailing empty")
+    check_scores(got, ref, live, "mixed lengths + trailing empty")
 
 
 def check_prefill_e4m3_q_strided_and_single_region():
@@ -282,9 +337,9 @@ def check_prefill_e4m3_q_strided_and_single_region():
     view = wide[:, :heads, :D]  # head stride 192, row stride 576 (both 16 B multiples)
     view.copy_(c["q8"])
     assert view.stride() == ((heads + 1) * (D + 64), D + 64, 1)
-    assert torch.equal(plain, run_fp4(dict(c, q8=view), kd, ks, "e4m3"))
+    check_equal(run_fp4(dict(c, q8=view), kd, ks, "e4m3"), plain, "strided q")
     kd1, ks1 = single_region_views(kd, ks)
-    assert torch.equal(plain, run_fp4(c, kd1, ks1, "e4m3"))
+    check_equal(run_fp4(c, kd1, ks1, "e4m3"), plain, "single-region pages")
 
 
 def expect_value_error(what, fn, *args, match=None):
@@ -356,7 +411,7 @@ def _prefill_bytes(batch, q_len, ctx_len, k_row_bytes, q_elem_bytes):
 
 
 @benchmark()
-def bench_prefill_fp4(batch, q_len, ctx_len):
+def test_prefill_fp4(batch, q_len, ctx_len):
     c, kd, ks = fp4_prefill_case(batch, q_len, ctx_len)
     ref, live = aiter_scores(c)
     ret = {"gfx": get_gfx()}
@@ -441,6 +496,13 @@ def build_cases():
         cases.append((f"scale_extremes_{qdt}", check_prefill_scale_extremes, (qdt,)))
         cases.append(
             (
+                f"scale_bytes_beyond_e4m3_{qdt}",
+                check_prefill_scale_bytes_beyond_e4m3,
+                (qdt,),
+            )
+        )
+        cases.append(
+            (
                 f"ragged_batch_and_garbage_tails_{qdt}",
                 check_prefill_ragged_batch_and_garbage_tails,
                 (qdt,),
@@ -465,15 +527,16 @@ def build_cases():
 
 
 def parse_args(argv=None):
-    ap = argparse.ArgumentParser(description="MXFP4 prefill index score checks + sweep")
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="MXFP4 prefill index score checks + sweep",
+    )
     ap.add_argument(
         "--case",
         nargs="*",
         default=None,
-        help="run only the correctness cases whose name contains one of these",
-    )
-    ap.add_argument(
-        "--no-perf", action="store_true", help="correctness cases only, no perf table"
+        help="run only the correctness cases whose name contains one of these\n"
+        "e.g.: --case rejections scale_\n",
     )
     ap.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 4])
     ap.add_argument("--q-len", type=int, nargs="*", default=[512, 4096])
@@ -494,7 +557,8 @@ def main(argv=None):
         try:
             check(*cargs)
             rows.append({"case": name, "status": "PASS", "detail": ""})
-        except (AssertionError, RuntimeError, ValueError) as e:  # list every failure
+        except AssertionError as e:  # list every failed check; a HIP RuntimeError or
+            # an unexpected ValueError propagates, so the run stops on a bad context
             rows.append({"case": name, "status": "FAIL", "detail": repr(e)[:200]})
     if rows:
         aiter.logger.info(
@@ -509,10 +573,8 @@ def main(argv=None):
             "mxfp4 prefill: %d of %d checks failed: %s", len(failed), len(rows), failed
         )
         return 1
-    if args.no_perf:
-        return 0
     perf = [
-        bench_prefill_fp4(b, q, c)
+        test_prefill_fp4(b, q, c)
         for b, q, c in itertools.product(args.batch, args.q_len, args.ctx_len)
         if q <= c
     ]
