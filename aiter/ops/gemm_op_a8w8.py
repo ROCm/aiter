@@ -30,7 +30,7 @@ from ..ops.gemm_op_common import (
     with_mxscale_w_scale_block,
 )
 from ..utility import dtypes
-from ..utility.graph_alloc import persistent_alloc
+from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 from .mxfp8fp4gemm_common import (
     _MXFP8_GEMM_CONFIG_KEYS,
     get_mxfp8_asm_dir,
@@ -435,7 +435,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
 
 
 # Ref on https://github.com/ROCm/aiter/blob/1be4ee9f70a7a7de5e9f57de2c0ecb9d13ed5983/aiter/ops/gemm_op_a16w16.py#L37-L57
-@functools.lru_cache(maxsize=1024)
+@capture_scoped_cache
 def get_zero_bias_buf_keyed(
     device: torch.device, stream_id: int, out_shape: int
 ) -> Tensor:
