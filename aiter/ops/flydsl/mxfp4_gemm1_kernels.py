@@ -113,6 +113,8 @@ def _assert_supported(
         raise NotImplementedError(
             "flydsl mxfp4 GEMM1 hidden prefetch requires inline quantization"
         )
+    if BK != 256:
+        raise NotImplementedError(f"flydsl mxfp4 GEMM1 requires BK==256, got BK={BK}")
     if D_HIDDEN % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % {BK} == 0, got H={D_HIDDEN}"
@@ -150,9 +152,9 @@ def _assert_supported(
         raise NotImplementedError(
             "flydsl mxfp4 GEMM1 two-wave specialization requires effective BN64"
         )
-    if native_scale_layout and not (BM == 16 and out_dtype == "fp4"):
+    if native_scale_layout and BM != 16:
         raise NotImplementedError(
-            "flydsl mxfp4 GEMM1 native scale layout requires BM16 FP4 output"
+            "flydsl mxfp4 GEMM1 native scale layout requires BM16 output"
         )
     if k_wave not in (1, 2, 4):
         raise NotImplementedError(
@@ -172,15 +174,24 @@ def _assert_supported(
             raise NotImplementedError(
                 f"D_HIDDEN/BK={k_tiles} must be divisible by k_wave={k_wave}"
             )
-        if k_tiles // k_wave < 2:
-            raise NotImplementedError(
-                f"k_wave leaves fewer than 2 K tiles per wave: {k_tiles // k_wave}"
-            )
-    if (BM, use_nt, inline_quant) not in MXFP4_G1_VARIANTS[a_dtype]:
+    if D_HIDDEN // BK // k_wave < 2:
+        raise NotImplementedError(
+            "flydsl mxfp4 GEMM1 requires at least 2 K tiles per wave, "
+            f"got D_HIDDEN/BK/k_wave={D_HIDDEN // BK // k_wave}"
+        )
+    # FP8 BM16 inline quant may also load B cached (no NT); kept out of
+    # MXFP4_G1_VARIANTS so the tuner's search space is unchanged.
+    variant = (BM, use_nt, inline_quant)
+    inline_cached = a_dtype == "fp8" and variant == (16, False, True)
+    if variant not in MXFP4_G1_VARIANTS[a_dtype] and not inline_cached:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
             f"(a_dtype={a_dtype}, BM={BM}, use_nt={use_nt}, "
             f"inline_quant={inline_quant})"
+        )
+    if inline_quant and not use_nt and out_dtype != "fp8":
+        raise NotImplementedError(
+            "flydsl mxfp4 GEMM1 cached inline quantization requires FP8 output"
         )
 
 
