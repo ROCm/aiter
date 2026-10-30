@@ -15,6 +15,11 @@ for every batch and query length, at each grid key/value length, bisecting
 between grid points where the wrapper switches kernels. The heuristics stay
 the wrapper's own, so changing them needs no AOT change.
 
+Between grid points of the batch and query length the wrapper can still pick
+a launcher no grid point does, so each launcher it can pick at all
+(``_variant_space``) is replayed too, with its tile and split count pinned
+through the wrapper's own overrides.
+
 Usage:
     python -m aiter.aot.flydsl.fmha_fp8                          # DEFAULT_SHAPES
     python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128    # ad hoc
@@ -49,11 +54,17 @@ DEFAULT_SHAPES = {
     "kimi_k3_tp8": [(12, 12, 192, 128, "varlen_cross")],
 }
 # The sizes the wrapper is replayed at. Its heuristics compare tile and
-# workgroup counts against thresholds and the CU count, so the kernels change
-# only between these points, where the replay bisects. Past the longest
-# sequence the flattened tensors outgrow the int32 ABI.
+# workgroup counts against thresholds and the CU count, so along the key/value
+# length the kernels change only between these points, where the replay
+# bisects. Past the longest sequence the flattened tensors outgrow the int32
+# ABI.
 _BATCHES = (1, 2, 3, 4, 8, 16, 32, 64, 128)
 _SEQLENS = tuple(2**i for i in range(4, 18))
+# The query length of a pinned cross-attention replay: one causal split-K
+# serves, with a workspace far below the int32 ABI at every split count.
+_PINNED_SEQLEN_Q = 512
+# The wrapper's overrides a ``_variant_jobs`` job pins.
+_PINS = ("fp8_block_m", "num_kv_splits")
 
 
 def _layout(value: str | None) -> str:
@@ -82,14 +93,86 @@ def unsupported_reason(h: int, hkv: int, d: int, dv: int) -> str | None:
     return _fp8_config_reason(h, hkv, d, dv)
 
 
+def _variant_space(causal: bool, cross: bool) -> list[tuple[float, int, int, int]]:
+    """Every ``(rescale_threshold, block_m, num_kv_splits, batch_interleave_group)``
+    the wrapper can pick, as an upper bound derived from its heuristics.
+
+    - threshold: 6.0 while seqlen_kv <= _FP8_LONG_SEQ, else 4.0.
+    - block_m: the narrow tile only while kv_tiles <= _FP8_NARROW_MAX_KV_TILES.
+    - splits: a candidate s > 1 needs kv_tiles // s >= _FP8_AUTOSPLIT_MIN_TILES,
+      so the largest kv_tiles a (threshold, block_m) bucket admits bounds s.
+      Causal self-attention always lands in the skewed branch (kept < 0.75 once
+      split-K is allowed), which only returns 1 or 2.
+    - interleave group: > 1 only for causal self-attention without split-K.
+    """
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    wide = fa.DUALWAVE_SWP_BLOCK_M
+    narrow = wide // 2
+    long_tiles = fa._FP8_LONG_SEQ // fa._FP8_BLOCK_N
+    narrow_tiles = fa._FP8_NARROW_MAX_KV_TILES
+    unbounded = None
+
+    buckets = []  # (threshold, block_m, max kv_tiles in the bucket or None)
+    buckets.append((6.0, wide, long_tiles))
+    buckets.append((6.0, narrow, min(narrow_tiles, long_tiles)))
+    buckets.append((4.0, wide, unbounded))
+    if narrow_tiles > long_tiles:
+        buckets.append((4.0, narrow, narrow_tiles))
+
+    max_splits = 2 if causal and not cross else max(fa._FP8_AUTOSPLIT_CANDIDATES)
+    out = []
+    for thr, bm, max_tiles in buckets:
+        for s in fa._FP8_AUTOSPLIT_CANDIDATES:
+            if s > max_splits:
+                continue
+            if (
+                s > 1
+                and max_tiles is not unbounded
+                and max_tiles // s < fa._FP8_AUTOSPLIT_MIN_TILES
+            ):
+                continue
+            groups = {1}
+            if causal and not cross and s == 1:
+                groups.add(fa._FP8_BATCH_INTERLEAVE_GROUP)
+            for g in sorted(groups):
+                out.append((thr, bm, s, g))
+    return out
+
+
+def _variant_jobs(base: dict, causal: bool, cross: bool) -> list[dict]:
+    """A job per launcher of ``_variant_space``, its tile and split count pinned:
+    the longest grid key/value length of its threshold, and a batch of its
+    interleave group. Causal cross attention at batch 1, query length 5675 and
+    key/value length 66157, say, splits 11 ways, which no grid point does."""
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    jobs = []
+    for threshold, block_m, splits, group in _variant_space(causal, cross):
+        seqlen_kv = max(
+            s for s in _SEQLENS if fa._fp8_rescale_threshold(s) == threshold
+        )
+        jobs.append(
+            {
+                **base,
+                "batch": group,
+                "seqlen_q": _PINNED_SEQLEN_Q if cross else None,
+                "m": seqlen_kv,
+                "m_low": None,
+                "fp8_block_m": block_m,
+                "num_kv_splits": splits,
+            }
+        )
+    return jobs
+
+
 def jobs_for_shape(h: int, hkv: int, d: int, dv: int, layout: str) -> list[dict]:
     """A job per causal mask, LSE output, batch and query length, at each grid
-    key/value length (the query length itself, without cross attention)."""
+    key/value length (the query length itself, without cross attention), and
+    one per launcher the wrapper can pick (``_variant_jobs``)."""
     _, cross = LAYOUTS[layout]
     jobs = []
-    for causal, return_lse, batch in itertools.product(
-        (True, False), (False, True), _BATCHES
-    ):
+    for causal, return_lse in itertools.product((True, False), (False, True)):
         base = {
             "kernel_name": f"fmha_fp8_h{h}_hkv{hkv}_d{d}_dv{dv}_{layout}",
             "gfx": AOT_ARCH_DEFAULT,
@@ -101,19 +184,22 @@ def jobs_for_shape(h: int, hkv: int, d: int, dv: int, layout: str) -> list[dict]
             "layout": layout,
             "causal": causal,
             "return_lse": return_lse,
-            "batch": batch,
         }
-        for seqlen_q in _SEQLENS if cross else (None,):
+        for batch, seqlen_q in itertools.product(
+            _BATCHES, _SEQLENS if cross else (None,)
+        ):
             points = [s for s in _SEQLENS if seqlen_q is None or s >= seqlen_q]
             for low, high in zip([None, *points], points):
                 jobs.append(
                     {
                         **base,
+                        "batch": batch,
                         "seqlen_q": seqlen_q,
                         "m": high,
                         "m_low": None if low is None else low + 1,
                     }
                 )
+        jobs += _variant_jobs(base, causal, cross)
     return jobs
 
 
@@ -165,6 +251,9 @@ def replay(job: dict) -> None:
         q = empty(batch, seqlen_q, h, d)
         k = empty(batch, seqlen_kv, hkv, d)
         v = empty(batch, seqlen_kv, hkv, dv)
+    for name in _PINS:
+        if job.get(name) is not None:
+            kwargs[name] = job[name]
     descale = [empty(1, dtype=torch.float32) for _ in range(3)]
     flydsl_flash_attn_fp8_func(
         q,
@@ -185,9 +274,13 @@ def describe(job: dict) -> str:
         if job["seqlen_q"] is not None
         else f"s={job['m']}"
     )
-    return (
-        f"{job['kernel_name']} causal={job['causal']} lse={job['return_lse']} "
-        f"b={job['batch']} {seqlens}"
+    pinned = [f"{name}={job[name]}" for name in _PINS if job.get(name) is not None]
+    return " ".join(
+        [
+            f"{job['kernel_name']} causal={job['causal']} lse={job['return_lse']}",
+            f"b={job['batch']} {seqlens}",
+            *pinned,
+        ]
     )
 
 
