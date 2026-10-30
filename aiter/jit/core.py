@@ -268,6 +268,18 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
 )
 
 
+def model_config_files(tuned_file_name: str) -> list[str]:
+    """Per-model tuned CSVs merged with the default one when no env var is set."""
+    from pathlib import Path
+
+    model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+    return [
+        str(p)
+        for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+        if (p.is_file() and "untuned" not in p.name)
+    ]
+
+
 class AITER_CONFIG:
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
@@ -723,15 +735,8 @@ class AITER_CONFIG:
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
-        from pathlib import Path
-
         if not config_env_file:
-            model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            op_tuned_file_list = [
-                p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
-                if (p.is_file() and "untuned" not in p.name)
-            ]
+            op_tuned_file_list = model_config_files(tuned_file_name)
 
             if not op_tuned_file_list:
                 # No per-model table to merge with, so the canonical CSV is used
@@ -742,9 +747,7 @@ class AITER_CONFIG:
                     default_file, tuned_file_name, env_name
                 )
             else:
-                tuned_files = os.pathsep.join(
-                    [default_file] + [str(p) for p in op_tuned_file_list]
-                )
+                tuned_files = os.pathsep.join([default_file] + op_tuned_file_list)
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )

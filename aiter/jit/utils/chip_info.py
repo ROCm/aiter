@@ -161,6 +161,70 @@ def _parse_asic_revision(value: str) -> int:
     return int(token, 16 if token.lower().startswith("0x") else 10)
 
 
+_GPU_MODEL_PATTERN = re.compile(r"\bMI[0-9]{3,4}[A-Z0-9]*\b", re.IGNORECASE)
+
+
+def normalize_gpu_model(device_name: str) -> str:
+    """Lowercase model token, e.g. "mi325x": arch and CU count alone cannot
+    tell MI300X from MI325X."""
+    text = str(device_name).strip()
+    match = _GPU_MODEL_PATTERN.search(text)
+    if match is not None:
+        return match.group(0).lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return normalized or "unknown"
+
+
+# HIP takes the device name from the amdgpu.ids file of the installed libdrm,
+# and older copies lack these products. The IDs follow upstream libdrm's
+# data/amdgpu.ids, virtual functions included.
+_GPU_MODELS_BY_PCI_ID = {
+    0x75A0: "mi350x",
+    0x75A3: "mi355x",
+    0x75A8: "mi350p",
+    0x75B0: "mi350x",
+    0x75B3: "mi355x",
+    0x75B8: "mi350p",
+}
+
+
+def _gpu_model_from_pci(properties) -> str | None:
+    try:
+        bdf = (
+            f"{properties.pci_domain_id:04x}:{properties.pci_bus_id:02x}:"
+            f"{properties.pci_device_id:02x}.0"
+        )
+        with open(f"/sys/bus/pci/devices/{bdf}/device", encoding="utf-8") as handle:
+            product_id = int(handle.read(), 0)
+    except (AttributeError, OSError, ValueError):
+        return None
+    return _GPU_MODELS_BY_PCI_ID.get(product_id)
+
+
+@functools.lru_cache(maxsize=8)
+def get_gpu_model(device_id: int = 0) -> str:
+    """The product tuned rows are keyed on, e.g. "mi325x"; "unknown" if it
+    cannot tell. ``AITER_GPU_MODEL`` overrides. For the family a kernel binary
+    targets ("MI300", "MI350P"), see ``get_device_name``."""
+    override = os.getenv("AITER_GPU_MODEL", "").strip()
+    if override:
+        return normalize_gpu_model(override)
+    try:
+        import torch
+
+        name = torch.cuda.get_device_name(int(device_id))
+        if _GPU_MODEL_PATTERN.search(name) is None:
+            from_pci = _gpu_model_from_pci(
+                torch.cuda.get_device_properties(int(device_id))
+            )
+            if from_pci is not None:
+                return from_pci
+        return normalize_gpu_model(name)
+    except Exception as error:  # noqa: BLE001 - callers fail closed to "unknown"
+        logger.debug("GPU model detection failed, keying as unknown: %s", error)
+        return "unknown"
+
+
 @functools.lru_cache(maxsize=1)
 def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
     """(arch, asicRevision) of every GPU agent rocminfo reports.
@@ -631,9 +695,10 @@ MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
 
 
 def get_device_name():
-    """Name of the device this thread is bound to.
+    """Family of the device this thread is bound to, e.g. "MI300" or "MI350P".
 
     Needs a live GPU: the arch, PCI id and XCD count all come from that device.
+    For the exact product tuned configs are keyed on, see ``get_gpu_model``.
     """
     device_id = get_current_hip_device()
     if device_id is None:
