@@ -73,6 +73,7 @@ from aiter.aot.flydsl.common import (
     get_max_workers,
     replay_env,
     run_jobs_parallel,
+    worker_waves,
 )
 
 # Jobs one worker replays in turn: they share tuned-table loads and kernels.
@@ -413,8 +414,9 @@ def run(
     """Replay ``jobs`` of every arch ``GPU_ARCHS`` names (every arch the jobs
     have when it names none), one process per arch, running
     ``python -m module_name --arch <arch> *argv``. The processes run side by
-    side and split the worker budget by job count. Returns the number of archs
-    whose replay failed."""
+    side as far as the worker budget gives each a worker, and split it by job
+    count (:func:`~.common.worker_waves`). Returns the number of archs whose
+    replay failed."""
     module = importlib.import_module(module_name)
     arch_of = Counter(job_arch(job, _default_arch(module)) for job in jobs)
     targets = aot_target_archs()
@@ -432,15 +434,17 @@ def run(
     )
     if not archs:
         return 0
-    workers = get_max_workers(total)
-    replays = []
-    for arch in archs:
-        command = [sys.executable, "-m", module_name, "--arch", arch, *argv]
-        share = max(1, round(workers * arch_of[arch] / total))
-        process_env = replay_env(arch, share)
-        process_env.update(env or {})
-        replays.append(subprocess.Popen(command, env=process_env))
-    return sum(replay.wait() != 0 for replay in replays)
+    failed = 0
+    waves = worker_waves(get_max_workers(total), {a: arch_of[a] for a in archs})
+    for wave in waves:
+        replays = []
+        for arch, share in wave.items():
+            command = [sys.executable, "-m", module_name, "--arch", arch, *argv]
+            process_env = replay_env(arch, share)
+            process_env.update(env or {})
+            replays.append(subprocess.Popen(command, env=process_env))
+        failed += sum(replay.wait() != 0 for replay in replays)
+    return failed
 
 
 def run_default(module_name: str) -> int:

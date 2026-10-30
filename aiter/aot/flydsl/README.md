@@ -67,9 +67,11 @@ need no AOT change.
   arch and `AITER_AOT_REPLAY=1`. Under that flag `get_gfx_runtime()` and
   `dtypes.fp8` answer the `GPU_ARCHS` arch instead of probing a device, so a
   visible GPU of another arch cannot leak in; the GPUs stay hidden all the
-  same. `python -m aiter.aot.flydsl.moe` starts those processes side by side
-  and splits the worker budget (`AITER_MAX_JOBS`, below) between them by job
-  count. Beforehand, it builds aiter's C++ core module and the one
+  same. `python -m aiter.aot.flydsl.moe` starts those processes side by side,
+  as many as the worker budget (`AITER_MAX_JOBS`, below) gives a worker each,
+  and splits the budget between them by job count; with fewer workers than
+  archs, the rest wait for a later round. Beforehand, it builds aiter's C++
+  core module and the one
   behind the two-stage host-side query once, for the arch with the most
   two-stage jobs and with the whole budget: the replays run only their host
   code, and not every toolchain builds every arch (ROCm 7.2 cannot build the

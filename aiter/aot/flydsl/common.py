@@ -192,6 +192,29 @@ def get_max_workers(num_jobs: int) -> int:
     return get_worker_count_for(num_jobs)
 
 
+def worker_waves(workers: int, jobs_per_arch: dict[str, int]) -> list[dict[str, int]]:
+    """The per-arch replay processes to run side by side, wave after wave, and
+    the workers each runs, such that no wave runs more than ``workers`` in all:
+    as many archs as the budget gives a worker each, the largest first, the
+    budget split among them by job count (largest remainder)."""
+    archs = sorted(jobs_per_arch, key=lambda arch: (-jobs_per_arch[arch], arch))
+    workers = max(1, workers)
+    waves = []
+    for start in range(0, len(archs), workers):
+        wave = archs[start : start + workers]
+        total = sum(jobs_per_arch[arch] for arch in wave)
+        extra = {
+            arch: (workers - len(wave)) * jobs_per_arch[arch] / total for arch in wave
+        }
+        shares = {arch: 1 + int(extra[arch]) for arch in wave}
+        rest = workers - sum(shares.values())
+        by_remainder = sorted(wave, key=lambda arch: int(extra[arch]) - extra[arch])
+        for arch in by_remainder[:rest]:
+            shares[arch] += 1
+        waves.append(shares)
+    return waves
+
+
 def _run_file_pool(
     specs: list[tuple[Callable[..., dict[str, Any]], dict[str, Any], Any]],
     max_workers: int,
