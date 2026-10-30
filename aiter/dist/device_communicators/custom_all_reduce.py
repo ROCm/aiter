@@ -1001,6 +1001,7 @@ class CustomAllreduce:
             # kernel ops (arch)
             self._ops_meta_size = ops.meta_size_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
+            self._ops_all_reduce_add = None
             self._ops_all_gather = ops.all_gather_gfx1250
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm_gfx1250
@@ -1025,6 +1026,7 @@ class CustomAllreduce:
             self._ops_meta_size = ops.meta_size
             self._ops_init_custom_ar = ops.init_custom_ar
             self._ops_all_reduce = ops.all_reduce
+            self._ops_all_reduce_add = ops.all_reduce_add
             self._ops_all_gather = None
             self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm
@@ -1879,6 +1881,76 @@ class CustomAllreduce:
                 open_fp8_quant=open_fp8_quant,
                 registered_input=False,
             )
+
+    @property
+    def supports_all_reduce_add(self) -> bool:
+        return self._ops_all_reduce_add is not None
+
+    def should_custom_ar_add(self, inp: torch.Tensor, addend: torch.Tensor) -> bool:
+        # The kernels index both inputs by flat offset, so their layouts must
+        # match; weak contiguity would admit e.g. a transposed addend.
+        return (
+            self.supports_all_reduce_add
+            and self.should_custom_ar(inp)
+            and addend.shape == inp.shape
+            and addend.dtype == inp.dtype
+            and inp.is_contiguous()
+            and addend.is_contiguous()
+            and inp.data_ptr() % 16 == 0
+            and addend.data_ptr() % 16 == 0
+        )
+
+    def all_reduce_add(
+        self,
+        inp: torch.Tensor,
+        addend: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+    ) -> torch.Tensor:
+        """Out-of-place all-reduce of (inp + addend).
+
+        Neither input needs to be IPC-registered: the small-message kernels
+        read them locally, and the other paths stage the sum into the
+        pre-registered input buffer. inp, addend and out must be contiguous.
+        """
+        if out is None:
+            out = torch.empty_like(inp, memory_format=torch.contiguous_format)
+        for name, t in (("inp", inp), ("addend", addend), ("out", out)):
+            if not t.is_contiguous():
+                raise ValueError(f"all_reduce_add: {name} must be contiguous")
+        if any(t.shape != inp.shape or t.dtype != inp.dtype for t in (addend, out)):
+            raise ValueError(
+                "all_reduce_add: inp, addend and out shapes and dtypes must match"
+            )
+        self._ops_all_reduce_add(
+            self._ptr,
+            inp,
+            addend,
+            out,
+            use_new,
+            open_fp8_quant,
+            self._pool["input"].data_ptr,
+            self._pool["input"].max_size,
+        )
+        return out
+
+    def custom_all_reduce_add(
+        self,
+        input: torch.Tensor,
+        addend: torch.Tensor,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+    ) -> torch.Tensor | None:
+        if self.disabled or not self.should_custom_ar_add(input, addend):
+            return None
+        if self._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+            # warm up: mimic the allocation pattern
+            return torch.zeros_like(input)
+        return self.all_reduce_add(
+            input, addend, use_new=use_new, open_fp8_quant=open_fp8_quant
+        )
 
     # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
     # in csrc/include/custom_all_reduce.cuh.
