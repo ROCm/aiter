@@ -15,11 +15,14 @@ sequence lengths that maps each workgroup to its group on device.
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T
 
-from aiter.jit.utils.chip_info import get_num_xcds
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes, get_num_xcds
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from .tensor_shim import _run_compiled
@@ -28,8 +31,34 @@ BLOCK_M = 128
 BLOCK_N = 128
 STAGES_A = 2
 B_STAGES = 3
-LDS_BYTES = 65536
-K_TILE_GRAN = 32  # MFMA K-tile loop uses block_k // 32 stages
+
+
+@dataclass(frozen=True)
+class ArchTraits:
+    mma_mnk: tuple[int, int, int]
+    k_perm_shape: tuple[int, int, int]
+    k_perm_stride: tuple[int, int, int]
+    lds_bytes: int
+    a_swizzle: tuple[int, int, int]
+    wave_size: int
+    min_block_k: int
+
+    @property
+    def k_tile_gran(self) -> int:
+        return math.prod(self.k_perm_shape)
+
+
+ARCH_TRAITS = {
+    "gfx942": ArchTraits(
+        mma_mnk=(16, 16, 16),
+        k_perm_shape=(4, 4, 2),
+        k_perm_stride=(1, 8, 4),
+        lds_bytes=get_lds_capacity_bytes("gfx942"),
+        a_swizzle=(3, 3, 3),
+        wave_size=64,
+        min_block_k=64,
+    ),
+}
 
 _DEFAULT_STREAM = fx.Stream(None)
 
@@ -93,12 +122,16 @@ def _build_launcher(
     COMPACT,
     NXCD,
     DENSE_KN,
+    TRAITS,
 ):
+    MMA_N = TRAITS.mma_mnk[1]
+    K_STEP = TRAITS.k_tile_gran
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
     # DENSE_KN: >= 2 adjacent n per lane, so each B load is at least 32-bit.
-    N_WARPS = min(THREADS // 64, BLOCK_N // (32 if DENSE_KN else 16))
-    M_WARPS = THREADS // 64 // N_WARPS
-    B_REPS = BLOCK_N // (16 * N_WARPS)
+    WAVES = THREADS // TRAITS.wave_size
+    N_WARPS = min(WAVES, BLOCK_N // (MMA_N * (2 if DENSE_KN else 1)))
+    M_WARPS = WAVES // N_WARPS
+    B_REPS = BLOCK_N // (MMA_N * N_WARPS)
     smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -235,7 +268,7 @@ def _build_launcher(
             thr_copy_s2r_A = tiled_copy_s2r_A.get_slice(tid)
             if fx.const_expr(DENSE_KN):
                 b_copy = fx.make_copy_atom(
-                    fx.rocdl.BufferCopy(B_REPS * 16), fx.BFloat16
+                    fx.rocdl.BufferCopy(B_REPS * MMA_N), fx.BFloat16
                 )
                 tv_mma_B = tiled_mma.tv_layout_B_tiled
                 k_in_atom, n_rep, k_rep = 0, 1, 2
@@ -246,14 +279,14 @@ def _build_launcher(
                     fx.append(tv_mma_B[0], vals_g2r_B), 0, tv_mma_B[0].rank
                 )
                 thr_copy_g2r_B = fx.make_tiled_copy(
-                    b_copy, tv_g2r_B, fx.make_tile(BLOCK_N, K_TILE_GRAN)
+                    b_copy, tv_g2r_B, fx.make_tile(BLOCK_N, K_STEP)
                 ).get_slice(tid)
             else:
                 b_copy = buffer_copy_128b
                 thr_copy_g2r_B = fx.make_tiled_copy_B(b_copy, tiled_mma).get_slice(tid)
 
             composed_layout_A = fx.make_composed_layout(
-                fx.static(fx.SwizzleType.get(3, 3, 3)),
+                fx.static(fx.SwizzleType.get(*TRAITS.a_swizzle)),
                 fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2)),
             )
             sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)
@@ -327,7 +360,7 @@ def _build_launcher(
                         soffset=fx.Int32(b_next_k) * gB_k_stride,
                     )
 
-                for block_k_iter in fx.range_constexpr(BLOCK_K // 32):
+                for block_k_iter in fx.range_constexpr(BLOCK_K // K_STEP):
                     fx.copy(
                         uni_copy_128b,
                         thr_sA_s2r[None, None, block_k_iter, a_read_stage],
@@ -439,14 +472,18 @@ def _build_launcher(
         stream: fx.Stream = _DEFAULT_STREAM,
     ):
         n_perm = (
-            fx.make_layout((16, N_WARPS, B_REPS), (B_REPS, 16 * B_REPS, 1))
+            fx.make_layout((MMA_N, N_WARPS, B_REPS), (B_REPS, MMA_N * B_REPS, 1))
             if DENSE_KN
             else None
         )
         tiled_mma = fx.make_tiled_mma(
-            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+            fx.make_mma_atom(fx.rocdl.MFMA(*TRAITS.mma_mnk, fx.BFloat16)),
             fx.make_layout((M_WARPS, N_WARPS, 1), (1, M_WARPS, 0)),
-            fx.make_tile(None, n_perm, fx.make_layout((4, 4, 2), (1, 8, 4))),
+            fx.make_tile(
+                None,
+                n_perm,
+                fx.make_layout(TRAITS.k_perm_shape, TRAITS.k_perm_stride),
+            ),
         )
         val_per_thr = 8  # 16B / bf16
         thrs_col = BLOCK_K // val_per_thr
@@ -505,6 +542,7 @@ def jagged_dense_bmm(
     uniform_seqlen: bool = True,
     block_m: int | None = None,
     block_n: int | None = None,
+    traits: ArchTraits,
 ):
     dense_kn = B.dim() == 3
     if dense_kn:
@@ -524,20 +562,25 @@ def jagged_dense_bmm(
     if dense_kn and bnn % 32:
         raise ValueError(f"3-D dense needs block_n % 32 == 0, got {bnn}")
     block_k = int(block_k)
-    if block_k <= 0 or block_k % K_TILE_GRAN != 0:
+    if block_k <= 0 or block_k % traits.k_tile_gran != 0:
         raise ValueError(
-            f"block_k must be a positive multiple of {K_TILE_GRAN}, got {block_k}"
+            f"block_k must be a positive multiple of {traits.k_tile_gran}, "
+            f"got {block_k}"
         )
-    if block_k < 64:
-        raise ValueError(f"block_k must be >= 64 for MFMA 16x16x16, got {block_k}")
+    if block_k < traits.min_block_k:
+        mma = "x".join(map(str, traits.mma_mnk))
+        raise ValueError(
+            f"block_k must be >= {traits.min_block_k} for MFMA {mma}, got {block_k}"
+        )
     # n_tiles = K // block_k floors, silently dropping the K tail.
     if K % block_k != 0:
         raise ValueError(f"block_k={block_k} must divide K={K}")
     a_smem = bmn * block_k * STAGES_A * 2
     epi_smem = max(a_smem, bmn * bnn * 2)
-    if epi_smem > LDS_BYTES:
+    if epi_smem > traits.lds_bytes:
         raise ValueError(
-            f"block_k={block_k} needs {epi_smem} bytes LDS (max {LDS_BYTES}); "
+            f"block_k={block_k} needs {epi_smem} bytes LDS "
+            f"(max {traits.lds_bytes}); "
             f"A-stage staging is {a_smem} bytes"
         )
     nthreads = int(threads)
@@ -562,6 +605,7 @@ def jagged_dense_bmm(
         compact,
         get_num_xcds(),
         dense_kn,
+        traits,
     )
     launch_args = (
         C,
