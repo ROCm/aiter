@@ -26,18 +26,12 @@ from .tensor_shim import _run_compiled
 
 BLOCK_M = 128
 BLOCK_N = 128
-BLOCK_K = 64
 STAGES_A = 2
 B_STAGES = 3
-THREADS = 256
 LDS_BYTES = 65536
-K_TILE_GRAN = 32  # MFMA K-tile loop uses BLOCK_K // 32 stages
+K_TILE_GRAN = 32  # MFMA K-tile loop uses block_k // 32 stages
 
 _DEFAULT_STREAM = fx.Stream(None)
-
-XCD_W = 8
-XCD_C_SMALL_K = 32
-XCD_C_LARGE_K = 120
 
 
 def _f32_to_bf16_rne(x):
@@ -503,13 +497,14 @@ def jagged_dense_bmm(
     n_groups: int,
     max_seq_len: int,
     stream: fx.Stream = _DEFAULT_STREAM,
-    xcd_c: int | None = None,
-    xcd_w: int | None = None,
+    *,
+    xcd_c: int,
+    xcd_w: int,
+    block_k: int,
+    threads: int,
     uniform_seqlen: bool = True,
     block_m: int | None = None,
     block_n: int | None = None,
-    block_k: int | None = None,
-    threads: int | None = None,
 ):
     dense_kn = B.dim() == 3
     if dense_kn:
@@ -528,18 +523,14 @@ def jagged_dense_bmm(
         raise ValueError(f"block_n={bnn} must be a positive divisor of N={N}")
     if dense_kn and bnn % 32:
         raise ValueError(f"3-D dense needs block_n % 32 == 0, got {bnn}")
-    if block_k is None:
-        block_k = BLOCK_K
-    else:
-        block_k = int(block_k)
-        if block_k <= 0 or block_k % K_TILE_GRAN != 0:
-            raise ValueError(
-                f"block_k must be a positive multiple of {K_TILE_GRAN}, got {block_k}"
-            )
-        if block_k < 64:
-            raise ValueError(f"block_k must be >= 64 for MFMA 16x16x16, got {block_k}")
-    # These depend on block_m / block_n too, so they run for the default block_k
-    # as well: n_tiles = K // block_k floors, silently dropping the K tail.
+    block_k = int(block_k)
+    if block_k <= 0 or block_k % K_TILE_GRAN != 0:
+        raise ValueError(
+            f"block_k must be a positive multiple of {K_TILE_GRAN}, got {block_k}"
+        )
+    if block_k < 64:
+        raise ValueError(f"block_k must be >= 64 for MFMA 16x16x16, got {block_k}")
+    # n_tiles = K // block_k floors, silently dropping the K tail.
     if K % block_k != 0:
         raise ValueError(f"block_k={block_k} must divide K={K}")
     a_smem = bmn * block_k * STAGES_A * 2
@@ -549,16 +540,7 @@ def jagged_dense_bmm(
             f"block_k={block_k} needs {epi_smem} bytes LDS (max {LDS_BYTES}); "
             f"A-stage staging is {a_smem} bytes"
         )
-    if xcd_c is None:
-        if not uniform_seqlen:
-            xcd_c = 1
-        elif K > 256:
-            xcd_c = XCD_C_LARGE_K
-        else:
-            xcd_c = XCD_C_SMALL_K
-    if xcd_w is None:
-        xcd_w = 1 if xcd_c == 1 else XCD_W
-    nthreads = THREADS if threads is None else threads
+    nthreads = int(threads)
     compact = not uniform_seqlen
     if compact:
         # Slot-count bound from A.shape[0] >= SEQ_OFFSETS[-1]; reading
