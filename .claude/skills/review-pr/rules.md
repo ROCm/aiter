@@ -148,12 +148,12 @@ C4 judges only the arch literal. Which helper a runtime wrapper calls is C5's qu
 
 **C5 — Shared chip_info helpers are the ISA gate** ⚠️
 Policy: `.github/instructions/aiter-ops-flydsl.instructions.md`. Do not invent a mixed-device, process-global, or first-`rocminfo`-agent finding against `get_gfx_runtime()` / `get_gfx()`.
-The context picks the helper. Runtime dispatch (wrappers, launchers, kernel or tuned-config selection) uses `get_gfx_runtime()`, which detects the live GPU. Tests and build-time codegen (`gen_instances`, AOT, module-level `csrc` selection) use `get_gfx()`, which follows `GPU_ARCHS` and returns its last entry when that lists several targets, so on a multi-target build it can name an ISA other than the one installed.
+The context picks the helper. Code that asks which GPU it is running on uses `get_gfx_runtime()`, which detects the live GPU: runtime dispatch (wrappers, launchers, kernel or tuned-config selection), test gates in `main()`, and the card a test records. Build-time codegen (`gen_instances`, AOT, module-level `csrc` selection) uses `get_gfx()`, which follows `GPU_ARCHS` and returns its last entry when that lists several targets, so on a multi-target build it can name an ISA other than the one installed (`GPU_ARCHS='gfx950;gfx942'` gives `gfx942` on an MI355X).
 **FP self-check first:** only `+` lines count. `get_gfx()` or `gcnArchName` on unchanged lines is pre-existing style, not a new violation.
-FIRE when a `+` line adds (a) a local ISA probe instead of the helpers (`gcnArchName`, `get_device_properties` read for architecture, a `rocminfo` parse), or (b) `get_gfx()` in a runtime dispatch path. One such line fires even when other added lines use the right helper.
+FIRE when a `+` line adds (a) a local ISA probe instead of the helpers (`gcnArchName`, `get_device_properties` read for architecture, a `rocminfo` parse), or (b) `get_gfx()` in a runtime dispatch path or a test gate. One such line fires even when other added lines use the right helper.
 CLEAR only when every added architecture check uses the helper that fits its context.
-Real examples (synthetic): `torch.cuda.get_device_properties(0).gcnArchName` added to `aiter/ops/mha.py` → fire (a); `get_gfx() == "gfx950"` added to kernel selection in an `aiter/ops/flydsl/` launcher → fire (b); `get_gfx()` added to `main()` of `op_tests/test_flydsl_<op>.py` → clear; `get_gfx_runtime()` added to a wrapper plus a new `gcnArchName` read in another file of the same PR → fire (a).
-→ `⚠️ C5: new local ISA probe or runtime get_gfx() — use get_gfx_runtime() for dispatch, get_gfx() for tests and codegen`
+Real examples (synthetic): `torch.cuda.get_device_properties(0).gcnArchName` added to `aiter/ops/mha.py` → fire (a); `get_gfx() == "gfx950"` added to kernel selection in an `aiter/ops/flydsl/` launcher → fire (b); `get_gfx()` added to the gate in `main()` of `op_tests/test_flydsl_<op>.py` → fire (b); `get_gfx()` on an unchanged test line → clear; `get_gfx()` added to an AOT target list → clear; `get_gfx_runtime()` added to a wrapper plus a new `gcnArchName` read in another file of the same PR → fire (a).
+→ `⚠️ C5: new local ISA probe or get_gfx() in dispatch or a test gate — use get_gfx_runtime() for anything that asks which GPU is running, get_gfx() for build-time codegen`
 
 ---
 
