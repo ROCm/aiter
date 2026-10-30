@@ -108,7 +108,7 @@ jobs:
   triton:
     if: ${{ needs.split_triton_tests.outputs.selected_count != '0' }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
-    runs-on: linux-aiter-vultr-mi325-1
+    runs-on: amd-dpx-linux.aiter.gpu.gfx950.1
     timeout-minutes: 120
     needs: [split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     strategy:
@@ -128,7 +128,7 @@ jobs:
           submodules: 'recursive'
 
       - name: Network preflight before Triton artifact downloads
-        if: ${{ startsWith(runner.name, 'linux-aiter-vultr-mi325-1-') }}
+        if: ${{ startsWith(runner.name, 'amd-dpx-linux.aiter.gpu.gfx950.1-') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -192,7 +192,7 @@ jobs:
           path: triton_wheels
 
       - name: Speedtest after Triton cache or artifact download failure
-        if: ${{ always() && startsWith(runner.name, 'linux-aiter-vultr-mi325-1-') && (steps.download_triton_shards.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        if: ${{ always() && startsWith(runner.name, 'amd-dpx-linux.aiter.gpu.gfx950.1-') && (steps.download_triton_shards.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
