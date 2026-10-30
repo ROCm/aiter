@@ -1973,6 +1973,8 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "QUERY_DTYPE",
         "KV_CACHE_DTYPE",
+        "TDM_PARTIAL_STORE",
+        "Q_FROM_LDS",
     ],
 )
 
