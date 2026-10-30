@@ -194,6 +194,8 @@ def _gfx950_gluon_supported(params: _UAParams):
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
+        # its non-causal branch is not validated
+        and params.causal
         # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
         and not params.softcap
         and not params.use_qq_bias
@@ -298,7 +300,30 @@ def unified_attention(
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
-    assert causal, "Only causal attention is supported"
+    """Paged attention for a varlen batch of query tokens.
+
+    Each sequence i has the query tokens cu_seqlens_q[i]:cu_seqlens_q[i + 1]
+    and seqused_k[i] keys in the paged cache that block_table addresses. The
+    query tokens are the last keys of their sequence. With causal=True, a
+    query token attends to the keys up to its own position. With causal=False,
+    it attends to all keys of its sequence. Non-causal attention does not
+    support a sliding window, ALiBi, a query-query bias or an fp4 Q or KV.
+    The result goes into out. With skip_reduce and a split launch, the
+    function returns the unmerged segments instead.
+    """
+    # Checked before the decode case below, so a decode batch rejects them too.
+    if not causal:
+        assert (
+            window_size[0] < 0 and window_size[1] < 0
+        ), "Non-causal attention does not support a sliding window"
+        assert (
+            alibi_slopes is None and qq_bias is None
+        ), "Non-causal attention does not support ALiBi or a query-query bias"
+        assert (
+            q.dtype != torch.uint8 and k.dtype != torch.uint8
+        ), "Non-causal attention does not support an fp4 Q or KV cache"
+    # A decode query sees all keys either way, so it keeps the causal kernels.
+    causal = causal or int(max_seqlen_q) == 1
 
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
@@ -581,8 +606,10 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
     # arch-specific gates
     use_gluon_arch = False
     if DEVICE_ARCH == "gfx1250":
+        # The gfx1250 Gluon kernels are not validated for non-causal attention.
         use_gluon_arch = (
             _unified_attention_kernel_2d_gfx1250 is not None
+            and params.causal
             and not params.softcap
             and not params.use_qq_bias
             and not params.use_alibi_slopes
@@ -605,6 +632,7 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
     if DEVICE_ARCH == "gfx1250":
         use_gluon_arch = (
             _unified_attention_kernel_3d_gfx1250 is not None
+            and params.causal
             and params.shuffled_kv_cache
         )
     elif DEVICE_ARCH == "gfx950":
@@ -707,6 +735,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        CAUSAL=params.causal,
         **config,
         enable_fp_fusion=True,
     )
@@ -818,6 +847,7 @@ def _unified_attention_3d_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         **length_aware,
+        CAUSAL=params.causal,
         **config,
         enable_fp_fusion=True,
     )
