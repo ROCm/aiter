@@ -227,6 +227,13 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+# Per-shape configs of the FlyDSL gfx942 bf16 GEMM; shapes without a row use
+# gfx942_fallback_config.
+AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942 = os.getenv(
+    "AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942",
+    f"{AITER_ROOT_DIR}/aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv",
+)
+
 # Per-model tuned rows live under model_configs/
 # (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
 # get merged into this canonical file by get_config_file. It ships header-only.
@@ -411,6 +418,18 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942",
+            # Live env value keys the lru_cache so a runtime override is seen.
+            os.getenv(
+                "AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942",
+                AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942,
+            ),
+            "flydsl_gemm_a16w16_gfx942_tuned",
         )
 
     @property
