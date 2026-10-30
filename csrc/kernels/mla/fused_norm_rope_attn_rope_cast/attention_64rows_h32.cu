@@ -23,7 +23,8 @@ hipError_t run_fused_norm_rope_attn_rope_cast_fwd_small_heads(
                 run_fused_norm_rope_attn_rope_cast_h32_tile16_attention(args, raw_q, stream);
             if(status != hipSuccess)
                 return status;
-            if(!args.debug_ptr && !args.lse_ptr && !args.max_ptr && !args.out_ptr)
+            if(!args.debug_ptr && !args.max_ptr && !args.out_ptr &&
+               (!args.lse_ptr || use_fused_split_reduce(args)))
                 return launch_small_head_output_reduce(args, stream);
             fused_norm_rope_attn_rope_cast_decode_reduce_kernel<32, 0, false, 32>
                 <<<dim3(args.N, 2), 256, 0, stream>>>(args);

@@ -117,8 +117,10 @@ __global__ __launch_bounds__(256, 2) void fused_norm_rope_attn_rope_cast_kernel_
         const float inv     = denom > 0 ? rescale / denom : 0;
         if(group == 0)
         {
-            a.lse[int64_t(t) * a.heads + h]        = l > 0 ? m / log2e + logf(l) : INFINITY;
-            a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
+            if(a.lse)
+                a.lse[int64_t(t) * a.heads + h] = l > 0 ? m / log2e + logf(l) : INFINITY;
+            if(a.max_logits)
+                a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
         }
         opus::static_for<16>([&](auto chunk) {
             F4 x[2] = {opus::slice(o[int(chunk)], opus::number<0>{}, opus::number<4>{}),
@@ -263,8 +265,10 @@ __global__ __launch_bounds__(512, 1) void fused_norm_rope_attn_rope_cast_kernel_
         const float inv     = denom > 0 ? rescale / denom : 0;
         if(group == 0)
         {
-            a.lse[int64_t(t) * a.heads + h]        = l > 0 ? m / log2e + logf(l) : INFINITY;
-            a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
+            if(a.lse)
+                a.lse[int64_t(t) * a.heads + h] = l > 0 ? m / log2e + logf(l) : INFINITY;
+            if(a.max_logits)
+                a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
         }
         opus::static_for<16>([&](auto chunk) {
             F4 x[2] = {opus::slice(o[int(chunk)], opus::number<0>{}, opus::number<4>{}),
@@ -411,8 +415,10 @@ __global__ __launch_bounds__(256, 2) void fused_norm_rope_attn_rope_cast_kernel_
         const float inv     = denom > 0 ? rescale / denom : 0;
         if(group == 0 && part == 0)
         {
-            a.lse[int64_t(t) * a.heads + h]        = l > 0 ? m / log2e + logf(l) : INFINITY;
-            a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
+            if(a.lse)
+                a.lse[int64_t(t) * a.heads + h] = l > 0 ? m / log2e + logf(l) : INFINITY;
+            if(a.max_logits)
+                a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
         }
         opus::static_for<OSlices>([&](auto local_chunk) {
             const int chunk = int(local_chunk) + part * OSlices;
@@ -555,8 +561,10 @@ __global__ __launch_bounds__(256, 2) void fused_norm_rope_attn_rope_cast_decode_
         const float inv     = denom > 0 ? rescale / denom : 0;
         if(group == 0)
         {
-            a.lse[int64_t(t) * a.heads + h]        = l > 0 ? m / log2e + logf(l) : INFINITY;
-            a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
+            if(a.lse)
+                a.lse[int64_t(t) * a.heads + h] = l > 0 ? m / log2e + logf(l) : INFINITY;
+            if(a.max_logits)
+                a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
         }
         opus::static_for<16>([&](auto chunk) {
             F4 x[2] = {opus::slice(o[int(chunk)], opus::number<0>{}, opus::number<4>{}),
@@ -1048,8 +1056,10 @@ __global__ __launch_bounds__(512, 1) void fused_norm_rope_attn_rope_cast_decode_
         const float inv     = denom > 0 ? rescale / denom : 0;
         if(group == 0)
         {
-            a.lse[int64_t(t) * a.heads + h]        = l > 0 ? m / log2e + logf(l) : INFINITY;
-            a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
+            if(a.lse)
+                a.lse[int64_t(t) * a.heads + h] = l > 0 ? m / log2e + logf(l) : INFINITY;
+            if(a.max_logits)
+                a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
         }
         opus::static_for<16>([&](auto chunk) {
             F4 x[2] = {opus::slice(o[int(chunk)], opus::number<0>{}, opus::number<4>{}),

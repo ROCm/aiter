@@ -431,6 +431,7 @@ __global__ __launch_bounds__(256, 2) void fused_norm_rope_attn_rope_cast_h16_ker
 }
 
 
+template <bool WriteLSE = false>
 __global__ __launch_bounds__(64) void fused_h16_tiled_split_reduce(
     FusedNormRopeAttnRopeCastParams a)
 {
@@ -452,6 +453,24 @@ __global__ __launch_bounds__(64) void fused_h16_tiled_split_reduce(
     });
     for(int offset = 4; offset < 64; offset *= 2)
         maximum = fmaxf(maximum, __shfl_xor(maximum, offset));
+    if constexpr(WriteLSE)
+    {
+        if(blockIdx.z == 0)
+        {
+            float attention_sum = 0.0f;
+            static_for<2>([&](auto i) {
+                if(sums[i.value] > 0.0f)
+                    attention_sum += sums[i.value] * __builtin_amdgcn_exp2f(maxima[i.value] - maximum);
+            });
+            for(int offset = 4; offset < 64; offset *= 2)
+                attention_sum += __shfl_xor(attention_sum, offset);
+            if(lane < 4)
+                static_cast<float*>(a.lse_ptr)[int64_t(token) * 16 + head] =
+                    attention_sum > 0.0f
+                        ? (maximum + __builtin_amdgcn_logf(attention_sum)) * 0.69314718056f
+                        : __builtin_inff();
+        }
+    }
     const float sink = a.attn_sink_ptr
                            ? static_cast<const float*>(a.attn_sink_ptr)[head] * 1.44269504089f
                            : -__builtin_inff();
@@ -537,14 +556,18 @@ hipError_t run_fused_norm_rope_attn_rope_cast_fwd_h16(const FusedNormRopeAttnRop
             const auto status = hipGetLastError();
             if(status != hipSuccess)
                 return status;
-            if(!args.debug_ptr && !args.lse_ptr && !args.max_ptr && !args.out_ptr)
+            if(!args.debug_ptr && !args.max_ptr && !args.out_ptr)
             {
                 if(args.num_splits >= 4 && args.N <= 32)
                 {
-                    fused_h16_tiled_split_reduce<<<dim3(args.N, 4, 8), 64, 0, stream>>>(args);
+                    if(args.lse_ptr)
+                        fused_h16_tiled_split_reduce<true><<<dim3(args.N, 4, 8), 64, 0, stream>>>(args);
+                    else
+                        fused_h16_tiled_split_reduce<false><<<dim3(args.N, 4, 8), 64, 0, stream>>>(args);
                     return hipGetLastError();
                 }
-                return launch_small_head_output_reduce(args, stream);
+                if(!args.lse_ptr)
+                    return launch_small_head_output_reduce(args, stream);
             }
             fused_norm_rope_attn_rope_cast_decode_reduce_kernel<16, 0, false, 32>
                 <<<dim3(args.N), 256, 0, stream>>>(args);

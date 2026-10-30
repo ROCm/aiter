@@ -18,13 +18,15 @@ import torch
 import aiter
 from aiter import (
     dtypes,
-    fused_norm_rope_attn_rope_cast_bf16,
 )
 from aiter import (
-    fused_norm_rope_attn_rope_cast as fused_v41,
+    fused_norm_rope_attn_rope_cast as public_v41,
 )
 from aiter import (
-    fused_norm_rope_attn_rope_cast_legacy as fused_norm_rope_attn_rope_cast,
+    fused_norm_rope_attn_rope_cast_bf16 as public_bf16,
+)
+from aiter import (
+    fused_norm_rope_attn_rope_cast_legacy as public_legacy,
 )
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.fused_norm_rope_attn_rope_cast import (
@@ -36,6 +38,58 @@ from aiter.ops.fused_norm_rope_attn_rope_cast import (
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 SUPPORTED_GFX = ["gfx950"]  # The fused FP8 MFMA kernels target gfx950 only.
+
+
+def _with_statistics(api, native_name, args, kwargs, *, allocate=False):
+    kwargs = dict(kwargs)
+    q = args[0] if args else kwargs["q"]
+    statistics = {name: kwargs.pop(name, None) for name in ("max_logits", "lse")}
+    if allocate:
+        statistics = {
+            name: (
+                torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
+                if value is None
+                else value
+            )
+            for name, value in statistics.items()
+        }
+    kwargs["lse"] = statistics["lse"]
+    native = api.__globals__[native_name]
+    statistics_index = 17 if native_name == "_fused_norm_rope_attn_rope_cast_fwd" else 9
+
+    def invoke(*native_args):
+        native_args = list(native_args)
+        native_args[statistics_index : statistics_index + 2] = (
+            statistics["max_logits"],
+            statistics["lse"],
+        )
+        return native(*native_args)
+
+    with patch.dict(api.__globals__, {native_name: invoke}):
+        output = api(*args, **kwargs)
+    return *output[:2], statistics["max_logits"], statistics["lse"]
+
+
+def fused_v41(*args, **kwargs):
+    return _with_statistics(
+        public_v41, "_fused_norm_rope_attn_rope_cast_fwd", args, kwargs
+    )
+
+
+def fused_norm_rope_attn_rope_cast(*args, **kwargs):
+    return _with_statistics(
+        public_legacy,
+        "_fused_norm_rope_attn_rope_cast_legacy_fwd",
+        args,
+        kwargs,
+        allocate=True,
+    )
+
+
+def fused_norm_rope_attn_rope_cast_bf16(q, kv, *args, **kwargs):
+    return fused_norm_rope_attn_rope_cast(
+        q, public_bf16.__globals__["_bf16_kv_rows"](kv), *args, **kwargs
+    )
 
 
 def _raises(expected, match=None):
@@ -1118,8 +1172,9 @@ def two_source_inputs(
         reference_q = q
     elif mode == "prepared":
         q8, qs = quantize_fp8(rotate(q, cos, sin, pos).bfloat16())
-        q, q_scale = q8.reshape_as(q), qs.reshape(tokens, heads, 16).view(
-            torch.float8_e8m0fnu
+        q, q_scale = (
+            q8.reshape_as(q),
+            qs.reshape(tokens, heads, 16).view(torch.float8_e8m0fnu),
         )
     rows = []
     for t in range(tokens):
@@ -2254,13 +2309,13 @@ def check_public_api_has_no_debug_output(api):
     debug = torch.empty_like(args[0], dtype=torch.float32)
     if api == "two_source":
         kwargs, _ = two_source_inputs()
-        fn, positional = fused_v41, ()
+        fn, positional = public_v41, ()
     elif api == "bf16":
         args[1] = torch.ones(1, 512, device="cuda", dtype=torch.bfloat16)
         args[2] = torch.zeros(1, device="cuda", dtype=torch.int32)
-        fn, positional, kwargs = fused_norm_rope_attn_rope_cast_bf16, args, {}
+        fn, positional, kwargs = public_bf16, args, {}
     else:
-        fn, positional, kwargs = fused_norm_rope_attn_rope_cast, args, {}
+        fn, positional, kwargs = public_legacy, args, {}
     assert "debug_out" not in inspect.signature(fn).parameters
     import importlib
 
@@ -2442,7 +2497,7 @@ def test_fused_norm_rope_attn_rope_cast(
     )
     args["num_splits"] = splits
     # Model output is [T,H/8,4096] FP8 plus row-layout group32 scales. Allocate
-    # both before timing. Optional LSE/max outputs are not model outputs.
+    # both before timing.
     args["out"] = torch.empty(
         batch, heads // 8, 4096, device="cuda", dtype=torch.float8_e4m3fn
     )
@@ -2456,7 +2511,7 @@ def test_fused_norm_rope_attn_rope_cast(
     # For splits=0 the public wrapper selects/allocates split scratch itself;
     # graph timing excludes the host allocation, just as it excludes dispatch.
     ref = run_torch(args)
-    candidates = {"fused": lambda: fused_v41(**args)}
+    candidates = {"fused": lambda: public_v41(**args)}
 
     # Effective QK+PV FLOPs (4*H*D per selected KV row). TB/s is logical I/O:
     # selected KV values/scales once per query, CSR, Q, RoPE tables and outputs.
@@ -2791,9 +2846,128 @@ def check_small_head_split_storage(heads, mode, splits):
             assert bool((storage[offset + count :] == 90).all())
 
 
+def check_public_outputs_and_lse(api, heads, mode):
+    if api == "two_source":
+        fn = public_v41
+        kwargs, _ = two_source_inputs(heads, "padded", mode, True, True, True)
+        args = ()
+        shape = kwargs["q"].shape[:2]
+        reference = fused_v41(
+            **kwargs,
+            max_logits=torch.empty(shape, device="cuda"),
+            lse=torch.empty(shape, device="cuda"),
+        )
+    else:
+        args = simple_inputs(heads=heads)
+        args[0].normal_()
+        args[2].zero_()
+        kwargs = {"q_is_rotated": mode == "rotated", "q_norm": mode == "norm"}
+        fn = public_legacy
+        if api == "bf16":
+            args = (
+                args[0],
+                torch.randn(4, 512, device="cuda", dtype=torch.bfloat16),
+                torch.tensor([0], device="cuda", dtype=torch.int32),
+                torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+                *args[4:],
+            )
+            fn = public_bf16
+        shape = args[0].shape[:2]
+        reference = (
+            fused_norm_rope_attn_rope_cast_bf16
+            if api == "bf16"
+            else fused_norm_rope_attn_rope_cast
+        )(*args, **kwargs)
+    for supplied in (False, True):
+        lse = torch.full(shape, torch.nan, device="cuda") if supplied else None
+        output = fn(*args, **kwargs, lse=lse)
+        assert len(output) == 3
+        for actual, expected in zip(output[:2], reference[:2]):
+            torch.testing.assert_close(
+                actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+            )
+        if supplied:
+            assert output[2] is lse
+        if api == "two_source" and not supplied:
+            assert output[2] is None
+        else:
+            torch.testing.assert_close(output[2], reference[3], rtol=1e-4, atol=3e-5)
+    with _raises(TypeError, match="max_logits"):
+        fn(*args, **kwargs, max_logits=None)
+
+
+def check_optional_lse_reducer(heads, tokens, splits, mode):
+    kwargs, (_, _, dense_lse) = two_source_inputs(heads, "padded", mode, True)
+    original_tokens = kwargs["q"].shape[0]
+    row = torch.arange(tokens, device="cuda") % original_tokens
+    for name in ("q", "q_scale", "positions"):
+        if kwargs.get(name) is not None:
+            value = kwargs[name]
+            kwargs[name] = (
+                value.view(torch.uint8).index_select(0, row).view(value.dtype)
+                if value.element_size() == 1
+                else value.index_select(0, row)
+            )
+    for source in ("prefix", "extend"):
+        ptr_name, ids_name = "kv_indptr_" + source, "kv_indices_" + source
+        ptr = kwargs[ptr_name].cpu().tolist()
+        rows = [
+            kwargs[ids_name][ptr[t % original_tokens] : ptr[t % original_tokens + 1]]
+            for t in range(tokens)
+        ]
+        kwargs[ids_name], kwargs[ptr_name] = csr(rows, torch.int32, 2**31 - 1)
+    kwargs["attn_sink"] = kwargs["attn_sink"].clone()
+    kwargs["attn_sink"][0] = 1000.0
+    kwargs["attn_sink"][1] = -1000.0
+    kwargs["num_splits"] = splits
+    expected_lse = dense_lse.index_select(0, row)
+    reference = fused_v41(
+        **kwargs,
+        max_logits=torch.empty_like(expected_lse),
+        lse=torch.empty_like(expected_lse),
+    )
+    lse = torch.full_like(expected_lse, torch.nan)
+    result = public_v41(**kwargs, lse=lse)
+    assert result[2] is lse
+    _check_output(dequantize(*result[:2]), dequantize(*reference[:2]))
+    torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=3e-5)
+    if tokens == 32 and mode == "raw" and splits in (4, 5, 7):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            public_v41(**kwargs, out=result[0], out_scale=result[1], lse=lse)
+        lse.fill_(torch.nan)
+        graph.replay()
+        torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=3e-5)
+
+
 def run_contract_checks():
     """Run every correctness case during the same direct invocation used by CI."""
     checks = [
+        (
+            check_optional_lse_reducer,
+            [
+                ("heads", [16, 32, 64]),
+                ("tokens", [16, 32, 33, 64]),
+                ("splits", [2, 3, 4, 5, 7, 8, 16, 32]),
+                ("mode", ["raw", "prepared"]),
+            ],
+        ),
+        (
+            check_public_outputs_and_lse,
+            [
+                ("api", ["two_source", "legacy", "bf16"]),
+                ("heads", [16, 32, 64, 128]),
+                ("mode", ["raw", "norm", "rotated"]),
+            ],
+        ),
+        (
+            check_public_outputs_and_lse,
+            [
+                ("api", ["legacy", "bf16"]),
+                ("heads", [8]),
+                ("mode", ["raw", "norm", "rotated"]),
+            ],
+        ),
         (
             check_output_quantization,
             [

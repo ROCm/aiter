@@ -34,7 +34,7 @@ def _fused_norm_rope_attn_rope_cast_legacy_fwd(
     positions: torch.Tensor,
     out: torch.Tensor,
     out_scale: torch.Tensor,
-    max_logits: torch.Tensor,
+    max_logits: torch.Tensor | None,
     lse: torch.Tensor,
     extend_kv: torch.Tensor | None,
     extend: torch.Tensor | None,
@@ -67,14 +67,13 @@ def fused_norm_rope_attn_rope_cast_legacy(
     q_is_rotated: bool = True,
     out: torch.Tensor | None = None,
     out_scale: torch.Tensor | None = None,
-    max_logits: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
     fp8_qk: bool = False,
     q_scale: torch.Tensor | None = None,
     q_norm: bool = False,
     norm_eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return ``(out, out_scale, max_logits, lse)`` in one kernel launch.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(out, out_scale, lse)`` in one kernel launch.
 
     ``q`` is contiguous BF16 ``[T,H,512]``, H in {8,16,32,64,128}, in
     ordinary head-major layout. Set ``q_is_rotated=False`` to apply forward
@@ -117,10 +116,9 @@ def fused_norm_rope_attn_rope_cast_legacy(
     ``cos``/``sin`` are BF16 [P,32], using adjacent-pair RoPE.
 
     Outputs are E4M3FN ``[T,H/8,4096]``, E8M0 ``[T,H/8,128]``, and FP32
-    max/LSE ``[T,H]``. Attention is rounded to BF16 before inverse RoPE and
+    LSE ``[T,H]``. Attention is rounded to BF16 before inverse RoPE and
     MXFP8 quantization. ``attn_sink[H]`` (FP32) enters only the softmax
-    denominator; max/LSE exclude it. Empty rows return zero output, -inf
-    max, and +inf LSE.
+    denominator; LSE excludes it. Empty rows return zero output and +inf LSE.
 
     Q and selected KV values must be finite; sink may also be -inf. All
     tensors must be contiguous on q.device. Q, extend_kv and out
@@ -158,7 +156,6 @@ def fused_norm_rope_attn_rope_cast_legacy(
 
     out = buffer(out, torch.float8_e4m3fn, (t, h // 8, 4096))
     out_scale = buffer(out_scale, torch.float8_e8m0fnu, (t, h // 8, 128))
-    max_logits = buffer(max_logits, torch.float32, (t, h))
     lse = buffer(lse, torch.float32, (t, h))
     _fused_norm_rope_attn_rope_cast_legacy_fwd(
         q,
@@ -170,7 +167,7 @@ def fused_norm_rope_attn_rope_cast_legacy(
         positions,
         out,
         out_scale,
-        max_logits,
+        None,
         lse,
         extend_kv,
         extend,
@@ -183,7 +180,7 @@ def fused_norm_rope_attn_rope_cast_legacy(
         q_norm,
         norm_eps,
     )
-    return out, out_scale, max_logits, lse
+    return out, out_scale, lse
 
 
 def fused_norm_rope_attn_rope_cast_bf16(
@@ -195,7 +192,7 @@ def fused_norm_rope_attn_rope_cast_bf16(
     sin: torch.Tensor,
     positions: torch.Tensor,
     **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused attention reading a contiguous BF16 KV workspace directly.
 
     ``kv`` is BF16 ``[S,512]`` or ``[S,1,512]``, already rotated. ``indices``
@@ -264,13 +261,12 @@ def fused_norm_rope_attn_rope_cast(
     sin: torch.Tensor,
     positions: torch.Tensor,
     out_scale: torch.Tensor | None = None,
-    max_logits: torch.Tensor | None = None,
     q_is_rotated: bool = True,
     q_norm: bool = False,
     norm_eps: float = 1e-6,
     num_splits: int = 0,
     workspace: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Fuse Q preparation, two-source FP8 attention and output RoPE/quantization.
 
     The Q/KV argument names and CSR semantics follow ``mla_sparse_prefill_v41``.
@@ -304,13 +300,14 @@ def fused_norm_rope_attn_rope_cast(
     only the softmax denominator. Selected values/scales must be finite, and
     sink may also be -inf. ``backend`` accepts None or "opus" on gfx950.
 
-    Returns ``(out, out_scale, max_logits, lse)``. Unlike the attention-only
+    Returns ``(out, out_scale, lse)``. Unlike the attention-only
     entry, out is E4M3FN ``[T,H/8,4096]`` after BF16 attention rounding,
     inverse RoPE and group32 quantization; scales are row-layout E8M0
     ``[T,H/8,128]``. Provide ``out``/``out_scale`` to reuse buffers. Optional
-    ``max_logits``/``lse`` are caller-allocated FP32 ``[T,H]``; omitted buffers
-    remain None and are not allocated or written. Their values exclude sink;
-    empty rows produce zero out, -inf max and +inf LSE.
+    ``lse`` is caller-allocated FP32 ``[T,H]``; when omitted it remains None
+    and is not allocated or written. LSE excludes sink; empty rows produce
+    zero output and +inf LSE. Requesting LSE can select a general split
+    reducer in place of an output-only reducer.
 
     ``num_splits=0`` automatically chooses a split count for both prefill and
     decode from host-visible batch and index capacities, without reading
@@ -320,7 +317,7 @@ def fused_norm_rope_attn_rope_cast(
     followed by FP32 reduction and the fused
     output transform. Q preparation remains fused into each partial kernel.
     Split attention changes FP32 summation order. Sink is applied once during
-    reduction; max/LSE still exclude it.
+    reduction; LSE still excludes it.
 
     Optional ``workspace`` is disjoint, contiguous FP32 ``[T,num_splits,H,516]``
     scratch with opaque contents. It holds partial accumulators, not KV.
@@ -420,7 +417,7 @@ def fused_norm_rope_attn_rope_cast(
         positions,
         out,
         out_scale,
-        max_logits,
+        None,
         lse,
         q_is_rotated,
         q_norm,
@@ -428,7 +425,7 @@ def fused_norm_rope_attn_rope_cast(
         num_splits,
         workspace,
     )
-    return out, out_scale, max_logits, lse
+    return out, out_scale, lse
 
 
 def _bf16_kv_rows(kv):

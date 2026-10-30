@@ -204,7 +204,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_legacy_fwd,
                                      stream))
 {
     AITER_CHECK(q && pool && prefix && prefix_indptr && cos && sin && positions && out &&
-                    out_scale && max_logits && lse,
+                    out_scale,
                 "required tensors must not be null");
     AITER_CHECK(q->is_gpu() && q->dim() == 3, "q must be a GPU tensor [T,H,512]");
     const auto t = q->size(0), h = q->size(1);
@@ -260,8 +260,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_legacy_fwd,
     check_tensor(sin, "sin", AITER_DTYPE_bf16, {cos->size(0), 32}, device, 2);
     check_tensor(out, "out", AITER_DTYPE_fp8, {t, h / 8, 4096}, device, 16);
     check_tensor(out_scale, "out_scale", AITER_DTYPE_fp8_e8m0, {t, h / 8, 128}, device);
-    check_tensor(max_logits, "max_logits", AITER_DTYPE_fp32, {t, h}, device, 4);
-    check_tensor(lse, "lse", AITER_DTYPE_fp32, {t, h}, device, 4);
+    if(max_logits)
+        check_tensor(max_logits, "max_logits", AITER_DTYPE_fp32, {t, h}, device, 4);
+    if(lse)
+        check_tensor(lse, "lse", AITER_DTYPE_fp32, {t, h}, device, 4);
     if(attn_sink)
         check_tensor(attn_sink, "attn_sink", AITER_DTYPE_fp32, {h}, device, 4);
     int erows = 0, ecap = 0;
@@ -305,8 +307,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_legacy_fwd,
     a.debug_out       = nullptr;
     a.out             = static_cast<uint8_t*>(out->data_ptr());
     a.scales          = static_cast<uint8_t*>(out_scale->data_ptr());
-    a.max_logits      = static_cast<float*>(max_logits->data_ptr());
-    a.lse             = static_cast<float*>(lse->data_ptr());
+    a.max_logits      = max_logits ? static_cast<float*>(max_logits->data_ptr()) : nullptr;
+    a.lse             = lse ? static_cast<float*>(lse->data_ptr()) : nullptr;
     a.tokens          = t;
     a.heads           = h;
     a.extend_rows     = erows;
