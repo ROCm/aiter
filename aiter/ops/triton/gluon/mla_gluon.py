@@ -107,12 +107,6 @@ def _mla_gluon(
     # --- dsv4-prefill knobs ---
     HAS_PE: gl.constexpr,
     HAS_ATTN_SINK: gl.constexpr,
-    # --- optional regime select (REGIME_SEL) ---
-    Sel_buf,  # int32 [sel_bs + 2]: alt-kernel kv_indptr (or zeros) + use_alt flag
-    sel_bs,
-    sel_thresh,
-    SEL_P2: gl.constexpr,
-    REGIME_SEL: gl.constexpr,
 ):
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
     # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
@@ -146,26 +140,6 @@ def _mla_gluon(
     else:
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
-
-    # REGIME_SEL: exit when sel_bs * max_b(L_b) >= sel_thresh, leaving the batch to
-    # the caller's alternative kernel. Program (0, 0, 0) publishes that kernel's
-    # kv_indptr (zeros when this kernel runs, so it early-exits) and the flag.
-    if REGIME_SEL:
-        gl.static_assert(
-            USE_2D_VIEW == 0, "REGIME_SEL requires USE_2D_VIEW=False (kv_indptr)"
-        )
-        sel_lay: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
-        offs_sel = gl.arange(0, SEL_P2, layout=sel_lay)
-        ip_lo = gl.load(B_seq_len + offs_sel, mask=offs_sel <= sel_bs, other=0)
-        ip_hi = gl.load(B_seq_len + offs_sel + 1, mask=offs_sel < sel_bs, other=0)
-        sel_max_len = gl.max(gl.where(offs_sel < sel_bs, ip_hi - ip_lo, 0), axis=0)
-        use_alt = sel_max_len.to(gl.int64) * sel_bs >= sel_thresh
-        if (gl.program_id(0) == 0) & (gl.program_id(1) == 0) & (gl.program_id(2) == 0):
-            flag_v = gl.where(offs_sel == sel_bs + 1, use_alt.to(gl.int32), 0)
-            sel_v = gl.where(offs_sel <= sel_bs, gl.where(use_alt, ip_lo, 0), flag_v)
-            gl.store(Sel_buf + offs_sel, sel_v, mask=offs_sel < sel_bs + 2)
-        if use_alt:
-            return
 
     # NUM_KV_SPLITS is a launch-time budget only. 
     # the partition is derived here from the runtime per-batch KV length.
@@ -862,9 +836,6 @@ def mla_gluon(
     return_lse=False,
     has_pe=True,
     attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
-    sel_buf=None,  # int32 [batch + 2], enables on-device kernel selection
-    sel_thresh=0,
-    skip_reduce=False,
 ):
     """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
 
@@ -888,24 +859,9 @@ def mla_gluon(
     DSv4 Sparse prefill packs NoPE and RoPE in to one contiguous row (448+64).
     To run DSv4 prefill, it requires has_pe=False, prepares valid Q / K in q_nope / kv_c,
     and attn_sink, q_pe / k_pe are unused placeholders.
-
-    skip_reduce=True: returns the stage-1 partials (logits_buf, mid_lse) and the
-        caller reduces them. With one KV split, stage-1 writes o directly and
-        (o, final_lse) is returned as usual.
-
-    sel_buf: hands long batches to another kernel captured in the same CUDA
-        graph. When batch * max_b(L_b) >= sel_thresh this kernel does no work,
-        and sel_buf gets kv_indptr in [:batch + 1] and 1 in [batch + 1].
-        Otherwise it runs as usual and sel_buf is all zeros, so the other
-        kernel sees empty sequences. Requires kv_indptr (use_2d_view=False)
-        and skip_reduce=True.
     """
     if k_pe is None:
         k_pe = kv_c
-    regime_sel = sel_buf is not None
-    if regime_sel:
-        assert not use_2d_view and skip_reduce
-        assert sel_buf.dtype == torch.int32 and sel_buf.numel() >= q_nope.shape[0] + 2
 
     # Accept plain decode (3-D, qlen=1) or MTP (4-D, [batch, qlen, nhead, dim]).
     # DSv4 sparse prefill (has_pe=False) always uses the 3-D path.
@@ -1133,18 +1089,11 @@ def mla_gluon(
         QLEN=qlen,
         HAS_PE=has_pe,
         HAS_ATTN_SINK=has_attn_sink,
-        Sel_buf=sel_buf,
-        sel_bs=batch_size,
-        sel_thresh=sel_thresh,
-        SEL_P2=max(256, triton.next_power_of_2(batch_size + 2)) if regime_sel else 1,
-        REGIME_SEL=regime_sel,
     )
 
     if NUM_KV_SPLITS == 1:
         # Fast path: stage-1 already wrote o (and lse) directly.
         return o, final_lse
-    if skip_reduce:
-        return logits_buf, mid_lse
 
     # Stage-2: reduce per-split (acc, lse) into o (and lse when return_lse).
     # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).
