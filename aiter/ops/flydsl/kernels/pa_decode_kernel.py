@@ -21,6 +21,8 @@ with two LDS buffers where capacity permits. One-partition plans can write
 final output directly; other plans use the shared partition reducer.
 BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
 with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
+Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
+using the 64-token pipeline.
 
 Logical layouts (not preshuffled):
 
@@ -80,6 +82,38 @@ __all__ = [
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
 _GFX1250_PA_DECODE_CACHE = {}
+
+
+def _pa_decode_tile_kernel_name(
+    *,
+    kv_dtype,
+    query_dtype,
+    head_dim,
+    block_size,
+    query_group_size,
+    query_length,
+    per_token_kv,
+    trans_v,
+    sliding_window,
+    query_splits,
+    direct_output=False,
+):
+    """Trace-visible symbol carrying the main compile-time constants."""
+    name = (
+        f"pa_decode_tile_kernel_kv{kv_dtype}_q{query_dtype}_d{head_dim}"
+        f"_bs{block_size}_gqa{query_group_size}_mtp{query_length}"
+    )
+    if per_token_kv:
+        name += "_pertoken"
+    if not trans_v:
+        name += "_vplain"
+    if sliding_window:
+        name += f"_sw{sliding_window}"
+    if query_splits > 1:
+        name += f"_qs{query_splits}"
+    if direct_output:
+        name += "_direct"
+    return name
 
 
 def compile_pa_decode_tile(
@@ -271,7 +305,20 @@ def compile_pa_decode_tile(
         )
         PaDecodePipeline(ctx).run()
 
-    @flyc.kernel(known_block_size=(traits.BLOCK_THREADS, 1, 1))
+    kernel_name = _pa_decode_tile_kernel_name(
+        kv_dtype=kv_dtype,
+        query_dtype=query_dtype,
+        head_dim=traits.head_dim,
+        block_size=traits.block_size,
+        query_group_size=traits.query_group_size,
+        query_length=traits.query_length,
+        per_token_kv=traits.per_token_kv,
+        trans_v=traits.trans_v,
+        sliding_window=traits.sliding_window,
+        query_splits=traits.query_splits,
+    )
+
+    @flyc.kernel(name=kernel_name, known_block_size=(traits.BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
         pmax_ptr: fx.Pointer,
         psum_ptr: fx.Pointer,
@@ -446,8 +493,22 @@ def compile_gfx1250_pa_decode(
     class SharedStorage:
         buf: fx.Array[fx.Int32, t.total_bytes // 4, 16]
 
-    @flyc.kernel(known_block_size=(128, 1, 1))
-    def kernel(
+    kernel_name = _pa_decode_tile_kernel_name(
+        kv_dtype=compute_dtype,
+        query_dtype=query_dtype,
+        head_dim=head_dim,
+        block_size=block_size,
+        query_group_size=query_group_size,
+        query_length=query_length,
+        per_token_kv=per_token_kv,
+        trans_v=trans_v,
+        sliding_window=sliding_window,
+        query_splits=query_splits,
+        direct_output=direct_output,
+    )
+
+    @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
+    def pa_decode_tile_kernel(
         pmax: fx.Pointer,
         psum: fx.Pointer,
         pout: fx.Pointer,
@@ -505,15 +566,15 @@ def compile_gfx1250_pa_decode(
                 fx.Int32(task[2]),
                 fx.Int32(task[3]),
             )
-            if const_expr(t.bf16_packed):
+            if const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
             output = fx.recast_iter(t.q_dtype, pout)
             tid = fx.Int32(gpu.thread_id("x"))
-            for i in range_constexpr((t.rows * t.head_dim + 127) // 128):
-                index = i * 128 + tid
+            for i in range_constexpr(-(-t.rows * t.head_dim // t.BLOCK_THREADS)):
+                index = i * t.BLOCK_THREADS + tid
                 if index < t.rows * t.head_dim:
                     row, d = index // t.head_dim, index % t.head_dim
                     kv_query = fx.Int32(gpu.block_id("y"))
@@ -556,7 +617,7 @@ def compile_gfx1250_pa_decode(
         stream: fx.Stream,
     ):
         _ = tag
-        kernel(
+        pa_decode_tile_kernel(
             pmax,
             psum,
             pout,
@@ -579,9 +640,9 @@ def compile_gfx1250_pa_decode(
                 kv_heads * t.query_splits,
                 1,
             ),
-            block=(128, 1, 1),
+            block=(t.BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
-    compiled = {"launch": launch, "kernel": kernel}
+    compiled = {"launch": launch, "kernel": pa_decode_tile_kernel}
     return _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)

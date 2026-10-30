@@ -70,22 +70,18 @@ def dequant_ds_mla(cache):
 
 
 def make_indices(C, pool, topk, device, seed, ragged):
-    # Built on CPU
-    g = torch.Generator(device="cpu").manual_seed(seed)
+    g = torch.Generator(device=device).manual_seed(seed)
     lens = (
-        torch.randint(1, topk + 1, (C,), generator=g, device="cpu")
+        torch.randint(1, topk + 1, (C,), generator=g, device=device)
         if ragged
-        else torch.full((C,), topk, device="cpu")
+        else torch.full((C,), topk, device=device)
     )
-    rows = [
-        torch.randperm(pool, generator=g, device="cpu")[: int(lens[c])]
-        for c in range(C)
-    ]
-    indptr = torch.zeros(C + 1, dtype=torch.int64, device="cpu")
+    rows = [torch.randperm(pool, generator=g, device=device)[:n] for n in lens.tolist()]
+    indptr = torch.zeros(C + 1, dtype=torch.int64, device=device)
     indptr[1:] = lens.cumsum(0)
     return (
-        torch.cat(rows).to(torch.int32).to(device),
-        indptr.to(torch.int32).to(device),
+        torch.cat(rows).to(torch.int32),
+        indptr.to(torch.int32),
     )
 
 
