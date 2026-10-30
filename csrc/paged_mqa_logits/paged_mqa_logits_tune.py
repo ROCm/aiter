@@ -285,6 +285,17 @@ class PagedMqaLogitsTuner(TunerCommon):
             f"(best per backend {per_backend})",
             flush=True,
         )
+        # The geomean can hide a context where the pick is well off that
+        # context's own best; log the per-context gap so it stays visible.
+        for context_len in contexts:
+            at_ctx = {n: t[context_len] for n, t in times.items() if context_len in t}
+            ctx_best = min(at_ctx, key=at_ctx.get)
+            loss = (at_ctx[pick] / at_ctx[ctx_best] - 1) * 100
+            print(
+                f"{shape} ctx={context_len}: pick {at_ctx[pick]:.2f} us, "
+                f"best {ctx_best} {at_ctx[ctx_best]:.2f} us, loss {loss:+.1f}%",
+                flush=True,
+            )
         chosen = dict(configs[pick])
         if chosen["backend"] == "flydsl" and "gluon" in best:
             gluon = configs[best["gluon"]]
