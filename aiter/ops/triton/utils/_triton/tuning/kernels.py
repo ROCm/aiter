@@ -43,6 +43,7 @@ it with its config family and where its gluon path exists:
 """
 
 import argparse
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -279,8 +280,8 @@ def fused_bf16_bmm_cat_quant_pad_mla(shape, backend):
     B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
     q_nope, w_uk_t, q_pe = generate_inputs(M, B, kv_lora=N, d_nope=K)
     q_scale = torch.ones((), dtype=torch.float32, device="cuda")
-    # the asm MLA decode runs a multiple of 16 heads
-    padded_heads = cdiv(B, 16) * 16
+    # a multiple of 16 heads for the asm MLA decode, and of B for the wrapper
+    padded_heads = math.lcm(B, 16)
     out = torch.empty(
         (M, padded_heads, N + q_pe.shape[-1]),
         dtype=get_fp8_e4m3_dtype(),

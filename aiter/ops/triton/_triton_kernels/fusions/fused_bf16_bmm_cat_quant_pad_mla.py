@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _fused_bf16_bmm_cat_quant_pad_mla_repr = make_kernel_repr(
@@ -166,18 +167,7 @@ def _fused_bf16_bmm_cat_quant_pad_mla_kernel(
 
     if pid < bmm_programs:
         pid_h = pid // grid_mn
-        pid_tile = pid % grid_mn
-
-        if GROUP_SIZE_M == 1:
-            pid_m = pid_tile // num_pid_n
-            pid_n = pid_tile % num_pid_n
-        else:
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            group_id = pid_tile // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + (pid_tile % group_size_m)
-            pid_n = (pid_tile % num_pid_in_group) // group_size_m
+        pid_m, pid_n = pid_grid(pid % grid_mn, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
         tl.assume(pid_h >= 0)
         tl.assume(pid_m >= 0)
