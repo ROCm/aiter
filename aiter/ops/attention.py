@@ -29,8 +29,17 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 from ..jit.core import _atoi_flag, compile_ops, env_flag_atoi, is_experimental_enabled
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from .opus.mla import opus_mla_decode_fwd, opus_mla_decode_mxfp8_fwd  # noqa: F401
 
 MD_NAME = "module_attention"
+_PA_FWD_ASM_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+
+@_functools.cache
+def pa_fwd_asm_supports_arch() -> bool:
+    """Whether the paged-attention ASM backend supports the current GPU."""
+    return get_gfx_runtime() in _PA_FWD_ASM_SUPPORTED_ARCHS
+
 
 direct_register_custom_op(
     "pa_decode_gluon",
@@ -955,11 +964,13 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
-def get_pa_metadata_info_v1(
-    batch_size: int,
-    num_head_k: int = 1,
-):
+def get_pa_metadata_info_v1(batch_size: int, num_head_k: int = 1):
     """
+    Allocate PA metadata buffers. Batches from 513 to 32768 reserve an internal
+    work-info scratch tail for parallel planning when KV heads divide the CU
+    count. Existing smaller buffers remain usable through the serial fallback.
+    Only records before work_indptr[-1] are attention tasks.
+
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
@@ -976,6 +987,13 @@ def get_pa_metadata_info_v1(
     tile_cnt = batch_size
     max_work = (tile_cnt + cu_num - 1) * num_head_k
     max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
+
+    if (
+        512 < batch_size <= 32768
+        and 1 <= num_head_k <= cu_num
+        and cu_num % num_head_k == 0
+    ):
+        max_work += batch_size + 2 * ((batch_size + 511) // 512)
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs
@@ -1022,9 +1040,17 @@ def get_pa_metadata_v1(
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
-            fast_mode: default=True. Whether user wants metadata become as fast as possible. Note that fast
-                       mode may lead to bad overall performance.
+            fast_mode: default=True. Uses parallel generation for dense, single-Q-tile inputs
+                       with page size 16 (block_size=kv_granularity=16), up to 32768 requests and
+                       the full CU worker budget. False, other page sizes or configurations, or
+                       buffers without the extra scratch space (see get_pa_metadata_info_v1) use
+                       the serial generator with identical metadata. Valid inputs require consistent
+                       indptrs, context lengths and positive Q lengths. Empty contexts have no
+                       attention work in the parallel path; callers own their outputs.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
+            max_split_per_batch: Global worker budget:
+                       negative uses the CU count, otherwise min(CUs, batch * value).
+                       The budget must be positive and divisible by the KV-head count.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.
@@ -1766,6 +1792,17 @@ def _get_mla_decode_shape_support_cached(
             f"mla_reduce_v1 has no ({p.kernel_num_heads} heads, "
             f"head_dim {v_head_dim}) case"
         )
+    # The stage-1 asm kernels and opus_mla_decode_fwd are built for the 512-element
+    # MLA latent row, however many reduce cases exist for other head dims (those
+    # serve prefill).
+    bad_v_dim = (asm_route or backend is MlaBackend.OPUS) and v_head_dim != 512
+    if bad_v_dim:
+        kernels = (
+            "opus_mla_decode_fwd only supports"
+            if backend is MlaBackend.OPUS
+            else f"{backend.value} decode kernels only support"
+        )
+        reasons.append(f"{kernels} v_head_dim 512, got {v_head_dim}")
     if ps1_folded:
         reasons.append(
             f"{backend.value} kernels read unfolded heads; planner {planner} folds "
@@ -1792,6 +1829,7 @@ def _get_mla_decode_shape_support_cached(
     if (
         (persistent and not planner_accepts)
         or (persistent and not p.reduce_supported)
+        or bad_v_dim
         or ps1_folded
         or hk_problems
         or opus_problems
@@ -2875,50 +2913,3 @@ def hk_mla_v40_decode_fwd(
         raise NotImplementedError(
             f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
         )
-
-
-@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
-def opus_mla_decode_mxfp8_fwd(
-    q_nope: torch.Tensor,  # [total_q, H, D_NOPE]      fp8
-    q_scale: torch.Tensor,  # [total_q, H, D_SCALE]     uint8 (E8M0)
-    q_rope: torch.Tensor,  # [total_q, H, D_ROPE]      bf16
-    kv_nope: torch.Tensor,  # [total_tokens, D_NOPE]    fp8
-    kv_scale: torch.Tensor,  # [total_tokens, D_SCALE]   uint8 (E8M0)
-    kv_rope: torch.Tensor,  # [total_tokens, D_ROPE]    bf16
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    work_indptr: torch.Tensor,
-    work_info_set: torch.Tensor,
-    page_size: int,
-    softmax_scale: float,
-    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,D_NOPE] fp32
-    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]      fp32
-    out: torch.Tensor,  # final [total_q, H, D_NOPE] bf16
-    final_lse: torch.Tensor | None = None,
-) -> None: ...
-
-
-@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
-def opus_mla_decode_fwd(
-    q: torch.Tensor,  # [total_q, H, 576] bf16 or fp8 (merged nope+rope)
-    kv: torch.Tensor,  # [total_tokens, ..., 576] same dtype as q, page_size == 1
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    work_indptr: torch.Tensor,
-    work_info_set: torch.Tensor,
-    page_size: int,
-    softmax_scale: float,
-    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
-    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
-    out: torch.Tensor,  # final [total_q, H, 512] bf16
-    final_lse: torch.Tensor | None = None,  # [total_q, H] fp32
-    q_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
-    kv_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
-    max_seqlen_q: int = -1,  # fp8: required, picks the kernel; bf16: unused
-    causal: bool = True,  # fp8: mask across the max_seqlen_q query tokens
-    g_kv_indptr: torch.Tensor | None = None,  # fp8 round-robin CP: GLOBAL kv_indptr
-    cp_world_size: int = 1,  # fp8 round-robin CP: number of ranks, 1 = no CP
-    cp_rank: int = 0,  # fp8 round-robin CP: this rank
-) -> None: ...
