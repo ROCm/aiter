@@ -13,6 +13,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
+| `unified_attention.py` | `UNIFIED_ATTENTION` | gfx942 FP8 unified attention, per layer shape in `DEFAULT_SHAPES` (no CSV) |
 | `mxfp4_moe.py` | — | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 | `dry_run.py` | — | Runs aiter's real host code on CPU (FakeTensors, `COMPILE_ONLY=1`, GPU runtime forbidden) |
@@ -155,6 +156,20 @@ per rank, layout `varlen_cross` for the chunked-prefill serving path).
 python -m aiter.aot.flydsl.fmha_fp8
 # ad hoc shape, without editing DEFAULT_SHAPES
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+```
+
+The gfx942 unified-attention kernel compiles in the layer shape, page size, K/V
+strides and decode-only flag. `unified_attention` builds, per layer shape in its
+`DEFAULT_SHAPES` (`num_heads, num_kv_heads, head_dim, window`),
+every served page size for the two canonical K/V layouts (separate caches, or
+vLLM's views of one cache), in the unified and decode-only builds. It takes no
+`--csv`. Other strides, such as a padded cache, compile on first use; under
+`FLYDSL_RUNTIME_RUN_ONLY=1` they fall back to Triton.
+
+```bash
+# Gemma-4-31B at TP1: 16 attention + 4 combine kernels
+# (decode and prefill splits per head dim)
+python -m aiter.aot.flydsl.unified_attention
 ```
 
 The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An
