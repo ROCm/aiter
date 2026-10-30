@@ -12,6 +12,24 @@ import time
 logger = logging.getLogger("aiter")
 
 
+def _stat_state(stat_line):
+    # comm may contain spaces and parens; state follows the last ')'
+    return stat_line.rpartition(b")")[2].split()[0]
+
+
+def _exited_unreaped(pid):
+    # A zombie answers signal 0 but never runs again. State Z alone only means
+    # the main thread exited, so also require that no other thread is left.
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            if _stat_state(stat_file.read()) != b"Z":
+                return False
+        with open(f"/proc/{pid}/status", "rb") as status_file:
+            return b"\nThreads:\t1\n" in status_file.read()
+    except OSError:
+        return False
+
+
 class FileBaton:
     """A primitive, file-based synchronization utility.
 
@@ -146,8 +164,8 @@ class FileBaton:
         except ProcessLookupError:
             return False
         except PermissionError:
-            return True  # exists but owned by another user
-        return True
+            pass  # exists but owned by another user
+        return not _exited_unreaped(pid)
 
     def _is_stale(self):
         """A lock is stale if its recorded holder is dead, or if it carries no
