@@ -213,7 +213,7 @@ def _mxfp4_pages(x):
 
     A pool row is one (page, head): [128 x 64 B e2m1][128 x 4 B e8m0].
     """
-    pages, heads, tokens, dim = x.shape
+    pages, heads, _, dim = x.shape
     data, scale = per_1x32_f4_quant(x.reshape(-1, dim))
     data = data.view(torch.uint8).reshape(-1, dim // 2)
     scale = scale.view(torch.uint8).reshape(-1, dim // 32)
