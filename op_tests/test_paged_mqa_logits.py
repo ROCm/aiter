@@ -338,8 +338,70 @@ def check_2d_context_lens_matches_reference():
         with torch.inference_mode():
             got = launch()[:, :kv_len]
         assert torch.equal(torch.isneginf(got), ref_inf), f"{name}: 2D -inf mask"
-        diff = calc_diff(ref.masked_fill(ref_inf, 0), got.masked_fill(ref_inf, 0))
+        want, got = ref.masked_fill(ref_inf, 0), got.masked_fill(ref_inf, 0)
+        diff = calc_diff(want, got)
         assert diff < 1e-3, f"{name}: 2D calc_diff={diff}"
+        err = checkAllclose(
+            want.to(dtypes.fp32),
+            got.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=5.0,
+            msg=f"{name}: 2D context_lens",
+        )
+        assert err < 0.05, f"{name}: 2D checkAllclose mismatch ratio {err}"
+
+
+def check_graph_replay_reads_lengths_on_device():
+    """Capture the op and each backend in a CUDA graph, change ``context_lens``
+    in place, and replay: the output must follow the new lengths. A launch that
+    read the lengths on the host would fail capture or bake in the old ones."""
+    batch, next_n, kv_len, new_len = 64, 8, 1024, 512
+    inp = build_inputs(
+        (batch, next_n, HEADS, HEAD_DIM, KV_BLOCK_SIZE, True), kv_len, kv_len
+    )
+    ref = run_torch(inp, new_len)
+    ref_inf = torch.isneginf(ref)
+    lens = inp["context_lens"]
+    args = launch_args(inp)
+    launches = {
+        "paged_mqa_logits": lambda: pmql.paged_mqa_logits(*args),
+        "gluon": lambda: pmql.run_paged_mqa_logits(pmql.DEFAULT_CONFIG, *args),
+    }
+    if pmql.flydsl_supports(
+        inp["q_fp8"], inp["kv_cache"], inp["weights"], True, KV_BLOCK_SIZE
+    ):
+        flydsl = {"backend": "flydsl", "ChunkK": 0, "WavePerEU": 0, "wg_per_cu": 0}
+        launches["flydsl"] = lambda: pmql.run_paged_mqa_logits(flydsl, *args)
+    for name, launch in launches.items():
+        lens.fill_(kv_len)
+        launch()  # compile and warm up outside the capture
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            launch()
+        torch.cuda.current_stream().wait_stream(stream)
+        lens.fill_(new_len)
+        inp["out_logits"].fill_(float("-inf"))
+        graph.replay()
+        torch.cuda.synchronize()
+        got = inp["out_logits"][:, :new_len]
+        assert torch.equal(torch.isneginf(got), ref_inf), f"{name}: replay -inf mask"
+        want, got = ref.masked_fill(ref_inf, 0), got.masked_fill(ref_inf, 0)
+        diff = calc_diff(want, got)
+        assert diff < 1e-3, f"{name}: replay calc_diff={diff}"
+        err = checkAllclose(
+            want.to(dtypes.fp32),
+            got.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=5.0,
+            msg=f"{name}: CUDA graph replay",
+        )
+        assert err < 0.05, f"{name}: replay checkAllclose mismatch ratio {err}"
+        assert torch.isneginf(
+            inp["out_logits"][:, new_len:kv_len]
+        ).all(), f"{name}: replay wrote past the new context length"
 
 
 def main():
@@ -354,6 +416,7 @@ def main():
     check_flydsl_fallback_keeps_gluon_knobs()
     check_strided_context_lens_rejected()
     check_2d_context_lens_matches_reference()
+    check_graph_replay_reads_lengths_on_device()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
