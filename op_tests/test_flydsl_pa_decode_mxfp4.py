@@ -26,7 +26,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
 from aiter.ops.flydsl.pa_decode_mxfp4 import pa_decode_mxfp4
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
@@ -34,11 +34,10 @@ torch.set_default_device("cuda")
 # v_mfma_scale_f32_16x16x128_f8f6f4 and ds_read_b64_tr_b16: CDNA4 only.
 SUPPORTED_GFX = ["gfx950"]
 
-# The implementation under test: every call below goes through this one name.
-PA_DECODE = pa_decode_mxfp4
-
 HEAD_DIM = 128
 Q_MAX_FP8 = 448.0
+ATOL = RTOL = 1e-2
+TOL_ERR_RATIO = 1e-2  # bf16 output vs the fp32 reference: a few outliers, never a row
 
 
 # --------------------------------------------------------------------------
@@ -133,10 +132,6 @@ def quantize_q_fp8(q_bf16):
     return q8, q8.to(torch.float32)
 
 
-def rel_l2(a, b):
-    return ((a - b).norm() / b.norm().clamp_min(1e-30)).item()
-
-
 def run_mxfp4(
     q,
     kd,
@@ -153,7 +148,7 @@ def run_mxfp4(
     out = torch.empty(rows, nq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
     if plan is None:
         plan = plan_pa_decode(ctx, kd.shape[1])
-    PA_DECODE(
+    pa_decode_mxfp4(
         out,
         q,
         kd,
@@ -181,10 +176,17 @@ def expect_error(exc, match, fn, *args, **kwargs):
         raise AssertionError(f"{exc.__name__} ({match!r}) was not raised")
 
 
-def assert_rel(a, b, tol, msg=""):
-    err = rel_l2(a.float(), b)
-    assert err < tol, f"{msg} rel-L2 {err:.2e} >= {tol}"
-    return err
+def check_close(out, ref, msg=""):
+    """assertAllclose against the torch reference: fails the script when more than
+    TOL_ERR_RATIO of the elements are outside rtol/atol; returns that ratio."""
+    return assertAllclose(
+        ref.float(),
+        out.float(),
+        rtol=RTOL,
+        atol=ATOL,
+        tol_err_ratio=TOL_ERR_RATIO,
+        msg=msg,
+    )
 
 
 CTX_SWEEP = [1, 15, 16, 17, 127, 128, 129, 255, 256, 257, 511, 2047, 2048]
@@ -200,10 +202,7 @@ def test_ctx_sweep(block_size, group):
     out = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale)
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, block_size)
     torch.cuda.synchronize()
-    err = assert_rel(out, ref, 3e-3)
-    for r, n in enumerate(ctx_lens):
-        assert_rel(out[r], ref[r], 1e-2, f"ctx {n}:")
-    return {"err": err}
+    return {"err": check_close(out, ref)}
 
 
 def test_garbage_tail(block_size):
@@ -241,7 +240,7 @@ def test_garbage_tail(block_size):
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, block_size)
     torch.cuda.synchronize()
     assert torch.isfinite(out.float()).all()
-    return {"err": assert_rel(out, ref, 3e-3)}
+    return {"err": check_close(out, ref)}
 
 
 def test_heads(kv_heads, group):
@@ -256,7 +255,7 @@ def test_heads(kv_heads, group):
     out = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale)
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, 128)
     torch.cuda.synchronize()
-    return {"err": assert_rel(out, ref, 3e-3)}
+    return {"err": check_close(out, ref)}
 
 
 def test_task_shapes(max_partitions):
@@ -272,7 +271,7 @@ def test_task_shapes(max_partitions):
     out = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale, plan=plan)
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, 16)
     torch.cuda.synchronize()
-    return {"err": assert_rel(out, ref, 3e-3)}
+    return {"err": check_close(out, ref)}
 
 
 def test_one_task_per_row(rows, out_dtype):
@@ -288,13 +287,13 @@ def test_one_task_per_row(rows, out_dtype):
     out = torch.full(
         (rows, 16, HEAD_DIM), float("nan"), dtype=out_dtype, device=q.device
     )
-    PA_DECODE(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
+    pa_decode_mxfp4(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
     torch.cuda.synchronize()
     assert torch.isfinite(out.float()).all()  # every row was written
     if rows > 64:
         return {}
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
-    return {"err": assert_rel(out, ref, 3e-3)}
+    return {"err": check_close(out, ref)}
 
 
 def test_default_plan_vs_one_task_per_row():
@@ -313,7 +312,7 @@ def test_default_plan_vs_one_task_per_row():
         plan=plan_pa_decode(ctx, 1, max_partitions=1),
     )  # fmt: skip
     torch.cuda.synchronize()
-    return {"err": assert_rel(a, b.float(), 1e-2)}
+    return {"err": check_close(a, b)}
 
 
 def test_direct_output_strided_and_empty_rows():
@@ -327,16 +326,16 @@ def test_direct_output_strided_and_empty_rows():
     # output rows padded to 2x: a strided view
     big = torch.full((4, 32, HEAD_DIM), 7.0, dtype=torch.bfloat16, device=q.device)
     out = big[:, :16]
-    PA_DECODE(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
+    pa_decode_mxfp4(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
     torch.cuda.synchronize()
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
-    err = max(assert_rel(out[r], ref[r], 3e-3) for r in (0, 2, 3))
+    err = max(check_close(out[r], ref[r]) for r in (0, 2, 3))
     assert (big[:, 16:] == 7.0).all()  # nothing written outside the view
     # a context-0 row has no task: the direct path leaves it alone (documented)
     assert (out[1] == 7.0).all()
     # the reduce path (a splitting plan) zero-fills it
     out2 = torch.full_like(q, 7.0)
-    PA_DECODE(
+    pa_decode_mxfp4(
         out2, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5,
         work_plan=plan_pa_decode(ctx, 1, max_partitions=2),
     )  # fmt: skip
@@ -357,7 +356,7 @@ def replay_matches(call, out, ref):
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, first)
-    return assert_rel(out, ref, 3e-3)
+    return check_close(out, ref)
 
 
 def test_direct_output_graph_replay():
@@ -371,14 +370,16 @@ def test_direct_output_graph_replay():
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
 
     def call():
-        PA_DECODE(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
+        pa_decode_mxfp4(
+            out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan
+        )
 
     return {"err": replay_matches(call, out, ref)}
 
 
 def run_free(q, kd, ks, vd, vs, bt, ctx, scale, out_dtype=torch.bfloat16, **kw):
     out = torch.full(q.shape, 7.0, dtype=out_dtype, device=q.device)
-    PA_DECODE(out, q, kd, ks, vd, vs, ctx, bt, scale, work_plan=None, **kw)
+    pa_decode_mxfp4(out, q, kd, ks, vd, vs, ctx, bt, scale, work_plan=None, **kw)
     return out
 
 
@@ -394,10 +395,7 @@ def test_plan_free_vs_reference(block_size):
     out = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale)
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, block_size)
     torch.cuda.synchronize()
-    err = assert_rel(out, ref, 3e-3)
-    for r, n in enumerate(ctx_lens):
-        assert_rel(out[r], ref[r], 1e-2, f"ctx {n}:")
-    return {"err": err}
+    return {"err": check_close(out, ref)}
 
 
 def test_plan_free_is_bitwise_the_planned_path(rows):
@@ -429,7 +427,7 @@ def test_plan_free_empty_rows():
     err = 0.0
     for r, n in enumerate(ctx_lens):
         if n:
-            err = max(err, assert_rel(out[r], ref[r], 3e-3))
+            err = max(err, check_close(out[r], ref[r]))
         else:
             assert (out[r] == 0).all(), f"row {r}"
     return {"err": err}
@@ -444,7 +442,7 @@ def test_plan_free_graph_replay():
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
 
     def call():
-        PA_DECODE(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5)
+        pa_decode_mxfp4(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5)
 
     return {"err": replay_matches(call, out, ref)}
 
@@ -457,11 +455,11 @@ def test_plan_free_argument_checks():
     out = torch.empty_like(q)
     expect_error(
         NotImplementedError, "one task per sequence",
-        PA_DECODE, out, q_in, kd, ks, vd, vs, ctx, bt, 1.0, max_partitions=2,
+        pa_decode_mxfp4, out, q_in, kd, ks, vd, vs, ctx, bt, 1.0, max_partitions=2,
     )  # fmt: skip
     expect_error(
         ValueError, "plan-free",
-        PA_DECODE, out, q_in, kd, ks, vd, vs, ctx, bt, 1.0,
+        pa_decode_mxfp4, out, q_in, kd, ks, vd, vs, ctx, bt, 1.0,
         work_plan=plan_pa_decode(ctx, 1), max_partitions=2,
     )  # fmt: skip
     ctx, bt, k, v, q = make_case([40000], 16, 16, seed=2, extra_pages=0)
@@ -482,11 +480,13 @@ def test_output_device_and_empty_batch():
     q_in, _ = quantize_q_fp8(q)
     expect_error(
         ValueError, "output must be on",
-        PA_DECODE, q.cpu(), q_in, kd, ks, vd, vs, ctx, bt, 1.0, max_partitions=1,
+        pa_decode_mxfp4, q.cpu(), q_in, kd, ks, vd, vs, ctx, bt, 1.0, max_partitions=1,
     )  # fmt: skip
     # zero sequences: nothing to do, in particular no division by num_seqs
     empty = torch.empty(0, 16, HEAD_DIM, dtype=torch.bfloat16)
-    PA_DECODE(empty, q_in[:0], kd, ks, vd, vs, ctx[:0], bt[:0], 1.0, work_plan=None)
+    pa_decode_mxfp4(
+        empty, q_in[:0], kd, ks, vd, vs, ctx[:0], bt[:0], 1.0, work_plan=None
+    )
     return {}
 
 
@@ -537,16 +537,15 @@ def run_checks():
     rows = []
     for fn, cases in CHECKS:
         for case in cases:
-            ret = fn(**case)  # asserts inside; the worst rel-L2 it measured, if any
+            ret = fn(**case)  # asserts inside; the mismatch ratio it measured, if any
             params = " ".join(f"{k}={v}" for k, v in case.items())
             rows.append({"check": fn.__name__[5:], "case": params, **ret})
     return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------
-# Timing: MXFP4 KV (this kernel) vs the FP8 KV pa_decode at the same shape
+# Timing: pa_decode_mxfp4 (MXFP4 KV cache), the one candidate
 # --------------------------------------------------------------------------
-ATOL = RTOL = 1e-2
 # K + V bytes per token: MXFP4 data + e8m0 scales.
 TOKEN_BYTES = 2 * (HEAD_DIM // 2 + HEAD_DIM // 32)
 
