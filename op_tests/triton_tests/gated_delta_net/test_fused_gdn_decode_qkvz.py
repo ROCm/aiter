@@ -506,6 +506,59 @@ def test_fused_gdn_decode_correctness_flat_layout(
     )
 
 
+def _split_k_partials(projected_ba, num_ksplit):
+    """fp32 partials whose sum is exactly the bf16 projection."""
+    torch.manual_seed(1)
+    rest = torch.randn(
+        (num_ksplit - 1, *projected_ba.shape), device=projected_ba.device
+    )
+    return torch.cat([rest, (projected_ba.float() - rest.sum(0))[None]])
+
+
+@pytest.mark.parametrize("batch", [1, 4, 64])
+@pytest.mark.parametrize("num_k_heads,ratio", [(16, 3), (4, 2)])
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+@pytest.mark.parametrize("num_ksplit", [2, 8, 20])
+@pytest.mark.parametrize("qkvz_layout", ["interleaved", "flat"])
+def test_fused_gdn_decode_ba_partials(
+    batch, num_k_heads, ratio, state_dtype, num_ksplit, qkvz_layout
+):
+    """Split-K partials of ``projected_ba`` ([KS, T, 2*VH] fp32) give the result of
+    the bf16 projection they sum to."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    if qkvz_layout == "flat":
+        inp = to_flat_layout(inp)
+    out, _, _ = fused_gdn_decode_qkvz(
+        inp["projected_qkvz"],
+        _split_k_partials(inp["projected_ba"], num_ksplit),
+        inp["conv_state"],
+        inp["ssm_state"],
+        inp["ssm_state_indices"],
+        inp["conv_weight"],
+        inp["conv_bias"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["norm_weight"],
+        scale=inp["scale"],
+        norm_eps=inp["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout=qkvz_layout,
+    )
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        inp["ssm_state"], ref_inp["ssm_state"], atol=ATOL, rtol=ATOL
+    )
+
+
 @pytest.mark.parametrize("batch", [2, 64])
 @pytest.mark.parametrize(
     "num_k_heads,ratio,qkvz_layout", [(16, 3, "flat"), (4, 2, "interleaved")]

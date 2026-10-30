@@ -19,7 +19,7 @@ from .fused_gdn_decode_qkvz import _exp, _quantization_scale, _sigmoid
 
 _ratio_repr = make_kernel_repr(
     "_decode_group_ratio",
-    ["RATIO", "NW", "KL", "KS", "HAS_FP8", "FLAT", "NUM_BUFFERS"],
+    ["RATIO", "NW", "KL", "KS", "HAS_FP8", "FLAT", "NUM_BUFFERS", "BA_KSPLIT"],
 )
 
 
@@ -78,18 +78,32 @@ def _gating(
     token,
     head,
     ba_row_stride,
+    ba_split_stride,
     VH: gl.constexpr,
     RATIO: gl.constexpr,
     FLAT: gl.constexpr,
+    BA_KSPLIT: gl.constexpr,
 ):
-    """Gating inputs of one value head (loads only, so they can all be in flight)."""
+    """Gating inputs of one value head (loads only, so they can all be in flight).
+    With BA_KSPLIT > 1, BA holds that many fp32 split-K partials of ba; their sum is
+    rounded to bf16 like the GEMM output it replaces."""
     if FLAT:
-        b = gl.load(BA + token * ba_row_stride + head).to(gl.float32)
-        a = gl.load(BA + token * ba_row_stride + VH + head).to(gl.float32)
+        b_offset = token * ba_row_stride + head
+        a_offset = b_offset + VH
     else:
-        offset = token * ba_row_stride + (head // RATIO) * (2 * RATIO) + head % RATIO
-        b = gl.load(BA + offset).to(gl.float32)
-        a = gl.load(BA + offset + RATIO).to(gl.float32)
+        b_offset = token * ba_row_stride + (head // RATIO) * (2 * RATIO) + head % RATIO
+        a_offset = b_offset + RATIO
+    if BA_KSPLIT == 1:
+        b = gl.load(BA + b_offset).to(gl.float32)
+        a = gl.load(BA + a_offset).to(gl.float32)
+    else:
+        b = gl.load(BA + b_offset)
+        a = gl.load(BA + a_offset)
+        for s in gl.static_range(1, BA_KSPLIT):
+            b += gl.load(BA + s * ba_split_stride + b_offset)
+            a += gl.load(BA + s * ba_split_stride + a_offset)
+        b = b.to(gl.bfloat16).to(gl.float32)
+        a = a.to(gl.bfloat16).to(gl.float32)
     a_log = gl.load(ALog + head)
     bias = gl.load(DTBias + head).to(gl.float32)
     return b, a, a_log, bias
@@ -258,6 +272,7 @@ def _decode_group_ratio(
     ssm_slot_stride,
     proj_row_stride,
     ba_row_stride,
+    ba_split_stride,
     KH: gl.constexpr,
     VH: gl.constexpr,
     K: gl.constexpr,
@@ -273,6 +288,7 @@ def _decode_group_ratio(
     HAS_QSL: gl.constexpr,
     REG_EPILOGUE: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 4,
+    BA_KSPLIT: gl.constexpr = 1,
 ):
     """One program per (token, key-head group). Rows with an empty ``QueryStartLoc`` segment (``HAS_QSL``) or ``PAD_SLOT_ID`` are
     padded and skipped; ``conv_*_stride``
@@ -322,7 +338,17 @@ def _decode_group_ratio(
     biases = ()
     for h in gl.static_range(RATIO):
         b, a, a_log, bias = _gating(
-            BA, ALog, DtBias, token, head0 + h, ba_row_stride, VH, RATIO, FLAT
+            BA,
+            ALog,
+            DtBias,
+            token,
+            head0 + h,
+            ba_row_stride,
+            ba_split_stride,
+            VH,
+            RATIO,
+            FLAT,
+            BA_KSPLIT,
         )
         bs = bs + (b,)
         as_ = as_ + (a,)
