@@ -51,8 +51,11 @@ def _reduce_exe():
     import flydsl.compiler as flyc
 
     from .kernels.gemm.mxscale_preshuffle import launch_splitk_reduce
+    from .kernels.kernels_common import set_slp_vectorize_once_used
 
-    return flyc.jit(launch_splitk_reduce.func)
+    # flyc.jit(.func) starts with empty compile_hints, so the hint on
+    # launch_splitk_reduce itself never reaches this reduction.
+    return set_slp_vectorize_once_used(flyc.jit(launch_splitk_reduce.func), False)
 
 
 @functools.lru_cache(maxsize=1024)

@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import multiprocessing as mp
+import os
 
 import pytest
 import torch
@@ -9,6 +10,10 @@ import torch.distributed as dist
 
 import aiter
 from aiter import logger
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_fused_allreduce_rmsnorm,
+)
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.comms.all_reduce import all_reduce_free, all_reduce_init
@@ -123,6 +128,56 @@ def test_all_reduce_rmsnorm_quant():
     with mp.Pool(processes=WORLD_SIZE) as pool:
         results = [
             pool.apply_async(_worker, (rank, init_method)) for rank in range(WORLD_SIZE)
+        ]
+        failures = [f for r in results for f in r.get(timeout=1800)]
+    assert not failures, "\n".join(failures[:20])
+
+
+def _dispatch_worker(rank, init_method):
+    os.environ["AITER_GLUON_FUSED_AR"] = "1"  # read when the TP communicator is made
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    aiter.init_dist_env(WORLD_SIZE, rank, distributed_init_method=init_method)
+    tp = get_tp_group()
+    failures = []
+    try:
+        if tp.device_communicator.gluon_ar is None:
+            failures.append(f"rank {rank}: the TP communicator has no Gluon inboxes")
+        for tokens in (1, 8, 128, 1024, 2048):  # 2048 rows at hidden 2048 are 8 MiB
+            x, residual, weight, *ref = _inputs(tokens, rank, device)
+            outs = tensor_model_parallel_fused_allreduce_rmsnorm(
+                x, residual, weight, EPS, gemma_norm=True
+            )
+            name = f"rank {rank} dispatch tokens {tokens}"
+            failures += _compare(name, outs, *ref, tp.device_group)
+
+        # The plain all-reduce, up to 4 MiB. Bit-exact only on the Gluon path.
+        if tp.device_communicator.gluon_ar_plain is None:
+            failures.append(f"rank {rank}: no Gluon inboxes for the plain all-reduce")
+        for tokens in (1, 8, 128, 1024):  # 1024 rows at hidden 2048 are 4 MiB
+            gen = torch.Generator(device=device).manual_seed(1000 + tokens)
+            shape = (tokens, HIDDEN)
+            xs = [
+                torch.randn(shape, generator=gen, dtype=torch.bfloat16, device=device)
+                for _ in range(WORLD_SIZE)
+            ]
+            ref = xs[0].float() + xs[1].float() + xs[2].float() + xs[3].float()
+            out = tensor_model_parallel_all_reduce(xs[rank])
+            bad = out.view(torch.int16) != ref.to(torch.bfloat16).view(torch.int16)
+            if bool(bad.any()):
+                failures.append(f"rank {rank} plain dispatch tokens {tokens}: wrong")
+    finally:
+        aiter.destroy_dist_env()
+    return failures
+
+
+def test_fused_allreduce_rmsnorm_dispatch():
+    ensure_spawn_method()
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with mp.Pool(processes=WORLD_SIZE) as pool:
+        results = [
+            pool.apply_async(_dispatch_worker, (rank, init_method))
+            for rank in range(WORLD_SIZE)
         ]
         failures = [f for r in results for f in r.get(timeout=1800)]
     assert not failures, "\n".join(failures[:20])
