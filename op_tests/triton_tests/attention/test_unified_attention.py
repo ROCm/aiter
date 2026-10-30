@@ -1238,3 +1238,84 @@ def test_unified_attn_equal_seqlen_q_gfx1250(
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
     assert (out_buf[num_tokens:] == sentinel).all(), "wrote past the real tokens"
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # uneven: a big chunk over a short context next to a few tokens over a long one
+        # -> 3D above the program cap, with the split widened
+        [(3000, 6000), (8, 20000)],
+        # even and long: two 4000-token chunks over 20k contexts -> 2D, wider block/tile
+        [(4000, 20000), (4000, 20000)],
+        # fresh prompts: untouched by the hint
+        [(2048, 2048), (1024, 1024)],
+    ],
+)
+@pytest.mark.parametrize("with_hint", [True, False])
+@torch.inference_mode()
+def test_unified_attn_attn_work_gfx1250(seq_lens, with_hint: bool) -> None:
+    """The optional attn_work hint (sum of q x (k - q / 2)) only steers the gfx1250
+    prefill routing and config; the output must match the reference either way."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    block_size, head_size, num_heads = 64, 256, (4, 1)
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * (max(k for _, k in seq_lens) // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+    attn_work = int(sum(q * (k - q / 2) for q, k in seq_lens)) if with_hint else None
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=True,
+        attn_work=attn_work,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+    )
+    assert not output.isnan().any()
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
