@@ -66,10 +66,12 @@ class GemmConfigPruner:
             * (config["block_m"] + config["block_n"])
             * config["block_k"]
             * self.element_bytes,
-            config["k_waves"]
-            * config["block_m"]
-            * config["block_n"]
-            * self.element_bytes,
+            # slice-K exchanges fp32 tiles
+            (
+                config["k_waves"] * config["block_m"] * config["block_n"] * 4
+                if config["k_waves"] > 1
+                else 0
+            ),
         )
         # A workgroup may occupy the whole per-CU LDS here, so the capacity the
         # chip table reports per workgroup is also the per-CU figure.
@@ -222,7 +224,8 @@ def get_flydsl_a16w16_configs(
     if get_gfx() != "gfx950":
         return []
 
-    split_k_candidates = list(range(1, 17))
+    # Past 16, only the counts that the smallest shapes use.
+    split_k_candidates = list(range(1, 17)) + [20, 24, 28, 32]
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
@@ -231,7 +234,7 @@ def get_flydsl_a16w16_configs(
         "split_k": split_k_candidates,
         "m_waves": [1, 2, 4],
         "n_waves": [1, 2, 4],
-        "k_waves": [1, 2],
+        "k_waves": [1, 2, 4, 8],
         "group_m": [0, 4],
         "use_half_tile_interleaved": [False, True],
     }
