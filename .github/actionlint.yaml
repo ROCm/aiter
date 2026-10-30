@@ -22,7 +22,7 @@ self-hosted-runner:
     - linux-aiter-mi355-8
     - box308
     - devlab-dispatch
-    - gfx1201
+    - radeon-r9700
 
 config-variables: null
 

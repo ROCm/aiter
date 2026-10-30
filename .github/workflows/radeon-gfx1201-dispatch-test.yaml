@@ -10,7 +10,7 @@ on:
 
 jobs:
   gfx1201:
-    runs-on: [self-hosted, linux, devlab-dispatch, gfx1201]
+    runs-on: [self-hosted, linux, devlab-dispatch, radeon-r9700]
     steps:
       - name: Check gfx1201 runner
         run: |
