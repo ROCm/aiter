@@ -255,6 +255,6 @@ def __getattr__(name: str):
     # Importing a submodule binds it on this package, shadowing an export of the
     # same name (``pa_decode``). Drop those bindings so the export loads instead.
     for export in _LAZY_IMPORTS.keys() & globals().keys():
-        if isinstance(globals()[export], ModuleType):
-            del globals()[export]
+        if isinstance(globals().get(export), ModuleType):
+            globals().pop(export, None)
     return value
