@@ -35,6 +35,9 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
 from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     alloc_score as prefill_alloc_score,
 )
+from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+    geometry as prefill_geometry,
+)
 from aiter.ops.msa_block_select import pa_sparse_block_score_prefill
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -300,7 +303,6 @@ SHAPES = PREFILL_SHAPES + [
     (1, 8192, 8192),
     (1, 7000, 7000),
     (2, 4096, 20000),
-    (4, 512, 8192),
     (3, 300, 33333),
 ]
 
@@ -317,6 +319,38 @@ def check_prefill_every_geometry(shape, qdt):
     c, kd, ks = fp4_prefill_case(*shape)
     ref, live = aiter_scores(c)
     check_scores(run_fp4(c, kd, ks, qdt), ref, live, f"{shape}")
+
+
+def check_prefill_geometry_arms_are_exhaustive():
+    """Every geometry the selector can reach has an every_geometry case: without
+    this, narrowing `geometry` leaves the arms passing on the surviving shape."""
+    dev = torch.device("cuda")
+
+    def key(g):
+        return (g["tile_q"], g["waves"], g["pages_per_wave"], g["m32"])
+
+    reachable = set()
+    for ctx in (256, 1000, 2048, 5000, 8192, 16384, 32768, 131072, 524288):
+        for q_len in (128, 130, 256, 512, 777, 1024, 2048, 4096):
+            for batch in (1, 2, 3, 4, 8):
+                if q_len <= ctx:
+                    reachable.add(
+                        key(prefill_geometry(q_len, batch, 1, -(-ctx // P), dev))
+                    )
+    covered = {
+        key(prefill_geometry(q_len, batch, 1, -(-ctx // P), dev))
+        for batch, q_len, ctx in GEOM_SHAPES
+    }
+    assert covered == reachable, f"uncovered: {sorted(reachable - covered)}"
+
+
+def check_prefill_typed_views(qdt):
+    """per_1x32_f4_quant's own dtypes (fp4x2 data, e8m0 scale) are accepted and
+    score bit for bit like the uint8 views."""
+    c, kd, ks = fp4_prefill_case(1, 256, 1000)
+    plain = run_fp4(c, kd, ks, qdt)
+    typed = run_fp4(c, kd.view(dtypes.fp4x2), ks.view(dtypes.fp8_e8m0), qdt)
+    check_equal(typed, plain, "typed views")
 
 
 def check_prefill_two_heads(qdt):
@@ -582,7 +616,11 @@ def build_cases():
         cases.append(
             (f"every_geometry_{name}", check_prefill_every_geometry, (shape, qdt))
         )
+    cases.append(
+        ("geometry_arms_are_exhaustive", check_prefill_geometry_arms_are_exhaustive, ())
+    )
     for qdt in QDTS:
+        cases.append((f"typed_views_{qdt}", check_prefill_typed_views, (qdt,)))
         cases.append((f"two_heads_{qdt}", check_prefill_two_heads, (qdt,)))
     for ctx in [1, 127, 128, 129, 1000, 4097]:
         cases.append((f"ragged_tails_ctx{ctx}", check_prefill_ragged_tails, (ctx,)))

@@ -1559,8 +1559,8 @@ def alloc_score(total_q: int, heads: int, max_block: int, device):
 
 
 def _validate_cache(k_data, k_scale, device):
-    """Shapes, dtypes and strides of the two MXFP4 views. Contents (block ids inside
-    the pool, e8m0 not 0/255) are a caller contract."""
+    """Shapes, dtypes and strides of the two MXFP4 views (already uint8). Contents
+    (block ids inside the pool, e8m0 not 0/255) are a caller contract."""
     import torch
 
     _validate_tensor(k_data, "k_data", (torch.uint8,), 3, device, 16, False)
@@ -1608,8 +1608,9 @@ def score_prefill_flydsl(
     """Block scores for a ragged prefill batch.
 
     With `k_scale` the cache is MXFP4 and read natively: `cache` is then the e2m1
-    view `[pages, 128, 64]` uint8, `k_scale` the e8m0 view `[pages, 128, 4]` uint8
-    (see `_validate_cache`), and `idx_q` may also be e4m3.
+    view `[pages, 128, 64]` (uint8 or fp4x2), `k_scale` the e8m0 view
+    `[pages, 128, 4]` (uint8 or float8_e8m0fnu; see `_validate_cache`), and `idx_q`
+    may also be e4m3.
 
     Shapes, dtypes, strides and the launch bounds are checked here. The ragged
     arrays' CONTENTS are a caller contract, as they are for the decode scorer:
@@ -1626,6 +1627,13 @@ def score_prefill_flydsl(
 
     total_q, heads, head_dim = idx_q.shape
     k_fp4 = k_scale is not None
+    if k_fp4:
+        # per_1x32_f4_quant hands back fp4x2 / e8m0: take those as they are. Same
+        # bytes either way, so the uint8 view is only a reinterpretation.
+        if getattr(cache, "dtype", None) == dtypes.fp4x2:
+            cache = cache.view(torch.uint8)
+        if getattr(k_scale, "dtype", None) == dtypes.fp8_e8m0:
+            k_scale = k_scale.view(torch.uint8)
     if head_dim != HEAD_DIM:
         raise ValueError(f"index head_dim must be {HEAD_DIM}, got {head_dim}")
     if not k_fp4 and (
