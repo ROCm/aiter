@@ -9,8 +9,15 @@ import triton
 from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_dual_splitk import (
     fused_gemm_a16w16_dual_splitk,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
+)
+
+# Configs exist for gfx950 only; the config loader needs an arch-local DEFAULT.json.
+pytestmark = pytest.mark.skipif(
+    get_arch() != "gfx950",
+    reason="fused_gemm_a16w16_dual_splitk configs are gfx950-only",
 )
 
 

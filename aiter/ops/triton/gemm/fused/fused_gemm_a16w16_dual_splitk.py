@@ -69,6 +69,10 @@ def fused_gemm_a16w16_dual_splitk(
         n2,
     )
 
+    assert x.shape[1] == w.shape[1], (
+        f"x is (M, K)={tuple(x.shape)} and w is "
+        f"(N, K)={tuple(w.shape)}, K must match"
+    )
     M, K = x.shape
     N, _ = w.shape
     N1 = N - n2
