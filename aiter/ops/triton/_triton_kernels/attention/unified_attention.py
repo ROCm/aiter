@@ -651,6 +651,9 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "IS_Q_FP8",
         "IS_KV_FP8",
+        "LENGTH_AWARE_SPLIT",
+        "SEQ_BLOCK",
+        "ITEM_RUN",
     ],
 )
 
@@ -1104,6 +1107,9 @@ _reduce_segments_repr = make_kernel_repr(
         "NUM_SEGMENTS_PER_SEQ",
         "SEGMENT_BLOCK",
         "BLOCK_D",
+        "LENGTH_AWARE_SPLIT",
+        "SEQ_BLOCK",
+        "LENGTH_AWARE_SEGMENT_BLOCK",
     ],
 )
 

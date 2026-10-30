@@ -843,6 +843,22 @@ def test_length_aware_split_scope() -> None:
     edge = {"num_seqs": 1023, "num_kv_heads": 1}
     assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=1 << 21))
     assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=2_099_202)) is None
+    # find_work_item unpacks the sequences before an item from 15 bits
+    wide = {**vars(params), "max_seqlen_k": 1 << 15}
+    assert _length_aware_split(
+        config, SimpleNamespace(**{**wide, "num_seqs": 2**15 - 1})
+    )
+    assert (
+        _length_aware_split(config, SimpleNamespace(**{**wide, "num_seqs": 2**15}))
+        is None
+    )
+    # the 3D launch and the reduce read their length-aware keys from these entries
+    assert "SPLIT_RUNS_PER_XCD" in get_unified_attention_config(
+        "attn_3d", params, arch="gfx950"
+    )
+    assert "SPLIT_SEGMENT_BLOCK_MIN" in get_unified_attention_config(
+        "reduce", params, arch="gfx950"
+    )
 
 
 @pytest.mark.parametrize(
