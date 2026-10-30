@@ -449,7 +449,15 @@ def build_smallm(kc: KernelCtx) -> dict:
             )
         else:  # (the static K loop of the whole K dim)
             gemm1(
-                L, tid, a, e, i0, icnt // i32(128), half=icnt == i32(64), dup=ce > i32(1)
+                L,
+                tid,
+                a,
+                e,
+                i0,
+                icnt // i32(128),
+                rows=R,
+                half=icnt == i32(64),
+                dup=ce > i32(1),
             )
         mark(tid, a, 14)
         if u == i32(0):

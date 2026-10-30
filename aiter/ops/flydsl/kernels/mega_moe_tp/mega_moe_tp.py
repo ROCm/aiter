@@ -263,6 +263,8 @@ class MegaMoeTPLDSError(ValueError):
 
 # the tuned launch-config fields of a batch (configs/mega_moe_tp_tuned.csv)
 _TUNED_FIELDS = ("mt", "npp", "q", "pf", "lp", "ll", "llr")
+# the small-M tuned launch fields (aiter/configs/mega_moe_tp_sm_tuned.csv)
+_SM_TUNED_FIELDS = ("mt", "nc", "ar2")
 
 
 def _mt_table(spec) -> tuple[int, list[tuple[int, int]]]:
@@ -599,18 +601,57 @@ class MegaMoeTPEngine:
             mt += 1
         return mt
 
+    def _sm_tuned(self, tot: int) -> dict:
+        """(small-M) the tuned launch fields (mt, nc, ar2) of the nearest tuned batch <= tot
+        (AITER_CONFIG_MEGA_MOE_TP_SM), else {} (the defaults)"""
+        key = {
+            **device_key(self.device),
+            "model_dim": self.H,
+            "inter_dim": self.I,
+            "experts": self.E,
+            "topk": self.K,
+            "tp": self.tp,
+            "comm_mode": self.mode,
+        }
+        # (an explicit env path read live: AITER_CONFIGS caches its first lookup)
+        path = os.environ.get("AITER_CONFIG_MEGA_MOE_TP_SM") or (
+            AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_SM_FILE
+        )
+        row = nearest(tuned_rows(path, key, "tot"), tot, clamp=True)
+        if row is None:
+            return {}
+        return {k: int(row[k]) for k in _SM_TUNED_FIELDS if row.get(k, "") != ""}
+
     def _sm_mt(self, tot: int) -> int:
-        # (debug: AITER_MEGAMOE_TP_SMMT "mt<=32,mt<=64,mt<=128,mt<=256")
-        m = [int(v) for v in os.environ.get("AITER_MEGAMOE_TP_SMMT", "1,2,2,3").split(",")]
+        # (debug: AITER_MEGAMOE_TP_SMMT "mt<=32,mt<=64,mt<=128,mt<=256" over the tuned file)
+        env = os.environ.get("AITER_MEGAMOE_TP_SMMT")
+        tu = self._sm_tuned(tot)
+        if env is None and "mt" in tu:
+            return self._fit_mt(tu["mt"])
+        m = [int(v) for v in (env or "1,2,2,3").split(",")]
         return self._fit_mt(m[0] if tot <= 32 else m[1] if tot <= 64 else m[2] if tot <= 128 else m[3])
 
     def _sm_nc(self, tot: int) -> int:
         # few tokens: a smaller persistent grid (measured faster: the HBM stays saturated
         # and the per-launch sync / all-gather counting has fewer participants); 0: all CUs
         # (debug: AITER_MEGAMOE_TP_SMNC "ctas<=8,ctas<=16,ctas<=32")
-        n = [int(v) for v in os.environ.get("AITER_MEGAMOE_TP_SMNC", SMNC).split(",")]
-        nc = n[0] if tot <= 8 else n[1] if tot <= 16 else n[2] if tot <= 32 else 0
+        env = os.environ.get("AITER_MEGAMOE_TP_SMNC")
+        tu = self._sm_tuned(tot)
+        if env is None and "nc" in tu:
+            nc = tu["nc"]
+        else:
+            n = [int(v) for v in (env or SMNC).split(",")]
+            nc = n[0] if tot <= 8 else n[1] if tot <= 16 else n[2] if tot <= 32 else 0
         return 0 if nc <= 0 or nc >= self.n_cta else nc
+
+    def _sm_ar2(self, tot: int) -> bool:
+        if not self.ar:
+            return False
+        env = os.environ.get("AITER_MEGAMOE_TP_AR2MIN")
+        tu = self._sm_tuned(tot)
+        if env is None and "ar2" in tu:
+            return bool(tu["ar2"])
+        return tot >= int(env or AR2_MIN)
 
     def _sm_fits(self, tot: int) -> bool:
         # small-M: every CTA's G1 blocks (rounds of n_cta over all row chunks' inter
@@ -643,8 +684,7 @@ class MegaMoeTPEngine:
                     sm=True,
                     # the one-shot all-reduce sends tp x the RS bytes: xGMI bound from
                     # AR2_MIN tokens on
-                    ar2=self.ar
-                    and tot >= int(os.environ.get("AITER_MEGAMOE_TP_AR2MIN", AR2_MIN)),
+                    ar2=self._sm_ar2(tot),
                     nc=self._sm_nc(tot),
                 )
             elif self._lb_ok(tot):

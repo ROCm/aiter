@@ -84,6 +84,8 @@ def build_gemm(kc: KernelCtx) -> dict:
     L_B1, L_B1S, L_CTL, L_DCH, L_INTER = kc.get("L_B1 L_B1S L_CTL L_DCH L_INTER")
     L_INTERS, L_RING, L_RIX, L_WT, MT = kc.get("L_INTERS L_RING L_RIX L_WT MT")
     MTSKIP, NA_L, NA_ROWOPS, NAB, NCG = kc.get("MTSKIP NA_L NA_ROWOPS NAB NCG")
+    # (small-M) a unit's MFMAs over its row tiles only up to 16 rows: 1 tile, else MT
+    SMSKIP = kc.SM and MT >= 2 and os.environ.get("AITER_MEGAMOE_TP_SMSKIP", "1") == "1"
     TRACE_ = kc.TRACE and not kc.TRACE_LIGHT
     ABS, ASS, HB = kc.get("ABS ASS HB")
     (TMAX_,) = kc.get("TMAX")
@@ -136,11 +138,21 @@ def build_gemm(kc: KernelCtx) -> dict:
         if const_expr(HB and half is not None):
             if half:
                 _gemm1h(L, tid, a, expert, i0, bnt=bnt)
+            elif const_expr(SMSKIP and rows is not None):
+                if uni(rows) <= i32(16):
+                    _gemm1_disp(L, tid, a, expert, i0, nnb, 1, bnt=bnt)
+                else:
+                    _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt)
             else:
                 _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt)
         elif const_expr(MTSKIP and rows is not None):
             if uni(rows) <= i32(3 * 16):
                 _gemm1_disp(L, tid, a, expert, i0, nnb, 3, bnt=bnt)
+            else:
+                _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt)
+        elif const_expr(SMSKIP and rows is not None and kr is None):
+            if uni(rows) <= i32(16):
+                _gemm1_disp(L, tid, a, expert, i0, nnb, 1, bnt=bnt)
             else:
                 _gemm1_disp(L, tid, a, expert, i0, nnb, bnt=bnt)
         else:
@@ -819,155 +831,166 @@ def build_gemm(kc: KernelCtx) -> dict:
             pre()
         if const_expr(rows is None):  # (the routes gathered in pre)
             rows = fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(TMAX_))
-        zero = fx.full(4, 0.0, fx.Float32)
+        def body(MTE):
+            zero = fx.full(4, 0.0, fx.Float32)
 
-        row_meta = []
-        for m in range_constexpr(MTE):
-            R = i32(m * 16) + lane % i32(16)
-            ok = R < rows
-            Rc = ok.select(R, i32(0))
-            row_meta.append(
-                (
-                    ok,
-                    fx.Float32(lds_ld(L, wt0 + (r0 + Rc) * i32(4), T.f32)),
-                    lds_ld_i32(L, rix0 + (r0 + Rc) * i32(4)),
+            row_meta = []
+            for m in range_constexpr(MTE):
+                R = i32(m * 16) + lane % i32(16)
+                ok = R < rows
+                Rc = ok.select(R, i32(0))
+                row_meta.append(
+                    (
+                        ok,
+                        fx.Float32(lds_ld(L, wt0 + (r0 + Rc) * i32(4), T.f32)),
+                        lds_ld_i32(L, rix0 + (r0 + Rc) * i32(4)),
+                    )
                 )
-            )
 
-        def groups(gi0, nj=GPI):
-            for j in range_constexpr(nj):
-                gi = gi0 + i32(j)
-                acc = [zero] * (4 * MTE)
-                s0 = s1 = None
-                for k in range_constexpr(NKS):
-                    sidx = (j * NKS + k) % NSK2
-                    if const_expr(k < NSK2 and NKS >= NSK2):
-                        if const_expr(j > 0):  # noqa: SIM114
-                            wait_vm(wait_b2(k) + 2 * MTE)
-                        elif gi > g_lo:
-                            wait_vm(wait_b2(k) + 2 * MTE)
+            def groups(gi0, nj=GPI):
+                for j in range_constexpr(nj):
+                    gi = gi0 + i32(j)
+                    acc = [zero] * (4 * MTE)
+                    s0 = s1 = None
+                    for k in range_constexpr(NKS):
+                        sidx = (j * NKS + k) % NSK2
+                        if const_expr(k < NSK2 and NKS >= NSK2):
+                            if const_expr(j > 0):  # noqa: SIM114
+                                wait_vm(wait_b2(k) + 2 * MTE)
+                            elif gi > g_lo:
+                                wait_vm(wait_b2(k) + 2 * MTE)
+                            else:
+                                wait_vm(wait_b2(k))
                         else:
                             wait_vm(wait_b2(k))
-                    else:
-                        wait_vm(wait_b2(k))
-                    slot = ring + i32(sidx * SLOT)
-                    b = [
-                        lds_ld(slot, i32(t * 1024) + lane * i32(16), V4I, 16)
-                        for t in range(4)
-                    ]
-                    if not (sdd and k % 2 == 1):
-                        s0 = lds_ld_i32(slot, i32(4096) + lane * i32(4))
-                        s1 = lds_ld_i32(slot, i32(4096 + 256) + lane * i32(4))
-                    sh0 = ((ks0 + i32(k)) & i32(1)) * i32(16)
-                    sb = [
-                        (s0 >> sh0) & i32(0xFF),
-                        (s0 >> (sh0 + i32(8))) & i32(0xFF),
-                        (s1 >> sh0) & i32(0xFF),
-                        (s1 >> (sh0 + i32(8))) & i32(0xFF),
-                    ]
-                    af_l, sa_l = [], []
-                    for m in range_constexpr(MTE):
-                        row = i32(m * 16) + lane % i32(16)
-                        ib = ib0 + row * i32(SI_STRIDE)
-                        if const_expr(a8):
-                            kb = ib + (ka + i32(k)) * i32(128) + q4 * i32(16)
-                            af_l.append(
-                                cat8(
-                                    lds_ld(L, kb, V4I, 16),
-                                    lds_ld(L, kb + i32(64), V4I, 16),
+                        slot = ring + i32(sidx * SLOT)
+                        b = [
+                            lds_ld(slot, i32(t * 1024) + lane * i32(16), V4I, 16)
+                            for t in range(4)
+                        ]
+                        if not (sdd and k % 2 == 1):
+                            s0 = lds_ld_i32(slot, i32(4096) + lane * i32(4))
+                            s1 = lds_ld_i32(slot, i32(4096 + 256) + lane * i32(4))
+                        sh0 = ((ks0 + i32(k)) & i32(1)) * i32(16)
+                        sb = [
+                            (s0 >> sh0) & i32(0xFF),
+                            (s0 >> (sh0 + i32(8))) & i32(0xFF),
+                            (s1 >> sh0) & i32(0xFF),
+                            (s1 >> (sh0 + i32(8))) & i32(0xFF),
+                        ]
+                        af_l, sa_l = [], []
+                        for m in range_constexpr(MTE):
+                            row = i32(m * 16) + lane % i32(16)
+                            ib = ib0 + row * i32(SI_STRIDE)
+                            if const_expr(a8):
+                                kb = ib + (ka + i32(k)) * i32(128) + q4 * i32(16)
+                                af_l.append(
+                                    cat8(
+                                        lds_ld(L, kb, V4I, 16),
+                                        lds_ld(L, kb + i32(64), V4I, 16),
+                                    )
                                 )
+                            else:
+                                af_l.append(
+                                    lds_ld(
+                                        L,
+                                        ib + (ka + i32(k)) * i32(64) + q4 * i32(16),
+                                        V4I,
+                                        16,
+                                    )
+                                )
+                            sa_l.append(
+                                fx.Int32(
+                                    lds_ld(
+                                        L,
+                                        is0
+                                        + row * i32(I // 32)
+                                        + (ka + i32(k)) * i32(4)
+                                        + q4,
+                                        T.i8,
+                                        1,
+                                    )
+                                )
+                                & i32(0xFF)
+                            )
+                        rocdl.sched_barrier(0)
+                        rocdl.s_setprio(1)
+                        for m in range_constexpr(MTE):
+                            for t in range_constexpr(4):
+                                acc[m * 4 + t] = mfma(
+                                    b[t], af_l[m], acc[m * 4 + t], sb[t], sa_l[m], a8
+                                )
+                        rocdl.s_setprio(0)
+                        wait_lgkm0()
+                        rocdl.sched_barrier(0)
+                        issue(gi * i32(NKS) + i32(k + NSK2), sidx, (k + NSK2) % 2 == 1)
+                        rocdl.sched_barrier(0)
+                    n0 = (w + i32(NW) * gi) * i32(64)
+                    ccol = (q4 & i32(1)) * i32(16) + (q4 >> i32(1)) * i32(8)
+                    for m in range_constexpr(MTE):
+                        ok, wt, rix = row_meta[m]
+                        if const_expr(route_fp8):
+                            store_route_fp8(
+                                r_routes,
+                                acc[m * 4 : m * 4 + 4],
+                                wt,
+                                rix,
+                                n0,
+                                q4,
+                                ok,
+                                oob,
+                                a,
                             )
                         else:
-                            af_l.append(
-                                lds_ld(
-                                    L,
-                                    ib + (ka + i32(k)) * i32(64) + q4 * i32(16),
-                                    V4I,
-                                    16,
+                            pk = []
+                            for t in range_constexpr(4):
+                                av = fx.Vector(acc[m * 4 + t])
+                                pk.append(
+                                    [
+                                        pack_bf16x2(
+                                            fx.Float32(av[2 * h]) * wt,
+                                            fx.Float32(av[2 * h + 1]) * wt,
+                                        )
+                                        for h in range(2)
+                                    ]
                                 )
-                            )
-                        sa_l.append(
-                            fx.Int32(
-                                lds_ld(
-                                    L,
-                                    is0
-                                    + row * i32(I // 32)
-                                    + (ka + i32(k)) * i32(4)
-                                    + q4,
-                                    T.i8,
-                                    1,
-                                )
-                            )
-                            & i32(0xFF)
-                        )
-                    rocdl.sched_barrier(0)
-                    rocdl.s_setprio(1)
-                    for m in range_constexpr(MTE):
-                        for t in range_constexpr(4):
-                            acc[m * 4 + t] = mfma(
-                                b[t], af_l[m], acc[m * 4 + t], sb[t], sa_l[m], a8
-                            )
-                    rocdl.s_setprio(0)
-                    wait_lgkm0()
-                    rocdl.sched_barrier(0)
-                    issue(gi * i32(NKS) + i32(k + NSK2), sidx, (k + NSK2) % 2 == 1)
-                    rocdl.sched_barrier(0)
-                n0 = (w + i32(NW) * gi) * i32(64)
-                ccol = (q4 & i32(1)) * i32(16) + (q4 >> i32(1)) * i32(8)
-                for m in range_constexpr(MTE):
-                    ok, wt, rix = row_meta[m]
-                    if const_expr(route_fp8):
-                        store_route_fp8(
-                            r_routes,
-                            acc[m * 4 : m * 4 + 4],
-                            wt,
-                            rix,
-                            n0,
-                            q4,
-                            ok,
-                            oob,
-                            a,
-                        )
-                    else:
-                        pk = []
-                        for t in range_constexpr(4):
-                            av = fx.Vector(acc[m * 4 + t])
-                            pk.append(
-                                [
-                                    pack_bf16x2(
-                                        fx.Float32(av[2 * h]) * wt,
-                                        fx.Float32(av[2 * h + 1]) * wt,
-                                    )
-                                    for h in range(2)
-                                ]
-                            )
-                        for half in range_constexpr(2):
-                            ta, tb = 2 * half, 2 * half + 1
-                            lo, hi = [], []
-                            for h in range_constexpr(2):
-                                x, y = swap16(pk[ta][h], pk[tb][h])
-                                lo.append(x)
-                                hi.append(y)
-                            ov = fx.Vector.from_elements(lo + hi, fx.Int32)
-                            col = n0 + i32(half * 32) + ccol
-                            voff = (rix * i32(H) + col) * i32(2)
-                            bst(ov, r_routes, ok.select(voff, oob), 0, AUX_RT)
-                if const_expr(not DLL):
-                    maybe_report(L, lane, w, gi, signal, LAG * RLAG, LAG)
+                            for half in range_constexpr(2):
+                                ta, tb = 2 * half, 2 * half + 1
+                                lo, hi = [], []
+                                for h in range_constexpr(2):
+                                    x, y = swap16(pk[ta][h], pk[tb][h])
+                                    lo.append(x)
+                                    hi.append(y)
+                                ov = fx.Vector.from_elements(lo + hi, fx.Int32)
+                                col = n0 + i32(half * 32) + ccol
+                                voff = (rix * i32(H) + col) * i32(2)
+                                bst(ov, r_routes, ok.select(voff, oob), 0, AUX_RT)
+                    if const_expr(not DLL):
+                        maybe_report(L, lane, w, gi, signal, LAG * RLAG, LAG)
 
-        for gi0_ in range(g_lo, g_hi, i32(GPI)):
-            if const_expr(progress is not None):  # noqa: SIM102
-                if i32(gi0_) + i32(GPI) >= g_hi:
-                    progress()
-            if const_expr(GPI > 1 and odd):
-                # (an odd group range: its last group alone, the ring prefetches past it
-                # clamped to its last k-step)
-                if i32(gi0_) + i32(1) < g_hi:
-                    groups(i32(gi0_))
+            for gi0_ in range(g_lo, g_hi, i32(GPI)):
+                if const_expr(progress is not None):  # noqa: SIM102
+                    if i32(gi0_) + i32(GPI) >= g_hi:
+                        progress()
+                if const_expr(GPI > 1 and odd):
+                    # (an odd group range: its last group alone, the ring prefetches past it
+                    # clamped to its last k-step)
+                    if i32(gi0_) + i32(1) < g_hi:
+                        groups(i32(gi0_))
+                    else:
+                        groups(i32(gi0_), 1)
                 else:
-                    groups(i32(gi0_), 1)
+                    groups(i32(gi0_))
+
+        if const_expr(SMSKIP and MTE > 1):
+            # (small-M: a unit of at most 16 rows (most experts) one row tile; the
+            # wide tile for the hot experts' few big chunks)
+            if uni(rows) <= i32(16):
+                body(1)
             else:
-                groups(i32(gi0_))
+                body(MTE)
+        else:
+            body(MTE)
         wait_vm(0)
         if const_expr(not DLL):  # noqa: SIM102
             if signal:
