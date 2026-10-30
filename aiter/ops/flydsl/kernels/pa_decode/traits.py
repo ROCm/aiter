@@ -128,6 +128,7 @@ class PaDecodeSchedule:
         max_context_length: int | None = None,
         sliding_window: int = 0,
         trans_k: bool = True,
+        mask_unowned_kv: bool = True,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
@@ -354,6 +355,7 @@ class PaDecodeSchedule:
             batch_first_plan_grid,
             sliding_window,
             kv_dtype,
+            bool(mask_unowned_kv),
             D256_PIPE,
             stage_pages,
             output_dtype,
@@ -384,6 +386,7 @@ class PaDecodeTraits:
     query_length: int
     trans_v: bool
     wide_kv_addressing: bool
+    mask_unowned_kv: bool
     query_splits: int
     sliding_window: int
     single_tile_plan: bool
@@ -494,6 +497,7 @@ class PaDecodeTraits:
             batch_first_plan_grid,
             sliding_window,
             kv_dtype,
+            mask_unowned_kv,
             D256_PIPE,
             stage_page_capacity,
             output_dtype,
@@ -697,6 +701,7 @@ class PaDecodeTraits:
             query_length=query_length,
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
+            mask_unowned_kv=mask_unowned_kv,
             query_splits=query_splits,
             sliding_window=sliding_window,
             single_tile_plan=single_tile_plan,

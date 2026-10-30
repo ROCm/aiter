@@ -251,12 +251,14 @@ class PaDecodePipeline:
             if const_expr(self.traits.MTP4_FUSED):
                 # Defer K until P packing releases saved score registers.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
-                self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1))
+                self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1), tt1)
             else:
                 k_next, phys_vec1 = self.kv.load_k(tt1)
                 self.kv.fetch_v_pages(tt1)
                 if const_expr(self.traits.per_token_kv):
-                    self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1))
+                    self.kv.stage_scales(
+                        phys_vec1, self.kv.scale_buffer_offset(tt1), tt1
+                    )
         next_state[self.traits.K_SLOT] = k_next
 
         gpu.barrier()
@@ -301,6 +303,7 @@ class PaDecodePipeline:
 
             gpu.barrier()
 
+            v_masks = self.kv.tail_masks(tile_valid)
             v_next_chunks = []
             for m in range_constexpr(self.traits.M_TILES):
                 p_base = self.traits.sP_off + m * MFMA_MNK * self.traits.SP_ROW_BYTES
@@ -338,6 +341,10 @@ class PaDecodePipeline:
                 )
                 corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                    if const_expr(m == 0):
+                        v_vh_shared[vh] = self.kv.mask_v_chunk(
+                            v_vh_shared[vh], v_masks, tile_valid
+                        )
                     v_vh = v_vh_shared[vh]
                     op = self.gemm.pv(v_vh, p_ops) * fx.full(
                         self.traits.OP_ELEMS, v_max_scaled, fx.Float32
@@ -438,7 +445,13 @@ class PaDecodePipeline:
                 )
 
                 corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
+                if const_expr(m == 0):
+                    v_masks = self.kv.tail_masks(tile_valid)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                    if const_expr(m == 0):
+                        v_vh_shared[vh] = self.kv.mask_v_chunk(
+                            v_vh_shared[vh], v_masks, tile_valid
+                        )
                     v_vh = v_vh_shared[vh]
                     op = self.gemm.pv(v_vh, p_ops)
                     if const_expr(self.traits.per_token_kv):
@@ -509,14 +522,18 @@ class PaDecodePipeline:
                 # page16 defers K until the P barrier.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
                 if const_expr(self.traits.per_token_kv):
-                    self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1))
+                    self.kv.stage_scales(
+                        phys_vec1, self.kv.scale_buffer_offset(tt1), tt1
+                    )
                 if const_expr(not self.traits.PAGE16_VPIPE):
                     k_next = self.kv.load_k_from_pages(phys_vec1)
             else:
                 k_next, phys_vec1 = self.kv.load_k(tt1)
                 self.kv.fetch_v_pages(tt1)
                 if const_expr(self.traits.per_token_kv):
-                    self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1))
+                    self.kv.stage_scales(
+                        phys_vec1, self.kv.scale_buffer_offset(tt1), tt1
+                    )
         if const_expr(self.traits.SCALES_BEFORE_CURRENT_V):
             # Issue V after scale staging so scale waits do not drain V.
             v_vh_shared = [
@@ -600,10 +617,11 @@ class PaDecodePipeline:
                 self.kv.load_v(v_page_cur, vh, tt1 - 1)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
+        v_masks = self.kv.tail_masks(tile_valid)
         # vh outer, m inner: each M-tile is a separate accumulator chain on the
         # same V operand.
         for vh in range_constexpr(self.traits.VHE_CHUNKS):
-            v_vh = v_vh_batch[vh]
+            v_vh = self.kv.mask_v_chunk(v_vh_batch[vh], v_masks, tile_valid)
             for m in range_constexpr(self.traits.M_TILES):
                 op = self.gemm.pv(v_vh, p_ops[m])
                 if const_expr(self.traits.per_token_kv):
