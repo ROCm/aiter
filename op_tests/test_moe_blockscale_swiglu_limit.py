@@ -281,7 +281,7 @@ def cohere_weights():
 @pytest.mark.parametrize("limit", [7.0, 5.0])
 @pytest.mark.parametrize("tokens", [1, 32])
 def test_cohere_shape_clamps(cohere_weights, tokens, limit):
-    model_dim, inter_dim, experts, topk = 2048, 768, 128, 8
+    model_dim, _inter_dim, experts, topk = 2048, 768, 128, 8
     torch.manual_seed(tokens)
     x = torch.randn(tokens, model_dim, device="cuda", dtype=dtypes.bf16)
     score = torch.randn(tokens, experts, device="cuda", dtype=dtypes.bf16)

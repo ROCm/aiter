@@ -4004,10 +4004,9 @@ def get_2stage_cfgs(
                 else ksplit
             )
         )
-        if q_type == QuantType.per_1x128 and not run_1stage:
-            if ksplit > 1:
-                # CK blockscale split-K at block_m 64 (pipeline V3) writes up as zeros.
-                block_m = min(block_m, 32)
+        if q_type == QuantType.per_1x128 and not run_1stage and ksplit > 1:
+            # CK blockscale split-K at block_m 64 (pipeline V3) writes up as zeros.
+            block_m = min(block_m, 32)
         use_non_temporal_load = use_nt(token, topk, expert)
         aiter.logger.info(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
