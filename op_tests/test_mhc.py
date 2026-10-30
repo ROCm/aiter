@@ -37,7 +37,6 @@ except ImportError:
 # Triton ``mhc_post_pre`` is only validated for M <= 4096 (hangs on larger M).
 TRITON_MHC_POST_PRE_MAX_M = 4096
 
-torch.set_default_device("cuda")
 # torch.set_printoptions(precision=3, linewidth=200, sci_mode=False)
 
 
@@ -1138,135 +1137,100 @@ def test_mhc_res_layout(m, hidden_size, hc_mult, dtype):
     }
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
-    nargs="*",
-    metavar="{fp16, bf16}",
-    default=[dtypes.bf16],
-    help="""Data type.
+if __name__ == "__main__":
+    torch.set_default_device("cuda")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
+        nargs="*",
+        metavar="{fp16, bf16}",
+        default=[dtypes.bf16],
+        help="""Data type.
     e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-m",
-    type=int,
-    nargs="*",
-    default=[1, 32, 64, 128, 256, 512, 1024, 2048, 8192, 65536],
-    help="""M.
+    )
+    parser.add_argument(
+        "-m",
+        type=int,
+        nargs="*",
+        default=[1, 32, 64, 128, 256, 512, 1024, 2048, 8192, 65536],
+        help="""M.
     e.g.: -m 32""",
-)
-parser.add_argument(
-    "-n",
-    "--hidden_size",
-    type=int,
-    nargs="*",
-    choices=[4096, 5120, 7168],
-    default=[4096, 5120, 7168],
-    help="""hidden_size.
+    )
+    parser.add_argument(
+        "-n",
+        "--hidden_size",
+        type=int,
+        nargs="*",
+        choices=[4096, 5120, 7168],
+        default=[4096, 5120, 7168],
+        help="""hidden_size.
     e.g.: -n 5120""",
-)
-_mode_group = parser.add_mutually_exclusive_group()
-_mode_group.add_argument(
-    "--hc_head",
-    action="store_true",
-    help="Test mhc_pre for hc_head only (mutually exclusive with --fuse_rmsnorm).",
-)
-_mode_group.add_argument(
-    "--fuse_rmsnorm",
-    action="store_true",
-    help="Fuse RMSNorm into mhc_pre / mhc_post_pre HIP paths (mutually exclusive with --hc_head).",
-)
-parser.add_argument(
-    "--largeM",
-    action="store_true",
-    help="In mhc_post_pre summary, add large_m_us / hip_large_m_err columns "
-    "(gfx950, M>1024, mhc_fused_post_pre_large_m).",
-)
-parser.add_argument(
-    "--w_preshuffle_bf16",
-    action=argparse.BooleanOptionalAction,
-    default=False,
-    help="Enable BF16 hi/lo GEMM with pre-packed weights, independently of residual layout.",
-)
-parser.add_argument(
-    "--res_shuffle",
-    "--res_preshuffle",
-    dest="res_preshuffle",
-    action=argparse.BooleanOptionalAction,
-    default=False,
-    help="Request shuffled residual input/output when the runtime policy uses "
-    "the fused path (gfx1250 only), independently of GEMM compute.",
-)
-add_data_init_args(parser, default_dist="norm")
+    )
+    _mode_group = parser.add_mutually_exclusive_group()
+    _mode_group.add_argument(
+        "--hc_head",
+        action="store_true",
+        help="Test mhc_pre for hc_head only (mutually exclusive with --fuse_rmsnorm).",
+    )
+    _mode_group.add_argument(
+        "--fuse_rmsnorm",
+        action="store_true",
+        help="Fuse RMSNorm into mhc_pre / mhc_post_pre HIP paths (mutually exclusive with --hc_head).",
+    )
+    parser.add_argument(
+        "--largeM",
+        action="store_true",
+        help="In mhc_post_pre summary, add large_m_us / hip_large_m_err columns "
+        "(gfx950, M>1024, mhc_fused_post_pre_large_m).",
+    )
+    parser.add_argument(
+        "--w_preshuffle_bf16",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable BF16 hi/lo GEMM with pre-packed weights, independently of residual layout.",
+    )
+    parser.add_argument(
+        "--res_shuffle",
+        "--res_preshuffle",
+        dest="res_preshuffle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Request shuffled residual input/output when the runtime policy uses "
+        "the fused path (gfx1250 only), independently of GEMM compute.",
+    )
+    add_data_init_args(parser, default_dist="norm")
 
-args = parser.parse_args()
-if args.res_preshuffle and get_gfx_runtime() != "gfx1250":
-    parser.error("residual shuffle is only supported on gfx1250; use --no-res_shuffle")
+    args = parser.parse_args()
+    if args.res_preshuffle and get_gfx_runtime() != "gfx1250":
+        parser.error(
+            "residual shuffle is only supported on gfx1250; use --no-res_shuffle"
+        )
 
-if args.res_preshuffle and not args.hc_head:
-    from aiter.ops.mhc import mhc_res_shuffle_enabled
+    if args.res_preshuffle and not args.hc_head:
+        from aiter.ops.mhc import mhc_res_shuffle_enabled
 
-    df = []
-    for dtype in args.dtype:
-        for hidden_size in args.hidden_size:
-            for m in args.m:
-                if not mhc_res_shuffle_enabled(m):
-                    continue
-                for hc_mult in [4]:
-                    df.append(
-                        test_mhc_res_layout(
-                            m=m,
-                            hidden_size=hidden_size,
-                            hc_mult=hc_mult,
-                            dtype=dtype,
-                        )
-                    )
-    print_json_table("mhc_res_layout summary", df)
-
-
-df = []
-for dtype in args.dtype:
-    for data_init in args.data_init:
-        for hidden_size in args.hidden_size:
-            for m in args.m:
-                for hc_mult in [4]:
-                    ret = test_mhc_pre(
-                        m=m,
-                        hidden_size=hidden_size,
-                        hc_mult=hc_mult,
-                        test_hc_head=args.hc_head,
-                        fuse_rmsnorm=args.fuse_rmsnorm,
-                        w_preshuffle_bf16=args.w_preshuffle_bf16,
-                        dtype=dtype,
-                        data_init=data_init,
-                        seed=args.seed,
-                    )
-                    df.append(ret)
-print_json_table("mhc_pre summary", df)
-
-if not args.hc_head:
-    df = []
-    for dtype in args.dtype:
-        for data_init in args.data_init:
+        df = []
+        for dtype in args.dtype:
             for hidden_size in args.hidden_size:
                 for m in args.m:
+                    if not mhc_res_shuffle_enabled(m):
+                        continue
                     for hc_mult in [4]:
-                        ret = test_mhc_post(
-                            m=m,
-                            hidden_size=hidden_size,
-                            hc_mult=hc_mult,
-                            dtype=dtype,
-                            data_init=data_init,
-                            seed=args.seed,
+                        df.append(
+                            test_mhc_res_layout(
+                                m=m,
+                                hidden_size=hidden_size,
+                                hc_mult=hc_mult,
+                                dtype=dtype,
+                            )
                         )
-                        df.append(ret)
-    print_json_table("mhc_post summary", df)
+        print_json_table("mhc_res_layout summary", df)
 
     df = []
     for dtype in args.dtype:
@@ -1274,22 +1238,60 @@ if not args.hc_head:
             for hidden_size in args.hidden_size:
                 for m in args.m:
                     for hc_mult in [4]:
-                        ret = test_mhc_post_pre(
+                        ret = test_mhc_pre(
                             m=m,
                             hidden_size=hidden_size,
                             hc_mult=hc_mult,
+                            test_hc_head=args.hc_head,
                             fuse_rmsnorm=args.fuse_rmsnorm,
-                            large_m=args.largeM,
                             w_preshuffle_bf16=args.w_preshuffle_bf16,
-                            res_preshuffle=args.res_preshuffle,
                             dtype=dtype,
                             data_init=data_init,
                             seed=args.seed,
                         )
-                        if ret.get("skipped"):
-                            continue
                         df.append(ret)
-    if df:
-        print_json_table("mhc_post_pre summary", df)
-    else:
-        aiter.logger.info("mhc_post_pre: all cases skipped")
+    print_json_table("mhc_pre summary", df)
+
+    if not args.hc_head:
+        df = []
+        for dtype in args.dtype:
+            for data_init in args.data_init:
+                for hidden_size in args.hidden_size:
+                    for m in args.m:
+                        for hc_mult in [4]:
+                            ret = test_mhc_post(
+                                m=m,
+                                hidden_size=hidden_size,
+                                hc_mult=hc_mult,
+                                dtype=dtype,
+                                data_init=data_init,
+                                seed=args.seed,
+                            )
+                            df.append(ret)
+        print_json_table("mhc_post summary", df)
+
+        df = []
+        for dtype in args.dtype:
+            for data_init in args.data_init:
+                for hidden_size in args.hidden_size:
+                    for m in args.m:
+                        for hc_mult in [4]:
+                            ret = test_mhc_post_pre(
+                                m=m,
+                                hidden_size=hidden_size,
+                                hc_mult=hc_mult,
+                                fuse_rmsnorm=args.fuse_rmsnorm,
+                                large_m=args.largeM,
+                                w_preshuffle_bf16=args.w_preshuffle_bf16,
+                                res_preshuffle=args.res_preshuffle,
+                                dtype=dtype,
+                                data_init=data_init,
+                                seed=args.seed,
+                            )
+                            if ret.get("skipped"):
+                                continue
+                            df.append(ret)
+        if df:
+            print_json_table("mhc_post_pre summary", df)
+        else:
+            aiter.logger.info("mhc_post_pre: all cases skipped")

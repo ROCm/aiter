@@ -1139,6 +1139,107 @@ def _mhc_post_pre_gfx950(
     return post, comb, out, next_residual
 
 
+@compile_ops("module_mhc", develop=True)
+def mhc_post_pre_gram_gfx950(
+    post: Tensor,
+    comb: Tensor,
+    out: Tensor,
+    next_residual: Tensor,
+    partials: Tensor,
+    layer_input: Tensor,
+    residual_in: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    weight: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    norm_eps: float,
+    post_mult: float,
+) -> None: ...
+
+
+def _mhc_gram_gfx950_supported(
+    layer_input, residual, post_mix, comb_mix, fn, scale, base, norm_weight
+) -> bool:
+    if (
+        norm_weight is None
+        or get_cu_num() != 256
+        or any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    ):
+        return False
+    expected = (
+        (layer_input, (64, 7168), torch.bfloat16),
+        (residual, (64, 4, 7168), torch.bfloat16),
+        (post_mix, (64, 4, 1) if post_mix.ndim == 3 else (64, 4), torch.float32),
+        (comb_mix, (64, 4, 4), torch.float32),
+        (fn, (24, 28672), torch.float32),
+        (scale, (3,), torch.float32),
+        (base, (24,), torch.float32),
+        (norm_weight, (7168,), torch.bfloat16),
+    )
+    return all(
+        tensor.is_cuda
+        and tensor.device == layer_input.device
+        and tuple(tensor.shape) == shape
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tensor.data_ptr() % 16 == 0
+        for tensor, shape, dtype in expected
+    )
+
+
+def _mhc_gram_gfx950(
+    layer_input,
+    residual,
+    post_mix,
+    comb_mix,
+    fn,
+    scale,
+    base,
+    norm_weight,
+    rms_eps,
+    pre_eps,
+    sink_eps,
+    norm_eps,
+    post_mult,
+):
+    device = layer_input.device
+    partials = torch.empty((56, 64, 48), dtype=torch.float32, device=device)
+    next_residual = torch.empty_like(residual)
+    post = torch.empty((64, 4, 1), dtype=torch.float32, device=device)
+    comb = torch.empty((64, 4, 4), dtype=torch.float32, device=device)
+    out = torch.empty_like(layer_input)
+    with torch.cuda.device(device):
+        mhc_post_pre_gram_gfx950(
+            post,
+            comb,
+            out,
+            next_residual,
+            partials,
+            layer_input,
+            residual,
+            post_mix.reshape(64, 4),
+            comb_mix,
+            fn,
+            scale,
+            base,
+            norm_weight,
+            rms_eps,
+            pre_eps,
+            sink_eps,
+            norm_eps,
+            post_mult,
+        )
+    return post, comb, out, next_residual
+
+
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_fake)
 def mhc_fused_post_pre(
     layer_input: torch.Tensor,
@@ -1204,6 +1305,22 @@ def mhc_fused_post_pre(
     implementation of the fused path (tests, benchmarks). A shuffled residual must
     then be in that backend's blocks (``mhc_res_ks(..., backend=backend)``).
     ``"gluon"`` needs gfx1250 and inputs the Gluon kernels take, or raises.
+
+    On an unmasked 256-CU gfx950, M=64, hidden=7168, four BF16 residual
+    streams and FP32 ``fn`` can use the Gram-statistics decode route. It requires
+    contiguous aligned inputs, ``norm_weight``, 20 Sinkhorn iterations and all
+    three layout/force flags False. Other inputs keep the existing paths.
+    The projection uses BF16 hi/lo conversion of FP32 weights; Gram statistics
+    use the BF16-rounded next residual. On the Gram fast path, the fold remains
+    FP32 until its final BF16 output, and RMS normalization uses the FP32
+    quadratic ``p.T @ G @ p``.
+    This changes reduction and rounding boundaries. If the quadratic is at most
+    1e-3 times its diagonal contribution, or it/the normalization argument is
+    invalid, each finalizer CTA recomputes the full norm directly. That path
+    follows the upstream four-head fold/reduction, BF16 fold rounding and
+    weight-before-normalization order, given this route's residual and gates.
+    Its projection/gates still differ from upstream. The 1e-3 detector is an
+    empirical policy, not an error bound; the Gram quadratic is never clamped.
     """
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
@@ -1213,6 +1330,42 @@ def mhc_fused_post_pre(
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     res_preshuffle = res_preshuffle and mhc_res_shuffle_enabled(m, arch)
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
+
+    # Prefer Gram in its supported decode regime. Other calls continue through
+    # the existing row-finalization and fallback paths below.
+    if (
+        arch == "gfx950"
+        and backend in (None, "hip")
+        and not force_fused
+        and not res_preshuffle
+        and not w_preshuffle_bf16
+        and sinkhorn_repeat == 20
+        and _mhc_gram_gfx950_supported(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+        )
+    ):
+        return _mhc_gram_gfx950(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            norm_eps,
+            hc_post_mult_value,
+        )
 
     if (
         arch == "gfx950"

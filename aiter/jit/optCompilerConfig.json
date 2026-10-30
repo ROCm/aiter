@@ -2076,7 +2076,8 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mhc_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gfx950.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gfx950.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mhc_post_pre_gram.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

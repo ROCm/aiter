@@ -8,11 +8,12 @@ import hashlib
 import json
 import os
 import statistics
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from test_mhc import mhc_post_pre_ref
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops import mhc as mhc_api
@@ -40,30 +41,23 @@ def reference(
     sinkhorn_repeat=20,
     norm_eps=1e-6,
 ):
-    """Unfused PyTorch post -> projection -> mixes -> fold -> RMSNorm."""
-    next_residual = (
-        x.float().unsqueeze(1) * post.reshape(-1, 4, 1)
-        + torch.bmm(comb.mT, residual.float())
-    ).to(x.dtype)
-    flat = next_residual.flatten(1).float()
-    mix = (flat @ fn.T) * (flat.square().mean(-1, keepdim=True) + rms_eps).rsqrt()
-    mix = (
-        mix * torch.cat((scale[0].expand(4), scale[1].expand(4), scale[2].expand(16)))
-        + base
+    """Forward test defaults to the unchanged public mHC oracle."""
+    return mhc_post_pre_ref(
+        x,
+        residual,
+        post.reshape(-1, 4, 1),
+        comb,
+        fn,
+        scale,
+        base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
-    pre = (mix[:, :4].sigmoid() + hc_pre_eps).unsqueeze(-1)
-    out_post = (mix[:, 4:8].sigmoid() * hc_post_mult_value).unsqueeze(-1)
-    out_comb = mix[:, 8:].reshape(-1, 4, 4).softmax(-1) + hc_sinkhorn_eps
-    out_comb = out_comb / (out_comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
-    for _ in range(sinkhorn_repeat - 1):
-        out_comb = out_comb / (out_comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
-        out_comb = out_comb / (out_comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
-    out = (next_residual * pre).sum(1)
-    if norm_weight is not None:
-        out = out * (out.square().mean(-1, keepdim=True) + norm_eps).rsqrt()
-        out = out * norm_weight.float()
-    # The public HIP API returns BF16 layer output even for FP16 residual input.
-    return out_post, out_comb, out.bfloat16(), next_residual
 
 
 def inputs(m, hidden=7168, dtype=torch.bfloat16, seed=0):
@@ -91,8 +85,7 @@ def check(actual, expected):
         assert torch.isfinite(got).all(), f"non-finite output {i}"
         assert torch.isfinite(want).all(), f"non-finite reference output {i}"
         assert got.shape == want.shape and got.dtype == want.dtype
-        # Explicitly adopt this revision's native mHC helper defaults. This is
-        # a prospective change from test08's zero-outlier reference gate.
+        # Use the native mHC tolerance, including its 5% outlier allowance.
         assertAllclose(
             want, got, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg=f"output {i}"
         )
@@ -113,8 +106,33 @@ def check_with_upstream(actual, expected, args, kwargs):
     with upstream_dispatch():
         upstream = mhc_fused_post_pre(*args, **kwargs)
     check(actual, expected)
-    check(upstream, expected)
-    check_pair(actual, upstream)
+    if gram_selected(args, kwargs):
+        # Gram changes reduction and rounding. Its oracle gate is mandatory;
+        # the old route and strict pair are diagnostics, not numerical oracles.
+        print(
+            "mhc_comparator_diagnostic="
+            + json.dumps(
+                {
+                    "upstream_vs_reference": error_metrics(upstream, expected),
+                    "candidate_vs_upstream": error_metrics(actual, upstream),
+                }
+            )
+        )
+    else:
+        check(upstream, expected)
+        check_pair(actual, upstream)
+
+
+def gram_selected(args, kwargs):
+    return (
+        get_gfx_runtime() == "gfx950"
+        and kwargs.get("backend") in (None, "hip")
+        and not kwargs.get("force_fused", False)
+        and not kwargs.get("res_preshuffle", False)
+        and not kwargs.get("w_preshuffle_bf16", False)
+        and kwargs.get("sinkhorn_repeat", 20) == 20
+        and mhc_api._mhc_gram_gfx950_supported(*args, kwargs.get("norm_weight"))
+    )
 
 
 def call_inputs(args, kwargs, packed):
@@ -122,11 +140,14 @@ def call_inputs(args, kwargs, packed):
     return call_args, dict(kwargs, w_preshuffle_bf16=packed)
 
 
+@contextmanager
 def upstream_dispatch():
-    return patch(
+    # Disable both added routes to retain this test's original comparator.
+    with patch(
         "aiter.ops.mhc._mhc_post_pre_gfx950_supported",
-        new=lambda *args, **kwargs: False,
-    )
+        return_value=False,
+    ), patch("aiter.ops.mhc._mhc_gram_gfx950_supported", return_value=False):
+        yield
 
 
 def test_case(m, seed, packed, normalized=False):
@@ -139,12 +160,16 @@ def test_case(m, seed, packed, normalized=False):
     assert _mhc_post_pre_gfx950_supported(*call_args, kwargs["norm_weight"], packed)
     saved_inputs = tuple(t.clone() for t in call_args)
     saved_norm = kwargs["norm_weight"].clone()
+    selected_gram = gram_selected(call_args, options)
     with patch(
         "aiter.ops.mhc._mhc_post_pre_gfx950",
         wraps=mhc_api._mhc_post_pre_gfx950,
-    ) as implementation:
+    ) as implementation, patch(
+        "aiter.ops.mhc._mhc_gram_gfx950", wraps=mhc_api._mhc_gram_gfx950
+    ) as gram:
         out = mhc_fused_post_pre(*call_args, **options)
-        assert implementation.call_count == 1
+        assert implementation.call_count == int(not selected_gram)
+        assert gram.call_count == int(selected_gram)
     check_with_upstream(out, reference(*args, **kwargs), call_args, options)
     saved_out = tuple(t.clone() for t in out)
     for got, want in zip(call_args, saved_inputs):
@@ -274,10 +299,13 @@ def test_routing(m, seed):
                 selected = (
                     not force_fused and backend != "gluon" and (m == 64 or packed)
                 )
+                selected_gram = gram_selected(call_args, config)
                 with patch(
                     "aiter.ops.mhc._mhc_post_pre_gfx950",
                     wraps=mhc_api._mhc_post_pre_gfx950,
-                ) as implementation:
+                ) as implementation, patch(
+                    "aiter.ops.mhc._mhc_gram_gfx950", wraps=mhc_api._mhc_gram_gfx950
+                ) as gram:
                     if selected:
                         check_with_upstream(
                             mhc_fused_post_pre(*call_args, **config),
@@ -287,7 +315,10 @@ def test_routing(m, seed):
                         )
                     else:
                         check_fallback(call_args, config)
-                    assert implementation.call_count == int(selected), config
+                    assert implementation.call_count == int(
+                        selected and not selected_gram
+                    ), config
+                    assert gram.call_count == int(selected_gram), config
     print(f"m={m}: precision/force_fused/backend routing PASS")
 
 
@@ -588,4 +619,7 @@ if __name__ == "__main__":
             test_routing(m, args.seed[0])
         test_small_values(args.seed[0])
         if args.benchmark_json:
-            benchmark_cases(args.m, args.seed[0], args.benchmark_json)
+            # Keep this benchmark specific to the row-finalizer change. Gram
+            # has its own same-stack benchmark in test_mhc_post_pre_gram.py.
+            with patch("aiter.ops.mhc._mhc_gram_gfx950_supported", return_value=False):
+                benchmark_cases(args.m, args.seed[0], args.benchmark_json)
