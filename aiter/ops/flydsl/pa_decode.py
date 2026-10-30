@@ -196,6 +196,7 @@ def pa_decode(
     sliding_window: int = 0,
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
+    mask_unowned_kv: bool = True,
 ) -> None:
     """Decode FP8 or BF16 K/V using planned context partitions.
 
@@ -257,6 +258,13 @@ def pa_decode(
     graph replay: every context length that will run must be at most
     ``max_context_length``. A smaller value still covers the real context:
     page ids outside the staged window are read from the block table.
+
+    ``mask_unowned_kv`` (default True) zeroes, on gfx942/gfx950, V bytes and
+    K/V scales of tokens at or past each sequence's context length before PV,
+    so pinned block-0 pages and the unwritten tail of the last page may hold
+    any bytes, including NaN. False skips that masking (slightly faster on
+    tiny boundary-tile-only calls); the caller must then keep those bytes and
+    scales finite. gfx1250 ignores it and always requires finite bytes.
 
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
@@ -655,6 +663,7 @@ def pa_decode(
             direct_output=direct_output,
             context_partition_size=context_partition_size,
             trans_k=trans_k,
+            mask_unowned_kv=mask_unowned_kv,
         )
 
     total_rows = query_length * query_group_size
