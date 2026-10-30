@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -50,6 +51,29 @@ inline SelectedImage select_image(const std::string& root,
     const auto directory = combined ? base / (a0 ? arch + "-a0" : arch) : base;
     return {(directory / (symbol + ".co")).lexically_normal().string(),
             asic_revision, a0 ? 0xebu : 0x49u};
+}
+
+// Regular gfx1250 image used only when the A0 strict image cannot be loaded by
+// the installed HIP runtime (HIP < 7.16.26385). It is never selected when the
+// strict image is loadable. Returns nullopt when no regular image exists.
+inline std::optional<SelectedImage> select_regular_fallback(const std::string& root,
+                                                            const std::string& arch,
+                                                            const std::string& symbol) {
+    if(arch != "gfx1250")
+        return std::nullopt;
+    const std::filesystem::path base(absolute_co_root(root));
+    std::vector<std::filesystem::path> candidates;
+    // Combined root: <root>/gfx1250/<symbol>.co
+    candidates.push_back(base / arch / (symbol + ".co"));
+    // Direct A0 leaf: <root>/../gfx1250/<symbol>.co
+    if(base.filename() == arch + "-a0" && base.has_parent_path())
+        candidates.push_back(base.parent_path() / arch / (symbol + ".co"));
+    for(const auto& candidate : candidates) {
+        std::error_code error;
+        if(std::filesystem::is_regular_file(candidate, error) && !error)
+            return SelectedImage{candidate.lexically_normal().string(), 1, 0x49u};
+    }
+    return std::nullopt;
 }
 
 inline std::string co_cache_key(int device, const SelectedImage& image) {
