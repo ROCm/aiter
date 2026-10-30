@@ -7,17 +7,19 @@ import sys
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
 
-# base_gfx_arch: the single source of truth for gfx1250-strict -> gfx1250 kernel
-# family folding (see aiter/jit/utils/build_targets.py). Imported as a top-level
-# module -- build_targets.py has no torch/aiter deps -- so these standalone Opus
-# build scripts do not trigger aiter/__init__ (which loads native .so).
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "..", "aiter", "jit", "utils"
-    ),
-)
-from build_targets import base_gfx_arch
+
+def base_gfx_arch(gfx: str) -> str:
+    """Kernel-family base arch for ``gfx`` (gfx1250-strict -> gfx1250; identity otherwise).
+
+    A local copy of ``aiter.jit.utils.build_targets.base_gfx_arch``: these Opus
+    codegen scripts run standalone from a staging tree (e.g. ``aiter_meta/``)
+    where the aiter package is not importable, so the helper is duplicated here.
+    Keep the two in sync. Used only to select shared gfx1250 kernel definitions;
+    build targets, caches, and prebuilt ``.co`` paths stay keyed by the exact
+    target.
+    """
+    return "gfx1250" if gfx == "gfx1250-strict" else gfx
+
 
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
