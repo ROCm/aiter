@@ -13,7 +13,9 @@ cached token inside that row's causal bound. It takes:
 - ``weights``: ``[B * next_n, H]`` float32 head weights.
 - ``out_logits``: ``[B * next_n, >= max_model_len]`` float32, written in place.
   Columns outside a row's causal bound are left as they are.
-- ``context_lens``: ``[B]`` contiguous int32 sequence lengths on the GPU.
+- ``context_lens``: contiguous int32 on the GPU, either ``[B]`` (the length of
+  each sequence) or ``(B, next_n)`` (the table vLLM builds with MTP; both
+  kernels read its last column).
 - ``kv_indices``: ``[B, max_blocks]`` int32 block table.
 - ``max_model_len``: logical row width.
 
@@ -27,10 +29,13 @@ plus any ``model_configs/*paged_mqa_logits_tuned*.csv``). Tune new shapes with
 
 Rows are keyed on ``(gfx, cu_num, batch_size, next_n, heads, head_dim,
 kv_block_size, preshuffle)``: everything a decode CUDA graph fixes at capture.
-Rows also record the context lengths they were tuned over in ``context_len``,
-but dispatch does not key on it: the lengths live in a GPU tensor, and reading
-them on the host would sync and break graph capture. A
-batch size with no row uses the row of the largest tuned batch size below it;
+
+Context length is deliberately not a dispatch key. The lengths live
+in a GPU tensor, so reading them on the host would sync and break graph capture.
+The ``context_len`` column only records which lengths a row was tuned over
+(provenance): one config per shape is picked by the geomean over them.
+
+A batch size with no row uses the row of the largest tuned batch size below it;
 a shape with no row at all uses Gluon with ``ChunkK=256, WavePerEU=2``. A
 FlyDSL row the kernel cannot run uses that row's Gluon knobs, and those
 defaults when the row stored zeros.
@@ -87,6 +92,9 @@ def _load_tuned_table() -> dict[tuple, dict]:
                 backend = (row.get("backend") or "").strip()
                 if backend not in BACKENDS:
                     continue
+                # Not keyed on context_len (see module docstring). That column is
+                # free-text provenance such as "8192;60000" and is never parsed
+                # here; only the tuner reads it, as the lengths to time.
                 key = (
                     row["gfx"].strip(),
                     int(row["cu_num"]),
@@ -272,7 +280,7 @@ def paged_mqa_logits(
         weights: ``[B * next_n, H]`` float32 head weights.
         out_logits: ``[B * next_n, >= max_model_len]`` float32 output. Only
             columns inside each row's causal bound are written.
-        context_lens: ``[B]`` contiguous int32 sequence lengths.
+        context_lens: contiguous int32, ``[B]`` or ``(B, next_n)``.
         kv_indices: ``[B, max_blocks]`` int32 block table.
         max_model_len: Logical row width.
 
