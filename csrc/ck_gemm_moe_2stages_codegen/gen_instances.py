@@ -1099,7 +1099,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu", "swiglu", "gelutanh"],
+        choices=["silu", "gelu", "swiglu", "gelutanh", "relu2"],
         help="select activation",
     )
 
