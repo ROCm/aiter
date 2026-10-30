@@ -557,6 +557,14 @@ namespace py = pybind11;
           py::arg("open_fp8_quant"),                                                 \
           py::arg("reg_inp_ptr"),                                                    \
           py::arg("reg_inp_bytes"));                                                 \
+    m.def("all_reduce_residual",                                                     \
+          &aiter::all_reduce_residual,                                               \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("out"),                                                            \
+          py::arg("residual"),                                                       \
+          py::arg("reg_inp_ptr"),                                                    \
+          py::arg("reg_inp_bytes"));                                                 \
     m.def("reduce_scatter",                                                          \
           &aiter::reduce_scatter,                                                    \
           py::arg("_fa"),                                                            \
@@ -602,7 +610,9 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                        \
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
-          py::arg("gemma_norm") = false);                                            \
+          py::arg("gemma_norm")    = false,                                          \
+          py::arg("num_norm_rows") = static_cast<int64_t>(-1),                       \
+          py::arg("skip_residual") = false);                                         \
     m.def("fused_allreduce_rmsnorm_pad",                                             \
           &aiter::fused_allreduce_rmsnorm_pad,                                       \
           py::arg("_fa"),                                                            \
@@ -2859,7 +2869,8 @@ namespace py = pybind11;
           py::arg("D_HIDDEN"),                \
           py::arg("D_INTER"),                 \
           py::arg("MB"),                      \
-          py::arg("prologue"));               \
+          py::arg("prologue"),                \
+          py::arg("num_local_tokens") = std::nullopt); \
     m.def("mxfp4_moe_quant",                  \
           &mxfp4_moe_quant_kernel,            \
           py::arg("a_input"),                 \

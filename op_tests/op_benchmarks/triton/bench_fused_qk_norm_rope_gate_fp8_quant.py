@@ -11,7 +11,7 @@ Usage:
         -M 128,1024,4096,8192 --metric time
 """
 
-import argparse
+import functools
 
 import torch
 import triton
@@ -21,8 +21,15 @@ from aiter.ops.triton.rope.fused_qk_norm_rope_gate_fp8_quant import (
     MAX_SEQUENCES,
     fused_qk_norm_rope_gate_fp8_quant,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import override_parser_action
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
 )
 
@@ -48,10 +55,12 @@ def balanced_cu_seqlens(total_tokens, requested_sequences, device):
     return cu_seqlens
 
 
-def benchmark_fused_qkv(tokens, metric, args, **_):
+def _generate_inputs(
+    tokens, num_query_heads, num_kv_heads, head_dim, rotary_dim, num_sequences
+):
     device = torch.device("cuda")
-    q_width = args.num_query_heads * args.head_dim
-    kv_width = args.num_kv_heads * args.head_dim
+    q_width = num_query_heads * head_dim
+    kv_width = num_kv_heads * head_dim
     q_gate = torch.randn(
         tokens,
         2 * q_width,
@@ -60,17 +69,20 @@ def benchmark_fused_qkv(tokens, metric, args, **_):
     )
     key = torch.randn(tokens, kv_width, dtype=torch.bfloat16, device=device)
     value = torch.randn_like(key)
-    query_norm_weight = torch.randn(args.head_dim, dtype=torch.bfloat16, device=device)
+    query_norm_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
     key_norm_weight = torch.randn_like(query_norm_weight)
     positions = torch.arange(tokens, dtype=torch.int64, device=device)
     cos_sin_cache = torch.randn(
         tokens,
-        args.rotary_dim,
+        rotary_dim,
         dtype=torch.bfloat16,
         device=device,
     )
-    cu_seqlens = balanced_cu_seqlens(tokens, args.num_sequences, device)
+    cu_seqlens = balanced_cu_seqlens(tokens, num_sequences, device)
 
+    # Allocate this pool entry's own output buffers up front (one setup call,
+    # not timed) so the timed call below can write into them in place, exactly
+    # mirroring the graph-captured vLLM integration.
     output = fused_qk_norm_rope_gate_fp8_quant(
         q_gate,
         key,
@@ -81,14 +93,91 @@ def benchmark_fused_qkv(tokens, metric, args, **_):
         positions,
         cu_seqlens,
         num_actual_tokens=tokens,
-        num_query_heads=args.num_query_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        rotary_dim=args.rotary_dim,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
     )
     torch.cuda.synchronize()
 
-    def run():
+    return (
+        q_gate,
+        key,
+        value,
+        query_norm_weight,
+        key_norm_weight,
+        positions,
+        cos_sin_cache,
+        cu_seqlens,
+        output.query,
+        output.key,
+        output.gate,
+        output.query_fp8,
+        output.key_fp8,
+        output.value_fp8,
+        output.query_descale,
+        output.key_descale,
+        output.value_descale,
+    )
+
+
+def benchmark_fused_qkv(tokens, metric, args, **_):
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    _p_gen = functools.partial(
+        _generate_inputs,
+        tokens,
+        args.num_query_heads,
+        args.num_kv_heads,
+        args.head_dim,
+        args.rotary_dim,
+        args.num_sequences,
+    )
+    _out_val_keys = [
+        "q_gate",
+        "key",
+        "value",
+        "query_norm_weight",
+        "key_norm_weight",
+        "positions",
+        "cos_sin_cache",
+        "cu_seqlens",
+        "query_out",
+        "key_out",
+        "gate_out",
+        "query_fp8_out",
+        "key_fp8_out",
+        "value_fp8_out",
+        "query_descale_out",
+        "key_descale_out",
+        "value_descale_out",
+    ]
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+    )
+
+    # Shapes/dtypes are identical across the pool, so any entry works for sizing.
+    sample = rot_bufs[0]
+
+    def _run(
+        q_gate,
+        key,
+        value,
+        query_norm_weight,
+        key_norm_weight,
+        positions,
+        cos_sin_cache,
+        cu_seqlens,
+        query_out,
+        key_out,
+        gate_out,
+        query_fp8_out,
+        key_fp8_out,
+        value_fp8_out,
+        query_descale_out,
+        key_descale_out,
+        value_descale_out,
+    ):
         fused_qk_norm_rope_gate_fp8_quant(
             q_gate,
             key,
@@ -103,31 +192,39 @@ def benchmark_fused_qkv(tokens, metric, args, **_):
             num_kv_heads=args.num_kv_heads,
             head_dim=args.head_dim,
             rotary_dim=args.rotary_dim,
-            query_out=output.query,
-            key_out=output.key,
-            gate_out=output.gate,
-            query_fp8_out=output.query_fp8,
-            key_fp8_out=output.key_fp8,
-            value_fp8_out=output.value_fp8,
-            query_descale_out=output.query_descale,
-            key_descale_out=output.key_descale,
-            value_descale_out=output.value_descale,
+            query_out=query_out,
+            key_out=key_out,
+            gate_out=gate_out,
+            query_fp8_out=query_fp8_out,
+            key_fp8_out=key_fp8_out,
+            value_fp8_out=value_fp8_out,
+            query_descale_out=query_descale_out,
+            key_descale_out=key_descale_out,
+            value_descale_out=value_descale_out,
         )
 
-    time_ms = triton.testing.do_bench(run, warmup=25, rep=100)
+    time_ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
     if metric == "time":
         return time_ms
     if metric == "bandwidth":
         tensors = (
-            q_gate,
-            key,
-            value,
-            query_norm_weight,
-            key_norm_weight,
-            cos_sin_cache,
-            positions,
-            cu_seqlens,
-            *output,
+            sample["q_gate"],
+            sample["key"],
+            sample["value"],
+            sample["query_norm_weight"],
+            sample["key_norm_weight"],
+            sample["cos_sin_cache"],
+            sample["positions"],
+            sample["cu_seqlens"],
+            sample["query_out"],
+            sample["key_out"],
+            sample["gate_out"],
+            sample["query_fp8_out"],
+            sample["key_fp8_out"],
+            sample["value_fp8_out"],
+            sample["query_descale_out"],
+            sample["key_descale_out"],
+            sample["value_descale_out"],
         )
         total_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
         return total_bytes / time_ms * 1.0e-6
@@ -157,10 +254,7 @@ def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="fused_qk_norm_rope_gate_fp8_quant")
     parser.add_argument(
         "-M",
         type=parse_int_or_list,
