@@ -49,7 +49,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import triton
 import triton.language as tl
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter import dtypes
@@ -98,6 +98,7 @@ DATA_BYTES = HEAD_DIM // 2
 SCALE_BYTES = HEAD_DIM // GROUP
 DATA_UNITS = DATA_BYTES // ACCESS_BYTES  # 16 B accesses per token row
 assert KSTEPS * LANE_K == GROUP
+UNIT_SCALE = 0x7F7F7F7F  # e8m0 0x7F = 2^0, in all four scale bytes
 # K tiles kept in flight per wave (the fp8 scorer uses 3 at 2 KiB a tile; an
 # MXFP4 tile is half the bytes). Swept 2/3/4/6/8: 6 is 15-35% faster than 3 where
 # batch*context is small and within 2% of the best once it is not.
@@ -806,8 +807,8 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                 data, scale_word = raws[0]
                 # A = K as fp4 (4 dwords; the other 4 are unused by cbsz=4), scaled
                 # by this lane group's e8m0 byte (scaleA, byte 0 of the shifted
-                # word); B = Q as e4m3 with unit scale (0x7F = 2^0 in all four
-                # bytes).
+                # word); B = Q as e4m3 with `UNIT_SCALE`. Raw MFMA on dword vectors; the
+                # fx.gemm MFMA_Scale atom (mega_moe/gemm2.py) was not tried here.
                 a_k = fx.Vector.from_elements(
                     [data[k] for k in range_constexpr(4)]
                     + [fx.Int32(0) for _ in range_constexpr(4)],
@@ -816,7 +817,7 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                 scale_a = fx.Int32(scale_word).shrui(g * fx.Int32(8))
                 accs = [
                     fx.Vector(
-                        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                             T.f32x4,
                             [
                                 a_k,
@@ -827,7 +828,7 @@ def build_index_score(S: int, H: int, geom, mxfp4: bool = False, q_fp8: bool = F
                                 0,
                                 scale_a,
                                 0,
-                                fx.Int32(0x7F7F7F7F),
+                                fx.Int32(UNIT_SCALE),
                             ],
                         )
                     )

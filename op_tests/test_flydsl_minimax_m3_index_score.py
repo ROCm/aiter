@@ -2347,6 +2347,27 @@ def check_mxfp4_metadata_rejects_cpu():
     assert not kernel.index_score_supported_fp4(q, kd, ks, 1, 1, 1, bt, seq_lens=seq)
 
 
+def check_mxfp4_sm_scale_must_be_positive_finite():
+    """The epilogue takes the page max before multiplying by the scale, so a
+    non-positive one would pick the wrong block silently; NaN likewise."""
+    q, kd, ks, bt, seq, mb = _valid_inputs()
+    for scale in (-1.0, 0.0, float("nan")):
+        expect_value_error(
+            f"sm_scale={scale}",
+            kernel.score_flydsl_fp4,
+            q,
+            kd,
+            ks,
+            bt,
+            seq,
+            4,
+            4,
+            scale,
+            mb,
+            match="sm_scale",
+        )
+
+
 def check_mxfp4_supported_accepts_valid_inputs():
     q, kd, ks, bt, seq, mb = _valid_inputs()
     assert kernel.index_score_supported_fp4(q, kd, ks, 4, 4, mb, bt, seq_lens=seq)
@@ -2412,6 +2433,7 @@ def build_mxfp4_checks():
         check_mxfp4_default_score_buffer_reads_as_minus_inf,
         check_mxfp4_e4m3_q_rows_must_be_16_byte_aligned,
         check_mxfp4_metadata_rejects_cpu,
+        check_mxfp4_sm_scale_must_be_positive_finite,
         check_mxfp4_supported_accepts_valid_inputs,
     ):
         checks.append((fn.__name__.removeprefix("check_mxfp4_"), fn, ()))
