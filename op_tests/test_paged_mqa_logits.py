@@ -309,6 +309,39 @@ def check_strided_context_lens_rejected():
         raise AssertionError(f"{name} accepted a strided context_lens")
 
 
+def check_2d_context_lens_matches_reference():
+    """The ``(B, next_n)`` table vLLM builds with MTP gives the reference logits
+    through the op and through each backend (FlyDSL owns the shipped B=64,
+    next_n=8 row)."""
+    batch, next_n, kv_len = 64, 8, 1024
+    inp = build_inputs(
+        (batch, next_n, HEADS, HEAD_DIM, KV_BLOCK_SIZE, True), kv_len, kv_len
+    )
+    ref = run_torch(inp, kv_len)
+    ref_inf = torch.isneginf(ref)
+    offsets = torch.arange(next_n, dtype=torch.int32)
+    inp["context_lens"] = (
+        inp["context_lens"][:, None] - next_n + 1 + offsets
+    ).contiguous()
+    args = launch_args(inp)
+    launches = {
+        "paged_mqa_logits": lambda: pmql.paged_mqa_logits(*args),
+        "gluon": lambda: pmql.run_paged_mqa_logits(pmql.DEFAULT_CONFIG, *args),
+    }
+    if pmql.flydsl_supports(
+        inp["q_fp8"], inp["kv_cache"], inp["weights"], True, KV_BLOCK_SIZE
+    ):
+        flydsl = {"backend": "flydsl", "ChunkK": 0, "WavePerEU": 0, "wg_per_cu": 0}
+        launches["flydsl"] = lambda: pmql.run_paged_mqa_logits(flydsl, *args)
+    for name, launch in launches.items():
+        inp["out_logits"].fill_(float("-inf"))
+        with torch.inference_mode():
+            got = launch()[:, :kv_len]
+        assert torch.equal(torch.isneginf(got), ref_inf), f"{name}: 2D -inf mask"
+        diff = calc_diff(ref.masked_fill(ref_inf, 0), got.masked_fill(ref_inf, 0))
+        assert diff < 1e-3, f"{name}: 2D calc_diff={diff}"
+
+
 def main():
     if os.environ.get(_SHIPPED_ROW_CHILD):
         assert get_gfx() != get_gfx_runtime()
@@ -320,6 +353,7 @@ def main():
     check_launches_shipped_row()
     check_flydsl_fallback_keeps_gluon_knobs()
     check_strided_context_lens_rejected()
+    check_2d_context_lens_matches_reference()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
