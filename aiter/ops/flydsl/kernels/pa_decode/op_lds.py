@@ -941,7 +941,7 @@ class PaDecodeKVLoader:
 
     def tail_masks(self, tile_valid):
         """V byte masks for mask_v_chunk; None when masking is disabled."""
-        if const_expr(not self.traits.mask_unowned_kv):
+        if const_expr(not self.traits.mask_unowned_kv or self.traits.nhd_layout):
             return None
         return self._tail_masks(tile_valid)
 
@@ -967,8 +967,10 @@ class PaDecodeKVLoader:
         Their probabilities are exactly zero, but those rows may be pinned
         block-0 pages or unwritten tails holding NaN, and 0 * NaN is NaN in PV.
         Disabled by ``mask_unowned_kv=False``, which returns ``v_ops`` as is.
+        NHD returns ``v_ops`` as is too: its V DMA already zero-fills past the
+        context.
         """
-        if const_expr(not self.traits.mask_unowned_kv):
+        if const_expr(not self.traits.mask_unowned_kv or self.traits.nhd_layout):
             return v_ops
         v = self._mask_v_chunk(
             fx.Vector.from_elements(
