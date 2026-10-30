@@ -147,6 +147,13 @@ RUN pip install --force-reinstall --no-deps "${AITER_DIR}"/dist/*.whl \
          AITER_AOT_IMPORT=1 python3 -c "from aiter.ops.flydsl import allreduce_policy; from aiter.dist.device_communicators.flydsl_backends import FlyDSLQuickAllReduce, FlyDSLAllReduceRMSNorm; print('flydsl allreduce + quick allreduce ok')"; \
        fi
 
+# The target the kernels were built for: the tuned GEMM configs pick kernels by the
+# GPU's CU count, and only the target's are compiled in, so an image built for
+# another CU count fails at the first GEMM. e2e.sh check compares these with the
+# GPUs. Derived images (Dockerfile.vllm-fork, Dockerfile.lm-eval) inherit them.
+LABEL aiter.gpu_arch="${AITER_GPU_ARCH}" aiter.cu_num="${AITER_CU_NUM}" \
+      aiter.num_xcds="${AITER_NUM_XCDS}"
+
 # vLLM defaults this to False and then never calls aiter.
 ENV VLLM_ROCM_USE_AITER=1 \
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 \

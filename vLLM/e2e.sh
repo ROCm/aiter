@@ -202,14 +202,35 @@ in_image() {  # image cmd...
     docker run --rm --entrypoint "" "$image" "$@"
 }
 
+gpu_target() {  # "<CUs> <XCDs>" of the first GPU, from the KFD topology
+    local p cus xcds
+    for p in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+        read -r cus xcds < <(awk '$1 == "simd_count" {s = $2} $1 == "simd_per_cu" {c = $2}
+            $1 == "num_xcc" {x = $2} END {if (c) print s / c, x}' "$p")
+        [ -n "${cus:-}" ] && [ "$cus" -gt 0 ] && { echo "$cus $xcds"; return 0; }
+    done
+    return 0
+}
+
 cmd_check() {
     command -v docker >/dev/null || die "docker not found: run this on the host"
     local ok=1 image
-    local arm tag env v fly
+    local arm tag env v fly built gpu
+    gpu=$(gpu_target)
     for arm in $ARMS; do
         IFS=, read -r tag image env <<<"$arm"
         docker image inspect "$image" >/dev/null 2>&1 \
             || die "image $image missing: ./e2e.sh build / build-fork"
+        # aiter compiles in only the build target's tuned kernels; on GPUs with another
+        # CU count the server dies at its first GEMM, after loading the weights.
+        built=$(docker image inspect -f '{{index .Config.Labels "aiter.cu_num"}} {{index .Config.Labels "aiter.num_xcds"}}' "$image")
+        if [ "$built" = " " ]; then
+            log "WARNING $tag: $image does not say which GPU it was built for (built before the label): rebuild it"
+            ok=0
+        elif [ -n "$gpu" ] && [ "$built" != "$gpu" ]; then
+            die "$tag: $image is built for ${built% *} CUs / ${built#* } XCDs, the GPUs have ${gpu% *} / ${gpu#* }:" \
+                "build and use images for them (MI350X: see the top of this script)"
+        fi
         log "$tag = $image: $(in_image "$image" sh -c \
             'echo "aiter $(git -C /opt/aiter log -1 --format=%h), AITER_FLY_AR=$AITER_FLY_AR, vllm $(python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null), fork $(cat /opt/vllm-fork-ref 2>/dev/null || echo none)"')${env:+, overrides: $env}"
         # vLLM reaches aiter's CustomAllreduce (and through it the FlyDSL
@@ -262,7 +283,7 @@ cmd_check() {
         # runs offline so it loads exactly this snapshot and never re-downloads.
         [ -r "$model_dir/snapshots" ] || die "$model_dir is not readable"
         HF_OFFLINE=1
-        log "model cached: $model_dir ($(du -sh "$model_dir" 2>/dev/null | cut -f1)), serving offline"
+        log "model cached: $model_dir ($(du -shL "$model_dir/snapshots" 2>/dev/null | cut -f1)), serving offline"
         # The index lists every shard's size; a partial download (shards
         # missing) fails at load time, so catch it here.
         local index have want
