@@ -164,6 +164,11 @@ constexpr int kArRmsTwoStageMinHidden = 6144;
 constexpr size_t kLLScratchCapBytes = 4194304;          // 4 MiB
 // Per-rank staging slot capacity, in 8-byte packets.
 constexpr size_t kLLPackCapacity   = kLLScratchCapBytes / 8;  // 524288
+// ar_ll_rmsnorm_gfx1250: blocks wait on packets other blocks published, so the
+// grid must be co-resident: at most one block per CU. Each block publishes about
+// kLLFusedPacketsPerBlock packets, which spreads the peer stores over CUs.
+constexpr int kLLFusedMaxBlocks       = 256;
+constexpr int kLLFusedPacketsPerBlock = 256;
 
 // 16-byte LL line: two (4B data, 4B flag) pairs carrying 8B of payload.
 union LLPackedMsg
@@ -196,9 +201,10 @@ constexpr size_t kLLScratchOffset =
     ((sizeof(Signal) + 127) / 128) * 128;
 
 // Two-stage fused AR + RMSNorm stages each rank's reduced shard right after the
-// LL scratch, so LL never polls a line it did not write. 16 MiB covers the
-// communicator's 64 MiB fused limit at TP4.
-constexpr size_t kArRmsShardBytes = 16 * 1024 * 1024;
+// LL scratch, so LL never polls a line it did not write. 32 MiB takes a
+// 128 MiB message at TP4, where RCCL starts to beat these kernels; the
+// communicator bounds the fused path by it (_GFX1250_AR_RMS_SHARD_BYTES).
+constexpr size_t kArRmsShardBytes = 32 * 1024 * 1024;
 constexpr size_t arRmsShardOffset(int ngpus)
 {
     return kLLScratchOffset + llScratchBytes(ngpus);
@@ -551,31 +557,119 @@ __global__ void __launch_bounds__(512, 1) ar_rmsnorm_reduce_scatter_gfx1250(
     }
 }
 
-// Sum or max over the block; every thread gets the result. Threads past the
-// row contribute 0, so the block size may exceed the row as long as it is a
-// whole number of waves.
+// Butterfly over the wave through DPP and permlanex16: __shfl_xor lowers to
+// ds_bpermute, an LDS round trip per step. Every lane ends with the same bits.
 template <bool kMax>
-DINLINE float block_allreduce_f32(float v)
+DINLINE float wave_allreduce_f32(float v)
 {
-    __shared__ float partial[32];
-    __shared__ float result;
-    for(int off = warpSize / 2; off > 0; off >>= 1)
-    {
-        const float o = __shfl_xor(v, off);
-        v             = kMax ? fmaxf(v, o) : v + o;
-    }
-    if(threadIdx.x % warpSize == 0)
-        partial[threadIdx.x / warpSize] = v;
+    const auto op = [](float a, float b) { return kMax ? fmaxf(a, b) : a + b; };
+#define AR_ROW_XMASK(x, m) \
+    __builtin_bit_cast(    \
+        float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, x), 0x160 | (m), 0xf, 0xf, false))
+    v = op(v, AR_ROW_XMASK(v, 1));
+    v = op(v, AR_ROW_XMASK(v, 2));
+    v = op(v, AR_ROW_XMASK(v, 4));
+    v = op(v, AR_ROW_XMASK(v, 8));
+#undef AR_ROW_XMASK
+    v = op(v,
+           __builtin_bit_cast(float,
+                              __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, v),
+                                                           __builtin_bit_cast(int, v),
+                                                           0x76543210u,
+                                                           0xfedcba98u,
+                                                           true,
+                                                           true)));
+    if(__builtin_amdgcn_wavefrontsize() == 64)
+        v = op(v, __shfl_xor(v, 32));
+    return v;
+}
+
+// Block sum of `sum` and block max of `max`; every thread gets both. Threads
+// past the row contribute 0, so the block size may exceed the row as long as
+// it is a whole number of waves. One barrier: every wave combines the per-wave
+// partials itself. A wave may still read buffer `parity` after a faster wave
+// has left, so consecutive calls must alternate parity unless another barrier
+// separates them.
+DINLINE void block_allreduce_sum_max_f32(float& sum, float& max, int parity)
+{
+    __shared__ float2 partial[2][32];
+    sum            = wave_allreduce_f32<false>(sum);
+    max            = wave_allreduce_f32<true>(max);
+    const int lane = threadIdx.x % warpSize;
+    if(lane == 0)
+        partial[parity][threadIdx.x / warpSize] = make_float2(sum, max);
     __syncthreads();
-    if(threadIdx.x == 0)
+    const float2 p =
+        lane < (int)(blockDim.x / warpSize) ? partial[parity][lane] : make_float2(0.f, 0.f);
+    sum = wave_allreduce_f32<false>(p.x);
+    max = wave_allreduce_f32<true>(p.y);
+}
+
+// RMSNorm + optional per-token FP8 quant of one 16-byte pack per thread, the
+// tail shared by ar_rmsnorm_gfx1250 and ar_ll_rmsnorm_gfx1250. x holds the
+// residual-added row in fp32. The row is scaled as (x * w) * inv_rms, so the
+// row amax of the T-rounded output is T(max|x * w| * inv_rms) exactly
+// (inv_rms > 0 and rounding is monotonic): one barrier yields both the sum of
+// squares and the amax, and the FP8 steps still match
+// dynamic_per_token_scaled_quant of the T output bit for bit.
+template <typename T, typename OutT, bool GEMMA_NORM, int pack_size>
+DINLINE void rmsnorm_quant_pack(float (&x)[pack_size],
+                                const opus::vector_t<T, pack_size>& w,
+                                bool active,
+                                size_t idx,
+                                int t,
+                                int hidden,
+                                float eps,
+                                int parity,
+                                OutT* __restrict__ output,
+                                float* __restrict__ scale_out,
+                                T* __restrict__ bf16_output)
+{
+    using P          = opus::vector_t<T, pack_size>;
+    float square_sum = 0.f, wmax = 0.f;
+#pragma unroll
+    for(int j = 0; j < pack_size; ++j)
     {
-        float r = partial[0];
-        for(int w = 1; w < (int)(blockDim.x / warpSize); ++w)
-            r = kMax ? fmaxf(r, partial[w]) : r + partial[w];
-        result = r;
+        square_sum += x[j] * x[j];
+        x[j] *= upcast_s(w[j]) + (GEMMA_NORM ? 1.f : 0.f);
+        wmax = fmaxf(wmax, fabsf(x[j]));
     }
-    __syncthreads();
-    return result;
+    block_allreduce_sum_max_f32(square_sum, wmax, parity);
+    const float inv_rms = rsqrtf(square_sum / hidden + eps);
+    P o;
+#pragma unroll
+    for(int j = 0; j < pack_size; ++j)
+        o[j] = downcast_s<T>(x[j] * inv_rms);
+    if constexpr(std::is_same_v<T, OutT>)
+    {
+        if(active)
+            reinterpret_cast<P*>(output)[idx] = o;
+    }
+    else
+    {
+        if(active && bf16_output != nullptr)
+            reinterpret_cast<P*>(bf16_output)[idx] = o;
+        const float fp8_max = opus::cast<opus::fp32_t>(opus::numeric_limits<OutT>::max());
+        const float amax    = upcast_s(downcast_s<T>(wmax * inv_rms));
+        const float scale   = amax * (float)(1. / fp8_max);
+        const float inv     = __builtin_amdgcn_rcpf(scale);
+        if(active)
+        {
+            opus::vector_t<OutT, pack_size> q;
+#pragma unroll
+            for(int j = 0; j < pack_size; j += 2)
+            {
+                const float a = __builtin_amdgcn_fmed3f(upcast_s(o[j]) * inv, -fp8_max, fp8_max);
+                const float b =
+                    __builtin_amdgcn_fmed3f(upcast_s(o[j + 1]) * inv, -fp8_max, fp8_max);
+                reinterpret_cast<uint16_t*>(&q)[j / 2] =
+                    __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+            }
+            reinterpret_cast<opus::vector_t<OutT, pack_size>*>(output)[idx] = q;
+        }
+        if(threadIdx.x == 0)
+            scale_out[t] = scale;
+    }
 }
 
 // One block per token, one thread per 16-byte pack of the row. Matches the
@@ -617,11 +711,11 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
 
     if constexpr(!TWO_STAGE)
         start_sync<ngpus>(sg, self_sg, rank);
-    for(int t = blockIdx.x; t < tokens; t += gridDim.x)
+    int parity = 0;
+    for(int t = blockIdx.x; t < tokens; t += gridDim.x, parity ^= 1)
     {
         const int idx = t * packs + threadIdx.x;
         float x[pack_size] = {};
-        float square_sum   = 0.f;
         if(active)
         {
             if constexpr(TWO_STAGE)
@@ -648,70 +742,169 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
             const P res = reinterpret_cast<const P*>(residual_inp)[idx];
             P sum;
 #pragma unroll
-            for(int j = 0; j < pack_size; j++)
+            for(int j = 0; j < pack_size; ++j)
             {
                 x[j]   = upcast_s(downcast_s<T>(x[j])) + upcast_s(res[j]);
                 sum[j] = downcast_s<T>(x[j]);
-                square_sum += x[j] * x[j];
             }
             reinterpret_cast<P*>(residual_out)[idx] = sum;
         }
-        const float inv_rms = rsqrtf(block_allreduce_f32<false>(square_sum) / hidden + eps);
-#pragma unroll
-        for(int j = 0; j < pack_size; j++)
-        {
-            const float wj = upcast_s(w[j]) + (GEMMA_NORM ? 1.f : 0.f);
-            x[j] *= inv_rms * wj;
-        }
-        if constexpr(std::is_same_v<T, OutT>)
-        {
-            if(active)
-            {
-                P o;
-#pragma unroll
-                for(int j = 0; j < pack_size; j++)
-                    o[j] = downcast_s<T>(x[j]);
-                reinterpret_cast<P*>(output)[idx] = o;
-            }
-        }
-        else
-        {
-            // Quantize the T-rounded output with the steps of the unfused
-            // dynamic_per_token_scaled_quant on gfx1250 (scale = amax / max,
-            // multiply by rcp(scale), clamp, cvt_pk), so both FP8 paths match
-            // bit for bit.
-            P o;
-            float amax = 0.f;
-#pragma unroll
-            for(int j = 0; j < pack_size; j++)
-            {
-                o[j] = downcast_s<T>(x[j]);
-                amax = fmaxf(amax, fabsf(upcast_s(o[j])));
-            }
-            if(active && bf16_output != nullptr)
-                reinterpret_cast<P*>(bf16_output)[idx] = o;
-            const float fp8_max = opus::cast<opus::fp32_t>(opus::numeric_limits<OutT>::max());
-            const float scale   = block_allreduce_f32<true>(amax) * (float)(1. / fp8_max);
-            const float inv     = __builtin_amdgcn_rcpf(scale);
-            if(active)
-            {
-                opus::vector_t<OutT, pack_size> q;
-#pragma unroll
-                for(int j = 0; j < pack_size; j += 2)
-                {
-                    const float a = __builtin_amdgcn_fmed3f(upcast_s(o[j]) * inv, -fp8_max, fp8_max);
-                    const float b = __builtin_amdgcn_fmed3f(upcast_s(o[j + 1]) * inv, -fp8_max, fp8_max);
-                    reinterpret_cast<uint16_t*>(&q)[j / 2] =
-                        __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
-                }
-                reinterpret_cast<opus::vector_t<OutT, pack_size>*>(output)[idx] = q;
-            }
-            if(threadIdx.x == 0)
-                scale_out[t] = scale;
-        }
+        rmsnorm_quant_pack<T, OutT, GEMMA_NORM>(
+            x, w, active, idx, t, hidden, eps, parity, output, scale_out, bf16_output);
     }
     if constexpr(!TWO_STAGE)
         end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// LL all-reduce fused with residual add + RMSNorm (+ per-token FP8 quant) for
+// messages in the LL range. Same scratch slots, banks and epoch protocol as
+// ar_ll_gfx1250, so the two kernels interleave freely. One block per token row,
+// one thread per 16-byte pack (two 8-byte LL packets): a block publishes and
+// polls only its own rows, so the row reductions need no grid-wide barrier and
+// the input is read in place (no registered copy). The arithmetic matches
+// ar_rmsnorm_gfx1250: ranks summed in rank order in fp32, the sum rounded to T
+// before the residual add, and the FP8 steps of dynamic_per_token_scaled_quant.
+template <typename T, typename OutT, int ngpus, bool GEMMA_NORM>
+__global__ void __launch_bounds__(1024, 1) ar_ll_rmsnorm_gfx1250(
+    T* const* __restrict__ peer_scratch,
+    const T* __restrict__ input,
+    const T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    OutT* __restrict__ output,
+    const T* __restrict__ weight,
+    float* __restrict__ scale_out,
+    T* __restrict__ bf16_output,
+    int tokens,
+    int hidden,
+    float eps,
+    int rank,
+    uint32_t* __restrict__ block_flags)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    constexpr size_t slot   = kLLPackCapacity;
+    const int packs         = hidden / pack_size;
+    const bool active       = (int)threadIdx.x < packs;
+
+    const uint2* in2 = reinterpret_cast<const uint2*>(input);
+    const uint4* in4 = reinterpret_cast<const uint4*>(input);
+
+    // Publish: a CU sustains little peer-store throughput, so every block of the
+    // grid pushes a share of the 8-byte packets, as ar_ll_gfx1250 does, rather
+    // than each block only its own rows. A row's owner then waits on packets
+    // that other blocks of the peers published, so the host keeps the grid
+    // within one co-resident wave (kLLFusedMaxBlocks). Contiguous per-block
+    // chunks: a grid-stride over all threads would load the first blocks (the
+    // row owners) and leave the rest idle.
+    const size_t nPk   = (size_t)tokens * packs * 2;
+    const size_t chunk = (nPk + gridDim.x - 1) / gridDim.x;
+    const size_t begin = (size_t)blockIdx.x * chunk + threadIdx.x;
+    const size_t end   = (size_t)blockIdx.x * chunk + chunk < nPk
+                             ? (size_t)blockIdx.x * chunk + chunk
+                             : nPk;
+
+    // Issue the first packet, the weight and this block's first row before the
+    // epoch load returns, so their latencies overlap it.
+    uint2 d = begin < end ? in2[begin] : make_uint2(0u, 0u);
+    P w{}, res{};
+    uint4 selfv{};
+    if(active)
+    {
+        w = reinterpret_cast<const P*>(weight)[threadIdx.x];
+        if((int)blockIdx.x < tokens)
+        {
+            const size_t idx = (size_t)blockIdx.x * packs + threadIdx.x;
+            selfv            = in4[idx];
+            res              = reinterpret_cast<const P*>(residual_inp)[idx];
+        }
+    }
+
+    // Every wave reads the epoch itself; the barrier before the fan-out keeps
+    // this block's entry unchanged until all of them have.
+    uint32_t flag = __builtin_amdgcn_readfirstlane(block_flags[blockIdx.x]) + 1u;
+    if(flag == 0u)
+        flag = 2u;
+    const size_t bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+
+    for(size_t pk = begin; pk < end; pk += blockDim.x)
+    {
+        if(pk != begin)
+            d = in2[pk];
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            const int    peer = (rank + r) % ngpus;
+            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
+                               bankOffPkts + (size_t)rank * slot;
+            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d.x, flag, d.y, flag);
+        }
+    }
+
+    LLPackedMsg* myBase =
+        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+
+    int parity = 0;
+    for(int t = blockIdx.x; t < tokens; t += gridDim.x, parity ^= 1)
+    {
+        const size_t idx   = (size_t)t * packs + threadIdx.x;
+        float x[pack_size] = {};
+        if(active)
+        {
+            if(t != (int)blockIdx.x)
+            {
+                selfv = in4[idx];
+                res   = reinterpret_cast<const P*>(residual_inp)[idx];
+            }
+            // Poll the 2 * ngpus lines of this pack together: every pending line
+            // is loaded before any flag is checked, so a round trip costs one
+            // load latency rather than one per line.
+            uint32_t data[ngpus][4]; // peers only; this rank's pack is selfv
+            uint32_t pending = ((1u << (2 * ngpus)) - 1u) & ~(3u << (2 * rank));
+            while(pending)
+            {
+                uint32_t line[2 * ngpus][4];
+#pragma unroll
+                for(int l = 0; l < 2 * ngpus; ++l)
+                    if(pending & (1u << l))
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(
+                                         &myBase[(size_t)(l >> 1) * slot + 2 * idx + (l & 1)]),
+                                     line[l][0], line[l][1], line[l][2], line[l][3]);
+#pragma unroll
+                for(int l = 0; l < 2 * ngpus; ++l)
+                    if((pending & (1u << l)) && line[l][1] == flag && line[l][3] == flag)
+                    {
+                        data[l >> 1][2 * (l & 1)]     = line[l][0];
+                        data[l >> 1][2 * (l & 1) + 1] = line[l][2];
+                        pending &= ~(1u << l);
+                    }
+            }
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+            {
+                const uint4 v = r == rank ? selfv
+                                          : make_uint4(data[r][0], data[r][1], data[r][2], data[r][3]);
+                const P pv    = *reinterpret_cast<const P*>(&v);
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    x[j] += upcast_s(pv[j]);
+            }
+            P sum;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+            {
+                x[j]   = upcast_s(downcast_s<T>(x[j])) + upcast_s(res[j]);
+                sum[j] = downcast_s<T>(x[j]);
+            }
+            reinterpret_cast<P*>(residual_out)[idx] = sum;
+        }
+        rmsnorm_quant_pack<T, OutT, GEMMA_NORM>(
+            x, w, active, idx, t, hidden, eps, parity, output, scale_out, bf16_output);
+    }
+
+    __syncthreads();
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,6 +1482,30 @@ public:
         return ll_enabled() && bytes <= kLLArMaxBytes && world_size_ <= kLLMaxRanks;
     }
 
+    // Whether fused_allreduce_rmsnorm of this size takes ar_ll_rmsnorm_gfx1250,
+    // which also reads the input in place: one block holds a row, one thread
+    // per 16-byte pack, and the input must allow 16-byte loads. Blocks publish
+    // rows they do not own, so no output may overlap the input.
+    bool use_ll_fused(size_t bytes,
+                      int hidden,
+                      int elem_bytes,
+                      const void* input,
+                      const void* residual_out,
+                      const void* output,
+                      size_t out_bytes,
+                      const void* bf16_output) const
+    {
+        const int pack     = 16 / elem_bytes;
+        const auto in      = reinterpret_cast<uintptr_t>(input);
+        const auto overlap = [&](const void* p, size_t n) {
+            const auto q = reinterpret_cast<uintptr_t>(p);
+            return p != nullptr && q < in + bytes && in < q + n;
+        };
+        return use_ll(bytes) && hidden % pack == 0 && hidden / pack <= 1024 && in % 16 == 0 &&
+               !overlap(residual_out, bytes) && !overlap(output, out_bytes) &&
+               !overlap(bf16_output, bytes);
+    }
+
     // Whether the LL small-message fast path is enabled. On by default; set
     // AITER_CUSTOM_AR_DISABLE_LL=1 to force the naive kernel for all sizes.
     static bool ll_enabled()
@@ -1712,10 +1929,33 @@ public:
                                      std::to_string(hidden));
         if(tokens == 0)
             return;
-        RankData* input_ptrs = get_buffer_RD(stream, input);
         const int threads    = (hidden / pack_size + 63) / 64 * 64;
         const int blocks     = std::min(tokens, kMaxBlocks);
         const size_t bytes   = (size_t)tokens * hidden * sizeof(T);
+        if(use_ll_fused(bytes, hidden, sizeof(T), input, residual_out, output,
+                        (size_t)tokens * hidden * sizeof(OutT), bf16_output))
+        {
+            ensure_ll_tables_();
+            T* const* peers   = reinterpret_cast<T* const*>(d_ll_peers_);
+            const int packets = (int)(bytes / 8);
+            const int ll_blocks =
+                std::min(kLLFusedMaxBlocks,
+                         std::max(tokens, (packets + kLLFusedPacketsPerBlock - 1) /
+                                              kLLFusedPacketsPerBlock));
+#define LAUNCH_LL_RMS(NG)                                                                     \
+            if(gemma_norm)                                                                    \
+                ar_ll_rmsnorm_gfx1250<T, OutT, NG, true><<<ll_blocks, threads, 0, stream>>>(  \
+                    peers, input, residual_inp, residual_out, output, weight, scale_out,      \
+                    bf16_output, tokens, hidden, eps, rank_, d_ll_block_flags_);              \
+            else                                                                              \
+                ar_ll_rmsnorm_gfx1250<T, OutT, NG, false><<<ll_blocks, threads, 0, stream>>>( \
+                    peers, input, residual_inp, residual_out, output, weight, scale_out,      \
+                    bf16_output, tokens, hidden, eps, rank_, d_ll_block_flags_)
+            DISPATCH_NGPUS_1250(world_size_, LAUNCH_LL_RMS);
+#undef LAUNCH_LL_RMS
+            return;
+        }
+        RankData* input_ptrs = get_buffer_RD(stream, input);
         // At TP4+, two-stage halves or better the peer traffic of direct-read.
         // Its three single-block barriers do not amortize at TP2 or narrow rows.
         // Each rank's reduced shard must fit its staging region.

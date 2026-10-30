@@ -361,10 +361,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.cpu_group,
                 *self.gluon_ar,
             )
-        can_use_fuse_ar_rms = (
-            n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
-        )
         ca_comm = self.ca_comm
+        # gfx1250's two-stage kernels take messages past the 64 MiB cutoff
+        large_fused = (
+            ca_comm is not None
+            and input_n == n == out_n
+            and ca_comm.fuses_ar_rms_large(input_, n)
+        )
+        can_use_fuse_ar_rms = (
+            n <= 16384
+            and self.world_size != 6
+            and (large_fused or total_bytes < 8 * 1024 * 8192)
+        )
         can_use_custom_ar = (
             ca_comm is not None
             and not ca_comm.disabled
@@ -402,7 +410,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             not use_general_path
             and can_use_custom_ar
-            and ca_comm.should_custom_ar(input_, prefill_support)
+            and (large_fused or ca_comm.should_custom_ar(input_, prefill_support))
         ):
             out, res_out = ca_comm.custom_fused_ar_rms(
                 input_,
@@ -550,6 +558,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             else 64 * 1024 * 1024
         )
         ca_comm = self.ca_comm
+        # gfx1250's two-stage kernels take messages past the 64 MiB cutoff;
+        # an explicit quant size limit still bounds them
+        large_fused = (
+            ca_comm is not None
+            and self._ar_quant_max_bytes < 0
+            and ca_comm.fuses_ar_rms_large(input_, hidden_dim)
+        )
         if (
             ca_comm is not None
             and not ca_comm.disabled
@@ -560,10 +575,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     and input_.dtype in (torch.float16, torch.bfloat16)
                 )
             )
-            and total_bytes <= fused_quant_bytes_limit
-            and (prefill_support or total_bytes <= no_prefill_quant_bytes_limit)
+            and (
+                large_fused
+                or (
+                    total_bytes <= fused_quant_bytes_limit
+                    and (prefill_support or total_bytes <= no_prefill_quant_bytes_limit)
+                    and ca_comm.should_custom_ar(input_, prefill_support)
+                )
+            )
             and ca_comm.should_fuse_ar_rms(input_, hidden_dim, hidden_dim)
-            and ca_comm.should_custom_ar(input_, prefill_support)
         ):
             total_bytes_limit = (
                 self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024

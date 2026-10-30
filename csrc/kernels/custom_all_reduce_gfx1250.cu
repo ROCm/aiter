@@ -558,10 +558,12 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
     const int hidden   = (int)w.numel();
     const int tokens   = (int)(inp.numel() / hidden);
 
-    void* actual_inp = inp.data_ptr();
-    if(reg_ptr != 0)
+    void* actual_inp         = inp.data_ptr();
+    const int64_t data_bytes = inp.numel() * inp.element_size();
+    const size_t out_bytes   = inp.numel() * (scale_out == nullptr ? inp.element_size() : 1);
+    if(reg_ptr != 0 && !fa->use_ll_fused(data_bytes, hidden, inp.element_size(), actual_inp,
+                                         res_out.data_ptr(), out, out_bytes, bf16_out))
     {
-        const int64_t data_bytes = inp.numel() * inp.element_size();
         if(data_bytes > reg_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
         HIP_CALL(hipMemcpyAsync(
