@@ -94,6 +94,243 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
 
 
+@pytest.mark.parametrize("max_partitions", [None, 1])
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+def test_pa_decode_graph_plan_refresh(device, kv_dtype, max_partitions):
+    """Graph replays decode new lengths through a plan refreshed in the graph.
+
+    Dense page128 decode as ATOM runs it: a capture-sized block table and no
+    max_context_length, with poisoned output and scratch on every replay.
+    One-partition plans write output directly; default plans feed the reducer,
+    including its LDS branch at more than 32 partitions.
+    """
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    kv_heads, group, dim, page = 2, 16, 128, 128
+    replays = [
+        (16384, 1, 300, 0),
+        (129, 8192, 0, 4100),
+        (0, 0, 0, 0),
+        (257, 256, 16384, 2049),
+    ]
+    torch.manual_seed(0)
+    query, key, value, table, context = _make_inputs(
+        1,
+        kv_heads,
+        group,
+        dim,
+        page,
+        torch.bfloat16,
+        "varied",
+        device,
+        (16384,) * len(replays[0]),
+        table_width=2048,
+    )
+    compute_type, key_scale, value_scale, vector = torch.bfloat16, None, None, 8
+    if kv_dtype == "fp8":
+        compute_type = (
+            torch.float8_e4m3fn
+            if get_gfx_runtime() in ("gfx950", "gfx1250")
+            else torch.float8_e4m3fnuz
+        )
+        key, key_scale = pertoken_quant(key, quant_dtype=compute_type)
+        value, value_scale = pertoken_quant(value, quant_dtype=compute_type)
+        vector = 16
+    logical_key = key.float() * (1.0 if key_scale is None else key_scale)
+    logical_value = value.float() * (1.0 if value_scale is None else value_scale)
+    pages = key.shape[0]
+    key_cache = (
+        key.reshape(pages, kv_heads, page, dim // vector, vector)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.reshape(pages, kv_heads, page // vector, vector, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    plan = pa.plan_pa_decode(context, kv_heads, max_partitions=max_partitions)
+    scalar_shape = (kv_heads, plan.capacity, group)
+    workspace = {
+        "exp_sums": torch.empty(scalar_shape, dtype=torch.float32, device=device),
+        "max_logits": torch.empty(scalar_shape, dtype=torch.float32, device=device),
+        "temporary_output": torch.empty(
+            (*scalar_shape, dim), dtype=query.dtype, device=device
+        ),
+    }
+    output = torch.empty_like(query)
+
+    def step():
+        pa.plan_pa_decode(context, kv_heads, plan=plan)
+        pa.pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context,
+            table,
+            dim**-0.5,
+            1,
+            compute_type=compute_type,
+            key_scale=key_scale,
+            value_scale=value_scale,
+            work_plan=plan,
+            **workspace,
+        )
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        step()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        step()
+    for lengths in replays:
+        context.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+        output.fill_(float("nan"))
+        for tensor in workspace.values():
+            tensor.fill_(float("nan"))
+        graph.replay()
+        reference = _reference(
+            query, logical_key, logical_value, table, context, 1, 0, None
+        )
+        _check_output(output, reference)
+
+
+@pytest.mark.parametrize(
+    "head_size,dtype,with_sinks",
+    [
+        (128, torch.bfloat16, False),
+        (128, torch.bfloat16, True),
+        (64, torch.float16, False),
+        (192, torch.bfloat16, True),
+        (256, torch.float16, False),
+        (512, torch.bfloat16, False),
+    ],
+)
+def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
+    """Rungs split across partition groups match the single-group ladder bit for bit.
+
+    Register-only CTAs (24 and 32 partition bounds) and the register branch of
+    dual-mode CTAs reduce the same packed partials with one group and with
+    split groups; sequences above 32 partitions take the LDS branch and match
+    a float64 reference. Slots past the live tasks hold NaN.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 splits register rungs across partition groups")
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
+    from aiter.ops.flydsl.kernels.tensor_shim import (
+        _run_compiled,
+        get_dtype_str,
+        ptr_arg,
+    )
+
+    kv_heads, rows = 2, 16
+    counts = (17, 0, 32, 1, 24, 16, 31, 20, 40, 256, 100)
+    first = [sum(counts[:i]) for i in range(len(counts))]
+    capacity = sum(counts) + 8
+    torch.manual_seed(0)
+    exp_sums = torch.full((kv_heads, capacity, rows), float("nan"), device=device)
+    max_logits = torch.full_like(exp_sums, float("nan"))
+    logits = torch.full(
+        (kv_heads, capacity, rows, head_size), float("nan"), dtype=dtype, device=device
+    )
+    live = sum(counts)
+    exp_sums[:, :live] = torch.rand(kv_heads, live, rows, device=device) * 50 + 0.5
+    max_logits[:, :live] = torch.randn(kv_heads, live, rows, device=device) * 4
+    logits[:, :live] = torch.randn(kv_heads, live, rows, head_size, device=device).to(
+        dtype
+    )
+    reduce_info = torch.tensor(
+        [[f, c] for f, c in zip(first, counts)], dtype=torch.int32, device=device
+    )
+    sinks = None
+    if with_sinks:
+        sinks = torch.linspace(-3, 3, kv_heads * rows, device=device).to(dtype)
+        sinks[0] = float("-inf")
+
+    def pairs_for(partitions):
+        return head_size % 128 == 0 if partitions > 32 else head_size in (128, 256)
+
+    def run(partitions, groups):
+        pairs = pairs_for(partitions)
+        compiled = compile_pa_decode_ps_reduce(
+            architecture="gfx1250",
+            max_context_partition_num=partitions,
+            head_size=head_size,
+            output_dtype_str=get_dtype_str(dtype),
+            logits_dtype_str=get_dtype_str(dtype),
+            sink_dtype_str=get_dtype_str(dtype),
+            use_sinks=with_sinks,
+            query_group_size=rows,
+            pairs=pairs,
+            parallel_groups=groups,
+        )
+        out = torch.full(
+            (len(counts), 1, kv_heads, rows, head_size),
+            float("nan"),
+            dtype=dtype,
+            device=device,
+        )
+        pointer = fx.BFloat16 if dtype == torch.bfloat16 else fx.Float16
+        _run_compiled(
+            compiled["launch"],
+            ptr_arg(out, pointer),
+            ptr_arg(exp_sums, fx.Float32),
+            ptr_arg(max_logits, fx.Float32),
+            ptr_arg(logits, pointer),
+            (
+                flyc.from_c_void_p(pointer, 0)
+                if sinks is None
+                else ptr_arg(sinks, pointer)
+            ),
+            *out.stride()[:4],
+            *exp_sums.stride()[:2],
+            *logits.stride()[:3],
+            1,
+            len(counts),
+            kv_heads,
+            ptr_arg(reduce_info, fx.Int32),
+            -(-(1 << 30) // rows),
+            -(-(1 << 30) // (rows * kv_heads)),
+            torch.cuda.current_stream(),
+        )
+        return out
+
+    reference = torch.zeros(len(counts), kv_heads, rows, head_size, device=device)
+    for seq, (f, c) in enumerate(zip(first, counts)):
+        if c == 0:
+            continue
+        maxima = max_logits[:, f : f + c].double()
+        top = maxima.max(dim=1).values
+        if sinks is not None:
+            top = torch.maximum(top, sinks.double().view(kv_heads, rows))
+        mass = exp_sums[:, f : f + c].double() * torch.exp(maxima - top[:, None])
+        total = mass.sum(dim=1)
+        if sinks is not None:
+            total = total + torch.exp(sinks.double().view(kv_heads, rows) - top)
+        weights = mass / total[:, None]
+        reference[seq] = (
+            (weights[..., None] * logits[:, f : f + c].double()).sum(1).float()
+        )
+    for partitions, split in ((32, 4), (24, 4), (32, 2), (64, 16), (256, 4), (256, 16)):
+        if split * head_size // (2 if pairs_for(partitions) else 1) // 32 > 32:
+            continue
+        single, grouped = run(partitions, 1), run(partitions, split)
+        register = [seq for seq, c in enumerate(counts) if c <= min(partitions, 32)]
+        assert torch.equal(
+            single[register].view(torch.int16), grouped[register].view(torch.int16)
+        )
+        # Plans keep every count within the partition bound.
+        bounded = [seq for seq, c in enumerate(counts) if c <= partitions]
+        torch.testing.assert_close(
+            grouped[bounded, 0].float(), reference[bounded], atol=2e-2, rtol=2e-2
+        )
+
+
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()
@@ -230,6 +467,29 @@ _COMMON_CASES = [
         for page, group in ((16, 8), (128, 16))
         for pattern in ("small_query", "probability_tail")
     ],
+    # Sparse decode rows of up to 2048 tokens take 8 partitions, which gfx1250
+    # merges within one workgroup cluster; replays must not see stale partials.
+    (
+        "cluster8",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (2048,) * 6 + (0, 1, 257, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 8,
+        },
+    ),
+    (
+        "mtp4-g16-page128",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+            "sink_dtype": torch.float32,
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
@@ -269,6 +529,53 @@ _FP8_CASES = _COMMON_CASES + [
         "default-cap",
         {"group_size": 16, "block_size": 128, "max_partitions": None},
     ),
+    # Four 16-row query tiles at D128 give each gfx1250 wave its own tile.
+    # Varied token magnitudes make a misplaced per-token scale fail; rows past
+    # one page run unmasked interior pages (two-token rows exceed FP8 P error).
+    (
+        "mtp4-g16-page128-direct",
+        {"query_length": 4, "group_size": 16, "block_size": 128},
+    ),
+    (
+        "mtp4-g16-page128-varied",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": None,
+            "lengths": (65, 129, 257, 300, 1027, 4100),
+            "pattern": "varied",
+        },
+    ),
+    (
+        "mtp4-g16-page128-probability_tail",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "pattern": "probability_tail",
+        },
+    ),
+    # One task slot per sequence: slots of the empty rows give the long row
+    # several tasks, which its last-arriving CTA merges across replays.
+    (
+        "mtp4-g16-page128-merge",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "capture": True,
+        },
+    ),
+    # 60 rows pad the last wave's tile; GQA 8 puts two queries in each tile.
+    (
+        "mtp5-g12-page128",
+        {"query_length": 5, "group_size": 12, "block_size": 128, "max_partitions": 7},
+    ),
+    ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
     (
@@ -285,6 +592,16 @@ _BF16_CASES = _COMMON_CASES + [
     (
         "head256",
         {"kv_heads": 2, "head_dim": 256, "block_size": 16, "max_partitions": 7},
+    ),
+    (
+        "cluster16",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (4096,) * 3 + (0, 255),
+            "max_partitions": 16,
+            "cluster": 16,
+        },
     ),
     ("head192-decode", {"group_size": 16, "head_dim": 192, "max_partitions": 4}),
     (
@@ -304,6 +621,65 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
+    # Four 16-row query tiles at D128 over page128 caches: on gfx1250, wave
+    # pairs share two tiles and split every page, in each output mode. One
+    # task per sequence runs window-masked, unmasked and causal pages in turn;
+    # one slot per sequence merges the long rows' tasks across replays.
+    (
+        "mtp4-g16-page128-direct",
+        {"query_length": 4, "group_size": 16, "block_size": 128},
+    ),
+    (
+        "mtp4-g16-page128-cluster",
+        {
+            "query_length": 4,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+        },
+    ),
+    (
+        "mtp4-g16-page128-merge",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "capture": True,
+        },
+    ),
+    (
+        "mtp4-g16-page128-fp16-query",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "query_dtype": torch.float16,
+            "lengths": (65, 1027, 4100),
+            "max_partitions": 3,
+            "sink_dtype": torch.float16,
+        },
+    ),
+    (
+        "mtp4-g16-page128-window",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (65, 300, 1027, 4100),
+            "window": 700,
+            "sink_dtype": torch.float32,
+        },
+    ),
+    # 60 rows pad the last tile; GQA 8 puts two queries in each tile.
+    (
+        "mtp5-g12-page128",
+        {"query_length": 5, "group_size": 12, "block_size": 128, "max_partitions": 7},
+    ),
+    ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
     (
         "loose-bound",
@@ -503,11 +879,15 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
+    if case["cluster"] is not None:
+        expected = case["cluster"] if arch == "gfx1250" else 0
+        assert compile_kwargs[-1]["cluster_merge"] == expected
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
+        schedule_kwargs.pop("cluster_merge", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -576,6 +956,7 @@ def test_pa_decode(case, device, monkeypatch):
             "wide": False,
             "pipe": False,
             "staged": None,
+            "cluster": None,
         },
         **case,
     )
@@ -641,6 +1022,9 @@ def test_pa_decode(case, device, monkeypatch):
             key, value = key.to(compute_type), value.to(compute_type)
             if mode == "python":
                 key_scale, value_scale = 0.25, 2.0
+    else:
+        # FP16 queries read BF16 caches.
+        key, value = key.to(compute_type), value.to(compute_type)
     logical_key = key.float() * (1.0 if key_scale is None else key_scale)
     logical_value = value.float() * (1.0 if value_scale is None else value_scale)
     pages = key.shape[0]

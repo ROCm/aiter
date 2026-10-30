@@ -16,9 +16,13 @@ f32 softmax state and accumulation. BF16 KV does not use quantization scales.
 gfx1250 uses wave32 WMMA with native FP8 Q/P conversion or BF16 operands.
 Its four waves process 64- or 128-token compute tiles within each 256-token
 plan tile. Packed FP8 D128/D256 full-attention paths use K128 WMMA; other
-FP8 paths use K64 and BF16 uses K32. Supported layouts use TDM K/V transfers,
-with two LDS buffers where capacity permits. One-partition plans can write
-final output directly; other plans use the shared partition reducer.
+FP8 paths use K64 and BF16 uses K32. Four FP8 D128 query tiles over page128
+caches give each wave its own tile and keep P in registers. Supported layouts
+use TDM K/V transfers, with two LDS buffers where capacity permits.
+One-partition plans can write final output directly. Plans with one task slot
+per sequence merge a sequence's few partitions in its last-arriving CTA, and
+plans whose sequences each fit one workgroup cluster merge within that
+cluster; other plans use the shared partition reducer.
 BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
 with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
@@ -56,7 +60,19 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .pa_decode import implementation_cache_tag
 from .pa_decode.context import PaDecodeContext
-from .pa_decode.pipeline import Gfx1250Bf16Pipeline, Gfx1250Pipeline, PaDecodePipeline
+from .pa_decode.op_merge import (
+    CLUSTER_PARTITIONS,
+    MERGE_HEAD_DIM,
+    MERGE_PARTITIONS,
+    Gfx1250ClusterMerge,
+)
+from .pa_decode.pipeline import (
+    Gfx1250Bf16Pipeline,
+    Gfx1250Bf16WavePipeline,
+    Gfx1250Pipeline,
+    Gfx1250WavePipeline,
+    PaDecodePipeline,
+)
 from .pa_decode.traits import (
     FP8_PACK_K,
     KV_COMPUTE_BLOCK,
@@ -68,11 +84,18 @@ from .pa_decode.traits import (
     PaDecodeSchedule,
     PaDecodeTraits,
 )
+from .tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+)
 
 __all__ = [
+    "CLUSTER_PARTITIONS",
     "FP8_PACK_K",
     "KV_COMPUTE_BLOCK",
     "LOG2E",
+    "MERGE_HEAD_DIM",
+    "MERGE_PARTITIONS",
     "MFMA_ACC_ELEMS",
     "MFMA_MNK",
     "WAVE",
@@ -97,6 +120,8 @@ def _pa_decode_tile_kernel_name(
     sliding_window,
     query_splits,
     direct_output=False,
+    merge_partitions=False,
+    cluster_merge=0,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -113,6 +138,10 @@ def _pa_decode_tile_kernel_name(
         name += f"_qs{query_splits}"
     if direct_output:
         name += "_direct"
+    if merge_partitions:
+        name += "_merge"
+    if cluster_merge:
+        name += f"_cluster{cluster_merge}"
     return name
 
 
@@ -140,6 +169,7 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     direct_output: bool = False,
     trans_k: bool = True,
+    cluster_merge: int = 0,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -169,9 +199,14 @@ def compile_pa_decode_tile(
     Plans cover the MTP window union; scores are masked per query row.
     ``trans_k=False`` is not implemented.
     gfx1250 uses wave32 WMMA, native BF16 or OCP FP8, and its larger LDS budget.
-    A one-partition gfx1250 plan can write final output directly when sinks
-    are absent and query/output strides match. Other tasks write packed partials
-    for the shared reducer, which applies sinks once.
+    With ``direct_output`` a gfx1250 plan writes final output when sinks are
+    absent and query/output strides match: one-partition plans directly, and
+    other plans of at most ``MERGE_PARTITIONS`` partitions per sequence by
+    merging in each sequence's last-arriving CTA. Other tasks write packed
+    partials for the shared reducer, which applies sinks once. A positive
+    ``cluster_merge`` P instead merges each sequence's tasks within a cluster
+    of P CTAs (see ``compile_gfx1250_pa_decode``); plans must give every
+    sequence at most P tasks.
 
     Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
     Pages past the sequence are pinned to block 0; callers must leave the
@@ -183,8 +218,6 @@ def compile_pa_decode_tile(
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture == "gfx1250":
-        if direct_output and num_partitions != 1:
-            raise ValueError("direct_output requires a one-partition plan")
         if query_splits is None:
             # Split the measured spilling BF16 specialization into one Q tile
             # per CTA. Other shapes retain fused queries and their KV reuse.
@@ -210,13 +243,15 @@ def compile_pa_decode_tile(
             trans_v=trans_v,
             sliding_window=sliding_window,
             compute_dtype=kv_dtype,
-            direct_output=direct_output,
+            direct_output=direct_output and num_partitions == 1,
             query_splits=query_splits,
+            merge_partitions=direct_output and num_partitions > 1,
+            cluster_merge=cluster_merge,
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
-    if direct_output:
-        raise NotImplementedError("direct_output requires gfx1250")
+    if direct_output or cluster_merge:
+        raise NotImplementedError("direct_output and cluster_merge require gfx1250")
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
         query_group_size=query_group_size,
@@ -456,7 +491,19 @@ def compile_gfx1250_pa_decode(
     compute_dtype="fp8",
     direct_output=False,
     query_splits=1,
+    merge_partitions=False,
+    cluster_merge=0,
 ):
+    """Compile a gfx1250 tile kernel; merging partitions writes final output.
+
+    ``merge_partitions`` plans keep packed partials and count arrivals per
+    (sequence, KV head) in the plan's zeroed ``arrival_counters``. A positive
+    ``cluster_merge`` P instead launches P CTAs per sequence as one workgroup
+    cluster: CTA i runs the sequence's task i when it has one, and the cluster
+    merges P-way after a cluster barrier. Every sequence must have at most P
+    tasks. In both modes a sequence's single task stores final rows directly,
+    and empty sequences clear their rows.
+    """
     if query_splits not in (1, 2, 4) or query_length % query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
     t = Gfx1250Traits(
@@ -472,11 +519,27 @@ def compile_gfx1250_pa_decode(
         compute_dtype,
         direct_output,
         query_splits,
+        merge_partitions,
+        cluster_merge,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
     if t.bf16 and per_token_kv:
         raise ValueError("BF16 PA decode does not use quantization scales")
+    if merge_partitions and (direct_output or head_dim > MERGE_HEAD_DIM):
+        raise ValueError(
+            f"merge_partitions excludes direct_output and head_dim > {MERGE_HEAD_DIM}"
+        )
+    if cluster_merge and (
+        direct_output
+        or merge_partitions
+        or head_dim > MERGE_HEAD_DIM
+        or not 2 <= cluster_merge <= CLUSTER_PARTITIONS
+    ):
+        raise ValueError(
+            f"cluster_merge must be in [2, {CLUSTER_PARTITIONS}] and excludes other "
+            f"output modes and head_dim > {MERGE_HEAD_DIM}"
+        )
     if t.total_bytes > 327680:
         raise NotImplementedError(
             "gfx1250 PA decode query/KV tiles exceed LDS capacity"
@@ -501,17 +564,23 @@ def compile_gfx1250_pa_decode(
         sliding_window=sliding_window,
         query_splits=query_splits,
         direct_output=direct_output,
+        merge_partitions=merge_partitions,
+        cluster_merge=cluster_merge,
     )
 
+    # Every argument that reducer-fed and direct-output kernels read fits in
+    # the 30 user SGPRs (120 bytes) that preload kernel arguments, ahead of
+    # the merge-only arguments.
     @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
-        pmax: fx.Pointer,
-        psum: fx.Pointer,
-        pout: fx.Pointer,
+        work: fx.Pointer,
+        table: fx.Pointer,
         query: fx.Pointer,
         key: fx.Pointer,
         value: fx.Pointer,
-        table: fx.Pointer,
+        pmax: fx.Pointer,
+        psum: fx.Pointer,
+        pout: fx.Pointer,
         ks: fx.Pointer,
         vs: fx.Pointer,
         max_blocks: fx.Int32,
@@ -519,11 +588,47 @@ def compile_gfx1250_pa_decode(
         sk_head: fx.Int32,
         sq_row: fx.Int32,
         sq_head: fx.Int32,
-        work: fx.Pointer,
         sequences: fx.Int32,
+        capacity: fx.Int32,
+        kv_heads: fx.Int32,
+        reduce_info: fx.Pointer,
+        output: fx.Pointer,
+        counters: fx.Pointer,
     ):
         _ = tag
+
+        def zero_output(seq, dst):
+            # Empty sequences have no attention mass; clear this CTA's rows.
+            rows = fx.recast_iter(t.q_dtype, dst)
+            tid = fx.Int32(gpu.thread_id("x"))
+            for i in range_constexpr(-(-t.rows * t.head_dim // t.BLOCK_THREADS)):
+                index = i * t.BLOCK_THREADS + tid
+                if index < t.rows * t.head_dim:
+                    row, d = index // t.head_dim, index % t.head_dim
+                    kv_query = fx.Int32(gpu.block_id("y"))
+                    row = row + (kv_query % t.query_splits) * t.rows
+                    offset = (
+                        (fx.Int64(seq) * t.query_length + row // t.query_group_size)
+                        * sq_row
+                        + (
+                            (kv_query // t.query_splits) * t.query_group_size
+                            + row % t.query_group_size
+                        )
+                        * sq_head
+                        + d
+                    )
+                    rows[offset] = t.q_dtype(0.0)
+
         task_slot = fx.Int32(gpu.block_id("x"))
+        if const_expr(t.cluster_merge):
+            # Cluster s runs sequence s's tasks on its leading CTAs.
+            seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
+            seq_tasks = fx.ptr_load(
+                fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
+                result_type=fx.Vector.make_type(2, fx.Int32),
+            )
+            first, count = fx.Int32(seq_tasks[0]), fx.Int32(seq_tasks[1])
+            task_slot = (part < count).select(first + part, fx.Int32(0))
         if const_expr(t.direct_output):
             # One task per nonempty sequence; reduce_info supplies its packed slot.
             info = fx.recast_iter(fx.Int32, pmax)
@@ -538,6 +643,8 @@ def compile_gfx1250_pa_decode(
         active = fx.Int32(task[1]) < fx.Int32(task[2])
         if const_expr(t.direct_output):
             active = count > 0
+        if const_expr(t.cluster_merge):
+            active = part < count
         if active:
             ctx = PaDecodeContext(
                 t,
@@ -562,33 +669,50 @@ def compile_gfx1250_pa_decode(
                 fx.Int32(task[2]),
                 fx.Int32(task[3]),
             )
-            if const_expr(t.bf16_page128_packed):
+            # Packed partials are [KV heads, capacity, rows] by task slot.
+            ctx.task_slot, ctx.capacity = task_slot, capacity
+            ctx.n_kv = kv_heads
+            if const_expr(t.merge_partitions):
+                # Issued early: only the epilogue reads the sequence's tasks.
+                tasks = fx.ptr_load(
+                    fx.add_offset(
+                        fx.recast_iter(fx.Int32, reduce_info), fx.Int32(task[0]) * 2
+                    ),
+                    result_type=fx.Vector.make_type(2, fx.Int32),
+                )
+                ctx.first_task = fx.Int32(tasks[0])
+                ctx.task_count = fx.Int32(tasks[1])
+                ctx.output_ptr = output
+                ctx.counters_ptr = counters
+            if const_expr(t.cluster_merge):
+                ctx.task_count = count
+                ctx.output_ptr = output
+            if const_expr(t.bf16_wave_query_tiles):
+                Gfx1250Bf16WavePipeline(ctx).run()
+            elif const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
+            elif const_expr(t.wave_query_tiles):
+                Gfx1250WavePipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
-            output = fx.recast_iter(t.q_dtype, pout)
-            tid = fx.Int32(gpu.thread_id("x"))
-            for i in range_constexpr(-(-t.rows * t.head_dim // t.BLOCK_THREADS)):
-                index = i * t.BLOCK_THREADS + tid
-                if index < t.rows * t.head_dim:
-                    row, d = index // t.head_dim, index % t.head_dim
-                    kv_query = fx.Int32(gpu.block_id("y"))
-                    row = row + (kv_query % t.query_splits) * t.rows
-                    offset = (
-                        (
-                            fx.Int64(gpu.block_id("x")) * t.query_length
-                            + row // t.query_group_size
-                        )
-                        * sq_row
-                        + (
-                            (kv_query // t.query_splits) * t.query_group_size
-                            + row % t.query_group_size
-                        )
-                        * sq_head
-                        + d
-                    )
-                    output[offset] = t.q_dtype(0.0)
+            zero_output(gpu.block_id("x"), pout)
+        if const_expr(t.merge_partitions):
+            # Empty sequences own no task. Capacity >= batch gives each one the
+            # CTA at its index, which clears its rows.
+            info = fx.recast_iter(fx.Int32, reduce_info)
+            if task_slot < sequences:  # noqa: SIM102
+                if fx.Int32(info[task_slot * 2 + 1]) == 0:
+                    zero_output(task_slot, output)
+        if const_expr(t.cluster_merge):
+            # Every CTA of a cluster reaches its barrier exactly once.
+            if count > 1:
+                merge = Gfx1250ClusterMerge(
+                    t, pmax, psum, pout, output, sq_row, sq_head
+                )
+                merge.run(seq, part, first, count, capacity)
+            elif (count == 0) & (part == 0):
+                zero_output(seq, output)
 
     @flyc.jit
     def launch(
@@ -610,17 +734,26 @@ def compile_gfx1250_pa_decode(
         sq_head: fx.Int32,
         work: fx.Pointer,
         capacity: fx.Int32,
+        output: fx.Pointer,
+        reduce_info: fx.Pointer,
+        counters: fx.Pointer,
         stream: fx.Stream,
     ):
         _ = tag
+        grid_x = capacity
+        if const_expr(t.direct_output):
+            grid_x = sequences
+        if const_expr(t.cluster_merge):
+            grid_x = sequences * t.cluster_merge
         pa_decode_tile_kernel(
-            pmax,
-            psum,
-            pout,
+            work,
+            table,
             query,
             key,
             value,
-            table,
+            pmax,
+            psum,
+            pout,
             ks,
             vs,
             max_blocks,
@@ -628,17 +761,37 @@ def compile_gfx1250_pa_decode(
             sk_head,
             sq_row,
             sq_head,
-            work,
             sequences,
-        ).launch(
-            grid=(
-                sequences if t.direct_output else capacity,
-                kv_heads * t.query_splits,
-                1,
+            capacity,
+            kv_heads,
+            reduce_info,
+            output,
+            counters,
+            value_attrs=(
+                {"rocdl.cluster_dims": f"{t.cluster_merge},1,1"}
+                if t.cluster_merge
+                else None
             ),
+        ).launch(
+            grid=(grid_x, kv_heads * t.query_splits, 1),
             block=(t.BLOCK_THREADS, 1, 1),
             stream=stream,
+            cluster=(t.cluster_merge, 1, 1) if t.cluster_merge else None,
         )
 
+    llvm_options = {}
+    if t.bf16_wave_query_tiles:
+        # Iterative ILP scheduling leaves fewer VGPR bank switches per page.
+        llvm_options["amdgpu-sched-strategy"] = "iterative-ilp"
+    if not t.merged_output:
+        # Argument loads that a preload leaves behind are slower than those of
+        # an unpreloaded kernel (cluster merges ran 2-6% slower), so merging
+        # kernels, whose arguments do not all fit, keep loading them.
+        llvm_options["amdgpu-kernarg-preload"] = AITER_FLYDSL_KERNARG_PRELOAD
+        llvm_options["amdgpu-kernarg-preload-count"] = (
+            AITER_FLYDSL_KERNARG_PRELOAD_COUNT
+        )
+    if llvm_options:
+        launch.compile_hints["llvm_options"] = llvm_options
     compiled = {"launch": launch, "kernel": pa_decode_tile_kernel}
     return _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)

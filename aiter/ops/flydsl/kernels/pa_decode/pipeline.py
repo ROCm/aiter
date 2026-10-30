@@ -18,6 +18,7 @@ from ..utils import rcp_f32
 from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
+from .op_merge import Gfx1250PartitionMerge
 from .op_softmax import PaDecodeSoftmax
 from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK
 
@@ -621,6 +622,7 @@ class Gfx1250Bf16Pipeline:
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
         self.mem = Gfx1250Memory(ctx)
+        self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
     @flyc.jit
     def run(self):
@@ -632,7 +634,6 @@ class Gfx1250Bf16Pipeline:
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
-        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
         self.mem.allocate()
         query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
         q_operands = []
@@ -675,6 +676,8 @@ class Gfx1250Bf16Pipeline:
             ctx.planned_start * KV_COMPUTE_BLOCK,
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
+        # Keep the Q loads ahead of the first page's table lookup.
+        fx.rocdl.sched_barrier(0)
         self.mem.stage_bf16_page(begin, fx.Int32(0))
         for token_i, state in range(begin, end, 128, init=initial):
             token_base = fx.Int32(token_i)
@@ -791,60 +794,225 @@ class Gfx1250Bf16Pipeline:
                         )
                         out = Gfx1250Gemm.mma(v, p_operands[d], out, 32, True)
                     next_state.append(out)
-                if const_expr(m + 1 < t.m_tiles):
-                    # Retire P reads before another query tile overwrites them.
-                    gpu.barrier()
+                # The next query tile writes P and its sum only after its max
+                # barrier, which every wave reaches after these reads.
             final = yield next_state
-        pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
-        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
-        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
-        slot = fx.Int64(ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
-            gpu.block_id("x")
-        )
-        for m in range_constexpr(t.m_tiles):
-            row = m * 16 + ctx.lane16
-            output_row = ctx.query_begin * t.query_group_size + row
-            partial_row = slot * (t.rows * t.query_splits) + output_row
-            denom = final[m * state_stride + 1]
-            inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
-            if row < t.rows:
-                for vh in range_constexpr(t.head_dim // 64):
-                    d = vh * 64 + ctx.warp * 16 + ctx.half * 8
-                    value = (
-                        final[m * state_stride + 2 + vh]
-                        * fx.Vector.from_elements(
-                            [inv],
-                            dtype=fx.Float32,
-                        ).broadcast_to(8)
-                    ).to(t.q_dtype)
-                    offset = (
-                        (
-                            fx.Int64(ctx.planned_seq) * t.query_length
-                            + output_row // t.query_group_size
+        slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
+
+        def store(direct):
+            # Direct stores write final rows; other tasks store packed partials.
+            pout = fx.recast_iter(
+                t.q_dtype,
+                ctx.output_ptr if t.merged_output and direct else ctx.pout_ptr,
+            )
+            pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+            psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+            for m in range_constexpr(t.m_tiles):
+                row = m * 16 + ctx.lane16
+                output_row = ctx.query_begin * t.query_group_size + row
+                partial_row = slot * (t.rows * t.query_splits) + output_row
+                denom = final[m * state_stride + 1]
+                inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+                if row < t.rows:
+                    for vh in range_constexpr(t.head_dim // 64):
+                        d = vh * 64 + ctx.warp * 16 + ctx.half * 8
+                        value = (
+                            final[m * state_stride + 2 + vh]
+                            * fx.Vector.from_elements(
+                                [inv],
+                                dtype=fx.Float32,
+                            ).broadcast_to(8)
+                        ).to(t.q_dtype)
+                        offset = (
+                            self.merge.output_offset(output_row, d)
+                            if direct
+                            else partial_row * t.head_dim + d
                         )
-                        * ctx.stride_q_row
-                        + (
-                            ctx.kv_h * t.query_group_size
-                            + output_row % t.query_group_size
-                        )
-                        * ctx.stride_q_head
-                        + d
-                        if t.direct_output
-                        else partial_row * t.head_dim + d
-                    )
-                    fx.ptr_store(value, fx.add_offset(pout, offset))
-                if const_expr(not t.direct_output):  # noqa: SIM102
-                    if ctx.warp == 0 and ctx.half == 0:
-                        pmax[partial_row] = final[m * state_stride] * fx.Float32(
-                            1.0 / LOG2E
-                        )
-                        psum[partial_row] = denom
+                        if const_expr(t.merge_partitions and not direct):
+                            self.merge.publish(fx.add_offset(pout, offset), value)
+                        else:
+                            fx.ptr_store(value, fx.add_offset(pout, offset))
+                    if const_expr(not direct):  # noqa: SIM102
+                        if ctx.warp == 0 and ctx.half == 0:
+                            row_max = final[m * state_stride] * fx.Float32(1.0 / LOG2E)
+                            if const_expr(t.merge_partitions):
+                                self.merge.publish(
+                                    fx.add_offset(pmax, partial_row), row_max
+                                )
+                                self.merge.publish(
+                                    fx.add_offset(psum, partial_row), denom
+                                )
+                            else:
+                                pmax[partial_row] = row_max
+                                psum[partial_row] = denom
+
+        if const_expr(t.merged_output):
+            if ctx.task_count == 1:
+                store(True)
+            else:
+                store(False)
+                if const_expr(t.merge_partitions):
+                    self.merge.arrive()
+        else:
+            store(t.direct_output)
 
 
-class Gfx1250Pipeline:
+class Gfx1250Bf16WavePipeline:
+    """Wave pairs share two 16-row BF16 query tiles across 128-token pages.
+
+    Each wave covers half of every page for both tiles, so one K or V operand
+    feeds two WMMAs and a wave reads half the page from LDS. Half-wave h of QK
+    token tile i holds tokens 16 i + 8 h + r, which is how PV's 32-token P
+    operand splits its contraction, so P stays in registers. A pair merges its
+    two online-softmax states once, after the last page.
+    """
+
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
         self.mem = Gfx1250Memory(ctx)
+        self.merge = Gfx1250PartitionMerge(ctx, self.mem)
+
+    @flyc.jit
+    def _stage_next(self, token_base, begin, end, buffer):
+        # The prologue stages the second page.
+        if (token_base != begin) & (token_base + 128 < end):
+            self.mem.stage_bf16_page(token_base + 128, 1 - buffer)
+
+    @flyc.jit
+    def _wait(self, token_base, begin, end):
+        # The second page's K and V copies may stay in flight; a partial
+        # page's extra V copies only lengthen this wait.
+        if (token_base == begin) & (begin + 128 < end):
+            tdm_ops.tensor_wait(2)
+        else:
+            tdm_ops.tensor_wait(0)
+
+    def _operand(self, base, offset):
+        # Half-wave h holds eight-element chunks h and h + 2 of a 32-wide
+        # contraction slice; packed K and transposed V both space chunks
+        # 2048 bytes apart.
+        words = []
+        for j in range_constexpr(2):
+            pointer = fx.recast_iter(
+                fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16),
+                fx.add_offset(self.mem.base, base + offset + 4096 * j),
+            )
+            fragment = fx.Vector(
+                fx.ptr_load(pointer, result_type=fx.Vector.make_type(4, fx.Int32))
+            )
+            words.extend([fragment[w] for w in range_constexpr(4)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32).bitcast(fx.BFloat16)
+
+    def _page(self, token_base, begin, end, state, q_operands, uppers, bases, masked):
+        """Consume half a page; ``masked`` applies the causal and window bounds."""
+        t = self.t
+        # A positive scale commutes with the maximum and fuses into the
+        # exponent; masked scores stay -inf.
+        fused = t.softmax_scale > 0
+        scale = fx.Float32(t.softmax_scale * LOG2E)
+        buffer = ((token_base - begin) // 128) % 2
+        self._wait(token_base, begin, end)
+        gpu.barrier()
+        self._stage_next(token_base, begin, end, buffer)
+        # Selecting a precomputed base keeps every K/V load at a single base
+        # register plus an immediate offset.
+        kbase = (buffer == 0).select(bases[0][0], bases[0][1])
+        vbase = (buffer == 0).select(bases[1][0], bases[1][1])
+        tiles = [
+            [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range_constexpr(4)]
+            for _ in range_constexpr(2)
+        ]
+        for i in range_constexpr(4):
+            for d in range_constexpr(t.head_dim // 32):
+                k = self._operand(kbase, 8192 * d + 256 * i)
+                for m in range_constexpr(2):
+                    tiles[m][i] = Gfx1250Gemm.mma(
+                        k, q_operands[m][d], tiles[m][i], 32, True
+                    )
+        stride = 2 + t.head_dim // 16
+        next_state, p_operands, outs = [], [], []
+        for m in range_constexpr(2):
+            limit = uppers[m] - token_base
+            units = []
+            for i in range_constexpr(4):
+                for r in range_constexpr(8):
+                    value = tiles[m][i][r]
+                    if const_expr(not fused):
+                        value = value * scale
+                    if const_expr(masked):
+                        # Rows never mix, and padded rows are never stored.
+                        visible = fx.Int32(16 * i + r) < limit
+                        if const_expr(t.sliding_window > 0):
+                            visible = visible & (
+                                fx.Int32(16 * i + r) >= limit - t.sliding_window
+                            )
+                        value = visible.select(value, fx.Float32(float("-inf")))
+                    units.append(value)
+            maxima = units
+            while len(maxima) > 1:
+                maxima = [
+                    fx.maxnumf(maxima[k], maxima[k + 1])
+                    for k in range_constexpr(0, len(maxima), 2)
+                ]
+            tile_max = fx.maxnumf(maxima[0], maxima[0].shuffle_xor(16, t.WAVE))
+            if const_expr(fused):
+                tile_max = tile_max * scale
+            old_max = state[m * stride]
+            new_max = fx.maxnumf(old_max, tile_max)
+            safe_max = (new_max > fx.Float32(float("-inf"))).select(
+                new_max, fx.Float32(0.0)
+            )
+            corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
+            scores = fx.Vector.from_elements(units, dtype=fx.Float32)
+            if const_expr(fused):
+                exponent = fx.fma(
+                    scores,
+                    fx.Vector.from_elements([scale], dtype=fx.Float32).broadcast_to(32),
+                    fx.Vector.from_elements(
+                        [-fx.Float32(safe_max)], dtype=fx.Float32
+                    ).broadcast_to(32),
+                )
+            else:
+                exponent = scores - fx.Vector.from_elements(
+                    [fx.Float32(safe_max)], dtype=fx.Float32
+                ).broadcast_to(32)
+            probs = fx.Vector(fx.exp2(exponent, fastmath="afn"))
+            pairs = [
+                fx.Vector.from_elements([probs[k], probs[k + 1]], dtype=fx.Float32)
+                for k in range_constexpr(0, 32, 2)
+            ]
+            while len(pairs) > 1:
+                pairs = [
+                    pairs[k] + pairs[k + 1] for k in range_constexpr(0, len(pairs), 2)
+                ]
+            tile_sum = pairs[0][0] + pairs[0][1]
+            tile_sum = tile_sum + tile_sum.shuffle_xor(16, t.WAVE)
+            p_operands.append(
+                [
+                    fx.Vector.from_elements(
+                        [probs[16 * s + k] for k in range_constexpr(16)],
+                        dtype=fx.Float32,
+                    ).to(fx.BFloat16)
+                    for s in range_constexpr(2)
+                ]
+            )
+            next_state.append([new_max, state[m * stride + 1] * corr + tile_sum])
+            # Rescale the running accumulator before PV's fused adds.
+            factor = fx.Vector.from_elements([corr], dtype=fx.Float32).broadcast_to(8)
+            outs.append(
+                [
+                    state[m * stride + 2 + d] * factor
+                    for d in range_constexpr(t.head_dim // 16)
+                ]
+            )
+        for d in range_constexpr(t.head_dim // 16):
+            for s in range_constexpr(2):
+                v = self._operand(vbase, t.k_bytes + 8192 * s + 256 * d)
+                for m in range_constexpr(2):
+                    outs[m][d] = Gfx1250Gemm.mma(
+                        v, p_operands[m][s], outs[m][d], 32, True
+                    )
+        return next_state[0] + outs[0] + next_state[1] + outs[1]
 
     @flyc.jit
     def run(self):
@@ -856,15 +1024,550 @@ class Gfx1250Pipeline:
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
-        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
         self.mem.allocate()
-        if const_expr(t.q_tiles == t.m_tiles):
-            self.mem.stage_query()
         begin, end = (
             ctx.planned_start * KV_COMPUTE_BLOCK,
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
+        self.mem.stage_bf16_page(begin, fx.Int32(0))
+        # Wave 2 g + p takes tokens [64 p, 64 p + 64) of each page for tiles
+        # 2 g and 2 g + 1. Its slot 0 holds tile 2 g + p, the one it stores.
+        part = ctx.warp % 2
+        query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
+        # Pages ending at or before the first query's bound mask nothing.
+        unmasked_end = ctx.planned_context - t.query_length + ctx.query_begin + 1
+        q_operands, uppers = [], []
+        for m in range_constexpr(2):
+            row = (ctx.warp - part + (part ^ m)) * 16 + ctx.lane16
+            qbase = (
+                fx.Int64(ctx.planned_seq) * t.query_length
+                + ctx.query_begin
+                + row // t.query_group_size
+            ) * ctx.stride_q_row + (
+                ctx.kv_h * t.query_group_size + row % t.query_group_size
+            ) * ctx.stride_q_head
+            operands = []
+            for d in range_constexpr(t.head_dim // 32):
+                values = []
+                for j in range_constexpr(2):
+                    fragment = fx.Vector.filled(8, 0.0, fx.BFloat16)
+                    if row < t.rows:
+                        fragment = fx.Vector(
+                            fx.ptr_load(
+                                fx.add_offset(
+                                    query, qbase + d * 32 + ctx.half * 8 + j * 16
+                                ),
+                                result_type=fx.Vector.make_type(8, t.q_dtype),
+                            )
+                        ).to(fx.BFloat16)
+                    values.extend([fragment[i] for i in range_constexpr(8)])
+                operands.append(fx.Vector.from_elements(values, dtype=fx.BFloat16))
+            q_operands.append(operands)
+            # This lane's tokens are page offsets 64 part + 8 half + c for
+            # constant c.
+            uppers.append(
+                unmasked_end + row // t.query_group_size - 8 * ctx.half - 64 * part
+            )
+        # After the query loads, which the first page's QK waits for too.
+        if begin + 128 < end:
+            self.mem.stage_bf16_page(begin + 128, fx.Int32(1))
+        pages = (end - begin) // 128
+        split = (
+            begin
+            + fx.max(fx.min((unmasked_end - begin) // 128, pages), fx.Int32(0)) * 128
+        )
+        lanes = t.q_bytes + ctx.half * 2048 + ctx.lane16 * 16
+        kbase = lanes + part * 64 * 16
+        vbase = lanes + part * 8 * 2048
+        bases = ((kbase, kbase + t.kv_stride), (vbase, vbase + t.kv_stride))
+        initial = []
+        for _ in range_constexpr(2):
+            initial.extend([fx.Float32(float("-inf")), fx.Float32(0.0)])
+            initial.extend(
+                [
+                    fx.Vector.filled(8, 0.0, fx.Float32)
+                    for _ in range_constexpr(t.head_dim // 16)
+                ]
+            )
+        head, head_state = begin, initial
+        if const_expr(t.sliding_window > 0):
+            # Pages starting before the last query's window edge are masked.
+            window_begin = (
+                ctx.planned_context
+                - t.query_length
+                + ctx.query_begin
+                + t.query_length // t.query_splits
+                - t.sliding_window
+            )
+            head = (
+                begin
+                + fx.max(
+                    fx.min((window_begin - begin + 127) // 128, pages), fx.Int32(0)
+                )
+                * 128
+            )
+            split = fx.max(split, head)
+            for token_i, state in range(begin, head, 128, init=initial):
+                next_state = self._page(
+                    fx.Int32(token_i),
+                    begin,
+                    end,
+                    state,
+                    q_operands,
+                    uppers,
+                    bases,
+                    True,
+                )
+                head_state = yield next_state
+        for token_i, state in range(head, split, 128, init=head_state):
+            next_state = self._page(
+                fx.Int32(token_i), begin, end, state, q_operands, uppers, bases, False
+            )
+            interior = yield next_state
+        for token_i, state in range(split, end, 128, init=interior):
+            next_state = self._page(
+                fx.Int32(token_i), begin, end, state, q_operands, uppers, bases, True
+            )
+            final = yield next_state
+        # Pass slot 1 to the partner through the buffer the last page left
+        # unused; nothing reads or stages it any more.
+        stride = 2 + t.head_dim // 16
+        mine, sent = final[:stride], final[stride:]
+        area = (1 - fx.max(pages - 1, fx.Int32(0)) % 2) * t.kv_stride
+        slot_bytes = (t.head_dim // 16) * t.WAVE * 32 + t.WAVE * 8
+        stats = (t.head_dim // 16) * t.WAVE * 32 + ctx.lane * 8
+        outgoing = area + (ctx.warp ^ 1) * slot_bytes
+        for d in range_constexpr(t.head_dim // 16):
+            self.mem.store(
+                outgoing + (d * t.WAVE + ctx.lane) * 32, sent[2 + d], fx.Float32
+            )
+        self.mem.store(
+            outgoing + stats,
+            fx.Vector.from_elements([sent[0], sent[1]], dtype=fx.Float32),
+            fx.Float32,
+        )
+        gpu.barrier()
+        incoming = area + ctx.warp * slot_bytes
+        partner = self.mem.load(incoming + stats, fx.Float32, 2)
+        new_max = fx.maxnumf(mine[0], fx.Float32(partner[0]))
+        safe_max = (new_max > fx.Float32(float("-inf"))).select(
+            new_max, fx.Float32(0.0)
+        )
+        own = fx.Float32(fx.exp2(mine[0] - safe_max, fastmath="afn"))
+        other = fx.Float32(fx.exp2(fx.Float32(partner[0]) - safe_max, fastmath="afn"))
+        final = [new_max, mine[1] * own + fx.Float32(partner[1]) * other]
+        for d in range_constexpr(t.head_dim // 16):
+            final.append(
+                mine[2 + d]
+                * fx.Vector.from_elements([own], dtype=fx.Float32).broadcast_to(8)
+                + self.mem.load(incoming + (d * t.WAVE + ctx.lane) * 32, fx.Float32, 8)
+                * fx.Vector.from_elements([other], dtype=fx.Float32).broadcast_to(8)
+            )
+        row = ctx.warp * 16 + ctx.lane16
+        slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
+        output_row = ctx.query_begin * t.query_group_size + row
+        partial_row = slot * (t.rows * t.query_splits) + output_row
+        denom = final[1]
+        inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+
+        def store(direct):
+            # Direct stores write final rows; other tasks store packed partials.
+            pout = fx.recast_iter(
+                t.q_dtype,
+                ctx.output_ptr if t.merged_output and direct else ctx.pout_ptr,
+            )
+            pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+            psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+            if row < t.rows:
+                for d in range_constexpr(t.head_dim // 16):
+                    dim = d * 16 + ctx.half * 8
+                    value = (
+                        final[2 + d]
+                        * fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
+                            8
+                        )
+                    ).to(t.q_dtype)
+                    target = fx.add_offset(
+                        pout,
+                        (
+                            self.merge.output_offset(output_row, dim)
+                            if direct
+                            else partial_row * t.head_dim + dim
+                        ),
+                    )
+                    if const_expr(t.merge_partitions and not direct):
+                        self.merge.publish(target, value)
+                    else:
+                        fx.ptr_store(value, target)
+                if const_expr(not direct):  # noqa: SIM102
+                    if ctx.half == 0:
+                        row_max = final[0] * fx.Float32(1.0 / LOG2E)
+                        if const_expr(t.merge_partitions):
+                            self.merge.publish(
+                                fx.add_offset(pmax, partial_row), row_max
+                            )
+                            self.merge.publish(fx.add_offset(psum, partial_row), denom)
+                        else:
+                            pmax[partial_row] = row_max
+                            psum[partial_row] = denom
+
+        if const_expr(t.merged_output):
+            if ctx.task_count == 1:
+                store(True)
+            else:
+                store(False)
+                if const_expr(t.merge_partitions):
+                    self.merge.arrive()
+        else:
+            store(t.direct_output)
+
+
+class Gfx1250WavePipeline:
+    """Each wave owns one 16-row FP8 query tile across every 128-token page.
+
+    QK reads K rows in PV's contraction order: accumulator row 8 h + r of
+    token tile i holds token 32 (i // 2) + 16 h + 8 (i % 2) + r, where half-wave
+    h's P operand keeps it. P stays in registers, and the double-buffered page
+    is the only LDS state the waves share.
+    """
+
+    def __init__(self, ctx):
+        self.ctx, self.t = ctx, ctx.traits
+        self.mem = Gfx1250Memory(ctx)
+        self.merge = Gfx1250PartitionMerge(ctx, self.mem)
+
+    @flyc.jit
+    def _stage_next(self, token_base, end, buffer):
+        if token_base + self.t.TOKENS < end:
+            self.mem.stage_kv(token_base + self.t.TOKENS, 1 - buffer)
+
+    def _page(self, token_base, begin, end, state, q_operand, scale, upper, masked):
+        """Consume one page; ``masked`` applies the causal and length bounds."""
+        ctx, t = self.ctx, self.t
+        # Unmasked scores are finite and the row scale is nonnegative, so it
+        # commutes with the maximum and fuses into the exponent.
+        fused = not masked and t.per_token_kv and t.softmax_scale >= 0
+        buffer = ((token_base - begin) // t.TOKENS) % 2
+        tdm_ops.tensor_wait(0)
+        fx.rocdl.s_wait_asynccnt(0)
+        gpu.barrier()
+        kv_off = t.q_bytes + buffer * t.kv_stride
+        self._stage_next(token_base, end, buffer)
+        # K, then V per-token scales; piece s of this lane's 16-token chunks
+        # starts at token 16 half + 8 (s ^ half).
+        scales = kv_off + t.k_bytes + t.v_bytes
+        piece = [16 * ctx.half + 8 * (s ^ ctx.half) for s in range_constexpr(2)]
+        limit = [upper - token_base - 8 * (s ^ ctx.half) for s in range_constexpr(2)]
+        if const_expr(t.per_token_kv):
+            vscale = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
+            vmax = fx.Float32(self.mem.load(vscale + ctx.lane * 4, fx.Float32)[0])
+            for k in range_constexpr(1, t.TOKENS // t.WAVE):
+                vmax = fx.maxnumf(
+                    vmax,
+                    fx.Float32(
+                        self.mem.load(vscale + (ctx.lane + k * t.WAVE) * 4, fx.Float32)[
+                            0
+                        ]
+                    ),
+                )
+            for shift in (16, 8, 4, 2, 1):
+                vmax = fx.maxnumf(vmax, vmax.shuffle_xor(shift, t.WAVE))
+            vfactor = vmax * fx.Float32(1.0 / t.FP8_MAX)
+            # Empty planned tails carry no new mass. Keep the prior scale
+            # so their zero V contribution preserves the output.
+            vfactor = (vfactor > 0.0).select(vfactor, fx.Float32(state[-1]))
+            vnorm = fx.Float32(rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20))))
+        else:
+            value_scale = fx.recast_iter(fx.Float32, ctx.value_scale_ptr)
+            vfactor = fx.Float32(value_scale[0]) * fx.Float32(1.0 / t.FP8_MAX)
+            # A zero scalar V scale must produce zero without 0 * inf.
+            vnorm = fx.Float32(
+                rcp_f32((vfactor != 0.0).select(vfactor, fx.Float32(1.0)))
+            )
+        units = []
+        for i in range_constexpr(t.TOKENS // 16):
+            first, s = 32 * (i // 2), i % 2
+            # Rows 0-7 and 8-15 read opposite chunk halves: distinct LDS banks.
+            row_half = ctx.lane16 // 8
+            token = first + 16 * row_half + 8 * (s ^ row_half) + ctx.lane16 % 8
+            words = []
+            for j in range_constexpr(4):
+                frag = self.mem.load(
+                    kv_off + (ctx.half + 2 * j) * t.TOKENS * 16 + token * 16,
+                    fx.Int32,
+                    4,
+                )
+                words.extend([frag[k] for k in range_constexpr(4)])
+            scores = Gfx1250Gemm.mma(
+                fx.Vector.from_elements(words, dtype=fx.Int32),
+                q_operand,
+                fx.Vector.filled(8, 0.0, fx.Float32),
+                128,
+            )
+            if const_expr(t.per_token_kv):
+                ks = self.mem.load(scales + (first + piece[s]) * 4, fx.Float32, 8)
+            for r in range_constexpr(8):
+                if const_expr(fused):
+                    value = scores[r] * fx.Float32(ks[r])
+                else:
+                    value = scores[r] * scale
+                    if const_expr(t.per_token_kv):
+                        value = value * fx.Float32(ks[r])
+                if const_expr(masked):
+                    # Rows never mix, and padded rows are never stored.
+                    value = (fx.Int32(first + r) < limit[s]).select(
+                        value, fx.Float32(float("-inf"))
+                    )
+                units.append(value)
+        scores = fx.Vector.from_elements(units, dtype=fx.Float32)
+        tile_max = scores.reduce(ReductionOp.MAX)
+        tile_max = fx.maxnumf(tile_max, tile_max.shuffle_xor(16, t.WAVE))
+        if const_expr(fused):
+            tile_max = tile_max * scale
+        old_max = state[0]
+        new_max = fx.maxnumf(old_max, tile_max)
+        safe_max = (new_max > fx.Float32(float("-inf"))).select(
+            new_max, fx.Float32(0.0)
+        )
+        corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
+        tokens = t.TOKENS // 2
+        if const_expr(fused):
+            # exp2(scale * u - max + log2(vnorm)) is the probability times
+            # vnorm, which P needs; the denominator divides vnorm back out.
+            probs = fx.Vector(
+                fx.exp2(
+                    fx.fma(
+                        scores,
+                        fx.Vector.from_elements([scale], dtype=fx.Float32).broadcast_to(
+                            tokens
+                        ),
+                        fx.Vector.from_elements(
+                            [
+                                fx.Float32(fx.log2(vnorm, fastmath="afn"))
+                                - fx.Float32(safe_max)
+                            ],
+                            dtype=fx.Float32,
+                        ).broadcast_to(tokens),
+                    ),
+                    fastmath="afn",
+                )
+            )
+        else:
+            probs = fx.Vector(
+                fx.exp2(
+                    scores
+                    - fx.Vector.from_elements(
+                        [fx.Float32(safe_max)], dtype=fx.Float32
+                    ).broadcast_to(tokens),
+                    fastmath="afn",
+                )
+            )
+        pairs = [
+            fx.Vector.from_elements([probs[k], probs[k + 1]], dtype=fx.Float32)
+            for k in range_constexpr(0, tokens, 2)
+        ]
+        while len(pairs) > 1:
+            pairs = [pairs[k] + pairs[k + 1] for k in range_constexpr(0, len(pairs), 2)]
+        tile_sum = pairs[0][0] + pairs[0][1]
+        tile_sum = tile_sum + tile_sum.shuffle_xor(16, t.WAVE)
+        if const_expr(fused):
+            tile_sum = tile_sum * fx.maxnumf(vfactor, fx.Float32(1e-20))
+        pieces = []
+        for i in range_constexpr(t.TOKENS // 16):
+            first, s = 32 * (i // 2), i % 2
+            if const_expr(fused):
+                vs = self.mem.load(
+                    scales + (t.TOKENS + first + piece[s]) * 4, fx.Float32, 8
+                )
+                pvalues = [
+                    probs[i * 8 + r] * fx.Float32(vs[r]) for r in range_constexpr(8)
+                ]
+            elif const_expr(t.per_token_kv):
+                vs = self.mem.load(
+                    scales + (t.TOKENS + first + piece[s]) * 4, fx.Float32, 8
+                )
+                pvalues = [
+                    probs[i * 8 + r] * fx.Float32(vs[r]) * vnorm
+                    for r in range_constexpr(8)
+                ]
+            else:
+                pvalues = [
+                    probs[i * 8 + r] * fx.Float32(t.FP8_MAX) for r in range_constexpr(8)
+                ]
+            pieces.append(
+                self.mem.fp8(fx.Vector.from_elements(pvalues, dtype=fx.Float32))
+            )
+        # Half-wave 1 holds each chunk's upper piece in its even token tile.
+        lower = ctx.half == 0
+        words = []
+        for i in range_constexpr(0, t.TOKENS // 16, 2):
+            for w in range_constexpr(2):
+                words.append(lower.select(pieces[i][w], pieces[i + 1][w]))
+            for w in range_constexpr(2):
+                words.append(lower.select(pieces[i + 1][w], pieces[i][w]))
+        p_operand = fx.Vector.from_elements(words, dtype=fx.Int32)
+        # Outputs remain normalized by the previous V factor. Rescale
+        # before WMMA to fuse its accumulation.
+        factor = fx.Vector.from_elements(
+            [corr * state[-1] * vnorm], dtype=fx.Float32
+        ).broadcast_to(8)
+        next_state = [new_max, state[1] * corr + tile_sum]
+        for d in range_constexpr(t.head_dim // 16):
+            v_operand = self.mem.packed_operand(
+                kv_off + t.k_bytes + d * 16 * 16,
+                t.head_dim,
+                t.TOKENS,
+                ctx.lane16,
+                ctx.half,
+            )
+            next_state.append(
+                Gfx1250Gemm.mma(v_operand, p_operand, state[2 + d] * factor, 128)
+            )
+        next_state.append(vfactor)
+        return next_state
+
+    @flyc.jit
+    def run(self):
+        ctx, t = self.ctx, self.t
+        ctx.tid = fx.Int32(gpu.thread_id("x"))
+        ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
+        ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
+        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
+            t.query_length // t.query_splits
+        )
+        self.mem.allocate()
+        begin, end = (
+            ctx.planned_start * KV_COMPUTE_BLOCK,
+            ctx.planned_end * KV_COMPUTE_BLOCK,
+        )
+        # The first page's DMA overlaps Q staging; the regions are disjoint.
         self.mem.stage_kv(begin, fx.Int32(0))
+        self.mem.stage_query()
+        row = ctx.warp * 16 + ctx.lane16
+        gpu.barrier()
+        q_operand = self.mem.operand(
+            ctx.warp * 16 * t.q_stride, t.q_stride, 128, ctx.lane16, ctx.half
+        )
+        scale = fx.Float32(
+            self.mem.load(row * t.q_stride + t.head_dim, fx.Float32)[0]
+        ) * fx.Float32(t.softmax_scale * LOG2E)
+        if const_expr(not t.per_token_kv):
+            key_scale = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
+            scale = scale * fx.Float32(key_scale[0])
+        # Pages ending at or before the first query's bound mask nothing.
+        unmasked_end = ctx.planned_context - t.query_length + ctx.query_begin + 1
+        split = (
+            begin
+            + fx.max(
+                fx.min((unmasked_end - begin) // t.TOKENS, (end - begin) // t.TOKENS),
+                fx.Int32(0),
+            )
+            * t.TOKENS
+        )
+        # This lane's tokens are page offsets 16 half + c for constant c.
+        upper = unmasked_end + row // t.query_group_size - 16 * ctx.half
+        initial = [fx.Float32(float("-inf")), fx.Float32(0.0)]
+        initial.extend(
+            [
+                fx.Vector.filled(8, 0.0, fx.Float32)
+                for _ in range_constexpr(t.head_dim // 16)
+            ]
+        )
+        initial.append(fx.Float32(1.0))
+        for token_i, state in range(begin, split, t.TOKENS, init=initial):
+            next_state = self._page(
+                fx.Int32(token_i), begin, end, state, q_operand, scale, upper, False
+            )
+            interior = yield next_state
+        for token_i, state in range(split, end, t.TOKENS, init=interior):
+            next_state = self._page(
+                fx.Int32(token_i), begin, end, state, q_operand, scale, upper, True
+            )
+            final = yield next_state
+        slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
+        output_row = ctx.query_begin * t.query_group_size + row
+        partial_row = slot * (t.rows * t.query_splits) + output_row
+        denom = final[1]
+        inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+
+        def store(direct):
+            # Direct stores write final rows; other tasks store packed partials.
+            pout = fx.recast_iter(
+                t.q_dtype,
+                ctx.output_ptr if t.merged_output and direct else ctx.pout_ptr,
+            )
+            pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+            psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+            if row < t.rows:
+                for d in range_constexpr(t.head_dim // 16):
+                    dim = d * 16 + ctx.half * 8
+                    value = (
+                        final[2 + d]
+                        * fx.Vector.from_elements(
+                            [fx.Float32(inv * final[-1])], dtype=fx.Float32
+                        ).broadcast_to(8)
+                    ).to(t.q_dtype)
+                    target = fx.add_offset(
+                        pout,
+                        (
+                            self.merge.output_offset(output_row, dim)
+                            if direct
+                            else partial_row * t.head_dim + dim
+                        ),
+                    )
+                    if const_expr(t.merge_partitions and not direct):
+                        self.merge.publish(target, value)
+                    else:
+                        fx.ptr_store(value, target)
+                if const_expr(not direct):  # noqa: SIM102
+                    if ctx.half == 0:
+                        row_max = final[0] * fx.Float32(1.0 / LOG2E)
+                        if const_expr(t.merge_partitions):
+                            self.merge.publish(
+                                fx.add_offset(pmax, partial_row), row_max
+                            )
+                            self.merge.publish(fx.add_offset(psum, partial_row), denom)
+                        else:
+                            pmax[partial_row] = row_max
+                            psum[partial_row] = denom
+
+        if const_expr(t.merged_output):
+            if ctx.task_count == 1:
+                store(True)
+            else:
+                store(False)
+                if const_expr(t.merge_partitions):
+                    self.merge.arrive()
+        else:
+            store(t.direct_output)
+
+
+class Gfx1250Pipeline:
+    def __init__(self, ctx):
+        self.ctx, self.t = ctx, ctx.traits
+        self.mem = Gfx1250Memory(ctx)
+        self.merge = Gfx1250PartitionMerge(ctx, self.mem)
+
+    @flyc.jit
+    def run(self):
+        ctx, t = self.ctx, self.t
+        ctx.tid = fx.Int32(gpu.thread_id("x"))
+        ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
+        ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
+        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
+            t.query_length // t.query_splits
+        )
+        self.mem.allocate()
+        begin, end = (
+            ctx.planned_start * KV_COMPUTE_BLOCK,
+            ctx.planned_end * KV_COMPUTE_BLOCK,
+        )
+        # The first page's DMA overlaps Q staging; the regions are disjoint.
+        self.mem.stage_kv(begin, fx.Int32(0))
+        if const_expr(t.q_tiles == t.m_tiles):
+            self.mem.stage_query()
         # Per-M-tile state: maximum, denominator, then wave-owned D fragments.
         vh_count = t.head_dim // 64
         initial = []
@@ -1214,10 +1917,11 @@ class Gfx1250Pipeline:
                                 [fx.Float32(vfactor)], dtype=fx.Float32
                             ).broadcast_to(8)
                         )
-                # The next iteration's barrier retires the final M-tile reads
-                # before a double buffer is reused. Intra-iteration reuse and
-                # the single-buffer staging path still need an explicit barrier.
-                if const_expr(m + 1 < t.m_tiles or t.buffers == 1):
+                # The next M-tile writes P and statistics only after its max
+                # barrier, which every wave reaches after these reads. The next
+                # iteration's barrier likewise retires them before a double
+                # buffer is reused; single-buffer staging still needs one here.
+                if const_expr(t.buffers == 1 and m + 1 == t.m_tiles):
                     gpu.barrier()
             if const_expr(t.buffers == 1):  # noqa: SIM102
                 if token_base + t.TOKENS < end:
@@ -1225,52 +1929,64 @@ class Gfx1250Pipeline:
             if const_expr(t.packed_lds):
                 next_state.append(vfactor)
             final = yield next_state
-        pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
-        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
-        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
-        slot = fx.Int64(ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
-            gpu.block_id("x")
-        )
-        for m in range_constexpr(t.m_tiles):
-            row = m * 16 + ctx.lane16
-            output_row = ctx.query_begin * t.query_group_size + row
-            partial_row = slot * (t.rows * t.query_splits) + output_row
-            denom = final[m * state_stride + 1]
-            inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
-            if row < t.rows:
-                for vh in range_constexpr(vh_count):
-                    d = vh * 64 + ctx.warp * 16 + ctx.half * 8
-                    value = (
-                        final[m * state_stride + 2 + vh]
-                        * fx.Vector.from_elements(
-                            [fx.Float32(inv * final[-1] if t.packed_lds else inv)],
-                            dtype=fx.Float32,
-                        ).broadcast_to(8)
-                    ).to(t.q_dtype)
-                    fx.ptr_store(
-                        value,
-                        fx.add_offset(
+        slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
+
+        def store(direct):
+            # Direct stores write final rows; other tasks store packed partials.
+            pout = fx.recast_iter(
+                t.q_dtype,
+                ctx.output_ptr if t.merged_output and direct else ctx.pout_ptr,
+            )
+            pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+            psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+            for m in range_constexpr(t.m_tiles):
+                row = m * 16 + ctx.lane16
+                output_row = ctx.query_begin * t.query_group_size + row
+                partial_row = slot * (t.rows * t.query_splits) + output_row
+                denom = final[m * state_stride + 1]
+                inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+                if row < t.rows:
+                    for vh in range_constexpr(vh_count):
+                        d = vh * 64 + ctx.warp * 16 + ctx.half * 8
+                        value = (
+                            final[m * state_stride + 2 + vh]
+                            * fx.Vector.from_elements(
+                                [fx.Float32(inv * final[-1] if t.packed_lds else inv)],
+                                dtype=fx.Float32,
+                            ).broadcast_to(8)
+                        ).to(t.q_dtype)
+                        target = fx.add_offset(
                             pout,
                             (
-                                (
-                                    fx.Int64(ctx.planned_seq) * t.query_length
-                                    + output_row // t.query_group_size
-                                )
-                                * ctx.stride_q_row
-                                + (
-                                    ctx.kv_h * t.query_group_size
-                                    + output_row % t.query_group_size
-                                )
-                                * ctx.stride_q_head
-                                + d
-                                if t.direct_output
+                                self.merge.output_offset(output_row, d)
+                                if direct
                                 else partial_row * t.head_dim + d
                             ),
-                        ),
-                    )
-                if const_expr(not t.direct_output):  # noqa: SIM102
-                    if ctx.warp == 0 and ctx.half == 0:
-                        pmax[partial_row] = final[m * state_stride] * fx.Float32(
-                            1.0 / LOG2E
                         )
-                        psum[partial_row] = denom
+                        if const_expr(t.merge_partitions and not direct):
+                            self.merge.publish(target, value)
+                        else:
+                            fx.ptr_store(value, target)
+                    if const_expr(not direct):  # noqa: SIM102
+                        if ctx.warp == 0 and ctx.half == 0:
+                            row_max = final[m * state_stride] * fx.Float32(1.0 / LOG2E)
+                            if const_expr(t.merge_partitions):
+                                self.merge.publish(
+                                    fx.add_offset(pmax, partial_row), row_max
+                                )
+                                self.merge.publish(
+                                    fx.add_offset(psum, partial_row), denom
+                                )
+                            else:
+                                pmax[partial_row] = row_max
+                                psum[partial_row] = denom
+
+        if const_expr(t.merged_output):
+            if ctx.task_count == 1:
+                store(True)
+            else:
+                store(False)
+                if const_expr(t.merge_partitions):
+                    self.merge.arrive()
+        else:
+            store(t.direct_output)

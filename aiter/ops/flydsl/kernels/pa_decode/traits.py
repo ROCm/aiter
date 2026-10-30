@@ -767,11 +767,19 @@ class Gfx1250Traits:
     compute_dtype: str = "fp8"
     direct_output: bool = False
     query_splits: int = 1
+    merge_partitions: bool = False
+    # Workgroups per sequence cluster that merges its partitions; 0 disables.
+    cluster_merge: int = 0
 
     WAVE = 32
     NWARP = 4
     BLOCK_THREADS = NWARP * WAVE
     FP8_MAX = 448.0
+
+    @property
+    def merged_output(self):
+        # Tasks of multi-partition sequences merge partials in the tile kernel.
+        return self.merge_partitions or self.cluster_merge > 0
 
     @property
     def bf16_packed(self):
@@ -918,15 +926,31 @@ class Gfx1250Traits:
         return 16 * self.v_stride
 
     @property
-    def async_page(self):
-        # Two packed buffers overlap page DMA with QK/softmax/PV. Keep these
-        # measured specializations separate from windowed and single-M D128 tiles.
+    def wave_query_tiles(self):
+        # One D128 query tile per wave keeps scores, P and output in registers:
+        # softmax needs no cross-wave exchange, only the page buffers are shared.
         return (
-            self.packed_lds
-            and (self.head_dim == 256 or self.fp8_multi_tile)
-            and self.block_size == 128
-            and self.sliding_window == 0
+            self.fp8_multi_tile
+            and self.m_tiles == self.NWARP
+            and self.head_dim == 128
+            and self.async_page
         )
+
+    @property
+    def bf16_wave_query_tiles(self):
+        # Four D128 query tiles over BF16 page128 caches: wave pairs share two
+        # tiles, P stays in registers, and a page needs only its buffer barrier.
+        return (
+            self.bf16_page128_packed
+            and self.m_tiles == self.NWARP
+            and self.head_dim == 128
+        )
+
+    @property
+    def async_page(self):
+        # Two packed buffers overlap page DMA and asynchronous per-token scale
+        # copies with QK/softmax/PV. Windowed tiles keep synchronous staging.
+        return self.packed_lds and self.block_size == 128 and self.sliding_window == 0
 
     @property
     def page16_async_scales(self):

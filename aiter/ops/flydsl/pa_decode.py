@@ -9,6 +9,8 @@ MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
 K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -17,15 +19,27 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
-from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_kernel import (
+    CLUSTER_PARTITIONS,
+    KV_COMPUTE_BLOCK,
+    MERGE_HEAD_DIM,
+    MERGE_PARTITIONS,
+    compile_pa_decode_tile,
+)
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     DUAL_REGISTER_PARTITIONS,
     REGISTER_PARTITIONS,
+    SPLIT_GROUPS,
+    SPLIT_PARTITIONS,
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+
+# AITER_FLYDSL_PA_CLUSTER_MERGE=0 keeps the shared reducer for plans that
+# would otherwise merge partitions within workgroup clusters.
+_CLUSTER_MERGE = os.environ.get("AITER_FLYDSL_PA_CLUSTER_MERGE", "1") != "0"
 
 
 def _flydsl_pointer_dtype(dtype: torch.dtype):
@@ -108,17 +122,28 @@ def launch_pa_decode_ps_reduce(
     )
     ctas = batch * kv_heads * rows
     groups, num_xcds = 1, 0
-    if dual:
-        # Partition groups fill the CTA while the grid stays within 16 waves
-        # per CU. D128 sequences averaging at most 32 partitions keep one.
+    if not dual and arch == "gfx1250" and partitions > SPLIT_PARTITIONS:
+        # Register rungs above 16 partitions split their loads over groups,
+        # within the same wave budget as the dual-mode CTA.
         group_waves = head_size // wave // (2 if pairs else 1)
         budget = max_cta_waves * props.multi_processor_count
-        if head_size != 128 or exp_sums.shape[1] > DUAL_REGISTER_PARTITIONS * batch:
-            while (
-                2 * groups * group_waves <= max_cta_waves
-                and 2 * groups * group_waves * ctas <= budget
-            ):
-                groups *= 2
+        while (
+            2 * groups <= SPLIT_GROUPS
+            and 2 * groups * group_waves <= max_cta_waves
+            and 2 * groups * group_waves * ctas <= budget
+        ):
+            groups *= 2
+    if dual:
+        # Partition groups fill the CTA while the grid stays within 16 waves
+        # per CU. D128 sequences averaging at most 32 partitions keep one, or
+        # on gfx1250 the four that split their 32-partition rung.
+        group_waves = head_size // wave // (2 if pairs else 1)
+        budget = max_cta_waves * props.multi_processor_count
+        max_groups = max_cta_waves // group_waves
+        if head_size == 128 and exp_sums.shape[1] <= DUAL_REGISTER_PARTITIONS * batch:
+            max_groups = SPLIT_GROUPS if arch == "gfx1250" else 1
+        while 2 * groups <= max_groups and 2 * groups * group_waves * ctas <= budget:
+            groups *= 2
         per_seq = rows * kv_heads
         if (
             arch != "gfx1250"
@@ -232,9 +257,16 @@ def pa_decode(
     the device CU count for the gfx950 head-256 pipe shapes and twice that
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
-    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, a cap
-    of one writes output directly when sinks are absent and query/output strides
-    match. Other plans use packed scratch and reduction.
+    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, when
+    sinks are absent and query/output strides match, a cap of one writes output
+    directly. So do plans with one task slot per sequence (capacity equal to
+    the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
+    that still own several tasks merge them in the tile kernel using the plan's
+    arrival counters. Otherwise, when P = min(partition bound, max_partitions)
+    is in [2, 16], P CTAs per sequence fit the plan capacity or two per CU,
+    and the sequences times KV heads stay within 15 per 16 CUs (head_dim <=
+    512), each sequence's tasks run as one cluster of P workgroups that merges
+    them on chip. Other plans use packed scratch and the separate reducer.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -600,11 +632,60 @@ def pa_decode(
     pmax = max_logits
     psum = exp_sums
     pout = temporary_output
+    # Bound this call's partitions without shrinking the reusable plan or scratch.
+    max_partitions = min(
+        num_partitions,
+        work_plan.capacity,
+        max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
+    )
+    if sliding_window > 0:
+        # Bound the unaligned MTP window without shrinking the reusable plan.
+        window_tiles = (
+            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+        ) // KV_COMPUTE_BLOCK + 1
+        max_partitions = min(max_partitions, window_tiles)
+    # gfx1250 tile kernels write final output for one-partition plans and for
+    # plans with one task slot per sequence: single tasks store directly, and
+    # sequences given slots freed by empty ones merge in their last-arriving
+    # CTA. That merge costs two device-scope round trips (sparse decode 64
+    # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
+    # within workgroup clusters instead.
     direct_output = (
         arch == "gfx1250"
-        and num_partitions == 1
         and sinks is None
         and output.stride() == query.stride()
+        and (
+            num_partitions == 1
+            or (
+                work_plan.capacity == num_seqs
+                and work_plan.arrival_counters is not None
+                and max_partitions <= MERGE_PARTITIONS
+                and head_dim <= MERGE_HEAD_DIM
+            )
+        )
+    )
+    one_partition_output = direct_output and num_partitions == 1
+    num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
+    # Other gfx1250 plans merge each sequence's tasks, at most P of them, in a
+    # cluster of P CTAs. Its idle CTAs wait at the cluster barrier, so the grid
+    # stays within the plan's or the default two-per-CU budget. gfx1250 keeps
+    # 15 clusters resident per 16 CUs (240 on 256 CUs) whatever their size;
+    # later clusters run as a second wave, which is slower than the reducer.
+    cluster_merge = (
+        max_partitions
+        if (
+            _CLUSTER_MERGE
+            and arch == "gfx1250"
+            and not direct_output
+            and sinks is None
+            and output.stride() == query.stride()
+            and 2 <= max_partitions <= CLUSTER_PARTITIONS
+            and num_seqs * max_partitions
+            <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
+            and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
+            and head_dim <= MERGE_HEAD_DIM
+        )
+        else 0
     )
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
@@ -623,9 +704,7 @@ def pa_decode(
             block_size=int(block_size),
             num_seqs=num_seqs,
             num_kv_heads=num_kv_heads,
-            num_compute_units=torch.cuda.get_device_properties(
-                dev
-            ).multi_processor_count,
+            num_compute_units=num_compute_units,
             num_partitions=num_partitions,
             softmax_scale=softmax_scale,
             query_dtype=query_dtype,
@@ -640,6 +719,7 @@ def pa_decode(
             sliding_window=sliding_window,
             direct_output=direct_output,
             trans_k=trans_k,
+            cluster_merge=cluster_merge,
         )
 
     total_rows = query_length * query_group_size
@@ -695,18 +775,31 @@ def pa_decode(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+    merge_args = ()
+    if arch == "gfx1250":
+        merged = direct_output and not one_partition_output
+        merge_args = (
+            ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
+            ptr_arg(work_plan.reduce_info, fx.Int32),
+            (
+                ptr_arg(work_plan.arrival_counters, fx.Int32)
+                if merged
+                else flyc.from_c_void_p(fx.Int32, 0)
+            ),
+        )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
         _run_compiled(
             compiled["launch"],
             (
                 ptr_arg(work_plan.reduce_info, fx.Float32)
-                if direct_output
+                if one_partition_output
                 else ptr_arg(pmax, fx.Float32)
             ),
             ptr_arg(psum, fx.Float32),
             ptr_arg(
-                output if direct_output else pout, _flydsl_pointer_dtype(pout.dtype)
+                output if one_partition_output else pout,
+                _flydsl_pointer_dtype(pout.dtype),
             ),
             ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
             ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
@@ -731,25 +824,14 @@ def pa_decode(
             int(query.stride(1)),
             ptr_arg(work_plan.work_info, fx.Int32),
             work_plan.capacity,
+            *merge_args,
             s,
         )
-        if direct_output:
+        if direct_output or cluster_merge:
             return
         output_5d = output.reshape(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
         )
-        # Bound the reducer without shrinking the reusable plan or scratch.
-        max_partitions = min(
-            num_partitions,
-            work_plan.capacity,
-            max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
-        )
-        if sliding_window > 0:
-            # Bound the unaligned MTP window without shrinking the reusable plan.
-            window_tiles = (
-                sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
-            ) // KV_COMPUTE_BLOCK + 1
-            max_partitions = min(max_partitions, window_tiles)
         launch_pa_decode_ps_reduce(
             output_5d,
             psum,
