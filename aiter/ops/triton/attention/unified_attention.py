@@ -66,11 +66,6 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
 _GFX950_LDS_BUDGET = 160 * 1024
 
 
-# Length-aware split work items per KV head dealt out in a row, per XCD. 16 per
-# XCD (128 on gfx950) measured best: 8 KV heads at 1 run per XCD lost ~10%.
-_LENGTH_AWARE_RUNS_PER_XCD = 16
-
-
 def _length_aware_seq_block(num_seqs: int) -> int:
     """Lanes the length-aware split reads the batch's KV lengths in, per step."""
     return min(256, max(64, triton.next_power_of_2(num_seqs)))
@@ -163,8 +158,12 @@ def _length_aware_split(config, params: _UAParams):
     num_segments = config.get("SPLIT_NUM_SEGMENTS", config["NUM_SEGMENTS"])
     if per_cu is None or num_segments == 1 or params.skip_reduce:
         return None
-    # tuned for bf16 Q; the config's bf16 dtype tag also covers fp16
-    if params.q_dtype != torch.bfloat16:
+    # The dtype tag also covers fp16, and the config matches the wider head.
+    if (
+        params.q_dtype != torch.bfloat16
+        or params.head_size != 64
+        or params.head_size_v != 64
+    ):
         return None
     if not params.all_decode and params.max_seqlen_q > _attn_3d_block_q(params):
         return None
@@ -723,6 +722,7 @@ def _unified_attention_3d_triton(
     split_budget=None,
 ):
     config = get_unified_attention_config("attn_3d", params, backend="triton")
+    split_runs_per_xcd = config.pop("SPLIT_RUNS_PER_XCD", None)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -741,7 +741,7 @@ def _unified_attention_3d_triton(
         # no sequence takes more than NUM_SEGMENTS. Items are dealt out in runs
         # of ITEM_RUN, once per head; a multiple of the XCD count keeps every
         # head of an item on one XCD, so they share its L2.
-        item_run = _LENGTH_AWARE_RUNS_PER_XCD * get_num_xcds()
+        item_run = split_runs_per_xcd * get_num_xcds()
         num_items = min(split_budget + params.num_seqs, params.num_seqs * NUM_SEGMENTS)
         num_items = triton.cdiv(num_items, item_run) * item_run
         grid = (num_items * params.num_kv_heads, 1, 1)
@@ -825,6 +825,7 @@ def _reduce_segments_triton(
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
+    split_segment_block_min = config.pop("SPLIT_SEGMENT_BLOCK_MIN", None)
     length_aware = {}
     if split_budget is not None:
         # merge as many slots per step as a sequence of an even batch uses, so
@@ -835,7 +836,8 @@ def _reduce_segments_triton(
             "LENGTH_AWARE_SPLIT": True,
             "SEQ_BLOCK": _length_aware_seq_block(params.num_seqs),
             "LENGTH_AWARE_SEGMENT_BLOCK": min(
-                NUM_SEGMENTS, max(16, triton.next_power_of_2(even_share))
+                NUM_SEGMENTS,
+                max(split_segment_block_min, triton.next_power_of_2(even_share)),
             ),
         }
     v_head_size_padded = triton.next_power_of_2(params.head_size_v)
