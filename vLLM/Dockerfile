@@ -96,7 +96,7 @@ ARG AITER_DIR=/opt/aiter
 # machine just gets fewer workers.
 # These are ARGs, set per RUN below and not ENV: the build settings stay out of
 # the runtime image, and changing them reruns only the compile steps.
-ARG AITER_BUILD_JOBS=64
+ARG AITER_BUILD_JOBS=192
 
 # Build options. The defaults are MI350P's. For MI350X:
 #   --build-arg AITER_CU_NUM=256 --build-arg AITER_NUM_XCDS=8
