@@ -370,6 +370,39 @@ def test_flydsl_hstu_attention(
     torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=0)
 
 
+def record_launch_allocation_streams(monkeypatch, caller_tensors):
+    """Record, per kernel launch, the allocator streams of its own tensors.
+
+    Returns a list that gains one set per `_run_compiled` call: the streams
+    whose cache segments hold the launch's tensor arguments, excluding the
+    caller's tensors (and views of them). The caching allocator recycles a
+    freed block on the stream it was allocated on, so a temporary is safe on a
+    side stream only if its segment belongs to that stream.
+    """
+    caller_storages = {t.untyped_storage().data_ptr() for t in caller_tensors}
+    launches = []
+    real = hstu_kernels._run_compiled
+
+    def spy(*args):
+        segments = [
+            (s["address"], s["address"] + s["total_size"], s["stream"])
+            for s in torch.cuda.memory_snapshot()
+        ]
+        streams = set()
+        for t in args:
+            if not isinstance(t, torch.Tensor):
+                continue
+            if t.untyped_storage().data_ptr() in caller_storages:
+                continue
+            ptr = t.data_ptr()
+            streams |= {s for lo, hi, s in segments if lo <= ptr < hi}
+        launches.append(streams)
+        return real(*args)
+
+    monkeypatch.setattr(hstu_kernels, "_run_compiled", spy)
+    return launches
+
+
 # --------------------------------------------------------------------------- #
 # Input validation
 # --------------------------------------------------------------------------- #

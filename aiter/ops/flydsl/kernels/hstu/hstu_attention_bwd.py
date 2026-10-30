@@ -199,6 +199,12 @@ def validate_hstu_attention_bwd(
             f"(256, 16, 8), got ({block_m}, {block_n}, {num_waves}). 8 waves give "
             "2 per SIMD inside one barrier domain, and 384 rows spill."
         )
+    if waves_per_eu != 2:
+        raise ValueError(
+            f"hstu bwd fused requires waves_per_eu == 2, got {waves_per_eu}. The "
+            "ping-pong schedule holds two waves per SIMD in opposite phases, and "
+            "its register budget is sized for exactly that occupancy."
+        )
     if num_heads <= 0:
         raise ValueError(f"num_heads must be positive, got {num_heads}")
     validate_hstu_attention_bwd_dq_reduce(
@@ -206,8 +212,6 @@ def validate_hstu_attention_bwd(
     )
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
-    if waves_per_eu < 0:
-        raise ValueError(f"waves_per_eu must be non-negative, got {waves_per_eu}")
     if not host_math.isfinite(alpha):
         raise ValueError(f"alpha must be finite, got {alpha}")
     if contextual_seq_len != 0:

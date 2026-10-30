@@ -54,6 +54,7 @@ try:
     from op_tests.test_flydsl_hstu_attention import (
         _load_torch_hstu_reference,
         generate_hstu_attn_inputs,
+        record_launch_allocation_streams,
     )
 except ModuleNotFoundError as exc:
     missing = exc.name or ""
@@ -70,6 +71,7 @@ except ModuleNotFoundError as exc:
     from op_tests.test_flydsl_hstu_attention import (
         _load_torch_hstu_reference,
         generate_hstu_attn_inputs,
+        record_launch_allocation_streams,
     )
 
 requires_cuda = pytest.mark.skipif(
@@ -290,6 +292,12 @@ def test_flydsl_bwd_asymmetric_dims(attn_dim, hidden_dim, dtype):
         # still contribute. A raw-position-only cap would drop them.
         (256, 0, 20),  # semi_local_fig (window << seq + targets)
         (128, 0, 20),
+        # contextual + window: the window is measured in effective IDs, where the
+        # whole prefix is ID 0. Query tiles starting inside (w, w + c - 1] still
+        # reach prefix keys that a raw-position bound would skip.
+        (20, 50, 0),
+        (20, 50, 20),
+        (256, 100, 20),
     ],
 )
 def test_flydsl_bwd_variants(max_attn_len, contextual_seq_len, target_size, dtype):
@@ -672,6 +680,38 @@ def test_flydsl_bwd_fused_custom_stream():
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
+@requires_cuda
+@pytest.mark.parametrize("fused", [False, pytest.param(True, marks=requires_fused)])
+@pytest.mark.parametrize("sort_by_length", [True, False])
+def test_flydsl_bwd_custom_stream_temporaries(monkeypatch, fused, sort_by_length):
+    """Outputs and temporaries are allocated on `stream`, not the caller's.
+
+    Non-contiguous inputs force contiguous copies, and the call also builds
+    its own `num_targets` and permutation. Allocated on the caller's stream,
+    they would return to its pool when the call exits and could be handed to
+    the caller's next allocation while the side stream still reads them.
+    """
+    b, h, n, d = (_FUSED_CASE[key] for key in ("b", "h", "n", "d"))
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, _ = _fused_inputs(b, h, n, d, target_size=0)
+    kwargs = {"fused": fused, "sort_by_length": sort_by_length}
+    expected = flydsl_hstu_attention_bwd(
+        n, alpha, q, k, v, dout, seq_offsets, True, None, 0, 0, **kwargs
+    )
+    strided = [torch.cat([t, t], dim=-1)[..., :d] for t in (q, k, v, dout)]
+    assert not strided[0].is_contiguous()
+
+    launches = record_launch_allocation_streams(monkeypatch, [*strided, seq_offsets])
+    side = torch.cuda.Stream()
+    got = flydsl_hstu_attention_bwd(
+        n, alpha, *strided, seq_offsets, True, None, 0, 0, stream=side, **kwargs
+    )
+    torch.cuda.synchronize()
+    assert launches and all(s == {side.cuda_stream} for s in launches), launches
+    for name, g, e in zip(("dq", "dk", "dv"), got, expected):
+        assert torch.equal(g, e), name
+
+
 def _inputs_with_lengths(lengths, h=4, d=64, seed=7):
     dev = torch.device("cuda")
     g = torch.Generator(device=dev).manual_seed(seed)
@@ -739,6 +779,17 @@ def test_bwd_fused_gate_rejects_too_many_heads():
         validate_hstu_attention_bwd(
             80, 64, 64, True, 0, 0, False, 1.0, "bf16", 1024,
             block_m=256, block_n=16, num_waves=8, waves_per_eu=2, arch="gfx942",
+        )  # fmt: skip
+
+
+@pytest.mark.parametrize("waves_per_eu", [0, 1, 3, 4, 99, -1])
+def test_bwd_fused_gate_requires_measured_occupancy(waves_per_eu):
+    """Only the measured occupancy, waves_per_eu == 2, passes the fused gate."""
+    with pytest.raises(ValueError, match="waves_per_eu == 2"):
+        validate_hstu_attention_bwd(
+            4, 64, 64, True, 0, 0, False, 1.0, "bf16", 1024,
+            block_m=256, block_n=16, num_waves=8, waves_per_eu=waves_per_eu,
+            arch="gfx942",
         )  # fmt: skip
 
 
@@ -840,6 +891,24 @@ def test_flydsl_bwd_explicit_tiles_use_fallback(monkeypatch):
         block_m=64, block_n=32, num_waves=4,
     )  # fmt: skip
     assert not calls
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+@requires_fused
+def test_flydsl_bwd_unmeasured_occupancy_uses_fallback():
+    """A waves_per_eu the fused kernel was not measured at runs the fallback
+    by default, and is refused when the fused kernel is required."""
+    b, h, n, d = (_FUSED_CASE[key] for key in ("b", "h", "n", "d"))
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0)
+    with pytest.raises(ValueError, match="waves_per_eu == 2"):
+        flydsl_hstu_attention_bwd(*args, waves_per_eu=99, fused=True)
+
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    dq, dk, dv = flydsl_hstu_attention_bwd(*args, waves_per_eu=4)
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
@@ -1117,6 +1186,7 @@ def test_bwd_tuned_csv_per_kernel_configs(tmp_path):
         (0, 0, 20),  # num_targets forwarded
         (64, 0, 0),  # max_attn_len forwarded
         (0, 64, 0),  # contextual_seq_len forwarded
+        (20, 50, 0),  # contextual prefix and window together
     ],
 )
 def test_flydsl_autograd_end_to_end(max_attn_len, contextual_seq_len, target_size):

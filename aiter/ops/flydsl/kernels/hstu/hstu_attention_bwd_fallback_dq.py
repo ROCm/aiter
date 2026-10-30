@@ -354,17 +354,19 @@ def build_hstu_attention_bwd_dq(
         kv_upper = active.select(base_upper, fx.Int32(0))
         n_tiles = (kv_upper + fx.Int32(BLOCK_N - 1)) // fx.Int32(BLOCK_N)
 
-        # Sliding-window lower bound: skip fully-masked low KV tiles.
+        # Sliding-window lower bound: skip fully-masked low KV tiles. The window
+        # is measured in effective IDs, where the whole contextual prefix is ID
+        # 0, so the bound is mapped back to a raw position only when it is
+        # positive. Otherwise the window reaches the prefix and the sweep starts
+        # at tile zero.
         kv_tile_start = fx.Int32(0)
         if has_window:
-            eff_q_low = (q_start < max_id).select(q_start, max_id)
-            kv_lower = eff_q_low - fx.Int32(max_attn_len)
-            kv_lower = (kv_lower > fx.Int32(0)).select(kv_lower, fx.Int32(0))
-            win_tile_start = kv_lower // fx.Int32(BLOCK_N)
-            kv_tile_start = win_tile_start
+            id_lower = to_id(q_start) - fx.Int32(max_attn_len)
+            kv_lower = id_lower
             if has_contextual:
-                ctx_prefix_block = q_start < fx.Int32(contextual_seq_len)
-                kv_tile_start = ctx_prefix_block.select(fx.Int32(0), win_tile_start)
+                kv_lower = id_lower + fx.Int32(contextual_seq_len - 1)
+            kv_lower = (id_lower > fx.Int32(0)).select(kv_lower, fx.Int32(0))
+            kv_tile_start = kv_lower // fx.Int32(BLOCK_N)
 
         N_ACC = HC_CHUNKS * Q_SUBTILES
         c_zero_v4f32 = fx.full(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()

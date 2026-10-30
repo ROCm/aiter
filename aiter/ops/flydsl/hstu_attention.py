@@ -390,6 +390,31 @@ def _validate_inputs(
     )
 
 
+def _enter_launch_stream(
+    stream: torch.cuda.Stream | None, *inputs: torch.Tensor | None
+) -> torch.cuda.Stream:
+    """Return the stream to launch on, ordered after the caller's current stream.
+
+    Callers must allocate every temporary and output under
+    `torch.cuda.stream(<returned stream>)`. The caching allocator recycles a
+    freed block on the stream it was allocated on, so a temporary allocated on
+    the current stream could be reused while the launch stream still reads it.
+    """
+    device = inputs[0].device
+    current_stream = torch.cuda.current_stream(device)
+    launch_stream = current_stream if stream is None else stream
+    if launch_stream.device != device:
+        raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
+    if launch_stream != current_stream:
+        # The inputs may still be being produced on the caller's stream, and
+        # the caller may free them while `launch_stream` still reads them.
+        launch_stream.wait_stream(current_stream)
+        for t in inputs:
+            if t is not None:
+                t.record_stream(launch_stream)
+    return launch_stream
+
+
 def flydsl_hstu_attention_fwd(
     N: int,
     alpha: float,
@@ -1078,12 +1103,6 @@ def _make_bwd_fused_runners(
             fused=True,
         )
 
-    device = q.device
-    current_stream = torch.cuda.current_stream(device)
-    launch_stream = current_stream if stream is None else stream
-    if launch_stream.device != device:
-        raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
-
     fused_launcher = build_hstu_attention_bwd(
         num_heads,
         head_dim,
@@ -1099,14 +1118,9 @@ def _make_bwd_fused_runners(
         **config,
     )
 
-    if launch_stream != current_stream:
-        # The inputs may still be being produced on the caller's stream, and
-        # the caller may free them while `launch_stream` still reads them.
-        launch_stream.wait_stream(current_stream)
-        for t in (q, k, v, dout, seq_offsets, num_targets):
-            if t is not None:
-                t.record_stream(launch_stream)
-
+    launch_stream = _enter_launch_stream(
+        stream, q, k, v, dout, seq_offsets, num_targets
+    )
     with torch.cuda.stream(launch_stream):
         return _prepare_bwd_fused_runners(
             fused_launcher,
@@ -1397,27 +1411,6 @@ def flydsl_hstu_attention_bwd(
                 "hstu bwd fused scratch does not fit, using dvdk + dq: %s", exc
             )
 
-    nt = num_targets
-    if nt is None:
-        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
-
-    q_c = q.contiguous()
-    k_c = k.contiguous()
-    v_c = v.contiguous()
-    do_c = dout.contiguous()
-    so_c = seq_offsets.contiguous()
-    nt_c = nt.contiguous()
-
-    # Disabled kernels receive a dummy permutation that compile-time guards never read.
-    if sort_by_length:
-        perm_c = _build_balance_perm(so_c).contiguous()
-    else:
-        perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
-
-    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
-    if launch_stream.device != q.device:
-        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
-
     dvdk_launcher, dq_launcher = _compile_bwd_launcher(
         batch=batch,
         max_seq_len=N,
@@ -1437,11 +1430,32 @@ def flydsl_hstu_attention_bwd(
         has_perm=sort_by_length,
     )
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    launch_stream = _enter_launch_stream(
+        stream, q, k, v, dout, seq_offsets, num_targets
+    )
+    with torch.cuda.device(q.device.index), torch.cuda.stream(launch_stream):
+        nt = num_targets
+        if nt is None:
+            nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
 
-    with torch.cuda.device(q.device.index):
+        q_c = q.contiguous()
+        k_c = k.contiguous()
+        v_c = v.contiguous()
+        do_c = dout.contiguous()
+        so_c = seq_offsets.contiguous()
+        nt_c = nt.contiguous()
+
+        # Disabled kernels receive a dummy permutation that compile-time guards
+        # never read.
+        if sort_by_length:
+            perm_c = _build_balance_perm(so_c).contiguous()
+        else:
+            perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
+
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+
         _run_compiled(
             dvdk_launcher,
             batch,
@@ -1524,29 +1538,29 @@ def _make_bwd_kernel_runners(
         has_perm=sort_by_length,
     )
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    launch_stream = _enter_launch_stream(
+        stream, q, k, v, dout, seq_offsets, num_targets
+    )
+    with torch.cuda.device(q.device.index), torch.cuda.stream(launch_stream):
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
 
-    nt = num_targets
-    if nt is None:
-        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
+        nt = num_targets
+        if nt is None:
+            nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
 
-    q_c = q.contiguous()
-    k_c = k.contiguous()
-    v_c = v.contiguous()
-    do_c = dout.contiguous()
-    so_c = seq_offsets.contiguous()
-    nt_c = nt.contiguous()
+        q_c = q.contiguous()
+        k_c = k.contiguous()
+        v_c = v.contiguous()
+        do_c = dout.contiguous()
+        so_c = seq_offsets.contiguous()
+        nt_c = nt.contiguous()
 
-    if sort_by_length:
-        perm_c = _build_balance_perm(so_c).contiguous()
-    else:
-        perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
-
-    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
-    if launch_stream.device != q.device:
-        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
+        if sort_by_length:
+            perm_c = _build_balance_perm(so_c).contiguous()
+        else:
+            perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
 
     def run_dvdk():
         with torch.cuda.device(q.device.index):
