@@ -40,7 +40,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a1_scale, // [m, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt)
+                        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
@@ -198,7 +198,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                             std::optional<void*> w1_scale,    \
                                             std::optional<void*> a1_scale,    \
                                             std::optional<int> splitk,        \
-                                            std::optional<bool> nt);
+                                            std::optional<bool> nt, [[maybe_unused]] float swiglu_limit);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -233,7 +233,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt)
+                        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
@@ -372,4 +372,4 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         std::optional<void *> w2_scale,                                                                                                                              \
         std::optional<void *> a2_scale,                                                                                                                              \
         std::optional<int>   splitk,                                                                                                                                 \
-        std::optional<bool>   nt);
+        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit);

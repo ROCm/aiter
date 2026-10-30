@@ -1245,7 +1245,8 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")       = true);              \
+          py::arg("is_shuffled")       = true,         \
+          py::arg("swiglu_limit")      = 0);           \
                                                        \
     m.def("ck_moe_stage2",                             \
           &ck_moe_stage2,                              \

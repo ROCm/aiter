@@ -28,7 +28,6 @@ from aiter import (
     dtypes,
 )
 from aiter.fused_moe import (
-    CK_SWIGLUSTEP_LIMIT,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
     asm_stage1,
@@ -811,6 +810,7 @@ class FmoeTuner(TunerCommon):
             use_non_temporal_load=use_nt,
             dst_type=dtype if is_splitk else None,
             swiglustep=swiglustep,
+            swiglu_limit=float(swiglu_limit or 0.0),
         )
         if is_splitk:
             out = torch.empty(
@@ -3395,13 +3395,11 @@ class FmoeTuner(TunerCommon):
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
                 # (tag name, kernel name, splitk); post_process reads ksplit from _skN.
-                stage1_candidates = []
-                if clamp_limit is None or clamp_limit == CK_SWIGLUSTEP_LIMIT:
-                    stage1_candidates += [
-                        (k.name, k.name, 0)
-                        for k in ck_stage1_kernels.values()
-                        if k.MPerBlock == blockM
-                    ]
+                stage1_candidates = [
+                    (k.name, k.name, 0)
+                    for k in ck_stage1_kernels.values()
+                    if k.MPerBlock == blockM
+                ]
                 # CK blockscale split-K at block_m 64 (pipeline V3) writes up as zeros.
                 if clamp_limit is not None and blockM <= 32:
                     stage1_candidates += [
@@ -6129,6 +6127,10 @@ class FmoeTuner(TunerCommon):
             best_one["q_dtype_w"] = str(best_one["q_dtype_w"])
             if self.swiglu_limit_tag:
                 best_one["_tag"] = self.swiglu_limit_tag
+                if int(best_one.get("ksplit", 0) or 0) <= 1:
+                    best_one["kernelName1"] = str(best_one["kernelName1"]).replace(
+                        "_silu_", "_swiglustep_"
+                    )
             bests.append(best_one)
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
