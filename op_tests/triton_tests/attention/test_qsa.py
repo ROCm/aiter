@@ -242,8 +242,12 @@ def test_qsa_fp8_writer_never_saturates():
     torch.manual_seed(0)
     rows = 2048
     magnitude = torch.logspace(-4, 4, rows, device="cuda")[:, None, None]
-    key = (torch.randn(rows, 2, 256, device="cuda") * magnitude).bfloat16()
-    value = (torch.randn(rows, 2, 256, device="cuda") * magnitude).bfloat16()
+    key = (
+        torch.randn(rows, 2, 256, dtype=torch.float32, device="cuda") * magnitude
+    ).bfloat16()
+    value = (
+        torch.randn(rows, 2, 256, dtype=torch.float32, device="cuda") * magnitude
+    ).bfloat16()
     caches = [torch.zeros(rows // 16, 16, 2, 256, device="cuda", dtype=FP8_DTYPE)]
     caches.append(torch.zeros_like(caches[0]))
     scales = [torch.zeros(rows // 16, 16, 2, device="cuda") for _ in range(2)]
@@ -277,7 +281,7 @@ def test_qsa_fp4_writer_is_exact_on_the_grid_and_close_off_it():
     torch.testing.assert_close(
         _dequant("fp4", cache, scale).view(-1, 1, 128)[:rows], exact, rtol=0, atol=0
     )
-    noisy = torch.randn(rows, 1, 128, device="cuda").bfloat16()
+    noisy = torch.randn(rows, 1, 128, dtype=torch.float32, device="cuda").bfloat16()
     cache, scale = _store("fp4", noisy, 4)
     restored = _dequant("fp4", cache, scale).view(-1, 1, 128)[:rows]
     per_row = (restored - noisy.float()).norm(dim=-1) / noisy.float().norm(dim=-1)
@@ -334,7 +338,7 @@ def test_qsa_writer_rejects_bad_slots_and_planes():
         cache = torch.zeros(pages, 4, 2, vdim, device="cuda", dtype=vdtype)
         return cache, torch.zeros(pages, 4, 2, *tail, device="cuda", dtype=sdtype)
 
-    values = torch.randn(4, 2, 256, device="cuda").bfloat16()
+    values = torch.randn(4, 2, 256, dtype=torch.float32, device="cuda").bfloat16()
     backing = torch.arange(8, device="cuda")
     # The writers read slots[row] without a stride.
     for fmt in ("fp8", "fp4"):
@@ -374,6 +378,62 @@ def test_qsa_writer_rejects_bad_slots_and_planes():
     assert torch.equal(scale, second_scale)
     assert scale[1].all() and not scale[0].any()
 
+    # A second tensor comes with its scale plane and values, or not at all.
+    for fmt in ("fp8", "fp4"):
+        first_cache, first_scale = planes(fmt, 2)
+        other_cache, other_scale = planes(fmt, 2)
+        for partial in (
+            (other_cache, None, None),
+            (other_cache, other_scale, None),
+            (None, other_scale, values),
+            (None, None, values),
+        ):
+            with pytest.raises(ValueError):
+                qsa_store_quantized_rows(
+                    first_cache, first_scale, slots, values, *partial
+                )
+        assert not first_scale.any() and not other_scale.any()
+
+
+def test_qsa_scorers_reject_scale_planes_that_do_not_match_the_cache():
+    from aiter.ops.qsa import FP8_DTYPE, qsa_paged_mqa_logits, qsa_sparse_paged_gqa
+
+    keys, q, table, t2r, positions, lens = _index_case(1, 256, 4, 16)
+    args = (table, t2r, positions, lens, 4)
+    for fmt in ("fp8", "fp4"):
+        cache, scale = _store(fmt, keys, 16)
+        qsa_paged_mqa_logits(q, cache, *args, compressed_k_scale=scale)
+        if fmt == "fp8":
+            bad = [scale[..., None].repeat(1, 1, 1, 4), scale.double()]
+        else:
+            # Three of the four groups: the kernel would read past each row.
+            bad = [scale[..., :3].contiguous(), scale.view(torch.int8)]
+        for wrong in bad:
+            with pytest.raises(ValueError):
+                qsa_paged_mqa_logits(q, cache, *args, compressed_k_scale=wrong)
+
+    shape = (4, 16, 2, 256)
+    k_cache, v_cache = (
+        torch.zeros(shape, device="cuda", dtype=FP8_DTYPE) for _ in "kv"
+    )
+    scale = torch.ones(shape[:3], device="cuda")
+    q = torch.zeros(1, 4, 256, dtype=torch.bfloat16, device="cuda")
+    selected = torch.zeros(1, 16, dtype=torch.int32, device="cuda")
+    table = torch.arange(4, dtype=torch.int32, device="cuda")[None]
+    t2r = torch.zeros(1, dtype=torch.int32, device="cuda")
+    args = (selected, table, t2r, 1 / 16)
+    qsa_sparse_paged_gqa(q, k_cache, v_cache, *args, k_scale=scale, v_scale=scale)
+    # Fewer pages with the same strides as the K scale.
+    assert scale[:2].stride() == scale.stride()
+    with pytest.raises(ValueError):
+        qsa_sparse_paged_gqa(
+            q, k_cache, v_cache, *args, k_scale=scale, v_scale=scale[:2]
+        )
+    bf16 = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    qsa_sparse_paged_gqa(q, bf16, bf16, *args)
+    with pytest.raises(ValueError):
+        qsa_sparse_paged_gqa(q, bf16, bf16, *args, v_scale=scale)
+
 
 def _index_case(requests, context, rows_per_request, page_rows, seed=2):
     g = torch.Generator(device="cuda").manual_seed(seed)
@@ -382,8 +442,17 @@ def _index_case(requests, context, rows_per_request, page_rows, seed=2):
     pages = requests * pages_per_request + 3
     order = torch.randperm(pages, device="cuda", generator=g).to(torch.int32)
     table = order[: requests * pages_per_request].view(requests, pages_per_request)
-    keys = torch.randn(pages * page_rows, 1, 128, device="cuda", generator=g)
-    q = torch.randn(requests * rows_per_request, 4, 128, device="cuda", generator=g)
+    keys = torch.randn(
+        pages * page_rows, 1, 128, dtype=torch.float32, device="cuda", generator=g
+    )
+    q = torch.randn(
+        requests * rows_per_request,
+        4,
+        128,
+        dtype=torch.float32,
+        device="cuda",
+        generator=g,
+    )
     t2r = torch.arange(requests, device="cuda", dtype=torch.int32)
     t2r = t2r.repeat_interleave(rows_per_request)
     positions = torch.arange(rows_per_request, device="cuda").repeat(requests)
@@ -503,9 +572,13 @@ def test_qsa_fp8_sparse_gqa_matches_dequantized_kv(tokens, requests):
     order = torch.randperm(pages, device="cuda", generator=g).to(torch.int32)
     table = order[: requests * pages_per_request].view(requests, pages_per_request)
     shape = (pages, page_rows, 2, 256)
-    key = torch.randn(shape, device="cuda", generator=g).bfloat16()
-    value = (torch.randn(shape, device="cuda", generator=g) * 3).bfloat16()
-    q = torch.randn(tokens, 24, 256, device="cuda", generator=g).bfloat16()
+    key = torch.randn(shape, dtype=torch.float32, device="cuda", generator=g).bfloat16()
+    value = (
+        torch.randn(shape, dtype=torch.float32, device="cuda", generator=g) * 3
+    ).bfloat16()
+    q = torch.randn(
+        tokens, 24, 256, dtype=torch.float32, device="cuda", generator=g
+    ).bfloat16()
     context = pages_per_request * page_rows
     selected = torch.randint(0, context, (tokens, 515), device="cuda", generator=g)
     selected = selected.to(torch.int32)
@@ -564,7 +637,15 @@ def _stacked_case(rows_per_request, page_size, contexts, padded_rows=3, seed=0):
     for req, ctx in enumerate(contexts):
         used = -(-(ctx // ratio) // page_size)
         table[req, :used] = order[req * width : req * width + used]
-    keys = torch.randn(pages, page_size, 1, _STACKED_DIM, generator=g, device="cuda")
+    keys = torch.randn(
+        pages,
+        page_size,
+        1,
+        _STACKED_DIM,
+        generator=g,
+        dtype=torch.float32,
+        device="cuda",
+    )
     keys = keys.to(torch.bfloat16)
     requests, positions = [], []
     for req, ctx in enumerate(contexts):
@@ -573,7 +654,14 @@ def _stacked_case(rows_per_request, page_size, contexts, padded_rows=3, seed=0):
     requests += [-1] * padded_rows
     positions += [0] * padded_rows
     rows = len(requests)
-    q = torch.randn(rows, _STACKED_HEADS, _STACKED_DIM, generator=g, device="cuda")
+    q = torch.randn(
+        rows,
+        _STACKED_HEADS,
+        _STACKED_DIM,
+        generator=g,
+        dtype=torch.float32,
+        device="cuda",
+    )
     q = q.to(torch.bfloat16)
     token_to_request = torch.tensor(requests, dtype=torch.int32, device="cuda")
     query_positions = torch.tensor(positions, dtype=torch.int64, device="cuda")
@@ -673,11 +761,20 @@ def test_qsa_scorers_stay_inside_a_narrow_page_table(fmt, rows):
     # A [1, 3] table with page size 4 rounds up to width 4. The last tile must
     # not read table entry 3, which is outside the table.
     g = torch.Generator(device="cuda").manual_seed(3)
-    keys = torch.randn(16, 1, _STACKED_DIM, generator=g, device="cuda").bfloat16()
+    keys = torch.randn(
+        16, 1, _STACKED_DIM, generator=g, dtype=torch.float32, device="cuda"
+    ).bfloat16()
     cache, scale = _store(fmt, keys, 4)
     restored = _dequant(fmt, cache, scale)
     table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")[:, :3]
-    q = torch.randn(rows, _STACKED_HEADS, _STACKED_DIM, generator=g, device="cuda")
+    q = torch.randn(
+        rows,
+        _STACKED_HEADS,
+        _STACKED_DIM,
+        generator=g,
+        dtype=torch.float32,
+        device="cuda",
+    )
     q = q.bfloat16()
     token_to_request = torch.zeros(rows, dtype=torch.int32, device="cuda")
     positions = torch.full((rows,), 47, dtype=torch.int64, device="cuda")

@@ -11,7 +11,6 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.triton._triton_kernels.attention.qsa import (
     _expand_selected_groups,
-    _qsa_paged_mqa_logits_fp4_kernel,
     _qsa_paged_mqa_logits_kernel,
     _qsa_paged_mqa_logits_mfma_kernel,
     _qsa_paged_mqa_logits_stacked_kernel,
@@ -79,6 +78,10 @@ def qsa_store_quantized_rows(
     shares the slots and both planes' strides, written in the same launch.
     """
     fmt = _cache_format(cache, scale)
+    given = [t is not None for t in (second_cache, second_scale, second_values)]
+    if any(given) and not all(given):
+        raise ValueError("pass second_cache, second_scale and second_values together")
+    second = all(given)
     if cache.ndim != 4 or values.ndim != 3:
         raise ValueError("cache must be [pages, page, heads, dim], values 3-D")
     rows, heads, head_dim = values.shape
@@ -97,11 +100,8 @@ def qsa_store_quantized_rows(
     if fmt == _FMT_FP8:
         if cache.shape[3] != head_dim:
             raise ValueError("values and FP8 cache disagree on head_dim")
-        second = second_cache is not None
         if second and (
-            second_scale is None
-            or second_values is None
-            or second_cache.shape != cache.shape
+            second_cache.shape != cache.shape
             or second_cache.dtype != cache.dtype
             or second_scale.shape != scale.shape
             or second_scale.dtype != scale.dtype
@@ -136,7 +136,7 @@ def qsa_store_quantized_rows(
             num_warps=4,
         )
         return
-    if second_cache is not None:
+    if second:
         raise ValueError("only the FP8 writer takes a second tensor")
     if cache.shape[3] * 2 != head_dim or head_dim % FP4_GROUP:
         raise ValueError("values and FP4 cache disagree on head_dim")
@@ -276,13 +276,18 @@ def qsa_paged_mqa_logits(
         )
     if key_fmt == _FMT_BF16 and q.dtype != compressed_k_cache.dtype:
         raise ValueError("q and compressed_k_cache must have the same dtype")
-    if key_fmt != _FMT_BF16 and (
-        compressed_k_scale.shape[:3] != compressed_k_cache.shape[:3]
-        or compressed_k_scale.stride(-1) != 1
-        or q.stride(2) != 1
-        or compressed_k_cache.stride(3) != 1
-    ):
-        raise ValueError("compressed_k_scale must page like compressed_k_cache")
+    if key_fmt != _FMT_BF16:
+        _, _, tail, scale_dtype = qsa_cache_row_layout(
+            QSA_CACHE_FORMATS[key_fmt], q.shape[2]
+        )
+        if (
+            compressed_k_scale.shape != (*compressed_k_cache.shape[:3], *tail)
+            or compressed_k_scale.dtype != scale_dtype
+            or compressed_k_scale.stride(-1) != 1
+            or q.stride(2) != 1
+            or compressed_k_cache.stride(3) != 1
+        ):
+            raise ValueError("compressed_k_scale must be the scale plane of the cache")
     # BF16 keys pass a None scale, which binds as a constexpr.
     scale = compressed_k_scale
     scale_strides = (0, 0) if scale is None else (scale.stride(0), scale.stride(1))
@@ -407,41 +412,6 @@ def qsa_paged_mqa_logits(
     column_programs = min(
         triton.cdiv(columns, _SCORING_BLOCK_N), _SCORING_COLUMN_PROGRAMS
     )
-    if key_fmt == _FMT_FP4:
-        _qsa_paged_mqa_logits_fp4_kernel[(q.shape[0], column_programs)](
-            q,
-            compressed_k_cache,
-            scale,
-            page_table,
-            token_to_request,
-            query_positions,
-            context_lens,
-            visible_groups,
-            row_starts,
-            logits,
-            q.stride(0),
-            q.stride(1),
-            compressed_k_cache.stride(0),
-            compressed_k_cache.stride(1),
-            *scale_strides,
-            page_table.stride(0),
-            page_table.stride(1),
-            logits.stride(0),
-            q.shape[0],
-            columns,
-            compressed_k_cache.shape[0],
-            page_table.shape[0],
-            float(divisor),
-            PAGE_SIZE=compressed_k_cache.shape[1],
-            PAGE_TABLE_WIDTH=_table_width_bucket(page_table.shape[1]),
-            NUM_HEADS=q.shape[1],
-            HEAD_DIM=q.shape[2],
-            COMPRESS_RATIO=compress_ratio,
-            GROUP=FP4_GROUP,
-            BLOCK_N=_SCORING_BLOCK_N,
-            num_warps=4,
-        )
-        return logits, visible_groups
     _qsa_paged_mqa_logits_kernel[(q.shape[0], column_programs)](
         q,
         compressed_k_cache,
@@ -475,7 +445,8 @@ def qsa_paged_mqa_logits(
         COMPRESS_RATIO=compress_ratio,
         BLOCK_N=_SCORING_BLOCK_N,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
-        KEY_FP8=key_fmt == _FMT_FP8,
+        KEY_FMT=key_fmt,
+        GROUP=FP4_GROUP,
         num_warps=4,
     )
     return logits, visible_groups
@@ -576,9 +547,12 @@ def qsa_sparse_paged_gqa(
             v_cache.dtype != k_cache.dtype
             or v_scale is None
             or k_scale.shape != k_cache.shape[:3]
+            or v_scale.shape != k_scale.shape
             or v_scale.stride() != k_scale.stride()
         ):
             raise ValueError("FP8 K/V need matching [pages, page, heads] scales")
+    elif v_scale is not None:
+        raise ValueError("v_scale needs an FP8 cache and k_scale")
     elif q.dtype != k_cache.dtype or q.dtype != v_cache.dtype:
         raise ValueError("q, k_cache and v_cache must have the same dtype")
     if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
