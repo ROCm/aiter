@@ -23,8 +23,8 @@
 #     IMAGE_A=vllm-aiter-main-mi350x IMAGE_B=vllm-aiter-ar-mi350x \
 #     IMAGE_FORK=vllm-aiter-ar-prefill-mi350x IMAGE_A_EVAL=vllm-aiter-main-eval-mi350x
 #   ./e2e.sh build-eval
-#   ./e2e.sh eval                                      # TP8, RULER at 16k
-#   TPS=4 GPU_MEM_UTIL=0.92 MAX_MODEL_LEN=16384 ./e2e.sh eval
+#   ./e2e.sh eval                                      # TP8, RULER at 64k
+#   TPS=4 GPU_MEM_UTIL=0.92 MAX_MODEL_LEN=65536 ./e2e.sh eval   # fits 2.4 64k prompts
 #
 # For every (TP, image) "run" starts one server, checks that it answers,
 # records which all-reduce path vLLM took, runs the benchmark scenarios and
@@ -69,8 +69,9 @@ ARMS3=${ARMS3:-"base,$IMAGE_A fork,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL
 # all-reduce, and its default mesh window (from 128 KiB at TP8/PCIe) would
 # otherwise still quantize decode. The ring window starts at 24 MiB (none on xGMI),
 # far above decode, so its floor is left alone: raising it past the mesh window's
-# end would open a gap. Add a second exact arm (e.g. exact2) to measure
-# run-to-run noise.
+# end would open a gap. exact2 repeats exact, last, so that exact vs exact2 is
+# the run-to-run noise (batch composition at concurrency 64, drift over the run):
+# the yardstick for the other arms' discordant questions and identical outputs.
 # 8 MiB is the HIP quick-reduce's own floor for INT4 at TP8 (_QR_MIN_SIZE in
 # aiter/dist/device_communicators/quick_all_reduce.py: the (float16, 8) row, which
 # applies to bf16 too, as AITER_QUICK_REDUCE_CAST_BF16_TO_FP16 defaults to 1), so
@@ -78,7 +79,8 @@ ARMS3=${ARMS3:-"base,$IMAGE_A fork,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL
 # decode step (896 KiB at 64 tokens). Payloads from the plain one-shot's 1216 KiB
 # to 8 MiB are served by the stock path, as with the HIP kernel.
 EVAL_FLOOR_BYTES=${EVAL_FLOOR_BYTES:-8388608}
-ARMS_EVAL=${ARMS_EVAL:-"base,$IMAGE_A_EVAL,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=NONE,AITER_QUICK_REDUCE_QUANTIZATION=NONE exact,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=NONE,AITER_QUICK_REDUCE_QUANTIZATION=NONE flyqr,$IMAGE_FORK flyqr_floor,$IMAGE_FORK,AITER_FLY_AR_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES,AITER_FLY_AR_FUSED_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES"}
+QR_OFF=VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=NONE,AITER_QUICK_REDUCE_QUANTIZATION=NONE
+ARMS_EVAL=${ARMS_EVAL:-"base,$IMAGE_A_EVAL,$QR_OFF exact,$IMAGE_FORK,$QR_OFF flyqr,$IMAGE_FORK flyqr_floor,$IMAGE_FORK,AITER_FLY_AR_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES,AITER_FLY_AR_FUSED_MESH_MIN_BYTES=$EVAL_FLOOR_BYTES exact2,$IMAGE_FORK,$QR_OFF"}
 # lm-eval settings for "eval". The concurrency sets the decode batch: one
 # DeepSeek V4 token is 14 KiB of all-reduce payload, so at 64 concurrent
 # requests a decode step moves up to 896 KiB, inside the FlyDSL INT4 mesh
@@ -92,20 +94,21 @@ EVAL_LIMIT=${EVAL_LIMIT:-}            # questions per task; empty = all (quick c
 # These RULER tasks send prompts of a whole length through chunked prefill (8192-token
 # chunks, 112 MiB per all-reduce: the INT4 ring window, as in the recipe's 60k-token
 # case), and the answer has to be retrieved from that KV cache through the
-# sparse attention's top-k selection. The tasks are ones not at the ceiling: uuid needles
-# among uuid distractors, all 4 values of a key, multi-hop variable tracking, and
-# multi-document QA. Zero-shot, greedy. The prompts are generated once, before the
-# first server starts, with lm-eval's RULER generator seeded with EVAL_SEED, and cached
-# under RULER_CACHE (see e2e_ruler_prep.py): every arm reads the same files. Empty
-# EVAL_LONG_TASKS skips it.
-EVAL_LONG_TASKS=${EVAL_LONG_TASKS-niah_multikey_3,niah_multivalue,ruler_vt,ruler_qa_hotpot}
+# sparse attention's top-k selection. The tasks are ones not at the ceiling at 16k
+# (needle retrieval and variable tracking scored 1.0 on every arm there): multi-hop
+# and single-document QA among distractor documents, and the 10 most common / most
+# frequent words of a long list, which score partial credit. Zero-shot, greedy. The
+# prompts are generated once, before the first server starts, with lm-eval's RULER
+# generator seeded with EVAL_SEED, and cached under RULER_CACHE (see
+# e2e_ruler_prep.py): every arm reads the same files. Empty EVAL_LONG_TASKS skips it.
+EVAL_LONG_TASKS=${EVAL_LONG_TASKS-ruler_qa_hotpot,ruler_qa_squad,ruler_cwe,ruler_fwe}
 # Prompt lengths, one lm-eval run each: RULER lists its samples length by length,
 # so one --limit over several lengths would keep only the first. Each one must be
 # a RULER length (4096 8192 16384 32768 65536 131072) and at most MAX_MODEL_LEN.
-EVAL_LONG_LENGTHS=${EVAL_LONG_LENGTHS:-16384}
+EVAL_LONG_LENGTHS=${EVAL_LONG_LENGTHS:-65536}
 # Questions per task and length that are run, the first of the 500 RULER generates
 # (and caches); empty = all 500.
-EVAL_LONG_LIMIT=${EVAL_LONG_LIMIT:-25}
+EVAL_LONG_LIMIT=${EVAL_LONG_LIMIT:-50}
 # Prefill-bound; each request holds a whole prompt of KV cache, and more just queue.
 EVAL_LONG_CONCURRENCY=${EVAL_LONG_CONCURRENCY:-8}
 # Only sizes the haystacks (vLLM tokenizes the prompts itself), so any close
