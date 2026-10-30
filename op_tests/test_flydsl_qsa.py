@@ -2481,6 +2481,61 @@ def test_paged_gqa_empty_first_tile_keeps_later_token():
             )
 
 
+def test_paged_gqa_large_negative_score_keeps_weight():
+    """A bf16 score below -1e20 keeps its softmax weight.
+
+    Q is 2**36 and K is -2**36, both exact bf16, so the only live token
+    has a scaled log2 score near -1e23. Its V is 1, so the output is 1.
+    Width 16 is one split; width 2048 merges. A fully masked row stays 0.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    page_size, seq_len = 16, 64
+    q_bit = torch.tensor(2**36, dtype=dtypes.bf16, device=device)
+    k_bit = torch.tensor(-(2**36), dtype=dtypes.bf16, device=device)
+    if q_bit.float().item() != 2**36 or k_bit.float().item() != -(2**36):
+        raise AssertionError("2**36 is not exact bf16")
+    q = torch.empty(1, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    q.fill_(q_bit)
+    k = torch.empty(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k.fill_(k_bit)
+    v = torch.ones_like(k)
+    token_to_req = torch.zeros(1, dtype=dtypes.i32, device=device)
+    k_cache, kv_table = pack_paged_cache(k, page_size)
+    v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
+    if not torch.equal(kv_table, kv_table_v):
+        raise AssertionError("K and V page tables diverged")
+    for width, masked in ((16, False), (2048, False), (16, True), (2048, True)):
+        indices = torch.full((1, width), -1, dtype=dtypes.i32, device=device)
+        if not masked:
+            indices[0, 0] = 0
+        _, _, n_splits = _launch_config(1, width, gqa.kv_heads, gqa.head_dim)
+        if (width == 16 and n_splits != 1) or (width == 2048 and n_splits < 2):
+            raise AssertionError(
+                f"width {width} launched {n_splits} splits on {get_gfx()}"
+            )
+        ref = sparse_gqa_ref(q, k, v, indices)
+        out = flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
+        label = f"width {width} masked {masked} splits {n_splits}"
+        if torch.isnan(out).any():
+            raise AssertionError(f"paged GQA {label} produced NaN")
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"paged GQA large-negative score {label}",
+        )
+        if err != 0:
+            raise AssertionError(
+                f"paged GQA {label} diverged from the oracle (err={err})"
+            )
+
+
 def test_paged_gqa_default_out_ignores_query_strides():
     """Default output matches the oracle for both review layouts.
 
