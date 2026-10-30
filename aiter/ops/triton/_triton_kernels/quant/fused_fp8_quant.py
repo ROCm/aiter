@@ -666,6 +666,9 @@ _fused_reduce_rms_fp8_group_quant_repr = make_kernel_repr(
         "HAS_SPLITK",
         "NUM_SPLITK",
         "NUM_SPLITK_POW2",
+        "HAS_QUANT",
+        "GEMMA_NORM",
+        "HAVE_THIRD_INPUT",
     ],
 )
 
@@ -728,7 +731,11 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
     HAS_SPLITK: tl.constexpr,
     NUM_SPLITK: tl.constexpr,
     NUM_SPLITK_POW2: tl.constexpr,
+    HAS_QUANT: tl.constexpr = True,
+    GEMMA_NORM: tl.constexpr = False,
+    HAVE_THIRD_INPUT: tl.constexpr = True,
 ):
+    # HAS_QUANT=False skips the fp8 output of the first input; GEMMA_NORM applies its weight as (1 + w).
     m_pid = tl.program_id(0)
 
     if m_pid < n_rows:
@@ -786,6 +793,8 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
             inp1 = inp1 + res1
 
         w1 = tl.load(weight1_ptr + n1_offs, mask=mask1, other=other1).to(tl.float32)
+        if GEMMA_NORM:
+            w1 = w1 + 1.0
 
         norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1)
 
@@ -796,25 +805,28 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
                 mask=mask1,
             )
 
-        out1_fp8, out1_block_scales = _fp8_quant_op(
-            norm1, 1, BLOCK_SIZE_N1, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
-        )
-        out1_fp8 = tl.ravel(out1_fp8)
-        out1_block_scales = tl.ravel(out1_block_scales)
+        if HAS_QUANT:
+            out1_fp8, out1_block_scales = _fp8_quant_op(
+                norm1, 1, BLOCK_SIZE_N1, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
+            )
+            out1_fp8 = tl.ravel(out1_fp8)
+            out1_block_scales = tl.ravel(out1_block_scales)
 
-        # store the results
-        tl.store(
-            out1_fp8_ptr + m_pid * out1_fp8_row_stride + n1_offs * out1_fp8_col_stride,
-            out1_fp8.to(out1_fp8_ptr.dtype.element_ty),
-            mask=mask1,
-        )
-        g_offs = tl.arange(0, NUM_QUANT_BLOCKS)
-        num_bs_cols = (inp1_n_cols + QUANT_BLOCK_SIZE - 1) // QUANT_BLOCK_SIZE
-        tl.store(
-            out1_bs_ptr + m_pid * out1_bs_row_stride + g_offs * out1_bs_col_stride,
-            out1_block_scales.to(out1_bs_ptr.dtype.element_ty),
-            mask=g_offs < num_bs_cols,
-        )
+            # store the results
+            tl.store(
+                out1_fp8_ptr
+                + m_pid * out1_fp8_row_stride
+                + n1_offs * out1_fp8_col_stride,
+                out1_fp8.to(out1_fp8_ptr.dtype.element_ty),
+                mask=mask1,
+            )
+            g_offs = tl.arange(0, NUM_QUANT_BLOCKS)
+            num_bs_cols = (inp1_n_cols + QUANT_BLOCK_SIZE - 1) // QUANT_BLOCK_SIZE
+            tl.store(
+                out1_bs_ptr + m_pid * out1_bs_row_stride + g_offs * out1_bs_col_stride,
+                out1_block_scales.to(out1_bs_ptr.dtype.element_ty),
+                mask=g_offs < num_bs_cols,
+            )
 
         if FIRST_INPUT_RES:
             inp1 = inp1.to(out_res1_ptr.dtype.element_ty)
@@ -878,7 +890,7 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
             )
     elif m_pid < 3 * n_rows:
         m_pid -= 2 * n_rows
-        if HAS_SPLITK:
+        if HAS_SPLITK and HAVE_THIRD_INPUT:
             spk_offs = tl.arange(0, NUM_SPLITK_POW2)
             n3_offs = tl.arange(0, BLOCK_SIZE_N3)
             if N_MASK3:
