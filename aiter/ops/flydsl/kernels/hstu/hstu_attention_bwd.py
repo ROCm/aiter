@@ -181,7 +181,9 @@ def validate_hstu_attention_bwd(
     `build_hstu_attention_bwd_dq` pair rather than silently compile a variant
     that was never measured.
 
-    `arch` and `num_cus` default to the current device's.
+    Pass `arch` and `num_cus` of the device the kernel will run on. They
+    default to the process-wide arch and the CU count of the current device,
+    which differ from the tensors' device on a mixed multi-GPU node.
     """
     if arch is None:
         arch = get_rocm_arch()
@@ -198,8 +200,9 @@ def validate_hstu_attention_bwd(
         # gfx942 also covers MI300A (228 CUs) and MI308X (80 CUs), whose
         # occupancy and memory differ from the MI300X it was validated on.
         raise ValueError(
-            f"hstu bwd fused is validated on MI300X only ({_VALIDATED_NUM_CUS} "
-            f"CUs), got a gfx942 device with {num_cus} CUs"
+            "hstu bwd fused is validated on the 304-CU gfx942 class only "
+            "(MI300X; MI325X is indistinguishable), got a gfx942 device with "
+            f"{num_cus} CUs"
         )
     if dtype_str != "bf16":
         raise ValueError(f"hstu bwd fused requires bf16, got {dtype_str!r}")
@@ -261,6 +264,8 @@ def build_hstu_attention_bwd(
     num_waves: int = 8,
     waves_per_eu: int = 2,
     has_perm: bool = False,
+    arch: str | None = None,
+    num_cus: int | None = None,
 ):
     validate_hstu_attention_bwd(
         num_heads,
@@ -277,6 +282,8 @@ def build_hstu_attention_bwd(
         block_n=block_n,
         num_waves=num_waves,
         waves_per_eu=waves_per_eu,
+        arch=arch,
+        num_cus=num_cus,
     )
 
     BLOCK_M = block_m

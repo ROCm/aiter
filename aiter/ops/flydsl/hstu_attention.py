@@ -16,6 +16,7 @@ import torch
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter import logger
+from aiter.jit.utils.build_targets import torch_processor_count_to_cu
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
     balanced_tile_groups,
     build_hstu_attention_bwd,
@@ -555,6 +556,9 @@ def _validate_bwd_metadata_values(
     device, which costs ~100 us per call (several times a small inference
     call) and is illegal during CUDA graph capture.
     """
+    # int64 throughout: the two tensors may differ in width, and narrowing an
+    # int64 to int32 would wrap an out-of-range value into a valid-looking one.
+    seq_offsets = seq_offsets.to(torch.int64)
     lengths = seq_offsets.diff()
     checks = {
         "seq_offsets[0] must be 0": seq_offsets[0] != 0,
@@ -567,7 +571,7 @@ def _validate_bwd_metadata_values(
         ).any(),
     }
     if num_targets is not None:
-        targets = num_targets.to(lengths.dtype)
+        targets = num_targets.to(torch.int64)
         checks["num_targets must be non-negative"] = (targets < 0).any()
         checks["num_targets must not exceed each sequence's length"] = (
             targets > lengths
@@ -731,7 +735,9 @@ def _get_bwd_tuned_config(
 
 
 @functools.lru_cache(maxsize=64)
-def _balance_gather_index(B: int, groups: int, device: str) -> torch.Tensor:
+def _balance_gather_index(
+    B: int, groups: int, device: str
+) -> tuple[torch.Tensor, torch.cuda.Event]:
     """Map sorted ranks to grid groups with a cached alternating-direction deal.
 
     Alternating the group direction each round distributes long and short
@@ -747,25 +753,35 @@ def _balance_gather_index(B: int, groups: int, device: str) -> torch.Tensor:
 
 
 @functools.lru_cache(maxsize=64)
-def _identity_perm(B: int, device: str) -> torch.Tensor:
+def _identity_perm(B: int, device: str) -> tuple[torch.Tensor, torch.cuda.Event]:
     """Return a cached identity permutation."""
     return _publish_cached(torch.arange(B, dtype=torch.int32, device=device))
 
 
-def _publish_cached(t: torch.Tensor) -> torch.Tensor:
-    """Finish building a cached device tensor before any stream may read it.
+def _publish_cached(t: torch.Tensor) -> tuple[torch.Tensor, torch.cuda.Event]:
+    """Pair a freshly built cached device tensor with its completion event.
 
     The cache is shared by every stream, while the producing stream is known
-    only here. Synchronising it once, on a cache miss, orders the build before
-    all later readers. Each reader still records its stream (`_use_cached`),
-    so an eviction cannot recycle the block under a queued reader.
+    only here, so readers order themselves after the build through the event
+    (`_use_cached`) instead of the host waiting for it.
     """
-    torch.cuda.current_stream(t.device).synchronize()
-    return t
+    built = torch.cuda.Event()
+    built.record(torch.cuda.current_stream(t.device))
+    return t, built
 
 
-def _use_cached(t: torch.Tensor) -> torch.Tensor:
-    t.record_stream(torch.cuda.current_stream(t.device))
+def _use_cached(entry: tuple[torch.Tensor, torch.cuda.Event]) -> torch.Tensor:
+    """Read a cached device tensor on the current stream.
+
+    Waits for the build on the device, and only while it may still be
+    pending, so a warm cache queues nothing. Recording the reader's stream
+    keeps an eviction from recycling the block under a queued reader.
+    """
+    t, built = entry
+    stream = torch.cuda.current_stream(t.device)
+    if not built.query():
+        stream.wait_event(built)
+    t.record_stream(stream)
     return t
 
 
@@ -917,8 +933,21 @@ def _compile_bwd_launcher(
     return dvdk_launcher, dq_launcher
 
 
+@functools.cache
+def _device_arch_and_cus(device_index: int) -> tuple[str, int]:
+    """(arch, CU count) of one device.
+
+    Per device rather than the process-wide arch helpers: a node can mix
+    gfx942 products, e.g. a 304-CU MI300X next to an 80-CU MI308X.
+    """
+    props = torch.cuda.get_device_properties(device_index)
+    arch = props.gcnArchName.split(":", 1)[0].lower()
+    return arch, torch_processor_count_to_cu(arch, props.multi_processor_count)
+
+
 def _resolve_bwd_fused_config(
     *,
+    device: torch.device,
     dtype_str: str,
     num_heads: int,
     head_dim: int,
@@ -965,6 +994,7 @@ def _resolve_bwd_fused_config(
     # A tuned row brings its own tile and has to match the gate anyway; explicit
     # tiles are the fallback pair's, so any that differ fail the gate below.
     config = {**_BWD_FUSED_TILES, **tuned_config, **custom_config}
+    arch, num_cus = _device_arch_and_cus(device.index)
     try:
         validate_hstu_attention_bwd(
             num_heads,
@@ -978,6 +1008,8 @@ def _resolve_bwd_fused_config(
             dtype_str,
             max_seq_len,
             **config,
+            arch=arch,
+            num_cus=num_cus,
         )
     except ValueError as exc:
         if fused is True:
@@ -1158,6 +1190,7 @@ def _make_bwd_fused_runners(
         # A direct caller asked for this kernel by name, so the gate raises
         # rather than silently handing back the dvdk + dq pair.
         config = _resolve_bwd_fused_config(
+            device=q.device,
             dtype_str=dtype_str,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -1173,6 +1206,7 @@ def _make_bwd_fused_runners(
             fused=True,
         )
 
+    arch, num_cus = _device_arch_and_cus(q.device.index)
     fused_launcher = build_hstu_attention_bwd(
         num_heads,
         head_dim,
@@ -1186,6 +1220,8 @@ def _make_bwd_fused_runners(
         max_seq_len=N,
         has_perm=sort_by_length,
         **config,
+        arch=arch,
+        num_cus=num_cus,
     )
 
     launch_stream = _enter_launch_stream(
@@ -1439,7 +1475,11 @@ def flydsl_hstu_attention_bwd(
     if q.shape[0] == 0:
         # No tokens: nothing to launch, and every kernel's out-of-bounds lanes
         # rely on global row 0 existing.
-        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        launch_stream = _enter_launch_stream(
+            stream, q, k, v, dout, seq_offsets, num_targets
+        )
+        with torch.cuda.stream(launch_stream):
+            return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
     custom_config = {
         key: value
@@ -1452,6 +1492,7 @@ def flydsl_hstu_attention_bwd(
         if value is not None
     }
     fused_config = _resolve_bwd_fused_config(
+        device=q.device,
         dtype_str=dtype_str,
         num_heads=num_heads,
         head_dim=head_dim,

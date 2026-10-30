@@ -25,6 +25,7 @@ fp32 scores, so it is skipped (``err`` empty) for cases where that would not fit
 import argparse
 import csv
 import itertools
+import time
 import weakref
 
 import pandas as pd
@@ -446,6 +447,17 @@ def test_validate_bwd_inputs_checks_metadata_values(offsets, targets, match):
 
 
 @requires_cuda
+def test_validate_bwd_inputs_compares_mixed_widths_in_int64():
+    """int64 targets next to int32 offsets are not narrowed: 2**32 would wrap
+    to 0 and pass."""
+    q, k, v, dout, _ = _qkv_do()
+    seq_offsets = torch.tensor([0, 4, 8], dtype=torch.int32, device=q.device)
+    num_targets = torch.tensor([2**32, 0], dtype=torch.int64, device=q.device)
+    with pytest.raises(ValueError, match="must not exceed each sequence's length"):
+        _validate_bwd_inputs(q, k, v, dout, seq_offsets, num_targets, max_seq_len=8)
+
+
+@requires_cuda
 def test_validate_bwd_inputs_skips_values_by_default(monkeypatch):
     """Value checks synchronise with the device, so they are opt-in."""
     monkeypatch.delenv("AITER_HSTU_VALIDATE")
@@ -520,9 +532,10 @@ def test_flydsl_bwd_dense_causal_shapes(
 
 requires_fused = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or get_gfx() != "gfx942"
-    or torch.cuda.get_device_properties(0).multi_processor_count != 304,
-    reason="hstu bwd fused is validated on MI300X (gfx942, 304 CUs) only",
+    # The tests allocate on "cuda", i.e. the current device.
+    or hstu_kernels._device_arch_and_cus(torch.cuda.current_device())
+    != ("gfx942", 304),
+    reason="hstu bwd fused is validated on the 304-CU gfx942 class only",
 )
 
 # B=32/H=4/N=1024/d=64 spans ~2-4 kv tiles per sequence at BLOCK_M=256, which is
@@ -788,6 +801,9 @@ def test_balance_perm_cache_is_safe_across_streams(aligned):
     stalled stream's free blocks are zero-filled first, so such a read gives a
     perm full of repeats instead of, by luck, the right one; the reader copies
     the perm at once, so a premature read is captured.
+
+    The ordering must not come from the host waiting: the cache miss returns
+    while the stalled stream is still asleep.
     """
     groups = hstu_kernels.NUM_GRID_GROUPS
     batch = groups * 3 + (0 if aligned else 1)
@@ -795,6 +811,11 @@ def test_balance_perm_cache_is_safe_across_streams(aligned):
     lengths = torch.randint(0, 100, (batch,), device="cuda", generator=g)
     seq_offsets = torch.zeros(batch + 1, dtype=torch.int64, device="cuda")
     seq_offsets[1:] = torch.cumsum(lengths, 0)
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    torch.cuda._sleep(200_000_000)
+    torch.cuda.synchronize()
+    sleep_s = time.perf_counter() - start
 
     for _ in range(5):
         hstu_kernels._balance_gather_index.cache_clear()
@@ -808,7 +829,9 @@ def test_balance_perm_cache_is_safe_across_streams(aligned):
         del poison
         with torch.cuda.stream(stalled):
             torch.cuda._sleep(200_000_000)
+            start = time.perf_counter()
             hstu_kernels._build_balance_perm(seq_offsets)
+            assert time.perf_counter() - start < sleep_s / 2, "cache miss blocked"
         with torch.cuda.stream(reader):
             perm = hstu_kernels._build_balance_perm(seq_offsets).clone()
         torch.cuda.synchronize()
@@ -911,9 +934,48 @@ def test_bwd_fused_gate_requires_validated_device(num_cus):
     CUs, MI300A with 228) are gated out; MI300X's 304 passes."""
     args = (4, 64, 64, True, 0, 0, False, 1.0, "bf16", 1024)
     tiles = {"block_m": 256, "block_n": 16, "num_waves": 8, "waves_per_eu": 2}
-    with pytest.raises(ValueError, match="validated on MI300X only"):
+    with pytest.raises(ValueError, match="304-CU gfx942 class only"):
         validate_hstu_attention_bwd(*args, **tiles, arch="gfx942", num_cus=num_cus)
     validate_hstu_attention_bwd(*args, **tiles, arch="gfx942", num_cus=304)
+
+
+@requires_fused
+def test_flydsl_bwd_fused_gate_reads_the_tensors_device(monkeypatch):
+    """The gate checks the device holding q, not the process's current one.
+
+    A node can mix gfx942 parts. Here q's device reports an 80-CU MI308X
+    while the current device stays the validated one, so the default must
+    fall back and `fused=True` must refuse.
+    """
+    real = hstu_kernels._device_arch_and_cus
+    queried = []
+
+    def fake(index):
+        queried.append(index)
+        return ("gfx942", 80) if index == q.device.index else real(index)
+
+    b, h, n, d = (_FUSED_CASE[key] for key in ("b", "h", "n", "d"))
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    monkeypatch.setattr(hstu_kernels, "_device_arch_and_cus", fake)
+    args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0)
+    with pytest.raises(ValueError, match="304-CU gfx942 class only"):
+        flydsl_hstu_attention_bwd(*args, fused=True)
+    assert queried and set(queried) == {q.device.index}
+
+    calls = []
+    real_runners = hstu_kernels._make_bwd_fused_runners
+    monkeypatch.setattr(
+        hstu_kernels,
+        "_make_bwd_fused_runners",
+        lambda *a, **kw: calls.append(1) or real_runners(*a, **kw),
+    )
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    dq, dk, dv = flydsl_hstu_attention_bwd(*args)
+    assert not calls
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
 @requires_fused
