@@ -478,6 +478,10 @@ def fused_gdn_decode_qkvz(
             _decode_group_ratio,
         )
 
+        # Row chunks in flight: 12 for an fp32 state (a whole ratio-3 group), 4 for a
+        # bf16 state.
+        num_buffers = 4 if ssm_state.dtype == torch.bfloat16 else 12
+        num_warps = 8
         conv_width = 2 * head_k_dim + ratio * head_v_dim
         has_qsl = query_start_loc is not None
         _decode_group_ratio[(tokens * k_heads,)](
@@ -496,14 +500,16 @@ def fused_gdn_decode_qkvz(
             1 << (conv_width - 1).bit_length(),
             # NW, KL, KS: 16 lanes per tile row, KS elements = one contiguous 16 B
             # access per lane (4 fp32 or 8 bf16; wider chunks cost 2-4x in bandwidth).
-            8,
+            num_warps,
             16,
             16 // ssm_state.element_size(),
             PAD_SLOT_ID=pad_slot_id,
             HAS_FP8=has_fp8,
             FLAT=flat,
             HAS_QSL=has_qsl,
-            num_warps=8,
+            REG_EPILOGUE=has_fp8,
+            NUM_BUFFERS=num_buffers,
+            num_warps=num_warps,
         )
     elif tokens >= _LARGE_BATCH:
         # Large-batch band: a separate decomposition that keeps the whole [V, K]
