@@ -773,28 +773,36 @@ def _late_rank(what, ctx, run, poll, reset, checked):
     checked()
 
 
-def _late_rank_layer(shape, wt, ctx, mode):
+def _late_rank_layer(shape, wt, ctx, mode, local=8, **kw):
     layer = new_layer(
-        shape, wt, ctx, mode, max_local(mode, shape, wt), wait_timeout_ms=LATE_LIMIT_MS
-    )
-    c = make_case(shape, wt, ctx, mode, 8 * ctx.world, "random", 16)
-    check(call(layer, c).clone(), c, RTOL, f"{mode}: call before the late rank")
-    _late_rank(
+        shape,
+        wt,
+        ctx,
         mode,
+        max_local(mode, shape, wt),
+        wait_timeout_ms=LATE_LIMIT_MS,
+        **kw,
+    )
+    what = f"{mode} big-M" if kw else mode
+    c = make_case(shape, wt, ctx, mode, local * ctx.world, "random", 16)
+    check(call(layer, c).clone(), c, RTOL, f"{what}: call before the late rank")
+    _late_rank(
+        what,
         ctx,
         lambda: layer(c.x, c.w, c.ids),
         layer.poll_errors,
         layer.reset,
-        lambda: check(call(layer, c).clone(), c, RTOL, f"{mode}: call after reset()"),
+        lambda: check(call(layer, c).clone(), c, RTOL, f"{what}: call after reset()"),
     )
     layer.close()
 
 
 def case_late_rank(shape, wt, ctx, S):
     """Rank 1 enters calls late (_late_rank), with wait_timeout_ms=LATE_LIMIT_MS: both
-    comm modes, then SpRsNorm."""
+    comm modes on the small-batch kernel and on big-M, then SpRsNorm."""
     for mode in MODES:
         _late_rank_layer(shape, wt, ctx, mode)
+        _late_rank_layer(shape, wt, ctx, mode, 64, bigm_min_tokens=64 * ctx.world)
     # 4 rows per CTA (one CTA per CU, 256 on MI355X), each a wait on every peer
     tokens = 1024 * ctx.world
     op = SpRsNorm(
