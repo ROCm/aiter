@@ -652,8 +652,20 @@ def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
         assert (storage[..., :offset].float() == 16).all()
 
 
+@pytest.mark.parametrize(
+    "kv_lora_rank, block_size, dtype",
+    [
+        (64, 64, e4m3_dtype),
+        (128, 64, e4m3_dtype),
+        (512, 64, e4m3_dtype),
+        (128, 128, torch.bfloat16),
+        (512, 128, e4m3_dtype),
+    ],
+)
 @torch.inference_mode()
-def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(monkeypatch):
+def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(
+    monkeypatch, kv_lora_rank, block_size, dtype
+):
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("unshuffled LDS pipeline requires gfx1250")
 
@@ -661,27 +673,73 @@ def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(monkeypatch):
 
     kernel = mla_module.gluon_mla_decode_fwd_kernel
     launches = []
+    heuristic_configs = []
+    select_config = mla_module.select_3d_config
+
+    def capture_config(*args, **kwargs):
+        attn, reduce = select_config(*args, **kwargs)
+        heuristic_configs.append(attn.copy())
+        return attn, reduce
+
+    monkeypatch.setattr(mla_module, "select_3d_config", capture_config)
 
     class CaptureLaunch:
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
                 launches.append(kwargs)
                 assert not kwargs["SHUFFLED_KV_CACHE"]
-                assert kwargs["num_stages"] == 3
-                assert kwargs["Q_FROM_LDS"]
-                assert kwargs["TDM_PARTIAL_STORE"]
+                if block_size == 128:
+                    for key, value in heuristic_configs[-1].items():
+                        assert kwargs[key] == value
+                    assert not kwargs.get("Q_FROM_LDS", False)
+                    assert not kwargs.get("TDM_PARTIAL_STORE", False)
+                else:
+                    assert kwargs["num_stages"] == 3
+                    assert kwargs["Q_FROM_LDS"]
+                    assert kwargs["TDM_PARTIAL_STORE"]
                 return kernel[grid](*args, **kwargs)
 
             return launch
 
     monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
     torch.manual_seed(0)
-    batch_size, num_query_heads, block_size, num_blocks = 32, 64, 64, 128
+    batch_size, num_query_heads, num_blocks = 32, 64, 128
+    qk_head_dim = kv_lora_rank + 64
     max_seqlen_kv = 16385
-    # This shape selects the shipped three-stage config. Mixed lengths cover
-    # short segment drains, ring reuse, and a partial final page in one launch.
-    lengths = [1, 65, 129, 257, 2049, max_seqlen_kv]
-    lengths.extend([65] * (batch_size - len(lengths)))
+    # Mixed lengths cover page boundaries, ring reuse and partial final pages.
+    # Rank 64 uses direct stores despite the tuned TDM store flag.
+    if block_size == 128 and dtype == e4m3_dtype:
+        tuned = mla_module._tuned_decode_config(
+            "pipelined_unshuffled",
+            "fp8",
+            "fp8",
+            num_query_heads,
+            batch_size,
+            max_seqlen_kv,
+        )
+        assert tuned
+        assert mla_module._pipelined_unshuffled_lds_bytes(
+            block_size,
+            tuned["BLOCK_M"],
+            kv_lora_rank,
+            64,
+            1,
+            1,
+            tuned["num_stages"],
+            tuned["Q_FROM_LDS"],
+        ) > 256 * 1024
+        assert mla_module._pipelined_unshuffled_lds_bytes(
+            block_size, num_query_heads, kv_lora_rank, 64, 1, 1
+        ) <= 256 * 1024
+    lengths = [
+        1,
+        block_size,
+        block_size + 1,
+        2 * block_size + 1,
+        16 * block_size + 1,
+        max_seqlen_kv,
+    ]
+    lengths.extend([block_size + 1] * (batch_size - len(lengths)))
     seq_lens_kv = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
     block_tables = torch.randint(
@@ -693,16 +751,16 @@ def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(monkeypatch):
     )
     # Logical pages may reuse physical pages; the oracle follows the same table.
     kv_buffer = torch.randn(
-        (num_blocks, block_size, 1, 576), dtype=torch.bfloat16, device="cuda"
-    ).to(e4m3_dtype)
+        (num_blocks, block_size, 1, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    ).to(dtype)
     query = torch.randn(
-        (batch_size, num_query_heads, 576), dtype=torch.bfloat16, device="cuda"
-    ).to(e4m3_dtype)
+        (batch_size, num_query_heads, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    ).to(dtype)
     q_descale = torch.tensor([0.3], dtype=torch.float32, device="cuda")
     kv_descale = torch.tensor([0.4], dtype=torch.float32, device="cuda")
     output_scale = torch.tensor([0.7], dtype=torch.float32, device="cuda")
     output = torch.empty(
-        (batch_size, num_query_heads, 512), dtype=torch.bfloat16, device="cuda"
+        (batch_size, num_query_heads, kv_lora_rank), dtype=torch.bfloat16, device="cuda"
     )
     mla_decode_fwd(
         q=query,
@@ -712,8 +770,8 @@ def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(monkeypatch):
         seqused_k=seq_lens_kv,
         max_seqlen_kv=max_seqlen_kv,
         block_tables=block_tables,
-        softmax_scale=576**-0.5,
-        kv_lora_rank=512,
+        softmax_scale=qk_head_dim**-0.5,
+        kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=64,
         causal=True,
         q_descale=q_descale,
@@ -728,8 +786,8 @@ def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(monkeypatch):
         cu_seqlens_q,
         seq_lens_kv,
         block_tables,
-        512,
-        576**-0.5,
+        kv_lora_rank,
+        qk_head_dim**-0.5,
         q_descale=q_descale,
         kv_descale=kv_descale,
         out_scale=output_scale,

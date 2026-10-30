@@ -1408,8 +1408,12 @@ class MLAProgram:
         )
         mask = self.query_mask_0_pv[:, None] & self.query_mask_1_pv[:, None]
 
+        token_offset = self.query_offset_0_pv[:, None]
+        if not self.cfg.USE_STORE_BUFFER_OP:
+            # Widen before multiplication; the output offset can exceed int32.
+            token_offset = token_offset.to(gl.int64)
         segm_output_offset = (
-            self.query_offset_0_pv[:, None]
+            token_offset
             * (
                 self.cfg.NUM_QUERY_HEADS
                 * self.cfg.NUM_SEGMENTS_PER_SEQ
@@ -2584,13 +2588,14 @@ def _mla_decode_fwd_kernel(
             if segm_output_ptr.type.element_ty.is_fp8():
                 acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
-        # The TDM store needs fp32 partials of one token's BLOCK_M heads, all in
-        # range, per program.
+        # TDM stores need full 128-column slices and one token's BLOCK_M heads
+        # in range per program.
         if (
             TDM_PARTIAL_STORE
             and NUM_SEGMENTS_PER_SEQ > 1
             and BLOCK_Q == 1
             and cfg.NUM_QUERIES_PER_KV % BLOCK_M == 0
+            and cfg.KV_LORA_RANK % 128 == 0
         ):
             pgm.tdm_store_output_3D(
                 acc,
