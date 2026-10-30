@@ -130,6 +130,7 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "can_use_flydsl_pa_decode": (".pa_decode", "can_use_flydsl_pa_decode"),
     "pa_decode": (".pa_decode", "pa_decode"),
     "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
     "prepare_gemm_a16wfp4_weight": (
@@ -185,6 +186,7 @@ __all__ = [
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
     "a16wfp4_shape_supported",
+    "can_use_flydsl_pa_decode",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
