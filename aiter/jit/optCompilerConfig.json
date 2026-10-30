@@ -142,7 +142,8 @@
     "module_custom_all_reduce": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce_ext.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -2026,6 +2027,7 @@
             "f'{AITER_CSRC_DIR}/pybind/fused_ar_mhc_post_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/fused_ar_mhc_post.cu'",
             "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce_ext.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'"
         ],
         "flags_extra_cc": [],
