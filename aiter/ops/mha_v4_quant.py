@@ -198,6 +198,9 @@ def _validate_hd128_last_dimension(input: Tensor, operation: str) -> None:
 
 def _validate_hip_row_layout(input: Tensor, operation: str) -> None:
     _validate_hd128_last_dimension(input, operation)
+    if input.is_contiguous():
+        # Dense rows are read as one buffer range, which takes any element-aligned start.
+        return
     if input.data_ptr() % 16:
         raise ValueError(f"{operation} input must start on a 16-byte boundary")
     if input.dim() == 4:
@@ -210,14 +213,15 @@ def _validate_hip_row_layout(input: Tensor, operation: str) -> None:
                 f"{operation} input batch, sequence and head strides must be "
                 "multiples of 16 bytes"
             )
-    elif not input.is_contiguous():
+    else:
         raise ValueError(f"{operation} input that is not BSHD must be contiguous")
 
 
 def _validate_bshd_hd128(
     input: Tensor, operation: str, hip_rows: bool = True
 ) -> tuple[int, int, int, int]:
-    # The HIP producers read rows as 16-byte vectors; the Triton ones take any pointer and strides.
+    # The HIP producers read strided rows as 16-byte vectors; the Triton ones take any pointer and
+    # strides.
     if input.dim() != 4:
         raise ValueError(f"{operation} requires hd128 BSHD input")
     if hip_rows:

@@ -820,8 +820,9 @@ __global__ __launch_bounds__(256) void quantize_v_mxfp6_fp6_p_kernel(
         out[groups * 24 + group_idx] = 0;
 }
 
-// Validates that `input`'s rows can be read through a RowLayout and returns it. The rows are read
-// as 16-byte vectors, so every row start has to be 16-byte aligned.
+// Validates that `input`'s rows can be read through a RowLayout and returns it. Strided rows are
+// read as plain 16-byte vectors, so each of their starts has to be 16-byte aligned; dense rows are
+// one buffer range, which takes any element-aligned start.
 RowLayout input_row_layout(const aiter_tensor_t& input)
 {
     AITER_CHECK(input.dim() >= 1 && input.size(-1) == kHeadDim,
@@ -829,14 +830,15 @@ RowLayout input_row_layout(const aiter_tensor_t& input)
     AITER_CHECK(input.numel() == 0 || input.stride(-1) == 1,
                 "input must have a contiguous last dimension");
     const int64_t element_size = static_cast<int64_t>(input.element_size());
-    AITER_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0,
+    const bool dense           = input.is_contiguous();
+    AITER_CHECK(dense || reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0,
                 "input must start on a 16-byte boundary");
     RowLayout layout{};
     if(input.dim() == 4)
     {
         for(int d = 0; d < 3; ++d)
         {
-            AITER_CHECK(input.size(d) == 1 || input.stride(d) * element_size % 16 == 0,
+            AITER_CHECK(dense || input.size(d) == 1 || input.stride(d) * element_size % 16 == 0,
                         "input batch, sequence and head strides must be multiples of 16 bytes");
         }
         layout.batch_stride = input.stride(0);
@@ -859,7 +861,7 @@ RowLayout input_row_layout(const aiter_tensor_t& input)
         layout.sequence = 1;
         layout.heads    = 1;
     }
-    layout.dense = input.is_contiguous();
+    layout.dense = dense;
     return layout;
 }
 

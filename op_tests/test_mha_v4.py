@@ -720,6 +720,61 @@ def test_mha_v4_hip_quantizers_reject_unsupported_bshd_layouts(
         _HIP_ROW_LAYOUT_QUANTIZERS[quantizer](value)
 
 
+def _rotate_hd128(value):
+    out = torch.empty(value.shape, device=value.device, dtype=value.dtype)
+    rotate_activation_hd128(out, value)
+    return out
+
+
+def _rotate_mxfp6(value):
+    batch, sequence, heads, _ = value.shape
+    out = value.new_empty((batch, sequence, heads, 96), dtype=torch.uint8)
+    scale = value.new_empty((batch, sequence, heads, 4), dtype=torch.uint8)
+    rotate_activation_mxfp6_quant(out, scale, value, 1.0)
+    return out, scale
+
+
+_HIP_DENSE_ENTRY_POINTS = {
+    "rotate_hd128": _rotate_hd128,
+    "rotate_mxfp6": _rotate_mxfp6,
+    **{
+        name: lambda x, quantize=_STRIDED_QUANTIZERS[name]: quantize(x, None)
+        for name in _HIP_ROW_LAYOUT_QUANTIZERS
+        if name in _STRIDED_QUANTIZERS
+    },
+}
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
+@parametrize(
+    "entry_point",
+    [
+        param(
+            name,
+            skip=get_gfx() != "gfx950" and name not in ("rotate_hd128", "fp8_rotated"),
+        )
+        for name in _HIP_DENSE_ENTRY_POINTS
+    ],
+)
+@parametrize("offset", [1, 4])
+def test_mha_v4_hip_quantizers_take_contiguous_input_at_any_element_offset(
+    entry_point, offset
+):
+    """Contiguous rows are read as one buffer range, which needs no 16-byte start: only strided
+    rows do. A contiguous view off that grid quantizes exactly as an aligned copy does.
+    """
+    torch.manual_seed(47)
+    shape = (2, 257, 3, 128)
+    storage = torch.randn(
+        math.prod(shape) + offset, device="cuda", dtype=torch.bfloat16
+    )
+    value = storage[offset:].view(shape)
+    assert value.is_contiguous() and value.data_ptr() % 16
+    quantize = _HIP_DENSE_ENTRY_POINTS[entry_point]
+
+    assert _bitwise_equal(quantize(value), quantize(value.clone()))
+
+
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
 @parametrize(
     "quantizer",
