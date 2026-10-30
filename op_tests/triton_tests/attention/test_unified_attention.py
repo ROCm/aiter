@@ -655,9 +655,9 @@ def _length_aware_seq_lens(batch: str, query_len: int):
 
 
 @pytest.mark.parametrize(
-    "batch, num_heads, max_query_len, use_sinks",
+    "batch, num_heads, max_query_len, use_sinks, seqused_k_dtype",
     [
-        (batch, *shape)
+        (batch, *shape, torch.int32)
         for shape in [
             ((8, 2), 4, False),  # Kimi-K3 DSpark draft verify
             ((8, 2), 1, False),
@@ -665,7 +665,9 @@ def _length_aware_seq_lens(batch: str, query_len: int):
         ]
         for batch in ["skewed", "uniform"]
     ]
-    + [("skewed_300", (8, 2), 1, False)],
+    + [("skewed_300", (8, 2), 1, False, torch.int32)]
+    # sglang passes int64 sequence lengths
+    + [("skewed", (8, 2), 4, False, torch.int64)],
 )
 @torch.inference_mode()
 def test_triton_unified_attn_3d_length_aware_split(
@@ -673,6 +675,7 @@ def test_triton_unified_attn_3d_length_aware_split(
     num_heads: tuple[int, int],
     max_query_len: int,
     use_sinks: bool,
+    seqused_k_dtype: torch.dtype,
     monkeypatch,
 ) -> None:
     """Length-aware KV split (kv_split SPLIT_PROGRAMS_PER_CU), head dim 64 bf16-Q / fp8-KV.
@@ -736,7 +739,7 @@ def test_triton_unified_attn_3d_length_aware_split(
         v=value_cache,
         out=output,
         cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
+        seqused_k=kv_lens.to(seqused_k_dtype),
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=1 << 20,
         softmax_scale=scale,
