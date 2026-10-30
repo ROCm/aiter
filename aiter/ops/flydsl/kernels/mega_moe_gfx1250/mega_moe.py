@@ -2033,8 +2033,14 @@ class MegaMoEGfx1250:
                 )
             if self._compact_wire_row > 0xFFFF:
                 reasons.append(f"wire row {self._compact_wire_row} B > 65535")
-            if 2 * self.inter_dim > 16 * _S1F_TILE_N:
-                reasons.append(f"inter_dim {self.inter_dim} needs more than 16 n-tiles")
+            from .s1f_stage1 import _ITEM_N_BITS
+
+            max_s1f_n_tiles = 1 << _ITEM_N_BITS
+            if 2 * self.inter_dim > max_s1f_n_tiles * _S1F_TILE_N:
+                reasons.append(
+                    f"inter_dim {self.inter_dim} needs more than "
+                    f"{max_s1f_n_tiles} n-tiles"
+                )
             # The stage-1 builder's own limits, checked before any step can skip
             # its dispatch for a kernel that would not build.
             from .s1f_stage1 import _SCALE_PIECE, N_XCC, S1F_PRODUCERS

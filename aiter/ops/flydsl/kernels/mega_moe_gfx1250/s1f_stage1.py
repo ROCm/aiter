@@ -102,6 +102,12 @@ from .config import _WAVE_SIZE as WAVE
 SCOPE_DEV = 2 << 3
 SCOPE_SYS = 3 << 3
 
+#: A GEMM1 work item is ``(m_tile << _ITEM_N_BITS) | n_tile``.  Five bits
+#: cover Flash's SwiGLU N=4608 (18 tiles at tile_n=256) while leaving 27 bits
+#: for the compact row tile.
+_ITEM_N_BITS = 5
+_ITEM_N_MASK = (1 << _ITEM_N_BITS) - 1
+
 #: Control block layout (i32 words). Each counter on its own 128 B line.
 CTL_ENTRY = 0  # u64 entry ticket (words 0-1)
 #: Generations run 1 .. GEN_MOD: never 0 (a flag no launch has written reads
@@ -619,8 +625,10 @@ def make_s1f_stage1(
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
-    if NT > 16:
-        raise ValueError(f"an item code packs the n-tile in 4 bits, got {NT} n-tiles")
+    if NT > _ITEM_N_MASK + 1:
+        raise ValueError(
+            f"an item code packs the n-tile in {_ITEM_N_BITS} bits, got {NT} n-tiles"
+        )
     B1 = GM * NT
     # Runs per W1 claim. A piece has at most FLAG_M / R = 8 runs, and W1 reads
     # 31 - RBK runs past its block to find where its last piece ends.
@@ -1520,7 +1528,8 @@ def make_s1f_stage1(
                 _ring_barrier()
 
             # ================= GEMM1 consumer role (every CTA) =================
-            # An item is the tile (m, n), coded (m << 4) | n; -1 ends the loop.
+            # An item is the tile (m, n), coded
+            # ``(m << _ITEM_N_BITS) | n``; -1 ends the loop.
             # Per-item state, uniform in every wave: code, tinfo (the plan's
             # srcmask | expert << 8 | rows << 16), ready (wave 0 pre-checked
             # the tile's flags), queue (the head the next claim goes to).
@@ -1619,7 +1628,9 @@ def make_s1f_stage1(
                     (k == groups - fx.Int32(1)).select(gs_last, fx.Int32(GM))
                 )
                 rq = r // gsz
-                return ((k * fx.Int32(GM) + r - rq * gsz) << fx.Int32(4)) | rq
+                return (
+                    (k * fx.Int32(GM) + r - rq * gsz) << fx.Int32(_ITEM_N_BITS)
+                ) | rq
 
             def q_head_bytes(xq):
                 return (fx.Int32(CTL_HEAD) + par * fx.Int32(32)) * fx.Int32(4)
@@ -1813,11 +1824,16 @@ def make_s1f_stage1(
                 # static range: claim (blocking) and broadcast.
                 if is_w0:
                     c0, x0 = claim_now(queue)
-                    publish_slot(c0, tinfo_m(c0 >> fx.Int32(4)), fx.Int32(0), x0)
+                    publish_slot(
+                        c0,
+                        tinfo_m(c0 >> fx.Int32(_ITEM_N_BITS)),
+                        fx.Int32(0),
+                        x0,
+                    )
                 _rawbar()
                 code, tinfo, ready, queue = read_slot()
             if code >= fx.Int32(0):
-                tinfo = tinfo_m(code >> fx.Int32(4))
+                tinfo = tinfo_m(code >> fx.Int32(_ITEM_N_BITS))
 
             def set_holders(meta, ready_fn, hooks):
                 # The GEMM body reads these when it is inlined below; a
@@ -1829,8 +1845,8 @@ def make_s1f_stage1(
 
             seq = fx.Int32(0)
             while code >= fx.Int32(0):
-                m = code >> fx.Int32(4)
-                n = code & fx.Int32(15)
+                m = code >> fx.Int32(_ITEM_N_BITS)
+                n = code & fx.Int32(_ITEM_N_MASK)
                 mask = tinfo & fx.Int32(0xFF)
 
                 def a_ready(m=m, mask=mask, ready=ready, seq=seq):
@@ -1900,7 +1916,9 @@ def make_s1f_stage1(
                 def epi_start(queue=queue, nxt=nxt):
                     c = claim_resolve(queue, nxt["claim"])
                     live = c >= fx.Int32(0)
-                    m_n = fx.Int32(live.select(c >> fx.Int32(4), fx.Int32(0)))
+                    m_n = fx.Int32(
+                        live.select(c >> fx.Int32(_ITEM_N_BITS), fx.Int32(0))
+                    )
                     ts_n, ti_n, fl_n = pre_load(m_n, live)
                     nxt["code"] = c
                     nxt["tsub"] = ts_n
@@ -1915,7 +1933,7 @@ def make_s1f_stage1(
                         xq_n = queue
                         if c == fx.Int32(-2):
                             c, xq_n = steal(queue)
-                            ti = tinfo_m(c >> fx.Int32(4))
+                            ti = tinfo_m(c >> fx.Int32(_ITEM_N_BITS))
                             rdy = fx.Int32(0)
                         publish_slot(c, ti, rdy, xq_n)
 
