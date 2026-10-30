@@ -1241,12 +1241,14 @@ def _head_major(*xs):
     return tuple(x.transpose(1, 2).contiguous().transpose(1, 2) for x in xs)
 
 
-def _record_tdm_operands(monkeypatch):
-    """Have the gfx1250 Gluon launchers note the storage they are handed for
-    each operand they read by TDM, as ``{(launcher, argument): {data_ptr}}``."""
+def _record_in_place_operands(monkeypatch):
+    """Have this arch's Gluon launchers note the storage they are handed for
+    each operand they read at its own stride, as
+    ``{(launcher, argument): {data_ptr}}``."""
     g1, g2 = (
         importlib.import_module(
-            f"aiter.ops.triton._gluon_kernels.gfx1250.kimi_delta_attn.{name}"
+            f"aiter.ops.triton._gluon_kernels.{_flash_kda.DEVICE_ARCH}"
+            f".kimi_delta_attn.{name}"
         )
         for name in ("flash_kda_k1", "flash_kda_k2")
     )
@@ -1298,14 +1300,14 @@ def test_strided_operands_match_packed(layout, chunks_per_seg, monkeypatch):
     views = _LAYOUTS[layout](*args[:4])
     assert not any(x.is_contiguous() for x in views)
 
-    on_tdm = _flash_kda.DEVICE_ARCH == "gfx1250"
+    reads_strided = _flash_kda.DEVICE_ARCH in ("gfx950", "gfx1250")
     with _route(k1=True, k2=True):
         o_ref, ht_ref = run_flash(*args, **kw)
-        seen = _record_tdm_operands(monkeypatch) if on_tdm else None
+        seen = _record_in_place_operands(monkeypatch) if reads_strided else None
         o, ht = run_flash(*views, *args[4:], **kw)
     assert torch.equal(o, o_ref)
     assert torch.equal(ht, ht_ref)
-    if not on_tdm:
+    if not reads_strided:
         return
 
     q, k, v, g = views
@@ -1317,10 +1319,13 @@ def test_strided_operands_match_packed(layout, chunks_per_seg, monkeypatch):
     }
     if chunks_per_seg:
         handed[("k2_ab_fused_fast", "v_input")] = v
+    # gfx950 packs rows that are not 16-byte aligned.
+    aligned_only = _flash_kda.DEVICE_ARCH == "gfx950"
+    in_place_layouts = ("bands",) if aligned_only else ("bands", "skewed bands")
     assert seen.keys() == handed.keys()
     for key, view in handed.items():
         in_place = seen[key] == {view.data_ptr()}
-        assert in_place == (layout in ("bands", "skewed bands")), key
+        assert in_place == (layout in in_place_layouts), key
 
 
 @pytest.mark.parametrize("pipeline", ["flash_kda", "default"])
@@ -1401,8 +1406,10 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
     params = inspect.signature(flash_kda_fwd).parameters
     assert by_name.keys() == params.keys()
 
+    # On gfx950 this small shape can take the Triton pass C, which reads a
+    # packed v.
     on_tdm = _flash_kda.DEVICE_ARCH == "gfx1250"
-    seen = _record_tdm_operands(monkeypatch) if on_tdm else None
+    seen = _record_in_place_operands(monkeypatch) if on_tdm else None
     o, ht = flash_kda_fwd(*(by_name[name] for name in params))
     assert ht is None
     assert o.data_ptr() == out.data_ptr()

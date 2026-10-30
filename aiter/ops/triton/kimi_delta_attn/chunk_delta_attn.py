@@ -28,8 +28,9 @@ Notes on the fla-compatible surface:
     * ``cu_seqlens_cpu`` is used for every host-side read of the sequence
       bounds, not only for the chunk indices as in fla.
     * Tensor arguments are made contiguous, as fla's ``@input_guard`` does,
-      because some kernels below assume contiguous strides. On gfx1250 the
-      FlashKDA kernels read q, k, v and g at their own token stride instead.
+      because some kernels below assume contiguous strides. On gfx950 and
+      gfx1250 the FlashKDA Gluon kernels read q, k, v and g at their own token
+      stride instead.
     * This path is forward-only, so the output carries no ``grad_fn`` even
       when the inputs require grad, whereas fla returns a differentiable
       tensor.
