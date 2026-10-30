@@ -22,7 +22,6 @@ _PLAN_SCAN_LDS_BYTES = 512
 @cache
 def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_length):
     """Compile a batch bucket; actual batch and task capacity are runtime values."""
-    items = (max_batch + threads - 1) // threads
     scan_tiles = fx.coop.BlockScan[fx.Int64, threads]
     scan_counts = fx.coop.BlockScan[fx.Int32, threads]
     reduce_rows = fx.coop.BlockReduce[fx.Int32, threads]
@@ -30,6 +29,16 @@ def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_
     @fx.struct
     class TaskStorage:
         ends: fx.Array[fx.Int32, max_batch, 16]
+
+    def visible_tiles(ctx):
+        """Return the first visible tile and the visible tile count."""
+        length = fx.max(fx.Int64(ctx), fx.Int64(0))
+        first = fx.Int64(0)
+        if sliding_window > 0:
+            first = (
+                fx.max(length - (query_length - 1) - sliding_window, fx.Int64(0)) // 256
+            )
+        return first, (length + 255) // 256 - first
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
     def pa_decode_plan_kernel(
@@ -48,53 +57,53 @@ def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_
         count_storage = smem.allocate(scan_counts.SharedStorage).peek()
         row_storage = smem.allocate(reduce_rows.SharedStorage).peek()
         task_ends = smem.allocate(TaskStorage).peek().ends
-        tiles = []
-        nonempty = []
-        # Consecutive per-thread items preserve sequence order in vector scans.
-        for item in fx.range_constexpr(items):
-            seq = tid * items + item
-            ctx = fx.Int32(0)
-            if seq < batch:
-                ctx = lengths[seq]
-            length = fx.max(fx.Int64(ctx), fx.Int64(0))
-            first = fx.Int64(0)
-            if fx.const_expr(sliding_window > 0):
-                first = (
-                    fx.max(length - (query_length - 1) - sliding_window, fx.Int64(0))
-                    // 256
-                )
-            count = (length + 255) // 256 - first
-            tiles.append(count)
-            nonempty.append(fx.Int32(count > 0))
+        # Each thread walks its consecutive rows with runtime bounds, so scans
+        # of per-thread totals preserve sequence order, padding rows cost
+        # nothing, and register use does not grow with the batch bucket.
+        rows = (batch + threads - 1) // threads
+        row_begin = fx.min(fx.Int32(tid) * rows, batch)
+        row_end = fx.min(row_begin + rows, batch)
+        thread_tiles = fx.Int64(0)
+        thread_rows = fx.Int32(0)
+        for seq in range(row_begin, row_end):
+            _, tiles = visible_tiles(lengths[seq])
+            thread_tiles = thread_tiles + tiles
+            thread_rows = thread_rows + fx.Int32(tiles > 0)
 
-        cumulative, total = scan_tiles.inclusive_with_aggregate(
-            fx.Vector.from_elements(tiles), fx.ReductionOp.ADD, storage=tile_storage
+        cumulative, total = scan_tiles.exclusive_with_aggregate(
+            thread_tiles, fx.ReductionOp.ADD, storage=tile_storage
         )
         total = fx.max(total, fx.Int64(1))
-        remaining = capacity - reduce_rows(
-            fx.Vector.from_elements(nonempty), fx.ReductionOp.ADD, storage=row_storage
+        remaining = fx.Int64(
+            capacity - reduce_rows(thread_rows, fx.ReductionOp.ADD, storage=row_storage)
         )
-        counts = []
-        for item in fx.range_constexpr(items):
-            upper = cumulative[item] * fx.Int64(remaining) // total
-            lower = (cumulative[item] - tiles[item]) * fx.Int64(remaining) // total
-            count = fx.min(
-                fx.min(fx.Int64(nonempty[item]) + upper - lower, tiles[item]),
-                fx.Int64(max_parts),
+        # Each row's lower bound is the previous row's upper bound.
+        lower = cumulative * remaining // total
+        thread_tasks = fx.Int32(0)
+        for seq in range(row_begin, row_end):
+            _, tiles = visible_tiles(lengths[seq])
+            cumulative = cumulative + tiles
+            upper = cumulative * remaining // total
+            count = fx.Int32(
+                fx.min(
+                    fx.min(fx.Int64(tiles > 0) + upper - lower, tiles),
+                    fx.Int64(max_parts),
+                )
             )
-            counts.append(fx.Int32(count))
-        starts, total_tasks = scan_counts.exclusive_with_aggregate(
-            fx.Vector.from_elements(counts), fx.ReductionOp.ADD, storage=count_storage
+            lower = upper
+            task_ends[seq] = count
+            thread_tasks = thread_tasks + count
+        row_start, total_tasks = scan_counts.exclusive_with_aggregate(
+            thread_tasks, fx.ReductionOp.ADD, storage=count_storage
         )
 
-        for item in fx.range_constexpr(items):
-            seq = tid * items + item
-            if seq < batch:
-                start = starts[item]
-                count = counts[item]
-                reduce_info[seq * 2] = start
-                reduce_info[seq * 2 + 1] = count
-                task_ends[seq] = start + count
+        # Rows are thread-private here; convert counts to ends in place.
+        for seq in range(row_begin, row_end):
+            count = task_ends[seq]
+            reduce_info[seq * 2] = row_start
+            reduce_info[seq * 2 + 1] = count
+            row_start = row_start + count
+            task_ends[seq] = row_start
         fx.gpu.barrier()
 
         # Spread packed task writes across all threads, including small batches
@@ -114,16 +123,7 @@ def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_
                     start = task_ends[seq - 1]
                 count = task_ends[seq] - start
                 ctx = lengths[seq]
-                length = fx.max(fx.Int64(ctx), fx.Int64(0))
-                first = fx.Int64(0)
-                if fx.const_expr(sliding_window > 0):
-                    first = (
-                        fx.max(
-                            length - (query_length - 1) - sliding_window, fx.Int64(0)
-                        )
-                        // 256
-                    )
-                num_tiles = (length + 255) // 256 - first
+                first, num_tiles = visible_tiles(ctx)
                 part = fx.Int64(slot - start)
                 work[slot * 4] = seq
                 work[slot * 4 + 1] = fx.Int32(first + part * num_tiles // count)

@@ -171,7 +171,7 @@ def test_pa_decode_plan(
         check(other_plan, values)
         other_config, other_launch = calls[-1]
         assert other_config == config
-        assert other_launch._cf is launch._cf
+        assert other_launch is launch
 
     if max_batch_size is not None:
         invalid_batch = batch + 1 if lds_limit else max_batch_size + 1
