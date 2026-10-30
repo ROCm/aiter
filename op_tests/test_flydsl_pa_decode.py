@@ -108,6 +108,8 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
 )
 def test_pa_decode_export_import_order(first):
     """Loading a sibling export first must not leave ``pa_decode`` a module."""
+    if importlib.util.find_spec("flydsl") is None:
+        pytest.skip("FlyDSL is not installed")
     code = (
         f"from aiter.ops.flydsl import {first}, pa_decode; assert callable(pa_decode)"
     )
