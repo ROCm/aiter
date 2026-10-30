@@ -320,6 +320,8 @@ def test_psum_remap(numel, E, tile_m):
     rows0[::101] = -1  # DROPPED_ROUTE_ROW must be left untouched
     masked = counts.clone()
     nvr = torch.tensor([numel], dtype=I32)
+    null_expert_tile_map = torch.empty(0, dtype=I32)
+    expert_tile_m = tile_m
     null_row_to_token = torch.empty(0, dtype=I32)
 
     ref_starts = run_torch_psum(masked, tile_m)[0]
@@ -340,10 +342,12 @@ def test_psum_remap(numel, E, tile_m):
             ptr_arg(starts),
             ptr_arg(psum),
             ptr_arg(cm),
+            ptr_arg(null_expert_tile_map),
             numel,
             E,
             route_max_m,
             tile_m,
+            expert_tile_m,
             ptr_arg(nvr),
             ptr_arg(null_row_to_token),
             1,  # topk, unused while row_to_token is null.
@@ -874,6 +878,11 @@ def test_route_psum_fused(numel, E, tile_m, topk=0):
     masked = torch.full((E,), -99, dtype=I32)
     starts = torch.full((E,), -99, dtype=I32)
     psum = torch.full((E,), -99, dtype=I32)
+    expert_tile_map = torch.full(
+        ((numel + E * tile_m + tile_m - 1) // tile_m,),
+        -99,
+        dtype=I32,
+    )
 
     def fn():
         launch(
@@ -882,9 +891,11 @@ def test_route_psum_fused(numel, E, tile_m, topk=0):
             ptr_arg(masked),
             ptr_arg(starts),
             ptr_arg(psum),
+            ptr_arg(expert_tile_map),
             numel,
             E,
             max_m,
+            tile_m,
             tile_m,
             stream=torch.cuda.current_stream().cuda_stream,
         )
@@ -914,6 +925,10 @@ def test_route_psum_fused(numel, E, tile_m, topk=0):
         assert bool(
             ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
         ), f"{name}: row outside its expert's contiguous band"
+        tile_experts = expert_tile_map.cpu().long()[r // tile_m]
+        assert bool(
+            (tile_experts == ids).all()
+        ), f"{name}: expert tile map disagrees with routed rows"
         assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
         ret[f"{name} us"] = us
         ret[f"{name} TB/s"] = nbytes / us / 1e6
