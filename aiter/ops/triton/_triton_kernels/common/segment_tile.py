@@ -51,3 +51,17 @@ def _find_segment_tile_range(
     m_range_start = tl.load(seg_indptr + bid) + (pid - idx_start) * BLOCK_SIZE
     m_range_end = min(tl.load(seg_indptr + bid + 1), m_range_start + BLOCK_SIZE)
     return m_range_start, m_range_end, bid
+
+
+@triton.jit
+def _lower_bound(sorted_ptr, n, value):
+    """Number of entries of sorted_ptr[0:n] that are less than value. The entries must not decrease."""
+    lo = 0
+    hi = n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if tl.load(sorted_ptr + mid) < value:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
