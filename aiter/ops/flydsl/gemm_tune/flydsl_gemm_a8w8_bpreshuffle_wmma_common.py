@@ -135,7 +135,9 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
         return False
-    if (K // ki.split_k) // ki.tile_k < ki.num_buffers:
+    # K=128 with two buffers needs no steady-loop iteration.
+    min_k_tiles = 1 if ki.num_buffers == 2 and K == ki.tile_k == 128 else ki.num_buffers
+    if (K // ki.split_k) // ki.tile_k < min_k_tiles:
         return False
     # M may be ragged; the kernel handles partial M tiles via OOB clamping,
     # so tile_m > M is legal (and needed for small-M decode shapes).
