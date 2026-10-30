@@ -459,7 +459,7 @@ def launch_gemm_a8w8_256x256(
                 pad_amount=pad,
                 num_warps=1,
                 workgroup_mask=mask,
-                early_timeout=early,
+                early_timeout=early and owner > 1,
                 oob_outer_bound=bound,
                 oob_inner_bound=inner_bound,
             )
@@ -1351,7 +1351,7 @@ def launch_gemm_a8w8_256x256(
                     if defer == 0:
                         rocdl.sched_barrier(0)
                         tdm_ops.tensor_wait(0)
-                        cluster.cluster_barrier()
+                        workgroup_barrier(use_cluster=False)
             seed_delta = _seed_delta(i)
             if const_expr(c_relocate and i < C_EARLY_SLOTS):
                 if fx.Int32(i) >= prev_pref:
@@ -1488,7 +1488,7 @@ def launch_gemm_a8w8_256x256(
             for c in range_constexpr(C_EARLY_SLOTS + 1):
                 if n_out == c:
                     tdm_ops.tensor_wait(c)
-            workgroup_barrier(use_cluster=True)
+            workgroup_barrier(use_cluster=False)
         else:
             pipeline_fence(outstanding=0, use_cluster=True)
         gC_base = fx.recast_iter(
