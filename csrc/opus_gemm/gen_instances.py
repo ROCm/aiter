@@ -26,7 +26,6 @@ from codegen.common import (
 )
 from opus_gemm_common import (
     KERNEL_REGISTRY,
-    base_gfx_arch,
     KernelKey,
     OpusGemmInstance,
     a8w8_kernels_list,
@@ -35,6 +34,7 @@ from opus_gemm_common import (
     a16w16_flatmm_splitk_kernels_list,
     a16w16_kernels_list,
     a16w16_mono_tile_kernels_list,
+    base_gfx_arch,
     default_compiled_keys,
     get_registry,
     gfx942_a8w8_kernels_list,

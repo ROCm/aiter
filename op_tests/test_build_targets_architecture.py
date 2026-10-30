@@ -195,9 +195,7 @@ class TestRuntimeArchitecture(unittest.TestCase):
                 "_gpu_info_output",
                 return_value="  Name: gfx1250-strict\n",
             ):
-                self.assertEqual(
-                    self.chip_info._detect_native(), ["gfx1250-strict"]
-                )
+                self.assertEqual(self.chip_info._detect_native(), ["gfx1250-strict"])
         finally:
             self.chip_info._detect_native.cache_clear()
 
@@ -358,7 +356,6 @@ asicRevision: 0
                     self.chip_info.get_gfx_runtime()
 
 
-
 class TestGfxFamilyHelper(unittest.TestCase):
     """base_gfx_arch / is_gfx1250_family: map strict to the gfx1250 family for
     source/kernel sharing only -- never a binary-compatibility claim."""
@@ -411,6 +408,7 @@ class TestCodeObjectRebuildGuard(unittest.TestCase):
     def test_host_only_so_is_not_rebuilt(self):
         # empty offload set = host-only module; never force a rebuild.
         self.assertFalse(self._needs_rebuild("gfx1250-strict", set()))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,8 +15,8 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.build_targets import is_gfx1250_family
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .arena import (
@@ -176,7 +176,6 @@ class MegaMoEGfx1250:
         self = cls.__new__(cls)
         self._build(recipe, geometry, communicator, situ_beta, situ_linear_beta)
         return self
-
 
     @classmethod
     def required_vmm_bytes(

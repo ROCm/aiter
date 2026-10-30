@@ -17,7 +17,7 @@ sys.path.insert(
         os.path.dirname(os.path.abspath(__file__)), "..", "..", "aiter", "jit", "utils"
     ),
 )
-from build_targets import base_gfx_arch  # noqa: E402
+from build_targets import base_gfx_arch
 
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
