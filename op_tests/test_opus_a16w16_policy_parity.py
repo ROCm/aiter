@@ -256,16 +256,25 @@ def _pre_pr_python_tuned_map(rows: pd.DataFrame) -> dict[tuple, dict]:
 
 
 def _pre_pr_codegen_tuned_map(rows: pd.DataFrame) -> dict[tuple, int]:
-    # Preserve the original arch-specific launcher-pointer table, with identity
-    # now supplied by the CSV's gfx/CU fields rather than inferred from an ID.
+    # Preserve the original arch-specific launcher-pointer table, scoped by CU
+    # count like the local kernel IDs. Identity is supplied by the CSV's gfx/CU
+    # fields rather than inferred from an ID.
     result = {}
     for _, row in rows.iterrows():
         kid = int(row["solidx"])
         arch = str(row["gfx"])
-        instance = get_kernel_instance(arch, "a16w16", kid, cu_num=int(row["cu_num"]))
+        cu_num = int(row["cu_num"])
+        instance = get_kernel_instance(arch, "a16w16", kid, cu_num=cu_num)
         assert instance is not None
         assert instance.name == row["kernelName"]
-        key = (arch, int(row["M"]), int(row["N"]), int(row["K"]), str(row["outdtype"]))
+        key = (
+            arch,
+            cu_num,
+            int(row["M"]),
+            int(row["N"]),
+            int(row["K"]),
+            str(row["outdtype"]),
+        )
         result[key] = kid
     return result
 
@@ -318,7 +327,12 @@ def test_shipped_tuned_selection_diff_is_exhaustive(
 
         # The removed C++ table and the runtime table select the same kid for
         # every shipped full-key row. splitK was not stored in the C++ table.
-        codegen_key = (*shape, str(fields["outdtype"]))
+        codegen_key = (
+            arch,
+            int(fields["cu_num"]),
+            *shape[1:],
+            str(fields["outdtype"]),
+        )
         assert pre_pr_codegen[codegen_key] == pair[0]
 
         old_row = pre_pr_python[key[1:]]
