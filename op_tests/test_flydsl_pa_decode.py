@@ -1,99 +1,35 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Generic FlyDSL paged decode correctness test.
+"""Generic FlyDSL paged decode correctness test and perf sweep.
 
-Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
+Run with: python3 op_tests/test_flydsl_pa_decode.py [-k fp8 bf16 mxfp4]
 """
 
+import argparse
+import importlib
 import importlib.util
+import re
+import sys
 from itertools import product
+from types import SimpleNamespace
+from unittest import mock
 
-import pytest
+import pandas as pd
 import torch
 
+import aiter
 from aiter import per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.quant import per_1x32_f4_quant
+from aiter.test_common import assertAllclose, benchmark, run_perftest
 from aiter.utility import fp4_utils
 
+torch.set_default_device("cuda")
 
-@pytest.fixture
-def device(monkeypatch):
-    if not torch.cuda.is_available():
-        pytest.skip("ROCm is not available")
-    if get_gfx_runtime() not in ("gfx942", "gfx950", "gfx1250"):
-        pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
-    if importlib.util.find_spec("flydsl") is None:
-        pytest.skip("FlyDSL is not installed")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    return torch.device("cuda")
-
-
-@pytest.mark.parametrize(
-    "batch,max_parts,budget,window,query_length",
-    [
-        (1, 1, 1, 0, 1),
-        (6, 7, 160, 257, 4),
-        (63, 7, 160, 0, 1),
-        (65, 7, 512, 1, 4),
-        (257, None, 4096, 8193, 4),
-        (4096, None, 8192, 0, 1),
-    ],
-)
-def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
-    """Packed tasks cover every visible tile and remain valid after graph refresh."""
-    from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
-
-    def check(plan, lengths):
-        info = plan.reduce_info.cpu().tolist()
-        work = plan.work_info.cpu().tolist()
-        cursor = 0
-        for seq, (ctx, (start, count)) in enumerate(zip(lengths, info)):
-            assert start == cursor
-            first = (
-                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0
-            )
-            last = (max(ctx, 0) + 255) // 256
-            assert 0 <= count <= min(last - first, plan.max_partitions)
-            assert (count > 0) == (last > first)
-            tile = first
-            for record in work[start : start + count]:
-                row, begin, end, original_length = record
-                assert row == seq and original_length == ctx
-                assert begin == tile and begin < end <= last
-                tile = end
-            assert tile == last
-            cursor += count
-        assert cursor <= plan.capacity
-        assert all(record == [0, 0, 0, 0] for record in work[cursor:])
-
-    pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
-    lengths = [pattern[i % len(pattern)] for i in range(batch)]
-    context = torch.tensor(lengths, dtype=torch.int32, device=device)
-    plan = plan_pa_decode(
-        context,
-        2,
-        max_partitions=max_parts,
-        workgroup_budget=budget,
-        sliding_window=window,
-        query_length=query_length,
-    )
-    check(plan, lengths)
-    pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        refreshed = plan_pa_decode(
-            context, 2, sliding_window=window, query_length=query_length, plan=plan
-        )
-    assert refreshed is plan
-    # All-empty replay must erase old active records, then mixed lengths must
-    # rebuild them using the same buffers without stale padding or readback.
-    for values in ([0] * batch, list(reversed(lengths))):
-        context.copy_(torch.tensor(values, dtype=torch.int32, device=device))
-        graph.replay()
-        check(plan, values)
-        assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
+DEVICE = torch.device("cuda")
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
+KV_DTYPES = ["fp8", "bf16", "mxfp4"]
 
 
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
@@ -566,41 +502,39 @@ _INVALID_CASES = [
 
 
 def _check_output(output, reference):
+    """Finite and equal to the FP32 reference; any element off fails (ratio 0)."""
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    assert output.shape == reference.shape
+    return assertAllclose(
+        output.float(), reference, rtol=5e-3, atol=5e-3, tol_err_ratio=0
+    )
 
 
-def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
-    query, key, value, *rest = arguments
-    invalid = case["invalid_input"]
-    if invalid == "fp16-query":
-        query = query.to(torch.float16)
-    elif invalid == "plain-v":
-        value = torch.empty((1, 1, 128, 64), dtype=query.dtype, device=query.device)
-    elif invalid == "scaled-kv":
-        options.update(
-            key_scale=torch.ones(1, dtype=torch.float32, device=query.device),
-            value_scale=torch.ones(1, dtype=torch.float32, device=query.device),
-        )
-    elif invalid == "vector16-k":
-        key = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=query.device)
-    elif invalid == "vector16-v":
-        value = torch.empty((1, 1, 4, 128, 16), dtype=query.dtype, device=query.device)
+def _expect_error(error, match, call):
+    try:
+        call()
+    except error as exc:
+        if not re.search(match, str(exc)):
+            raise AssertionError(
+                f"expected {error.__name__} matching {match!r}, got {exc!r}"
+            ) from exc
+        return
+    raise AssertionError(f"expected {error.__name__} matching {match!r}; none raised")
 
-    def unexpected_compile(**_):
-        pytest.fail("invalid BF16 inputs reached kernel compilation")
 
-    monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
-    with pytest.raises(case["error"], match=case["match"]):
-        pa.pa_decode(
-            torch.empty_like(query),
-            query,
-            key,
-            value,
-            *rest,
-            work_plan=plan,
-            **options,
-        )
+def _roofline(us, query, context, query_length, window, caches, kv_heads, page):
+    """Nominal TFLOPS and TB/s: QK and PV per visible token, one K+V read of it."""
+    tokens = sum(
+        min(n, window + query_length - 1) if window else n for n in context.tolist()
+    )
+    caches = [c for c in caches if isinstance(c, torch.Tensor)]
+    per_token = sum(c.nbytes for c in caches) / (caches[0].shape[0] * kv_heads * page)
+    heads, dim = query.shape[1:]
+    flops = 4 * query_length * heads * dim * tokens
+    return {
+        "TFLOPS": flops / us / 1e6,
+        "TB/s": tokens * kv_heads * per_token / us / 1e6,
+    }
 
 
 def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256):
@@ -642,89 +576,101 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             assert (staged > 0) == (case["staged"] is not False)
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        *[
-            pytest.param(
-                dict(
-                    geometry,
-                    kv_dtype="fp8",
-                    query_dtype=dtype,
-                    scale_mode=scale_mode,
-                    trans_v=trans_v,
-                ),
-                id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
-            )
-            for name, geometry in _FP8_CASES
-            for dtype, scale_mode, trans_v in product(
-                (torch.bfloat16, torch.float16),
-                ("per-tensor", "per-token"),
-                (False, True),
-            )
-        ],
-        *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "error": error,
-                    "match": match,
-                    "lengths": (1,),
-                },
-                id=f"invalid-bf16-{invalid}",
-            )
-            for invalid, error, match in _INVALID_CASES
-        ],
-    ],
-)
-def test_pa_decode(case, device, monkeypatch):
-    """FP8/BF16 decode shares input, reference, planning and replay checks."""
-    case = dict(
-        {
-            "query_length": 1,
-            "kv_heads": 1,
-            "group_size": 8,
-            "head_dim": 128,
-            "block_size": 64,
-            "max_partitions": 1,
-            "window": 0,
-            "sink_dtype": None,
-            "pattern": "random",
-            "kv_dtype": "bf16",
-            "query_dtype": torch.bfloat16,
-            "scale_mode": "none",
-            "trans_v": True,
-            "capture": False,
-            "lengths": None,
-            "budget": None,
-            "table_width": None,
-            "max_context": "lengths",
-            "wide": False,
-            "pipe": False,
-            "staged": None,
-            "plan_free": False,
-        },
-        **case,
+def _poison_unowned(cache, scale, owned, fill):
+    """Overwrite K/V rows no sequence owns (and their per-token scales)."""
+    rows = ~owned[:, None, :].expand(-1, cache.shape[1], -1)
+    if cache.dtype == torch.bfloat16:
+        bits = {"zero": 0, "nan": 0x7FC0, "inf": 0x7F80}[fill]
+        cache.view(torch.int16)[rows] = bits
+    else:
+        # E4M3 has no infinity; its largest finite magnitude stands in.
+        nan = 0x80 if cache.dtype == torch.float8_e4m3fnuz else 0x7F
+        bits = {"zero": 0, "nan": nan, "inf": 0x7E}[fill]
+        cache.view(torch.uint8)[rows] = bits
+    if scale is not None and scale.dtype == torch.uint8:
+        # e8m0: 255 is NaN, 254 is 2**127.
+        scale[rows] = {"zero": 0, "nan": 255}.get(fill, 254)
+    elif scale is not None and scale.numel() > 1:
+        scale.view(scale.shape[:3])[rows] = {"zero": 0.0, "nan": float("nan")}.get(
+            fill, float("inf")
+        )
+
+
+def _mxfp4_inputs(device, lengths=(300, 1, 2048, 5)):
+    """e4m3 query, MXFP4 K/V views and the dequantized reference, one query token."""
+    torch.manual_seed(0)
+    query, key, value, table, context = _make_inputs(
+        1, 1, 16, 128, 128, torch.bfloat16, "block_scales", device, lengths
     )
+    query = query.to(torch.float8_e4m3fn)
+    (key_pool, logical_key), (value_pool, logical_value) = (
+        _mxfp4_pages(key),
+        _mxfp4_pages(value),
+    )
+    (kd, ks), (vd, vs) = _mxfp4_views(key_pool), _mxfp4_views(value_pool)
+    return query, kd, ks, vd, vs, table, context, (logical_key, logical_value)
+
+
+_CASE_DEFAULTS = {
+    "query_length": 1,
+    "kv_heads": 1,
+    "group_size": 8,
+    "head_dim": 128,
+    "block_size": 64,
+    "max_partitions": 1,
+    "window": 0,
+    "sink_dtype": None,
+    "pattern": "random",
+    "kv_dtype": "bf16",
+    "query_dtype": torch.bfloat16,
+    "scale_mode": "none",
+    "trans_v": True,
+    "capture": False,
+    "lengths": None,
+    "budget": None,
+    "table_width": None,
+    "max_context": "lengths",
+    "wide": False,
+    "pipe": False,
+    "staged": None,
+    "plan_free": False,
+}
+_MXFP4_INVALID_CASES = [
+    ("fp16-output", TypeError, "bf16 output"),
+    ("fp16-query", TypeError, "e4m3 or bf16 query"),
+    ("page-64", ValueError, "uint8 .* view"),
+    ("17-heads", NotImplementedError, "1..16 query heads"),
+    ("sinks", NotImplementedError, "no sinks"),
+    ("sliding-window", NotImplementedError, "no sliding window"),
+    ("query-length-2", NotImplementedError, "query_length 1"),
+    ("plan-free-strides", ValueError, "output needs the query's strides"),
+    ("oversized-task", ValueError, "PAGE_ID_STAGE_LIMIT"),
+    ("max-partitions-2", ValueError, "max_partitions may only be 1"),
+]
+_UNOWNED_GEOMETRIES = [(1, 1, 8, 128), (4, 2, 8, 256), (4, 1, 16, 128)]
+_UNOWNED_KV = [
+    "fp8-per-tensor",
+    "fp8-per-tensor-plain-v",
+    "fp8-per-token",
+    "bf16",
+    "mxfp4",
+]
+_PLAN_CASES = [
+    # (batch, max_parts, budget, window, query_length)
+    (1, 1, 1, 0, 1),
+    (6, 7, 160, 257, 4),
+    (63, 7, 160, 0, 1),
+    (65, 7, 512, 1, 4),
+    (257, None, 4096, 8193, 4),
+    (4096, None, 8192, 0, 1),
+]
+
+
+def _prepare(case):
+    """Inputs, cache views, options and plan of one decode case (no launch)."""
+    case = {**_CASE_DEFAULTS, **case}
     arch = get_gfx_runtime()
-    if case["kv_dtype"] == "mxfp4" and arch != "gfx950":
-        pytest.skip("MXFP4 pa_decode runs on gfx950")
-    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
-    if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
-        pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    if get_gfx_runtime() == "gfx1250":
-        if case.get("invalid_input") in ("fp16-query", "plain-v"):
-            pytest.skip("gfx1250 supports FP16 queries and plain BF16 V caches")
-        if (
-            case["kv_dtype"] == "bf16"
-            and case["head_dim"] % 128
-            and case["head_dim"] != 64
-        ):
-            pytest.skip("gfx1250 supports head_dim 64 or multiples of 128")
     query_length, kv_heads, group_size, dim, page, window = (
         case[name]
         for name in (
@@ -750,7 +696,7 @@ def test_pa_decode(case, device, monkeypatch):
             else case["query_dtype"]
         ),
         case["pattern"],
-        device,
+        DEVICE,
         case["lengths"],
         case["table_width"],
     )
@@ -761,7 +707,7 @@ def test_pa_decode(case, device, monkeypatch):
     if case["kv_dtype"] == "fp8":
         compute_type = (
             torch.float8_e4m3fn
-            if get_gfx_runtime() in ("gfx950", "gfx1250")
+            if arch in ("gfx950", "gfx1250")
             else torch.float8_e4m3fnuz
         )
         vector = 16
@@ -808,7 +754,7 @@ def test_pa_decode(case, device, monkeypatch):
     sinks = None
     if case["sink_dtype"] is not None:
         sinks = torch.linspace(
-            -2, 2, query.shape[1], dtype=case["sink_dtype"], device=device
+            -2, 2, query.shape[1], dtype=case["sink_dtype"], device=DEVICE
         )
         sinks[0], sinks[-1] = float("-inf"), float("inf")
     options = {
@@ -827,7 +773,6 @@ def test_pa_decode(case, device, monkeypatch):
             )
         ),
     }
-    arguments = (query, key_cache, value_cache, context, table, dim**-0.5, query_length)
     plan = pa.plan_pa_decode(
         context,
         kv_heads,
@@ -836,18 +781,143 @@ def test_pa_decode(case, device, monkeypatch):
         query_length=query_length,
         sliding_window=window,
     )
-    if "invalid_input" in case:
-        _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch)
-        return
+    return SimpleNamespace(
+        case=case,
+        arch=arch,
+        pa=pa,
+        query=query,
+        context=context,
+        table=table,
+        sinks=sinks,
+        options=options,
+        plan=plan,
+        logical_key=logical_key,
+        logical_value=logical_value,
+        caches=(key_cache, value_cache, key_scale, value_scale),
+        arguments=(
+            query,
+            key_cache,
+            value_cache,
+            context,
+            table,
+            dim**-0.5,
+            query_length,
+        ),
+    )
 
+
+def _check_unsupported_input(s, invalid, error, match):
+    pa, options = s.pa, dict(s.options)
+    query, key, value, *rest = s.arguments
+    if invalid == "fp16-query":
+        query = query.to(torch.float16)
+    elif invalid == "plain-v":
+        value = torch.empty((1, 1, 128, 64), dtype=query.dtype, device=query.device)
+    elif invalid == "scaled-kv":
+        options.update(
+            key_scale=torch.ones(1, dtype=torch.float32, device=query.device),
+            value_scale=torch.ones(1, dtype=torch.float32, device=query.device),
+        )
+    elif invalid == "vector16-k":
+        key = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=query.device)
+    elif invalid == "vector16-v":
+        value = torch.empty((1, 1, 4, 128, 16), dtype=query.dtype, device=query.device)
+
+    def unexpected_compile(**_):
+        raise AssertionError("invalid BF16 inputs reached kernel compilation")
+
+    with mock.patch.object(pa, "compile_pa_decode_tile", unexpected_compile):
+        _expect_error(
+            error,
+            match,
+            lambda: pa.pa_decode(
+                torch.empty_like(query),
+                query,
+                key,
+                value,
+                *rest,
+                work_plan=s.plan,
+                **options,
+            ),
+        )
+
+
+@benchmark()
+def test_pa_decode_plan(batch, max_parts, budget, window, query_length):
+    """Packed tasks cover every visible tile and remain valid after graph refresh.
+
+    The planner is a host-side graph-safe kernel with no roofline, so it is
+    checked but not timed.
+    """
+    from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
+
+    def check(plan, lengths):
+        info = plan.reduce_info.cpu().tolist()
+        work = plan.work_info.cpu().tolist()
+        cursor = 0
+        for seq, (ctx, (start, count)) in enumerate(zip(lengths, info)):
+            assert start == cursor
+            first = (
+                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0
+            )
+            last = (max(ctx, 0) + 255) // 256
+            assert 0 <= count <= min(last - first, plan.max_partitions)
+            assert (count > 0) == (last > first)
+            tile = first
+            for record in work[start : start + count]:
+                row, begin, end, original_length = record
+                assert row == seq and original_length == ctx
+                assert begin == tile and begin < end <= last
+                tile = end
+            assert tile == last
+            cursor += count
+        assert cursor <= plan.capacity
+        assert all(record == [0, 0, 0, 0] for record in work[cursor:])
+
+    pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
+    lengths = [pattern[i % len(pattern)] for i in range(batch)]
+    context = torch.tensor(lengths, dtype=torch.int32, device=DEVICE)
+    plan = plan_pa_decode(
+        context,
+        2,
+        max_partitions=max_parts,
+        workgroup_budget=budget,
+        sliding_window=window,
+        query_length=query_length,
+    )
+    check(plan, lengths)
+    pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        refreshed = plan_pa_decode(
+            context, 2, sliding_window=window, query_length=query_length, plan=plan
+        )
+    assert refreshed is plan
+    # All-empty replay must erase old active records, then mixed lengths must
+    # rebuild them using the same buffers without stale padding or readback.
+    for values in ([0] * batch, list(reversed(lengths))):
+        context.copy_(torch.tensor(values, dtype=torch.int32, device=DEVICE))
+        graph.replay()
+        check(plan, values)
+        assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
+    return {"gfx": get_gfx_runtime()}
+
+
+@benchmark()
+def test_pa_decode(name, geometry):
+    """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks."""
+    s = _prepare(geometry)
+    case, pa, query, window = s.case, s.pa, s.query, s.case["window"]
+    query_length, kv_heads, group_size, dim, page = (
+        case[n]
+        for n in ("query_length", "kv_heads", "group_size", "head_dim", "block_size")
+    )
     compile_kwargs = []
     compile_tile = pa.compile_pa_decode_tile
 
     def spy_tile(**kwargs):
         compile_kwargs.append(kwargs)
         return compile_tile(**kwargs)
-
-    monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
 
     output = torch.full_like(
         query,
@@ -856,90 +926,123 @@ def test_pa_decode(case, device, monkeypatch):
     )
     workspace = {}
     if case["capture"]:
-        scalar_shape = (kv_heads, plan.capacity, query_length * group_size)
+        scalar_shape = (kv_heads, s.plan.capacity, query_length * group_size)
         workspace = {
-            "exp_sums": torch.empty(scalar_shape, dtype=torch.float32, device=device),
-            "max_logits": torch.empty(scalar_shape, dtype=torch.float32, device=device),
+            "exp_sums": torch.empty(scalar_shape, dtype=torch.float32, device=DEVICE),
+            "max_logits": torch.empty(scalar_shape, dtype=torch.float32, device=DEVICE),
             "temporary_output": torch.empty(
-                (*scalar_shape, dim), dtype=output.dtype, device=device
+                (*scalar_shape, dim), dtype=output.dtype, device=DEVICE
             ),
         }
 
     def launch():
         pa.pa_decode(
             output,
-            *arguments,
-            work_plan=None if case["plan_free"] else plan,
-            **options,
+            *s.arguments,
+            work_plan=None if case["plan_free"] else s.plan,
+            **s.options,
             **workspace,
         )
 
     def check():
         reference = _reference(
             _round_query_e4m3(query) if case["kv_dtype"] == "mxfp4" else query,
-            logical_key,
-            logical_value,
-            table,
-            context,
+            s.logical_key,
+            s.logical_value,
+            s.table,
+            s.context,
             query_length,
             window,
-            sinks,
+            s.sinks,
         )
-        _check_output(output, reference)
+        return _check_output(output, reference)
 
-    launch()
-    check()
-    if case["kv_dtype"] != "mxfp4":
-        _check_pipe_policy(pa, case, arch, compile_kwargs)
-    if case["capture"]:
-        # Compile/allocate before capture; replay must observe changed query data.
-        capture_stream = torch.cuda.Stream()
-        capture_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(capture_stream):
-            launch()
-        torch.cuda.current_stream().wait_stream(capture_stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=capture_stream):
-            launch()
-        for _ in range(2):
-            query.neg_()
-            output.fill_(float("nan"))
-            graph.replay()
-            check()
+    with mock.patch.object(pa, "compile_pa_decode_tile", spy_tile):
+        launch()
+        err = check()
+        if case["kv_dtype"] != "mxfp4":
+            _check_pipe_policy(pa, case, s.arch, compile_kwargs)
+        _, us = run_perftest(launch)
+        if case["capture"]:
+            # Compile/allocate before capture; replay must observe changed query data.
+            capture_stream = torch.cuda.Stream()
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                launch()
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                launch()
+            for _ in range(2):
+                query.neg_()
+                output.fill_(float("nan"))
+                graph.replay()
+                check()
+    return {
+        "gfx": s.arch,
+        "kv": case["kv_dtype"],
+        "q": str(query.dtype).removeprefix("torch."),
+        "scale": case["scale_mode"],
+        "q_len": query_length,
+        "kv_heads": kv_heads,
+        "group": group_size,
+        "dim": dim,
+        "page": page,
+        "batch": s.context.numel(),
+        "us": us,
+        **_roofline(
+            us, query, s.context, query_length, window, s.caches, kv_heads, page
+        ),
+        "err": err,
+    }
 
 
-def _poison_unowned(cache, scale, owned, fill):
-    """Overwrite K/V rows no sequence owns (and their per-token scales)."""
-    rows = ~owned[:, None, :].expand(-1, cache.shape[1], -1)
-    if cache.dtype == torch.bfloat16:
-        bits = {"zero": 0, "nan": 0x7FC0, "inf": 0x7F80}[fill]
-        cache.view(torch.int16)[rows] = bits
+@benchmark()
+def test_pa_decode_rejects(kv, invalid, error, match):
+    """Unsupported inputs raise the documented error before any kernel compiles."""
+    if kv == "bf16":
+        _check_unsupported_input(_prepare({"lengths": (1,)}), invalid, error, match)
+        return {"gfx": get_gfx_runtime(), "raised": error.__name__}
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    entry = importlib.import_module("aiter.ops.flydsl.pa_decode_mxfp4")
+    query, kd, ks, vd, vs, table, context, _ = _mxfp4_inputs(DEVICE)
+    output = torch.empty(query.shape, dtype=torch.bfloat16, device=DEVICE)
+    options = {"key_scale": ks, "value_scale": vs, "work_plan": None}
+    query_length = 1
+    if invalid == "fp16-output":
+        output = output.half()
+    elif invalid == "fp16-query":
+        query = query.to(torch.float16)
+    elif invalid == "page-64":
+        kd = kd[:, :, :64]
+    elif invalid == "17-heads":
+        query = torch.cat([query, query[:, :1]], 1)
+        output = torch.empty(query.shape, dtype=torch.bfloat16, device=DEVICE)
+    elif invalid == "sinks":
+        options["sinks"] = torch.zeros(16, device=DEVICE)
+    elif invalid == "sliding-window":
+        options["sliding_window"] = 256
+    elif invalid == "query-length-2":
+        query_length = 2
+    elif invalid == "plan-free-strides":
+        output = torch.empty(4, 32, 128, dtype=torch.bfloat16, device=DEVICE)[:, :16]
+    elif invalid == "oversized-task":
+        table = torch.zeros(4, 4097, dtype=torch.int32, device=DEVICE)
+    if invalid == "max-partitions-2":
+        call = lambda: entry.pa_decode_mxfp4(
+            output, query, kd, ks, vd, vs, context, table, 1.0, max_partitions=2
+        )
     else:
-        # E4M3 has no infinity; its largest finite magnitude stands in.
-        nan = 0x80 if cache.dtype == torch.float8_e4m3fnuz else 0x7F
-        bits = {"zero": 0, "nan": nan, "inf": 0x7E}[fill]
-        cache.view(torch.uint8)[rows] = bits
-    if scale is not None and scale.dtype == torch.uint8:
-        # e8m0: 255 is NaN, 254 is 2**127.
-        scale[rows] = {"zero": 0, "nan": 255}.get(fill, 254)
-    elif scale is not None and scale.numel() > 1:
-        scale.view(scale.shape[:3])[rows] = {"zero": 0.0, "nan": float("nan")}.get(
-            fill, float("inf")
+        call = lambda: pa.pa_decode(
+            output, query, kd, vd, context, table, 1.0, query_length, **options
         )
+    _expect_error(error, match, call)
+    return {"gfx": get_gfx_runtime(), "raised": error.__name__}
 
 
-@pytest.mark.parametrize("fill", ["nan", "inf"])
-@pytest.mark.parametrize(
-    "query_length,kv_heads,group_size,head_dim",
-    [(1, 1, 8, 128), (4, 2, 8, 256), (4, 1, 16, 128)],
-)
-@pytest.mark.parametrize("block_size", [16, 64, 128])
-@pytest.mark.parametrize(
-    "kv",
-    ["fp8-per-tensor", "fp8-per-tensor-plain-v", "fp8-per-token", "bf16", "mxfp4"],
-)
+@benchmark()
 def test_pa_decode_unowned_kv_rows(
-    device, kv, block_size, query_length, kv_heads, group_size, head_dim, fill
+    kv, block_size, query_length, kv_heads, group_size, head_dim, fill
 ):
     """Rows no sequence owns contribute exactly zero, even when NaN or Inf.
 
@@ -948,13 +1051,7 @@ def test_pa_decode_unowned_kv_rows(
     image); P is zero there but 0 * NaN is NaN in PV.
     ``mask_unowned_kv=False`` skips the masking and matches it on clean input.
     """
-    if get_gfx_runtime() == "gfx1250":
-        pytest.skip("gfx1250 pipelines still require finite unowned V rows")
-    if kv == "mxfp4" and (
-        get_gfx_runtime() != "gfx950"
-        or (block_size, query_length, head_dim) != (128, 1, 128)
-    ):
-        pytest.skip("MXFP4 pa_decode: gfx950, page 128, head_dim 128, one query token")
+    arch = get_gfx_runtime()
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     torch.manual_seed(0)
     lengths = tuple(max(n, query_length) for n in (1, 17, 255, 257, 1000))
@@ -966,25 +1063,23 @@ def test_pa_decode_unowned_kv_rows(
         block_size,
         torch.bfloat16,
         "random",
-        device,
+        DEVICE,
         lengths,
     )
     # Page 0 is owned by no sequence; padded block-table lanes point at it.
     spare = torch.zeros_like(key[:1])
     key, value = torch.cat([spare, key]), torch.cat([spare, value])
     table = torch.nn.functional.pad(table + 1, (0, 2))
-    owned = torch.zeros(key.shape[0], block_size, dtype=torch.bool, device=device)
+    owned = torch.zeros(key.shape[0], block_size, dtype=torch.bool, device=DEVICE)
     for seq, length in enumerate(lengths):
-        tokens = torch.arange(length, device=device)
+        tokens = torch.arange(length, device=DEVICE)
         owned[table[seq, tokens // block_size].long(), tokens % block_size] = True
 
     key_scale = value_scale = None
     vector = 8
     if kv.startswith("fp8"):
         compute_type = (
-            torch.float8_e4m3fn
-            if get_gfx_runtime() == "gfx950"
-            else torch.float8_e4m3fnuz
+            torch.float8_e4m3fn if arch == "gfx950" else torch.float8_e4m3fnuz
         )
         vector = 16
         quantize = pertoken_quant if kv == "fp8-per-token" else per_tensor_quant
@@ -1003,7 +1098,7 @@ def test_pa_decode_unowned_kv_rows(
     )
     plan = pa.plan_pa_decode(context, kv_heads, query_length=query_length)
 
-    def run(fill, mask_unowned_kv=True):
+    def prepare(fill, mask_unowned_kv=True):
         if kv == "mxfp4":
             (k, ks), (v, vs) = (
                 _mxfp4_views(key_pool.clone()),
@@ -1032,63 +1127,66 @@ def test_pa_decode_unowned_kv_rows(
                     .contiguous()
                 )
         output = torch.full_like(query, float("nan"))
-        pa.pa_decode(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            context,
-            table,
-            head_dim**-0.5,
-            query_length,
-            compute_type=key_cache.dtype,
-            key_scale=ks,
-            value_scale=vs,
-            work_plan=plan,
-            max_context_length=max(lengths),
-            mask_unowned_kv=mask_unowned_kv,
-        )
+
+        def launch():
+            pa.pa_decode(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                context,
+                table,
+                head_dim**-0.5,
+                query_length,
+                compute_type=key_cache.dtype,
+                key_scale=ks,
+                value_scale=vs,
+                work_plan=plan,
+                max_context_length=max(lengths),
+                mask_unowned_kv=mask_unowned_kv,
+            )
+
+        return output, launch, (key_cache, value_cache, ks, vs)
+
+    def run(fill, mask_unowned_kv=True):
+        output, launch, _ = prepare(fill, mask_unowned_kv)
+        launch()
         return output
 
-    clean, poisoned = run("zero"), run(fill)
+    clean = run("zero")
+    poisoned, launch, caches = prepare(fill)
+    launch()
     assert torch.isfinite(poisoned).all()
     # Short FP8 contexts round P coarsely; exactness is the bitwise check.
     tol = 5e-3 if kv == "bf16" else 2.5e-2
-    torch.testing.assert_close(poisoned.float(), reference, atol=tol, rtol=tol)
+    err = assertAllclose(
+        poisoned.float(), reference, rtol=tol, atol=tol, tol_err_ratio=0
+    )
     assert torch.equal(poisoned, clean)
     if fill == "nan":
         assert torch.equal(run("zero", mask_unowned_kv=False), clean)
+    _, us = run_perftest(launch)
+    return {
+        "gfx": arch,
+        "us": us,
+        **_roofline(us, query, context, query_length, 0, caches, kv_heads, block_size),
+        "err": err,
+    }
 
 
-def _mxfp4_inputs(device, lengths=(300, 1, 2048, 5)):
-    """e4m3 query, MXFP4 K/V views and the dequantized reference, one query token."""
-    torch.manual_seed(0)
-    query, key, value, table, context = _make_inputs(
-        1, 1, 16, 128, 128, torch.bfloat16, "block_scales", device, lengths
-    )
-    query = query.to(torch.float8_e4m3fn)
-    (key_pool, logical_key), (value_pool, logical_value) = (
-        _mxfp4_pages(key),
-        _mxfp4_pages(value),
-    )
-    (kd, ks), (vd, vs) = _mxfp4_views(key_pool), _mxfp4_views(value_pool)
-    return query, kd, ks, vd, vs, table, context, (logical_key, logical_value)
-
-
-def test_pa_decode_mxfp4_one_task_per_row(device):
+@benchmark()
+def test_pa_decode_mxfp4_one_task_per_row():
     """Plan-free, one-partition plan and the pa_decode_mxfp4 entry run the same task.
 
     A strided output cannot be written directly and takes the reducer; a context-0
     row is zero-filled on both paths.
     """
-    if get_gfx_runtime() != "gfx950":
-        pytest.skip("MXFP4 pa_decode runs on gfx950")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     entry = importlib.import_module("aiter.ops.flydsl.pa_decode_mxfp4")
     query, kd, ks, vd, vs, table, context, (logical_key, logical_value) = _mxfp4_inputs(
-        device
+        DEVICE
     )
-    context = torch.tensor([300, 0, 2048, 5], dtype=torch.int32, device=device)
+    context = torch.tensor([300, 0, 2048, 5], dtype=torch.int32, device=DEVICE)
     plan = pa.plan_pa_decode(context, 1, max_partitions=1)
     reference = _reference(
         query, logical_key, logical_value, table, context, 1, 0, None
@@ -1112,7 +1210,7 @@ def test_pa_decode_mxfp4_one_task_per_row(device):
         return output
 
     free = run(
-        torch.full(query.shape, 7.0, dtype=torch.bfloat16, device=device),
+        torch.full(query.shape, 7.0, dtype=torch.bfloat16, device=DEVICE),
         work_plan=None,
     )
     planned = run(torch.full_like(free, 7.0), work_plan=plan)
@@ -1121,62 +1219,217 @@ def test_pa_decode_mxfp4_one_task_per_row(device):
         aliased, query, kd, ks, vd, vs, context, table, scale, max_partitions=1
     )
     assert torch.equal(free, planned) and torch.equal(free, aliased)
-    _check_output(free, reference)
-    padded = torch.full((4, 32, 128), 7.0, dtype=torch.bfloat16, device=device)
+    err = _check_output(free, reference)
+    padded = torch.full((4, 32, 128), 7.0, dtype=torch.bfloat16, device=DEVICE)
     _check_output(run(padded[:, :16], work_plan=plan), reference)
     assert (padded[:, 16:] == 7.0).all()
+    _, us = run_perftest(lambda: run(free, work_plan=None))
+    return {
+        "gfx": get_gfx_runtime(),
+        "us": us,
+        **_roofline(us, query, context, 1, 0, (kd, vd, ks, vs), 1, 128),
+        "err": err,
+    }
 
 
-@pytest.mark.parametrize(
-    "invalid,error,match",
-    [
-        ("fp16-output", TypeError, "bf16 output"),
-        ("fp16-query", TypeError, "e4m3 or bf16 query"),
-        ("page-64", ValueError, "uint8 .* view"),
-        ("17-heads", NotImplementedError, "1..16 query heads"),
-        ("sinks", NotImplementedError, "no sinks"),
-        ("sliding-window", NotImplementedError, "no sliding window"),
-        ("query-length-2", NotImplementedError, "query_length 1"),
-        ("plan-free-strides", ValueError, "output needs the query's strides"),
-        ("oversized-task", ValueError, "PAGE_ID_STAGE_LIMIT"),
-        ("max-partitions-2", ValueError, "max_partitions may only be 1"),
-    ],
-)
-def test_pa_decode_mxfp4_invalid_input(device, invalid, error, match):
-    if get_gfx_runtime() != "gfx950":
-        pytest.skip("MXFP4 pa_decode runs on gfx950")
-    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    entry = importlib.import_module("aiter.ops.flydsl.pa_decode_mxfp4")
-    query, kd, ks, vd, vs, table, context, _ = _mxfp4_inputs(device)
-    output = torch.empty(query.shape, dtype=torch.bfloat16, device=device)
-    options = {"key_scale": ks, "value_scale": vs, "work_plan": None}
-    query_length = 1
-    if invalid == "fp16-output":
-        output = output.half()
-    elif invalid == "fp16-query":
-        query = query.to(torch.float16)
-    elif invalid == "page-64":
-        kd = kd[:, :, :64]
-    elif invalid == "17-heads":
-        query = torch.cat([query, query[:, :1]], 1)
-        output = torch.empty(query.shape, dtype=torch.bfloat16, device=device)
-    elif invalid == "sinks":
-        options["sinks"] = torch.zeros(16, device=device)
-    elif invalid == "sliding-window":
-        options["sliding_window"] = 256
-    elif invalid == "query-length-2":
-        query_length = 2
-    elif invalid == "plan-free-strides":
-        output = torch.empty(4, 32, 128, dtype=torch.bfloat16, device=device)[:, :16]
-    elif invalid == "oversized-task":
-        table = torch.zeros(4, 4097, dtype=torch.int32, device=device)
-    elif invalid == "max-partitions-2":
-        with pytest.raises(error, match=match):
-            entry.pa_decode_mxfp4(
-                output, query, kd, ks, vd, vs, context, table, 1.0, max_partitions=2
+def _decode_cases(kv_dtypes):
+    """(name, geometry) of every valid decode case, in a stable order."""
+    cases = []
+    if "fp8" in kv_dtypes:
+        cases += [
+            (
+                f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
+                dict(
+                    geometry,
+                    kv_dtype="fp8",
+                    query_dtype=dtype,
+                    scale_mode=scale_mode,
+                    trans_v=trans_v,
+                ),
             )
+            for name, geometry in _FP8_CASES
+            for dtype, scale_mode, trans_v in product(
+                (torch.bfloat16, torch.float16),
+                ("per-tensor", "per-token"),
+                (False, True),
+            )
+        ]
+    if "bf16" in kv_dtypes:
+        cases += [(f"bf16-{name}", geometry) for name, geometry in _BF16_CASES]
+    if "fp8" in kv_dtypes:
+        cases += _PIPE_CASES
+    if "mxfp4" in kv_dtypes:
+        cases += _MXFP4_CASES
+    return cases
+
+
+def _skip_reason(case, arch, num_cu):
+    """Why this arch cannot run a decode case, or None."""
+    case = {**_CASE_DEFAULTS, **case}
+    if case["kv_dtype"] == "mxfp4" and arch != "gfx950":
+        return "MXFP4 pa_decode runs on gfx950"
+    if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
+        return f"plan_pa_decode caps max_partitions at {num_cu} CUs"
+    if arch == "gfx1250" and (
+        case["kv_dtype"] == "bf16" and case["head_dim"] % 128 and case["head_dim"] != 64
+    ):
+        return "gfx1250 supports head_dim 64 or multiples of 128"
+    return None
+
+
+def _unowned_skip_reason(kv, block_size, query_length, head_dim, arch):
+    if arch == "gfx1250":
+        return "gfx1250 pipelines still require finite unowned V rows"
+    if kv == "mxfp4" and (
+        arch != "gfx950" or (block_size, query_length, head_dim) != (128, 1, 128)
+    ):
+        return "MXFP4 pa_decode: gfx950, page 128, head_dim 128, one query token"
+    return None
+
+
+def _summarize(title, rows):
+    # The geometry dict only drives the case; its summary is the columns beside it.
+    df = pd.DataFrame(rows).drop(columns="geometry", errors="ignore")
+    aiter.logger.info("%s summary (markdown):\n%s", title, df.to_markdown(index=False))
+
+
+def _sweep(title, test, cases, failures):
+    """Run (tag, args) cases, one failing case must not hide the others."""
+    rows = []
+    for tag, args in cases:
+        try:
+            rows.append(test(*args))
+        except Exception as exc:  # noqa: BLE001 - record, keep sweeping
+            aiter.logger.error(
+                "FAILED %s case %s: %s",
+                title,
+                tag,
+                exc,
+                exc_info=not isinstance(exc, AssertionError),
+            )
+            failures.append((title, tag, exc))
+            rows.append({"name": tag, "gfx": get_gfx_runtime(), "status": "FAIL"})
+    _summarize(title, rows)
+    return len(rows)
+
+
+def _skipping(arch, cases, reason):
+    """Drop cases whose reason(case) is set, warning once per distinct reason."""
+    kept, skipped = [], {}
+    for tag, args in cases:
+        why = reason(*args)
+        if why:
+            skipped.setdefault(why, []).append(tag)
+        else:
+            kept.append((tag, args))
+    for why, tags in skipped.items():
+        aiter.logger.warning("%s: skipping %d case(s): %s", arch, len(tags), why)
+    return kept
+
+
+def main():
+    arch = get_gfx_runtime()
+    if not torch.cuda.is_available() or arch not in SUPPORTED_GFX:
+        aiter.logger.warning("pa_decode unsupported on %s; skipping", arch)
         return
-    with pytest.raises(error, match=match):
-        pa.pa_decode(
-            output, query, kd, vd, context, table, 1.0, query_length, **options
+    if importlib.util.find_spec("flydsl") is None:
+        aiter.logger.warning("FlyDSL is not installed; skipping")
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="FlyDSL paged decode correctness + perf sweep",
+    )
+    parser.add_argument(
+        "-k",
+        "--kv",
+        type=str,
+        nargs="*",
+        default=KV_DTYPES,
+        choices=KV_DTYPES,
+        help="KV cache dtypes to sweep (default: all)",
+    )
+    args = parser.parse_args()
+    # The reference is FP32; a TF32 matmul would loosen it.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    num_cu = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    failures, total = [], 0
+
+    total += _sweep(
+        "pa_decode plan",
+        test_pa_decode_plan,
+        [(f"plan-{'-'.join(map(str, c))}", c) for c in _PLAN_CASES],
+        failures,
+    )
+    decode = _skipping(
+        arch,
+        [(name, (name, geometry)) for name, geometry in _decode_cases(args.kv)],
+        lambda name, geometry: _skip_reason(geometry, arch, num_cu),
+    )
+    total += _sweep("pa_decode", test_pa_decode, decode, failures)
+
+    rejects = []
+    if "bf16" in args.kv:
+        # gfx1250 serves FP16 queries and plain BF16 V caches, so it rejects neither.
+        rejects += [
+            ("bf16", *c)
+            for c in _INVALID_CASES
+            if arch != "gfx1250" or c[0] not in ("fp16-query", "plain-v")
+        ]
+    if "mxfp4" in args.kv and arch == "gfx950":
+        rejects += [("mxfp4", *c) for c in _MXFP4_INVALID_CASES]
+    elif "mxfp4" in args.kv:
+        aiter.logger.warning("%s: skipping MXFP4 cases, which run on gfx950", arch)
+    total += _sweep(
+        "pa_decode rejected inputs",
+        test_pa_decode_rejects,
+        [
+            (f"{kv}-{invalid}", (kv, invalid, error, match))
+            for kv, invalid, error, match in rejects
+        ],
+        failures,
+    )
+
+    unowned = _skipping(
+        arch,
+        [
+            (
+                "unowned-" + "-".join(map(str, (kv, block_size, *geometry, fill))),
+                (kv, block_size, *geometry, fill),
+            )
+            for kv, block_size, geometry, fill in product(
+                [kv for kv in _UNOWNED_KV if kv.split("-")[0] in args.kv],
+                [16, 64, 128],
+                _UNOWNED_GEOMETRIES,
+                ["nan", "inf"],
+            )
+        ],
+        lambda kv, block_size, query_length, kv_heads, group_size, head_dim, fill: (
+            _unowned_skip_reason(kv, block_size, query_length, head_dim, arch)
+        ),
+    )
+    total += _sweep(
+        "pa_decode unowned KV rows", test_pa_decode_unowned_kv_rows, unowned, failures
+    )
+
+    if "mxfp4" in args.kv and arch == "gfx950":
+        total += _sweep(
+            "pa_decode MXFP4 one task per row",
+            test_pa_decode_mxfp4_one_task_per_row,
+            [("mxfp4-one-task-per-row", ())],
+            failures,
         )
+
+    if failures:
+        aiter.logger.error(
+            "pa_decode: %d of %d cases FAILED\n%s",
+            len(failures),
+            total,
+            "\n".join(f"  [{t}] {tag}\n        {exc}" for t, tag, exc in failures),
+        )
+        sys.exit(1)
+    aiter.logger.info("pa_decode: all %d cases passed", total)
+
+
+if __name__ == "__main__":
+    main()
