@@ -397,6 +397,12 @@ class FlyDSLAllReduceRMSNorm:
       If none of those happened, :meth:`should_fly_fused_ar_rms` **declines
       while a capture is open** rather than building inside it. The capture then
       records the caller's unfused path, and it cannot hang.
+
+    * Making a (family, hidden) ready is a collective: building exchanges IPC 
+      handles, and then the ranks agree that every one of them compiled and loaded 
+      its binaries.
+    * If any rank fails to make a width ready, every rank marks it failed and
+      the predicate declines it from then on. The caller's next backend serves the call.
     """
 
     def __init__(
@@ -414,6 +420,9 @@ class FlyDSLAllReduceRMSNorm:
         # payload window JIT-compiled, so a call on them is a pure launch and
         # safe inside a graph capture.
         self._ready: set[tuple[str, int]] = set()
+        # (family, hidden) pairs that failed to become ready on some rank. The
+        # same on every rank: only the agreement in _prepare adds to it.
+        self._failed: set[tuple[str, int]] = set()
         self._warned_capture = False
         self._quantized = bool(quantized)
         self.policy = None
@@ -514,9 +523,11 @@ class FlyDSLAllReduceRMSNorm:
 
         # Widths declared up front are built now, while nothing is
         # capturing. This is the only path that needs no cooperation from
-        # the caller's warmup.
+        # the caller's warmup. A width that fails here is marked failed, and
+        # the predicate declines it.
         for h in fly_policy.fused_hiddens(hiddens):
-            self._prime_up_front(h)
+            for family in self._families_for(h):
+                self._prepare(family, h)
 
     def _build(self, family: str):
         """One engine, tuning left to that schedule's own ladder.
@@ -539,24 +550,6 @@ class FlyDSLAllReduceRMSNorm:
         # The policy window is the floor here, not the engine's own. The
         # engine takes each width's ``atoms_per_row`` from the policy.
         return FlyQuickAllReduceRMSNorm(**common, algorithm=family, min_bytes=0)
-
-    def _prime_up_front(self, hidden: int) -> None:
-        """:meth:`prime` at construction, agreed across ranks."""
-        ok = True
-        try:
-            self.prime(hidden)
-        except Exception:
-            logger.warning(
-                "%s: could not pre-build hidden=%d.", self._tag, hidden, exc_info=True
-            )
-            ok = False
-        if not all_ranks_agree(ok, self.group):
-            self._ready = {k for k in self._ready if k[1] != int(hidden)}
-            logger.warning(
-                "%s: hidden=%d is not pre-built; it will be built on first use.",
-                self._tag,
-                hidden,
-            )
 
     @property
     def inbox_bytes(self) -> int:
@@ -590,29 +583,64 @@ class FlyDSLAllReduceRMSNorm:
         return got if h_pad == int(hidden) else f"{got}/pad{h_pad}"
 
     def prime(self, hidden: int) -> bool:
-        """Build every family at *hidden* and JIT the binaries its payload
-        window can select.
+        """Build every family at *hidden*, and JIT-compile and load the binaries
+        its payload window can select.
 
-        Makes a width safe to use inside a HIP graph capture. Every rank must
-        call it with the same hidden dim, in the same order. The HIP module load is
-        left to each binary's first launch.
+        Makes a width safe to use inside a HIP graph capture: a call at it is
+        then a pure launch.
 
         Returns False when this width fuses in no family, which is a geometry
-        fact (``supports_hidden``).
+        fact (``supports_hidden``), or when it failed to build in any family on
+        some rank. The predicate declines the failed families.
         """
         if self.disabled:
             return False
         hidden = int(hidden)
-        usable = [
-            (fam, eng)
-            for fam, eng in self._engines.items()
-            if eng.supports_hidden(hidden)
-        ]
-        if not usable:
+        families = self._families_for(hidden)
+        if not families:
             return False
-        for fam, _eng in usable:
-            self._prime_family(fam, hidden)
-        return True
+        
+        ready = [self._prepare(fam, hidden) for fam in families]
+        return all(ready)
+
+    def _families_for(self, hidden: int) -> list[str]:
+        """The families with a build at *hidden*, in engine order."""
+        return [
+            fam for fam, eng in self._engines.items() if eng.supports_hidden(hidden)
+        ]
+
+    def _prepare(self, family: str, hidden: int) -> bool:
+        """Make (family, hidden) ready on every rank, or on none of them."""
+        key = (family, int(hidden))
+        if key in self._ready:
+            return True
+        if key in self._failed:
+            return False
+        ok = True
+        try:
+            self._prime_family(family, hidden)
+        except Exception:
+            logger.warning(
+                "%s: could not build %s at hidden=%d.",
+                self._tag,
+                family,
+                hidden,
+                exc_info=True,
+            )
+            ok = False
+        if all_ranks_agree(ok, self.group):
+            return True
+        self._ready.discard(key)
+        self._failed.add(key)
+        logger.warning(
+            "%s: %s at hidden=%d failed to build on %s; every rank declines "
+            "this width.",
+            self._tag,
+            family,
+            hidden,
+            "a peer rank" if ok else "this rank",
+        )
+        return False
 
     def _prime_family(self, family: str, hidden: int) -> None:
         """Build family at hidden and JIT every rung binary its payload
@@ -676,7 +704,9 @@ class FlyDSLAllReduceRMSNorm:
             return False
         if nbytes > fly_policy.PAD_MASK_MAX_BYTES and eng.pads_hidden(hidden) != hidden:
             return False
-        return not self._capture_blocked(family, hidden)
+        if (family, hidden) in self._failed or self._capture_blocked(family, hidden):
+            return False
+        return self._prepare(family, hidden)
 
     def fly_fused_ar_rms(self, inp, residual, weight, eps, *, out=None, res_out=None):
         """``(out, residual_out)``. Only call when the predicate said yes.
@@ -687,11 +717,13 @@ class FlyDSLAllReduceRMSNorm:
         family = self.family_for(nbytes)
         eng = self._engines[family]
         hidden = int(inp.shape[-1])
-        if (family, hidden) not in self._ready:
-            # The first call at a width is eager (the predicate declines inside
-            # a capture), so compile every rung the window can reach now, not
-            # just the one this payload picks.
-            self._prime_family(family, hidden)
+        # The predicate has prepared the width. A caller that skipped it gets
+        # the preparation here, and the same error on every rank if it fails.
+        if not self._prepare(family, hidden):
+            raise RuntimeError(
+                f"{self._tag}: {family} at hidden={hidden} failed to build on "
+                "at least one rank. The failing rank logged the cause."
+            )
         got = eng.allreduce_rmsnorm(
             inp, residual, weight, eps, out=out, residual_out=res_out
         )

@@ -1022,6 +1022,7 @@ def _fused_backend(quantized, link="pcie", ws=4, arch="gfx950"):
         if quantized != (alg == ONESHOT)
     }
     b._ready = {(fam, h) for fam in b._engines for h in (64, 4096)}
+    b._failed = set()
     b._warned_capture = False
     return b
 
@@ -1232,3 +1233,13 @@ def test_unknown_quantization_declines(tmp_path):
     finally:
         dist.destroy_process_group()
     assert backend.disabled and backend.select(1 << 20) is None
+
+
+def test_old_ipc_module_name_still_imports():
+    """vLLM imports ``UncachedIpcHeap`` from ``quick_allreduce_int4_ipc``, the
+    module's name before ``ipc_heap``. A merge with a branch that renames the
+    module leaves the old name out of the merged tree, so check it here."""
+    from aiter.ops.flydsl.ipc_heap import UncachedIpcHeap
+    from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap as Old
+
+    assert Old is UncachedIpcHeap

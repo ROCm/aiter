@@ -1478,6 +1478,84 @@ def _fused_dispatch_rank(rank: int, tp: int, init_method: str, regime: str) -> d
     return {"built": built, "probes": probes}
 
 
+def _fused_prepare_fails_rank(rank: int, tp: int, init_method: str) -> dict:
+    """One rank of the failed-preparation spawn.
+
+    Stands up the real communicators like ``_fused_dispatch_rank`` (exact
+    regime), and makes the binaries of the width fail to load on the last rank
+    only, after its engines are built. Two calls at a one-shot payload must
+    then take the next backend on every rank, and match the reference.
+    """
+    from unittest import mock
+
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import one_shot_allreduce as one_shot
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "NONE"
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(tp, 1)
+    tp_group = get_tp_group()
+    cpu_group = tp_group.cpu_group
+    comm = tp_group.device_communicator
+    backend = getattr(comm.ca_comm, "_fly_rms", None)
+    if backend is None:
+        return {"error": "the exact fused backend is not built"}
+
+    hidden = FUSED_FRESH_HIDDEN
+    row_bytes = hidden * 2
+    lo, _hi = backend._windows[
+        fly_policy.AllReduceAlgorithm.OneShot.value
+    ].inclusive_range()
+    m = max(-(-lo // row_bytes), 1)
+    ran = []
+    run = backend.fly_fused_ar_rms
+
+    def fused(*args, **kw):
+        ran.append("exact")
+        return run(*args, **kw)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected module load failure")
+
+    backend.fly_fused_ar_rms = fused
+    calls = []
+    try:
+        with mock.patch.object(
+            one_shot,
+            "preload_launcher",
+            fail if rank == tp - 1 else one_shot.preload_launcher,
+        ):
+            for _ in range(2):
+                parts, residual, weight = _fused_inputs(m, hidden, tp, device)
+                ran.clear()
+                out, res_out = comm.fused_allreduce_rmsnorm(
+                    parts[rank].contiguous(), residual, weight, RMS_EPS
+                )
+                torch.cuda.synchronize()
+                out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+                calls.append(
+                    {
+                        "ran": list(ran),
+                        "out_sqnr_db": _sqnr_db(out_ref.float(), out.float()),
+                        "res_sqnr_db": _sqnr_db(res_ref.float(), res_out.float()),
+                    }
+                )
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        failed = sorted(backend._failed)
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    return {"m": m, "calls": calls, "failed": failed}
+
+
 @benchmark()
 def test_fused_allreduce_rmsnorm_dispatch(tp, regime):
     """Production fused dispatch with ``AITER_FLY_AR=1``: custom all-reduce
@@ -2468,6 +2546,26 @@ def test_fused_allreduce_rmsnorm_capture_ready(world_size):
 
 
 @_graded_benchmark
+def test_fused_allreduce_rmsnorm_prepare_fails(world_size):
+    """A width that fails to load on one rank is declined on every rank, and
+    the production dispatch serves it with the next backend (see
+    ``_fused_prepare_fails_rank``)."""
+    ranks = _spawn(_fused_prepare_fails_rank, world_size)
+    want_failed = [(fly_policy.AllReduceAlgorithm.OneShot.value, FUSED_FRESH_HIDDEN)]
+    for rank, r in enumerate(ranks):
+        where = f"tp={world_size}, rank {rank}"
+        assert "error" not in r, f"{where}: {r.get('error')}"
+        assert r["failed"] == want_failed, f"{where}: failed widths {r['failed']}"
+        for i, c in enumerate(r["calls"]):
+            assert not c["ran"], f"{where}, call {i}: FlyDSL ran after the failure"
+            db = min(c["out_sqnr_db"], c["res_sqnr_db"])
+            assert db >= SQNR_FLOOR_DB, (
+                f"{where}, call {i} ({r['m']} rows): fallback SQNR {db:.2f} dB "
+                f"below {SQNR_FLOOR_DB} dB"
+            )
+
+
+@_graded_benchmark
 def test_one_shot_allreduce_rmsnorm_split_exchange(world_size):
     """A split build's exchange against the unsplit build: NaN rows stay NaN,
     and small rows keep the resolution the output sees (see
@@ -2868,6 +2966,7 @@ def _verify_fused(tps, extended: bool) -> None:
             + [test_one_shot_allreduce_rmsnorm_run_ahead(tp)]
             + [test_one_shot_allreduce_rmsnorm_alias(tp)]
             + [test_fused_allreduce_rmsnorm_capture_ready(tp)]
+            + [test_fused_allreduce_rmsnorm_prepare_fails(tp)]
         )
         if extended:
             rows += (

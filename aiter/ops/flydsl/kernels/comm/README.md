@@ -259,11 +259,30 @@ Step 3 compiles every rung that the family's payload window can select, not only
 the rung of the call itself. A capture at another payload size then finds every
 binary ready.
 
+Each of the three ways is a collective. It builds the engines, compiles and
+loads the binaries, and then ranks agree on success. In step 3, 
+`should_fly_fused_ar_rms` does this, before the dispatcher commits to
+the fused path.
+
+* Every rank must call `should_fly_fused_ar_rms` in the same order, with the
+  same shape, dtype and contiguity, so that it gives the same answer on every
+  rank.
+* If the compile or the module load fails on any rank, every rank marks the
+  width failed, and `should_fly_fused_ar_rms` declines it on every rank from
+  then on. The dispatcher then serves the call with its next backend.
+
 #### Memory per width
 
-Each (family, hidden size) owns IPC inboxes, one for each rung, and nothing is
-freed until the engine closes. Measured with `inbox_bytes` on MI350P (PCIe), per
-GPU and per width:
+Each (family, hidden size) builds one engine for each distinct config in its
+ladder. The mesh and the ring always also build the ST=1 engine, their fallback 
+for payloads with fewer tiles than the super-tile. Callers that use 
+`allreduce_rmsnorm_mxfp4` directly get a second set of engines for the MXFP4
+variant.
+
+Each engine owns its own IPC inbox and state, and nothing is freed until the
+backend closes. Memory therefore grows with the number of distinct widths a
+process uses. The `inbox_bytes` property of the backend and of each engine
+reports it. Measured on MI350P (PCIe), per GPU and per width:
 
 | TP | exact one-shot | quantized (mesh and ring) |
 |---|--:|--:|
@@ -272,8 +291,11 @@ GPU and per width:
 | 8 | 30 to 60 MiB | 10 to 20 MiB |
 
 The ranges cover hidden sizes 4096, 7168 and 8192. The quantized TP4 number at
-7168 is the largest. Set `AITER_FLY_AR_FUSED_HIDDENS` to the widths a model
-uses, so that no other width is built.
+7168 is the largest.
+
+`AITER_FLY_AR_FUSED_HIDDENS` does not limit the widths. It only builds the
+listed widths at startup. Any other supported width is still built on its first
+call outside a graph capture, and declined during a capture.
 
 
 ## Environment variables
@@ -349,7 +371,7 @@ overrides included.
 
 | Variable | Effect |
 |---|---|
-| `AITER_FLY_AR_FUSED_HIDDENS` | Comma-separated hidden sizes to build at startup, for example `4096,7168`. |
+| `AITER_FLY_AR_FUSED_HIDDENS` | Comma-separated hidden sizes to build at startup, for example `4096,7168`. It does not limit the widths: other supported widths are still built on first use outside a graph capture. |
 | `AITER_FLY_AR_FUSED_SPLIT` | `1` lets the fused one-shot split a token row over several workgroups, where its ladder has a split rung. Not set (the default): every rung runs unsplit. Set it the same on every rank. |
 | `AITER_FLY_AR_FUSED_LADDERS` | Path to a ladder file to read instead of `aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json`. Read once at import; a malformed file raises `ValueError` naming the bad entry. Set it to the same file on every rank, or the fused path declines. |
 | `AITER_FLY_AR_FUSED_ONESHOT_MIN_BYTES` | The minimum of the fused one-shot window. |
