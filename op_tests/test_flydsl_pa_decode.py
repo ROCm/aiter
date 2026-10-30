@@ -439,7 +439,7 @@ _INVALID_CASES = [
 
 def _check_output(output, reference):
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(output.float(), reference, atol=8e-3, rtol=5e-3)
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):

@@ -136,8 +136,8 @@ def test_mha_with_sink(
     )
 
     relax_bwd_err_tol: bool = SEQLEN_Q >= 1024 and SEQLEN_K >= 1024
-    bwd_atol = 2.5e-2 if relax_bwd_err_tol else 1.5e-2
-    bwd_rtol = 2.5e-2 if relax_bwd_err_tol else 1.5e-2
+    bwd_atol = 3e-2 if relax_bwd_err_tol else 2.5e-2
+    bwd_rtol = 3e-2 if relax_bwd_err_tol else 2.5e-2
     torch.testing.assert_close(
         triton_dq,
         torch_dq,

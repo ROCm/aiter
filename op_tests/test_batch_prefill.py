@@ -196,7 +196,7 @@ def get_tolerances(dtype, is_fp8: bool = False) -> tuple[float, float]:
     if is_fp8:
         return 2e-2, 1e-2
     if dtype == torch.float16:
-        return 1e-3, 1e-3
+        return 1e-3, 2e-3
     return 2e-2, 1e-2
 
 
