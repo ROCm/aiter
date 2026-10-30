@@ -95,7 +95,6 @@ def _launch(
         BLOCK_M=block_m,
         CACHE=cache,
         BLOCK_SIZE=k_cache.shape[3] if cache else 1,
-        X=k_cache.shape[4] if cache else 1,
         num_warps=num_warps,
         **get_fused_qk_norm_mrope_layouts(num_warps),
     )
