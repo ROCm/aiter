@@ -663,12 +663,20 @@ def make_packed_cache(num_tokens, D, dtype, page_size=256, layout="trailer"):
         bf16 RoPE at [512, 640), so one row index addresses a token's data and
         its scales together. Only the gfx1250 2buff kernel reads this.
 
+    ``"v41"`` -- DeepSeek-V4.1's 528 B record: all 512 dims (RoPE included)
+        fp8 e4m3, then that token's 16 UE8M0 scales, one per 32 dims.
+
+    ``"nvfp4"`` -- DeepSeek-V4.1's 288 B compressed record: 256 B of e2m1
+        pairs (even dim in the low nibble), then 32 e4m3 scales, one per 16.
+
     Defaulting to "trailer" keeps every pre-existing caller on the bytes it was
     written against; feeding a gfx950 kernel the aligned form makes it read the
     pad region as exponents and the output comes back all-NaN.
     """
-    if layout not in ("trailer", "aligned"):
-        raise ValueError(f"layout must be 'trailer' or 'aligned', got {layout!r}")
+    if layout not in ("trailer", "aligned", "v41", "nvfp4"):
+        raise ValueError(
+            f"layout must be 'trailer', 'aligned', 'v41' or 'nvfp4', got {layout!r}"
+        )
     device = "cuda"
     rope = 64  # DSv4 RoPE dim, stored bf16
     block = page_size  # packed cache page size; vLLM allocates 64
@@ -679,6 +687,42 @@ def make_packed_cache(num_tokens, D, dtype, page_size=256, layout="trailer"):
             torch.randn(nb, block, D, device=device, dtype=torch.float32) * 0.4
         ).to(torch.bfloat16)
         return cache, cache.reshape(nb * block, D).float()
+
+    if layout == "nvfp4":
+        num_groups = D // 16
+        cache = torch.zeros(
+            nb, block, D // 2 + num_groups, dtype=torch.uint8, device=device
+        )
+        codes = torch.randint(0, 256, (nb, block, D // 2), device=device)
+        cache[:, :, : D // 2] = codes.to(torch.uint8)
+        e2m1 = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            device=device,
+        )
+        vals = torch.stack([e2m1[codes & 0xF], e2m1[codes >> 4]], dim=-1)
+        # 1/32 .. 1/2, log-uniform, so a scale read off its group shows.
+        scales = torch.exp2(
+            torch.rand(nb, block, num_groups, device=device) * 4 - 5
+        ).to(torch.float8_e4m3fn)
+        cache[:, :, D // 2 :] = scales.view(torch.uint8)
+        kv_deq = vals.reshape(nb, block, D) * scales.float().repeat_interleave(
+            16, dim=2
+        )
+        return cache, kv_deq.reshape(nb * block, D)
+
+    if layout == "v41":
+        num_groups = D // 32
+        cache = torch.zeros(nb, block, D + num_groups, dtype=torch.uint8, device=device)
+        x_fp8 = (
+            torch.randn(nb, block, D, device=device, dtype=torch.float32) * 0.4
+        ).to(torch.float8_e4m3fn)
+        cache[:, :, :D] = x_fp8.view(torch.uint8)
+        exps = torch.randint(
+            124, 130, (nb, block, num_groups), device=device, dtype=torch.uint8
+        )
+        cache[:, :, D:] = exps
+        scales = torch.exp2(exps.float() - 127.0).repeat_interleave(32, dim=2)
+        return cache, (x_fp8.float() * scales).reshape(nb * block, D)
 
     if layout == "trailer":
         # per token: [nope fp8 (1B) | rope bf16 (2B)], scales in a per-block
@@ -946,6 +990,65 @@ def test_pa_decode_sparse_with_extra(
 
     tol = 1e-2 if dtype == "fp8" else 5e-3
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("T", [1, 32, 128])
+@pytest.mark.parametrize("H", [16, 64, 128])
+@pytest.mark.parametrize("extra_len", [8, 256])
+@pytest.mark.parametrize("page_size", [64, 256])
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("extra_layout", ["v41", "nvfp4"])
+def test_pa_decode_sparse_v41_record(T, H, extra_len, page_size, pooled, extra_layout):
+    """The SWA + top-k two-loop on DeepSeek-V4.1's records (gfx950): the 528 B
+    MXFP8 SWA record with a 528 B or 288 B NVFP4 compressed record."""
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("the V4.1 records are read on gfx950 only")
+    D, main_len = 512, 128
+    torch.manual_seed(0)
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda") * 0.125
+    attn_sink = torch.randn(H, dtype=torch.float32, device="cuda") * 0.1
+    main_cache, main_deq = make_packed_cache(T * main_len, D, "fp8", page_size, "v41")
+    main_idx = torch.arange(T * main_len, dtype=torch.int32, device="cuda")
+    main_indptr = torch.arange(
+        0, T * main_len + 1, main_len, dtype=torch.int32, device="cuda"
+    )
+    extra_cache, extra_deq = make_packed_cache(
+        T * extra_len, D, "fp8", page_size, extra_layout
+    )
+    if pooled:
+        main_cache = as_pooled_layer(main_cache)
+        extra_cache = as_pooled_layer(extra_cache)
+    extra_idx = torch.randint(
+        0, T * extra_len, (T * extra_len,), dtype=torch.int32, device="cuda"
+    )
+    extra_idx[::5] = -1
+    extra_indptr = torch.arange(
+        0, T * extra_len + 1, extra_len, dtype=torch.int32, device="cuda"
+    )
+    ref = two_loop_reference(
+        q,
+        main_deq,
+        main_idx,
+        main_indptr,
+        extra_deq,
+        extra_idx,
+        extra_indptr,
+        attn_sink,
+        D**-0.5,
+    )
+    out = pa_decode_sparse(
+        q,
+        main_cache,
+        main_idx,
+        main_indptr,
+        attn_sink,
+        D**-0.5,
+        extra_cache=extra_cache,
+        extra_indices=extra_idx,
+        extra_indptr=extra_indptr,
+        has_invalid=True,
+    )
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("has_invalid", [False, True])
