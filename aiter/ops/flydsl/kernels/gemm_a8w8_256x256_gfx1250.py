@@ -161,6 +161,62 @@ def launch_gemm_a8w8_256x256(
     # kernels under FLYDSL_GPU_ARCH, which get_rocm_arch() honours.
     arch = get_rocm_arch().split(":", 1)[0]
     lds_cap = get_lds_capacity_bytes(arch)
+    # Persistent tiles stage C per wave, clear of LDS slots 0..C_EARLY_SLOTS-1, so
+    # the next tile can load those slots while this tile's C store still reads LDS.
+    C_EARLY_SLOTS = num_buffers // 2
+    Q_LDS_ROW = warp_tile_n + 8
+    Q_BYTES = warp_tile_m * Q_LDS_ROW * 2
+    Q_FREE_OFF = (PLANAR_END + 255) // 256 * 256
+    # Each wave stages rows [0, Q_SPLIT) of its quadrant at Q_OFFS[w] and the rest
+    # at Q_TAIL_OFFS[w]: contiguous except for the last wave, whose head fits B slot 3
+    # alone so that B slot 2 stays free for the next tile's K-tile 2.
+    Q_SPLIT = warp_tile_m - 16
+    Q_HEAD_BYTES = Q_SPLIT * Q_LDS_ROW * 2
+    if const_expr(num_buffers == 4):
+        Q_OFFS = [
+            Q_FREE_OFF,
+            PLANAR_A_BASE + 3 * STAGE_A,
+            PLANAR_A_BASE + 2 * STAGE_A,
+            PLANAR_B_BASE + 3 * STAGE_B,
+        ]
+        Q_TAIL_OFFS = [off + Q_HEAD_BYTES for off in Q_OFFS[:3]] + [
+            Q_FREE_OFF + Q_BYTES
+        ]
+        q_fits = STAGE_A >= Q_BYTES and STAGE_B >= Q_HEAD_BYTES
+    else:
+        Q_OFFS = [
+            Q_FREE_OFF,
+            PLANAR_A_BASE + STAGE_A,
+            PLANAR_A_BASE + STAGE_A + Q_BYTES,
+            PLANAR_B_BASE + STAGE_B,
+        ]
+        Q_TAIL_OFFS = [off + Q_HEAD_BYTES for off in Q_OFFS]
+        q_fits = STAGE_A >= 2 * Q_BYTES and STAGE_B >= Q_BYTES
+    Q_END = max(Q_FREE_OFF + Q_BYTES, Q_TAIL_OFFS[3] + Q_BYTES - Q_HEAD_BYTES)
+    # An mx32 A-scale panel feeds several K-steps, so its slot is still being read
+    # when the drain would prefetch the next tile into it.
+    c_relocate = (
+        persistent_n_tiles > 1
+        and num_buffers in (2, 4)
+        and num_waves == 4
+        and SA_PANEL_STAGES == 1
+        and Q_END <= lds_cap
+        and q_fits
+    )
+    if c_relocate:
+        ARENA_B = max(ARENA_B, Q_END)
+    # Drain K-steps whose freed slot takes the next tile's matching K-step, and how
+    # many of those loads are already in flight when each drain K-step fences.
+    DRAIN_PREF = [
+        c_relocate and g % KPAIR == KPAIR - 1 and g // KPAIR < C_EARLY_SLOTS
+        for g in range(UNROLL)
+    ]
+    # With four slots and one K-tile per slot, the third drain K-step also lands
+    # the next tile's K-tile 2 for every operand but A (whose slot 2 holds C), and
+    # that tile waits for the C store only at its first refill.
+    BB_OK = c_relocate and num_buffers == 4 and KPAIR == 1
+    BB_SLOT = 2
+    DRAIN_PREF_BEFORE = [sum(DRAIN_PREF[:g]) for g in range(UNROLL)]
     if ARENA_B > lds_cap:
         raise RuntimeError(
             f"Shared Memory Overflow: requested {ARENA_B} bytes on {arch}, "
@@ -280,6 +336,16 @@ def launch_gemm_a8w8_256x256(
             scale_k0 = kt_base * K_WS
             sa_off0 = blk_m64 + scale_k0 * fx.Int64(i32_stride_ascale_k)
             sb_off0 = (blk_n64 // 128) * (k64 // 128) + scale_k0
+        b_tile_shift = sb_tile_shift = fx.Int32(0)
+        if const_expr(c_relocate):
+            # The next persistent tile differs only in its N block. Byte deltas are
+            # added unsigned, so they must stay below 4 GiB.
+            n_adv = fx.Int32(fx.grid_dim.y) * tile_n
+            b_tile_shift = n_adv * i32_k
+            if const_expr(mx32):
+                sb_tile_shift = (n_adv // 32) * i32_k
+            else:
+                sb_tile_shift = (n_adv // 128) * (i32_k // 128)
 
         gA = _gv(gA_base, a_off0, (A_LDS_ROWS, A_PAIR * tile_k), (A_PAIR * tile_k, 1))
         gB = _gv(
@@ -393,7 +459,7 @@ def launch_gemm_a8w8_256x256(
                 pad_amount=pad,
                 num_warps=1,
                 workgroup_mask=mask,
-                early_timeout=early,
+                early_timeout=early and owner > 1,
                 oob_outer_bound=bound,
                 oob_inner_bound=inner_bound,
             )
@@ -408,24 +474,39 @@ def launch_gemm_a8w8_256x256(
 
         def _owned_tdm_desc(owner):
             desc, lds_step, global_step = _build_tdm_desc(owner)
+            tile_shift = (
+                b_tile_shift
+                if const_expr(owner == 1)
+                else (sb_tile_shift if const_expr(owner == 3) else fx.Int32(0))
+            )
             return (
                 Vec(desc.dgroup0),
                 Vec(desc.dgroup1),
                 fx.Int32(lds_step),
                 fx.Int32(global_step),
+                tile_shift,
             )
 
         dgroup0 = fx.full(4, 0, fx.Int32)
         dgroup1 = fx.full(8, 0, fx.Int32)
         tdm_lds_step, tdm_global_step = fx.Int32(0), fx.Int32(0)
+        tdm_tile_shift = fx.Int32(0)
         if wave == 0:
-            dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(0)
+            dgroup0, dgroup1, tdm_lds_step, tdm_global_step, tdm_tile_shift = (
+                _owned_tdm_desc(0)
+            )
         elif wave == 1:
-            dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(1)
+            dgroup0, dgroup1, tdm_lds_step, tdm_global_step, tdm_tile_shift = (
+                _owned_tdm_desc(1)
+            )
         elif wave == 2:
-            dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(2)
+            dgroup0, dgroup1, tdm_lds_step, tdm_global_step, tdm_tile_shift = (
+                _owned_tdm_desc(2)
+            )
         else:
-            dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(3)
+            dgroup0, dgroup1, tdm_lds_step, tdm_global_step, tdm_tile_shift = (
+                _owned_tdm_desc(3)
+            )
 
         tdm_desc = tdm_ops.TDMDescriptor2D(as_ir_value(dgroup0), as_ir_value(dgroup1))
         tdm_base_lds, tdm_base_lo, tdm_base_hi = (
@@ -536,10 +617,14 @@ def launch_gemm_a8w8_256x256(
                     sb_k,
                 )
 
-        if const_expr(persistent_n_tiles > 1):
-            rocdl.sched_barrier(0)
-            tdm_ops.tensor_wait(0)
-        cluster.cluster_barrier()
+        if const_expr(c_relocate):
+            if tile_idx == 0:
+                cluster.cluster_barrier()
+        else:
+            if const_expr(persistent_n_tiles > 1):
+                rocdl.sched_barrier(0)
+                tdm_ops.tensor_wait(0)
+            cluster.cluster_barrier()
         # Keep fragment displacements as DS immediates inside the K loop.
         stage_a_addr, stage_b_addr, stage_sa_addr, stage_sb_addr = (
             [],
@@ -614,6 +699,13 @@ def launch_gemm_a8w8_256x256(
         lds_load_b128, _ = make_lds_copy_ops(128)
 
         DS_PER_FRAG = 4  # ds_load_b128 per 16-dword fragment
+        WAR_SCHED = const_expr(
+            tile_m == 256 and half_m == 4 and half_n == 4 and not mx32
+        )
+        # Load windows (first, last WMMA position a load may follow) per quadrant.
+        WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 11), (4, 11), (3, 10)
+        WAR_WAIT_AT = 3
+        WAR_PERM_AT = 11
 
         def _frag_geom(kind, stage):
             if const_expr(kind == "a"):
@@ -756,34 +848,45 @@ def launch_gemm_a8w8_256x256(
             boundary=True,
             parity=0,
             sa_super=0,
+            prefetch=False,
+            fence_extra=0,
+            pref_gate=None,
+            first_hook=None,
         ):
             """One K-tile, four 64x64 quadrants, at most three fragment groups live."""
-            sa_k = [_sa_of(seed_sa[sm].load()[0]) for sm in range_constexpr(N_SA)]
-            sb_k = [_sb_of(seed_sb[sn].load()[0]) for sn in range_constexpr(N_SB)]
+            if const_expr(WAR_SCHED):
+                # The previous K-step already broadcast the scale bytes.
+                sa_k = [seed_sa[sm].load()[0] for sm in range_constexpr(N_SA)]
+                sb_k = [seed_sb[sn].load()[0] for sn in range_constexpr(N_SB)]
+            else:
+                sa_k = [_sa_of(seed_sa[sm].load()[0]) for sm in range_constexpr(N_SA)]
+                sb_k = [_sb_of(seed_sb[sn].load()[0]) for sn in range_constexpr(N_SB)]
             a0, b0 = seed_a, seed_b
 
             rocdl.sched_barrier(0)
 
             refill = const_expr(boundary and future_kt is not None)
-            if const_expr(SA_PANEL_STAGES > 1):
-                sa_next_panel = sa_super // SA_PANEL_STAGES + num_buffers
-                sa_refill = (sa_super % SA_PANEL_STAGES == SA_PANEL_STAGES - 1) & (
-                    sa_next_panel < (SUPERS + SA_PANEL_STAGES - 1) // SA_PANEL_STAGES
-                )
-                prepared = (
-                    _prepare_tdm(
-                        future_slot,
-                        future_kt,
-                        sa_next_panel,
-                        sa_refill.select(fx.Int32(1), fx.Int32(0)),
+            prep_box = [None]
+
+            def _prep():
+                if const_expr(SA_PANEL_STAGES > 1):
+                    sa_next_panel = sa_super // SA_PANEL_STAGES + num_buffers
+                    sa_refill = (sa_super % SA_PANEL_STAGES == SA_PANEL_STAGES - 1) & (
+                        sa_next_panel
+                        < (SUPERS + SA_PANEL_STAGES - 1) // SA_PANEL_STAGES
                     )
-                    if const_expr(refill)
-                    else None
-                )
-            else:
-                prepared = (
-                    _prepare_tdm(future_slot, future_kt) if const_expr(refill) else None
-                )
+                    if const_expr(refill):
+                        prep_box[0] = _prepare_tdm(
+                            future_slot,
+                            future_kt,
+                            sa_next_panel,
+                            sa_refill.select(fx.Int32(1), fx.Int32(0)),
+                        )
+                elif const_expr(refill):
+                    prep_box[0] = _prepare_tdm(future_slot, future_kt)
+
+            if const_expr(not WAR_SCHED):
+                _prep()
 
             def _quad(
                 wm0,
@@ -861,18 +964,236 @@ def launch_gemm_a8w8_256x256(
             def _sig():
                 _drain_ds()
                 if const_expr(boundary and has_next):
-                    pipeline_fence_signal(
-                        outstanding=fence_outstanding,
-                        use_cluster=False,
-                    )
+                    if const_expr(fence_extra > 0):
+                        if has_next_tile:
+                            pipeline_fence_signal(
+                                outstanding=fence_outstanding + fence_extra,
+                                use_cluster=False,
+                            )
+                        else:
+                            pipeline_fence_signal(
+                                outstanding=fence_outstanding,
+                                use_cluster=False,
+                            )
+                    else:
+                        pipeline_fence_signal(
+                            outstanding=fence_outstanding,
+                            use_cluster=False,
+                        )
                 rocdl.sched_barrier(0)
 
             def _wait_refill():
                 if const_expr(boundary and has_next):
+                    # Without this fence the scheduler hoists the wait up to the
+                    # signal, and the WMMAs between them no longer hide it.
+                    rocdl.sched_barrier(0)
                     pipeline_fence_wait(use_cluster=False)
-                    if const_expr(refill):
-                        tdm_ops.tensor_load_2d(prepared)
+                    if const_expr(first_hook is not None):
+                        first_hook()
+                    if const_expr(refill and prefetch and pref_gate is not None):
+                        if pref_gate == 1:
+                            tdm_ops.tensor_load_2d(prep_box[0])
+                    elif const_expr(refill and prefetch):
+                        if has_next_tile:
+                            tdm_ops.tensor_load_2d(prep_box[0])
+                    elif const_expr(refill):
+                        tdm_ops.tensor_load_2d(prep_box[0])
                 rocdl.sched_barrier(0)
+
+            if const_expr(WAR_SCHED):
+                # Every fragment dies only in the last four WMMAs of a quadrant and
+                # every load issues at least four WMMAs after the latest death, so
+                # no ds_load overwrites VGPRs that an in-flight WMMA still reads.
+                a0 = [_rmem(16, t.load()) for t in seed_a]
+                b0 = [_rmem(16, t.load()) for t in seed_b]
+                frags = {}
+
+                def _frag_thunks(kind, stg, idx, dest):
+                    addr, row, span = _frag_geom(kind, stg)
+                    parts = []
+
+                    def _one(j):
+                        parts.append(Vec(lds_load_b128(addr, idx * row + span * j)))
+                        if const_expr(j == DS_PER_FRAG - 1):
+                            dest(_join(parts))
+
+                    return [lambda j=j: _one(j) for j in range_constexpr(DS_PER_FRAG)]
+
+                def _cur(kind, key):
+                    n = half_m if kind == "a" else half_n
+                    frags[key] = [None] * n
+                    out = []
+                    for i in range_constexpr(n):
+
+                        def _set(v, i=i):
+                            frags[key][i] = _rmem(16, v)
+
+                        out += _frag_thunks(kind, stage, n + i, _set)
+                    return out
+
+                def _seed(kind):
+                    if const_expr(not has_next):
+                        return []
+                    n = half_m if kind == "a" else half_n
+                    tgt = seed_a if kind == "a" else seed_b
+                    out = []
+                    for i in range_constexpr(n):
+
+                        def _set(v, i=i):
+                            tgt[i].store(v)
+
+                        out += _frag_thunks(kind, next_stage, i, _set)
+                    return out
+
+                def _seed_scales():
+                    sa_next = sa_super + int(stage % KPAIR == KPAIR - 1)
+                    for sm in range_constexpr(N_SA):
+                        seed_sa[sm].store(
+                            Vec.from_elements(
+                                [_stage_load_sa_raw(next_stage, sm, sa_next)], fx.Int32
+                            )
+                        )
+                    for sn in range_constexpr(N_SB):
+                        seed_sb[sn].store(
+                            Vec.from_elements(
+                                [_stage_load_sb_raw(next_stage, sn)], fx.Int32
+                            )
+                        )
+
+                def _spread(thunks, lo, hi):
+                    out = {}
+                    if const_expr(len(thunks) == 0):
+                        return out
+                    pos = list(range(lo, hi + 1))
+                    for t_i, t in enumerate(thunks):
+                        out.setdefault(pos[t_i * len(pos) // len(thunks)], []).append(t)
+                    return out
+
+                Qn = half_m
+                i_fast = [(p % Qn, p // Qn) for p in range(Qn * Qn)]
+                j_fast = [(p // Qn, p % Qn) for p in range(Qn * Qn)]
+                diag_last = [(i, j) for i in range(Qn) for j in range(Qn) if i != j] + [
+                    (k, k) for k in range(Qn)
+                ]
+
+                def _run(
+                    wm0,
+                    wn0,
+                    act,
+                    wt,
+                    order,
+                    loads,
+                    pre=None,
+                    at=None,
+                    head=None,
+                    free=0,
+                ):
+                    if const_expr(pre is not None):
+                        pre()
+                    if const_expr(head is not None):
+                        head()
+                    for pos in range_constexpr(len(order)):
+                        i, j = order[pos]
+                        _mma_one(wm0 + i, wn0 + j, act[i], wt[j], sa_k, sb_k)
+                        if const_expr(at is not None and pos in at):
+                            at[pos]()
+                        for t in loads.get(pos, []):
+                            t()
+                        if const_expr(pos >= free - 1):
+                            rocdl.sched_barrier(0)
+
+                def _perm_seeds():
+                    for sm in range_constexpr(N_SA):
+                        seed_sa[sm].store(
+                            Vec.from_elements([_sa_of(seed_sa[sm].load()[0])], fx.Int32)
+                        )
+                    for sn in range_constexpr(N_SB):
+                        seed_sb[sn].store(
+                            Vec.from_elements([_sb_of(seed_sb[sn].load()[0])], fx.Int32)
+                        )
+
+                l3_at = {WAR_PERM_AT: _perm_seeds} if const_expr(has_next) else None
+
+                l2_at = {WAR_WAIT_AT: _wait_refill}
+                if const_expr(has_next):
+                    l2_at = {WAR_WAIT_AT: lambda: (_wait_refill(), _seed_scales())}
+                if const_expr(parity == 0):
+                    _run(
+                        0,
+                        0,
+                        a0,
+                        b0,
+                        i_fast,
+                        _spread(_cur("b", "b1"), *WAR_Q0),
+                        head=_prep,
+                        free=WAR_Q0[0],
+                    )
+                    _run(
+                        0,
+                        half_n,
+                        a0,
+                        frags["b1"],
+                        i_fast,
+                        _spread(_cur("a", "a1"), *WAR_Q1),
+                    )
+                    _run(
+                        half_m,
+                        half_n,
+                        frags["a1"],
+                        frags["b1"],
+                        j_fast,
+                        _spread(_seed("a"), *WAR_Q2),
+                        pre=_sig,
+                        at=l2_at,
+                    )
+                    _run(
+                        half_m,
+                        0,
+                        frags["a1"],
+                        b0,
+                        diag_last,
+                        _spread(_seed("b"), *WAR_Q3),
+                        at=l3_at,
+                    )
+                else:
+                    _run(
+                        0,
+                        0,
+                        a0,
+                        b0,
+                        j_fast,
+                        _spread(_cur("a", "a1"), *WAR_Q0),
+                        head=_prep,
+                        free=WAR_Q0[0],
+                    )
+                    _run(
+                        half_m,
+                        0,
+                        frags["a1"],
+                        b0,
+                        j_fast,
+                        _spread(_cur("b", "b1"), *WAR_Q1),
+                    )
+                    _run(
+                        half_m,
+                        half_n,
+                        frags["a1"],
+                        frags["b1"],
+                        i_fast,
+                        _spread(_seed("b"), *WAR_Q2),
+                        pre=_sig,
+                        at=l2_at,
+                    )
+                    _run(
+                        0,
+                        half_n,
+                        a0,
+                        frags["b1"],
+                        diag_last,
+                        _spread(_seed("a"), *WAR_Q3),
+                        at=l3_at,
+                    )
+                return
 
             n_slots = half_m * half_n
             SLACK = n_slots // 4
@@ -990,10 +1311,55 @@ def launch_gemm_a8w8_256x256(
 
         SUPERS = K_TILES // KPAIR
         last_delta = (SUPERS - 1) * tdm_global_step
+        n_full = (SUPERS + num_buffers - 1) // num_buffers - 1
+        drain_s = SUPERS - n_full * num_buffers  # 1..num_buffers
+        if const_expr(c_relocate):
+            # The drain loads the next tile's first n_pref slots as it frees them,
+            # so that tile's prologue skips those loads.
+            has_next_tile = tile_idx < persistent_n_tiles - 1
+            n_pref = (drain_s < C_EARLY_SLOTS).select(drain_s, fx.Int32(C_EARLY_SLOTS))
+            prev_pref = (tile_idx > 0).select(n_pref, fx.Int32(0))
+            pref_delta = [
+                (fx.Int32(s) * tdm_global_step < last_delta).select(
+                    fx.Int32(s) * tdm_global_step, last_delta
+                )
+                + tdm_tile_shift
+                for s in range_constexpr(BB_SLOT + 1 if BB_OK else C_EARLY_SLOTS)
+            ]
+        # bb_on: this K split has four drain K-steps and a steady loop. defer: this
+        # tile's slots C_EARLY_SLOTS.. wait for the previous C store until its first
+        # refill. pref_bb: this wave lands the next tile's K-tile 2 in the drain.
+        bb_on = defer = pref_bb = fx.Int32(0)
+        if const_expr(BB_OK):
+            bb_on = (n_full > 0).select(
+                (drain_s == num_buffers).select(fx.Int32(1), fx.Int32(0)), fx.Int32(0)
+            )
+            defer = (tile_idx > 0).select(bb_on, fx.Int32(0))
+            pref_bb = (fx.Int32(wave) == 0).select(
+                fx.Int32(0), has_next_tile.select(bb_on, fx.Int32(0))
+            )
+
+        def _seed_delta(i):
+            d = fx.Int32(i) * tdm_global_step
+            return (d < last_delta).select(d, last_delta)
+
         for i in range_constexpr(num_buffers):
-            seed_delta = fx.Int32(i) * tdm_global_step
-            seed_delta = (seed_delta < last_delta).select(seed_delta, last_delta)
-            if const_expr(SA_PANEL_STAGES > 1):
+            if const_expr(c_relocate and i == C_EARLY_SLOTS):  # noqa: SIM102
+                # Slots from here on hold the previous tile's C until its TDM
+                # store, and every peer's, has read it out of LDS.
+                if tile_idx > 0:  # noqa: SIM102
+                    if defer == 0:
+                        rocdl.sched_barrier(0)
+                        tdm_ops.tensor_wait(0)
+                        workgroup_barrier(use_cluster=False)
+            seed_delta = _seed_delta(i)
+            if const_expr(c_relocate and i < C_EARLY_SLOTS):
+                if fx.Int32(i) >= prev_pref:
+                    tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
+            elif const_expr(BB_OK):
+                if defer == 0:
+                    tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
+            elif const_expr(SA_PANEL_STAGES > 1):
                 sa_seed = (fx.Int32(i * SA_PANEL_STAGES) < SUPERS).select(
                     fx.Int32(1), fx.Int32(0)
                 )
@@ -1003,12 +1369,33 @@ def launch_gemm_a8w8_256x256(
             else:
                 tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
         pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
+
+        def _deferred_slots():
+            """First refill of a deferring tile: wait out every wave's C store in the
+            cluster, then load the slots that C occupied (slot 2's non-A operands
+            already landed in the previous tile's drain)."""
+            rocdl.sched_barrier(0)
+            tdm_ops.tensor_wait(0)
+            cluster.cluster_barrier()
+            if fx.Int32(wave) == 0:
+                tdm_ops.tensor_load_2d(_prepare_tdm(BB_SLOT, _seed_delta(BB_SLOT)))
+            for s in range_constexpr(BB_SLOT + 1, num_buffers):
+                tdm_ops.tensor_load_2d(_prepare_tdm(s, _seed_delta(s)))
+            rocdl.sched_barrier(0)
+
         for group in _seed_thunks(0, 0, fx.Int32(0)):
             for thunk in group:
                 thunk()
+        if const_expr(WAR_SCHED):
+            for sm in range_constexpr(N_SA):
+                seed_sa[sm].store(
+                    Vec.from_elements([_sa_of(seed_sa[sm].load()[0])], fx.Int32)
+                )
+            for sn in range_constexpr(N_SB):
+                seed_sb[sn].store(
+                    Vec.from_elements([_sb_of(seed_sb[sn].load()[0])], fx.Int32)
+                )
 
-        n_full = (SUPERS + num_buffers - 1) // num_buffers - 1
-        drain_s = SUPERS - n_full * num_buffers  # 1..num_buffers
         slot_delta = [
             fx.Int32(c + num_buffers) * tdm_global_step
             for c in range_constexpr(num_buffers)
@@ -1032,6 +1419,11 @@ def launch_gemm_a8w8_256x256(
             for rev in range(n_full):
                 rev_delta = (rev * num_buffers) * tdm_global_step
                 do_sync = (rev % cluster_sync_revs) == (cluster_sync_revs - 1)
+
+                def _first_refill(rev=rev):
+                    if (rev == 0).select(defer, fx.Int32(0)) == 1:
+                        _deferred_slots()
+
                 for g in range_constexpr(UNROLL):
                     args = _stage_args(g, rev_delta, num_buffers - 2)
                     boundary = g % KPAIR == KPAIR - 1
@@ -1042,6 +1434,9 @@ def launch_gemm_a8w8_256x256(
                         boundary,
                         owner_parity,
                         rev * num_buffers + g // KPAIR,
+                        first_hook=(
+                            _first_refill if const_expr(BB_OK and g == 0) else None
+                        ),
                     )
                 if do_sync:
                     cluster.cluster_barrier()
@@ -1071,87 +1466,163 @@ def launch_gemm_a8w8_256x256(
                     g % 2,
                     (g + 1) % 2,
                     g // KPAIR,
-                    None,
+                    (
+                        pref_delta[g // KPAIR]
+                        if const_expr(DRAIN_PREF[g] or (BB_OK and g == BB_SLOT))
+                        else None
+                    ),
                     num_buffers - 2 - g // KPAIR,
                     g < UNROLL - 1,
                     False,
                     g % KPAIR == KPAIR - 1,
                     0,
                     n_full * num_buffers + g // KPAIR,
+                    prefetch=const_expr(DRAIN_PREF[g] or (BB_OK and g == BB_SLOT)),
+                    fence_extra=DRAIN_PREF_BEFORE[g],
+                    pref_gate=pref_bb if const_expr(BB_OK and g == BB_SLOT) else None,
                 )
         accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
 
-        pipeline_fence(outstanding=0, use_cluster=True)
-        for wm in range_constexpr(wmma_m_rep):
-            row_rel = wmb + wm * 16 + lane16
-            if const_expr(cluster_splitk):
-                # Put the locally reduced stripe last so all peer rows form
-                # one contiguous TDM store, with no packing copy in LDS.
-                row_rel = (row_rel + tile_m - (split_idx + 1) * (tile_m // split_k)) & (
-                    tile_m - 1
-                )
-            for wn in range_constexpr(wmma_n_rep):
-                col_rel = wnb + wn * 16 + kgrp * 8
-                h = accs[wm * wmma_n_rep + wn].to(partial_elem)
-                fx.ptr_store(
-                    h.bitcast(fx.Int8),
-                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * partial_bytes,
-                )
-        workgroup_barrier(use_cluster=False)
-        c_off_rt = c_off_rt_out = blk_m64 * ldc64 + blk_n64
-        if const_expr(cluster_splitk):
-            # Peer rows go to a packed scratch tensor, one contiguous plane
-            # per split of an output tile; the local stripe stays in LDS.
-            c_off_rt = (fx.Int64(_flat_tile) * split_k + fx.Int64(split_idx)) * (
-                tile_m * tile_n
-            )
-        elif const_expr(split_k > 1):
-            c_off_rt = c_off_rt + fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
+        if const_expr(c_relocate):
+            n_out = has_next_tile.select(n_pref, fx.Int32(0))
+            for c in range_constexpr(C_EARLY_SLOTS + 1):
+                if n_out == c:
+                    tdm_ops.tensor_wait(c)
+            workgroup_barrier(use_cluster=False)
+        else:
+            pipeline_fence(outstanding=0, use_cluster=True)
         gC_base = fx.recast_iter(
             fx.PointerType.get(partial_elem.ir_type, arg_c.address_space),
             arg_c,
         )
-        if const_expr(cluster_splitk):
-            emit_fused_splitk_epilogue(
-                elem=oc,
-                tid=tid,
-                block=block,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                lds_base_ptr=base_ptr,
-                partials=arg_c,
-                out=arg_out,
-                c_off=c_off_rt_out,
-                ldc64=ldc64,
-                c_lds_row=C_LDS_ROW,
-                split_k=split_k,
-                split_idx=split_idx,
-                mn_oob=mn_oob,
-                flat_tile=_flat_tile,
-                bounded_m=bounded_m,
-            )
+        if const_expr(c_relocate):
+            wave_i = fx.Int32(wave)
+            q_offs = []
+            for offs in (Q_OFFS, Q_TAIL_OFFS):
+                q_off = fx.Int32(offs[num_waves - 1] // 2)
+                for w in range_constexpr(num_waves - 1):
+                    q_off = (wave_i == w).select(fx.Int32(offs[w] // 2), q_off)
+                q_offs.append(q_off)
+            q_ptrs = [base_ptr + q_off * 2 for q_off in q_offs]
+            for wm in range_constexpr(wmma_m_rep):
+                part = 0 if const_expr(wm * 16 < Q_SPLIT) else 1
+                row0 = 0 if const_expr(part == 0) else Q_SPLIT
+                for wn in range_constexpr(wmma_n_rep):
+                    h = accs[wm * wmma_n_rep + wn].to(oc)
+                    fx.ptr_store(
+                        h.bitcast(fx.Int8),
+                        q_ptrs[part]
+                        + ((wm * 16 - row0 + lane16) * Q_LDS_ROW + wn * 16 + kgrp * 8)
+                        * 2,
+                    )
+            rocdl.s_wait_dscnt(0)
+            rocdl.sched_barrier(0)
+            q_rows = mn_oob - wmb
+            q_rows = (q_rows < warp_tile_m).select(q_rows, fx.Int32(warp_tile_m))
+            q_rows = (q_rows > 0).select(q_rows, fx.Int32(0))
+            for part, row0, n_rows in (
+                (0, 0, Q_SPLIT),
+                (1, Q_SPLIT, warp_tile_m - Q_SPLIT),
+            ):
+                p_rows = q_rows - row0
+                p_rows = (p_rows < n_rows).select(p_rows, fx.Int32(n_rows))
+                p_rows = (p_rows > 0).select(p_rows, fx.Int32(0))
+                # Already uniform; as an SGPR it keeps the C store descriptor out of VGPRs.
+                p_rows = fx.Int32(rocdl.readfirstlane(T.i32, p_rows))
+                q_tile = (n_rows, Q_LDS_ROW)
+                gtQ = _gv(
+                    gC_base,
+                    blk_m64 * ldc64
+                    + blk_n64
+                    + fx.Int64(wmb + row0) * ldc64
+                    + fx.Int64(wnb),
+                    (p_rows, warp_tile_n),
+                    (ldc64, 1),
+                )
+                atomQ, coordQ = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorStore(),
+                    gtQ,
+                    fx.make_layout(q_tile, (Q_LDS_ROW, 1)),
+                    q_tile,
+                    num_warps=1,
+                )
+                blkQ = fx.zipped_divide(coordQ, q_tile)[None, (0, None)]
+                sQ = _view(
+                    fx.recast_iter(oc, base_ptr) + q_offs[part],
+                    (q_tile, 1),
+                    ((Q_LDS_ROW, 1), n_rows * Q_LDS_ROW),
+                )
+                tQs, tQg = fx.rocdl.cdna5.tdm_partition(
+                    atomQ, 0, fx.make_layout(1, 1), sQ, blkQ
+                )
+                fx.copy(atomQ, tQs[None, 0], tQg[None, 0])
         else:
-            c_tile = (tile_m, C_LDS_ROW)
-            gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
-            atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorStore(),
-                gtC,
-                fx.make_layout(c_tile, (C_LDS_ROW, 1)),
-                c_tile,
-                num_warps=num_waves,
-            )
-            blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
-            sC = _view(
-                fx.recast_iter(partial_elem, base_ptr),
-                (c_tile, 1),
-                ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
-            )
-            tCs, tCg = fx.rocdl.cdna5.tdm_partition(
-                atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
-            )
-            fx.copy(atomC, tCs[None, 0], tCg[None, 0])
-            if const_expr(persistent_n_tiles == 1):
-                tdm_ops.tensor_wait(0)
+            for wm in range_constexpr(wmma_m_rep):
+                row_rel = wmb + wm * 16 + lane16
+                if const_expr(cluster_splitk):
+                    # Put the locally reduced stripe last so all peer rows form
+                    # one contiguous TDM store, with no packing copy in LDS.
+                    row_rel = (
+                        row_rel + tile_m - (split_idx + 1) * (tile_m // split_k)
+                    ) & (tile_m - 1)
+                for wn in range_constexpr(wmma_n_rep):
+                    col_rel = wnb + wn * 16 + kgrp * 8
+                    h = accs[wm * wmma_n_rep + wn].to(partial_elem)
+                    fx.ptr_store(
+                        h.bitcast(fx.Int8),
+                        base_ptr + (row_rel * C_LDS_ROW + col_rel) * partial_bytes,
+                    )
+            workgroup_barrier(use_cluster=False)
+            c_off_rt = c_off_rt_out = blk_m64 * ldc64 + blk_n64
+            if const_expr(cluster_splitk):
+                # Peer rows go to a packed scratch tensor, one contiguous plane
+                # per split of an output tile; the local stripe stays in LDS.
+                c_off_rt = (fx.Int64(_flat_tile) * split_k + fx.Int64(split_idx)) * (
+                    tile_m * tile_n
+                )
+            elif const_expr(split_k > 1):
+                c_off_rt = c_off_rt + fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
+            if const_expr(cluster_splitk):
+                emit_fused_splitk_epilogue(
+                    elem=oc,
+                    tid=tid,
+                    block=block,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    lds_base_ptr=base_ptr,
+                    partials=arg_c,
+                    out=arg_out,
+                    c_off=c_off_rt_out,
+                    ldc64=ldc64,
+                    c_lds_row=C_LDS_ROW,
+                    split_k=split_k,
+                    split_idx=split_idx,
+                    mn_oob=mn_oob,
+                    flat_tile=_flat_tile,
+                    bounded_m=bounded_m,
+                )
+            else:
+                c_tile = (tile_m, C_LDS_ROW)
+                gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+                atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorStore(),
+                    gtC,
+                    fx.make_layout(c_tile, (C_LDS_ROW, 1)),
+                    c_tile,
+                    num_warps=num_waves,
+                )
+                blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
+                sC = _view(
+                    fx.recast_iter(partial_elem, base_ptr),
+                    (c_tile, 1),
+                    ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
+                )
+                tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                    atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
+                )
+                fx.copy(atomC, tCs[None, 0], tCg[None, 0])
+                if const_expr(persistent_n_tiles == 1):
+                    tdm_ops.tensor_wait(0)
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_gemm_a8w8_256x256(
