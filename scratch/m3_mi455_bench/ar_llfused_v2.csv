@@ -1,0 +1,23 @@
+M,site,mode,us_per_call,kernels
+1,post_attn,graph,8.704343810677528,1.0|void aiter::ar_ll_rmsnorm_gfx1250x1
+1,post_moe,graph,9.470468852669,1.0|_ZN5aiter21ar_ll_rmsnorm_gfx1250IDF16bDB8_Li4ELbx1
+4,post_attn,graph,9.039843920618296,1.0|void aiter::ar_ll_rmsnorm_gfx1250x1
+4,post_moe,graph,9.715843945741653,1.0|_ZN5aiter21ar_ll_rmsnorm_gfx1250IDF16bDB8_Li4ELbx1
+12,post_attn,graph,9.546875022351742,1.0|void aiter::ar_ll_rmsnorm_gfx1250x1
+12,post_moe,graph,10.21909387782216,1.0|_ZN5aiter21ar_ll_rmsnorm_gfx1250IDF16bDB8_Li4ELbx1
+16,post_attn,graph,9.68078151345253,1.0|void aiter::ar_ll_rmsnorm_gfx1250x1
+16,post_moe,graph,10.27296856045723,1.0|_ZN5aiter21ar_ll_rmsnorm_gfx1250IDF16bDB8_Li4ELbx1
+32,post_attn,graph,10.33678138628602,1.0|void aiter::ar_ll_rmsnorm_gfx1250x1
+32,post_moe,graph,10.999031364917755,1.0|_ZN5aiter21ar_ll_rmsnorm_gfx1250IDF16bDB8_Li4ELbx1
+64,post_attn,graph,12.0731252245605,1.0|void aiter::ar_ll_rmsnorm_gfx1250x1
+64,post_moe,graph,12.81300000846386,1.0|_ZN5aiter21ar_ll_rmsnorm_gfx1250IDF16bDB8_Li4ELbx1
+128,post_attn,graph,15.89890569448471,1.0|void aiter::ar_ll_rmsnorm_gfx1250x1
+128,post_moe,graph,16.4560005068779,1.0|_ZN5aiter21ar_ll_rmsnorm_gfx1250IDF16bDB8_Li4ELbx1
+512,post_attn,graph,33.60925056040287,5.0|void aiter::start_sync_kernelx1;void aiter::ar_rmsnorm_reduce_scatter_gfx1250x1;void aiter::end_sync_kernelx2;void aiter::ar_rmsnorm_gfx1250x1
+512,post_moe,graph,34.58325006067753,5.0|void aiter::start_sync_kernelx1;void aiter::ar_rmsnorm_reduce_scatter_gfx1250x1;void aiter::end_sync_kernelx2;_ZN5aiter18ar_rmsnorm_gfx1250IDF16bDB8_Li4ELb1ELx1
+2517,post_attn,eager,97.51781076192856,6.0|Memcpy DtoD x1;void aiter::start_sync_kernelx1;void aiter::ar_rmsnorm_reduce_scatter_gfx1250x1;void aiter::end_sync_kernelx2;void aiter::ar_rmsnorm_gfx1250x1
+2517,post_moe,eager,97.3425917327404,6.0|Memcpy DtoD x1;void aiter::start_sync_kernelx1;void aiter::ar_rmsnorm_reduce_scatter_gfx1250x1;void aiter::end_sync_kernelx2;_ZN5aiter18ar_rmsnorm_gfx1250IDF16bDB8_Li4ELb1ELx1
+8192,post_attn,eager,265.1936262845993,3.0|Memcpy DtoD x1;void meta::comms::ddaAllReduceTreeFabricx1;void aiter::add_rmsnorm_quant_kernelx1
+8192,post_moe,eager,296.84367775917053,4.0|Memcpy DtoD x1;void meta::comms::ddaAllReduceTreeFabricx1;void aiter::add_rmsnorm_quant_kernelx1;_ZN5aiter37dynamic_per_token_scaled_quant_kernelx1
+16384,post_attn,eager,350.7985323667526,2.0|ncclDevKernel_Generic_32x1;void aiter::add_rmsnorm_quant_kernelx1
+16384,post_moe,eager,387.62640953063965,3.0|ncclDevKernel_Generic_32x1;void aiter::add_rmsnorm_quant_kernelx1;_ZN5aiter37dynamic_per_token_scaled_quant_kernelx1
