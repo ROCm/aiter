@@ -1,4 +1,5 @@
 {
+    "DEFAULT_FALLBACK": true,
     "M_LEQ_4": {
         "BLOCK_M": 16,
         "BLOCK_N": 16,
@@ -35,7 +36,7 @@
         "BLOCK_M": 256,
         "BLOCK_N": 256,
         "BLOCK_K": 64,
-        "NUM_BUFFERS": 4,
+        "NUM_BUFFERS": 3,
         "num_warps": 8,
         "kernel_type": "compute_bound"
     }
