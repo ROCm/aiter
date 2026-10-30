@@ -2883,7 +2883,7 @@ KERNEL_REGISTRY = {
     "a16w16": {
         "gfx950": {cu: dict(sorted(gfx950_a16w16_kernels_list.items())) for cu in (128, 256)},
         "gfx942": {cu: dict(sorted(gfx942_kernels_list.items())) for cu in (80, 228, 304)},
-        "gfx1250": {256: dict(sorted(gfx1250_a16w16_kernels_list.items()))},
+        "gfx1250": {cu: dict(sorted(gfx1250_a16w16_kernels_list.items())) for cu in (96, 256)},
     },
     "a8w8": {"gfx950": {cu: dict(a8w8_kernels_list) for cu in (128, 256)}},
     "a8w8_blockscale": {"gfx950": {cu: dict(a8w8_scale_kernels_list) for cu in (128, 256)}},
