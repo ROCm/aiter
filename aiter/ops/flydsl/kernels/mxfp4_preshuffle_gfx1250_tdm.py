@@ -676,10 +676,22 @@ def launch_gemm_a8w4_tdm(
             addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
             fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
-        def make_tdm_store(gt, outer, stride):
-            return fx.rocdl.make_tdm_atom(
-                gt, [outer, None], strides=[stride, None], num_warps=num_waves
+        def tiled_store(gt, tile, lds_ptr, lds_row):
+            atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
+                gt,
+                fx.make_layout(tile, (lds_row, 1)),
+                tile,
+                num_warps=num_waves,
             )
+            blk = fx.zipped_divide(coord, tile)[None, (0, None)]
+            box = tensor_view(
+                lds_ptr, (tile, 1), ((lds_row, 1), tile[0] * lds_row)
+            )
+            ts, tg = fx.rocdl.cdna5.tdm_partition(
+                atom, wave, fx.make_layout(num_waves, 1), box, blk
+            )
+            fx.copy(atom, ts[None, 0], tg[None, 0])
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
@@ -2331,46 +2343,26 @@ def launch_gemm_a8w4_tdm(
                     c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
                     gtC = tensor_view(
                         c_iter + c_off_rt,
-                        (tile_m // 16, STORE_N * 16),
+                        ((mn_oob + 15) // 16, STORE_N * 16),
                         (out_stride * 16, 1),
                     )
-                    atomC = make_tdm_store(gtC, (mn_oob + 15) // 16, out_stride * 16)
-                    src = tensor_view(
-                        fx.recast_iter(oc_store, base_ptr),
+                    tiled_store(
+                        gtC,
                         (tile_m // 16, STORE_N * 16),
-                        (STORE_N * 16, 1),
+                        fx.recast_iter(oc_store, base_ptr),
+                        STORE_N * 16,
                     )
-                    fx.copy(atomC, src, gtC)
                 else:
                     c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-                    if const_expr(STORE_PAD == 0):
-                        gtC = tensor_view(
-                            c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
-                        )
-                        atomC = make_tdm_store(gtC, mn_oob, out_stride)
-                        src = tensor_view(
-                            fx.recast_iter(oc_store, base_ptr),
-                            (tile_m, STORE_N),
-                            (STORE_N, 1),
-                        )
-                    else:
-                        # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
-                        # extent clamps the inner axis to STORE_N so the pad never lands.
-                        gtC = tensor_view(
-                            c_iter + c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
-                        )
-                        atomC = fx.rocdl.make_tdm_atom(
-                            gtC,
-                            [mn_oob, STORE_N],
-                            strides=[out_stride, None],
-                            num_warps=num_waves,
-                        )
-                        src = tensor_view(
-                            fx.recast_iter(oc_store, base_ptr),
-                            (tile_m, STORE_PITCH),
-                            (STORE_PITCH, 1),
-                        )
-                    fx.copy(atomC, src, gtC)
+                    gtC = tensor_view(
+                        c_iter + c_off_rt, (mn_oob, STORE_N), (out_stride, 1)
+                    )
+                    tiled_store(
+                        gtC,
+                        (tile_m, STORE_PITCH),
+                        fx.recast_iter(oc_store, base_ptr),
+                        STORE_PITCH,
+                    )
                 if const_expr(stage1_quant_out and stage1_act):
                     rocdl.s_wait_storecnt(0)
                 tdm_ops.tensor_wait(0)
