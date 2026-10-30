@@ -51,9 +51,9 @@ def test_preshuffle_flat_buffers_stay_below_4gib():
         # Past M=174592 the bf16 output, padded to 256 rows, reaches 2 GiB and
         # CK writes wrong rows, so the FlyDSL launcher raises instead.
         (174592, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "ck"),
-        (174593, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "flydsl"),
+        (174593, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "raises"),
         # The 57344x8192 M=8192 row on main: the output is past 2 GiB here.
-        (65537, 57344, 8192, "256x128x128_F8_F8_B16_1x2x0x2_default", "flydsl"),
+        (65537, 57344, 8192, "256x128x128_F8_F8_B16_1x2x0x2_default", "raises"),
     ],
 )
 @pytest.mark.parametrize("stride", [1, 2], ids=["dense", "strided"])
@@ -92,6 +92,12 @@ def test_flydsl_bpreshuffle_row_falls_back_to_ck_above_m_max(
     monkeypatch.setattr(gemm_kernels, "flydsl_preshuffle_gemm_a8", fake_flydsl)
     monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
 
+    if backend == "raises":
+        with pytest.raises(RuntimeError, match=r"M .* exceeds 65536"):
+            gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+        assert seen == []
+        return
+
     got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
 
     assert gemm_kernels.PRESHUFFLE_M_MAX == 65536
@@ -102,20 +108,20 @@ def test_flydsl_bpreshuffle_row_falls_back_to_ck_above_m_max(
 @pytest.mark.parametrize(
     "m, n, k, kernel_name, backend",
     [
-        # Kimi-K3's 2112x7168 M=1 row; 7168 = 7 * 1024 but 8192 is not.
+        # Kimi-K3's 2112x7168 M=1 row also supports uneven padded-K splits.
         (1, 2112, 7168, "16x64x512_F8_F8_B16_1x2x0x2_default_ks7", "flydsl"),
-        (1, 2112, 8192, "16x64x512_F8_F8_B16_1x2x0x2_default_ks7", "ck"),
-        # K/split_k must also stay a multiple of tile_k.
+        (1, 2112, 8192, "16x64x512_F8_F8_B16_1x2x0x2_default_ks7", "flydsl"),
+        # K must remain a multiple of tile_k, regardless of split_k.
         (1, 2112, 7040, "16x64x512_F8_F8_B16_1x2x0x2_default_ks2", "ck"),
         (1, 2112, 8192, "16x64x512_F8_F8_B16_1x2x0x2_default_ks4", "flydsl"),
         # Oversized M with an incompatible padded K must not reach CK, whose
         # output is wrong past 2 GiB: the FlyDSL error is raised instead.
-        (175000, 6144, 7232, "128x256x128_F8_F8_B16_1x2x4x2_default", "flydsl"),
+        (175000, 6144, 7232, "128x256x128_F8_F8_B16_1x2x4x2_default", "raises"),
         (65537, 6144, 7232, "128x256x128_F8_F8_B16_1x2x4x2_default", "ck"),
     ],
 )
 @pytest.mark.parametrize("stride", [1, 2], ids=["dense", "strided"])
-def test_flydsl_bpreshuffle_split_k_falls_back_to_ck_when_k_not_divisible(
+def test_flydsl_bpreshuffle_dispatch_accepts_ragged_splits_and_checks_limits(
     monkeypatch, m, n, k, kernel_name, backend, stride
 ):
     from aiter.ops.flydsl import gemm_kernels
@@ -143,6 +149,12 @@ def test_flydsl_bpreshuffle_split_k_falls_back_to_ck_when_k_not_divisible(
         lambda *args, **kwargs: seen.append("flydsl"),
     )
     monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
+
+    if backend == "raises":
+        with pytest.raises(RuntimeError, match=r"M .* exceeds 65536"):
+            gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+        assert seen == []
+        return
 
     got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
 
@@ -547,7 +559,7 @@ def test_blockscale_quantizer_public_dispatch(monkeypatch, layout):
     monkeypatch.setattr(
         gemm_mod,
         "get_CKGEMM_config",
-        lambda *args: {
+        lambda *args, **kwargs: {
             "libtype": "flydsl",
             "kernelName": "flydsl_bpreshuflle_32x64x128_fp8_bf16_none_0x0x0x2_smbs",
         },
