@@ -1509,6 +1509,8 @@ def mla_decode_fwd(
                 and nhead == 12
                 and nhead * max_seqlen_q <= 128
             )
+        ):
+            pass
         elif head_plan.plan in (
             _MlaHeadPlanKind.NATIVE,
             _MlaHeadPlanKind.ACCEPTED_NON_NATIVE,
