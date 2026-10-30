@@ -206,6 +206,33 @@
       "TILE_SIZE_MIN": 128,
       "TILE_SIZE_MAX": 128
     },
+    "D_GEQ_256.G_EQ_8.Q_LEQ_16.DT_fp8_fp8": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "waves_per_eu": 1,
+      "LOOP_VARIANT": 1,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 128,
+      "TILE_SIZE_MAX": 128
+    },
+    "D_GEQ_256.G_EQ_8.Q_LEQ_1024.DT_fp8_fp8": {
+      "BLOCK_M": 64,
+      "num_warps": 4,
+      "waves_per_eu": 1,
+      "LOOP_VARIANT": 2,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 256,
+      "TILE_SIZE_MAX": 256
+    },
+    "D_GEQ_256.G_EQ_8.DT_fp8_fp8": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "waves_per_eu": 1,
+      "LOOP_VARIANT": 1,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 128,
+      "TILE_SIZE_MAX": 128
+    },
     "any": {
       "BLOCK_M": 128,
       "num_warps": 4,
@@ -315,6 +342,27 @@
       "num_stages": 2,
       "waves_per_eu": 1
     },
+    "D_GEQ_256.G_EQ_8.Q_LEQ_16.SHUF.DT_fp8_fp8.BS_LEQ_64": {
+      "BLOCK_M": 16,
+      "num_warps": 1,
+      "num_stages": 2,
+      "waves_per_eu": 1
+    },
+    "D_GEQ_256.G_EQ_8.Q_LEQ_512.SHUF.DT_fp8_fp8.BS_LEQ_64": {
+      "BLOCK_M": 32,
+      "num_warps": 1,
+      "num_stages": 2,
+      "waves_per_eu": 1,
+      "PREFILL_MAX_2D_PRGMS": 160,
+      "PREFILL_MIN_KV": 2048,
+      "PREFILL_MIN_KV_PER_PRGM": 124
+    },
+    "D_GEQ_256.G_EQ_8.SHUF.DT_fp8_fp8.BS_LEQ_64": {
+      "BLOCK_M": 16,
+      "num_warps": 1,
+      "num_stages": 2,
+      "waves_per_eu": 1
+    },
     "any": {
       "BLOCK_M": 16,
       "num_warps": 1,
@@ -384,6 +432,30 @@
       "TILE_SIZE_MAX": 4096
     },
     "D_GEQ_256.G_EQ_4.SHUF.DT_fp8_fp8": {
+      "MIN_SEGMENTS": 1,
+      "SEGMENTS_PER_CU": 4,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
+    },
+    "D_GEQ_256.G_EQ_8.Q_LEQ_16.SHUF.DT_fp8_fp8": {
+      "MIN_SEGMENTS": 1,
+      "SEGMENTS_PER_CU": 4,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
+    },
+    "D_GEQ_256.G_EQ_8.Q_LEQ_64.SHUF.DT_fp8_fp8": {
+      "MIN_SEGMENTS": 1,
+      "SEGMENTS_PER_CU": 4,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
+    },
+    "D_GEQ_256.G_EQ_8.Q_LEQ_512.SHUF.DT_fp8_fp8": {
+      "MIN_SEGMENTS": 1,
+      "SEGMENTS_PER_CU": 8,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
+    },
+    "D_GEQ_256.G_EQ_8.SHUF.DT_fp8_fp8": {
       "MIN_SEGMENTS": 1,
       "SEGMENTS_PER_CU": 4,
       "TILE_SIZE_MIN": 1,
