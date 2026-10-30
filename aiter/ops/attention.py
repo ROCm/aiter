@@ -2532,6 +2532,30 @@ def get_mla_metadata_v1(
         if dtype_kv_rope is None:
             dtype_kv_rope = dtype_kv
 
+    # mla_decode_fwd runs these configs with the gfx1250 Gluon decode, which
+    # does not read this schedule. Skip it and leave the buffers untouched.
+    if (
+        topk < 0
+        and not is_cp_round_robin
+        and not intra_batch_mode
+        and max_seqlen_qo == 1
+        and (uni_seqlen_qo in (-1, 1))
+        and int(mla_version) == MlaVersion.V32.value
+        and dtype_q_nope == dtype_q_rope
+        and dtype_kv_nope == dtype_kv_rope
+    ):
+        from aiter.mla import gluon_mla_decode_route_enabled
+
+        if gluon_mla_decode_route_enabled(
+            num_heads_per_head_k * num_heads_k,
+            num_heads_k,
+            max_seqlen_qo,
+            page_size,
+            dtype_q_nope if dtype_q_nope is not None else torch.bfloat16,
+            dtype_kv_nope if dtype_kv_nope is not None else torch.bfloat16,
+        ):
+            return None
+
     # develop=True auto-converts torch.Tensor args to aiter_tensor_t but NOT
     # torch.dtype, so map the per-component dtypes to their AiterDtype enum ids
     # here (None stays None -> C++ defaults to bf16). Both fp8 torch variants

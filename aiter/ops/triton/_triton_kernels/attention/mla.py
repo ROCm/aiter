@@ -672,7 +672,7 @@ def _mla_decode_fwd_reduce_kernel(
     # [num_tokens, num_query_heads, max_num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, max_num_segments]
-    seq_lens_ptr,  # [num_seqs]
+    seq_lens_ptr,  # [num_seqs] (KV_INDPTR_TABLE: kv_indptr [num_seqs + 1])
     out_scale_ptr,  # float32
     num_seqs,  # int
     num_query_heads: tl.constexpr,  # int
@@ -689,6 +689,7 @@ def _mla_decode_fwd_reduce_kernel(
     ALL_DECODE: tl.constexpr = False,  # int
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    KV_INDPTR_TABLE: tl.constexpr = False,  # seq_lens_ptr holds kv_indptr
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -699,7 +700,10 @@ def _mla_decode_fwd_reduce_kernel(
         seq_idx = query_token_idx // num_tokens_per_seq
 
     # sequence len for this particular sequence
-    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    if KV_INDPTR_TABLE:
+        seq_len = tl.load(seq_lens_ptr + seq_idx + 1) - tl.load(seq_lens_ptr + seq_idx)
+    else:
+        seq_len = tl.load(seq_lens_ptr + seq_idx)
 
     out_scale = None
     if out_scale_ptr is not None:
@@ -707,7 +711,9 @@ def _mla_decode_fwd_reduce_kernel(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    # At least one tile per segment, so a zero-length row (CUDA-graph padding)
+    # does not divide by zero below. It has no active segment: zero output.
+    tiles_per_segment = tl.maximum(cdiv_fn(seq_len, num_segments * TILE_SIZE), 1)
 
     # create masks for subsequent loads
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
@@ -723,6 +729,8 @@ def _mla_decode_fwd_reduce_kernel(
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
     overall_max = tl.max(segm_max)
+    # No active segment: keep exp2(segm_max - overall_max) at 0, not NaN.
+    overall_max = tl.where(overall_max > float("-inf"), overall_max, 0.0)
 
     # load and rescale segment exp sums
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)

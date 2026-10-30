@@ -1,0 +1,33 @@
+{
+  "decode": [
+    {
+      "match": {
+        "QUERY_DTYPE": "bf16",
+        "KV_CACHE_DTYPE": "bf16",
+        "KV_LORA_RANK": 512,
+        "QK_ROPE_HEAD_DIM": 64,
+        "NUM_KV_HEADS": 1,
+        "MIN_QUERIES_PER_KV": 17,
+        "MAX_QUERIES_PER_KV": 32
+      },
+      "TILE_SIZE": 64,
+      "attn": {
+        "B_LEQ_1": {"BLOCK_M": 16, "num_warps": 4, "waves_per_eu": 1, "num_stages": 2},
+        "B_LEQ_2": {"BLOCK_M": 16, "num_warps": 2, "waves_per_eu": 1, "num_stages": 2},
+        "any": {"BLOCK_M": 32, "num_warps": 2, "waves_per_eu": 1, "num_stages": 2}
+      },
+      "segments": {
+        "WORKGROUPS_PER_CU": 2,
+        "MIN_LAST_WAVE_FILL": 0.85,
+        "MAX_SEGMENTS": 128,
+        "SINGLE_SEQ_SEGMENTS": 128
+      },
+      "reduce": {
+        "NSEG_GEQ_128": {"num_warps": 8, "waves_per_eu": 1, "num_stages": 1},
+        "NSEG_GEQ_64": {"num_warps": 4, "waves_per_eu": 2, "num_stages": 1},
+        "NSEG_GEQ_16": {"num_warps": 2, "waves_per_eu": 2, "num_stages": 1},
+        "any": {"num_warps": 1, "waves_per_eu": 2, "num_stages": 1}
+      }
+    }
+  ]
+}
