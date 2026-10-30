@@ -61,8 +61,9 @@ from aiter.ops.flydsl.kernels.comm.quick_allreduce_codec import (
     scale_slot_of,
     thread_lane,
 )
+from aiter.jit.utils.chip_info import get_gfx
 
-ARCH = get_gfx_runtime()
+ARCH = get_gfx()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 pytestmark = pytest.mark.skipif(

@@ -4,8 +4,7 @@
 """Every tuned decision of the FlyDSL all-reduce: which kernel runs a payload,
 and in which configuration.
 
-Kernels
-=======
+**Kernels**
 
 * **one-shot** (``OneShotAllReduce``) -- one round, no grid-wide barrier, wire
   volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding.
