@@ -31,6 +31,14 @@ dpkg -l | grep rocm || echo "No ROCm packages found."
 
 echo
 echo "==== Install dependencies and aiter ===="
+if ! command -v git >/dev/null 2>&1; then
+    echo "git not found; installing (required by setuptools_scm for the aiter version string)"
+    if command -v sudo >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y git
+    else
+        apt-get update && apt-get install -y git
+    fi
+fi
 git config --global --add safe.directory /workspace
 pip config set global.retries 15
 pip config set global.timeout 120
