@@ -97,17 +97,20 @@ jobs:
       artifact-name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
       retention-days: 3
 
-  # Step 2: MI35X matrix jobs
+  # Step 2: DPX matrix jobs (mi325/gfx942 and mi350/gfx950 runner scale sets)
   triton:
     if: ${{ needs.split_triton_tests.outputs.selected_count != '0' }}
-    name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
-    runs-on: linux-aiter-vultr-mi325-1
+    name: Triton Tests (${{ matrix.dpx_runner.arch }}) / Shard ${{ matrix.shard }}
+    runs-on: ${{ matrix.dpx_runner.label }}
     timeout-minutes: 120
     needs: [split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     strategy:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.split_triton_tests.outputs.shards) }}
+        dpx_runner:
+          - { label: "linux-aiter-vultr-mi325-1", arch: "MI325X" }
+          - { label: "amd-dpx-linux.aiter.gpu.gfx950.1", arch: "MI350X" }
     env:
       # Pinned (not ci_config's pytorch_py312_image) while validating the DPX
       # memory_reserved()/mem_get_info() desync fix confirmed present in this
@@ -125,7 +128,7 @@ jobs:
           submodules: 'recursive'
 
       - name: Network preflight before Triton artifact downloads
-        if: ${{ startsWith(runner.name, 'linux-aiter-vultr-mi325-1-') }}
+        if: ${{ startsWith(runner.name, format('{0}-', matrix.dpx_runner.label)) }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -189,7 +192,7 @@ jobs:
           path: triton_wheels
 
       - name: Speedtest after Triton cache or artifact download failure
-        if: ${{ always() && startsWith(runner.name, 'linux-aiter-vultr-mi325-1-') && (steps.download_triton_shards.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        if: ${{ always() && startsWith(runner.name, format('{0}-', matrix.dpx_runner.label)) && (steps.download_triton_shards.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -305,7 +308,7 @@ jobs:
         # which expires.
         if: ${{ !cancelled() }}
         with:
-          name: triton-test-shard-${{ matrix.shard }}
+          name: triton-test-${{ matrix.dpx_runner.arch }}-shard-${{ matrix.shard }}
           path: |
             test-reports/triton.xml
             test-reports/pytest.log
