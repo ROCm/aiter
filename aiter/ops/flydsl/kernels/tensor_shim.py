@@ -288,20 +288,6 @@ def ptr_arg(t: torch.Tensor, dtype=None):
     return flyc.from_c_void_p(dtype, t.data_ptr())
 
 
-def flat_arg(t: torch.Tensor) -> torch.Tensor:
-    """``t`` as a rank-1 tensor argument at the same base address.
-
-    For a tensor the kernel reads only through its base pointer, so the compiled
-    launcher is not specialized on its rank. A contiguous ``t`` is ``t.view(-1)``.
-    A strided one -- rows sitting inside wider rows -- cannot ``view(-1)``; it
-    becomes the run of elements from its first to its last.
-    """
-    if t.is_contiguous():
-        return t.view(-1)
-    span = 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
-    return torch.as_strided(t, (span,), (1,))
-
-
 def _compile_and_run(exe, *args):
     """``flyc.compile(exe, *args)``: compiles **and** executes the kernel, and
     returns its ``CompiledFunction`` (None under compile-only)."""

@@ -179,7 +179,22 @@ def _find_grouped_config(
     # as a value that matches nothing.
     def _cell(row, k):
         value = str(row.get(k) or "").strip()
-        return "" if value.lower() in ("nan", "none") else value
+        if value.lower() in ("nan", "none"):
+            return ""
+        # pandas/astype(str) turns int flags into "1.0"/"0.0"; keys use "1"/"0".
+        if value in ("1.0", "0.0") and k in (
+            "ep_fused",
+            "use_g1u1",
+            "doweight_stage1",
+        ):
+            return value[0]
+        try:
+            f = float(value)
+            if f == int(f):
+                return str(int(f))
+        except ValueError:
+            pass
+        return value
 
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():
@@ -212,6 +227,16 @@ def _find_grouped_config(
                 f"loaded_rows={len(rows)}",
                 flush=True,
             )
+        logger.info(
+            "grouped CSV config miss token=%s model_dim=%s inter_dim=%s "
+            "experts=%s topk=%s ep_fused=%s; tile stays at the caller default",
+            keys["token"],
+            keys["model_dim"],
+            keys["inter_dim"],
+            keys["expert"],
+            keys["topk"],
+            keys["ep_fused"],
+        )
         return None
 
     # Unmeasured rows sort last: a hand-written row's blank or 0 `us` reads as
@@ -224,7 +249,29 @@ def _find_grouped_config(
         return (us <= 0.0, us)
 
     matches.sort(key=_by_measured_us)
-    return matches[0]
+    chosen = matches[0]
+    # Once per shape: lru_cache runs this body a single time for each key, and
+    # a serving step looks the same bucket up on every forward.
+    logger.info(
+        "grouped CSV config selected token=%s model_dim=%s inter_dim=%s "
+        "experts=%s topk=%s ep_fused=%s tile=%sx%sx%s tile2=%sx%sx%s "
+        "buffers=%s/%s",
+        keys["token"],
+        keys["model_dim"],
+        keys["inter_dim"],
+        keys["expert"],
+        keys["topk"],
+        keys["ep_fused"],
+        chosen.get("tile_m"),
+        chosen.get("tile_n"),
+        chosen.get("tile_k"),
+        chosen.get("tile_m2"),
+        chosen.get("tile_n2"),
+        chosen.get("tile_k2"),
+        chosen.get("num_buffers"),
+        chosen.get("num_buffer_stage2"),
+    )
+    return chosen
 
 
 def _use_grouped_gemm_enabled() -> bool:
@@ -1649,14 +1696,15 @@ def grouped_gemm_gfx1250_a8w4(
     else:
         logger.info(
             "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
-            "experts=%d topk=%d act=%s dtype=%s q_dtype_a=%s q_dtype_w=%s "
-            "quant_type=%s); using defaults tile_m=%d n_warp=%d "
+            "experts=%d topk=%d ep_fused=%s act=%s dtype=%s q_dtype_a=%s "
+            "q_dtype_w=%s quant_type=%s); using defaults tile_m=%d n_warp=%d "
             "num_buffers=%d",
             _get_padded_m(_csv_tokens),
             model_dim,
             inter_dim,
             E,
             topk,
+            stage2_scatter is not None,
             activation,
             dtype,
             q_dtype_a,

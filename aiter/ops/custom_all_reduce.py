@@ -411,6 +411,18 @@ def get_graph_buffer_ptrs_gfx1250(_fa: int, ptrs_out: int) -> None: ...
 def register_graph_buffers_gfx1250(_fa: int, ptrs_per_rank: list[int]) -> None: ...
 
 
+@compile_ops(GFX1250_MD_NAME, fc_name="get_graph_buffer_ipc_meta", develop=True)
+def get_graph_buffer_ipc_meta_gfx1250(
+    _fa: int, handle_out: int, offset_out: int
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="register_graph_buffers_ipc", develop=True)
+def register_graph_buffers_gfx1250_ipc(
+    _fa: int, handle_ptrs: list[int], offset_ptrs: list[int]
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="start_sync_latency", develop=True)
 def start_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
 

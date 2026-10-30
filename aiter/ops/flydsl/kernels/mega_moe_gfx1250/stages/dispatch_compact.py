@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import flydsl.expr as fx
 import torch
 
-from aiter import dtypes
+from aiter import dtypes, logger
 
 from ...tensor_shim import _preload_compiled, _run_compiled
 from ..arena import _align_up
@@ -43,6 +43,12 @@ def _compact_gemm_align_m(
     a decode step runs at. Alignment is per-expert padding, so holding it at the
     capacity tile costs ``experts_per_rank * (tile - used)`` dead rows that the
     GEMM still computes.
+
+    This pipeline always fuses the EP scatter into gemm2, and ``fused_moe``
+    looks that shape up with ``ep_fused=True``. The compact plan has to use
+    the same mode: the default ``False`` skips rows tuned for the scatter
+    path and falls back to a 64 tile, so the plan alignment and the GEMM
+    tile disagree.
     """
 
     def _env(name: str) -> int | None:
@@ -56,7 +62,22 @@ def _compact_gemm_align_m(
     if ov_m is not None or ov_m2 is not None:
         tile_m = 64 if ov_m is None else ov_m
         tile_m2 = tile_m if ov_m2 is None else ov_m2
-        return max(int(tile_m), int(tile_m2))
+        align = max(int(tile_m), int(tile_m2))
+        seen = getattr(_compact_gemm_align_m, "_override_logged", None)
+        if seen is None:
+            seen = set()
+            _compact_gemm_align_m._override_logged = seen
+        sig = (ov_m, ov_m2, align)
+        if sig not in seen:
+            seen.add(sig)
+            logger.info(
+                "compact align overridden by AITER_TDM_TILE_M=%s "
+                "AITER_TDM_TILE_M2=%s -> %d (CSV lookup skipped)",
+                ov_m,
+                ov_m2,
+                align,
+            )
+        return align
 
     from aiter.ops.flydsl.grouped_moe_gfx1250 import (
         _as_int,
@@ -84,6 +105,7 @@ def _compact_gemm_align_m(
         q_dtype_a=q_dtype_a,
         q_dtype_w=dtypes.fp4x2,
         quant_type=config.recipe.compute.quant_type,
+        ep_fused=True,
     )
     tile_m = 64
     tile_m2 = 64
