@@ -713,13 +713,16 @@ def _flydsl_moe_sorting(
     num_local_tokens,
     accumulate=True,
     output=None,
+    herd_topk=0,
+    herd_routed_scaling_factor=1.0,
 ):
     """FlyDSL sorting dispatch -- called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 
     device = topk_ids.device
     M, topk = topk_ids.shape
-    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+    topk = herd_topk or topk
+    max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     max_num_tokens_padded = max_num_m_blocks * block_size
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
@@ -743,6 +746,23 @@ def _flydsl_moe_sorting(
     else:
         moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
 
+    ret = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+    if herd_topk:
+        from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_herd
+
+        kept_ids, kept_weights = flydsl_moe_sorting_herd(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            int(block_size),
+            herd_routed_scaling_factor,
+        )
+        return (*ret, kept_ids, kept_weights)
     flydsl_moe_sorting_fwd(
         topk_ids,
         topk_weights,
@@ -756,7 +776,7 @@ def _flydsl_moe_sorting(
         expert_mask,
         num_local_tokens,
     )
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+    return ret
 
 
 def moe_sorting(
@@ -1126,6 +1146,8 @@ def fused_moe(
     quant_dtype_a2: torch.dtype | None = None,
     # False explicitly selects unclamped shared-expert SiLU semantics.
     clamp_shared: bool = True,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1151,6 +1173,8 @@ def fused_moe(
     if not clamp_shared and not has_shared_expert:
         raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
     if has_shared_expert:
+        if herd_topk:
+            raise ValueError("herd_topk does not support fused shared experts")
         routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
         unsupported = []
         if stage2_scatter is not None:
@@ -1268,6 +1292,8 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
     )
 
 
@@ -1310,6 +1336,8 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1371,6 +1399,8 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1414,6 +1444,8 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
     )
 
 
@@ -1448,6 +1480,8 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1470,6 +1504,21 @@ def _fused_moe_impl(
         block_size_M = None
     """user API"""
     M, topk = topk_ids.shape
+    herd_candidate_ids, herd_candidate_weights = topk_ids, topk_weight
+    if herd_topk:
+        # Only the gfx1250 integration passes K+1 candidates to MoE.
+        # Other architectures finish HERD in the router and pass K routes.
+        if get_gfx() != "gfx1250":
+            raise ValueError("herd_topk is supported only on gfx1250")
+        if topk != herd_topk + 1 or topk_weight.shape != topk_ids.shape:
+            raise ValueError(
+                "herd_topk requires K+1 candidate IDs and weights per token"
+            )
+        if expert_mask is not None or stage2_scatter is not None or doweight_stage1:
+            raise ValueError(
+                "HERD routing requires unmasked routes and doweight_stage1=False"
+            )
+        topk = herd_topk
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     assert w1.shape[1] in [
@@ -1503,6 +1552,25 @@ def _fused_moe_impl(
         output, (M, model_dim), dtype, hidden_states.device
     )
     _validate_output_buffer_no_overlap(output, hidden_states)
+    if herd_topk:
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+            _FUSED_ROUTE_PSUM_MAX_EXPERTS,
+        )
+        from aiter.ops.flydsl.herd_topk import herd_finalize_candidates
+
+        # The grouped MoE drops inside its one-workgroup route kernel, which
+        # keeps one LDS slot per expert; wider MoEs finish HERD here instead.
+        if E > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
+            # Pad rows past num_local_tokens leave as ids -1, which the grouped
+            # MoE route skips like any other unrouted row.
+            topk_weight, topk_ids = herd_finalize_candidates(
+                topk_weight,
+                topk_ids,
+                E,
+                herd_routed_scaling_factor,
+                num_valid_rows=num_local_tokens,
+            )
+            herd_topk = 0
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
@@ -1559,10 +1627,17 @@ def _fused_moe_impl(
             situ_beta=1.0 if beta is None else float(beta),
             situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             stage2_scatter=stage2_scatter,
+            herd_topk=herd_topk,
+            herd_routed_scaling_factor=herd_routed_scaling_factor,
         )
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    if herd_topk and get_gfx() == "gfx1250":
+        raise ValueError(
+            "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "
+            "gate_mode=INTERLEAVE)"
+        )
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
@@ -1659,7 +1734,13 @@ def _fused_moe_impl(
             metadata if _metadata_transform is None else _metadata_transform(metadata)
         )
 
-    metadata = _resolve_metadata()
+    metadata = _resolve_metadata(disable_inline_sort=bool(herd_topk))
+    if herd_topk and (
+        metadata.flat or metadata.output_aux or metadata.full_impl is not None
+    ):
+        raise ValueError(
+            "gfx950 HERD needs a MoE backend using the standard sorted-token layout"
+        )
 
     # A tuned fast row that this invocation cannot run is discarded, not raised
     # on: re-resolve with that family disabled and fall back to legacy.
@@ -1810,11 +1891,36 @@ def _fused_moe_impl(
         hidden_pad=hidden_pad,
         ksplit=metadata.ksplit,
     )
+    fused_sort_quant = fused_sort_quant and not herd_topk
     # compact-scale variant not ported (its stage-1 change targets the
     # refactored mixed_moe_gemm_2stage_common); keep the fused sort+quant on
     # the expanded-scale path only.
     fused_compact_scale = False
-    if metadata.output_aux:
+    if herd_topk:
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            topk_ids,
+            topk_weight,
+        ) = _flydsl_moe_sorting(
+            herd_candidate_ids,
+            herd_candidate_weights,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            None,
+            None,
+            accumulate=not runtime_stage2_reduce,
+            output=output,
+            herd_topk=herd_topk,
+            herd_routed_scaling_factor=herd_routed_scaling_factor,
+        )
+        local_topk_ids = None
+    elif metadata.output_aux:
         # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
         # routes get reverse_sorted = -1). The MXMOE a4w4 port would silently
         # route tokens to the wrong experts, so fail loudly there.
