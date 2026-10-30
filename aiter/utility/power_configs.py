@@ -113,7 +113,7 @@ def _overlay_power_tables(config, latency_file, power_files, merge_name, env_nam
     import pandas as pd
 
     from aiter.jit.core import mp_lock
-    from aiter.utility.tune_result import SELECT_COLUMN
+    from aiter.utility.tune_result import SELECT_COLUMN, row_select_mode
 
     pairs = []
     for path in power_files:
@@ -128,6 +128,20 @@ def _overlay_power_tables(config, latency_file, power_files, merge_name, env_nam
     config._raise_on_duplicate_shapes(power_df, pairs, merge_name, env_name)
     keys = config._shape_dedup_keys(power_df, merge_name)
     if not keys or not os.path.exists(latency_file):
+        return latency_file
+    # Only rows a power tune measured and stamped may replace a shipped row.
+    # A file without ``select`` (older or hand-copied) contributes nothing.
+    if SELECT_COLUMN in power_df.columns:
+        is_power = power_df[SELECT_COLUMN].map(row_select_mode).eq("power")
+    else:
+        is_power = pd.Series(False, index=power_df.index)
+    if not bool(is_power.all()):
+        logger.warning(
+            f"AITER_SELECT=power: ignoring {int((~is_power).sum())} row(s) of "
+            f"'{merge_name}' in {[p for p, _ in pairs]} without select=power"
+        )
+        power_df = power_df[is_power]
+    if power_df.empty:
         return latency_file
     latency_df = pd.read_csv(latency_file)
     if not all(k in latency_df.columns for k in keys):
