@@ -658,6 +658,9 @@ _MXFP4_INVALID_CASES = [
     ("output-on-cpu", ValueError, "output must be on the query device"),
     ("scratch-on-cpu", ValueError, "exp_sums must be contiguous .* on cuda"),
     ("key-scale-none", TypeError, "key_scale must be a uint8 torch.Tensor"),
+    ("scale-pages-mismatch", ValueError, "key_scale must be a uint8 .* view"),
+    ("misaligned-key", ValueError, "key_cache base pointer must be 16 B aligned"),
+    ("misaligned-scale", ValueError, "key_scale base pointer must be 4 B aligned"),
     # A windowed plan is refused with one partition (served without it) and more.
     ("windowed-plan-1", ValueError, "sliding_window must match work_plan"),
     ("windowed-plan-2", ValueError, "sliding_window must match work_plan"),
@@ -961,7 +964,12 @@ def run_pa_decode(name, geometry):
 
     def check():
         reference = _reference(
-            _round_query_e4m3(query) if case["kv_dtype"] == "mxfp4" else query,
+            # The kernel quantizes a bf16 query; an e4m3 query is used as stored.
+            (
+                _round_query_e4m3(query)
+                if case["kv_dtype"] == "mxfp4" and query.dtype == torch.bfloat16
+                else query
+            ),
             s.logical_key,
             s.logical_value,
             s.table,
@@ -1066,6 +1074,15 @@ def run_pa_decode_rejects(kv, invalid, error, match):
         )
     elif invalid == "key-scale-none":
         options["key_scale"] = None
+    elif invalid == "scale-pages-mismatch":
+        ks = ks[:1]
+        options["key_scale"] = ks
+    elif invalid == "misaligned-key":
+        # One byte into the pool: in bounds, with the shape and strides unchanged.
+        kd = kd.as_strided(kd.shape, kd.stride(), kd.storage_offset() + 1)
+    elif invalid == "misaligned-scale":
+        ks = ks.as_strided(ks.shape, ks.stride(), ks.storage_offset() - 1)
+        options["key_scale"] = ks
     elif invalid.startswith("windowed-plan"):
         options["work_plan"] = pa.plan_pa_decode(
             context, 1, max_partitions=int(invalid[-1]), sliding_window=256
@@ -1371,8 +1388,10 @@ def _skipping(arch, cases, reason):
 
 def _unsupported():
     """Why pa_decode cannot run here, or None."""
+    if not torch.cuda.is_available():
+        return "pa_decode needs a GPU"
     arch = get_gfx_runtime()
-    if not torch.cuda.is_available() or arch not in SUPPORTED_GFX:
+    if arch not in SUPPORTED_GFX:
         return f"pa_decode unsupported on {arch}"
     if importlib.util.find_spec("flydsl") is None:
         return "FlyDSL is not installed"

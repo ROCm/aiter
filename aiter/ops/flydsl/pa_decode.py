@@ -233,14 +233,19 @@ def _pa_decode_mxfp4(
         if (
             t.dtype != torch.uint8
             or t.device != dev
+            or t.shape[0] != k_data.shape[0]
             or tuple(t.shape[1:]) != (num_kv_heads, 128, tail)
             or t.stride() != (*page_head_strides, tail, 1)
         ):
             raise ValueError(
-                f"{name} must be a uint8 [pages, {num_kv_heads}, 128, {tail}] view "
-                f"on {dev} with the key cache's page and head strides, got "
-                f"{t.dtype} {tuple(t.shape)} {t.stride()}"
+                f"{name} must be a uint8 [{k_data.shape[0]} pages, {num_kv_heads}, "
+                f"128, {tail}] view on {dev} with the key cache's page count, page "
+                f"and head strides, got {t.dtype} {tuple(t.shape)} {t.stride()}"
             )
+        # mx_init loads data as 16 B and scale as 4 B aligned.
+        align = 16 if tail == 64 else 4
+        if t.data_ptr() % align:
+            raise ValueError(f"{name} base pointer must be {align} B aligned")
     if block_tables.dtype != torch.int32 or context_lengths.dtype != torch.int32:
         raise TypeError("block_tables and context_lengths must be int32")
     if context_lengths.shape[0] != num_seqs or block_tables.shape[0] != num_seqs:
