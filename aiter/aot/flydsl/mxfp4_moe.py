@@ -8,6 +8,10 @@ Parses flydsl_mxmoe_* and flydsl_moe2_layout_* rows from the existing model
 configs plus the active FMoE CSV, and warms the FlyDSL disk cache via the same
 runtime entry points, keyed identically so inference hits the cache.
 
+Not part of the AOT build, which replays these rows through ``fused_moe``
+itself (``moe.py``). The MXFP4 tuner's ``--fast-scan`` precompiles its
+candidates with ``jobs_from_rows`` and ``compile_job_batch``.
+
 Standalone:
     python -m aiter.aot.flydsl.mxfp4_moe [--csv /path/to/foo_fp4_tuned_fmoe.csv]
 """
@@ -15,16 +19,16 @@ Standalone:
 import argparse
 import csv
 import glob
+import io
 import os
 import sys
 import time
+from contextlib import nullcontext
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
-# moe.py defers every ``flydsl_moe2_layout_`` name to this module, so a CSV the
-# glob misses gets no AOT job at all and JITs on the first inference call.
 DEFAULT_CSVS = sorted(
     set(
         glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv")
@@ -36,10 +40,6 @@ DEFAULT_CSVS = sorted(
 _ACTIVE_FMOE_CSV = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
 if os.path.exists(_ACTIVE_FMOE_CSV) and _ACTIVE_FMOE_CSV not in DEFAULT_CSVS:
     DEFAULT_CSVS.append(_ACTIVE_FMOE_CSV)
-
-# Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
-_MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
-_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
 def _job_key(job: dict) -> tuple:
@@ -65,6 +65,7 @@ def _job_key(job: dict) -> tuple:
             job.get("enable_bias", False),
             job.get("g2_spart"),
             job.get("g2_bf16_lds"),
+            bool(job.get("use_valid_token_count", False) and job["epilog"] == "atomic"),
         )
     if job["stage"] == 1:
         return (
@@ -105,11 +106,22 @@ def _job_key(job: dict) -> tuple:
     )
 
 
-def parse_csv(csv_path: str):
-    """Parse a tuned CSV into unique MXMOE-port jobs for each stage and layout."""
+def parse_csv(
+    csv_path: "str | io.TextIOBase", swiglu_limit: float | None = None
+) -> "list[dict[str, object]]":
+    """Parse a tuned CSV path or text stream into deduplicated AOT jobs.
+
+    ``swiglu_limit`` defaults to AITER_MXFP4_TUNE_SWIGLU_LIMIT, else the
+    activation default.
+    """
+    from aiter.fused_moe import (
+        _flydsl_stage2_fp8_enabled,
+        _mxfp4_intermediate_enabled,
+    )
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
+        resolve_swiglu_limit,
     )
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
@@ -119,6 +131,10 @@ def parse_csv(csv_path: str):
         native_scale_layout_for,
         parse_flydsl_v2_gemm2_kernel,
     )
+
+    swiglu_limit, limit_source = resolve_swiglu_limit(swiglu_limit)
+    mxfp4_intermediate = _mxfp4_intermediate_enabled()
+    stage2_fp8_route_out = _flydsl_stage2_fp8_enabled()
 
     jobs = []
     seen = set()
@@ -130,7 +146,13 @@ def parse_csv(csv_path: str):
         seen.add(key)
         jobs.append(job)
 
-    with open(csv_path, newline="") as f:
+    # ``csv_path`` is either a filesystem path or an already-open stream (the
+    # in-memory tuner candidate path), so the context manager is chosen inline.
+    with (
+        nullcontext(csv_path)
+        if hasattr(csv_path, "read")
+        else open(csv_path, newline="")
+    ) as f:
         for row in csv.DictReader(f):
             token = int(row["token"])
             topk = int(row["topk"])
@@ -153,6 +175,12 @@ def parse_csv(csv_path: str):
                 p1 = _parse_mxfp4_g1_kname(kn1)
                 situ_params = [(1.0, 1.0)]
                 if p1["act"] == "situv2":
+                    if swiglu_limit is not None:
+                        raise ValueError(
+                            f"swiglu_limit is not supported for situv2: "
+                            f"{getattr(f, 'name', '<in-memory rows>')} row {kn1} with "
+                            f"{limit_source}={swiglu_limit:g}"
+                        )
                     situ_params.append(
                         (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
                     )
@@ -187,7 +215,11 @@ def parse_csv(csv_path: str):
                                 # MXMOE. +inf preserves historical unclamped
                                 # SiLU; SwiGLU retains its default limit of 7.
                                 "swiglu_limit": (
-                                    7.0 if p1["act"] == "swiglu" else float("inf")
+                                    swiglu_limit
+                                    if swiglu_limit is not None
+                                    else (
+                                        7.0 if p1["act"] == "swiglu" else float("inf")
+                                    )
                                 ),
                                 "enable_bias": p1["enable_bias"],
                                 "interleave": interleave,
@@ -203,7 +235,7 @@ def parse_csv(csv_path: str):
                 bm = v2_g2["tile_m"]
                 out_dtype = (
                     "fp8"
-                    if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
+                    if v2_g2["epilog"] == "reduce" and stage2_fp8_route_out
                     else "bf16"
                 )
                 bias_supported = (
@@ -211,33 +243,53 @@ def parse_csv(csv_path: str):
                     and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
                     and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
                 )
-                enable_bias_options = [False, True] if bias_supported else [False]
+                include_bias_variants = row.get("_include_bias_variants", "1") != "0"
+                enable_bias_options = (
+                    [False, True]
+                    if bias_supported and include_bias_variants
+                    else [False]
+                )
+                count_options = (
+                    (False, True) if v2_g2["epilog"] == "atomic" else (False,)
+                )
                 for enable_bias in enable_bias_options:
-                    _add(
-                        {
-                            "stage": 2,
-                            "v2_stage2": True,
-                            "kernel_name": kn2,
-                            "BM": bm,
-                            "BN": v2_g2["tile_n"],
-                            "BK": v2_g2["tile_k"],
-                            "use_nt": v2_g2["use_nt"],
-                            "NE": expert,
-                            "N_OUT": model_dim,
-                            "epilog": v2_g2["epilog"],
-                            "D_INTER": v2_d_inter,
-                            "topk": topk,
-                            "SBM": v2_g2["sort_block_m"] or bm,
-                            "persist": v2_g2["persist"] or v2_g2["epilog"] == "scatter",
-                            "cu_num": int(row.get("cu_num", "0") or "0"),
-                            "a_dtype": v2_g2["a_dtype"],
-                            "b_dtype": v2_g2["b_dtype"],
-                            "out_dtype": out_dtype,
-                            "enable_bias": enable_bias,
-                            "g2_spart": v2_g2["spart"],
-                            "g2_bf16_lds": v2_g2["bf16_lds"],
-                        }
-                    )
+                    effective_out_dtype = out_dtype
+                    if (
+                        v2_g2["epilog"] == "scatter"
+                        and bm == 128
+                        and v2_g2["tile_n"] in (128, 256)
+                        and not enable_bias
+                        and mxfp4_intermediate
+                    ):
+                        effective_out_dtype = "fp4"
+                    for use_valid_token_count in count_options:
+                        _add(
+                            {
+                                "stage": 2,
+                                "v2_stage2": True,
+                                "kernel_name": kn2,
+                                "BM": bm,
+                                "BN": v2_g2["tile_n"],
+                                "BK": v2_g2["tile_k"],
+                                "use_nt": v2_g2["use_nt"],
+                                "NE": expert,
+                                "N_OUT": model_dim,
+                                "epilog": v2_g2["epilog"],
+                                "D_INTER": v2_d_inter,
+                                "topk": topk,
+                                "SBM": v2_g2["sort_block_m"] or bm,
+                                "persist": v2_g2["persist"]
+                                or v2_g2["epilog"] == "scatter",
+                                "cu_num": int(row.get("cu_num", "0") or "0"),
+                                "a_dtype": v2_g2["a_dtype"],
+                                "b_dtype": v2_g2["b_dtype"],
+                                "out_dtype": effective_out_dtype,
+                                "enable_bias": enable_bias,
+                                "use_valid_token_count": use_valid_token_count,
+                                "g2_spart": v2_g2["spart"],
+                                "g2_bf16_lds": v2_g2["bf16_lds"],
+                            }
+                        )
             elif _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
                 # An _f4out row falls back to the plain kernel whenever the
@@ -246,7 +298,7 @@ def parse_csv(csv_path: str):
                 # fallback too, else RUN_ONLY has no cache entry for the kernel
                 # that actually launches.
                 mxfp4outs = [False]
-                if p2["mxfp4out"] and _MXFP4_INTERMEDIATE:
+                if p2["mxfp4out"] and mxfp4_intermediate:
                     mxfp4outs.append(True)
                 for mxfp4out in mxfp4outs:
                     _add(
@@ -270,6 +322,23 @@ def parse_csv(csv_path: str):
                     )
 
     return jobs
+
+
+def jobs_from_rows(rows, *, include_bias_variants=True):
+    """Build deduplicated AOT jobs from in-memory tuner candidate rows."""
+    rows = [
+        dict(row, _include_bias_variants="1" if include_bias_variants else "0")
+        for row in rows
+    ]
+    if not rows:
+        return []
+    stream = io.StringIO()
+    fieldnames = sorted({key for row in rows for key in row})
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    stream.seek(0)
+    return parse_csv(stream)
 
 
 def _dummy(nbytes=256):
@@ -368,10 +437,19 @@ def _compile_v2_stage2(job):
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
     is_fp8_route_out = job["epilog"] == "reduce" and job["out_dtype"] == "fp8"
     out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
+    target_scale = None
     if job["epilog"] == "scatter":
-        target = torch.empty(
-            (max_sorted, job["N_OUT"]), dtype=torch.bfloat16, device="cpu"
-        )
+        if job["out_dtype"] == "fp4":
+            target = torch.empty(
+                (max_sorted, job["N_OUT"] // 2), dtype=torch.uint8, device="cpu"
+            )
+            target_scale = torch.empty(
+                (max_sorted, job["N_OUT"] // 32), dtype=torch.uint8, device="cpu"
+            )
+        else:
+            target = torch.empty(
+                (max_sorted, job["N_OUT"]), dtype=torch.bfloat16, device="cpu"
+            )
     elif job["epilog"] == "reduce":
         if is_fp8_route_out:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
@@ -420,9 +498,13 @@ def _compile_v2_stage2(job):
         cu_num=job["cu_num"],
         n_sorted_padded=max_sorted,
         out_dtype=job["out_dtype"],
+        out_scale=target_scale,
         g2_spart=job.get("g2_spart"),
         g2_bf16_lds=job.get("g2_bf16_lds"),
         bias=bias if job.get("enable_bias", False) else None,
+        use_valid_token_count=bool(
+            job.get("use_valid_token_count", False) and job["epilog"] == "atomic"
+        ),
         stream=0,
     )
     if job["epilog"] == "reduce":
@@ -471,6 +553,17 @@ def compile_one_config(**job):
     return result
 
 
+def compile_job_batch(jobs):
+    """Compile a batch in one worker process to amortize AITER import cost."""
+    started = time.monotonic()
+    results = [compile_one_config(**job) for job in jobs]
+    return {
+        "kernel_name": f"mxfp4 batch ({len(jobs)} jobs)",
+        "compile_time": time.monotonic() - started,
+        "results": results,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AOT pre-compile FlyDSL mxmoe/layout-v2 kernels from tuned FMoE CSVs",
@@ -484,6 +577,14 @@ def main():
         help="Path(s) to tuned FMoE CSVs; default: fp4, fp8fp4, a4w4, and a8w4 "
         "model configs plus the active merged FMoE config",
     )
+    parser.add_argument(
+        "--swiglu-limit",
+        type=float,
+        default=None,
+        help="Positive finite SiLU/SwiGLU clamp limit; default: "
+        "AITER_MXFP4_TUNE_SWIGLU_LIMIT or activation defaults. "
+        "Use the same limit and stage2 environment as tuning and production.",
+    )
     args = parser.parse_args()
 
     csv_paths = [os.path.abspath(p) for p in args.csv]
@@ -495,7 +596,12 @@ def main():
         print("Error: no fp4 tuned CSVs found and none given via --csv")
         sys.exit(1)
 
-    all_jobs = collect_aot_jobs(csv_paths, parse_csv)
+    try:
+        all_jobs = collect_aot_jobs(
+            csv_paths, lambda path: parse_csv(path, swiglu_limit=args.swiglu_limit)
+        )
+    except ValueError as error:
+        parser.error(str(error))
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
 

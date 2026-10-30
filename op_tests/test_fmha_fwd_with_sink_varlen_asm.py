@@ -28,9 +28,13 @@ verbatim.  D64 kernels read it; D128 and D192x128 kernels ignore it (pass None).
 KV-length constraint (mask=0 only): the non-causal D64/D128 kernels require
 per-sequence kv_seqlen that is a multiple of 256.  D192x128 has no such
 constraint (sub_K=128 with the border mask compiled in).
+
+Strided inputs: D192x128 takes q/k/v/out views (e.g. v = kv[..., 128:]); they are
+checked against the reference and bit-for-bit against contiguous inputs.
 """
 
 import argparse
+import functools
 import itertools
 import math
 
@@ -139,7 +143,18 @@ def _d64_sink(hq):
 
 
 def run_kernel(
-    q, k, v, cu_q, cu_k, max_seqlen_q, *, scale, is_causal, sink=None, via="public"
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    max_seqlen_q,
+    *,
+    scale,
+    is_causal,
+    sink=None,
+    via="public",
+    out=None,
 ):
     """Return (out, lse) with lse shaped (total_q, nheads) to match run_torch.
 
@@ -160,11 +175,22 @@ def run_kernel(
             causal=is_causal,
             return_lse=True,
             sink_ptr=sink,
+            out=out,
         )
         return r[0], r[1].transpose(0, 1).contiguous()
     if via == "ops":
         out, lse = aiter.fmha_fwd_with_sink_varlen_asm(
-            q, k, v, cu_q, cu_k, max_seqlen_q, scale, is_causal, True, sink=sink
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q,
+            scale,
+            is_causal,
+            True,
+            sink=sink,
+            out=out,
         )
         return out, lse.squeeze(-1)
     raise ValueError(f"unknown via={via!r}")
@@ -292,6 +318,234 @@ def test_fmha_fwd_with_sink_varlen_asm(
     return ret
 
 
+def _as_view(x, head_pad=0, token_pad=0, base_off=0):
+    """Strided copy of `x` in a NaN buffer; odd pads/offset give 2-byte-aligned rows."""
+    t, h, d = x.shape
+    row = h * (d + head_pad) + token_pad
+    buf = torch.full((base_off + t * row,), float("nan"), dtype=x.dtype)
+    view = buf.as_strided((t, h, d), (row, d + head_pad, 1), base_off)
+    view.copy_(x)
+    return view
+
+
+def _strided_inputs(layout, q, k, v):
+    """Views with the same values as q/k/v for one of the strided layouts."""
+    t, hq, dq = q.shape
+    hk, dv = k.size(1), v.size(2)
+    if layout == "kv_split":
+        # DeepSeek-style: v is the second half of a [.., k_nope | v] projection.
+        kv = torch.full((t, hk, dv + dv), float("nan"), dtype=v.dtype)
+        kv[..., dv:] = v
+        return q, k, kv[..., dv:]
+    if layout == "fused_qkv":
+        # One row per token holds every q, k and v head back to back.
+        row = torch.full((t, hq * dq + hk * dq + hk * dv), float("nan"), dtype=q.dtype)
+        qv = row[:, : hq * dq].view(t, hq, dq)
+        kvv = row[:, hq * dq : hq * dq + hk * dq].view(t, hk, dq)
+        vv = row[:, hq * dq + hk * dq :].view(t, hk, dv)
+        qv.copy_(q)
+        kvv.copy_(k)
+        vv.copy_(v)
+        return qv, kvv, vv
+    if layout == "padded":
+        return (
+            _as_view(q, head_pad=64, token_pad=8),
+            _as_view(k, head_pad=16, token_pad=24),
+            _as_view(v, head_pad=128),
+        )
+    if layout == "odd":
+        # Odd-element strides and offsets: rows start only 2-byte aligned.
+        return (
+            _as_view(q, head_pad=1, token_pad=3),
+            _as_view(k, head_pad=1, token_pad=1),
+            _as_view(v, head_pad=3, token_pad=1, base_off=1),
+        )
+    raise ValueError(f"unknown layout {layout!r}")
+
+
+# Runs per candidate before timing; every run must match the dense result bit
+# for bit (an intermittent race shows up as one differing run).
+_STRIDED_REPEATS = 5
+_STRIDED_VIAS = ["public", "ops"]
+
+
+def _same(res, dense):
+    return torch.equal(res[0], dense[0]) and torch.equal(res[1], dense[1])
+
+
+def _record(ret, name, fn, dense, ref, flops, nbytes, msg):
+    """Check `fn` against the dense run (repeated) and the reference, then time it."""
+    same = all(_same(fn(), dense) for _ in range(_STRIDED_REPEATS))
+    assert same, f"{msg} via={name}: differs from dense"
+    (out, lse), us = run_perftest(fn)
+    ret[f"{name} us"] = us
+    ret[f"{name} TFLOPS"] = flops / us / 1e6
+    ret[f"{name} TB/s"] = nbytes / us / 1e6
+    ret[f"{name} == dense"] = same
+    ret[f"{name} err(O)"] = checkAllclose(
+        ref[0].to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"{msg} via={name} O",
+    )
+    ret[f"{name} err(LSE)"] = checkAllclose(
+        ref[1].to(dtypes.fp32),
+        lse.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"{msg} via={name} LSE",
+    )
+
+
+def _strided_setup(hq, hk, seqlens, is_causal):
+    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, 192, 128)
+    kw = {"scale": 1.0 / math.sqrt(192), "is_causal": is_causal}
+    ref = run_torch(q, k, v, cu, cu, is_causal=is_causal, sink=None)
+    dense = run_kernel(q, k, v, cu, cu, max(seqlens), via="ops", **kw)
+    flops, nbytes = _flops_bytes(
+        seqlens, hq, hk, 192, 128, is_causal, q.size(0), q.element_size()
+    )
+    return q, k, v, cu, kw, ref, dense, flops, nbytes
+
+
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, is_causal, layout):
+    """D192x128 with strided q/k/v views."""
+    q, k, v, cu, kw, ref, dense, flops, nbytes = _strided_setup(
+        hq, hk, seqlens, is_causal
+    )
+    qs, ks, vs = _strided_inputs(layout, q, k, v)
+    candidates = {
+        via: functools.partial(
+            run_kernel, qs, ks, vs, cu, cu, max(seqlens), via=via, **kw
+        )
+        for via in _STRIDED_VIAS
+    }
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        _record(ret, name, fn, dense, ref, flops, nbytes, f"strided {layout}")
+    return ret
+
+
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_strided_out(hq, hk, seqlens, is_causal, width):
+    """D192x128 writing into a preallocated `out` that is a [..., :128] view of a
+    wider NaN buffer (width 129: rows only 2-byte aligned)."""
+    q, k, v, cu, kw, ref, dense, flops, nbytes = _strided_setup(
+        hq, hk, seqlens, is_causal
+    )
+    wides = {
+        via: torch.full((q.size(0), hq, width), float("nan"), dtype=q.dtype)
+        for via in _STRIDED_VIAS
+    }
+    candidates = {
+        via: functools.partial(
+            run_kernel,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            via=via,
+            out=wide[..., :128],
+            **kw,
+        )
+        for via, wide in wides.items()
+    }
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        _record(ret, name, fn, dense, ref, flops, nbytes, f"strided out w={width}")
+        wide = wides[name]
+        in_place = fn()[0].data_ptr() == wide.data_ptr()
+        pad_untouched = bool(wide[..., 128:].isnan().all().item())
+        assert in_place and pad_untouched, f"w={width} via={name}: out not in place"
+        ret[f"{name} out in place"] = in_place
+        ret[f"{name} pad untouched"] = pad_untouched
+    return ret
+
+
+def _unsupported_kv(case, k, v):
+    """k/v views the D192x128 kernel cannot address."""
+    if case == "k token stride 2^24 B":
+        tok = (1 << 24) // k.element_size()
+        buf = torch.empty((len(k) - 1) * tok + k.size(1) * 192, dtype=k.dtype)
+        k_far = buf.as_strided(k.shape, (tok, 192, 1))
+        k_far.copy_(k)
+        return k_far, v
+    if case == "k/v head stride 0":
+        # All kv heads share one head (expanded MQA): pass hk=1 instead.
+        return k[:, :1].expand_as(k), v[:, :1].expand_as(v)
+    raise ValueError(f"unknown case {case!r}")
+
+
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, is_causal):
+    """Unsupported k/v strides: the public path must use another backend, and a
+    direct op call must be refused by the C++ entry.
+
+    Not timed: the backend that serves these calls is not the one under test."""
+    seqlens, hq, hk = [2], 4, 2
+    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, 192, 128)
+    k, v = _unsupported_kv(case, k, v)
+    scale = 1.0 / math.sqrt(192)
+    ref_out, _ = run_torch(q, k, v, cu, cu, is_causal=is_causal, sink=None)
+
+    mha = aiter.ops.mha
+    calls = []
+    asm = mha._fmha_fwd_with_sink_varlen_asm
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return asm(*args, **kwargs)
+
+    mha._fmha_fwd_with_sink_varlen_asm = spy
+    try:
+        try:
+            aiter.fmha_fwd_with_sink_varlen_asm(
+                q, k, v, cu, cu, max(seqlens), scale, is_causal, True
+            )
+            ops_refused = False
+        except RuntimeError as e:  # raised by the C++ stride check
+            ops_refused = "strides out of range" in str(e)
+        ops_calls = len(calls)
+        out, _ = run_kernel(
+            q, k, v, cu, cu, max(seqlens), scale=scale, is_causal=is_causal
+        )
+    finally:
+        mha._fmha_fwd_with_sink_varlen_asm = asm
+    assert ops_refused, f"{case}: C++ accepted an unsupported stride"
+    assert len(calls) == ops_calls, f"{case}: public path called ASM"
+    return {
+        "gfx": get_gfx(),
+        "ops refused": ops_refused,
+        "public asm calls": len(calls) - ops_calls,
+        "err(O)": checkAllclose(
+            ref_out.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"{case} -> other backend, c={is_causal}",
+        ),
+    }
+
+
+_STRIDED_LAYOUTS = [
+    "kv_split",
+    "fused_qkv",
+    "padded",
+    "odd",
+]
+# out buffer widths for the strided-out table (129: 2-byte-aligned rows)
+_STRIDED_OUT_WIDTHS = [192, 129]
+# (hq, hk, seqlens): GQA, unaligned and mixed lengths
+_STRIDED_SHAPES = [
+    (16, 4, [129, 1000, 333]),
+    (32, 32, [2048]),
+]
+
+
 @benchmark()
 def test_fmha_fwd_with_sink_varlen_asm_perf(
     hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
@@ -328,6 +582,14 @@ def test_fmha_fwd_with_sink_varlen_asm_perf(
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
     return ret
+
+
+def summarize(name, rows):
+    aiter.logger.info(
+        "fmha_fwd_with_sink_varlen_asm %s summary (markdown):\n%s",
+        name,
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
 
 
 def main():
@@ -389,6 +651,36 @@ def main():
         "fmha_fwd_with_sink_varlen_asm correctness summary (markdown):\n%s",
         df.to_markdown(index=False),
     )
+
+    # ---- D192x128 strided q/k/v/out ----
+    if 192 in args.head_dim:
+        summarize(
+            "D192x128 strided q/k/v",
+            [
+                test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, c, layout)
+                for (hq, hk, seqlens), c, layout in itertools.product(
+                    _STRIDED_SHAPES, causal_modes, _STRIDED_LAYOUTS
+                )
+            ],
+        )
+        summarize(
+            "D192x128 strided out",
+            [
+                test_fmha_fwd_with_sink_varlen_asm_strided_out(hq, hk, seqlens, c, w)
+                for (hq, hk, seqlens), c, w in itertools.product(
+                    _STRIDED_SHAPES, causal_modes, _STRIDED_OUT_WIDTHS
+                )
+            ],
+        )
+        summarize(
+            "D192x128 unsupported stride",
+            [
+                test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, c)
+                for case, c in itertools.product(
+                    ["k token stride 2^24 B", "k/v head stride 0"], causal_modes
+                )
+            ],
+        )
 
     # ---- perf-only table (large shapes; ref infeasible) ----
     df = []
