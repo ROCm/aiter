@@ -68,8 +68,10 @@ from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_stage1_kernels,
+    get_flydsl_stage1_kernels_a16w16,
     get_flydsl_stage1_kernels_int4_bf16,
     get_flydsl_stage2_kernels,
+    get_flydsl_stage2_kernels_a16w16,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
     runtime_swiglu_limit,
@@ -2198,9 +2200,14 @@ class FmoeTuner(TunerCommon):
                 q_type == QuantType.per_1x32
                 and q_dtype_a in (dtypes.bf16, dtypes.fp16)
                 and q_dtype_w in (dtypes.fp4x2, dtypes.i4x2)
+            ) or (
+                q_type == QuantType.No
+                and q_dtype_a == dtypes.bf16
+                and q_dtype_w == dtypes.bf16
             ):
-                # a16w-mix (mxfp4 a16w4 / int4 a16wi4): the abf16 stage2 consumes the
-                # bf16 intermediate directly -- no inter-stage activation quant
+                # a16w-mix (mxfp4 a16w4 / int4 a16wi4 / bf16 a16w16): the abf16
+                # stage2 consumes the bf16 intermediate directly -- no inter-stage
+                # activation quant
                 # (a2_scale=None). The kernel wants it in SORTED [max_sorted, inter]
                 # layout; build that once here (untimed) so run_flydsl_stage2_out stays
                 # kernel-only. Without this a16wi4 falls through to the generic
@@ -3736,9 +3743,18 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        if q_type != QuantType.per_1x32 or q_dtype_w not in (
-            dtypes.fp4x2,
-            dtypes.fp8,
+        # a16w16: bf16 A x bf16 W on the a16w-mix port, the kernel the runtime
+        # selects for BF16 QuantType.No when swiglu_limit is active.
+        is_a16w16 = (
+            q_type == QuantType.No
+            and dtype == dtypes.bf16
+            and q_dtype_a == dtypes.bf16
+            and q_dtype_w == dtypes.bf16
+            and act_type in (ActivationType.Silu, ActivationType.Swiglu)
+            and not doweight_stage1
+        )
+        if not is_a16w16 and (
+            q_type != QuantType.per_1x32 or q_dtype_w not in (dtypes.fp4x2, dtypes.fp8)
         ):
             return tasks_flydsl
 
@@ -3756,12 +3772,22 @@ class FmoeTuner(TunerCommon):
         b_dtype_str = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
-        flydsl_s1_kernels = get_flydsl_stage1_kernels(
-            a_dtype_str, b_dtype_str, out_dtype_str
-        )
-        flydsl_s2_kernels = get_flydsl_stage2_kernels(
-            a_dtype_str, b_dtype_str, out_dtype_str
-        )
+        if is_a16w16:
+            b_dtype_str = "bf16"
+            # The runtime wrapper passes waves_per_eu=None for registry entries
+            # without the key; run_flydsl_stage1_out would otherwise time wpe=3.
+            flydsl_s1_kernels = {
+                k: {**v, "waves_per_eu": None}
+                for k, v in get_flydsl_stage1_kernels_a16w16(out_dtype_str).items()
+            }
+            flydsl_s2_kernels = get_flydsl_stage2_kernels_a16w16(out_dtype_str)
+        else:
+            flydsl_s1_kernels = get_flydsl_stage1_kernels(
+                a_dtype_str, b_dtype_str, out_dtype_str
+            )
+            flydsl_s2_kernels = get_flydsl_stage2_kernels(
+                a_dtype_str, b_dtype_str, out_dtype_str
+            )
 
         for blockM in blockMs:
             # 16 included: a16w4/a8w4 emit t16 names, s1_tile_m drops the rest.
@@ -5550,6 +5576,17 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
+            # a16w16 stage1 writes a SORTED intermediate that only the a16w16
+            # stage2 reads, and CK stage2 cannot read it; both share BF16
+            # QuantType.No keys, so dedup and pair them on separate sides.
+            profileDF["a16w16"] = (
+                profileDF["kernelName"]
+                .astype(str)
+                .str.startswith(
+                    ("flydsl_moe1_abf16_wbf16_", "flydsl_moe2_abf16_wbf16_")
+                )
+                .astype(int)
+            )
             # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
             # penalty below is applied only to non-fused, so dedup must not drop the
             # fused kernel by raw us before that penalty runs. Keep v2 and non-v2
@@ -5560,7 +5597,8 @@ class FmoeTuner(TunerCommon):
             profileDF = (
                 profileDF.sort_values("us")
                 .drop_duplicates(
-                    ["stage", "block_m", "flat", "nt", "v2", "_is_fused"], keep="first"
+                    ["stage", "block_m", "flat", "nt", "v2", "a16w16", "_is_fused"],
+                    keep="first",
                 )
                 .drop(columns=["_is_fused"])
             )
@@ -5650,6 +5688,7 @@ class FmoeTuner(TunerCommon):
                     "block_m",
                     "nt",
                     "v2",
+                    "a16w16",
                 ],
                 how="inner",
             )
@@ -6064,6 +6103,8 @@ class FmoeTuner(TunerCommon):
             # dump already carries internal columns like stage/flat/ksplit.)
             if "v2" in profileDF.columns:
                 profileDF = profileDF.drop(columns=["v2"])
+            if "a16w16" in profileDF.columns:
+                profileDF = profileDF.drop(columns=["a16w16"])
             profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
                 lambda row: self.calculate(
