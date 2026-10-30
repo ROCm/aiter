@@ -61,7 +61,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ...jit.core import compile_ops, get_module
+from ...jit.core import compile_ops
 from ...jit.utils.torch_guard import torch_compile_guard
 from ._arch import GFX950, GFX1250, _device_arch
 
@@ -135,21 +135,54 @@ def _build_schedule_raw(
 ) -> None: ...
 
 
-# == the launch op ================================================================================
-# A tensor custom op, so torch.compile sees one opaque call that writes `out` only. Its body hands
-# the C++ launch addresses and scalars, not tensors: a pybind tensor descriptor apiece cost the
-# launch more host time than the rest of it, and it runs once a layer, once a band in prefill.
-# Its first parameter is a tensor, so the op takes no dummy one (that needs the annotations
-# evaluated: this module does not postpone them). mqa_logits_mxfp4 checks the tensors.
-_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None) or (
-    lambda device: torch.cuda.current_stream(device).cuda_stream
+# Addresses and scalars, not tensors: a pybind tensor descriptor apiece cost the launch more host
+# time than the rest of it, and it runs once a layer, once a band in prefill. Called through
+# _mqa_logits_mxfp4_launch only, which owns the tensors and the torch op.
+@compile_ops(_MD_NAME, fc_name="mqa_logits_mxfp4_launch")
+def _mqa_logits_mxfp4_launch_raw(
+    q: int,
+    q_scale: int,
+    kv_cache: int,
+    kv_scale: int,
+    weights: int,
+    block_tables: int,
+    query_start_loc: int,
+    row_ends: int,
+    cta_info: int,
+    out: int,
+    out_offsets: int,
+    kv_bytes: int,
+    rows: int,
+    num_seqs: int,
+    bt_stride: int,
+    out_stride: int,
+    instance: int,
+    schedule_mode: int,
+    weight_scale: float,
+    tpb_shift: int,
+    cta_target: int,
+    prefill_parts: int,
+    grid: int,
+    device: int,
+    stream: int,
+) -> None: ...
+
+
+# The stub's body without its own torch op dispatch (an op of integers only would take a dummy
+# tensor every call); the tensor op below is the one torch sees.
+_launch_raw = getattr(
+    _mqa_logits_mxfp4_launch_raw, "_eager_body", _mqa_logits_mxfp4_launch_raw
 )
 
 
-@functools.cache
-def _launch_fn():
-    # A config's instance query has loaded the module by the first launch.
-    return get_module(_MD_NAME).mqa_logits_mxfp4_launch
+# == the launch op ================================================================================
+# A tensor custom op, so torch.compile sees one opaque call that writes `out` only. Its first
+# parameter is a tensor, so it takes no dummy one (that needs the annotations evaluated: this
+# module does not postpone them). mqa_logits_mxfp4 checks the tensors; this hands their addresses
+# on, with the current stream of q's device.
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None) or (
+    lambda device: torch.cuda.current_stream(device).cuda_stream
+)
 
 
 def _launch_fake(*args, **kwargs) -> None:
@@ -181,7 +214,7 @@ def _mqa_logits_mxfp4_launch(
 ) -> None:
     device = q.get_device()
     flat = out_offsets.numel() > 0
-    _launch_fn()(
+    _launch_raw(
         q.data_ptr(),
         q_scale.data_ptr(),
         kv_cache.data_ptr(),
