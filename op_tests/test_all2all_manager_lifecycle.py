@@ -122,6 +122,26 @@ def test_unsupported_backend_is_rejected_without_changing_state():
     assert communicator._active_all2all_backend is None
 
 
+def test_mori_v2_backend_constructs_its_own_manager(monkeypatch):
+    from aiter.dist.device_communicators import all2all
+
+    communicator = make_communicator()
+    communicator.cpu_group = object()
+    created = []
+
+    class FakeMoriV2Manager:
+        def __init__(self, cpu_group):
+            created.append(cpu_group)
+
+    monkeypatch.setattr(all2all, "MoriV2All2AllManager", FakeMoriV2Manager)
+
+    manager = communicator.get_or_create_all2all_manager("mori_v2")
+
+    assert isinstance(manager, FakeMoriV2Manager)
+    assert created == [communicator.cpu_group]
+    assert communicator._active_all2all_backend == "mori_v2"
+
+
 def test_non_ep_communicator_cannot_create_manager():
     communicator = make_communicator(use_all2all=False)
 

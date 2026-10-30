@@ -247,9 +247,12 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             f"split_k*tile_k={split_k}*{tile_k}={split_k * tile_k}"
         )
     num_k_tiles = (K // split_k) // tile_k
-    if num_k_tiles < nb:
+    # Generic K=128 with two buffers uses only the prologue and drain.
+    # Other configurations, including compute-bound kernels, keep their limits.
+    min_k_tiles = 1 if not compute_bound and nb == 2 and K == tile_k == 128 else nb
+    if num_k_tiles < min_k_tiles:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 mxfp8] {nb}-buffer pipeline needs >= {nb} "
+            f"[FlyDSL gfx1250 mxfp8] {nb}-buffer pipeline needs >= {min_k_tiles} "
             f"K-tiles per split-k chunk, got {num_k_tiles}"
         )
     if compute_bound:

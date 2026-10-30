@@ -294,7 +294,7 @@ def pin_routed_experts(logits, n_routed, n_expts_act, balance=False):
         keep = pool[flat % n_pinned].view(n_tokens, n_expts_act)
     else:
         slot = torch.arange(n_pinned, device=dev)
-        score = torch.rand((n_tokens, n_pinned), device=dev)
+        score = torch.rand((n_tokens, n_pinned), dtype=torch.float32, device=dev)
         score[slot % n_tokens, slot] += 1.0
         keep = pool[score.topk(n_expts_act, dim=-1).indices]
 
@@ -367,7 +367,11 @@ def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
     from mori.cco import Communicator
 
     from aiter import ActivationType, QuantType
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
+        MegaMoEGeometry,
+        MegaMoEGfx1250,
+        MegaMoERecipe,
+    )
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import _from_gpu_ptr
     from aiter.ops.flydsl.moe_common import GateMode
 
@@ -384,8 +388,13 @@ def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
     comm = Communicator.init(world, rank, objs[0], per_rank_vmm=per_rank_vmm)
     comm.barrier()
 
-    mega = MegaMoEGfx1250(
-        communicator=comm,
+    recipe = MegaMoERecipe.from_legacy(
+        activation=ActivationType.Silu,
+        gate_mode=GateMode.INTERLEAVE.value,
+        quant_type=QuantType.per_1x32,
+        swiglu_limit=10.0,
+    )
+    geometry = MegaMoEGeometry(
         rank=rank,
         world_size=world,
         model_dim=hidden,
@@ -393,11 +402,8 @@ def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
         experts=experts,
         topk=topk,
         max_tokens_per_rank=mtpr,
-        activation=ActivationType.Silu,
-        gate_mode=GateMode.INTERLEAVE.value,
-        quant_type=QuantType.per_1x32,
-        swiglu_limit=10.0,
     )
+    mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=comm)
     # Read once here, where every rank is aligned and a barrier follows:
     # create_dev_comm() may be COLLECTIVE, so it cannot be done lazily from a
     # per-rank branch. Same contract ATOM's init_mega_transport honours.
@@ -440,7 +446,8 @@ def do_bench_cudagraph_synced(fn, rep, group):
         torch.cuda.synchronize()
         estimate_ms = start.elapsed_time(end) / 5
 
-        agreed = torch.tensor([estimate_ms], dtype=torch.float64)
+        # Keep on the CPU: the all-reduce uses the gloo (CPU) group.
+        agreed = torch.tensor([estimate_ms], dtype=torch.float64, device="cpu")
         dist.all_reduce(agreed, op=dist.ReduceOp.MAX, group=group)
         estimate_ms = float(agreed[0])
         n_repeat = 1000 if estimate_ms == 0 else max(1, int(rep / estimate_ms))
@@ -560,13 +567,15 @@ def bench_mlp_single_weight_init(
         torch.manual_seed(0)
     # The router scores every GLOBAL expert (that is what picks the tile
     # geometry), but the expert weights are only this rank's shard.
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
-    w1 = torch.randn((n_expts_local, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_local, dim2 // TP // 2, dim1), device=dev)
+    wg = torch.randn((dim1, n_expts_tot), dtype=torch.float32, device=dev)
+    w1 = torch.randn((n_expts_local, dim1, dim2 // TP), dtype=torch.float32, device=dev)
+    w2 = torch.randn(
+        (n_expts_local, dim2 // TP // 2, dim1), dtype=torch.float32, device=dev
+    )
     # biases
-    bg = torch.randn((n_expts_tot,), device=dev)
-    b1 = torch.randn((n_expts_local, dim2 // TP), device=dev)
-    b2 = torch.randn((n_expts_local, dim1), device=dev)
+    bg = torch.randn((n_expts_tot,), dtype=torch.float32, device=dev)
+    b1 = torch.randn((n_expts_local, dim2 // TP), dtype=torch.float32, device=dev)
+    b2 = torch.randn((n_expts_local, dim1), dtype=torch.float32, device=dev)
 
     # -- numerics --
     wg, _ = quantize(wg, "bf16")
