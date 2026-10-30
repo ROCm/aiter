@@ -278,8 +278,13 @@ def gen(
         .view(E, model_dim, inter_dim)
         .to(dtypes.bf16)
     )
+    # The a8w4 stage 1 reads a plain fp8 cast of the input (a_scale_one), not a1_qt.
+    if adtype == "fp8" and b_dtype == "fp4":
+        a_stage1 = inp.to(dtypes.fp8).to(dtypes.bf16)
+    else:
+        a_stage1 = a_deq
     ref1_fp32 = torch_moe_stage1(
-        a_deq,
+        a_stage1,
         w1_deq,
         w2_deq,
         topk_weights,
@@ -292,22 +297,6 @@ def gen(
         situ_linear_beta=situ_linear_beta,
     )  # [token, topk, inter]
     ref1 = ref1_fp32.to(dtypes.bf16)
-    # The fused stage 1 quantizes this fp32 result. The a8w4 stage 1 reads a plain
-    # fp8 cast of the input (a_scale_one), not a1_qt, so it gets its own.
-    if adtype == "fp8" and b_dtype == "fp4":
-        ref1_fp32 = torch_moe_stage1(
-            inp.to(dtypes.fp8).to(dtypes.bf16),
-            w1_deq,
-            w2_deq,
-            topk_weights,
-            topk_ids,
-            dtype=dtypes.fp32,
-            activation=activation,
-            quant_type=QuantType.No,
-            doweight=False,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-        )
     ref2 = torch_moe_stage2(
         ref1,
         w1_deq,

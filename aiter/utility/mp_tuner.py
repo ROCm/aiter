@@ -357,11 +357,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             else:
                 ref = cached_ref
                 _cur_key = (id(ref_func), ref_args, ref_kwargs, data_key)
-                if (
-                    ref is None
-                    and not fast_mode
-                    or (ref_func is not None and fast_mode)
-                ) and _cur_key != cached_ref_key:
+                if ref_func is not None and _cur_key != cached_ref_key:
                     ref_data_keys_i, *rest_i = ref_args
                     updated = tuple(data[k] for k in ref_data_keys_i) + tuple(rest_i)
                     ref = ref_func(*updated, **ref_kwargs)

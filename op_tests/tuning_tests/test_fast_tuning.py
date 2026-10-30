@@ -1246,8 +1246,12 @@ class TestRunConfigRouting(unittest.TestCase):
     def setUp(self):
         import torch
 
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
         if not torch.cuda.is_available():
             self.skipTest("run_config builds its inputs on the GPU")
+        if get_gfx_runtime() != "gfx950":
+            self.skipTest("the rows and their routing are gfx950's")
 
     def _row(self, token, q_dtype_a, q_dtype_w, act="Silu", kernel1="", stage1=0):
         return {

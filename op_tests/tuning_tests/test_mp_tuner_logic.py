@@ -493,14 +493,16 @@ class TestWorkerErrorRatio(unittest.TestCase):
                 None,
             )
 
-        rets = tuner.work_group(
-            {os.getpid(): 0},
-            True,
-            0.05,
-            (2, {"x": values}),
-            [task(2), task(3)],
-        )
-        self.assertEqual([err for _, _, err in rets], [0.0, 0.0])
+        for fast_mode in (True, False):
+            with self.subTest(fast_mode=fast_mode):
+                rets = tuner.work_group(
+                    {os.getpid(): 0},
+                    fast_mode,
+                    0.05,
+                    (2, {"x": values}),
+                    [task(2), task(3)],
+                )
+                self.assertEqual([err for _, _, err in rets], [0.0, 0.0])
 
 
 if __name__ == "__main__":
