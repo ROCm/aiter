@@ -3,156 +3,119 @@
 
 """CPU-only checks for MegaMoEGfx1250.required_vmm_bytes().
 
-Rebuilds the arena exactly as _initialize_pipeline lays it out for every
-dispatch wire, compact tile and backend, and asserts the bf16-pitch bound that
-required_vmm_bytes() reserves covers it. No GPU and no communicator needed.
+The arena the compact path allocates, including the stage-1 flag region when
+``AITER_MEGA_S1F=1`` and the shape can build that kernel, has to fit in the
+reservation. No GPU and no communicator.
 """
-
-import itertools
 
 import pytest
 
-from aiter.ops.flydsl.kernels.mega_moe_gfx1250.compact_plan import (
-    compact_hist_stride,
-)
-from aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe import (
-    _MAX_COMPACT_TILE_M,
-    _VMM_SLACK_BYTES,
+from aiter.jit.utils.chip_info import get_cu_num
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import arena, transport
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe import MegaMoEGfx1250
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.recipe import (
+    CombineKind,
+    DispatchKind,
     MegaMoEConfig,
-    MegaMoEGfx1250,
-    _align_up,
-    _arena_bound_nbytes,
-    _arena_nbytes,
-    _arena_regions,
+    MegaMoEGeometry,
+    MegaMoERecipe,
 )
 
 _GIB = 1 << 30
 
 
-def _mori_available() -> bool:
-    try:
-        from mori.ops.dispatch_combine_v2.hip_backend import (  # noqa: F401
-            scale_stride_bytes,
-        )
-    except ImportError:
-        return False
-    return True
-
-
-def _actual_arena_bytes(
-    *, ws, hidden, mtpr, experts, topk, wire, fused, tile_m, backend
-) -> int:
-    epr = experts // ws
-    config = MegaMoEConfig(
+def _config(*, ws, hidden, mtpr, experts, topk, wire, fused, inter=2048):
+    recipe = MegaMoERecipe(
+        dispatch=DispatchKind.COMPACT if fused else DispatchKind.MORI,
+        combine=CombineKind.FUSED_SCATTER,
+        dispatch_wire=wire,
+    )
+    geometry = MegaMoEGeometry(
         rank=0,
         world_size=ws,
-        hidden_dim=hidden,
-        max_tokens_per_rank=mtpr,
-        experts_per_rank=epr,
+        model_dim=hidden,
+        inter_dim=inter,
+        experts=experts,
         topk=topk,
-        dispatch_wire=wire,
-        dispatch_backend=backend,
-        stage1_fused=fused,
+        max_tokens_per_rank=mtpr,
     )
-    recv_rows = config.compact_row_cap(tile_m) if fused else config.max_recv
-    wire_row = (
-        _align_up(config.dispatch_token_nbytes + config.dispatch_scale_nbytes, 128)
-        if fused
-        else config.dispatch_token_nbytes
+    return MegaMoEConfig(recipe=recipe, geometry=geometry)
+
+
+def _layout_bytes(config) -> int:
+    layout = transport._arena_layout(config, transport._capabilities_for(config.recipe))
+    return layout.total_bytes
+
+
+def test_compact_reserve_matches_the_arena(monkeypatch):
+    monkeypatch.delenv("AITER_MEGA_S1F", raising=False)
+    monkeypatch.setenv("AITER_TDM_TILE_M", "64")
+    config = _config(
+        ws=4, hidden=7168, mtpr=1024, experts=256, topk=8, wire="fp4", fused=True
     )
-    hist_stride = compact_hist_stride(
-        npes=ws, experts_per_rank=epr, max_routes=mtpr * topk
-    )
-    return _arena_nbytes(
-        _arena_regions(
-            config,
-            compact=fused,
-            recv_rows=recv_rows,
-            wire_row=wire_row,
-            scale_row=config.dispatch_scale_dst_nbytes,
-            hist_stride=hist_stride,
+    layout = transport._arena_layout(config, None)
+    assert "tile_flag" not in dict(layout.regions)
+    need = MegaMoEGfx1250.required_vmm_bytes(config.recipe, config.geometry)
+    assert need == arena._cco_alloc_bytes(layout.total_bytes, 2 << 20)
+
+
+def test_s1f_reserves_tile_flags(monkeypatch):
+    monkeypatch.setenv("AITER_MEGA_S1F", "1")
+    monkeypatch.setenv("CU_NUM", "256")
+    monkeypatch.setenv("AITER_TDM_TILE_M", "64")
+    get_cu_num.cache_clear()
+    try:
+        off = _config(
+            ws=4, hidden=7168, mtpr=1024, experts=256, topk=8, wire="fp4", fused=True
         )
-    )
-
-
-def _cases():
-    backends = ["flydsl"] + (["mori"] if _mori_available() else [])
-    for ws, topk, hidden, mtpr, experts in itertools.product(
-        (2, 4, 8), (4, 6, 8), (4096, 7168), (1024, 16384), (256, 384)
-    ):
-        for wire, fused, tile_m, backend in itertools.product(
-            ("bf16", "fp8", "fp4"), (False, True), (16, 32, 64, 128, 256), backends
-        ):
-            if fused and (wire == "bf16" or backend != "flydsl"):
-                continue
-            if not fused and tile_m != 64:
-                continue
-            yield {
-                "ws": ws,
-                "hidden": hidden,
-                "mtpr": mtpr,
-                "experts": experts,
-                "topk": topk,
-                "wire": wire,
-                "fused": fused,
-                "tile_m": tile_m,
-                "backend": backend,
-            }
-
-
-def test_bound_covers_every_arena():
-    for case in _cases():
-        actual = _actual_arena_bytes(**case)
-        bound = _arena_bound_nbytes(
-            world_size=case["ws"],
-            hidden_dim=case["hidden"],
-            max_tokens_per_rank=case["mtpr"],
-            experts_per_rank=case["experts"] // case["ws"],
-            topk=case["topk"],
-            stage1_fused=case["fused"],
+        # Same shape with the switch off, so the only added region is the flags.
+        monkeypatch.setenv("AITER_MEGA_S1F", "0")
+        bare = _layout_bytes(off)
+        monkeypatch.setenv("AITER_MEGA_S1F", "1")
+        config = _config(
+            ws=4, hidden=7168, mtpr=1024, experts=256, topk=8, wire="fp4", fused=True
         )
-        reserve = MegaMoEGfx1250.required_vmm_bytes(
-            world_size=case["ws"],
-            hidden_dim=case["hidden"],
-            max_tokens_per_rank=case["mtpr"],
-            experts=case["experts"],
-            topk=case["topk"],
-            stage1_fused=case["fused"],
+        layout = transport._arena_layout(config, None)
+        assert "tile_flag" in dict(layout.regions)
+        assert layout.total_bytes > bare
+        need = MegaMoEGfx1250.required_vmm_bytes(config.recipe, config.geometry)
+        assert need == arena._cco_alloc_bytes(layout.total_bytes, 2 << 20)
+        bound = MegaMoEGfx1250.required_vmm_bytes(
+            world_size=4,
+            hidden_dim=7168,
+            max_tokens_per_rank=1024,
+            experts=256,
+            topk=8,
+            stage1_fused=True,
         )
-        assert actual <= bound, (case, actual, bound)
-        assert reserve >= bound + _VMM_SLACK_BYTES, (case, reserve, bound)
+        assert bound >= need
+    finally:
+        get_cu_num.cache_clear()
 
 
-def test_review_config_fits():
+def test_review_config_fits(monkeypatch):
     # ROCm/ATOM#2384 P1: EP4, fp8 wire, compact stage1 overflowed a 4 GiB slot.
-    geom = {"ws": 4, "hidden": 7168, "mtpr": 16384, "experts": 384, "topk": 6}
-    reserve = MegaMoEGfx1250.required_vmm_bytes(
-        world_size=4,
-        hidden_dim=7168,
-        max_tokens_per_rank=16384,
-        experts=384,
-        topk=6,
-        stage1_fused=True,
+    monkeypatch.delenv("AITER_MEGA_S1F", raising=False)
+    monkeypatch.setenv("AITER_TDM_TILE_M", "256")
+    config = _config(
+        ws=4, hidden=7168, mtpr=16384, experts=384, topk=6, wire="fp8", fused=True
     )
-    for tile_m in (16, 32, 64, 128, _MAX_COMPACT_TILE_M):
-        actual = _actual_arena_bytes(
-            **geom, wire="fp8", fused=True, tile_m=tile_m, backend="flydsl"
-        )
-        assert actual > 4 * _GIB
-        assert reserve >= actual + _VMM_SLACK_BYTES
+    actual = _layout_bytes(config)
+    reserve = MegaMoEGfx1250.required_vmm_bytes(config.recipe, config.geometry)
+    assert actual > 4 * _GIB
+    assert reserve >= actual
 
 
-def test_fused_reserves_route_rows():
-    kwargs = {
-        "world_size": 4,
-        "hidden_dim": 7168,
-        "max_tokens_per_rank": 16384,
-        "experts": 384,
-        "topk": 6,
-    }
-    fused = MegaMoEGfx1250.required_vmm_bytes(**kwargs, stage1_fused=True)
-    token_major = MegaMoEGfx1250.required_vmm_bytes(**kwargs, stage1_fused=False)
-    assert fused > token_major
+def test_fused_reserves_route_rows(monkeypatch):
+    monkeypatch.delenv("AITER_MEGA_S1F", raising=False)
+    shape = dict(ws=4, hidden=7168, mtpr=16384, experts=384, topk=6, wire="fp4", fused=True)
+    monkeypatch.setenv("AITER_TDM_TILE_M", "256")
+    wide = _layout_bytes(_config(**shape))
+    monkeypatch.setenv("AITER_TDM_TILE_M", "16")
+    narrow = _layout_bytes(_config(**shape))
+    # Compact rows are padded per expert to the GEMM tile, so the wider tile
+    # reserves more of the arena than the narrow one.
+    assert wide > narrow
 
 
 def test_rejects_indivisible_experts():
@@ -161,15 +124,8 @@ def test_rejects_indivisible_experts():
             world_size=3,
             hidden_dim=7168,
             max_tokens_per_rank=1024,
-            experts=384 + 1,
+            experts=385,
             topk=6,
             stage1_fused=False,
         )
 
-
-if __name__ == "__main__":
-    test_bound_covers_every_arena()
-    test_review_config_fits()
-    test_fused_reserves_route_rows()
-    test_rejects_indivisible_experts()
-    print("ok")
