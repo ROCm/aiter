@@ -28,11 +28,6 @@ from aiter import (
 )
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.fused_norm_rope_attn_rope_cast import (
-    _bf16_kv_rows,
-    _fused_norm_rope_attn_rope_cast_legacy_with_debug,
-    _fused_norm_rope_attn_rope_cast_with_debug,
-)
-from aiter.ops.fused_norm_rope_attn_rope_cast import (
     _fused_norm_rope_attn_rope_cast_fwd as fused_v41_fwd,
 )
 from aiter.ops.fused_norm_rope_attn_rope_cast import (
@@ -48,28 +43,6 @@ def _raises(expected, match=None):
     if match is None:
         return case.assertRaises(expected)
     return case.assertRaisesRegex(expected, match)
-
-
-def _call_v41(*args, **kwargs):
-    if "debug_out" in kwargs:
-        return _fused_norm_rope_attn_rope_cast_with_debug(*args, **kwargs)
-    return fused_v41(*args, **kwargs)
-
-
-def _call_legacy(*args, **kwargs):
-    if "debug_out" in kwargs:
-        return _fused_norm_rope_attn_rope_cast_legacy_with_debug(*args, **kwargs)
-    return fused_norm_rope_attn_rope_cast(*args, **kwargs)
-
-
-def _call_bf16(q, kv, indices, indptr, cos, sin, positions, **kwargs):
-    if "debug_out" in kwargs:
-        return _fused_norm_rope_attn_rope_cast_legacy_with_debug(
-            q, _bf16_kv_rows(kv), indices, indptr, cos, sin, positions, **kwargs
-        )
-    return fused_norm_rope_attn_rope_cast_bf16(
-        q, kv, indices, indptr, cos, sin, positions, **kwargs
-    )
 
 
 def quantize_fp8(x):
@@ -153,6 +126,76 @@ def dequantize(out, scales):
     return (out.float() * scales.float().repeat_interleave(32, -1)).reshape(
         t, groups * 8, 512
     )
+
+
+def _check_output(actual, expected):
+    assert float((actual - expected).norm() / expected.norm().clamp_min(1e-30)) < 0.035
+
+
+def _assert_quantized_output(out, expected):
+    groups = expected.float().reshape(-1, 16, 32)
+    mantissa, exponent = torch.frexp(groups.abs().amax(-1).clamp_min(1e-8) / 448)
+    exponent = exponent - (mantissa == 0.5).int()
+    scales = (exponent + 127).to(torch.uint8)
+    values = (groups * torch.exp2(-exponent.float())[..., None]).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        out[1].view(torch.uint8), scales.reshape_as(out[1]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        out[0].float(), values.reshape_as(out[0]).float(), rtol=0, atol=0
+    )
+
+
+def check_output_quantization(heads, tokens, splits, raw):
+    channels = torch.arange(512, device="cuda")
+    pattern = torch.tensor([448, 224, -448, -224, 64, 32, -64, -32], device="cuda")
+    values = (
+        pattern[channels % 8] * torch.exp2((channels // 32 % 9 - 4).float())
+    ).bfloat16()[None]
+    packed = pack_rows(*quantize_fp8(values))
+    q = torch.zeros(
+        tokens,
+        heads,
+        512,
+        device="cuda",
+        dtype=torch.bfloat16 if raw else torch.float8_e4m3fn,
+    )
+    coefficients = torch.tensor(
+        [0, 0.5, 1, 1.0078125, -0.5, -1], device="cuda", dtype=torch.bfloat16
+    )
+    cosine = coefficients[torch.arange(96, device="cuda").reshape(3, 32) % 6]
+    sine = coefficients[(torch.arange(96, device="cuda").reshape(3, 32) + 2) % 6]
+    positions = torch.arange(tokens, device="cuda", dtype=torch.int32) % 3
+    prefix = torch.full((tokens * 512,), -1, device="cuda", dtype=torch.int32)
+    extend = torch.full((tokens * 128,), -1, device="cuda", dtype=torch.int32)
+    prefix[:tokens] = 0
+    extend[:tokens] = 0
+    ptr = torch.arange(tokens + 1, device="cuda", dtype=torch.int32)
+    out = fused_v41(
+        q=q,
+        q_scale=(
+            None
+            if raw
+            else torch.full((tokens, heads, 16), 127, device="cuda", dtype=torch.uint8)
+        ),
+        unified_kv=packed[:, :512].view(torch.float8_e4m3fn),
+        unified_kv_scale=packed[:, 512:],
+        kv_indices_prefix=prefix,
+        kv_indptr_prefix=ptr,
+        kv=packed[:, :512].view(torch.float8_e4m3fn),
+        kv_scale=packed[:, 512:],
+        kv_indices_extend=extend,
+        kv_indptr_extend=ptr,
+        cos=cosine,
+        sin=sine,
+        positions=positions,
+        q_is_rotated=not raw,
+        num_splits=splits,
+    )
+    expected = rotate(
+        values[None].expand(tokens, heads, 512), cosine, sine, positions, inverse=True
+    )
+    _assert_quantized_output(out, expected)
 
 
 def simple_inputs(tokens=1, heads=64):
@@ -289,7 +332,7 @@ def check_ragged_dense(q_norm, heads, raw_q, with_extend):
     for n in counts:
         ids = all_ids[torch.randperm(1200, device="cuda")[:n]].clone()
         ordinal = torch.arange(n, device="cuda")
-        ids[((ordinal >= 32) & (ordinal < 64)) | (ordinal % 71 == 0)] = -1
+        ids[(ordinal >= 32) & (ordinal < 64) | (ordinal % 71 == 0)] = -1
         if n > 2:
             ids[-2] = 2**45
         rows.append(ids)
@@ -331,8 +374,7 @@ def check_ragged_dense(q_norm, heads, raw_q, with_extend):
     expected, maxima, lses = dense_legacy_reference(
         qr, pool, cids, cptr, cos, sin, pos, sink, extra, ceids, ceptr
     )
-    debug = torch.empty_like(q, dtype=torch.float32)
-    out = _call_legacy(
+    out = fused_norm_rope_attn_rope_cast(
         q,
         pool,
         ids,
@@ -344,16 +386,14 @@ def check_ragged_dense(q_norm, heads, raw_q, with_extend):
         q_is_rotated=not raw_q,
         q_norm=q_norm,
         norm_eps=norm_eps,
-        debug_out=debug,
         **options,
     )
-    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
-    assert float((debug - expected).norm() / expected.norm()) < 0.005
-    torch.testing.assert_close(out[2], maxima, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lses, rtol=1e-4, atol=3e-5)
+    _check_output(dequantize(*out[:2]), expected)
+    torch.testing.assert_close(out[2], maxima, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lses, rtol=0.0001, atol=3e-05)
     quant = dequantize(*out[:2])
     assert float((quant - expected).norm() / expected.norm()) < 0.035
-    assert torch.count_nonzero(debug[0]) == 0
+    assert torch.count_nonzero(dequantize(*out[:2])[0]) == 0
 
 
 def check_invalid_metadata(bad):
@@ -382,11 +422,11 @@ def check_invalid_metadata(bad):
     elif bad == "scale":
         kw["softmax_scale"] = float("nan")
     with _raises((ValueError, RuntimeError)):
-        _call_legacy(*args, **kw)
+        fused_norm_rope_attn_rope_cast(*args, **kw)
 
 
 def check_zero_tokens():
-    out = _call_legacy(*simple_inputs(0))
+    out = fused_norm_rope_attn_rope_cast(*simple_inputs(0))
     assert all(x.numel() == 0 for x in out)
 
 
@@ -395,8 +435,8 @@ def check_nondefault_stream_and_buffers():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        out = _call_legacy(*args)
-        again = _call_legacy(
+        out = fused_norm_rope_attn_rope_cast(*args)
+        again = fused_norm_rope_attn_rope_cast(
             *args, out=out[0], out_scale=out[1], max_logits=out[2], lse=out[3]
         )
         assert all(x is y for x, y in zip(out, again))
@@ -424,32 +464,31 @@ def check_prefetch_codec_empty_tiles_and_replay(heads):
     cos = torch.ones(1, 32, device="cuda", dtype=torch.bfloat16)
     sin = torch.zeros_like(cos)
     pos = torch.zeros(6, device="cuda", dtype=torch.int32)
-    debug = torch.empty_like(q, dtype=torch.float32)
     args = (q, pool, ids.flatten(), ptr, cos, sin, pos)
-    out = _call_legacy(*args, debug_out=debug, q_is_rotated=False)
+    out = fused_norm_rope_attn_rope_cast(*args, q_is_rotated=False)
     buffers = {
         "out": out[0],
         "out_scale": out[1],
         "max_logits": out[2],
         "lse": out[3],
-        "debug_out": debug,
         "q_is_rotated": False,
     }
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _call_legacy(*args, **buffers)
-    expected = decode(pool, row_ids).float()[:, None, :].expand_as(debug)
+        fused_norm_rope_attn_rope_cast(*args, **buffers)
+    expected = decode(pool, row_ids).float()[:, None, :].expand_as(dequantize(*out[:2]))
     for slot in (64, 32, -1, 0, 64):
         ids.fill_(-1)
         if slot >= 0:
             ids[:, slot].copy_(row_ids)
-        debug.fill_(float("nan"))
+        for value in out[:2]:
+            value.view(torch.uint8).fill_(255)
         graph.replay()
         if slot < 0:
-            assert torch.count_nonzero(debug) == 0
+            assert torch.count_nonzero(dequantize(*out[:2])) == 0
             assert torch.isposinf(out[3]).all()
         else:
-            torch.testing.assert_close(debug, expected, rtol=0, atol=0)
+            _assert_quantized_output(out, expected)
             torch.testing.assert_close(out[3], torch.zeros_like(out[3]), rtol=0, atol=0)
 
 
@@ -469,7 +508,7 @@ def check_prefetch_long_invalid_decode(heads, raw_q):
     for n in counts:
         ids = all_ids[torch.randperm(1200, device="cuda")[:n]].clone()
         ordinal = torch.arange(n, device="cuda")
-        ids[((ordinal >= 32) & (ordinal < 64)) | (ordinal % 73 == 0)] = -1
+        ids[(ordinal >= 32) & (ordinal < 64) | (ordinal % 73 == 0)] = -1
         rows.append(ids)
         clean.append(ids[ids >= 0])
     ids, ptr = csr(rows, torch.int64, 2**45)
@@ -485,23 +524,12 @@ def check_prefetch_long_invalid_decode(heads, raw_q):
     expected, maxima, lses = dense_legacy_reference(
         qr, pool, cids, cptr, cos, sin, pos, sink
     )
-    debug = torch.empty_like(q, dtype=torch.float32)
-    out = _call_legacy(
-        q,
-        pool,
-        ids,
-        ptr,
-        cos,
-        sin,
-        pos,
-        attn_sink=sink,
-        q_is_rotated=not raw_q,
-        debug_out=debug,
+    out = fused_norm_rope_attn_rope_cast(
+        q, pool, ids, ptr, cos, sin, pos, attn_sink=sink, q_is_rotated=not raw_q
     )
-    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
-    assert float((debug - expected).norm() / expected.norm()) < 0.005
-    torch.testing.assert_close(out[2], maxima, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lses, rtol=1e-4, atol=3e-5)
+    _check_output(dequantize(*out[:2]), expected)
+    torch.testing.assert_close(out[2], maxima, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lses, rtol=0.0001, atol=3e-05)
 
 
 def check_prefetch_dispatch_boundary(heads, tokens):
@@ -519,7 +547,9 @@ def check_prefetch_dispatch_boundary(heads, tokens):
     cos = torch.ones(1, 32, device="cuda", dtype=torch.bfloat16)
     sin = torch.zeros_like(cos)
     pos = torch.zeros(tokens, device="cuda", dtype=torch.int32)
-    out = _call_legacy(q, pool, ids, ptr, cos, sin, pos, q_is_rotated=False)
+    out = fused_norm_rope_attn_rope_cast(
+        q, pool, ids, ptr, cos, sin, pos, q_is_rotated=False
+    )
     value = dequantize(*out[:2])
     torch.testing.assert_close(
         value, row.float()[None, :, :].expand_as(value), rtol=0, atol=0
@@ -547,7 +577,9 @@ def check_h128_load_schedule_dispatch_boundary(tokens, raw_q):
     cos = torch.ones(1, 32, device="cuda", dtype=torch.bfloat16)
     sin = torch.zeros_like(cos)
     pos = torch.zeros(tokens, device="cuda", dtype=torch.int64)
-    out = _call_legacy(q, pool, ids, ptr, cos, sin, pos, q_is_rotated=not raw_q)
+    out = fused_norm_rope_attn_rope_cast(
+        q, pool, ids, ptr, cos, sin, pos, q_is_rotated=not raw_q
+    )
     actual = dequantize(*out[:2])
     torch.testing.assert_close(
         actual, row.float()[None, :, :].expand_as(actual), rtol=0, atol=0
@@ -564,7 +596,7 @@ def check_h128_load_schedule_dispatch_boundary(tokens, raw_q):
 def check_bf16_dense(q_norm, heads, raw, singleton):
     torch.manual_seed(16100 + heads)
     kv = torch.randn(1201, 512, device="cuda", dtype=torch.bfloat16) * 0.25
-    rows, clean = [], []
+    rows, clean = ([], [])
     for n in [0, 1, 31, 32, 33, 65, 127, 1153]:
         ids = torch.randperm(len(kv), device="cuda")[:n].int()
         j = torch.arange(n, device="cuda")
@@ -577,7 +609,7 @@ def check_bf16_dense(q_norm, heads, raw, singleton):
     ids, ptr = csr(rows, torch.int32, 2**31 - 1)
     q = torch.randn(8, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.25
     angle = torch.randn(64, 32, device="cuda")
-    cos, sin = angle.cos().bfloat16(), angle.sin().bfloat16()
+    cos, sin = (angle.cos().bfloat16(), angle.sin().bfloat16())
     pos = torch.arange(8, device="cuda", dtype=torch.int32) * 7
     sink = torch.linspace(-3, 3, heads, device="cuda")
     sink[::11] = -torch.inf
@@ -592,8 +624,7 @@ def check_bf16_dense(q_norm, heads, raw, singleton):
     )
     qr = rotate(normalized, cos, sin, pos).bfloat16() if raw else q
     expected, maxima, lses = dense_bf16_reference(qr, kv, clean, cos, sin, pos, sink)
-    debug = torch.empty_like(q, dtype=torch.float32)
-    out = _call_bf16(
+    out = fused_norm_rope_attn_rope_cast_bf16(
         q,
         kv[:, None] if singleton else kv,
         ids,
@@ -605,12 +636,10 @@ def check_bf16_dense(q_norm, heads, raw, singleton):
         q_is_rotated=not raw,
         q_norm=q_norm,
         norm_eps=norm_eps,
-        debug_out=debug,
     )
-    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
-    assert float((debug - expected).norm() / expected.norm()) < 0.005
-    torch.testing.assert_close(out[2], maxima, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lses, rtol=1e-4, atol=3e-5)
+    _check_output(dequantize(*out[:2]), expected)
+    torch.testing.assert_close(out[2], maxima, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lses, rtol=0.0001, atol=3e-05)
     assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
 
 
@@ -633,7 +662,9 @@ def check_bf16_stream_replay(heads, tokens):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        out = _call_bf16(q, kv, ids, ptr, cos, sin, pos, q_is_rotated=False)
+        out = fused_norm_rope_attn_rope_cast_bf16(
+            q, kv, ids, ptr, cos, sin, pos, q_is_rotated=False
+        )
         if not tokens:
             assert all(x.numel() == 0 for x in out)
             return
@@ -641,7 +672,9 @@ def check_bf16_stream_replay(heads, tokens):
         expected = [x.clone() for x in out]
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            _call_bf16(q, kv, ids, ptr, cos, sin, pos, q_is_rotated=False, **buffers)
+            fused_norm_rope_attn_rope_cast_bf16(
+                q, kv, ids, ptr, cos, sin, pos, q_is_rotated=False, **buffers
+            )
         for _ in range(3):
             for x in out:
                 x.view(torch.uint8).fill_(255)
@@ -675,12 +708,12 @@ def check_bf16_contract(bad):
     elif bad == "indices":
         ids = ids.long()
     elif bad == "empty_cache":
-        out = _call_bf16(q, kv[:0], ids, ptr, cos, sin, pos)
+        out = fused_norm_rope_attn_rope_cast_bf16(q, kv[:0], ids, ptr, cos, sin, pos)
         assert torch.count_nonzero(out[0].view(torch.uint8)) == 0
         assert torch.isneginf(out[2]).all() and torch.isposinf(out[3]).all()
         return
     with _raises((ValueError, RuntimeError)):
-        _call_bf16(q, kv, ids, ptr, cos, sin, pos, **kw)
+        fused_norm_rope_attn_rope_cast_bf16(q, kv, ids, ptr, cos, sin, pos, **kw)
 
 
 # FP8 QK and prepared Q.
@@ -701,8 +734,7 @@ def check_fp8_qk_dense(q_norm, heads, raw_q):
     expected, mx, lse = dense_fp8_qk_reference(
         normalized, kv, rows, cos, sin, pos, sink, raw_q
     )
-    debug = torch.empty_like(q, dtype=torch.float32)
-    out = _call_legacy(
+    out = fused_norm_rope_attn_rope_cast(
         *args,
         **kw,
         attn_sink=sink,
@@ -710,14 +742,12 @@ def check_fp8_qk_dense(q_norm, heads, raw_q):
         q_norm=q_norm,
         norm_eps=norm_eps,
         fp8_qk=True,
-        debug_out=debug,
     )
-    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
-    assert float((debug - expected).norm() / expected.norm()) < 0.005
+    torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
+    _check_output(dequantize(*out[:2]), expected)
     assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
-    assert torch.count_nonzero(debug[0]) == 0
+    assert torch.count_nonzero(dequantize(*out[:2])[0]) == 0
 
 
 def check_fp8_qk_reject(kind):
@@ -733,7 +763,7 @@ def check_fp8_qk_reject(kind):
             "extend_indptr": args[3],
         }
     with _raises((ValueError, RuntimeError), match="FP8 QK requires"):
-        _call_legacy(*args, **kw, fp8_qk=True)
+        fused_norm_rope_attn_rope_cast(*args, **kw, fp8_qk=True)
 
 
 def check_fp8_qk_replay():
@@ -741,7 +771,9 @@ def check_fp8_qk_replay():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        out = _call_legacy(*args, **kw, fp8_qk=True, q_is_rotated=False, attn_sink=sink)
+        out = fused_norm_rope_attn_rope_cast(
+            *args, **kw, fp8_qk=True, q_is_rotated=False, attn_sink=sink
+        )
         refs = [x.clone() for x in out]
         buffers = {
             "out": out[0],
@@ -751,7 +783,7 @@ def check_fp8_qk_replay():
         }
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            _call_legacy(
+            fused_norm_rope_attn_rope_cast(
                 *args, **kw, **buffers, fp8_qk=True, q_is_rotated=False, attn_sink=sink
             )
         for _ in range(5):
@@ -766,7 +798,7 @@ def check_fp8_qk_replay():
 
 
 def check_fp8_qk_zero_tokens():
-    out = _call_legacy(*simple_inputs(0), fp8_qk=True)
+    out = fused_norm_rope_attn_rope_cast(*simple_inputs(0), fp8_qk=True)
     assert all(x.numel() == 0 for x in out)
 
 
@@ -776,8 +808,10 @@ def check_fp8_prepared_q(heads):
     q8, qs = quantize_fp8(rotate(q, cos, sin, pos).bfloat16())
     q8 = q8.reshape_as(q)
     qs = qs.reshape(q.shape[0], heads, 16)
-    out = _call_legacy(*args, **kw, fp8_qk=True, q_is_rotated=False, attn_sink=sink)
-    prepared = _call_legacy(
+    out = fused_norm_rope_attn_rope_cast(
+        *args, **kw, fp8_qk=True, q_is_rotated=False, attn_sink=sink
+    )
+    prepared = fused_norm_rope_attn_rope_cast(
         q8, *args[1:], **kw, fp8_qk=True, q_scale=qs, attn_sink=sink
     )
     for x, y in zip(out, prepared):
@@ -803,7 +837,7 @@ def check_prepared_q_contract(bad):
     if bad == "q_dtype":
         args[0] = args[0].bfloat16()
     with _raises((ValueError, RuntimeError)):
-        _call_legacy(*args, **kw)
+        fused_norm_rope_attn_rope_cast(*args, **kw)
 
 
 # Prefill integration.
@@ -819,7 +853,6 @@ def check_fused_norm_rope_attn_rope_cast_contract(q_norm, raw, pos64, mode):
             (torch.arange(1153, device="cuda") * 17 + i) % len(kv)
             for i in range(len(rows))
         ]
-    # Padded CSR selects the new dispatch while retaining empty, invalid and tail queries.
     rows = [
         torch.cat((r, torch.full((1153 - len(r),), -1, device="cuda", dtype=r.dtype)))
         for r in rows
@@ -844,9 +877,8 @@ def check_fused_norm_rope_attn_rope_cast_contract(q_norm, raw, pos64, mode):
         if q_norm
         else q
     )
-    debug = torch.empty_like(q, dtype=torch.float32)
-    common = dict(**kw, fp8_qk=True, attn_sink=sink, debug_out=debug)
-    out = _call_legacy(
+    common = dict(**kw, fp8_qk=True, attn_sink=sink)
+    out = fused_norm_rope_attn_rope_cast(
         q,
         pool,
         ids,
@@ -862,10 +894,9 @@ def check_fused_norm_rope_attn_rope_cast_contract(q_norm, raw, pos64, mode):
     expected, mx, lse = dense_fp8_qk_reference(
         normalized, kv, rows, cos, sin, pos, sink, raw
     )
-    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
-    assert float((debug - expected).norm() / expected.norm().clamp_min(1e-10)) < 0.005
+    torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
+    _check_output(dequantize(*out[:2]), expected)
     assert (
         float(
             (dequantize(*out[:2]) - expected).norm() / expected.norm().clamp_min(1e-10)
@@ -874,7 +905,7 @@ def check_fused_norm_rope_attn_rope_cast_contract(q_norm, raw, pos64, mode):
     )
     rotated = rotate(normalized, cos, sin, pos).bfloat16() if raw else q
     q8, qs = quantize_fp8(rotated)
-    prepared = _call_legacy(
+    prepared = fused_norm_rope_attn_rope_cast(
         q8.reshape_as(q),
         pool,
         ids,
@@ -893,7 +924,7 @@ def check_fused_norm_rope_attn_rope_cast_contract(q_norm, raw, pos64, mode):
     refs = [x.clone() for x in out]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _call_legacy(
+        fused_norm_rope_attn_rope_cast(
             q,
             pool,
             ids,
@@ -949,15 +980,15 @@ def check_norm_contract(direct, bad):
                 torch.empty((1, 64), device=q.device),
             ]
             fused_norm_rope_attn_rope_cast_fwd(
-                *args, *outputs, None, None, None, None, None, 512**-0.5, **kw
+                *args, *outputs, None, None, None, None, 512**-0.5, **kw
             )
         else:
-            _call_legacy(*args, **kw)
+            fused_norm_rope_attn_rope_cast(*args, **kw)
 
 
 def check_norm_zero_q(tokens):
     args = simple_inputs(tokens)
-    out = _call_legacy(*args, q_norm=True, q_is_rotated=False)
+    out = fused_norm_rope_attn_rope_cast(*args, q_norm=True, q_is_rotated=False)
     assert all(torch.isfinite(x.float()).all() for x in out)
     assert torch.count_nonzero(out[2]) == torch.count_nonzero(out[3]) == 0
 
@@ -976,11 +1007,11 @@ def check_norm_recomputed_on_graph_replay():
     kw.update(
         q_norm=True, norm_eps=0.125, q_is_rotated=False, fp8_qk=True, attn_sink=sink
     )
-    out = _call_legacy(*args, **kw)
+    out = fused_norm_rope_attn_rope_cast(*args, **kw)
     buffers = dict(zip(("out", "out_scale", "max_logits", "lse"), out))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _call_legacy(*args, **kw, **buffers)
+        fused_norm_rope_attn_rope_cast(*args, **kw, **buffers)
     # Make the norm scale change after capture, including zero-valued heads.
     q.mul_(0.25)
     q[:, ::11] = 0
@@ -1131,20 +1162,15 @@ def check_two_source_dense(heads, layout, mode, wide, with_sink, valid_indices):
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, layout, mode, wide, with_sink, valid_indices
     )
-    debug = torch.empty_like(kwargs["q"], dtype=torch.float32)
-    out = _call_v41(
-        **kwargs,
-        debug_out=debug,
-        max_logits=torch.empty_like(mx),
-        lse=torch.empty_like(lse),
+    out = fused_v41(
+        **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
     )
-    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
-    assert float((debug - expected).norm() / expected.norm()) < 0.005
+    torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
+    _check_output(dequantize(*out[:2]), expected)
     assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
     if not valid_indices or wide:
-        assert torch.count_nonzero(debug[0]) == 0
+        assert torch.count_nonzero(dequantize(*out[:2])[0]) == 0
 
 
 def check_two_source_empty_and_bounds(heads, empty, large_grid):
@@ -1161,8 +1187,6 @@ def check_two_source_empty_and_bounds(heads, empty, large_grid):
                 torch.full((rows, 512), value, device="cuda", dtype=torch.bfloat16)
             )
         )
-    # A valid last extend row lies outside the prefix's row count. Negative and
-    # oversized ids must be masked independently for both sources.
     prefix = torch.tensor([1, -1, 100] * tokens, device="cuda", dtype=torch.int32)
     extend = torch.tensor([6, -1, 100] * tokens, device="cuda", dtype=torch.int32)
     ptr = torch.arange(tokens + 1, device="cuda", dtype=torch.int32) * 3
@@ -1196,21 +1220,18 @@ def check_two_source_empty_and_bounds(heads, empty, large_grid):
             kv_indices_extend=extend,
             kv_indptr_extend=ptr,
         )
-    debug = torch.empty_like(q, dtype=torch.float32)
-    out = _call_v41(
-        **kwargs, debug_out=debug, lse=torch.empty(tokens, heads, device="cuda")
-    )
+    out = fused_v41(**kwargs, lse=torch.empty(tokens, heads, device="cuda"))
     live = int(counts[0] > 0) + int(counts[1] > 0 and empty != "omitted")
     expected = (
         2 * int(counts[0] > 0) + int(counts[1] > 0 and empty != "omitted")
     ) / max(live, 1)
-    torch.testing.assert_close(debug, torch.full_like(debug, expected), rtol=0, atol=0)
+    _check_output(dequantize(*out[:2]), torch.full_like(dequantize(*out[:2]), expected))
     if live:
         torch.testing.assert_close(
             out[3],
             torch.full_like(out[3], float(torch.log(torch.tensor(float(live))))),
-            rtol=1e-5,
-            atol=1e-6,
+            rtol=1e-05,
+            atol=1e-06,
         )
     else:
         assert torch.isposinf(out[3]).all()
@@ -1227,11 +1248,8 @@ def check_two_source_rescale(heads, mixed_scales):
     query = kwargs["q"].float() * torch.exp2(scales.float() - 127).repeat_interleave(
         32, -1
     )
-    debug = torch.empty_like(query)
     stats = torch.empty(query.shape[:2], device="cuda")
-    out = _call_v41(
-        **kwargs, debug_out=debug, max_logits=torch.empty_like(stats), lse=stats
-    )
+    out = fused_v41(**kwargs, max_logits=torch.empty_like(stats), lse=stats)
     for t in range(len(query)):
         selected = []
         for data, scale, ids, ptr in [
@@ -1256,9 +1274,9 @@ def check_two_source_rescale(heads, mixed_scales):
             selected.append(decoded[rows])
         values = torch.cat(selected)
         if not len(values):
-            assert torch.count_nonzero(debug[t]) == 0
+            assert torch.count_nonzero(dequantize(*out[:2])[t]) == 0
             continue
-        logits = query[t] @ values.T * 512**-0.5
+        logits = query[t] @ values.T * 512 ** (-0.5)
         probs = torch.cat((logits, kwargs["attn_sink"][:, None]), -1).softmax(-1)[
             :, : len(values)
         ]
@@ -1270,12 +1288,12 @@ def check_two_source_rescale(heads, mixed_scales):
             inverse=True,
         )[0]
         torch.testing.assert_close(
-            out[2][t], logits.max(-1).values, rtol=1e-4, atol=3e-5
+            out[2][t], logits.max(-1).values, rtol=0.0001, atol=3e-05
         )
         torch.testing.assert_close(
-            out[3][t], logits.logsumexp(-1), rtol=1e-4, atol=3e-5
+            out[3][t], logits.logsumexp(-1), rtol=0.0001, atol=3e-05
         )
-        assert float((debug[t] - expected).norm() / expected.norm()) < 0.005
+        _check_output(dequantize(*out[:2])[t], expected)
 
 
 def check_two_source_graph_replay(heads, mode, valid_indices):
@@ -1283,7 +1301,7 @@ def check_two_source_graph_replay(heads, mode, valid_indices):
     kwargs, _ = two_source_inputs(
         heads, "padded", input_mode, wide=True, valid_indices=valid_indices
     )
-    out = _call_v41(**kwargs)
+    out = fused_v41(**kwargs)
     assert out[2:] == (None, None)
     buffers = {"out": out[0], "out_scale": out[1]}
     stream = torch.cuda.Stream()
@@ -1291,7 +1309,7 @@ def check_two_source_graph_replay(heads, mode, valid_indices):
     with torch.cuda.stream(stream):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            _call_v41(**kwargs, **buffers)
+            fused_v41(**kwargs, **buffers)
         # Change the second source after capture, including its scales and CSR.
         kwargs["kv"].view(torch.uint8).zero_()
         kwargs["kv_scale"].view(torch.uint8).fill_(127)
@@ -1302,7 +1320,7 @@ def check_two_source_graph_replay(heads, mode, valid_indices):
             kwargs["q_scale"].view(torch.uint8).random_(118, 131)
         else:
             kwargs["q"].mul_(0.5)
-        expected = _call_v41(**kwargs)
+        expected = fused_v41(**kwargs)
         for _ in range(3):
             out[0].view(torch.uint8).fill_(255)
             out[1].view(torch.uint8).fill_(255)
@@ -1365,14 +1383,12 @@ def check_two_source_contract(bad):
     elif bad == "backend":
         kwargs["backend"] = "invalid"
     with _raises((ValueError, RuntimeError)):
-        _call_v41(**kwargs)
+        fused_v41(**kwargs)
 
 
 def check_two_source_h64_causal_prefill(
     tokens, topk, mode, heads=64, splits=1, sliding_window=False
 ):
-    # Long causal CSR rows exercise the 64-row pipeline, including its source
-    # switch and final partial tile. Check all heads against a dense oracle.
     torch.manual_seed(23917 + topk)
     prefix_rows = 65536
     values, scales = quantize_fp8(
@@ -1380,7 +1396,7 @@ def check_two_source_h64_causal_prefill(
         * 0.25
     )
     packed = pack_rows(values, scales)
-    prefix, extend = packed[:prefix_rows], packed[prefix_rows:]
+    prefix, extend = (packed[:prefix_rows], packed[prefix_rows:])
     pids = torch.randint(prefix_rows, (tokens, topk), device="cuda", dtype=torch.int32)
     pp = torch.arange(tokens + 1, device="cuda", dtype=torch.int32) * topk
     lengths = torch.arange(1, tokens + 1, device="cuda", dtype=torch.int32).clamp_max(
@@ -1392,7 +1408,7 @@ def check_two_source_h64_causal_prefill(
     columns = torch.arange(topk, device="cuda", dtype=torch.int32).expand(tokens, -1)
     eids = columns[columns < lengths[:, None]]
     if sliding_window:
-        prefix_ids, extend_ids = [], []
+        prefix_ids, extend_ids = ([], [])
         for j in range(tokens):
             old_swa = max(127 - j, 0)
             prefix_ids.append(
@@ -1415,7 +1431,7 @@ def check_two_source_h64_causal_prefill(
         eids, ep = csr(extend_ids, torch.int32, 2**31 - 1)
     q = torch.randn(tokens, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.125
     angles = torch.randn(tokens, 32, device="cuda")
-    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+    cos, sin = (angles.cos().bfloat16(), angles.sin().bfloat16())
     pos = torch.arange(tokens, device="cuda", dtype=torch.int32)
     sink = torch.linspace(-3, 3, heads, device="cuda")
     sink[::11] = -torch.inf
@@ -1424,21 +1440,20 @@ def check_two_source_h64_causal_prefill(
         reference_q = (
             q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + 0.125)
         ).bfloat16()
-    query, qscale = q, None
+    query, qscale = (q, None)
     if mode == "prepared":
         query, qscale = quantize_fp8(rotate(q, cos, sin, pos).bfloat16())
         query = query.reshape_as(q)
         qscale = qscale.reshape(tokens, heads, 16).view(torch.float8_e8m0fnu)
-    debug = torch.empty_like(q, dtype=torch.float32)
     workspace = None
     if splits > 1:
         count = tokens * splits * heads * 516
-        storage = torch.full((count + 8,), 0x5A5A5A5A, device="cuda", dtype=torch.int32)
+        storage = torch.full((count + 8,), 1515870810, device="cuda", dtype=torch.int32)
         workspace = (
             storage[4:-4].view(torch.float32).reshape(tokens, splits, heads, 516)
         )
         workspace.fill_(torch.nan)
-    out = _call_v41(
+    out = fused_v41(
         q=query,
         q_scale=qscale,
         unified_kv=prefix[:, :512].view(torch.float8_e4m3fn),
@@ -1458,7 +1473,6 @@ def check_two_source_h64_causal_prefill(
         norm_eps=0.125,
         num_splits=splits,
         workspace=workspace,
-        debug_out=debug,
         max_logits=torch.empty(tokens, heads, device="cuda"),
         lse=torch.empty(tokens, heads, device="cuda"),
     )
@@ -1481,18 +1495,16 @@ def check_two_source_h64_causal_prefill(
     expected, mx, lse = dense_fp8_qk_reference(
         reference_q[probes], decoded, rows, cos, sin, pos[probes], sink, True
     )
-    torch.testing.assert_close(out[2][probes], mx, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3][probes], lse, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(debug[probes], expected, rtol=0.02, atol=0.008)
-    assert float((debug[probes] - expected).norm() / expected.norm()) < 0.005
+    torch.testing.assert_close(out[2][probes], mx, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3][probes], lse, rtol=0.0001, atol=3e-05)
+    _check_output(dequantize(*out[:2])[probes], expected)
     assert (
         float((dequantize(*out[:2])[probes] - expected).norm() / expected.norm())
         < 0.035
     )
-
     if workspace is not None:
-        assert bool((storage[:4] == 0x5A5A5A5A).all())
-        assert bool((storage[-4:] == 0x5A5A5A5A).all())
+        assert bool((storage[:4] == 1515870810).all())
+        assert bool((storage[-4:] == 1515870810).all())
 
 
 def check_two_source_h64_q_scale_groups(rotated, valid_indices, extend):
@@ -1515,7 +1527,7 @@ def check_two_source_h64_q_scale_groups(rotated, valid_indices, extend):
         max_logits=torch.empty(q.shape[:2], device=q.device),
         lse=torch.empty(q.shape[:2], device=q.device),
     )
-    actual = _call_v41(**kwargs)
+    actual = fused_v41(**kwargs)
     q8, scales = quantize_fp8(prepared_q)
     kwargs.update(
         q=q8.reshape_as(q),
@@ -1524,7 +1536,7 @@ def check_two_source_h64_q_scale_groups(rotated, valid_indices, extend):
         max_logits=torch.empty_like(actual[2]),
         lse=torch.empty_like(actual[3]),
     )
-    expected = _call_v41(**kwargs)
+    expected = fused_v41(**kwargs)
     for x, y in zip(actual, expected):
         torch.testing.assert_close(
             x.view(torch.uint8), y.view(torch.uint8), rtol=0, atol=0
@@ -1533,7 +1545,7 @@ def check_two_source_h64_q_scale_groups(rotated, valid_indices, extend):
 
 def check_two_source_rope_storage_offset(heads, mode):
     kwargs, (_, mx, lse) = two_source_inputs(heads, "padded", mode, True, True, True)
-    reference = _call_v41(
+    reference = fused_v41(
         **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
     )
     # Contiguous BF16 views can start two or six bytes past an aligned allocation.
@@ -1546,7 +1558,7 @@ def check_two_source_rope_storage_offset(heads, mode):
         view.copy_(original)
         assert view.is_contiguous() and view.data_ptr() % 8 != 0
         kwargs[name] = view
-    actual = _call_v41(
+    actual = fused_v41(
         **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
     )
     for out, expected in zip(actual, reference):
@@ -1557,7 +1569,7 @@ def check_two_source_rope_storage_offset(heads, mode):
 
 def check_two_source_scale_output_storage_offset(heads, mode, offset):
     kwargs, (_, mx, lse) = two_source_inputs(heads, "padded", mode, True, True, True)
-    reference = _call_v41(
+    reference = fused_v41(
         **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
     )
     storage = torch.empty(
@@ -1565,7 +1577,7 @@ def check_two_source_scale_output_storage_offset(heads, mode, offset):
     )
     scales = storage[offset:].view(reference[1].dtype).view_as(reference[1])
     assert scales.is_contiguous() and scales.data_ptr() % 4 != 0
-    actual = _call_v41(
+    actual = fused_v41(
         **kwargs,
         out_scale=scales,
         max_logits=torch.empty_like(mx),
@@ -1582,7 +1594,7 @@ def check_two_source_index_storage_offset(heads, mode, offset, valid_indices):
     kwargs, (_, mx, lse) = two_source_inputs(
         heads, "padded", mode, True, True, valid_indices
     )
-    reference = _call_v41(
+    reference = fused_v41(
         **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
     )
     for name in ("kv_indices_prefix", "kv_indices_extend"):
@@ -1594,7 +1606,7 @@ def check_two_source_index_storage_offset(heads, mode, offset, valid_indices):
         view.copy_(original)
         assert view.is_contiguous() and view.data_ptr() % 16 != 0
         kwargs[name] = view
-    actual = _call_v41(
+    actual = fused_v41(
         **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
     )
     for out, expected in zip(actual, reference):
@@ -1607,18 +1619,15 @@ def check_fp8_split_dense(heads, layout, mode, splits, valid_indices, with_sink)
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, layout, mode, True, with_sink, valid_indices
     )
-    debug = torch.empty_like(kwargs["q"], dtype=torch.float32)
-    out = _call_v41(
+    out = fused_v41(
         **kwargs,
         num_splits=splits,
-        debug_out=debug,
         max_logits=torch.empty_like(mx),
         lse=torch.empty_like(lse),
     )
-    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
-    assert float((debug - expected).norm() / expected.norm()) < 0.005
+    torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
+    _check_output(dequantize(*out[:2]), expected)
     assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
 
 
@@ -1636,8 +1645,10 @@ def check_fp8_decode_ring_view(heads, splits, sources):
     en = ei.numel() if sources in ("both", "extend") else 0
     pp = torch.tensor([0, pn], device="cuda", dtype=torch.int32)
     ep = torch.tensor([0, en], device="cuda", dtype=torch.int32)
-    debug = torch.empty(1, heads, 512, device="cuda")
-    mx, lse = torch.empty(1, heads, device="cuda"), torch.empty(1, heads, device="cuda")
+    mx, lse = (
+        torch.empty(1, heads, device="cuda"),
+        torch.empty(1, heads, device="cuda"),
+    )
     kwargs = {
         "q": q,
         "q_scale": qs,
@@ -1653,14 +1664,14 @@ def check_fp8_decode_ring_view(heads, splits, sources):
         "sin": torch.zeros(1, 32, device="cuda", dtype=torch.bfloat16),
         "positions": torch.zeros(1, device="cuda", dtype=torch.int32),
         "num_splits": splits,
-        "debug_out": debug,
         "max_logits": mx,
         "lse": lse,
     }
-    _call_v41(**kwargs)
+    out = fused_v41(**kwargs)
     expected = (2 * pn + ring_values[7:][ei[:en].long()].sum()) / max(1, pn + en)
-    torch.testing.assert_close(
-        debug, torch.full_like(debug, expected.bfloat16().float()), rtol=0, atol=0
+    _check_output(
+        dequantize(*out[:2]),
+        torch.full_like(dequantize(*out[:2]), expected.bfloat16().float()),
     )
     torch.testing.assert_close(
         mx, torch.full_like(mx, 0 if pn + en else -torch.inf), rtol=0, atol=0
@@ -1669,7 +1680,7 @@ def check_fp8_decode_ring_view(heads, splits, sources):
         torch.log(torch.tensor(float(pn + en), device="cuda")) if pn + en else torch.inf
     )
     torch.testing.assert_close(
-        lse, torch.full_like(lse, expected_lse), rtol=1e-4, atol=3e-5
+        lse, torch.full_like(lse, expected_lse), rtol=0.0001, atol=3e-05
     )
 
 
@@ -1689,16 +1700,16 @@ def check_fp8_split_graph_replay(heads, mode):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        _call_v41(**kwargs)
+        fused_v41(**kwargs)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            _call_v41(**kwargs)
+            fused_v41(**kwargs)
         for empty in [False, True, False]:
             kwargs["kv_indices_prefix"].fill_(-1 if empty else 4)
             kwargs["kv_indices_extend"].fill_(-1 if empty else 8)
             kwargs["kv_indptr_prefix"][1:-1].zero_()
             kwargs["kv_indptr_extend"][1:-1].zero_()
-            expected = tuple(x.clone() for x in _call_v41(**kwargs))
+            expected = tuple(x.clone() for x in fused_v41(**kwargs))
             kwargs["workspace"].fill_(torch.nan)
             graph.replay()
             for actual, ref in zip(
@@ -1732,14 +1743,12 @@ def check_fp8_split_contract(bad):
         )
     elif bad == "workspace_overlap":
         kwargs["workspace"] = torch.empty(t, 2, h, 516, device="cuda")
-        kwargs["debug_out"] = (
-            kwargs["workspace"].flatten()[: t * h * 512].view(t, h, 512)
-        )
+        kwargs["lse"] = kwargs["workspace"].flatten()[: t * h].view(t, h)
     else:
         kwargs["num_splits"] = 1
         kwargs["workspace"] = torch.empty(t, 1, h, 516, device="cuda")
     with _raises((ValueError, RuntimeError)):
-        _call_v41(**kwargs)
+        fused_v41(**kwargs)
 
 
 def check_fp8_explicit_workspace(heads, mode, splits):
@@ -1749,7 +1758,6 @@ def check_fp8_explicit_workspace(heads, mode, splits):
     kwargs.update(
         num_splits=splits,
         workspace=workspace,
-        debug_out=torch.empty_like(expected),
         max_logits=torch.empty_like(mx),
         lse=torch.empty_like(lse),
     )
@@ -1757,56 +1765,46 @@ def check_fp8_explicit_workspace(heads, mode, splits):
         "aiter.ops.fused_norm_rope_attn_rope_cast._fused_norm_rope_attn_rope_cast_fwd",
         wraps=fused_v41_fwd,
     ) as native:
-        out = _call_v41(**kwargs)
-        assert native.call_args.args[23] == splits
-        assert native.call_args.args[24] is workspace
-    torch.testing.assert_close(kwargs["debug_out"], expected, rtol=0.02, atol=0.008)
-    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
+        out = fused_v41(**kwargs)
+        assert native.call_args.args[22] == splits
+        assert native.call_args.args[23] is workspace
+    _check_output(dequantize(*out[:2]), expected)
+    torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
 
 
 def check_fp8_auto_split(heads, mode):
     kwargs, (expected, mx, lse) = two_source_inputs(heads, "padded", mode, True)
-    kwargs.update(
-        debug_out=torch.empty_like(expected),
-        max_logits=torch.empty_like(mx),
-        lse=torch.empty_like(lse),
-    )
+    kwargs.update(max_logits=torch.empty_like(mx), lse=torch.empty_like(lse))
     with patch(
         "aiter.ops.fused_norm_rope_attn_rope_cast._fused_norm_rope_attn_rope_cast_fwd",
         wraps=fused_v41_fwd,
     ) as native:
-        out = _call_v41(**kwargs)
-        splits, workspace = native.call_args.args[23:25]
+        out = fused_v41(**kwargs)
+        splits, workspace = native.call_args.args[22:24]
         assert 1 < splits <= 32
         assert workspace.shape == (expected.shape[0], splits, heads, 516)
-        torch.testing.assert_close(kwargs["debug_out"], expected, rtol=0.02, atol=0.008)
-        torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-        torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
-        out = _call_v41(**kwargs, num_splits=1)
-        assert native.call_args.args[23] == 1
-        assert native.call_args.args[24] is None
-        torch.testing.assert_close(kwargs["debug_out"], expected, rtol=0.02, atol=0.008)
-        torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-        torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
+        _check_output(dequantize(*out[:2]), expected)
+        torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+        torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
+        out = fused_v41(**kwargs, num_splits=1)
+        assert native.call_args.args[22] == 1
+        assert native.call_args.args[23] is None
+        _check_output(dequantize(*out[:2]), expected)
+        torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+        torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
 
 
 def check_fp8_split_auto_and_poisoned_workspace(heads, mode, valid_indices, splits):
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, "padded", mode, True, False, valid_indices
     )
-    debug = torch.empty_like(expected)
-    # Automatic dispatch must handle spare index-buffer capacity and ragged rows.
-    out = _call_v41(
-        **kwargs,
-        debug_out=debug,
-        max_logits=torch.empty_like(mx),
-        lse=torch.empty_like(lse),
+    out = fused_v41(
+        **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
     )
-    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
-    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
-    # More splits than live tiles must overwrite every partial, including empties.
+    _check_output(dequantize(*out[:2]), expected)
+    torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
     t = kwargs["q"].shape[0]
     workspace = torch.full((t, splits, heads, 516), torch.nan, device="cuda")
     for ids in (kwargs["kv_indices_prefix"], kwargs["kv_indices_extend"]):
@@ -1818,15 +1816,14 @@ def check_fp8_split_auto_and_poisoned_workspace(heads, mode, valid_indices, spli
     ):
         kwargs["attn_sink"] = sink
         workspace.fill_(torch.nan)
-        out = _call_v41(
+        out = fused_v41(
             **kwargs,
             num_splits=splits,
             workspace=workspace,
-            debug_out=debug,
             max_logits=torch.empty_like(mx),
             lse=torch.empty_like(lse),
         )
-        assert torch.count_nonzero(debug) == 0
+        assert torch.count_nonzero(dequantize(*out[:2])) == 0
         assert torch.count_nonzero(dequantize(*out[:2])) == 0
         assert torch.isneginf(out[2]).all()
         assert torch.isposinf(out[3]).all()
@@ -1836,7 +1833,6 @@ def check_fp8_split_large_grid_replay(heads, mode, valid_indices, layout, splits
     kwargs, (expected, mx, lse) = two_source_inputs(
         heads, layout, mode, True, True, valid_indices
     )
-    # The single path must exercise the 32-head tile at both H64 and H128.
     original_tokens = kwargs["q"].shape[0]
     target_tokens = 128 // (heads // 64) if splits == 1 else original_tokens * 22
     repeats = (target_tokens + original_tokens - 1) // original_tokens
@@ -1848,8 +1844,8 @@ def check_fp8_split_large_grid_replay(heads, mode, valid_indices, layout, splits
             )
     kwargs["positions"] = kwargs["positions"].repeat(repeats)[:target_tokens]
     for source in ("prefix", "extend"):
-        pk, ik = "kv_indptr_" + source, "kv_indices_" + source
-        ptr, ids = kwargs[pk], kwargs[ik]
+        pk, ik = ("kv_indptr_" + source, "kv_indices_" + source)
+        ptr, ids = (kwargs[pk], kwargs[ik])
         count = int(ptr[-1])
         kwargs[ik] = ids[:count].repeat(repeats)
         kwargs[pk] = torch.cat(
@@ -1868,18 +1864,17 @@ def check_fp8_split_large_grid_replay(heads, mode, valid_indices, layout, splits
             if splits > 1
             else None
         ),
-        debug_out=torch.empty_like(expected),
         max_logits=torch.empty_like(mx),
         lse=torch.empty_like(lse),
     )
-    out = _call_v41(**kwargs)
+    out = fused_v41(**kwargs)
     kwargs["out"], kwargs["out_scale"] = out[:2]
-    torch.testing.assert_close(kwargs["debug_out"], expected, rtol=0.02, atol=0.008)
-    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
+    _check_output(dequantize(*out[:2]), expected)
+    torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _call_v41(**kwargs)
+        fused_v41(**kwargs)
     for empty in [False, True, False]:
         if empty:
             kwargs["kv_indices_prefix"].fill_(-1)
@@ -1890,7 +1885,7 @@ def check_fp8_split_large_grid_replay(heads, mode, valid_indices, layout, splits
         if empty:
             kwargs["kv_indptr_prefix"][1:-1].zero_()
             kwargs["kv_indptr_extend"][1:-1].zero_()
-        refs = tuple(x.clone() for x in _call_v41(**kwargs))
+        refs = tuple(x.clone() for x in fused_v41(**kwargs))
         for _ in range(4):
             if kwargs["workspace"] is not None:
                 kwargs["workspace"].fill_(torch.nan)
@@ -1944,32 +1939,26 @@ def _check_shared_kv_wave_boundary(
     padded[: ids.numel()] = ids
     kwargs["kv_indices_prefix"] = padded
     expected, mx, lse = [x.index_select(0, selected) for x in (expected, mx, lse)]
-    kwargs.update(
-        debug_out=torch.empty_like(expected),
-        max_logits=torch.empty_like(mx),
-        lse=torch.empty_like(lse),
-    )
+    kwargs.update(max_logits=torch.empty_like(mx), lse=torch.empty_like(lse))
     kwargs["num_splits"] = splits
     if splits > 1:
         count = tokens * splits * heads * 516
-        storage = torch.full((count + 8,), 0x5A5A5A5A, device="cuda", dtype=torch.int32)
+        storage = torch.full((count + 8,), 1515870810, device="cuda", dtype=torch.int32)
         kwargs["workspace"] = (
             storage[4:-4].view(torch.float32).reshape(tokens, splits, heads, 516)
         )
         kwargs["workspace"].fill_(torch.nan)
-    out = _call_v41(**kwargs)
-    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(kwargs["debug_out"], expected, rtol=0.02, atol=0.008)
-    assert float((kwargs["debug_out"] - expected).norm() / expected.norm()) < 0.005
+    out = fused_v41(**kwargs)
+    torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+    torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
+    _check_output(dequantize(*out[:2]), expected)
     assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
-    # Replay must overwrite every head, including after invalid and empty rows.
     kwargs["out"], kwargs["out_scale"] = out[:2]
-    outputs = (*out, kwargs["debug_out"])
+    outputs = (*out,)
     refs = tuple(x.clone() for x in outputs)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _call_v41(**kwargs)
+        fused_v41(**kwargs)
     for _ in range(2):
         for x in outputs:
             x.view(torch.uint8).fill_(255)
@@ -1978,21 +1967,19 @@ def _check_shared_kv_wave_boundary(
             torch.testing.assert_close(
                 x.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
             )
-
     if output_only:
         call = dict(kwargs)
-        for key in ("debug_out", "max_logits", "lse"):
+        for key in ("max_logits", "lse"):
             call.pop(key)
-        actual = _call_v41(**call)
+        actual = fused_v41(**call)
         assert actual[2:] == (None, None)
         assert (
             float((dequantize(*actual[:2]) - expected).norm() / expected.norm()) < 0.035
         )
-        # Compare replay against the same output-only kernel's eager result.
         refs = tuple(x.clone() for x in actual[:2])
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            _call_v41(**call)
+            fused_v41(**call)
         for _ in range(2):
             for x in actual[:2]:
                 x.view(torch.uint8).fill_(255)
@@ -2002,46 +1989,33 @@ def _check_shared_kv_wave_boundary(
                 torch.testing.assert_close(
                     x.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
                 )
-            assert bool((storage[:4] == 0x5A5A5A5A).all())
-            assert bool((storage[-4:] == 0x5A5A5A5A).all())
-
+            assert bool((storage[:4] == 1515870810).all())
+            assert bool((storage[-4:] == 1515870810).all())
     if exercise_common:
-        # With 32-bit positions, omitted diagnostic outputs must agree with the
-        # general route. Toggle each host guard while retaining identical inputs.
-        for variant in ("common", "positions64", "sinkless", "max", "debug", "no_lse"):
+        for variant in ("common", "positions64", "sinkless", "max", "no_lse"):
             call = dict(kwargs)
             call["max_logits"] = None
-            call["debug_out"] = None
             if variant == "positions64":
                 call["positions"] = call["positions"].long()
             elif variant == "sinkless":
                 call["attn_sink"] = None
             elif variant == "max":
                 call["max_logits"] = torch.empty_like(mx)
-            elif variant == "debug":
-                call["debug_out"] = torch.empty_like(expected)
             elif variant == "no_lse":
                 call["lse"] = None
             general = dict(
-                call,
-                debug_out=torch.empty_like(expected),
-                max_logits=torch.empty_like(mx),
-                lse=torch.empty_like(lse),
+                call, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
             )
-            reference = [x.clone() for x in _call_v41(**general)]
-            actual = _call_v41(**call)
+            reference = [x.clone() for x in fused_v41(**general)]
+            actual = fused_v41(**call)
             for value, ref in zip(actual, reference):
                 if value is not None:
                     torch.testing.assert_close(
                         value.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
                     )
-            if call["debug_out"] is not None:
-                torch.testing.assert_close(
-                    call["debug_out"], general["debug_out"], rtol=0, atol=0
-                )
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                _call_v41(**call)
+                fused_v41(**call)
             for value in actual:
                 if value is not None:
                     value.view(torch.uint8).fill_(255)
@@ -2089,7 +2063,7 @@ def check_h128_large_shared_kv_capacity(tokens, capacity, mode, layout, valid_in
 def check_native_split_integer_width_and_error_recovery(bad_splits):
     kwargs, _ = two_source_inputs(128, "padded", "raw")
     tokens, heads, _ = kwargs["q"].shape
-    outputs = _call_v41(
+    outputs = fused_v41(
         **kwargs,
         max_logits=torch.empty((tokens, heads), device="cuda"),
         lse=torch.empty((tokens, heads), device="cuda"),
@@ -2101,20 +2075,17 @@ def check_native_split_integer_width_and_error_recovery(bad_splits):
         out_scale=outputs[1],
         max_logits=outputs[2],
         lse=outputs[3],
-        debug_out=None,
         q_norm=False,
-        norm_eps=1e-6,
-        softmax_scale=512**-0.5,
+        norm_eps=1e-06,
+        softmax_scale=512 ** (-0.5),
     )
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        # Both values would become a valid split count if the FFI narrowed to int32.
         with _raises(RuntimeError, match="num_splits must be in"):
             fused_v41_fwd(**native, num_splits=bad_splits)
         for output in outputs:
             output.view(torch.uint8).fill_(255)
-        # Default split/workspace values and a fresh call must work after the error.
         fused_v41_fwd(**native)
     torch.cuda.current_stream().wait_stream(stream)
     for output, reference in zip(outputs, references):
@@ -2124,8 +2095,6 @@ def check_native_split_integer_width_and_error_recovery(bad_splits):
 
 
 def check_prefill_address_width(wide_view, rows, prepared, tokens, heads=64, topk=1024):
-    # Exercise unsigned offsets beyond 2 GiB and the fallback beyond 4 GiB.
-    # All four independently strided views must participate in the dispatch guard.
     row_stride = 2**30 + 4
     kwargs = {}
     for key in ("unified_kv", "unified_kv_scale", "kv", "kv_scale"):
@@ -2139,7 +2108,7 @@ def check_prefill_address_width(wide_view, rows, prepared, tokens, heads=64, top
             view = storage.as_strided((rows, width), (row_stride, 1))
         else:
             view = torch.empty(rows, width, device="cuda", dtype=torch.uint8)
-        view.fill_(127 if scale else 0x38)
+        view.fill_(127 if scale else 56)
         kwargs[key] = view.view(torch.float8_e8m0fnu if scale else torch.float8_e4m3fn)
     for source, count in (("prefix", topk), ("extend", 128)):
         kwargs[f"kv_indices_{source}"] = torch.full(
@@ -2162,18 +2131,15 @@ def check_prefill_address_width(wide_view, rows, prepared, tokens, heads=64, top
         cos=torch.ones(1, 32, device="cuda", dtype=torch.bfloat16),
         sin=torch.zeros(1, 32, device="cuda", dtype=torch.bfloat16),
         positions=torch.zeros(tokens, device="cuda", dtype=torch.int32),
-        debug_out=torch.empty_like(q, dtype=torch.float32),
     )
-    out = _call_v41(**kwargs)
-    torch.testing.assert_close(
-        kwargs["debug_out"], torch.ones_like(q, dtype=torch.float32), rtol=0, atol=0
-    )
+    out = fused_v41(**kwargs)
+    _check_output(dequantize(*out[:2]), torch.ones_like(q, dtype=torch.float32))
     torch.testing.assert_close(
         dequantize(*out[:2]), torch.ones_like(q, dtype=torch.float32), rtol=0, atol=0
     )
 
 
-def check_q_and_debug_16byte_storage_offsets(api, heads, q_norm):
+def check_q_16byte_storage_offset(api, heads, q_norm):
     if api == "two_source":
         kwargs, _ = two_source_inputs(
             heads, "padded", "norm" if q_norm else "raw", wide=True
@@ -2194,61 +2160,39 @@ def check_q_and_debug_16byte_storage_offsets(api, heads, q_norm):
             norm_eps=0.125,
         )
 
-    def run(query, debug, buffers=None):
-        call = dict(kwargs, debug_out=debug)
+    def run(query, buffers=None):
+        call = dict(kwargs)
         call.update(buffers or {})
         if api == "two_source":
             call["q"] = query
-            return _call_v41(**call)
-        return _call_legacy(query, *args[1:], **call)
+            return fused_v41(**call)
+        return fused_norm_rope_attn_rope_cast(query, *args[1:], **call)
 
-    aligned_debug = torch.empty_like(q, dtype=torch.float32)
-    expected = tuple(x.clone() for x in run(q, aligned_debug))
-    expected_debug = aligned_debug.clone()
-    for shifted in ("q", "debug", "both"):
-        query = q
-        debug = torch.empty_like(aligned_debug)
-        guards = []
-        for name, original, offset in (("q", q, 8), ("debug", aligned_debug, 4)):
-            if shifted not in (name, "both"):
-                continue
-            storage = torch.full(
-                (original.numel() + 2 * offset,),
-                3.0,
-                device=original.device,
-                dtype=original.dtype,
+    expected = tuple(x.clone() for x in run(q))
+    storage = torch.full((q.numel() + 16,), 3.0, device=q.device, dtype=q.dtype)
+    query = storage[8:-8].view_as(q).copy_(q)
+    assert query.is_contiguous() and query.data_ptr() % 32 == 16
+    actual = run(query)
+    buffers = dict(zip(("out", "out_scale", "max_logits", "lse"), actual))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(query, buffers)
+    for replay in (False, True):
+        if replay:
+            for value in actual:
+                value.view(torch.uint8).fill_(255)
+            graph.replay()
+        for value, ref in zip(actual, expected):
+            torch.testing.assert_close(
+                value.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
             )
-            view = storage[offset:-offset].view_as(original)
-            assert view.is_contiguous() and view.data_ptr() % 32 == 16
-            guards.append((storage, offset))
-            if name == "q":
-                query = view.copy_(q)
-            else:
-                debug = view
-        actual = run(query, debug)
-        buffers = dict(zip(("out", "out_scale", "max_logits", "lse"), actual))
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run(query, debug, buffers)
-        for replay in (False, True):
-            if replay:
-                for x in (*actual, debug):
-                    x.view(torch.uint8).fill_(255)
-                graph.replay()
-            for value, ref in zip((*actual, debug), (*expected, expected_debug)):
-                torch.testing.assert_close(
-                    value.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
-                )
-            for storage, offset in guards:
-                assert torch.all(storage[:offset] == 3)
-                assert torch.all(storage[-offset:] == 3)
-            torch.testing.assert_close(query, q, rtol=0, atol=0)
+        assert torch.all(storage[:8] == 3) and torch.all(storage[-8:] == 3)
+        torch.testing.assert_close(query, q, rtol=0, atol=0)
 
 
 def check_softmax_scale_base2_range_and_error_recovery(api, direct):
     args = simple_inputs(tokens=1, heads=64)
     q, pool, _ids, ptr, cos, sin, pos = args
-    debug = torch.empty_like(q, dtype=torch.float32)
     if api == "two_source":
         kwargs = {
             "q": q,
@@ -2267,42 +2211,40 @@ def check_softmax_scale_base2_range_and_error_recovery(api, direct):
             "positions": pos,
             "q_is_rotated": True,
             "q_norm": False,
-            "norm_eps": 1e-6,
-            "debug_out": debug,
+            "norm_eps": 1e-06,
             "max_logits": torch.empty(q.shape[:2], device=q.device),
             "lse": torch.empty(q.shape[:2], device=q.device),
         }
-        out = _call_v41(**kwargs)
+        out = fused_v41(**kwargs)
         kwargs.update(out=out[0], out_scale=out[1])
 
         def run(scale):
             if direct:
                 fused_v41_fwd(**kwargs, softmax_scale=scale)
             else:
-                _call_v41(**kwargs, softmax_scale=scale)
+                fused_v41(**kwargs, softmax_scale=scale)
 
     else:
-        out = _call_legacy(*args, debug_out=debug)
+        out = fused_norm_rope_attn_rope_cast(*args)
         buffers = dict(zip(("out", "out_scale", "max_logits", "lse"), out))
 
         def run(scale):
             if direct:
                 fused_norm_rope_attn_rope_cast_fwd(
-                    *args, *out, None, None, None, None, debug, scale, True
+                    *args, *out, None, None, None, None, scale, True
                 )
             else:
-                _call_legacy(*args, **buffers, debug_out=debug, softmax_scale=scale)
+                fused_norm_rope_attn_rope_cast(*args, **buffers, softmax_scale=scale)
 
-    # 2e38 remains finite in base-2 units; zero Q must retain zero logits.
     run(2e38)
-    torch.testing.assert_close(debug, torch.ones_like(debug), rtol=0, atol=0)
+    _check_output(dequantize(*out[:2]), torch.ones_like(dequantize(*out[:2])))
     torch.testing.assert_close(out[2], torch.zeros_like(out[2]), rtol=0, atol=0)
     torch.testing.assert_close(out[3], torch.zeros_like(out[3]), rtol=0, atol=0)
     for scale in (3e38, torch.finfo(torch.float32).max):
         with _raises(RuntimeError, match="softmax_scale.*base-2"):
             run(scale)
         run(2e38)
-        torch.testing.assert_close(debug, torch.ones_like(debug), rtol=0, atol=0)
+        _check_output(dequantize(*out[:2]), torch.ones_like(dequantize(*out[:2])))
 
 
 def check_public_api_has_no_debug_output(api):
@@ -2320,6 +2262,13 @@ def check_public_api_has_no_debug_output(api):
     else:
         fn, positional, kwargs = fused_norm_rope_attn_rope_cast, args, {}
     assert "debug_out" not in inspect.signature(fn).parameters
+    import importlib
+
+    module = importlib.import_module("aiter.ops.fused_norm_rope_attn_rope_cast")
+    for entry in (fused_v41_fwd, fused_norm_rope_attn_rope_cast_fwd):
+        assert "debug_out" not in inspect.signature(entry).parameters
+    assert not hasattr(module, "_fused_norm_rope_attn_rope_cast_with_debug")
+    assert not hasattr(module, "_fused_norm_rope_attn_rope_cast_legacy_with_debug")
     with _raises(TypeError, match="debug_out"):
         fn(*positional, **kwargs, debug_out=debug)
     assert not hasattr(aiter, "fused_norm_rope_attn_rope_cast_fwd")
@@ -2493,7 +2442,7 @@ def test_fused_norm_rope_attn_rope_cast(
     )
     args["num_splits"] = splits
     # Model output is [T,H/8,4096] FP8 plus row-layout group32 scales. Allocate
-    # both before timing. Optional LSE/max/debug outputs are not model outputs.
+    # both before timing. Optional LSE/max outputs are not model outputs.
     args["out"] = torch.empty(
         batch, heads // 8, 4096, device="cuda", dtype=torch.float8_e4m3fn
     )
@@ -2557,47 +2506,6 @@ def test_fused_norm_rope_attn_rope_cast(
         )
         assert err == 0, f"{name}: output exceeds reference tolerance"
         assert float((actual - ref).norm() / ref.norm().clamp_min(1e-30)) < 0.035
-        # Attention rounding can cross an E8M0 boundary relative to the dense
-        # oracle. Check scales exactly against torch quantization of the kernel's
-        # pre-quant output, obtained in a separate, untimed diagnostic call.
-        debug = torch.empty_like(ref)
-        checked = _call_v41(**args, debug_out=debug)
-        debug_err = checkAllclose(
-            ref,
-            debug,
-            rtol=0.02,
-            atol=0.008,
-            tol_err_ratio=0,
-            msg=f"{name}: pre-quant output",
-        )
-        assert debug_err == 0
-        assert float((debug - ref).norm() / ref.norm().clamp_min(1e-30)) < 0.005
-        groups = debug.reshape(-1, 16, 32)
-        # frexp preserves the FP32 boundary: log2 can round a scale just above
-        # 2**n to n and incorrectly select the smaller E8M0 scale.
-        mantissa, exponent = torch.frexp(groups.abs().amax(-1).clamp_min(1e-8) / 448)
-        exponent = exponent - (mantissa == 0.5).int()
-        scales = (exponent + 127).to(torch.uint8)
-        values = (groups * torch.exp2(-exponent.float())[..., None]).to(
-            torch.float8_e4m3fn
-        )
-        scale_err = checkAllclose(
-            scales.reshape_as(checked[1]).to(dtypes.fp32),
-            checked[1].view(torch.uint8).to(dtypes.fp32),
-            rtol=0,
-            atol=0,
-            tol_err_ratio=0,
-            msg=f"{name}: scale bytes",
-        )
-        quant_err = checkAllclose(
-            values.reshape_as(checked[0]).to(dtypes.fp32),
-            checked[0].to(dtypes.fp32),
-            rtol=0,
-            atol=0,
-            tol_err_ratio=0,
-            msg=f"{name}: FP8 quantization",
-        )
-        assert scale_err == quant_err == 0
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -2606,7 +2514,7 @@ def test_fused_norm_rope_attn_rope_cast(
 
 
 def check_norm_subnormal_products(api, heads, tokens, splits, capacity):
-    q_value, epsilon = 2.0**-64, 2.0**-126
+    q_value, epsilon = (2.0 ** (-64), 2.0 ** (-126))
     scalar = torch.tensor(q_value, dtype=torch.float32, device="cpu")
     normalized = float((scalar * torch.rsqrt(scalar.square() + epsilon)).bfloat16())
     assert normalized == 0.447265625
@@ -2646,10 +2554,8 @@ def check_norm_subnormal_products(api, heads, tokens, splits, capacity):
             "q_is_rotated": False,
         }
 
-        def run(query, norm, debug):
-            return _call_v41(
-                q=query, **kwargs, q_norm=norm, norm_eps=epsilon, debug_out=debug
-            )
+        def run(query, norm):
+            return fused_v41(q=query, **kwargs, q_norm=norm, norm_eps=epsilon)
 
     else:
         ids = torch.arange(3, device="cuda", dtype=torch.int32).repeat(tokens)
@@ -2658,8 +2564,8 @@ def check_norm_subnormal_products(api, heads, tokens, splits, capacity):
             ids = ids.long() * 1056 + 1
         ptr = torch.arange(tokens + 1, device="cuda", dtype=torch.int32) * 3
 
-        def run(query, norm, debug):
-            return _call_legacy(
+        def run(query, norm):
+            return fused_norm_rope_attn_rope_cast(
                 query,
                 pool,
                 ids,
@@ -2671,14 +2577,10 @@ def check_norm_subnormal_products(api, heads, tokens, splits, capacity):
                 norm_eps=epsilon,
                 q_is_rotated=False,
                 softmax_scale=1 / 512,
-                debug_out=debug,
             )
 
-    actual = torch.empty_like(q, dtype=torch.float32)
-    expected = torch.empty_like(actual)
-    result = run(q, True, actual)
-    reference = run(torch.full_like(q, normalized), False, expected)
-    torch.testing.assert_close(actual, expected, rtol=0.001, atol=0.001)
+    result = run(q, True)
+    reference = run(torch.full_like(q, normalized), False)
     torch.testing.assert_close(
         dequantize(*result[:2]), dequantize(*reference[:2]), rtol=0, atol=0
     )
@@ -2693,7 +2595,7 @@ def check_csr_capacity_limit(api, source):
 
         def run(indices):
             kwargs[key] = indices
-            return _call_v41(**kwargs)
+            return fused_v41(**kwargs)
 
     else:
         args = simple_inputs()
@@ -2714,7 +2616,7 @@ def check_csr_capacity_limit(api, source):
                 args[2] = indices
             else:
                 kwargs["extend"] = indices
-            return _call_legacy(*args, **kwargs)
+            return fused_norm_rope_attn_rope_cast(*args, **kwargs)
 
     for capacity in (limit + 1, 2**31 - 1):
         with _raises(RuntimeError, match="CSR capacity exceeds"):
@@ -2731,27 +2633,23 @@ def check_split_optional_statistics(heads, mode, splits, valid_indices):
     tokens = kwargs["q"].shape[0]
     workspace = torch.empty(tokens, splits, heads, 516, device="cuda")
     kwargs.update(num_splits=splits, workspace=workspace)
-    for option in ("output", "max_logits", "lse", "debug_out"):
+    for option in ("output", "max_logits", "lse"):
         call = dict(kwargs)
         if option != "output":
-            call[option] = torch.empty_like(expected if option == "debug_out" else mx)
-        actual = _call_v41(**call)
+            call[option] = torch.empty_like(mx)
+        actual = fused_v41(**call)
         error = (dequantize(*actual[:2]) - expected).norm() / expected.norm()
         assert float(error) < 0.035
         if option == "max_logits":
             torch.testing.assert_close(actual[2], mx, rtol=1e-4, atol=3e-5)
         elif option == "lse":
             torch.testing.assert_close(actual[3], lse, rtol=1e-4, atol=3e-5)
-        elif option == "debug_out":
-            torch.testing.assert_close(call[option], expected, rtol=0.02, atol=0.008)
         call.update(out=actual[0], out_scale=actual[1])
         outputs = [x for x in actual if x is not None]
-        if option == "debug_out":
-            outputs.append(call[option])
         references = [x.clone() for x in outputs]
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            _call_v41(**call)
+            fused_v41(**call)
         for _ in range(2):
             for x in [workspace, *outputs]:
                 x.view(torch.uint8).fill_(255)
@@ -2778,7 +2676,7 @@ def check_decode_small_grid_output(heads, mode, splits, valid_indices):
         else None
     )
     kwargs.update(num_splits=splits, workspace=workspace)
-    actual = _call_v41(**kwargs)
+    actual = fused_v41(**kwargs)
     error = (dequantize(*actual[:2]) - expected).norm() / expected.norm().clamp_min(
         1e-30
     )
@@ -2787,7 +2685,7 @@ def check_decode_small_grid_output(heads, mode, splits, valid_indices):
     refs = [x.clone() for x in actual[:2]]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _call_v41(**kwargs)
+        fused_v41(**kwargs)
     for _ in range(3):
         for x in actual[:2]:
             x.view(torch.uint8).fill_(255)
@@ -2856,7 +2754,7 @@ def check_small_head_split_storage(heads, mode, splits):
     def buffer(shape, dtype, offset):
         count = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
         storage = torch.full(
-            (offset + count + 16,), 0x5A, device="cuda", dtype=torch.uint8
+            (offset + count + 16,), 90, device="cuda", dtype=torch.uint8
         )
         guards.append((storage, offset, count))
         return storage[offset : offset + count].view(dtype).reshape(shape)
@@ -2870,7 +2768,6 @@ def check_small_head_split_storage(heads, mode, splits):
         num_splits=splits,
         out=buffer((t, heads // 8, 4096), torch.float8_e4m3fn, 16),
         out_scale=buffer((t, heads // 8, 128), torch.float8_e8m0fnu, 1),
-        debug_out=buffer((t, heads, 512), torch.float32, 16),
         max_logits=buffer((t, heads), torch.float32, 4),
         lse=buffer((t, heads), torch.float32, 4),
     )
@@ -2879,26 +2776,33 @@ def check_small_head_split_storage(heads, mode, splits):
         kwargs["workspace"].fill_(torch.nan)
     for auxiliary in (True, False):
         if not auxiliary:
-            for name in ("debug_out", "max_logits", "lse"):
+            for name in ("max_logits", "lse"):
                 kwargs.pop(name)
         if splits > 1:
             kwargs["workspace"].fill_(torch.nan)
-        out = _call_v41(**kwargs)
+        out = fused_v41(**kwargs)
         if auxiliary:
-            torch.testing.assert_close(
-                kwargs["debug_out"], expected, rtol=0.02, atol=0.008
-            )
-            torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
-            torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
+            _check_output(dequantize(*out[:2]), expected)
+            torch.testing.assert_close(out[2], mx, rtol=0.0001, atol=3e-05)
+            torch.testing.assert_close(out[3], lse, rtol=0.0001, atol=3e-05)
         assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
         for storage, offset, count in guards:
-            assert bool((storage[:offset] == 0x5A).all())
-            assert bool((storage[offset + count :] == 0x5A).all())
+            assert bool((storage[:offset] == 90).all())
+            assert bool((storage[offset + count :] == 90).all())
 
 
 def run_contract_checks():
     """Run every correctness case during the same direct invocation used by CI."""
     checks = [
+        (
+            check_output_quantization,
+            [
+                ("heads", [16, 32, 64, 128]),
+                ("tokens", [4, 128, 256]),
+                ("splits", [1, 2, 7]),
+                ("raw", [False, True]),
+            ],
+        ),
         (
             check_fp8_explicit_workspace,
             [
@@ -3427,7 +3331,7 @@ def run_contract_checks():
             ],
         ),
         (
-            check_q_and_debug_16byte_storage_offsets,
+            check_q_16byte_storage_offset,
             [
                 ("q_norm", [False, True]),
                 ("heads", [64, 128]),

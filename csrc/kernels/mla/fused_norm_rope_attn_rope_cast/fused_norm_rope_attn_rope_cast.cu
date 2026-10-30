@@ -173,7 +173,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_legacy_fwd,
                                      const aiter_tensor_t* extend,
                                      const aiter_tensor_t* extend_indptr,
                                      const aiter_tensor_t* attn_sink,
-                                     const aiter_tensor_t* debug_out,
                                      float softmax_scale,
                                      int q_is_rotated,
                                      int fp8_qk,
@@ -196,7 +195,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_legacy_fwd,
                                      extend,
                                      extend_indptr,
                                      attn_sink,
-                                     debug_out,
                                      softmax_scale,
                                      q_is_rotated,
                                      fp8_qk,
@@ -266,8 +264,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_legacy_fwd,
     check_tensor(lse, "lse", AITER_DTYPE_fp32, {t, h}, device, 4);
     if(attn_sink)
         check_tensor(attn_sink, "attn_sink", AITER_DTYPE_fp32, {h}, device, 4);
-    if(debug_out)
-        check_tensor(debug_out, "debug_out", AITER_DTYPE_fp32, {t, h, 512}, device, 16);
     int erows = 0, ecap = 0;
     AITER_CHECK(bool(extend_kv) == bool(extend) && bool(extend_kv) == bool(extend_indptr),
                 "extend_kv, extend and extend_indptr must be provided together");
@@ -306,7 +302,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_legacy_fwd,
         a.extend_indptr = static_cast<const int*>(extend_indptr->data_ptr());
     }
     a.sink            = attn_sink ? static_cast<const float*>(attn_sink->data_ptr()) : nullptr;
-    a.debug_out       = debug_out ? static_cast<float*>(debug_out->data_ptr()) : nullptr;
+    a.debug_out       = nullptr;
     a.out             = static_cast<uint8_t*>(out->data_ptr());
     a.scales          = static_cast<uint8_t*>(out_scale->data_ptr());
     a.max_logits      = static_cast<float*>(max_logits->data_ptr());
@@ -347,7 +343,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
                                      const aiter_tensor_t* out_scale,
                                      const aiter_tensor_t* max_logits,
                                      const aiter_tensor_t* lse,
-                                     const aiter_tensor_t* debug_out,
                                      int q_is_rotated,
                                      int q_norm,
                                      float norm_eps,
@@ -373,7 +368,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
                                      out_scale,
                                      max_logits,
                                      lse,
-                                     debug_out,
                                      q_is_rotated,
                                      q_norm,
                                      norm_eps,
@@ -449,14 +443,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
         check_tensor(lse, "lse", AITER_DTYPE_fp32, {t, h}, device, 4);
     if(attn_sink)
         check_tensor(attn_sink, "attn_sink", AITER_DTYPE_fp32, {h}, device, 4);
-    if(debug_out)
-        check_tensor(debug_out, "debug_out", AITER_DTYPE_fp32, {t, h, 512}, device, 16);
     AITER_CHECK(num_splits >= 1 && num_splits <= 32, "num_splits must be in [1,32]");
     AITER_CHECK(bool(workspace) == (num_splits > 1),
                 "split decode requires workspace, single split must omit it");
     if(workspace)
         check_tensor(workspace, "workspace", AITER_DTYPE_fp32, {t, num_splits, h, 516}, device, 16);
-    const aiter_tensor_t* outputs[] = {workspace, out, out_scale, max_logits, lse, debug_out};
+    const aiter_tensor_t* outputs[] = {workspace, out, out_scale, max_logits, lse};
     const aiter_tensor_t* inputs[]  = {q,
                                        q_scale,
                                        unified_kv,
@@ -471,7 +463,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
                                        sin,
                                        positions,
                                        attn_sink};
-    for(size_t i = 0; i < 6; ++i)
+    for(size_t i = 0; i < 5; ++i)
     {
         for(const auto* input : inputs)
             AITER_CHECK(!overlaps(outputs[i], input), "outputs must not overlap inputs");
@@ -517,7 +509,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_fused_norm_rope_attn_rope_cast_fwd,
     a.scales        = static_cast<uint8_t*>(out_scale->data_ptr());
     a.max_logits    = max_logits ? static_cast<float*>(max_logits->data_ptr()) : nullptr;
     a.lse           = lse ? static_cast<float*>(lse->data_ptr()) : nullptr;
-    a.debug_out     = debug_out ? static_cast<float*>(debug_out->data_ptr()) : nullptr;
+    a.debug_out     = nullptr;
     a.sink          = attn_sink ? static_cast<const float*>(attn_sink->data_ptr()) : nullptr;
     a.tokens        = t;
     a.heads         = h;

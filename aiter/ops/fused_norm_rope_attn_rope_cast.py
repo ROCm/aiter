@@ -40,7 +40,6 @@ def _fused_norm_rope_attn_rope_cast_legacy_fwd(
     extend: torch.Tensor | None,
     extend_indptr: torch.Tensor | None,
     attn_sink: torch.Tensor | None,
-    debug_out: torch.Tensor | None,
     softmax_scale: float,
     q_is_rotated: bool,
     fp8_qk: bool = False,
@@ -129,57 +128,6 @@ def fused_norm_rope_attn_rope_cast_legacy(
     another. Warm up before graph capture and reuse preallocated outputs.
     This entry does not allocate a rearrangement or intermediate KV tensor.
     """
-    return _fused_norm_rope_attn_rope_cast_legacy_with_debug(
-        q=q,
-        pool=pool,
-        prefix=prefix,
-        prefix_indptr=prefix_indptr,
-        cos=cos,
-        sin=sin,
-        positions=positions,
-        extend_kv=extend_kv,
-        extend=extend,
-        extend_indptr=extend_indptr,
-        attn_sink=attn_sink,
-        softmax_scale=softmax_scale,
-        q_is_rotated=q_is_rotated,
-        out=out,
-        out_scale=out_scale,
-        max_logits=max_logits,
-        lse=lse,
-        fp8_qk=fp8_qk,
-        q_scale=q_scale,
-        q_norm=q_norm,
-        norm_eps=norm_eps,
-    )
-
-
-def _fused_norm_rope_attn_rope_cast_legacy_with_debug(
-    q: torch.Tensor,
-    pool: torch.Tensor,
-    prefix: torch.Tensor,
-    prefix_indptr: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    extend_kv: torch.Tensor | None = None,
-    extend: torch.Tensor | None = None,
-    extend_indptr: torch.Tensor | None = None,
-    attn_sink: torch.Tensor | None = None,
-    softmax_scale: float | None = None,
-    q_is_rotated: bool = True,
-    out: torch.Tensor | None = None,
-    out_scale: torch.Tensor | None = None,
-    max_logits: torch.Tensor | None = None,
-    lse: torch.Tensor | None = None,
-    debug_out: torch.Tensor | None = None,
-    fp8_qk: bool = False,
-    q_scale: torch.Tensor | None = None,
-    q_norm: bool = False,
-    norm_eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Internal test entry with an optional pre-quantization FP32 output."""
     if not isinstance(q, torch.Tensor) or q.device.type != "cuda" or q.ndim != 3:
         raise ValueError("q must be a GPU tensor [T,H,512]")
     t, h, d = q.shape
@@ -228,7 +176,6 @@ def _fused_norm_rope_attn_rope_cast_legacy_with_debug(
         extend,
         extend_indptr,
         attn_sink,
-        debug_out,
         scale,
         q_is_rotated,
         fp8_qk,
@@ -287,7 +234,6 @@ def _fused_norm_rope_attn_rope_cast_fwd(
     out_scale: torch.Tensor,
     max_logits: torch.Tensor | None,
     lse: torch.Tensor | None,
-    debug_out: torch.Tensor | None,
     q_is_rotated: bool,
     q_norm: bool,
     norm_eps: float,
@@ -388,65 +334,6 @@ def fused_norm_rope_attn_rope_cast(
     The previous pool/tagged-address interface is available explicitly as
     :func:`fused_norm_rope_attn_rope_cast_legacy`.
     """
-    return _fused_norm_rope_attn_rope_cast_with_debug(
-        q=q,
-        q_scale=q_scale,
-        unified_kv=unified_kv,
-        unified_kv_scale=unified_kv_scale,
-        kv_indices_prefix=kv_indices_prefix,
-        kv_indptr_prefix=kv_indptr_prefix,
-        kv=kv,
-        kv_scale=kv_scale,
-        kv_indices_extend=kv_indices_extend,
-        kv_indptr_extend=kv_indptr_extend,
-        attn_sink=attn_sink,
-        softmax_scale=softmax_scale,
-        out=out,
-        lse=lse,
-        backend=backend,
-        cos=cos,
-        sin=sin,
-        positions=positions,
-        out_scale=out_scale,
-        max_logits=max_logits,
-        q_is_rotated=q_is_rotated,
-        q_norm=q_norm,
-        norm_eps=norm_eps,
-        num_splits=num_splits,
-        workspace=workspace,
-    )
-
-
-def _fused_norm_rope_attn_rope_cast_with_debug(
-    q: torch.Tensor,
-    q_scale: torch.Tensor | None,
-    unified_kv: torch.Tensor,
-    unified_kv_scale: torch.Tensor,
-    kv_indices_prefix: torch.Tensor,
-    kv_indptr_prefix: torch.Tensor,
-    kv: torch.Tensor | None = None,
-    kv_scale: torch.Tensor | None = None,
-    kv_indices_extend: torch.Tensor | None = None,
-    kv_indptr_extend: torch.Tensor | None = None,
-    attn_sink: torch.Tensor | None = None,
-    softmax_scale: float = 512**-0.5,
-    out: torch.Tensor | None = None,
-    lse: torch.Tensor | None = None,
-    backend: str | None = None,
-    *,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    positions: torch.Tensor,
-    out_scale: torch.Tensor | None = None,
-    max_logits: torch.Tensor | None = None,
-    debug_out: torch.Tensor | None = None,
-    q_is_rotated: bool = True,
-    q_norm: bool = False,
-    norm_eps: float = 1e-6,
-    num_splits: int = 0,
-    workspace: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """Internal test entry with an optional pre-quantization FP32 output."""
     if backend not in (None, "opus"):
         raise ValueError("backend must be None or 'opus'")
     if not isinstance(q, torch.Tensor) or q.ndim != 3 or q.device.type != "cuda":
@@ -535,7 +422,6 @@ def _fused_norm_rope_attn_rope_cast_with_debug(
         out_scale,
         max_logits,
         lse,
-        debug_out,
         q_is_rotated,
         q_norm,
         float(norm_eps),
