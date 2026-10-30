@@ -27,11 +27,7 @@ def pa_decode_mxfp4(
     # keyword argument".
     for name, why in (
         ("tile_depth", "the tile is fixed by the shared pa_decode kernel"),
-        (
-            "direct_output",
-            "a task that is the whole row writes it directly (work_plan=None or a "
-            "plan with max_partitions 1)",
-        ),
+        ("direct_output", "a one-task row writes its output directly by itself"),
     ):
         if name in kwargs:
             raise NotImplementedError(f"pa_decode_mxfp4 no longer takes {name}: {why}")
