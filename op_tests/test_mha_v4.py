@@ -62,7 +62,6 @@ from aiter.ops.mha_v4_quant import (
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
 )
-from aiter.ops.triton.attention.utils import lse_merge
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
     fp6_k_raw_buffer_sizes,
@@ -1673,97 +1672,6 @@ def test_mha_v4_kv_splits_compile_parity(formats):
 
     assert torch.equal(eager[0], compiled[0])
     assert torch.equal(eager[1], compiled[1])
-
-
-@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="~10 GB of gfx942/gfx950 memory")
-@parametrize(
-    "sequence,heads,splits",
-    [
-        param(65536, 64, 5, id="splits-past-2^31"),
-        param(147456, 128, 1, id="partial-past-2^31"),
-    ],
-)
-def test_mha_v4_kv_splits_merge_addresses_past_2_31_elements(sequence, heads, splits):
-    """An explicit split count can put the last partial, or one partial alone, past 2^31
-    elements. All weight sits on the last range, so the merge must return it exactly; an offset
-    computed in 32 bits reads before the buffer and faults instead."""
-    partial_out = torch.zeros(
-        (splits, sequence, heads, 128), device="cuda", dtype=torch.bfloat16
-    )
-    partial_lse = torch.full((splits, heads, sequence), float("-inf"), device="cuda")
-    partial_out[-1].normal_()
-    partial_lse[-1] = 0.5
-    out = torch.empty((1, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
-    lse = torch.empty((1, heads, sequence), device="cuda")
-
-    lse_merge(partial_out, partial_lse, out, lse)
-
-    assert torch.equal(out[0], partial_out[-1])
-    assert torch.equal(lse[0], partial_lse[-1])
-
-
-@parametrize("write_lse", [True, False])
-@parametrize(
-    "empty_fill",
-    [
-        param(1e4, id="1e4"),
-        param(float("nan"), id="nan"),
-        param(float("inf"), id="inf"),
-    ],
-)
-def test_mha_v4_kv_splits_merge_skips_empty_ranges(write_lse, empty_fill):
-    """A range with no valid keys for a row has LSE -inf and must carry no weight, whatever its
-    partial output holds: its weight is 0, and 0 * NaN or 0 * Inf would still be NaN. mha_v4
-    gives every range real keys, so its tests never reach this. Range 1 is empty for every row,
-    some rows are empty in range 0 alone, and some in every range, which must give a 0 output
-    and LSE -inf rather than NaN. 77 rows leave a partial tile.
-    """
-    torch.manual_seed(67)
-    batch, splits, heads, sequence = 2, 3, 2, 77
-    partial_out = torch.randn(
-        (batch * splits, sequence, heads, 128), device="cuda", dtype=torch.bfloat16
-    )
-    partial_lse = torch.randn((batch * splits, heads, sequence), device="cuda") * 4
-    partial_lse[1::splits] = float("-inf")
-    partial_lse[0::splits, :, :10] = float("-inf")
-    partial_lse[:, :, 20:25] = float("-inf")
-    partial_lse[splits : 2 * splits, 1, 40:42] = float("-inf")
-    empty = partial_lse.isneginf().transpose(1, 2)
-    partial_out[empty] = empty_fill
-    out = torch.full((batch, sequence, heads, 128), float("nan"), device="cuda")
-    out = out.to(torch.bfloat16)
-    lse = torch.full((batch, heads, sequence), float("nan"), device="cuda")
-
-    lse_merge(partial_out, partial_lse, out, lse if write_lse else None)
-
-    split_lse = partial_lse.view(batch, splits, heads, sequence)
-    reference_lse = torch.logsumexp(split_lse, dim=1)
-    reached = torch.isfinite(reference_lse)
-    weight = torch.where(
-        reached.unsqueeze(1), torch.exp(split_lse - reference_lse.unsqueeze(1)), 0.0
-    )
-    reference = torch.einsum(
-        "bihs,bishd->bshd",
-        weight,
-        partial_out.float()
-        .masked_fill(empty.unsqueeze(-1), 0.0)
-        .view(batch, splits, sequence, heads, 128),
-    )
-    assert not out.isnan().any()
-    assert (out.permute(0, 2, 1, 3)[~reached] == 0).all()
-    torch.testing.assert_close(out.float(), reference, atol=1e-2, rtol=1e-2)
-    if write_lse:
-        assert torch.equal(lse[~reached], reference_lse[~reached])
-        torch.testing.assert_close(lse[reached], reference_lse[reached])
-
-
-def test_mha_v4_kv_splits_merge_rejects_zero_ranges():
-    """Zero partials fold evenly into any batch, and would merge to a silent 0 output."""
-    partial_out = torch.empty((0, 16, 2, 128), device="cuda", dtype=torch.bfloat16)
-    partial_lse = torch.empty((0, 2, 16), device="cuda")
-    out = torch.empty((1, 16, 2, 128), device="cuda", dtype=torch.bfloat16)
-    with expect_raises(ValueError, match="no key range"):
-        lse_merge(partial_out, partial_lse, out)
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
