@@ -20,3 +20,12 @@ def torch_silu_and_mul_ref(input):
     output = silu_A * B
 
     return output.to(dtype)
+
+
+def can_overflow_int32(tensor: torch.Tensor):
+    """True when the tensor's largest linear offset does not fit in int32."""
+    max_int32 = (1 << 31) - 1
+    offset = 0
+    for i in range(tensor.ndim):
+        offset += (tensor.shape[i] - 1) * tensor.stride(i)
+    return offset > max_int32
