@@ -266,8 +266,16 @@ def _build_attn_res(
     num_sources = num_blocks + 1
     write_block = block_write_idx >= 0
     prefetch_in_flight = min(_SOURCE_PREFETCH_IN_FLIGHT, max(num_blocks - 1, 0))
-    # One-wave rows have no cross-wave barrier to collapse.
-    group_size = _SOURCE_GROUP_SIZE if red_slots > 1 else 1
+    # One-wave rows have no cross-wave barrier to collapse. Mix-only rows put
+    # every source behind one barrier; with delta, snapshot, or output norm
+    # that is slower at large T, so those keep _SOURCE_GROUP_SIZE.
+    mix_only = not (has_delta or write_block or apply_output_norm)
+    if red_slots == 1:
+        group_size = 1
+    elif mix_only:
+        group_size = num_sources
+    else:
+        group_size = _SOURCE_GROUP_SIZE
     num_groups = (num_sources + group_size - 1) // group_size
     if _WAVE_REDUCE_MODE == "auto":
         # One-wave rows reduce through the one-lane cascade and never reach
