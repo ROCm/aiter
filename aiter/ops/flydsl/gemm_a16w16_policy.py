@@ -33,6 +33,9 @@ class GemmConfigPruner:
     target_waves_per_cu: int = 8
     max_split_grid_rounds: int = 2
     max_tile_grid_ratio: int = 4
+    # The kernel gives each split whole K tiles (the last split the remainder),
+    # so split_k adds no K padding.
+    whole_tile_splits: bool = False
 
     @staticmethod
     def _ceil_div(value, divisor):
@@ -47,6 +50,8 @@ class GemmConfigPruner:
         split_k = config["split_k"]
         padded_m = self._ceil_div(self.m, config["block_m"]) * config["block_m"]
         padded_n = self._ceil_div(self.n, config["block_n"]) * config["block_n"]
+        if self.whole_tile_splits:
+            split_k = 1
         part_k = self.k // split_k
         padded_k = (
             self._ceil_div(part_k, config["block_k"]) * config["block_k"] * split_k
@@ -61,10 +66,12 @@ class GemmConfigPruner:
             * (config["block_m"] + config["block_n"])
             * config["block_k"]
             * self.element_bytes,
-            config["k_waves"]
-            * config["block_m"]
-            * config["block_n"]
-            * self.element_bytes,
+            # slice-K exchanges fp32 tiles
+            (
+                config["k_waves"] * config["block_m"] * config["block_n"] * 4
+                if config["k_waves"] > 1
+                else 0
+            ),
         )
         # A workgroup may occupy the whole per-CU LDS here, so the capacity the
         # chip table reports per workgroup is also the per-CU figure.
@@ -217,8 +224,8 @@ def get_flydsl_a16w16_configs(
     if get_gfx() != "gfx950":
         return []
 
-    split_k_candidates = [1]
-    split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
+    # Past 16, only the counts that the smallest shapes use.
+    split_k_candidates = list(range(1, 17)) + [20, 24, 28, 32]
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
@@ -227,7 +234,7 @@ def get_flydsl_a16w16_configs(
         "split_k": split_k_candidates,
         "m_waves": [1, 2, 4],
         "n_waves": [1, 2, 4],
-        "k_waves": [1, 2],
+        "k_waves": [1, 2, 4, 8],
         "group_m": [0, 4],
         "use_half_tile_interleaved": [False, True],
     }
@@ -242,6 +249,8 @@ def get_flydsl_a16w16_configs(
         k,
         device_props,
         2,
+        max_split_grid_rounds=3,
+        whole_tile_splits=True,
     ).prune(configs)
 
     in_dtype_id = (
