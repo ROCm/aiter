@@ -1036,6 +1036,7 @@ def test_triton_unified_attn(
             shuffled_kv_cache=shuffled_kv_cache,
             block_size=block_size,
             k_width=16 // kv_dtype.itemsize,
+            causal=True,
         ),
         backend,
     )
@@ -1144,6 +1145,178 @@ def test_triton_unified_attn(
         (
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
+        )
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # speculative-decode verify: a few query tokens per sequence, long KV;
+        # each batch has a short request, where a causal result is far off
+        [(4, 8704)] * 3 + [(4, 40)],
+        [(5, 1328), (5, 37), (5, 8192)],
+        [(8, 16384), (8, 48)],
+        # prefill and mixed batches
+        [(512, 512)],
+        [(1, 15), (12, 133), (567, 600), (34, 345), (777, 777)],
+        # decode
+        [(1, 1328), (1, 523), (1, 2011)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(8, 2), (8, 8)])
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, use_q_descale, use_kv_descale",
+    [
+        (torch.bfloat16, torch.bfloat16, False, False),
+        (torch.bfloat16, e4m3_dtype, False, True),
+        (e4m3_dtype, e4m3_dtype, True, True),
+    ],
+)
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_unified_attn_non_causal(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    use_q_descale: bool,
+    use_kv_descale: bool,
+    backend: str,  # "triton" | "gluon"
+) -> None:
+    """With causal=False every query token attends to all keys of its sequence."""
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-max(kv_lens_list) // block_size),
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        out_dtype=torch.bfloat16,
+        use_q_descale=use_q_descale,
+        use_kv_descale=use_kv_descale,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend=backend,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=0,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if kv_dtype.itemsize == 1 or q_dtype.itemsize == 1:
+        atol, rtol = 1.5e-1, 1.5e-1
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
+    # A query that misses a few of thousands of keys stays inside the elementwise
+    # tolerance, so also bound each request's relative L2 error. For the short
+    # requests a causal result is at least 0.14 off.
+    rel_bound = 5e-2 if q_dtype.itemsize == 1 else 2e-2
+    start = 0
+    for q_len, kv_len in seq_lens:
+        out_rows = output[start : start + q_len].float()
+        ref_rows = ref_output[start : start + q_len].float()
+        start += q_len
+        rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
+        assert rel_err < rel_bound, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+
+
+@pytest.mark.parametrize(
+    "window_size, use_alibi, match",
+    [
+        ((255, 0), False, "sliding window"),
+        ((-1, 0), False, "sliding window"),
+        ((-1, -1), True, "ALiBi"),
+    ],
+    ids=["left_window", "right_window", "alibi"],
+)
+# a decode batch runs on the causal kernels, but it must reject them too
+@pytest.mark.parametrize("query_len", [2, 1], ids=["verify", "decode"])
+def test_unified_attn_non_causal_rejects_unsupported(
+    window_size: tuple[int, int], use_alibi: bool, match: str, query_len: int
+) -> None:
+    q = torch.empty(query_len, 1, 64, dtype=torch.bfloat16, device="cuda")
+    kv = torch.empty(1, 16, 1, 64, dtype=torch.bfloat16, device="cuda")
+    alibi = torch.ones(1, dtype=torch.float32, device="cuda") if use_alibi else None
+    with pytest.raises(AssertionError, match=match):
+        unified_attention(
+            q=q,
+            k=kv,
+            v=kv,
+            out=torch.empty_like(q),
+            cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32, device="cuda"),
+            seqused_k=torch.tensor([2], dtype=torch.int32, device="cuda"),
+            max_seqlen_q=query_len,
+            max_seqlen_k=2,
+            softmax_scale=1.0,
+            causal=False,
+            window_size=window_size,
+            block_table=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            alibi_slopes=alibi,
         )
 
 
