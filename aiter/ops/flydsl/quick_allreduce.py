@@ -21,6 +21,7 @@ on ``(arch, link, world_size)`` in ``allreduce_policy``.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import math
 from collections.abc import Callable
@@ -832,9 +833,23 @@ class FlyQuickAllReduceRMSNorm:
 
     # -- engine construction -------------------------------------------------
 
+    @functools.cached_property
+    def _supports_hidden(self) -> dict[int, bool]:
+        return {}
+
     def supports_hidden(self, hidden: int) -> bool:
-        """Whether a fused build exists for hidden dim, padded ones included."""
-        return bool(self._native_opts(hidden) or self._padded_opts(hidden))
+        """Whether a fused build exists for hidden dim, padded ones included.
+
+        Memoized per width: every launch asks (``_check``), the answer depends
+        only on state fixed at construction.
+        """
+        hidden = int(hidden)
+        got = self._supports_hidden.get(hidden)
+        if got is None:
+            got = self._supports_hidden[hidden] = bool(
+                self._native_opts(hidden) or self._padded_opts(hidden)
+            )
+        return got
 
     def _block_ok(self, block: int) -> bool:
         """Whether this schedule can actually build at *block*."""

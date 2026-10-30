@@ -247,6 +247,12 @@
               {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
             ]
           },
+          "6144": {
+            "atoms_per_row": 2,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 256}
+            ]
+          },
           "8192": {
             "atoms_per_row": 4,
             "rungs": [
@@ -312,6 +318,12 @@
           },
           "4096": {
             "atoms_per_row": 2,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
+            ]
+          },
+          "8192": {
+            "atoms_per_row": 4,
             "rungs": [
               {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
             ]

@@ -2864,6 +2864,8 @@ def _bare_fused_engine(algorithm: str, tp: int, **knobs):
     algo = HOST_ALGORITHMS[algorithm]
     eng = FlyQuickAllReduceRMSNorm.__new__(FlyQuickAllReduceRMSNorm)
     eng.world_size = tp
+    eng.link = fly_policy.detect_link()
+    eng.arch = fly_policy.detect_arch()
     eng._algo = algo
     eng.rs_codec, _ag = _resolve_codecs(algo, tp, None, None)
     eng.block = knobs.get("block")
