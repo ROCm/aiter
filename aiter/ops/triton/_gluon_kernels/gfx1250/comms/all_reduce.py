@@ -112,7 +112,14 @@ def _receive(
                 _, hi = _unit_words((l0, l1, l2, l3)[r])
                 old += (hi & -65536) != tag << 16
         # Keeps the loads in the loop.
-        gl.inline_asm("", "~{memory}", [], [], is_pure=False)
+        old = gl.inline_asm_elementwise(
+            "; memory clobber $0",
+            "=v,0,~{memory}",
+            [old],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
         late = gl.sum(gl.sum(old, axis=1), axis=0)
         it += 1
 
