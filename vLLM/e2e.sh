@@ -17,13 +17,14 @@
 #
 # Settings are environment variables, e.g. TPS="8" ./e2e.sh run. See below.
 # The defaults are for MI350P. On MI350X (8 XCDs, 256 CUs, 252 GiB), every image
-# built for it, the baseline too:
-#   export AITER_CU_NUM=256 AITER_NUM_XCDS=8 GPU_GIB=252 \
+# built for it, the baseline too, and the model in ~/huggingface/hub
+# (hf download deepseek-ai/DeepSeek-V4-Pro-0813 --cache-dir ~/huggingface/hub):
+#   export AITER_CU_NUM=256 AITER_NUM_XCDS=8 GPU_GIB=252 HF_HUB=~/huggingface/hub \
 #     IMAGE_A=vllm-aiter-main-mi350x IMAGE_B=vllm-aiter-ar-mi350x \
 #     IMAGE_FORK=vllm-aiter-ar-prefill-mi350x IMAGE_A_EVAL=vllm-aiter-main-eval-mi350x
 #   ./e2e.sh build-eval
-#   ./e2e.sh eval                                      # TP8, RULER at 64k
-#   TPS=4 GPU_MEM_UTIL=0.92 MAX_MODEL_LEN=16384 EVAL_LONG_LENGTHS=16384 ./e2e.sh eval
+#   ./e2e.sh eval                                      # TP8, RULER at 16k
+#   TPS=4 GPU_MEM_UTIL=0.92 MAX_MODEL_LEN=16384 ./e2e.sh eval
 #
 # For every (TP, image) "run" starts one server, checks that it answers,
 # records which all-reduce path vLLM took, runs the benchmark scenarios and
@@ -93,19 +94,25 @@ EVAL_LIMIT=${EVAL_LIMIT:-}            # questions per task; empty = all (quick c
 # case), and the answer has to be retrieved from that KV cache through the
 # sparse attention's top-k selection. The tasks are ones not at the ceiling: uuid needles
 # among uuid distractors, all 4 values of a key, multi-hop variable tracking, and
-# multi-document QA. Zero-shot, greedy. RULER builds the haystacks itself with a
-# fixed seed, so every arm gets the same prompts. Empty EVAL_LONG_TASKS skips it.
+# multi-document QA. Zero-shot, greedy. The prompts are generated once, before the
+# first server starts, with lm-eval's RULER generator seeded with EVAL_SEED, and cached
+# under RULER_CACHE (see e2e_ruler_prep.py): every arm reads the same files. Empty
+# EVAL_LONG_TASKS skips it.
 EVAL_LONG_TASKS=${EVAL_LONG_TASKS-niah_multikey_3,niah_multivalue,ruler_vt,ruler_qa_hotpot}
 # Prompt lengths, one lm-eval run each: RULER lists its samples length by length,
 # so one --limit over several lengths would keep only the first. Each one must be
 # a RULER length (4096 8192 16384 32768 65536 131072) and at most MAX_MODEL_LEN.
-EVAL_LONG_LENGTHS=${EVAL_LONG_LENGTHS:-65536}
-EVAL_LONG_LIMIT=${EVAL_LONG_LIMIT:-100}   # questions per task and length (RULER makes 500)
+EVAL_LONG_LENGTHS=${EVAL_LONG_LENGTHS:-16384}
+# Questions per task and length that are run, the first of the 500 RULER generates
+# (and caches); empty = all 500.
+EVAL_LONG_LIMIT=${EVAL_LONG_LIMIT:-25}
 # Prefill-bound; each request holds a whole prompt of KV cache, and more just queue.
 EVAL_LONG_CONCURRENCY=${EVAL_LONG_CONCURRENCY:-8}
 # Only sizes the haystacks (vLLM tokenizes the prompts itself), so any close
 # tokenizer will do if the model's does not load with AutoTokenizer.
 EVAL_LONG_TOKENIZER=${EVAL_LONG_TOKENIZER:-$MODEL}
+EVAL_SEED=${EVAL_SEED:-15}            # lm-eval's seeds, and RULER's prompts
+RULER_CACHE=${RULER_CACHE:-}          # generated RULER prompts; default under CACHE_ROOT
 # V4-Pro (~830 GiB) fits on 144 GiB GPUs only at TP=8; preflight rejects
 # TPs whose per-GPU weight share does not fit.
 TPS=${TPS:-8}
@@ -133,6 +140,7 @@ NAME=dsv4-e2e
 MODE=bench
 HF_OFFLINE=0   # set by cmd_check when the model is already cached
 RUN_DIR=
+RULER_DIR=     # set by prep_ruler: this run's RULER prompts, mounted at /ruler
 
 log() {
     local line="[$(date +%H:%M:%S)] $*"
@@ -287,19 +295,6 @@ cmd_check() {
         log "WARNING checkpoint size unknown, not checking that TPs $TPS fit (set MODEL_GIB)"
         ok=0
     fi
-    # RULER sizes its haystacks with this tokenizer; if it does not load, every
-    # arm's long-context eval fails, and only after its short tasks.
-    if [ "$MODE" = eval ] && [ -n "$EVAL_LONG_TASKS" ]; then
-        IFS=, read -r tag image env <<<"${ARMS%% *}"
-        docker run --rm --entrypoint "" -e HF_HUB_OFFLINE="$HF_OFFLINE" -e HF_TOKEN="${HF_TOKEN:-}" \
-            -v "$HF_HUB":/root/.cache/huggingface/hub "$image" \
-            /opt/lm-eval/bin/python -c "from transformers import AutoTokenizer as T; \
-t = T.from_pretrained('$EVAL_LONG_TOKENIZER', trust_remote_code=True); \
-assert len(t('The quick brown fox').input_ids) > 0" >/dev/null 2>&1 \
-            || die "tokenizer $EVAL_LONG_TOKENIZER does not load for RULER: set EVAL_LONG_TOKENIZER" \
-                   "to a close one, or EVAL_LONG_TASKS= to skip the long-context eval"
-        log "RULER tokenizer: $EVAL_LONG_TOKENIZER"
-    fi
     if docker ps -a -q -f name="^$NAME$" | grep -q .; then
         log "WARNING a $NAME container exists; it will be replaced"
     fi
@@ -323,6 +318,8 @@ start_server() {  # image tag tp out_dir [VAR=value...]
             --profiler-config.torch_profiler_with_stack false
         )
     fi
+    local ruler=()
+    [ -n "$RULER_DIR" ] && ruler=(-v "$RULER_DIR":/ruler:ro)
     # Per-image cache: torch.compile, triton and FlyDSL caches survive restarts,
     # and the two aiter builds never share compiled artifacts.
     mkdir -p "$CACHE_ROOT/$tag" "$out/traces"
@@ -342,6 +339,7 @@ start_server() {  # image tag tp out_dir [VAR=value...]
         -v "$CACHE_ROOT/$tag":/root/.cache \
         -v "$HF_HUB":/root/.cache/huggingface/hub \
         -v "$out/traces":/traces \
+        "${ruler[@]}" \
         --device /dev/dri:/dev/dri --device /dev/kfd:/dev/kfd \
         --security-opt seccomp=unconfined \
         --shm-size 128G \
@@ -503,7 +501,7 @@ lm_eval_run() {  # log_file concurrency lm_eval_args...
         --model local-completions \
         --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/completions,num_concurrent=$conc,max_retries=3,timeout=3600,tokenized_requests=False,tokenizer_backend=None" \
         --batch_size 1 \
-        --seed 15 \
+        --seed "$EVAL_SEED" \
         --output_path /traces/lm_eval \
         --log_samples \
         "$@" >>"$log_file" 2>&1
@@ -527,9 +525,11 @@ run_eval() {  # out_dir
             return 0
         fi
         log "eval $EVAL_LONG_TASKS at $len tokens, concurrency $EVAL_LONG_CONCURRENCY${EVAL_LONG_LIMIT:+, limit $EVAL_LONG_LIMIT}"
+        # The tasks of the same name under /ruler/$len replace the built-in ones,
+        # which would generate their prompts again.
         if lm_eval_run "$out/eval_long_$len.log" "$EVAL_LONG_CONCURRENCY" \
             --tasks "$EVAL_LONG_TASKS" ${EVAL_LONG_LIMIT:+--limit "$EVAL_LONG_LIMIT"} \
-            --metadata "{\"max_seq_lengths\": [$len], \"tokenizer\": \"$EVAL_LONG_TOKENIZER\"}"; then
+            --include_path "/ruler/$len"; then
             # One table row per task and length; the other lengths' rows are -1.
             log "eval $len done: $(grep -E "^\|.*\| *$len *\|" "$out/eval_long_$len.log" | tr -s ' ' | paste -sd ' ' || true)"
         else
@@ -538,11 +538,38 @@ run_eval() {  # out_dir
     done
 }
 
+prep_ruler() {
+    # RULER's prompts, generated on the CPU before any server holds the GPUs, once
+    # per tokenizer, seed and lm-eval version (the generator's); later runs reuse
+    # them. It also checks that the tokenizer loads: without it every arm's
+    # long-context eval would fail, and only after its short tasks.
+    local tag image env ver
+    IFS=, read -r tag image env <<<"${ARMS%% *}"
+    ver=$(in_image "$image" /opt/lm-eval/bin/python -c \
+        "from importlib.metadata import version; print(version('lm_eval'))")
+    RULER_DIR=${RULER_CACHE:-$CACHE_ROOT/ruler}/${EVAL_LONG_TOKENIZER//\//--}-seed$EVAL_SEED-lm_eval$ver
+    mkdir -p "$RULER_DIR"
+    log "RULER prompts: $EVAL_LONG_TASKS at $EVAL_LONG_LENGTHS tokens, tokenizer $EVAL_LONG_TOKENIZER, in $RULER_DIR"
+    # Online: the essays and HotpotQA are downloaded.
+    docker run --rm --entrypoint "" -e HF_HUB_OFFLINE=0 -e HF_TOKEN="${HF_TOKEN:-}" \
+        -v "$HF_HUB":/root/.cache/huggingface/hub -v "$RULER_DIR":/ruler -v "$HERE":/e2e:ro \
+        "$image" /opt/lm-eval/bin/python /e2e/e2e_ruler_prep.py /ruler \
+        "$EVAL_LONG_TOKENIZER" "$EVAL_LONG_TASKS" "$EVAL_LONG_LENGTHS" "$EVAL_SEED" \
+        >>"$RUN_DIR/ruler_prep.log" 2>&1 \
+        || die "RULER prompt generation failed, see ruler_prep.log. If the tokenizer" \
+               "$EVAL_LONG_TOKENIZER does not load, set EVAL_LONG_TOKENIZER to a close one," \
+               "or EVAL_LONG_TASKS= to skip the long-context eval"
+    log "RULER prompts ready (ruler_prep.log)"
+}
+
 cmd_run() {
     RUN_DIR=${RUN_DIR_OVERRIDE:-$HERE/results/$(date +%Y%m%d-%H%M%S)-$MODE}
     mkdir -p "$RUN_DIR"
     trap stop_server EXIT
     cmd_check
+    if [ "$MODE" = eval ] && [ -n "$EVAL_LONG_TASKS" ]; then
+        prep_ruler
+    fi
     log "run dir $RUN_DIR, mode $MODE, TPs $TPS"
     local arms=($ARMS) i=0 tp k arm tag image env
     : >"$RUN_DIR/arms.txt"
