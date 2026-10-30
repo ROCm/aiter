@@ -3,7 +3,7 @@
 
 """Perf-only benchmark for the FlyDSL m32x8 MHA forward kernel on gfx1250.
 
-This is the performance companion to ``op_tests/test_mha_flydsl.py`` — it drives
+This is the performance companion to ``op_tests/test_flydsl_mha_fwd.py`` — it drives
 the same public interface (``flash_attn_func`` / ``flash_attn_varlen_func`` in
 ``aiter/ops/mha.py``) but computes NO reference and checks NO correctness. It only
 times the kernel and reports latency / TFLOPS / TB-s.
@@ -129,7 +129,7 @@ def _verify_dispatch(layout):
 
 def _attended_pairs(sq, sk, causal, window):
     """(query, key) pairs inside the bottom-right aligned band, matching
-    ``_local_mask``/``_effective_window`` in test_mha_flydsl.py: query ``s`` attends
+    ``_local_mask``/``_effective_window`` in test_flydsl_mha_fwd.py: query ``s`` attends
     ``s + (sk - sq) - left <= j <= s + (sk - sq) + right``, where ``-1`` is infinite
     on that side and ``causal`` pins ``right`` to 0."""
     left, right = window
