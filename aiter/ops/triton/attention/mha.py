@@ -895,7 +895,7 @@ def _gluon_gfx1250_flash_attn_varlen_forward(
             *(lse_i.stride() if has_init else (0, 0)),
             HEAD_DIM=v_head_dim,
             NUM_SPLITS=num_splits,
-            BLOCK_D=triton.next_power_of_2(v_head_dim),
+            BLOCK_D=1 << (v_head_dim - 1).bit_length(),
             RETURN_LSE=write_lse,
             HAS_INIT=has_init,
             num_warps=1,

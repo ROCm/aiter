@@ -51,6 +51,8 @@ BLOCK_DMODEL_PE = gl.constexpr(64)
 BLOCK_DMODEL_V = gl.constexpr(128)
 # extra V / O columns of a 192-wide V (v head dim == qk head dim)
 BLOCK_DMODEL_V_HI = gl.constexpr(64)
+# Plain int for the host code: gl.constexpr arithmetic is slow on the host.
+_QK_HEAD_DIM = 192
 
 
 @gluon.constexpr_function
@@ -494,7 +496,7 @@ def _get_config(
     arch = arch_info.get_arch()
     fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
     fwd_cfg = load_config_json(fpath)["fwd"]
-    family = "pe_narrow_v" if v_head_dim < BLOCK_DMODEL_NOPE + BLOCK_DMODEL_PE else "pe"
+    family = "pe_narrow_v" if v_head_dim < _QK_HEAD_DIM else "pe"
     if causal:
         return dict(fwd_cfg[f"{family}_causal"], NUM_SPLITS=1)
     if seqlen_k <= fwd_cfg["short_max_seqlen_k"]:
@@ -502,7 +504,7 @@ def _get_config(
     cfg = dict(fwd_cfg[family])
     # Split K when there are fewer than num_cus / 2 programs, while each split
     # keeps at least split_kv_min_tiles_per_split K tiles.
-    progs = max(1, triton.cdiv(total_q, cfg["BLOCK_M"])) * num_q_heads
+    progs = max(1, -(-total_q // cfg["BLOCK_M"])) * num_q_heads
     ns = 1
     while (
         ns < fwd_cfg["split_kv_max_num_splits"]
