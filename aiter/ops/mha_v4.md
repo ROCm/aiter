@@ -5,7 +5,7 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 
 ## Scope
 
-- Contiguous BF16 BSHD inputs with head dimension 128.
+- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4 on GFX950.
 - BF16 BSHD output.
 - Dense and sorted block-sparse inference.
 - GFX950 LDS-staged sparse recipes support up to 8,192 KV tiles per sequence.
@@ -37,6 +37,9 @@ V packing and scale modes.
 | MXFP4 | MXFP4 | dense, sparse |
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
+
+Head dimension 256 exists only for MXFP4 Q/K/V, dense, on GFX950. Every other recipe, sorted
+sparse, and GFX942 reject it.
 
 ## Ownership
 
@@ -129,6 +132,10 @@ calling `mha_v4_packed`.
 MXFP4 V uses E2M1 values with one E8M0 scale per `(channel, 32-token)` block. Each 128-token tile
 contributes 8,192 data bytes and 512 scale bytes. The data buffer includes 64 bytes of launch slack.
 
+At head dimension 256 the MXFP4 producers run the hd128 kernels on a `[B, S, 2H, 128]` view, so
+each tile carries twice the data and scale bytes and the slack doubles to 128 bytes. The Hadamard
+acts on each 128-wide half independently, which keeps it orthogonal and Q.K^T unchanged.
+
 `AttentionPack.DEFAULT` is the canonical V token order. `AttentionPack.V_FOR_FP6_P` selects the V
 token order that FP6-P and FP4-P consumers require, and a row's packing no longer depends on the
 mode: dense and sparse rows for the same recipe select the same pack. Numeric format and consumer
@@ -167,7 +174,8 @@ of the same code object may remain exact where determinism is part of the test.
 
 ## Validation
 
-Run `pytest op_tests/test_mha_v4.py` for entrypoint changes. Quantizer/layout changes additionally
+Run `python3 op_tests/test_mha_v4.py` and `python3 op_tests/test_mha_v4_sparse.py` for entrypoint
+changes; CI runs them as scripts, not under pytest. Quantizer/layout changes additionally
 require byte-level checks at aligned and ragged sequence lengths, eager/fullgraph parity, allocator
 churn, and downstream-consumer coverage. Kernel performance changes require the relevant retained
 model captures and balanced multi-GPU target-shape benchmarks.
