@@ -396,6 +396,8 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     // note: we don't reorder the address so the accumulation order is the same
     // for all ranks, ensuring bitwise identical results
     auto dp     = *_input_dp;
+    // When ngpus does not divide THREAD_NUM (e.g. 6), the last THREAD_NUM %
+    // ngpus threads get warp_id == ngpus: they only join the barriers.
     int warp_id = threadIdx.x / tnum_gpu;
     int lane_id = threadIdx.x % tnum_gpu;
 
@@ -421,7 +423,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     int buf  = 0;
     int idx0 = start;
 
-    if(idx0 < size)
+    if(warp_id < ngpus && idx0 < size)
     {
         P val                                       = ((const P**)&dp.ptrs[0])[warp_id][idx0];
         tmp_smem[buf][warp_id * tnum_gpu + lane_id] = val;
@@ -470,7 +472,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
         // 2. ALL warps prefetch NEXT buffer
         //    (including warp 0; safe to issue after reduction)
         // =======================================================
-        if(next_idx < size)
+        if(warp_id < ngpus && next_idx < size)
         {
             P nxt = ((const P**)&dp.ptrs[0])[warp_id][next_idx];
             tmp_smem[next_buf][warp_id * tnum_gpu + lane_id] = nxt;
@@ -4744,6 +4746,7 @@ class CustomAllreduce
 #define DISPATCH_REDUCE(ngpus, name)                      \
     do                                                    \
     {                                                     \
+        /* these kernels need ngpus to divide 512 */      \
         if(bytes % (ngpus * 16) == 0 && world_size_ != 6) \
         {                                                 \
             if(use_write_mode)                            \
