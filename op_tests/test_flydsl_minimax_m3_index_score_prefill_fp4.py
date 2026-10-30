@@ -19,10 +19,7 @@ Run (exits nonzero if any check fails):
 
 import argparse
 import itertools
-import os
 import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 import torch
@@ -31,26 +28,123 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+    LOG2E,
     score_prefill_flydsl,
     score_prefill_flydsl_fp4,
+)
+from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+    alloc_score as prefill_alloc_score,
 )
 from aiter.ops.msa_block_select import pa_sparse_block_score_prefill
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
-from op_tests.test_flydsl_minimax_m3_index_score import (
-    GEOM_SHAPES,
-    LOG2E,
-    PREFILL_SHAPES,
-    SENTINEL,
-    D,
-    P,
-    _prefill_work,
-    aiter_scores,
-    make_prefill_case,
-    prefill_alloc_score,
-    run_prefill,
-)
+
+P = 128  # page size and head dim: the public operator contract
+D = 128
+SENTINEL = -12345.678  # a value no score can take: "did the kernel write here"
+
+# The fp8 op test's shapes (op_tests/test_flydsl_minimax_m3_index_score.py), same lists.
+PREFILL_SHAPES = [
+    (1, 256, 256),
+    (1, 130, 1000),
+    (3, 777, 5000),
+    (1, 2048, 2048),
+    (4, 512, 8192),
+    (8, 512, 16384),
+    (2, 2048, 32768),
+    (1, 1024, 65536),
+    (1, 4096, 131072),
+    (1, 4096, 524288),
+]
+# One (batch, q_len, ctx) per geometry the selector can reach.
+GEOM_SHAPES = [
+    (1, 128, 256),  # tile_q 64, 4 waves, L1, 16-wide
+    (8, 512, 1000),  # tile_q 128, 4 waves, L1
+    (8, 512, 2048),  # tile_q 128, 4 waves, L2
+    (2, 128, 16384),  # tile_q 256, 8 waves, L1
+    (4, 128, 16384),  # tile_q 256, 8 waves, L2
+    (8, 2048, 16384),  # tile_q 256, 8 waves, L4 -- the production point
+]
+
+
+def _prefill_work(batch, q_len, ctx_len):
+    """(live (query, block) pairs, unique pages) for a uniform ragged batch."""
+    prefix = ctx_len - q_len
+    pairs = sum(-(-(prefix + i + 1) // P) for i in range(q_len)) * batch
+    return pairs, batch * (-(-ctx_len // P))
+
+
+def make_prefill_case(batch, q_len, ctx_len, heads=1, seed=0):
+    """A uniform ragged batch: every request has q_len new tokens on ctx_len."""
+    torch.manual_seed(seed)
+    dev = "cuda"
+    seq_lens = torch.full((batch,), ctx_len, dtype=torch.int32, device=dev)
+    prefix = torch.full((batch,), ctx_len - q_len, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, (batch + 1) * q_len, q_len, dtype=torch.int32, device=dev)
+    max_block = -(-ctx_len // P)
+    npages = batch * max_block
+    q8 = (torch.randn(batch * q_len, heads, D, device=dev) / 4).to(dtypes.fp8)
+    cache = (torch.randn(npages, P, D, device=dev) / 4).to(dtypes.fp8)
+    # A permutation on purpose: an identity block table would hide a kernel that
+    # assumed pages were visited in storage order.
+    bt = (
+        torch.randperm(npages, device=dev, dtype=torch.int32)
+        .view(batch, max_block)
+        .contiguous()
+    )
+    return {
+        "q8": q8,
+        # aiter takes Q in fp8; the bf16 arm gets its exact upcast.
+        "q_bf16": q8.float().bfloat16(),
+        "cache": cache,
+        "bt": bt,
+        "cu": cu,
+        "seq": seq_lens,
+        "prefix": prefix,
+        "max_q": q_len,
+        "max_seq": ctx_len,
+        "batch": batch,
+        "mb": max_block,
+    }
+
+
+def aiter_scores(c):
+    """aiter's scores, and the mask of slots it considers live."""
+    heads = c["q8"].shape[1]
+    ref = torch.full((heads, c["q8"].shape[0], c["mb"]), -float("inf"), device="cuda")
+    pa_sparse_block_score_prefill(
+        c["q8"],
+        c["cache"],
+        ref,
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        max_query_len=c["max_q"],
+        max_seq_len=c["max_seq"],
+    )
+    return ref, torch.isfinite(ref)
+
+
+def run_prefill(c):
+    """The fp8 FlyDSL scorer on the case's fp8 cache, into a sentinel-filled buffer."""
+    heads = c["q8"].shape[1]
+    out = prefill_alloc_score(c["q8"].shape[0], heads, c["mb"], "cuda")
+    out.fill_(SENTINEL)
+    score_prefill_flydsl(
+        c["q_bf16"],
+        c["cache"],
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        c["prefix"],
+        c["max_q"],
+        c["max_seq"],
+        1.0 / LOG2E,
+        out=out,
+    )
+    return out.reshape(heads, c["q8"].shape[0], c["mb"])
+
 
 SUPPORTED_GFX = ["gfx950"]  # the FlyDSL scorers are built for gfx950
 QCHUNK = 512  # pages quantized per torch call; the reference makes fp32 temporaries
@@ -472,7 +566,7 @@ QDTS = ["bf16", "e4m3"]  # the dtype the query reaches the scorer in
 
 
 def build_cases():
-    """(name, check, args): one row per case; the same set the pytest matrix had."""
+    """(name, check, args): one row per case."""
     cases = []
     for shape, qdt in itertools.product(SHAPES, QDTS):
         name = f"b{shape[0]}_q{shape[1]}_ctx{shape[2]}_{qdt}"
