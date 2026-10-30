@@ -9,13 +9,20 @@ from torch.distributed import ProcessGroup
 
 from aiter import get_hip_quant, logger
 from aiter.dist.parallel_state import is_global_first_rank
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
 
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
+# gfx1250, 4 ranks: the Gluon all-reduce + RMSNorm takes up to 2048 tokens of hidden
+# 2048. RCCL is faster above that.
+_GLUON_AR_MAX_BYTES = 8 << 20
+# The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
+_GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
+
 should_nccl_symm_mem_allreduce = False
-_SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori")
+_SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -77,6 +84,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.ca_comm = reuse_from.ca_comm
             self.qr_comm = reuse_from.qr_comm
             self.symm_mem_comm = reuse_from.symm_mem_comm
+            self.gluon_ar = reuse_from.gluon_ar
+            self.gluon_ar_plain = reuse_from.gluon_ar_plain
             return
 
         # lazy import to avoid documentation build error
@@ -124,6 +133,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # ),
             )
 
+        # Inboxes and call counters of the Gluon fused all-reduce + RMSNorm and of the
+        # plain Gluon all-reduce (gfx1250, 4 ranks), one set for each op. They live as
+        # long as the process: destroy() runs after the groups are gone.
+        self.gluon_ar = None
+        self.gluon_ar_plain = None
+        if (
+            os.environ.get("AITER_GLUON_FUSED_AR") == "1"
+            and self.world_size == 4
+            and get_gfx() == "gfx1250"
+        ):
+            from aiter.ops.triton.comms.all_reduce import all_reduce_init
+
+            self.gluon_ar = all_reduce_init(self.cpu_group, _GLUON_AR_MAX_BYTES)
+            self.gluon_ar_plain = all_reduce_init(
+                self.cpu_group, _GLUON_PLAIN_AR_MAX_BYTES
+            )
+
         if self.world_size > 1:
             from aiter.dist.device_communicators.quick_all_reduce import (
                 QuickAllReduce,
@@ -141,6 +167,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from .all2all import MoriAll2AllManager
 
             return MoriAll2AllManager(self.cpu_group)
+        if backend == "mori_v2":
+            from .all2all import MoriV2All2AllManager
+
+            return MoriV2All2AllManager(self.cpu_group)
         if backend == "flydsl":
             from .all2all import FlyDSLAll2AllManager
 
@@ -210,6 +240,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
+        if (
+            self.gluon_ar_plain is not None
+            and input_.dtype == torch.bfloat16
+            and input_.is_contiguous()
+            and input_.numel() % 4 == 0
+            and input_.data_ptr() % 16 == 0
+            and input_.numel() * 2 <= _GLUON_PLAIN_AR_MAX_BYTES
+        ):
+            from aiter.ops.triton.comms.all_reduce import all_reduce as gluon_all_reduce
+
+            return gluon_all_reduce(input_, self.cpu_group, *self.gluon_ar_plain)
+
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
@@ -283,16 +325,51 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 "fused_allreduce_rmsnorm requires residual width == weight width, "
                 f"got residual_width={residual_n}, weight_width={n}"
             )
+        if input_.shape[:-1] != res_inp_.shape[:-1]:
+            raise RuntimeError(
+                "fused_allreduce_rmsnorm requires input and residual leading "
+                f"dimensions to match, got input_shape={tuple(input_.shape)}, "
+                f"residual_shape={tuple(res_inp_.shape)}"
+            )
         out_n = n
         if x_pad_to_multiple > 0:
             out_n = (n + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
         total_bytes = input_.numel() * input_.element_size()
+        if (
+            self.gluon_ar is not None
+            and total_bytes <= _GLUON_AR_MAX_BYTES
+            and input_.dim() == 2
+            and input_n == n
+            and n >= 256
+            and n & (n - 1) == 0
+            and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
+            and input_.is_contiguous()
+            and res_inp_.is_contiguous()
+            and x_pad_to_multiple == 0
+        ):
+            from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant import (
+                all_reduce_rmsnorm_quant,
+            )
+
+            return all_reduce_rmsnorm_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                gemma_norm,
+                False,
+                self.cpu_group,
+                *self.gluon_ar,
+            )
         can_use_fuse_ar_rms = (
             n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
         )
         ca_comm = self.ca_comm
         can_use_custom_ar = (
-            ca_comm is not None and not ca_comm.disabled and can_use_fuse_ar_rms
+            ca_comm is not None
+            and not ca_comm.disabled
+            and can_use_fuse_ar_rms
+            and ca_comm.should_fuse_ar_rms(input_, n, out_n)
         )
         total_bytes_limit = (
             self._ar_1stage_max_kb
@@ -425,10 +502,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "per_group"/"mxfp4") from the public API.
-        if gemma_norm and quant_type not in ("per_token", "per_group"):
-            raise NotImplementedError(
-                "gemma_norm fused quant supports per-token and per-group FP8 only"
-            )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
                 input_,
@@ -449,6 +522,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 eps,
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
+                gemma_norm=gemma_norm,
             )
         # emit_bf16 additionally returns the pre-quantization bf16/fp16 normed
         # output alongside the per-token FP8 result. Used by v32 DSA models
@@ -458,16 +532,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
         hidden_dim = int(input_.shape[-1])
         element_size = input_.element_size()
         total_bytes = input_.numel() * element_size
+        # gfx1250 fuses only above the 4 MiB LL range, so the old-arch default
+        # would rule its fused kernel out; bound it like the unquantized path.
+        default_quant_bytes = (
+            8 * 1024 * 8192
+            if self.ca_comm is not None and not self.ca_comm.has_old_arch_fused_kernels
+            else 4096 * 1024
+        )
         fused_quant_bytes_limit = (
-            self._ar_quant_max_bytes if self._ar_quant_max_bytes >= 0 else 4096 * 1024
+            self._ar_quant_max_bytes
+            if self._ar_quant_max_bytes >= 0
+            else default_quant_bytes
         )
         no_prefill_quant_bytes_limit = (
             self._ar_quant_no_prefill_max_bytes
             if self._ar_quant_no_prefill_max_bytes >= 0
             else 64 * 1024 * 1024
         )
+        ca_comm = self.ca_comm
         if (
-            (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and (
                 hidden_dim in [512, 1024, 2048, 4096]
                 or (
                     hidden_dim in [7168, 6144]
@@ -476,6 +562,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             and total_bytes <= fused_quant_bytes_limit
             and (prefill_support or total_bytes <= no_prefill_quant_bytes_limit)
+            and ca_comm.should_fuse_ar_rms(input_, hidden_dim, hidden_dim)
+            and ca_comm.should_custom_ar(input_, prefill_support)
         ):
             total_bytes_limit = (
                 self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
@@ -485,12 +573,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 if self._ar_1stage_override is not None
                 else (total_bytes <= total_bytes_limit)
             )
-            result = self.ca_comm.custom_fused_ar_rms_quant(
+            result = ca_comm.custom_fused_ar_rms_quant(
                 input_,
                 res_inp_,
                 weight_,
                 eps,
                 use_1stage,
+                prefill_support=prefill_support,
                 gemma_norm=gemma_norm,
                 emit_bf16=emit_bf16,
             )
@@ -664,6 +753,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
         """Fused AR+RMSNorm with an MXFP4 quantization epilogue when supported.
 
@@ -724,6 +814,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_kernel = (
             ca_comm is not None
             and not ca_comm.disabled
+            and ca_comm.has_old_arch_fused_kernels
             and ca_comm.should_custom_ar(input_, prefill_support)
             and self.world_size != 6
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
@@ -737,6 +828,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 eps,
                 use_1stage=can_1stage,
                 emit_bf16=emit_bf16,
+                gemma_norm=gemma_norm,
             )
             assert result is not None
             if emit_bf16:
@@ -745,7 +837,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 out_fp4, res_out, scale_out = result
         else:
             normed, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
+                input_, res_inp_, weight_, eps, prefill_support, gemma_norm=gemma_norm
             )
             from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
@@ -945,6 +1037,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         if dim != 0:
             raise NotImplementedError("only dim 0 all-gatherv is supported")
+        ca_comm = self.ca_comm
+        if ca_comm is not None and not ca_comm.disabled:
+            single = isinstance(input_, torch.Tensor)
+            outs = ca_comm.custom_all_gatherv(
+                [input_] if single else list(input_), sizes
+            )
+            if outs is not None:
+                return outs[0] if single else outs
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None and not pynccl_comm.disabled

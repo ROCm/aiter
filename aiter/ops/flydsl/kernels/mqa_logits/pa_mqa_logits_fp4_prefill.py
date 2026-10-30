@@ -16,6 +16,7 @@ from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
+from ..tensor_shim import _run_compiled
 from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
     _i32_buffer,
@@ -183,12 +184,21 @@ def _row_plan(le, block_k, P, s_max) -> _RowPlan:
         P,
         block_k,
         s_max,
+        max(1, (s_max - 1).bit_length() + 1),
         BLOCK_T=(
             _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS
         ),
-        SEARCH_STEPS=max(1, (s_max - 1).bit_length() + 1),
     )
     return plan
+
+
+def warmup_prefill_row_plan(device, block_k: int = 256) -> None:
+    """Compile both BLOCK_T variants of `_prefill_row_plan_kernel` before serving."""
+    buf = torch.empty(16, dtype=torch.int32, device=device)
+    for block_t in (_ROW_PLAN_BLOCK_FLOOR, _ROW_PLAN_MAX_ROWS):
+        _prefill_row_plan_kernel.warmup(
+            *([buf] * 6), 16, 16, block_k, 16, 5, BLOCK_T=block_t, grid=(1,)
+        )
 
 
 def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
@@ -229,7 +239,12 @@ def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
 # gives up the divisibility hint the wide blocks vectorize on, 41.1us -> 52.0us
 # at 16384 lanes. That lands on prefill, one call per ~500ms forward; the widths
 # decode runs stay hidden behind the call's own dispatch either way.
-@triton.jit(do_not_specialize=["T", "P"])
+# `s_max`, the search depth derived from it and `le`'s alignment all vary per batch;
+# specializing on them kept compiling new variants (~1.4 s each) mid-serving.
+@triton.jit(
+    do_not_specialize=["T", "P", "s_max", "search_steps"],
+    do_not_specialize_on_alignment=["le_ptr"],
+)
 def _prefill_row_plan_kernel(
     le_ptr,  # [T] int32 local_ends
     incl_ptr,  # [T] int32 out
@@ -241,8 +256,8 @@ def _prefill_row_plan_kernel(
     P,
     block_k,
     s_max,
+    search_steps,
     BLOCK_T: tl.constexpr,
-    SEARCH_STEPS: tl.constexpr,
 ):
     """Single-block row plan: chunk counts, split factor, and its prefix sums.
 
@@ -255,7 +270,7 @@ def _prefill_row_plan_kernel(
     Masked-out lanes carry `chunks = 0`, which contributes 0 CTAs at every s, so
     no reduction below needs a second mask.
 
-    `SEARCH_STEPS` is derived from `s_max`, not a generous constant: the range
+    `search_steps` is derived from `s_max`, not a generous constant: the range
     halves each step, so `(s_max - 1).bit_length()` converges it and the caller
     passes one more. Every surplus step is another reduction over all BLOCK_T
     lanes -- 0.74us each at 4096 rows -- and a fixed 32 was this kernel's ENTIRE
@@ -273,7 +288,7 @@ def _prefill_row_plan_kernel(
 
     lo = 1
     hi = s_max
-    for _ in tl.static_range(SEARCH_STEPS):
+    for _ in range(search_steps):
         mid = (lo + hi) // 2
         feasible = tl.sum((chunks + mid - 1) // mid, axis=0) <= P
         active = lo < hi
@@ -658,7 +673,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             return kv_list, kvs_packed_list
 
         def _issue_nt_mfmas(kv_list_in, kvs_packed_per_kt, nt):
-            zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            zero = fx.full(4, 0.0, fx.Float32)
             accs = [zero] * m_tiles
             # opsel_b=nt is baked into the atom; scale_b is the packed 4-nt word.
             atom = mfma_atoms[nt]
@@ -683,7 +698,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
         def _post_process_nt(accs, nt, c_i32_arg):
             """relu + per-head weight + per-thread sum + bperm + windowed store."""
-            zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            zero = fx.full(4, 0.0, fx.Float32)
             ni_warp = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
             token_base = (chunk_start + c_i32_arg) * fx.Int32(
                 block_k
@@ -699,7 +714,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             lane_i32 = fx.Int32(lane_id)
 
             def _bperm_xor_add(val, sh):
-                peer_byte = (lane_i32 ^ fx.Int32(sh)) * fx.Int32(4)
+                peer_byte = (lane_i32 ^ fx.Int32(sh)) * 4
                 peer_i32 = fx.Int32(
                     rocdl.ds_bpermute(T.i32, peer_byte, val.bitcast(fx.Int32))
                 )
@@ -778,8 +793,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 for mi in range(m_tiles)
             ]
             c_idx_i32 = fx.Int32(c_idx)
-            c_next_i32 = c_idx_i32 + fx.Int32(1)
-            c_next_next_i32 = c_next_i32 + fx.Int32(1)
+            c_next_i32 = c_idx_i32 + 1
+            c_next_next_i32 = c_next_i32 + 1
 
             _compute_chunk(
                 kv_cur_list, kvs_cur_list, c_idx_i32, nt0_accs_in=nt0_accs_cur
@@ -930,12 +945,13 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     if stream is None:
         stream = torch.cuda.current_stream()
 
-    launcher(
+    _run_compiled(
+        launcher,
         out,
         q_fp4,
         q_scale,
-        kv_cache,
-        kv_scale,
+        kv_cache.view(-1),
+        kv_scale.view(-1),
         block_tables,
         weights,
         cta_info,

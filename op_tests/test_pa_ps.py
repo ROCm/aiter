@@ -12,6 +12,7 @@ import torch.profiler as tpf
 
 import aiter
 from aiter import dtypes, pertoken_quant
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.enum import QuantType
 from aiter.test_common import benchmark, checkAllclose, perftest
 
@@ -612,11 +613,11 @@ def test_pa_ps(
     else:
         # warmup for get_pa_metadata_v1
         aiter.get_pa_metadata_v1(
-            torch.tensor([0], dtype=torch.int32),
-            torch.tensor([0], dtype=torch.int32),
-            torch.tensor([0], dtype=torch.int32),
-            1,
-            1,
+            qo_indptr,
+            kv_indptr,
+            seq_lens_kv,
+            num_query_heads // num_kv_heads,
+            num_kv_heads,
             is_causal,
             work_metadata_ptrs,
             work_indptr,
@@ -626,8 +627,8 @@ def test_pa_ps(
             reduce_partial_map,
             kv_granularity=max(block_size, 16),
             block_size=block_size,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
+            max_seqlen_qo=int(max_qlen),
+            uni_seqlen_qo=qlen,
             fast_mode=True,
             max_split_per_batch=-1,
         )
@@ -742,7 +743,7 @@ def test_pa_ps(
 gpu = torch.cuda.current_device()
 device_properties = torch.cuda.get_device_properties(gpu)
 cu_num = device_properties.multi_processor_count
-gpu_arch = device_properties.gcnArchName.split(":", 1)[0]
+gpu_arch = get_gfx()
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

@@ -162,4 +162,7 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         p_v += stride_qkv_l
         p_o += HV * V
         p_b += HV
-        p_a += HV
+        if not IS_KDA:
+            p_a += HV
+        else:
+            p_a += HV * K

@@ -13,6 +13,7 @@ breaks and how to fix it. The author can be new to these rules.
   words, one point in each sentence. You can use technical terms.
 - Keep each comment short: one sentence for the problem and one for the fix.
 - Do not repeat what the code does. Do not add long explanations.
+- Set the severity of each comment about a rule in this file to High.
 
 ## PR scope
 
@@ -24,8 +25,9 @@ breaks and how to fix it. The author can be new to these rules.
   `*_asm.py`), CK (`csrc/ck_*`, `ck_tile`), OPUS (`aiter/ops/opus/`) and FlyDSL
   (`aiter/ops/flydsl/`, `aiter/aot/flydsl/`). Triton and Gluon are one
   backend. List the files of the other backend. When the parts depend on each
-  other, suggest stacked PRs. Tests and benchmarks belong to the backend that
-  they test. Docs, CI files and other wrappers are not a backend.
+  other, suggest [stacked PRs](https://docs.github.com/en/pull-requests/how-tos/stacked-pull-requests).
+  Tests and benchmarks belong to the backend that they test. Docs, CI files and
+  other wrappers are not a backend.
 - Each PR fixes one problem. Flag a PR that fixes two or more independent
   problems, for example a bug fix and a refactor. Name the part to move to a
   follow-up PR.
@@ -63,9 +65,11 @@ breaks and how to fix it. The author can be new to these rules.
 - Flag common helpers (config loading, shuffles, arch detection, logging)
   that a kernel file writes again instead of importing them from `utils/`.
 - Flag imports through the old flat paths
-  (`from aiter.ops.triton.gemm_a16w16 import ...`). Use the category path.
-- Flag relative imports. Use absolute imports
-  (`from aiter.ops.triton.<...> import ...`).
+  (`from aiter.ops.triton.gemm_a16w16 import gemm_a16w16`). Use the category
+  path: `from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16`.
+- Flag relative imports, for example `from .gemm_a16w16 import gemm_a16w16` or
+  `from ..utils.logger import AiterTritonLogger`. Use absolute imports:
+  `from aiter.ops.triton.utils.logger import AiterTritonLogger`.
 
 ## No torch in torch-free code
 
@@ -83,10 +87,17 @@ These parts must work without PyTorch, for example with JAX-Triton. Flag:
 
 All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
 `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`.
-`<d_type>` is `config_name.lower().replace("-", "_")`. Flag:
+`<d_type>` is `config_name.lower().replace("-", "_")`. A family tuned on a
+CU count other than the arch's default can have its own tree,
+`configs/<arch>/<cu_num>cu/<backend>/<op>/<d_type>/`, with its own
+`DEFAULT.json` (for example `gfx1250/96cu/`). Flag:
 
 - A config file outside this layout, for example in `configs/gemm/` or at the
   top of `configs/`.
+- A `<cu_num>cu/` tree for the CU count the plain folder was tuned on. That
+  count reads the plain folder.
+- A `<cu_num>cu/` folder without `DEFAULT.json`. The loaders read a tree
+  whole or not at all, and a folder without `DEFAULT.json` is not a tree.
 - An arch prefix in a file name in `configs/<arch>/...`. The default file must
   be `DEFAULT.json`.
 - A specialized file in a folder without `DEFAULT.json`, when the loader needs
@@ -98,13 +109,20 @@ All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
 - A new `.gitkeep` file under `configs/`.
 - A new arch folder copied from another arch, when the copy is not byte
   identical or the commit message does not say so. The allowed copies are
-  gfx950 → gfx1250 and gfx1151 → gfx1150, Triton only. Never copy into a Gluon
-  folder or into gfx950.
+  gfx950 → gfx1250 and gfx1151 → gfx1150, Triton only. The copy from gfx1101
+  to gfx1200 and gfx1201 is also allowed, for Triton MHA only. Never copy into
+  a Gluon folder or into gfx950.
 - `kpack` in a config outside gfx942.
 - Files under `configs/gemm/aot/` or `configs/paged_mqa_logits/aot/`. These are
   runtime caches. Do not commit them.
 
 ## Configs: JSON contents
+
+In all config files, flag:
+
+- A comment or a note in a JSON file, for example a `"_comment"` or `"_note"`
+  key. Config files have only config values. Put the explanation in the code
+  that reads the config, or in the PR description.
 
 In GEMM configs, flag:
 
@@ -132,8 +150,9 @@ Do not flag:
 
 In MOE dispatch tables, flag:
 
-- A new Gluon shape without all six buckets: `tiny`, `small`, `medium`,
-  `medium2`, `large`, `xlarge`.
+- A new Gluon shape without all six buckets. `m2bucket()` gives the bucket of
+  M: `tiny` (M ≤ 8), `small` (M ≤ 32), `medium` (M ≤ 128), `medium2`
+  (M ≤ 256), `large` (M ≤ 512) and `xlarge` (M > 512).
 - A Gluon file without a `bm<block_m>_any` entry for a `block_m` that it uses.
 - `BLOCK_SIZE_M` or `block_m` in an entry. `block_m` is the key, not a tuned
   value.
@@ -142,12 +161,14 @@ In MOE dispatch tables, flag:
 
 ## Configs: Python code
 
-Tuning values are in JSON, never in Python. This applies to Triton and Gluon.
-Flag:
+Tuning values are in JSON files in `configs/`, never in Python or CSV files.
+This applies to Triton and Gluon. Flag:
 
 - Tuning values in `.py` files: `config.setdefault(...)`, dict literals with
   `BLOCK_SIZE_*`, `num_warps` or `waves_per_eu`, arch-specific tuning
   constants, or fallback configs.
+- A tuned config in a CSV file. Triton and Gluon configs are JSON files in
+  `aiter/ops/triton/configs/`.
 - A kernel `_get_config()` with a `backend` argument that defaults to `None`.
   The default must be `"triton"`. A public wrapper with `backend=None` must set
   the backend before it calls down.
@@ -172,7 +193,9 @@ Flag:
   the only one.
 - A new arch or backend fallback chain in a loader. The only allowed fallbacks
   are MHC (gfx942) and Triton `fused_clamp_act_mul` (gfx950). Both use the
-  `arch=` argument.
+  `arch=` argument. The choice `resolve_config_dir()` makes between the
+  `<cu_num>cu/` tree and the plain folder is not a fallback chain: a loader
+  reads one tree whole.
 - A raw config list in `@triton.autotune`. Use `autotune_configs()`:
 
   ```python
@@ -225,8 +248,13 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
 
 - Flag `device="cuda"`, `torch.device("cuda")` and `.cuda()` in wrappers and
   launch code. Allocate on the device of the input:
-  `torch.empty(shape, dtype=x.dtype, device=x.device)`. Docstring examples and
-  tests can use `"cuda"`.
+  `torch.empty(shape, dtype=x.dtype, device=x.device)`. Docstring examples,
+  tests, benchmarks and the tuning scripts can use `"cuda"`.
+- Flag a floating-point allocation without an explicit `dtype` in library
+  code. Do not flag integer constructors without a `dtype`: `arange`,
+  `randint`, `randperm` and lists of Python ints infer `int64`. Flag
+  `torch.set_default_device` and `torch.set_default_dtype` in library code.
+  The default device and dtype are global state.
 - Flag a new public wrapper without a docstring. The docstring tells what the
   kernel computes, the arguments, the return value and the limits.
 - Flag `print(...)` or a new logger in library code. Use
@@ -251,8 +279,8 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
 - The test folder is the folder of the wrapper that the test imports:
   - `attention/mla.py` → `op_tests/triton_tests/attention/test_mla.py`
   - `gemm/basic/gemm_a8w8.py` → `gemm/basic/test_gemm_a8w8.py`
-  - `moe/moe_routing/routing.py` → `moe/moe_routing/`
-  - `attention/mha.py` → `attention/`, also if its kernels are in
+  - `moe/moe_routing/routing.py` → `moe/moe_routing/test_moe_routing.py`
+  - `attention/mha.py` → `attention/test_mha.py`, also if its kernels are in
     `flash_attn_triton_amd/`
   - flat wrappers (`topk.py`, `softmax.py`) → the `triton_tests/` root
   - `utils/` helpers → `triton_tests/utils/`
@@ -267,11 +295,28 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
 - Flag configs in tests: dicts with `BLOCK_SIZE_*`, `num_warps` or
   `waves_per_eu`, or a literal `config=` argument. Tests use the config that
   the wrapper loads.
+- Flag a tensor that a test or benchmark makes without `device="cuda"`. A
+  multi-GPU test uses the CUDA device of its rank. A benchmark with a
+  `--device` option uses that option.
+- Flag a floating-point tensor that a test or benchmark makes without an
+  explicit `dtype`. Do not flag integer constructors without a `dtype`:
+  `arange`, `randint`, `randperm` and lists of Python ints infer `int64`.
+- Flag `.cuda()`, `.to("cuda")` and `.to(device)` on a tensor that the test
+  made on the CPU. Make the tensor directly on the GPU.
+- Flag `torch.set_default_device`, `torch.set_default_dtype` and
+  `torch.set_default_tensor_type` in tests and benchmarks. These calls change
+  the defaults for all later tests in the same pytest process. Do not flag a
+  context manager that sets a default and restores the previous one on exit,
+  such as `_with_default_device` in `attention/test_mha_dao_ai.py` or
+  `with_default_dtype` in `op_tests/triton_tests/utils/types.py`. It tests
+  that library code does not depend on the default.
+- Flag `torch.load` without `map_location`.
+- Do not flag `device="cpu"` in a test that checks that the wrapper rejects
+  CPU inputs.
 - Flag `print(...)` of tensors, shapes or timings, and
   `if __name__ == "__main__"` report blocks. Tests check results with asserts
   (`torch.testing.assert_close`). Do not flag the old prints in
-  `gemm/basic/test_gemm_a8wfp4.py`, `quant/test_quant.py` and
-  `conv/_helpers.py`.
+  `gemm/basic/test_gemm_a8wfp4.py` and `quant/test_quant.py`.
 - Flag f-strings and `+` in log calls. Use `%` placeholders:
   `logger.info("shape=%s", x.shape)`. Use `%d` and `%f` only for numbers that
   are never `None`. Use `%s` for all other values.
@@ -294,6 +339,10 @@ A PR that changes a convention under `aiter/ops/triton/` must update
 `aiter/ops/triton/README.md` and this file. Examples: a moved shared helper, a
 change to the config layout or the loaders, or new folders. Flag a PR that
 does not.
+
+Some rules in this file name exceptions, for example the old prints in two
+test files. When a PR fixes a file that an exception names, the PR must also
+remove that file from the exception. Flag a PR that does not.
 
 ## Agent instruction files
 
