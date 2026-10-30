@@ -48,6 +48,7 @@ SHAPES = [
     (129, 6144, 512, 5),  # MiniMax-M3 (INTER 384 pads to 512)
     (129, 6144, 768, 5),  # MiniMax-M3
     (129, 6144, 1536, 5),  # MiniMax-M3 TP=2
+    (128, 6144, 512, 4),  # MiniMax-M3 shared expert not fused, TP=8 (INTER 384 pads to 512)
     (128, 6144, 768, 4),  # MiniMax-M3 shared expert not fused, TP=4
     (128, 6144, 1536, 4),  # MiniMax-M3 shared expert not fused, TP=2
     (256, 3072, 256, 8),  # MiniMax-M2.5 TP=6
