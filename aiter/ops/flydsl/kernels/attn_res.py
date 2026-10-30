@@ -720,14 +720,14 @@ def flydsl_attn_res(
     Multi-dimensional inputs must have unit trailing stride, positive leading
     strides that are multiples of ``_VEC_WIDTH``, and a 16-byte-aligned base
     pointer for ``BufferCopy128b``. Weight vectors must satisfy the same
-    vector-copy layout rules. Each tensor must span less than 4 GiB.
-    Requires gfx942 or gfx950 (wave64) on the live GPU. ``D`` must
-    be a positive multiple of ``_VEC_WIDTH`` with a wave-aligned row size;
-    D=7168 uses 448 threads and one row per workgroup, while D=1024 defaults
-    to one 64-thread row per workgroup. ``rows_per_wg=4`` packs four
-    independent D=1024 rows into a 256-thread workgroup; packing is rejected
-    when ``row_threads * rows_per_wg`` exceeds ``_MAX_BLOCK_THREADS``, and
-    multi-wave rows reject any value other than 1.
+    vector-copy layout rules. Each tensor must span less than 4 GiB, and
+    ``stream`` must be on ``prefix.device``. Requires gfx942 or gfx950 (wave64)
+    on the live GPU. ``D`` must be a positive multiple of ``_VEC_WIDTH`` with a
+    wave-aligned row size; D=7168 uses 448 threads and one row per workgroup,
+    while D=1024 defaults to one 64-thread row per workgroup. ``rows_per_wg=4``
+    packs four independent D=1024 rows into a 256-thread workgroup; packing is
+    rejected when ``row_threads * rows_per_wg`` exceeds ``_MAX_BLOCK_THREADS``,
+    and multi-wave rows reject any value other than 1.
     """
     has_delta = delta is not None
     apply_output_norm = output_norm_weight is not None
@@ -813,30 +813,38 @@ def flydsl_attn_res(
     if prefix.shape[0] == 0:
         return out
 
-    if stream is None:
-        stream = torch.cuda.current_stream(prefix.device)
     delta_arg = delta if has_delta else prefix
     output_norm_weight_arg = output_norm_weight if apply_output_norm else norm_weight
-    launcher = _build_attn_res(
-        hidden_size,
-        num_blocks,
-        float(eps),
-        float(output_norm_eps) if apply_output_norm else 0.0,
-        has_delta,
-        block_write_idx,
-        apply_output_norm,
-        rows_per_wg,
-    )
-    _run_compiled(
-        launcher,
-        prefix,
-        delta_arg,
-        blocks,
-        norm_weight,
-        qk_weight,
-        output_norm_weight_arg,
-        out,
-        prefix.shape[0],
-        Stream(stream),
-    )
+    with torch.cuda.device(prefix.device):
+        launch_stream = (
+            torch.cuda.current_stream(prefix.device) if stream is None else stream
+        )
+        if launch_stream.device != prefix.device:
+            raise ValueError(
+                f"stream must be on {prefix.device}, got {launch_stream.device}"
+            )
+        launcher = _build_attn_res(
+            hidden_size,
+            num_blocks,
+            float(eps),
+            float(output_norm_eps) if apply_output_norm else 0.0,
+            has_delta,
+            block_write_idx,
+            apply_output_norm,
+            rows_per_wg,
+        )
+        _run_compiled(
+            launcher,
+            prefix,
+            delta_arg,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight_arg,
+            out,
+            prefix.shape[0],
+            Stream(launch_stream),
+        )
+        if stream is not None:
+            out.record_stream(launch_stream)
     return out

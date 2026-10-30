@@ -337,6 +337,29 @@ def test_flydsl_attn_res_rejects_non_wave64_live_gpu(monkeypatch):
 
 
 @_skip_unsupported_gfx
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_flydsl_attn_res_rejects_stream_on_another_device():
+    """Reject a caller stream that is not on the tensors' device."""
+    prefix, _, blocks, norm_weight, qk_weight, _, _ = _make_inputs(1)
+    other_stream = torch.cuda.Stream(device=1)
+
+    with pytest.raises(ValueError, match="stream must be on"):
+        flydsl_attn_res(
+            prefix,
+            None,
+            blocks,
+            norm_weight,
+            qk_weight,
+            None,
+            0,
+            -1,
+            _EPS,
+            _EPS,
+            stream=other_stream,
+        )
+
+
+@_skip_unsupported_gfx
 def test_flydsl_attn_res_rejects_tensors_over_4gib():
     """Reject a tensor whose byte offsets overflow the 32-bit buffer offset."""
     _, _, _, norm_weight, qk_weight, _, _ = _make_inputs(1)
