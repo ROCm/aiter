@@ -303,7 +303,9 @@ def _tuned_decode_config(
     # Zero means max_seqlen_kv is unknown (graph capture), not a short context.
     if max_seqlen_kv == 0:
         return {}
-    cfg_dir = resolve_config_dir("attention", "MLA-DECODE", backend="gluon")
+    cfg_dir = resolve_config_dir(
+        "attention", "MLA-DECODE", backend="gluon", arch=DEVICE_ARCH
+    )
     table = load_config_json(f"{cfg_dir}/DEFAULT.json")
     entries = table.get(kernel, {}).get(f"{query_dtype}_{kv_cache_dtype}")
     if entries is None:
