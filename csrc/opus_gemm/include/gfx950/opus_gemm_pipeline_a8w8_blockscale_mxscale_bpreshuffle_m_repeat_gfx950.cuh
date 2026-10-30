@@ -10,27 +10,6 @@
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
 namespace opus_gemm_bpreshuffle_pingpong_lds_layout {
 
-// Read an A/B fragment directly from LDS into its assigned AGPRs.
-template<int Vec, int OFFSET_BEGIN, class Reg, class Fragment, class Mem, class Offsets>
-__device__ inline void load_operand_fragment_pinned(Reg reg, Fragment& fragment, Mem& smem, const Offsets& offsets) {
-    using Chunk = decltype(opus::load<Vec>(smem, offsets[OFFSET_BEGIN]));
-    constexpr int dwords_per_chunk = sizeof(Chunk) / sizeof(opus::u32_t);
-    constexpr int physical_reg = decltype(reg)::value;
-    static_assert(physical_reg >= 0 && physical_reg < 128);
-    opus::array<Chunk, 2> values;
-
-    opus::static_for<2>([&](auto i) {
-        constexpr int chunk = decltype(i)::value;
-        [[clang::amdgpu_pin_agpr(physical_reg + chunk * dwords_per_chunk)]]
-        values[chunk] = opus::load<Vec>(smem, offsets[OFFSET_BEGIN + chunk]);
-    });
-
-    Fragment result;
-    opus::set_slice(result, values[0], opus::number<0>{}, opus::number<16>{});
-    opus::set_slice(result, values[1], opus::number<16>{}, opus::number<32>{});
-    [[clang::amdgpu_pin_agpr(physical_reg)]] fragment = result;
-}
-
 // Read an A/B fragment without fixing its register allocation.
 template<int Vec, int OFFSET_BEGIN, class Fragment, class Mem, class Offsets>
 __device__ inline Fragment load_operand_fragment_staged(Mem& smem, const Offsets& offsets) {
@@ -601,16 +580,12 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
         scale_b[0] = load<1>(s_sfb, rsfb_offsets[0] + ssfb_offset(tile_k))[0];
     };
 
-    // Matrix LDS -> registers, pinning A/B only when the corresponding trait is enabled.
+    // Matrix LDS -> registers using the configured fragment representation.
     auto load_a_fragment = [&](auto m_i, auto stage_i) {
         if constexpr (T::FRAGMENT_ARRAYS) {
             constexpr int m_repeat = decltype(m_i)::value;
             const auto offsets = layout_to_offsets<T::VEC_A>(u_ra + sa_offset(static_cast<int>(stage_i)));
-            if constexpr (T::PIN_A) {
-                load_operand_fragment_pinned<T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT>(number<(m_repeat % T::A_RING) * 8>{}, v_a[m_repeat % T::A_RING], s_a, offsets);
-            } else {
-                v_a[m_repeat % T::A_RING] = load_operand_fragment_staged<T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_a>(s_a, offsets);
-            }
+            v_a[m_repeat % T::A_RING] = load_operand_fragment_staged<T::VEC_A, m_repeat * T::A_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_a>(s_a, offsets);
         } else {
             constexpr int m_repeat = decltype(m_i)::value;
             const int stage = static_cast<int>(stage_i);
@@ -628,11 +603,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
         if constexpr (T::FRAGMENT_ARRAYS) {
             constexpr int n_repeat = decltype(n_i)::value;
             const auto offsets = layout_to_offsets<T::VEC_B>(u_rb + sb_offset(decltype(stage_i)::value));
-            if constexpr (T::PIN_B) {
-                load_operand_fragment_pinned<T::VEC_B, n_repeat * T::B_CHUNKS_PER_FRAGMENT>(number<64 + n_repeat * 8>{}, v_b[n_repeat], s_b, offsets);
-            } else {
-                v_b[n_repeat] = load_operand_fragment_staged<T::VEC_B, n_repeat * T::B_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_b>(s_b, offsets);
-            }
+            v_b[n_repeat] = load_operand_fragment_staged<T::VEC_B, n_repeat * T::B_CHUNKS_PER_FRAGMENT, typename BaseMMA::vtype_b>(s_b, offsets);
         } else {
             constexpr int n_repeat = decltype(n_i)::value;
             constexpr int stage = decltype(stage_i)::value;
@@ -651,17 +622,8 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
             constexpr int nr = decltype(n_i)::value;
             constexpr int ci = mr * T::E_N + nr;
             constexpr int sn = nr / (T::GROUP_N / (T::T_N * T::W_N));
-            if constexpr (T::PIN_C) {
-                // Pin C and D to the same AGPRs for in-place accumulation.
-                [[clang::amdgpu_pin_agpr(128 + ci * 4)]]
-                v_c[ci] = v_c[ci];
-                [[clang::amdgpu_pin_agpr(128 + ci * 4)]]
-                v_c[ci] = BaseMMA{}(v_a[mr % T::A_RING], v_b[nr], v_c[ci],
-                    static_cast<int>(v_sfa[mr / T::VEC_SF]), static_cast<int>(v_sfb[0]), number<mr % T::VEC_SF>{}, number<sn>{});
-            } else {
-                v_c[ci] = BaseMMA{}(v_a[mr % T::A_RING], v_b[nr], v_c[ci],
-                    static_cast<int>(v_sfa[mr / T::VEC_SF]), static_cast<int>(v_sfb[0]), number<mr % T::VEC_SF>{}, number<sn>{});
-            }
+            v_c[ci] = BaseMMA{}(v_a[mr % T::A_RING], v_b[nr], v_c[ci],
+                static_cast<int>(v_sfa[mr / T::VEC_SF]), static_cast<int>(v_sfb[0]), number<mr % T::VEC_SF>{}, number<sn>{});
         } else {
             constexpr int m_repeat = decltype(m_i)::value;
             constexpr int n_repeat = decltype(n_i)::value;
@@ -789,11 +751,11 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
 
     // ===== Epilogue =====
     if constexpr (T::FRAGMENT_ARRAYS || (T::FIXED_K == 0 && T::E_M >= 3)) {
-        // One final MFMA site keeps pinned C/D in place and shortens live
-        // ranges when the final LDS stage is selected at runtime.
+        // One final MFMA site shortens live ranges when the final LDS stage
+        // is selected at runtime.
         finish_tile((loops - 1) % 2);
     } else {
-        // Fixed-K and small unpinned tiles retain their constant LDS offsets.
+        // Fixed-K and small packed-fragment tiles retain their constant LDS offsets.
         if ((loops - 1) % 2 == 0)
             finish_tile(0_I);
         else
@@ -814,3 +776,12 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     static_for<T::OUTPUT_PASSES>([&](auto copy_i) { copy_output_bf16(decltype(copy_i)::value); });
 }
 #endif // gfx950
+
+template<class Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::MIN_WGS_PER_CU)
+void opus_gemm_bpreshuffle_pingpong_lds_kernel(
+    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+    opus_gemm_bpreshuffle_pingpong_lds_body<Traits>(args);
+#endif
+}

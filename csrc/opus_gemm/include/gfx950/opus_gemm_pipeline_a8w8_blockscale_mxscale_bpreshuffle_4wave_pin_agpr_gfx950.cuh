@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstdint>
 #include <type_traits>
 #include <opus/hip_minimal.hpp>
 #include <opus/opus.hpp>
@@ -365,35 +366,12 @@ __device__ inline constexpr auto make_layout_rsfb_scale() {
         opus::unfold_p_coord(block_dim, opus::tuple{}));
 }
 
-// Fixed-shape entries use contiguous matrix and scale strides.
-#if defined(OPUS_BP_FIXED_M) && defined(OPUS_BP_FIXED_N) && defined(OPUS_BP_FIXED_K)
-__device__ __forceinline__ void apply_fixed_args(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950& a) {
-    a.m = OPUS_BP_FIXED_M;
-    a.n = OPUS_BP_FIXED_N;
-    a.k = OPUS_BP_FIXED_K;
-    a.batch = 1;
-    a.stride_a = OPUS_BP_FIXED_K;
-    a.stride_b = OPUS_BP_FIXED_K;
-    a.stride_c = OPUS_BP_FIXED_N;
-    a.stride_a_batch = static_cast<int>(int64_t(OPUS_BP_FIXED_M) * OPUS_BP_FIXED_K);
-    a.stride_b_batch = static_cast<int>(int64_t(OPUS_BP_FIXED_N) * OPUS_BP_FIXED_K);
-    a.stride_c_batch = static_cast<int>(int64_t(OPUS_BP_FIXED_M) * OPUS_BP_FIXED_N);
-    a.stride_sfa = OPUS_BP_FIXED_M;
-    a.stride_sfb = OPUS_BP_FIXED_K / 128;
-    a.stride_sfa_batch = OPUS_BP_FIXED_M * (OPUS_BP_FIXED_K / 128);
-    a.stride_sfb_batch = (OPUS_BP_FIXED_N / 128) * (OPUS_BP_FIXED_K / 128);
-}
-#endif
-
 } // namespace opus_gemm_blockscale_mxscale_bpreshuffle_pin_detail
 
 template<class Traits>
 __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_pin_agpr(
     opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 kargs) {
     using namespace opus_gemm_blockscale_mxscale_bpreshuffle_pin_detail;
-#if defined(OPUS_BP_FIXED_M) && defined(OPUS_BP_FIXED_N) && defined(OPUS_BP_FIXED_K)
-    opus_gemm_blockscale_mxscale_bpreshuffle_pin_detail::apply_fixed_args(kargs);
-#endif
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
@@ -402,12 +380,12 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
     using Index = std::conditional_t<T::UNSIGNED_THREAD_INDEX, unsigned, int>;
     const int m = T::STATIC_M ? T::STATIC_M : kargs.m;
     const int n = T::STATIC_N ? T::STATIC_N : kargs.n;
-    const int k = T::STATIC_K ? T::STATIC_K : kargs.k;
-    const int stride_a = T::STATIC_K ? T::STATIC_K : kargs.stride_a;
-    const int stride_b = T::STATIC_K ? T::STATIC_K : kargs.stride_b;
+    const int k = kargs.k;
+    const int stride_a = kargs.stride_a;
+    const int stride_b = kargs.stride_b;
     const int stride_c = T::STATIC_N ? T::STATIC_N : kargs.stride_c;
     const int stride_sfa = T::STATIC_M ? T::STATIC_M : kargs.stride_sfa;
-    const int stride_sfb = T::STATIC_K ? T::STATIC_K / 128 : kargs.stride_sfb;
+    const int stride_sfb = kargs.stride_sfb;
     const int stride_a_batch = T::STATIC_BATCH_STRIDES ? m * k : kargs.stride_a_batch;
     const int stride_b_batch = T::STATIC_BATCH_STRIDES ? n * k : kargs.stride_b_batch;
     const int stride_c_batch = T::STATIC_BATCH_STRIDES ? m * n : kargs.stride_c_batch;
@@ -651,33 +629,43 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
     };
 
     // Load Scale_A
-    const int scale_k_groups = static_cast<unsigned int>(T::FIXED_K ? T::FIXED_K : k) / T::GROUP_K;
+    const int scale_k_groups = static_cast<unsigned int>(k) / T::GROUP_K;
     constexpr int sfa_lds_word_stride = T::VEC_SF * (T::B_M / T::HALF_B_M) * T::E_M; // 4 * （256 / 128）* 4 = 32
     const auto sfa_gmem_offsets = opus::layout_to_offsets<T::VEC_SCALE_A>(u_gsfa);
     opus::vector_t<D_SF, T::VEC_SCALE_A> sfa_panel_raw[T::SFA_PASSES_PER_CACHE_PANEL];
 
     // Scale_A Global to VGPR
-    auto load_sfa_panel = [&](int panel_k_begin) { // K<= 8192 panel_k_begin = 0
+    auto load_sfa_values = [&](int panel_k_begin, auto& sfa_values) { // K<= 8192 panel_k_begin = 0
         opus::static_for<T::SFA_PASSES_PER_CACHE_PANEL>([&](auto pass_i) { // 0/1/2/3
             constexpr int pass = decltype(pass_i)::value;
             const int first_k_group = panel_k_begin + pass * T::SFA_K_COLUMNS_PER_PASS + wave_id * T::SFA_K_COLUMNS_PER_WAVE;
             // 0 + 0/1/2/3 * 16 + 0/1/2/3 * 4
             // 8192/128 = 64 K groups, divided into 4 passes, with 16 K groups per pass. Each pass has 4 waves, and each wave consecutively loads 4 groups.
-            if constexpr (T::PAD_M || T::RESET_SFA_BEFORE_LOAD) sfa_panel_raw[pass] = {};
+            if constexpr (T::SCALE_LOAD_MODE == 0 && T::PAD_M) sfa_values[pass] = {};
             if (first_k_group < scale_k_groups) {
                 if constexpr (T::PAD_M) {
                     const int scale_row = ((lane_id & 8) | ((lane_id & 3) << 1) | ((lane_id & 4) >> 2)) * T::VEC_SCALE_A;
                     if (row + scale_row < m)
-                        sfa_panel_raw[pass] = load<T::VEC_SCALE_A>(g_sfa, sfa_gmem_offsets[pass] + gsfa_offset(panel_k_begin));
+                        sfa_values[pass] = load<T::VEC_SCALE_A>(g_sfa, sfa_gmem_offsets[pass] + gsfa_offset(panel_k_begin));
                 } else {
-                    sfa_panel_raw[pass] = load<T::VEC_SCALE_A>(g_sfa, sfa_gmem_offsets[pass] + gsfa_offset(panel_k_begin));
+                    sfa_values[pass] = load<T::VEC_SCALE_A>(g_sfa, sfa_gmem_offsets[pass] + gsfa_offset(panel_k_begin));
                 }
             }
         });
     };
+    auto load_sfa_panel = [&](int panel_k_begin) -> decltype(auto) {
+        if constexpr (T::SCALE_LOAD_MODE != 0) {
+            opus::array<opus::vector_t<D_SF, T::VEC_SCALE_A>, T::SFA_PASSES_PER_CACHE_PANEL> values{};
+            load_sfa_values(panel_k_begin, values);
+            return values;
+        } else {
+            load_sfa_values(panel_k_begin, sfa_panel_raw);
+            return (sfa_panel_raw);
+        }
+    };
 
     // Scale_A VGPR transpose and to lds
-    auto publish_sfa_panel = [&](int panel_k_begin) { // K<= 8192 panel_k_begin = 0
+    auto publish_sfa_panel = [&](int panel_k_begin, const auto& sfa_panel_raw) { // K<= 8192 panel_k_begin = 0
         // Rebuild the SFA LDS write layout at each publish site instead of
         // carrying its derived address base through the matrix mainloop.
         int publish_lane_id = lane_id;
@@ -727,14 +715,14 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
         if ((next_tile & scale_panel_mask) == 0) {
             s_waitcnt_lgkmcnt(0_I);
             opus::sync_threads();
-            load_sfa_panel(next_tile);
+            decltype(auto) refill_sfa_raw = load_sfa_panel(next_tile);
             D_SF_PACK raw_b = 0;
             if (wave_id < T::SCALE_N_HALVES && (!T::GUARD_SFB_LANE || lane_id < T::SCALE_PANEL_K_CAPACITY)) {
                 const auto raw = load<1>(g_sfb, u_gsfb + gsfb_offset(next_tile));
                 raw_b = static_cast<D_SF_PACK>(raw[0]);
             }
             s_waitcnt_vmcnt(0_I);
-            publish_sfa_panel(next_tile);
+            publish_sfa_panel(next_tile, refill_sfa_raw);
             if (wave_id < T::SCALE_N_HALVES && (!T::GUARD_SFB_LANE || lane_id < T::SCALE_PANEL_K_CAPACITY)) {
                 const D_SF_PACK packed = raw_b;
                 store<T::VEC_SF>(s_sfb, __builtin_bit_cast(opus::vector_t<D_SF, T::VEC_SF>, packed), u_ssfb);
@@ -746,7 +734,7 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
 
     int stage = 0;
     int tile = 0;
-    const int loops = static_cast<unsigned int>(T::FIXED_K ? T::FIXED_K : k) / T::B_K;
+    const int loops = static_cast<unsigned int>(k) / T::B_K;
 
     // ===== Prologue =====
     if constexpr (T::PAD_M) {
@@ -756,7 +744,7 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
         async_load<T::VEC_A>(g_a, s_a.ptr, u_ga, u_sa + sa_offset(0, 0), ga_offset(0, 0));
         async_load<T::VEC_A>(g_a, s_a.ptr, u_ga, u_sa + sa_offset(0, 1), ga_offset(1, 0));
     }
-    load_sfa_panel(0);
+    decltype(auto) prologue_sfa_raw = load_sfa_panel(0);
 
     D_SF_PACK panel_sfb_raw = 0;
     if (wave_id < T::SCALE_N_HALVES && (!T::GUARD_SFB_LANE || lane_id < T::SCALE_PANEL_K_CAPACITY)) {
@@ -766,7 +754,7 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
     async_load<T::VEC_B>(g_b, s_b.ptr, u_gb, u_sb + sb_offset(0, 0), gb_offset(0, 0));
     async_load<T::VEC_B>(g_b, s_b.ptr, u_gb, u_sb + sb_offset(0, 1), gb_offset(1, 0));
 
-    publish_sfa_panel(0);
+    publish_sfa_panel(0, prologue_sfa_raw);
     if (wave_id < T::SCALE_N_HALVES && (!T::GUARD_SFB_LANE || lane_id < T::SCALE_PANEL_K_CAPACITY)) {
         const D_SF_PACK packed = panel_sfb_raw;
         store<T::VEC_SF>(s_sfb, __builtin_bit_cast(opus::vector_t<D_SF, T::VEC_SF>, packed), u_ssfb);
@@ -797,11 +785,12 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
 
     __builtin_amdgcn_s_setprio(1);
     // ===== Main loop =====
-#pragma clang loop unroll_count(T::LOOP_UNROLL)
-    for (; tile + 2 < loops; ++tile) {
+    // Preserve the flat loop for persistent/local scales; only chunk scales
+    // need panel-bounded loops. Both use the same MFMA iteration.
+    auto main_loop_iteration = [&]() __attribute__((always_inline)) {
         const int k_tile = tile;
         asm volatile("" : "+v"(matrix_voffsets[0]), "+v"(matrix_voffsets[1]), "+v"(matrix_voffsets[2]), "+v"(matrix_voffsets[3]));
-        refill_scale_panel(k_tile + 1);
+        if constexpr (T::SCALE_LOAD_MODE != 2) refill_scale_panel(k_tile + 1);
         const int next_stage = stage ^ 1;
         const int future_tile = k_tile + 2;
         int future_matrix_offset = __builtin_amdgcn_readfirstlane(future_tile * matrix_tile_stride);
@@ -821,150 +810,150 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
         mma_scale_group<T, 6, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         mma_scale_group<T, 7, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         issue_matrix_prefetch(opus::number<0>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 3, 0);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 3, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
 
         mma_scale_group<T, 8, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         issue_matrix_prefetch(opus::number<1>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
 
         mma_scale_group<T, 9, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         mma_scale_group<T, 10, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         issue_matrix_prefetch(opus::number<2>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 0);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
 
         mma_scale_group<T, 11, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         mma_scale_group<T, 12, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         issue_matrix_prefetch(opus::number<3>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 0);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
 
         mma_scale_group<T, 13, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         mma_scale_group<T, 14, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         issue_matrix_prefetch(opus::number<4>{}, stage, future_matrix_offset);
         mma_scale_group<T, 15, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 0);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
         __builtin_amdgcn_sched_barrier(0);
 
         // A half 1 x B half 0 -> C[1][0]
         mma_scale_group<T, 0, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         issue_matrix_prefetch(opus::number<5>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 1);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
 
         mma_scale_group<T, 1, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         mma_scale_group<T, 2, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         issue_matrix_prefetch(opus::number<6>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
 
         mma_scale_group<T, 3, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         v_sfb_next = __builtin_bit_cast(opus::vector_t<D_SF_PACK, 2>, load<T::VEC_SCALE_SF_PAIR>(s_sfb, u_rsfb_pair + ssfb_offset(k_tile + 1, 0)));
         mma_scale_group<T, 4, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         issue_matrix_prefetch(opus::number<7>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 1);
-        __builtin_amdgcn_sched_group_barrier(0x100, 1, 1);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 1);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
 
         mma_scale_group<T, 5, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         mma_scale_group<T, 6, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         issue_matrix_prefetch(opus::number<8>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
 
         mma_scale_group<T, 7, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         mma_scale_group<T, 8, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         issue_matrix_prefetch(opus::number<9>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
 
         mma_scale_group<T, 9, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         mma_scale_group<T, 10, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         issue_matrix_prefetch(opus::number<10>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
 
         mma_scale_group<T, 11, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         mma_scale_group<T, 12, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         issue_matrix_prefetch(opus::number<11>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 1);
 
         mma_scale_group<T, 13, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         mma_scale_group<T, 14, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         mma_scale_group<T, 15, 1>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         load_operand_fragment_pinned<T::VEC_B, 0>(opus::number<64>{}, v_b[0], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 3, 1);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 3, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 1);
         __builtin_amdgcn_sched_barrier(0);
 
 
         // A half 0 x B half 1 -> C[0][1]
         mma_scale_group<T, 0, 1>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         issue_matrix_prefetch(opus::number<12>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 2);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 2);
 
         mma_scale_group<T, 1, 1>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 2>(opus::number<72>{}, v_b[1], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         mma_scale_group<T, 2, 1>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         mma_scale_group<T, 3, 1>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 0>(opus::number<0>{}, v_a[0][0], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 0)));
         load_operand_fragment_pinned<T::VEC_B, 4>(opus::number<80>{}, v_b[2], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         mma_scale_group<T, 4, 1>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         issue_matrix_prefetch(opus::number<13>{}, stage, future_matrix_offset);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 2);
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 2);
 
         mma_scale_group<T, 5, 1>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 6>(opus::number<88>{}, v_b[3], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         v_sfb[0] = v_sfb_next[0];
 
         issue_matrix_prefetch(opus::number<14>{}, stage, future_matrix_offset);
         mma_scale_group<T, 6, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 2>(opus::number<8>{}, v_a[0][1], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 2);
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         issue_matrix_prefetch(opus::number<15>{}, stage, future_matrix_offset);
         mma_scale_group<T, 8, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         mma_scale_group<T, 10, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 4>(opus::number<16>{}, v_a[0][2], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x800, 1, 2);
-        __builtin_amdgcn_sched_group_barrier(0x008, 4, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x800 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x800, 1, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 4, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         mma_scale_group<T, 12, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         mma_scale_group<T, 14, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
 
         v_sfa[0] = v_sfa_next[0];
         load_operand_fragment_pinned<T::VEC_A, 6>(opus::number<24>{}, v_a[0][3], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 4, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 4, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
         __builtin_amdgcn_sched_barrier(0);
 
         // A half 1 x B half 1 -> C[1][1]
         mma_scale_group<T, 0, 2>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         mma_scale_group<T, 2, 2>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 0>(opus::number<32>{}, v_a[1][0], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 4, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 4, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 4, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
 
@@ -976,36 +965,36 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
         load_operand_fragment_pinned<T::VEC_A, 2>(opus::number<40>{}, v_a[1][1], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 1)));
         const AFragment a1_m3_next = load_operand_fragment_staged<T::VEC_A, 6, AFragment>(
             s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x008, 3, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 3, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 8, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         mma_scale_group<T, 12, 1, C11_TAIL_AGPR_BASE, 11>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 0>(opus::number<96>{}, v_b_second[0], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 9, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         mma_scale_group<T, 13, 1, C11_TAIL_AGPR_BASE, 11>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 2>(opus::number<104>{}, v_b_second[1], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 10, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         mma_scale_group<T, 14, 1, C11_TAIL_AGPR_BASE, 11>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 4>(opus::number<112>{}, v_b_second[2], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 11, 1, C11_TAIL_AGPR_BASE, 11>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 4>(opus::number<48>{}, v_a[1][2], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 1)));
         mma_scale_group<T, 15, 1, C11_TAIL_AGPR_BASE, 11>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
 
         [[clang::amdgpu_pin_agpr(A1_AGPR_BASE + 3 * sizeof(AFragment) / sizeof(opus::u32_t))]] v_a[1][3] = a1_m3_next;
         [[clang::amdgpu_pin_agpr(B1_AGPR_BASE + 3 * sizeof(BFragment) / sizeof(opus::u32_t))]] v_b_second[3] = b1_n3_next;
@@ -1014,6 +1003,19 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
         v_sfb[1] = v_sfb_next[1];
         v_sfa[1] = v_sfa_next[1];
         stage = next_stage;
+    };
+    if constexpr (T::SCALE_LOAD_MODE == 2) {
+        for (; tile + 2 < loops;) {
+            refill_scale_panel(tile + 1);
+            const int panel_end = ((tile + 1) & ~scale_panel_mask)
+                + T::SCALE_PANEL_K_CAPACITY - 1;
+            const int chunk_end = panel_end < loops - 2 ? panel_end : loops - 2;
+#pragma clang loop unroll_count(T::LOOP_UNROLL)
+            for (; tile < chunk_end; ++tile) main_loop_iteration();
+        }
+    } else {
+#pragma clang loop unroll_count(T::LOOP_UNROLL)
+        for (; tile + 2 < loops; ++tile) main_loop_iteration();
     }
     // ===== Epilogue =====
     if (loops > 1) {
@@ -1025,8 +1027,8 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
         // A half 0 x B half 0 -> C[0][0]
         mma_scale_group<T, 0, 2>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         v_sfa_next = __builtin_bit_cast(opus::vector_t<D_SF_PACK, 2>, load<T::VEC_SCALE_SF_PAIR>(s_sfa, u_rsfa_pair + ssfa_offset(tile + 1, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 0);
-        __builtin_amdgcn_sched_group_barrier(0x100, 1, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 1, 0);
 
         mma_scale_group<T, 2, 2>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         mma_scale_group<T, 4, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
@@ -1038,21 +1040,21 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
         __builtin_amdgcn_s_setprio(1);
 
         mma_scale_group<T, 5, 1>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
 
         mma_scale_group<T, 6, 2>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         mma_scale_group<T, 8, 2>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         mma_scale_group<T, 10, 2>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         mma_scale_group<T, 12, 2>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
         mma_scale_group<T, 14, 2>(mma, v_a[0], v_b, c00, v_sfa[0], v_sfb[0]);
-        __builtin_amdgcn_sched_group_barrier(0x008, 10, 0);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 10, 0);
 
         // A half 1 x B half 0 -> C[1][0]
         mma_scale_group<T, 0, 2>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         mma_scale_group<T, 2, 2>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         v_sfb_next = __builtin_bit_cast(opus::vector_t<D_SF_PACK, 2>, load<T::VEC_SCALE_SF_PAIR>(s_sfb, u_rsfb_pair + ssfb_offset(tile + 1, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 4, 1);
-        __builtin_amdgcn_sched_group_barrier(0x100, 1, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 4, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 1, 1);
 
         mma_scale_group<T, 4, 2>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         mma_scale_group<T, 6, 2>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
@@ -1064,25 +1066,25 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
         AChunk a0_m0_next_1;
         [[clang::amdgpu_pin_agpr(A0_M0_STAGE_AGPR_BASE)]] a0_m0_next_0 = load<T::VEC_A>(s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 0))[0]);
         [[clang::amdgpu_pin_agpr(A0_M0_STAGE_AGPR_BASE + A_DWORDS_PER_CHUNK)]] a0_m0_next_1 = load<T::VEC_A>(s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 0))[1]);
-        __builtin_amdgcn_sched_group_barrier(0x008, 10, 1);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 10, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 1);
 
         mma_scale_group<T, 14, 2>(mma, v_a[1], v_b, c10, v_sfa[1], v_sfb[0]);
         load_operand_fragment_pinned<T::VEC_B, 0>(opus::number<64>{}, v_b[0], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 1);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 1);
         __builtin_amdgcn_sched_barrier(0);
 
         // A half 0 x B half 1 -> C[0][1]
         mma_scale_group<T, 0, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 2>(opus::number<72>{}, v_b[1], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         mma_scale_group<T, 2, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 4>(opus::number<80>{}, v_b[2], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         AFragment a0_m0_joined;
         opus::set_slice(a0_m0_joined, a0_m0_next_0, opus::number<0>{}, opus::number<16>{});
@@ -1093,71 +1095,71 @@ __device__ __forceinline__ void opus_gemm_blockscale_mxscale_bpreshuffle_4wave_p
         mma_scale_group<T, 4, 1>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         mma_scale_group<T, 5, 1>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 6>(opus::number<88>{}, v_b[3], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         v_sfb[0] = v_sfb_next[0];
 
         mma_scale_group<T, 6, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 2>(opus::number<8>{}, v_a[0][1], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         mma_scale_group<T, 8, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         mma_scale_group<T, 10, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 4>(opus::number<16>{}, v_a[0][2], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 4, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 4, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
 
         mma_scale_group<T, 12, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
         mma_scale_group<T, 14, 2>(mma, v_a[0], v_b_second, c01, v_sfa[0], v_sfb[1]);
 
         v_sfa[0] = v_sfa_next[0];
         load_operand_fragment_pinned<T::VEC_A, 6>(opus::number<24>{}, v_a[0][3], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 0)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 4, 2);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 4, 2);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 2);
         __builtin_amdgcn_sched_barrier(0);
 
         // A half 1 x B half 1 -> C[1][1]
         mma_scale_group<T, 0, 2>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         mma_scale_group<T, 2, 2>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 0>(opus::number<32>{}, v_a[1][0], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 4, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 4, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 4, 2>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         mma_scale_group<T, 6, 2>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 2>(opus::number<40>{}, v_a[1][1], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 4, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 4, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 8, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         mma_scale_group<T, 12, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 0>(opus::number<96>{}, v_b_second[0], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 9, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         mma_scale_group<T, 13, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 2>(opus::number<104>{}, v_b_second[1], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 10, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         mma_scale_group<T, 14, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_B, 4>(opus::number<112>{}, v_b_second[2], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
 
         mma_scale_group<T, 11, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 4>(opus::number<48>{}, v_a[1][2], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 1)));
         mma_scale_group<T, 15, 1>(mma, v_a[1], v_b_second, c11, v_sfa[1], v_sfb[1]);
         load_operand_fragment_pinned<T::VEC_A, 6>(opus::number<56>{}, v_a[1][3], s_a, opus::layout_to_offsets<T::VEC_A>(u_ra + sa_offset(next_stage, 1)));
         load_operand_fragment_pinned<T::VEC_B, 6>(opus::number<120>{}, v_b_second[3], s_b, opus::layout_to_offsets<T::VEC_B>(u_rb + sb_offset(next_stage, 1)));
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
-        __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
-        __builtin_amdgcn_sched_group_barrier(0x100, 4, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 2, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x008 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x008, 1, 3);
+        if constexpr (T::SCHEDULE_POLICY == 0 || (T::SCHEDULE_POLICY == 2 && 0x100 == 0x008)) __builtin_amdgcn_sched_group_barrier(0x100, 4, 3);
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(0);

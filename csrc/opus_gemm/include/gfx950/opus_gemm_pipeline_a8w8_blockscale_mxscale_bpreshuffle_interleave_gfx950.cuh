@@ -459,8 +459,15 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
         constexpr int slot = decltype(slot_i)::value;
         static_for<T::A_STEPS>([&](auto i) {
             constexpr int step = decltype(i)::value;
+            constexpr int rows_per_wave = T::WARP_SIZE / (T::K_STAGE / T::VEC_A);
+            constexpr int rows_per_block = T::BLOCK_SIZE / (T::K_STAGE / T::VEC_A);
+            static_assert(T::HALF_M % rows_per_wave == 0);
+            const int producer_row = wave_id * rows_per_wave + step * rows_per_block;
+            // Do not skip actual tail-M zero writes: only rows with no consumer.
+            if (!T::SKIP_UNUSED_A || producer_row < T::HALF_M) {
             async_load<16>(g_a, s_a.ptr + slot * T::A_SLOT + sa_offsets[step],
                 ga_offsets[step], (slot % 2) * T::HALF_M * kargs.stride_a + k * 128, number<0>{}, number<T::CACHE_A>{});
+            }
         });
     };
     auto load_b = [&](auto slot_i, int k) {
@@ -543,10 +550,17 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
     };
     auto issue_tile = [&](auto stage_i, int k) {
         constexpr int first = decltype(stage_i)::value * 2;
+        if constexpr (T::B_FIRST) {
+            load_b(number<first>{}, k);
+            load_b(number<first + 1>{}, k);
+            load_a(number<first>{}, k);
+            load_a(number<first + 1>{}, k);
+        } else {
         load_a(number<first>{}, k);
         load_a(number<first + 1>{}, k);
         load_b(number<first>{}, k);
         load_b(number<first + 1>{}, k);
+        }
     };
     auto read_b = [&](auto stage_i, auto n_i) {
         constexpr int n = decltype(n_i)::value;
@@ -638,3 +652,12 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
     });
 }
 #endif // gfx950
+
+template<class Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1)
+void opus_gemm_bpreshuffle_wave_interleave_kernel(
+    opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 args) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+    opus_gemm_bpreshuffle_wave_interleave_body<Traits>(args);
+#endif
+}

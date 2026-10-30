@@ -8,7 +8,7 @@
 // M repeats share an A fragment ring, B fragments, and two LDS matrix stages.
 template<int BlockM = 192, int BlockN = 256, int ScalePanel = 128, int FixedK = 0,
     int WaveM = 4, int GroupM = 0, int CacheA = 0, int CacheB = 0,
-    bool FragmentArrays = false, bool PinA = false, bool PinB = false, bool PinC = false,
+    bool FragmentArrays = false,
     bool XcdOrder = false, bool BoundedOutput = false, int PublishM = 0, int GroupN = 8>
 struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     // Wave64 topology and block/MFMA tile dimensions.
@@ -55,11 +55,8 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static_assert(CacheA == 0 || CacheA == 1 || CacheA == 17);
     static_assert(CacheB == 0 || CacheB == 1 || CacheB == 17);
 
-    // Fragment arrays support independent A/B/C pinning.
-    static constexpr bool PIN_A = PinA;
-    static constexpr bool PIN_B = PinB;
-    static constexpr bool PIN_C = PinC;
-    static constexpr bool FRAGMENT_ARRAYS = FragmentArrays || PinA || PinB || PinC;
+    // Keep fragments in separate arrays when requested by the JIT configuration.
+    static constexpr bool FRAGMENT_ARRAYS = FragmentArrays;
 
     static constexpr bool XCD_ORDER = XcdOrder;
     static constexpr bool BOUNDED_OUTPUT = BoundedOutput;
@@ -67,9 +64,6 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
 
     // The publication index excludes the final M repeat.
     static_assert(PublishM >= 0 && PublishM < BlockM / (WaveM * 16) - 1);
-    // Pinned B occupies AGPRs 64-127; pinned C starts at AGPR 128.
-    static_assert(!PIN_B || E_N * 8 <= 64);
-    static_assert(!PIN_C || 128 + E_M * E_N * 4 <= 256);
 
     // Vector widths and K128 block-scale groups.
     static constexpr int VEC_A = 16;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Offline builder for gfx1250 pin VGPR and gfx950 MXFP8 pin AGPR kernels.
+"""Offline builder for gfx1250 and gfx950 pre-compiled kernels.
 
 Why this exists
 ---------------
@@ -21,21 +21,24 @@ goes through the ordinary JIT path.
 
 Source of truth
 ---------------
-``gen_co/co_kernels_gfx1250.json`` -- read by ``opus_gemm_common.py`` to build the kid
+``gen_co/co_kernels_<arch>.json`` -- read by ``opus_gemm_common.py`` to build the kid
 table (which drives the JIT codegen) and re-read from there by this script. One
 file describes each variant's tile, cluster, launch bounds, VGPR budget, dtypes
 and device flags, so adding a variant never touches Python. Both sides spell the
-traits through ``co_traits_args()``. For both architectures, all three names
-are identical::
+traits through ``co_traits_args()``, which is what makes the three names
+identical without any sidecar::
 
     .co filename == extern "C" symbol inside the .co == host launcher symbol
+
+gfx950 uses short image/launcher names while retaining each verified ELF symbol.
 
 The compiler is NOT pinned to a version
 ---------------------------------------
 ``--llvm-bin`` just says which toolchain to use; nothing here checks what it is.
-For gfx1250, the resolved clang, its version and each entry's exact flags are
-recorded in ``build_info.json`` alongside the emitted assembly. gfx950 records
-build status and pin-variant resource checks in its build report.
+The resolved clang, its version and each entry's exact flags are recorded in
+``build_info.json`` -- when behaviour changes after a toolchain bump, that
+record plus the emitted assembly (``asm/*.s`` and ``asm/*.dis``) is how you find
+out why.
 
 Usage
 -----
@@ -67,10 +70,10 @@ _OPUS_GEMM_DIR = os.path.dirname(_HERE)  # csrc/opus_gemm
 _CSRC_DIR = os.path.dirname(_OPUS_GEMM_DIR)  # csrc
 _REPO_ROOT = os.path.dirname(_CSRC_DIR)
 
+# opus_gemm_common / codegen.* are imported the same way gen_instances.py does.
 sys.path.insert(0, _OPUS_GEMM_DIR)
 sys.path.insert(0, _REPO_ROOT)
 
-from codegen.gen_instances_gfx950 import co_traits_args as co_traits_args_gfx950
 from codegen.gen_instances_gfx1250 import (
     KARGS_NAME_MAP,
     KERNEL_FUNC_MAP,
@@ -81,10 +84,7 @@ from codegen.gen_instances_gfx1250 import (
 # The _declared_ table, not the filtered one: opus_gemm_common drops entries
 # whose .co is not on disk (so nothing downstream can register an unlaunchable
 # kid), and this script exists to create exactly those files.
-from opus_gemm_common import (
-    gfx950_co_kernels_declared,
-    gfx1250_4wave_co_kernels_declared,
-)
+from opus_gemm_common import gfx950_co_kernels_declared, gfx1250_4wave_co_kernels_declared
 
 from aiter_worker_limits import (
     JOBS_CLI_HELP,
@@ -92,6 +92,9 @@ from aiter_worker_limits import (
     get_worker_count_for,
 )
 
+# Every pre-compiled family and the pipeline header each one's device body
+# lives in. The rest of the stub (traits/kargs/body names) comes from the
+# codegen maps, so a new family is one row here plus one row there.
 _PIPELINE_HEADERS = {
     "a16w16_4wave_co": "opus_gemm_pipeline_a16w16_4wave_compute_gfx1250.cuh",
     "a16w16_4wave_wl_co": "opus_gemm_pipeline_a16w16_4wave_wl_gfx1250.cuh",
@@ -206,7 +209,7 @@ def _elf_target_metadata(path, offload_arch):
     machine = int.from_bytes(header[18:20], "little")
     flags = int.from_bytes(header[48:52], "little")
     processor = flags & 0xFF
-    expected = {"gfx1250": 0x49, "gfx1250-strict": 0xEB}[offload_arch]
+    expected = {"gfx950": 0x4F, "gfx1250": 0x49, "gfx1250-strict": 0xEB}[offload_arch]
     if machine != 224 or processor != expected:
         raise SystemExit(
             f"build_co: {path} target mismatch: machine={machine}, "
@@ -230,37 +233,33 @@ def _device_link_metadata(readelf, path):
     return {"undefined_symbols": []}
 
 
-def _kernel_metadata(
-    readelf,
-    path,
-    symbol,
-    keys=(
+def _kernel_metadata(readelf, path, symbol, extra_keys=()):
+    """Pull (.vgpr_count, .sgpr_count, .group_segment_fixed_size,
+    .kernarg_segment_size) for `symbol` out of the AMDGPU note."""
+    out = _run([readelf, "--notes", path]).stdout
+    # One kernel per .co, so a flat scan is enough -- but assert that, because
+    # a second kernel would make the numbers ambiguous.
+    names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", out, re.MULTILINE)
+    if names != [symbol]:
+        raise SystemExit(
+            f"build_co: {os.path.basename(path)} should contain exactly one "
+            f"kernel named {symbol!r}, found {names!r}"
+        )
+    fields = {}
+    for key in (
         "vgpr_count",
         "sgpr_count",
         "vgpr_spill_count",
         "sgpr_spill_count",
         "group_segment_fixed_size",
         "kernarg_segment_size",
-    ),
-):
-    """Read the requested integer fields from a single-kernel AMDGPU note."""
-    out = _run([readelf, "--notes", path]).stdout
-    names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", out, re.MULTILINE)
-    if names != [symbol]:
-        raise ValueError(
-            f"build_co: {os.path.basename(path)} should contain exactly one "
-            f"kernel named {symbol!r}, found {names!r}"
-        )
-    fields = {}
-    for key in keys:
+    ) + extra_keys:
         m = re.search(rf"^\s*(?:-\s*)?\.{key}:\s*(\d+)\s*$", out, re.MULTILINE)
         if m is None:
-            raise ValueError(f"build_co: .{key} missing from {path} metadata")
+            raise SystemExit(f"build_co: .{key} missing from {path} metadata")
         fields[key] = int(m.group(1))
     return fields
 
-
-_GFX950_MANIFEST = os.path.join(_HERE, "co_kernels_gfx950.json")
 
 _GFX950_STUB_TEMPLATE = """// Auto-generated by gen_co/build_co.py for gfx950.
 #include "gfx950/{traits_header}"
@@ -283,18 +282,10 @@ void {symbol}(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 kargs)
 """
 
 
-def _check_gfx950_pin(entry, path, llvm_bin):
+def _check_gfx950_pin(entry, path, llvm_bin, *, fail_on_spill=False):
     fields = _kernel_metadata(
-        _tool(llvm_bin, "llvm-readelf"),
-        path,
-        entry["symbol"],
-        (
-            "vgpr_count",
-            "agpr_count",
-            "vgpr_spill_count",
-            "sgpr_spill_count",
-            "private_segment_fixed_size",
-        ),
+        _tool(llvm_bin, "llvm-readelf"), path, entry["symbol"],
+        ("agpr_count", "private_segment_fixed_size"),
     )
     if any(
         fields[key]
@@ -304,7 +295,10 @@ def _check_gfx950_pin(entry, path, llvm_bin):
             "private_segment_fixed_size",
         )
     ):
-        raise ValueError(f"register spill/scratch: {fields}")
+        message = f"register spill/scratch for {entry['symbol']}: {fields}"
+        if fail_on_spill:
+            raise ValueError(message)
+        print(f"[build_co] warning: {message}", file=sys.stderr)
     mask = entry["pin_mask"]
     if not mask:
         return fields
@@ -342,86 +336,60 @@ def _check_gfx950_pin(entry, path, llvm_bin):
 def build_one_gfx950(entry, args, llvm_bin, workdir):
     symbol = entry["symbol"]
     output = os.path.join(args.out_dir, entry["image"])
-    os.makedirs(os.path.dirname(output), exist_ok=True)
-    optional = entry.get("pin_variant", False)
-    if getattr(args, "skip_existing", False) and os.path.isfile(output):
-        try:
-            resources = _check_gfx950_pin(entry, output, llvm_bin) if optional else {}
-            return {"kid": entry["kid"], "status": "ready", **resources}
-        except ValueError:
-            pass
-    stub_path = os.path.join(workdir, f"{symbol}.hip")
-    with open(stub_path, "w") as f:
-        f.write(
-            _GFX950_STUB_TEMPLATE.format(
-                traits_header=entry.get(
-                    "traits_header",
-                    entry["pipeline_header"].replace("_pipeline_", "_traits_", 1),
-                ),
-                pipeline_header=entry["pipeline_header"],
-                traits_name=entry["traits"]["name"],
-                traits_args=co_traits_args_gfx950(entry),
-                body_func=entry["body_func"],
-                body_args=", ".join(map(str, entry["body_args"])),
-                symbol=symbol,
-                lb_threads=entry["launch_bounds"][0],
-                lb_waves=entry["launch_bounds"][1],
-            )
-        )
-    staged = os.path.join(workdir, f"{symbol}.co")
-    command = [
-        *shlex.split(args.hipcc),
-        "-x",
-        "hip",
-        "--offload-arch=gfx950",
-        "-std=c++20",
-        "-O3",
-        "-D__HIPCC_RTC__",
-        "-DOPUS_ENABLE_RUNTIME_QUERY=0",
-        f"-I{_CSRC_DIR}/include",
-        f"-I{_OPUS_GEMM_DIR}/include",
-        *entry.get("device_flags", []),
-        *args.device_flag,
-        *(
-            ["-Werror=unknown-attributes", "-Werror=ignored-attributes"]
-            if optional
-            else []
-        ),
-        "--genco",
-        "-o",
-        staged,
-        stub_path,
-    ]
-    env = dict(os.environ)
-    if llvm_bin:
-        env["HIP_CLANG_PATH"] = llvm_bin
-    print(f"[build_co] compiling {entry['image']}", flush=True)
+    staged = os.path.join(workdir, entry["image"])
+    reuse = args.skip_existing and os.path.isfile(output)
+    device_flags = list(entry["device_flags"]) + list(args.device_flag)
+    if entry.get("pin_variant"):
+        device_flags += ["-Werror=unknown-attributes", "-Werror=ignored-attributes"]
     try:
-        result = _run(command, env=env)
-        if result.stderr.strip():
-            sys.stderr.write(result.stderr)
+        if not reuse:
+            stub_path = os.path.join(workdir, entry["name"] + ".hip")
+            with open(stub_path, "w") as stream:
+                stream.write(_GFX950_STUB_TEMPLATE.format(
+                    traits_header=entry.get("traits_header", entry["pipeline_header"].replace("_pipeline_", "_traits_", 1)),
+                    pipeline_header=entry["pipeline_header"],
+                    traits_name=entry["traits"]["name"],
+                    traits_args=", ".join(entry["traits"]["args"]),
+                    body_func=entry["body_func"], body_args=", ".join(entry["body_args"]),
+                    symbol=symbol, lb_threads=entry["launch_bounds"][0],
+                    lb_waves=entry["launch_bounds"][1],
+                ))
+            env = dict(os.environ)
+            if llvm_bin:
+                env["HIP_CLANG_PATH"] = llvm_bin
+            print(f"[build_co] compiling {entry['image']}", flush=True)
+            proc = _run([
+                *shlex.split(args.hipcc), "-x", "hip", f"--offload-arch={args.offload_arch}",
+                "-std=c++20", "-O3", "-D__HIPCC_RTC__", "-DOPUS_ENABLE_RUNTIME_QUERY=0",
+                f"-I{_CSRC_DIR}/include", f"-I{_OPUS_GEMM_DIR}/include", *device_flags,
+                "--genco", "-o", staged, stub_path,
+            ], env=env)
+            if proc.stderr.strip():
+                sys.stderr.write(proc.stderr)
+            _unbundle_if_needed(staged, llvm_bin, args.offload_arch)
+        image = output if reuse else staged
+        resources = _check_gfx950_pin(entry, image, llvm_bin, fail_on_spill=args.fail_on_spill)
+        if resources["kernarg_segment_size"] != 96:
+            raise ValueError(f"gfx950 kid {entry['kid']} requires a 96-byte kernel ABI")
+        target = _elf_target_metadata(image, args.offload_arch)
+        linked = _device_link_metadata(_tool(llvm_bin, "llvm-readelf"), image)
+        with open(image, "rb") as stream:
+            checksum = hashlib.sha256(stream.read()).hexdigest()
+        if not reuse:
+            os.replace(staged, output)
+        return {
+            "kid": entry["kid"], "name": entry["name"], "image": entry["image"],
+            "symbol": symbol, "status": "ready", "co_sha256": checksum,
+            **target, **linked, **resources,
+        }
     except subprocess.CalledProcessError as error:
-        sys.stderr.write((error.stdout or "") + (error.stderr or ""))
-        if optional:
-            if os.path.isfile(output):
-                os.remove(output)
-            return {
-                "kid": entry["kid"],
-                "status": "rejected",
-                "reason": "compilation failed",
-            }
-        raise SystemExit(
-            f"build_co: compilation failed for gfx950 kid {entry['kid']}"
-        ) from error
-    _unbundle_if_needed(staged, llvm_bin, "gfx950")
-    try:
-        resources = _check_gfx950_pin(entry, staged, llvm_bin) if optional else {}
+        diagnostics = (error.stdout or "") + (error.stderr or "")
+        sys.stderr.write(diagnostics)
+        if not entry.get("pin_variant"):
+            raise SystemExit(f"build_co: compilation failed for gfx950 kid {entry['kid']}") from error
+        return {"kid": entry["kid"], "status": "rejected", "reason": diagnostics.strip()}
     except ValueError as error:
-        if os.path.isfile(output):
-            os.remove(output)
         return {"kid": entry["kid"], "status": "rejected", "reason": str(error)}
-    os.replace(staged, output)
-    return {"kid": entry["kid"], "status": "ready", **resources}
 
 
 def _expected_lds(k, no_pad=False):
@@ -429,6 +397,8 @@ def _expected_lds(k, no_pad=False):
 
     Including the 1-WG/CU pad: a tile whose A/B segments fit twice in the
     320 KB budget is padded past 160 KB so a second workgroup cannot co-reside.
+    Keep this in step with LDS_BYTES in the traits -- the check below compares
+    the two and is the reason the drift was caught rather than shipped.
 
     ``no_pad`` mirrors -DOPUS_CO_NO_1WG_PAD, the debug switch that puts the
     padded variants back at 2 WG/CU.
@@ -450,6 +420,15 @@ _WMMA_DST = re.compile(r"v_wmma\S*\s+v\[(\d+):\d+\]\s*(?:/\*v\[(\d+):)?")
 
 
 def _asm_stats(text, prefix):
+    """The numbers that used to be enforced by --min-vgpr, now RECORDED instead
+    of judged: with several VGPR budgets in the table there is no single
+    threshold that means "the pin was honoured". Compare them across builds.
+
+    va_vdst(0) counts the full VALU->VMEM drains the pinning exists to avoid
+    (21 in the pinned reference, 160 unpinned); wmma_dst_hi says whether the
+    accumulators actually landed in the high register file (768/768 pinned,
+    0/768 unpinned).
+    """
     lines = text.splitlines()
     hi = total = 0
     for ln in lines:
@@ -666,6 +645,8 @@ def build_one(k, args, llvm_bin, workdir):
             sys.stderr.write(proc.stderr)
             raise SystemExit(f"build_co: hipcc failed for {symbol} ({what})")
         if proc.stderr.strip():
+            # Warnings are worth seeing: a dropped attribute here is exactly the
+            # failure mode this whole offline path exists to avoid.
             sys.stderr.write(proc.stderr)
 
     print(f"[build_co] compiling {symbol}")
@@ -674,10 +655,7 @@ def build_one(k, args, llvm_bin, workdir):
     unbundled = _unbundle_if_needed(out_path, llvm_bin, args.offload_arch)
 
     readelf = _tool(llvm_bin, "llvm-readelf")
-    try:
-        md = _kernel_metadata(readelf, out_path, symbol)
-    except ValueError as error:
-        raise SystemExit(str(error)) from error
+    md = _kernel_metadata(readelf, out_path, symbol)
     target_md = _elf_target_metadata(out_path, args.offload_arch)
     target_md.update(_device_link_metadata(readelf, out_path))
 
@@ -767,6 +745,10 @@ def build_one(k, args, llvm_bin, workdir):
             "s": os.path.relpath(s_path, args.out_dir),
             "dis": os.path.relpath(dis_path, args.out_dir),
         }
+        # Both, because they count different things: the listing carries the
+        # directives and scheduling comments (and is what the historical
+        # 6463-line / 21 va_vdst(0) / 768 WMMA reference numbers came from),
+        # while the disassembly is the artifact that actually ships.
         with open(s_path) as f:
             info.update(_asm_stats(f.read(), "asm_"))
 
@@ -801,7 +783,7 @@ def main():
         help="bin/ of the LLVM build to compile with; exported as "
         "HIP_CLANG_PATH and used for llvm-readelf / llvm-objdump / "
         "clang-offload-bundler. No version is assumed or checked -- what "
-        "was used is recorded in build_info.json for gfx1250. "
+        "was used is recorded in build_info.json. "
         "Defaults to $OPUS_CO_LLVM_BIN, then $PIN.",
     )
     p.add_argument(
@@ -818,21 +800,6 @@ def main():
         "while retaining gfx1250 runtime routing and kernel identities",
     )
     p.add_argument(
-        "--kids",
-        nargs="+",
-        metavar="KID",
-        help="exact local CO kids to rebuild, separated by spaces or commas "
-        "(default: all); use a separate --out-dir for a subset",
-    )
-    p.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="gfx950: reuse existing COs; pin variants still undergo resource/ISA checks.",
-    )
-    p.add_argument(
-        "--report", help="gfx950: write this invocation's build report to this path."
-    )
-    p.add_argument(
         "--device-flag",
         action="append",
         default=[],
@@ -840,25 +807,24 @@ def main():
         help="extra device-pass flag appended to EVERY entry, repeatable. For "
         "investigations that need the whole family rebuilt one way, e.g. "
         "--device-flag=-DOPUS_CO_NO_1WG_PAD to drop the 1-WG/CU pad and "
-        "put the affected variants back at 2 WG/CU. For gfx1250, recorded per entry in "
+        "put the affected variants back at 2 WG/CU. Recorded per entry in "
         "build_info.json, so an artifact never hides which one built it.",
     )
     p.add_argument(
         "--out-dir",
         default="",
-        help="default: <this dir>/gfx950 or <this dir>/named_reg/gfx1250; "
-        "with gfx1250-strict: <this dir>/gfx1250-a0. "
-        "Pass an explicit output for production rebuilds",
+        help="default: <this dir>/named_reg/<arch>; with gfx1250-strict: "
+        "<this dir>/<arch>-a0. Pass an explicit output for production rebuilds",
     )
     p.add_argument(
         "--no-asm",
         action="store_true",
-        help="gfx1250 only: skip the asm/<symbol>.s and asm/<symbol>.dis debug dumps",
+        help="skip the asm/<symbol>.s and asm/<symbol>.dis debug dumps",
     )
     p.add_argument(
         "--fail-on-spill",
         action="store_true",
-        help="gfx1250 only: treat any VGPR/SGPR spill as an error. Off by default: at the "
+        help="treat any VGPR/SGPR spill as an error. Off by default: at the "
         "tighter VGPR budgets spilling is the expected outcome, not a "
         "malfunction. The counts always land in build_info.json.",
     )
@@ -869,21 +835,21 @@ def main():
         default=None,
         help=JOBS_CLI_HELP,
     )
+    p.add_argument(
+        "--kids",
+        nargs="+",
+        default=None,
+        help="comma-separated exact CO kids to rebuild (default: all); "
+        "use a separate --out-dir for a subset",
+    )
+    p.add_argument("--skip-existing", action="store_true", help="gfx950: validate and reuse existing COs")
+    p.add_argument("--report", help="gfx950: optional build_info.json output path")
     p.add_argument("--keep-temps", action="store_true")
     args = p.parse_args()
 
     args.offload_arch = args.offload_arch or args.arch
-    if args.arch == "gfx950" and args.offload_arch != "gfx950":
-        p.error("gfx950 COs require --offload-arch=gfx950")
-    if args.arch == "gfx1250" and args.offload_arch == "gfx950":
-        p.error("gfx1250 COs require --offload-arch=gfx1250 or gfx1250-strict")
-    if args.kids is not None:
-        try:
-            args.kids = sorted(
-                {int(kid.strip()) for token in args.kids for kid in token.split(",")}
-            )
-        except ValueError:
-            p.error("--kids must contain integer CO kids separated by spaces or commas")
+    if args.offload_arch != args.arch and (args.arch, args.offload_arch) != ("gfx1250", "gfx1250-strict"):
+        p.error("--offload-arch does not match --arch")
     if not args.out_dir:
         args.out_dir = _default_co_output_dir(args.arch, args.offload_arch)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -891,55 +857,32 @@ def main():
     llvm_bin = os.path.abspath(args.llvm_bin) if args.llvm_bin else ""
     print(f"[build_co] clang from: {llvm_bin or '(PATH / hipcc default)'}")
 
-    if args.arch == "gfx950":
-        # Local registry keys remain distinct when CO metadata is shared by aliases.
-        instances = [
-            {**entry, "kid": kid} for kid, entry in gfx950_co_kernels_declared.items()
-        ]
-        build = build_one_gfx950
-        manifest_path = _GFX950_MANIFEST
-    else:
-        instances = [
-            k
-            for k in gfx1250_4wave_co_kernels_declared.values()
-            if k.kernel_tag in _PIPELINE_HEADERS
-        ]
-        build = build_one
-        manifest_path = os.path.join(_HERE, "co_kernels_gfx1250.json")
-    if args.kids is not None:
-        if args.arch == "gfx950":
-            unknown = set(args.kids) - set(gfx950_co_kernels_declared)
-            if unknown:
-                p.error(f"Unknown CO IDs: {sorted(unknown)}")
-            instances = [entry for entry in instances if entry["kid"] in args.kids]
-        else:
-            unknown = set(args.kids) - set(gfx1250_4wave_co_kernels_declared)
-            if unknown:
-                p.error(f"unknown CO kids: {sorted(unknown)}")
-            instances = [
-                entry
-                for kid, entry in gfx1250_4wave_co_kernels_declared.items()
-                if kid in args.kids and entry.kernel_tag in _PIPELINE_HEADERS
-            ]
+    table = gfx950_co_kernels_declared if args.arch == "gfx950" else gfx1250_4wave_co_kernels_declared
+    selected = set(table)
+    if args.kids:
+        try:
+            selected = {int(kid.strip()) for token in args.kids for kid in token.split(",")}
+        except ValueError:
+            p.error("--kids must contain integer CO kids separated by spaces or commas")
+        unknown = selected - set(table)
+        if unknown:
+            p.error(f"unknown CO kids: {sorted(unknown)}")
+    instances = [entry for kid, entry in table.items() if kid in selected and
+                 (args.arch == "gfx950" or entry.kernel_tag in _PIPELINE_HEADERS)]
     if not instances:
-        raise SystemExit(f"build_co: no pre-compiled entries -- check {manifest_path}")
-    if args.arch == "gfx950":
-        co_aliases, co_instances = {}, {}
-        for entry in instances:
-            symbol = entry["symbol"]
-            co_aliases.setdefault(symbol, []).append(entry["kid"])
-            if symbol not in co_instances or entry.get("pin_variant"):
-                co_instances[symbol] = entry
-        instances = list(co_instances.values())
+        raise SystemExit(f"build_co: no pre-compiled entries for {args.arch}")
+    build = build_one_gfx950 if args.arch == "gfx950" else build_one
     jobs = get_worker_count_for(len(instances), args.jobs)
 
-    workdir = tempfile.mkdtemp(
-        prefix="opus_build_co_", dir=args.out_dir if args.arch == "gfx950" else None
-    )
+    workdir = tempfile.mkdtemp(prefix="opus_build_co_", dir=args.out_dir if args.arch == "gfx950" else None)
     try:
         if jobs == 1:
             built = [build(k, args, llvm_bin, workdir) for k in instances]
         else:
+            # One hipcc per entry and they share nothing but the read-only headers,
+            # so this is embarrassingly parallel. A full sweep is thousands of
+            # entries; serially that is hours, and the box has hundreds of cores.
+            # Threads, not processes: every worker spends its life in subprocess.
             from concurrent.futures import ThreadPoolExecutor
 
             print(f"[build_co] {len(instances)} entries on {jobs} jobs")
@@ -953,32 +896,6 @@ def main():
             print(f"[build_co] stub TUs kept in {workdir}")
         else:
             shutil.rmtree(workdir, ignore_errors=True)
-
-    if args.arch == "gfx950":
-        results = {row["kid"]: row for row in built}
-        built = sorted(
-            (
-                {
-                    **results[entry["kid"]],
-                    "kid": kid,
-                    "image": entry["image"],
-                    "symbol": entry["symbol"],
-                }
-                for entry in instances
-                for kid in co_aliases[entry["symbol"]]
-            ),
-            key=lambda row: row["kid"],
-        )
-        with open(
-            args.report or os.path.join(args.out_dir, "build_info.json"), "w"
-        ) as stream:
-            json.dump({"llvm_bin": llvm_bin, "kernels": built}, stream, indent=2)
-            stream.write("\n")
-        rejected = sum(row.get("status") == "rejected" for row in built)
-        print(
-            f"[build_co] ready={len(built) - rejected} rejected={rejected} in {args.out_dir}"
-        )
-        return
 
     # Reproducibility record: which compiler and which flags produced these, so
     # "it behaves differently after a toolchain bump" is answerable. This record
@@ -1007,11 +924,15 @@ def main():
         ],
         "kernels": built,
     }
-    info_path = os.path.join(args.out_dir, "build_info.json")
+    info_path = (args.report if args.arch == "gfx950" else None) or os.path.join(args.out_dir, "build_info.json")
     with open(info_path, "w") as f:
         json.dump(info, f, indent=2, sort_keys=True)
         f.write("\n")
-    print(f"[build_co] wrote {len(built)} .co + {info_path}")
+    if args.arch == "gfx950":
+        ready = sum(row["status"] == "ready" for row in built)
+        print(f"[build_co] ready={ready} rejected={len(built) - ready} + {info_path}")
+    else:
+        print(f"[build_co] wrote {len(built)} .co + {info_path}")
 
 
 if __name__ == "__main__":

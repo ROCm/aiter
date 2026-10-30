@@ -21,16 +21,16 @@ struct CoModule {
     std::vector<char> image;
     AiterAsmKernelFast kernel;
 
-    explicit CoModule(const std::string& symbol)
-        : image(read_co(symbol)),
+    CoModule(const std::string& symbol, const std::string& image_name)
+        : image(read_co(image_name)),
           kernel(symbol.c_str(), image.data(), AiterAsmKernelFast::SkipGfx1250Gate{}) {}
 
 private:
-    static std::vector<char> read_co(const std::string& symbol) {
+    static std::vector<char> read_co(const std::string& image_name) {
         const char* env = std::getenv("OPUS_GEN_CO_DIR");
         const std::string root = env && *env ? env : OPUS_GEN_CO_DIR;
         AITER_CHECK(!root.empty(), "gfx950 CO directory is empty");
-        const auto path = root + "/gfx950/" + symbol + ".co";
+        const auto path = root + "/gfx950/" + image_name;
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         AITER_CHECK(file.is_open(), "gfx950 cannot open CO: ", path);
         const std::streamsize size = file.tellg();
@@ -43,9 +43,9 @@ private:
         return bytes;
     }
 };
-inline AiterAsmKernelFast& co_kernel(const std::string& symbol) {
+inline AiterAsmKernelFast& co_kernel(const std::string& symbol, const std::string& image_name) {
     static SynchronizedCache<std::string, CoModule> cache;
-    return cache.get_or_create(symbol, [&]() { return CoModule(symbol); }).kernel;
+    return cache.get_or_create(image_name, [&]() { return CoModule(symbol, image_name); }).kernel;
 }
 } // namespace opus_gfx950_co
 template<class Kargs>
@@ -59,10 +59,4 @@ inline void opus_co_launch_gfx950(AiterAsmKernelFast& kernel, dim3 grid, dim3 bl
                           stream, 1, 1, 1, dynamic_lds});
 }
 
-namespace opus_gfx950_co {
-struct LaunchContract {
-    int64_t m, n, k;
-    unsigned gx, gy, gz, bx, by, bz, dynamic_lds;
-};
-} // namespace opus_gfx950_co
 #endif

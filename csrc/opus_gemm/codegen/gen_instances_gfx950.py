@@ -183,9 +183,6 @@ KARGS_NAME_MAP = {
 }
 
 
-def co_traits_args(k):
-    return ",".join(k["traits"]["args"])
-
 
 def splitk_reduce_extra_device_instantiations():
     # gfx950 carries a second reduce kernel: the mmajor BMM reduce used by the
@@ -3215,92 +3212,47 @@ def gen_mxscale_bpreshuffle_instance(
             return
         entry = k.bpreshuffle_co
         symbol = entry["symbol"]
-        if "launches" in entry:
-            rows = [
-                "{"
-                + ",".join(
-                    map(
-                        str,
-                        (
-                            *map(int, shape.split(",")),
-                            *launch["grid"],
-                            *launch["block"],
-                            launch.get("dynamic_lds_bytes", 0),
-                        ),
-                    )
-                )
-                + "}"
-                for shape, launch in entry["launches"].items()
-            ]
-            grid_setup = (
-                "static constexpr opus_gfx950_co::LaunchContract contracts[] = {"
-                + ",\n".join(rows)
-                + "};\n"
-                "    const opus_gfx950_co::LaunchContract* selected = nullptr;\n"
-                "    for (const auto& contract : contracts)\n"
-                "        if (contract.m == m && contract.n == n && contract.k == k) { selected = &contract; break; }\n"
-                '    AITER_CHECK(selected, "shape is unsupported by this CO");\n'
-                "    const dim3 grid(selected->gx, selected->gy, selected->gz), block(selected->bx, selected->by, selected->bz);\n"
-                "    const unsigned dynamic_lds = selected->dynamic_lds;"
+        grid_setup = f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
+        if entry.get("grid_layout") in ("xcd", "linear"):
+            grid_x = (
+                "((tiles + 7) / 8) * 8"
+                if entry["grid_layout"] == "xcd"
+                else "tiles"
+            )
+            grid_setup += (
+                f"    const int tiles = ((m + {k.B_M - 1}) / {k.B_M}) * (n / {k.B_N});\n"
+                f"    const dim3 grid({grid_x}), block({k.BLOCK_SIZE});\n"
             )
         else:
-            grid_setup = f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
-            if entry.get("grid_layout") in ("xcd", "linear"):
-                grid_x = (
-                    "((tiles + 7) / 8) * 8"
-                    if entry["grid_layout"] == "xcd"
-                    else "tiles"
-                )
-                grid_setup += (
-                    f"    const int tiles = ((m + {k.B_M - 1}) / {k.B_M}) * (n / {k.B_N});\n"
-                    f"    const dim3 grid({grid_x}), block({k.BLOCK_SIZE});\n"
-                )
-            else:
-                rounded_m = f"(m + {k.B_M - 1})" if k.pad_m else "m"
-                grid_setup += f"    const dim3 grid(n / {k.B_N}, {rounded_m} / {k.B_M}), block({k.BLOCK_SIZE});\n"
-            grid_setup += "    const unsigned dynamic_lds = 0;"
-            limit = min(2147483647, k.max_tensor_bytes)
-            conditions = [
-                f"m * k <= {limit}",
-                f"n * k <= {limit}",
-                f"2 * m * n <= {k.max_tensor_bytes}",
-            ]
-            if k.max_k is not None:
-                conditions.append(f"k <= {k.max_k}")
-            if k.bpreshuffle_fixed_k:
-                conditions.append(f"k == {k.bpreshuffle_fixed_k}")
-            if entry.get("wide_output"):
-                conditions.append(
-                    f"2 * (((m < {k.B_M} ? m : {k.B_M}) - 1) * n + {k.B_N}) <= {limit}"
-                )
-            elif not k.pad_m:
-                conditions.extend(
-                    (
-                        f"m * n <= {limit}",
-                        f"2 * (({k.B_M - 1}) * n + {k.B_N}) <= {limit}",
-                    )
-                )
-            grid_setup += (
-                "\n    AITER_CHECK("
-                + " && ".join(conditions)
-                + ', "CO tensor extent exceeds pipeline limits");'
+            rounded_m = f"(m + {k.B_M - 1})" if k.pad_m else "m"
+            grid_setup += f"    const dim3 grid(n / {k.B_N}, {rounded_m} / {k.B_M}), block({k.BLOCK_SIZE});\n"
+        grid_setup += "    const unsigned dynamic_lds = 0;"
+        limit = min(2147483647, k.max_tensor_bytes)
+        conditions = [
+            f"m * k <= {limit}",
+            f"n * k <= {limit}",
+            f"2 * m * n <= {k.max_tensor_bytes}",
+        ]
+        if k.max_k is not None:
+            conditions.append(f"k <= {k.max_k}")
+        if k.bpreshuffle_fixed_k:
+            conditions.append(f"k == {k.bpreshuffle_fixed_k}")
+        if entry.get("wide_output"):
+            conditions.append(
+                f"2 * (((m < {k.B_M} ? m : {k.B_M}) - 1) * n + {k.B_N}) <= {limit}"
             )
-        alignment = entry.get("pointer_alignment", {})
-        alignment_check = " && ".join(
-            f"reinterpret_cast<uintptr_t>({name}.data_ptr()) % {alignment[key]} == 0"
-            for key, name in (
-                ("a", "XQ"),
-                ("b", "WQ"),
-                ("out", "Y"),
-                ("sfa", "x_scale"),
-                ("sfb", "w_scale"),
+        elif not k.pad_m:
+            conditions.extend(
+                (
+                    f"m * n <= {limit}",
+                    f"2 * (({k.B_M - 1}) * n + {k.B_N}) <= {limit}",
+                )
             )
-            if alignment.get(key, 1) and alignment.get(key, 1) > 1
+        grid_setup += (
+            "\n    AITER_CHECK("
+            + " && ".join(conditions)
+            + ', "CO tensor extent exceeds pipeline limits");'
         )
-        if alignment_check:
-            grid_setup += (
-                f'\n    AITER_CHECK({alignment_check}, "CO pointer alignment differs");'
-            )
         preamble = instance_impl_preamble(
             '\n#include <climits>\n#include <type_traits>\n#include "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"'
         )
@@ -3313,7 +3265,7 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
     static_assert(std::is_same_v<D_C, opus::bf16_t>);
 {_BPRESHUFFLE_ARGUMENTS}
     {grid_setup}
-    static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{symbol}");
+    static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{symbol}", "{entry["image"]}");
     opus_co_launch_gfx950(kernel, grid, block, args, aiter::getCurrentHIPStream(), dynamic_lds);
 }}
 #endif
@@ -3323,6 +3275,13 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
         entry = k.bpreshuffle_entry
         kernel, alias = entry["kernel"], f"{k.name}_Traits"
         header = entry["headers"][0]
+        traits_header = entry.get(
+            "traits_header", header.replace("_pipeline_", "_traits_", 1)
+        )
+        grid = (
+            "dim3(tiles_n, tiles_m)" if entry.get("grid_layout") == "n_m"
+            else "dim3(Traits::XCD_ORDER ? (tiles + 7) / 8 * 8 : tiles)"
+        )
         abi = "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950"
         checks = [
             f"m % {k.m_align} == 0",
@@ -3353,7 +3312,7 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
             '\n#include <climits>\n#include <type_traits>\n#include "opus_gemm_common.cuh"'
         )
         source = f"""{preamble}
-#include "{header.replace("_pipeline_", "_traits_", 1)}"
+#include "{traits_header}"
 #ifdef OPUS_FUSED_HOST_TU
 template<class Traits> __global__ void {kernel}({abi});
 #else
@@ -3370,7 +3329,7 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
     using Traits = {alias};
     const unsigned tiles_m = (m + Traits::B_M - 1) / Traits::B_M;
     const unsigned tiles_n = n / Traits::B_N, tiles = tiles_m * tiles_n;
-    {kernel}<{alias}><<<dim3(Traits::XCD_ORDER ? (tiles + 7) / 8 * 8 : tiles), dim3(Traits::BLOCK_SIZE), 0, aiter::getCurrentHIPStream()>>>(args);
+    {kernel}<{alias}><<<{grid}, dim3(Traits::BLOCK_SIZE), 0, aiter::getCurrentHIPStream()>>>(args);
 }}
 #endif
 """

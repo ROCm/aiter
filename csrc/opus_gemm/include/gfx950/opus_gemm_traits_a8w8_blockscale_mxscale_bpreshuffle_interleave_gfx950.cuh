@@ -50,6 +50,8 @@ struct opus_gemm_bpreshuffle_wave_interleave_traits {
     static constexpr bool XCD_ORDER = XcdOrder;
     static constexpr int CACHE_A = CacheA;
     static constexpr int CACHE_B = CacheB;
+    static constexpr bool SKIP_UNUSED_A = false;
+    static constexpr bool B_FIRST = false;
 
     // Two LDS stages, each containing two A slots and two B slots.
     static constexpr int LDS_STAGES = 2;
@@ -87,4 +89,10 @@ struct opus_gemm_bpreshuffle_wave_interleave_traits {
     static_assert(B_STEPS == B_N_REPEATS * B_K_REPEATS);
     static_assert(LDS_BYTES <= 163840);
     static_assert(B_M * C_STRIDE * 2 <= LDS_BYTES);
+};
+
+template<class Base, bool SkipUnusedA, bool BFirst>
+struct opus_gemm_bpreshuffle_interleave_load_traits : Base {
+    static constexpr bool SKIP_UNUSED_A = SkipUnusedA;
+    static constexpr bool B_FIRST = BFirst;
 };

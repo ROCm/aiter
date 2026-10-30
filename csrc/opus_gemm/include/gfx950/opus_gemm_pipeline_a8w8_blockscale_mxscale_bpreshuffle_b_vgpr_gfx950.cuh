@@ -431,6 +431,8 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
     constexpr int SC = T::SCALE_COLS;
     constexpr int BK = T::B_K;
     constexpr int KS = BK / T::W_K;
+    constexpr bool ROTATE_RING = T::ROTATE_B && !T::STATIC_B_RING;
+    constexpr bool STREAM_A = T::ROTATE_B || T::STREAM_A;
 
     const int M = args.m;
     const int N = args.n;
@@ -471,10 +473,19 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
     constexpr int STEADY = P - T::INITIAL_A;
     constexpr int START = T::INITIAL_A < STEADY ? T::INITIAL_A : STEADY;
     constexpr int PERIOD = []() constexpr {
-        if constexpr (T::ROTATE_B) return 1;
-        int a = NB, b = BS;
-        while (b) { int r = a % b; a = b; b = r; }
-        return NB / a * BS;
+        if constexpr (ROTATE_RING) return 1;
+        if constexpr (T::COMPACT_B_RING) {
+            int a = BS, b = F;
+            while (b) { int r = a % b; a = b; b = r; }
+            const int b_panels = BS / a;
+            a = NB; b = b_panels;
+            while (b) { int r = a % b; a = b; b = r; }
+            return NB / a * b_panels;
+        } else {
+            int a = NB, b = BS;
+            while (b) { int r = a % b; a = b; b = r; }
+            return NB / a * BS;
+        }
     }();
     constexpr int GROUPS = (STEADY - START) / PERIOD;
     constexpr int END = START + GROUPS * PERIOD;
@@ -609,13 +620,13 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         constexpr int newer_b_a = phase < T::INITIAL_A ? issued_b : (issued_b > before_a ? issued_b - before_a : 0);
         constexpr int newer_a = phase < T::INITIAL_A ? T::INITIAL_A - phase - 1 : (P - phase - 1 < T::INITIAL_A - 1 ? P - phase - 1 : T::INITIAL_A - 1);
         constexpr int wa = newer_b_a * 2 + newer_a * T::A_COPIES;
-        const int slot = T::ROTATE_B ? t % NB : phase % NB;
+        const int slot = ROTATE_RING ? t % NB : phase % NB;
         __builtin_amdgcn_sched_barrier(0);
         s_waitcnt_vmcnt(number<(wa > 63 ? 63 : wa)>{});
         s_waitcnt_lgkmcnt(0_I);
         opus::sync_threads();
 
-        array<array<typename Base::vtype_a, MR>, T::ROTATE_B ? 1 : KS> r_a;
+        array<array<typename Base::vtype_a, MR>, STREAM_A ? 1 : KS> r_a;
         array<array<unsigned, T::SFA_PACKED_M_GROUPS>, KS> r_sfa;
         array<unsigned, KS> r_sfb{};
         static_for<KS>([&](auto ki) {
@@ -652,24 +663,24 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
                     array<int, 2> offsets;
                     offsets[0] = lo;
                     offsets[1] = hi;
-                    load_operand_fragment_pinned<16, 0>(number<(ks * MR + m) * 8>{}, r_a[T::ROTATE_B ? 0 : ks][m], s_a, offsets);
+                    load_operand_fragment_pinned<16, 0>(number<(ks * MR + m) * 8>{}, r_a[STREAM_A ? 0 : ks][m], s_a, offsets);
                 } else {
-                    set_slice(r_a[T::ROTATE_B ? 0 : ks][m], load<16>(s_a, lo), 0_I, 16_I);
-                    set_slice(r_a[T::ROTATE_B ? 0 : ks][m], load<16>(s_a, hi), 16_I, 32_I);
+                    set_slice(r_a[STREAM_A ? 0 : ks][m], load<16>(s_a, lo), 0_I, 16_I);
+                    set_slice(r_a[STREAM_A ? 0 : ks][m], load<16>(s_a, hi), 16_I, 32_I);
                 }
             });
         };
-        if constexpr (!T::ROTATE_B)
+        if constexpr (!STREAM_A)
             static_for<KS>([&](auto ki) { read_a(ki); });
         static_for<KS * NR>([&](auto fragment_i) {
             constexpr int fragment = decltype(fragment_i)::value;
             constexpr int ks = fragment / NR;
             constexpr int n = fragment % NR;
             constexpr int absolute = phase * F + fragment;
-            if constexpr (T::ROTATE_B && n == 0)
+            if constexpr (STREAM_A && n == 0)
                 read_a(number<ks>{});
             if constexpr (absolute + BD < P * F)
-                issue_b(number<((T::ROTATE_B ? fragment : absolute) + BD) % BS>{}, number<(fragment + BD) % F>{}, t + (fragment + BD) / F);
+                issue_b(number<((ROTATE_RING ? fragment : absolute) + BD) % BS>{}, number<(fragment + BD) % F>{}, t + (fragment + BD) / F);
             constexpr int newer_b = P * F - absolute - 1 < BD ? P * F - absolute - 1 : BD;
             constexpr int first_a = absolute < BD ? 0 : (absolute - BD + F - 1) / F;
             constexpr int last_a = (phase - (fragment == 0 ? 1 : 0) < P - T::INITIAL_A - 1)
@@ -678,10 +689,10 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
             constexpr int wait = newer_b * 2 + pending_a;
             __builtin_amdgcn_sched_barrier(0);
             s_waitcnt_vmcnt(number<(wait > 63 ? 63 : wait)>{});
-            if constexpr (fragment == 0 || (T::ROTATE_B && n == 0))
+            if constexpr (fragment == 0 || (STREAM_A && n == 0))
                 s_waitcnt_lgkmcnt(0_I);
             if constexpr (future_a && fragment == 0 && PublishM < 0)
-                issue_a((T::ROTATE_B ? t + NB - 1 : phase + NB - 1) % NB, t + NB - 1);
+                issue_a((ROTATE_RING ? t + NB - 1 : phase + NB - 1) % NB, t + NB - 1);
 
             static_for<MR>([&](auto mi) {
                 constexpr int m = decltype(mi)::value;
@@ -689,17 +700,17 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
                 if constexpr (T::PIN_C) {
                     [[clang::amdgpu_pin_agpr(128 + ci * 4)]] r_c[ci] = r_c[ci];
                     [[clang::amdgpu_pin_agpr(128 + ci * 4)]]
-                    r_c[ci] = Base{}(r_a[T::ROTATE_B ? 0 : ks][m], r_b[(T::ROTATE_B ? fragment : phase * F + fragment) % BS], r_c[ci],
+                    r_c[ci] = Base{}(r_a[STREAM_A ? 0 : ks][m], r_b[(ROTATE_RING ? fragment : phase * F + fragment) % BS], r_c[ci],
                         static_cast<int>(r_sfa[ks][m / T::VEC_SF]), static_cast<int>(r_sfb[ks]), number<m % T::VEC_SF>{}, number<n / 8>{});
                 } else {
-                    r_c[ci] = Base{}(r_a[T::ROTATE_B ? 0 : ks][m], r_b[(T::ROTATE_B ? fragment : phase * F + fragment) % BS], r_c[ci],
+                    r_c[ci] = Base{}(r_a[STREAM_A ? 0 : ks][m], r_b[(ROTATE_RING ? fragment : phase * F + fragment) % BS], r_c[ci],
                         static_cast<int>(r_sfa[ks][m / T::VEC_SF]), static_cast<int>(r_sfb[ks]), number<m % T::VEC_SF>{}, number<n / 8>{});
                 }
                 if constexpr (future_a && fragment == 0 && m == PublishM)
-                    issue_a((T::ROTATE_B ? t + NB - 1 : phase + NB - 1) % NB, t + NB - 1);
+                    issue_a((ROTATE_RING ? t + NB - 1 : phase + NB - 1) % NB, t + NB - 1);
             });
         });
-        if constexpr (T::ROTATE_B) {
+        if constexpr (ROTATE_RING) {
             // Advance the bounded queue without expanding its ring period.
             auto next_b = r_b;
             static_for<BS>([&](auto i) {

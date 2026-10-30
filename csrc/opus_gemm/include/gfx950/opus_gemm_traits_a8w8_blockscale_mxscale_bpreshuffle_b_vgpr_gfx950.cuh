@@ -78,6 +78,9 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
         REGISTER_BUDGET - MR * NR * 4 - (B_K / 128) * MR * 8 - 48;
     static constexpr int B_MAX_AHEAD = B_REGISTER_ROOM / 8 - 1 > 0
         ? B_REGISTER_ROOM / 8 - 1 : 1;
+    static constexpr bool STREAM_A = false;
+    static constexpr bool STATIC_B_RING = false;
+    static constexpr bool COMPACT_B_RING = false;
     static constexpr bool ROTATE_B = WGPerCU == 2 || (B_K / 128) * MR >= 16;
     static constexpr int B_SCHEDULE_AHEAD = ROTATE_B ? (NB == 2 ? 1 : 4)
         : (B_K == 128 && NR >= 4 && PinA && FixedK >= 1536 ? 3 : B_MAX_AHEAD);
@@ -123,4 +126,21 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static_assert(SB_ROWS * (SB_SLOTS ? SCALE_COLS : SCALE_COLS / 4) <= BLOCK_SIZE);
     static_assert(((LDS_BYTES + 1279) / 1280 * 1280) * WGPerCU <= 160 * 1024);
     static_assert(MR * NR * 4 <= 256);
+};
+
+template<class Base, int Ahead>
+struct opus_gemm_bpreshuffle_b_queue_traits : Base {
+    static_assert(Ahead >= 1 && Ahead <= Base::B_MAX_AHEAD);
+    static_assert(Ahead < Base::PANELS * Base::B_FRAGMENTS);
+    static constexpr int B_AHEAD = Ahead;
+    static constexpr int B_SETS = Ahead + 1;
+};
+
+template<class Base, bool StreamA, bool StaticRing, int Output, bool Compact>
+struct opus_gemm_bpreshuffle_b_pipeline_traits : Base {
+    static constexpr bool STREAM_A = StreamA;
+    static constexpr bool STATIC_B_RING = StaticRing;
+    static constexpr bool COMPACT_B_RING = Compact;
+    static constexpr int OUTPUT = Output < 0 ? Base::OUTPUT : Output;
+    static_assert(OUTPUT == 0 || OUTPUT == 2);
 };
