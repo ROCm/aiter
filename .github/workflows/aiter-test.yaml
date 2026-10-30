@@ -791,6 +791,7 @@ jobs:
           --group-add $(getent group video | cut -d: -f3) \
           -e AITER_TEST="${AITER_TEST}" \
           -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
+          -e PYTORCH_ALLOC_CONF=expandable_segments:True \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
@@ -1118,6 +1119,7 @@ jobs:
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
+          -e PYTORCH_ALLOC_CONF=expandable_segments:True \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
