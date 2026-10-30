@@ -29,32 +29,77 @@ def device(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "batch,max_parts,budget,window,query_length",
+    "batch,max_parts,budget,window,query_length,max_batch_size,bucket",
     [
-        (1, 1, 1, 0, 1),
-        (6, 7, 160, 257, 4),
-        (63, 7, 160, 0, 1),
-        (65, 7, 512, 1, 4),
-        (257, None, 4096, 8193, 4),
-        (4096, None, 8192, 0, 1),
+        (1, 1, 1, 0, 1, None, 64),
+        (6, 7, 160, 257, 4, None, 64),
+        (63, 7, 160, 0, 1, None, 64),
+        (65, 7, 512, 1, 4, None, 128),
+        (257, None, 4096, 8193, 4, None, 512),
+        (4096, None, 8192, 0, 1, None, 4096),
+        (1, 1, 1, 0, 1, 1, 1),
+        (65, None, None, 0, 1, 100, 100),
+        (100, None, None, 0, 1, 100, 100),
+        (4097, None, None, 0, 1, 5000, 5000),
+        pytest.param(None, None, None, 0, 1, None, None, id="lds-limit"),
     ],
 )
-def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
-    """Packed tasks cover every visible tile and remain valid after graph refresh."""
-    from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
+def test_pa_decode_plan(
+    device,
+    monkeypatch,
+    batch,
+    max_parts,
+    budget,
+    window,
+    query_length,
+    max_batch_size,
+    bucket,
+):
+    """Packed tasks cover visible tiles, refresh in graphs and reuse batch buckets."""
+    from aiter.ops.flydsl.kernels import pa_decode_plan as planner
+
+    properties = torch.cuda.get_device_properties(device)
+    lds_limit = batch is None
+    if lds_limit:
+        lds_bytes = getattr(properties, "shared_memory_per_block", None)
+        if lds_bytes is None:
+            lds_bytes = planner.get_lds_capacity_bytes(properties.gcnArchName)
+        batch = bucket = (lds_bytes - planner._PLAN_SCAN_LDS_BYTES) // 16 * 4
+        max_batch_size = batch + 1
+
+    compile_plan = planner.compile_pa_decode_plan
+    calls = []
+
+    def spy_compile(*args):
+        launch = compile_plan(*args)
+        calls.append((args, launch))
+        return launch
+
+    monkeypatch.setattr(planner, "compile_pa_decode_plan", spy_compile)
 
     def check(plan, lengths):
         info = plan.reduce_info.cpu().tolist()
         work = plan.work_info.cpu().tolist()
-        cursor = 0
-        for seq, (ctx, (start, count)) in enumerate(zip(lengths, info)):
-            assert start == cursor
-            first = (
-                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0
+        ranges = [
+            (
+                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0,
+                (max(ctx, 0) + 255) // 256,
             )
-            last = (max(ctx, 0) + 255) // 256
-            assert 0 <= count <= min(last - first, plan.max_partitions)
-            assert (count > 0) == (last > first)
+            for ctx in lengths
+        ]
+        total_tiles = max(sum(last - first for first, last in ranges), 1)
+        remaining = plan.capacity - sum(last > first for first, last in ranges)
+        cursor = prefix_tiles = 0
+        for seq, (ctx, (start, count), (first, last)) in enumerate(
+            zip(lengths, info, ranges)
+        ):
+            assert start == cursor
+            tiles = last - first
+            # Verify that the runtime capacity supplies the task budget used
+            # to distribute slots by cumulative visible tile count.
+            extra = (prefix_tiles + tiles) * remaining // total_tiles
+            extra -= prefix_tiles * remaining // total_tiles
+            assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
             tile = first
             for record in work[start : start + count]:
                 row, begin, end, original_length = record
@@ -63,25 +108,31 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
                 tile = end
             assert tile == last
             cursor += count
+            prefix_tiles += tiles
         assert cursor <= plan.capacity
         assert all(record == [0, 0, 0, 0] for record in work[cursor:])
 
     pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
     lengths = [pattern[i % len(pattern)] for i in range(batch)]
     context = torch.tensor(lengths, dtype=torch.int32, device=device)
-    plan = plan_pa_decode(
+    plan = planner.plan_pa_decode(
         context,
         2,
         max_partitions=max_parts,
+        max_batch_size=max_batch_size,
         workgroup_budget=budget,
         sliding_window=window,
         query_length=query_length,
     )
     check(plan, lengths)
+    config, launch = calls[-1]
+    assert config[0] == bucket
+    if max_batch_size is not None:
+        assert plan.max_batch_size == max_batch_size
     pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        refreshed = plan_pa_decode(
+        refreshed = planner.plan_pa_decode(
             context, 2, sliding_window=window, query_length=query_length, plan=plan
         )
     assert refreshed is plan
@@ -92,6 +143,45 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         graph.replay()
         check(plan, values)
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
+
+    if bucket > 1:
+        # Change both runtime values inside the same batch/block-size bucket.
+        other_batch = batch + 1 if batch < bucket else batch - 1
+        other_budget = max(
+            1,
+            (budget if budget is not None else 2 * properties.multi_processor_count)
+            - 2,
+        )
+        values = [pattern[i % len(pattern)] for i in range(other_batch)]
+        other_context = torch.tensor(values, dtype=torch.int32, device=device)
+        other_plan = planner.plan_pa_decode(
+            other_context,
+            2,
+            max_partitions=plan.max_partitions,
+            max_batch_size=plan.max_batch_size,
+            workgroup_budget=other_budget,
+            sliding_window=window,
+            query_length=query_length,
+        )
+        assert other_plan.capacity == min(
+            other_batch * plan.max_partitions,
+            max(other_batch, (other_budget + 1) // 2),
+        )
+        assert other_plan.capacity != plan.capacity
+        check(other_plan, values)
+        other_config, other_launch = calls[-1]
+        assert other_config == config
+        assert other_launch._cf is launch._cf
+
+    if max_batch_size is not None:
+        invalid_batch = batch + 1 if lds_limit else max_batch_size + 1
+        message = "exceeds planner LDS capacity" if lds_limit else "supports batches"
+        with pytest.raises(ValueError, match=message):
+            planner.plan_pa_decode(
+                torch.zeros(invalid_batch, dtype=torch.int32, device=device),
+                2,
+                max_batch_size=max_batch_size,
+            )
 
 
 def _reference(query, key, value, table, lengths, query_length, window, sinks):

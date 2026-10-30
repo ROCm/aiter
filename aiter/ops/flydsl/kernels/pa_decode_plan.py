@@ -10,6 +10,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
 from .tensor_shim import _run_compiled, ptr_arg, ptr_buf_tensor
 
 DEFAULT_MAX_BATCH_SIZE = 4096
@@ -18,23 +20,24 @@ _PLAN_SCAN_LDS_BYTES = 512
 
 
 @cache
-def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_length):
-    """Allocate packed tasks with one block-wide scan, without GPU readback."""
-    threads = max(64, min(1024, 1 << (capacity - 1).bit_length()))
-    items = (batch + threads - 1) // threads
+def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_length):
+    """Compile a batch bucket; actual batch and task capacity are runtime values."""
+    items = (max_batch + threads - 1) // threads
     scan_tiles = fx.coop.BlockScan[fx.Int64, threads]
     scan_counts = fx.coop.BlockScan[fx.Int32, threads]
     reduce_rows = fx.coop.BlockReduce[fx.Int32, threads]
 
     @fx.struct
     class TaskStorage:
-        ends: fx.Array[fx.Int32, batch, 16]
+        ends: fx.Array[fx.Int32, max_batch, 16]
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
     def pa_decode_plan_kernel(
         lengths_ptr: fx.Pointer,
         work_ptr: fx.Pointer,
         reduce_ptr: fx.Pointer,
+        batch: fx.Int32,
+        capacity: fx.Int32,
     ):
         tid = fx.thread_idx.x
         lengths = ptr_buf_tensor(lengths_ptr)
@@ -100,7 +103,7 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
         for slot in range(tid, capacity, threads):
             if slot < total_tasks:
                 seq = fx.Int32(-1)
-                for bit in fx.range_constexpr(batch.bit_length() - 1, -1, -1):
+                for bit in fx.range_constexpr(max_batch.bit_length() - 1, -1, -1):
                     candidate = seq + (1 << bit)
                     if candidate < batch:  # noqa: SIM102 -- guard the LDS read
                         if task_ends[candidate] <= slot:
@@ -136,9 +139,11 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
         lengths: fx.Pointer,
         work: fx.Pointer,
         reduce_info: fx.Pointer,
+        batch: fx.Int32,
+        capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        pa_decode_plan_kernel(lengths, work, reduce_info).launch(
+        pa_decode_plan_kernel(lengths, work, reduce_info, batch, capacity).launch(
             grid=(1, 1, 1), block=(threads, 1, 1), stream=stream
         )
 
@@ -212,8 +217,10 @@ def plan_pa_decode(
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
     omitting it on refresh preserves the existing limit.
     ``max_batch_size`` defaults to 4096 for a new plan and is retained on refresh.
-    Larger batches require four LDS bytes per sequence plus scan storage and
-    must fit the device's per-block shared-memory capacity.
+    Kernels use batch buckets with upper bounds 64, 128, 256, ... clipped to
+    ``max_batch_size`` and the device's LDS capacity. Each bucket requires four
+    LDS bytes per sequence plus scan storage. Actual batch and task capacity
+    are runtime values; capacity only specializes the block size (64--1024).
 
     Lengths include MTP tokens. Positive windows include each query's position;
     nonpositive windows disable them. Plans cover the MTP window union: match
@@ -245,13 +252,21 @@ def plan_pa_decode(
     dev = context_lengths.device
     properties = torch.cuda.get_device_properties(dev)
     num_compute_units = properties.multi_processor_count
+    shared_memory_per_block = getattr(properties, "shared_memory_per_block", None)
+    if shared_memory_per_block is None:
+        shared_memory_per_block = get_lds_capacity_bytes(properties.gcnArchName)
     task_end_bytes = (batch * 4 + 15) // 16 * 16
-    if task_end_bytes + _PLAN_SCAN_LDS_BYTES > properties.shared_memory_per_block:
+    if task_end_bytes + _PLAN_SCAN_LDS_BYTES > shared_memory_per_block:
         raise ValueError(
             f"batch={batch} exceeds planner LDS capacity: requires up to "
             f"{task_end_bytes + _PLAN_SCAN_LDS_BYTES} bytes, device supports "
-            f"{properties.shared_memory_per_block} bytes per block"
+            f"{shared_memory_per_block} bytes per block"
         )
+    # Clip the last bucket so rounding up cannot reject a batch that fits LDS.
+    lds_max_batch = (shared_memory_per_block - _PLAN_SCAN_LDS_BYTES) // 16 * 4
+    max_batch = min(
+        max_batch_size, lds_max_batch, max(64, 1 << (batch - 1).bit_length())
+    )
     if max_partitions is None:
         max_partitions = num_compute_units if plan is None else plan.max_partitions
     if not 1 <= max_partitions <= num_compute_units:
@@ -287,9 +302,10 @@ def plan_pa_decode(
             raise ValueError("query_length must match the reused plan")
     plan.validate(batch, num_kv_heads, dev)
     with torch.cuda.device(dev):
+        threads = max(64, min(1024, 1 << (plan.capacity - 1).bit_length()))
         launch = compile_pa_decode_plan(
-            batch,
-            plan.capacity,
+            max_batch,
+            threads,
             plan.max_partitions,
             # Clamp windows to int32 lengths; dense plans share one specialization.
             min(sliding_window, 2**31 - 1),
@@ -300,6 +316,8 @@ def plan_pa_decode(
             ptr_arg(context_lengths, fx.Int32),
             ptr_arg(plan.work_info, fx.Int32),
             ptr_arg(plan.reduce_info, fx.Int32),
+            batch,
+            plan.capacity,
             torch.cuda.current_stream(dev),
         )
     return plan
