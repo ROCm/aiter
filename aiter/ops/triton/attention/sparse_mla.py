@@ -1044,6 +1044,8 @@ def sparse_mla_fwd(
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
+        # row-contiguous output / partial stores (25% -> 100% line efficiency)
+        STORE_ROWS=os.environ.get("AITER_SPARSE_MLA_STORE_ROWS", "1") != "0",
         UNI_TILE=True,
         GRID_ORDER="qsh",
         Q_CACHE=q_cache,

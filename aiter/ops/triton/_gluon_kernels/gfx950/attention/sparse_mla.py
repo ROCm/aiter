@@ -2299,6 +2299,7 @@ def _sparse_mla(
     NOPE_CHUNK: gl.constexpr,
     CHUNK_AXIS: gl.constexpr,
     PART_STORE_CACHE: gl.constexpr,
+    STORE_ROWS: gl.constexpr,
     UNI_TILE: gl.constexpr,
     GRID_ORDER: gl.constexpr,
     Q_CACHE: gl.constexpr,
@@ -2836,14 +2837,18 @@ def _sparse_mla(
             )
         else:
             out_row_ptr = out_ptr + query_idx.to(gl.int64) * out_stride0  # else overflows
-            offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-            o_off = (h_pv[:, None] * out_stride1 + offs_d_o[None, :]).to(gl.int32)
-            gl.amd.cdna4.buffer_store(
-                out.to(out_ptr.dtype.element_ty),
-                ptr=out_row_ptr,
-                offsets=o_off,
-                mask=head_mask_pv[:, None],
-            )
+            if STORE_ROWS:
+                _store_rows(out.to(out_ptr.dtype.element_ty), out_row_ptr, h_off, num_heads,
+                            out_stride1)
+            else:
+                offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
+                o_off = (h_pv[:, None] * out_stride1 + offs_d_o[None, :]).to(gl.int32)
+                gl.amd.cdna4.buffer_store(
+                    out.to(out_ptr.dtype.element_ty),
+                    ptr=out_row_ptr,
+                    offsets=o_off,
+                    mask=head_mask_pv[:, None],
+                )
         if HAS_LSE:
             # m is base-2, so sum_j exp(s_j) = 2^m * l and ln of it is
             # (m + log2 l) * ln2. A fully masked row keeps -inf, not NaN.
@@ -2871,17 +2876,47 @@ def _sparse_mla(
             mask=head_mask_pv,
             cache=PART_STORE_CACHE,
         )
-        offs_d_a = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
         a_base = query_idx * pa_stride0.to(gl.int64) + split_id * pa_stride_s
-        a_off = (h_pv[:, None] * pa_stride_h + offs_d_a[None, :]).to(gl.int32)
         # Follow part_acc's own dtype: bf16 halves the partial HBM traffic.
-        gl.amd.cdna4.buffer_store(
-            acc.to(part_acc_ptr.dtype.element_ty),
-            ptr=part_acc_ptr + a_base,
-            offsets=a_off,
-            mask=head_mask_pv[:, None],
-            cache=PART_STORE_CACHE,
-        )
+        if STORE_ROWS:
+            _store_rows(acc.to(part_acc_ptr.dtype.element_ty), part_acc_ptr + a_base, h_off,
+                        num_heads, pa_stride_h, PART_STORE_CACHE)
+        else:
+            offs_d_a = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
+            a_off = (h_pv[:, None] * pa_stride_h + offs_d_a[None, :]).to(gl.int32)
+            gl.amd.cdna4.buffer_store(
+                acc.to(part_acc_ptr.dtype.element_ty),
+                ptr=part_acc_ptr + a_base,
+                offsets=a_off,
+                mask=head_mask_pv[:, None],
+                cache=PART_STORE_CACHE,
+            )
+
+
+@gluon.constexpr_function
+def _row_store_layout(BLOCK_M, HEAD_SIZE, BITS, NUM_WARPS):
+    """16 B per lane along a head row: row-contiguous stores (whole cache lines)."""
+    vec = max(1, 128 // BITS)
+    tpn = max(1, min(64, HEAD_SIZE // vec))
+    return gl.BlockedLayout([1, vec], [64 // tpn, tpn], [NUM_WARPS, 1], [1, 0])
+
+
+@gluon.jit
+def _store_rows(x, ptr, h_off, num_heads, row_stride, cache: gl.constexpr = ""):
+    """Store a [BLOCK_M, HEAD_SIZE] tile (heads h_off.. as rows) through a
+    row-contiguous layout. Stored straight from the MFMA accumulator layout,
+    each lane writes 8 B scattered over 16 cache lines (25% line efficiency,
+    AegisBit); this costs one LDS round trip in the epilogue instead."""
+    BLOCK_M: gl.constexpr = x.shape[0]
+    HEAD_SIZE: gl.constexpr = x.shape[1]
+    ST_L: gl.constexpr = _row_store_layout(BLOCK_M, HEAD_SIZE, x.dtype.primitive_bitwidth,
+                                           gl.num_warps())
+    x = gl.convert_layout(x, ST_L)
+    hs = h_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, ST_L))
+    ds = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, ST_L))
+    gl.amd.cdna4.buffer_store(
+        x, ptr=ptr, offsets=(hs[:, None] * row_stride + ds[None, :]).to(gl.int32),
+        mask=(hs < num_heads)[:, None], cache=cache)
 
 
 @gluon.constexpr_function

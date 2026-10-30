@@ -8,6 +8,7 @@ TODO: add details once API has settled
 """
 
 import functools
+import os
 import math
 
 import torch
@@ -1037,6 +1038,7 @@ def _pa_decode_sparse_gfx950_gluon(
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
+        STORE_ROWS=os.environ.get("AITER_SPARSE_MLA_STORE_ROWS", "1") != "0",
         Q_CACHE=q_cache,
         GRID_ORDER="qsh",
         # The partial last tile rides the full-tile body. Gluon inlines, so a peeled
