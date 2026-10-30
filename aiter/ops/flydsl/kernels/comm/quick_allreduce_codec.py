@@ -30,7 +30,7 @@ every codec, and all in-kernel arithmetic is packed fp16. Two limits follow.
 many blocks a payload gets.
 
 Imported by the mesh and ring kernels, which must agree on it byte for byte.
-Depends on ``allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
+Depends on ``transport`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
 """
 
 import functools
@@ -40,10 +40,18 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
 
+from ...allreduce_policy import (
+    BLOCK_ALIGN,
+    MAX_BLOCK,
+    SUPPORTED_BLOCKS,
+)
 from ..kernels_common import ceildiv
-from .allreduce_shared import BLOCK, I32_BYTES, SUPPORTED_BLOCKS, WAVE
+from .transport import (
+    BLOCK,
+    I32_BYTES,
+    WAVE,
+)
 
-SUPER_TILES = (1, 8)
 # Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
 GROUP = 8
 PAIR = 2
@@ -62,11 +70,17 @@ SECTOR_I32 = 16
 
 def validate_block(block: int) -> int:
     block = int(block)
-    if block not in SUPPORTED_BLOCKS:
-        raise ValueError(
-            f"codec block must be one of {SUPPORTED_BLOCKS}, got {block!r}"
-        )
-    return block
+    # Besides ``SUPPORTED_BLOCKS``, the fused schedules size a workgroup to one
+    # token row (block = hidden / 8), on any BLOCK_ALIGN multiple up to
+    # MAX_BLOCK. Both keep every rank-tile region on the 64 B sector grid.
+    if block in SUPPORTED_BLOCKS or (
+        BLOCK_ALIGN <= block <= MAX_BLOCK and block % BLOCK_ALIGN == 0
+    ):
+        return block
+    raise ValueError(
+        f"codec block must be one of {SUPPORTED_BLOCKS} or a multiple of "
+        f"{BLOCK_ALIGN} in [{BLOCK_ALIGN}, {MAX_BLOCK}], got {block!r}"
+    )
 
 
 def _round_up_to_sector(n_i32: int) -> int:

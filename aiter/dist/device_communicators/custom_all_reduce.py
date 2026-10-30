@@ -33,7 +33,8 @@ from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.utils import env_flag
 from aiter.utility.dtypes import fp8
 
-from .flydsl_utils import (
+from .flydsl_backends import (
+    FlyDSLAllReduceRMSNorm,
     all_ranks_agree,
     all_ranks_agree_on_plan,
     preload_fly_engines,
@@ -1274,6 +1275,30 @@ class CustomAllreduce:
         self._fly_oneshot = None
         self._fly_window = None
         self._init_fly_oneshot()
+        self._fly_rms = None
+        self._init_fly_rms()
+
+    def _init_fly_rms(self):
+        """Build the exact FlyDSL fused all-reduce+RMSNorm engine."""
+
+        # Not gated on the local FlyDSL settings: the construction votes, and a
+        # rank that skipped the vote would leave its peers waiting in it.
+        if self.disabled:
+            return
+        try:
+            rms = FlyDSLAllReduceRMSNorm(
+                group=self.group, device=self.device, quantized=False
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "FlyDSL fused AR+RMSNorm (exact) disabled: construction failed.",
+                exc_info=True,
+            )
+            return
+        if rms.disabled:
+            rms.close()
+            return
+        self._fly_rms = rms
 
     def _init_fly_oneshot(self):
         """Build the FlyDSL exact one-shot that fronts small plain all-reduces,
@@ -2451,6 +2476,30 @@ class CustomAllreduce:
                 return out, res_out, scale_out, bf16_out
             return out, res_out, scale_out
 
+    def should_fly_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        """Whether the exact FlyDSL fused AR+RMSNorm backend can serve this
+        call.
+
+        Never raises; delegates the geometry/capture checks to the backend."""
+        if self._fly_rms is None:
+            return False
+        return self._fly_rms.should_fly_fused_ar_rms(inp, residual_inp, weight)
+
+    def fly_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(out, residual_out)`` on the exact FlyDSL fused backend."""
+        return self._fly_rms.fly_fused_ar_rms(inp, residual_inp, weight, eps)
+
     def custom_fused_ar_rms(
         self,
         input: torch.Tensor,
@@ -3055,11 +3104,13 @@ class CustomAllreduce:
         )
 
     def close(self):
-        # Not gated on self.disabled: the one-shot holds an IPC inbox opened
+        # Not gated on self.disabled: the one-shots hold IPC inboxes opened
         # against every peer, and those handles have to be released before the
         # process group goes away regardless of the slot's state.
         _close_quietly(getattr(self, "_fly_oneshot", None))
         self._fly_oneshot = None
+        _close_quietly(getattr(self, "_fly_rms", None))
+        self._fly_rms = None
         if getattr(self, "_ptr", 0):
             try:
                 self._ops_dispose(self._ptr)
