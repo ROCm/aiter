@@ -504,17 +504,27 @@ def build_combine(*, layout, rank, hidden, topk):
             for chunk in range_constexpr(chunks):
                 u = fx.Int32(chunk * BLOCK) + tid
                 if u < fx.Int32(units):
+                    # Branch-free over k, so all top-k row loads are in flight together.
                     acc = fx.Vector.filled(8, 0.0, fx.Float32)
                     for k in range_constexpr(topk):
                         landed = slots[k] >= fx.Int32(0)
                         keep = landed.select(fx.Float32(1.0), fx.Float32(0.0))
-                        vals, scale = row_vals(0, landed.select(slots[k], fx.Int32(0)) * fx.Int32(row_bytes), u)
+                        vals, scale = row_vals(
+                            0, landed.select(slots[k], fx.Int32(0)) * fx.Int32(row_bytes), u
+                        )
                         acc = acc + vals * (scale * keep)
-                        # Rare: a row past the per-pair reservation, in comb_inp[slot].
-                        if slots[k] == fx.Int32(INV_P2P):
-                            slot = tok * fx.Int32(topk) + fx.Int32(k)
+                    # Rare: rows past the per-pair reservation, in comb_inp[slot]. The
+                    # slots are the same for the whole block, so this branch is uniform.
+                    direct = [slots[k] == fx.Int32(INV_P2P) for k in range_constexpr(topk)]
+                    any_direct = direct[0]
+                    for k in range_constexpr(1, topk):
+                        any_direct = any_direct | direct[k]
+                    if any_direct:
+                        for k in range_constexpr(topk):
+                            slot = direct[k].select(tok * fx.Int32(topk) + fx.Int32(k), fx.Int32(0))
                             pvals, pscale = row_vals(1, slot * fx.Int32(row_bytes), u)
-                            acc = acc + pvals * pscale
+                            keep = direct[k].select(fx.Float32(1.0), fx.Float32(0.0))
+                            acc = acc + pvals * (pscale * keep)
                     buf_copy_store(
                         out, tok * fx.Int32(units) + u, acc.to(fx.BFloat16), fx.BFloat16, unit_elems=8
                     )
