@@ -4,7 +4,7 @@
 #
 #   ./e2e.sh build             # build both images from ./Dockerfile
 #   ./e2e.sh build-fork        # build IMAGE_FORK: IMAGE_B + the vLLM fork's prefill dispatch
-#   ./e2e.sh build-eval        # build IMAGE_B, IMAGE_FORK and IMAGE_A_EVAL, the images "eval" needs
+#   ./e2e.sh build-eval        # build IMAGE_A, IMAGE_B, IMAGE_FORK and IMAGE_A_EVAL, the images "eval" needs
 #   ./e2e.sh check             # preflight: images, vLLM all-reduce path, model
 #   ./e2e.sh run               # check, then the A/B benchmark, then the summary
 #   ./e2e.sh run3              # the same for the 3 arms in ARMS3 (needs build-fork)
@@ -16,11 +16,14 @@
 #   ./e2e.sh all               # build + run
 #
 # Settings are environment variables, e.g. TPS="8" ./e2e.sh run. See below.
-# The defaults are for MI350P. On MI350X (8 XCDs, 256 CUs, 252 GiB):
-#   AITER_CU_NUM=256 AITER_NUM_XCDS=8 IMAGE_B=vllm-aiter-ar-mi350x \
-#     IMAGE_FORK=vllm-aiter-ar-prefill-mi350x ./e2e.sh build-eval
-#   IMAGE_FORK=vllm-aiter-ar-prefill-mi350x TPS="4 8" GPU_GIB=252 \
-#     GPU_MEM_UTIL=0.92 MAX_MODEL_LEN=16384 ./e2e.sh eval
+# The defaults are for MI350P. On MI350X (8 XCDs, 256 CUs, 252 GiB), every image
+# built for it, the baseline too:
+#   export AITER_CU_NUM=256 AITER_NUM_XCDS=8 GPU_GIB=252 \
+#     IMAGE_A=vllm-aiter-main-mi350x IMAGE_B=vllm-aiter-ar-mi350x \
+#     IMAGE_FORK=vllm-aiter-ar-prefill-mi350x IMAGE_A_EVAL=vllm-aiter-main-eval-mi350x
+#   ./e2e.sh build-eval
+#   ./e2e.sh eval                                      # TP8, RULER at 64k
+#   TPS=4 GPU_MEM_UTIL=0.92 MAX_MODEL_LEN=16384 EVAL_LONG_LENGTHS=16384 ./e2e.sh eval
 #
 # For every (TP, image) "run" starts one server, checks that it answers,
 # records which all-reduce path vLLM took, runs the benchmark scenarios and
@@ -83,6 +86,26 @@ EVAL_TASKS=${EVAL_TASKS:-gsm8k}
 EVAL_FEWSHOT=${EVAL_FEWSHOT:-5}
 EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-64}
 EVAL_LIMIT=${EVAL_LIMIT:-}            # questions per task; empty = all (quick check: 100)
+# Long-context eval: a second lm-eval run after EVAL_TASKS. GSM8K prompts are ~1k
+# tokens, so INT4 error written into the KV cache by prefill has little to act on.
+# These RULER tasks send prompts of a whole length through chunked prefill (8192-token
+# chunks, 112 MiB per all-reduce: the INT4 ring window, as in the recipe's 60k-token
+# case), and the answer has to be retrieved from that KV cache through the
+# sparse attention's top-k selection. The tasks are ones not at the ceiling: uuid needles
+# among uuid distractors, all 4 values of a key, multi-hop variable tracking, and
+# multi-document QA. Zero-shot, greedy. RULER builds the haystacks itself with a
+# fixed seed, so every arm gets the same prompts. Empty EVAL_LONG_TASKS skips it.
+EVAL_LONG_TASKS=${EVAL_LONG_TASKS-niah_multikey_3,niah_multivalue,ruler_vt,ruler_qa_hotpot}
+# Prompt lengths, one lm-eval run each: RULER lists its samples length by length,
+# so one --limit over several lengths would keep only the first. Each one must be
+# a RULER length (4096 8192 16384 32768 65536 131072) and at most MAX_MODEL_LEN.
+EVAL_LONG_LENGTHS=${EVAL_LONG_LENGTHS:-65536}
+EVAL_LONG_LIMIT=${EVAL_LONG_LIMIT:-100}   # questions per task and length (RULER makes 500)
+# Prefill-bound; each request holds a whole prompt of KV cache, and more just queue.
+EVAL_LONG_CONCURRENCY=${EVAL_LONG_CONCURRENCY:-8}
+# Only sizes the haystacks (vLLM tokenizes the prompts itself), so any close
+# tokenizer will do if the model's does not load with AutoTokenizer.
+EVAL_LONG_TOKENIZER=${EVAL_LONG_TOKENIZER:-$MODEL}
 # V4-Pro (~830 GiB) fits on 144 GiB GPUs only at TP=8; preflight rejects
 # TPs whose per-GPU weight share does not fit.
 TPS=${TPS:-8}
@@ -156,6 +179,10 @@ cmd_build_eval() {
     log "building $IMAGE_B (main + FlyDSL comm branch)${AITER_CU_NUM:+, CU_NUM=$AITER_CU_NUM}"
     docker build -t "$IMAGE_B" $(build_args) -f "$HERE/Dockerfile" "$HERE"
     cmd_build_fork
+    # The baseline from the same Dockerfile and options, so that it differs from
+    # IMAGE_B only by the comm branch. Cached when it is already up to date.
+    log "building $IMAGE_A (main only)${AITER_CU_NUM:+, CU_NUM=$AITER_CU_NUM}"
+    docker build -t "$IMAGE_A" $(build_args) --build-arg WITH_ALLREDUCE=0 -f "$HERE/Dockerfile" "$HERE"
     cmd_build_eval_base
 }
 
@@ -205,6 +232,18 @@ cmd_check() {
                 || die "$tag: $image has no lm-eval: ./e2e.sh build-fork"
         fi
     done
+    if [ "$MODE" = eval ] && [ -n "$EVAL_LONG_TASKS" ]; then
+        local len
+        for len in $EVAL_LONG_LENGTHS; do
+            # RULER's metrics are named by these lengths; any other is dropped.
+            case " 4096 8192 16384 32768 65536 131072 " in
+                *" $len "*) ;;
+                *) die "EVAL_LONG_LENGTHS: $len is not a RULER length (4096 8192 ... 131072)" ;;
+            esac
+            [ "$len" -le "$MAX_MODEL_LEN" ] \
+                || die "EVAL_LONG_LENGTHS: $len is above MAX_MODEL_LEN=$MAX_MODEL_LEN"
+        done
+    fi
 
     mkdir -p "$CACHE_ROOT" 2>/dev/null && [ -w "$CACHE_ROOT" ] \
         || die "$CACHE_ROOT is not writable: set CACHE_ROOT to a writable directory"
@@ -247,6 +286,19 @@ cmd_check() {
     else
         log "WARNING checkpoint size unknown, not checking that TPs $TPS fit (set MODEL_GIB)"
         ok=0
+    fi
+    # RULER sizes its haystacks with this tokenizer; if it does not load, every
+    # arm's long-context eval fails, and only after its short tasks.
+    if [ "$MODE" = eval ] && [ -n "$EVAL_LONG_TASKS" ]; then
+        IFS=, read -r tag image env <<<"${ARMS%% *}"
+        docker run --rm --entrypoint "" -e HF_HUB_OFFLINE="$HF_OFFLINE" -e HF_TOKEN="${HF_TOKEN:-}" \
+            -v "$HF_HUB":/root/.cache/huggingface/hub "$image" \
+            /opt/lm-eval/bin/python -c "from transformers import AutoTokenizer as T; \
+t = T.from_pretrained('$EVAL_LONG_TOKENIZER', trust_remote_code=True); \
+assert len(t('The quick brown fox').input_ids) > 0" >/dev/null 2>&1 \
+            || die "tokenizer $EVAL_LONG_TOKENIZER does not load for RULER: set EVAL_LONG_TOKENIZER" \
+                   "to a close one, or EVAL_LONG_TASKS= to skip the long-context eval"
+        log "RULER tokenizer: $EVAL_LONG_TOKENIZER"
     fi
     if docker ps -a -q -f name="^$NAME$" | grep -q .; then
         log "WARNING a $NAME container exists; it will be replaced"
@@ -436,31 +488,54 @@ run_scenarios() {  # out_dir
     done
 }
 
-run_eval() {  # out_dir
+lm_eval_run() {  # log_file concurrency lm_eval_args...
     # lm-eval runs in the server's container, against its completions API.
     # Greedy (the tasks' defaults). The server may be offline; lm-eval needs the
-    # hub only for the datasets, cached per arm under CACHE_ROOT.
-    local out=$1
-    log "quick-reduce in the server: $(docker exec "$NAME" sh -c \
-        'echo "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=$VLLM_ROCM_QUICK_REDUCE_QUANTIZATION, VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=$VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL, AITER_FLY_AR=$AITER_FLY_AR, AITER_FLY_AR_MESH_MIN_BYTES=${AITER_FLY_AR_MESH_MIN_BYTES:-default}, AITER_FLY_AR_FUSED_MESH_MIN_BYTES=${AITER_FLY_AR_FUSED_MESH_MIN_BYTES:-default}"')"
-    log "eval $EVAL_TASKS, ${EVAL_FEWSHOT}-shot, concurrency $EVAL_CONCURRENCY${EVAL_LIMIT:+, limit $EVAL_LIMIT}"
+    # hub only for the datasets, cached per arm under CACHE_ROOT. Every run
+    # writes its own results_*.json and samples next to the others' (left where
+    # the container wrote them: the directory is root's, so the host user may
+    # not be able to move them).
+    local log_file=$1 conc=$2
+    shift 2
     docker exec \
         -e HF_HUB_OFFLINE=0 -e HF_DATASETS_OFFLINE=0 -e HF_ALLOW_CODE_EVAL=1 \
         "$NAME" /opt/lm-eval/bin/lm_eval \
         --model local-completions \
-        --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/completions,num_concurrent=$EVAL_CONCURRENCY,max_retries=3,timeout=3600,tokenized_requests=False,tokenizer_backend=None" \
-        --tasks "$EVAL_TASKS" \
-        --num_fewshot "$EVAL_FEWSHOT" \
+        --model_args "model=$MODEL,base_url=http://localhost:$PORT/v1/completions,num_concurrent=$conc,max_retries=3,timeout=3600,tokenized_requests=False,tokenizer_backend=None" \
         --batch_size 1 \
         --seed 15 \
-        ${EVAL_LIMIT:+--limit "$EVAL_LIMIT"} \
         --output_path /traces/lm_eval \
         --log_samples \
-        >>"$out/eval.log" 2>&1 \
-        || { log "eval FAILED, see eval.log"; return 0; }
-    # Left where the container wrote it: the directory is root's, so the host
-    # user may not be able to move it.
-    log "eval done (traces/lm_eval): $(grep -E '^\|' "$out/eval.log" | grep -m2 -E 'exact_match|acc' | tr -s ' ' || true)"
+        "$@" >>"$log_file" 2>&1
+}
+
+run_eval() {  # out_dir
+    local out=$1 len
+    log "quick-reduce in the server: $(docker exec "$NAME" sh -c \
+        'echo "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=$VLLM_ROCM_QUICK_REDUCE_QUANTIZATION, VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=$VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL, AITER_FLY_AR=$AITER_FLY_AR, AITER_FLY_AR_MESH_MIN_BYTES=${AITER_FLY_AR_MESH_MIN_BYTES:-default}, AITER_FLY_AR_FUSED_MESH_MIN_BYTES=${AITER_FLY_AR_FUSED_MESH_MIN_BYTES:-default}"')"
+    log "eval $EVAL_TASKS, ${EVAL_FEWSHOT}-shot, concurrency $EVAL_CONCURRENCY${EVAL_LIMIT:+, limit $EVAL_LIMIT}"
+    if lm_eval_run "$out/eval.log" "$EVAL_CONCURRENCY" \
+        --tasks "$EVAL_TASKS" --num_fewshot "$EVAL_FEWSHOT" ${EVAL_LIMIT:+--limit "$EVAL_LIMIT"}; then
+        log "eval done (traces/lm_eval): $(grep -E '^\|' "$out/eval.log" | grep -m2 -E 'exact_match|acc' | tr -s ' ' || true)"
+    else
+        log "eval FAILED, see eval.log"
+    fi
+    [ -n "$EVAL_LONG_TASKS" ] || return 0
+    for len in $EVAL_LONG_LENGTHS; do
+        if ! docker ps -q -f name="^$NAME$" | grep -q .; then
+            log "server died, skipping the long-context eval, see server.log"
+            return 0
+        fi
+        log "eval $EVAL_LONG_TASKS at $len tokens, concurrency $EVAL_LONG_CONCURRENCY${EVAL_LONG_LIMIT:+, limit $EVAL_LONG_LIMIT}"
+        if lm_eval_run "$out/eval_long_$len.log" "$EVAL_LONG_CONCURRENCY" \
+            --tasks "$EVAL_LONG_TASKS" ${EVAL_LONG_LIMIT:+--limit "$EVAL_LONG_LIMIT"} \
+            --metadata "{\"max_seq_lengths\": [$len], \"tokenizer\": \"$EVAL_LONG_TOKENIZER\"}"; then
+            # One table row per task and length; the other lengths' rows are -1.
+            log "eval $len done: $(grep -E "^\|.*\| *$len *\|" "$out/eval_long_$len.log" | tr -s ' ' | paste -sd ' ' || true)"
+        else
+            log "eval $len FAILED, see eval_long_$len.log"
+        fi
+    done
 }
 
 cmd_run() {
@@ -528,5 +603,5 @@ case "${1:-}" in
     summary) cmd_summary "${2:-}" ;;
     eval-summary) run_py e2e_eval_summary.py "${2:?usage: ./e2e.sh eval-summary <run dir>}" ;;
     all) cmd_build; MODE=bench; cmd_run ;;
-    *) sed -n '2,22p' "$0"; exit 1 ;;
+    *) sed -n '2,26p' "$0"; exit 1 ;;
 esac

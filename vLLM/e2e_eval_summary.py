@@ -5,15 +5,20 @@
 
 The arms and their order come from <run dir>/arms.txt (the first is the
 reference). Each arm's lm-eval output is under
-<tag>_tp<N>/traces/lm_eval/<model>/{results_*.json,samples_<task>_*.jsonl};
-if an arm has several, the newest is used. Prints two tables:
+<tag>_tp<N>/traces/lm_eval/<model>/{results_*.json,samples_<task>_*.jsonl},
+one results file per lm-eval run (e2e.sh runs one for the short tasks and one
+per long-context length); they are merged, a newer one winning a clash. Prints
+two tables:
   - per (TP, task, metric) the score of each arm with its standard error, and
     the difference of every other arm from the first, with the standard error
     of the difference (the two runs taken as independent);
   - per (TP, task, metric) and arm, the paired comparison with the first arm on
-    the same questions: how many each one alone got right, and the two-sided
-    exact McNemar p-value of that split. Greedy decoding makes the pairing
-    tight, so this is the more sensitive test.
+    the same prompts: on how many each one scored higher, the two-sided exact
+    sign-test p-value of that split (McNemar's test when scores are right or
+    wrong; RULER's are fractions), the mean paired difference with its standard
+    error, and how many generations were identical to the reference's
+    (with the median character at which the others first differ). Greedy
+    decoding makes the pairing tight, so this is the more sensitive test.
 """
 
 import json
@@ -33,22 +38,33 @@ def arm_order(run_dir):
     )
 
 
-def newest(paths):
-    return max(paths, key=lambda p: p.name) if paths else None
-
-
 def load_arm(arm_dir):
-    """(results json, {task: samples path}) of one arm, or None if it has none."""
+    """(merged results, {task: samples paths, oldest first}) of one arm, or None.
+
+    The results' "results" and "n-samples" are merged per task over all
+    results_*.json, oldest first, so a newer run's metric wins. RULER reports
+    -1 for the lengths a run did not have; those are not results and are dropped
+    with their stderr, so that they do not overwrite another run's.
+    """
     root = arm_dir / "traces" / "lm_eval"
-    results = newest(list(root.glob("**/results_*.json")))
-    if results is None:
+    files = sorted(root.glob("**/results_*.json"), key=lambda p: p.name)
+    if not files:
         return None
+    merged = {"results": {}, "n-samples": {}}
+    for f in files:
+        r = json.loads(f.read_text())
+        for task, v in r.get("results", {}).items():
+            dead = {k for k, x in v.items() if "," in k and x == -1}
+            dead |= {"%s_stderr,%s" % tuple(k.split(",", 1)) for k in dead}
+            merged["results"].setdefault(task, {}).update(
+                (k, x) for k, x in v.items() if k not in dead)
+        for task, v in r.get("n-samples", {}).items():
+            merged["n-samples"].setdefault(task, {}).update(v)
     samples = {}
-    for f in root.glob("**/samples_*.jsonl"):
+    for f in sorted(root.glob("**/samples_*.jsonl"), key=lambda p: p.name):
         task = re.match(r"samples_(.+)_[^_]+$", f.stem).group(1)
-        if task not in samples or f.name > samples[task].name:
-            samples[task] = f
-    return json.loads(results.read_text()), samples
+        samples.setdefault(task, []).append(f)
+    return merged, samples
 
 
 def scores(results):
@@ -66,24 +82,45 @@ def scores(results):
     return out
 
 
-def per_question(samples_path):
-    """{metric label: {doc_id: score}} from an lm-eval samples file."""
-    out = {}
-    # Split on "\n" only: str.splitlines() also breaks at U+2028 and friends, which
-    # lm-eval writes unescaped inside the generated text, cutting a record in two.
-    for line in samples_path.read_text(encoding="utf-8").split("\n"):
-        if not line:
-            continue
-        s = json.loads(line)
-        for metric in s.get("metrics", []):
-            if isinstance(s.get(metric), (int, float)):
-                label = "%s (%s)" % (metric, s.get("filter", "none"))
-                out.setdefault(label, {})[s["doc_id"]] = float(s[metric])
-    return out
+def per_question(samples_paths):
+    """({metric label: {prompt: score}}, {prompt: generation}) from samples files.
+
+    Prompts are keyed by lm-eval's prompt hash, so the pairing holds across
+    files and only pairs questions the arms were really asked alike.
+    """
+    out, gens = {}, {}
+    for path in samples_paths:
+        # Split on "\n" only: str.splitlines() also breaks at U+2028 and friends, which
+        # lm-eval writes unescaped inside the generated text, cutting a record in two.
+        for line in path.read_text(encoding="utf-8").split("\n"):
+            if not line:
+                continue
+            s = json.loads(line)
+            key = s.get("prompt_hash", s["doc_id"])
+            # Generations: [[text]] per question; anything else (log-likelihoods)
+            # compared as its JSON.
+            r = s.get("resps")
+            gens[key] = (r[0][0] if r and r[0] and isinstance(r[0][0], str)
+                         else json.dumps(r))
+            for metric in s.get("metrics", []):
+                # -1: a RULER length this question was not of.
+                if isinstance(s.get(metric), (int, float)) and s[metric] != -1:
+                    label = "%s (%s)" % (metric, s.get("filter", "none"))
+                    out.setdefault(label, {})[key] = float(s[metric])
+    return out, gens
+
+
+def first_difference(a, b):
+    """Index of the first character where two generations differ, or None."""
+    if a == b:
+        return None
+    a, b = a or "", b or ""
+    return next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
 
 
 def mcnemar_p(b, c):
-    """Two-sided exact McNemar p-value for b and c discordant pairs."""
+    """Two-sided exact sign-test p-value for b and c discordant pairs (McNemar's
+    test when the scores are right or wrong)."""
     n = b + c
     if n == 0:
         return 1.0
@@ -147,21 +184,31 @@ def main():
         for t in others:
             if t not in data:
                 continue
-            for task, path in sorted(data[t][1].items()):
+            for task, paths in sorted(data[t][1].items()):
                 if task not in ref_q:
                     continue
-                arm_q = per_question(path)
-                for metric in sorted(set(ref_q[task]) & set(arm_q)):
-                    a, b = ref_q[task][metric], arm_q[metric]
-                    docs = set(a) & set(b)
-                    both = sum(1 for d in docs if a[d] and b[d])
-                    neither = sum(1 for d in docs if not a[d] and not b[d])
-                    ref_only = sum(1 for d in docs if a[d] and not b[d])
-                    arm_only = sum(1 for d in docs if b[d] and not a[d])
+                (ref_s, ref_g), (arm_s, arm_g) = ref_q[task], per_question(paths)
+                for metric in sorted(set(ref_s) & set(arm_s)):
+                    a, b = ref_s[metric], arm_s[metric]
+                    docs = sorted(set(a) & set(b))
+                    if not docs:
+                        continue
+                    ref_higher = sum(1 for d in docs if a[d] > b[d])
+                    arm_higher = sum(1 for d in docs if b[d] > a[d])
+                    diffs = [b[d] - a[d] for d in docs]
+                    mean = sum(diffs) / len(docs)
+                    se = (math.sqrt(sum((x - mean) ** 2 for x in diffs)
+                                    / (len(docs) - 1) / len(docs))
+                          if len(docs) > 1 else 0.0)
+                    firsts = [first_difference(ref_g.get(d), arm_g.get(d)) for d in docs]
+                    differ = sorted(i for i in firsts if i is not None)
                     paired_rows.append([
                         str(tp), task, metric, "%s vs %s" % (t, ref), str(len(docs)),
-                        str(both), str(neither), str(ref_only), str(arm_only),
-                        "%.3f" % mcnemar_p(ref_only, arm_only),
+                        str(len(docs) - ref_higher - arm_higher), str(ref_higher),
+                        str(arm_higher), "%.3f" % mcnemar_p(ref_higher, arm_higher),
+                        "%+.4f ± %.4f" % (mean, se),
+                        "%d/%d" % (len(docs) - len(differ), len(docs)),
+                        str(differ[len(differ) // 2]) if differ else "-",
                     ])
 
     print("## Accuracy, reference %s\n" % ref)
@@ -173,8 +220,9 @@ def main():
     if paired_rows:
         print("\n## Paired, per question\n")
         print("\n".join(table(
-            ["TP", "task", "metric", "arms", "n", "both right", "both wrong",
-             "only %s right" % ref, "only the other right", "McNemar p"],
+            ["TP", "task", "metric", "arms", "n", "same score",
+             "%s higher" % ref, "other higher", "sign test p", "mean diff",
+             "identical outputs", "median first diff (char)"],
             paired_rows,
         )))
     if missing:
