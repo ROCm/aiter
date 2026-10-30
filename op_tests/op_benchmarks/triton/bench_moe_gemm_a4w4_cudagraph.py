@@ -367,7 +367,11 @@ def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
     from mori.cco import Communicator
 
     from aiter import ActivationType, QuantType
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
+        MegaMoEGeometry,
+        MegaMoEGfx1250,
+        MegaMoERecipe,
+    )
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import _from_gpu_ptr
     from aiter.ops.flydsl.moe_common import GateMode
 
@@ -384,8 +388,13 @@ def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
     comm = Communicator.init(world, rank, objs[0], per_rank_vmm=per_rank_vmm)
     comm.barrier()
 
-    mega = MegaMoEGfx1250(
-        communicator=comm,
+    recipe = MegaMoERecipe.from_legacy(
+        activation=ActivationType.Silu,
+        gate_mode=GateMode.INTERLEAVE.value,
+        quant_type=QuantType.per_1x32,
+        swiglu_limit=10.0,
+    )
+    geometry = MegaMoEGeometry(
         rank=rank,
         world_size=world,
         model_dim=hidden,
@@ -393,11 +402,8 @@ def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
         experts=experts,
         topk=topk,
         max_tokens_per_rank=mtpr,
-        activation=ActivationType.Silu,
-        gate_mode=GateMode.INTERLEAVE.value,
-        quant_type=QuantType.per_1x32,
-        swiglu_limit=10.0,
     )
+    mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=comm)
     # Read once here, where every rank is aligned and a barrier follows:
     # create_dev_comm() may be COLLECTIVE, so it cannot be done lazily from a
     # per-rank branch. Same contract ATOM's init_mega_transport honours.
