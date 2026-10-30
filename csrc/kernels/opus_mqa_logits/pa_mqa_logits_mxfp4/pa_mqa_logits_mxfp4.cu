@@ -640,122 +640,85 @@ void mqa_logits_mxfp4_build_schedule(aiter_tensor_t& query_start_loc,
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
-// The kernels stride every input by compile-time constants and read no runtime stride but the
-// table's and out's, so a padded or permuted input would be silently wrong: layouts are required.
-// Byte counts catch a wrong array, not a wrong permutation (the Python wrapper checks the ndim).
-void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
-                             aiter_tensor_t& q_scale,
-                             aiter_tensor_t& kv_cache,
-                             aiter_tensor_t& kv_scale,
-                             aiter_tensor_t& weights,
-                             aiter_tensor_t& block_tables,
-                             aiter_tensor_t& query_start_loc,
-                             aiter_tensor_t& row_ends,
-                             aiter_tensor_t& cta_info,
-                             aiter_tensor_t& out,
-                             aiter_tensor_t& out_offsets,
+// The addresses come checked by the Python wrapper (dtypes, layouts, contiguity, sizes; the kernels
+// stride every input by compile-time constants but the table's and out's rows). This checks what
+// the scalars alone tell: the mode, the split, and the kv_cache the instance can address.
+void mqa_logits_mxfp4_launch(int64_t q,
+                             int64_t q_scale,
+                             int64_t kv_cache,
+                             int64_t kv_scale,
+                             int64_t weights,
+                             int64_t block_tables,
+                             int64_t query_start_loc,
+                             int64_t row_ends,
+                             int64_t cta_info,
+                             int64_t out,
+                             int64_t out_offsets,
+                             int64_t kv_bytes,
+                             int rows,
+                             int num_seqs,
+                             int bt_stride,
+                             int out_stride,
                              int instance,
-                             int mode,
+                             int schedule_mode,
                              float weight_scale,
                              int tpb_shift,
                              int cta_target,
                              int prefill_parts,
-                             int grid) {
+                             int grid,
+                             int device,
+                             int64_t stream) {
     aiter_detail::AiterThrowGuard throw_guard;
+    constexpr int TOKEN_BYTES = 64;   // D = 128 fp4
     const ol::mqa_logits_instance& in = instance_at(instance);
+    const int mode = schedule_mode;
     AITER_CHECK(mode >= 0 && mode < ol::SCHED_MODES && (in.modes & (1 << mode)),
                 "instance ", instance, " has no schedule mode ", mode);
-
-    constexpr int TOKEN_BYTES = 64;   // D = 128 fp4
-    constexpr int SCALE_BYTES = 4;    // D / 32 E8M0
-    const int64_t rows = q.dim() == 3 ? q.size(0) : -1;
-    AITER_CHECK(rows >= 0 && q.size(1) == in.heads && q.size(2) == TOKEN_BYTES,
-                "q must be [rows, ", in.heads, ", ", TOKEN_BYTES, "] (H x D/2 packed fp4)");
-    AITER_CHECK(q.dtype() == AITER_DTYPE_fp4x2 || q.dtype() == AITER_DTYPE_u8,
-                "q must be fp4x2 (E2M1, 2/byte) or u8 bytes");
-    AITER_CHECK(kv_cache.dtype() == AITER_DTYPE_fp4x2 || kv_cache.dtype() == AITER_DTYPE_u8,
-                "kv_cache must be fp4x2 (E2M1, 2/byte) or u8 bytes");
-    AITER_CHECK(q_scale.dtype() == AITER_DTYPE_u8 && kv_scale.dtype() == AITER_DTYPE_u8,
-                "q_scale / kv_scale are E8M0 bytes and must be u8");
-    AITER_CHECK(weights.dtype() == AITER_DTYPE_bf16 && weights.dim() == 2 &&
-                    weights.size(0) >= rows && weights.size(1) == in.heads,
-                "weights must be bf16 [rows, ", in.heads, "]");
-    AITER_CHECK(q.is_contiguous() && q_scale.is_contiguous() && kv_cache.is_contiguous() &&
-                    kv_scale.is_contiguous() && weights.is_contiguous(),
-                "q / q_scale / kv_cache / kv_scale / weights must be contiguous");
-    AITER_CHECK(static_cast<int64_t>(q_scale.numel()) == rows * in.heads * SCALE_BYTES,
-                "q_scale must hold ", in.heads * SCALE_BYTES, " bytes a row, got ", q_scale.numel(),
-                " for ", rows, " rows");
-    AITER_CHECK(kv_cache.numel() % TOKEN_BYTES == 0 &&
-                    kv_scale.numel() == kv_cache.numel() / TOKEN_BYTES * SCALE_BYTES,
-                "kv_cache must be whole ", TOKEN_BYTES, "-byte keys and kv_scale ", SCALE_BYTES,
-                " bytes a key; got ", kv_cache.numel(), " and ", kv_scale.numel());
-    AITER_CHECK(in.max_kv_bytes == 0 || static_cast<int64_t>(kv_cache.numel()) <= in.max_kv_bytes,
+    AITER_CHECK(rows >= 0 && num_seqs >= 1 && bt_stride >= 0 && grid >= 0 && tpb_shift >= 0 &&
+                    tpb_shift <= ol::MAX_TPB_SHIFT,
+                "bad rows / num_seqs / bt_stride / grid / tpb_shift");
+    AITER_CHECK(kv_bytes >= 0 && kv_bytes % TOKEN_BYTES == 0,
+                "kv_cache must be whole ", TOKEN_BYTES, "-byte keys; got ", kv_bytes, " bytes");
+    AITER_CHECK(in.max_kv_bytes == 0 || kv_bytes <= in.max_kv_bytes,
                 "instance ", instance, " (", in.arch, ") addresses a kv_cache of at most ",
-                in.max_kv_bytes, " bytes; got ", kv_cache.numel());
-    AITER_CHECK(block_tables.dtype() == AITER_DTYPE_i32 && block_tables.dim() == 2 &&
-                    block_tables.stride(1) == 1,
-                "block_tables must be int32 [num_seqs, width] with unit column stride");
-    check_i32_vector(query_start_loc, "query_start_loc");
-    check_i32_vector(row_ends, "row_ends");
-    const int num_seqs = static_cast<int>(query_start_loc.numel()) - 1;
-    AITER_CHECK(num_seqs >= 1 && block_tables.size(0) >= num_seqs,
-                "query_start_loc must hold num_seqs + 1 >= 2 entries and block_tables a row each");
-    AITER_CHECK(static_cast<int64_t>(row_ends.numel()) >= rows,
-                "row_ends needs ", rows, " entries");
-
-    AITER_CHECK(out.dtype() == AITER_DTYPE_fp32, "out must be fp32");
-    const bool flat = out_offsets.numel() > 0;
-    if (flat) {
-        AITER_CHECK(in.flat_out,
-                    "instance ", instance, " writes [rows, width] only, not out_offsets");
-        AITER_CHECK(out_offsets.dtype() == AITER_DTYPE_i32 && out_offsets.is_contiguous() &&
-                        static_cast<int64_t>(out_offsets.numel()) >= rows,
-                    "out_offsets must be contiguous int32 with an entry a row");
-        AITER_CHECK(out.is_contiguous(), "a flat out must be contiguous");
-    } else {
-        AITER_CHECK(out.dim() == 2 && out.size(0) >= rows && out.stride(1) == 1,
-                    "out must be [rows, width] with unit column stride");
-    }
+                in.max_kv_bytes, " bytes; got ", kv_bytes);
+    const bool flat = out_offsets != 0;
+    AITER_CHECK(!flat || in.flat_out,
+                "instance ", instance, " writes [rows, width] only, not out_offsets");
     if (mode == ol::SCHED_TABLE)
-        AITER_CHECK(cta_info.dtype() == AITER_DTYPE_i32 && cta_info.is_contiguous() &&
-                        static_cast<int64_t>(cta_info.numel()) >= grid * RECORD_INTS,
-                    "a Table launch over ", grid, " slots needs that many records");
+        AITER_CHECK(cta_info != 0, "a Table launch needs its schedule records");
     else
         AITER_CHECK(cta_target >= 1 && prefill_parts >= 1 &&
                         prefill_parts <= ol::MAX_PREFILL_PARTS,
                     "cta_target must be >= 1 and prefill_parts in [1, ", ol::MAX_PREFILL_PARTS,
                     "]");
-    AITER_CHECK(grid >= 0 && tpb_shift >= 0 && tpb_shift <= ol::MAX_TPB_SHIFT,
-                "bad grid / tpb_shift");
     if (rows == 0 || grid == 0) return;
 
     mqa_logits_mxfp4_kargs k{};
-    k.ptr_q               = q.data_ptr();
-    k.ptr_q_scale         = q_scale.data_ptr();
-    k.ptr_kv              = kv_cache.data_ptr();
-    k.ptr_kv_scale        = kv_scale.data_ptr();
-    k.ptr_block_tables    = reinterpret_cast<const int*>(block_tables.data_ptr());
-    k.ptr_weights         = weights.data_ptr();
-    k.ptr_out             = reinterpret_cast<float*>(out.data_ptr());
-    k.ptr_out_offsets     = flat ? reinterpret_cast<const int*>(out_offsets.data_ptr())
-                                 : nullptr;
-    k.ptr_query_start_loc = reinterpret_cast<const int*>(query_start_loc.data_ptr());
-    k.ptr_row_ends        = reinterpret_cast<const int*>(row_ends.data_ptr());
+    k.ptr_q               = reinterpret_cast<const void*>(q);
+    k.ptr_q_scale         = reinterpret_cast<const void*>(q_scale);
+    k.ptr_kv              = reinterpret_cast<const void*>(kv_cache);
+    k.ptr_kv_scale        = reinterpret_cast<const void*>(kv_scale);
+    k.ptr_block_tables    = reinterpret_cast<const int*>(block_tables);
+    k.ptr_weights         = reinterpret_cast<const void*>(weights);
+    k.ptr_out             = reinterpret_cast<float*>(out);
+    k.ptr_out_offsets     = reinterpret_cast<const int*>(out_offsets);
+    k.ptr_query_start_loc = reinterpret_cast<const int*>(query_start_loc);
+    k.ptr_row_ends        = reinterpret_cast<const int*>(row_ends);
     k.ptr_cta_info        = mode == ol::SCHED_TABLE
-                                ? reinterpret_cast<const opus_mqa_cta_record*>(cta_info.data_ptr())
+                                ? reinterpret_cast<const opus_mqa_cta_record*>(cta_info)
                                 : nullptr;
-    k.bt_stride           = static_cast<int>(block_tables.stride(0));
+    k.bt_stride           = bt_stride;
     k.tpb_shift           = tpb_shift;
-    k.out_stride          = flat ? 0 : static_cast<int>(out.stride(0));
-    k.num_rows            = static_cast<int>(rows);
+    k.out_stride          = flat ? 0 : out_stride;
+    k.num_rows            = rows;
     k.num_seqs            = num_seqs;
     k.weight_scale        = weight_scale;
     k.cta_target          = cta_target;
     k.prefill_parts       = prefill_parts;
     k.kv_last_row         = static_cast<unsigned>(  // keys past 2^32 are never addressed (4.)
-        std::min<int64_t>(static_cast<int64_t>(kv_cache.numel()) / TOKEN_BYTES, 1LL << 32) - 1);
+        std::min<int64_t>(kv_bytes / TOKEN_BYTES, 1LL << 32) - 1);
 
-    HipDeviceGuard guard(q.device_id);
-    HIP_CALL_LAUNCH(in.launch(mode, k, grid, aiter::getCurrentHIPStream()));
+    HipDeviceGuard guard(device);
+    HIP_CALL_LAUNCH(in.launch(mode, k, grid, reinterpret_cast<hipStream_t>(stream)));
 }
