@@ -839,9 +839,6 @@ def launch_gemm_a4w4_256x256(
         else:
             if const_expr(split_k > 1):
                 c_off_rt += fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
-            # A store cannot drain a padded LDS tile: make the tile the PADDED width
-            # and the view's inner extent the real one, so boundary_check drops the
-            # pad columns -- exactly what the old tensor_extents clamp did.
             C_TILE = (tile_m, C_LDS_ROW)
             gtC = _gv(
                 fx.recast_iter(partial_elem, arg_c),

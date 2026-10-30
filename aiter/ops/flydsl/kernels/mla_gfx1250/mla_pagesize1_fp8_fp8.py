@@ -1452,8 +1452,6 @@ def launch_mla_pagesize1_fp8_fp8(
                         # The store three passes back still reads this chunk.
                         tdm_ops.tensor_wait(2)
                     chunk_base = output_chunk_base(chunk, last_slot)
-                    # The tiled store needs a size-1 rest alongside the box, so the
-                    # LDS tile is spelled ((rows, row_elems), 1) rather than flat.
                     lds_view = fx.Tensor(
                         fx.make_view(
                             fx.recast_iter(
@@ -1508,12 +1506,8 @@ def launch_mla_pagesize1_fp8_fp8(
                     for store in range_constexpr(len(stores)):
                         lds_store_b128(stores[store][0], stores[store][1])
                     rocdl.s_wait_dscnt(0)
-                    # Padded rows copied whole: a store cannot drain a padded LDS
-                    # tile, so the tile is the PADDED width (row_elems) and the
-                    # view's extents are the real ones (store_rows x pass_cols).
-                    # boundary_check then keeps the pad columns -- and an invalid
-                    # wave's zero store_rows -- out of global memory, exactly as
-                    # the old tensor_extents clamp did.
+                    # Padded rows copied whole; the column extent keeps the pad
+                    # columns out of global memory.
                     O_TILE = (wave_rows, row_elems)
                     global_view = fx.Tensor(
                         fx.make_view(

@@ -461,10 +461,6 @@ def launch_gemm_a4w4(
             # out-of-range clamp is relied on; edge tiles keep the guarded stores.
             if const_expr(tile_m % waves == 0):
                 if (bm + tile_m <= m) & (bn + tile_n <= n) & (ld_c % 8 == 0):
-                    # Padded tile, real-width view: a store cannot drain a padded LDS
-                    # tile, so the tile carries the pad and boundary_check drops the
-                    # pad columns. This branch is already gated on a whole tile, so
-                    # the M extent is exactly tile_m.
                     C_TILE = (tile_m, c_lds_row)
                     tile_out = fx.Tensor(
                         fx.make_view(
