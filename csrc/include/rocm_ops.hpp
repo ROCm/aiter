@@ -2948,3 +2948,21 @@ namespace py = pybind11;
           py::arg("split_lse"),         \
           py::arg("final_output"),      \
           py::arg("attn_sink") = py::none());
+
+#define FP8_MQA_LOGITS_PYBIND                          \
+    m.def("fp8_mqa_logits",                            \
+          &fp8_mqa_logits,                             \
+          py::arg("q_fp8"),                            \
+          py::arg("k_fp8"),                            \
+          py::arg("kv_scale"),                         \
+          py::arg("weights"),                          \
+          py::arg("cu_seqlen_ks"),                     \
+          py::arg("cu_seqlen_ke"),                     \
+          py::arg("BlockM")       = 0,                 \
+          py::arg("SplitN")       = 0,                 \
+          py::arg("num_warps")    = 0,                 \
+          py::arg("TotalCuCount") = 256,               \
+          py::arg("clean_logits") = true,              \
+          py::arg("unroll2")      = -1,                \
+          py::arg("reverse_rows") = -1,                \
+          py::arg("out")          = std::nullopt);
