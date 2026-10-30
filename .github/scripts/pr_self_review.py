@@ -19,6 +19,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,6 +60,27 @@ REQUIRED_CHECKS = {
     "Aiter Test Gate": {"Aiter Test Gate"},
 }
 PASS_CONCLUSIONS = {"success"}
+
+# Pure CI or documentation changes never trigger the Aiter Test workflow, so its gate
+# check-run structurally cannot exist on such PRs. Keeping it required there makes those
+# PRs permanently "not ready" -- a false positive with no CI signal to wait for.
+CI_ONLY_PREFIXES = (".github/", "docs/")
+CI_ONLY_SUFFIXES = (".md", ".rst")
+
+
+def required_checks(paths: list[str]) -> dict[str, set[str]]:
+    """Drop the Aiter Test Gate requirement when all changed paths are CI-only or
+    documentation; everything else keeps the full four-check requirement."""
+    if paths and all(
+        path.startswith(CI_ONLY_PREFIXES) or path.endswith(CI_ONLY_SUFFIXES)
+        for path in paths
+    ):
+        return {
+            label: aliases
+            for label, aliases in REQUIRED_CHECKS.items()
+            if label != "Aiter Test Gate"
+        }
+    return REQUIRED_CHECKS
 
 
 class APIError(RuntimeError):
@@ -431,13 +453,17 @@ def inspect_copilot(
     return issues[:20], advisories[:20]
 
 
-def inspect_ci(api: GitHub, head_sha: str) -> dict[str, str]:
+def inspect_ci(
+    api: GitHub, head_sha: str, required: dict[str, set[str]] | None = None
+) -> dict[str, str]:
+    if required is None:
+        required = REQUIRED_CHECKS
     if not head_sha:
-        return {name: "missing" for name in REQUIRED_CHECKS}
+        return {name: "missing" for name in required}
     result = api.request(f"commits/{head_sha}/check-runs?filter=latest&per_page=100")
     runs = result.get("check_runs") if isinstance(result, dict) else []
     states: dict[str, str] = {}
-    for label, aliases in REQUIRED_CHECKS.items():
+    for label, aliases in required.items():
         matches = [run for run in runs or [] if run.get("name") in aliases]
         if not matches:
             states[label] = "missing"
@@ -491,10 +517,11 @@ def evaluate(api: GitHub, number: int, mode: str) -> Result:
     )
     copilot_issues, copilot_advisories = inspect_copilot(api, number, author)
     ci_unavailable = False
+    required = required_checks(paths)
     try:
-        ci = inspect_ci(api, head_sha)
+        ci = inspect_ci(api, head_sha, required)
     except APIError:
-        ci = {name: "unavailable" for name in REQUIRED_CHECKS}
+        ci = {name: "unavailable" for name in required}
         ci_unavailable = True
     result = Result(
         head_sha=head_sha,
@@ -654,15 +681,14 @@ def render(result: Result) -> str:
     return "\n".join(lines)
 
 
-def upsert_comment(api: GitHub, number: int, body: str) -> str:
+def upsert_comment(api: GitHub, number: int, body: str, own_login: str) -> str:
     comments = api.pages(f"issues/{number}/comments")
     existing = next(
         (
             comment
             for comment in comments
             if MARKER in (comment.get("body") or "")
-            and ((comment.get("user") or {}).get("login") or "").lower()
-            == "github-actions[bot]"
+            and ((comment.get("user") or {}).get("login") or "").lower() == own_login
         ),
         None,
     )
@@ -679,7 +705,9 @@ def upsert_comment(api: GitHub, number: int, body: str) -> str:
     return response.get("html_url") or ""
 
 
-def post_status(api: GitHub, sha: str, result: Result, url: str) -> None:
+def post_status(
+    api: GitHub, sha: str, result: Result, url: str, own_login: str
+) -> None:
     state = result.state()
     if result.mode == "shadow":
         description = f"shadow: {len(result.blocking)} blocker(s), CI {'pending' if result.ci_pending else 'complete'}"
@@ -695,8 +723,7 @@ def post_status(api: GitHub, sha: str, result: Result, url: str) -> None:
             status
             for status in statuses
             if status.get("context") == STATUS_CONTEXT
-            and ((status.get("creator") or {}).get("login") or "").lower()
-            == "github-actions[bot]"
+            and ((status.get("creator") or {}).get("login") or "").lower() == own_login
         ),
         None,
     )
@@ -719,6 +746,23 @@ def post_status(api: GitHub, sha: str, result: Result, url: str) -> None:
     )
 
 
+def writer_token(env: Mapping[str, str]) -> str:
+    """Write calls prefer the PAT: the org policy keeps GITHUB_TOKEN read-only,
+    so comments and commit statuses must go through AITER_BOT_TOKEN."""
+    return env.get("AITER_BOT_TOKEN") or env.get("GH_TOKEN", "")
+
+
+def resolve_own_login(api: GitHub) -> str:
+    """Login of the token owner, used to recognize our own sticky comment and
+    commit status. Falls back to github-actions[bot] when the query fails."""
+    try:
+        viewer = api.graphql("query { viewer { login } }", {})
+    except APIError:
+        return "github-actions[bot]"
+    login = (viewer.get("viewer") or {}).get("login") or ""
+    return login.strip().lower() or "github-actions[bot]"
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -729,7 +773,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     repo = os.environ.get("GITHUB_REPOSITORY", "ROCm/aiter")
-    token = os.environ.get("GH_TOKEN", "")
+    token = writer_token(os.environ)
     mode = os.environ.get("SELF_REVIEW_MODE", "shadow").strip().lower()
     if mode not in {"shadow", "enforce"}:
         raise SystemExit(f"invalid SELF_REVIEW_MODE={mode!r}")
@@ -753,10 +797,19 @@ def main(argv: list[str]) -> int:
     body = render(result)
     print(body)
     if args.apply:
-        url = upsert_comment(api, number, body)
+        own_login = resolve_own_login(api)
+        url = ""
+        try:
+            url = upsert_comment(api, number, body, own_login)
+        except APIError as exc:
+            if mode == "enforce":
+                raise
+            print(
+                f"::warning title=PR Self-Review sticky comment::shadow mode could not write comment: {exc}"
+            )
         # PR checks and branch protection are attached to the PR head commit.
         try:
-            post_status(api, result.head_sha, result, url or result.pr_url)
+            post_status(api, result.head_sha, result, url or result.pr_url, own_login)
         except APIError as exc:
             if mode == "enforce":
                 raise
