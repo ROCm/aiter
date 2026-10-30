@@ -130,9 +130,7 @@ def blocking_reasons(config) -> list:
     max_n_tiles = 1 << _ITEM_N_BITS
     inter = int(config.geometry.inter_dim)
     if 2 * inter > max_n_tiles * _S1F_TILE_N:
-        reasons.append(
-            f"inter_dim {inter} needs more than {max_n_tiles} n-tiles"
-        )
+        reasons.append(f"inter_dim {inter} needs more than {max_n_tiles} n-tiles")
     from .s1f_stage1 import _SCALE_PIECE, N_XCC, S1F_PRODUCERS
 
     if config.dispatch_scale_nbytes % _SCALE_PIECE:
@@ -445,7 +443,9 @@ class _Stage1Fusion:
 
         return s1f_producers(tokens), s1f_block_runs(tokens)
 
-    def _launcher(self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs):
+    def _launcher(
+        self, *, tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs
+    ):
         from .s1f_stage1 import make_s1f_stage1
 
         key = (tile_m, producers, group_m, stage1_act, quant_wmma_rep, block_runs)
@@ -630,7 +630,10 @@ class _Stage1Fusion:
             )
 
         pkey = (align_m, int(stage1_act), int(quant_wmma_rep))
-        if pkey not in self.precompiled and not torch.cuda.is_current_stream_capturing():
+        if (
+            pkey not in self.precompiled
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             self.precompiled.add(pkey)
             self._precompile(
                 launch_args,

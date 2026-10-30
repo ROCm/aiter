@@ -515,8 +515,7 @@ class _CompactDispatch(_Dispatch):
         if fused_quant:
             payload = self._quant_payload[:token_count]
             scales_ptr = (
-                self.fusion.wire[:token_count].data_ptr()
-                + config.dispatch_token_nbytes
+                self.fusion.wire[:token_count].data_ptr() + config.dispatch_token_nbytes
             )
         else:
             payload, scales_ptr, _ = self.fusion.quantize(
@@ -751,14 +750,10 @@ class _CompactDispatch(_Dispatch):
                     "quant_blocks": qb,
                     "quant_model_dim": config.hidden_dim if qb else 0,
                     "quant_row_stride": geo.wire_row if qb else 0,
-                    "quant_payload_bytes": (
-                        config.dispatch_token_nbytes if qb else 0
-                    ),
+                    "quant_payload_bytes": (config.dispatch_token_nbytes if qb else 0),
                 }
                 if plan_s1f:
-                    extra.update(
-                        s1f=True, write_tok_map=write_tok_map, align_m=align_m
-                    )
+                    extra.update(s1f=True, write_tok_map=write_tok_map, align_m=align_m)
             # Stage-1: runs and tile_info per producer flag tile; experts are
             # still padded to the step's GEMM1 tile (align_m).
             tile_m = align_m

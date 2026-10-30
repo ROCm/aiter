@@ -108,11 +108,18 @@ def test_review_config_fits(monkeypatch):
 
 def test_fused_reserves_route_rows(monkeypatch):
     monkeypatch.delenv("AITER_MEGA_S1F", raising=False)
-    shape = dict(ws=4, hidden=7168, mtpr=16384, experts=384, topk=6, wire="fp4", fused=True)
     monkeypatch.setenv("AITER_TDM_TILE_M", "256")
-    wide = _layout_bytes(_config(**shape))
+    wide = _layout_bytes(
+        _config(
+            ws=4, hidden=7168, mtpr=16384, experts=384, topk=6, wire="fp4", fused=True
+        )
+    )
     monkeypatch.setenv("AITER_TDM_TILE_M", "16")
-    narrow = _layout_bytes(_config(**shape))
+    narrow = _layout_bytes(
+        _config(
+            ws=4, hidden=7168, mtpr=16384, experts=384, topk=6, wire="fp4", fused=True
+        )
+    )
     # Compact rows are padded per expert to the GEMM tile, so the wider tile
     # reserves more of the arena than the narrow one.
     assert wide > narrow
@@ -128,4 +135,3 @@ def test_rejects_indivisible_experts():
             topk=6,
             stage1_fused=False,
         )
-
