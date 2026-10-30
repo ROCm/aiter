@@ -550,7 +550,9 @@ class DualwaveFp8KernelContext:
         self.dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         # fp8 global->LDS DMA uses i8 destination typing; K/V LDS reads are byte-addressed.
-        self.lds_ptr_ty = fx.PointerType.get(fx.Int8.ir_type, 2, traits.DMA_BYTES)
+        self.lds_ptr_ty = fx.PointerType.get(
+            fx.Int8.ir_type, fx.AddressSpace.Shared, traits.DMA_BYTES
+        )
 
     def _load_scale_scalar(self, tensor):
         _div = fx.logical_divide(

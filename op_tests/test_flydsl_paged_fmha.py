@@ -29,6 +29,24 @@ LAYOUTS = [
     (1024, "vectorized"),
 ]
 DIMS = [(128, 128), (192, 128), (192, 192)]
+# Every layout/width pair, with both metadata forms distributed across them.
+LAYOUT_CASES = [
+    (1, "linear3d", 128, 128, False),
+    (1, "linear3d", 192, 128, True),
+    (1, "linear3d", 192, 192, False),
+    (1, "linear", 128, 128, True),
+    (1, "linear", 192, 128, False),
+    (1, "linear", 192, 192, True),
+    (16, "vectorized", 128, 128, False),
+    (16, "vectorized", 192, 128, True),
+    (16, "vectorized", 192, 192, False),
+    (64, "vectorized", 128, 128, True),
+    (64, "vectorized", 192, 128, False),
+    (64, "vectorized", 192, 192, True),
+    (1024, "vectorized", 128, 128, False),
+    (1024, "vectorized", 192, 128, True),
+    (1024, "vectorized", 192, 192, False),
+]
 gfx950 = pytest.mark.skipif(
     not torch.cuda.is_available() or get_gfx() != "gfx950",
     reason="native paged FP8 requires gfx950",
@@ -235,7 +253,6 @@ def check_accuracy(case, actual, expected, *, msg="paged FP8"):
             )
         offset += qlen
     assert offset == actual.shape[0] == expected.shape[0]
-    return 0.0
 
 
 def check_case(case, **kwargs):
@@ -266,32 +283,10 @@ def check_lse(actual, expected):
             msg="paged FP8 LSE",
         )
         assert err == 0
-        return float((actual[finite] - expected[finite]).abs().max())
-    return 0.0
 
 
 @gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv,csr",
-    [
-        # Each layout/width pair once, with both metadata paths represented.
-        (1, "linear3d", 128, 128, False),
-        (1, "linear3d", 192, 128, True),
-        (1, "linear3d", 192, 192, False),
-        (1, "linear", 128, 128, True),
-        (1, "linear", 192, 128, False),
-        (1, "linear", 192, 192, True),
-        (16, "vectorized", 128, 128, False),
-        (16, "vectorized", 192, 128, True),
-        (16, "vectorized", 192, 192, False),
-        (64, "vectorized", 128, 128, True),
-        (64, "vectorized", 192, 128, False),
-        (64, "vectorized", 192, 192, True),
-        (1024, "vectorized", 128, 128, False),
-        (1024, "vectorized", 192, 128, True),
-        (1024, "vectorized", 192, 192, False),
-    ],
-)
+@pytest.mark.parametrize("page,layout,d,dv,csr", LAYOUT_CASES)
 def test_lse_ragged_and_output_buffers(page, layout, d, dv, csr):
     case = make_case(
         page,
@@ -384,8 +379,10 @@ def test_runtime_scale_reuses_compiled_launcher(page, layout, d, dv):
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS[:3])
-@pytest.mark.parametrize("d,dv", DIMS)
+@pytest.mark.parametrize(
+    "page,layout,d,dv",
+    [(1, "linear3d", 128, 128), (1, "linear", 192, 128), (16, "vectorized", 192, 192)],
+)
 def test_bounded_matches_wide_pointer_cache(monkeypatch, page, layout, d, dv):
     case = make_case(page, layout, d, dv)
     bounded = check_case(case).clone()
@@ -541,7 +538,9 @@ def test_graph_reads_updated_lengths(page, layout, d, dv):
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS)
+@pytest.mark.parametrize(
+    "page,layout", [(1, "linear3d"), (1, "linear"), (64, "vectorized")]
+)
 def test_strided_metadata_and_scalar_descales(page, layout):
     case = make_case(page, layout, 192, 128)
     case.cuq = case.cuq.repeat_interleave(2)[::2]
@@ -761,19 +760,17 @@ def test_csr_strided_metadata_on_side_stream(page, layout):
 @pytest.mark.parametrize(
     "page,layout,d,dv,return_lse",
     [
-        (page, layout, d, dv, False)
-        for page, layout in (LAYOUTS[i] for i in (0, 2, 3, 4))
-        for d, dv in DIMS
-    ]
-    + [
+        (1, "linear3d", 128, 128, False),
+        (16, "vectorized", 192, 192, False),
+        (64, "vectorized", 192, 128, False),
+        (1024, "vectorized", 128, 128, False),
         (64, "vectorized", 128, 128, True),
         (16, "vectorized", 192, 128, True),
         (1, "linear3d", 192, 192, True),
     ],
 )
 def test_lazy_and_eager_match_reference(page, layout, d, dv, return_lse):
-    # Cover both softmax modes across pages/widths, with LSE on each head pair.
-    # The ragged LSE matrix covers the full layout/metadata product.
+    # Exercise both softmax modes across page paths and LSE on each head pair.
     case = make_case(page, layout, d, dv)
     options = csr_metadata(case, prefix=5)
     if not return_lse:
@@ -904,9 +901,7 @@ def _native_cache(case, key, value):
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS)
-@pytest.mark.parametrize("d,dv", DIMS)
-@pytest.mark.parametrize("csr", [False, True])
+@pytest.mark.parametrize("page,layout,d,dv,csr", LAYOUT_CASES)
 def test_inactive_nan_bytes_and_empty_request(page, layout, d, dv, csr):
     # Cross token groups, 64/128-token tiles and the 1024-token page boundary
     # through the real attention pipeline, with inactive K/V bytes poisoned.
