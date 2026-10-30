@@ -2629,6 +2629,7 @@ __device__ void store_zero_mx_quant_moe_sort_row(
     const int32_t scaleN_valid,
     const int scale_k,
     const int num_thread_per_group,
+    const bool route_valid,
     const int64_t offset_base,
     const int cols)
 {
@@ -2636,6 +2637,12 @@ __device__ void store_zero_mx_quant_moe_sort_row(
     {
         int addr    = aiter::mx_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k);
         scale[addr] = 0;
+    }
+    // A sorting sentinel (topk_id == topk) names no route: its token may be a
+    // real one under a num_local_tokens count, so offset_base can lie past `out`.
+    if(!route_valid)
+    {
+        return;
     }
     const int64_t row_bytes = std::is_same_v<DTYPE_O, opus::fp4_t> ? cols / 2 : cols;
     uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
@@ -2740,11 +2747,12 @@ __global__ void fused_mx_quant_moe_sort_kernel(
 
             int64_t offset_base = topk == 1 ? (int64_t)(token_idx) : (int64_t)(token_idx * topk + topk_id);
             const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
+            const bool route_valid = topk == 1 || topk_id < topk;
             // A shared row (one per token, quantized by each of its routes) only
             // ever receives the token's own bytes, so its writers agree; zeroing
             // it for one zero-weight route would race the token's other routes.
-            if(route_owns_row && sorted_weights != nullptr &&
-               sorted_weights[sorted_row] == 0.0f)
+            if(!route_valid || (route_owns_row && sorted_weights != nullptr &&
+                                sorted_weights[sorted_row] == 0.0f))
             {
                 store_zero_mx_quant_moe_sort_row<DTYPE_O, thread_data_size>(
                     out,
@@ -2754,6 +2762,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                     scaleN_valid,
                     scale_k,
                     num_thread_per_group,
+                    route_valid,
                     offset_base,
                     cols);
                 continue;

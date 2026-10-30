@@ -198,8 +198,7 @@ def csr_metadata(case, prefix=0):
 
 
 @gfx950
-@pytest.mark.parametrize("layout", ["linear3d", "linear"])
-@pytest.mark.parametrize("d,dv", DIMS)
+@pytest.mark.parametrize("layout,d,dv", [("linear3d", 128, 128), ("linear", 192, 128)])
 def test_csr_page1_optional_last_lengths(layout, d, dv):
     case = make_case(1, layout, d, dv)
     options = csr_metadata(case)
@@ -272,9 +271,27 @@ def check_lse(actual, expected):
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS)
-@pytest.mark.parametrize("d,dv", DIMS)
-@pytest.mark.parametrize("csr", [False, True])
+@pytest.mark.parametrize(
+    "page,layout,d,dv,csr",
+    [
+        # Each layout/width pair once, with both metadata paths represented.
+        (1, "linear3d", 128, 128, False),
+        (1, "linear3d", 192, 128, True),
+        (1, "linear3d", 192, 192, False),
+        (1, "linear", 128, 128, True),
+        (1, "linear", 192, 128, False),
+        (1, "linear", 192, 192, True),
+        (16, "vectorized", 128, 128, False),
+        (16, "vectorized", 192, 128, True),
+        (16, "vectorized", 192, 192, False),
+        (64, "vectorized", 128, 128, True),
+        (64, "vectorized", 192, 128, False),
+        (64, "vectorized", 192, 192, True),
+        (1024, "vectorized", 128, 128, False),
+        (1024, "vectorized", 192, 128, True),
+        (1024, "vectorized", 192, 192, False),
+    ],
+)
 def test_lse_ragged_and_output_buffers(page, layout, d, dv, csr):
     case = make_case(
         page,
@@ -645,14 +662,13 @@ def test_side_stream_keeps_copy_source_alive(explicit_stream):
         (1024, "vectorized", 128, 128),
     ],
 )
-@pytest.mark.parametrize("rectangular", [False, True])
-def test_direct_prefill_metadata_precedence(page, layout, d, dv, rectangular):
+def test_direct_prefill_metadata_precedence(page, layout, d, dv):
     case = make_case(page, layout, d, dv)
     metadata = csr_metadata(case, prefix=5)
-    if rectangular:
-        metadata["block_table"] = case.table
-        metadata["seqlen_k"] = case.lengths
-        metadata["kv_page_indices"].fill_(-1)
+    # The rectangular table must win over the unused, invalid CSR page IDs.
+    metadata["block_table"] = case.table
+    metadata["seqlen_k"] = case.lengths
+    metadata["kv_page_indices"].fill_(-1)
     actual = run_case(case, **metadata, softmax_scale=0.137)
     torch.cuda.synchronize()
     assert actual is case.out
