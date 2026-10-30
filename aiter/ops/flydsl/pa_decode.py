@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 or BF16 paged-attention decode on gfx942/gfx950/gfx1250.
+"""FP8, BF16 or MXFP4 paged-attention decode on gfx942/gfx950/gfx1250.
 
 Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
 OCP on gfx950/gfx1250. See ``kernels.pa_decode_kernel`` for Q/P quantization and
 MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
-K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
+K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches. MXFP4 K/V
+(e2m1 data, e8m0 scale per 32 elements) run on gfx950, see ``pa_decode``.
 """
 
 import flydsl.compiler as flyc
@@ -169,6 +170,168 @@ def launch_pa_decode_ps_reduce(
     )
 
 
+def _pa_decode_mxfp4(
+    output,
+    query,
+    k_data,
+    v_data,
+    k_scale,
+    v_scale,
+    context_lengths,
+    block_tables,
+    softmax_scale,
+    exp_sums,
+    max_logits,
+    temporary_output,
+    work_plan,
+    max_context_length,
+):
+    """MXFP4 K/V on gfx950: ``kv_dtype="mxfp4"`` of the shared tile kernel."""
+    if get_gfx_runtime() != "gfx950":
+        raise NotImplementedError("MXFP4 pa_decode supports gfx950")
+    dev = query.device
+    num_seqs, num_q_heads, head_dim = query.shape
+    num_kv_heads = k_data.shape[1]
+    group = num_q_heads // num_kv_heads
+    if head_dim != 128 or num_q_heads % num_kv_heads or group > 16:
+        raise NotImplementedError(
+            "MXFP4 pa_decode needs head_dim 128 and 1..16 query heads per KV head, "
+            f"got query {tuple(query.shape)} over {num_kv_heads} KV heads"
+        )
+    if query.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+        raise TypeError(
+            f"MXFP4 pa_decode needs an e4m3 or bf16 query, got {query.dtype}"
+        )
+    if output.dtype != torch.bfloat16 or output.shape != query.shape:
+        raise TypeError("MXFP4 pa_decode needs a bf16 output shaped like the query")
+    if any(x * t.element_size() % 16 for t in (query, output) for x in t.stride()[:2]):
+        raise ValueError("MXFP4 pa_decode needs 16 B query and output row/head strides")
+    # K and V are data views [pages, kv_heads, 128, 64] and e8m0 scale views
+    # [pages, kv_heads, 128, 4] of one page; the four share page and head strides.
+    page_head_strides = k_data.stride()[:2]
+    if any(x % 16 or x >= 2**31 for x in page_head_strides):
+        raise ValueError(
+            "MXFP4 page and head strides must be multiples of 16 and fit i32"
+        )
+    for name, t, tail in (
+        ("key_cache", k_data, 64),
+        ("value_cache", v_data, 64),
+        ("key_scale", k_scale, 4),
+        ("value_scale", v_scale, 4),
+    ):
+        if (
+            t.dtype != torch.uint8
+            or t.device != dev
+            or tuple(t.shape[1:]) != (num_kv_heads, 128, tail)
+            or t.stride() != (*page_head_strides, tail, 1)
+        ):
+            raise ValueError(
+                f"{name} must be a uint8 [pages, {num_kv_heads}, 128, {tail}] view "
+                f"on {dev} with the key cache's page and head strides, got "
+                f"{t.dtype} {tuple(t.shape)} {t.stride()}"
+            )
+    if block_tables.dtype != torch.int32 or context_lengths.dtype != torch.int32:
+        raise TypeError("block_tables and context_lengths must be int32")
+    if num_seqs == 0:
+        return
+    max_blocks_per_seq = block_tables.shape[1]
+    schedule_context_length = max_blocks_per_seq * 128
+    if max_context_length is not None:
+        if not 0 <= max_context_length <= schedule_context_length:
+            raise ValueError("max_context_length must be within block-table capacity")
+        schedule_context_length = -(-max_context_length // 128) * 128
+    same_strides = query.stride()[:2] == output.stride()[:2]
+    if work_plan is None and not same_strides:
+        raise ValueError("without a work_plan the output needs the query's strides")
+    if work_plan is not None:
+        work_plan.validate(num_seqs, num_kv_heads, dev)
+    # One task per sequence needs neither the plan nor the reducer.
+    direct = work_plan is None or (work_plan.max_partitions == 1 and same_strides)
+    capacity = num_seqs if direct else work_plan.capacity
+    with torch.cuda.device(dev):
+        compiled = compile_pa_decode_tile(
+            head_dim=head_dim,
+            query_group_size=group,
+            block_size=128,
+            num_seqs=num_seqs,
+            num_kv_heads=num_kv_heads,
+            num_compute_units=torch.cuda.get_device_properties(
+                dev
+            ).multi_processor_count,
+            num_partitions=1 if direct else work_plan.max_partitions,
+            softmax_scale=softmax_scale,
+            query_dtype="fp8" if query.dtype == torch.float8_e4m3fn else "bf16",
+            kv_dtype="mxfp4",
+            work_capacity=capacity,
+            max_context_length=schedule_context_length,
+            direct_output=direct,
+        )
+    pmax = psum = pout = output
+    if not direct:
+        shape = (num_kv_heads, capacity, group)
+        scratch = []
+        for name, t, expected, dtype in (
+            ("max_logits", max_logits, shape, torch.float32),
+            ("exp_sums", exp_sums, shape, torch.float32),
+            ("temporary_output", temporary_output, (*shape, head_dim), output.dtype),
+        ):
+            if t is None:
+                t = torch.empty(expected, dtype=dtype, device=dev)
+            if tuple(t.shape) != expected or t.dtype != dtype or not t.is_contiguous():
+                raise ValueError(f"{name} must be contiguous {dtype} {expected}")
+            scratch.append(t)
+        pmax, psum, pout = scratch
+    with torch.cuda.device(dev):
+        stream = torch.cuda.current_stream(dev)
+        _run_compiled(
+            compiled["launch"],
+            ptr_arg(pmax, fx.Float32),
+            ptr_arg(psum, fx.Float32),
+            ptr_arg(pout, _flydsl_pointer_dtype(pout.dtype)),
+            ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
+            ptr_arg(k_data, fx.Uint8),
+            ptr_arg(v_data, fx.Uint8),
+            ptr_arg(block_tables, fx.Int32),
+            ptr_arg(k_scale, fx.Uint8),
+            ptr_arg(v_scale, fx.Uint8),
+            max_blocks_per_seq,
+            num_seqs,
+            num_kv_heads,
+            *page_head_strides,
+            query.stride(0),
+            query.stride(1),
+            ptr_arg(context_lengths if direct else work_plan.work_info, fx.Int32),
+            capacity,
+            stream,
+        )
+        if direct:
+            return
+        output_5d = output.reshape(num_seqs, 1, num_kv_heads, group, head_dim)
+        launch_pa_decode_ps_reduce(
+            output_5d,
+            psum,
+            pmax,
+            pout,
+            None,
+            *output_5d.stride()[:4],
+            pmax.stride(0),
+            pmax.stride(1),
+            pout.stride(0),
+            pout.stride(1),
+            pout.stride(2),
+            query_seq_len=1,
+            query_group_size=group,
+            head_size=head_dim,
+            max_partitions=min(
+                work_plan.max_partitions,
+                capacity,
+                max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
+            ),
+            stream=stream,
+            reduce_info=work_plan.reduce_info,
+        )
+
+
 def pa_decode(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
@@ -190,7 +353,7 @@ def pa_decode(
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
-    work_plan: PADecodePlan,
+    work_plan: PADecodePlan | None = None,
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
 ) -> None:
@@ -238,6 +401,21 @@ def pa_decode(
     Each contributes once, independently of the window; -inf disables it and
     +inf suppresses the head's output.
 
+    MXFP4 K/V (gfx950): ``key_cache``/``value_cache`` are uint8 data views
+    [pages, kv_heads, 128, 64] and ``key_scale``/``value_scale`` uint8 e8m0 views
+    [pages, kv_heads, 128, 4] of the same pages (the four share page and head
+    byte strides, multiples of 16). ``query`` is float8_e4m3fn, used as stored, or
+    bf16, quantized to e4m3 per head row in the kernel; ``output`` is bf16.
+    Supported: head_dim 128, block size 128, ``query_length`` 1, at most 16 query
+    heads per KV head. Refused: other block sizes, head dims and output dtypes,
+    sliding windows and sinks (``mask_unowned_kv`` has no effect: tokens past the
+    context are always masked). Scale bytes 0 and 255 are not supported in valid
+    rows. ``work_plan=None`` is accepted for MXFP4 only: one task per sequence
+    writes its row directly (the output needs the query's row and head strides,
+    a context-0 row is zero-filled) and nothing is specialized on ``num_seqs``; a
+    plan with ``max_partitions == 1`` is served the same way. A task may span at
+    most 4096 pages: pass a smaller ``max_context_length`` otherwise.
+
     Refresh ``work_plan`` on the current stream after changing lengths. Its
     max_partitions is bounded by device CUs. Match sliding_window and, for
     windowed plans, query_length. Scratch is [KV heads, capacity, query rows
@@ -261,7 +439,8 @@ def pa_decode(
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
-    if not isinstance(work_plan, PADecodePlan):
+    mxfp4 = isinstance(key_cache, torch.Tensor) and key_cache.dtype == torch.uint8
+    if not isinstance(work_plan, PADecodePlan) and not (mxfp4 and work_plan is None):
         raise TypeError("work_plan must be a PADecodePlan")
     if context_partition_size != KV_COMPUTE_BLOCK:
         raise NotImplementedError(
@@ -310,6 +489,33 @@ def pa_decode(
             raise ValueError(
                 f"{name} must be {expected}, got shape {tuple(tensor.shape)}"
             )
+
+    if mxfp4:
+        if (
+            query_length != 1
+            or sliding_window
+            or sinks is not None
+            or compute_type not in (None, torch.uint8)
+        ):
+            raise NotImplementedError(
+                "MXFP4 KV supports query_length 1, no sliding window and no sinks"
+            )
+        return _pa_decode_mxfp4(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            key_scale,
+            value_scale,
+            context_lengths,
+            block_tables,
+            softmax_scale,
+            exp_sums,
+            max_logits,
+            temporary_output,
+            work_plan,
+            max_context_length,
+        )
 
     trans_k = key_cache.dim() == 5
     if not trans_k:

@@ -10,6 +10,9 @@ from flydsl.expr.typing import T
 
 from .traits import MFMA_ACC_ELEMS
 
+# e8m0 byte 127 (2**0) in all four scale bytes: the scaled MFMA applies no scaling.
+UNIT_E8M0_SCALES = 0x7F7F7F7F
+
 
 class PaDecodeGemm:
     def __init__(self, traits):
@@ -54,9 +57,9 @@ class PaDecodeGemm:
                         0,
                         0,
                         0,
-                        fx.Int32(0x7F7F7F7F),
+                        fx.Int32(UNIT_E8M0_SCALES),
                         0,
-                        fx.Int32(0x7F7F7F7F),
+                        fx.Int32(UNIT_E8M0_SCALES),
                     ],
                 )
         else:
@@ -89,6 +92,33 @@ class PaDecodeGemm:
                 m * self.traits.N_SUBCHUNKS,
                 self.traits.N_SUBCHUNKS,
                 acc,
+            )
+            frag_Ss.append(fx.Vector(acc))
+        return frag_Ss
+
+    def qk_mxfp4(self, k_raw, k_scales, q_op):
+        """QK of one MXFP4 K tile: per 16-token chunk one scaled MFMA, A = fp4 K
+        (lane: 16 B = one e8m0 group, its scale byte), B = fp8 Q (``q_op``)."""
+        frag_Ss = []
+        for a in range_constexpr(self.traits.NCHUNK):
+            a_k = fx.Vector.from_elements(
+                [fx.Int32(k_raw[a * 5 + 1 + i]) for i in range_constexpr(4)]
+                + [fx.Int32(0) for _ in range_constexpr(4)],
+                dtype=fx.Int32,
+            )
+            acc = fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                T.f32x4,
+                [
+                    a_k,
+                    q_op,
+                    fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32),
+                    4,
+                    0,
+                    0,
+                    k_scales[a],
+                    0,
+                    fx.Int32(UNIT_E8M0_SCALES),
+                ],
             )
             frag_Ss.append(fx.Vector(acc))
         return frag_Ss

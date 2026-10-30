@@ -19,7 +19,7 @@ from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK
+from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, WAVE
 
 
 class PaDecodePipeline:
@@ -31,7 +31,7 @@ class PaDecodePipeline:
         self.query = PaDecodeQueryLoader(ctx, self.lds, self.gemm)
         self.kv = PaDecodeKVLoader(ctx, self.lds)
         self.softmax = PaDecodeSoftmax(ctx, self.lds, self.kv, self.gemm)
-        self.epilogue = PaDecodeEpilogue(ctx)
+        self.epilogue = PaDecodeEpilogue(ctx, self.lds)
 
     @flyc.jit
     def run(self):
@@ -52,15 +52,21 @@ class PaDecodePipeline:
             self.kv.stage_page_ids()
             gpu.barrier()
         k_pf0 = self.kv.prefetch_first()
+        if const_expr(self.traits.MXFP4):
+            v_page_pf0 = self.kv.mx_prefetch("v")
         self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
         self.query.stage(q_units_prefetched)
         gpu.barrier()
-        v_page_pf0 = self.kv.read_v_pages()
+        if const_expr(not self.traits.MXFP4):
+            v_page_pf0 = self.kv.read_v_pages()
         q_ops_all = self.query.load_operands()
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
         o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all)
-        self.epilogue.store(o_final)
+        if const_expr(self.traits.MXFP4):
+            self.epilogue.store_mx(o_final)
+        else:
+            self.epilogue.store(o_final)
 
     @flyc.jit
     def mainloop(self, k_pf0, v_page_pf0, q_ops_all):
@@ -169,6 +175,10 @@ class PaDecodePipeline:
                     v_vh_shared,
                     q_scale_vec,
                     q_ops_all,
+                )
+            elif const_expr(self.traits.MXFP4):
+                next_state = self.single_query_tile_mx(
+                    ostate, k_cur, tt1, tile_valid, q_ops_all
                 )
             else:
                 next_state = self.single_query_tile(
@@ -631,6 +641,83 @@ class PaDecodePipeline:
         for m in range_constexpr(self.traits.M_TILES):
             next_state.extend([*o_acc[m], m_new[m], l_new[m]])
         return next_state
+
+    @flyc.jit
+    def single_query_tile_mx(
+        self,
+        ostate,
+        k_cur,
+        tt1,
+        tile_valid,
+        q_ops_all,
+    ):
+        """MXFP4 tile, one wave on its own 64 tokens and all 128 dims: QK, an online
+        softmax and PV with P kept in registers, so the tile loop has no barrier.
+        Raw K/V of the next tile are issued early and are in flight across this
+        tile's work; the four waves merge once, after the loop."""
+        t = self.traits
+        o_acc = [ostate[t.o_slot(0, vh)] for vh in range_constexpr(t.VHE_CHUNKS)]
+        m_prev = ostate[t.m_slot(0)]
+        l_prev = ostate[t.l_slot(0)]
+        v_raw = ostate[t.V_SLOT]
+        # Unconditional: a branch around the loads makes the compiler's vmcnt
+        # counts assume they were skipped and drain them right after issue. The
+        # last tile re-reads itself (tt1 clamped); nothing consumes the result.
+        base = self.kv.mx_base(self.kv.mx_pages(fx.min(tt1, self.ctx.part_end - 1)))
+        k_scales = [
+            self.kv.mx_scale_byte(k_cur[a * 5]) for a in range_constexpr(t.NCHUNK)
+        ]
+        frag_Ss = self.gemm.qk_mxfp4(k_cur, k_scales, q_ops_all[0])
+        k_next = self.kv.mx_load("k", base)
+        # Widen V while the softmax runs.
+        for a in range_constexpr(t.NCHUNK):
+            self.kv.mx_stage_v(v_raw, a, tile_valid)
+        scale = self.ctx.scale_qk * self.lds.load_scalar(t.sQscale_off, self.ctx.lane16)
+        scale_b = fx.full(4, scale, fx.Float32)
+        scores = [frag_Ss[a] * scale_b for a in range_constexpr(t.NCHUNK)]
+        if tile_valid < t.TILE_TOK:  # only a sequence's last tile has masked tokens
+            thr, _ = self.softmax.row_thresholds(tile_valid, None, 0)
+            neg4 = fx.full(4, float("-inf"), fx.Float32)
+            scores = [
+                self.softmax.score_mask(a, thr, None).select(scores[a], neg4)
+                for a in range_constexpr(t.NCHUNK)
+            ]
+        nnan = self.ctx.fm_nnan
+        m_tile = scores[0].reduce(ReductionOp.MAX, fastmath=nnan)
+        for a in range_constexpr(1, t.NCHUNK):
+            m_tile = fx.maxnumf(
+                m_tile, scores[a].reduce(ReductionOp.MAX, fastmath=nnan), fastmath=nnan
+            )
+        for sh in (16, 32):
+            m_tile = fx.maxnumf(m_tile, m_tile.shuffle_xor(sh, WAVE), fastmath=nnan)
+        m_new = fx.maxnumf(m_prev, m_tile, fastmath=nnan)
+        # Relative to 0 while nothing is valid yet: no -inf - -inf.
+        safe = fx.Float32((m_new > self.ctx.NEG_INF).select(m_new, self.ctx.ZERO_F))
+        safe_b = fx.full(4, safe, fx.Float32)
+        alpha = fx.Float32(fx.exp2(m_prev - safe, fastmath="fast"))
+        probs = [
+            fx.Vector(fx.exp2(scores[a] - safe_b, fastmath="fast"))
+            for a in range_constexpr(t.NCHUNK)
+        ]
+        l_new = l_prev * alpha
+        for a in range_constexpr(t.NCHUNK):
+            l_new = l_new + probs[a].reduce(ReductionOp.ADD)  # this lane's tokens
+        # S^T[token 4g+v][head] is the B operand layout of the PV MFMA: P stays here.
+        p_ops = [
+            probs[a].to(fx.BFloat16).bitcast(fx.Int64)[0]
+            for a in range_constexpr(t.NCHUNK)
+        ]
+        # V's loads follow K's by part of a tile so the two bursts do not queue together.
+        v_next = self.kv.mx_load("v", base)
+        alpha_b = fx.full(t.OP_ELEMS, alpha, fx.Float32)
+        o_acc = [o_acc[vh] * alpha_b for vh in range_constexpr(t.VHE_CHUNKS)]
+        for a in range_constexpr(t.NCHUNK):
+            v_ops = self.kv.mx_read_v(a)
+            for vh in range_constexpr(t.VHE_CHUNKS):
+                o_acc[vh] = fx.Vector(
+                    self.gemm.mfma([v_ops[vh]], [p_ops[a]], 0, 0, 1, o_acc[vh])
+                )
+        return [k_next, v_next, *o_acc, m_new, l_new]
 
 
 class Gfx1250Bf16Pipeline:
