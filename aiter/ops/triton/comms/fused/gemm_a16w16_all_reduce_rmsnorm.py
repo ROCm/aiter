@@ -61,7 +61,8 @@ def gemm_a16w16_all_reduce_rmsnorm(
     )
     rows, block_n, block_k = config["ROWS"], config["BLOCK_N"], config["BLOCK_K"]
     num_buffers, num_warps = config["NUM_BUFFERS"], config["num_warps"]
-    assert k % block_k == 0 and k // block_k >= num_buffers - 1
+    # The K pipeline needs at least NUM_BUFFERS K tiles.
+    assert k % block_k == 0 and k // block_k >= num_buffers
     # A triple of rows is one place in the inbox, so a state serves one hidden size.
     first = _HIDDEN.setdefault(calls.data_ptr(), hidden)
     assert first == hidden, f"these inboxes serve hidden {first}, not {hidden}"
