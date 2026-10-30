@@ -2128,11 +2128,17 @@ def q_for(q, qdt):
     """(the Q the kernel is given, the bf16 Q the oracle scores). For e4m3 that is
     the index-Q writer's rule: the value is already rounded to bf16, then RNE and
     saturating to e4m3 (torch's own cast would turn an overflow into NaN). e4m3 is a
-    subset of bf16, so the oracle's bf16 view of it is exact."""
+    subset of bf16, so the oracle's bf16 view of it is exact. Both keep q's strides."""
     if qdt == "bf16":
         return q, q
-    q8 = q.float().clamp(-448, 448).to(dtypes.fp8)
-    return q8, q8.to(torch.bfloat16)
+    # Same strides as `q` (the `qslice` case is a view into a wider tensor), so the
+    # e4m3 kernel's strided Q loads are exercised; `.to` would repack it.
+    clamped = q.float().clamp(-448, 448)
+    q8 = torch.empty_strided(q.shape, q.stride(), dtype=dtypes.fp8, device=q.device)
+    q8.copy_(clamped)
+    q_ref = torch.empty_strided(q.shape, q.stride(), dtype=q.dtype, device=q.device)
+    q_ref.copy_(q8)
+    return q8, q_ref
 
 
 def run_fp4(q, kd, ks, bt, seq, S, H, mb, **kw):
@@ -2152,21 +2158,37 @@ def check_mxfp4_matches_oracle(case, qdt):
 
 def check_mxfp4_every_geometry_matches_oracle(point, qdt):
     """Every launch geometry the selector can reach (work-chunk depth, token
-    split, spread) against the oracle. Negative scores expose accidental
+    split, spread, CP shard) against the oracle. Negative scores expose accidental
     zero-initialised maxima, as in the fp8 test."""
-    S, H, batch, max_block, _, _ = point
-    lens = ([0, 1, 130] + [P] * batch)[: batch - 1] + [max_block * P]
-    lens = [min(x, max_block * P) for x in lens]
+    S, H, batch, max_block, world, rank = point
+    # As in the fp8 test: `max_block` is this rank's LOCAL width, the table and
+    # lengths are global, and the score is the compacted shard.
+    glob = max_block * world
+    lens = ([0, 1, 130] + [P] * batch)[: batch - 1] + [glob * P]
+    lens = [min(x, glob * P) for x in lens]
     q, cache8, bt, seq, mb = make_case(batch, S, H, lens)
-    assert mb == max_block
+    assert mb == glob
     q.copy_(q.abs() + 0.25)
     q, q_ref = q_for(q, qdt)
     kd, ks, deq = fp4_cache_of(cache8, lambda b: -(b.abs() + 0.25))
     del cache8
-    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, mb)
-    out = kernel.alloc_score(batch, S, H, mb, q.device)
+    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, max_block, world, rank)
+    out = kernel.alloc_score(batch, S, H, max_block, q.device)
     out.fill_(float("nan"))
-    got = run_fp4(q, kd, ks, bt, seq, S, H, mb, out=out)
+    got = score_flydsl(
+        q,
+        kd,
+        bt,
+        seq,
+        S,
+        H,
+        D**-0.5,
+        max_block,
+        out=out,
+        cp_world=world,
+        cp_rank=rank,
+        k_scale=ks,
+    )
     assert got.data_ptr() == out.data_ptr()
     check_scores(got, ref)
     assert bool((got[torch.isfinite(ref)] < 0).all())
@@ -2385,14 +2407,15 @@ def bench_score_mxfp4(case, B, S, H, lens, kwargs):
     pages = sum((L + P - 1) // P for L in lens)
     flops = 2 * pages * P * D * S * H
     cache8 = deq.to(dtypes.fp8)  # prepared here so only the scorers are timed
+    out = kernel.alloc_score(B, S, H, mb, q.device)  # outside the timed region
     cands = {
         "fp4": (
-            lambda: run_fp4(q, kd, ks, bt, seq, S, H, mb, work_map=wm),
+            lambda: run_fp4(q, kd, ks, bt, seq, S, H, mb, out=out, work_map=wm),
             pages * P * 68,
         ),
         "fp8": (
             lambda: kernel.score_flydsl(
-                q, cache8, bt, seq, S, H, D**-0.5, mb, work_map=wm
+                q, cache8, bt, seq, S, H, D**-0.5, mb, out=out, work_map=wm
             ),
             pages * P * D,
         ),
@@ -2418,7 +2441,7 @@ def build_mxfp4_checks():
     for case, qdt in itertools.product(build_matrix(), QDTS):
         name = f"matches_oracle_{case[0].replace('fp8', 'mxfp4')}_{qdt}"
         checks.append((name, check_mxfp4_matches_oracle, (case, qdt)))
-    for point, qdt in itertools.product([p for p in GEOM_POINTS if p[4] == 1], QDTS):
+    for point, qdt in itertools.product(GEOM_POINTS, QDTS):
         name = f"every_geometry_{geom_id(point)}_{qdt}"
         checks.append((name, check_mxfp4_every_geometry_matches_oracle, (point, qdt)))
     for (S, H), layout, in_graph in itertools.product(

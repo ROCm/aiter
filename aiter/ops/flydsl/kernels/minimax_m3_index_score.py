@@ -39,8 +39,11 @@ bf16 Q, each data dword is widened by `v_cvt_scalef32_pk_bf16_fp4` and fed to
 the same bf16 MFMA, so K is still lifted to Q's precision. With an e4m3 Q, one
 `v_mfma_scale_f32_16x16x128_f8f6f4` per tile takes fp4 K with its e8m0 byte and
 Q as stored; the products are exact in fp32. e8m0 bytes 0 and 255 are
-unsupported (the hardware reads the scale as a float whose exponent field is the
-byte, so 0 scales by 0.0 and 255 is NaN); a conforming writer never emits them.
+unsupported and a conforming writer never emits them. The two Q paths do not
+read the byte the same way: the bf16-Q path builds an f32 whose exponent field is
+the byte, so 0 is 0.0 and 255 is +inf; the e4m3-Q MFMA takes the raw e8m0 byte, so
+0 is 2^-127 and 255 is NaN. Measured on gfx950, a 255 scale makes the score NaN on
+both paths; do not rely on any other behaviour for these two bytes.
 """
 
 import math
@@ -215,7 +218,8 @@ def e8m0_to_f32(packed, byte_pos):
     The scale operand of `v_cvt_scalef32_*` is a float, and a float whose
     exponent field is the e8m0 byte and whose mantissa is zero is exactly that
     power of two. 0 and 255 are the two bytes this does not mean what e8m0 means
-    for; see the module docstring.
+    for: 0 gives 0.0 (e8m0: 2^-127) and 255 gives +inf (e8m0: NaN); see the
+    module docstring.
     """
     b = packed.shrui(byte_pos * fx.Int32(8)) & fx.Int32(0xFF)
     return (b << fx.Int32(23)).bitcast(fx.Float32)
