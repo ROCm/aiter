@@ -252,6 +252,16 @@ def _check_out(out, q, v_hdim, out_dtype=None):
     ), f"out shape {tuple(out.shape)} != expected {want} (v_hdim={v_hdim})"
 
 
+def _descale_ok(d, q):
+    """A per-tensor fp32 descale, as gfx950 defines it."""
+    return (
+        torch.is_tensor(d)
+        and d.dtype == torch.float32
+        and d.numel() == 1
+        and d.device == q.device
+    )
+
+
 def _bshd_batch_stride_ok(t, seq_len):
     """The BSHD kernels take no batch stride: they address batch b at
     ``b * seq_len * stride_seq``. A view whose own batch stride differs from that
@@ -412,7 +422,12 @@ def flydsl_flash_attn_varlen_fwd(
         # 8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything
         # else to a16w16, whose output follows the input.
         _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
-        if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
+        # a8w8 applies per-tensor fp32 descales (gfx950's contract); a16w16 has none,
+        # and a partial set is ambiguous, so both fall through.
+        _descales = (q_descale, k_descale, v_descale)
+        if any(d is not None for d in _descales) and not (
+            _is_b8 and all(_descale_ok(d, q) for d in _descales)
+        ):
             return None
         if any(t.stride(-1) != 1 for t in (q, k, v)):
             return None
@@ -467,6 +482,15 @@ def flydsl_flash_attn_varlen_fwd(
             out=out,
             return_lse=return_lse,
             sink=sink,
+            **(
+                {
+                    "q_descale": q_descale,
+                    "k_descale": k_descale,
+                    "v_descale": v_descale,
+                }
+                if _is_b8
+                else {}
+            ),
         )
 
     return None
@@ -542,7 +566,12 @@ def flydsl_flash_attn_batch_fwd(
     # flash_attn_func defaults it True -- gating on it would reject every request.
     elif gfxip == "gfx1250" and q.dim() == 4:
         _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
-        if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
+        # a8w8 applies per-tensor fp32 descales (gfx950's contract); a16w16 has none,
+        # and a partial set is ambiguous, so both fall through.
+        _descales = (q_descale, k_descale, v_descale)
+        if any(d is not None for d in _descales) and not (
+            _is_b8 and all(_descale_ok(d, q) for d in _descales)
+        ):
             return None
         if any(t.stride(-1) != 1 for t in (q, k, v)):
             return None
@@ -599,6 +628,15 @@ def flydsl_flash_attn_batch_fwd(
             out=out,
             return_lse=return_lse,
             sink=sink,
+            **(
+                {
+                    "q_descale": q_descale,
+                    "k_descale": k_descale,
+                    "v_descale": v_descale,
+                }
+                if _is_b8
+                else {}
+            ),
         )
 
     return None
