@@ -172,6 +172,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
         ("last", 128, 3),
         ("cluster", 128, 1),
         ("cluster", 384, 1),
+        ("reducer", 128, 1),
     ],
 )
 def test_pa_decode_merge_alignment(
@@ -180,14 +181,14 @@ def test_pa_decode_merge_alignment(
     """Offset scratch and odd query/output strides retain element alignment.
 
     Last-arriver atomics require eight-byte scratch alignment; unaligned
-    scratch falls back to the reducer when clusters are disabled. Cluster
-    loads and final stores support the otherwise valid offset views directly.
+    scratch falls back to the cluster merge. Cluster loads and final stores
+    support the otherwise valid offset views directly, as does the reducer,
+    which a -inf sink selects without adding attention mass.
     """
     if get_gfx_runtime() != "gfx1250":
         pytest.skip("gfx1250 tile-kernel partition merges")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    monkeypatch.setattr(pa, "_CLUSTER_MERGE", mode == "cluster")
-    lengths = (1024, 0, 0, 0) if mode == "last" else (1024,)
+    lengths = (1024,) if mode == "cluster" else (1024, 0, 0, 0)
     page, group = 16, 16
     query, key, value, table, context = _make_inputs(
         1, 1, group, dim, page, dtype, "random", device, lengths
@@ -216,7 +217,12 @@ def test_pa_decode_merge_alignment(
         .contiguous()
     )
     plan = pa.plan_pa_decode(
-        context, 1, max_partitions=4, workgroup_budget=1 if mode == "last" else None
+        context, 1, max_partitions=4, workgroup_budget=None if mode == "cluster" else 1
+    )
+    sinks = (
+        torch.full((group,), float("-inf"), dtype=dtype, device=device)
+        if mode == "reducer"
+        else None
     )
     scalar_shape = (1, plan.capacity, group)
     partial_shape = (*scalar_shape, dim)
@@ -244,7 +250,7 @@ def test_pa_decode_merge_alignment(
         context,
         1,
         0,
-        None,
+        sinks,
     )
     for _ in range(3):
         output.fill_(float("nan"))
@@ -259,15 +265,17 @@ def test_pa_decode_merge_alignment(
             table,
             dim**-0.5,
             1,
+            sinks=sinks,
             work_plan=plan,
             **workspace,
         )
         _check_output(output, reference)
         assert torch.count_nonzero(plan.arrival_counters) == 0
-    assert compile_kwargs[-1]["direct_output"] == (
-        mode == "last" and scratch_offset == 0
+    last_arriver = mode == "last" and scratch_offset == 0
+    assert compile_kwargs[-1]["direct_output"] == last_arriver
+    assert compile_kwargs[-1]["cluster_merge"] == (
+        0 if last_arriver or mode == "reducer" else 4
     )
-    assert compile_kwargs[-1]["cluster_merge"] == (4 if mode == "cluster" else 0)
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx950"])
