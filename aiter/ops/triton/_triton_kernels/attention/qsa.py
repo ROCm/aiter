@@ -246,9 +246,9 @@ def _qsa_paged_mqa_logits_kernel(
     KEY_FMT: tl.constexpr = 0,
     GROUP: tl.constexpr = 32,
 ) -> None:
-    """Score compressed QSA keys from a paged cache: BF16 (KEY_FMT 0), FP8 with
-    a per-row scale (1) or MXFP4 (2). For MXFP4 the even and odd Q dims multiply
-    the low and high nibbles of each key byte."""
+    """Score compressed QSA keys from a paged cache: unquantized (KEY_FMT 0),
+    FP8 with a per-row scale (1) or MXFP4 (2). For MXFP4 the even and odd Q dims
+    multiply the low and high nibbles of each key byte."""
     token = tl.program_id(0)
     if KEY_FMT == 2:
         HALF: tl.constexpr = HEAD_DIM // 2
@@ -466,6 +466,7 @@ def _qsa_paged_mqa_logits_mfma_kernel(
     columns = col0 + tl.arange(0, BN)
     logical_page = columns // PAGE_SIZE
     page_offset = columns % PAGE_SIZE
+    # The width is rounded up; columns < num_columns keeps table reads in bounds.
     page_ok = (logical_page < PAGE_TABLE_WIDTH) & (columns < num_columns)
     safe_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
     active = visible > 0
@@ -591,7 +592,7 @@ def _qsa_paged_mqa_logits_stacked_kernel(
 
     BMT rows times NUM_HEADS heads make one M operand, so one dot reads each
     key tile for all heads of all rows. The ReLU is applied to each head
-    before the heads are added. Keys are BF16, FP8 or MXFP4.
+    before the heads are added. Keys are unquantized, FP8 or MXFP4.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -641,6 +642,7 @@ def _qsa_paged_mqa_logits_stacked_kernel(
         columns = tile * BN + tl.arange(0, BN)
         logical_page = columns // PAGE_SIZE
         page_offset = columns % PAGE_SIZE
+        # The width is rounded up; columns < num_columns keeps table reads in bounds.
         page_ok = (logical_page < PAGE_TABLE_WIDTH) & (columns < num_columns)
         safe_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
         score = tl.zeros((BMT, BN), dtype=tl.float32)
@@ -809,7 +811,8 @@ def _qsa_sparse_paged_gqa_kernel(
     SUB_GROUP: tl.constexpr = 0,
     KV_FP8: tl.constexpr = False,
 ) -> None:
-    """Apply GQA over arbitrary logical tokens in separate paged BF16 or FP8 K/V.
+    """Apply GQA over arbitrary logical tokens in separate paged K/V, unquantized
+    or FP8.
 
     FP8 K/V have one FP32 scale per (token, KV head). The key scale multiplies
     the scores. The value scale multiplies the probabilities before PV.

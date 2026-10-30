@@ -243,7 +243,8 @@ def test_qsa_fp8_writer_never_saturates():
 
     torch.manual_seed(0)
     rows = 2048
-    magnitude = torch.logspace(-4, 4, rows, device="cuda")[:, None, None]
+    magnitude = torch.logspace(-4, 4, rows, dtype=torch.float32, device="cuda")
+    magnitude = magnitude[:, None, None]
     key = (
         torch.randn(rows, 2, 256, dtype=torch.float32, device="cuda") * magnitude
     ).bfloat16()
@@ -411,6 +412,61 @@ def test_qsa_writer_rejects_bad_slots_and_planes():
         assert not first_scale.any() and not other_scale.any()
 
 
+def test_qsa_writer_rejects_wrong_scale_dtypes_and_pool_slices():
+    from aiter.ops.qsa import qsa_cache_row_layout, qsa_store_quantized_rows
+
+    values = torch.randn(4, 2, 256, dtype=torch.float32, device="cuda").bfloat16()
+    slots = torch.arange(4, device="cuda")
+    for fmt, wrong_dtype in (("fp8", torch.float64), ("fp4", torch.int8)):
+        vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, 256)
+        cache = torch.zeros(2, 4, 2, vdim, device="cuda", dtype=vdtype)
+        scale = torch.zeros(2, 4, 2, *tail, device="cuda", dtype=sdtype)
+        with pytest.raises(ValueError, match="plane of the cache"):
+            qsa_store_quantized_rows(cache, scale.to(wrong_dtype), slots, values)
+        # The first 4 of 8 slots of each page of a larger pool.
+        pool = torch.zeros(2, 8, 2, vdim, device="cuda", dtype=vdtype)
+        pool_scale = torch.zeros(2, 8, 2, *tail, device="cuda", dtype=sdtype)
+        for sliced_cache, sliced_scale in (
+            (pool[:, :4], scale),
+            (cache, pool_scale[:, :4]),
+        ):
+            with pytest.raises(ValueError, match="back to back"):
+                qsa_store_quantized_rows(sliced_cache, sliced_scale, slots, values)
+        assert not scale.any() and not pool_scale.any()
+        qsa_store_quantized_rows(cache, scale, slots, values)
+        assert scale[0].all()
+
+    unquantized = torch.zeros(2, 4, 2, 256, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="FP8 or FP4"):
+        qsa_store_quantized_rows(unquantized, None, slots, values)
+
+
+def test_qsa_fp4_rows_need_a_power_of_two_head_dim():
+    from aiter.ops.qsa import (
+        qsa_cache_row_layout,
+        qsa_paged_mqa_logits,
+        qsa_store_quantized_rows,
+    )
+
+    with pytest.raises(ValueError, match="power-of-two"):
+        qsa_cache_row_layout("fp4", 96)
+    assert qsa_cache_row_layout("fp8", 96)[0] == 96
+    values = torch.randn(4, 1, 96, dtype=torch.float32, device="cuda").bfloat16()
+    cache = torch.zeros(1, 4, 1, 48, dtype=torch.uint8, device="cuda")
+    scale = torch.zeros(1, 4, 1, 3, dtype=torch.uint8, device="cuda")
+    slots = torch.arange(4, device="cuda")
+    with pytest.raises(ValueError, match="power-of-two"):
+        qsa_store_quantized_rows(cache, scale, slots, values)
+    table = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
+    t2r = torch.zeros(4, dtype=torch.int32, device="cuda")
+    positions = torch.arange(12, 16, dtype=torch.int64, device="cuda")
+    lens = torch.tensor([16], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="power-of-two"):
+        qsa_paged_mqa_logits(
+            values, cache, table, t2r, positions, lens, 4, compressed_k_scale=scale
+        )
+
+
 def test_qsa_scorers_reject_scale_planes_that_do_not_match_the_cache():
     from aiter.ops.qsa import FP8_DTYPE, qsa_paged_mqa_logits, qsa_sparse_paged_gqa
 
@@ -445,10 +501,18 @@ def test_qsa_scorers_reject_scale_planes_that_do_not_match_the_cache():
         qsa_sparse_paged_gqa(
             q, k_cache, v_cache, *args, k_scale=scale, v_scale=scale[:2]
         )
+    as_int = scale.view(torch.int32)
+    for k_scale, v_scale in ((as_int, as_int), (scale, scale.half())):
+        with pytest.raises(ValueError, match="float32"):
+            qsa_sparse_paged_gqa(
+                q, k_cache, v_cache, *args, k_scale=k_scale, v_scale=v_scale
+            )
     bf16 = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
     qsa_sparse_paged_gqa(q, bf16, bf16, *args)
     with pytest.raises(ValueError):
         qsa_sparse_paged_gqa(q, bf16, bf16, *args, v_scale=scale)
+    with pytest.raises(ValueError, match="no scale plane"):
+        qsa_sparse_paged_gqa(q, bf16, bf16, *args, k_scale=scale, v_scale=scale)
 
 
 def _index_case(requests, context, rows_per_request, page_rows, seed=2):
@@ -769,6 +833,51 @@ def test_qsa_stacked_scorer_respects_max_columns():
     torch.testing.assert_close(
         _seen(logits, visible), _seen(ref[:, :1000], visible), rtol=1e-4, atol=1e-4
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_qsa_takes_unquantized_fp16_and_fp32_caches(dtype):
+    from aiter.ops.qsa import qsa_paged_mqa_logits, qsa_sparse_paged_gqa
+
+    # FP32 dots may run as xf32 (gfx942).
+    tol = 1e-4 if dtype == torch.float16 else 1e-2
+    for rows_per_request, stacked in ((4, True), (4, False), (300, False)):
+        q, keys, *rest = _stacked_case(rows_per_request, 16, [4103, 1990])
+        q, keys = q.to(dtype), keys.to(dtype)
+        ref, ref_visible = _stacked_reference(q, keys, *rest)
+        (logits, visible), kernels = _launched_kernels(
+            qsa_paged_mqa_logits,
+            q,
+            keys,
+            *rest,
+            compress_ratio=_STACKED_RATIO,
+            stacked_decode=stacked,
+        )
+        assert any("_stacked" in name for name in kernels) == stacked
+        assert torch.equal(visible, ref_visible)
+        torch.testing.assert_close(
+            _seen(logits, visible), _seen(ref, visible), rtol=tol, atol=tol
+        )
+
+    g = torch.Generator(device="cuda").manual_seed(4)
+    k, v = (
+        torch.randn(8, 16, 2, 128, generator=g, dtype=torch.float32, device="cuda")
+        for _ in "kv"
+    )
+    q = torch.randn(4, 8, 128, generator=g, dtype=torch.float32, device="cuda")
+    q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+    selected = torch.randint(
+        0, 128, (4, 64), generator=g, dtype=torch.int32, device="cuda"
+    )
+    table = torch.arange(8, dtype=torch.int32, device="cuda")[None]
+    t2r = torch.zeros(4, dtype=torch.int32, device="cuda")
+    out = qsa_sparse_paged_gqa(q, k, v, selected, table, t2r, num_decode_requests=1)
+    keys = k.view(-1, 2, 128)[selected.long()].float()
+    values = v.view(-1, 2, 128)[selected.long()].float()
+    scores = torch.einsum("thgd,tnhd->thgn", q.float().view(4, 2, 4, 128), keys)
+    probs = (scores / 128**0.5).softmax(-1)
+    ref = torch.einsum("thgn,tnhd->thgd", probs, values).reshape(q.shape)
+    torch.testing.assert_close(out.float(), ref, rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4"])

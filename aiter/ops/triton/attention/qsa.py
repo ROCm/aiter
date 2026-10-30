@@ -45,22 +45,43 @@ def qsa_cache_row_layout(fmt: str, head_dim: int):
             raise ValueError("FP8 QSA rows need a GPU with an FP8 dtype")
         return head_dim, FP8_DTYPE, (), torch.float32
     if fmt == "fp4":
-        if head_dim % FP4_GROUP:
-            raise ValueError(f"FP4 rows need head_dim divisible by {FP4_GROUP}")
+        # The FP4 kernels index the packed bytes with tl.arange(0, head_dim / 2).
+        if head_dim < FP4_GROUP or head_dim & (head_dim - 1):
+            raise ValueError(f"FP4 rows need a power-of-two head_dim >= {FP4_GROUP}")
         return head_dim // 2, torch.uint8, (head_dim // FP4_GROUP,), torch.uint8
     raise ValueError(f"unsupported QSA cache format {fmt!r}")
 
 
 def _cache_format(cache: torch.Tensor, scale: torch.Tensor | None) -> int:
-    if cache.dtype == torch.bfloat16 and scale is None:
+    """KEY_FMT of a cache. `_FMT_BF16` covers every unquantized float cache
+    (BF16, FP16, FP32), which the kernels read in Q's dtype."""
+    if FP8_MAX is not None and cache.dtype == FP8_DTYPE:
+        fmt = _FMT_FP8
+    elif cache.dtype == torch.uint8:
+        fmt = _FMT_FP4
+    elif cache.dtype.is_floating_point and cache.dtype.itemsize > 1:
+        if scale is not None:
+            raise ValueError("an unquantized QSA cache takes no scale plane")
         return _FMT_BF16
+    else:
+        raise ValueError(f"unsupported QSA cache dtype {cache.dtype}")
     if scale is None:
         raise ValueError("a quantized QSA cache needs its scale plane")
-    if FP8_MAX is not None and cache.dtype == FP8_DTYPE:
-        return _FMT_FP8
-    if cache.dtype == torch.uint8:
-        return _FMT_FP4
-    raise ValueError(f"unsupported QSA cache dtype {cache.dtype}")
+    return fmt
+
+
+def _merge_slots(plane: torch.Tensor, name: str) -> torch.Tensor:
+    """`[pages, page_size, ...]` viewed as `[pages * page_size, ...]`."""
+    (pages, page_size, *rest), (page_stride, slot_stride, *_) = (
+        plane.shape,
+        plane.stride(),
+    )
+    if pages > 1 and page_size > 1 and page_stride != page_size * slot_stride:
+        raise ValueError(
+            f"{name} must hold its pages back to back (stride(0) == page_size * "
+            "stride(1)); a slice of a larger page pool does not"
+        )
+    return plane.view(pages * page_size, *rest)
 
 
 def qsa_store_quantized_rows(
@@ -81,6 +102,8 @@ def qsa_store_quantized_rows(
     shares the slots and both planes' strides, written in the same launch.
     """
     fmt = _cache_format(cache, scale)
+    if fmt == _FMT_BF16:
+        raise ValueError("qsa_store_quantized_rows writes FP8 or FP4 caches")
     given = [t is not None for t in (second_cache, second_scale, second_values)]
     if any(given) and not all(given):
         raise ValueError("pass second_cache, second_scale and second_values together")
@@ -93,13 +116,20 @@ def qsa_store_quantized_rows(
         return
     if slots.shape[0] < rows or heads != cache.shape[2]:
         raise ValueError("slots or heads disagree with the cache")
-    _, _, tail, _ = qsa_cache_row_layout(QSA_CACHE_FORMATS[fmt], head_dim)
-    if scale.shape != (*cache.shape[:3], *tail):
-        raise ValueError("scale must be [pages, page, heads(, groups)] of the cache")
-    if values.stride(-1) != 1 or cache.stride(-1) != 1:
+    _, _, tail, scale_dtype = qsa_cache_row_layout(QSA_CACHE_FORMATS[fmt], head_dim)
+    if scale.shape != (*cache.shape[:3], *tail) or scale.dtype != scale_dtype:
+        raise ValueError(
+            f"scale must be the {scale_dtype} [pages, page, heads(, groups)] "
+            "plane of the cache"
+        )
+    if (
+        values.stride(-1) != 1
+        or cache.stride(-1) != 1
+        or (tail and scale.stride(-1) != 1)
+    ):
         raise ValueError("quantized QSA rows must be contiguous in the head dim")
-    flat = cache.view(cache.shape[0] * cache.shape[1], heads, cache.shape[3])
-    flat_scale = scale.view(scale.shape[0] * scale.shape[1], *scale.shape[2:])
+    flat = _merge_slots(cache, "cache")
+    flat_scale = _merge_slots(scale, "scale")
     if fmt == _FMT_FP8:
         if cache.shape[3] != head_dim:
             raise ValueError("values and FP8 cache disagree on head_dim")
@@ -141,10 +171,8 @@ def qsa_store_quantized_rows(
         return
     if second:
         raise ValueError("only the FP8 writer takes a second tensor")
-    if cache.shape[3] * 2 != head_dim or head_dim % FP4_GROUP:
+    if cache.shape[3] * 2 != head_dim:
         raise ValueError("values and FP4 cache disagree on head_dim")
-    if head_dim & (head_dim - 1):
-        raise ValueError("FP4 rows need a power-of-two head_dim")
     _qsa_store_rows_fp4_kernel[(rows, heads)](
         flat,
         flat_scale,
@@ -222,15 +250,7 @@ _SCORING_COLUMN_PROGRAMS = 64
 
 @functools.lru_cache(maxsize=1024)
 def _tuned_tile(kernel: str, case: str) -> dict:
-    """One tile of the running arch (`configs/<arch>/triton/attention/qsa`).
-
-    `stacked_decode[<key format>]` is the stacked decode scorer's tile,
-    measured on gfx950 at 36 rows over 9 requests (MTP 3 verify).
-    `gqa_fp8[decode]` and `gqa_fp8[prefill]` replace `_kernel_config` for FP8
-    K/V, measured on gfx950 at 36 decode rows over 9 requests and at one
-    16384-row prefill with 98304 context. gfx942 has the same values, which
-    it used before they moved to JSON; they are not tuned for it.
-    """
+    """`kernel[case]` of `configs/<arch>/triton/attention/qsa/DEFAULT.json`."""
     cfg_dir = resolve_config_dir("attention", "QSA", backend="triton")
     return load_config_json(f"{cfg_dir}/DEFAULT.json")[kernel][case]
 
@@ -264,9 +284,10 @@ def qsa_paged_mqa_logits(
     `[pages, page_size, 1, head_dim]`. Returns FP32 logits `[tokens, columns]`
     and the per-row count of causally visible groups.
 
-    A quantized cache comes with `compressed_k_scale`: FP8 (`head_dim` E4M3,
-    scale `[pages, page_size, 1]` FP32) or MXFP4 (`head_dim / 2` bytes, scale
-    `[pages, page_size, 1, head_dim / 32]` E8M0). Q stays in its own dtype.
+    An unquantized cache (BF16, FP16, FP32) has Q's dtype. A quantized cache
+    comes with `compressed_k_scale`: FP8 (`head_dim` E4M3, scale `[pages,
+    page_size, 1]` FP32) or MXFP4 (`head_dim / 2` bytes, scale `[pages,
+    page_size, 1, head_dim / 32]` E8M0). Q stays in its own dtype.
 
     `stacked_decode` scores decode-sized calls (<= 256 rows) with an MFMA
     kernel that stacks each row's heads into M, so a request's keys are read
@@ -420,7 +441,7 @@ def qsa_paged_mqa_logits(
             num_warps=4,
         )
         return logits, visible_groups
-    # Decode-sized calls without stacking use the CUDA-core kernel.
+    # Fallback calls use the CUDA-core kernel.
     column_programs = min(
         triton.cdiv(columns, _SCORING_BLOCK_N), _SCORING_COLUMN_PROGRAMS
     )
@@ -555,8 +576,12 @@ def qsa_sparse_paged_gqa(
             or k_scale.shape != k_cache.shape[:3]
             or v_scale.shape != k_scale.shape
             or v_scale.stride() != k_scale.stride()
+            or k_scale.dtype != torch.float32
+            or v_scale.dtype != torch.float32
         ):
-            raise ValueError("FP8 K/V need matching [pages, page, heads] scales")
+            raise ValueError(
+                "FP8 K/V need matching float32 [pages, page, heads] scales"
+            )
     elif v_scale is not None:
         raise ValueError("v_scale needs an FP8 cache and k_scale")
     elif q.dtype != k_cache.dtype or q.dtype != v_cache.dtype:
