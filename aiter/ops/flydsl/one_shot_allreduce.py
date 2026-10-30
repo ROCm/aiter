@@ -22,7 +22,9 @@ from .allreduce_host_shared import (
     _resolve_inbox_flags,
     _StEngine,
     _validate_ipc_process_group,
+    check_build_outside_capture,
     check_fused_aliasing,
+    check_launch_outside_capture,
     check_payload,
     check_world_size,
     kernel_symbol,
@@ -546,11 +548,15 @@ class OneShotAllReduceRMSNorm:
 
     def _build_hidden(self, hidden: int) -> None:
         """Build every rung for hidden dim. Collective: all ranks must call it in
-        the same order,."""
+        the same order. Raises under HIP graph capture when any rung is
+        missing."""
         for rung in self._ladder(hidden):
             key = self._cfg_key(hidden, rung)
             if key in self._by_cfg:
                 continue
+            check_build_outside_capture(
+                owner="OneShotAllReduceRMSNorm", hidden=int(hidden)
+            )
             spec = make_one_shot_allreduce_kernel(
                 world_size=self.world_size,
                 atoms=key[1],
@@ -742,6 +748,7 @@ class OneShotAllReduceRMSNorm:
         args = self._launch_args(
             eng, spec, ptrs, eps, stream, hidden=hidden, live_bytes=live_bytes
         )
+        check_launch_outside_capture(eng.launch, owner="OneShotAllReduceRMSNorm")
         self._has_launched = True
         with torch.cuda.device(self._device_index):
             _run_compiled(eng.launch, *args)

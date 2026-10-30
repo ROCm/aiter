@@ -39,7 +39,9 @@ from .allreduce_host_shared import (
     _resolve_inbox_flags,
     _StEngine,
     _validate_ipc_process_group,
+    check_build_outside_capture,
     check_fused_aliasing,
+    check_launch_outside_capture,
     check_payload,
     check_world_size,
     kernel_symbol,
@@ -1023,7 +1025,8 @@ class FlyQuickAllReduceRMSNorm:
 
         A collective: each rung does its own IPC handle exchange and a grid
         MIN-reduce, so every rank must reach this with the same hidden and walk
-        the rungs in the same order.
+        the rungs in the same order. Raises under HIP graph capture when any
+        rung is missing.
         """
         hidden = int(hidden)
         if not self.supports_hidden(hidden):
@@ -1037,6 +1040,7 @@ class FlyQuickAllReduceRMSNorm:
             key = (hidden, st, bool(mxfp4), low_latency)
             if key in self._by_cfg:
                 continue
+            check_build_outside_capture(owner="FlyQuickAllReduceRMSNorm", hidden=hidden)
             spec = self._algo.build(
                 world_size=self.world_size,
                 rank=self.rank,
@@ -1212,8 +1216,10 @@ class FlyQuickAllReduceRMSNorm:
         """Run *args*, compiling under ``_compile_hints`` on the first call.
 
         The hint only has an effect on the compile, so the steady-state path
-        skips the context entirely.
+        skips the context entirely. Under HIP graph capture the binary must
+        already be loaded (``preload``).
         """
+        check_launch_outside_capture(eng.launch, owner="FlyQuickAllReduceRMSNorm")
         self._has_launched = True
         with torch.cuda.device(self._device_index):
             if getattr(eng.launch, "_cf", None) is not None:

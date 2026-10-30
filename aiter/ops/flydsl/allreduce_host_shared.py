@@ -400,6 +400,31 @@ def launcher_loaded(launch) -> bool:
     return bool(artifacts) and all(a._engine is not None for a in artifacts)
 
 
+def check_build_outside_capture(*, owner: str, hidden: int) -> None:
+    """Raise if building the engines of hidden would run inside an open HIP
+    graph capture.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{owner}: hidden={hidden} is not built, and building it exchanges "
+            "IPC handles with every rank, which cannot run under HIP graph "
+            f"capture; pass hiddens=({hidden},) to the constructor or call "
+            f"preload({hidden}) on every rank before the capture"
+        )
+
+
+def check_launch_outside_capture(launch, *, owner: str) -> None:
+    """Raise if launching *launch* would JIT-compile it or load its module
+    inside an open HIP graph capture.
+    """
+    if not launcher_loaded(launch) and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{owner}: {kernel_symbol(launch)} is not compiled and loaded, and "
+            "neither can run under HIP graph capture; call preload(hidden) on "
+            "every rank before the capture"
+        )
+
+
 def payload_probes(floors, lo: int, hi: int) -> tuple[int, ...]:
     """Sample payload sizes that select all the configs a ladder can use for a
     payload of ``lo..hi`` bytes (inclusive).
