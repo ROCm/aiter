@@ -36,6 +36,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
     flash_attn_a8w8_m32x8_supported,
 )
+from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_paged_fwd
 from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_a16w16_m32x8_supported,
     supports_gqa_ratio,
@@ -311,6 +312,86 @@ def _call_batch(q, k, v, scale, causal, window, lse, sink):
 # ============================================================================
 # Test functions -- one @benchmark per arg signature, one table each
 # ============================================================================
+
+
+def _build_paged(seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, device):
+    """A paged pool with a PERMUTED page table, plus the dense K/V it spells out.
+
+    The permutation is the point: a kernel that assumes pages are sequential fails
+    here. Unreferenced pages are left in the pool so a gather that strays outside the
+    page list shows up too."""
+    pages = [(sk + page_size - 1) // page_size for sk in seqs_k]
+    num_blocks = sum(pages) + 8
+    k_pool = torch.randn((num_blocks, page_size, H_kv, d_qk), dtype=dtype, device=device)
+    v_pool = torch.randn((num_blocks, page_size, H_kv, d_v), dtype=dtype, device=device)
+    page_ids = torch.randperm(num_blocks, device=device).int()[: sum(pages)].contiguous()
+    kv_indptr = torch.tensor(
+        [0] + list(itertools.accumulate(pages)), dtype=dtypes.i32, device=device
+    )
+    last_lens = torch.tensor(
+        [sk - (p - 1) * page_size for sk, p in zip(seqs_k, pages)],
+        dtype=dtypes.i32, device=device,
+    )
+    k_flat = k_pool.view(-1, H_kv, d_qk)
+    v_flat = v_pool.view(-1, H_kv, d_v)
+    k_dense, v_dense = [], []
+    for b, sk in enumerate(seqs_k):
+        ids = page_ids[kv_indptr[b] : kv_indptr[b + 1]].tolist()
+        rows = [slice(i * page_size, (i + 1) * page_size) for i in ids]
+        k_dense.append(torch.cat([k_flat[r] for r in rows], 0)[:sk])
+        v_dense.append(torch.cat([v_flat[r] for r in rows], 0)[:sk])
+    return (
+        k_pool, v_pool, page_ids, kv_indptr, last_lens,
+        torch.cat(k_dense, 0), torch.cat(v_dense, 0),
+    )
+
+
+@benchmark()
+def test_mha_flydsl_paged(
+    seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, causal, lse
+):
+    """Paged KV: the pool is page-indexed, Q is ragged exactly as in thd."""
+    device = "cuda"
+    tot_q, tot_k = sum(seqs_q), sum(seqs_k)
+    q = torch.randn((tot_q, H_q, d_qk), dtype=dtype, device=device)
+    cu_q = torch.tensor(
+        [0] + list(itertools.accumulate(seqs_q)), dtype=dtypes.i32, device=device
+    )
+    cu_k = torch.tensor(
+        [0] + list(itertools.accumulate(seqs_k)), dtype=dtypes.i32, device=device
+    )
+    k_pool, v_pool, page_ids, kv_indptr, last_lens, k_dense, v_dense = _build_paged(
+        seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, device
+    )
+    scale = 1.0 / math.sqrt(d_qk)
+    ref = run_torch_varlen(
+        q, k_dense, v_dense, cu_q.tolist(), cu_k.tolist(), scale, causal, False, None,
+        (-1, -1),
+    )
+
+    # No CK candidate: mha_batch_prefill does not compile on gfx1250 -- its tile
+    # distributions static_assert on wave64 -- so there is no paged baseline here.
+    def _run():
+        return flydsl_flash_attn_paged_fwd(
+            q, k_pool, v_pool, cu_q, kv_indptr, page_ids,
+            kv_last_page_lens=last_lens, max_seqlen_q=max(seqs_q),
+            max_seqlen_k=max(seqs_k), causal=causal, return_lse=lse,
+        )
+
+    flops = _flops(list(zip(seqs_q, seqs_k)), H_q, d_qk, d_v, causal)
+    nbytes = _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v,
+                     q.element_size(), q.element_size(), lse)
+    ret = {"gfx": get_gfx()}
+    out, us = run_perftest(_run)
+    out = out[0] if isinstance(out, (tuple, list)) else out
+    ret["flydsl us"] = us
+    ret["flydsl TFLOPS"] = flops / us / 1e6
+    ret["flydsl TB/s"] = nbytes / us / 1e6
+    ret["flydsl err"] = checkAllclose(
+        ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=1e-2, atol=1e-2,
+        msg="flydsl: paged prefill",
+    )
+    return ret
 
 
 @benchmark()
@@ -898,9 +979,17 @@ def main():
         "--layout",
         type=str,
         nargs="*",
-        choices=["thd", "bshd"],
-        default=["thd", "bshd"],
+        choices=["thd", "bshd", "paged"],
+        default=["thd", "bshd", "paged"],
         help="Layouts to sweep.\n        e.g.: -l thd",
+    )
+    parser.add_argument(
+        "-p",
+        "--page-size",
+        type=int,
+        nargs="*",
+        default=[1, 16, 1024],
+        help="KV cache page sizes, for -l paged.\n        e.g.: -p 16",
     )
     parser.add_argument(
         "-k",
@@ -1118,6 +1207,27 @@ def main():
                 )
             )
         summarize("FlyDSL FMHA prefill thd summary", rows)
+
+    if "paged" in args.layout:
+        # paged is a16w16 only, so the 8-bit dtypes in the sweep do not apply
+        paged_dtypes = [d for d in served_dtypes if d[0].itemsize == 2 and d[0] == d[1]]
+        rows = []
+        for (d_qk, d_v), shape, dtype, page_size, causal, lse in itertools.product(
+            [h for h in d_qk_v if _flydsl_serves(*h) and h[0] != 192],
+            thd_shapes,
+            paged_dtypes,
+            args.page_size,
+            causals,
+            lses,
+        ):
+            seqs_q, seqs_k, H_q, H_kv = shape
+            rows.append(
+                test_mha_flydsl_paged(
+                    seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size,
+                    dtype[0], causal, lse,
+                )
+            )
+        summarize("FlyDSL FMHA prefill paged summary", rows)
 
     if "bshd" in args.layout:
         rows = []
