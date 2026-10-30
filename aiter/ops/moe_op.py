@@ -353,7 +353,7 @@ def cmdGenFunc_ck_moe_stage(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float = 7.0,
     swiglustep: bool = False,
 ):
 
@@ -437,7 +437,7 @@ def ck_moe_stage1(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float = 7.0,
 ) -> None: ...
 
 
@@ -466,7 +466,7 @@ def ck_moe_stage1_swiglustep(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float = 7.0,
 ) -> None: ...
 
 
@@ -710,7 +710,7 @@ def ck_moe_stage1_fwd(
     use_non_temporal_load: bool | None = False,
     dst_type: torch.dtype | None = None,
     swiglustep: bool = False,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float = 7.0,
 ):
     stage1 = ck_moe_stage1_swiglustep if swiglustep else ck_moe_stage1
     stage1(
