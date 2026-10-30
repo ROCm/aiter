@@ -1006,7 +1006,7 @@ def flydsl_hca_compress_attn(
     # ---- gfx1250 dispatch (wave32) ----
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    if _get_gfx() == "gfx1250":
+    if _get_gfx() in ("gfx1250", "gfx1250-strict"):
         from .fused_compress_attn_hca_gfx1250 import flydsl_hca_compress_attn_gfx1250
 
         return flydsl_hca_compress_attn_gfx1250(
@@ -1256,7 +1256,7 @@ def flydsl_hca_compress_forward(
     """
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    if _get_gfx() == "gfx1250":
+    if _get_gfx() in ("gfx1250", "gfx1250-strict"):
         raise NotImplementedError(
             "flydsl_hca_compress_forward standalone pool: gfx1250 path not wired"
         )

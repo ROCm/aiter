@@ -326,7 +326,7 @@ def get_meta_param(
         # Take the max so either path applies; for V3 callers (tg_factor=1) the
         # gfx1250 auto-rule still kicks in, and for v4 callers the explicit
         # tg_factor governs.
-        is_gfx1250 = get_gfx() == "gfx1250"
+        is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
         wg_per_split = 2 if nhead == 128 and is_gfx1250 else 1
         bs_occ = bs * max(tg_factor, wg_per_split)
         if ignore_total_kv:
@@ -689,7 +689,7 @@ def _mla_scale_on_device(scale, q: torch.Tensor, name: str) -> torch.Tensor:
 
 def _check_mla_qh128_inputs(q, kv, out, seq_lens, page_table, lse):
     """Validate the public contract without reading any GPU tensor contents."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError("kv_shuffled MLA ASM requires gfx1250")
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise RuntimeError("Q must be a GPU tensor")
@@ -817,7 +817,7 @@ def _mla_decode_fwd_kv_shuffled(
 
 def _check_mla_qh64_shuffled_inputs(q, kv, out, qo, indptr, indices, last, splits):
     """Check the packed CSR contract without synchronizing GPU metadata."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError("kv_shuffled QH64 requires gfx1250")
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise ValueError("Q must be a GPU tensor")
@@ -1251,7 +1251,7 @@ def mla_decode_fwd(
             and num_kv_splits == 1
             and nhead == 64
             and (max_seqlen_q == 1 or kv_shuffled_flag)
-            and get_gfx() == "gfx1250"
+            and get_gfx() in ("gfx1250", "gfx1250-strict")
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
         )

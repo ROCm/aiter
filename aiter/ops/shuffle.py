@@ -137,7 +137,7 @@ def moe_shuffle_weight(
     use ``shuffle_weight``'s lane-level interleave. Mirror of ``moe_shuffle_scale``.
     ``is_guinterleave`` is ignored unless ``gate_up=True`` (stage2 has no gate/up).
     """
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         if is_guinterleave and gate_up:
             src = interleave_gate_up_rows(src)
         return shuffle_weight(src, layout=layout)
@@ -428,7 +428,7 @@ def moe_shuffle_scale(
 ) -> torch.Tensor:
     """Arch-aware MoE weight (B) scale shuffle."""
 
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         # n32k4 grouped-MoE B-scale. GGUU (is_guinterleave=False) folds rows
         # as-is; GUGU (is_guinterleave=True) interleaves gate/up rows first.
         return shuffle_scale_n32k4(
