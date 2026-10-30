@@ -1367,7 +1367,13 @@ def _run_csv_file(args, csv_path: str) -> None:
         disable_requant = os.environ.get(
             "AITER_FLYDSL_DISABLE_GEMM1_REQUANT", "0"
         ).lower() in ("1", "true", "yes", "on")
-        if disable_requant and inter_dim % 256:
+        disable_act = os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_ACT", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if (disable_requant or disable_act) and inter_dim % 256:
             print(
                 f"[csv] row {idx}: skipped inter_dim={inter_dim} without fused "
                 "requant (needs inter_dim % 256 == 0)",
