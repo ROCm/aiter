@@ -718,19 +718,25 @@ def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(
             max_seqlen_kv,
         )
         assert tuned
-        assert mla_module._pipelined_unshuffled_lds_bytes(
-            block_size,
-            tuned["BLOCK_M"],
-            kv_lora_rank,
-            64,
-            1,
-            1,
-            tuned["num_stages"],
-            tuned["Q_FROM_LDS"],
-        ) > 256 * 1024
-        assert mla_module._pipelined_unshuffled_lds_bytes(
-            block_size, num_query_heads, kv_lora_rank, 64, 1, 1
-        ) <= 256 * 1024
+        assert (
+            mla_module._pipelined_unshuffled_lds_bytes(
+                block_size,
+                tuned["BLOCK_M"],
+                kv_lora_rank,
+                64,
+                1,
+                1,
+                tuned["num_stages"],
+                tuned["Q_FROM_LDS"],
+            )
+            > 256 * 1024
+        )
+        assert (
+            mla_module._pipelined_unshuffled_lds_bytes(
+                block_size, num_query_heads, kv_lora_rank, 64, 1, 1
+            )
+            <= 256 * 1024
+        )
     lengths = [
         1,
         block_size,
