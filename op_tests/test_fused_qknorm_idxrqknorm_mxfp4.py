@@ -24,7 +24,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.test_common import benchmark, run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
@@ -183,6 +183,20 @@ def same(a, b):
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
+def check_bytes(actual, expected, *, msg):
+    """Bit-exact: compare the raw bytes with rtol=atol=0, return the mismatch ratio (0)."""
+    err = checkAllclose(
+        expected.view(torch.uint8).float(),
+        actual.view(torch.uint8).float(),
+        rtol=0,
+        atol=0,
+        msg=msg,
+    )
+    if err != 0:
+        raise AssertionError(f"{msg} mismatch ratio: {err}")
+    return err
+
+
 @benchmark()
 def test_write_bytes(T, nkv, dtype, kv, bs, index_dtype, case):
     torch.manual_seed(T)
@@ -193,6 +207,7 @@ def test_write_bytes(T, nkv, dtype, kv, bs, index_dtype, case):
         inputs, nkv, slots, auto(kv), bs, auto(index_dtype), dtype, index_slots
     )
     got = run_op(inputs, nkv, slots, kv, bs, index_dtype, dtype, index_slots)
+    err = 0
     for name, ref in base.items():
         if ref is None:
             continue
@@ -200,8 +215,8 @@ def test_write_bytes(T, nkv, dtype, kv, bs, index_dtype, case):
             ref = index_pages(ref, index_slots)
         elif name in ("kc", "vc") and kv == "mxfp4":
             ref = expected_pages(ref, slots)
-        assert same(got[name], ref), f"{name} differs from the auto-mode reference"
-    return {"result": "PASS"}
+        err = max(err, check_bytes(got[name], ref, msg=f"{name} vs auto-mode: "))
+    return {"err": err}
 
 
 @benchmark()
@@ -212,9 +227,13 @@ def test_skip_index_branch(dtype):
     inputs = make_inputs(T, 1, dtype)
     base = run_op(inputs, 1, slots, "auto", 128, "auto", dtype, skip_index=True)
     got = run_op(inputs, 1, slots, "mxfp4", 128, "auto", dtype, skip_index=True)
+    err = 0
     for name in ("kc", "vc"):
-        assert same(got[name], expected_pages(base[name], slots)), name
-    return {"result": "PASS"}
+        err = max(
+            err,
+            check_bytes(got[name], expected_pages(base[name], slots), msg=f"{name}: "),
+        )
+    return {"err": err}
 
 
 def test_views_into_one_pool():
@@ -250,12 +269,12 @@ def test_q_fp8_out(dtype, kv, q_dtype):
     qf = q_ref.float()
     assert (qf.abs() > fp8_max).any() and qf.isinf().any() and qf.isnan().any()
     want, nan = qf.clamp(-fp8_max, fp8_max).to(dtypes.fp8), qf.isnan()
-    assert same(q8[~nan], want[~nan])
+    err = check_bytes(q8[~nan], want[~nan], msg="q_out e4m3: ")
     assert (
         q8.view(dtypes.fp8)[nan].float().isnan().all()
     )  # NaN stays NaN, its sign is free
-    assert torch.equal(inputs[0], qkv)
-    return {"result": "PASS"}
+    err = max(err, check_bytes(inputs[0], qkv, msg="qkv unchanged: "))
+    return {"err": err}
 
 
 def test_existing_index_modes_unchanged():
@@ -411,7 +430,7 @@ def test_rejections(case):
     else:
         assert r.returncode != 0
         assert "mxfp4" in r.stderr or "index" in r.stderr, r.stderr[-500:]
-    return {"result": "PASS"}
+    return {"err": 0}  # the expected outcome happened; there is no numeric error
 
 
 @benchmark()
