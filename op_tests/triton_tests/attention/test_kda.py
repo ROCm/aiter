@@ -1737,10 +1737,13 @@ def test_fused_conv_rms_gate_spec(N, k, padded, state_dtype, seed):
     assert torch.equal(S1[untouched], S[untouched]), "unused state slots changed"
 
 
+@pytest.mark.parametrize("padded_weight", [False, True])
 @pytest.mark.parametrize("conv1d_layout", [False, True])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("seed", [0, 42, 2026])
-def test_fused_recurrent_kda_packed_decode(state_dtype, seed, conv1d_layout):
+def test_fused_recurrent_kda_packed_decode(
+    state_dtype, seed, conv1d_layout, padded_weight
+):
     N, H, D, W, NS, pad = 16, 24, 128, 4, 40, 16
     if state_dtype == torch.bfloat16 and arch != "gfx950":
         pytest.skip("bf16 state requires gfx950")
@@ -1764,8 +1767,12 @@ def test_fused_recurrent_kda_packed_decode(state_dtype, seed, conv1d_layout):
     idx = torch.randperm(NS - 1, device=DEVICE)[:N].to(torch.int32) + 1
     idx[-2:] = 0
     out = torch.empty(N, H, D, dtype=torch.bfloat16, device=DEVICE)
-    # conv1d_layout: the same weights as a [3*lp, 1, W] conv1d parameter viewed 2-D
+    # conv1d_layout: the same weights as a [3*lp, 1, W] conv1d parameter viewed 2-D;
+    # padded_weight: stored in a buffer one larger in every dimension
     cw_in = cw.permute(0, 2, 1).reshape(3 * lp, W) if conv1d_layout else cw
+    if padded_weight:
+        buf = cw_in.new_zeros([n + 1 for n in cw_in.shape])
+        cw_in = buf[tuple(map(slice, cw_in.shape))].copy_(cw_in)
     S1, cs1 = S.clone(), cs.clone()
     fused_recurrent_kda_packed_decode(
         mixed, g, beta, A_log, dt_bias, -5.0, S1, idx, cs1, cw_in, g2, nw, 1e-5, out
