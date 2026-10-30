@@ -7,9 +7,10 @@ kernel selection, and CUDA-graph replay of HK with changing lengths."""
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.mla_verify import (
     MLA_VERIFY_GLUON,

@@ -12,8 +12,6 @@ CUDA graphs, capture one graph per returned kernel:
   latent 576 / value 512, FP8 e4m3 KV with page size 1, gfx950 only).
 """
 
-from typing import Optional
-
 import torch
 import triton
 
@@ -60,7 +58,7 @@ def mla_verify_hk_supported(
     )
 
 
-def mla_verify_hk_threshold(batch_size: int) -> Optional[int]:
+def mla_verify_hk_threshold(batch_size: int) -> int | None:
     """batch * max_kv_len from which HK beats Gluon, or None without HK."""
     entry = _HK_THRESHOLDS.get(get_gfx())
     if entry is None:
@@ -115,7 +113,7 @@ def mla_verify_hk(
     kv_indices: torch.Tensor,
     sm_scale: float,
     kv_scale=None,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MLA target verify on gfx950 for QLEN 8, 12 heads, FP8 KV, page size 1.
 

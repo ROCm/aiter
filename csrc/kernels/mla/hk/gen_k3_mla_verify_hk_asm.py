@@ -124,7 +124,8 @@ def qk_schedule(sbase, valu):
 
 def decide_valu(cur, tmp):
     """Row max of S[cur] -> lazy rescale decision. Outputs m (m_used), nb (6 - m_used),
-    al (2^(m_old - m_used), 1 if no rescale), rs (wave mask of rows wanting a rescale)."""
+    al (2^(m_old - m_used), 1 if no rescale), rs (wave mask of rows wanting a rescale).
+    """
     s = [cur + k for k in range(32)]
     t = [tmp + i for i in range(16)]
     v = []
@@ -161,7 +162,8 @@ def decide_valu(cur, tmp):
 
 def exp_valu(cur):
     """p = 2^(s*sc + nb) (x kPScale folded into nb) -> fp8 P; l = l*al + sum(p).
-    Software-pipelined order so no instruction consumes a result produced < 4 slots before."""
+    Software-pipelined order so no instruction consumes a result produced < 4 slots before.
+    """
     s = [cur + k for k in range(32)]
     t = [T + i for i in range(16)]
     fma = [f"v_fma_f32 v{s[k]}, v{s[k]}, %[sc], %[nb]" for k in range(32)]
