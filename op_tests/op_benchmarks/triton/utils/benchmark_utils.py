@@ -402,10 +402,12 @@ def generate_rotating_buffers_pool(
     target_mb: int,
     min_pool_len: int,
     max_pool_len: int | None = None,
+    exclude_from_sizing: Sequence[str] | None = None,
     print_info: bool = False,
 ):
     per_set_bytes = 0
     seen_storage_ptrs = set()
+    excluded = set(exclude_from_sizing or ())
     # Keep every generator's output alive for the whole sizing loop below: once
     # a kwargs dict is dropped, its tensors' storages can be freed and the
     # caching allocator can hand the same address to a later gen's unrelated
@@ -413,21 +415,37 @@ def generate_rotating_buffers_pool(
     # skipped. Release these extra references once sizing is done, before
     # building the real pool.
     keepalive = []
-    for gen, fields in zip(gens, out_vals_keys):
-        kwargs = run_input_generator(gen, fields)
-        keepalive.append(kwargs)
-        for v in kwargs.values():
-            if not isinstance(v, torch.Tensor):
-                continue
+
+    def _count(v):
+        nonlocal per_set_bytes
+        if isinstance(v, torch.Tensor):
             storage = v.untyped_storage()
             ptr = storage.data_ptr()
             # Aliased views (e.g. a reshape of another returned tensor) share
             # backing storage; count it once, by its real size, not once per
             # view, or pool sizing undercounts/overcounts the true footprint.
             if ptr in seen_storage_ptrs:
-                continue
+                return
             seen_storage_ptrs.add(ptr)
             per_set_bytes += storage.nbytes()
+        elif isinstance(v, dict):
+            for item in v.values():
+                _count(item)
+        elif isinstance(v, (list, tuple)):
+            # A list/tuple/dict of tensors (e.g. one entry per candidate) is
+            # real backing memory too -- walk it instead of skipping it, or
+            # sizing undercounts and pool_len blows up to cover a
+            # phantom-small entry.
+            for item in v:
+                _count(item)
+
+    for gen, fields in zip(gens, out_vals_keys):
+        kwargs = run_input_generator(gen, fields)
+        keepalive.append(kwargs)
+        for name, v in kwargs.items():
+            if name in excluded:
+                continue
+            _count(v)
     del keepalive
 
     if per_set_bytes == 0:
@@ -435,7 +453,7 @@ def generate_rotating_buffers_pool(
             "per_set_bytes=0, specify gens that generate tensors with size > 0"
         )
 
-    del kwargs, v, storage
+    del kwargs, v
 
     pool_len = max(min_pool_len, math.ceil(target_mb * 1024 * 1024 / per_set_bytes))
 
