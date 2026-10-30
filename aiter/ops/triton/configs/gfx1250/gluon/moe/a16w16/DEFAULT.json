@@ -1,0 +1,30 @@
+{
+    "bm16_any": {
+        "block_n": 128,
+        "block_k": 128,
+        "num_buffers": 3,
+        "num_warps": 4,
+        "num_subtiles": 1
+    },
+    "bm32_any": {
+        "block_n": 256,
+        "block_k": 64,
+        "num_buffers": 3,
+        "num_warps": 4,
+        "num_subtiles": 1
+    },
+    "bm64_any": {
+        "block_n": 256,
+        "block_k": 64,
+        "num_buffers": 3,
+        "num_warps": 4,
+        "num_subtiles": 1
+    },
+    "bm128_any": {
+        "block_n": 256,
+        "block_k": 64,
+        "num_buffers": 2,
+        "num_warps": 4,
+        "num_subtiles": 1
+    }
+}

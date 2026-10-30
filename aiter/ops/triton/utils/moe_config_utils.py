@@ -15,6 +15,21 @@ from aiter.ops.triton.utils.config_utils import (
 )
 
 
+def m2bucket(m: int) -> str:
+    """M bucket suffix of a gluon MOE dispatch key, e.g. ``bm16_n512_k256_small``."""
+    if m <= 8:
+        return "tiny"
+    if m <= 32:
+        return "small"
+    if m <= 128:
+        return "medium"
+    if m <= 256:
+        return "medium2"
+    if m <= 512:
+        return "large"
+    return "xlarge"
+
+
 @functools.lru_cache(maxsize=64 if USE_LRU_CACHE else 0)
 def get_moe_dispatch(config_name: str, arch: str, backend: str) -> dict:
     """Tuned dispatch table for one MOE GEMM family on one dispatch path.
