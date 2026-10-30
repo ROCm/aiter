@@ -575,6 +575,8 @@ def case_tail(shape, wt, ctx, S):
 
 
 SPRS_EPS = 1e-6
+# SpRsNorm's width in every case: it needs hidden % 2048 == 0, which not every model meets
+SPRS_HIDDEN = 6144
 # SpRsNorm's fused router: experts, top-k, routed scaling, shared-expert weight
 SPRS_ROUTER = (128, 4, 2.0, 0.5)
 
@@ -683,7 +685,7 @@ def case_validation(shape, wt, ctx, S):
     )
     expect_raise(
         lambda: SpRsNorm(
-            shape.model_dim,
+            SPRS_HIDDEN,
             64 * ctx.world,
             SPRS_EPS,
             device=ctx.device,
@@ -806,13 +808,13 @@ def case_late_rank(shape, wt, ctx, S):
     # 4 rows per CTA (one CTA per CU, 256 on MI355X), each a wait on every peer
     tokens = 1024 * ctx.world
     op = SpRsNorm(
-        shape.model_dim,
+        SPRS_HIDDEN,
         tokens,
         SPRS_EPS,
         device=ctx.device,
         wait_timeout_ms=LATE_LIMIT_MS,
     )
-    inputs = sp_rs_norm_inputs(shape.model_dim, tokens, False, 3000)
+    inputs = sp_rs_norm_inputs(SPRS_HIDDEN, tokens, False, 3000)
 
     def checked():
         out, res_out = op(*inputs[:3])
@@ -1162,7 +1164,7 @@ def main() -> int:
     routed = max_tokens // (16 * ctx.world) * 16 * ctx.world
     for tokens, router in ((routed, True), (max_tokens, False)):
         if tokens:
-            rows["SpRsNorm"].append(_run(test_sp_rs_norm, 6144, tokens, router))
+            rows["SpRsNorm"].append(_run(test_sp_rs_norm, SPRS_HIDDEN, tokens, router))
     S.layers = {}
 
     for name, r in rows.items():
