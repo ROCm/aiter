@@ -99,7 +99,7 @@ class SplitKReduction:
     scope (what LLVM emits for monotonic agent-scope accesses), so no cache-wide
     fence is needed. Partials are thread-major float4 groups of the MMA
     fragments, or row-major float4 vectors under the one-pass slice-K combine;
-    ``tid`` and ``THREADS`` index the threads that hold the tile. Row-major
+    ``tid`` and ``THREADS`` index the threads that hold the tile. Groups and
     vectors outside C take an offset beyond the workspace, so the bounds-checked
     buffer drops their stores and returns zeros without touching memory.
     """
@@ -108,12 +108,10 @@ class SplitKReduction:
     # Element offset past any workspace (validation keeps it below 2**31 bytes).
     SKIP = (2**31 - 16) // 4
 
-    def __init__(self, SPLIT_K, TILE_ELEMS, THREADS, BOUNDED=False):
+    def __init__(self, SPLIT_K, TILE_ELEMS, THREADS):
         self.SPLIT_K = SPLIT_K
         self.TILE_ELEMS = TILE_ELEMS
         self.THREADS = THREADS
-        # Bounds-checked workspace (row-major partials skip vectors outside C).
-        self.BOUNDED = BOUNDED
 
     # Polls of a helping split before it leaves the reduction to the last arrival.
     HELP_POLLS = 64
@@ -124,8 +122,9 @@ class SplitKReduction:
             semaphore, tile_idx * SPLIT_K_COUNTER_STRIDE, fx.Int32
         )
         self.help_flag_ptr = flag_ptr + 1
+        # Bounds-checked: a slot past the workspace drops stores and reads zero.
         self.slots = fx.logical_divide(
-            fx.rocdl.make_buffer_tensor(workspace, max_size=not self.BOUNDED),
+            fx.rocdl.make_buffer_tensor(workspace, max_size=False),
             fx.make_layout(1, 1),
         )
         self.flag_ptr = flag_ptr
@@ -139,15 +138,19 @@ class SplitKReduction:
     def _at(self, offset, valid):
         return fx.slice(self.slots, (None, valid.select(offset, fx.Int32(self.SKIP))))
 
-    def _slot(self, ks, group):
-        offset = self.tile_base + ks * self.TILE_ELEMS
-        return fx.slice(
-            self.slots, (None, offset + (group * self.THREADS + self.tid) * 4)
+    def _slot(self, ks, group, live=None):
+        offset = (
+            self.tile_base
+            + ks * self.TILE_ELEMS
+            + (group * self.THREADS + self.tid) * 4
         )
+        if const_expr(live is not None):
+            return self._at(offset, live(group))
+        return fx.slice(self.slots, (None, offset))
 
-    def store_partial(self, frags, rows=None, m_valid=None):
-        """With ``rows``, a group (4 rows of one column) whose first row is at or
-        past row ``m_valid`` of the tile is not stored."""
+    def store_partial(self, frags, live=None):
+        """Store the fp32 partial; ``live(group)``, if given, skips groups that
+        hold only rows past M."""
         group = 0
         for frag in frags:
             for i in range_constexpr(fx.size(frag.shape).unpack() // 4):
@@ -157,16 +160,8 @@ class SplitKReduction:
                         [frag[i * 4 + e] for e in range_constexpr(4)], fx.Float32
                     )
                 )
-                if const_expr(rows is None):
-                    fx.copy(self.copy_atom, vec, self._slot(self.ks_idx, group))
-                else:
-                    self._store_if(vec, group, fx.get_scalar(rows[i * 4]) < m_valid)
+                fx.copy(self.copy_atom, vec, self._slot(self.ks_idx, group, live))
                 group += 1
-
-    @flyc.jit
-    def _store_if(self, vec, group, valid):
-        if valid:
-            fx.copy(self.copy_atom, vec, self._slot(self.ks_idx, group))
 
     def _vec_slot(self, ks, vector_idx, valid):
         return self._at(self.tile_base + ks * self.TILE_ELEMS + vector_idx * 4, valid)
@@ -279,20 +274,27 @@ class SplitKReduction:
         gpu.barrier()
         return fx.ptr_load(self.help_flag_ptr + 1)
 
-    def accumulate(self, frag, first_group, init_frag, rows=None, m_valid=None):
+    def accumulate(self, frag, first_group, init_frag, own_split=None, live=None):
         """Set ``frag`` to init + every split's partial, in split order;
-        ``init_frag`` writes the bias (or zero) into ``frag``. Groups that were
-        not stored read group 0's slot instead: their rows never reach C."""
+        ``init_frag`` writes the bias (or zero) into ``frag``. With ``own_split``
+        (this split's index, a constant), this split's partial is taken from
+        ``frag`` instead of being read back. ``live(group)`` skips padding groups."""
+        groups = fx.size(frag.shape).unpack() // 4
+        if const_expr(own_split is not None):
+            own = [frag[j] for j in range_constexpr(groups * 4)]
         init_frag()
         for ks in range_constexpr(self.SPLIT_K):
-            for i in range_constexpr(fx.size(frag.shape).unpack() // 4):
-                partial = fx.make_rmem_tensor(4, fx.Float32)
-                group = first_group + i
-                if const_expr(rows is not None):
-                    group = (fx.get_scalar(rows[i * 4]) < m_valid).select(group, 0)
-                fx.copy(self.copy_atom, self._slot(ks, group), partial)
-                for e in range_constexpr(4):
-                    frag[i * 4 + e] = frag[i * 4 + e] + partial[e]
+            for i in range_constexpr(groups):
+                if const_expr(ks == own_split):
+                    for e in range_constexpr(4):
+                        frag[i * 4 + e] = frag[i * 4 + e] + own[i * 4 + e]
+                else:
+                    partial = fx.make_rmem_tensor(4, fx.Float32)
+                    fx.copy(
+                        self.copy_atom, self._slot(ks, first_group + i, live), partial
+                    )
+                    for e in range_constexpr(4):
+                        frag[i * 4 + e] = frag[i * 4 + e] + partial[e]
 
 
 def make_lds_layout(rows, block_k):
