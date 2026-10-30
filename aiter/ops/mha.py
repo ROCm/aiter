@@ -3857,7 +3857,6 @@ def flash_attn_varlen_func(
 
     if (
         _FLYDSL_AVAILABLE
-        and not has_all_descales
         and (len(window_size) < 3 or window_size[2] == 0)
         and cu_seqlens_q_padded is None
         and cu_seqlens_k_padded is None
@@ -3885,6 +3884,9 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         if _flydsl_result is not None:
             return _flydsl_result
