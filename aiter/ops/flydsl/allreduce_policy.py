@@ -15,8 +15,7 @@ and in which configuration.
 
 The decisions come in two levels.
 
-Level 1: which algorithm
-========================
+**Level 1: which algorithm**
 
 ``FAMILY_POLICIES`` has one ``FamilyPolicy`` per ``(arch, link,
 world_size)``. A policy has one ``Window`` of payload sizes per algorithm
@@ -39,8 +38,7 @@ the mesh and the ring take their payloads first.
 host's arch and link, with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES``
 overrides applied.
 
-Level 2: which configuration
-============================
+**Level 2: which configuration**
 
 Each algorithm has a tuning ladder per ``(arch, link, world_size)``:
 ``ONESHOT_LADDER``, ``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a
