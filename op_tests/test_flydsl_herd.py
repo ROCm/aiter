@@ -312,8 +312,8 @@ def test_legacy_herd_valid_rows_follow_graph_replay(monkeypatch):
 
 @pytest.mark.parametrize("gfx", ["gfx950", "gfx1250"])
 @pytest.mark.parametrize("tokens", [128, 129])
-@pytest.mark.parametrize("drop", ["0", "1"])
-def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, drop):
+@pytest.mark.parametrize("experts,topk", [(128, 4), (896, 16)])
+def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, experts, topk):
     from aiter import ActivationType, QuantType
     from aiter.ops.flydsl.moe_common import GateMode
     from aiter.utility import dtypes
@@ -321,8 +321,7 @@ def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, drop):
     moe = importlib.import_module("aiter.fused_moe")
     grouped = importlib.import_module("aiter.ops.flydsl.grouped_moe_gfx1250")
     monkeypatch.setattr(moe, "get_gfx", lambda: gfx)
-    monkeypatch.setenv("AITER_HERD_FUSED_DROP", drop)
-    experts, topk, dim = 128, 4, 256
+    dim = 256
     ids, values = _candidates(tokens, experts, topk)
     hidden = torch.zeros(tokens, dim, device="cuda", dtype=torch.bfloat16)
     w1 = torch.empty(experts, 2 * dim, dim // 2, device="cuda", dtype=dtypes.fp4x2)
@@ -335,7 +334,7 @@ def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, drop):
 
     monkeypatch.setattr(grouped, "grouped_gemm_gfx1250_a8w4", mock_grouped)
     if gfx != "gfx1250":
-        # Reject before candidate finalize or grouped MoE, regardless of drop.
+        # Reject before candidate finalize or grouped MoE, at any expert count.
         herd = importlib.import_module("aiter.ops.flydsl.herd_topk")
         finalize_calls = []
         monkeypatch.setattr(
@@ -371,7 +370,8 @@ def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, drop):
         herd_routed_scaling_factor=2.5,
     )
     selected, weights, selected_topk = calls[-1]
-    if drop == "0":
+    if experts > grouped._FUSED_ROUTE_PSUM_MAX_EXPERTS:
+        # Too wide for the grouped MoE's fused drop: finalized before it.
         expected_ids, expected_weights = _reference(ids, values, experts, 2.5)
         assert selected_topk == 0
         torch.testing.assert_close(selected, expected_ids, rtol=0, atol=0)
@@ -427,13 +427,14 @@ def _logits_diff(actual, expected):
 
 
 @pytest.mark.parametrize("tokens", [16, 128])
-def test_fused_moe_outputs_match_router_drop(monkeypatch, tokens):
+# 128 experts drop inside the grouped MoE route; 896 are finalized before it.
+@pytest.mark.parametrize("experts,topk", [(128, 4), (896, 16)])
+def test_fused_moe_outputs_match_router_drop(tokens, experts, topk):
     if get_gfx_runtime() not in ("gfx950", "gfx1250"):
         pytest.skip("HERD MoE supports gfx950 and gfx1250")
     from aiter.fused_moe import fused_moe
 
-    monkeypatch.setenv("AITER_HERD_FUSED_DROP", "1")
-    experts, topk, dim = 128, 4, 512
+    dim = 512
     generator = torch.Generator(device="cuda").manual_seed(2713)
     w1, w2, kwargs = _moe_weights(experts, dim, generator)
     hidden = (
@@ -481,13 +482,11 @@ def test_fused_moe_outputs_match_router_drop(monkeypatch, tokens):
         result = run()
     graph.replay()
     check_output(result)
-    monkeypatch.setenv("AITER_HERD_FUSED_DROP", "0")
-    check_output(run())
 
 
-@pytest.mark.parametrize("drop", ["0", "1"])
+@pytest.mark.parametrize("experts,topk", [(128, 4), (896, 16)])
 @pytest.mark.parametrize("unrouted", [True, False])
-def test_fused_moe_herd_skips_pad_rows(monkeypatch, drop, unrouted):
+def test_fused_moe_herd_skips_pad_rows(experts, topk, unrouted):
     """fused_moe(herd_topk) under num_local_tokens: the real rows match a MoE
     over them alone, the pad rows come out zero, and a replayed CUDA graph
     follows each step's count."""
@@ -495,8 +494,7 @@ def test_fused_moe_herd_skips_pad_rows(monkeypatch, drop, unrouted):
         pytest.skip("K+1 HERD candidates reach fused_moe only on gfx1250")
     from aiter.fused_moe import fused_moe
 
-    monkeypatch.setenv("AITER_HERD_FUSED_DROP", drop)
-    experts, topk, dim, tokens = 128, 4, 512, 64
+    dim, tokens = 512, 64
     generator = torch.Generator(device="cuda").manual_seed(6938)
     w1, w2, kwargs = _moe_weights(experts, dim, generator)
     hidden = (

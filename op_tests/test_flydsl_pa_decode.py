@@ -1167,3 +1167,132 @@ def test_pa_decode_softmax_scale_rejected(softmax_scale, device, monkeypatch):
             value_scale=scale,
             work_plan=plan,
         )
+
+
+def _poison_unowned(cache, scale, owned, fill):
+    """Overwrite K/V rows no sequence owns (and their per-token scales)."""
+    rows = ~owned[:, None, :].expand(-1, cache.shape[1], -1)
+    if cache.dtype == torch.bfloat16:
+        bits = {"zero": 0, "nan": 0x7FC0, "inf": 0x7F80}[fill]
+        cache.view(torch.int16)[rows] = bits
+    else:
+        # E4M3 has no infinity; its largest finite magnitude stands in.
+        nan = 0x80 if cache.dtype == torch.float8_e4m3fnuz else 0x7F
+        bits = {"zero": 0, "nan": nan, "inf": 0x7E}[fill]
+        cache.view(torch.uint8)[rows] = bits
+    if scale is not None and scale.numel() > 1:
+        scale.view(scale.shape[:3])[rows] = {"zero": 0.0, "nan": float("nan")}.get(
+            fill, float("inf")
+        )
+
+
+@pytest.mark.parametrize("fill", ["nan", "inf"])
+@pytest.mark.parametrize(
+    "query_length,kv_heads,group_size,head_dim",
+    [(1, 1, 8, 128), (4, 2, 8, 256), (4, 1, 16, 128)],
+)
+@pytest.mark.parametrize("block_size", [16, 64, 128])
+@pytest.mark.parametrize(
+    "kv", ["fp8-per-tensor", "fp8-per-tensor-plain-v", "fp8-per-token", "bf16"]
+)
+def test_pa_decode_unowned_kv_rows(
+    device, kv, block_size, query_length, kv_heads, group_size, head_dim, fill
+):
+    """Rows no sequence owns contribute exactly zero, even when NaN or Inf.
+
+    Padded block-table lanes read block 0 and the last page's tail past the
+    context is read as is. Both may hold NaN (a recycled page, a checkpoint
+    image); P is zero there but 0 * NaN is NaN in PV.
+    ``mask_unowned_kv=False`` skips the masking and matches it on clean input.
+    """
+    if get_gfx_runtime() == "gfx1250":
+        pytest.skip("gfx1250 pipelines still require finite unowned V rows")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    torch.manual_seed(0)
+    lengths = tuple(max(n, query_length) for n in (1, 17, 255, 257, 1000))
+    query, key, value, table, context = _make_inputs(
+        query_length,
+        kv_heads,
+        group_size,
+        head_dim,
+        block_size,
+        torch.bfloat16,
+        "random",
+        device,
+        lengths,
+    )
+    # Page 0 is owned by no sequence; padded block-table lanes point at it.
+    spare = torch.zeros_like(key[:1])
+    key, value = torch.cat([spare, key]), torch.cat([spare, value])
+    table = torch.nn.functional.pad(table + 1, (0, 2))
+    owned = torch.zeros(key.shape[0], block_size, dtype=torch.bool, device=device)
+    for seq, length in enumerate(lengths):
+        tokens = torch.arange(length, device=device)
+        owned[table[seq, tokens // block_size].long(), tokens % block_size] = True
+
+    key_scale = value_scale = None
+    vector = 8
+    if kv.startswith("fp8"):
+        compute_type = (
+            torch.float8_e4m3fn
+            if get_gfx_runtime() == "gfx950"
+            else torch.float8_e4m3fnuz
+        )
+        vector = 16
+        quantize = pertoken_quant if kv == "fp8-per-token" else per_tensor_quant
+        key, key_scale = quantize(key, quant_dtype=compute_type)
+        value, value_scale = quantize(value, quant_dtype=compute_type)
+    logical_key = key.float() * (1.0 if key_scale is None else key_scale)
+    logical_value = value.float() * (1.0 if value_scale is None else value_scale)
+    reference = _reference(
+        query, logical_key, logical_value, table, context, query_length, 0, None
+    )
+    plan = pa.plan_pa_decode(context, kv_heads, query_length=query_length)
+
+    def run(fill, mask_unowned_kv=True):
+        k, v = key.clone(), value.clone()
+        ks = None if key_scale is None else key_scale.clone()
+        vs = None if value_scale is None else value_scale.clone()
+        _poison_unowned(k, ks, owned, fill)
+        _poison_unowned(v, vs, owned, fill)
+        pages = k.shape[0]
+        key_cache = (
+            k.reshape(pages, kv_heads, block_size, head_dim // vector, vector)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
+        if kv == "fp8-per-tensor-plain-v":
+            value_cache = v.permute(0, 1, 3, 2).contiguous()
+        else:
+            value_cache = (
+                v.reshape(pages, kv_heads, block_size // vector, vector, head_dim)
+                .permute(0, 1, 2, 4, 3)
+                .contiguous()
+            )
+        output = torch.full_like(query, float("nan"))
+        pa.pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context,
+            table,
+            head_dim**-0.5,
+            query_length,
+            compute_type=key_cache.dtype,
+            key_scale=ks,
+            value_scale=vs,
+            work_plan=plan,
+            max_context_length=max(lengths),
+            mask_unowned_kv=mask_unowned_kv,
+        )
+        return output
+
+    clean, poisoned = run("zero"), run(fill)
+    assert torch.isfinite(poisoned).all()
+    # Short FP8 contexts round P coarsely; exactness is the bitwise check.
+    tol = 5e-3 if kv == "bf16" else 2.5e-2
+    torch.testing.assert_close(poisoned.float(), reference, atol=tol, rtol=tol)
+    assert torch.equal(poisoned, clean)
+    if fill == "nan":
+        assert torch.equal(run("zero", mask_unowned_kv=False), clean)

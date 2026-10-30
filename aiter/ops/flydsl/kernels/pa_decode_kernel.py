@@ -144,6 +144,7 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     direct_output: bool = False,
     trans_k: bool = True,
+    mask_unowned_kv: bool = True,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -178,10 +179,15 @@ def compile_pa_decode_tile(
     are absent and query/output strides match. Other tasks write packed partials
     for the shared reducer, which applies sinks once.
 
-    Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
-    Pages past the sequence are pinned to block 0; callers must leave the
-    unwritten tail of the last owned page finite. NHD zero-fills that tail, so
-    it may hold any bytes. ``wide_kv_addressing`` protects
+    Pages past the sequence are pinned to block 0 and the unwritten tail of the
+    last owned page is read as is. On gfx942/gfx950 with ``mask_unowned_kv``
+    (the default), a sequence's last tile zeroes V bytes and K/V scales at or
+    past its context before PV, so those rows may hold anything, including NaN
+    (``0 * NaN == NaN`` in PV MFMA). ``mask_unowned_kv=False`` skips that
+    masking and restores the caller contract that those V bytes and scales
+    remain finite; NHD V is also zero-filled past the context by its DMA. The
+    gfx1250 pipelines ignore the flag and always require it.
+    ``wide_kv_addressing`` protects
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
     and permits unsigned buffer offsets instead of i64. For NHD it also widens
     the head term, and the in-page term stays i32.
@@ -245,6 +251,7 @@ def compile_pa_decode_tile(
         max_context_length=max_context_length,
         sliding_window=sliding_window,
         trans_k=trans_k,
+        mask_unowned_kv=mask_unowned_kv,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
     if cached is not None:

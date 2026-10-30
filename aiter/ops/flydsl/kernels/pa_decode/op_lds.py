@@ -575,7 +575,25 @@ class PaDecodeKVLoader:
             return (tt_val & fx.Int32(1)) * self.traits.KV_BUF_STRIDE
         return 0
 
-    def stage_scales(self, phys_vec, buf_off=0):
+    def _context_scales(self, scales, remaining):
+        """Zero scales of tokens at or past the context length.
+
+        P is zero there, but a NaN or infinite V scale still makes P * scale
+        NaN. ``remaining`` counts valid tokens from the vector's first element.
+        """
+        if const_expr(not self.traits.mask_unowned_kv):
+            return scales
+        zero = fx.Float32(0.0)
+        return fx.Vector.from_elements(
+            [
+                (remaining > i).select(fx.Float32(scales[i]), zero)
+                for i in range_constexpr(scales.shape[0])
+            ],
+            dtype=fx.Float32,
+        )
+
+    def stage_scales(self, phys_vec, buf_off, tt):
+        tile_valid = self.ctx.context_len - tt * self.traits.TILE_TOK
         if const_expr(self.traits.block_size >= 64):
             phys = fx.Int32(phys_vec[0])
             chunk_tok = (
@@ -591,11 +609,11 @@ class PaDecodeKVLoader:
                 + self.ctx.kv_h * self.ctx.stride_ks_head
                 + page_tok
             )
-            k_scale_vec = self.load_k_scale(scale_idx)
-            v_scale_vec = self.load_v_scale(scale_idx)
-            slot = (
-                self.ctx.warp * self.traits.TOK_PER_WARP + chunk_tok
-            ) * self.traits.f32
+            tile_tok = self.ctx.warp * self.traits.TOK_PER_WARP + chunk_tok
+            remaining = tile_valid - tile_tok
+            k_scale_vec = self._context_scales(self.load_k_scale(scale_idx), remaining)
+            v_scale_vec = self._context_scales(self.load_v_scale(scale_idx), remaining)
+            slot = tile_tok * self.traits.f32
             self.lds.store(
                 self.traits.sKScale_off + buf_off + slot, fx.Float32, k_scale_vec
             )
@@ -613,11 +631,16 @@ class PaDecodeKVLoader:
             k_scale_scalar = fx.Float32(self.load_k_scale(scale_idx)[0])
             v_scale_scalar = fx.Float32(self.load_v_scale(scale_idx)[0])
             fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
-            slot = (
+            tile_tok = (
                 self.ctx.warp * self.traits.TOK_PER_WARP
                 + self.ctx.rgroup * MFMA_MNK
                 + self.ctx.lane16
-            ) * self.traits.f32
+            )
+            if const_expr(self.traits.mask_unowned_kv):
+                in_context = tile_tok < tile_valid
+                k_scale_scalar = in_context.select(k_scale_scalar, fx.Float32(0.0))
+                v_scale_scalar = in_context.select(v_scale_scalar, fx.Float32(0.0))
+            slot = tile_tok * self.traits.f32
             self.lds.store(
                 self.traits.sKScale_off + buf_off + slot,
                 fx.Float32,
@@ -881,6 +904,82 @@ class PaDecodeKVLoader:
             gathered.append(ops)
         return gathered
 
+    def v_tail_masks(self, tile_valid):
+        """Byte masks keeping only this lane's V tokens below the context length.
+
+        Operand i holds tokens rgroup * TOK_PER_WARP + i * (8 // element bytes)
+        onward, in load_v's order.
+        """
+        remaining = tile_valid - self.ctx.rgroup * self.traits.TOK_PER_WARP
+        bits_per_tok = 8 * self.traits.QP_ELEM_BYTES
+        if const_expr(self.traits.is_bf16_kv and self.traits.block_size >= 64):
+            # The per-word form below is fewer VALU ops, but these kernels
+            # already sit at the register limit and it spills inside the tile
+            # loop there.
+            tok_per_op = 8 // self.traits.QP_ELEM_BYTES
+            masks = []
+            for i in range_constexpr(self.traits.NVOPS):
+                n = remaining - i * tok_per_op
+                n = (n > 0).select(n, 0)
+                full = n >= tok_per_op
+                shift = fx.Int64((n * bits_per_tok) & 63)
+                masks.append(full.select(fx.Int64(-1), (fx.Int64(1) << shift) - 1))
+            return masks
+        valid_bits = remaining * bits_per_tok
+        words = []
+        for d in range_constexpr(2 * self.traits.NVOPS):
+            # A 64-bit shift of the low word by 0..32 bits covers every 32-bit
+            # mask from all ones to zero.
+            shift = 32 * (d + 1) - valid_bits
+            shift = (shift > 0).select(shift, 0)
+            shift = (shift < 32).select(shift, 32)
+            words.append(fx.Int64(0xFFFFFFFF) >> fx.Int64(shift))
+        return [
+            words[2 * i] | (words[2 * i + 1] << 32)
+            for i in range_constexpr(self.traits.NVOPS)
+        ]
+
+    def tail_masks(self, tile_valid):
+        """V byte masks for mask_v_chunk; None when masking is disabled."""
+        if const_expr(not self.traits.mask_unowned_kv):
+            return None
+        return self._tail_masks(tile_valid)
+
+    @flyc.jit
+    def _tail_masks(self, tile_valid):
+        # Only a sequence's last tile holds tokens at or past its context.
+        masks = fx.full(self.traits.NVOPS, -1, fx.Int64)
+        if tile_valid < self.traits.TILE_TOK:
+            masks = fx.Vector.from_elements(
+                self.v_tail_masks(tile_valid), dtype=fx.Int64
+            )
+        return masks
+
+    @flyc.jit
+    def _mask_v_chunk(self, v, masks, tile_valid):
+        if tile_valid < self.traits.TILE_TOK:
+            v = v & masks
+        return v
+
+    def mask_v_chunk(self, v_ops, masks, tile_valid):
+        """Zero one head chunk's V tokens at or past the context length before PV.
+
+        Their probabilities are exactly zero, but those rows may be pinned
+        block-0 pages or unwritten tails holding NaN, and 0 * NaN is NaN in PV.
+        Disabled by ``mask_unowned_kv=False``, which returns ``v_ops`` as is.
+        """
+        if const_expr(not self.traits.mask_unowned_kv):
+            return v_ops
+        v = self._mask_v_chunk(
+            fx.Vector.from_elements(
+                [v_ops[i] for i in range_constexpr(self.traits.NVOPS)],
+                dtype=fx.Int64,
+            ),
+            masks,
+            tile_valid,
+        )
+        return [v[i] for i in range_constexpr(self.traits.NVOPS)]
+
     @flyc.jit
     def stage_page_ids(self):
         """Stage this task's page ids in LDS so the tile loop never reads the table."""
@@ -913,7 +1012,9 @@ class PaDecodeKVLoader:
                 # writes does not also drain the first K prefetch.
                 phys_vec0 = self.fetch_v_pages(self.ctx.part_start)
                 self.stage_scales(
-                    phys_vec0, self.scale_buffer_offset(fx.Int32(self.ctx.part_start))
+                    phys_vec0,
+                    self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+                    self.ctx.part_start,
                 )
                 k_pf0 = self.load_k_from_pages(phys_vec0)
             else:
@@ -927,6 +1028,7 @@ class PaDecodeKVLoader:
                     self.stage_scales(
                         phys_vec0,
                         self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+                        self.ctx.part_start,
                     )
         elif self.ctx.lane == 0:
             self.lds.store(
