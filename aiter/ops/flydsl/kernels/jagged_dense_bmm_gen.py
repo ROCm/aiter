@@ -457,25 +457,19 @@ def _build_launcher(
         val_per_thr = 8  # 16B / bf16
         thrs_col = BLOCK_K // val_per_thr
         thrs_row = THREADS // thrs_col
-        tiled_copy_g2s_A = fx.make_tiled_copy(
+        tiled_copy_g2s_A = fx.make_tiled_copy_tv(
             fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
-            fx.make_layout(
-                ((thrs_col, thrs_row), (1, val_per_thr)),
-                ((thrs_row * val_per_thr, 1), (1, thrs_row)),
-            ),
-            fx.make_tile(thrs_row, BLOCK_K),
+            fx.make_layout((thrs_row, thrs_col), (thrs_col, 1)),
+            fx.make_layout((1, val_per_thr), (1, 1)),
         )
 
         c_val = 8
         c_thrs_n = BLOCK_N // c_val  # threads along N
         c_thrs_m = THREADS // c_thrs_n  # threads along M
-        tiled_copy_s2g_C = fx.make_tiled_copy(
+        tiled_copy_s2g_C = fx.make_tiled_copy_tv(
             fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16),
-            fx.make_layout(
-                ((c_thrs_n, c_thrs_m), (1, c_val)),
-                ((c_thrs_m * c_val, 1), (1, c_thrs_m)),
-            ),
-            fx.make_tile(c_thrs_m, BLOCK_N),
+            fx.make_layout((c_thrs_m, c_thrs_n), (c_thrs_n, 1)),
+            fx.make_layout((1, c_val), (1, 1)),
         )
 
         epi_smem_bytes = max(smem_bytes, BLOCK_M * BLOCK_N * 2)
