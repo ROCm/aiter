@@ -908,6 +908,19 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
 
 
 class TestFlydslAotReplay(unittest.TestCase):
+    def test_arch_waves_stay_within_the_worker_budget(self):
+        from aiter.aot.flydsl.common import worker_waves
+
+        jobs = {"gfx950": 8512, "gfx1250": 893}
+        for workers in range(1, 9):
+            waves = worker_waves(workers, jobs)
+            self.assertEqual(sorted(a for wave in waves for a in wave), sorted(jobs))
+            for wave in waves:
+                self.assertLessEqual(sum(wave.values()), workers)
+                self.assertGreaterEqual(min(wave.values()), 1)
+        self.assertEqual(worker_waves(1, jobs), [{"gfx950": 1}, {"gfx1250": 1}])
+        self.assertEqual(worker_waves(4, jobs), [{"gfx950": 3, "gfx1250": 1}])
+
     def test_gemm_table_follows_its_config_variable_under_any_file_name(self):
         from aiter.aot.flydsl import gemm
         from aiter.jit.core import AITER_CONFIGS
