@@ -18,13 +18,6 @@ on:
     branches: [main]
   workflow_dispatch:
 
-concurrency:
-  # Labels other than ci:triton-300x and ci:triton-355 change nothing here: such
-  # a run gets a group of its own, so it cannot cancel the run in progress, and
-  # all its jobs skip.
-  group: ${{ github.workflow }}-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !contains(fromJSON('["ci:triton-300x", "ci:triton-355"]'), github.event.label.name) && format('-{0}', github.run_id) || '' }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
 jobs:
   ci_config:
     needs: [split_triton_tests]
@@ -108,7 +101,7 @@ jobs:
   triton:
     if: ${{ needs.split_triton_tests.outputs.selected_count != '0' }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
-    runs-on: amd-dpx-linux.aiter.gpu.gfx950.1
+    runs-on: linux-aiter-vultr-mi325-1
     timeout-minutes: 120
     needs: [split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     strategy:
@@ -116,7 +109,11 @@ jobs:
       matrix:
         shard: ${{ fromJSON(needs.split_triton_tests.outputs.shards) }}
     env:
-      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      # Pinned (not ci_config's pytorch_py312_image) while validating the DPX
+      # memory_reserved()/mem_get_info() desync fix confirmed present in this
+      # ROCm/PyTorch pairing but absent on ROCm 7.2.4 (see
+      # dpx_memory_reserved_desync_bug_report.md).
+      DOCKER_IMAGE: "rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0"
       TRITON_WHEEL_ARTIFACT_NAME: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
       TRITON_TEST: "op_tests/triton_tests/"
 
@@ -128,7 +125,7 @@ jobs:
           submodules: 'recursive'
 
       - name: Network preflight before Triton artifact downloads
-        if: ${{ startsWith(runner.name, 'amd-dpx-linux.aiter.gpu.gfx950.1-') }}
+        if: ${{ startsWith(runner.name, 'linux-aiter-vultr-mi325-1-') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -192,7 +189,7 @@ jobs:
           path: triton_wheels
 
       - name: Speedtest after Triton cache or artifact download failure
-        if: ${{ always() && startsWith(runner.name, 'amd-dpx-linux.aiter.gpu.gfx950.1-') && (steps.download_triton_shards.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-vultr-mi325-1-') && (steps.download_triton_shards.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
