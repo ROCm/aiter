@@ -362,7 +362,77 @@ def check_skinny_rejects():
         except ValueError:
             continue
         raise AssertionError(f"skinny policy accepted an unsupported input: {what}")
-    aiter.logger.info("skinny policy rejects all %d unsupported inputs", len(cases))
+
+    # the launch hands the kernel raw pointers, so a host tensor that gets past
+    # here is a GPU memory fault rather than an exception
+    host = {
+        "b on cpu": lambda: flydsl_hgemm(
+            torch.randn((4, 2048), dtype=dtypes.bf16),
+            torch.randn((6144, 2048), dtype=dtypes.bf16, device="cpu"),
+            **sk,
+        ),
+        "out on cpu": lambda: flydsl_hgemm(
+            torch.randn((4, 2048), dtype=dtypes.bf16),
+            torch.randn((6144, 2048), dtype=dtypes.bf16),
+            out=torch.empty((4, 6144), dtype=dtypes.bf16, device="cpu"),
+            **sk,
+        ),
+    }
+    for what, call in host.items():
+        try:
+            call()
+        except ValueError:
+            continue
+        raise AssertionError(f"skinny policy accepted a host tensor: {what}")
+
+    aiter.logger.info(
+        "skinny policy rejects all %d unsupported inputs", len(cases) + len(host)
+    )
+
+
+def check_skinny_large_weight():
+    """A weight past 2 GiB must not wrap the DMA's 32-bit offset.
+
+    B's byte offset is cast to a signed i32, so a descriptor based at the tensor
+    goes negative once the workgroup's slab passes 2 GiB and the load silently
+    reads elsewhere. N here is the smallest multiple of block_n that crosses it.
+    """
+    n, k = 131088, 8192
+    need = n * k * 2 + (1 << 28)
+    free, _ = torch.cuda.mem_get_info()
+    if free < need:
+        aiter.logger.info(
+            "skipping the >2 GiB skinny weight check: %.1f GiB free, %.1f GiB needed",
+            free / 2**30,
+            need / 2**30,
+        )
+        return
+    sk = {
+        "block_m": 8,
+        "block_n": 24,
+        "block_k": 64,
+        "stages": 4,
+        "split_k": 1,
+        "m_waves": 1,
+        "n_waves": 1,
+        "k_waves": 4,
+        "group_m": 0,
+        "policy": "sk",
+    }
+    torch.manual_seed(SEED)
+    a = torch.empty((1, k), dtype=dtypes.bf16).uniform_(-1, 1)
+    w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
+    y = flydsl_hgemm(a, w, **sk)
+    atol, rtol = _atol_rtol(k, 1, 1, dtypes.bf16)
+    checkAllclose(
+        run_torch(a, w, dtypes.bf16).to(dtypes.fp32),
+        y.to(dtypes.fp32),
+        rtol=rtol,
+        atol=atol,
+        msg=f"flydsl: skinny N={n} K={k} ({n * k * 2 / 2**30:.2f} GiB weight)",
+    )
+    del a, w, y
+    torch.cuda.empty_cache()
 
 
 def summarize(title, rows):
@@ -419,6 +489,7 @@ def main():
         ]
         summarize(f"flydsl_hgemm {dtype} with a concurrent copy", rows)
     check_skinny_rejects()
+    check_skinny_large_weight()
 
 
 if __name__ == "__main__":
