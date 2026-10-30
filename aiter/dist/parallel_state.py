@@ -1091,11 +1091,20 @@ class GroupCoordinator:
         ca_comm = self.device_communicator.ca_comm
         assert ca_comm is not None
         assert not ca_comm.disabled
+        if not ca_comm._has_gather_scatter_kernel():
+            raise RuntimeError(
+                f"custom all-gather has no kernel for {self.world_size} ranks: "
+                "check should_custom_ag() first, or use all_gather(use_custom=True), "
+                "which falls back to NCCL"
+            )
         out = ca_comm.custom_all_gather(input_, dim)
         assert out is not None
         return out
 
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
+        """The custom all-gather, with no NCCL fallback: raises at group sizes
+        it has no kernel for (6 ranks off gfx1250). Callers check
+        `should_custom_ag()` first; `all_gather(use_custom=True)` falls back."""
         return outplace_all_gather(input_, group_name=self.unique_name)
 
     # didn't support dim in custom reduce_scatter
@@ -1180,7 +1189,9 @@ class GroupCoordinator:
         input_size = input_.size()
 
         is_last_dim = dim == input_.dim() - 1
-        ca_comm = self.device_communicator.ca_comm
+        # A group built without a device communicator (the world group) has none.
+        dc = self.device_communicator
+        ca_comm = dc.ca_comm if (use_custom and dc is not None) else None
         can_use_custom = (
             use_custom
             # No custom all-gather kernel for this group size (6 ranks).
