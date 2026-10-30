@@ -70,7 +70,7 @@ def launch_pa_decode_ps_reduce(
             f"{props.multi_processor_count} partitions"
         )
     arch = get_gfx_runtime()
-    wave = 32 if arch == "gfx1250" else 64
+    wave = props.warp_size
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = 1024 // wave
     batch, kv_heads = output.shape[0], output.shape[2]
@@ -120,11 +120,7 @@ def launch_pa_decode_ps_reduce(
             ):
                 groups *= 2
         per_seq = rows * kv_heads
-        if (
-            arch != "gfx1250"
-            and ctas * group_waves >= budget
-            and batch * per_seq * per_seq <= 2**30
-        ):
+        if ctas * group_waves >= budget and batch * per_seq * per_seq <= 2**30:
             num_xcds = get_num_xcds()
     num_xcds = num_xcds if num_xcds > 1 else 0
     compiled = compile_pa_decode_ps_reduce(

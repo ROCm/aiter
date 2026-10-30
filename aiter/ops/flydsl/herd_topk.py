@@ -3,8 +3,6 @@
 
 """HERD routing orchestration with FlyDSL candidate selection + finalize."""
 
-import os
-
 import torch
 
 from .kernels.herd_topk import build_herd_finalize_module
@@ -19,13 +17,6 @@ _HERD_MAX_TOKENS = 128
 _DEFAULT_FINALIZE_THREADS = 256
 _K3_CANDIDATE_THREADS = 256
 _K3_FINALIZE_THREADS = 1024
-
-
-def herd_use_fused_drop() -> bool:
-    value = os.environ.get("AITER_HERD_FUSED_DROP", "1")
-    if value not in ("0", "1"):
-        raise ValueError(f"AITER_HERD_FUSED_DROP must be 0 or 1, got {value!r}")
-    return value == "1"
 
 
 def herd_finalize_candidates(
@@ -71,11 +62,11 @@ def herd_topk_candidates(
     width = candidate_ids.shape[1]
     stream = torch.cuda.current_stream(logits.device)
     packed = logits.contiguous()
-    if score_func == "sigmoid":
-        if correction_bias is None or correction_bias.shape != (experts,):
-            raise ValueError(
-                "sigmoid candidates require one correction bias per expert"
-            )
+    if score_func == "sigmoid" and (
+        correction_bias is None or correction_bias.shape != (experts,)
+    ):
+        raise ValueError("sigmoid candidates require one correction bias per expert")
+    if score_func == "sigmoid" and wave_size_of(logits.device.index) == 64:
         _run_sigmoid_candidate(
             packed,
             correction_bias,
@@ -92,7 +83,9 @@ def herd_topk_candidates(
 
         token_expert_ids = torch.empty_like(candidate_ids)
         topk_softmax(candidate_values, candidate_ids, token_expert_ids, packed, True)
-    elif score_func == "sqrtsoftplus":
+    elif score_func in ("sigmoid", "sqrtsoftplus"):
+        # The FlyDSL sigmoid selector ballots over a 64-lane wave, so wave32
+        # GPUs take the HIP top-k gating kernel sqrtsoftplus always uses.
         from ..topk import topk_gating_fwd
 
         topk_gating_fwd(
