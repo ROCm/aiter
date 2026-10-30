@@ -62,7 +62,9 @@ from .transport import (
 #: Epilogues a kernel factory may be asked to build. ``"none"`` is the plain
 #: all-reduce, and is not a special case anywhere except in the factories'
 #: argument validation.
-FUSIONS = ("none", "rmsnorm")
+#: ``"attn_res"`` is mesh-only and prototype-stage; see
+#: ``quick_allreduce_attn_res``.
+FUSIONS = ("none", "rmsnorm", "attn_res")
 
 #: bf16 values in one 16 B atom, per thread.
 ATOM_ELEMS = 8
@@ -809,6 +811,58 @@ def xchg_total(delta):
     )
     units = delta // fx.Int64(1 << XCHG_COUNT_BITS)
     total = fx.Float32(units) * fx.Float32(2.0**-XCHG_FIX_BITS)
+    return (poisoned == fx.Int64(0)).select(total, fx.Float32(float("nan")))
+
+
+def xchg_signed_bias_units(n_writers: int) -> int:
+    """Fixed-point bias (in units) that recenters a SIGNED partial so it joins
+    through the same non-negative integer exchange. Half of ``xchg_clamp_units``
+    so ``2*C`` per writer still sums below ``2**XCHG_SUM_BITS``; a power of two,
+    exact in f32. See ``xchg_contribution_signed`` (SILOTIGER-1277 split AttnRes:
+    the prefix dot(prefix, cw) is signed, unlike every sum of squares)."""
+    return xchg_clamp_units(n_writers) >> 1
+
+
+def xchg_contribution_signed(partial, n_writers: int):
+    """The i64 a writer adds for a SIGNED fp32 *partial* (e.g. a dot product).
+
+    Bias by ``C = xchg_signed_bias_units/2^FIX`` so ``partial + C >= 0``, then
+    pack exactly as ``xchg_contribution`` does. ``xchg_total_signed`` subtracts
+    ``n_writers * C`` back out. A ``|partial| >= C`` (or NaN/Inf, which compare
+    false) is poisoned -- the signed range is +-C, with C ~ 3.3e7 at nvb-scale
+    n_writers, orders of magnitude above any dot(row, cw). Branchless, and the
+    integer sum stays order-independent, so every rank decodes the same bits."""
+    c_units = xchg_signed_bias_units(n_writers)
+    C = fx.Float32(c_units * 2.0**-XCHG_FIX_BITS)
+    ok = (partial < C) & (partial > fx.Float32(0.0) - C)
+    v = ok.select(partial, fx.Float32(0.0))
+    # Quantize the SMALL signed partial in fp32 (it is precise there), then add
+    # the large recentering bias ``c_units`` in the INTEGER domain. Adding C in
+    # fp32 first -- as a non-negative sum of squares can -- would round the
+    # partial away: C ~ 2^27 dwarfs |dot| ~ 1e3, and fp32's 24-bit mantissa
+    # keeps only ~2^(27-24) ~ 8 of the partial's units. Round half away from
+    # zero, matching the non-negative path's ``+ 0.5`` on its u >= 0.
+    rnd = (v >= fx.Float32(0.0)).select(fx.Float32(0.5), fx.Float32(-0.5))
+    q = fx.Int64(v * fx.Float32(2.0**XCHG_FIX_BITS) + rnd) + fx.Int64(c_units)
+    fixed = q * fx.Int64(1 << XCHG_COUNT_BITS) + fx.Int64(1)
+    poison = fx.Int64((1 << XCHG_ARRIVAL_BITS) + 1)
+    return ok.select(fixed, poison)
+
+
+def xchg_total_signed(delta, n_writers: int):
+    """The fp32 signed sum a *complete* ``cur - prev`` carries: NaN if poisoned.
+    Removes the ``n_writers * C`` bias ``xchg_contribution_signed`` added.
+
+    The bias is removed in the INTEGER domain, before the fp32 conversion: the
+    biased unit count is ~``n_writers * C`` ~ 2^52, and converting that to fp32
+    first would round the small signed sum away (fp32's 24-bit mantissa) exactly
+    as adding C in fp32 would on the encode side (SILOTIGER-1277 iter003)."""
+    poisoned = (delta >> fx.Int64(XCHG_ARRIVAL_BITS)) & fx.Int64(
+        (1 << XCHG_ARRIVAL_BITS) - 1
+    )
+    units = delta // fx.Int64(1 << XCHG_COUNT_BITS)
+    signed_units = units - fx.Int64(n_writers * xchg_signed_bias_units(n_writers))
+    total = fx.Float32(signed_units) * fx.Float32(2.0**-XCHG_FIX_BITS)
     return (poisoned == fx.Int64(0)).select(total, fx.Float32(float("nan")))
 
 
