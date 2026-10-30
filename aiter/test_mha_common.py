@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 
 from .bert_padding import pad_input, unpad_input
 
@@ -806,3 +807,46 @@ def sparse_mla_dsv4_ref(q, kv, topk_indices, attn_sink=None, scale=None):
         )
         lses.append((m + torch.log(denom)).detach())
     return torch.stack(outs, dim=0), torch.stack(lses, dim=0)
+
+
+def unsupported_fp8_mha_head_pair(
+    d, d_v, nheads, nheads_k, seqlen_q, *, varlen, return_lse=False
+):
+    """Skip reason for a per-tensor FP8 MHA head pair, or None when it can run.
+
+    192x128 and 128x64 use the CK fp8 kernels. 128x64 is the d128 tile with V
+    padded. 256x256 is the gfx950 FMHA v3 kernel, and only for a power-of-two
+    GQA ratio. Fixed-shape queries with seqlen_q <= 128 stay on CK, which does
+    not build an fp8 hdim-256 instance, so those cases skip too. CK fp8 has no
+    LSE instance; LSE is requested only by the harness CLI.
+    """
+    if return_lse and (d, d_v) in ((192, 128), (128, 64)):
+        return (
+            "CK per-tensor FP8 has no LSE instance for "
+            f"(D_QK, D_V)={d}x{d_v}; FMHA v3 LSE covers 128x128 and gfx950 256x256"
+        )
+    if (d, d_v) != (256, 256):
+        return None
+    gfx = get_gfx()
+    if gfx != "gfx950":
+        return (
+            "per-tensor FP8 (D_QK, D_V)=(256, 256) is the gfx950 FMHA v3 kernel; "
+            f"{gfx} has no aiter CK fp8 hdim-256 instance"
+        )
+    if nheads % nheads_k != 0:
+        return (
+            "gfx950 per-tensor FP8 HD256 requires nheads to be divisible by "
+            f"nheads_k (got {nheads}/{nheads_k})"
+        )
+    gqa = nheads // nheads_k
+    if gqa & (gqa - 1):
+        return (
+            "gfx950 per-tensor FP8 HD256 only accepts a power-of-two GQA ratio "
+            f"(got {nheads}/{nheads_k}={gqa}); CK has no fp8 hdim-256 fallback"
+        )
+    if not varlen and seqlen_q <= 128:
+        return (
+            "fixed-shape per-tensor FP8 uses CK when seqlen_q <= 128, which does "
+            "not build fp8 hdim 256; gfx950 HD256 requires seqlen_q > 128"
+        )
+    return None
