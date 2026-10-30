@@ -796,6 +796,53 @@ def test_mha_v4_triton_v_quantizers_accept_misaligned_bshd_views(quantizer, layo
     assert _bitwise_equal(quantize(value), quantize(value.contiguous()))
 
 
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="~4 GB of gfx942/gfx950 memory")
+@parametrize(
+    "quantizer",
+    [
+        param(
+            quantizer,
+            skip=get_gfx() != "gfx950" and quantizer not in _GFX942_STRIDED_QUANTIZERS,
+        )
+        for quantizer in _TRITON_V_QUANTIZERS
+    ],
+)
+def test_mha_v4_triton_v_quantizers_address_strided_views_past_2_31_elements(
+    quantizer,
+):
+    """A view of three single rows can put its last batch 2^31 elements in, so the offsets must
+    be 64-bit. Out of process because a wrapped offset faults the GPU rather than failing.
+    """
+    source = textwrap.dedent(f"""
+        import torch
+        from aiter.ops.mha_v4_quant import quantize_v_fp8, quantize_v_mxfp6
+
+        quantize = {{"v_fp8": quantize_v_fp8, "v_mxfp6": quantize_v_mxfp6}}["{quantizer}"]
+        stride = 1 << 30
+        storage = torch.zeros(2 * stride + 128, device="cuda", dtype=torch.bfloat16)
+        value = storage.as_strided((3, 1, 1, 128), (stride, 128, 128, 1))
+        value.copy_(torch.randn((3, 1, 1, 128), device="cuda", dtype=torch.bfloat16))
+        actual = quantize(value)
+        expected = quantize(value.contiguous())
+        for a, e in zip(actual, expected):
+            assert torch.equal(
+                a.contiguous().view(torch.uint8), e.contiguous().view(torch.uint8)
+            )
+        torch.cuda.synchronize()
+        print("matched")
+        """)
+    finished = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    assert "matched" in finished.stdout
+
+
 def test_mha_v4_rotated_fp8_rejects_noncontiguous_non_bshd_input():
     value = torch.randn((2, 3, 128), device="cuda", dtype=torch.bfloat16)
     value = value.transpose(0, 1)
