@@ -20,11 +20,16 @@ import torch
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 
-from .kernels.jagged_dense_bmm_gen import BLOCK_M, BLOCK_N, jagged_dense_bmm
+from .kernels.jagged_dense_bmm_gen import (
+    ARCH_TRAITS,
+    BLOCK_M,
+    BLOCK_N,
+    jagged_dense_bmm,
+)
 
 __all__ = ["jagged_dense_bmm_dispatched"]
 
-SUPPORTED_ARCHS = ("gfx942",)
+SUPPORTED_ARCHS = tuple(ARCH_TRAITS)
 
 DEFAULT_BLOCK_K = 64
 DEFAULT_THREADS = 256
@@ -244,5 +249,6 @@ def jagged_dense_bmm_dispatched(
         max_seq_len,
         stream=stream,
         uniform_seqlen=uniform_seqlen,
+        traits=ARCH_TRAITS[arch],
         **cfg,
     )
