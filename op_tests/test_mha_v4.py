@@ -7,9 +7,11 @@ import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import textwrap
+import time
 
 import pandas as pd
 import torch
@@ -2392,13 +2394,70 @@ def _verdict(err):
     return "warning" if err <= _TOL_ERR_RATIO else "failed"
 
 
+_KV_SPLIT_RECIPES = ("bf16", "bf16fp8", "i8fp8", "fp8")
+_GRAPH_CALLS, _GRAPH_SAMPLES = 10, 100
+_EAGER_CALLS, _EAGER_SAMPLES = 20, 50
+
+
+def _graph_us(fn):
+    """Median us per call over replays of one HIP graph holding back-to-back calls."""
+    for _ in range(3):
+        output = fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(_GRAPH_CALLS):
+            fn()
+    for _ in range(5):
+        graph.replay()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    samples = []
+    for _ in range(_GRAPH_SAMPLES):
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) * 1e3 / _GRAPH_CALLS)
+    return output, statistics.median(samples)
+
+
+def _eager_us(fn):
+    """Median us per call of back-to-back eager calls: issue to synchronize, and issue alone."""
+    for _ in range(10):
+        output = fn()
+    torch.cuda.synchronize()
+    e2e, host = [], []
+    for _ in range(_EAGER_SAMPLES):
+        start = time.perf_counter()
+        for _ in range(_EAGER_CALLS):
+            fn()
+        issued = time.perf_counter()
+        torch.cuda.synchronize()
+        done = time.perf_counter()
+        e2e.append((done - start) * 1e6 / _EAGER_CALLS)
+        host.append((issued - start) * 1e6 / _EAGER_CALLS)
+    return output, statistics.median(e2e), statistics.median(host)
+
+
+def _kv_splits_arg(value):
+    return value if value == "auto" else int(value)
+
+
 @benchmark()
-def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
+def benchmark_mha_v4(
+    batch, sequence_q, sequence_k, heads, dtype, kv_splits=1, timing="profiler"
+):
     """Benchmark every dense MHA v4 recipe against one Torch reference.
 
     All recipes are timed side by side because they differ only in how Q/K/V are quantized, so
     the interesting number is what each costs at the same shape and what it costs in accuracy.
     The quantized rows time their quantizers too, since that is what mha_v4 runs per call.
+
+    `timing` picks what "us" means: "profiler" is the device time of one call's kernels,
+    "graph" the median over HIP-graph replays of _GRAPH_CALLS back-to-back calls, and "eager"
+    the median issue-to-synchronize time of _EAGER_CALLS back-to-back calls, with the time to
+    issue them alone as "host us". Any `kv_splits` but 1 times only the recipes that split.
     """
     head_dim = 128
     softmax_scale = head_dim**-0.5
@@ -2420,6 +2479,9 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
         "f6f4": (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4),
         "mxfp4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
     }
+    if kv_splits != 1:
+        recipes = {name: recipes[name] for name in _KV_SPLIT_RECIPES}
+    out = torch.empty_like(q)
     candidates = {
         name: (
             lambda q_format=q_format, v_format=v_format: mha_v4(
@@ -2430,6 +2492,8 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
                 q_format,
                 v_format,
                 softmax_scale=softmax_scale,
+                out=out,
+                kv_splits=kv_splits,
             )
         )
         for name, (q_format, v_format) in recipes.items()
@@ -2440,7 +2504,21 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
     nbytes = elements * q.element_size()
     ret = {"gfx": get_gfx()}
     for name, candidate in candidates.items():
-        output, us = run_perftest(candidate)
+        if timing == "graph":
+            output, us = _graph_us(candidate)
+        elif timing == "eager":
+            output, us, ret[f"{name} host us"] = _eager_us(candidate)
+        else:
+            output, us = run_perftest(candidate)
+        if kv_splits == "auto":
+            q_format, v_format = recipes[name]
+            ret[f"{name} splits"] = mha_v4_kv_splits(
+                batch,
+                sequence_q,
+                heads,
+                sequence_k,
+                ragged=mha_v4_module._varlen_capable(q_format, v_format),
+            )
         # Quantized recipes are expected to land well outside a bitwise bound; the err column is
         # what carries their accuracy, so compare loosely and let the number speak.
         # catastrophic_check turns NaN/Inf or delta > ref_max/2 into an AssertionError; catching it
@@ -2487,16 +2565,52 @@ def main():
     parser.add_argument(
         "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
     )
+    parser.add_argument(
+        "--kv-splits",
+        type=_kv_splits_arg,
+        nargs="*",
+        default=[1],
+        help='KV split counts, each a positive int or "auto"; any but 1 times only\n'
+        "the recipes that split (bf16, bf16fp8, i8fp8, fp8)",
+    )
+    parser.add_argument(
+        "--timing",
+        choices=["profiler", "graph", "eager"],
+        nargs="*",
+        default=["profiler"],
+        help="profiler: device time of one call's kernels\n"
+        f"graph: median over HIP-graph replays of {_GRAPH_CALLS} back-to-back calls\n"
+        f"eager: median issue-to-synchronize time of {_EAGER_CALLS} back-to-back calls,\n"
+        '       plus the time to issue them alone as "host us"',
+    )
     args = parser.parse_args()
 
     rows = []
-    for batch, sequence_q, sequence_k, heads, dtype in itertools.product(
-        args.batch, args.sequence_q, args.sequence_k, args.heads, args.dtype
+    for (
+        batch,
+        sequence_q,
+        sequence_k,
+        heads,
+        dtype,
+        kv_splits,
+        timing,
+    ) in itertools.product(
+        args.batch,
+        args.sequence_q,
+        args.sequence_k,
+        args.heads,
+        args.dtype,
+        args.kv_splits,
+        args.timing,
     ):
         if dtype != dtypes.bf16:
             aiter.logger.warning("MHA v4 dense benchmark skips dtype %s", dtype)
             continue
-        rows.append(benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype))
+        rows.append(
+            benchmark_mha_v4(
+                batch, sequence_q, sequence_k, heads, dtype, kv_splits, timing
+            )
+        )
     if rows:
         frame = pd.DataFrame(rows)
         aiter.logger.info(
