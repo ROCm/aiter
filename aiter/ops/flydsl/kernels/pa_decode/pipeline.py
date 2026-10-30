@@ -1244,9 +1244,8 @@ class Gfx1250WavePipeline:
     def _page(self, token_base, begin, end, state, q_operand, scale, upper, masked):
         """Consume one page; ``masked`` applies the causal and length bounds."""
         ctx, t = self.ctx, self.t
-        # Unmasked pages fold V normalization into the exponent. Keep query
-        # scaling before per-token K scaling: the opposite order can overflow
-        # even when the fully scaled logit is finite.
+        # Unmasked scores are finite and the row scale is nonnegative, so it
+        # commutes with the maximum and fuses into the exponent.
         fused = not masked and t.per_token_kv and t.softmax_scale >= 0
         buffer = ((token_base - begin) // t.TOKENS) % 2
         tdm_ops.tensor_wait(0)
@@ -1308,9 +1307,12 @@ class Gfx1250WavePipeline:
             if const_expr(t.per_token_kv):
                 ks = self.mem.load(scales + (first + piece[s]) * 4, fx.Float32, 8)
             for r in range_constexpr(8):
-                value = scores[r] * scale
-                if const_expr(t.per_token_kv):
-                    value = value * fx.Float32(ks[r])
+                if const_expr(fused):
+                    value = scores[r] * fx.Float32(ks[r])
+                else:
+                    value = scores[r] * scale
+                    if const_expr(t.per_token_kv):
+                        value = value * fx.Float32(ks[r])
                 if const_expr(masked):
                     # Rows never mix, and padded rows are never stored.
                     value = (fx.Int32(first + r) < limit[s]).select(
@@ -1320,6 +1322,8 @@ class Gfx1250WavePipeline:
         scores = fx.Vector.from_elements(units, dtype=fx.Float32)
         tile_max = scores.reduce(ReductionOp.MAX)
         tile_max = fx.maxnumf(tile_max, tile_max.shuffle_xor(16, t.WAVE))
+        if const_expr(fused):
+            tile_max = tile_max * scale
         old_max = state[0]
         new_max = fx.maxnumf(old_max, tile_max)
         safe_max = (new_max > fx.Float32(float("-inf"))).select(
@@ -1327,16 +1331,37 @@ class Gfx1250WavePipeline:
         )
         corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
         tokens = t.TOKENS // 2
-        exponent = scores - fx.Vector.from_elements(
-            [fx.Float32(safe_max)], dtype=fx.Float32
-        ).broadcast_to(tokens)
         if const_expr(fused):
-            # Subtract the maximum first, so large logits do not round away
-            # log2(vnorm). The denominator divides the normalization back out.
-            exponent = exponent + fx.Vector.from_elements(
-                [fx.Float32(fx.log2(vnorm, fastmath="afn"))], dtype=fx.Float32
-            ).broadcast_to(tokens)
-        probs = fx.Vector(fx.exp2(exponent, fastmath="afn"))
+            # exp2(scale * u - max + log2(vnorm)) is the probability times
+            # vnorm, which P needs; the denominator divides vnorm back out.
+            probs = fx.Vector(
+                fx.exp2(
+                    fx.fma(
+                        scores,
+                        fx.Vector.from_elements([scale], dtype=fx.Float32).broadcast_to(
+                            tokens
+                        ),
+                        fx.Vector.from_elements(
+                            [
+                                fx.Float32(fx.log2(vnorm, fastmath="afn"))
+                                - fx.Float32(safe_max)
+                            ],
+                            dtype=fx.Float32,
+                        ).broadcast_to(tokens),
+                    ),
+                    fastmath="afn",
+                )
+            )
+        else:
+            probs = fx.Vector(
+                fx.exp2(
+                    scores
+                    - fx.Vector.from_elements(
+                        [fx.Float32(safe_max)], dtype=fx.Float32
+                    ).broadcast_to(tokens),
+                    fastmath="afn",
+                )
+            )
         pairs = [
             fx.Vector.from_elements([probs[k], probs[k + 1]], dtype=fx.Float32)
             for k in range_constexpr(0, tokens, 2)
