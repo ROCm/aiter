@@ -162,9 +162,9 @@ def compile_preshuffle_gemm(
         raise ValueError(f"in_dtype must be fp8/int8/fp16/bf16, got {in_dtype!r}")
     if split_k < 1:
         raise ValueError(f"split_k must be positive; got split_k={split_k}")
-    if tile_n < 16 or tile_n % 16 != 0:
+    if tile_n not in (16, 32) and (tile_n < 64 or tile_n % 64 != 0):
         raise ValueError(
-            f"tile_n must be a multiple of 16 and at least 16; got tile_n={tile_n}"
+            f"tile_n must be 16, 32, or a positive multiple of 64; got tile_n={tile_n}"
         )
     if tile_k <= 0 or K % tile_k != 0:
         raise ValueError(

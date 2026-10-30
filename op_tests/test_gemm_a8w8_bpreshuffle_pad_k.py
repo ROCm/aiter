@@ -449,11 +449,13 @@ def test_per_tensor_scale_forms(m, tm, tn, tk, sk, form):
 
 
 @requires_flydsl_gfx
-@pytest.mark.parametrize("tile_n", [80, 96, 112])
-def test_uncovered_tile_width_raises(tile_n):
+@pytest.mark.parametrize("tile_n", [48, 80, 96, 112])
+def test_unsupported_tile_width_raises(tile_n):
     from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 
-    with pytest.raises(ValueError, match="not fully covered by the MMA loop"):
+    with pytest.raises(
+        ValueError, match="tile_n must be 16, 32, or a positive multiple of 64"
+    ):
         compile_preshuffle_gemm(
             N=256, K=256, tile_m=32, tile_n=tile_n, tile_k=128, in_dtype="fp8"
         )
