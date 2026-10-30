@@ -3131,9 +3131,9 @@ def flash_attn_varlen_a8w8_m32x8(
             d is not None for d in _descales
         ), "q/k/v_descale must be given together"
         for _name, _d in zip(("q", "k", "v"), _descales):
-            assert torch.is_tensor(_d) and _d.dtype == torch.float32, (
-                f"{_name}_descale must be a float32 tensor, got {type(_d)}"
-            )
+            assert (
+                torch.is_tensor(_d) and _d.dtype == torch.float32
+            ), f"{_name}_descale must be a float32 tensor, got {type(_d)}"
             assert _d.numel() == 1, f"{_name}_descale must hold one element"
             assert _d.device == q.device, f"{_name}_descale must be on {q.device}"
     qd_ptr, kd_ptr, vd_ptr = _descales if has_descale else (q, q, q)
@@ -3325,9 +3325,9 @@ def flash_attn_batch_a8w8_m32x8(
             d is not None for d in _descales
         ), "q/k/v_descale must be given together"
         for _name, _d in zip(("q", "k", "v"), _descales):
-            assert torch.is_tensor(_d) and _d.dtype == torch.float32, (
-                f"{_name}_descale must be a float32 tensor, got {type(_d)}"
-            )
+            assert (
+                torch.is_tensor(_d) and _d.dtype == torch.float32
+            ), f"{_name}_descale must be a float32 tensor, got {type(_d)}"
             assert _d.numel() == 1, f"{_name}_descale must hold one element"
             assert _d.device == q.device, f"{_name}_descale must be on {q.device}"
     qd_ptr, kd_ptr, vd_ptr = _descales if has_descale else (q, q, q)
