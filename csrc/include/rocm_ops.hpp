@@ -1557,13 +1557,20 @@ namespace py = pybind11;
           py::arg("cta_info"),                           \
           py::arg("out"),                                \
           py::arg("out_offsets"),                        \
+          py::arg("kv_bytes"),                           \
+          py::arg("rows"),                               \
+          py::arg("num_seqs"),                           \
+          py::arg("bt_stride"),                          \
+          py::arg("out_stride"),                         \
           py::arg("instance"),                           \
-          py::arg("mode"),                               \
+          py::arg("schedule_mode"),                      \
           py::arg("weight_scale"),                       \
           py::arg("tpb_shift"),                          \
           py::arg("cta_target"),                         \
           py::arg("prefill_parts"),                      \
-          py::arg("grid"));
+          py::arg("grid"),                               \
+          py::arg("device"),                             \
+          py::arg("stream"));
 
 #define FMHA_FWD_BF16_OPUS_PYBIND                   \
     m.def("fmha_fwd_bf16_opus_fwd",                 \

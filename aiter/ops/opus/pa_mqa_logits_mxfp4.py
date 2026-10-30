@@ -56,14 +56,13 @@ NaN: relu is IEEE ``maximum``. A logit is NaN exactly where a key's or the row's
 scales; the gfx1250 TU is built with -fno-honor-nans).
 """
 
-from __future__ import annotations
-
 import functools
 from dataclasses import dataclass
 
 import torch
 
-from ...jit.core import compile_ops
+from ...jit.core import compile_ops, get_module
+from ...jit.utils.torch_guard import torch_compile_guard
 from ._arch import GFX950, GFX1250, _device_arch
 
 _MD_NAME = "module_pa_mqa_logits_mxfp4_opus"
@@ -73,6 +72,9 @@ TABLE, FREE, PREFILL = 0, 1, 2
 _MODE_NAMES = {"table": TABLE, "free": FREE, "prefill": PREFILL}
 
 _TILE = 64  # keys a KV tile, every instance's (gfx1250's rule tells V4.1 layers by it)
+_TOKEN_BYTES = 64  # a key or a head's query: D = 128 fp4
+_SCALE_BYTES = 4  # its E8M0 scales: D / 32
+_FP4_DTYPES = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
 # Mirrors of the C++ builder's constants (pa_mqa_logits_mxfp4.cu).
 _SCHED_RECORD_INTS = 8
 _SCHED_SCRATCH_RECORDS = 96
@@ -133,10 +135,29 @@ def _build_schedule_raw(
 ) -> None: ...
 
 
-# The tensors lead: compile_ops gives an op whose first argument is not a tensor a dummy one,
-# allocated every call.
-@compile_ops(_MD_NAME, fc_name="mqa_logits_mxfp4_launch", develop=True)
-def _launch_raw(
+# == the launch op ================================================================================
+# A tensor custom op, so torch.compile sees one opaque call that writes `out` only. Its body hands
+# the C++ launch addresses and scalars, not tensors: a pybind tensor descriptor apiece cost the
+# launch more host time than the rest of it, and it runs once a layer, once a band in prefill.
+# Its first parameter is a tensor, so the op takes no dummy one (that needs the annotations
+# evaluated: this module does not postpone them). mqa_logits_mxfp4 checks the tensors.
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None) or (
+    lambda device: torch.cuda.current_stream(device).cuda_stream
+)
+
+
+@functools.cache
+def _launch_fn():
+    # A config's instance query has loaded the module by the first launch.
+    return get_module(_MD_NAME).mqa_logits_mxfp4_launch
+
+
+def _launch_fake(*args, **kwargs) -> None:
+    return None
+
+
+@torch_compile_guard(mutates_args=["out"], device="cuda", gen_fake=_launch_fake)
+def _mqa_logits_mxfp4_launch(
     q: torch.Tensor,
     q_scale: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -148,14 +169,45 @@ def _launch_raw(
     cta_info: torch.Tensor,
     out: torch.Tensor,
     out_offsets: torch.Tensor,
+    rows: int,
+    num_seqs: int,
     instance: int,
-    mode: int,
+    schedule_mode: int,  # not `mode`: auto_functionalized takes that name itself
     weight_scale: float,
     tpb_shift: int,
     cta_target: int,
     prefill_parts: int,
     grid: int,
-) -> None: ...
+) -> None:
+    device = q.get_device()
+    flat = out_offsets.numel() > 0
+    _launch_fn()(
+        q.data_ptr(),
+        q_scale.data_ptr(),
+        kv_cache.data_ptr(),
+        kv_scale.data_ptr(),
+        weights.data_ptr(),
+        block_tables.data_ptr(),
+        query_start_loc.data_ptr(),
+        row_ends.data_ptr(),
+        cta_info.data_ptr() if schedule_mode == TABLE else 0,
+        out.data_ptr(),
+        out_offsets.data_ptr() if flat else 0,
+        kv_cache.numel(),
+        rows,
+        num_seqs,
+        block_tables.stride(0),
+        0 if flat else out.stride(0),
+        instance,
+        schedule_mode,
+        weight_scale,
+        tpb_shift,
+        cta_target,
+        prefill_parts,
+        grid,
+        device,
+        _raw_stream(device),
+    )
 
 
 # == the registry ===================================================================================
@@ -291,7 +343,7 @@ def _matches(inst: _Instance, want: dict) -> bool:
 class MqaLogitsScheduleBuffers:
     """One live schedule's device memory, from :meth:`MqaLogitsConfig.schedule_buffers`."""
 
-    cfg: MqaLogitsConfig
+    cfg: "MqaLogitsConfig"
     cta_info: torch.Tensor  # [num_ctas + scratch, 8] int32 records
     cu_groups: (
         torch.Tensor
@@ -304,7 +356,7 @@ class MqaLogitsSchedule:
     """One forward's Table schedule, bound to its cfg and to the very `query_start_loc` and
     `row_ends` tensors it was built from (the launch checks identity, not contents)."""
 
-    cfg: MqaLogitsConfig
+    cfg: "MqaLogitsConfig"
     query_start_loc: torch.Tensor
     row_ends: torch.Tensor
     cta_info: torch.Tensor
@@ -335,7 +387,6 @@ class MqaLogitsConfig:
     _tpb_shift: int  # log2(tiles a table entry); 0 where a tile spans entries
     _table_slots: int  # the Table grid at the bounds
     _empty_i32: torch.Tensor
-    _empty_i64: torch.Tensor
     _internal: list  # [MqaLogitsScheduleBuffers], built on first need
 
     def schedule_buffers(self) -> MqaLogitsScheduleBuffers:
@@ -532,7 +583,6 @@ def _config(
         _tpb_shift=0 if inst.gather else tpb.bit_length() - 1,
         _table_slots=slots,
         _empty_i32=torch.empty(0, dtype=torch.int32, device=dev),
-        _empty_i64=torch.empty(0, dtype=torch.int64, device=dev),
         _internal=[],
     )
 
@@ -658,8 +708,10 @@ def mqa_logits_mxfp4(
             raise ValueError(
                 f"{cfg.arch}: {name} must be {want}-D, got {tuple(t.shape)}{why}"
             )
-    if q.dim() != 3 or q.shape[1] != cfg.heads:
-        raise ValueError(f"q must be [rows, {cfg.heads}, D/2], got {tuple(q.shape)}")
+    if q.dim() != 3 or q.shape[1] != cfg.heads or q.shape[2] != _TOKEN_BYTES:
+        raise ValueError(
+            f"q must be [rows, {cfg.heads}, {_TOKEN_BYTES}] (D/2 packed fp4), got {tuple(q.shape)}"
+        )
     if kv_cache.shape[page_dim] != cfg.page_size:
         raise ValueError(
             f"kv_cache pages hold {kv_cache.shape[page_dim]} rows; the config is for "
@@ -670,17 +722,72 @@ def mqa_logits_mxfp4(
             f"block_tables must be [seqs, >= {cfg.block_table_width}] (cfg.block_table_width), "
             f"got {tuple(block_tables.shape)}"
         )
-    if weights.dtype != torch.bfloat16:
-        raise ValueError(f"weights must be bf16, got {weights.dtype}")
     rows, seqs = _check_rows(cfg, query_start_loc, row_ends)
     if q.shape[0] != rows:
         raise ValueError(f"q has {q.shape[0]} rows and row_ends {rows}")
+    # The kernels stride every input by compile-time constants but the table's and out's rows, so
+    # a padded or permuted input would be silently wrong. Byte counts catch a wrong array, not a
+    # wrong permutation (the ndim checks above do).
+    if q.dtype not in _FP4_DTYPES or kv_cache.dtype not in _FP4_DTYPES:
+        raise ValueError("q / kv_cache must be fp4x2 (E2M1, 2 a byte) or uint8 bytes")
+    if q_scale.dtype != torch.uint8 or kv_scale.dtype != torch.uint8:
+        raise ValueError("q_scale / kv_scale hold E8M0 bytes and must be uint8")
+    if not (
+        q.is_contiguous()
+        and q_scale.is_contiguous()
+        and kv_cache.is_contiguous()
+        and kv_scale.is_contiguous()
+        and weights.is_contiguous()
+    ):
+        raise ValueError(
+            "q / q_scale / kv_cache / kv_scale / weights must be contiguous"
+        )
+    if q_scale.numel() != rows * cfg.heads * _SCALE_BYTES:
+        raise ValueError(
+            f"q_scale must hold {cfg.heads * _SCALE_BYTES} bytes a row, got {q_scale.numel()} "
+            f"for {rows} rows"
+        )
+    if (
+        kv_cache.numel() % _TOKEN_BYTES
+        or kv_scale.numel() * _TOKEN_BYTES != kv_cache.numel() * _SCALE_BYTES
+    ):
+        raise ValueError(
+            f"kv_cache must be whole {_TOKEN_BYTES}-byte keys and kv_scale {_SCALE_BYTES} bytes "
+            f"a key; got {kv_cache.numel()} and {kv_scale.numel()}"
+        )
+    if (
+        weights.dtype != torch.bfloat16
+        or weights.dim() != 2
+        or weights.shape[0] < rows
+        or weights.shape[1] != cfg.heads
+    ):
+        raise ValueError(
+            f"weights must be bf16 [rows, {cfg.heads}], got {weights.dtype} "
+            f"{tuple(weights.shape)}"
+        )
+    if (
+        block_tables.dtype != torch.int32
+        or block_tables.stride(1) != 1
+        or block_tables.shape[0] < seqs
+    ):
+        raise ValueError(
+            "block_tables must be int32 with a row a sequence and unit column stride"
+        )
 
     if out_offsets is not None:
         if out is None:
             raise ValueError("a flat out (out_offsets) must be passed in")
-        if out_offsets.dtype != torch.int32:
-            raise ValueError(f"out_offsets must be int32, got {out_offsets.dtype}")
+        if (
+            out_offsets.dtype != torch.int32
+            or not out_offsets.is_contiguous()
+            or out_offsets.numel() < rows
+        ):
+            raise ValueError(
+                f"out_offsets must be contiguous int32 with an entry a row, got "
+                f"{out_offsets.dtype} {tuple(out_offsets.shape)}"
+            )
+        if not out.is_contiguous():
+            raise ValueError("a flat out (out_offsets) must be contiguous")
         if not inst.flat_out:
             raise ValueError(
                 f"instance {inst.name} does not write a flat out (out_offsets)"
@@ -689,11 +796,16 @@ def mqa_logits_mxfp4(
         out = torch.full(
             (rows, cfg.max_seq_len), float("-inf"), dtype=torch.float32, device=q.device
         )
-    elif out.dim() != 2 or out.shape[0] < rows or out.shape[1] < cfg.max_seq_len:
+    elif (
+        out.dim() != 2
+        or out.shape[0] < rows
+        or out.shape[1] < cfg.max_seq_len
+        or out.stride(1) != 1
+    ):
         # The kernels bound a row's stores by its row_ends only.
         raise ValueError(
-            f"out must be [>= {rows}, >= {cfg.max_seq_len}] (rows, cfg.max_seq_len), "
-            f"got {tuple(out.shape)}"
+            f"out must be [>= {rows}, >= {cfg.max_seq_len}] (rows, cfg.max_seq_len) with unit "
+            f"column stride, got {tuple(out.shape)} strides {out.stride()}"
         )
     if out.dtype != torch.float32:
         raise ValueError(f"out must be fp32, got {out.dtype}")
@@ -710,6 +822,10 @@ def mqa_logits_mxfp4(
                 "tensors; a schedule is bound to the very tensors it was built from"
             )
         mode, cta_info, grid = TABLE, schedule.cta_info, schedule.num_ctas
+        if cta_info.numel() < grid * _SCHED_RECORD_INTS:
+            raise ValueError(
+                f"a Table launch over {grid} slots needs that many records"
+            )
     elif cfg._mode is not None:
         mode, cta_info = cfg._mode, cfg._empty_i32
         groups = _max_groups(rows, seqs, inst.rows_per_cta)
@@ -726,7 +842,7 @@ def mqa_logits_mxfp4(
         _build(cfg, buf, query_start_loc, row_ends)
         mode, cta_info, grid = TABLE, buf.cta_info, buf.num_ctas
 
-    _launch_raw(
+    _mqa_logits_mxfp4_launch(
         q,
         q_scale,
         kv_cache,
@@ -737,7 +853,9 @@ def mqa_logits_mxfp4(
         row_ends,
         cta_info,
         out,
-        cfg._empty_i64 if out_offsets is None else out_offsets,
+        cfg._empty_i32 if out_offsets is None else out_offsets,
+        rows,
+        seqs,
         inst.id,
         mode,
         float(weight_scale),
