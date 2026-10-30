@@ -36,6 +36,17 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_residual(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    residual: torch.Tensor,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
     inp: torch.Tensor,
@@ -70,6 +81,17 @@ def all_gather_unreg(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_gatherv(
+    _fa: int,
+    inps: list[torch.Tensor],
+    outs: list[torch.Tensor],
+    sizes: list[int],
+    reg_buffer: int,
+    reg_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm(
     _fa: int,
     inp: torch.Tensor,
@@ -82,6 +104,8 @@ def fused_allreduce_rmsnorm(
     reg_bytes: int,
     use_1stage: bool,
     gemma_norm: bool = False,
+    num_norm_rows: int = -1,
+    skip_residual: bool = False,
 ) -> None: ...
 
 
@@ -292,6 +316,40 @@ def all_gather_gfx1250(
 ) -> None: ...
 
 
+@compile_ops(GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm", develop=True)
+def fused_allreduce_rmsnorm_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+    gemma_norm: bool = False,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm_quant", develop=True)
+def fused_allreduce_rmsnorm_quant_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+    gemma_norm: bool = False,
+    bf16_out_ptr: int = 0,
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="p2p_bw_test", develop=True)
 def p2p_bw_test_gfx1250(
     _fa: int,
@@ -364,6 +422,18 @@ def get_graph_buffer_ptrs_gfx1250(_fa: int, ptrs_out: int) -> None: ...
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_graph_buffers", develop=True)
 def register_graph_buffers_gfx1250(_fa: int, ptrs_per_rank: list[int]) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="get_graph_buffer_ipc_meta", develop=True)
+def get_graph_buffer_ipc_meta_gfx1250(
+    _fa: int, handle_out: int, offset_out: int
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="register_graph_buffers_ipc", develop=True)
+def register_graph_buffers_gfx1250_ipc(
+    _fa: int, handle_ptrs: list[int], offset_ptrs: list[int]
+) -> None: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="start_sync_latency", develop=True)
