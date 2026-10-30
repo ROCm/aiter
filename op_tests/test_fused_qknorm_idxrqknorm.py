@@ -1786,6 +1786,8 @@ def run_fused_qknorm_idxrqknorm(
             )
         kv_cache_k = kv_cache[:, 0]
         kv_cache_v = kv_cache[:, 1]
+        if kv_dtype == "mxfp4" and case["num_kv_heads"] == 1:  # separate, contiguous
+            kv_cache_k, kv_cache_v = kv_cache_k.clone(), kv_cache_v.clone()
     index_slot_mapping = case["index_slot_mapping"] if use_index_slot_mapping else None
     index_q_out_arg = index_q_out
     index_cache_arg = index_cache
@@ -2288,6 +2290,7 @@ def check_mxfp4_reject():
         case(block_size=128), mode="mxfp4_kv", kv_dtype="mxfp4", index_dtype="mxfp4"
     )[0][-1]
     q8 = run(case(block_size=128), mode="q_fp8_out", q_dtype=dtypes.fp8)[0][-1]
+    kv_only = run(case(block_size=128), mode="mxfp4_kv", kv_dtype="mxfp4")[0][-1]
     # name -> (call, {positional index: replacement}, kwargs); 14 is V, 15 the index cache
     cases = {
         "good": (page16, {}, {}),
@@ -2318,6 +2321,7 @@ def check_mxfp4_reject():
     for call, gfx, msg in (
         (page16, "gfx942", "gfx950"),
         (kv, "gfx942", "gfx950"),
+        (kv_only, "gfx942", "gfx950"),  # an mxfp4 main K/V alone is refused too
         (q8, "gfx1100", "fp8 q_out"),
     ):
         with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
