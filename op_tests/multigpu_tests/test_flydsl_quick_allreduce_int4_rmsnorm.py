@@ -13,6 +13,12 @@ case:
   (tight: the only difference is the bf16 rounding of the reduced sum that
   the fused kernel skips);
 * bitwise equality of ``out`` / ``residual_out`` across ranks;
+* hidden 6144 on the 12-atom tile, at the world sizes it splits across;
+* where the fused RMSNorm has its own ladder, the same checks again on the
+  mesh ladder, so the fused builds of its super-tiles stay covered;
+* the first fused call inside a HIP graph capture, with no eager call
+  before it: every fused binary of a hidden declared in ``rmsnorm_hidden`` is
+  captured in one graph, at an epsilon other than the default;
 * on gfx950, ``allreduce_rmsnorm_mxfp4``: the same ``out`` / ``residual_out``
   bit for bit, and fp4 bytes plus shuffled e8m0 scales equal to
   ``per_1x32_f4_quant_hip(out, shuffle=True)``.
@@ -38,25 +44,26 @@ import torch
 
 import aiter
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, run_perftest
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+from aiter.ops.flydsl.allreduce_policy import (
+    mesh_norm_ladder,
+    mesh_st_ladder,
+    resolve_link,
+)
+from aiter.ops.flydsl.kernels.comm.allreduce_shared import WORLD
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import (
     DEFAULT_ATOMS,
     WIDE_ATOMS,
-    WORLD,
     max_payload_bytes,
     mxfp4_scale_shape,
     tile_atoms_for,
 )
-from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
 
-try:
-    ARCH = get_gfx_runtime()
-except (KeyError, RuntimeError):
-    ARCH = None
+ARCH = get_gfx()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 EPS = 1e-6
 
@@ -76,7 +83,8 @@ TIGHT_ERR_RATIO = 0.01
 # (tokens, hidden, gemma_norm, inplace_residual). tokens=1 at hidden=2048 is a
 # single partial tile; 37 rows leave a partial last tile at every hidden. Up to
 # 512 tiles (16 MiB) on a 256-CU part run the ST=1 latency build; 1536x8192 and
-# 3072x4096 (768 tiles) the occupancy-pinned ST=1 build; larger ones ST=8.
+# 3072x4096 (768 tiles) the occupancy-pinned ST=1 build; larger ones ST=8 where
+# the ladder has it.
 _VALIDITY_CASES = [
     (1, 2048, False, False),
     (37, 2048, False, False),
@@ -90,14 +98,15 @@ _VALIDITY_CASES = [
     (4096, 8192, True, True),
     (16384, 8192, False, False),
 ]
-# Hidden 6144 runs on the 48 KiB tile, which splits across TP 2 and 4 only.
+# Hidden 6144 runs on the 12-atom tile, which splits across TP 2 and 4 only.
+WIDE_HIDDEN = 6144
 _WIDE_CASES = [
-    (1, 6144, True, False),
-    (37, 6144, True, True),
-    (37, 6144, False, False),
-    (512, 6144, True, False),
-    (4096, 6144, True, True),
-    (16384, 6144, False, False),
+    (1, WIDE_HIDDEN, True, False),
+    (37, WIDE_HIDDEN, True, True),
+    (37, WIDE_HIDDEN, False, False),
+    (512, WIDE_HIDDEN, True, False),
+    (4096, WIDE_HIDDEN, True, True),
+    (16384, WIDE_HIDDEN, False, False),
 ]
 
 
@@ -109,10 +118,10 @@ def _sqnr_db(got: torch.Tensor, ref: torch.Tensor) -> float:
     return float(10.0 * torch.log10(pow_ / mse))
 
 
-def _ref_add_rmsnorm(ar, res, weight, gemma_norm):
+def _ref_add_rmsnorm(ar, res, weight, gemma_norm, eps=EPS):
     z = ar.float() + res.float()
     w = weight.float() + 1.0 if gemma_norm else weight.float()
-    rstd = torch.rsqrt(z.pow(2).mean(dim=-1, keepdim=True) + EPS)
+    rstd = torch.rsqrt(z.pow(2).mean(dim=-1, keepdim=True) + eps)
     return (z * rstd * w).to(torch.bfloat16), z.to(torch.bfloat16)
 
 
@@ -159,7 +168,7 @@ def _unfused_mxfp4(fly, inp, res, weight, out, ar, res_t, q, q_s, *, gemma_norm)
     aiter.per_1x32_f4_quant_hip(out, shuffle=True)
 
 
-def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
+def _run_rank(rank, tp, init_method, cases, time_it, norm_ladder):
     import torch.distributed as dist
 
     from aiter.ops.flydsl import QuickAllReduceInt4
@@ -176,37 +185,18 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
     fly = QuickAllReduceInt4(
-        group=gloo, device=device, rank=rank, world_size=tp, grid_cap=grid_cap
+        group=gloo,
+        device=device,
+        rank=rank,
+        world_size=tp,
+        min_bytes=0,
+        norm_ladder=norm_ladder,
+        rmsnorm_hidden=tuple(sorted({c[1] for c in cases})),
     )
-    wide_atoms = tile_atoms_for(6144, tp)
-    if wide_atoms is not None and wide_atoms != DEFAULT_ATOMS:
-        is_capturing = torch.cuda.is_current_stream_capturing
-        try:
-            torch.cuda.is_current_stream_capturing = lambda: True
-            assert not fly.supports_rmsnorm(6144, 6144 * 2)
-        finally:
-            torch.cuda.is_current_stream_capturing = is_capturing
-        fly.prepare_rmsnorm(6144)
-        try:
-            torch.cuda.is_current_stream_capturing = lambda: True
-            assert fly.supports_rmsnorm(6144, 6144 * 2)
-        finally:
-            torch.cuda.is_current_stream_capturing = is_capturing
     rows = []
-    # compile_rmsnorm must cover every fused build the cases pick: a case that
-    # adds one to the cache compiled it on its first call.
-    for hidden, gemma_norm in sorted({(c[1], c[2]) for c in cases}):
-        for mxfp4 in (False, True) if fly.supports_mxfp4 else (False,):
-            fly.compile_rmsnorm(hidden, EPS, gemma_norm=gemma_norm, mxfp4=mxfp4)
-
-    def _norm_launch_sets():
-        return [
-            set(e._norm_launch)
-            for engines in [fly._by_st, *fly._by_atoms.values()]
-            for e in engines.values()
-        ]
-
-    warmed = _norm_launch_sets()
+    # The constructor must prepare every fused build the cases pick: a case
+    # that adds one to the cache compiled it on its first call.
+    warmed = set(fly._norm_launch)
     try:
         for ntok, hidden, gemma_norm, inplace in cases:
             gen = torch.Generator().manual_seed(1234 + rank)
@@ -245,34 +235,56 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
             dist.all_gather(gathered, res_out, group=group)
             same_res = all(torch.equal(g, gathered[0]) for g in gathered)
 
+            # The unfused all-reduce takes the mesh ladder's pick and the fused
+            # one its own ladder's. The block and the tile width set the tile,
+            # and so which rank owns, and keeps unquantized, each element;
+            # when they differ, only the SQNR check against the fp32
+            # reference is meaningful. Hidden 6144 always runs on a wider tile
+            # than the unfused all-reduce.
+            nbytes = inp.numel() * inp.element_size()
+            fused_cfg = fly._norm_cfg(nbytes, hidden)[0]
+            same_cfg = (
+                fly._pick_cfg(nbytes)[0][1] == fused_cfg[1]
+                and tile_atoms_for(hidden, tp, fused_cfg[1]) == DEFAULT_ATOMS
+            )
+
             tag = f"rank {rank} {ntok}x{hidden} gemma={gemma_norm}"
             row = {
                 "tokens": ntok,
                 "hidden": hidden,
                 "gemma": gemma_norm,
                 "inplace": inplace,
+                "fused_cfg": fused_cfg,
                 "sqnr_out_db": _sqnr_db(out.float(), ref_out.float()),
                 "sqnr_res_db": _sqnr_db(res_out.float(), ref_res.float()),
-                "err_out_vs_unfused": float(
-                    checkAllclose(
-                        unf_out.float(),
-                        out.float(),
-                        rtol=TIGHT_RTOL,
-                        atol=TIGHT_ATOL,
-                        tol_err_ratio=TIGHT_ERR_RATIO,
-                        printLog=False,
-                        msg=f"{tag} out",
+                "err_out_vs_unfused": (
+                    0.0
+                    if not same_cfg
+                    else float(
+                        checkAllclose(
+                            unf_out.float(),
+                            out.float(),
+                            rtol=TIGHT_RTOL,
+                            atol=TIGHT_ATOL,
+                            tol_err_ratio=TIGHT_ERR_RATIO,
+                            printLog=False,
+                            msg=f"{tag} out",
+                        )
                     )
                 ),
-                "err_res_vs_unfused": float(
-                    checkAllclose(
-                        unf_res.float(),
-                        res_out.float(),
-                        rtol=TIGHT_RTOL,
-                        atol=TIGHT_ATOL,
-                        tol_err_ratio=TIGHT_ERR_RATIO,
-                        printLog=False,
-                        msg=f"{tag} residual_out",
+                "err_res_vs_unfused": (
+                    0.0
+                    if not same_cfg
+                    else float(
+                        checkAllclose(
+                            unf_res.float(),
+                            res_out.float(),
+                            rtol=TIGHT_RTOL,
+                            atol=TIGHT_ATOL,
+                            tol_err_ratio=TIGHT_ERR_RATIO,
+                            printLog=False,
+                            msg=f"{tag} residual_out",
+                        )
                     )
                 ),
                 "ranks_equal": same_out and same_res,
@@ -326,15 +338,15 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
                     )
             rows.append(row)
             dist.barrier(group=group)
-        if _norm_launch_sets() != warmed:
-            raise AssertionError("a case compiled a fused build compile_rmsnorm missed")
+        if set(fly._norm_launch) != warmed:
+            raise AssertionError("a case compiled a fused build rmsnorm_hidden missed")
     finally:
         fly.close()
         dist.destroy_process_group()
     return rows
 
 
-def _spawn(tp, cases, *, time_it, grid_cap):
+def _spawn(tp, cases, *, time_it, norm_ladder=None):
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
     pool = Pool(processes=tp)
@@ -342,7 +354,7 @@ def _spawn(tp, cases, *, time_it, grid_cap):
         futs = [
             pool.apply_async(
                 _run_rank,
-                args=(rank, tp, init_method, cases, time_it, grid_cap),
+                args=(rank, tp, init_method, cases, time_it, norm_ladder),
             )
             for rank in range(tp)
         ]
@@ -355,6 +367,190 @@ def _spawn(tp, cases, *, time_it, grid_cap):
     finally:
         pool.join()
     return ranks
+
+
+CAPTURE_HIDDEN = 4096
+CAPTURE_TOKENS = (37, 3072)
+CAPTURE_EPS = 0.5
+
+
+def _capture_first_rank(rank, tp, init_method, norm_ladder, hidden):
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        world_size=tp,
+        rank=rank,
+        device_id=device,
+    )
+    gloo = dist.new_group(backend="gloo")
+    group = dist.group.WORLD
+    fly = QuickAllReduceInt4(
+        group=gloo,
+        device=device,
+        rank=rank,
+        world_size=tp,
+        min_bytes=0,
+        norm_ladder=norm_ladder,
+        rmsnorm_hidden=(hidden,),
+    )
+    res = {"capture_error": None, "rows": []}
+    try:
+        built = set(fly._norm_launch)
+        res["unloaded"] = sum(not launcher_loaded(fly._norm_launch[k]) for k in built)
+        calls = []
+        for ntok in CAPTURE_TOKENS:
+            for gemma_norm in (False, True):
+                for mxfp4 in (False, True) if fly.supports_mxfp4 else (False,):
+                    gen = torch.Generator().manual_seed(1234 + rank + ntok)
+                    inp = (torch.randn((ntok, hidden), generator=gen) * 0.1).to(
+                        device=device, dtype=torch.bfloat16
+                    )
+                    shared = torch.Generator().manual_seed(99 + ntok)
+                    resid = torch.randn((ntok, hidden), generator=shared).to(
+                        device=device, dtype=torch.bfloat16
+                    )
+                    weight = (
+                        torch.randn((hidden,), generator=shared) * 0.2
+                        + (0.0 if gemma_norm else 1.0)
+                    ).to(device=device, dtype=torch.bfloat16)
+                    ref_ar = inp.float()
+                    dist.all_reduce(ref_ar, group=group)
+                    calls.append(
+                        {
+                            "tokens": ntok,
+                            "gemma": gemma_norm,
+                            "mxfp4": mxfp4,
+                            "args": (inp, resid, weight),
+                            "out": torch.empty_like(inp),
+                            "res_out": torch.empty_like(inp),
+                            "q": _mxfp4_buffers(ntok, hidden, device),
+                            "ref": _ref_add_rmsnorm(
+                                ref_ar, resid, weight, gemma_norm, CAPTURE_EPS
+                            ),
+                        }
+                    )
+        torch.cuda.synchronize()
+
+        def _call(c):
+            inp, resid, weight = c["args"]
+            if c["mxfp4"]:
+                fly.allreduce_rmsnorm_mxfp4(
+                    inp,
+                    resid,
+                    weight,
+                    CAPTURE_EPS,
+                    c["out"],
+                    c["res_out"],
+                    *c["q"],
+                    gemma_norm=c["gemma"],
+                )
+            else:
+                fly.allreduce_rmsnorm(
+                    inp,
+                    resid,
+                    weight,
+                    CAPTURE_EPS,
+                    c["out"],
+                    c["res_out"],
+                    gemma_norm=c["gemma"],
+                )
+
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                for c in calls:
+                    _call(c)
+        except Exception as exc:  # noqa: BLE001 -- reported, and ends the test
+            res["capture_error"] = f"{type(exc).__name__}: {exc}"
+        errors = [None] * tp
+        dist.all_gather_object(errors, res["capture_error"], group=gloo)
+        # Replay only if every rank captured: the graph launches peers' kernels.
+        if not any(errors):
+            graph.replay()
+            torch.cuda.synchronize()
+            for c in calls:
+                ref_out, ref_res = c["ref"]
+                row = {
+                    "tokens": c["tokens"],
+                    "gemma": c["gemma"],
+                    "mxfp4": c["mxfp4"],
+                    "sqnr_out_db": _sqnr_db(c["out"].float(), ref_out.float()),
+                    "sqnr_res_db": _sqnr_db(c["res_out"].float(), ref_res.float()),
+                    "mxfp4_equal": None,
+                }
+                if c["mxfp4"]:
+                    ref_q, ref_s = aiter.per_1x32_f4_quant_hip(c["out"], shuffle=True)
+                    live = _live_scale_idx(c["tokens"], hidden, device)
+                    q, q_s = c["q"]
+                    row["mxfp4_equal"] = torch.equal(
+                        q, ref_q.view(torch.uint8)
+                    ) and torch.equal(
+                        q_s.flatten()[live], ref_s.view(torch.uint8).flatten()[live]
+                    )
+                res["rows"].append(row)
+        res["compiled_in_capture"] = len(set(fly._norm_launch) - built)
+
+        # A width that was never prepared cannot be prepared under capture.
+        inp = torch.zeros((1, 2 * hidden), dtype=torch.bfloat16, device=device)
+        weight = torch.zeros(2 * hidden, dtype=torch.bfloat16, device=device)
+        res["unprepared_error"] = None
+        try:
+            with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+                fly.allreduce_rmsnorm(
+                    inp, inp.clone(), weight, CAPTURE_EPS, inp.clone(), inp.clone()
+                )
+        except RuntimeError as exc:
+            res["unprepared_error"] = str(exc)
+        dist.barrier(group=gloo)
+    finally:
+        fly.close()
+        dist.destroy_process_group()
+    return res
+
+
+def test_first_call_in_capture(tp, norm_ladder=None, hidden=CAPTURE_HIDDEN):
+    """The first fused call is inside a graph capture."""
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with Pool(processes=tp) as pool:
+        futs = [
+            pool.apply_async(
+                _capture_first_rank,
+                args=(rank, tp, init_method, norm_ladder, hidden),
+            )
+            for rank in range(tp)
+        ]
+        ranks = [
+            f.get(timeout=float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600")))
+            for f in futs
+        ]
+    fails = []
+    for rank, r in enumerate(ranks):
+        where = f"rank {rank}"
+        if r["capture_error"]:
+            fails.append(f"{where}: capture failed: {r['capture_error']}")
+        if r["unloaded"]:
+            fails.append(f"{where}: {r['unloaded']} fused builds not loaded at init")
+        if r["compiled_in_capture"]:
+            fails.append(f"{where}: the capture built {r['compiled_in_capture']}")
+        if not r["unprepared_error"] or "rmsnorm_hidden" not in r["unprepared_error"]:
+            fails.append(f"{where}: unprepared hidden under capture did not raise")
+        for row in r["rows"]:
+            for key in ("sqnr_out_db", "sqnr_res_db"):
+                if row[key] < SQNR_MIN_DB:
+                    fails.append(f"{where} {row}: {key} < {SQNR_MIN_DB}")
+            if row["mxfp4_equal"] is False:
+                fails.append(f"{where} {row}: MXFP4 differs")
+    if fails:
+        raise AssertionError("; ".join(fails))
+    return ranks[0]["rows"]
 
 
 def _assert_valid(ranks, cases):
@@ -376,13 +572,55 @@ def _assert_valid(ranks, cases):
         raise AssertionError("; ".join(fails))
 
 
+def _validate(tp):
+    """Validity, on the fused RMSNorm's own ladder and on the mesh ladder
+    where the two differ, and the first fused call inside a graph capture."""
+    wide = tile_atoms_for(WIDE_HIDDEN, tp) is not None
+    cases = _VALIDITY_CASES + (_WIDE_CASES if wide else [])
+    ranks = _spawn(tp, cases, time_it=False)
+    _assert_valid(ranks, cases)
+    aiter.logger.info(
+        "validity tp=%s (rank 0):\n%s",
+        tp,
+        pd.DataFrame(ranks[0]).to_markdown(index=False),
+    )
+    link = resolve_link(None)
+    mesh = mesh_st_ladder(world_size=tp, link=link)
+    own_ladder = mesh_norm_ladder(world_size=tp, link=link) != mesh
+    if own_ladder:
+        ranks = _spawn(tp, cases, time_it=False, norm_ladder=mesh)
+        _assert_valid(ranks, cases)
+        aiter.logger.info(
+            "validity tp=%s on the mesh ladder (rank 0):\n%s",
+            tp,
+            pd.DataFrame(ranks[0]).to_markdown(index=False),
+        )
+    for ladder, label in (
+        (None, ""),
+        *(((mesh, " on the mesh ladder"),) if own_ladder else ()),
+    ):
+        for hidden in (CAPTURE_HIDDEN, *((WIDE_HIDDEN,) if wide else ())):
+            rows = test_first_call_in_capture(tp, norm_ladder=ladder, hidden=hidden)
+            aiter.logger.info(
+                "first call in capture tp=%s hidden=%s%s (rank 0):\n%s",
+                tp,
+                hidden,
+                label,
+                pd.DataFrame(rows).to_markdown(index=False),
+            )
+
+
 def main():
     if ARCH not in SUPPORTED_ARCHS:
         aiter.logger.warning("QuickAllReduceInt4 unsupported on %s; skipping", ARCH)
         return
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tp", type=int, default=WORLD)
-    parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=WORLD,
+        help="world size of the sweep; validity runs at every world size that fits.",
+    )
     parser.add_argument(
         "--bench",
         type=str,
@@ -392,34 +630,23 @@ def main():
     )
     args = parser.parse_args()
     n_gpu = torch.cuda.device_count()
-
-    wide_hidden = _WIDE_CASES[0][1]
     for tp in (WORLD, 4, 2):
         if n_gpu < tp:
             aiter.logger.warning(
-                "QuickAllReduceInt4 needs %s GPUs, have %s; skipping validity tp=%s",
+                "QuickAllReduceInt4 needs %s GPUs, have %s; skipping tp=%s",
                 tp,
                 n_gpu,
                 tp,
             )
             continue
-        cases = list(_VALIDITY_CASES)
-        if tile_atoms_for(wide_hidden, tp) is not None:
-            cases += _WIDE_CASES
-        ranks = _spawn(tp, cases, time_it=False, grid_cap=args.grid_cap)
-        _assert_valid(ranks, cases)
-        aiter.logger.info(
-            "validity tp=%s (rank 0):\n%s",
-            tp,
-            pd.DataFrame(ranks[0]).to_markdown(index=False),
-        )
+        _validate(tp)
 
     bench = []
     for pair in args.bench:
         t, h = (int(x) for x in pair.split(","))
         bench.append((t, h, False, False))
     if bench and n_gpu >= args.tp:
-        ranks = _spawn(args.tp, bench, time_it=True, grid_cap=args.grid_cap)
+        ranks = _spawn(args.tp, bench, time_it=True)
         _assert_valid(ranks, bench)
         has_mxfp4 = ARCH == "gfx950"
         df = pd.DataFrame(
