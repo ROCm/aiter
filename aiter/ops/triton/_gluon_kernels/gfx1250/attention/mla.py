@@ -2747,6 +2747,82 @@ def _mla_prefill_fwd_kernel_non_pipelined(
     )
 
 
+@gluon.jit
+def _mla_decode_tile_attend(
+    cfg,
+    Q_lora,
+    Q_rope,
+    kv_lora_shared,
+    k_rope_shared,
+    qk_factor,
+    seq_offset,
+    context_len,
+    query_pos_qk,
+    query_mask_0_qk,
+    query_mask_1_qk,
+    M,
+    L,
+    acc,
+    BLOCK_M: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    IS_Q_FP8: gl.constexpr,
+    IS_KV_FP8: gl.constexpr,
+):
+    """Online-softmax update of (M, L, acc) with the KV tile staged in shared
+    memory (the body of the non-pipelined decode tile loop)."""
+    S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
+
+    KV_lora = kv_lora_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
+    S = gl.amd.gfx1250.wmma(Q_lora, KV_lora.to(Q_lora.dtype), S)
+    K_rope = k_rope_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
+    S = gl.amd.gfx1250.wmma(Q_rope, K_rope.to(Q_lora.dtype), S) * qk_factor
+
+    seq_mask = seq_offset[None, :] < context_len + query_pos_qk[:, None] + 1
+
+    S = gl.where(
+        query_mask_1_qk[:, None] & query_mask_0_qk[:, None] & seq_mask,
+        S,
+        float("-inf"),
+    )
+
+    # compute running maximum
+    # m_j : (BLOCK_M,)
+    m_j = gl.maximum(M, gl.max(S, axis=1))
+
+    # For sliding window there's a chance the max is -inf due to masking of
+    # the entire row. In this case we need to set m_j 0 to avoid NaN
+    m_j = gl.where(m_j > float("-inf"), m_j, 0.0)
+
+    # P : (BLOCK_M, TILE_SIZE,)
+    P = gl.exp2(S - m_j[:, None])
+
+    # l_j : (BLOCK_M,)
+    l_j = gl.sum(P, axis=1)
+
+    # alpha : (BLOCK_M, )
+    alpha = gl.exp2(M - m_j)
+
+    # acc : (BLOCK_M, KV_LORA_RANK)
+    acc = acc * gl.convert_layout(alpha[:, None], layout=cfg.PV_WMMA_LAYOUT)
+
+    # update constants
+    L = L * alpha + l_j
+    M = m_j
+
+    # acc : (BLOCK_M, KV_LORA_RANK)
+    KV_lora_trans = kv_lora_shared.load(layout=cfg.V_DOT_LAYOUT)
+    if IS_Q_FP8 and IS_KV_FP8:
+        P = P.to(KV_lora_trans.dtype)
+    elif IS_KV_FP8:
+        P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
+        KV_lora_trans = KV_lora_trans.to(gl.bfloat16)
+    else:
+        P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
+    P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
+    acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
+    return M, L, acc
+
+
 _mla_decode_fwd_kernel_non_pipelined_repr = make_kernel_repr(
     "_mla_decode_fwd_kernel_non_pipelined",
     [
@@ -2774,8 +2850,8 @@ def _mla_decode_fwd_kernel_non_pipelined(
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
     query_scales_ptr,  # nvfp4 query scales (unused for non-shuffled bf16/fp8)
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
-    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
-    seq_lens_ptr,  # [num_seqs]
+    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq] (KV_INDPTR_TABLE: kv_indices)
+    seq_lens_ptr,  # [num_seqs] (KV_INDPTR_TABLE: kv_indptr [num_seqs + 1])
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
@@ -2793,7 +2869,7 @@ def _mla_decode_fwd_kernel_non_pipelined(
     stride_kv_buffer_1: gl.int64,  # int
     stride_kv_buffer_2: gl.int64,  # int
     stride_kv_buffer_3: gl.constexpr,  # int
-    query_start_len_ptr,  # [num_seqs+1]
+    query_start_len_ptr,  # [num_seqs+1], or None: seq i owns rows i*num_tokens_per_seq..
     num_tokens_per_seq: gl.int32,
     num_blocks: gl.int32,
     TILE_SIZE: gl.constexpr,  # int
@@ -2812,6 +2888,9 @@ def _mla_decode_fwd_kernel_non_pipelined(
     QUERY_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
     KV_CACHE_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
+    # Page-size-1 KV [num_tokens, 1, H_kv, D]: block_tables_ptr is kv_indices
+    # and seq_lens_ptr is kv_indptr.
+    KV_INDPTR_TABLE: gl.constexpr = False,  # bool
 ):
     assert not SHUFFLED_KV_CACHE
     # Non-shuffled KV cache only supports bf16/fp8 query: nvfp4 query requires a
@@ -2858,7 +2937,11 @@ def _mla_decode_fwd_kernel_non_pipelined(
     else:
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
 
-    q_start_idx = gl.load(query_start_len_ptr + seq_idx)
+    if query_start_len_ptr is None:
+        # Rows map to sequences positionally (num_tokens_per_seq rows each).
+        q_start_idx = seq_idx * num_tokens_per_seq
+    else:
+        q_start_idx = gl.load(query_start_len_ptr + seq_idx)
     q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
 
     token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
@@ -2866,13 +2949,19 @@ def _mla_decode_fwd_kernel_non_pipelined(
     head_offset = head_block_idx * BLOCK_M
 
     # sequence len for this particular sequence
-    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    if KV_INDPTR_TABLE:
+        kv_start_idx = gl.load(seq_lens_ptr + seq_idx)
+        seq_len = gl.load(seq_lens_ptr + seq_idx + 1) - kv_start_idx
+    else:
+        seq_len = gl.load(seq_lens_ptr + seq_idx)
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    # A zero-length row (CUDA-graph padding) still runs segment 0 over no
+    # tiles, so its result is zero instead of unwritten.
+    if segm_idx * tiles_per_segment * TILE_SIZE >= gl.maximum(seq_len, 1):
         return
 
     q_lora_shared = gl.allocate_shared_memory(
@@ -3010,7 +3099,10 @@ def _mla_decode_fwd_kernel_non_pipelined(
     query_mask_1_qk = query_offset_1_qk < num_query_heads
     offs_seq_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT))
 
-    block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_tables_stride
+    if KV_INDPTR_TABLE:
+        block_tables_ptr_shifted = block_tables_ptr + kv_start_idx.to(gl.int64)
+    else:
+        block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_tables_stride
 
     M = gl.full(
         [BLOCK_M],
@@ -3046,92 +3138,228 @@ def _mla_decode_fwd_kernel_non_pipelined(
 
     seq_offset = segm_idx * tiles_per_segment * TILE_SIZE + offs_seq_t
 
-    # iterate through tiles within current segment
-    for j in range(
-        segm_idx * tiles_per_segment,
-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
-    ):
-        physical_block_idx = gl.load(block_tables_ptr_shifted + j).to(gl.int64)
-
-        kv_offset = (
-            physical_block_idx * stride_kv_buffer_0 + kv_head_idx * stride_kv_buffer_2
+    if KV_INDPTR_TABLE:
+        # Read each full tile as one run of rows (scalar base + arange, as in
+        # the paged loop) and check its indices. A segment with a scattered
+        # tile, and the last partial tile, are read row by row.
+        j_begin = segm_idx * tiles_per_segment
+        j_end = gl.minimum((segm_idx + 1) * tiles_per_segment, num_tiles)
+        j_full_end = gl.maximum(gl.minimum(j_end, seq_len // TILE_SIZE), j_begin)
+        CHECK_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1],
+            threads_per_warp=[WARP_SIZE],
+            warps_per_cta=[num_warps],
+            order=[0],
         )
-
-        kv_lora_offset = (
-            kv_offset
-            + offs_kv_t_lora[:, None] * stride_kv_buffer_1
-            + offs_kv_d_lora[None, :] * stride_kv_buffer_3
+        offs_check = gl.arange(0, TILE_SIZE, layout=CHECK_LAYOUT)
+        not_a_run = gl.zeros([TILE_SIZE], dtype=gl.int32, layout=CHECK_LAYOUT)
+        next_tile_row = gl.load(
+            block_tables_ptr_shifted + j_begin * TILE_SIZE,
+            mask=j_begin < j_full_end,
+            other=0,
         )
-        # KV_lora : (BLOCK_M, KV_LORA_RANK)
-        KV_lora_load = gl.load(
-            kv_buffer_ptr + kv_lora_offset,
-            cache_modifier=cfg.kv_cache_modifier,
+        for j in range(j_begin, j_full_end):
+            # Clamped so a speculative read stays inside kv_buffer; a clamped
+            # base fails the check below.
+            tile_row = gl.maximum(gl.minimum(next_tile_row, num_blocks - TILE_SIZE), 0)
+            next_tile_row = gl.load(
+                block_tables_ptr_shifted + gl.minimum((j + 1) * TILE_SIZE, seq_len - 1)
+            )
+            tile_offset = (
+                tile_row.to(gl.int64) * stride_kv_buffer_0
+                + kv_head_idx * stride_kv_buffer_2
+            )
+            # Add the full offset to the pointer in one step, as the paged
+            # loop does, so that the loads stay vectorized.
+            kv_lora_offset = (
+                tile_offset
+                + offs_kv_t_lora[:, None] * stride_kv_buffer_0
+                + offs_kv_d_lora[None, :] * stride_kv_buffer_3
+            )
+            # KV_lora : (TILE_SIZE, KV_LORA_RANK)
+            KV_lora_load = gl.load(
+                kv_buffer_ptr + kv_lora_offset,
+                cache_modifier=cfg.kv_cache_modifier,
+            )
+            kv_lora_shared.store(KV_lora_load)
+            k_rope_offset = (
+                tile_offset
+                + offs_k_t_rope[:, None] * stride_kv_buffer_0
+                + (KV_LORA_RANK + offs_k_d_rope[None, :]) * stride_kv_buffer_3
+            )
+            # K_rope : (TILE_SIZE, QK_ROPE_HEAD_DIM)
+            K_rope_load = gl.load(
+                kv_buffer_ptr + k_rope_offset,
+                cache_modifier=cfg.kv_cache_modifier,
+            )
+            tile_rows = gl.load(block_tables_ptr_shifted + j * TILE_SIZE + offs_check)
+            not_a_run = not_a_run | (tile_rows != tile_row + offs_check).to(gl.int32)
+            k_rope_shared.store(K_rope_load)
+            M, L, acc = _mla_decode_tile_attend(
+                cfg,
+                Q_lora,
+                Q_rope,
+                kv_lora_shared,
+                k_rope_shared,
+                qk_factor,
+                seq_offset,
+                context_len,
+                query_pos_qk,
+                query_mask_0_qk,
+                query_mask_1_qk,
+                M,
+                L,
+                acc,
+                BLOCK_M,
+                TILE_SIZE,
+                IS_Q_FP8,
+                IS_KV_FP8,
+            )
+            seq_offset += TILE_SIZE
+        # Any scattered tile: drop the speculative result, redo the segment.
+        redo = gl.sum(not_a_run, axis=0) != 0
+        j_gather_begin = j_full_end - (j_full_end - j_begin) * redo.to(gl.int32)
+        M = gl.where(redo, float("-inf"), M)
+        L = gl.where(redo, 1.0, L)
+        acc = gl.where(redo, 0.0, acc)
+        seq_offset = gl.where(
+            redo, segm_idx * tiles_per_segment * TILE_SIZE + offs_seq_t, seq_offset
         )
-        kv_lora_shared.store(KV_lora_load)
+        for j in range(j_gather_begin, j_end):
+            # Row by row; positions past seq_len reuse the last row (a written
+            # KV row) and are masked out of S.
+            tok_lora = gl.minimum(j * TILE_SIZE + offs_kv_t_lora, seq_len - 1)
+            row_lora = gl.load(block_tables_ptr_shifted + tok_lora).to(gl.int64)
+            kv_lora_offset = (
+                row_lora[:, None] * stride_kv_buffer_0
+                + kv_head_idx * stride_kv_buffer_2
+                + offs_kv_d_lora[None, :] * stride_kv_buffer_3
+            )
+            KV_lora_load = gl.load(
+                kv_buffer_ptr + kv_lora_offset,
+                cache_modifier=cfg.kv_cache_modifier,
+            )
+            kv_lora_shared.store(KV_lora_load)
+            tok_rope = gl.minimum(j * TILE_SIZE + offs_k_t_rope, seq_len - 1)
+            row_rope = gl.load(block_tables_ptr_shifted + tok_rope).to(gl.int64)
+            k_rope_offset = (
+                row_rope[:, None] * stride_kv_buffer_0
+                + kv_head_idx * stride_kv_buffer_2
+                + (KV_LORA_RANK + offs_k_d_rope[None, :]) * stride_kv_buffer_3
+            )
+            K_rope_load = gl.load(
+                kv_buffer_ptr + k_rope_offset,
+                cache_modifier=cfg.kv_cache_modifier,
+            )
+            k_rope_shared.store(K_rope_load)
+            M, L, acc = _mla_decode_tile_attend(
+                cfg,
+                Q_lora,
+                Q_rope,
+                kv_lora_shared,
+                k_rope_shared,
+                qk_factor,
+                seq_offset,
+                context_len,
+                query_pos_qk,
+                query_mask_0_qk,
+                query_mask_1_qk,
+                M,
+                L,
+                acc,
+                BLOCK_M,
+                TILE_SIZE,
+                IS_Q_FP8,
+                IS_KV_FP8,
+            )
+            seq_offset += TILE_SIZE
+    else:
+        # iterate through tiles within current segment
+        for j in range(
+            segm_idx * tiles_per_segment,
+            min((segm_idx + 1) * tiles_per_segment, num_tiles),
+        ):
+            physical_block_idx = gl.load(block_tables_ptr_shifted + j).to(gl.int64)
 
-        k_rope_offset = (
-            kv_offset
-            + offs_k_t_rope[:, None] * stride_kv_buffer_1
-            + (KV_LORA_RANK + offs_k_d_rope[None, :]) * stride_kv_buffer_3
-        )
-        # K_rope : (BLOCK_M, QK_ROPE_HEAD_DIM)
-        K_rope_load = gl.load(
-            kv_buffer_ptr + k_rope_offset,
-            cache_modifier=cfg.kv_cache_modifier,
-        )
-        k_rope_shared.store(K_rope_load)
+            kv_offset = (
+                physical_block_idx * stride_kv_buffer_0 + kv_head_idx * stride_kv_buffer_2
+            )
 
-        S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
+            kv_lora_offset = (
+                kv_offset
+                + offs_kv_t_lora[:, None] * stride_kv_buffer_1
+                + offs_kv_d_lora[None, :] * stride_kv_buffer_3
+            )
+            # KV_lora : (BLOCK_M, KV_LORA_RANK)
+            KV_lora_load = gl.load(
+                kv_buffer_ptr + kv_lora_offset,
+                cache_modifier=cfg.kv_cache_modifier,
+            )
+            kv_lora_shared.store(KV_lora_load)
 
-        KV_lora = kv_lora_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
-        S = gl.amd.gfx1250.wmma(Q_lora, KV_lora.to(Q_lora.dtype), S)
-        K_rope = k_rope_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
-        S = gl.amd.gfx1250.wmma(Q_rope, K_rope.to(Q_lora.dtype), S) * qk_factor
+            k_rope_offset = (
+                kv_offset
+                + offs_k_t_rope[:, None] * stride_kv_buffer_1
+                + (KV_LORA_RANK + offs_k_d_rope[None, :]) * stride_kv_buffer_3
+            )
+            # K_rope : (BLOCK_M, QK_ROPE_HEAD_DIM)
+            K_rope_load = gl.load(
+                kv_buffer_ptr + k_rope_offset,
+                cache_modifier=cfg.kv_cache_modifier,
+            )
+            k_rope_shared.store(K_rope_load)
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos_qk[:, None] + 1
+            S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
 
-        S = gl.where(
-            query_mask_1_qk[:, None] & query_mask_0_qk[:, None] & seq_mask,
-            S,
-            float("-inf"),
-        )
+            KV_lora = kv_lora_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
+            S = gl.amd.gfx1250.wmma(Q_lora, KV_lora.to(Q_lora.dtype), S)
+            K_rope = k_rope_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
+            S = gl.amd.gfx1250.wmma(Q_rope, K_rope.to(Q_lora.dtype), S) * qk_factor
 
-        # compute running maximum
-        # m_j : (BLOCK_M,)
-        m_j = gl.maximum(M, gl.max(S, axis=1))
+            seq_mask = seq_offset[None, :] < context_len + query_pos_qk[:, None] + 1
 
-        # For sliding window there's a chance the max is -inf due to masking of
-        # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = gl.where(m_j > float("-inf"), m_j, 0.0)
+            S = gl.where(
+                query_mask_1_qk[:, None] & query_mask_0_qk[:, None] & seq_mask,
+                S,
+                float("-inf"),
+            )
 
-        # P : (BLOCK_M, TILE_SIZE,)
-        P = gl.exp2(S - m_j[:, None])
+            # compute running maximum
+            # m_j : (BLOCK_M,)
+            m_j = gl.maximum(M, gl.max(S, axis=1))
 
-        # l_j : (BLOCK_M,)
-        l_j = gl.sum(P, axis=1)
+            # For sliding window there's a chance the max is -inf due to masking of
+            # the entire row. In this case we need to set m_j 0 to avoid NaN
+            m_j = gl.where(m_j > float("-inf"), m_j, 0.0)
 
-        # alpha : (BLOCK_M, )
-        alpha = gl.exp2(M - m_j)
+            # P : (BLOCK_M, TILE_SIZE,)
+            P = gl.exp2(S - m_j[:, None])
 
-        # acc : (BLOCK_M, KV_LORA_RANK)
-        acc = acc * gl.convert_layout(alpha[:, None], layout=cfg.PV_WMMA_LAYOUT)
+            # l_j : (BLOCK_M,)
+            l_j = gl.sum(P, axis=1)
 
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
+            # alpha : (BLOCK_M, )
+            alpha = gl.exp2(M - m_j)
 
-        # acc : (BLOCK_M, KV_LORA_RANK)
-        KV_lora_trans = kv_lora_shared.load(layout=cfg.V_DOT_LAYOUT)
-        if IS_Q_FP8 and IS_KV_FP8:
-            P = P.to(KV_lora_trans.dtype)
-        elif IS_KV_FP8:
-            P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
-            KV_lora_trans = KV_lora_trans.to(gl.bfloat16)
-        else:
-            P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
-        P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
-        acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
-        seq_offset += TILE_SIZE
+            # acc : (BLOCK_M, KV_LORA_RANK)
+            acc = acc * gl.convert_layout(alpha[:, None], layout=cfg.PV_WMMA_LAYOUT)
+
+            # update constants
+            L = L * alpha + l_j
+            M = m_j
+
+            # acc : (BLOCK_M, KV_LORA_RANK)
+            KV_lora_trans = kv_lora_shared.load(layout=cfg.V_DOT_LAYOUT)
+            if IS_Q_FP8 and IS_KV_FP8:
+                P = P.to(KV_lora_trans.dtype)
+            elif IS_KV_FP8:
+                P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
+                KV_lora_trans = KV_lora_trans.to(gl.bfloat16)
+            else:
+                P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
+            P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
+            acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
+            seq_offset += TILE_SIZE
 
     # epilogue: when NUM_SEGMENTS == 1 the reduce kernel is skipped, so
     # normalize here; when NUM_SEGMENTS > 1 the reduce kernel combines

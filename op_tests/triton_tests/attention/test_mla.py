@@ -7,7 +7,10 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.mla import (
+    has_tuned_mla_decode_config,
     mla_decode_fwd,
+    mla_decode_max_workspace_numel,
+    mla_decode_workspace_numel,
     mla_prefill_fwd,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -954,3 +957,262 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
         assert isinstance(result, tuple) and len(result) == 3
     else:
         assert result is output
+
+
+# ---------------------------------------------------------------------------
+# gfx1250 Gluon decode: page-size-1 KV (kv_indptr), tuned rule, workspace,
+# zero-length rows, CUDA graphs, and the aiter.mla.mla_decode_fwd route.
+# ---------------------------------------------------------------------------
+_FLAT_BLOCK = 1536  # cache block the per-token indices are expanded from
+
+
+def _flat_kv_inputs(lens, num_heads, layout, num_blocks=256, seed=0):
+    """Cache [num_blocks * 1536, 1, 1, 576] bf16 and a per-token index table.
+    layout "runs": a block table expanded per token (consecutive rows inside a
+    block). "scattered": random rows."""
+    torch.manual_seed(seed)
+    kv = torch.randn(
+        (num_blocks * _FLAT_BLOCK, 1, 1, 576), dtype=torch.bfloat16, device="cuda"
+    )
+    total = sum(lens)
+    if layout == "runs":
+        rows = []
+        for n in lens:
+            nb = max(1, -(-n // _FLAT_BLOCK))
+            blocks = torch.randperm(num_blocks, device="cuda")[:nb]
+            tok = torch.arange(n, device="cuda")
+            rows.append(blocks[tok // _FLAT_BLOCK] * _FLAT_BLOCK + tok % _FLAT_BLOCK)
+        rows = torch.cat(rows).to(torch.int32)
+    else:
+        rows = torch.randperm(kv.shape[0], device="cuda")[:total].to(torch.int32)
+    # A caller-owned table is usually larger than the live part.
+    kv_indices = torch.full((total + 4096,), -1, dtype=torch.int32, device="cuda")
+    kv_indices[:total] = rows
+    kv_indptr = torch.zeros(len(lens) + 1, dtype=torch.int32, device="cuda")
+    kv_indptr[1:] = torch.cumsum(torch.tensor(lens, device="cuda"), 0)
+    q = torch.randn(
+        (len(lens), num_heads, 576), dtype=torch.bfloat16, device="cuda"
+    )
+    return kv, kv_indices, kv_indptr, q
+
+
+def _flat_reference(q, kv, kv_indices, kv_indptr, scale):
+    out = torch.zeros(q.shape[0], q.shape[1], 512, dtype=torch.float32, device="cuda")
+    flat = kv.view(-1, 576).float()
+    for b in range(q.shape[0]):
+        s, e = int(kv_indptr[b]), int(kv_indptr[b + 1])
+        if e > s:
+            k = flat[kv_indices[s:e].long()]
+            p = torch.softmax(q[b].float() @ k.T * scale, dim=-1)
+            out[b] = p @ k[:, :512]
+    return out
+
+
+def _flat_decode(q, kv, kv_indices, kv_indptr, scale, **kwargs):
+    out = torch.empty(q.shape[0], q.shape[1], 512, dtype=torch.bfloat16, device="cuda")
+    mla_decode_fwd(
+        q, kv, out, None, None, 0, kv_indices, scale, 512, 64, True, None, None,
+        kv_indptr=kv_indptr, **kwargs,
+    )
+    return out
+
+
+_FLAT_LENS = [
+    [1000],
+    [33000, 65],
+    [1537, 4000, 0, 0],
+    [1, 64, 65, 3071, 129],
+    [1024 + 17 * i for i in range(60)] + [0] * 4,
+]
+
+
+@pytest.mark.parametrize("lens", _FLAT_LENS)
+@pytest.mark.parametrize("num_heads", [24, 32])
+@pytest.mark.parametrize("layout", ["runs", "scattered"])
+def test_mla_decode_fwd_kv_indptr(lens, num_heads, layout):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("page-size-1 Gluon decode is gfx1250 only")
+    scale = 192**-0.5
+    kv, kv_indices, kv_indptr, q = _flat_kv_inputs(lens, num_heads, layout)
+    out = _flat_decode(q, kv, kv_indices, kv_indptr, scale)
+    ref = _flat_reference(q, kv, kv_indices, kv_indptr, scale)
+    live = [b for b, n in enumerate(lens) if n > 0]
+    torch.testing.assert_close(out[live].float(), ref[live], atol=1e-2, rtol=1e-2)
+    # Zero-length rows (CUDA-graph padding) give a zero output.
+    empty = [b for b, n in enumerate(lens) if n == 0]
+    if empty:
+        assert torch.count_nonzero(out[empty]) == 0
+
+
+@pytest.mark.parametrize("lens", [[1000], [33000, 65], [40000] * 8, [3000] * 64])
+def test_mla_decode_fwd_kv_indptr_matches_paged(lens):
+    """Block-expanded indices give the paged kernel's result bit for bit."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("page-size-1 Gluon decode is gfx1250 only")
+    scale = 192**-0.5
+    num_blocks = 256
+    torch.manual_seed(1)
+    kv = torch.randn(
+        (num_blocks * _FLAT_BLOCK, 1, 1, 576), dtype=torch.bfloat16, device="cuda"
+    )
+    width = -(-max(lens) // 64)
+    pages = torch.randperm(num_blocks * _FLAT_BLOCK // 64, device="cuda")
+    page_table = pages[: len(lens) * width].view(len(lens), width).to(torch.int32)
+    rows = []
+    for b, n in enumerate(lens):
+        tok = torch.arange(n, device="cuda")
+        rows.append(page_table[b, tok // 64] * 64 + tok % 64)
+    kv_indices = torch.cat(rows).to(torch.int32)
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    kv_indptr = torch.zeros(len(lens) + 1, dtype=torch.int32, device="cuda")
+    kv_indptr[1:] = torch.cumsum(seq_lens, 0)
+    q = torch.randn((len(lens), 24, 576), dtype=torch.bfloat16, device="cuda")
+    flat = _flat_decode(q, kv, kv_indices, kv_indptr, scale)
+    paged = torch.empty_like(flat)
+    mla_decode_fwd(
+        q, kv.view(-1, 64, 1, 576), paged,
+        torch.arange(len(lens) + 1, dtype=torch.int32, device="cuda"),
+        seq_lens, max(lens), page_table, scale, 512, 64, True, None, None,
+    )
+    assert torch.equal(flat, paged)
+
+
+@pytest.mark.parametrize("num_segments", [1, 4, 32])
+def test_mla_decode_fwd_overrides_and_workspace(num_segments):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("page-size-1 Gluon decode is gfx1250 only")
+    scale = 192**-0.5
+    lens = [5000, 777, 0, 12000]
+    kv, kv_indices, kv_indptr, q = _flat_kv_inputs(lens, 24, "runs")
+    ref = _flat_reference(q, kv, kv_indices, kv_indptr, scale)
+    numel = mla_decode_workspace_numel(len(lens), 24, 512, num_segments)
+    workspace = torch.empty(max(numel, 1), dtype=torch.float32, device="cuda")
+    out = _flat_decode(
+        q, kv, kv_indices, kv_indptr, scale,
+        num_segments=num_segments,
+        attn_config={"BLOCK_M": 32, "num_warps": 2},
+        reduce_config={"num_warps": 2},
+        workspace=workspace,
+    )
+    torch.testing.assert_close(out[[0, 1, 3]].float(), ref[[0, 1, 3]], atol=1e-2, rtol=1e-2)
+    assert torch.count_nonzero(out[2]) == 0
+    if numel:
+        with pytest.raises(AssertionError):
+            _flat_decode(
+                q, kv, kv_indices, kv_indptr, scale,
+                num_segments=num_segments, workspace=workspace[: numel - 1],
+            )
+
+
+def test_mla_decode_tuned_rule_selection():
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("the tuned rule is a gfx1250 config")
+    bf16 = torch.bfloat16
+    assert has_tuned_mla_decode_config(24, 1, 512, 64, bf16, bf16)
+    assert has_tuned_mla_decode_config(32, 1, 512, 64, bf16, bf16)
+    assert not has_tuned_mla_decode_config(16, 1, 512, 64, bf16, bf16)
+    assert not has_tuned_mla_decode_config(128, 1, 512, 64, e4m3_dtype, e4m3_dtype)
+    assert mla_decode_max_workspace_numel(24, 1, 512, 64, bf16, bf16, 512) > 0
+
+
+def test_mla_decode_fwd_kv_indptr_cuda_graph():
+    """Capture once; rebuild indices, lengths and q in place; replay."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("page-size-1 Gluon decode is gfx1250 only")
+    scale = 192**-0.5
+    lens = [1024 + 17 * i for i in range(60)] + [0] * 4
+    kv, kv_indices, kv_indptr, q = _flat_kv_inputs(lens, 24, "runs")
+    workspace = torch.empty(
+        mla_decode_max_workspace_numel(24, 1, 512, 64, torch.bfloat16, torch.bfloat16, 64),
+        dtype=torch.float32, device="cuda",
+    )
+    out = torch.empty(len(lens), 24, 512, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        mla_decode_fwd(
+            q, kv, out, None, None, 0, kv_indices, scale, 512, 64, True, None, None,
+            kv_indptr=kv_indptr, workspace=workspace,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    lens2 = [n + 3 if n else 0 for n in lens]
+    _, idx2, ptr2, q2 = _flat_kv_inputs(lens2, 24, "runs", seed=7)
+    kv_indices[: idx2.numel()].copy_(idx2[: kv_indices.numel()])
+    kv_indptr.copy_(ptr2)
+    q.copy_(q2)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = _flat_reference(q, kv, kv_indices, kv_indptr, scale)
+    torch.testing.assert_close(out[:60].float(), ref[:60], atol=1e-2, rtol=1e-2)
+    assert torch.count_nonzero(out[60:]) == 0
+
+
+@pytest.mark.parametrize("num_heads", [24, 32])
+def test_aiter_mla_decode_fwd_gfx1250_gluon_route(num_heads):
+    """aiter.mla.mla_decode_fwd with page-size-1 CSR inputs (as an inference
+    engine builds them, with persistent metadata and padding requests) runs
+    the Gluon decode on gfx1250."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("the Gluon route is gfx1250 only")
+    from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
+    from aiter.mla import gluon_mla_decode_route_enabled
+    from aiter.mla import mla_decode_fwd as aiter_mla_decode_fwd
+
+    scale = 192**-0.5
+    lens = [1537, 4000, 33000, 0, 0]
+    kv, kv_indices, kv_indptr, q = _flat_kv_inputs(lens, num_heads, "runs")
+    bs = len(lens)
+    # Padding requests have no query token: flat qo_indptr past the live rows.
+    qo_indptr = torch.tensor([0, 1, 2, 3, 3, 3], dtype=torch.int32, device="cuda")
+    last_page_lens = torch.ones(bs, dtype=torch.int32, device="cuda")
+    assert gluon_mla_decode_route_enabled(num_heads, 1, 1, 1, dtypes.bf16, dtypes.bf16)
+    info = get_mla_metadata_info_v1(
+        bs, 1, num_heads, dtypes.bf16, dtypes.bf16, is_sparse=False, fast_mode=True
+    )
+    meta = [torch.empty(shape, dtype=dt, device="cuda") for shape, dt in info]
+    # Nothing to schedule for the Gluon decode: the metadata call is a no-op.
+    assert (
+        get_mla_metadata_v1(
+            qo_indptr, kv_indptr, last_page_lens, num_heads, 1, True,
+            meta[0], meta[2], meta[1], meta[3], meta[4], meta[5],
+            page_size=1, kv_granularity=16, max_seqlen_qo=1, uni_seqlen_qo=1,
+            fast_mode=True, dtype_q=dtypes.bf16, dtype_kv=dtypes.bf16,
+        )
+        is None
+    )
+    out = torch.full((bs, num_heads, 512), float("nan"), dtype=torch.bfloat16, device="cuda")
+    aiter_mla_decode_fwd(
+        q, kv, out, qo_indptr, kv_indptr, kv_indices, last_page_lens, 1,
+        sm_scale=scale, work_meta_data=meta[0], work_indptr=meta[1],
+        work_info_set=meta[2], reduce_indptr=meta[3], reduce_final_map=meta[4],
+        reduce_partial_map=meta[5],
+    )
+    ref = _flat_reference(q, kv, kv_indices, kv_indptr, scale)
+    torch.testing.assert_close(out[:3].float(), ref[:3], atol=1e-2, rtol=1e-2)
+    assert torch.count_nonzero(out[3:]) == 0
+
+    # Same result as the Triton decode vLLM's TRITON_MLA backend runs, if present.
+    vllm_decode = pytest.importorskip("vllm.v1.attention.ops.triton_decode_attention")
+    block_table = (kv_indices[: sum(lens)].long() // _FLAT_BLOCK).to(torch.int32)
+    width = -(-max(lens) // _FLAT_BLOCK)
+    bt = torch.zeros(bs, width, dtype=torch.int32, device="cuda")
+    for b, n in enumerate(lens):
+        s = int(kv_indptr[b])
+        for i in range(-(-n // _FLAT_BLOCK)):
+            bt[b, i] = block_table[s + i * _FLAT_BLOCK]
+    kv_blocks = kv.view(-1, _FLAT_BLOCK, 1, 576)
+    old = torch.zeros(bs, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros(bs, num_heads, dtype=torch.bfloat16, device="cuda")
+    logits = torch.empty(bs, num_heads, 64, 513, dtype=torch.float32, device="cuda")
+    one = torch.ones((), dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    vllm_decode.decode_attention_fwd(
+        q, kv_blocks, kv_blocks[..., :512], old, lse, bt, seq_lens, logits, 64,
+        scale, _FLAT_BLOCK, k_scale=one, v_scale=one, is_mla=True,
+    )
+    torch.testing.assert_close(out[:3].float(), old[:3].float(), atol=2e-2, rtol=2e-2)

@@ -955,6 +955,120 @@ def mla_decode_prepare_page_csr(
     return kv_indptr, kv_indices, kv_last_page_lens
 
 
+# gfx1250 has no bf16 MLA decode asm kernel. Single-token decode shapes with a
+# tuned Gluon rule (configs/gfx1250/gluon/attention/mla_decode) use the Gluon
+# split-KV decode on the page-size-1 CSR inputs. AITER_MLA_DECODE_GLUON=0
+# turns this off.
+def gluon_mla_decode_route_enabled(
+    num_heads: int,
+    num_heads_kv: int,
+    max_seqlen_q: int,
+    page_size: int,
+    q_dtype,
+    kv_dtype,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+) -> bool:
+    """Whether mla_decode_fwd serves this decode configuration with the
+    gfx1250 Gluon kernel (and so ignores the persistent work/reduce metadata).
+    """
+    if (
+        get_gfx() != "gfx1250"
+        or os.environ.get("AITER_MLA_DECODE_GLUON", "1") == "0"
+        or max_seqlen_q != 1
+        or page_size != 1
+    ):
+        return False
+    from aiter.ops.triton.attention.mla import has_tuned_mla_decode_config
+
+    return has_tuned_mla_decode_config(
+        num_heads, num_heads_kv, kv_lora_rank, qk_rope_head_dim, q_dtype, kv_dtype
+    )
+
+
+# Rows the persistent Gluon workspace is sized for. Larger batches grow it; the
+# old buffer stays alive for the CUDA graphs that use it.
+_GLUON_DECODE_WORKSPACE_ROWS = 1024
+_gluon_decode_workspaces: dict = {}
+_gluon_decode_retired_workspaces: list = []
+
+
+def _gluon_decode_workspace(device, numel, nhead, nhead_kv, kv_lora_rank, rope_dim, dtype):
+    """Persistent per-device fp32 segment scratch, sized once for every batch
+    of up to _GLUON_DECODE_WORKSPACE_ROWS rows, so that no call allocates.
+    Calls on one device must be stream-ordered."""
+    from aiter.ops.triton.attention.mla import mla_decode_max_workspace_numel
+
+    key = (device.type, device.index)
+    buf = _gluon_decode_workspaces.get(key)
+    if buf is None or buf.numel() < numel:
+        want = max(
+            numel,
+            mla_decode_max_workspace_numel(
+                nhead,
+                nhead_kv,
+                kv_lora_rank,
+                rope_dim,
+                dtype,
+                dtype,
+                _GLUON_DECODE_WORKSPACE_ROWS,
+            ),
+        )
+        if buf is not None:
+            _gluon_decode_retired_workspaces.append(buf)
+        buf = torch.empty(want, dtype=torch.float32, device=device)
+        _gluon_decode_workspaces[key] = buf
+    return buf
+
+
+def _gluon_mla_decode_fwd(q, kv_buffer, o, kv_indptr, kv_indices, sm_scale):
+    from aiter.ops.triton.attention.mla import (
+        _find_tuned_decode_rule,
+        _tuned_decode_config,
+        mla_decode_fwd as triton_mla_decode_fwd,
+        mla_decode_workspace_numel,
+    )
+
+    total_s, nhead, qk_head_dim = q.shape
+    nhead_kv = kv_buffer.shape[2]
+    v_head_dim = o.shape[-1]
+    rope_dim = qk_head_dim - v_head_dim
+    rule = _find_tuned_decode_rule(
+        nhead, nhead_kv, v_head_dim, rope_dim, q.dtype, kv_buffer.dtype
+    )
+    nseg = _tuned_decode_config(rule, total_s, nhead // nhead_kv)[1][
+        "NUM_SEGMENTS_PER_SEQ"
+    ]
+    numel = mla_decode_workspace_numel(total_s, nhead, v_head_dim, nseg)
+    workspace = (
+        _gluon_decode_workspace(
+            q.device, numel, nhead, nhead_kv, v_head_dim, rope_dim, q.dtype
+        )
+        if numel
+        else None
+    )
+    triton_mla_decode_fwd(
+        q,
+        kv_buffer,
+        o,
+        # Rows map to requests positionally, so each CUDA-graph padding request
+        # (flat qo_indptr, zero KV length) gets its own zero row.
+        None,
+        None,
+        0,
+        kv_indices,
+        sm_scale,
+        v_head_dim,
+        rope_dim,
+        True,
+        None,
+        None,
+        kv_indptr=kv_indptr,
+        workspace=workspace,
+    )
+    return o, None
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -1169,6 +1283,38 @@ def mla_decode_fwd(
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
+
+    if (
+        kv_layout == "token_major"
+        and kv_buffer.dtype != torch.uint8
+        and total_s == bs
+        and q.shape[1] == nhead
+        and cp_world_size == 1
+        and g_kv_indptr is None
+        and num_kv_splits is None
+        and not intra_batch_mode
+        and not return_logits
+        and not return_lse
+        and kv_buffer.shape[1] == 1
+        and kv_indices.dim() == 1
+        and kv_indices.stride(0) == 1
+        and q.stride(-1) == 1
+        and kv_buffer.stride(-1) == 1
+        and o.stride(-1) == 1
+        and gluon_mla_decode_route_enabled(
+            nhead,
+            nhead_kv,
+            max_seqlen_q,
+            page_size,
+            q.dtype,
+            kv_buffer.dtype,
+            v_head_dim,
+            qk_head_dim - v_head_dim,
+        )
+    ):
+        # One query per request: causal has no effect. bf16 q/kv scales are
+        # not applied.
+        return _gluon_mla_decode_fwd(q, kv_buffer, o, kv_indptr, kv_indices, sm_scale)
 
     persistent_mode = work_meta_data is not None
 

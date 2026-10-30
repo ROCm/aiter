@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import functools
 import math
 
 import torch
@@ -36,6 +37,11 @@ except:  # noqa: E722
     gluon_mla_decode_fwd_reduce_kernel = None
 
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -272,6 +278,160 @@ def _fits_int32_offsets(tensor):
     )
 
 
+# Tuned decode rules: configs/<arch>/gluon/attention/mla_decode/DEFAULT.json.
+# A rule depends only on the batch size, so a captured CUDA graph keeps its
+# launch config. Other arches and shapes use select_3d_config.
+
+
+def _decode_dtype_tag(dtype):
+    if dtype == torch.bfloat16:
+        return "bf16"
+    if dtype == e4m3_dtype:
+        return "fp8"
+    if dtype == torch.uint8:
+        return "nvfp4"
+    return str(dtype)
+
+
+@functools.lru_cache(maxsize=1)
+def _tuned_decode_rules():
+    if not IS_DEVICE_ARCH_GFX12:
+        return ()
+    cfg_dir = resolve_config_dir("attention", "MLA_DECODE", backend="gluon")
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+    return tuple(table["decode"]) if table else ()
+
+
+def _find_tuned_decode_rule(
+    num_query_heads,
+    num_kv_heads,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    q_dtype,
+    kv_dtype,
+):
+    q_tag, kv_tag = _decode_dtype_tag(q_dtype), _decode_dtype_tag(kv_dtype)
+    queries_per_kv = num_query_heads // max(1, num_kv_heads)
+    for rule in _tuned_decode_rules():
+        m = rule["match"]
+        if (
+            m["QUERY_DTYPE"] == q_tag
+            and m["KV_CACHE_DTYPE"] == kv_tag
+            and m["KV_LORA_RANK"] == kv_lora_rank
+            and m["QK_ROPE_HEAD_DIM"] == qk_rope_head_dim
+            and m["NUM_KV_HEADS"] == num_kv_heads
+            and m["MIN_QUERIES_PER_KV"] <= queries_per_kv <= m["MAX_QUERIES_PER_KV"]
+        ):
+            return rule
+    return None
+
+
+def has_tuned_mla_decode_config(
+    num_query_heads: int,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> bool:
+    """Whether this arch ships a tuned single-token decode rule for the shape
+    (non-shuffled KV cache; see configs/<arch>/gluon/attention/mla_decode)."""
+    return (
+        _find_tuned_decode_rule(
+            num_query_heads,
+            num_kv_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            q_dtype,
+            kv_dtype,
+        )
+        is not None
+    )
+
+
+def _tuned_num_segments(segments, num_seqs, num_head_blocks):
+    # Smallest power of two whose grid fills one wave of workgroups with the
+    # last wave at least MIN_LAST_WAVE_FILL full; else the best-filled count.
+    wave = get_num_sms() * segments["WORKGROUPS_PER_CU"]
+    best, best_fill = 1, -1.0
+    n = 1
+    while n <= segments["MAX_SEGMENTS"]:
+        prgms = num_seqs * num_head_blocks * n
+        fill = prgms / (wave * triton.cdiv(prgms, wave))  # last-wave occupancy
+        if prgms >= wave and fill >= segments["MIN_LAST_WAVE_FILL"]:
+            return n
+        if fill > best_fill + 1e-9:
+            best, best_fill = n, fill
+        n *= 2
+    return best if num_seqs > 1 else segments["SINGLE_SEQ_SEGMENTS"]
+
+
+def _tuned_decode_config(rule, num_seqs, queries_per_kv):
+    """(BLOCK_M, attn_config, reduce_config) from a tuned rule for a batch of
+    num_seqs single-token decode rows."""
+    attn = select_leq_config(rule["attn"], axes=("B",), B=num_seqs)
+    block_m = attn.pop("BLOCK_M")
+    num_segments = _tuned_num_segments(
+        rule["segments"], num_seqs, triton.cdiv(queries_per_kv, block_m)
+    )
+    reduce = select_leq_config(rule["reduce"], axes=("NSEG",), NSEG=num_segments)
+    tile = rule["TILE_SIZE"]
+    attn_config = {"TILE_SIZE": tile, "NUM_SEGMENTS_PER_SEQ": num_segments, **attn}
+    reduce_config = {"TILE_SIZE": tile, "NUM_SEGMENTS_PER_SEQ": num_segments, **reduce}
+    return block_m, attn_config, reduce_config
+
+
+def mla_decode_workspace_numel(
+    total_num_tokens: int,
+    num_query_heads: int,
+    kv_lora_rank: int,
+    num_segments: int,
+) -> int:
+    """fp32 elements of the ``workspace`` mla_decode_fwd needs for a split
+    count (segment outputs, maxima and exp-sums); 0 when it does not split."""
+    if num_segments <= 1:
+        return 0
+    per_segment = triton.next_power_of_2(kv_lora_rank) + 2
+    return total_num_tokens * num_query_heads * num_segments * per_segment
+
+
+@functools.lru_cache(maxsize=None)
+def mla_decode_max_workspace_numel(
+    num_query_heads: int,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    max_num_seqs: int,
+) -> int:
+    """Largest workspace the tuned rule needs for any single-token decode
+    batch of 1..max_num_seqs rows (0 if no tuned rule matches). Sizing a
+    persistent workspace with it keeps every batch size, and so every captured
+    CUDA graph, on the same buffer."""
+    rule = _find_tuned_decode_rule(
+        num_query_heads,
+        num_kv_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        q_dtype,
+        kv_dtype,
+    )
+    if rule is None:
+        return 0
+    queries_per_kv = num_query_heads // num_kv_heads
+    best = 0
+    for num_seqs in range(1, max_num_seqs + 1):
+        nseg = _tuned_decode_config(rule, num_seqs, queries_per_kv)[1][
+            "NUM_SEGMENTS_PER_SEQ"
+        ]
+        best = max(
+            best,
+            mla_decode_workspace_numel(num_seqs, num_query_heads, kv_lora_rank, nseg),
+        )
+    return best
+
+
 def mla_decode_fwd(
     q,  # [num_tokens_per_seq * num_seqs, num_query_heads, qk_lora_rank + qk_rope_head_dim]
     kv_buffer,  # [num_blocks, block_size, num_kv_heads, qk_lora_rank + qk_rope_head_dim]
@@ -290,7 +450,38 @@ def mla_decode_fwd(
     out_scale=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    *,
+    kv_indptr=None,
+    num_segments=None,
+    attn_config=None,
+    reduce_config=None,
+    workspace=None,
 ):
+    """Split-KV MLA decode (attention kernel + segment reduce).
+
+    Optional keyword arguments:
+        kv_indptr: [num_seqs + 1] int32. Selects the page-size-1 ("flat") KV
+            layout: kv_buffer is [num_tokens, 1, num_kv_heads, D],
+            block_tables is the flat per-token row list (kv_indices) and
+            kv_indptr its per-sequence offsets; seqused_k is unused. gfx1250,
+            non-shuffled cache only. The kernel tile is then independent of
+            the cache page size.
+        num_segments: KV split count override (1 skips the reduce).
+        attn_config / reduce_config: launch-parameter overrides merged over
+            the selected configs (keys of select_3d_config's dicts; attn_config
+            may also set BLOCK_M, and TILE_SIZE in the flat layout).
+        cu_seqlens_q may be None for single-token decode on gfx1250: row i
+            then belongs to sequence i.
+        workspace: caller-owned 1-D contiguous fp32 tensor with at least
+            mla_decode_workspace_numel(...) elements. Segment outputs, maxima
+            and exp-sums are carved out of it instead of being allocated per
+            call, so the call allocates nothing (CUDA-graph safe).
+
+    On gfx1250, with no override, single-token decode shapes listed in
+    configs/gfx1250/gluon/attention/mla_decode/DEFAULT.json use that tuned
+    rule instead of select_3d_config. Rows with a zero KV length produce a
+    zero output.
+    """
     assert causal, "Only causal attention is supported"
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
@@ -343,9 +534,26 @@ def mla_decode_fwd(
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
         K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
 
-    num_seqs = len(seqused_k)
+    kv_indptr_table = kv_indptr is not None
+    if kv_indptr_table:
+        assert (
+            IS_DEVICE_ARCH_GFX12 and not shuffled_kv_cache
+        ), "kv_indptr (page-size-1 KV) needs the gfx1250 non-shuffled kernel"
+        assert block_size == 1, "kv_indptr expects kv_buffer [num_tokens, 1, H_kv, D]"
+        assert block_tables.dim() == 1 and block_tables.stride(0) == 1
+        assert num_blocks >= 128, "page-size-1 KV needs at least one tile of rows"
+        num_seqs = kv_indptr.shape[0] - 1
+        seq_lens_arg = kv_indptr
+        block_tables_stride = 0
+    else:
+        num_seqs = len(seqused_k)
+        seq_lens_arg = seqused_k
+        block_tables_stride = block_tables.stride(0)
     num_tokens_per_seq = total_num_tokens // num_seqs
     num_queries_per_kv = num_query_heads // num_kv_heads
+    assert cu_seqlens_q is not None or (
+        IS_DEVICE_ARCH_GFX12 and not shuffled_kv_cache and num_tokens_per_seq == 1
+    ), "cu_seqlens_q=None needs single-token decode on the gfx1250 kernel"
 
     assert (
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
@@ -356,6 +564,29 @@ def mla_decode_fwd(
         BLOCK_M = 16
     else:
         BLOCK_M = min(triton.next_power_of_2(num_queries_per_kv), MAX_BLOCK_M)
+
+    tuned = None
+    if (
+        num_segments is None
+        and attn_config is None
+        and reduce_config is None
+        and not shuffled_kv_cache
+        and num_tokens_per_seq == 1
+    ):
+        rule = _find_tuned_decode_rule(
+            num_query_heads,
+            num_kv_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            q_dtype,
+            kv_buffer_dtype,
+        )
+        # A paged cache fixes the tile to its block size.
+        if rule is not None and (kv_indptr_table or block_size == rule["TILE_SIZE"]):
+            tuned = _tuned_decode_config(rule, num_seqs, num_queries_per_kv)
+            BLOCK_M = tuned[0]
+    if attn_config is not None and "BLOCK_M" in attn_config:
+        BLOCK_M = attn_config["BLOCK_M"]
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
     BLOCK_Q = max(BLOCK_Q, 1)
@@ -372,16 +603,32 @@ def mla_decode_fwd(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
 
-    attn_config, reduce_config = select_3d_config(
-        block_size,
-        max_seqlen_kv,
-        target_num_prgms,
-        num_2d_prgms,
-        q_dtype,
-        kv_buffer_dtype,
-        shuffled_kv_cache,
-        BLOCK_M,
-    )
+    attn_overrides, reduce_overrides = attn_config, reduce_config
+    if tuned is not None:
+        _, attn_config, reduce_config = tuned
+    else:
+        attn_config, reduce_config = select_3d_config(
+            # The flat layout has no page size; tile like a 64-token cache.
+            64 if kv_indptr_table else block_size,
+            max_seqlen_kv,
+            target_num_prgms,
+            num_2d_prgms,
+            q_dtype,
+            kv_buffer_dtype,
+            shuffled_kv_cache,
+            BLOCK_M,
+        )
+    if attn_overrides is not None:
+        attn_config.update({k: v for k, v in attn_overrides.items() if k != "BLOCK_M"})
+        reduce_config["TILE_SIZE"] = attn_config["TILE_SIZE"]
+    if reduce_overrides is not None:
+        reduce_config.update(reduce_overrides)
+    if num_segments is not None:
+        attn_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
+        reduce_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
+    assert kv_indptr_table or attn_config["TILE_SIZE"] == block_size or (
+        shuffled_kv_cache
+    ), "a paged KV cache needs TILE_SIZE == block_size"
 
     selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
     use_lds_pipeline = (
@@ -403,6 +650,9 @@ def mla_decode_fwd(
             or (not skip_reduce and 0 < max_seqlen_kv <= 3 * block_size)
         )
         and q_scales is None
+        and not kv_indptr_table
+        and attn_overrides is None
+        and num_segments is None
         and q.stride(2) == 1
         and kv_buffer.stride(3) == 1
         and 0 < kv_buffer.stride(1) < 2**31
@@ -414,7 +664,36 @@ def mla_decode_fwd(
         and _fits_int32_offsets(block_tables)
     )
     NUM_SEGMENTS = 1 if use_lds_pipeline else selected_num_segments
-    if NUM_SEGMENTS > 1:
+    if NUM_SEGMENTS > 1 and workspace is not None:
+        numel = mla_decode_workspace_numel(
+            total_num_tokens, num_query_heads, kv_lora_rank, NUM_SEGMENTS
+        )
+        assert (
+            workspace.dtype == torch.float32
+            and workspace.dim() == 1
+            and workspace.is_contiguous()
+            and workspace.numel() >= numel
+        ), f"workspace must be a contiguous fp32 vector of >= {numel} elements"
+        n_out = (
+            total_num_tokens
+            * num_query_heads
+            * NUM_SEGMENTS
+            * triton.next_power_of_2(kv_lora_rank)
+        )
+        n_stat = total_num_tokens * num_query_heads * NUM_SEGMENTS
+        segm_output = workspace[:n_out].view(
+            total_num_tokens,
+            num_query_heads,
+            NUM_SEGMENTS,
+            triton.next_power_of_2(kv_lora_rank),
+        )
+        segm_max = workspace[n_out : n_out + n_stat].view(
+            total_num_tokens, num_query_heads, NUM_SEGMENTS
+        )
+        segm_expsum = workspace[n_out + n_stat : n_out + 2 * n_stat].view(
+            total_num_tokens, num_query_heads, NUM_SEGMENTS
+        )
+    elif NUM_SEGMENTS > 1:
         segm_output = torch.empty(
             total_num_tokens,
             num_query_heads,
@@ -464,6 +743,8 @@ def mla_decode_fwd(
             impl = gluon_mla_decode_fwd_kernel
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
+            if kv_indptr_table:
+                attn_config["KV_INDPTR_TABLE"] = True
 
         impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
@@ -473,7 +754,7 @@ def mla_decode_fwd(
             query_scales_ptr=q_scales,
             kv_buffer_ptr=kv_buffer,
             block_tables_ptr=block_tables,
-            seq_lens_ptr=seqused_k,
+            seq_lens_ptr=seq_lens_arg,
             SCALE=softmax_scale,
             q_scale_ptr=q_descale,
             kv_scale_ptr=kv_descale,
@@ -482,7 +763,7 @@ def mla_decode_fwd(
             ),
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
-            block_tables_stride=block_tables.stride(0),
+            block_tables_stride=block_tables_stride,
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
             query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
@@ -519,13 +800,13 @@ def mla_decode_fwd(
             query_scales_ptr=q_scales,
             kv_buffer_ptr=kv_buffer,
             block_tables_ptr=block_tables,
-            seq_lens_ptr=seqused_k,
+            seq_lens_ptr=seq_lens_arg,
             scale=softmax_scale,
             q_scale_ptr=q_descale,
             kv_scale_ptr=kv_descale,
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
-            block_tables_stride=block_tables.stride(0),
+            block_tables_stride=block_tables_stride,
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
             query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
@@ -566,19 +847,20 @@ def mla_decode_fwd(
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
-        seq_lens_ptr=seqused_k,
+        seq_lens_ptr=seq_lens_arg,
         out_scale_ptr=out_scale,
         num_seqs=num_seqs,
         num_query_heads=num_query_heads,
         output_stride_0=out.stride(0),
         output_stride_1=out.stride(1),
-        block_tables_stride=block_tables.stride(0),
+        block_tables_stride=block_tables_stride,
         num_tokens_per_seq=num_tokens_per_seq,
         total_num_tokens=total_num_tokens,
         KV_LORA_RANK=kv_lora_rank,
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
         ALL_DECODE=ALL_DECODE,
+        KV_INDPTR_TABLE=kv_indptr_table,
         **reduce_config,
     )
     return out
