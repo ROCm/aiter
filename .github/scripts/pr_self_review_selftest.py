@@ -147,6 +147,115 @@ class PRSelfReviewSelftest(unittest.TestCase):
         self.assertTrue(result.ci_pending)
         self.assertEqual(set(result.ci.values()), {"unavailable"})
 
+    def test_gpu_gate_not_required_for_ci_only_changes(self) -> None:
+        ci_only = gate.required_checks(
+            [".github/workflows/x.yml", "docs/gate.md", "CONTRIBUTE.md"]
+        )
+        self.assertNotIn("Aiter Test Gate", ci_only)
+        self.assertEqual(set(ci_only), {"Black", "Ruff", "Repository dependency"})
+
+        mixed = gate.required_checks([".github/workflows/x.yml", "aiter/ops/x.py"])
+        self.assertIn("Aiter Test Gate", mixed)
+
+        self.assertEqual(set(gate.required_checks([])), set(gate.REQUIRED_CHECKS))
+
+    def test_ci_only_pr_becomes_ready_without_gpu_gate(self) -> None:
+        api = RequestAPI(
+            {
+                "pulls/9": {
+                    "head": {"sha": "head0000000"},
+                    "html_url": "https://example/pr/9",
+                    "draft": False,
+                    "user": {"login": "alice"},
+                    "body": valid_body("head0000000"),
+                },
+                "pulls/9/files": [
+                    {"filename": ".github/workflows/x.yml", "status": "modified"},
+                    {"filename": "docs/gate.md", "status": "modified"},
+                ],
+                "graphql": {
+                    "repository": {
+                        "pullRequest": {
+                            "headRefOid": "head0000000",
+                            "reviews": {"nodes": []},
+                            "reviewThreads": {"nodes": []},
+                        }
+                    }
+                },
+                "commits/head0000000/check-runs?filter=latest&per_page=100": {
+                    "check_runs": [
+                        {
+                            "name": "Black",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                        {
+                            "name": "Ruff",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                        {
+                            "name": "Check Repository Dependency",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                    ]
+                },
+            }
+        )
+        result = gate.evaluate(api, 9, "shadow")
+        self.assertEqual(set(result.ci), {"Black", "Ruff", "Repository dependency"})
+        self.assertFalse(result.ci_pending)
+        self.assertTrue(gate.render(result).startswith("# READY FOR HUMAN REVIEW"))
+
+    def test_gpu_pr_still_waits_for_the_aiter_test_gate(self) -> None:
+        api = RequestAPI(
+            {
+                "pulls/10": {
+                    "head": {"sha": "head0000000"},
+                    "html_url": "https://example/pr/10",
+                    "draft": False,
+                    "user": {"login": "alice"},
+                    "body": valid_body("head0000000"),
+                },
+                "pulls/10/files": [
+                    {"filename": "aiter/ops/matmul.py", "status": "modified"}
+                ],
+                "graphql": {
+                    "repository": {
+                        "pullRequest": {
+                            "headRefOid": "head0000000",
+                            "reviews": {"nodes": []},
+                            "reviewThreads": {"nodes": []},
+                        }
+                    }
+                },
+                "commits/head0000000/check-runs?filter=latest&per_page=100": {
+                    "check_runs": [
+                        {
+                            "name": "Black",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                        {
+                            "name": "Ruff",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                        {
+                            "name": "Check Repository Dependency",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                    ]
+                },
+            }
+        )
+        result = gate.evaluate(api, 10, "shadow")
+        self.assertEqual(result.ci["Aiter Test Gate"], "missing")
+        self.assertTrue(result.ci_pending)
+        self.assertTrue(gate.render(result).startswith("# NOT READY FOR HUMAN REVIEW"))
+
     def test_fork_workflow_run_resolves_by_head_identity(self) -> None:
         api = RequestAPI({})
         api.responses[

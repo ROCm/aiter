@@ -108,7 +108,7 @@ int64_t meta_size(int64_t world_size)
 
 static void _all_reduce(fptr_t _fa, void* inp, void* out,
                         int64_t numel, AiterDtype dtype,
-                        bool use_new, bool is_broadcast_reg_outptr)
+                        bool use_new)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -118,14 +118,14 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
         fa->allreduce<opus::fp32_t>(stream,
                              reinterpret_cast<opus::fp32_t*>(inp),
                              reinterpret_cast<opus::fp32_t*>(out),
-                             numel, use_new, is_broadcast_reg_outptr);
+                             numel, use_new);
         break;
     }
     case AITER_DTYPE_fp16: {
         fa->allreduce<opus::fp16_t>(stream,
                                 reinterpret_cast<opus::fp16_t*>(inp),
                                 reinterpret_cast<opus::fp16_t*>(out),
-                                numel, use_new, is_broadcast_reg_outptr);
+                                numel, use_new);
         break;
     }
     case AITER_DTYPE_bf16: {
@@ -284,6 +284,34 @@ void register_graph_buffers(fptr_t _fa,
     for(int i = 0; i < world_size; i++)
         per_rank[i] = &ptrs_per_rank[i * total_buffers];
     fa->register_graph_buffers(per_rank.data());
+}
+
+// ---- Graph buffer registration (IPC handle-based, ROCm >= 7.15) ----
+// Same signatures as the old-arch ops, so IPCBufferPool.flush_graph_buffers
+// drives both.
+
+void get_graph_buffer_ipc_meta(fptr_t _fa, int64_t handle_out, int64_t offset_out)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    auto [handle_bytes, offsets] = fa->get_graph_buffer_ipc_meta();
+    std::memcpy((void*)handle_out, handle_bytes.data(), handle_bytes.size());
+    std::memcpy((void*)offset_out, offsets.data(), offsets.size() * sizeof(int64_t));
+}
+
+void register_graph_buffers_ipc(fptr_t _fa,
+                                const std::vector<int64_t>& handle_ptrs,
+                                const std::vector<int64_t>& offset_ptrs)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int world_size = handle_ptrs.size();
+    std::vector<const void*> handles(world_size);
+    std::vector<const int64_t*> offsets(world_size);
+    for(int i = 0; i < world_size; i++)
+    {
+        handles[i] = (const void*)handle_ptrs[i];
+        offsets[i] = (const int64_t*)offset_ptrs[i];
+    }
+    fa->register_graph_buffers(handles.data(), offsets.data());
 }
 
 // ---- Allgather dispatch helpers ----
@@ -463,8 +491,6 @@ void all_reduce(fptr_t _fa,
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
 
-    bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
-
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     if(reg_inp_ptr != 0 && !fa->use_ll(data_bytes))
     {
@@ -475,8 +501,7 @@ void all_reduce(fptr_t _fa,
         actual_inp = (void*)reg_inp_ptr;
     }
 
-    _all_reduce(_fa, actual_inp, actual_out, numel, dtype,
-                use_new, is_broadcast_reg_outptr);
+    _all_reduce(_fa, actual_inp, actual_out, numel, dtype, use_new);
 }
 
 // ---- Fused allreduce + RMSNorm ----
