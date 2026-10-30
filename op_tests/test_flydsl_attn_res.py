@@ -6,6 +6,7 @@
 Usage:
     python op_tests/test_flydsl_attn_res.py
     python op_tests/test_flydsl_attn_res.py --tokens 17 320
+    python op_tests/test_flydsl_attn_res.py --cache warm cold
 
 Delta update, canonical append snapshot, and output RMSNorm are independently
 specialized. Snapshot writes remain limited to ``block_write_idx == num_blocks``.
@@ -35,9 +36,9 @@ _MAX_BLOCKS = 8
 _EPS = 1e-5
 _ATOL = 8e-2
 _RTOL = 3e-2
-# Measured cache-bypassed BF16 bandwidth floor (TB/s). Arches without an entry
-# report no floor_us or efficiency.
-_FLOOR_BW_TBPS = {"gfx950": 6.26}
+# run_perftest num_rotate_args: 1 reuses one arg set (L2-resident), 0 rotates
+# copies so each timed iteration reads cold HBM.
+_ROTATE_ARGS = {"warm": 1, "cold": 0}
 _BF16_ULP_REL = 3.863e-3
 _SUPPORTED_GFX = ("gfx942", "gfx950")
 
@@ -484,7 +485,7 @@ def benchmark_flydsl_attn_res(
     pad: int = 0,
     hidden_size: int = _D,
     rows_per_wg: int = 1,
-    rotate_inputs: bool = False,
+    cache: str = "warm",
 ):
     """Validate and measure one supported prefill flag specialization."""
     block_write_idx = num_blocks if write_block else -1
@@ -510,8 +511,6 @@ def benchmark_flydsl_attn_res(
         output_norm_weight,
         _,
     ) = _make_inputs(tokens, hidden_size=hidden_size, pad=pad)
-    # num_rotate_args=1 reuses one arg set (cache-resident, PR-table method).
-    # num_rotate_args=0 auto-rotates tensors for cold HBM (--rotate-inputs).
     _, us = run_perftest(
         flydsl_attn_res,
         prefix,
@@ -525,7 +524,7 @@ def benchmark_flydsl_attn_res(
         _EPS,
         _EPS,
         rows_per_wg,
-        num_rotate_args=0 if rotate_inputs else 1,
+        num_rotate_args=_ROTATE_ARGS[cache],
     )
 
     # k source reads, optional delta read + prefix write, optional snapshot
@@ -535,8 +534,6 @@ def benchmark_flydsl_attn_res(
     moved_bytes = rows * tokens * hidden_size * 2
     tbps = moved_bytes / (us * 1e-6) / 1e12
     gfx = get_gfx()
-    floor_bw = _FLOOR_BW_TBPS.get(gfx)
-    floor_us = moved_bytes / (floor_bw * 1e12) * 1e6 if floor_bw else None
     # ~4D (sumsq + dot) + 2D mix per source; optional output RMS ~4D.
     flops = tokens * hidden_size * (6 * k + 4 * int(apply_output_norm))
     return {
@@ -548,11 +545,10 @@ def benchmark_flydsl_attn_res(
         "apply_output_norm": apply_output_norm,
         "pad": pad,
         "rows_per_wg": rows_per_wg,
+        "cache": cache,
         "us": round(us, 3),
         "TFLOPS": round(flops / us / 1e6, 2),
         "TB/s": round(tbps, 3),
-        "floor_us": round(floor_us, 3) if floor_us else None,
-        "efficiency": round(floor_us / us, 3) if floor_us else None,
         "err": err,
     }
 
@@ -571,9 +567,11 @@ def main():
         help="Prefill token counts to test and benchmark",
     )
     parser.add_argument(
-        "--rotate-inputs",
-        action="store_true",
-        help="Rotate tensor args so each timed iteration reads cold HBM",
+        "--cache",
+        nargs="+",
+        choices=tuple(_ROTATE_ARGS),
+        default=["warm"],
+        help="Cache states to time: warm reuses one arg set, cold reads HBM",
     )
     args = parser.parse_args()
     _run_num_blocks_sweep()
@@ -607,7 +605,7 @@ def main():
             pad=pad,
             hidden_size=hidden_size,
             rows_per_wg=rows_per_wg,
-            rotate_inputs=args.rotate_inputs,
+            cache=cache,
         )
         for (
             hidden_size,
@@ -617,9 +615,10 @@ def main():
             apply_output_norm,
             pad,
             rows_per_wg,
-        ), tokens in itertools.product(
+        ), tokens, cache in itertools.product(
             (*large_d_configs, *small_d_configs),
             args.tokens,
+            args.cache,
         )
     ]
     aiter.logger.info(
