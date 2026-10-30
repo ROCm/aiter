@@ -18,17 +18,22 @@ import aiter
 from aiter import benchmark_data_init as bench_init
 from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
-from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_mxfp8fp4_a,
+    shuffle_mxfp8fp4_scale,
+    shuffle_weight,
+)
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
-SCALE_BLOCK_SHAPES = {"32x32": (32, 32), "128x128": block_shape}
-# Native 32x32 E8M0 dispatch exists on these archs only; elsewhere the op casts the
-# scales to FP32 and runs implementations that expect 128x128 blocks.
-W_SCALE_32X32_GFX = ("gfx950", "gfx1250")
+SCALE_BLOCK_SHAPES = {"1x32": (1, 32), "32x32": (32, 32), "128x128": block_shape}
+# Native E8M0 preshuffle dispatch is supported on these architectures.
+NATIVE_SCALE_GFX = ("gfx950", "gfx1250")
 TEST_NUM_ITERS = 100
 
 
@@ -108,7 +113,7 @@ def test_gemm(
     m,
     n,
     k,
-    ck_preshuffle=True,
+    b_preshuffle=True,
     use_flydsl=False,
     data_init="uniform",
     scale_init="auto",
@@ -120,11 +125,9 @@ def test_gemm(
     if w_scale_block not in SCALE_BLOCK_SHAPES:
         raise ValueError(f"unsupported w_scale_block {w_scale_block!r}")
     scale_shape = SCALE_BLOCK_SHAPES[w_scale_block]
-    use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
-    if w_scale_block == "32x32" and not use_flydsl_fp8_scale:
-        raise ValueError("32x32 scales require --flydsl and --ck_preshuffle True")
-    if w_scale_block == "32x32" and apre:
-        raise ValueError("32x32 scales do not support the A-preshuffle candidate")
+    use_flydsl_fp8_scale = (use_flydsl and b_preshuffle) or w_scale_block != "128x128"
+    if w_scale_block != "128x128" and apre:
+        raise ValueError("Group32 scales do not support the A-preshuffle candidate")
 
     block_shape_n, block_shape_k = scale_shape
     scale_m = m
@@ -164,15 +167,30 @@ def test_gemm(
     a, _ = run_torch(x, weight, x_scale, w_scale, dtype, scale_shape)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
-    gemm_x_scale = (
-        x_scale if w_scale_block == "32x32" or not ck_preshuffle else x_scale_t
+    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if b_preshuffle else weight
+    gemm_x_scale = x_scale if block_shape_k == 32 or not b_preshuffle else x_scale_t
+    run_func = run_gemm_bpreshuffle if b_preshuffle else run_gemm
+    gemm_w_scale = (
+        shuffle_mxfp8fp4_scale(w_scale)
+        if b_preshuffle and w_scale_block == "1x32" and get_gfx() == "gfx1250"
+        else w_scale
     )
-    run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
-    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
+    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, gemm_w_scale, dtype)
 
-    err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
-    if ck_preshuffle and not use_flydsl_fp8_scale:
+    if a.numel() < 1 << 31:
+        err = checkAllclose(a, b, msg="gemm", catastrophic_check=True)
+    else:
+        # Keep each HIP boolean mask below the int32 element-count limit.
+        err = 0.0
+        for a_part, b_part in zip(
+            a.flatten().split(1 << 30), b.flatten().split(1 << 30)
+        ):
+            part_err = checkAllclose(
+                a_part, b_part, msg="gemm", catastrophic_check=True
+            )
+            err += part_err * a_part.numel()
+        err /= a.numel()
+    if b_preshuffle and not use_flydsl_fp8_scale:
         x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
         b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(
             x, gemm_weight, x_scale_strided, w_scale, dtype
@@ -180,15 +198,17 @@ def test_gemm(
         checkAllclose(
             a,
             b_strided,
-            msg="ck strided x_scale",
+            msg="strided x_scale",
             catastrophic_check=True,
         )
     ret["gfx"] = get_gfx()
     ret["w_scale_block"] = w_scale_block
-    ret["ck us"] = avg_b
-    ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
-    ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
-    ret["ck err"] = err_ck
+    ret["us"] = avg_b
+    ret["TFLOPS"] = m * n * k * 2 / avg_b / 1e6
+    # Effective bandwidth in TB/s: one read of A/B/scales and one write of D.
+    num_bytes = sum(t.nbytes for t in (x, gemm_weight, gemm_x_scale, gemm_w_scale, b))
+    ret["BW"] = num_bytes / avg_b / 1e6
+    ret["err"] = err
 
     if apre and use_flydsl_fp8_scale:
         # A-preshuffle packs adjacent A row pairs, so an odd M needs A -- and only
@@ -203,9 +223,12 @@ def test_gemm(
         )
         ret["apre us"] = avg_e
         ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
-        ret["apre TB/s"] = (x_apre.nbytes + weight.nbytes) / avg_e / 1e6
+        num_bytes = sum(
+            t.nbytes for t in (x_apre, gemm_weight, gemm_x_scale, w_scale, e)
+        )
+        ret["apre BW"] = num_bytes / avg_e / 1e6
         ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
-        ret["apre/ck"] = avg_e / avg_b
+        ret["apre/base"] = avg_e / avg_b
 
     if not use_flydsl_fp8_scale:
         # The ASM blockscale implementation has no gfx1250 kernel.
@@ -217,20 +240,22 @@ def test_gemm(
             err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
             ret[f"{tag} us"] = avg_c
             ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-            ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+            num_bytes = sum(t.nbytes for t in (x, weight_asm, x_scale_t, w_scale, c))
+            ret[f"{tag} BW"] = num_bytes / avg_c / 1e6
             ret[f"{tag} err"] = err_asm
-            ret["asm/ck"] = avg_c / avg_b
+            ret["asm/base"] = avg_c / avg_b
 
         # Triton path requires a preshuffled weight. When not preshuffled we simply omit
         # these columns; pd.DataFrame NaN-fills them for those rows in the summary.
-        if ck_preshuffle:
+        if b_preshuffle:
             d, avg_d = run_triton(x, gemm_weight, x_scale_t, w_scale, dtype)
             err_triton = checkAllclose(a, d, msg="triton", catastrophic_check=True)
             ret["triton us"] = avg_d
             ret["triton TFLOPS"] = m * n * k * 2 / avg_d / 1e6
-            ret["triton TB/s"] = (x.nbytes + weight.nbytes) / avg_d / 1e6
+            num_bytes = sum(t.nbytes for t in (x, gemm_weight, x_scale_t, w_scale, d))
+            ret["triton BW"] = num_bytes / avg_d / 1e6
             ret["triton err"] = err_triton
-            ret["triton/ck"] = avg_d / avg_b
+            ret["triton/base"] = avg_d / avg_b
 
     return ret
 
@@ -410,19 +435,21 @@ parser.add_argument(
     help="RNG seed for input, weight, and scales (default: 0)",
 )
 parser.add_argument(
+    "--b_preshuffle",
     "--ck_preshuffle",
+    dest="b_preshuffle",
     type=dtypes.str2bool,
     nargs="*",
     default=None,
-    help="""weight ck_preshuffle or not.
-    e.g.: --ck_preshuffle True
-        or --ck_preshuffle False
+    help="""weight B preshuffle or not (default: CSV layout, else True and False).
+    e.g.: --b_preshuffle True
+        or --b_preshuffle False
     """,
 )
 parser.add_argument(
     "--flydsl",
     action="store_true",
-    help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
+    help="use native E8M0 scales (selected automatically for native CSV rows)",
 )
 parser.add_argument(
     "--w-scale-block",
@@ -436,8 +463,8 @@ parser.add_argument(
     nargs="*",
     default=[False],
     help="""also measure the FlyDSL A-preshuffle candidate (requires --flydsl
-    --ck_preshuffle True). Odd M is padded to M+1 rows for A only.
-    Sweeps like --ck_preshuffle.
+    --b_preshuffle True). Odd M is padded to M+1 rows for A only.
+    Sweeps like --b_preshuffle.
     e.g.: --apre True
         or --apre True False""",
 )
@@ -446,7 +473,8 @@ parser.add_argument(
     type=str,
     default=None,
     help="""CSV file containing M, N, K columns (one shape per row).
-    An optional w_scale_block column selects 32x32 or 128x128 per row.
+    An optional w_scale_block column selects 1x32, 32x32 or 128x128 per row.
+    Without --csv or explicit -m/-nk, sweep all configured CSVs for this GPU.
     e.g.: --csv shapes.csv""",
 )
 parser.add_argument(
@@ -486,87 +514,117 @@ if len(data_init_list) != len(scale_init_list):
     )
 init_pairs = list(zip(data_init_list, scale_init_list))
 
-if args.ck_preshuffle is None:
-    args.ck_preshuffle = [True] if args.flydsl else [True, False]
-l_preshuffle = (
-    args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
+l_preshuffle = args.b_preshuffle or ([True] if args.flydsl else [True, False])
+l_apre = args.apre
+# Preserve the -m/-nk defaults; only explicit shape arguments select shape mode.
+default_csv = args.csv is None and not any(
+    arg.startswith(("-m", "-nk")) for arg in sys.argv[1:]
 )
-l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
 
 df = []
-if args.csv is not None:
-    if not os.path.exists(args.csv):
-        raise FileNotFoundError(f"CSV file not found: {args.csv}")
-    shapes_df = pd.read_csv(args.csv)
-    if "gfx" in shapes_df.columns:
-        current_gfx = get_gfx()
-        shapes_df = shapes_df[shapes_df["gfx"].astype(str).str.strip() == current_gfx]
-        if shapes_df.empty:
-            parser.error(f"No rows for {current_gfx} in {args.csv}")
-    print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
-
-    def _scale_block_for_row(row):
-        value = row.get("w_scale_block")
-        if args.w_scale_block:
-            return args.w_scale_block
-        return (
-            str(value).strip() if pd.notna(value) and str(value).strip() else "128x128"
+if args.csv is not None or default_csv:
+    sources = [
+        ("", False, False, "128x128"),
+        ("_BPRESHUFFLE", True, False, "128x128"),
+        ("_GROUP32", False, True, "32x32"),
+        ("_MXSCALE_BPRESHUFFLE", True, True, "128x128"),
+    ]
+    if args.csv is not None:
+        sources = [(args.csv, None, args.flydsl, "128x128")]
+    tables = []
+    for suffix, preshuffle, native, block in sources:
+        path = args.csv or getattr(
+            AITER_CONFIGS, f"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE{suffix}_FILE"
         )
-
-    scale_blocks = [_scale_block_for_row(row) for _, row in shapes_df.iterrows()]
+        name = os.path.basename(path)
+        native = native or "mxscale" in name or "group32" in name
+        if "group32" in name:
+            preshuffle, block = False, "32x32"
+        table = pd.read_csv(path)
+        if "gfx" in table:
+            table = table[table["gfx"].astype(str).str.strip() == get_gfx()]
+        if "cu_num" in table:
+            table = table[table["cu_num"] == get_cu_num()]
+        table = table.filter(["M", "N", "K", "w_scale_block"]).copy()
+        table["w_scale_block"] = table.get("w_scale_block", block)
+        table["w_scale_block"] = (
+            table["w_scale_block"]
+            .replace(r"^\s*$", pd.NA, regex=True)
+            .fillna(block)
+            .astype(str)
+            .str.strip()
+        )
+        table["b_preshuffle"] = preshuffle
+        table["use_flydsl"] = native
+        tables.append(table)
+        print(f"Loaded {len(table)} shapes from {path}", flush=True)
+    shapes_df = pd.concat(tables, ignore_index=True).drop_duplicates()
+    if args.w_scale_block:
+        if default_csv:
+            shapes_df = shapes_df[shapes_df["w_scale_block"] == args.w_scale_block]
+        else:
+            shapes_df["w_scale_block"] = args.w_scale_block
+    shapes_df["use_flydsl"] |= shapes_df["w_scale_block"].isin(("1x32", "32x32"))
+    if args.csv is not None and args.b_preshuffle is not None:
+        shapes_df = pd.concat(
+            [shapes_df.assign(b_preshuffle=p) for p in args.b_preshuffle]
+        )
+    shapes_df["use_flydsl"] &= shapes_df["b_preshuffle"].ne(False) | (
+        shapes_df["w_scale_block"] != "128x128"
+    )
+    if default_csv and args.flydsl:
+        shapes_df = shapes_df[shapes_df["use_flydsl"]]
+    if default_csv and args.b_preshuffle is not None:
+        shapes_df = shapes_df[shapes_df["b_preshuffle"].isin(args.b_preshuffle)]
+    if shapes_df.empty:
+        print("No matching CSV rows, nothing to run")
+        sys.exit(0)
+    scale_blocks = shapes_df["w_scale_block"].tolist()
 else:
     scale_blocks = [args.w_scale_block or "128x128"]
-
-if get_gfx() not in W_SCALE_32X32_GFX and "32x32" in scale_blocks:
-    print(f"Skipping the 32x32 cases: {get_gfx()} has no native 32x32 dispatch")
-    if args.csv is not None:
-        shapes_df = shapes_df[[b != "32x32" for b in scale_blocks]]
-    scale_blocks = [b for b in scale_blocks if b != "32x32"]
-if not scale_blocks:
-    print("No supported case left, nothing to run")
-    sys.exit(0)
+    if scale_blocks[0] != "128x128":
+        if get_gfx() not in NATIVE_SCALE_GFX:
+            print(f"Skipping the group32 cases: {get_gfx()} has no native dispatch")
+            sys.exit(0)
+        if args.b_preshuffle is None:
+            l_preshuffle = [True]
 
 for w_scale_block in set(scale_blocks):
     if w_scale_block not in SCALE_BLOCK_SHAPES:
-        parser.error(
-            f"unsupported w_scale_block {w_scale_block!r}; choose from "
-            f"{', '.join(SCALE_BLOCK_SHAPES)}"
-        )
-    if w_scale_block == "32x32":
-        if not args.flydsl:
-            parser.error("32x32 scales require --flydsl")
-        if any(not preshuffle for preshuffle in l_preshuffle):
-            parser.error("32x32 scales require --ck_preshuffle True")
-        if any(l_apre):
-            parser.error("32x32 scales do not support --apre True")
+        parser.error(f"unsupported w_scale_block {w_scale_block!r}")
+    if w_scale_block != "128x128" and any(l_apre):
+        parser.error("Group32 scales do not support --apre True")
 
-if args.csv is not None:
+if args.csv is not None or default_csv:
     for dtype in args.dtype:
-        for preshuffle in l_preshuffle:
-            for data_init, scale_init in init_pairs:
-                for apre in l_apre:
-                    for (_, row), w_scale_block in zip(
-                        shapes_df.iterrows(), scale_blocks
-                    ):
+        for _, row in shapes_df.iterrows():
+            preshuffles = (
+                [bool(row["b_preshuffle"])]
+                if pd.notna(row["b_preshuffle"])
+                else ([True] if row["use_flydsl"] else l_preshuffle)
+            )
+            for preshuffle in preshuffles:
+                for data_init, scale_init in init_pairs:
+                    for apre in l_apre:
                         ret = test_gemm(
                             dtype,
                             int(row["M"]),
                             int(row["N"]),
                             int(row["K"]),
-                            ck_preshuffle=preshuffle,
-                            use_flydsl=args.flydsl,
+                            b_preshuffle=preshuffle,
+                            use_flydsl=bool(row["use_flydsl"]),
                             data_init=data_init,
                             scale_init=scale_init,
                             seed=args.seed,
                             apre=apre,
-                            w_scale_block=w_scale_block,
+                            w_scale_block=row["w_scale_block"],
                         )
                         df.append(ret)
 else:
     for dtype in args.dtype:
         for m in args.m:
             for n, k in args.nk:
-                for ck_p in l_preshuffle:
+                for b_p in l_preshuffle:
                     for apre in l_apre:
                         for data_init, scale_init in init_pairs:
                             ret = test_gemm(
@@ -574,7 +632,7 @@ else:
                                 m,
                                 n,
                                 k,
-                                ck_preshuffle=ck_p,
+                                b_preshuffle=b_p,
                                 use_flydsl=args.flydsl,
                                 data_init=data_init,
                                 scale_init=scale_init,
@@ -588,18 +646,21 @@ df = pd.DataFrame([row for row in df if row is not None])
 print_json_table("gemm_a8w8_blockscale summary", df)
 if args.table and not df.empty:
     print("\n" + "=" * 150)
-    print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
+    print("GEMM PERFORMANCE SUMMARY (BW in TB/s)")
     print("=" * 150)
     print(df.to_string(index=False))
     print("=" * 150)
 
-# Correctness check: verify split-K produces matching results
-print("\nRunning split-K correctness checks ...")
-for splitK in [1, 2]:
-    test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
-# Two K loops per split for the default CK-Tile tile, the shortest split it runs.
-for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
-    test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
+# The legacy HIP split-K kernels do not support gfx1250.
+if get_gfx() in ("gfx942", "gfx950"):
+    # Correctness check: verify split-K produces matching results
+    print("\nRunning split-K correctness checks ...")
+    for splitK in [1, 2]:
+        test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
+    # Two K loops per split for the default CK-Tile tile, the shortest split it runs.
+    for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
+        test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
+
 
 # Save results from benchmarks
 if args.output:
