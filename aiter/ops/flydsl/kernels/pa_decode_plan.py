@@ -40,6 +40,19 @@ def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_
             )
         return first, (length + 255) // 256 - first
 
+    def split(tiles, lower, upper):
+        """Return a row's task count from its cumulative slot bounds."""
+        return fx.Int32(
+            fx.min(
+                fx.min(fx.Int64(tiles > 0) + upper - lower, tiles),
+                fx.Int64(max_parts),
+            )
+        )
+
+    # Lookup reaches rows below max_batch, so it needs one fewer level than
+    # max_batch.bit_length() at power-of-two buckets.
+    lookup_bits = (max_batch - 1).bit_length()
+
     @flyc.kernel(known_block_size=[threads, 1, 1])
     def pa_decode_plan_kernel(
         lengths_ptr: fx.Pointer,
@@ -57,18 +70,28 @@ def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_
         count_storage = smem.allocate(scan_counts.SharedStorage).peek()
         row_storage = smem.allocate(reduce_rows.SharedStorage).peek()
         task_ends = smem.allocate(TaskStorage).peek().ends
-        # Each thread walks its consecutive rows with runtime bounds, so scans
-        # of per-thread totals preserve sequence order, padding rows cost
-        # nothing, and register use does not grow with the batch bucket.
-        rows = (batch + threads - 1) // threads
-        row_begin = fx.min(fx.Int32(tid) * rows, batch)
-        row_end = fx.min(row_begin + rows, batch)
-        thread_tiles = fx.Int64(0)
-        thread_rows = fx.Int32(0)
-        for seq in range(row_begin, row_end):
-            _, tiles = visible_tiles(lengths[seq])
-            thread_tiles = thread_tiles + tiles
-            thread_rows = thread_rows + fx.Int32(tiles > 0)
+        # Each thread owns consecutive rows, so scans of per-thread totals
+        # preserve sequence order. Buckets that fit the block give each thread
+        # at most one row; larger ones walk rows with runtime bounds, so padding
+        # rows cost nothing and register use does not grow with the bucket.
+        single = max_batch <= threads
+        if fx.const_expr(single):
+            row = fx.Int32(tid)
+            row_ctx = fx.Int32(0)
+            if row < batch:
+                row_ctx = lengths[row]
+            _, thread_tiles = visible_tiles(row_ctx)
+            thread_rows = fx.Int32(thread_tiles > 0)
+        else:
+            rows = (batch + threads - 1) // threads
+            row_begin = fx.min(fx.Int32(tid) * rows, batch)
+            row_end = fx.min(row_begin + rows, batch)
+            thread_tiles = fx.Int64(0)
+            thread_rows = fx.Int32(0)
+            for seq in range(row_begin, row_end):
+                _, tiles = visible_tiles(lengths[seq])
+                thread_tiles = thread_tiles + tiles
+                thread_rows = thread_rows + fx.Int32(tiles > 0)
 
         cumulative, total = scan_tiles.exclusive_with_aggregate(
             thread_tiles, fx.ReductionOp.ADD, storage=tile_storage
@@ -77,33 +100,44 @@ def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_
         remaining = fx.Int64(
             capacity - reduce_rows(thread_rows, fx.ReductionOp.ADD, storage=row_storage)
         )
-        # Each row's lower bound is the previous row's upper bound.
-        lower = cumulative * remaining // total
-        thread_tasks = fx.Int32(0)
-        for seq in range(row_begin, row_end):
-            _, tiles = visible_tiles(lengths[seq])
-            cumulative = cumulative + tiles
-            upper = cumulative * remaining // total
-            count = fx.Int32(
-                fx.min(
-                    fx.min(fx.Int64(tiles > 0) + upper - lower, tiles),
-                    fx.Int64(max_parts),
+        if fx.const_expr(single):
+            # Empty and padding rows get no tasks; skip their Int64 divisions.
+            thread_tasks = fx.Int32(0)
+            if thread_tiles > 0:
+                thread_tasks = split(
+                    thread_tiles,
+                    cumulative * remaining // total,
+                    (cumulative + thread_tiles) * remaining // total,
                 )
-            )
-            lower = upper
-            task_ends[seq] = count
-            thread_tasks = thread_tasks + count
+        else:
+            # Each row's lower bound is the previous row's upper bound.
+            lower = cumulative * remaining // total
+            thread_tasks = fx.Int32(0)
+            for seq in range(row_begin, row_end):
+                _, tiles = visible_tiles(lengths[seq])
+                cumulative = cumulative + tiles
+                upper = cumulative * remaining // total
+                count = split(tiles, lower, upper)
+                lower = upper
+                task_ends[seq] = count
+                thread_tasks = thread_tasks + count
         row_start, total_tasks = scan_counts.exclusive_with_aggregate(
             thread_tasks, fx.ReductionOp.ADD, storage=count_storage
         )
 
-        # Rows are thread-private here; convert counts to ends in place.
-        for seq in range(row_begin, row_end):
-            count = task_ends[seq]
-            reduce_info[seq * 2] = row_start
-            reduce_info[seq * 2 + 1] = count
-            row_start = row_start + count
-            task_ends[seq] = row_start
+        if fx.const_expr(single):
+            if row < batch:
+                reduce_info[row * 2] = row_start
+                reduce_info[row * 2 + 1] = thread_tasks
+                task_ends[row] = row_start + thread_tasks
+        else:
+            # Rows are thread-private here; convert counts to ends in place.
+            for seq in range(row_begin, row_end):
+                count = task_ends[seq]
+                reduce_info[seq * 2] = row_start
+                reduce_info[seq * 2 + 1] = count
+                row_start = row_start + count
+                task_ends[seq] = row_start
         fx.gpu.barrier()
 
         # Spread packed task writes across all threads, including small batches
@@ -112,7 +146,7 @@ def compile_pa_decode_plan(max_batch, threads, max_parts, sliding_window, query_
         for slot in range(tid, capacity, threads):
             if slot < total_tasks:
                 seq = fx.Int32(-1)
-                for bit in fx.range_constexpr(max_batch.bit_length() - 1, -1, -1):
+                for bit in fx.range_constexpr(lookup_bits - 1, -1, -1):
                     candidate = seq + (1 << bit)
                     if candidate < batch:  # noqa: SIM102 -- guard the LDS read
                         if task_ends[candidate] <= slot:
@@ -217,7 +251,7 @@ def plan_pa_decode(
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
     omitting it on refresh preserves the existing limit.
     ``max_batch_size`` defaults to 4096 for a new plan and is retained on refresh.
-    Kernels use batch buckets with upper bounds 64, 128, 256, ... clipped to
+    Kernels use batch buckets with upper bounds 1, 2, 4, ... clipped to
     ``max_batch_size`` and the device's LDS capacity. Each bucket requires four
     LDS bytes per sequence plus scan storage. Actual batch and task capacity
     are runtime values; capacity only specializes the block size (64--1024).
@@ -264,9 +298,7 @@ def plan_pa_decode(
         )
     # Clip the last bucket so rounding up cannot reject a batch that fits LDS.
     lds_max_batch = (shared_memory_per_block - _PLAN_SCAN_LDS_BYTES) // 16 * 4
-    max_batch = min(
-        max_batch_size, lds_max_batch, max(64, 1 << (batch - 1).bit_length())
-    )
+    max_batch = min(max_batch_size, lds_max_batch, 1 << (batch - 1).bit_length())
     if max_partitions is None:
         max_partitions = num_compute_units if plan is None else plan.max_partitions
     if not 1 <= max_partitions <= num_compute_units:

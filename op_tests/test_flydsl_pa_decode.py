@@ -31,8 +31,8 @@ def device(monkeypatch):
 @pytest.mark.parametrize(
     "batch,max_parts,budget,window,query_length,max_batch_size,bucket",
     [
-        (1, 1, 1, 0, 1, None, 64),
-        (6, 7, 160, 257, 4, None, 64),
+        (1, 1, 1, 0, 1, None, 1),
+        (6, 7, 160, 257, 4, None, 8),
         (63, 7, 160, 0, 1, None, 64),
         (65, 7, 512, 1, 4, None, 128),
         (257, None, 4096, 8193, 4, None, 512),
