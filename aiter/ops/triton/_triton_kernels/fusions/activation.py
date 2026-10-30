@@ -245,12 +245,18 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             )
 
 
+_act_mul_and_dynamic_fp8_group_quant_repr = make_kernel_repr(
+    "_act_mul_and_dynamic_fp8_group_quant_kernel",
+    ["ACTIVATION", "BLOCK_SIZE_N", "QUANT_BLOCK_SIZE", "EVEN_N"],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,
     }
 )
-@triton.jit
+@triton.jit(repr=_act_mul_and_dynamic_fp8_group_quant_repr)
 def _act_mul_and_dynamic_fp8_group_quant_kernel(
     x_ptr,
     x_fp8_ptr,
