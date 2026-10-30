@@ -1,4 +1,4 @@
-name: Radeon gfx1201 dispatch test
+name: Radeon xsj-dispatch dispatch test
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
 
 jobs:
   gfx1201:
-    runs-on: [self-hosted, linux, devlab-dispatch, radeon-r9700]
+    runs-on: [self-hosted, linux, devlab-dispatch, xsj-dispatch]
     steps:
       - name: Check gfx1201 runner
         run: |
