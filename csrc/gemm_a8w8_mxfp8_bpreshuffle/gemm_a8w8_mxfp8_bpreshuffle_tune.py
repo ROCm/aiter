@@ -34,6 +34,7 @@ import torch.nn.functional as F
 
 from aiter import dtypes, logger
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+    KERNEL_ID_BASE_PF,
     MXFP8_ROW_PIPELINES,
     MXFP8_ROW_W32X32_PIPELINES,
     MXFP8_ROW_W128X128_PIPELINES,
@@ -393,7 +394,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             elif getattr(self, "_mxscale_table", False):
                 kernelId = (
                     MXSCALE_BMM_KERNEL_ID
-                    if kernelId >= KERNEL_ID_BASE_BMM
+                    # bmm's ids sit between fsk's and the _pf ones
+                    if KERNEL_ID_BASE_BMM <= kernelId < KERNEL_ID_BASE_PF
                     else MXSCALE_KERNEL_ID
                 )
             tflops, bw = self.calculate(el)
