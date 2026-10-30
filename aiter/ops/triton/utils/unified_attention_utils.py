@@ -12,6 +12,7 @@ only the axes that matter, joined by '.':
       "attn_2d": {
         "D_LEQ_128.Q_LEQ_1.SW": {...},   # head_size <= 128, decode, sliding window
         "D_LEQ_128.Q_LEQ_1":    {...},   # head_size <= 128, decode
+        "D_EQ_192":             {...},   # head_size == 192 and nothing else
         "D_GEQ_512":            {...},   # head_size >= 512, any query length
         "DT_fp8_fp8":           {...},   # fp8 query and KV cache
         "any":                  {...}
@@ -21,8 +22,9 @@ only the axes that matter, joined by '.':
     }
 
 Lookup walks the axes in the order "schema" lists them and takes the first key
-that exists: LEQ bounds ascending, then GEQ descending, then "any". So the
-leftmost axis wins: D before Q is what makes head_size outrank max_seqlen_q.
+that exists: an exact EQ first, then LEQ bounds ascending, then GEQ
+descending, then "any". So the leftmost axis wins: D before Q is what makes
+head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 
 A section with no axes, like reduce above, is just a config.
@@ -66,6 +68,8 @@ _AXIS_KIND = {
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
     "DT": "enum",  # (q dtype tag, kv dtype tag)
+    # 2d programs per CU, rounded up to a power of 2, so P bounds must be powers of 2
+    "P": "num",
 }
 
 
@@ -120,12 +124,14 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
         q, kv = value
         return [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
 
+    eq = sorted(c for c in parts if c.startswith(f"{axis}_EQ_"))
     leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound)
     geq = sorted(
         (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound, reverse=True
     )
     return (
-        [c for c in leq if value <= _bound(c)]
+        [c for c in eq if value == _bound(c)]
+        + [c for c in leq if value <= _bound(c)]
         + [c for c in geq if value >= _bound(c)]
         + ["any"]
     )
@@ -216,6 +222,7 @@ def _axis_values(
     block_size,
     q_dtype,
     kv_dtype,
+    programs_per_cu,
 ) -> dict:
     return {
         "D": head_size,
@@ -225,7 +232,12 @@ def _axis_values(
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype)),
+        "P": programs_per_cu,
     }
+
+
+def _programs_per_cu(params) -> int:
+    return triton.next_power_of_2(triton.cdiv(params.num_2d_prgms, params.num_sms))
 
 
 def _load(op: str, backend, arch: str | None) -> tuple:
@@ -263,6 +275,7 @@ def _get_unified_attention_config_cached(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     block_size: int,
+    programs_per_cu: int,
     backend: str,
     arch: str | None,
 ) -> dict:
@@ -280,6 +293,7 @@ def _get_unified_attention_config_cached(
         block_size,
         q_dtype,
         kv_dtype,
+        programs_per_cu,
     )
     _, config = _lookup(table, axes, values)
     return compute_tile_params(config, block_size)
@@ -315,6 +329,7 @@ def get_unified_attention_config(
         params.q_dtype,
         params.kv_cache_dtype,
         params.block_size,
+        _programs_per_cu(params),
         backend,
         arch,
     )
@@ -335,6 +350,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.block_size,
         params.q_dtype,
         params.kv_cache_dtype,
+        _programs_per_cu(params),
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(
