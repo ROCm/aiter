@@ -262,6 +262,13 @@ jobs:
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
 
+      - name: GPU memory preflight
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== rocm-smi VRAM + PIDs at container start (before tests) ==="
+          docker exec triton_test rocm-smi --showmeminfo vram --showpids
+
       - name: Setup Aiter and Triton
         timeout-minutes: 20
         run: |
@@ -419,6 +426,13 @@ jobs:
           -w /workspace \
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
+
+      - name: GPU memory preflight
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== rocm-smi VRAM + PIDs at container start (before tests) ==="
+          docker exec triton_test rocm-smi --showmeminfo vram --showpids
 
       - name: Setup Aiter and Triton
         run: |

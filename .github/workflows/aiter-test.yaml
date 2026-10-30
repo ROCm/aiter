@@ -797,6 +797,13 @@ jobs:
           --name aiter_test \
           $IMAGE_TAG
 
+      - name: GPU memory preflight
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== rocm-smi VRAM + PIDs at container start (before tests) ==="
+          docker exec aiter_test rocm-smi --showmeminfo vram --showpids
+
       - name: Check GPU visibility
         run: |
           set -euo pipefail
@@ -1124,6 +1131,13 @@ jobs:
           -w /workspace \
           --name aiter_test \
           $IMAGE_TAG
+
+      - name: GPU memory preflight
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== rocm-smi VRAM + PIDs at container start (before tests) ==="
+          docker exec aiter_test rocm-smi --showmeminfo vram --showpids
 
       - name: Check GPU visibility
         run: |
