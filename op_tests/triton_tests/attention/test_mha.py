@@ -1262,11 +1262,11 @@ def _fwd_masked(
     return out, lse.transpose(1, 2)
 
 
-# 512/128 and 256/64 mask whole BLOCK_M blocks and take the early-return path.
-# 300/128 and 129/1 put causal_start_idx inside a block and take the post-loop path.
+# BLOCK_M=128: masked rows end on a block boundary for 512/128 (early return only)
+# and inside a block for 300/128, 256/64 and 200/1 (early return and post-loop).
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize(
-    "seqlen_q, seqlen_k", [(512, 128), (300, 128), (256, 64), (129, 1)]
+    "seqlen_q, seqlen_k", [(512, 128), (300, 128), (256, 64), (200, 1)]
 )
 def test_fully_masked_rows_have_neg_inf_lse(seqlen_q, seqlen_k, backend):
     skip_if_gluon_unsupported(backend)
