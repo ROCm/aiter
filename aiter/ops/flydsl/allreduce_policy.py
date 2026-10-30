@@ -50,20 +50,7 @@ rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
 one engine per rung.
 
 Fused all-reduce + RMSNorm
-==========================
-
-The fused kernels (``OneShotAllReduceRMSNorm``, ``FlyQuickAllReduceRMSNorm``)
-have their own tables of both levels: ``FUSED_FAMILY_POLICIES`` and
-``FUSED_ONESHOT_LADDER``, ``FUSED_MESH_ST_LADDER``, ``FUSED_RING_ST_LADDER``
-plus ``FUSED_QR_ROW_ATOMS``. All three fused families live in one slot
-(``QuickAllReduce``). The overrides are
-``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES``. The one-shot ladder's ``split``
-rungs run unsplit unless ``AITER_FLY_AR_FUSED_SPLIT=1``.
-
-The fused ladders are also keyed by the hidden size, and are read from
-``configs/comm/fused_allreduce_ladders.json`` (or the file ``AITER_FLY_AR_FUSED_LADDERS``
-names).
-"""
+==================="""
 
 from __future__ import annotations
 
@@ -504,7 +491,7 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx950",
         link="xgmi",
         world_size=2,
-        oneshot=Window(0, 64 * MiB),
+        oneshot=Window(0, 4 * MiB),
         mesh=Window(512 * KiB, None),
         ring=None,
     ),
@@ -646,10 +633,12 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 
 # Mesh, ``TwoShotRung``.
 #
-#   xGMI  ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
-#         Block 512 from 4 MiB.
-#         gfx950: ST=8 b256, then b512 from 4 MiB for TP4 (ST=1) and TP8 (ST=8).
-#         TP2 stays on one rung.
+#   xGMI  gfx942: ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
+#           Block 512 from 4 MiB.
+#         gfx950: one b256 rung per TP.
+#           - TP2 ST=1 cap512
+#           - TP4 ST=1 cap1024
+#           - TP8 ST=8 cap384:
 #   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
 #         TP8 ST=8 everywhere.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
@@ -669,15 +658,13 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
     ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=256),
     ),
     ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
     ),
     ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 * MiB, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=384, block=256),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (

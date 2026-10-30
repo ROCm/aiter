@@ -514,8 +514,9 @@ def _full_storage_transpose(nbytes: int) -> torch.Tensor:
     """A bf16 view that is weakly but not strictly contiguous.
 
     The transpose of a whole contiguous allocation covers its storage exactly,
-    so ``is_weak_contiguous`` accepts it while ``Tensor.is_contiguous()`` does
-    not -- the gap the FlyDSL selectors have to close.
+    so quick-reduce's ``is_weak_contiguous`` accepts it while
+    ``Tensor.is_contiguous()`` does not -- the gap the FlyDSL selectors have to
+    close.
     """
     cols = 64
     rows = nbytes // (cols * 2)
@@ -527,10 +528,12 @@ def _full_storage_transpose(nbytes: int) -> torch.Tensor:
 def test_selectors_reject_non_contiguous():
     """Both FlyDSL selectors decline a weakly-contiguous view.
 
-    ``CustomAllreduce`` admits weakly-contiguous tensors, but both FlyDSL
+    ``QuickAllReduce`` admits weakly-contiguous tensors, but both FlyDSL
     engines require strict contiguity and raise otherwise. Once dispatch has
     picked FlyDSL the exception replaces the fallback, so the selectors must
-    decline these tensors themselves. Each selector is run against a stand-in
+    decline these tensors themselves. ``CustomAllreduce`` now admits only
+    strictly contiguous tensors, so its selector is checked as a guard: the
+    one-shot must not rely on the caller's check. Each selector is run against a stand-in
     ``self`` (the fields it reads), so no process group or GPU is needed. The
     contiguous copy of the same payload is accepted, which shows the refusal
     comes from contiguity rather than from size, dtype or alignment.
