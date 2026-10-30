@@ -31,6 +31,7 @@ from flydsl.expr import (
     Int32,
     Int64,
     const_expr,
+    fastmath,
     gpu,
     range_constexpr,
 )
@@ -75,11 +76,11 @@ _TINY_SPLITS = 128
 _NARROW_HEAD_DIM = 128
 _DECODE_BANDS_NARROW = (4, 16)
 _DECODE_BANDS_WIDE = (2, 12)
-# Finite floor for an empty LSE, the initial running max, and a masked
-# score. The kernel is compiled with fastmath "fast", which includes ninf,
-# so a real -inf operand is poison and a compare against it can fold away.
-# 1e20 sits far below any bf16 QK score this kernel scales.
-_LSE_EMPTY = -1.0e20
+# Empty running max, masked score, and empty-split LSE. fastmath "fast"
+# includes ninf, so a compare against this value is emitted with fastmath
+# none and the max itself is tagged nnan only. A fully masked row keeps
+# the max here and exponentiates against 0.
+_NEG_INF = float("-inf")
 
 
 def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
@@ -806,9 +807,13 @@ def build_qsa_sparse_gqa_module(
                         BFloat16,
                     )
                 )
+        # See ``_NEG_INF``. The carried max stays -inf until a finite score
+        # arrives; ``m_exp`` below is only the exponent base.
+        neg_inf = Float32(_NEG_INF)
+        zero_f = Float32(0.0)
         init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
-        init_acc.append(Float32(_LSE_EMPTY))
-        init_acc.append(Float32(0.0))
+        init_acc.append(neg_inf)
+        init_acc.append(zero_f)
 
         def tile_body(safe_phys, page_off_i, live, state):
             gpu.barrier()
@@ -1090,7 +1095,7 @@ def build_qsa_sparse_gqa_module(
 
             m_prev = Float32(state[out_chunks])
             l_prev = Float32(state[out_chunks + 1])
-            tile_max = Float32(_LSE_EMPTY)
+            tile_max = neg_inf
             scores = []
             score_lives = []
             live_bits = Int64(0)
@@ -1110,30 +1115,35 @@ def build_qsa_sparse_gqa_module(
                             != zero
                         )
                     score = qk_accs[ng][i] * softmax_scale_log2
-                    score = score_live.select(score, Float32(_LSE_EMPTY))
+                    score = score_live.select(score, neg_inf)
                     sc.append(score)
                     lives.append(score_live)
-                    tile_max = fx.max(tile_max, score)
+                    tile_max = fx.max(tile_max, score, fastmath="nnan")
                 scores.append(sc)
                 score_lives.append(lives)
             tile_peer = fx.gpu.shuffle_xor(tile_max, 32, 64)
-            tile_max = fx.max(tile_max, tile_peer)
+            tile_max = fx.max(tile_max, tile_peer, fastmath="nnan")
             tile_peer = fx.gpu.shuffle_xor(tile_max, 16, 64)
-            tile_max = fx.max(tile_max, tile_peer)
-            m_new = fx.max(m_prev, tile_max)
-            alpha = fxmath.exp2(m_prev - m_new)
-            # An empty history stays at the floor, and exp2(floor - floor)
-            # is 1. A zero denominator has nothing to carry.
-            alpha = ((m_prev == Float32(_LSE_EMPTY)) | (l_prev == Float32(0.0))).select(
-                Float32(0.0), alpha
-            )
+            tile_max = fx.max(tile_max, tile_peer, fastmath="nnan")
+            m_new = fx.max(m_prev, tile_max, fastmath="nnan")
+            # ninf folds `x == -inf` to false. The persisted max stays -inf
+            # on a fully masked row; exp2 subtracts the finite stand-in.
+            with fastmath(None):
+                row_alive = m_new > neg_inf
+                hist_empty = m_prev == neg_inf
+            m_exp = row_alive.select(m_new, zero_f)
+            m_prev_exp = hist_empty.select(m_exp, m_prev)
+            alpha = hist_empty.select(zero_f, fxmath.exp2(m_prev_exp - m_exp))
+            # A zero denominator has nothing to carry.
+            alpha = (l_prev == zero_f).select(zero_f, alpha)
             p_sum = Float32(0.0)
             p_vecs = []
             for ng in range_constexpr(n_subtiles):
                 probs = []
                 for i in range_constexpr(4):
+                    live_score = score_lives[ng][i].select(scores[ng][i], m_exp)
                     p = score_lives[ng][i].select(
-                        fxmath.exp2(scores[ng][i] - m_new), Float32(0.0)
+                        fxmath.exp2(live_score - m_exp), zero_f
                     )
                     p_sum = p_sum + p
                     if const_expr(decode_tr_pv):
@@ -1335,9 +1345,14 @@ def build_qsa_sparse_gqa_module(
             head = kv_h * Int32(group_size) + lane_m
             den = l_final
             has = den > Float32(0.0)
+            # log(0) and -inf + log are poison under ninf. An empty split
+            # stores -inf, and both operands of the log-sum are finite
+            # on that path.
+            lse_m = has.select(m_final, zero_f)
+            lse_den = has.select(den, Float32(1.0))
             lse = has.select(
-                m_final + fxmath.log(den) * Float32(LOG2E),
-                Float32(_LSE_EMPTY),
+                lse_m + fxmath.log(lse_den) * Float32(LOG2E),
+                neg_inf,
             )
             partial_lse[split, row, head] = lse
 
@@ -1356,29 +1371,37 @@ def build_qsa_sparse_gqa_module(
         d_slice = fx.block_idx.z
         lane = fx.thread_idx.x
         zero_f = Float32(0.0)
+        neg_inf = Float32(_NEG_INF)
         # The wave reduces the LSEs, so past 64 splits a lane owns several.
+        # An empty split is -inf and must lose to any finite LSE.
         lses = []
         for j in range_constexpr(merge_per_lane):
             s = lane + Int32(j * 64)
             s_live = s < Int32(n_splits)
             part_lse = partial_lse[s_live.select(s, Int32(0)), row, head]
-            lses.append(s_live.select(part_lse, Float32(_LSE_EMPTY)))
+            lses.append(s_live.select(part_lse, neg_inf))
 
         lse_max = lses[0]
         for j in range_constexpr(merge_per_lane):
             if const_expr(j > 0):
-                lse_max = fx.max(lse_max, lses[j])
+                lse_max = fx.max(lse_max, lses[j], fastmath="nnan")
         for sh in (32, 16, 8, 4, 2, 1):
-            lse_max = fx.max(lse_max, fx.gpu.shuffle_xor(lse_max, sh, 64))
+            lse_max = fx.max(
+                lse_max, fx.gpu.shuffle_xor(lse_max, sh, 64), fastmath="nnan"
+            )
 
         merge_storage = fx.SharedAllocator().allocate(MergeStorage).peek()
         weights = merge_storage.weights.view(fx.make_layout(merge_slots, 1))
 
+        with fastmath(None):
+            any_live = lse_max > neg_inf
+        lse_exp = any_live.select(lse_max, zero_f)
         den = zero_f
         for j in range_constexpr(merge_per_lane):
-            w = (lses[j] > Float32(_LSE_EMPTY)).select(
-                fxmath.exp2(lses[j] - lse_max), zero_f
-            )
+            with fastmath(None):
+                split_live = lses[j] > neg_inf
+            lse_exp_j = split_live.select(lses[j], lse_exp)
+            w = split_live.select(fxmath.exp2(lse_exp_j - lse_exp), zero_f)
             weights[lane + Int32(j * 64)] = w
             den = den + w
         for sh in (32, 16, 8, 4, 2, 1):
