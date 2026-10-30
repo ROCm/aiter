@@ -71,6 +71,10 @@ from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
     compile_bmm_a8w8_mxfp8_gfx950,
     parse_bmm_kernel_name,
 )
+from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+    BMM_MX32_WMMA_NAME_PREFIX,
+    parse_bmm_mx32_kernel_name,
+)
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
@@ -118,7 +122,10 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     check_persistent_n_tiles,
     cluster_m_fallback_values,
     is_compute_wmma_kernel_name,
+    k_has_tail,
+    n_is_bounded,
     parse_mxfp8_32_wmma_kernel_name,
+    scale_k_align,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as MXFP8_128_WMMA_PREFIX,
@@ -212,6 +219,28 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
         "lds_stage": int(m.group("lds_stage")) if m.group("lds_stage") else 2,
         "scheduler": m.group("scheduler"),
         "k_split": int(m.group("k_split")) if m.group("k_split") else 1,
+    }
+
+
+def _bmm_mx32_job(row: dict, kernel_name: str, b: int, n: int, k: int) -> dict | None:
+    """A gfx1250 batched mxfp8_32 row as a compile job (M is a runtime argument).
+
+    One job per kernel, B, N, K serves every M bucket; the w_scale block is the row's.
+    """
+    if parse_bmm_mx32_kernel_name(kernel_name) is None:
+        # The runtime runs the heuristic's pick for such a row.
+        print(f"  [WARN] Unknown FlyDSL BMM kernel name: {kernel_name}, skipping")
+        return None
+    return {
+        "kernel_name": kernel_name,
+        "kind": "bmm_mx32",
+        "m": 1,
+        "n": n,
+        "k": k,
+        "cu_num": 0,
+        "gfx": row.get("gfx", "").strip(),
+        "b": b,
+        "w_scale_block": row.get("w_scale_block", "").strip(),
     }
 
 
@@ -331,12 +360,17 @@ def parse_csv(csv_path: str):
             continue
 
         if row.get("b", "").strip():  # a batched row (may be in a mixed table)
-            if not kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
+            if kernel_name.startswith(f"{BMM_MX32_WMMA_NAME_PREFIX}_"):
+                job = _bmm_mx32_job(
+                    row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
+                )
+            elif kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
+                job = _bmm_mfma_job(
+                    row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
+                )
+            else:
                 batched_skipped.add(kernel_name)
                 continue
-            job = _bmm_mfma_job(
-                row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
-            )
             if job is not None and job_identity(job) not in seen:
                 seen.add(job_identity(job))
                 jobs.append(job)
@@ -362,6 +396,13 @@ def parse_csv(csv_path: str):
             continue
 
         if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
+            if kernel_name.startswith(f"{BMM_MX32_WMMA_NAME_PREFIX}_"):
+                # gfx1250 batched mxfp8_32, run at B = 1 with a row-major 1x32 x_scale
+                job = _bmm_mx32_job(row, kernel_name, 1, n, k)
+                if job is not None and job_identity(job) not in seen:
+                    seen.add(job_identity(job))
+                    jobs.append(job)
+                continue
             # Dispatch runs the row with the x_scale block that goes with its
             # w_scale's: 1x128 with 128x128 (column-major, blockscale, read
             # by the transposed kernel except at M = 1), else 1x32.
@@ -419,6 +460,8 @@ def parse_csv(csv_path: str):
                 params = dict(params)
                 params["kind"] = "mxfp8_wmma"
                 params["scale_block"] = MX32_BLOCK_K
+                # The block is the row's (w_scale_block), not the name's.
+                params["w_scale_32x32"] = mxfp8_block == "32x32"
         elif kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
             params = parse_ptpc_wmma_kernel_name(kernel_name)
             if params is not None:
@@ -974,6 +1017,72 @@ def _compile_bmm_mfma_to_cache(
         )
 
 
+def _compile_bmm_mx32_to_cache(
+    *, kernel_name: str, n: int, k: int, b: int, w_scale_block: str = "1x32", **kwargs
+):
+    """Compile one gfx1250 batched mxfp8_32 config (compile-only, CPU dummies).
+
+    The launch takes run_bmm_a8w8_mxfp8_32_gfx1250's argument order (PR #6864), so the
+    cache entry is the one that runner hits at run time."""
+    del kwargs
+    import torch
+
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import MX32_BLOCK_K
+    from aiter.ops.flydsl.kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
+
+    cfg = parse_bmm_mx32_kernel_name(kernel_name)
+    if cfg is None:
+        raise ValueError(f"{kernel_name}: not a batched mxfp8_32 kernelName")
+    b32 = w_scale_block == "32x32"
+    if k % MX32_BLOCK_K or n % 32 or (not b32 and k % 128):
+        raise ValueError(f"{kernel_name}: N={n}, K={k} misaligned for its scale")
+    dev = torch.device("cpu")
+    k_blocks = k // MX32_BLOCK_K
+    m = 1
+    xq = torch.empty((m, b, k), device=dev, dtype=torch.uint8)
+    wq = torch.empty((b, n, k), device=dev, dtype=torch.uint8)
+    xs = torch.empty((m, b, k_blocks), device=dev, dtype=torch.uint8)
+    ws = torch.empty(
+        (b, n // 32 if b32 else n, k_blocks), device=dev, dtype=torch.uint8
+    )
+    out = torch.empty((m, b, n), device=dev, dtype=torch.bfloat16)
+    k_tail = k % cfg["tile_k"] != 0
+    with compile_only_env():
+        launch_gemm_a8w8(
+            _ptr_view_safe(out),
+            _ptr_view_safe(xq),
+            _ptr_view_safe(wq),
+            _ptr_view_safe(xs),
+            _ptr_view_safe(ws),
+            m,
+            fx.Stream(0),
+            n,
+            k,
+            b * k_blocks,
+            b * k,
+            b * n,
+            cfg["tile_m"],
+            cfg["tile_n"],
+            cfg["tile_k"],
+            cfg["m_warp"],
+            cfg["n_warp"],
+            0,
+            cfg["num_buffers"],
+            1,
+            1,
+            True,
+            MX32_BLOCK_K,
+            1,
+            True,
+            0,
+            b,
+            False,
+            False,
+            b32,
+            k_tail,
+        )
+
+
 def _compile_mxfp8_wmma_to_cache(
     *,
     kernel_name: str,
@@ -994,6 +1103,7 @@ def _compile_mxfp8_wmma_to_cache(
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
     scale_block: int = SCALE_BLOCK_SIZE,
+    w_scale_32x32: bool = False,
     **kwargs,
 ):
     del kwargs
@@ -1008,10 +1118,16 @@ def _compile_mxfp8_wmma_to_cache(
         compile_gemm_a8w8_splitk_reduce,
     )
 
+    k_align = scale_k_align(
+        scale_block == MX32_BLOCK_K, a_scale_preshuffled, w_scale_32x32
+    )
+    if k % k_align:
+        raise ValueError(f"{kernel_name}: K={k} must be aligned to {k_align}")
     dev = torch.device("cpu")
     k_blocks = (k + scale_block - 1) // scale_block
-    if scale_block == MX32_BLOCK_K:  # row-major or shuffled A; shuffled B
-        a_rows, b_rows = (((m + 31) // 32) * 32 if a_scale_preshuffled else m), n
+    if scale_block == MX32_BLOCK_K:  # row-major or shuffled A; B shuffled or 32x32
+        a_rows = ((m + 31) // 32) * 32 if a_scale_preshuffled else m
+        b_rows = n // 32 if w_scale_32x32 else n
     else:
         a_rows, b_rows = m, (n + 127) // 128
     xq = torch.empty((m, k), device=dev, dtype=torch.uint8)
@@ -1020,6 +1136,14 @@ def _compile_mxfp8_wmma_to_cache(
     b_scale = torch.empty((b_rows, k_blocks), device=dev, dtype=torch.uint8)
     out = torch.empty((m, n), device=dev, dtype=torch.bfloat16)
     stream = fx.Stream(0)
+    k_tail = k_has_tail(
+        k,
+        split_k,
+        tile_k,
+        num_buffers,
+        tile_n,
+        is_compute_wmma_kernel_name(kernel_name),
+    )
 
     with compile_only_env():
         launch_args = (
@@ -1048,12 +1172,11 @@ def _compile_mxfp8_wmma_to_cache(
         )
         compute_bound = is_compute_wmma_kernel_name(kernel_name)
         launch = launch_gemm_a8w8_256x256 if compute_bound else launch_gemm_a8w8
-        check_persistent_n_tiles(
-            persistent_n_tiles, n, tile_n, cluster_n, split_k, compute_bound
+        check_persistent_n_tiles(persistent_n_tiles, split_k, compute_bound)
+        bounded_n = n_is_bounded(
+            n, tile_n, cluster_n, persistent_n_tiles, compute_bound
         )
-        for variant_cm in cluster_m_fallback_values(
-            cluster_m, cluster_n, compute_bound
-        ):
+        for variant_cm in cluster_m_fallback_values(cluster_m):
             variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
             if compute_bound:
                 fused = fused_splitk and _fused_splitk_ok(
@@ -1073,6 +1196,9 @@ def _compile_mxfp8_wmma_to_cache(
                         fused,
                         bounded_m,
                         a_scale_preshuffled,
+                        w_scale_32x32,
+                        k_tail,
+                        bounded_n,
                     )
             else:
                 launch(
@@ -1084,6 +1210,8 @@ def _compile_mxfp8_wmma_to_cache(
                     1,
                     a_preshuffle,
                     a_scale_preshuffled,
+                    w_scale_32x32,
+                    k_tail,
                 )
         if split_k > 1:
             compile_gemm_a8w8_splitk_reduce(
@@ -1261,6 +1389,8 @@ def compile_one_config(
                 _compile_a4w4_to_cache(kernel_name=kernel_name, m=m, n=n, k=k, **kwargs)
             elif kind == "bmm_mfma":
                 _compile_bmm_mfma_to_cache(kernel_name=kernel_name, n=n, k=k, **kwargs)
+            elif kind == "bmm_mx32":
+                _compile_bmm_mx32_to_cache(kernel_name=kernel_name, n=n, k=k, **kwargs)
             else:
                 raise ValueError(f"Unknown GEMM AOT kind: {kind}")
 
