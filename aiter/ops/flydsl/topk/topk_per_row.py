@@ -500,3 +500,91 @@ def flydsl_radix_topk_one_block(
         num_rows,
         stream,
     )
+
+
+def _validate_sampled_topk_call(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor | None,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+) -> None:
+    """Raise if this call cannot run the sampled selector."""
+    if seq_lens is None:
+        raise ValueError("sampled top-k requires seq_lens")
+    _validate_flydsl_topk_call(
+        logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, None
+    )
+    if get_gfx_runtime() != "gfx950":
+        raise ValueError("sampled top-k requires gfx950")
+    if k != 2048:
+        raise ValueError("sampled top-k requires k=2048")
+    if logits.shape[1] > _MAX_ROW_ELEMENTS:
+        raise ValueError("one logits row exceeds the AMD buffer descriptor span")
+
+
+def is_flydsl_sampled_topk_supported(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor | None,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+) -> bool:
+    """Whether the sampled selector accepts the call; never raises."""
+    try:
+        _validate_sampled_topk_call(
+            logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k
+        )
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return True
+
+
+def flydsl_sampled_topk_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    k: int = 2048,
+    *,
+    candidate_counts: torch.Tensor | None = None,
+) -> None:
+    """Exact gfx950 selector for FP32 logits [rows, width] with inner stride 1
+    and int32 ``seq_lens``; writes int32 ``indices`` [rows, k]. Rows of at most
+    8192 elements use the radix body directly. Optional int32
+    ``candidate_counts`` has one entry per row; -1 denotes a short-row bypass.
+    Counts are diagnostics and do not change ranking.
+    """
+    from ..kernels.topk.sampled_topk_gfx950 import build_sampled_topk_module
+
+    rows, width = logits.shape
+    _validate_sampled_topk_call(
+        logits, next_n, seq_lens, indices, rows, logits.stride(0), logits.stride(1), k
+    )
+    if candidate_counts is not None and (
+        candidate_counts.shape != (rows,)
+        or candidate_counts.dtype != torch.int32
+        or candidate_counts.device != logits.device
+        or not candidate_counts.is_contiguous()
+    ):
+        raise ValueError(
+            "candidate_counts must be a contiguous int32 vector on the logits device"
+        )
+    if rows:
+        run_topk_launcher(
+            build_sampled_topk_module(k, candidate_counts is not None),
+            logits,
+            seq_lens,
+            indices,
+            candidate_counts if candidate_counts is not None else indices,
+            width,
+            next_n,
+            rows,
+            torch.cuda.current_stream(logits.device),
+        )
