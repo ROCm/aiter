@@ -401,7 +401,9 @@ def test_fused_recurrent_gate_in_kernel(B, T, H, HV, D, has_dt_bias, safe_gate):
 def test_fused_recurrent_varlen(lens):
     H, D = 4, 128
     N, total_T = len(lens), sum(lens)
-    cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), device=DEVICE).long()
+    cu = torch.tensor(
+        [0] + torch.tensor(lens, device=DEVICE).cumsum(0).tolist(), device=DEVICE
+    ).long()
 
     q, k, v = make_qkv(1, total_T, H, H, D, torch.float32)
     q, k = F.normalize(q, p=2, dim=-1), F.normalize(k, p=2, dim=-1)
@@ -510,8 +512,8 @@ def test_paged_state_restore_strided(state_dtype):
     written = torch.zeros_like(raw, dtype=torch.bool)
     written.as_strided(state.shape, state.stride(), 1)[indices.long()] = True
     q, k, v = make_qkv(1, B * T, H, H, D, torch.bfloat16)
-    g = F.logsigmoid(torch.randn(1, B * T, H, D, device=DEVICE))
-    beta = torch.rand(1, B * T, H, device=DEVICE)
+    g = F.logsigmoid(torch.randn(1, B * T, H, D, dtype=torch.float32, device=DEVICE))
+    beta = torch.rand(1, B * T, H, dtype=torch.float32, device=DEVICE)
     q, k = (F.normalize(x.float(), dim=-1).to(v.dtype) for x in (q, k))
     for counts in ([1, 4], [2, 3]):
         before = raw.clone()
@@ -769,7 +771,9 @@ def test_cache_state_updates_varlen():
     """Unequal sequence lengths: per-sequence record counts and acceptance."""
     lens, H, D = [3, 1, 4], 4, 128
     N, total_T, maxlen = len(lens), sum(lens), max(lens)
-    cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), device=DEVICE).long()
+    cu = torch.tensor(
+        [0] + torch.tensor(lens, device=DEVICE).cumsum(0).tolist(), device=DEVICE
+    ).long()
 
     torch.manual_seed(11)
     max_slots = N * maxlen * 3
@@ -928,10 +932,10 @@ def test_varlen_state_precision_with_short_sequences(state_dtype):
     length, H, D = 128, 1, 128
     lengths = [length] + [1] * length
     total = sum(lengths)
-    q = torch.zeros(1, total, H, D, device=DEVICE)
+    q = torch.zeros(1, total, H, D, dtype=torch.float32, device=DEVICE)
     q[..., 0] = 1
     k, v, g = q.clone(), torch.zeros_like(q), torch.zeros_like(q)
-    beta = torch.full((1, total, H), 0.001, device=DEVICE)
+    beta = torch.full((1, total, H), 0.001, dtype=torch.float32, device=DEVICE)
     state = torch.ones(len(lengths), H, D, D, dtype=state_dtype, device=DEVICE)
     cu = torch.tensor([0] + lengths, device=DEVICE, dtype=torch.int32).cumsum(0)
     out, final = fused_recurrent_kda(
@@ -1598,7 +1602,7 @@ def test_fused_conv_rms_gate(N, T, H):
         **kw,
     )
     x, w, S2, cs2 = mixed.float(), cw.float(), S.clone(), cs.clone()
-    y = torch.empty(TT, 3 * lp, device=DEVICE)
+    y = torch.empty(TT, 3 * lp, device=DEVICE, dtype=torch.float32)
     for t in range(T):
         rows = torch.arange(t, TT, T, device=DEVICE)
         h = cs2[idx.long()].float()
@@ -1641,7 +1645,9 @@ def test_fused_conv_rms_gate_spec(N, k, padded, state_dtype, seed):
     og = torch.randn(1, TT, H, D, dtype=torch.bfloat16, device=DEVICE)
     A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.1
     dt_bias = torch.randn(lp, dtype=torch.float32, device=DEVICE) * 0.1
-    S = (torch.randn(NS, H, D, D, device=DEVICE) * 0.01).to(state_dtype)
+    S = (torch.randn(NS, H, D, D, dtype=torch.float32, device=DEVICE) * 0.01).to(
+        state_dtype
+    )
     nw = torch.rand(D, dtype=torch.float32, device=DEVICE) + 0.5
     idx = (torch.randperm(NS - 1, device=DEVICE)[:TT] + 1).int().view(N, T)
     if padded:
@@ -1678,7 +1684,7 @@ def test_fused_conv_rms_gate_spec(N, k, padded, state_dtype, seed):
     )
     # Reference: PyTorch conv, recurrence, and norm with the same accepted state.
     x, w, S2, cs2 = mixed.float(), cw.float(), S.clone(), cs.clone()
-    y = torch.zeros(TT, 3 * lp, device=DEVICE)
+    y = torch.zeros(TT, 3 * lp, device=DEVICE, dtype=torch.float32)
     for n in range(N):
         c, off, rows = int(idx[n, 0]), int(acc[n]) - 1, slice(n * T, (n + 1) * T)
         if c == 0:
@@ -1747,7 +1753,9 @@ def test_fused_recurrent_kda_packed_decode(state_dtype, seed):
     g = torch.randn(N, H, D, dtype=torch.bfloat16, device=DEVICE) * 0.5
     cs = torch.randn(NS, W - 1, 3 * lp, dtype=torch.bfloat16, device=DEVICE)
     cs = cs.transpose(-1, -2) * 0.1
-    S = (torch.randn(NS, H, D, D, device=DEVICE) * 0.01).to(state_dtype)
+    S = (torch.randn(NS, H, D, D, dtype=torch.float32, device=DEVICE) * 0.01).to(
+        state_dtype
+    )
     cw = torch.randn(3, W, lp, dtype=torch.float32, device=DEVICE) * 0.1
     A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.1
     dt_bias = torch.randn(lp, dtype=torch.float32, device=DEVICE) * 0.1

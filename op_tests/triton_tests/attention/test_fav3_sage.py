@@ -120,7 +120,11 @@ def test_sage_small_probabilities(
     if tail_logit == "spread":
         # Encode logits -7 - code/64 exactly using integer dot products.
         q[..., :7] = torch.tensor([64, 32, 16, 8, 4, 2, 1], device=q.device)
-        codes = torch.linspace(0, 128, seqlen - 1, device=q.device).round().int()
+        codes = (
+            torch.linspace(0, 128, seqlen - 1, device=q.device, dtype=torch.float32)
+            .round()
+            .int()
+        )
         shifts = torch.arange(5, -1, -1, device=q.device)
         encoded_k = torch.cat(
             (-7 - codes[:, None] // 64, -((codes[:, None] >> shifts) & 1)), dim=1
@@ -139,10 +143,13 @@ def test_sage_small_probabilities(
     )
     # QK descaling includes the conversion from natural logits to exp2 units.
     q_descale = torch.full(
-        (1, 1, num_q_blocks), math.log2(math.e) * logit_scale, device=q.device
+        (1, 1, num_q_blocks),
+        math.log2(math.e) * logit_scale,
+        device=q.device,
+        dtype=torch.float32,
     )
-    k_descale = torch.ones((1, 1, num_k_blocks), device=q.device)
-    v_descale = torch.ones((1, 1, head_dim_v), device=q.device)
+    k_descale = torch.ones((1, 1, num_k_blocks), device=q.device, dtype=torch.float32)
+    v_descale = torch.ones((1, 1, head_dim_v), device=q.device, dtype=torch.float32)
     sparse_args = {}
     if sparse:
         block_mask = torch.ones(
@@ -194,6 +201,19 @@ def test_block_attn_mask_to_ragged_lut_metadata_dtype():
     torch.testing.assert_close(
         lut_count, torch.tensor([2, 2], device="cuda", dtype=torch.int32)
     )
+
+
+def test_tiebreak_keeps_its_own_reference_bound():
+    """A tie resolved differently moves a whole output row, so `tiebreak` needs a looser bound.
+
+    Reusing a neighbouring distribution's bound here would report breakage on the property the
+    generator is built to create.
+    """
+    bound = fp8_max_diff_percentage("tiebreak")
+    others = [
+        fp8_max_diff_percentage(name) for name in ("normal", "diffusion", "peaked")
+    ]
+    assert bound > max(others), f"tiebreak {bound} vs {others}"
 
 
 def compare_accuracy(current, reference):
@@ -259,7 +279,9 @@ def pad_rearrange_dropout_mask(
     batch_size = cu_seqlens_q.numel() - 1
 
     padded_dropout_mask = torch.ones(
-        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
+        (batch_size, num_q_heads, seqlen_q, seqlen_k),
+        device="cuda",
+        dtype=torch.float32,
     )
     for b in range(batch_size):
         start_q = cu_seqlens_q[b].item()
@@ -351,6 +373,24 @@ def check_attention_outputs(
             atol=atol or 1e-2,
             rtol=rtol or 1e-2,
         )
+
+
+def fp8_max_diff_percentage(input_distribution: str) -> float:
+    # tiebreak diverges from the BF16 reference by construction, so closeness to BF16 is not the
+    # property under test; this bound is only a backstop against gross breakage.
+    if input_distribution == "tiebreak":
+        return 25.0
+    # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
+    if input_distribution in (
+        "transformer",
+        "sink",
+        "diffusion",
+        "kcommon",
+    ) or str(
+        input_distribution
+    ).startswith("dump:"):
+        return 2.0
+    return 0.5
 
 
 def input_helper(

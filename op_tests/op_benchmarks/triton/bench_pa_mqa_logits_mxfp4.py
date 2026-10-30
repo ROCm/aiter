@@ -60,11 +60,10 @@ def build(
     hb, ns = head_size // 2, head_size // SCALE_GROUP
     per_seq = (ctx + page_size - 1) // page_size
     total_pages = batch * per_seq
-    g = torch.Generator().manual_seed(seed)
+    g = torch.Generator(device=dev).manual_seed(seed)
     block_table = (
-        torch.randperm(total_pages, generator=g)
+        torch.randperm(total_pages, generator=g, device=dev)
         .reshape(batch, per_seq)
-        .to(dev)
         .to(torch.int32)
     )
     values = torch.randint(

@@ -357,8 +357,10 @@ def select(diff):
             raise RuntimeError(f"{path}: package initializer changed")
 
         if path.startswith(CONFIGS):
-            # configs/<arch>/<backend>/<op>/<family>/<file>.json
+            # configs/<arch>[/<cu_num>cu]/<backend>/<op>/<family>/<file>.json
             parts = path[len(CONFIGS) :].split("/")
+            if len(parts) > 1 and re.fullmatch(r"[1-9][0-9]*cu", parts[1]):
+                del parts[1]  # a CU tree has the default tree's layout below the arch
             if not (
                 path.endswith(".json")
                 and len(parts) >= 5
