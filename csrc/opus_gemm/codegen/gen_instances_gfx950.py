@@ -2352,7 +2352,8 @@ def _emit_bmm_specialized(
         traits_aliases = (
             f"using {k.name}_Traits = {traits_name}<"
             f"{k.B_M}, {k.B_N}, {k.B_K}, {k.T_M}, {k.T_N}, {k.num_slots}, "
-            f"{str(k.cachectl_b == 2).lower()}, {str(k.early_b).lower()}>;"
+            f"{str(k.cachectl_b == 2).lower()}, {str(k.early_b).lower()}, "
+            f"{build_num_xcd()}>;"
         )
     else:
         traits_aliases = _bmm_specialized_traits_alias(k, traits_name, da, db)
@@ -2475,7 +2476,8 @@ _BMM_COMPACT_LAUNCHER_BODY = (
 """
     + r"""
   const int tiles = (M + Traits::B_M - 1) / Traits::B_M * (N / Traits::B_N);
-  dim3 grid_main((tiles * batch + 7) / 8 * 8);
+  constexpr int NUM_XCD = Traits::NUM_XCD;
+  dim3 grid_main((tiles * batch + NUM_XCD - 1) / NUM_XCD * NUM_XCD);
   dim3 block_main(Traits::BLOCK_SIZE);
   if (Y.dtype() == AITER_DTYPE_bf16)
     @@KERNEL@@<Traits, __bf16><<<grid_main, block_main, 0, stream>>>(kargs);
