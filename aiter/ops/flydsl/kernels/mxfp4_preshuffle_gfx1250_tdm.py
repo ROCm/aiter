@@ -685,9 +685,7 @@ def launch_gemm_a8w4_tdm(
                 num_warps=num_waves,
             )
             blk = fx.zipped_divide(coord, tile)[None, (0, None)]
-            box = tensor_view(
-                lds_ptr, (tile, 1), ((lds_row, 1), tile[0] * lds_row)
-            )
+            box = tensor_view(lds_ptr, (tile, 1), ((lds_row, 1), tile[0] * lds_row))
             ts, tg = fx.rocdl.cdna5.tdm_partition(
                 atom, wave, fx.make_layout(num_waves, 1), box, blk
             )
