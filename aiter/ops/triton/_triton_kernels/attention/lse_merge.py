@@ -85,7 +85,9 @@ def _lse_merge_kernel(
         partial = tl.load(lse_split, mask=valid, other=float("-inf"))
         weight = tl.exp(partial - lse_max)
         total += weight
-        value = tl.load(out_split, mask=valid[:, None], other=0.0)
+        # An empty range weighs 0, but 0 * NaN or 0 * Inf is NaN, so its value must not be read.
+        reached = valid & (partial != float("-inf"))
+        value = tl.load(out_split, mask=reached[:, None], other=0.0)
         acc += weight[:, None] * value.to(tl.float32)
         lse_split += stride_pl_b
         out_split += stride_po_b

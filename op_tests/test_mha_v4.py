@@ -1703,11 +1703,20 @@ def test_mha_v4_kv_splits_merge_addresses_past_2_31_elements(sequence, heads, sp
 
 
 @parametrize("write_lse", [True, False])
-def test_mha_v4_kv_splits_merge_skips_empty_ranges(write_lse):
+@parametrize(
+    "empty_fill",
+    [
+        param(1e4, id="1e4"),
+        param(float("nan"), id="nan"),
+        param(float("inf"), id="inf"),
+    ],
+)
+def test_mha_v4_kv_splits_merge_skips_empty_ranges(write_lse, empty_fill):
     """A range with no valid keys for a row has LSE -inf and must carry no weight, whatever its
-    partial output holds. mha_v4 gives every range real keys, so its tests never reach this.
-    Range 1 is empty for every row, some rows are empty in range 0 alone, and some in every
-    range, which must give a 0 output and LSE -inf rather than NaN. 77 rows leave a partial tile.
+    partial output holds: its weight is 0, and 0 * NaN or 0 * Inf would still be NaN. mha_v4
+    gives every range real keys, so its tests never reach this. Range 1 is empty for every row,
+    some rows are empty in range 0 alone, and some in every range, which must give a 0 output
+    and LSE -inf rather than NaN. 77 rows leave a partial tile.
     """
     torch.manual_seed(67)
     batch, splits, heads, sequence = 2, 3, 2, 77
@@ -1716,10 +1725,11 @@ def test_mha_v4_kv_splits_merge_skips_empty_ranges(write_lse):
     )
     partial_lse = torch.randn((batch * splits, heads, sequence), device="cuda") * 4
     partial_lse[1::splits] = float("-inf")
-    partial_out[1::splits] = 1e4
     partial_lse[0::splits, :, :10] = float("-inf")
     partial_lse[:, :, 20:25] = float("-inf")
     partial_lse[splits : 2 * splits, 1, 40:42] = float("-inf")
+    empty = partial_lse.isneginf().transpose(1, 2)
+    partial_out[empty] = empty_fill
     out = torch.full((batch, sequence, heads, 128), float("nan"), device="cuda")
     out = out.to(torch.bfloat16)
     lse = torch.full((batch, heads, sequence), float("nan"), device="cuda")
@@ -1735,7 +1745,9 @@ def test_mha_v4_kv_splits_merge_skips_empty_ranges(write_lse):
     reference = torch.einsum(
         "bihs,bishd->bshd",
         weight,
-        partial_out.float().view(batch, splits, sequence, heads, 128),
+        partial_out.float()
+        .masked_fill(empty.unsqueeze(-1), 0.0)
+        .view(batch, splits, sequence, heads, 128),
     )
     assert not out.isnan().any()
     assert (out.permute(0, 2, 1, 3)[~reached] == 0).all()
