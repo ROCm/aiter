@@ -2111,10 +2111,17 @@ def single_region_views(data, scale):
     return buf, kd, ks
 
 
-@pytest.fixture(params=["bf16", "e4m3"], ids=["qbf16", "qe4m3"])
-def qdt(request):
-    """The dtype the query reaches the scorer in."""
-    return request.param
+QDTS = ["bf16", "e4m3"]  # the dtype the query reaches the scorer in
+
+
+def expect_value_error(what, fn, *args, match=None):
+    """`fn(*args)` must raise ValueError (whose message contains `match`)."""
+    try:
+        fn(*args)
+    except ValueError as e:
+        assert match is None or match in str(e), f"{what}: wrong message: {e}"
+        return
+    raise AssertionError(f"{what}: no ValueError")
 
 
 def q_for(q, qdt):
@@ -2133,28 +2140,17 @@ def run_fp4(q, kd, ks, bt, seq, S, H, mb, **kw):
 
 
 # --- Correctness ----------------------------------------------------------
-@requires_gfx950
-@pytest.mark.parametrize(
-    "case",
-    build_matrix(),
-    ids=[c[0].replace("fp8", "mxfp4") for c in build_matrix()],
-)
-def test_mxfp4_matches_oracle(case, qdt):
+def check_mxfp4_matches_oracle(case, qdt):
     _, B, S, H, lens, kw = case
     q, cache8, bt, seq, mb = make_case(B, S, H, lens, **kw)
     q, q_ref = q_for(q, qdt)
     kd, ks, deq = fp4_cache_of(cache8)
     ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, mb)
     got = run_fp4(q, kd, ks, bt, seq, S, H, mb)
-    ok, why = compare(got, ref)
-    assert ok, why
+    check_scores(got, ref)
 
 
-@requires_gfx950
-@pytest.mark.parametrize(
-    "point", [p for p in GEOM_POINTS if p[4] == 1], ids=geom_id  # no CP shard
-)
-def test_mxfp4_every_geometry_matches_oracle(point, qdt):
+def check_mxfp4_every_geometry_matches_oracle(point, qdt):
     """Every launch geometry the selector can reach (work-chunk depth, token
     split, spread) against the oracle. Negative scores expose accidental
     zero-initialised maxima, as in the fp8 test."""
@@ -2172,16 +2168,11 @@ def test_mxfp4_every_geometry_matches_oracle(point, qdt):
     out.fill_(float("nan"))
     got = run_fp4(q, kd, ks, bt, seq, S, H, mb, out=out)
     assert got.data_ptr() == out.data_ptr()
-    ok, why = compare(got, ref)
-    assert ok, why
+    check_scores(got, ref)
     assert bool((got[torch.isfinite(ref)] < 0).all())
 
 
-@requires_gfx950
-@pytest.mark.parametrize("S,H", [(1, 4), (4, 2), (8, 4)])
-@pytest.mark.parametrize("layout", ["contiguous", "feature"])
-@pytest.mark.parametrize("map_in_graph", [False, True])
-def test_mxfp4_graph_buffers(S, H, layout, map_in_graph):
+def check_mxfp4_graph_buffers(S, H, layout, map_in_graph):
     """Captured once, replayed with different lengths and block tables."""
     B, mb = 3, 9
     q, cache8, _, seq, _ = make_case(B, S, H, [0, 513, 1])
@@ -2222,8 +2213,7 @@ def test_mxfp4_graph_buffers(S, H, layout, map_in_graph):
         check_scores(out, score_oracle(q, deq, bt, seq, S, H, D**-0.5, mb))
 
 
-@requires_gfx950
-def test_mxfp4_split_and_single_region_views_agree_bitwise():
+def check_mxfp4_split_and_single_region_views_agree_bitwise():
     """Two separate tensors and two views of one `[pages, 8704]` page are the
     same input to the kernel, down to the bit."""
     q, cache8, bt, seq, mb = make_case(3, 4, 4, [130, 4096, 513])
@@ -2235,8 +2225,7 @@ def test_mxfp4_split_and_single_region_views_agree_bitwise():
     assert torch.equal(a, b)
 
 
-@requires_gfx950
-def test_mxfp4_wide_scale_range(qdt):
+def check_mxfp4_wide_scale_range(qdt):
     """Per-token magnitudes over 2^+-20 give e8m0 bytes spread over the range a
     real cache uses; every lane group must pick its own byte."""
     B, S, H = 2, 4, 4
@@ -2256,12 +2245,10 @@ def test_mxfp4_wide_scale_range(qdt):
     q2, q2_ref = q_for(q2, qdt)
     ref = score_oracle(q2_ref, deq, bt, seq, S, H, D**-0.5, mb)
     got = run_fp4(q2, kd, ks, bt, seq, S, H, mb)
-    ok, why = compare(got, ref)
-    assert ok, why
+    check_scores(got, ref)
 
 
-@requires_gfx950
-def test_mxfp4_default_score_buffer_reads_as_minus_inf():
+def check_mxfp4_default_score_buffer_reads_as_minus_inf():
     lens = [512, 256, 128, 512]
     q, cache8, bt, seq, mb = make_case(len(lens), 1, 1, lens)
     kd, ks, _ = fp4_cache_of(cache8)
@@ -2270,15 +2257,25 @@ def test_mxfp4_default_score_buffer_reads_as_minus_inf():
     assert torch.isfinite(out[out != float("-inf")]).all()
 
 
-@requires_gfx950
-def test_mxfp4_e4m3_q_rows_must_be_16_byte_aligned():
+def check_mxfp4_e4m3_q_rows_must_be_16_byte_aligned():
     _, cache8, bt, seq, mb = make_case(2, 4, 2, [513, 513])
     kd, ks, _ = fp4_cache_of(cache8)
     flat = torch.empty(8 * 2 * D + 64, dtype=dtypes.fp8, device="cuda")
     bad = torch.as_strided(flat, (8, 2, D), (2 * D + 8, D, 1), 0)  # row stride 264 B
     assert not kernel.index_score_supported_fp4(bad, kd, ks, 4, 2, mb, bt, seq_lens=seq)
-    with pytest.raises(ValueError, match="16-byte aligned"):
-        run_fp4(bad, kd, ks, bt, seq, 4, 2, mb)
+    expect_value_error(
+        "misaligned q rows",
+        run_fp4,
+        bad,
+        kd,
+        ks,
+        bt,
+        seq,
+        4,
+        2,
+        mb,
+        match="16-byte aligned",
+    )
 
 
 # --- Rejections -----------------------------------------------------------
@@ -2335,16 +2332,13 @@ BAD = [
 ]
 
 
-@requires_gfx950
-@pytest.mark.parametrize("name", BAD + ["cpu"])
-def test_mxfp4_invalid_cache_rejected(name):
+def check_mxfp4_invalid_cache_rejected(name):
     q, kd, ks, bt, seq, mb = _bad(name)
     assert not kernel.index_score_supported_fp4(q, kd, ks, 4, 4, mb, bt, seq_lens=seq)
-    with pytest.raises(ValueError):
-        run_fp4(q, kd, ks, bt, seq, 4, 4, mb)
+    expect_value_error(name, run_fp4, q, kd, ks, bt, seq, 4, 4, mb)
 
 
-def test_mxfp4_metadata_rejects_cpu():
+def check_mxfp4_metadata_rejects_cpu():
     q = torch.empty(1, 1, D, dtype=torch.bfloat16)
     kd = torch.empty(1, P, 64, dtype=torch.uint8)
     ks = torch.empty(1, P, 4, dtype=torch.uint8)
@@ -2353,17 +2347,13 @@ def test_mxfp4_metadata_rejects_cpu():
     assert not kernel.index_score_supported_fp4(q, kd, ks, 1, 1, 1, bt, seq_lens=seq)
 
 
-@requires_gfx950
-def test_mxfp4_supported_accepts_valid_inputs():
+def check_mxfp4_supported_accepts_valid_inputs():
     q, kd, ks, bt, seq, mb = _valid_inputs()
     assert kernel.index_score_supported_fp4(q, kd, ks, 4, 4, mb, bt, seq_lens=seq)
 
 
-@pytest.mark.skip(
-    reason="perf sweep: run via python op_tests/test_flydsl_minimax_m3_index_score.py"
-)
 @benchmark()
-def test_score_mxfp4(case, B, S, H, lens, kwargs):
+def bench_score_mxfp4(case, B, S, H, lens, kwargs):
     q, cache8, bt, seq, mb = make_case(B, S, H, lens, **kwargs)
     kd, ks, deq = fp4_cache_of(cache8)
     ref = score_oracle(q, deq, bt, seq, S, H, D**-0.5, mb)
@@ -2399,6 +2389,56 @@ def test_score_mxfp4(case, B, S, H, lens, kwargs):
             }
         )
     return ret
+
+
+def build_mxfp4_checks():
+    """(name, check, args): one row per MXFP4 correctness case."""
+    checks = []
+    for case, qdt in itertools.product(build_matrix(), QDTS):
+        name = f"matches_oracle_{case[0].replace('fp8', 'mxfp4')}_{qdt}"
+        checks.append((name, check_mxfp4_matches_oracle, (case, qdt)))
+    for point, qdt in itertools.product([p for p in GEOM_POINTS if p[4] == 1], QDTS):
+        name = f"every_geometry_{geom_id(point)}_{qdt}"
+        checks.append((name, check_mxfp4_every_geometry_matches_oracle, (point, qdt)))
+    for (S, H), layout, in_graph in itertools.product(
+        [(1, 4), (4, 2), (8, 4)], ["contiguous", "feature"], [False, True]
+    ):
+        name = f"graph_buffers_S{S}_H{H}_{layout}_{'map_in_graph' if in_graph else 'map_outside'}"
+        checks.append((name, check_mxfp4_graph_buffers, (S, H, layout, in_graph)))
+    for qdt in QDTS:
+        checks.append((f"wide_scale_range_{qdt}", check_mxfp4_wide_scale_range, (qdt,)))
+    for fn in (
+        check_mxfp4_split_and_single_region_views_agree_bitwise,
+        check_mxfp4_default_score_buffer_reads_as_minus_inf,
+        check_mxfp4_e4m3_q_rows_must_be_16_byte_aligned,
+        check_mxfp4_metadata_rejects_cpu,
+        check_mxfp4_supported_accepts_valid_inputs,
+    ):
+        checks.append((fn.__name__.removeprefix("check_mxfp4_"), fn, ()))
+    for name in BAD + ["cpu"]:
+        checks.append(
+            (
+                f"invalid_cache_rejected_{name}",
+                check_mxfp4_invalid_cache_rejected,
+                (name,),
+            )
+        )
+    return checks
+
+
+def run_checks(checks, what):
+    """Run every check, tabulate PASS/FAIL, return the failed names."""
+    rows = []
+    for name, check, cargs in checks:
+        try:
+            check(*cargs)
+            rows.append({"case": name, "status": "PASS", "detail": ""})
+        except (AssertionError, RuntimeError, ValueError) as e:  # list every failure
+            rows.append({"case": name, "status": "FAIL", "detail": repr(e)[:200]})
+    aiter.logger.info(
+        "%s checks (markdown):\n%s", what, pd.DataFrame(rows).to_markdown(index=False)
+    )
+    return [r["case"] for r in rows if r["status"] != "PASS"]
 
 
 def parse_args(argv=None):
@@ -2491,6 +2531,15 @@ def main(argv=None):
     if not torch.cuda.is_available() or get_gfx() not in DECODE_SUPPORTED_GFX:
         aiter.logger.warning("index score requires gfx950; skipping sweep")
         return 0
+    # A custom --case/--mnk selection is a perf sweep: the correctness checks
+    # run with the default matrix only.
+    if args.case is None and args.mnk is None:
+        failed = run_checks(build_mxfp4_checks(), "mxfp4 decode index score")
+        if failed:
+            aiter.logger.error(
+                "mxfp4 decode index score: %d checks failed: %s", len(failed), failed
+            )
+            return 1
     rows = []
     for (name, B, S, H, lens, kw), layout in itertools.product(
         select_cases(args), args.layout
@@ -2507,7 +2556,7 @@ def main(argv=None):
     # More tables, not a merged one: the @benchmark signatures have different
     # call args, so one frame would scatter NaN columns.
     mx = [
-        test_score_mxfp4(name, B, S, H, lens, kw)
+        bench_score_mxfp4(name, B, S, H, lens, kw)
         for name, B, S, H, lens, kw in select_cases(args)
     ]
     if mx:
@@ -2531,14 +2580,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    # CI runs this file as a script, so the pytest checks run first. Not inside
-    # `main`: `test_empty_selection` calls it from under pytest.
-    aiter.logger.info("index score: running correctness checks...")
-    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
-    if status != pytest.ExitCode.OK:
-        aiter.logger.error(
-            "index score: checks failed (pytest exit %s); skipping perf sweep",
-            int(status),
-        )
-        sys.exit(1)
     sys.exit(main())
