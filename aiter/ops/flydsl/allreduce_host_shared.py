@@ -19,8 +19,8 @@ from .allreduce_policy import (
     default_inbox_memory,
     resolve_link,
 )
-from .kernels.tensor_shim import _preload_compiled
 from .ipc_heap import UncachedIpcHeap
+from .kernels.tensor_shim import _preload_compiled
 
 logger = logging.getLogger("aiter")
 

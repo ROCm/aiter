@@ -398,8 +398,8 @@ class FlyDSLAllReduceRMSNorm:
       while a capture is open** rather than building inside it. The capture then
       records the caller's unfused path, and it cannot hang.
 
-    * Making a (family, hidden) ready is a collective: building exchanges IPC 
-      handles, and then the ranks agree that every one of them compiled and loaded 
+    * Making a (family, hidden) ready is a collective: building exchanges IPC
+      handles, and then the ranks agree that every one of them compiled and loaded
       its binaries.
     * If any rank fails to make a width ready, every rank marks it failed and
       the predicate declines it from then on. The caller's next backend serves the call.
@@ -599,7 +599,7 @@ class FlyDSLAllReduceRMSNorm:
         families = self._families_for(hidden)
         if not families:
             return False
-        
+
         ready = [self._prepare(fam, hidden) for fam in families]
         return all(ready)
 
