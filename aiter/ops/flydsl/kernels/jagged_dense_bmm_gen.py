@@ -243,17 +243,16 @@ def _build_launcher(
                 b_copy = fx.make_copy_atom(
                     fx.rocdl.BufferCopy(B_REPS * 16), fx.BFloat16
                 )
-                bk_chunks = BLOCK_K // 32
+                tv_mma_B = tiled_mma.tv_layout_B_tiled
+                k_in_atom, n_rep, k_rep = 0, 1, 2
+                vals_g2r_B = fx.coalesce(
+                    fx.select(fx.coalesce(tv_mma_B[1]), [n_rep, k_in_atom, k_rep])
+                )
+                tv_g2r_B = fx.group(
+                    fx.append(tv_mma_B[0], vals_g2r_B), 0, tv_mma_B[0].rank
+                )
                 thr_copy_g2r_B = fx.make_tiled_copy(
-                    b_copy,
-                    fx.make_layout(
-                        ((16, 4, M_WARPS, N_WARPS), (B_REPS, 8, bk_chunks)),
-                        (
-                            (B_REPS, 8 * BLOCK_N, 0, 16 * B_REPS),
-                            (1, BLOCK_N, 32 * BLOCK_N),
-                        ),
-                    ),
-                    fx.make_tile(BLOCK_N, BLOCK_K),
+                    b_copy, tv_g2r_B, fx.make_tile(BLOCK_N, K_TILE_GRAN)
                 ).get_slice(tid)
             else:
                 b_copy = buffer_copy_128b
@@ -284,22 +283,21 @@ def _build_launcher(
                     for _ in range(B_STAGES)
                 ]
                 mma_frag_B = thr_mma.make_fragment_B(gB_k[None, None, 0])
-                kc_vals = B_REPS * 8
+                mma_to_ring_B = fx.composition(fx.left_inverse(vals_g2r_B), tv_mma_B[1])
                 b_shuffle = [
-                    r + B_REPS * (a + 4 * m)
-                    for m in range(2)
-                    for r in range(B_REPS)
-                    for a in range(4)
+                    fx.get_scalar(fx.crd2idx(i, mma_to_ring_B))
+                    for i in range(fx.get_scalar(fx.size(mma_to_ring_B)))
                 ]
 
                 def b_dst(slot):
                     return b_ring[slot]
 
                 def b_operand(slot, kc):
-                    raw = b_ring[slot].load()
+                    raw = b_ring[slot][None, None, kc].load()
                     dst = mma_frag_B[None, None, (None, kc)]
-                    mask = [kc * kc_vals + i for i in b_shuffle]
-                    dst.store(raw.shuffle(raw, mask).reshape(dst.shape.to_py_value()))
+                    dst.store(
+                        raw.shuffle(raw, b_shuffle).reshape(dst.shape.to_py_value())
+                    )
                     return dst
 
             else:
@@ -367,16 +365,11 @@ def _build_launcher(
             mma_frag_C_retile = thr_copy_r2s_C.retile(mma_frag_C_bf16)
 
             thr_gBias = thr_copy_r2s_C.partition_S(gBias)
-            if fx.const_expr(DENSE_KN):
-                # make_fragment_like(thr_gBias) divides by zero on the
-                # permuted stride-0 layout.
-                bias_frag = fx.make_fragment_like(mma_frag_C_retile)
-            else:
-                bias_frag = fx.make_fragment_like(thr_gBias)
+            bias_frag = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
             fx.copy(
                 fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16),
                 thr_gBias,
-                bias_frag,
+                thr_copy_r2s_C.retile(bias_frag),
             )
 
             n_tiles = K // BLOCK_K
@@ -393,23 +386,7 @@ def _build_launcher(
                     b_dst(1),
                     soffset=fx.Int32(1) * gB_k_stride,
                 )
-            acc_shape = mma_frag_C.shape.to_py_value()
-            bias = bias_frag.load()
-            if fx.const_expr(DENSE_KN):
-                # The N permutation folds the n-reps into the copy's first
-                # mode: bias comes as (row, n-rep, m-rep), acc as
-                # (row, m-rep, n-rep).
-                m_reps = BLOCK_M // (16 * M_WARPS)
-                bias = bias.shuffle(
-                    bias,
-                    [
-                        a + 4 * r + 4 * B_REPS * m
-                        for r in range(B_REPS)
-                        for m in range(m_reps)
-                        for a in range(4)
-                    ],
-                )
-            mma_frag_C.store(fx.Vector(bias, acc_shape, fx.BFloat16).to(fx.Float32))
+            mma_frag_C.store(bias_frag.load().to(fx.Float32))
             fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
             fx.gpu.barrier()
 
