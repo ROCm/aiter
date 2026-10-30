@@ -576,6 +576,29 @@ def _check_large_m_edges(
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} rank-local mask relL2={rel_l2:.6f}")
 
+    # Launches keep the bound pointers (a captured graph replays them): a copy made for a
+    # strided weight would be freed after the call, so bind_weights refuses one.
+    try:
+        moe.bind_weights(
+            moe._s1_w1, moe._s1_w1_scale, moe.w2.transpose(-1, -2), moe.w2_scale
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("bind_weights accepted a non-contiguous weight")
+    # A refused slot leaves the weights bound before the call.
+    bound_w2 = moe.w2
+    try:
+        moe.bind_layer(
+            1 << 20, moe._s1_w1, moe._s1_w1_scale, moe.w2.clone(), moe.w2_scale
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("bind_layer accepted an out-of-range slot")
+    if moe.w2 is not bound_w2:
+        raise AssertionError("a refused bind_layer changed the bound weights")
+
     layout = {
         "arch": "gfx950",
         "world_size": 8,
@@ -588,13 +611,19 @@ def _check_large_m_edges(
     }
     if not large_m_eligible(enabled=True, max_tok_per_rank=8192, **layout) or (
         large_m_eligible(enabled=True, max_tok_per_rank=8192, act="situv2", **layout)
-        or small_m_eligible(enabled=True, act="situv2", **layout)
+        or small_m_eligible(enabled=True, num_cu=256, act="situv2", **layout)
     ):
         raise AssertionError("the large/small-input paths must be gated to SiLU")
+    # The small-input kernel shards its work over 8 XCDs: a 4-XCD (128-CU) part is not eligible.
+    if not small_m_eligible(enabled=True, num_cu=256, **layout) or small_m_eligible(
+        enabled=True, num_cu=128, **layout
+    ):
+        raise AssertionError("the small-input path must be gated to 8-XCD parts")
     if rank == 0:
         print(
             f"[LARGE-M] bs={tokens} explicit_stream=PASS "
-            f"rank_local_mask={'PASS' if check_mask else 'SKIP'} silu_gate=PASS",
+            f"rank_local_mask={'PASS' if check_mask else 'SKIP'} silu_gate=PASS "
+            "strided_weights=PASS xcd_gate=PASS",
             flush=True,
         )
 

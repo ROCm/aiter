@@ -78,6 +78,7 @@ def small_m_eligible(
     *,
     enabled: bool,
     arch: str,
+    num_cu: int,
     world_size: int,
     model_dim: int,
     inter_dim: int,
@@ -88,10 +89,15 @@ def small_m_eligible(
     fanout_masks: tuple[int, ...] = (),
     act: str = "silu",
 ) -> bool:
-    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 a8w4)."""
+    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 a8w4).
+
+    The kernel splits its work across 8 XCDs by XCC id, so it needs the 8-XCD
+    (256-CU) gfx950 parts; a 4-XCD part would leave half the work unclaimed.
+    """
     return (
         enabled
         and arch.split(":", 1)[0] == "gfx950"
+        and num_cu == 256
         and world_size == 8
         and model_dim == 7168
         and inter_dim == 3072
@@ -190,8 +196,14 @@ class MegaMoEV2:
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
+        # Contiguous copies of strided weights live as long as the instance: a graph captured with
+        # them keeps their pointers even after another bind_weights() call.
+        w1, w1_scale, w2, w2_scale = (
+            t if t.is_contiguous() else t.contiguous() for t in (w1, w1_scale, w2, w2_scale)
+        )
+        self._construction_weights = (w1, w1_scale, w2, w2_scale)
+        self.w2 = w2
+        self.w2_scale = w2_scale
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
         self._large_m = None
@@ -241,6 +253,7 @@ class MegaMoEV2:
         if small_m_eligible(
             enabled=envs.AITER_MEGA_SMALL_M,
             arch=device_arch,
+            num_cu=torch.cuda.get_device_properties(self.dev).multi_processor_count,
             world_size=self.world_size,
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
@@ -281,18 +294,20 @@ class MegaMoEV2:
         """Largest per-rank token count forward_small_m accepts (0 when disabled)."""
         return self._small_m.mtpr if self._small_m is not None else 0
 
-    def forward_small_m(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, max_tokens=None):
+    def forward_small_m(self, x_bf16, wts, topk_ids, *, max_tokens, stream=None, slice_output=True):
         """Run the small-input single kernel.
 
         The caller must make the same main/small-input choice on every EP rank for a
         given call: the two paths share no protocol state. ``max_tokens`` is the
-        DP-global max rows of this call and picks the runtime, so every rank
-        lands on the same instance; it defaults to the local row count. ``topk_ids``
-        may contain -1 (skipped, contributing zero).
+        max row count of this call over all EP ranks and picks the runtime; it must
+        be the same on every rank (the runtimes share no protocol state either), so
+        it has no per-rank default. ``topk_ids`` may contain -1 (skipped, contributing zero).
         """
         if self._small_m is None:
             raise RuntimeError("small-input path is not enabled (set AITER_MEGA_SMALL_M=1)")
-        need = int(x_bf16.shape[0]) if max_tokens is None else int(max_tokens)
+        need = int(max_tokens)
+        if need < int(x_bf16.shape[0]):
+            raise ValueError(f"max_tokens={need} is below this rank's {int(x_bf16.shape[0])} rows")
         runtime = next((r for r in self._small_m_runtimes if r.mtpr >= need), None)
         if runtime is None:
             raise ValueError(f"{need} tokens exceed the largest small-input mtpr {self._small_m.mtpr}")
@@ -330,10 +345,17 @@ class MegaMoEV2:
 
     def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
         """Bind weights for the main path and the optional small- and large-input runtimes."""
-        self._s1_w1 = w1.contiguous().view(torch.uint8)
-        self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
+        if not all(t.is_contiguous() for t in (w1, w1_scale, w2, w2_scale)):
+            # A contiguous copy would die after this call while a captured graph keeps its pointer.
+            raise ValueError("bind_weights needs contiguous weights")
+        # Everything that can refuse runs before any binding changes, so a refusal leaves the main,
+        # small- and large-input paths on the previous weights together.
+        for runtime in self._small_m_runtimes:
+            runtime.w2_dispatch_table(w2, w2_scale)
+        self._s1_w1 = w1.view(torch.uint8)
+        self._s1_w1_scale = w1_scale.view(torch.uint8)
+        self.w2 = w2
+        self.w2_scale = w2_scale
         if self._large_m is not None:
             self._large_m.bind_weights(
                 self._s1_w1,
@@ -350,9 +372,12 @@ class MegaMoEV2:
             )
 
     def bind_layer(self, layer_slot: int, w1, w1_scale, w2, w2_scale) -> None:
-        """Bind a stable layer slot and its weights without resetting state."""
-        self.select_layer_state(layer_slot)
+        """Bind a stable layer slot and its weights without resetting state; a refused
+        slot or weight binding changes neither."""
+        if self._large_m is not None and not 0 <= int(layer_slot) < self._large_m.state_slots:
+            raise ValueError(f"layer_slot={layer_slot} outside [0, {self._large_m.state_slots})")
         self.bind_weights(w1, w1_scale, w2, w2_scale)
+        self.select_layer_state(layer_slot)
 
     def preload_aot_bundles(self):
         """Load the paired Stage1 and Stage2 production bundles, and the small- and

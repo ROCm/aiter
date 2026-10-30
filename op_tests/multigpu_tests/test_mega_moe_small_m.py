@@ -346,7 +346,9 @@ def run(args):
                 bind(layer, which)
                 # The output is the operator's combine buffer (as in main), valid
                 # until its next call: copy it out before the next call.
-                graph_out.append(moe.forward_small_m(sx, sw, si)[:n].clone())
+                graph_out.append(
+                    moe.forward_small_m(sx, sw, si, max_tokens=n)[:n].clone()
+                )
 
         # Warm (eager) so dispatch tables exist before capture.
         graph_body()
@@ -380,7 +382,7 @@ def run(args):
             _barrier()
             for layer in range(args.graph_layers):
                 bind(layer, layer & 1)
-                eager = moe.forward_small_m(gx, gw, gi)[:n]
+                eager = moe.forward_small_m(gx, gw, gi, max_tokens=n)[:n]
                 gmism += int((eager != replay[layer]).any(dim=-1).sum().item())
             _barrier()
         gm = torch.tensor(gmism, device=device)
@@ -430,7 +432,9 @@ def run(args):
                 paths.append(
                     (
                         "small_m",
-                        lambda tx=tx, tw=tw, ti=ti: moe.forward_small_m(tx, tw, ti),
+                        lambda tx=tx, tw=tw, ti=ti, n=n: moe.forward_small_m(
+                            tx, tw, ti, max_tokens=n
+                        ),
                     )
                 )
             for label, fn in paths:

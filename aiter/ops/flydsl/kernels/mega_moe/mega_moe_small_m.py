@@ -1599,18 +1599,9 @@ class SmallMRuntime:
         self._s1_disp = torch.tensor(table, dtype=torch.int64, device=self.dev)
         self._s1_disp_by_w2[(self.w2.data_ptr(), self.w2_scale.data_ptr())] = self._s1_disp
 
-    def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
-        """Bind layer weights.
-
-        W1 pointers are launch arguments; W2 pointers live in the dispatch table,
-        so each distinct W2 gets its own table, built on first (eager) use and
-        reused afterwards, including inside captured graphs.
-        """
-        self._s1_w1 = w1.contiguous().view(torch.uint8)
-        self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
-        key = (self.w2.data_ptr(), self.w2_scale.data_ptr())
+    def w2_dispatch_table(self, w2, w2_scale):
+        """The dispatch table for these W2 weights, built on first (eager) use; binds nothing."""
+        key = (w2.data_ptr(), w2_scale.data_ptr())
         disp = self._s1_disp_by_w2.get(key)
         if disp is None:
             if torch.cuda.is_current_stream_capturing():
@@ -1620,6 +1611,24 @@ class SmallMRuntime:
             table[DispatchSlot.G2_BSCALE] = key[1]
             disp = torch.tensor(table, dtype=torch.int64, device=self.dev)
             self._s1_disp_by_w2[key] = disp
+        return disp
+
+    def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
+        """Bind layer weights.
+
+        W1 pointers are launch arguments; W2 pointers live in the dispatch table,
+        so each distinct W2 gets its own table, built on first (eager) use and
+        reused afterwards, including inside captured graphs. A refused binding
+        leaves the previous one in place.
+        """
+        if not all(t.is_contiguous() for t in (w1, w1_scale, w2, w2_scale)):
+            # A contiguous copy would die after this call while a captured graph keeps its pointer.
+            raise ValueError("bind_weights needs contiguous weights")
+        disp = self.w2_dispatch_table(w2, w2_scale)
+        self._s1_w1 = w1.view(torch.uint8)
+        self._s1_w1_scale = w1_scale.view(torch.uint8)
+        self.w2 = w2
+        self.w2_scale = w2_scale
         self._s1_disp = disp
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:

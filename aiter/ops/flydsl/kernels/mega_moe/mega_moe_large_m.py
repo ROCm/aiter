@@ -1216,7 +1216,8 @@ def _torch_stream(stream):
     if isinstance(stream, fx.Stream):
         stream = 0 if stream.value is None else stream.value
     if isinstance(stream, int):
-        return torch.cuda.ExternalStream(stream)
+        # ExternalStream(0) would take a new pool stream instead of the null stream the kernel runs on.
+        return torch.cuda.default_stream() if stream == 0 else torch.cuda.ExternalStream(stream)
     return stream
 
 
@@ -1352,7 +1353,7 @@ def compile_mega_moe_stage1(
     @fx.struct
     class SharedStorage:
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
-        A_scale: fx.Array[fx.Int8, n_scale_bytes + 16, 16]
+        A_scale: fx.Array[fx.Int8, n_scale_bytes + 32, 16]
 
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
@@ -1624,8 +1625,6 @@ def compile_mega_moe_stage1(
 
         # Control CTAs join the work pool after dispatch.
         consumer_active = fx.Int32(1) == fx.Int32(1)
-        work_scratch = fx.recast_iter(fx.Int32, a_buf.ptr)
-        work_scratch_view = fx.make_view(work_scratch, fx.make_layout(1, 1))
         work_shard = ticket & fx.Int32(WORK_SHARDS - 1)
         # Thread-0-private LDS word holding the last G1 stripe this CTA finished (-1 = none).
         # Its completion is published at the next claim so no atomic sits in the GEMM1 tail.
@@ -1637,6 +1636,15 @@ def compile_mega_moe_stage1(
         )
         epoch_slot_ptr = lds_typed_ptr(
             fx.Int32(fx.ptrtoint(lds.A_scale.ptr)) + fx.Int32(n_scale_bytes + 8), T.i32
+        )
+        # Thread 0 broadcasts the claimed G1 unit, then whether it has work, through two LDS words of
+        # their own: one reused word could be rewritten before a slower wave read it, and the tile
+        # buffers are written by the first waves to start the tile.
+        work_word = lds_typed_ptr(
+            fx.Int32(fx.ptrtoint(lds.A_scale.ptr)) + fx.Int32(n_scale_bytes + 16), T.i32
+        )
+        has_work_word = lds_typed_ptr(
+            fx.Int32(fx.ptrtoint(lds.A_scale.ptr)) + fx.Int32(n_scale_bytes + 20), T.i32
         )
         if tid == fx.Int32(0):
             fx.ptr_store(fx.Int32(-1), pub_slot)
@@ -1691,16 +1699,17 @@ def compile_mega_moe_stage1(
                             1,
                         )
                         work = work + (ready_m_tile - ready_slot) * fx.Int32(N_TILES)
-                fx.ptr_store(Vec.from_elements([work], fx.Int32), work_scratch)
+                fx.ptr_store(work, work_word)
             fx.barrier()
-            work = Vec(work_scratch_view.load())[0]
+            work = fx.Int32(fx.ptr_load(work_word, result_type=T.i32))
             if tid == fx.Int32(0):
                 has_work = (work < total_work).select(fx.Int32(1), fx.Int32(0))
                 if has_work != fx.Int32(0):
                     _wait_tile_payload(work)
-                fx.ptr_store(Vec.from_elements([has_work], fx.Int32), work_scratch)
+                fx.ptr_store(has_work, has_work_word)
             fx.barrier()
-            has_work = Vec(work_scratch_view.load())[0]
+            has_work = fx.Int32(fx.ptr_load(has_work_word, result_type=T.i32))
+            # Both words are rewritten only after the next loop-head barrier, once every wave read them.
             if has_work != fx.Int32(0):
                 comm_ops.fence_system_acquire()
                 _do_scheduled_tile(work)
@@ -2188,10 +2197,13 @@ class LargeMRuntime:
 
     def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
         """Bind layer weights; launch arguments capture these exact pointers."""
-        self._s1_w1 = w1.contiguous().view(torch.uint8)
-        self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
+        if not all(t.is_contiguous() for t in (w1, w1_scale, w2, w2_scale)):
+            # A contiguous copy would die after this call while a captured graph keeps its pointer.
+            raise ValueError("bind_weights needs contiguous weights")
+        self._s1_w1 = w1.view(torch.uint8)
+        self._s1_w1_scale = w1_scale.view(torch.uint8)
+        self.w2 = w2
+        self.w2_scale = w2_scale
 
     def bind_layer(self, layer_slot: int, w1, w1_scale, w2, w2_scale) -> None:
         """Atomically bind one layer's protocol slot and weight pointers."""
