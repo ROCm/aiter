@@ -204,6 +204,8 @@ def _pa_decode_mxfp4(
         )
     if output.dtype != torch.bfloat16 or output.shape != query.shape:
         raise TypeError("MXFP4 pa_decode needs a bf16 output shaped like the query")
+    if output.device != dev:
+        raise ValueError(f"output must be on the query device ({dev})")
     if any(t.stride(2) != 1 for t in (query, output)) or any(
         x * t.element_size() % 16 for t in (query, output) for x in t.stride()[:2]
     ):
@@ -300,8 +302,15 @@ def _pa_decode_mxfp4(
         ):
             if t is None:
                 t = torch.empty(expected, dtype=dtype, device=dev)
-            if tuple(t.shape) != expected or t.dtype != dtype or not t.is_contiguous():
-                raise ValueError(f"{name} must be contiguous {dtype} {expected}")
+            if (
+                tuple(t.shape) != expected
+                or t.dtype != dtype
+                or t.device != dev
+                or not t.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous {dtype} {expected} on {dev}"
+                )
             scratch.append(t)
         pmax, psum, pout = scratch
     with torch.cuda.device(dev):

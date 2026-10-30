@@ -654,6 +654,8 @@ _MXFP4_INVALID_CASES = [
     ("table-rows-mismatch", ValueError, r"query.shape\[0\] .* must match"),
     ("query-stride-2", ValueError, "contiguous head_dim axis"),
     ("output-stride-2", ValueError, "contiguous head_dim axis"),
+    ("output-on-cpu", ValueError, "output must be on the query device"),
+    ("scratch-on-cpu", ValueError, "exp_sums must be contiguous .* on cuda"),
     ("key-scale-none", TypeError, "key_scale must be a uint8 torch.Tensor"),
     # A windowed plan is refused with one partition (served without it) and more.
     ("windowed-plan-1", ValueError, "sliding_window must match work_plan"),
@@ -1053,6 +1055,14 @@ def test_pa_decode_rejects(kv, invalid, error, match):
         query = strided.copy_(query)
     elif invalid == "output-stride-2":
         output = torch.empty(4, 16, 256, dtype=torch.bfloat16, device=DEVICE)[..., ::2]
+    elif invalid == "output-on-cpu":
+        output = output.cpu()
+    elif invalid == "scratch-on-cpu":
+        # Scratch is only used (and checked) when the plan has more than one partition.
+        options["work_plan"] = pa.plan_pa_decode(context, 1, max_partitions=2)
+        options["exp_sums"] = torch.empty(
+            1, options["work_plan"].capacity, 16, device="cpu"
+        )
     elif invalid == "key-scale-none":
         options["key_scale"] = None
     elif invalid.startswith("windowed-plan"):
