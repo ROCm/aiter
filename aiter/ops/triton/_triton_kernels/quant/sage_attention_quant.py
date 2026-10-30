@@ -33,6 +33,8 @@ def _mha_v4_per_tensor_block_offsets(
     a tile of whole rows: the batch/sequence/head decomposition runs once per row rather than once
     per element, which would otherwise dominate these memory-bound kernels.
     """
+    # 64-bit before any multiplication: past 2^31 elements (or rows) the block's start wraps.
+    block = block.to(tl.int64)
     if STRIDED:
         input_offsets, offsets, mask = _mha_v4_per_tensor_row_tile_offsets(
             block,
@@ -64,7 +66,7 @@ def _mha_v4_per_tensor_row_tile_offsets(
     HEAD_DIM: tl.constexpr,
     ROWS: tl.constexpr,
 ):
-    rows = (block * ROWS + tl.arange(0, ROWS)).to(tl.int64)
+    rows = block * ROWS + tl.arange(0, ROWS)
     cols = tl.arange(0, HEAD_DIM)
     token_flat = rows // heads
     row_base = (

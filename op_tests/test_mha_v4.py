@@ -843,6 +843,43 @@ def test_mha_v4_triton_v_quantizers_address_strided_views_past_2_31_elements(
     assert "matched" in finished.stdout
 
 
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="~6 GB of gfx942/gfx950 memory")
+@parametrize("layout", ["contiguous", "expanded"])
+def test_mha_v4_per_tensor_quantization_addresses_past_2_31_elements(layout):
+    """A block starting past 2^31 elements, or past 2^31 rows of an expanded view, must not
+    wrap to a negative offset. The last element alone is 2, so it sets the scale and quantizes to
+    the FP8 maximum. Out of process because a wrapped offset faults the GPU rather than failing.
+    """
+    source = textwrap.dedent(f"""
+        import torch
+        from aiter.ops.mha_v4_quant import quantize_fp8
+
+        if "{layout}" == "contiguous":
+            value = torch.ones((1 << 31) + 8192, device="cuda", dtype=torch.bfloat16)
+            value[-1] = 2.0
+            value = value.view(-1, 128)
+        else:
+            value = torch.full((1, 1, 1, 1), 2.0, device="cuda", dtype=torch.bfloat16)
+            value = value.expand(1, 1, (1 << 31) + 1, 1)
+        quantized, scale = quantize_fp8(value)
+        fp8_max = torch.finfo(quantized.dtype).max
+        assert abs(scale.item() * fp8_max - 2) < 1e-5, scale.item()
+        assert quantized.view(-1)[-1].float().item() == fp8_max
+        torch.cuda.synchronize()
+        print("matched")
+        """)
+    finished = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    assert "matched" in finished.stdout
+
+
 def test_mha_v4_rotated_fp8_rejects_noncontiguous_non_bshd_input():
     value = torch.randn((2, 3, 128), device="cuda", dtype=torch.bfloat16)
     value = value.transpose(0, 1)
