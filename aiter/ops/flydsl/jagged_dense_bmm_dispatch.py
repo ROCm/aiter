@@ -3,28 +3,34 @@
 
 """Dispatch layer for jagged_dense_bmm_broadcast_add.
 
-Picks a per-shape config from the live arch's section of
-``jagged_dense_bmm_dispatch.json``: explicit override, then table winner, then
-kernel default. The skew path takes only ``block_k`` from the table; its XCD
-remap comes from ``_skew_compact_xcd`` unless overridden.
+Owns every launch default. Picks a config in this order: explicit override,
+then the row of ``AITER_CONFIG_JAGGED_DENSE_BMM`` keyed by
+``(gfx, cu_num, K, N, tiles_log2)``, then the analytic default. The skew path
+takes only ``block_k`` from the row; its XCD remap comes from
+``_skew_compact_xcd`` unless overridden.
 """
 
 from __future__ import annotations
 
 import functools
-import json
-import os
-from pathlib import Path
 
+import pandas as pd
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 
-from .kernels.jagged_dense_bmm_gen import jagged_dense_bmm
+from .kernels.jagged_dense_bmm_gen import BLOCK_M, BLOCK_N, jagged_dense_bmm
 
 __all__ = ["jagged_dense_bmm_dispatched"]
 
 SUPPORTED_ARCHS = ("gfx942",)
+
+DEFAULT_BLOCK_K = 64
+DEFAULT_THREADS = 256
+DEFAULT_XCD_W = 8
+DEFAULT_XCD_C_SMALL_K = 32
+DEFAULT_XCD_C_LARGE_K = 120
 
 SKEW_COMPACT_XCD_C = 32
 SKEW_COMPACT_XCD_W = 8
@@ -32,29 +38,28 @@ SKEW_COMPACT_KN_XCD_C_SMALL = 64
 SKEW_COMPACT_KN_XCD_W_SMALL = 16
 _SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
 
+_KEY_COLS = ["gfx", "cu_num", "K", "N", "tiles_log2"]
 _CFG_KEYS = ("xcd_c", "xcd_w", "block_k", "threads")
 
 
-def _dispatch_json_path() -> Path:
-    env = os.environ.get("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON")
-    if env:
-        return Path(env)
-    return Path(__file__).resolve().parent / "jagged_dense_bmm_dispatch.json"
-
-
 @functools.cache
-def _load_winners(arch: str) -> dict:
-    path = _dispatch_json_path()
-    if not path.is_file():
-        return {}
-    section = json.loads(path.read_text()).get("by_arch", {}).get(arch, {})
-    return dict(section.get("winners") or {})
+def _tuned_table() -> dict:
+    df = pd.read_csv(
+        AITER_CONFIGS.AITER_CONFIG_JAGGED_DENSE_BMM_FILE,
+        dtype=str,
+        keep_default_na=False,
+    )
+    return {
+        (r["gfx"], int(r["cu_num"]), int(r["K"]), int(r["N"]), int(r["tiles_log2"])): {
+            k: int(r[k]) if r[k] else None for k in _CFG_KEYS
+        }
+        for r in df.to_dict("records")
+    }
 
 
-def shape_id(
-    *, n_groups: int, reduction_k: int, output_n: int, max_seq_len: int
-) -> str:
-    return f"B{n_groups}D{reduction_k}K{output_n}N{max_seq_len}"
+def tiles_log2(*, n_groups: int, output_n: int, max_seq_len: int) -> int:
+    tiles = n_groups * -(-max_seq_len // BLOCK_M) * (output_n // BLOCK_N)
+    return max(tiles, 1).bit_length() - 1
 
 
 def _skew_compact_xcd(
@@ -68,34 +73,56 @@ def _skew_compact_xcd(
 
 
 def _config_valid(cfg: dict, *, reduction_k: int) -> bool:
-    bk = cfg["block_k"] or 64
+    bk = cfg["block_k"] or DEFAULT_BLOCK_K
     return reduction_k % bk == 0 and reduction_k // bk >= 2
 
 
 def resolve_config(
     *,
-    arch: str,
     n_groups: int,
     reduction_k: int,
     output_n: int,
     max_seq_len: int,
+    uniform_seqlen: bool,
+    dense_kn: bool,
     xcd_c: int | None = None,
     xcd_w: int | None = None,
     block_k: int | None = None,
 ) -> dict:
-    sid = shape_id(
-        n_groups=n_groups,
-        reduction_k=reduction_k,
-        output_n=output_n,
-        max_seq_len=max_seq_len,
+    key = (
+        get_gfx(),
+        get_cu_num(),
+        reduction_k,
+        output_n,
+        tiles_log2(n_groups=n_groups, output_n=output_n, max_seq_len=max_seq_len),
     )
-    entry = _load_winners(arch).get(sid) or {}
-    cfg = {k: None if entry.get(k) is None else int(entry[k]) for k in _CFG_KEYS}
+    cfg = dict(_tuned_table().get(key) or dict.fromkeys(_CFG_KEYS))
     if not _config_valid(cfg, reduction_k=reduction_k):
         cfg = dict.fromkeys(_CFG_KEYS)
-    for k, v in (("xcd_c", xcd_c), ("xcd_w", xcd_w), ("block_k", block_k)):
-        if v is not None:
-            cfg[k] = int(v)
+    if block_k is not None:
+        cfg["block_k"] = int(block_k)
+    if not uniform_seqlen:
+        cfg["xcd_c"], cfg["xcd_w"] = _skew_compact_xcd(n_groups, reduction_k, dense_kn)
+    # Thread counts were tuned on the uniform 2-D layout; 3-D is faster at the default.
+    if not uniform_seqlen or dense_kn:
+        cfg["threads"] = None
+    if xcd_c is not None:
+        cfg["xcd_c"] = int(xcd_c)
+    if xcd_w is not None:
+        cfg["xcd_w"] = int(xcd_w)
+    if cfg["xcd_c"] is None:
+        if not uniform_seqlen:
+            cfg["xcd_c"] = 1
+        elif reduction_k > 256:
+            cfg["xcd_c"] = DEFAULT_XCD_C_LARGE_K
+        else:
+            cfg["xcd_c"] = DEFAULT_XCD_C_SMALL_K
+    if cfg["xcd_w"] is None:
+        cfg["xcd_w"] = 1 if cfg["xcd_c"] == 1 else DEFAULT_XCD_W
+    if cfg["block_k"] is None:
+        cfg["block_k"] = DEFAULT_BLOCK_K
+    if cfg["threads"] is None:
+        cfg["threads"] = DEFAULT_THREADS
     return cfg
 
 
@@ -195,35 +222,18 @@ def jagged_dense_bmm_dispatched(
     if uniform_seqlen and max_seq_len < 1:
         raise ValueError(f"max_seq_len must be >= 1, got {max_seq_len}")
     cfg = resolve_config(
-        arch=arch,
         n_groups=n_groups,
         reduction_k=reduction_k,
         output_n=output_n,
         max_seq_len=max_seq_len,
+        uniform_seqlen=uniform_seqlen,
+        dense_kn=B.dim() == 3,
         xcd_c=xcd_c,
         xcd_w=xcd_w,
         block_k=block_k,
     )
     if stream is None:
         stream = torch.cuda.current_stream(A.device)
-
-    if not uniform_seqlen:
-        sc_xcd_c, sc_xcd_w = _skew_compact_xcd(n_groups, reduction_k, B.dim() == 3)
-        return jagged_dense_bmm(
-            C,
-            A,
-            B,
-            BIAS,
-            SEQ_OFFSETS,
-            n_groups,
-            max_seq_len,
-            stream=stream,
-            xcd_c=sc_xcd_c if xcd_c is None else xcd_c,
-            xcd_w=sc_xcd_w if xcd_w is None else xcd_w,
-            uniform_seqlen=False,
-            block_k=cfg["block_k"],
-        )
-
     return jagged_dense_bmm(
         C,
         A,
@@ -233,9 +243,6 @@ def jagged_dense_bmm_dispatched(
         n_groups,
         max_seq_len,
         stream=stream,
-        xcd_c=cfg["xcd_c"],
-        xcd_w=cfg["xcd_w"],
-        block_k=cfg["block_k"],
-        # Thread counts were tuned on the 2-D layout; 3-D is faster at the default.
-        threads=cfg["threads"] if B.dim() == 2 else None,
+        uniform_seqlen=uniform_seqlen,
+        **cfg,
     )
