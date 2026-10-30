@@ -22,6 +22,8 @@ _gemm_a16w16_repr = make_kernel_repr(
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
         "EVEN_MN",
+        "NUM_PID_M",
+        "NUM_PID_N",
         "cache_modifier",
         "activation",
         "use_activation",
@@ -37,6 +39,8 @@ _gemm_a16w16_repr = make_kernel_repr(
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
         "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
         and (args["N"] % args["BLOCK_SIZE_N"] == 0),
+        "NUM_PID_M": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"]),
+        "NUM_PID_N": lambda args: triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(
@@ -67,6 +71,8 @@ def _gemm_a16_w16_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     EVEN_MN: tl.constexpr,
+    NUM_PID_M: tl.constexpr,
+    NUM_PID_N: tl.constexpr,
     cache_modifier: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
@@ -89,8 +95,9 @@ def _gemm_a16_w16_kernel(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid_unified = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    # The launch grid is known on the host. Keep its divisions out of the kernel.
+    num_pid_m = NUM_PID_M
+    num_pid_n = NUM_PID_N
     pid_unified = remap_xcd(pid_unified, num_pid_m * num_pid_n * NUM_KSPLIT, NUM_XCDS=8)
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
@@ -138,7 +145,10 @@ def _gemm_a16_w16_kernel(
 
         split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
         k_span = split_k_end - split_k_start
-        num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
+        if EVEN_K:
+            num_k_iter = SPLITK_BLOCK_SIZE // BLOCK_SIZE_K
+        else:
+            num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
 
         for k in range(num_k_iter):
             # Load the next block of A and B, generate a mask by checking the K dimension.
