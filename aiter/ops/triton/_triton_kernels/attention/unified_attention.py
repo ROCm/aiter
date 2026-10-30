@@ -90,7 +90,8 @@ def seq_num_segments(seq_len, segment_tokens, NUM_SEGMENTS_PER_SEQ):
 @triton.jit
 def load_seq_lens(seq_lens_ptr, num_seqs, s0, SEQ_BLOCK: tl.constexpr):
     offs = s0 + tl.arange(0, SEQ_BLOCK)
-    return tl.load(seq_lens_ptr + offs, mask=offs < num_seqs, other=0)
+    # callers pass int32 or int64 lengths; the split math runs in int32
+    return tl.load(seq_lens_ptr + offs, mask=offs < num_seqs, other=0).to(tl.int32)
 
 
 @triton.jit
