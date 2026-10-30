@@ -951,7 +951,7 @@ class AttentionProgram:
     ):
         casted_out = out.to(self.output_ptr.dtype.element_ty)
 
-        if USE_TDM and self.cfg.ARCH_NAME in ("gfx1250", "gfx1250-strict"):
+        if USE_TDM and (self.cfg.ARCH_NAME == "gfx1250" or self.cfg.ARCH_NAME == "gfx1250-strict"):
             STORE_COLS: gl.constexpr = self.cfg.NUM_QUERIES_PER_KV * self.cfg.HEAD_SIZE
             o_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
                 vec=1, per_phase=1, max_phase=1, order=[1, 0]
@@ -1273,7 +1273,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
         "gfx1250-strict",
     )
     MERGE_EPI_TDM_WAITS: gl.constexpr = False
-    SPLIT_SOFTMAX0: gl.constexpr = pgm.cfg.ARCH_NAME in ("gfx1250", "gfx1250-strict")
+    SPLIT_SOFTMAX0: gl.constexpr = (pgm.cfg.ARCH_NAME == "gfx1250" or pgm.cfg.ARCH_NAME == "gfx1250-strict")
     SPLIT_SOFTMAX0_EPI: gl.constexpr = False
     # Buffer rotation: tile m lives in slot m%N (K and V use disjoint LDS regions).
     #   buf_tile_cur   -> tile i     ( i   %N)
@@ -1764,7 +1764,7 @@ def load_q(
     query_stride_0,
     USE_TDM_LOAD: gl.constexpr = False,
 ):
-    if USE_TDM_LOAD and cfg.ARCH_NAME in ("gfx1250", "gfx1250-strict"):
+    if USE_TDM_LOAD and (cfg.ARCH_NAME == "gfx1250" or cfg.ARCH_NAME == "gfx1250-strict"):
         LOAD_COLS: gl.constexpr = cfg.NUM_QUERIES_PER_KV * cfg.HEAD_SIZE
         q_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
