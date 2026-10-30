@@ -1526,7 +1526,12 @@ class MegaMoEGfx1250:
             if blocks_env is not None or warps_env is not None:
                 compact_blocks = int(blocks_env or "64")
                 compact_warps = int(warps_env or "8")
-                config.schedule = ((None, compact_blocks, compact_warps),)
+                route_parallel = os.environ.get(
+                    "AITER_TDM_COMPACT_ROUTE_PARALLEL", "0"
+                ) in ("1", "true", "True")
+                config.schedule = (
+                    (None, compact_blocks, compact_warps, route_parallel),
+                )
             else:
                 config.schedule = _compact_dispatch_schedule(
                     config.world_size, config.topk

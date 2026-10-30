@@ -296,7 +296,15 @@ def compile_tdm_compact_plan(
         lds_matrix = fx.Int64(fx.ptrtoint(matrix_ptr))
         if const_expr(merge_routes):
             routes_ptr = smem.allocate(chunk_cap * 4, 16)._ptr
+            route_warp_ptr = smem.allocate(chunk_cap * 4, 16)._ptr
+            # One histogram per warp. A shared LDS histogram serializes every
+            # route in the chunk on a few hundred expert bins; prefill is that
+            # chunk. The exclusive scan below stitches the warp bins back into
+            # the same per-segment row offsets the shared atomic produced.
+            whist_ptr = smem.allocate(plan_waves * segs * 4, 16)._ptr
             lds_routes = fx.Int64(fx.ptrtoint(routes_ptr))
+            lds_route_warp = fx.Int64(fx.ptrtoint(route_warp_ptr))
+            lds_whist = fx.Int64(fx.ptrtoint(whist_ptr))
         if const_expr(use_sparse):
             pack_ptr = smem.allocate(row_dwords * 4, 128)._ptr
             recv_ptr = smem.allocate(npes * row_dwords * 4, 128)._ptr
@@ -311,6 +319,9 @@ def compile_tdm_compact_plan(
 
         for s in range(tid, segs, plan_threads):
             comm_ops.store_i32_lds(lds_hist + fx.Int64(s) * 4, arith.constant(0))
+        if const_expr(merge_routes):
+            for s in range(tid, plan_waves * segs, plan_threads):
+                comm_ops.store_i32_lds(lds_whist + fx.Int64(s) * 4, arith.constant(0))
         fx.barrier()
 
         n_routes = inp_cur_tok * fx.Int32(topk)
@@ -336,9 +347,16 @@ def compile_tdm_compact_plan(
             segment = dest_pe * fx.Int32(epr) + local_e
             intra = arith.constant(0)
             if valid:
-                intra = comm_ops.atomic_add_lds(
-                    lds_hist + fx.Int64(segment) * 4, arith.constant(1)
-                )
+                if const_expr(merge_routes):
+                    intra = comm_ops.atomic_add_lds(
+                        lds_whist
+                        + (fx.Int64(warp) * fx.Int64(segs) + fx.Int64(segment)) * 4,
+                        arith.constant(1),
+                    )
+                else:
+                    intra = comm_ops.atomic_add_lds(
+                        lds_hist + fx.Int64(segment) * 4, arith.constant(1)
+                    )
             packed = arith.select(
                 valid,
                 segment | (intra << arith.constant(16)),
@@ -346,6 +364,7 @@ def compile_tdm_compact_plan(
             )
             if const_expr(merge_routes):
                 comm_ops.store_i32_lds(lds_routes + fx.Int64(local) * 4, packed)
+                comm_ops.store_i32_lds(lds_route_warp + fx.Int64(local) * 4, warp)
             else:
                 buffer_store(packed, rsrc_map, route)
 
@@ -365,6 +384,16 @@ def compile_tdm_compact_plan(
             _tally_one(local, expert)
 
         fx.barrier()
+        if const_expr(merge_routes):
+            for s in range(tid, segs, plan_threads):
+                total = arith.constant(0)
+                for w in range_constexpr(plan_waves):
+                    slot = lds_whist + fx.Int64(w * segs + s) * 4
+                    cnt = comm_ops.load_i32_lds(slot)
+                    comm_ops.store_i32_lds(slot, total)
+                    total = total + cnt
+                comm_ops.store_i32_lds(lds_hist + fx.Int64(s) * 4, total)
+            fx.barrier()
         if const_expr(plan_blocks > 1):
             # barrier[0] counts arrivals and is reset by block 0 once all are in:
             # plans on one slot share a stream, so the next launch starts after.
@@ -645,6 +674,7 @@ def compile_tdm_compact_plan(
             route = r0 + local
             if const_expr(merge_routes):
                 packed = comm_ops.load_i32_lds(lds_routes + fx.Int64(local) * 4)
+                owner_warp = comm_ops.load_i32_lds(lds_route_warp + fx.Int64(local) * 4)
             else:
                 packed = buffer_load(rsrc_map, route, vec_width=1, dtype=T.i32)
             valid = packed >= 0
@@ -652,6 +682,13 @@ def compile_tdm_compact_plan(
             intra = packed >> arith.constant(16)
             dest_pe = segment // fx.Int32(epr)
             send_base = comm_ops.load_i32_lds(lds_hist + fx.Int64(segment) * 4)
+            if const_expr(merge_routes):
+                safe_seg = valid.select(segment, fx.Int32(0))
+                safe_warp = valid.select(owner_warp, fx.Int32(0))
+                send_base = send_base + comm_ops.load_i32_lds(
+                    lds_whist
+                    + (fx.Int64(safe_warp) * fx.Int64(segs) + fx.Int64(safe_seg)) * 4
+                )
             dest_row = send_base + intra
             in_cap = dest_row < compact_cap
             flat = (dest_row << fx.Int32(peer_bits)) | (dest_pe & fx.Int32(peer_mask))

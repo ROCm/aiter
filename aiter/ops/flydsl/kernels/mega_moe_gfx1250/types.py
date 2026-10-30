@@ -73,8 +73,9 @@ class Stage2ScatterContext:
     world_size: int
     source_token_map: torch.Tensor
     compact_layout: bool = False
-    # Compact dispatch shipped one row per token per peer, not one per route in
-    # expert order, so GEMM1 must gather its A rows through compact_ep_rowmap.
+    # Compact dispatch shipped one row per token per peer. The grouped GEMM
+    # scatters those rows into expert order before GEMM1, then clears this flag
+    # so GEMM1 does a contiguous load.
     compact_row_gather: bool = False
     compact_masked_m: torch.Tensor | None = None
     compact_psum: torch.Tensor | None = None

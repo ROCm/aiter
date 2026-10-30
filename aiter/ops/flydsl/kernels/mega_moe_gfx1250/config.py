@@ -75,9 +75,29 @@ _DISPATCH_COMPACT_EP4_TOPK9 = (
 )
 
 
+# EP2 h5120 topk6 fp4 (DSV4.1 Flash). The EP4 tail is token-major 128x16 past
+# 4096 tokens/rank. On this geometry that tail is slower than 256x16, and
+# route-parallel grids (256/384/512/1024) are slower still: each token hits
+# about two peers, so fanning six routes does not hide the deduped stores.
+# MegaMoE microbenchmark, scatter compact path, tpr 8192, per layer:
+#   128x16 token-major  1075 us
+#   256x16 token-major  1059 us
+#   512x16 route        1072 us
+_DISPATCH_COMPACT_EP2_TOPK6 = (
+    (64, 64, 8, True),
+    (256, 192, 8, True),
+    (512, 192, 16, True),
+    (1536, 384, 16, True),
+    (4096, 256, 16, True),
+    (None, 256, 16, False),
+)
+
+
 def _compact_dispatch_schedule(world_size: int, topk: int):
     if (int(world_size), int(topk)) == (4, 9):
         return _DISPATCH_COMPACT_EP4_TOPK9
+    if (int(world_size), int(topk)) == (2, 6):
+        return _DISPATCH_COMPACT_EP2_TOPK6
     return _DISPATCH_COMPACT
 
 
