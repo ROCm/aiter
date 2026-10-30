@@ -741,14 +741,16 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
 # The FP8 arm is real gfx942 coverage; the MX arms would reach quantizers that AITER_CHECK on
 # gfx950, and that check aborts the process rather than raising.
 @parametrize(
-    "recipe",
+    "recipe,head_dim",
     [
-        "fp8",
-        param("mxfp8", skip=get_gfx() != "gfx950"),
-        param("mxfp4", skip=get_gfx() != "gfx950"),
+        ("fp8", 128),
+        param("mxfp8", 128, skip=get_gfx() != "gfx950"),
+        param("mxfp4", 128, skip=get_gfx() != "gfx950"),
+        # hd256 routes K and its mean through a half-head view a 128 head never exercises.
+        param("mxfp4", 256, skip=get_gfx() != "gfx950"),
     ],
 )
-def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
+def test_mha_v4_quantized_tolerates_k_common_mode(recipe, head_dim):
     """A direction shared by every key must not cost accuracy.
 
     Softmax is shift invariant in such a component, so the reference barely moves; only the
@@ -756,10 +758,10 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     is the tripwire for silently dropping it.
     """
     torch.manual_seed(17)
-    q = torch.randn((1, 1024, 4, 128), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((1, 1024, 4, head_dim), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(q)
     base_k = torch.randn_like(q)
-    direction = torch.randn((1, 1, 4, 128), device="cuda", dtype=torch.bfloat16)
+    direction = torch.randn((1, 1, 4, head_dim), device="cuda", dtype=torch.bfloat16)
 
     if recipe == "fp8":
         formats = (native_fp8_format(),) * 3
@@ -796,8 +798,11 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     get_gfx() != "gfx950",
     reason="gfx950 LSE",
 )
-@parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
-def test_mha_v4_lse_survives_k_common_mode(recipe):
+@parametrize(
+    "recipe,head_dim",
+    [("fp8", 128), ("mxfp8", 128), ("mxfp4", 128), ("mxfp4", 256)],
+)
+def test_mha_v4_lse_survives_k_common_mode(recipe, head_dim):
     """K smoothing must not leak into the exported LSE.
 
     Smoothing runs the kernel against k - k_mean, shifting every score by the per-query constant
@@ -807,10 +812,10 @@ def test_mha_v4_lse_survives_k_common_mode(recipe):
     of its output norm this way while every output test stayed green.
     """
     torch.manual_seed(17)
-    q = torch.randn((1, 1024, 4, 128), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((1, 1024, 4, head_dim), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(q)
     base_k = torch.randn_like(q)
-    direction = torch.randn((1, 1, 4, 128), device="cuda", dtype=torch.bfloat16)
+    direction = torch.randn((1, 1, 4, head_dim), device="cuda", dtype=torch.bfloat16)
 
     if recipe == "fp8":
         formats = (native_fp8_format(),) * 3
