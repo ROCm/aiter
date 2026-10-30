@@ -118,6 +118,18 @@ _LAZY_IMPORTS = {
         ".gemm_kernels",
         "flydsl_preshuffle_gemm_a8",
     ),
+    "gemm_a8w8_mxscale_preshuffle_1x32_flydsl": (
+        ".mxscale_preshuffle_kernels",
+        "gemm_a8w8_mxscale_preshuffle_1x32_flydsl",
+    ),
+    "run_gemm_a8w8_mxscale_preshuffle_1x32_gfx950": (
+        ".mxscale_preshuffle_kernels",
+        "run_gemm_a8w8_mxscale_preshuffle_1x32_gfx950",
+    ),
+    "get_mxscale_preshuffle_config": (
+        ".mxscale_preshuffle_kernels",
+        "get_mxscale_preshuffle_config",
+    ),
     "flydsl_qk_norm_rope_quant": (
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
@@ -212,6 +224,8 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "gemm_a8w8_mxscale_preshuffle_1x32_flydsl",
+    "get_mxscale_preshuffle_config",
     "make_fp4_mqa_plan",
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",
@@ -224,6 +238,7 @@ __all__ = [
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "run_gemm_a8w8_mxscale_preshuffle_1x32_gfx950",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
