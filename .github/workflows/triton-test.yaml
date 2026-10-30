@@ -255,6 +255,7 @@ jobs:
           --shm-size=16G \
           -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           -e PYTORCH_ALLOC_CONF=expandable_segments:True \
+          -e AITER_GPU_MEMTRACE=1 \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
@@ -420,6 +421,7 @@ jobs:
           --shm-size=16G \
           -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           -e PYTORCH_ALLOC_CONF=expandable_segments:True \
+          -e AITER_GPU_MEMTRACE=1 \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
