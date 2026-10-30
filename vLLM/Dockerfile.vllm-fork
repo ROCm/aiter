@@ -60,7 +60,8 @@ assert e.VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL is True"
 ARG LM_EVAL_VERSION=0.4.13
 RUN (python3 -m venv --system-site-packages /opt/lm-eval \
      || { pip install virtualenv && python3 -m virtualenv --system-site-packages /opt/lm-eval; }) \
-    && /opt/lm-eval/bin/pip install "lm-eval[api]==${LM_EVAL_VERSION}" \
+    && /opt/lm-eval/bin/pip install "lm-eval[api,ruler]==${LM_EVAL_VERSION}" \
+    && /opt/lm-eval/bin/python -c "import nltk, wonderwords, scipy; nltk.download('punkt_tab')" \
     && /opt/lm-eval/bin/lm_eval --help >/dev/null \
     && python3 -c "import vllm; print('vllm', vllm.__version__)"
 
