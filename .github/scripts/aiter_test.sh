@@ -100,7 +100,7 @@ for file in "${sharded_files[@]}"; do
             # no tests are collected, so an empty run cannot report success.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py)
+        op_tests/test_fhmoe.py|op_tests/tuning_tests/test_fhmoe_tuner.py|op_tests/test_hipb_grouped_gemm.py)
             # These files contain pytest-style test functions and intentionally
             # have no script entry point; direct execution would only import them.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
