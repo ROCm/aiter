@@ -1568,8 +1568,14 @@ def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
         param(
             {"kv_splits": 1025},
             ValueError,
-            "at most the key length",
+            "at least one 128-key tile: at most 8",
             id="more-than-keys",
+        ),
+        param(
+            {"kv_splits": 9},
+            ValueError,
+            "at least one 128-key tile: at most 8",
+            id="shorter-than-a-tile",
         ),
         param(
             {"kv_splits": 2, "block_mask": torch.ones((1, 4, 8), dtype=torch.bool)},
@@ -1613,6 +1619,20 @@ def test_mha_v4_kv_splits_rejects_what_it_cannot_split(kwargs, error, match):
             kwargs[name] = kwargs[name].cuda()
     with expect_raises(error, match=match):
         mha_v4(q, q, q, *formats, **kwargs)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_allow_one_kv_tile_per_range():
+    """The bound is inclusive: a count leaving exactly one KV tile per range still splits."""
+    torch.manual_seed(67)
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    bf16 = (AttentionFormat.BF16,) * 3
+    splits = 1024 // mha_v4_kv_tile()
+
+    out = mha_v4(q, q, q, *bf16, kv_splits=splits)
+
+    assert not torch.isnan(out).any()
+    torch.testing.assert_close(out, mha_v4(q, q, q, *bf16), atol=2e-2, rtol=2e-2)
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")

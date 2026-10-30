@@ -1312,9 +1312,15 @@ def _resolve_kv_splits(
             f"FP8/FP8), not recipe {recipe.kind.name} with V {v_format.name}"
         )
     _check_lse_capable(q_format, v_format)
-    if kv_splits > k.shape[1]:
+    # A range shorter than a KV tile still costs a whole tile, so splitting past one tile per
+    # range adds work-groups and merge traffic without adding parallelism. The merge also unrolls
+    # over the count, whose compile time grows steeply with it (13 s cold at 128 on MI355X).
+    kv_tile = mha_v4_kv_tile()
+    most = max(k.shape[1] // kv_tile, 1)
+    if kv_splits > most:
         raise ValueError(
-            f"kv_splits={kv_splits} must be at most the key length {k.shape[1]}"
+            f"kv_splits={kv_splits} must leave every key range at least one {kv_tile}-key "
+            f"tile: at most {most} for key length {k.shape[1]}"
         )
     if k.shape[1] % kv_splits and not _varlen_capable(q_format, v_format):
         raise ValueError(
@@ -1493,7 +1499,8 @@ def mha_v4(
     exports their LSE (gfx950 today), without ``block_mask`` or ``seqlens_k``. The ranges are
     equal when the count divides the key length; otherwise the last one takes the remainder,
     which needs operands that take per-batch key lengths (all four on gfx950), and any others
-    need a count that divides it.
+    need a count that divides it. A count is at most ``key_length // mha_v4_kv_tile()``, so
+    every range holds at least one KV tile.
     ``"auto"`` minimizes device time, so it is meant for HIP-graph-replayed or torch.compile'd
     callers. A split adds ~35 us of host time per eager call (more with a remainder), mostly the
     merge's Triton launch, and at the short sequences it targets an eager call is already bound
