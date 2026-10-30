@@ -281,21 +281,25 @@ TABLES = (
 )
 _TABLES = {table.name: table for table in TABLES}
 
-DEFAULT_CSVS = [
-    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
-    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE,
-    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE,
-    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE,
-    AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE,
-    AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
-    AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE,
-]
+
+def _runtime_file(table: Table) -> str:
+    """The file the runtime's lookup of ``table`` reads: the one its variable
+    names, of any name, else the merged default."""
+    return getattr(AITER_CONFIGS, f"{table.env}_FILE")
+
+
+DEFAULT_CSVS = [_runtime_file(table) for table in TABLES]
 
 
 def table_of(csv_path: str) -> Table | None:
-    """The table a CSV belongs to, by the runtime's name for it in the file
-    name (the longest that matches: ``bf16_tuned_gemm`` must not claim a
-    batched table)."""
+    """The table a CSV belongs to: the one whose runtime lookup reads it, else
+    the one whose name (the runtime's, which its merged and per-model files
+    carry too) the file name holds, the longest that matches:
+    ``bf16_tuned_gemm`` must not claim a batched table."""
+    path = os.path.realpath(csv_path)
+    for table in TABLES:
+        if os.path.realpath(_runtime_file(table)) == path:
+            return table
     base = os.path.basename(csv_path)
     names = [name for name in _TABLES if name in base]
     return _TABLES[max(names, key=len)] if names else None
@@ -314,8 +318,10 @@ def parse_csv(csv_path: str) -> list[dict]:
     tuned M of its shape, plus one)."""
     table = table_of(csv_path)
     if table is None:
-        print(f"  [WARN] {csv_path} is no FlyDSL GEMM table, skipping")
-        return []
+        raise ValueError(
+            f"{csv_path} is no FlyDSL GEMM table: no table's AITER_CONFIG_* "
+            f"variable names it, and its file name holds none of {sorted(_TABLES)}"
+        )
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(line for line in f if not line.startswith("#")))
     shapes: dict[tuple, list[int]] = {}

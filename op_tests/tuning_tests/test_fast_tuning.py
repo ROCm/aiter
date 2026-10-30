@@ -4,7 +4,9 @@
 
 import csv
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -903,6 +905,28 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
         self.assertEqual(precompiled[0]["swiglu_limit"], 3.5)
         self.assertEqual(precompiled[1]["swiglu_limit"], 3.5)
         self.assertNotIn("swiglu_limit", precompiled[2])
+
+
+class TestFlydslAotReplay(unittest.TestCase):
+    def test_gemm_table_follows_its_config_variable_under_any_file_name(self):
+        from aiter.aot.flydsl import gemm
+        from aiter.jit.core import AITER_CONFIGS
+
+        lookup = type(AITER_CONFIGS).get_config_file
+        self.addCleanup(lookup.cache_clear)
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = os.path.join(tmp, "custom_override.csv")
+            shutil.copyfile(REPO_ROOT / "aiter/configs/bf16_tuned_gemm.csv", custom)
+            lookup.cache_clear()
+            with mock.patch.dict(os.environ, {"AITER_CONFIG_GEMM_BF16": custom}):
+                self.assertIs(gemm.table_of(custom), gemm._TABLES["bf16_tuned_gemm"])
+                self.assertTrue(gemm.parse_csv(custom))
+                self.assertEqual(
+                    gemm.config_env([custom]), {"AITER_CONFIG_GEMM_BF16": custom}
+                )
+            lookup.cache_clear()
+            with self.assertRaisesRegex(ValueError, "is no FlyDSL GEMM table"):
+                gemm.parse_csv(custom)
 
 
 if __name__ == "__main__":
