@@ -400,10 +400,12 @@ class TunerCommon:
         return measured
 
     def _stamp_power_rows(self, results, args):
-        """Record the power-management state on rows that were actually measured.
+        """Keep only rows whose power was measured and record their conditions.
 
-        A shape whose watts are missing was ranked by latency. Labeling it
-        ``select=power`` would publish that latency pick as a power result.
+        A shape whose watts are missing was ranked by latency. Writing it to
+        ``power_configs/`` would let that latency pick override the shipped
+        row under ``AITER_SELECT=power``, so it is dropped and stays untuned
+        for the next power tune.
         """
         from aiter.utility.tune_result import POWER_ROW_COLUMNS, SELECT_COLUMN
 
@@ -414,11 +416,15 @@ class TunerCommon:
             return results
         results = self.power_metrics(results)
         measured = self._rows_with_finite_watts(results)
-        if not bool(measured.any()):
+        if not bool(measured.all()):
+            keys = [k for k in self.keys if k in results.columns]
+            skipped = results.loc[~measured, keys].to_dict("records")
             logger.warning(
-                "select=power: no finite package watts were recorded; "
-                "leaving this batch as a latency result"
+                f"select=power: no finite package watts for {len(skipped)} "
+                f"shape(s); not writing them, so they stay untuned: {skipped}"
             )
+            results = results[measured]
+        if results.empty:
             return results
         conditions = getattr(self, "_power_conditions", None)
         if conditions is None:
@@ -432,11 +438,9 @@ class TunerCommon:
             self._power_conditions = conditions
             logger.info(f"select=power: tune conditions {conditions}")
         results = results.copy()
-        results[SELECT_COLUMN] = pd.NA
-        results.loc[measured, SELECT_COLUMN] = "power"
+        results[SELECT_COLUMN] = "power"
         for name, value in conditions.items():
-            results[name] = pd.NA
-            results.loc[measured, name] = value
+            results[name] = value
         # watts / tflops_per_w are power-tune columns. They stay off the
         # latency CSV schema, which is the column list a latency tune writes.
         power_columns = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS

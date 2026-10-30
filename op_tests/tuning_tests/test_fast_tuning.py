@@ -985,8 +985,11 @@ class TestMoePowerRanking(unittest.TestCase):
             ]
         )
         ranked = rank_moe_pairs(pairs, LATENCY)
-        self.assertEqual(list(ranked["kernelName1"]), ["fast", "slow"])
-        self.assertEqual(int(ranked.iloc[0]["rank"]), 1)
+        # Latency keeps the -o2 profile exactly as main writes it: same
+        # columns, same row order, no rank or energy columns.
+        self.assertEqual(list(ranked.columns), list(pairs.columns))
+        self.assertEqual(list(ranked["kernelName1"]), ["slow", "fast"])
+        self.assertEqual(LATENCY.sort_frame(ranked).iloc[0]["kernelName1"], "fast")
 
     def test_unmeasured_power_sorts_last(self):
         import pandas as pd
@@ -1268,7 +1271,9 @@ class TestPowerTableSeparation(unittest.TestCase):
         from aiter.utility.base_tuner import TunerCommon
 
         def stamp_stub():
-            stub = SimpleNamespace(columns=["M", "us"], POWER_WATT_COLUMNS=("watts",))
+            stub = SimpleNamespace(
+                columns=["M", "us"], keys=["M"], POWER_WATT_COLUMNS=("watts",)
+            )
             stub.policy = TunerCommon.policy
             stub.policy_for = lambda args: TunerCommon.policy_for(stub, args)
             stub.power_metrics = lambda df: TunerCommon.power_metrics(stub, df)
@@ -1305,12 +1310,30 @@ class TestPowerTableSeparation(unittest.TestCase):
                 "sclk_max_mhz",
             ],
         )
-        unmeasured = TunerCommon._stamp_power_rows(
-            stamp_stub(),
-            pd.DataFrame([{"M": 1, "us": 2.0, "watts": float("nan")}]),
-            args,
-        )
-        self.assertNotIn("select", unmeasured.columns)
+        with mock.patch(
+            "aiter.utility.package_power.tune_conditions", return_value=conditions
+        ):
+            unmeasured = TunerCommon._stamp_power_rows(
+                stamp_stub(),
+                pd.DataFrame([{"M": 1, "us": 2.0, "watts": float("nan")}]),
+                args,
+            )
+            mixed = TunerCommon._stamp_power_rows(
+                stamp_stub(),
+                pd.DataFrame(
+                    [
+                        {"M": 1, "us": 2.0, "watts": 400.0},
+                        {"M": 2, "us": 3.0, "watts": float("nan")},
+                    ]
+                ),
+                args,
+            )
+        # Unmeasured shapes are latency picks: they are not written to
+        # power_configs/ and stay untuned for the next power tune.
+        self.assertTrue(unmeasured.empty)
+        self.assertIn("M", unmeasured.columns)
+        self.assertEqual(list(mixed["M"]), [1])
+        self.assertEqual(list(mixed["select"]), ["power"])
         latency = TunerCommon._stamp_power_rows(
             stamp_stub(),
             frame,
@@ -1687,6 +1710,55 @@ class TestPowerTableSeparation(unittest.TestCase):
         self.assertEqual(list(merged["kernel"]), ["cool", "only_latency"])
         self.assertEqual(list(merged["select"]), ["power", "latency"])
         self.assertEqual(list(merged["xbf16"]), [0, 0])
+
+    def test_power_overlay_ignores_rows_not_stamped_power(self):
+        import tempfile
+
+        import pandas as pd
+
+        from aiter.jit.core import AITER_CONFIG, AITER_CONFIGS
+        from aiter.utility.power_configs import _overlay_power_tables
+
+        with tempfile.TemporaryDirectory() as tmp:
+            latency_file = f"{tmp}/latency.csv"
+            stamped = f"{tmp}/tuned_demo.csv"
+            unstamped = f"{tmp}/old_tuned_demo.csv"
+            pd.DataFrame(
+                [
+                    {"M": 1, "us": 5.0, "kernel": "shipped_1"},
+                    {"M": 2, "us": 7.0, "kernel": "shipped_2"},
+                    {"M": 3, "us": 8.0, "kernel": "shipped_3"},
+                ]
+            ).to_csv(latency_file, index=False)
+            pd.DataFrame(
+                [
+                    {"M": 1, "us": 9.0, "kernel": "cool", "select": "power"},
+                    {"M": 2, "us": 6.0, "kernel": "latency_pick", "select": ""},
+                ]
+            ).to_csv(stamped, index=False)
+            # An older or hand-copied table with no select column.
+            pd.DataFrame([{"M": 3, "us": 4.0, "kernel": "hand_copied"}]).to_csv(
+                unstamped, index=False
+            )
+            with (
+                mock.patch.object(
+                    AITER_CONFIG, "_shape_dedup_keys", return_value=["M"]
+                ),
+                mock.patch("tempfile.gettempdir", return_value=tmp),
+            ):
+                merged_path = _overlay_power_tables(
+                    AITER_CONFIGS,
+                    latency_file,
+                    [stamped, unstamped],
+                    "tuned_demo",
+                    None,
+                )
+                only_unstamped = _overlay_power_tables(
+                    AITER_CONFIGS, latency_file, [unstamped], "tuned_demo", None
+                )
+            merged = pd.read_csv(merged_path).sort_values("M")
+        self.assertEqual(list(merged["kernel"]), ["cool", "shipped_2", "shipped_3"])
+        self.assertEqual(only_unstamped, latency_file)
 
     def test_prebuild_config_load_does_not_import_aiter_package(self):
         import subprocess

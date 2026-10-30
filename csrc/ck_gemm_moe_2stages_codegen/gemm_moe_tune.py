@@ -457,7 +457,12 @@ def rank_moe_pairs(profile_df, policy):
     The pair cost is the policy's stage energy ``us1*watts1 + us2*watts2``
     (stage 2 contributes only when it actually ran); its mean watts feed the
     same frame order every tuner uses. ``rank`` 1 is the winner.
+
+    Latency mode returns the frame unchanged, so the ``-o2`` profile keeps
+    main's columns and row order.
     """
+    if not policy.measures_power:
+        return profile_df
     frame = profile_df.copy()
     us1 = _numeric_column(frame, "us1")
     us2 = _numeric_column(frame, "us2", default=0.0).fillna(0.0)
@@ -5585,6 +5590,10 @@ class FmoeTuner(TunerCommon):
                     "watts",
                 ],
             )
+            # Stage watts are a power-tune column; the latency profile files
+            # keep main's schema.
+            if not policy.measures_power:
+                profileDF = profileDF.drop(columns="watts")
             prorfiles.append(profileDF)
 
             dump_tag = _candidate_dump_tag(
@@ -5693,7 +5702,8 @@ class FmoeTuner(TunerCommon):
             empty_1stage_profileDF["us2"] = 0
             empty_1stage_profileDF["tflops2"] = 0
             empty_1stage_profileDF["bw2"] = 0
-            empty_1stage_profileDF["watts2"] = float("nan")
+            if "watts1" in asm_1stage_profileDF.columns:
+                empty_1stage_profileDF["watts2"] = float("nan")
             asm_1stage_profileDF = pd.concat(
                 [asm_1stage_profileDF, empty_1stage_profileDF], axis=1
             )
@@ -6172,26 +6182,33 @@ class FmoeTuner(TunerCommon):
                 if os.path.exists(args.profile_file):
                     old_df = pd.read_csv(args.profile_file)
                 else:
-                    old_df = pd.DataFrame(columns=ranked.columns)
+                    old_df = pd.DataFrame(columns=self.columns)
                 tmpprofileDF = pd.concat([old_df, ranked], ignore_index=True)
                 tmpprofileDF.to_csv(args.profile_file, index=False)
-            best_one = ranked.iloc[0].copy()
+            # The first preferred row: lowest us in latency mode (same as
+            # idxmin), lowest energy in power mode.
+            best_one = policy.sort_frame(ranked).iloc[0].copy()
             latency_one = ranked.loc[
                 pd.to_numeric(ranked["us"], errors="coerce").idxmin()
             ]
-            print(
-                f"Tuning result for {key} is {best_one['block_m'], best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'], best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s, "
-                f"rank={best_one.get('rank', 1)} energy={best_one.get('energy', float('nan'))} "
+            energy_text = (
+                f", rank={best_one.get('rank', 1)} energy={best_one['energy']} "
                 f"tflops_per_w={best_one.get('tflops_per_w', float('nan'))}"
+                if "energy" in ranked.columns
+                else ""
             )
-            if policy.measures_power:
+            print(
+                f"Tuning result for {key} is {best_one['block_m'], best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'], best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
+                + energy_text
+            )
+            if "energy" in ranked.columns:
                 for _, cand in ranked.head(5).iterrows():
                     print(
                         f"  rank {int(cand['rank'])}: energy={cand['energy']} "
                         f"us={cand['us']} W={cand.get('watts', float('nan'))} "
                         f"{cand['kernelName1']} / {cand['kernelName2']}"
                     )
-            if best_one.name != latency_one.name:
+            if policy.measures_power and best_one.name != latency_one.name:
                 print(
                     f"Latency winner differs: block_m={latency_one['block_m']} "
                     f"{latency_one['kernelName1']} / {latency_one['kernelName2']} "
