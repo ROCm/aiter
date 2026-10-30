@@ -256,16 +256,28 @@ def _pre_pr_python_tuned_map(rows: pd.DataFrame) -> dict[tuple, dict]:
 
 
 def _pre_pr_codegen_tuned_map(rows: pd.DataFrame) -> dict[tuple, int]:
-    # Preserve the original arch-specific launcher-pointer table, with identity
-    # now supplied by the CSV's gfx/CU fields rather than inferred from an ID.
+    # The removed C++ table was one arch-specific launcher map, and
+    # gen_instances.py filtered the tuned CSV to the host's cu_num before
+    # emitting it, so every build saw a single cu_num per arch. Key on cu_num
+    # too: gfx942 SKUs with different CU counts (MI308X 80, MI300A 228) can
+    # pick different kids for the same shape. Identity comes from the CSV's
+    # gfx and cu_num, not from scanning heuristic ids.
     result = {}
     for _, row in rows.iterrows():
         kid = int(row["solidx"])
         arch = str(row["gfx"])
-        instance = get_kernel_instance(arch, "a16w16", kid, cu_num=int(row["cu_num"]))
+        cu_num = int(row["cu_num"])
+        instance = get_kernel_instance(arch, "a16w16", kid, cu_num=cu_num)
         assert instance is not None
         assert instance.name == row["kernelName"]
-        key = (arch, int(row["M"]), int(row["N"]), int(row["K"]), str(row["outdtype"]))
+        key = (
+            arch,
+            cu_num,
+            int(row["M"]),
+            int(row["N"]),
+            int(row["K"]),
+            str(row["outdtype"]),
+        )
         result[key] = kid
     return result
 
@@ -318,8 +330,17 @@ def test_shipped_tuned_selection_diff_is_exhaustive(
 
         # The removed C++ table and the runtime table select the same kid for
         # every shipped full-key row. splitK was not stored in the C++ table.
-        codegen_key = (*shape, str(fields["outdtype"]))
-        assert pre_pr_codegen[codegen_key] == pair[0]
+        codegen_key = (
+            arch,
+            int(fields["cu_num"]),
+            *shape[1:],
+            str(fields["outdtype"]),
+        )
+        assert pre_pr_codegen[codegen_key] == pair[0], (
+            f"codegen mismatch for key={codegen_key}: "
+            f"expected kid={pre_pr_codegen[codegen_key]}, got kid={pair[0]} "
+            f"(full tuned key={key})"
+        )
 
         old_row = pre_pr_python[key[1:]]
         old_pair = (int(old_row["solidx"]), int(old_row["splitK"]))
