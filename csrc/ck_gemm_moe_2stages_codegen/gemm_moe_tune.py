@@ -41,6 +41,7 @@ from aiter.fused_moe import (
     fused_moe,
     fused_topk,
     moe_sorting,
+    swiglu_limit_tag,
     torch_moe,
     torch_moe_stage1,
     torch_moe_stage2,
@@ -623,6 +624,8 @@ _GEN_DATA_1STAGE_KEYS = [
 
 class FmoeTuner(TunerCommon):
     SUPPORTS_FAST_SCAN = False
+    swiglu_limit = None
+    swiglu_limit_tag = ""
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -678,9 +681,34 @@ class FmoeTuner(TunerCommon):
             help="positive screening top-K per stage context (default 2); "
             "staged search only; unused for M_est < 4; distinct from routing top-k.",
         )
+        self.parser.add_argument(
+            "--swiglu_limit",
+            type=float,
+            default=None,
+            help="Tune FP8 per_1x128 SiLU MoE with this gate/up clamp. Only CK "
+            "2-stage candidates can clamp; results are tagged in a _tag column "
+            "and must go to a separate tuned file (-o).",
+        )
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
+        self.swiglu_limit = args.swiglu_limit or None
+        self.swiglu_limit_tag = swiglu_limit_tag(self.swiglu_limit)
+        if self.swiglu_limit is not None:
+            if args.grouped_gemm or args.mxfp4_flydsl or args.e2e_tune:
+                self.parser.error(
+                    "--swiglu_limit is only supported by the default fmoe tuner "
+                    "(MXFP4 uses AITER_MXFP4_TUNE_SWIGLU_LIMIT)"
+                )
+            if os.path.abspath(self.get_out_file(args.tune_file)) == os.path.abspath(
+                self.get_out_file(self.ARG_DEFAULTS["tune_file"])
+            ):
+                self.parser.error(
+                    "--swiglu_limit results must go to a separate tuned file (-o); "
+                    "they would replace unclamped rows in the default one"
+                )
+            if "_tag" not in self.columns:
+                self.columns = self.columns + ["_tag"]
         if getattr(args, "fast_scan", False) and not self.SUPPORTS_FAST_SCAN:
             self.parser.error("--fast-scan requires --mxfp4-flydsl")
         if not hasattr(args, "fast_scan"):
@@ -794,10 +822,16 @@ class FmoeTuner(TunerCommon):
         act_type,
         splitk=0,
         use_nt=False,
+        swiglu_limit=None,
     ):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
         is_splitk = q_type == QuantType.per_1x128 and splitk > 1
+        # Without split-K the clamp lives in the CK epilogue (swiglustep_and_mul);
+        # fused_moe.ck_moe_stage1 swaps the kernel name the same way.
+        swiglustep = bool(swiglu_limit) and not is_splitk
+        if swiglustep:
+            kernelName = kernelName.replace("_silu_", "_swiglustep_")
         if is_splitk:
             sorted_size = min(token_num * topk * blockM, sorted_ids.shape[0])
             tmp_out = torch.empty(
@@ -831,6 +865,8 @@ class FmoeTuner(TunerCommon):
             splitk if is_splitk else 0,
             use_non_temporal_load=use_nt,
             dst_type=dtype if is_splitk else None,
+            swiglustep=swiglustep,
+            swiglu_limit=float(swiglu_limit or 0.0),
         )
         if is_splitk:
             out = torch.empty(
@@ -842,7 +878,9 @@ class FmoeTuner(TunerCommon):
             if act_type == ActivationType.Silu or (
                 isinstance(act_type, str) and "silu" in act_type.lower()
             ):
-                aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
+                aiter.silu_and_mul(
+                    out, valid_out.view(dtypes.fp32), swiglu_limit or 0.0
+                )
             else:
                 aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         if q_type == QuantType.per_1x128:
@@ -3378,6 +3416,7 @@ class FmoeTuner(TunerCommon):
             and q_dtype_w == dtypes.fp8
         )
         splitk_list = []
+        _ck_stage1_splitk_kernels = {}
         if is_fp8_blockscale:
             tilek = 128
             for _sk in range(2, 9):
@@ -3407,17 +3446,30 @@ class FmoeTuner(TunerCommon):
         )
         # only the blockscale kernels read the hint
         nt_values = (False, True) if q_type == QuantType.per_1x128 else (False,)
+        clamp_limit = self.swiglu_limit if is_fp8_blockscale else None
+        stage1_kwargs = {"swiglu_limit": clamp_limit} if clamp_limit else {}
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
-                for kernel, nt in [
-                    (k, n)
+                # (tag name, kernel name, splitk); post_process reads ksplit from _skN.
+                stage1_candidates = [
+                    (k.name, k.name, 0)
                     for k in ck_stage1_kernels.values()
                     if k.MPerBlock == blockM
-                    for n in nt_values
+                ]
+                # CK blockscale split-K at block_m 64 (pipeline V3) writes up as zeros.
+                if clamp_limit is not None and blockM <= 32:
+                    stage1_candidates += [
+                        (f"{k.name}_sk{sk}", k.name, sk)
+                        for k in _ck_stage1_splitk_kernels.values()
+                        if k.MPerBlock == blockM
+                        for sk in splitk_list
+                    ]
+                for (tag_name, kernel_name, splitk), nt in [
+                    (c, n) for c in stage1_candidates for n in nt_values
                 ]:
                     tasks_ck.append(
                         (
-                            (info, "stage1", kernel.name, blockM, 0, 0, nt),  # tag
+                            (info, "stage1", tag_name, blockM, 0, 0, nt),  # tag
                             FmoeTuner.generate_data_2stages,
                             (
                                 token,
@@ -3450,12 +3502,16 @@ class FmoeTuner(TunerCommon):
                                 ],
                                 dtype,
                                 topk,
-                                kernel.name,
+                                kernel_name,
                                 blockM,
                                 q_type,
                                 act_type,
                             ),
-                            {"use_nt": nt},
+                            (
+                                {"use_nt": nt, "splitk": splitk, **stage1_kwargs}
+                                if splitk
+                                else {"use_nt": nt, **stage1_kwargs}
+                            ),
                             FmoeTuner.run_torch_moe_stage1,
                             (
                                 [
@@ -3477,11 +3533,11 @@ class FmoeTuner(TunerCommon):
                                 topk,
                                 blockM,
                             ),
-                            {},
+                            stage1_kwargs,
                             (None),
                             0.01,
                             0.01,
-                            None,
+                            cosine_diff_compare if is_fp8_blockscale else None,
                         )
                     )
 
@@ -3553,7 +3609,7 @@ class FmoeTuner(TunerCommon):
                             (None),
                             0.01,
                             0.01,
-                            None,
+                            cosine_diff_compare if is_fp8_blockscale else None,
                         )
                     )
         return tasks_ck
@@ -5269,6 +5325,16 @@ class FmoeTuner(TunerCommon):
             # unset = flydslv2; empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE).
             tune_only = os.environ.get("TUNE_ONLY", "flydslv2")
             _tune_only = {s for s in tune_only.split(",") if s}
+            if self.swiglu_limit is not None:
+                if not (
+                    q_type == QuantType.per_1x128 and act_type == ActivationType.Silu
+                ):
+                    raise ValueError(
+                        f"--swiglu_limit supports only per_1x128 SiLU, got {line}"
+                    )
+                # ASM, FlyDSL and Opus per_1x128 SiLU kernels have no clamp.
+                print(f"--swiglu_limit={self.swiglu_limit:g}: tuning CK 2-stage only")
+                _opus_only, _tune_only = False, {"cktile"}
 
             def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
                 if _tune_only:
@@ -5362,6 +5428,16 @@ class FmoeTuner(TunerCommon):
 
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
+        other_tag_df = None
+        if self.swiglu_limit_tag:
+            # Rows tuned for another swiglu_limit share the keys; keep them as is.
+            old_tags = (
+                old_tunedf["_tag"].fillna("").astype(str)
+                if "_tag" in old_tunedf.columns
+                else pd.Series("", index=old_tunedf.index)
+            )
+            other_tag_df = old_tunedf[old_tags != self.swiglu_limit_tag]
+            old_tunedf = old_tunedf[old_tags == self.swiglu_limit_tag]
 
         for col in self.columns:
             if col not in old_tunedf.columns:
@@ -5375,7 +5451,7 @@ class FmoeTuner(TunerCommon):
         # Legacy tuned files may carry an obsolete _tag column (and tagged
         # rows). Drop the tagged rows and the column so the rewrite matches the
         # current schema.
-        if "_tag" in old_tunedf.columns:
+        if "_tag" in old_tunedf.columns and not self.swiglu_limit_tag:
             old_tunedf = old_tunedf[old_tunedf["_tag"].fillna("") == ""].drop(
                 columns=["_tag"]
             )
@@ -5396,6 +5472,10 @@ class FmoeTuner(TunerCommon):
             resultdf = resultdf.astype(str).drop_duplicates(
                 subset=self.keys,
                 keep="last",
+            )
+        if other_tag_df is not None and not other_tag_df.empty:
+            resultdf = pd.concat(
+                [other_tag_df.astype(str), resultdf], ignore_index=True
             )
         # Canonical column order (self.columns, so gfx stays the first column).
         # Without this an incremental tune of a legacy file would append gfx at
@@ -5694,6 +5774,7 @@ class FmoeTuner(TunerCommon):
                         -1,
                         -1,
                     ]
+                    + ([self.swiglu_limit_tag] if self.swiglu_limit_tag else [])
                 )
                 failedf = pd.DataFrame(ret, columns=self.columns)
                 self.failed = pd.concat([self.failed, failedf], axis=0)
@@ -6100,6 +6181,12 @@ class FmoeTuner(TunerCommon):
             best_one["dtype"] = str(best_one["dtype"])
             best_one["q_dtype_a"] = str(best_one["q_dtype_a"])
             best_one["q_dtype_w"] = str(best_one["q_dtype_w"])
+            if self.swiglu_limit_tag:
+                best_one["_tag"] = self.swiglu_limit_tag
+                if int(best_one.get("ksplit", 0) or 0) <= 1:
+                    best_one["kernelName1"] = str(best_one["kernelName1"]).replace(
+                        "_silu_", "_swiglustep_"
+                    )
             bests.append(best_one)
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
@@ -6137,6 +6224,14 @@ class FmoeTuner(TunerCommon):
                 and "cu_num" in self.tunedf.columns
             ):
                 self.tunedf["gfx"] = self.tunedf["cu_num"].map(gfx_from_cu_num)
+            if self.tunedf is not None and self.swiglu_limit_tag:
+                # A shape only counts as tuned for rows with the same swiglu_limit.
+                tags = (
+                    self.tunedf["_tag"].fillna("").astype(str)
+                    if "_tag" in self.tunedf.columns
+                    else pd.Series("", index=self.tunedf.index)
+                )
+                self.tunedf = self.tunedf[tags == self.swiglu_limit_tag]
             if args.last:
                 self.untunedf = self.untunedf.iloc[-1:]
 

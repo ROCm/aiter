@@ -14,14 +14,18 @@
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
 // Map aiter ActivationType (stage1) to the CK stage1 activation op value.
-// CK act values: gelu=0, silu=1, swiglu(OAI swiglu_oai)=3, gelu_tanh_and_mul=4.
-// Value 2 is reserved.
+// CK act values: gelu=0, silu=1, swiglustep_and_mul=2, swiglu(OAI swiglu_oai)=3,
+// gelu_tanh_and_mul=4. The swiglustep module (generated with -act swiglustep)
+// defines AITER_CK_MOE_STAGE1_SILU_ACT_OP=2 so Silu selects its clamped instances.
+#ifndef AITER_CK_MOE_STAGE1_SILU_ACT_OP
+#define AITER_CK_MOE_STAGE1_SILU_ACT_OP 1
+#endif
 static inline int map_activation_to_ck_stage1(int activation)
 {
     switch (static_cast<ActivationType>(activation))
     {
     case ActivationType::Silu:
-        return 1;
+        return AITER_CK_MOE_STAGE1_SILU_ACT_OP;
     case ActivationType::Gelu:
         return 0;
     case ActivationType::Swiglu:
@@ -82,7 +86,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    std::optional<int> splitk = 1,
                    bool nt = false,
                    std::optional<std::string> dst_type = std::nullopt,
-                   bool is_shuffled = true)
+                   bool is_shuffled = true,
+                   double swiglu_limit)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt << " " << block_m.value() << std::endl;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
@@ -135,7 +140,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
-           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt);
+           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt, static_cast<float>(swiglu_limit));
 }
 
 void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
@@ -198,5 +203,5 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
-           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt);
+           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt, 0.f);
 }

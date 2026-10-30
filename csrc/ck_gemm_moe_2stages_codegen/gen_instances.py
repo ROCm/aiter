@@ -830,11 +830,17 @@ heuristic_dispatch_dict = {
 }
 
 
-def generate_instance_and_lookUpTable_head(working_path):
+def generate_instance_and_lookUpTable_head(working_path, activation=None):
     f_lookUpTable = os.path.join(working_path, "gemm_moe_ck2stages_lookup.h")
     if os.path.exists(f_lookUpTable):
         os.remove(f_lookUpTable)
     with open(f_lookUpTable, "w") as f_lookup:
+        if activation == "swiglustep":
+            # The runtime passes ActivationType::Silu; this module only holds
+            # swiglustep stage1 instances, so Silu must map to its CK act value.
+            f_lookup.write(
+                f"#define AITER_CK_MOE_STAGE1_SILU_ACT_OP {ACT_OP_MAP['swiglustep']}\n"
+            )
         f_lookup.write(LOOKUP_head)
 
     f_gemm1_heuristic_dispatch = os.path.join(
@@ -1099,7 +1105,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu", "swiglu", "gelutanh"],
+        choices=["silu", "gelu", "swiglu", "gelutanh", "swiglustep"],
         help="select activation",
     )
 
@@ -1147,7 +1153,7 @@ if __name__ == "__main__":
         "per_1x128": 4,
     }
 
-    generate_instance_and_lookUpTable_head(args.working_path)
+    generate_instance_and_lookUpTable_head(args.working_path, args.activation)
     # build all
     if args.b_dtype is None:
         # quanted moe

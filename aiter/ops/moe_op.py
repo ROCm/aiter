@@ -353,6 +353,8 @@ def cmdGenFunc_ck_moe_stage(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
+    swiglu_limit: float = 7.0,
+    swiglustep: bool = False,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
@@ -368,6 +370,7 @@ def cmdGenFunc_ck_moe_stage(
         mul_routed_weight_stage,
         is_shuffled,
         is_splitk,
+        swiglustep,
     )
     return {
         "md_name": md_name,
@@ -434,6 +437,36 @@ def ck_moe_stage1(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
+    swiglu_limit: float = 7.0,
+) -> None: ...
+
+
+@compile_ops(
+    "module_moe_ck2stages",
+    fc_name="ck_moe_stage1",
+    gen_func=functools.partial(cmdGenFunc_ck_moe_stage, swiglustep=True),
+)
+def ck_moe_stage1_swiglustep(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str | None = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
+    quant_type: int = 0,
+    activation: int = 0,
+    splitk: int | None = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: str | None = None,
+    is_shuffled: bool = True,
+    swiglu_limit: float = 7.0,
 ) -> None: ...
 
 
@@ -611,6 +644,7 @@ def get_moe_stage_module(
     mul_routed_weight_stage,
     preshuffle_mode=False,
     is_splitk=False,
+    swiglustep=False,
 ):
     if isinstance(activation, int):
         activation = ActivationType(activation)
@@ -630,6 +664,10 @@ def get_moe_stage_module(
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
     act = str(activation).split(".")[-1].lower()
+    if swiglustep:
+        if act != "silu":
+            raise ValueError(f"swiglustep requires Silu activation, got {act}")
+        act = "swiglustep"
     quant_type = str(quant_type).split(".")[-1].lower()
 
     parts = [
@@ -671,8 +709,11 @@ def ck_moe_stage1_fwd(
     splitk: int | None = 1,
     use_non_temporal_load: bool | None = False,
     dst_type: torch.dtype | None = None,
+    swiglustep: bool = False,
+    swiglu_limit: float = 7.0,
 ):
-    ck_moe_stage1(
+    stage1 = ck_moe_stage1_swiglustep if swiglustep else ck_moe_stage1
+    stage1(
         hidden_states,
         w1,
         w2,
@@ -692,6 +733,7 @@ def ck_moe_stage1_fwd(
         use_non_temporal_load,
         None if dst_type is None else dtype2str_dict[dst_type],
         is_shuffled=getattr(w1, "is_shuffled", False),
+        swiglu_limit=float(swiglu_limit or 0.0),
     )
     return out
 

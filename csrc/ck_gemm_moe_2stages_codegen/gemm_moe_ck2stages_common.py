@@ -17,10 +17,10 @@ sys.path.insert(0, AITER_CORE_DIR)
 
 from chip_info import get_gfx
 
-# CK stage1 activation op values. swiglu (OAI swiglu_oai) maps to CK act value 3;
-# gelutanh (gelu_tanh_and_mul) maps to CK act value 4; value 2 is intentionally
-# skipped (reserved for a future activation variant).
-ACT_OP_MAP = {"gelu": 0, "silu": 1, "swiglu": 3, "gelutanh": 4}
+# CK stage1 activation op values. swiglustep (swiglustep_and_mul: SiLU with the
+# gate/up clamp hardcoded to 7.0 in CK) maps to CK act value 2; swiglu (OAI
+# swiglu_oai) maps to 3; gelutanh (gelu_tanh_and_mul) maps to 4.
+ACT_OP_MAP = {"gelu": 0, "silu": 1, "swiglustep": 2, "swiglu": 3, "gelutanh": 4}
 ACT_OP_NAME = {v: k for k, v in ACT_OP_MAP.items()}
 
 
