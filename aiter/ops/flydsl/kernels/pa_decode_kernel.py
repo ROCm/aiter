@@ -180,9 +180,9 @@ def compile_pa_decode_tile(
     ways. Explicit BF16 splits must fit that limit as well.
     ``max_context_length`` bounds dense planned work for scheduling only; it does not
     change the launch capacity, scratch layout, or single-tile guarantee. Every
-    context length, including later graph replays, should be at most this value.
-    A smaller value still covers the real context: page ids outside the staged
-    window are read from the block table.
+    context length, including later graph replays, must be at most this value:
+    ``pa_decode`` derives its partition bound from it, so a smaller value can
+    truncate attention.
     CTAs receive equal groups of MTP positions, flattened with GQA into 16-row
     M-tiles. Partial output stays unsplit for the shared reducer.
 
