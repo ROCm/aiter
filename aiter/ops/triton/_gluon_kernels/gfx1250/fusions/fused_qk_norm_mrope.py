@@ -33,6 +33,17 @@ _fused_qk_norm_mrope_tdm_repr = make_kernel_repr(
 )
 
 
+@gluon.jit
+def _tdm_tile(ptr, num_tokens, stride, BLOCK_M: gl.constexpr, COLS: gl.constexpr):
+    # A [BLOCK_M, COLS] TDM tile of a [num_tokens, COLS] tensor, and its LDS buffer.
+    layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        ptr, [num_tokens, COLS], [stride, 1], [BLOCK_M, COLS], layout
+    )
+    smem = gl.allocate_shared_memory(ptr.dtype.element_ty, [BLOCK_M, COLS], layout)
+    return desc, smem
+
+
 @gluon.jit(repr=_fused_qk_norm_mrope_repr)
 def fused_qk_norm_mrope_gfx1250(
     q_ptr,
@@ -172,13 +183,12 @@ def _norm_rope_tile(
     HEADS: gl.constexpr,
     SECTION_H: gl.constexpr,
     SECTION_W: gl.constexpr,
-    ROWS: gl.constexpr,
     WAIT: gl.constexpr,
     row_layout: gl.constexpr,
     rope_layout: gl.constexpr,
 ):
     # Row m of the tile is head m % HEADS of token t0 + m // HEADS.
-    offs_m = gl.arange(0, ROWS, layout=gl.SliceLayout(1, row_layout))
+    offs_m = gl.arange(0, x_s.shape[0], layout=gl.SliceLayout(1, row_layout))
     offs_n = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, row_layout))
     mask_m = t0 + offs_m // HEADS < num_tokens
 
@@ -255,34 +265,13 @@ def fused_qk_norm_mrope_tdm_gfx1250(
 ):
     # A program does BLOCK_M tokens. Their Q heads and their K heads move between memory and
     # LDS as one TDM tile each.
-    smem_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
     Q_COLS: gl.constexpr = Q_HEADS * HEAD_DIM
     K_COLS: gl.constexpr = K_HEADS * HEAD_DIM
     t0 = gl.program_id(0) * BLOCK_M
-    q_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        q_ptr, [num_tokens, Q_COLS], [stride_q, 1], [BLOCK_M, Q_COLS], smem_layout
-    )
-    k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        k_ptr, [num_tokens, K_COLS], [stride_k, 1], [BLOCK_M, K_COLS], smem_layout
-    )
-    q_out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        q_out_ptr, [num_tokens, Q_COLS], [Q_COLS, 1], [BLOCK_M, Q_COLS], smem_layout
-    )
-    k_out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        k_out_ptr, [num_tokens, K_COLS], [K_COLS, 1], [BLOCK_M, K_COLS], smem_layout
-    )
-    q_s = gl.allocate_shared_memory(
-        q_ptr.dtype.element_ty, [BLOCK_M, Q_COLS], smem_layout
-    )
-    k_s = gl.allocate_shared_memory(
-        k_ptr.dtype.element_ty, [BLOCK_M, K_COLS], smem_layout
-    )
-    q_out_s = gl.allocate_shared_memory(
-        q_out_ptr.dtype.element_ty, [BLOCK_M, Q_COLS], smem_layout
-    )
-    k_out_s = gl.allocate_shared_memory(
-        k_out_ptr.dtype.element_ty, [BLOCK_M, K_COLS], smem_layout
-    )
+    q_desc, q_s = _tdm_tile(q_ptr, num_tokens, stride_q, BLOCK_M, Q_COLS)
+    k_desc, k_s = _tdm_tile(k_ptr, num_tokens, stride_k, BLOCK_M, K_COLS)
+    q_out_desc, q_out_s = _tdm_tile(q_out_ptr, num_tokens, Q_COLS, BLOCK_M, Q_COLS)
+    k_out_desc, k_out_s = _tdm_tile(k_out_ptr, num_tokens, K_COLS, BLOCK_M, K_COLS)
     gl.amd.gfx1250.tdm.async_load(q_desc, [t0, 0], q_s)
     gl.amd.gfx1250.tdm.async_load(k_desc, [t0, 0], k_s)
     _norm_rope_tile(
@@ -300,7 +289,6 @@ def fused_qk_norm_mrope_tdm_gfx1250(
         Q_HEADS,
         SECTION_H,
         SECTION_W,
-        BLOCK_M * Q_HEADS,
         1,
         row_layout,
         rope_layout,
@@ -320,7 +308,6 @@ def fused_qk_norm_mrope_tdm_gfx1250(
         K_HEADS,
         SECTION_H,
         SECTION_W,
-        BLOCK_M * K_HEADS,
         0,
         row_layout,
         rope_layout,

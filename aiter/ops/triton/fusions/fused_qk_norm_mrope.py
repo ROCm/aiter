@@ -89,33 +89,22 @@ def fused_qk_norm_mrope(
         # A program does block_m tokens, so that the K tile has one row a wave.
         assert q_heads & (q_heads - 1) == 0 and k_heads & (k_heads - 1) == 0
         assert q.stride(0) % 8 == 0 and k.stride(0) % 8 == 0
+        kernel, num = fused_qk_norm_mrope_tdm_gfx1250, num_tokens
         block_m = max(1, num_warps // k_heads)
-        fused_qk_norm_mrope_tdm_gfx1250[(triton.cdiv(num_tokens, block_m),)](
-            *args,
-            num_tokens,
-            *strides,
-            EPS=eps,
-            Q_HEADS=q_heads,
-            K_HEADS=k_heads,
-            SECTION_H=mrope_section[1],
-            SECTION_W=mrope_section[2],
-            BLOCK_M=block_m,
-            num_warps=num_warps,
-            **get_fused_qk_norm_mrope_layouts(num_warps),
-        )
     else:
         # One row per wave. The rows of token t are its Q heads, then its K heads.
-        fused_qk_norm_mrope_gfx1250[(triton.cdiv(num_rows, num_warps),)](
-            *args,
-            num_rows,
-            *strides,
-            EPS=eps,
-            Q_HEADS=q_heads,
-            K_HEADS=k_heads,
-            SECTION_H=mrope_section[1],
-            SECTION_W=mrope_section[2],
-            BLOCK_M=num_warps,
-            num_warps=num_warps,
-            **get_fused_qk_norm_mrope_layouts(num_warps),
-        )
+        kernel, num, block_m = fused_qk_norm_mrope_gfx1250, num_rows, num_warps
+    kernel[(triton.cdiv(num, block_m),)](
+        *args,
+        num,
+        *strides,
+        EPS=eps,
+        Q_HEADS=q_heads,
+        K_HEADS=k_heads,
+        SECTION_H=mrope_section[1],
+        SECTION_W=mrope_section[2],
+        BLOCK_M=block_m,
+        num_warps=num_warps,
+        **get_fused_qk_norm_mrope_layouts(num_warps),
+    )
     return q_out, k_out
