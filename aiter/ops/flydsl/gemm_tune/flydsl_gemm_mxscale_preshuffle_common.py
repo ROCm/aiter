@@ -179,6 +179,37 @@ def parse_kernel_name(name: str):
     }
 
 
+def mxscale_preshuffle_1x32_params(
+    kernel_name: str,
+    *,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str | None = None,
+):
+    """Validate a tuned mxpsh name for the per-1x32 mfma_tile contract.
+
+    Shared by runtime dispatch and AOT. Rejects non-flydsl names, fused
+    split-K (row-layout only), and operand/out dtype mismatches. Returns the
+    parse dict, or None when ``out_dtype`` is set and does not match the name
+    (treated as a tuned-row miss).
+    """
+    parsed = parse_kernel_name(kernel_name)
+    if parsed is None:
+        raise ValueError(f"{kernel_name!r} is not an mxpsh kernel name")
+    if parsed["fused_split_k"]:
+        raise ValueError(
+            f"{kernel_name}: fused split-K requires row-layout scales"
+        )
+    if (parsed["a_dtype"], parsed["b_dtype"]) != (a_dtype, b_dtype):
+        raise ValueError(
+            f"{kernel_name}: encodes {parsed['a_dtype']}/{parsed['b_dtype']}, "
+            f"expected {a_dtype}/{b_dtype}"
+        )
+    if out_dtype is not None and parsed["out_dtype"] != out_dtype:
+        return None
+    return parsed
+
+
 # Each operand's e8m0 scale is a block and a layout -- the kernel's
 # a_/b_scale_block and a_/b_scale_layout Constexprs. A block is "1x32", or the
 # coarse "1x128" (A) / "128x128" (B) broadcast to the 1x32 MFMA (a8w8 only).
