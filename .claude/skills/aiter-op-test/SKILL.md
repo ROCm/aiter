@@ -44,10 +44,12 @@ shapes/candidates to an existing one.
    *op-specific sweep axes* as needed (e.g. `--layout`, `--modes`, `--mtp`). Those
    are legitimate data lists. **Do not** add bespoke behavior-toggle flags
    (no `--dsv4`, no `--only-*`) — every flag is a list the sweep iterates.
-9. **Run clean on every supported card.** Gate on `get_gfx()` in `main()` so the
-   test passes on all supported archs; arch-unsupported ops/candidates are filtered
-   out *before* launch. Prefer the kernel's arch-dispatching wrapper over a
+9. **Run clean on every supported card.** Gate on `get_gfx_runtime()` in `main()`
+   so the test passes on all supported archs; arch-unsupported ops/candidates are
+   filtered out *before* launch. Prefer the kernel's arch-dispatching wrapper over a
    file-per-arch (full section below).
+10. **The test can fail.** It must fail if the change under test were reverted
+   (full section below).
 
 ## Canonical template
 
@@ -68,7 +70,7 @@ from aiter.test_common import (
     checkAllclose,
     run_perftest,
 )
-from aiter.jit.utils.chip_info import get_gfx  # "gfx942", "gfx950", "gfx1250", ...
+from aiter.jit.utils.chip_info import get_gfx_runtime  # "gfx942", "gfx950", "gfx1250", ...
 
 torch.set_default_device("cuda")
 
@@ -89,13 +91,13 @@ def test_op(b, m, n, k, dtype, layout):
         "triton": lambda: ...,        # the path the model really runs
         "torch_einsum": lambda: ...,  # optional torch kernel under test
     }
-    if <kernel supported on this arch + config>:   # e.g. get_gfx() != "gfx1250"
+    if <kernel supported on this arch + config>:   # e.g. get_gfx_runtime() != "gfx1250"
         candidates["ck"] = lambda: ...   # else skip it (see rules below)
 
     flops = 2 * b * m * n * k                                   # roofline numerator
     nbytes = (b * m * k + b * n * k + b * m * n) * x.element_size()
 
-    ret = {"gfx": get_gfx()}             # record the card in the table
+    ret = {"gfx": get_gfx_runtime()}     # record the card in the table
     for name, fn in candidates.items():
         out, us = run_perftest(fn)
         err = checkAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32),
@@ -110,8 +112,8 @@ def test_op(b, m, n, k, dtype, layout):
 def main():
     # Whole-op arch gate goes HERE, not inside test_op: @benchmark always returns
     # the call-args dict, so an in-fn `return` still emits an args-only row.
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("<op> unsupported on %s; skipping", get_gfx())
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning("<op> unsupported on %s; skipping", get_gfx_runtime())
         return
 
     parser = argparse.ArgumentParser(
@@ -221,15 +223,23 @@ config, then skip with a comment.
 
 A test must run **clean on every currently-supported card** — today `gfx942`
 (MI300) and `gfx950` (MI35x), plus any arch the kernel specifically targets.
-Never assume one GPU. Detect arch at runtime and filter *before* launching:
+Never assume one GPU. Detect the card the test runs on and filter *before*
+launching:
 
 ```python
-from aiter.jit.utils.chip_info import get_gfx   # "gfx942" / "gfx950" / "gfx1250" / ...
+from aiter.jit.utils.chip_info import get_gfx_runtime   # "gfx942" / "gfx950" / "gfx1250" / ...
 ```
+
+Use `get_gfx_runtime()`, the same helper runtime dispatch uses, so the test gates
+on the GPU it actually runs on. `get_gfx()` follows `GPU_ARCHS` and returns its
+last entry for a multi-target list: with `GPU_ARCHS="gfx950;gfx942"` it reports
+`gfx942` on an MI355X. It is for build-time codegen and AOT only. Existing tests
+that still call `get_gfx()` work when `GPU_ARCHS` is unset or names one arch;
+convert them when you touch their gate.
 
 - **One test, all archs — drive the arch-dispatching wrapper; do NOT write a file
   per arch.** Most aiter kernels expose a public wrapper that routes to the
-  wave64/wave32 (or gfx-specific) implementation internally by `get_gfx()` — call
+  wave64/wave32 (or gfx-specific) implementation internally by `get_gfx_runtime()` — call
   that wrapper and the single test covers every arch. Only the *behavioral* arch
   differences need handling in the test (e.g. gfx1250 uses a linear FP8 layout, so
   force `preshuffle=False` there; keep the kernel call and the reference in sync).
@@ -239,8 +249,8 @@ from aiter.jit.utils.chip_info import get_gfx   # "gfx942" / "gfx950" / "gfx1250
   early `return` (skips the whole sweep cleanly — no rows):
   ```python
   SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
-  if get_gfx() not in SUPPORTED_GFX:
-      aiter.logger.warning("<op> unsupported on %s; skipping", get_gfx())
+  if get_gfx_runtime() not in SUPPORTED_GFX:
+      aiter.logger.warning("<op> unsupported on %s; skipping", get_gfx_runtime())
       return
   ```
   Do **not** gate by returning from inside the `@benchmark` fn: that wrapper always
@@ -250,18 +260,51 @@ from aiter.jit.utils.chip_info import get_gfx   # "gfx942" / "gfx950" / "gfx1250
 - **One candidate / one sub-check unsupported on this arch → drop just it**, with a
   warning naming arch + reason — e.g. the fp8 nm-asm cross-checks are wave64-only:
   ```python
-  if get_gfx() != "gfx1250":
+  if get_gfx_runtime() != "gfx1250":
       summarize("hca_fp8", [test_hca_fp8(bs) for bs in args.fp8_bs])
   else:
       aiter.logger.warning("gfx1250: skipping wave64-only fp8 cross-checks")
   ```
-- **Record the card**: put `"gfx": get_gfx()` in the returned dict so one table is
+- **Record the card**: put `"gfx": get_gfx_runtime()` in the returned dict so one table is
   self-describing across cards.
 
 In-tree precedent: the flydsl `fused_compress_attn` wrappers dispatch wave64/wave32
 internally (one `test_flydsl_compress_attn.py` covers all archs); `test_deepgemm.py`
 / `test_gemm_a4w4.py` allow-list a single arch; `test_gemm_a8w8.py` does per-arch
 candidate/dtype/shape gating with warnings.
+
+## A test that can fail
+
+A test that passes whether or not the change works is not evidence. Before
+adding or extending a test, ask: would it fail if the change under test were
+reverted, or if the kernel read the wrong row, scale or stride?
+
+- **Inputs must exercise the feature.** Constant scales hide a scale applied to
+  the wrong row. A clamp that is never reached cannot show the clamp works. A
+  uniform-length batch cannot show per-row lengths are honored. Use distinct
+  per-row values, and include the boundary that the change is about (an empty
+  row, the 2^31-byte offset, a non-power-of-two tile count).
+- **Grade against an independent reference.** Compare with the fp32 torch
+  reference, not with another aiter kernel or the kernel itself. Use a per-row
+  or per-element error with a tolerance justified by the dtype, not a cosine or
+  a batch-wide maximum that one corrupted row cannot move.
+- **Use the wrapper's own output allocation.** A test that pre-zeroes the output
+  passes even when the wrapper allocates with `torch.empty` and leaves rows
+  unwritten.
+- **Act on the comparison.** `checkAllclose` logs and returns a result; check it
+  so a mismatch fails the run.
+- **Inject configs.** A dispatch test passes a small config or monkeypatched
+  lookup instead of depending on the contents of production tuned CSVs, which
+  change under it.
+- **Make sure CI runs it.** CI collects top-level `op_tests/test_*.py` and runs
+  them as `python3 <file>`. A test elsewhere, or one that needs pytest to run its
+  functions, is not executed by the default shards. Extend the existing
+  `op_tests/test_<op>.py` instead of adding a parallel suite. Every changed
+  `op_tests/` file needs a stated, non-redundant purpose for PR self-review.
+- **Keep test-only code out of the package.** A test oracle or harness lives
+  under `op_tests/`, not in `aiter/`.
+
+Evidence: aiter #4772, #6050, #4188, #4577, #6450, #5913.
 
 ## Deriving model shapes (don't guess)
 
@@ -310,7 +353,10 @@ When adding "test op X for model Y" shapes:
 - ❌ Force-merging test fns with different arg signatures into one table (NaN scatter).
 - ❌ Idealized contiguous inputs when the model uses a transposed view.
 - ❌ Leaving a wrong-result kernel in the table instead of skipping its config.
-- ❌ Hardcoding one arch / no `get_gfx()` gate — crashes on other supported cards.
+- ❌ Hardcoding one arch / no `get_gfx_runtime()` gate — crashes on other supported cards.
+- ❌ Gating on `get_gfx()`: it reports the last `GPU_ARCHS` entry, not the GPU in use.
+- ❌ A test that still passes with the change reverted (constant scales, an
+  untriggered clamp, pre-zeroed outputs, an unchecked `checkAllclose`).
 - ❌ Deny-list arch checks that let an unknown new card run an unbuilt kernel.
 - ❌ Deep manual nested loops for the sweep instead of `itertools.product`.
 - ❌ No final summary table.
