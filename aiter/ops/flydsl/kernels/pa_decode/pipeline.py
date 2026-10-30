@@ -687,13 +687,20 @@ class Gfx1250Bf16Pipeline:
             next_state = []
             for m in range_constexpr(t.m_tiles):
                 row = m * 16 + ctx.lane16
-                upper = (
-                    ctx.planned_context
-                    - t.query_length
-                    + ctx.query_begin
-                    + row // t.query_group_size
-                    + 1
-                )
+                upper = ctx.planned_context
+                if const_expr(t.causal or t.sliding_window > 0):
+                    # The row's causal bound; the window starts W keys before it.
+                    causal_upper = (
+                        upper
+                        - t.query_length
+                        + ctx.query_begin
+                        + row // t.query_group_size
+                        + 1
+                    )
+                    if const_expr(t.causal):
+                        upper = causal_upper
+                    elif const_expr(t.sliding_window < t.query_length):
+                        upper = fx.min(upper, causal_upper + (t.sliding_window - 1))
                 units = []
                 for n in range_constexpr(2):
                     scores = fx.Vector.filled(8, 0.0, fx.Float32)
@@ -710,7 +717,9 @@ class Gfx1250Bf16Pipeline:
                         token = token_base + ctx.warp * 32 + n * 16 + ctx.half * 8 + r
                         visible = (token < upper) & (row < t.rows)
                         if const_expr(t.sliding_window > 0):
-                            visible = visible & (token >= upper - t.sliding_window)
+                            visible = visible & (
+                                token >= causal_upper - t.sliding_window
+                            )
                         units.append(
                             visible.select(
                                 scores[r] * fx.Float32(t.softmax_scale * LOG2E),
@@ -999,13 +1008,20 @@ class Gfx1250Pipeline:
                 if const_expr(not t.per_token_kv and not t.bf16):
                     ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
                     scale = scale * fx.Float32(ks[0])
-                upper = (
-                    ctx.planned_context
-                    - t.query_length
-                    + ctx.query_begin
-                    + row // t.query_group_size
-                    + 1
-                )
+                upper = ctx.planned_context
+                if const_expr(t.causal or t.sliding_window > 0):
+                    # The row's causal bound; the window starts W keys before it.
+                    causal_upper = (
+                        upper
+                        - t.query_length
+                        + ctx.query_begin
+                        + row // t.query_group_size
+                        + 1
+                    )
+                    if const_expr(t.causal):
+                        upper = causal_upper
+                    elif const_expr(t.sliding_window < t.query_length):
+                        upper = fx.min(upper, causal_upper + (t.sliding_window - 1))
                 units, values = [], []
                 qk_k = 32 if t.bf16 else (128 if t.head_dim % 128 == 0 else 64)
                 for n in range_constexpr(t.TOKENS // 64):
@@ -1068,7 +1084,7 @@ class Gfx1250Pipeline:
                         visible = (token_base + token < upper) & (row < t.rows)
                         if const_expr(t.sliding_window > 0):
                             visible = visible & (
-                                token_base + token >= upper - t.sliding_window
+                                token_base + token >= causal_upper - t.sliding_window
                             )
                         units.append(visible.select(value, fx.Float32(float("-inf"))))
                 scores = fx.Vector.from_elements(units, dtype=fx.Float32)

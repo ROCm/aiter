@@ -17,6 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
+from .kernels.pa_decode.traits import resolve_causal
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -196,6 +197,7 @@ def pa_decode(
     sliding_window: int = 0,
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
+    causal: bool = True,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -221,10 +223,15 @@ def pa_decode(
     head dimensions must match.
     ALiBi and externally quantized queries are unsupported.
 
-    MTP lengths include the query tokens and use dense causal masking.
+    MTP lengths include the query tokens and use dense causal masking by default.
     Independently selected sparse queries need separate table rows and
     query_length=1. Positive ``sliding_window`` includes each query's own
     position; nonpositive values disable it.
+    ``causal=False`` drops the causal mask: all query_length rows of a sequence
+    attend to all ``context_lengths[i]`` keys, e.g. a bidirectional draft block
+    whose own keys are already cached. Its sliding window is two-sided: the row
+    at position p sees key k when |p - k| < sliding_window, the definition of
+    FlashAttention's ``window_size=(W - 1, W - 1)``.
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
     calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
@@ -277,6 +284,7 @@ def pa_decode(
         raise TypeError("query_length must be an int")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
+    resolve_causal(causal, query_length)
 
     required_tensors = (
         ("output", output),
@@ -640,6 +648,7 @@ def pa_decode(
             sliding_window=sliding_window,
             direct_output=direct_output,
             trans_k=trans_k,
+            causal=causal,
         )
 
     total_rows = query_length * query_group_size

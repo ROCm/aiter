@@ -37,7 +37,7 @@ def d256_pipe(
 
     Uniform query length; rows = query_length * query_group_size fit two
     16-row M-tiles that share one K/V stream. Packed caches support both V
-    layouts, per-tensor/per-token scales and causal sliding windows.
+    layouts, per-tensor/per-token scales and sliding windows.
     """
     return (
         "gfx95" in arch
@@ -95,6 +95,13 @@ def _bf16_lds_bytes(head_dim, query_rows, block_size):
     return qp_bytes + max_sum_bytes + 4 * pages_per_chunk * 4
 
 
+def resolve_causal(causal, query_length):
+    """Validate ``causal``; one query row sees the same keys either way."""
+    if not isinstance(causal, bool):
+        raise TypeError("causal must be a bool")
+    return causal or query_length == 1
+
+
 @dataclass(frozen=True)
 class PaDecodeSchedule:
     """Select the cache key without constructing the full kernel layout."""
@@ -127,6 +134,7 @@ class PaDecodeSchedule:
         max_context_length: int | None = None,
         sliding_window: int = 0,
         trans_k: bool = True,
+        causal: bool = True,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
@@ -135,6 +143,7 @@ class PaDecodeSchedule:
             raise ValueError("work_capacity must be positive")
         if not trans_k:
             raise NotImplementedError("Non-transposed key cache is not implemented")
+        causal = resolve_causal(causal, query_length)
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
         if kv_dtype not in ("fp8", "bf16"):
@@ -344,6 +353,7 @@ class PaDecodeSchedule:
             single_tile_plan,
             batch_first_plan_grid,
             sliding_window,
+            causal,
             kv_dtype,
             D256_PIPE,
             stage_pages,
@@ -372,6 +382,7 @@ class PaDecodeTraits:
     softmax_scale: float
     per_token_kv: bool
     query_length: int
+    causal: bool
     trans_v: bool
     wide_kv_addressing: bool
     query_splits: int
@@ -481,6 +492,7 @@ class PaDecodeTraits:
             single_tile_plan,
             batch_first_plan_grid,
             sliding_window,
+            causal,
             kv_dtype,
             D256_PIPE,
             stage_page_capacity,
@@ -679,6 +691,7 @@ class PaDecodeTraits:
             softmax_scale=softmax_scale,
             per_token_kv=per_token_kv,
             query_length=query_length,
+            causal=causal,
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
             query_splits=query_splits,
