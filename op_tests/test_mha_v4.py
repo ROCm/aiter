@@ -640,6 +640,7 @@ _STRIDED_QUANTIZERS = {
     "v_mxfp6_fp6_p": lambda x, mean: quantize_v_mxfp6_fp6_p(x),
 }
 _HIP_ROW_LAYOUT_QUANTIZERS = {
+    "rotate_hd128": lambda x: rotate_activation_hd128(torch.empty_like(x), x),
     "fp8_rotated": lambda x: quantize_fp8_rotated(x),
     "mxfp8_q": lambda x: quantize_mxfp8_q(x, 0.127),
     "mxfp8_k": lambda x: quantize_mxfp8_k(x),
@@ -746,6 +747,53 @@ def test_mha_v4_rotated_fp8_rejects_noncontiguous_non_bshd_input():
 
     with expect_raises(ValueError, match="not BSHD must be contiguous"):
         quantize_fp8_rotated(value)
+
+
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 activation rotation",
+)
+@parametrize(
+    "caller,operation",
+    [
+        ("quantize_fp8_rotated", "rotated FP8 quantization"),
+        ("rotate", "hd128 rotation"),
+    ],
+)
+def test_mha_v4_rotation_keeps_its_row_layout_check_under_torch_compile(
+    caller, operation
+):
+    """torch.compile drops an op with neither outputs nor mutations, so a row-layout check of
+    its own let a misaligned view through to the HIP check.
+
+    Out of process because that check aborts rather than raises.
+    """
+    source = textwrap.dedent(f"""
+        import torch
+        from aiter.ops.mha_v4_quant import quantize_fp8_rotated, rotate_activation_hd128
+
+        def rotate(value):
+            out = torch.empty_like(value)
+            rotate_activation_hd128(out, value)
+            return out
+
+        storage = torch.randn((1, 128, 2, 136), device="cuda", dtype=torch.bfloat16)
+        torch.compile({caller}, fullgraph=True)(storage[..., 1:129])
+        torch.cuda.synchronize()
+        """)
+    finished = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+
+    assert finished.returncode != 0
+    assert (
+        f"ValueError: {operation} input must start on a 16-byte boundary"
+        in finished.stderr
+    ), finished.stderr[-2000:]
 
 
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 rows")

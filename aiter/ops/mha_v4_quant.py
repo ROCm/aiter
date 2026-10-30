@@ -72,6 +72,25 @@ def _or_empty(input: Tensor, mean: Optional[Tensor]) -> Tensor:  # noqa: UP045
     return input.new_empty((0,), dtype=torch.float32) if mean is None else mean
 
 
+def _rotate_activation_hd128_checked_fake(
+    out: Tensor, input: Tensor, mean: Tensor, partial_amax: Tensor, operation: str
+) -> None:
+    del out, input, mean, partial_amax, operation
+
+
+# The row layout depends on data_ptr(), which only a real tensor has, so the check runs in an op.
+# It is the op that launches: one with neither outputs nor mutations is dead code to torch.compile.
+@torch_compile_guard(
+    mutates_args=["out", "partial_amax"], gen_fake=_rotate_activation_hd128_checked_fake
+)
+def _rotate_activation_hd128_checked(
+    out: Tensor, input: Tensor, mean: Tensor, partial_amax: Tensor, operation: str
+) -> None:
+    _validate_hip_row_layout(input, operation)
+    rotate = getattr(_rotate_activation_hd128, "_eager_body", _rotate_activation_hd128)
+    rotate(out, input, mean, partial_amax)
+
+
 def rotate_activation_hd128(
     out: Tensor,
     input: Tensor,
@@ -83,8 +102,12 @@ def rotate_activation_hd128(
     Pass `partial_amax` to have the kernel also emit a per-block amax of the rotated values,
     which saves a per-tensor quantizer the full extra read its own amax pass would cost.
     """
-    _rotate_activation_hd128(
-        out, input, _or_empty(input, mean), _or_empty(input, partial_amax)
+    _rotate_activation_hd128_checked(
+        out,
+        input,
+        _or_empty(input, mean),
+        _or_empty(input, partial_amax),
+        "hd128 rotation",
     )
 
 
@@ -173,7 +196,7 @@ def _validate_hd128_last_dimension(input: Tensor, operation: str) -> None:
         )
 
 
-def _validate_hip_row_layout_impl(input: Tensor, operation: str) -> None:
+def _validate_hip_row_layout(input: Tensor, operation: str) -> None:
     _validate_hd128_last_dimension(input, operation)
     if input.data_ptr() % 16:
         raise ValueError(f"{operation} input must start on a 16-byte boundary")
@@ -191,11 +214,6 @@ def _validate_hip_row_layout_impl(input: Tensor, operation: str) -> None:
         raise ValueError(f"{operation} input that is not BSHD must be contiguous")
 
 
-@torch_compile_guard(mutates_args=[], gen_fake=lambda input, operation: None)
-def _validate_hip_row_layout(input: Tensor, operation: str) -> None:
-    _validate_hip_row_layout_impl(input, operation)
-
-
 def _validate_bshd_hd128(
     input: Tensor, operation: str, hip_rows: bool = True
 ) -> tuple[int, int, int, int]:
@@ -203,7 +221,7 @@ def _validate_bshd_hd128(
     if input.dim() != 4:
         raise ValueError(f"{operation} requires hd128 BSHD input")
     if hip_rows:
-        _validate_hip_row_layout_impl(input, operation)
+        _validate_hip_row_layout(input, operation)
     else:
         _validate_hd128_last_dimension(input, operation)
     return input.shape
@@ -330,11 +348,12 @@ def quantize_fp8_rotated(
     The rotation kernel emits the amax as it goes, so this costs two passes over the tensor
     rather than three.
     """
-    _validate_hip_row_layout(input, "rotated FP8 quantization")
     rotated = input.new_empty(input.shape)
     blocks = triton.cdiv(input.numel() // 128, MHA_V4_ROTATE_ROWS_PER_BLOCK)
     partial = input.new_empty((blocks,), dtype=torch.float32)
-    rotate_activation_hd128(rotated, input, mean, partial)
+    _rotate_activation_hd128_checked(
+        rotated, input, _or_empty(input, mean), partial, "rotated FP8 quantization"
+    )
     return _quantize_per_tensor(
         rotated, dtypes.fp8, torch.finfo(dtypes.fp8).max, 1.0, partial
     )
