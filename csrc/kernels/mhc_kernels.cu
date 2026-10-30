@@ -1106,7 +1106,12 @@ namespace aiter {
                 const opus::u32_t s0 = sw[0], s1 = sw[1];
                 acc_2r[i.value] = __builtin_bit_cast(float, s0) + __builtin_bit_cast(float, s1);
             });
-            g_out.template store<4>(acc_2r, lane < 32 ? out_off + 16 : oob);
+            // Lanes 32-63 zero columns 24-31, so a padded row (32 floats) is written as a whole
+            // 128 B line instead of a 96 B partial one.
+            if (lane >= 32) {
+                opus::clear(acc_2r);
+            }
+            g_out.template store<4>(acc_2r, lane < 32 || out_stride >= 32 ? out_off + 16 : oob);
             const float sq_row = cross_row_sum_4(sq, lane);
             g_sq.template store<1>(sq_row, lane < 16 ? tile_row + lane : oob);
             clear_acc();
