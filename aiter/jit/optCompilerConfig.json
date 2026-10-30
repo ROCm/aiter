@@ -1971,6 +1971,21 @@
         "third_party": ["'HipKittens'", "'ComposableKernel'"],
         "is_experimental": "True"
     },
+    "module_hk_mla_verify": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_hk_verify_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk_mla_verify_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_k3_mla_verify_hk.cuh'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": ["'-mllvm'", "'-amdgpu-spill-vgpr-to-agpr=0'"],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/mla/hk/gen_k3_mla_verify_hk_asm.py --output_dir {{}}'",
+        "is_experimental": "True"
+    },
     "module_hk_mla_v40_fwd_mi3xx": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_hk_v40_pybind.cu'",
