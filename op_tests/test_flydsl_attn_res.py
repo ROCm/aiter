@@ -168,22 +168,27 @@ def _run_and_check(
     return error
 
 
+def _run_num_blocks_sweep(tokens: int = 17) -> None:
+    for hidden_size, num_blocks in itertools.product(
+        (_D, _D_SMALL), range(_MAX_BLOCKS + 1)
+    ):
+        _run_and_check(tokens, num_blocks, False, False, False, hidden_size=hidden_size)
+        if num_blocks < _MAX_BLOCKS:
+            _run_and_check(
+                tokens, num_blocks, True, True, True, hidden_size=hidden_size
+            )
+
+
 @_skip_unsupported_gfx
 def test_flydsl_attn_res_correctness():
-    """Cover the flag surface and source-count endpoints at the prefill grid."""
+    """Cover the flag surface and every source count at the prefill grid."""
     for flags in itertools.product((False, True), repeat=3):
         _run_and_check(17, _MAX_BLOCKS - 1, *flags)
 
     _run_and_check(17, _MAX_BLOCKS - 1, True, True, True, pad=8)
     _run_and_check(17, _MAX_BLOCKS, False, False, False, pad=16)
-
-    _run_and_check(17, 0, False, False, False)
-    _run_and_check(17, 0, True, True, True)
-    _run_and_check(17, _MAX_BLOCKS, False, False, False)
     _run_and_check(17, _MAX_BLOCKS, True, False, True)
-
-    _run_and_check(17, _MAX_BLOCKS, False, False, False, hidden_size=_D_SMALL)
-    _run_and_check(17, _MAX_BLOCKS - 1, True, True, True, hidden_size=_D_SMALL)
+    _run_num_blocks_sweep()
 
     for tokens in (1, 320):
         _run_and_check(tokens, _MAX_BLOCKS, False, False, False)
@@ -571,6 +576,7 @@ def main():
         help="Rotate tensor args so each timed iteration reads cold HBM",
     )
     args = parser.parse_args()
+    _run_num_blocks_sweep()
     large_d_configs = (
         (_D, _MAX_BLOCKS, False, False, False, 0, 1),
         (_D, _MAX_BLOCKS - 1, True, True, True, 0, 1),
