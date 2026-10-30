@@ -15,6 +15,8 @@
 * limitations under the License.
 """
 
+import ctypes
+import functools
 import os
 import pickle
 from contextlib import contextmanager
@@ -30,6 +32,7 @@ import aiter as ops
 from aiter import logger
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.utils import env_flag
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.utility.dtypes import fp8
 
 from .rocm_version import get_rocm_version
@@ -101,12 +104,142 @@ def _expandable_segments_enabled() -> bool:
     return False
 
 
+def _ipc_base_ptr(data_ptr: int) -> int:
+    """Base address of the device allocation containing *data_ptr*.
+
+    ``hipIpcGetMemHandle`` always returns a handle for the whole allocation
+    that contains the pointer, never for the pointer itself, and the importing
+    rank maps that allocation at its own base address. A buffer that is a
+    sub-block of a larger allocation therefore has to travel with its
+    ``data_ptr - base`` offset, or peers address the wrong region -- silently
+    reading whatever else lives at the base of that allocation.
+
+    The C++ graph path already does exactly this (``get_graph_buffer_ipc_meta``
+    in ``csrc/include/custom_all_reduce.cuh``); this is the Python-side
+    equivalent for the named pool buffers.
+
+    Raw ``hipMalloc``/``hipExtMallocWithFlags`` buffers are their own base, so
+    this returns *data_ptr* unchanged for them.
+    """
+    from .vmm_allocator import load_hip_runtime
+
+    hip = load_hip_runtime()
+    base = ctypes.c_void_p()
+    size = ctypes.c_size_t()
+    err = hip.hipMemGetAddressRange(
+        ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(data_ptr)
+    )
+    if err != 0 or not base.value:
+        raise RuntimeError(
+            f"hipMemGetAddressRange failed (err={err}) for pointer "
+            f"0x{data_ptr:x}; cannot compute the IPC handle offset"
+        )
+    return base.value
+
+
+# hip/driver_types.h: hipPointer_attribute
+_HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR = 11
+
+
+class _HipIpcMemHandle(ctypes.Structure):
+    """hipIpcMemHandle_t, which hipIpcOpenMemHandle takes by value."""
+
+    _fields_ = [("reserved", ctypes.c_byte * 64)]
+
+
+_hip_rt = None
+
+
+def _loaded_hip_runtime():
+    """The HIP runtime torch already loaded, or None if it cannot be found.
+
+    Bound by the path mapped into this process: a second copy of the runtime
+    would not know about torch's allocations.
+    """
+    global _hip_rt
+    if _hip_rt is None:
+        from aiter.dist.cuda_wrapper import find_loaded_library
+
+        path = find_loaded_library("libamdhip64")
+        rt = ctypes.CDLL(path) if path else False
+        if rt:
+            rt.hipPointerGetAttribute.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+            ]
+            rt.hipIpcGetMemHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            rt.hipIpcOpenMemHandle.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                _HipIpcMemHandle,
+                ctypes.c_uint,
+            ]
+            rt.hipIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
+        _hip_rt = rt
+    return _hip_rt or None
+
+
+def _ipc_exportable(ptr: int) -> bool:
+    """Whether flush_graph_buffers will be able to export *ptr* (~1 us).
+
+    Mirrors get_graph_buffer_ipc_meta, which exports the allocation's base
+    address and aborts the process (HIP_CALL) if that fails. Checking at the
+    call site turns that into a Python error that points at the offending
+    collective. Legal while the stream is capturing.
+    """
+    rt = _loaded_hip_runtime()
+    if rt is None:
+        return True
+    base = ctypes.c_void_p()
+    handle = (ctypes.c_char * 64)()  # sizeof(hipIpcMemHandle_t)
+    ok = (
+        rt.hipPointerGetAttribute(
+            ctypes.byref(base), _HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR, ptr
+        )
+        == 0
+        and rt.hipIpcGetMemHandle(handle, base) == 0
+    )
+    if not ok:
+        # A failed HIP call leaves a sticky error that the next kernel launch
+        # would report as its own.
+        rt.hipGetLastError()
+    return ok
+
+
 # ROCm release at which hipIpc is reported to work on gfx1250. Below this we fall
 # back to the HIP VMM transport (i.e. gfx1250 uses VMM only on ROCm < 7.14).
 # NOTE: bisect this across ROCm versions on real hardware (use
 # AITER_CUSTOM_AR_FORCE_IPC together with AITER_ROCM_VERSION) and update once
 # confirmed.
 _IPC_MIN_ROCM = (7, 14)
+
+# gfx1250 all-reduces up to this size take the LL kernel (kLLArMaxBytes in
+# custom_all_reduce_gfx1250.cuh).
+_GFX1250_LL_MAX_BYTES = 4 * 1024 * 1024
+
+# Max input bytes custom_all_reduce_residual fuses, per (arch, TP); None = no
+# limit. Larger inputs and unlisted pairs fall back to all-reduce + add.
+# Timed end to end on CUDA graphs on MI300X (gfx942) and MI355X (gfx950).
+_AR_RESIDUAL_MAX_BYTES = {
+    ("gfx942", 2): 10 * 1024 * 1024,
+    ("gfx942", 4): 14 * 1024 * 1024,
+    ("gfx942", 6): None,
+    ("gfx942", 8): None,
+    ("gfx950", 2): None,
+    ("gfx950", 4): None,
+    # The fallback, plain all-reduce, faults at TP6 below 80 KiB, on main too.
+    ("gfx950", 6): None,
+    ("gfx950", 8): None,
+}
+
+
+@functools.cache
+def _runtime_gfx() -> str | None:
+    """The live GPU arch, or None if unknown (never fused)."""
+    try:
+        return get_gfx_runtime()
+    except (KeyError, RuntimeError):
+        return None
 
 
 # Default custom-AR size cutoff (bytes): inputs at or below this run on the
@@ -291,10 +424,12 @@ except Exception as e:  # noqa: BLE001
 
 
 def is_weak_contiguous(inp: torch.Tensor):
-    return inp.is_contiguous() or (
-        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-        == inp.numel() * inp.element_size()
-    )
+    # The custom kernels flatten tensors and do not consume stride metadata.
+    # Merely occupying a contiguous storage span is not enough: a transpose of
+    # a full allocation has that property but a different logical element
+    # order. PyTorch's predicate still accepts contiguous views with a storage
+    # offset, which is the useful "weak" case this helper historically covered.
+    return inp.is_contiguous()
 
 
 def can_pack_2d_last_dim_slice(inp: torch.Tensor) -> bool:
@@ -525,6 +660,7 @@ class IPCBufferPool:
         self._store_key_prefix = f"aiter_ipc/p{IPCBufferPool._pool_seq}/g{ranks_tag}"
         IPCBufferPool._pool_seq += 1
         self._ipc_seq = 0
+        self._peer_bases: list[int] = []  # mapped by open_peer_buffers
 
     @staticmethod
     def _assert_pure_tcp_store(store) -> None:
@@ -590,6 +726,39 @@ class IPCBufferPool:
         buf = self._buffers[key]
         return self._broadcast_ipc(buf.data_ptr)
 
+    def open_peer_buffers(self, key: str) -> list[int]:
+        """Map the named buffer of every rank into this process.
+
+        Returns the address of the buffer of each rank, by rank: this rank's own
+        buffer, and the peers' buffers mapped with hipIpcOpenMemHandle. All ranks
+        must call it. close_peer_buffers unmaps the peers' buffers.
+        """
+        handles, offsets = self.get_ipc_meta(key)
+        rt = _loaded_hip_runtime()
+        ptrs = []
+        for rank, (handle, offset) in enumerate(zip(handles, offsets)):
+            if rank == self._rank:
+                ptrs.append(self._buffers[key].data_ptr)
+                continue
+            h = _HipIpcMemHandle.from_buffer_copy(handle.numpy().tobytes())
+            base = ctypes.c_void_p()
+            # 1 is hipIpcMemLazyEnablePeerAccess.
+            err = rt.hipIpcOpenMemHandle(ctypes.byref(base), h, 1)
+            if err != 0:
+                raise RuntimeError(f"hipIpcOpenMemHandle of rank {rank} failed: {err}")
+            self._peer_bases.append(base.value)
+            ptrs.append(base.value + offset)
+        return ptrs
+
+    def close_peer_buffers(self):
+        """Unmap the peers' buffers that open_peer_buffers mapped."""
+        rt = _loaded_hip_runtime()
+        for base in self._peer_bases:
+            err = rt.hipIpcCloseMemHandle(ctypes.c_void_p(base))
+            if err != 0:
+                raise RuntimeError(f"hipIpcCloseMemHandle failed: {err}")
+        self._peer_bases = []
+
     # ---- Graph mode: external buffer IPC meta ----
 
     def get_external_ipc_meta(self, tensor: torch.Tensor) -> tuple[list, list]:
@@ -604,6 +773,14 @@ class IPCBufferPool:
         their IPC handles across all ranks and completes registration.
         """
         count = self._graph_count_fn(ar_ptr)
+        counts = self.all_gather_object(count)
+        if any(c != count for c in counts):
+            raise RuntimeError(
+                "custom allreduce: ranks recorded different numbers of CUDA "
+                f"graph buffers during capture (per rank: {counts}). They are "
+                "registered by position, so every rank must capture the same "
+                "collectives in the same order."
+            )
         if count == 0:
             return
         handle_sz = 64  # sizeof(hipIpcMemHandle_t)
@@ -624,31 +801,40 @@ class IPCBufferPool:
     # ---- Private IPC primitives ----
 
     def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
-        """Get IPC handle for *data_ptr* and broadcast across all ranks."""
+        """Get IPC handle + offset for *data_ptr* and broadcast across ranks.
+
+        The handle covers the whole allocation containing *data_ptr*, so the
+        buffer's offset within it travels alongside; see _ipc_base_ptr.
+        """
+        base_ptr = _ipc_base_ptr(data_ptr)
         # sizeof(hipIpcMemHandle_t); host memory, as in flush_graph_buffers
         handle = torch.empty(64, dtype=torch.uint8, device="cpu")
-        self._ipc_handle_fn(data_ptr, handle.data_ptr())
-        return self._gather_ipc_meta((handle, 0))
+        self._ipc_handle_fn(base_ptr, handle.data_ptr())
+        return self._gather_ipc_meta((handle, data_ptr - base_ptr))
 
-    def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
-        """Exchange IPC metadata (handle + offset) across all ranks via TCP store.
+    def all_gather_object(self, obj) -> list:
+        """Gather a picklable *obj* from every rank via the TCP store.
 
-        Each rank writes its serialised *shard_data* under a unique key, then
-        reads every other rank's data.  ``store.get()`` blocks until the key
-        is available, providing natural barrier semantics without involving any
+        Each rank writes its serialised *obj* under a unique key, then reads
+        every other rank's.  ``store.get()`` blocks until the key is
+        available, providing natural barrier semantics without involving any
         collective communication backend.
         """
         seq = self._ipc_seq
         self._ipc_seq += 1
         prefix = f"{self._store_key_prefix}/{seq}"
 
-        self._store.set(f"{prefix}/r{self._rank}", pickle.dumps(shard_data))
+        self._store.set(f"{prefix}/r{self._rank}", pickle.dumps(obj))
+        return [
+            pickle.loads(self._store.get(f"{prefix}/r{r}"))
+            for r in range(self._world_size)
+        ]
 
+    def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
+        """Exchange IPC metadata (handle + offset) across all ranks."""
         handles = []
         offsets = []
-        for r in range(self._world_size):
-            raw = self._store.get(f"{prefix}/r{r}")
-            h, o = pickle.loads(raw)
+        for h, o in self.all_gather_object(shard_data):
             handles.append(h)
             offsets.append(o)
         return handles, offsets
@@ -683,9 +869,8 @@ class _GFX1250BufferProxy:
         raise KeyError(key)
 
     def flush_graph_buffers(self, ar_ptr):
-        # TODO: full CUDA graph support on gfx1250 requires VMM-based
-        # exchange for graph-captured buffers. For now, graph capture
-        # is not supported on gfx1250 — log a warning.
+        # The VMM transport cannot export captured buffers, so __init__ keeps
+        # it on the copy-in path and nothing is recorded; warn if anything was.
         count = self._ca._ops_get_graph_buffer_count(ar_ptr)
         if count > 0:
             logger.warning(
@@ -806,7 +991,12 @@ class _SymmMemBufferProxy:
 
 
 class CustomAllreduce:
+    defers_capture_registration = True
+
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
+    # gfx1250 allgather also runs at 16/32/64 (multi-node symm_mem); all-reduce
+    # stays within _SUPPORTED_WORLD_SIZES.
+    _SUPPORTED_WORLD_SIZES_GFX1250: ClassVar[list[Any]] = [2, 4, 6, 8, 16, 32, 64]
 
     def _meta_size(self) -> int:
         """Bytes of shared meta buffer this group needs.
@@ -837,8 +1027,11 @@ class CustomAllreduce:
             # kernel ops (arch)
             self._ops_meta_size = ops.meta_size_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
+            self._ops_all_reduce_residual = None
             self._ops_all_gather = ops.all_gather_gfx1250
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
+            self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm_gfx1250
+            self._ops_fused_ar_rms_quant = ops.fused_allreduce_rmsnorm_quant_gfx1250
             self._ops_dispose = ops.dispose_gfx1250
             self._ops_get_graph_buffer_count = ops.get_graph_buffer_count_gfx1250
             self._ops_get_graph_buffer_ptrs = ops.get_graph_buffer_ptrs_gfx1250
@@ -859,8 +1052,11 @@ class CustomAllreduce:
             self._ops_meta_size = ops.meta_size
             self._ops_init_custom_ar = ops.init_custom_ar
             self._ops_all_reduce = ops.all_reduce
+            self._ops_all_reduce_residual = ops.all_reduce_residual
             self._ops_all_gather = None
             self._ops_reduce_scatter = ops.reduce_scatter
+            self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm
+            self._ops_fused_ar_rms_quant = ops.fused_allreduce_rmsnorm_quant
             self._ops_dispose = ops.dispose
             self._ops_register_input_buffer = ops.register_input_buffer
             self._ops_register_output_buffer = ops.register_output_buffer
@@ -888,6 +1084,10 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self._register_for_capturing = False
+        self._register_for_capturing_init = False
+        self._register_for_capturing_requested = False
+        self._register_for_capturing_opt_out = False
         self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
         self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
@@ -923,13 +1123,18 @@ class CustomAllreduce:
             # No need to initialize custom allreduce for single GPU case.
             return
 
-        if world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
+        supported = (
+            CustomAllreduce._SUPPORTED_WORLD_SIZES_GFX1250
+            if self._is_gfx1250
+            else CustomAllreduce._SUPPORTED_WORLD_SIZES
+        )
+        if world_size not in supported:
             logger.warning(
                 "Custom allreduce is disabled due to an unsupported world"
                 " size: %d. Supported world sizes: %s. To silence this "
                 "warning, specify disable_custom_all_reduce=True explicitly.",
                 world_size,
-                str(CustomAllreduce._SUPPORTED_WORLD_SIZES),
+                str(supported),
             )
             return
 
@@ -1000,16 +1205,13 @@ class CustomAllreduce:
             return
 
         self.disabled = False
-        # gfx1250 (MI450) cannot register CUDA-graph-captured buffers across
-        # ranks yet: cross-rank graph-buffer exchange is unimplemented for both
-        # gfx1250 transports (VMM fd exchange, and IPC graph-meta ops). The
-        # "registered" capture path bakes raw input pointers that peers would
-        # dereference at replay without ever being registered → GPU page fault
-        # on the first graph replay (e.g. V4 TP=2 decode). Force the copy-in
-        # "unreg" path during capture, which routes through the pre-registered
-        # pool (exchanged at init, address-stable across replays). Keyed on the
-        # kernel (arch), so both VMM and IPC gfx1250 paths use copy-in.
-        if self._is_gfx1250:
+        # Only the IPC transport, which never spans nodes, can map a peer's
+        # CUDA-graph-captured buffer: the VMM and symm_mem transports cannot
+        # export a tensor from PyTorch's caching allocator. On those, capture
+        # takes the copy-in path, which stages each input in the pool exchanged
+        # at init. Keyed on the transport, not the arch: gfx1250 on IPC
+        # registers captured inputs like the old arch does.
+        if self._use_vmm or self._use_symm_mem or not self._same_node:
             enable_register_for_capturing = False
         # PyTorch expandable_segments hands out VMM-managed pointers that cannot
         # be exported via hipIpcGetMemHandle (issue #4174). The classic IPC
@@ -1017,6 +1219,7 @@ class CustomAllreduce:
         # it would fail. Force the copy-in path, which stages into the plain
         # hipMalloc input pool (IPC-exportable). The VMM transport does its own
         # pointer exchange and is unaffected, so only guard the IPC path.
+        self._register_for_capturing_requested = enable_register_for_capturing
         if (
             not self._use_vmm
             and not self._use_symm_mem
@@ -1024,18 +1227,20 @@ class CustomAllreduce:
         ):
             if enable_register_for_capturing:
                 logger.warning(
-                    "PyTorch expandable_segments is enabled; forcing custom "
-                    "allreduce copy-in during CUDA graph capture because "
+                    "PyTorch expandable_segments is enabled; defaulting custom "
+                    "allreduce to copy-in during CUDA graph capture because "
                     "expandable-segment pointers cannot be IPC-exported "
-                    "(issue #4174)."
+                    "(issue #4174). Re-checked when capture() is entered."
                 )
             enable_register_for_capturing = False
-        self.enable_register_for_capturing = enable_register_for_capturing
+        self._register_for_capturing = enable_register_for_capturing
+        self._register_for_capturing_init = enable_register_for_capturing
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
-        # 8*world_size bytes where world_size is at most 8. Allocating 8MB
-        # is enough for 131072 such tuples. The largest model I've seen only
-        # needs less than 10000 of registered tuples.
+        # 8*kMaxNgpus bytes (kMaxNgpus is 8 on old arch, 64 on gfx1250).
+        # Allocating 8MB is enough for 16384 such tuples even at 64. The
+        # largest model I've seen only needs less than 10000 of registered
+        # tuples.
         self.rank_data = torch.empty(
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
@@ -1333,12 +1538,13 @@ class CustomAllreduce:
         else:
             meta_size = self._meta_size() + max_size * 2
         # Wire the pool's graph helpers to the kernel-matching ops so that
-        # flush_graph_buffers() during capture never reinterpret_casts a gfx1250
-        # `fa` through the old-arch graph ops. Graph-buffer registration itself
-        # stays disabled on gfx1250 (copy-in path → count is always 0).
+        # flush_graph_buffers() after capture never reinterpret_casts a gfx1250
+        # `fa` through the old-arch graph ops.
         pool_kwargs = {}
         if self._is_gfx1250:
             pool_kwargs["graph_count_fn"] = self._ops_get_graph_buffer_count
+            pool_kwargs["graph_ipc_meta_fn"] = ops.get_graph_buffer_ipc_meta_gfx1250
+            pool_kwargs["graph_register_fn"] = ops.register_graph_buffers_gfx1250_ipc
         # Create IPC buffer pool and allocate all named buffers.
         self._pool = IPCBufferPool(self.device, self.group, **pool_kwargs)
         self._pool.create("meta", meta_size, uncached=True)
@@ -1350,12 +1556,9 @@ class CustomAllreduce:
         # PyTorch caching allocator (its memory accounting is what downstream
         # consumers profile against). Gated on the same condition as the
         # capture copy-in path above; _init_ipc only runs for non-VMM.
-        # AITER_CUSTOM_AR_RAW_INPUT_POOL forces the raw pool without
-        # expandable segments. Its use case is co-resident engines on one node
-        # (#4921): a second engine's torch.empty input pool can fail
-        # hipIpcGetMemHandle outright, and the raw pool sidesteps that while
-        # everything else (meta pool, capture-time outputs) stays exportable
-        # under the default allocator.
+        # AITER_CUSTOM_AR_RAW_INPUT_POOL also permits opting into a raw pool.
+        # It is not needed for ordinary caching-allocator sub-blocks: their
+        # allocation offsets are included in _broadcast_ipc.
         raw_cached = _expandable_segments_enabled() or env_flag(
             "AITER_CUSTOM_AR_RAW_INPUT_POOL"
         )
@@ -1391,6 +1594,29 @@ class CustomAllreduce:
             offsets,
         )
 
+    @property
+    def enable_register_for_capturing(self) -> bool:
+        """Whether a collective captured now binds its input directly (the
+        registered path) instead of staging it through the copy-in pool.
+        Outside capture() this is the __init__ decision, or False once a host
+        has opted out."""
+        return self._register_for_capturing
+
+    @enable_register_for_capturing.setter
+    def enable_register_for_capturing(self, value: bool) -> None:
+        # A host may opt out after __init__; ATOM forces copy-in for PIECEWISE
+        # graphs. capture() keeps that choice instead of re-deriving the path
+        # from the constructor argument. Setting True only withdraws the
+        # opt-out: it cannot enable a path __init__ ruled out.
+        if self._IS_CAPTURING:
+            raise RuntimeError(
+                "Set enable_register_for_capturing before capture(): changing "
+                "it inside the capture window would switch this rank's path "
+                "without the other ranks."
+            )
+        self._register_for_capturing_opt_out = not value
+        self._register_for_capturing = bool(value) and self._register_for_capturing_init
+
     @contextmanager
     def capture(self):
         """
@@ -1398,18 +1624,84 @@ class CustomAllreduce:
         flush_graph_buffers call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
+        prev_register = self._register_for_capturing
+        if not self.disabled and not self._use_vmm:
+            self._register_for_capturing = self._agree_capture_path()
         try:
             self._IS_CAPTURING = True
-            yield
-        finally:
-            self._IS_CAPTURING = False
+            try:
+                yield
+            finally:
+                self._IS_CAPTURING = False
+            # A failed capture is discarded; registering its buffers would
+            # only exchange a partial, possibly rank-dependent set.
             if not self.disabled:
                 self._pool.flush_graph_buffers(self._ptr)
+        finally:
+            self._register_for_capturing = prev_register
+
+    def _agree_capture_path(self) -> bool:
+        """Decide the capture path from the live allocator state and any host
+        opt-out, on every rank.
+
+        The registered path is used only if every rank can take it: the choice
+        changes the kernel's input source and the graph-buffer count, so ranks
+        that split would mismatch at flush and read the wrong peer buffers on
+        replay. Copy-in is always safe, so any dissent falls back to it.
+        """
+        # Set from the constructor argument and arch, so every rank takes part
+        # in the exchange or none does. A host opt-out is only a vote: ranks
+        # that differ on it fall back to copy-in instead of hanging.
+        if not self._register_for_capturing_requested:
+            return False
+        decisions = self._pool.all_gather_object(
+            not self._register_for_capturing_opt_out
+            and not _expandable_segments_enabled()
+        )
+        agreed = all(decisions)
+        if len(set(decisions)) > 1:
+            logger.warning(
+                "Ranks disagree on the custom-allreduce capture path "
+                "(registered per rank: %s; expandable_segments off and "
+                "no host opt-out). Using copy-in on every rank.",
+                decisions,
+            )
+        elif agreed and not self.enable_register_for_capturing:
+            logger.info(
+                "expandable_segments is off at capture time; using the "
+                "registered custom-allreduce capture path (no staging copy)."
+            )
+        elif not agreed and self.enable_register_for_capturing:
+            logger.info(
+                "expandable_segments is on at capture time; using the "
+                "copy-in custom-allreduce capture path."
+            )
+        return agreed
+
+    def _capture_registered(self, inp: torch.Tensor) -> bool:
+        """Whether a collective captured now may bind *inp* directly.
+
+        Raises if the registered path is on but *inp* cannot be IPC-exported,
+        e.g. it was allocated while expandable_segments were still on. Every
+        rank then fails at the same collective, since capture() agreed on the
+        path and hosts allocate the same way on every rank.
+        """
+        if not self.enable_register_for_capturing:
+            return False
+        if not _ipc_exportable(inp.data_ptr()):
+            raise RuntimeError(
+                "Custom allreduce is capturing on the registered path, but a "
+                "collective buffer cannot be IPC-exported. It was most likely "
+                "allocated while expandable_segments were on (issue #4174). "
+                "Allocate every collective buffer inside the capture window, "
+                "after expandable_segments are turned off."
+            )
+        return True
 
     def register_input_buffer(self, inp: torch.Tensor):
         """Register an external tensor as an IPC input buffer."""
         # No-op on symm_mem: it cannot share an external tensor (see
-        # _SymmMemBufferProxy.get_external_ipc_meta), and gfx1250 always
+        # _SymmMemBufferProxy.get_external_ipc_meta), and symm_mem always
         # reduces through the copy-in pool, which never looks up an externally
         # registered buffer. Callers that register anyway, such as ATOM's
         # signal tensor, keep working.
@@ -1455,6 +1747,9 @@ class CustomAllreduce:
         # AITER_CUSTOM_AR_MAX_SIZE=0 disables custom AR entirely -> RCCL for all.
         if self._car_max_size <= 0:
             return False
+        # gfx1250 groups above 8 ranks are allgather-only.
+        if self.world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
+            return False
         # AITER_CUSTOM_AR_MIN_SIZE lower bound: inputs at or below it fall back
         # to RCCL (custom AR runs only in the (min, max] window). Default 0 keeps
         # the historical behavior of accepting all sizes down to 16 bytes.
@@ -1476,6 +1771,59 @@ class CustomAllreduce:
         return self._fits_custom_ar_size(inp, prefill_support) and is_weak_contiguous(
             inp
         )
+
+    def can_fuse_ar_rms(
+        self, inp: torch.Tensor, hidden_dim: int, out_hidden_dim: int
+    ) -> bool:
+        """Whether fused_ar_rms (and its per-token quant form) has a kernel here."""
+        if not self._is_gfx1250:
+            return True
+        # gfx1250 has the contiguous, unpadded one-stage kernel only: one thread
+        # per 16 bytes of the row, at most 1024 threads.
+        row_bytes = hidden_dim * inp.element_size()
+        return (
+            inp.dtype in (torch.float16, torch.bfloat16)
+            and inp.is_contiguous()
+            and inp.shape[-1] == hidden_dim == out_hidden_dim
+            and row_bytes % 16 == 0
+            and row_bytes // 16 <= 1024
+        )
+
+    def should_fuse_ar_rms(
+        self, inp: torch.Tensor, hidden_dim: int, out_hidden_dim: int
+    ) -> bool:
+        """Whether fused_ar_rms beats all-reduce followed by RMSNorm here."""
+        if not self.can_fuse_ar_rms(inp, hidden_dim, out_hidden_dim):
+            return False
+        # The gfx1250 fused kernel syncs through the barrier. In the LL range,
+        # the LL all-reduce plus a separate RMSNorm is faster.
+        return (
+            not self._is_gfx1250
+            or inp.numel() * inp.element_size() > _GFX1250_LL_MAX_BYTES
+        )
+
+    def should_fuse_ar_residual(self, inp: torch.Tensor) -> bool:
+        """Whether custom_all_reduce_residual beats all-reduce + add here."""
+        key = (_runtime_gfx(), self.world_size)
+        if key not in _AR_RESIDUAL_MAX_BYTES:
+            return False
+        max_bytes = _AR_RESIDUAL_MAX_BYTES[key]
+        return max_bytes is None or inp.numel() * inp.element_size() <= max_bytes
+
+    @property
+    def has_old_arch_fused_kernels(self) -> bool:
+        """Whether the per-group / MXFP4 quant and qk-norm fused kernels can run.
+
+        They are built only into the old-arch module, whose ops cast ``_ptr`` to
+        the old-arch ``CustomAllreduce``. On gfx1250 ``_ptr`` is the gfx1250
+        class, so they would synchronize through the gfx1250 ``Signal`` with
+        their own counters and release later gfx1250 barriers early.
+        """
+        return not self._is_gfx1250
+
+    def _require_old_arch_fused_kernels(self, op: str) -> None:
+        if not self.has_old_arch_fused_kernels:
+            raise RuntimeError(f"{op} has no gfx1250 kernel")
 
     def should_custom_ar_bytes(self, inp: torch.Tensor, prefill_support: bool = False):
         """Return whether the tensor size fits custom AR even if it is strided.
@@ -1516,6 +1864,14 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
+        elif (
+            registered_input
+            and not self._is_gfx1250
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # The old-arch registered path records the output for export at
+            # flush too. gfx1250 reads only its peers' inputs.
+            self._capture_registered(out)
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
@@ -1530,6 +1886,74 @@ class CustomAllreduce:
         )
         return out
 
+    def uses_1stage_ar(self, inp: torch.Tensor) -> bool:
+        """Whether custom_all_reduce(inp) runs a one-shot kernel.
+
+        Mirrors CustomAllreduce::select_ar_stage; gfx1250 has only one-shot
+        kernels (LL and naive).
+        """
+        if self.disabled:
+            return False
+        if self._is_gfx1250 or self.world_size == 2:
+            return True
+        nbytes = inp.numel() * inp.element_size()
+        limit = 160 * 1024 if self.world_size <= 4 else 80 * 1024
+        return self.fully_connected and nbytes < limit
+
+    def all_reduce_residual(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        registered_input: bool = False,
+    ):
+        """Out-of-place all reduce followed by ``+ residual``.
+
+        ``residual`` must be identical on every rank. Uses the same kernel
+        switches as all_reduce, except LL.
+        """
+        assert residual.shape == inp.shape, "residual must match the input shape"
+        if out is None:
+            out = torch.empty_like(inp)
+        elif registered_input and torch.cuda.is_current_stream_capturing():
+            # Write mode records the output for export at flush, as in all_reduce.
+            self._capture_registered(out)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        assert is_weak_contiguous(residual), "residual tensor is not weak-contiguous"
+        if self._ops_all_reduce_residual is None:
+            raise NotImplementedError("all_reduce_residual has no gfx1250 kernel")
+        reg_inp = 0 if registered_input else self._pool["input"].data_ptr
+        reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
+        self._ops_all_reduce_residual(
+            self._ptr, inp, out, residual, reg_inp, reg_inp_bytes
+        )
+        return out
+
+    def custom_all_reduce_residual(
+        self, input: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor | None:
+        # None when custom allreduce is disabled, has no residual kernel
+        # (gfx1250), the input is not contiguous (the kernels read it densely),
+        # or fusing is not faster here (_AR_RESIDUAL_MAX_BYTES)
+        if (
+            self.disabled
+            or self._ops_all_reduce_residual is None
+            or not self.should_custom_ar(input)
+            or not input.is_contiguous()
+            or not self.should_fuse_ar_residual(input)
+        ):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.all_reduce_residual(
+                    input,
+                    residual,
+                    registered_input=self._capture_registered(input),
+                )
+            return torch.zeros_like(input)
+        return self.all_reduce_residual(input, residual, registered_input=False)
+
     def custom_all_reduce(
         self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
     ) -> torch.Tensor | None:
@@ -1542,7 +1966,7 @@ class CustomAllreduce:
                     input,
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
-                    registered_input=self.enable_register_for_capturing,
+                    registered_input=self._capture_registered(input),
                 )
             else:
                 # if warm up, mimic the allocation pattern
@@ -1651,11 +2075,11 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                # gfx1250 cannot register graph buffers cross-rank (see
-                # enable_register_for_capturing note in __init__); use the
-                # copy-in path so capture/replay reads the pre-registered pool.
+                # Peers read the input in place if capture() agreed on the
+                # registered path; otherwise it is staged in the pre-registered
+                # pool (see enable_register_for_capturing in __init__).
                 return self.reduce_scatter(
-                    input, output, dim, registered=self.enable_register_for_capturing
+                    input, output, dim, registered=self._capture_registered(input)
                 )
             else:
                 # Warmup forward (pre-capture): run the REAL reduce_scatter via
@@ -1751,10 +2175,10 @@ class CustomAllreduce:
 
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                # gfx1250 cannot register graph buffers cross-rank (see
-                # enable_register_for_capturing note in __init__); use the
-                # copy-in path so capture/replay reads the pre-registered pool.
-                if self.enable_register_for_capturing:
+                # Peers read the input in place if capture() agreed on the
+                # registered path; otherwise it is staged in the pre-registered
+                # pool (see enable_register_for_capturing in __init__).
+                if self._capture_registered(inp):
                     out = self.all_gather_reg(inp.view(view_dtype), dim=dim)
                 else:
                     out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
@@ -1769,6 +2193,71 @@ class CustomAllreduce:
         if view_dtype is not None and out is not None:
             out = out.view(orig_dtype)
         return out
+
+    # Tensors one `all_gatherv` launch takes (kAllGatherVMax).
+    _ALL_GATHERV_MAX: ClassVar[int] = 4
+    # Past this many bytes per rank, times the group size, NCCL's grouped
+    # all-gather is faster. Measured on MI355X gathering MoE routed rows
+    # in a replayed graph: the two cross near 4.5 / 9 / 21 MB a rank at
+    # 2 / 4 / 8 ranks.
+    _ALL_GATHERV_BYTES_PER_RANK: ClassVar[int] = 2 << 20
+
+    def custom_all_gatherv(
+        self, inps: list[torch.Tensor], sizes: list[int] | None = None
+    ) -> list[torch.Tensor] | None:
+        """First-dim all-gather of every tensor in `inps`, rank r holding
+        `sizes[r]` rows of each (every rank this one's count when None), in
+        one launch and one rank barrier. Each output is a contiguous
+        `[sum(sizes), ...]` of its input's dtype.
+
+        None where one launch cannot take them -- the gfx1250 path, too many
+        tensors, rows not a multiple of 4 bytes, a non-contiguous input, more
+        than the registered pool holds -- or where NCCL is the faster (more
+        than `_ALL_GATHERV_BYTES_PER_RANK` times the group's size a rank), so
+        the caller gathers another way.
+        Every condition reads only what all ranks share (row widths, `sizes`),
+        so all ranks decide alike.
+
+        Binds the inputs as `custom_all_gather` does: read in place while
+        capturing on the registered path, copied into the registered pool
+        otherwise.
+        """
+        if self._ops_all_gather is not None:
+            return None
+        if not 0 < len(inps) <= self._ALL_GATHERV_MAX:
+            return None
+        if sizes is None:
+            sizes = [inps[0].shape[0]] * self.world_size
+        # From the row shape, not a row: this rank may hold none.
+        row_bytes = [
+            t.shape[1:].numel() * t.element_size() if t.dim() else 0 for t in inps
+        ]
+        if any(
+            b == 0 or b % 4 or not t.is_contiguous() for b, t in zip(row_bytes, inps)
+        ):
+            return None
+        rank_bytes = max(sizes) * sum(row_bytes)
+        if rank_bytes > self._ALL_GATHERV_BYTES_PER_RANK * self.world_size:
+            return None
+        registered = (
+            self._IS_CAPTURING
+            and torch.cuda.is_current_stream_capturing()
+            and all(self._capture_registered(t) for t in inps)
+        )
+        pool = self._pool["input"]
+        if not registered and pool.max_size < sum(
+            (max(sizes) * b + 15) // 16 * 16 for b in row_bytes
+        ):
+            return None
+        total = sum(sizes)
+        outs = [
+            torch.empty((total, *t.shape[1:]), dtype=t.dtype, device=t.device)
+            for t in inps
+        ]
+        if total:
+            reg, reg_bytes = (0, 0) if registered else (pool.data_ptr, pool.max_size)
+            ops.all_gatherv(self._ptr, inps, outs, list(sizes), reg, reg_bytes)
+        return outs
 
     def fused_ar_rms(
         self,
@@ -1786,8 +2275,42 @@ class CustomAllreduce:
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
         emit_bf16: bool = False,
+        num_norm_rows: int = -1,
+        skip_residual: bool = False,
     ):
         valid_dim = w.numel()
+        rows = inp.numel() // inp.shape[-1]
+        # Width of the output the call writes, including one it allocates below;
+        # a padded width takes the pad kernel, which has no row options.
+        out_dim = (
+            out.shape[-1] if out is not None else (out_hidden_dim or inp.shape[-1])
+        )
+        if skip_residual or 0 <= num_norm_rows < rows:
+            # Only the plain 2-stage kernels implement these options.
+            if self._is_gfx1250:
+                raise ValueError(
+                    "skip_residual and num_norm_rows < rows are not supported on gfx1250"
+                )
+            if use_1stage:
+                raise ValueError(
+                    "skip_residual and num_norm_rows < rows require use_1stage=False"
+                )
+            if (
+                post_per_token_quant
+                or inp.shape[-1] != valid_dim
+                or out_dim != valid_dim
+            ):
+                raise ValueError(
+                    "skip_residual and num_norm_rows are not supported with "
+                    "quant or padded fused allreduce rmsnorm"
+                )
+        # Check the width the call writes: a padded caller-provided out takes the
+        # pad kernel, which gfx1250 does not have.
+        if not self.can_fuse_ar_rms(inp, valid_dim, out_dim):
+            raise RuntimeError(
+                "gfx1250 fused_ar_rms needs a contiguous, unpadded row of at most "
+                "1024 16-byte packs"
+            )
         if res_out is None:
             res_out = torch.empty(
                 inp.shape[:-1] + (valid_dim,), dtype=inp.dtype, device=inp.device
@@ -1796,13 +2319,12 @@ class CustomAllreduce:
         reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
             if out is None:
-                out_dim = out_hidden_dim or inp.shape[-1]
                 out = torch.empty(
                     inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device
                 )
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             if inp.shape[-1] == valid_dim and out.shape[-1] == inp.shape[-1]:
-                ops.fused_allreduce_rmsnorm(
+                self._ops_fused_ar_rms(
                     self._ptr,
                     inp,
                     res_inp,
@@ -1814,6 +2336,8 @@ class CustomAllreduce:
                     reg_bytes,
                     use_1stage,
                     gemma_norm,
+                    # The gfx1250 op has no row options.
+                    *(() if self._is_gfx1250 else (num_norm_rows, skip_residual)),
                 )
             else:
                 ops.fused_allreduce_rmsnorm_pad(
@@ -1847,7 +2371,7 @@ class CustomAllreduce:
             if emit_bf16:
                 bf16_out = torch.empty_like(inp)
                 bf16_ptr = int(bf16_out.data_ptr())
-            ops.fused_allreduce_rmsnorm_quant(
+            self._ops_fused_ar_rms_quant(
                 self._ptr,
                 inp,
                 res_inp,
@@ -1875,6 +2399,10 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
+        residual_out: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        num_norm_rows: int = -1,
+        skip_residual: bool = False,
     ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -1884,37 +2412,53 @@ class CustomAllreduce:
                 return self.fused_ar_rms(
                     input,
                     residual_inp,
+                    res_out=residual_out,
+                    out=out,
                     w=weight,
                     eps=eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
+                    num_norm_rows=num_norm_rows,
+                    skip_residual=skip_residual,
                 )
             else:
+                # Warmup: hand back the caller's buffers, as the eager and
+                # captured calls do, so their shapes (e.g. num_norm_rows rows
+                # of out) carry through. Zero them, as the allocated ones are.
                 out_dim = out_hidden_dim or input.shape[-1]
-                return (
-                    torch.zeros(
+                if out is None:
+                    out = torch.zeros(
                         input.shape[:-1] + (out_dim,),
                         dtype=input.dtype,
                         device=input.device,
-                    ),
-                    torch.zeros(
+                    )
+                else:
+                    out.zero_()
+                if residual_out is None:
+                    residual_out = torch.zeros(
                         input.shape[:-1] + (weight.numel(),),
                         dtype=input.dtype,
                         device=input.device,
-                    ),
-                )
+                    )
+                else:
+                    residual_out.zero_()
+                return out, residual_out
         else:
             return self.fused_ar_rms(
                 input,
                 residual_inp,
+                res_out=residual_out,
+                out=out,
                 w=weight,
                 eps=eps,
                 registered=False,
                 use_1stage=use_1stage,
                 out_hidden_dim=out_hidden_dim,
                 gemma_norm=gemma_norm,
+                num_norm_rows=num_norm_rows,
+                skip_residual=skip_residual,
             )
 
     def custom_fused_ar_rms_packed_input(
@@ -1977,11 +2521,12 @@ class CustomAllreduce:
         weight: torch.Tensor,
         eps: float,
         use_1stage: bool,
+        prefill_support: bool = False,
         gemma_norm: bool = False,
         emit_bf16: bool = False,
     ):
         # when custom allreduce is disabled, this will be None
-        if self.disabled or not self.should_custom_ar(input):
+        if self.disabled or not self.should_custom_ar(input, prefill_support):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
@@ -1990,7 +2535,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
                     gemma_norm=gemma_norm,
@@ -2034,7 +2579,9 @@ class CustomAllreduce:
         use_1stage: bool = False,
         emit_bf16: bool = False,
         transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
+        self._require_old_arch_fused_kernels("fused_ar_rms_per_group_quant")
         K = inp.shape[-1]
         # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
         # the C++ host dispatcher checks; catching it here surfaces a
@@ -2080,6 +2627,7 @@ class CustomAllreduce:
             use_1stage,
             bf16_ptr,
             transpose_scale,
+            gemma_norm,
         )
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
@@ -2093,6 +2641,7 @@ class CustomAllreduce:
         eps: float,
         registered: bool = False,
     ):
+        self._require_old_arch_fused_kernels("fused_qknorm_ar")
         dtype = qkv_in.dtype
         device = qkv_in.device
         hidden_dim_q = q_w.shape[-1]
@@ -2130,6 +2679,7 @@ class CustomAllreduce:
         eps: float,
         registered: bool = False,
     ):
+        self._require_old_arch_fused_kernels("fused_qknorm_ar_rope")
         dtype = qkv_in.dtype
         device = qkv_in.device
         hidden_dim_q = q_w.shape[-1]
@@ -2188,7 +2738,7 @@ class CustomAllreduce:
                     q_w,
                     k_w,
                     eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(qkv_in),
                 )
             else:
                 return (
@@ -2257,7 +2807,7 @@ class CustomAllreduce:
                     head_dim,
                     rotary_dim,
                     eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(qkv_in),
                 )
             else:
                 return (
@@ -2303,7 +2853,9 @@ class CustomAllreduce:
         registered: bool = False,
         use_1stage: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
+        self._require_old_arch_fused_kernels("fused_ar_rms_mxfp4_quant")
         K = inp.shape[-1]
         _validate_mxfp4_hidden_dim(K, inp.element_size())
         res_out = torch.empty_like(inp)
@@ -2333,6 +2885,7 @@ class CustomAllreduce:
             reg_bytes,
             use_1stage,
             bf16_ptr,
+            gemma_norm,
         )
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
@@ -2348,8 +2901,13 @@ class CustomAllreduce:
         use_1stage: bool = False,
         emit_bf16: bool = False,
         transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
-        if self.disabled or not self.should_custom_ar(input):
+        if (
+            self.disabled
+            or not self.has_old_arch_fused_kernels
+            or not self.should_custom_ar(input)
+        ):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
@@ -2359,10 +2917,11 @@ class CustomAllreduce:
                     w=weight,
                     eps=eps,
                     group_size=group_size,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                     transpose_scale=transpose_scale,
+                    gemma_norm=gemma_norm,
                 )
             else:
                 K = input.shape[-1]
@@ -2398,6 +2957,7 @@ class CustomAllreduce:
                 use_1stage=use_1stage,
                 emit_bf16=emit_bf16,
                 transpose_scale=transpose_scale,
+                gemma_norm=gemma_norm,
             )
 
     def custom_fused_ar_rms_mxfp4_quant(
@@ -2408,6 +2968,7 @@ class CustomAllreduce:
         eps: float,
         use_1stage: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -2418,9 +2979,10 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=self.enable_register_for_capturing,
+                    registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
+                    gemma_norm=gemma_norm,
                 )
             else:
                 K = input.shape[-1]
@@ -2448,6 +3010,7 @@ class CustomAllreduce:
             registered=False,
             use_1stage=use_1stage,
             emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
         )
 
     def close(self):

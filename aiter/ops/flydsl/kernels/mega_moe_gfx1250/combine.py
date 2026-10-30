@@ -95,9 +95,7 @@ def _make_combine_fused_sync(
         phase = fx.Int64(buffer_load(rsrc_xdb_flag, 0, vec_width=1, dtype=T.i64))
         # push this call's phase to every peer's shared xdb slot [rank]
         if tid < npes:
-            xdb_remote = fx.Int64(window.lsa_ptr(tid, off_xdb_mem)) + fx.Int64(
-                rank
-            ) * fx.Int64(8)
+            xdb_remote = fx.Int64(window.lsa_ptr(tid, off_xdb_mem)) + fx.Int64(rank) * 8
             comm_ops.store_i64_global_system(xdb_remote, phase)
         # advance the counter for the next call (single writer, no atomic)
         if tid == 0:
@@ -105,9 +103,9 @@ def _make_combine_fused_sync(
         # `>=` not `==`: a faster peer can lap us and overwrite its monotonic push
         # with a higher call count before we read it.
         if tid < npes:
-            xdb_peer_slot = fx.Int64(
-                window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(tid) * fx.Int64(8)
+            xdb_peer_slot = (
+                fx.Int64(window.lsa_ptr(my_lsa_rank, off_xdb_mem)) + fx.Int64(tid) * 8
+            )
             comm_ops.spin_until_ge_i64(xdb_peer_slot, phase)
 
     @flyc.jit
@@ -207,8 +205,17 @@ def _make_combine_fused_reduce(
     P_ROW_BYTES = C_CHK * IN_CHUNK_BYTES
     S_ROW_BYTES = C_CHK * (CHUNK_ELEMS // SCALE_BLOCK) if quant_bits else 0
     IN_SCALE_OFF = IN_ROWS * P_ROW_BYTES
+    IN_TILE = (IN_ROWS, P_ROW_BYTES)
+    # The scale plane keeps the old TDM atom, so it has no tile constant of its
+    # own: its row is C_CHK * 8 bytes, and _combine_tile picks C_CHK=1 whenever
+    # the hidden chunk count is odd -- hidden_dim=2304, topk=8, quant_bits=8
+    # gives an 8-byte row, under the 16-byte tile_dim0 span the tiled atom
+    # requires in the pinned flydsl. Only the payload and output planes use it.
+    # To restore, once the pin carries the relaxed span check: give this plane
+    # an (IN_ROWS, S_ROW_BYTES) tile and copy what IN_TILE does below.
     OUT_ROW_ELEMS = C_CHK * CHUNK_ELEMS
     OUT_ROW_BYTES = OUT_ROW_ELEMS * 2
+    OUT_TILE = (T_TOK, OUT_ROW_ELEMS)
     # Lane slots per iteration; one slot is ELEMS_PER_LANE elements of one token.
     SLOTS = T_TOK * OUT_ROW_ELEMS // ELEMS_PER_LANE
     SLOTS_PER_TOK = OUT_ROW_ELEMS // ELEMS_PER_LANE
@@ -338,8 +345,8 @@ def _make_combine_fused_reduce(
             address_space=fx.AddressSpace.Global,
             alignment=16,
         )
-        inp_iter = fx.inttoptr(i8_global, fx.Int64(addr_comb_inp))
-        out_iter = fx.inttoptr(i16_global, fx.Int64(addr_out))
+        inp_iter = fx.inttoptr(i8_global, addr_comb_inp)
+        out_iter = fx.inttoptr(i16_global, addr_out)
 
         def global_view(base, off, shape, stride):
             return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
@@ -350,11 +357,13 @@ def _make_combine_fused_reduce(
         def lds_in_view(s):
             return lds_view(
                 fx.recast_iter(p8_shared, in_buf_ptr(s)),
-                (IN_ROWS, P_ROW_BYTES),
-                (P_ROW_BYTES, 1),
+                (IN_TILE, 1),
+                ((P_ROW_BYTES, 1), IN_ROWS * P_ROW_BYTES),
             )
 
         def lds_scale_view(s):
+            # Flat 2-D: the scale plane stays on the old TDM atom (see the note
+            # at S_ROW_BYTES), whose fx.copy takes a plain view.
             return lds_view(
                 fx.recast_iter(p8_shared, in_buf_ptr(s) + IN_SCALE_OFF),
                 (IN_ROWS, S_ROW_BYTES),
@@ -364,8 +373,8 @@ def _make_combine_fused_reduce(
         def lds_out_view(s):
             return lds_view(
                 fx.recast_iter(p16_shared, out_buf_ptr(s)),
-                (T_TOK, OUT_ROW_ELEMS),
-                (OUT_ROW_ELEMS, 1),
+                (OUT_TILE, 1),
+                ((OUT_ROW_ELEMS, 1), T_TOK * OUT_ROW_ELEMS),
             )
 
         # Lane -> (token, chunk, element) decode, constant across iterations.
@@ -383,6 +392,9 @@ def _make_combine_fused_reduce(
         n_groups = (safe_tok + (T_TOK - 1)) // T_TOK
         total_work = n_groups * iters_per_tok
         last_work = total_work - 1
+
+        # Wave id is loop-invariant; read it once instead of per tile.
+        wave = fx.rocdl.wave_id()
 
         def tile_origin(work):
             grp = work // iters_per_tok
@@ -417,15 +429,24 @@ def _make_combine_fused_reduce(
             slot_off = fx.Int64(tok0) * fx.Int64(topk * slot_stride)
             g_off = slot_off + fx.Int64(q0) * fx.Int64(IN_CHUNK_BYTES)
             gt_in = global_view(
-                inp_iter, g_off, (IN_ROWS, P_ROW_BYTES), (slot_stride, 1)
+                inp_iter, g_off, (row_oob, P_ROW_BYTES), (slot_stride, 1)
             )
-            atom_in = fx.rocdl.make_tdm_atom(
+            atom_in, coord_in = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(),
                 gt_in,
-                [row_oob, None],
-                strides=[slot_stride, None],
+                fx.make_layout(IN_TILE, (P_ROW_BYTES, 1)),
+                IN_TILE,
                 num_warps=warp_num_per_block,
             )
-            fx.copy(atom_in, gt_in, lds_in_view(buf))
+            blk_in = fx.zipped_divide(coord_in, IN_TILE)[None, (0, None)]
+            tIs, tIg = fx.rocdl.cdna5.tdm_partition(
+                atom_in,
+                wave,
+                fx.make_layout(warp_num_per_block, 1),
+                lds_in_view(buf),
+                blk_in,
+            )
+            fx.copy(atom_in, tIg[None, 0], tIs[None, 0])
             if quant_bits and live is not False:
                 # The scale plane starts one payload plane into the slot.
                 g_off_s = (
@@ -451,7 +472,7 @@ def _make_combine_fused_reduce(
             for r in range_constexpr(ROUNDS):
                 t_off = lane_tok[r] * (topk * P_ROW_BYTES)
                 chunk_off = t_off + lane_chunk[r] * IN_CHUNK_BYTES
-                accs = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
+                accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
 
                 if quant_bits:
                     base_in = chunk_off + (
@@ -512,17 +533,29 @@ def _make_combine_fused_reduce(
             out_off = fx.Int64(tok0) * fx.Int64(hidden_dim) + fx.Int64(q0) * fx.Int64(
                 CHUNK_ELEMS
             )
-            gt_out = global_view(
-                out_iter, out_off, (T_TOK, OUT_ROW_ELEMS), (hidden_dim, 1)
-            )
             _toks_left = cur_rank_num_token - tok0
-            atom_out = fx.rocdl.make_tdm_atom(
+            gt_out = global_view(
+                out_iter,
+                out_off,
+                ((_toks_left > T_TOK).select(T_TOK, _toks_left), OUT_ROW_ELEMS),
+                (hidden_dim, 1),
+            )
+            atom_out, coord_out = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
                 gt_out,
-                [(_toks_left > T_TOK).select(T_TOK, _toks_left), None],
-                strides=[hidden_dim, None],
+                fx.make_layout(OUT_TILE, (OUT_ROW_ELEMS, 1)),
+                OUT_TILE,
                 num_warps=warp_num_per_block,
             )
-            fx.copy(atom_out, lds_out_view(buf), gt_out)
+            blk_out = fx.zipped_divide(coord_out, OUT_TILE)[None, (0, None)]
+            tOs, tOg = fx.rocdl.cdna5.tdm_partition(
+                atom_out,
+                wave,
+                fx.make_layout(warp_num_per_block, 1),
+                lds_out_view(buf),
+                blk_out,
+            )
+            fx.copy(atom_out, tOs[None, 0], tOg[None, 0])
 
         # Prime buffer 0. bid < block_num, so work // block_num is the trip count
         # and its parity picks the buffer -- trip 0 reads what this load writes.

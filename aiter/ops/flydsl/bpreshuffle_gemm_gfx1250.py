@@ -130,9 +130,12 @@ def run_preshuffle_gemm_a8_gfx1250(
             f"{split_k}*{tile_k}={split_k * tile_k}"
         )
     num_k_tiles = (K // split_k) // tile_k
-    if num_k_tiles < nb:
+    # K=128 with two buffers uses only the prologue and drain. Keep all
+    # other configurations at their existing minimum.
+    min_k_tiles = 1 if nb == 2 and K == tile_k == 128 else nb
+    if num_k_tiles < min_k_tiles:
         raise RuntimeError(
-            f"[FlyDSL gfx1250] {nb}-buffer pipeline needs >= {nb} K-tiles per "
+            f"[FlyDSL gfx1250] {nb}-buffer pipeline needs >= {min_k_tiles} K-tiles per "
             f"split-k chunk, got {num_k_tiles} (K={K}, split_k={split_k}, tile_k={tile_k})"
         )
     if split_k > 1:
@@ -156,15 +159,36 @@ def run_preshuffle_gemm_a8_gfx1250(
     lda = XQ.stride(0)
     ldc = Out.stride(0)
     partials = (
-        torch.empty((split_k, M, ldc), dtype=Out.dtype, device=Out.device)
+        torch.empty((split_k, M, ldc), dtype=torch.float32, device=Out.device)
         if split_k > 1
         else None
     )
     gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
 
+    gemm_spec = (
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        nb,
+        cluster_m,
+        cluster_n,
+        False,  # is_mxscale
+        SCALE_BLOCK_SIZE,
+        split_k,
+        False,  # batched
+        0,  # preload_ks
+        False,  # a_preshuffle
+        False,  # a_scale_preshuffled
+        False,  # b_scale_32x32
+        False,  # k_tail
+    )
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
-    _launch_gemm_a8w8(
+    _run_compiled(
+        _launch_gemm_a8w8,
         _ptr_arg(gemm_out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
@@ -177,29 +201,23 @@ def run_preshuffle_gemm_a8_gfx1250(
         0,
         lda,
         ldc,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        out_is_f16,
-        nb,
-        cluster_m,
-        cluster_n,
-        False,
-        SCALE_BLOCK_SIZE,
-        split_k,
+        *gemm_spec[:14],
+        1,  # batch (runtime)
+        *gemm_spec[14:],
+        specialization_key=gemm_spec,
     )
     if partials is not None:
         dense = ldc == N
         _run_compiled(
-            _compile_splitk_reduce(split_k=split_k, out_dtype_str=out_dtype),
+            _compile_splitk_reduce(
+                split_k=split_k, out_dtype_str=out_dtype, partial_dtype_str="f32"
+            ),
             _ptr_arg(partials),
             _ptr_arg(Out),
             M * N if dense else N,
             1 if dense else M,
             ldc,
-            M * ldc * Out.element_size(),
+            M * ldc * partials.element_size(),
             stream,
         )
     return Out

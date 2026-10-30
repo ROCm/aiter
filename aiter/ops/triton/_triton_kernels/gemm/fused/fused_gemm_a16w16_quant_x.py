@@ -4,9 +4,12 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
@@ -200,7 +203,7 @@ def _fused_gemm_a16w16_quant_x_kernel(
                 c_ptr
                 + stride_cm * offs_cm[:, None]
                 + stride_cn * offs_cn[None, :]
-                + pid_k * stride_ck
+                + pid_k.to(tl.int64) * stride_ck
             )
             if EVEN_MN:
                 tl.store(c_ptrs, c)
