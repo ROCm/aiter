@@ -53,10 +53,8 @@ _SMALL_D_ROWS_PER_WG = 1
 _SOURCE_PREFETCH_IN_FLIGHT = 3
 # Changing this constant requires _build_attn_res.cache_clear().
 _SOURCE_GROUP_SIZE = 2
-# Selects the butterfly in ``_wave_reduce_add_f32``, which only the
-# red_slots > 8 finish reduce still uses. "auto" resolves to "dpp" for one-wave
-# rows and "swizzle" otherwise. Changing this constant requires
-# _build_attn_res.cache_clear().
+# Butterfly used by ``_wave_reduce_add_f32``: "auto" | "swizzle" | "dpp".
+# Changing this constant requires _build_attn_res.cache_clear().
 _WAVE_REDUCE_MODE = "auto"
 _LOG2E = math.log2(math.e)
 _DPP_QUAD_XOR1 = 0xB1
@@ -266,9 +264,9 @@ def _build_attn_res(
     num_sources = num_blocks + 1
     write_block = block_write_idx >= 0
     prefetch_in_flight = min(_SOURCE_PREFETCH_IN_FLIGHT, max(num_blocks - 1, 0))
-    # One-wave rows have no cross-wave barrier to collapse. Mix-only rows put
-    # every source behind one barrier; with delta, snapshot, or output norm
-    # that is slower at large T, so those keep _SOURCE_GROUP_SIZE.
+    # One-wave rows have no cross-wave barrier. Mix-only rows put every source
+    # behind one barrier; rows with delta, snapshot, or output norm are slower
+    # that way at large T.
     mix_only = not (has_delta or write_block or apply_output_norm)
     if red_slots == 1:
         group_size = 1
@@ -278,8 +276,6 @@ def _build_attn_res(
         group_size = _SOURCE_GROUP_SIZE
     num_groups = (num_sources + group_size - 1) // group_size
     if _WAVE_REDUCE_MODE == "auto":
-        # One-wave rows reduce through the one-lane cascade and never reach
-        # the butterfly; the mode only names the kernel.
         wave_reduce_mode = "dpp" if red_slots == 1 else "swizzle"
     elif _WAVE_REDUCE_MODE in ("swizzle", "dpp"):
         wave_reduce_mode = _WAVE_REDUCE_MODE

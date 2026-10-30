@@ -34,8 +34,8 @@ _MAX_BLOCKS = 8
 _EPS = 1e-5
 _ATOL = 8e-2
 _RTOL = 3e-2
-# Measured cache-bypassed BF16 bandwidth floor from the PR (TB/s). gfx942 has
-# no measured floor, so its efficiency column stays empty.
+# Measured cache-bypassed BF16 bandwidth floor (TB/s). Arches without an entry
+# report no floor_us or efficiency.
 _FLOOR_BW_TBPS = {"gfx950": 6.26}
 _BF16_ULP_REL = 3.863e-3
 _SUPPORTED_GFX = ("gfx942", "gfx950")
