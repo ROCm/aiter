@@ -4,6 +4,7 @@
 
 import ast
 import functools
+import json
 import re
 import sys
 import unittest
@@ -106,12 +107,30 @@ Agent 3
         )
         self.assertEqual(profiles(base / "gfx1250-a0"), [(base / "gfx1250-a0", "")])
 
+    def test_all_profile_metadata_uses_current_local_kids(self):
+        sys.path.insert(0, str(ROOT / "csrc/opus_gemm"))
+        from opus_gemm_common import gfx1250_4wave_co_kernels_declared
+
+        expected = {
+            instance.name: kid
+            for kid, instance in gfx1250_4wave_co_kernels_declared.items()
+        }
+        base = ROOT / "csrc/opus_gemm/gen_co"
+        for relative in ("gfx1250", "gfx1250-a0", "named_reg/gfx1250"):
+            with self.subTest(profile=relative):
+                info = json.loads((base / relative / "build_info.json").read_text())
+                self.assertEqual(len(info["kernels"]), len(expected))
+                self.assertEqual(
+                    {entry["symbol"]: entry["kid"] for entry in info["kernels"]},
+                    expected,
+                )
+
     def test_launcher_does_not_pin_the_first_device(self):
         sys.path.insert(0, str(ROOT / "csrc/opus_gemm"))
         from codegen import gen_instances_gfx1250 as gen
         from opus_gemm_common import gfx1250_4wave_co_kernels_declared
 
-        k = gfx1250_4wave_co_kernels_declared[21016]
+        k = gfx1250_4wave_co_kernels_declared[496]
         cg = SimpleNamespace(
             impl_path="unused", _host_instantiations=[], _device_instantiations=[]
         )

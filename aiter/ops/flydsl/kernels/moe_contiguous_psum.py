@@ -17,6 +17,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32
 
+from aiter.ops.flydsl.kernels.herd_topk import _kept_routes
+from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -62,6 +64,14 @@ class _RoutePsumStorage:
     atomics -- to the ping-pong scan buffers of :class:`_PsumStorage`.
     """
 
+    cnt: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+
+
+@fx.struct
+class _RoutePsumHerdStorage:
+    pop: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     cnt: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
@@ -736,3 +746,179 @@ def build_moe_route_psum_fused_module():
     }
 
     return launch_route_psum_fused
+
+
+def build_moe_route_psum_herd_module(topk: int, has_num_valid_rows: bool = False):
+    """HERD drop + route + prefix sum over Top-(K+1) candidates in one block.
+
+    `has_num_valid_rows`: rows at or past the device count `num_valid_rows[0]`
+    are padding -- left out of the batch popularity, their routes written as
+    DROPPED_ROUTE_ROW with weight 0, so they claim no grouped row. Their
+    candidates are never read. Without it `num_valid_rows` is unread."""
+    kp1 = topk + 1
+
+    @flyc.kernel(
+        name=f"moe_route_psum_herd_k{topk}" + ("_nv" if has_num_valid_rows else ""),
+        known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
+    )
+    def route_psum_herd_kernel(
+        cand_ids: fx.Pointer,
+        cand_scores: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        masked_m: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        tokens: Int32,
+        experts: Int32,
+        max_m: Int32,
+        tile_m: Int32,
+        routed_scaling_factor: fx.Float32,
+        num_valid_rows: fx.Pointer,
+    ):
+        tid = fx.Uint32(fx.thread_idx.x)
+        tile_v = fx.Uint32(tile_m)
+        tile_minus_1 = tile_v - 1
+        valid_tokens = fx.Uint32(tokens)
+        if const_expr(has_num_valid_rows):
+            valid_tokens = fx.Uint32(
+                fx.min(tokens, fx.Int32(ptr_buf_tensor(num_valid_rows)[fx.Uint32(0)]))
+            )
+
+        lds = fx.SharedAllocator().allocate(_RoutePsumHerdStorage).peek()
+        lds_pop = lds.pop.ptr
+        lds_cnt = lds.cnt.ptr
+        lds0 = lds.lds0.ptr
+        lds1 = lds.lds1.ptr
+
+        ids_p = ptr_buf_tensor(cand_ids)
+        scores_p = ptr_buf_tensor(cand_scores, fx.Float32)
+        rows_p = ptr_buf_tensor(topids_to_rows)
+        w_p = ptr_buf_tensor(gather_w, fx.Float32)
+        m_p = ptr_buf_tensor(masked_m)
+        s_p = ptr_buf_tensor(starts)
+        p_p = ptr_buf_tensor(psum)
+
+        in_expert = tid < fx.Uint32(experts)
+        if in_expert:
+            lds_pop[tid] = fx.Int32(0)
+            lds_cnt[tid] = fx.Int32(0)
+        gpu.barrier()
+
+        n_cand = valid_tokens * fx.Uint32(kp1)
+        for cand in range(tid, n_cand, MAX_EXPERTS_PER_BLOCK):
+            e = ids_p[cand]
+            fx.atomic_add(lds_pop + e, fx.Int32(1), syncscope="workgroup")
+        gpu.barrier()
+
+        n_route = valid_tokens * fx.Uint32(topk)
+        if const_expr(has_num_valid_rows):
+            n_all_routes = fx.Uint32(tokens) * fx.Uint32(topk)
+            for route in range(n_route + tid, n_all_routes, MAX_EXPERTS_PER_BLOCK):
+                rows_p[route] = fx.Int32(DROPPED_ROUTE_ROW)
+                w_p[route] = fx.Float32(0.0)
+        for route in range(tid, n_route, MAX_EXPERTS_PER_BLOCK):
+            token = route // fx.Uint32(topk)
+            out_slot = fx.Int32(route - token * fx.Uint32(topk))
+            base = token * fx.Uint32(kp1)
+            ids = [fx.Int32(ids_p[base + j]) for j in range_constexpr(kp1)]
+            scores = [scores_p[base + j] for j in range_constexpr(kp1)]
+            pops = [fx.Int32(lds_pop[ids[j]]) for j in range_constexpr(kp1)]
+            keeps, ranks, weights = _kept_routes(
+                ids, scores, pops, routed_scaling_factor
+            )
+            e = ids[0]
+            w = weights[0]
+            for j in range_constexpr(kp1):
+                mine = keeps[j] & (ranks[j] == out_slot)
+                e = mine.select(ids[j], e)
+                w = mine.select(weights[j], w)
+            slot = fx.atomic_add(lds_cnt + e, fx.Int32(1), syncscope="workgroup")
+            rows_p[route] = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
+            w_p[route] = w
+        gpu.barrier()
+
+        if in_expert:
+            m = fx.Uint32(lds_cnt[tid])
+            lds0[tid] = (m + tile_minus_1) // tile_v * tile_v
+            m_p[tid] = m
+        gpu.barrier()
+
+        src = lds0
+        dst = lds1
+        for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
+            if const_expr((offset & (offset - 1)) != 0):
+                continue
+            if in_expert:
+                val = src[tid]
+                has_prev = tid >= offset
+                prev = fx.Int32(0)
+                if has_prev:
+                    prev = src[tid - offset]
+                dst[tid] = val + prev
+            gpu.barrier()
+            src, dst = dst, src
+
+        if in_expert:
+            is_not_first = tid != 0
+            start = fx.Int32(0)
+            if is_not_first:
+                start = src[tid - 1]
+            m_tid = lds_cnt[tid]
+            s_p[tid] = start
+            p_p[tid] = start + m_tid
+        gpu.barrier()
+
+        for route in range(tid, n_route, MAX_EXPERTS_PER_BLOCK):
+            row = fx.Uint32(rows_p[route])
+            m = fx.Uint32(max_m)
+            expert = row // m
+            slot = row - expert * m
+            start = fx.Uint32(s_p[expert])
+            rows_p[route] = start + slot
+
+    @flyc.jit
+    def launch_route_psum_herd(
+        cand_ids: fx.Pointer,
+        cand_scores: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        masked_m: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        tokens: fx.Int32,
+        experts: fx.Int32,
+        max_m: fx.Int32,
+        tile_m: fx.Int32,
+        routed_scaling_factor: fx.Float32,
+        num_valid_rows: fx.Pointer,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        route_psum_herd_kernel(
+            cand_ids,
+            cand_scores,
+            topids_to_rows,
+            gather_w,
+            masked_m,
+            starts,
+            psum,
+            tokens,
+            experts,
+            max_m,
+            tile_m,
+            routed_scaling_factor,
+            num_valid_rows,
+        ).launch(
+            grid=(1, 1, 1),
+            block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
+            stream=stream,
+        )
+
+    launch_route_psum_herd.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+
+    return launch_route_psum_herd

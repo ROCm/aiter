@@ -183,7 +183,6 @@ KARGS_NAME_MAP = {
 }
 
 
-
 def splitk_reduce_extra_device_instantiations():
     # gfx950 carries a second reduce kernel: the mmajor BMM reduce used by the
     # a8w8_mxscale BMM split-K launchers (VEC=8/BLOCK=128, explicit C strides,
@@ -3215,9 +3214,7 @@ def gen_mxscale_bpreshuffle_instance(
         grid_setup = f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
         if entry.get("grid_layout") in ("xcd", "linear"):
             grid_x = (
-                "((tiles + 7) / 8) * 8"
-                if entry["grid_layout"] == "xcd"
-                else "tiles"
+                "((tiles + 7) / 8) * 8" if entry["grid_layout"] == "xcd" else "tiles"
             )
             grid_setup += (
                 f"    const int tiles = ((m + {k.B_M - 1}) / {k.B_M}) * (n / {k.B_N});\n"
@@ -3279,7 +3276,8 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
             "traits_header", header.replace("_pipeline_", "_traits_", 1)
         )
         grid = (
-            "dim3(tiles_n, tiles_m)" if entry.get("grid_layout") == "n_m"
+            "dim3(tiles_n, tiles_m)"
+            if entry.get("grid_layout") == "n_m"
             else "dim3(Traits::XCD_ORDER ? (tiles + 7) / 8 * 8 : tiles)"
         )
         abi = "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950"

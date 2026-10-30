@@ -84,7 +84,10 @@ from codegen.gen_instances_gfx1250 import (
 # The _declared_ table, not the filtered one: opus_gemm_common drops entries
 # whose .co is not on disk (so nothing downstream can register an unlaunchable
 # kid), and this script exists to create exactly those files.
-from opus_gemm_common import gfx950_co_kernels_declared, gfx1250_4wave_co_kernels_declared
+from opus_gemm_common import (
+    gfx950_co_kernels_declared,
+    gfx1250_4wave_co_kernels_declared,
+)
 
 from aiter_worker_limits import (
     JOBS_CLI_HELP,
@@ -284,7 +287,9 @@ void {symbol}(opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950 kargs)
 
 def _check_gfx950_pin(entry, path, llvm_bin, *, fail_on_spill=False):
     fields = _kernel_metadata(
-        _tool(llvm_bin, "llvm-readelf"), path, entry["symbol"],
+        _tool(llvm_bin, "llvm-readelf"),
+        path,
+        entry["symbol"],
         ("agpr_count", "private_segment_fixed_size"),
     )
     if any(
@@ -345,30 +350,55 @@ def build_one_gfx950(entry, args, llvm_bin, workdir):
         if not reuse:
             stub_path = os.path.join(workdir, entry["name"] + ".hip")
             with open(stub_path, "w") as stream:
-                stream.write(_GFX950_STUB_TEMPLATE.format(
-                    traits_header=entry.get("traits_header", entry["pipeline_header"].replace("_pipeline_", "_traits_", 1)),
-                    pipeline_header=entry["pipeline_header"],
-                    traits_name=entry["traits"]["name"],
-                    traits_args=", ".join(entry["traits"]["args"]),
-                    body_func=entry["body_func"], body_args=", ".join(entry["body_args"]),
-                    symbol=symbol, lb_threads=entry["launch_bounds"][0],
-                    lb_waves=entry["launch_bounds"][1],
-                ))
+                stream.write(
+                    _GFX950_STUB_TEMPLATE.format(
+                        traits_header=entry.get(
+                            "traits_header",
+                            entry["pipeline_header"].replace(
+                                "_pipeline_", "_traits_", 1
+                            ),
+                        ),
+                        pipeline_header=entry["pipeline_header"],
+                        traits_name=entry["traits"]["name"],
+                        traits_args=", ".join(entry["traits"]["args"]),
+                        body_func=entry["body_func"],
+                        body_args=", ".join(entry["body_args"]),
+                        symbol=symbol,
+                        lb_threads=entry["launch_bounds"][0],
+                        lb_waves=entry["launch_bounds"][1],
+                    )
+                )
             env = dict(os.environ)
             if llvm_bin:
                 env["HIP_CLANG_PATH"] = llvm_bin
             print(f"[build_co] compiling {entry['image']}", flush=True)
-            proc = _run([
-                *shlex.split(args.hipcc), "-x", "hip", f"--offload-arch={args.offload_arch}",
-                "-std=c++20", "-O3", "-D__HIPCC_RTC__", "-DOPUS_ENABLE_RUNTIME_QUERY=0",
-                f"-I{_CSRC_DIR}/include", f"-I{_OPUS_GEMM_DIR}/include", *device_flags,
-                "--genco", "-o", staged, stub_path,
-            ], env=env)
+            proc = _run(
+                [
+                    *shlex.split(args.hipcc),
+                    "-x",
+                    "hip",
+                    f"--offload-arch={args.offload_arch}",
+                    "-std=c++20",
+                    "-O3",
+                    "-D__HIPCC_RTC__",
+                    "-DOPUS_ENABLE_RUNTIME_QUERY=0",
+                    f"-I{_CSRC_DIR}/include",
+                    f"-I{_OPUS_GEMM_DIR}/include",
+                    *device_flags,
+                    "--genco",
+                    "-o",
+                    staged,
+                    stub_path,
+                ],
+                env=env,
+            )
             if proc.stderr.strip():
                 sys.stderr.write(proc.stderr)
             _unbundle_if_needed(staged, llvm_bin, args.offload_arch)
         image = output if reuse else staged
-        resources = _check_gfx950_pin(entry, image, llvm_bin, fail_on_spill=args.fail_on_spill)
+        resources = _check_gfx950_pin(
+            entry, image, llvm_bin, fail_on_spill=args.fail_on_spill
+        )
         if resources["kernarg_segment_size"] != 96:
             raise ValueError(f"gfx950 kid {entry['kid']} requires a 96-byte kernel ABI")
         target = _elf_target_metadata(image, args.offload_arch)
@@ -378,16 +408,28 @@ def build_one_gfx950(entry, args, llvm_bin, workdir):
         if not reuse:
             os.replace(staged, output)
         return {
-            "kid": entry["kid"], "name": entry["name"], "image": entry["image"],
-            "symbol": symbol, "status": "ready", "co_sha256": checksum,
-            **target, **linked, **resources,
+            "kid": entry["kid"],
+            "name": entry["name"],
+            "image": entry["image"],
+            "symbol": symbol,
+            "status": "ready",
+            "co_sha256": checksum,
+            **target,
+            **linked,
+            **resources,
         }
     except subprocess.CalledProcessError as error:
         diagnostics = (error.stdout or "") + (error.stderr or "")
         sys.stderr.write(diagnostics)
         if not entry.get("pin_variant"):
-            raise SystemExit(f"build_co: compilation failed for gfx950 kid {entry['kid']}") from error
-        return {"kid": entry["kid"], "status": "rejected", "reason": diagnostics.strip()}
+            raise SystemExit(
+                f"build_co: compilation failed for gfx950 kid {entry['kid']}"
+            ) from error
+        return {
+            "kid": entry["kid"],
+            "status": "rejected",
+            "reason": diagnostics.strip(),
+        }
     except ValueError as error:
         return {"kid": entry["kid"], "status": "rejected", "reason": str(error)}
 
@@ -842,13 +884,20 @@ def main():
         help="comma-separated exact CO kids to rebuild (default: all); "
         "use a separate --out-dir for a subset",
     )
-    p.add_argument("--skip-existing", action="store_true", help="gfx950: validate and reuse existing COs")
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="gfx950: validate and reuse existing COs",
+    )
     p.add_argument("--report", help="gfx950: optional build_info.json output path")
     p.add_argument("--keep-temps", action="store_true")
     args = p.parse_args()
 
     args.offload_arch = args.offload_arch or args.arch
-    if args.offload_arch != args.arch and (args.arch, args.offload_arch) != ("gfx1250", "gfx1250-strict"):
+    if args.offload_arch != args.arch and (args.arch, args.offload_arch) != (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
         p.error("--offload-arch does not match --arch")
     if not args.out_dir:
         args.out_dir = _default_co_output_dir(args.arch, args.offload_arch)
@@ -857,24 +906,36 @@ def main():
     llvm_bin = os.path.abspath(args.llvm_bin) if args.llvm_bin else ""
     print(f"[build_co] clang from: {llvm_bin or '(PATH / hipcc default)'}")
 
-    table = gfx950_co_kernels_declared if args.arch == "gfx950" else gfx1250_4wave_co_kernels_declared
+    table = (
+        gfx950_co_kernels_declared
+        if args.arch == "gfx950"
+        else gfx1250_4wave_co_kernels_declared
+    )
     selected = set(table)
     if args.kids:
         try:
-            selected = {int(kid.strip()) for token in args.kids for kid in token.split(",")}
+            selected = {
+                int(kid.strip()) for token in args.kids for kid in token.split(",")
+            }
         except ValueError:
             p.error("--kids must contain integer CO kids separated by spaces or commas")
         unknown = selected - set(table)
         if unknown:
             p.error(f"unknown CO kids: {sorted(unknown)}")
-    instances = [entry for kid, entry in table.items() if kid in selected and
-                 (args.arch == "gfx950" or entry.kernel_tag in _PIPELINE_HEADERS)]
+    instances = [
+        entry
+        for kid, entry in table.items()
+        if kid in selected
+        and (args.arch == "gfx950" or entry.kernel_tag in _PIPELINE_HEADERS)
+    ]
     if not instances:
         raise SystemExit(f"build_co: no pre-compiled entries for {args.arch}")
     build = build_one_gfx950 if args.arch == "gfx950" else build_one
     jobs = get_worker_count_for(len(instances), args.jobs)
 
-    workdir = tempfile.mkdtemp(prefix="opus_build_co_", dir=args.out_dir if args.arch == "gfx950" else None)
+    workdir = tempfile.mkdtemp(
+        prefix="opus_build_co_", dir=args.out_dir if args.arch == "gfx950" else None
+    )
     try:
         if jobs == 1:
             built = [build(k, args, llvm_bin, workdir) for k in instances]
@@ -924,7 +985,9 @@ def main():
         ],
         "kernels": built,
     }
-    info_path = (args.report if args.arch == "gfx950" else None) or os.path.join(args.out_dir, "build_info.json")
+    info_path = (args.report if args.arch == "gfx950" else None) or os.path.join(
+        args.out_dir, "build_info.json"
+    )
     with open(info_path, "w") as f:
         json.dump(info, f, indent=2, sort_keys=True)
         f.write("\n")

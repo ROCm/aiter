@@ -331,27 +331,29 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
     {
         PL selfv = *reinterpret_cast<const PL*>(&in[2 * pk]);
         AL acc;
-#pragma unroll
-        for(int j = 0; j < LP; ++j)
-            acc[j] = upcast_s(selfv[j]);
 
-        for(int r = 1; r < ngpus; ++r)
+        // Sum in rank order, with the local value at its own rank, so every
+        // receiver rounds the same element the same way.
+        for(int r = 0; r < ngpus; ++r)
         {
-            int                   peer = (rank + r) % ngpus;
-            volatile LLPackedMsg* src  = myBase + (size_t)peer * slot;
-            uint32_t d0, f0, d1, f1;
-            do
+            PL pv = selfv;
+            if(r != rank)
             {
-                ll_load_b128(
-                    reinterpret_cast<const uint32_t*>(const_cast<LLPackedMsg*>(&src[pk])),
-                    d0, f0, d1, f1);
-            } while(f0 != flag || f1 != flag);
+                volatile LLPackedMsg* src = myBase + (size_t)r * slot;
+                uint32_t d0, f0, d1, f1;
+                do
+                {
+                    ll_load_b128(
+                        reinterpret_cast<const uint32_t*>(const_cast<LLPackedMsg*>(&src[pk])),
+                        d0, f0, d1, f1);
+                } while(f0 != flag || f1 != flag);
 
-            const uint32_t w[2] = {d0, d1};
-            PL             pv   = *reinterpret_cast<const PL*>(w);
+                const uint32_t w[2] = {d0, d1};
+                pv                  = *reinterpret_cast<const PL*>(w);
+            }
 #pragma unroll
             for(int j = 0; j < LP; ++j)
-                acc[j] += upcast_s(pv[j]);
+                acc[j] = r == 0 ? upcast_s(pv[j]) : acc[j] + upcast_s(pv[j]);
         }
 
         PL ov;
@@ -435,8 +437,8 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        // Sum in rank order so every rank gets the same bits.
+        ptrs[i] = (const P*)_input_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     int aligned_size = (size / unroll) * unroll;
@@ -925,8 +927,8 @@ __global__ void __launch_bounds__(512, 1) rs_gfx1250_split_first_dim(
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int idx = tid; idx < range; idx += stride)
@@ -967,8 +969,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_lastdim_naive(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const T*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const T*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1004,8 +1006,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_lastdim(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1052,8 +1054,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim_naive(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const T*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const T*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1090,8 +1092,8 @@ __global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim(
 #pragma unroll
     for(int i = 0; i < ngpus; ++i)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
     for(int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1357,6 +1359,28 @@ public:
         return ptrs;
     }
 
+    // IPC transport: the same buffers as hipIpc handles plus offsets. A handle
+    // covers the whole allocation that contains the pointer, so the offset
+    // into that allocation travels alongside.
+    std::pair<std::vector<uint8_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta()
+    {
+        auto ptrs      = get_graph_buffer_ptrs();
+        auto handle_sz = sizeof(hipIpcMemHandle_t);
+        std::vector<uint8_t> handles(handle_sz * ptrs.size(), 0);
+        std::vector<int64_t> offsets(ptrs.size());
+        for(size_t i = 0; i < ptrs.size(); i++)
+        {
+            void* base_ptr;
+            if(hipPointerGetAttribute(&base_ptr,
+                                      HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                      (hipDeviceptr_t)ptrs[i]) != hipSuccess)
+                throw std::runtime_error("failed to get the allocation of a graph buffer");
+            HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
+            offsets[i] = ptrs[i] - (int64_t)base_ptr;
+        }
+        return {handles, offsets};
+    }
+
     void check_rank_data_capacity(size_t num = 1)
     {
         if(d_rank_data_base_ + num > d_rank_data_end_)
@@ -1454,25 +1478,6 @@ public:
                                  " is not registered!");
     }
 
-    RankData* get_output_buffer_RD(hipStream_t stream, void* output)
-    {
-        auto it = output_buffers_.find(output);
-        if(it != output_buffers_.end())
-            return it->second;
-        hipStreamCaptureStatus status;
-        HIP_CALL(hipStreamIsCapturing(stream, &status));
-        if(status == hipStreamCaptureStatusActive)
-        {
-            auto ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size() +
-                        graph_unreg_output_buffers_.size();
-            graph_unreg_output_buffers_.push_back(output);
-            return ptrs;
-        }
-        throw std::runtime_error("output buffer address " +
-                                 std::to_string(reinterpret_cast<uint64_t>(output)) +
-                                 " is not registered!");
-    }
-
     // gfx1250: receive direct device pointers per rank per buffer.
     // ptrs_per_rank[rank_j] points to a flat array of int64_t device pointers,
     // one per buffer (inputs first, then outputs), in the same order as
@@ -1506,6 +1511,30 @@ public:
         d_rank_data_base_ += total_buffers;
         graph_unreg_input_buffers_.clear();
         graph_unreg_output_buffers_.clear();
+    }
+
+    // IPC transport overload: handles_per_rank[j] and offsets_per_rank[j] are
+    // rank j's get_graph_buffer_ipc_meta output. Each peer handle is opened
+    // once (open_ipc_handle caches it) and resolved to a pointer here.
+    void register_graph_buffers(const void* const* handles_per_rank,
+                                const int64_t* const* offsets_per_rank)
+    {
+        auto total_buffers =
+            graph_unreg_input_buffers_.size() + graph_unreg_output_buffers_.size();
+        check_rank_data_capacity(total_buffers);
+        std::vector<std::vector<int64_t>> ptrs(world_size_,
+                                               std::vector<int64_t>(total_buffers));
+        std::vector<const int64_t*> ptrs_per_rank(world_size_);
+        for(int j = 0; j < world_size_; j++)
+        {
+            for(size_t i = 0; j != rank_ && i < total_buffers; i++)
+            {
+                auto* handle = (const hipIpcMemHandle_t*)handles_per_rank[j] + i;
+                ptrs[j][i]   = (int64_t)(open_ipc_handle(handle) + offsets_per_rank[j][i]);
+            }
+            ptrs_per_rank[j] = ptrs[j].data();
+        }
+        register_graph_buffers(ptrs_per_rank.data());
     }
 
     template <typename T>
@@ -1626,16 +1655,15 @@ public:
                    T* input,
                    T* output,
                    int size,
-                   bool use_new                 = true,
-                   bool is_broadcast_reg_outptr = false)
+                   bool use_new = true)
     {
         auto d = 16 / sizeof(T);
         if(size % d != 0)
             throw std::runtime_error(
                 "custom allreduce requires input length to be multiple of " + std::to_string(d));
 
-        // LL small-message fast lane: bytes <= kLLArMaxBytes (128 KiB) route to
-        // the flag-in-data kernel, which reads input locally and pushes to the
+        // LL small-message fast lane: bytes <= kLLArMaxBytes route to the
+        // flag-in-data kernel, which reads input locally and pushes to the
         // shared peer scratch — no registered peer-input table (_input_dp) is
         // needed, so branch before get_buffer_RD.
         const size_t bytes = (size_t)size * sizeof(T);
@@ -1645,10 +1673,9 @@ public:
             return;
         }
 
+        // The kernel reads the peers' inputs and writes only this rank's output,
+        // so a captured all-reduce registers its input alone.
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        RankData* output_ptrs = nullptr;
-        if(is_broadcast_reg_outptr)
-            output_ptrs = get_output_buffer_RD(stream, output);
 
         size /= d;
 
@@ -1657,7 +1684,7 @@ public:
                               (size + threads * 4 - 1) / (threads * 4));
 #define LAUNCH_AR(NG) \
         ar_gfx1250_naive_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
-            input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size)
+            input_ptrs, nullptr, sg_, self_sg_, output, rank_, size)
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_AR);
 #undef LAUNCH_AR
     }

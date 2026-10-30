@@ -359,6 +359,8 @@ def _run_grouped_via_fused_moe(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     use_bias: bool = True,
+    bias_dtype: torch.dtype = torch.float32,
+    bias_column_pattern: bool = False,
     bench: bool = False,
     kernel_bench: bool = False,
     seed: int = 0,
@@ -427,7 +429,20 @@ def _run_grouped_via_fused_moe(
         generator=generator,
     )
     if use_bias:
-        if data_init == "constant":
+        if bias_column_pattern:
+            # Exact binary fractions vary across experts, lanes and N tiles.
+            # A missing tile offset or wrong bias dtype cannot hide behind a
+            # constant bias, and the reference uses these same logical values.
+            expert_bias = torch.arange(experts, dtype=torch.float32)[:, None] / 8
+            bias1 = (
+                expert_bias
+                + torch.arange(2 * inter, dtype=torch.float32)[None, :] / 512
+                + 0.25
+            )
+            bias2 = (
+                expert_bias + torch.arange(K, dtype=torch.float32)[None, :] / 256 + 0.5
+            )
+        elif data_init == "constant":
             bias1 = torch.full((experts, 2 * inter), 0.5)
             bias2 = torch.full((experts, K), 0.5)
         else:
@@ -435,6 +450,7 @@ def _run_grouped_via_fused_moe(
                 torch.randn((experts, 2 * inter), generator=generator) * 1e-3
             ).float()
             bias2 = (torch.randn((experts, K), generator=generator) * 1e-3).float()
+        bias1, bias2 = bias1.to(bias_dtype), bias2.to(bias_dtype)
     else:
         bias1 = torch.zeros((experts, 2 * inter))
         bias2 = torch.zeros((experts, K))
@@ -658,6 +674,8 @@ def run_moe(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     use_bias: bool = True,
+    bias_dtype: torch.dtype = torch.float32,
+    bias_column_pattern: bool = False,
     tol: float = VERIFY_TOL_A4W4,
     raise_on_fail: bool = True,
     bench: bool = False,
@@ -700,6 +718,8 @@ def run_moe(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             use_bias=use_bias,
+            bias_dtype=bias_dtype,
+            bias_column_pattern=bias_column_pattern,
             bench=bench,
             kernel_bench=kernel_bench,
             seed=seed,
@@ -972,6 +992,55 @@ def test_grouped_a4w4_situv2_kimi_k3_tp8_matches_torch_ref(tokens):
     )
 
 
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+def test_kimi_tp_route_histogram_public_path(data_format, monkeypatch):
+    """Wide expert dispatch changes only routing, through the real fused_moe API."""
+    _require_gfx1250()
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_module,
+    )
+
+    selected = []
+    getter = moe_kernels._get_compiled_topids_to_rows_lds
+
+    def counted(experts):
+        selected.append(experts)
+        return getter(experts)
+
+    monkeypatch.setattr(moe_kernels, "_get_compiled_topids_to_rows_lds", counted)
+    if data_format == "a8w4":
+        monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    else:
+        monkeypatch.delenv("AITER_FORCE_A8W4", raising=False)
+    shape = {
+        "experts": 896,
+        "tokens": 513,
+        "topk": 16,
+        "model_dim": 3584,
+        "inter_dim": 384,
+        "data_format": data_format,
+        "activation": ActivationType.Situv2,
+        "use_bias": False,
+        "seed": 19,
+        "data_init": "uniform",
+        "scale_init": "auto",
+    }
+    result, reference, _, _ = _run_grouped_via_fused_moe(**shape)
+    assert 896 in selected, "wide ordinary-TP histogram was not reached"
+    assert _logits_diff(result, reference) < LOGITS_DIFF_TOL
+
+    # Compare with the real original route kernel, not a mocked GEMM. The
+    # fixture recreates identical seeded inputs and all downstream operations.
+    original_router = build_moe_topids_to_rows_module()
+    monkeypatch.setattr(
+        moe_kernels, "_get_compiled_topids_to_rows_lds", lambda experts: original_router
+    )
+    baseline, baseline_ref, _, _ = _run_grouped_via_fused_moe(**shape)
+    torch.testing.assert_close(reference, baseline_ref, rtol=0, atol=0)
+    torch.testing.assert_close(result, baseline, rtol=0, atol=0)
+
+
 # The same shape with a GEMM2 k-tile that 384 does not divide, as a tuned row or
 # AITER_TDM_TILE_K2 may pick: 256 runs one full tile and a 128-wide tail, 512 a
 # single ragged tile (K < tile_k). 20000 tokens are past the table, so the other
@@ -989,6 +1058,22 @@ def test_grouped_a4w4_situv2_kimi_k3_tp8_k_tail_matches_torch_ref(tile_k2, monke
         inter_dim=384,
         activation=ActivationType.Situv2,
         use_bias=False,
+        check_aot_cache=False,
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 16])
+def test_grouped_swiglu_m3_tp_decode(tokens):
+    # MiniMax-M3 per-rank TP4 shape (128 routed + 1 shared expert, top-5) at
+    # decode, where the TP path routes all tokens in one fused launch.
+    run_moe(
+        "a4w4",
+        experts=129,
+        tokens=tokens,
+        topk=5,
+        model_dim=6144,
+        inter_dim=768,
+        activation=ActivationType.Swiglu,
         check_aot_cache=False,
     )
 
@@ -1277,13 +1362,15 @@ def _run_csv_file(args, csv_path: str) -> None:
                 flush=True,
             )
             continue
-        # A gemm1 bias turns off gemm1's own requantization, and the stage-2
-        # quant that replaces it needs inter_dim % 256 == 0 (Kimi-K3 at TP8 has
-        # 384 and no bias).
-        if not args.no_bias and inter_dim % 256:
+        # Bias does not disable the fused requant epilogue. Only explicitly
+        # selecting the standalone quant path imposes its 256-column bound.
+        disable_requant = os.environ.get(
+            "AITER_FLYDSL_DISABLE_GEMM1_REQUANT", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        if disable_requant and inter_dim % 256:
             print(
-                f"[csv] row {idx}: skipped inter_dim={inter_dim} with a bias "
-                "(needs inter_dim % 256 == 0; pass --no-bias)",
+                f"[csv] row {idx}: skipped inter_dim={inter_dim} without fused "
+                "requant (needs inter_dim % 256 == 0)",
                 flush=True,
             )
             continue

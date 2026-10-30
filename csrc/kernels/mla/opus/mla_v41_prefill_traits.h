@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 #include <opus/dtypes.hpp>
+
+#include "mla_v41_prefill_kargs.h"
 
 using bf16_t = opus::dtypes::bf16;
 using fp8_t  = _BitInt(8);
@@ -87,5 +90,64 @@ struct opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits {
 
     static constexpr int smem_bytes() {
         return 2 * smem_kv_bytes + 2 * smem_scale_bytes + smem_v_bytes + smem_p_bytes + smem_fac_bytes;
+    }
+};
+
+// 16mx1_16nx4: the four waves split the KV tile and share the 16-head Q tile, for H <= 16.
+template<int Q_TILE_SIZE_ = 16,
+         int KV_TILE_SIZE_ = 64,
+         int NUM_WARPS_ = 4,
+         typename D_ATTN_ = fp8_t,
+         typename D_PV_ = bf16_t,
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
+struct opus_mla_v41_prefill_a8w8_16mx1_16nx4_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs>,
+                                          opus_mla_v41_prefill_kargs>;
+
+    static constexpr int WARP_SIZE = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    static constexpr int D_HEAD_SIZE = 512;
+    static constexpr int D_SCALE_BLOCK = 32;
+    static constexpr int D_SCALE_SIZE = D_HEAD_SIZE / D_SCALE_BLOCK;
+
+    using D_ATTN = D_ATTN_;
+    using D_PV   = D_PV_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    static constexpr int T_M = 1;
+    static constexpr int T_N = NUM_WARPS;
+    static constexpr int T_K = 1;
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K_QK = 128;
+    static constexpr int W_K_PV = 32;
+
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_HEAD_SIZE / W_K_QK;
+
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = D_HEAD_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K_PV;
+
+    static constexpr int VEC_Q    = 16;
+    static constexpr int VEC_KV   = 16;
+    static constexpr int VEC_TR_V = 4;
+    static constexpr int VEC_O    = 4;
+
+    // bf16 V tile staged row per key.
+    static constexpr int SMEM_KV_PAD = 16;
+    static constexpr int SMEM_KV_ROW = D_HEAD_SIZE + SMEM_KV_PAD;
+
+    static constexpr int smem_bytes() {
+        return KV_TILE_SIZE * SMEM_KV_ROW * sizeof(D_PV) + T_N * W_M * sizeof(D_ACC) + T_N * W_M * W_N * sizeof(D_PV);
     }
 };

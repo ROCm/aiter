@@ -112,19 +112,19 @@ class NamedRegisterEvidenceTests(unittest.TestCase):
             builder._named_register_stats(separate)
 
     def test_expected_fragment_banks(self):
-        instance = builder.gfx1250_4wave_co_kernels_declared[21016]
+        instance = builder.gfx1250_4wave_co_kernels_declared[496]
         tuples = builder._expected_named_tuples(instance, [])
         self.assertEqual(len(tuples), 32)
         self.assertIn("v[256:263]", tuples)
         self.assertIn("v[504:511]", tuples)
 
     def test_overlapping_experimental_a_c_banks_are_rejected(self):
-        instance = builder.gfx1250_4wave_co_kernels_declared[21316]
+        instance = builder.gfx1250_4wave_co_kernels_declared[715]
         with self.assertRaises(SystemExit):
             builder._expected_named_tuples(instance, ["-DOPUS_C_BF16F32=1"])
 
     def test_wmma_producer_must_use_the_named_accumulator_bank(self):
-        instance = builder.gfx1250_4wave_co_kernels_declared[21016]
+        instance = builder.gfx1250_4wave_co_kernels_declared[496]
         good = "v_wmma_f32_16x16x32_bf16 v[0:7] /*v[256:263]*/, v[8:15]\n"
         result = builder._check_wmma_placement(good, instance, [])
         self.assertTrue(result["wmma_placement_checked"])

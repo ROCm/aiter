@@ -73,6 +73,7 @@ _TUNED = [
     (32, 7168, 2048, 32, 32, 64, 8, 1, 2, 1, 1, 0, False),
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
 ]
+_CONCURRENT_COPY_MNK = [(8192, 8192, 128)]
 
 
 def _policy(hti):
@@ -209,6 +210,62 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     return ret
 
 
+@benchmark()
+def test_hgemm_concurrent_copy(m, n, k, dtype):
+    # The HTI tail LDS race shows only with exactly two K tiles (no main loop) and
+    # memory traffic from another stream. Without split-K the output is
+    # deterministic, so every launch must match the idle-GPU output bitwise.
+    tile = {
+        "block_m": 256,
+        "block_n": 256,
+        "block_k": k // 2,
+        "stages": 2,
+        "split_k": 1,
+        "m_waves": 2,
+        "n_waves": 4,
+        "k_waves": 1,
+        "group_m": 0,
+    }
+    torch.manual_seed(SEED)
+    a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    golden = flydsl_hgemm(a, w, **tile, policy="hti")
+    atol, rtol = _atol_rtol(k, 1, 1, dtype)
+    err = checkAllclose(
+        run_torch(a, w, dtype).to(dtypes.fp32),
+        golden.to(dtypes.fp32),
+        rtol=rtol,
+        atol=atol,
+        msg="flydsl: idle hgemm",
+    )
+
+    side_stream = torch.cuda.Stream()
+    src = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+    dst = torch.empty_like(src)
+    out = torch.empty_like(golden)
+    launches = 1000
+    bad_launches = torch.zeros((), dtype=torch.int64, device="cuda")
+    for _ in range(launches):
+        with torch.cuda.stream(side_stream):
+            dst.copy_(src)
+        out.fill_(float("nan"))
+        flydsl_hgemm(a, w, out=out, **tile, policy="hti")
+        bad_launches += (out != golden).any()
+    torch.cuda.synchronize()
+    bad = bad_launches.item()
+    assert bad == 0, f"{bad} of {launches} launches differ from the idle-GPU output"
+    return {
+        "gfx": get_gfx(),
+        "tile": (
+            f"{tile['block_m']}x{tile['block_n']}x{tile['block_k']}"
+            f"s{tile['stages']}"
+        ),
+        "flydsl err": err,
+        "launches": launches,
+        "bad launches": bad,
+    }
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -241,7 +298,7 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=_default_mnk(),
+        default=_default_mnk() + _CONCURRENT_COPY_MNK,
         help="""Shape of mnk.
         e.g.:   -s 128,4096,4096
                 --mnk 32,384,7168""",
@@ -257,6 +314,12 @@ def main():
                 continue
             rows.append(test_hgemm(m, n, k, dtype, policy, split_k))
         summarize(f"flydsl_hgemm {dtype}", rows)
+        rows = [
+            test_hgemm_concurrent_copy(m, n, k, dtype)
+            for m, n, k in _CONCURRENT_COPY_MNK
+            if (m, n, k) in wanted
+        ]
+        summarize(f"flydsl_hgemm {dtype} with a concurrent copy", rows)
 
 
 if __name__ == "__main__":
