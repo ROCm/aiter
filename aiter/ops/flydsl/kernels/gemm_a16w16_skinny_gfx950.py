@@ -180,7 +180,6 @@ def compile_gemm_a16w16_skinny_gfx950(
         a_rsrc = buffer_ops.create_buffer_resource_from_addr(
             fx.Int64(ptrtoint(A)), num_records_bytes=a_bytes
         )
-        b_rsrc = buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(B)))
         c_rsrc = buffer_ops.create_buffer_resource_from_addr(
             fx.Int64(ptrtoint(C)), num_records_bytes=c_bytes
         )
@@ -202,6 +201,18 @@ def compile_gemm_a16w16_skinny_gfx950(
             n0 = fx.Index(fx.block_idx.x) * TN
         k0 = wid * KS
 
+        # B is based at this workgroup's N slab, not at the tensor: the DMA's
+        # voffset is one 32-bit VGPR, so a tensor-based descriptor wraps as soon
+        # as n0 * k * 2 passes 2 GiB (the offset is cast to a SIGNED i32) and the
+        # load reads whatever happens to be mapped there. Folding n0 into the
+        # 64-bit base leaves the voffset at most TN * k * 2 bytes to span, which
+        # no supported config comes near, and num_records then bounds the slab
+        # exactly -- a future offset bug returns zeros instead of faulting.
+        b_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            fx.Int64(ptrtoint(B)) + fx.Int64(n0) * (k * 2),
+            num_records_bytes=TN * k * 2,
+        )
+
         buf_i64 = fx.Int64(fx.ptrtoint(buf_ptr))
         wave_off = rocdl.readfirstlane(
             T.i64,
@@ -219,7 +230,8 @@ def compile_gemm_a16w16_skinny_gfx950(
             if const_expr(i < A_INSTS):
                 g = (r * k + k0 + c * DMA_VEC) * 2
             else:
-                g = ((n0 + (r - TA)) * k + k0 + c * DMA_VEC) * 2
+                # relative to b_rsrc, which is already based at slab n0
+                g = ((r - TA) * k + k0 + c * DMA_VEC) * 2
             return arith.index_cast(T.i32, g)
 
         vofs = [None] * IPC
@@ -424,6 +436,12 @@ def gemm_a16w16_skinny(
         raise ValueError(
             f"expected a[m, k] and b[n, k], got {tuple(a.shape)} and {tuple(b.shape)}"
         )
+    # the launch below hands the kernel raw pointers, so a host tensor reaching
+    # it is a GPU memory fault, not a Python error
+    if a.device.type != "cuda" or b.device != a.device:
+        raise ValueError(
+            f"a and b must be on one CUDA device, got {a.device} and {b.device}"
+        )
     m, k = a.shape
     n = b.shape[0]
     err = skinny_config_error(n, k, block_m, block_n, block_k, stages, k_waves)
@@ -437,8 +455,15 @@ def gemm_a16w16_skinny(
         b = b.contiguous()
     if out is None:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
-    elif out.shape != (m, n) or out.dtype != torch.bfloat16 or not out.is_contiguous():
-        raise ValueError(f"out must be a contiguous bf16 [{m}, {n}] tensor")
+    elif (
+        out.shape != (m, n)
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or out.device != a.device
+    ):
+        raise ValueError(
+            f"out must be a contiguous bf16 [{m}, {n}] tensor on {a.device}"
+        )
     exe = compile_gemm_a16w16_skinny_gfx950(
         int(n),
         int(k),
