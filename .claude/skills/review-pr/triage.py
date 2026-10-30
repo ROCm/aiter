@@ -431,7 +431,7 @@ def aot_symbol_table(root):
       name similarity  what sibling_variants already does, which is why A1 never caught
                        this: `parse_csv` and `resolve_flydsl_stage1_tile_n` share nothing.
       directory mirror aot/flydsl/X.py <-> ops/flydsl/X_kernels.py does not hold.
-                       chunk_gdn_h.py imports kernels.gdr_prefill and kernels.tensor_shim
+                       chunk_gdn_h.py imports kernels.gdn_prefill and kernels.tensor_shim
                        and there is no chunk_gdn_h_kernels.py; gemm.py alone imports 11
                        ops-side modules. The mirror is a coincidence on three files.
 
