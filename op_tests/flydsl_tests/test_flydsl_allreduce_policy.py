@@ -975,7 +975,7 @@ def test_fused_ladder_file_env_override(tmp_path):
 @pytest.mark.parametrize("cell", CELLS)
 def test_fused_oneshot_max_bytes_is_the_window_max(cell):
     link, ws, arch = cell
-    want = _fused_row(*cell).window(ONESHOT, quantized=False).max - 1
+    want = _fused_row(*cell).window(ONESHOT, quantized=False).inclusive_range()[1]
     got = resolve_fused_oneshot_max_bytes(world_size=ws, link=link, arch=arch)
     assert got == want
 

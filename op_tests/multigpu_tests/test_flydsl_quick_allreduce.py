@@ -2816,6 +2816,245 @@ def test_quick_allreduce_rmsnorm_mesh_pinned_st_is_bit_exact(
     return _fused_summary(rows)
 
 
+# The width the fused first-call-in-capture spawn declares up front.
+FUSED_CAPTURE_HIDDEN = 4096
+FUSED_CAPTURE_EPS = 0.5
+
+
+def _capture_first_fused_rank(rank: int, tp: int, init_method: str) -> dict:
+    """One rank of the fused first-call-in-capture spawn.
+
+    Stands up the production ``QuickAllReduce`` with ``AITER_FLY_AR=1``,
+    ``AITER_QUICK_REDUCE_QUANTIZATION=INT4`` and
+    ``AITER_FLY_AR_FUSED_HIDDENS=FUSED_CAPTURE_HIDDEN``, and makes no eager
+    fused call. The first launch of every rung the quantized fused families
+    serve at that width is inside one HIP graph capture, through
+    ``CudaCommunicator.fused_allreduce_rmsnorm``.
+
+    It records the served rungs that were not loaded at init, and every FlyDSL
+    compile or JIT cache load inside the capture. It then replays the graph
+    and checks ``out`` and ``residual_out`` against the fp32 reference at
+    ``FUSED_CAPTURE_EPS``.
+    """
+    import torch.distributed as dist
+    from flydsl.compiler import jit_function as jf
+
+    from aiter.dist.parallel_state import graph_capture
+    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded, payload_probes
+
+    hidden = FUSED_CAPTURE_HIDDEN
+    row_bytes = hidden * 2
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+    os.environ[fly_policy.FUSED_HIDDENS_ENV] = str(hidden)
+    set_custom_all_reduce(False)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(tp, 1)
+    tp_group = get_tp_group()
+    gloo = tp_group.cpu_group
+    group = tp_group.device_group
+    comm = tp_group.device_communicator
+    qr = comm.qr_comm
+    fly = None if qr is None else qr._fly_rms
+    built = fly is not None and not fly.disabled
+    res = {"built": built, "unloaded": [], "rows": [], "events": []}
+
+    try:
+        if built:
+            cases = []
+            for family, eng in fly._engines.items():
+                lo, hi = fly._windows[family].inclusive_range()
+                res["unloaded"] += [
+                    f"{family} {key}"
+                    for key in eng.cfgs_for(hidden, lo, hi)
+                    if not launcher_loaded(eng._by_cfg[key][0].launch)
+                ]
+                # The smallest whole-row payload of every rung the window serves.
+                top = min(hi, TOP_PAYLOAD_BYTES)
+                tile_bytes = eng._tile_bytes(hidden)
+                floors = [r.min_bytes for r in eng._ladder(hidden)[0]]
+                first = {}
+                for n in payload_probes(floors, lo, top):
+                    tokens = -(-n // row_bytes)
+                    if tokens * row_bytes > top:
+                        tokens = n // row_bytes
+                    nbytes = tokens * row_bytes
+                    if tokens < 1 or nbytes < lo:
+                        continue
+                    key = eng._pick_cfg(hidden, nbytes, -(-nbytes // tile_bytes))
+                    first.setdefault(key, tokens)
+                for key, tokens in sorted(first.items(), key=lambda kv: kv[1]):
+                    inp, residual, weight = _fused_inputs(tokens, hidden, rank, device)
+                    total = inp.to(torch.float32)
+                    dist.all_reduce(total, group=group)
+                    ref = fab.fused_reference(
+                        total, residual, weight, eps=FUSED_CAPTURE_EPS
+                    )
+                    if "eps_sqnr_db" not in res:
+                        # How far the reference moves between the two epsilons:
+                        # a dropped epsilon is only visible if this is below
+                        # the floor.
+                        other = fab.fused_reference(
+                            total, residual, weight, eps=RMS_EPS
+                        )
+                        res["eps_sqnr_db"] = _sqnr_db(other[0].float(), ref[0].float())
+                    cases.append((family, key, tokens, inp, residual, weight, ref))
+
+            ran = []
+            for family, eng in fly._engines.items():
+
+                def allreduce_rmsnorm(
+                    *args, _run=eng.allreduce_rmsnorm, _f=family, **kw
+                ):
+                    ran.append(_f)
+                    return _run(*args, **kw)
+
+                eng.allreduce_rmsnorm = allreduce_rmsnorm
+
+            events = res["events"]
+            orig_trace = jf.JitFunction._trace_and_compile
+            orig_get = jf.JitCacheManager.get
+
+            def watch(name, orig):
+                def wrapped(self, *args, **kwargs):
+                    if torch.cuda.is_current_stream_capturing():
+                        events.append(name)
+                    return orig(self, *args, **kwargs)
+
+                return wrapped
+
+            jf.JitFunction._trace_and_compile = watch("compile", orig_trace)
+            jf.JitCacheManager.get = watch("cache load", orig_get)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            error = None
+            try:
+                with graph_capture() as gc, torch.cuda.graph(g, stream=gc.stream):
+                    outs = [
+                        comm.fused_allreduce_rmsnorm(
+                            case[3], case[4], case[5], FUSED_CAPTURE_EPS
+                        )
+                        for case in cases
+                    ]
+            except Exception as e:  # noqa: BLE001
+                error = f"{type(e).__name__}: {e}"
+            finally:
+                jf.JitFunction._trace_and_compile = orig_trace
+                jf.JitCacheManager.get = orig_get
+            res["capture_error"] = error
+            res["ran"] = ran
+            res["expected"] = [case[0] for case in cases]
+            # Replay only if every rank captured: the graph launches peers'
+            # kernels that wait for each other.
+            vote = torch.tensor([error is None], dtype=torch.int32)
+            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=gloo)
+            if vote.item():
+                sqnr = [(float("inf"), float("inf"))] * len(cases)
+                for _ in range(GRAPH_REPLAYS):
+                    torch.cuda.synchronize()
+                    dist.barrier(group=gloo)
+                    for out, res_out in outs:
+                        out.fill_(float("nan"))
+                        res_out.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    dist.barrier(group=gloo)
+                    g.replay()
+                    torch.cuda.synchronize()
+                    for i, (case, (out, res_out)) in enumerate(zip(cases, outs)):
+                        ref_out, ref_res = case[6]
+                        sqnr[i] = (
+                            min(sqnr[i][0], _sqnr_db(out.float(), ref_out.float())),
+                            min(sqnr[i][1], _sqnr_db(res_out.float(), ref_res.float())),
+                        )
+                res["rows"] = [
+                    {
+                        "family": family,
+                        "cfg": str(key),
+                        "tokens": tokens,
+                        "out_sqnr_db": s_out,
+                        "res_sqnr_db": s_res,
+                    }
+                    for (family, key, tokens, *_rest), (s_out, s_res) in zip(
+                        cases, sqnr
+                    )
+                ]
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=gloo)
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    return res
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_first_call_in_capture(tp):
+    """Production fused dispatch with ``AITER_FLY_AR_FUSED_HIDDENS`` and no
+    eager fused call: every served rung of the declared width is loaded at
+    init, the capture that holds the first launch of each one compiles and
+    loads nothing, and its replay honours a non-default epsilon within the
+    fused floor."""
+    ranks = _spawn(_capture_first_fused_rank, tp)
+    fails = []
+    for rank, r in enumerate(ranks):
+        if not r["built"]:
+            fails.append(
+                f"rank {rank}: the quantized fused backend was not built under "
+                "AITER_FLY_AR=1"
+            )
+            continue
+        if not r["rows"] and not r.get("capture_error"):
+            fails.append(
+                f"rank {rank}: no fused rung serves hidden {FUSED_CAPTURE_HIDDEN}"
+            )
+        if r["unloaded"]:
+            fails.append(
+                f"rank {rank}: served rungs not loaded at init: {r['unloaded']}"
+            )
+        if r["events"]:
+            kinds = "/".join(sorted(set(r["events"])))
+            fails.append(
+                f"rank {rank}: {len(r['events'])} FlyDSL {kinds} event(s) inside "
+                "the capture"
+            )
+        if r["capture_error"]:
+            fails.append(f"rank {rank}: capture failed: {r['capture_error']}")
+            continue
+        if r["ran"] != r["expected"]:
+            fails.append(
+                f"rank {rank}: captured calls ran {r['ran']}, expected {r['expected']}"
+            )
+        if not r.get("eps_sqnr_db", 0.0) < FUSED_SQNR_MIN_DB:
+            fails.append(
+                f"rank {rank}: epsilon {FUSED_CAPTURE_EPS} moves the reference only "
+                f"to {r.get('eps_sqnr_db')} dB, so a dropped epsilon would pass"
+            )
+        for row in r["rows"]:
+            for name in ("out", "res"):
+                got = row[f"{name}_sqnr_db"]
+                if not got >= FUSED_SQNR_MIN_DB:
+                    fails.append(
+                        f"rank {rank}: {row['family']} {row['cfg']} at "
+                        f"{row['tokens']}x{FUSED_CAPTURE_HIDDEN} {name} SQNR "
+                        f"{got:.2f} dB below the {FUSED_SQNR_MIN_DB} dB floor"
+                    )
+    _check(f"tp={tp} fused first call in capture", fails)
+    rows0 = ranks[0]["rows"]
+    return {
+        "gfx": ARCH,
+        "rungs": [f"{row['family']} {row['cfg']}" for row in rows0],
+        "tokens": [row["tokens"] for row in rows0],
+        "unloaded": sum(len(r["unloaded"]) for r in ranks),
+        "min_out_sqnr_db": min(
+            (row["out_sqnr_db"] for row in rows0), default=float("nan")
+        ),
+        "eps_sqnr_db": ranks[0].get("eps_sqnr_db"),
+    }
+
+
 def _expect_raises(what: str, pattern: str, fn) -> list[str]:
     try:
         fn()
@@ -3511,6 +3750,10 @@ def _verify_fused(tps, algos, extended: bool) -> None:
             for case in _FUSED_LOW_LATENCY_CASES
             if _wide_row_case(case[1], tp)
         ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm first call in capture",
+        [test_quick_allreduce_rmsnorm_first_call_in_capture(tp) for tp in tps],
     )
     _summarize(
         "flydsl quick allreduce rmsnorm host-side geometry checks",
