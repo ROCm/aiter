@@ -254,7 +254,7 @@ def gmm(
         # the override into subsequent calls.
         config = dict(config)
         config["GRID_DIM"] = grid_dim
-    else:
+    elif grid_dim is None:
         config = _cap_grid_dim_to_device(config)
 
     grid = _gmm_grid(
@@ -467,7 +467,7 @@ def ptgmm(
         # the override into subsequent calls.
         config = dict(config)
         config["GRID_DIM"] = grid_dim
-    else:
+    elif grid_dim is None:
         config = _cap_grid_dim_to_device(config)
 
     # Bias gradient handling.
