@@ -2692,6 +2692,19 @@ def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
     assert torch.equal(dense, full)
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
+def test_mha_v4_varlen_gate_follows_the_live_gpu_not_gpu_archs():
+    """GPU_ARCHS can name another build target, but the launcher dispatches on the live GPU."""
+    formats = (AttentionFormat.BF16, AttentionFormat.BF16)
+    with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx942"):
+        assert mha_v4_module._varlen_capable(*formats)
+        torch._dynamo.reset()
+        gate = torch.compile(
+            lambda x: x + mha_v4_module._varlen_capable(*formats), fullgraph=True
+        )
+        assert gate(torch.zeros(1, device="cuda")).item() == 1
+
+
 @skipif(get_gfx() != "gfx950", reason="dense varlen is a gfx950 row")
 def test_mha_v4_rejects_unusable_seqlens_k():
     """Off gfx950 the capability gate preempts these, so the dtype and shape messages
