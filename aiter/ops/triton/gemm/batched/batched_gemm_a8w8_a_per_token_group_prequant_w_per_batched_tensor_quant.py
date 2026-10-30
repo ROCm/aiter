@@ -6,6 +6,7 @@ import triton
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
+    _batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel,
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -36,6 +37,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     transpose_bm_in: bool | None = False,
     config: dict | None = None,
     backend: str | None = None,
+    y_scale_out: torch.Tensor | None = None,
 ):
     """
     Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
@@ -59,12 +61,13 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             batched_gemm_a16w8). Passing a config with backend=None keeps the
             triton path, since the config is interpreted as a triton config.
         backend (Optional[str]): "triton", "gluon", or None (auto). Auto selects
-            gluon on gfx1250 when bias is None, config is None and the inputs fit
+            gluon on gfx1250 when bias, config and y_scale_out are None and the inputs fit
             batched_gemm_a16w8 (bf16/fp16 X, fp8 WQ, both K-contiguous);
             otherwise triton. The gluon path keeps X in bf16 and upcasts
             WQ to bf16 in registers instead of quantizing X per token-group, so
             its numerics differ from the triton path (it is closer to the exact
-            bf16 product); group_size does not apply to it and bias is unsupported.
+            bf16 product); group_size does not apply to it and bias and y_scale_out are unsupported.
+        y_scale_out (Optional[torch.Tensor]): Pre-allocated scale tensor with shape (M, 1) for a per-token quantized FP8 YQ.
 
     Returns:
         torch.Tensor: Output batch with shape (B, M, N) or (M, B, N) if transpose_bm=True.
@@ -94,7 +97,12 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     X_bmk = X.transpose(0, 1) if transpose_bm_in else X
     if backend is None:
         backend = "triton"
-        if _is_gluon_available() and bias is None and config is None:
+        if (
+            _is_gluon_available()
+            and bias is None
+            and config is None
+            and y_scale_out is None
+        ):
             from aiter.ops.triton.gemm.batched.batched_gemm_a16w8 import (
                 is_batched_gemm_a16w8_supported,
             )
@@ -111,6 +119,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     if backend == "gluon":
         assert _is_gluon_available(), f"gluon backend requires {_GLUON_SUPPORTED_ARCHS}"
         assert bias is None, "gluon backend does not support bias"
+        assert y_scale_out is None, "gluon backend does not support y_scale_out"
         from aiter.ops.triton.gemm.batched.batched_gemm_a16w8 import (
             batched_gemm_a16w8,
         )
@@ -145,7 +154,10 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             ), "Output dimension error"
 
     if config is None:
-        config, _ = _get_config(M, N, K)
+        if y_scale_out is None:
+            config, _ = _get_config(M, N, K)
+        else:
+            config, _ = _get_config(M, N, K, B, y_per_token_quant=True)
     config["BLOCK_SIZE_K"] = group_size
 
     grid = lambda META: (
@@ -158,6 +170,93 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         if torch.is_floating_point(WQ)
         else torch.iinfo(WQ.dtype).max
     )
+
+    if y_scale_out is not None:
+        assert (
+            transpose_bm and not has_bias
+        ), "y_scale_out (per-token quant of Y) needs transpose_bm=True and no bias"
+        assert (
+            torch.is_floating_point(YQ) and YQ.element_size() == 1
+        ), f"y_scale_out needs a pre-allocated FP8 YQ, got {YQ.dtype=}"
+        assert (
+            YQ.stride(2) == 1 and YQ.stride(1) == N
+        ), "YQ must hold the B * N values of a token contiguously"
+        assert (
+            y_scale_out.shape == (M, 1) and y_scale_out.dtype == torch.float32
+        ), "y_scale_out must be FP32 with shape (M, 1)"
+
+        # Split K in whole quant groups and launch only non-empty splits.
+        num_k_groups = triton.cdiv(K, group_size)
+        splitk_block_size = triton.cdiv(num_k_groups, config["NUM_KSPLIT"]) * group_size
+        num_ksplit = triton.cdiv(K, splitk_block_size)
+        y_pp = torch.empty((num_ksplit, M, B, N), dtype=torch.float32, device=X.device)
+        gemm_config = {
+            k: v
+            for k, v in config.items()
+            if k != "NUM_KSPLIT" and not k.startswith("REDUCE_")
+        }
+
+        grid_splitk = (
+            B,
+            num_ksplit
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+        )
+        _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel[
+            grid_splitk
+        ](
+            X,
+            WQ,
+            y_pp,
+            w_scale,
+            bias,
+            M,
+            N,
+            K,
+            X.stride(0) if not transpose_bm_in else X.stride(1),
+            X.stride(1) if not transpose_bm_in else X.stride(0),
+            X.stride(2),
+            WQ.stride(0),
+            WQ.stride(1),
+            WQ.stride(2),
+            y_pp.stride(2),
+            y_pp.stride(1),
+            y_pp.stride(3),
+            y_pp.stride(0),
+            0,
+            has_bias,
+            DTYPE_MAX=DTYPE_MAX,
+            DTYPE_MIN=-DTYPE_MAX,
+            NUM_KSPLIT=num_ksplit,
+            SPLITK_BLOCK_SIZE=splitk_block_size,
+            **gemm_config,
+        )
+
+        Y_DTYPE_MAX = torch.finfo(YQ.dtype).max
+        grid_reduce = (triton.cdiv(M, config["REDUCE_BLOCK_SIZE_M"]),)
+        _batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel[grid_reduce](
+            y_pp,
+            YQ,
+            y_scale_out,
+            M,
+            B * N,
+            y_pp.stride(0),
+            y_pp.stride(1),
+            y_pp.stride(3),
+            YQ.stride(0),
+            YQ.stride(2),
+            y_scale_out.stride(0),
+            DTYPE_MAX=Y_DTYPE_MAX,
+            DTYPE_MIN=-Y_DTYPE_MAX,
+            BLOCK_SIZE_M=config["REDUCE_BLOCK_SIZE_M"],
+            BLOCK_SIZE_N=min(
+                triton.next_power_of_2(B * N), config["REDUCE_BLOCK_SIZE_N"]
+            ),
+            NUM_KSPLIT=num_ksplit,
+            num_warps=config["REDUCE_num_warps"],
+        )
+
+        return YQ
 
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel[
         grid
@@ -179,10 +278,13 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         YQ.stride(0) if not transpose_bm else YQ.stride(1),
         YQ.stride(1) if not transpose_bm else YQ.stride(0),
         YQ.stride(2),
+        0,
         bias.stride(0) if has_bias else 0,
         has_bias,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
+        NUM_KSPLIT=1,
+        SPLITK_BLOCK_SIZE=triton.cdiv(K, group_size) * group_size,
         **config,
     )
 
