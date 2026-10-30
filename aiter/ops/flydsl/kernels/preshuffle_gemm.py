@@ -26,6 +26,7 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
     async_copy_supported_on_arch,
 )
 
+from .kernels_common import set_slp_vectorize_once_used
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
 from .splitk_epilogue import CPOL_COHERENT, splitk_reduce_epilogue
 
@@ -1213,4 +1214,6 @@ def compile_preshuffle_gemm(
     if const_expr(is_f16_or_bf16 and num_acc_n <= 2):
         launch_gemm.compile_hints["llvm_options"] = {"enable-post-misched": False}
 
+    # After the f16 assignment above: that one replaces llvm_options outright.
+    set_slp_vectorize_once_used(launch_gemm, False)
     return launch_gemm

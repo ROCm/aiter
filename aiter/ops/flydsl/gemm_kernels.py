@@ -287,6 +287,36 @@ def _check_preshuffle_split_capacity(
         )
 
 
+def _check_preshuffle_launch_shape(
+    m: int, n: int, k: int, tile_m: int, tile_n: int, tile_k: int, split_k: int
+) -> None:
+    """Validate the launch geometry, including uneven split-K partitions."""
+    if m > PRESHUFFLE_M_MAX:
+        raise RuntimeError(
+            f"[FlyDSL] M ({m}) exceeds {PRESHUFFLE_M_MAX}; the preshuffle kernel "
+            f"views A and C through a layout bounded by that many rows."
+        )
+    if n % 16 != 0:
+        raise RuntimeError(
+            f"[FlyDSL] N ({n}) must be a multiple of 16 for preshuffled B."
+        )
+    if n % tile_n != 0 and split_k > 1:
+        raise RuntimeError(
+            f"[FlyDSL] ragged N ({n}) does not support split_k ({split_k})."
+        )
+    if split_k < 1:
+        raise RuntimeError(f"[FlyDSL] split_k ({split_k}) must be positive.")
+    if tile_k <= 0 or k % tile_k != 0:
+        raise RuntimeError(
+            f"[FlyDSL] K ({k}) is not a multiple of "
+            f"tile_k ({tile_k}). "
+            f"Arguments not supported! Skipping gemm!"
+        )
+
+    if split_k > 1:
+        _check_preshuffle_split_capacity(m, n, tile_m, tile_n, split_k)
+
+
 def flydsl_preshuffle_gemm_a8(
     XQ: Tensor,
     WQ: Tensor,
@@ -317,27 +347,7 @@ def flydsl_preshuffle_gemm_a8(
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0]
 
-    if m > PRESHUFFLE_M_MAX:
-        raise RuntimeError(
-            f"[FlyDSL] M ({m}) exceeds {PRESHUFFLE_M_MAX}; the preshuffle kernel "
-            f"views A and C through a layout bounded by that many rows."
-        )
-    if n % 16 != 0:
-        raise RuntimeError(
-            f"[FlyDSL] N ({n}) must be a multiple of 16 for preshuffled B."
-        )
-    if n % tile_n != 0 and split_k > 1:
-        raise RuntimeError(
-            f"[FlyDSL] ragged N ({n}) does not support split_k ({split_k})."
-        )
-    if split_k < 1:
-        raise RuntimeError(f"[FlyDSL] split_k ({split_k}) must be positive.")
-    if tile_k <= 0 or k % tile_k != 0:
-        raise RuntimeError(
-            f"[FlyDSL] K ({k}) is not a multiple of "
-            f"tile_k ({tile_k}). "
-            f"Arguments not supported! Skipping gemm!"
-        )
+    _check_preshuffle_launch_shape(m, n, k, tile_m, tile_n, tile_k, split_k)
 
     if XQ.dtype == dtypes.fp8:
         in_dtype = "fp8"
@@ -447,7 +457,6 @@ def flydsl_preshuffle_gemm_a8(
     # default epilogue="none" path.
     dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     if split_k > 1:
-        _check_preshuffle_split_capacity(m, n, tile_m, tile_n, split_k)
         workspace, semaphore = _get_preshuffle_split_buffers(
             Out.device, torch.cuda.current_stream(device=Out.device)
         )
