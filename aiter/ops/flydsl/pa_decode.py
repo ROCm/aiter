@@ -277,8 +277,9 @@ def pa_decode(
     whole pages as in tuning. This keeps the selected specialization independent
     of extra block-table padding. It is the caller's contract, including for
     graph replay: every context length that will run must be at most
-    ``max_context_length``. A smaller value still covers the real context:
-    page ids outside the staged window are read from the block table.
+    ``max_context_length``. The reducer and in-kernel merges size their
+    partition bound from it, so a smaller value can drop partitions and
+    silently truncate attention, including on graph replay.
 
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
