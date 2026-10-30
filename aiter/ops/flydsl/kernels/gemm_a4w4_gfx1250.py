@@ -461,25 +461,38 @@ def launch_gemm_a4w4(
             # out-of-range clamp is relied on; edge tiles keep the guarded stores.
             if const_expr(tile_m % waves == 0):
                 if (bm + tile_m <= m) & (bn + tile_n <= n) & (ld_c % 8 == 0):
-                    out_layout = fx.make_layout((tile_m, c_lds_row), (c_lds_row, 1))
+                    # Padded tile, real-width view: a store cannot drain a padded LDS
+                    # tile, so the tile carries the pad and boundary_check drops the
+                    # pad columns. This branch is already gated on a whole tile, so
+                    # the M extent is exactly tile_m.
+                    C_TILE = (tile_m, c_lds_row)
                     tile_out = fx.Tensor(
                         fx.make_view(
                             out + fx.Int64(bm) * fx.Int64(ld_c) + fx.Int64(bn),
-                            out_layout,
+                            fx.make_layout((tile_m, tile_n), (fx.Int64(ld_c), 1)),
                         )
                     )
-                    store_atom = fx.rocdl.make_tdm_atom(
+                    store_atom, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                        fx.rocdl.TensorStore(),
                         tile_out,
-                        [tile_m, tile_n],
-                        strides=[fx.Int64(ld_c), None],
+                        fx.make_layout(C_TILE, (c_lds_row, 1)),
+                        C_TILE,
                         num_warps=waves,
                     )
-                    fx.copy(
-                        store_atom,
-                        fx.Tensor(fx.make_view(fx.recast_iter(elem, base), out_layout)),
-                        tile_out,
+                    out_blk = fx.zipped_divide(out_coord, C_TILE)[None, (0, None)]
+                    sC = fx.Tensor(
+                        fx.make_view(
+                            fx.recast_iter(elem, base),
+                            fx.make_layout(
+                                (C_TILE, 1), ((c_lds_row, 1), tile_m * c_lds_row)
+                            ),
+                        )
                     )
-                    tdm_ops.tensor_wait(0)
+                    tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                        store_atom, wave, fx.make_layout(waves, 1), sC, out_blk
+                    )
+                    fx.copy(store_atom, tCs[None, 0], tCg[None, 0])
+                    rocdl.s_wait_tensorcnt(0)
                 else:
                     store_guarded()
             else:

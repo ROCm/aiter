@@ -918,20 +918,30 @@ def launch_gemm_a8w8(
             c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
         if const_expr(split_k > 1):
             c_off_rt = c_off_rt + fx.Int64(bid_z) * fx.Int64(i32_m) * ldc64
-        gtC = _gv(gC_base, c_off_rt, (tile_m, C_LDS_ROW), (C_LDS_ROW, 1))
-        atomC = fx.rocdl.make_tdm_atom(
+        # A store cannot drain a padded LDS tile, so the tile is the PADDED width and
+        # the view's inner extent the real one -- boundary_check then drops the pad
+        # columns, which is exactly what the old tensor_extents clamp did. With
+        # C_PAD == 0 the two widths coincide and the clamp is a no-op, as before.
+        C_TILE = (tile_m, C_LDS_ROW)
+        gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
+        atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorStore(),
             gtC,
-            [mn_oob, tile_n if C_PAD else None],
-            strides=[ldc64, None],
+            fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
+            C_TILE,
             num_warps=num_waves,
-            early_timeout=False,
         )
-        fx.copy(
-            atomC,
-            _lv(fx.recast_iter(out_cls, base_ptr), (tile_m, C_LDS_ROW), (C_LDS_ROW, 1)),
-            gtC,
+        blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
+        sC = _lv(
+            fx.recast_iter(out_cls, base_ptr),
+            (C_TILE, 1),
+            ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
         )
-        tdm_ops.tensor_wait(0)
+        tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+            atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
+        )
+        fx.copy(atomC, tCs[None, 0], tCg[None, 0])
+        rocdl.s_wait_tensorcnt(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n

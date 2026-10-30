@@ -839,25 +839,34 @@ def launch_gemm_a4w4_256x256(
         else:
             if const_expr(split_k > 1):
                 c_off_rt += fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
+            # A store cannot drain a padded LDS tile: make the tile the PADDED width
+            # and the view's inner extent the real one, so boundary_check drops the
+            # pad columns -- exactly what the old tensor_extents clamp did.
+            C_TILE = (tile_m, C_LDS_ROW)
             gtC = _gv(
                 fx.recast_iter(partial_elem, arg_c),
                 c_off_rt,
-                (tile_m, C_LDS_ROW),
-                (C_LDS_ROW, 1),
+                (mn_oob, tile_n),
+                (ldc64, 1),
             )
-            atomC = fx.rocdl.make_tdm_atom(
-                gtC, [mn_oob, tile_n], strides=[ldc64, None], num_warps=num_waves
-            )
-            fx.copy(
-                atomC,
-                _view(
-                    fx.recast_iter(partial_elem, base_ptr),
-                    (tile_m, C_LDS_ROW),
-                    (C_LDS_ROW, 1),
-                ),
+            atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
                 gtC,
+                fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
+                C_TILE,
+                num_warps=num_waves,
             )
-            tdm_ops.tensor_wait(0)
+            blkC = fx.zipped_divide(coordC, C_TILE)[None, (0, None)]
+            sC = _view(
+                fx.recast_iter(partial_elem, base_ptr),
+                (C_TILE, 1),
+                ((C_LDS_ROW, 1), tile_m * C_LDS_ROW),
+            )
+            tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                atomC, wave, fx.make_layout(num_waves, 1), sC, blkC
+            )
+            fx.copy(atomC, tCs[None, 0], tCg[None, 0])
+            rocdl.s_wait_tensorcnt(0)
 
     grid_arg = make_gemm_grid(
         i32_m,
