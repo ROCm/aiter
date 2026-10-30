@@ -7,8 +7,8 @@ from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.ops.triton.fusions.activation import act_mul_and_mxfp4_quant
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
-from op_tests.triton_tests.fusions.test_fused_silu_mul import silu_exp2_ref
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from op_tests.triton_tests.utils.activation_ref import silu_exp2_ref
 
 
 def pad_tensor_2d(tensor, mult_m=256, mult_n=8):
@@ -164,7 +164,8 @@ def test_act_mul_and_mxfp4_quant_roundup_matches_hip_quant(
         pytest.skip("MXFP4 not supported on this architecture")
 
     torch.manual_seed(M)
-    x = (torch.randn((M, 2 * N), device="cuda") * magnitude).to(torch.bfloat16)
+    x = torch.randn((M, 2 * N), dtype=torch.float32, device="cuda")
+    x = (x * magnitude).to(torch.bfloat16)
     # An all-zero and a tiny output block, both under the HIP quant's amax floor.
     x[0, :32] = 0
     x[-1, N - 32 : N] = 1e-12
@@ -228,6 +229,6 @@ def test_act_mul_and_mxfp4_quant_round_to_input_dtype():
 
 
 def test_act_mul_and_mxfp4_quant_rejects_unknown_scaling_mode():
-    x = torch.zeros((1, 64), dtype=torch.bfloat16)
+    x = torch.zeros((1, 64), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="scaling_mode"):
         act_mul_and_mxfp4_quant(x, "silu", scaling_mode="round_up")

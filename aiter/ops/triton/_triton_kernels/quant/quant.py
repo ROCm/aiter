@@ -143,25 +143,14 @@ def _mxfp4_scale_from_amax(amax):
 
 
 @triton.jit
-def _mxfp4_ceil_scale_from_amax(amax):
-    """E8M0 2^ceil(log2(amax / 6)) and its reciprocal, so no value saturates.
-    Exact, from the exponent bits."""
-    # An all-zero block still gets a normal scale, 2^-126.
-    ratio = tl.maximum(amax, 6.0 * (2**-126)) * (1.0 / 6.0)
-    # Adding 0x7FFFFF carries into the exponent unless the mantissa is zero.
-    bs_e8m0 = (ratio.to(tl.uint32, bitcast=True) + 0x7FFFFF) >> 23
-    quant_scale = ((254 - bs_e8m0) << 23).to(tl.float32, bitcast=True)
-    return bs_e8m0.to(tl.uint8), quant_scale
-
-
-@triton.jit
-def _mxfp4_roundup_scale_from_amax(amax):
-    """The E8M0 scale of the HIP per_1x32_f4_quant and its reciprocal: amax
-    floored at aiter::kAmaxFloor (1e-10), then
-    fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundUp>, 2^ceil(log2(amax / 6)).
-    Unlike _mxfp4_ceil_scale_from_amax, an all-zero block gets byte 92, as
-    there, not 1."""
-    ratio = (tl.maximum(amax, 1e-10) * (1.0 / 6.0)).to(tl.uint32, bitcast=True)
+def _mxfp4_ceil_scale_from_amax(amax, AMAX_FLOOR: tl.constexpr = 6.0 * (2**-126)):
+    """E8M0 2^ceil(log2(max(amax, AMAX_FLOOR) / 6)) and its reciprocal, so no
+    value saturates. Exact, from the exponent bits.
+    The default floor gives an all-zero block a normal scale, 2^-126 (byte 1).
+    "roundup" passes aiter::kAmaxFloor (1e-10), which makes this
+    fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundUp> of the HIP
+    per_1x32_f4_quant: an all-zero block gets byte 92, as there."""
+    ratio = (tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)).to(tl.uint32, bitcast=True)
     exponent = (ratio >> 23) & 0xFF
     # Round up if the mantissa is nonzero, unless the ratio is Inf or NaN.
     exponent = tl.where(
@@ -184,8 +173,8 @@ def _mxfp4_quant_op(
     Converts given x (in fp32) to mxfp4 format.
     x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
     SCALING_MODE: 0 is "even" (_mxfp4_scale_from_amax), 1 is "ceil"
-    (_mxfp4_ceil_scale_from_amax), 2 is "roundup"
-    (_mxfp4_roundup_scale_from_amax).
+    (_mxfp4_ceil_scale_from_amax), 2 is "roundup" (the same with the 1e-10
+    amax floor of the HIP quant).
     USE_ASM: see _mxfp4_pack_op.
 
     """
@@ -199,7 +188,7 @@ def _mxfp4_quant_op(
         bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(amax)
     else:
         tl.static_assert(SCALING_MODE == 2)
-        bs_e8m0, quant_scale = _mxfp4_roundup_scale_from_amax(amax)
+        bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(amax, AMAX_FLOOR=1e-10)
 
     # Compute quantized x
     qx = x * quant_scale
