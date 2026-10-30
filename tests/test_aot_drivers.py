@@ -3,6 +3,7 @@
 import inspect
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, call, patch
 
@@ -25,6 +26,33 @@ class AsmMlaDecodeAotTest(unittest.TestCase):
         )[:6]
 
         self.assertEqual(driver.MLAConfig._fields, compile_parameters)
+
+
+class Int8FourWaveAotTest(unittest.TestCase):
+    def test_tuned_csv_row_parses_to_4wave_job(self):
+        from aiter.aot.flydsl.gemm import parse_csv
+        from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+            make_4wave_kernel_name,
+        )
+
+        kernel_name = make_4wave_kernel_name(
+            K=5120, xcd_swizzle=8, num_cu=128, num_xcds=4
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / "int8.csv"
+            config.write_text(
+                "gfx,cu_num,M,N,K,q_dtype_w,libtype,kernelId,splitK,us,"
+                "kernelName,tflops,bw,errRatio\n"
+                f"gfx950,128,9450,5120,5120,torch.int8,flydsl,1000041,0,0,"
+                f"{kernel_name},0,0,0\n"
+            )
+            jobs = parse_csv(str(config))
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["kind"], "4wave")
+        self.assertEqual(jobs[0]["kernel_name"], kernel_name)
+        self.assertEqual(jobs[0]["num_cu"], 128)
+        self.assertEqual(jobs[0]["num_xcds"], 4)
 
 
 class PaGluonProcessLimitTest(unittest.TestCase):

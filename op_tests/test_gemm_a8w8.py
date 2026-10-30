@@ -28,6 +28,16 @@ except ModuleNotFoundError as e:
     if e.name != "tuned_op_bench_utils":
         raise
     from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
+try:
+    from int8_4wave_test_utils import (
+        int8_4wave_reference,
+        make_int8_4wave_case,
+    )
+except ModuleNotFoundError:
+    from op_tests.int8_4wave_test_utils import (
+        int8_4wave_reference,
+        make_int8_4wave_case,
+    )
 import argparse
 from functools import lru_cache
 
@@ -141,8 +151,8 @@ def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
+def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, bias, dtype)
 
 
 @perftest()
@@ -252,9 +262,28 @@ def test_gemm(
             err_b = checkAllclose(
                 a, b, msg="ck: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
             )
-    if quantDtype != dtypes.i8 and quant_mode == "per-token":
-        c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
-        # c = c + bias
+    run_bpreshuffle = quant_mode == "per-token" and quantDtype != dtypes.i8
+    if quant_mode == "per-token" and quantDtype == dtypes.i8:
+        from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+            supports_4wave_int8_shape,
+        )
+
+        run_bpreshuffle = (
+            get_gfx() == "gfx950"
+            and dtype == dtypes.bf16
+            and supports_4wave_int8_shape(m, n, k)
+        )
+    if run_bpreshuffle:
+        c, avg_c = run_gemm_ck_bpreshuffle(
+            x,
+            weightshuffle,
+            x_scale,
+            w_scale,
+            None if quantDtype == dtypes.i8 else bias,
+            dtype,
+        )
+        if quantDtype == dtypes.i8 and bias is not None:
+            c = c + bias
         err_c = checkAllclose(
             a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
         )
@@ -703,6 +732,165 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
 
 
+@torch.no_grad()
+def run_int8_4wave_ci_correctness():
+    """Observable correctness cases run by AITER's script-based CI entry."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("INT8 4-wave correctness: skipped, requires gfx950")
+        return
+
+    cases = (
+        (17, 32, 256),
+        (257, 272, 1024),
+        (257, 272, 1152),
+        (4352, 4608, 5120),
+    )
+    for m, n, k in cases:
+        case = make_int8_4wave_case((m, n, k), m + n + k)
+        actual = aiter.gemm_a8w8_bpreshuffle(
+            case["x"],
+            case["weight_shuffled"],
+            case["x_scale"],
+            case["w_scale"],
+        )
+        expected = int8_4wave_reference(case)
+        assert torch.equal(actual, expected), (m, n, k)
+
+    # Padded weights dispatch at the physical K, with XQ zero-padded to match.
+    case = make_int8_4wave_case((17, 32, 256), 384)
+    padded = aiter.gemm_a8w8_bpreshuffle(
+        case["x"],
+        shuffle_weight(case["weight"], layout=(16, 16), pad_k_to=384).contiguous(),
+        case["x_scale"],
+        case["w_scale"],
+    )
+    assert torch.equal(padded, int8_4wave_reference(case))
+
+    # Signed extrema exercise true INT8 rather than a narrowed test range.
+    m, n, k = 17, 32, 256
+    x_extreme = torch.full((m, k), -128, dtype=torch.int8, device="cuda")
+    weight_extreme = torch.full((n, k), 127, dtype=torch.int8, device="cuda")
+    x_scale_extreme = torch.full((m, 1), 1e-3, dtype=torch.float32, device="cuda")
+    w_scale_extreme = torch.full((1, n), 2e-3, dtype=torch.float32, device="cuda")
+    extreme = aiter.gemm_a8w8_bpreshuffle(
+        x_extreme,
+        shuffle_weight(weight_extreme, layout=(16, 16)).contiguous(),
+        x_scale_extreme,
+        w_scale_extreme,
+    )
+    extreme_ref = (
+        F.linear(x_extreme.float(), weight_extreme.float())
+        * (x_scale_extreme * w_scale_extreme)
+    ).to(torch.bfloat16)
+    assert torch.equal(extreme, extreme_ref)
+
+    # Zero rows return an empty BF16 matrix without compiling a specialization.
+    n = k = 256
+    zero = aiter.gemm_a8w8_bpreshuffle(
+        torch.empty((0, k), dtype=torch.int8, device="cuda"),
+        shuffle_weight(
+            torch.zeros((n, k), dtype=torch.int8, device="cuda"),
+            layout=(16, 16),
+        ).contiguous(),
+        torch.empty((0, 1), dtype=torch.float32, device="cuda"),
+        torch.ones((1, n), dtype=torch.float32, device="cuda"),
+    )
+    assert zero.shape == (0, n)
+
+    # Bias is deliberately caller-owned because adding it before and after
+    # BF16 conversion is not numerically interchangeable.
+    case = make_int8_4wave_case((17, 32, 256), 7)
+    try:
+        aiter.gemm_a8w8_bpreshuffle(
+            case["x"],
+            case["weight_shuffled"],
+            case["x_scale"],
+            case["w_scale"],
+            bias=torch.zeros(32, dtype=torch.bfloat16, device="cuda"),
+        )
+    except ValueError as error:
+        if "does not fuse bias" not in str(error):
+            raise
+    else:
+        raise AssertionError("INT8 bpreshuffle must reject fused bias")
+
+    def expect_value_error(message, launch):
+        try:
+            launch()
+        except ValueError as error:
+            if message not in str(error):
+                raise
+        else:
+            raise AssertionError(f"expected ValueError containing {message!r}")
+
+    expect_value_error(
+        "BF16 output",
+        lambda: aiter.gemm_a8w8_bpreshuffle(
+            case["x"],
+            case["weight_shuffled"],
+            case["x_scale"],
+            case["w_scale"],
+            dtype=torch.float16,
+        ),
+    )
+    expect_value_error(
+        "FP32",
+        lambda: aiter.gemm_a8w8_bpreshuffle(
+            case["x"],
+            case["weight_shuffled"],
+            case["x_scale"].half(),
+            case["w_scale"],
+        ),
+    )
+    expect_value_error(
+        "K >= 256",
+        lambda: aiter.gemm_a8w8_bpreshuffle(
+            torch.zeros((17, 128), dtype=torch.int8, device="cuda"),
+            shuffle_weight(
+                torch.zeros((32, 128), dtype=torch.int8, device="cuda"),
+                layout=(16, 16),
+            ).contiguous(),
+            torch.ones((17, 1), dtype=torch.float32, device="cuda"),
+            torch.ones((1, 32), dtype=torch.float32, device="cuda"),
+        ),
+    )
+
+    # Compile, graph and stream smoke use one small untuned specialization.
+    case = make_int8_4wave_case((257, 272, 384), 11)
+    x = case["x"]
+    x_scale = case["x_scale"]
+    shuffled = case["weight_shuffled"]
+    w_scale = case["w_scale"]
+    eager = aiter.gemm_a8w8_bpreshuffle(x, shuffled, x_scale, w_scale)
+
+    def launch(x_arg, scale_arg):
+        return aiter.gemm_a8w8_bpreshuffle(x_arg, shuffled, scale_arg, w_scale)
+
+    compiled = torch.compile(launch, fullgraph=True)
+    assert torch.equal(compiled(x, x_scale), eager)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch(x, x_scale)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, eager)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        streamed = launch(x, x_scale)
+        consumed = streamed.float() * 2
+    side.synchronize()
+    assert torch.equal(streamed, eager)
+    assert torch.equal(consumed, eager.float() * 2)
+    aiter.logger.info(
+        "INT8 4-wave correctness: passed %d bit-exact shapes, padded K, signed "
+        "extrema, zero rows, contract rejections, compile, graph and stream",
+        len(cases),
+    )
+
+
 def _iter_flydsl_csv_cases():
     """Yield (test_gemm kwargs, bench metadata) for flydsl tuned CSV rows."""
     gfx, cu = get_gfx(), get_cu_num()
@@ -872,6 +1060,8 @@ parser.add_argument(
 
 
 args = parser.parse_args()
+
+run_int8_4wave_ci_correctness()
 
 if not args.no_flydsl_csv:
     bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
