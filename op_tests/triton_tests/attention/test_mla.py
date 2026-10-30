@@ -1116,3 +1116,56 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
         assert isinstance(result, tuple) and len(result) == 3
     else:
         assert result is output
+
+
+@pytest.mark.parametrize("query_stride", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+def test_mla_decode_fwd_unshuffled_query_stride_eligibility(
+    monkeypatch, query_stride, dtype
+):
+    import aiter.ops.triton.attention.mla as mla_module
+
+    monkeypatch.setattr(mla_module, "DEVICE_ARCH", "gfx1250")
+    monkeypatch.setattr(mla_module, "IS_DEVICE_ARCH_GFX12", True)
+    monkeypatch.setattr(mla_module, "get_num_sms", lambda: 96)
+    launches = []
+
+    class CaptureLaunch:
+        def __init__(self, pipelined):
+            self.pipelined = pipelined
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(self.pipelined)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch(True))
+    monkeypatch.setattr(
+        mla_module, "gluon_mla_decode_fwd_kernel_non_pipelined", CaptureLaunch(False)
+    )
+    # Metadata-only dispatch check. No GPU allocation or kernel launch.
+    batch_size, heads, head_dim = 128, 64, 576
+    query = torch.empty(
+        (batch_size, heads, head_dim * query_stride), dtype=dtype, device="meta"
+    )[..., ::query_stride]
+    output = torch.empty((batch_size, heads, 512), dtype=torch.bfloat16, device="meta")
+    result = mla_module.mla_decode_fwd(
+        q=query,
+        kv_buffer=torch.empty((1, 64, 1, head_dim), dtype=dtype, device="meta"),
+        out=output,
+        cu_seqlens_q=torch.empty((batch_size + 1,), dtype=torch.int32, device="meta"),
+        seqused_k=torch.empty((batch_size,), dtype=torch.int32, device="meta"),
+        max_seqlen_kv=1,
+        block_tables=torch.empty((batch_size, 1), dtype=torch.int32, device="meta"),
+        softmax_scale=head_dim**-0.5,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        causal=True,
+        q_descale=None,
+        kv_descale=None,
+        shuffled_kv_cache=False,
+    )
+    assert query.stride(2) == query_stride
+    assert launches == [query_stride == 1]
+    assert result is output

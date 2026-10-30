@@ -478,6 +478,9 @@ def mla_decode_fwd(
         and ALL_DECODE
         and KV_CACHE_DTYPE in ("bf16", "fp8")
         and block_size in (64, 128)
+        and q.stride(2) == 1
+        and out.stride(2) == 1
+        and block_tables.stride(1) == 1
         and kv_buffer.stride(3) == 1
         and kv_buffer.stride(0) == block_size * kv_buffer.stride(1)
         and (
