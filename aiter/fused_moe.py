@@ -1553,12 +1553,14 @@ def _fused_moe_impl(
     )
     _validate_output_buffer_no_overlap(output, hidden_states)
     if herd_topk:
-        from aiter.ops.flydsl.herd_topk import (
-            herd_finalize_candidates,
-            herd_use_fused_drop,
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+            _FUSED_ROUTE_PSUM_MAX_EXPERTS,
         )
+        from aiter.ops.flydsl.herd_topk import herd_finalize_candidates
 
-        if not herd_use_fused_drop():
+        # The grouped MoE drops inside its one-workgroup route kernel, which
+        # keeps one LDS slot per expert; wider MoEs finish HERD here instead.
+        if E > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
             # Pad rows past num_local_tokens leave as ids -1, which the grouped
             # MoE route skips like any other unrouted row.
             topk_weight, topk_ids = herd_finalize_candidates(
