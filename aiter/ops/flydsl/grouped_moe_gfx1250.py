@@ -670,6 +670,44 @@ def get_wmma_m_rep(
     return tile_m // m_warp // wmma_m
 
 
+def _a_gather_wave_grid(
+    tile_m: int, tile_n: int, m_warp: int, n_warp: int
+) -> tuple[int, int, int]:
+    """``(m_warp, n_warp, waves_per_tensor_tdm)`` the indexed A gather accepts.
+
+    The gather keeps A and its scale on one half of the workgroup and B on the
+    other, so it needs ``num_waves == 2 * waves_per_tensor_tdm``, and each A
+    wave must own a multiple of 8 rows. A tuned grid that fits is kept with
+    its ``waves_per_tensor_tdm`` fixed up; otherwise the grid nearest in wave
+    count that fits replaces it.
+    """
+    tile_m, tile_n = int(tile_m), int(tile_n)
+    m_warp, n_warp = int(m_warp), int(n_warp)
+    if tile_m == 256 and m_warp * n_warp == 4:
+        # Only A's owner waves issue its row gathers, which at four waves left
+        # two of them 128 rows each per K tile. Eight waves with A on four
+        # (1536 tok decode: GEMM1 182 -> 147 us, 515 -> 488 us/layer).
+        return 2, 4, 4
+    waves = (m_warp * n_warp).bit_length()
+    grids = sorted(
+        ((mw, nw) for mw in (1, 2, 4) for nw in (1, 2, 4, 8) if mw * nw in (2, 4, 8)),
+        key=lambda g: (
+            g != (m_warp, n_warp),
+            abs((g[0] * g[1]).bit_length() - waves),
+            g[0] != m_warp,
+        ),
+    )
+    for mw, nw in grids:
+        wpt = mw * nw // 2
+        if tile_m % (8 * wpt) or tile_m % (16 * mw) or tile_n % (16 * nw):
+            continue
+        return mw, nw, wpt
+    raise ValueError(
+        f"[grouped-moe gemm1] no wave grid lets tile {tile_m}x{tile_n} gather "
+        "its compact A rows"
+    )
+
+
 def _grouped_a8w4_tdm_moe(
     hidden_states,
     w1,
@@ -1080,16 +1118,18 @@ def _grouped_a8w4_tdm_moe(
         torch.uint8,
         dtypes.fp4x2,
     )
-    if (
-        _compact
-        and _prequantized
-        and int(tile_m) == 256
-        and int(m_warp) * int(n_warp) == 4
-    ):
-        # Only A's owner waves issue its row gathers, which at four waves left
-        # two of them 128 rows each per K tile. Eight waves with A on four
-        # (1536 tok decode: GEMM1 182 -> 147 us, 515 -> 488 us/layer).
-        m_warp, n_warp, waves_per_tensor_tdm = 2, 4, 4
+    _row_gather = _compact and bool(getattr(_compact_ctx, "compact_row_gather", False))
+    if _row_gather and not _prequantized:
+        raise ValueError(
+            "[grouped-moe compact] dispatch shipped token-major rows for GEMM1 "
+            "to gather, but only a prequantized A can be gathered; got "
+            f"{hidden_states.dtype} with a1_scale="
+            f"{None if src_a1_scale is None else src_a1_scale.dtype}"
+        )
+    if _row_gather:
+        m_warp, n_warp, waves_per_tensor_tdm = _a_gather_wave_grid(
+            tile_m, tile_n, m_warp, n_warp
+        )
         wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
@@ -1278,16 +1318,14 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
-            a_row_index=(
-                stage2_scatter.compact_ep_rowmap if _compact and _prequantized else None
-            ),
+            a_row_index=stage2_scatter.compact_ep_rowmap if _row_gather else None,
             a_index_bound=(
                 int(stage2_scatter.world_size) * int(stage2_scatter.max_tokens_per_rank)
-                if _compact and _prequantized
+                if _row_gather
                 else 0
             ),
-            a_index_stride=2 if _compact and _prequantized else 1,
-            a_index_divisor=int(topk) if _compact and _prequantized else 1,
+            a_index_stride=2 if _row_gather else 1,
+            a_index_divisor=int(topk) if _row_gather else 1,
             **_situ_kw,
         )
     else:
@@ -1328,16 +1366,14 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
-            a_row_index=(
-                stage2_scatter.compact_ep_rowmap if _compact and _prequantized else None
-            ),
+            a_row_index=stage2_scatter.compact_ep_rowmap if _row_gather else None,
             a_index_bound=(
                 int(stage2_scatter.world_size) * int(stage2_scatter.max_tokens_per_rank)
-                if _compact and _prequantized
+                if _row_gather
                 else 0
             ),
-            a_index_stride=2 if _compact and _prequantized else 1,
-            a_index_divisor=int(topk) if _compact and _prequantized else 1,
+            a_index_stride=2 if _row_gather else 1,
+            a_index_divisor=int(topk) if _row_gather else 1,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(

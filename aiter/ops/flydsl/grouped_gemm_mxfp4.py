@@ -248,6 +248,10 @@ def flydsl_grouped_gemm_a8w4_masked(
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
+    if m_align:
+        # A tile skipped for starting in an expert's padding never reaches the
+        # M-cluster barrier its peers wait in; cluster_m only buys B multicast.
+        cluster_m = 1
     stage = 1 if stage1_act else 2
     persistent_workers = int(
         os.environ.get(
@@ -291,6 +295,19 @@ def flydsl_grouped_gemm_a8w4_masked(
             )
     ep_row_map_tensor = (ep_row_map if ep_row_map is not None else out).view(-1)
     a_gather = _a_gather_mode(a_row_index, a_index_bound)
+    as_prologue = _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue)
+    if a_gather:
+        # The gather kernel has no A-scale prologue load.
+        as_prologue = 0
+        if m_warp * n_warp != 2 * waves_per_tensor_tdm or tile_m % (
+            8 * waves_per_tensor_tdm
+        ):
+            raise ValueError(
+                f"indexed A gather needs num_waves == 2 * waves_per_tensor_tdm "
+                f"and tile_m % (8 * waves_per_tensor_tdm) == 0, got "
+                f"{m_warp}x{n_warp} waves, waves_per_tensor_tdm="
+                f"{waves_per_tensor_tdm}, tile_m={tile_m}"
+            )
     if a_gather & 4:
         # A resident full-K A-scale beats one more stage of the per-K-tile
         # scale row gather (t256 decode, 1536 tok: 562 -> 513 us/layer at b3).
@@ -317,7 +334,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         cluster_m,
         _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
         waves_per_tensor_tdm,
-        _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue),
+        as_prologue,
         _select_tdm_b_th(tdm_b_th),
     )
     ep_spec = (
