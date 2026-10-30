@@ -470,6 +470,8 @@ def _parse_args(argv=None):
         length < args.query_length or length >= 2**31 for length in args.context_length
     ):
         parser.error("context lengths must include all query tokens and fit in int32")
+    if args.sliding_window < -1:
+        parser.error("--sliding-window must be -1, 0 or positive")
     args.sliding_window = max(args.sliding_window, 0)
     if asymmetric and (args.head_dim, args.value_dim) != (192, 128):
         parser.error("asymmetric dimensions require Q/K192-V128")
