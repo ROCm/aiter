@@ -17,7 +17,7 @@ import torch
 import aiter
 import aiter.ops.fused_qknorm_idxrqknorm as op
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 from aiter.utility import fp4_utils
@@ -2177,7 +2177,7 @@ def check_mxfp4(mode, dtype, num_tokens, block_size, rotary_dim, use_fp8_kv_cach
         num_index_heads=1,
         rotary_dim=rotary_dim,
     )
-    ret, err = {"gfx": get_gfx()}, 0
+    ret, err = {"gfx": get_gfx_runtime()}, 0
     for nkv, slot_case in itertools.product(nkvs, slot_cases):
         case = new_case(num_kv_heads=nkv)
         case["slot_mapping"], case["index_slot_mapping"] = mxfp4_slots(case, slot_case)
@@ -2273,8 +2273,8 @@ def check_mxfp4_scale_rule(num_tokens: int):
 
 
 def check_mxfp4_reject():
-    """Each contract violation is refused ("good" shows the harness is sound). Returns 0:
-    there is no numeric error, the expected refusal happened."""
+    """Each contract violation is refused with its own check's message ("good" shows the
+    harness is sound). Returns 0: no numeric error, the expected refusal happened."""
     bf16, zeros8 = torch.bfloat16, partial(
         torch.zeros, dtype=torch.uint8, device="cuda"
     )
@@ -2291,32 +2291,50 @@ def check_mxfp4_reject():
     )[0][-1]
     q8 = run(case(block_size=128), mode="q_fp8_out", q_dtype=dtypes.fp8)[0][-1]
     kv_only = run(case(block_size=128), mode="mxfp4_kv", kv_dtype="mxfp4")[0][-1]
-    # name -> (call, {positional index: replacement}, kwargs); 14 is V, 15 the index cache
+    # name -> (call, {positional index: replacement}, kwargs, expected message); 14 is V, 15
+    # the index cache
+    whole_pages = "requires a uint8 index_cache of whole 8704 B pages"
     cases = {
-        "good": (page16, {}, {}),
+        "good": (page16, {}, {}, None),
         "not_uint8": (
             page16,
             {15: torch.zeros(1, 128, HEAD_DIM, dtype=bf16, device="cuda")},
             {},
+            whole_pages,
         ),
-        "partial_page": (page16, {15: zeros8(MXFP4_PAGE + 128)}, {}),
-        "skip_index_branch": (page16, {}, {"skip_index_branch": True}),
-        "kv_mxfp4_small_index": (kv, {15: zeros8(128)}, {}),
-        "kv_mxfp4_few_index_pages": (kv, {15: zeros8(MXFP4_PAGE)}, {}),
-        "kv_mxfp4_v_pages": (kv, {14: kv.args[14][:1]}, {}),
+        "partial_page": (page16, {15: zeros8(MXFP4_PAGE + 128)}, {}, whole_pages),
+        "skip_index_branch": (
+            page16,
+            {},
+            {"skip_index_branch": True},
+            "index_cache_dtype='mxfp4' requires the sparse insert mode",
+        ),
+        # the case holds 2 pages of 128 tokens, the index cache 1
+        "kv_mxfp4_few_index_pages": (
+            kv,
+            {15: zeros8(MXFP4_PAGE)},
+            {},
+            "index_cache must contain at least num_blocks * block_size rows",
+        ),
+        "kv_mxfp4_v_pages": (
+            kv,
+            {14: kv.args[14][:1]},
+            {},
+            "with the same num_pages and a contiguous last dim",
+        ),
     }
     with tempfile.TemporaryDirectory() as tmp:
-        for name, (call, edits, kwargs) in cases.items():
+        for name, (call, edits, kwargs, msg) in cases.items():
             args = [edits.get(i, a) for i, a in enumerate(call.args)]
             path = os.path.join(tmp, name)
             torch.save((args, {**call.keywords, **kwargs}), path)
             cmd = [sys.executable, "-c", REJECT_CHILD, path]
             r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if name == "good":
+            if msg is None:
                 assert r.returncode == 0, r.stderr[-500:]
             else:
                 assert r.returncode != 0, name
-                assert "mxfp4" in r.stderr or "index" in r.stderr, r.stderr[-500:]
+                assert msg in r.stderr, f"{name}: {r.stderr[-500:]}"
     # Where opus converts to fp4/fp8 as zeros the wrapper raises: fake the arch
     for call, gfx, msg in (
         (page16, "gfx942", "gfx950"),
@@ -2368,10 +2386,11 @@ DEFAULT_CASES += [
     ("mxfp4_scale_rule", "bf16", 4096, 128, 64, 1),
     ("mxfp4_reject", "bf16", 32, 16, 64, 1),
 ]
-if get_gfx() != "gfx950":
+# the live GPU, not GPU_ARCHS (CI exports "gfx942;gfx950" and get_gfx() takes the last one)
+if get_gfx_runtime() != "gfx950":
     aiter.logger.warning(
         "mxfp4 caches and the e4m3 q_out are tested on gfx950 only, not %s: skipping",
-        get_gfx(),
+        get_gfx_runtime(),
     )
     DEFAULT_CASES = [case for case in DEFAULT_CASES if case[0] not in MXFP4]
 

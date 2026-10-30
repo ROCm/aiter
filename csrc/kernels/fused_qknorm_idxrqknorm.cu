@@ -239,7 +239,7 @@ constexpr int kFp4PageBytes  = kFp4PageTokens * (kFp4DataBytes + kFp4ScaleBytes)
 constexpr int kFp4LanesPerGroup = 32 / kElemsPerLane;
 
 // ceil(log2(amax / 6)) + 127: copy of indexer_fp4_scale_e8m0 in cache_kernels.cu, pinned to
-// per_1x32_f4_quant by op_tests/test_fused_qknorm_idxrqknorm_mxfp4.py.
+// per_1x32_f4_quant by the mxfp4_scale_rule mode of op_tests/test_fused_qknorm_idxrqknorm.py.
 __device__ __forceinline__ uint8_t mxfp4ScaleE8m0(const float amax)
 {
     constexpr float fp4_max     = static_cast<float>(opus::finfo<opus::fp4_t>::max());
@@ -317,7 +317,8 @@ template <typename scalar_t,
           bool kInsertKV,
           bool kAsmLayout,
           bool kIndexFp4,
-          bool kKvFp4>
+          bool kKvFp4,
+          bool kQFp8>
 __global__ void fusedQKNormIdxrQKNormKernel(
     scalar_t* __restrict__ qkv,
     scalar_t* __restrict__ q_out,
@@ -360,7 +361,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int64_t v_s_block,
     int64_t v_s_token,
     int64_t v_s_head,
-    // Main Q as unit-scale e4m3 (replaces the q_out row when set).
+    // Main Q as unit-scale e4m3 (kQFp8 only; replaces the q_out row).
     opus::fp8_t* __restrict__ q_fp8_out)
 {
     const int warps_per_block = blockDim.x / 32;
@@ -552,7 +553,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     {
         if(is_q)
         {
-            if(q_fp8_out != nullptr)
+            if constexpr(kQFp8)
             {
                 // Saturate (+-inf too); the compares keep NaN a NaN.
                 const float fp8_max = fp8Max<opus::fp8_t>();
@@ -767,7 +768,7 @@ void launchFusedQKNormIdxrQKNorm(
         return;
     }
 
-#define LAUNCH(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE)               \
+#define LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8)      \
     fusedQKNormIdxrQKNormKernel<scalar_t,                                                    \
                                 cache_t,                                                     \
                                 index_cache_t,                                               \
@@ -780,7 +781,8 @@ void launchFusedQKNormIdxrQKNorm(
                                 INSERT,                                                      \
                                 ASM,                                                         \
                                 kIndexFp4,                                                   \
-                                kKvFp4>                                                      \
+                                kKvFp4,                                                      \
+                                QFP8>                                                        \
         <<<grid, kBlockSize, 0, stream>>>(qkv,                                               \
                                           q_out,                                             \
                                           index_q_out,                                       \
@@ -814,6 +816,28 @@ void launchFusedQKNormIdxrQKNorm(
                                           v_s_token,                                         \
                                           v_s_head,                                          \
                                           q_fp8_out)
+
+// The e4m3 q_out store is compiled in only where it can run (insert mode), so the other
+// instantiations are unchanged.
+#define LAUNCH(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE)               \
+    do                                                                                       \
+    {                                                                                        \
+        if constexpr(INSERT)                                                                 \
+        {                                                                                    \
+            if(q_fp8_out != nullptr)                                                         \
+            {                                                                                \
+                LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, true); \
+            }                                                                                \
+            else                                                                             \
+            {                                                                                \
+                LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, false); \
+            }                                                                                \
+        }                                                                                    \
+        else                                                                                 \
+        {                                                                                    \
+            LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, false); \
+        }                                                                                    \
+    } while(0)
 
 #define LAUNCH_SCALE(IS_SPARSE, PROCESS_INDEX, INSERT, ASM)     \
     do                                                          \
@@ -896,6 +920,7 @@ void launchFusedQKNormIdxrQKNorm(
 #undef LAUNCH_ASM
 #undef LAUNCH_SCALE
 #undef LAUNCH
+#undef LAUNCH_Q
 }
 
 } // namespace fused_qknorm_idxrqknorm_ops
@@ -1187,7 +1212,9 @@ static void fused_qknorm_idxrqknorm_impl(
                 // Main-cache size(0) is a physical storage span in packed LBHNC
                 // mode and includes gaps belonging to the opposite K/V side. It
                 // therefore cannot define the independently mapped index-cache
-                // capacity. As with slot_mapping, callers own bounds validity.
+                // capacity: no capacity check is possible here. Caller contract (as for
+                // slot_mapping): every non-negative index_slot_mapping entry must be below
+                // the rows index_cache holds (numel / 128; numel / 8704 * 128 for mxfp4).
                 AITER_CHECK(index_cache->numel() % kHeadDim == 0,
                             "index_cache must contain contiguous 128-element rows");
             }
