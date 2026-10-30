@@ -147,6 +147,7 @@ def _issue_chunk(
     ws_off,
     cc_off,
     v_off,
+    stride_v,
     o_c_v,
     o_t,
     H: gl.constexpr,
@@ -160,7 +161,6 @@ def _issue_chunk(
     ``gt`` and ``beta`` are copied one element per thread (``o_t``), excess
     threads masked. ``WITH_OUTPUT`` (pass C) also fetches ``qd`` and ``Mqk``.
     """
-    tb = t0 * H
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         s_gt, ws_gt + ws_idx * K, o_t, mask=o_t < K
     )
@@ -175,7 +175,7 @@ def _issue_chunk(
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         s_v,
-        v_input + tb * V,
+        v_input + t0 * stride_v,
         v_off,
         mask=((t0 + o_c_v) < tok_end)[:, None],
         other=0.0,
@@ -209,6 +209,7 @@ def k2_ab_fused_gluon(
     seg_tok_base,
     seg_tok_end,
     TOTAL_TILES,
+    stride_v,
     H: gl.constexpr,
     K: gl.constexpr,
     V: gl.constexpr,
@@ -275,7 +276,7 @@ def k2_ab_fused_gluon(
 
     ws_off = (o_c_s[:, None] * K + o_k_s[None, :]).to(gl.int32)
     cc_off = (o_r_cc[:, None] * C + o_c_cc[None, :]).to(gl.int32)
-    v_off = (i_h * V + o_c_v[:, None] * (H * V) + o_w_v[None, :]).to(gl.int32)
+    v_off = (i_h * V + o_c_v[:, None] * stride_v + o_w_v[None, :]).to(gl.int32)
 
     inv_ty: gl.constexpr = ws_inv_mqk.dtype.element_ty
     s_kd = gl.allocate_shared_memory(gl.bfloat16, [2, C, K], SH_WS)
@@ -293,8 +294,8 @@ def k2_ab_fused_gluon(
         _issue_chunk(ws_kd, ws_kr, ws_gt, ws_beta, ws_inv_mqk, v_input, None,
                      s_kd.index(0), s_kr.index(0), s_inv.index(0), s_v.index(0),
                      s_gt.index(0), s_beta.index(0), None, None, ws0, tok_base,
-                     tok_end, ws_off, cc_off, v_off, o_c_v, o_t, H, K, V, C,
-                     False)  # fmt: skip
+                     tok_end, ws_off, cc_off, v_off, stride_v, o_c_v, o_t, H, K,
+                     V, C, False)  # fmt: skip
 
     for j in range(n_chunks):
         cur = j % 2
@@ -306,7 +307,8 @@ def k2_ab_fused_gluon(
                          s_inv.index(1 - cur), s_v.index(1 - cur),
                          s_gt.index(1 - cur), s_beta.index(1 - cur), None, None,
                          ws0 + j + 1, tok_base + (j + 1) * C, tok_end, ws_off,
-                         cc_off, v_off, o_c_v, o_t, H, K, V, C, False)  # fmt: skip
+                         cc_off, v_off, stride_v, o_c_v, o_t, H, K, V, C,
+                         False)  # fmt: skip
 
         kd_a = gl.amd.cdna4.async_copy.load_shared_relaxed(s_kd.index(cur), A_OP_B)
         # The permuted [C, K] view is the kr^T A operand.
@@ -377,6 +379,7 @@ def k2_c_gluon(
     has_initial_state,
     cache_stride,
     TOTAL_TILES,
+    stride_v,
     H: gl.constexpr,
     K: gl.constexpr,
     V: gl.constexpr,
@@ -451,7 +454,7 @@ def k2_c_gluon(
 
     ws_off = (o_c_s[:, None] * K + o_k_s[None, :]).to(gl.int32)
     cc_off = (o_r_cc[:, None] * C + o_c_cc[None, :]).to(gl.int32)
-    v_off = (i_h * V + o_c_v[:, None] * (H * V) + o_w_v[None, :]).to(gl.int32)
+    v_off = (i_h * V + o_c_v[:, None] * stride_v + o_w_v[None, :]).to(gl.int32)
     o_off = (i_h * V + o_c_m[:, None] * (H * V) + o_w_m[None, :]).to(gl.int32)
     # K-first [K, V] and V-first [V, K] offsets of this program's state block.
     s_off = (o_k_m[:, None] * V + o_w_m[None, :]).to(gl.int32)
@@ -491,7 +494,7 @@ def k2_c_gluon(
                      s_kd.index(0), s_kr.index(0), s_inv.index(0), s_v.index(0),
                      s_gt.index(0), s_beta.index(0), s_qd.index(0),
                      s_mqk.index(0), ws0, tok_base, tok_end, ws_off, cc_off,
-                     v_off, o_c_v, o_t, H, K, V, C, True)  # fmt: skip
+                     v_off, stride_v, o_c_v, o_t, H, K, V, C, True)  # fmt: skip
 
     for j in range(n_chunks):
         cur = j % 2
@@ -504,7 +507,7 @@ def k2_c_gluon(
                          s_gt.index(1 - cur), s_beta.index(1 - cur),
                          s_qd.index(1 - cur), s_mqk.index(1 - cur), ws0 + j + 1,
                          tok_base + (j + 1) * C, tok_end, ws_off, cc_off, v_off,
-                         o_c_v, o_t, H, K, V, C, True)  # fmt: skip
+                         stride_v, o_c_v, o_t, H, K, V, C, True)  # fmt: skip
 
         t0 = tok_base + j * C
         kd_a = gl.amd.cdna4.async_copy.load_shared_relaxed(s_kd.index(cur), A_OP_B)
@@ -575,6 +578,7 @@ def gluon_k2_ab_fused(
     seg_tok_base,
     seg_tok_end,
     TOTAL_TILES,
+    stride_v,
     H,
     K,
     V,
@@ -598,6 +602,7 @@ def gluon_k2_ab_fused(
         seg_tok_base=seg_tok_base,
         seg_tok_end=seg_tok_end,
         TOTAL_TILES=TOTAL_TILES,
+        stride_v=stride_v,
         H=H,
         K=K,
         V=V,
@@ -633,6 +638,7 @@ def gluon_k2_c(
     has_initial_state,
     cache_stride,
     TOTAL_TILES,
+    stride_v,
     H,
     K,
     V,
@@ -667,6 +673,7 @@ def gluon_k2_c(
         has_initial_state=has_initial_state,
         cache_stride=cache_stride,
         TOTAL_TILES=TOTAL_TILES,
+        stride_v=stride_v,
         H=H,
         K=K,
         V=V,

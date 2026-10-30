@@ -904,11 +904,20 @@ def _gluon_k2_usable(C: int, K: int, V: int) -> bool:
     )
 
 
-def _tdm_operand(x: torch.Tensor, tdm: bool) -> tuple[torch.Tensor, int]:
-    """``x`` ``[B, T, H, D]`` and its token stride: ``x`` itself if ``tdm`` and
-    the gfx1250 Gluon kernels can read it in place, else a packed copy."""
+def _strided_operand(x: torch.Tensor, in_place: bool) -> tuple[torch.Tensor, int]:
+    """``x`` ``[B, T, H, D]`` and its token stride: ``x`` itself if ``in_place``
+    and the Gluon kernels can read it at its own token stride, else a packed copy."""
     B, T, H, D = x.shape
-    if tdm and B == 1 and T > 1 and x.stride(3) == 1 and (H == 1 or x.stride(2) == D):
+    readable = B == 1 and T > 1 and x.stride(3) == 1 and (H == 1 or x.stride(2) == D)
+    # The gfx950 kernels use 32-bit element offsets and 16-byte vector loads,
+    # so the rows must be 16-byte aligned.
+    if readable and DEVICE_ARCH == "gfx950":
+        readable = (
+            (T - 1) * x.stride(1) + H * D < 2**31
+            and x.data_ptr() % 16 == 0
+            and x.stride(1) * x.element_size() % 16 == 0
+        )
+    if in_place and readable:
         return x, x.stride(1)
     return x.contiguous(), H * D
 
@@ -1286,21 +1295,6 @@ def flash_kda_fwd(
 
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
     use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
-    # The gfx1250 Gluon kernels read q, k, g (K1) and v (K2) at their own token
-    # stride. Every other kernel needs them packed.
-    stride_q = stride_k = stride_g = H * K
-    stride_v = H * V
-    if not (
-        q.is_contiguous()
-        and k.is_contiguous()
-        and g.is_contiguous()
-        and v.is_contiguous()
-    ):
-        tdm = DEVICE_ARCH == "gfx1250"
-        q, stride_q = _tdm_operand(q, tdm and use_gluon_k1)
-        k, stride_k = _tdm_operand(k, tdm and use_gluon_k1)
-        g, stride_g = _tdm_operand(g, tdm and use_gluon_k1)
-        v, stride_v = _tdm_operand(v, tdm and use_gluon_k2)
 
     if cu_seqlens is not None:
         if B != 1:
@@ -1365,15 +1359,31 @@ def flash_kda_fwd(
     # here for the same reason.
     ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
 
-    # Only a segmented shape has a pass A. On gfx950, pass C's route is final
-    # here when unsegmented; segmented, it is settled once the segment count is
-    # known.
+    # Only a segmented shape has a pass A. On gfx950, a segmented pass C takes
+    # its route from the segment count.
     use_gluon_k2a = use_gluon_k2 and segmented
     use_gluon_k2c = (
         use_gluon_k2
         and _GLUON_K2C_ARCH_OK
         and (DEVICE_ARCH == "gfx1250" or segmented or _k2c_gluon_usable(False, V, N, H))
     )
+    if use_gluon_k2c and DEVICE_ARCH == "gfx950" and segmented:
+        use_gluon_k2c = _k2c_gluon_usable(True, V, num_segs, H)
+    # The Gluon kernels read q, k, g (K1) and v (passes A and C) at their own
+    # token stride. The Triton kernels need them packed.
+    stride_q = stride_k = stride_g = H * K
+    stride_v = H * V
+    if not (
+        q.is_contiguous()
+        and k.is_contiguous()
+        and g.is_contiguous()
+        and v.is_contiguous()
+    ):
+        v_in_place = use_gluon_k2c and (use_gluon_k2a or not segmented)
+        q, stride_q = _strided_operand(q, use_gluon_k1)
+        k, stride_k = _strided_operand(k, use_gluon_k1)
+        g, stride_g = _strided_operand(g, use_gluon_k1)
+        v, stride_v = _strided_operand(v, v_in_place)
     # sigmoid(beta) per tile, read only by the gfx950 Gluon K2.
     ws_beta = (
         torch.empty(H * total_tiles, C, dtype=torch.float32, device=dev)
@@ -1388,13 +1398,7 @@ def flash_kda_fwd(
             )
 
             k1_warps, k1_waves = _k1_gluon_schedule()
-            k1_args = {
-                "stride_q": stride_q,
-                "stride_k": stride_k,
-                "stride_g": stride_g,
-                "num_warps": k1_warps,
-                "waves_per_eu": k1_waves,
-            }
+            k1_args = {"num_warps": k1_warps, "waves_per_eu": k1_waves}
         else:
             from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.flash_kda_k1 import (
                 gluon_k1_prepare,
@@ -1426,6 +1430,9 @@ def flash_kda_fwd(
             T=T,
             NT=NT,
             TOTAL_TILES=total_tiles,
+            stride_q=stride_q,
+            stride_k=stride_k,
+            stride_g=stride_g,
             H=H,
             K=K,
             C=C,
@@ -1589,6 +1596,7 @@ def flash_kda_fwd(
                 seg_tok_base=seg_tok_base,
                 seg_tok_end=seg_tok_end,
                 TOTAL_TILES=total_tiles,
+                stride_v=stride_v,
                 H=H,
                 K=K,
                 V=V,
@@ -1639,19 +1647,13 @@ def flash_kda_fwd(
         h_in = None if paged else h0
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
-    if use_gluon_k2c and DEVICE_ARCH == "gfx950" and segmented:
-        use_gluon_k2c = _k2c_gluon_usable(True, V, num_segs, H)
     _log_route(
         use_gluon_k1, use_gluon_k2a if segmented else None, use_gluon_k2c, C, K, V
     )
     if use_gluon_k2c:
         if DEVICE_ARCH == "gfx1250":
             sched = _k2_gluon_schedule(V, num_segs, H, "k2_c_gluon")
-            arch_args = {
-                "beta_raw": beta,
-                "stride_v": stride_v,
-                "CPL": sched.kwargs["CPL"],
-            }
+            arch_args = {"beta_raw": beta, "CPL": sched.kwargs["CPL"]}
         else:
             sched = _k2c_gluon_schedule(segmented)
             arch_args = {"ws_beta": ws_beta}
@@ -1673,6 +1675,7 @@ def flash_kda_fwd(
             seg_is_last=seg_is_last,
             **(paged_args if paged else unpaged_args),
             TOTAL_TILES=total_tiles,
+            stride_v=stride_v,
             H=H,
             K=K,
             V=V,
