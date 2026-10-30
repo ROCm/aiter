@@ -48,17 +48,17 @@ def _detect_native() -> list[str]:
     try:
         # rocminfo: "Name: gfx942"; hipinfo: "gcnArchName: gfx1200"
         for line in _gpu_info_output().splitlines():
-            # A0 may surface as the gfx1250-strict variant target. Collapse it to
-            # gfx1250 for runtime dispatch: A0 and B0 select the same kernel
-            # family. B0-only binaries are rejected on A0 by the asicRevision asm
-            # gate and the Opus mach-0xeb code-object check, not by this name.
-            # Build-time strict targeting comes from GPU_ARCHS, not this path.
+            # Preserve the exact ROCr-reported identity, including the
+            # gfx1250-strict (MI450 A0) variant. strict is mapped to the gfx1250
+            # kernel family only at explicitly validated dispatch sites, via
+            # base_gfx_arch()/is_gfx1250_family(); build artifacts, caches, tuned
+            # configs and prebuilt binaries stay keyed by the exact target.
+            # Folding here would make _needs_arch_rebuild() treat a strict .so as
+            # not covering a strict device and rebuild in a loop once ROCr
+            # reports gfx1250-strict.
             match = re.search(rf"\b({_GFX_ARCH_PATTERN})\b", line, re.IGNORECASE)
             if match:
-                arch = match.group(1).lower()
-                if arch == "gfx1250-strict":
-                    arch = "gfx1250"
-                return [arch]
+                return [match.group(1).lower()]
     except Exception as e:
         raise RuntimeError(f"Get GPU arch from {_GPU_INFO_TOOL} failed: {e}") from e
     raise RuntimeError(f"No gfx arch found in {_GPU_INFO_TOOL} output.")

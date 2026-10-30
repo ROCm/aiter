@@ -26,6 +26,7 @@ from codegen.common import (
 )
 from opus_gemm_common import (
     KERNEL_REGISTRY,
+    base_gfx_arch,
     KernelKey,
     OpusGemmInstance,
     a8w8_kernels_list,
@@ -55,7 +56,7 @@ def _registry_arch(gfx: str) -> str:
     which all key on the family; hipcc still gets --offload-arch=gfx1250-strict
     from GPU_ARCHS.
     """
-    return "gfx1250" if gfx == "gfx1250-strict" else gfx
+    return base_gfx_arch(gfx)
 
 
 def _build_targets_standalone(explicit_targets=()):

@@ -16,6 +16,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.build_targets import is_gfx1250_family
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .arena import (
@@ -57,8 +58,10 @@ __all__ = [
 
 def _require_gfx1250():
     gfx = get_gfx()
-    if gfx != "gfx1250":
-        raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
+    # gfx1250-strict (MI450 A0) shares the gfx1250 MegaMoE kernel family. Accept
+    # the family here; exact identity is enforced for build/cache/.co elsewhere.
+    if not is_gfx1250_family(gfx):
+        raise RuntimeError(f"MegaMoEGfx1250 requires the gfx1250 family, got {gfx}")
 
 
 def _alias(owner: str, name: str) -> property:

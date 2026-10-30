@@ -14,7 +14,9 @@ sys.path.insert(
 )
 
 from aiter.jit.utils.build_targets import (
+    base_gfx_arch,
     get_build_targets_env,
+    is_gfx1250_family,
     torch_processor_count_to_cu,
 )
 
@@ -178,10 +180,14 @@ class TestRuntimeArchitecture(unittest.TestCase):
     def tearDown(self):
         self.chip_info.get_gfx_runtime.cache_clear()
 
-    def test_native_detection_normalizes_strict_variant(self):
-        # _detect_native folds gfx1250-strict (A0) to the gfx1250 kernel family
-        # for runtime dispatch; A0/B0 safety lives in the asicRevision asm gate
-        # and the Opus mach-id check, not in the dispatch name.
+    def test_native_detection_preserves_strict_identity(self):
+        # Regression lock: _detect_native must return the exact ROCr-reported
+        # identity, NOT fold gfx1250-strict (A0) to gfx1250. Folding here makes
+        # _needs_arch_rebuild treat a strict .so as not covering a strict device
+        # and rebuild in a loop once ROCr reports gfx1250-strict. A0/B0 safety
+        # lives in the asicRevision asm gate and the Opus mach-id check; the
+        # kernel-family mapping lives in base_gfx_arch()/is_gfx1250_family(),
+        # used only at explicitly validated dispatch sites.
         self.chip_info._detect_native.cache_clear()
         try:
             with mock.patch.object(
@@ -189,7 +195,9 @@ class TestRuntimeArchitecture(unittest.TestCase):
                 "_gpu_info_output",
                 return_value="  Name: gfx1250-strict\n",
             ):
-                self.assertEqual(self.chip_info._detect_native(), ["gfx1250"])
+                self.assertEqual(
+                    self.chip_info._detect_native(), ["gfx1250-strict"]
+                )
         finally:
             self.chip_info._detect_native.cache_clear()
 
@@ -349,6 +357,60 @@ asicRevision: 0
                 ):
                     self.chip_info.get_gfx_runtime()
 
+
+
+class TestGfxFamilyHelper(unittest.TestCase):
+    """base_gfx_arch / is_gfx1250_family: map strict to the gfx1250 family for
+    source/kernel sharing only -- never a binary-compatibility claim."""
+
+    def test_base_gfx_arch_folds_only_strict(self):
+        self.assertEqual(base_gfx_arch("gfx1250-strict"), "gfx1250")
+        self.assertEqual(base_gfx_arch("gfx1250"), "gfx1250")
+        self.assertEqual(base_gfx_arch("gfx942"), "gfx942")
+        self.assertEqual(base_gfx_arch("gfx950"), "gfx950")
+
+    def test_is_gfx1250_family(self):
+        self.assertTrue(is_gfx1250_family("gfx1250"))
+        self.assertTrue(is_gfx1250_family("gfx1250-strict"))
+        self.assertFalse(is_gfx1250_family("gfx942"))
+        self.assertFalse(is_gfx1250_family("gfx950"))
+
+
+class TestCodeObjectRebuildGuard(unittest.TestCase):
+    """_needs_arch_rebuild keys on the EXACT identity (via get_gfx_runtime and
+    the .so's embedded offload archs), so strict and gfx1250 code objects never
+    satisfy each other. This is the whole point of preserving raw identity in
+    _detect_native."""
+
+    def setUp(self):
+        from aiter.jit import core
+
+        self.core = core
+
+    def _needs_rebuild(self, running_arch, built_archs):
+        with (
+            mock.patch.object(self.core, "get_gfx_runtime", return_value=running_arch),
+            mock.patch.object(
+                self.core, "_so_offload_archs", return_value=set(built_archs)
+            ),
+        ):
+            return self.core._needs_arch_rebuild("dummy_module")
+
+    def test_matching_identity_is_accepted(self):
+        # runtime strict + built strict -> accept; runtime gfx1250 + built
+        # gfx1250 -> accept.
+        self.assertFalse(self._needs_rebuild("gfx1250-strict", {"gfx1250-strict"}))
+        self.assertFalse(self._needs_rebuild("gfx1250", {"gfx1250"}))
+
+    def test_crossed_identity_forces_rebuild(self):
+        # runtime strict + built gfx1250 (B0) -> reject; runtime gfx1250 +
+        # built strict -> reject. A0 must never run a B0 code object and v.v.
+        self.assertTrue(self._needs_rebuild("gfx1250-strict", {"gfx1250"}))
+        self.assertTrue(self._needs_rebuild("gfx1250", {"gfx1250-strict"}))
+
+    def test_host_only_so_is_not_rebuilt(self):
+        # empty offload set = host-only module; never force a rebuild.
+        self.assertFalse(self._needs_rebuild("gfx1250-strict", set()))
 
 if __name__ == "__main__":
     unittest.main()

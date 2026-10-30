@@ -7,6 +7,18 @@ import sys
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
 
+# base_gfx_arch: the single source of truth for gfx1250-strict -> gfx1250 kernel
+# family folding (see aiter/jit/utils/build_targets.py). Imported as a top-level
+# module -- build_targets.py has no torch/aiter deps -- so these standalone Opus
+# build scripts do not trigger aiter/__init__ (which loads native .so).
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "aiter", "jit", "utils"
+    ),
+)
+from build_targets import base_gfx_arch  # noqa: E402
+
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
@@ -2943,8 +2955,7 @@ class KernelKey:
 def _get_registry_records(family: str, gfx: str, cu_num: int) -> dict[int, object]:
     # gfx1250-strict (A0) shares the gfx1250 kernel family in the registry;
     # callers keep the gfx1250-strict spelling in KernelKey (compile target).
-    if gfx == "gfx1250-strict":
-        gfx = "gfx1250"
+    gfx = base_gfx_arch(gfx)
     tables = KERNEL_REGISTRY.get(family, {}).get(gfx, {})
     if not tables:
         return {}
@@ -2957,9 +2968,8 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
     """Select available kernels from the family/gfx/CU table."""
     family = family.strip().lower()
     gfx = gfx.split(":", 1)[0].strip().lower()
-    # Fold strict here too so main's a16w16 gfx1250 CO-existence filter below applies.
-    if gfx == "gfx1250-strict":
-        gfx = "gfx1250"
+    # Fold strict here too so the a16w16 gfx1250 CO-existence filter below applies.
+    gfx = base_gfx_arch(gfx)
     records = _get_registry_records(family, gfx, cu_num)
     if family == "a16w16" and gfx == "gfx1250":
         return {
@@ -3002,7 +3012,7 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
 
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
     """Select the default compile set from the current CU table."""
-    lookup_gfx = "gfx1250" if gfx == "gfx1250-strict" else gfx
+    lookup_gfx = base_gfx_arch(gfx)
     defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
     return {
         KernelKey("a16w16", gfx, cu_num, kid)
