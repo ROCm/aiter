@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# Q/K Gemma RMSNorm and interleaved MRoPE of Qwen3.5 full attention
+# Q/K Gemma RMSNorm and interleaved MRoPE
 
 import functools
 
@@ -16,7 +16,7 @@ ROPE_HALF = gl.constexpr(32)  # rotary_dim 64: two Neox halves
 
 @functools.cache
 def get_fused_qk_norm_mrope_layouts(num_warps):
-    # One row per wave: 8 values per lane for the norm, 1 value per lane for the RoPE halves.
+    # Rows over the waves: 8 values per lane for the norm, 1 value per lane for the RoPE halves.
     return {
         "row_layout": gl.BlockedLayout(
             [1, HEAD_DIM // 32], [1, 32], [num_warps, 1], [1, 0]
@@ -27,6 +27,9 @@ def get_fused_qk_norm_mrope_layouts(num_warps):
 
 _fused_qk_norm_mrope_repr = make_kernel_repr(
     "fused_qk_norm_mrope_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M"]
+)
+_fused_qk_norm_mrope_tdm_repr = make_kernel_repr(
+    "fused_qk_norm_mrope_tdm_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M"]
 )
 
 
@@ -77,8 +80,19 @@ def fused_qk_norm_mrope_gfx1250(
         token * (K_HEADS * HEAD_DIM) + (head - Q_HEADS) * HEAD_DIM,
     )
 
-    # Every load comes before the first wait: the row and its weight, the RoPE halves, the positions.
+    # The positions load first: the cos/sin loads wait for them. Then the row, its weight and the RoPE
+    # halves. The values with an _r suffix hold the same rows in the RoPE layout.
     x_row = gl.where(is_q, q_ptr, k_ptr) + offs_x
+    offs_r = gl.arange(0, ROPE_HALF, layout=gl.SliceLayout(0, rope_layout))
+    token_r = gl.convert_layout(token, gl.SliceLayout(1, rope_layout))
+    is_q_r = gl.convert_layout(is_q, gl.SliceLayout(1, rope_layout))
+    mask_r = gl.convert_layout(mask_m, gl.SliceLayout(1, rope_layout))
+    x_row_r = gl.convert_layout(x_row, gl.SliceLayout(1, rope_layout))
+    pos_t = gl.load(positions_ptr + token_r, mask=mask_r, other=0)
+    pos_h = gl.load(positions_ptr + stride_positions + token_r, mask=mask_r, other=0)
+    pos_w = gl.load(
+        positions_ptr + 2 * stride_positions + token_r, mask=mask_r, other=0
+    )
     x = gl.load(x_row[:, None] + offs_n[None, :], mask=mask_m[:, None], other=0.0)
     w = gl.where(
         is_q[:, None],
@@ -86,12 +100,7 @@ def fused_qk_norm_mrope_gfx1250(
         gl.load(k_weight_ptr + offs_n)[None, :],
     )
 
-    # The same rows in the RoPE layout: columns [0, 32) and [32, 64).
-    offs_r = gl.arange(0, ROPE_HALF, layout=gl.SliceLayout(0, rope_layout))
-    token_r = gl.convert_layout(token, gl.SliceLayout(1, rope_layout))
-    is_q_r = gl.convert_layout(is_q, gl.SliceLayout(1, rope_layout))
-    mask_r = gl.convert_layout(mask_m, gl.SliceLayout(1, rope_layout))
-    x_row_r = gl.convert_layout(x_row, gl.SliceLayout(1, rope_layout))
+    # The RoPE halves: columns [0, 32) and [32, 64).
     x_lo = gl.load(x_row_r[:, None] + offs_r[None, :], mask=mask_r[:, None], other=0.0)
     x_hi = gl.load(
         x_row_r[:, None] + ROPE_HALF + offs_r[None, :], mask=mask_r[:, None], other=0.0
@@ -108,11 +117,6 @@ def fused_qk_norm_mrope_gfx1250(
     )
 
     # Frequency i uses the H position, the W position or the T position (interleaved sections).
-    pos_t = gl.load(positions_ptr + token_r, mask=mask_r, other=0)
-    pos_h = gl.load(positions_ptr + stride_positions + token_r, mask=mask_r, other=0)
-    pos_w = gl.load(
-        positions_ptr + 2 * stride_positions + token_r, mask=mask_r, other=0
-    )
     use_h = (offs_r % 3 == 1) & (offs_r < 3 * SECTION_H)
     use_w = (offs_r % 3 == 2) & (offs_r < 3 * SECTION_W)
     pos = gl.where(
@@ -120,8 +124,13 @@ def fused_qk_norm_mrope_gfx1250(
         pos_h[:, None],
         gl.where(use_w[None, :], pos_w[:, None], pos_t[:, None]),
     )
-    cos = gl.load(cos_ptr + pos * stride_cos + offs_r[None, :])
-    sin = gl.load(sin_ptr + pos * stride_cos + offs_r[None, :])
+    # The mask keeps these loads before the norm: the compiler moves an unmasked load next to its use.
+    cos = gl.load(
+        cos_ptr + pos * stride_cos + offs_r[None, :], mask=mask_r[:, None], other=0.0
+    )
+    sin = gl.load(
+        sin_ptr + pos * stride_cos + offs_r[None, :], mask=mask_r[:, None], other=0.0
+    )
 
     # Gemma RMSNorm: x / rms(x) * (1 + w). Columns [64, 256) are done.
     x = x.to(gl.float32)
@@ -145,3 +154,178 @@ def fused_qk_norm_mrope_gfx1250(
     gl.store(
         out_row_r[:, None] + ROPE_HALF + offs_r[None, :], rope_hi, mask=mask_r[:, None]
     )
+
+
+@gluon.jit
+def _norm_rope_tile(
+    x_s,
+    out_s,
+    w_ptr,
+    t0,
+    num_tokens,
+    positions_ptr,
+    stride_positions,
+    cos_ptr,
+    sin_ptr,
+    stride_cos,
+    EPS: gl.constexpr,
+    HEADS: gl.constexpr,
+    SECTION_H: gl.constexpr,
+    SECTION_W: gl.constexpr,
+    ROWS: gl.constexpr,
+    WAIT: gl.constexpr,
+    row_layout: gl.constexpr,
+    rope_layout: gl.constexpr,
+):
+    # Row m of the tile is head m % HEADS of token t0 + m // HEADS.
+    offs_m = gl.arange(0, ROWS, layout=gl.SliceLayout(1, row_layout))
+    offs_n = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, row_layout))
+    mask_m = t0 + offs_m // HEADS < num_tokens
+
+    # The positions, cos/sin and weights load while the tile is in flight.
+    offs_r = gl.arange(0, ROPE_HALF, layout=gl.SliceLayout(0, rope_layout))
+    token_r = gl.convert_layout(t0 + offs_m // HEADS, gl.SliceLayout(1, rope_layout))
+    mask_r = gl.convert_layout(mask_m, gl.SliceLayout(1, rope_layout))
+    pos_t = gl.load(positions_ptr + token_r, mask=mask_r, other=0)
+    pos_h = gl.load(positions_ptr + stride_positions + token_r, mask=mask_r, other=0)
+    pos_w = gl.load(
+        positions_ptr + 2 * stride_positions + token_r, mask=mask_r, other=0
+    )
+    use_h = (offs_r % 3 == 1) & (offs_r < 3 * SECTION_H)
+    use_w = (offs_r % 3 == 2) & (offs_r < 3 * SECTION_W)
+    pos = gl.where(
+        use_h[None, :],
+        pos_h[:, None],
+        gl.where(use_w[None, :], pos_w[:, None], pos_t[:, None]),
+    )
+    cos = gl.load(
+        cos_ptr + pos * stride_cos + offs_r[None, :], mask=mask_r[:, None], other=0.0
+    )
+    sin = gl.load(
+        sin_ptr + pos * stride_cos + offs_r[None, :], mask=mask_r[:, None], other=0.0
+    )
+    w = gl.load(w_ptr + offs_n)[None, :].to(gl.float32)
+    w_lo = gl.load(w_ptr + offs_r)[None, :].to(gl.float32)
+    w_hi = gl.load(w_ptr + ROPE_HALF + offs_r)[None, :].to(gl.float32)
+
+    # Gemma RMSNorm: x / rms(x) * (1 + w). All columns go to LDS, then the RoPE values
+    # replace columns [0, 64) after the barrier.
+    gl.amd.gfx1250.tdm.async_wait(WAIT)
+    x = x_s.load(row_layout).to(gl.float32)
+    rstd = gl.rsqrt(gl.sum(x * x, axis=1) / HEAD_DIM + EPS)
+    out_s.store((x * rstd[:, None] * (w + 1.0)).to(out_s.dtype))
+    gl.barrier()
+
+    # Neox RoPE of columns [0, 64), from the same normalized values.
+    x_lo = x_s.slice(0, ROPE_HALF, dim=1).load(rope_layout).to(gl.float32)
+    x_hi = x_s.slice(ROPE_HALF, ROPE_HALF, dim=1).load(rope_layout).to(gl.float32)
+    rstd_r = gl.convert_layout(rstd, gl.SliceLayout(1, rope_layout))[:, None]
+    y_lo = x_lo * rstd_r * (w_lo + 1.0)
+    y_hi = x_hi * rstd_r * (w_hi + 1.0)
+    out_s.slice(0, ROPE_HALF, dim=1).store((y_lo * cos - y_hi * sin).to(out_s.dtype))
+    out_s.slice(ROPE_HALF, ROPE_HALF, dim=1).store(
+        (y_hi * cos + y_lo * sin).to(out_s.dtype)
+    )
+
+
+@gluon.jit(repr=_fused_qk_norm_mrope_tdm_repr)
+def fused_qk_norm_mrope_tdm_gfx1250(
+    q_ptr,
+    k_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    positions_ptr,
+    cos_ptr,
+    sin_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    num_tokens,
+    stride_q,
+    stride_k,
+    stride_positions,
+    stride_cos,
+    EPS: gl.constexpr,
+    Q_HEADS: gl.constexpr,
+    K_HEADS: gl.constexpr,
+    SECTION_H: gl.constexpr,
+    SECTION_W: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    row_layout: gl.constexpr,
+    rope_layout: gl.constexpr,
+):
+    # A program does BLOCK_M tokens. Their Q heads and their K heads move between memory and
+    # LDS as one TDM tile each.
+    smem_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    Q_COLS: gl.constexpr = Q_HEADS * HEAD_DIM
+    K_COLS: gl.constexpr = K_HEADS * HEAD_DIM
+    t0 = gl.program_id(0) * BLOCK_M
+    q_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        q_ptr, [num_tokens, Q_COLS], [stride_q, 1], [BLOCK_M, Q_COLS], smem_layout
+    )
+    k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        k_ptr, [num_tokens, K_COLS], [stride_k, 1], [BLOCK_M, K_COLS], smem_layout
+    )
+    q_out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        q_out_ptr, [num_tokens, Q_COLS], [Q_COLS, 1], [BLOCK_M, Q_COLS], smem_layout
+    )
+    k_out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        k_out_ptr, [num_tokens, K_COLS], [K_COLS, 1], [BLOCK_M, K_COLS], smem_layout
+    )
+    q_s = gl.allocate_shared_memory(
+        q_ptr.dtype.element_ty, [BLOCK_M, Q_COLS], smem_layout
+    )
+    k_s = gl.allocate_shared_memory(
+        k_ptr.dtype.element_ty, [BLOCK_M, K_COLS], smem_layout
+    )
+    q_out_s = gl.allocate_shared_memory(
+        q_out_ptr.dtype.element_ty, [BLOCK_M, Q_COLS], smem_layout
+    )
+    k_out_s = gl.allocate_shared_memory(
+        k_out_ptr.dtype.element_ty, [BLOCK_M, K_COLS], smem_layout
+    )
+    gl.amd.gfx1250.tdm.async_load(q_desc, [t0, 0], q_s)
+    gl.amd.gfx1250.tdm.async_load(k_desc, [t0, 0], k_s)
+    _norm_rope_tile(
+        q_s.reshape([BLOCK_M * Q_HEADS, HEAD_DIM]),
+        q_out_s.reshape([BLOCK_M * Q_HEADS, HEAD_DIM]),
+        q_weight_ptr,
+        t0,
+        num_tokens,
+        positions_ptr,
+        stride_positions,
+        cos_ptr,
+        sin_ptr,
+        stride_cos,
+        EPS,
+        Q_HEADS,
+        SECTION_H,
+        SECTION_W,
+        BLOCK_M * Q_HEADS,
+        1,
+        row_layout,
+        rope_layout,
+    )
+    _norm_rope_tile(
+        k_s.reshape([BLOCK_M * K_HEADS, HEAD_DIM]),
+        k_out_s.reshape([BLOCK_M * K_HEADS, HEAD_DIM]),
+        k_weight_ptr,
+        t0,
+        num_tokens,
+        positions_ptr,
+        stride_positions,
+        cos_ptr,
+        sin_ptr,
+        stride_cos,
+        EPS,
+        K_HEADS,
+        SECTION_H,
+        SECTION_W,
+        BLOCK_M * K_HEADS,
+        0,
+        row_layout,
+        rope_layout,
+    )
+    gl.barrier()
+    gl.amd.gfx1250.tdm.async_store(q_out_desc, [t0, 0], q_out_s)
+    gl.amd.gfx1250.tdm.async_store(k_out_desc, [t0, 0], k_out_s)
+    gl.amd.gfx1250.tdm.async_wait(0)

@@ -19,7 +19,7 @@ SECTION = [11, 11, 10]
 
 def make_inputs(num_tokens, q_heads, k_heads):
     torch.manual_seed(0)
-    # Q and K are column slices of one [T, gate | q | k | v] projection output, as in Qwen3.5.
+    # Q and K are column slices of one [T, gate | q | k | v] projection output.
     qkv = torch.randn(
         (num_tokens, 2 * (q_heads + k_heads) * HEAD_DIM),
         dtype=torch.bfloat16,
@@ -64,7 +64,7 @@ def torch_ref(x, weight, heads, inputs):
     return out.flatten(-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 37, 300])
+@pytest.mark.parametrize("num_tokens", [1, 37, 300, 4001])
 @pytest.mark.parametrize("q_heads, k_heads", [(4, 1), (16, 2)])
 def test_fused_qk_norm_mrope(num_tokens, q_heads, k_heads):
     inputs = make_inputs(num_tokens, q_heads, k_heads)

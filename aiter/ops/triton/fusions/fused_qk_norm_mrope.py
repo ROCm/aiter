@@ -5,6 +5,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_qk_norm_mrope import 
     HEAD_DIM,
     ROPE_HALF,
     fused_qk_norm_mrope_gfx1250,
+    fused_qk_norm_mrope_tdm_gfx1250,
     get_fused_qk_norm_mrope_layouts,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -19,10 +20,10 @@ _LOGGER = AiterTritonLogger()
 _CONFIG_NAME = "FUSED_QK_NORM_MROPE"
 
 
-def _get_config(num_tokens: int) -> dict:
+def _get_config(num_rows: int) -> dict:
     config_dir = resolve_config_dir("fusions", _CONFIG_NAME, backend="gluon")
     configs = load_config_json(f"{config_dir}/DEFAULT.json")
-    return select_leq_config(configs, num_tokens, prefix="T_LEQ_")
+    return select_leq_config(configs, num_rows, prefix="ROWS_LEQ_")
 
 
 def fused_qk_norm_mrope(
@@ -36,7 +37,7 @@ def fused_qk_norm_mrope(
     sin: torch.Tensor,
     mrope_section: list[int],
 ):
-    """Q/K Gemma RMSNorm and interleaved MRoPE (Qwen3.5 full attention).
+    """Q/K Gemma RMSNorm and interleaved MRoPE.
 
     Each head of 256 values gets x / rms(x) * (1 + weight). Values [0, 64) then get
     Neox RoPE: values i and i + 32 rotate with cos/sin[pos, i]. pos is the H position
@@ -53,6 +54,10 @@ def fused_qk_norm_mrope(
 
     Returns:
         q_out [T, Hq * 256] and k_out [T, Hk * 256], contiguous.
+
+    Above the row count of the smallest config bucket, a TDM kernel moves the Q and K rows
+    of several tokens as tiles. It needs head counts that are powers of 2 and row strides
+    that are multiples of 16 bytes.
     """
     assert arch_info.get_arch() == "gfx1250"
     num_tokens = q.shape[0]
@@ -64,37 +69,53 @@ def fused_qk_norm_mrope(
     assert positions.shape == (3, num_tokens) and positions.stride(1) == 1
     assert cos.shape[1] == ROPE_HALF.value and cos.stride(1) == 1
     assert sin.stride() == cos.stride()
-    config = _get_config(num_tokens)
+    num_rows = num_tokens * (q_heads + k_heads)
+    config = _get_config(num_rows)
 
     q_out = torch.empty((num_tokens, q.shape[1]), dtype=q.dtype, device=q.device)
     k_out = torch.empty((num_tokens, k.shape[1]), dtype=k.dtype, device=k.device)
-    _LOGGER.info("FUSED_QK_NORM_MROPE: T=%d Hq=%d Hk=%d", num_tokens, q_heads, k_heads)
-
-    # One row per wave. The rows of token t are its Q heads, then its K heads.
-    num_rows = num_tokens * (q_heads + k_heads)
-    block_m = config["num_warps"]
-    fused_qk_norm_mrope_gfx1250[(triton.cdiv(num_rows, block_m),)](
-        q,
-        k,
-        q_weight,
-        k_weight,
-        positions,
-        cos,
-        sin,
-        q_out,
-        k_out,
-        num_rows,
-        q.stride(0),
-        k.stride(0),
-        positions.stride(0),
-        cos.stride(0),
-        EPS=eps,
-        Q_HEADS=q_heads,
-        K_HEADS=k_heads,
-        SECTION_H=mrope_section[1],
-        SECTION_W=mrope_section[2],
-        BLOCK_M=block_m,
-        num_warps=block_m,
-        **get_fused_qk_norm_mrope_layouts(block_m),
+    _LOGGER.info(
+        "FUSED_QK_NORM_MROPE: T=%d Hq=%d Hk=%d TDM=%s",
+        num_tokens,
+        q_heads,
+        k_heads,
+        config["TDM"],
     )
+
+    num_warps = config["num_warps"]
+    args = (q, k, q_weight, k_weight, positions, cos, sin, q_out, k_out)
+    strides = (q.stride(0), k.stride(0), positions.stride(0), cos.stride(0))
+    if config["TDM"]:
+        # A program does block_m tokens, so that the K tile has one row a wave.
+        assert q_heads & (q_heads - 1) == 0 and k_heads & (k_heads - 1) == 0
+        assert q.stride(0) % 8 == 0 and k.stride(0) % 8 == 0
+        block_m = max(1, num_warps // k_heads)
+        fused_qk_norm_mrope_tdm_gfx1250[(triton.cdiv(num_tokens, block_m),)](
+            *args,
+            num_tokens,
+            *strides,
+            EPS=eps,
+            Q_HEADS=q_heads,
+            K_HEADS=k_heads,
+            SECTION_H=mrope_section[1],
+            SECTION_W=mrope_section[2],
+            BLOCK_M=block_m,
+            num_warps=num_warps,
+            **get_fused_qk_norm_mrope_layouts(num_warps),
+        )
+    else:
+        # One row per wave. The rows of token t are its Q heads, then its K heads.
+        fused_qk_norm_mrope_gfx1250[(triton.cdiv(num_rows, num_warps),)](
+            *args,
+            num_rows,
+            *strides,
+            EPS=eps,
+            Q_HEADS=q_heads,
+            K_HEADS=k_heads,
+            SECTION_H=mrope_section[1],
+            SECTION_W=mrope_section[2],
+            BLOCK_M=num_warps,
+            num_warps=num_warps,
+            **get_fused_qk_norm_mrope_layouts(num_warps),
+        )
     return q_out, k_out
