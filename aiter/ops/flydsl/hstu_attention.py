@@ -734,11 +734,8 @@ def _get_bwd_tuned_config(
     return _bwd_tuned_config_map().get((problem_key, kernel), {})
 
 
-@functools.lru_cache(maxsize=64)
-def _balance_gather_index(
-    B: int, groups: int, device: str
-) -> tuple[torch.Tensor, torch.cuda.Event]:
-    """Map sorted ranks to grid groups with a cached alternating-direction deal.
+def _gather_index(B: int, groups: int, device: str) -> torch.Tensor:
+    """Map sorted ranks to grid groups with an alternating-direction deal.
 
     Alternating the group direction each round distributes long and short
     sequences across the hardware groups. The mapping depends only on shape.
@@ -749,13 +746,25 @@ def _balance_gather_index(
     slot = group * (B // groups) + rnd
     inv = torch.empty_like(rank)
     inv[slot] = rank
-    return _publish_cached(inv)
+    return inv
+
+
+def _identity(B: int, device: str) -> torch.Tensor:
+    return torch.arange(B, dtype=torch.int32, device=device)
+
+
+@functools.lru_cache(maxsize=64)
+def _balance_gather_index(
+    B: int, groups: int, device: str
+) -> tuple[torch.Tensor, torch.cuda.Event]:
+    """Cached `_gather_index`."""
+    return _publish_cached(_gather_index(B, groups, device))
 
 
 @functools.lru_cache(maxsize=64)
 def _identity_perm(B: int, device: str) -> tuple[torch.Tensor, torch.cuda.Event]:
-    """Return a cached identity permutation."""
-    return _publish_cached(torch.arange(B, dtype=torch.int32, device=device))
+    """Cached identity permutation."""
+    return _publish_cached(_identity(B, device))
 
 
 def _publish_cached(t: torch.Tensor) -> tuple[torch.Tensor, torch.cuda.Event]:
@@ -773,14 +782,14 @@ def _publish_cached(t: torch.Tensor) -> tuple[torch.Tensor, torch.cuda.Event]:
 def _use_cached(entry: tuple[torch.Tensor, torch.cuda.Event]) -> torch.Tensor:
     """Read a cached device tensor on the current stream.
 
-    Waits for the build on the device, and only while it may still be
-    pending, so a warm cache queues nothing. Recording the reader's stream
-    keeps an eviction from recycling the block under a queued reader.
+    Waits for the build on the device; waiting on a completed event is cheap.
+    The wait is unconditional because `Event.query()` would invalidate a
+    stream capture. Recording the reader's stream keeps an eviction from
+    recycling the block under a queued reader.
     """
     t, built = entry
     stream = torch.cuda.current_stream(t.device)
-    if not built.query():
-        stream.wait_event(built)
+    stream.wait_event(built)
     t.record_stream(stream)
     return t
 
@@ -796,11 +805,20 @@ def _build_balance_perm(
     """
     lengths = seq_offsets[1:] - seq_offsets[:-1]
     B = int(lengths.numel())
-    device = seq_offsets.device
+    device = str(seq_offsets.device)
+    # Under capture the index is built into the graph instead: a cached tensor
+    # made here would hold nothing until the first replay, so an eager call in
+    # between would read unwritten memory.
+    capturing = torch.cuda.is_current_stream_capturing()
     if B % groups != 0:
-        return _use_cached(_identity_perm(B, str(device)))
+        if capturing:
+            return _identity(B, device)
+        return _use_cached(_identity_perm(B, device))
     order = torch.argsort(lengths, descending=True)  # sequence indices, longest first
-    inv = _use_cached(_balance_gather_index(B, groups, str(device)))
+    if capturing:
+        inv = _gather_index(B, groups, device)
+    else:
+        inv = _use_cached(_balance_gather_index(B, groups, device))
     return order[inv].to(torch.int32)
 
 

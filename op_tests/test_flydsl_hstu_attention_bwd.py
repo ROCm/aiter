@@ -25,7 +25,6 @@ fp32 scores, so it is skipped (``err`` empty) for cases where that would not fit
 import argparse
 import csv
 import itertools
-import time
 import weakref
 
 import pandas as pd
@@ -790,6 +789,22 @@ def test_flydsl_bwd_custom_stream_temporaries(monkeypatch, fused, sort_by_length
         assert torch.equal(g, e), name
 
 
+def _balance_perm_offsets(aligned):
+    """seq_offsets whose batch takes the gather path (aligned) or identity."""
+    groups = hstu_kernels.NUM_GRID_GROUPS
+    batch = groups * 3 + (0 if aligned else 1)
+    g = torch.Generator(device="cuda").manual_seed(3)
+    lengths = torch.randint(0, 100, (batch,), device="cuda", generator=g)
+    seq_offsets = torch.zeros(batch + 1, dtype=torch.int64, device="cuda")
+    seq_offsets[1:] = torch.cumsum(lengths, 0)
+    return seq_offsets
+
+
+def _clear_balance_perm_cache():
+    hstu_kernels._balance_gather_index.cache_clear()
+    hstu_kernels._identity_perm.cache_clear()
+
+
 @requires_cuda
 @pytest.mark.parametrize("aligned", [True, False])
 def test_balance_perm_cache_is_safe_across_streams(aligned):
@@ -801,25 +816,11 @@ def test_balance_perm_cache_is_safe_across_streams(aligned):
     stalled stream's free blocks are zero-filled first, so such a read gives a
     perm full of repeats instead of, by luck, the right one; the reader copies
     the perm at once, so a premature read is captured.
-
-    The ordering must not come from the host waiting: the cache miss returns
-    while the stalled stream is still asleep.
     """
-    groups = hstu_kernels.NUM_GRID_GROUPS
-    batch = groups * 3 + (0 if aligned else 1)
-    g = torch.Generator(device="cuda").manual_seed(3)
-    lengths = torch.randint(0, 100, (batch,), device="cuda", generator=g)
-    seq_offsets = torch.zeros(batch + 1, dtype=torch.int64, device="cuda")
-    seq_offsets[1:] = torch.cumsum(lengths, 0)
-    torch.cuda.synchronize()
-    start = time.perf_counter()
-    torch.cuda._sleep(200_000_000)
-    torch.cuda.synchronize()
-    sleep_s = time.perf_counter() - start
-
+    seq_offsets = _balance_perm_offsets(aligned)
+    batch = seq_offsets.numel() - 1
     for _ in range(5):
-        hstu_kernels._balance_gather_index.cache_clear()
-        hstu_kernels._identity_perm.cache_clear()
+        _clear_balance_perm_cache()
         stalled, reader = torch.cuda.Stream(), torch.cuda.Stream()
         with torch.cuda.stream(stalled):
             poison = [
@@ -829,13 +830,54 @@ def test_balance_perm_cache_is_safe_across_streams(aligned):
         del poison
         with torch.cuda.stream(stalled):
             torch.cuda._sleep(200_000_000)
-            start = time.perf_counter()
             hstu_kernels._build_balance_perm(seq_offsets)
-            assert time.perf_counter() - start < sleep_s / 2, "cache miss blocked"
         with torch.cuda.stream(reader):
             perm = hstu_kernels._build_balance_perm(seq_offsets).clone()
         torch.cuda.synchronize()
         assert sorted(perm.tolist()) == list(range(batch))
+
+
+@requires_cuda
+@pytest.mark.parametrize("aligned", [True, False])
+def test_balance_perm_cache_never_waits_on_the_host(monkeypatch, aligned):
+    """Cold and warm lookups order readers on the device only."""
+    seq_offsets = _balance_perm_offsets(aligned)
+    _clear_balance_perm_cache()
+
+    def host_wait(*_args, **_kwargs):
+        raise AssertionError("the permutation cache waited on the host")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", host_wait)
+    monkeypatch.setattr(torch.cuda.Stream, "synchronize", host_wait)
+    monkeypatch.setattr(torch.cuda.Event, "synchronize", host_wait)
+    monkeypatch.setattr(torch.cuda.Event, "query", host_wait)
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        hstu_kernels._build_balance_perm(seq_offsets)
+        hstu_kernels._build_balance_perm(seq_offsets)
+
+
+@requires_cuda
+@pytest.mark.parametrize("warm", [True, False])
+@pytest.mark.parametrize("aligned", [True, False])
+def test_balance_perm_is_graph_capturable(aligned, warm):
+    """The permutation builds under graph capture, cache warm or cold, and
+    replays to the eager result; a cold capture leaves the cache empty."""
+    seq_offsets = _balance_perm_offsets(aligned)
+    expected = hstu_kernels._build_balance_perm(seq_offsets).clone()
+    if not warm:
+        _clear_balance_perm_cache()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        perm = hstu_kernels._build_balance_perm(seq_offsets)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(perm, expected)
+    if not warm:
+        assert hstu_kernels._balance_gather_index.cache_info().currsize == 0
+        assert hstu_kernels._identity_perm.cache_info().currsize == 0
 
 
 def _inputs_with_lengths(lengths, h=4, d=64, seed=7):
@@ -930,8 +972,9 @@ def test_bwd_fused_gate_requires_measured_occupancy(waves_per_eu):
 
 @pytest.mark.parametrize("num_cus", [80, 228, 256])
 def test_bwd_fused_gate_requires_validated_device(num_cus):
-    """gfx942 products other than the validated MI300X (e.g. MI308X with 80
-    CUs, MI300A with 228) are gated out; MI300X's 304 passes."""
+    """Only the validated 304-CU gfx942 class passes: MI300X, and MI325X,
+    which reports the same count. MI308X (80 CUs) and MI300A (228) are gated
+    out."""
     args = (4, 64, 64, True, 0, 0, False, 1.0, "bf16", 1024)
     tiles = {"block_m": 256, "block_n": 16, "num_waves": 8, "waves_per_eu": 2}
     with pytest.raises(ValueError, match="304-CU gfx942 class only"):
@@ -939,43 +982,47 @@ def test_bwd_fused_gate_requires_validated_device(num_cus):
     validate_hstu_attention_bwd(*args, **tiles, arch="gfx942", num_cus=304)
 
 
-@requires_fused
-def test_flydsl_bwd_fused_gate_reads_the_tensors_device(monkeypatch):
-    """The gate checks the device holding q, not the process's current one.
+@pytest.mark.parametrize("tensors_cus,expect_fused", [(304, True), (80, False)])
+def test_bwd_fused_gate_reads_the_tensors_device(
+    monkeypatch, tensors_cus, expect_fused
+):
+    """The gate checks the device holding the tensors, not the current one.
 
-    A node can mix gfx942 parts. Here q's device reports an 80-CU MI308X
-    while the current device stays the validated one, so the default must
-    fall back and `fused=True` must refuse.
+    A node can mix gfx942 parts. The tensors' device (index 7) and every
+    other device report different CU counts, and reading the current device
+    directly fails, so only a gate that queries index 7 passes both cases.
     """
-    real = hstu_kernels._device_arch_and_cus
-    queried = []
+    other_cus = 80 if tensors_cus == 304 else 304
 
     def fake(index):
-        queried.append(index)
-        return ("gfx942", 80) if index == q.device.index else real(index)
+        return ("gfx942", tensors_cus if index == 7 else other_cus)
 
-    b, h, n, d = (_FUSED_CASE[key] for key in ("b", "h", "n", "d"))
-    alpha = 1.0 / d * 10000
-    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    def current_device_read(*_args, **_kwargs):
+        raise AssertionError("the gate read the current device")
+
     monkeypatch.setattr(hstu_kernels, "_device_arch_and_cus", fake)
-    args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0)
-    with pytest.raises(ValueError, match="304-CU gfx942 class only"):
-        flydsl_hstu_attention_bwd(*args, fused=True)
-    assert queried and set(queried) == {q.device.index}
-
-    calls = []
-    real_runners = hstu_kernels._make_bwd_fused_runners
-    monkeypatch.setattr(
-        hstu_kernels,
-        "_make_bwd_fused_runners",
-        lambda *a, **kw: calls.append(1) or real_runners(*a, **kw),
-    )
-    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
-        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
-    )
-    dq, dk, dv = flydsl_hstu_attention_bwd(*args)
-    assert not calls
-    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", current_device_read)
+    monkeypatch.setattr(torch.cuda, "current_device", current_device_read)
+    kwargs = {
+        "device": torch.device("cuda", 7),
+        "dtype_str": "bf16",
+        "num_heads": 4,
+        "head_dim": 64,
+        "hidden_dim": 64,
+        "batch": 32,
+        "max_seq_len": 1024,
+        "causal": True,
+        "has_targets": False,
+        "alpha": 1.0,
+        "max_attn_len": 0,
+        "contextual_seq_len": 0,
+        "custom_config": {},
+    }
+    config = hstu_kernels._resolve_bwd_fused_config(**kwargs, fused=None)
+    assert (config is not None) == expect_fused
+    if not expect_fused:
+        with pytest.raises(ValueError, match="304-CU gfx942 class only"):
+            hstu_kernels._resolve_bwd_fused_config(**kwargs, fused=True)
 
 
 @requires_fused
