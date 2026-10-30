@@ -9,8 +9,6 @@ MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
 K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 """
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -36,10 +34,6 @@ from .kernels.pa_decode_reduce import (
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
-
-# AITER_FLYDSL_PA_CLUSTER_MERGE=0 keeps the shared reducer for plans that
-# would otherwise merge partitions within workgroup clusters.
-_CLUSTER_MERGE = os.environ.get("AITER_FLYDSL_PA_CLUSTER_MERGE", "1") != "0"
 
 
 def _flydsl_pointer_dtype(dtype: torch.dtype):
@@ -682,8 +676,7 @@ def pa_decode(
     cluster_merge = (
         max_partitions
         if (
-            _CLUSTER_MERGE
-            and arch == "gfx1250"
+            arch == "gfx1250"
             and not direct_output
             and sinks is None
             and output.stride() == query.stride()
