@@ -2,6 +2,11 @@ name: Radeon gfx1201 dispatch test
 
 on:
   workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+    paths:
+      - .github/workflows/radeon-gfx1201-dispatch-test.yaml
 
 jobs:
   gfx1201:
