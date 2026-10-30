@@ -34,25 +34,30 @@ def all_reduce_rmsnorm_quant(
 
     Args:
         x, residual (torch.Tensor): bf16 (tokens, hidden). hidden is a power of 2
-            and at least 256. residual is the same on all ranks.
+            and at least 256, or 6144 when quant is false. residual is the same
+            on all ranks.
         weight (torch.Tensor): bf16 (hidden,). With gemma, the norm uses 1 + weight.
         quant (bool): Also return q, out as fp8, and scale, one fp32 value for
-            each 128 values.
-        inboxes, calls: The result of ``all_reduce_init``, for this op and one
-            hidden size only, with max_bytes of 2 rows or more.
+            each 128 values. Quantization requires a power-of-two hidden size.
+        inboxes, calls: The result of ``all_reduce_init``, for this op and one hidden
+            size only. Its slot must hold 2 * next_power_of_2(hidden) int32 words per
+            triple.
     """
     tokens, hidden = x.shape
     assert x.dtype == residual.dtype == weight.dtype == torch.bfloat16
     assert residual.shape == x.shape and weight.shape == (hidden,)
     assert x.is_contiguous() and residual.is_contiguous() and weight.is_contiguous()
-    assert hidden >= 256 and hidden & (hidden - 1) == 0
+    assert hidden >= 256 and (
+        hidden & (hidden - 1) == 0 or (hidden == 6144 and not quant)
+    )
     # A row is one chunk, so rows of another hidden size would meet old call numbers.
     first = _HIDDEN.setdefault(calls.data_ptr(), hidden)
     assert first == hidden, f"these inboxes serve hidden {first}, not {hidden}"
     slot = 4 * _LINES * ((calls.numel() - 1) // 2)  # as in all_reduce_init
     triples = triton.cdiv(tokens, 3)  # a program sends or receives 3 rows
-    # A triple is 2 * hidden int32 words of inbox.
-    assert 2 * hidden * triples <= slot, "x is larger than max_bytes"
+    hidden_pad = triton.next_power_of_2(hidden)
+    # A triple is 2 * hidden_pad int32 words of inbox.
+    assert 2 * hidden_pad * triples <= slot, "x is larger than max_bytes"
 
     _LOGGER.info("ALL_REDUCE_RMSNORM_QUANT [gluon]: x=%s quant=%s", x.shape, quant)
 

@@ -341,7 +341,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and input_.dim() == 2
             and input_n == n
             and n >= 256
-            and n & (n - 1) == 0
+            and (n & (n - 1) == 0 or n == 6144)
             and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
             and input_.is_contiguous()
             and res_inp_.is_contiguous()
