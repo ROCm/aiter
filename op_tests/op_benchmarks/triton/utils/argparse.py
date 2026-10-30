@@ -59,7 +59,17 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
         allow_abbrev=False,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    available_models = get_available_models()  # Dynamically load model names
+    # Peek at --model-configs before the real parser runs, so the --model
+    # help text lists models from the file the user actually passed in.
+    model_configs_peek_parser = argparse.ArgumentParser(
+        add_help=False, allow_abbrev=False
+    )
+    model_configs_peek_parser.add_argument(
+        "--model-configs", type=str, default="utils/model_configs.json"
+    )
+    model_configs_path = model_configs_peek_parser.parse_known_args()[0].model_configs
+
+    available_models = get_available_models(model_configs_path)
     model_help = (
         "Model name to benchmark. Select from: ["
         + ", ".join(available_models)
@@ -68,7 +78,7 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-configs",
         type=str,
-        default="utils/model_configs.json",
+        default=model_configs_path,
         help="Model config json file.",
     )
     parser.add_argument("--model", type=str, help=model_help)
