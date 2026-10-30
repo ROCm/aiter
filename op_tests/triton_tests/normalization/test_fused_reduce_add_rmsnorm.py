@@ -11,6 +11,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.normalization.fused_reduce_add_rmsnorm import (
     fused_reduce_add_rmsnorm,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def run_torch(x, residual, weight, eps, gemma_norm):
@@ -56,6 +57,10 @@ def test_fused_reduce_add_rmsnorm_gemm_partials(M, N, K, gemma_norm):
     weight = torch.randn((N,), dtype=dtype, device="cuda")
 
     config, _ = _get_gemm_config(M, N, K)
+    if config["NUM_KSPLIT"] == 1:
+        pytest.skip(
+            f"the {get_arch()} gemm_a16w16 config for M={M} N={N} K={K} does not split K"
+        )
     partials = gemm_a16w16(x, w, dtype=dtype, config=config, skip_reduce=True)
     assert partials.shape == (config["NUM_KSPLIT"], M, N)
     assert partials.dtype == torch.float32
