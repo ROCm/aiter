@@ -2711,7 +2711,16 @@ hipError_t run_fused_norm_rope_attn_rope_cast_heads(const FusedNormRopeAttnRopeC
             if(policy::prefer_32head_tile(args.N, Heads, capacity))
             {
                 const dim3 head_grid(args.N, Heads / 32);
-                if(raw_q)
+                if(prefill::kv_offsets_fit_u32(args))
+                {
+                    if(raw_q)
+                        fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, true, true, true, 32, true>
+                            <<<head_grid, 256, 0, stream>>>(args);
+                    else
+                        fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, false, true, false, 32, true>
+                            <<<head_grid, 256, 0, stream>>>(args);
+                }
+                else if(raw_q)
                     fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, true, true, true, 32>
                         <<<head_grid, 256, 0, stream>>>(args);
                 else

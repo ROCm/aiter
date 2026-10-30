@@ -370,10 +370,10 @@ def fused_norm_rope_attn_rope_cast(
             # enough independent requests for these short lists.
             if h == 64 and t >= 128 and capacity < t * 1024:
                 limit = 1
-            # The 32-head single path fills a 256-CTA grid for short lists
-            # without partial-output traffic or a separate reduction launch.
+            # Use head tiles to supply parallelism without splitting short lists.
             if (
-                t * (h // 64) == 128
+                h >= 64
+                and (grid == 128 or (q.dtype == torch.bfloat16 and 96 <= grid < 128))
                 and capacity < t * 768
                 and kv_indices_prefix.numel() > 0
                 and kv_indices_extend is not None

@@ -2047,6 +2047,10 @@ def _check_shared_kv_wave_boundary(
             assert bool((storage[:4] == 1515870810).all())
             assert bool((storage[-4:] == 1515870810).all())
     if exercise_common:
+        _, (sinkless_expected, _, _) = two_source_inputs(
+            heads, layout, mode, wide=True, valid_indices=valid_indices, with_sink=False
+        )
+        sinkless_expected = sinkless_expected.index_select(0, selected)
         for variant in ("common", "positions64", "sinkless", "max", "no_lse"):
             call = dict(kwargs)
             call["max_logits"] = None
@@ -2063,11 +2067,16 @@ def _check_shared_kv_wave_boundary(
             )
             reference = [x.clone() for x in fused_v41(**general)]
             actual = fused_v41(**call)
-            for value, ref in zip(actual, reference):
+            # Different reducers may round differently; validate both against the oracle.
+            actual_output = dequantize(*actual[:2])
+            expected_output = sinkless_expected if variant == "sinkless" else expected
+            _check_output(dequantize(*reference[:2]), expected_output)
+            _check_output(actual_output, expected_output)
+            for value, ref in zip(actual[2:], reference[2:]):
                 if value is not None:
-                    torch.testing.assert_close(
-                        value.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
-                    )
+                    torch.testing.assert_close(value, ref, rtol=0.0001, atol=3e-05)
+            # Replay must reproduce this entrypoint's eager result byte for byte.
+            reference = [x.clone() if x is not None else None for x in actual]
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 fused_v41(**call)
@@ -3437,8 +3446,17 @@ def run_contract_checks():
                 (
                     "tokens",
                     [
+                        31,
+                        32,
+                        33,
+                        47,
+                        48,
+                        63,
                         64,
                         65,
+                        95,
+                        96,
+                        97,
                         127,
                         128,
                         129,
@@ -3459,8 +3477,21 @@ def run_contract_checks():
             check_mid_batch_attention_capacity,
             [
                 ("mode", ["raw", "prepared"]),
-                ("capacity", [511, 512, 513, 1023, 1024, 1025]),
-                ("tokens,heads", [(128, 64), (256, 64), (128, 128), (256, 128)]),
+                ("capacity", [511, 512, 513, 767, 768, 769, 1023, 1024, 1025]),
+                (
+                    "tokens,heads",
+                    [
+                        (32, 128),
+                        (48, 128),
+                        (64, 128),
+                        (64, 64),
+                        (96, 64),
+                        (128, 64),
+                        (256, 64),
+                        (128, 128),
+                        (256, 128),
+                    ],
+                ),
             ],
         ),
         (

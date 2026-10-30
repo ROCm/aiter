@@ -210,8 +210,8 @@ constexpr bool prefer_h32_split_head_tile16(int tokens, int splits)
 
 constexpr bool prefer_32head_tile(int tokens, int heads, int64_t capacity)
 {
-    // Double a 128-CTA grid to fill a 256-CU scheduling round for short lists.
-    return int64_t(tokens) * (heads / 64) == 128 && !has_capacity(tokens, capacity, 768);
+    const int64_t blocks = int64_t(tokens) * (heads / 64);
+    return blocks >= 96 && blocks <= 128 && !has_capacity(tokens, capacity, 768);
 }
 
 constexpr bool prefer_h128_shared_kv(int tokens, int64_t capacity)
