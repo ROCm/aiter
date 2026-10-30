@@ -20,7 +20,7 @@ from .allreduce_policy import (
     resolve_link,
 )
 from .kernels.tensor_shim import _preload_compiled
-from .quick_allreduce_ipc import UncachedIpcHeap
+from .ipc_heap import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
 
