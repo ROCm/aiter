@@ -202,6 +202,11 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
 )
 
+AITER_CONFIG_JAGGED_DENSE_BMM = os.getenv(
+    "AITER_CONFIG_JAGGED_DENSE_BMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/jagged_dense_bmm_tuned.csv",
+)
+
 # fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
 # (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
 # future fp32 rowwise-scale variant lands in a separate CSV and never collides
@@ -405,6 +410,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_BF16_BATCHED_GEMM",
             AITER_CONFIG_BF16_BATCHED_GEMM,
             "bf16_tuned_batched_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_JAGGED_DENSE_BMM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_JAGGED_DENSE_BMM",
+            AITER_CONFIG_JAGGED_DENSE_BMM,
+            "jagged_dense_bmm_tuned",
         )
 
     @property

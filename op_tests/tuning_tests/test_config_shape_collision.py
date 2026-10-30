@@ -97,6 +97,7 @@ FAMILIES = [
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
     ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
+    ("AITER_CONFIG_JAGGED_DENSE_BMM", "jagged_dense_bmm_tuned"),
 ]
 
 
