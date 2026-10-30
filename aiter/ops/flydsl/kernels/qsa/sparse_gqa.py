@@ -635,7 +635,7 @@ def build_qsa_sparse_gqa_module(
             fx.memref_store_vec(b_vec, qk_b)
             fx.memref_store_vec(c_vec, qk_c)
             fx.gemm(qk_mma, qk_c, qk_a, qk_b, qk_c)
-            return fx.Vector(fx.memref_load_vec(qk_c))
+            return fx.memref_load_vec(qk_c)
 
         def pv_mfma(a_vec, b_vec, c_vec):
             pv_a = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
@@ -645,7 +645,7 @@ def build_qsa_sparse_gqa_module(
             fx.memref_store_vec(b_vec, pv_b)
             fx.memref_store_vec(c_vec, pv_c)
             fx.gemm(pv_mma, pv_c, pv_a, pv_b, pv_c)
-            return fx.Vector(fx.memref_load_vec(pv_c))
+            return fx.memref_load_vec(pv_c)
 
         def amd_k_elem(n_tok, d0):
             # Match the live AMD prefill K LDS lowering. Each lane owns one
@@ -698,7 +698,7 @@ def build_qsa_sparse_gqa_module(
             src = fx.make_view(k_arr.ptr + amd_k_off(n_tok, d0), fx.make_layout(8, 1))
             frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
             fx.copy(lds_copy, src, frag)
-            return fx.Vector(fx.memref_load_vec(frag))
+            return fx.memref_load_vec(frag)
 
         def store_amd_v4(elem_off, vec4):
             dst = fx.make_view(
@@ -879,7 +879,7 @@ def build_qsa_sparse_gqa_module(
         q_regs = []
         if const_expr(qk_reg):
             for ks in range_constexpr(gather_rounds * 2):
-                q_vec = fx.Vector(fx.memref_load_vec(q_frags[ks]))
+                q_vec = fx.memref_load_vec(q_frags[ks])
                 q_regs.append(
                     fx.Vector.from_elements(
                         [
@@ -893,7 +893,7 @@ def build_qsa_sparse_gqa_module(
                 )
         else:
             for ks in range_constexpr(qk_steps):
-                q_vec = fx.Vector(fx.memref_load_vec(q_frags[ks]))
+                q_vec = fx.memref_load_vec(q_frags[ks])
                 if const_expr(decode_tr_pv):
                     # Packed cndmask. The per-element f32 round-trip packed with
                     # v_perm; AMD zeros OOB heads at the load mask instead.
@@ -1037,7 +1037,7 @@ def build_qsa_sparse_gqa_module(
                     for j in range_constexpr(gather_chunk):
                         gr = gc * gather_chunk + j
                         k_vec = live.select(
-                            fx.Vector(fx.memref_load_vec(k_frags[j])),
+                            fx.memref_load_vec(k_frags[j]),
                             fx.Vector.filled(vec, 0.0, BFloat16),
                         )
                         if const_expr(use_k32):
@@ -1106,7 +1106,7 @@ def build_qsa_sparse_gqa_module(
                             a_vec = load_amd_k8(
                                 n_tok, Int32(ks * qk_k) + lane_kg * Int32(8)
                             )
-                        acc4 = qk_mfma(a_vec, fx.Vector(q_regs[ks]), acc4)
+                        acc4 = qk_mfma(a_vec, q_regs[ks], acc4)
                 elif const_expr(not qk_reg):
                     k_row_bytes = Int32(k_stride)
 
@@ -1123,8 +1123,8 @@ def build_qsa_sparse_gqa_module(
 
                     def mfma_qk(frag, ks, acc):
                         return qk_mfma(
-                            fx.Vector(fx.memref_load_vec(frag)),
-                            fx.Vector(q_regs[ks]),
+                            fx.memref_load_vec(frag),
+                            q_regs[ks],
                             acc,
                         )
 
@@ -1165,7 +1165,7 @@ def build_qsa_sparse_gqa_module(
                         a_vec = live.select(
                             raw, fx.Vector.filled(qk_vec, 0.0, BFloat16)
                         )
-                        acc4 = qk_mfma(a_vec, fx.Vector(q_regs[i]), acc4)
+                        acc4 = qk_mfma(a_vec, q_regs[i], acc4)
                 qk_local.append(acc4)
             if const_expr(gfx942_v_pf):
                 # The mask that consumes the fragment is VALU and cannot
@@ -1210,7 +1210,7 @@ def build_qsa_sparse_gqa_module(
             if const_expr(decode_tr_pv):
                 for gr in range_constexpr(gather_rounds):
                     v_vec = live.select(
-                        fx.Vector(fx.memref_load_vec(v_frags[gr])),
+                        fx.memref_load_vec(v_frags[gr]),
                         fx.Vector.filled(vec, 0.0, BFloat16),
                     )
                     d0 = (chunk_owner + Int32(gr * col_owners)) * Int32(8)
@@ -1254,7 +1254,7 @@ def build_qsa_sparse_gqa_module(
                     for j in range_constexpr(gather_chunk):
                         gr = gc * gather_chunk + j
                         v_vec = live.select(
-                            fx.Vector(fx.memref_load_vec(v_chunk[j])),
+                            fx.memref_load_vec(v_chunk[j]),
                             fx.Vector.filled(vec, 0.0, BFloat16),
                         )
                         lo = fx.Vector.from_elements(
@@ -1282,7 +1282,7 @@ def build_qsa_sparse_gqa_module(
                     for j in range_constexpr(gather_chunk):
                         gr = gc * gather_chunk + j
                         v_vec = live.select(
-                            fx.Vector(fx.memref_load_vec(v_chunk[j])),
+                            fx.memref_load_vec(v_chunk[j]),
                             fx.Vector.filled(vec, 0.0, BFloat16),
                         )
                         v_tile = fx.make_view(
@@ -1301,7 +1301,7 @@ def build_qsa_sparse_gqa_module(
                     v_frag = fx.make_fragment_like(v_src)
                     fx.copy(kv_copy, v_src, v_frag)
                     v_vec = live.select(
-                        fx.Vector(fx.memref_load_vec(v_frag)),
+                        fx.memref_load_vec(v_frag),
                         fx.Vector.filled(vec, 0.0, BFloat16),
                     )
                     v_tile = fx.make_view(
@@ -1326,7 +1326,7 @@ def build_qsa_sparse_gqa_module(
                         ),
                         sc_frag,
                     )
-                    qk_accs.append(fx.Vector(fx.memref_load_vec(sc_frag)))
+                    qk_accs.append(fx.memref_load_vec(sc_frag))
             elif const_expr(qk_reg):
                 acc = fx.Vector.filled(4, 0.0, Float32)
                 for w in range_constexpr(num_waves):
@@ -1339,7 +1339,7 @@ def build_qsa_sparse_gqa_module(
                         ),
                         sc_frag,
                     )
-                    acc = acc + fx.Vector(fx.memref_load_vec(sc_frag))
+                    acc = acc + fx.memref_load_vec(sc_frag)
                 qk_accs = [acc]
             else:
                 qk_accs = qk_local
@@ -1535,7 +1535,7 @@ def build_qsa_sparse_gqa_module(
                         )
                 for ng in range_constexpr(n_subtiles):
                     if const_expr(use_k32):
-                        v_vec = fx.Vector(fx.memref_load_vec(v_ops[ng]))
+                        v_vec = fx.memref_load_vec(v_ops[ng])
                     else:
                         v_vec = v_ops[ng]
                     if const_expr(decode_tr_pv):
@@ -1546,10 +1546,7 @@ def build_qsa_sparse_gqa_module(
                         acc4 = pv_mfma(p_vecs[ng], v_vec, acc4)
                 next_acc.append(acc4)
             if const_expr(gfx942_v_pf):
-                more = [
-                    fx.Vector(fx.memref_load_vec(next_frags[i]))
-                    for i in range(n_k_pref)
-                ]
+                more = [fx.memref_load_vec(next_frags[i]) for i in range(n_k_pref)]
             else:
                 more = []
             return next_acc + [m_new, l_new] + more
@@ -1567,7 +1564,7 @@ def build_qsa_sparse_gqa_module(
             # land. Later tiles are issued at the end of the previous one.
             safe0, off0, _live0 = resolve(tok0, Int32(0), phys0)
             k0_frags = load_k_frags(safe0, off0)
-            k0 = [fx.Vector(fx.memref_load_vec(k0_frags[i])) for i in range(n_k_pref)]
+            k0 = [fx.memref_load_vec(k0_frags[i]) for i in range(n_k_pref)]
             init_state = init_acc + [tok0, tok1, phys0] + k0
         else:
             init_state = init_acc + [tok0, tok1, phys0]
