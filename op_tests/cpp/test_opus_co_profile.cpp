@@ -2,6 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "gfx1250/opus_co_profile_gfx1250.h"
 #include <cassert>
+#include <fstream>
 #include <iostream>
 
 using namespace opus_gfx1250_co;
@@ -57,6 +58,21 @@ int main(int argc, char** argv) {
     // missing A0 filename, never the regular image.
     assert(!fs::exists(a0.path));
     assert(a0.path != b0.path);
+
+    // Regular fallback used only when the A0 image exists but the runtime
+    // rejects it: combined root, direct A0 leaf, and no-sibling cases.
+    {
+        std::ofstream regular(base / "gfx1250" / (symbol + ".co"));
+        regular.put('x');
+    }
+    const auto fallback = select_regular_fallback(base.string(), "gfx1250", symbol);
+    assert(fallback.has_value());
+    assert(fallback->path == (base / "gfx1250" / (symbol + ".co")).string());
+    assert(fallback->processor == 0x49);
+    assert(!select_regular_fallback(base.string(), "gfx950", symbol).has_value());
+    const auto leaf = select_regular_fallback((base / "gfx1250-a0").string(), "gfx1250", symbol);
+    assert(leaf.has_value() && leaf->path == fallback->path);
+    assert(!select_regular_fallback((work / "flat-a0").string(), "gfx1250", symbol).has_value());
 
     // HIP visibility can reorder device IDs. Stepping is supplied per device,
     // and cache entries isolate both ordinal and exact selected image.

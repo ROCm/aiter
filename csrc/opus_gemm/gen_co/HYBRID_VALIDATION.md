@@ -75,6 +75,54 @@ A0 profile: on c7-1, ROCm 10.0 / HIP `7.15.26333` rejected the real strict ELF w
 existing aiter path. Three family representatives (21016, 21105, 21316) passed
 CPU-golden BMM checks at tiny `1x1x1` and ragged `129x129x385` shapes.
 
+### HIP runtime floor for A0 strict images
+
+The A0 `0xeb` code objects need a HIP runtime that knows `gfx1250-strict`. This is
+**not** implied by the device having ASIC Revision 0: on the same g21-10 A0 GPUs
+(`asicRevision=0`, 256 CU), two runtimes were compared with the real
+`__hipRegisterFatBinary` + `hipGetFuncBySymbol` path:
+
+| HIP runtime | image | regular `0x49` | A0 strict `0xeb` |
+|---|---|---|---|
+| `7.16.26315` | `rocm/fw-bringup:gfx1250-atom-20260903` | registers | **fails: `invalid device function`** |
+| `7.16.26385` | `rocm/dev-ubuntu-24.04:10.1.0-full` (ROCm 10.1.0 release) | registers | registers and launches |
+
+`hipModuleLoadData` on the old runtime returns `hipErrorNoBinaryForGpu` (209) for
+the same strict image, and `HSA_DISABLE_GFX12_STRICT=0/1/unset` does not change
+the result. The ATOM CI base image `rocm/fw-bringup:gfx1250-atom-20260831-ci-base`
+used by the failing extended-test job also reports HIP `7.16.26315`
+(`torch.version.hip=7.16.26315`), which explains its
+`kernel registration failed for 'opus_gemm_gfx1250_4wave_wl_co_...': invalid
+device function` on an A0 node: the loader correctly selected
+`gen_co/gfx1250-a0/`, but the CI runtime was too old to load it.
+
+### Automatic regular-CO fallback on old runtimes
+
+The loader now keeps old-ROCm A0 nodes working without changing the strict
+preference on new runtimes:
+
+1. On ASIC Revision 0 it first selects `gen_co/gfx1250-a0/`.
+2. It checks that image with `hipModuleLoadData`. If the runtime rejects the
+   strict ELF (`hipErrorNoBinaryForGpu` / `invalid device function`), and a
+   regular `gen_co/gfx1250/<symbol>.co` exists, it transparently falls back to
+   that regular image for the process and prints one warning.
+3. Missing files or wrong ELF profiles are still hard errors: only a runtime
+   rejection of an existing strict image triggers fallback.
+4. On HIP `>= 7.16.26385` the strict image loads, so fallback never triggers.
+
+The regular `0x49` COs were validated on A0 hardware before enabling this:
+g21-10 (4× gfx1250, ASIC Revision 0, 256 CU) with the CI-matching HIP
+`7.16.26315` ran compute/wl/wlr kernels at tiny and ragged M/N/K, batch 2 and
+padded source rows, matching the CPU golden with max absolute error 0. A
+current-loader end-to-end test produced
+`FALLBACK_E2E_PASS max_err=0` with the fallback warning; the same test on HIP
+`7.16.26385` passed without fallback, confirming strict is still preferred.
+
+The runtime floor for the A0-tuned images remains ROCm 10.1.0 (HIP
+`>= 7.16.26385`): falling back restores compatibility but uses the regular
+schedule, not the A0 strict one. A0 CI should still be upgraded to that runtime
+for the intended kernels.
+
 The exhaustive A0 suite is **not certified**. The GPU-input suite reported
 repeated failures; an isolated diagnostic then stalled in GPU random-input setup
 before any CO call. A separate CPU-input diagnostic later stalled in the host-to-

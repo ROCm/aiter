@@ -255,6 +255,15 @@ A0/B0 nodes do not use a node-wide minimum.
 is read without adding another subdirectory, but its ELF processor must match the detected
 stepping. Missing/wrong A0 images fail clearly rather than falling back to B0.
 
+If the strict image exists but the installed HIP runtime is too old to load it
+(`hipErrorNoBinaryForGpu` / `invalid device function`, HIP `< 7.16.26385`), the
+loader falls back once per process to the regular `gfx1250/` image of the same
+symbol and prints a warning. This keeps old A0 nodes running; the regular
+schedule is not the A0-tuned one, so upgrade to ROCm 10.1.0 release (HIP
+`>= 7.16.26385`) to get the strict kernels. On that runtime strict stays the
+first choice and no fallback occurs. A missing file or a wrong ELF profile is
+still a hard error and never silently selects another profile.
+
 ```sh
 # Default automatic selection; do not set a stepping-specific root.
 python3 -m pytest -q op_tests/test_opus_co_integration.py
