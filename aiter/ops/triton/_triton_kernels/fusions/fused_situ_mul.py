@@ -5,7 +5,13 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+import functools
+
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 
 _fused_situ_mul_repr = make_kernel_repr(
     "_fused_situ_mul_kernel",
@@ -15,13 +21,27 @@ _fused_situ_mul_repr = make_kernel_repr(
 _LOG2_E = tl.constexpr(1.4426950408889634)
 
 
-def _get_config(key: str = "any") -> dict:
+def _get_config(M: int | None = None, N: int | None = None) -> dict:
+    if M is None or N is None:
+        config_dir = resolve_config_dir("fusions", "FUSED_SITU_MUL")
+        return dict(load_config_json(f"{config_dir}/DEFAULT.json", required=True)["any"])
+    return dict(_get_config_cached(_m_bucket(M), N))
+
+
+def _m_bucket(M: int) -> int:
+    return 1 << max(0, (M - 1).bit_length())
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config_cached(M: int, N: int) -> dict:
     config_dir = resolve_config_dir("fusions", "FUSED_SITU_MUL")
-    return dict(load_config_json(f"{config_dir}/DEFAULT.json", required=True)[key])
+    table = load_config_json(f"{config_dir}/DEFAULT.json", required=True)
+    return select_leq_config(table, axes=("N", "M"), N=N, M=M)
 
 
 @triton.jit
 def _rcp(x):
+    x = x.to(tl.float32)
     return tl.inline_asm_elementwise(
         "v_rcp_f32 $0, $1", "=v,v", [x], dtype=tl.float32, is_pure=True, pack=1
     )
