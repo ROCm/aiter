@@ -282,6 +282,9 @@ def test_flydsl_hstu_attention_perf(
         (4, 512, 0.5, 64, 0, 0, 128, 128, True),
         # contextual_seq_len > 0 (causal only)
         (4, 512, 0.5, 0, 64, 0, 128, 128, True),
+        # causal contextual + window (see test_flydsl_hstu_attention_contextual_window)
+        (4, 512, 0.5, 20, 50, 0, 128, 128, True),
+        (4, 512, 0.5, 20, 50, 20, 128, 128, True),
         # symmetric and dims %64 != 0
         (4, 512, 0.5, 0, 0, 0, 96, 96, True),
         # not symmetric
@@ -370,6 +373,47 @@ def test_flydsl_hstu_attention(
     torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=0)
 
 
+@pytest.mark.parametrize("tile", [None, (64, 32, 4), (32, 32, 2)])
+@pytest.mark.parametrize("target_size", [0, 20])
+def test_flydsl_hstu_attention_contextual_window(tile, target_size):
+    """The window lower bound is computed in effective IDs.
+
+    The whole contextual prefix is ID 0, so a query tile starting in
+    (max_attn_len, max_attn_len + contextual_seq_len - 1] still reaches prefix
+    keys below `q_start - max_attn_len`. Whether a tile start lands there
+    depends on block_m and block_n, so small explicit tiles are included.
+    """
+    torch_hstu_attention = _load_torch_hstu_reference()
+    max_seq_len, d, max_attn_len, contextual_seq_len = 512, 128, 20, 50
+    alpha = 1.0 / d * 10000
+    q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
+        batch_size=8,
+        max_seq_len=max_seq_len,
+        sparsity=0.5,
+        heads=4,
+        attn_dim=d,
+        hidden_dim=d,
+        target_size=target_size,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    tile_kwargs = {}
+    if tile is not None:
+        tile_kwargs = dict(zip(("block_m", "block_n", "num_waves"), tile))
+    out = flydsl_hstu_attention_fwd(
+        max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets,
+        max_attn_len, contextual_seq_len, **tile_kwargs,
+    )  # fmt: skip
+    out_ref = torch_hstu_attention(
+        max_seq_len, alpha, q, k, v, seq_offsets, True, dropout_pr=0.0,
+        training=False, num_targets=num_targets, max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len, min_full_attn_seq_len=0,
+    )  # fmt: skip
+    torch.testing.assert_close(
+        out * max_seq_len, out_ref * max_seq_len, atol=1e-3, rtol=0
+    )
+
+
 def record_launch_allocation_streams(monkeypatch, caller_tensors):
     """Record, per kernel launch, the allocator streams of its own tensors.
 
@@ -401,6 +445,47 @@ def record_launch_allocation_streams(monkeypatch, caller_tensors):
 
     monkeypatch.setattr(hstu_kernels, "_run_compiled", spy)
     return launches
+
+
+@pytest.mark.parametrize("has_targets", [False, True])
+def test_flydsl_hstu_attention_custom_stream_temporaries(monkeypatch, has_targets):
+    """Outputs and temporaries are allocated on `stream`, not the caller's.
+
+    Non-contiguous inputs force contiguous copies, and without targets the
+    call makes its own zero `num_targets`. Allocated on the caller's stream,
+    they would return to its pool when the call exits and could be handed to
+    the caller's next allocation while the side stream still reads them.
+    """
+    max_seq_len, d = 256, 128
+    alpha = 1.0 / d * 10000
+    q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
+        batch_size=4,
+        max_seq_len=max_seq_len,
+        sparsity=0.5,
+        heads=4,
+        attn_dim=d,
+        hidden_dim=d,
+        target_size=20 if has_targets else 0,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    args = (max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0)
+    expected = flydsl_hstu_attention_fwd(*args)
+    q_s, k_s, v_s = (torch.cat([t, t], dim=-1)[..., :d] for t in (q, k, v))
+    assert not q_s.is_contiguous()
+
+    caller = [q_s, k_s, v_s, seq_offsets]
+    if num_targets is not None:
+        caller.append(num_targets)
+    launches = record_launch_allocation_streams(monkeypatch, caller)
+    side = torch.cuda.Stream()
+    out = flydsl_hstu_attention_fwd(
+        max_seq_len, alpha, q_s, k_s, v_s, seq_offsets, True, num_targets, 0, 0,
+        stream=side,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    assert launches and all(s == {side.cuda_stream} for s in launches), launches
+    assert torch.equal(out, expected)
 
 
 # --------------------------------------------------------------------------- #

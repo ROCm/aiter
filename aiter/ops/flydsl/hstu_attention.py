@@ -460,14 +460,11 @@ def flydsl_hstu_attention_fwd(
         waves_per_eu=waves_per_eu,
     )
 
-    out = torch.empty_like(v)
-    if num_targets is None:
-        num_targets = torch.zeros(1, dtype=seq_offsets.dtype, device=out.device)
-
-    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
-    if launch_stream.device != q.device:
-        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
-    with torch.cuda.device(q.device.index):
+    launch_stream = _enter_launch_stream(stream, q, k, v, seq_offsets, num_targets)
+    with torch.cuda.device(q.device.index), torch.cuda.stream(launch_stream):
+        out = torch.empty_like(v)
+        if num_targets is None:
+            num_targets = torch.zeros(1, dtype=seq_offsets.dtype, device=out.device)
         _run_compiled(
             launcher,
             N,
