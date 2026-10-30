@@ -1627,11 +1627,12 @@ def _run_blockscale_case(symbol, **case):
 
 def test_gfx950_blockscale_64xn():
     """Coverage for the gfx950 fp8 block-scale SiLU kernels. Each case names
-    its kernel.
+    its kernel and checks the numerical output against the reference.
 
-    inter_dim=1536 on 64x256 is a regression: the old object fails the
-    numerical check. model_dim=512 is the smallest supported K on each
-    kernel, checked through the numerical output.
+    inter_dim=1536 on 64x256 gives a tile count that does not divide the CU
+    count; the launcher rounds total_tgs for that, so the stock object passes
+    too. model_dim=512 is the smallest K each kernel supports. These are small
+    shape coverage, not a check for the out-of-bounds scale read.
     """
     if get_gfx() != "gfx950":
         return
@@ -1640,9 +1641,8 @@ def test_gfx950_blockscale_64xn():
     get_2stage_cfgs.cache_clear()
     try:
         with override_env("AITER_BYPASS_TUNE_CONFIG", "1"):
-            # Regression: 64x256 at inter_dim=1536. The tile count is smaller
-            # than the launch grid and is not a multiple of the de-swizzle
-            # group. The old object fails this numerical check.
+            # 64x256 at inter_dim=1536: six column tiles, so the launch grid
+            # is smaller than the CU count.
             for case in (
                 {
                     "token": 256,
@@ -1661,12 +1661,12 @@ def test_gfx950_blockscale_64xn():
             ):
                 _run_blockscale_case(_FMOE_64XN["64x256"], **case)
 
-            # Smallest supported K on 64x128, 64x256, and 64x384. The check
-            # compares the numerical output.
+            # Smallest supported K on each kernel. inter_dim keeps a 32-row
+            # kernel eligible at model_dim=512 for the default dispatch.
             for tile, inter_dim in (
-                ("64x128", 128),
+                ("64x128", 384),
                 ("64x256", 256),
-                ("64x384", 384),
+                ("64x384", 1152),
             ):
                 _run_blockscale_case(
                     _FMOE_64XN[tile],
