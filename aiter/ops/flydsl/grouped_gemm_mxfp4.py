@@ -10,21 +10,7 @@ import os
 import torch
 
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from .kernels.tensor_shim import _run_compiled, ptr_arg
-
-# Resolve the optional API once, but query its device/stream on every call.
-# This is not a stream cache: graph capture and thread-local stream switches
-# must still be observed. Older torch builds keep the public API fallback.
-_get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-
-
-def _current_flydsl_stream():
-    if _get_current_raw_stream is None:
-        return torch.cuda.current_stream()
-    from flydsl.expr import Stream
-
-    return Stream(_get_current_raw_stream(torch.cuda.current_device()))
-
+from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
 _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
@@ -222,7 +208,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
     if stream is None:
-        stream = _current_flydsl_stream()
+        stream = current_stream_arg()
     if stage1_act == 3:
         if float(situ_beta) <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")

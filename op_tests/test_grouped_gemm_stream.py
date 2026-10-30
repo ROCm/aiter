@@ -12,6 +12,9 @@ import pytest
 import torch
 
 gm = importlib.import_module("aiter.ops.flydsl.grouped_gemm_mxfp4")
+shim = importlib.import_module("aiter.ops.flydsl.kernels.tensor_shim")
+moe = importlib.import_module("aiter.ops.flydsl.moe_kernels")
+grouped = importlib.import_module("aiter.ops.flydsl.grouped_moe_gfx1250")
 
 
 def _handle(value):
@@ -34,33 +37,33 @@ def test_raw_handle_is_queried_each_time(monkeypatch):
         seen.append(device)
         return state["handles"][device]
 
-    monkeypatch.setattr(gm, "_get_current_raw_stream", raw)
+    monkeypatch.setattr(shim, "_get_current_raw_stream", raw)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: state["device"])
     monkeypatch.setattr(
         torch.cuda,
         "current_stream",
         lambda *a, **kw: pytest.fail("constructed a torch Stream on the fast path"),
     )
-    first = gm._current_flydsl_stream()
+    first = shim.current_stream_arg()
     assert isinstance(first, Stream) and _handle(first) == 101
     state["handles"][0] = 303
-    assert _handle(gm._current_flydsl_stream()) == 303
+    assert _handle(shim.current_stream_arg()) == 303
     state["device"] = 1
-    assert _handle(gm._current_flydsl_stream()) == 202
+    assert _handle(shim.current_stream_arg()) == 202
     assert seen == [0, 0, 1]
     assert _handle(first) == 101  # No mutable Stream object reused across calls.
 
 
 def test_missing_private_api_uses_public_fallback(monkeypatch):
     sentinel = object()
-    monkeypatch.setattr(gm, "_get_current_raw_stream", None)
+    monkeypatch.setattr(shim, "_get_current_raw_stream", None)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: sentinel)
     monkeypatch.setattr(
         torch.cuda,
         "current_device",
         lambda: pytest.fail("fallback must delegate device selection to torch"),
     )
-    assert gm._current_flydsl_stream() is sentinel
+    assert shim.current_stream_arg() is sentinel
 
 
 def _gpu():
@@ -81,7 +84,7 @@ def test_device_and_thread_local_handles():
             streams = [torch.cuda.default_stream(), torch.cuda.Stream()]
             for stream in streams:
                 with torch.cuda.stream(stream):
-                    assert _handle(gm._current_flydsl_stream()) == stream.cuda_stream
+                    assert _handle(shim.current_stream_arg()) == stream.cuda_stream
 
     device = torch.cuda.current_device()
     streams = [torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)]
@@ -89,7 +92,7 @@ def test_device_and_thread_local_handles():
     def worker(index):
         with torch.cuda.device(device), torch.cuda.stream(streams[index]):
             return all(
-                _handle(gm._current_flydsl_stream()) == streams[index].cuda_stream
+                _handle(shim.current_stream_arg()) == streams[index].cuda_stream
                 for _ in range(100)
             )
 
@@ -142,6 +145,8 @@ def test_real_moe_stream_order_and_graph(data_format, tokens, monkeypatch):
 
         with monkeypatch.context() as patch:
             patch.setattr(gm, "flydsl_grouped_gemm_a8w4_masked", old)
+            patch.setattr(moe, "current_stream_arg", torch.cuda.current_stream)
+            patch.setattr(grouped, "current_stream_arg", torch.cuda.current_stream)
             before = fm.fused_moe(*args, **kwargs)
         assert torch.equal(before, actual)
 
@@ -165,7 +170,7 @@ def test_real_moe_stream_order_and_graph(data_format, tokens, monkeypatch):
             with monkeypatch.context() as patch:
                 patch.setattr(
                     gm,
-                    "_current_flydsl_stream",
+                    "current_stream_arg",
                     lambda: pytest.fail("explicit stream replaced"),
                 )
                 new(*a, **{**kw, "stream": stream})
@@ -179,6 +184,10 @@ def test_real_moe_stream_order_and_graph(data_format, tokens, monkeypatch):
                 graph.replay()
                 with monkeypatch.context() as patch:
                     patch.setattr(gm, "flydsl_grouped_gemm_a8w4_masked", old)
+                    patch.setattr(moe, "current_stream_arg", torch.cuda.current_stream)
+                    patch.setattr(
+                        grouped, "current_stream_arg", torch.cuda.current_stream
+                    )
                     eager = fm.fused_moe(*args, **kwargs)
                 assert torch.equal(replayed, eager)
         torch.cuda.current_stream().wait_stream(stream)
