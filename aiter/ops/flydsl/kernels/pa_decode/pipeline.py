@@ -667,13 +667,23 @@ class PaDecodePipeline:
         k_scales = [
             self.kv.mx_scale_byte(k_cur[a * 5]) for a in range_constexpr(t.NCHUNK)
         ]
-        frag_Ss = self.gemm.qk_mxfp4(k_cur, k_scales, q_ops_all[0])
+        # q_scale = 2**e * mantissa, mantissa in [1, 2): 2**e rides on the MFMA's e8m0
+        # scale of Q and the mantissa is applied after it, so the f32 accumulator holds
+        # the logit itself and not the e4m3-normalized (up to 448x larger) product.
+        q_bits = self.lds.load(
+            self.lds.row_offset(t.sQscale_off, self.ctx.lane16, 1, fx.Float32),
+            fx.Int32,
+            1,
+        )[0]
+        q_mantissa = fx.Vector.from_elements(
+            [(q_bits & fx.Int32(0x7FFFFF)) | fx.Int32(0x3F800000)], dtype=fx.Int32
+        ).bitcast(fx.Float32)[0]
+        frag_Ss = self.gemm.qk_mxfp4(k_cur, k_scales, q_ops_all[0], q_bits >> 23)
         k_next = self.kv.mx_load("k", base)
         # Widen V while the softmax runs.
         for a in range_constexpr(t.NCHUNK):
             self.kv.mx_stage_v(v_raw, a, tile_valid)
-        scale = self.ctx.scale_qk * self.lds.load_scalar(t.sQscale_off, self.ctx.lane16)
-        scale_b = fx.full(4, scale, fx.Float32)
+        scale_b = fx.full(4, self.ctx.scale_qk * q_mantissa, fx.Float32)
         scores = [frag_Ss[a] * scale_b for a in range_constexpr(t.NCHUNK)]
         if tile_valid < t.TILE_TOK:  # only a sequence's last tile has masked tokens
             thr, _ = self.softmax.row_thresholds(tile_valid, None, 0)

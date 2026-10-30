@@ -96,9 +96,11 @@ class PaDecodeGemm:
             frag_Ss.append(fx.Vector(acc))
         return frag_Ss
 
-    def qk_mxfp4(self, k_raw, k_scales, q_op):
+    def qk_mxfp4(self, k_raw, k_scales, q_op, q_scale_byte):
         """QK of one MXFP4 K tile: per 16-token chunk one scaled MFMA, A = fp4 K
-        (lane: 16 B = one e8m0 group, its scale byte), B = fp8 Q (``q_op``)."""
+        (lane: 16 B = one e8m0 group, its scale byte), B = fp8 Q (``q_op``) scaled
+        by the e8m0 byte ``q_scale_byte``, so the f32 accumulator never exceeds the
+        logit by more than the 2x left in the mantissa of the query scale."""
         frag_Ss = []
         for a in range_constexpr(self.traits.NCHUNK):
             a_k = fx.Vector.from_elements(
@@ -117,7 +119,7 @@ class PaDecodeGemm:
                     0,
                     k_scales[a],
                     0,
-                    fx.Int32(UNIT_E8M0_SCALES),
+                    q_scale_byte,
                 ],
             )
             frag_Ss.append(fx.Vector(acc))

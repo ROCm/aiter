@@ -1291,31 +1291,48 @@ def run_pa_decode_mxfp4_one_task_per_row():
     }
 
 
-@benchmark()
-def run_pa_decode_mxfp4_tiny_query():
-    """A bf16 query far below the 1e-20 floor still meets K scales of 2**80.
+# (tag, (query exponent, K e8m0 byte, K e2m1 bytes per token, V e2m1 bytes per token)).
+# Each logit stays inside f32; what is extreme is the query and K scale on their own.
+_EXTREME_SCALE_CASES = [
+    ("mxfp4-tiny-query", (-80, 207, (0x22, 0xAA), (0x22, 0xAA))),
+    ("mxfp4-tiny-query-k2e120", (-80, 247, (0x22, 0xAA), (0x22, 0xAA))),
+    ("mxfp4-unit-query-k2e120", (0, 247, (0x22, 0xAA), (0x22, 0xAA))),
+    ("mxfp4-subnormal-query-k2e127", (-133, 254, (0x22, 0xAA), (0x22, 0xAA))),
+    ("mxfp4-huge-query-k2e-120", (120, 7, (0x22, 0xAA), (0x22, 0xAA))),
+    # Logits 0.35, 0.71, 1.06: the softmax weights depend on the restored scale.
+    ("mxfp4-weighted", (-104, 227, (0x11, 0x22, 0x33), (0x22, 0xAA, 0x11))),
+]
 
-    Q = 2**-80, K = +-2**80 (e8m0 byte 207, e2m1 +-1), V = +-1: the logits are
-    +-128 * 128**-0.5 and the output is V of the first token, about 1.
+
+@benchmark()
+def run_pa_decode_mxfp4_extreme_scales(q_exp, k_byte, k_codes, v_codes):
+    """A bf16 query at 2**q_exp meets K scales of 2**(k_byte - 127).
+
+    The logits are finite, but the e4m3-normalized query times such a K scale
+    reaches f32 range or beyond before the query scale is restored.
     """
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    pool = torch.zeros(1, 1, 128 * 64 + 128 * 4, dtype=torch.uint8, device=DEVICE)
-    # Tokens 0 and 1: +1 (0x22) and -1 (0xAA); K scale 2**80, V scale 1.
-    caches = []
-    for exponent in (207, 127):
-        page = pool.clone()
-        data, scale = page[..., : 128 * 64], page[..., 128 * 64 :]
-        data.view(1, 1, 128, 64)[..., 0, :] = 0x22
-        data.view(1, 1, 128, 64)[..., 1, :] = 0xAA
-        scale.view(1, 1, 128, 4)[..., :2, :] = exponent
-        caches.append(_mxfp4_views(page))
-    (kd, ks), (vd, vs) = caches
-    sign = torch.tensor([1.0, -1.0] + [0.0] * 126, device=DEVICE)[:, None]
-    logical_key = (sign * 2.0**80).expand(1, 1, 128, 128)
-    logical_value = sign.expand(1, 1, 128, 128)
-    query = torch.full((1, 1, 128), 2.0**-80, dtype=torch.bfloat16, device=DEVICE)
+
+    def page(codes, exponent):
+        pool = torch.zeros(1, 1, 128 * 64 + 128 * 4, dtype=torch.uint8, device=DEVICE)
+        data, scale = pool[..., : 128 * 64], pool[..., 128 * 64 :]
+        for token, code in enumerate(codes):
+            data.view(1, 1, 128, 64)[..., token, :] = code
+        scale.view(1, 1, 128, 4)[..., : len(codes), :] = exponent
+        dequant = fp4_utils.mxfp4_to_f32(
+            data.reshape(-1, 64).clone()
+        ) * fp4_utils.e8m0_to_f32(scale.reshape(-1, 4)).repeat_interleave(32, dim=-1)
+        return pool, dequant.reshape(1, 1, 128, 128)
+
+    (key_pool, logical_key), (value_pool, logical_value) = (
+        page(k_codes, k_byte),
+        page(v_codes, 127),
+    )
+    kd, ks = _mxfp4_views(key_pool)
+    vd, vs = _mxfp4_views(value_pool)
+    query = torch.full((1, 1, 128), 2.0**q_exp, dtype=torch.bfloat16, device=DEVICE)
     table = torch.zeros(1, 1, dtype=torch.int32, device=DEVICE)
-    context = torch.tensor([2], dtype=torch.int32, device=DEVICE)
+    context = torch.tensor([len(k_codes)], dtype=torch.int32, device=DEVICE)
     output = torch.full_like(query, float("nan"))
     pa.pa_decode(
         output,
@@ -1333,7 +1350,7 @@ def run_pa_decode_mxfp4_tiny_query():
     reference = _reference(
         query, logical_key, logical_value, table, context, 1, 0, None
     )
-    assert reference.float().mean() > 0.99
+    assert torch.isfinite(reference).all() and reference.abs().max() > 0.1
     return {"gfx": get_gfx_runtime(), "err": _check_output(output, reference)}
 
 
@@ -1490,10 +1507,10 @@ def _sweeps(arch, kv_dtypes):
             _unowned_skip_reason(kv, block_size, query_length, head_dim, arch)
         ),
     )
-    one_task = tiny_query = []
+    one_task, extreme_scales = [], []
     if "mxfp4" in kv_dtypes and arch == "gfx950":
         one_task = [("mxfp4-one-task-per-row", ())]
-        tiny_query = [("mxfp4-tiny-query", ())]
+        extreme_scales = _EXTREME_SCALE_CASES
     return [
         ("pa_decode", run_pa_decode, decode),
         (
@@ -1510,7 +1527,11 @@ def _sweeps(arch, kv_dtypes):
             run_pa_decode_mxfp4_one_task_per_row,
             one_task,
         ),
-        ("pa_decode MXFP4 tiny query", run_pa_decode_mxfp4_tiny_query, tiny_query),
+        (
+            "pa_decode MXFP4 extreme scales",
+            run_pa_decode_mxfp4_extreme_scales,
+            extreme_scales,
+        ),
     ]
 
 
