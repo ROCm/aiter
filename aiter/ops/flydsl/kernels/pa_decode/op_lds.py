@@ -173,7 +173,12 @@ class PaDecodeQueryLoader:
             absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
 
         q_scale = absmax * fx.Float32(1.0 / self.traits.FP8_MAX)
-        inv = fx.Float32(rcp_f32(fx.maxnumf(q_scale, fx.Float32(1e-20))))
+        # The floor only keeps 1/0 finite for an all-zero row. MXFP4 K scales reach
+        # 2**127, so there it is the smallest normal f32 and a tiny query still
+        # fills the e4m3 range; q_scale below stays exact to restore it.
+        # shortcut: a row with absmax under ~5e-36 still flushes, not worth a rescale.
+        floor = 1.17549435e-38 if self.traits.MXFP4 else 1e-20
+        inv = fx.Float32(rcp_f32(fx.maxnumf(q_scale, fx.Float32(floor))))
         inv_b = fx.full(self.traits.QLOAD_UNIT, inv, fx.Float32)
 
         for u in range_constexpr(self.traits.N_QLOADS):

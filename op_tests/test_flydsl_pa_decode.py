@@ -1291,6 +1291,52 @@ def run_pa_decode_mxfp4_one_task_per_row():
     }
 
 
+@benchmark()
+def run_pa_decode_mxfp4_tiny_query():
+    """A bf16 query far below the 1e-20 floor still meets K scales of 2**80.
+
+    Q = 2**-80, K = +-2**80 (e8m0 byte 207, e2m1 +-1), V = +-1: the logits are
+    +-128 * 128**-0.5 and the output is V of the first token, about 1.
+    """
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    pool = torch.zeros(1, 1, 128 * 64 + 128 * 4, dtype=torch.uint8, device=DEVICE)
+    # Tokens 0 and 1: +1 (0x22) and -1 (0xAA); K scale 2**80, V scale 1.
+    caches = []
+    for exponent in (207, 127):
+        page = pool.clone()
+        data, scale = page[..., : 128 * 64], page[..., 128 * 64 :]
+        data.view(1, 1, 128, 64)[..., 0, :] = 0x22
+        data.view(1, 1, 128, 64)[..., 1, :] = 0xAA
+        scale.view(1, 1, 128, 4)[..., :2, :] = exponent
+        caches.append(_mxfp4_views(page))
+    (kd, ks), (vd, vs) = caches
+    sign = torch.tensor([1.0, -1.0] + [0.0] * 126, device=DEVICE)[:, None]
+    logical_key = (sign * 2.0**80).expand(1, 1, 128, 128)
+    logical_value = sign.expand(1, 1, 128, 128)
+    query = torch.full((1, 1, 128), 2.0**-80, dtype=torch.bfloat16, device=DEVICE)
+    table = torch.zeros(1, 1, dtype=torch.int32, device=DEVICE)
+    context = torch.tensor([2], dtype=torch.int32, device=DEVICE)
+    output = torch.full_like(query, float("nan"))
+    pa.pa_decode(
+        output,
+        query,
+        kd,
+        vd,
+        context,
+        table,
+        128**-0.5,
+        1,
+        key_scale=ks,
+        value_scale=vs,
+        work_plan=None,
+    )
+    reference = _reference(
+        query, logical_key, logical_value, table, context, 1, 0, None
+    )
+    assert reference.float().mean() > 0.99
+    return {"gfx": get_gfx_runtime(), "err": _check_output(output, reference)}
+
+
 def _decode_cases(kv_dtypes):
     """(name, geometry) of every valid decode case, in a stable order."""
     cases = []
@@ -1444,9 +1490,10 @@ def _sweeps(arch, kv_dtypes):
             _unowned_skip_reason(kv, block_size, query_length, head_dim, arch)
         ),
     )
-    one_task = []
+    one_task = tiny_query = []
     if "mxfp4" in kv_dtypes and arch == "gfx950":
         one_task = [("mxfp4-one-task-per-row", ())]
+        tiny_query = [("mxfp4-tiny-query", ())]
     return [
         ("pa_decode", run_pa_decode, decode),
         (
@@ -1463,6 +1510,7 @@ def _sweeps(arch, kv_dtypes):
             run_pa_decode_mxfp4_one_task_per_row,
             one_task,
         ),
+        ("pa_decode MXFP4 tiny query", run_pa_decode_mxfp4_tiny_query, tiny_query),
     ]
 
 
