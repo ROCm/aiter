@@ -53,8 +53,7 @@ def gemm_a16w16_all_reduce_rmsnorm(
     assert x.dtype == w.dtype == residual.dtype == weight.dtype == torch.bfloat16
     assert w.shape == (hidden, k) and residual.shape == (tokens, hidden)
     assert weight.shape == (hidden,)
-    assert x.is_contiguous() and w.is_contiguous() and residual.is_contiguous()
-    assert weight.is_contiguous()
+    assert all(t.is_contiguous() for t in (x, w, residual, weight))
     assert hidden >= 256 and hidden & (hidden - 1) == 0
     config, _ = get_gemm_config(
         "GEMM-A16W16-ALL-REDUCE-RMSNORM", tokens, hidden, k, backend="gluon"
@@ -69,10 +68,8 @@ def gemm_a16w16_all_reduce_rmsnorm(
     slot = 4 * _LINES * ((calls.numel() - 1) // 2)  # as in all_reduce_init
     blocks = triton.cdiv(tokens, 3 * rows)
     triples = blocks * rows
-    tiles = blocks * (hidden // block_n)
     # A triple is 2 * hidden int32 words of inbox and has a counter.
     assert 2 * hidden * triples <= slot, "x is larger than max_bytes"
-    assert triples <= calls.numel() - 1
 
     _LOGGER.info("GEMM_A16W16_ALL_REDUCE_RMSNORM [gluon]: x=%s w=%s", x.shape, w.shape)
 
@@ -81,7 +78,7 @@ def gemm_a16w16_all_reduce_rmsnorm(
     wmma, operand_a, operand_b = create_wmma_layouts(num_warps)
     shared_a, shared_b = create_shared_layouts(4 * rows, block_n, block_k, "TN")
     programs = min(triples, _ROW_PROGRAMS)
-    _gemm_a16w16_all_reduce_rmsnorm_kernel[(tiles + programs,)](
+    _gemm_a16w16_all_reduce_rmsnorm_kernel[(blocks * (hidden // block_n) + programs,)](
         x,
         w,
         residual,

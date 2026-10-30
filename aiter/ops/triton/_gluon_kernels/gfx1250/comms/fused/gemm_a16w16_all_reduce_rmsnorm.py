@@ -263,10 +263,7 @@ def _receive_all(
     tag = call % 32768 + 1
     bank = call % 2 * 4 * SLOT
     inbox = gl.multiple_of(inboxes[RANK].to(gl.pointer_type(gl.int32)), 16)
-    l0 = pos
-    l1 = pos
-    l2 = pos
-    l3 = pos
+    l0, l1, l2, l3 = pos, pos, pos, pos
     late = 1
     it = 0
     while (late > 0) & (it < MAXIT):
@@ -325,9 +322,8 @@ def _receive_norm(
     i = line % N
     pos = 64 * (i // 32) + 32 * (line // N) + i % 32
     pos = 4 * pos + gl.arange(0, 4, layout=gl.SliceLayout(0, ROW))[None, :]
-    w = gl.amd.cdna5.buffer_load(weight, col).to(gl.float32)  # once for all rows
-    if GEMMA:
-        w += 1.0
+    # Once for all rows. The Gemma norm uses 1 + weight.
+    w = gl.amd.cdna5.buffer_load(weight, col).to(gl.float32) + GEMMA
     for t in range(first, blocks * ROWS, programs):
         row = 3 * ROWS * (t // ROWS) + t % ROWS
         if row < tokens:
