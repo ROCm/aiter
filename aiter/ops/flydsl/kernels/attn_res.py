@@ -32,7 +32,7 @@ from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, Stream, T
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from . import dpp_utils
 from .tensor_shim import _run_compiled
@@ -721,7 +721,7 @@ def flydsl_attn_res(
     strides that are multiples of ``_VEC_WIDTH``, and a 16-byte-aligned base
     pointer for ``BufferCopy128b``. Weight vectors must satisfy the same
     vector-copy layout rules. Each tensor must span less than 4 GiB.
-    Requires gfx942 or gfx950 (wave64). ``D`` must
+    Requires gfx942 or gfx950 (wave64) on the live GPU. ``D`` must
     be a positive multiple of ``_VEC_WIDTH`` with a wave-aligned row size;
     D=7168 uses 448 threads and one row per workgroup, while D=1024 defaults
     to one 64-thread row per workgroup. ``rows_per_wg=4`` packs four
@@ -792,7 +792,7 @@ def flydsl_attn_res(
     if not all(t.is_cuda for t in tensors):
         raise ValueError("all tensors must be CUDA tensors")
 
-    gfx = get_gfx()
+    gfx = get_gfx_runtime()
     if gfx not in _ALLOWED_GFX:
         raise ValueError(
             f"flydsl_attn_res requires wave64 CDNA ({', '.join(_ALLOWED_GFX)}); "
