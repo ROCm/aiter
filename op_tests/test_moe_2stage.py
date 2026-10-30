@@ -1637,10 +1637,13 @@ def test_gfx950_blockscale_64xn():
     if get_gfx() != "gfx950":
         return
 
-    # Dispatch must not consult a tuned config for these shapes.
+    # Dispatch must not consult a tuned config for these shapes, and must take
+    # the fp8-input path the forced symbols belong to, whatever the caller set.
     get_2stage_cfgs.cache_clear()
     try:
-        with override_env("AITER_BYPASS_TUNE_CONFIG", "1"):
+        with override_env("AITER_BYPASS_TUNE_CONFIG", "1"), override_env(
+            "AITER_XBFLOAT16", "0"
+        ):
             # 64x256 at inter_dim=1536: six column tiles, so the launch grid
             # is smaller than the CU count.
             for case in (
