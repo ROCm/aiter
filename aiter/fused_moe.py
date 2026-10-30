@@ -1247,53 +1247,57 @@ def fused_moe(
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
     scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
+    # The public entry point remains keyword-friendly. This internal call
+    # follows fused_moe_'s schema order to avoid dispatcher keyword matching
+    # for every tensor/scalar on every layer. Keep the forwarding-order test
+    # in sync when extending the registered schema.
     return fused_moe_(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weight=topk_weight,
-        topk_ids=topk_ids,
-        expert_mask=expert_mask,
-        activation=activation.value,
-        quant_type=quant_type.value,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_size_M=block_size_M,
-        num_local_tokens=num_local_tokens,
-        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-        dtype=dtype,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        swiglu_limit=swiglu_limit,
-        beta=beta,
-        linear_beta=linear_beta,
-        gate_mode=gate_mode,
-        ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
-        ep_combine_input_offset=(
+        hidden_states,  # hidden_states
+        w1,  # w1
+        w2,  # w2
+        topk_weight,  # topk_weight
+        topk_ids,  # topk_ids
+        expert_mask,  # expert_mask
+        activation.value,  # activation
+        quant_type.value,  # quant_type
+        doweight_stage1,  # doweight_stage1
+        w1_scale,  # w1_scale
+        w2_scale,  # w2_scale
+        a1_scale,  # a1_scale
+        a2_scale,  # a2_scale
+        block_size_M,  # block_size_M
+        num_local_tokens,  # num_local_tokens
+        moe_sorting_dispatch_policy,  # moe_sorting_dispatch_policy
+        dtype,  # dtype
+        hidden_pad,  # hidden_pad
+        intermediate_pad,  # intermediate_pad
+        bias1,  # bias1
+        bias2,  # bias2
+        swiglu_limit,  # swiglu_limit
+        beta,  # beta
+        linear_beta,  # linear_beta
+        gate_mode,  # gate_mode
+        stage2_scatter.arena_handle if enable_ep_scatter else 0,  # ep_arena_handle
+        (
             stage2_scatter.combine_input_offset if enable_ep_scatter else 0
-        ),
-        ep_slot_stride_bytes=(
+        ),  # ep_combine_input_offset
+        (
             stage2_scatter.slot_stride_bytes if enable_ep_scatter else 0
-        ),
-        ep_max_tokens_per_rank=(
+        ),  # ep_slot_stride_bytes
+        (
             stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
-        ),
-        ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
-        ep_combine_quant=(
+        ),  # ep_max_tokens_per_rank
+        stage2_scatter.world_size if enable_ep_scatter else 0,  # ep_world_size
+        (
             int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
-        ),
-        ep_source_token_map=scatter_source_map,
-        output=output,
-        quant_type_a=None if quant_type_a is None else quant_type_a.value,
-        quant_dtype_a=quant_dtype_a,
-        quant_dtype_a2=quant_dtype_a2,
-        herd_topk=herd_topk,
-        herd_routed_scaling_factor=herd_routed_scaling_factor,
+        ),  # ep_combine_quant
+        scatter_source_map,  # ep_source_token_map
+        output,  # output
+        None if quant_type_a is None else quant_type_a.value,  # quant_type_a
+        quant_dtype_a,  # quant_dtype_a
+        quant_dtype_a2,  # quant_dtype_a2
+        herd_topk,  # herd_topk
+        herd_routed_scaling_factor,  # herd_routed_scaling_factor
     )
 
 
