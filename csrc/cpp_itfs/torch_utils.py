@@ -54,8 +54,15 @@ def torch_to_c_types(*args):
             c_args.append(ctypes.POINTER(ctypes.c_int)())
         elif isinstance(arg, torch.Tensor):
             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
-        elif isinstance(arg, torch.cuda.Stream):
-            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
+        elif isinstance(arg, torch.Stream):
+            handle = getattr(arg, "cuda_stream", None)
+            if handle is None:
+                handle = torch.cuda.Stream(
+                    stream_id=arg.stream_id,
+                    device_index=arg.device_index,
+                    device_type=arg.device_type,
+                ).cuda_stream
+            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
         else:
             if type(arg) not in ctypes_map:
                 raise ValueError(f"Unsupported type: {type(arg)}")

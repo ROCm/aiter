@@ -419,9 +419,11 @@ def _gemm_a16w16(
     otype = otype if otype is not None else inp_view.dtype
     if out is not None and out.dtype != otype:
         raise ValueError(f"gemm_a16w16: out is {out.dtype} but otype is {otype}")
-    from aiter.ops.opus._arch import _device_arch_and_cu
+    from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
 
     gfx, cu_num = _device_arch_and_cu(inp_view.device)
+    if gfx not in SUPPORTED_OPUS_ARCHES:
+        gfx, cu_num = get_gfx(), get_cu_num()
     config = get_GEMM_A16W16_config(
         M=m,
         N=n,
@@ -645,6 +647,12 @@ def asm_gemm(
     return gemm_a16w16_asm(inp, weights, result, bias, splitK, kernelName, bpreshuffle)
 
 
+@functools.cache
+def _flydsl_hgemm_kernel_params(kernel_name: str) -> dict | None:
+    """Parsed once per tuned name; `flydsl_gemm` only reads the result."""
+    return _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(kernel_name)
+
+
 def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -662,9 +670,7 @@ def flydsl_gemm(
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
-    flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(
-        config["kernelName"]
-    )
+    flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
     fused_bias = None
     if (
         bias is not None
