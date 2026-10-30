@@ -44,6 +44,8 @@ _WARP_SIZE = 64
 _VEC_WIDTH = 8  # 8 bf16 values = one 128-bit global-memory transaction.
 _TILE_CANDIDATES = (2, 4, 8, 1)
 _MAX_BLOCK_THREADS = 1024
+# Buffer loads and stores take a 32-bit byte offset from the tensor's base.
+_BUFFER_LIMIT_BYTES = 1 << 32
 _ALLOWED_GFX = ("gfx942", "gfx950")
 _SMALL_D_ROWS_PER_WG = 1
 # Extra block sources kept outstanding during consume_source. Value 3 means
@@ -680,6 +682,17 @@ def _check_row_layout(tensor: torch.Tensor, name: str) -> None:
             "BufferCopy128b"
         )
 
+    if tensor.numel():
+        last_offset = sum(
+            (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+        )
+        extent_bytes = (last_offset + 1) * tensor.element_size()
+        if extent_bytes >= _BUFFER_LIMIT_BYTES:
+            raise ValueError(
+                f"{name} spans {extent_bytes} bytes; buffer offsets are 32-bit, "
+                "so each tensor must span less than 4 GiB"
+            )
+
 
 def flydsl_attn_res(
     prefix: torch.Tensor,
@@ -707,7 +720,8 @@ def flydsl_attn_res(
     Multi-dimensional inputs must have unit trailing stride, positive leading
     strides that are multiples of ``_VEC_WIDTH``, and a 16-byte-aligned base
     pointer for ``BufferCopy128b``. Weight vectors must satisfy the same
-    vector-copy layout rules. Requires gfx942 or gfx950 (wave64). ``D`` must
+    vector-copy layout rules. Each tensor must span less than 4 GiB.
+    Requires gfx942 or gfx950 (wave64). ``D`` must
     be a positive multiple of ``_VEC_WIDTH`` with a wave-aligned row size;
     D=7168 uses 448 threads and one row per workgroup, while D=1024 defaults
     to one 64-thread row per workgroup. ``rows_per_wg=4`` packs four

@@ -22,6 +22,7 @@ import torch
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_attn_res
+from aiter.ops.flydsl.kernels import attn_res as attn_res_kernel
 from aiter.ops.torch_ref.attn_res import attn_res as attn_res_reference
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -308,6 +309,30 @@ def test_flydsl_attn_res_rejects_unsupported_layouts(layout: str):
             qk_weight,
             None,
             0,
+            -1,
+            _EPS,
+            _EPS,
+        )
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_rejects_tensors_over_4gib():
+    """Reject a tensor whose byte offsets overflow the 32-bit buffer offset."""
+    _, _, _, norm_weight, qk_weight, _, _ = _make_inputs(1)
+    block_row_bytes = _MAX_BLOCKS * _D * torch.bfloat16.itemsize
+    tokens = attn_res_kernel._BUFFER_LIMIT_BYTES // block_row_bytes + 1
+    prefix = torch.empty(tokens, _D, dtype=torch.bfloat16)
+    blocks = torch.empty(tokens, _MAX_BLOCKS, _D, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="4 GiB"):
+        flydsl_attn_res(
+            prefix,
+            None,
+            blocks,
+            norm_weight,
+            qk_weight,
+            None,
+            _MAX_BLOCKS,
             -1,
             _EPS,
             _EPS,
