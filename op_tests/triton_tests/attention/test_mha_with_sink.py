@@ -138,6 +138,13 @@ def test_mha_with_sink(
     relax_bwd_err_tol: bool = SEQLEN_Q >= 1024 and SEQLEN_K >= 1024
     bwd_atol = 3e-2 if relax_bwd_err_tol else 2.5e-2
     bwd_rtol = 3e-2 if relax_bwd_err_tol else 2.5e-2
+
+    # Diagnostic: log the actual dq diff regardless of pass/fail, to compare
+    # the real margin against the tolerance across GPU archs/partitions
+    # (assert_close only reports this on failure).
+    dq_abs_diff = (triton_dq - torch_dq).abs().max().item()
+    print(f"[dq-diag] max_abs_diff={dq_abs_diff:.6e} atol={bwd_atol}", flush=True)
+
     torch.testing.assert_close(
         triton_dq,
         torch_dq,
