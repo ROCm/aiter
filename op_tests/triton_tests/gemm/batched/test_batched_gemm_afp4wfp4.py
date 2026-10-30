@@ -206,3 +206,47 @@ def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
     batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
 
     torch.testing.assert_close(torch_out, out)
+
+
+def _place_before_nan_scales(scales):
+    """
+    Returns a copy of scales (B, D, K // 32), with the same strides, whose
+    storage is followed by 0xFF (NaN in e8m0) bytes.
+    """
+    B, D, G = scales.shape
+    storage = torch.full((B * G * D + 4096,), 0xFF, dtype=torch.uint8, device="cuda")
+    out = storage[: B * G * D].view(B, G, D).transpose(1, 2)
+    out.copy_(scales)
+    return out
+
+
+# K values that are not a multiple of the selected BLOCK_SIZE_K, so the last
+# K iteration covers scale groups past the end of the scale tensors.
+@pytest.mark.parametrize(
+    "B, M, N, K",
+    [
+        (2, 256, 3584, 2112),
+        (2, 1, 1280, 2112),
+        (3, 32, 512, 96),
+        (2, 128, 256, 160),
+        (2, 64, 1024, 4160),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN", "NT"])
+def test_batched_gemm_afp4_wfp4_unaligned_k_ignores_oob_scales(
+    B: int, M: int, N: int, K: int, dtype, layout
+):
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    x, w, x_scales, w_scales, out = generate_batched_gemm_afp4wfp4_inputs(
+        B, M, N, K, dtype, layout=layout, output=True
+    )
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+
+    x_scales = _place_before_nan_scales(x_scales)
+    w_scales = _place_before_nan_scales(w_scales)
+    batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
+
+    torch.testing.assert_close(torch_out, out)
