@@ -588,19 +588,56 @@ class CudaCommunicator(DeviceCommunicatorBase):
             else:
                 out, res_out, scale_out = result
         else:
-            out_, res_out = self.fused_allreduce_rmsnorm(
-                input_,
-                res_inp_,
-                weight_,
-                eps,
-                prefill_support,
-                gemma_norm=gemma_norm,
+            use_fused_norm_quant = (
+                get_gfx() == "gfx1250"
+                and gemma_norm
+                and not emit_bf16
+                and input_.dim() == 2
+                and input_.dtype in (torch.float16, torch.bfloat16)
+                and input_.shape == res_inp_.shape
+                and weight_.shape == (hidden_dim,)
+                and hidden_dim <= 8192
+                and hidden_dim % 8 == 0
+                and input_.is_contiguous()
+                and res_inp_.is_contiguous()
+                and weight_.is_contiguous()
+                and total_bytes <= no_prefill_quant_bytes_limit
             )
-            hip_quant = get_hip_quant(QuantType.per_Token)
-            out, scale_out = hip_quant(out_, quant_dtype=fp8)
-            if emit_bf16:
-                # out_ is the pre-quantization bf16/fp16 normed activation.
-                bf16_out = out_
+            if use_fused_norm_quant:
+                from aiter import rmsnorm2d_fwd_with_add_dynamicquant
+
+                ar_out = self.all_reduce(input_, prefill_support=prefill_support)
+                out = torch.empty(ar_out.shape, dtype=fp8, device=ar_out.device)
+                res_out = torch.empty_like(ar_out)
+                scale_out = torch.empty(
+                    ar_out.shape[:-1] + (1,),
+                    dtype=torch.float32,
+                    device=ar_out.device,
+                )
+                rmsnorm2d_fwd_with_add_dynamicquant(
+                    out,
+                    ar_out,
+                    res_inp_,
+                    res_out,
+                    scale_out,
+                    weight_,
+                    eps,
+                    gemma_norm=True,
+                )
+            else:
+                out_, res_out = self.fused_allreduce_rmsnorm(
+                    input_,
+                    res_inp_,
+                    weight_,
+                    eps,
+                    prefill_support,
+                    gemma_norm=gemma_norm,
+                )
+                hip_quant = get_hip_quant(QuantType.per_Token)
+                out, scale_out = hip_quant(out_, quant_dtype=fp8)
+                if emit_bf16:
+                    # out_ is the pre-quantization bf16/fp16 normed activation.
+                    bf16_out = out_
         assert out is not None
         assert res_out is not None
         assert scale_out is not None
