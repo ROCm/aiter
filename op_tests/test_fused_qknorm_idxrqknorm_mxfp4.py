@@ -487,30 +487,6 @@ def sweep(dtype_list, tokens, perf_tokens):
     )
 
 
-def test_sweep():
-    """The pytest entry: the whole script run with its default sweep."""
-    if get_gfx() in SUPPORTED_GFX:
-        sweep(DEFAULT_DTYPES, DEFAULT_TOKENS, DEFAULT_PERF_TOKENS)
-
-
-# The sweep drives these (they take arguments, or are only parts of it), not pytest.
-for _fn in (
-    test_write_bytes,
-    test_skip_index_branch,
-    test_views_into_one_pool,
-    test_q_fp8_out,
-    test_existing_index_modes_unchanged,
-    test_rewriting_a_slot_replaces_all_68_bytes,
-    test_zero_and_extreme_rows,
-    test_pages_dequantize_to_the_reference,
-    test_reference_scale_rule_is_the_hip_rule,
-    test_arch_guards,
-    test_rejections,
-    test_write_perf,
-):
-    _fn.__test__ = False
-
-
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
