@@ -39,7 +39,9 @@ _RTOL = 3e-2
 # run_perftest num_rotate_args: 1 reuses one arg set (L2-resident), 0 rotates
 # copies so each timed iteration reads cold HBM.
 _ROTATE_ARGS = {"warm": 1, "cold": 0}
-_BF16_ULP_REL = 3.863e-3
+# A correctly rounded BF16 output is within 2**-8 of its row's peak magnitude;
+# 1e-5 covers FP32 accumulation before that rounding.
+_ORACLE_MAX_REL = 2.0**-8 + 1e-5
 _SUPPORTED_GFX = ("gfx942", "gfx950")
 
 
@@ -466,9 +468,9 @@ def test_flydsl_attn_res_float64_oracle(
     kernel_f64 = output.to(torch.float64)
     row_peak = oracle.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
     max_rel = ((kernel_f64 - oracle).abs() / row_peak).max().item()
-    assert max_rel < _BF16_ULP_REL, (
+    assert max_rel < _ORACLE_MAX_REL, (
         "float64 oracle max relative error vs row peak "
-        f"{max_rel:.6e} exceeds {_BF16_ULP_REL:.6e} "
+        f"{max_rel:.6e} exceeds {_ORACLE_MAX_REL:.6e} "
         f"(D={hidden_size}, k={num_blocks + 1}, "
         f"delta={has_delta}, write={write_block}, "
         f"output_norm={apply_output_norm})"
