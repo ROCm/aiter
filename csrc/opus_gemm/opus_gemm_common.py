@@ -2940,10 +2940,7 @@ class KernelKey:
         return cls(family, gfx, int(cu_num), int(kid))
 
 
-def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
-    """Select available kernels from the family/gfx/CU table."""
-    family = family.strip().lower()
-    gfx = gfx.split(":", 1)[0].strip().lower()
+def _get_registry_records(family: str, gfx: str, cu_num: int) -> dict[int, object]:
     # gfx1250-strict (A0) shares the gfx1250 kernel family in the registry;
     # callers keep the gfx1250-strict spelling in KernelKey (compile target).
     if gfx == "gfx1250-strict":
@@ -2953,7 +2950,17 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
         return {}
     if type(cu_num) is not int or cu_num not in tables:
         raise ValueError(f"unregistered OPUS namespace {family}/{gfx}/{cu_num}")
-    records = tables[cu_num]
+    return tables[cu_num]
+
+
+def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
+    """Select available kernels from the family/gfx/CU table."""
+    family = family.strip().lower()
+    gfx = gfx.split(":", 1)[0].strip().lower()
+    # Fold strict here too so main's a16w16 gfx1250 CO-existence filter below applies.
+    if gfx == "gfx1250-strict":
+        gfx = "gfx1250"
+    records = _get_registry_records(family, gfx, cu_num)
     if family == "a16w16" and gfx == "gfx1250":
         return {
             kid: instance
@@ -3265,7 +3272,7 @@ def get_kernel_instance(
     *,
     cu_num: int,
 ) -> OpusGemmInstance | None:
-    """Return a kernel registered for ``(arch, interface, kid, Y.dtype)``."""
+    """Return a kernel registered for ``(family, arch, cu_num, kid, Y.dtype)``."""
     arch = str(arch).lower().split(":", 1)[0]
     family = str(family).lower()
     family_tags = OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.get(arch, {}).get(family)
@@ -3277,7 +3284,7 @@ def get_kernel_instance(
     except (TypeError, ValueError):
         return None
 
-    instance = get_registry(family, arch, cu_num).get(kid)
+    instance = _get_registry_records(family, arch, cu_num).get(kid)
     if instance is None or instance.kernel_tag not in family_tags:
         return None
     instance_arch = (instance.arch_prefix or "gfx950").lower()
@@ -3303,6 +3310,13 @@ def get_kernel_instance(
             output_compatible = dtype in instance.output_dtypes
         if not output_compatible:
             return None
+    if (
+        family == "a16w16"
+        and arch == "gfx1250"
+        and instance.kernel_tag in _A16W16_CO_TAGS
+        and not os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
+    ):
+        return None
     return instance
 
 
