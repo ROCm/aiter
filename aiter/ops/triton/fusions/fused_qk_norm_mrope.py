@@ -57,33 +57,40 @@ def _launch(
 
     q_out = torch.empty((num_tokens, q.shape[1]), dtype=q.dtype, device=q.device)
     k_out = torch.empty((num_tokens, k.shape[1]), dtype=k.dtype, device=k.device)
+    # The cache write makes the row kernel faster up to a larger row count.
+    tdm = config["TDM_CACHE"] if cache else config["TDM"]
     _LOGGER.info(
         "FUSED_QK_NORM_MROPE: T=%d Hq=%d Hk=%d cache=%s TDM=%s",
         num_tokens,
         q_heads,
         k_heads,
         cache,
-        config["TDM"],
+        tdm,
     )
 
     num_warps = config["num_warps"]
     args = (q, k, q_weight, k_weight, positions, cos, sin, q_out, k_out)
     strides = (q.stride(0), k.stride(0), positions.stride(0), cos.stride(0))
-    if config["TDM"] and not cache:
+    cache_args = (v, slot_mapping, v.stride(0), slot_mapping.shape[0], k_cache, v_cache)
+    if tdm:
         # A program does block_m tokens, so that the K tile has one row a wave.
         assert q_heads & (q_heads - 1) == 0 and k_heads & (k_heads - 1) == 0
-        assert q.stride(0) % 8 == 0 and k.stride(0) % 8 == 0
+        assert q.stride(0) % 8 == 0 and k.stride(0) % 8 == 0 and v.stride(0) % 8 == 0
         block_m = max(1, num_warps // k_heads)
         fused_qk_norm_mrope_tdm_gfx1250[(triton.cdiv(num_tokens, block_m),)](
             *args,
             num_tokens,
             *strides,
+            *cache_args,
             EPS=eps,
             Q_HEADS=q_heads,
             K_HEADS=k_heads,
             SECTION_H=mrope_section[1],
             SECTION_W=mrope_section[2],
             BLOCK_M=block_m,
+            CACHE=cache,
+            BLOCK_SIZE=k_cache.shape[3] if cache else 1,
+            X=k_cache.shape[4] if cache else 1,
             num_warps=num_warps,
             **get_fused_qk_norm_mrope_layouts(num_warps),
         )
@@ -93,12 +100,7 @@ def _launch(
             *args,
             num_rows,
             *strides,
-            v,
-            slot_mapping,
-            v.stride(0),
-            slot_mapping.shape[0],
-            k_cache,
-            v_cache,
+            *cache_args,
             EPS=eps,
             Q_HEADS=q_heads,
             K_HEADS=k_heads,
@@ -198,6 +200,10 @@ def fused_qk_norm_mrope_cache(
 
     Returns:
         q_out [T, Hq * 256] and k_out [T, Hk * 256], contiguous.
+
+    The TDM kernel also does the cache write, above a larger row count than in
+    ``fused_qk_norm_mrope``. The V rows then also need a stride that is a multiple of
+    16 bytes.
     """
     num_blocks, k_heads, _, block, x = k_cache.shape
     assert k_cache.shape == (num_blocks, k_heads, HEAD_DIM.value // x, block, x)

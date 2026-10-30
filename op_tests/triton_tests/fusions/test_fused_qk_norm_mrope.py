@@ -107,7 +107,7 @@ def make_cache_inputs(num_tokens, q_heads, k_heads):
     return inputs
 
 
-@pytest.mark.parametrize("num_tokens", [1, 37, 300])
+@pytest.mark.parametrize("num_tokens", [1, 37, 300, 7001])
 @pytest.mark.parametrize("q_heads, k_heads", [(4, 1), (16, 2)])
 def test_fused_qk_norm_mrope_cache(num_tokens, q_heads, k_heads):
     inputs = make_cache_inputs(num_tokens, q_heads, k_heads)

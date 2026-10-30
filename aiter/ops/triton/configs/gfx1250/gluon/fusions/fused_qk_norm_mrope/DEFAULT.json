@@ -1,10 +1,17 @@
 {
     "ROWS_LEQ_16384": {
         "TDM": false,
+        "TDM_CACHE": false,
+        "num_warps": 4
+    },
+    "ROWS_LEQ_32768": {
+        "TDM": true,
+        "TDM_CACHE": false,
         "num_warps": 4
     },
     "any": {
         "TDM": true,
+        "TDM_CACHE": true,
         "num_warps": 4
     }
 }

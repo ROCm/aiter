@@ -29,7 +29,7 @@ _fused_qk_norm_mrope_repr = make_kernel_repr(
     "fused_qk_norm_mrope_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M", "CACHE"]
 )
 _fused_qk_norm_mrope_tdm_repr = make_kernel_repr(
-    "fused_qk_norm_mrope_tdm_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M"]
+    "fused_qk_norm_mrope_tdm_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_M", "CACHE"]
 )
 
 
@@ -302,12 +302,22 @@ def fused_qk_norm_mrope_tdm_gfx1250(
     stride_k,
     stride_positions,
     stride_cos,
+    # The arguments of the cache write come last, as in the row kernel.
+    v_ptr,
+    slot_mapping_ptr,
+    stride_v,
+    num_slots,
+    k_cache_ptr,
+    v_cache_ptr,
     EPS: gl.constexpr,
     Q_HEADS: gl.constexpr,
     K_HEADS: gl.constexpr,
     SECTION_H: gl.constexpr,
     SECTION_W: gl.constexpr,
     BLOCK_M: gl.constexpr,
+    CACHE: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
+    X: gl.constexpr,
     row_layout: gl.constexpr,
     rope_layout: gl.constexpr,
 ):
@@ -343,6 +353,20 @@ def fused_qk_norm_mrope_tdm_gfx1250(
     )
     gl.amd.gfx1250.tdm.async_load(q_desc, [t0, 0], q_s)
     gl.amd.gfx1250.tdm.async_load(k_desc, [t0, 0], k_s)
+    if CACHE:
+        # The V tile, and the slot of each K row. Tokens past the slot table are padding.
+        v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            v_ptr, [num_tokens, K_COLS], [stride_v, 1], [BLOCK_M, K_COLS], smem_layout
+        )
+        v_s = gl.allocate_shared_memory(
+            v_ptr.dtype.element_ty, [BLOCK_M, K_COLS], smem_layout
+        )
+        gl.amd.gfx1250.tdm.async_load(v_desc, [t0, 0], v_s)
+        offs_k = gl.arange(0, BLOCK_M * K_HEADS, layout=gl.SliceLayout(1, row_layout))
+        token_k = t0 + offs_k // K_HEADS
+        in_table = (token_k < num_tokens) & (token_k < num_slots)
+        slot = gl.load(slot_mapping_ptr + token_k, mask=in_table, other=-1).to(gl.int64)
+    # Each tile waits for its own TDM load only: the V tile can still be in flight.
     _norm_rope_tile(
         q_s.reshape([BLOCK_M * Q_HEADS, HEAD_DIM]),
         q_out_s.reshape([BLOCK_M * Q_HEADS, HEAD_DIM]),
@@ -359,7 +383,7 @@ def fused_qk_norm_mrope_tdm_gfx1250(
         SECTION_H,
         SECTION_W,
         BLOCK_M * Q_HEADS,
-        1,
+        1 + CACHE,
         row_layout,
         rope_layout,
     )
@@ -379,11 +403,40 @@ def fused_qk_norm_mrope_tdm_gfx1250(
         SECTION_H,
         SECTION_W,
         BLOCK_M * K_HEADS,
-        0,
+        CACHE * 1,
         row_layout,
         rope_layout,
     )
     gl.barrier()
     gl.amd.gfx1250.tdm.async_store(q_out_desc, [t0, 0], q_out_s)
     gl.amd.gfx1250.tdm.async_store(k_out_desc, [t0, 0], k_out_s)
+    if CACHE:
+        # K[block, head, d // X, offset, d % X] from the K tile in LDS, 16 bytes a lane, and
+        # V[block, head, offset // X, d, offset % X], one value a lane. A negative slot is a pad token.
+        gl.amd.gfx1250.tdm.async_wait(2)
+        offs_n = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, row_layout))
+        offs_v = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, rope_layout))
+        write = in_table & (slot >= 0)
+        block = slot // BLOCK_SIZE
+        offset = slot % BLOCK_SIZE
+        cache_row = (block * K_HEADS + offs_k % K_HEADS) * (HEAD_DIM * BLOCK_SIZE)
+        k_rows = k_out_s.reshape([BLOCK_M * K_HEADS, HEAD_DIM]).load(row_layout)
+        gl.store(
+            k_cache_ptr
+            + (cache_row + offset * X)[:, None]
+            + ((offs_n // X) * (BLOCK_SIZE * X) + offs_n % X)[None, :],
+            k_rows,
+            mask=write[:, None],
+        )
+        v_rows = v_s.reshape([BLOCK_M * K_HEADS, HEAD_DIM]).load(rope_layout)
+        v_dst = gl.convert_layout(
+            cache_row + (offset // X) * (HEAD_DIM * X) + offset % X,
+            gl.SliceLayout(1, rope_layout),
+        )
+        write_v = gl.convert_layout(write, gl.SliceLayout(1, rope_layout))
+        gl.store(
+            v_cache_ptr + v_dst[:, None] + offs_v[None, :] * X,
+            v_rows,
+            mask=write_v[:, None],
+        )
     gl.amd.gfx1250.tdm.async_wait(0)
