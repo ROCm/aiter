@@ -17,6 +17,7 @@ jobs:
           set +e
           echo "runner=${RUNNER_NAME}"
           uname -a
+          command -v amd-smi && amd-smi list
           command -v rocm-smi && rocm-smi
           command -v rocminfo && rocminfo | grep -m1 gfx
           ls -l /dev/kfd /dev/dri/render* 2>/dev/null
