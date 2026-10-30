@@ -9,11 +9,12 @@ from dataclasses import dataclass
 import flydsl.expr as fx
 import torch
 
-from aiter import ActivationType, QuantType, dtypes
+from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
+from ..tensor_shim import _run_compiled
 from .combine import (
     CHUNK_ELEMS as _COMBINE_CHUNK_ELEMS,
 )
@@ -175,6 +176,12 @@ def _compact_gemm_align_m(
     a decode step runs at. Alignment is per-expert padding, so holding it at the
     capacity tile costs ``experts_per_rank * (tile - used)`` dead rows that the
     GEMM still computes.
+
+    This pipeline always fuses the EP scatter into gemm2, and ``fused_moe``
+    looks that shape up with ``ep_fused=True``. The compact plan has to use
+    the same mode: the default ``False`` skips rows tuned for the scatter
+    path and falls back to a 64 tile, so the plan alignment and the GEMM
+    tile disagree.
     """
 
     def _env(name: str) -> int | None:
@@ -188,7 +195,22 @@ def _compact_gemm_align_m(
     if ov_m is not None or ov_m2 is not None:
         tile_m = 64 if ov_m is None else ov_m
         tile_m2 = tile_m if ov_m2 is None else ov_m2
-        return max(int(tile_m), int(tile_m2))
+        align = max(int(tile_m), int(tile_m2))
+        seen = getattr(_compact_gemm_align_m, "_override_logged", None)
+        if seen is None:
+            seen = set()
+            _compact_gemm_align_m._override_logged = seen
+        sig = (ov_m, ov_m2, align)
+        if sig not in seen:
+            seen.add(sig)
+            logger.info(
+                "compact align overridden by AITER_TDM_TILE_M=%s "
+                "AITER_TDM_TILE_M2=%s -> %d (CSV lookup skipped)",
+                ov_m,
+                ov_m2,
+                align,
+            )
+        return align
 
     from aiter.ops.flydsl.grouped_moe_gfx1250 import (
         _as_int,
@@ -216,6 +238,7 @@ def _compact_gemm_align_m(
         q_dtype_a=q_dtype_a,
         q_dtype_w=dtypes.fp4x2,
         quant_type=quant_type,
+        ep_fused=True,
     )
     tile_m = 64
     tile_m2 = 64
@@ -697,6 +720,7 @@ class MegaMoEGfx1250:
         next_topk_ids: torch.Tensor | None = None,
         next_recv_token_bound: int | None = None,
         combine_quant: str | None = None,
+        recv_counter_is_zero: bool = False,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
@@ -789,7 +813,7 @@ class MegaMoEGfx1250:
                 self._compact_recv_bound(token_count, recv_token_bound)
             )
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
-            hidden_states, topk_weights, topk_ids
+            hidden_states, topk_weights, topk_ids, recv_counter_is_zero
         )
         if recv_token_bound is not None and not self._compact_plan:
             bound = int(recv_token_bound)
@@ -1023,7 +1047,8 @@ class MegaMoEGfx1250:
         plan_stream = self._compact_plan_stream
         plan_stream.wait_stream(cur)
         with torch.cuda.stream(plan_stream):
-            self._compact_plan_for(self._compact_step_align_m, slot)(
+            _run_compiled(
+                self._compact_plan_for(self._compact_step_align_m, slot),
                 self._arena.handle,
                 topk_ids.data_ptr(),
                 bufs["tok_map"].data_ptr(),
@@ -1402,7 +1427,8 @@ class MegaMoEGfx1250:
                 inp_cur_tok,
                 stream,
             ):
-                kern(
+                _run_compiled(
+                    kern,
                     arena_handle,
                     addr_inp_tok,
                     addr_inp_idx,
@@ -1564,10 +1590,12 @@ class MegaMoEGfx1250:
                 my_lsa_rank,
                 inp_cur_tok,
                 stream,
+                reset_recv=True,
             ):
                 # mori's dispatch only accumulates into total_recv (this package's
                 # zeroes it in Phase 2), so without this it grows every forward.
-                self._total_recv.zero_()
+                if reset_recv:
+                    self._total_recv.zero_()
                 plan.launch(
                     stream=torch.cuda.current_stream().cuda_stream,
                     token_indices=addr_inp_idx,
@@ -1673,6 +1701,7 @@ class MegaMoEGfx1250:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        recv_counter_is_zero: bool = False,
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
@@ -1707,6 +1736,10 @@ class MegaMoEGfx1250:
             self._compact_psum = self._psums[self._compact_slot]
         else:
             tok_map = self._token_destination_map
+        reset_args = {}
+        if recv_counter_is_zero:
+            assert self._config.dispatch_backend == "mori"
+            reset_args["reset_recv"] = False
         self._dispatch_variants[spec](
             self._arena.handle,
             payload.data_ptr(),
@@ -1719,6 +1752,7 @@ class MegaMoEGfx1250:
             self._config.rank,
             token_count,
             stream,
+            **reset_args,
         )
         reverse_source_view = _from_gpu_ptr(
             self._arena.local_ptr("recv_to_src_token"),
@@ -1780,13 +1814,15 @@ class MegaMoEGfx1250:
         stream = fx.Stream(torch.cuda.current_stream())
         # 1-block cross-device barrier, then the barrier-free reduce on the same
         # stream; the kernel boundary gives the reduce its visibility.
-        self._combine_sync(
+        _run_compiled(
+            self._combine_sync,
             self._arena.handle,
             self._cross_device_flag.data_ptr(),
             self._config.rank,
             stream,
         )
-        self._combine_variants[combine_quant_bits](
+        _run_compiled(
+            self._combine_variants[combine_quant_bits],
             self._arena.local_ptr("comb_inp"),
             self._combine_output.data_ptr(),
             routing.token_count,
