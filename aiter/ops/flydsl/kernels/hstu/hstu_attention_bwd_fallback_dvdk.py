@@ -428,12 +428,14 @@ def build_hstu_attention_bwd_dvdk(
             kv_rows.append(local)
             kv_in_bounds.append(local < seq_len)
 
+        # Out-of-bounds lanes load global row 0 and discard it. `seq_start`
+        # would not do: for a trailing empty sequence it is one past the end.
         k_packs = []
         for ks in range_constexpr(K_STEPS):
             k_col = fx.Int32(ks * MFMA_QK_K) + lane_div_16 * fx.Int32(MFMA_QK_LANE_K)
             per_og = []
             for og in range_constexpr(KV_OWNED_SUBTILES):
-                safe = kv_in_bounds[og].select(seq_start + kv_rows[og], seq_start)
+                safe = kv_in_bounds[og].select(seq_start + kv_rows[og], fx.Int32(0))
                 raw = k_load(
                     fx.Int64(safe), head_idx, k_col // fx.Int32(MFMA_QK_LANE_K)
                 ).ir_value()
@@ -445,7 +447,7 @@ def build_hstu_attention_bwd_dvdk(
             v_col = fx.Int32(ks * MFMA_DA_K) + lane_div_16 * fx.Int32(MFMA_DA_LANE_K)
             per_og = []
             for og in range_constexpr(KV_OWNED_SUBTILES):
-                safe = kv_in_bounds[og].select(seq_start + kv_rows[og], seq_start)
+                safe = kv_in_bounds[og].select(seq_start + kv_rows[og], fx.Int32(0))
                 raw = v_load(
                     fx.Int64(safe), head_idx, v_col // fx.Int32(MFMA_DA_LANE_K)
                 ).ir_value()

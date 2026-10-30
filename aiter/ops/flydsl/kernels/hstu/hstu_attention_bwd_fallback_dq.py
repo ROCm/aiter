@@ -293,12 +293,14 @@ def build_hstu_attention_bwd_dq(
             q_in_bounds.append(local < seq_len)
 
         # ---- Resident Q B-operand packs (GEMM1 S^T = K*Q^T) ----
+        # Out-of-bounds lanes load global row 0 and discard it. `seq_start`
+        # would not do: for a trailing empty sequence it is one past the end.
         q_packs = []  # q_packs[ks][qg]
         for ks in range_constexpr(K_STEPS):
             q_col = fx.Int32(ks * MFMA_QK_K) + lane_div_16 * fx.Int32(MFMA_QK_LANE_K)
             per_qg = []
             for qg in range_constexpr(Q_SUBTILES):
-                safe = q_in_bounds[qg].select(seq_start + q_rows[qg], seq_start)
+                safe = q_in_bounds[qg].select(seq_start + q_rows[qg], fx.Int32(0))
                 raw = q_load(
                     fx.Int64(safe), head_idx, q_col // fx.Int32(MFMA_QK_LANE_K)
                 ).ir_value()
@@ -312,7 +314,7 @@ def build_hstu_attention_bwd_dq(
             d_col = fx.Int32(ks * MFMA_DA_K) + lane_div_16 * fx.Int32(MFMA_DA_LANE_K)
             per_qg = []
             for qg in range_constexpr(Q_SUBTILES):
-                safe = q_in_bounds[qg].select(seq_start + q_rows[qg], seq_start)
+                safe = q_in_bounds[qg].select(seq_start + q_rows[qg], fx.Int32(0))
                 raw = do_load(
                     fx.Int64(safe), head_idx, d_col // fx.Int32(MFMA_DA_LANE_K)
                 ).ir_value()
@@ -438,7 +440,7 @@ def build_hstu_attention_bwd_dq(
                 in_bounds = tok < seq_len
                 if V_NEEDS_GUARD:
                     in_bounds = in_bounds & (row < fx.Int32(BLOCK_N))
-                safe_tok = in_bounds.select(seq_start + tok, seq_start)
+                safe_tok = in_bounds.select(seq_start + tok, fx.Int32(0))
                 raw = v_load(
                     fx.Int64(safe_tok), head_idx, v_load_col // fx.Int32(VEC_V)
                 ).ir_value()

@@ -519,7 +519,63 @@ def _validate_bwd_inputs(
             f"dout must share v's dtype, got dout={dout.dtype} v={v.dtype}"
         )
 
+    metadata = {"seq_offsets": seq_offsets}
+    if num_targets is not None:
+        metadata["num_targets"] = num_targets
+    for name, t in metadata.items():
+        if t.dim() != 1:
+            raise ValueError(f"{name} must be rank 1, got {tuple(t.shape)}")
+        if t.dtype not in _BWD_METADATA_DTYPES:
+            raise ValueError(f"{name} must be int32 or int64, got {t.dtype}")
+    # The kernels address token rows with 32-bit positions.
+    if q.shape[0] > torch.iinfo(torch.int32).max:
+        raise ValueError(f"total tokens must fit in int32, got {q.shape[0]}")
+
+    if os.environ.get("AITER_HSTU_VALIDATE", "0").lower() in ("1", "true"):
+        _validate_bwd_metadata_values(
+            seq_offsets, num_targets, total_tokens=q.shape[0], max_seq_len=max_seq_len
+        )
+
     return batch, num_heads, head_dim, hidden_dim, dtype_str
+
+
+_BWD_METADATA_DTYPES = (torch.int32, torch.int64)
+
+
+def _validate_bwd_metadata_values(
+    seq_offsets: torch.Tensor,
+    num_targets: torch.Tensor | None,
+    *,
+    total_tokens: int,
+    max_seq_len: int,
+) -> None:
+    """Check the metadata VALUES the kernels trust, behind AITER_HSTU_VALIDATE=1.
+
+    Off by default: reading the verdict back synchronises the host with the
+    device, which costs ~100 us per call (several times a small inference
+    call) and is illegal during CUDA graph capture.
+    """
+    lengths = seq_offsets.diff()
+    checks = {
+        "seq_offsets[0] must be 0": seq_offsets[0] != 0,
+        f"seq_offsets[-1] must equal the token count ({total_tokens})": (
+            seq_offsets[-1] != total_tokens
+        ),
+        "seq_offsets must be non-decreasing": (lengths < 0).any(),
+        f"sequence lengths must not exceed max_seq_len ({max_seq_len})": (
+            lengths > max_seq_len
+        ).any(),
+    }
+    if num_targets is not None:
+        targets = num_targets.to(lengths.dtype)
+        checks["num_targets must be non-negative"] = (targets < 0).any()
+        checks["num_targets must not exceed each sequence's length"] = (
+            targets > lengths
+        ).any()
+    failed = torch.stack(list(checks.values())).tolist()
+    errors = [msg for msg, bad in zip(checks, failed) if bad]
+    if errors:
+        raise ValueError("invalid hstu metadata: " + "; ".join(errors))
 
 
 # The default backward is the fused dV/dK/dQ ping-pong kernel: all three
@@ -687,13 +743,30 @@ def _balance_gather_index(B: int, groups: int, device: str) -> torch.Tensor:
     slot = group * (B // groups) + rnd
     inv = torch.empty_like(rank)
     inv[slot] = rank
-    return inv
+    return _publish_cached(inv)
 
 
 @functools.lru_cache(maxsize=64)
 def _identity_perm(B: int, device: str) -> torch.Tensor:
     """Return a cached identity permutation."""
-    return torch.arange(B, dtype=torch.int32, device=device)
+    return _publish_cached(torch.arange(B, dtype=torch.int32, device=device))
+
+
+def _publish_cached(t: torch.Tensor) -> torch.Tensor:
+    """Finish building a cached device tensor before any stream may read it.
+
+    The cache is shared by every stream, while the producing stream is known
+    only here. Synchronising it once, on a cache miss, orders the build before
+    all later readers. Each reader still records its stream (`_use_cached`),
+    so an eviction cannot recycle the block under a queued reader.
+    """
+    torch.cuda.current_stream(t.device).synchronize()
+    return t
+
+
+def _use_cached(t: torch.Tensor) -> torch.Tensor:
+    t.record_stream(torch.cuda.current_stream(t.device))
+    return t
 
 
 def _build_balance_perm(
@@ -709,9 +782,9 @@ def _build_balance_perm(
     B = int(lengths.numel())
     device = seq_offsets.device
     if B % groups != 0:
-        return _identity_perm(B, str(device))
+        return _use_cached(_identity_perm(B, str(device)))
     order = torch.argsort(lengths, descending=True)  # sequence indices, longest first
-    inv = _balance_gather_index(B, groups, str(device))
+    inv = _use_cached(_balance_gather_index(B, groups, str(device)))
     return order[inv].to(torch.int32)
 
 
@@ -1340,6 +1413,19 @@ def flydsl_hstu_attention_bwd(
     `fused` overrides the choice: None picks as above (AITER_HSTU_BWD_FUSED=0
     forces the fallback), True requires the single-pass kernel and raises
     instead of falling back, False always uses the fallback pair.
+
+    All work is queued on `stream` (default: the current stream), after the
+    work already queued on the current stream. The returned gradients are
+    allocated on `stream` and are complete only once that stream reaches this
+    point: a caller consuming them on another stream must synchronise first,
+    e.g. `torch.cuda.current_stream().wait_stream(stream)`, and call
+    `record_stream` if it frees them there.
+
+    `seq_offsets` must start at 0, be non-decreasing, and end at the token
+    count. Each sequence must be at most `N` long, and each `num_targets`
+    entry between 0 and its sequence's length. Those values are not checked
+    by default, because doing so synchronises the host with the device; set
+    AITER_HSTU_VALIDATE=1 to check them.
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q,
@@ -1350,6 +1436,10 @@ def flydsl_hstu_attention_bwd(
         num_targets=num_targets,
         max_seq_len=N,
     )
+    if q.shape[0] == 0:
+        # No tokens: nothing to launch, and every kernel's out-of-bounds lanes
+        # rely on global row 0 existing.
+        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
     custom_config = {
         key: value

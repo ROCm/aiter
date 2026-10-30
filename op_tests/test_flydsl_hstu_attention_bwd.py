@@ -79,6 +79,12 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _validate_metadata_values(monkeypatch):
+    """Every case also checks the metadata values, which production skips."""
+    monkeypatch.setenv("AITER_HSTU_VALIDATE", "1")
+
+
 # --------------------------------------------------------------------------- #
 # Reference gradient oracle
 # --------------------------------------------------------------------------- #
@@ -356,7 +362,7 @@ def _qkv_do(batch=2, tokens=8, heads=4, attn_dim=128, hidden_dim=128, device="cu
     k = torch.zeros_like(q)
     v = torch.zeros((tokens, heads, hidden_dim), dtype=torch.bfloat16, device=device)
     dout = torch.zeros_like(v)
-    seq_offsets = torch.zeros(batch + 1, dtype=torch.int64, device=device)
+    seq_offsets = (torch.arange(batch + 1, device=device) * tokens) // batch
     return q, k, v, dout, seq_offsets
 
 
@@ -389,6 +395,63 @@ def test_validate_bwd_inputs_rejects_cpu_tensors():
     q, k, v, dout, seq_offsets = _qkv_do(device="cpu")
     with pytest.raises(ValueError):
         _validate_bwd_inputs(q, k, v, dout, seq_offsets, None, max_seq_len=8)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "make_offsets,make_targets,match",
+    [
+        (lambda so: so[None, :], None, "seq_offsets must be rank 1"),
+        (lambda so: so.float(), None, "seq_offsets must be int32 or int64"),
+        (lambda so: so, lambda nt: nt[:, None], "num_targets must be rank 1"),
+        (lambda so: so, lambda nt: nt.to(torch.int16), "num_targets must be int32"),
+    ],
+)
+def test_validate_bwd_inputs_rejects_bad_metadata_layout(
+    monkeypatch, make_offsets, make_targets, match
+):
+    """Rank and dtype are checked on every call, AITER_HSTU_VALIDATE or not."""
+    monkeypatch.delenv("AITER_HSTU_VALIDATE")
+    q, k, v, dout, seq_offsets = _qkv_do()
+    num_targets = torch.zeros(2, dtype=torch.int32, device=q.device)
+    if make_targets is not None:
+        num_targets = make_targets(num_targets)
+    with pytest.raises(ValueError, match=match):
+        _validate_bwd_inputs(
+            q, k, v, dout, make_offsets(seq_offsets), num_targets, max_seq_len=8
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "offsets,targets,match",
+    [
+        ([1, 4, 8], None, r"seq_offsets\[0\] must be 0"),
+        ([0, 4, 6], None, r"seq_offsets\[-1\] must equal the token count \(8\)"),
+        ([0, 6, 4, 8], None, "non-decreasing"),
+        ([0, 0, 8], None, r"must not exceed max_seq_len \(6\)"),
+        ([0, 4, 8], [1, -1], "num_targets must be non-negative"),
+        ([0, 4, 8], [5, 0], "must not exceed each sequence's length"),
+    ],
+)
+def test_validate_bwd_inputs_checks_metadata_values(offsets, targets, match):
+    """With AITER_HSTU_VALIDATE=1, invalid offsets and targets are refused."""
+    q, k, v, dout, _ = _qkv_do(batch=len(offsets) - 1)
+    seq_offsets = torch.tensor(offsets, dtype=torch.int64, device=q.device)
+    num_targets = None
+    if targets is not None:
+        num_targets = torch.tensor(targets, dtype=torch.int32, device=q.device)
+    with pytest.raises(ValueError, match=match):
+        _validate_bwd_inputs(q, k, v, dout, seq_offsets, num_targets, max_seq_len=6)
+
+
+@requires_cuda
+def test_validate_bwd_inputs_skips_values_by_default(monkeypatch):
+    """Value checks synchronise with the device, so they are opt-in."""
+    monkeypatch.delenv("AITER_HSTU_VALIDATE")
+    q, k, v, dout, _ = _qkv_do()
+    seq_offsets = torch.tensor([0, 6, 4], dtype=torch.int64, device=q.device)
+    _validate_bwd_inputs(q, k, v, dout, seq_offsets, None, max_seq_len=8)
 
 
 # --------------------------------------------------------------------------- #
@@ -456,8 +519,10 @@ def test_flydsl_bwd_dense_causal_shapes(
 # --------------------------------------------------------------------------- #
 
 requires_fused = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx() != "gfx942",
-    reason="hstu bwd fused is specialized for gfx942",
+    not torch.cuda.is_available()
+    or get_gfx() != "gfx942"
+    or torch.cuda.get_device_properties(0).multi_processor_count != 304,
+    reason="hstu bwd fused is validated on MI300X (gfx942, 304 CUs) only",
 )
 
 # B=32/H=4/N=1024/d=64 spans ~2-4 kv tiles per sequence at BLOCK_M=256, which is
@@ -712,6 +777,44 @@ def test_flydsl_bwd_custom_stream_temporaries(monkeypatch, fused, sort_by_length
         assert torch.equal(g, e), name
 
 
+@requires_cuda
+@pytest.mark.parametrize("aligned", [True, False])
+def test_balance_perm_cache_is_safe_across_streams(aligned):
+    """A cache miss on a stalled stream is complete before another stream reads.
+
+    The cached gather index (identity perm for unaligned batches) is built on
+    whichever stream misses first. A second stream that read it while the
+    first was still stalled would see whatever the block held before. The
+    stalled stream's free blocks are zero-filled first, so such a read gives a
+    perm full of repeats instead of, by luck, the right one; the reader copies
+    the perm at once, so a premature read is captured.
+    """
+    groups = hstu_kernels.NUM_GRID_GROUPS
+    batch = groups * 3 + (0 if aligned else 1)
+    g = torch.Generator(device="cuda").manual_seed(3)
+    lengths = torch.randint(0, 100, (batch,), device="cuda", generator=g)
+    seq_offsets = torch.zeros(batch + 1, dtype=torch.int64, device="cuda")
+    seq_offsets[1:] = torch.cumsum(lengths, 0)
+
+    for _ in range(5):
+        hstu_kernels._balance_gather_index.cache_clear()
+        hstu_kernels._identity_perm.cache_clear()
+        stalled, reader = torch.cuda.Stream(), torch.cuda.Stream()
+        with torch.cuda.stream(stalled):
+            poison = [
+                torch.zeros(batch, dtype=torch.int64, device="cuda") for _ in range(32)
+            ]
+        torch.cuda.synchronize()
+        del poison
+        with torch.cuda.stream(stalled):
+            torch.cuda._sleep(200_000_000)
+            hstu_kernels._build_balance_perm(seq_offsets)
+        with torch.cuda.stream(reader):
+            perm = hstu_kernels._build_balance_perm(seq_offsets).clone()
+        torch.cuda.synchronize()
+        assert sorted(perm.tolist()) == list(range(batch))
+
+
 def _inputs_with_lengths(lengths, h=4, d=64, seed=7):
     dev = torch.device("cuda")
     g = torch.Generator(device=dev).manual_seed(seed)
@@ -725,8 +828,15 @@ def _inputs_with_lengths(lengths, h=4, d=64, seed=7):
     return q, k, v, dout * 100, seq_offsets
 
 
-@requires_fused
-def test_flydsl_bwd_fused_empty_sequences():
+_FUSED_OR_FALLBACK = [
+    False,
+    pytest.param(True, marks=requires_fused),
+]
+
+
+@requires_cuda
+@pytest.mark.parametrize("fused", _FUSED_OR_FALLBACK)
+def test_flydsl_bwd_empty_sequences(fused):
     """Empty sequences -- leading, interior and trailing -- contribute nothing.
 
     A trailing empty sequence starts one past the last token, so any load
@@ -740,17 +850,18 @@ def test_flydsl_bwd_fused_empty_sequences():
         n, alpha, q, k, v, seq_offsets, True, None, 0, 0, dout
     )
     dq, dk, dv = flydsl_hstu_attention_bwd(
-        n, alpha, q, k, v, dout, seq_offsets, True, None, 0, 0, fused=True
+        n, alpha, q, k, v, dout, seq_offsets, True, None, 0, 0, fused=fused
     )
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
-@requires_fused
-def test_flydsl_bwd_fused_all_empty():
+@requires_cuda
+@pytest.mark.parametrize("fused", _FUSED_OR_FALLBACK)
+def test_flydsl_bwd_all_empty(fused):
     """A batch without a single token returns empty gradients, launching nothing."""
     q, k, v, dout, seq_offsets = _inputs_with_lengths([0, 0, 0, 0])
     dq, dk, dv = flydsl_hstu_attention_bwd(
-        512, 1.0, q, k, v, dout, seq_offsets, True, None, 0, 0, fused=True
+        512, 1.0, q, k, v, dout, seq_offsets, True, None, 0, 0, fused=fused
     )
     assert dq.shape == q.shape and dk.shape == k.shape and dv.shape == v.shape
 
@@ -779,6 +890,7 @@ def test_bwd_fused_gate_rejects_too_many_heads():
         validate_hstu_attention_bwd(
             80, 64, 64, True, 0, 0, False, 1.0, "bf16", 1024,
             block_m=256, block_n=16, num_waves=8, waves_per_eu=2, arch="gfx942",
+            num_cus=304,
         )  # fmt: skip
 
 
@@ -789,8 +901,19 @@ def test_bwd_fused_gate_requires_measured_occupancy(waves_per_eu):
         validate_hstu_attention_bwd(
             4, 64, 64, True, 0, 0, False, 1.0, "bf16", 1024,
             block_m=256, block_n=16, num_waves=8, waves_per_eu=waves_per_eu,
-            arch="gfx942",
+            arch="gfx942", num_cus=304,
         )  # fmt: skip
+
+
+@pytest.mark.parametrize("num_cus", [80, 228, 256])
+def test_bwd_fused_gate_requires_validated_device(num_cus):
+    """gfx942 products other than the validated MI300X (e.g. MI308X with 80
+    CUs, MI300A with 228) are gated out; MI300X's 304 passes."""
+    args = (4, 64, 64, True, 0, 0, False, 1.0, "bf16", 1024)
+    tiles = {"block_m": 256, "block_n": 16, "num_waves": 8, "waves_per_eu": 2}
+    with pytest.raises(ValueError, match="validated on MI300X only"):
+        validate_hstu_attention_bwd(*args, **tiles, arch="gfx942", num_cus=num_cus)
+    validate_hstu_attention_bwd(*args, **tiles, arch="gfx942", num_cus=304)
 
 
 @requires_fused

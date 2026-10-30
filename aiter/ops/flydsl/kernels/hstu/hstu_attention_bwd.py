@@ -150,6 +150,10 @@ NUM_OPERAND_GROUPS = 16
 GROUP_ORDER = [0, 4, 1, 5, 2, 6, 3, 7, 8, 12, 9, 13, 10, 14, 11, 15]
 assert sorted(GROUP_ORDER) == list(range(NUM_OPERAND_GROUPS))
 
+# CU count of the MI300X the fused kernel was validated on. The arch string
+# cannot tell gfx942 products apart. MI325X shares this count and also passes.
+_VALIDATED_NUM_CUS = 304
+
 
 def validate_hstu_attention_bwd(
     num_heads: int,
@@ -168,6 +172,7 @@ def validate_hstu_attention_bwd(
     num_waves: int,
     waves_per_eu: int,
     arch: str | None = None,
+    num_cus: int | None = None,
 ) -> None:
     """Hard gate for the fused kernel.
 
@@ -175,6 +180,8 @@ def validate_hstu_attention_bwd(
     outside it must fall back to the `build_hstu_attention_bwd_dvdk` +
     `build_hstu_attention_bwd_dq` pair rather than silently compile a variant
     that was never measured.
+
+    `arch` and `num_cus` default to the current device's.
     """
     if arch is None:
         arch = get_rocm_arch()
@@ -182,6 +189,17 @@ def validate_hstu_attention_bwd(
         raise ValueError(
             f"hstu bwd fused requires gfx942, got {arch!r}. The schedule "
             "assumes 16x16x16 MFMA timing and a dword LDS DMA."
+        )
+    if num_cus is None:
+        num_cus = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+    if num_cus != _VALIDATED_NUM_CUS:
+        # gfx942 also covers MI300A (228 CUs) and MI308X (80 CUs), whose
+        # occupancy and memory differ from the MI300X it was validated on.
+        raise ValueError(
+            f"hstu bwd fused is validated on MI300X only ({_VALIDATED_NUM_CUS} "
+            f"CUs), got a gfx942 device with {num_cus} CUs"
         )
     if dtype_str != "bf16":
         raise ValueError(f"hstu bwd fused requires bf16, got {dtype_str!r}")
