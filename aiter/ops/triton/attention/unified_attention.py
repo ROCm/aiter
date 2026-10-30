@@ -169,10 +169,10 @@ def _length_aware_split(config, params: _UAParams):
         return None
     budget = max(1, params.num_sms * per_cu // params.num_kv_heads)
     # the kernels sum the KV lengths and round that up by budget in int32, and
-    # pack work-item counts in 16 bits
+    # pack the sequences before an item in 15 bits and the items before it in 16
     if params.num_seqs * params.max_seqlen_k + budget >= 2**31:
         return None
-    if budget + params.num_seqs >= 2**16:
+    if budget + params.num_seqs >= 2**16 or params.num_seqs >= 2**15:
         return None
     return budget, int(num_segments)
 
@@ -741,6 +741,9 @@ def _unified_attention_3d_triton(
         # no sequence takes more than NUM_SEGMENTS. Items are dealt out in runs
         # of ITEM_RUN, once per head; a multiple of the XCD count keeps every
         # head of an item on one XCD, so they share its L2.
+        assert (
+            split_runs_per_xcd is not None
+        ), "a length-aware split needs SPLIT_RUNS_PER_XCD in the attn_3d config"
         item_run = split_runs_per_xcd * get_num_xcds()
         num_items = min(split_budget + params.num_seqs, params.num_seqs * NUM_SEGMENTS)
         num_items = triton.cdiv(num_items, item_run) * item_run
@@ -830,6 +833,9 @@ def _reduce_segments_triton(
     if split_budget is not None:
         # merge as many slots per step as a sequence of an even batch uses, so
         # the usual merge is one step and only an outsized sequence loops
+        assert (
+            split_segment_block_min is not None
+        ), "a length-aware split needs SPLIT_SEGMENT_BLOCK_MIN in the reduce config"
         even_share = triton.cdiv(split_budget, params.num_seqs)
         length_aware = {
             "split_budget": split_budget,
