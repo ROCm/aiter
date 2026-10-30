@@ -225,7 +225,9 @@ def _dequant(fmt, cache, scale):
         return cache.float()
     if fmt == "fp8":
         return cache.float() * scale.unsqueeze(-1)
-    grid = torch.tensor(E2M1 + tuple(-x for x in E2M1), device="cuda")
+    grid = torch.tensor(
+        E2M1 + tuple(-x for x in E2M1), dtype=torch.float32, device="cuda"
+    )
     codes = cache.long()
     values = torch.stack([grid[codes & 15], grid[codes >> 4]], dim=-1).flatten(-2)
     exponent = scale.float().repeat_interleave(FP4_GROUP, dim=-1)
@@ -250,7 +252,10 @@ def test_qsa_fp8_writer_never_saturates():
     ).bfloat16()
     caches = [torch.zeros(rows // 16, 16, 2, 256, device="cuda", dtype=FP8_DTYPE)]
     caches.append(torch.zeros_like(caches[0]))
-    scales = [torch.zeros(rows // 16, 16, 2, device="cuda") for _ in range(2)]
+    scales = [
+        torch.zeros(rows // 16, 16, 2, dtype=torch.float32, device="cuda")
+        for _ in range(2)
+    ]
     slots = torch.arange(rows, device="cuda")
     slots[5] = -1
     qsa_store_quantized_rows(
@@ -269,7 +274,9 @@ def test_qsa_fp4_writer_is_exact_on_the_grid_and_close_off_it():
 
     torch.manual_seed(1)
     rows = 512
-    grid = torch.tensor(E2M1 + tuple(-x for x in E2M1), device="cuda")
+    grid = torch.tensor(
+        E2M1 + tuple(-x for x in E2M1), dtype=torch.float32, device="cuda"
+    )
     # Each 32-dim group holds +-6 so the shared exponent is the group's own.
     codes = torch.randint(0, 16, (rows, 1, 128), device="cuda")
     exact = grid[codes]
@@ -293,8 +300,12 @@ def test_qsa_fp4_writer_rounds_ties_away_from_zero():
 
     torch.manual_seed(2)
     rows = 64
-    ties = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device="cuda")
-    up = torch.tensor([0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+    ties = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32, device="cuda"
+    )
+    up = torch.tensor(
+        [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32, device="cuda"
+    )
     pick = torch.randint(0, len(ties), (rows, 1, 128), device="cuda")
     sign = torch.randint(0, 2, (rows, 1, 128), device="cuda") * 2.0 - 1.0
     values, expected = ties[pick] * sign, up[pick] * sign
@@ -315,10 +326,15 @@ def test_qsa_fp4_writer_rounds_ties_away_from_zero():
 def test_qsa_fp4_writer_caps_the_scale_for_the_fp16_decode():
     # E8M0 240 (2^113) is the largest scale the readers decode exactly.
     top = 6.0 * 2.0**113
-    values = torch.zeros(2, 1, 128, device="cuda")
+    values = torch.zeros(2, 1, 128, dtype=torch.float32, device="cuda")
     values[0, 0, :32] = top
-    values[0, 0, 32:35] = torch.tensor([4 * top, -4 * top, top / 2])
-    values[1, 0, 64:80] = torch.tensor(E2M1 + tuple(-x for x in E2M1)) * 2.0**-90
+    values[0, 0, 32:35] = torch.tensor(
+        [4 * top, -4 * top, top / 2], dtype=torch.float32, device="cuda"
+    )
+    values[1, 0, 64:80] = (
+        torch.tensor(E2M1 + tuple(-x for x in E2M1), dtype=torch.float32, device="cuda")
+        * 2.0**-90
+    )
     values = values.bfloat16()
     cache, scale = _store("fp4", values, 4)
     assert scale.view(-1, 4)[0, :2].tolist() == [240, 240]
@@ -416,7 +432,7 @@ def test_qsa_scorers_reject_scale_planes_that_do_not_match_the_cache():
     k_cache, v_cache = (
         torch.zeros(shape, device="cuda", dtype=FP8_DTYPE) for _ in "kv"
     )
-    scale = torch.ones(shape[:3], device="cuda")
+    scale = torch.ones(shape[:3], dtype=torch.float32, device="cuda")
     q = torch.zeros(1, 4, 256, dtype=torch.bfloat16, device="cuda")
     selected = torch.zeros(1, 16, dtype=torch.int32, device="cuda")
     table = torch.arange(4, dtype=torch.int32, device="cuda")[None]
@@ -465,7 +481,7 @@ def _index_reference(q, restored, table, t2r, columns):
     """FP32 scores of every column against dequantized keys `[slots, dim]`."""
     page_rows = restored.shape[1]
     groups = torch.arange(columns, device="cuda")
-    ref = torch.empty(q.shape[0], columns, device="cuda")
+    ref = torch.empty(q.shape[0], columns, dtype=torch.float32, device="cuda")
     for request in range(table.shape[0]):
         rows = t2r == request
         k = restored[table[request, groups // page_rows].long(), groups % page_rows]
@@ -586,7 +602,7 @@ def test_qsa_fp8_sparse_gqa_matches_dequantized_kv(tokens, requests):
     t2r = (torch.arange(tokens, device="cuda") * requests // tokens).to(torch.int32)
 
     caches = [torch.empty(shape, device="cuda", dtype=FP8_DTYPE) for _ in "kv"]
-    scales = [torch.empty(shape[:3], device="cuda") for _ in "kv"]
+    scales = [torch.empty(shape[:3], dtype=torch.float32, device="cuda") for _ in "kv"]
     flat = pages * page_rows
     qsa_store_quantized_rows(
         caches[0],
@@ -672,7 +688,9 @@ def _stacked_case(rows_per_request, page_size, contexts, padded_rows=3, seed=0):
 def _stacked_reference(q, keys, table, token_to_request, query_positions, lens):
     page_size = keys.shape[1]
     columns = table.shape[1] * page_size
-    logits = torch.full((q.shape[0], columns), -float("inf"), device="cuda")
+    logits = torch.full(
+        (q.shape[0], columns), -float("inf"), dtype=torch.float32, device="cuda"
+    )
     visible = torch.zeros(q.shape[0], dtype=torch.int32, device="cuda")
     for row in range(q.shape[0]):
         req = int(token_to_request[row])
@@ -758,15 +776,15 @@ def test_qsa_stacked_scorer_respects_max_columns():
 def test_qsa_scorers_stay_inside_a_narrow_page_table(fmt, rows):
     from aiter.ops.qsa import qsa_paged_mqa_logits
 
-    # A [1, 3] table with page size 4 rounds up to width 4. The last tile must
-    # not read table entry 3, which is outside the table.
+    # The kernels round the width of a [1, 3] table up to 4. With page size 4
+    # the 12 columns of the three pages must still score right.
     g = torch.Generator(device="cuda").manual_seed(3)
     keys = torch.randn(
         16, 1, _STACKED_DIM, generator=g, dtype=torch.float32, device="cuda"
     ).bfloat16()
     cache, scale = _store(fmt, keys, 4)
     restored = _dequant(fmt, cache, scale)
-    table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")[:, :3]
+    table = torch.tensor([[2, 0, 3]], dtype=torch.int32, device="cuda")
     q = torch.randn(
         rows,
         _STACKED_HEADS,

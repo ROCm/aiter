@@ -12,12 +12,15 @@ each GROUP dims, rounded up so that no value clips.
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton._triton_kernels.quant.quant import (
+    _mxfp4_e8m0_to_fp32,
+    _mxfp4_quant_op,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _qsa_store_rows_fp8_repr = make_kernel_repr(
     "_qsa_store_rows_fp8",
-    ["HEAD_DIM", "BLOCK_D", "HAS_SECOND"],
+    ["HEAD_DIM", "BLOCK_D", "FP8_MAX_C", "HAS_SECOND"],
 )
 
 _qsa_store_rows_fp4_repr = make_kernel_repr(
@@ -64,15 +67,10 @@ _qsa_sparse_paged_gqa_repr = make_kernel_repr(
 @triton.jit
 def _e2m1_value_lo(code):
     """FP32 value of E2M1 `code` (int32, 0..15) times 2^-14, decoded with an
-    FP16 bitcast. `_e8m0_value_hi` supplies the 2^14."""
+    FP16 bitcast. The group scale makes up the 2^14: it is decoded as E8M0
+    `e + 14`, which is exact for e <= 240, as the writer keeps."""
     bits = ((code & 7) << 9) | ((code & 8) << 12)
     return bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
-
-
-@triton.jit
-def _e8m0_value_hi(e):
-    """2^(e - 127) times 2^14. It is exact for e <= 240, which the writer keeps."""
-    return ((e.to(tl.int32) + 14) << 23).to(tl.float32, bitcast=True)
 
 
 @triton.jit(repr=_qsa_store_rows_fp8_repr)
@@ -354,7 +352,7 @@ def _qsa_paged_mqa_logits_kernel(
                 mask=valid[:, None],
                 other=127,
             )
-            group_scale = _e8m0_value_hi(exponent)
+            group_scale = _mxfp4_e8m0_to_fp32(exponent.to(tl.int32) + 14)
             low = _e2m1_value_lo(packed & 15) * group_scale
             high = _e2m1_value_lo(packed >> 4) * group_scale
             score = tl.maximum(
@@ -505,7 +503,7 @@ def _qsa_paged_mqa_logits_mfma_kernel(
                 mask=key_ok[None, :],
                 other=127,
             )
-            group_scale = _e8m0_value_hi(exponent)
+            group_scale = _mxfp4_e8m0_to_fp32(exponent.to(tl.int32) + 14)
             low_t = (_e2m1_value_lo(packed & 15) * group_scale).to(
                 q_ptr.dtype.element_ty
             )
@@ -671,7 +669,7 @@ def _qsa_paged_mqa_logits_stacked_kernel(
                     mask=key_ok[None, :],
                     other=127,
                 )
-                group_scale = _e8m0_value_hi(exponent)
+                group_scale = _mxfp4_e8m0_to_fp32(exponent.to(tl.int32) + 14)
                 low_t = (_e2m1_value_lo(packed & 15) * group_scale).to(
                     q_ptr.dtype.element_ty
                 )

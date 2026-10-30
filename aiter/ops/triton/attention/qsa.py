@@ -4,6 +4,8 @@
 """QSA operators for quantized cache writes, index scoring, selection and
 sparse paged GQA."""
 
+import functools
+
 import torch
 import triton
 
@@ -18,6 +20,7 @@ from aiter.ops.triton._triton_kernels.attention.qsa import (
     _qsa_store_rows_fp4_kernel,
     _qsa_store_rows_fp8_kernel,
 )
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 # Quantized cache rows: FP8 with one FP32 scale per row, or MXFP4 with one
 # E8M0 exponent for each FP4_GROUP dims (see the kernel module).
@@ -216,13 +219,20 @@ def _kernel_config(
 _SCORING_BLOCK_N = 32
 _SCORING_COLUMN_PROGRAMS = 64
 
-# (BMT, BN, num_warps, column programs) of the stacked decode scorer for each
-# key format, measured at 36 rows over 9 requests (MTP 3 verify).
-_STACKED_DECODE_TILES = {
-    _FMT_BF16: (4, 32, 2, 256),
-    _FMT_FP8: (4, 64, 4, 256),
-    _FMT_FP4: (4, 64, 4, 256),
-}
+
+@functools.lru_cache(maxsize=1024)
+def _tuned_tile(kernel: str, case: str) -> dict:
+    """One tile of the running arch (`configs/<arch>/triton/attention/qsa`).
+
+    `stacked_decode[<key format>]` is the stacked decode scorer's tile,
+    measured on gfx950 at 36 rows over 9 requests (MTP 3 verify).
+    `gqa_fp8[decode]` and `gqa_fp8[prefill]` replace `_kernel_config` for FP8
+    K/V, measured on gfx950 at 36 decode rows over 9 requests and at one
+    16384-row prefill with 98304 context. gfx942 has the same values, which
+    it used before they moved to JSON; they are not tuned for it.
+    """
+    cfg_dir = resolve_config_dir("attention", "QSA", backend="triton")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")[kernel][case]
 
 
 def _check_vector(name: str, tensor: torch.Tensor, length: int | None = None) -> None:
@@ -319,20 +329,22 @@ def qsa_paged_mqa_logits(
         and page_table.stride(1) == 1
     )
     heads, head_dim = q.shape[1], q.shape[2]
-    bmt, bn, warps, column_programs = _STACKED_DECODE_TILES[key_fmt]
+    tile = None
     if (
         q.shape[0] <= 256
         and stacked_decode
         and contiguous
         and heads & (heads - 1) == 0
-        and bmt * heads >= 16
         and head_dim & (head_dim - 1) == 0
         and head_dim >= 16
     ):
+        tile = _tuned_tile("stacked_decode", QSA_CACHE_FORMATS[key_fmt])
+    if tile is not None and tile["BMT"] * heads >= 16:
+        bmt, bn = tile["BMT"], tile["BN"]
         _qsa_paged_mqa_logits_stacked_kernel[
             (
                 triton.cdiv(q.shape[0], bmt),
-                min(triton.cdiv(columns, bn), column_programs),
+                min(triton.cdiv(columns, bn), tile["column_programs"]),
             )
         ](
             q,
@@ -366,10 +378,9 @@ def qsa_paged_mqa_logits(
             BN=bn,
             KEY_FMT=key_fmt,
             GROUP=FP4_GROUP,
-            num_warps=warps,
+            num_warps=tile["num_warps"],
         )
         return logits, visible_groups
-    # Decode-sized calls without stacking use the CUDA-core kernel.
     if q.shape[0] > 256 and contiguous and q.shape[2] >= 16:
         bmt, bn = 16, 128
         _qsa_paged_mqa_logits_mfma_kernel[
@@ -409,6 +420,7 @@ def qsa_paged_mqa_logits(
             num_warps=4,
         )
         return logits, visible_groups
+    # Decode-sized calls without stacking use the CUDA-core kernel.
     column_programs = min(
         triton.cdiv(columns, _SCORING_BLOCK_N), _SCORING_COLUMN_PROGRAMS
     )
@@ -513,12 +525,6 @@ def qsa_expand_block_indices(
     return out
 
 
-# (BLOCK_N, num_warps, num_stages, waves_per_eu) for (FP8 K/V, prefill), used
-# in place of `_kernel_config`. Measured at 36 decode rows over 9 requests and
-# at one 16384-row prefill with 98304 context.
-_GQA_TILES = {(True, False): (32, 4, 2, 0), (True, True): (32, 2, 2, 0)}
-
-
 def qsa_sparse_paged_gqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -591,9 +597,11 @@ def qsa_sparse_paged_gqa(
     block_n, num_warps, num_stages, waves_per_eu, sub_group = _kernel_config(
         q.shape[0], k_cache.shape[2], kv_splits, group_size
     )
-    override = _GQA_TILES.get((kv_fp8, num_decode_requests is None))
-    if override is not None:
-        block_n, num_warps, num_stages, waves_per_eu = override
+    if kv_fp8:
+        phase = "prefill" if num_decode_requests is None else "decode"
+        tile = _tuned_tile("gqa_fp8", phase)
+        block_n, num_warps = tile["BLOCK_N"], tile["num_warps"]
+        num_stages, waves_per_eu = tile["num_stages"], tile["waves_per_eu"]
     num_head_groups = (group_size + sub_group - 1) // sub_group
     block_m = max(16, triton.next_power_of_2(sub_group))
     if logical_indices.shape[1] == 0:
