@@ -4,8 +4,7 @@
 """Every tuned decision of the FlyDSL all-reduce: which kernel runs a payload,
 and in which configuration.
 
-Kernels
-=======
+**Kernels**
 
 * **one-shot** (``OneShotAllReduce``) -- one round, no grid-wide barrier, wire
   volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding.
@@ -16,8 +15,7 @@ Kernels
 
 The decisions come in two levels.
 
-Level 1: which algorithm
-========================
+**Level 1: which algorithm**
 
 ``FAMILY_POLICIES`` has one ``FamilyPolicy`` per ``(arch, link,
 world_size)``. A policy has one ``Window`` of payload sizes per algorithm
@@ -40,8 +38,7 @@ the mesh and the ring take their payloads first.
 host's arch and link, with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES``
 overrides applied.
 
-Level 2: which configuration
-============================
+**Level 2: which configuration**
 
 Each algorithm has a tuning ladder per ``(arch, link, world_size)``:
 ``ONESHOT_LADDER``, ``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a
@@ -49,8 +46,8 @@ tuple of rungs in ascending ``min_bytes`` order, and a payload runs on the last
 rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
 one engine per rung.
 
-Fused all-reduce + RMSNorm
-==================="""
+**Fused all-reduce + RMSNorm**
+"""
 
 from __future__ import annotations
 

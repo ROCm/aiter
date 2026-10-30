@@ -155,7 +155,7 @@ from aiter.dist.parallel_state import (
     set_custom_all_reduce,
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose
 
 set_start_method("spawn", force=True)
@@ -170,10 +170,7 @@ from aiter.ops.flydsl.allreduce_policy import (
     oneshot_ladder,
 )
 
-try:
-    ARCH = get_gfx_runtime()
-except (KeyError, RuntimeError):
-    ARCH = None
+ARCH = get_gfx()
 
 HIDDEN = 7168
 
