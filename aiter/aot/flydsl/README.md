@@ -141,6 +141,9 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
 - Each module runs one process per arch its jobs compile for, with
   `GPU_ARCHS` pinned and `AITER_AOT_REPLAY=1`, as `moe.py` does. `--csv` points
   the runtime's tuned-config lookups of those processes at the given tables.
+  A GEMM CSV belongs to the table whose `AITER_CONFIG_*` variable names it,
+  under any file name, else to the table its file name holds; any other file
+  is an error, not a table to skip.
 - `--check` compiles nothing and fails on any kernel the replay would need but
   the cache lacks. Set `AITER_FLYDSL_AOT_TRACEBACK=1` for a failing replay's
   traceback.
