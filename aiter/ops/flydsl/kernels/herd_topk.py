@@ -165,3 +165,39 @@ def build_herd_finalize_module(
         )
 
     return launch_finalize
+
+
+def _kept_routes(ids, values, pops, routed_scaling_factor):
+    kp1 = len(ids)
+    drop = Int32(0)
+    drop_id = ids[0]
+    drop_value = values[0]
+    drop_pop = pops[0]
+    for j in range_constexpr(1, kp1):
+        take = (pops[j] < drop_pop) | (
+            (pops[j] == drop_pop)
+            & (
+                (values[j] < drop_value)
+                | ((values[j] == drop_value) & (ids[j] < drop_id))
+            )
+        )
+        drop = take.select(Int32(j), drop)
+        drop_id = take.select(ids[j], drop_id)
+        drop_value = take.select(values[j], drop_value)
+        drop_pop = take.select(pops[j], drop_pop)
+    keeps = [drop != Int32(j) for j in range_constexpr(kp1)]
+
+    kept_sum = Float32(0.0)
+    for j in range_constexpr(kp1):
+        kept_sum = kept_sum + keeps[j].select(values[j], Float32(0.0))
+    scale = routed_scaling_factor / fx.max(kept_sum, Float32(1e-20))
+
+    ranks = []
+    for j in range_constexpr(kp1):
+        rank = Int32(0)
+        for other in range_constexpr(kp1):
+            before = keeps[other] & (ids[other] < ids[j])
+            rank = rank + before.select(Int32(1), Int32(0))
+        ranks.append(rank)
+    weights = [values[j] * scale for j in range_constexpr(kp1)]
+    return keeps, ranks, weights

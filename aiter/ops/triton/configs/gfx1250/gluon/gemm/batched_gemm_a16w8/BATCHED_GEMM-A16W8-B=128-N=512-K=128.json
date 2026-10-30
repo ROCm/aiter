@@ -139,12 +139,13 @@
     },
     "any": {
         "BLOCK_SIZE_M": 256,
-        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 64,
         "num_warps": 4,
         "NUM_BUFFERS": 3,
-        "WG_PER_CU": 1,
+        "WG_PER_CU": 4,
         "STORE_MODE": 2,
-        "C_PAD": 16
+        "C_PAD": 16,
+        "waves_per_eu": 1
     }
 }

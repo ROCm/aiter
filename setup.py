@@ -24,7 +24,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.4.0"
+FLYDSL_VERSION = "flydsl==0.4.1"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -349,6 +349,7 @@ if PREBUILD_KERNELS != 0:
                 "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_skip_nqscale",
                 "mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_skip_nqscale",
                 "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_skip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale",
             ]
             variants = get_mha_varlen_prebuild_variants_by_names(req_md_names, ck_dir)
             base_args = core.get_args_of_build("module_mha_varlen_fwd")
