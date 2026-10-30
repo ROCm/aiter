@@ -646,6 +646,18 @@ _MXFP4_INVALID_CASES = [
     ("plan-free-strides", ValueError, "output needs the query's strides"),
     ("oversized-task", ValueError, "PAGE_ID_STAGE_LIMIT"),
     ("max-partitions-2", ValueError, "max_partitions may only be 1"),
+    # Operands the kernel would read with the wrong layout or plan: each used to
+    # produce wrong output (or an AttributeError) instead of an error.
+    ("non-contiguous-table", ValueError, "block_tables must be contiguous"),
+    ("context-on-cpu", ValueError, "context_lengths must be contiguous on the query"),
+    ("context-length-mismatch", ValueError, r"query.shape\[0\] .* must match"),
+    ("table-rows-mismatch", ValueError, r"query.shape\[0\] .* must match"),
+    ("query-stride-2", ValueError, "contiguous head_dim axis"),
+    ("output-stride-2", ValueError, "contiguous head_dim axis"),
+    ("key-scale-none", TypeError, "key_scale must be a uint8 torch.Tensor"),
+    # A windowed plan is refused with one partition (served without it) and more.
+    ("windowed-plan-1", ValueError, "sliding_window must match work_plan"),
+    ("windowed-plan-2", ValueError, "sliding_window must match work_plan"),
 ]
 _UNOWNED_GEOMETRIES = [(1, 1, 8, 128), (4, 2, 8, 256), (4, 1, 16, 128)]
 _UNOWNED_KV = [
@@ -1028,6 +1040,25 @@ def test_pa_decode_rejects(kv, invalid, error, match):
         output = torch.empty(4, 32, 128, dtype=torch.bfloat16, device=DEVICE)[:, :16]
     elif invalid == "oversized-task":
         table = torch.zeros(4, 4097, dtype=torch.int32, device=DEVICE)
+    elif invalid == "non-contiguous-table":
+        table = torch.cat([table, table], 1)[:, ::2]
+    elif invalid == "context-on-cpu":
+        context = context.cpu()
+    elif invalid == "context-length-mismatch":
+        context = context[:3]
+    elif invalid == "table-rows-mismatch":
+        table = table[:3]
+    elif invalid == "query-stride-2":
+        strided = torch.empty(4, 16, 256, dtype=query.dtype, device=DEVICE)[..., ::2]
+        query = strided.copy_(query)
+    elif invalid == "output-stride-2":
+        output = torch.empty(4, 16, 256, dtype=torch.bfloat16, device=DEVICE)[..., ::2]
+    elif invalid == "key-scale-none":
+        options["key_scale"] = None
+    elif invalid.startswith("windowed-plan"):
+        options["work_plan"] = pa.plan_pa_decode(
+            context, 1, max_partitions=int(invalid[-1]), sliding_window=256
+        )
     if invalid == "max-partitions-2":
         call = lambda: entry.pa_decode_mxfp4(
             output, query, kd, ks, vd, vs, context, table, 1.0, max_partitions=2

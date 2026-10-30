@@ -204,8 +204,13 @@ def _pa_decode_mxfp4(
         )
     if output.dtype != torch.bfloat16 or output.shape != query.shape:
         raise TypeError("MXFP4 pa_decode needs a bf16 output shaped like the query")
-    if any(x * t.element_size() % 16 for t in (query, output) for x in t.stride()[:2]):
-        raise ValueError("MXFP4 pa_decode needs 16 B query and output row/head strides")
+    if any(t.stride(2) != 1 for t in (query, output)) or any(
+        x * t.element_size() % 16 for t in (query, output) for x in t.stride()[:2]
+    ):
+        raise ValueError(
+            "MXFP4 pa_decode needs 16 B query and output row/head strides and a "
+            "contiguous head_dim axis"
+        )
     # K and V are data views [pages, kv_heads, 128, 64] and e8m0 scale views
     # [pages, kv_heads, 128, 4] of one page; the four share page and head strides.
     page_head_strides = k_data.stride()[:2]
@@ -219,6 +224,10 @@ def _pa_decode_mxfp4(
         ("key_scale", k_scale, 4),
         ("value_scale", v_scale, 4),
     ):
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(
+                f"{name} must be a uint8 torch.Tensor, got {type(t).__name__}"
+            )
         if (
             t.dtype != torch.uint8
             or t.device != dev
@@ -232,6 +241,18 @@ def _pa_decode_mxfp4(
             )
     if block_tables.dtype != torch.int32 or context_lengths.dtype != torch.int32:
         raise TypeError("block_tables and context_lengths must be int32")
+    if context_lengths.shape[0] != num_seqs or block_tables.shape[0] != num_seqs:
+        raise ValueError(
+            f"query.shape[0] ({num_seqs}) must match context_lengths.shape[0] "
+            f"({context_lengths.shape[0]}) and block_tables.shape[0] "
+            f"({block_tables.shape[0]})"
+        )
+    for name, t in (
+        ("block_tables", block_tables),
+        ("context_lengths", context_lengths),
+    ):
+        if t.device != dev or not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous on the query device ({dev})")
     if num_seqs == 0:
         return
     max_blocks_per_seq = block_tables.shape[1]
@@ -245,6 +266,8 @@ def _pa_decode_mxfp4(
         raise ValueError("without a work_plan the output needs the query's strides")
     if work_plan is not None:
         work_plan.validate(num_seqs, num_kv_heads, dev)
+        if work_plan.sliding_window:
+            raise ValueError("sliding_window must match work_plan.sliding_window")
     # One task per sequence needs neither the plan nor the reducer.
     direct = work_plan is None or (work_plan.max_partitions == 1 and same_strides)
     capacity = num_seqs if direct else work_plan.capacity
