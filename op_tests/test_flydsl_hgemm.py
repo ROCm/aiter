@@ -315,6 +315,71 @@ def check_strided_out():
         assert err == 0
 
 
+def _run_tile(a, w, out, policy, tile):
+    return flydsl_hgemm(
+        a,
+        w,
+        out=out,
+        block_m=tile["block_m"],
+        block_n=tile["block_n"],
+        block_k=tile["block_k"],
+        stages=tile["stages"],
+        split_k=tile["split_k"],
+        m_waves=tile["m_waves"],
+        n_waves=tile["n_waves"],
+        k_waves=tile["k_waves"],
+        group_m=tile["group_m"],
+        policy=policy,
+    )
+
+
+def check_out_column_offset():
+    # An out starting at a nonzero column is written in place and nothing outside
+    # it changes. Split-K's atomics need 4-byte alignment, so it starts at column 2.
+    for m, n, k, policy, split_k, col in (
+        (32, 14336, 4096, "ft", 1, 1),
+        (4096, 4096, 4096, "hti", 1, 1),
+        (16, 5120, 2880, "ft", 3, 2),
+    ):
+        tile = _tile_for(m, n, k, policy, split_k)
+        torch.manual_seed(SEED)
+        a = torch.empty((m, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        parent = torch.full((m + 1, n + 64), 4096.0, dtype=dtypes.bf16)
+        out = parent[:m, col : col + n]
+        y = _run_tile(a, w, out, policy, tile)
+        assert y is out
+        outside = torch.ones_like(parent, dtype=torch.bool)
+        outside[:m, col : col + n] = False
+        assert torch.all(parent[outside] == 4096)
+        atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtypes.bf16)
+        err = checkAllclose(
+            run_torch(a, w, dtypes.bf16).to(dtypes.fp32),
+            y.to(dtypes.fp32),
+            rtol=rtol,
+            atol=atol,
+            msg=f"out at column {col} {m}x{n}x{k} {policy} ks{split_k}",
+        )
+        assert err == 0
+
+
+def check_split_k_out_alignment():
+    # Split-K's atomics write 4-byte units, so an out 2 bytes off is rejected.
+    m, n, k = 16, 5120, 2880
+    tile = _tile_for(m, n, k, "ft", 3)
+    a = torch.empty((m, k), dtype=dtypes.bf16)
+    w = torch.empty((n, k), dtype=dtypes.bf16)
+    strided = torch.empty((m, n + 64), dtype=dtypes.bf16)[:, 1 : 1 + n]
+    contiguous = torch.empty(m * n + 1, dtype=dtypes.bf16)[1:].view(m, n)
+    for out in (strided, contiguous):
+        try:
+            _run_tile(a, w, out, "ft", tile)
+        except ValueError as e:
+            assert "4-byte-aligned" in str(e), e
+        else:
+            raise AssertionError(f"expected ValueError for out stride={out.stride()}")
+
+
 @benchmark()
 def test_hgemm_concurrent_copy(m, n, k, dtype):
     # The HTI tail LDS race shows only with exactly two K tiles (no main loop) and
@@ -414,6 +479,8 @@ def main():
         check_shape_limits()
         check_input_span()
         check_strided_out()
+        check_out_column_offset()
+        check_split_k_out_alignment()
         check_large_a()
 
     for dtype in args.dtype:

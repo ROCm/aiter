@@ -1523,7 +1523,8 @@ def gemm_a16w16(
     Each layout character controls only the corresponding tensor stride:
     N is row-major and T is column-major. Logical tensor shapes never change.
     Inputs that violate the selected layout or DMA alignment are rejected.
-    Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions.
+    Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions;
+    ``out`` must then be 4-byte aligned.
     Set ``user_kwargs["k_waves"]`` above 1 for full-tile workgroup-local slice-K.
     ``out_dtype`` may be the input dtype or ``torch.float32``.
     A 2D ``out`` may be row-strided; it is written in place and returned.
@@ -1674,6 +1675,11 @@ def gemm_a16w16(
         span = ((m - 1) * out.stride(0) + n) * out.element_size()
         if split_k > 1 and span >= GFX950_FLAT_BUFFER_LIMIT_BYTES:
             raise ValueError("split-K output must span less than 4 GiB")
+    # Split-K's atomics write 4-byte units: an fp32 element or a 16-bit pair.
+    if split_k > 1 and out.data_ptr() % 4 != 0:
+        raise ValueError(
+            f"split-K needs a 4-byte-aligned out; got data_ptr={out.data_ptr():#x}"
+        )
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
