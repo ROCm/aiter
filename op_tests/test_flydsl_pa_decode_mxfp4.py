@@ -9,17 +9,16 @@ head_dim 128, one query token per row, a sparse selection of at most
 K/V pages are single-region: ``[block_size x 64 B e2m1][block_size x 4 B e8m0]``.
 
 Run:
-    python op_tests/test_flydsl_pa_decode_mxfp4.py   (pytest checks, then the timing table)
+    python op_tests/test_flydsl_pa_decode_mxfp4.py   (correctness checks, then the timing table)
     python op_tests/test_flydsl_pa_decode_mxfp4.py -r 1 64 -c 2048 -bs 128
-    pytest op_tests/test_flydsl_pa_decode_mxfp4.py -q
 """
 
 import argparse
 import itertools
+import re
 import sys
 
 import pandas as pd
-import pytest
 import torch
 
 import aiter
@@ -34,9 +33,9 @@ torch.set_default_device("cuda")
 
 # v_mfma_scale_f32_16x16x128_f8f6f4 and ds_read_b64_tr_b16: CDNA4 only.
 SUPPORTED_GFX = ["gfx950"]
-pytestmark = pytest.mark.skipif(
-    get_gfx() not in SUPPORTED_GFX, reason="pa_decode_mxfp4 requires gfx950"
-)
+
+# The implementation under test: every call below goes through this one name.
+PA_DECODE = pa_decode_mxfp4
 
 HEAD_DIM = 128
 Q_MAX_FP8 = 448.0
@@ -154,7 +153,7 @@ def run_mxfp4(
     out = torch.empty(rows, nq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
     if plan is None:
         plan = plan_pa_decode(ctx, kd.shape[1])
-    pa_decode_mxfp4(
+    PA_DECODE(
         out,
         q,
         kd,
@@ -170,14 +169,28 @@ def run_mxfp4(
 
 
 # --------------------------------------------------------------------------
-# Correctness (pytest)
+# Correctness: plain asserts; a failure raises and the script exits non-zero
 # --------------------------------------------------------------------------
+def expect_error(exc, match, fn, *args, **kwargs):
+    """``fn`` must raise ``exc`` whose message matches the regex ``match``."""
+    try:
+        fn(*args, **kwargs)
+    except exc as e:
+        assert re.search(match, str(e)), f"{exc.__name__} message: {e}"
+    else:
+        raise AssertionError(f"{exc.__name__} ({match!r}) was not raised")
+
+
+def assert_rel(a, b, tol, msg=""):
+    err = rel_l2(a.float(), b)
+    assert err < tol, f"{msg} rel-L2 {err:.2e} >= {tol}"
+    return err
+
+
 CTX_SWEEP = [1, 15, 16, 17, 127, 128, 129, 255, 256, 257, 511, 2047, 2048]
 
 
-@pytest.mark.parametrize("block_size", [16, 64, 128])
-@pytest.mark.parametrize("group", [16, 8])
-def test_pa_decode_mxfp4_ctx_sweep(block_size, group):
+def test_ctx_sweep(block_size, group):
     ctx_lens = CTX_SWEEP
     ctx, bt, k, v, q = make_case(ctx_lens, group, block_size, seed=block_size + group)
     _, kd, ks, k_deq = quantize_pages(k, block_size)
@@ -187,15 +200,13 @@ def test_pa_decode_mxfp4_ctx_sweep(block_size, group):
     out = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale)
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, block_size)
     torch.cuda.synchronize()
-    err = rel_l2(out.float(), ref)
-    assert err < 3e-3, f"rel-L2 {err:.2e}"
+    err = assert_rel(out, ref, 3e-3)
     for r, n in enumerate(ctx_lens):
-        e = rel_l2(out[r].float(), ref[r])
-        assert e < 1e-2, f"ctx {n}: rel-L2 {e:.2e}"
+        assert_rel(out[r], ref[r], 1e-2, f"ctx {n}:")
+    return {"err": err}
 
 
-@pytest.mark.parametrize("block_size", [16, 128])
-def test_pa_decode_mxfp4_garbage_tail(block_size):
+def test_garbage_tail(block_size):
     """Rows past the context inside the last page, and table entries past the
     context, hold garbage (random bytes, e8m0 255 and 0): they must not leak."""
     ctx_lens = [1, 5, 13, 16 if block_size == 16 else 100]
@@ -230,11 +241,10 @@ def test_pa_decode_mxfp4_garbage_tail(block_size):
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, block_size)
     torch.cuda.synchronize()
     assert torch.isfinite(out.float()).all()
-    assert rel_l2(out.float(), ref) < 3e-3
+    return {"err": assert_rel(out, ref, 3e-3)}
 
 
-@pytest.mark.parametrize("kv_heads,group", [(2, 16), (4, 4), (1, 1), (1, 3)])
-def test_pa_decode_mxfp4_heads(kv_heads, group):
+def test_heads(kv_heads, group):
     """Several KV heads (head stride in the views) and GQA groups that are not
     16 (padding heads alias head 0 and are never stored)."""
     ctx_lens = [1, 17, 300, 1025]
@@ -246,11 +256,10 @@ def test_pa_decode_mxfp4_heads(kv_heads, group):
     out = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale)
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, 128)
     torch.cuda.synchronize()
-    assert rel_l2(out.float(), ref) < 3e-3
+    return {"err": assert_rel(out, ref, 3e-3)}
 
 
-@pytest.mark.parametrize("max_partitions", [1, 2, 3, 8])
-def test_pa_decode_mxfp4_task_shapes(max_partitions):
+def test_task_shapes(max_partitions):
     """Tasks of 1..N plan tiles: waves with fewer tiles than the unroll depth
     (phantom tiles) and tasks that own several tiles per wave."""
     ctx_lens = [16, 255, 1000, 4097, 5000]
@@ -263,12 +272,10 @@ def test_pa_decode_mxfp4_task_shapes(max_partitions):
     out = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale, plan=plan)
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, 16)
     torch.cuda.synchronize()
-    assert rel_l2(out.float(), ref) < 3e-3
+    return {"err": assert_rel(out, ref, 3e-3)}
 
 
-@pytest.mark.parametrize("rows", [1, 8, 64, 512])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-def test_pa_decode_mxfp4_one_task_per_row(rows, out_dtype):
+def test_one_task_per_row(rows, out_dtype):
     """Plan max_partitions == 1: the kernel writes every output row itself, in
     bf16 and f16."""
     ctx_lens = [(2048, 1, 129, 777, 1000, 17, 2048, 300)[i % 8] for i in range(rows)]
@@ -281,15 +288,16 @@ def test_pa_decode_mxfp4_one_task_per_row(rows, out_dtype):
     out = torch.full(
         (rows, 16, HEAD_DIM), float("nan"), dtype=out_dtype, device=q.device
     )
-    pa_decode_mxfp4(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
+    PA_DECODE(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
     torch.cuda.synchronize()
     assert torch.isfinite(out.float()).all()  # every row was written
-    if rows <= 64:
-        ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
-        assert rel_l2(out.float(), ref) < 3e-3
+    if rows > 64:
+        return {}
+    ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
+    return {"err": assert_rel(out, ref, 3e-3)}
 
 
-def test_pa_decode_mxfp4_default_plan_vs_one_task_per_row():
+def test_default_plan_vs_one_task_per_row():
     """With rows >= 2 * CUs the default plan has capacity == rows yet splits: it is
     not eligible for the direct path, and agrees with the one-task plan."""
     ctx_lens = [2048] * 4
@@ -305,10 +313,10 @@ def test_pa_decode_mxfp4_default_plan_vs_one_task_per_row():
         plan=plan_pa_decode(ctx, 1, max_partitions=1),
     )  # fmt: skip
     torch.cuda.synchronize()
-    assert rel_l2(a.float(), b.float()) < 1e-2
+    return {"err": assert_rel(a, b.float(), 1e-2)}
 
 
-def test_pa_decode_mxfp4_direct_output_strided_and_empty_rows():
+def test_direct_output_strided_and_empty_rows():
     ctx_lens = [300, 0, 2048, 5]
     ctx, bt, k, v, q = make_case([max(n, 1) for n in ctx_lens], 16, 128, seed=8)
     ctx = torch.tensor(ctx_lens, dtype=torch.int32, device=q.device)
@@ -319,37 +327,26 @@ def test_pa_decode_mxfp4_direct_output_strided_and_empty_rows():
     # output rows padded to 2x: a strided view
     big = torch.full((4, 32, HEAD_DIM), 7.0, dtype=torch.bfloat16, device=q.device)
     out = big[:, :16]
-    pa_decode_mxfp4(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
+    PA_DECODE(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
     torch.cuda.synchronize()
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
-    for r in (0, 2, 3):
-        assert rel_l2(out[r].float(), ref[r]) < 3e-3
+    err = max(assert_rel(out[r], ref[r], 3e-3) for r in (0, 2, 3))
     assert (big[:, 16:] == 7.0).all()  # nothing written outside the view
     # a context-0 row has no task: the direct path leaves it alone (documented)
     assert (out[1] == 7.0).all()
     # the reduce path (a splitting plan) zero-fills it
     out2 = torch.full_like(q, 7.0)
-    pa_decode_mxfp4(
+    PA_DECODE(
         out2, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5,
         work_plan=plan_pa_decode(ctx, 1, max_partitions=2),
     )  # fmt: skip
     assert (out2[1] == 0).all()
+    return {"err": err}
 
 
-def test_pa_decode_mxfp4_direct_output_graph_replay():
-    ctx_lens = [2048] * 8
-    ctx, bt, k, v, q = make_case(ctx_lens, 16, 128, seed=12)
-    _, kd, ks, k_deq = quantize_pages(k, 128)
-    _, vd, vs, v_deq = quantize_pages(v, 128)
-    q_in, q_ref = quantize_q_fp8(q)
-    plan = plan_pa_decode(ctx, 1, max_partitions=1)
-    out = torch.empty_like(q)
-
-    def call():
-        pa_decode_mxfp4(
-            out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan
-        )
-
+def replay_matches(call, out, ref):
+    """Capture ``call`` into a CUDA graph, replay it over a zeroed ``out`` and check
+    the replay reproduces the eager result and the reference."""
     call()  # compile outside capture
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
@@ -360,18 +357,32 @@ def test_pa_decode_mxfp4_direct_output_graph_replay():
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, first)
+    return assert_rel(out, ref, 3e-3)
+
+
+def test_direct_output_graph_replay():
+    ctx_lens = [2048] * 8
+    ctx, bt, k, v, q = make_case(ctx_lens, 16, 128, seed=12)
+    _, kd, ks, k_deq = quantize_pages(k, 128)
+    _, vd, vs, v_deq = quantize_pages(v, 128)
+    q_in, q_ref = quantize_q_fp8(q)
+    plan = plan_pa_decode(ctx, 1, max_partitions=1)
+    out = torch.empty_like(q)
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
-    assert rel_l2(out.float(), ref) < 3e-3
+
+    def call():
+        PA_DECODE(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
+
+    return {"err": replay_matches(call, out, ref)}
 
 
 def run_free(q, kd, ks, vd, vs, bt, ctx, scale, out_dtype=torch.bfloat16, **kw):
     out = torch.full(q.shape, 7.0, dtype=out_dtype, device=q.device)
-    pa_decode_mxfp4(out, q, kd, ks, vd, vs, ctx, bt, scale, work_plan=None, **kw)
+    PA_DECODE(out, q, kd, ks, vd, vs, ctx, bt, scale, work_plan=None, **kw)
     return out
 
 
-@pytest.mark.parametrize("block_size", [16, 64, 128])
-def test_pa_decode_mxfp4_plan_free_vs_reference(block_size):
+def test_plan_free_vs_reference(block_size):
     """No plan: one task per row, from single tiles to 20 tiles (5000 tokens),
     with tails."""
     ctx_lens = [1, 16, 255, 256, 257, 1000, 2048, 4097, 5000]
@@ -383,13 +394,13 @@ def test_pa_decode_mxfp4_plan_free_vs_reference(block_size):
     out = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale)
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, block_size)
     torch.cuda.synchronize()
-    assert rel_l2(out.float(), ref) < 3e-3
+    err = assert_rel(out, ref, 3e-3)
     for r, n in enumerate(ctx_lens):
-        assert rel_l2(out[r].float(), ref[r]) < 1e-2, f"ctx {n}"
+        assert_rel(out[r], ref[r], 1e-2, f"ctx {n}:")
+    return {"err": err}
 
 
-@pytest.mark.parametrize("rows", [1, 8, 64, 512])
-def test_pa_decode_mxfp4_plan_free_is_bitwise_the_planned_path(rows):
+def test_plan_free_is_bitwise_the_planned_path(rows):
     """A one-task plan and the plan-free form run the same task: the same bits."""
     ctx, bt, k, v, q = make_case([2048] * rows, 16, 128, seed=rows + 40)
     _, kd, ks, _ = quantize_pages(k, 128)
@@ -401,9 +412,10 @@ def test_pa_decode_mxfp4_plan_free_is_bitwise_the_planned_path(rows):
     free = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale)
     torch.cuda.synchronize()
     assert torch.equal(planned, free)
+    return {}
 
 
-def test_pa_decode_mxfp4_plan_free_empty_rows():
+def test_plan_free_empty_rows():
     """A context-0 row has no work but is still written (zeros)."""
     ctx_lens = [300, 0, 2048, 0, 5]
     ctx, bt, k, v, q = make_case([max(n, 1) for n in ctx_lens], 16, 128, seed=8)
@@ -414,80 +426,121 @@ def test_pa_decode_mxfp4_plan_free_empty_rows():
     out = run_free(q_in, kd, ks, vd, vs, bt, ctx, HEAD_DIM**-0.5)
     torch.cuda.synchronize()
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
+    err = 0.0
     for r, n in enumerate(ctx_lens):
         if n:
-            assert rel_l2(out[r].float(), ref[r]) < 3e-3
+            err = max(err, assert_rel(out[r], ref[r], 3e-3))
         else:
             assert (out[r] == 0).all(), f"row {r}"
+    return {"err": err}
 
 
-def test_pa_decode_mxfp4_plan_free_graph_replay():
+def test_plan_free_graph_replay():
     ctx, bt, k, v, q = make_case([2048, 700, 2048, 33], 16, 128, seed=14)
     _, kd, ks, k_deq = quantize_pages(k, 128)
     _, vd, vs, v_deq = quantize_pages(v, 128)
     q_in, q_ref = quantize_q_fp8(q)
     out = torch.empty_like(q)
+    ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
 
     def call():
-        pa_decode_mxfp4(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5)
+        PA_DECODE(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5)
 
-    call()
-    torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        call()
-    first = out.clone()
-    out.zero_()
-    g.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, first)
-    ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
-    assert rel_l2(out.float(), ref) < 3e-3
+    return {"err": replay_matches(call, out, ref)}
 
 
-def test_pa_decode_mxfp4_plan_free_argument_checks():
+def test_plan_free_argument_checks():
     ctx, bt, k, v, q = make_case([2048], 16, 16, seed=2, extra_pages=0)
     _, kd, ks, _ = quantize_pages(k, 16)
     _, vd, vs, _ = quantize_pages(v, 16)
     q_in, _ = quantize_q_fp8(q)
     out = torch.empty_like(q)
-    with pytest.raises(NotImplementedError, match="one task per sequence"):
-        pa_decode_mxfp4(out, q_in, kd, ks, vd, vs, ctx, bt, 1.0, max_partitions=2)
-    with pytest.raises(ValueError, match="plan-free"):
-        pa_decode_mxfp4(
-            out, q_in, kd, ks, vd, vs, ctx, bt, 1.0,
-            work_plan=plan_pa_decode(ctx, 1), max_partitions=2,
-        )  # fmt: skip
+    expect_error(
+        NotImplementedError, "one task per sequence",
+        PA_DECODE, out, q_in, kd, ks, vd, vs, ctx, bt, 1.0, max_partitions=2,
+    )  # fmt: skip
+    expect_error(
+        ValueError, "plan-free",
+        PA_DECODE, out, q_in, kd, ks, vd, vs, ctx, bt, 1.0,
+        work_plan=plan_pa_decode(ctx, 1), max_partitions=2,
+    )  # fmt: skip
     ctx, bt, k, v, q = make_case([40000], 16, 16, seed=2, extra_pages=0)
     _, kd, ks, _ = quantize_pages(k, 16)
     _, vd, vs, _ = quantize_pages(v, 16)
     q_in, _ = quantize_q_fp8(q)
-    with pytest.raises(NotImplementedError, match="max_partitions"):
-        run_free(q_in, kd, ks, vd, vs, bt, ctx, 1.0)
+    expect_error(
+        NotImplementedError, "max_partitions",
+        run_free, q_in, kd, ks, vd, vs, bt, ctx, 1.0,
+    )  # fmt: skip
+    return {}
 
 
-def test_pa_decode_mxfp4_output_device_and_empty_batch():
+def test_output_device_and_empty_batch():
     ctx, bt, k, v, q = make_case([16], 16, 16, seed=2)
     _, kd, ks, _ = quantize_pages(k, 16)
     _, vd, vs, _ = quantize_pages(v, 16)
     q_in, _ = quantize_q_fp8(q)
-    with pytest.raises(ValueError, match="output must be on"):
-        pa_decode_mxfp4(q.cpu(), q_in, kd, ks, vd, vs, ctx, bt, 1.0, max_partitions=1)
+    expect_error(
+        ValueError, "output must be on",
+        PA_DECODE, q.cpu(), q_in, kd, ks, vd, vs, ctx, bt, 1.0, max_partitions=1,
+    )  # fmt: skip
     # zero sequences: nothing to do, in particular no division by num_seqs
     empty = torch.empty(0, 16, HEAD_DIM, dtype=torch.bfloat16)
-    pa_decode_mxfp4(
-        empty, q_in[:0], kd, ks, vd, vs, ctx[:0], bt[:0], 1.0, work_plan=None
-    )
+    PA_DECODE(empty, q_in[:0], kd, ks, vd, vs, ctx[:0], bt[:0], 1.0, work_plan=None)
+    return {}
 
 
-def test_pa_decode_mxfp4_rejects_oversized_task():
+def test_rejects_oversized_task():
     ctx, bt, k, v, q = make_case([40000], 16, 16, seed=2, extra_pages=0)
     _, kd, ks, _ = quantize_pages(k, 16)
     _, vd, vs, _ = quantize_pages(v, 16)
     q_in, _ = quantize_q_fp8(q)
     plan = plan_pa_decode(ctx, 1, max_partitions=1)
-    with pytest.raises(NotImplementedError, match="max_partitions"):
-        run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, 1.0, plan=plan)
+    expect_error(
+        NotImplementedError, "max_partitions",
+        run_mxfp4, q_in, kd, ks, vd, vs, bt, ctx, 1.0, plan=plan,
+    )  # fmt: skip
+    return {}
+
+
+def grid(**axes):
+    return [dict(zip(axes, vals)) for vals in itertools.product(*axes.values())]
+
+
+# (check, its cases): every case runs, in this order.
+CHECKS = [
+    (test_ctx_sweep, grid(block_size=[16, 64, 128], group=[16, 8])),
+    (test_garbage_tail, grid(block_size=[16, 128])),
+    (
+        test_heads,
+        [{"kv_heads": h, "group": g} for h, g in ((2, 16), (4, 4), (1, 1), (1, 3))],
+    ),
+    (test_task_shapes, grid(max_partitions=[1, 2, 3, 8])),
+    (
+        test_one_task_per_row,
+        grid(rows=[1, 8, 64, 512], out_dtype=[torch.bfloat16, torch.float16]),
+    ),
+    (test_default_plan_vs_one_task_per_row, [{}]),
+    (test_direct_output_strided_and_empty_rows, [{}]),
+    (test_direct_output_graph_replay, [{}]),
+    (test_plan_free_vs_reference, grid(block_size=[16, 64, 128])),
+    (test_plan_free_is_bitwise_the_planned_path, grid(rows=[1, 8, 64, 512])),
+    (test_plan_free_empty_rows, [{}]),
+    (test_plan_free_graph_replay, [{}]),
+    (test_plan_free_argument_checks, [{}]),
+    (test_output_device_and_empty_batch, [{}]),
+    (test_rejects_oversized_task, [{}]),
+]
+
+
+def run_checks():
+    rows = []
+    for fn, cases in CHECKS:
+        for case in cases:
+            ret = fn(**case)  # asserts inside; the worst rel-L2 it measured, if any
+            params = " ".join(f"{k}={v}" for k, v in case.items())
+            rows.append({"check": fn.__name__[5:], "case": params, **ret})
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------
@@ -524,9 +577,6 @@ def bench_pa_decode_mxfp4(rows, ctx_len, group, block_size):
             msg=f"rows={rows} ctx={ctx_len} group={group} bs={block_size}",
         ),
     }
-
-
-bench_pa_decode_mxfp4.__test__ = False
 
 
 def main():
@@ -576,13 +626,12 @@ def main():
     args = parser.parse_args()
 
     aiter.logger.info("pa_decode_mxfp4: running correctness checks...")
-    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
-    if status != pytest.ExitCode.OK:
-        aiter.logger.error(
-            "pa_decode_mxfp4: checks failed (pytest exit %s); skipping perf sweep",
-            int(status),
-        )
-        return 1
+    checks = run_checks()  # raises (non-zero exit) on the first mismatch
+    aiter.logger.info(
+        "pa_decode_mxfp4 correctness (%d cases passed):\n%s",
+        len(checks),
+        checks.to_markdown(index=False),
+    )
 
     df = []
     for rows, ctx_len, group, block_size in itertools.product(
