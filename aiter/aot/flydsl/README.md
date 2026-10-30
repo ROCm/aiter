@@ -133,6 +133,11 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   over batch sizes the table never measured, where the BV rule decides.
 - `fmha_fp8.py` replays a grid of batch sizes and sequence lengths per head
   shape, bisecting between grid points where the wrapper switches kernels.
+  Between grid points of the batch and query length the wrapper can still
+  pick a launcher no grid point does (causal cross attention at batch 1,
+  query length 5675 and key/value length 66157 splits 11 ways), so each
+  launcher it can pick at all is replayed too, with its tile and split count
+  pinned through the wrapper's own overrides.
 - Ops with a Python body behind `torch_compile_guard` run that body under
   `dry_run(python_ops=True)`, so a replay can enter at a public op; C++ ops
   still dispatch to their fakes.
@@ -197,7 +202,8 @@ python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
 The FP8 flash-attention kernel picks its tile, rescale threshold and split-K
 factor per call, so a serving process JIT-compiles each new combination on the
 request path. `fmha_fp8` replays the wrapper over a grid of batch sizes and
-sequence lengths for each head shape in its `DEFAULT_SHAPES` table. Add a model by
+sequence lengths, and once per launcher it can pick, for each head shape in
+its `DEFAULT_SHAPES` table. Add a model by
 adding an entry (`num_heads, num_kv_heads, head_dim, head_dim_v, layout`, heads
 per rank, layout `varlen_cross` for the chunked-prefill serving path).
 

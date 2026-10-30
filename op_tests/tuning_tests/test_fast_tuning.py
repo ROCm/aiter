@@ -941,6 +941,25 @@ class TestFlydslAotReplay(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "is no FlyDSL GEMM table"):
                 gemm.parse_csv(custom)
 
+    def test_fmha_builds_a_launcher_no_grid_point_picks(self):
+        from aiter.aot.flydsl import fmha_fp8
+        from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+        # Causal cross attention the wrapper splits 11 ways, between grid
+        # points of the query length.
+        batch, heads, seqlen_q, seqlen_kv, num_cu = 1, 12, 5675, 66157, 256
+        block_m = fa._fp8_auto_block_m(batch, heads, seqlen_q, seqlen_kv, num_cu)
+        splits = fa._fp8_auto_kv_splits(
+            batch, heads, seqlen_q, seqlen_kv, True, num_cu, block_m
+        )
+        pinned = {
+            (job["causal"], job["return_lse"], job["fp8_block_m"], job["num_kv_splits"])
+            for job in fmha_fp8.shape_jobs()
+            if job.get("num_kv_splits") is not None
+        }
+        for return_lse in (False, True):
+            self.assertIn((True, return_lse, block_m, splits), pinned)
+
 
 if __name__ == "__main__":
     unittest.main()
