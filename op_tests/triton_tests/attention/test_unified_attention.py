@@ -381,6 +381,22 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
+def _assert_request_rel_l2(output, ref_output, seq_lens, bound=2e-2):
+    """Bound each request's relative L2 error against the reference.
+
+    Long-KV rows average many tokens and stay small (|out| <= ~0.03 at 20k KV), so
+    a fixed atol would pass all-zero rows. gfx950 measures ~0.0025, and dropping one
+    64-token KV tile gives ~0.06. seq_lens holds (query_len, kv_len) per request.
+    """
+    start = 0
+    for q_len, kv_len in seq_lens:
+        out_rows = output[start : start + q_len].float()
+        ref_rows = ref_output[start : start + q_len].float()
+        start += q_len
+        rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
+        assert rel_err < bound, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -630,16 +646,7 @@ def test_triton_unified_attn_3d_long_kv(captured_max_seqlen_k: bool) -> None:
         v_descale=v_descale,
     )
 
-    # Long-KV rows average many tokens and stay small (|out| <= ~0.03 at 20k KV), so
-    # a fixed atol would pass all-zero rows. Bound each request's relative L2 error
-    # instead: gfx950 measures ~0.0025, and dropping one 64-token KV tile gives ~0.06.
-    start = 0
-    for q_len, kv_len in seq_lens:
-        out_rows = output[start : start + q_len].float()
-        ref_rows = ref_output[start : start + q_len].float()
-        start += q_len
-        rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
-        assert rel_err < 2e-2, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+    _assert_request_rel_l2(output, ref_output, seq_lens)
 
 
 def _length_aware_seq_lens(batch: str, query_len: int):
@@ -782,15 +789,8 @@ def test_triton_unified_attn_3d_length_aware_split(
         v_descale=v_descale,
     )
 
-    # relative L2 per request, as in test_triton_unified_attn_3d_long_kv: a dropped
-    # or doubly merged segment moves it far past the bound
-    start = 0
-    for q_len, kv_len in seq_lens:
-        out_rows = output[start : start + q_len].float()
-        ref_rows = ref_output[start : start + q_len].float()
-        start += q_len
-        rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
-        assert rel_err < 2e-2, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+    # a dropped or doubly merged segment moves it far past the bound
+    _assert_request_rel_l2(output, ref_output, seq_lens)
 
 
 @torch.inference_mode()
@@ -886,13 +886,7 @@ def test_triton_unified_attn_3d_length_aware_split_graph_replay() -> None:
             k_descale=k_descale,
             v_descale=v_descale,
         )
-        start = 0
-        for q_len, kv_len in batch:
-            out_rows = output[start : start + q_len].float()
-            ref_rows = ref_output[start : start + q_len].float()
-            start += q_len
-            rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
-            assert rel_err < 2e-2, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+        _assert_request_rel_l2(output, ref_output, batch)
 
 
 def _gfx950_split(**overrides):
