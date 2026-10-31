@@ -14,8 +14,8 @@ struct opus_mla_v41_prefill_kargs
 {
     const void* __restrict__ q_ptr;                // [N, H, D] e4m3
     const void* __restrict__ q_scale_ptr;          // [N, H, D / 32] e8m0
-    const void* __restrict__ unified_kv_ptr;       // [total_pages, D], prefix source
-    const void* __restrict__ unified_kv_scale_ptr; // [total_pages, D / 32]
+    const void* __restrict__ unified_kv_ptr;       // [total_pages, D] e4m3, or [total_pages, D / 2] e2m1 pairs (a8w4)
+    const void* __restrict__ unified_kv_scale_ptr; // [total_pages, D / 32] e8m0, or [total_pages, D / 16] e4m3 (a8w4)
     const void* __restrict__ kv_ptr;               // [total_tokens, D], extend source
     const void* __restrict__ kv_scale_ptr;         // [total_tokens, D / 32]
     const void* __restrict__ attn_sink_ptr;        // [H] fp32, may be nullptr
@@ -34,14 +34,17 @@ struct opus_mla_v41_prefill_kargs
     int stride_q_scale_h;
     int stride_o_n;
     int stride_o_h;
-    int stride_kv_page;       // shared by unified_kv and kv
-    int stride_kv_scale_page; // shared by unified_kv_scale and kv_scale
+    int stride_unified_kv_page;       // bytes
+    int stride_unified_kv_scale_page; // bytes
+    int stride_kv_page;               // bytes
+    int stride_kv_scale_page;         // bytes
     float softmax_scale;
 };
 
-static_assert(sizeof(opus_mla_v41_prefill_kargs) == 152);
+static_assert(sizeof(opus_mla_v41_prefill_kargs) == 160);
 static_assert(offsetof(opus_mla_v41_prefill_kargs, kv_indices_extend) == 88);
 static_assert(offsetof(opus_mla_v41_prefill_kargs, N) == 96);
-static_assert(offsetof(opus_mla_v41_prefill_kargs, stride_kv_page) == 136);
-static_assert(offsetof(opus_mla_v41_prefill_kargs, softmax_scale) == 144);
-static_assert(sizeof(opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs>) == 184);
+static_assert(offsetof(opus_mla_v41_prefill_kargs, stride_unified_kv_page) == 136);
+static_assert(offsetof(opus_mla_v41_prefill_kargs, stride_kv_page) == 144);
+static_assert(offsetof(opus_mla_v41_prefill_kargs, softmax_scale) == 152);
+static_assert(sizeof(opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs>) == 192);
