@@ -177,6 +177,7 @@ def pod_persistent(
     prefill_ratio: tl.constexpr,
     decode_ratio: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
+    num_cus: tl.constexpr,
 ):
 
     # cu_id: 4 bits, se_id: 2 bits, xcc_id: 4 bits
@@ -195,7 +196,7 @@ def pod_persistent(
     if ticket < prefill_ratio:
         op = 1  # 1 - prefill
 
-    current_pid = tl.program_id(0) % 304
+    current_pid = tl.program_id(0) % num_cus
     # if gcu_id==352:
     #    tl.device_print("ticket is", ticket)
     #    tl.device_print("op is ", op)

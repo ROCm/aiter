@@ -23,6 +23,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import clamp_num_buffers
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -271,6 +272,7 @@ def gemm_afp4wfp4_(
         w_scales.stride(0),
         w_scales.stride(1),
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if return_y_pp:
@@ -449,6 +451,7 @@ def gemm_afp4wfp4_preshuffled_scales(
         w_scales.stride(0),
         w_scales.stride(1),
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -703,6 +706,7 @@ def gemm_afp4wfp4_preshuffle(
         w_scales.stride(0),
         w_scales.stride(1),
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if return_y_pp:
