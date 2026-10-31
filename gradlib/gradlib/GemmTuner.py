@@ -467,9 +467,14 @@ class GemmTuner(GemmCommonTuner):
         self.num_warmup = 10
 
     def _clear_op_caches(self):
-        from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_
+        from aiter.tuned_gemm import (
+            get_GEMM_A16W16_batch_invariant_configs_,
+            get_GEMM_A16W16_config,
+            get_GEMM_A16W16_config_,
+        )
 
         get_GEMM_A16W16_config_.cache_clear()
+        get_GEMM_A16W16_batch_invariant_configs_.cache_clear()
         get_GEMM_A16W16_config.cache_clear()
 
     def run_config(self, args):

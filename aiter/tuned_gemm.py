@@ -84,6 +84,20 @@ def get_GEMM_A16W16_config_():
     return gemm_dict
 
 
+@functools.lru_cache(maxsize=1)
+def get_GEMM_A16W16_batch_invariant_configs_():
+    """Group rows validated together for equal results across batch sizes."""
+    families = {}
+    for key, config in get_GEMM_A16W16_config_().items():
+        if str(config.get("batch_invariant", False)).lower() != "true":
+            continue
+        family_key = key[:2] + key[3:]
+        families.setdefault(family_key, []).append((key[2], config))
+    for rows in families.values():
+        rows.sort(key=lambda row: row[0])
+    return families
+
+
 def is_skinny_default_shape(
     M: int,
     N: int,
@@ -131,23 +145,39 @@ def get_GEMM_A16W16_tuned_config(
     config = None
     gfx = get_gfx() if gfx is None else gfx
     warned_invalid_opus = set()
-    for gl in [None, 0, 1]:
-        padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = cfg.get(
-            (
-                gfx,
-                cu_num,
-                padded_M,
-                N,
-                K,
-                bias,
-                str(dtype),
-                str(otype),
-                scaleAB,
-                bpreshuffle,
-            ),
-            None,
+    family_key = (gfx, cu_num, N, K, bias, str(dtype), str(otype), scaleAB, bpreshuffle)
+    family = get_GEMM_A16W16_batch_invariant_configs_().get(family_key)
+    if family:
+        # Prefer the ceiling bucket, then keep the last bucket for larger M.
+        # Exact-M speed tuning must not override a validated family.
+        preferred = next((row for row in family if row[0] >= M), family[-1])
+        candidates = [preferred] + [row for row in family if row is not preferred]
+    else:
+        # An exact hit must not load the native padding helper.
+        padded_ms = (
+            M if gl is None else get_padded_m(M, N, K, gl) for gl in (None, 0, 1)
         )
+        candidates = (
+            (
+                padded_m,
+                cfg.get(
+                    (
+                        gfx,
+                        cu_num,
+                        padded_m,
+                        N,
+                        K,
+                        bias,
+                        str(dtype),
+                        str(otype),
+                        scaleAB,
+                        bpreshuffle,
+                    )
+                ),
+            )
+            for padded_m in padded_ms
+        )
+    for padded_M, config in candidates:
         if config is not None:
             if config["libtype"] == "flydsl":
                 flydsl_config = (
@@ -223,6 +253,10 @@ def get_GEMM_A16W16_tuned_config(
                     continue
                 config = dict(config)
                 config["solidx"] = int(resolved.resolved_kid)
+            if family:
+                config = dict(config)
+                config["_config_m"] = padded_M
+                config["_selection_source"] = "batch_invariant_family"
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = (
                     config["kernelName"] if config["libtype"] != "hipblaslt" else ""
@@ -643,6 +677,11 @@ def asm_gemm(
 ):
     kernelName = config.get("kernelName") if config else None
     splitK = config.get("splitK") if config else None
+    # The ASM ABI passes row strides only; K must be contiguous.
+    if inp.stride(-1) != 1:
+        inp = inp.contiguous()
+    if weights.stride(-1) != 1:
+        weights = weights.contiguous()
     result = _result_buffer(out, inp.shape[0], weights.shape[0], otype, inp.device)
     return gemm_a16w16_asm(inp, weights, result, bias, splitK, kernelName, bpreshuffle)
 

@@ -24,18 +24,28 @@ KEY = (GFX, CU_NUM, M, N, K, False, BF16, BF16, False, False)
 
 
 class TestA16W16TunedConfigLookup(unittest.TestCase):
+    def setUp(self):
+        for fn in (
+            tuned.get_GEMM_A16W16_config,
+            tuned.get_GEMM_A16W16_batch_invariant_configs_,
+        ):
+            fn.cache_clear()
+            self.addCleanup(fn.cache_clear)
+        patch = mock.patch.object(
+            tuned, "get_padded_m", side_effect=lambda m, _n, _k, _gl: m
+        )
+        self.get_padded_m = patch.start()
+        self.addCleanup(patch.stop)
+
     def _lookup(self, table):
         patches = [
             mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: table),
             mock.patch.object(tuned, "get_gfx", lambda: GFX),
             mock.patch.object(tuned, "get_cu_num", lambda: CU_NUM),
-            mock.patch.object(tuned, "get_padded_m", lambda m, _n, _k, _gl: m),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        tuned.get_GEMM_A16W16_config.cache_clear()
-        self.addCleanup(tuned.get_GEMM_A16W16_config.cache_clear)
         return (
             tuned.get_GEMM_A16W16_tuned_config(M, N, K, False, BF16, BF16),
             tuned.get_GEMM_A16W16_config(M, N, K, False, BF16, BF16),
@@ -44,6 +54,20 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
     def test_tuned_row_is_returned(self):
         row = {"libtype": "asm", "solidx": 3, "splitK": 1, "kernelName": "k"}
         tuned_config, config = self._lookup({KEY: row})
+        self.assertEqual(tuned_config, row)
+        self.assertEqual(config, row)
+        self.get_padded_m.assert_not_called()
+
+    def test_first_padded_hit_does_not_load_second_padding(self):
+        row = {"libtype": "asm", "solidx": 3, "splitK": 1, "kernelName": "k"}
+
+        def padded_m(m, _n, _k, gl):
+            self.assertEqual(gl, 0, "the first padded row should satisfy lookup")
+            return m * 2
+
+        self.get_padded_m.side_effect = padded_m
+        padded_key = KEY[:2] + (M * 2,) + KEY[3:]
+        tuned_config, config = self._lookup({padded_key: row})
         self.assertEqual(tuned_config, row)
         self.assertEqual(config, row)
 
