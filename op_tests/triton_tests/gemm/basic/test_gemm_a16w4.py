@@ -16,7 +16,7 @@ from aiter.ops.triton.utils.shuffle import (
 )
 
 # Archs with gemm_a16w4 configs.
-SUPPORTED_ARCHS = ("gfx942", "gfx1100")
+SUPPORTED_ARCHS = ("gfx942", "gfx1100", "gfx1151")
 
 # (N, K) of the linear layers of Llama-3-8B (also Mistral-7B) and Qwen2.5-7B:
 # fused qkv, o, fused gate_up and down projections.
