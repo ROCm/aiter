@@ -798,6 +798,42 @@ _PYTEST_CASES = [
 ]
 
 
+@pytest.mark.skipif(
+    _get_gpu_arch() != "gfx950", reason="gfx950 independent Q/O strides"
+)
+@pytest.mark.parametrize("h", [16, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("q_layout", ["row_padded", "head_strided"])
+@pytest.mark.parametrize("out_padded", [False, True])
+@pytest.mark.parametrize("num_splits", [1, 2])
+def test_independent_out_strides(h, dtype, q_layout, out_padded, num_splits):
+    n, d = 4, 512
+    inputs = _make_inputs(n, h, d, 256, 256, dtype, topk=128, seed=42)
+    if q_layout == "row_padded":
+        # Padding after the last head changes the token stride only.
+        q = torch.empty(n, h + 8, d, dtype=dtype, device="cuda")[:, :h]
+    else:
+        # Selecting alternate heads changes both token and head strides.
+        q = torch.empty(n, h * 2, d, dtype=dtype, device="cuda")[:, ::2]
+    q.copy_(inputs["q"])
+    inputs["q"] = q
+    storage = torch.full((n, h + 4, d), 7.0, dtype=dtype, device="cuda")
+    out = storage[:, :h] if out_padded else torch.empty_like(q.contiguous())
+    assert out.stride() != q.stride()
+    scale = d**-0.5
+    ref = _ref_mla_sparse_prefill(**inputs, softmax_scale=scale)
+    mla_sparse_prefill(
+        **inputs,
+        out=out,
+        softmax_scale=scale,
+        num_kv_splits=num_splits,
+        backend="opus",
+    )
+    torch.testing.assert_close(out, ref, atol=0.02, rtol=0.02)
+    if out_padded:
+        assert bool((storage[:, h:] == 7.0).all()), "wrote outside the output view"
+
+
 @pytest.mark.parametrize("prec", _PYTEST_PRECS)
 @pytest.mark.parametrize(
     "n,h,total_pages,total_tokens,topk",
