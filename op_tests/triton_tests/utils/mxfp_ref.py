@@ -55,7 +55,11 @@ def _upcast_from_mxfp(
     tl.static_assert(
         mx_tensor_dtype == tl.uint8
         or (
-            (mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5)
+            (
+                mx_tensor_dtype == tl.float8e4nv
+                or mx_tensor_dtype == tl.float8e4b8
+                or mx_tensor_dtype == tl.float8e5
+            )
             or mx_tensor_dtype == dst_dtype
         ),
         "mx_tensor_ptr must be uint8 or float8 or dst_dtype",
@@ -66,8 +70,11 @@ def _upcast_from_mxfp(
 
     # Determine if we are dealing with fp8 types.
     is_fp4: tl.constexpr = mx_tensor_dtype == tl.uint8
+    # float8e4b8 is e4m3fnuz (gfx942).
     is_fp8: tl.constexpr = (
-        mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5
+        mx_tensor_dtype == tl.float8e4nv
+        or mx_tensor_dtype == tl.float8e4b8
+        or mx_tensor_dtype == tl.float8e5
     )
     K_DIVISOR: tl.constexpr = 2 if is_fp4 else 1
     BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = BLOCK_SIZE_QUANT_DIM // 32
