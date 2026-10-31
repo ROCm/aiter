@@ -36,9 +36,9 @@ Layout facts this kernel relies on (all contiguous, checked by the wrapper):
 * fp8 scale: one page = 4 fp32 = 16 B, row ``j`` at ``j * 4``.
 
 The module imports only ``flydsl`` and ``torch``: the few buffer primitives it
-needs (byte-addressed ``buffer_load``/``buffer_store`` with hardware OOB
-drop, and a cached ``flyc.compile`` dispatch) are implemented here on
-published FlyDSL APIs instead of importing the ``aiter`` package.
+needs (byte-addressed ``buffer_load``/``buffer_store`` and a cached
+``flyc.compile`` dispatch) are implemented here on published FlyDSL APIs instead
+of importing the ``aiter`` package.
 
 GPU-safety revision (G2 builder #2, 2026-10-31).  v0 was never dispatched
 successfully: its first dispatch attempt on d07-2 wedged the device and left
@@ -62,12 +62,32 @@ the V# bounds check on this toolchain.  Three changes remove that dependency:
    metadata.
 
 The V# extents stay: they are the second line of defence (loads zero-fill,
-stores drop) for anything that still slips through.
+stores drop) for anything that still slips through — but see the OOB_SELECT note
+in the access-layer block: on RDNA (gfx1250) the V# check is *not* the
+drop-everything net it is on CDNA, so it must never be the mechanism that keeps
+an address in bounds.
+
+GPU-hang revision (G2 builder #3, 2026-10-31).  The ``6c272c3c`` build above was
+dispatched once, on d01-3 (single gfx1250, 256 CU): the launch itself returned
+(0.8 s), then ``torch.cuda.synchronize()`` never returned, the device stayed
+100 % busy, and ``dmesg`` showed ``MES(0, 0) failed to respond to
+msg=REMOVE_QUEUE`` / ``Failed to evict queue 1`` / ``Failed to quiesce KFD`` — a
+firmware-level queue hang, no ``VM_PAGE_FAULT`` (so no address left its buffer:
+the address arithmetic is not the suspect).  The one layer of this file with no
+gfx1250 precedent in the tree is the global access layer (see that block), so
+the default is now the in-tree ``make_buffer_ptr`` -> ``get_buffer_rsrc`` ->
+``raw_ptr_buffer_load/store`` pattern with **one pinned descriptor per plane and
+byte offsets in the instruction**, and the previous copy-atom layer is kept
+behind ``QSA_G2_ACCESS=cop`` for the bisect ladder
+(``_g2/bisect.py`` / ``_g2/BISECT.md``) and as a one-variable revert.  Nothing
+observable at the op boundary changes: same planes, same extents, same byte
+addresses, same predicates, same values.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from functools import lru_cache
 
 import flydsl.compiler as flyc
@@ -100,62 +120,181 @@ def _imax(a, b):
 
 
 # ---------------------------------------------------------------------------
-# Minimal buffer primitives (published FlyDSL APIs only)
+# Global access layer: one pinned descriptor (V#) per plane + byte offsets
 # ---------------------------------------------------------------------------
-def _byte_ptr(tensor, num_bytes):
-    """Byte-addressed buffer pointer (V#) for a kernel tensor argument.
+# Every plane is addressed through **one** AMD buffer resource descriptor whose
+# ``NUM_RECORDS`` is the plane's true extent in bytes, and an explicit **byte**
+# offset per access.  Two implementations of that seam exist:
+#
+#   raw (default)  ``make_buffer_ptr`` -> ``get_buffer_rsrc`` ->
+#                  ``rocdl.raw_ptr_buffer_load/store``.  This is the in-tree
+#                  pattern of the kernels that are exercised on gfx1250
+#                  hardware: ``aiter/ops/flydsl/kernels/buffer_ops.py:389-568``
+#                  (``buffer_load``/``buffer_store``, "Buffer load offset is in
+#                  BYTES, not elements") and the pinned-descriptor form of
+#                  ``.../moe_gemm_2stage/gfx9_fp8/gemm2_1x4.py:353-383``.
+#   cop            ``make_copy_atom(BufferCopy(nbytes*8), Int8)`` +
+#                  ``copy_atom_call`` through a per-access ``make_view`` — what
+#                  commit ``6c272c3c`` shipped, and what the first real dispatch
+#                  of this kernel hung the GPU with (``records/g2/
+#                  builder3-log.md``).  It is the only construct in this file
+#                  with **no gfx1250 precedent in the tree**: its single in-tree
+#                  user, ``mqa_logits/qsa_flydsl_layout.py:70-81``, is a
+#                  candidate implementation that has never been dispatched on
+#                  gfx1250 either, and on the *store* path it additionally
+#                  allocates a register array inside a lane-varying ``if``::
+#
+#                      if col_ok:                       # only 4 of 256 lanes
+#                          reg = make_rmem_tensor(...)  # <- allocation in a branch
+#                          memref_store_vec(...); copy_atom_call(...)
+#
+#                  which nothing else in the tree does around a global store.
+#                  It stays selectable (``QSA_G2_ACCESS=cop``) so the bisect
+#                  ladder can compare the two layers on hardware and so a
+#                  compile problem in the raw layer is one environment variable
+#                  away from a revert rather than an edit on a wedged node.
+#
+# Both layers keep the ``6c272c3c`` address guarantees: the descriptor extent is
+# the true plane size (i64, at least one dword), every offset is clamped in
+# bounds, and stores stay **predicated** — never steered at a sentinel byte
+# offset.  That last point is not stylistic: on RDNA the V# OOB check is not the
+# drop-everything net it is on CDNA (``buffer_ops._get_buffer_flags`` sets
+# OOB_SELECT=2, "no bounds checking", for ``is_rdna_arch``, and gfx1250 is RDNA),
+# which is exactly what the d07-2 ``VM_PAGE_FAULT`` at ``base + 0x7FFFFFFF``
+# says.  See ``records/g2/builder2-log.md`` §2.
+_ACCESS = os.environ.get("QSA_G2_ACCESS", "raw").strip().lower()
+if _ACCESS not in ("raw", "cop"):
+    raise ValueError(f"QSA_G2_ACCESS must be 'raw' or 'cop', got {_ACCESS!r}")
+
+
+def _plane(tensor, num_bytes):
+    """Descriptor for a kernel tensor argument, extent ``num_bytes`` (i64).
 
     ``num_bytes`` is the descriptor's ``num_records``: loads past it are
-    zero-filled and stores past it are dropped by the hardware.  That check is
-    the *second* line of defence here — the kernel no longer steers masked
-    stores at an out-of-bounds sentinel offset (see the module docstring), so a
-    dropped access is only ever a safety net.
+    zero-filled and stores past it dropped by hardware that implements the
+    check (see the OOB_SELECT note above — treat it as a safety net, not as the
+    mechanism that keeps stores in bounds in the first place).
 
     ``num_bytes`` must therefore be the *true* extent of the plane in bytes and
     is computed in i64 (an i32 product can wrap and then either truncate the
     descriptor or, worse, look large enough to admit a bad offset).
     """
-    return fx.rocdl.make_buffer_ptr(
+    ptr = fx.rocdl.make_buffer_ptr(
         fx.recast_iter(fx.Int8, fx.get_iter(tensor)),
         num_records_bytes=_imax(fx.Int64(num_bytes), fx.Int64(_MIN_DESC_BYTES)),
     )
+    return ptr if _ACCESS == "cop" else fx.rocdl.get_buffer_rsrc(ptr)
 
 
-def _gload(ptr, byte_off, n, elem):
+_RAW: dict = {}
+
+
+def _raw():
+    """``(ir, aux)`` for the raw ROCDL intrinsics, resolved once per process.
+
+    Kept lazy on purpose: this module must still import on a host with no
+    ``flydsl`` (``_g2/_load.py`` installs a stub so the op wrapper stays
+    testable), and ``flydsl._mlir`` is not part of that stub.
+    """
+    if not _RAW:
+        import inspect
+
+        from flydsl._mlir import ir
+
+        # flydsl moved the buffer cache policy from an i32 operand to an enum
+        # attribute; ``buffer_ops.py:44-48`` detects the same way.
+        is_attr = (
+            inspect.signature(fx.rocdl.RawPtrBufferLoadOp).parameters["aux"].kind
+            is inspect.Parameter.KEYWORD_ONLY
+        )
+        aux = (
+            ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 0)
+            if is_attr
+            else fx.Int32(0).ir_value()
+        )
+        _RAW.update(ir=ir, aux=aux)
+    return _RAW["ir"], _RAW["aux"]
+
+
+def _ld_vec(ptr, byte_off, n, elem):
     """``n`` elements of ``elem`` at ``byte_off`` (one buffer_load_dwordx n*4)."""
-    nbytes = n * _ELEM_BYTES[elem]
-    src = fx.make_view(ptr + byte_off, fx.make_layout(nbytes, 1))
-    reg = fx.make_rmem_tensor(fx.make_layout(n, 1), elem)
-    fx.copy_atom_call(
-        fx.make_copy_atom(fx.rocdl.BufferCopy(nbytes * 8), fx.Int8), src, reg
+    if _ACCESS == "cop":
+        nbytes = n * _ELEM_BYTES[elem]
+        src = fx.make_view(ptr + byte_off, fx.make_layout(nbytes, 1))
+        reg = fx.make_rmem_tensor(fx.make_layout(n, 1), elem)
+        fx.copy_atom_call(
+            fx.make_copy_atom(fx.rocdl.BufferCopy(nbytes * 8), fx.Int8), src, reg
+        )
+        return Vec(fx.memref_load_vec(reg))
+    ir, aux = _raw()
+    return Vec(
+        fx.rocdl.raw_ptr_buffer_load(
+            ir.VectorType.get([n], elem.ir_type),
+            ptr,
+            fx.Int32(byte_off).ir_value(),
+            fx.Int32(0).ir_value(),
+            aux=aux,
+        )
     )
-    return fx.memref_load_vec(reg)
 
 
-def _gstore(ptr, byte_off, vec, n, elem):
-    nbytes = n * _ELEM_BYTES[elem]
-    dst = fx.make_view(ptr + byte_off, fx.make_layout(nbytes, 1))
-    reg = fx.make_rmem_tensor(fx.make_layout(n, 1), elem)
-    fx.memref_store_vec(vec, reg)
-    fx.copy_atom_call(
-        fx.make_copy_atom(fx.rocdl.BufferCopy(nbytes * 8), fx.Int8), reg, dst
+def _ld_scalar(ptr, byte_off, elem):
+    """One element of ``elem`` at ``byte_off`` (buffer_load_dword)."""
+    if _ACCESS == "cop":
+        nbytes = _ELEM_BYTES[elem]
+        src = fx.make_view(ptr + byte_off, fx.make_layout(nbytes, 1))
+        reg = fx.make_rmem_tensor(fx.make_layout(1, 1), elem)
+        fx.copy_atom_call(
+            fx.make_copy_atom(fx.rocdl.BufferCopy(nbytes * 8), fx.Int8), src, reg
+        )
+        return elem(Vec(fx.memref_load_vec(reg))[0])
+    _, aux = _raw()
+    return elem(
+        fx.rocdl.raw_ptr_buffer_load(
+            elem.ir_type,
+            ptr,
+            fx.Int32(byte_off).ir_value(),
+            fx.Int32(0).ir_value(),
+            aux=aux,
+        )
+    )
+
+
+def _st_scalar(ptr, byte_off, value, elem):
+    """One buffer_store_dword of ``value`` at ``byte_off``."""
+    if _ACCESS == "cop":
+        nbytes = _ELEM_BYTES[elem]
+        dst = fx.make_view(ptr + byte_off, fx.make_layout(nbytes, 1))
+        reg = fx.make_rmem_tensor(fx.make_layout(1, 1), elem)
+        fx.memref_store_vec(Vec.from_elements([value], dtype=elem), reg)
+        fx.copy_atom_call(
+            fx.make_copy_atom(fx.rocdl.BufferCopy(nbytes * 8), fx.Int8), reg, dst
+        )
+        return
+    _, aux = _raw()
+    fx.rocdl.raw_ptr_buffer_store(
+        elem(value).ir_value(),
+        ptr,
+        fx.Int32(byte_off).ir_value(),
+        fx.Int32(0).ir_value(),
+        aux=aux,
     )
 
 
 def _ld_i32(ptr, byte_off):
-    return fx.Int32(Vec(_gload(ptr, byte_off, 1, fx.Int32))[0])
+    return _ld_scalar(ptr, byte_off, fx.Int32)
 
 
 def _ld_f32(ptr, byte_off):
-    return fx.Float32(Vec(_gload(ptr, byte_off, 1, fx.Float32))[0])
+    return _ld_scalar(ptr, byte_off, fx.Float32)
 
 
 def _st_i32(ptr, byte_off, value):
-    _gstore(ptr, byte_off, Vec.from_elements([value], dtype=fx.Int32), 1, fx.Int32)
+    _st_scalar(ptr, byte_off, value, fx.Int32)
 
 
 def _st_f32(ptr, byte_off, value):
-    _gstore(ptr, byte_off, Vec.from_elements([value], dtype=fx.Float32), 1, fx.Float32)
+    _st_scalar(ptr, byte_off, value, fx.Float32)
 
 
 # Exact E4M3 (e4m3fn) -> f32 for one byte code, in integer arithmetic.
@@ -238,10 +377,10 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
     def _ks_bytes_bf16(num_pages):   # no scale plane: a 4-byte dummy descriptor
         return fx.Int64(4)
 
-    def _scale_fp8(ks_ptr, phys, off):
-        return _ld_f32(ks_ptr, (phys * PAGE_SIZE + off) * 4)
+    def _scale_fp8(ks_rsrc, phys, off):
+        return _ld_f32(ks_rsrc, (phys * PAGE_SIZE + off) * 4)
 
-    def _scale_bf16(ks_ptr, phys, off):   # no scale: the dequant multiplier is 1
+    def _scale_bf16(ks_rsrc, phys, off):   # no scale: the dequant multiplier is 1
         return fx.Float32(1.0)
 
     if is_fp8:
@@ -272,25 +411,26 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         ptile = fx.Int32(fx.block_idx.x)
         col = ptile * threads + tid
 
-        # Descriptor extents: bytes, i64 (see `_byte_ptr`).  `ks_bytes(num_pages)`
+        # Descriptor extents: bytes, i64 (see `_plane`).  One pinned descriptor
+        # per plane, built here and not inside any branch.  `ks_bytes(num_pages)`
         # is already an i64 expression, and the bf16 dummy plane is a constant.
-        q_ptr = _byte_ptr(Q, fx.Int64(rows) * fx.Int64(q_row_bytes))
-        kv_ptr = _byte_ptr(KV, fx.Int64(num_pages) * fx.Int64(page_bytes))
-        pt_ptr = _byte_ptr(PT, fx.Int64(num_requests) * fx.Int64(width) * fx.Int64(4))
-        t2r_ptr = _byte_ptr(T2R, fx.Int64(rows) * fx.Int64(4))
-        qp_ptr = _byte_ptr(QP, fx.Int64(rows) * fx.Int64(4))
-        cl_ptr = _byte_ptr(CL, fx.Int64(num_requests) * fx.Int64(4))
-        logits_ptr = _byte_ptr(LOGITS, fx.Int64(rows) * fx.Int64(columns) * fx.Int64(4))
-        vis_ptr = _byte_ptr(VIS, fx.Int64(rows) * fx.Int64(4))
-        rst_ptr = _byte_ptr(RST, fx.Int64(rows) * fx.Int64(4))
-        ks_ptr = _byte_ptr(KS, ks_bytes(num_pages))
+        q_rsrc = _plane(Q, fx.Int64(rows) * fx.Int64(q_row_bytes))
+        kv_rsrc = _plane(KV, fx.Int64(num_pages) * fx.Int64(page_bytes))
+        pt_rsrc = _plane(PT, fx.Int64(num_requests) * fx.Int64(width) * fx.Int64(4))
+        t2r_rsrc = _plane(T2R, fx.Int64(rows) * fx.Int64(4))
+        qp_rsrc = _plane(QP, fx.Int64(rows) * fx.Int64(4))
+        cl_rsrc = _plane(CL, fx.Int64(num_requests) * fx.Int64(4))
+        logits_rsrc = _plane(LOGITS, fx.Int64(rows) * fx.Int64(columns) * fx.Int64(4))
+        vis_rsrc = _plane(VIS, fx.Int64(rows) * fx.Int64(4))
+        rst_rsrc = _plane(RST, fx.Int64(rows) * fx.Int64(4))
+        ks_rsrc = _plane(KS, ks_bytes(num_pages))
 
         # --- row metadata: visible count (identical to the golden's visible_groups)
-        req = _ld_i32(t2r_ptr, row * 4)
+        req = _ld_i32(t2r_rsrc, row * 4)
         req_ok = (req >= 0) & (req < num_requests)
         safe_req = req_ok.select(req, 0)
-        ctx = _ld_i32(cl_ptr, safe_req * 4)
-        pos = _ld_i32(qp_ptr, row * 4)
+        ctx = _ld_i32(cl_rsrc, safe_req * 4)
+        pos = _ld_i32(qp_rsrc, row * 4)
         # min is monotone, so min(a, b) // 4 == min(a // 4, b // 4); clamping to
         # >= 0 first keeps the division on a non-negative operand.
         head = _imax(_imin(pos + 1, ctx), 0)
@@ -302,8 +442,8 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         # that reaches it, so an un-taken branch can never fault.
         writer = (tid == 0) & (ptile == 0) & (row < rows)
         if writer:
-            _st_i32(vis_ptr, row * 4, vis)
-            _st_i32(rst_ptr, row * 4, fx.Int32(0))
+            _st_i32(vis_rsrc, row * 4, vis)
+            _st_i32(rst_rsrc, row * 4, fx.Int32(0))
 
         # --- column -> (logical page, row in page)
         col_ok = col < columns
@@ -311,7 +451,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         off = col % PAGE_SIZE
         logical_ok = logical < width
         safe_logical = logical_ok.select(logical, 0)
-        phys = _ld_i32(pt_ptr, (safe_req * width + safe_logical) * 4)
+        phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
         page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
         phys = page_ok.select(phys, 0)
 
@@ -321,10 +461,10 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         zero = fx.Float32(0.0)
         acc = [zero, zero, zero, zero]
         for s in range_constexpr(steps):
-            kraw = Vec(_gload(kv_ptr, k_base + s * k_bytes, k_dwords, fx.Int32))
+            kraw = _ld_vec(kv_rsrc, k_base + s * k_bytes, k_dwords, fx.Int32)
             kv = key_vals(kraw)
             for h in range_constexpr(NUM_HEADS):
-                qraw = Vec(_gload(q_ptr, q_base + h * (HEAD_DIM * 2) + s * 16, 4, fx.Int32))
+                qraw = _ld_vec(q_rsrc, q_base + h * (HEAD_DIM * 2) + s * 16, 4, fx.Int32)
                 qs = []
                 for j in range_constexpr(4):
                     dw = fx.Int32(qraw[j])
@@ -333,7 +473,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
                 for d in range_constexpr(DIM_PER_STEP):
                     acc[h] = acc[h] + qs[d] * kv[d]
 
-        scale = scale_of(ks_ptr, phys, off)
+        scale = scale_of(ks_rsrc, phys, off)
         total = (
             (acc[0] * scale).maximumf(zero)
             + (acc[1] * scale).maximumf(zero)
@@ -354,7 +494,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         # was not.  Do not reintroduce that pattern.
         out_idx = _imin(row * columns + col, rows * columns - 1)
         if col_ok:
-            _st_f32(logits_ptr, out_idx * 4, value)
+            _st_f32(logits_rsrc, out_idx * 4, value)
 
     @flyc.jit
     def launch(
