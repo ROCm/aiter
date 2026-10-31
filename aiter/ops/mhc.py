@@ -351,14 +351,28 @@ def mhc_res_unshuffle(shuffled: torch.Tensor, ks: int | None = None) -> torch.Te
     return mhc_res_unshuffle_flydsl(shuffled, ks)
 
 
+# MUST stay in lockstep with ``mhc_fnres_ks`` in csrc/kernels/mhc_kernels.cu.
+MHC_FNRES_KS = 1024
+
+
 @functools.lru_cache(maxsize=1024)
 def get_mhc_pre_splitk(
-    m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
+    m: int,
+    hc_hidden_size: int,
+    w_preshuffle_bf16: bool = False,
+    hc_mult3: int | None = None,
 ) -> tuple[int, int]:
     prefetch_stages = 2
     tile_m = 16 * 4
     num_cu = get_cu_num()
     arch = get_gfx_runtime()
+    if (
+        arch == "gfx950"
+        and hc_mult3 == 24
+        and m >= 2048
+        and hc_hidden_size % MHC_FNRES_KS == 0
+    ):
+        return hc_hidden_size // MHC_FNRES_KS, MHC_FNRES_KS
     # Vector LDS weight reads shorten the gfx1250 BF16 loop. More split-K
     # workgroups improve latency hiding for large M without changing FP32 tuning.
     prefill_tg_factor = (
@@ -701,11 +715,11 @@ def mhc_pre(
     packed_config = bool(w_preshuffle_bf16) and hc_mult == 4 and hc_mult3 == 24
     if large_m_splitk:
         selected_splitk, selected_tile_k = get_mhc_pre_splitk_large_m(
-            m, hc_hidden_size, w_preshuffle_bf16=packed_config
+            m, hc_hidden_size, w_preshuffle_bf16=packed_config, hc_mult3=hc_mult3
         )
     else:
         selected_splitk, selected_tile_k = get_mhc_pre_splitk(
-            m, hc_hidden_size, w_preshuffle_bf16=packed_config
+            m, hc_hidden_size, w_preshuffle_bf16=packed_config, hc_mult3=hc_mult3
         )
     device = residual.device
     out_pad = torch.empty(
@@ -794,12 +808,17 @@ def mhc_post(
 
 
 def get_mhc_pre_splitk_large_m(
-    m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
+    m: int,
+    hc_hidden_size: int,
+    w_preshuffle_bf16: bool = False,
+    hc_mult3: int | None = None,
 ) -> tuple[int, int]:
     """Split-K policy for gfx950 large-M post_pre kernel (M > 1024)."""
     if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
         return 8, 64
-    return get_mhc_pre_splitk(m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16)
+    return get_mhc_pre_splitk(
+        m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16, hc_mult3=hc_mult3
+    )
 
 
 @compile_ops("module_mhc", develop=True)
