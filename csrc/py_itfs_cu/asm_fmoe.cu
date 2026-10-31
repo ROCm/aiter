@@ -161,7 +161,13 @@ class FMoeKernel
         args.ptr_O      = out->ptr;
         args.ptr_X      = input->ptr;
         args.ptr_GU     = w1->ptr;
-        args.ptr_XC     = num_valid_ids->ptr;
+        // FLAT and EMSORT route directly from raw top-k ids and use the
+        // token-count kernarg.  Their XC[0] ABI is a token count, whereas
+        // num_valid_ids is the host-sorted assignment count (token_cnt * topk).
+        // EMSORT also sizes its leader O-zero sweep from XC[0], so handing it
+        // the assignment count makes that sweep run token_cnt*topk*dim*2 bytes
+        // past the end of out.
+        args.ptr_XC     = this->flat_mode == 0 ? num_valid_ids->ptr : nullptr;
         args.ptr_D      = w2->ptr;
         if constexpr(I_elemSize == 1)
         {
@@ -356,9 +362,15 @@ static bool ps_grid_fits(const CFG::mapped_type& cfg, int inter_dim)
 static bool kernel_fits(
     const CFG::mapped_type& cfg, int vskip, int smf, int block_size_M, int inter_dim, int model_dim)
 {
-    return cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m && cfg.flat == 0 &&
-           inter_dim % cfg.subGU_n == 0 && model_dim % std::max(cfg.dim_align, 1) == 0 &&
-           model_dim >= cfg.dim_min && ps_grid_fits(cfg, inter_dim);
+    if(cfg.smf != smf || inter_dim % cfg.subGU_n != 0 ||
+       model_dim % std::max(cfg.dim_align, 1) != 0 || model_dim < cfg.dim_min ||
+       !ps_grid_fits(cfg, inter_dim))
+        return false;
+    // flat==1 rows are the 16xN tiles. Their subGU_m is 16 and vskip is 0, so the
+    // checks below would hide the only rows that divide inter_dim such as 160 and 320.
+    if(cfg.flat == 1)
+        return true;
+    return cfg.vskip == vskip && block_size_M == cfg.subGU_m && cfg.flat == 0;
 }
 
 FMoeKernel* get_heuristic_kernel(int inter_dim,
@@ -375,6 +387,7 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
     uint32_t tg_num             = 0;
     uint32_t num_persistent_tgs = 0;
     uint32_t round              = 0xffffffff;
+    int selected_flat           = 0;
     std::string arch_id         = get_gpu_arch();
     std::string selectedKl      = kernel_name.empty() ? "" : arch_id + kernel_name;
     int vskip                   = get_vskip();
@@ -392,15 +405,19 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
                 tg_num = inter_dim / cfg.subGU_n *
                          sub_X_cnt; // how many thread_groups are needed to handle inter_dim
                 uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
-                if(local_round < round || // fewer round is better
+                const uint32_t empty = local_round * num_cu - tg_num;
+                // Fewer rounds, then fewer empty CUs. At the same cost a flat==0 row
+                // beats a flat==1 row with the same subGU_n, and a PS row wins a tie.
+                if(local_round < round ||
                    (local_round == round &&
-                    (empty_cu > (local_round * num_cu - tg_num) || // fewer empty_cu is better
-                     (empty_cu == (local_round * num_cu - tg_num) &&
-                      cfg.ps == 1)))) // prefer PS kernel
+                    (empty_cu > empty ||
+                     (empty_cu == empty && cfg.flat == selected_flat && cfg.ps == 1) ||
+                     (empty_cu == empty && selected_flat != 0 && cfg.flat == 0))))
                 {
-                    round      = local_round;
-                    empty_cu   = local_round * num_cu - tg_num;
-                    selectedKl = el.first;
+                    round         = local_round;
+                    empty_cu      = empty;
+                    selectedKl    = el.first;
+                    selected_flat = cfg.flat;
                     if(cfg.ps == 1)
                         num_persistent_tgs = cfg.tg_num_perCU * num_cu;
                     else

@@ -730,13 +730,24 @@ parser.add_argument(
     e.g.: -hip 0,0""",
 )
 parser.add_argument(
+    "--stage1-bias",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True],
+    help="""Whether CLI-generated cases include a random per-expert stage-1
+    bias. Default is [True] for backward compatibility. Use
+    --stage1-bias f for bias-free models, or --stage1-bias t f to test both.
+    FLAT MXFP4 assembly kernels do not apply this bias.""",
+)
+parser.add_argument(
     "--stage2-bias",
     type=dtypes.str2bool,
     nargs="*",
     default=[True],
     help="""Whether CLI-generated cases include a random per-expert stage-2
     bias. Default is [True] for backward compatibility. Use
-    --stage2-bias f for bias-free models, or --stage2-bias t f to test both.""",
+    --stage2-bias f for bias-free models, or --stage2-bias t f to test both.
+    FLAT MXFP4 assembly kernels do not apply this bias.""",
 )
 parser.add_argument(
     "--no-flydsl-csv",
@@ -1242,12 +1253,14 @@ def _iter_legacy_cases():
         (quant_type, aq_dtype, wq_dtype),
         (model_dim, inter_dim),
         doweight_stage1,
+        stage1_bias,
         stage2_bias,
     ) in itertools.product(
         args.dtype,
         l_quant,
         args.dim,
         args.doweight_stage1,
+        args.stage1_bias,
         args.stage2_bias,
     ):
         triple = (quant_type, aq_dtype, wq_dtype)
@@ -1274,6 +1287,7 @@ def _iter_legacy_cases():
                             use_g1u1=(act_type != aiter.ActivationType.Relu2),
                             hidden_pad=hidden_pad,
                             intermediate_pad=intermediate_pad,
+                            disable_stage1_bias=not stage1_bias,
                             disable_stage2_bias=not stage2_bias,
                         ), extras
         elif triple == _PER1X32_FP8_FP4:
@@ -1292,6 +1306,7 @@ def _iter_legacy_cases():
                             act_type,
                             hidden_pad=hidden_pad,
                             intermediate_pad=intermediate_pad,
+                            disable_stage1_bias=not stage1_bias,
                             disable_stage2_bias=not stage2_bias,
                             **_situv2_beta_kwargs(act_type),
                         ), extras
@@ -1316,6 +1331,7 @@ def _iter_legacy_cases():
                                 preshuffle=preshuffle,
                                 hidden_pad=0,
                                 intermediate_pad=0,
+                                disable_stage1_bias=not stage1_bias,
                                 disable_stage2_bias=not stage2_bias,
                                 **_situv2_beta_kwargs(act_type),
                             ),
@@ -1333,6 +1349,7 @@ def _iter_legacy_cases():
                     wq_dtype,
                     doweight_stage1,
                     aiter.ActivationType.Silu,
+                    disable_stage1_bias=not stage1_bias,
                     disable_stage2_bias=not stage2_bias,
                 ), extras
         else:
@@ -1357,6 +1374,7 @@ def _iter_legacy_cases():
                             doweight_stage1,
                             act_type,
                             use_g1u1=(act_type != aiter.ActivationType.Relu2),
+                            disable_stage1_bias=not stage1_bias,
                             disable_stage2_bias=not stage2_bias,
                             **_situv2_beta_kwargs(act_type),
                         ),
