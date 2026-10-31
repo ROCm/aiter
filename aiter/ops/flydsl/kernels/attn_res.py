@@ -3,11 +3,13 @@
 
 """FlyDSL AttnRes prefill kernel for Kimi-K3.
 
-Each workgroup's wave-aligned size is derived from the hidden size. D=7168
-keeps one 448-thread row per workgroup. D=1024 defaults to one 64-thread row
-per workgroup. ``flydsl_attn_res(..., rows_per_wg=4)`` packs four independent
-one-wave rows into a 256-thread workgroup; idle tail waves skip when ``T`` is
-not a multiple of four. Multi-wave rows always stay at one row per workgroup.
+Each workgroup's wave-aligned size is derived from the hidden size. D=1024
+defaults to one 64-thread row per workgroup. ``flydsl_attn_res(...,
+rows_per_wg=4)`` packs four independent one-wave rows into a 256-thread
+workgroup; idle tail waves skip when ``T`` is not a multiple of four.
+Multi-wave rows always stay at one row per workgroup. Their thread count
+depends on ``T``: at ``T <= num_cus`` D=7168 runs 448 threads per row, and
+above the CU count it runs 256.
 Inputs may be contiguous or have padded leading dimensions when their trailing
 stride is one and their row starts are 16-byte aligned. The kernel reads up to
 eight block sources plus the live prefix, scores sources with RMS-normalized
@@ -28,6 +30,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, Stream, T
@@ -42,6 +45,7 @@ KERNEL_NAME = "flydsl_attn_res"
 _MAX_BLOCKS = 8
 _WARP_SIZE = 64
 _VEC_WIDTH = 8  # 8 bf16 values = one 128-bit global-memory transaction.
+_TAIL_VEC_WIDTH = 4  # 4 bf16 values = one 64-bit transaction for a row's tail tile.
 _TILE_CANDIDATES = (2, 4, 8, 1)
 _MAX_BLOCK_THREADS = 1024
 # Buffer loads and stores take a 32-bit byte offset from the tensor's base.
@@ -55,6 +59,10 @@ _SMALL_D_ROWS_PER_WG = 1
 _SOURCE_PREFETCH_IN_FLIGHT = 3
 # Changing this constant requires _build_attn_res.cache_clear().
 _SOURCE_GROUP_SIZE = 2
+# Multi-wave rows when T exceeds the CU count.
+_WIDE_ROW_THREADS = 256
+_WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
+_WIDE_SOURCE_GROUP_SIZE = 1
 # Butterfly used by ``_wave_reduce_add_f32``: "auto" | "swizzle" | "dpp".
 # Changing this constant requires _build_attn_res.cache_clear().
 _WAVE_REDUCE_MODE = "auto"
@@ -195,6 +203,19 @@ def _narrow_dpp_reduce_add_f32(value, red_slots: int, fastmath):
     return broadcast.bitcast(fx.Float32)
 
 
+def _wide_row_supported(hidden_size: int) -> bool:
+    """Return whether 256 threads split the row into 128-bit tiles and at most one 64-bit tail."""
+    if hidden_size % _WIDE_ROW_THREADS:
+        return False
+    elems_per_thread = hidden_size // _WIDE_ROW_THREADS
+    return elems_per_thread >= _VEC_WIDTH and not elems_per_thread % _TAIL_VEC_WIDTH
+
+
+@lru_cache(maxsize=64)
+def _num_cus(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def _block_threads_for(num_vec: int) -> int:
     """Return a wave-aligned thread count that prefers two vector tiles per thread."""
     if num_vec <= 0:
@@ -240,6 +261,7 @@ def _build_attn_res(
     block_write_idx: int,
     apply_output_norm: bool,
     rows_per_wg: int,
+    wide_grid: bool,
 ):
     """Return one fixed-shape, compile-time-specialized AttnRes launcher."""
     if hidden_size <= 0 or hidden_size % _VEC_WIDTH:
@@ -259,19 +281,40 @@ def _build_attn_res(
 
     num_vec = hidden_size // _VEC_WIDTH
     row_threads = _block_threads_for(num_vec)
+    if wide_grid:
+        if row_threads == _WARP_SIZE or not _wide_row_supported(hidden_size):
+            raise ValueError(
+                f"wide_grid needs a multi-wave row that {_WIDE_ROW_THREADS} threads "
+                f"split into 128-bit tiles plus a 64-bit tail, got D={hidden_size}"
+            )
+        row_threads = _WIDE_ROW_THREADS
     rows_per_wg = _resolve_rows_per_wg(row_threads, rows_per_wg)
     block_threads = row_threads * rows_per_wg
-    tiles_per_thread = num_vec // row_threads
+    elems_per_thread = hidden_size // row_threads
+    full_tiles = elems_per_thread // _VEC_WIDTH
+    tile_widths = (_VEC_WIDTH,) * full_tiles
+    tile_bases = tuple(tile * row_threads for tile in range(full_tiles))
+    if elems_per_thread % _VEC_WIDTH:
+        tile_widths += (_TAIL_VEC_WIDTH,)
+        tile_bases += (full_tiles * 2 * row_threads,)
+    tiles_per_thread = len(tile_widths)
     red_slots = row_threads // _WARP_SIZE
     num_sources = num_blocks + 1
     write_block = block_write_idx >= 0
-    prefetch_in_flight = min(_SOURCE_PREFETCH_IN_FLIGHT, max(num_blocks - 1, 0))
+    prefetch = (
+        _WIDE_SOURCE_PREFETCH_IN_FLIGHT if wide_grid else _SOURCE_PREFETCH_IN_FLIGHT
+    )
+    prefetch_in_flight = min(prefetch, max(num_blocks - 1, 0))
+    prefix_slot = 0 if wide_grid else num_blocks
+    first_block_slot = 1 if wide_grid else 0
     # One-wave rows have no cross-wave barrier. Mix-only rows put every source
     # behind one barrier; rows with delta, snapshot, or output norm are slower
     # that way at large T.
     mix_only = not (has_delta or write_block or apply_output_norm)
     if red_slots == 1:
         group_size = 1
+    elif wide_grid:
+        group_size = _WIDE_SOURCE_GROUP_SIZE
     elif mix_only:
         group_size = num_sources
     else:
@@ -296,6 +339,8 @@ def _build_attn_res(
         f"_onorm{int(apply_output_norm)}_pf{prefetch_in_flight}_g{group_size}"
         f"_wr{wave_reduce_mode}"
     )
+    if wide_grid:
+        kernel_name += "_wide"
 
     @fx.struct
     class SharedStorage:
@@ -323,10 +368,9 @@ def _build_attn_res(
         local_tid = fx.Int32(fx.get(row_coord, 1))
         token = fx.block_idx.x * rows_per_wg + wg_row
         fm_fast = arith.FastMathFlags.fast
-        vec_layout = fx.make_layout((tiles_per_thread, row_threads), (row_threads, 1))
 
         def vector_index_for(tile):
-            return fx.Int32(fx.get_scalar(fx.crd2idx((tile, local_tid), vec_layout)))
+            return local_tid + tile_bases[tile]
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         pingpong_layout = fx.make_layout(
@@ -340,6 +384,17 @@ def _build_attn_res(
         neg_inf = fx.Float32(float("-inf"))
         inv_hidden_size = 1.0 / float(hidden_size)
         log2e = _LOG2E
+
+        # Without the pin the compiler sinks each FP32 mix update to the final
+        # store and keeps every source live.
+        def pin_registers(values):
+            llvm.inline_asm(
+                None,
+                [value.ir_value() for value in values],
+                "",
+                ",".join("v" for _ in values),
+                has_side_effects=True,
+            )
 
         def wave_reduce_add(value):
             return _wave_reduce_add_f32(value, wave_reduce_mode, fm_fast)
@@ -406,21 +461,44 @@ def _build_attn_res(
             partial = in_range.select(partial, zero)
             return finish_reduce(partial)
 
-        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        vector_layout = fx.make_layout(_VEC_WIDTH, 1)
+        copy_atoms = {
+            width: fx.make_copy_atom(copy_op(), fx.BFloat16)
+            for width, copy_op in (
+                (_VEC_WIDTH, fx.rocdl.BufferCopy128b),
+                (_TAIL_VEC_WIDTH, fx.rocdl.BufferCopy64b),
+            )
+            if width in tile_widths
+        }
+        vector_layouts = {width: fx.make_layout(width, 1) for width in copy_atoms}
 
-        def issue_bf16_vec(divided_tensor, index):
-            register = fx.make_rmem_tensor(_VEC_WIDTH, fx.BFloat16)
-            fx.copy(copy_atom, fx.slice(divided_tensor, (None, index)), register)
+        def divide_row(row):
+            return {
+                width: fx.logical_divide(row, layout)
+                for width, layout in vector_layouts.items()
+            }
+
+        def issue_bf16_vec(divided, tile):
+            width = tile_widths[tile]
+            register = fx.make_rmem_tensor(width, fx.BFloat16)
+            fx.copy(
+                copy_atoms[width],
+                fx.slice(divided[width], (None, vector_index_for(tile))),
+                register,
+            )
             return register
 
-        def load_bf16_vec(divided_tensor, index):
-            return fx.memref_load_vec(issue_bf16_vec(divided_tensor, index))
+        def load_bf16_vec(divided, tile):
+            return fx.memref_load_vec(issue_bf16_vec(divided, tile))
 
-        def store_bf16_vec(value, divided_tensor, index):
-            register = fx.make_rmem_tensor(_VEC_WIDTH, fx.BFloat16)
+        def store_bf16_vec(value, divided, tile):
+            width = tile_widths[tile]
+            register = fx.make_rmem_tensor(width, fx.BFloat16)
             fx.memref_store_vec(value, register)
-            fx.copy(copy_atom, register, fx.slice(divided_tensor, (None, index)))
+            fx.copy(
+                copy_atoms[width],
+                register,
+                fx.slice(divided[width], (None, vector_index_for(tile))),
+            )
 
         prefix_buf = fx.rocdl.make_buffer_tensor(prefix)
         blocks_buf = fx.rocdl.make_buffer_tensor(blocks)
@@ -431,21 +509,21 @@ def _build_attn_res(
         def run_row():
             prefix_row = fx.slice(prefix_buf, (token, None))
             out_row = fx.slice(out_buf, (token, None))
-            prefix_div = fx.logical_divide(prefix_row, vector_layout)
-            norm_weight_div = fx.logical_divide(norm_weight_buf, vector_layout)
-            qk_weight_div = fx.logical_divide(qk_weight_buf, vector_layout)
-            out_div = fx.logical_divide(out_row, vector_layout)
+            prefix_div = divide_row(prefix_row)
+            norm_weight_div = divide_row(norm_weight_buf)
+            qk_weight_div = divide_row(qk_weight_buf)
+            out_div = divide_row(out_row)
             if const_expr(has_delta):
                 delta_buf = fx.rocdl.make_buffer_tensor(delta)
                 delta_row = fx.slice(delta_buf, (token, None))
-                delta_div = fx.logical_divide(delta_row, vector_layout)
+                delta_div = divide_row(delta_row)
 
             def issue_block_source(source_idx):
                 block_row = fx.slice(blocks_buf, (token, source_idx, None))
-                block_div = fx.logical_divide(block_row, vector_layout)
+                block_div = divide_row(block_row)
                 handles = []
                 for tile in range_constexpr(tiles_per_thread):
-                    handles.append(issue_bf16_vec(block_div, vector_index_for(tile)))
+                    handles.append(issue_bf16_vec(block_div, tile))
                 return handles
 
             def load_issued_source(handles):
@@ -468,29 +546,27 @@ def _build_attn_res(
             q_local = []
             prefix_local = []
             for tile in range_constexpr(tiles_per_thread):
-                vector_index = vector_index_for(tile)
-                gamma = load_bf16_vec(norm_weight_div, vector_index).to(fx.Float32)
-                weight = load_bf16_vec(qk_weight_div, vector_index).to(fx.Float32)
+                gamma = load_bf16_vec(norm_weight_div, tile).to(fx.Float32)
+                weight = load_bf16_vec(qk_weight_div, tile).to(fx.Float32)
                 q_local.append(gamma * weight)
-                prefix_value = load_bf16_vec(prefix_div, vector_index)
+                prefix_value = load_bf16_vec(prefix_div, tile)
                 if const_expr(has_delta):
-                    delta_value = load_bf16_vec(delta_div, vector_index).to(fx.Float32)
+                    delta_value = load_bf16_vec(delta_div, tile).to(fx.Float32)
                     prefix_value = (prefix_value.to(fx.Float32) + delta_value).to(
                         fx.BFloat16
                     )
-                    store_bf16_vec(prefix_value, prefix_div, vector_index)
+                    store_bf16_vec(prefix_value, prefix_div, tile)
                 prefix_local.append(prefix_value)
 
             if const_expr(write_block):
                 block_out_row = fx.slice(blocks_buf, (token, block_write_idx, None))
-                block_out_div = fx.logical_divide(block_out_row, vector_layout)
+                block_out_div = divide_row(block_out_row)
                 for tile in range_constexpr(tiles_per_thread):
-                    vector_index = vector_index_for(tile)
-                    store_bf16_vec(prefix_local[tile], block_out_div, vector_index)
+                    store_bf16_vec(prefix_local[tile], block_out_div, tile)
 
             mixed_local = [
-                fx.Vector.filled(_VEC_WIDTH, 0.0, fx.Float32)
-                for _ in range_constexpr(tiles_per_thread)
+                fx.Vector.filled(tile_widths[tile], 0.0, fx.Float32)
+                for tile in range_constexpr(tiles_per_thread)
             ]
             max_logit = neg_inf
             denominator = zero
@@ -569,14 +645,15 @@ def _build_attn_res(
                     group_local = []
                     for slot in range_constexpr(n_members):
                         src = start + slot
-                        if const_expr(src < num_blocks):
-                            if const_expr(src + prefetch_in_flight < num_blocks):
+                        if const_expr(src == prefix_slot):
+                            source_local = prefix_local
+                        else:
+                            block = src - first_block_slot
+                            if const_expr(block + prefetch_in_flight < num_blocks):
                                 in_flight.append(
-                                    issue_block_source(src + prefetch_in_flight)
+                                    issue_block_source(block + prefetch_in_flight)
                                 )
                             source_local = load_issued_source(in_flight.pop(0))
-                        else:
-                            source_local = prefix_local
                         store_source_partials(source_local, slot, buf)
                         group_local.append(source_local)
                     fx.gpu.barrier()
@@ -590,6 +667,8 @@ def _build_attn_res(
                             denominator,
                             mixed_local,
                         )
+                    if const_expr(wide_grid):
+                        pin_registers(mixed_local)
 
             if const_expr(apply_output_norm):
                 thread_sumsq = zero
@@ -606,22 +685,18 @@ def _build_attn_res(
                 )
 
                 output_norm_weight_buf = fx.rocdl.make_buffer_tensor(output_norm_weight)
-                output_norm_weight_div = fx.logical_divide(
-                    output_norm_weight_buf, vector_layout
-                )
+                output_norm_weight_div = divide_row(output_norm_weight_buf)
                 for tile in range_constexpr(tiles_per_thread):
-                    vector_index = vector_index_for(tile)
-                    output_gamma = load_bf16_vec(
-                        output_norm_weight_div, vector_index
-                    ).to(fx.Float32)
+                    output_gamma = load_bf16_vec(output_norm_weight_div, tile).to(
+                        fx.Float32
+                    )
                     result = (mixed_local[tile] * scale * output_gamma).to(fx.BFloat16)
-                    store_bf16_vec(result, out_div, vector_index)
+                    store_bf16_vec(result, out_div, tile)
             else:
                 inverse_denominator = 1.0 / denominator
                 for tile in range_constexpr(tiles_per_thread):
-                    vector_index = vector_index_for(tile)
                     result = (mixed_local[tile] * inverse_denominator).to(fx.BFloat16)
-                    store_bf16_vec(result, out_div, vector_index)
+                    store_bf16_vec(result, out_div, tile)
 
         if const_expr(rows_per_wg == 1):
             run_row()
@@ -723,11 +798,14 @@ def flydsl_attn_res(
     vector-copy layout rules. Each tensor must span less than 4 GiB, and
     ``stream`` must be on ``prefix.device``. Requires gfx942 or gfx950 (wave64)
     on the live GPU. ``D`` must be a positive multiple of ``_VEC_WIDTH`` with a
-    wave-aligned row size; D=7168 uses 448 threads and one row per workgroup,
-    while D=1024 defaults to one 64-thread row per workgroup. ``rows_per_wg=4``
-    packs four independent D=1024 rows into a 256-thread workgroup; packing is
-    rejected when ``row_threads * rows_per_wg`` exceeds ``_MAX_BLOCK_THREADS``,
-    and multi-wave rows reject any value other than 1.
+    wave-aligned row size; D=7168 uses one row per workgroup, with 448 threads
+    when ``T`` is at most the device's CU count. Above the CU count, a
+    multi-wave row uses 256 threads when D splits over 256 threads into 128-bit
+    tiles and at most one 64-bit tail; other rows keep their default width.
+    D=1024 defaults to one 64-thread row per workgroup. ``rows_per_wg=4`` packs four
+    independent D=1024 rows into a 256-thread workgroup; packing is rejected
+    when ``row_threads * rows_per_wg`` exceeds ``_MAX_BLOCK_THREADS``, and
+    multi-wave rows reject any value other than 1.
     """
     has_delta = delta is not None
     apply_output_norm = output_norm_weight is not None
@@ -815,6 +893,11 @@ def flydsl_attn_res(
 
     delta_arg = delta if has_delta else prefix
     output_norm_weight_arg = output_norm_weight if apply_output_norm else norm_weight
+    wide_grid = (
+        row_threads > _WARP_SIZE
+        and prefix.shape[0] > _num_cus(prefix.device)
+        and _wide_row_supported(hidden_size)
+    )
     with torch.cuda.device(prefix.device):
         launch_stream = (
             torch.cuda.current_stream(prefix.device) if stream is None else stream
@@ -832,6 +915,7 @@ def flydsl_attn_res(
             block_write_idx,
             apply_output_norm,
             rows_per_wg,
+            wide_grid,
         )
         _run_compiled(
             launcher,
