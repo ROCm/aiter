@@ -39,7 +39,7 @@
         "WARPS_N": 4,
         "USE_TDM": false
     },
-    "N_LEQ_3072.M_LEQ_512": {
+    "N_LEQ_3072.M_LEQ_8": {
         "BLOCK_M": 1,
         "WARPS_N": 16,
         "USE_TDM": false
@@ -49,15 +49,15 @@
         "WARPS_N": 4,
         "USE_TDM": true
     },
-    "N_LEQ_4096.M_LEQ_256": {
+    "N_LEQ_4096.M_LEQ_512": {
         "BLOCK_M": 1,
         "WARPS_N": 8,
         "USE_TDM": false
     },
     "N_LEQ_4096.M_LEQ_2048": {
         "BLOCK_M": 1,
-        "WARPS_N": 2,
-        "USE_TDM": false
+        "WARPS_N": 4,
+        "USE_TDM": true
     },
     "N_LEQ_4096": {
         "BLOCK_M": 1,
@@ -69,12 +69,22 @@
         "WARPS_N": 4,
         "USE_TDM": false
     },
+    "N_LEQ_8192.M_LEQ_512": {
+        "BLOCK_M": 1,
+        "WARPS_N": 2,
+        "USE_TDM": false
+    },
+    "N_LEQ_8192.M_LEQ_2048": {
+        "BLOCK_M": 1,
+        "WARPS_N": 4,
+        "USE_TDM": true
+    },
     "N_LEQ_8192": {
         "BLOCK_M": 1,
         "WARPS_N": 2,
         "USE_TDM": false
     },
-    "N_LEQ_16384.M_LEQ_256": {
+    "N_LEQ_16384.M_LEQ_128": {
         "BLOCK_M": 1,
         "WARPS_N": 32,
         "USE_TDM": false
@@ -83,11 +93,6 @@
         "BLOCK_M": 1,
         "WARPS_N": 4,
         "USE_TDM": true
-    },
-    "M_LEQ_256": {
-        "BLOCK_M": 1,
-        "WARPS_N": 32,
-        "USE_TDM": false
     },
     "any": {
         "BLOCK_M": 1,
