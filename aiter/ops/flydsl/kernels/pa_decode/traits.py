@@ -772,24 +772,77 @@ class Gfx1250Traits:
     compute_dtype: str = "fp8"
     direct_output: bool = False
     query_splits: int = 1
+    context_partition_size: int = 128
 
     WAVE = 32
     NWARP = 4
     BLOCK_THREADS = NWARP * WAVE
     FP8_MAX = 448.0
 
+    @staticmethod
+    def select_query_splits(
+        *,
+        head_dim,
+        query_group_size,
+        query_length,
+        kv_dtype,
+        block_size,
+        sliding_window,
+        num_seqs,
+        num_kv_heads,
+        num_compute_units,
+        work_capacity,
+        context_partition_size,
+        max_context_length=None,
+    ):
+        """Bound fused BF16 operands and account for short planned work."""
+        if kv_dtype != "bf16" or query_length == 1 or max_context_length == 0:
+            return 1
+        rows = query_length * query_group_size
+        max_m_tiles = (rows + 15) // 16
+        if head_dim >= 640:
+            max_m_tiles = 2
+        elif head_dim <= 128 and block_size == 128:
+            # Packed page128 retains Q and running outputs across all M tiles.
+            max_m_tiles = 4
+        task_bound = work_capacity
+        if max_context_length is not None:
+            tiles = -(-max_context_length // context_partition_size)
+            task_bound = min(task_bound, num_seqs * tiles)
+        if sliding_window > 0:
+            tiles = (
+                sliding_window + query_length - 2 + context_partition_size - 1
+            ) // context_partition_size + 1
+            task_bound = min(task_bound, num_seqs * tiles)
+        if head_dim >= 512 and 0 < 2 * task_bound * num_kv_heads <= num_compute_units:
+            # A short window or context leaves too few tasks to hide latency.
+            max_m_tiles = 1
+        selected = 1
+        for splits in (1, 2, 3, 4):
+            if query_length % splits:
+                continue
+            selected = splits
+            if (rows // splits + 15) // 16 <= max_m_tiles:
+                break
+        return selected
+
     @property
     def bf16_packed(self):
-        # Page16 gathers one vector-8 page per wave. Page128 keeps resident
-        # Q/accumulator registers bounded and two pages within LDS.
+        # Both V layouts stage vector-8 chunks in the same packed LDS order.
+        # Plain page128 reuses D64/D128 operands across two to four query tiles;
+        # other shapes retain padded staging to bound resident registers/LDS.
         return (
             self.bf16
-            and self.trans_v
             and self.head_dim in (64, 128, 256)
             and (
                 self.block_size == 16
                 or (
-                    self.block_size == 128 and (self.head_dim <= 128 or self.rows <= 32)
+                    self.block_size == 128
+                    and (self.head_dim <= 128 or self.rows <= 32)
+                    and (
+                        self.trans_v
+                        or (self.head_dim <= 128 and 2 <= self.m_tiles <= 4)
+                    )
                 )
             )
         )
@@ -851,7 +904,9 @@ class Gfx1250Traits:
         # The widest BF16 MTP tile fits by staging one query tile at a time.
         full = self.m_tiles * 16 * self.q_stride
         return (
-            1 if full + self.kv_stride + self.p_bytes + 576 > 327680 else self.m_tiles
+            1
+            if full + self.kv_stride + self.p_bytes + self.stats_bytes > 327680
+            else self.m_tiles
         )
 
     @property
@@ -920,7 +975,21 @@ class Gfx1250Traits:
 
     @property
     def p_bytes(self):
-        return 16 * self.v_stride
+        return self.p_tiles * 16 * self.v_stride
+
+    @property
+    def p_tiles(self):
+        return self.m_tiles if self.fp8_batched_softmax else 1
+
+    @property
+    def fp8_batched_softmax(self):
+        # Its masks omit sliding windows; async_page also excludes them today.
+        return (
+            self.fp8_multi_tile
+            and self.head_dim == 128
+            and self.async_page
+            and self.sliding_window == 0
+        )
 
     @property
     def async_page(self):
@@ -954,7 +1023,10 @@ class Gfx1250Traits:
                 else 1
             )
         return (
-            2 if self.q_bytes + 2 * self.kv_stride + self.p_bytes + 576 <= 327680 else 1
+            2
+            if self.q_bytes + 2 * self.kv_stride + self.p_bytes + self.stats_bytes
+            <= 327680
+            else 1
         )
 
     @property
@@ -966,8 +1038,13 @@ class Gfx1250Traits:
         return self.p_offset + self.p_bytes
 
     @property
+    def stats_bytes(self):
+        # Each P tile exchanges FP32 maxima and sums for 16 rows x 4 waves.
+        return self.p_tiles * 512 + 64
+
+    @property
     def total_bytes(self):
-        return self.stats_offset + 576
+        return self.stats_offset + self.stats_bytes
 
     @property
     def use_tdm(self):
