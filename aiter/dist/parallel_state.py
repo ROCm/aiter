@@ -827,9 +827,12 @@ class GroupCoordinator:
         emit_bf16: bool = False,
         transpose_scale: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "per_group"/"mxfp4") from the public API and the mxfp4 helper.
+        if hadamard_rotate and quant_type != "mxfp4":
+            raise ValueError("hadamard_rotate is MXFP4-only")
         if quant_type == "per_token" and group_size == 128:
             # Both paths go through torch.library-registered ops so they lower
             # into the compiled graph (Dynamo-traceable + CUDAGraph-capturable).
@@ -867,6 +870,7 @@ class GroupCoordinator:
             emit_bf16=emit_bf16,
             transpose_scale=transpose_scale,
             gemma_norm=gemma_norm,
+            hadamard_rotate=hadamard_rotate,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -965,6 +969,7 @@ class GroupCoordinator:
         prefill_support: bool = False,
         emit_bf16: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         return self.fused_allreduce_rmsnorm_quant(
             input_,
@@ -975,6 +980,7 @@ class GroupCoordinator:
             quant_type="mxfp4",
             emit_bf16=emit_bf16,
             gemma_norm=gemma_norm,
+            hadamard_rotate=hadamard_rotate,
         )
 
     def _fused_allreduce_rmsnorm_out_place(
