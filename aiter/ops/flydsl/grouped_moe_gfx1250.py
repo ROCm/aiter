@@ -605,6 +605,18 @@ def get_wmma_m_rep(
     return tile_m // m_warp // wmma_m
 
 
+def _fit_tile_n(n: int, tile_n: int, n_warp: int) -> tuple[int, int]:
+    """Halve ``tile_n`` (and ``n_warp`` while its wave tile stays >= 64) until
+    it divides ``n``."""
+    while n % tile_n and tile_n > 64:
+        tile_n //= 2
+        if tile_n // n_warp < 64 and n_warp > 1:
+            n_warp //= 2
+    if n % tile_n:
+        raise ValueError(f"[grouped-moe] no N tile divides N={n}")
+    return tile_n, n_warp
+
+
 def _grouped_a8w4_tdm_moe(
     hidden_states,
     w1,
@@ -649,6 +661,8 @@ def _grouped_a8w4_tdm_moe(
     a_preshuffle=0,
     persistent_workers=0,
     persistent_workers2=0,
+    split_k1=1,
+    split_k2=1,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -723,6 +737,11 @@ def _grouped_a8w4_tdm_moe(
                     f"[grouped-moe compact] tiles {tile_m}/{tile_m2} do not divide "
                     f"the compact plan's row alignment {_plan_align}"
                 )
+    # The B loads do not clamp N, so a partial last N tile would read the next
+    # expert's rows (and fault past the last one). Narrow such a tile, e.g. the
+    # 256-wide default at inter_dim=576 (N=1152), to one that divides N.
+    tile_n, n_warp = _fit_tile_n(2 * inter_dim, tile_n, n_warp)
+    tile_n2, n_warp2 = _fit_tile_n(model_dim, tile_n2, n_warp2)
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
@@ -735,8 +754,18 @@ def _grouped_a8w4_tdm_moe(
             f"divide their max ({_align_m}); otherwise a GEMM tile straddles "
             "two experts and silently computes against the wrong weights"
         )
+    # Empty experts take no rows, so at most min(E, routes) experts pad their
+    # tail: a decode batch launches a few M tiles instead of one per expert.
+    _routes = token_num * topk
     contiguous_m = max(
-        _align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m)
+        _align_m,
+        _tdm_align_up(
+            min(
+                _routes + E * _align_m - topk,
+                _routes + min(E, _routes) * (_align_m - 1),
+            ),
+            _align_m,
+        ),
     )
     max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
     if _compact:
@@ -1148,7 +1177,10 @@ def _grouped_a8w4_tdm_moe(
         # Pre-allocate MX payload + preshuffled e8m0 scale for gemm1 output.
         # These are written directly by the kernel's fused quant epilogue.
         payload_bytes = inter_dim // 2 if _is_fp4 else inter_dim
-        scale_bytes = inter_dim // 32  # one e8m0 byte per 32-element MX block
+        # One e8m0 byte per 32-element MX block, laid out per whole k128 (four
+        # blocks), so a half-k128 tail (inter_dim % 128 == 64) keeps a padded
+        # dword that gemm1 fills with a finite scale.
+        scale_bytes = (inter_dim + 127) // 128 * 4
         a2_payload = torch.empty(
             (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
         )
@@ -1195,6 +1227,7 @@ def _grouped_a8w4_tdm_moe(
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
+            split_k=split_k1,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1235,6 +1268,7 @@ def _grouped_a8w4_tdm_moe(
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
+            split_k=split_k1,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1285,6 +1319,7 @@ def _grouped_a8w4_tdm_moe(
         tdm_b_th=tdm_b_th,
         lds_soa_load_interleave=lds_soa_load_interleave,
         rolled_drain=rolled_drain,
+        split_k=split_k2,
         **_ep_gemm2_kwargs,
     )
 
@@ -1372,6 +1407,7 @@ def _grouped_a8w4_tdm_moe(
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
+                        split_k=split_k1,
                         **_situ_kw,
                     ),
                 )
@@ -1414,6 +1450,7 @@ def _grouped_a8w4_tdm_moe(
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
+                        split_k=split_k1,
                         **_situ_kw,
                     ),
                 )
@@ -1453,6 +1490,7 @@ def _grouped_a8w4_tdm_moe(
                     tdm_b_th=tdm_b_th,
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
+                    split_k=split_k2,
                 ),
             )
         )
@@ -1761,6 +1799,8 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
+            _tdm_kw["split_k1"] = _as_int(cfg_row.get("split_k1"), 1)
+            _tdm_kw["split_k2"] = _as_int(cfg_row.get("split_k2"), 1)
             # Follow the matched CSV bucket, including padded token counts
             # (for example, 6144 -> 8192), just like the other kernel knobs.
             _tdm_kw["a_preshuffle"] = _as_int(cfg_row.get("a_preshuffle"), 0)
