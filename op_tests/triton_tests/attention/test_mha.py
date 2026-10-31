@@ -122,6 +122,199 @@ def _test_mha_impl(
             assert sd_mask.shape == (BATCH, NUM_Q_HEADS, SEQLEN_Q, SEQLEN_K)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 192, 256])
+@pytest.mark.parametrize("causal", [False, True])
+def test_mha_gluon_rescale_transitions(dtype, head_dim, causal):
+    """Check deferred rescaling when later tiles repeatedly raise the row max."""
+    skip_if_gluon_unsupported("gluon")
+    torch.manual_seed(24)
+    q = torch.randn((1, 513, 8, head_dim), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1537, 2, head_dim), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    q[..., 0] = 1
+    # Tile plateaus cover both skipped corrections and threshold crossings.
+    steps = torch.arange(k.shape[1], device=k.device) // 256
+    k[..., 0] += (steps * 6 * head_dim**0.5)[None, :, None]
+    expected, _, expected_lse = attention_ref(
+        q.float(), k.float(), v.float(), causal=causal
+    )
+    for _ in range(3):
+        actual, lse = flash_attn_func(
+            q, k, v, causal=causal, return_lse=True, backend="gluon"
+        )
+        torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            lse, expected_lse, atol=0.15 if dtype == torch.bfloat16 else 0.01, rtol=1e-2
+        )
+
+
+@pytest.mark.parametrize("head_dim", [32, 53, 63, 64, 112, 128, 192, 256])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("window", [(-1, -1), (128, 0)])
+def test_mha_gluon_fp32(head_dim, causal, window):
+    """Check native FP32 math, unaligned heads, and the benchmark window mode."""
+    skip_if_gluon_unsupported("gluon")
+    torch.manual_seed(25)
+    q = torch.randn((1, 129, 4, head_dim), device="cuda")
+    k = torch.randn((1, 577, 2, head_dim), device="cuda")
+    v = torch.randn_like(k)
+    expected, _, expected_lse = attention_ref(
+        q, k, v, causal=causal, window_size=window
+    )
+    actual, lse = flash_attn_func(
+        q, k, v, causal=causal, window_size=window, return_lse=True, backend="gluon"
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("head_dim", [53, 63, 96, 112, 192, 256])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("window", [(-1, -1), (128, 0)])
+def test_mha_gluon_fp8_padded_heads(head_dim, causal, window):
+    """Check FP8 probability bounds and tails outside the tutorial's head size."""
+    skip_if_gluon_unsupported("gluon")
+    torch.manual_seed(26)
+    q = torch.randn((1, 257, 4, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2053, 2, head_dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q[..., 0] = 1
+    steps = torch.arange(k.shape[1], device=k.device) // 256
+    k[..., 0] += (steps * 4 * head_dim**0.5)[None, :, None]
+    fp8 = get_fp8_e4m3_dtype()
+    q8, dq = quantize_fp8_per_bh(q, fp8)
+    k8, dk = quantize_fp8_per_bh(k, fp8)
+    v8, dv = quantize_fp8_per_bh(v, fp8)
+    expected, _, expected_lse = attention_ref(
+        q8.float() * dq[:, None, :, None],
+        k8.float() * dk[:, None, :, None],
+        v8.float() * dv[:, None, :, None],
+        causal=causal,
+        window_size=window,
+    )
+    actual, lse = flash_attn_func(
+        q8,
+        k8,
+        v8,
+        q_descale=dq,
+        k_descale=dk,
+        v_descale=dv,
+        causal=causal,
+        window_size=window,
+        return_lse=True,
+        backend="gluon",
+    )
+    torch.testing.assert_close(actual, expected, atol=0.06, rtol=0.06)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("head_dim", [53, 128])
+@pytest.mark.parametrize("window", [(-1, -1), (128, 0)])
+def test_mha_gluon_varlen_dtypes(dtype, head_dim, window):
+    """Check packed ragged batches, including fully masked causal rows."""
+    skip_if_gluon_unsupported("gluon")
+    torch.manual_seed(28)
+    q_lengths, k_lengths = [129, 65, 257], [577, 193, 129]
+    qs = [torch.randn((n, 4, head_dim), device="cuda", dtype=dtype) for n in q_lengths]
+    ks = [torch.randn((n, 2, head_dim), device="cuda", dtype=dtype) for n in k_lengths]
+    vs = [torch.randn_like(k) for k in ks]
+    cu_q = torch.tensor([0] + q_lengths, device="cuda", dtype=torch.int32).cumsum(
+        0, dtype=torch.int32
+    )
+    cu_k = torch.tensor([0] + k_lengths, device="cuda", dtype=torch.int32).cumsum(
+        0, dtype=torch.int32
+    )
+    actual, lse = flash_attn_varlen_func(
+        torch.cat(qs),
+        torch.cat(ks),
+        torch.cat(vs),
+        cu_q,
+        cu_k,
+        max(q_lengths),
+        max(k_lengths),
+        causal=True,
+        window_size=window,
+        return_lse=True,
+        backend="gluon",
+    )
+    start = 0
+    tol = 2e-5 if dtype == torch.float32 else 0.003
+    for q, k, v in zip(qs, ks, vs):
+        expected, _, expected_lse = attention_ref(
+            q[None].float(),
+            k[None].float(),
+            v[None].float(),
+            causal=True,
+            window_size=window,
+        )
+        stop = start + q.shape[0]
+        torch.testing.assert_close(
+            actual[start:stop].float(), expected[0], atol=tol, rtol=tol
+        )
+        expected_lse = expected_lse[0].T
+        finite = torch.isfinite(expected_lse)
+        torch.testing.assert_close(
+            lse[start:stop][finite], expected_lse[finite], atol=tol, rtol=tol
+        )
+        start = stop
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("causal", [False, True])
+def test_mha_gluon_zero_window(dtype, causal):
+    """A zero-width window attends to the aligned key only."""
+    skip_if_gluon_unsupported("gluon")
+    torch.manual_seed(27)
+    q = torch.randn((2, 257, 4, 64), device="cuda", dtype=dtype)
+    k = torch.randn((2, 129, 2, 64), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    expected, _, expected_lse = attention_ref(
+        q.float(), k.float(), v.float(), causal=causal, window_size=(0, 0)
+    )
+    actual, lse = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        window_size=(0, 0),
+        return_lse=True,
+        backend="gluon",
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=1e-5, rtol=1e-5)
+    finite = torch.isfinite(expected_lse)
+    torch.testing.assert_close(lse[finite], expected_lse[finite], atol=0.015, rtol=0.01)
+
+
+@pytest.mark.parametrize(
+    "q_range,k_range,scale", [(1e-5, 30000.0, 0.125), (60000.0, 1e-4, 2.0)]
+)
+def test_mha_gluon_fp16_scale_range(q_range, k_range, scale):
+    """Scaling Q must keep finite FP16 inputs finite and retain small values."""
+    skip_if_gluon_unsupported("gluon")
+    torch.manual_seed(34)
+    q = (
+        (torch.randn((1, 129, 4, 63), device="cuda") * q_range)
+        .clamp(-65000, 65000)
+        .half()
+    )
+    k = (
+        (torch.randn((1, 1025, 2, 63), device="cuda") * k_range)
+        .clamp(-65000, 65000)
+        .half()
+    )
+    v = torch.randn_like(k)
+    expected, _, expected_lse = attention_ref(
+        q.float() * (scale * q.shape[-1] ** 0.5), k.float(), v.float()
+    )
+    actual, lse = flash_attn_func(
+        q, k, v, softmax_scale=scale, return_lse=True, backend="gluon"
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=0.003, rtol=0.003)
+    torch.testing.assert_close(lse, expected_lse, atol=0.01, rtol=0.003)
+
+
 @pytest.mark.parametrize("BATCH", [1, 30, 50])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
