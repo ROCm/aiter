@@ -806,7 +806,9 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 # is COMPILED, which for a prebuilt wheel is the build tree's aiter_meta/ (a
 # directory setup.py deletes when it is done). Only an import-time value knows
 # where the files ended up after install. The C++ loader prefers this env var
-# over the macro, so an explicit user override still wins.
+# over the macro. The CO loader resolves the current HIP device's ASIC Revision:
+# A0 uses this root's gfx1250-a0 directory, B0+ uses gfx1250. A direct profile
+# override is accepted only when the ELF processor matches the detected stepping.
 OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
 os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
 
@@ -1404,6 +1406,10 @@ def build_module(
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+        # Starting with ROCm 10.1 (HIP 7.16), LLVM won't inline across differing target features,
+        # as in CK-tile's target("no-packed-fp32-ops") kentry. This flag restores the inlining.
+        if hip_version >= Version("7.16"):
+            flags_hip += ["-mllvm -ignore-tti-inline-compatible=true"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
         # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +

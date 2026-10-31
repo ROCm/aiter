@@ -179,11 +179,27 @@ def device_cu_count(device_index: int) -> int:
         return 256
 
 
-def _build_kernel():
+def _build_kernel(ctx_stride: int):
+    # ctx_stride is a build-time constant: 1 for a [B] context_lens (the
+    # pre-2D kernel and name), n for a (B, n) table (its own build and name).
     kernel_name = (
         "fp8_paged_mqa_logits_gfx950_H32_D128_bkv64_kvb64_"
         "nn8_w8_lds2_mfma16_ntg2l_flydsl"
     )
+    if ctx_stride != 1:
+        kernel_name += f"_cs{ctx_stride}"
+
+    # Chosen at build time, outside the kernel body: request b's length is
+    # element b of a [B], or the last entry of row b of a (B, ctx_stride) table.
+    if ctx_stride == 1:
+
+        def _context_len_index(pid_batch):
+            return pid_batch
+
+    else:
+
+        def _context_len_index(pid_batch):
+            return pid_batch * ctx_stride + (ctx_stride - 1)
 
     @fx.struct
     class SharedStorage:
@@ -228,7 +244,7 @@ def _build_kernel():
 
         ragged_nn = _imin(fx.Int32(nn_t[pid_batch]), rows_per_batch)
         nn = (has_next_n_lens != 0).select(ragged_nn, rows_per_batch)
-        context_len = fx.Int32(context_t[pid_batch])
+        context_len = fx.Int32(context_t[_context_len_index(pid_batch)])
         page_count = uceildiv(context_len, fx.Int32(KV_BLOCK_SIZE))
         pages_per_split = uceildiv(page_count, split_kv)
         page_lo = pid_split * pages_per_split
@@ -467,9 +483,9 @@ def _build_kernel():
     return launch
 
 
-@lru_cache(maxsize=1)
-def _compile():
-    return _build_kernel()
+@lru_cache(maxsize=MAX_NN)
+def _compile(ctx_stride: int = 1):
+    return _build_kernel(ctx_stride)
 
 
 def flydsl_fp8_paged_mqa_logits(
@@ -492,6 +508,19 @@ def flydsl_fp8_paged_mqa_logits(
 
     ``next_n`` may be 1..8. The compiled kernel reserves LDS for eight rows;
     ``next_n_lens`` optionally selects fewer live rows per sequence.
+
+    ``context_lens``: int32, contiguous, on ``q_fp8``'s device. Either
+
+    - ``[B]``: the full length ``L_b`` of request ``b``, including its ``next_n``
+      query tokens, or
+    - ``(B, next_n)``: row ``b`` is ``[L_b - next_n + 1, ..., L_b]``, the layout
+      vLLM builds. Only the last column is read: query row ``j`` attends to KV
+      positions ``[0, L_b - n_b + 1 + j)``, where ``n_b`` is the number of live
+      rows (``min(next_n_lens[b], next_n)`` when ``next_n_lens`` is given, else
+      ``next_n``), so other row values are not supported.
+
+    ``(B, 1)`` is the same as ``[B]``. Anything else raises ``ValueError``; a
+    strided tensor is rejected rather than copied.
     """
     if get_gfx() != _GFX950:
         raise RuntimeError(f"gfx950 kernel requested on {get_gfx()}")
@@ -524,12 +553,32 @@ def flydsl_fp8_paged_mqa_logits(
     if out_logits.shape[0] != batch_size * next_n:
         raise ValueError(f"out_logits first dimension must be {batch_size * next_n}")
 
-    context_lens = context_lens.reshape(batch_size)
+    # The kernel reads request b's length at b * ctx_stride + ctx_stride - 1.
+    # A strided input is rejected rather than copied: a hidden copy allocates on
+    # every call, and the kernel would otherwise read it as dense.
+    if context_lens.dtype != torch.int32 or context_lens.device != q_fp8.device:
+        raise ValueError(
+            "context_lens must be int32 on the same device as q_fp8, got "
+            f"{context_lens.dtype} on {context_lens.device}"
+        )
+    if (
+        context_lens.dim() not in (1, 2)
+        or not context_lens.is_contiguous()
+        or context_lens.shape[0] != batch_size
+        or (context_lens.dim() == 2 and context_lens.shape[1] not in (1, next_n))
+    ):
+        raise ValueError(
+            f"context_lens must be a contiguous [B] or [B, n] with B={batch_size}, "
+            f"n in (1, next_n={next_n}), got shape {tuple(context_lens.shape)} "
+            f"with strides {context_lens.stride()}"
+        )
+    ctx_stride = context_lens.shape[1] if context_lens.dim() == 2 else 1
+    context_lens = context_lens.reshape(-1)
     max_block_len = kv_indices.shape[-1]
     kv_indices = kv_indices.reshape(batch_size, max_block_len)
     has_next_n_lens = next_n_lens is not None
     if next_n_lens is None:
-        next_n_lens = context_lens
+        next_n_lens = context_lens[:batch_size]
     next_n_lens = next_n_lens.reshape(batch_size)
     if next_n_lens.dtype != torch.int32 or next_n_lens.device != q_fp8.device:
         raise ValueError("next_n_lens must be int32 on the same device as q_fp8")
@@ -555,7 +604,7 @@ def flydsl_fp8_paged_mqa_logits(
         split_kv = max(1, int(SplitKV))
 
     grid_blocks = batch_size * split_kv
-    launcher = _compile()
+    launcher = _compile(int(ctx_stride))
     launcher.compile_hints = dict(DEFAULT_COMPILE_HINTS)
     stream = stream or torch.cuda.current_stream(q_fp8.device)
     with torch.cuda.device(q_fp8.device.index):

@@ -43,7 +43,14 @@ from aiter.test_common import checkAllclose, run_perftest
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import WORLD, mxfp4_scale_shape
+from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+    DEFAULT_ATOMS,
+    WIDE_ATOMS,
+    WORLD,
+    max_payload_bytes,
+    mxfp4_scale_shape,
+    tile_atoms_for,
+)
 from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
 
 try:
@@ -52,6 +59,15 @@ except (KeyError, RuntimeError):
     ARCH = None
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 EPS = 1e-6
+
+
+def test_signed_soffset_payload_boundary():
+    assert max_payload_bytes(DEFAULT_ATOMS) == 1 << 31
+    assert max_payload_bytes(WIDE_ATOMS) == 2_147_450_880
+    assert 174_760 * 6144 * 2 == max_payload_bytes(WIDE_ATOMS)
+    assert 174_761 * 6144 * 2 > max_payload_bytes(WIDE_ATOMS)
+
+
 SQNR_MIN_DB = 18.0
 # vs unfused FlyDSL: differs only by bf16 rounding of the reduced sum.
 TIGHT_RTOL = 2e-2
@@ -73,6 +89,15 @@ _VALIDITY_CASES = [
     (4096, 8192, False, False),
     (4096, 8192, True, True),
     (16384, 8192, False, False),
+]
+# Hidden 6144 runs on the 48 KiB tile, which splits across TP 2 and 4 only.
+_WIDE_CASES = [
+    (1, 6144, True, False),
+    (37, 6144, True, True),
+    (37, 6144, False, False),
+    (512, 6144, True, False),
+    (4096, 6144, True, True),
+    (16384, 6144, False, False),
 ]
 
 
@@ -153,13 +178,35 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
     fly = QuickAllReduceInt4(
         group=gloo, device=device, rank=rank, world_size=tp, grid_cap=grid_cap
     )
+    wide_atoms = tile_atoms_for(6144, tp)
+    if wide_atoms is not None and wide_atoms != DEFAULT_ATOMS:
+        is_capturing = torch.cuda.is_current_stream_capturing
+        try:
+            torch.cuda.is_current_stream_capturing = lambda: True
+            assert not fly.supports_rmsnorm(6144, 6144 * 2)
+        finally:
+            torch.cuda.is_current_stream_capturing = is_capturing
+        fly.prepare_rmsnorm(6144)
+        try:
+            torch.cuda.is_current_stream_capturing = lambda: True
+            assert fly.supports_rmsnorm(6144, 6144 * 2)
+        finally:
+            torch.cuda.is_current_stream_capturing = is_capturing
     rows = []
     # compile_rmsnorm must cover every fused build the cases pick: a case that
     # adds one to the cache compiled it on its first call.
     for hidden, gemma_norm in sorted({(c[1], c[2]) for c in cases}):
         for mxfp4 in (False, True) if fly.supports_mxfp4 else (False,):
             fly.compile_rmsnorm(hidden, EPS, gemma_norm=gemma_norm, mxfp4=mxfp4)
-    warmed = [set(e._norm_launch) for e in fly._by_st.values()]
+
+    def _norm_launch_sets():
+        return [
+            set(e._norm_launch)
+            for engines in [fly._by_st, *fly._by_atoms.values()]
+            for e in engines.values()
+        ]
+
+    warmed = _norm_launch_sets()
     try:
         for ntok, hidden, gemma_norm, inplace in cases:
             gen = torch.Generator().manual_seed(1234 + rank)
@@ -279,7 +326,7 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
                     )
             rows.append(row)
             dist.barrier(group=group)
-        if [set(e._norm_launch) for e in fly._by_st.values()] != warmed:
+        if _norm_launch_sets() != warmed:
             raise AssertionError("a case compiled a fused build compile_rmsnorm missed")
     finally:
         fly.close()
@@ -344,21 +391,34 @@ def main():
         help="tokens,hidden pairs to time (fused vs unfused).",
     )
     args = parser.parse_args()
-    if torch.cuda.device_count() < args.tp:
-        aiter.logger.warning("need %s GPUs; skipping", args.tp)
-        return
+    n_gpu = torch.cuda.device_count()
 
-    ranks = _spawn(args.tp, _VALIDITY_CASES, time_it=False, grid_cap=args.grid_cap)
-    _assert_valid(ranks, _VALIDITY_CASES)
-    aiter.logger.info(
-        "validity (rank 0):\n%s", pd.DataFrame(ranks[0]).to_markdown(index=False)
-    )
+    wide_hidden = _WIDE_CASES[0][1]
+    for tp in (WORLD, 4, 2):
+        if n_gpu < tp:
+            aiter.logger.warning(
+                "QuickAllReduceInt4 needs %s GPUs, have %s; skipping validity tp=%s",
+                tp,
+                n_gpu,
+                tp,
+            )
+            continue
+        cases = list(_VALIDITY_CASES)
+        if tile_atoms_for(wide_hidden, tp) is not None:
+            cases += _WIDE_CASES
+        ranks = _spawn(tp, cases, time_it=False, grid_cap=args.grid_cap)
+        _assert_valid(ranks, cases)
+        aiter.logger.info(
+            "validity tp=%s (rank 0):\n%s",
+            tp,
+            pd.DataFrame(ranks[0]).to_markdown(index=False),
+        )
 
     bench = []
     for pair in args.bench:
         t, h = (int(x) for x in pair.split(","))
         bench.append((t, h, False, False))
-    if bench:
+    if bench and n_gpu >= args.tp:
         ranks = _spawn(args.tp, bench, time_it=True, grid_cap=args.grid_cap)
         _assert_valid(ranks, bench)
         has_mxfp4 = ARCH == "gfx950"

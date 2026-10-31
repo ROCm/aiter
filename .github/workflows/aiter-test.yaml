@@ -486,6 +486,7 @@ jobs:
     needs: [detect_aiter_test_scope, check-signal, build_aiter_wheels]
     outputs:
       shard_count: 8
+      standard_matrix: ${{ steps.standard_matrix.outputs.matrix }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -494,6 +495,31 @@ jobs:
 
       - name: Split Aiter Tests (8 shards)
         run: ./.github/scripts/split_tests.sh --shards 8 --test-type aiter
+
+      - name: Build standard test matrix
+        id: standard_matrix
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          runners = [("linux-aiter-mi35x-1", "MI35X")]
+          if os.environ["GITHUB_REF"] == "refs/heads/main":
+              runners.append(("linux-aiter-oci-mi300x-1", "MI300X"))
+
+          matrix = [
+              {
+                  "runner": runner,
+                  "label": label,
+                  "shard_total": 8,
+                  "shard_idx": shard_idx,
+              }
+              for runner, label in runners
+              for shard_idx in range(8)
+          ]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              print(f"matrix={json.dumps(matrix, separators=(',', ':'))}", file=f)
+          PY
 
       - name: Upload test shard lists as artifact
         uses: actions/upload-artifact@v4
@@ -595,71 +621,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 0
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 1
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 2
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 3
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 4
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 5
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 6
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 7
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 0
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 1
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 2
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 3
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 4
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 5
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 6
-          - runner: linux-aiter-oci-mi300x-1
-            label: MI300X
-            shard_total: 8
-            shard_idx: 7
+        include: ${{ fromJSON(needs.split_aiter_tests.outputs.standard_matrix) }}
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -1022,8 +984,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           missing=0
+          runners=(linux-aiter-mi35x-1)
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            runners+=(linux-aiter-oci-mi300x-1)
+          fi
+
           for shard in {0..7}; do
-            for runner in {linux-aiter-mi35x-1,linux-aiter-oci-mi300x-1}; do
+            for runner in "${runners[@]}"; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "::warning::Test report for ${runner} shard ${shard} not found."
                 echo "- Missing log: ${runner} shard ${shard}" >> "$GITHUB_STEP_SUMMARY"
@@ -1208,7 +1175,19 @@ jobs:
             pip install tabulate
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
+            # nightly: amd-mori 1.2.4 lacks mori #751 (grpc-free import) and #786 (SDMA bitcode)
+            pip install 'amd-mori-nightly==1.2.5.dev20261025'
+            pip show amd-mori-nightly
           "
+
+      - name: Mori smoke test
+        timeout-minutes: 30
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "set -o pipefail; timeout 25m python3 op_tests/multigpu_tests/test_mori_smoke.py 2>&1 | tee -a latest_test.log"
 
       - name: Sync prebuilt kernels into source tree
         run: |

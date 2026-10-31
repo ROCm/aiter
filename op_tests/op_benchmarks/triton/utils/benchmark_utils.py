@@ -401,22 +401,51 @@ def generate_rotating_buffers_pool(
     out_vals_keys: Sequence[Sequence[str]],
     target_mb: int,
     min_pool_len: int,
+    max_pool_len: int | None = None,
     print_info: bool = False,
 ):
     per_set_bytes = 0
+    seen_storage_ptrs = set()
+    # Keep every generator's output alive for the whole sizing loop below: once
+    # a kwargs dict is dropped, its tensors' storages can be freed and the
+    # caching allocator can hand the same address to a later gen's unrelated
+    # tensor, which would then look like an already-counted alias and get
+    # skipped. Release these extra references once sizing is done, before
+    # building the real pool.
+    keepalive = []
     for gen, fields in zip(gens, out_vals_keys):
         kwargs = run_input_generator(gen, fields)
-        per_set_bytes += sum(
-            v.numel() * v.element_size()
-            for v in kwargs.values()
-            if isinstance(v, torch.Tensor)
-        )
+        keepalive.append(kwargs)
+        for v in kwargs.values():
+            if not isinstance(v, torch.Tensor):
+                continue
+            storage = v.untyped_storage()
+            ptr = storage.data_ptr()
+            # Aliased views (e.g. a reshape of another returned tensor) share
+            # backing storage; count it once, by its real size, not once per
+            # view, or pool sizing undercounts/overcounts the true footprint.
+            if ptr in seen_storage_ptrs:
+                continue
+            seen_storage_ptrs.add(ptr)
+            per_set_bytes += storage.nbytes()
+    del keepalive
+
     if per_set_bytes == 0:
         raise ValueError(
             "per_set_bytes=0, specify gens that generate tensors with size > 0"
         )
 
+    del kwargs, v, storage
+
     pool_len = max(min_pool_len, math.ceil(target_mb * 1024 * 1024 / per_set_bytes))
+
+    # max_pool_len is needed in case the size of input set is small, then covering
+    # target_mb might create pool_len in order of millions. This will require
+    # do_bench_aiter_triton to capture one kernel launch per pool entry i.e. a long
+    # graph capture. So, we need to bound this.
+    if max_pool_len is not None:
+        pool_len = min(pool_len, max(max_pool_len, min_pool_len))
+
     pool = []
     for _ in range(pool_len):
         entry = {}

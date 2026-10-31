@@ -13,6 +13,7 @@ from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -59,7 +60,9 @@ def allocate_output(
         )  # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
+    # Keep split-K partials in fp32 for the reduction.
+    matmul_dtype = torch.float32 if split_k > 1 else out_dtype
+    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=matmul_dtype)
     if scatter_indx is not None or split_k > 1:
         final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
     else:
@@ -67,7 +70,7 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None):
+def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None, fnuz_mx=False):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -76,6 +79,31 @@ def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None):
     arch = get_arch()
 
     split_k = 1
+
+    tuned = (
+        get_moe_dispatch("A8W8", arch, "triton").get(f"bm{block_m}_n{n}_k{k}")
+        if fnuz_mx
+        else None
+    )
+    if tuned is not None:
+        assert tuned["BLOCK_SIZE_K"] in (32, 64, 128), (
+            f"bm{block_m}_n{n}_k{k}: fnuz MXFP8 needs BLOCK_SIZE_K of 32/64/128, "
+            f"got {tuned['BLOCK_SIZE_K']}"
+        )
+        return {
+            "block_m": block_m,
+            "block_n": tuned["BLOCK_SIZE_N"],
+            "block_k": tuned["BLOCK_SIZE_K"],
+            "num_warps": tuned["num_warps"],
+            "num_stages": tuned["num_stages"],
+            "group_m": group_m,
+            "xcd_swizzle": xcd_swizzle,
+            "w_cache_modifier": w_cache_modifier,
+            "split_k": tuned.get("NUM_KSPLIT", 1),
+            "waves_per_eu": tuned.get("waves_per_eu", 0),
+            "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
+            "kpack": tuned.get("kpack", 1),
+        }
     if block_m == 16:
         block_n = 64
         block_k = 256
@@ -101,6 +129,14 @@ def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None):
                 block_n = 128
             elif block_m == 64:
                 num_warps = 4
+    if fnuz_mx:
+        # gfx942 MXFP8 runs one FP8 dot per 32-wide scale slice, for BLOCK_K up
+        # to 128. Use the widest tile that divides K. Short K stays at 32: there
+        # are too few K steps to hide the extra per-slice dots.
+        if k <= 256:
+            block_k = 32
+        else:
+            block_k = next((b for b in (128, 64, 32) if k % b == 0), 32)
     num_stages = pick_gemm_num_stages(
         arch, block_m, block_n, block_k, 8, 8, use_async_padding=True
     )
@@ -181,6 +217,13 @@ def moe_gemm_a8w8(
             f"w_expt_scale must have one entry per expert "
             f"({w.shape[0]}), got {w_expt_scale.numel()}"
         )
+    use_fnuz = x.dtype == torch.float8_e4m3fnuz
+    assert not (
+        use_fnuz and quant_static_scale is not None
+    ), "fused FP8 output quant writes OCP e4m3fn and is not supported for fnuz"
+    assert use_fnuz == (
+        w.dtype == torch.float8_e4m3fnuz
+    ), f"x and w must both be fnuz or both be OCP fp8, got {x.dtype} / {w.dtype}"
     w_has_mx = w_scales is not None
     if w_has_mx:
         assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
@@ -211,7 +254,20 @@ def moe_gemm_a8w8(
     if unpadded_K and block_m == 16:
         K = unpadded_K
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data, swizzle_mx_scale)
+    config = get_kernel_config(
+        M,
+        N,
+        K,
+        routing_data,
+        swizzle_mx_scale,
+        fnuz_mx=use_fnuz and (x_has_mx or w_has_mx),
+    )
+    if apply_swiglu and gammas is not None and config["split_k"] > 1:
+        # Gammas are applied per partial, before the swiglu in the reduction.
+        config["split_k"] = 1
+    # Split-K slices are not tail-masked.
+    while config["split_k"] > 1 and K % (config["block_k"] * config["split_k"]):
+        config["split_k"] //= 2
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -307,6 +363,7 @@ def moe_gemm_a8w8(
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
         UPCAST_INDICES=should_upcast_indices(x, w, y),
+        USE_FNUZ=use_fnuz,
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         kpack=config["kpack"],

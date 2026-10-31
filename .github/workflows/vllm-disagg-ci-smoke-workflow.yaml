@@ -20,17 +20,22 @@ on:
         type: string
         default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       image:
-        description: "Official vLLM ROCm image (default: the v0.29.0 release tag)"
+        description: "vLLM ROCm image (default: the nightly tag, pinned to its digest for the whole run)"
         required: false
         type: string
-        default: "vllm/vllm-openai-rocm:v0.29.0"
+        default: "vllm/vllm-openai-rocm:nightly"
+      vllm_ref:
+        description: "vLLM branch, tag or SHA for the .buildkite/amd-disagg harness and case list (empty = VLLM_BASELINE_SHA)"
+        required: false
+        type: string
+        default: ""
       models:
         description: "Comma-separated MODEL_NAME filter for a quick subset run (empty = all models)"
         required: false
         type: string
         default: ""
       topologies:
-        description: "Comma-separated topology filter, e.g. 2P1D-TP8 (empty = all topologies)"
+        description: "Comma-separated topology filter, e.g. 2P1D-TP8,2P2D-EP16 (empty = all topologies)"
         required: false
         type: string
         default: ""
@@ -44,14 +49,16 @@ permissions:
 
 env:
   VLLM_REPOSITORY_URL: https://github.com/vllm-project/vllm.git
-  # vLLM v0.29.0. The harness under .buildkite/amd-disagg is taken from this
-  # tree, so it must stay in step with BASE_IMAGE below.
-  VLLM_BASELINE_SHA: 98dff2a81d747d1dba01a47f939f48c3526d4206
-  # The v0.29.0 release tag, which currently resolves to
-  # sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1.
-  # Release tags are not expected to move; pass a digest via the `image` input
-  # if a run needs to be pinned exactly.
-  BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm:v0.29.0' }}
+  # vLLM main as of 2026-10-27. The harness under .buildkite/amd-disagg and the
+  # case list are taken from this tree and run against the nightly image below,
+  # so bump it when the nightly moves past a harness change. A non-empty
+  # vllm_ref input overrides it for a single run.
+  VLLM_BASELINE_SHA: 7fe793a5d5b75a30386e0e182708da6fc5487954
+  VLLM_REF_INPUT: ${{ inputs.vllm_ref || '' }}
+  # :nightly moves daily. build_aiter_wheel pins it to a digest that the wheel
+  # build and every case then use, so a nightly published mid-run cannot mix two
+  # images. Pass a digest via the image input to rerun an exact image.
+  BASE_IMAGE: ${{ inputs.image || 'vllm/vllm-openai-rocm:nightly' }}
   # vllm/vllm-router publishes no release tags, only nightlies, so this tracks
   # nightly rather than pinning a digest that no tag points at any more. As of
   # 2026-09-16 it resolves to
@@ -60,6 +67,12 @@ env:
   VLLM_ROUTER_IMAGE: vllm/vllm-router:nightly
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
   SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
+  # Every case shares SPUR_NODE_POOL, so 3- and 4-node cases queue behind each
+  # other in Spur. Allow up to 3 h queued instead of the harness's 30-minute
+  # default. SLURM_TIME_LIMIT is both the job walltime and the harness poller's
+  # deadline from submission, so it has to cover the wait plus the run.
+  PENDING_MAX_S: "10800"
+  SLURM_TIME_LIMIT: "06:00:00"
   # Optional workflow_dispatch filters for a quick subset run. Empty on PR and
   # cron events, which always exercise the full matrix.
   CASE_MODEL_FILTER: ${{ inputs.models || '' }}
@@ -84,6 +97,8 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'ci:vllm-di'))
     needs: ci_config
     runs-on: build-only-aiter
+    outputs:
+      image_ref: ${{ steps.base_image.outputs.image_ref }}
     steps:
       - name: Checkout AITER
         uses: actions/checkout@v4
@@ -113,10 +128,46 @@ jobs:
           echo "Docker login failed after 3 attempts, continuing anyway"
           exit 0
 
-      - name: Build AITER wheel in the vLLM nightly image
+      - name: Pin the vLLM image to a digest
+        id: base_image
         run: |
           set -euo pipefail
           bash .github/scripts/docker_pull_with_retry.sh "${BASE_IMAGE}"
+          if [[ "${BASE_IMAGE}" == *@sha256:* ]]; then
+            image_ref="${BASE_IMAGE}"
+          else
+            repo="${BASE_IMAGE}"
+            # Strip a trailing :tag, but not a registry :port.
+            if [[ "${repo##*/}" == *:* ]]; then
+              repo="${repo%:*}"
+            fi
+            image_ref="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${BASE_IMAGE}" \
+              | grep -m1 -F "${repo}@sha256:" || true)"
+          fi
+          if [[ -z "${image_ref}" ]]; then
+            echo "Could not resolve a digest for ${BASE_IMAGE}" >&2
+            exit 1
+          fi
+          vllm_version="$(docker run --rm --entrypoint python3 "${image_ref}" \
+            -c 'from importlib.metadata import version; print(version("vllm"))')"
+          echo "Pinned ${BASE_IMAGE} to ${image_ref} (vllm ${vllm_version})"
+          {
+            echo "image_ref=${image_ref}"
+            echo "vllm_version=${vllm_version}"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "### vLLM image"
+            echo
+            echo "- Requested: \`${BASE_IMAGE}\`"
+            echo "- Pinned: \`${image_ref}\`"
+            echo "- vllm: \`${vllm_version}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Build AITER wheel in the vLLM nightly image
+        env:
+          BASE_IMAGE: ${{ steps.base_image.outputs.image_ref }}
+        run: |
+          set -euo pipefail
           docker run --rm \
             --network=host \
             -v "${GITHUB_WORKSPACE}:/workspace" \
@@ -189,17 +240,33 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
+      vllm_sha: ${{ steps.vllm_ref.outputs.sha }}
     steps:
-      - name: Checkout the pinned vLLM baseline
+      - name: Resolve the vLLM harness commit
+        id: vllm_ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ref="${VLLM_REF_INPUT:-${VLLM_BASELINE_SHA}}"
+          # Every matrix job checks out this exact SHA, so a branch or tag input
+          # cannot move between them.
+          sha="$(gh api "repos/vllm-project/vllm/commits/${ref}" --jq .sha)"
+          echo "vLLM harness: ${ref} -> ${sha}"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout the vLLM harness
         uses: actions/checkout@v4
         with:
           repository: vllm-project/vllm
-          ref: ${{ env.VLLM_BASELINE_SHA }}
+          ref: ${{ steps.vllm_ref.outputs.sha }}
           fetch-depth: 1
           path: vllm
 
       - name: Select vLLM-router cases
         id: select
+        env:
+          VLLM_SHA: ${{ steps.vllm_ref.outputs.sha }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -210,42 +277,59 @@ jobs:
           from pathlib import Path
 
           pipeline = Path("vllm/.buildkite/amd-disagg/pipeline-disagg.yaml")
+          # Node count per P/D shape, and (topology suffix, WIDE_EP_MODE) per
+          # parallelism, as they appear in the upstream step labels.
+          shape_nodes = {"1P1D": 2, "2P1D": 3, "2P2D": 4}
+          parallel_modes = {
+              "TP8": ("TP8", "0"),
+              "EP8/DP8": ("EP8", "1"),
+              "EP16/DP16": ("EP16", "1"),
+          }
+          required = {"1P1D-TP8", "2P1D-TP8", "2P2D-TP8", "1P1D-EP8", "2P2D-EP16"}
+          label_re = re.compile(r"-PD-(\d+P\d+D)-([A-Z]+\d+(?:/DP\d+)?)-")
           cases = []
-          label = None
+          skipped = []
+          pending = None  # vLLM-router label still waiting for its command line
 
           for line in pipeline.read_text(encoding="utf-8").splitlines():
               label_match = re.match(r'\s*-\s+label:\s+["\'](.+)["\']\s*$', line)
               if label_match:
+                  if pending:
+                      raise SystemExit(f"No command found for {pending!r} in {pipeline}")
                   label = label_match.group(1)
+                  pending = label if label.endswith("-vllm-router") else None
                   continue
 
               command_match = re.match(
                   r"\s*-\s+((?:IMAGE=\S+\s+)?MODEL_NAME=.*run-slurm-disagg-test\.sh)\s*$",
                   line,
               )
-              if not command_match or not label or not label.endswith("-vllm-router"):
+              if not command_match or not pending:
                   continue
+              label, pending = pending, None
 
-              command = command_match.group(1)
-              # The historical pipeline used the mutable :nightly tag inline.
-              # Replace only that token with the immutable pinned image.
-              command = re.sub(
-                  r"^IMAGE=\S+",
-                  f"IMAGE={os.environ['BASE_IMAGE']}",
-                  command,
-                  count=1,
-              )
-              model_match = re.search(r"(?:^|\s)MODEL_NAME=([^\s]+)", command)
-              nodes_match = re.search(r"(?:^|\s)NODES=([0-9]+)", command)
-              if not model_match or not nodes_match:
+              topology_match = label_re.search(label)
+              shape, parallel = topology_match.groups() if topology_match else (None, None)
+              if shape not in shape_nodes or parallel not in parallel_modes:
+                  skipped.append(label)
                   continue
-              model = model_match.group(1)
+              suffix, wide_ep = parallel_modes[parallel]
+              topology = f"{shape}-{suffix}"
 
-              topology_match = re.search(r"-PD-(1P1D|2P1D|2P2D)-TP8-", label)
-              if topology_match is None:
-                  continue
+              # The run step passes the pinned image as IMAGE, so an inline
+              # IMAGE= would override it.
+              command = re.sub(r"^IMAGE=\S+\s+", "", command_match.group(1))
+              fields = dict(re.findall(r"(?:^|\s)([A-Za-z_]+)=(\S+)", command))
+              model = fields.get("MODEL_NAME")
+              nodes = fields.get("NODES", "")
+              if not model or not nodes.isdigit():
+                  raise SystemExit(f"{label!r}: no MODEL_NAME/NODES in {command!r}")
+              if int(nodes) != shape_nodes[shape] or fields.get("WIDE_EP_MODE", "0") != wide_ep:
+                  raise SystemExit(
+                      f"{label!r}: NODES={nodes} WIDE_EP_MODE={fields.get('WIDE_EP_MODE')} "
+                      f"do not match {topology}"
+                  )
 
-              topology = f"{topology_match.group(1)}-TP8"
               slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{model}-{topology}")
               cases.append(
                   {
@@ -254,17 +338,22 @@ jobs:
                       "command": command,
                       "model_name": model,
                       "topology": topology,
-                      "nodes": int(nodes_match.group(1)),
+                      "nodes": int(nodes),
                   }
               )
+          if pending:
+              raise SystemExit(f"No command found for {pending!r} in {pipeline}")
 
-          # Upstream ships only 1P1D and 2P2D. Derive the 2P1D shape from each
-          # 2P2D case so the coverage lives here rather than waiting on a vLLM
-          # pipeline change; the harness patches #SBATCH --nodes at submit time,
-          # so a 3-node topology needs nothing extra from the job script.
+          # Upstream ships TP8 only as 1P1D and 2P2D. Derive the 2P1D shape from
+          # each 2P2D TP8 case so the coverage lives here rather than waiting on a
+          # vLLM pipeline change; the harness patches #SBATCH --nodes at submit
+          # time, so a 3-node topology needs nothing extra from the job script.
+          existing = {(case["model_name"], case["topology"]) for case in cases}
           derived = []
           for case in cases:
               if case["topology"] != "2P2D-TP8":
+                  continue
+              if (case["model_name"], "2P1D-TP8") in existing:
                   continue
               command, subs = re.subn(
                   r"(?<=\s)yD=2 NODES=4(?=\s)", "yD=1 NODES=3", case["command"]
@@ -294,13 +383,16 @@ jobs:
               )
           cases.extend(derived)
 
-          selected = {(case["model_name"], case["topology"]) for case in cases}
+          keys = Counter((case["model_name"], case["topology"]) for case in cases)
+          duplicates = sorted(key for key, count in keys.items() if count > 1)
+          if duplicates:
+              raise SystemExit(f"Duplicate vLLM-router cases in {pipeline}: {duplicates}")
           per_topology = Counter(case["topology"] for case in cases)
-          expected = {"1P1D-TP8": 5, "2P1D-TP8": 5, "2P2D-TP8": 5}
-          if len(selected) != len(cases) or per_topology != Counter(expected):
+          missing = sorted(required - set(per_topology))
+          if missing:
               raise SystemExit(
-                  f"Expected {expected} unique vLLM-router cases from {pipeline}; "
-                  f"got {dict(per_topology)} with {len(selected)} unique keys"
+                  f"No vLLM-router cases for {missing} in {pipeline}; "
+                  f"got {dict(per_topology)}"
               )
 
           # workflow_dispatch may narrow the matrix for a quick subset run. PR and
@@ -349,6 +441,19 @@ jobs:
                       f"Selected all {len(cases)} vLLM-router accuracy cases.\n",
                       file=output,
                   )
+              print(f"vLLM harness `{os.environ['VLLM_SHA']}`.\n", file=output)
+              selected_per_topology = Counter(case["topology"] for case in cases)
+              print("| Topology | Cases |", file=output)
+              print("|---|---:|", file=output)
+              for topology, count in sorted(selected_per_topology.items()):
+                  print(f"| `{topology}` | {count} |", file=output)
+              print(file=output)
+              if skipped:
+                  print(
+                      "Skipped upstream vLLM-router steps with an unrecognized "
+                      f"topology: {', '.join(f'`{label}`' for label in skipped)}\n",
+                      file=output,
+                  )
               print("| Case | Nodes | Upstream command |", file=output)
               print("|---|---:|---|", file=output)
               for case in cases:
@@ -373,6 +478,8 @@ jobs:
       max-parallel: 6
       matrix: ${{ fromJSON(needs.select_vllm_cases.outputs.matrix) }}
     env:
+      BASE_IMAGE: ${{ needs.build_aiter_wheel.outputs.image_ref }}
+      VLLM_SHA: ${{ needs.select_vllm_cases.outputs.vllm_sha }}
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
       UPSTREAM_CASE_COMMAND: ${{ matrix.command }}
       CASE_NAME: ${{ matrix.case_name }}
@@ -400,18 +507,16 @@ jobs:
           command -v sacct || true
           command -v spur && spur --help | head -120 || true
 
-      - name: Checkout the pinned vLLM baseline
+      - name: Checkout the vLLM harness
         run: |
           set -euo pipefail
           rm -rf vllm
           git init vllm
           cd vllm
           git remote add origin "${VLLM_REPOSITORY_URL}"
-          git fetch --depth=1 origin "${VLLM_BASELINE_SHA}"
+          git fetch --depth=1 origin "${VLLM_SHA}"
           git checkout --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = "${VLLM_BASELINE_SHA}"
-          echo "VLLM_BASE_SHA=${VLLM_BASELINE_SHA}" >> "${GITHUB_ENV}"
-          echo "VLLM_TEST_SHA=${VLLM_BASELINE_SHA}" >> "${GITHUB_ENV}"
+          test "$(git rev-parse HEAD)" = "${VLLM_SHA}"
 
       - name: Add offline AITER wheel overlay to the upstream case
         run: |
@@ -518,9 +623,8 @@ jobs:
             echo "### vLLM disagg smoke input"
             echo
             echo "- vLLM repository: \`${VLLM_REPOSITORY_URL}\`"
-            echo "- vLLM Buildkite baseline SHA: \`${VLLM_BASE_SHA}\`"
+            echo "- vLLM harness SHA: \`${VLLM_SHA}\`"
             echo "- AITER gfx950 + FlyDSL wheel overlay: \`PREBUILD_KERNELS=0 + targeted CKTile prebuild (offline, no compute-node pip)\`"
-            echo "- Tested tree SHA: \`${VLLM_TEST_SHA}\`"
             echo "- AITER SHA: \`${GITHUB_SHA}\`"
             echo "- Upstream case: \`${CASE_NAME}\`"
             echo "- Upstream command: \`${UPSTREAM_CASE_COMMAND}\`"
@@ -528,6 +632,7 @@ jobs:
             echo "- VLLM_ROUTER_IMAGE: \`${VLLM_ROUTER_IMAGE}\`"
             echo "- SPUR_NODE_POOL: \`${SPUR_NODE_POOL}\`"
             echo "- SPUR_NODE_EXCLUDE: \`${SPUR_NODE_EXCLUDE}\`"
+            echo "- PENDING_MAX_S / SLURM_TIME_LIMIT: \`${PENDING_MAX_S}\` / \`${SLURM_TIME_LIMIT}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Run upstream vLLM disagg case
@@ -558,7 +663,7 @@ jobs:
           rm -f "${submit_log}" "${sacct_log}"
 
           cd "${GITHUB_WORKSPACE}/vllm"
-          echo "Running pinned vLLM baseline case: ${CASE_NAME}"
+          echo "Running vLLM case at ${VLLM_SHA}: ${CASE_NAME}"
           echo "${UPSTREAM_CASE_COMMAND}"
 
           stream_disagg_logs() {
@@ -652,9 +757,11 @@ jobs:
 
           set +e
           env \
-            BUILDKITE_COMMIT="${VLLM_BASELINE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}" \
+            BUILDKITE_COMMIT="${VLLM_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}" \
             IMAGE="${BASE_IMAGE}" \
             VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
+            PENDING_MAX_S="${PENDING_MAX_S}" \
+            SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             LOG_ROOT="${log_root}" \
             CLUSTER_ENV_IN="/vllm-workspace/.buildkite/amd-disagg/aiter_cluster_env.sh" \
