@@ -6,6 +6,7 @@
 Reports the public API, its preallocated-output path, and an FP32 eager reference.
 """
 
+import functools
 import sys
 
 import torch
@@ -13,10 +14,14 @@ import triton
 
 from aiter.ops.triton.fusions.activation import silu_and_mul_backward
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -41,32 +46,57 @@ def _torch_reference(grad_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor
     return torch.cat((grad_gate, grad_up), dim=-1).to(x.dtype)
 
 
-def _benchmark(rows: int, width: int, provider: str, metric: str, args):
-    dtype = _DTYPES[args.dtype]
+def _generate_pool_entry(dtype, rows, width):
     x = torch.randn((rows, 2 * width), dtype=dtype, device="cuda")
     grad_output = torch.randn((rows, width), dtype=dtype, device=x.device)
-    if provider == "aiter-preallocated":
-        out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    return x, grad_output, out
 
-        def fn():
-            return silu_and_mul_backward(grad_output, x, out=out)
+
+_POOL_FIELDS = ["x", "grad_output", "out"]
+
+
+def _make_kernel_fn(provider):
+    if provider == "aiter-preallocated":
+
+        def kernel_fn(x, grad_output, out, **_):
+            silu_and_mul_backward(grad_output, x, out=out)
 
     elif provider == "aiter":
 
-        def fn():
-            return silu_and_mul_backward(grad_output, x)
+        def kernel_fn(x, grad_output, **_):
+            silu_and_mul_backward(grad_output, x)
 
     else:
 
-        def fn():
-            return _torch_reference(grad_output, x)
+        def kernel_fn(x, grad_output, **_):
+            _torch_reference(grad_output, x)
 
-    ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+    return kernel_fn
+
+
+def _benchmark(
+    rows: int,
+    width: int,
+    provider: str,
+    metric: str,
+    args,
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+):
+    dtype = _DTYPES[args.dtype]
+    pool_gen = functools.partial(_generate_pool_entry, dtype, rows, width)
+    rot_bufs = generate_rotating_buffers_pool(
+        [pool_gen], [_POOL_FIELDS], **kwargs_rot_bufs
+    )
+    kernel_fn = _make_kernel_fn(provider)
+
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
     if metric == "time":
         return ms * 1000
     if metric == "bandwidth":
         # Three logical input reads and two gradient writes per gate/up pair.
-        logical_bytes = 5 * rows * width * x.element_size()
+        logical_bytes = 5 * rows * width * rot_bufs[0]["x"].element_size()
         return logical_bytes / (ms * 1e-3) * 1e-9
     raise ValueError(f"unknown metric: {metric}")
 
@@ -76,6 +106,8 @@ def run_benchmark(args):
     widths = (args.width,) if args.width is not None else _WIDTHS
     providers = _PROVIDERS if args.provider == "all" else (args.provider,)
     lines = [f"{provider}_{args.metric}" for provider in providers]
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     benchmark = triton.testing.Benchmark(
         x_names=["rows", "width"],
@@ -96,7 +128,9 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_fn(rows, width, provider_metric):
         provider, metric = provider_metric.rsplit("_", 1)
-        return _benchmark(rows, width, provider, metric, args)
+        return _benchmark(
+            rows, width, provider, metric, args, kwargs_rot_bufs, kwargs_do_bench_graph
+        )
 
     bench_fn.run(save_path="." if args.output else None, print_data=True)
 
@@ -110,8 +144,20 @@ def parse_args():
     override_parser_action(
         parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=25,
+        help="Unused: do_bench_aiter_triton's warmup is controlled by "
+        "--graph-warmup-iters. Kept for CLI compatibility.",
+    )
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=100,
+        help="Unused: do_bench_aiter_triton's replay count is a fixed "
+        "constant, not an adaptive rep target. Kept for CLI compatibility.",
+    )
     parser.add_argument("--print-vgpr", action="store_true")
     parser.add_argument("-o", "--output", action="store_true")
     return parser.parse_args()

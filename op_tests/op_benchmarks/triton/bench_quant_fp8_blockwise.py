@@ -10,6 +10,7 @@ One provider per kernel:
   segment_m  -> quant_fp8_blockwise_segment_m_kernel
 """
 
+import functools
 import math
 
 import torch
@@ -23,10 +24,16 @@ from aiter.ops.triton.quant.quant_fp8_blockwise import (
     requant_fp8_row_to_col,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 _BS = 128
 
@@ -41,10 +48,40 @@ def _segment_indptrs(M, nseg, device):
     return seg, sseg
 
 
+def _generate_blockwise_pool_inputs(M, N):
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    return (x,)
+
+
+def _generate_weight_pool_inputs(M, N):
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    w = x.unsqueeze(0)  # [1, M, N]
+    return (w,)
+
+
+def _generate_act_grad_pool_inputs(M, N):
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    return (x,)
+
+
+def _generate_requant_pool_inputs(M, N):
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    x_row, s_row = quant_fp8_blockwise(x, block_size=_BS, axis=1)
+    return x_row, s_row
+
+
+def _generate_segment_m_pool_inputs(M, N):
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    seg, sseg = _segment_indptrs(M, nseg=4, device=x.device)
+    return x, seg, sseg
+
+
 def benchmark(args):
     x_vals = [(m, n) for m in [4096, 8192] for n in [4096, 7168, 8192]]
     unit = "ms" if args.metric == "time" else "GB/s"
     providers = ["blockwise", "weight", "act_grad", "requant", "segment_m"]
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     config = triton.testing.Benchmark(
         x_names=["M", "N"],
@@ -66,26 +103,49 @@ def benchmark(args):
 
     @triton.testing.perf_report([config])
     def _run(M, N, provider):
-        x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
         if provider == "blockwise":
-            fn = lambda: quant_fp8_blockwise(x, block_size=_BS, axis=1)
-        elif provider == "weight":
-            w = x.unsqueeze(0)  # [1, M, N]
-            fn = lambda: quant_fp8_blockwise_for_weight(w, block_size=_BS)
-        elif provider == "act_grad":
-            fn = lambda: quant_fp8_blockwise_for_act_grad(x, block_size=_BS)
-        elif provider == "requant":
-            x_row, s_row = quant_fp8_blockwise(x, block_size=_BS, axis=1)
-            fn = lambda: requant_fp8_row_to_col(x_row, s_row, block_size=_BS)
-        else:  # segment_m
-            seg, sseg = _segment_indptrs(M, nseg=4, device=x.device)
-            fn = lambda: quant_fp8_blockwise_segment_m(x, 4, seg, sseg, block_size=_BS)
+            _p_gen = functools.partial(_generate_blockwise_pool_inputs, M, N)
+            _out_val_keys = ["x"]
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+            def kernel_fn(x):
+                quant_fp8_blockwise(x, block_size=_BS, axis=1)
+
+        elif provider == "weight":
+            _p_gen = functools.partial(_generate_weight_pool_inputs, M, N)
+            _out_val_keys = ["w"]
+
+            def kernel_fn(w):
+                quant_fp8_blockwise_for_weight(w, block_size=_BS)
+
+        elif provider == "act_grad":
+            _p_gen = functools.partial(_generate_act_grad_pool_inputs, M, N)
+            _out_val_keys = ["x"]
+
+            def kernel_fn(x):
+                quant_fp8_blockwise_for_act_grad(x, block_size=_BS)
+
+        elif provider == "requant":
+            _p_gen = functools.partial(_generate_requant_pool_inputs, M, N)
+            _out_val_keys = ["x_row", "s_row"]
+
+            def kernel_fn(x_row, s_row):
+                requant_fp8_row_to_col(x_row, s_row, block_size=_BS)
+
+        else:  # segment_m
+            _p_gen = functools.partial(_generate_segment_m_pool_inputs, M, N)
+            _out_val_keys = ["x", "seg", "sseg"]
+
+            def kernel_fn(x, seg, sseg):
+                quant_fp8_blockwise_segment_m(x, 4, seg, sseg, block_size=_BS)
+
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+        )
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         if args.metric == "time":
             return ms
         # Per-provider bytes moved (hp=2, fp8=1, scale fp32=4), incl. scales.
-        hp, fp8, f32 = x.element_size(), 1, 4
+        hp, fp8, f32 = torch.bfloat16.itemsize, 1, 4
         nb, mb = math.ceil(N / _BS), math.ceil(M / _BS)
         if provider == "blockwise":
             b = M * N * hp + M * N * fp8 + M * nb * f32

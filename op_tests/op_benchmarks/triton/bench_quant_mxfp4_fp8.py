@@ -8,13 +8,16 @@ import torch
 import triton
 
 from aiter.ops.triton.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
-from aiter.test_common import run_perftest
 from aiter.utility.fp4_utils import dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_configs,
 )
@@ -83,6 +86,27 @@ def parse_shape_args(args) -> list[tuple[str, int, int]]:
     return [("default", M, N) for M, N in shapes]
 
 
+def _generate_quant_pool_entry(dtype, M, N):
+    return (torch.randn((M, N), dtype=dtype, device="cuda"),)
+
+
+_QUANT_POOL_FIELDS = ["x"]
+
+
+def _make_quant_kernel_fn(quant_fn, use_sr):
+    if use_sr:
+
+        def kernel_fn(x, **_):
+            quant_fn(x, use_sr=True, philox_seed=1234)
+
+    else:
+
+        def kernel_fn(x, **_):
+            quant_fn(x)
+
+    return kernel_fn
+
+
 def run_benchmark(args):
     if args.shape is not None and args.model is not None:
         raise ValueError("Use either --shape or --model, not both")
@@ -102,6 +126,9 @@ def run_benchmark(args):
         ylabel = "Bandwidth (GB/s)"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
+
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     colors = ["green", "blue", "red", "orange", "purple"]
     benchmark = triton.testing.Benchmark(
@@ -124,18 +151,18 @@ def run_benchmark(args):
     ):
         fmt, provider = provider.split("-", 1)
         dtype = get_dtype(dtype)
-        x = torch.randn((M, N), dtype=dtype, device="cuda")
         quant_fn = get_provider(fmt, provider)
 
-        # run_perftest rotates input copies beyond L2 size and times device kernels only.
-        if use_sr:
-            _, us = run_perftest(quant_fn, x, use_sr=True, philox_seed=1234)
-        else:
-            _, us = run_perftest(quant_fn, x)
-        ms = us * 1e-3
+        pool_gen = partial(_generate_quant_pool_entry, dtype, M, N)
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_QUANT_POOL_FIELDS], **kwargs_rot_bufs
+        )
+        kernel_fn = _make_quant_kernel_fn(quant_fn, use_sr)
+
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
         # Read x and write quantized output + block scales.
-        x_bytes = x.numel() * x.element_size()
+        x_bytes = M * N * rot_bufs[0]["x"].element_size()
         x_quant_bytes = M * (N // 2) if fmt == "mxfp4" else M * N
         x_scale_bytes = M * ((N + 31) // 32)
         total_bytes = x_bytes + x_quant_bytes + x_scale_bytes
