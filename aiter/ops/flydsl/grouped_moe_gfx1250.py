@@ -658,6 +658,7 @@ def _grouped_a8w4_tdm_moe(
     a1_scale=None,
     herd_topk=0,
     herd_routed_scaling_factor=1.0,
+    output=None,
 ):
     import functools
 
@@ -1462,7 +1463,11 @@ def _grouped_a8w4_tdm_moe(
         # MegaMoE ignores its contents and consumes comb_inp instead.
         return torch.empty((token_num, model_dim), dtype=dtype, device=device)
 
-    moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
+    moe_out = (
+        torch.empty((token_num, model_dim), dtype=dtype, device=device)
+        if output is None
+        else output
+    )
     if _is_ep:
         # Route kernel already produced gather weights (dropped routes zeroed);
         # the dead-tail (tokens >= total_recv) is skipped via num_valid_tokens, and
@@ -1519,6 +1524,7 @@ def grouped_gemm_gfx1250_a8w4(
     a1_scale: torch.Tensor | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    output: torch.Tensor | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1528,7 +1534,8 @@ def grouped_gemm_gfx1250_a8w4(
     gate/up) weights is not detected and yields wrong results.
 
     Returns ``None`` when the shape/dtype/arch is not served here, so the caller
-    can fall back to the generic MoE.
+    can fall back to the generic MoE. ``output``, a [token_num, model_dim]
+    buffer, receives the result in place of a fresh tensor.
     """
 
     # Read once per call (still honours a runtime change of the variable): when
@@ -1850,6 +1857,7 @@ def grouped_gemm_gfx1250_a8w4(
             a1_scale=a1_scale,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
+            output=output,
             **_tdm_kw,
         )
 
