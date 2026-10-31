@@ -177,6 +177,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
     rolled_drain=0,
+    m_align=0,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -231,6 +232,10 @@ def flydsl_grouped_gemm_a8w4_masked(
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
+    if m_align:
+        # A tile skipped for starting in an expert's padding never reaches the
+        # M-cluster barrier its peers wait in; cluster_m only buys B multicast.
+        cluster_m = 1
     stage = 1 if stage1_act else 2
     persistent_workers = int(
         os.environ.get(
@@ -311,6 +316,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_workers,
         rolled_drain,
         int(a_preshuffled),
+        int(m_align),
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,

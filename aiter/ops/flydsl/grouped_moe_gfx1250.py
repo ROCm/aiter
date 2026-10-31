@@ -274,6 +274,71 @@ def _find_grouped_config(
     return chosen
 
 
+@functools.lru_cache(maxsize=1024)
+def _widest_grouped_tile(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    quant_type,
+    ep_fused: bool = False,
+) -> int | None:
+    """Largest ``max(tile_m, tile_m2)`` tuned for this shape, any token bucket.
+
+    The compact arena is allocated once, but a step looks its tile up from its
+    own recv-token bucket. Those tiles are not monotonic, and the full-arena
+    bucket often has no row of its own; sizing the arena from that miss (the
+    tile_m=64 default) then clamps every larger tuned tile down to 64.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    keys = {
+        "gfx": str(get_gfx()),
+        "cu_num": str(get_cu_num()),
+        "model_dim": str(int(model_dim)),
+        "inter_dim": str(int(inter_dim)),
+        "expert": str(int(experts)),
+        "topk": str(int(topk)),
+        "act_type": _enum_name(activation),
+        "dtype": _dtype_name(dtype),
+        "q_dtype_a": str(q_dtype_a),
+        "q_dtype_w": str(q_dtype_w),
+        "q_type": _enum_name(quant_type),
+        "ep_fused": "1" if ep_fused else "0",
+    }
+
+    def _cell(row, k):
+        value = str(row.get(k) or "").strip()
+        return "" if value.lower() in ("nan", "none") else value
+
+    def _matches(row, *, require_cu_num: bool):
+        for k, v in keys.items():
+            if k == "cu_num" and not require_cu_num:
+                continue
+            cell = _cell(row, k)
+            if cell and cell != v:
+                return False
+        return True
+
+    rows = _load_grouped_config_rows()
+    matches = [row for row in rows if _matches(row, require_cu_num=True)]
+    if not matches:
+        matches = [row for row in rows if _matches(row, require_cu_num=False)]
+    widest = 0
+    for row in matches:
+        for column in ("tile_m", "tile_m2"):
+            try:
+                widest = max(widest, int(float(_cell(row, column) or 0)))
+            except ValueError:
+                continue
+    return widest or None
+
+
 def _use_grouped_gemm_enabled() -> bool:
     env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
     is_gfx1250 = get_gfx() == "gfx1250"
@@ -700,6 +765,7 @@ def _grouped_a8w4_tdm_moe(
         m_warp2 = m_warp
     if n_warp2 is None:
         n_warp2 = n_warp
+    _gemm2_m_align = 0
     if cluster_n2 is None:
         # The two stages want different cluster widths: gemm1 gains from the
         # multicast of its shared A operand, while gemm2 loses more than it
@@ -714,10 +780,12 @@ def _grouped_a8w4_tdm_moe(
         _plan_align = int(getattr(_compact_ctx, "compact_align_m", 0) or 0)
         if _plan_align:
             tile_m = min(int(tile_m), _plan_align)
+            tile_m2 = min(int(tile_m2), _plan_align)
             # psum holds each expert's unpadded end, so a gemm2 tile narrower
-            # than the alignment can start in an expert's padding, map to the
-            # next expert, and scatter stale ep_rowmap rows into live slots.
-            tile_m2 = _plan_align
+            # than the alignment can start in an expert's padding; gemm2 must
+            # skip those or it scatters stale ep_rowmap rows into live slots.
+            if tile_m2 < _plan_align:
+                _gemm2_m_align = _plan_align
             if _plan_align % tile_m or _plan_align % tile_m2:
                 raise ValueError(
                     f"[grouped-moe compact] tiles {tile_m}/{tile_m2} do not divide "
@@ -968,6 +1036,8 @@ def _grouped_a8w4_tdm_moe(
         if enable_ep_scatter
         else {}
     )
+    if _gemm2_m_align:
+        _ep_gemm2_kwargs["m_align"] = _gemm2_m_align
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
     two_inter = 2 * inter_dim
@@ -1011,6 +1081,14 @@ def _grouped_a8w4_tdm_moe(
         torch.uint8,
         dtypes.fp4x2,
     )
+    _row_gather = _compact and bool(getattr(_compact_ctx, "compact_row_gather", False))
+    if _row_gather and not _prequantized:
+        raise ValueError(
+            "[grouped-moe compact] dispatch shipped token-major rows for GEMM1 "
+            "to scatter, but only a prequantized A can be scattered; got "
+            f"{hidden_states.dtype} with a1_scale="
+            f"{None if src_a1_scale is None else src_a1_scale.dtype}"
+        )
     if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
         assert hidden_states.dtype == dtype, (
@@ -1080,6 +1158,21 @@ def _grouped_a8w4_tdm_moe(
     if _compact and _prequantized:
         a1_payload = hidden_states[:contiguous_m].reshape(1, contiguous_m, _src_width)
         a1_scale = src_a1_scale
+        if _row_gather:
+            # The wire carries one deduplicated payload per token/peer. Scatter
+            # it once into final expert-row order so GEMM1 remains a contiguous
+            # TDM load instead of repeating indexed gathers for every K tile.
+            a1_payload, a1_scale = flydsl_moe_scatter_copy_compact(
+                a1_payload,
+                a1_scale,
+                stage2_scatter.compact_ep_rowmap,
+                wire_row_stride=int(stage2_scatter.compact_wire_row_stride),
+                topk=int(topk),
+                masked_m=stage2_scatter.compact_masked_m,
+                psum=stage2_scatter.compact_psum,
+            )
+            _row_gather = False
+            _a1_wire_stride = 0
     elif _fuse_ep_route_quant:
         route_ws = route_fused_workspace(E, device)
         (
@@ -2354,6 +2447,145 @@ def flydsl_moe_scatter_copy_token(
         )
 
     return grouped_a1, a1_scale_raw
+
+
+@functools.cache
+def _get_compiled_compact_scatter_copy(row_bytes: int):
+    """Compile the compact-wire row scatter once per copied row width."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_compact_module,
+    )
+
+    return build_moe_scatter_copy_compact_module(row_bytes)
+
+
+@functools.cache
+def _get_compiled_compact_scatter_copy_pair(payload_bytes: int, scale_bytes: int):
+    """Compile the paired payload + scale compact scatter once per shape."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_compact_pair_module,
+    )
+
+    return build_moe_scatter_copy_compact_pair_module(payload_bytes, scale_bytes)
+
+
+def flydsl_moe_scatter_copy_compact(
+    a1_payload: torch.Tensor,
+    a1_scale: torch.Tensor | None,
+    ep_rowmap: torch.Tensor,
+    *,
+    wire_row_stride: int,
+    topk: int,
+    grouped_payload: torch.Tensor | None = None,
+    grouped_scale: torch.Tensor | None = None,
+    masked_m: torch.Tensor | None = None,
+    psum: torch.Tensor | None = None,
+):
+    """Materialize compact token-major wire rows in expert-contiguous order.
+
+    Compact dispatch keeps one payload per source token and peer. ``ep_rowmap``
+    names that source payload for each final expert row. Scatter it once before
+    GEMM1 so the grouped kernel can use its normal contiguous-A TDM loads.
+    """
+    if wire_row_stride <= 0:
+        raise ValueError(f"wire_row_stride must be positive, got {wire_row_stride}")
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+    num_dst = int(ep_rowmap.shape[0]) - 1
+    if num_dst <= 0:
+        raise ValueError(f"ep_rowmap needs at least two rows, got {ep_rowmap.shape}")
+    device = a1_payload.device
+    payload_w = int(a1_payload.shape[-1])
+    if wire_row_stride % 16 == 0:
+        payload_unit = 16
+    elif wire_row_stride % 8 == 0:
+        payload_unit = 8
+    elif wire_row_stride % 4 == 0:
+        payload_unit = 4
+    else:
+        payload_unit = 1
+    if wire_row_stride % payload_unit:
+        raise ValueError("compact wire stride is not a whole copy unit")
+    if grouped_payload is None:
+        grouped_payload = torch.empty(
+            (1, num_dst, payload_w), dtype=torch.uint8, device=device
+        )
+    if (
+        a1_scale is not None
+        and payload_w % 16 == 0
+        and int(a1_scale.shape[-1]) % 16 == 0
+        and wire_row_stride % 16 == 0
+    ):
+        scale_w = int(a1_scale.shape[-1])
+        if grouped_scale is None:
+            grouped_scale = torch.empty(
+                (1, num_dst, scale_w), dtype=torch.uint8, device=device
+            )
+        if (
+            masked_m is not None
+            and psum is not None
+            and int(masked_m.shape[0]) == int(psum.shape[0])
+            and int(masked_m.shape[0]) > 0
+        ):
+            n_experts = int(masked_m.shape[0])
+            # About 32 live rows per block when the row cap is spread across
+            # experts. The y grid is a host upper bound, so a captured graph
+            # stays static; a short expert just leaves its extra blocks idle.
+            n_split = max(
+                1, min(32, (num_dst + n_experts * 32 - 1) // (n_experts * 32))
+            )
+            _run_compiled(
+                _get_compiled_compact_scatter_copy_pair(payload_w, scale_w),
+                ptr_arg(a1_payload, fx.Uint8),
+                ptr_arg(a1_scale, fx.Uint8),
+                ptr_arg(grouped_payload, fx.Uint8),
+                ptr_arg(grouped_scale, fx.Uint8),
+                ptr_arg(ep_rowmap, fx.Int32),
+                ptr_arg(masked_m, fx.Int32),
+                ptr_arg(psum, fx.Int32),
+                wire_row_stride // 16,
+                topk,
+                n_experts,
+                n_split,
+                fx.Stream(torch.cuda.current_stream()),
+            )
+            return grouped_payload, grouped_scale
+    _run_compiled(
+        _get_compiled_compact_scatter_copy(payload_w),
+        ptr_arg(a1_payload, fx.Uint8),
+        ptr_arg(grouped_payload, fx.Uint8),
+        ptr_arg(ep_rowmap, fx.Int32),
+        wire_row_stride // payload_unit,
+        topk,
+        num_dst,
+        fx.Stream(torch.cuda.current_stream()),
+    )
+
+    if a1_scale is not None:
+        scale_w = int(a1_scale.shape[-1])
+        if wire_row_stride % 16 == 0:
+            scale_unit = 16
+        elif wire_row_stride % 8 == 0:
+            scale_unit = 8
+        elif wire_row_stride % 4 == 0:
+            scale_unit = 4
+        else:
+            scale_unit = 1
+        if grouped_scale is None:
+            grouped_scale = torch.empty(
+                (1, num_dst, scale_w), dtype=torch.uint8, device=device
+            )
+        _run_compiled(
+            _get_compiled_compact_scatter_copy(scale_w),
+            ptr_arg(a1_scale, fx.Uint8),
+            ptr_arg(grouped_scale, fx.Uint8),
+            ptr_arg(ep_rowmap, fx.Int32),
+            wire_row_stride // scale_unit,
+            topk,
+            num_dst,
+            fx.Stream(torch.cuda.current_stream()),
+        )
+    return grouped_payload, grouped_scale
 
 
 @functools.cache
