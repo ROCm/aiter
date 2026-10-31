@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# RMSNorm + optional residual add.
+# RMSNorm of each row with an optional residual add: s = x + res (HAS_RES), out = s / rms(s) * w (1 + w with GEMMA).
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-_gluon_fused_rms_kernel_repr = make_kernel_repr(
-    "_gluon_fused_rms_kernel",
-    ["N", "BLOCK_M", "BLOCK_N", "WARPS_N", "HAS_RES", "GEMMA"],
+_REPR_KEYS = ["N", "BLOCK_M", "BLOCK_N", "WARPS_N", "HAS_RES", "GEMMA"]
+_gluon_fused_rms_kernel_repr = make_kernel_repr("_gluon_fused_rms_kernel", _REPR_KEYS)
+_gluon_fused_rms_tdm_kernel_repr = make_kernel_repr(
+    "_gluon_fused_rms_tdm_kernel", _REPR_KEYS
 )
 
 
@@ -33,8 +34,7 @@ def _gluon_fused_rms_kernel(
     HAS_RES: gl.constexpr,
     GEMMA: gl.constexpr,
 ):
-    # BLOCK_M rows a program and WARPS_N waves a row.
-    # A lane loads 8 contiguous elements (16 bytes) of its row.
+    # BLOCK_M rows a program and WARPS_N waves a row. A lane loads 8 contiguous elements (16 bytes) of its row.
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [BLOCK_M, WARPS_N], [1, 0])
     pid_m = gl.program_id(0)
     offs_m = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
@@ -61,7 +61,7 @@ def _gluon_fused_rms_kernel(
         out_res_ptrs = out_res_ptr + rows[:, None] * stride_out_resm + offs_n[None, :]
         gl.store(out_res_ptrs, x.to(out_res_ptr.dtype.element_ty), mask=mask)
 
-    # The sum of squares: inside the wave, then across the WARPS_N waves of the row.
+    # The sum of squares: in the wave, then across the WARPS_N waves of the row.
     rstd = gl.rsqrt(gl.sum(x * x, axis=1) / N + eps)
     if GEMMA:
         w = w + 1.0
@@ -74,129 +74,76 @@ def _gluon_fused_rms_kernel(
 
 
 @gluon.jit
-def _rmsnorm_op(row, weights, n_cols, epsilon):
-    row_norm = row * row
-    row_norm = gl.sum(row_norm, axis=-1, keep_dims=True)
-    norm_factor = gl.rsqrt((row_norm / n_cols) + epsilon)
-    return row * norm_factor * weights
+def _tdm_tile(
+    ptr, M, stride_m, N: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr
+):
+    # A [BLOCK_M, BLOCK_N] TDM tile of an [M, N] tensor, and its LDS buffer.
+    layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        ptr, [M, N], [stride_m, 1], [BLOCK_M, BLOCK_N], layout
+    )
+    smem = gl.allocate_shared_memory(ptr.dtype.element_ty, [BLOCK_M, BLOCK_N], layout)
+    return desc, smem
 
 
-_gluon_fused_rms_tdm_kernel_repr = make_kernel_repr(
-    "_gluon_fused_rms_tdm_kernel",
-    ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "WARPS_N", "FIRST_INPUT_RES", "GEMMA"],
-)
-
-
-# The rows go through LDS with TDM copies. The config selects it with USE_TDM.
+# The same op with the tiles copied between HBM and LDS by TDM. The config selects it with USE_TDM.
 @gluon.jit(repr=_gluon_fused_rms_tdm_kernel_repr)
 def _gluon_fused_rms_tdm_kernel(
-    x1_ptr,
-    w1_ptr,
-    res1_ptr,
-    out1_ptr,
-    out_res1_ptr,
-    eps1,
+    x_ptr,
+    res_ptr,
+    w_ptr,
+    out_ptr,
+    out_res_ptr,
     M,
-    N,
-    x1_stride_m,
-    res1_stride_m,
-    out1_stride_m,
-    out_res1_stride_m,
-    BLOCK_SIZE_M: gl.constexpr,
-    BLOCK_SIZE_N: gl.constexpr,
+    stride_xm,
+    stride_resm,
+    stride_outm,
+    stride_out_resm,
+    eps,
+    N: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
     WARPS_N: gl.constexpr,
-    FIRST_INPUT_RES: gl.constexpr,
+    HAS_RES: gl.constexpr,
     GEMMA: gl.constexpr,
 ):
-    start_pid = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [BLOCK_M, WARPS_N], [1, 0])
+    w_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    row0 = gl.program_id(0) * BLOCK_M
 
-    gLayout2D: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [1, 32], [BLOCK_SIZE_M, WARPS_N], [1, 0]
-    )
-    gLayoutN: gl.constexpr = gl.SliceLayout(0, gLayout2D)
-    sharedLayout2D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
-    sharedLayoutN: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
-
-    # descriptors + smem for first input and its weight
-    x1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        x1_ptr, [M, N], [x1_stride_m, 1], [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
-    )
-    w1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        w1_ptr, [N], [1], [BLOCK_SIZE_N], sharedLayoutN
-    )
-    smemX1 = gl.allocate_shared_memory(
-        x1_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
-    )
-    smemW1 = gl.allocate_shared_memory(
-        w1_ptr.dtype.element_ty, [BLOCK_SIZE_N], sharedLayoutN
-    )
-
-    # x1 load issued first for early latency hiding
-    gl.amd.gfx1250.tdm.async_load(x1_desc, [start_pid * BLOCK_SIZE_M, 0], smemX1)
-
-    # optional residual input
-    if FIRST_INPUT_RES:
-        res1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            res1_ptr,
-            [M, N],
-            [res1_stride_m, 1],
-            [BLOCK_SIZE_M, BLOCK_SIZE_N],
-            sharedLayout2D,
+    # The loads first: x, res, then the weight.
+    x_desc, x_smem = _tdm_tile(x_ptr, M, stride_xm, N, BLOCK_M, BLOCK_N)
+    gl.amd.gfx1250.tdm.async_load(x_desc, [row0, 0], x_smem)
+    if HAS_RES:
+        res_desc, res_smem = _tdm_tile(res_ptr, M, stride_resm, N, BLOCK_M, BLOCK_N)
+        gl.amd.gfx1250.tdm.async_load(res_desc, [row0, 0], res_smem)
+        out_res_desc, out_res_smem = _tdm_tile(
+            out_res_ptr, M, stride_out_resm, N, BLOCK_M, BLOCK_N
         )
-        smemRes1 = gl.allocate_shared_memory(
-            res1_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
-        )
-        gl.amd.gfx1250.tdm.async_load(
-            res1_desc, [start_pid * BLOCK_SIZE_M, 0], smemRes1
-        )
-        out_res1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            out_res1_ptr,
-            [M, N],
-            [out_res1_stride_m, 1],
-            [BLOCK_SIZE_M, BLOCK_SIZE_N],
-            sharedLayout2D,
-        )
-        smemOutRes1 = gl.allocate_shared_memory(
-            out_res1_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
-        )
-
-    gl.amd.gfx1250.tdm.async_load(w1_desc, [0], smemW1)
-
-    # output descriptor + smem (static alloc; placement before wait is free)
-    out1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        out1_ptr,
-        [M, N],
-        [out1_stride_m, 1],
-        [BLOCK_SIZE_M, BLOCK_SIZE_N],
-        sharedLayout2D,
+    w_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        w_ptr, [N], [1], [BLOCK_N], w_layout
     )
-    smemOut1 = gl.allocate_shared_memory(
-        out1_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
-    )
+    w_smem = gl.allocate_shared_memory(w_ptr.dtype.element_ty, [BLOCK_N], w_layout)
+    gl.amd.gfx1250.tdm.async_load(w_desc, [0], w_smem)
+    out_desc, out_smem = _tdm_tile(out_ptr, M, stride_outm, N, BLOCK_M, BLOCK_N)
 
+    # The TDM copies end in order: wait(1) leaves only the newest copy (the weight) in flight.
     gl.amd.gfx1250.tdm.async_wait(1)
-
-    x1 = smemX1.load(gLayout2D).to(gl.float32)
-
-    if FIRST_INPUT_RES:
-        res1_loaded = smemRes1.load(gLayout2D).to(gl.float32)
-        x1 = x1 + res1_loaded
-        smemOutRes1.store(x1.to(out_res1_ptr.dtype.element_ty))
-        gl.amd.gfx1250.tdm.async_store(
-            out_res1_desc, [start_pid * BLOCK_SIZE_M, 0], smemOutRes1
-        )
+    x = x_smem.load(layout).to(gl.float32)
+    if HAS_RES:
+        x = x + res_smem.load(layout).to(gl.float32)
+        out_res_smem.store(x.to(out_res_ptr.dtype.element_ty))
+        gl.amd.gfx1250.tdm.async_store(out_res_desc, [row0, 0], out_res_smem)
+        # The weight is in LDS: only the residual-sum store can be in flight.
         gl.amd.gfx1250.tdm.async_wait(1)
     else:
         gl.amd.gfx1250.tdm.async_wait(0)
-
-    w1 = smemW1.load(gLayoutN).to(gl.float32)
+    w = w_smem.load(gl.SliceLayout(0, layout)).to(gl.float32)
     if GEMMA:
-        w1 = w1 + 1.0
-    w1 = w1.reshape(1, BLOCK_SIZE_N)
-    w1 = gl.convert_layout(w1, gLayout2D)
-    norm1 = _rmsnorm_op(x1, w1, N, eps1)
+        w = w + 1.0
 
-    smemOut1.store(norm1.to(out1_ptr.dtype.element_ty))
-    gl.amd.gfx1250.tdm.async_store(out1_desc, [start_pid * BLOCK_SIZE_M, 0], smemOut1)
-
+    rstd = gl.rsqrt(gl.sum(x * x, axis=1) / N + eps)
+    out = x * rstd[:, None] * w[None, :]
+    out_smem.store(out.to(out_ptr.dtype.element_ty))
+    gl.amd.gfx1250.tdm.async_store(out_desc, [row0, 0], out_smem)
     gl.amd.gfx1250.tdm.async_wait(0)
