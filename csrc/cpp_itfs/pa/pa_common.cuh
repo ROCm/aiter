@@ -136,6 +136,28 @@ __device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const long& inpA,
     }
 }
 
+// Returns rows token .. token + 7 of column col + lane16id of a 16-bit LDS tile with ROW_BYTES per
+// row, as two ds_read_b64_tr_b16 (CDNA4 ISA reference guide, section 11.4 "MFMA Transpose Load
+// from LDS") of 4 rows each. Within each group of 16 lanes, lane l reads the 4 elements at columns
+// col + (l % 4) * 4 .. + 3 of the read's row l / 4, and receives column col + l of all 4 rows.
+// col must be a multiple of 4 to keep each read 8-byte aligned.
+template <int ROW_BYTES>
+__device__ __forceinline__ _B16x8
+lds_read_transposed_b16x8(unsigned char* lds, int token, int col, int lane16id)
+{
+    static_assert(ROW_BYTES % 8 == 0);
+    using i16x4_t     = __attribute__((__vector_size__(4 * sizeof(short)))) short;
+    using lds_i16x4_t = __attribute__((address_space(3))) i16x4_t;
+    _B16x8 out;
+    for(int i = 0; i < 2; i++)
+    {
+        auto* ptr = (lds_i16x4_t*)(lds + (token + i * 4 + lane16id / 4) * ROW_BYTES +
+                                   (col + (lane16id % 4) * 4) * sizeof(uint16_t));
+        out.xy[i] = __builtin_bit_cast(_B16x4, __builtin_amdgcn_ds_read_tr16_b64_v4i16(ptr));
+    }
+    return out;
+}
+
 #else
 template <typename T, int absz, int cbid, int blgp>
 __device__ __forceinline__ floatx4 gcn_mfma16x16x16_instr(const _B16x4& inpA,
