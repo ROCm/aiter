@@ -92,6 +92,10 @@ python3 op_tests/test_rmsnorm2d.py
 ls op_tests/test_*.py
 ```
 
+The experimental RDNA3 FlyDSL A8W8 GEMM is opt-in: set
+`AITER_GEMM_A8W8_BACKEND=flydsl` before importing AITER. The default keeps the
+existing backend selection, and unsupported FlyDSL calls use the usual fallback.
+
 ## Release Plan
 
 AITER publishes a scheduled release every two weeks. Each scheduled release uses a release branch named after the target version, such as `release/v0.1.20`, and a matching release tag, such as `v0.1.20`. The normal version progression moves from one scheduled release tag to the next, for example `v0.1.19` to `v0.1.20`.
