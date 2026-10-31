@@ -312,7 +312,7 @@ def test_pa_decode_sparse_vs_reference(
 
 
 # ---------------------------------------------------------------------------
-# DSv4 "2buff" packed-fp8 KV layout — byte-identical to what the gfx1250 MLA-v4
+# DSv4 "2buff" packed-fp8 KV layout -- byte-identical to what the gfx1250 MLA-v4
 # asm decode kernel reads (aiter.mla.mla_decode_fwd_v4_nm ->
 # _ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE). Mirrors
 # op_tests/test_mla_v4_kargpreld.py::_native_to_2buff_for_asm and ATOM's
@@ -697,6 +697,7 @@ def make_packed_cache(num_tokens, D, dtype, page_size=256, layout="trailer"):
         cache[:, :, : D // 2] = codes.to(torch.uint8)
         e2m1 = torch.tensor(
             [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            dtype=torch.float32,
             device=device,
         )
         vals = torch.stack([e2m1[codes & 0xF], e2m1[codes >> 4]], dim=-1)
