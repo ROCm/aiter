@@ -442,6 +442,56 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     )
 
 
+def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Like :func:`batched_gemm_a8w8_mxscale_bpreshuffle` but fuses the output
+    group-32 MXFP8 quant into the GEMM epilogue, returning the ``(x, x_scale)``
+    pair a downstream native-quant GEMM (e.g. ``wo_b``) reads directly -- so the
+    standalone ``quantize_fp8`` of the bf16 output is removed.
+
+    Returns ``(y_fp8 [M, G, N] e4m3, y_scale [M, (G*N)//32] e8m0)``, bit-identical
+    to ``quantize_fp8`` of the unfused bf16 output. gfx1250 flydsl mxfp8_32 only;
+    raises ``NotImplementedError`` otherwise so a caller can fall back to the
+    bf16 GEMM + ``quantize_fp8``.
+    """
+    from .flydsl.batched_gemm_a8w8 import (
+        bmm_a8w8_mxfp8_fused_quant_supported,
+        run_bmm_a8w8_mxfp8,
+    )
+
+    m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    n = int(wo_a.shape[1])
+    w_scale_block = _w_scale_block_of(tuple(w_scale.shape), n, k)
+    if not bmm_a8w8_mxfp8_fused_quant_supported(w_scale_block):
+        raise NotImplementedError(
+            f"fused output quant unsupported for a {w_scale_block} w_scale on "
+            f"{get_gfx()}; use batched_gemm_a8w8_mxscale_bpreshuffle + quantize_fp8"
+        )
+    y8 = torch.empty((m, g, n), dtype=dtypes.fp8, device=x.device)
+    y_scale = torch.empty(
+        (m, g * n // 32), dtype=torch.float8_e8m0fnu, device=x.device
+    )
+    run_bmm_a8w8_mxfp8(
+        x, wo_a, x_scale, w_scale, y8, y_scale_out=y_scale.view(torch.uint8)
+    )
+    return y8, y_scale
+
+
+def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
+    w_scale: tuple[int, ...], n: int, k: int
+) -> bool:
+    """Whether :func:`batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant` can run
+    this shape (gfx1250 flydsl mxfp8_32). Lets a caller choose the fused path
+    once instead of catching ``NotImplementedError`` per call."""
+    from .flydsl.batched_gemm_a8w8 import bmm_a8w8_mxfp8_fused_quant_supported
+
+    return bmm_a8w8_mxfp8_fused_quant_supported(_w_scale_block_of(w_scale, n, k))
+
+
 @torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
 def batched_gemm_a8w8_mxscale_bpreshuffle(
     x: Tensor,
