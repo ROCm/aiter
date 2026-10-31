@@ -594,6 +594,10 @@ THD_SHAPES = [
     ([72], [600], 32, 4),  # decode-like
     ([481, 100, 401], [481, 100, 401], 32, 8),
     ([128, 128], [0, 128], 8, 2),  # mixed seqlen_k == 0
+    # --- skewed varlen: grid.x is sized by the longest sequence, so the short ones'
+    # trailing tiles own no query and must skip the core (prefix-cached agentic turns)
+    ([1, 5, 300, 13, 2048], [1025, 2053, 2348, 1037, 4096], 16, 2),
+    ([1, 1, 1024], [512, 2048, 1024], 8, 1),
     ([1024], [1024], 32, 4),
     # --- larger shapes ---
     ([512], [512], 128, 128),
