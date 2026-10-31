@@ -1355,8 +1355,13 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     const bool flydsl_ps1 = std::getenv("AITER_MLA_DECODE_PS1_FLYDSL") != nullptr &&
                             std::atoi(std::getenv("AITER_MLA_DECODE_PS1_FLYDSL")) != 0;
 
-    const MlaDecodeHeadPlan head_plan = mla_decode_head_plan_v1_2(
-        arch_id, num_heads, max_seqlen_qo, q_dtype, kv_dtype, {enable_experimental, flydsl_ps1});
+    const MlaDecodeHeadPlan head_plan = mla_decode_head_plan_v1_2(arch_id,
+                                                                  num_heads,
+                                                                  max_seqlen_qo,
+                                                                  q_dtype,
+                                                                  kv_dtype,
+                                                                  is_cp_round_robin,
+                                                                  {enable_experimental, flydsl_ps1});
     const bool natively_supported = head_plan.natively_supported;
 
     qk_batch_ratio = head_plan.qk_batch_ratio;

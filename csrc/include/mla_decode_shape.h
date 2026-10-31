@@ -123,6 +123,7 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
                                                    const int32_t max_seqlen_qo,
                                                    const AiterDtype q_dtype,
                                                    const AiterDtype kv_dtype,
+                                                   const bool cp_round_robin,
                                                    const MlaPlannerFlags flags)
 {
     int32_t qk_batch_ratio = 1;
@@ -169,8 +170,12 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
          ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
+        // 96 heads at qlen 7 and 8 run natively only under round-robin CP. There the
+        // fold's copy and index kernels add about 0.1 ms a call, so native is faster
+        // up to 64K tokens of global context at any batch size. Without CP the fold
+        // is faster from batch 16 up.
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 96) &&
-         (max_seqlen_qo <= 6)) ||
+         ((max_seqlen_qo <= 6) || (cp_round_robin && (max_seqlen_qo <= 8)))) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 12) &&
          ((num_heads * max_seqlen_qo) <= 128)) ||
         hk_mtp_experimental;
@@ -224,13 +229,19 @@ inline MlaDecodeHeadPlan mla_decode_head_plan(const std::string_view arch_id,
                                               const AiterDtype kv_nope_dtype,
                                               const bool fast_mode,
                                               const bool intra_batch_mode,
+                                              const bool cp_round_robin,
                                               const MlaPlannerFlags flags)
 {
     const int32_t num_heads = num_heads_k * num_heads_per_head_k;
     if(fast_mode)
     {
-        return mla_decode_head_plan_v1_2(
-            arch_id, num_heads, max_seqlen_qo, q_nope_dtype, kv_nope_dtype, flags);
+        return mla_decode_head_plan_v1_2(arch_id,
+                                         num_heads,
+                                         max_seqlen_qo,
+                                         q_nope_dtype,
+                                         kv_nope_dtype,
+                                         cp_round_robin,
+                                         flags);
     }
     else if(intra_batch_mode)
     {
