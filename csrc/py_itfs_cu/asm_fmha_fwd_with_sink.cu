@@ -28,7 +28,10 @@
 #include "asm_fmha_fwd_bf16_configs.hpp"
 #include <hip/hip_runtime.h>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <string>
 
 // Kernel argument block — packed ABI (132 B = 0x84), matches the .args YAML
 // emitted into the v8 .s patched HSA metadata.
@@ -43,7 +46,7 @@
 //   q_ts       = stride between Q-tiles (sub_Q * q_seqs)
 //   lse_hs     = stride per Q head for LSE (q_seq_len * 4)
 //   opt        = packed switches: bit0 reverse_kv, bit1 double_q,
-//                bit2 remap_xy.  We swap gdx/gdy at launch, so bit2=1.
+//                bit2 remap_xy (gdx/gdy are swapped at launch when set).
 //   sink_addr  = per-Q-head f32 sink logits (pre-scale).  Read only by
 //                D64 `_rxy_sink_*` kernels (ENABLE_SINK=1).  For D128
 //                the slot must still be valid (kernarg layout) but is
@@ -84,6 +87,18 @@ static_assert(sizeof(KernelArgs) == 0x84,
               "fmha_fwd_with_sink_asm: KernelArgs must be 132B packed (matches v8 .args)");
 
 // ---- helpers ---------------------------------------------------------------
+
+// AITER_FMHA_FWD_ASM_REMAP_XY=0 / 1 forces s_opt bit2 (remap_xy) off / on for
+// non-causal launches; unset (or any other value) keeps the shape heuristic.
+// Read once.
+static int fmha_fwd_asm_remap_xy_env()
+{
+    static const int value = [] {
+        const char* s = std::getenv("AITER_FMHA_FWD_ASM_REMAP_XY");
+        return s == nullptr ? -1 : std::string(s) == "0" ? 0 : std::string(s) == "1" ? 1 : -1;
+    }();
+    return value;
+}
 
 // Kernel selection: (dtype, hdim_q, hdim_v, mask).  mask = is_causal: the csv
 // registers both mask=0 (non-causal, _rxy_pfnr source) and mask=1 (causal,
@@ -288,11 +303,24 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // s_opt SGPR: packs three host-side switches.  Bit layout:
     //   bit0: reverse_kv   (compile-time gated by CAS_MASK build; ignored by mask=0 kernels)
     //   bit1: double_q     (compile-time gated by DOUBLE_Q   build; ignored by non-_dq kernels)
-    //   bit2: remap_xy     (must be 1 — we swap gdx/gdy at launch below)
+    //   bit2: remap_xy     (runtime; the gdx/gdy order at launch below must match)
     // 7 = 0b111 enables all three.  Safe for the four shipped _rxy_brd /
     // _rxy_cas_brd [_sink] .co binaries because bits 0/1 are compile-time
-    // gated off in those builds; bit2 matches the gdx/gdy swap on launch.
-    args.opt        = 7;
+    // gated off in those builds.
+    //
+    // remap_xy picks the workgroup order.  With remap_xy=1 (bid.x = head) the
+    // same Q-tile of every head runs together, so the K/V of all heads of a
+    // batch is read at once; with remap_xy=0 (bid.x = Q-tile) the Q-tiles of one
+    // head run together and share that head's K/V.  Non-causal (D64 / D128, MHA
+    // and GQA), dropping it is faster once the K/V read at once is large
+    // (kv_seq_len * q_head_num >= 448K) and there are enough Q-tiles to share it
+    // (q_seq_len >= 4096); below either, the head-major order is as fast or
+    // faster.  Causal keeps 7.
+    const int remap_env  = fmha_fwd_asm_remap_xy_env();
+    const bool long_kv   = (int64_t)kv_seq_len * q_head_num >= 448 * 1024;
+    const bool remap_xy  = is_causal || (remap_env >= 0 ? remap_env == 1
+                                                        : q_seq_len < 4096 || !long_kv);
+    args.opt        = remap_xy ? 7 : 3;
     args.lse        = return_lse ? 1 : 0;
     args.kv_seq_len = kv_seq_len;
     args.q_head_num = q_head_num;
@@ -343,12 +371,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int  gdy         = q_head_num;
     const int  gdz         = batch;
 
-    // All _rxy kernels use remap_xy=1: swap gdx↔gdy at launch so that
-    // bid.x indexes heads and bid.y indexes Q-tiles.
+    // remap_xy=1: swap gdx↔gdy at launch so that bid.x indexes heads and
+    // bid.y indexes Q-tiles; remap_xy=0 launches Q-tiles along x.
     impl_ptr->launch_kernel({&args,
                              &arg_size,
-                             gdy,   // launch_gdx = head count  (swapped)
-                             gdx,   // launch_gdy = Q-tile count (swapped)
+                             remap_xy ? gdy : gdx,
+                             remap_xy ? gdx : gdy,
                              gdz,
                              bdx,
                              1,

@@ -30,7 +30,9 @@
 #include "asm_fmha_fwd_bf16_varlen_configs.hpp"
 #include <hip/hip_runtime.h>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
+#include <string>
 
 // Kernel argument block -- packed varlen ABI (0x58 = 88 B), matches the
 // FmhaFwdVarlenKernelArgs layout in the poc host code (s_load order of the
@@ -58,6 +60,17 @@ static_assert(sizeof(FmhaFwdVarlenKernelArgs) == 0x58,
               "fmha_fwd_with_sink_varlen_asm: FmhaFwdVarlenKernelArgs must be 88B packed");
 
 // ---- helpers ---------------------------------------------------------------
+
+// AITER_FMHA_FWD_ASM_REMAP_XY=0 drops s_opt bit2 (remap_xy) for non-causal
+// D64/D128 launches (see asm_fmha_fwd_with_sink.cu); 1 / unset keep it.  Read once.
+static int fmha_fwd_asm_remap_xy_env()
+{
+    static const int value = [] {
+        const char* s = std::getenv("AITER_FMHA_FWD_ASM_REMAP_XY");
+        return s == nullptr ? -1 : std::string(s) == "0" ? 0 : std::string(s) == "1" ? 1 : -1;
+    }();
+    return value;
+}
 
 // Kernel selection: (dtype, hdim_q, hdim_v, mask).  mask = is_causal: the csv
 // registers both mask=0 (non-causal, _rxy[_sink]_pfnr source) and mask=1
@@ -216,11 +229,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.scalar     = softmax_scale;
     args.gqa        = gqa;
     args.q_head_num = q_head_num;
-    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy.
-    // 7 = 0b111 -> all three on.  Must match how the shipped VARLEN .co was
-    // built (REMAP_XY=1 in particular, since we swap gdx/gdy at launch).
+    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy (runtime; the
+    // gdx/gdy order at launch below must match).  7 = 0b111 -> all three on.
+    //
+    // remap_xy=1 (bid.x = head) reads the K/V of every head of a batch at once;
+    // remap_xy=0 (bid.x = Q-tile) keeps one head's Q-tiles together.  Unlike the
+    // fixed-batch path it stays on by default: whether dropping it pays depends on
+    // the length distribution, which the host does not see (faster when a few
+    // long sequences carry most of the work, slower with many short ones, at any
+    // max_seqlen).  AITER_FMHA_FWD_ASM_REMAP_XY=0 drops it for non-causal D64/D128.
     const bool hd192_non_causal = (qk_head_dim == 192 && mask_flag == 0);
-    args.opt        = hd192_non_causal ? 0x4 : 0x7;
+    const bool remap_xy = hd192_non_causal || mask_flag || fmha_fwd_asm_remap_xy_env() != 0;
+    args.opt        = hd192_non_causal ? 0x4 : remap_xy ? 0x7 : 0x3;
     args.lse        = return_lse ? 1 : 0;
     args.max_q_len  = max_seqlen_q;
     args.sink_addr  = sink ? sink->data_ptr() : nullptr;
@@ -246,24 +266,29 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // ---- launch ------------------------------------------------------------
     // Dispatch along max_q_len (double_q halves the tile count via tg_div); z is
     // the batch index.  The kernel early-exits q-tiles that fall beyond a batch's
-    // actual seqlen using cu_seqlens_q.  All shipped VARLEN kernels use ts_qo=128,
-    // wv_tg=4 (block=128) and remap_xy=1; tg_div follows the double_q bit set
-    // above, so D192x128 non-causal launches the full tile count.
+    // actual seqlen using cu_seqlens_q.  All shipped VARLEN kernels use ts_qo=128
+    // and wv_tg=4 (block=128); tg_div follows the double_q bit set above, so
+    // D192x128 non-causal launches the full tile count.
     const int sub_Q        = 128;   // ts_qo
     const int wv_tg        = 4;
     const int bdx          = (wv_tg == 4) ? 128 : 256;
     const bool double_q    = (args.opt & 0x2) != 0;  // bit1 of s_opt
     const int  tg_div      = double_q ? 2 : 1;
     const int  q_tile_count = (max_seqlen_q + sub_Q - 1) / sub_Q;
-    const int  gdx          = (q_tile_count + tg_div - 1) / tg_div;
+    int        gdx          = (q_tile_count + tg_div - 1) / tg_div;
+    // remap_xy=0: workgroups go round-robin over the XCDs, and an x extent that is
+    // a multiple of their count puts the live Q-tiles of short batches (the rest
+    // early-exit) on one XCD.  The extra workgroup of an odd extent exits early.
+    if (!remap_xy)
+        gdx |= 1;
     const int gdy          = q_head_num;
     const int gdz          = batch;
 
     // remap_xy=1: swap gdx<->gdy at launch so bid.x indexes heads, bid.y Q-tiles.
     impl_ptr->launch_kernel({&args,
                              &arg_size,
-                             gdy,   // launch_gdx = head count  (swapped)
-                             gdx,   // launch_gdy = Q-tile count (swapped)
+                             remap_xy ? gdy : gdx,
+                             remap_xy ? gdx : gdy,
                              gdz,
                              bdx,
                              1,
