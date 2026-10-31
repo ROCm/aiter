@@ -1232,6 +1232,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                     psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
                 else:
                     psink = tl.math.exp(sink - m)
+                # A row with no keys and a -inf sink has LSE -inf; -inf - (-inf) is NaN.
+                psink = tl.where(m == float("-inf"), 0.0, psink)
                 delta_recomp = delta_recomp_masked + delta_recomp_unmasked
                 dsink = tl.sum(-psink * delta_recomp[:, None])
                 tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
@@ -1756,6 +1758,8 @@ def bwd_kernel_noncausal(
                     psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
                 else:
                     psink = tl.math.exp(sink - m)
+                # A row with no keys and a -inf sink has LSE -inf; -inf - (-inf) is NaN.
+                psink = tl.where(m == float("-inf"), 0.0, psink)
                 dsink = tl.sum(-psink * delta_recomp[:, None])
                 tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
             # Write back dQ.

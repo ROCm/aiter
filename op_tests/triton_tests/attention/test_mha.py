@@ -1339,3 +1339,46 @@ def test_fully_masked_rows_store_sink_lse(seqlen_q, seqlen_k, backend):
     assert torch.isfinite(
         lse[:, cs:]
     ).all(), "rows at or after causal_start_idx attend to at least one key"
+
+
+def _check_neg_inf_sink_backward(shape_q, shape_k, attn):
+    """Run attn with a -inf sink on head 0 of 4 and check every gradient."""
+    torch.manual_seed(20)
+    q = torch.randn(shape_q, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(shape_k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(shape_k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    sink = torch.tensor(
+        [float("-inf"), -1.0, 0.5, 2.0], device="cuda", requires_grad=True
+    )
+    out = attn(q, k, v, sink)
+    out.backward(torch.randn_like(out))
+
+    assert (
+        sink.grad[0] == 0
+    ), f"a -inf sink has no mass, so its gradient is 0; got {sink.grad[0].item()}"
+    for name, t in (("sink", sink), ("q", q), ("k", k), ("v", v)):
+        assert torch.isfinite(t.grad).all(), f"d{name} must be finite"
+
+
+# 512/128 reaches the early return; 300/128 reaches the post-loop cleanup.
+@pytest.mark.parametrize("seqlen_q, seqlen_k", [(512, 128), (300, 128)])
+def test_neg_inf_sink_grad_with_fully_masked_rows(seqlen_q, seqlen_k):
+    """A -inf sink gets a zero gradient, not NaN, when causal rows see no key."""
+    _check_neg_inf_sink_backward(
+        (2, seqlen_q, 4, 128),
+        (2, seqlen_k, 4, 128),
+        lambda q, k, v, sink: flash_attn_func(q, k, v, causal=True, sink=sink),
+    )
+
+
+def test_neg_inf_sink_grad_with_empty_kv_sequence():
+    """A -inf sink gets a zero gradient, not NaN, when a varlen sequence has no keys."""
+    cu_seqlens_q = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 64, 64], device="cuda", dtype=torch.int32)
+    _check_neg_inf_sink_backward(
+        (128, 4, 128),
+        (64, 4, 128),
+        lambda q, k, v, sink: flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, 64, 64, causal=False, sink=sink
+        ),
+    )
