@@ -1,6 +1,9 @@
 import functools
 
 import torch
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.rope.rope import (
     RotateStyle,
@@ -33,11 +36,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     get_rot_bufs_kwargs,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
-    get_model_configs,
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_model_configs
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 
 
@@ -115,8 +114,9 @@ def run_benchmark(args):
     Q = Q if two_inputs == True else 1
     is_mha = Q == 1
 
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     if dtype == "fp16":
         dtype = torch.float16
@@ -216,9 +216,7 @@ def run_benchmark(args):
             "cos",
             "sin",
         ]
-        rot_bufs = generate_rotating_buffers_pool(
-            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-        )
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
         # Shapes/dtypes are identical across the pool, so any entry works for sizing.
         sample = rot_bufs[0]
@@ -538,7 +536,7 @@ def run_benchmark(args):
 
             fn()
 
-        ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+        ms = bencher.bench(_run)
 
         return flops, mem, ms
 
@@ -546,11 +544,11 @@ def run_benchmark(args):
         print("Running input config:")
         for i in range(len(x_names)):
             print(f"    {x_names[i]:23s}= {x_vals_list[0][i]}")
-        print(f"Kernels per graph = {kwargs_do_bench_graph['kernels_per_graph']}")
+        print(f"Kernels per graph = {bencher.kernels_per_graph}")
         flops, mem, ms = bench_rope(*x_vals)
-        print(f"Total flops  = {flops/1e12 : .6e} (TFLOPS)")
-        print(f"Total memory = {mem/1e9 : .6e} (GB)")
-        print(f"Time         = {ms * 1e3 : .6e} (us)")
+        print(f"Total flops  = {flops / 1e12: .6e} (TFLOPS)")
+        print(f"Total memory = {mem / 1e9: .6e} (GB)")
+        print(f"Time         = {ms * 1e3: .6e} (us)")
 
 
 def parse_args(args: list[str] | None = None):
