@@ -31,13 +31,16 @@ from aiter.ops.mha_v4_quant import (
     quantize_fp8_rotated,
     quantize_int8,
     quantize_mxfp4_k,
+    quantize_mxfp4_k_hd256,
     quantize_mxfp4_q,
+    quantize_mxfp4_q_hd256,
     quantize_mxfp6_k,
     quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
+    quantize_v_mxfp4_fp6_p_hd256,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
@@ -63,13 +66,16 @@ __all__ = (
     "quantize_fp8_rotated",
     "quantize_int8",
     "quantize_mxfp4_k",
+    "quantize_mxfp4_k_hd256",
     "quantize_mxfp4_q",
+    "quantize_mxfp4_q_hd256",
     "quantize_mxfp6_k",
     "quantize_mxfp6_q",
     "quantize_mxfp8_k",
     "quantize_mxfp8_q",
     "quantize_v_fp8",
     "quantize_v_mxfp4_fp6_p",
+    "quantize_v_mxfp4_fp6_p_hd256",
     "quantize_v_mxfp6",
     "quantize_v_mxfp6_fp6_p",
     "rotate_activation_hd128",
@@ -183,6 +189,15 @@ _PACKED_QK_WIDTH = {
     AttentionFormat.FP6_E2M3: 96,
     AttentionFormat.FP4_E2M1: 64,
 }
+_MHA_V4_BASE_HEAD_DIM = 128
+
+
+def _packed_qk_width(q_format: AttentionFormat, head_dim: int) -> int:
+    """Packed last-dim size of a Q/K tensor. The table above is the hd128 row; every format's
+    width is linear in the head dim, so scaling it is exact rather than a second table.
+    """
+    return _PACKED_QK_WIDTH[q_format] * head_dim // _MHA_V4_BASE_HEAD_DIM
+
 
 _MHA_V4_Q_TILE = 256
 # mode=1 selects the sorted-sparse manifest rows; the launcher dispatches the same rows through
@@ -928,18 +943,23 @@ def mha_v4_packed(
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Q, K, and V must have contiguous last dimensions")
 
-    logical_head_dim = 128
-    expected_q_width = _PACKED_QK_WIDTH[q_format]
+    # V is the only operand carrying the logical head dim in its last axis; Q/K carry packed ones.
+    logical_head_dim = v.shape[-1]
+    if logical_head_dim not in (128, 256):
+        raise ValueError("MHA v4 supports logical head dimension 128 or 256")
+    if logical_head_dim == 256 and q_format != AttentionFormat.MXFP4:
+        raise ValueError("MHA v4 head dimension 256 is MXFP4-only")
+    expected_q_width = _packed_qk_width(q_format, logical_head_dim)
     if q.shape[-1] != expected_q_width or k.shape[-1] != expected_q_width:
         raise ValueError(
             f"{q_format.name} Q/K must have packed width {expected_q_width}"
         )
-    if v.shape[-1] != logical_head_dim:
-        raise ValueError("MHA v4 currently requires logical V head dimension 128")
     if q_format == AttentionFormat.MXFP4:
+        # The MXFP4 K producer tiles 128 tokens whatever KV tile the kernel runs.
         tiles = (k.shape[1] + 127) // 128
-        head_stride = tiles * 8192
-        expected_k_stride = (k.shape[2] * head_stride, 64, head_stride, 1)
+        row_bytes = logical_head_dim // 2
+        head_stride = tiles * 128 * row_bytes
+        expected_k_stride = (k.shape[2] * head_stride, row_bytes, head_stride, 1)
         if k.stride() != expected_k_stride:
             raise ValueError("MXFP4 K must use the coalesced MHA v4 tile layout")
 
@@ -1214,8 +1234,10 @@ def _validate_mha_v4_raw_inputs(
         or v.dtype != torch.bfloat16
     ):
         raise ValueError(f"{operation} currently expects BF16 Q, K, and V inputs")
-    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
-        raise ValueError(f"{operation} currently supports head dimension 128 only")
+    if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+        raise ValueError(f"{operation} requires one head dimension across Q, K, and V")
+    if q.shape[-1] not in (128, 256):
+        raise ValueError(f"{operation} supports head dimension 128 or 256")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError(f"{operation} currently requires contiguous BSHD inputs")
     if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
@@ -1291,6 +1313,11 @@ def mha_v4(
         sparse=sparse,
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
+    if q.shape[-1] != 128 and recipe.kind is not _RawRecipeKind.MXFP4:
+        raise ValueError(
+            f"head dimension {q.shape[-1]} is MXFP4-only; "
+            f"{recipe.kind.name} is packed for head dimension 128"
+        )
 
     # Every quantized K path fuses the subtraction into its rotation kernel, except INT8, whose
     # quantizer is still Triton and so needs a materialised K.
@@ -1342,11 +1369,20 @@ def mha_v4(
         else:
             v_quantized, v_descale = quantize_v_mxfp6(v)
     elif recipe.kind == _RawRecipeKind.MXFP4:
+        head_dim = q.shape[-1]
         if softmax_scale is None:
-            softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp4_q(q, mha_v4_q_multiplier(softmax_scale))
-        k_quantized, k_descale = quantize_mxfp4_k(k, k_mean)
-        v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
+            softmax_scale = head_dim**-0.5
+        multiplier = mha_v4_q_multiplier(softmax_scale)
+        # hd256 reuses the hd128 HIP producers on a half-head view and permutes the result; the
+        # Hadamard is then block-diagonal over the two halves, still orthogonal, so Q.K^T holds.
+        if head_dim == 256:
+            q_quantized, q_descale = quantize_mxfp4_q_hd256(q, multiplier)
+            k_quantized, k_descale = quantize_mxfp4_k_hd256(k, k_mean)
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p_hd256(v)
+        else:
+            q_quantized, q_descale = quantize_mxfp4_q(q, multiplier)
+            k_quantized, k_descale = quantize_mxfp4_k(k, k_mean)
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None:
             launch = functools.partial(
                 _launch_mxfp4_coalesced,

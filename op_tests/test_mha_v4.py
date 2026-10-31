@@ -741,14 +741,16 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
 # The FP8 arm is real gfx942 coverage; the MX arms would reach quantizers that AITER_CHECK on
 # gfx950, and that check aborts the process rather than raising.
 @parametrize(
-    "recipe",
+    "recipe,head_dim",
     [
-        "fp8",
-        param("mxfp8", skip=get_gfx() != "gfx950"),
-        param("mxfp4", skip=get_gfx() != "gfx950"),
+        ("fp8", 128),
+        param("mxfp8", 128, skip=get_gfx() != "gfx950"),
+        param("mxfp4", 128, skip=get_gfx() != "gfx950"),
+        # hd256 routes K and its mean through a half-head view a 128 head never exercises.
+        param("mxfp4", 256, skip=get_gfx() != "gfx950"),
     ],
 )
-def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
+def test_mha_v4_quantized_tolerates_k_common_mode(recipe, head_dim):
     """A direction shared by every key must not cost accuracy.
 
     Softmax is shift invariant in such a component, so the reference barely moves; only the
@@ -756,10 +758,10 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     is the tripwire for silently dropping it.
     """
     torch.manual_seed(17)
-    q = torch.randn((1, 1024, 4, 128), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((1, 1024, 4, head_dim), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(q)
     base_k = torch.randn_like(q)
-    direction = torch.randn((1, 1, 4, 128), device="cuda", dtype=torch.bfloat16)
+    direction = torch.randn((1, 1, 4, head_dim), device="cuda", dtype=torch.bfloat16)
 
     if recipe == "fp8":
         formats = (native_fp8_format(),) * 3
@@ -796,8 +798,11 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     get_gfx() != "gfx950",
     reason="gfx950 LSE",
 )
-@parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
-def test_mha_v4_lse_survives_k_common_mode(recipe):
+@parametrize(
+    "recipe,head_dim",
+    [("fp8", 128), ("mxfp8", 128), ("mxfp4", 128), ("mxfp4", 256)],
+)
+def test_mha_v4_lse_survives_k_common_mode(recipe, head_dim):
     """K smoothing must not leak into the exported LSE.
 
     Smoothing runs the kernel against k - k_mean, shifting every score by the per-query constant
@@ -807,10 +812,10 @@ def test_mha_v4_lse_survives_k_common_mode(recipe):
     of its output norm this way while every output test stayed green.
     """
     torch.manual_seed(17)
-    q = torch.randn((1, 1024, 4, 128), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((1, 1024, 4, head_dim), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(q)
     base_k = torch.randn_like(q)
-    direction = torch.randn((1, 1, 4, 128), device="cuda", dtype=torch.bfloat16)
+    direction = torch.randn((1, 1, 4, head_dim), device="cuda", dtype=torch.bfloat16)
 
     if recipe == "fp8":
         formats = (native_fp8_format(),) * 3
@@ -1724,6 +1729,69 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
     assert torch.equal(gqa, mha)
 
 
+# hd256 runs a 64-token KV tile where hd128 runs 128, so the aligned/partial split moves.
+_HD256_SHAPES = [
+    param(1, 256, 256, 1, id="aligned"),
+    param(2, 512, 512, 2, id="batched"),
+    param(1, 768, 576, 2, id="partial_kv"),
+]
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+@parametrize(("batch", "sequence_q", "sequence_k", "heads"), _HD256_SHAPES)
+def test_mha_v4_mxfp4_hd256_matches_attention(batch, sequence_q, sequence_k, heads):
+    torch.manual_seed(43)
+    q = torch.randn(
+        (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+
+    actual = mha_v4(
+        q, k, v, AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4
+    )
+    torch.cuda.synchronize()
+
+    assert actual.shape == (batch, sequence_q, heads, 256)
+    assert torch.isfinite(actual).all()
+    assert _cosine_against_attention(actual, q, k, v) > _MX_UNALIGNED_COSINE
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 GQA validation")
+def test_mha_v4_mxfp4_hd256_gqa_matches_repeated_kv():
+    torch.manual_seed(44)
+    q = torch.randn((1, 257, 16, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 320, 4, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    gqa = mha_v4(
+        q, k, v, AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4
+    )
+    mha = mha_v4(
+        q,
+        k.repeat_interleave(4, dim=2),
+        v.repeat_interleave(4, dim=2),
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP4,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(gqa, mha)
+
+
+@parametrize(
+    "qk_format",
+    [AttentionFormat.BF16, native_fp8_format(), AttentionFormat.MXFP6],
+)
+def test_mha_v4_rejects_non_mxfp4_head_dim_256(qk_format):
+    q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
+    with expect_raises(ValueError, match="MXFP4-only"):
+        mha_v4(q, q, q, qk_format, qk_format, qk_format)
+
+
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 I8FP8 validation")
 def test_mha_v4_packed_i8fp8_compile_parity():
     torch.manual_seed(17)
@@ -1926,6 +1994,33 @@ def test_mha_v4_raw_mxfp8_compile_parity():
     assert torch.isfinite(compiled).all()
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+def test_mha_v4_mxfp4_hd256_compile_parity():
+    """The hd256 producers are custom ops so this path can be traced; only tracing it proves that.
+
+    hd256 reaches its quantizers through a separate trio rather than a head-dim argument, so the
+    hd128 parity checks say nothing about whether these ones still carry their schemas.
+    """
+    torch.manual_seed(45)
+    q = torch.randn((1, 257, 4, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 320, 4, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    eager_out = torch.empty_like(q)
+    compiled_out = torch.empty_like(q)
+    formats = (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4)
+
+    eager = mha_v4(q, k, v, *formats, out=eager_out)
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q, k, v, *formats, out=compiled_out
+    )
+    torch.cuda.synchronize()
+
+    assert eager.data_ptr() == eager_out.data_ptr()
+    assert compiled.data_ptr() == compiled_out.data_ptr()
+    assert torch.equal(eager, compiled)
+    assert torch.isfinite(compiled).all()
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
 @parametrize("q_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
 def test_mha_v4_raw_mxfp4_v_supports_unaligned_sequence(q_format):
@@ -2016,14 +2111,13 @@ def _verdict(err):
 
 
 @benchmark()
-def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
+def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype):
     """Benchmark every dense MHA v4 recipe against one Torch reference.
 
     All recipes are timed side by side because they differ only in how Q/K/V are quantized, so
     the interesting number is what each costs at the same shape and what it costs in accuracy.
     The quantized rows time their quantizers too, since that is what mha_v4 runs per call.
     """
-    head_dim = 128
     softmax_scale = head_dim**-0.5
     torch.manual_seed(batch + sequence_q + sequence_k + heads)
     q = torch.randn((batch, sequence_q, heads, head_dim), device="cuda", dtype=dtype)
@@ -2043,6 +2137,9 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
         "f6f4": (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4),
         "mxfp4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
     }
+    if head_dim != 128:
+        # Only MXFP4 has a kernel past hd128; the rest would raise rather than return a number.
+        recipes = {"mxfp4": recipes["mxfp4"]}
     candidates = {
         name: (
             lambda q_format=q_format, v_format=v_format: mha_v4(
@@ -2107,19 +2204,27 @@ def main():
     parser.add_argument("--sequence-q", type=int, nargs="*", default=[1024])
     parser.add_argument("--sequence-k", type=int, nargs="*", default=[1024, 4096])
     parser.add_argument("--heads", type=int, nargs="*", default=[8])
+    parser.add_argument("--head-dim", type=int, nargs="*", default=[128])
     parser.add_argument(
         "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
     )
     args = parser.parse_args()
 
     rows = []
-    for batch, sequence_q, sequence_k, heads, dtype in itertools.product(
-        args.batch, args.sequence_q, args.sequence_k, args.heads, args.dtype
+    for batch, sequence_q, sequence_k, heads, head_dim, dtype in itertools.product(
+        args.batch,
+        args.sequence_q,
+        args.sequence_k,
+        args.heads,
+        args.head_dim,
+        args.dtype,
     ):
         if dtype != dtypes.bf16:
             aiter.logger.warning("MHA v4 dense benchmark skips dtype %s", dtype)
             continue
-        rows.append(benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype))
+        rows.append(
+            benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype)
+        )
     if rows:
         frame = pd.DataFrame(rows)
         aiter.logger.info(
@@ -2178,6 +2283,81 @@ def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
             out[b : b + 1].float().flatten(), reference.float().flatten(), dim=0
         )
         assert cosine > 0.99, f"batch {b} of {lengths}"
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+@parametrize(
+    "lengths,padded",
+    [((192, 128), 256), ((320, 192, 64), 384), ((576, 320, 128, 64), 640)],
+)
+def test_mha_v4_mxfp4_hd256_seqlens_k_matches_truncated_kv(lengths, padded):
+    """hd256 MXFP4 per-batch key lengths, against the same kernel on cut-down K/V.
+
+    A torch reference cannot adjudicate this: MXFP4 sits at a flat ~0.978 cosine whatever the
+    length, which is looser than the failure. The hazard is that kv_seq_len also strides the MX
+    scale slices, so shrinking it before the bases are built relocates each batch's scale base
+    and leaves batch 0 right and batches 1+ wrong -- hence the per-batch comparison.
+    """
+    torch.manual_seed(41)
+    batch, heads = len(lengths), 4
+    formats = (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4)
+    q = torch.randn((batch, 256, heads, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, padded, heads, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    varlen = mha_v4(
+        q,
+        k,
+        v,
+        *formats,
+        seqlens_k=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+    )
+    torch.cuda.synchronize()
+
+    for b, valid in enumerate(lengths):
+        truncated = mha_v4(
+            q[b : b + 1], k[b : b + 1, :valid], v[b : b + 1, :valid], *formats
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(
+            varlen[b : b + 1], truncated
+        ), f"batch {b} of {lengths} differs from its truncated control"
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+def test_mha_v4_mxfp4_hd256_lse_tracks_hd128():
+    """_LSE_CAPABLE_QV is keyed on (q_format, v_format) with no head-dim term, so hd256 inherited
+    the MXFP4 claim without its epilogue ever being compared against torch.
+
+    Two bounds because they catch different things. The absolute one separates a real LSE from an
+    object that never wrote one, which leaves the buffer as torch.empty handed it back. The
+    comparison against hd128 is what a constant cannot do: the residual is MXFP4 quantization, so
+    only a sibling recipe says whether hd256 carries more of it than it should.
+    """
+
+    def lse_error(head_dim):
+        torch.manual_seed(43)
+        q = torch.randn((1, 256, 4, head_dim), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn((1, 256, 4, head_dim), device="cuda", dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        formats = (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4)
+
+        _, lse = mha_v4(q, k, v, *formats, return_lse=True)
+        torch.cuda.synchronize()
+
+        scores = q.float().permute(0, 2, 1, 3) @ k.float().permute(
+            0, 2, 1, 3
+        ).transpose(-1, -2)
+        reference = torch.logsumexp(scores * head_dim**-0.5, dim=-1)
+        actual = lse.float().reshape(reference.shape)
+        assert torch.isfinite(actual).all(), f"hd{head_dim} LSE is not finite"
+        error = ((actual - reference).abs().max() / reference.abs().max()).item()
+        assert error < 0.1, f"hd{head_dim} LSE relative error {error:.5f}"
+        return error
+
+    hd128 = lse_error(128)
+    hd256 = lse_error(256)
+    assert hd256 < 3 * hd128, f"hd256 LSE error {hd256:.5f} vs hd128 {hd128:.5f}"
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
@@ -2317,8 +2497,12 @@ def check_varlen_capable_objects(arch="gfx950"):
             text=True,
             check=True,
         ).stdout
-        # Drop the trailing "// address: encoding" first, or a code address matches 0x1c0.
-        if not re.search(r"\b0x1c0\b", re.sub(r"//.*", "", listing)):
+        # Match the load off the kernarg base, not a bare 0x1c0: the literal also shows up as an
+        # ordinary VALU immediate, which let an object that never reads seqlens_k pass this.
+        if not re.search(
+            r"s_load_dword(?:x2)?\s+s\[\d+:\d+\], s\[0:1\], 0x1c0\b",
+            re.sub(r"//.*", "", listing),
+        ):
             silent.append(name)
     assert not silent, (
         f"{arch} rows claimed in _VARLEN_CAPABLE_QV never load kernarg 0x1C0: {silent}; "
@@ -2333,6 +2517,67 @@ def check_varlen_capable_objects(arch="gfx950"):
 @parametrize("arch", ["gfx950"])
 def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
     check_varlen_capable_objects(arch)
+
+
+def check_lse_capable_objects(arch="gfx950"):
+    """Every dense row _LSE_CAPABLE_QV claims must really read the LSE kernarg.
+
+    Same hole as the varlen gate: the key is (q_format, v_format) alone, so a pair that gains a
+    second object inherits the claim. O never reads LSE, so every output test still passes while
+    the returned LSE is whatever the buffer held. Matched on the kernarg load rather than a bare
+    literal, and calibrated against a pre-LSE object, which reads neither 0x40 nor 0x100.
+    """
+    asm_dir = os.environ.get(
+        "AITER_ASM_DIR", os.path.join(mha_v4_module.AITER_ROOT_DIR, "hsa")
+    )
+    root = os.path.join(asm_dir, arch, "fmha_v4_fwd")
+    with open(os.path.join(root, "fmha_v4_fwd.csv"), encoding="utf-8") as manifest:
+        rows = [
+            line.strip().split(",")
+            for line in manifest
+            if line.strip() and not line.startswith("#")
+        ]
+    header, rows = rows[0], rows[1:]
+    q_at, v_at = header.index("q_format"), header.index("v_format")
+    mode_at, co_at = header.index("mode"), header.index("co_name")
+
+    claimed = sorted(
+        {
+            row[co_at]
+            for row in rows
+            if row[mode_at] == "0"
+            and (AttentionFormat(int(row[q_at])), AttentionFormat(int(row[v_at])))
+            in mha_v4_module._LSE_CAPABLE_QV
+        }
+    )
+    assert claimed, f"no dense {arch} rows are claimed LSE-capable"
+
+    silent = []
+    for name in claimed:
+        listing = subprocess.run(
+            [_llvm_objdump(), "-d", f"--mcpu={arch}", os.path.join(root, name)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        if not re.search(
+            r"s_load_dword(?:x2)?\s+s\[?\d+(?::\d+)?\]?, s\[0:1\], 0x100\b",
+            re.sub(r"//.*", "", listing),
+        ):
+            silent.append(name)
+    assert not silent, (
+        f"{arch} rows claimed in _LSE_CAPABLE_QV never load the LSE kernarg: {silent}; "
+        "they would return whatever the LSE buffer already held"
+    )
+    aiter.logger.info(
+        "LSE gate: all %d claimed %s rows load the LSE kernarg", len(claimed), arch
+    )
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@parametrize("arch", ["gfx950"])
+def test_mha_v4_lse_capable_rows_load_the_lse_kernarg(arch):
+    check_lse_capable_objects(arch)
 
 
 if __name__ == "__main__":

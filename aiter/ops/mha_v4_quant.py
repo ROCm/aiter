@@ -37,6 +37,8 @@ MHA_V4_PER_TENSOR_BLOCK_SIZE = 8192
 MHA_V4_MXFP4_V_TILE_TOKENS = FP4_V_TILE_TOKENS
 MHA_V4_MXFP4_V_PACKED_ROW_BYTES = FP4_V_PACKED_BYTES_PER_TOKEN
 MHA_V4_MXFP4_V_SCALE_TILE_BYTES = 512
+# One E8M0 scale per 32 contracted elements, which is what lets a descale shape name the head dim.
+MHA_V4_MX_BLOCK_ELEMENTS = 32
 MHA_V4_MXFP4_V_BUFFER_SLACK_BYTES = FP4_V_BUFFER_SLACK_BYTES
 # Dense kernels speculatively gather the overlapping final K-scale dword and two lookahead V-scale
 # tiles. Keep those reads mapped and zero without changing either scale tensor's logical shape.
@@ -143,8 +145,13 @@ def rotate_activation_mxfp4_quant_k(
     scale: Tensor,
     input: Tensor,
     mean: Tensor,
+    head_split: int = 1,
 ) -> None:
-    """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order."""
+    """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order.
+
+    `head_split` splits the head axis into (heads // head_split, head_split) and places the inner
+    index inside the tile axis; hd256 passes 2 to get its interleaved tile order directly.
+    """
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
@@ -152,6 +159,7 @@ def _quantize_v_mxfp4_hip(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    head_split: int = 1,
 ) -> None:
     """Pack V into the canonical column-major MXFP4 order."""
 
@@ -161,13 +169,18 @@ def _quantize_v_mxfp4_fp6_p_hip(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    head_split: int = 1,
 ) -> None:
     """Pack MXFP4 V in the contraction order required by an FP6 P operand."""
 
 
 def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, int]:
-    if input.dim() != 4 or input.shape[-1] != 128 or not input.is_contiguous():
-        raise ValueError(f"{operation} requires contiguous hd128 BSHD input")
+    if input.dim() != 4 or not input.is_contiguous():
+        raise ValueError(f"{operation} requires a contiguous BSHD input")
+    if input.shape[-1] != 128:
+        raise ValueError(
+            f"{operation} is packed for head dimension 128, got {input.shape[-1]}"
+        )
     return input.shape
 
 
@@ -453,14 +466,18 @@ def _quantize_mxfp4_k_fake(
 
 
 def mxfp4_k_view(raw: Tensor, scale: Tensor) -> Tensor:
-    """Rebuild the logical MXFP4 K view from its contiguous backing buffer."""
-    batch, sequence, heads, _ = scale.shape
-    tiles = (sequence + 127) // 128
-    head_stride = tiles * 8192
+    """Rebuild the logical MXFP4 K view from its contiguous backing buffer.
+
+    The scale names the head dim: one E8M0 byte per 32 contracted elements.
+    """
+    batch, sequence, heads, blocks = scale.shape
+    row_bytes = blocks * MHA_V4_MX_BLOCK_ELEMENTS // 2
+    tiles = (sequence + MHA_V4_KV_TILE_ROWS - 1) // MHA_V4_KV_TILE_ROWS
+    head_stride = tiles * MHA_V4_KV_TILE_ROWS * row_bytes
     return torch.as_strided(
         raw,
-        (batch, sequence, heads, 64),
-        (heads * head_stride, 64, head_stride, 1),
+        (batch, sequence, heads, row_bytes),
+        (heads * head_stride, row_bytes, head_stride, 1),
     )
 
 
@@ -685,16 +702,192 @@ def _quantize_v_mxfp6_fp6_p_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def mxfp4_v_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:
-    """Rebuild the logical MXFP4 V view from its contiguous backing buffer."""
-    batch, heads, _ = scale.shape
+    """Rebuild the logical MXFP4 V view from its contiguous backing buffer.
+
+    The last axis is the LOGICAL head dim while the row stride is the packed one. The scale image
+    is one E8M0 byte per 32 elements over the padded sequence, which is what names the head dim.
+    """
+    batch, heads, scale_bytes = scale.shape
     padded_sequence = mxfp4_v_padded_sequence(sequence)
+    head_dim = scale_bytes * MHA_V4_MX_BLOCK_ELEMENTS // padded_sequence
+    row_bytes = head_dim // 2
     return torch.as_strided(
         raw,
-        (batch, sequence, heads, 128),
+        (batch, sequence, heads, head_dim),
         (
-            heads * padded_sequence * MHA_V4_MXFP4_V_PACKED_ROW_BYTES,
-            MHA_V4_MXFP4_V_PACKED_ROW_BYTES,
-            padded_sequence * MHA_V4_MXFP4_V_PACKED_ROW_BYTES,
+            heads * padded_sequence * row_bytes,
+            row_bytes,
+            padded_sequence * row_bytes,
             1,
         ),
     )
+
+
+# ---- hd256 MXFP4 ---------------------------------------------------------------------------
+# hd256 reuses the hd128 producers on a [b, s, 2h, 128] view and permutes the result. Every hd256
+# layout is a permutation of the hd128 one -- both tile the SAME 16-byte lane slots, 128 tokens by
+# 4 chunks against 64 tokens by 8 -- so this is exact and needs no second HIP kernel. The Hadamard
+# then acts block-diagonally over the two halves, which is still orthogonal, so Q.K^T is unchanged
+# and the two halves are decorrelated independently rather than jointly.
+MHA_V4_HD256 = 256
+MHA_V4_MXFP4_TILE_BYTES = MHA_V4_MXFP4_V_TILE_TOKENS * MHA_V4_MXFP4_V_PACKED_ROW_BYTES
+
+
+def mxfp4_producer_tiles(sequence: int) -> int:
+    """Number of 128-token tiles the MXFP4 K and V producers emit."""
+    return (sequence + MHA_V4_KV_TILE_ROWS - 1) // MHA_V4_KV_TILE_ROWS
+
+
+def _validate_bshd_hd256(input: Tensor, operation: str) -> tuple[int, int, int, int]:
+    if input.dim() != 4 or not input.is_contiguous():
+        raise ValueError(f"{operation} requires a contiguous BSHD input")
+    if input.shape[-1] != MHA_V4_HD256:
+        raise ValueError(
+            f"{operation} is packed for head dimension {MHA_V4_HD256}, got {input.shape[-1]}"
+        )
+    return input.shape
+
+
+def _hd256_half_heads(input: Tensor) -> Tensor:
+    """View [b, s, h, 256] as the [b, s, 2h, 128] the hd128 producers accept."""
+    batch, sequence, heads, head_dim = input.shape
+    return input.reshape(batch, sequence, heads * 2, head_dim // 2)
+
+
+# Custom ops, like their hd128 counterparts: the buffers below are deliberately larger than their
+# logical extent, and inlining these into a compiled graph lets the allocation be shrunk to what
+# the traced code reads. The kernels then gather past the end of a tile. Keep the boundary.
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp4_q_hd256", mutates_args=())
+def quantize_mxfp4_q_hd256(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd256 BSHD Q as MXFP4 data with E8M0 block scales."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP4 Q quantization"
+    )
+    quantized, scale = quantize_mxfp4_q(_hd256_half_heads(input), multiplier)
+    # Both are pure reshapes, so the scale keeps whatever storage the hd128 producer gave it.
+    return (
+        quantized.reshape(batch, sequence, heads, MHA_V4_HD256 // 2),
+        scale.reshape(batch, sequence, heads, MHA_V4_HD256 // 32),
+    )
+
+
+@quantize_mxfp4_q_hd256.register_fake
+def _quantize_mxfp4_q_hd256_fake(
+    input: Tensor, multiplier: float
+) -> tuple[Tensor, Tensor]:
+    del multiplier
+    batch, sequence, heads, _ = input.shape
+    return input.new_empty(
+        (batch, sequence, heads, MHA_V4_HD256 // 2), dtype=torch.uint8
+    ), _plain_block_scale(input)
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp4_k_hd256", mutates_args=())
+def quantize_mxfp4_k_hd256(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    """Rotate and pack hd256 BSHD K into the coalesced MXFP4 ASM layout."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP4 K quantization"
+    )
+    half_heads = _hd256_half_heads(input)
+    half_mean = (
+        None if mean is None else mean.reshape(batch, heads * 2, MHA_V4_HD256 // 2)
+    )
+    blocks = MHA_V4_HD256 // 32
+    raw = input.new_empty(
+        (mxfp4_k_raw_buffer_size(batch, sequence, heads * 2),), dtype=torch.uint8
+    )
+    # The scale image is head-major over the logical head, so hd128's is already hd256's: half h
+    # of head j is blocks [4h, 4h+4) of row j, which is what a (.., heads, 8) view reads.
+    scale = block_scale_storage(
+        input,
+        batch,
+        sequence,
+        heads,
+        blocks,
+        MHA_V4_KV_TILE_ROWS,
+        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    )
+    rotate_activation_mxfp4_quant_k(
+        raw, scale, half_heads, _or_empty(input, half_mean), 2
+    )
+    return raw, scale
+
+
+@quantize_mxfp4_k_hd256.register_fake
+def _quantize_mxfp4_k_hd256_fake(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    del mean
+    batch, sequence, heads, _ = input.shape
+    blocks = MHA_V4_HD256 // 32
+    tiles = mxfp4_producer_tiles(sequence)
+    data = input.new_empty(
+        (batch * heads * tiles * MHA_V4_KV_TILE_ROWS * (MHA_V4_HD256 // 2),),
+        dtype=torch.uint8,
+    )
+    scale = block_scale_storage(
+        input,
+        batch,
+        sequence,
+        heads,
+        blocks,
+        MHA_V4_KV_TILE_ROWS,
+        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    )
+    return data, scale
+
+
+def _mxfp4_v_hd256_sizes(batch: int, sequence: int, heads: int) -> tuple[int, int, int]:
+    """(data payload, data allocation, scale elements) for an hd256 MXFP4 V buffer.
+
+    The real op and its fake both size their buffers here: a fake that under-allocates would let
+    a compiled graph hand the kernel a shorter buffer than eager does.
+    """
+    tiles = mxfp4_producer_tiles(sequence)
+    payload = batch * heads * 2 * tiles * MHA_V4_MXFP4_TILE_BYTES
+    # mxfp4_v_view's last axis is the LOGICAL head dim over PACKED rows, so its final element
+    # reaches half a row past the payload.
+    allocation = payload + MHA_V4_HD256 // 2
+    elements = batch * heads * 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    return payload, allocation, elements
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_fp6_p_hd256", mutates_args=())
+def quantize_v_mxfp4_fp6_p_hd256(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack hd256 MXFP4 V in the token order consumed by the FP6-P kernel."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP4 V-for-FP6-P quantization"
+    )
+    tiles = mxfp4_producer_tiles(sequence)
+    payload, allocation, elements = _mxfp4_v_hd256_sizes(batch, sequence, heads)
+
+    hd256_raw = input.new_empty((allocation,), dtype=torch.uint8)
+    hd256_raw[payload:].zero_()
+    storage = input.new_empty(
+        (elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    storage[elements:].zero_()
+    _quantize_v_mxfp4_fp6_p_hip(hd256_raw, storage, _hd256_half_heads(input), 2)
+    hd256_scale = storage[:elements].view(
+        batch, heads, 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    )
+    return hd256_raw, hd256_scale
+
+
+@quantize_v_mxfp4_fp6_p_hd256.register_fake
+def _quantize_v_mxfp4_fp6_p_hd256_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, _ = input.shape
+    tiles = mxfp4_producer_tiles(sequence)
+    _, allocation, elements = _mxfp4_v_hd256_sizes(batch, sequence, heads)
+    data = input.new_empty((allocation,), dtype=torch.uint8)
+    storage = input.new_empty(
+        (elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    scale = storage[:elements].view(
+        batch, heads, 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    )
+    return data, scale

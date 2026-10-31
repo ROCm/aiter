@@ -29,6 +29,9 @@ void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
                                    double multiplier);
 
 // The K variants write the coalesced tile layouts consumed directly by MHA v4 code objects.
+// `head_split` divides the head axis into (heads / head_split, head_split) and places the inner
+// index inside the tile axis. hd128 passes 1; hd256 runs as 2h half-heads and passes 2 so the two
+// halves of a head land adjacent per tile, which is the layout its code object reads.
 void rotate_activation_mxfp6_quant_k(aiter_tensor_t& out,
                                      aiter_tensor_t& scale,
                                      const aiter_tensor_t& input,
@@ -46,15 +49,18 @@ void rotate_activation_mxfp4_quant(aiter_tensor_t& out,
 void rotate_activation_mxfp4_quant_k(aiter_tensor_t& out,
                                      aiter_tensor_t& scale,
                                      const aiter_tensor_t& input,
-                                     const aiter_tensor_t& mean);
+                                     const aiter_tensor_t& mean,
+                                     int64_t head_split = 1);
 
 void quantize_v_mxfp4_fp6_p(aiter_tensor_t& out,
                             aiter_tensor_t& scale,
-                            const aiter_tensor_t& input);
+                            const aiter_tensor_t& input,
+                            int64_t head_split = 1);
 
 void quantize_v_mxfp4(aiter_tensor_t& out,
                       aiter_tensor_t& scale,
-                      const aiter_tensor_t& input);
+                      const aiter_tensor_t& input,
+                      int64_t head_split = 1);
 
 } // namespace torch_itfs
 } // namespace aiter
