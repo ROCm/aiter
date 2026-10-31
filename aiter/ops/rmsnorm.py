@@ -548,6 +548,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     use_model_sensitive_rmsnorm: int = 0,
     group_size: int = 0,
     shuffle_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> None:
     # e8m0 (1-byte) block scale is only produced by the HIP module_rmsnorm_quant
     # kernel; the opus dynamicquant backend only emits fp32 per-token scale, so an
@@ -556,9 +557,20 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     if group_size == 0 and not shuffle_scale and not is_e8m0:
         if _use_hip_common(input, use_model_sensitive_rmsnorm):
             add_rmsnorm_quant(  # fast HIP
-                out, input, residual_in, residual_out, yscale, weight, epsilon
+                out,
+                input,
+                residual_in,
+                residual_out,
+                yscale,
+                weight,
+                epsilon,
+                gemma_norm=gemma_norm,
             )
         else:
+            if gemma_norm:
+                raise NotImplementedError(
+                    "Gemma add RMSNorm dynamic quant requires the HIP common path"
+                )
             rmsnorm2d_fwd_with_add_dynamicquant_opus(
                 out,
                 input,
@@ -584,6 +596,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
             epsilon,
             group_size,
             shuffle_scale,
+            gemma_norm=gemma_norm,
         )
 
 
