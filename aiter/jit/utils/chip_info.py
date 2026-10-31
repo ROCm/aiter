@@ -627,6 +627,37 @@ def _get_pci_chip_id(device_id=None):
     return chip_id.value
 
 
+def get_pci_chip_id_sysfs(device_id=None) -> int:
+    """PCI device id (chip id, e.g. ``0x74a5``) of a GPU, read from sysfs.
+
+    A ROCm-version-stable alternative to ``_get_pci_chip_id``, which goes through
+    ``hipDeviceGetAttribute(PciChipId)``: that attribute's ordinal is not stable
+    (10019 before HIP 7.1, 10020 after), and 10019 returns a bogus ``0x200`` on
+    ROCm 7.2.4 / 7.13 / 7.14. The sysfs ``device`` file holds the PCI device id
+    directly, independent of the HIP attribute numbering.
+
+    Builds the PCI BDF path from the Torch device properties
+    (``/sys/bus/pci/devices/<domain>:<bus>:<slot>.0/device``). Raises OSError if
+    the sysfs node cannot be read, leaving any fallback to the caller.
+    """
+    import torch
+
+    if device_id is None:
+        device_id = get_current_hip_device()
+        if device_id is None:
+            raise RuntimeError(
+                "hipGetDevice failed, so there is no current device to read "
+                "the PCI chip id from."
+            )
+    props = torch.cuda.get_device_properties(device_id)
+    path = (
+        f"/sys/bus/pci/devices/{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
+        f"{props.pci_device_id:02x}.0/device"
+    )
+    with open(path) as f:
+        return int(f.read(), 16)
+
+
 MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
 
 
