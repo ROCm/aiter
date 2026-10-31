@@ -17,9 +17,9 @@ counts and no conv bias. Qwen3-Next GDN uses a per-head
 Qwen3.5/3.8-27B) and a biased convolution. The head topology alone (KDA's
 ``lp = H*K`` offsets) cannot express ``VH == ratio*KH``.
 
-Ratio 2 runs the generated, batch-specialised kernels; any other ratio runs the
-hand-written ``_decode_group_ratio`` kernel, which walks a group's value heads
-one state tile at a time.
+Ratio 2 with an fp32 state runs the generated, batch-specialised kernels; any
+other ratio, and any bf16 state, runs the hand-written ``_decode_group_ratio``
+kernel, which walks a group's value heads one state tile at a time.
 
 Support is deliberately narrow and is reported by
 :func:`fused_gdn_decode_qkvz_supported` rather than asserted, so callers fall
@@ -55,12 +55,31 @@ _SUPPORTED_RATIOS = (1, 2, 3, 4)
 # register-resident tile does. See notes/gdn-perf-matrix.md.
 _LARGE_BATCH = 128
 _CONV_WIDTH = 4
+# projected_ba may be [KS, T, 2*VH] fp32 split-K partials (summed in the kernel).
+SUPPORTS_BA_SPLITK_PARTIALS = True
 
 
-def _uses_ratio_generic_kernel(ratio: int, flat: bool, has_qsl: bool) -> bool:
-    """Ratio 2 in the interleaved layout without padding runs the generated pair
-    kernels; every other call runs the ratio-generic kernel."""
-    return ratio != 2 or flat or has_qsl
+def _uses_ratio_generic_kernel(
+    ratio: int,
+    flat: bool,
+    has_qsl: bool,
+    state_dtype: torch.dtype,
+    strided_rows: bool = False,
+) -> bool:
+    """Ratio 2 in the interleaved layout with an fp32 state, dense projection rows and
+    no padding runs the generated pair kernels; every other call runs the
+    ratio-generic kernel."""
+    return (
+        ratio != 2
+        or flat
+        or has_qsl
+        or state_dtype is not torch.float32
+        or strided_rows
+    )
+
+
+def _strided_rows(projected_qkvz: torch.Tensor, projected_ba: torch.Tensor) -> bool:
+    return not (projected_qkvz.is_contiguous() and projected_ba.is_contiguous())
 
 
 def _arch_supported() -> tuple[bool, str]:
@@ -198,8 +217,10 @@ def fused_gdn_decode_qkvz_supported(
     group_width = 2 * head_k_dim + 2 * (v_heads // k_heads) * head_v_dim
     if projected_qkvz.shape != (tokens, k_heads * group_width):
         return False, f"packed qkvz layout mismatch: {tuple(projected_qkvz.shape)}"
-    if projected_ba.shape != (tokens, 2 * v_heads):
+    if projected_ba.shape[-2:] != (tokens, 2 * v_heads) or projected_ba.dim() > 3:
         return False, f"packed ba layout mismatch: {tuple(projected_ba.shape)}"
+    if projected_ba.dim() == 3 and projected_ba.dtype is not torch.float32:
+        return False, "split-K ba partials must be fp32"
     if conv_state.shape[2] != _CONV_WIDTH - 1 or conv_weight.shape != (
         channels,
         _CONV_WIDTH,
@@ -211,9 +232,11 @@ def fused_gdn_decode_qkvz_supported(
     if conv_bias is None:
         return False, "conv bias is required (pass zeros if the model has none)"
 
-    if ssm_state.dtype is not torch.float32:
-        return False, f"ssm_state must be fp32, got {ssm_state.dtype}"
-    bf16_args = (projected_qkvz, projected_ba, conv_state, conv_weight, conv_bias)
+    if ssm_state.dtype not in (torch.float32, torch.bfloat16):
+        return False, f"ssm_state must be fp32 or bf16, got {ssm_state.dtype}"
+    bf16_args = (projected_qkvz, conv_state, conv_weight, conv_bias)
+    if projected_ba.dim() == 2:
+        bf16_args += (projected_ba,)
     if not all(t.dtype is torch.bfloat16 for t in bf16_args):
         return False, "packed projections, conv state/weight/bias must be bf16"
     if A_log.shape != (v_heads,) or A_log.dtype is not torch.float32:
@@ -240,8 +263,6 @@ def fused_gdn_decode_qkvz_supported(
     # The kernels address every one of these with flat pointer arithmetic, so a
     # same-shaped strided view would be read from the wrong locations.
     flat = {
-        "projected_qkvz": projected_qkvz,
-        "projected_ba": projected_ba,
         "ssm_state_indices": ssm_state_indices,
         "conv_weight": conv_weight,
         "conv_bias": conv_bias,
@@ -252,6 +273,13 @@ def fused_gdn_decode_qkvz_supported(
     non_contiguous = [name for name, t in flat.items() if not t.is_contiguous()]
     if non_contiguous:
         return False, f"operands must be contiguous: {', '.join(non_contiguous)}"
+    # Token rows of the projections may be strided (e.g. column views of one GEMM
+    # that also produces ba); each row must be dense.
+    if projected_qkvz.stride(-1) != 1 or projected_ba.stride(-1) != 1:
+        return False, (
+            "projected_qkvz / projected_ba rows must be dense, got strides "
+            f"{projected_qkvz.stride()} / {projected_ba.stride()}"
+        )
     # The recurrent state must be dense within a slot; the slot dimension of both
     # pools may be strided (a serving engine packs a block's conv and recurrent
     # states into one page) and the conv window may be stored channel-major or
@@ -288,12 +316,17 @@ def fused_gdn_decode_qkvz_supported(
         if not query_start_loc.is_contiguous():
             return False, "query_start_loc must be contiguous"
     generic = _uses_ratio_generic_kernel(
-        v_heads // k_heads, qkvz_layout == "flat", query_start_loc is not None
+        v_heads // k_heads,
+        qkvz_layout == "flat",
+        query_start_loc is not None,
+        ssm_state.dtype,
+        _strided_rows(projected_qkvz, projected_ba) or projected_ba.dim() == 3,
     )
     if not generic and not (conv_state.is_contiguous() and ssm_state.is_contiguous()):
         return False, (
             "strided state pools are only supported by the ratio-generic kernel "
-            "(num_v_heads / num_k_heads != 2, the flat layout or query_start_loc); "
+            "(num_v_heads / num_k_heads != 2, the flat layout, query_start_loc, a "
+            "bf16 state or strided projection rows); "
             f"got conv strides {conv_state.stride()}, ssm strides {ssm_state.stride()}"
         )
 
@@ -329,10 +362,14 @@ def fused_gdn_decode_qkvz(
             ``in_proj_qkvz`` output (``ratio = VH // KH``, 1 to 4). Split
             internally; no separate split kernel.
         projected_ba: [T, 2*VH] bf16, packed ``in_proj_ba`` output (betas then a's
-            per key-head group).
+            per key-head group), or [KS, T, 2*VH] fp32 split-K partials of it,
+            summed here. Token rows of both may be strided (each row dense), e.g.
+            column views of one GEMM that produces qkvz and ba together. Partials
+            and strided rows run the ratio-generic kernel.
         conv_state: [N, channels, 3] bf16, rolling conv window. **Mutated in place.**
-        ssm_state: [N, VH, VD, KD] fp32, delta-rule state. **Mutated in place.**
-            On the ratio-generic path (``ratio != 2`` or the flat layout) both
+        ssm_state: [N, VH, VD, KD] fp32 or bf16, delta-rule state. **Mutated in
+            place.** The update runs in fp32 either way; a bf16 state runs the
+            ratio-generic kernel. On the ratio-generic path both
             may be strided along N and ``conv_state`` may be any strided view
             (e.g. the transpose of a width-major [N, 3, channels] buffer);
             ``ssm_state`` stays dense within a slot.
@@ -435,13 +472,23 @@ def fused_gdn_decode_qkvz(
         k_heads,
         v_heads,
     )
-    if _uses_ratio_generic_kernel(ratio, flat, query_start_loc is not None):
+    if _uses_ratio_generic_kernel(
+        ratio,
+        flat,
+        query_start_loc is not None,
+        ssm_state.dtype,
+        _strided_rows(projected_qkvz, projected_ba) or projected_ba.dim() == 3,
+    ):
         # Ratio-generic kernel at every batch size; the bands below hardcode
-        # ratio 2, the interleaved layout and dense pools.
+        # ratio 2, the interleaved layout, dense pools and rows and an fp32 state.
         from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz_ratio import (
             _decode_group_ratio,
         )
 
+        # Row chunks in flight: 12 for an fp32 state (a whole ratio-3 group), 4 for a
+        # bf16 state.
+        num_buffers = 4 if ssm_state.dtype == torch.bfloat16 else 12
+        num_warps = 8
         conv_width = 2 * head_k_dim + ratio * head_v_dim
         has_qsl = query_start_loc is not None
         _decode_group_ratio[(tokens * k_heads,)](
@@ -450,22 +497,28 @@ def fused_gdn_decode_qkvz(
             *launch_args[5:-2],
             *conv_state.stride(),
             ssm_state.stride(0),
+            projected_qkvz.stride(0),
+            projected_ba.stride(-2),
+            projected_ba.stride(0) if projected_ba.dim() == 3 else 0,
             k_heads,
             v_heads,
             head_k_dim,
             head_v_dim,
             ratio,
             1 << (conv_width - 1).bit_length(),
-            # NW, KL, KS: 16 lanes x 4 fp32 per tile row = one contiguous 16 B
-            # access per lane (wider per-lane chunks cost 2-4x in bandwidth).
-            8,
+            # NW, KL, KS: 16 lanes per tile row, KS elements = one contiguous 16 B
+            # access per lane (4 fp32 or 8 bf16; wider chunks cost 2-4x in bandwidth).
+            num_warps,
             16,
-            4,
+            16 // ssm_state.element_size(),
             PAD_SLOT_ID=pad_slot_id,
             HAS_FP8=has_fp8,
             FLAT=flat,
             HAS_QSL=has_qsl,
-            num_warps=8,
+            REG_EPILOGUE=has_fp8,
+            NUM_BUFFERS=num_buffers,
+            BA_KSPLIT=projected_ba.shape[0] if projected_ba.dim() == 3 else 1,
+            num_warps=num_warps,
         )
     elif tokens >= _LARGE_BATCH:
         # Large-batch band: a separate decomposition that keeps the whole [V, K]
