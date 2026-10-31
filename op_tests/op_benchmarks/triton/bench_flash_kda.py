@@ -50,15 +50,22 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import torch
-import triton
 
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
 )
 from aiter.ops.triton.attention.chunk_kda import chunk_kda, prepare_chunk_kda_metadata
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 # (B, T, H, K, V) – H=12 is the Kimi K3 shape this path was built for; the rest
 # bracket it so a regression in the segmentation heuristic shows up as well as a
@@ -219,6 +226,119 @@ def _bytes(B, T, H, K, V, HV, elem_bytes=2):
     return read + write
 
 
+_FLASH_KDA_POOL_FIELDS = [
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "A_log",
+    "dt_bias",
+    "out",
+    "state_cache",
+    "state_indices",
+    "has_initial_state",
+]
+
+
+def _generate_flash_kda_pool_inputs(B, T, H, qkv_bands, tp8_step):
+    """Build one q/k/v/g/beta/A_log/dt_bias set, paged state included for k3-tp8.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry, so
+    replaying through the pool during timing defeats cache residency instead
+    of timing one fixed buffer repeatedly. cu_seqlens, scale and
+    state_v_first are deterministic given the shape (not randomly drawn), so
+    they stay outside the pool: see run_benchmark.
+    """
+    if tp8_step is not None:
+        t = _make_tp8_inputs(*tp8_step, qkv_bands=qkv_bands)
+    else:
+        t = _make_inputs(B, T, H, qkv_bands=qkv_bands)
+    return tuple(t.get(k) for k in _FLASH_KDA_POOL_FIELDS)
+
+
+def _make_flash_kda_kernel_fn(scale, chunks_per_seg, cu_seqlens, state_v_first):
+    def kernel_fn(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        out,
+        state_cache,
+        state_indices,
+        has_initial_state,
+    ):
+        flash_kda_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            lower_bound=LOWER_BOUND,
+            chunks_per_seg=chunks_per_seg,
+            cu_seqlens=cu_seqlens,
+            state_v_first=state_v_first,
+            out=out,
+            state_cache=state_cache,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+        )
+
+    return kernel_fn
+
+
+def _make_chunk_kda_kernel_fn(cu_seqlens, chunk_indices, chunk_offsets, scale):
+    def kernel_fn(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        out,
+        state_cache,
+        state_indices,
+        has_initial_state,
+    ):
+        tokens = {
+            "q": q.flatten(0, 1)[None],
+            "k": k.flatten(0, 1)[None],
+            "v": v.flatten(0, 1)[None],
+            "g": g.flatten(0, 1)[None],
+            "beta": beta.flatten(0, 1)[None],
+        }
+        buffers = {
+            name: val
+            for name, val in (
+                ("out", out),
+                ("state_cache", state_cache),
+                ("state_indices", state_indices),
+                ("has_initial_state", has_initial_state),
+            )
+            if val is not None
+        }
+        chunk_kda(
+            **tokens,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=LOWER_BOUND,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            scale=scale,
+            **buffers,
+        )
+
+    return kernel_fn
+
+
 def _seg_label(chunks_per_seg):
     if chunks_per_seg is None:
         return "auto"
@@ -226,6 +346,8 @@ def _seg_label(chunks_per_seg):
 
 
 def run_benchmark(args):
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     if args.k3_tp8:
         x_vals_list = [
             (1, sum(new), K3_TP8_HEADS, K_DIM, K_DIM) for new, _ in K3_TP8_STEPS
@@ -251,10 +373,36 @@ def run_benchmark(args):
     rows = []
     for i, (B, T, H, K, V) in enumerate(x_vals_list):
         HV = H
-        if args.k3_tp8:
-            t = _make_tp8_inputs(*K3_TP8_STEPS[i], qkv_bands=args.qkv_bands)
+        scale = 1.0 / math.sqrt(K)
+        tp8_step = K3_TP8_STEPS[i] if args.k3_tp8 else None
+        pool_gen = functools.partial(
+            _generate_flash_kda_pool_inputs, B, T, H, args.qkv_bands, tp8_step
+        )
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_FLASH_KDA_POOL_FIELDS], **kwargs_rot_bufs
+        )
+
+        # cu_seqlens is deterministic given the shape, not randomly drawn, so
+        # it stays a single shared tensor outside the pool: flash_kda_fwd's
+        # internal prepare_chunk_indices caches its host-sync result by
+        # cu_seqlens identity, and chunk_kda's own metadata prep needs one
+        # fixed cu_seqlens to build chunk_indices/chunk_offsets once.
+        if tp8_step is not None:
+            new, _ = tp8_step
+            cu_seqlens = torch.tensor(
+                [0, *itertools.accumulate(new)], dtype=torch.int32, device=DEVICE
+            )
+        elif args.impl == "chunk_kda":
+            cu_seqlens = torch.arange(0, B * T + 1, T, dtype=torch.int32, device=DEVICE)
         else:
-            t = _make_inputs(B, T, H, qkv_bands=args.qkv_bands)
+            cu_seqlens = None
+        state_v_first = tp8_step is not None
+
+        if args.impl == "chunk_kda":
+            chunk_indices, chunk_offsets = prepare_chunk_kda_metadata(cu_seqlens)
+            chunk_kernel_fn = _make_chunk_kda_kernel_fn(
+                cu_seqlens, chunk_indices, chunk_offsets, scale
+            )
 
         if args.seg_sweep:
             # A segment longer than the sequence would leave the grid empty.
@@ -264,24 +412,12 @@ def run_benchmark(args):
 
         for m in segs:
             if args.impl == "chunk_kda":
-                fn = _chunk_kda_fn(t)
+                kernel_fn = chunk_kernel_fn
             else:
-                fn = functools.partial(
-                    flash_kda_fwd, **t, lower_bound=LOWER_BOUND, chunks_per_seg=m
+                kernel_fn = _make_flash_kda_kernel_fn(
+                    scale, m, cu_seqlens, state_v_first
                 )
-
-            # Time-based warmup: run until WARMUP_MS elapsed so JIT/autotune completes.
-            _elapsed = 0.0
-            while _elapsed < args.warmup_ms:
-                _t0 = torch.cuda.Event(enable_timing=True)
-                _t1 = torch.cuda.Event(enable_timing=True)
-                _t0.record()
-                fn()
-                _t1.record()
-                torch.cuda.synchronize()
-                _elapsed += _t0.elapsed_time(_t1)
-
-            ms = triton.testing.do_bench(fn, warmup=0, rep=args.rep_ms)
+            ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
             tflops = _flops(B, T, H, K, V, FLASH_KDA_CHUNK) / ms * 1e-9
             bw = _bytes(B, T, H, K, V, HV) / (ms * 1e-3) * 1e-9
 
@@ -358,18 +494,6 @@ def parse_args(args=None):
         "-o",
         action="store_true",
         help="Write results to a CSV file in the current directory.",
-    )
-    parser.add_argument(
-        "--warmup-ms",
-        type=float,
-        default=300.0,
-        help="Warmup budget in ms (time-based, ensures JIT/autotune completes).",
-    )
-    parser.add_argument(
-        "--rep-ms",
-        type=float,
-        default=500.0,
-        help="Measurement budget in ms passed to triton.testing.do_bench.",
     )
     args = parser.parse_args(args=args)
     if args.seg_sweep and args.impl != "flash_kda":

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import sys
 
 import torch
@@ -9,8 +10,17 @@ import triton
 
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
 from aiter.ops.triton.utils._triton import arch_info
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 try:
     from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd as fla_kda
@@ -144,54 +154,63 @@ def traffic_bytes(
     return B * slab + writes + B * T * per_tok
 
 
-def _time(fn, args):
-    """One measurement in ms; cudagraph keeps host launch cost out of the span."""
-    if args.timing == "cudagraph":
-        return _bench_graph(fn, args.graph_ms, args.n_replays)
-    return triton.testing.do_bench(
-        fn, warmup=args.warmup, rep=args.rep, quantiles=[0.5, 0.2, 0.8]
+_KDA_POOL_FIELDS = [
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "A_log",
+    "dt_bias",
+    "initial_state",
+    "cu_seqlens",
+    "ssm_state_indices",
+    "num_accepted_tokens",
+    "conv_state",
+    "conv_weight",
+    "out_gate",
+    "norm_weight",
+    "out",
+]
+
+
+def _generate_kda_pool_inputs(
+    B, T, H, D, dtype, device, paged, gate, num_accepted, fused, state_dtype
+):
+    inputs = make_inputs(
+        B,
+        T,
+        H,
+        D,
+        dtype,
+        device,
+        paged,
+        gate,
+        num_accepted,
+        fused=fused,
+        state_dtype=state_dtype,
     )
+    inputs["out"] = torch.empty_like(inputs["v"])
+    return tuple(inputs.get(k) for k in _KDA_POOL_FIELDS)
 
 
-def _bench_graph(fn, graph_ms, n_replays):
-    """Replay a graph of ~graph_ms of launches; returns (median, p20, p80) ms."""
-    for _ in range(5):
-        fn()
-    torch.cuda.synchronize()
-    ev0, ev1 = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-    ev0.record()
-    for _ in range(20):
-        fn()
-    ev1.record()
-    torch.cuda.synchronize()
-    est_ms = ev0.elapsed_time(ev1) / 20
-    n_per_graph = max(1, int(graph_ms / est_ms)) if est_ms > 0 else 1000
+def _make_gluon_kernel_fn(fixed_kwargs, csu, config):
+    def kernel_fn(**pool_entry):
+        fused_recurrent_kda(
+            **pool_entry,
+            **fixed_kwargs,
+            cache_state_updates=csu,
+            config=config,
+        )
 
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(3):
-            fn()
-        side.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=side):
-            for _ in range(n_per_graph):
-                fn()
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
+    return kernel_fn
 
-    per_iter = []
-    for _ in range(n_replays):
-        s, e = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-        s.record()
-        graph.replay()
-        e.record()
-        torch.cuda.synchronize()
-        per_iter.append(s.elapsed_time(e) / n_per_graph)
-    per_iter.sort()
-    lo = per_iter[int(0.2 * (len(per_iter) - 1))]
-    hi = per_iter[int(0.8 * (len(per_iter) - 1))]
-    return per_iter[len(per_iter) // 2], lo, hi
+
+def _make_fla_kernel_fn(fixed_kwargs):
+    def kernel_fn(**pool_entry):
+        fla_kda(**pool_entry, **fixed_kwargs)
+
+    return kernel_fn
 
 
 def gluon_lines(args):
@@ -250,11 +269,23 @@ def benchmark(args):
     ]
 
     spread = {}
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     @triton.testing.perf_report(configs)
     def bench_kda(H, B, T, provider):
         torch.manual_seed(0)
-        inputs = make_inputs(
+        fixed_kwargs = {
+            "lower_bound": K3_LOWER_BOUND if args.gate else None,
+            "use_gate_in_kernel": args.gate,
+            "use_qk_l2norm_in_kernel": args.gate,
+            "use_beta_sigmoid_in_kernel": args.gate,
+            "output_final_state": True,
+            "inplace_final_state": True,
+            "state_v_first": not args.state_k_first,
+        }
+        pool_gen = functools.partial(
+            _generate_kda_pool_inputs,
             B,
             T,
             H,
@@ -267,12 +298,8 @@ def benchmark(args):
             fused=args.fused,
             state_dtype=state_dtype,
         )
-        shared = dict(
-            inputs,
-            out=torch.empty_like(inputs["v"]),
-            output_final_state=True,
-            inplace_final_state=True,
-            state_v_first=not args.state_k_first,
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_KDA_POOL_FIELDS], **kwargs_rot_bufs
         )
 
         if provider.startswith("gluon:"):
@@ -292,40 +319,34 @@ def benchmark(args):
                 fused=args.fused,
                 state_dtype=state_dtype,
             )
-
-            def fn():
-                fused_recurrent_kda(
-                    **shared,
-                    cache_state_updates=bool(csu),
-                    config={
-                        "BV": bv,
-                        "SK": sk,
-                        "num_warps": nw,
-                        "num_buffers": nb,
-                        "use_tdm_store": bool(ts),
-                        "use_tdm_load": bool(tl),
-                        "use_tdm_fused_load": bool(tf),
-                    },
-                )
+            config = {
+                "BV": bv,
+                "SK": sk,
+                "num_warps": nw,
+                "num_buffers": nb,
+                "use_tdm_store": bool(ts),
+                "use_tdm_load": bool(tl),
+                "use_tdm_fused_load": bool(tf),
+            }
+            kernel_fn = _make_gluon_kernel_fn(fixed_kwargs, bool(csu), config)
 
         else:
             mem = traffic_bytes(
                 B, T, H, D, dtype, args.device, args.paged, state_dtype=state_dtype
             )
+            kernel_fn = _make_fla_kernel_fn(fixed_kwargs)
 
-            def fn():
-                fla_kda(**shared)
-
-        runs = [_time(fn, args) for _ in range(args.runs)]
-        med = sorted(r[0] for r in runs)[len(runs) // 2]
-        lo, hi = min(r[1] for r in runs), max(r[2] for r in runs)
-        best, worst = min(r[0] for r in runs), max(r[0] for r in runs)
-        spread[(H, B, T, provider)] = (best, med, worst, lo, hi)
+        times = sorted(
+            do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+            for _ in range(args.runs)
+        )
+        best, med, worst = times[0], times[len(times) // 2], times[-1]
+        spread[(H, B, T, provider)] = (best, med, worst)
 
         ms = best if args.reduce == "best" else med
         if args.metric == "time":
-            return ms * 1e3, lo * 1e3, hi * 1e3
-        return mem / ms * 1e-9, mem / hi * 1e-9, mem / lo * 1e-9
+            return ms * 1e3
+        return mem / ms * 1e-9
 
     bench_kda.run(save_path="." if args.o else None, print_data=True, show_plots=False)
     report_spread(spread, line_vals, line_names, args)
@@ -333,27 +354,20 @@ def benchmark(args):
 
 def report_spread(spread, line_vals, line_names, args):
     name = dict(zip(line_vals, line_names))
-    flush = "no L2 flush, cache-warm" if args.timing == "cudagraph" else "L2 flushed"
     print(
-        f"\nvariability (us) -- timing={args.timing} ({flush}), "
-        + (
-            f"{args.runs} run(s) x {args.n_replays} replays "
-            f"x {args.graph_ms}ms/graph"
-            if args.timing == "cudagraph"
-            else f"{args.runs} run(s) x rep={args.rep}ms each"
-        )
+        f"\nvariability (us) -- {args.runs} run(s) of do_bench_aiter_triton "
+        "(CUDA graph replay, cache-warm, no L2 flush)"
     )
     hdr = f"{'H':>4}{'B':>5}{'T':>3}  {'backend':<28}{'best':>9}{'med':>9}{'worst':>9}"
-    hdr += f"{'run-run':>9}{'p20-p80':>9}"
+    hdr += f"{'run-run':>9}"
     print(hdr)
     print("-" * len(hdr))
-    for (H, B, T, prov), (best, med, worst, lo, hi) in spread.items():
+    for (H, B, T, prov), (best, med, worst) in spread.items():
         rr = worst / best if best else float("nan")
-        iq = hi / lo if lo else float("nan")
-        flag = "  <-- noisy" if rr > 1.10 or iq > 1.10 else ""
+        flag = "  <-- noisy" if rr > 1.10 else ""
         print(
             f"{H:>4}{B:>5}{T:>3}  {name[prov]:<28}{best * 1e3:9.1f}{med * 1e3:9.1f}"
-            f"{worst * 1e3:9.1f}{rr:8.2f}x{iq:8.2f}x{flag}"
+            f"{worst * 1e3:9.1f}{rr:8.2f}x{flag}"
         )
 
 
@@ -433,29 +447,6 @@ def parse_args():
         default=["gluon"],
         choices=list(BACKENDS),
     )
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
-    parser.add_argument(
-        "--timing",
-        choices=["cudagraph", "do_bench"],
-        default="cudagraph",
-        help="cudagraph: capture graph_ms worth of launches and replay n_replays "
-        "times, so no host work sits inside the measurement (small batch stops "
-        "reporting the ~41 us/call wrapper cost) -- but no L2 flush between "
-        "iterations. do_bench: per-iteration event pairs with a 256 MB flush",
-    )
-    parser.add_argument(
-        "--n_replays",
-        type=int,
-        default=5,
-        help="cudagraph only: graph replays per measurement, each timed separately",
-    )
-    parser.add_argument(
-        "--graph_ms",
-        type=float,
-        default=100.0,
-        help="cudagraph only: target ms of work captured into one graph",
-    )
     parser.add_argument(
         "--runs",
         type=int,
@@ -469,13 +460,9 @@ def parse_args():
         help="which of the --runs measurements lands in the main table",
     )
     parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="bandwidth",
-        choices=["time", "bandwidth"],
-        default="bandwidth",
-        help="Metrics for the kernel benchmark.",
+
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="bandwidth"
     )
     parser.add_argument(
         "-o",
