@@ -65,11 +65,13 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils imp
     exp,
     exp2,
     input_guard,
-    tensor_cache,
+    upload_ints,
+    wait_for_upload,
 )
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
-    prepare_chunk_indices,
+    chunk_index_pairs,
+    seq_bounds,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
@@ -902,11 +904,20 @@ def _gluon_k2_usable(C: int, K: int, V: int) -> bool:
     )
 
 
-def _tdm_operand(x: torch.Tensor, tdm: bool) -> tuple[torch.Tensor, int]:
-    """``x`` ``[B, T, H, D]`` and its token stride: ``x`` itself if ``tdm`` and
-    the gfx1250 Gluon kernels can read it in place, else a packed copy."""
+def _strided_operand(x: torch.Tensor, in_place: bool) -> tuple[torch.Tensor, int]:
+    """``x`` ``[B, T, H, D]`` and its token stride: ``x`` itself if ``in_place``
+    and the Gluon kernels can read it at its own token stride, else a packed copy."""
     B, T, H, D = x.shape
-    if tdm and B == 1 and T > 1 and x.stride(3) == 1 and (H == 1 or x.stride(2) == D):
+    readable = B == 1 and T > 1 and x.stride(3) == 1 and (H == 1 or x.stride(2) == D)
+    # The gfx950 kernels use 32-bit element offsets and 16-byte vector loads,
+    # so the rows must be 16-byte aligned.
+    if readable and DEVICE_ARCH == "gfx950":
+        readable = (
+            (T - 1) * x.stride(1) + H * D < 2**31
+            and x.data_ptr() % 16 == 0
+            and x.stride(1) * x.element_size() % 16 == 0
+        )
+    if in_place and readable:
         return x, x.stride(1)
     return x.contiguous(), H * D
 
@@ -1079,35 +1090,30 @@ def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> in
     return max(1, min(n_chunks_max, 1 << round(math.log2(n_chunks_max / segs))))
 
 
-@tensor_cache
-def _seq_bounds(cu_seqlens: torch.Tensor) -> tuple[tuple[int, int], ...]:
-    """``(bos, eos)`` per sequence.
-
-    Cached because reading it is a device-to-host copy issued after the prepare
-    kernel has been queued, so an uncached call stalls the host on that kernel
-    on every invocation rather than only on the first.
-    """
-    bounds = cu_seqlens.tolist()
-    return tuple((bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1))
+def _align4(n: int) -> int:
+    # 16 bytes of int32: fast_launch keys on 16-byte pointer alignment.
+    return -(-n // 4) * 4
 
 
 @functools.lru_cache(maxsize=64)
-def _build_segments(
+def _build_metadata(
     seqs: tuple[tuple[int, int], ...],
     C: int,
     chunks_per_seg: int,
     device: torch.device,
 ):
-    """Descriptors for the segmented recurrence.
+    """K1's chunk indices and the descriptors for the segmented recurrence.
 
-    Returns ``(desc, seq_seg_off, num_segs, max_segs_per_seq)`` where ``desc`` is
-    a ``[6, num_segs]`` int32 tensor holding, per segment: the global chunk index
-    it starts at (indexing the K1 workspace), its chunk count, its first and
-    one-past-last token, its sequence, and whether it ends that sequence.
+    Returns ``(chunk_indices, desc, seq_seg_off, num_segs, max_segs_per_seq,
+    stream)``. ``chunk_indices`` is ``prepare_chunk_indices``' ``[NT, 2]`` table.
+    ``desc`` is a ``[6, num_segs]`` int32 tensor holding, per segment: the
+    global chunk index it starts at (indexing the K1 workspace), its chunk
+    count, its first and one-past-last token, its sequence, and whether it ends
+    that sequence. All three share one buffer and one non-blocking upload, made
+    on ``stream`` (see ``wait_for_upload``).
 
-    Cached on the sequence bounds: building these costs a Python loop and a host
-    to device copy, which at this kernel's runtime is not noise, and a serving
-    loop repeats the same shapes.
+    Cached on the sequence bounds, so the layers of a forward pass share the
+    Python loop and the upload.
     """
     chunk_base, nchunks, tok_base, tok_end, seq_id, is_last = [], [], [], [], [], []
     seq_seg_off = [0]
@@ -1127,16 +1133,29 @@ def _build_segments(
         seq_seg_off.append(len(chunk_base))
         g_chunk += nch
 
-    desc = torch.tensor(
-        [chunk_base, nchunks, tok_base, tok_end, seq_id, is_last],
-        dtype=torch.int32,
-        device=device,
+    num_segs = len(chunk_base)
+    pairs = chunk_index_pairs(seqs, C)
+    desc_at = _align4(len(pairs))
+    off_at = desc_at + _align4(6 * num_segs)
+    buf = [0] * (off_at + len(seq_seg_off))
+    buf[: len(pairs)] = pairs
+    buf[desc_at : desc_at + 6 * num_segs] = (
+        chunk_base + nchunks + tok_base + tok_end + seq_id + is_last
     )
-    off = torch.tensor(seq_seg_off, dtype=torch.int32, device=device)
+    buf[off_at:] = seq_seg_off
+    dev_buf, stream = upload_ints(buf, torch.int32, device)
+
     max_per_seq = max(
         seq_seg_off[i + 1] - seq_seg_off[i] for i in range(len(seq_seg_off) - 1)
     )
-    return desc, off, len(chunk_base), max_per_seq
+    return (
+        dev_buf[: len(pairs)].view(-1, 2),
+        dev_buf[desc_at : desc_at + 6 * num_segs].view(6, num_segs),
+        dev_buf[off_at:],
+        num_segs,
+        max_per_seq,
+        stream,
+    )
 
 
 _prepare_fast = fast_launch(_flash_kda_prepare_kernel)
@@ -1199,6 +1218,7 @@ def flash_kda_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Two-kernel KDA forward, with an optional segmented (context parallel) scan.
@@ -1218,8 +1238,8 @@ def flash_kda_fwd(
         output_final_state: Allocate and return the final state.
         state_v_first:      V-first state layout.
         cu_seqlens:         ``[N + 1]`` for varlen; ``B`` must be 1.
-        chunk_indices:      Output of ``prepare_chunk_indices``; computed here
-                            when omitted.
+        chunk_indices:      Output of ``prepare_chunk_indices``; built here
+                            from the sequence bounds when omitted.
         chunks_per_seg:     Segment length for the parallel scan. None picks a
                             value from the head count; <= 0 disables it.
         out:                Optional output buffer, same shape as ``v``, and
@@ -1236,6 +1256,10 @@ def flash_kda_fwd(
                             ``[0, slots)``. Not range-checked: that would
                             need a host sync per call.
         has_initial_state:  Bool ``[N]``; false starts that sequence from zero.
+        cu_seqlens_cpu:     ``cu_seqlens`` on the host, trusted to hold the same
+                            values. When given, ``cu_seqlens`` is never read
+                            back to the host; otherwise it is read once per
+                            tensor (``seq_bounds``).
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is
@@ -1271,34 +1295,17 @@ def flash_kda_fwd(
 
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
     use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
-    # The gfx1250 Gluon kernels read q, k, g (K1) and v (K2) at their own token
-    # stride. Every other kernel needs them packed.
-    stride_q = stride_k = stride_g = H * K
-    stride_v = H * V
-    if not (
-        q.is_contiguous()
-        and k.is_contiguous()
-        and g.is_contiguous()
-        and v.is_contiguous()
-    ):
-        tdm = DEVICE_ARCH == "gfx1250"
-        q, stride_q = _tdm_operand(q, tdm and use_gluon_k1)
-        k, stride_k = _tdm_operand(k, tdm and use_gluon_k1)
-        g, stride_g = _tdm_operand(g, tdm and use_gluon_k1)
-        v, stride_v = _tdm_operand(v, tdm and use_gluon_k2)
 
     if cu_seqlens is not None:
         if B != 1:
             raise ValueError(f"Varlen mode requires B=1, got {B}.")
-        if chunk_indices is None:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, C)
         N = cu_seqlens.numel() - 1
         NT = 0
-        total_tiles = chunk_indices.shape[0]
+        seqs = seq_bounds(cu_seqlens, cu_seqlens_cpu)
     else:
         N = B
         NT = triton.cdiv(T, C)
-        total_tiles = B * NT
+        seqs = tuple((b * T, b * T + T) for b in range(B))
 
     if paged:
         _check_paged_state_cache(
@@ -1311,21 +1318,26 @@ def flash_kda_fwd(
             K=K,
         )
 
-    if cu_seqlens is not None:
-        seqs = _seq_bounds(cu_seqlens)
-    else:
-        seqs = tuple((b * T, b * T + T) for b in range(B))
-
     # Longest sequence in chunks: segmentation is judged per sequence, and
-    # passing it as the segment length is what disables segmentation. Resolved
-    # here rather than next to _build_segments because K1 launches first and the
-    # cache modifiers below depend on the answer.
+    # passing it as the segment length is what disables segmentation.
     n_chunks_max = max(triton.cdiv(eos - bos, C) for bos, eos in seqs)
     if chunks_per_seg is None:
         chunks_per_seg = _choose_chunks_per_seg(n_chunks_max, N, H, V)
     elif chunks_per_seg <= 0:
         chunks_per_seg = n_chunks_max
     segmented = n_chunks_max > chunks_per_seg
+
+    built_indices, desc, seq_seg_off, num_segs, max_segs, upload_stream = (
+        _build_metadata(seqs, C, chunks_per_seg, dev)
+    )
+    # The three tables are views of one buffer, which built_indices starts.
+    wait_for_upload(upload_stream, built_indices)
+    if cu_seqlens is not None:
+        if chunk_indices is None:
+            chunk_indices = built_indices
+        total_tiles = chunk_indices.shape[0]
+    else:
+        total_tiles = B * NT
 
     CM_LOAD = ".cg"
     CM_STORE = "" if segmented else ".wt"
@@ -1347,15 +1359,31 @@ def flash_kda_fwd(
     # here for the same reason.
     ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
 
-    # Only a segmented shape has a pass A. On gfx950, pass C's route is final
-    # here when unsegmented; segmented, it is settled once the segment count is
-    # known.
+    # Only a segmented shape has a pass A. On gfx950, a segmented pass C takes
+    # its route from the segment count.
     use_gluon_k2a = use_gluon_k2 and segmented
     use_gluon_k2c = (
         use_gluon_k2
         and _GLUON_K2C_ARCH_OK
         and (DEVICE_ARCH == "gfx1250" or segmented or _k2c_gluon_usable(False, V, N, H))
     )
+    if use_gluon_k2c and DEVICE_ARCH == "gfx950" and segmented:
+        use_gluon_k2c = _k2c_gluon_usable(True, V, num_segs, H)
+    # The Gluon kernels read q, k, g (K1) and v (passes A and C) at their own
+    # token stride. The Triton kernels need them packed.
+    stride_q = stride_k = stride_g = H * K
+    stride_v = H * V
+    if not (
+        q.is_contiguous()
+        and k.is_contiguous()
+        and g.is_contiguous()
+        and v.is_contiguous()
+    ):
+        v_in_place = use_gluon_k2c and (use_gluon_k2a or not segmented)
+        q, stride_q = _strided_operand(q, use_gluon_k1)
+        k, stride_k = _strided_operand(k, use_gluon_k1)
+        g, stride_g = _strided_operand(g, use_gluon_k1)
+        v, stride_v = _strided_operand(v, v_in_place)
     # sigmoid(beta) per tile, read only by the gfx950 Gluon K2.
     ws_beta = (
         torch.empty(H * total_tiles, C, dtype=torch.float32, device=dev)
@@ -1370,13 +1398,7 @@ def flash_kda_fwd(
             )
 
             k1_warps, k1_waves = _k1_gluon_schedule()
-            k1_args = {
-                "stride_q": stride_q,
-                "stride_k": stride_k,
-                "stride_g": stride_g,
-                "num_warps": k1_warps,
-                "waves_per_eu": k1_waves,
-            }
+            k1_args = {"num_warps": k1_warps, "waves_per_eu": k1_waves}
         else:
             from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.flash_kda_k1 import (
                 gluon_k1_prepare,
@@ -1408,6 +1430,9 @@ def flash_kda_fwd(
             T=T,
             NT=NT,
             TOTAL_TILES=total_tiles,
+            stride_q=stride_q,
+            stride_k=stride_k,
+            stride_g=stride_g,
             H=H,
             K=K,
             C=C,
@@ -1448,9 +1473,6 @@ def flash_kda_fwd(
             CM_WS=CM_STORE,
         )
 
-    desc, seq_seg_off, num_segs, max_segs = _build_segments(
-        seqs, C, chunks_per_seg, dev
-    )
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
 
     # The kernel indexes h_in by segment, so normalize a V-first initial state
@@ -1574,6 +1596,7 @@ def flash_kda_fwd(
                 seg_tok_base=seg_tok_base,
                 seg_tok_end=seg_tok_end,
                 TOTAL_TILES=total_tiles,
+                stride_v=stride_v,
                 H=H,
                 K=K,
                 V=V,
@@ -1624,19 +1647,13 @@ def flash_kda_fwd(
         h_in = None if paged else h0
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
-    if use_gluon_k2c and DEVICE_ARCH == "gfx950" and segmented:
-        use_gluon_k2c = _k2c_gluon_usable(True, V, num_segs, H)
     _log_route(
         use_gluon_k1, use_gluon_k2a if segmented else None, use_gluon_k2c, C, K, V
     )
     if use_gluon_k2c:
         if DEVICE_ARCH == "gfx1250":
             sched = _k2_gluon_schedule(V, num_segs, H, "k2_c_gluon")
-            arch_args = {
-                "beta_raw": beta,
-                "stride_v": stride_v,
-                "CPL": sched.kwargs["CPL"],
-            }
+            arch_args = {"beta_raw": beta, "CPL": sched.kwargs["CPL"]}
         else:
             sched = _k2c_gluon_schedule(segmented)
             arch_args = {"ws_beta": ws_beta}
@@ -1658,6 +1675,7 @@ def flash_kda_fwd(
             seg_is_last=seg_is_last,
             **(paged_args if paged else unpaged_args),
             TOTAL_TILES=total_tiles,
+            stride_v=stride_v,
             H=H,
             K=K,
             V=V,
