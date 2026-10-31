@@ -354,6 +354,8 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
     steps = HEAD_DIM // DIM_PER_STEP                       # 16 steps of 8 dims
     inv_divisor = 1.0 / divisor
     per_page = NUM_HEADS * HEAD_DIM                        # elements of one q row
+    q_dwords = q_row_bytes // 4                            # 256 packed bf16 words
+    q_stage_steps = (q_dwords + threads - 1) // threads if is_fp8 else 0
     dtype_tag = "fp8" if is_fp8 else "bf16"
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_{dtype_tag}"
@@ -393,10 +395,40 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
     def _scale_bf16(ks_rsrc, phys, off):   # no scale: the dequant multiplier is 1
         return fx.Float32(1.0)
 
+    # Round F: change only fp8 Q storage, keeping bf16 scalar (and the separate
+    # WMMA builder) untouched.  Pick closures at build time, just like key_vals:
+    # no pointer is bound inside a traced dtype branch and then used outside it.
+    def _q_lds_fp8(q_rsrc):
+        return fx.SharedAllocator(base_alignment=16, static=True).allocate(
+            fx.Array[fx.Int32, q_dwords, 16]
+        ).peek().ptr
+
+    def _q_direct_bf16(q_rsrc):
+        return q_rsrc
+
+    def _q_load_fp8(q_ptr, q_base, h, s):
+        # Element offsets are dwords.  Every 4-word consumer is 16-byte aligned
+        # and entirely inside [0, 256); unpacking/accumulation below is unchanged.
+        return Vec(fx.ptr_load(
+            q_ptr + h * (HEAD_DIM // 2) + s * 4,
+            result_type=Vec.make_type(4, fx.Int32),
+        ))
+
+    def _q_load_bf16(q_ptr, q_base, h, s):
+        return _ld_vec(q_ptr, q_base + h * (HEAD_DIM * 2) + s * 16, 4, fx.Int32)
+
+    def _q_barrier_fp8():
+        fx.gpu.barrier()
+
+    def _q_barrier_bf16():
+        pass
+
     if is_fp8:
         key_vals, ks_bytes, scale_of = _key_vals_fp8, _ks_bytes_fp8, _scale_fp8
+        q_storage, q_load, q_barrier = _q_lds_fp8, _q_load_fp8, _q_barrier_fp8
     else:
         key_vals, ks_bytes, scale_of = _key_vals_bf16, _ks_bytes_bf16, _scale_bf16
+        q_storage, q_load, q_barrier = _q_direct_bf16, _q_load_bf16, _q_barrier_bf16
 
     @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
     def kernel(
@@ -435,6 +467,20 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         rst_rsrc = _plane(RST, fx.Int64(rows) * fx.Int64(4))
         ks_rsrc = _plane(KS, ks_bytes(num_pages))
 
+        # fp8 only: cooperatively stage the row's 1 KiB packed bf16 Q once.
+        # The allocator and barrier are unconditional (output tails and invalid
+        # metadata participate).  The bf16 closures are a descriptor passthrough
+        # and a no-op, with a constexpr zero-trip staging loop: no LDS or barrier.
+        q_ptr = q_storage(q_rsrc)
+        q_base = row * per_page * 2
+        for qi in range_constexpr(q_stage_steps):
+            q_dw = tid + qi * threads
+            safe_q_dw = _imin(q_dw, fx.Int32(q_dwords - 1))
+            q_word = _ld_i32(q_rsrc, q_base + safe_q_dw * 4)
+            if q_dw < q_dwords:
+                fx.ptr_store(q_word, q_ptr + safe_q_dw)
+        q_barrier()
+
         # --- row metadata: visible count (identical to the golden's visible_groups)
         req = _ld_i32(t2r_rsrc, row * 4)
         req_ok = (req >= 0) & (req < num_requests)
@@ -466,7 +512,6 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         phys = page_ok.select(phys, 0)
 
         # --- score: sum_h relu(q[t,h,:] . k[c]) / sqrt(128)
-        q_base = row * per_page * 2
         k_base = phys * page_bytes + off * key_row_bytes
         zero = fx.Float32(0.0)
         acc = [zero, zero, zero, zero]
@@ -474,7 +519,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
             kraw = _ld_vec(kv_rsrc, k_base + s * k_bytes, k_dwords, fx.Int32)
             kv = key_vals(kraw)
             for h in range_constexpr(NUM_HEADS):
-                qraw = _ld_vec(q_rsrc, q_base + h * (HEAD_DIM * 2) + s * 16, 4, fx.Int32)
+                qraw = q_load(q_ptr, q_base, h, s)
                 qs = []
                 for j in range_constexpr(4):
                     dw = fx.Int32(qraw[j])

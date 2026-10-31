@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""Compile-only check for the v0 kernel: NO device, NO kernel launch.
+"""Stock FlyDSL tracing-only check: NO device, NO kernel launch.
 
-Runs in a container started without ``--device=/dev/kfd`` / ``--device=/dev/dri``,
-so it cannot touch the GPU. It exercises the whole FlyDSL lowering path for both
-dtype specializations (bf16 and fp8) and reports whether a code object was
-produced, plus its sha256.
+Run in a container without ``--device=/dev/kfd`` / ``--device=/dev/dri``.
+``COMPILE_ONLY=1`` traces bf16 scalar, fp8 LDS-Q, and bf16 WMMA specializations;
+it does not run the LLVM backend or produce a code object on dev886.  The
+``[COMPILED]`` markers mean trace success, NOT a real GPU build or dispatch.
 
     COMPILE_ONLY=1 python3 compile_only.py
 """

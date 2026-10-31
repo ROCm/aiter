@@ -3,9 +3,12 @@
 
 The v0 kernel wedged the device on its first dispatch (dmesg:
 ``VM_PAGE_FAULT size=0x1000 start=0x16bf5fff000``).  This script runs nothing: it
-re-derives, in plain Python, **every global address** the kernel can compute for
-a shape and checks it against the extent of the plane it belongs to.  It is the
-offline half of "this kernel cannot fault the device":
+re-derives, in plain Python, **every global and Q LDS address** the scalar kernel
+can compute for a shape and checks it against the extent of its plane.  The fp8
+cache path stages packed bf16 Q with scalar global loads and predicated LDS
+stores, then consumes aligned 16-byte LDS chunks; bf16 keeps global vector loads.
+The round-C bf16 WMMA address audit and its gate cases are retained separately.
+This is the offline half of "this kernel cannot fault the device":
 
   * ``analytic`` — closed-form bounds.  Every address expression is monotone in
     ``(row, col, phys, off, s)``, so its maximum over the whole domain is the
@@ -42,6 +45,7 @@ HEADS = 4         # index heads
 HDIM = 128        # head dim
 THREADS = 256     # one thread per output column
 Q_ROW_BYTES = HEADS * HDIM * 2          # 1024 B
+Q_DWORDS = Q_ROW_BYTES // 4             # packed bf16 dwords staged for fp8
 STEPS = HDIM // 8                       # 16 unrolled head-dim steps
 MAX_I32 = 2**31 - 1
 V0_SENTINEL = 0x7FFFFFFF                # v0's "dropped" store byte offset
@@ -61,6 +65,9 @@ def columns_of(width, max_columns):
 def plane_sizes(rows, requests, width, cache_pages, fmt, columns):
     kv_elem = 1 if fmt == "fp8" else 2
     return {
+        # LDS is one 1 KiB row per workgroup, not rows * 1 KiB.  bf16 does not
+        # allocate it and its existing plane extents stay unchanged.
+        **({"q_lds": Q_ROW_BYTES} if fmt == "fp8" else {}),
         "q": rows * Q_ROW_BYTES,
         "compressed_k_cache": cache_pages * PAGE * HDIM * kv_elem,
         "compressed_k_scale": cache_pages * PAGE * 4 if fmt == "fp8" else 4,
@@ -105,10 +112,16 @@ class Checker:
         self.i32 = []
         self.n = 0
         self.n_stores = 0
+        self.n_by_plane = {}
+        self.n_stores_by_plane = {}
+        self.unaligned = []
         self.max_end = {}
 
-    def acc(self, plane, off, nbytes, detail=""):
+    def acc(self, plane, off, nbytes, detail="", alignment=1):
         self.n += 1
+        self.n_by_plane[plane] = self.n_by_plane.get(plane, 0) + 1
+        if off % alignment and len(self.unaligned) < 20:
+            self.unaligned.append((plane, off, alignment, detail))
         end = off + nbytes
         size = self.sizes[plane]
         prev = self.max_end.get(plane)
@@ -121,9 +134,10 @@ class Checker:
             if len(self.i32) < 20:
                 self.i32.append((plane, off, nbytes, detail))
 
-    def store(self, plane, off, nbytes, detail=""):
+    def store(self, plane, off, nbytes, detail="", alignment=1):
         self.n_stores += 1
-        self.acc(plane, off, nbytes, detail)
+        self.n_stores_by_plane[plane] = self.n_stores_by_plane.get(plane, 0) + 1
+        self.acc(plane, off, nbytes, detail, alignment)
 
 
 def audit_analytic(rows, requests, width, cache_pages, fmt, max_columns=None):
@@ -143,8 +157,20 @@ def audit_analytic(rows, requests, width, cache_pages, fmt, max_columns=None):
     c.acc("context_lens", (requests - 1) * 4, 4, "safe_req <= num_requests-1")
     c.acc("page_table", ((requests - 1) * width + (width - 1)) * 4, 4,
           "safe_req, safe_logical at max")
-    c.acc("q", last_row * Q_ROW_BYTES + (HEADS - 1) * HDIM * 2 + (STEPS - 1) * 16, 16,
-          "row, h, s at max")
+    if fmt == "fp8":
+        # Every lane loads a clamped dword, even if the following store is not
+        # taken.  Surplus lanes therefore repeat this last safe scalar address.
+        c.acc("q", last_row * Q_ROW_BYTES + (Q_DWORDS - 1) * 4, 4,
+              "row, safe_q_dw at max (scalar stage load)", alignment=4)
+        c.store("q_lds", (Q_DWORDS - 1) * 4, 4,
+                "q_dw < q_dwords; safe_q_dw at max", alignment=4)
+        c.acc("q_lds", (HEADS - 1) * HDIM * 2 + (STEPS - 1) * 16, 16,
+              "h, s at max (vector LDS read)", alignment=16)
+        c.store("q_lds", 0, 4, "first staging writer", alignment=4)
+        c.acc("q_lds", 0, 16, "first consumer chunk", alignment=16)
+    else:
+        c.acc("q", last_row * Q_ROW_BYTES + (HEADS - 1) * HDIM * 2 + (STEPS - 1) * 16, 16,
+              "row, h, s at max")
     c.acc("compressed_k_cache",
           (cache_pages - 1) * page_bytes + (PAGE - 1) * key_row_bytes + (STEPS - 1) * k_bytes,
           k_bytes, "phys, off, s at max")
@@ -153,7 +179,7 @@ def audit_analytic(rows, requests, width, cache_pages, fmt, max_columns=None):
               "phys, off at max")
 
     # --- the min corner: every index is >= 0 after the masks, so 0 is the min
-    for plane, width_bytes in (("q", 16), ("compressed_k_cache", k_bytes),
+    for plane, width_bytes in (("q", 4 if fmt == "fp8" else 16), ("compressed_k_cache", k_bytes),
                                ("page_table", 4), ("token_to_request", 4),
                                ("query_positions", 4), ("context_lens", 4)):
         c.acc(plane, 0, width_bytes, "min corner (all indices clamped >= 0)")
@@ -180,10 +206,13 @@ def audit_analytic(rows, requests, width, cache_pages, fmt, max_columns=None):
         },
         "accesses": c.n,
         "stores": c.n_stores,
+        "accesses_by_plane": c.n_by_plane,
+        "stores_by_plane": c.n_stores_by_plane,
+        "unaligned": c.unaligned,
         "oob": c.oob,
         "i32": c.i32,
         "max_offset_plus_width": {k: v[0] for k, v in c.max_end.items()},
-        "ok": not c.oob and not c.i32,
+        "ok": not c.oob and not c.i32 and not c.unaligned,
     }
 
 
@@ -223,7 +252,23 @@ def audit_enumerate(rows, requests, width, cache_pages, fmt, max_columns=None,
     cols = _visit_cols(columns, threads, full)
     c = Checker(sizes)
     sentinel = 0
+    ptiles = sorted({col // threads for col in cols})
     for row in row_iter:
+        if fmt == "fp8":
+            # Staging is block-wide and precedes metadata/output predicates.
+            # Even boundary-only audits enumerate *all* staging lanes of each
+            # represented block, including surplus lanes whose store is skipped.
+            for ptile in ptiles:
+                for qi in range((Q_DWORDS + threads - 1) // threads):
+                    for tid in range(threads):
+                        q_dw = tid + qi * threads
+                        safe_q_dw = min(q_dw, Q_DWORDS - 1)
+                        detail = f"row={row} ptile={ptile} tid={tid} qi={qi} q_dw={q_dw}"
+                        c.acc("q", row * Q_ROW_BYTES + safe_q_dw * 4, 4,
+                              detail + " (clamped scalar stage load)", alignment=4)
+                        if q_dw < Q_DWORDS:
+                            c.store("q_lds", safe_q_dw * 4, 4,
+                                    detail + " (predicated stage store)", alignment=4)
         c.acc("token_to_request", row * 4, 4, f"row={row}")
         c.acc("query_positions", row * 4, 4, f"row={row}")
         for col in cols:
@@ -247,8 +292,13 @@ def audit_enumerate(rows, requests, width, cache_pages, fmt, max_columns=None,
                           f"phys={phys} off={off} page_ok={page_ok}")
             for h in range(HEADS):
                 for s in range(STEPS):
-                    c.acc("q", row * Q_ROW_BYTES + h * HDIM * 2 + s * 16, 16,
-                          f"row={row} h={h} s={s}")
+                    if fmt == "fp8":
+                        # No row term: q_ptr addresses this workgroup's LDS row.
+                        c.acc("q_lds", (h * (HDIM // 2) + s * 4) * 4, 16,
+                              f"row={row} col={col} h={h} s={s}", alignment=16)
+                    else:
+                        c.acc("q", row * Q_ROW_BYTES + h * HDIM * 2 + s * 16, 16,
+                              f"row={row} h={h} s={s}")
             if col_ok:
                 idx = min(row * columns + col, rows * columns - 1)
                 c.store("logits", idx * 4, 4, f"row={row} col={col}")
@@ -268,13 +318,16 @@ def audit_enumerate(rows, requests, width, cache_pages, fmt, max_columns=None,
         "sizes": sizes,
         "accesses": c.n,
         "stores": c.n_stores,
+        "accesses_by_plane": c.n_by_plane,
+        "stores_by_plane": c.n_stores_by_plane,
+        "unaligned": c.unaligned,
         "oob": c.oob,
         "i32": c.i32,
         "max_offset_plus_width": {k: v[0] for k, v in c.max_end.items()},
         "sentinel_events": sentinel,
         "sentinel_dropped_if_armed": all(
             V0_SENTINEL >= max(sizes[p], 1) for p in ("logits", "visible_groups", "row_starts")),
-        "ok": not c.oob and not c.i32,
+        "ok": not c.oob and not c.i32 and not c.unaligned,
     }
 
 
@@ -428,6 +481,9 @@ def cases():
         ("wm_draft_16x65536_bf16", 16, 16, 16384, 738964, "bf16", None),
         ("wm_prefill_512x65536_bf16", 512, 2, 16384, 738964, "bf16", None),
         ("wm_i32_cap_8191x65536_bf16", 8191, 2, 16384, 738964, "bf16", None),
+        # round F fp8 LDS path: tail blocks participate fully in staging/barrier.
+        ("fp8_lds_tail_cols_1", 1, 1, 1, 4, "fp8", 1),
+        ("fp8_lds_tail_cols_257", 4, 2, 65, 256, "fp8", 257),
     ]
 
 
@@ -493,6 +549,15 @@ def main(argv=None) -> int:
                           if k in ("q", "compressed_k_cache", "logits")}))
                 for (plane, off, nbytes, size, detail) in w["oob"][:3]:
                     print("        WMMA OOB %s off=%d+%d > %d (%s)" % (plane, off, nbytes, size, detail))
+            if fmt == "fp8":
+                print("       q LDS: extent=%d global scalar loads=%d LDS stores=%d "
+                      "vector reads=%d unaligned=%d"
+                      % (e["sizes"]["q_lds"], e["accesses_by_plane"]["q"],
+                         e["stores_by_plane"]["q_lds"],
+                         e["accesses_by_plane"]["q_lds"] - e["stores_by_plane"]["q_lds"],
+                         len(a["unaligned"]) + len(e["unaligned"])))
+            for issue in (a["unaligned"] + e["unaligned"])[:3]:
+                print("        UNALIGNED %s off=%d alignment=%d (%s)" % issue)
             if oversized:
                 print("        over i32 cap: %s" % oversized)
             for (plane, off, nbytes, size, detail) in (a["oob"] + e["oob"])[:3]:
