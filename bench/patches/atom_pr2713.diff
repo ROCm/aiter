@@ -1,0 +1,331 @@
+diff --git a/atom/model_ops/moe.py b/atom/model_ops/moe.py
+index a689f71b90..ead18bcfa2 100644
+--- a/atom/model_ops/moe.py
++++ b/atom/model_ops/moe.py
+@@ -20,6 +20,7 @@
+     moe_shuffle_scale,
+     moe_shuffle_weight,
+ )
++from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
+ from torch import nn
+ from transformers import PretrainedConfig
+ 
+@@ -1512,6 +1513,15 @@ def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+             self.use_triton_decode = False
+             self.use_triton_ep = False
+ 
++        # AITER_FLYDSL_USE_HERD: aiter's gfx1250 HERD drop, TP only (no expert_mask).
++        self.use_flydsl_herd = (
++            _FLYDSL_USE_HERD
++            and self.is_gfx1250
++            and self.is_guinterleave
++            and not ep_moe
++            and not getattr(get_current_atom_config(), "eplb_enable", False)
++        )
++
+         # Triton MoE under EP exists only for gfx95x and gfx125x -- those are the
+         # arches whose branch-A weight prep and gluon experts are wired up. The
+         # arch test that computes `use_triton_moe` above is bypassed whenever
+@@ -2066,6 +2076,22 @@ def select_experts(
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """The base routing over the layer's logical experts, its prefilled
+         shared column widened in where the legacy layout fuses one."""
++        if self._flydsl_herd_step(layer, router_logits):
++            # Raw Top-(K+1) scores; fused_moe(herd_topk=K) drops and scales.
++            return FusedMoE.select_experts(
++                hidden_states=x,
++                router_logits=router_logits,
++                top_k=layer.top_k + 1,
++                use_grouped_topk=layer.use_grouped_topk,
++                topk_group=layer.topk_group,
++                num_expert_group=layer.num_expert_group,
++                renormalize=False,
++                scoring_func=layer.scoring_func,
++                e_score_correction_bias=layer.e_score_correction_bias,
++                # Pad rows as _select_logical routes them: aiter's HERD drop
++                # skips -1 rows only with the count pure TP no longer passes.
++                mask_pad_rows=layer.use_ep,
++            )
+         layout = layer.expert_layout
+         return _select_logical(
+             layer,
+@@ -2252,6 +2278,14 @@ def apply(
+                 )
+             return _moe_result
+ 
++        # Top-(K+1) HERD candidates; a fused shared column also widens by one.
++        herd_topk = (
++            layer.top_k
++            if self.use_flydsl_herd
++            and layer.num_fused_shared_experts == 0
++            and topk_ids.shape[1] == layer.top_k + 1
++            else 0
++        )
+         a1_scale = getattr(layer, "w13_input_scale", None)
+         a2_scale = getattr(layer, "w2_input_scale", None)
+         moe_extra_args = {
+@@ -2269,6 +2303,14 @@ def apply(
+             moe_extra_args["linear_beta"] = getattr(
+                 layer, "activation_situ_linear_beta", None
+             )
++        if herd_topk:
++            moe_extra_args["herd_topk"] = herd_topk
++            # The scale select_experts folds in: grouped top-k and sqrtsoftplus.
++            moe_extra_args["herd_routed_scaling_factor"] = (
++                layer.routed_scaling_factor
++                if layer.use_grouped_topk or layer.scoring_func == "sqrtsoftplus"
++                else 1.0
++            )
+         _ep_triton_now = False
+         if self.use_triton_ep and self.using_modular_kernel:
+             # Phase split, transport version. FusedMoEModularKernel.forward runs
+@@ -2469,6 +2511,38 @@ def apply(
+             x_scale=x_scale,
+         )
+ 
++    def _flydsl_herd_step(
++        self, layer: torch.nn.Module, router_logits: torch.Tensor
++    ) -> bool:
++        """Whether this step routes Top-(K+1) candidates for fused_moe(herd_topk):
++        decode steps in aiter's HERD window that reach the FlyDSL experts, on
++        routing the drop can stand in for (it renormalises the kept K)."""
++        tokens = router_logits.shape[0]
++        if (
++            not self.use_flydsl_herd
++            or self.use_triton
++            or self.fused_experts is not None
++            or not _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
++            or not layer.renormalize
++            or layer.custom_routing_function is not None
++            or layer.apply_router_weight_on_input
++            or layer.num_fused_shared_experts > 0
++            or (
++                layer.use_grouped_topk
++                and (layer.num_expert_group, layer.topk_group) != (1, 1)
++            )
++        ):
++            return False
++        comm_fused = getattr(layer, "_comm_fused_moe", None)
++        if comm_fused is not None and comm_fused.supports(tokens):
++            return False
++        ctx = get_forward_context().context
++        return (
++            ctx is not None
++            and not ctx.is_prefill
++            and bool(getattr(ctx, "running_tokens_are_unified", True))
++        )
++
+     def _apply_shared_experts_dense(self, layer, x, activation):
+         """Standalone dense MXFP4 GEMM for the always-on shared expert(s).
+ 
+diff --git a/tests/model_ops/test_shared_expert_dispatch.py b/tests/model_ops/test_shared_expert_dispatch.py
+index 2a8a98659c..a2a0cbcc0a 100644
+--- a/tests/model_ops/test_shared_expert_dispatch.py
++++ b/tests/model_ops/test_shared_expert_dispatch.py
+@@ -105,7 +105,8 @@ def fake_map_and_record(received_layer, received_ids, gathered):
+         layer, weights, ids
+     )
+ 
+-    method = object()
++    method = object.__new__(Mxfp4MoEMethod)
++    method.use_flydsl_herd = False
+     weights, ids = Mxfp4MoEMethod.select_experts(
+         method, layer, torch.empty(1, 4), torch.empty(1, 8)
+     )
+@@ -145,7 +146,8 @@ def fake_select_experts(**kwargs):
+         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
+     )
+ 
+-    method = object()
++    method = object.__new__(Mxfp4MoEMethod)
++    method.use_flydsl_herd = False
+     weights, ids = Mxfp4MoEMethod.select_experts(
+         method, layer, torch.empty(2, 4), torch.empty(2, 8)
+     )
+diff --git a/tests/test_flydsl_herd_routing.py b/tests/test_flydsl_herd_routing.py
+new file mode 100644
+index 0000000000..4fbea5e812
+--- /dev/null
++++ b/tests/test_flydsl_herd_routing.py
+@@ -0,0 +1,157 @@
++# SPDX-License-Identifier: MIT
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++from import_guard import skip_if_dependency_missing
++
++try:
++    # aiter/triton absent under bare non-GPU pytest
++    import atom.model_ops.moe as moe_mod
++except ImportError as exc:
++    skip_if_dependency_missing(exc, "requires full atom import env")
++
++# scoring, grouped top-k (groups, selected groups), top_k, the layer's routed
++# scale and the scale HERD must apply: the one the layer's own routing folds in.
++PROFILES = {
++    "deepseek_v4": ("sqrtsoftplus", False, None, None, 6, 1.5, 1.5),
++    # The softmax top-k never applies the routed scale.
++    "gpt_oss": ("softmax", False, None, None, 4, 2.0, 1.0),
++    "kimi_k3": ("sigmoid", True, 1, 1, 16, 2.5, 2.5),
++    # Applied outside the MoE when the shared experts are not fused.
++    "minimax_m3": ("sigmoid", False, None, None, 4, 2.0, 1.0),
++}
++
++
++def _layer(scoring_func, grouped, groups, topk_group, top_k, scale, **extra):
++    return SimpleNamespace(
++        scoring_func=scoring_func,
++        use_grouped_topk=grouped,
++        num_expert_group=groups,
++        topk_group=topk_group,
++        top_k=top_k,
++        routed_scaling_factor=scale,
++        renormalize=True,
++        custom_routing_function=None,
++        apply_router_weight_on_input=False,
++        num_fused_shared_experts=0,
++        expert_mask=None,
++        e_score_correction_bias="bias",
++        use_ep=False,
++        **extra,
++    )
++
++
++def _herd_method():
++    method = object.__new__(moe_mod.Mxfp4MoEMethod)
++    method.use_flydsl_herd = True
++    method.use_triton = False
++    method.fused_experts = None
++    return method
++
++
++@pytest.fixture
++def decode_step(monkeypatch):
++    context = SimpleNamespace(is_prefill=False, running_tokens_are_unified=True)
++    monkeypatch.setattr(
++        moe_mod, "get_forward_context", lambda: SimpleNamespace(context=context)
++    )
++
++
++@pytest.mark.parametrize("profile", list(PROFILES))
++def test_herd_candidates_take_the_layers_own_routing(monkeypatch, decode_step, profile):
++    scoring_func, grouped, groups, topk_group, top_k, scale, _ = PROFILES[profile]
++    layer = _layer(scoring_func, grouped, groups, topk_group, top_k, scale)
++    calls = []
++
++    def fake_select_experts(**kwargs):
++        calls.append(kwargs)
++        return "weights", "ids"
++
++    monkeypatch.setattr(
++        moe_mod.FusedMoE, "select_experts", staticmethod(fake_select_experts)
++    )
++
++    assert _herd_method().select_experts(layer, "x", torch.empty(64, 8)) == (
++        "weights",
++        "ids",
++    )
++    kwargs = calls.pop()
++    # One extra candidate, raw scores: fused_moe drops, renormalises and scales.
++    assert kwargs["top_k"] == top_k + 1
++    assert kwargs["renormalize"] is False
++    assert kwargs.get("routed_scaling_factor", 1.0) == 1.0
++    assert kwargs.get("custom_routing_function") is None
++    assert kwargs.get("num_fused_shared_experts", 0) == 0
++    # Pure TP routes pad rows like real ones, as _select_logical does, so the
++    # candidates carry no -1 rows for the count fused_moe is not given.
++    assert kwargs["mask_pad_rows"] is False
++    assert kwargs["scoring_func"] == scoring_func
++    assert kwargs["e_score_correction_bias"] == "bias"
++    assert kwargs["use_grouped_topk"] is grouped
++    assert kwargs["num_expert_group"] == groups
++    assert kwargs["topk_group"] == topk_group
++
++
++@pytest.mark.parametrize("groups,topk_group", [(8, 4), (8, 1), (1, 1)])
++def test_herd_takes_grouped_topk_with_one_group_only(decode_step, groups, topk_group):
++    layer = _layer("sigmoid", True, groups, topk_group, 8, 2.5)
++
++    assert _herd_method()._flydsl_herd_step(layer, torch.empty(64, 8)) is (
++        groups == 1 and topk_group == 1
++    )
++
++
++@pytest.mark.parametrize("profile", list(PROFILES))
++def test_herd_applies_the_routed_scale_the_layer_folds_in(monkeypatch, profile):
++    scoring_func, grouped, groups, topk_group, top_k, scale, herd_scale = PROFILES[
++        profile
++    ]
++    calls = []
++
++    def fake_fused_moe(*args, **kwargs):
++        calls.append(kwargs)
++        return "output"
++
++    monkeypatch.setattr(moe_mod, "fused_moe", fake_fused_moe)
++    method = _herd_method()
++    method.quant_type = "mxfp4"
++    method.is_guinterleave = True
++    method.fp8_activations = False
++    method.hidden_pad = 0
++    method.intermediate_pad = 0
++    method.use_triton_decode = False
++    method.use_triton_ep = False
++    layer = _layer(
++        scoring_func,
++        grouped,
++        groups,
++        topk_group,
++        top_k,
++        scale,
++        w13_weight="w1",
++        w2_weight="w2",
++        w13_weight_scale="w1_scale",
++        w2_weight_scale="w2_scale",
++        w13_input_scale=None,
++        w2_input_scale=None,
++        w13_bias=None,
++        w2_bias=None,
++        swiglu_limit=0.0,
++    )
++
++    method.apply(
++        layer=layer,
++        x="x",
++        topk_weights="topk_weights",
++        topk_ids=torch.empty(4, top_k + 1, dtype=torch.int32),
++        global_num_experts=128,
++        expert_map=None,
++        activation="silu",
++        apply_router_weight_on_input=False,
++    )
++
++    kwargs = calls.pop()
++    assert kwargs["herd_topk"] == top_k
++    assert kwargs["herd_routed_scaling_factor"] == herd_scale
+diff --git a/tests/test_mega_mxfp4_method.py b/tests/test_mega_mxfp4_method.py
+index 90162758dd..e08a8789aa 100644
+--- a/tests/test_mega_mxfp4_method.py
++++ b/tests/test_mega_mxfp4_method.py
+@@ -106,6 +106,7 @@ def fake_fused_moe(*args, **kwargs):
+     monkeypatch.setattr(moe_mod, "fused_moe", fake_fused_moe)
+     method = object.__new__(moe_mod.Mxfp4MoEMethod)
+     method.fused_experts = None
++    method.use_flydsl_herd = False
+     method.quant_type = "mxfp4"
+     method.is_guinterleave = True
+     method.fp8_activations = fp8_activations
+diff --git a/tests/test_mxfp4_triton_moe_decode.py b/tests/test_mxfp4_triton_moe_decode.py
+index 05b6394970..d1f44d66b0 100644
+--- a/tests/test_mxfp4_triton_moe_decode.py
++++ b/tests/test_mxfp4_triton_moe_decode.py
+@@ -333,6 +333,7 @@ def fake_fused_moe(*args, **kwargs):
+     method.hidden_pad = 0
+     method.intermediate_pad = 0
+     method.fused_experts = None
++    method.use_flydsl_herd = False
+     method.triton_identity_expert_map = "identity_map"
+     method._triton_views_of_flydsl_weights = lambda _layer: (
+         "w13_view",
