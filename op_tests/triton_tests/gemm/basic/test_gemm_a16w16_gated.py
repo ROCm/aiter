@@ -40,9 +40,8 @@ def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
     return x, weight, out_dtype, y
 
 
-# "silu" and "silu_exp2" share a reference because the kernel's _silu just calls
-# _silu_exp2. "gelu" and "gelu_tanh" must not: they differ by only 4.7e-4 per
-# element, which this test's tolerance would not catch if they were merged.
+# The kernel's _silu just calls _silu_exp2, so both names share one reference.
+# Never merge gelu and gelu_tanh: their 4.7e-4 per-element gap hides under atol.
 _TORCH_ACTIVATIONS = {
     "gelu": F.gelu,
     "gelu_tanh": partial(F.gelu, approximate="tanh"),
