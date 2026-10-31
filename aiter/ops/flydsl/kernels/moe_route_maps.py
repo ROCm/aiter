@@ -341,9 +341,12 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         # and must not be written or contribute to the counter; leaving their
         # topids_to_rows/gather_w slots unwritten matches the fused single-block
         # kernel (every downstream consumer is bounded by the same nvr/nvt). When
-        # truncation is disabled the caller passes numel here, so nothing is oob.
-        nvr_p = ptr_buf_tensor(num_valid_routes)
-        nvr = nvr_p[c0]
+        # truncation is disabled the caller passes null, meaning all numel routes.
+        # An omitted count is passed as a null pointer by the public wrapper.
+        # Treat it as the full static route extent, just like psum/remap/gather.
+        nvr = fx.Int32(numel)
+        if fx.Int64(ptrtoint(num_valid_routes)) != 0:
+            nvr = fx.Int32(ptr_buf_tensor(num_valid_routes)[c0])
         in_range = route < fx.Uint32(nvr)
         if in_range:
             topk_p = ptr_buf_tensor(topk_ids)
@@ -489,7 +492,9 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             if (fx.block_idx.x == 0) & (tid == 0):
                 nvr_p[c0] = nvr
         else:
-            nvr = nvr_p[c0]
+            nvr = fx.Int32(numel)
+            if fx.Int64(ptrtoint(num_valid_routes)) != 0:
+                nvr = fx.Int32(nvr_p[c0])
 
         n_buckets_i32 = fx.Uint32(n_buckets)
         nvr_i32 = fx.Uint32(nvr)
@@ -820,9 +825,12 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         # padding rows of the dispatch buffer (rows >= total_recv) and must not
         # contribute. Load once and fold into the per-route "dropped" predicate so
         # they reuse the existing drop path (gather_w=0, folded to bucket 0). When
-        # truncation is disabled the caller passes numel here, so nothing is oob.
-        nvr_p = ptr_buf_tensor(num_valid_routes)
-        nvr = nvr_p[c0]
+        # truncation is disabled the caller passes null, meaning all numel routes.
+        # An omitted count is passed as a null pointer by the public wrapper.
+        # Treat it as the full static route extent, just like psum/remap/gather.
+        nvr = fx.Int32(numel)
+        if fx.Int64(ptrtoint(num_valid_routes)) != 0:
+            nvr = fx.Int32(ptr_buf_tensor(num_valid_routes)[c0])
 
         # Iterate only the valid routes ([0, nvr)); the dead-tail padding routes
         # (>= num_valid_routes) are skipped entirely, so topids_to_rows/gather_w
