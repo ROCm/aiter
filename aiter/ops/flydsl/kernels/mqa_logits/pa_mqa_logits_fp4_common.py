@@ -18,14 +18,18 @@ from flydsl.expr.typing import T
 _NON_WRITER_LANE_OFF = 1 << 30
 
 
-def _i32_buffer(ptr, width=1):
+def _i32_buffer(ptr, width=1, byte_offset=None):
     """OOB-checked global i32 buffer-tensor over ``ptr`` (mirrors a max_size V#).
 
     ``width`` shapes it ``(N, width)`` so a per-``width`` row can be sliced and
     vector-copied; ``width=1`` gives a flat tensor for scalar ``[idx]`` loads.
+    ``byte_offset`` rebases the global pointer before constructing the resource;
+    buffer instruction offsets alone cannot address beyond 4 GiB.
     """
     src = fx.get_iter(ptr)
     it = fx.recast_iter(fx.PointerType.get(T.i32, src.memspace, 4), src)
+    if byte_offset is not None:
+        it = fx.add_offset(it, byte_offset // fx.Int64(4))
     if width == 1:
         lay = fx.make_layout((1 << 30,), (1,))
     else:
@@ -46,6 +50,52 @@ def _load_vec4_i32(bt2d, elem_off):
         r,
     )
     return fx.memref_load_vec(r).ir_value()
+
+
+def default_varctx_parallel_unit_num(
+    batch_size: int,
+    max_seq_len: int,
+    next_n: int = 1,
+) -> int:
+    """Return the tuned gfx950 persistent-grid size without reading the GPU.
+
+    Context lengths stay device-side so graph replay never synchronizes with
+    the host. The grid can therefore depend only on the host-known row count
+    and maximum sequence length. These buckets are process-level medians from
+    8K/32K/64K/128K sweeps on a 256-CU MI355X; callers can still pass an
+    explicit ``parallel_unit_num`` to override them.
+    """
+    if batch_size < 1 or max_seq_len < 1 or next_n < 1:
+        raise ValueError(
+            "batch_size, max_seq_len, and next_n must all be positive; "
+            f"got {batch_size=}, {max_seq_len=}, {next_n=}."
+        )
+
+    rows = batch_size * next_n
+    if rows <= 1:
+        row_bucket = 0
+    elif rows <= 2:
+        row_bucket = 1
+    elif rows <= 4:
+        row_bucket = 2
+    elif rows <= 8:
+        row_bucket = 3
+    elif rows <= 32:
+        row_bucket = 4
+    else:
+        row_bucket = 5
+
+    if max_seq_len <= 16384:
+        targets = (64, 96, 256, 256, 512, 512)
+    elif max_seq_len <= 49152:
+        targets = (128, 256, 256, 512, 1024, 2048)
+    elif max_seq_len <= 98304:
+        targets = (256, 512, 1024, 1280, 1536, 2048)
+    else:
+        targets = (256, 512, 1280, 1280, 2048, 4096)
+
+    target = max(rows, targets[row_bucket])
+    return ((target + next_n - 1) // next_n) * next_n
 
 
 @triton.jit
@@ -131,8 +181,9 @@ def compute_varctx_schedule(
 ):
     B = context_lens.shape[0]
     if parallel_unit_num is None:
-        chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
-        parallel_unit_num = B * next_n * chunks_per_seq
+        parallel_unit_num = default_varctx_parallel_unit_num(
+            B, max_seq_len, next_n=next_n
+        )
     P = parallel_unit_num
     if P % next_n != 0:
         raise ValueError(f"parallel_unit_num={P} must be a multiple of next_n={next_n}")
@@ -152,6 +203,11 @@ def compute_varctx_schedule(
     if cta_info_out is None:
         cta_info = torch.empty(P, 4, dtype=torch.int32, device=dev)
     else:
+        if cta_info_out.shape[0] < P or cta_info_out.shape[1:] != (4,):
+            raise ValueError(
+                f"cta_info_out must have shape (at least {P}, 4), "
+                f"got {tuple(cta_info_out.shape)}."
+            )
         cta_info = cta_info_out
     safe_out = torch.empty(1, dtype=torch.int32, device=dev)
     BLOCK_B = triton.next_power_of_2(max(int(B), 1))
