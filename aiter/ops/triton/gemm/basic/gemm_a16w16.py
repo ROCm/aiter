@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from functools import lru_cache
+
 import torch
 import triton
 
@@ -31,6 +33,20 @@ _LOGGER = AiterTritonLogger()
 
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+@lru_cache(maxsize=128)
+def _get_gluon_layouts(block_m, block_n, block_k, layout, elem_bits, num_warps):
+    """Reuse tensor-independent layout metadata for non-persistent gfx1250 GEMM."""
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+        create_shared_layouts,
+        create_wmma_layouts,
+    )
+
+    return (
+        *create_wmma_layouts(num_warps),
+        *create_shared_layouts(block_m, block_n, block_k, layout, elem_bits),
+    )
 
 
 def _is_gluon_available():
@@ -357,8 +373,6 @@ def gemm_a16w16_(
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             _KERNEL_MAP,
-            create_shared_layouts,
-            create_wmma_layouts,
         )
 
         assert (
@@ -436,9 +450,8 @@ def gemm_a16w16_(
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(
-            BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8
+        wmma_layout, operand_a, operand_b, shared_a, shared_b = _get_gluon_layouts(
+            BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8, num_warps
         )
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
