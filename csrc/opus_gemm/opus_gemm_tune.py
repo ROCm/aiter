@@ -856,7 +856,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
 _OPUS_PERMA_BAD_KIDS = frozenset()
 
 
-def _ensure_kids_compiled(candidate_kids):
+def _ensure_kids_compiled(candidate_kids, *, family="a16w16", gfx=None, cu_num=None):
     """Make sure every kid in ``candidate_kids`` is compiled into the
     current module_deepgemm_opus.so.
 
@@ -921,8 +921,12 @@ def _ensure_kids_compiled(candidate_kids):
     from aiter.jit.utils.jit_cache import compiled_kids_are_current
 
     candidate_kids = frozenset(int(k) for k in candidate_kids)
-    gfx, cu = _device_arch_and_cu(torch.cuda.current_device())
-    requests = {KernelKey("a16w16", gfx, cu, kid) for kid in candidate_kids}
+    if gfx is None or cu_num is None:
+        device_gfx, device_cu = _device_arch_and_cu(torch.cuda.current_device())
+        gfx = device_gfx if gfx is None else gfx
+        cu_num = device_cu if cu_num is None else cu_num
+    cu = int(cu_num)
+    requests = {KernelKey(family, gfx, cu, kid) for kid in candidate_kids}
     required = {key.encode() for key in requests | default_compiled_keys(gfx, cu)}
 
     def _read_sidecar(path):
@@ -966,7 +970,7 @@ def _ensure_kids_compiled(candidate_kids):
             return False
         # Peer's expand didn't cover us (rare: peer's `required` set was
         # disjoint from ours). Re-enter to extend further.
-        return _ensure_kids_compiled(candidate_kids)
+        return _ensure_kids_compiled(candidate_kids, family=family, gfx=gfx, cu_num=cu)
 
     try:
         compiled = _read_sidecar(sidecar)

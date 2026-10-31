@@ -324,3 +324,39 @@ __global__ void opus_bmm_splitk_reduce_kernel(
 #endif
 #endif
 }
+
+// Contiguous [SplitK, elements] FP32 partials with compile-time SplitK.
+// Each thread reduces Vec output elements and converts their sum to BF16.
+template <int SplitK, int Vec = 4, int Block = 128>
+__global__ __launch_bounds__(Block, 2) void
+splitk_reduce_contiguous_kernel_gfx950(const float* __restrict__ workspace,
+                                                         opus::bf16_t* __restrict__ out,
+                                                         int elements)
+{
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+    using namespace opus;
+    const int index = (block_id_x() * Block + thread_id_x()) * Vec;
+    if(index >= elements)
+        return;
+    vector_t<float, Vec> acc{};
+    static_for<SplitK>([&](auto split) {
+        auto source = make_gmem(workspace + static_cast<int64_t>(decltype(split)::value) * elements,
+                                static_cast<unsigned>(elements * sizeof(float)));
+        static_for<Vec / 4>([&](auto part) {
+            constexpr int offset = decltype(part)::value * 4;
+            const auto value     = load<4>(source, index + offset);
+            static_for<4>([&](auto elem) {
+                acc[offset + decltype(elem)::value] += value[decltype(elem)::value];
+            });
+        });
+    });
+    auto target             = make_gmem(out, static_cast<unsigned>(elements * sizeof(bf16_t)));
+    constexpr int store_vec = Vec < 8 ? Vec : 8;
+    static_for<Vec / store_vec>([&](auto part) {
+        constexpr int offset = decltype(part)::value * store_vec;
+        store<store_vec>(target,
+                         cast<bf16_t>(slice(acc, number<offset>{}, number<offset + store_vec>{})),
+                         index + offset);
+    });
+#endif
+}
