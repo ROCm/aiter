@@ -34,6 +34,7 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 BT = 64
 ATOL_G = 1e-3
 ATOL_WU = 5e-2
+MERGE_REL_RMS_TOL = 3e-3
 PERF_ITERS = 21
 PERF_WARMUP = 3
 
@@ -74,6 +75,7 @@ class GDNShape:
 PREPARE_SHAPES = {
     "qwen35_35b_tp2": GDNShape(t=2500, hg=8, h=16),
     "qwen35_397b_tp8": GDNShape(t=1024, hg=2, h=8),
+    "qwen38_flash_next_tp2": GDNShape(t=12000, hg=8, h=24),
     # Non-aligned dense and packed lengths exercise tail guards.
     "dense_tail": GDNShape(t=300, hg=4, h=8),
     "varlen_ragged": GDNShape(t=600, hg=4, h=16, seq_lens=(128, 172, 300)),
@@ -163,8 +165,13 @@ def run_torch_gdn_prepare(
     seq_lens: tuple[int, ...] | None = None,
     num_decodes: int = 0,
     use_exp2: bool = True,
+    output_dtype: torch.dtype = torch.bfloat16,
 ):
-    """Fp32 algebraic specification of cumsum, KKT, solve and WY GEMMs."""
+    """Fp32 algebraic specification of cumsum, KKT, solve and WY GEMMs.
+
+    ``output_dtype`` controls the final w/u cast. FP32 retains the WY result
+    for relative-error checks; existing callers keep the BF16 output reference.
+    """
     b, t, hg, k_dim = k.shape
     h, v_dim = v.shape[2], v.shape[3]
     if h % hg:
@@ -231,8 +238,8 @@ def run_torch_gdn_prepare(
     if use_exp2:
         g_cumsum *= math.log2(math.e)
     return (
-        w_bar.transpose(1, 2).contiguous().to(torch.bfloat16),
-        u_bar.transpose(1, 2).contiguous().to(torch.bfloat16),
+        w_bar.transpose(1, 2).contiguous().to(output_dtype),
+        u_bar.transpose(1, 2).contiguous().to(output_dtype),
         g_cumsum.transpose(1, 2).contiguous(),
     )
 
@@ -401,6 +408,80 @@ def _check_prepare_outputs(name, ref, out, b, shape):
         ),
     ]
     return max(errors)
+
+
+@torch.no_grad()
+@benchmark()
+def _benchmark_gdn_prepare_merge_precision(hg, h, use_exp2):
+    """Time one correlated-key case and enforce its numerical regression bound."""
+    shape = GDNShape(t=BT, hg=hg, h=h)
+    gen = torch.Generator(device="cuda").manual_seed(2026)
+    base = torch.randn(1, 1, hg, shape.k, device="cuda", generator=gen)
+    k = torch.nn.functional.normalize(
+        base
+        + 0.01 * torch.randn(1, shape.t, hg, shape.k, device="cuda", generator=gen),
+        dim=-1,
+    ).to(dtypes.bf16)
+    v = torch.randn(
+        1, shape.t, h, shape.v, device="cuda", dtype=dtypes.bf16, generator=gen
+    )
+    g = torch.full((1, shape.t, h), -1e-4, device="cuda")
+    beta = torch.full_like(g, 0.999)
+    ref = run_torch_gdn_prepare(
+        k, v, g, beta, use_exp2=use_exp2, output_dtype=dtypes.fp32
+    )
+    candidates = {
+        "prepare_flydsl": lambda: _run_flydsl_prepare(
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens=None,
+            use_exp2=use_exp2,
+            shape=shape,
+            prefill_metadata=None,
+        ),
+    }
+    flops, nbytes = _prepare_work(shape, 1, k.element_size(), use_exp2)
+    ret = {"gfx": get_gfx()}
+    for name, candidate in candidates.items():
+        out, us = run_perftest(candidate, num_iters=PERF_ITERS, num_warmup=PERF_WARMUP)
+        torch.testing.assert_close(out[2], ref[2], atol=1e-6, rtol=1e-5)
+        for tensor, actual, expected in zip(("w", "u"), out[:2], ref[:2]):
+            relative_rms = (
+                ((actual.float() - expected).square().mean() / expected.square().mean())
+                .sqrt()
+                .item()
+            )
+            assert relative_rms < MERGE_REL_RMS_TOL, (
+                f"merge_precision Hg={hg} H={h} exp2={use_exp2}: "
+                f"{tensor} relative RMS error {relative_rms} >= {MERGE_REL_RMS_TOL}"
+            )
+            ret[f"{name} {tensor} relative RMS"] = relative_rms
+        err = _check_prepare_outputs(name, ref, out, 1, shape)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def _run_merge_precision_sweep(use_exp2=(False, True)):
+    rows = [
+        _benchmark_gdn_prepare_merge_precision(hg, h, exp2)
+        for (hg, h), exp2 in itertools.product(((8, 24), (4, 12)), use_exp2)
+    ]
+    if rows:
+        _summarize("gdn_prepare_merge_precision", rows)
+
+
+def test_gdn_prepare_merge_precision():
+    """Pytest entry point for the same timed regression sweep used by the CLI."""
+    if get_gfx() not in SUPPORTED_GFX:
+        import pytest
+
+        pytest.skip("FlyDSL GDN prepare requires gfx942 or gfx950")
+    _run_merge_precision_sweep()
 
 
 @benchmark()
@@ -982,7 +1063,7 @@ def main():
         nargs="*",
         choices=list(PREPARE_SHAPES),
         default=list(PREPARE_SHAPES),
-        help="Direct prepare shape labels.",
+        help="Direct prepare shape labels; pass no values to skip this sweep.",
     )
     parser.add_argument(
         "--pipeline-shapes",
@@ -990,7 +1071,7 @@ def main():
         nargs="*",
         choices=list(PIPELINE_SHAPES),
         default=list(PIPELINE_SHAPES),
-        help="Model-facing pipeline shape labels.",
+        help="Model-facing pipeline shape labels; pass no values to skip this sweep.",
     )
     parser.add_argument(
         "--hidden-backends",
@@ -1023,6 +1104,7 @@ def main():
         return
 
     _load_kernels()
+    _run_merge_precision_sweep(args.use_exp2)
     _run_contract_checks()
 
     direct_rows = []
@@ -1047,7 +1129,8 @@ def main():
                 dtype,
             )
         )
-    _summarize("gdn_prepare", direct_rows)
+    if args.shapes:
+        _summarize("gdn_prepare", direct_rows)
 
     pipeline_rows = []
     for dtype, b, shape_name, hidden_backend in itertools.product(
@@ -1073,7 +1156,8 @@ def main():
                 dtype,
             )
         )
-    _summarize("gdn_prepare_pipeline", pipeline_rows)
+    if args.pipeline_shapes:
+        _summarize("gdn_prepare_pipeline", pipeline_rows)
 
 
 if __name__ == "__main__":
