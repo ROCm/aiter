@@ -1,0 +1,2 @@
+# large/r18-put (R18 route B) - note
+INTERNAL-ONLY, implementor-lg. Source only, uncompiled. See README-PUT.md (contract, launch order, ORDER PROOF O1-O8, gates, risks). Tree = r13 + lg_put_v1 + host launcher; tests/check_r18put_static.py: additive-only vs r13 (PASS), single put call site / no gdone (PASS), address model (PASS). A caught slip: the first ABI insertion glued a comment to the next #define (a here-string without a trailing newline); the additive-only check found it before commit.
