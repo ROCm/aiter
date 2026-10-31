@@ -1,0 +1,5 @@
+gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
+gfx942,304,1,8192,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,10300,0,21.9782,opus_gemm_gfx942_wkc_512x16x16x64_1x1_16x16x16_0x0x0,0.0,3.05,3054.55
+gfx942,304,2,8192,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,10300,0,22.1884,opus_gemm_gfx942_wkc_512x16x16x64_1x1_16x16x16_0x0x0,0.0,6.05,3026.72
+gfx942,304,4,8192,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,10300,0,22.0984,opus_gemm_gfx942_wkc_512x16x16x64_1x1_16x16x16_0x0x0,0.0,12.15,3041.27
+gfx942,304,8,8192,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,10300,0,22.5324,opus_gemm_gfx942_wkc_512x16x16x64_1x1_16x16x16_0x0x0,0.0,23.83,2987.05
