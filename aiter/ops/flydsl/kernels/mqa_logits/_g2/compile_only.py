@@ -85,6 +85,7 @@ def main() -> int:
     out["specializations"].append(rec)
     for tag, builder, block_rows, fp8 in (
         ("bf16_wmma_r32", K._build_wmma_kernel, 32, False),
+        *((("bf16_wmma_r64", K._build_wmma_kernel, 64, False),) if K._BF16_R64 else ()),
         ("fp8_wmma", K._build_wmma_fp8_kernel, 16, True),
         ("fp8_wmma_r32", K._build_wmma_fp8_kernel, 32, True),
     ):

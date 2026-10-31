@@ -831,12 +831,13 @@ class KPaddedKernelSourceCPU(unittest.TestCase):
         padded = self.helpers["_pair_base_tdm"]
         returns = [node for node in ast.walk(padded) if isinstance(node, ast.Return)]
         self.assertEqual(len(returns), 1)
-        for c in range(128):
-            for kgrp in (0, 1):
-                values = dict(self.values, c=c, kgrp=kgrp, phys=7, off=3,
-                              key_row_bytes=256, page_bytes=1024)
-                self.assertEqual(_integer_expression(returns[0].value, values),
-                                 (c % 64) * 272 + kgrp * 16)
+        for tdm_cols in (64, 32):   # r32/legacy-r16 tile and the R16 c32 tile
+            for c in range(128):
+                for kgrp in (0, 1):
+                    values = dict(self.values, c=c, kgrp=kgrp, phys=7, off=3, tdm_cols=tdm_cols,
+                                  key_row_bytes=256, page_bytes=1024)
+                    self.assertEqual(_integer_expression(returns[0].value, values),
+                                     (c % tdm_cols) * 272 + kgrp * 16)
         fragment = self.helpers["_pair_frag_tdm"]
         loads = _calls(fragment, "fx.ptr_load")
         self.assertEqual(len(loads), 2)
@@ -881,6 +882,8 @@ class KR16PerWaveKernelSourceCPU(unittest.TestCase):
         cls.kernel = cls.helpers["kernel_tdm_r16"]
 
     def test_one_69632b_allocator_and_all_wave_gather_offsets_are_disjoint(self):
+        # Round R16: the same source serves the legacy c64 (69,632 B) and the
+        # default forced-TDM c32 (34,816 B) geometry; both are proven here.
         storage = self.helpers["_r16_storage_tdm"]
         self.assertEqual(len(_calls(storage, "fx.SharedAllocator")), 1)
         self.assertFalse(any(isinstance(node, (ast.If, ast.For, ast.While))
@@ -890,37 +893,57 @@ class KR16PerWaveKernelSourceCPU(unittest.TestCase):
         self.assertEqual(len(arrays), 1)
         element_type, count, alignment = arrays[0].slice.elts
         self.assertEqual(ast.unparse(element_type), "fx.Int32")
-        self.assertEqual(_integer_expression(count, self.values) * 4, 69632)
-        self.assertGreaterEqual(_integer_expression(alignment, self.values), 16)
+        build = {target.id: node.value for node in self.build.body
+                 if isinstance(node, ast.Assign) for target in node.targets
+                 if isinstance(target, ast.Name)}
+        self.assertEqual(ast.unparse(build["tdm_cols"]),
+                         "R16_TDM_COLS if rows_per_block == 16 else WMMA_COLS")
+        self.assertEqual(ast.unparse(build["cols_per_block"]),
+                         "tdm_cols if use_tdm else WMMA_COLS")
         assignments = {target.id: node.value for node in ast.walk(self.stage)
                        if isinstance(node, ast.Assign) for target in node.targets
                        if isinstance(target, ast.Name)}
         loops = [node for node in ast.walk(self.stage) if isinstance(node, ast.For)
                  and isinstance(node.target, ast.Name) and node.target.id == "group"]
         self.assertEqual(len(loops), 1)
-        self.assertEqual(ast.unparse(loops[0].iter), "range_constexpr(8)")
+        self.assertEqual(ast.unparse(loops[0].iter), "range_constexpr(tdm_cols // 8)")
         gathers = _calls(self.stage, "_tdm_k_gather")
         self.assertEqual(len(gathers), 1)
         self.assertEqual(ast.unparse(gathers[0].args[-1]), "byte_off")
-        ranges = []
-        for wave in range(4):
-            for group in range(8):
-                local = _integer_expression(assignments["local"], dict(self.values, group=group))
-                self.assertEqual(local, group * 8)
-                offset = _integer_expression(assignments["byte_off"], dict(
-                    self.values, wave_id=wave, local=local))
-                self.assertEqual(offset, wave * 17408 + local * 272)
-                self.assertEqual(offset % 16, 0)
-                self.assertLessEqual(offset + 8 * 272, 69632)
-                ranges.append((offset, offset + 8 * 272))
-        self.assertEqual(ranges, [(group * 2176, (group + 1) * 2176) for group in range(32)])
         self.assertEqual(len(_calls(self.kernel, "_r16_storage_tdm")), 1)
         kernel_assignments = {target.id: node.value for node in self.kernel.body
                               if isinstance(node, ast.Assign) for target in node.targets
                               if isinstance(target, ast.Name)}
-        for wave in range(4):
-            self.assertEqual(_integer_expression(kernel_assignments["kptr"], dict(
-                self.values, storage=0, wave=wave)) * 4, wave * 17408)
+        for tdm_cols, lds_bytes in ((64, 69632), (32, 34816)):
+            tile_bytes = _integer_expression(build["tdm_tile_bytes"],
+                                             dict(self.values, tdm_cols=tdm_cols))
+            self.assertEqual(tile_bytes, tdm_cols * 272)
+            self.assertEqual(tile_bytes % 128, 0)
+            values = dict(self.values, tdm_cols=tdm_cols, tdm_tile_bytes=tile_bytes)
+            self.assertEqual(_integer_expression(count, values) * 4, lds_bytes)
+            self.assertGreaterEqual(_integer_expression(alignment, values), 128)
+            groups = _integer_expression(loops[0].iter.args[0], values)
+            self.assertEqual(groups, tdm_cols // 8)
+            ranges = []
+            for wave in range(4):
+                for group in range(groups):
+                    local = _integer_expression(assignments["local"], dict(values, group=group))
+                    self.assertEqual(local, group * 8)
+                    offset = _integer_expression(assignments["byte_off"], dict(
+                        values, wave_id=wave, local=local))
+                    self.assertEqual(offset, wave * tile_bytes + local * 272)
+                    self.assertEqual(offset % 128, 0)
+                    self.assertLessEqual(offset + 8 * 272, lds_bytes)
+                    ranges.append((offset, offset + 8 * 272))
+            self.assertEqual(ranges, [(g * 2176, (g + 1) * 2176) for g in range(4 * groups)])
+            for wave in range(4):
+                self.assertEqual(_integer_expression(kernel_assignments["kptr"], dict(
+                    values, storage=0, wave=wave)) * 4, wave * tile_bytes)
+            for chunk in (0, 1, 7):
+                col0 = _integer_expression(kernel_assignments["col0"], dict(values, chunk=chunk))
+                self.assertEqual(col0, chunk * tdm_cols)
+        self.assertEqual(ast.unparse(kernel_assignments["cols"]),
+                         "_lane_cols(col0, n_in, tdm_cols // WMMA_N)")
 
     def test_producer_request_page_metadata_are_wave_uniform_and_safely_clamped(self):
         assignments = {target.id: node.value for node in ast.walk(self.stage)
@@ -1054,7 +1077,7 @@ class KR16PerWaveKernelSourceCPU(unittest.TestCase):
                          and any(isinstance(target, ast.Name) and target.id == "selected_kernel"
                                  for target in node.targets))
         self.assertEqual(ast.unparse(selection),
-                         "(kernel_tdm_r16 if use_tdm else kernel) if rows_per_block == 16 else kernel_r32")
+                         "(kernel_tdm_r16 if use_tdm else kernel) if rows_per_block == 16 else kernel_r64 if rows_per_block == 64 else kernel_r32")
 
     def test_b_prologue_wave_and_metadata_are_scalar_without_changing_raw_metadata(self):
         assignments = {target.id: node.value for node in self.kernel.body
@@ -1094,6 +1117,290 @@ class KR16PerWaveKernelSourceCPU(unittest.TestCase):
         calls = _calls(values, "_tile")
         self.assertEqual(len(calls), 1)
         self.assertEqual(ast.unparse(calls[0].args[-1]), "staged")
+
+
+# ---------------------------------------------------------------------------
+# Round R16: occupancy-neutral forced-TDM r16, 32-column wave-private tiles.
+# Independent of the 64-row helpers above: payload DWORDs are copied straight
+# from the source with the descriptor's skip rule; references are per-lane
+# global-load fragments.  Byte/layout model only, not ISA or GPU evidence.
+# ---------------------------------------------------------------------------
+def r16_tile_bytes(tile_cols):
+    return tile_cols * TDM_K_ROW_BYTES
+
+
+def stage_r16_cols_pass(source, tables, t2r, rblk, origin, columns, row_visible, p,
+                        tile_cols, *, scratch, active_only=True, wave_order=(0, 1, 2, 3)):
+    """Mirror of _r16_stage_active + _r16_stage_tdm for one pass, any tile width."""
+    num_pages = len(source) // PAGE_BYTES
+    tile_bytes = r16_tile_bytes(tile_cols)
+    lds_bytes = R16_WAVES * tile_bytes
+    assert len(scratch) == lds_bytes and origin % tile_cols == 0
+    scratch = bytearray(scratch)
+    issued = {}
+    for wave in wave_order:
+        t0 = rblk * 16 + wave * 4
+        req = t2r[t0 + p]
+        req_ok = 0 <= req < len(tables)
+        safe_req = req if req_ok else 0
+        active = req_ok and all(t2r[t0 + prior] != req for prior in range(p))
+        vmax = max([row_visible[t0 + i] if t2r[t0 + i] == req else 0 for i in range(4)])
+        issue = (active and origin < vmax) if active_only else True
+        issued[wave] = issue
+        if not issue:
+            continue
+        table = tables[safe_req]
+        starts = []
+        for group in range(tile_cols // INDICES_PER_GATHER):
+            local = group * 8
+            row_ids = []
+            for page in range(2):
+                logical = (origin + local) // PAGE_ROWS + page
+                logical_ok = logical < len(table)
+                phys = table[logical if logical_ok else 0]
+                valid = req_ok and logical_ok and 0 <= phys < num_pages
+                phys = phys if valid else 0
+                row_ids += [phys * PAGE_ROWS + row for row in range(PAGE_ROWS)]
+            byte_off = wave * tile_bytes + local * TDM_K_ROW_BYTES
+            assert byte_off % 128 == 0 and byte_off + 8 * TDM_K_ROW_BYTES <= (wave + 1) * tile_bytes
+            starts.append(byte_off)
+            for data_dw in range(8 * 64):
+                row_id = row_ids[data_dw // 64]
+                src = row_id * ROW_BYTES + (data_dw % 64) * 4
+                dst = byte_off + (data_dw + (data_dw // 64) * 4) * 4
+                assert 0 <= src <= len(source) - 4
+                assert wave * tile_bytes <= dst <= (wave + 1) * tile_bytes - 4
+                scratch[dst:dst + 4] = source[src:src + 4]
+        issued[wave] = tuple(starts)
+    return bytes(scratch), issued
+
+
+def r16_store_plan(t2r, row_visible, rows, columns, tile_cols, num_requests):
+    """Mirror of _pass_plan/_lane_cols/_store_offsets/_pass_values masks: count writes."""
+    writes = {}
+    grid_x = (columns + tile_cols - 1) // tile_cols
+    for rblk in range((rows + 15) // 16):
+        for wave in range(4):
+            t0 = rblk * 16 + wave * 4
+            if t0 >= rows:
+                continue          # `live` (raw fallback) / `full` both skip it
+            meta = []
+            for i in range(4):
+                row = t0 + i
+                safe_row = min(row, rows - 1)
+                meta.append((row, row < rows, t2r[safe_row]))
+            for chunk in range(grid_x):
+                col0 = chunk * tile_cols
+                for p in range(4):
+                    row_p, ok_p, req_p = meta[p]
+                    active = ok_p and all(meta[q][0] >= rows or meta[q][2] != req_p
+                                          for q in range(p))
+                    if not active:
+                        continue
+                    for lane in range(32):
+                        kgrp, n_in = lane // 16, lane % 16
+                        for nt in range(tile_cols // 16):
+                            c = col0 + nt * 16 + n_in
+                            for i in (2 * kgrp, 2 * kgrp + 1):
+                                own = meta[i][1] and meta[i][2] == req_p
+                                if own and c < columns:
+                                    row = min(t0 + i, rows - 1)
+                                    off = min(row * columns + c, rows * columns - 1) * 4
+                                    assert 0 <= off < rows * columns * 4
+                                    writes[off] = writes.get(off, 0) + 1
+    return writes
+
+
+class KR16Cols32GatherCPU(unittest.TestCase):
+    """Byte exactness of the 32-column r16 TDM tile for every lane/k-chunk."""
+
+    TILE_COLS = 32
+
+    @classmethod
+    def setUpClass(cls):
+        KTileGatherCPU.setUpClass()
+        cls.source = KTileGatherCPU.source
+        cls.num_pages = KTileGatherCPU.num_pages
+        cls.tables = tuple(tuple((request * 13 + logical * 29 + 7) % cls.num_pages
+                                 for logical in range(33)) for request in range(8))
+
+    def lds(self):
+        return r16_tile_bytes(self.TILE_COLS) * R16_WAVES
+
+    def check_pass(self, tables, t2r, p, origin, columns, row_visible, scratch, rblk=0,
+                   active_only=True, wave_order=(0, 1, 2, 3)):
+        tile_cols = self.TILE_COLS
+        tile_bytes = r16_tile_bytes(tile_cols)
+        actual, issued = stage_r16_cols_pass(self.source, tables, t2r, rblk, origin, columns,
+                                             row_visible, p, tile_cols, scratch=scratch,
+                                             active_only=active_only, wave_order=wave_order)
+        self.assertEqual(len(actual), self.lds())
+        for wave in range(4):
+            base = wave * tile_bytes
+            t0 = rblk * 16 + wave * 4
+            req = t2r[t0 + p]
+            req_ok = 0 <= req < len(tables)
+            if issued[wave] is False:
+                self.assertEqual(actual[base:base + tile_bytes], scratch[base:base + tile_bytes])
+                continue
+            self.assertEqual(issued[wave], tuple(base + g * 2176 for g in range(tile_cols // 8)))
+            table = tables[req if req_ok else 0]
+            for nt in range(tile_cols // 16):
+                for lane in range(32):
+                    c = origin + nt * 16 + lane % 16
+                    logical_ok = c // 4 < len(table)
+                    phys = table[c // 4 if logical_ok else 0]
+                    page_ok = req_ok and logical_ok and 0 <= phys < self.num_pages
+                    phys = phys if page_ok else 0
+                    for s in range(4):
+                        g = phys * PAGE_BYTES + (c % 4) * ROW_BYTES + (lane // 16) * 16 + s * 64
+                        expected = self.source[g:g + 16] + self.source[g + 32:g + 48]
+                        # Kernel consumer: (c % tdm_cols) * 272 + kgrp * 16 + s * 64 (+32).
+                        lo = base + (c % tile_cols) * 272 + (lane // 16) * 16 + s * 64
+                        hi = lo + 32
+                        for off in (lo, hi):
+                            self.assertEqual(off % 16, 0)
+                            self.assertGreaterEqual(off, base)
+                            self.assertLessEqual(off + 16, base + tile_bytes)
+                            self.assertLessEqual((off - base) % 272 + 16, 256,
+                                                 "consumer vector touches LDS padding")
+                        self.assertEqual(actual[lo:lo + 16] + actual[hi:hi + 16], expected,
+                                         f"wave={wave} p={p} nt={nt} s={s} lane={lane}")
+            for row in range(tile_cols):
+                pad = base + row * 272 + 256
+                self.assertEqual(actual[pad:pad + 16], scratch[pad:pad + 16], "padding written")
+        return actual, issued
+
+    def test_lds_footprint_alignment_and_occupancy_ratio(self):
+        self.assertEqual(r16_tile_bytes(32), 8704)
+        self.assertEqual(self.lds(), 34816)
+        self.assertEqual(R16_LDS_BYTES, 69632)
+        self.assertEqual(R16_LDS_BYTES // self.lds(), 2)
+        self.assertEqual(r16_tile_bytes(32) % 128, 0)
+        # Per pass a wave issues 4 eight-row ops (32 rows), 16 over four passes:
+        # far below the 63-op completion counter; XACK 3/wave is HW throttled.
+        self.assertEqual(self.TILE_COLS // INDICES_PER_GATHER, 4)
+        self.assertLessEqual(R16_PASSES * self.TILE_COLS // INDICES_PER_GATHER, 63)
+
+    def test_every_lane_kchunk_all_passes_mixed_requests_and_origins(self):
+        t2r = (0, 1, 2, 3, 4, 3, 2, 1, 7, 5, 4, 6, 2, 6, 0, 5)
+        for origin in (0, 32, 64, 96, 128):
+            scratch = PADDING_SENTINEL * (self.lds() // 16)
+            for p in range(4):
+                with self.subTest(origin=origin, p=p):
+                    scratch, issued = self.check_pass(self.tables, t2r, p, origin, 132,
+                                                      [132] * 16, scratch, active_only=False)
+                    payloads = [b"".join(scratch[w * 8704 + r * 272:w * 8704 + r * 272 + 256]
+                                         for r in range(32)) for w in range(4)]
+                    self.assertEqual(len(set(payloads)), len({t2r[w * 4 + p] for w in range(4)}))
+
+    def test_request_dedup_visibility_and_invalid_requests_skip_issue(self):
+        t2r = (0, 0, 1, 1, 2, 3, 2, 4, -1, 0, 8, 1, 5, 6, 7, 5)
+        visible = (65, 65, 132, 132, 32, 0, 32, 132, 132, 132, 132, 132, 132, 0, 132, 132)
+        for origin in (0, 32, 64):
+            scratch = bytes([0xD3]) * self.lds()
+            for p in range(4):
+                with self.subTest(origin=origin, p=p):
+                    scratch, issued = self.check_pass(self.tables, t2r, p, origin, 132,
+                                                      visible, scratch)
+                    for wave in range(4):
+                        req = t2r[wave * 4 + p]
+                        vis = max(visible[wave * 4 + i] for i in range(4)
+                                  if t2r[wave * 4 + i] == req)
+                        expect = (0 <= req < 8 and req not in t2r[wave * 4:wave * 4 + p]
+                                  and origin < vis)
+                        self.assertEqual(issued[wave] is not False, expect)
+
+    def test_invalid_pages_and_logical_tails_select_physical_page_zero(self):
+        tables = tuple(tuple((7, -1, self.num_pages, 0x7FFFFFFF, 3)[(i + req) % 5]
+                             for i in range(9)) for req in range(3))
+        t2r = (-1, 0, 2, 1, 2, -0x80000000, 1, 0x7FFFFFFF, 0, 1, 2, 2, 1, -1, 1, 2)
+        for origin in (0, 32):      # width 9 pages = 36 columns: origin 32 has a tail
+            scratch = PADDING_SENTINEL * (self.lds() // 16)
+            for p in range(4):
+                with self.subTest(origin=origin, p=p):
+                    scratch, _ = self.check_pass(tables, t2r, p, origin, 33, [36] * 16,
+                                                 scratch, active_only=False)
+
+    def test_padding_canaries_survive_and_wave_orders_commute(self):
+        rng = random.Random(0x34816)
+        canaries = bytes(rng.randrange(256) for _ in range(self.lds()))
+        t2r = tuple((row * 3 + row // 4) % 8 for row in range(48))
+        for rblk in (0, 1, 2):
+            scratch = canaries
+            for p in range(4):
+                results = set()
+                for order in ((0, 1, 2, 3), (3, 2, 1, 0), (1, 3, 0, 2)):
+                    actual, _ = self.check_pass(self.tables, t2r, p, 64, 132, [132] * 48,
+                                                scratch, rblk=rblk, active_only=False,
+                                                wave_order=order)
+                    results.add(actual)
+                self.assertEqual(len(results), 1)
+                scratch = results.pop()
+
+    def test_logical_64_bank_spread_matches_c64_layout(self):
+        for nt in range(2):
+            for s in range(4):
+                for half in range(2):
+                    banks = []
+                    for lane in range(half * 16, half * 16 + 16):
+                        lo = (nt * 16 + lane % 16) * 272 + (lane // 16) * 16 + s * 64
+                        banks += [(lo // 4 + d) % 64 for d in range(4)]
+                    self.assertEqual(sorted(banks), list(range(64)))
+
+    def test_every_logit_written_exactly_once_with_32_column_blocks(self):
+        rng = random.Random(0x3232)
+        cases = [(64, 16, 65536 // 64), (16, 16, 33), (17, 3, 1), (31, 2, 255),
+                 (64, 16, 1000), (48, 5, 257), (7, 9, 31), (64, 4, 64)]
+        for rows, requests, columns in cases:
+            t2r = [rng.choice([-1, requests] + list(range(requests))) for _ in range(rows)]
+            for tile_cols in (32, 64):
+                with self.subTest(rows=rows, requests=requests, columns=columns, cols=tile_cols):
+                    writes = r16_store_plan(t2r, [columns] * rows, rows, columns,
+                                            tile_cols, requests)
+                    self.assertEqual(len(writes), rows * columns)
+                    self.assertEqual(set(writes.values()), {1})
+                    self.assertEqual(set(writes), {4 * i for i in range(rows * columns)})
+
+
+class KR16Cols32KernelSourceCPU(unittest.TestCase):
+    """Source bindings specific to the 32-column r16 TDM kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        KR16PerWaveKernelSourceCPU.setUpClass()
+        cls.helpers = KR16PerWaveKernelSourceCPU.helpers
+        cls.kernel = KR16PerWaveKernelSourceCPU.kernel
+        cls.tree = KR16PerWaveKernelSourceCPU.tree
+
+    def test_store_loops_follow_actual_tile_count(self):
+        loops = [node for node in ast.walk(self.kernel) if isinstance(node, ast.For)
+                 and isinstance(node.target, ast.Name) and node.target.id.startswith("j")]
+        self.assertEqual(len(loops), 4)
+        self.assertEqual(sorted(ast.unparse(loop.iter) for loop in loops),
+                         ["range_constexpr(len(msk))", "range_constexpr(len(msk))",
+                          "range_constexpr(len(res))", "range_constexpr(len(res))"])
+        for name in ("_pass_values", "_pass_masks"):
+            loop = next(node for node in ast.walk(self.helpers[name]) if isinstance(node, ast.For))
+            self.assertEqual(ast.unparse(loop.iter), "range_constexpr(len(cols))")
+        lane_cols = self.helpers["_lane_cols"]
+        self.assertEqual(ast.unparse(lane_cols.args.defaults[-1]), "WMMA_N_TILES")
+        for name in ("kernel", "kernel_r32"):
+            calls = _calls(self.helpers[name], "_lane_cols")
+            self.assertEqual([ast.unparse(c) for c in calls], ["_lane_cols(col0, n_in)"])
+            col0 = [node.value for node in self.helpers[name].body if isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "col0" for t in node.targets)]
+            self.assertEqual([ast.unparse(v) for v in col0], ["chunk * WMMA_COLS"])
+
+    def test_environment_switch_and_host_grid_binding(self):
+        consts = {t.id: node.value for node in self.tree.body if isinstance(node, ast.Assign)
+                  for t in node.targets if isinstance(t, ast.Name)}
+        self.assertIn("'QSA_BF16_R16_TDM_COLS', '32'", ast.unparse(consts["_BF16_R16_TDM_COLS"]))
+        wrapper = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef)
+                       and n.name == "qsa_paged_mqa_logits_page4")
+        text = ast.unparse(wrapper)
+        self.assertIn("launch = _build_wmma_kernel(float(divisor), rows_per_block, k_load)", text)
+        self.assertIn("wmma_grid(rows, columns, rows_per_block, launch.cols_per_block)", text)
 
 
 if __name__ == "__main__":
