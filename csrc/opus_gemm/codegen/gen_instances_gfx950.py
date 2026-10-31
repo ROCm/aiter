@@ -3210,11 +3210,12 @@ def _bpreshuffle_declaration(kernel, parameters, arguments):
 def _gen_small_mxscale_bpreshuffle_instance(
     cg, k, instance_impl_preamble, make_a8w8_bpreshuffle_host_decl
 ):
-    """Emit small-shape launchers with internal stream-ordered split-K scratch."""
+    """Emit small-shape launchers using Python-owned split-K workspace."""
     entry = k.bpreshuffle_entry
     kernel, alias = entry["kernel"], f"{k.name}_Traits"
     header = entry["headers"][-1]
     host_kind = entry.get("host_kind")
+    workspace_extra = ",\n    aiter_tensor_t &workspace" if k.bpreshuffle_split_k > 1 else ""
     abi = "opus_gemm_blockscale_mxscale_bpreshuffle_kargs_gfx950"
     checks = [
         f"m % {k.m_align} == 0",
@@ -3245,12 +3246,16 @@ def _gen_small_mxscale_bpreshuffle_instance(
     )
     if host_kind == "xcd_ring":
         abi += ", opus::bf16_t*, unsigned*"
-        body = f"""    const uint64_t tiles = ((m + Traits::B_M - 1) / Traits::B_M) * (n / Traits::B_N);
-    const uint64_t partials = tiles * Traits::SPLIT_K * Traits::B_M * Traits::B_N;
-    const uint64_t scratch_bytes = partials * sizeof(float) + tiles * sizeof(unsigned);
-    AITER_CHECK(scratch_bytes <= {k.max_tensor_bytes}, "split-K scratch exceeds pipeline limits");
-    OpusGfx950Scratch allocation(scratch_bytes, Y.device_id, stream);
-    auto* scratch = static_cast<float*>(allocation.data_ptr());
+        body = f"""    const size_t tiles = opus_checked_extent_product(
+        {{size_t((m + Traits::B_M - 1) / Traits::B_M), size_t(n / Traits::B_N)}}, "{k.name}");
+    const size_t partials = opus_checked_extent_product(
+        {{tiles, Traits::SPLIT_K, Traits::B_M, Traits::B_N}}, "{k.name}");
+    static_assert(sizeof(float) == sizeof(unsigned));
+    AITER_CHECK(partials <= {k.max_tensor_bytes} / sizeof(float) &&
+                tiles <= {k.max_tensor_bytes} / sizeof(float) - partials,
+                "split-K workspace exceeds pipeline limits");
+    auto* scratch = static_cast<float*>(opus_validate_workspace(
+        workspace, Y, AITER_DTYPE_fp32, partials + tiles, 16, "{k.name}"));
     args.ptr_c = scratch;
     auto* counters = reinterpret_cast<unsigned*>(scratch + partials);
     HIP_CALL(hipMemsetAsync(counters, 0, tiles * sizeof(unsigned), stream));
@@ -3269,11 +3274,12 @@ def _gen_small_mxscale_bpreshuffle_instance(
         )
         lds = "Traits::lds_bytes(k)" if entry.get("dynamic_lds") else "0"
         body = f"""    static_assert(Traits::SPLIT_K > 1);
-    const uint64_t scratch_bytes = uint64_t(Traits::SPLIT_K) * m * n * sizeof(float);
-    AITER_CHECK(m * n <= INT32_MAX && scratch_bytes <= {k.max_tensor_bytes},
-                "split-K scratch exceeds reducer limits");
-    OpusGfx950Scratch allocation(scratch_bytes, Y.device_id, stream);
-    args.ptr_c = allocation.data_ptr();
+    const size_t workspace_numel = opus_checked_extent_product(
+        {{Traits::SPLIT_K, size_t(m), size_t(n)}}, "{k.name}");
+    AITER_CHECK(m * n <= INT32_MAX && workspace_numel <= {k.max_tensor_bytes} / sizeof(float),
+                "split-K workspace exceeds reducer limits");
+    args.ptr_c = opus_validate_workspace(
+        workspace, Y, AITER_DTYPE_fp32, workspace_numel, 16, "{k.name}");
     {kernel}<{alias}><<<dim3(n / Traits::B_N, (m + Traits::B_M - 1) / Traits::B_M, Traits::SPLIT_K),
         dim3(Traits::BLOCK_SIZE), {lds}, stream>>>(args);
     if constexpr(Traits::SPLIT_K > 1) {{
@@ -3312,7 +3318,7 @@ def _gen_small_mxscale_bpreshuffle_instance(
     pipeline_headers = "\n".join(f'#include "{name}"' for name in entry["headers"])
     host_includes = '\n#include <climits>\n#include <type_traits>'
     if host_kind in ("xcd_ring", "reduce"):
-        host_includes += '\n#include "gfx950/opus_gemm_scratch_gfx950.cuh"'
+        host_includes += '\n#include "opus_gemm_common.cuh"'
     preamble = instance_impl_preamble(host_includes)
     source = f"""{preamble}
 {traits_headers}
@@ -3325,7 +3331,7 @@ struct {alias} : {entry["traits"]} {{}};
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template<class D_C>
 void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
-              aiter_tensor_t& x_scale, aiter_tensor_t& w_scale, aiter_tensor_t& Y) {{
+              aiter_tensor_t& x_scale, aiter_tensor_t& w_scale, aiter_tensor_t& Y{workspace_extra}) {{
     static_assert(std::is_same_v<D_C, opus::bf16_t>);
 {_BPRESHUFFLE_ARGUMENTS}
     {shape_check}
@@ -3341,7 +3347,7 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
         {
             "kid_name": k.name,
             "dtype": "bf16_t",
-            "host_decl": make_a8w8_bpreshuffle_host_decl(k.name, "bf16_t", ""),
+            "host_decl": make_a8w8_bpreshuffle_host_decl(k.name, "bf16_t", workspace_extra),
         }
     )
     if device_decl is not None:

@@ -12,6 +12,8 @@ import torch
 from torch import Tensor
 
 from csrc.opus_gemm.opus_gemm_common import (
+    a8w8_mxscale_bpreshuffle_supports_shape,
+    bpreshuffle_workspace_bytes,
     get_registry,
 )
 
@@ -117,6 +119,35 @@ def _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
 ) -> Tensor: ...
 
 
+def _gen_opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    kid: int,
+    workspace: Tensor,
+) -> Tensor:
+    return Y
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch",
+    gen_fake=_gen_opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch_raw(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    kid: int,
+    workspace: Tensor,
+) -> Tensor: ...
+
+
 def opus_gemm_a8w8_blockscale_bpreshuffle_tune(
     XQ: Tensor,
     WQ: Tensor,
@@ -210,18 +241,29 @@ def _launch_a8w8_backend(
         return
 
     if family == _A8W8_BPRESHUFFLE_FAMILY:
-        if workspace is not None or split_k != 0:
+        if split_k != 0:
             raise RuntimeError(
                 "A8W8 blockscale-bpreshuffle backend received split-K state"
             )
-        _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
-            XQ,
-            WQ,
-            x_scale,
-            w_scale,
-            Y,
-            kid,
-        )
+        if workspace is None:
+            _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                kid,
+            )
+        else:
+            _opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch_raw(
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                kid,
+                workspace,
+            )
         return
 
     if family == _A8W8_MXSCALE_BMM_FAMILY:
@@ -324,6 +366,82 @@ def _launch_a8w8_blockscale_gemm(
     return Y
 
 
+def _validate_a8w8_blockscale_bpreshuffle_workspace_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    instance: object,
+    route_arch: str | None,
+) -> int:
+    """Validate small-shape metadata before allocating FP32 workspace."""
+    entry = "opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch"
+    tensors = (XQ, WQ, Y, x_scale, w_scale)
+    if any(not isinstance(tensor, Tensor) for tensor in tensors):
+        raise TypeError(f"{entry}: XQ/WQ/Y/x_scale/w_scale must be Tensors")
+    if any(tensor.dim() != 2 for tensor in tensors):
+        raise ValueError(f"{entry}: XQ/WQ/Y/x_scale/w_scale must be logical 2D")
+    device = XQ.device
+    if device.type != "cuda" or any(tensor.device != device for tensor in tensors[1:]):
+        raise ValueError(f"{entry}: all tensors must be on one CUDA device")
+    if torch.cuda.current_device() != device.index:
+        raise ValueError(
+            f"{entry}: current CUDA device must match tensor device {device}"
+        )
+    device_arch, _ = _device_arch_and_cu(device)
+    if (
+        device_arch != "gfx950"
+        or (route_arch is not None and route_arch != device_arch)
+        or instance.arch_prefix != "gfx950"
+        or instance.kernel_tag != "a8w8_blockscale_mxscale_gemm_bpreshuffle"
+    ):
+        raise ValueError(f"{entry}: small-shape workspace requires native gfx950")
+    if XQ.dtype != torch.float8_e4m3fn or WQ.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"{entry}: XQ and WQ must be float8_e4m3fn")
+    if Y.dtype != torch.bfloat16:
+        raise ValueError(f"{entry}: Y must be BF16")
+    if x_scale.dtype not in _E8M0_DTYPES or w_scale.dtype not in _E8M0_DTYPES:
+        raise ValueError(
+            f"{entry}: x_scale and w_scale must contain one-byte E8M0 values"
+        )
+
+    M, K = map(int, XQ.shape)
+    N, w_K = map(int, WQ.shape)
+    int32_max = (1 << 31) - 1
+    if min(M, N, K) <= 0 or max(M, N, K) > int32_max:
+        raise ValueError(f"{entry}: M, N and K must be positive INT32 dimensions")
+    if w_K != K or tuple(Y.shape) != (M, N):
+        raise ValueError(f"{entry}: expected WQ [{N},{K}] and Y [{M},{N}]")
+    if any(not tensor.is_contiguous() for tensor in (XQ, WQ, Y)):
+        raise ValueError(f"{entry}: XQ, WQ and Y must be contiguous")
+    if (
+        K % 128
+        or tuple(x_scale.shape) != (M, K // 128)
+        or not (x_scale.is_contiguous() or x_scale.stride() == (1, M))
+        or tuple(w_scale.shape) != (N // 128, K // 128)
+        or not w_scale.is_contiguous()
+    ):
+        raise ValueError(f"{entry}: scale shape or layout differs")
+    if (
+        not a8w8_mxscale_bpreshuffle_supports_shape(instance, M, N, K)
+        or max(M * K, N * K) > min(int32_max, instance.max_tensor_bytes)
+        or (
+            instance.bpreshuffle_entry.get("host_kind") == "reduce"
+            and M * N > int32_max
+        )
+    ):
+        raise ValueError(f"{entry}: shape exceeds this pipeline configuration")
+    required_bytes = bpreshuffle_workspace_bytes(instance, M, N, K)
+    if (
+        required_bytes <= 0
+        or required_bytes % 4
+        or required_bytes > instance.max_tensor_bytes
+    ):
+        raise ValueError(f"{entry}: invalid FP32 workspace extent")
+    return required_bytes // 4
+
+
 def _launch_a8w8_blockscale_bpreshuffle_gemm(
     XQ: Tensor,
     WQ: Tensor,
@@ -334,17 +452,24 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     kid: int,
     route_arch: str | None = None,
     instance: object | None = None,
+    workspace: Tensor | None = None,
 ) -> Tensor:
     """Launch logical 2D bpreshuffled blockscale A8W8 GEMM.
 
     ``WQ`` pre-shuffle is a content/layout semantic. It
     cannot be proven from Tensor shape or strides. Build it with
     ``shuffle_weight(WQ, layout=(16, 16))``. The generated launcher checks
-    output dtype, scale layout, batch and tile alignment.
+    output dtype, scale layout, batch and tile alignment. Small-shape split-K
+    candidates allocate flat FP32 workspace, or reuse the supplied tensor.
     """
     resolved_kid = kid
     if instance is None:
-        if any(tensor.dim() != 2 for tensor in (XQ, WQ, Y, x_scale, w_scale)):
+        tensors = (XQ, WQ, Y, x_scale, w_scale)
+        if any(not isinstance(tensor, Tensor) for tensor in tensors):
+            raise TypeError(
+                "opus_gemm A8W8 blockscale bpreshuffle expects Tensor inputs"
+            )
+        if any(tensor.dim() != 2 for tensor in tensors):
             raise ValueError(
                 "opus_gemm A8W8 blockscale bpreshuffle expects logical 2D "
                 "XQ/WQ/Y/x_scale/w_scale; this family is GEMM-only"
@@ -358,17 +483,34 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
             output_dtype=Y.dtype,
             cu_num=cu_num,
         )
+        instance = get_registry(_A8W8_BPRESHUFFLE_FAMILY, arch, cu_num)[resolved_kid]
+    workspace_rule = (instance.bpreshuffle_entry or {}).get("workspace_rule", ("none",))
+    launch_workspace = workspace
+    if workspace_rule[0] != "none":
+        required_numel = _validate_a8w8_blockscale_bpreshuffle_workspace_tensors(
+            XQ, WQ, x_scale, w_scale, Y, instance, route_arch
+        )
+        if launch_workspace is None:
+            launch_workspace = torch.empty(
+                (required_numel,), dtype=torch.float32, device=XQ.device
+            )
+        # The checked C++ entry validates supplied workspace dtype, device,
+        # capacity and alignment. Generated launchers reset counters per launch.
+    elif launch_workspace is not None:
+        raise ValueError(f"OPUS bpreshuffle kid {resolved_kid} does not use workspace")
     _launch_a8w8_backend(
         XQ.unsqueeze(0),
         WQ.unsqueeze(0),
         Y.unsqueeze(0),
         x_scale,
         w_scale,
-        None,
+        launch_workspace,
         _A8W8_BPRESHUFFLE_FAMILY,
         resolved_kid,
         0,
     )
+    if workspace is not None:
+        workspace.record_stream(torch.cuda.current_stream(XQ.device))
     return Y
 
 

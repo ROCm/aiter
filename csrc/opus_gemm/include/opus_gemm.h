@@ -34,3 +34,13 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
     aiter_tensor_t& w_scale,
     aiter_tensor_t& Y,
     int kid);
+
+// gfx950 Split-K bpreshuffle launchers take a caller-owned FP32 workspace.
+void opus_gemm_a8w8_blockscale_bpreshuffle_workspace_launch(
+    aiter_tensor_t& XQ,
+    aiter_tensor_t& WQ,
+    aiter_tensor_t& x_scale,
+    aiter_tensor_t& w_scale,
+    aiter_tensor_t& Y,
+    int kid,
+    aiter_tensor_t& workspace);
