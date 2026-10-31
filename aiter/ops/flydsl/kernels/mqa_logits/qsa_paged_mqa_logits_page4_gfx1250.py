@@ -39,6 +39,30 @@ The module imports only ``flydsl`` and ``torch``: the few buffer primitives it
 needs (byte-addressed ``buffer_load``/``buffer_store`` with hardware OOB
 drop, and a cached ``flyc.compile`` dispatch) are implemented here on
 published FlyDSL APIs instead of importing the ``aiter`` package.
+
+GPU-safety revision (G2 builder #2, 2026-10-31).  v0 was never dispatched
+successfully: its first dispatch attempt on d07-2 wedged the device and left
+``amdgpu 0001:04:00.0: [0] id=4 (VM_PAGE_FAULT) size=0x1000 start=0x16bf5fff000``
+in dmesg (see ``records/g2/builder2-log.md``).  That address is *exactly* what a
+non-dropped ``base + 0x7FFFFFFF`` looks like: the page start is
+``0x1ff000`` mod 2 MiB and the implied base ``0x16b76000000`` is 2 MiB aligned,
+i.e. a device allocation — so v0's masked stores were **not** being dropped by
+the V# bounds check on this toolchain.  Three changes remove that dependency:
+
+1. every ``logits``/``visible_groups``/``row_starts`` store is now *predicated*
+   (``if ok: store``) instead of being steered to a "dropped" out-of-bounds
+   byte offset, so every store address is inside its buffer by construction
+   (the offset is additionally clamped, so even a mis-lowered predicate cannot
+   leave the buffer);
+2. descriptor ``num_records`` extents are computed in **i64** and clamped to at
+   least 4 bytes, because ``num_records == 0`` means *unbounded* on this ISA
+   (a zero-size plane would turn masked accesses into real ones);
+3. the op wrapper rejects anything that could break the kernel's i32 byte
+   addressing (2 GiB cap), zero-size planes, misalignment, or out-of-int32
+   metadata.
+
+The V# extents stay: they are the second line of defence (loads zero-fill,
+stores drop) for anything that still slips through.
 """
 
 from __future__ import annotations
@@ -60,8 +84,19 @@ DIM_PER_STEP = 8       # head dims consumed per unrolled step (16 B of Q)
 THREADS = 256          # one thread per output column
 MAX_GRID_Y = 65535
 _NEG_INF = float("-inf")
-_DROP_BYTE = 0x7FFFFFFF  # out-of-bounds byte offset: the V# drops the access
+# A V# with num_records == 0 is *unbounded* (no bounds check at all), so every
+# descriptor gets at least one dword: a zero-size plane then drops every access
+# instead of allowing it.
+_MIN_DESC_BYTES = 4
 _ELEM_BYTES = {fx.Int8: 1, fx.Int32: 4, fx.Float32: 4, fx.BFloat16: 2}
+
+
+def _imin(a, b):
+    return (a <= b).select(a, b)
+
+
+def _imax(a, b):
+    return (a >= b).select(a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +105,19 @@ _ELEM_BYTES = {fx.Int8: 1, fx.Int32: 4, fx.Float32: 4, fx.BFloat16: 2}
 def _byte_ptr(tensor, num_bytes):
     """Byte-addressed buffer pointer (V#) for a kernel tensor argument.
 
-    ``num_bytes`` is the descriptor's ``num_records``: loads and stores past it
-    are dropped by the hardware, which is how the masked tail stores work.
+    ``num_bytes`` is the descriptor's ``num_records``: loads past it are
+    zero-filled and stores past it are dropped by the hardware.  That check is
+    the *second* line of defence here — the kernel no longer steers masked
+    stores at an out-of-bounds sentinel offset (see the module docstring), so a
+    dropped access is only ever a safety net.
+
+    ``num_bytes`` must therefore be the *true* extent of the plane in bytes and
+    is computed in i64 (an i32 product can wrap and then either truncate the
+    descriptor or, worse, look large enough to admit a bad offset).
     """
     return fx.rocdl.make_buffer_ptr(
         fx.recast_iter(fx.Int8, fx.get_iter(tensor)),
-        num_records_bytes=num_bytes,
+        num_records_bytes=_imax(fx.Int64(num_bytes), fx.Int64(_MIN_DESC_BYTES)),
     )
 
 
@@ -114,14 +156,6 @@ def _st_i32(ptr, byte_off, value):
 
 def _st_f32(ptr, byte_off, value):
     _gstore(ptr, byte_off, Vec.from_elements([value], dtype=fx.Float32), 1, fx.Float32)
-
-
-def _imin(a, b):
-    return (a <= b).select(a, b)
-
-
-def _imax(a, b):
-    return (a >= b).select(a, b)
 
 
 # Exact E4M3 (e4m3fn) -> f32 for one byte code, in integer arithmetic.
@@ -199,10 +233,10 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         return vals
 
     def _ks_bytes_fp8(num_pages):
-        return num_pages * PAGE_SIZE * 4
+        return fx.Int64(num_pages) * fx.Int64(PAGE_SIZE) * fx.Int64(4)
 
     def _ks_bytes_bf16(num_pages):   # no scale plane: a 4-byte dummy descriptor
-        return 4
+        return fx.Int64(4)
 
     def _scale_fp8(ks_ptr, phys, off):
         return _ld_f32(ks_ptr, (phys * PAGE_SIZE + off) * 4)
@@ -238,15 +272,17 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         ptile = fx.Int32(fx.block_idx.x)
         col = ptile * threads + tid
 
-        q_ptr = _byte_ptr(Q, rows * q_row_bytes)
-        kv_ptr = _byte_ptr(KV, num_pages * page_bytes)
-        pt_ptr = _byte_ptr(PT, num_requests * width * 4)
-        t2r_ptr = _byte_ptr(T2R, rows * 4)
-        qp_ptr = _byte_ptr(QP, rows * 4)
-        cl_ptr = _byte_ptr(CL, num_requests * 4)
-        logits_ptr = _byte_ptr(LOGITS, rows * columns * 4)
-        vis_ptr = _byte_ptr(VIS, rows * 4)
-        rst_ptr = _byte_ptr(RST, rows * 4)
+        # Descriptor extents: bytes, i64 (see `_byte_ptr`).  `ks_bytes(num_pages)`
+        # is already an i64 expression, and the bf16 dummy plane is a constant.
+        q_ptr = _byte_ptr(Q, fx.Int64(rows) * fx.Int64(q_row_bytes))
+        kv_ptr = _byte_ptr(KV, fx.Int64(num_pages) * fx.Int64(page_bytes))
+        pt_ptr = _byte_ptr(PT, fx.Int64(num_requests) * fx.Int64(width) * fx.Int64(4))
+        t2r_ptr = _byte_ptr(T2R, fx.Int64(rows) * fx.Int64(4))
+        qp_ptr = _byte_ptr(QP, fx.Int64(rows) * fx.Int64(4))
+        cl_ptr = _byte_ptr(CL, fx.Int64(num_requests) * fx.Int64(4))
+        logits_ptr = _byte_ptr(LOGITS, fx.Int64(rows) * fx.Int64(columns) * fx.Int64(4))
+        vis_ptr = _byte_ptr(VIS, fx.Int64(rows) * fx.Int64(4))
+        rst_ptr = _byte_ptr(RST, fx.Int64(rows) * fx.Int64(4))
         ks_ptr = _byte_ptr(KS, ks_bytes(num_pages))
 
         # --- row metadata: visible count (identical to the golden's visible_groups)
@@ -261,9 +297,13 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         vis = head // PAGE_SIZE
         vis = req_ok.select(vis, 0)
 
+        # One thread per row writes the row metadata.  Predicated (not sentinel-
+        # masked): the store address `row * 4` is in bounds for *every* thread
+        # that reaches it, so an un-taken branch can never fault.
         writer = (tid == 0) & (ptile == 0) & (row < rows)
-        _st_i32(vis_ptr, writer.select(row * 4, _DROP_BYTE), vis)
-        _st_i32(rst_ptr, writer.select(row * 4, _DROP_BYTE), fx.Int32(0))
+        if writer:
+            _st_i32(vis_ptr, row * 4, vis)
+            _st_i32(rst_ptr, row * 4, fx.Int32(0))
 
         # --- column -> (logical page, row in page)
         col_ok = col < columns
@@ -304,10 +344,17 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
 
         keep = page_ok & (col < vis)
         value = keep.select(total, fx.Float32(_NEG_INF))
-        # masked store: `col_ok` sends the byte offset past the descriptor and
-        # the hardware drops the access (same device as the visible mask).
-        out_off = col_ok.select((row * columns + col) * 4, _DROP_BYTE)
-        _st_f32(logits_ptr, out_off, value)
+        # Predicated store: the column tail (`col >= columns`) writes nothing, so
+        # the address is always inside [0, rows * columns * 4).  It is clamped as
+        # well, so even a mis-lowered predicate degrades to one corrupted element
+        # (the last column of the last row) instead of an out-of-buffer access.
+        # v0 instead stored at the constant byte offset 0x7FFFFFFF, which relies
+        # on the V# bounds check actually being armed; the d07-2 VM_PAGE_FAULT
+        # (page start 0x16bf5fff000 == a 2 MiB-aligned base + 0x7FFFFFFF) says it
+        # was not.  Do not reintroduce that pattern.
+        out_idx = _imin(row * columns + col, rows * columns - 1)
+        if col_ok:
+            _st_f32(logits_ptr, out_idx * 4, value)
 
     @flyc.jit
     def launch(
@@ -372,6 +419,45 @@ def _dummy_scale(dev):
 # ---------------------------------------------------------------------------
 # Op wrapper with explicit contract checks
 # ---------------------------------------------------------------------------
+# The kernel addresses every buffer with an i32 byte offset (`buffer_*`
+# voffsets, and FlyDSL passes tensor extents as i32).  These are the guard rails
+# that keep that assumption true, so a legal-looking call can never wrap an
+# offset and land where it does not belong.
+_MAX_I32 = 2**31 - 1
+
+
+def _check_plane(name, nbytes):
+    """Non-empty and byte-addressable with i32 offsets."""
+    if nbytes <= 0:
+        raise ValueError(
+            f"{name} is empty ({nbytes} B): a zero-length V# has no bounds check"
+        )
+    if nbytes > _MAX_I32:
+        raise ValueError(
+            f"{name} is {nbytes} B > {_MAX_I32} B: the kernel addresses its buffers "
+            "with int32 byte offsets (split the call / chunk the rows)"
+        )
+
+
+def _check_align(tensor, name, align):
+    ptr = int(tensor.data_ptr())
+    if ptr % align:
+        raise ValueError(
+            f"{name} base address {ptr:#x} is not {align}-byte aligned; the kernel "
+            f"issues {align}-byte vector buffer accesses from it"
+        )
+
+
+def _to_i32_checked(tensor, name):
+    """Narrow to int32 only after proving the values fit (no silent wrap)."""
+    if tensor.dtype == torch.int32:
+        return tensor
+    lo, hi = int(tensor.min()), int(tensor.max())
+    if lo < -(2**31) or hi > _MAX_I32:
+        raise ValueError(f"{name} values [{lo}, {hi}] do not fit in int32")
+    return tensor.to(torch.int32)
+
+
 def qsa_paged_mqa_logits_page4(
     q: torch.Tensor,
     compressed_k_cache: torch.Tensor,
@@ -415,6 +501,8 @@ def qsa_paged_mqa_logits_page4(
     if not compressed_k_cache.is_contiguous():
         raise ValueError("compressed_k_cache must be contiguous")
     num_pages = int(compressed_k_cache.shape[0])
+    if num_pages < 1:
+        raise ValueError("compressed_k_cache must have at least one page")
     is_fp8 = compressed_k_cache.dtype == torch.float8_e4m3fn
     if not is_fp8 and compressed_k_cache.dtype != torch.bfloat16:
         raise ValueError(
@@ -446,9 +534,23 @@ def qsa_paged_mqa_logits_page4(
         raise ValueError("page_table must be contiguous")
     num_requests = int(page_table.shape[0])
     width = int(page_table.shape[1])
+    if width < 1:
+        # width == 0 makes the page-table V# zero-length: on this ISA a
+        # num_records of 0 disables the bounds check entirely.
+        raise ValueError("page_table must have at least one column (width >= 1)")
 
     columns_full = width * PAGE_SIZE
-    columns = columns_full if max_columns is None else max(1, min(columns_full, int(max_columns)))
+    if max_columns is None:
+        columns = columns_full
+    else:
+        if int(max_columns) < 1:
+            raise ValueError(f"max_columns must be >= 1, got {max_columns}")
+        columns = min(columns_full, int(max_columns))
+    # `columns % PAGE_SIZE` needs no special case: the kernel derives
+    # `logical = col // 4` / `off = col % 4` per column and predicates every
+    # store, so a partial trailing page is written column by column and nothing
+    # outside [0, rows * columns) is touched.  (Covered by the CPU contract
+    # tests: columns = 1, 3, 5, 255, 257, 1000.)
 
     for name, t, n in (
         ("token_to_request", token_to_request, rows),
@@ -473,21 +575,54 @@ def qsa_paged_mqa_logits_page4(
         row_starts = torch.empty(rows, dtype=torch.int32, device=dev)
     elif row_starts.numel() != rows or row_starts.dtype != torch.int32:
         raise ValueError(f"row_starts must be int32 [{rows}]")
+    for name, t in (("logits", logits), ("visible_groups", visible_groups),
+                    ("row_starts", row_starts)):
+        if t.device != dev:
+            raise ValueError(f"{name} must be on {dev}, got {t.device}")
+
+    # --- GPU memory-safety guard rails (see the module docstring) ------------
+    # 1. every plane is non-empty (a zero-length V# is unbounded) and fits the
+    #    kernel's i32 byte addressing;
+    # 2. every base address is aligned for the widest access the kernel issues
+    #    from it (16 B dwordx4 K/Q loads, 4 B scalar metadata/scale/logits).
+    kv_elem_bytes = 1 if is_fp8 else 2
+    page_bytes = PAGE_SIZE * HEAD_DIM * kv_elem_bytes
+    _check_plane("q", rows * NUM_HEADS * HEAD_DIM * 2)
+    _check_plane("compressed_k_cache", num_pages * page_bytes)
+    if is_fp8:
+        _check_plane("compressed_k_scale", num_pages * PAGE_SIZE * 4)
+    _check_plane("page_table", num_requests * width * 4)
+    _check_plane("token_to_request", rows * 4)
+    _check_plane("query_positions", rows * 4)
+    _check_plane("context_lens", num_requests * 4)
+    _check_plane("logits", rows * columns * 4)
+    _check_plane("visible_groups", rows * 4)
+    _check_plane("row_starts", rows * 4)
+    _check_align(q, "q", 16)
+    _check_align(compressed_k_cache, "compressed_k_cache", 16 if not is_fp8 else 8)
+    _check_align(page_table, "page_table", 4)
+    _check_align(logits, "logits", 4)
+    _check_align(visible_groups, "visible_groups", 4)
+    _check_align(row_starts, "row_starts", 4)
+    _check_align(token_to_request, "token_to_request", 4)
+    _check_align(query_positions, "query_positions", 4)
+    _check_align(context_lens, "context_lens", 4)
+    if is_fp8:
+        _check_align(compressed_k_scale, "compressed_k_scale", 4)
 
     # Explicit, checked narrowings (never a silent cast): the kernel reads int32
-    # indices and FlyDSL passes tensor extents as int32.
-    page_table_i32 = page_table.to(torch.int32) if page_table.dtype != torch.int32 else page_table
-    t2r_i32 = token_to_request.to(torch.int32).contiguous().view(-1)
-    if query_positions.dtype != torch.int32:
-        if bool((query_positions.abs() > 2**31 - 1).any()):
-            raise ValueError("query_positions values do not fit int32")
-        qp_i32 = query_positions.to(torch.int32).contiguous().view(-1)
-    else:
-        qp_i32 = query_positions.contiguous().view(-1)
-    cl_i32 = context_lens.to(torch.int32).contiguous().view(-1)
+    # indices and FlyDSL passes tensor extents as int32.  The min/max probes only
+    # run for non-int32 inputs, so the common path stays launch-free.
+    page_table_i32 = _to_i32_checked(page_table, "page_table")
+    t2r_i32 = _to_i32_checked(token_to_request, "token_to_request").contiguous().view(-1)
+    qp_i32 = _to_i32_checked(query_positions, "query_positions").contiguous().view(-1)
+    cl_i32 = _to_i32_checked(context_lens, "context_lens").contiguous().view(-1)
 
     if divisor is None:
         divisor = math.sqrt(HEAD_DIM)
+    divisor = float(divisor)
+    if not math.isfinite(divisor) or divisor <= 0.0:
+        raise ValueError(f"divisor must be finite and > 0, got {divisor}")
     threads = THREADS
     grid_x = (columns + threads - 1) // threads
 

@@ -118,9 +118,15 @@ def outside_stats(out, gold, valid_page, visible):
 def run_case(name, spec, do_compare=True):
     """spec: dict(regime, rows, requests, fmt, table_width, cache_pages, max_ctx, max_columns, patch)"""
     t0 = time.time()
+    # Progress line BEFORE the first GPU touch of the case: the d07-2 smoke run
+    # produced no output for 40 min because the first print came after a whole
+    # case. Never again: print, flush, then work.
+    print(f"[CASE] {name} start rows={spec['rows']} fmt={spec['fmt']} "
+          f"width={spec['table_width']} pages={spec['cache_pages']}", flush=True)
     case, data = make_fixture(**{k: v for k, v in spec.items()
                                  if k in ("regime", "rows", "requests", "fmt", "table_width",
                                           "cache_pages", "max_ctx", "max_columns")})
+    print(f"[CASE] {name} fixture+golden ready ({time.time() - t0:.1f}s)", flush=True)
     what = spec.get("patch")
     if what:
         data = patch(data, what)
@@ -128,12 +134,14 @@ def run_case(name, spec, do_compare=True):
     rec = {"name": name, "spec": {**{k: v for k, v in spec.items()}, "columns": cols},
            "dtype": spec["fmt"], "rows": spec["rows"], "columns": int(cols)}
     try:
+        print(f"[CASE] {name} dispatch", flush=True)
         out, out_vis = K.qsa_paged_mqa_logits_page4(
             data["q"], data["compressed_k_cache"], data["page_table"],
             data["token_to_request"], data["query_positions"], data["context_lens"],
             compress_ratio=PAGE, max_columns=cols,
             compressed_k_scale=data["compressed_k_scale"],
         )
+        print(f"[CASE] {name} dispatched -> synchronize", flush=True)
         torch.cuda.synchronize()
         rec["ran"] = True
     except Exception as exc:  # noqa: BLE001
@@ -397,12 +405,21 @@ def hsaco_hashes(root):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default="all",
-                    choices=["smoke", "correctness", "timing", "all"])
+                    choices=["first_touch", "smoke", "correctness", "timing", "all"])
     ap.add_argument("--tag", default="run")
     args = ap.parse_args()
     os.makedirs(RESULTS, exist_ok=True)
-    res = {"tag": args.tag, "versions": versions(), "rtol": RTOL, "atol": ATOL,
-           "kernel_import": K_IMPORT}
+    if args.stage == "first_touch":
+        # The ladder is its own driver: every step in its own process with a hard
+        # timeout (see FIRST_TOUCH.md).  Do not fold it into this script.
+        import first_touch
+        return first_touch.main(["--timeout", "60",
+                                 "--out", os.path.join(RESULTS, "first_touch_" + args.tag)])
+    print(f"[START] run_gpu stage={args.stage} tag={args.tag} results={RESULTS}", flush=True)
+    res = {"tag": args.tag, "stage": args.stage, "versions": versions(), "rtol": RTOL,
+           "atol": ATOL, "kernel_import": K_IMPORT}
+    print("[VERSIONS] " + json.dumps(res["versions"], default=str), flush=True)
+    print("[KERNEL]   " + str(K_IMPORT), flush=True)
     if args.stage == "smoke":
         res["correctness"] = [
             run_case("I5_min_decode_bf16", dict(regime="decode", rows=4, requests=1,
