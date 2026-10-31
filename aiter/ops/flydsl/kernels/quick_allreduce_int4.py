@@ -144,40 +144,47 @@ def _atom_f16_to_bf16(atom):
 
 
 def _f32_to_e4m3(x):
-    """Pack f32 to a signed E4M3 byte: 1 sign, 4-bit exp (bias 7), 3-bit mantissa.
+    """Pack f32 to a signed 8-bit scale: 1 sign, 5-bit exp (bias 12), 2-bit mantissa.
 
-    Decode is ``±(1 + m/8) * 2**(e - 7)`` for every ``e``, including 0
-    (no OCP denorms). ``0x7F`` / ``0xFF`` are max finite, not NaN.
+    The scale was E4M3 with bias 7, which spans only [2**-7, 480]: a group
+    whose extremum is above 480 saturated, and one below 2**-7 got the 2**-7
+    scale (step 2**-10), so small partial sums lost most of their bits. E5M2
+    with bias 12 spans [2**-12, 1.75 * 2**19]: every fp16 extremum fits, and
+    the smallest scale keeps 1/d below the fp16 max for the packed-fp16
+    quantizer. The byte, the layout and the instruction count are unchanged;
+    the function names keep "e4m3" for a small diff.
+
+    Decode is ``±(1 + m/4) * 2**(e - 12)`` for every ``e``, including 0
+    (no denorms). ``0x7F`` / ``0xFF`` are max finite, not NaN.
 
     ``0x00`` is +0 only. Any other value that would land there (positive
-    underflow, or exactly ``2**-7``) is stored as ``0x01``. Negative
-    underflow keeps ``0x80`` (``-2**-7``). Overflow clamps both exponent
-    and mantissa; saturating the exponent alone would map ``512`` to
-    ``256``.
+    underflow, or exactly ``2**-12``) is stored as ``0x01``. Negative
+    underflow keeps ``0x80`` (``-2**-12``). Overflow clamps both exponent
+    and mantissa.
     """
     is_z = x == fx.Float32(0.0)
     sign = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0))
     bits = abs(x).bitcast(fx.Int32)
     e = (bits.shrui(fx.Int32(23)) & fx.Int32(255)) - fx.Int32(127)
     mant = bits & fx.Int32(0x7FFFFF)
-    m3 = (mant + fx.Int32(1 << 19)).shrui(fx.Int32(20))
-    carry = m3 == fx.Int32(8)
+    m3 = (mant + fx.Int32(1 << 20)).shrui(fx.Int32(21))
+    carry = m3 == fx.Int32(4)
     e = e + carry.select(fx.Int32(1), fx.Int32(0))
     m3 = carry.select(fx.Int32(0), m3)
-    e4 = e + fx.Int32(7)
-    overflow = e4 > fx.Int32(15)
-    m3 = overflow.select(fx.Int32(7), m3)
-    e4 = (e4 < fx.Int32(0)).select(fx.Int32(0), overflow.select(fx.Int32(15), e4))
-    byte = sign | (e4 << fx.Int32(3)) | (m3 & fx.Int32(7))
+    e4 = e + fx.Int32(12)
+    overflow = e4 > fx.Int32(31)
+    m3 = overflow.select(fx.Int32(3), m3)
+    e4 = (e4 < fx.Int32(0)).select(fx.Int32(0), overflow.select(fx.Int32(31), e4))
+    byte = sign | (e4 << fx.Int32(2)) | (m3 & fx.Int32(3))
     return is_z.select(fx.Int32(0), (byte == fx.Int32(0)).select(fx.Int32(1), byte))
 
 
 def _e4m3_to_f32(b):
     is_z = b == fx.Int32(0)
     sign = (b & fx.Int32(0x80)) != fx.Int32(0)
-    e4 = b.shrui(fx.Int32(3)) & fx.Int32(15)
-    m3 = b & fx.Int32(7)
-    mag_bits = ((e4 + fx.Int32(120)) << fx.Int32(23)) | (m3 << fx.Int32(20))
+    e4 = b.shrui(fx.Int32(2)) & fx.Int32(31)
+    m3 = b & fx.Int32(3)
+    mag_bits = ((e4 + fx.Int32(115)) << fx.Int32(23)) | (m3 << fx.Int32(21))
     mag = mag_bits.bitcast(fx.Float32)
     signed = sign.select(-mag, mag)
     return is_z.select(fx.Float32(0.0), signed)
