@@ -8,6 +8,9 @@ For each tuner family, discovers all tuned CSVs (default + model_configs),
 merges them via pathsep, and runs --run_config to benchmark every shape.
 Any shape that errors (us=-1 or exception) is reported as a test failure.
 
+The tuner only benchmarks rows whose gfx and cu_num match the live device,
+so a family with no rows for this device is skipped rather than passed.
+
 Run:
     python3 -m unittest op_tests.tuning_tests.test_run_config -v
 """
@@ -80,6 +83,61 @@ def _resolve_config_via_aiter(config_property):
 def _merge_config_paths(csv_list):
     """Merge multiple CSV paths with os.pathsep (like AITER_CONFIG_* env)."""
     return os.pathsep.join(csv_list)
+
+
+def _count_rows_for_live_device(config_csv):
+    """Count tuned rows that --run_config will benchmark on the live device.
+
+    Mirrors the tuner's filter: gfx must match when the CSV has a gfx column,
+    and cu_num must match when it has a cu_num column. Returns
+    ``(matched, summary)`` where summary names the device and the targets the
+    CSVs do cover, so an empty run says why it was empty.
+    """
+    import torch
+
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    gfx = get_gfx_runtime()
+    cu_num = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+    targets = {}
+    total = 0
+    matched = 0
+    for path in config_csv.split(os.pathsep):
+        if not os.path.exists(path):
+            continue
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                total += 1
+                row_gfx = row.get("gfx")
+                row_cu = row.get("cu_num")
+                target = f"{row_gfx or '?'}/cu{row_cu or '?'}"
+                targets[target] = targets.get(target, 0) + 1
+                if row_gfx is not None and row_gfx != gfx:
+                    continue
+                if row_cu is not None and row_cu != str(cu_num):
+                    continue
+                matched += 1
+
+    present = ", ".join(
+        f"{t} ({n})" for t, n in sorted(targets.items(), key=lambda kv: -kv[1])
+    )
+    summary = (
+        f"{matched} of {total} tuned rows match {gfx}/cu{cu_num}"
+        f" (rows present: {present or 'none'})"
+    )
+    return matched, summary
+
+
+def _skip_or_fail_when_nothing_ran(testcase, name, config_csv, all_results):
+    matched, summary = _count_rows_for_live_device(config_csv)
+    if not all_results:
+        if matched == 0:
+            testcase.skipTest(f"{name}: nothing to verify on this device; {summary}")
+        testcase.fail(f"{name}: run_config reported no results; {summary}")
+    return summary
 
 
 def _run_config(script, config_csv, timeout=600, extra_args=None):
@@ -396,9 +454,11 @@ class TestRunConfig(unittest.TestCase):
         )
 
         all_results = _parse_all_benchmark_results(lines)
+        coverage = _skip_or_fail_when_nothing_ran(self, name, merged, all_results)
+        print(f"\n  {name}: {coverage}")
         csv_file = _save_results_csv(name, all_results)
         if csv_file:
-            print(f"\n  Results CSV: {csv_file} ({len(all_results)} shapes)")
+            print(f"  Results CSV: {csv_file} ({len(all_results)} shapes)")
 
         failures = _format_failures(
             name, error_shapes, mismatch_shapes, skip_count, lines
@@ -407,8 +467,8 @@ class TestRunConfig(unittest.TestCase):
             len(failures),
             0,
             f"{name} run_config: {ok_count} OK, {skip_count} SKIP, "
-            f"{len(error_shapes)} ERROR, {len(mismatch_shapes)} MISMATCH\n"
-            + "\n".join(failures),
+            f"{len(error_shapes)} ERROR, {len(mismatch_shapes)} MISMATCH; "
+            f"{coverage}\n" + "\n".join(failures),
         )
 
     def test_a8w8(self):
@@ -533,9 +593,11 @@ class TestRunConfigCustom(unittest.TestCase):
         )
 
         all_results = _parse_all_benchmark_results(lines)
+        coverage = _skip_or_fail_when_nothing_ran(self, family, merged, all_results)
+        print(f"\n  {family}: {coverage}")
         csv_file = _save_results_csv(family, all_results)
         if csv_file:
-            print(f"\n  Results CSV: {csv_file} ({len(all_results)} shapes)")
+            print(f"  Results CSV: {csv_file} ({len(all_results)} shapes)")
 
         failures = _format_failures(
             family, error_shapes, mismatch_shapes, skip_count, lines
@@ -544,8 +606,8 @@ class TestRunConfigCustom(unittest.TestCase):
             len(failures),
             0,
             f"{family} run_config: {ok_count} OK, {skip_count} SKIP, "
-            f"{len(error_shapes)} ERROR, {len(mismatch_shapes)} MISMATCH\n"
-            + "\n".join(failures),
+            f"{len(error_shapes)} ERROR, {len(mismatch_shapes)} MISMATCH; "
+            f"{coverage}\n" + "\n".join(failures),
         )
 
 
