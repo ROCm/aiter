@@ -1212,6 +1212,10 @@ def _bwd_dkdvdq_inner_atomic(
             causal_mask = (offs_m[None, :] - delta_qk) >= (offs_n[:, None])
             mask = causal_mask & mask_nm
             pT = tl.where(mask, pT, 0.0)
+        else:
+            # Keys past seqlen_k are loaded as 0, so pT = exp(-m) there, which overflows to inf when every
+            # logit of the row is very negative (m < -88). dsT.T @ k(=0) would then put NaN in dq.
+            pT = tl.where(mask_nm, pT, 0.0)
 
         # load DO
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
@@ -5055,6 +5059,10 @@ def attention_backward_triton_impl(
                 stride_vh,
                 stride_vn,
                 stride_vd,
+                stride_dkb,
+                stride_dkh,
+                stride_dkn,
+                stride_dkd,
                 stride_dqb,
                 stride_dqh,
                 stride_dqm,
@@ -5120,6 +5128,10 @@ def attention_backward_triton_impl(
                 stride_vh,
                 stride_vn,
                 stride_vd,
+                stride_dkb,
+                stride_dkh,
+                stride_dkn,
+                stride_dkd,
                 stride_dqb,
                 stride_dqh,
                 stride_dqm,
