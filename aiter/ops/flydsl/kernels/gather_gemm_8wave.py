@@ -571,6 +571,7 @@ def compile_gather_kv_b_proj_8w(
     head_tiles: int = 1,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 1,
+    num_xcds: int = 8,
     weight_preshuffle: bool = True,
     per_row_scale: bool = True,
     wide_index: bool = False,
@@ -626,6 +627,8 @@ def compile_gather_kv_b_proj_8w(
         f"{'_wide' if wide_index else ''}"
         f"{'_fp8' if output_fp8 else '_bf16'}"
     )
+    if xcd_swizzle > 0 and num_xcds != 8:
+        _kname += f"_nxcd{num_xcds}"
 
     @fx.struct
     class SharedStorage:
@@ -679,7 +682,10 @@ def compile_gather_kv_b_proj_8w(
         # XCD's L2.
         if const_expr(xcd_swizzle > 0):
             block_m, block_n = _xcd_swizzle_any(
-                ceildiv(m_rows, BLOCK_M), n_heads * head_tiles, wgm=xcd_swizzle
+                ceildiv(m_rows, BLOCK_M),
+                n_heads * head_tiles,
+                wgm=xcd_swizzle,
+                num_xcds=num_xcds,
             )
         else:
             block_m, block_n = split_row_major_2d(fx.block_idx.x, n_heads * head_tiles)

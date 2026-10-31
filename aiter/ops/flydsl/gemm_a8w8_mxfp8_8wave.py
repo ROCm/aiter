@@ -11,7 +11,7 @@ import re
 import torch
 from torch import Tensor
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes, get_num_xcds
 
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile, one
 # 256x256 block tile, and scales staged a 256-K pair at a time.
@@ -106,6 +106,7 @@ def compile_mxfp8_8wave_gemm(
     K: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    num_xcds: int,
     scale_preshuffled: bool = False,
     w_scale_block: str = "1x32",
 ):
@@ -120,6 +121,7 @@ def compile_mxfp8_8wave_gemm(
         scale_preshuffled=bool(scale_preshuffled),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
         b_scale_block=w_scale_block,
         a_scale_block="1x128" if w_scale_block == "128x128" else "1x32",
     )
@@ -238,6 +240,7 @@ def flydsl_mxfp8_8wave_gemm(
         K=K,
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=get_num_xcds(),
         scale_preshuffled=scale_preshuffled,
         w_scale_block=w_scale_block,
     )
