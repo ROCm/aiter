@@ -618,8 +618,8 @@ def compile_gemm2_a4w4_port(
         bx = gpu.block_id("x")
         tx_i32 = fx.Int32(tx)
         bx_i32 = fx.Int32(bx)
-        lane = tx_i32 % fx.Int32(64)
-        wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+        lane = tx_i32 % 64
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // 64)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         _gemm2_kernel_body(
             arg_aq,

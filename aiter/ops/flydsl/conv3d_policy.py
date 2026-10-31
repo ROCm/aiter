@@ -118,7 +118,17 @@ def _n_fill(tile_n, kg):
     return kg / (_ceil_div(kg, tile_n) * tile_n)
 
 
-def _sweep(npq, kg, groups, num_cu, min_n_fill, min_waves, check_waste, check_grid):
+def _sweep(
+    npq,
+    kg,
+    groups,
+    num_cu,
+    min_n_fill,
+    min_waves,
+    check_waste,
+    check_grid,
+    lds_bytes_fn,
+):
     """One filtering pass. Returns ``[(sort_key, config), ...]``, unsorted."""
     scored = []
     lds_limit = max_lds_bytes()
@@ -136,7 +146,7 @@ def _sweep(npq, kg, groups, num_cu, min_n_fill, min_waves, check_waste, check_gr
         if n_acc > MAX_N_ACC:
             continue
 
-        if lds_bytes(tile_m, tile_n) > lds_limit:
+        if lds_bytes_fn((tile_m, tile_n, wave_m, wave_n)) > lds_limit:
             continue
 
         fill = _n_fill(tile_n, kg)
@@ -191,12 +201,28 @@ def get_flydsl_conv3d_configs(
     groups,
     num_cu,
     max_configs=96,
+    lds_bytes_fn=None,
 ):
-    """Candidate ``(tile_m, tile_n, wave_m, wave_n, wgm)`` tuples; never empty."""
+    """Candidate ``(tile_m, tile_n, wave_m, wave_n, wgm)`` tuples; never empty.
+
+    ``lds_bytes_fn(tile)``: the LDS a block of this tile allocates for the shape
+    being tuned. The kW-reuse layout depends on the filter, which this function
+    does not see; without it the default-path footprint is assumed.
+    """
+    if lds_bytes_fn is None:
+        lds_bytes_fn = lambda tile: lds_bytes(tile[0], tile[1])
     scored = []
     for min_n_fill, min_waves, check_waste, check_grid in _RELAXATIONS:
         scored = _sweep(
-            npq, kg, groups, num_cu, min_n_fill, min_waves, check_waste, check_grid
+            npq,
+            kg,
+            groups,
+            num_cu,
+            min_n_fill,
+            min_waves,
+            check_waste,
+            check_grid,
+            lds_bytes_fn,
         )
         if scored:
             break

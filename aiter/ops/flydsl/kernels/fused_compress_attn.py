@@ -129,19 +129,15 @@ def _load_f32_vec(buf, off_elems_i32, vec_width):
     """
     f32 = T.f32
     if const_expr(vec_width <= 4):
-        raw = fx.Vector(
-            fx.add_offset(fx.get_iter(buf), off_elems_i32).load(T.vec(vec_width, f32))
-        )
+        raw = fx.add_offset(fx.get_iter(buf), off_elems_i32).load(T.vec(vec_width, f32))
         return [raw[i] for i in range(vec_width)]
     else:
         # vec_width == 8 -> 2x dwordx4
         assert vec_width == 8
         half = vec_width // 2
         base = fx.Int32(off_elems_i32)
-        r0 = fx.Vector(fx.add_offset(fx.get_iter(buf), base).load(T.vec(half, f32)))
-        r1 = fx.Vector(
-            fx.add_offset(fx.get_iter(buf), base + half).load(T.vec(half, f32))
-        )
+        r0 = fx.add_offset(fx.get_iter(buf), base).load(T.vec(half, f32))
+        r1 = fx.add_offset(fx.get_iter(buf), base + half).load(T.vec(half, f32))
         return [r0[i] for i in range(half)] + [r1[i] for i in range(half)]
 
 
@@ -164,9 +160,7 @@ def _load_bf16_vec_then_f32(buf, off_elems_i32, vec_width):
             dtype=fx.Int32,
         )
     else:
-        raw = fx.Vector(
-            fx.add_offset(fx.get_iter(buf), off_dw).load(T.vec(dwords, i32))
-        )
+        raw = fx.add_offset(fx.get_iter(buf), off_dw).load(T.vec(dwords, i32))
     vec_bf16 = raw.bitcast(fx.BFloat16)
     return [vec_bf16[i].to(fx.Float32) for i in range_constexpr(vec_width)]
 
@@ -355,8 +349,8 @@ def _build_kernel(
         # saves 3 buffer-load instructions per program (visible at small N
         # where total program count is low).
         plan_buf = ptr_buf_tensor(fx.get_iter(plan), fx.Int32)
-        plan_vec = fx.Vector(
-            fx.add_offset(fx.get_iter(plan_buf), fx.Int32(pid) * 4).load(T.vec(4, i32))
+        plan_vec = fx.add_offset(fx.get_iter(plan_buf), fx.Int32(pid) * 4).load(
+            T.vec(4, i32)
         )
         ragged_id = plan_vec[0]
         batch_id = plan_vec[1]
@@ -490,7 +484,7 @@ def _build_kernel(
                 m_lane, kv_lane, w_lane = _split_state(state, VEC)
 
                 k_i32 = fx.Int32(k_static)
-                s = fx.Int32(position) - (K - 1) + k_i32
+                s = position - (K - 1) + k_i32
                 is_pad = s < fx.Int32(0)
                 s_safe = is_pad.select(fx.Int32(0), s)
                 ring = fx.Uint32(s_safe) % fx.Uint32(state_size)
@@ -538,7 +532,7 @@ def _build_kernel(
                 k = fx.Int32(k_i32)
                 col_off = _col_off_for_k(k_i32)
                 ape_row = fx.Uint32(k) % fx.Uint32(ratio)
-                in_row = fx.Int32(ragged_id) - ((K - 1) - k)
+                in_row = ragged_id - ((K - 1) - k)
                 return col_off, in_row, ape_row
 
             def _phase2_issue_loads(k_i32):
@@ -599,7 +593,7 @@ def _build_kernel(
                 #                no new prefetch. Gated by window_len < K so
                 #                that wl==K skips Phase 2 entirely.
                 # fx.min on signed fx.Int32 lowers to arith.minsi (byte-identical).
-                k_prologue = fx.min(fx.Int32(window_len), fx.Int32(K - 1))
+                k_prologue = fx.min(window_len, fx.Int32(K - 1))
                 pre_kv0, pre_sc0, pre_ape0 = _phase2_issue_loads(k_prologue)
                 init_pf_state = (
                     list(phase1_state) + list(pre_kv0) + list(pre_sc0) + list(pre_ape0)
@@ -616,7 +610,7 @@ def _build_kernel(
 
                     k_i32 = fx.Int32(k_static)
                     # k+1 ? [window_len+1, K-1]: always in-bounds, no clamp.
-                    k_next = k_i32 + fx.Int32(1)
+                    k_next = k_i32 + 1
                     nxt_kv, nxt_sc, nxt_ape = _phase2_issue_loads(k_next)
 
                     score_k_lane = [
@@ -645,7 +639,7 @@ def _build_kernel(
                 # the accumulator passes through phase1_state. Both arms are pure
                 # arithmetic (no loads), so compute the update unconditionally and
                 # per-lane select -- bit-identical to the old value-yielding IfOp.
-                is_phase2_nonempty = fx.Int32(window_len) < K
+                is_phase2_nonempty = window_len < K
                 m_lane_t = list(loop_final[0:VEC])
                 kv_lane_t = list(loop_final[VEC : 2 * VEC])
                 w_lane_t = list(loop_final[2 * VEC : 3 * VEC])
@@ -744,19 +738,15 @@ def _build_kernel(
                 sin_b = fx.add_offset(fx.get_iter(sin_buf), cos_row_base + cs_lo).load(
                     T.bf16
                 )
-                cos_vals = [fx.BFloat16(cos_b).to(fx.Float32)]
-                sin_vals = [fx.BFloat16(sin_b).to(fx.Float32)]
+                cos_vals = [cos_b.to(fx.Float32)]
+                sin_vals = [sin_b.to(fx.Float32)]
             else:
-                cos_vec = fx.Vector(
-                    fx.add_offset(fx.get_iter(cos_buf), cos_row_base + cs_lo).load(
-                        T.vec(PAIRS_PER_THREAD, T.bf16)
-                    )
-                )
-                sin_vec = fx.Vector(
-                    fx.add_offset(fx.get_iter(sin_buf), cos_row_base + cs_lo).load(
-                        T.vec(PAIRS_PER_THREAD, T.bf16)
-                    )
-                )
+                cos_vec = fx.add_offset(
+                    fx.get_iter(cos_buf), cos_row_base + cs_lo
+                ).load(T.vec(PAIRS_PER_THREAD, T.bf16))
+                sin_vec = fx.add_offset(
+                    fx.get_iter(sin_buf), cos_row_base + cs_lo
+                ).load(T.vec(PAIRS_PER_THREAD, T.bf16))
                 cos_vals = [cos_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
                 sin_vals = [sin_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
 
@@ -787,9 +777,7 @@ def _build_kernel(
 
                 # physical_block = block_table[batch_id, block_in_seq]
                 bt_buf = ptr_buf_tensor(fx.get_iter(block_table), fx.Int32)
-                bt_off = fx.Int32(batch_id) * block_table_seq_stride + block_in_seq.to(
-                    fx.Int32
-                )
+                bt_off = batch_id * block_table_seq_stride + block_in_seq.to(fx.Int32)
                 physical_block = fx.add_offset(fx.get_iter(bt_buf), bt_off).load(i32)
 
                 if const_expr(not quant):
@@ -1075,8 +1063,8 @@ def _build_kernel(
                         mode=_MxRoundInt.RoundUp,
                         dtype=_MxDtypeInt.FP4_E2M1,
                     )
-                    quant_exp = fx.Int32(254) - fx.Int32(e8m0)
-                    quant_scale = (quant_exp << fx.Int32(23)).bitcast(fx.Float32)
+                    quant_exp = 254 - fx.Int32(e8m0)
+                    quant_scale = (quant_exp << 23).bitcast(fx.Float32)
 
                     # (c) per-element E2M1 nibble, pack VEC/2 bytes.
                     # emit_f32_to_e2m1 bitcasts its arg with a raw MLIR type, so
@@ -1106,20 +1094,20 @@ def _build_kernel(
                         fx.Int8,
                     )
                     # packed byte index within the row = (tid*VEC) / 2.
-                    packed_start = fx.Uint32(tid_x_vec) >> fx.Uint32(1)
+                    packed_start = fx.Uint32(tid_x_vec) >> 1
                     for b in range_constexpr(PACKED_BYTES):
                         byte_val = fx.Int32(nibs[2 * b]) | (
-                            fx.Int32(nibs[2 * b + 1]) << fx.Int32(4)
+                            fx.Int32(nibs[2 * b + 1]) << 4
                         )
                         packed_idx = fx.Int32(packed_start) + b
                         if const_expr(preshuffle):
                             # FP4 KV preshuffle [NB, k_tiles, 4, kvbs, 16] u8.
                             # packed_idx / rem >= 0 -> unsigned divide/rem.
                             pk_u = fx.Uint32(packed_idx)
-                            k_tile = fx.Int32(pk_u // fx.Uint32(64))
-                            rem_u = pk_u % fx.Uint32(64)
-                            group4 = fx.Int32(rem_u // fx.Uint32(16))
-                            sub16 = fx.Int32(rem_u % fx.Uint32(16))
+                            k_tile = fx.Int32(pk_u // 64)
+                            rem_u = pk_u % 64
+                            group4 = fx.Int32(rem_u // 16)
+                            sub16 = fx.Int32(rem_u % 16)
                             byte_off = (
                                 k_tile * (4 * KVBS * 16)
                                 + group4 * (KVBS * 16)
@@ -1129,7 +1117,7 @@ def _build_kernel(
                         else:
                             byte_off = slot_in_block * (D // 2) + packed_idx
                         fx.add_offset(fx.get_iter(out_buf), byte_off).store(
-                            fx.Int32(byte_val).to(fx.Int8)
+                            byte_val.to(fx.Int8)
                         )
 
                     # (e) group-rep lane writes the e8m0 scale byte.
@@ -1160,13 +1148,11 @@ def _build_kernel(
                             # (KVS_NTPW == 4). Matches the op-test reference
                             # writer `indexer_k_fp4_paged_preshuffle` and the
                             # packed N_PHYS==1 readers in pa_mqa_logits_fp4*.
-                            sg_u = fx.Uint32(scale_group_idx)
-                            k_tile_s = fx.Int32(sg_u // fx.Uint32(4))
-                            group4_s = fx.Int32(sg_u % fx.Uint32(4))
+                            sg_u = scale_group_idx
+                            k_tile_s = fx.Int32(sg_u // 4)
+                            group4_s = fx.Int32(sg_u % 4)
                             slot_u = fx.Uint32(slot_in_block)
-                            sflat = fx.Int32(slot_u % fx.Uint32(16)) * 4 + fx.Int32(
-                                slot_u // fx.Uint32(16)
-                            )
+                            sflat = fx.Int32(slot_u % 16) * 4 + fx.Int32(slot_u // 16)
                             cs_off = k_tile_s * (4 * KVBS) + group4_s * KVBS + sflat
                         else:
                             cs_off = slot_in_block * (D // _FP4_GROUP_SIZE) + fx.Int32(
@@ -1177,7 +1163,7 @@ def _build_kernel(
                         )  # e8m0 uint8
             # else: warmup — no scatter, just consume compute.
 
-        if fx.Int32(position) >= 0:
+        if position >= 0:
             _body()
 
     @flyc.jit
@@ -1443,8 +1429,8 @@ def _build_kernel_ksplit(
 
         # ---- plan row (single dwordx4) ----
         plan_buf = ptr_buf_tensor(fx.get_iter(plan), fx.Int32)
-        plan_vec = fx.Vector(
-            fx.add_offset(fx.get_iter(plan_buf), fx.Int32(pid) * 4).load(T.vec(4, i32))
+        plan_vec = fx.add_offset(fx.get_iter(plan_buf), fx.Int32(pid) * 4).load(
+            T.vec(4, i32)
         )
         ragged_id = plan_vec[0]
         batch_id = plan_vec[1]
@@ -1524,7 +1510,7 @@ def _build_kernel_ksplit(
                 return new_m, new_kv, new_w
 
             def _phase1_loads(k_i32):
-                s = fx.Int32(position) - (K - 1) + fx.Int32(k_i32)
+                s = position - (K - 1) + fx.Int32(k_i32)
                 is_pad = s < fx.Int32(0)
                 s_safe = is_pad.select(fx.Int32(0), s)
                 ring = fx.Int32(s_safe) % state_size
@@ -1543,7 +1529,7 @@ def _build_kernel_ksplit(
                 col_off = _col_off_for_k(k_i32)
                 k = fx.Int32(k_i32)
                 ape_row = k % ratio
-                in_row_raw = fx.Int32(ragged_id) - ((K - 1) - k)
+                in_row_raw = ragged_id - ((K - 1) - k)
                 in_row = (in_row_raw > 0).select(in_row_raw, fx.Int32(0))
                 base_in = in_row * kv_in_row_stride + col_off + lid_x_vec
                 base_sc = in_row * score_in_row_stride + col_off + lid_x_vec
@@ -1557,7 +1543,7 @@ def _build_kernel_ksplit(
             # ---- this wave's K range [wid*KPW, (wid+1)*KPW), split at window_len ----
             k_start = wid * K_PER_WAVE
             k_end = k_start + K_PER_WAVE
-            wl = fx.Int32(window_len)
+            wl = window_len
             split_lo = (wl > k_start).select(wl, k_start)
             split = (split_lo < k_end).select(split_lo, k_end)
 
@@ -1673,19 +1659,15 @@ def _build_kernel_ksplit(
                     sin_b = fx.add_offset(
                         fx.get_iter(sin_buf), cos_row_base + cs_lo
                     ).load(T.bf16)
-                    cos_vals = [fx.BFloat16(cos_b).to(fx.Float32)]
-                    sin_vals = [fx.BFloat16(sin_b).to(fx.Float32)]
+                    cos_vals = [cos_b.to(fx.Float32)]
+                    sin_vals = [sin_b.to(fx.Float32)]
                 else:
-                    cos_vec = fx.Vector(
-                        fx.add_offset(fx.get_iter(cos_buf), cos_row_base + cs_lo).load(
-                            T.vec(PAIRS_PER_THREAD, T.bf16)
-                        )
-                    )
-                    sin_vec = fx.Vector(
-                        fx.add_offset(fx.get_iter(sin_buf), cos_row_base + cs_lo).load(
-                            T.vec(PAIRS_PER_THREAD, T.bf16)
-                        )
-                    )
+                    cos_vec = fx.add_offset(
+                        fx.get_iter(cos_buf), cos_row_base + cs_lo
+                    ).load(T.vec(PAIRS_PER_THREAD, T.bf16))
+                    sin_vec = fx.add_offset(
+                        fx.get_iter(sin_buf), cos_row_base + cs_lo
+                    ).load(T.vec(PAIRS_PER_THREAD, T.bf16))
                     cos_vals = [
                         cos_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)
                     ]
@@ -1714,9 +1696,7 @@ def _build_kernel_ksplit(
                 block_in_seq = ci // fx.Uint32(k_per_block)
                 slot_in_block = (ci % fx.Uint32(k_per_block)).to(fx.Int32)
                 bt_buf = ptr_buf_tensor(fx.get_iter(block_table), fx.Int32)
-                bt_off = fx.Int32(batch_id) * block_table_seq_stride + block_in_seq.to(
-                    fx.Int32
-                )
+                bt_off = batch_id * block_table_seq_stride + block_in_seq.to(fx.Int32)
                 physical_block = fx.add_offset(fx.get_iter(bt_buf), bt_off).load(i32)
 
                 if const_expr(not quant):
@@ -1941,8 +1921,8 @@ def _build_kernel_ksplit(
                         mode=_MxRoundInt.RoundUp,
                         dtype=_MxDtypeInt.FP4_E2M1,
                     )
-                    quant_exp = fx.Int32(254) - fx.Int32(e8m0)
-                    quant_scale = (quant_exp << fx.Int32(23)).bitcast(fx.Float32)
+                    quant_exp = 254 - fx.Int32(e8m0)
+                    quant_scale = (quant_exp << 23).bitcast(fx.Float32)
 
                     # (c) per-element E2M1 nibble, pack VEC/2 bytes.
                     # emit_f32_to_e2m1 bitcasts its arg with a raw MLIR type, so
@@ -1969,19 +1949,19 @@ def _build_kernel_ksplit(
                         ),
                         fx.Int8,
                     )
-                    packed_start = fx.Uint32(lid_x_vec_i) >> fx.Uint32(1)
+                    packed_start = fx.Uint32(lid_x_vec_i) >> 1
                     for b in range_constexpr(PACKED_BYTES):
                         byte_val = fx.Int32(nibs[2 * b]) | (
-                            fx.Int32(nibs[2 * b + 1]) << fx.Int32(4)
+                            fx.Int32(nibs[2 * b + 1]) << 4
                         )
                         packed_idx = fx.Int32(packed_start) + b
                         if const_expr(preshuffle):
                             # packed_idx / rem >= 0 -> unsigned divide/rem.
                             pk_u = fx.Uint32(packed_idx)
-                            k_tile = fx.Int32(pk_u // fx.Uint32(64))
-                            rem_u = pk_u % fx.Uint32(64)
-                            group4 = fx.Int32(rem_u // fx.Uint32(16))
-                            sub16 = fx.Int32(rem_u % fx.Uint32(16))
+                            k_tile = fx.Int32(pk_u // 64)
+                            rem_u = pk_u % 64
+                            group4 = fx.Int32(rem_u // 16)
+                            sub16 = fx.Int32(rem_u % 16)
                             byte_off = (
                                 k_tile * (4 * KVBS * 16)
                                 + group4 * (KVBS * 16)
@@ -1991,7 +1971,7 @@ def _build_kernel_ksplit(
                         else:
                             byte_off = slot_in_block * (D // 2) + packed_idx
                         fx.add_offset(fx.get_iter(out_buf), byte_off).store(
-                            fx.Int32(byte_val).to(fx.Int8)
+                            byte_val.to(fx.Int8)
                         )
 
                     # (e) group-rep lane writes the e8m0 scale byte.
@@ -2021,13 +2001,11 @@ def _build_kernel_ksplit(
                             # (KVS_NTPW==4). Matches the legacy writer, the
                             # op-test reference, and the packed N_PHYS==1
                             # readers in pa_mqa_logits_fp4*.
-                            sg_u = fx.Uint32(scale_group_idx)
-                            k_tile_s = fx.Int32(sg_u // fx.Uint32(4))
-                            group4_s = fx.Int32(sg_u % fx.Uint32(4))
+                            sg_u = scale_group_idx
+                            k_tile_s = fx.Int32(sg_u // 4)
+                            group4_s = fx.Int32(sg_u % 4)
                             slot_u = fx.Uint32(slot_in_block)
-                            sflat = fx.Int32(slot_u % fx.Uint32(16)) * 4 + fx.Int32(
-                                slot_u // fx.Uint32(16)
-                            )
+                            sflat = fx.Int32(slot_u % 16) * 4 + fx.Int32(slot_u // 16)
                             cs_off = k_tile_s * (4 * KVBS) + group4_s * KVBS + sflat
                         else:
                             cs_off = slot_in_block * (D // _FP4_GROUP_SIZE) + fx.Int32(
@@ -2040,7 +2018,7 @@ def _build_kernel_ksplit(
             if wid == 0:
                 _wave0()
 
-        if fx.Int32(position) >= 0:
+        if position >= 0:
             _body()
 
     @flyc.jit

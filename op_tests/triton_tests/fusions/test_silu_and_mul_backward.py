@@ -106,10 +106,13 @@ def test_silu_and_mul_backward_validation():
     grad_output = torch.randn((2, 32), dtype=x.dtype, device=x.device)
     with pytest.raises(AssertionError, match="non-zero"):
         silu_and_mul_backward(
-            torch.empty((2, 0), device=x.device), torch.empty((2, 0), device=x.device)
+            torch.empty((2, 0), dtype=torch.float32, device=x.device),
+            torch.empty((2, 0), dtype=torch.float32, device=x.device),
         )
     with pytest.raises(AssertionError, match="even"):
-        silu_and_mul_backward(grad_output, torch.randn((2, 63), device=x.device))
+        silu_and_mul_backward(
+            grad_output, torch.randn((2, 63), dtype=torch.float32, device=x.device)
+        )
     with pytest.raises(AssertionError, match="shape"):
         silu_and_mul_backward(grad_output[:, :-1], x)
     with pytest.raises(AssertionError, match="dtype"):

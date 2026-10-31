@@ -9,10 +9,8 @@ from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
     _fused_fp4_bmm_reduce_kernel,
     _fused_fp4_bmm_rope_cat_and_cache_mla_kernel,
     _fused_fp8_bmm_rope_cat_and_cache_mla_kernel,
+    _get_fp4_config,
     _get_fp8_config,
-)
-from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
-    _get_config as _get_fp4_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
 from aiter.ops.triton.utils._triton import arch_info

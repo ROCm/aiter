@@ -177,6 +177,7 @@ else:
     from .ops.inverse_rope_group_quant import *
     from .ops.groupnorm import *
     from .ops.mhc import *
+    from .ops.mega_mhc import *
     from .ops.causal_conv1d_update import *
     from .ops.fused_split_gdr_update import *
     from .ops.gdr_decode_packed_bf16 import *

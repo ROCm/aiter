@@ -357,8 +357,8 @@ def build_silu_and_mul_fq_module(
                                 dtype=_mx_dtype,
                             )
                         )
-                        quant_exp = fx.Int32(254) - e8m0_biased
-                        quant_scale = (quant_exp << fx.Int32(23)).bitcast(fx.Float32)
+                        quant_exp = 254 - e8m0_biased
+                        quant_scale = (quant_exp << 23).bitcast(fx.Float32)
 
                         if const_expr(_need_fp4):
                             # Pack VEC values into VEC//2 fp4 nibble bytes.

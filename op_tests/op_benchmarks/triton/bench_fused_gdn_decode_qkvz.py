@@ -22,7 +22,6 @@ Usage:
     python3 bench_fused_gdn_decode_qkvz.py --batch 1,32,256 --no-fp8
 """
 
-import argparse
 import sys
 
 import torch
@@ -31,6 +30,7 @@ from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
     fused_gdn_decode_qkvz,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # Peak theoretical HBM bandwidth, bytes/s.
 _PEAK_BW = {"gfx950": 8.0e12, "gfx942": 5.3e12}
@@ -38,9 +38,8 @@ _HEAD_DIM = 128
 _CONV_WIDTH = 4
 
 
-def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda"):
-    num_v_heads = 2 * num_k_heads
-    ratio = num_v_heads // num_k_heads
+def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda", ratio=2):
+    num_v_heads = ratio * num_k_heads
     group_width = 2 * head_dim + 2 * ratio * head_dim
     channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim
     slots = max(slots, batch + 1)
@@ -63,14 +62,16 @@ def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda"):
     }
 
 
-def bytes_moved(batch, num_k_heads, head_dim, fp8):
+def bytes_moved(batch, num_k_heads, head_dim, fp8, ratio=2):
     """Compulsory traffic for one launch."""
-    num_v_heads = 2 * num_k_heads
+    num_v_heads = ratio * num_k_heads
     channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim
     state = batch * num_v_heads * head_dim * head_dim * 4  # fp32
     total = 2 * state  # read + write, the dominant term
     total += 2 * batch * channels * (_CONV_WIDTH - 1) * 2  # conv window r+w, bf16
-    total += batch * num_k_heads * (2 * head_dim + 4 * head_dim) * 2  # packed qkvz
+    total += (
+        batch * num_k_heads * (2 * head_dim + 2 * ratio * head_dim) * 2
+    )  # packed qkvz
     total += batch * num_v_heads * head_dim * 2  # bf16 out
     if fp8:
         total += batch * num_v_heads * head_dim  # fp8 out
@@ -78,8 +79,18 @@ def bytes_moved(batch, num_k_heads, head_dim, fp8):
     return total
 
 
-def bench_one(batch, num_k_heads, head_dim, slots, quant_dtype, iters, warmup=25):
-    inp = make_inputs(batch, num_k_heads, head_dim, slots)
+def bench_one(
+    batch,
+    num_k_heads,
+    head_dim,
+    slots,
+    quant_dtype,
+    iters,
+    warmup=25,
+    ratio=2,
+    layout="interleaved",
+):
+    inp = make_inputs(batch, num_k_heads, head_dim, slots, ratio=ratio)
     args = (
         inp["projected_qkvz"],
         inp["projected_ba"],
@@ -92,7 +103,12 @@ def bench_one(batch, num_k_heads, head_dim, slots, quant_dtype, iters, warmup=25
         inp["dt_bias"],
         inp["norm_weight"],
     )
-    kwargs = {"scale": head_dim**-0.5, "norm_eps": 1e-6, "quant_dtype": quant_dtype}
+    kwargs = {
+        "scale": head_dim**-0.5,
+        "norm_eps": 1e-6,
+        "quant_dtype": quant_dtype,
+        "qkvz_layout": layout,
+    }
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -124,9 +140,21 @@ def bench_one(batch, num_k_heads, head_dim, slots, quant_dtype, iters, warmup=25
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = get_parser(kernel_name="Fused GDN Decode QKVZ")
     ap.add_argument("--batch", default="1,2,4,8,16,32,64,128,256")
     ap.add_argument("--num-k-heads", type=int, default=4)
+    ap.add_argument(
+        "--ratio",
+        type=int,
+        default=2,
+        help="value heads per key head (2 Qwen3-Next, 3 Qwen3.8-27B)",
+    )
+    ap.add_argument(
+        "--layout",
+        choices=("interleaved", "flat"),
+        default="interleaved",
+        help="packed qkvz/ba layout (interleaved: Qwen3-Next, flat: Qwen3.5/3.8)",
+    )
     ap.add_argument("--head-dim", type=int, default=_HEAD_DIM)
     ap.add_argument("--slots", type=int, default=512)
     ap.add_argument("--iters", type=int, default=200)
@@ -143,16 +171,23 @@ def main():
     print(
         f"fused_gdn_decode_qkvz on {torch.cuda.get_device_name(0)} ({arch}), "
         f"num_k_heads={args.num_k_heads} head_dim={args.head_dim} "
-        f"slots={args.slots} fp8={not args.no_fp8}"
+        f"slots={args.slots} fp8={not args.no_fp8} ratio={args.ratio} layout={args.layout}"
     )
     # us per call; this op is always a single launch, so also per launch.
     print(f"{'batch':>7}{'us/call':>10}{'GB moved':>11}{'TB/s':>9}{'% peak':>9}")
     for b in [int(x) for x in args.batch.split(",")]:
         us = bench_one(
-            b, args.num_k_heads, args.head_dim, args.slots, quant_dtype, args.iters
+            b,
+            args.num_k_heads,
+            args.head_dim,
+            args.slots,
+            quant_dtype,
+            args.iters,
+            ratio=args.ratio,
+            layout=args.layout,
         )
         nbytes = bytes_moved(
-            b, args.num_k_heads, args.head_dim, quant_dtype is not None
+            b, args.num_k_heads, args.head_dim, quant_dtype is not None, args.ratio
         )
         tbs = nbytes / (us * 1e-6) / 1e12
         pct = 100.0 * tbs * 1e12 / peak if peak else float("nan")

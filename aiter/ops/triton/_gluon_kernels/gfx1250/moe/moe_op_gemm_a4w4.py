@@ -49,7 +49,7 @@ def matmul_launch_metadata(grid, kernel, args):
     hist = args["ExptHist"]
     if hist is not None:
         n_rows = int(hist.float().mean())
-        n_tokens = float(hist.sum())
+        n_tokens = int(hist.sum())
         n_w_bytes = (W.numel() * W.element_size() // hist.numel()) * (hist > 0).sum()
     else:
         n_tokens = None

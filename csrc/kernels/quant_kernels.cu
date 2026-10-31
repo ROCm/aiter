@@ -13,6 +13,7 @@
 #include "gemm_dispatch_utils.h"
 #include "quant.h"
 #include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include "rocprim/rocprim.hpp"
 #include <cstdlib>
 
@@ -285,7 +286,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     };
 
     auto process = [&](vec_i thread_data, int64_t x, int32_t y, int64_t groupId) {
-        float absMax = 1e-10f;
+        float absMax = aiter::kAmaxFloor;
         if constexpr(packed_bf16_amax && kTunedForThisArch)
         {
             static_assert(std::is_same_v<DTYPE_I, opus::bf16_t> && thread_data_size % 2 == 0);
@@ -669,7 +670,7 @@ __global__ void initializeScale(float *d_data, int size, float value)
     }
 }
 
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16, bool check_tail = false>
 __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __restrict__ input,
                                                              const int32_t cols)
 {
@@ -689,6 +690,24 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
     auto buffer_i = opus::make_gmem<DTYPE_I>(ptr_i, oob_i * sizeof(DTYPE_I));
 
+    // Only the per-tensor non-dword-aligned path needs scalar row-tail loads.
+    auto load_vec = [&](size_t index) {
+        if constexpr(check_tail)
+        {
+            const size_t offset = index * vec_size_i;
+            if(offset + vec_size_i > static_cast<size_t>(cols))
+            {
+                vec_i tail{};
+#pragma unroll
+                for(int j = 0; j < vec_size_i; ++j)
+                    if(offset + j < static_cast<size_t>(cols))
+                        tail[j] = ptr_i[offset + j];
+                return tail;
+            }
+        }
+        return load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, index * vec_size_i);
+    };
+
     // double load core loop start
     const int32_t num_elems_tail = cols % vec_size_i;
     const int32_t num_vecs       = (cols + vec_size_i - 1) / vec_size_i;
@@ -698,7 +717,10 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     size_t vec_stride = BlockSize;
     if(vec_idx < num_vecs)
     {
-        vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
+        if constexpr(check_tail)
+            vec_cur = load_vec(vec_idx);
+        else
+            vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
     }
 
     float absMax = 0.f;
@@ -707,7 +729,10 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
         vec_i vec_nxt;
         for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
         {
-            vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
+            if constexpr(check_tail)
+                vec_nxt = load_vec(vec_idx);
+            else
+                vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
             for(size_t j = 0; j < vec_size_i; j++)
             {
                 absMax = max(absMax, abs(static_cast<float>(vec_cur[j])));
@@ -758,6 +783,20 @@ data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ inpu
 }
 
 template <typename DTYPE_I, typename DTYPE_O>
+__global__ void
+data_to_scale_tail_kernel(float* __restrict__ scale,
+                          const DTYPE_I* __restrict__ input,
+                          const int cols)
+{
+    auto res        = data_to_per_row_scale<DTYPE_I, DTYPE_O, 0, true>(input, cols);
+    float row_scale = std::get<0>(res);
+    if(threadIdx.x == 0)
+    {
+        atomicMaxFloat(scale, row_scale);
+    }
+}
+
+template <typename DTYPE_I, typename DTYPE_O, bool check_tail = false>
 __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
                                   const DTYPE_I* __restrict__ input,
                                   const float* __restrict__ scale,
@@ -787,6 +826,45 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
     auto buffer_i = opus::make_gmem<DTYPE_I>(ptr_i, oob_i * sizeof(DTYPE_I));
     auto buffer_o = opus::make_gmem<DTYPE_STORE>(ptr_o, oob_o * sizeof(DTYPE_STORE));
 
+    // Only the per-tensor non-dword-aligned path needs scalar row-tail loads.
+    auto load_vec = [&](size_t index) {
+        if constexpr(check_tail)
+        {
+            const size_t offset = index * vec_size_i;
+            if(offset + vec_size_i > static_cast<size_t>(cols))
+            {
+                vec_i tail{};
+#pragma unroll
+                for(int j = 0; j < vec_size_i; ++j)
+                    if(offset + j < static_cast<size_t>(cols))
+                        tail[j] = ptr_i[offset + j];
+                return tail;
+            }
+        }
+        return load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, index * vec_size_i);
+    };
+
+    auto store_vec = [&](const vec_i& vec, size_t index) {
+        if constexpr(check_tail)
+        {
+            static_assert(std::is_same_v<DTYPE_O, opus::fp8_t> ||
+                          std::is_same_v<DTYPE_O, opus::i8_t>);
+            const size_t offset = index * vec_size_i;
+            if(offset + vec_size_i > static_cast<size_t>(cols))
+            {
+                // Keep the same FP8 saturation and int8 conversion as store_vector.
+                const auto converted = scaled_cast<DTYPE_O>(vec, inverted_scale);
+#pragma unroll
+                for(int j = 0; j < vec_size_i; ++j)
+                    if(offset + j < static_cast<size_t>(cols))
+                        ptr_o[offset + j] = converted[j];
+                return;
+            }
+        }
+        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(
+            buffer_o, vec, index * vec_size_o, inverted_scale);
+    };
+
     // double load core loop start
     const int32_t num_elems_tail = cols % vec_size_i;
     const int32_t num_vecs       = (cols + vec_size_i - 1) / vec_size_i;
@@ -799,19 +877,33 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
     size_t vec_stride = BlockSize;
     if(vec_idx < num_vecs)
     {
-        vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
+        if constexpr(check_tail)
+            vec_cur = load_vec(vec_idx);
+        else
+            vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
     }
 
     for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
     {
-        vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
-        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
+        if constexpr(check_tail)
+            vec_nxt = load_vec(vec_idx);
+        else
+            vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
+        if constexpr(check_tail)
+            store_vec(vec_cur, vec_idx - vec_stride);
+        else
+            store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(
+                buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
         vec_cur = vec_nxt;
     }
 
     if(vec_idx - vec_stride < num_vecs)
     {
-        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
+        if constexpr(check_tail)
+            store_vec(vec_cur, vec_idx - vec_stride);
+        else
+            store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(
+                buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
     }
     // double load core loop end
 }
@@ -860,6 +952,15 @@ __global__ void scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                     const int cols)
 {
     scaled_quant_impl<DTYPE_I>(out, input, scale, cols);
+}
+
+template <typename DTYPE_I, typename DTYPE_O>
+__global__ void scaled_quant_tail_kernel(DTYPE_O* __restrict__ out,
+                                         const DTYPE_I* __restrict__ input,
+                                         const float* __restrict__ scale,
+                                         const int cols)
+{
+    scaled_quant_impl<DTYPE_I, DTYPE_O, true>(out, input, scale, cols);
 }
 
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
@@ -929,7 +1030,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
 
     vec_s smscale_cur;
     size_t vec_idx = threadIdx.x;
-    float absMax   = 1e-10f;
+    float absMax   = aiter::kAmaxFloor;
     smscale_cur = load_vector_nbytes<float, thread_data_size, 16>(buffer_s, vec_idx * vec_size_i);
 #pragma unroll
     for(size_t j = 0; j < vec_size_i; j++)
@@ -1105,22 +1206,36 @@ void static_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
     {
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
-                reinterpret_cast<input_dtype*>(input.data_ptr()),
-                reinterpret_cast<float*>(scale.data_ptr()),
-                cols);
+            if(cols % 4 == 0)
+                aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            else
+                aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
         });
     }
     else if(out.dtype() == AITER_DTYPE_i8)
     {
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<opus::i8_t*>(out.data_ptr()),
-                reinterpret_cast<input_dtype*>(input.data_ptr()),
-                reinterpret_cast<float*>(scale.data_ptr()),
-                cols);
+            if(cols % 4 == 0)
+                aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::i8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            else
+                aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::i8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
         });
     }
     else
@@ -1181,13 +1296,26 @@ void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
-                reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
-                reinterpret_cast<input_dtype*>(input.data_ptr()),
-                reinterpret_cast<float*>(scale.data_ptr()),
-                cols);
+            if(cols % 4 == 0)
+            {
+                aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            }
+            else
+            {
+                aiter::data_to_scale_tail_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            }
         });
     }
     else if(out.dtype() == AITER_DTYPE_i8)
@@ -1196,13 +1324,26 @@ void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
-                reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<opus::i8_t*>(out.data_ptr()),
-                reinterpret_cast<input_dtype*>(input.data_ptr()),
-                reinterpret_cast<float*>(scale.data_ptr()),
-                cols);
+            if(cols % 4 == 0)
+            {
+                aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::i8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            }
+            else
+            {
+                aiter::data_to_scale_tail_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
+                    reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                aiter::scaled_quant_tail_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<opus::i8_t*>(out.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    reinterpret_cast<float*>(scale.data_ptr()),
+                    cols);
+            }
         });
     }
     else
@@ -1344,23 +1485,26 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
     }
 }
 
-// MXFP8 1x32 quant whose e8m0 scale is written straight into the gfx1250 MXFP8 ASM GEMM's
-// A-scale layout ("m32k4", the byte layout of shuffle_mxfp8fp4_scale):
+// MXFP8 / MXFP4 1x32 quant whose e8m0 scale is written straight into the gfx1250 ASM / FlyDSL
+// GEMM's A-scale layout ("m32k4", the byte layout of shuffle_mxfp8fp4_scale):
 //     scale[(m / 32) * K + (g / 4) * 128 + (m % 32) * 4 + g % 4],   g = k / 32
 // i.e. one contiguous 128B block per 32 rows x 128 columns. Rows are padded to a multiple of
 // 32; the pad rows' scales are written as 0x7F (2^0, the shuffle_mxfp8fp4_scale pad value),
 // so the caller only allocates (pad32(M), K/32) bytes and never pre-fills it.
 //
-// A lane holds 16 contiguous elements (32B load, 16B fp8 store) and two lanes form a group, so
+// A lane holds 16 contiguous elements (32B load, 16B fp8 / 8B packed-fp4 store) and two lanes
+// form a group, so
 // a 32-lane slice covers four rows of a 32x128 tile per step. A slice runs kSteps steps and
 // 32 / (4 * kSteps) slices share a tile; all of a slice's loads are issued before its first
 // convert. The only cross-lane op is a quad-perm DPP, so nothing depends on the wave size. The
 // amax / e8m0 rounding / saturation below mirror the g32 path of
 // dynamic_per_group_scaled_quant_kernel, so the fp8 output and the unshuffled scale are
 // bit-identical to that path.
-template <typename DTYPE_I, int kWaves, int kSteps>
+template <typename DTYPE_I, typename DTYPE_O, int kWaves, int kSteps>
 __global__ void __launch_bounds__(kWaves * 32)
-dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
+dynamic_per_group_quant_m32k4_kernel(std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>,
+                                                        uint8_t,
+                                                        opus::fp8_t>* __restrict__ out,
                                      uint8_t* __restrict__ scale,
                                      DTYPE_I const* __restrict__ input,
                                      int64_t rows,
@@ -1371,10 +1515,15 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
     // A slice covers 4 * kSteps rows of one 128-column tile; kSlices slices cover its 32 rows.
     static constexpr int kSlices = 32 / (4 * kSteps);
     static_assert(kSteps * 4 * kSlices == 32 && kWaves % kSlices == 0);
+    static constexpr bool kFp4 = std::is_same_v<DTYPE_O, opus::fp4_t>;
     using vec_i = opus::vector_t<DTYPE_I, kElems>;
-    using vec_o = opus::vector_t<opus::fp8_t, kElems>;
+    // fp4 packs two values per byte: 16 elements store as 8 bytes.
+    using vec_o = std::conditional_t<kFp4,
+                                     opus::vector_t<uint8_t, kElems / 2>,
+                                     opus::vector_t<opus::fp8_t, kElems>>;
 #if defined(__gfx1250__)
-    static constexpr bool kHwConvertDiv = std::is_same_v<DTYPE_I, opus::bf16_t>;
+    // The hardware divide-by-scale convert is the fp8 path's; fp4 casts through scaled_cast.
+    static constexpr bool kHwConvertDiv = !kFp4 && std::is_same_v<DTYPE_I, opus::bf16_t>;
 #else
     static constexpr bool kHwConvertDiv = false;
 #endif
@@ -1382,9 +1531,11 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
         aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::RoundDown ||
         aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even;
 #if defined(__gfx942__)
-    static constexpr aiter::MxDtype kMxDtype = aiter::MxDtype::FP8_E4M3_FNUZ;
+    static constexpr aiter::MxDtype kMxDtype =
+        kFp4 ? aiter::MxDtype::FP4_E2M1 : aiter::MxDtype::FP8_E4M3_FNUZ;
 #else
-    static constexpr aiter::MxDtype kMxDtype = aiter::MxDtype::FP8_E4M3;
+    static constexpr aiter::MxDtype kMxDtype =
+        kFp4 ? aiter::MxDtype::FP4_E2M1 : aiter::MxDtype::FP8_E4M3;
 #endif
 
     const int lane     = threadIdx.x % 32;
@@ -1409,7 +1560,7 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
         const int r        = 4 * s.value + rsub; // row within the 32-row block
         const bool valid   = row0 + r < rows;
         vec_i thread_data  = data[s.value];
-        float absMax       = 1e-10f;
+        float absMax       = aiter::kAmaxFloor;
         for(int j = 0; j < kElems; ++j)
             absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
         absMax = multithread_reduce(absMax, aiter::Max(), 2);
@@ -1442,8 +1593,20 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
                 }
             }
         }
-        const vec_o q = scaled_cast_div<opus::fp8_t>(thread_data, row_scale);
-        *reinterpret_cast<vec_o*>(out + (row0 + r) * cols + col) = q;
+        if constexpr(kFp4)
+        {
+            // Same primitive as the grouped fp4 path (store_vector): the divisor, not its
+            // reciprocal, so the packed bytes match that path bit for bit.
+            const auto q = scaled_cast<opus::fp4_t>(thread_data, row_scale);
+            static_assert(sizeof(q) == sizeof(vec_o));
+            *reinterpret_cast<vec_o*>(out + ((row0 + r) * cols + col) / 2) =
+                __builtin_bit_cast(vec_o, q);
+        }
+        else
+        {
+            const vec_o q = scaled_cast_div<opus::fp8_t>(thread_data, row_scale);
+            *reinterpret_cast<vec_o*>(out + (row0 + r) * cols + col) = q;
+        }
     });
 }
 
@@ -1458,7 +1621,9 @@ static void dynamic_per_group_quant_m32k4(aiter_tensor_t& out,
     int64_t const rows   = input.numel() / cols;
     int64_t const rstride = input.ndim > 1 ? input.stride(-2) : cols;
     AITER_CHECK(group_size == 32, __func__, " m32k4 scale layout needs group_size 32, got ", group_size);
-    AITER_CHECK(out.dtype() == AITER_DTYPE_fp8, __func__, " m32k4 scale layout needs fp8 output, got ",
+    const bool out_fp4 = out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8;
+    AITER_CHECK(out.dtype() == AITER_DTYPE_fp8 || out_fp4, __func__,
+                " m32k4 scale layout needs fp8 or fp4x2 output, got ",
                 AiterDtype_to_str(out.dtype()));
     AITER_CHECK(scales.dtype() == AITER_DTYPE_fp8_e8m0 || scales.dtype() == AITER_DTYPE_u8, __func__,
                 " m32k4 scale layout needs an e8m0/u8 scale, got ", AiterDtype_to_str(scales.dtype()));
@@ -1480,17 +1645,20 @@ static void dynamic_per_group_quant_m32k4(aiter_tensor_t& out,
         return;
 
     const int ktiles = cols / 128;
-    auto launch = [&](auto waves_tag, auto steps_tag) {
-        constexpr int kWaves  = decltype(waves_tag)::value;
-        constexpr int kSteps  = decltype(steps_tag)::value;
+    auto launch = [&](auto out_tag, auto waves_tag, auto steps_tag) {
+        using out_dtype      = decltype(out_tag);
+        constexpr int kWaves = decltype(waves_tag)::value;
+        constexpr int kSteps = decltype(steps_tag)::value;
+        using out_ptr_t =
+            std::conditional_t<std::is_same_v<out_dtype, opus::fp4_t>, uint8_t, opus::fp8_t>;
         constexpr int kTilesPerBlock = kWaves / (32 / (4 * kSteps));
         dim3 const grid((ktiles + kTilesPerBlock - 1) / kTilesPerBlock,
                         static_cast<uint32_t>(rows_pad / 32));
         dim3 const block(kWaves * 32);
         AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "dynamic_per_group_quant_m32k4", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            dynamic_per_group_quant_m32k4_kernel<input_dtype, kWaves, kSteps>
-                <<<grid, block, 0, stream>>>(reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+            dynamic_per_group_quant_m32k4_kernel<input_dtype, out_dtype, kWaves, kSteps>
+                <<<grid, block, 0, stream>>>(reinterpret_cast<out_ptr_t*>(out.data_ptr()),
                                              reinterpret_cast<uint8_t*>(scales.data_ptr()),
                                              reinterpret_cast<input_dtype const*>(input.data_ptr()),
                                              rows,
@@ -1500,7 +1668,10 @@ static void dynamic_per_group_quant_m32k4(aiter_tensor_t& out,
     };
     // One 4-row step per wave, eight waves per 32x128 tile.
     // Fewer rows per wave means more waves in flight; 8x1 gives 8 waves/SIMD at this shape.
-    launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+    if(out_fp4)
+        launch(opus::fp4_t{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 2>{});
+    else
+        launch(opus::fp8_t{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
 }
 
 // Canonical dynamic per-group scaled quant. Accepts fp8 / i8 / fp4x2 output;
@@ -2291,7 +2462,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
             {
                 vec_input_f[i] = static_cast<float>(vec_input[i]);
             }
-            float absMax = 1e-10f;
+            float absMax = aiter::kAmaxFloor;
             #pragma unroll
             for(int j = 0; j < vec_size_i; j++)
             {
@@ -2447,6 +2618,8 @@ void moe_smooth_per_token_scaled_quant_v2(
 // `aiter::mx_scale_shuffle_idx`. The legacy kernel name
 // `mxfp4_quant_moe_sort_kernel` was misleading because it implied fp4-only
 // — the implementation has always been dtype-templated.
+// Zeroes a zero-weight route's output row and its scale. The row must be the
+// route's own (one input row per route); see `route_owns_row`.
 template <typename DTYPE_O, int thread_data_size>
 __device__ void store_zero_mx_quant_moe_sort_row(
     DTYPE_O* __restrict__ out,
@@ -2456,8 +2629,7 @@ __device__ void store_zero_mx_quant_moe_sort_row(
     const int32_t scaleN_valid,
     const int scale_k,
     const int num_thread_per_group,
-    const int topk_id,
-    const int topk,
+    const bool route_valid,
     const int64_t offset_base,
     const int cols)
 {
@@ -2466,26 +2638,29 @@ __device__ void store_zero_mx_quant_moe_sort_row(
         int addr    = aiter::mx_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k);
         scale[addr] = 0;
     }
-    if(topk_id < topk || topk == 1)
+    // A sorting sentinel (topk_id == topk) names no route: its token may be a
+    // real one under a num_local_tokens count, so offset_base can lie past `out`.
+    if(!route_valid)
     {
-        const int64_t row_bytes = std::is_same_v<DTYPE_O, opus::fp4_t> ? cols / 2 : cols;
-        uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
-        const int64_t row_offset = offset_base * row_bytes;
-        auto buffer_o = opus::make_gmem<uint8_t>(out_u8 + row_offset, row_bytes);
+        return;
+    }
+    const int64_t row_bytes = std::is_same_v<DTYPE_O, opus::fp4_t> ? cols / 2 : cols;
+    uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
+    const int64_t row_offset = offset_base * row_bytes;
+    auto buffer_o = opus::make_gmem<uint8_t>(out_u8 + row_offset, row_bytes);
 
-        static constexpr int32_t zero_vec_bytes = 16;
-        opus::vector_t<uint8_t, zero_vec_bytes> zero_vec;
+    static constexpr int32_t zero_vec_bytes = 16;
+    opus::vector_t<uint8_t, zero_vec_bytes> zero_vec;
 #pragma unroll
-        for(int j = 0; j < zero_vec_bytes; j++)
-        {
-            zero_vec[j] = 0;
-        }
+    for(int j = 0; j < zero_vec_bytes; j++)
+    {
+        zero_vec[j] = 0;
+    }
 
-        const int32_t num_vecs = (row_bytes + zero_vec_bytes - 1) / zero_vec_bytes;
-        for(int32_t vec_idx = threadIdx.x; vec_idx < num_vecs; vec_idx += blockDim.x)
-        {
-            buffer_o.template store<zero_vec_bytes>(zero_vec, vec_idx * zero_vec_bytes);
-        }
+    const int32_t num_vecs = (row_bytes + zero_vec_bytes - 1) / zero_vec_bytes;
+    for(int32_t vec_idx = threadIdx.x; vec_idx < num_vecs; vec_idx += blockDim.x)
+    {
+        buffer_o.template store<zero_vec_bytes>(zero_vec, vec_idx * zero_vec_bytes);
     }
 }
 
@@ -2505,7 +2680,8 @@ __global__ void fused_mx_quant_moe_sort_kernel(
     const int32_t num_blocks,
     const int32_t num_tg,
     const int32_t topk,
-    const int32_t input_stride)
+    const int32_t input_stride,
+    const bool route_owns_row)
 {
     int num_thread_per_group = group_size / thread_data_size;
     int num_valid_ids_value  = num_valid_ids[0];
@@ -2571,7 +2747,12 @@ __global__ void fused_mx_quant_moe_sort_kernel(
 
             int64_t offset_base = topk == 1 ? (int64_t)(token_idx) : (int64_t)(token_idx * topk + topk_id);
             const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
-            if(sorted_weights != nullptr && sorted_weights[sorted_row] == 0.0f)
+            const bool route_valid = topk == 1 || topk_id < topk;
+            // A shared row (one per token, quantized by each of its routes) only
+            // ever receives the token's own bytes, so its writers agree; zeroing
+            // it for one zero-weight route would race the token's other routes.
+            if(!route_valid || (route_owns_row && sorted_weights != nullptr &&
+                                sorted_weights[sorted_row] == 0.0f))
             {
                 store_zero_mx_quant_moe_sort_row<DTYPE_O, thread_data_size>(
                     out,
@@ -2581,8 +2762,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                     scaleN_valid,
                     scale_k,
                     num_thread_per_group,
-                    topk_id,
-                    topk,
+                    route_valid,
                     offset_base,
                     cols);
                 continue;
@@ -2593,7 +2773,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 buffer_input, threadIdx.x * vec_size_i);
             vec_f vec_input_f;
             float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
-            float absMax       = 1e-10f;
+            float absMax       = aiter::kAmaxFloor;
             #pragma unroll
             for(int j = 0; j < vec_size_i; j++)
             {
@@ -2663,7 +2843,8 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 num_blocks,                                                                     \
                 num_tg,                                                                         \
                 topk,                                                                           \
-                input_stride);                                                                  \
+                input_stride,                                                                   \
+                route_owns_row);                                                                \
     });
 
 
@@ -2700,12 +2881,17 @@ static void fused_dynamic_mx_quant_moe_sort_hip_impl(aiter_tensor_t& output,
                                                      const aiter_tensor_t& num_valid_ids,
                                                      int token_num,
                                                      int block_m,
+                                                     int64_t total_routes,
                                                      int group_size,
                                                      std::optional<aiter_tensor_t> sorted_weights,
                                                      int64_t padded_rows_upper_bound)
 {
+    AITER_CHECK(total_routes >= 0, __func__, " total_routes must be non-negative");
     int cols = input.size(-1);
     int topk = input.numel() / (cols * token_num);
+    // One input row per route (stage 2's topk-replicated rows, or top-1
+    // routing) versus one per token shared by its routes (stage 1).
+    const bool route_owns_row = static_cast<int64_t>(topk) * token_num == total_routes;
     int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
     if(sorted_weights.has_value())
     {
@@ -2770,6 +2956,7 @@ void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& output,
                                          const aiter_tensor_t& num_valid_ids,
                                          int token_num,
                                          int block_m,
+                                         int64_t total_routes,
                                          int group_size,
                                          std::optional<aiter_tensor_t> sorted_weights)
 {
@@ -2780,6 +2967,7 @@ void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& output,
                                              num_valid_ids,
                                              token_num,
                                              block_m,
+                                             total_routes,
                                              group_size,
                                              sorted_weights,
                                              -1);
@@ -2797,7 +2985,6 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
                                                  int group_size,
                                                  std::optional<aiter_tensor_t> sorted_weights)
 {
-    AITER_CHECK(total_routes >= 0, __func__, " total_routes must be non-negative");
     // A non-positive bound clamps the launch extent to 0, silently skipping
     // every row, so reject it instead of under-launching.
     AITER_CHECK(num_experts_upper_bound > 0, __func__, " num_experts_upper_bound must be positive");
@@ -2810,6 +2997,7 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
                                              num_valid_ids,
                                              token_num,
                                              block_m,
+                                             total_routes,
                                              group_size,
                                              sorted_weights,
                                              padded_rows_upper_bound);

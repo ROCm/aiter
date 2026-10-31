@@ -10,21 +10,22 @@ import torch
 from torch import Tensor
 
 from csrc.opus_gemm.opus_gemm_common import (
+    KernelKey,
     OpusGemmInstance,
     get_kernel_instance,
-    kernels_list,
 )
 
 from . import gemm_op_a8w8 as _a8w8_family
 from . import gemm_op_a16w16 as _a16w16_family
 from . import launch_plan
-from ._arch import GFX950
+from ._arch import GFX950, _device_arch_and_cu
 
 
 def _validate_a16w16_public_contract(
     *,
     kid: int,
     instance: OpusGemmInstance,
+    cu_num: int,
     input_dtype: torch.dtype,
     weight_dtype: torch.dtype,
     output_dtype: torch.dtype,
@@ -47,13 +48,13 @@ def _validate_a16w16_public_contract(
     if has_x_scale or has_w_scale:
         raise ValueError("OPUS a16w16 does not accept x_scale/w_scale")
     arch = (instance.arch_prefix or GFX950).lower()
-    if get_kernel_instance(arch, "a16w16", kid, output_dtype) is None:
+    if get_kernel_instance(arch, "a16w16", kid, output_dtype, cu_num=cu_num) is None:
         raise ValueError(f"OPUS kid {kid} does not support Y.dtype={output_dtype}")
 
 
 @lru_cache(maxsize=4096)
 def _resolve_contract(
-    kid: int,
+    key: KernelKey,
     input_dtype: torch.dtype,
     weight_dtype: torch.dtype,
     output_dtype: torch.dtype,
@@ -65,7 +66,8 @@ def _resolve_contract(
     split_k: int,
 ) -> tuple[str, object, object]:
     """Validate/cache the public contract and its resolved family module."""
-    instance = kernels_list.get(kid)
+    kid = key.kid
+    instance = get_kernel_instance(key.gfx, key.family, kid, cu_num=key.cu_num)
     if instance is None:
         raise ValueError(f"unknown OPUS kid {kid}")
 
@@ -73,6 +75,7 @@ def _resolve_contract(
         _validate_a16w16_public_contract(
             kid=kid,
             instance=instance,
+            cu_num=key.cu_num,
             input_dtype=input_dtype,
             weight_dtype=weight_dtype,
             output_dtype=output_dtype,
@@ -106,6 +109,7 @@ def _opus_dispatch(
     Y: Tensor,
     *,
     kid: int,
+    family: str,
     layout: str = "plain",
     x_scale: Tensor | None = None,
     w_scale: Tensor | None = None,
@@ -168,8 +172,10 @@ def _opus_dispatch(
 
     has_x_scale = x_scale is not None
     has_w_scale = w_scale is not None
+    arch, cu_num = _device_arch_and_cu(XQ.device)
+    key = KernelKey(family, arch, cu_num, kid)
     family, instance, family_module = _resolve_contract(
-        kid,
+        key,
         XQ.dtype,
         WQ.dtype,
         Y.dtype,
@@ -180,7 +186,7 @@ def _opus_dispatch(
         workspace is not None,
         split_k,
     )
-    route_arch = (instance.arch_prefix or GFX950).lower()
+    route_arch = arch
 
     if family == "a16w16":
         launch = (
@@ -197,6 +203,7 @@ def _opus_dispatch(
             split_k=split_k,
             workspace=workspace,
             route_arch=route_arch,
+            route_cu_num=cu_num,
             instance=instance,
         )
 

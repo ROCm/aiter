@@ -25,7 +25,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import flydsl_conv_implicit
+from aiter.ops.flydsl import conv_kernels, flydsl_conv_implicit
 from aiter.ops.flydsl.conv_kernels import SUPPORTED_GFX
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -261,6 +261,10 @@ def qwen_vae_conv2d(height, width):
 # has no such argument.
 _X3, _W3 = (1, 32, 4, 16, 16), (48, 32, 3, 3, 3)
 _X2, _W2 = (1, 96, 64, 64), (96, 96, 3, 3)
+# kH x kW reuse at 8x32 output blocks, forced rather than taken from a table.
+_KH8 = {"tile": (256, 96, 4, 1), "block_rows": 8}
+_NHWC = {"input_layout": "NHWC", "output_layout": "NHWC"}
+_NDHWC = {"input_layout": "NDHWC", "output_layout": "NDHWC"}
 
 # (case, rank, xshape, wshape, kw, ref_kw, bias)
 KW_CASES = [
@@ -380,6 +384,55 @@ KW_CASES = [
         {"padding": 1, "tile": (256, 256, 2, 4)},
         {"padding": 1},
         False,
+    ),
+    # B's last DMA round is half full (384 vecs over 256 threads), on the kW
+    # reuse path (Wo >= TILE_M).
+    (
+        "2d_tile_256x96",
+        2,
+        (1, 96, 20, 300),
+        _W2,
+        {"padding": 1, "tile": (256, 96, 4, 1)},
+        {"padding": 1},
+        True,
+    ),
+    # kH x kW reuse forced (_KH8), independently of the tuned tables. Ho/Wo
+    # leave an H and a W tail; stride 2 must be declined by the plan.
+    (
+        "2d_block_rows8_nhwc",
+        2,
+        (1, 96, 37, 70),
+        _W2,
+        {"padding": 1, **_KH8, **_NHWC},
+        {"padding": 1},
+        True,
+    ),
+    (
+        "3d_block_rows8_ndhwc",
+        3,
+        (1, 96, 4, 20, 45),
+        (96, 96, 3, 3, 3),
+        {"padding": 1, **_KH8, **_NDHWC},
+        {"padding": 1},
+        True,
+    ),
+    (
+        "2d_block_rows8_dil_w2",
+        2,
+        (1, 96, 37, 70),
+        _W2,
+        {"padding": (1, 2), "dilation": (1, 2), **_KH8},
+        {"padding": (1, 2), "dilation": (1, 2)},
+        True,
+    ),
+    (
+        "2d_block_rows8_gated_s2",
+        2,
+        (1, 96, 41, 81),
+        _W2,
+        {"stride": 2, "padding": 1, **_KH8},
+        {"stride": 2, "padding": 1},
+        True,
     ),
 ]
 
@@ -600,6 +653,36 @@ def test_artifact_key_isolation(dtype):
     return rows
 
 
+def test_block_rows_static(dtype):
+    """kH x kW reuse on the per-shape (static-extent) path, not dyn_hw.
+
+    AITER_CONV3D_DYN_HW is read when the module loads; _dyn_hw_ok reads the
+    module global per call, so flipping it here selects the static artifact.
+    """
+    torch.manual_seed(0)
+    x = torch.randn((1, 96, 37, 70), device="cuda", dtype=dtype)
+    w = torch.randn(_W2, device="cuda", dtype=dtype)
+    b = torch.randn(_W2[0], device="cuda", dtype=dtype)
+    kw = {"padding": 1, **_KH8}
+    saved = conv_kernels.AITER_CONV3D_DYN_HW
+    conv_kernels.AITER_CONV3D_DYN_HW = 0
+    try:
+        out = flydsl_conv_implicit(x, w, b, **kw)
+    finally:
+        conv_kernels.AITER_CONV3D_DYN_HW = saved
+    ref = _ref(x, w, b, 2, padding=1)
+    case = "2d_block_rows8_static"
+    return [
+        {
+            "case": case,
+            "gfx": get_gfx(),
+            "flydsl err": checkAllclose(
+                ref.to(dtypes.fp32), out.to(dtypes.fp32), msg=f"{case}: ", **TOL
+            ),
+        }
+    ]
+
+
 def summarize(title, rows):
     if not rows:  # every case in this sweep was filtered out by --cases
         return
@@ -737,6 +820,12 @@ def main():
         summarize(
             f"compile-key isolation, same output extents ({name})",
             test_artifact_key_isolation(dtype),
+        )
+        # Also unfiltered: the static-extent 2D path is otherwise only reached
+        # with AITER_CONV3D_DYN_HW=0 set for the whole process.
+        summarize(
+            f"kH x kW reuse on the static-extent path ({name})",
+            test_block_rows_static(dtype),
         )
 
     # After the tables, so a failure is read next to the numbers that produced it.

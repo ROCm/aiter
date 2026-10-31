@@ -970,7 +970,7 @@ def test_fused_qk_rope_cosine_cache_llama(
     torch_value_cache = value_cache.clone()
     # slot_t = slot_mapping // block_size
     # slot_b = slot_mapping % block_size
-    slot_t = torch.arange(slot_mapping.shape[0]).to(slot_mapping.device)
+    slot_t = torch.arange(slot_mapping.shape[0], device="cuda")
     slot_b = slot_mapping
     if cache_dtype == torch.uint8:
         torch_key_cache = torch_key_cache.view(cache_dtype_actual)

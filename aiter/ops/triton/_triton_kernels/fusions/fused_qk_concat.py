@@ -6,6 +6,22 @@ from aiter.ops.triton._triton_kernels.rope.rope import (
     _get_neox_rotated_x_1D,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
+
+
+def _get_config(config_name: str, M: int) -> dict:
+    """Launch options from ``config_name`` over ``M`` = B * QH rows: the smallest
+    ``M_LEQ_<x> >= M``, else ``any``. Arches without a table keep Triton's defaults."""
+    table = load_config_json(
+        resolve_config_dir("fusions", config_name) + "/DEFAULT.json", required=False
+    )
+    if table is None:
+        return {}
+    return select_leq_config(table, M, prefix="M_LEQ_")
 
 
 @triton.jit
@@ -45,6 +61,7 @@ _qk_cat_kernel_repr = make_kernel_repr(
         "QH_PER_KH",
         "BLOCK_D1",
         "BLOCK_D2",
+        "NUM_WARPS",
     ],
 )
 
@@ -78,6 +95,7 @@ def _qk_cat_kernel(
     QH_PER_KH: tl.constexpr,
     BLOCK_D1: tl.constexpr,
     BLOCK_D2: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_hq = tl.program_id(1)
@@ -188,6 +206,7 @@ _qk_rope_cat_kernel_repr = make_kernel_repr(
         "BLOCK_D_HALF_pe",
         "REUSE_FREQS_FRONT_PART",
         "IS_NEOX",
+        "NUM_WARPS",
     ],
 )
 
@@ -230,6 +249,7 @@ def _qk_rope_cat_kernel(
     BLOCK_D_nope: tl.constexpr,
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_hq = tl.program_id(1)

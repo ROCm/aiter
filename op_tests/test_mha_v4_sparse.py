@@ -15,7 +15,6 @@ import sys
 from typing import NamedTuple
 
 import pandas as pd
-import pytest
 import torch
 import torch._dynamo
 
@@ -39,18 +38,29 @@ from aiter.ops.mha_v4_quant import (
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
+try:
+    from mha_v4_check_harness import (
+        CheckRegistry,
+        expect_raises,
+        param,
+        parametrize,
+        skipif,
+    )
+except ModuleNotFoundError as e:
+    if e.name != "mha_v4_check_harness":
+        raise
+    from op_tests.mha_v4_check_harness import (
+        CheckRegistry,
+        expect_raises,
+        param,
+        parametrize,
+        skipif,
+    )
 
-@pytest.fixture(autouse=True)
-def isolate_dynamo_cache():
-    """Keep each test's ``torch.compile`` behaviour independent of the tests that ran before it.
-
-    Dynamo caches compiled entries per code object, and this file compiles ``mha_v4`` under many
-    format combinations. Sharing that cache across tests means the suite drifts toward the recompile
-    limit and whichever test compiles last fails under ``fullgraph=True`` -- a failure that reports
-    against a kernel while actually depending on how many earlier tests got far enough to compile.
-    """
-    torch._dynamo.reset()
-    yield
+# Dynamo caches compiled entries per code object and this file compiles mha_v4 under many format
+# combinations, so a shared cache drifts toward the recompile limit and whichever check compiles
+# last fails under fullgraph.
+_CHECKS = CheckRegistry(setup=torch._dynamo.reset)
 
 
 def _mha_v4_sparse_co_available() -> bool:
@@ -82,7 +92,7 @@ def _mha_v4_mxfp6_sparse_co_available() -> bool:
 
 def test_mha_v4_packed_rejects_partial_lut():
     dummy = torch.empty(0)
-    with pytest.raises(ValueError, match="all be set or all omitted"):
+    with expect_raises(ValueError, match="all be set or all omitted"):
         mha_v4_packed(
             dummy,
             dummy,
@@ -103,7 +113,7 @@ def test_mha_v4_packed_rejects_partial_lut():
 def test_mha_v4_rejects_wrong_block_mask_shape():
     q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
     mask = torch.ones((1, 2, 1, 1), dtype=torch.bool)
-    with pytest.raises(ValueError, match="block_mask must have shape"):
+    with expect_raises(ValueError, match="block_mask must have shape"):
         mha_v4(
             q,
             q,
@@ -115,7 +125,7 @@ def test_mha_v4_rejects_wrong_block_mask_shape():
         )
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse schema")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse schema")
 def test_mha_v4_sparse_schema_mutates_only_out():
     dense = str(torch.ops.aiter.mha_v4_fwd_launch.default._schema)
     assert "Tensor kv_block_indices" not in dense
@@ -156,8 +166,8 @@ def _unpack_work_table(table, nhead, q_tiles):
 
 # The table has one entry per (batch, head, query tile). 8192 is the point where the builder hands
 # the sort to ATen, so straddle it, and include sizes that are not multiples of a wave or workgroup.
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.parametrize(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@parametrize(
     ("batch", "nhead", "q_tiles"),
     [
         (1, 1, 1),
@@ -171,7 +181,7 @@ def _unpack_work_table(table, nhead, q_tiles):
         (8, 32, 64),
     ],
 )
-@pytest.mark.parametrize(
+@parametrize(
     "pattern",
     [
         "uniform",
@@ -204,8 +214,8 @@ def test_mha_v4_sparse_work_table_is_longest_lut_first(batch, nhead, q_tiles, pa
     assert torch.equal(visited, expected)
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.parametrize(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@parametrize(
     "batch,nhead,q_tiles", [(1, 16, 32), (1, 5, 296), (8, 16, 64), (8, 32, 64)]
 )
 def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
@@ -221,15 +231,15 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
     assert torch.equal(visited, torch.arange(total, device="cuda"))
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-@pytest.mark.parametrize(
+@parametrize(
     "launch",
     [
-        pytest.param(
+        param(
             lambda q, k, v, mask: mha_v4(
                 q,
                 k,
@@ -239,12 +249,10 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 AttentionFormat.BF16,
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
-            ),
+            skip=get_gfx() != "gfx950",
             id="bf16",
         ),
-        pytest.param(
+        param(
             lambda q, k, v, mask: mha_v4(
                 q,
                 k,
@@ -254,12 +262,10 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 native_fp8_format(),
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
-            ),
+            skip=get_gfx() != "gfx950",
             id="bf16fp8",
         ),
-        pytest.param(
+        param(
             lambda q, k, v, mask: mha_v4(
                 q,
                 k,
@@ -271,7 +277,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
             ),
             id="fp8",
         ),
-        pytest.param(
+        param(
             lambda q, k, v, mask: mha_v4(
                 q,
                 k,
@@ -283,7 +289,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
             ),
             id="i8fp8",
         ),
-        pytest.param(
+        param(
             lambda q, k, v, mask: mha_v4(
                 q,
                 k,
@@ -296,10 +302,10 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
                 v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
             ),
-            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+            skip=get_gfx() != "gfx950",
             id="mxfp8",
         ),
-        pytest.param(
+        param(
             lambda q, k, v, mask: mha_v4(
                 q,
                 k,
@@ -309,10 +315,10 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 AttentionFormat.MXFP6,
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+            skip=get_gfx() != "gfx950",
             id="f8f6",
         ),
-        pytest.param(
+        param(
             lambda q, k, v, mask: mha_v4(
                 q,
                 k,
@@ -322,10 +328,10 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 native_fp8_format(),
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+            skip=get_gfx() != "gfx950",
             id="f6f8",
         ),
-        pytest.param(
+        param(
             lambda q, k, v, mask: mha_v4(
                 q,
                 k,
@@ -335,10 +341,10 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 AttentionFormat.MXFP4,
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+            skip=get_gfx() != "gfx950",
             id="f6f4",
         ),
-        pytest.param(
+        param(
             lambda q, k, v, mask: mha_v4(
                 q,
                 k,
@@ -348,7 +354,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 AttentionFormat.MXFP4,
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+            skip=get_gfx() != "gfx950",
             id="mxfp4",
         ),
     ],
@@ -376,13 +382,201 @@ def _assert_sparse_matches_dense(sparse, dense, message=None):
     assert torch.isfinite(sparse).all()
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
-@pytest.mark.skipif(
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-def test_mha_v4_f4f4_sparse_all_true_mask_matches_dense():
-    """Retained FP8-P sparse F4F4 remains close to dense FP6-P on an all-true mask."""
+@parametrize(
+    ("q_format", "v_format", "tol"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16, 0.01),
+        (AttentionFormat.BF16, AttentionFormat.FP8, 0.10),
+        (AttentionFormat.FP8, AttentionFormat.FP8, 0.15),
+    ],
+)
+@parametrize("kept", [[0, 1], [2, 5], [3], [0, 1, 2, 3, 4, 5, 6, 7]])
+def test_mha_v4_sparse_lse_matches_logsumexp_over_selected_blocks(
+    q_format, v_format, tol, kept
+):
+    """The sorted-sparse LSE sums only the KV blocks the LUT names.
+
+    A whole-length logsumexp would pass the all-blocks case and fail the others, so the reference
+    is rebuilt per selection rather than taken once over the full key length.
+    """
+    torch.manual_seed(7)
+    kv = mha_v4_kv_tile()
+    batch, heads, dim, tiles = 1, 5, 128, 8
+    sequence_q, sequence_k = 256, tiles * kv
+    q = torch.randn(
+        (batch, sequence_q, heads, dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, heads, dim), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    scale = dim**-0.5
+
+    mask = torch.zeros((batch, heads, 1, tiles), device="cuda", dtype=torch.bool)
+    for tile in kept:
+        mask[..., tile] = True
+
+    _, lse = mha_v4(
+        q,
+        k,
+        v,
+        q_format,
+        q_format,
+        v_format,
+        softmax_scale=scale,
+        block_mask=mask,
+        return_lse=True,
+    )
+    torch.cuda.synchronize()
+
+    index = torch.cat(
+        [torch.arange(t * kv, (t + 1) * kv, device=k.device) for t in sorted(kept)]
+    )
+    scores = (
+        torch.matmul(
+            q.float().permute(0, 2, 1, 3),
+            k.float()[:, index].permute(0, 2, 1, 3).transpose(-1, -2),
+        )
+        * scale
+    )
+    reference = torch.logsumexp(scores, dim=-1)
+
+    assert torch.isfinite(lse).all()
+    error = (lse.float() - reference).abs().max().item()
+    assert error < tol, f"sparse LSE off by {error:.4f} nats for tiles {kept}"
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
+@skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+@parametrize(
+    ("q_format", "v_format"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8),
+        (AttentionFormat.FP8, AttentionFormat.FP8),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
+    ],
+)
+def test_mha_v4_sparse_lse_is_neg_inf_where_the_row_selects_nothing(q_format, v_format):
+    """A LUT row that names no KV tile has an empty softmax, so its LSE is -inf.
+
+    The head-0-empty case is the one that matters: a finite LSE there is not obviously wrong, and
+    O is zero either way, so nothing else in the suite would catch it.
+    """
+    torch.manual_seed(11)
+    kv = mha_v4_kv_tile()
+    batch, heads, dim, tiles = 1, 5, 128, 8
+    sequence_q, sequence_k = 256, tiles * kv
+    q = torch.randn(
+        (batch, sequence_q, heads, dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, heads, dim), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+
+    mask = torch.zeros((batch, heads, 1, tiles), device="cuda", dtype=torch.bool)
+    mask[:, 1:, :, :] = True  # every head but 0 attends; head 0 selects nothing
+
+    _, lse = mha_v4(
+        q,
+        k,
+        v,
+        q_format,
+        q_format,
+        v_format,
+        softmax_scale=dim**-0.5,
+        block_mask=mask,
+        return_lse=True,
+    )
+    torch.cuda.synchronize()
+
+    empty = lse[:, 0].float()
+    assert (
+        torch.isinf(empty).all() and (empty < 0).all()
+    ), f"empty LUT row exported a finite LSE (sample {empty.flatten()[0].item()})"
+    assert torch.isfinite(lse[:, 1:].float()).all()
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
+@skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+@parametrize(
+    ("q_format", "v_format"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.FP8, AttentionFormat.FP8),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
+    ],
+)
+@parametrize("gqa_ratio", [2, 4])
+def test_mha_v4_sparse_lse_under_gqa(q_format, v_format, gqa_ratio):
+    """The LUT holds one row per query head, but K smoothing holds one mean per KV head.
+
+    The quantized rows are the ones that matter: their LSE correction contracts a per-KV-head
+    mean against Q, which is a shape error unless it is expanded over the query-head group.
+    """
+    torch.manual_seed(41)
+    kv = mha_v4_kv_tile()
+    heads_k = 2
+    heads_q = heads_k * gqa_ratio
+    dim, tiles = 128, 4
+    sequence_q, sequence_k = 256, tiles * kv
+    q = torch.randn((1, sequence_q, heads_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, sequence_k, heads_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    scale = dim**-0.5
+
+    kept = [0, 2, 3]
+    mask = torch.zeros((1, heads_q, 1, tiles), device="cuda", dtype=torch.bool)
+    for tile in kept:
+        mask[..., tile] = True
+
+    _, lse = mha_v4(
+        q,
+        k,
+        v,
+        q_format,
+        q_format,
+        v_format,
+        softmax_scale=scale,
+        block_mask=mask,
+        return_lse=True,
+    )
+
+    index = torch.cat(
+        [torch.arange(t * kv, (t + 1) * kv, device=k.device) for t in kept]
+    )
+    expanded = k[:, index].repeat_interleave(gqa_ratio, dim=2)
+    scores = torch.matmul(
+        q.float().permute(0, 2, 1, 3),
+        expanded.float().permute(0, 2, 1, 3).transpose(-1, -2),
+    )
+    reference = torch.logsumexp(scores * scale, dim=-1)
+
+    assert lse.shape == reference.shape
+    assert torch.isfinite(lse).all()
+    error = (lse.float() - reference).abs().max().item()
+    assert error < 0.25, error
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
+@skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_mxfp4_sparse_all_true_mask_matches_dense():
+    """Sparse MXFP4 stays close to dense on an all-true mask at a ragged query length."""
     torch.manual_seed(41)
     q = torch.randn((1, 511, 5, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
@@ -398,8 +592,8 @@ def test_mha_v4_f4f4_sparse_all_true_mask_matches_dense():
     _assert_sparse_matches_dense(sparse, dense)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 validation")
-@pytest.mark.skipif(
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 validation")
+@skipif(
     not _mha_v4_mxfp6_sparse_co_available(),
     reason="sorted-sparse MXFP6 code object is not deployed",
 )
@@ -422,8 +616,8 @@ def test_mha_v4_mxfp6_accepts_block_mask():
     assert torch.isfinite(out).all()
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
@@ -457,41 +651,35 @@ def test_mha_v4_sparse_block_mask_compiles_without_graph_breaks():
     assert torch.equal(eager, compiled)
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-@pytest.mark.parametrize(
+@parametrize(
     ("q_format", "v_format"),
     [
-        pytest.param(
+        param(
             AttentionFormat.BF16,
             AttentionFormat.BF16,
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
-            ),
+            skip=get_gfx() != "gfx950",
             id="bf16",
         ),
-        pytest.param(
+        param(
             AttentionFormat.BF16,
             native_fp8_format(),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
-            ),
+            skip=get_gfx() != "gfx950",
             id="bf16fp8",
         ),
-        pytest.param(
+        param(
             native_fp8_format(),
             native_fp8_format(),
             id="fp8",
         ),
-        pytest.param(
+        param(
             AttentionFormat.MXFP4,
             AttentionFormat.MXFP4,
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 MXFP4 sparse"
-            ),
+            skip=get_gfx() != "gfx950",
             id="mxfp4",
         ),
     ],
@@ -608,12 +796,12 @@ def _tile_mask(heads, kv_tiles, tiles, q_tiles=1, batch=1):
     return mask
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-@pytest.mark.parametrize("tiles", [(0,), (1,), (3,), (0, 2), (1, 2, 3)])
+@parametrize("tiles", [(0,), (1,), (3,), (0, 2), (1, 2, 3)])
 def test_mha_v4_sparse_reads_only_the_kv_tiles_the_lut_names(tiles):
     """A kernel that ignored kv_block_indices would pass every all-True test."""
     heads = 2
@@ -633,8 +821,8 @@ def test_mha_v4_sparse_reads_only_the_kv_tiles_the_lut_names(tiles):
     _assert_sparse_matches_dense(sparse, dense)
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
@@ -658,8 +846,8 @@ def test_mha_v4_sparse_distinct_kv_tiles_give_distinct_results():
         )
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
@@ -690,8 +878,8 @@ def test_mha_v4_sparse_gives_each_head_its_own_kv_tiles():
         )
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
@@ -724,12 +912,12 @@ def test_mha_v4_sparse_follows_the_lut_across_query_tiles():
         )
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-@pytest.mark.parametrize("tail_rows", [64, 128, 200])
+@parametrize("tail_rows", [64, 128, 200])
 def test_mha_v4_sparse_partial_query_tile_follows_the_lut(tail_rows):
     """A trailing partial query tile has to select and zero the same way a full one does.
 
@@ -783,10 +971,10 @@ def test_mha_v4_sparse_partial_query_tile_follows_the_lut(tail_rows):
 
 
 def _gfx950_only(launch, label):
-    return pytest.param(
+    return param(
         launch,
         id=label,
-        marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+        skip=get_gfx() != "gfx950",
     )
 
 
@@ -815,7 +1003,7 @@ _EMPTY_ROW_LAUNCHES = [
         ),
         "bf16fp8",
     ),
-    pytest.param(
+    param(
         lambda q, k, v, m: mha_v4(
             q,
             k,
@@ -827,7 +1015,7 @@ _EMPTY_ROW_LAUNCHES = [
         ),
         id="fp8",
     ),
-    pytest.param(
+    param(
         lambda q, k, v, m: mha_v4(
             q,
             k,
@@ -905,12 +1093,12 @@ _EMPTY_ROW_LAUNCHES = [
 ]
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-@pytest.mark.parametrize("launch", _EMPTY_ROW_LAUNCHES)
+@parametrize("launch", _EMPTY_ROW_LAUNCHES)
 def test_mha_v4_sparse_empty_row_writes_zeros(launch):
     """An all-False row selects no KV block, so its output tile must be zero, not garbage.
 
@@ -951,11 +1139,12 @@ def test_mha_v4_sparse_empty_row_writes_zeros(launch):
     ), "empty row disturbed the live row"
 
 
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 def test_mha_v4_rejects_non_bool_block_mask():
     """Counts come from a sum but the fill uses truthiness, so non-bool masks disagree."""
     q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
     mask = torch.ones((1, 2, 1, 256 // mha_v4_kv_tile()), dtype=torch.int32)
-    with pytest.raises(ValueError, match="block_mask must be a bool tensor"):
+    with expect_raises(ValueError, match="block_mask must be a bool tensor"):
         mha_v4(
             q,
             q,
@@ -967,15 +1156,13 @@ def test_mha_v4_rejects_non_bool_block_mask():
         )
 
 
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 2, reason="needs two GPUs to mismatch devices"
-)
+@skipif(torch.cuda.device_count() < 2, reason="needs two GPUs to mismatch devices")
 def test_mha_v4_rejects_block_mask_on_another_device():
     q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16, device="cuda:0")
     mask = torch.ones(
         (1, 2, 1, 256 // mha_v4_kv_tile()), dtype=torch.bool, device="cuda:1"
     )
-    with pytest.raises(ValueError, match="block_mask must be on the same device"):
+    with expect_raises(ValueError, match="block_mask must be on the same device"):
         mha_v4(
             q,
             q,
@@ -987,8 +1174,8 @@ def test_mha_v4_rejects_block_mask_on_another_device():
         )
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
@@ -1001,7 +1188,7 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
     rows = heads  # batch 1, one query tile
     device = q.quantized.device
     fp8_format = native_fp8_format()
-    with pytest.raises(RuntimeError, match="must be non-empty"):
+    with expect_raises(RuntimeError, match="must be non-empty"):
         mha_v4_packed(
             q.quantized,
             k.quantized,
@@ -1021,7 +1208,97 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse")
+# The three guards below are what let the sparse ASM skip apply_mask entirely: with the key length
+# padded to a whole number of KV tiles and no per-batch length, the last selected block is always
+# full, so there is no ragged tail to mask. Relax either and the unmasked tail columns read zeroed
+# K, score 0, and contribute weight 1.0 each to L -- O is not obviously wrong, just silently scaled.
+
+
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_sparse_rejects_ragged_key_length():
+    kv_tile = mha_v4_kv_tile()
+    sequence_k = kv_tile * 4 - 1
+    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, sequence_k, 2, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    kv_tiles = (sequence_k + kv_tile - 1) // kv_tile
+    mask = torch.ones((1, 2, 1, kv_tiles), device="cuda", dtype=torch.bool)
+    with expect_raises(ValueError, match="padded to a multiple"):
+        mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            block_mask=mask,
+        )
+
+
+def test_mha_v4_sparse_rejects_per_batch_key_lengths():
+    """BF16 Q/V so the varlen capability gate cannot fire; only the sparse guard can raise."""
+    q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
+    # A literal tile count, not mha_v4_kv_tile(): the guard runs before mask geometry is checked,
+    # and the manifest read would raise here on an architecture with no sparse row.
+    mask = torch.ones((1, 2, 1, 2), dtype=torch.bool)
+    seqlens_k = torch.full((1,), 128, dtype=torch.int32)
+    with expect_raises(NotImplementedError, match="sorted-sparse"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            block_mask=mask,
+            seqlens_k=seqlens_k,
+        )
+
+
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_packed_sparse_rejects_per_batch_key_lengths():
+    """mha_v4 guards this too, but the MX recipes return through launchers it never reaches.
+
+    Matching "sorted-sparse" rather than the shared "per-batch key lengths" phrase is what keeps
+    this pinned to the sparse guard: FP8 is not varlen-capable, so _check_varlen_capable would
+    otherwise raise NotImplementedError here too and the test would pass with the guard removed.
+    """
+    heads = 2
+    kv_tiles = 4
+    q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * mha_v4_kv_tile(), heads=heads)
+    device = q.quantized.device
+    fp8_format = native_fp8_format()
+    rows = heads
+    with expect_raises(NotImplementedError, match="sorted-sparse"):
+        mha_v4_packed(
+            q.quantized,
+            k.quantized,
+            v.quantized,
+            q.descale,
+            k.descale,
+            v.descale,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            kv_block_indices=torch.zeros(rows, dtype=torch.int32, device=device),
+            lut_start=torch.zeros(rows, dtype=torch.int32, device=device),
+            lut_count=torch.ones(rows, dtype=torch.int32, device=device),
+            seqlens_k=torch.full((1,), 128, dtype=torch.int32, device=device),
+        )
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse")
 def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
     max_tiles = 8192
     kv_tile = mha_v4_kv_tile()
@@ -1031,7 +1308,7 @@ def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
     indices = torch.zeros(1, device="cuda", dtype=torch.int32)
     row = torch.zeros(1, device="cuda", dtype=torch.int32)
 
-    with pytest.raises(RuntimeError, match="supports at most 8192 KV tiles"):
+    with expect_raises(RuntimeError, match="supports at most 8192 KV tiles"):
         mha_v4_packed(
             q,
             kv,
@@ -1051,20 +1328,20 @@ def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
         )
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
-@pytest.mark.skipif(
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-@pytest.mark.parametrize(
+@parametrize(
     "mutation,message",
     [
-        pytest.param(
+        param(
             "indices.fill_(9999)",
             "outside",
             id="index_out_of_range",
         ),
-        pytest.param(
+        param(
             "start.fill_(-1)",
             "negative",
             id="negative_start",
@@ -1115,9 +1392,12 @@ mha_v4_packed(
 )
 """
     env = {**os.environ, "AITER_MHA_V4_VALIDATE_LUT": "1"}
+    # The probe imports op_tests, which lives beside this file. AITER_ROOT_DIR is the installed
+    # package under a wheel install and carries no op_tests at all.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     result = subprocess.run(
         [sys.executable, "-c", probe],
-        cwd=AITER_ROOT_DIR,
+        cwd=repo_root,
         env=env,
         text=True,
         capture_output=True,
@@ -1157,7 +1437,7 @@ GROWN_TILES = (4, 7, 8, 12, 16, 32)
 MAX_DEGRADATION = 0.01
 ABSOLUTE_FLOOR = 0.95
 
-requires_sparse = pytest.mark.skipif(
+requires_sparse = skipif(
     get_gfx() != "gfx950" or not _mha_v4_sparse_co_available(),
     reason="gfx950 sorted-sparse MHA v4 code object is not deployed",
 )
@@ -1194,7 +1474,7 @@ def _run(recipe_name, tiles, heads=5, sequence_q=256, all_true=True):
 
 
 @requires_sparse
-@pytest.mark.parametrize("recipe_name", sorted(SPARSE_RECIPES))
+@parametrize("recipe_name", sorted(SPARSE_RECIPES))
 def test_mha_v4_sparse_accuracy_holds_as_tile_count_grows(recipe_name):
     """A row's own small-tile-count accuracy is its baseline; growing the count must not erode it."""
     baseline_out, baseline_ref, _ = _run(recipe_name, BASELINE_TILES)
@@ -1218,7 +1498,7 @@ def test_mha_v4_sparse_accuracy_holds_as_tile_count_grows(recipe_name):
 
 
 @requires_sparse
-@pytest.mark.parametrize("recipe_name", sorted(SPARSE_RECIPES))
+@parametrize("recipe_name", sorted(SPARSE_RECIPES))
 def test_mha_v4_sparse_skipping_lut_holds_as_tile_count_grows(recipe_name):
     """Same sweep with a LUT that actually skips, so the walk has to jump rather than run affine."""
     for tiles in (4, 8, 16, 32):
@@ -1231,9 +1511,7 @@ def test_mha_v4_sparse_skipping_lut_holds_as_tile_count_grows(recipe_name):
 
 
 @requires_sparse
-@pytest.mark.parametrize(
-    "recipe_name", ["bf16", "bf16fp8", "i8fp8", "fp8", "mxfp8", "f6f8"]
-)
+@parametrize("recipe_name", ["bf16", "bf16fp8", "i8fp8", "fp8", "mxfp8", "f6f8"])
 def test_mha_v4_sparse_all_true_lut_matches_dense_bitwise(recipe_name):
     """An all-true LUT selects every tile, so the walk must reduce exactly to the dense one.
 
@@ -1280,6 +1558,15 @@ def run_torch_mha_v4_sparse(q, k, v, block_mask, softmax_scale, kv_tile):
     ).transpose(1, 2)
 
 
+_TOL_ERR_RATIO = 0.05  # matches checkAllclose default tol_err_ratio
+
+
+def _verdict(err):
+    if err == 0:
+        return "pass"
+    return "warning" if err <= _TOL_ERR_RATIO else "failed"
+
+
 @benchmark()
 def benchmark_mha_v4_sparse(batch, sequence_q, sequence_k, heads, density, dtype):
     """Benchmark the sorted block-sparse BF16 path against masked Torch attention."""
@@ -1323,17 +1610,29 @@ def benchmark_mha_v4_sparse(batch, sequence_q, sequence_k, heads, density, dtype
     ret = {"gfx": get_gfx(), "kv_tiles": kv_tiles, "kept": keep}
     for name, candidate in candidates.items():
         output, us = run_perftest(candidate)
-        err = checkAllclose(
-            reference,
-            output.to(dtypes.fp32),
-            rtol=2e-2,
-            atol=2e-2,
-            msg=f"{name}: block-sparse BF16",
-        )
+        # catastrophic_check turns NaN/Inf or delta > ref_max/2 into an AssertionError; catching it
+        # here marks the row failed instead of aborting, so the table still shows every recipe.
+        accuracy_error = None
+        try:
+            err = checkAllclose(
+                reference,
+                output.to(dtypes.fp32),
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"{name}: block-sparse BF16",
+                catastrophic_check=True,
+            )
+        except AssertionError as exc:
+            err = float("nan")
+            accuracy_error = str(exc)
+            aiter.logger.error("%s: block-sparse BF16: %s", name, accuracy_error)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+        ret[f"{name} result"] = (
+            "failed" if accuracy_error is not None else _verdict(err)
+        )
     return ret
 
 
@@ -1388,6 +1687,23 @@ def main():
             frame.to_markdown(index=False),
         )
 
+    # Raised after the table so every recipe is reported, not just the first bad one.
+    failed = sorted(
+        {
+            key.rsplit(" ", 1)[0]
+            for row in rows
+            for key, value in row.items()
+            if key.endswith(" result") and value == "failed"
+        }
+    )
+    if failed:
+        raise RuntimeError(
+            f"MHA v4 block-sparse correctness failed for {failed}; see the summary above"
+        )
+
 
 if __name__ == "__main__":
     main()
+    # CI runs this file as a script, so the checks only execute if main() invokes them.
+    if _CHECKS.run(globals()):
+        raise SystemExit(1)

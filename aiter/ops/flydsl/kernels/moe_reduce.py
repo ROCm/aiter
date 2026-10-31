@@ -159,9 +159,9 @@ def _moe_reduction_body(
             scales = []
             for k in range_constexpr(topk):
                 e8m0 = fx.Uint32(fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)]))
-                scales.append((e8m0 << fx.Uint32(23)).bitcast(fx.Float32))
+                scales.append((e8m0 << 23).bitcast(fx.Float32))
 
-        acc = fx.Vector.filled(V, 0.0, fx.Float32)
+        acc = fx.full(V, 0.0, fx.Float32)
         for k in range_constexpr(topk):
             if const_expr(is_fp8):
                 vk = _decode_fp8(frags[k], scales[k])
@@ -174,7 +174,7 @@ def _moe_reduction_body(
                 )
             if const_expr(use_mask):
                 vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
-                    vk, fx.Vector.filled(V, 0.0, fx.Float32)
+                    vk, fx.full(V, 0.0, fx.Float32)
                 )
             acc = acc + vk
         ofrag = fx.make_fragment_like(p_dst)

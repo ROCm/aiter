@@ -63,9 +63,9 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
     def _v_concat_i32x8(self, v_v, dc):
         words = []
         for ks in range_constexpr(4):
-            v2 = Vec.from_elements([fx.Int64(v_v[ks][dc])], fx.Int64).bitcast(fx.Int32)
-            words.append(fx.Int32(v2[0]))
-            words.append(fx.Int32(v2[1]))
+            v2 = Vec.from_elements([v_v[ks][dc]], fx.Int64).bitcast(fx.Int32)
+            words.append(v2[0])
+            words.append(v2[1])
         return Vec.from_elements(words, fx.Int32).ir_value()
 
     def _load_q_wide_lds(self):

@@ -13,9 +13,12 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from aiter.jit.core import AITER_CONFIGS
+
 from ...quick_allreduce_int4_ipc import UncachedIpcHeap as _Ipc
 from ..kernels_common import ceildiv
 from ..tensor_shim import _preload_compiled, _run_compiled
+from .common import device_key, nearest, tuned_rows
 from .mega_moe_tp_config import (
     CTRL_ERR,
     CTRL_INTS,
@@ -73,6 +76,7 @@ class LaunchCfg:
     tn: int = 0
     pf: bool = False
     lp: int = 0
+    q: int = 0  # LB GEMM2 output split (0: the engine's lb_q)
 
 
 # --- intra-node symmetric memory (hipIpc, via quick_allreduce_int4_ipc) ---------------
@@ -246,9 +250,8 @@ class MegaMoeTPLDSError(ValueError):
     """max_local_tokens does not fit in LDS (retry with a smaller one)."""
 
 
-def _lb_param(value, env: str, default):
-    # explicit config value, else the AITER_MEGAMOE_TP_LB_* env var, else the default
-    return value if value is not None else os.environ.get(env, default)
+# the tuned launch-config fields of a batch (configs/mega_moe_tp_tuned.csv)
+_TUNED_FIELDS = ("mt", "npp", "q", "pf", "lp", "ll", "llr")
 
 
 def _mt_table(spec) -> tuple[int, list[tuple[int, int]]]:
@@ -286,7 +289,11 @@ class MegaMoeTPEngine:
         tail_gemma: bool = True,
         group=None,
         device: torch.device | None = None,
+        fit_max_local: bool = False,
     ):
+        """fit_max_local: max_local_tokens is an upper bound, lowered to the largest count
+        the kernel takes (its tables, 32-bit offsets, LDS; see capacity) instead of
+        raising."""
         if not mega_moe_tp_shape_supported(model_dim, inter_dim, world_size):
             raise ValueError(
                 f"fused TP MegaMoE does not tile h{model_dim} i{inter_dim} tp{world_size}"
@@ -311,27 +318,24 @@ class MegaMoeTPEngine:
         if act_dtype not in ("fp4", "fp8"):
             raise ValueError(f"unknown act_dtype {act_dtype!r}")
         self.a8 = act_dtype == "fp8"
-        lb = lb or {}
+        lb = {k: v for k, v in (lb or {}).items() if v is not None}
+        # the LB fields set explicitly: they take precedence over the tuned configs
+        self._lb_set = frozenset(lb)
         # above DYN_MAX tokens always the LB schedule (fp8 activations: never)
-        lb_min = int(_lb_param(lb.get("min"), "AITER_MEGAMOE_TP_LB_MIN", "256"))
+        lb_min = int(lb.get("min", 256))
         lb_min = lb_min if 0 < lb_min <= DYN_MAX else DYN_MAX + 1
         self.lb_min = 0 if self.a8 else lb_min
-        self.lb_mt, self.lb_mt_table = _mt_table(
-            _lb_param(lb.get("mt"), "AITER_MEGAMOE_TP_LB_MT", "3")
-        )
-        self.lb_mt_small = int(
-            _lb_param(lb.get("mt_small"), "AITER_MEGAMOE_TP_LB_MT_SMALL", "3")
-        )
-        self.lb_small_max = int(
-            _lb_param(lb.get("small_max"), "AITER_MEGAMOE_TP_LB_SMALL_MAX", "512")
-        )
-        self.lb_npp = int(_lb_param(lb.get("npp"), "AITER_MEGAMOE_TP_LB_NPP", "1"))
-        lb_q = int(_lb_param(lb.get("q"), "AITER_MEGAMOE_TP_LB_Q", "1"))
+        self.lb_mt, self.lb_mt_table = _mt_table(lb.get("mt", 5))
+        self.lb_mt_small = int(lb.get("mt_small", 3))
+        self.lb_small_max = int(lb.get("small_max", 512))
+        self.lb_npp = int(lb.get("npp", 2))
+        lb_q = int(lb.get("q", 3))
         nck = mega_moe_tp_consts(model_dim, inter_dim, 1, 1)["NCK"]
         gpc = gemm2_chunk_groups(model_dim, inter_dim)
         step = gemm2_group_step(model_dim, inter_dim)
         valid = [d for d in range(1, nck + 1) if nck % d == 0 and d * gpc % step == 0]
         self.lb_q = max((d for d in valid if d <= lb_q), default=min(valid))
+        self._lb_q_valid = valid
         self.ar = comm_mode == "ar"
         self.rank, self.tp = int(rank), int(world_size)
         self.H, self.I, self.E, self.K = model_dim, inter_dim, experts, topk
@@ -354,6 +358,8 @@ class MegaMoeTPEngine:
         self.gfx = getattr(props, "gcnArchName", "").split(":")[0]
         if self.gfx != "gfx950":
             raise ValueError(f"fused TP MegaMoE needs gfx950, not {self.gfx}")
+        if fit_max_local:
+            self.mmax = self.capacity(self.mmax)
         self.agr = max(1, ceildiv(self.mmax, self.n_cta))
         self._check_limits()
         if not self._fits(self.mmax):
@@ -387,6 +393,10 @@ class MegaMoeTPEngine:
         # the fused tail's norm (compiled in; part of the launcher key)
         self.tn_eps = float(tail_eps)
         self.tn_gemma = bool(tail_gemma)
+        # tail q/scales (bf16: + rows) of own rows only, at their [T, H] position; the other
+        # ranks' rows are not written (no peer stores / waits). Default: an SP caller (ATOM)
+        # consumes its own rows only; False: every rank's rows (the caller needs them all)
+        self.tn_local = True
         arena.commit()
         self.arena = arena
         self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
@@ -415,19 +425,42 @@ class MegaMoeTPEngine:
         self._armed: set = set()
         self._args = (None, None)
 
+    def capacity(self, upto: int) -> int:
+        """The largest local token count <= upto the kernel takes (0: none)."""
+
+        def ok(m):
+            return not self._limit_errors(m) and self._fits(m)
+
+        if ok(upto):
+            return upto
+        lo, hi = 0, upto  # ok(lo) or lo == 0; not ok(hi)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+        return lo
+
     def _check_limits(self) -> None:
         """The kernel's fixed-size tables and 32-bit offsets, checked up front."""
-        tot, H, K = self.mmax * self.tp, self.H, self.K
+        bad = self._limit_errors(self.mmax)
+        if bad:
+            raise ValueError(
+                f"MegaMoeTP h{self.H} i{self.I} e{self.E} k{self.K} tp{self.tp} "
+                f"max_local_tokens={self.mmax}: need " + ", ".join(bad)
+            )
+
+    def _limit_errors(self, mmax: int) -> list:
+        tot, H, K = mmax * self.tp, self.H, self.K
+        agr = max(1, ceildiv(mmax, self.n_cta))
         bad = []
-        if self.agr > (4 if self.a8 else 8):
+        if agr > (4 if self.a8 else 8):
             bad.append(f"max_local_tokens <= {(4 if self.a8 else 8) * self.n_cta}")
-        if not self.ar and ceildiv(self.mmax * K, 256) > min(NMETA_CAP, self.n_cta):
+        if not self.ar and ceildiv(mmax * K, 256) > min(NMETA_CAP, self.n_cta):
             bad.append(f"max_local_tokens * topk <= {256 * min(NMETA_CAP, self.n_cta)}")
         if self.lb_min and self.lb_min <= tot and self.I // 128 >= 2:
             mts = [self.lb_mt, *(n for _, n in self.lb_mt_table)]
             if self.lb_small_max >= self.lb_min:
                 mts.append(self.lb_mt_small)
-            mt = min(self._fit_mt(t, lb=True) for t in mts)
+            mt = min(self._fit_mt(t, lb=True, mmax=mmax) for t in mts)
             if self.E + ceildiv(tot * K, 16 * mt) + 1 > NCHLB_MAX:
                 bad.append(f"LB row chunks <= {NCHLB_MAX} (larger LB row tiles)")
         for what, n in (
@@ -438,11 +471,7 @@ class MegaMoeTPEngine:
         ):
             if n >= 1 << 31:
                 bad.append(f"{what} within 32-bit offsets")
-        if bad:
-            raise ValueError(
-                f"MegaMoeTP h{H} i{self.I} e{self.E} k{K} tp{self.tp} "
-                f"max_local_tokens={self.mmax}: need " + ", ".join(bad)
-            )
+        return bad
 
     def _bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
         w = tuple(t.view(torch.uint8) for t in (w1, w1_scale, w2, w2_scale))
@@ -501,9 +530,9 @@ class MegaMoeTPEngine:
             not lb or self._lds(1, mmax, lb=True) <= LDS_LIMIT
         )
 
-    def _fit_mt(self, mt: int, lb: bool = False) -> int:
+    def _fit_mt(self, mt: int, lb: bool = False, mmax: int = 0) -> int:
         mt = max(1, min(6, int(mt)))
-        while mt > 1 and self._lds(mt, lb=lb) > LDS_LIMIT:
+        while mt > 1 and self._lds(mt, mmax, lb=lb) > LDS_LIMIT:
             mt -= 1
         return mt
 
@@ -511,29 +540,73 @@ class MegaMoeTPEngine:
         ok = npp >= 1 and 4 % (2 * npp) == 0 and (self.H // 128 * npp) % 4 == 0
         return npp if ok else 1
 
+    def _tuned(self, lb: bool, tot: int) -> dict:
+        """The tuned fields of the nearest tuned batch (same schedule, <= tot, inside the
+        tuned range: common.nearest), else {} (the defaults)."""
+        key = {
+            **device_key(self.device),
+            "model_dim": self.H,
+            "inter_dim": self.I,
+            "experts": self.E,
+            "topk": self.K,
+            "tp": self.tp,
+            "comm_mode": self.mode,
+            "act": "fp8" if self.a8 else "fp4",
+            "lb": int(lb),
+        }
+        row = nearest(
+            tuned_rows(AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_FILE, key, "tot"), tot
+        )
+        if row is None:
+            return {}
+        return {k: int(row[k]) for k in _TUNED_FIELDS if row.get(k, "") != ""}
+
+    def _lb_mt_ok(self, mt: int) -> int:
+        # LB row chunks of the largest batch fit the kernel's table: grow the tile if not
+        tot = self.mmax * self.tp
+        while mt < 6 and self.E + ceildiv(tot * self.K, 16 * mt) + 1 > NCHLB_MAX:
+            mt += 1
+        return mt
+
     def config(self, m: int) -> LaunchCfg:
         cfg = self._cfgs.get(m)
         if cfg is None:
             tot = m * self.tp
             lb = bool(self.lb_min) and tot >= self.lb_min
             fp8 = not self.comm_bf16
+            tu = self._tuned(lb, tot)
             if lb:
-                mt = next((n for t, n in self.lb_mt_table if tot <= t), self.lb_mt)
                 small = tot <= self.lb_small_max
-                lp = 0 if tot <= LB_PF_MAX else 3
+                # an explicit config field, else the tuned one, else the default
+                if ("mt_small" if small else "mt") in self._lb_set:
+                    tu.pop("mt", None)
+                if "npp" in self._lb_set and not small:
+                    tu.pop("npp", None)
+                if "q" in self._lb_set:
+                    tu.pop("q", None)
+                mt = next((n for t, n in self.lb_mt_table if tot <= t), self.lb_mt)
+                lp = tu.get("lp", 0 if tot <= LB_PF_MAX else 3)
+                q = tu.get("q", 0)
                 cfg = LaunchCfg(
-                    self._fit_mt(self.lb_mt_small if small else mt, lb=True),
-                    npp=self._fit_npp(2 if small else self.lb_npp),
+                    self._fit_mt(
+                        self._lb_mt_ok(tu.get("mt", self.lb_mt_small if small else mt)),
+                        lb=True,
+                    ),
+                    npp=self._fit_npp(tu.get("npp", 2 if small else self.lb_npp)),
                     ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                     lb=True,
-                    pf=tot <= LB_PF_MAX,
+                    pf=bool(tu.get("pf", tot <= LB_PF_MAX)),
                     lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
+                    q=q if q in self._lb_q_valid else 0,
                 )
             elif tot <= self.dyn_max:
                 cfg = LaunchCfg(
-                    self._fit_mt(1 if tot <= 32 else 2 if tot <= 64 else 3),
-                    ll=tot <= 256 and fp8,
-                    llr=tot <= 128 and fp8,
+                    self._fit_mt(
+                        tu.get("mt", 1 if tot <= 32 else 2 if tot <= 64 else 3)
+                    ),
+                    # LL packets carry FP8 rows only (the tuned rows are fp8-comm tunings)
+                    ll=fp8 and bool(tu.get("ll", tot <= 256)),
+                    llr=fp8 and bool(tu.get("llr", tot <= 128)),
                     ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                 )
             else:
@@ -550,7 +623,7 @@ class MegaMoeTPEngine:
         return self.ar and (self.ag_fp8 or cfg.ag8) and not self._arll(cfg)
 
     def _key(self, cfg: LaunchCfg):
-        return (cfg, self.tn_eps, self.tn_gemma) if cfg.tn else cfg
+        return (cfg, self.tn_eps, self.tn_gemma, self.tn_local) if cfg.tn else cfg
 
     def _launcher(self, cfg: LaunchCfg):
         fn = self._launchers.get(self._key(cfg))
@@ -581,17 +654,23 @@ class MegaMoeTPEngine:
                 nch=nch,
                 a8=self.a8,
                 lb=cfg.lb,
-                lbq=self.lb_q if cfg.lb else 1,
+                lbq=(cfg.q or self.lb_q) if cfg.lb else 1,
                 tn=cfg.tn,
                 tn_eps=self.tn_eps,
                 tn_gemma=self.tn_gemma,
+                tn_local=self.tn_local,
                 lbpf=cfg.pf,
                 lbp=cfg.lp,
             )
             self._launchers[self._key(cfg)] = fn
         return fn
 
-    def _local_tokens(self, x, topk_weights, topk_ids) -> int:
+    def _local_tokens(
+        self, x, topk_weights, topk_ids, limit: int = 0, uneven: bool = False
+    ) -> int:
+        """forward's input checks -> its local token count (limit: the largest, default
+        max_local_tokens; uneven: ar batches need not be a multiple of tp, their local
+        count rounded up)"""
         rows = int(x.shape[0]) if x.dim() == 2 else -1
         for name, t in (
             ("x", x),
@@ -616,13 +695,14 @@ class MegaMoeTPEngine:
             raise ValueError(f"topk_weights: need float32, got {topk_weights.dtype}")
         m = rows
         if self.ar:
-            if m % self.tp:
+            if m % self.tp and not uneven:
                 raise ValueError(
                     f"{self.mode}: {m} tokens are not a multiple of tp={self.tp}"
                 )
-            m //= self.tp
-        if m > self.mmax:
-            raise ValueError(f"{m} local tokens exceed max_local_tokens {self.mmax}")
+            m = ceildiv(m, self.tp)
+        limit = limit or self.mmax
+        if m > limit:
+            raise ValueError(f"{m} local tokens exceed max_local_tokens {limit}")
         if (
             self.check
             and dist.is_initialized()
@@ -754,6 +834,26 @@ class MegaMoeTPEngine:
             self.n_cta,
         )
 
+    def _check_out(self, out, rows: int) -> None:
+        if out is not None and (
+            tuple(out.shape) != (rows, self.H)
+            or out.dtype != torch.bfloat16
+            or out.device != self.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(f"out: need a contiguous bf16 [{rows}, {self.H}]")
+
+    def _check_tail(self, tail, m: int) -> None:
+        res_in, res_out, nw = tail
+        for t, shp in ((res_in, (m, self.H)), (res_out, (m, self.H)), (nw, (self.H,))):
+            if (
+                tuple(t.shape) != shp
+                or t.dtype != torch.bfloat16
+                or t.device != self.device
+                or not t.is_contiguous()
+            ):
+                raise ValueError(f"tail: need contiguous bf16 {shp} on {self.device}")
+
     def forward(
         self,
         x_local: torch.Tensor,
@@ -765,13 +865,7 @@ class MegaMoeTPEngine:
     ):
         m = self._local_tokens(x_local, topk_weights, topk_ids)
         rows = m * self.tp if self.ar else m
-        if out is not None and (
-            tuple(out.shape) != (rows, self.H)
-            or out.dtype != torch.bfloat16
-            or out.device != self.device
-            or not out.is_contiguous()
-        ):
-            raise ValueError(f"out: need a contiguous bf16 [{rows}, {self.H}]")
+        self._check_out(out, rows)
         if m == 0:
             return x_local.new_empty((0, self.H)) if out is None else out
         x = x_local.contiguous()
@@ -783,18 +877,7 @@ class MegaMoeTPEngine:
                 raise ValueError(
                     "tail: ag_rs, the LB schedule, at most TN_MAX local tokens"
                 )
-            res_in, res_out, nw = tail
-            for t, shp in (
-                (res_in, (m, self.H)),
-                (res_out, (m, self.H)),
-                (nw, (self.H,)),
-            ):
-                if (
-                    tuple(t.shape) != shp
-                    or t.dtype != torch.bfloat16
-                    or not t.is_contiguous()
-                ):
-                    raise ValueError(f"tail: need contiguous bf16 {shp}")
+            self._check_tail(tail, m)
             cfg = dataclasses.replace(cfg, tn=2 if bf16 else 1)
         local_y = not self.ar or self._arll(cfg) or self._ag8(cfg)
         y = out if out is not None and local_y else self.y

@@ -9,8 +9,6 @@ import contextlib
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly as fly_dialect
-from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.rocdl import tdm_ops as _tdm_ops
@@ -39,11 +37,8 @@ __all__ = [
 
 def _fly_lds_base_index(raw: ir.Value) -> ir.Value:
     """Extract a Fly shared pointer / view as an LDS byte index."""
-    ptr_type = ir.Type.parse("!llvm.ptr<3>")
-    ptr = fly_dialect.extract_aligned_pointer_as_index(ptr_type, raw)
-    i64 = ir.IntegerType.get_signless(64)
-    ptr_i64 = llvm_dialect.ptrtoint(i64, ptr)
-    return fx.Index(ptr_i64).ir_value()
+    ptr = fx.Pointer(raw) if isinstance(raw.type, fx.PointerType) else fx.get_iter(raw)
+    return fx.Index(fx.ptrtoint(ptr)).ir_value()
 
 
 class _FlyAwareMemrefDialect:
@@ -129,7 +124,7 @@ def update_tensor_descriptor_2d_lds_addr(
     g0 = Vec(desc.dgroup0)
     return TDMDescriptor2D(
         dgroup0=Vec.from_elements(
-            [g0[0], fx.Int32(new_lds_addr), g0[2], g0[3]], fx.Int32
+            [g0[0], new_lds_addr, g0[2], g0[3]], fx.Int32
         ).ir_value(),
         dgroup1=desc.dgroup1,
     )
@@ -140,8 +135,6 @@ def update_tensor_descriptor_2d_pred(desc: TDMDescriptor2D, pred) -> TDMDescript
     """Enable one wave's TDM load only when its panel needs refilling."""
     g0 = Vec(desc.dgroup0)
     return TDMDescriptor2D(
-        dgroup0=Vec.from_elements(
-            [fx.Int32(pred), g0[1], g0[2], g0[3]], fx.Int32
-        ).ir_value(),
+        dgroup0=Vec.from_elements([pred, g0[1], g0[2], g0[3]], fx.Int32).ir_value(),
         dgroup1=desc.dgroup1,
     )

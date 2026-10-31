@@ -2,14 +2,16 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Benchmark SonicMoE forward and training throughput."""
 
-import argparse
-
 import torch
 import triton
 
 from aiter.ops.triton.moe.sonicmoe import (
     SonicMoEActivationType,
     moe_TC_softmax_topk_layer,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
@@ -87,11 +89,9 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark SonicMoE", allow_abbrev=False)
-    parser.add_argument(
-        "-metric",
-        choices=["time", "throughput"],
-        default="time",
+    parser = get_parser(kernel_name="SonicMoE")
+    override_parser_action(
+        parser, action="--metric", choices=["time", "throughput"], default="time"
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()

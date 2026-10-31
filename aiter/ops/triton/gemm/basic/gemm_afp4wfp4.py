@@ -23,6 +23,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.gemm_config_utils import clamp_num_buffers
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -588,10 +589,12 @@ def gemm_afp4wfp4_preshuffle(
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x_fp4.device)
 
-        # Clamp NUM_BUFFERS so  prologue never advances TDM descriptors past the end of K when k_tiles < NUM_BUFFERS (BLOCK_K_BYTES = BLOCK_SIZE_K // 2)
-        BLOCK_K_BYTES = config["BLOCK_SIZE_K"] // 2
-        k_tiles = triton.cdiv(K_bytes, BLOCK_K_BYTES)
-        config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
+        # The prologue advances the TDM descriptors NUM_BUFFERS times. A K tile is
+        # BLOCK_SIZE_K // 2 bytes.
+        k_tiles = triton.cdiv(K_bytes, config["BLOCK_SIZE_K"] // 2)
+        config["NUM_BUFFERS"] = clamp_num_buffers(
+            config["NUM_BUFFERS"], k_tiles, prefetch_all=True
+        )
 
         num_ctas = config["num_ctas"]
         ctas_m, _ = cluster_shape(

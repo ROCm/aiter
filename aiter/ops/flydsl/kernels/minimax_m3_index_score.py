@@ -489,8 +489,8 @@ def build_index_score(S: int, H: int, geom):
         tid = fx.Int32(gpu.thread_id("x"))
         wave = tid // fx.Int32(WAVE)
         lane = tid % fx.Int32(WAVE)
-        g = lane // fx.Int32(16)
-        u = lane % fx.Int32(16)
+        g = lane // 16
+        u = lane % 16
         # wave = tw + WAVES_PER_TOK*pw, so the waves sharing a page are
         # adjacent and their K addresses issue together.
         if const_expr(WAVES_PER_TOK == 1):
@@ -511,11 +511,11 @@ def build_index_score(S: int, H: int, geom):
         # Work-map entry n is two adjacent dwords, (packed, seq_len): one cache
         # line, one round trip. A hole reads as (0, 0), so num_pages is zero and
         # the tail guard retires the CTA with no extra branch.
-        wm = fx.add_offset(fx.get_iter(wm_buf), n * fx.Int32(2))
-        packed = fx.Int32(wm.load(T.i32))
-        seq_len = fx.Int32(fx.add_offset(wm, fx.Int32(1)).load(T.i32))
-        b = (packed >> fx.Int32(16)) & fx.Int32(0xFFFF)
-        c = packed & fx.Int32(0xFFFF)
+        wm = fx.add_offset(fx.get_iter(wm_buf), n * 2)
+        packed = wm.load(T.i32)
+        seq_len = fx.add_offset(wm, fx.Int32(1)).load(T.i32)
+        b = (packed >> 16) & 0xFFFF
+        c = packed & 0xFFFF
         if const_expr(SPREAD):
             # A spread row names its first page rather than a chunk, and
             # carries its page count (1..4) in the length word's top byte.
@@ -563,10 +563,8 @@ def build_index_score(S: int, H: int, geom):
             off = row * i32_stride_q_n + head * i32_stride_q_h + q_load_offset(j)
             # Q is bf16, which is also the compute dtype, so there is no
             # conversion on this path at all.
-            return fx.Vector(
-                fx.add_offset(fx.get_iter(q_buf), off >> fx.Int32(1)).load(
-                    T.vec(4, T.i32)
-                )
+            return fx.add_offset(fx.get_iter(q_buf), off >> fx.Int32(1)).load(
+                T.vec(4, T.i32)
             )
 
         # Only the token-wave partial-max exchange needs LDS; otherwise the
@@ -589,7 +587,7 @@ def build_index_score(S: int, H: int, geom):
             for i in range_constexpr(FEAT_TILES_PER_WAVE)
         ]
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.BFloat16))
-        zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
+        zero4 = fx.full(4, 0.0, fx.Float32)
         neg_inf = fx.Float32(NEG_INF)
         # -- page ids and their buffer descriptors, one batch up front --------
         # Issued with no dependant between them so they pipeline instead of costing
@@ -624,11 +622,9 @@ def build_index_score(S: int, H: int, geom):
             # all, yet still forms descriptors (and its token-split waves
             # execute barriers), so clamp that speculative load to column 0.
             column = (num_pages > zero).select(global_block(p_clamped), zero)
-            page = fx.Int32(
-                fx.add_offset(fx.get_iter(bt_buf), b * i32_stride_bt_b + column).load(
-                    T.i32
-                )
-            )
+            page = fx.add_offset(
+                fx.get_iter(bt_buf), b * i32_stride_bt_b + column
+            ).load(T.i32)
             address = k_base + fx.Int64(page) * page_bytes
             page_buffers.append(
                 ptr_buf_tensor(
@@ -669,7 +665,7 @@ def build_index_score(S: int, H: int, geom):
             )
             # `base` counts fp8 elements; 16 of them are one 16 B access, and
             # every stride above that is a multiple, so the shift is exact.
-            return load_k16(page, base >> fx.Int32(4))
+            return load_k16(page, base >> 4)
 
         # ==================== MAIN LOOP ====================
         def score_tok_tile(p, tok_tile, raws, run_max):
@@ -694,7 +690,7 @@ def build_index_score(S: int, H: int, geom):
                 global_block(p) * fx.Int32(PAGE)
                 + fx.Int32(MFMA_M * tok_tile)
                 + tw_tok
-                + g * fx.Int32(4)
+                + g * 4
             )
             for i in range_constexpr(FEAT_TILES_PER_WAVE):
                 tok, _ = tok_head_of(i)
@@ -811,10 +807,10 @@ def build_index_score(S: int, H: int, geom):
                     )
                     # One writer per feature; padding columns and pages past
                     # this request write nothing.
-                    is_writer = (g == fx.Int32(0)) & (feature_of(i) < fx.Int32(F))
+                    is_writer = (g == 0) & (feature_of(i) < fx.Int32(F))
                     if const_expr(WAVES_PER_TOK > 1):
                         # All WAVES_PER_TOK waves hold the same value; pick one.
-                        is_writer = is_writer & (tw == fx.Int32(0))
+                        is_writer = is_writer & (tw == 0)
                     if valid is not None:
                         is_writer = is_writer & valid
                     if is_writer:

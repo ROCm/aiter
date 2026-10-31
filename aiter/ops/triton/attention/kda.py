@@ -73,7 +73,7 @@ def fused_recurrent_kda(
         beta: [B, T, HV] scalar or [B, T, HV, V] headwise write strengths.
         A_log: [HV] gate parameter
         dt_bias: [HV, K] optional bias added to g inside the gate chain.
-        initial_state: fp32 state slabs, [slots, HV, V, K] when
+        initial_state: fp32 (or bf16 on gfx950) state slabs, [slots, HV, V, K] when
             ``state_v_first`` (default) else [slots, HV, K, V]
         scale: q scale factor; defaults to K**-0.5.
         output_final_state: return the post-recurrence state
@@ -93,7 +93,8 @@ def fused_recurrent_kda(
             state eigenvalues may go negative.
         lower_bound: bound for the lower-bounded gate chain
         out: optional output buffer, v's shape and dtype.
-        state_out: optional final-state destination when not in-place
+        state_out: optional final-state destination when not in-place. Its dtype
+            must match initial_state when initial_state is provided.
         cache_state_updates: paged + in-place + v-first only: store the
             full slab only for a sequence's first token, then compact
             (a, k, err) records per token for replay after verification.
@@ -105,9 +106,10 @@ def fused_recurrent_kda(
 
     Returns:
         (o, final_state): o is [B, T, HV, V] in v's dtype. final_state is
-        the fp32 state tensor (initial_state itself when in-place, else
+        the state tensor (initial_state itself when in-place, else
         state_out or a fresh [N, HV, ., .] tensor), or None when
         neither ``output_final_state`` nor ``inplace_final_state`` is set.
+        A fresh state uses initial_state's dtype, or fp32 without initial_state.
     """
 
     if fused_recurrent_kda_packed_decode_kernel is None:
@@ -239,8 +241,12 @@ def fused_recurrent_kda(
             conv_state.shape[2] >= W - 2 + max_tok
         ), f"spec conv_state needs {W - 2 + max_tok} taps, got {conv_state.shape[2]}"
 
+    state_dtypes = (
+        (torch.float32, torch.bfloat16) if _ARCH == "gfx950" else (torch.float32,)
+    )
+    state_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if initial_state is not None:
-        assert initial_state.dtype == torch.float32
+        assert initial_state.dtype in state_dtypes
         assert (
             initial_state.shape[1:] == state_shape
         ), f"state must be [slots, HV, {state_shape[1]}, {state_shape[2]}]"
@@ -257,12 +263,14 @@ def fused_recurrent_kda(
                 "[total_T, HV, V, K] -- snapshots are indexed by token, not by slot"
             )
         else:
-            final_state = q.new_empty(N, *state_shape, dtype=torch.float32)
+            final_state = q.new_empty(N, *state_shape, dtype=state_dtype)
     else:
         final_state = None
 
     if final_state is not None:
-        assert final_state.dtype == torch.float32
+        assert final_state.dtype in state_dtypes
+        if initial_state is not None:
+            assert final_state.dtype == initial_state.dtype, "state dtypes must match"
         assert (
             final_state.shape[1:] == state_shape
         ), "final state layout must match initial_state"
@@ -293,7 +301,10 @@ def fused_recurrent_kda(
     state_dst = final_state
     if state_dst is None and _ARCH == "gfx950":
         n_dst = B * T if is_paged else N
-        state_dst = q.new_empty(n_dst, *state_shape, dtype=torch.float32)
+        state_dst = q.new_empty(n_dst, *state_shape, dtype=state_dtype)
+    # BF16 storage must not round the recurrent state between tokens.
+    if state_dst is not None and state_dst.dtype == torch.bfloat16 and T > 1:
+        resident_state = True
     slot_rows_in, rows_in = _rows(initial_state)
     slot_rows_out, rows_out = (
         (slot_rows_in, rows_in) if state_dst is initial_state else _rows(state_dst)

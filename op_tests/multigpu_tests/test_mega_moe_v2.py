@@ -123,6 +123,8 @@ def _make_inputs(
     force_fanout_boundary,
     inject_invalid_route,
     force_padding_boundary,
+    concentrate_experts=0,
+    zipf=0.0,
 ):
     generator = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn(
@@ -131,7 +133,26 @@ def _make_inputs(
     scores = torch.randn(
         (tokens, experts), dtype=torch.float32, device=device, generator=generator
     )
+    if zipf > 0:
+        # Zipf expert-popularity skew (realistic MoE load imbalance): bias scores
+        # by -zipf*ln(rank+1) over a seed-fixed permutation shared across ranks,
+        # so a few experts attract most tokens (spread across expert ids).
+        pgen = torch.Generator(device=device).manual_seed(seed)
+        perm = torch.randperm(experts, generator=pgen, device=device)
+        rank_of = torch.empty(experts, dtype=torch.float32, device=device)
+        rank_of[perm] = torch.arange(experts, dtype=torch.float32, device=device)
+        scores = scores + (-float(zipf) * torch.log(rank_of + 1.0))[None, :]
     values, ids = torch.topk(scores, topk, dim=-1)
+    if concentrate_experts:
+        # OOB repro: route every token's top-k slots to experts [0, topk) which
+        # all live on rank 0, so rank 0's route-major receive buffer must hold
+        # (sum of sender tokens) * topk rows -- the cross-rank skew the local
+        # payload-capacity guard cannot see.
+        ids = (
+            torch.arange(topk, dtype=torch.int64, device=device)
+            .expand(tokens, topk)
+            .clone()
+        )
     if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
         if topk != 16 or experts % dist.get_world_size():
             raise ValueError("fanout adversarial cases require topk=16 and EP")
@@ -547,6 +568,8 @@ def main():
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument("--concentrate-experts", type=int, default=0)
+    parser.add_argument("--zipf", type=float, default=0.0)
     parser.add_argument("--force-fanout-boundary", action="store_true")
     parser.add_argument("--inject-invalid-route", action="store_true")
     parser.add_argument("--force-padding-boundary", action="store_true")
@@ -620,6 +643,8 @@ def main():
             force_fanout_boundary=args.force_fanout_boundary,
             inject_invalid_route=args.inject_invalid_route,
             force_padding_boundary=args.force_padding_boundary,
+            concentrate_experts=args.concentrate_experts,
+            zipf=args.zipf,
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
         # MegaMoE's producer/consumer wire geometry is rank-invariant. A

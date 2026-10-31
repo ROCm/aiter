@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import importlib.util
 
 import pandas as pd
 import torch
@@ -16,6 +17,8 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
+
+_FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
 
 
 @functools.lru_cache(maxsize=1024)
@@ -77,6 +80,105 @@ def get_GEMM_config(M: int, N: int, K: int):
             f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
         )
     return config
+
+
+# gfx1250 MXFP4 rows (1x32 e8m0 scales in the 32x4 layout), kept apart from the
+# a4w4_blockscale table above: its kernels read a different scale layout.
+@functools.lru_cache(maxsize=1)
+def _load_a4w4_mxscale_tuned(tuned_file: str) -> dict:
+    """{(gfx, cu_num, M, N, K): (libtype, kernelName)} of the a4w4_mxscale_bpreshuffle table."""
+    try:
+        df = pd.read_csv(tuned_file).drop_duplicates()
+    except (OSError, pd.errors.EmptyDataError):
+        return {}
+    return {
+        (r.gfx, r.cu_num, r.M, r.N, r.K): (r.libtype, str(r.kernelName))
+        for r in df.itertuples(index=False)
+    }
+
+
+@functools.lru_cache(maxsize=1024)
+def flydsl_a4w4_fallback_kernel(M: int, N: int, K: int, cu_num: int) -> str | None:
+    """FlyDSL kernelName for an untuned shape."""
+    from .flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+        a4w4_kernel_launchable,
+        a4w4_kernel_name,
+    )
+    from .flydsl.gemm_tune.flydsl_gemm_a4w4_mxscale_bpreshuffle_wmma_common import (
+        kernel_fits_shape,
+        kernels_list,
+    )
+
+    cdiv = lambda a, b: -(-a // b)
+    fill = 0.6 * cu_num
+    if M >= 256 and K >= 1024 and fill <= cdiv(M, 256) * cdiv(N, 256) <= cu_num:
+        # cluster_m 4 shrinks at launch to the largest that tiles M in whole cluster rows
+        for cn in (4, 2, 1):
+            name = a4w4_kernel_name(256, 256, 256, cluster_m=4, cluster_n=cn)
+            if a4w4_kernel_launchable(name, M, N, K):
+                return name
+
+    wgs = lambda ki: cdiv(M, ki.tile_m) * cdiv(N, ki.tile_n) * ki.split_k
+    pow2_m = 1 << (M - 1).bit_length()
+    general = [
+        ki
+        for ki in kernels_list.values()
+        if not ki.compute_bound
+        and min(64, pow2_m) <= ki.tile_m <= min(256, max(16, pow2_m))
+        and ki.tile_n >= 64
+        and ki.cluster_m == cdiv(M, ki.tile_m)
+        and wgs(ki) <= cu_num
+        and K // (ki.split_k * ki.tile_k) >= 2
+        and ki.cluster_n <= 4
+        and kernel_fits_shape(ki, M, N, K)  # the costly check, last
+    ]
+
+    def rank(ki):
+        full = wgs(ki) >= fill
+        warps = (1, 4) if ki.tile_m <= 64 and ki.tile_n >= 128 else (2, 2)
+        return (
+            not full,
+            ki.split_k if full else 0,
+            -wgs(ki),
+            -ki.tile_m * ki.tile_n / (ki.tile_m + ki.tile_n),
+            -ki.tile_m,
+            (512, 256, 128, 1024).index(ki.tile_k),
+            (ki.m_warp, ki.n_warp) != warps,
+            (3, 4, 2).index(ki.num_buffers),
+            -ki.cluster_n,
+        )
+
+    return min(general, key=rank).name if general else None
+
+
+@functools.lru_cache(maxsize=1024)
+def _a4w4_mxscale_config(M: int, N: int, K: int) -> tuple[str, str] | None:
+    """(libtype, kernelName) for a gfx1250 shape: the tuned row at M or a padded M (a FlyDSL
+    row that cannot launch for the real M is skipped), else the FlyDSL fallback."""
+    if not _FLYDSL_AVAILABLE:  # optional dependency: asm serves all
+        return None
+    from .flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import a4w4_kernel_launchable
+
+    gfx, cu_num = get_gfx(), get_cu_num()
+    rows = _load_a4w4_mxscale_tuned(
+        AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE
+    )
+    for gl in (None, 0, 1):
+        row = rows.get(
+            (gfx, cu_num, M if gl is None else get_padded_m(M, N, K, gl), N, K)
+        )
+        if row is not None and (
+            row[0] != "flydsl" or a4w4_kernel_launchable(row[1], M, N, K)
+        ):
+            return row
+    name = flydsl_a4w4_fallback_kernel(M, N, K, cu_num)
+    if name is None:
+        return None
+    logger.warning(
+        f"[gfx1250] gemm_a4w4 untuned M={M}, N={N}, K={K}; "
+        f"falling back to flydsl kernel '{name}'."
+    )
+    return "flydsl", name
 
 
 def _f4gemm_asm_dispatch(
@@ -176,8 +278,8 @@ def gemm_a4w4(
 ) -> torch.Tensor:
     """A4W4 GEMM (4-bit quantized matmul) returning one plain-dtype tensor.
 
-    On gfx1250 the call is dispatched to the dedicated F4GEMM asm path.
-    MXFP4 vs NVFP4 is selected by the presence of ``global_A_scale``/
+    On gfx1250 the a4w4_mxscale_bpreshuffle table picks FlyDSL or the F4GEMM asm
+    kernels per shape. MXFP4 vs NVFP4 is selected by the presence of ``global_A_scale``/
     ``global_B_scale`` (NVFP4 per-tensor global scales).
     """
     # Low-precision output has a different return arity/shape (mxfp8 is a
@@ -192,6 +294,30 @@ def gemm_a4w4(
     k = A.shape[-1] * 2
     gfx_arch = get_gfx()
     if gfx_arch in ["gfx1250"]:
+        # FlyDSL serves plain MXFP4 with row-major A and a bf16 output; the rest is asm.
+        plain_mxfp4 = (
+            dtype == dtypes.bf16
+            and not apreshuffle
+            and global_A_scale is None
+            and global_B_scale is None
+            and bias is None
+            and alpha in (None, 1.0)
+            and beta in (None, 0.0)
+        )
+        config = _a4w4_mxscale_config(m, n, k) if plain_mxfp4 else None
+        if config is not None and config[0] == "flydsl":
+            from .flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+                a4w4_operands_aligned,
+                run_gemm_a4w4_mxscale_bpreshuffle_gfx1250,
+            )
+
+            A2 = A.view(m, k // 2)
+            if a4w4_operands_aligned(A2, B, A_scale, B_scale):  # else asm
+                out = torch.empty((m, n), dtype=dtype, device=A.device)
+                run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
+                    A2, B, A_scale, B_scale, out, config[1]
+                )
+                return out.view(*A.shape[:-1], n)
         require_gfx1250_asm("gemm_a4w4")
         out = _f4gemm_asm_dispatch(
             A,
@@ -348,10 +474,23 @@ def _is_mxfp8_out(dtype: torch.dtype) -> bool:
     return dtype == dtypes.fp8
 
 
-def _alloc_f4gemm_out(M: int, N: int, dtype: torch.dtype, device) -> Tensor:
-    """Allocate the F4GEMM output. bf16 output is a plain ``[M, N]``; mxfp8 output
+def _alloc_f4gemm_out(
+    M: int, N: int, dtype: torch.dtype, device, y: Tensor | None = None
+) -> Tensor:
+    """Allocate or reuse the F4GEMM output. bf16 output is a plain ``[M, N]``; mxfp8 output
     is a plain ``[M, N]`` fp8 (its E8M0 scale is a separate tensor, see
     :func:`_alloc_f4gemm_out_scale`)."""
+    if y is not None:
+        if (
+            y.shape != (M, N)
+            or y.dtype != dtype
+            or y.device != device
+            or not y.is_contiguous()
+        ):
+            raise ValueError(
+                f"y must be contiguous with shape {(M, N)}, dtype {dtype}, device {device}"
+            )
+        return y
     return torch.empty((M, N), dtype=dtype, device=device)
 
 
@@ -389,17 +528,23 @@ def gemm_mxfp4_asm(
     dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
+    *,
+    y: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """MXFP4 GEMM (preload SGPR mode). D = A * B with e8m0 scales. ``dtype``:
     bf16 ``[M,N]`` or mxfp8 (``dtypes.fp8``) returning
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
-    :func:`unpack_mxfp8_out_scale`."""
+    :func:`unpack_mxfp8_out_scale`. Optional ``y`` supplies a contiguous
+    ``[M,N]`` output with the requested dtype on A's device, as in Gluon.
+    An empty batch returns empty output buffers without launching a kernel."""
     require_gfx1250_asm("gemm_mxfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
-    out = _alloc_f4gemm_out(M, N, dtype, A.device)
+    out = _alloc_f4gemm_out(M, N, dtype, A.device, y)
     out_scale = _alloc_f4gemm_out_scale(M, N, dtype, A.device)
+    if M == 0:
+        return (out, out_scale) if out_scale is not None else out
     _mxfp4_gemm_asm(
         A,
         B,
@@ -423,17 +568,23 @@ def gemm_nvfp4_asm(
     dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
+    *,
+    y: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """NVFP4 GEMM (preload SGPR mode). D = A * B with e4m3 scales + global alphas.
     ``dtype``: bf16 ``[M,N]`` or mxfp8 (``dtypes.fp8``) returning
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
-    :func:`unpack_mxfp8_out_scale`."""
+    :func:`unpack_mxfp8_out_scale`. Optional ``y`` supplies a contiguous
+    ``[M,N]`` output with the requested dtype on A's device.
+    An empty batch returns empty output buffers without launching a kernel."""
     require_gfx1250_asm("gemm_nvfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
-    out = _alloc_f4gemm_out(M, N, dtype, A.device)
+    out = _alloc_f4gemm_out(M, N, dtype, A.device, y)
     out_scale = _alloc_f4gemm_out_scale(M, N, dtype, A.device)
+    if M == 0:
+        return (out, out_scale) if out_scale is not None else out
     _nvfp4_gemm_asm(
         A,
         B,

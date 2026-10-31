@@ -597,7 +597,9 @@ def _ref_arbitrary_grouped(
         scores = f32
     choice = scores + bias.float().unsqueeze(0) if bias is not None else scores
 
-    group_scores = torch.empty((nt, num_expert_group), device=logits.device)
+    group_scores = torch.empty(
+        (nt, num_expert_group), device=logits.device, dtype=torch.float32
+    )
     for g in range(num_expert_group):
         cols = (expert_group == g).nonzero(as_tuple=False).flatten()
         sub = choice[:, cols]

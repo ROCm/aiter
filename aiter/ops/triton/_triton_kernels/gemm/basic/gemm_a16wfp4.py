@@ -176,7 +176,7 @@ def _gemm_a16wfp4_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         if ATOMIC_ADD:
@@ -374,7 +374,7 @@ def _gemm_a16wfp4_preshuffle_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)

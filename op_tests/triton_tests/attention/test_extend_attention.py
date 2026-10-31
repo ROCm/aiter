@@ -59,7 +59,7 @@ def input_helper(
     )
     cu_seqlens_prefix = torch.cat(
         [
-            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32, device=device),
             seqlens_prefix.cumsum(dim=0, dtype=torch.int32),
         ]
     )
@@ -166,8 +166,6 @@ def test_op_fwd(
     device="cuda",
 ):
     torch.manual_seed(0)
-    torch.set_default_device(device)
-    torch.set_default_dtype(dtype)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 

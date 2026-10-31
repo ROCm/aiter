@@ -39,6 +39,19 @@ def is_fp8_avail():
     return get_arch() in ("gfx942", "gfx950", "gfx1250", "gfx1200", "gfx1201")
 
 
+def is_sw_emulated_fp8_avail():
+    # No fp8 WMMA or cvt instructions: Triton converts fp8 operands to fp16
+    # in software and runs the fp16 WMMA. The archs match get_fp8_dtypes()
+    # in utils/types.py, and each FP8 entry point opts in separately once
+    # it has configs and a passing test.
+    return get_arch() in ("gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151")
+
+
+def is_any_fp8_avail():
+    # FP8 through hardware or through software emulation.
+    return is_fp8_avail() or is_sw_emulated_fp8_avail()
+
+
 def is_mx_scale_preshuffling_avail():
     return get_arch() in ("gfx950", "gfx1250")
 

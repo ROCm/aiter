@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // ============================================================================
-// gfx1250 F4GEMM ASM Support Matrix
+// gfx1250 F4GEMM ASM Support Matrix (256x256 persistent kernels)
 // ----------------------------------------------------------------------------
 //  OUTTYPE | A_PRESHUFFLE | B_PRESHUFFLE | INTYPE |   M    |   N    |   K
 // ---------+--------------+--------------+--------+--------+--------+--------
@@ -19,6 +19,12 @@
 //  - B_PRESHUFFLE is always 1 (B is always pre-shuffled).
 //  - A_PRESHUFFLE=1 tightens the M constraint from %1==0 to %16==0.
 //  - K is always a multiple of 32.
+//  - The current 192x256 non-persistent (NPS) path accepts MXFP4 -> BF16,
+//    A_PRESHUFFLE=0, M%768==0, N%1024==0 and K%256==0, with 4x4 clusters.
+//    Automatic selection is limited to 48 clusters (768 TG);
+//    larger shapes and other formats use the persistent kernels.
+//  - Python GEMM entrypoints return empty outputs for M==0 without a launch.
+//  - See hsa/gfx1250/f4gemm/README.md for runtime geometry and tuning controls.
 // ============================================================================
 //
 // gfx1250 F4GEMM ASM dispatch (preload SGPR mode).
@@ -44,8 +50,12 @@
 #include "asm_f4gemm_configs.hpp"
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <hip/hip_runtime.h>
 
 constexpr int MXFP4_SCALE_BLOCK = 32;
@@ -54,6 +64,84 @@ constexpr int NVFP4_SCALE_BLOCK = 16;
 constexpr int F4GEMM_N_ALIGN      = 16;
 constexpr int F4GEMM_K_ALIGN      = 32;
 constexpr int F4GEMM_M_ALIGN_APRE = 16;
+// Bound automatic NPS selection to output sizes with a clear measured gain.
+// Larger sampled outputs are near parity or regress versus PS. Explicit
+// kernelName remains available; see hsa/gfx1250/f4gemm/README.md for measurements.
+constexpr int F4GEMM_NPS_MAX_CLUSTERS = 48;
+
+namespace aiter::f4gemm
+{
+constexpr int TILE_M        = 256;
+constexpr int TILE_N        = 256;
+constexpr int PERSISTENT_TG = 256;
+
+struct LaunchGeometry
+{
+    int cluster_x; // N direction; HIP cluster attribute / ttmp6
+    int cluster_y; // M direction
+    int grid_x;    // Cluster grid, not the HIP workgroup grid
+    int grid_y;
+};
+
+constexpr bool is_power_of_two(int value)
+{
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+static unsigned int log2_power_of_two(int value)
+{
+    unsigned int result = 0;
+    for(; value > 1; value >>= 1)
+        ++result;
+    return result;
+}
+
+static LaunchGeometry make_launch_geometry(int cluster_x, int cluster_y, int grid_y)
+{
+    // 1x1 bypasses cluster launch, but these shaders need ttmp6 and barriers.
+    // A single axis of 16 hung the current stack; automatic axes stay <= 4.
+    if(!is_power_of_two(cluster_x) || !is_power_of_two(cluster_y) ||
+       cluster_x > 8 || cluster_y > 8 || cluster_x * cluster_y < 2 ||
+       cluster_x * cluster_y > 16)
+        throw std::invalid_argument("f4gemm: cluster axes must be powers of two <= 8, "
+                                    "with 2..16 TG per cluster");
+
+    const int clusters = PERSISTENT_TG / (cluster_x * cluster_y);
+    if(!is_power_of_two(grid_y) || grid_y > clusters)
+        throw std::invalid_argument("f4gemm: grid_y must be a power-of-two divisor "
+                                    "of the persistent cluster count");
+    return {cluster_x, cluster_y, clusters / grid_y, grid_y};
+}
+
+static LaunchGeometry select_launch_geometry(int M, int N)
+{
+    if(M < 0 || N < 0)
+        throw std::invalid_argument("f4gemm: M and N must be nonnegative");
+    const int tiles_m = M / TILE_M + (M % TILE_M != 0);
+    const int tiles_n = N / TILE_N + (N % TILE_N != 0);
+
+    // Shrink axes that would add whole phantom tiles to the default 4x4 cluster.
+    int cluster_x = 4;
+    int cluster_y = 4;
+    while(cluster_x > 1 && tiles_n % cluster_x != 0)
+        cluster_x >>= 1;
+    while(cluster_y > 1 && tiles_m % cluster_y != 0)
+        cluster_y >>= 1;
+    if(cluster_x * cluster_y == 1)
+    {
+        if(tiles_n >= tiles_m)
+            cluster_x = 2;
+        else
+            cluster_y = 2;
+    }
+
+    const int cluster_rows = (tiles_m + cluster_y - 1) / cluster_y;
+    int grid_y = 1;
+    while(grid_y < 4 && grid_y < cluster_rows)
+        grid_y <<= 1;
+    return make_launch_geometry(cluster_x, cluster_y, grid_y);
+}
+} // namespace aiter::f4gemm
 
 // Preload-mode KernelArgs (4B-tight, MEM-first). Offsets in comments are the
 // kernarg byte offsets the preload-aware shader s_load's from.
@@ -82,13 +170,30 @@ struct __attribute__((packed)) KernelArgs
 // Only fp8 outputs ship ScaleD; other outputs ship 80B (MXFP4) / 88B (NVFP4).
 static_assert(sizeof(KernelArgs) == 96, "f4gemm preload KernelArgs must be 96B");
 
+// Keep NPS on the validated full 4x4 clusters and K256 steps. Both shaders
+// read cluster dimensions from ttmp6; 4x4 is the current NPS dispatch policy.
+template <typename Config>
+static bool supports_shape(const Config& cfg, int M, int N, int K)
+{
+    if(M <= 0 || N <= 0 || K <= 0)
+        return false;
+    const int m_align = cfg.a_preshuffle ? F4GEMM_M_ALIGN_APRE : 1;
+    if(M % m_align || N % F4GEMM_N_ALIGN || K % F4GEMM_K_ALIGN)
+        return false;
+    if(cfg.ps_mode == 1)
+        return true;
+    return cfg.ps_mode == 0 && cfg.tile_m == 192 && cfg.tile_n == 256 &&
+           cfg.cluster_x == 4 && cfg.cluster_y == 4 && cfg.intype == "mxfp4" &&
+           cfg.outtype == "bf16" && cfg.a_preshuffle == 0 && cfg.scale == 1 &&
+           M % (192 * 4) == 0 && N % (256 * 4) == 0 && K % 256 == 0;
+}
+
 static std::tuple<std::string, int> get_heuristic_kernel(
     int M, int N, int K, std::string arch_id, const std::string& intype,
     const std::string& outtype, int a_preshuffle, CFG* cfgs)
 {
-    // (intype, a_preshuffle, outtype) maps to a single .co in the CSV -- the scale
-    // mode is baked into that variant -- so there is no tile/round search: pick
-    // the one variant whose alignment matches.
+    // Prefer NPS within the measured size bound. Select deterministically
+    // regardless of unordered-map iteration order, with persistent fallback.
     std::string selectedKernelName = "";
 
     for(const auto& el : *cfgs)
@@ -101,12 +206,18 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         if(cfg.outtype != outtype)
             continue;
 
-        const int m_align = a_preshuffle ? F4GEMM_M_ALIGN_APRE : 1;
-        if((M % m_align) != 0 || (N % F4GEMM_N_ALIGN) != 0 || (K % F4GEMM_K_ALIGN) != 0)
+        if(!supports_shape(cfg, M, N, K))
+            continue;
+        if(cfg.ps_mode == 0 &&
+           static_cast<int64_t>(M) * N >
+               static_cast<int64_t>(F4GEMM_NPS_MAX_CLUSTERS) * cfg.tile_m * cfg.tile_n *
+                   cfg.cluster_x * cfg.cluster_y)
             continue;
 
-        selectedKernelName = el.first;
-        break;
+        if(selectedKernelName.empty() ||
+           cfg.ps_mode < cfgs->at(selectedKernelName).ps_mode ||
+           (cfg.ps_mode == cfgs->at(selectedKernelName).ps_mode && el.first < selectedKernelName))
+            selectedKernelName = el.first;
     }
 
     AITER_CHECK(selectedKernelName != "",
@@ -124,6 +235,106 @@ static std::tuple<std::string, int> get_heuristic_kernel(
                 ", K=",
                 K);
     return std::make_tuple(selectedKernelName, 1);
+}
+
+static const f4gemmConfig& get_kernel_config(
+    int M, int N, int K, const std::string& arch_id, const std::string& intype,
+    const std::string& outtype, int a_preshuffle, const char* kernelName)
+{
+    static CFG* config_map = &cfg_f4gemm;
+    AITER_CHECK(!config_map->empty(),
+                __func__,
+                " no kernel registered for f4gemm; check AITER_GPU_ARCHS=gfx1250");
+
+    std::string selectedName =
+        (kernelName && kernelName[0] != '\0') ? (arch_id + kernelName) : "";
+
+    // Keep identical shapes on different GPU architectures in separate entries.
+    const int intype_id = (intype == "nvfp4") ? 1 : 0;   // else mxfp4
+    const int out_id    = (outtype == "fp8") ? 1 : 0;  // bf16=0
+    using DictKey = std::tuple<std::string, int, int, int, int, int, int>;
+    struct DictHash
+    {
+        size_t operator()(const DictKey& k) const
+        {
+            const auto& [arch, m, n, kk, it, ap, ot] = k;
+            size_t h = std::hash<std::string>{}(arch);
+            for(int v : {m, n, kk, it, ap, ot})
+                h = (h ^ static_cast<size_t>(static_cast<unsigned>(v))) * 1099511628211ull;
+            return h;
+        }
+    };
+    static SynchronizedCache<DictKey, std::string, DictHash> heuristic_kernel_dict;
+
+    if(selectedName.empty())
+    {
+        selectedName = heuristic_kernel_dict.get_or_create(
+            DictKey(arch_id, M, N, K, intype_id, a_preshuffle, out_id), [&]() {
+                auto [name, _] = get_heuristic_kernel(
+                    M, N, K, arch_id, intype, std::string(outtype),
+                    a_preshuffle, config_map);
+                return name;
+            });
+    }
+
+    auto it = config_map->find(selectedName);
+    AITER_CHECK(it != config_map->end(),
+                __func__,
+                " kernel not in cfg_f4gemm: ",
+                selectedName);
+
+    const auto& cfg     = it->second;
+    // Guard the explicit-kernelName path. outtype MUST match: a mismatched .co
+    // keeps the same kernarg size (HIP won't catch it) but sizes stride_d / the
+    // output buffer for a different element width -> device-side OOB write.
+    AITER_CHECK(cfg.intype == intype && cfg.a_preshuffle == a_preshuffle &&
+                    cfg.outtype == outtype,
+                __func__,
+                " selected kernel ",
+                selectedName,
+                " mismatches requested intype/a_preshuffle/outtype (got intype=",
+                cfg.intype,
+                ", outtype=",
+                cfg.outtype,
+                "; requested intype=",
+                intype,
+                ", outtype=",
+                outtype,
+                ")");
+    AITER_CHECK(supports_shape(cfg, M, N, K),
+                __func__, " selected kernel does not support M/N/K=",
+                M, "/", N, "/", K,
+                cfg.ps_mode == 0
+                    ? "; 192x256 NPS requires MXFP4/BF16/AP0, M%768=0, N%1024=0, K%256=0"
+                    : "; persistent kernels require N%16=0, K%32=0 and M%16=0 for AP1");
+
+    return cfg;
+}
+
+static aiter::f4gemm::LaunchGeometry get_launch_geometry(
+    const f4gemmConfig& cfg, int M, int N)
+{
+    if(cfg.ps_mode == 0)
+        return {cfg.cluster_x, cfg.cluster_y,
+                N / (cfg.tile_n * cfg.cluster_x), M / (cfg.tile_m * cfg.cluster_y)};
+
+    AITER_CHECK(cfg.tile_m == aiter::f4gemm::TILE_M && cfg.tile_n == aiter::f4gemm::TILE_N,
+                "f4gemm persistent geometry requires the registered 256x256 tile");
+    // Snapshot the override on the first persistent selection.
+    // Later environment changes do not alter dispatch. NPS keeps its fixed 4x4
+    // clusters. See hsa/gfx1250/f4gemm/README.md for the format and constraints.
+    static const auto override_geometry = []() -> std::optional<aiter::f4gemm::LaunchGeometry> {
+        const char* tune = std::getenv("AITER_F4GEMM_TUNE");
+        if(tune == nullptr)
+            return std::nullopt;
+        int cluster_x, cluster_y, grid_y;
+        char trailing;
+        AITER_CHECK(std::sscanf(tune, "%d,%d,%d%c", &cluster_x, &cluster_y, &grid_y,
+                               &trailing) == 3,
+                    "AITER_F4GEMM_TUNE must be cluster_x,cluster_y,grid_y");
+        return aiter::f4gemm::make_launch_geometry(cluster_x, cluster_y, grid_y);
+    }();
+    return override_geometry ? *override_geometry : aiter::f4gemm::select_launch_geometry(M, N);
 }
 
 // Shared dispatch body. arg_size (shipped bytes) is set per (intype, out_is_fp8)
@@ -218,126 +429,32 @@ static void f4gemm_launch(aiter_tensor_t* A,
 
     const HipDeviceGuard device_guard(A->device_id);
 
-    static CFG* config_map = &cfg_f4gemm;
-    AITER_CHECK(!config_map->empty(),
-                __func__,
-                " no kernel registered for f4gemm; check AITER_GPU_ARCHS=gfx1250");
-
-    std::string arch_id = get_gpu_arch();
-    std::string selectedName =
-        (kernelName && kernelName[0] != '\0') ? (arch_id + kernelName) : "";
-
-    // All-int cache key: the hot lookup hashes ints, not std::strings.
-    const int intype_id = (intype == "nvfp4") ? 1 : 0;   // else mxfp4
-    const int out_id    = out_is_fp8 ? 1 : 0;  // bf16=0
-    using DictKey = std::tuple<int, int, int, int, int, int>; // M,N,K,intype_id,apre,out_id
-    struct DictHash
-    {
-        size_t operator()(const DictKey& k) const
-        {
-            const auto& [m, n, kk, it, ap, ot] = k;
-            size_t h = 1469598103934665603ull;
-            for(int v : {m, n, kk, it, ap, ot})
-                h = (h ^ static_cast<size_t>(static_cast<unsigned>(v))) * 1099511628211ull;
-            return h;
-        }
-    };
-    static SynchronizedCache<DictKey, std::string, DictHash> heuristic_kernel_dict;
-
-    if(selectedName.empty())
-    {
-        selectedName = heuristic_kernel_dict.get_or_create(
-            DictKey(Mdim, Ndim, Kdim, intype_id, a_preshuffle, out_id), [&]() {
-                auto [name, _] = get_heuristic_kernel(
-                    Mdim, Ndim, Kdim, arch_id, intype, std::string(out_type),
-                    a_preshuffle, config_map);
-                return name;
-            });
-    }
-
-    auto it = config_map->find(selectedName);
-    AITER_CHECK(it != config_map->end(),
-                __func__,
-                " kernel not in cfg_f4gemm: ",
-                selectedName);
-
-    const auto& cfg     = it->second;
-    // Guard the explicit-kernelName path. outtype MUST match: a mismatched .co
-    // keeps the same kernarg size (HIP won't catch it) but sizes stride_d / the
-    // output buffer for a different element width -> device-side OOB write.
-    AITER_CHECK(cfg.intype == intype && cfg.a_preshuffle == a_preshuffle &&
-                    cfg.outtype == out_type,
-                __func__,
-                " selected kernel ",
-                selectedName,
-                " mismatches requested intype/a_preshuffle/outtype (got intype=",
-                cfg.intype,
-                ", outtype=",
-                cfg.outtype,
-                "; requested intype=",
-                intype,
-                ", outtype=",
-                out_type,
-                ")");
+    const auto& cfg = get_kernel_config(
+        Mdim, Ndim, Kdim, get_gpu_arch(), intype, out_type, a_preshuffle, kernelName);
 
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
         cfg.knl_name, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
-    // ----- Launch geometry: cluster + persistent -----
-    // Every f4gemm .co is a persistent shader, so the launch is fixed-size and
-    // independent of M/N/K. The tile-walk swizzle is NOT baked into
-    // the .co: the shader reads log2(gridX)/log2(gridY) as kernargs, so the host
-    // picks the cluster-grid shape here and must ship it. persistent_tg / grid_y
-    // are runtime-only knobs; gridX is derived.
-    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1; // compile-time per .co (CSV)
-    const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
-
-    constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
-    constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
-
-    AITER_CHECK((PERSISTENT_TG % (cluster_x * cluster_y)) == 0,
-                __func__, " persistent_tg=", PERSISTENT_TG,
-                " not divisible by cluster_x*cluster_y=", cluster_x * cluster_y);
-    const int clusters = PERSISTENT_TG / (cluster_x * cluster_y);
-    AITER_CHECK(PERSISTENT_GY != 0 && (clusters % PERSISTENT_GY) == 0,
-                __func__, " grid_y=", PERSISTENT_GY,
-                " must be a nonzero divisor of cluster count ", clusters);
-    const int gridY = PERSISTENT_GY;
-    const int gridX = clusters / gridY;
-    // grid_flat advance = 1 << (log2_grid_x + log2_grid_y) must equal the
-    // cluster count, so cluster count and both grid dims must be power-of-two.
-    AITER_CHECK((clusters & (clusters - 1)) == 0,
-                __func__, " persistent cluster count ", clusters, " must be power-of-two");
-    AITER_CHECK((gridX & (gridX - 1)) == 0 && (gridY & (gridY - 1)) == 0,
-                __func__, " persistent gridX=", gridX, " gridY=", gridY,
-                " must each be power-of-two");
-
-    // HIP gridDim must be a multiple of clusterDim per axis: the cluster grid
-    // scaled by the cluster dims.
-    const int gdx = gridX * cluster_x;
-    const int gdy = gridY * cluster_y;
+    const auto geometry = get_launch_geometry(cfg, Mdim, Ndim);
+    const int gdx = geometry.grid_x * geometry.cluster_x;
+    const int gdy = geometry.grid_y * geometry.cluster_y;
     const int gdz = 1;
-
-    unsigned int log2_grid_x = 0;
-    unsigned int log2_grid_y = 0;
-    for(int g = gridX; g > 1; g >>= 1)
-        log2_grid_x++;
-    for(int g = gridY; g > 1; g >>= 1)
-        log2_grid_y++;
-
-    // Persistent shader reads log2(gridX)/log2(gridY). NVFP4 ships them at
-    // dw20/21; MXFP4 has no GlobalScale so the shader reads them from the
-    // GlobalScale slots (dw18/19).
-    if(intype == "nvfp4")
+    if(cfg.ps_mode == 1)
     {
-        args.log2_grid_x = log2_grid_x;
-        args.log2_grid_y = log2_grid_y;
-    }
-    else
-    {
-        std::memcpy(&args.GlobalScaleA, &log2_grid_x, sizeof(unsigned int));
-        std::memcpy(&args.GlobalScaleB, &log2_grid_y, sizeof(unsigned int));
+        const auto log2_grid_x = aiter::f4gemm::log2_power_of_two(geometry.grid_x);
+        const auto log2_grid_y = aiter::f4gemm::log2_power_of_two(geometry.grid_y);
+        // MXFP4 overlays the persistent grid on the unused GlobalScale slots.
+        if(intype == "nvfp4")
+        {
+            args.log2_grid_x = log2_grid_x;
+            args.log2_grid_y = log2_grid_y;
+        }
+        else
+        {
+            std::memcpy(&args.GlobalScaleA, &log2_grid_x, sizeof(unsigned int));
+            std::memcpy(&args.GlobalScaleB, &log2_grid_y, sizeof(unsigned int));
+        }
     }
 
     // fp8 output E8M0 scale pointer (set after the persistent block so the log2
@@ -353,7 +470,8 @@ static void f4gemm_launch(aiter_tensor_t* A,
     const int bdx = 128; // 4 wave * 32 thread on gfx1250
 
     impl_ptr->launch_kernel(
-        {&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, stream, cluster_x, cluster_y, 1});
+        {&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, stream,
+         geometry.cluster_x, geometry.cluster_y, 1});
 }
 
 AITER_CTYPES_ERROR_DEF

@@ -84,7 +84,9 @@ def test_exact_sigmoid_topk_matches_torch(
         device="cuda",
     )
     logits = backing[:, 7 : 7 + experts]
-    bias = (torch.randn(experts, device="cuda") * 0.1).to(torch.bfloat16)
+    bias = (torch.randn(experts, device="cuda", dtype=torch.float32) * 0.1).to(
+        torch.bfloat16
+    )
 
     if case == "ties":
         logits.zero_()
@@ -105,6 +107,7 @@ def test_exact_sigmoid_topk_matches_torch(
             20,
             experts // 4,
             device="cuda",
+            dtype=torch.float32,
         )
 
     expected_weights, expected_ids = _torch_reference(

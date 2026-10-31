@@ -22,7 +22,7 @@ _MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 def _e2m1(x):
     """fp32 -> e2m1 code: nearest magnitude, ties to the even code, saturating;
     the sign bit is x's, so -0.0 packs as 8."""
-    mag = torch.tensor(_MAG, device=x.device)
+    mag = torch.tensor(_MAG, device=x.device, dtype=torch.float32)
     d = (x.abs().unsqueeze(-1) - mag).abs()
     ties = d == d.min(dim=-1, keepdim=True).values
     codes = torch.arange(8, device=x.device)
@@ -43,7 +43,7 @@ def _quantize(x):
 
 def _dequantize(packed, e8m0):
     *prefix, dh = packed.shape
-    grid = torch.tensor(_MAG, device=packed.device)
+    grid = torch.tensor(_MAG, device=packed.device, dtype=torch.float32)
     grid = torch.cat([grid, -grid])
     nib = torch.stack([packed & 0xF, packed >> 4], dim=-1).reshape(*prefix, dh * 2)
     vals = grid[nib.long()].reshape(*prefix, -1, SCALE_GROUP)
@@ -59,7 +59,9 @@ def _rope_gptj(x, cos, sin):
 
 
 def _cos_sin(max_pos):
-    angle = torch.rand(max_pos, ROPE_DIM // 2, device="cuda") * 6.28
+    angle = (
+        torch.rand(max_pos, ROPE_DIM // 2, device="cuda", dtype=torch.float32) * 6.28
+    )
     return torch.cat([angle.cos(), angle.sin()], dim=-1)
 
 
@@ -112,7 +114,9 @@ def _k_case(num_tokens, page_size, ratio):
         "k": torch.randn(num_tokens, HEAD_SIZE, device="cuda", dtype=torch.bfloat16),
         "positions": torch.randint(0, 4096, (num_tokens,), device="cuda"),
         "slots": slots,
-        "w": (1 + 0.1 * torch.randn(HEAD_SIZE, device="cuda")).bfloat16(),
+        "w": (
+            1 + 0.1 * torch.randn(HEAD_SIZE, device="cuda", dtype=torch.float32)
+        ).bfloat16(),
         "cos_sin": _cos_sin(4096),
         "num_pages": num_pages,
         "ratio": ratio,
@@ -218,7 +222,9 @@ def test_k_cache_rejects_a_pattern_that_does_not_tile(shuffle):
 def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
     torch.manual_seed(0)
     t, h = num_tokens, num_heads
-    q = (torch.randn(t, h + 3, HEAD_SIZE, device="cuda") * 3).bfloat16()
+    q = (
+        torch.randn(t, h + 3, HEAD_SIZE, device="cuda", dtype=torch.float32) * 3
+    ).bfloat16()
     q = q[:, :h]
     positions = torch.randint(0, 4096, (t,), device="cuda")
     cos_sin = _cos_sin(4096)
@@ -281,7 +287,7 @@ def test_round_trip_through_logits(page_size):
         batch * next_n, num_heads, HEAD_SIZE, device="cuda", dtype=torch.bfloat16
     )
     q_pos = (ctx - next_n + torch.arange(next_n, device="cuda")).repeat(batch)
-    weights = torch.randn(batch * next_n, num_heads, device="cuda")
+    weights = torch.randn(batch * next_n, num_heads, device="cuda", dtype=torch.float32)
     q_packed, q_scale, w_out = q_rope_mxfp4_quant(q, q_pos, cos_sin, weights)
     ctx_lens = torch.full((batch,), ctx, dtype=torch.int32, device="cuda")
     logits = paged_mxfp4_mqa_logits(

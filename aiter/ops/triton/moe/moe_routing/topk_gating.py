@@ -18,8 +18,10 @@ def exact_sigmoid_biased_topk(
     topk_ids: torch.Tensor,
     need_renorm: bool,
     routed_scaling_factor: float,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None:
-    """Write the gfx1250 HIP-compatible result into caller-owned buffers."""
+    """Write the gfx1250 HIP-compatible result into caller-owned buffers.
+    Rows at or past `num_valid_rows` get ids -1 and weights 0."""
     num_experts = gating_output.shape[1]
     topk = topk_ids.shape[1]
     _exact_sigmoid_biased_topk[(gating_output.shape[0],)](
@@ -27,6 +29,7 @@ def exact_sigmoid_biased_topk(
         correction_bias,
         topk_weights,
         topk_ids,
+        num_valid_rows,
         gating_output.stride(0),
         topk_weights.stride(0),
         topk_ids.stride(0),
@@ -36,5 +39,6 @@ def exact_sigmoid_biased_topk(
         TOPK=topk,
         BLOCK_N=triton.next_power_of_2(num_experts),
         NEED_RENORM=need_renorm,
+        HAS_NUM_VALID_ROWS=num_valid_rows is not None,
         num_warps=4,
     )

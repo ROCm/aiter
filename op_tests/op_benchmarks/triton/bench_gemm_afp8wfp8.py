@@ -4,11 +4,12 @@
 """Benchmark compact-scale FP8 GEMM and its preshuffled weight path.
 
 For the PR group32 sweep, use --shape-set group32 --x-scale-group-size 32
---w-scale-group-size 32 32 --no-transpose-x-scale --cudagraph.
+--w-scale-group-size 32 32 --no-transpose-x-scale.
 Use --test to validate an FP64 reference before timing each shape.
 """
 
 import csv
+import functools
 import math
 import warnings
 from pathlib import Path
@@ -24,10 +25,14 @@ from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
@@ -41,8 +46,8 @@ DTYPE_MAP = {
 
 
 def generate_inputs(M, N, K, preshuffle, a_group, w_group, transpose):
-    x = torch.randn((M, K), device="cuda").to(torch.float8_e4m3fn)
-    w = torch.randn((N, K), device="cuda").to(torch.float8_e4m3fn)
+    x = torch.randn((M, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    w = torch.randn((N, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
     xs = torch.randint(125, 130, (M, K // a_group), dtype=torch.uint8, device="cuda")
     ws = torch.randint(
         125,
@@ -56,7 +61,17 @@ def generate_inputs(M, N, K, preshuffle, a_group, w_group, transpose):
     return x, w, wk, xs, xsk, ws
 
 
+def _generate_bench_inputs(M, N, K, preshuffle, a_group, w_group, transpose, dtype):
+    x, w, w_kernel, xs, x_scales_kernel, w_scales = generate_inputs(
+        M, N, K, preshuffle, a_group, w_group, transpose
+    )
+    y = torch.empty((M, N), dtype=dtype, device=x.device)
+    return x, w, w_kernel, xs, x_scales_kernel, w_scales, y
+
+
 def bench_gemm_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
     M: int,
     N: int,
     K: int,
@@ -66,7 +81,6 @@ def bench_gemm_fn(
     backend: str | None,
     x_scale_group_size: int,
     transpose_x_scale: bool,
-    cudagraph: bool = False,
     w_scale_group_size: tuple[int, int] = (128, 128),
     test: bool = False,
 ):
@@ -78,44 +92,44 @@ def bench_gemm_fn(
         return float("nan")
 
     torch.manual_seed(0)
-    x, w, w_kernel, xs, x_scales_kernel, w_scales = generate_inputs(
-        M, N, K, preshuffle, x_scale_group_size, w_scale_group_size, transpose_x_scale
-    )
-    y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    # flops
-    flops = 2.0 * M * N * K
-    # memory transfer
-    mem_read = x.numel() * x.element_size() + w_kernel.numel() * w_kernel.element_size()
-    mem_read += (
-        x_scales_kernel.numel() * x_scales_kernel.element_size()
-        + w_scales.numel() * w_scales.element_size()
-    )
-    mem_write = y.numel() * y.element_size()
-    mem = mem_read + mem_write
-
+    # weight kwarg name differs between kernels: "w" (plain) vs "w_shuffled" (preshuffle)
+    w_key = "w_shuffled" if preshuffle else "w"
     kwargs = {
         "dtype": dtype,
-        "y": y,
         "x_scale_group_size": x_scale_group_size,
         "is_x_scale_transposed": transpose_x_scale,
     }
     if preshuffle:
-        fn = lambda: gemm_afp8wfp8_preshuffle(
-            x, w_kernel, x_scales_kernel, w_scales, backend=backend, **kwargs
+        kernel_fn = functools.partial(
+            gemm_afp8wfp8_preshuffle, backend=backend, **kwargs
         )
     else:
         # Only the preshuffle wrapper has a gluon backend.
-        fn = lambda: gemm_afp8wfp8(
-            x,
-            w_kernel,
-            x_scales_kernel,
-            w_scales,
-            w_scale_group_size=w_scale_group_size,
-            **kwargs,
+        kernel_fn = functools.partial(
+            gemm_afp8wfp8, w_scale_group_size=w_scale_group_size, **kwargs
         )
 
     if test:
+        x, w, w_kernel, xs, x_scales_kernel, w_scales, y_ref = _generate_bench_inputs(
+            M,
+            N,
+            K,
+            preshuffle,
+            x_scale_group_size,
+            w_scale_group_size,
+            transpose_x_scale,
+            dtype,
+        )
+        out = kernel_fn(
+            **{
+                "x": x,
+                w_key: w_kernel,
+                "x_scales": x_scales_kernel,
+                "w_scales": w_scales,
+                "y": y_ref,
+            }
+        )
         a = x.double() * torch.exp2(xs.double() - 127).repeat_interleave(
             x_scale_group_size, 1
         )
@@ -124,7 +138,7 @@ def bench_gemm_fn(
         )[:N].repeat_interleave(group_k, 1)
         expected = a @ b.T
         torch.testing.assert_close(
-            fn(),
+            out,
             expected.to(dtype),
             rtol={torch.bfloat16: 0.016, torch.float16: 0.002, torch.float32: 3e-5}[
                 dtype
@@ -132,11 +146,42 @@ def bench_gemm_fn(
             atol=5e-5 * expected.abs().max().item(),
         )
 
-    bench_fn = (
-        triton.testing.do_bench_cudagraph if cudagraph else triton.testing.do_bench
+    _p_gen = functools.partial(
+        _generate_bench_inputs,
+        M,
+        N,
+        K,
+        preshuffle,
+        x_scale_group_size,
+        w_scale_group_size,
+        transpose_x_scale,
+        dtype,
     )
-    bench_kwargs = {"rep": 100} if cudagraph else {"warmup": 25, "rep": 100}
-    ms = bench_fn(fn, **bench_kwargs)
+    # (x, w, w_kernel, xs, x_scales_kernel, w_scales, y); drop the raw/untransposed
+    # tensors only needed for the --test reference check above
+    _out_vals_keys = ["x", "_", w_key, "_", "x_scales", "w_scales", "y"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], **kwargs_rot_bufs
+    )
+
+    # flops
+    flops = 2.0 * M * N * K
+    # memory transfer. x/w are e4m3 (one byte each, unpacked; preshuffle is a
+    # layout permutation and doesn't change the byte count). The scale tensors
+    # keep their own numel (one scale per group of K-elements, which doesn't
+    # reduce to a clean M/N/K product).
+    mem_read = (M * K) * rot_bufs[0]["x"].element_size() + (N * K) * rot_bufs[0][
+        w_key
+    ].element_size()
+    mem_read += (
+        rot_bufs[0]["x_scales"].numel() * rot_bufs[0]["x_scales"].element_size()
+        + rot_bufs[0]["w_scales"].numel() * rot_bufs[0]["w_scales"].element_size()
+    )
+    mem_write = (M * N) * rot_bufs[0]["y"].element_size()
+    mem = mem_read + mem_write
+
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -158,7 +203,6 @@ def _bench_args(args):
         "backend": args.backend,
         "x_scale_group_size": args.x_scale_group_size,
         "transpose_x_scale": args.transpose_x_scale,
-        "cudagraph": args.cudagraph,
         "w_scale_group_size": tuple(args.w_scale_group_size),
         "test": args.test,
     }
@@ -191,6 +235,9 @@ def run_benchmark(args, defaults):
 def run_model_benchmark(args):
     benchmark = get_model_benchmark_object("GEMM AFP8 x WFP8 Benchmark", args)
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp8wfp8(
         M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
@@ -207,13 +254,18 @@ def run_model_benchmark(args):
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(M, N, K, metric, **_bench_args(args))
+        return bench_gemm_fn(
+            kwargs_rot_bufs, kwargs_do_bench_graph, M, N, K, metric, **_bench_args(args)
+        )
 
     bench_gemm_afp8wfp8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object("GEMM AFP8 x WFP8 Benchmark", args)
+
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     if args.shape_set == "group32":
         shape_file = (
@@ -233,7 +285,9 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp8wfp8(M, N, K, metric, model_name=None, **kwargs):
-        return bench_gemm_fn(M, N, K, metric, **_bench_args(args))
+        return bench_gemm_fn(
+            kwargs_rot_bufs, kwargs_do_bench_graph, M, N, K, metric, **_bench_args(args)
+        )
 
     bench_gemm_afp8wfp8.run(save_path="." if args.o else None, print_data=True)
 
@@ -247,13 +301,6 @@ def parse_args(args: list[str] | None = None):
         action="store_true",
         dest="preshuffle",
         help="Preshuffle the weight (layout=(16, 16)) and use gemm_afp8wfp8_preshuffle.",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["triton", "gluon"],
-        default=None,
-        help="Backend for the preshuffle kernel. Default auto-detects (gluon on gfx1250, else triton). Ignored without --shuffle.",
     )
     parser.add_argument(
         "--dtype",
@@ -278,12 +325,6 @@ def parse_args(args: list[str] | None = None):
         help="Hand the kernel row-major activation scales. Default is the column-major layout per_group_quant_hip(transpose_scale=True) emits.",
     )
     parser.set_defaults(transpose_x_scale=True)
-    parser.add_argument(
-        "--cudagraph",
-        action="store_true",
-        default=False,
-        help="Use do_bench_cudagraph instead of do_bench to reduce CPU overhead for bandwidth-bound kernels.",
-    )
     parser.add_argument(
         "--w-scale-group-size",
         "--w_scale_group_size",

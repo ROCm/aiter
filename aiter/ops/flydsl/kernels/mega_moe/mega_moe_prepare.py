@@ -119,9 +119,9 @@ def compile_mega_moe_prepare(
         generation = ticket64 // fx.Int64(launch_grid)
         ticket = fx.Int32(ticket64 - generation * fx.Int64(launch_grid))
         gate_epoch = fx.Int32(generation + fx.Int64(1))
-        owner = ticket == fx.Int32(0)
-        producer = (ticket > fx.Int32(0)) & (ticket <= fx.Int32(prepare_blocks))
-        producer_slot = ticket - fx.Int32(1)
+        owner = ticket == 0
+        producer = (ticket > 0) & (ticket <= fx.Int32(prepare_blocks))
+        producer_slot = ticket - 1
         quant_producer = ticket > fx.Int32(prepare_blocks)
         quant_slot = ticket - fx.Int32(prepare_blocks + 1)
 

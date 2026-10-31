@@ -4,16 +4,18 @@
 
 Usage:
     python bench_moe_wgrad.py
-    python bench_moe_wgrad.py -metric bandwidth
+    python bench_moe_wgrad.py --metric bandwidth
 """
-
-import argparse
 
 import torch
 import triton
 
 from aiter.ops.moe_op import moe_align_block_size
 from aiter.ops.triton.moe.moe_wgrad import moe_wgrad
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 # (num_tokens, E, N, K, top_k, label)
@@ -29,7 +31,7 @@ def _setup(num_tokens, E, N, K, top_k, device="cuda"):
     torch.manual_seed(0)
     grad = torch.randn(num_tokens, N, dtype=torch.bfloat16, device=device) * 0.1
     inp = torch.randn(num_tokens, K, dtype=torch.bfloat16, device=device) * 0.1
-    scores = torch.randn(num_tokens, E, device=device)
+    scores = torch.randn(num_tokens, E, dtype=torch.float32, device=device)
     topk_ids = scores.topk(top_k, dim=1).indices  # [num_tokens, top_k]
 
     # moe_align_block_size requires pre-allocated output buffers.
@@ -87,13 +89,9 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark moe_wgrad", allow_abbrev=False)
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
+    parser = get_parser(kernel_name="moe_wgrad")
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()

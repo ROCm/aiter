@@ -11,9 +11,12 @@ using fptr_t = int64_t;
 
 namespace aiter {
 
-fptr_t
-init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size = std::nullopt);
+fptr_t init_custom_qr(int64_t rank,
+                      int64_t world_size,
+                      std::optional<int64_t> qr_max_size = std::nullopt,
+                      std::optional<int64_t> quant_level = std::nullopt);
 void qr_destroy(fptr_t _fa);
+bool qr_uses_pull_q4(fptr_t _fa);
 void qr_get_handle(fptr_t _fa, int64_t out_ptr);
 void qr_open_handles(fptr_t _fa, const std::vector<int64_t>& handle_ptrs);
 void qr_all_reduce(fptr_t _fa,

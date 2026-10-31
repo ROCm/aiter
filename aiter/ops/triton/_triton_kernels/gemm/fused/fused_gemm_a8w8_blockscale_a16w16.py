@@ -210,7 +210,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 c_fp8_ptr
                 + stride_c_fp8_m * offs_cm[:, None]
                 + stride_c_fp8_n * offs_c_fp8_n[None, :]
-                + pid_k * stride_c_fp8_k
+                + pid_k.to(tl.int64) * stride_c_fp8_k
             )
             c_fp8_mask = (offs_cm[:, None] < M) & (offs_c_fp8_n[None, :] < N_fp8)
             tl.store(c_fp8_ptrs, c_fp8, mask=c_fp8_mask)
@@ -267,7 +267,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 c_bf16_ptr
                 + stride_c_bf16_m * offs_cm[:, None]
                 + stride_c_bf16_n * offs_c_bf16_n[None, :]
-                + pid_k * stride_c_bf16_k
+                + pid_k.to(tl.int64) * stride_c_bf16_k
             )
             c_bf16_mask = (offs_cm[:, None] < M) & (offs_c_bf16_n[None, :] < N_bf16)
             tl.store(c_bf16_ptrs, c_bf16, mask=c_bf16_mask)
@@ -343,7 +343,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel(
         offs_fp8_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N_fp8
         c_fp8_in_ptrs = (
             c_fp8_in_ptr
-            + (offs_k[:, None, None] * stride_c_fp8_in_k)
+            + (offs_k[:, None, None].to(tl.int64) * stride_c_fp8_in_k)
             + (offs_m[None, :, None] * stride_c_fp8_in_m)
             + (offs_fp8_n[None, None, :] * stride_c_fp8_in_n)
         )
@@ -375,7 +375,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel(
         offs_bf16_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N_bf16
         c_bf16_in_ptrs = (
             c_bf16_in_ptr
-            + (offs_k[:, None, None] * stride_c_bf16_in_k)
+            + (offs_k[:, None, None].to(tl.int64) * stride_c_bf16_in_k)
             + (offs_m[None, :, None] * stride_c_bf16_in_m)
             + (offs_bf16_n[None, None, :] * stride_c_bf16_in_n)
         )

@@ -13,6 +13,7 @@ from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
+from ..tensor_shim import _run_compiled
 from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
     _i32_buffer,
@@ -322,7 +323,7 @@ def build_pa_mqa_logits_fp4_module(
             return scales
 
         def _issue_nt_mfmas(kv_list_in, kvs_scales_per_nt, nt):
-            zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            zero = fx.full(4, 0.0, fx.Float32)
             accs = [zero] * m_tiles
             for k_tile in range_constexpr(k_tiles):
                 b_frag = fx.make_rmem_tensor(4, fx.Int32)
@@ -344,7 +345,7 @@ def build_pa_mqa_logits_fp4_module(
             return accs
 
         def _post_process_nt(accs, nt, c_i32_arg):
-            zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            zero = fx.full(4, 0.0, fx.Float32)
             ni_warp = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
             token_base = (chunk_start + c_i32_arg) * fx.Int32(
                 block_k
@@ -360,7 +361,7 @@ def build_pa_mqa_logits_fp4_module(
             lane_i32 = fx.Int32(lane_id)
 
             def _bperm_xor_add(val, sh):
-                peer_byte = (lane_i32 ^ fx.Int32(sh)) * fx.Int32(4)
+                peer_byte = (lane_i32 ^ fx.Int32(sh)) * 4
                 peer_i32 = fx.Int32(
                     rocdl.ds_bpermute(T.i32, peer_byte, val.bitcast(fx.Int32))
                 )
@@ -446,8 +447,8 @@ def build_pa_mqa_logits_fp4_module(
                 for mi in range(m_tiles)
             ]
             c_idx_i32 = fx.Int32(c_idx)
-            c_next_i32 = c_idx_i32 + fx.Int32(1)
-            c_next_next_i32 = c_next_i32 + fx.Int32(1)
+            c_next_i32 = c_idx_i32 + 1
+            c_next_next_i32 = c_next_i32 + 1
 
             # Compute current chunk using pre-issued nt=0.
             _compute_chunk(
@@ -669,12 +670,13 @@ def flydsl_pa_mqa_logits_fp4(
     if stream is None:
         stream = torch.cuda.current_stream()
 
-    launcher(
+    _run_compiled(
+        launcher,
         out,
         q_fp4,
         q_scale,
-        kv_cache,
-        kv_scale,
+        kv_cache.view(-1),
+        kv_scale.view(-1),
         block_tables,
         weights,
         cta_info,

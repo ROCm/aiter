@@ -359,8 +359,8 @@ def _build_compress_forward_kernel(
                 ape_row = fx.Int32((fx.Uint32(k_i32) % ratio).ir_value())
                 in_row_raw = fx.Int32(ragged_id) - (fx.Int32(K - 1) - k)
                 in_row = fx.max(in_row_raw, fx.Int32(0))
-                base_in_off = in_row * fx.Int32(kv_in_row_stride) + col_off_base
-                base_sc_off = in_row * fx.Int32(score_in_row_stride) + col_off_base
+                base_in_off = in_row * kv_in_row_stride + col_off_base
+                base_sc_off = in_row * score_in_row_stride + col_off_base
                 base_ape_off = ape_row * DIM_FULL + col_off_base
                 kv = _load_bf16_vec_to_f32(kv_in_rsrc, base_in_off)
                 sc = _load_bf16_vec_to_f32(score_in_rsrc, base_sc_off)
@@ -380,8 +380,8 @@ def _build_compress_forward_kernel(
                 s_safe = is_pad_b.select(fx.Int32(0), s)
                 ring = fx.Int32((fx.Uint32(s_safe.ir_value()) % state_size).ir_value())
                 # Slot term already folded into the descriptor base.
-                base_kv_off = ring * fx.Int32(kv_state_pos_stride) + col_off_base
-                base_sc_off = ring * fx.Int32(score_state_pos_stride) + col_off_base
+                base_kv_off = ring * kv_state_pos_stride + col_off_base
+                base_sc_off = ring * score_state_pos_stride + col_off_base
                 kv_state_rsrc, score_state_rsrc = _state_rsrcs()
                 kv_list = _load_f32_vec(kv_state_rsrc, base_kv_off)
                 sc_list = _load_f32_vec(score_state_rsrc, base_sc_off)
@@ -561,9 +561,7 @@ def _build_compress_forward_kernel(
                 out_rsrc = buffer_ops.create_buffer_resource(
                     kv_compressed, max_size=True
                 )
-                out_off = (
-                    fx.Int32(pid) * fx.Int32(kv_compressed_row_stride) + col_off_base
-                )
+                out_off = fx.Int32(pid) * kv_compressed_row_stride + col_off_base
                 # When fused, a sibling block reads this slice back, so it has
                 # to reach L2 (the device coherence point) rather than sit in
                 # this CU's caches, which is where a default-scope store may
@@ -688,10 +686,7 @@ def _build_compress_forward_kernel(
                     row_rsrc = buffer_ops.create_buffer_resource(
                         kv_compressed, max_size=True
                     )
-                    row_off = (
-                        fx.Int32(pid) * fx.Int32(kv_compressed_row_stride)
-                        + lid * VEC_EPI
-                    )
+                    row_off = fx.Int32(pid) * kv_compressed_row_stride + lid * VEC_EPI
                     row = []
                     for q in range_constexpr(VEC_EPI // 4):
                         r = fx.Vector(
@@ -1244,7 +1239,7 @@ def _build_norm_rope_scatter_kernel(
         # Sentinel rows then read a scratch row that is always allocated
         # (kv_compressed is [plan_capacity, D]) and still write nothing.
         kvc_rsrc = buffer_ops.create_buffer_resource(kv_compressed, max_size=True)
-        base_off = fx.Int32(pid) * fx.Int32(kv_compressed_row_stride) + tid_x_vec
+        base_off = fx.Int32(pid) * kv_compressed_row_stride + tid_x_vec
         # VEC ? {2, 4, 8, 16}: VEC <= 4 -> single dwordx{VEC}; VEC>4 -> Nx dwordx4.
         # comp_lane held as raw f32 ir.Values for the explicit-fastmath layer.
         if const_expr(VEC <= 4):

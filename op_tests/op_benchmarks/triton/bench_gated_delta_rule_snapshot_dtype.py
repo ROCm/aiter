@@ -12,8 +12,6 @@ The persistent initial/final state remains FP32 in both runs so the reported
 difference isolates the temporary chunk-snapshot policy.
 """
 
-import argparse
-
 import torch
 import triton
 
@@ -23,6 +21,7 @@ from aiter.ops.chunk_gated_delta_rule_fwd_h import (
 from aiter.ops.triton._triton_kernels.gated_delta_net.prefill import (
     chunk_fwd_o_opt_vk,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -146,9 +145,7 @@ def benchmark_snapshot_dtype(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Benchmark BF16/FP32 GDN chunk snapshot producer and consumer."
-    )
+    parser = get_parser(kernel_name="Gated Delta Rule Snapshot Dtype")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=8192)
     parser.add_argument("--num-heads", type=int, default=16)

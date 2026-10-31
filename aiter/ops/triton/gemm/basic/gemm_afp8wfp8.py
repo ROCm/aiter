@@ -18,6 +18,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.gemm_config_utils import clamp_num_buffers
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
 
@@ -488,11 +489,10 @@ def gemm_afp8wfp8_preshuffle(
             kernel_type,
         )
 
-        # Shape-derived clamp, not a tuning default: the pipeline computes
-        # NUM_BUFFERS - 1 tiles outside the main loop, so the depth cannot
-        # exceed the K-tile count of a single split.
+        # The pipeline computes NUM_BUFFERS - 1 tiles outside the main loop. It
+        # uses at least 2 buffers.
         num_k_iter = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
-        num_buffers = max(2, min(config["NUM_BUFFERS"], num_k_iter + 1))
+        num_buffers = max(2, clamp_num_buffers(config["NUM_BUFFERS"], num_k_iter))
 
         # warp_bases mirrors the a8w8 blockscale gluon wrapper: warp 0 walks N,
         # the remaining log2(num_warps // 2) warps walk M.

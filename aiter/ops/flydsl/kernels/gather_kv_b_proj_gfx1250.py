@@ -191,9 +191,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
                 fx.make_layout(ARENA_B, 1),
             )
         )
-        index_rsrc = ptr_rsrc(
-            arg_indices, num_records_bytes=fx.Int64(i32_m) * fx.Int64(4)
-        )
+        index_rsrc = ptr_rsrc(arg_indices, num_records_bytes=fx.Int64(i32_m) * 4)
 
         zero_indices = [fx.Int32(0) for _ in range_constexpr(A_GATHER_ROWS)]
         gather_template = make_tensor_gather_descriptor(
@@ -220,23 +218,22 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
         B_ROWS_PER_WAVE = B_OUTER // num_waves
         b_wave_row = wave * B_ROWS_PER_WAVE
         b_off0 = blk_n64 // 16 * (k64 * 16)
+        B_TILE = (B_ROWS_PER_WAVE, tile_k * 16)
         gB = _gv(
             gB_base,
             b_off0 + fx.Int64(b_wave_row) * (k64 * 16),
-            (B_ROWS_PER_WAVE, tile_k * 16),
-            (tile_k * 16, 1),
+            (B_ROWS_PER_WAVE, K_TILES * tile_k * 16),
+            (k64 * 16, 1),
         )
-        atomB = fx.atom_set_value(
-            fx.rocdl.make_tdm_atom(
-                gB,
-                [None, None],
-                strides=[k64 * 16, None],
-                num_warps=1,
-                early_timeout=True,
-            ),
-            "workgroup_mask",
-            b_mask,
+        atomB, coordB = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
+            gB,
+            fx.make_layout(B_TILE, (B_LDS_ROW, 1)),
+            B_TILE,
+            num_warps=1,
         )
+        atomB = fx.atom_set_value(atomB, "workgroup_mask", b_mask)
+        blkB = fx.zipped_divide(coordB, B_TILE)[None, (0, None)]
 
         def _gather_indices(group):
             local_base = group * num_waves * A_GATHER_ROWS + wave * A_GATHER_ROWS
@@ -282,16 +279,15 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
                         dgroup3=desc.dgroup3,
                     )
                 )
-            fx.copy(
-                atomB,
-                gB,
-                _lv(
-                    fx.add_offset(pa, STAGE_A + b_wave_row * B_LDS_ROW),
-                    (B_ROWS_PER_WAVE, tile_k * 16),
-                    (B_LDS_ROW, 1),
-                ),
-                imm_offset=ktg * (tile_k * 16),
+            b_box = _lv(
+                fx.add_offset(pa, STAGE_A + b_wave_row * B_LDS_ROW),
+                (B_TILE, 1),
+                ((B_LDS_ROW, 1), B_ROWS_PER_WAVE * B_LDS_ROW),
             )
+            tBs, tBg = fx.rocdl.cdna5.tdm_partition(
+                atomB, 0, fx.make_layout(1, 1), b_box, blkB
+            )
+            fx.copy(atomB, tBg[None, fx.Int32(kt)], tBs[None, 0])
             rocdl.sched_barrier(0)
 
         wmb = wave_m * warp_tile_m
@@ -330,7 +326,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
         )
         c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
         for cf in c_frags:
-            cf.store(Vec.filled(8, 0.0, fx.Float32))
+            cf.store(fx.full(8, 0.0, fx.Float32))
 
         def _rmem(n, v):
             t = fx.make_rmem_tensor(n, fx.Int32)
@@ -422,7 +418,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
                 sb_r[wn][0].load().shuffle(sb_r[wn][1].load(), list(range(8)))
                 for wn in range_constexpr(wmma_n_rep)
             ]
-            sa = Vec.filled(8, activation_scale, fx.Float32)
+            sa = fx.full(8, activation_scale, fx.Float32)
             for wm in range_constexpr(wmma_m_rep):
                 for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
@@ -538,7 +534,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
 
         head = bid_y
         lds_base = _bidx(base_ptr)
-        rope_scale = Vec.filled(8, activation_scale, fx.Float32)
+        rope_scale = fx.full(8, activation_scale, fx.Float32)
         rope_lanes_per_row = _ROPE_WIDTH // 8
         rope_rows_per_wave = WAVE // rope_lanes_per_row
         rope_row_in_wave = lane // rope_lanes_per_row

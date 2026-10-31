@@ -58,8 +58,8 @@ MAX_POS = 65536
 
 # The kernel seeds each group's amax with this floor so an all-zero group cannot
 # produce a zero scale (graph warmup, padded rows). Mirrors
-# kFp8QuantAbsmaxFloorF32 in csrc/kernels/inverse_rope_group_quant.cu.
-AMAX_FLOOR = 1e-8
+# aiter::kAmaxFloor in csrc/include/quant_amax_floor.h.
+AMAX_FLOOR = 1e-10
 
 # One row of the perf table: `once` is called for the correctness check, `bench`
 # is the timed call, `ref` is the (dq, scale_byte) reference it is checked

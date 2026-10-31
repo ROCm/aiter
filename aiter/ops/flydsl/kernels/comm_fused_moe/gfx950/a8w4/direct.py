@@ -77,12 +77,10 @@ def compile_reduce_scatter_add(config: DirectConfig):
         epoch = storage.epoch.peek().view(fx.make_layout(1, 1))
         arrival = storage.arrival.peek().view(fx.make_layout(1, 1))
         ready_epoch_address = local_base + fx.Int64(config.ready_offset)
-        ready_gate_address = ready_epoch_address + fx.Int64(4)
-        ready_arrival_address = ready_gate_address + fx.Int64(4)
-        if tid == fx.Int32(0):
-            epoch[0] = fx.Int32(
-                comm_ops.load_i32_global_agent(ready_gate_address)
-            ) + fx.Int32(1)
+        ready_gate_address = ready_epoch_address + 4
+        ready_arrival_address = ready_gate_address + 4
+        if tid == 0:
+            epoch[0] = fx.Int32(comm_ops.load_i32_global_agent(ready_gate_address)) + 1
         gpu.barrier()
         expected = epoch[0]
 
@@ -92,13 +90,13 @@ def compile_reduce_scatter_add(config: DirectConfig):
         # gate.  Elect the last locally arriving CTA so every CTA snapshots the
         # old gate before it can advance; otherwise a late-starting CTA could
         # mistake the new gate value for the previous epoch and wait forever.
-        if tid == fx.Int32(0):
+        if tid == 0:
             arrival[0] = fx.Int32(
                 comm_ops.atomic_add_agent_one_as(ready_arrival_address, fx.Int32(1))
             )
         gpu.barrier()
         if arrival[0] == fx.Int32(grid - 1):
-            if tid == fx.Int32(0):
+            if tid == 0:
                 comm_ops.fence_agent_acquire()
                 comm_ops.store_i32_global_agent_release(
                     ready_arrival_address, fx.Int32(0)
@@ -112,11 +110,11 @@ def compile_reduce_scatter_add(config: DirectConfig):
                     acquire=True,
                 )
             gpu.barrier()
-            if tid == fx.Int32(0):
+            if tid == 0:
                 comm_ops.fence_system_acquire()
                 comm_ops.store_i32_global_agent_release(ready_gate_address, expected)
 
-        if tid == fx.Int32(0):
+        if tid == 0:
             spin_until_epoch_i32_agent(ready_gate_address, expected)
             comm_ops.fence_agent_acquire()
         gpu.barrier()

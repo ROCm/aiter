@@ -197,7 +197,9 @@
     "any": {
       "num_stages": 1,
       "waves_per_eu": 2,
-      "num_warps": 2
+      "num_warps": 1,
+      "SEGMENT_BLOCK": 64,
+      "BLOCK_D": 64
     }
   },
   "kv_split": {
