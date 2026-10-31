@@ -29,6 +29,7 @@ import os
 import sys
 import tempfile
 import textwrap
+from unittest.mock import patch
 
 # Ensure the repo-local aiter is imported, not any system/site-packages install.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +41,7 @@ from build_targets import (
     GFX_CU_NUM_MAP,
     filter_tune_df,
     get_build_targets_env,
+    target_num_xcds,
 )
 
 REPRO_CSV = os.path.join(
@@ -939,6 +941,26 @@ def test_build_tune_dict_strict_unknown_kernel():
             del os.environ["CU_NUM"]
 
 
+def test_target_num_xcds():
+    _section("8. target_num_xcds() — die count per SKU")
+    for cu_override in ("128", "256"):
+        with patch.dict(os.environ, GPU_ARCHS="gfx950", CU_NUM=cu_override):
+            for gfx, cu_num, expected in [
+                ("gfx950", 128, 4),
+                ("gfx950", 256, 8),
+                ("gfx942", 80, 4),
+                ("gfx942", 228, 6),
+                ("gfx942", 304, 8),
+                ("gfx1250", 256, 8),
+            ]:
+                actual = target_num_xcds(gfx, cu_num)
+                _check(
+                    f"{gfx}/{cu_num} has {expected} XCDs with CU_NUM={cu_override}",
+                    actual == expected,
+                    f"got {actual}",
+                )
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -962,6 +984,7 @@ if __name__ == "__main__":
     test_runtime_dispatch_key()
     test_blockscale_kernel_name_forwarding()
     test_build_tune_dict_strict_unknown_kernel()
+    test_target_num_xcds()
 
     print(f"\n{'='*60}")
     print(f"  Results: {_passed} passed, {_failed} failed")
