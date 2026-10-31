@@ -191,6 +191,7 @@ def launch_gemm_a8w4_tdm(
     a_preshuffled: Constexpr[int] = 0,
     split_k: Constexpr[int] = 1,
     arg_splitk_ws: fx.Tensor = None,
+    k_waves: Constexpr[int] = 1,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -275,6 +276,19 @@ def launch_gemm_a8w4_tdm(
         if enable_ep_scatter or tdm_as_in_prologue:
             raise ValueError("split_k does not support EP scatter or the As prologue")
         K_TILES = K_TILES // split_k
+    # Intra-workgroup split-K: k_waves wave groups of m_warp x n_warp waves each
+    # run the whole pipeline on their own contiguous K slice and LDS arena, then
+    # reduce their accumulators through LDS. Unlike split_k it adds waves, not
+    # workgroups, so a decode tile's serial K loop shortens without a global
+    # store -> atomic -> load round trip.
+    if k_waves > 1:
+        if K_TILES % k_waves or K % tile_k:
+            raise ValueError(f"k_waves={k_waves} must divide K tiles of K={K}/{tile_k}")
+        if split_k > 1 or persistent_workers or cluster_m > 1 or cluster_n > 1:
+            raise ValueError("k_waves needs a plain (unsplit, non-persistent, unclustered) grid")
+        if enable_ep_scatter or tdm_as_in_prologue:
+            raise ValueError("k_waves does not support EP scatter or the As prologue")
+        K_TILES = K_TILES // k_waves
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
@@ -332,6 +346,7 @@ def launch_gemm_a8w4_tdm(
         persistent_workers,
         rolled_drain,
         split_k,
+        k_waves,
         PSUM_LOOKUP,
     )
     _ = cache_tag
@@ -365,7 +380,7 @@ def launch_gemm_a8w4_tdm(
     n_acc = wmma_m_rep * wmma_n_rep
     output_n_rep = warp_tile_n // 16
     num_waves = m_warp * n_warp
-    block = num_waves * WAVE
+    block = num_waves * k_waves * WAVE
     SCATTER_GROUP_ROWS = 8
     SCATTER_PASSES_PER_VECTOR = WAVE // SCATTER_GROUP_ROWS
     scatter_groups = (tile_m + SCATTER_GROUP_ROWS - 1) // SCATTER_GROUP_ROWS
@@ -459,6 +474,13 @@ def launch_gemm_a8w4_tdm(
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    # Each k_waves group gets its own arena, which also holds its partial
+    # accumulators (one f32 dword4 per lane per chunk) for the final reduction.
+    K_PARTIAL_B = (
+        ((tile_m // m_warp) // 16) * ((tile_n // n_warp) // (32 if a_is_fp4 else 16))
+        * ((32 if a_is_fp4 else 16) // 2) * 4 * num_waves * WAVE
+    )
+    GROUP_ARENA_B = ceildiv(max(ARENA_B, K_PARTIAL_B), 512) * 512
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -500,6 +522,7 @@ def launch_gemm_a8w4_tdm(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _splitk = f"_sk{split_k}" if split_k > 1 else ""
+    _splitk += f"_kw{k_waves}" if k_waves > 1 else ""
     _splitk += "" if PSUM_LOOKUP else "_bisect"
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
@@ -555,6 +578,13 @@ def launch_gemm_a8w4_tdm(
             split_id = bid_x % split_k
             bid_x = bid_x // split_k
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
+        k_group = 0
+        if const_expr(k_waves > 1):
+            # Group 0 holds hardware waves 0..num_waves-1, so the group-0 epilogue
+            # sees the same wave ids as an unsplit workgroup.
+            k_group = wave // num_waves
+            wave = wave % num_waves
+            split_id = k_group
         lane = tid % WAVE
         lane16 = lane % 16
         kgrp = lane // 16
@@ -701,7 +731,20 @@ def launch_gemm_a8w4_tdm(
             if const_expr(enable_ep_scatter)
             else fx.SharedAllocator(static=True)
         )
-        base_ptr = _smem.allocate(ARENA_B)._ptr
+        base_ptr = _smem.allocate(
+            GROUP_ARENA_B * k_waves if k_waves > 1 else ARENA_B
+        )._ptr
+        if const_expr(k_waves > 1):
+            # Rebuild the pointer so the group offset keeps its 16-B alignment;
+            # plain pointer arithmetic drops it, which the bf16 epilogue rejects.
+            base_ptr = fx.inttoptr(
+                fx.PointerType.get(
+                    elem_ty=fx.Int8.ir_type,
+                    address_space=fx.AddressSpace.Shared,
+                    alignment=16,
+                ),
+                fx.Int32(fx.ptrtoint(base_ptr)) + k_group * GROUP_ARENA_B,
+            )
 
         def ptr_to_idx(p):
             return fx.Index(fx.ptrtoint(p))
@@ -834,7 +877,7 @@ def launch_gemm_a8w4_tdm(
             target_jobs=None,
             cache_modifier=0,
         ):
-            if const_expr(split_k > 1 and k_adv):
+            if const_expr((split_k > 1 or k_waves > 1) and k_adv):
                 # This split's first k-tile, in the view's element units.
                 g_off = g_off + fx.Int64(split_id * K_TILES) * fx.Int64(
                     k_adv // 4 if on_i32 else k_adv
@@ -1826,6 +1869,55 @@ def launch_gemm_a8w4_tdm(
             # mainloop body and no wave-parity branch.
             run_mainloop(bool(interleaved_lds_load_on))
 
+            if const_expr(k_waves > 1):
+                # Every group is past its last LDS input read once this fence
+                # retires, so each parks its partials in its own arena. Group 0
+                # adds them in group order (deterministic) and alone keeps the
+                # tile; the other groups blank their epilogue via mn_oob.
+                pipeline_fence(outstanding=0)
+                KW_CHUNKS = WMMA_VECTOR_DWORDS // 4
+                KW_LANES = num_waves * WAVE
+                kw_tid = tid % KW_LANES
+
+                def kw_off(idx, q):
+                    # Lane-contiguous dword4s: conflict-free b128 LDS traffic.
+                    return ((idx * KW_CHUNKS + q) * KW_LANES + kw_tid) * 16
+
+                if k_group > 0:
+                    for idx in range_constexpr(n_acc):
+                        v = Vec(c_frags[idx].load())
+                        for q in range_constexpr(KW_CHUNKS):
+                            lds_store_b128(
+                                stC_idx,
+                                kw_off(idx, q),
+                                Vec.from_elements(
+                                    [v[q * 4 + i] for i in range_constexpr(4)],
+                                    fx.Float32,
+                                )
+                                .bitcast(fx.Int32)
+                                .ir_value(),
+                            )
+                workgroup_barrier()
+                if k_group == 0:
+                    for idx in range_constexpr(n_acc):
+                        own = Vec(c_frags[idx].load())
+                        tot = []
+                        for q in range_constexpr(KW_CHUNKS):
+                            acc4 = Vec.from_elements(
+                                [own[q * 4 + i] for i in range_constexpr(4)],
+                                fx.Float32,
+                            )
+                            for g in range_constexpr(1, k_waves):
+                                part = Vec(
+                                    lds_load_b128(
+                                        stC_idx, g * GROUP_ARENA_B + kw_off(idx, q)
+                                    )
+                                ).bitcast(fx.Float32)
+                                acc4 = acc4 + part
+                            tot += [acc4[i] for i in range_constexpr(4)]
+                        c_frags[idx].store(Vec.from_elements(tot, fx.Float32).ir_value())
+                mn_oob = (k_group == 0).select(mn_oob, mn_oob * 0)
+
             if const_expr(split_k > 1):
                 # Partials keep each thread's own register layout, so the
                 # reduction is a per-thread sum with no shuffle. The last
@@ -2470,6 +2562,15 @@ def launch_gemm_a8w4_tdm(
                         issue_scatter_group(group, scatter_vector, vector_pass)
                 tdm_ops.tensor_wait(0)
             else:
+
+                def store_tile(atom, src, dst):
+                    # A k_waves workgroup's tile belongs to group 0 alone.
+                    if const_expr(k_waves > 1):
+                        if k_group == 0:
+                            fx.copy(atom, src, dst)
+                    else:
+                        fx.copy(atom, src, dst)
+
                 if const_expr(stage1_act):
                     out_divisor = 4 if is_fp4_quant else 2
                     out_stride = i32_n // out_divisor
@@ -2498,7 +2599,7 @@ def launch_gemm_a8w4_tdm(
                         (tile_m // 16, STORE_N * 16),
                         (STORE_N * 16, 1),
                     )
-                    fx.copy(atomC, src, gtC)
+                    store_tile(atomC, src, gtC)
                 else:
                     c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
                     if const_expr(STORE_PAD == 0):
@@ -2528,7 +2629,7 @@ def launch_gemm_a8w4_tdm(
                             (tile_m, STORE_PITCH),
                             (STORE_PITCH, 1),
                         )
-                    fx.copy(atomC, src, gtC)
+                    store_tile(atomC, src, gtC)
                 if const_expr(stage1_quant_out and stage1_act):
                     rocdl.s_wait_storecnt(0)
                 tdm_ops.tensor_wait(0)

@@ -663,6 +663,8 @@ def _grouped_a8w4_tdm_moe(
     persistent_workers2=0,
     split_k1=1,
     split_k2=1,
+    k_waves1=1,
+    k_waves2=1,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -1228,6 +1230,7 @@ def _grouped_a8w4_tdm_moe(
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
             split_k=split_k1,
+            k_waves=k_waves1,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1269,6 +1272,7 @@ def _grouped_a8w4_tdm_moe(
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
             split_k=split_k1,
+            k_waves=k_waves1,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1320,6 +1324,7 @@ def _grouped_a8w4_tdm_moe(
         lds_soa_load_interleave=lds_soa_load_interleave,
         rolled_drain=rolled_drain,
         split_k=split_k2,
+        k_waves=k_waves2,
         **_ep_gemm2_kwargs,
     )
 
@@ -1408,6 +1413,7 @@ def _grouped_a8w4_tdm_moe(
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
                         split_k=split_k1,
+                        k_waves=k_waves1,
                         **_situ_kw,
                     ),
                 )
@@ -1451,6 +1457,7 @@ def _grouped_a8w4_tdm_moe(
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
                         split_k=split_k1,
+                        k_waves=k_waves1,
                         **_situ_kw,
                     ),
                 )
@@ -1491,6 +1498,7 @@ def _grouped_a8w4_tdm_moe(
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
                     split_k=split_k2,
+                    k_waves=k_waves2,
                 ),
             )
         )
@@ -1801,6 +1809,8 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
             _tdm_kw["split_k1"] = _as_int(cfg_row.get("split_k1"), 1)
             _tdm_kw["split_k2"] = _as_int(cfg_row.get("split_k2"), 1)
+            _tdm_kw["k_waves1"] = _as_int(cfg_row.get("k_waves1"), 1)
+            _tdm_kw["k_waves2"] = _as_int(cfg_row.get("k_waves2"), 1)
             # Follow the matched CSV bucket, including padded token counts
             # (for example, 6144 -> 8192), just like the other kernel knobs.
             _tdm_kw["a_preshuffle"] = _as_int(cfg_row.get("a_preshuffle"), 0)

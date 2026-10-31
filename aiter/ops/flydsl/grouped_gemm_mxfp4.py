@@ -192,6 +192,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_workers=0,
     rolled_drain=0,
     split_k=1,
+    k_waves=1,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -235,7 +236,17 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     if split_k > 1 and (k_tiles % split_k or K % tile_k):
         split_k = 1
-    num_buffers = min(num_buffers, max(1, k_tiles // split_k))
+    k_waves = int(
+        os.environ.get(f"AITER_FLYDSL_K_WAVES{1 if stage1_act else 2}", k_waves)
+    )
+    if k_waves > 1 and (
+        split_k > 1
+        or k_tiles % k_waves
+        or K % tile_k
+        or stage2_scatter is not None
+    ):
+        k_waves = 1
+    num_buffers = min(num_buffers, max(1, k_tiles // split_k // k_waves))
     if bias is None:
         has_bias = 0
     elif bias.dtype in _BIAS_MODE:
@@ -280,7 +291,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_workers = (
             (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
         )
-    if split_k > 1:
+    if split_k > 1 or k_waves > 1:
         # Split-K owns the grid: no clusters, no persistent workers, no As prologue.
         cluster_n = cluster_m = 1
         persistent_workers = 0
@@ -372,6 +383,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_linear_beta),
         *layout_spec,
         splitk_ws if splitk_ws is not None else out.view(-1),
+        int(k_waves),
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -379,6 +391,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
+            int(k_waves),
         ),
     )
     return out
