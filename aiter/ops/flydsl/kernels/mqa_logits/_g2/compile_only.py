@@ -64,6 +64,25 @@ def main() -> int:
             rc = 1
             print(f"[FAILED]   {tag}: {rec['error'][:2000]}")
         out["specializations"].append(rec)
+    # round C: the bf16 WMMA kernel (the path the wrapper dispatches bf16 to)
+    rec = {"dtype": "bf16_wmma"}
+    try:
+        launcher = K._build_wmma_kernel(math.sqrt(128))
+        gx, gy = K.wmma_grid(rows, columns)
+        cf = flyc.compile(
+            launcher,
+            q, kv, pt, t2r, qp, cl, logits, vis, rst,
+            gx, gy, rows, columns, pages, reqs, width, fx.Stream(None),
+        )
+        rec["compiled"] = True
+        rec["compiled_function"] = type(cf).__name__
+        print(f"[COMPILED] bf16_wmma kernel={launcher.kernel_name}")
+    except Exception as exc:  # noqa: BLE001
+        rec["compiled"] = False
+        rec["error"] = f"{type(exc).__name__}: {exc}"[:6000]
+        rc = 1
+        print(f"[FAILED]   bf16_wmma: {rec['error'][:2000]}")
+    out["specializations"].append(rec)
     root = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "")
     hits = []
     for dp, _, fs in os.walk(root) if root else []:

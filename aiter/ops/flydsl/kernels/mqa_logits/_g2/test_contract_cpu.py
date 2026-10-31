@@ -81,8 +81,235 @@ def emulate_page4(q, cache, scale, table, t2r, qpos, ctx, max_columns=None):
     return out, vis_out
 
 
+# ---------------------------------------------------------------------------
+# Emulation of the bf16 WMMA kernel (round C), lane by lane
+# ---------------------------------------------------------------------------
+# Mirrors `_build_wmma_kernel` exactly: grid (ceil(cols/64), ceil(rows/16)),
+# 4 waves x 32 lanes, wave rows t0..t0+3, request-dedup passes, the early -inf
+# branch, per-lane byte offsets of every Q / K / page-table / metadata load
+# (bounds-checked against the plane), the gfx1250 WMMA operand layouts
+#   A/B: lane l, elem v<16 -> row l%16, k = (v//8)*16 + (l//16)*8 + v%8
+#   C/D: lane l, elem v<8  -> m = (l//16)*8 + v, n = l%16
+# and every predicated store (bounds-checked, counted: each logit and each
+# visible/row_starts entry must be written exactly once).
+WM_WAVE, WM_WAVES, WM_ROWS, WM_N, WM_K, WM_NT = 32, 4, 4, 16, 32, 4
+WM_COLS = WM_N * WM_NT
+WM_KS = HDIM // WM_K
+_LANES = torch.arange(WM_WAVE)
+_VALS = torch.arange(16)
+_A_ROW = (_LANES[:, None] % 16).expand(WM_WAVE, 16)
+_A_K = (_VALS[None, :] // 8) * 16 + (_LANES[:, None] // 16) * 8 + _VALS[None, :] % 8
+
+
+class _Plane:
+    def __init__(self, name, nbytes):
+        self.name, self.nbytes = name, nbytes
+
+    def check(self, offs, width):
+        offs = torch.as_tensor(offs, dtype=torch.int64).reshape(-1)
+        if offs.numel() == 0:
+            return
+        lo, hi = int(offs.min()), int(offs.max()) + width
+        if lo < 0 or hi > self.nbytes:
+            raise AssertionError(f"{self.name}: access [{lo}, {hi}) outside plane of {self.nbytes} B")
+        if hi > 2**31 - 1:
+            raise AssertionError(f"{self.name}: byte offset {hi} overflows int32")
+
+
+def _ld16_bf16(u8, plane, offs):
+    """[L] byte offsets -> [L, 8] f32 (one 16-byte buffer_load per lane)."""
+    plane.check(offs, 16)
+    idx = offs[:, None] + torch.arange(16)[None, :]
+    b = u8[idx].to(torch.int32)
+    bits = (b[:, 0::2] | (b[:, 1::2] << 8)) << 16
+    return bits.to(torch.int32).view(torch.float32)
+
+
+def _wm_frag(u8, plane, base):
+    """Operand fragment: 16 bytes at base and at base + 32 -> [32, 16] f32."""
+    return torch.cat([_ld16_bf16(u8, plane, base), _ld16_bf16(u8, plane, base + 32)], dim=1)
+
+
+def _wm_matrix(frag):
+    m = torch.zeros(16, WM_K, dtype=torch.float32)
+    m[_A_ROW, _A_K] = frag
+    return m
+
+
+def emulate_wmma_bf16(q, cache, table, t2r, qpos, ctx, max_columns=None):
+    """logits / visible / row_starts exactly as the WMMA kernel writes them."""
+    rows = q.shape[0]
+    num_pages = cache.shape[0]
+    num_requests, width = table.shape
+    columns = width * PAGE if max_columns is None else max(1, min(width * PAGE, int(max_columns)))
+    q_u8 = q.contiguous().view(torch.uint8).reshape(-1)
+    kv_u8 = cache.contiguous().view(torch.uint8).reshape(-1)
+    pq = _Plane("q", rows * HEADS * HDIM * 2)
+    pkv = _Plane("compressed_k_cache", num_pages * PAGE * HDIM * 2)
+    ppt = _Plane("page_table", num_requests * width * 4)
+    pmeta = _Plane("rows_meta", rows * 4)
+    pcl = _Plane("context_lens", num_requests * 4)
+    plog = _Plane("logits", rows * columns * 4)
+    tbl = table.to(torch.int64).reshape(-1)
+    t2r_l, qpos_l, ctx_l = t2r.tolist(), qpos.tolist(), ctx.tolist()
+    inv = 1.0 / math.sqrt(HDIM)
+
+    out = torch.full((rows * columns,), float("nan"), dtype=torch.float32)
+    count = torch.zeros(rows * columns, dtype=torch.int32)
+    vis_out = torch.full((rows,), -7, dtype=torch.int32)
+    vis_cnt = torch.zeros(rows, dtype=torch.int32)
+    rst_cnt = torch.zeros(rows, dtype=torch.int32)
+
+    def store(ok, off, val):
+        ok = torch.as_tensor(ok, dtype=torch.bool)
+        off = torch.as_tensor(off, dtype=torch.int64)
+        plog.check(off, 4)                      # the clamped address, taken or not
+        if not bool(ok.any()):
+            return
+        idx = off[ok] // 4
+        val = torch.as_tensor(val, dtype=torch.float32).expand(off.shape)[ok]
+        out[idx] = val
+        count.index_add_(0, idx, torch.ones_like(idx, dtype=torch.int32))
+
+    grid_x = (columns + WM_COLS - 1) // WM_COLS
+    grid_y = (rows + WM_ROWS * WM_WAVES - 1) // (WM_ROWS * WM_WAVES)
+    n_in = _LANES % WM_N
+    kgrp = _LANES // WM_N
+    for by in range(grid_y):
+        for wave in range(WM_WAVES):
+            t0 = (by * WM_WAVES + wave) * WM_ROWS
+            meta = []
+            for i in range(WM_ROWS):
+                row = t0 + i
+                safe_row = min(row, rows - 1)
+                pmeta.check([safe_row * 4], 4)
+                req = int(t2r_l[safe_row])
+                req_ok = 0 <= req < num_requests
+                safe_req = req if req_ok else 0
+                pcl.check([safe_req * 4], 4)
+                head = max(min(int(qpos_l[safe_row]) + 1, int(ctx_l[safe_req])), 0)
+                vis = head // PAGE if req_ok else 0
+                meta.append(dict(row=row, row_ok=row < rows, req=req, req_ok=req_ok,
+                                 safe_req=safe_req, vis=vis))
+            # metadata writer (chunk 0, lanes 0..3)
+            for lane in range(WM_ROWS):
+                my_row = t0 + min(lane, WM_ROWS - 1)
+                pmeta.check([min(my_row, rows - 1) * 4], 4)
+                if my_row < rows:
+                    vis_out[my_row] = meta[lane]["vis"]
+                    vis_cnt[my_row] += 1
+                    rst_cnt[my_row] += 1
+            # per-pass plan (uniform), lane rows a = t0 + 2*kgrp, b = a + 1
+            plans = []
+            for p in range(WM_ROWS):
+                mp = meta[p]
+                active = mp["row_ok"] and all(
+                    (meta[qq]["row"] >= rows) or (meta[qq]["req"] != mp["req"]) for qq in range(p))
+                own = [meta[i]["row_ok"] and meta[i]["req"] == mp["req"] for i in range(WM_ROWS)]
+                vmax = max([meta[i]["vis"] if own[i] else 0 for i in range(WM_ROWS)] + [0])
+                own_a = torch.tensor([own[0], own[2]])[kgrp]
+                own_b = torch.tensor([own[1], own[3]])[kgrp]
+                vis_a = torch.tensor([meta[0]["vis"], meta[2]["vis"]])[kgrp]
+                vis_b = torch.tensor([meta[1]["vis"], meta[3]["vis"]])[kgrp]
+                plans.append((active, vmax, mp["safe_req"], mp["req_ok"], own_a, own_b, vis_a, vis_b))
+            if t0 >= rows:
+                continue
+            q_row = torch.clamp(t0 + n_in // HEADS, max=rows - 1)
+            q_base = q_row * (HEADS * HDIM * 2) + (n_in % HEADS) * (HDIM * 2) + kgrp * 16
+            qa = [_wm_matrix(_wm_frag(q_u8, pq, q_base + s * WM_K * 2)) for s in range(WM_KS)]
+            row_a = torch.clamp(t0 + 2 * kgrp, max=rows - 1)
+            row_b = torch.clamp(t0 + 2 * kgrp + 1, max=rows - 1)
+            last = rows * columns - 1
+            for bx in range(grid_x):
+                col0 = bx * WM_COLS
+                cols = [col0 + nt * WM_N + n_in for nt in range(WM_NT)]
+                offs = []
+                for c in cols:
+                    offs.append(torch.clamp(row_a * columns + c, max=last) * 4)
+                    offs.append(torch.clamp(row_b * columns + c, max=last) * 4)
+                for (active, vmax, safe_req, req_ok, own_a, own_b, vis_a, vis_b) in plans:
+                    if not active:
+                        continue
+                    if col0 < vmax:
+                        for nt, c in enumerate(cols):
+                            logical = c // PAGE
+                            off = c % PAGE
+                            logical_ok = logical < width
+                            safe_logical = torch.where(logical_ok, logical, torch.zeros_like(logical))
+                            pt_off = (safe_req * width + safe_logical) * 4
+                            ppt.check(pt_off, 4)
+                            phys = tbl[pt_off // 4]
+                            page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+                            phys = torch.where(page_ok, phys, torch.zeros_like(phys))
+                            k_base = phys * (PAGE * HDIM * 2) + off * (HDIM * 2) + kgrp * 16
+                            d = torch.zeros(16, WM_N, dtype=torch.float32)
+                            for s in range(WM_KS):
+                                kb = _wm_matrix(_wm_frag(kv_u8, pkv, k_base + s * WM_K * 2))
+                                d = d + qa[s] @ kb.T
+                            acc = d[(kgrp[:, None] * 8 + torch.arange(8)[None, :]), n_in[:, None]]
+                            relu = acc.clamp_min(0.0)
+                            sa = ((relu[:, 0] + relu[:, 1]) + (relu[:, 2] + relu[:, 3])) * inv
+                            sb = ((relu[:, 4] + relu[:, 5]) + (relu[:, 6] + relu[:, 7])) * inv
+                            col_ok = c < columns
+                            va = torch.where(page_ok & (c < vis_a), sa, torch.full_like(sa, float("-inf")))
+                            vb = torch.where(page_ok & (c < vis_b), sb, torch.full_like(sb, float("-inf")))
+                            store(own_a & col_ok, offs[2 * nt], va)
+                            store(own_b & col_ok, offs[2 * nt + 1], vb)
+                    else:
+                        for nt, c in enumerate(cols):
+                            col_ok = c < columns
+                            store(own_a & col_ok, offs[2 * nt], float("-inf"))
+                            store(own_b & col_ok, offs[2 * nt + 1], float("-inf"))
+    coverage = {
+        "logits_written_once": bool((count == 1).all()),
+        "logits_min_max_writes": (int(count.min()), int(count.max())),
+        "visible_written_once": bool((vis_cnt == 1).all()),
+        "row_starts_written_once": bool((rst_cnt == 1).all()),
+    }
+    return out.view(rows, columns), vis_out, coverage
+
+
+def _wmma_check(name, data_q, cache, table, t2r, qpos, ctx, cols, gold=None, gold_vis=None,
+                valid=None, verbose=True):
+    """Run the WMMA emulator and check coverage (+ golden when given)."""
+    out, out_vis, cov = emulate_wmma_bf16(data_q, cache, table, t2r, qpos, ctx, max_columns=cols)
+    cov_ok = (cov["logits_written_once"] and cov["visible_written_once"]
+              and cov["row_starts_written_once"])
+    res = {"pass": True}
+    if gold is not None:
+        res = G.compare_logits(out, out_vis, gold, gold_vis, valid)
+        cols_ix = torch.arange(gold.shape[1])
+        inside = valid & (cols_ix[None, :] < gold_vis.to(torch.int64)[:, None])
+        outside = out[~inside]
+        res["outside_not_neg_inf"] = int((~(torch.isinf(outside) & (outside < 0))).sum())
+        res["pass"] = bool(res.get("pass")) and res["outside_not_neg_inf"] == 0
+    ok = cov_ok and bool(res.get("pass")) and not bool(torch.isnan(out).any())
+    if verbose:
+        print("       [%s] wmma-emu %-22s writes(min,max)=%s vis1=%s max_abs=%.2e outside!=-inf=%s"
+              % ("PASS" if ok else "FAIL", name, cov["logits_min_max_writes"],
+                 cov["visible_written_once"], res.get("max_abs_err", 0.0),
+                 res.get("outside_not_neg_inf", "-")))
+    return ok, out, out_vis
+
+
 def _run_case(name, regime, rows, requests, fmt, table_width, cache_pages,
               max_columns=None, patch=None, seed=0, verbose=True):
+    ok, res = _run_case_scalar(name, regime, rows, requests, fmt, table_width, cache_pages,
+                               max_columns, patch, seed, verbose)
+    if fmt != "bf16":
+        return ok, res
+    data, (t2r, qpos, ctx, table), cols = _case_fixture(
+        regime, rows, requests, fmt, table_width, cache_pages, max_columns, patch, seed)
+    gold, gold_vis, valid = G.reference_logits(
+        data["q"], data["compressed_k_cache"], table, t2r, qpos, ctx,
+        compress_ratio=S.COMPRESS_RATIO, max_columns=cols)
+    wok, _, _ = _wmma_check(name, data["q"], data["compressed_k_cache"], table, t2r, qpos, ctx,
+                            cols, gold, gold_vis, valid, verbose)
+    return ok and wok, res
+
+
+def _run_case_scalar(name, regime, rows, requests, fmt, table_width, cache_pages,
+                     max_columns=None, patch=None, seed=0, verbose=True):
     # max_ctx = 16 * table_width fills the page table (needed_per_req == width) and
     # makes ctx//4 == columns, so the visible window covers every column.
     max_ctx = 16 * table_width
@@ -112,6 +339,11 @@ def _run_case(name, regime, rows, requests, fmt, table_width, cache_pages,
               % ("PASS" if ok else "FAIL", name, rows, out.shape[1], fmt,
                  int(gold_vis.sum()), res.get("checked", 0), mae, mre, res.get("bad", -1)))
     return ok, res
+
+
+def _expect(cond):
+    if not cond:
+        raise AssertionError("expectation failed")
 
 
 def _e4m3_byte_scalar(b):
@@ -194,15 +426,31 @@ def _contract_only(name, regime, rows, requests, fmt, table_width, cache_pages,
     page_ok = req_ok[:, None] & (logical[None, :] < width) & (entry >= 0) & (entry < num_pages)
     inside = page_ok & (ar[None, :] < vis_ref.to(torch.int64)[:, None])
     outside = ~inside
-    checks = {
-        "visible_equal": bool(torch.equal(out_vis.to(torch.int32), vis_ref.to(torch.int32))),
-        "invalid_page_neg_inf": bool(torch.isinf(out[~page_ok]).all()
-                                     and (out[~page_ok] < 0).all()),
-        "outside_window_neg_inf": bool(torch.isinf(out[outside]).all()
-                                       and (out[outside] < 0).all()),
-        "no_nan": not bool(torch.isnan(out).any()),
-        "inside_finite": bool(torch.isfinite(out[inside]).all()) if bool(inside.any()) else True,
-    }
+
+    def _checks(o, ov):
+        return {
+            "visible_equal": bool(torch.equal(ov.to(torch.int32), vis_ref.to(torch.int32))),
+            "invalid_page_neg_inf": bool(torch.isinf(o[~page_ok]).all()
+                                         and (o[~page_ok] < 0).all()),
+            "outside_window_neg_inf": bool(torch.isinf(o[outside]).all()
+                                           and (o[outside] < 0).all()),
+            "no_nan": not bool(torch.isnan(o).any()),
+            "inside_finite": bool(torch.isfinite(o[inside]).all()) if bool(inside.any()) else True,
+        }
+
+    checks = _checks(out, out_vis)
+    if fmt == "bf16":
+        # the WMMA path must satisfy the same contract and agree with the scalar
+        # emulation inside the window (both are fp32 dot products of bf16 data)
+        wout, wvis, cov = emulate_wmma_bf16(
+            data["q"], data["compressed_k_cache"], table, t2r, qpos, ctx, max_columns=cols)
+        for k, v in _checks(wout, wvis).items():
+            checks["wmma_" + k] = v
+        checks["wmma_written_once"] = (cov["logits_written_once"] and cov["visible_written_once"]
+                                       and cov["row_starts_written_once"])
+        if bool(inside.any()):
+            checks["wmma_matches_scalar"] = bool(torch.allclose(
+                wout[inside], out[inside], rtol=1e-4, atol=1e-4))
     ok = all(checks.values())
     if verbose:
         print("[%s] %-26s rows=%3d cols=%5d %-4s pages=%4d checked=%s %s"
@@ -326,6 +574,53 @@ def main() -> int:
                  ("tail_cols_258", 258), ("tail_cols_511", 511), ("tail_cols_512", 512)):
         ok, _ = _run_case(spec[0], "prefill", 4, 1, "bf16", 129, 512, spec[1])
         fails += 0 if ok else 1
+
+    # --- bf16 WMMA path (round C): every bf16 case above already runs the WMMA
+    # lane emulator too; these add its own geometry / dedup / early-exit edges --
+    print("== bf16 WMMA path: row/column geometry, request dedup, early exit ==")
+    wm_specs = [
+        # rows not a multiple of 4 / 16 / 64 (partial wave, partial workgroup)
+        ("wm_rows7", "prefill", 7, 2, "bf16", 32, 128, None, None),
+        ("wm_rows13", "prefill", 13, 2, "bf16", 32, 128, None, None),
+        ("wm_rows70", "prefill", 70, 2, "bf16", 16, 64, None, None),
+        # decode shape class (4 rows / request) and draft (1 row / request:
+        # four request passes in every wave)
+        ("wm_decode_64x16", "decode", 64, 16, "bf16", 16, 512, None, None),
+        ("wm_draft_16x16", "draft", 16, 16, "bf16", 16, 512, None, None),
+        # columns not a multiple of 64 / 16 / 4
+        ("wm_tail_cols_1000", "prefill", 8, 2, "bf16", 256, 1024, 1000, None),
+        ("wm_tail_cols_70", "prefill", 13, 2, "bf16", 32, 128, 70, None),
+    ]
+    for spec in wm_specs:
+        ok, _ = _run_case(*spec)
+        fails += 0 if ok else 1
+
+    def patch_mixed(t2r, qpos, ctx, table):        # non-contiguous requests in a wave
+        n = t2r.numel()
+        pattern = [0, 1, 1, 0, 1, 0, 0, 1]
+        for i in range(n):
+            t2r[i] = pattern[i % len(pattern)]
+        t2r[5] = -1                                 # invalid request inside a wave
+        if n > 9:
+            t2r[9] = 7                              # out of range request
+        return t2r, qpos, ctx, table
+    ok, _ = _run_case("wm_mixed_requests", "prefill", 16, 2, "bf16", 32, 128, None, patch_mixed)
+    fails += 0 if ok else 1
+
+    def patch_short(t2r, qpos, ctx, table):        # early-exit branch on most blocks
+        ctx[0] = 40                                 # visible <= 10 for request 0
+        qpos[-1] = 70                               # visible 17 on the last row (partial block)
+        return t2r, qpos, ctx, table
+    ok, _ = _run_case("wm_early_exit", "prefill", 13, 2, "bf16", 64, 256, None, patch_short)
+    fails += 0 if ok else 1
+
+    def patch_holes(t2r, qpos, ctx, table):        # -1 / OOB pages inside a 64-col block
+        table[0, 3] = -1
+        table[0, 17] = -1
+        table[1, 15] = 10**6
+        return t2r, qpos, ctx, table
+    ok, _ = _contract_only("wm_page_holes", "prefill", 13, 2, "bf16", 32, 128, None, patch_holes)
+    fails += 0 if ok else 1
 
     # fp8 scale plane: 0 (already covered below), 1.0 and > 1 must all match the
     # golden, i.e. the per-token fp32 scale is applied exactly once, at the
@@ -455,6 +750,18 @@ def main() -> int:
             torch.tensor([2**31], dtype=torch.int64), "m"), ValueError),
         ("_to_i32_checked passes int32 through", lambda: K._to_i32_checked(
             torch.zeros(3, dtype=torch.int32), "m"), None),
+        # round C dispatch: bf16 -> WMMA kernel by default, grid covers every
+        # (row, column) with 16 x 64 workgroups
+        ("bf16 path defaults to wmma", lambda: _expect(K._BF16_PATH == "wmma"), None),
+        ("wmma_grid(7 rows, 1000 cols) == (16, 1)",
+         lambda: _expect(K.wmma_grid(7, 1000) == (16, 1)), None),
+        ("wmma_grid(512, 65536) == (1024, 32)",
+         lambda: _expect(K.wmma_grid(512, 65536) == (1024, 32)), None),
+        ("wmma_grid(65535, 4) == (1, 4096)",
+         lambda: _expect(K.wmma_grid(65535, 4) == (1, 4096)), None),
+        ("WMMA geometry 4 waves x 32 lanes, 16 rows x 64 cols",
+         lambda: _expect((K.WMMA_THREADS, K.WMMA_ROWS_PER_BLOCK, K.WMMA_COLS)
+                         == (128, 16, 64)), None),
     ):
         try:
             fn()

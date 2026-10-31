@@ -279,6 +279,89 @@ def audit_enumerate(rows, requests, width, cache_pages, fmt, max_columns=None,
 
 
 # ---------------------------------------------------------------------------
+# bf16 WMMA path (round C): one workgroup = 4 waves x 32 lanes = 16 rows x 64 cols
+# ---------------------------------------------------------------------------
+WM_WAVE, WM_WAVES, WM_ROWS, WM_N, WM_K, WM_NT = 32, 4, 4, 16, 32, 4
+WM_COLS = WM_N * WM_NT
+WM_KS = HDIM // WM_K
+
+
+def _wm_lane_addrs(rows, requests, width, cache_pages, columns, table, by, bx, wave, lane):
+    """Every global address one lane of the WMMA kernel can issue (taken or not)."""
+    n_in, kgrp = lane % WM_N, lane // WM_N
+    t0 = (by * WM_WAVES + wave) * WM_ROWS
+    col0 = bx * WM_COLS
+    acc = []                                     # (plane, off, nbytes, is_store, i32_terms)
+    for i in range(WM_ROWS):                     # row metadata (clamped rows)
+        safe_row = min(t0 + i, rows - 1)
+        acc += [("token_to_request", safe_row * 4, 4, False, ()),
+                ("query_positions", safe_row * 4, 4, False, ())]
+        for req in (0, requests - 1):            # safe_req range
+            acc.append(("context_lens", req * 4, 4, False, ()))
+    my_row = t0 + min(lane, WM_ROWS - 1)         # metadata store (clamped)
+    acc += [("visible_groups", min(my_row, rows - 1) * 4, 4, True, ()),
+            ("row_starts", min(my_row, rows - 1) * 4, 4, True, ())]
+    q_row = min(t0 + n_in // HEADS, rows - 1)    # Q fragments
+    q_base = q_row * Q_ROW_BYTES + (n_in % HEADS) * HDIM * 2 + kgrp * 16
+    for s in range(WM_KS):
+        acc += [("q", q_base + s * 64, 16, False, ()), ("q", q_base + s * 64 + 32, 16, False, ())]
+    last = rows * columns - 1
+    row_a, row_b = min(t0 + 2 * kgrp, rows - 1), min(t0 + 2 * kgrp + 1, rows - 1)
+    for nt in range(WM_NT):
+        c = col0 + nt * WM_N + n_in
+        logical, off = c // PAGE, c % PAGE
+        safe_logical = logical if logical < width else 0
+        for req in (0, requests - 1):
+            acc.append(("page_table", (req * width + safe_logical) * 4, 4, False, ()))
+            entry = table[req][safe_logical]
+            phys = entry if 0 <= entry < cache_pages else 0
+            k_base = phys * PAGE * HDIM * 2 + off * HDIM * 2 + kgrp * 16
+            for s in range(WM_KS):
+                acc += [("compressed_k_cache", k_base + s * 64, 16, False, ()),
+                        ("compressed_k_cache", k_base + s * 64 + 32, 16, False, ())]
+        for r in (row_a, row_b):
+            acc.append(("logits", min(r * columns + c, last) * 4, 4, True, (r * columns + c,)))
+    return acc
+
+
+def audit_wmma(rows, requests, width, cache_pages, max_columns=None, full_limit=4096):
+    """Audit every lane of every workgroup (small shapes) or of the boundary
+    workgroups (big shapes: first/last row block x first/last two column blocks)."""
+    columns = columns_of(width, max_columns)
+    sizes = plane_sizes(rows, requests, width, cache_pages, "bf16", columns)
+    table = edge_page_table(requests, width, cache_pages)
+    gx = (columns + WM_COLS - 1) // WM_COLS
+    gy = (rows + WM_ROWS * WM_WAVES - 1) // (WM_ROWS * WM_WAVES)
+    full = gx * gy <= full_limit
+    bys = range(gy) if full else sorted({0, gy - 1})
+    bxs = range(gx) if full else sorted({0, 1, max(0, gx - 2), gx - 1})
+    c = Checker(sizes)
+    for by in bys:
+        for bx in bxs:
+            for wave in range(WM_WAVES):
+                for lane in range(WM_WAVE):
+                    for plane, off, nb, st, terms in _wm_lane_addrs(
+                            rows, requests, width, cache_pages, columns, table, by, bx, wave, lane):
+                        (c.store if st else c.acc)(plane, off, nb, f"by={by} bx={bx} w={wave} l={lane}")
+                        for t in terms:
+                            if t > MAX_I32:
+                                c.i32.append((plane, t, 0, "i32 intermediate"))
+    return {
+        "mode": "wmma",
+        "full": full,
+        "grid": {"x": gx, "y": gy, "covers_columns": gx * WM_COLS >= columns,
+                 "covers_rows": gy * WM_ROWS * WM_WAVES >= rows, "grid_y_ok": gy <= 65535},
+        "accesses": c.n,
+        "stores": c.n_stores,
+        "oob": c.oob,
+        "i32": c.i32,
+        "max_offset_plus_width": {k: v[0] for k, v in c.max_end.items()},
+        "ok": (not c.oob and not c.i32 and gx * WM_COLS >= columns
+               and gy * WM_ROWS * WM_WAVES >= rows and gy <= 65535),
+    }
+
+
+# ---------------------------------------------------------------------------
 # v0 fault forensics: is the dmesg address a sentinel store?
 # ---------------------------------------------------------------------------
 def fault_check():
@@ -337,6 +420,14 @@ def cases():
         ("decode_64x65536_bf16", 64, 16, 16384, 738964, "bf16", None),
         ("prefill_512x65536_fp8", 512, 2, 16384, 738964, "fp8", None),
         ("I14_decode_c32768_bf16", 64, 16, 16384, 738964, "bf16", 32768),
+        # round C (bf16 WMMA path): partial waves / workgroups, draft, prefill chunk,
+        # and the i32 logits cap (rows * columns * 4 = 2**31 - 2**18)
+        ("wm_rows7_cols70_bf16", 7, 2, 32, 128, "bf16", 70),
+        ("wm_rows13_bf16", 13, 2, 32, 128, "bf16", None),
+        ("wm_rows70_bf16", 70, 2, 16, 64, "bf16", None),
+        ("wm_draft_16x65536_bf16", 16, 16, 16384, 738964, "bf16", None),
+        ("wm_prefill_512x65536_bf16", 512, 2, 16384, 738964, "bf16", None),
+        ("wm_i32_cap_8191x65536_bf16", 8191, 2, 16384, 738964, "bf16", None),
     ]
 
 
@@ -370,6 +461,8 @@ def main(argv=None) -> int:
         a = audit_analytic(rows, requests, width, cache_pages, fmt, max_columns)
         e = audit_enumerate(rows, requests, width, cache_pages, fmt, max_columns)
         oversized = {k: v for k, v in a["sizes"].items() if v > args.max_bytes}
+        # bf16 is dispatched to the WMMA kernel (round C): audit that mapping too
+        w = audit_wmma(rows, requests, width, cache_pages, max_columns) if fmt == "bf16" else None
         rec = {
             "case": name,
             "shape": {"rows": rows, "requests": requests, "width": width,
@@ -377,9 +470,11 @@ def main(argv=None) -> int:
                       "cache_pages": cache_pages, "fmt": fmt},
             "analytic": a,
             "enumerate": e,
+            "wmma": w,
             "planes_over_cap": oversized,
             "ok": (a["ok"] and e["ok"] and not oversized
-                   and a["grid"]["covers_all_columns"] and a["grid"]["grid_y_ok"]),
+                   and a["grid"]["covers_all_columns"] and a["grid"]["grid_y_ok"]
+                   and (w is None or w["ok"])),
         }
         out["cases"].append(rec)
         rc |= 0 if rec["ok"] else 1
@@ -390,6 +485,14 @@ def main(argv=None) -> int:
                      rec["shape"]["columns"], cache_pages, len(a["oob"]), len(a["i32"]),
                      len(e["oob"]), len(e["i32"]), e["rows_visited"], e["cols_visited"],
                      "" if rec["ok"] else "   <-- CHECK"))
+            if w is not None:
+                print("       wmma: grid=%dx%d %s accesses=%d stores=%d oob=%d i32=%d max_end=%s"
+                      % (w["grid"]["x"], w["grid"]["y"], "full" if w["full"] else "boundary",
+                         w["accesses"], w["stores"], len(w["oob"]), len(w["i32"]),
+                         {k: v for k, v in w["max_offset_plus_width"].items()
+                          if k in ("q", "compressed_k_cache", "logits")}))
+                for (plane, off, nbytes, size, detail) in w["oob"][:3]:
+                    print("        WMMA OOB %s off=%d+%d > %d (%s)" % (plane, off, nbytes, size, detail))
             if oversized:
                 print("        over i32 cap: %s" % oversized)
             for (plane, off, nbytes, size, detail) in (a["oob"] + e["oob"])[:3]:
