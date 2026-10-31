@@ -1144,6 +1144,39 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     # heuristic picks.
     paired = x_block == (_BLOCKSCALE_X_BLOCK if w_scale_block == "128x128" else 32)
     config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block) if paired else None
+    if config is not None and config["libtype"] == "opus":
+        from csrc.opus_gemm.opus_gemm_common import (
+            a8w8_mxscale_bpreshuffle_supports_shape,
+            get_kernel_instance,
+        )
+
+        kid = int(config["kernelId"])
+        gfx, cu_num = get_gfx(), get_cu_num()
+        instance = get_kernel_instance(
+            gfx, "a8w8_blockscale_bpreshuffle", kid, cu_num=cu_num
+        )
+        if instance is None:
+            raise ValueError(f"Unknown or unavailable OPUS MXFP8 bpreshuffle kid {kid}")
+        if (
+            w_scale_block == "128x128"
+            and x_block == 128
+            and Y.dtype == dtypes.bf16
+            and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
+        ):
+            from .opus import opus_gemm
+
+            return opus_gemm(
+                XQ,
+                WQ,
+                Y,
+                kid=kid,
+                family="a8w8_blockscale_bpreshuffle",
+                layout="bpreshuffle",
+                x_scale=x_scale,
+                w_scale=w_scale,
+            )
+        # A padded-M lookup can select a kernel that does not support the original M.
+        config = None
     backend = None if config is None else str(config["kernelId"])
     if config is not None and (
         config["libtype"] != "flydsl" or backend not in _MXSCALE_RAW_KERNEL_IDS

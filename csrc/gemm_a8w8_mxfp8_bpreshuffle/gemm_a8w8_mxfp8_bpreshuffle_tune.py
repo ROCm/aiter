@@ -30,6 +30,10 @@ On gfx1250 --mxscale_table times the mxfp8_128 kernels the 2-D dispatch runs
 shapes, and a row's kernelId is the kernel's id in that list.
 """
 
+import math
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd
@@ -51,7 +55,6 @@ TUNED_FILE = "aiter/configs/model_configs/dsv4_a8w8_mxfp8_bpreshuffle_tuned_gemm
 # The block of a shape list without a w_scale_block column, and of a tuned
 # table from before the column.
 W_SCALE_BLOCK = "1x32"
-# w_scale block -> the pipelines tuned for it.
 PIPELINES_BY_W_SCALE_BLOCK = {
     "1x32": MXFP8_ROW_PIPELINES,
     "32x32": MXFP8_ROW_W32X32_PIPELINES,
@@ -97,6 +100,129 @@ def run_torch(x_deq, w_deq, dtype=dtypes.bf16):
     return F.linear(x_deq, w_deq).to(dtype)
 
 
+def opus_kernel_name(kid, *, cu_num):
+    from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
+
+    instance = get_kernel_instance(
+        "gfx950", "a8w8_blockscale_bpreshuffle", int(kid), cu_num=cu_num
+    )
+    if instance is None:
+        raise ValueError(f"Unknown or unavailable OPUS MXFP8 bpreshuffle kid {kid}")
+    return instance.name
+
+
+def _opus_geometry(instance):
+    entry = instance.bpreshuffle_co or instance.bpreshuffle_entry
+    return (
+        entry["pipeline"],
+        instance.B_M,
+        instance.B_N,
+        instance.B_K,
+        instance.T_M,
+        instance.T_N,
+    )
+
+
+def opus_candidates(m, n, k, *, cu_num):
+    """Shortlist JIT geometries per wave layout; include every legal prebuilt CO."""
+    from csrc.opus_gemm.opus_gemm_common import (
+        candidate_kids_for_shape,
+        get_registry,
+    )
+
+    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)
+    candidates = [
+        (kid, registry[kid])
+        for kid in candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num)
+    ]
+    candidate_count = len(candidates)
+    if not candidates:
+        return []
+    # CO images need no device-code compilation, so they do not consume the
+    # JIT shortlist. Neither path consults previous tuning results.
+    selected = {
+        kid for kid, instance in candidates if instance.bpreshuffle_co is not None
+    }
+    co_count = len(selected)
+    groups = defaultdict(list)
+    for kid, instance in candidates:
+        if instance.bpreshuffle_co is not None:
+            continue
+        geometry = _opus_geometry(instance)
+        groups[geometry].append(kid)
+    by_wave_layout = defaultdict(list)
+    for geometry in groups:
+        pipeline, bm, bn, bk, wm, wn = geometry
+        tiles = math.ceil(m / bm) * math.ceil(n / bn)
+        padding = math.ceil(m / bm) * bm / m * math.ceil(n / bn) * bn / n
+        occupancy = tiles / max(cu_num, 1)
+        cost = (
+            0.25 * (padding - 1)
+            + 0.25 * max(0, 1 - occupancy)
+            + 0.1 * (math.ceil(occupancy) / occupancy - 1)
+            + 8 / bm
+            + 8 / bn
+        )
+        # Keep BK and wave layouts independently: they change K-loop depth,
+        # fragment counts and register pressure even for the same M/N tile.
+        by_wave_layout[(pipeline, bk, wm, wn)].append((cost, geometry))
+    retained = {
+        geometry
+        for geometries in by_wave_layout.values()
+        for _, geometry in sorted(geometries)[:4]
+    }
+    selected.update(kid for geometry in retained for kid in groups[geometry])
+    print(
+        f"[OPUS search] shape={(m, n, k)} legal={candidate_count} "
+        f"jit_geometries={len(retained)} jit={len(selected) - co_count} "
+        f"co={co_count} candidates={len(selected)}",
+        flush=True,
+    )
+    return [(kid, registry[kid]) for kid in sorted(selected)]
+
+
+def ensure_opus_kids_compiled(kids, *, cu_num):
+    if not kids:
+        return False
+    from csrc.opus_gemm.opus_gemm_common import get_registry
+
+    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)
+    missing = set(kids) - registry.keys()
+    if missing:
+        raise FileNotFoundError(
+            f"OPUS COs are unavailable for kernel IDs {sorted(missing)}; "
+            "run csrc/opus_gemm/gen_co/build_co.py --arch gfx950 first."
+        )
+    opus_dir = str(Path(__file__).resolve().parents[1] / "opus_gemm")
+    added_path = opus_dir not in sys.path
+    if added_path:
+        sys.path.insert(0, opus_dir)
+    try:
+        from opus_gemm_tune import _ensure_kids_compiled
+
+        return _ensure_kids_compiled(
+            kids, family="a8w8_blockscale_bpreshuffle", gfx="gfx950", cu_num=cu_num
+        )
+    finally:
+        if added_path:
+            sys.path.remove(opus_dir)
+
+
+def run_gemm_opus(x, weight_shuffle, x_scale, w_scale, out, kid):
+    from aiter.ops.opus import opus_gemm
+
+    return opus_gemm(
+        x,
+        weight_shuffle,
+        out,
+        kid=kid,
+        family="a8w8_blockscale_bpreshuffle",
+        layout="bpreshuffle",
+        x_scale=x_scale,
+        w_scale=w_scale,
+    )
+
+
 # The batched GEMM at B = 1 in --mxscale_table mode: its ids follow mxfp8's
 # (kernelId records the backend in that table).
 KERNEL_ID_BASE_BMM = 3_000_000
@@ -131,14 +257,19 @@ def bmm_candidates(m, n, k, w_scale_block, seeds=()):
 
     scale_args = _bmm_scale_args(w_scale_block)
     names = bmm_candidate_names(1, m, n, k, seeds, **scale_args)
-    if not scale_args["x_scale_transposed"]:
-        return names
     row_major = {**scale_args, "x_scale_transposed": False}
-    return [
-        name
-        for name in names
-        if bmm_config_runs(1, n, k, row_major, parse_bmm_kernel_name(name))
-    ]
+    out = []
+    for name in names:
+        cfg = parse_bmm_kernel_name(name)
+        tiles = math.ceil(m / cfg["tile_m"]) * (n // cfg["tile_n"])
+        if cfg["splits"] > 1 and tiles > (1 << 16):
+            continue
+        if scale_args["x_scale_transposed"] and not bmm_config_runs(
+            1, n, k, row_major, cfg
+        ):
+            continue
+        out.append(name)
+    return out
 
 
 def run_bmm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
@@ -197,8 +328,25 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
-        "config_env_name": "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
     }
+
+    def _setup_common_arguments(self):
+        super()._setup_common_arguments()
+        for option in (
+            "--run_config",
+            "--e2e_tune",
+            "--compare",
+            "--update_improved",
+            "--min_improvement_pct",
+        ):
+            action = self.parser._option_string_actions.pop(option)
+            self.parser._remove_action(action)
+            self.parser._optionals._group_actions.remove(action)
+        # The shared run() reads these switches before entering candidate tuning.
+        self.parser.set_defaults(run_config=False, compare=False, update_improved=False)
+        self.parser._option_string_actions["--errRatio"].help = (
+            "Tolerable error ratio (default 0.05); candidates above this are rejected."
+        )
 
     def getKernelName(self, kernelId):
         # Pipeline id ranges are disjoint (8-wave ids start at 1_000_000).
@@ -207,22 +355,31 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 return pipe.kernels_list[kernelId].name
         return None
 
-    def _clear_op_caches(self):
-        from aiter.ops import gemm_op_a8w8 as _op
-
-        _op._get_mxfp8_bpreshuffle_config.cache_clear()
-        _op._load_mxfp8_bpreshuffle_tuned.cache_clear()
-        _op._CKGEMM_CONFIG_CACHE.clear()
-        _op._CKGEMM_HAS_GFX.clear()
-
     def _setup_specific_arguments(self):
         self.parser.add_argument(
             "--mxscale_table",
             action="store_true",
             help="Tune gemm_a8w8_blockscale_bpreshuffle's e8m0 table: bmm (the "
-            "batched GEMM at B = 1) joins on 1x32 / 32x32 / 128x128, and "
-            "kernelId names the backend, mxfp8 or bmm.",
+            "batched GEMM at B = 1) joins on 1x32 / 32x32 / 128x128; OPUS JIT/CO "
+            "joins on 128x128. FlyDSL kernelId names mxfp8 or bmm; "
+            "OPUS IDs are numeric.",
         )
+        self.parser.add_argument(
+            "--libtype",
+            choices=("both", "opus", "flydsl"),
+            default="both",
+            help="Backends to search; OPUS shortlists four legal JIT geometries per "
+            "pipeline/BK/wave layout and includes every legal prebuilt CO, "
+            "using shape and kernel metadata before compiling candidates "
+            "and requires --mxscale_table and 128x128. "
+            "Prebuild COs with csrc/opus_gemm/gen_co/build_co.py --arch gfx950.",
+        )
+
+    def pre_process(self, args):
+        self._mxscale_table = args.mxscale_table
+        if args.libtype == "opus" and not self._mxscale_table:
+            self.parser.error("OPUS tuning requires --mxscale_table")
+        super().pre_process(args)
 
     def _bmm_seeds(self):
         """{(N, K, w_scale_block): [(M, bmm kernelName)]} of the tuned
@@ -246,9 +403,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         return seeds
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
-        # A plain M,N,K shape list is a 1x32 one (as is a blank cell of a
-        # tuned table --all retunes); pre_process slices untunedf down to
-        # self.keys.
         df = super().get_untuned_gemm_list(untuned_gemm_file)
         if "w_scale_block" not in df.columns:
             df["w_scale_block"] = W_SCALE_BLOCK
@@ -264,53 +418,11 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=None):
         df = super().get_tuned_gemm_list(tuned_gemm_file, columns)
         df = with_mxscale_w_scale_block(df, tuned_gemm_file, default=W_SCALE_BLOCK)
-        # A table from before the column gets it where the tuner writes it.
         rest = [c for c in df.columns if c not in self.keys]
         return df[[c for c in self.keys if c in df.columns] + rest]
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
-
-    def run_config(self, args):
-        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8_bpreshuffle
-        from aiter.test_common import checkAllclose, run_perftest
-
-        results = []
-        for i in range(len(self.untunedf)):
-            row = self.untunedf.iloc[i]
-            M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
-            block = row.get("w_scale_block", W_SCALE_BLOCK)
-            shape_str = f"({M}, {N}, {K}, {block})"
-            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
-            try:
-                d = generate_data(M, N, K, 0, block)
-                out, us = run_perftest(
-                    gemm_a8w8_mxfp8_bpreshuffle,
-                    d["x"],
-                    d["weight_shuffle"],
-                    d["x_scale"],
-                    d["w_scale"],
-                    num_warmup=args.warmup,
-                    num_iters=args.iters,
-                )
-                err_ratio = checkAllclose(
-                    out,
-                    run_torch(d["x_deq"], d["w_deq"]),
-                    msg=f"run_config {shape_str}",
-                )
-                status = (
-                    "ok"
-                    if err_ratio <= allowed
-                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_desc})"
-                )
-                results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:  # noqa: BLE001
-                results.append(
-                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
-                )
-            finally:
-                torch.cuda.empty_cache()
-        return results
 
     def tune(self, untunedf, tunedf, args):
         gfx = self.get_gfx()
@@ -326,31 +438,46 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         seed = 0
 
         task = []
-        tasks_data = []
-        self._mxscale_table = bool(getattr(args, "mxscale_table", False))
+        self._mxscale_table = args.mxscale_table
         coarse = sorted(set(untunedf["w_scale_block"]) - {W_SCALE_BLOCK})
         if coarse and not self._mxscale_table:
-            # gemm_a8w8_mxfp8_bpreshuffle serves 1x32 only; these blocks run
-            # through gemm_a8w8_blockscale_bpreshuffle's table, tuned with bmm.
             raise ValueError(
                 f"w_scale block {coarse} is tuned for gemm_a8w8_blockscale_"
                 f"bpreshuffle only: pass --mxscale_table"
             )
-        if gfx == "gfx1250" and (
-            not self._mxscale_table or set(untunedf["w_scale_block"]) != {"128x128"}
-        ):
-            raise ValueError(
-                "gfx1250 tunes the mxfp8_128 kernels of gemm_a8w8_blockscale_"
-                "bpreshuffle's table only: pass --mxscale_table and 128x128 shapes"
-            )
-        seeds = self._bmm_seeds() if self._mxscale_table else {}
+        if gfx == "gfx1250":
+            if not self._mxscale_table or set(untunedf["w_scale_block"]) != {"128x128"}:
+                raise ValueError(
+                    "gfx1250 tunes the mxfp8_128 kernels of gemm_a8w8_blockscale_"
+                    "bpreshuffle's table only: pass --mxscale_table and 128x128 shapes"
+                )
+            if args.libtype == "opus":
+                raise ValueError("OPUS bpreshuffle tuning supports gfx950 only")
+        seeds = (
+            self._bmm_seeds()
+            if self._mxscale_table and gfx == "gfx950" and args.libtype != "opus"
+            else {}
+        )
+        opus_by_shape = {}
+        if gfx == "gfx950" and args.libtype != "flydsl" and self._mxscale_table:
+            if args.libtype == "opus" and set(untunedf.w_scale_block) != {"128x128"}:
+                raise ValueError("OPUS supports A 1x128 / B 128x128 scales only")
+            for row in untunedf.itertuples():
+                if row.w_scale_block == "128x128":
+                    shape = (int(row.M), int(row.N), int(row.K))
+                    opus_by_shape[shape] = opus_candidates(
+                        *shape,
+                        cu_num=cu_num,
+                    )
+                    if args.libtype == "opus" and not opus_by_shape[shape]:
+                        raise ValueError(f"No OPUS candidate supports {shape}")
         for i in range(len(untunedf)):
             M = int(untunedf.loc[i, "M"])
             N = int(untunedf.loc[i, "N"])
             K = int(untunedf.loc[i, "K"])
             block = str(untunedf.loc[i, "w_scale_block"])
             info_keys = (gfx, cu_num, M, N, K, block)
-            # One pass per pipeline of the block, in their order.
+            opus = opus_by_shape.get((M, N, K), ()) if block == "128x128" else ()
             cands = (
                 gfx1250_candidates(M, N, K)
                 if gfx == "gfx1250"
@@ -358,12 +485,12 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     (kernel_id, ki)
                     for pipe in PIPELINES_BY_W_SCALE_BLOCK[block]
                     for kernel_id, ki in pipe.kernels_list.items()
-                    if pipe.fits(ki, M, N, K)
+                    if args.libtype != "opus" and pipe.fits(ki, M, N, K)
                 ]
             )
             run_fn = run_gemm_flydsl_gfx1250 if gfx == "gfx1250" else run_gemm_flydsl
             runs = [(kernel_id, ki.split_k, ki.name, run_fn) for kernel_id, ki in cands]
-            if self._mxscale_table and gfx == "gfx950":
+            if self._mxscale_table and gfx == "gfx950" and args.libtype != "opus":
                 near = [
                     name
                     for mm, name in seeds.get((N, K, block), ())
@@ -376,19 +503,26 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
                     splits = parse_bmm_kernel_name(name)["splits"]
                     runs.append((KERNEL_ID_BASE_BMM + j, splits, name, run_bmm_flydsl))
+            runs.extend(
+                (kid, 1, opus_kernel_name(kid, cu_num=cu_num), run_gemm_opus)
+                for kid, _ in opus
+            )
             for kernel_id, split_k, name, run in runs:
-                # kernelName carries the full launch config (incl. split-K and
-                # the pipeline), so dispatch never needs kernelId -- it is
-                # recorded for reference (or, with --mxscale_table, replaced by
-                # the backend's tag).
-                info = (info_keys, kernel_id, split_k, name, "flydsl")
+                is_opus = run is run_gemm_opus
+                info = (
+                    info_keys,
+                    kernel_id,
+                    split_k,
+                    name,
+                    "opus" if is_opus else "flydsl",
+                )
                 task.append(
                     (
                         info,
                         generate_data,
                         (M, N, K, seed, block),
                         run,
-                        (gemm_keys, name),
+                        (gemm_keys, kernel_id) if is_opus else (gemm_keys, name),
                         dict(run_kwargs),
                         run_torch,
                         ref_args,
@@ -401,16 +535,24 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                         ("out",),
                     )
                 )
-            cands = runs
-            if not cands:
+            if not runs:
                 logger.warning(f"no mxfp8 {block} kernel fits M={M} N={N} K={K}")
-            tasks_data.append((len(cands), ()))
 
         if not task:
             return []
+        return self._run_tasks(task, args)
+
+    def _run_tasks(self, tasks, args):
+        if not tasks:
+            return []
+        ensure_opus_kids_compiled(
+            {task[0][1] for task in tasks if task[0][-1] == "opus"},
+            cu_num=self.get_cu_num(),
+        )
+        counts = Counter(task[0][0] for task in tasks)
         return mp_tuner(
-            task,
-            tasks_data,
+            tasks,
+            [(count, ()) for count in counts.values()],
             args.mp,
             False,
             args.shape_grouped,
@@ -426,14 +568,16 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             keys, kernelId, splitK, kernelName, libtype = info
             if time in (self.INVALID_TIME, self.INF_TIME):
                 kernelName = "None"
-            elif getattr(self, "_mxscale_table", False) and keys[0] == "gfx950":
+            elif libtype == "opus":
+                kernelName = opus_kernel_name(kernelId, cu_num=int(keys[1]))
+            elif libtype == "flydsl" and self._mxscale_table and keys[0] == "gfx950":
                 # gfx1250 rows keep their kernels_list id, as the table's do.
                 kernelId = (
                     MXSCALE_BMM_KERNEL_ID
                     if kernelId >= KERNEL_ID_BASE_BMM
                     else MXSCALE_KERNEL_ID
                 )
-            tflops, bw = self.calculate(el)
+            tflops, bw = self.calculate((info, time, err_ratio))
             key_dict = dict(zip(self.keys, keys))
             if len(results) == self.topk:
                 print(
@@ -460,7 +604,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
 
 if __name__ == "__main__":
-    # Same columns as the table the gfx1250 rows already live in.
     key = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
     resultList = [
         "libtype",
@@ -476,7 +619,7 @@ if __name__ == "__main__":
         "a8w8_mxfp8_bpreshuffle_tuned_gemm",
         key=key,
         resultList=resultList,
-        description="Tune gemm_a8w8_mxfp8_bpreshuffle (gfx950 FlyDSL mxpsh, 1x32 e8m0)",
+        description="Tune gfx950 MXFP8 bpreshuffle GEMM (FlyDSL and OPUS JIT/CO)",
     )
     args = tuner.parse_args()
     tuner.run(args, False)
