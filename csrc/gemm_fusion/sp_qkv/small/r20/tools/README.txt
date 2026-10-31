@@ -1,0 +1,1 @@
+# Reproducible derivation of r20 from r19 (patch scripts in order; each takes the small/r20 directory = a fresh copy of small/r19 minus SOURCE_SHA256.txt, NOTES-r19.md, tools/): derive_a (ABI, role asserts, layouts, build default), derive_b (BM64 traits + GEMM), derive_c (RAN roles). derive_c was re-run after fixing the legacy-push anchor; the file here is the fixed one.

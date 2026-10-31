@@ -1,0 +1,3 @@
+# Reproducible derivation of r19 from r18 (the exact patch scripts that were run, in order). usage: python derive_<x>.py <small/r19 dir> (the directory must be a fresh copy of small/r18 minus SOURCE_SHA256.txt);
+# derive_c.py and derive_d.py take the sp_qkv root (the directory that contains small/ and host/) instead. Order: a, b (the first run of b aborted on an anchor and was re-run after the regex fix, which is what this file contains), c, d, e.
+# For path B apply the same scripts to a copy of small/r17 (r19a); anchors that differ are reported by the asserts and must be fixed so that `diff r17->r19a` == `diff r18->r19b` modulo context.

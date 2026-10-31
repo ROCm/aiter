@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// gemm_fusion small-M host driver = the accepted Phase-1 driver_sm.cpp (included UNMODIFIED from the per-source vendored
+// host/ directory selected by -I) plus HOST-ONLY additions. Kernels, device code, ABI headers and the Phase-1 create/bind/
+// capture/replay entry points are untouched. Deviations (recorded in aiter-integration-notes.md):
+//   D1 sm_attach_v1: uses a process-shared comm and already-registered Rx/C windows instead of creating its own comm
+//      (no devcomm: the small-M kernels only dereference the Cwin handle through ccoGetLocalPtr; the shared devcomm is created by gf_comm).
+//   D2 sm_bind_new_v1 / sm_launch_blk_v1 / sm_blk_free_v1: several bindings (one per site/layer) can share one context
+//      (windows+epoch); each owns its device-resident SmDev block. A and W are passed per launch (as kernargs, like Phase-1).
+//   D3 sm_info_v1: exports Rx/control byte sizes so the runtime sizes windows from the compiled geometry.
+//   D4 Process-global HIP state (gf_device_scope.hpp): the Phase-1 file calls hipSetDevice(c->rank) (rank = SP rank, also a KERNEL argument, so it cannot
+//      be reused as the device index) in build_dev_block / sm_reset_control_v1 / sm_create_v1. Those calls are rerouted, WITHOUT editing the file, by a macro
+//      around the include to gf::set_device(), which targets the device of the active DeviceScope (comm->hipDev). Every entry point below runs in a
+//      scope: the caller's current device is restored on exit, and the sticky HIP last-error is flushed.
+#include <hip/hip_runtime.h>
+#include "gf_device_scope.hpp"
+#define hipSetDevice(x) gf::set_device(x)
+#include "driver_sm.cpp"
+#undef hipSetDevice
+#include <cstring>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+
+namespace {
+// H-1: bind/launch temporarily swap fields of the shared Ctx. Contract: ONE host thread per Ctx (the model-runner thread). Enforced:
+// the first thread that touches a Ctx owns it; any other thread gets E_STATE (never a silent race). The mutex additionally makes the
+// swap atomic w.r.t. a second thread that nevertheless got past the owner check (defence in depth; e.g. owner migration after free).
+std::mutex g_ctx_mu;
+std::unordered_map<const void*, std::thread::id> g_ctx_owner;
+bool own_ctx(const void* c) {
+    std::lock_guard<std::mutex> lk(g_ctx_mu);
+    auto it = g_ctx_owner.find(c);
+    if (it == g_ctx_owner.end()) { g_ctx_owner.emplace(c, std::this_thread::get_id()); return true; }
+    if (it->second != std::this_thread::get_id()) { std::fprintf(stderr, "SM_FUSION rc=FAIL ctx used from a second host thread (single-thread contract, H-1)\n"); return false; }
+    return true;
+}
+std::mutex g_swap_mu;
+struct Blk { SmDev* dblk = nullptr; SmBindingV1 b{}; int dev = -1; };
+inline int dev_of(const Ctx* c) { return (c && c->comm) ? static_cast<int>(c->comm->hipDev) : -1; }
+bool bind_ok(Ctx* c, const SmBindingV1* b) {
+    // identical checks to sm_bind_v1
+#if SM_B_ROWSPLIT
+    if (b->M <= 16u) { sm_log("bind", "rc=FAIL SM_B_ROWSPLIT build supports M>16 only (M=%u)", b->M); return false; }
+#endif
+#if SM_PUSH8
+    if (b->M > 16u) { sm_log("bind", "rc=FAIL SM_PUSH8 build supports M<=16 only (M=%u)", b->M); return false; }
+#endif
+    if (b->M == 0u || b->M > SM_MP || b->T != 4u * b->M) { sm_log("bind", "rc=FAIL M=%u T=%u", b->M, b->T); return false; }
+    auto al = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15u) == 0u; };
+    const bool okal = al(b->Wscale) && al(b->qw) && al(b->kw) && al(b->cos_cache) && al(b->sin_cache) && al(b->iqw) && al(b->ikw) && al(c->P) && al(c->rlocal)
+                      && (b->cos_stride_pos % 8 == 0) && (b->cos_stride_pos > 0);
+    if (!okal) { sm_log("bind", "rc=FAIL 16 B alignment or cos_stride_pos %% 8 != 0"); return false; }
+    return true;
+}
+}  // namespace
+
+#if SM_ABI_VERSION < 3
+extern "C" {
+int32_t sm_attach_v1(uint32_t rank, void* comm, void* rwin, void* rlocal, void* cwin, void* clocal,
+                     const char* gemm_hsaco, const char* ran_hsaco, void** out_ctx) {
+    if (!out_ctx) return E_ARG;
+    *out_ctx = nullptr;
+    if (!comm || !rwin || !rlocal || !cwin || !clocal || !gemm_hsaco || !ran_hsaco || rank > 3u) return E_ARG;
+    auto* c = new Ctx(); *out_ctx = c; c->rank = static_cast<int>(rank);
+    c->comm = static_cast<mori::cco::ccoComm*>(comm);
+    gf::DeviceScope scope(dev_of(c));   // the comm's HIP device (not the SP rank); restored on exit
+    if (!scope.ok()) { sm_log("device", "hipSetDevice(%d) rc=FAIL", dev_of(c)); return E_HIP; }
+    c->rwin = reinterpret_cast<mori::cco::ccoWindow_t>(rwin); c->rlocal = rlocal;
+    c->cwin = reinterpret_cast<mori::cco::ccoWindow_t>(cwin); c->clocal = clocal;
+    for (int p = 0; p < 4; ++p) {   // same peer resolution + self check as sm_create_v1
+        c->cpeer[p] = static_cast<uint8_t*>(mori::cco::ccoGetPeerPtr(c->comm, c->clocal, p));
+        c->rpeer[p] = static_cast<uint8_t*>(mori::cco::ccoGetPeerPtr(c->comm, c->rlocal, p));
+        if (!c->cpeer[p] || !c->rpeer[p]) { sm_log("attach", "rc=FAIL null peer pointer p=%d", p); return E_CCO_WIN_C; }
+        if (p == c->rank && (c->cpeer[p] != static_cast<uint8_t*>(c->clocal) || c->rpeer[p] != static_cast<uint8_t*>(c->rlocal))) {
+            sm_log("attach", "rc=FAIL self peer pointer != local window base"); return E_CCO_WIN_C; }
+    }
+    if (hipMalloc(reinterpret_cast<void**>(&c->P), sizeof(float) * SM_SK * SM_MP * SM_N) != hipSuccess) { sm_log("P", "hipMalloc rc=FAIL"); return E_HIP; }
+    if (!sm_image_matches(gemm_hsaco, SM_EXPECTED_GEMM_SHA256) || !sm_image_matches(ran_hsaco, SM_EXPECTED_RAN_SHA256)) { sm_log("bundle", "rc=FAIL image hash mismatch"); return E_HASH; }
+    if (hipModuleLoad(&c->mg, gemm_hsaco) != hipSuccess || hipModuleLoad(&c->mr, ran_hsaco) != hipSuccess) { sm_log("module", "rc=FAIL"); return E_HIP; }
+    if (hipModuleGetFunction(&c->fg, c->mg, "sm_gemm_v1") != hipSuccess || hipModuleGetFunction(&c->fr, c->mr, "sm_ran_v1") != hipSuccess) { sm_log("resolve", "rc=FAIL"); return E_HIP; }
+    gf::flush_sticky();  // peer-pointer resolution / module load may leave a sticky last-error that a later torch op would raise
+    sm_log("attach", "rc=OK");
+    return OK;
+}
+}
+#endif
+extern "C" {
+// Create a binding (device-resident SmDev block). OUTSIDE graph capture only (hipMalloc + H2D). Pointers must stay valid for the binding's lifetime.
+int32_t sm_bind_new_v1(void* ctx, const SmBindingV1* b, void** out_blk) {
+    auto* c = static_cast<Ctx*>(ctx); if (!c || !b || !out_blk) return E_ARG;
+    *out_blk = nullptr;
+    if (!own_ctx(c)) return E_STATE;
+    if (!bind_ok(c, b)) return E_ARG;
+    gf::DeviceScope scope(dev_of(c));
+    std::lock_guard<std::mutex> swap_lk(g_swap_mu);
+    SmBindingV1 saved_b = c->b; bool saved_bound = c->bound; SmDev* saved_dblk = c->dblk;
+    c->b = *b; c->dblk = nullptr;
+    const int32_t rc = build_dev_block(c);
+    auto* blk = new Blk(); blk->dblk = c->dblk; blk->b = *b; blk->dev = dev_of(c);
+    c->b = saved_b; c->bound = saved_bound; c->dblk = saved_dblk;
+    if (rc != OK) { delete blk; return rc; }
+    *out_blk = blk;
+    return OK;
+}
+#if SM_ABI_VERSION < 3
+// Enqueue sm_gemm then RAN on `stream` for this binding (capturable by torch.cuda.graph: plain kernel launches).
+int32_t sm_launch_blk_v1(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, void* stream) {   // D2b: A, W and strideA (bytes) are per-launch arguments
+    auto* c = static_cast<Ctx*>(ctx); auto* blk = static_cast<Blk*>(blk_); if (!c || !blk || !blk->dblk) return E_STATE;
+    if (!own_ctx(c)) return E_STATE;
+    gf::DeviceScope scope(dev_of(c));   // module functions belong to the comm's device context
+    std::lock_guard<std::mutex> swap_lk(g_swap_mu);
+    SmBindingV1 saved_b = c->b; SmDev* saved_dblk = c->dblk;
+    c->b = blk->b; c->b.A = A; c->b.W = W; c->b.strideA = strideA; c->dblk = blk->dblk;
+    const hipError_t e = enqueue(c, static_cast<hipStream_t>(stream));
+    c->b = saved_b; c->dblk = saved_dblk;
+    if (e != hipSuccess) { c->last_hip = static_cast<int>(e); std::fprintf(stderr, "SM_LAUNCH stage=enqueue err=%d (%s)\n", (int)e, hipGetErrorString(e)); return E_HIP; }
+    return OK;
+}
+#endif
+#if SM_ABI_VERSION >= 3
+// ---- R12 (card r2 D2.3/D2.6): ABI-3 entry points. Signatures match the aiter stub (small_rt.py load_driver(abi=3)).
+// attach(rank, comm, rx_win, rx_local, ctl_win, ctl_local, gpage_local, gpeers, gemm_hsaco, ran_hsaco, &ctx): like sm_attach_v1 plus the runtime-owned per-comm ERR/STEP/DIAG page.
+//   gpage_local = local address of the page in a registered window/arena (u32 ERR at +0, u64 STEP at +8, DIAG u64[8] at +64); gpeers == NULL: the driver resolves the 3 peer ERR words with ccoGetPeerPtr(comm, gpage_local, p)
+//   and uploads a device-resident SmGfPeers; non-NULL: a device-resident SmGfPeers* supplied by the runtime. There is NO per-plan poison read in ABI 3 (sm_poison_* are gone; the runtime reads ERR from the page).
+int32_t sm_attach_v3(uint32_t rank, void* comm, void* rwin, void* rlocal, void* cwin, void* clocal, void* gpage_local, void* gpeers,
+                     const char* gemm_hsaco, const char* ran_hsaco, void** out_ctx) {
+    if (!out_ctx) return E_ARG;
+    *out_ctx = nullptr;
+    if (!comm || !rwin || !rlocal || !cwin || !clocal || !gpage_local || !gemm_hsaco || !ran_hsaco || rank > 3u) return E_ARG;
+    if ((reinterpret_cast<uintptr_t>(gpage_local) & 63u) != 0u) { sm_log("attach", "rc=FAIL gpage_local not 64 B aligned"); return E_ARG; }
+    auto* c = new Ctx(); *out_ctx = c; c->rank = static_cast<int>(rank);
+    c->comm = static_cast<mori::cco::ccoComm*>(comm);
+    gf::DeviceScope scope(dev_of(c));
+    if (!scope.ok()) { sm_log("device", "hipSetDevice(%d) rc=FAIL", dev_of(c)); return E_HIP; }
+    c->rwin = reinterpret_cast<mori::cco::ccoWindow_t>(rwin); c->rlocal = rlocal;
+    c->cwin = reinterpret_cast<mori::cco::ccoWindow_t>(cwin); c->clocal = clocal;
+    c->gpage = static_cast<uint8_t*>(gpage_local); c->gpage_owned = false;
+    for (int p = 0; p < 4; ++p) {
+        c->cpeer[p] = static_cast<uint8_t*>(mori::cco::ccoGetPeerPtr(c->comm, c->clocal, p));
+        c->rpeer[p] = static_cast<uint8_t*>(mori::cco::ccoGetPeerPtr(c->comm, c->rlocal, p));
+        if (!c->cpeer[p] || !c->rpeer[p]) { sm_log("attach", "rc=FAIL null peer pointer p=%d", p); return E_CCO_WIN_C; }
+        if (p == c->rank && (c->cpeer[p] != static_cast<uint8_t*>(c->clocal) || c->rpeer[p] != static_cast<uint8_t*>(c->rlocal))) {
+            sm_log("attach", "rc=FAIL self peer pointer != local window base"); return E_CCO_WIN_C; }
+    }
+    if (gpeers) {
+        c->dgpeers = static_cast<SmGfPeers*>(gpeers);                  // runtime-owned device-resident table: not freed by sm_free_v1
+    } else {
+        SmGfPeers h{};
+        for (int p = 0; p < 4; ++p) {
+            void* pp = (p == c->rank) ? nullptr : mori::cco::ccoGetPeerPtr(c->comm, c->gpage, p);
+            h.err[p] = static_cast<uint32_t*>(pp);
+            if (p != c->rank && !pp) { sm_log("attach", "rc=FAIL null peer ERR pointer p=%d (gpage_local must lie in a registered window); pass gpeers or fix the page", p); return E_CCO_WIN_C; }
+        }
+        SmGfPeers* d = nullptr;
+        if (hipMalloc(reinterpret_cast<void**>(&d), sizeof(h)) != hipSuccess || hipMemcpy(d, &h, sizeof(h), hipMemcpyHostToDevice) != hipSuccess) { sm_log("attach", "gpeers upload rc=FAIL"); return E_HIP; }
+        c->dgpeers = d; c->dgpeers_owned = true;
+    }
+    if (hipMalloc(reinterpret_cast<void**>(&c->P), sizeof(float) * SM_SK * SM_MP * SM_N) != hipSuccess) { sm_log("P", "hipMalloc rc=FAIL"); return E_HIP; }
+#ifdef SM_STAMPS_HOST
+    // SM_STAMPS diagnostic build only (default OFF: not compiled, the normal binary is unchanged): the fusion path attaches here, so it must allocate the rotating debug buffer like the harness sm_create_v1.
+    // Zero-initialised (dbg[0] = replay counter); SmDev.dbg (bind) and SmGemmArgsV1.dbg (launch) read c->dbg; sm_dbg_read_v1 returns it; sm_free_v1 frees it.
+    if (hipMalloc(reinterpret_cast<void**>(&c->dbg), sizeof(uint64_t) * SM_DBG_TOTAL_WORDS) != hipSuccess || hipMemset(c->dbg, 0, sizeof(uint64_t) * SM_DBG_TOTAL_WORDS) != hipSuccess) { sm_log("dbg", "rc=FAIL"); return E_HIP; }
+    sm_log("dbg", "rc=OK words=%u (attach_v3)", (unsigned)SM_DBG_TOTAL_WORDS);
+#endif
+    if (!sm_image_matches(gemm_hsaco, SM_EXPECTED_GEMM_SHA256) || !sm_image_matches(ran_hsaco, SM_EXPECTED_RAN_SHA256)) { sm_log("bundle", "rc=FAIL image hash mismatch"); return E_HASH; }
+    if (hipModuleLoad(&c->mg, gemm_hsaco) != hipSuccess || hipModuleLoad(&c->mr, ran_hsaco) != hipSuccess) { sm_log("module", "rc=FAIL"); return E_HIP; }
+    if (hipModuleGetFunction(&c->fg, c->mg, "sm_gemm_v1") != hipSuccess || hipModuleGetFunction(&c->fr, c->mr, "sm_ran_v3") != hipSuccess) { sm_log("resolve", "rc=FAIL"); return E_HIP; }
+    gf::flush_sticky();
+    sm_log("attach", "rc=OK abi=3");
+    return OK;
+}
+// launch(ctx, blk, A, W, strideA, Ascale, positions, slot_mapping, t_valid, call_id, stream): per-launch tensors are kernel arguments (staging removed); rows t >= t_valid are padded in-kernel (pos 0, slot -1).
+// positions / slot_mapping must hold at least t_valid int64 elements, Ascale at least M floats (the kernel never reads beyond them).
+static int32_t sm_launch_impl(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, const float* Ascale, const int64_t* positions, const int64_t* slot_mapping,
+                              uint32_t t_valid, uint32_t call_id, uint32_t m_launch, void* stream) {
+    auto* c = static_cast<Ctx*>(ctx); auto* blk = static_cast<Blk*>(blk_); if (!c || !blk || !blk->dblk) return E_STATE;
+    if (!own_ctx(c)) return E_STATE;
+    const uint32_t m_use = m_launch ? m_launch : blk->b.M;                    // R16 pad-M: the REAL local rows of this launch (0 = the bound bucket M)
+    if (!A || !W || !Ascale || !positions || !slot_mapping || m_use < 1u || m_use > blk->b.M || t_valid > 4u * m_use) return E_ARG;
+#if SM_B_ROWSPLIT
+    if (m_use <= 16u) return E_ARG;                                            // r18 row-split variant: M > 16 only (device decide() would poison it)
+#endif
+#if SM_PUSH8
+    if (m_use > 16u) return E_ARG;
+#endif
+    gf::DeviceScope scope(dev_of(c));
+    std::lock_guard<std::mutex> swap_lk(g_swap_mu);
+    SmBindingV1 saved_b = c->b; SmDev* saved_dblk = c->dblk;
+    c->b = blk->b; c->b.M = m_use; c->b.A = A; c->b.W = W; c->b.strideA = strideA; c->dblk = blk->dblk;
+    const hipError_t e = enqueue_v3(c, static_cast<hipStream_t>(stream), Ascale, positions, slot_mapping, t_valid, call_id);
+    c->b = saved_b; c->dblk = saved_dblk;
+    if (e != hipSuccess) { c->last_hip = static_cast<int>(e); std::fprintf(stderr, "SM_LAUNCH stage=enqueue err=%d (%s)\n", (int)e, hipGetErrorString(e)); return E_HIP; }
+    return OK;
+}
+
+// R16 pad-M: launch with the REAL local rows m (1 <= m <= the bucket M the binding was made for; all 4 ranks must pass the same m). x holds m rows, A/Ascale are read for rows < m only, tokens are t = s*m + row,
+// t_valid <= 4*m. Outputs may be sized for the bucket (4*M_bucket rows): only rows t < 4*m are written. m = 0 behaves exactly like sm_launch_blk_v3 (the bound M). NOTE: M is a by-value kernarg of both kernels,
+// so a captured graph bakes it: capture one graph per (binding, m).
+int32_t sm_launch_blk_v3m(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, const float* Ascale, const int64_t* positions, const int64_t* slot_mapping,
+                          uint32_t t_valid, uint32_t call_id, uint32_t m, void* stream) {
+    return sm_launch_impl(ctx, blk_, A, W, strideA, Ascale, positions, slot_mapping, t_valid, call_id, m, stream);
+}
+int32_t sm_launch_blk_v3(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, const float* Ascale, const int64_t* positions, const int64_t* slot_mapping,
+                         uint32_t t_valid, uint32_t call_id, void* stream) {
+    return sm_launch_impl(ctx, blk_, A, W, strideA, Ascale, positions, slot_mapping, t_valid, call_id, 0u, stream);
+}
+// Host-only diagnostic snapshot of the per-OWNER control state (synchronous D2H copies: call after a device sync / quiesce; nothing on the device changes).
+// out16[0] = ep_r (SM_C_EPOCH, RAN-written), [1] = ep_g (SM_C_EPOCH_G, GEMM-written), [2..5] = flag[src 0..3] (release-sequence counters in THIS rank's ctl window),
+// [6..13] = tag[par][src] at index par*4 + src, [14] = sticky ERR word of the per-comm page (u32), [15] = STEP (u64). Invariant: flag[src] == K * (ok launches released by src) and ep_g == ep_r + 1 right after a launch started.
+int32_t sm_ctl_read_v1(void* ctx, uint64_t* out16) {
+    auto* c = static_cast<Ctx*>(ctx); if (!c || !out16 || !c->clocal || !c->gpage) return E_STATE;
+    if (!own_ctx(c)) return E_STATE;
+    gf::DeviceScope scope(dev_of(c));
+    uint8_t ctl[SM_C_BYTES];
+    if (hipMemcpy(ctl, c->clocal, SM_C_BYTES, hipMemcpyDeviceToHost) != hipSuccess) return E_HIP;
+    uint8_t pg[16];
+    if (hipMemcpy(pg, c->gpage, sizeof(pg), hipMemcpyDeviceToHost) != hipSuccess) return E_HIP;
+    auto rd64 = [&](size_t off) { uint64_t v; std::memcpy(&v, ctl + off, 8); return v; };
+    out16[0] = rd64(SM_C_EPOCH); out16[1] = rd64(SM_C_EPOCH_G);
+    for (uint32_t s = 0; s < 4u; ++s) out16[2u + s] = rd64(SM_T1_FLAG(s));
+    for (uint32_t par = 0; par < 2u; ++par) for (uint32_t s = 0; s < 4u; ++s) out16[6u + par * 4u + s] = rd64(SM_C_TAG(par, s));
+    uint32_t err; std::memcpy(&err, pg, 4); uint64_t step; std::memcpy(&step, pg + 8, 8);
+    out16[14] = err; out16[15] = step;
+    return OK;
+}
+#endif
+int32_t sm_blk_free_v1(void* blk_) {   // call only after quiesce (device sync)
+    auto* blk = static_cast<Blk*>(blk_); if (!blk) return E_ARG;
+    gf::DeviceScope scope(blk->dev);
+    if (blk->dblk) hipFree(blk->dblk);
+    delete blk; return OK;
+}
+// Compiled geometry: out[0]=Rx bytes, out[1]=control logical bytes, out[2]=N, out[3]=F, out[4]=ran grid, out[5]=ran threads, out[6]=gemm ntiles.
+int32_t sm_info_v1(uint64_t* out7) {
+    if (!out7) return E_ARG;
+    out7[0] = RX_BYTES; out7[1] = SM_C_BYTES; out7[2] = SM_N; out7[3] = SM_F; out7[4] = RAN_GRID; out7[5] = SM_RAN_THREADS; out7[6] = SM_GEMM_NTILES;
+    return OK;
+}
+// L-5: release everything this driver allocated for a context (P partials, modules, the Ctx itself). Call after hipDeviceSynchronize,
+// after every binding of this ctx was freed with sm_blk_free_v1, and BEFORE ccoCommDestroy. The windows belong to the runtime.
+int32_t sm_free_v1(void* ctx) {
+    auto* c = static_cast<Ctx*>(ctx); if (!c) return E_ARG;
+    gf::DeviceScope scope(dev_of(c));
+    if (!scope.ok()) return E_HIP;
+    if (c->P) hipFree(c->P);
+    if (c->dblk) hipFree(c->dblk);
+#if SM_ABI_VERSION >= 3
+    if (c->dgpeers && c->dgpeers_owned) hipFree(c->dgpeers);
+    if (c->gpage && c->gpage_owned) hipFree(c->gpage);
+#endif
+    if (c->dbg) hipFree(c->dbg);
+    if (c->mg) hipModuleUnload(c->mg);
+    if (c->mr) hipModuleUnload(c->mr);
+    { std::lock_guard<std::mutex> lk(g_ctx_mu); g_ctx_owner.erase(c); }
+    delete c;
+    return OK;
+}
+#if SM_ABI_VERSION < 3
+// Poison word (u32 at SM_C_POISON of the control window): 4-byte D2H on `stream` + stream sync (cheap; the legacy sm_poison_v1 is a blocking hipMemcpy).
+int32_t sm_poison_fast_v1(void* ctx, void* stream, uint32_t* out) {
+    auto* c = static_cast<Ctx*>(ctx); if (!c || !out) return E_ARG;
+    gf::DeviceScope scope(dev_of(c));
+    const hipStream_t s = static_cast<hipStream_t>(stream);
+    if (hipMemcpyAsync(out, static_cast<uint8_t*>(c->clocal) + SM_C_POISON, 4, hipMemcpyDeviceToHost, s) != hipSuccess) return E_HIP;
+    return hipStreamSynchronize(s) == hipSuccess ? OK : E_HIP;
+}
+#endif
+}
