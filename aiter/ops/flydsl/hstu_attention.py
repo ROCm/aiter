@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""High-level FlyDSL HSTU Attention Forward API."""
+"""High-level FlyDSL HSTU attention API."""
 
 from __future__ import annotations
 
 import csv
 import functools
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -15,13 +16,25 @@ import torch
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter import logger
+from aiter.jit.utils.build_targets import torch_processor_count_to_cu
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
-    NUM_GRID_GROUPS,
-    build_hstu_attention_bwd_dvdk,
+    balanced_tile_groups,
+    build_hstu_attention_bwd,
+    build_hstu_attention_bwd_dq_reduce,
+    build_partial_offsets,
+    build_reduce_map,
+    reduce_blocks_per_seq,
+    slot_rows,
+    span_scratch_rows,
     validate_hstu_attention_bwd,
 )
-from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_dq import (
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fallback_dq import (
     build_hstu_attention_bwd_dq,
+)
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fallback_dvdk import (
+    NUM_GRID_GROUPS,
+    build_hstu_attention_bwd_dvdk,
+    validate_hstu_attention_bwd_fallback,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd import (
     build_hstu_attention_fwd,
@@ -43,9 +56,7 @@ _GPU_ARCH = get_rocm_arch()
 
 
 def _str2bool(v: bool | str) -> bool:
-    # Local copy to avoid importing aiter.utility.dtypes at module load: that
-    # pulls in aiter.ops.enum, which triggers a JIT get_module() during the AOT
-    # build (setup.py run_aot) before the module exists -> import-time failure.
+    # Avoid utility.dtypes here because its imports require the AOT module to exist.
     if isinstance(v, bool):
         return v
     if v.lower() in ("yes", "true", "t", "y", "1"):
@@ -55,8 +66,7 @@ def _str2bool(v: bool | str) -> bool:
     raise ValueError(f"Boolean value expected, got {v!r}.")
 
 
-# Tuned kernel configs
-# list of column names in the tuned csv file
+# Tuned forward-kernel CSV schema.
 _CSV_COLUMNS: list[str] = [
     "arch",
     "dtype",
@@ -180,9 +190,7 @@ def _get_tuned_config(
     contextual_seq_len: int,
     has_targets: bool,
 ) -> dict:
-    """
-    Returns the tuned kernel config if it exists for the given parameters.
-    """
+    """Return the tuned forward config for this problem, if present."""
 
     problem_key = _problem_key(
         _GPU_ARCH,
@@ -205,10 +213,7 @@ def _get_default_config(
     head_dim: int,
     hidden_dim: int,
 ) -> dict:
-    """
-    Heuristic config for when tuning is unavailable.
-    Derived from a device sweep over shapes on MI300X.
-    """
+    """Return a forward config for problems without a tuned entry."""
 
     def as_dict(
         block_m: int,
@@ -224,8 +229,7 @@ def _get_default_config(
             "waves_per_eu": waves_per_eu,
         }
 
-    # hidden_dims 96/160/192 don't divide the K/V DMA pass with num_waves=4
-    # This map is required so the kernel still runs for these values.
+    # These dimensions need non-default wave counts to divide the K/V DMA pass.
     non_64_divisible_map = {
         96: (96, 48, 3, 0),
         160: (160, 80, 5, 0),
@@ -234,10 +238,7 @@ def _get_default_config(
     if hidden_dim in non_64_divisible_map:
         return as_dict(*non_64_divisible_map[hidden_dim])
 
-    # Key on the K stride the kernel actually processes: head_dim is rounded up to a
-    # multiple of 64 (HEAD_DIM_K) for the swizzled K LDS tile. Using the unrounded
-    # head_dim here picks too-large a block_n for non-64-aligned dims in the 128-192
-    # (and 192-256) band, which measured ~34% slower on gfx942 (144/176 head dims).
+    # Select by the padded K stride used by the swizzled LDS tile.
     head_dim_k = ((head_dim + 63) // 64) * 64
     dim = max(hidden_dim, head_dim_k)
     if dim >= 256:
@@ -268,7 +269,6 @@ def _compile_launcher(
     num_waves: int | None,
     waves_per_eu: int | None,
 ) -> Callable:
-    #  Config overrides (if provided)
     custom_config: dict = {
         "block_m": block_m,
         "block_n": block_n,
@@ -277,7 +277,6 @@ def _compile_launcher(
     }
     custom_config = {k: v for k, v in custom_config.items() if v is not None}
 
-    # Tuned config entry
     tuned_config = _get_tuned_config(
         dtype_str=dtype_str,
         num_heads=num_heads,
@@ -290,7 +289,6 @@ def _compile_launcher(
         has_targets=has_targets,
     )
 
-    # Default heuristic config
     default_config = _get_default_config(
         hidden_dim=hidden_dim,
         head_dim=head_dim,
@@ -393,6 +391,31 @@ def _validate_inputs(
     )
 
 
+def _enter_launch_stream(
+    stream: torch.cuda.Stream | None, *inputs: torch.Tensor | None
+) -> torch.cuda.Stream:
+    """Return the stream to launch on, ordered after the caller's current stream.
+
+    Callers must allocate every temporary and output under
+    `torch.cuda.stream(<returned stream>)`. The caching allocator recycles a
+    freed block on the stream it was allocated on, so a temporary allocated on
+    the current stream could be reused while the launch stream still reads it.
+    """
+    device = inputs[0].device
+    current_stream = torch.cuda.current_stream(device)
+    launch_stream = current_stream if stream is None else stream
+    if launch_stream.device != device:
+        raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
+    if launch_stream != current_stream:
+        # The inputs may still be being produced on the caller's stream, and
+        # the caller may free them while `launch_stream` still reads them.
+        launch_stream.wait_stream(current_stream)
+        for t in inputs:
+            if t is not None:
+                t.record_stream(launch_stream)
+    return launch_stream
+
+
 def flydsl_hstu_attention_fwd(
     N: int,
     alpha: float,
@@ -438,14 +461,11 @@ def flydsl_hstu_attention_fwd(
         waves_per_eu=waves_per_eu,
     )
 
-    out = torch.empty_like(v)
-    if num_targets is None:
-        num_targets = torch.zeros(1, dtype=seq_offsets.dtype, device=out.device)
-
-    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
-    if launch_stream.device != q.device:
-        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
-    with torch.cuda.device(q.device.index):
+    launch_stream = _enter_launch_stream(stream, q, k, v, seq_offsets, num_targets)
+    with torch.cuda.device(q.device.index), torch.cuda.stream(launch_stream):
+        out = torch.empty_like(v)
+        if num_targets is None:
+            num_targets = torch.zeros(1, dtype=seq_offsets.dtype, device=out.device)
         _run_compiled(
             launcher,
             N,
@@ -470,7 +490,7 @@ def _validate_bwd_inputs(
     num_targets: torch.Tensor | None,
     max_seq_len: int,
 ) -> tuple[int, int, int, int, str]:
-    """Validate backward inputs, reusing the forward's q/k/v checks.
+    """Validate backward inputs with the shared q/k/v checks.
 
     dout is the upstream gradient of the forward output O, so it must match v's
     (total_tokens, num_heads, hidden_dim) shape and dtype exactly.
@@ -500,19 +520,98 @@ def _validate_bwd_inputs(
             f"dout must share v's dtype, got dout={dout.dtype} v={v.dtype}"
         )
 
+    metadata = {"seq_offsets": seq_offsets}
+    if num_targets is not None:
+        metadata["num_targets"] = num_targets
+    for name, t in metadata.items():
+        if t.dim() != 1:
+            raise ValueError(f"{name} must be rank 1, got {tuple(t.shape)}")
+        if t.dtype not in _BWD_METADATA_DTYPES:
+            raise ValueError(f"{name} must be int32 or int64, got {t.dtype}")
+    # The kernels address token rows with 32-bit positions.
+    if q.shape[0] > torch.iinfo(torch.int32).max:
+        raise ValueError(f"total tokens must fit in int32, got {q.shape[0]}")
+
+    if os.environ.get("AITER_HSTU_VALIDATE", "0").lower() in ("1", "true"):
+        _validate_bwd_metadata_values(
+            seq_offsets, num_targets, total_tokens=q.shape[0], max_seq_len=max_seq_len
+        )
+
     return batch, num_heads, head_dim, hidden_dim, dtype_str
 
 
-# Backward tuned-config plumbing. The backward is two single-writer, fully
-# tile-parallel kernels: a fused dV+dK kernel (KV-owned, both reduce over the query
-# index and share one S recompute) and dQ (Q-owned, reduces over the key index).
-# The two kernels have *different* optimal tile configs, so the tuned CSV carries a `kernel`
-# discriminator column ("dvdk" | "dq") and each resolves its own config independently.
-# There is no dQ read-modify-write to synchronize and thus no sequence-parallel knob
-# to tune.
+_BWD_METADATA_DTYPES = (torch.int32, torch.int64)
+
+
+def _validate_bwd_metadata_values(
+    seq_offsets: torch.Tensor,
+    num_targets: torch.Tensor | None,
+    *,
+    total_tokens: int,
+    max_seq_len: int,
+) -> None:
+    """Check the metadata VALUES the kernels trust, behind AITER_HSTU_VALIDATE=1.
+
+    Off by default: reading the verdict back synchronises the host with the
+    device, which costs ~100 us per call (several times a small inference
+    call) and is illegal during CUDA graph capture.
+    """
+    # int64 throughout: the two tensors may differ in width, and narrowing an
+    # int64 to int32 would wrap an out-of-range value into a valid-looking one.
+    seq_offsets = seq_offsets.to(torch.int64)
+    lengths = seq_offsets.diff()
+    checks = {
+        "seq_offsets[0] must be 0": seq_offsets[0] != 0,
+        f"seq_offsets[-1] must equal the token count ({total_tokens})": (
+            seq_offsets[-1] != total_tokens
+        ),
+        "seq_offsets must be non-decreasing": (lengths < 0).any(),
+        f"sequence lengths must not exceed max_seq_len ({max_seq_len})": (
+            lengths > max_seq_len
+        ).any(),
+    }
+    if num_targets is not None:
+        targets = num_targets.to(torch.int64)
+        checks["num_targets must be non-negative"] = (targets < 0).any()
+        checks["num_targets must not exceed each sequence's length"] = (
+            targets > lengths
+        ).any()
+    failed = torch.stack(list(checks.values())).tolist()
+    errors = [msg for msg, bad in zip(checks, failed) if bad]
+    if errors:
+        raise ValueError("invalid hstu metadata: " + "; ".join(errors))
+
+
+# The default backward is the fused dV/dK/dQ ping-pong kernel: all three
+# gradients in one KV-owned pass, with dQ as a split-K partial that `dq_reduce`
+# then sums. It runs whenever its gate accepts the shape and its scratch fits;
+# AITER_HSTU_BWD_FUSED=0 or `fused=False` opts out.
+#
+# Everything else -- fp16, gfx950, head_dim != 64, a contextual prefix, more
+# heads than the reduction serves, explicit fallback tiles, or a scratch that
+# does not fit -- runs the fallback pair: dV/dK owns KV rows, dQ owns query
+# rows, and each single-writer kernel has an independent tuned configuration.
+# CSV tags identify the three kernels.
 _BWD_KERNEL_DVDK = "dvdk"
 _BWD_KERNEL_DQ = "dq"
-_BWD_KERNELS = (_BWD_KERNEL_DVDK, _BWD_KERNEL_DQ)
+_BWD_KERNEL_FUSED = "fused"
+_BWD_KERNELS = (
+    _BWD_KERNEL_DVDK,
+    _BWD_KERNEL_DQ,
+    _BWD_KERNEL_FUSED,
+)
+# The only tile the fused kernel is built for: 8 waves give 2 per SIMD inside
+# one barrier domain, and BLOCK_M quantises to 128 (8 waves x MFMA_M 16), so 256
+# and 384 are the only candidates -- and 384 spills.
+_BWD_FUSED_TILES = {
+    "block_m": 256,
+    "block_n": 16,
+    "num_waves": 8,
+    "waves_per_eu": 2,
+}
+# Fraction of the reachable memory (`_fused_scratch_budget`) the fp32 split-K
+# scratch and its carry may claim; the remainder is torch's allocator slack.
+_BWD_FUSED_MEM_BUDGET = 0.8
 
 _BWD_CSV_COLUMNS: list[str] = [
     "arch",
@@ -533,8 +632,7 @@ _BWD_CSV_COLUMNS: list[str] = [
     "duration_us",
 ]
 
-# Columns that identify the *problem* (everything except the tuned tile params +
-# duration_us).
+# Tile columns are excluded from the backward problem key.
 _BWD_TILE_COLUMNS = ("block_m", "block_n", "num_waves", "waves_per_eu")
 
 
@@ -570,7 +668,6 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
             "num_waves": int(row["num_waves"]),
             "waves_per_eu": int(row["waves_per_eu"]),
         }
-        # Key on (problem, kernel) so dVdK and dQ tune independently.
         return (problem_key, kernel), duration, kernel_config
 
     default_tuned_file = (
@@ -621,8 +718,7 @@ def _get_bwd_tuned_config(
     contextual_seq_len: int,
     has_targets: bool,
 ) -> dict:
-    """Returns the tuned config for one backward kernel ("dvdk" | "dq"), if the
-    CSV has an entry for this (problem, kernel)."""
+    """Return a backward kernel's tuned config, if present."""
     problem_key = _problem_key(
         _GPU_ARCH,
         dtype_str,
@@ -638,43 +734,95 @@ def _get_bwd_tuned_config(
     return _bwd_tuned_config_map().get((problem_key, kernel), {})
 
 
+def _gather_index(B: int, groups: int, device: str) -> torch.Tensor:
+    """Map sorted ranks to grid groups with an alternating-direction deal.
+
+    Alternating the group direction each round distributes long and short
+    sequences across the hardware groups. The mapping depends only on shape.
+    """
+    rank = torch.arange(B, device=device)
+    rnd, pos = rank // groups, rank % groups
+    group = torch.where(rnd % 2 == 0, pos, (groups - 1) - pos)
+    slot = group * (B // groups) + rnd
+    inv = torch.empty_like(rank)
+    inv[slot] = rank
+    return inv
+
+
+def _identity(B: int, device: str) -> torch.Tensor:
+    return torch.arange(B, dtype=torch.int32, device=device)
+
+
+@functools.lru_cache(maxsize=64)
+def _balance_gather_index(
+    B: int, groups: int, device: str
+) -> tuple[torch.Tensor, torch.cuda.Event]:
+    """Cached `_gather_index`."""
+    return _publish_cached(_gather_index(B, groups, device))
+
+
+@functools.lru_cache(maxsize=64)
+def _identity_perm(B: int, device: str) -> tuple[torch.Tensor, torch.cuda.Event]:
+    """Cached identity permutation."""
+    return _publish_cached(_identity(B, device))
+
+
+def _publish_cached(t: torch.Tensor) -> tuple[torch.Tensor, torch.cuda.Event]:
+    """Pair a freshly built cached device tensor with its completion event.
+
+    The cache is shared by every stream, while the producing stream is known
+    only here, so readers order themselves after the build through the event
+    (`_use_cached`) instead of the host waiting for it.
+    """
+    built = torch.cuda.Event()
+    built.record(torch.cuda.current_stream(t.device))
+    return t, built
+
+
+def _use_cached(entry: tuple[torch.Tensor, torch.cuda.Event]) -> torch.Tensor:
+    """Read a cached device tensor on the current stream.
+
+    Waits for the build on the device; waiting on a completed event is cheap.
+    The wait is unconditional because `Event.query()` would invalidate a
+    stream capture. Recording the reader's stream keeps an eviction from
+    recycling the block under a queued reader.
+    """
+    t, built = entry
+    stream = torch.cuda.current_stream(t.device)
+    stream.wait_event(built)
+    t.record_stream(stream)
+    return t
+
+
 def _build_balance_perm(
     seq_offsets: torch.Tensor, groups: int = NUM_GRID_GROUPS
 ) -> torch.Tensor:
-    """Group-aware sort-by-length permutation for the bwd grid.
+    """Balance quadratic sequence work across contiguous grid groups.
 
-    FlyDSL's grid uses `grid_group = block_id % NUM_GRID_GROUPS`, which partitions
-    the batch into `groups` contiguous chunks. A *naive* descending sort would pile
-    all the long sequences into one group and starve the rest (measured ~2.5x
-    slower). Instead, deal the length-sorted sequences round-robin across the
-    groups so every group gets a Sum(n^2)-balanced, longest-first (LPT) set. The
-    kernel remaps `batch_idx = perm[batch_idx]`.
-
-    Returns an int32 tensor `perm` of length B where `perm[slot]` is the sequence
-    that grid slot should process. Falls back to identity when the group
-    boundaries don't align to whole batches (B not divisible by `groups`).
+    Sequences are sorted by length, then dealt across groups in alternating
+    directions. `perm[slot]` is the sequence processed by that grid slot.
+    Unaligned batches use identity order because group boundaries split the deal.
     """
     lengths = seq_offsets[1:] - seq_offsets[:-1]
     B = int(lengths.numel())
-    device = seq_offsets.device
+    device = str(seq_offsets.device)
+    # Under capture the index is built into the graph instead: a cached tensor
+    # made here would hold nothing until the first replay, so an eager call in
+    # between would read unwritten memory.
+    capturing = torch.cuda.is_current_stream_capturing()
     if B % groups != 0:
-        return torch.arange(B, dtype=torch.int32, device=device)
-    per = B // groups
+        if capturing:
+            return _identity(B, device)
+        return _use_cached(_identity_perm(B, device))
     order = torch.argsort(lengths, descending=True)  # sequence indices, longest first
-    rank = torch.arange(B, device=device)
-    slot = (rank % groups) * per + (rank // groups)
-    perm = torch.empty(B, dtype=torch.int32, device=device)
-    perm[slot] = order.to(torch.int32)
-    return perm
+    if capturing:
+        inv = _gather_index(B, groups, device)
+    else:
+        inv = _use_cached(_balance_gather_index(B, groups, device))
+    return order[inv].to(torch.int32)
 
 
-# Fallback tiles tried after the per-kernel pick, in descending size order. A
-# hidden_dim that is not a multiple of 64 constrains the V DMA (the hidden_dim /
-# vec_v lanes per row must divide the thread block), and on gfx950 the wider dwordx4
-# DMA makes the dO tile divide a 4x larger pass -- num_waves is what buys back both,
-# so these trade block size for a wave count that fits. The forward's equivalent map
-# only has to cover 96/160/192; the backward streams a second (dO) tile, so more of
-# the dim space needs a non-default wave count.
+# Fallbacks trade tile size for wave counts that satisfy K/V and dO DMA divisibility.
 _BWD_FALLBACK_TILES = (
     (96, 48, 3, 0),
     (160, 80, 5, 0),
@@ -691,20 +839,8 @@ _BWD_FALLBACK_TILES = (
 def _get_bwd_default_config(
     kernel: str, *, head_dim: int, hidden_dim: int, arch: str | None = None
 ) -> dict:
-    """Conservative heuristic default when no tuned entry exists.
-
-    Picks the first candidate tile this (head_dim, hidden_dim, arch) actually
-    validates for, so the fallback cannot advertise a config the kernel refuses to
-    build. Per-kernel tuned CSV entries override the result; the per-kernel win
-    comes from the tuned CSV, whose entries are validated per shape.
-
-    The probe passes neutral values for the args that do not enter the tile
-    geometry (head/batch counts, mask extents, alpha, seq len) -- only the dims,
-    the tile, and the arch's DMA width and LDS budget do.
-    """
-    base = (
-        (128, 32, 4, 0) if kernel == _BWD_KERNEL_DVDK else (64, 32, 4, 0)
-    )  # historical pick, kept first so 64-aligned dims are unaffected
+    """Return the first fallback tile valid for these dimensions and architecture."""
+    base = (128, 32, 4, 0) if kernel == _BWD_KERNEL_DVDK else (64, 32, 4, 0)
     candidates = (base, *_BWD_FALLBACK_TILES)
     last_error = None
     for block_m, block_n, num_waves, waves_per_eu in candidates:
@@ -715,7 +851,7 @@ def _get_bwd_default_config(
             "waves_per_eu": waves_per_eu,
         }
         try:
-            validate_hstu_attention_bwd(
+            validate_hstu_attention_bwd_fallback(
                 1,
                 head_dim,
                 hidden_dim,
@@ -761,15 +897,11 @@ def _compile_bwd_launcher(
     waves_per_eu: int | None,
     has_perm: bool = False,
 ) -> tuple[Callable, Callable]:
-    """Builds the (dV+dK, dQ) launcher pair, resolving tuned -> default -> custom
-    per kernel.
+    """Build dV/dK and dQ launchers with independent kernel configurations.
 
-    Returns two launchers: the fused KV-owned kernel producing BOTH dV and dK from
-    one S recompute (reducing over the query index) and the Q-owned kernel producing
-    dQ. Each resolves its own tile config independently.
+    Explicit overrides take precedence over tuned entries and defaults.
     """
-    # Explicit overrides apply to BOTH kernels (this is what the block-size
-    # override tests and the tuner's per-kernel timing rely on).
+    # Explicit overrides apply to both kernels.
     custom_config: dict = {
         "block_m": block_m,
         "block_n": block_n,
@@ -779,7 +911,6 @@ def _compile_bwd_launcher(
     custom_config = {k: v for k, v in custom_config.items() if v is not None}
 
     def _resolve(kernel: str) -> dict:
-        # Precedence per kernel: explicit override > tuned CSV entry > default.
         tuned_config = _get_bwd_tuned_config(
             kernel=kernel,
             dtype_str=dtype_str,
@@ -811,12 +942,491 @@ def _compile_bwd_launcher(
         "max_seq_len": max_seq_len,
         "has_perm": has_perm,
     }
-    dvdk_config = _resolve(_BWD_KERNEL_DVDK)
-    dq_config = _resolve(_BWD_KERNEL_DQ)
-
-    dvdk_launcher = build_hstu_attention_bwd_dvdk(**common_kwargs, **dvdk_config)
-    dq_launcher = build_hstu_attention_bwd_dq(**common_kwargs, **dq_config)
+    dvdk_launcher = build_hstu_attention_bwd_dvdk(
+        **common_kwargs, **_resolve(_BWD_KERNEL_DVDK)
+    )
+    dq_launcher = build_hstu_attention_bwd_dq(
+        **common_kwargs, **_resolve(_BWD_KERNEL_DQ)
+    )
     return dvdk_launcher, dq_launcher
+
+
+@functools.cache
+def _device_arch_and_cus(device_index: int) -> tuple[str, int]:
+    """(arch, CU count) of one device.
+
+    Per device rather than the process-wide arch helpers: a node can mix
+    gfx942 products, e.g. a 304-CU MI300X next to an 80-CU MI308X.
+    """
+    props = torch.cuda.get_device_properties(device_index)
+    arch = props.gcnArchName.split(":", 1)[0].lower()
+    return arch, torch_processor_count_to_cu(arch, props.multi_processor_count)
+
+
+def _resolve_bwd_fused_config(
+    *,
+    device: torch.device,
+    dtype_str: str,
+    num_heads: int,
+    head_dim: int,
+    hidden_dim: int,
+    batch: int,
+    max_seq_len: int,
+    causal: bool,
+    has_targets: bool,
+    alpha: float,
+    max_attn_len: int,
+    contextual_seq_len: int,
+    custom_config: dict,
+    fused: bool | None,
+) -> dict | None:
+    """The fused kernel's config for this problem, or None to use dvdk + dq.
+
+    `fused` is the caller's explicit request: None uses the fused kernel
+    wherever its gate accepts the shape (unless AITER_HSTU_BWD_FUSED=0), True
+    *requires* it and re-raises the gate's error rather than falling back, False
+    never uses it. True exists because the default degrades to the fallback pair
+    silently, which is how a benchmark ends up timing a kernel it did not ask
+    for.
+    """
+    if fused is False:
+        return None
+    if fused is None and os.environ.get("AITER_HSTU_BWD_FUSED", "").lower() in (
+        "0",
+        "false",
+    ):
+        return None
+
+    tuned_config = _get_bwd_tuned_config(
+        kernel=_BWD_KERNEL_FUSED,
+        dtype_str=dtype_str,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        batch=batch,
+        max_seq_len=max_seq_len,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        has_targets=has_targets,
+    )
+    # A tuned row brings its own tile and has to match the gate anyway; explicit
+    # tiles are the fallback pair's, so any that differ fail the gate below.
+    config = {**_BWD_FUSED_TILES, **tuned_config, **custom_config}
+    arch, num_cus = _device_arch_and_cus(device.index)
+    try:
+        validate_hstu_attention_bwd(
+            num_heads,
+            head_dim,
+            hidden_dim,
+            causal,
+            max_attn_len,
+            contextual_seq_len,
+            has_targets,
+            alpha,
+            dtype_str,
+            max_seq_len,
+            **config,
+            arch=arch,
+            num_cus=num_cus,
+        )
+    except ValueError as exc:
+        if fused is True:
+            raise
+        logger.debug("hstu bwd fused not applicable, using dvdk + dq: %s", exc)
+        return None
+    return config
+
+
+def _fused_scratch_budget(device: torch.device) -> float:
+    """Bytes the split-K scratch and carry may plan for on `device`.
+
+    Free device memory plus the cached segments with nothing live in them,
+    which an allocation can reuse whole or the allocator can hand back. The free
+    pieces of a partly-used segment are neither: they fit the scratch only if a
+    single piece already does, and they never return to the driver.
+    """
+    free, _total = torch.cuda.mem_get_info(device)
+    stats = torch.cuda.memory_stats(device)
+    releasable = (
+        stats.get("reserved_bytes.all.current", 0)
+        - stats.get("allocated_bytes.all.current", 0)
+        - stats.get("inactive_split_bytes.all.current", 0)
+    )
+    return (free + max(releasable, 0)) * _BWD_FUSED_MEM_BUDGET
+
+
+def _plan_fused_groups(
+    counts: list[int],
+    *,
+    block_m: int,
+    num_heads: int,
+    head_dim: int,
+    max_seq_len: int,
+    total_tokens: int,
+    groups: int | str,
+    device: torch.device,
+) -> tuple[int, list, torch.Tensor, torch.Tensor]:
+    """Chunk the kv tiles into passes that fit, and allocate the scratch.
+
+    `counts` holds each kv tile's scratch rows on the host. Returns
+    `(G, spans, dq_part, dq_carry)`.
+
+    The fp32 partials dominate the fused path's memory, so the kv tiles are
+    chunked into G passes over ONE reused buffer. `groups="auto"` takes the
+    SMALLEST G that fits: every extra pass adds a fully serialised reduction
+    (reduce(g) must finish before fused(g+1) overwrites the scratch) plus carry
+    traffic, which exists only at G > 1 and costs 2*(G-1) passes over L*H*D
+    fp32.
+
+    Memory is settled by ATTEMPTING, not by predicting: the estimate below
+    cannot see how the reachable memory is laid out, while the scratch is one
+    large contiguous block. So: estimate, try, and on OOM release the cache and
+    step G up.
+
+    The estimate has to stay on the safe side, because a failed attempt is far
+    from free: the allocator first releases every whole cached segment --
+    including the previous call's scratch, the one block this call could have
+    reused -- and the planner then reallocates it, several hundred ms per call
+    at deployment sizes. Hence `_fused_scratch_budget` ignores the free pieces
+    of partly-used segments.
+
+    `empty_cache()` is deliberately NOT on the fast path. It hands the scratch
+    back to the driver, so the next call could not reuse it.
+    """
+    n_kv_tiles = len(counts)
+    elems = num_heads * head_dim
+    if groups != "auto" and not 1 <= int(groups) <= n_kv_tiles:
+        # Past n_kv_tiles the split cannot give every group a tile, and the
+        # spans come back overlapping rather than empty -- a silently wrong
+        # reduction instead of a failed one.
+        raise ValueError(
+            f"fused_groups must be in 1..{n_kv_tiles} (kv tiles at "
+            f"max_seq_len={max_seq_len}, block_m={block_m}), got {groups}"
+        )
+
+    def _plan(g):
+        spans = balanced_tile_groups(counts, g)
+        rows = span_scratch_rows(counts, spans)
+        carry_rows = 0 if g == 1 else total_tokens
+        return spans, rows, (rows + carry_rows) * elems * 4
+
+    if groups != "auto":
+        candidates = [int(groups)]
+    else:
+        budget = _fused_scratch_budget(device)
+        first = next(
+            (g for g in range(1, n_kv_tiles + 1) if _plan(g)[2] <= budget),
+            n_kv_tiles,
+        )
+        candidates = list(range(first, n_kv_tiles + 1))
+
+    last_error = None
+    for g in candidates:
+        spans, rows, _nbytes = _plan(g)
+        dq_part = dq_carry = None
+        try:
+            # `empty`, not `zeros`: the reduction reads only rows the fused
+            # kernel wrote. Each slot is sized to exactly the q rows its tile
+            # serves and the kernel stores every one of them; the reduction
+            # clamps row indices to seq_len-1 and, under a window, never
+            # reads past a slot. Keep the two in step or restore the memset.
+            dq_part = torch.empty(rows, elems, dtype=torch.float32, device=device)
+            dq_carry = (
+                torch.zeros(1, 1, dtype=torch.float32, device=device)
+                if g == 1
+                else torch.zeros(
+                    total_tokens, elems, dtype=torch.float32, device=device
+                )
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            last_error = str(exc)
+            # Drop a scratch that did fit before the carry did not, then hand
+            # the fragmented cached blocks back to the driver.
+            dq_part = dq_carry = None
+            torch.cuda.empty_cache()
+            continue
+        return g, spans, dq_part, dq_carry
+
+    raise MemoryError(
+        f"hstu bwd fused: no kv-chunking in {candidates[0]}..{candidates[-1]} "
+        f"fits -- the smallest pass still needs "
+        f"{_plan(candidates[-1])[2] / 1e9:.1f} GB "
+        f"({last_error})"
+    )
+
+
+def _make_bwd_fused_runners(
+    N: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    causal: bool,
+    num_targets: torch.Tensor | None,
+    max_attn_len: int,
+    contextual_seq_len: int,
+    *,
+    config: dict | None = None,
+    sort_by_length: bool = True,
+    groups: int | str = "auto",
+    stream: torch.cuda.Stream | None = None,
+) -> dict:
+    """Build the fused kernel's phase runners, for the dispatch and for tuning.
+
+    Returns ``{"fused": fn, "dq_reduce": fn, "all": fn, "fused_pass": fn(g),
+    "reduce_pass": fn(g), "outputs": (dq, dk, dv), "groups": G,
+    "spans": [(lo, hi), ...], "scratch": tensor, "offsets": [tensor, ...],
+    "scratch_bytes": int, "carry_bytes": int, "reduce_bytes": int}``.
+
+    `all` interleaves the passes -- fused(0), reduce(0), fused(1), ... -- which
+    is the only order that produces correct gradients: reduce(g) must finish
+    before fused(g+1) overwrites the shared scratch. `fused` and `dq_reduce`
+    run every pass of ONE phase back to back. At G > 1 that is only meaningful
+    for timing, and leaves `outputs` wrong until `all` runs again.
+
+    All work, including this function's own preparation, is queued on `stream`
+    (default: the current stream), after the work already queued on the
+    current stream. The outputs and temporaries are allocated on `stream`; a
+    caller consuming the outputs on another stream must synchronise first.
+
+    dV/dK come straight out of the fused kernel. dQ is accumulated over each
+    workgroup's KV range into an fp32 HBM scratch and summed by the reduction.
+    """
+    batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
+        q=q,
+        k=k,
+        v=v,
+        dout=dout,
+        seq_offsets=seq_offsets,
+        num_targets=num_targets,
+        max_seq_len=N,
+    )
+    has_targets = num_targets is not None
+    if config is None:
+        # A direct caller asked for this kernel by name, so the gate raises
+        # rather than silently handing back the dvdk + dq pair.
+        config = _resolve_bwd_fused_config(
+            device=q.device,
+            dtype_str=dtype_str,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            hidden_dim=hidden_dim,
+            batch=batch,
+            max_seq_len=N,
+            causal=causal,
+            has_targets=has_targets,
+            alpha=alpha,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            custom_config={},
+            fused=True,
+        )
+
+    arch, num_cus = _device_arch_and_cus(q.device.index)
+    fused_launcher = build_hstu_attention_bwd(
+        num_heads,
+        head_dim,
+        hidden_dim,
+        causal,
+        max_attn_len,
+        contextual_seq_len,
+        has_targets,
+        alpha,
+        dtype_str,
+        max_seq_len=N,
+        has_perm=sort_by_length,
+        **config,
+        arch=arch,
+        num_cus=num_cus,
+    )
+
+    launch_stream = _enter_launch_stream(
+        stream, q, k, v, dout, seq_offsets, num_targets
+    )
+    with torch.cuda.stream(launch_stream):
+        return _prepare_bwd_fused_runners(
+            fused_launcher,
+            q,
+            k,
+            v,
+            dout,
+            seq_offsets,
+            num_targets,
+            batch=batch,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype_str=dtype_str,
+            max_seq_len=N,
+            max_attn_len=max_attn_len,
+            block_m=config["block_m"],
+            sort_by_length=sort_by_length,
+            groups=groups,
+            launch_stream=launch_stream,
+        )
+
+
+def _prepare_bwd_fused_runners(
+    fused_launcher,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: torch.Tensor | None,
+    *,
+    batch: int,
+    num_heads: int,
+    head_dim: int,
+    dtype_str: str,
+    max_seq_len: int,
+    max_attn_len: int,
+    block_m: int,
+    sort_by_length: bool,
+    groups: int | str,
+    launch_stream: torch.cuda.Stream,
+) -> dict:
+    """Body of `_make_bwd_fused_runners`, run with `launch_stream` current."""
+    device = q.device
+    elems = num_heads * head_dim
+    has_targets = num_targets is not None
+
+    nt = num_targets
+    if nt is None:
+        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=device)
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    do_c = dout.contiguous()
+    so_c = seq_offsets.contiguous()
+    nt_c = nt.contiguous()
+    if sort_by_length:
+        perm_c = _build_balance_perm(so_c).contiguous()
+    else:
+        perm_c = torch.zeros(1, dtype=torch.int32, device=device)
+    total_tokens = q_c.shape[0]
+
+    dv = torch.empty_like(v_c)
+    dk = torch.empty_like(k_c)
+    dq = torch.empty_like(q_c)
+
+    # The tables depend on the sequence lengths, which change every training
+    # step, so they are rebuilt per call. The planner needs only the per-tile
+    # row counts and the reduction grid, copied to the host together.
+    rows = slot_rows(
+        so_c,
+        block_m,
+        max_seq_len=max_seq_len,
+        max_attn_len=max_attn_len,
+        num_targets=num_targets,
+    )
+    blocks_per_seq = reduce_blocks_per_seq(so_c)
+    host = torch.cat([rows.sum(0), blocks_per_seq.sum().reshape(1)]).tolist()
+    counts, n_blocks = host[:-1], host[-1]
+
+    if n_blocks == 0:
+        # No tokens at all: nothing to compute, and a zero-size grid is not
+        # launchable.
+        def _noop(*_args) -> None:
+            return None
+
+        return {
+            "fused": _noop,
+            "dq_reduce": _noop,
+            "all": _noop,
+            "fused_pass": _noop,
+            "reduce_pass": _noop,
+            "outputs": (dq, dk, dv),
+            "groups": 0,
+            "spans": [],
+            "scratch": None,
+            "offsets": [],
+            "scratch_bytes": 0,
+            "carry_bytes": 0,
+            "reduce_bytes": 0,
+        }
+
+    n_groups, spans, dq_part, dq_carry = _plan_fused_groups(
+        counts,
+        block_m=block_m,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        max_seq_len=max_seq_len,
+        total_tokens=total_tokens,
+        groups=groups,
+        device=device,
+    )
+    max_tiles = len(counts)
+    offs = [build_partial_offsets(rows, tile_lo=lo, tile_hi=hi) for lo, hi in spans]
+    red_map = build_reduce_map(blocks_per_seq, n_blocks)
+
+    reduce_launchers = [
+        build_hstu_attention_bwd_dq_reduce(
+            num_heads,
+            head_dim,
+            block_m,
+            max_tiles,
+            dtype_str,
+            max_attn_len=max_attn_len,
+            has_targets=has_targets,
+            first_pass=(g == 0),
+            last_pass=(g == n_groups - 1),
+        )
+        for g in range(n_groups)
+    ]
+
+    def run_fused(g: int) -> None:
+        lo, hi = spans[g]
+        with torch.cuda.device(device.index):
+            _run_compiled(
+                fused_launcher, batch, q_c, k_c, v_c, do_c, so_c, nt_c, perm_c,
+                dv, dk, dq_part, offs[g],
+                fx.Int32(lo), fx.Int32(hi), fx.Stream(launch_stream),
+            )  # fmt: skip
+
+    def run_reduce(g: int) -> None:
+        lo, hi = spans[g]
+        with torch.cuda.device(device.index):
+            _run_compiled(
+                reduce_launchers[g], fx.Int32(n_blocks), dq_part, offs[g],
+                red_map, so_c, nt_c, dq_carry, dq,
+                fx.Int32(lo), fx.Int32(hi), fx.Stream(launch_stream),
+            )  # fmt: skip
+
+    def run_all() -> None:
+        # Serialised by construction: reduce(g) must finish before fused(g+1)
+        # overwrites the scratch. Double-buffering would overlap them but
+        # restores the footprint chunking exists to avoid.
+        for g in range(n_groups):
+            run_fused(g)
+            run_reduce(g)
+
+    # Bytes the reduction must move: every partial read once, dq written once,
+    # PLUS the fp32 carry, which only exists at G > 1 -- every pass but the
+    # first reads it and every pass but the last writes it.
+    carry_bytes = 2 * (n_groups - 1) * total_tokens * elems * 4
+    return {
+        "fused": lambda: [run_fused(g) for g in range(n_groups)],
+        "dq_reduce": lambda: [run_reduce(g) for g in range(n_groups)],
+        "all": run_all,
+        # Single-pass variants, for a profiler that has to pin ONE dispatch:
+        # the passes have different grids, so their traces are not comparable.
+        "fused_pass": run_fused,
+        "reduce_pass": run_reduce,
+        "outputs": (dq, dk, dv),
+        "groups": n_groups,
+        "spans": spans,
+        # The scratch is allocated ONCE and reused by every pass, so its size
+        # is the footprint at any instant, not the sum over passes.
+        "scratch": dq_part,
+        "offsets": offs,
+        "scratch_bytes": dq_part.numel() * dq_part.element_size(),
+        "carry_bytes": dq_carry.numel() * dq_carry.element_size(),
+        "reduce_bytes": (
+            sum(counts) * elems * 4 + q_c.numel() * q_c.element_size() + carry_bytes
+        ),
+    }
 
 
 def flydsl_hstu_attention_bwd(
@@ -837,14 +1447,39 @@ def flydsl_hstu_attention_bwd(
     num_waves: int | None = None,
     waves_per_eu: int | None = None,
     sort_by_length: bool = True,
+    fused: bool | None = None,
+    fused_groups: int | str = "auto",
     stream: torch.cuda.Stream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """HSTU attention backward: returns (dq, dk, dv).
 
-    Recomputes S = alpha*Q*K^T and sigma from Q,K (nothing is stashed by the
-    forward), then dV = A^T dO, dS = M .* (1/N) sigma(1+S(1-sigma)) .* (dO V^T),
-    dQ = alpha dS K, dK = alpha dS^T Q. Mirrors the forward's conventions
-    (causal-only, {f16,bf16}, alpha-in-score, 1/N on dS, fast-math SiLU).
+    Recomputes `Z = alpha * Q * K^T`, then applies the mask, SiLU derivative,
+    and `1/N` normalization.
+
+    The default kernel computes dV, dK and dQ in one pass. It is specialized for
+    gfx942 / bf16 / head_dim == hidden_dim == 64 / no contextual prefix and its
+    own tile, and trades a large fp32 split-K scratch for the latency win, so
+    `fused_groups` chunks the kv tiles into passes over one reused buffer
+    ("auto" picks the smallest G that fits). Any other shape, explicit tile
+    overrides, or a scratch that does not fit run the fallback pair instead,
+    which computes dV/dK in one kernel and dQ in a second.
+
+    `fused` overrides the choice: None picks as above (AITER_HSTU_BWD_FUSED=0
+    forces the fallback), True requires the single-pass kernel and raises
+    instead of falling back, False always uses the fallback pair.
+
+    All work is queued on `stream` (default: the current stream), after the
+    work already queued on the current stream. The returned gradients are
+    allocated on `stream` and are complete only once that stream reaches this
+    point: a caller consuming them on another stream must synchronise first,
+    e.g. `torch.cuda.current_stream().wait_stream(stream)`, and call
+    `record_stream` if it frees them there.
+
+    `seq_offsets` must start at 0, be non-decreasing, and end at the token
+    count. Each sequence must be at most `N` long, and each `num_targets`
+    entry between 0 and its sequence's length. Those values are not checked
+    by default, because doing so synchronises the host with the device; set
+    AITER_HSTU_VALIDATE=1 to check them.
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q,
@@ -855,11 +1490,73 @@ def flydsl_hstu_attention_bwd(
         num_targets=num_targets,
         max_seq_len=N,
     )
+    if q.shape[0] == 0:
+        # No tokens: nothing to launch, and every kernel's out-of-bounds lanes
+        # rely on global row 0 existing.
+        launch_stream = _enter_launch_stream(
+            stream, q, k, v, dout, seq_offsets, num_targets
+        )
+        with torch.cuda.stream(launch_stream):
+            return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
-    # Two single-writer kernels (no atomics): the fused dV+dK kernel reduces over
-    # the query index (KV-owned) and produces both families from one S recompute;
-    # dQ reduces over the key index (Q-owned).
-    # Config precedence: explicit overrides > per-kernel tuned CSV > default heuristic.
+    custom_config = {
+        key: value
+        for key, value in (
+            ("block_m", block_m),
+            ("block_n", block_n),
+            ("num_waves", num_waves),
+            ("waves_per_eu", waves_per_eu),
+        )
+        if value is not None
+    }
+    fused_config = _resolve_bwd_fused_config(
+        device=q.device,
+        dtype_str=dtype_str,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        batch=batch,
+        max_seq_len=N,
+        causal=causal,
+        has_targets=num_targets is not None,
+        alpha=alpha,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        custom_config=custom_config,
+        fused=fused,
+    )
+
+    if fused_config is not None:
+        try:
+            runners = _make_bwd_fused_runners(
+                N,
+                alpha,
+                q,
+                k,
+                v,
+                dout,
+                seq_offsets,
+                causal,
+                num_targets,
+                max_attn_len,
+                contextual_seq_len,
+                config=fused_config,
+                sort_by_length=sort_by_length,
+                groups=fused_groups,
+                stream=stream,
+            )
+            runners["all"]()
+            return runners["outputs"]
+        except (MemoryError, torch.cuda.OutOfMemoryError) as exc:
+            # An explicit `fused=True` asked for this kernel specifically, so a
+            # scratch that does not fit is an error, not a reason to quietly
+            # run something else. Otherwise the pair below is always correct.
+            if fused is True:
+                raise
+            logger.warning(
+                "hstu bwd fused scratch does not fit, using dvdk + dq: %s", exc
+            )
+
     dvdk_launcher, dq_launcher = _compile_bwd_launcher(
         batch=batch,
         max_seq_len=N,
@@ -879,32 +1576,32 @@ def flydsl_hstu_attention_bwd(
         has_perm=sort_by_length,
     )
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    launch_stream = _enter_launch_stream(
+        stream, q, k, v, dout, seq_offsets, num_targets
+    )
+    with torch.cuda.device(q.device.index), torch.cuda.stream(launch_stream):
+        nt = num_targets
+        if nt is None:
+            nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
 
-    nt = num_targets
-    if nt is None:
-        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
+        q_c = q.contiguous()
+        k_c = k.contiguous()
+        v_c = v.contiguous()
+        do_c = dout.contiguous()
+        so_c = seq_offsets.contiguous()
+        nt_c = nt.contiguous()
 
-    q_c = q.contiguous()
-    k_c = k.contiguous()
-    v_c = v.contiguous()
-    do_c = dout.contiguous()
-    so_c = seq_offsets.contiguous()
-    nt_c = nt.contiguous()
+        # Disabled kernels receive a dummy permutation that compile-time guards
+        # never read.
+        if sort_by_length:
+            perm_c = _build_balance_perm(so_c).contiguous()
+        else:
+            perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
 
-    # Optional group-aware sort-by-length load balancing (see _build_balance_perm).
-    # A dummy 1-elem perm is passed (and never indexed) when disabled.
-    if sort_by_length:
-        perm_c = _build_balance_perm(so_c).contiguous()
-    else:
-        perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
 
-    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
-    if launch_stream.device != q.device:
-        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
-    with torch.cuda.device(q.device.index):
         _run_compiled(
             dvdk_launcher,
             batch,
@@ -955,16 +1652,9 @@ def _make_bwd_kernel_runners(
     sort_by_length: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> dict:
-    """Tuning/profiling helper: build the (dV+dK, dQ) launcher pair with an
-    explicit tile config forced on both, and return, per kernel, a zero-arg
-    callable that launches ONLY that kernel plus the output tensors it writes:
-    {"dvdk": (fn, (dv, dk)), "dq": (fn, (dq,))}.
+    """Build independent runners for tuning and validating each backward kernel.
 
-    This lets the tuner time the two backward kernels independently (they have
-    different optimal configs) without going through the public entry point,
-    which always launches both, and read back each kernel's output so a config
-    that compiles but computes garbage can be rejected before it is timed. Not
-    part of the public API.
+    Returns `{"dvdk": (runner, (dv, dk)), "dq": (runner, (dq,))}`.
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q,
@@ -994,29 +1684,29 @@ def _make_bwd_kernel_runners(
         has_perm=sort_by_length,
     )
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    launch_stream = _enter_launch_stream(
+        stream, q, k, v, dout, seq_offsets, num_targets
+    )
+    with torch.cuda.device(q.device.index), torch.cuda.stream(launch_stream):
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
 
-    nt = num_targets
-    if nt is None:
-        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
+        nt = num_targets
+        if nt is None:
+            nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
 
-    q_c = q.contiguous()
-    k_c = k.contiguous()
-    v_c = v.contiguous()
-    do_c = dout.contiguous()
-    so_c = seq_offsets.contiguous()
-    nt_c = nt.contiguous()
+        q_c = q.contiguous()
+        k_c = k.contiguous()
+        v_c = v.contiguous()
+        do_c = dout.contiguous()
+        so_c = seq_offsets.contiguous()
+        nt_c = nt.contiguous()
 
-    if sort_by_length:
-        perm_c = _build_balance_perm(so_c).contiguous()
-    else:
-        perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
-
-    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
-    if launch_stream.device != q.device:
-        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
+        if sort_by_length:
+            perm_c = _build_balance_perm(so_c).contiguous()
+        else:
+            perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
 
     def run_dvdk():
         with torch.cuda.device(q.device.index):
@@ -1058,13 +1748,7 @@ def _make_bwd_kernel_runners(
 
 
 class FlydslHstuAttention(torch.autograd.Function):
-    """Differentiable HSTU attention: FlyDSL forward + backward as one autograd op.
-
-    Mirrors the Triton `_AttentionFunction`. forward calls
-    `flydsl_hstu_attention_fwd`; backward calls `flydsl_hstu_attention_bwd` (which
-    launches the KV-owned dV/dK kernel and the Q-owned dQ kernel) and returns grads
-    for (q, k, v) only, with None for the non-tensor / non-differentiable args.
-    """
+    """Differentiable FlyDSL HSTU attention with gradients for q, k, and v."""
 
     @staticmethod
     def forward(
@@ -1080,8 +1764,7 @@ class FlydslHstuAttention(torch.autograd.Function):
         max_attn_len: int,
         contextual_seq_len: int,
     ) -> torch.Tensor:
-        # Supports only the causal and hstu (causal + targets) masks; reject here
-        # rather than in backward.
+        # Reject unsupported masks before saving autograd state.
         if not causal:
             raise ValueError("flydsl_hstu_attention requires causal=True")
 
@@ -1126,8 +1809,7 @@ class FlydslHstuAttention(torch.autograd.Function):
                 ctx.max_attn_len,
                 ctx.contextual_seq_len,
             )
-        # Grad positions match forward args:
-        # (N, alpha, q, k, v, seq_offsets, causal, num_targets, max_attn_len, contextual_seq_len)
+        # Gradient positions match the forward arguments.
         return None, None, dq, dk, dv, None, None, None, None, None
 
 
