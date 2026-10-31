@@ -1147,12 +1147,14 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     if config is not None and config["libtype"] == "opus":
         from csrc.opus_gemm.opus_gemm_common import (
             a8w8_mxscale_bpreshuffle_supports_shape,
-            get_registry,
+            get_kernel_instance,
         )
 
         kid = int(config["kernelId"])
         gfx, cu_num = get_gfx(), get_cu_num()
-        instance = get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).get(kid)
+        instance = get_kernel_instance(
+            gfx, "a8w8_blockscale_bpreshuffle", kid, cu_num=cu_num
+        )
         if instance is None:
             raise ValueError(f"Unknown or unavailable OPUS MXFP8 bpreshuffle kid {kid}")
         if (

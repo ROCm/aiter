@@ -304,7 +304,7 @@ def _check_gfx950_pin(entry, path, llvm_bin, *, fail_on_spill=False):
         if fail_on_spill:
             raise ValueError(message)
         print(f"[build_co] warning: {message}", file=sys.stderr)
-    mask = entry["pin_mask"]
+    mask = entry.get("pin_mask", 0)
     if not mask:
         return fields
     asm = _run([_tool(llvm_bin, "llvm-objdump"), "-d", "--mcpu=gfx950", path]).stdout
@@ -407,17 +407,21 @@ def build_one_gfx950(entry, args, llvm_bin, workdir):
             checksum = hashlib.sha256(stream.read()).hexdigest()
         if not reuse:
             os.replace(staged, output)
-        return {
+        record = {
             "kid": entry["kid"],
             "name": entry["name"],
             "image": entry["image"],
             "symbol": symbol,
             "status": "ready",
+            "reused": reuse,
             "co_sha256": checksum,
             **target,
             **linked,
             **resources,
         }
+        if not reuse:
+            record["device_flags"] = device_flags
+        return record
     except subprocess.CalledProcessError as error:
         diagnostics = (error.stdout or "") + (error.stderr or "")
         sys.stderr.write(diagnostics)
@@ -967,6 +971,12 @@ def main():
         ver = _run([clang, "--version"]).stdout.strip().splitlines()[0]
     except Exception:  # noqa: BLE001
         ver = "unknown"
+    common_flags = ["-D__HIPCC_RTC__", "-O3", "-std=c++20"]
+    common_flags.append(
+        "-DOPUS_ENABLE_RUNTIME_QUERY=0"
+        if args.arch == "gfx950"
+        else "-Werror=ignored-attributes"
+    )
     info = {
         "arch": args.arch,
         "offload_arch": args.offload_arch,
@@ -977,12 +987,7 @@ def main():
         "device_clang": ver,
         "hip_clang_path": llvm_bin,
         # Shared by every entry; the per-entry -mllvm flags are in kernels[].
-        "common_flags": [
-            "-D__HIPCC_RTC__",
-            "-O3",
-            "-std=c++20",
-            "-Werror=ignored-attributes",
-        ],
+        "common_flags": common_flags,
         "kernels": built,
     }
     info_path = (args.report if args.arch == "gfx950" else None) or os.path.join(

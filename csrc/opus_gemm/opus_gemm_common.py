@@ -2885,6 +2885,9 @@ def _load_gfx950_co_kernels(path, require_image=True):
     entries = {}
     for record in document["gfx950"]:
         entry = {**document.get("defaults", {}), **record}
+        kid = entry["kid"]
+        if kid in entries:
+            raise ValueError(f"Duplicate gfx950 CO kid {kid} in {path}")
         entry.setdefault("block_size", 64 * entry["wave_layout"][0] * entry["wave_layout"][1])
         entry.setdefault("launch_bounds", [entry["block_size"], 1])
         entry["device_flags"] = list(entry["device_flags"])
@@ -2892,7 +2895,7 @@ def _load_gfx950_co_kernels(path, require_image=True):
             entry["supported_shapes"] = sorted(
                 list(map(int, shape.split(","))) for shape in entry["launches"]
             )
-        entries[entry["kid"]] = entry
+        entries[kid] = entry
     image_configs = {}
     for kid, entry in sorted(entries.items()):
         fields = (
@@ -3714,6 +3717,15 @@ def get_kernel_instance(
         and arch == "gfx1250"
         and instance.kernel_tag in _A16W16_CO_TAGS
         and not os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
+    ):
+        return None
+    if (
+        family == "a8w8_blockscale_bpreshuffle"
+        and arch == "gfx950"
+        and instance.bpreshuffle_co is not None
+        and not os.path.isfile(
+            _gfx950_co_image_path(GFX950_CO_KERNELS_JSON, instance.bpreshuffle_co)
+        )
     ):
         return None
     return instance

@@ -101,9 +101,13 @@ def run_torch(x_deq, w_deq, dtype=dtypes.bf16):
 
 
 def opus_kernel_name(kid, *, cu_num):
-    from csrc.opus_gemm.opus_gemm_common import get_registry
+    from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
 
-    instance = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)[int(kid)]
+    instance = get_kernel_instance(
+        "gfx950", "a8w8_blockscale_bpreshuffle", int(kid), cu_num=cu_num
+    )
+    if instance is None:
+        raise ValueError(f"Unknown or unavailable OPUS MXFP8 bpreshuffle kid {kid}")
     return instance.name
 
 
@@ -280,7 +284,7 @@ def run_bmm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
         w_scale.view(1, *w_scale.shape),
         out.view(m, 1, n),
         kernel_name=kernel_name,
-        x_scale_transposed=k // x_scale.shape[-1] == 128 and m > 1,
+        x_scale_transposed=k // x_scale.shape[-1] == 128,
     )
     return out
 
@@ -324,8 +328,25 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
-        "config_env_name": "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
     }
+
+    def _setup_common_arguments(self):
+        super()._setup_common_arguments()
+        for option in (
+            "--run_config",
+            "--e2e_tune",
+            "--compare",
+            "--update_improved",
+            "--min_improvement_pct",
+        ):
+            action = self.parser._option_string_actions.pop(option)
+            self.parser._remove_action(action)
+            self.parser._optionals._group_actions.remove(action)
+        # The shared run() reads these switches before entering candidate tuning.
+        self.parser.set_defaults(run_config=False, compare=False, update_improved=False)
+        self.parser._option_string_actions["--errRatio"].help = (
+            "Tolerable error ratio (default 0.05); candidates above this are rejected."
+        )
 
     def getKernelName(self, kernelId):
         # Pipeline id ranges are disjoint (8-wave ids start at 1_000_000).
@@ -333,20 +354,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             if kernelId in pipe.kernels_list:
                 return pipe.kernels_list[kernelId].name
         return None
-
-    def _clear_op_caches(self):
-        from aiter.ops import gemm_op_a8w8 as _op
-
-        _op._get_mxfp8_bpreshuffle_config.cache_clear()
-        _op._load_mxfp8_bpreshuffle_tuned.cache_clear()
-        getattr(
-            _op, "_get_mxscale_bpreshuffle_config", _op.get_mxscale_bpreshuffle_config
-        ).cache_clear()
-        _op._load_mxscale_bpreshuffle_tuned.cache_clear()
-        _op._mxscale_bpreshuffle_tuned_nk.cache_clear()
-        _op._MXSCALE_UNTUNED_REPORTED.clear()
-        _op._CKGEMM_CONFIG_CACHE.clear()
-        _op._CKGEMM_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
@@ -369,13 +376,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         )
 
     def pre_process(self, args):
-        self._mxscale_table = bool(args.mxscale_table)
-        if self._mxscale_table:
-            self.ARG_DEFAULTS = {
-                **type(self).ARG_DEFAULTS,
-                "config_env_name": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
-            }
-        elif args.libtype == "opus":
+        self._mxscale_table = args.mxscale_table
+        if args.libtype == "opus" and not self._mxscale_table:
             self.parser.error("OPUS tuning requires --mxscale_table")
         super().pre_process(args)
 
@@ -422,62 +424,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
 
-    def run_config(self, args):
-        from aiter.ops.gemm_op_a8w8 import (
-            gemm_a8w8_blockscale_bpreshuffle,
-            gemm_a8w8_mxfp8_bpreshuffle,
-        )
-        from aiter.test_common import checkAllclose, run_perftest
-
-        if getattr(self, "_mxscale_table", False) and "libtype" in self.untunedf:
-            kids = {
-                int(row.kernelId)
-                for row in self.untunedf.itertuples()
-                if row.libtype == "opus"
-            }
-            ensure_opus_kids_compiled(kids, cu_num=self.get_cu_num())
-        op = (
-            gemm_a8w8_blockscale_bpreshuffle
-            if getattr(self, "_mxscale_table", False)
-            else gemm_a8w8_mxfp8_bpreshuffle
-        )
-        results = []
-        for i in range(len(self.untunedf)):
-            row = self.untunedf.iloc[i]
-            M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
-            block = row.get("w_scale_block", W_SCALE_BLOCK)
-            shape_str = f"({M}, {N}, {K}, {block})"
-            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
-            try:
-                d = generate_data(M, N, K, 0, block)
-                out, us = run_perftest(
-                    op,
-                    d["x"],
-                    d["weight_shuffle"],
-                    d["x_scale"],
-                    d["w_scale"],
-                    num_warmup=args.warmup,
-                    num_iters=args.iters,
-                )
-                err_ratio = checkAllclose(
-                    out,
-                    run_torch(d["x_deq"], d["w_deq"]),
-                    msg=f"run_config {shape_str}",
-                )
-                status = (
-                    "ok"
-                    if err_ratio <= allowed
-                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_desc})"
-                )
-                results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:  # noqa: BLE001
-                results.append(
-                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
-                )
-            finally:
-                torch.cuda.empty_cache()
-        return results
-
     def tune(self, untunedf, tunedf, args):
         gfx = self.get_gfx()
         if gfx not in ("gfx950", "gfx1250"):
@@ -492,7 +438,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         seed = 0
 
         task = []
-        self._mxscale_table = bool(getattr(args, "mxscale_table", False))
+        self._mxscale_table = args.mxscale_table
         coarse = sorted(set(untunedf["w_scale_block"]) - {W_SCALE_BLOCK})
         if coarse and not self._mxscale_table:
             raise ValueError(
@@ -619,17 +565,12 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         rows = []
         for el in results:
             info, time, err_ratio = el
-            time = round(time, 4)
             keys, kernelId, splitK, kernelName, libtype = info
             if time in (self.INVALID_TIME, self.INF_TIME):
                 kernelName = "None"
             elif libtype == "opus":
                 kernelName = opus_kernel_name(kernelId, cu_num=int(keys[1]))
-            elif (
-                libtype == "flydsl"
-                and getattr(self, "_mxscale_table", False)
-                and keys[0] == "gfx950"
-            ):
+            elif libtype == "flydsl" and self._mxscale_table and keys[0] == "gfx950":
                 # gfx1250 rows keep their kernels_list id, as the table's do.
                 kernelId = (
                     MXSCALE_BMM_KERNEL_ID
