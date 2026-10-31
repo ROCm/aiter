@@ -28,6 +28,57 @@ sys.path.insert(0, _HERE)
 from _load import load_kernel_module  # noqa: E402
 
 
+def _compile_wrapper_prefill(K, out) -> int:
+    """Execute production wrapper AST routing, then compile its real builder.
+
+    The helpers stub decorators only: no kernel body or GPU launch is executed.
+    The real FlyDSL builder below is compiled for the selected eligible shape.
+    """
+    import test_bf16_routing_cpu as routing
+
+    keys = ("QSA_BF16_K_LOAD", "QSA_BF16_PERSIST", "QSA_PERSIST_COLS",
+            "QSA_BF16_R64", "QSA_BF16_R16_TDM_COLS", "QSA_G2_ACCESS",
+            "QSA_FP8_K_LOAD")
+    rec = {"dispatch": "bf16_wrapper_prefill", "environment": {
+        key: os.environ.get(key) for key in keys},
+        "evidence": "production wrapper AST via test_bf16_routing_cpu helpers",
+        "source_sha256": hashlib.sha256(routing.SOURCE.read_bytes()).hexdigest(),
+        "rows": 512, "requests": 1, "columns": 1024, "pointer": 0x1000}
+    out["routing"] = [rec]
+    try:
+        ns = routing._namespace(os.environ)
+        br, mode, gx, gy = routing._wrapper_route(
+            ns, rec["rows"], rec["requests"], rec["pointer"], rec["columns"])
+        selected = ns["_build_wmma_kernel"](math.sqrt(128), br, mode)
+        kernel = routing._selected(selected)
+        launcher = K._build_wmma_kernel(math.sqrt(128), br, mode)
+        assert launcher.kernel_name == selected.kernel_name
+        assert launcher.cols_per_block == selected.cols_per_block
+        rec.update(rows_per_block=br, selected_k_load=mode, grid=[gx, gy],
+                   cols_per_block=launcher.cols_per_block,
+                   kernel_name=launcher.kernel_name, kernel_function=kernel._func.__name__,
+                   persist_chunks=ns["TDM_PERSIST_CHUNKS"] if mode == "persist" else 0)
+        rows, columns, pages, reqs, width = rec["rows"], rec["columns"], 256, 1, 256
+        args = (torch.zeros(rows * 4 * 128 * 2, dtype=torch.uint8),
+                torch.zeros(pages * 4 * 128 * 2, dtype=torch.uint8),
+                torch.zeros(reqs * width, dtype=torch.int32),
+                torch.zeros(rows, dtype=torch.int32), torch.zeros(rows, dtype=torch.int32),
+                torch.zeros(reqs, dtype=torch.int32),
+                torch.zeros(rows * columns, dtype=torch.float32),
+                torch.zeros(rows, dtype=torch.int32), torch.zeros(rows, dtype=torch.int32))
+        cf = flyc.compile(launcher, *args, gx, gy, rows, columns, pages, reqs, width,
+                          fx.Stream(None))
+        rec.update(compiled=True, compiled_function=type(cf).__name__)
+        print(f"[COMPILED] bf16_wrapper_prefill kernel={launcher.kernel_name}")
+        rc = 0
+    except Exception as exc:  # noqa: BLE001
+        rec.update(compiled=False, error=f"{type(exc).__name__}: {exc}"[:6000])
+        print(f"[FAILED]   bf16_wrapper_prefill: {rec['error'][:2000]}")
+        rc = 1
+    print("[ROUTED] " + json.dumps(rec, sort_keys=True))
+    return rc
+
+
 def main() -> int:
     K, how = load_kernel_module()
     print("kernel module:", how)
@@ -83,7 +134,9 @@ def main() -> int:
         rc = 1
         print(f"[FAILED]   bf16_wmma: {rec['error'][:2000]}")
     out["specializations"].append(rec)
-    for tag, builder, block_rows, fp8 in (
+    # Persistent evidence comes ONLY from actual wrapper selection below; raw
+    # and copy-atom access must never request an explicit persistent builder.
+    for tag, builder, block_rows, fp8, *k_load in (
         ("bf16_wmma_r32", K._build_wmma_kernel, 32, False),
         *((("bf16_wmma_r64", K._build_wmma_kernel, 64, False),) if K._BF16_R64 else ()),
         ("fp8_wmma", K._build_wmma_fp8_kernel, 16, True),
@@ -91,7 +144,7 @@ def main() -> int:
     ):
         rec = {"dtype": tag}
         try:
-            launcher = builder(math.sqrt(128), block_rows)
+            launcher = builder(math.sqrt(128), block_rows, *k_load)
             args = (q, kv, ks, pt, t2r, qp, cl, logits, vis, rst) if fp8 else (
                 q, kv, pt, t2r, qp, cl, logits, vis, rst)
             cf = flyc.compile(
@@ -106,6 +159,7 @@ def main() -> int:
             rc = 1
             print(f"[FAILED]   {tag}: {rec['error'][:2000]}")
         out["specializations"].append(rec)
+    rc = max(rc, _compile_wrapper_prefill(K, out))
     root = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "")
     hits = []
     for dp, _, fs in os.walk(root) if root else []:

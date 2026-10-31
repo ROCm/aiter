@@ -192,7 +192,9 @@ class SourceReplay:
                               WMMA_ROWS_PER_WAVE=4, WMMA_N=16, WMMA_K=32,
                               WMMA_K_STEPS=4, WMMA_N_TILES=4, WMMA_PASSES=4,
                               WMMA_COLS=64, R16_TDM_COLS=32, _BF16_R64=False,
-                              TDM_K_ROW_BYTES=272, TDM_K_TILE_BYTES=17408)
+                              TDM_K_ROW_BYTES=272, TDM_K_TILE_BYTES=17408,
+                              # Round PERSIST wrapper switch (default off).
+                              TDM_PERSIST=False, TDM_PERSIST_CHUNKS=4)
 
     def namespace(self):
         return dict(self.constants, range_constexpr=range, _imin=min, _imax=max)

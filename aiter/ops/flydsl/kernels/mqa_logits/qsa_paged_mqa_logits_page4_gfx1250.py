@@ -749,6 +749,45 @@ if _BF16_R16_TDM_COLS not in ("32", "64"):
     raise ValueError(f"QSA_BF16_R16_TDM_COLS must be '32' or '64', got {_BF16_R16_TDM_COLS!r}")
 R16_TDM_COLS = int(_BF16_R16_TDM_COLS)
 
+# Round PERSISTDEF (measured default): bf16 r32 *persistent* prefill. One
+# workgroup owns 32 query rows and loops over TDM_PERSIST_CHUNKS consecutive
+# 64-column K tiles with two 17,408 B (272 B pitch) buffers = 34,816 B LDS:
+# chunk k+1's TDM gathers are issued into the idle buffer before chunk k's
+# WMMA/store, then tensor_wait(0) + one WG barrier publish it (and retire the
+# buffer just read). QSA_BF16_PERSIST=0 forces the byte-identical single-tile
+# r32 kernel for A/B; QSA_BF16_PERSIST=1 (default) selects persistent for guarded
+# r32 TDM shapes with columns >= 64 * QSA_PERSIST_COLS (default 8).
+if os.environ.get("QSA_BF16_PERSIST", "1").strip() not in ("0", "1"):
+    raise ValueError("QSA_BF16_PERSIST must be '0' or '1'")
+if os.environ.get("QSA_PERSIST_COLS", "8").strip() not in ("2", "4", "8"):
+    raise ValueError("QSA_PERSIST_COLS must be '2', '4' or '8'")
+TDM_PERSIST = os.environ.get("QSA_BF16_PERSIST", "1").strip() == "1"
+TDM_PERSIST_CHUNKS = int(os.environ.get("QSA_PERSIST_COLS", "8").strip())
+TDM_PERSIST_BUFFERS = 2
+TDM_PERSIST_LDS_BYTES = TDM_PERSIST_BUFFERS * TDM_K_TILE_BYTES      # 34,816 B
+
+
+def persist_schedule(n_chunks: int):
+    """Trace-time event plan of the persistent kernel's K pipeline.
+
+    Pure Python (used by the kernel body *and* the CPU tests): per workgroup,
+    ``("issue", chunk, buffer)`` = every wave's two 8-row TDM gathers of that
+    chunk into that buffer (skipped at runtime by an SGPR-uniform guard when
+    the chunk is beyond every row's visibility / the column extent), ``("wait",)``
+    = ``tensor_wait(0)`` of the wave's own gathers, ``("barrier",)`` = one
+    workgroup barrier, ``("consume", chunk, buffer)`` = WMMA + stores.
+    """
+    if n_chunks not in (1, 2, 4, 8):
+        raise ValueError("persistent chunk count must be 1, 2, 4 or 8")
+    events = [("issue", 0, 0), ("wait",), ("barrier",)]
+    for k in range(n_chunks):
+        if k + 1 < n_chunks:
+            events.append(("issue", k + 1, (k + 1) % TDM_PERSIST_BUFFERS))
+        events.append(("consume", k, k % TDM_PERSIST_BUFFERS))
+        if k + 1 < n_chunks:
+            events += [("wait",), ("barrier",)]
+    return events
+
 
 def _resolve_bf16_k_load(rows_per_block: int, k_load: str | None = None):
     """Resolve geometry routing before building a compile-time specialization."""
@@ -853,10 +892,25 @@ class _Pass:
 
 
 @lru_cache(maxsize=None)
-def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | None = None):
-    """bf16 WMMA specialization; r32 shares B across two M tiles per wave."""
+def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | None = None,
+                       persist_chunks: int | None = None):
+    """bf16 WMMA specialization; r32 shares B across two M tiles per wave.
+
+    ``k_load="persist"`` (wrapper opt-in only) builds the r32 persistent TDM
+    kernel looping over ``persist_chunks`` (default TDM_PERSIST_CHUNKS) tiles.
+    """
     if rows_per_block not in (16, 32, 64):
         raise ValueError("bf16 WMMA rows_per_block must be 16, 32 or 64")
+    persist = k_load == "persist"
+    if persist:
+        if rows_per_block != 32 or _ACCESS != "raw":
+            raise ValueError("the persistent bf16 kernel is r32 TDM (raw access) only")
+        persist_chunks = TDM_PERSIST_CHUNKS if persist_chunks is None else int(persist_chunks)
+        if persist_chunks not in (2, 4, 8):
+            raise ValueError("persistent chunk count must be 2, 4 or 8")
+        k_load = "tdm"
+    else:
+        persist_chunks = 1
     k_load = _resolve_bf16_k_load(rows_per_block, k_load)
     inv_divisor = 1.0 / divisor
     use_tdm = k_load == "tdm" and _ACCESS == "raw"
@@ -984,6 +1038,48 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
         hi = Vec(fx.ptr_load(ptr + (byte_off + 32) // 4, result_type=Vec.make_type(4, fx.Int32)))
         return lo.shuffle(hi, list(range(8)))
 
+    # ---- Round PERSIST helpers (only the persistent kernel calls these) -----
+    def _persist_storage_tdm():
+        # One allocator, two 17,408 B padded K tiles (ping-pong) = 34,816 B.
+        return fx.SharedAllocator(base_alignment=128, static=True).allocate(
+            fx.Array[fx.Int32, TDM_PERSIST_LDS_BYTES // 4, 128]
+        ).peek().ptr
+
+    def _persist_block_vis(cl_rsrc, req):
+        """SGPR visibility bound of a full single-request block: max(ctx, 0) / 4.
+
+        Every row's `_rows_meta` vis = max(min(pos + 1, ctx), 0) // 4 <= this
+        bound, so a chunk with col0 >= bound stores only -inf masks and its K
+        tile is never needed. (A 32-row max chain was lowered by LLVM to
+        v_max3 + v_readfirstlane; this single scalar load keeps it SALU-only.)
+        """
+        ctx = _ld_uniform_i32(cl_rsrc, req * 4)
+        return _imax(ctx, 0) // PAGE_SIZE
+
+    def _persist_issue_tdm(KV, ptr, pt_rsrc, req, col0, width, num_pages, buf):
+        """`_pair_stage_tdm`'s two 8-row gathers per wave, into buffer `buf`,
+        WITHOUT wait/barrier (the persistent loop owns completion). All
+        descriptor inputs are SGPR: wave_id, req, page-table s_buffer_loads."""
+        wave_id = fx.Int32(fx.rocdl.wave_id())
+        for group in range_constexpr(2):
+            local = wave_id * 16 + group * 8
+            row_ids = []
+            for page in range_constexpr(2):
+                logical = (col0 + local) // PAGE_SIZE + page
+                logical_ok = logical < width
+                safe_logical = logical_ok.select(logical, 0)
+                phys = _ld_uniform_i32(pt_rsrc, (req * width + safe_logical) * 4)
+                valid = logical_ok & (phys >= 0) & (phys < num_pages)
+                phys = valid.select(phys, 0)
+                for row in range_constexpr(PAGE_SIZE):
+                    row_ids.append(phys * PAGE_SIZE + row)
+            _tdm_k_gather(KV, ptr, row_ids, num_pages,
+                          buf * TDM_K_TILE_BYTES + local * TDM_K_ROW_BYTES)
+
+    def _persist_next(k):
+        """Trace-time stop of `range_constexpr(k + 1, stop)`: chunk k+1 if any."""
+        return min(k + 2, persist_chunks)
+
     pair_storage = _pair_storage_tdm if use_tdm else _pair_storage_raw
     pair_stage = _pair_stage_tdm if use_tdm else _pair_stage_raw
     pair_base = _pair_base_tdm if use_tdm else _pair_base_raw
@@ -1000,6 +1096,8 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
         f"_r{rows_per_block}_c{cols_per_block}_flydsl"
         + ("_tdm" if use_tdm else "")
     )
+    if persist:
+        kernel_name = kernel_name + f"_persist{persist_chunks}"
 
     # ---- helpers: plain Python at trace time (no `if`/runtime `for` inside; the
     # AST rewriter only rewrites the kernel body, and the kernel body only calls
@@ -1573,8 +1671,128 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
                                 if msk[j4][0]:
                                     _st_f32(logits_rsrc, msk[j4][1], neg_inf)
 
+    @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
+    def kernel_r32_persist(
+        Q, KV, PT, T2R, QP, CL, LOGITS, VIS, RST,
+        rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
+        num_requests: fx.Int32, width: fx.Int32,
+    ):
+        # Round PERSIST: block (x, y) owns rows [32y, 32y + 32) and the
+        # persist_chunks 64-column tiles starting at span0 = x * 64 * chunks.
+        tid = fx.Int32(fx.thread_idx.x)
+        chunk = fx.Int32(fx.block_idx.x)
+        rblk = fx.Int32(fx.block_idx.y)
+        wave = tid // WMMA_WAVE
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N            # A: slot m / B, C: column n
+        kgrp = lane // WMMA_N           # k-half of the operands, row pair of C
+        t0 = (rblk * WMMA_WAVES + wave) * (2 * WMMA_ROWS_PER_WAVE)
+        span0 = chunk * (WMMA_COLS * persist_chunks)
+
+        # One pinned descriptor per plane, true extents in i64 (see `_plane`).
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, 4))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+
+        metas = [_rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0 + mi * WMMA_ROWS_PER_WAVE,
+                            rows, num_requests) for mi in range_constexpr(2)]
+        plans = [_pass_plan(metas[mi], rows, kgrp) for mi in range_constexpr(2)]
+        for mi in range_constexpr(2):
+            my_vis = _pick_vis(lane, metas[mi])
+            my_row = t0 + mi * WMMA_ROWS_PER_WAVE + _imin(lane, WMMA_ROWS_PER_WAVE - 1)
+            meta_off = _imin(my_row, rows - 1) * 4
+            writer = (chunk == 0) & (lane < WMMA_ROWS_PER_WAVE) & (my_row < rows)
+            if writer:
+                _st_i32(vis_rsrc, meta_off, my_vis)
+                _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+
+        atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
+        neg_inf = fx.Float32(_NEG_INF)
+        kbase = _persist_storage_tdm()
+        reuse = _r32_guard(t2r_rsrc, rblk * 32, rows, num_requests)
+        if reuse:
+            # Workgroup-uniform (SGPR) request, block visibility and per-chunk
+            # issue guards; the guards never surround a wait or a barrier.
+            preq = _ld_uniform_i32(t2r_rsrc, rblk * 32 * 4)
+            bvis = _persist_block_vis(cl_rsrc, preq)
+            issue = [(span0 + k0 * WMMA_COLS < bvis) & (span0 + k0 * WMMA_COLS < columns)
+                     for k0 in range_constexpr(persist_chunks)]
+            ppa = plans[0][0]
+            ppb = plans[1][0]
+            vmax = _imax(ppa.vmax, ppb.vmax)
+            qfa = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+            qfb = _q_frags(q_rsrc, t0 + WMMA_ROWS_PER_WAVE, rows, n_in, kgrp)
+            # Prologue: chunk 0 -> buffer 0, completed and published.
+            if issue[0]:
+                _persist_issue_tdm(KV, kbase, pt_rsrc, preq, span0, width, num_pages, 0)
+            fx.rocdl.tdm_ops.tensor_wait(0)
+            fx.gpu.barrier()
+            for k in range_constexpr(persist_chunks):
+                # (1) Issue chunk k+1 into buffer (k+1)%2. Its last readers
+                # (chunk k-1) all passed the end-of-iteration barrier below.
+                for kn in range_constexpr(k + 1, _persist_next(k)):
+                    if issue[kn]:
+                        _persist_issue_tdm(KV, kbase, pt_rsrc, preq, span0 + kn * WMMA_COLS,
+                                           width, num_pages, kn % TDM_PERSIST_BUFFERS)
+                # (2) Consume chunk k from buffer k%2 while chunk k+1 is in flight.
+                col0 = span0 + k * WMMA_COLS
+                cols = _lane_cols(col0, n_in)
+                offa = _store_offsets(t0, kgrp, cols, rows, columns)
+                offb = _store_offsets(t0 + WMMA_ROWS_PER_WAVE, kgrp, cols, rows, columns)
+                kbuf = kbase + (k % TDM_PERSIST_BUFFERS) * (TDM_K_TILE_BYTES // 4)
+                if col0 < vmax:
+                    res = _pair_values(atom, kbuf, pt_rsrc, qfa, qfb, ppa, ppb,
+                                       cols, offa, offb, columns, width, num_pages)
+                    for j1 in range_constexpr(4 * WMMA_N_TILES):
+                        if res[j1][0]:
+                            _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                if col0 >= vmax:
+                    for mi2 in range_constexpr(2):
+                        msk = _pass_masks(plans[mi2][0], cols, (offa, offb)[mi2], columns)
+                        for j2 in range_constexpr(2 * WMMA_N_TILES):
+                            if msk[j2][0]:
+                                _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+                # (3) Complete chunk k+1 (own gathers), then one rendezvous:
+                # publishes buffer (k+1)%2 and retires buffer k%2 for chunk k+2.
+                for kw in range_constexpr(k + 1, _persist_next(k)):
+                    fx.rocdl.tdm_ops.tensor_wait(0)
+                    fx.gpu.barrier()
+        if reuse == 0:
+            # Exact r16 per-M-tile raw path for mixed requests / incomplete blocks.
+            for kf in range_constexpr(persist_chunks):
+                fcol0 = span0 + kf * WMMA_COLS
+                fcols = _lane_cols(fcol0, n_in)
+                for fm in range_constexpr(2):
+                    subt0 = t0 + fm * WMMA_ROWS_PER_WAVE
+                    foffs = _store_offsets(subt0, kgrp, fcols, rows, columns)
+                    live = subt0 < rows
+                    if live:
+                        qf = _q_frags(q_rsrc, subt0, rows, n_in, kgrp)
+                        for p in range_constexpr(WMMA_PASSES):
+                            pp = plans[fm][p]
+                            if pp.active:
+                                if fcol0 < pp.vmax:
+                                    fallback = _pass_values(atom, kv_rsrc, pt_rsrc, qf, pp, fcols,
+                                                            foffs, columns, width, num_pages)
+                                    for j3 in range_constexpr(2 * WMMA_N_TILES):
+                                        if fallback[j3][0]:
+                                            _st_f32(logits_rsrc, fallback[j3][1], fallback[j3][2])
+                                if fcol0 >= pp.vmax:
+                                    masks = _pass_masks(pp, fcols, foffs, columns)
+                                    for j4 in range_constexpr(2 * WMMA_N_TILES):
+                                        if masks[j4][0]:
+                                            _st_f32(logits_rsrc, masks[j4][1], neg_inf)
+
     selected_kernel = ((kernel_tdm_r16 if use_tdm else kernel) if rows_per_block == 16
                        else (kernel_r64 if rows_per_block == 64 else kernel_r32))
+    if persist:
+        selected_kernel = kernel_r32_persist
 
     @flyc.jit
     def launch(
@@ -1609,6 +1827,10 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
     launch.kernel_name = kernel_name
     launch.dtype_tag = "bf16_wmma"
     launch.cols_per_block = cols_per_block    # host grid.x must use this width
+    launch.persist_chunks = persist_chunks
+    if persist:
+        # A persistent block spans persist_chunks 64-column tiles.
+        launch.cols_per_block = cols_per_block * persist_chunks
     return launch
 
 
@@ -2296,7 +2518,10 @@ def wmma_grid(rows: int, columns: int, rows_per_block: int = 16,
     """64-column (32 for TDM r16) x compile-time 16/32/64-row workgroups."""
     if rows_per_block not in (16, 32, 64):
         raise ValueError("WMMA rows_per_block must be 16, 32 or 64")
-    if cols_per_block not in (32, 64) or (cols_per_block == 32 and rows_per_block != 16):
+    # Round PERSIST: r32 persistent blocks span 2/4/8 x 64 columns.
+    persist_span = rows_per_block == 32 and cols_per_block in (128, 256, 512)
+    if ((cols_per_block not in (32, 64) and not persist_span)
+            or (cols_per_block == 32 and rows_per_block != 16)):
         raise ValueError("WMMA cols_per_block must be 64, or 32 for r16")
     return (
         (int(columns) + cols_per_block - 1) // cols_per_block,
@@ -2539,6 +2764,12 @@ def qsa_paged_mqa_logits_page4(
         if k_load == "tdm" and kv_u8.data_ptr() % 128:
             rows_per_block = 16
             k_load = "raw"
+        # Round PERSIST (opt-in QSA_BF16_PERSIST=1): r32 TDM prefill with at
+        # least one full persistent span loops TDM_PERSIST_CHUNKS tiles/block.
+        # Mixed/partial row blocks keep the kernel's exact raw fallback.
+        if (rows_per_block == 32 and k_load == "tdm" and TDM_PERSIST and _ACCESS == "raw"
+                and columns >= WMMA_COLS * TDM_PERSIST_CHUNKS):
+            k_load = "persist"
         # grid.x is bound to the actual specialization's column width (only a
         # forced-TDM r16 kernel may use 32 columns; every other one uses 64).
         launch = _build_wmma_kernel(float(divisor), rows_per_block, k_load)

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Check bf16 routing in real no-device final ISA dumps.
 
-Required directories: auto/raw/tdm. Optional: tdm64/r64/r64raw/r64tdm.
+Required directories: auto/raw/tdm. Optional: off/tdm64/r64/r64raw/r64tdm.
+When off exists, require routed default=P8/off=single-tile and p2/p4/p8
+production-wrapper AST evidence in compile JSON/log plus selected final ISA.
 Each contains compile.log and isa/<kernel-name>/21_final_isa.s.
 Auto r16 uses c32 TDM (34,816 B LDS, 97 VGPR); r32 TDM is unchanged.
 Only r64* directories enable QSA_BF16_R64=1; raw overrides its runtime routing.
@@ -19,7 +21,7 @@ import re
 from check_tdm_isa_cpu import check, _resources
 
 PREFIX = "qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma_D128_H4_P4"
-MODES = ("auto", "raw", "tdm", "tdm64", "r64", "r64raw", "r64tdm")
+MODES = ("auto", "raw", "tdm", "off", "tdm64", "r64", "r64raw", "r64tdm")
 R64_MODES = ("r64", "r64raw", "r64tdm")
 
 
@@ -58,6 +60,51 @@ def _raw_record(path, mode, rows):
     return {"status": "PASS", "path": str(path), "lds_bytes": 0, "markers": markers,
             "resources": _resources(source),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def check_routed_selection(results, mode):
+    """Cross-check actual production-wrapper AST selection, compilation and ISA."""
+    directory = Path(results) / mode
+    data = json.loads((directory / "compile_only.json").read_text(encoding="utf-8"))
+    routed = data.get("routing", [])
+    assert len(routed) == 1, (mode, "missing wrapper routing evidence")
+    rec = routed[0]
+    log = (directory / "compile.log").read_text(encoding="utf-8")
+    logged = re.findall(r"^\[ROUTED\] (.+)$", log, re.MULTILINE)
+    assert len(logged) == 1 and json.loads(logged[0]) == rec, (mode, "routing JSON/log mismatch")
+    assert rec["compiled"] is True, (mode, rec)
+    assert rec["evidence"] == "production wrapper AST via test_bf16_routing_cpu helpers"
+    assert re.fullmatch(r"[0-9a-f]{64}", rec["source_sha256"])
+    assert (rec["rows"], rec["requests"], rec["columns"], rec["pointer"]) == (512, 1, 1024, 0x1000)
+    env = rec["environment"]
+    if mode == "auto":
+        assert all(value is None for value in env.values()), ("default not truly unset", env)
+    elif mode == "off":
+        assert env["QSA_BF16_PERSIST"] == "0", env
+        assert all(value is None for key, value in env.items() if key != "QSA_BF16_PERSIST"), env
+    elif mode in ("p2", "p4", "p8"):
+        assert env["QSA_BF16_PERSIST"] == "1" and env["QSA_PERSIST_COLS"] == mode[1:], env
+        assert env["QSA_BF16_K_LOAD"] is None and env["QSA_G2_ACCESS"] is None, env
+    elif mode in ("raw", "tdm"):
+        assert env["QSA_BF16_PERSIST"] == "0" and env["QSA_BF16_K_LOAD"] == mode, env
+    else:
+        raise AssertionError(("unknown routed mode", mode))
+    chunks = 8 if mode == "auto" else int(mode[1:]) if mode.startswith("p") else 0
+    selected = "persist" if chunks else "raw" if mode == "raw" else "tdm"
+    name = f"{PREFIX}_r32_c64_flydsl" + ("" if selected == "raw" else "_tdm")
+    if chunks:
+        name += f"_persist{chunks}"
+    assert rec["rows_per_block"] == 32 and rec["selected_k_load"] == selected, (mode, rec)
+    assert rec["persist_chunks"] == chunks and rec["cols_per_block"] == 64 * (chunks or 1), (mode, rec)
+    assert rec["grid"] == [16 // (chunks or 1), 16], (mode, rec)
+    assert rec["kernel_name"] == name, (mode, rec, name)
+    assert rec["kernel_function"] == ("kernel_r32_persist" if chunks else "kernel_r32"), (mode, rec)
+    assert re.findall(r"^\[COMPILED\] bf16_wrapper_prefill kernel=(\S+)\s*$", log, re.MULTILINE) == [name]
+    names = {p.parent.name for p in (directory / "isa").glob("*/21_final_isa.s")}
+    assert name in names, (mode, "routed ISA missing", name)
+    persistent = {n for n in names if "_persist" in n}
+    assert persistent == ({name} if chunks else set()), (mode, persistent, name)
+    return rec
 
 
 def main():
@@ -125,6 +172,10 @@ def main():
                          "identical": norm_base == norm_new, "normalized_sha256": norm_new}
             assert same[key]["identical"], (key, same[key])
         out["isa_identical_to_base"] = same
+    if (args.results / "off" / "compile.log").exists():
+        routed_modes = ("auto", "off", "raw", "tdm", "p2", "p4", "p8")
+        out["routed_wrapper_prefill"] = [check_routed_selection(args.results, m) for m in routed_modes]
+        out["default_auto_routes_persist8_off_routes_single_tile"] = True
     out["kernels"] = records
     text = json.dumps(out, indent=2)
     print(text)

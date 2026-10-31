@@ -52,7 +52,8 @@ def _namespace(environment=None):
             if isinstance(node.test, ast.Compare) and isinstance(node.test.left, ast.Name):
                 if node.test.left.id in ("_ACCESS", "_BF16_K_LOAD", "_BF16_R16_TDM_COLS", "_BF16_R64", "_FP8_K_LOAD"):
                     nodes.append(node)
-            elif any(isinstance(n, ast.Constant) and n.value == "QSA_BF16_R64"
+            elif any(isinstance(n, ast.Constant) and n.value in
+                     ("QSA_BF16_R64", "QSA_BF16_PERSIST", "QSA_PERSIST_COLS")
                      for n in ast.walk(node.test)):
                 nodes.append(node)
     nodes += [FUNCTIONS[n] for n in ("_resolve_bf16_k_load", "_resolve_fp8_k_load", "wmma_rows_per_block",
@@ -100,6 +101,8 @@ class Bf16RoutingCPU(unittest.TestCase):
         ns = _namespace()
         self.assertEqual(ns["_BF16_K_LOAD"], "auto")
         self.assertIs(ns["_BF16_R64"], False)
+        self.assertIs(ns["TDM_PERSIST"], True)
+        self.assertEqual(ns["TDM_PERSIST_CHUNKS"], 8)
         for geometry, resolved in ((16, "tdm"), (32, "tdm"), (64, "tdm")):
             self.assertEqual(ns["_resolve_bf16_k_load"](geometry), resolved)
             self.assert_selection(ns, geometry, None, resolved == "tdm")
@@ -226,11 +229,13 @@ class Bf16RoutingCPU(unittest.TestCase):
                     tdm = mode != "raw"
                     with self.subTest(cols=cols, mode=mode, geometry=geometry):
                         self.assert_selection(ns, geometry, None, tdm, int(cols))
-                # Raw r16 and every r32 keep 64-column names/grids.
+                # Private single-tile builders keep their widths; the wrapper
+                # independently selects persistent r32 for eligible prefill.
                 for rows, requests in ((64, 16), (16, 16), (512, 1), (2880, 2)):
                     geometry, actual, gx, gy = _wrapper_route(ns, rows, requests, 0x1000,
                                                               columns=65536)
-                    width = int(cols) if (geometry == 16 and actual == "tdm") else 64
+                    width = (512 if actual == "persist" else
+                             int(cols) if (geometry == 16 and actual == "tdm") else 64)
                     with self.subTest(cols=cols, mode=mode, rows=rows):
                         self.assertEqual(gx, 65536 // width)
                         self.assertEqual(gy, (rows + geometry - 1) // geometry)
