@@ -744,8 +744,14 @@ def _unified_attention_3d_triton(
         assert (
             split_runs_per_xcd is not None
         ), "a length-aware split needs SPLIT_RUNS_PER_XCD in the attn_3d config"
-        item_run = split_runs_per_xcd * get_num_xcds()
+        num_xcds = get_num_xcds()
         num_items = min(split_budget + params.num_seqs, params.num_seqs * NUM_SEGMENTS)
+        # a batch with fewer items than a full run takes a shorter one, so the
+        # padding does not launch idle programs for every KV head
+        runs = min(
+            split_runs_per_xcd, triton.next_power_of_2(triton.cdiv(num_items, num_xcds))
+        )
+        item_run = runs * num_xcds
         num_items = triton.cdiv(num_items, item_run) * item_run
         grid = (num_items * params.num_kv_heads, 1, 1)
         length_aware = {
