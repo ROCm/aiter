@@ -57,6 +57,29 @@ _GLUON_REDUCE_MAX_SEGMENTS = 8
 # (tokens * query heads) per CU; past that the 2D grid fills the GPU.
 _GFX12_3D_MAX_SEQLEN_Q = 16
 _GFX12_3D_MAX_QUERY_ROWS_PER_CU = 8
+# Opt-in token split for the gfx1250 gluon 3d kernel (decode and spec-decode verify):
+# every KV segment covers the same number of tiles, so a long sequence gets more
+# segments instead of longer ones. The default cuts every sequence into the same
+# number of segments, and with mixed context lengths the longest sequences' segments
+# run long after the rest are done: Qwen3.5 (16 q / 2 kv heads, d 256, fp8, 4-token
+# verify), 64 sequences of 4k-191k tokens: 5.5 TB/s, against 16.7 for 64 x 64k.
+# The segment size is computed on the device each launch from the batch's total KV,
+# for about _GFX12_TOKEN_SPLIT_PROGRAMS programs, so it follows the live batch under
+# a CUDA graph too. The grid covers _GFX12_TOKEN_SPLIT_MAX_KV tokens at the minimum
+# segment size, since a graph keeps its capture's grid; spare segments exit at once.
+_GFX12_TOKEN_SPLIT = os.environ.get("AITER_GFX12_TOKEN_SPLIT", "0") == "1"
+_GFX12_TOKEN_SPLIT_PROGRAMS = int(
+    os.environ.get("AITER_GFX12_TOKEN_SPLIT_PROGRAMS", "2048")
+)
+_GFX12_TOKEN_SPLIT_MIN_TILES = int(
+    os.environ.get("AITER_GFX12_TOKEN_SPLIT_MIN_TILES", "32")
+)
+_GFX12_TOKEN_SPLIT_MAX_TILES = int(
+    os.environ.get("AITER_GFX12_TOKEN_SPLIT_MAX_TILES", "256")
+)
+_GFX12_TOKEN_SPLIT_MAX_KV = int(
+    os.environ.get("AITER_GFX12_TOKEN_SPLIT_MAX_KV", "262144")
+)
 # attn_3d config keys that steer use_2d_kernel on gfx1250 rather than the launch:
 # MAX_QUERY_ROWS_PER_CU overrides the short-query bound above, and
 # PREFILL_MAX_2D_PRGMS / PREFILL_MIN_KV / PREFILL_MIN_KV_PER_PRGM opt an entry
@@ -213,6 +236,28 @@ def _gfx950_split_params(params: _UAParams):
 _SW_SPLIT_MAX_Q = 16
 
 
+def _gfx12_token_split(params: _UAParams, tile_size: int):
+    """The token split's grid width (NUM_SEGMENTS) and its tiles per segment.
+
+    Tiles per segment is a device tensor: the batch's KV tiles over every KV head,
+    over _GFX12_TOKEN_SPLIT_PROGRAMS, clamped to [MIN_TILES, MAX_TILES]. Plain torch
+    ops, so a CUDA graph recomputes it from the live context lengths on replay.
+    """
+    tiles = (params.seqused_k + (tile_size - 1)) // tile_size
+    want = tiles.sum() * params.num_kv_heads
+    want = (want + (_GFX12_TOKEN_SPLIT_PROGRAMS - 1)) // _GFX12_TOKEN_SPLIT_PROGRAMS
+    segm_tiles = (
+        want.clamp(_GFX12_TOKEN_SPLIT_MIN_TILES, _GFX12_TOKEN_SPLIT_MAX_TILES)
+        .to(torch.int32)
+        .reshape(1)
+    )
+    kv_cover = max(int(params.max_seqlen_k), _GFX12_TOKEN_SPLIT_MAX_KV)
+    num_segments = triton.next_power_of_2(
+        triton.cdiv(kv_cover, _GFX12_TOKEN_SPLIT_MIN_TILES * tile_size)
+    )
+    return num_segments, segm_tiles
+
+
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
@@ -262,6 +307,14 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
         if params.sliding_window > 0:
             return True
         if params.all_decode:
+            return False
+        if (
+            _GFX12_TOKEN_SPLIT
+            and params.max_seqlen_q <= _GFX12_3D_MAX_SEQLEN_Q
+            and is_3d_gluon_available(params, backend)
+        ):
+            # the token split keeps the 3d grid full at any batch, where 2d runs
+            # one program per sequence over its whole context
             return False
         route = get_unified_attention_config("attn_3d", params, backend="gluon")
         if params.max_seqlen_q <= _GFX12_3D_MAX_SEQLEN_Q:
@@ -594,6 +647,9 @@ def unified_attention(
                 for max_fill, min_segments in config["FILL_MIN_SEGMENTS"]:
                     if fill < max_fill:
                         NUM_SEGMENTS = max(NUM_SEGMENTS, min(min_segments, limit))
+        segm_tiles = None
+        if _GFX12_TOKEN_SPLIT and use_gluon_3d and DEVICE_ARCH == "gfx1250":
+            NUM_SEGMENTS, segm_tiles = _gfx12_token_split(params, CONFIG_TILE_SIZE)
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -639,6 +695,7 @@ def unified_attention(
                     segm_expsum,
                     NUM_SEGMENTS,
                     TILE_SIZE,
+                    segm_tiles=segm_tiles,
                 )
             elif DEVICE_ARCH == "gfx950":
                 _unified_attention_3d_gfx950(
@@ -687,6 +744,7 @@ def unified_attention(
                     segm_expsum,
                     NUM_SEGMENTS,
                     TILE_SIZE,
+                    segm_tiles=segm_tiles,
                 )
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
@@ -700,6 +758,7 @@ def unified_attention(
                 TILE_SIZE,
                 output_gate=output_gate,
                 output_rows=output_rows,
+                segm_tiles=segm_tiles,
             )
     return final_out
 
@@ -987,6 +1046,7 @@ def _reduce_segments_triton(
     TILE_SIZE,
     output_gate=None,
     output_rows=None,
+    segm_tiles=None,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
@@ -1007,6 +1067,7 @@ def _reduce_segments_triton(
         num_seqs=params.num_seqs,
         num_query_heads=params.num_query_heads,
         out_scale_ptr=params.output_scale,
+        segm_tiles_ptr=segm_tiles,
         output_stride_0=params.out.stride(0),
         output_stride_1=params.out.stride(1),
         block_table_stride=params.block_table.stride(0),
@@ -1220,6 +1281,7 @@ def _unified_attention_3d_gfx1250(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    segm_tiles=None,
 ):
     # its split carves [0, seq_len), unlike reduce_segments for a sliding window;
     # use_2d_kernel keeps every sliding-window call on the 2d grid here
@@ -1277,6 +1339,7 @@ def _unified_attention_3d_gfx1250(
             if (params.output_scale is not None and NUM_SEGMENTS == 1)
             else None
         ),
+        segm_tiles_ptr=segm_tiles,
         softcap=params.softcap,
         num_seqs=params.num_seqs,
         num_blocks=params.num_blocks,
@@ -1345,6 +1408,7 @@ def _reduce_segments_gfx1250(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    segm_tiles=None,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     gluon_num_warps = 8 if params.num_query_heads % 8 == 0 else 4
@@ -1358,6 +1422,7 @@ def _reduce_segments_gfx1250(
         seq_lens_ptr=params.seqused_k,
         num_query_heads=params.num_query_heads,
         out_scale_ptr=params.output_scale,
+        segm_tiles_ptr=segm_tiles,
         output_stride_0=params.out.stride(0),
         output_stride_1=params.out.stride(1),
         H=params.num_query_heads,

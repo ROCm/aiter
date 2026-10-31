@@ -23,6 +23,7 @@ def reduce_segments_gluon(
     seq_lens_ptr,  # [num_seqs]
     num_query_heads,
     out_scale_ptr,  # float32 or None
+    segm_tiles_ptr,  # [1] int32 tiles a KV segment covers (token split), or None
     output_stride_0,
     output_stride_1,
     H: gl.constexpr,
@@ -39,7 +40,10 @@ def reduce_segments_gluon(
 
     # all-decode: each sequence has exactly one query token, so seq_idx == token
     seq_len = gl.load(seq_lens_ptr + token)
-    tiles_per_segment = (seq_len + S * TILE_SIZE - 1) // (S * TILE_SIZE)
+    if segm_tiles_ptr is not None:
+        tiles_per_segment = gl.load(segm_tiles_ptr)
+    else:
+        tiles_per_segment = (seq_len + S * TILE_SIZE - 1) // (S * TILE_SIZE)
     denom = tiles_per_segment * TILE_SIZE
     act_num_segments = (seq_len + denom - 1) // denom
 
