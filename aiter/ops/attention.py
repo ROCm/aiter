@@ -2196,7 +2196,7 @@ def _mla_legacy_max_qo_tiles_per_batch(
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
             and num_head_qo == 96
-            and effective_seqlen_qo <= 6
+            and effective_seqlen_qo <= 8
         )
         or (
             get_gfx() == "gfx950"

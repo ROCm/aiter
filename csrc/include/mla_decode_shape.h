@@ -170,7 +170,7 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
          ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 96) &&
-         (max_seqlen_qo <= 6)) ||
+         (max_seqlen_qo <= 8)) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 12) &&
          ((num_heads * max_seqlen_qo) <= 128)) ||
         hk_mtp_experimental;

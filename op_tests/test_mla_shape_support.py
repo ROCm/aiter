@@ -61,7 +61,8 @@ def _fold(arch, d, n, msq=1):
 
 def test_planner_verdict():
     assert [_fold("gfx950", "fp8", n) for n in (48, 64, 96, 128)] == [3, 1, 1, 1]
-    assert _fold("gfx950", "fp8", 96, 6) == 1 and _fold("gfx950", "fp8", 96, 7) == 6
+    # 96 heads stay native up to the 8 tokens of a DSpark block-7 verify.
+    assert [_fold("gfx950", "fp8", 96, q) for q in (6, 7, 8, 9)] == [1, 1, 1, 6]
     assert _fold("gfx950", "fp8", 24) is None
     assert [_fold("gfx950", "bf16", n) for n in (40, 48, 144)] == [1, 1, 1]
     assert _fold("gfx942", "fp8", 64) == 1 and _fold("gfx942", "fp8", 64, 2) == 4
@@ -371,7 +372,7 @@ def _run_planner(bs, msq, n, q, kv):
 @requires_gpu
 def test_planner_fold_agreement():
     for n, msq, d in itertools.product(
-        (16, 48, 64, 96, 128), (1, 2, 7), ("fp8", "bf16")
+        (16, 48, 64, 96, 128), (1, 2, 7, 8, 9), ("fp8", "bf16")
     ):
         s = get_mla_decode_shape_support(n, msq, _dtype(d), _dtype(d))
         if not s.planner_accepts:
@@ -414,9 +415,13 @@ def _run_decode(n, msq, d, lse, bs=2, persistent=True, v_head_dim=KV_LORA_RANK):
 @requires_gpu
 def test_decode_agreement():
     bad = []
-    for n, msq, d, lse in itertools.product(
-        (16, 48, 64, 128), (1, 2), ("fp8", "bf16"), (False, True)
-    ):
+    shapes = itertools.chain(
+        itertools.product((16, 48, 64, 128), (1, 2), ("fp8", "bf16"), (False, True)),
+        # the native 96-head fp8 boundary: the planner, the asm remap and the
+        # Python table must move it together
+        itertools.product((96,), (6, 7, 8, 9), ("fp8",), (False, True)),
+    )
+    for n, msq, d, lse in shapes:
         s = get_mla_decode_shape_support(n, msq, _dtype(d), _dtype(d), return_lse=lse)
         if not s.planner_accepts or not s.reduce_supported:
             assert s.supported is False
