@@ -92,6 +92,13 @@ scorer; see the block above ``_build_wmma_kernel`` for why it is WMMA and not
 MFMA on gfx1250).  The **fp8** cache keeps the v0 scalar kernel unchanged, and
 ``QSA_BF16_PATH=scalar`` routes bf16 back to it.  Same public API, same
 outputs, same safety contract (predicated + clamped stores, i64 extents).
+
+Round G (opt-g, 2026-10-31): the **fp8** cache runs on the matrix core too —
+``_build_wmma_fp8_kernel``: the bf16 WMMA kernel with B fragments built from
+E4M3 bytes converted *exactly* to bf16 in registers and the per-token fp32 scale
+applied after the GEMM (in the scalar fp8 kernel's order).  ``_build_wmma_kernel``
+(bf16) is byte-for-byte unchanged; ``QSA_FP8_PATH=scalar`` routes fp8 back to
+the round-F scalar kernel.  Same public API, outputs and safety contract.
 """
 
 from __future__ import annotations
@@ -928,6 +935,396 @@ def _build_wmma_kernel(divisor: float):
 
 
 # ---------------------------------------------------------------------------
+# fp8 matrix-core path (round G): E4M3 -> bf16 in registers, same bf16 WMMA
+# ---------------------------------------------------------------------------
+# The fp8 cache is E4M3 with one fp32 scale per compressed token (= per column),
+# and ``dot(q, s * k) = s * dot(q, k)``.  So the fp8 specialisation below is the
+# bf16 WMMA kernel above, helper for helper (``_g2/test_fp8_wmma_cpu.py`` checks
+# the shared helpers are textually identical), with exactly three differences:
+#
+#   1. a B fragment is built from 2 x 8 E4M3 bytes (``buffer_load_dwordx2`` at
+#      the *same* k positions as bf16: dims ``(l//16)*8 + 0..7`` and ``+16``
+#      of each 32-dim WMMA step) and converted in registers to 16 bf16 values
+#      **exactly** (``_e4m3x4_to_bf16x2``); the A (Q) fragments are unchanged;
+#   2. after the 4 WMMA steps each head's f32 dot is multiplied by the
+#      column's fp32 scale ``scale[phys, c % 4]`` *before* ReLU, then the heads
+#      are summed and multiplied by ``1/divisor`` — the scalar fp8 kernel's
+#      order of operations (``(acc_h * scale).maximumf(0)`` summed h = 0..3,
+#      then ``* inv_divisor``);
+#   3. the scale load uses the page-table path of the K load: ``phys`` is the
+#      already-masked physical page (``page_ok.select(phys, 0)``) and ``c % 4``
+#      is in [0, 4), so the byte offset ``(phys * 4 + c % 4) * 4`` is always
+#      inside the ``num_pages * 16`` B scale plane.
+#
+# Everything else (tiling, Q fragments, request-dedup passes, early -inf exit,
+# predicated stores at clamped in-plane offsets, i64 descriptor extents) is the
+# bf16 kernel's.  ``QSA_FP8_PATH=scalar`` routes fp8 back to the round-F scalar
+# kernel (LDS-staged Q), which stays built and selectable.
+_FP8_PATH = os.environ.get("QSA_FP8_PATH", "wmma").strip().lower()
+if _FP8_PATH not in ("wmma", "scalar"):
+    raise ValueError(f"QSA_FP8_PATH must be 'wmma' or 'scalar', got {_FP8_PATH!r}")
+
+
+def _s32(v):
+    """A 32-bit pattern as the signed Python int an i32 constant must carry."""
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+
+# E4M3 -> bf16, exact, two codes per 32-bit op (round G).
+#
+# Placing an E4M3 code ``b`` into a 16-bit slot as
+#
+#     f16 bits = (b & 0x80) << 8 | (b & 0x7F) << 7
+#
+# gives the IEEE half whose sign/exponent/mantissa fields are E4M3's (4-bit
+# exponent in the low bits of f16's 5-bit field, 3 mantissa bits on top of
+# f16's 10), i.e. exactly ``E4M3(b) * 2**-8`` — for E4M3 normals (f16
+# exponent 1..15) and E4M3 subnormals (f16 subnormals ``m * 2**-17``) alike,
+# and ``+-0`` for 0x00/0x80.  0x7F/0xFF become ``+-1.875`` (f16 exponent 15
+# is an ordinary exponent), i.e. ``+-480`` after the rescale, exactly what the
+# scalar decoder ``_e4m3_byte_to_f32`` returns for them (no NaN).  Then
+#
+#     * ``* 256`` in f16 is exact (every product is in [2**-9, 480], f16
+#       normal range, 4 significant bits);
+#     * ``f16 -> f32`` is exact;
+#     * the f32 has <= 4 significant bits, so its low 16 bits are zero and its
+#       high half *is* the bf16 encoding (no rounding anywhere).
+#
+# Exactness for all 256 codes, in every byte position of a dword, against the
+# scalar decoder is checked by ``_g2/test_fp8_wmma_cpu.py`` (pure-Python
+# mirror) and by ``_g2/trace_check_cpu.py`` (this source, executed).
+# Caveat: E4M3 subnormal codes are f16 *subnormals* before the ``* 256`` — this
+# relies on the default FP16 denormal mode (``FLOAT_DENORM_MODE_16_64``
+# = preserve, LLVM's AMDGPU default).  A flush-to-zero mode would turn those 14
+# codes (|v| <= 7 * 2**-9) into +-0; the root's GPU plan includes a bitwise
+# code-sweep against the scalar path to rule that out.
+_E4M3_F16_MAG = fx.Int32(0x3F803F80)              # (b & 0x7F) << 7 in both slots
+_E4M3_F16_SIGN = fx.Int32(_s32(0x80008000))       # sign bit of both slots
+_BF16_LO_MASK = fx.Int32(0xFFFF)
+_BF16_HI_MASK = fx.Int32(_s32(0xFFFF0000))
+
+
+def _e4m3x4_to_bf16x2(x):
+    """Four E4M3 codes (one little-endian dword) -> ``(lo, hi)`` packed bf16.
+
+    ``lo = bf16(b0) | bf16(b1) << 16`` and ``hi = bf16(b2) | bf16(b3) << 16``:
+    the same element order as two dwords of a bf16 row, so the result drops
+    into a WMMA B fragment exactly where the bf16 path's loaded words go.
+    """
+    x = fx.Int32(x)
+    # slot 0 <- byte 0, slot 1 <- byte 2   /   slot 0 <- byte 1, slot 1 <- byte 3
+    h_even = ((x << 7) & _E4M3_F16_MAG) | ((x << 8) & _E4M3_F16_SIGN)
+    h_odd = ((x >> 1) & _E4M3_F16_MAG) | (x & _E4M3_F16_SIGN)
+    h = Vec.from_elements([h_even, h_odd], dtype=fx.Int32).bitcast(fx.Float16)
+    f = (h * Vec.filled(4, 256.0, fx.Float16)).to(fx.Float32).bitcast(fx.Int32)
+    # f = f32 bits of [b0, b2, b1, b3]; bf16 = the high half (low half is zero)
+    lo = ((fx.Int32(f[0]) >> 16) & _BF16_LO_MASK) | (fx.Int32(f[2]) & _BF16_HI_MASK)
+    hi = ((fx.Int32(f[1]) >> 16) & _BF16_LO_MASK) | (fx.Int32(f[3]) & _BF16_HI_MASK)
+    return lo, hi
+
+
+@lru_cache(maxsize=None)
+def _build_wmma_fp8_kernel(divisor: float):
+    """fp8 (E4M3 + per-token fp32 scale) WMMA specialization, one per divisor.
+
+    A copy of ``_build_wmma_kernel`` that differs only in ``_kfrag_fp8``
+    (new), ``_tile`` / ``_pass_values`` (fp8 K fragments + post-GEMM scale)
+    and the kernel's extra ``KS`` plane; see the block comment above.
+    """
+    inv_divisor = 1.0 / divisor
+    q_row_bytes = NUM_HEADS * HEAD_DIM * 2            # 1024 B
+    head_bytes = HEAD_DIM * 2                         # 256 B
+    key_row_bytes = HEAD_DIM                          # 128 B (E4M3)
+    page_bytes = PAGE_SIZE * key_row_bytes            # 512 B
+    kstep_bytes = WMMA_K * 2                          # 64 B of one Q row per WMMA step
+    kstep_k_bytes = WMMA_K                            # 32 B of one fp8 key row per step
+    kernel_name = (
+        f"qsa_paged_mqa_logits_page4_gfx1250_fp8_wmma"
+        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}"
+        f"_r{WMMA_ROWS_PER_BLOCK}_c{WMMA_COLS}_flydsl"
+    )
+
+    # ---- helpers: plain Python at trace time (no `if`/runtime `for` inside; the
+    # AST rewriter only rewrites the kernel body, and the kernel body only calls
+    # these through bare names so no outer value becomes loop/if-carried) -----
+    def _i01(cond):
+        return cond.select(fx.Int32(1), fx.Int32(0))
+
+    def _frag(rsrc, byte_off):
+        """One WMMA operand fragment: 2 x 16 B, 32 B apart -> 8 x i32 (16 bf16)."""
+        lo = _ld_vec(rsrc, byte_off, 4, fx.Int32)
+        hi = _ld_vec(rsrc, byte_off + 32, 4, fx.Int32)
+        return lo.shuffle(hi, list(range(8)))
+
+    def _kfrag_fp8(rsrc, byte_off):
+        """B fragment from E4M3: 2 x 8 B, 16 B apart -> 8 x i32 (16 bf16, exact).
+
+        Same k positions as ``_frag`` on a bf16 row (16 dims = 32 B there,
+        16 B here): v = 0..7 from ``byte_off``, v = 8..15 from ``byte_off + 16``.
+        """
+        lo = _ld_vec(rsrc, byte_off, 2, fx.Int32)
+        hi = _ld_vec(rsrc, byte_off + 16, 2, fx.Int32)
+        words = []
+        for j in range_constexpr(4):
+            src = lo[j] if j < 2 else hi[j - 2]
+            w0, w1 = _e4m3x4_to_bf16x2(src)
+            words.append(w0)
+            words.append(w1)
+        return Vec.from_elements(words, dtype=fx.Int32)
+
+    def _rmem8(vec):
+        t = fx.make_rmem_tensor(8, fx.Int32)
+        t.store(vec)
+        return t
+
+    def _rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests):
+        out = []
+        for i in range_constexpr(WMMA_ROWS_PER_WAVE):
+            row = t0 + i
+            row_ok = row < rows
+            safe_row = _imin(row, rows - 1)          # loads stay in bounds
+            req = _ld_i32(t2r_rsrc, safe_row * 4)
+            req_ok = (req >= 0) & (req < num_requests)
+            safe_req = req_ok.select(req, 0)
+            ctx = _ld_i32(cl_rsrc, safe_req * 4)
+            pos = _ld_i32(qp_rsrc, safe_row * 4)
+            head = _imax(_imin(pos + 1, ctx), 0)
+            vis = req_ok.select(head // PAGE_SIZE, 0)
+            out.append(_RowMeta(row, row_ok, req, req_ok, safe_req, vis))
+        return out
+
+    def _pass_plan(meta, rows, kgrp):
+        """Request-dedup passes; lane rows are a = 2*kgrp, b = 2*kgrp + 1."""
+        g0 = kgrp == 0
+        plans = []
+        for p in range_constexpr(WMMA_PASSES):
+            mp = meta[p]
+            active = mp.row_ok
+            for q in range_constexpr(p):
+                mq = meta[q]
+                active = active & ((mq.row >= rows) | (mq.req != mp.req))
+            own = [_i01(meta[i].row_ok & (meta[i].req == mp.req))
+                   for i in range_constexpr(WMMA_ROWS_PER_WAVE)]
+            vmax = fx.Int32(0)
+            for i in range_constexpr(WMMA_ROWS_PER_WAVE):
+                vmax = _imax(vmax, (own[i] != 0).select(meta[i].vis, 0))
+            own_a = g0.select(own[0], own[2]) != 0
+            own_b = g0.select(own[1], own[3]) != 0
+            vis_a = g0.select(meta[0].vis, meta[2].vis)
+            vis_b = g0.select(meta[1].vis, meta[3].vis)
+            plans.append(_Pass(active, vmax, mp.safe_req, mp.req_ok,
+                               own_a, own_b, vis_a, vis_b, kgrp))
+        return plans
+
+    def _pick_vis(lane, meta):
+        """visible[t0 + lane] for lanes 0..3 (lanes >= 3 get row 3's; unused)."""
+        v = meta[WMMA_ROWS_PER_WAVE - 1].vis
+        for i in range_constexpr(WMMA_ROWS_PER_WAVE - 2, -1, -1):
+            v = (lane == i).select(meta[i].vis, v)
+        return v
+
+    def _lane_cols(col0, n_in):
+        return [col0 + nt * WMMA_N + n_in for nt in range_constexpr(WMMA_N_TILES)]
+
+    def _store_offsets(t0, kgrp, cols, rows, columns):
+        """Clamped byte offsets of the lane's two outputs per tile (always in plane)."""
+        last = rows * columns - 1
+        row_a = _imin(t0 + 2 * kgrp, rows - 1)
+        row_b = _imin(t0 + 2 * kgrp + 1, rows - 1)
+        out = []
+        for c in cols:
+            out.append(_imin(row_a * columns + c, last) * 4)
+            out.append(_imin(row_b * columns + c, last) * 4)
+        return out
+
+    def _q_frags(q_rsrc, t0, rows, n_in, kgrp):
+        q_row = _imin(t0 + n_in // NUM_HEADS, rows - 1)
+        head = n_in % NUM_HEADS
+        base = q_row * q_row_bytes + head * head_bytes + kgrp * 16
+        return [_frag(q_rsrc, base + s * kstep_bytes) for s in range_constexpr(WMMA_K_STEPS)]
+
+    def _tile(atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp, c, kgrp, width, num_pages):
+        """Scores of the lane's rows a/b at column c (one 16x16x128 WMMA tile)."""
+        logical = c // PAGE_SIZE
+        off = c % PAGE_SIZE
+        logical_ok = logical < width
+        safe_logical = logical_ok.select(logical, 0)
+        phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
+        page_ok = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+        phys = page_ok.select(phys, 0)
+        k_base = phys * page_bytes + off * key_row_bytes + kgrp * 8
+        kf = [_kfrag_fp8(kv_rsrc, k_base + s * kstep_k_bytes)
+              for s in range_constexpr(WMMA_K_STEPS)]
+        # per-token fp32 scale of column c: same masked phys as the K rows
+        scale = _ld_f32(ks_rsrc, (phys * PAGE_SIZE + off) * 4)
+        acc_t = fx.make_rmem_tensor(8, fx.Float32)
+        acc_t.store(Vec.filled(8, 0.0, fx.Float32))
+        for s in range_constexpr(WMMA_K_STEPS):
+            # D[m = 4*row + head, n = column] += Q[m, k] * K[n, k]
+            fx.gemm(atom, acc_t, _rmem8(qf[s]), _rmem8(kf[s]), acc_t)
+        acc = acc_t.load()
+        zero = fx.Float32(0.0)
+        # scalar fp8 order: relu(acc_h * scale) summed over h = 0..3, then / divisor
+        sa = (
+            (fx.Float32(acc[0]) * scale).maximumf(zero)
+            + (fx.Float32(acc[1]) * scale).maximumf(zero)
+            + (fx.Float32(acc[2]) * scale).maximumf(zero)
+            + (fx.Float32(acc[3]) * scale).maximumf(zero)
+        )
+        sb = (
+            (fx.Float32(acc[4]) * scale).maximumf(zero)
+            + (fx.Float32(acc[5]) * scale).maximumf(zero)
+            + (fx.Float32(acc[6]) * scale).maximumf(zero)
+            + (fx.Float32(acc[7]) * scale).maximumf(zero)
+        )
+        return page_ok, sa * inv_divisor, sb * inv_divisor
+
+    def _pass_values(atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp, cols, offs, columns, width,
+                     num_pages):
+        """[(store_ok, byte_off, value)] for the lane's 2 x N_TILES outputs."""
+        neg_inf = fx.Float32(_NEG_INF)
+        out = []
+        for nt in range_constexpr(WMMA_N_TILES):
+            c = cols[nt]
+            page_ok, sa, sb = _tile(atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp, c, pp.kgrp,
+                                    width, num_pages)
+            col_ok = c < columns
+            va = (page_ok & (c < pp.vis_a)).select(sa, neg_inf)
+            vb = (page_ok & (c < pp.vis_b)).select(sb, neg_inf)
+            out.append((pp.own_a & col_ok, offs[2 * nt], va))
+            out.append((pp.own_b & col_ok, offs[2 * nt + 1], vb))
+        return out
+
+    def _pass_masks(pp, cols, offs, columns):
+        """[(store_ok, byte_off)] for a pass whose rows see none of these columns."""
+        out = []
+        for nt in range_constexpr(WMMA_N_TILES):
+            col_ok = cols[nt] < columns
+            out.append((pp.own_a & col_ok, offs[2 * nt]))
+            out.append((pp.own_b & col_ok, offs[2 * nt + 1]))
+        return out
+
+    @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
+    def kernel(
+        Q,           # uint8 view of [rows, 4, 128] bf16
+        KV,          # uint8 view of [pages, 4, 1, 128] fp8 E4M3
+        KS,          # fp32 [pages, 4, 1] per-token scale
+        PT,          # int32 [requests, width]
+        T2R,         # int32 [rows]
+        QP,          # int32 [rows]
+        CL,          # int32 [requests]
+        LOGITS,      # fp32 [rows, columns]
+        VIS,         # int32 [rows]
+        RST,         # int32 [rows]
+        rows: fx.Int32,
+        columns: fx.Int32,
+        num_pages: fx.Int32,
+        num_requests: fx.Int32,
+        width: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        chunk = fx.Int32(fx.block_idx.x)
+        rblk = fx.Int32(fx.block_idx.y)
+        wave = tid // WMMA_WAVE
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N            # A: slot m / B, C: column n
+        kgrp = lane // WMMA_N           # k-half of the operands, row pair of C
+        t0 = (rblk * WMMA_WAVES + wave) * WMMA_ROWS_PER_WAVE
+        col0 = chunk * WMMA_COLS
+
+        # One pinned descriptor per plane, true extents in i64 (see `_plane`).
+        q_rsrc = _plane(Q, fx.Int64(rows) * fx.Int64(q_row_bytes))
+        kv_rsrc = _plane(KV, fx.Int64(num_pages) * fx.Int64(page_bytes))
+        ks_rsrc = _plane(KS, fx.Int64(num_pages) * fx.Int64(PAGE_SIZE) * fx.Int64(4))
+        pt_rsrc = _plane(PT, fx.Int64(num_requests) * fx.Int64(width) * fx.Int64(4))
+        t2r_rsrc = _plane(T2R, fx.Int64(rows) * fx.Int64(4))
+        qp_rsrc = _plane(QP, fx.Int64(rows) * fx.Int64(4))
+        cl_rsrc = _plane(CL, fx.Int64(num_requests) * fx.Int64(4))
+        logits_rsrc = _plane(LOGITS, fx.Int64(rows) * fx.Int64(columns) * fx.Int64(4))
+        vis_rsrc = _plane(VIS, fx.Int64(rows) * fx.Int64(4))
+        rst_rsrc = _plane(RST, fx.Int64(rows) * fx.Int64(4))
+
+        meta = _rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
+        plans = _pass_plan(meta, rows, kgrp)
+
+        # Row metadata: lanes 0..3 of each wave of column-block 0, one row each.
+        # Predicated store at a clamped in-plane offset (6c272c3c contract).
+        my_vis = _pick_vis(lane, meta)
+        my_row = t0 + _imin(lane, WMMA_ROWS_PER_WAVE - 1)
+        meta_off = _imin(my_row, rows - 1) * 4
+        writer = (chunk == 0) & (lane < WMMA_ROWS_PER_WAVE) & (my_row < rows)
+        if writer:
+            _st_i32(vis_rsrc, meta_off, my_vis)
+            _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+
+        atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
+        cols = _lane_cols(col0, n_in)
+        offs = _store_offsets(t0, kgrp, cols, rows, columns)
+        neg_inf = fx.Float32(_NEG_INF)
+        live = t0 < rows
+        if live:
+            qf = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+            for p in range_constexpr(WMMA_PASSES):
+                pp = plans[p]
+                if pp.active:
+                    if col0 < pp.vmax:
+                        res = _pass_values(atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp, cols, offs,
+                                           columns, width, num_pages)
+                        for j1 in range_constexpr(2 * WMMA_N_TILES):
+                            if res[j1][0]:
+                                _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                    if col0 >= pp.vmax:
+                        msk = _pass_masks(pp, cols, offs, columns)
+                        for j2 in range_constexpr(2 * WMMA_N_TILES):
+                            if msk[j2][0]:
+                                _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+
+    @flyc.jit
+    def launch(
+        Q,
+        KV,
+        KS,
+        PT,
+        T2R,
+        QP,
+        CL,
+        LOGITS,
+        VIS,
+        RST,
+        grid_x,
+        grid_y,
+        rows,
+        columns,
+        num_pages,
+        num_requests,
+        width,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        kernel._func.__name__ = kernel_name
+        kernel(
+            Q, KV, KS, PT, T2R, QP, CL, LOGITS, VIS, RST,
+            rows, columns, num_pages, num_requests, width,
+        ).launch(
+            grid=(fx.Int64(grid_x), fx.Int64(grid_y), 1),
+            block=(WMMA_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch.kernel_name = kernel_name
+    launch.dtype_tag = "fp8_wmma"
+    return launch
+
+
+def _build_wmma_kernel_for(dtype: str, divisor: float):
+    """The WMMA builder's dtype specialisations: ``bf16`` (round C) / ``fp8``."""
+    if dtype == "bf16":
+        return _build_wmma_kernel(divisor)
+    if dtype == "fp8":
+        return _build_wmma_fp8_kernel(divisor)
+    raise ValueError(f"unknown WMMA dtype {dtype!r}")
+
+
+# ---------------------------------------------------------------------------
 # Cached compile-and-dispatch (flyc.compile compiles *and* runs on first call)
 # ---------------------------------------------------------------------------
 def _run(exe, *args):
@@ -1180,6 +1577,33 @@ def qsa_paged_mqa_logits_page4(
             _build_wmma_kernel(float(divisor)),
             q_u8,
             kv_u8,
+            page_table_i32,
+            t2r_i32,
+            qp_i32,
+            cl_i32,
+            logits,
+            visible_groups.view(-1),
+            row_starts.view(-1),
+            grid_x,
+            grid_y,
+            rows,
+            columns,
+            num_pages,
+            num_requests,
+            width,
+            stream,
+        )
+        return logits, visible_groups.view(-1)
+    if is_fp8 and _FP8_PATH == "wmma":
+        # fp8 (round G): the same WMMA geometry with E4M3 -> bf16 B fragments
+        # and the per-token fp32 scale applied after the GEMM.  Same planes,
+        # same full coverage (every logit written once), no memset.
+        grid_x, grid_y = wmma_grid(rows, columns)
+        _run(
+            _build_wmma_kernel_for("fp8", float(divisor)),
+            q_u8,
+            kv_u8,
+            compressed_k_scale.view(num_pages, PAGE_SIZE, 1),
             page_table_i32,
             t2r_i32,
             qp_i32,
