@@ -356,8 +356,9 @@ static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
             if(!persistent){
                 // qSeqLen 1: the one-token kernel (every request has at most one query
                 // token); 0: the causal kernel for any qlen. Both: 2 tokens x 32 heads
-                // per workgroup (sub_Q 64), the same grid and kernargs.
-                config_max_seqlen_q = (max_seqlen_q == 1) ? 1 : 0;
+                // per workgroup (sub_Q 64), the same grid and kernargs. Only gfx942 has
+                // the qSeqLen 1 kernel.
+                config_max_seqlen_q = (max_seqlen_q == 1 && arch_id == "gfx942") ? 1 : 0;
                 sub_Q = 64;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
