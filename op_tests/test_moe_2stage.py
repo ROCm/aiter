@@ -114,6 +114,7 @@ def test_fmoe(
     disable_stage2_bias=False,
     ref_dtype="bf16",
     gate_up_layout: bool | None = None,
+    output_offset=0,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -558,10 +559,11 @@ def test_fmoe(
         logger.error(
             "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
         )
+    flops = token * model_dim * inter_dim * 3 * topk * 2
     err = checkAllclose(
         out2_ref,
         out2_ck,
-        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        msg=f"ck_moe_2stages:{us2:>8.2f} us, {flops/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -587,7 +589,94 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    # Callers such as the serving MoE layer hand fused_moe their own [token,
+    # model_dim] buffer. Fill it with NaN so a path that skips zeroing it before
+    # accumulating, or writes the result elsewhere, cannot pass. output_offset
+    # starts it that many elements into its allocation, as a contiguous view.
+    out_pool = torch.full(
+        (out2_ck.numel() + output_offset,),
+        float("nan"),
+        dtype=out2_ck.dtype,
+        device=out2_ck.device,
+    )
+    out_buf = out_pool[output_offset:].view(out2_ck.shape)
+    out_ret = fused_moe(
+        input,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
+        output=out_buf,
+        **_fused_moe_kwargs,
+    )
+    # calc_diff turns an inf element into NaN, which no threshold catches.
+    out_non_finite = not out_buf.isfinite().all().item()
+    out_err = checkAllclose(
+        out2_ref.to(dtypes.fp32),
+        out_buf.to(dtypes.fp32),
+        msg="ck_moe_2stages output=",
+    )
+    out_logits_diff = calc_diff(out2_ref, out_buf)
+    out_failed = (
+        out_ret is not out_buf
+        or out_non_finite
+        or (out_err != 0 and out_logits_diff > 0.01)
+    )
+    out_msg = (
+        f"output= check failed: returned buf={out_ret is out_buf}, "
+        f"non_finite={out_non_finite}, err={out_err}, logits_diff={out_logits_diff}"
+    )
+    if strict_accuracy:
+        assert not out_failed, out_msg
+    elif out_failed:
+        logger.warning("accuracy check failed (non-strict): %s", out_msg)
+    # Time the output= call too: it is how the serving layer calls fused_moe, and
+    # writing into the caller's buffer is what saves the copy. Checked above, as
+    # the timed calls overwrite out_buf and may run on rotated copies of it.
+    _, out_us = run_perftest(
+        fused_moe,
+        input,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
+        num_iters=5,
+        num_warmup=2,
+        output=out_buf,
+        **_fused_moe_kwargs,
+    )
+    # Bytes one call moves: activations in and out, routing, and the weights,
+    # scales and biases of the experts the tokens are routed to.
+    routed_experts = topk_ids.unique().numel()
+    expert_bytes = sum(
+        t.nbytes
+        for t in (
+            w1_qt_aiter,
+            w2_qt_aiter,
+            w1_scale_aiter,
+            w2_scale_aiter,
+            exp_bias1_aiter,
+            exp_bias2_aiter,
+        )
+        if t is not None
+    )
+    out_nbytes = (
+        input.nbytes
+        + out_buf.nbytes
+        + topk_weights.nbytes
+        + topk_ids.nbytes
+        + expert_bytes * routed_experts // E
+    )
+
+    return {
+        "us": us2,
+        "logits_diff": float(logits_diff),
+        "output us": out_us,
+        "output TFLOPS": flops / out_us / 1e6,
+        "output TB/s": out_nbytes / out_us / 1e6,
+        "output err": out_err,
+        "output logits_diff": float(out_logits_diff),
+    }
 
 
 l_quant = [
@@ -1465,6 +1554,89 @@ def test_bm16_tiled_scale_boundary():
             os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
 
 
+def test_adaptive_sort_output_in_place():
+    """The a4w4 adaptive aux sort accumulates straight into the caller's output.
+
+    Kimi-K3 A4W4 TP=8. test_fmoe hands fused_moe a NaN-filled output buffer and
+    checks it against the torch reference; here we also check that the buffer
+    reached the adaptive sort as its atomic moe_buf and was never copied into.
+    A buffer starting 2 bytes into its allocation is too underaligned for the
+    sort's 16-byte zeroing, so it must take a fresh moe_buf and be copied into.
+    """
+    global AITER_MOE_NUM_EXPERT_ACTIVATED
+    fm = aiter.fused_moe
+    real_adaptive = fm._adaptive_moe_sort
+    real_return = fm._return_output
+    # AITER_MOE_SORT_BACKEND=opus/ck bypasses the adaptive sort under test.
+    real_backend = fm._MOE_SORT_BACKEND
+    # The parsed override can exceed token * topk at M=1 and make test_fmoe raise.
+    real_n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+    adaptive_calls, copies = [], []
+
+    def tracking_adaptive(*a, **kw):
+        adaptive_calls.append(kw.get("output") is not None)
+        return real_adaptive(*a, **kw)
+
+    def tracking_return(ret, output):
+        if output is not None and ret is not output:
+            copies.append(1)
+        return real_return(ret, output)
+
+    # Decode batches; their tuned BM=16 configs take the adaptive aux sort.
+    # Kimi-K3 config.json: model_dim = routed_expert_hidden_size (3584),
+    # inter_dim = moe_intermediate_size / TP (3072 / 8 = 384),
+    # E = num_experts (896), topk = num_experts_per_token (16).
+    rows = []
+    torch.manual_seed(0)
+    try:
+        fm._adaptive_moe_sort = tracking_adaptive
+        fm._return_output = tracking_return
+        fm._MOE_SORT_BACKEND = "auto"
+        AITER_MOE_NUM_EXPERT_ACTIVATED = 0
+        with override_env("AITER_SITUV2_A8W4", None), override_env(
+            "AITER_SITUV2_A4W4", "1"
+        ):
+            for token, output_offset in ((1, 0), (4, 0), (1, 1)):
+                adaptive_calls.clear()
+                copies.clear()
+                rows.append(
+                    test_fmoe(
+                        dtype=dtypes.bf16,
+                        token=token,
+                        model_dim=3584,
+                        inter_dim=384,
+                        E=896,
+                        topk=16,
+                        actType=aiter.ActivationType.Situv2,
+                        gateMode=GateMode.SEPARATED.value,
+                        qType=aiter.QuantType.per_1x32,
+                        AQDType=dtypes.fp4x2,
+                        WQDType=dtypes.fp4x2,
+                        use_g1u1=True,
+                        check_aot_cache=False,
+                        output_offset=output_offset,
+                    )
+                )
+                assert (
+                    True in adaptive_calls
+                ), f"token={token}: output never reached the adaptive sort"
+                if output_offset:
+                    assert copies, f"token={token}: underaligned output used in place"
+                else:
+                    assert not copies, f"token={token}: output was copied into"
+                gc.collect()
+                torch.cuda.empty_cache()
+    finally:
+        fm._adaptive_moe_sort = real_adaptive
+        fm._return_output = real_return
+        fm._MOE_SORT_BACKEND = real_backend
+        AITER_MOE_NUM_EXPERT_ACTIVATED = real_n_act
+    aiter.logger.info(
+        "moe_2stage adaptive-sort in-place output summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 def test_output_buffer_contract():
     """Validate output identity, copy-back, validation, and compile contracts."""
     torch.manual_seed(0)
@@ -1496,8 +1668,8 @@ def test_output_buffer_contract():
         kw["output"] = None
         return sort(*a, **kw)
 
-    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
-    # paths, which cannot take the caller's buffer and must copy their result into it.
+    # in_place=False stands in for FLAT and grouped gfx1250 paths, which cannot
+    # take the caller's buffer and must copy their result into it.
     for in_place in (True, False):
         try:
             if not in_place:
@@ -1531,13 +1703,98 @@ def test_output_buffer_contract():
         "a non-contiguous output",
         output=torch.empty((token, model_dim * 2), dtype=dtype)[:, ::2],
     )
-    # moe_sorting zeroes output before stage1 reads hidden_states.
+    # moe_sorting zeroes output before the stages read their inputs.
     expect_raise("an output overlapping hidden_states", output=hidden)
+    for name, tensor in (("w1", w1), ("w2", w2)):
+        expect_raise(
+            f"an output overlapping {name}",
+            output=tensor.view(-1)[: token * model_dim].view(token, model_dim),
+        )
 
     # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
     pool = torch.zeros((2 * token, model_dim), dtype=dtype)
     pool[:token] = hidden
     assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
+    # A view one bf16 element into its allocation is only 2-byte aligned, which
+    # the atomic GEMM2 cannot accumulate into (it faulted the GPU queue): such a
+    # buffer is still filled, through a fresh one and a copy.
+    odd_pool = torch.full((token * model_dim + 1,), float("nan"), dtype=dtype)
+    odd = odd_pool[1:].view(token, model_dim)
+    assert fused_moe(*args, output=odd) is odd, "2-byte-aligned output not returned"
+    assert torch.equal(odd, ref), "2-byte-aligned output does not hold the result"
+    # The same through the FlyDSL sort (AITER_USE_FLYDSL_MOE_SORTING=1), whose
+    # launcher raised on such a buffer. AITER_USE_CK_MOE_SORTING=1 would take
+    # precedence, so it is forced off here too.
+    fm = aiter.fused_moe
+    real_use_ck = fm._USE_CK_MOE_SORTING
+    real_use_flydsl = fm._USE_FLYDSL_MOE_SORTING
+    real_flydsl_sort = fm._flydsl_moe_sorting
+    flydsl_sorts = []
+
+    def counting_flydsl_sort(*a, **kw):
+        flydsl_sorts.append(1)
+        return real_flydsl_sort(*a, **kw)
+
+    try:
+        fm._USE_CK_MOE_SORTING = False
+        fm._USE_FLYDSL_MOE_SORTING = True
+        fm._flydsl_moe_sorting = counting_flydsl_sort
+        flydsl_ref = fused_moe(*args)
+        odd.fill_(float("nan"))
+        assert fused_moe(*args, output=odd) is odd, "FlyDSL sort: output not returned"
+        assert flydsl_sorts, "the FlyDSL sort did not run"
+        assert torch.equal(
+            odd, flydsl_ref
+        ), "FlyDSL sort: output does not hold the result"
+    finally:
+        fm._USE_CK_MOE_SORTING = real_use_ck
+        fm._USE_FLYDSL_MOE_SORTING = real_use_flydsl
+        fm._flydsl_moe_sorting = real_flydsl_sort
+
+    check_overlap = aiter.fused_moe._validate_output_buffer_no_overlap
+    # A strided scale view reaches past its logical nbytes: scale_pool[::2] holds
+    # 8 rows (16 KiB) yet its expert 7 row starts at byte 28672, and the kernels
+    # honor stride(0). An output over that row must be rejected.
+    scale_pool = torch.zeros((16, model_dim), dtype=dtypes.fp32)
+    strided_scale = scale_pool[::2]
+    row = scale_pool[14].view(dtype)[:model_dim].view(1, model_dim)
+    assert row.data_ptr() >= strided_scale.data_ptr() + strided_scale.nbytes
+    try:
+        check_overlap(row, {"w1_scale": strided_scale})
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("output overlapping a strided w1_scale view was accepted")
+    # Memory past the view's last element stays legal.
+    check_overlap(
+        scale_pool[15].view(dtype)[:model_dim].view(1, model_dim),
+        {"w1_scale": strided_scale},
+    )
+
+    # The check clears most inputs from data_ptr/nbytes alone before the exact
+    # span test; probe each edge of that screen around one output row.
+    flat = torch.zeros(4 * model_dim, dtype=dtype)
+    out_row = flat[model_dim : 2 * model_dim].view(1, model_dim)
+    for described, tensor, overlaps in (
+        ("an input covering output from below", flat[: 3 * model_dim], True),
+        ("an input starting inside output", flat[2 * model_dim - 1 :], True),
+        ("an input ending where output starts", flat[:model_dim], False),
+        ("an input starting where output ends", flat[2 * model_dim :], False),
+        ("an empty input inside output", flat[model_dim + 1 : model_dim + 1], False),
+    ):
+        try:
+            check_overlap(out_row, {"x": tensor})
+        except RuntimeError:
+            assert overlaps, f"{described} was rejected"
+        else:
+            assert not overlaps, f"{described} was accepted"
+    # Tensors in the stage extra-arg dicts (FHMoE shared weights) count as inputs.
+    try:
+        check_overlap(out_row, {}, ({"shared_expert_id": 0, "shared_w1": flat}, None))
+    except RuntimeError as e:
+        assert "shared_w1" in str(e), e
+    else:
+        raise AssertionError("output overlapping an extra-arg tensor was accepted")
 
     stage2_scatter = Stage2ScatterContext(
         arena_handle=0,
@@ -1727,6 +1984,13 @@ test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
+    if get_gfx() == "gfx950":
+        test_adaptive_sort_output_in_place()
+    else:
+        aiter.logger.warning(
+            "%s: skipping adaptive-sort in-place output test (a4w4 is gfx950-only)",
+            get_gfx(),
+        )
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
