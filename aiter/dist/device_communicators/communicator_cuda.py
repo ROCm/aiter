@@ -9,10 +9,17 @@ from torch.distributed import ProcessGroup
 
 from aiter import get_hip_quant, logger
 from aiter.dist.parallel_state import is_global_first_rank
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
 
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
+
+# gfx1250, 4 ranks: the Gluon all-reduce + RMSNorm takes up to 2048 tokens of hidden
+# 2048. RCCL is faster above that.
+_GLUON_AR_MAX_BYTES = 8 << 20
+# The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
+_GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
@@ -77,6 +84,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.ca_comm = reuse_from.ca_comm
             self.qr_comm = reuse_from.qr_comm
             self.symm_mem_comm = reuse_from.symm_mem_comm
+            self.gluon_ar = reuse_from.gluon_ar
+            self.gluon_ar_plain = reuse_from.gluon_ar_plain
             return
 
         # lazy import to avoid documentation build error
@@ -122,6 +131,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # symm_mem_enabled=(
                 #     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 # ),
+            )
+
+        # Inboxes and call counters of the Gluon fused all-reduce + RMSNorm and of the
+        # plain Gluon all-reduce (gfx1250, 4 ranks), one set for each op. They live as
+        # long as the process: destroy() runs after the groups are gone.
+        self.gluon_ar = None
+        self.gluon_ar_plain = None
+        if (
+            os.environ.get("AITER_GLUON_FUSED_AR") == "1"
+            and self.world_size == 4
+            and get_gfx() == "gfx1250"
+        ):
+            from aiter.ops.triton.comms.all_reduce import all_reduce_init
+
+            self.gluon_ar = all_reduce_init(self.cpu_group, _GLUON_AR_MAX_BYTES)
+            self.gluon_ar_plain = all_reduce_init(
+                self.cpu_group, _GLUON_PLAIN_AR_MAX_BYTES
             )
 
         if self.world_size > 1:
@@ -214,6 +240,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
+        if (
+            self.gluon_ar_plain is not None
+            and input_.dtype == torch.bfloat16
+            and input_.is_contiguous()
+            and input_.numel() % 4 == 0
+            and input_.data_ptr() % 16 == 0
+            and input_.numel() * 2 <= _GLUON_PLAIN_AR_MAX_BYTES
+        ):
+            from aiter.ops.triton.comms.all_reduce import all_reduce as gluon_all_reduce
+
+            return gluon_all_reduce(input_, self.cpu_group, *self.gluon_ar_plain)
+
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
@@ -297,6 +335,32 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if x_pad_to_multiple > 0:
             out_n = (n + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
         total_bytes = input_.numel() * input_.element_size()
+        if (
+            self.gluon_ar is not None
+            and total_bytes <= _GLUON_AR_MAX_BYTES
+            and input_.dim() == 2
+            and input_n == n
+            and n >= 256
+            and n & (n - 1) == 0
+            and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
+            and input_.is_contiguous()
+            and res_inp_.is_contiguous()
+            and x_pad_to_multiple == 0
+        ):
+            from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant import (
+                all_reduce_rmsnorm_quant,
+            )
+
+            return all_reduce_rmsnorm_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                gemma_norm,
+                False,
+                self.cpu_group,
+                *self.gluon_ar,
+            )
         can_use_fuse_ar_rms = (
             n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
         )
