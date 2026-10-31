@@ -57,6 +57,7 @@ SHAPES = [
     (384, 7168, 256, 8),  # Kimi-K2 TP=8
     (512, 4096, 512, 10),  # Qwen3.5 TP=1
     (513, 4096, 512, 11),  # Qwen3.5 shared-expert variant
+    (513, 4096, 256, 11),  # Qwen3.5 shared-expert variant TP=4
     (513, 8192, 256, 11),  # Qwen3.8 TP=8 (shared-expert variant)
     (513, 2560, 768, 11),  # Qwen3.8-Flash-Next TP=1 (INTER 640 pads to 768)
     (512, 2048, 512, 10),  # Qwen3-Coder-Next TP=1
