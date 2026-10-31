@@ -126,7 +126,7 @@
     "D_LEQ_128.Q_GEQ_256.SW.DT_fp8_fp8": {
       "BLOCK_M": 128,
       "num_warps": 4,
-      "num_stages": 1,
+      "num_stages": 2,
       "waves_per_eu": 2,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
@@ -142,7 +142,7 @@
     "D_LEQ_128.Q_GEQ_256.DT_fp8_fp8": {
       "BLOCK_M": 128,
       "num_warps": 4,
-      "num_stages": 1,
+      "num_stages": 2,
       "waves_per_eu": 2,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64,
@@ -192,7 +192,7 @@
     "D_LEQ_128.Q_GEQ_256.SW": {
       "BLOCK_M": 128,
       "num_warps": 4,
-      "num_stages": 1,
+      "num_stages": 2,
       "waves_per_eu": 2,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
