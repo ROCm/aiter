@@ -10,6 +10,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.attention import (
     _MLA_ASM_STATUSES,
     _MLA_BACKENDS,
@@ -410,6 +411,40 @@ def _run_decode(n, msq, d, lse, bs=2, persistent=True, v_head_dim=KV_LORA_RANK):
         **kw,
     )
     torch.cuda.synchronize()
+    return o, (qt, kvb, qo, kv_indptr, kv_indices)
+
+
+def _mla_reference(qt, kvb, qo, kv_indptr, kv_indices, msq, v_head_dim):
+    """fp32 causal MLA decode: query token j of a request sees all but its
+    request's last msq - 1 - j keys."""
+    q, kv = qt.float(), kvb.view(kvb.shape[0], -1).float()
+    out = torch.empty(q.shape[0], q.shape[1], v_head_dim, device=q.device)
+    for b in range(qo.numel() - 1):
+        keys = kv[kv_indices[kv_indptr[b] : kv_indptr[b + 1]].long()]
+        for j in range(msq):
+            seen = keys[: keys.shape[0] - (msq - 1 - j)]
+            row = int(qo[b]) + j
+            scores = q[row] @ seen.T / q.shape[-1] ** 0.5
+            out[row] = torch.softmax(scores, dim=-1) @ seen[:, :v_head_dim]
+    return out
+
+
+@requires_gpu
+def test_native_96_head_fp8_decode_matches_reference():
+    # gfx950 runs 96 fp8 heads natively up to qlen 8 (a DSpark block-7 verify);
+    # the shape tests above only check that it launches.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    for msq in (7, 8):
+        support = get_mla_decode_shape_support(96, msq, dtypes.fp8, dtypes.fp8)
+        assert support.native, support
+        out, inputs = _run_decode(96, msq, "fp8", False)
+        ref = _mla_reference(*inputs, msq, KV_LORA_RANK)
+        err = (out.float() - ref).abs().max().item()
+        cos = torch.nn.functional.cosine_similarity(
+            out.float().flatten(), ref.flatten(), dim=0
+        ).item()
+        assert err < 0.1 and cos > 0.999, (msq, err, cos)
 
 
 @requires_gpu
