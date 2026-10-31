@@ -31,7 +31,11 @@ precision_check.py`` at v0.3.3.dev889)::
     A/B lane l, bf16 element v<16 -> row l%16, k = (v//8)*16 + (l//16)*8 + v%8
     C/D lane l, f32 element  v<8  -> m = (l//16)*8 + v,  n = l%16
 
-    python trace_check_cpu.py        # exit 0 on PASS
+    python trace_check_cpu.py        # r16, exit 0 on PASS
+    QSA_BF16_K_LOAD=raw QSA_TRACE_ROWS_PER_BLOCK=32 python trace_check_cpu.py
+
+The r32 mode checks the real two-M-tile shared-B path and mixed/partial fallback.
+TDM itself is covered by the separate bitwise model and no-device ISA gate.
 """
 
 from __future__ import annotations
@@ -559,8 +563,14 @@ def load_module():
 # Driver
 # ---------------------------------------------------------------------------
 def run_kernel(K, q, cache, table, t2r, qpos, ctx, columns):
-    launch = K._build_wmma_kernel(math.sqrt(128))
-    kern = dict(zip(launch.__code__.co_freevars, (c.cell_contents for c in launch.__closure__)))["kernel"]
+    block_rows = int(os.environ.get("QSA_TRACE_ROWS_PER_BLOCK", "16"))
+    launch = K._build_wmma_kernel(math.sqrt(128), block_rows)
+    closure = dict(zip(launch.__code__.co_freevars,
+                       (c.cell_contents for c in launch.__closure__)))
+    # The r16/r32 shape selector renamed the launcher capture in round J.
+    kern = closure.get("selected_kernel", closure.get("kernel"))
+    if kern is None:
+        raise TraceError("launcher has neither selected_kernel nor kernel capture")
     if kern._qsa_block != [K.WMMA_THREADS, 1, 1]:
         raise TraceError(f"known_block_size {kern._qsa_block}")
     body = _instrument(kern)
@@ -580,7 +590,7 @@ def run_kernel(K, q, cache, table, t2r, qpos, ctx, columns):
     }
     Sim.names = {id(v): k for k, v in tensors.items()}
     Sim.writes = {}
-    gx, gy = K.wmma_grid(rows, columns)
+    gx, gy = K.wmma_grid(rows, columns, block_rows)
     for by in range(gy):
         for bx in range(gx):
             Sim.bid = (bx, by)

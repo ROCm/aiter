@@ -2,9 +2,9 @@
 """Stock FlyDSL tracing-only check: NO device, NO kernel launch.
 
 Run in a container without ``--device=/dev/kfd`` / ``--device=/dev/dri``.
-``COMPILE_ONLY=1`` traces bf16 scalar, fp8 LDS-Q, and bf16 WMMA specializations;
-it does not run the LLVM backend or produce a code object on dev886.  The
-``[COMPILED]`` markers mean trace success, NOT a real GPU build or dispatch.
+``COMPILE_ONLY=1`` checks both scalar and all r16/r32 WMMA specializations.
+Enable ``FLYDSL_DUMP_IR=1 FLYDSL_DEBUG_DUMP_ASM=1`` to verify final ISA too;
+``[COMPILED]`` alone does not prove ISA generation or a GPU dispatch.
 
     COMPILE_ONLY=1 python3 compile_only.py
 """
@@ -83,6 +83,28 @@ def main() -> int:
         rc = 1
         print(f"[FAILED]   bf16_wmma: {rec['error'][:2000]}")
     out["specializations"].append(rec)
+    for tag, builder, block_rows, fp8 in (
+        ("bf16_wmma_r32", K._build_wmma_kernel, 32, False),
+        ("fp8_wmma", K._build_wmma_fp8_kernel, 16, True),
+        ("fp8_wmma_r32", K._build_wmma_fp8_kernel, 32, True),
+    ):
+        rec = {"dtype": tag}
+        try:
+            launcher = builder(math.sqrt(128), block_rows)
+            args = (q, kv, ks, pt, t2r, qp, cl, logits, vis, rst) if fp8 else (
+                q, kv, pt, t2r, qp, cl, logits, vis, rst)
+            cf = flyc.compile(
+                launcher, *args, 1, 1, rows, columns, pages, reqs, width, fx.Stream(None),
+            )
+            rec["compiled"] = True
+            rec["compiled_function"] = type(cf).__name__
+            print(f"[COMPILED] {tag} kernel={launcher.kernel_name}")
+        except Exception as exc:  # noqa: BLE001
+            rec["compiled"] = False
+            rec["error"] = f"{type(exc).__name__}: {exc}"[:6000]
+            rc = 1
+            print(f"[FAILED]   {tag}: {rec['error'][:2000]}")
+        out["specializations"].append(rec)
     root = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "")
     hits = []
     for dp, _, fs in os.walk(root) if root else []:
