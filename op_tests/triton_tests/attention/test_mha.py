@@ -1236,3 +1236,26 @@ def test_mha_fwd_mid_head_selection(
         batch_heads=batch_heads,
     )
     assert cfg == fwd_cfg[expected]
+
+
+def test_mha_bwd_onekernel_gfx950_num_stages():
+    from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
+        _get_config,
+    )
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx950":
+        pytest.skip("one-kernel backward tuning is gfx950-specific")
+    assert _get_config(get_arch())["onekernel"]["num_stages"] == 2
+
+
+def test_mha_bwd_onekernel_config_cache_is_arch_scoped():
+    from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
+        _get_config,
+    )
+
+    gfx950_config = _get_config("gfx950")
+    gfx942_config = _get_config("gfx942")
+    assert gfx950_config["onekernel"]["num_stages"] == 2
+    assert gfx942_config["onekernel"]["num_stages"] == 1
+    assert gfx950_config is not gfx942_config
