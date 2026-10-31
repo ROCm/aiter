@@ -1272,13 +1272,115 @@ def test_unified_attn_non_causal(
     # tolerance, so also bound each request's relative L2 error. For the short
     # requests a causal result is at least 0.14 off.
     rel_bound = 5e-2 if q_dtype.itemsize == 1 else 2e-2
-    start = 0
-    for q_len, kv_len in seq_lens:
-        out_rows = output[start : start + q_len].float()
-        ref_rows = ref_output[start : start + q_len].float()
-        start += q_len
-        rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
-        assert rel_err < rel_bound, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+    _assert_request_rel_l2(output, ref_output, seq_lens, bound=rel_bound)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # speculative-decode verify, with a short request a causal result misses
+        [(4, 8704)] * 3 + [(4, 40)],
+        # prefill and mixed batches
+        [(1, 15), (12, 133), (567, 600), (34, 345), (777, 777)],
+    ],
+)
+@pytest.mark.parametrize(
+    "kv_dtype, use_kv_descale", [(torch.bfloat16, False), (e4m3_dtype, True)]
+)
+# The logits are about N(0, 1), so a cap of 50 would not bend them.
+@pytest.mark.parametrize("soft_cap", [None, 2.0])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("shuffled_kv_cache", [False, True])
+@torch.inference_mode()
+def test_unified_attn_non_causal_features(
+    seq_lens: list[tuple[int, int]],
+    kv_dtype: torch.dtype,
+    use_kv_descale: bool,
+    soft_cap: float | None,
+    use_sinks: bool,
+    shuffled_kv_cache: bool,
+) -> None:
+    """Non-causal attention also takes sinks, a softcap and a shuffled KV cache;
+    those run on the Triton kernels, which the gfx950 Gluon gate keeps causal."""
+    block_size = 128
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-max(kv for _, kv in seq_lens) // block_size),
+        block_size=block_size,
+        head_size=64,
+        num_heads=(8, 2),
+        kv_dtype=kv_dtype,
+        out_dtype=torch.bfloat16,
+        shuffled_kv_cache=shuffled_kv_cache,
+        use_kv_descale=use_kv_descale,
+        device="cuda",
+    )
+    sinks = sinks if use_sinks else None
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[kv for _, kv in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        soft_cap=soft_cap,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=0,
+    )
+
+    atol, rtol = (1.5e-1, 1.5e-1) if kv_dtype.itemsize == 1 else (1.5e-2, 1e-2)
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
+    _assert_request_rel_l2(output, ref_output, seq_lens)
 
 
 @pytest.mark.parametrize(
