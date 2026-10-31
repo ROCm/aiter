@@ -397,9 +397,11 @@ __device__ constexpr T block_reduce(T local, F reduce_op)
     // static_assert(BlockSize <= 256, "BlockSize > 256 is not supported");
     static constexpr int waves     = BlockSize / WARP_SIZE;
     static constexpr int wave_size = WARP_SIZE;
-    if constexpr(BlockSize == wave_size)
+    // A sub-wave block needs no cross-wave scratch/barrier. This also keeps
+    // wave32 block instantiations valid in the host pass (WARP_SIZE defaults to 64).
+    if constexpr(BlockSize <= wave_size)
     {
-        local = wave_reduce<T, F, WARP_SIZE, waveBroadcast>(local, reduce_op);
+        local = wave_reduce<T, F, BlockSize, waveBroadcast>(local, reduce_op);
     }
     else
     {
