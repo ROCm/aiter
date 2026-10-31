@@ -580,6 +580,7 @@ def _flash_attn_forward(
     descale_v: torch.Tensor | None = None,
     sink: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]:
 
     if bias is not None:
@@ -597,12 +598,9 @@ def _flash_attn_forward(
     FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
     is_varlen = cu_seqlens_q is not None
 
-    if IS_FP8:
-        o = torch.zeros(
-            (q.shape[:-1] + v.shape[-1:]), dtype=torch.float32, device=q.device
-        )
-    else:
-        o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=q.dtype, device=q.device)
+    if out_dtype is None:
+        out_dtype = torch.float32 if IS_FP8 else q.dtype
+    o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=out_dtype, device=q.device)
     if is_varlen:
         # Layout is thd.
         # q and k are [total_tokens, num_head, head_dim_qk].

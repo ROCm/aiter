@@ -7,12 +7,15 @@ import torch
 
 from aiter import logger
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import ANY_FP8_ARCHS
 from aiter.ops.triton.attention.mha import (
+    _flash_attn_forward,
     flash_attn_func,
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
@@ -301,6 +304,71 @@ def test_mha_varlen_fp8_gluon(
     )
 
     _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
+
+
+@pytest.mark.parametrize("FP8", [True, False])
+@pytest.mark.parametrize("VARLEN", [False, True])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize("OUT_DTYPE", [None, torch.bfloat16, torch.float16])
+def test_mha_forward_out_dtype(
+    FP8: bool,
+    VARLEN: bool,
+    CAUSAL: bool,
+    OUT_DTYPE: torch.dtype,
+    dtype=torch.bfloat16,
+):
+    """out_dtype changes only the final store: the output matches the fp32 output."""
+    if FP8 and get_arch() not in ANY_FP8_ARCHS:
+        pytest.skip(f"FP8 not supported on {get_arch()}")
+    BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 2, 256, 8, 2, 128
+    torch.manual_seed(20)
+    q = torch.randn((BATCH, SEQLEN, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    cu_seqlens = None
+    if VARLEN:
+        q, k, v = (x.flatten(0, 1) for x in (q, k, v))
+        cu_seqlens = torch.arange(
+            0, (BATCH + 1) * SEQLEN, SEQLEN, device="cuda", dtype=torch.int32
+        )
+    descales = {}
+    if FP8:
+        fp8_dtype = get_fp8_e4m3_dtype()
+        q, descales["descale_q"] = quantize_fp8_per_bh(q, fp8_dtype, cu_seqlens)
+        k, descales["descale_k"] = quantize_fp8_per_bh(k, fp8_dtype, cu_seqlens)
+        v, descales["descale_v"] = quantize_fp8_per_bh(v, fp8_dtype, cu_seqlens)
+
+    def forward(**kwargs):
+        return _flash_attn_forward(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=HEAD_SZ**-0.5,
+            causal=CAUSAL,
+            window_size_left=-1,
+            window_size_right=-1,
+            bias=None,
+            alibi_slopes=None,
+            return_lse=False,
+            return_softmax=False,
+            max_seqlen_q=SEQLEN,
+            max_seqlen_k=SEQLEN,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            **descales,
+            **kwargs,
+        )[0]
+
+    ref = forward(out_dtype=torch.float32)
+    out = forward() if OUT_DTYPE is None else forward(out_dtype=OUT_DTYPE)
+    expected_dtype = OUT_DTYPE or (torch.float32 if FP8 else dtype)
+    assert out.dtype == expected_dtype
+    # The epilogue multiply may fuse into the store cast, rounding once, not twice.
+    finfo = torch.finfo(expected_dtype)
+    torch.testing.assert_close(
+        out.float(), ref, atol=finfo.smallest_normal * finfo.eps, rtol=finfo.eps
+    )
 
 
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1)])
