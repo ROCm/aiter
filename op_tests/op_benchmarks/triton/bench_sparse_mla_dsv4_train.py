@@ -9,6 +9,9 @@ Usage:
     python bench_sparse_mla_dsv4_train.py --metric bandwidth
 """
 
+import functools
+import itertools
+
 import torch
 import triton
 
@@ -17,10 +20,16 @@ from aiter.ops.triton.attention.sparse_mla_dsv4_train import (
     sparse_mla_fwd,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 # Representative DSV4 shapes: (N, H, D, N_kv, topk)
 _SHAPES = [
@@ -41,9 +50,54 @@ def _make_inputs(N, H, D, N_kv, topk, device="cuda"):
     return q, kv, attn_sink, indices, scale
 
 
+def _generate_fwd_pool_inputs(N, H, D, N_kv, topk, scale):
+    q, kv, attn_sink, indices, _ = _make_inputs(N, H, D, N_kv, topk)
+    return q, kv, attn_sink, indices
+
+
+def _generate_bwd_pool_inputs(N, H, D, N_kv, topk, scale):
+    q, kv, attn_sink, indices, _ = _make_inputs(N, H, D, N_kv, topk)
+    o, lse = sparse_mla_fwd(q, kv, attn_sink, indices, scale)
+    do = torch.randn_like(o)
+    return q, kv, o, do, indices, lse, attn_sink
+
+
+def _make_fwd_kernel_fn(scale):
+    def kernel_fn(q, kv, attn_sink, indices):
+        sparse_mla_fwd(q, kv, attn_sink, indices, scale)
+
+    return kernel_fn
+
+
+def _make_bwd_kernel_fn(scale):
+    def kernel_fn(q, kv, o, do, indices, lse, attn_sink):
+        sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale)
+
+    return kernel_fn
+
+
+def _rotating_eager_call(kernel_fn, rot_bufs):
+    """Cycle through a rotating-buffer pool without CUDA graph capture.
+
+    sparse_mla_bwd's _build_inverted_topk compacts a boolean mask
+    (``positions[valid]``), a data-dependent output shape that CUDA graph
+    capture cannot record, so do_bench_aiter_triton is not usable here. This
+    keeps the same cache-defeating pool rotation under plain do_bench.
+    """
+    pool_len = len(rot_bufs)
+    counter = itertools.count()
+
+    def fn():
+        kernel_fn(**rot_bufs[next(counter) % pool_len])
+
+    return fn
+
+
 def benchmark(args):
     op = args.op
     unit = "ms" if args.metric == "time" else "GB/s"
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     x_vals = [(N, H, D, N_kv, topk) for N, H, D, N_kv, topk in _SHAPES]
 
@@ -61,11 +115,15 @@ def benchmark(args):
 
     @triton.testing.perf_report([config])
     def _run(N, H, D, N_kv, topk, provider):
-        q, kv, attn_sink, indices, scale = _make_inputs(N, H, D, N_kv, topk)
-        elem = q.element_size()
+        scale = 1.0 / (D**0.5)
+        elem = torch.bfloat16.itemsize
 
         if op == "fwd":
-            fn = lambda: sparse_mla_fwd(q, kv, attn_sink, indices, scale)
+            pool_gen = functools.partial(
+                _generate_fwd_pool_inputs, N, H, D, N_kv, topk, scale
+            )
+            _out_val_keys = ["q", "kv", "attn_sink", "indices"]
+            kernel_fn = _make_fwd_kernel_fn(scale)
             # reads: q + kv (gathered topk) + attn_sink; writes: o + lse
             mem = (
                 N * H * D * elem
@@ -74,15 +132,12 @@ def benchmark(args):
                 + N * H * D * elem  # o
                 + N * H * 4  # lse
             )
-        else:  # bwd via sparse_mla_dsv4_train autograd
-            q_g = q.detach().requires_grad_(True)
-            kv_g = kv.detach().requires_grad_(True)
-            o, lse = sparse_mla_fwd(q_g, kv_g, attn_sink, indices, scale)
-            do = torch.randn_like(o)
-
-            fn = lambda: sparse_mla_bwd(
-                q_g, kv_g, o, do, indices, lse, attn_sink, scale
+        else:  # bwd via sparse_mla_dsv4_train
+            pool_gen = functools.partial(
+                _generate_bwd_pool_inputs, N, H, D, N_kv, topk, scale
             )
+            _out_val_keys = ["q", "kv", "o", "do", "indices", "lse", "attn_sink"]
+            kernel_fn = _make_bwd_kernel_fn(scale)
             mem = (
                 N * H * D * elem  # q
                 + N_kv * D * elem  # kv
@@ -94,7 +149,15 @@ def benchmark(args):
                 + N_kv * D * elem  # dkv
             )
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_out_val_keys], **kwargs_rot_bufs
+        )
+        if op == "fwd":
+            ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+        else:
+            ms = triton.testing.do_bench(
+                _rotating_eager_call(kernel_fn, rot_bufs), warmup=25, rep=100
+            )
         if args.metric == "time":
             return ms
         return mem * 1e-9 / (ms * 1e-3)

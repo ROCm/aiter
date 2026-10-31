@@ -19,6 +19,8 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4_bwd.py --cfgs 4096,128,512
 """
 
+import functools
+
 import torch
 import triton
 
@@ -29,7 +31,15 @@ from aiter.ops.triton.attention.sparse_attention_dsv4_bwd import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_mha_common import sparse_mla_dsv4_ref
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+)
 
 D = 512
 SWA = 128  # sliding-window width
@@ -104,6 +114,36 @@ def _build_case(T, H, topk, device, num_pool=1024, seed=0):
         "indices": indices,
         "num_kv": num_kv,
     }
+
+
+def _generate_bwd_pool_inputs(T, H, topk, device):
+    """Build one full backward case.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry,
+    so replaying through the pool during timing defeats cache residency
+    instead of timing one fixed buffer repeatedly.
+    """
+    case = _build_case(T, H, topk, device)
+    return (
+        case["q"],
+        case["kv"],
+        case["do"],
+        case["o"],
+        case["lse"],
+        case["sink"],
+        case["indices"],
+        case["num_kv"],
+    )
+
+
+_BWD_POOL_FIELDS = ["q", "kv", "do", "o", "lse", "sink", "indices", "num_kv"]
+
+
+def _make_bwd_kernel_fn(scale):
+    def kernel_fn(q, kv, do, o, lse, sink, indices, **_):
+        sparse_mla_bwd_dsv4(q, kv, do, o, lse, indices, attn_sink=sink, scale=scale)
+
+    return kernel_fn
 
 
 # ---------------------------------------------------------------------------
@@ -198,28 +238,25 @@ def _print_table(headers, rows):
 
 def run_bwd_bench(args, device):
     print("\n========== BACKWARD ==========")
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     rows = []
     for T, H, topk in args.cfgs:
-        case = _build_case(T, H, topk, device)
         scale = 1.0 / (D**0.5)
         tflops = _flops(T, H, topk) / 1e12
 
-        ms = triton.testing.do_bench(
-            lambda c=case, s=scale: sparse_mla_bwd_dsv4(
-                c["q"],
-                c["kv"],
-                c["do"],
-                c["o"],
-                c["lse"],
-                c["indices"],
-                attn_sink=c["sink"],
-                scale=s,
-            )
+        pool_gen = functools.partial(_generate_bwd_pool_inputs, T, H, topk, device)
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_BWD_POOL_FIELDS], **kwargs_rot_bufs
         )
-        rows.append([T, H, case["num_kv"], topk, ms, tflops / (ms * 1e-3)])
+        kernel_fn = _make_bwd_kernel_fn(scale)
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+        num_kv = rot_bufs[0]["num_kv"]
+        rows.append([T, H, num_kv, topk, ms, tflops / (ms * 1e-3)])
 
         if args.breakdown:
             print(f"\n  per-kernel, T={T} H={H} topk={topk}:")
+            case = _build_case(T, H, topk, device)
             phases = _time_phases(case, scale)
             total = sum(t for _, t in phases)
             for name, t in phases:

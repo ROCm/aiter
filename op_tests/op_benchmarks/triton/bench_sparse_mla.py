@@ -4,8 +4,10 @@
 """Benchmark for sparse_mla_fwd (gluon MLA; gfx950 and gfx942).
 
 Separated rope by default; --qk_rope_head_dim 0 runs the rope-free geometry.
-The cache is flushed between iterations by default. Leaving it warm lets the loop
-re-read its KV and flatters decode shapes badly.
+Timed with `do_bench_aiter_triton` (a rotating-buffer CUDA graph replay):
+cycling through a pool of independent launches defeats cache residency the
+same way the old explicit L2 flush did, so a decode shape is not flattered
+by re-reading its own warm KV.
 
 Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py
@@ -14,10 +16,10 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --qk_rope_head_dim 0
 """
 
+import functools
+
 import torch
 import triton
-from torch.autograd import DeviceType
-from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.triton.attention.sparse_mla import (
     FP8_ARCHS,
@@ -27,10 +29,14 @@ from aiter.ops.triton.attention.sparse_mla import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
 )
 
@@ -39,43 +45,6 @@ QK_ROPE_HEAD_DIM = 64
 D_QK = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 E4M3_DTYPE = get_fp8_e4m3_dtype()
 E4M3_MAX = torch.finfo(E4M3_DTYPE).max
-
-# Picks up the main kernel and _sparse_mla_reduce, nothing else.
-KERNEL_MATCH = "_sparse_mla"
-FLUSH_BYTES = 512 << 20
-
-_flush_buf = None
-
-
-def flush_l2():
-    global _flush_buf
-    if _flush_buf is None:
-        _flush_buf = torch.empty(FLUSH_BYTES, dtype=torch.uint8, device="cuda")
-    _flush_buf.fill_(1)
-
-
-def device_time_ms(func, warmup=25, rep=100, flush=True):
-    for _ in range(warmup):
-        if flush:
-            flush_l2()
-        func()
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        for _ in range(rep):
-            if flush:
-                flush_l2()
-            func()
-        torch.cuda.synchronize()
-    total = sum(
-        e.self_device_time_total
-        for e in prof.key_averages()
-        if e.device_type == DeviceType.CUDA
-        and KERNEL_MATCH in e.key
-        and e.self_device_time_total > 0
-    )
-    if total == 0:
-        raise RuntimeError(f"no kernel matching {KERNEL_MATCH!r} was profiled")
-    return total / rep / 1e3
 
 
 def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, d_qk=D_QK):
@@ -143,7 +112,65 @@ def build_case(
     return q, kv, kv_fp8, scale, indices, indptr
 
 
+def _generate_sparse_mla_pool_inputs(
+    num_seqs, num_tokens, num_heads, context, topk, d_qk, dots
+):
+    """Build one full launch: fresh Q/KV and its CSR topk-slot lists.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry;
+    replaying through the pool during timing defeats cache residency the
+    same way the old explicit L2 flush did, without needing a profiler to
+    isolate the kernel's own time from the flush.
+    """
+    q, kv, kv_fp8, kv_scale, indices, indptr = build_case(
+        num_seqs, num_tokens, num_heads, context, topk, d_qk=d_qk
+    )
+    out = torch.empty(
+        q.shape[0], num_heads, KV_LORA_RANK, dtype=torch.bfloat16, device=q.device
+    )
+    if dots == "fp8":
+        # Hand q over already quantized, the way production does.
+        cache, scale = kv_fp8, kv_scale
+        q_scale = (q.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
+        q = (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
+    else:
+        cache, scale, q_scale = kv, None, None
+    return q, cache, scale, q_scale, indices, indptr, out
+
+
+_SPARSE_MLA_POOL_FIELDS = [
+    "q",
+    "cache",
+    "scale",
+    "q_scale",
+    "indices",
+    "indptr",
+    "out",
+]
+
+
+def _make_sparse_mla_kernel_fn(sm_scale, rope, dots):
+    def kernel_fn(q, cache, scale, q_scale, indices, indptr, out):
+        # out= is supplied, so the returned pair is not needed
+        sparse_mla_fwd(
+            q,
+            cache,
+            indptr,
+            indices,
+            sm_scale,
+            kv_scale=scale,
+            qk_rope_head_dim=rope,
+            q_scale=q_scale,
+            dot_precision=dots,
+            out=out,
+        )
+
+    return kernel_fn
+
+
 def run_benchmark(args):
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     if args.metric == "time":
         ylabel = "Time (ms)"
     elif args.metric == "throughput":
@@ -197,44 +224,35 @@ def run_benchmark(args):
     ):
         rope = args.qk_rope_head_dim
         d_qk = KV_LORA_RANK + rope
-        q, kv, kv_fp8, kv_scale, indices, indptr = build_case(
-            num_seqs, num_tokens, num_heads, context, topk, d_qk=d_qk
-        )
         sm_scale = d_qk**-0.5
-        out = torch.empty(
-            q.shape[0],
+
+        pool_gen = functools.partial(
+            _generate_sparse_mla_pool_inputs,
+            num_seqs,
+            num_tokens,
             num_heads,
-            KV_LORA_RANK,
-            dtype=torch.bfloat16,
-            device=q.device,
+            context,
+            topk,
+            d_qk,
+            dots,
         )
-        if dots == "fp8":
-            # Hand q over already quantized, the way production does.
-            cache, scale = kv_fp8, kv_scale
-            q_scale = (q.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
-            q = (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
-        else:
-            cache, scale, q_scale = kv, None, None
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen],
+            [_SPARSE_MLA_POOL_FIELDS],
+            # sparse_mla_fwd gathers only topk rows per token out of cache's
+            # full num_seqs*context capacity via indices/indptr, so cache's
+            # allocated size way overstates what one call touches, especially
+            # at large context/small topk. Counting the full capacity here
+            # would undersize pool_len relative to the real gather footprint.
+            exclude_from_sizing=["cache"],
+            **kwargs_rot_bufs,
+        )
+        kernel_fn = _make_sparse_mla_kernel_fn(sm_scale, rope, dots)
+        time_ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
-        def func():
-            # out= is supplied, so the returned pair is not needed
-            sparse_mla_fwd(
-                q,
-                cache,
-                indptr,
-                indices,
-                sm_scale,
-                kv_scale=scale,
-                qk_rope_head_dim=rope,
-                q_scale=q_scale,
-                dot_precision=dots,
-                out=out,
-            )
-
-        time_ms = device_time_ms(func, flush=not args.no_flush_l2)
-
-        nnz = int(indptr[-1].item())
-        num_tokens = q.shape[0]
+        sample = rot_bufs[0]
+        nnz = int(sample["indptr"][-1].item())
+        num_tokens = sample["q"].shape[0]
         # QK reads the whole row, PV only the latent half
         flops = 2.0 * num_heads * nnz * (d_qk + KV_LORA_RANK)
         moved = bytes_moved(
@@ -279,7 +297,8 @@ def main():
     parser.add_argument(
         "--no_flush_l2",
         action="store_true",
-        help="skip the cache flush between iterations, so the gather runs warm",
+        help="Unused: do_bench_aiter_triton's rotating buffer pool defeats cache "
+        "residency instead of an explicit flush. Kept for CLI compatibility.",
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
@@ -287,6 +306,9 @@ def main():
     override_parser_action(
         parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
+    # The KV gather is the bulk of each pool entry; default to a larger
+    # rotation target than the shared 256 MB to keep the pool cache-cold.
+    override_parser_action(parser, action="--rot-bufs-target-mb", default=512)
     args = parser.parse_args()
     over = [t for t in args.num_tokens if t > args.context]
     if over:
