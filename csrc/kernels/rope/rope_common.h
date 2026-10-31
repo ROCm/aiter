@@ -7862,7 +7862,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int64_t v_head_stride    = 0,
                                           bool v_norm              = false,
                                           KVT* q_out_fp8           = nullptr,
-                                          const float* per_tensor_q_scale = nullptr)
+                                          const float* per_tensor_q_scale = nullptr,
+                                          T* k_out_unquantized     = nullptr)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -8118,12 +8119,15 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                 }
                 out_kv_vec.store(k_cache + offset);
             }
-            if(k_out != nullptr)
+            if(k_out != nullptr || k_out_unquantized != nullptr)
             {
                 const int64_t k_out_offset =
                     (static_cast<int64_t>(token_id) * num_heads_k + head_id_k) * HEAD_SIZE +
                     access_id_in_head;
-                out_kv_vec.store(k_out + k_out_offset);
+                if(k_out != nullptr)
+                    out_kv_vec.store(k_out + k_out_offset);
+                if(k_out_unquantized != nullptr)
+                    out_vec.store(k_out_unquantized + k_out_offset);
             }
         }
     }
@@ -8384,7 +8388,8 @@ void fused_rope_rms_set_kv(const T* qkv,
                            int64_t v_head_stride    = 0,
                            bool v_norm              = false,
                            KVT* q_out_fp8           = nullptr,
-                           const float* per_tensor_q_scale = nullptr)
+                           const float* per_tensor_q_scale = nullptr,
+                           T* k_out_unquantized     = nullptr)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256 || head_size == 512);
     // po2_div/po2_mod in the paged and shuffle-layout address math assume these are
@@ -8452,7 +8457,8 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         v_head_stride,       \
                                                         v_norm,              \
                                                         q_out_fp8,           \
-                                                        per_tensor_q_scale); \
+                                                        per_tensor_q_scale,  \
+                                                        k_out_unquantized);  \
     }                                                                        \
     else                                                                     \
     {                                                                        \
@@ -8493,7 +8499,8 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         v_head_stride,       \
                                                         v_norm,              \
                                                         q_out_fp8,           \
-                                                        per_tensor_q_scale); \
+                                                        per_tensor_q_scale,  \
+                                                        k_out_unquantized);  \
     }
 
     if(q_out_fp8 != nullptr)
