@@ -3,9 +3,21 @@ import torch
 import torch.nn.functional as F
 
 from aiter import logger
-from aiter.ops.triton.fusions.activation import act_mul_and_mxfp4_quant
+from aiter.ops.triton.fusions import activation as activation_ops
+from aiter.ops.triton.fusions.activation import (
+    act_mul_and_fp8_group_quant,
+    act_mul_and_mxfp4_quant,
+)
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
+from op_tests.triton_tests.quant.test_fused_fp8_quant import (
+    run_torch_reduce_act_mul_fp8_group_quant,
+)
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
 
 
@@ -138,3 +150,61 @@ def test_act_mul_and_mxfp4_quant(
 
     torch.testing.assert_close(triton_out, torch_out)
     torch.testing.assert_close(triton_scale, torch_scale)
+
+
+# Only 17408 fills whole 1024-column tiles; 1000 also ends in a partial group.
+FP8_GROUP_QUANT_N = [2 * 1000, 2 * 2176, 2 * 4352, 2 * 8704, 2 * 17408]
+
+
+@pytest.mark.parametrize("M", [1, 32, 256, 4097])
+@pytest.mark.parametrize("N", FP8_GROUP_QUANT_N)
+@pytest.mark.parametrize("activation", ["silu", "gelu"])
+def test_act_mul_and_fp8_group_quant(M: int, N: int, activation: str):
+    torch.manual_seed(0)
+    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+
+    out_q, out_s = act_mul_and_fp8_group_quant(x, activation, group_size=128)
+    # The kernel computes in fp32, so the reference also does.
+    (ref_q, ref_s), _ = run_torch_reduce_act_mul_fp8_group_quant(
+        x.float(), None, activation, torch.float32, out_q.dtype, group_size=128
+    )
+
+    torch.testing.assert_close(out_s, ref_s, atol=0, rtol=1e-5)
+    # A value at a rounding boundary can move by one FP8 step.
+    torch.testing.assert_close(out_q.float(), ref_q.float(), atol=2**-9, rtol=0.125)
+
+
+class _LaunchSpy:
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.kwargs = None
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            self.kwargs = kwargs
+            return self.kernel[grid](*args, **kwargs)
+
+        return launch
+
+
+@pytest.mark.parametrize("M", [1, 4097])
+@pytest.mark.parametrize("N", FP8_GROUP_QUANT_N)
+def test_act_mul_and_fp8_group_quant_launch(monkeypatch, M: int, N: int):
+    # gfx942 has a tuned config. Other architectures keep one group for each program.
+    config_dir = resolve_config_dir("fusions", "ACT_MUL_AND_FP8_GROUP_QUANT")
+    configs = load_config_json(
+        f"{config_dir}/DEFAULT.json", required=arch_info.get_arch() == "gfx942"
+    )
+    spy = _LaunchSpy(activation_ops._act_mul_and_dynamic_fp8_group_quant_kernel)
+    monkeypatch.setattr(
+        activation_ops, "_act_mul_and_dynamic_fp8_group_quant_kernel", spy
+    )
+    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+    act_mul_and_fp8_group_quant(x, "silu", group_size=128)
+
+    if configs is None:
+        assert spy.kwargs["BLOCK_SIZE_N"] == 128
+        assert "num_warps" not in spy.kwargs
+        return
+    for key, value in select_leq_config(configs, M, prefix="M_LEQ_").items():
+        assert spy.kwargs[key] == value, key
