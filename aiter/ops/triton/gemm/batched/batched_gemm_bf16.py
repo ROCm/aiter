@@ -29,6 +29,15 @@ def _is_gluon_available():
         return False
 
 
+def _fits_int32_per_batch(*tensors: torch.Tensor) -> bool:
+    """True if the largest element offset inside one batch fits in int32."""
+    for t in tensors:
+        n, s = t.shape, t.stride()
+        if (n[-2] - 1) * s[-2] + (n[-1] - 1) * s[-1] >= 2**31:
+            return False
+    return True
+
+
 def batched_gemm_bf16(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -278,12 +287,26 @@ def batched_gemm_bf16(
         else:
             y_pp = None
 
-        grid = lambda META: (
-            B,
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
+        # On gfx1151, put the tiles of one batch next to each other in the grid.
+        # The (B, tiles) order scatters the stores of neighbouring programs over
+        # all batches, which is slow when the GEMM is store-bound (small K).
+        out = YQ if num_ksplit == 1 else y_pp
+        tile_major = get_arch() == "gfx1151" and _fits_int32_per_batch(XQ, WQ, out)
+        even_mn = M % config["BLOCK_SIZE_M"] == 0 and N % config["BLOCK_SIZE_N"] == 0
+        if tile_major:
+            grid = lambda META: (
+                META["NUM_KSPLIT"]
+                * triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+                B,
+            )
+        else:
+            grid = lambda META: (
+                B,
+                META["NUM_KSPLIT"]
+                * triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            )
 
         _batched_gemm_bf16_kernel[grid](
             XQ,
@@ -305,6 +328,8 @@ def batched_gemm_bf16(
             0 if num_ksplit == 1 else y_pp.stride(0),
             bias.stride(0) if has_bias else 0,
             has_bias,
+            TILE_MAJOR=tile_major,
+            EVEN_MN=even_mn,
             **config,
         )
 
