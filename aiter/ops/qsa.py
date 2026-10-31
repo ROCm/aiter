@@ -8,6 +8,8 @@ Consumers should import from here rather than from the backend-specific
 modules directly.
 """
 
+from collections.abc import Sequence
+
 import torch
 
 from aiter.ops.topk import top_k_per_row_prefill
@@ -30,6 +32,13 @@ try:
     _HAS_FLYDSL = True
 except ImportError:
     _HAS_FLYDSL = False
+
+try:
+    from aiter.ops.flydsl.qsa_sparse_prefill import flydsl_qsa_sparse_prefill
+
+    _HAS_FLYDSL_PREFILL = True
+except ImportError:
+    _HAS_FLYDSL_PREFILL = False
 
 DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 
@@ -185,10 +194,40 @@ def qsa_select_paged_tokens(
     return out
 
 
+def qsa_sparse_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    query_lens: Sequence[int] | None = None,
+    prefix_lens: Sequence[int] | None = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse prefill/extend attention over packed K/V; FlyDSL on gfx942 only.
+
+    See ``aiter.ops.flydsl.qsa_sparse_prefill.flydsl_qsa_sparse_prefill``.
+    """
+    if not _HAS_FLYDSL_PREFILL:
+        raise RuntimeError("QSA sparse prefill requires FlyDSL")
+    return flydsl_qsa_sparse_prefill(
+        q,
+        k,
+        v,
+        indices,
+        query_lens=query_lens,
+        prefix_lens=prefix_lens,
+        softmax_scale=softmax_scale,
+        out=out,
+    )
+
+
 __all__ = [
     "DEFAULT_LOGITS_WORKSPACE_BYTES",
     "qsa_expand_block_indices",
     "qsa_paged_mqa_logits",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
+    "qsa_sparse_prefill",
 ]
