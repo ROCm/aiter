@@ -18,7 +18,9 @@ Usage:
 
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
-    ARCH                      Target GPU architecture (e.g. gfx942, gfx950).
+    GPU_ARCHS                 Keeps only the jobs for the listed archs, here and in
+                              setup.py's run_aot.
+    ARCH                      Replaces GPU_ARCHS, for this entry point only.
 """
 
 from __future__ import annotations
@@ -34,7 +36,8 @@ from typing import Any
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
-    collect_aot_jobs,
+    aot_target_archs,
+    collect_cli_jobs,
     compile_only_env,
     cu_num_to_arch,
     job_identity,
@@ -71,6 +74,11 @@ _FIXED_SWITCHES: dict[str, bool] = {
 }
 
 
+def job_arch(cu_num: int = 0) -> str:
+    """Target arch a job would compile for -- shared by dispatch and filtering."""
+    return cu_num_to_arch(cu_num, default=CHUNK_GDN_H_AOT_ARCH_DEFAULT)
+
+
 def _parse_bool(s: str) -> bool:
     """CSV-friendly bool parser. Tolerates ``"True"``/``"False"`` (Python
     ``str(bool)`` style, which is what a tuner writes) plus the more
@@ -104,7 +112,8 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
     keeps arbitrary ``T``/seqlens off the JIT path, and costs only compile time
     because a row's own tuned ``BV`` is always among them. ``g_head_major`` and
     ``use_state_indices`` are fanned out for a related reason: they are not
-    tuned dimensions, but they do fork the compiled artifact.
+    tuned dimensions, but they do fork the compiled artifact. Keeps only the
+    GPU_ARCHS jobs, so setup.py's run_aot filters like main().
     """
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
@@ -170,6 +179,9 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 seen.add(key)
                 jobs.append(job)
 
+    keep_archs = aot_target_archs()
+    if keep_archs is not None:
+        jobs = [j for j in jobs if job_arch(j["cu_num"]) in keep_archs]
     return jobs
 
 
@@ -305,7 +317,7 @@ def _format_shape_str(job: dict) -> str:
 
 def compile_one_config(*, cu_num: int = 0, **kwargs) -> dict:
     """Compile one opt configuration and save it to cache."""
-    aot_arch = cu_num_to_arch(cu_num, default=CHUNK_GDN_H_AOT_ARCH_DEFAULT)
+    aot_arch = job_arch(cu_num)
     kwargs.pop("kernel_name", None)
     shape_str = _format_shape_str(kwargs)
     result = {
@@ -357,7 +369,7 @@ def main():
     )
     arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(auto-detect)"
 
-    jobs = collect_aot_jobs(csv_paths, parse_csv)
+    jobs = collect_cli_jobs(csv_paths, parse_csv)
 
     print("=" * 72)
     print("FlyDSL chunk-gated-delta-h opt (K5) AOT Pre-compilation")

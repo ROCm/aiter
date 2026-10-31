@@ -90,6 +90,21 @@ def collect_aot_jobs(
     return dedupe_jobs(jobs)
 
 
+def collect_cli_jobs(
+    csv_paths: list[str],
+    parse_csv: Callable[[str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """collect_aot_jobs for a python -m entry point, where ARCH replaces GPU_ARCHS."""
+    with cli_arch_env():
+        return collect_aot_jobs(csv_paths, parse_csv)
+
+
+def keeps_arch(arch: str) -> bool:
+    """Whether GPU_ARCHS keeps the jobs that compile for arch."""
+    keep_archs = aot_target_archs()
+    return keep_archs is None or arch in keep_archs
+
+
 @contextmanager
 def compile_only_env() -> Iterator[None]:
     prev = os.environ.get("COMPILE_ONLY")
@@ -177,6 +192,14 @@ def check_replay_process(arch: str) -> None:
             f"aiter was imported for another arch: dtypes.fp8 is {dtypes.fp8}, "
             f"{arch} needs {expected}"
         )
+
+
+@contextmanager
+def cli_arch_env() -> Iterator[None]:
+    """Lets ARCH replace GPU_ARCHS, for a python -m entry point."""
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
+    with override_env("GPU_ARCHS", arch):
+        yield
 
 
 def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
