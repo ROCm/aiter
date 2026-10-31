@@ -4,7 +4,9 @@
 
 import csv
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -903,6 +905,60 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
         self.assertEqual(precompiled[0]["swiglu_limit"], 3.5)
         self.assertEqual(precompiled[1]["swiglu_limit"], 3.5)
         self.assertNotIn("swiglu_limit", precompiled[2])
+
+
+class TestFlydslAotReplay(unittest.TestCase):
+    def test_arch_waves_stay_within_the_worker_budget(self):
+        from aiter.aot.flydsl.common import worker_waves
+
+        jobs = {"gfx950": 8512, "gfx1250": 893}
+        for workers in range(1, 9):
+            waves = worker_waves(workers, jobs)
+            self.assertEqual(sorted(a for wave in waves for a in wave), sorted(jobs))
+            for wave in waves:
+                self.assertLessEqual(sum(wave.values()), workers)
+                self.assertGreaterEqual(min(wave.values()), 1)
+        self.assertEqual(worker_waves(1, jobs), [{"gfx950": 1}, {"gfx1250": 1}])
+        self.assertEqual(worker_waves(4, jobs), [{"gfx950": 3, "gfx1250": 1}])
+
+    def test_gemm_table_follows_its_config_variable_under_any_file_name(self):
+        from aiter.aot.flydsl import gemm
+        from aiter.jit.core import AITER_CONFIGS
+
+        lookup = type(AITER_CONFIGS).get_config_file
+        self.addCleanup(lookup.cache_clear)
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = os.path.join(tmp, "custom_override.csv")
+            shutil.copyfile(REPO_ROOT / "aiter/configs/bf16_tuned_gemm.csv", custom)
+            lookup.cache_clear()
+            with mock.patch.dict(os.environ, {"AITER_CONFIG_GEMM_BF16": custom}):
+                self.assertIs(gemm.table_of(custom), gemm._TABLES["bf16_tuned_gemm"])
+                self.assertTrue(gemm.parse_csv(custom))
+                self.assertEqual(
+                    gemm.config_env([custom]), {"AITER_CONFIG_GEMM_BF16": custom}
+                )
+            lookup.cache_clear()
+            with self.assertRaisesRegex(ValueError, "is no FlyDSL GEMM table"):
+                gemm.parse_csv(custom)
+
+    def test_fmha_builds_a_launcher_no_grid_point_picks(self):
+        from aiter.aot.flydsl import fmha_fp8
+        from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+        # Causal cross attention the wrapper splits 11 ways, between grid
+        # points of the query length.
+        batch, heads, seqlen_q, seqlen_kv, num_cu = 1, 12, 5675, 66157, 256
+        block_m = fa._fp8_auto_block_m(batch, heads, seqlen_q, seqlen_kv, num_cu)
+        splits = fa._fp8_auto_kv_splits(
+            batch, heads, seqlen_q, seqlen_kv, True, num_cu, block_m
+        )
+        pinned = {
+            (job["causal"], job["return_lse"], job["fp8_block_m"], job["num_kv_splits"])
+            for job in fmha_fp8.shape_jobs()
+            if job.get("num_kv_splits") is not None
+        }
+        for return_lse in (False, True):
+            self.assertIn((True, return_lse, block_m, splits), pinned)
 
 
 if __name__ == "__main__":

@@ -5,33 +5,41 @@
 
 """AOT pre-compilation for the gfx950 FlyDSL FP8 flash-attention forward.
 
-``flydsl_flash_attn_fp8_func`` picks its rescale threshold, BLOCK_M and split-K
-factor per call, so each new combination is a JIT compile on the serving path.
-The launcher's cache key is fixed by the ``_build_fp8`` parameters alone -- the
-runtime ints/floats enter it by type only and the flattened tensors by dtype
-only -- so the set a head shape can reach is finite. It is enumerated here from
-the heuristics' own module constants, which keeps the job list in step with
-them.
+``flydsl_flash_attn_fp8_func`` picks its rescale threshold, BLOCK_M, split-K
+factor and batch interleave per call from the batch and sequence lengths, so
+each new combination is a JIT compile on the serving path. This module
+replays the wrapper itself on FakeTensors inside
+:func:`aiter.aot.flydsl.dry_run.dry_run` (see ``replay.py``) for each head
+shape in ``DEFAULT_SHAPES``, over a grid of batch sizes and sequence lengths:
+for every batch and query length, at each grid key/value length, bisecting
+between grid points where the wrapper switches kernels. The heuristics stay
+the wrapper's own, so changing them needs no AOT change.
+
+Between grid points of the batch and query length the wrapper can still pick
+a launcher no grid point does, so each launcher it can pick at all
+(``_variant_space``) is replayed too, with its tile and split count pinned
+through the wrapper's own overrides.
 
 Usage:
     python -m aiter.aot.flydsl.fmha_fp8                          # DEFAULT_SHAPES
     python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128    # ad hoc
+    python -m aiter.aot.flydsl.fmha_fp8 --check
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import sys
-import time
 
-from aiter.aot.flydsl.common import (
-    compile_only_env,
-    dedupe_jobs,
-    override_env,
-    run_jobs_parallel,
-)
+from aiter.aot.flydsl import replay as _replay
+from aiter.aot.flydsl.common import dedupe_jobs
 
-AOT_ARCH = "gfx950"
+LABEL = "FMHA_FP8"
+# No tuned table: the jobs come from DEFAULT_SHAPES or --shape.
+DEFAULT_CSVS: list[str] = []
+AOT_ARCH_DEFAULT = "gfx950"
+_CU_NUM = 256
 LAYOUTS = {
     "varlen_cross": (True, True),
     "varlen": (True, False),
@@ -40,18 +48,23 @@ LAYOUTS = {
 }
 # Head shapes to pre-compile, per model: (num_heads, num_kv_heads, head_dim,
 # head_dim_v, layout) with the head counts per rank. ``varlen_cross`` is the
-# chunked-prefill serving path. Jobs dedupe by kernel name, so two models may
-# share a head shape.
+# chunked-prefill serving path. Jobs dedupe, so two models may share a head
+# shape.
 DEFAULT_SHAPES = {
     "kimi_k3_tp8": [(12, 12, 192, 128, "varlen_cross")],
 }
-# Flags the public wrapper defaults to; they are part of the compile key.
-_DEFAULT_FLAGS = {
-    "daz": True,
-    "lazy_rescale": True,
-    "setprio": True,
-    "enable_stagger": True,
-}
+# The sizes the wrapper is replayed at. Its heuristics compare tile and
+# workgroup counts against thresholds and the CU count, so along the key/value
+# length the kernels change only between these points, where the replay
+# bisects. Past the longest sequence the flattened tensors outgrow the int32
+# ABI.
+_BATCHES = (1, 2, 3, 4, 8, 16, 32, 64, 128)
+_SEQLENS = tuple(2**i for i in range(4, 18))
+# The query length of a pinned cross-attention replay: one causal split-K
+# serves, with a workspace far below the int32 ABI at every split count.
+_PINNED_SEQLEN_Q = 512
+# The wrapper's overrides a ``_variant_jobs`` job pins.
+_PINS = ("fp8_block_m", "num_kv_splits")
 
 
 def _layout(value: str | None) -> str:
@@ -72,8 +85,7 @@ def parse_shape(spec: str) -> tuple[int, int, int, int, str]:
 
 def unsupported_reason(h: int, hkv: int, d: int, dv: int) -> str | None:
     """Why the kernel cannot serve this head shape, or None. The runtime gate
-    uses the same check, so a rejected shape is never dispatched and its
-    kernels would only fail the build."""
+    uses the same check, so a rejected shape is never dispatched."""
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         _fp8_config_reason,
     )
@@ -128,42 +140,72 @@ def _variant_space(causal: bool, cross: bool) -> list[tuple[float, int, int, int
     return out
 
 
-def jobs_for_shape(h: int, hkv: int, d: int, dv: int, layout: str) -> list[dict]:
-    varlen, cross = LAYOUTS[layout]
+def _variant_jobs(base: dict, causal: bool, cross: bool) -> list[dict]:
+    """A job per launcher of ``_variant_space``, its tile and split count pinned:
+    the longest grid key/value length of its threshold, and a batch of its
+    interleave group. Causal cross attention at batch 1, query length 5675 and
+    key/value length 66157, say, splits 11 ways, which no grid point does."""
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
     jobs = []
-    for causal in (True, False):
-        for return_lse in (False, True):
-            for thr, bm, s, g in _variant_space(causal, cross):
-                jobs.append(
-                    {
-                        "kernel_name": (
-                            f"fmha_fp8_h{h}_hkv{hkv}_d{d}_dv{dv}_{layout}"
-                            f"_c{int(causal)}_lse{int(return_lse)}"
-                            f"_thr{thr:g}_bm{bm}_s{s}_g{g}"
-                        ),
-                        "num_heads": h,
-                        "num_kv_heads": hkv,
-                        "head_dim": d,
-                        "head_dim_v": dv,
-                        "varlen": varlen,
-                        "cross_seqlen": cross,
-                        "causal": causal,
-                        "return_lse": return_lse,
-                        "rescale_threshold": thr,
-                        "block_m": bm,
-                        "num_kv_splits": s,
-                        "batch_interleave_group": g,
-                    }
-                )
+    for threshold, block_m, splits, group in _variant_space(causal, cross):
+        seqlen_kv = max(
+            s for s in _SEQLENS if fa._fp8_rescale_threshold(s) == threshold
+        )
+        jobs.append(
+            {
+                **base,
+                "batch": group,
+                "seqlen_q": _PINNED_SEQLEN_Q if cross else None,
+                "m": seqlen_kv,
+                "m_low": None,
+                "fp8_block_m": block_m,
+                "num_kv_splits": splits,
+            }
+        )
     return jobs
 
 
-def default_jobs(shapes: dict[str, list] = DEFAULT_SHAPES) -> list[dict]:
-    """Every variant ``DEFAULT_SHAPES`` can reach.
+def jobs_for_shape(h: int, hkv: int, d: int, dv: int, layout: str) -> list[dict]:
+    """A job per causal mask, LSE output, batch and query length, at each grid
+    key/value length (the query length itself, without cross attention), and
+    one per launcher the wrapper can pick (``_variant_jobs``)."""
+    _, cross = LAYOUTS[layout]
+    jobs = []
+    for causal, return_lse in itertools.product((True, False), (False, True)):
+        base = {
+            "kernel_name": f"fmha_fp8_h{h}_hkv{hkv}_d{d}_dv{dv}_{layout}",
+            "gfx": AOT_ARCH_DEFAULT,
+            "cu_num": _CU_NUM,
+            "num_heads": h,
+            "num_kv_heads": hkv,
+            "head_dim": d,
+            "head_dim_v": dv,
+            "layout": layout,
+            "causal": causal,
+            "return_lse": return_lse,
+        }
+        for batch, seqlen_q in itertools.product(
+            _BATCHES, _SEQLENS if cross else (None,)
+        ):
+            points = [s for s in _SEQLENS if seqlen_q is None or s >= seqlen_q]
+            for low, high in zip([None, *points], points):
+                jobs.append(
+                    {
+                        **base,
+                        "batch": batch,
+                        "seqlen_q": seqlen_q,
+                        "m": high,
+                        "m_low": None if low is None else low + 1,
+                    }
+                )
+        jobs += _variant_jobs(base, causal, cross)
+    return jobs
 
-    A shape the kernel's own gate rejects is skipped with a warning rather
-    than failing the whole build.
-    """
+
+def shape_jobs(shapes: dict[str, list] = DEFAULT_SHAPES) -> list[dict]:
+    """Every job of ``shapes``; a shape the kernel's own gate rejects is
+    skipped with a warning rather than failing the whole build."""
     jobs = []
     for model, entries in shapes.items():
         for h, hkv, d, dv, layout in entries:
@@ -178,133 +220,98 @@ def default_jobs(shapes: dict[str, list] = DEFAULT_SHAPES) -> list[dict]:
     return dedupe_jobs(jobs)
 
 
-def _compile_to_cache(
-    *,
-    num_heads,
-    num_kv_heads,
-    head_dim,
-    head_dim_v,
-    varlen,
-    cross_seqlen,
-    causal,
-    return_lse,
-    rescale_threshold,
-    block_m,
-    num_kv_splits,
-    batch_interleave_group,
-):
+def replay(job: dict) -> None:
     import torch
 
-    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import _build_fp8
-
-    exe = _build_fp8(
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        causal=causal,
-        rescale_threshold=rescale_threshold,
-        head_dim=head_dim,
-        head_dim_v=head_dim_v,
-        varlen=varlen,
-        cross_seqlen=cross_seqlen,
-        num_kv_splits=num_kv_splits,
-        block_m=block_m,
-        batch_interleave_group=batch_interleave_group,
-        return_lse=return_lse,
-        **_DEFAULT_FLAGS,
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
     )
 
-    # Mirror the runtime exe(...) at the end of flydsl_flash_attn_fp8_func: flat
-    # tensors, the same optional kwargs present or absent, the same dtypes.
-    # Values and sizes never reach the key; a missing or extra kwarg, or a wrong
-    # dtype, silently would.
-    cpu = torch.device("cpu")
+    def empty(*shape, dtype=torch.float8_e4m3fn):
+        return torch.empty(shape, dtype=dtype, device="cuda")
 
-    def t(n, dtype):
-        return torch.empty(n, dtype=dtype, device=cpu)
-
-    f8, bf16, f32, i32 = torch.float8_e4m3fn, torch.bfloat16, torch.float32, torch.int32
-    batch, seq = batch_interleave_group, 512
-    kwargs = {
-        "stream": None,
-        "softmax_scale": head_dim**-0.5,
-        "q_descale": t(1, f32),
-        "k_descale": t(1, f32),
-        "v_descale": t(1, f32),
-    }
-    if return_lse:
-        kwargs["lse"] = t(num_heads * seq, f32)
-        kwargs["lse_stride_h"] = seq
-    if num_kv_splits > 1:
-        kwargs["workspace"] = t(1024, f32)
+    varlen, cross = LAYOUTS[job["layout"]]
+    h, hkv = job["num_heads"], job["num_kv_heads"]
+    d, dv, batch = job["head_dim"], job["head_dim_v"], job["batch"]
+    seqlen_kv = job["m"]
+    seqlen_q = job["seqlen_q"] if cross else seqlen_kv
+    kwargs = {}
     if varlen:
-        kwargs.update(cu_seqlens_q=t(batch + 1, i32), cu_seqlens_kv=t(batch + 1, i32))
-    if cross_seqlen:
-        kwargs["seq_len_kv"] = seq
-    exe.compile(
-        t(seq * num_heads * head_dim, f8),
-        t(seq * num_kv_heads * head_dim, f8),
-        t(seq * num_kv_heads * head_dim_v, f8),
-        t(seq * num_heads * head_dim_v, bf16),
-        batch,
-        seq,
+        q = empty(batch * seqlen_q, h, d)
+        k = empty(batch * seqlen_kv, hkv, d)
+        v = empty(batch * seqlen_kv, hkv, dv)
+        kwargs = {
+            "cu_seqlens_q": empty(batch + 1, dtype=torch.int32),
+            "cu_seqlens_kv": empty(batch + 1, dtype=torch.int32),
+            "max_seqlen_q": seqlen_q,
+            "max_seqlen_kv": seqlen_kv,
+            "cross_seqlen": cross,
+        }
+    else:
+        q = empty(batch, seqlen_q, h, d)
+        k = empty(batch, seqlen_kv, hkv, d)
+        v = empty(batch, seqlen_kv, hkv, dv)
+    for name in _PINS:
+        if job.get(name) is not None:
+            kwargs[name] = job[name]
+    descale = [empty(1, dtype=torch.float32) for _ in range(3)]
+    flydsl_flash_attn_fp8_func(
+        q,
+        k,
+        v,
+        causal=job["causal"],
+        q_descale=descale[0],
+        k_descale=descale[1],
+        v_descale=descale[2],
+        return_lse=job["return_lse"],
         **kwargs,
     )
 
 
-def compile_one_config(**job) -> dict:
-    result = {**job, "compile_time": None}
-    params = {k: v for k, v in job.items() if k != "kernel_name"}
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    started = time.time()
-    try:
-        # COMPILE_ONLY is mandatory: without it flyc.compile also launches.
-        with (
-            override_env("FLYDSL_GPU_ARCH", AOT_ARCH),
-            compile_only_env(),
-            FakeTensorMode(),
-        ):
-            _compile_to_cache(**params)
-        result["compile_time"] = time.time() - started
-    except Exception as error:  # noqa: BLE001
-        print(f"  [FAIL] {job['kernel_name']}: {error}")
-    return result
+def describe(job: dict) -> str:
+    seqlens = (
+        f"sq={job['seqlen_q']} skv={job['m']}"
+        if job["seqlen_q"] is not None
+        else f"s={job['m']}"
+    )
+    pinned = [f"{name}={job[name]}" for name in _PINS if job.get(name) is not None]
+    return " ".join(
+        [
+            f"{job['kernel_name']} causal={job['causal']} lse={job['return_lse']}",
+            f"b={job['batch']} {seqlens}",
+            *pinned,
+        ]
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+def collect_jobs(_csv_paths: list[str], args: argparse.Namespace | None) -> list:
+    if args is None or not args.shape:
+        return shape_jobs()
+    jobs = []
+    for spec in args.shape:
+        h, hkv, d, dv, layout = parse_shape(spec)
+        reason = unsupported_reason(h, hkv, d, dv)
+        if reason:
+            print(f"Error: {spec} is unsupported by the FP8 FMHA kernel: {reason}")
+            sys.exit(1)
+        jobs.extend(jobs_for_shape(h, hkv, d, dv, layout))
+    return dedupe_jobs(jobs)
+
+
+def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--shape",
         action="append",
         default=[],
         help="H:Hkv:D:Dv[@layout], repeatable; replaces DEFAULT_SHAPES",
     )
-    parser.add_argument("--list", action="store_true", help="print the jobs and exit")
-    args = parser.parse_args()
-    if args.shape:
-        jobs = []
-        for spec in args.shape:
-            h, hkv, d, dv, layout = parse_shape(spec)
-            reason = unsupported_reason(h, hkv, d, dv)
-            if reason:
-                print(f"Error: {spec} is unsupported by the FP8 FMHA kernel: {reason}")
-                sys.exit(1)
-            jobs.extend(jobs_for_shape(h, hkv, d, dv, layout))
-        jobs = dedupe_jobs(jobs)
-    else:
-        jobs = default_jobs()
-    if args.list:
-        for job in jobs:
-            print(job["kernel_name"])
-        print(f"{len(jobs)} jobs")
-        return
-    if not jobs:
-        print("no head shapes configured; nothing to compile")
-        return
-    results = run_jobs_parallel(compile_one_config, jobs)
-    failed = sum(result["compile_time"] is None for result in results)
-    print(f"Compiled: {len(results) - failed} ok, {failed} failed")
-    raise SystemExit(1 if failed else 0)
+
+
+def main() -> None:
+    _replay.main(
+        "aiter.aot.flydsl.fmha_fp8",
+        "AOT pre-compile the gfx950 FlyDSL FP8 flash-attention forward",
+    )
 
 
 if __name__ == "__main__":
