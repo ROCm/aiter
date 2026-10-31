@@ -2080,13 +2080,20 @@ def _unified_attention_gluon_kernel_2d(
     else:
         KVLoader: gl.constexpr = TDMGatherKVLoader
 
+    # The loaders clamp the page ids they read to this bound. A tile of
+    # several pages overhangs the sequence's last page, and the entries past
+    # it in the row are not this sequence's: a zero-padded table names
+    # physical block 0 there, whatever it holds. Bound the ids by the
+    # sequence's own pages; the overhang then re-reads its last page, which
+    # the mask drops like any key past seq_len.
+    seq_pages = gl.minimum((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, block_table_stride)
     kv_loader = KVLoader.initialize(
         cfg,
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
         kv_head_idx,
-        block_table_stride,
+        gl.maximum(seq_pages, 1),
         REMOVE_INDIRECT_ACCESS,
     )
 
