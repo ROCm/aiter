@@ -7,18 +7,24 @@ from __future__ import annotations
 
 import collections
 import functools
+import os
+from collections.abc import Iterable
 
 import flydsl.expr as fx
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from .kernels.gdn_decode_verify import create_gdn_decode_verify_kernel
 from .kernels.gdr_decode import (
+    _KDA_DIM,
+    _KDA_HEADS,
     MTP_MODE_CHAIN,
     MTP_MODE_SNAPSHOT,
+    create_kda_decode_kernel,
     create_vk_gdr_decode_kernel,
     create_vk_gdr_mtp_kernel,
 )
@@ -29,6 +35,9 @@ __all__ = [
     "flydsl_gdr_decode",
     "flydsl_gdr_mtp",
     "flydsl_gdr_mtp_sglang",
+    "flydsl_kda_decode",
+    "flydsl_kda_decode_with_f_b",
+    "is_flydsl_kda_decode_supported",
 ]
 
 
@@ -1070,6 +1079,584 @@ def flydsl_gdr_mtp_sglang(
         disable_state_update=disable_state_update,
         stream=stream,
     )
+
+
+# Fused KDA decode: the gated delta rule with a per-channel decay, fixed to
+# the gfx950 Kimi-K3 TP8 layout (_KDA_HEADS=12 local heads, _KDA_DIM=128 state,
+# both imported from the kernel so the two cannot disagree).
+_KDA_CONV_CHANNELS = 3 * _KDA_HEADS * _KDA_DIM
+_KDA_CONV_WIDTH = 4
+# Recurrent-state storage the KDA kernels accept, mapped to the tag that keys
+# kernels/gdr_decode.py's _KDA_STATE_DTYPES; the recurrence computes in FP32.
+_KDA_STATE_DTYPE_TAGS = {torch.float32: "f32", torch.bfloat16: "bf16"}
+_INT32_MAX = 2**31 - 1
+# Debug check that live KDA ``state_indices`` are unique. It copies the
+# duplicates to the host, a sync, so it is off by default and skipped while a
+# CUDA graph is being captured.
+_KDA_SLOT_CHECK = os.environ.get("AITER_KDA_DECODE_SLOT_CHECK", "0") == "1"
+
+
+def is_flydsl_kda_decode_supported(
+    device: torch.device | str | int | None = None,
+) -> bool:
+    """Return whether ``device`` can run this gfx950-only specialization."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        resolved = torch.device(
+            "cuda",
+            torch.cuda.current_device(),
+        )
+        if device is not None:
+            resolved = (
+                torch.device("cuda", device)
+                if isinstance(device, int)
+                else torch.device(device)
+            )
+            if resolved.type != "cuda":
+                return False
+            if resolved.index is None:
+                resolved = torch.device(
+                    "cuda",
+                    torch.cuda.current_device(),
+                )
+        if not 0 <= resolved.index < torch.cuda.device_count():
+            return False
+        return get_gfx_runtime() == "gfx950"
+    except (AssertionError, KeyError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _check_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    inner_strides: tuple[int, ...] = (),
+) -> None:
+    if tensor.shape != shape:
+        raise ValueError(
+            f"`{name}` must have shape {list(shape)}, got {list(tensor.shape)}."
+        )
+    if tensor.dtype != dtype:
+        raise ValueError(f"`{name}` must have dtype {dtype}, got {tensor.dtype}.")
+    if tensor.device != device:
+        raise ValueError(f"`{name}` must be on {device}, got {tensor.device}.")
+    if inner_strides and tensor.stride()[-len(inner_strides) :] != inner_strides:
+        raise ValueError(
+            f"`{name}` must have inner strides {inner_strides}, got {tensor.stride()}."
+        )
+
+
+def _check_same_device(
+    tensors: Iterable[tuple[str, torch.Tensor]],
+    device: torch.device,
+) -> None:
+    for name, tensor in tensors:
+        if not tensor.is_cuda:
+            raise ValueError(f"`{name}` must be a CUDA tensor.")
+        if tensor.device != device:
+            raise ValueError(f"`{name}` must be on {device}, got {tensor.device}.")
+
+
+def _num_cache_slots(state: torch.Tensor, conv_state: torch.Tensor) -> int:
+    """Return the slot count shared by both caches, clamped to the int32 index range."""
+    return min(state.shape[0], conv_state.shape[0], _INT32_MAX)
+
+
+def _check_unique_live_slots(state_indices: torch.Tensor, num_slots: int) -> None:
+    """Reject a live slot that appears more than once in ``state_indices``."""
+    live = state_indices[(state_indices >= 0) & (state_indices < num_slots)]
+    slots, counts = torch.unique(live, return_counts=True)
+    duplicates = slots[counts > 1].tolist()
+    if duplicates:
+        raise ValueError(
+            "`state_indices` must not repeat a live (non-negative, in-range) slot; "
+            f"duplicated slots: {duplicates[:8]}."
+        )
+
+
+def _check_dense_cache_slots(
+    name: str,
+    tensor: torch.Tensor,
+    layouts: tuple[tuple[int, ...], ...],
+) -> None:
+    """Require disjoint, dense cache slots while allowing padding between slots.
+
+    ``layouts`` lists the accepted inner strides; the kernel takes every stride
+    as an argument, so any dense ordering of a slot's elements works.
+    """
+    if (
+        tensor.stride()[1:] not in layouts
+        or tensor.stride(0) < tensor.shape[1:].numel()
+    ):
+        raise ValueError(f"`{name}` must have dense, non-overlapping cache slots.")
+
+
+def _check_i32_addressing(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    first_dim: int = 0,
+) -> None:
+    """Bound strides and the full byte span relative to the buffer base.
+
+    Cache buffers are rebased per slot in i64, so only their inner dimensions
+    contribute. The leading sequence dimension of raw gates and output is
+    unused by the kernel and is also excluded.
+    """
+    strides = tensor.stride()[first_dim:]
+    if any(stride < 0 or stride > _INT32_MAX for stride in strides):
+        raise ValueError(f"`{name}` strides must fit non-negative int32 addressing.")
+    # Include the last element's full width, including vector load/store tails.
+    span_bytes = (
+        1
+        + sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape[first_dim:], strides)
+        )
+    ) * tensor.element_size()
+    if span_bytes > _INT32_MAX:
+        raise ValueError(f"`{name}` byte span must fit int32 buffer addressing.")
+
+
+def _validate_kda_inputs(
+    *,
+    api_name: str,
+    batch_source: str,
+    device: torch.device,
+    batch: int,
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Validate operands shared by both explicit KDA specializations."""
+    if not is_flydsl_kda_decode_supported(device):
+        raise RuntimeError(f"`{api_name}` requires a gfx950 GPU.")
+    if batch <= 0:
+        raise ValueError(f"`{batch_source}` must have a non-empty batch dimension.")
+    if batch * _KDA_HEADS > _INT32_MAX:
+        raise ValueError("The KDA launch grid must fit int32 addressing.")
+    if conv_bias is not None:
+        raise ValueError("This specialization requires `conv_bias=None`.")
+    if lower_bound is None:
+        raise ValueError("This specialization requires the KDA lower-bound gate.")
+
+    _check_same_device(
+        (
+            ("x", x),
+            ("conv_weight", conv_weight),
+            ("conv_state", conv_state),
+            ("raw_beta", raw_beta),
+            ("A_log", A_log),
+            ("dt_bias", dt_bias),
+            ("state", state),
+            ("state_indices", state_indices),
+            ("output_gate", output_gate),
+            ("norm_weight", norm_weight),
+        ),
+        device,
+    )
+    _check_tensor(
+        "x",
+        x,
+        shape=(batch, _KDA_CONV_CHANNELS),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "conv_weight",
+        conv_weight,
+        shape=(_KDA_CONV_CHANNELS, _KDA_CONV_WIDTH),
+        dtype=torch.float32,
+        device=device,
+    )
+    if conv_state.ndim != 3 or conv_state.shape[1:] != (
+        _KDA_CONV_CHANNELS,
+        _KDA_CONV_WIDTH - 1,
+    ):
+        raise ValueError(
+            "`conv_state` must have shape [cache, 4608, 3], "
+            f"got {list(conv_state.shape)}."
+        )
+    if conv_state.dtype != torch.bfloat16:
+        raise ValueError("`conv_state` must have dtype torch.bfloat16.")
+    # Channel-major [cache, 4608, 3], or the [cache, 3, 4608] width-major cache
+    # (SGLang's layout) viewed through transpose(-1, -2).
+    _check_dense_cache_slots(
+        "conv_state", conv_state, ((_KDA_CONV_WIDTH - 1, 1), (1, _KDA_CONV_CHANNELS))
+    )
+    if state.ndim != 4 or state.shape[1:] != (
+        _KDA_HEADS,
+        _KDA_DIM,
+        _KDA_DIM,
+    ):
+        raise ValueError(
+            f"`state` must have shape [cache, 12, 128, 128], got {list(state.shape)}."
+        )
+    if state.dtype not in _KDA_STATE_DTYPE_TAGS:
+        raise ValueError(
+            "`state` must have dtype torch.float32 or torch.bfloat16, "
+            f"got {state.dtype}."
+        )
+    _check_dense_cache_slots("state", state, ((_KDA_DIM * _KDA_DIM, _KDA_DIM, 1),))
+    _check_tensor(
+        "raw_beta",
+        raw_beta,
+        shape=(1, batch, _KDA_HEADS),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "A_log",
+        A_log,
+        shape=(_KDA_HEADS,),
+        dtype=torch.float32,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "dt_bias",
+        dt_bias,
+        shape=(_KDA_HEADS * _KDA_DIM,),
+        dtype=torch.float32,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "state_indices",
+        state_indices,
+        shape=(batch,),
+        dtype=torch.int32,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "output_gate",
+        output_gate,
+        shape=(batch, _KDA_HEADS, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "norm_weight",
+        norm_weight,
+        shape=(_KDA_DIM,),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+
+    for name, tensor, first_dim in (
+        ("x", x, 0),
+        ("conv_weight", conv_weight, 0),
+        ("conv_state", conv_state, 1),
+        ("raw_beta", raw_beta, 1),
+        ("A_log", A_log, 0),
+        ("dt_bias", dt_bias, 0),
+        ("state", state, 1),
+        ("state_indices", state_indices, 0),
+        ("output_gate", output_gate, 0),
+        ("norm_weight", norm_weight, 0),
+    ):
+        _check_i32_addressing(name, tensor, first_dim=first_dim)
+
+    if out is None:
+        out = torch.empty(
+            (1, batch, _KDA_HEADS, _KDA_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    _check_same_device((("out", out),), device)
+    _check_tensor(
+        "out",
+        out,
+        shape=(1, batch, _KDA_HEADS, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_i32_addressing("out", out, first_dim=1)
+    # The final head need not include trailing padding in the batch stride.
+    head_span = (_KDA_HEADS - 1) * out.stride(2) + _KDA_DIM
+    if out.stride(2) < _KDA_DIM or (batch > 1 and out.stride(1) < head_span):
+        raise ValueError("`out` must have non-overlapping batch and head rows.")
+    if _KDA_SLOT_CHECK and not torch.cuda.is_current_stream_capturing():
+        _check_unique_live_slots(state_indices, _num_cache_slots(state, conv_state))
+    return out
+
+
+def flydsl_kda_decode(
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fuse width-4 Q/K/V convolution, FP32 KDA updates, and BF16 output gating.
+
+    Requires gfx950, 12 heads, and 128-dim state (Kimi-K3 TP8). Check
+    :func:`is_flydsl_kda_decode_supported` before dispatch.
+    ``state`` may be stored as FP32 or BF16. The recurrence always computes
+    in FP32: a BF16 state is widened on load and rounded to nearest-even BF16
+    on store, so it does not reproduce an FP32 state bit-for-bit.
+    Strides and byte spans must fit non-negative int32 buffer addressing,
+    except cache slot strides, which are rebased in int64.
+    Both caches require dense inner dimensions and non-overlapping slots;
+    padding between slots is supported. Output batch and head rows must not
+    overlap, but may also be padded.
+    Uses RMSNorm/sigmoid gating. Negative ``state_indices`` (PAD_SLOT_ID) are
+    padding: they produce zero output and leave both caches unchanged. Slot
+    zero is a live slot, as in the Triton ``fused_kda_decode``. Indices at or
+    above ``min(state.shape[0], conv_state.shape[0])`` are treated as padding
+    too, so out-of-range slots are never accessed.
+
+    Every non-negative in-range entry in ``state_indices`` must be unique within
+    the batch. Duplicate live slots cause unsynchronized concurrent updates of
+    the same recurrent and convolution cache rows and have undefined behavior.
+    Padding entries may repeat. The kernel does not check this; the caller
+    guarantees it. SGLang's KDA backend passes ``mamba_cache_indices``, where
+    each live request owns a distinct slot from its mamba slot allocator and
+    CUDA-graph padding rows are PAD_SLOT_ID (-1). Its eager DP-attention padding
+    rows instead share the reserved scratch slot 0, which is only safe because no
+    request owns that slot. Set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
+    ``ValueError`` on any duplicate live slot; the check syncs with the host and
+    is skipped during graph capture.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")
+    if not x.is_cuda:
+        raise ValueError("`x` must be a CUDA tensor.")
+    device = x.device
+    batch = x.shape[0]
+    out = _validate_kda_inputs(
+        api_name="flydsl_kda_decode",
+        batch_source="x",
+        device=device,
+        batch=batch,
+        x=x,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        conv_state=conv_state,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        state=state,
+        state_indices=state_indices,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        out=out,
+    )
+    _check_same_device((("raw_g", raw_g),), device)
+    _check_tensor(
+        "raw_g",
+        raw_g,
+        shape=(1, batch, _KDA_HEADS, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(_KDA_DIM, 1),
+    )
+    _check_i32_addressing("raw_g", raw_g, first_dim=1)
+
+    executable = create_kda_decode_kernel(
+        float(norm_eps),
+        float(lower_bound),
+        fuse_f_b=False,
+        state_dtype=_KDA_STATE_DTYPE_TAGS[state.dtype],
+    )
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device)
+        _run_compiled(
+            executable,
+            x,
+            conv_weight,
+            conv_state,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            output_gate,
+            norm_weight,
+            out,
+            batch,
+            _num_cache_slots(state, conv_state),
+            x.stride(0),
+            conv_weight.stride(0),
+            conv_weight.stride(1),
+            conv_state.stride(0),
+            conv_state.stride(1),
+            conv_state.stride(2),
+            raw_g.stride(1),
+            raw_beta.stride(1),
+            state.stride(0),
+            output_gate.stride(0),
+            output_gate.stride(1),
+            out.stride(1),
+            out.stride(2),
+            stream,
+        )
+    return out
+
+
+def flydsl_kda_decode_with_f_b(
+    f_a: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run :func:`flydsl_kda_decode` with a fused head-local ``f_b`` projection.
+
+    Projects ``f_a`` with ``f_b_weight`` in FP32, then rounds once to BF16
+    before the lower-bound decay gate, without storing raw-g in global memory.
+    Uses the same int32 stride/span limits and FP32-or-BF16 ``state`` storage
+    as :func:`flydsl_kda_decode`.
+    ``state_indices`` follows the same bounded, unique-live-slot contract and
+    opt-in ``AITER_KDA_DECODE_SLOT_CHECK`` as :func:`flydsl_kda_decode`.
+
+    Fusing saves the projection launch, which wins at decode batch sizes, but each
+    head re-reads the whole ``f_a`` row. On MI355X (CUDA-graph replay) it beats a
+    BF16 ``F.linear`` followed by :func:`flydsl_kda_decode` by 3-4 us up to batch 32,
+    is within 6% at 64-96, and is 2-8% slower at 128 (more with a BF16 state).
+    Callers serving larger batches should project separately.
+    """
+    if f_a.ndim != 2:
+        raise ValueError(f"`f_a` must have rank 2, got rank {f_a.ndim}.")
+    if not f_a.is_cuda:
+        raise ValueError("`f_a` must be a CUDA tensor.")
+    device = f_a.device
+    batch = f_a.shape[0]
+    _check_same_device((("f_b_weight", f_b_weight),), device)
+    _check_tensor(
+        "f_a",
+        f_a,
+        shape=(batch, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "f_b_weight",
+        f_b_weight,
+        shape=(_KDA_HEADS, _KDA_DIM, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(_KDA_DIM, 1),
+    )
+    _check_i32_addressing("f_a", f_a)
+    _check_i32_addressing("f_b_weight", f_b_weight)
+    out = _validate_kda_inputs(
+        api_name="flydsl_kda_decode_with_f_b",
+        batch_source="f_a",
+        device=device,
+        batch=batch,
+        x=x,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        conv_state=conv_state,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        state=state,
+        state_indices=state_indices,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        out=out,
+    )
+
+    executable = create_kda_decode_kernel(
+        float(norm_eps),
+        float(lower_bound),
+        fuse_f_b=True,
+        state_dtype=_KDA_STATE_DTYPE_TAGS[state.dtype],
+    )
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device)
+        _run_compiled(
+            executable,
+            f_a,
+            f_b_weight,
+            x,
+            conv_weight,
+            conv_state,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            output_gate,
+            norm_weight,
+            out,
+            batch,
+            _num_cache_slots(state, conv_state),
+            f_a.stride(0),
+            f_b_weight.stride(0),
+            f_b_weight.stride(1),
+            x.stride(0),
+            conv_weight.stride(0),
+            conv_weight.stride(1),
+            conv_state.stride(0),
+            conv_state.stride(1),
+            conv_state.stride(2),
+            raw_beta.stride(1),
+            state.stride(0),
+            output_gate.stride(0),
+            output_gate.stride(1),
+            out.stride(1),
+            out.stride(2),
+            stream,
+        )
+    return out
+
+
+# Lets callers such as SGLang's dispatch probe which recurrent-state dtypes a
+# given build accepts before routing a cache to it.
+flydsl_kda_decode.state_dtypes = tuple(_KDA_STATE_DTYPE_TAGS)
+flydsl_kda_decode_with_f_b.state_dtypes = tuple(_KDA_STATE_DTYPE_TAGS)
+# As with flydsl_gdr_decode, padding and out-of-range rows get positive-zero
+# output, so callers may allocate ``out`` with ``torch.empty``.
+flydsl_kda_decode.zeroes_invalid_output = True
+flydsl_kda_decode_with_f_b.zeroes_invalid_output = True
 
 
 # Swept on MI355X (Qwen3.8 TP1, batch 1-128, 1-5 tokens per sequence, KSPLIT
