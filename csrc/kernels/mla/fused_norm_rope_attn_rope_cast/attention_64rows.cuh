@@ -108,7 +108,8 @@ template <int CacheMode,
           int Heads           = 0,
           int HeadTile        = 64,
           bool BoundedPrefill = false,
-          bool PackedPrefill  = false>
+          bool PackedPrefill  = false,
+          bool WideKvOffsets  = false>
 struct FusedNormRopeAttnRopeCastConfig : FusedNormRopeAttnRopeCastTraits<>
 {
     static_assert(CacheMode >= 0 && CacheMode <= 1);
@@ -120,6 +121,8 @@ struct FusedNormRopeAttnRopeCastConfig : FusedNormRopeAttnRopeCastTraits<>
     static constexpr int HEAD_TILE        = HeadTile;
     static constexpr bool BOUNDED_PREFILL = BoundedPrefill;
     static constexpr bool PACKED_PREFILL  = PackedPrefill;
+    // Address width is independent of the softmax and output-layout optimizations.
+    static constexpr bool NARROW_KV_OFFSETS = BoundedPrefill && !WideKvOffsets;
     static_assert(HeadTile == 32 || HeadTile == 64);
     static constexpr int smem_p_bytes = HeadTile * KV_TILE_SIZE * sizeof(D_PV);
     static constexpr int smem_bytes()
@@ -1882,7 +1885,7 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
                 if constexpr(CHECKED)
                     live = id >= 0 && id < (Extend ? kargs.extend_rows : kargs.prefix_rows);
             }
-            if constexpr(T::BOUNDED_PREFILL && T::CACHE_MODE == 0)
+            if constexpr(T::NARROW_KV_OFFSETS && T::CACHE_MODE == 0)
             {
                 data_off =
                     uint32_t(id) * uint32_t(merge_sources ? current_stride
@@ -2544,7 +2547,8 @@ template <int Heads,
           bool DirectQ        = false,
           int HeadTile        = 64,
           bool BoundedPrefill = false,
-          bool PackedPrefill  = false>
+          bool PackedPrefill  = false,
+          bool WideKvOffsets  = false>
 __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fwd_kernel(
     FusedNormRopeAttnRopeCastParams args)
 {
@@ -2562,7 +2566,8 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fwd_ker
                                                    Heads,
                                                    HeadTile,
                                                    BoundedPrefill,
-                                                   PackedPrefill>;
+                                                   PackedPrefill,
+                                                   WideKvOffsets>;
     __shared__ __align__(16) char smem[Config::smem_bytes() + 2 * 68 * sizeof(int)];
     if(indices_valid<Config>(args))
         fused_norm_rope_attn_rope_cast_fwd_impl<Config, false, Continuous>(args, smem);
@@ -2721,7 +2726,15 @@ hipError_t run_fused_norm_rope_attn_rope_cast_heads(const FusedNormRopeAttnRopeC
                             <<<head_grid, 256, 0, stream>>>(args);
                 }
                 else if(raw_q)
-                    fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, true, true, true, 32>
+                    fused_norm_rope_attn_rope_cast_fwd_kernel<Heads,
+                                                              0,
+                                                              true,
+                                                              true,
+                                                              true,
+                                                              32,
+                                                              true,
+                                                              false,
+                                                              true>
                         <<<head_grid, 256, 0, stream>>>(args);
                 else
                     fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, false, true, false, 32>
@@ -2733,6 +2746,21 @@ hipError_t run_fused_norm_rope_attn_rope_cast_heads(const FusedNormRopeAttnRopeC
                 if(prefill::supports_packed_prefill(args, raw_q))
                     return launch_bounded_prefill<Heads, true>(args, raw_q, stream);
                 return launch_bounded_prefill<Heads, false>(args, raw_q, stream);
+            }
+            if(raw_q && policy::prefer_bounded_prefill(args.N, Heads) &&
+               !prefill::kv_offsets_fit_u32(args))
+            {
+                fused_norm_rope_attn_rope_cast_fwd_kernel<Heads,
+                                                          0,
+                                                          true,
+                                                          true,
+                                                          true,
+                                                          64,
+                                                          true,
+                                                          false,
+                                                          true>
+                    <<<grid, 256, 0, stream>>>(args);
+                return hipGetLastError();
             }
             if(raw_q)
                 fused_norm_rope_attn_rope_cast_fwd_kernel<Heads, 0, true, true, Heads == 64>
