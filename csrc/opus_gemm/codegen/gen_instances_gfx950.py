@@ -3265,12 +3265,9 @@ def _gen_small_mxscale_bpreshuffle_instance(
         args, reinterpret_cast<opus::bf16_t*>(Y.data_ptr()), counters);"""
     elif host_kind == "reduce":
         reducer = entry["reduce_kernel"]
-        reduce_abi = "const float* __restrict__, opus::bf16_t* __restrict__, int"
-        reduce_parameters = "int SplitK, int Vec, int Block"
-        reduce_templates = f"{alias}::SPLIT_K, {alias}::REDUCE_VEC, {alias}::REDUCE_BLOCK"
         reduce_arguments = (
-            "reinterpret_cast<const float*>(args.ptr_c), "
-            "reinterpret_cast<opus::bf16_t*>(Y.data_ptr()), int(m * n)"
+            "args.ptr_c, reinterpret_cast<__bf16*>(Y.data_ptr()), "
+            "Traits::SPLIT_K, 1, elements, 1, 1, elements, nullptr, 0"
         )
         lds = "Traits::lds_bytes(k)" if entry.get("dynamic_lds") else "0"
         body = f"""    static_assert(Traits::SPLIT_K > 1);
@@ -3282,11 +3279,12 @@ def _gen_small_mxscale_bpreshuffle_instance(
         workspace, Y, AITER_DTYPE_fp32, workspace_numel, 16, "{k.name}");
     {kernel}<{alias}><<<dim3(n / Traits::B_N, (m + Traits::B_M - 1) / Traits::B_M, Traits::SPLIT_K),
         dim3(Traits::BLOCK_SIZE), {lds}, stream>>>(args);
-    if constexpr(Traits::SPLIT_K > 1) {{
-        {reducer}<{reduce_templates}><<<dim3((uint64_t(m) * n + Traits::REDUCE_VEC * Traits::REDUCE_BLOCK - 1) /
-            (Traits::REDUCE_VEC * Traits::REDUCE_BLOCK)), dim3(Traits::REDUCE_BLOCK), 0,
-            stream>>>({reduce_arguments});
-    }}"""
+    // A single logical row preserves the contiguous [SplitK, M*N] layout
+    // while reusing the A16W16 reducer without an M-sized grid.y.
+    const int elements = int(m * n);
+    {reducer}<16, 64, __bf16, false, __bf16, false><<<
+        dim3((uint64_t(elements) + 1023) / 1024), dim3(64), 0,
+        stream>>>({reduce_arguments});"""
     else:
         grid_kind = "xcd" if host_kind is None else entry.get("grid_kind", "nm")
         n_tiles = "n / Traits::B_N"
@@ -3304,11 +3302,6 @@ def _gen_small_mxscale_bpreshuffle_instance(
 
     declarations = _bpreshuffle_declaration(kernel, "class Traits", abi)
     device_decl = f"template __global__ void {kernel}<{alias}>({abi});\n"
-    if host_kind == "reduce":
-        declarations += "\n" + _bpreshuffle_declaration(
-            reducer, reduce_parameters, reduce_abi
-        )
-        device_decl += f"template __global__ void {reducer}<{reduce_templates}>({reduce_abi});\n"
     traits_headers = "\n".join(
         f'#include "{name}"'
         for name in entry.get(
@@ -3356,6 +3349,7 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
                 "kid_name": k.name,
                 "dtype": "bf16_t",
                 "device_decl": device_decl,
+                **({"splitk_reduce_arch": "gfx950"} if host_kind == "reduce" else {}),
             }
         )
 

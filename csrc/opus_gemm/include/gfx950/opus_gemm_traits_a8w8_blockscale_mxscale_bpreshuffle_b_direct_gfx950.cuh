@@ -67,14 +67,12 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_b_direct_traits {
     static constexpr int E_M = MR;
     static constexpr int E_N = NR;
 
-    // K partition and reducer geometry.
+    // K partition.
     static constexpr int TOTAL_K = FixedK;
     static constexpr int SPLIT_K = SplitK;
     static constexpr int K = FixedK / SplitK;
     static constexpr int PANELS = K / B_K;
     static constexpr int SCALE_COLS = K / 128;
-    static constexpr int REDUCE_VEC = 8;
-    static constexpr int REDUCE_BLOCK = 128;
 
     // A stages and the direct-B register ring.
     static constexpr int STAGES = NB;

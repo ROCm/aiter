@@ -1175,7 +1175,11 @@ void
         is the preferred fast path when its constraints hold.
         """
         # Bucket present archs from splitk kids.
-        present_archs = set()
+        present_archs = {
+            row["splitk_reduce_arch"]
+            for row in self._device_instantiations
+            if row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
+        }
         for row in self._device_instantiations:
             name = row["kid_name"]
             for arch_prefix in SPLITK_REDUCE_ARCHES:
@@ -1279,7 +1283,9 @@ void
         # Only emit the standalone reduce TU if the build actually has a splitk kid (otherwise the fused
         # host TU will never reference any...
         needs_reduce_tu = any(
-            ("flatmm_splitk" in row["kid_name"]) or ("_splitk_" in row["kid_name"])
+            row.get("splitk_reduce_arch") in SPLITK_REDUCE_ARCHES
+            or ("flatmm_splitk" in row["kid_name"])
+            or ("_splitk_" in row["kid_name"])
             for row in self._device_instantiations
         )
         if needs_reduce_tu:

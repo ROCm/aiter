@@ -3392,7 +3392,7 @@ for _kid, _args, _name, _m_align, _wrapper, _grid in _BPRESHUFFLE_B_DIRECT_CONFI
         _entry["grid_kind"] = _grid
     if _sk > 1:
         _entry["headers"] = ("gfx950/splitk_reduce_gfx950.cuh", *_entry["headers"])
-        _entry["reduce_kernel"] = "splitk_reduce_contiguous_kernel_gfx950"
+        _entry["reduce_kernel"] = "splitk_reduce_kernel"
     _bpreshuffle_register_ring(
         _kid, (_bm, _bn, _bk, 1, _wn), _traits, _entry,
         fixed_k=_k, max_k=_k, split_k=_sk, wg=_wg, ca=_ca, cb=_bc,
@@ -3955,7 +3955,7 @@ for _args in _bpreshuffle_small_b_direct_configs():
     _entry["grid_kind"] = "nm" if _args[16] else "xcd"
     if _sk > 1:
         _entry.update(host_kind="reduce", headers=("gfx950/splitk_reduce_gfx950.cuh", *_entry["headers"]),
-                      reduce_kernel="splitk_reduce_contiguous_kernel_gfx950",
+                      reduce_kernel="splitk_reduce_kernel",
                       workspace_rule=["mn", 4 * _sk, 0])
     _register_generated_small(("b_direct", _args, ""), _bpreshuffle_traits(_BP_ROOT + "b_direct_traits", *_args),
                               (_bm, _bn, _bk, 1, _wn), _entry, fixed_k=_k, split_k=_sk, wg=_wg, ca=_ca, cb=_cb)
