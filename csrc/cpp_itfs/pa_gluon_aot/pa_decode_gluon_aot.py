@@ -137,6 +137,7 @@ def compile(
                 query_seq_len,
                 one_query_group_size,
                 head_size_pow2,
+                head_size != head_size_pow2,
                 kv_block_size,
                 context_partition_size,
                 query_quant_mode,
@@ -261,6 +262,8 @@ def compile(
             f"{value_transposed}",
             f"{is_causal}",
             f"{cdna_version}",
+            f"{int(head_size != head_size_pow2)}",  # KEY_HEAD_PADDED
+            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
             "0",
         ]
         signature = ",".join(signature_parts)
@@ -314,6 +317,7 @@ def compile(
             f"{head_size_pow2}",
             f"{context_partition_size}",
             f"{use_sinks}",
+            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
         ]
         reduce_signature = ",".join(reduce_signature_parts)
         reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
@@ -539,6 +543,10 @@ def pa_decode_gluon_aot(
 
     Notes
     -----
+    - Physical Q/K, V and output head dimensions must match.
+    - This AOT interface uses non-persistent full attention, with optional sinks.
+      Persistent PS/one-shot dispatch and sliding-window attention are unsupported.
+    - Use ``pa_decode_gluon`` JIT for supported native Q/K192-V128 configurations.
     - query_length * query_group_size must be <= 64
     - kv_block_size must be one of [16, 64, 1024]
     - query_length must be <= 4
@@ -604,6 +612,20 @@ def pa_decode_gluon_aot(
     assert (
         len(key_cache.shape) == 5
     ), f"Expected 5D key_cache tensor, but got shape {key_cache.shape}"
+
+    if value_cache.ndim not in (4, 5):
+        raise RuntimeError(f"Unsupported value cache shape: {value_cache.shape}")
+    value_transposed = value_cache.ndim == 5
+    key_head_size = key_cache.shape[2] * key_cache.shape[4]
+    value_head_size = value_cache.shape[3 if value_transposed else 2]
+    output_head_size = output.shape[-1]
+    if not head_size == key_head_size == value_head_size == output_head_size:
+        raise ValueError(
+            "pa_decode_gluon_aot: physical Q/K, V and output head dimensions "
+            f"must match; got Q={head_size}, K={key_head_size}, "
+            f"V={value_head_size}, output={output_head_size}. "
+            "Use pa_decode_gluon JIT for supported asymmetric configurations."
+        )
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
     stride_query_scale_bs = 0
@@ -672,15 +694,6 @@ def pa_decode_gluon_aot(
         assert (
             key_scale.shape == value_scale.shape
         ), f"Key and value scales must have same shape, but got key: {key_scale.shape}, value: {value_scale.shape}"
-
-    # ==================== VALUE CACHE LAYOUT DETECTION ====================
-    value_transposed = False
-    if len(value_cache.shape) == 5:
-        value_transposed = True
-    elif len(value_cache.shape) == 4:
-        value_transposed = False
-    else:
-        raise RuntimeError(f"Unsupported value cache shape: {value_cache.shape}")
 
     # ==================== FP8 CONFIGURATION ====================
     fp8_max_value = 1.0
