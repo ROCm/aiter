@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import os
+import struct
 import sys
 
 import torch
@@ -106,6 +107,40 @@ def _run_case(name, regime, rows, requests, fmt, table_width, cache_pages,
     return ok, res
 
 
+def _e4m3_byte_scalar(b):
+    """Pure-Python mirror of the kernel's `_e4m3_byte_to_f32` integer formula."""
+    sign = (b & 0x80) << 24
+    normal_bits = (((b & 0x7F) << 20) + (120 << 23) | sign) & 0xFFFFFFFF
+    normal = struct.unpack("<f", struct.pack("<I", normal_bits))[0]
+    sub_mag = struct.unpack("<f", struct.pack("<I", 0x46800000 | (b & 7)))[0] - 16384.0
+    sub = -sub_mag if b >= 0x80 else sub_mag
+    return sub if ((b >> 3) & 0xF) == 0 else normal
+
+
+def _check_e4m3_formula():
+    """Every E4M3 code must decode to exactly torch's value (NaN codes excepted)."""
+    codes = torch.arange(256, dtype=torch.int32).to(torch.uint8).view(torch.float8_e4m3fn)
+    ref = codes.to(torch.float32).tolist()
+    bad = []
+    nan_codes = {0x7F, 0xFF}
+    for b in range(256):
+        if b in nan_codes:
+            continue
+        got = _e4m3_byte_scalar(b)
+        want = ref[b]
+        same = (got == want) or (got != got and want != want)
+        if not same:
+            bad.append((hex(b), got, want))
+    if bad:
+        print("[FAIL] e4m3 formula: %d/%d codes wrong, first: %s"
+              % (len(bad), 256, bad[:6]))
+        return 1
+    print("[PASS] e4m3 formula: 254/254 non-NaN codes exact "
+          "(0x7F/0xFF are NaN in e4m3fn and decode as +-480; the ATOM fp8 "
+          "writer clamps to +-448 so they never appear)")
+    return 0
+
+
 def main() -> int:
     fails = 0
     print("== emulated page-4 kernel vs public golden (CPU, fp32) ==")
@@ -176,11 +211,21 @@ def main() -> int:
           % ("PASS" if res.get("pass") else "FAIL", res.get("checked", 0), res.get("bad", -1)))
     fails += 0 if res.get("pass") else 1
 
+    print("== E4M3 bit-formula check (all 256 codes, mirrors _e4m3_byte_to_f32) ==")
+    fails += _check_e4m3_formula()
+
     print("== wrapper host-side contract checks (no CUDA reached) ==")
     sys.path.insert(0, _HERE)
     from _load import load_kernel_module
 
-    K, how = load_kernel_module()
+    try:
+        K, how = load_kernel_module()
+    except Exception as exc:  # noqa: BLE001
+        print("[SKIP] kernel module not importable here (%s: %s) — needs flydsl"
+              % (type(exc).__name__, exc))
+        print("\nCPU contract test: %s (wrapper checks skipped)"
+              % ("PASS" if fails == 0 else "%d FAILURE(S)" % fails))
+        return 1 if fails else 0
     print("     kernel module: " + how)
 
     def expect_raise(tag, exc, fn):

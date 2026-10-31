@@ -50,8 +50,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import range_constexpr
-from flydsl.expr.rocdl import cvt_pk_f32_fp8
-from flydsl.expr.typing import T
 
 Vec = fx.Vector
 
@@ -126,6 +124,39 @@ def _imax(a, b):
     return (a >= b).select(a, b)
 
 
+# Exact E4M3 (e4m3fn) -> f32 for one byte code, in integer arithmetic.
+#
+# gfx1250 has no legal scalar/packed fp8->f32 convert: FlyDSL's
+# ``cvt_pk_f32_fp8`` lowers to ``v_cvt_pk_f32_fp8_e32``, which the assembler
+# rejects with "operands are not valid for this GPU or mode" (see
+# records/g2/builder-log.md). The in-tree gfx1250 fp8 kernels convert inside
+# WMMA operands instead. v0 therefore converts in software, which is exact:
+#
+#   normal (e != 0):  value = (1 + m/8) * 2**(e-7)
+#                     f32 bits = (b & 0x7F) << 20 | 120 << 23 | sign
+#   e == 0:           value = (m/8) * 2**-6 = m * 2**-9
+#                     bits(0x46800000 | m) == 2**14 + m * 2**-9, so subtracting
+#                     2**14 gives m * 2**-9 exactly (m <= 7).
+#
+# NaN codes (0x7F / 0xFF) decode as +-480 instead of NaN; the ATOM fp8 writer
+# clamps to +-448 before the cast, so its cache never contains them.
+_F32_BIAS = fx.Int32(120 << 23)        # 0x3C000000
+_F32_SUB_BIAS = fx.Int32(0x46800000)   # 2**14, mantissa LSB = 2**-9
+_F32_SUB_SUB = fx.Float32(16384.0)     # 2**14
+_NEG_ONE = fx.Float32(-1.0)
+
+
+def _e4m3_byte_to_f32(b):
+    """One E4M3 byte code (Int32, 0..255) as an exact f32 value."""
+    b = fx.Int32(b)
+    sign = (b & fx.Int32(0x80)) << 24
+    normal = (((b & fx.Int32(0x7F)) << 20) + _F32_BIAS | sign).bitcast(fx.Float32)
+    sub_mag = (_F32_SUB_BIAS | (b & fx.Int32(7))).bitcast(fx.Float32) - _F32_SUB_SUB
+    sub = (b >= fx.Int32(0x80)).select(sub_mag * _NEG_ONE, sub_mag)
+    is_sub = ((b >> 3) & fx.Int32(0xF)) == 0
+    return is_sub.select(sub, normal)
+
+
 # ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
@@ -145,6 +176,44 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         f"qsa_paged_mqa_logits_page4_gfx1250_{dtype_tag}"
         f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_t{threads}_flydsl"
     )
+
+    # The kernel body must not branch on this flag: an `if` over a closure
+    # variable is lowered as a traced region, and a name bound inside it does not
+    # escape (FlyDSL raises NameError on the use). Specialize with Python closures
+    # picked here, at build time, instead.
+    def _key_vals_bf16(kraw):
+        vals = []
+        for j in range_constexpr(k_dwords):
+            dw = fx.Int32(kraw[j])
+            vals.append((dw << 16).bitcast(fx.Float32))
+            vals.append(((dw >> 16) << 16).bitcast(fx.Float32))
+        return vals
+
+    def _key_vals_fp8(kraw):
+        vals = []
+        for j in range_constexpr(k_dwords):
+            dw = fx.Int32(kraw[j])
+            for sh in range_constexpr(4):
+                # byte 0 = dim 4j+0 ... byte 3 = dim 4j+3 (little endian)
+                vals.append(_e4m3_byte_to_f32((dw >> (8 * sh)) & fx.Int32(0xFF)))
+        return vals
+
+    def _ks_bytes_fp8(num_pages):
+        return num_pages * PAGE_SIZE * 4
+
+    def _ks_bytes_bf16(num_pages):   # no scale plane: a 4-byte dummy descriptor
+        return 4
+
+    def _scale_fp8(ks_ptr, phys, off):
+        return _ld_f32(ks_ptr, (phys * PAGE_SIZE + off) * 4)
+
+    def _scale_bf16(ks_ptr, phys, off):   # no scale: the dequant multiplier is 1
+        return fx.Float32(1.0)
+
+    if is_fp8:
+        key_vals, ks_bytes, scale_of = _key_vals_fp8, _ks_bytes_fp8, _scale_fp8
+    else:
+        key_vals, ks_bytes, scale_of = _key_vals_bf16, _ks_bytes_bf16, _scale_bf16
 
     @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
     def kernel(
@@ -178,8 +247,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         logits_ptr = _byte_ptr(LOGITS, rows * columns * 4)
         vis_ptr = _byte_ptr(VIS, rows * 4)
         rst_ptr = _byte_ptr(RST, rows * 4)
-        if is_fp8:
-            ks_ptr = _byte_ptr(KS, num_pages * PAGE_SIZE * 4)
+        ks_ptr = _byte_ptr(KS, ks_bytes(num_pages))
 
         # --- row metadata: visible count (identical to the golden's visible_groups)
         req = _ld_i32(t2r_ptr, row * 4)
@@ -210,25 +278,11 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         # --- score: sum_h relu(q[t,h,:] . k[c]) / sqrt(128)
         q_base = row * per_page * 2
         k_base = phys * page_bytes + off * key_row_bytes
-        acc0 = fx.Float32(0.0)
-        acc1 = fx.Float32(0.0)
-        acc2 = fx.Float32(0.0)
-        acc3 = fx.Float32(0.0)
+        zero = fx.Float32(0.0)
+        acc = [zero, zero, zero, zero]
         for s in range_constexpr(steps):
             kraw = Vec(_gload(kv_ptr, k_base + s * k_bytes, k_dwords, fx.Int32))
-            kv = []
-            if is_fp8:
-                for j in range_constexpr(k_dwords):
-                    dw = fx.Int32(kraw[j])
-                    lo2 = Vec(cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=dw, word_sel=False))
-                    hi2 = Vec(cvt_pk_f32_fp8(res=T.vec(2, T.f32), src=dw, word_sel=True))
-                    kv.extend([fx.Float32(lo2[0]), fx.Float32(lo2[1]),
-                               fx.Float32(hi2[0]), fx.Float32(hi2[1])])
-            else:
-                for j in range_constexpr(k_dwords):
-                    dw = fx.Int32(kraw[j])
-                    kv.append((dw << 16).bitcast(fx.Float32))
-                    kv.append(((dw >> 16) << 16).bitcast(fx.Float32))
+            kv = key_vals(kraw)
             for h in range_constexpr(NUM_HEADS):
                 qraw = Vec(_gload(q_ptr, q_base + h * (HEAD_DIM * 2) + s * 16, 4, fx.Int32))
                 qs = []
@@ -237,27 +291,14 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
                     qs.append((dw << 16).bitcast(fx.Float32))
                     qs.append(((dw >> 16) << 16).bitcast(fx.Float32))
                 for d in range_constexpr(DIM_PER_STEP):
-                    if h == 0:
-                        acc0 = acc0 + qs[d] * kv[d]
-                    elif h == 1:
-                        acc1 = acc1 + qs[d] * kv[d]
-                    elif h == 2:
-                        acc2 = acc2 + qs[d] * kv[d]
-                    else:
-                        acc3 = acc3 + qs[d] * kv[d]
+                    acc[h] = acc[h] + qs[d] * kv[d]
 
-        zero = fx.Float32(0.0)
-        if is_fp8:
-            scale = _ld_f32(ks_ptr, (phys * PAGE_SIZE + off) * 4)
-            acc0 = acc0 * scale
-            acc1 = acc1 * scale
-            acc2 = acc2 * scale
-            acc3 = acc3 * scale
+        scale = scale_of(ks_ptr, phys, off)
         total = (
-            acc0.maximumf(zero)
-            + acc1.maximumf(zero)
-            + acc2.maximumf(zero)
-            + acc3.maximumf(zero)
+            (acc[0] * scale).maximumf(zero)
+            + (acc[1] * scale).maximumf(zero)
+            + (acc[2] * scale).maximumf(zero)
+            + (acc[3] * scale).maximumf(zero)
         )
         total = total * inv_divisor
 
@@ -314,6 +355,18 @@ def _run(exe, *args):
     cf = flyc.compile(exe, *args)
     exe._cf = cf
     return cf
+
+
+_DUMMY_SCALE: dict = {}
+
+
+def _dummy_scale(dev):
+    """4-byte stand-in for the scale plane on the bf16 path (never read)."""
+    t = _DUMMY_SCALE.get(dev)
+    if t is None:
+        t = torch.zeros(4, dtype=torch.float32, device=dev)
+        _DUMMY_SCALE[dev] = t
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +494,7 @@ def qsa_paged_mqa_logits_page4(
     launcher = _build_kernel(is_fp8, threads, float(divisor))
     kv_u8 = compressed_k_cache.view(torch.uint8).view(num_pages, -1)
     q_u8 = q.view(torch.uint8).view(rows, -1)
-    ks = compressed_k_scale.view(num_pages, PAGE_SIZE, 1) if is_fp8 else q_u8
+    ks = compressed_k_scale.view(num_pages, PAGE_SIZE, 1) if is_fp8 else _dummy_scale(dev)
     stream = torch.cuda.current_stream(dev)
     _run(
         launcher,
