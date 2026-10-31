@@ -8,6 +8,9 @@ import sys
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter import dtypes
 from aiter.ops.triton.fusions.fused_mla_prefill_qkv_fp8 import (
@@ -20,8 +23,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -46,13 +47,12 @@ def get_benchmark_shapes(args):
 
 
 def bench_fn_impl(T, H, H_out, provider, metric, args):
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     _p_gen = functools.partial(generate_inputs, T, H, arg_to_torch_dtype[args.dtype])
     _out_val_keys = ["q", "k_nope", "v", "k_pe"]
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-    )
+    rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
     # Shapes/dtypes are identical across the pool, so any entry works for sizing.
     sample = rot_bufs[0]
@@ -70,7 +70,7 @@ def bench_fn_impl(T, H, H_out, provider, metric, args):
         def _run(q, k_nope, v, k_pe):
             torch_mla_prefill_qkv_fp8_ref(q, k_nope, v, k_pe, H_out, dtypes.fp8)
 
-    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+    ms = bencher.bench(_run)
     if metric == "time":
         return ms * 1000  # us
     if metric == "bandwidth":

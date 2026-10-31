@@ -31,6 +31,9 @@ import functools
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_cat_and_cache_mla,
@@ -44,11 +47,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
-    get_caller_name_no_ext,
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -141,8 +140,9 @@ def bench_cat_and_cache_mla_fn(
 ):
     cache_dtype = CACHE_DTYPES[args.cache_dtype]
     num_kv_cache_tokens = args.num_kv_cache_tokens
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     assert DEVICE_ARCH != "gfx1250", "Only triton kernel tested/supported"
     assert (
@@ -183,9 +183,7 @@ def bench_cat_and_cache_mla_fn(
         "sin",
         "positions",
     ]
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-    )
+    rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
     # Shapes/dtypes are identical across the pool, so any entry works for sizing.
     sample = rot_bufs[0]
@@ -235,7 +233,7 @@ def bench_cat_and_cache_mla_fn(
                 q_out_dtype=q_out_dtype,
             )
 
-    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+    ms = bencher.bench(_run)
 
     if metric == "time":
         return ms

@@ -15,6 +15,9 @@ import functools
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.rope.fused_qk_norm_rope_gate_fp8_quant import (
     FP8_DTYPE,
@@ -27,11 +30,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
-    get_caller_name_no_ext,
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 
 def parse_int_or_list(value):
@@ -122,8 +121,9 @@ def _generate_inputs(
 
 
 def benchmark_fused_qkv(tokens, metric, args, **_):
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     _p_gen = functools.partial(
         _generate_inputs,
         tokens,
@@ -152,9 +152,7 @@ def benchmark_fused_qkv(tokens, metric, args, **_):
         "key_descale_out",
         "value_descale_out",
     ]
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-    )
+    rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
     # Shapes/dtypes are identical across the pool, so any entry works for sizing.
     sample = rot_bufs[0]
@@ -203,7 +201,7 @@ def benchmark_fused_qkv(tokens, metric, args, **_):
             value_descale_out=value_descale_out,
         )
 
-    time_ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+    time_ms = bencher.bench(_run)
     if metric == "time":
         return time_ms
     if metric == "bandwidth":

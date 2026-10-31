@@ -6,7 +6,7 @@ weights + optional FP8 group quant).
 
 Structure mirrors the other op_benchmarks/triton bench scripts (a
 ``triton.testing.Benchmark`` + ``perf_report`` shape sweep, ``--metric`` /
-``--shape`` / ``-o`` / ``-print_vgpr``). Timing uses ``do_bench_aiter_triton`` ( rotating buffers +
+``--shape`` / ``-o`` / ``-print_vgpr``). Timing uses ``RotatingBufferBench.bench`` ( rotating buffers +
 CUDA graph replay) rather than ``do_bench`` to remove host launch overhead — this op
 is a short, memory-bound elementwise pass where per-launch overhead would
 otherwise dominate. ``--backend {auto,triton,gluon}`` selects the wrapper's
@@ -20,6 +20,9 @@ import functools
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter import dtypes
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -33,8 +36,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -97,8 +98,7 @@ def run_benchmark(args):
         backend = "gluon" if _is_gluon_available() else "triton"
     elif backend == "gluon" and not _is_gluon_available():
         raise ValueError(
-            "backend='gluon' requested but this arch has no Gluon port "
-            "(only gfx1250)."
+            "backend='gluon' requested but this arch has no Gluon port (only gfx1250)."
         )
 
     if args.metric == "time":
@@ -131,8 +131,9 @@ def run_benchmark(args):
     swiglu_limit = args.swiglu_limit
     weighted = bool(args.weighted)
     weight_shape = args.weight_shape
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_fused_clamp_act_mul(M, n_half, metric, **kwargs):
@@ -151,9 +152,7 @@ def run_benchmark(args):
             weight_shape,
         )
         _out_val_keys = ["inp", "weights", "out", "scale"]
-        rot_bufs = generate_rotating_buffers_pool(
-            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-        )
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
         # Shapes/dtypes are identical across the pool, so any entry works for sizing.
         sample = rot_bufs[0]
@@ -176,7 +175,7 @@ def run_benchmark(args):
                 backend=backend,
             )
 
-        ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+        ms = bencher.bench(_run)
 
         # Memory-bound: read gate+up (M x 2N), write out (M x N) + small scale
         # buffer. Weights add M x 1 when broadcast (negligible) or a full

@@ -10,6 +10,9 @@ import sys
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -19,8 +22,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -68,15 +69,14 @@ def _generate_inputs(N, D, dtype, layout, row_stride, x_row_stride):
 
 def bench_fused_sigmoid_mul_fn(N, D, provider, metric, args):
     dtype = arg_to_torch_dtype[args.dtype]
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     _p_gen = functools.partial(
         _generate_inputs, N, D, dtype, args.layout, args.row_stride, args.x_row_stride
     )
     _out_val_keys = ["x", "gate", "out"]
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-    )
+    rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
     # Shapes/dtypes are identical across the pool, so any entry works for sizing.
     sample = rot_bufs[0]
@@ -93,7 +93,7 @@ def bench_fused_sigmoid_mul_fn(N, D, provider, metric, args):
         def _run(x, gate, out):
             x * gate.sigmoid()
 
-    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+    ms = bencher.bench(_run)
     if metric == "time":
         return ms * 1000  # us
     if metric == "bandwidth":

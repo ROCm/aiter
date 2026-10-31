@@ -22,20 +22,41 @@ Usage:
     python3 bench_fused_gdn_decode_qkvz.py --batch 1,32,256 --no-fp8
 """
 
+import functools
 import sys
 
 import torch
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
     fused_gdn_decode_qkvz,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 
 # Peak theoretical HBM bandwidth, bytes/s.
 _PEAK_BW = {"gfx950": 8.0e12, "gfx942": 5.3e12}
 _HEAD_DIM = 128
 _CONV_WIDTH = 4
+
+_OUT_VAL_KEYS = [
+    "projected_qkvz",
+    "projected_ba",
+    "conv_state",
+    "ssm_state",
+    "ssm_state_indices",
+    "conv_weight",
+    "conv_bias",
+    "A_log",
+    "dt_bias",
+    "norm_weight",
+]
 
 
 def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda", ratio=2):
@@ -44,7 +65,7 @@ def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda", ratio=2):
     channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim
     slots = max(slots, batch + 1)
     bf16 = {"dtype": torch.bfloat16, "device": device}
-    return {
+    inp = {
         "projected_qkvz": torch.randn(batch, num_k_heads * group_width, **bf16),
         "projected_ba": torch.randn(batch, 2 * num_v_heads, **bf16),
         "conv_state": torch.randn(slots, channels, _CONV_WIDTH - 1, **bf16),
@@ -60,6 +81,7 @@ def make_inputs(batch, num_k_heads, head_dim, slots, device="cuda", ratio=2):
         "dt_bias": torch.randn(num_v_heads, **bf16),
         "norm_weight": torch.randn(head_dim, **bf16),
     }
+    return tuple(inp[k] for k in _OUT_VAL_KEYS)
 
 
 def bytes_moved(batch, num_k_heads, head_dim, fp8, ratio=2):
@@ -80,63 +102,28 @@ def bytes_moved(batch, num_k_heads, head_dim, fp8, ratio=2):
 
 
 def bench_one(
+    bencher,
     batch,
     num_k_heads,
     head_dim,
     slots,
     quant_dtype,
-    iters,
-    warmup=25,
     ratio=2,
     layout="interleaved",
 ):
-    inp = make_inputs(batch, num_k_heads, head_dim, slots, ratio=ratio)
-    args = (
-        inp["projected_qkvz"],
-        inp["projected_ba"],
-        inp["conv_state"],
-        inp["ssm_state"],
-        inp["ssm_state_indices"],
-        inp["conv_weight"],
-        inp["conv_bias"],
-        inp["A_log"],
-        inp["dt_bias"],
-        inp["norm_weight"],
+    _p_gen = functools.partial(
+        make_inputs, batch, num_k_heads, head_dim, slots, ratio=ratio
     )
-    kwargs = {
-        "scale": head_dim**-0.5,
-        "norm_eps": 1e-6,
-        "quant_dtype": quant_dtype,
-        "qkvz_layout": layout,
-    }
+    bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
 
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(warmup):
-            fused_gdn_decode_qkvz(*args, **kwargs)
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        fused_gdn_decode_qkvz(*args, **kwargs)
-    torch.cuda.synchronize()
-    for _ in range(5):
-        graph.replay()
-    torch.cuda.synchronize()
-
-    samples = []
-    for _ in range(5):
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        start.record()
-        for _ in range(iters):
-            graph.replay()
-        end.record()
-        torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0 / iters)
-    samples.sort()
-    return samples[len(samples) // 2]
+    kernel_fn = functools.partial(
+        fused_gdn_decode_qkvz,
+        scale=head_dim**-0.5,
+        norm_eps=1e-6,
+        quant_dtype=quant_dtype,
+        qkvz_layout=layout,
+    )
+    return bencher.bench(kernel_fn) * 1000.0  # ms -> us
 
 
 def main():
@@ -157,7 +144,13 @@ def main():
     )
     ap.add_argument("--head-dim", type=int, default=_HEAD_DIM)
     ap.add_argument("--slots", type=int, default=512)
-    ap.add_argument("--iters", type=int, default=200)
+    ap.add_argument(
+        "--iters",
+        type=int,
+        default=200,
+        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
+        "constant, not an adaptive iters target. Kept for CLI compatibility.",
+    )
     ap.add_argument("--no-fp8", action="store_true", help="bf16 output only")
     args = ap.parse_args()
 
@@ -173,16 +166,19 @@ def main():
         f"num_k_heads={args.num_k_heads} head_dim={args.head_dim} "
         f"slots={args.slots} fp8={not args.no_fp8} ratio={args.ratio} layout={args.layout}"
     )
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     # us per call; this op is always a single launch, so also per launch.
     print(f"{'batch':>7}{'us/call':>10}{'GB moved':>11}{'TB/s':>9}{'% peak':>9}")
     for b in [int(x) for x in args.batch.split(",")]:
         us = bench_one(
+            bencher,
             b,
             args.num_k_heads,
             args.head_dim,
             args.slots,
             quant_dtype,
-            args.iters,
             ratio=args.ratio,
             layout=args.layout,
         )

@@ -16,26 +16,28 @@ placed and that changes the access pattern:
     python bench_fused_deepseek_v4_k_cache.py --seqs 1024 --reqs 8
 """
 
-# The timing closures below capture the shape loop's variables by
-# reference. Every one is built and consumed inside its own iteration
-# (do_bench runs before the loop advances), so late binding cannot bite.
-# File-scoped rather than per-line: a trailing suppression comment sits
-# on a line black then rewraps, which moves it off the line ruff reports.
-# ruff: noqa: B023
-
-import argparse
+import functools
 import sys
 
 import torch
-import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_deepseek_v4_dequantize_and_gather_k_cache,
     fused_deepseek_v4_quantize_and_insert_k_cache,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 
 _QK, _NOPE = 512, 448
 _PACKED_REC, _ALIGNED_REC = 584, 640
+
+_OUT_VAL_KEYS = ["k", "k_cache", "slot_mapping", "block_table", "seq_lens", "out"]
 
 
 def build(num_reqs, seq_len, rec_bytes, block, device="cuda"):
@@ -50,12 +52,30 @@ def build(num_reqs, seq_len, rec_bytes, block, device="cuda"):
     block_table = pages.reshape(num_reqs, per_req).to(torch.int32)
     pos = torch.arange(seq_len, device=device)
     blk = block_table[:, pos // block].to(torch.int64)
-    slot = (blk * block + (pos % block)).reshape(-1)
+    slot_mapping = (blk * block + (pos % block)).reshape(-1)
 
-    cache = torch.zeros(nb, block, rec_bytes, dtype=torch.uint8, device=device)
+    k_cache = torch.zeros(nb, block, rec_bytes, dtype=torch.uint8, device=device)
     seq_lens = torch.full((num_reqs,), seq_len, dtype=torch.int32, device=device)
     out = torch.empty(num_reqs, seq_len, _QK, dtype=torch.bfloat16, device=device)
-    return k, cache, slot, block_table, seq_lens, out
+    return k, k_cache, slot_mapping, block_table, seq_lens, out
+
+
+def _do_write(block_size):
+    def _inner(k, k_cache, slot_mapping, **_):
+        fused_deepseek_v4_quantize_and_insert_k_cache(
+            k, k_cache, slot_mapping, block_size
+        )
+
+    return _inner
+
+
+def _do_read(block_size):
+    def _inner(out, k_cache, seq_lens, block_table, **_):
+        fused_deepseek_v4_dequantize_and_gather_k_cache(
+            out, k_cache, seq_lens, None, block_table, block_size, 0
+        )
+
+    return _inner
 
 
 def write_bytes(num_tokens):
@@ -69,10 +89,7 @@ def read_bytes(num_tokens):
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Benchmark the DSv4 paged K-cache writer and reader",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    p = get_parser(kernel_name="DSv4 paged K-cache writer and reader")
     p.add_argument("--reqs", type=int, default=8, help="requests per launch")
     p.add_argument(
         "--seqs",
@@ -94,7 +111,8 @@ def main():
         "--rep",
         type=int,
         default=20,
-        help="do_bench_cudagraph measurement target, in ms",
+        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
+        "constant, not an adaptive rep target. Kept for CLI compatibility.",
     )
     a = p.parse_args()
 
@@ -107,24 +125,18 @@ def main():
         f"{'write(GB/s)':<12} {'read(us)':<10} {'read(GB/s)':<12}"
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(a), **get_do_bench_graph_kwargs(a)}
+    )
+
     for rec in a.rec:
         for seq in a.seqs:
-            k, cache, slot, bt, seq_lens, out = build(a.reqs, seq, rec, a.block)
+            _p_gen = functools.partial(build, a.reqs, seq, rec, a.block)
+            bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
             ntok = a.reqs * seq
 
-            def do_write():
-                fused_deepseek_v4_quantize_and_insert_k_cache(k, cache, slot, a.block)
-
-            def do_read():
-                fused_deepseek_v4_dequantize_and_gather_k_cache(
-                    out, cache, seq_lens, None, bt, a.block, 0
-                )
-
-            do_write()  # compile outside the timed region
-            do_read()
-            torch.cuda.synchronize()
-            wms = triton.testing.do_bench_cudagraph(do_write, rep=a.rep)
-            rms = triton.testing.do_bench_cudagraph(do_read, rep=a.rep)
+            wms = bencher.bench(_do_write(a.block))
+            rms = bencher.bench(_do_read(a.block))
 
             print(
                 f"{rec:<8d} {seq:<7d} {wms * 1e3:<10.2f} "

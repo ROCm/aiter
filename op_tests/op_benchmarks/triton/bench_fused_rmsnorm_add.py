@@ -1,6 +1,9 @@
 import functools
 
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.normalization.fused_rmsnorm_add import fused_rmsnorm_add
 from aiter.ops.triton.utils.types import str_to_torch_dtype
@@ -11,8 +14,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -81,8 +82,9 @@ def run_benchmark(args):
 
     add_residual = args.add_residual
     c_dtype = str_to_torch_dtype[args.dtype]
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_fused_rmsnorm_add(M, N, metric, **kwargs):
@@ -92,9 +94,7 @@ def run_benchmark(args):
             generate_fused_rmsnorm_add_inputs, M, N, c_dtype, add_residual
         )
         _out_val_keys = ["x", "weight", "res1"]
-        rot_bufs = generate_rotating_buffers_pool(
-            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-        )
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
         # Shapes/dtypes are identical across the pool, so any entry works for sizing.
         sample = rot_bufs[0]
@@ -119,7 +119,7 @@ def run_benchmark(args):
 
         flops = 4 * M * N + (M * N if add_residual else 0)
 
-        ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+        ms = bencher.bench(_run)
 
         if metric == "time":
             return ms

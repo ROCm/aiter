@@ -6,14 +6,23 @@ Benchmark for the fused residual + gate[indices] * x kernel against the eager
 expression, which materialises the gathered gate and the product at [M, N].
 """
 
-import argparse
+import functools
 import sys
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.fusions.fused_indexed_gated_residual import (
     fused_indexed_gated_residual,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -30,25 +39,28 @@ _ARRAYS = {"fused": 3, "eager": 7}
 _HIDDEN = 5376
 _TOKENS = (1024, 4096, 16384, 57330, 114660)
 
+_OUT_VAL_KEYS = ["residual", "x", "gate", "indices", "out"]
 
-def bench_fn_impl(M, N, provider, metric, args):
+
+def _generate_pool_inputs(M, N, G, scattered):
     residual, x, gate, indices = make(
-        M, N, args.G, torch.bfloat16, "cuda", runs=not args.scattered
+        M, N, G, torch.bfloat16, "cuda", runs=not scattered
     )
-    mem = _ARRAYS[provider] * M * N * residual.element_size()
+    out = torch.empty_like(residual)
+    return residual, x, gate, indices, out
 
-    if provider == "fused":
-        out = torch.empty_like(residual)
 
-        def fn():
-            return fused_indexed_gated_residual(residual, x, gate, indices, out=out)
+def _eager_fn(residual, x, gate, indices, out, **_):
+    return residual + gate[indices] * x
 
-    else:
 
-        def fn():
-            return residual + gate[indices] * x
+def bench_fn_impl(bencher, M, N, provider, metric, args):
+    _p_gen = functools.partial(_generate_pool_inputs, M, N, args.G, args.scattered)
+    rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
+    mem = _ARRAYS[provider] * M * N * rot_bufs[0]["residual"].element_size()
 
-    ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+    kernel_fn = fused_indexed_gated_residual if provider == "fused" else _eager_fn
+    ms = bencher.bench(kernel_fn)
     if metric == "time":
         return ms * 1000  # us
     if metric == "bandwidth":
@@ -77,20 +89,20 @@ def run_benchmark(args):
         args={},
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([benchmark])
     def bench_fn(M, N, provider):
         name, metric = provider.rsplit("_", 1)
-        return bench_fn_impl(M, N, name, metric, args)
+        return bench_fn_impl(bencher, M, N, name, metric, args)
 
     bench_fn.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused indexed gated residual",
-        description="Benchmark residual + gate[indices] * x, fused against eager",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="fused indexed gated residual")
     parser.add_argument("-M", type=int, default=None, help="Number of tokens")
     parser.add_argument("-N", type=int, default=_HIDDEN, help="Hidden size")
     parser.add_argument("-G", type=int, default=9, help="Gate table rows")
@@ -106,15 +118,27 @@ def parse_args():
         choices=[*_PROVIDERS, "all"],
         help="fused kernel, eager expression, or both",
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default="all",
+    override_parser_action(
+        parser,
+        action="--metric",
         choices=["all", "time", "bandwidth"],
+        default="all",
         help="Metric to report (default: all)",
     )
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=25,
+        help="Unused: RotatingBufferBench.bench's warmup is controlled by "
+        "--graph-warmup-iters. Kept for CLI compatibility.",
+    )
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=100,
+        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
+        "constant, not an adaptive rep target. Kept for CLI compatibility.",
+    )
     parser.add_argument(
         "-print_vgpr",
         action="store_true",

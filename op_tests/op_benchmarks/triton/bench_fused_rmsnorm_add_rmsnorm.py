@@ -11,6 +11,9 @@ import functools
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.normalization.fused_rmsnorm_add_rmsnorm import (
     fused_rmsnorm_add_rmsnorm,
@@ -21,11 +24,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
-    get_caller_name_no_ext,
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 from op_tests.triton_tests.normalization.test_fused_rmsnorm_add_rmsnorm import (
     generate_fused_rmsnorm_add_rmsnorm_inputs,
 )
@@ -47,14 +46,10 @@ def _generate_inputs(M, N):
     return x, residual, post_weight, pre_weight, residual_out
 
 
-def bench_fused_rmsnorm_add_rmsnorm_fn(
-    M, N, metric, kwargs_rot_bufs, kwargs_do_bench_graph
-):
+def bench_fused_rmsnorm_add_rmsnorm_fn(M, N, metric, bencher: RotatingBufferBench):
     _p_gen = functools.partial(_generate_inputs, M, N)
     _out_val_keys = ["x", "residual", "post_weight", "pre_weight", "residual_out"]
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-    )
+    rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
     # Shapes/dtypes are identical across the pool, so any entry works for sizing.
     sample = rot_bufs[0]
@@ -64,7 +59,7 @@ def bench_fused_rmsnorm_add_rmsnorm_fn(
             x, residual, post_weight, pre_weight, POST_EPS, PRE_EPS, residual_out
         )
 
-    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+    ms = bencher.bench(_run)
     if metric == "time":
         return ms
     if metric == "bandwidth":
@@ -76,8 +71,9 @@ def bench_fused_rmsnorm_add_rmsnorm_fn(
 def run_benchmark(args):
     x_vals = [tuple(args.shape)] if args.shape is not None else get_x_vals()
     unit = "Time_(ms)" if args.metric == "time" else "Bandwidth_(GB/s)"
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     benchmark = triton.testing.Benchmark(
         x_names=["M", "N"],
         x_vals=x_vals,
@@ -92,9 +88,7 @@ def run_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_fused_rmsnorm_add_rmsnorm(M, N, metric, **kwargs):
-        return bench_fused_rmsnorm_add_rmsnorm_fn(
-            M, N, metric, kwargs_rot_bufs, kwargs_do_bench_graph
-        )
+        return bench_fused_rmsnorm_add_rmsnorm_fn(M, N, metric, bencher)
 
     bench_fused_rmsnorm_add_rmsnorm.run(
         save_path="." if args.o else None, print_data=True, show_plots=False
