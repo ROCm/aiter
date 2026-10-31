@@ -35,6 +35,18 @@ environment_variables: dict[str, tuple[Callable[[str], Any], str]] = {
     "AITER_MEGA_S1_FIXED_KPAIR": (_flag, "1"),
     # Compact dispatch producers keep two rows in flight.
     "AITER_MEGA_DISPATCH_FAST_COPY": (_flag, "1"),
+    # Stage2 + combine through the SDMA copy engines (stage2_sdma) when an instance is
+    # built with stage2_sdma=None. Needs mori with cco SDMA and MORI_ENABLE_SDMA=1;
+    # unsupported configurations keep the default Stage2. Per instance, not per call
+    # (every rank must take the same path): meant for prefill instances, as it is
+    # faster from ~2048 tokens per rank and slower below ~1024 (fixed plan / SDMA
+    # latency and full 256-row GEMM2 tiles).
+    "AITER_MEGA_STAGE2_SDMA": (_flag, "0"),
+    # SDMA Stage2: sort tiles per shipped chunk.
+    "AITER_MEGA_SDMA_CHUNK_TILES": (int, "16"),
+    # SDMA Stage2: rows reserved per (src, dst) pair, as a multiple of the even share
+    # max_tok_per_rank * topk / world_size. Rows past it take the direct P2P path.
+    "AITER_MEGA_SDMA_ROW_SLACK": (float, "2.0"),
 }
 
 

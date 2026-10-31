@@ -354,9 +354,44 @@ def _time_graph(fn, device, iters):
     return mean_ms, max_ms
 
 
+def _check_sdma_exact(moe, x, weights, ids, output, rank, device):
+    """The SDMA Stage2 must produce the default Stage2's bytes: same GEMM2 numerics,
+    same fp8 1x32 rows, same top-k sum order. Rows past the per-pair reservation
+    took the direct P2P path and must match too."""
+    tokens = x.shape[0]
+    overflow = moe._sdma_stage2.take_overflow_rows()
+    sdma_stage2, moe._sdma_stage2 = moe._sdma_stage2, None
+    try:
+        default = moe(x, weights, ids)[:tokens].clone()
+    finally:
+        moe._sdma_stage2 = sdma_stage2
+    _barrier()
+    mismatched = torch.tensor(
+        int((default != output).any(dim=1).sum()) if tokens else 0,
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(mismatched, op=dist.ReduceOp.MAX)
+    overflow_t = torch.tensor(overflow, dtype=torch.int64, device=device)
+    dist.all_reduce(overflow_t)
+    if int(mismatched.item()):
+        raise AssertionError(
+            f"bs={tokens} SDMA Stage2 differs from the default Stage2 in "
+            f"{int(mismatched.item())} rows (max over ranks)"
+        )
+    if rank == 0:
+        print(
+            f"[MEGA-V2] bs={tokens} stage2_sdma=EXACT p2p_overflow_rows={int(overflow_t.item())}",
+            flush=True,
+        )
+
+
 def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     tokens = x.shape[0]
     output = moe(x, weights, ids)[:tokens]
+    if moe.stage2_sdma:
+        _check_sdma_exact(moe, x, weights, ids, output.clone(), rank, device)
+        output = moe(x, weights, ids)[:tokens]
     if moe._active_config.stage2.aligned_pair:
         aligned_output = output.clone()
         full_output = moe(x, weights, ids, slice_output=False)
@@ -580,7 +615,22 @@ def main():
         help="Also route each rank's last N rows to -1 (whole rows) and check "
         "forward(mask_invalid_slots=True) returns them as zeros",
     )
+    parser.add_argument(
+        "--stage2-sdma",
+        action="store_true",
+        help="Run Stage2 + combine through the SDMA copy engines and check the output "
+        "byte for byte against the default Stage2 (needs MORI_ENABLE_SDMA=1)",
+    )
+    parser.add_argument(
+        "--sdma-row-slack",
+        type=float,
+        default=None,
+        help="Rows reserved per rank pair for --stage2-sdma, as a multiple of the even "
+        "share; a small value forces rows onto the direct P2P fallback",
+    )
     args = parser.parse_args()
+    if args.sdma_row_slack is not None:
+        os.environ["AITER_MEGA_SDMA_ROW_SLACK"] = str(args.sdma_row_slack)
     if (
         sum(
             (
@@ -661,6 +711,8 @@ def main():
                 16, _next_power_of_two(batch_size)
             )
             if shared_moe is None or args.max_tok_per_rank is None:
+                if shared_moe is not None:
+                    shared_moe.close()
                 fanout_masks = ()
                 if args.force_fanout_boundary:
                     pair_mask = (1 << (local_experts - 2)) | (1 << (local_experts - 1))
@@ -683,8 +735,13 @@ def main():
                     max_tok_per_rank=max_tok_per_rank,
                     fanout_masks=fanout_masks,
                     stage2_p2p_quant=args.stage2_p2p_quant,
+                    stage2_sdma=args.stage2_sdma,
                     **network,
                 )
+                if args.stage2_sdma and not shared_moe.stage2_sdma:
+                    raise RuntimeError(
+                        "--stage2-sdma: the SDMA Stage2 is unavailable (see the warning)"
+                    )
             moe = shared_moe
             _install_config_policy(moe, config_tokens, args.unify_fields)
             if rank_tokens:
@@ -722,6 +779,8 @@ def main():
                     world,
                     device,
                 )
+        if shared_moe is not None:
+            shared_moe.close()
     finally:
         _cleanup()
 

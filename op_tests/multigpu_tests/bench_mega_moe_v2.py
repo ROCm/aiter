@@ -257,6 +257,11 @@ def main():
     parser.add_argument("--profile-dir", default="")
     parser.add_argument("--mega-only", action="store_true")
     parser.add_argument("--perf-guard", action="store_true")
+    parser.add_argument(
+        "--stage2-sdma",
+        action="store_true",
+        help="Stage2 + combine through the SDMA copy engines (needs MORI_ENABLE_SDMA=1)",
+    )
     args = parser.parse_args()
 
     if not args.mega_only and args.phase is None:
@@ -345,7 +350,12 @@ def main():
         w2_scale=w2_scale,
         max_tok_per_rank=args.mtpr,
         swiglu_limit=SWIGLU_LIMIT,
+        stage2_sdma=args.stage2_sdma,
     )
+    if args.stage2_sdma and not mega.stage2_sdma:
+        raise RuntimeError(
+            "--stage2-sdma: the SDMA Stage2 is unavailable (see the warning)"
+        )
     default_select_config = mega._select_config
     variant_select_config = None
     if (
@@ -597,6 +607,7 @@ def main():
                 f"[PERF-GUARD] {status} speedup={speedup:.2f}% minimum={guard_floor:.2f}%",
                 flush=True,
             )
+    mega.close()
     ms.shmem_finalize()
     dist.destroy_process_group()
     if not guard_pass:
