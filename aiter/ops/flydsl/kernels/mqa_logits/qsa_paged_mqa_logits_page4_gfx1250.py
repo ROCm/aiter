@@ -184,6 +184,21 @@ if _ACCESS not in ("raw", "cop"):
     raise ValueError(f"QSA_G2_ACCESS must be 'raw' or 'cop', got {_ACCESS!r}")
 
 
+def _plane_bytes(count, item_bytes, count2=1):
+    """True i64 extent for positive i32 dimensions, at least one dword.
+
+    ``item_bytes`` is a constexpr stride >= 4 for every plane in this kernel.
+    Clamp dimensions *before* widening: an i64 signed max has no SALU opcode
+    on gfx1250, so it makes the V# divergent and wraps every MUBUF access in a
+    serialized waterfall.  Products still use i64 (never multiply in i32).
+    The wrapper rejects empty/negative dimensions; their descriptors remain
+    bounded here even for a direct compile-only invocation.
+    """
+    n = fx.Int64(_imax(fx.Int32(count), fx.Int32(1)))
+    n2 = fx.Int64(_imax(fx.Int32(count2), fx.Int32(1)))
+    return n * n2 * fx.Int64(item_bytes)
+
+
 def _plane(tensor, num_bytes):
     """Descriptor for a kernel tensor argument, extent ``num_bytes`` (i64).
 
@@ -194,11 +209,13 @@ def _plane(tensor, num_bytes):
 
     ``num_bytes`` must therefore be the *true* extent of the plane in bytes and
     is computed in i64 (an i32 product can wrap and then either truncate the
-    descriptor or, worse, look large enough to admit a bad offset).
+    descriptor or, worse, look large enough to admit a bad offset).  Callers
+    supply ``_plane_bytes`` or the 4-byte bf16 dummy, both >= _MIN_DESC_BYTES;
+    do not re-clamp the i64 product here (that forces a VGPR descriptor).
     """
     ptr = fx.rocdl.make_buffer_ptr(
         fx.recast_iter(fx.Int8, fx.get_iter(tensor)),
-        num_records_bytes=_imax(fx.Int64(num_bytes), fx.Int64(_MIN_DESC_BYTES)),
+        num_records_bytes=fx.Int64(num_bytes),
     )
     return ptr if _ACCESS == "cop" else fx.rocdl.get_buffer_rsrc(ptr)
 
@@ -391,7 +408,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         return vals
 
     def _ks_bytes_fp8(num_pages):
-        return fx.Int64(num_pages) * fx.Int64(PAGE_SIZE) * fx.Int64(4)
+        return _plane_bytes(num_pages, PAGE_SIZE * 4)
 
     def _ks_bytes_bf16(num_pages):   # no scale plane: a 4-byte dummy descriptor
         return fx.Int64(4)
@@ -463,15 +480,15 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float):
         # Descriptor extents: bytes, i64 (see `_plane`).  One pinned descriptor
         # per plane, built here and not inside any branch.  `ks_bytes(num_pages)`
         # is already an i64 expression, and the bf16 dummy plane is a constant.
-        q_rsrc = _plane(Q, fx.Int64(rows) * fx.Int64(q_row_bytes))
-        kv_rsrc = _plane(KV, fx.Int64(num_pages) * fx.Int64(page_bytes))
-        pt_rsrc = _plane(PT, fx.Int64(num_requests) * fx.Int64(width) * fx.Int64(4))
-        t2r_rsrc = _plane(T2R, fx.Int64(rows) * fx.Int64(4))
-        qp_rsrc = _plane(QP, fx.Int64(rows) * fx.Int64(4))
-        cl_rsrc = _plane(CL, fx.Int64(num_requests) * fx.Int64(4))
-        logits_rsrc = _plane(LOGITS, fx.Int64(rows) * fx.Int64(columns) * fx.Int64(4))
-        vis_rsrc = _plane(VIS, fx.Int64(rows) * fx.Int64(4))
-        rst_rsrc = _plane(RST, fx.Int64(rows) * fx.Int64(4))
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, 4))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
         ks_rsrc = _plane(KS, ks_bytes(num_pages))
 
         # fp8 only: cooperatively stage the row's 1 KiB packed bf16 Q once.
@@ -854,15 +871,15 @@ def _build_wmma_kernel(divisor: float):
         col0 = chunk * WMMA_COLS
 
         # One pinned descriptor per plane, true extents in i64 (see `_plane`).
-        q_rsrc = _plane(Q, fx.Int64(rows) * fx.Int64(q_row_bytes))
-        kv_rsrc = _plane(KV, fx.Int64(num_pages) * fx.Int64(page_bytes))
-        pt_rsrc = _plane(PT, fx.Int64(num_requests) * fx.Int64(width) * fx.Int64(4))
-        t2r_rsrc = _plane(T2R, fx.Int64(rows) * fx.Int64(4))
-        qp_rsrc = _plane(QP, fx.Int64(rows) * fx.Int64(4))
-        cl_rsrc = _plane(CL, fx.Int64(num_requests) * fx.Int64(4))
-        logits_rsrc = _plane(LOGITS, fx.Int64(rows) * fx.Int64(columns) * fx.Int64(4))
-        vis_rsrc = _plane(VIS, fx.Int64(rows) * fx.Int64(4))
-        rst_rsrc = _plane(RST, fx.Int64(rows) * fx.Int64(4))
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, 4))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
 
         meta = _rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
         plans = _pass_plan(meta, rows, kgrp)
@@ -1233,16 +1250,16 @@ def _build_wmma_fp8_kernel(divisor: float):
         col0 = chunk * WMMA_COLS
 
         # One pinned descriptor per plane, true extents in i64 (see `_plane`).
-        q_rsrc = _plane(Q, fx.Int64(rows) * fx.Int64(q_row_bytes))
-        kv_rsrc = _plane(KV, fx.Int64(num_pages) * fx.Int64(page_bytes))
-        ks_rsrc = _plane(KS, fx.Int64(num_pages) * fx.Int64(PAGE_SIZE) * fx.Int64(4))
-        pt_rsrc = _plane(PT, fx.Int64(num_requests) * fx.Int64(width) * fx.Int64(4))
-        t2r_rsrc = _plane(T2R, fx.Int64(rows) * fx.Int64(4))
-        qp_rsrc = _plane(QP, fx.Int64(rows) * fx.Int64(4))
-        cl_rsrc = _plane(CL, fx.Int64(num_requests) * fx.Int64(4))
-        logits_rsrc = _plane(LOGITS, fx.Int64(rows) * fx.Int64(columns) * fx.Int64(4))
-        vis_rsrc = _plane(VIS, fx.Int64(rows) * fx.Int64(4))
-        rst_rsrc = _plane(RST, fx.Int64(rows) * fx.Int64(4))
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        ks_rsrc = _plane(KS, _plane_bytes(num_pages, PAGE_SIZE * 4))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, 4))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
 
         meta = _rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
         plans = _pass_plan(meta, rows, kgrp)
