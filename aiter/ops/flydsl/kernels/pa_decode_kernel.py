@@ -28,9 +28,13 @@ Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
+                   or NHD [num_blocks, 64, num_kv_heads, 256] (strided, head contiguous;
+                   gfx950 FP8 head 256, page 64, at most two query M-tiles)
 * ``value_cache``  [num_blocks, num_kv_heads, block_size//x, head_dim, x] (trans_v)
                    or [num_blocks, num_kv_heads, head_dim, block_size] (FP8 plain)
-                   where x=16 for FP8 and x=8 for BF16
+                   where x=16 for FP8 and x=8 for BF16; with NHD K, an NHD view of
+                   the same shape: head_dim contiguous bytes per token, often the
+                   head_dim bytes after K in one token row
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``work_info``    [capacity, 4]  int32 sequence/tile bounds/context length
 * ``pmax``, ``psum`` [num_kv_heads, capacity, query_length * query_group_size] f32
@@ -168,7 +172,8 @@ def compile_pa_decode_tile(
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
-    ``trans_k=False`` is not implemented.
+    ``trans_k=False`` requires ``trans_v=False`` and selects NHD caches
+    (gfx950 only).
     gfx1250 uses wave32 WMMA, native BF16 or OCP FP8, and its larger LDS budget.
     A one-partition gfx1250 plan can write final output directly when sinks
     are absent and query/output strides match. Other tasks write packed partials
@@ -180,15 +185,17 @@ def compile_pa_decode_tile(
     past its context before PV, so those rows may hold anything, including NaN
     (``0 * NaN == NaN`` in PV MFMA). ``mask_unowned_kv=False`` skips that
     masking and restores the caller contract that those V bytes and scales
-    remain finite. The gfx1250 pipelines ignore the flag and always require it.
+    remain finite; NHD V is also zero-filled past the context by its DMA. The
+    gfx1250 pipelines ignore the flag and always require it.
     ``wide_kv_addressing`` protects
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
-    and permits unsigned buffer offsets instead of i64.
+    and permits unsigned buffer offsets instead of i64. For NHD it also widens
+    the head term, and the in-page term stays i32.
     """
-    if not trans_k:
-        raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture == "gfx1250":
+        if not trans_k:
+            raise NotImplementedError("NHD pa_decode requires gfx950")
         if direct_output and num_partitions != 1:
             raise ValueError("direct_output requires a one-partition plan")
         if query_splits is None:
@@ -276,6 +283,12 @@ def compile_pa_decode_tile(
         stride_ks_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
+        stride_k_block: fx.Int32,
+        stride_k_token: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_block: fx.Int32,
+        stride_v_token: fx.Int32,
+        stride_v_head: fx.Int32,
         num_sequences: fx.Int32,
         planned_seq: fx.Int32,
         planned_start: fx.Int32,
@@ -305,6 +318,12 @@ def compile_pa_decode_tile(
             planned_start,
             planned_end,
             planned_context,
+            stride_k_block=stride_k_block,
+            stride_k_token=stride_k_token,
+            stride_k_head=stride_k_head,
+            stride_v_block=stride_v_block,
+            stride_v_token=stride_v_token,
+            stride_v_head=stride_v_head,
         )
         PaDecodePipeline(ctx).run()
 
@@ -337,6 +356,12 @@ def compile_pa_decode_tile(
         stride_ks_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
+        stride_k_block: fx.Int32,
+        stride_k_token: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_block: fx.Int32,
+        stride_v_token: fx.Int32,
+        stride_v_head: fx.Int32,
         work_info_ptr: fx.Pointer,
         num_sequences: fx.Int32,
     ):
@@ -356,6 +381,12 @@ def compile_pa_decode_tile(
                 stride_ks_head,
                 stride_q_row,
                 stride_q_head,
+                stride_k_block,
+                stride_k_token,
+                stride_k_head,
+                stride_v_block,
+                stride_v_token,
+                stride_v_head,
                 num_sequences,
                 seq,
                 start,
@@ -400,6 +431,12 @@ def compile_pa_decode_tile(
         stride_ks_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
+        stride_k_block: fx.Int32,
+        stride_k_token: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_block: fx.Int32,
+        stride_v_token: fx.Int32,
+        stride_v_head: fx.Int32,
         work_info: fx.Pointer,
         work_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -422,6 +459,12 @@ def compile_pa_decode_tile(
                 stride_ks_head,
                 stride_q_row,
                 stride_q_head,
+                stride_k_block,
+                stride_k_token,
+                stride_k_head,
+                stride_v_block,
+                stride_v_token,
+                stride_v_head,
                 work_info,
                 num_seqs,
             ).launch(

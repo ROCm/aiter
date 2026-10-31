@@ -4,6 +4,7 @@
 """FlyDSL -- high-performance GPU kernels implemented using FlyDSL."""
 
 from importlib import import_module
+from types import ModuleType
 
 import flydsl as _flydsl
 from packaging.version import Version
@@ -130,7 +131,17 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "PADecodePlan": (".pa_decode", "PADecodePlan"),
     "pa_decode": (".pa_decode", "pa_decode"),
+    "pa_decode_default_workgroup_budget": (
+        ".pa_decode",
+        "pa_decode_default_workgroup_budget",
+    ),
+    "pa_decode_nhd_max_query_length": (
+        ".pa_decode",
+        "pa_decode_nhd_max_query_length",
+    ),
+    "plan_pa_decode": (".pa_decode", "plan_pa_decode"),
     "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
     "prepare_gemm_a16wfp4_weight": (
         ".gemm_a16wfp4",
@@ -182,6 +193,7 @@ __all__ = [
     "DenseGemmConfig",
     "Fp4MqaPlan",
     "GateMode",
+    "PADecodePlan",
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
     "a16wfp4_shape_supported",
@@ -222,6 +234,9 @@ __all__ = [
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
     "pa_decode",
+    "pa_decode_default_workgroup_budget",
+    "pa_decode_nhd_max_query_length",
+    "plan_pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
 ]
@@ -237,4 +252,9 @@ def __getattr__(name: str):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
     value = getattr(import_module(module_name, __name__), attr_name)
     globals()[name] = value
+    # Importing a submodule binds it on this package, shadowing an export of the
+    # same name (``pa_decode``). Drop those bindings so the export loads instead.
+    for export in _LAZY_IMPORTS.keys() & globals().keys():
+        if isinstance(globals().get(export), ModuleType):
+            globals().pop(export, None)
     return value
