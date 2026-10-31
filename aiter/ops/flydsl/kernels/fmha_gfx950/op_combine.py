@@ -12,8 +12,8 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.fmha_gfx950.common import _cu_load
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
-    _cu_load,
     _make_ws_rsrc,
     _store_lse,
 )
