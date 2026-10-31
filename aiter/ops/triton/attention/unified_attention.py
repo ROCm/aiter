@@ -13,7 +13,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
     get_dtype_str,
@@ -64,6 +64,11 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
 
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
+
+
+def _length_aware_seq_block(num_seqs: int) -> int:
+    """Lanes the length-aware split reads the batch's KV lengths in, per step."""
+    return min(256, max(64, triton.next_power_of_2(num_seqs)))
 
 
 def _is_gluon_available():
@@ -138,6 +143,46 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
 
 
+def _length_aware_split(config, params: _UAParams):
+    """(split_budget, NUM_SEGMENTS) for the length-aware KV split, or None when off.
+
+    A kv_split entry opts in with SPLIT_PROGRAMS_PER_CU, for batches where every
+    sequence fits one query block (decode, short verify queries). Each sequence
+    takes a share of num_sms * SPLIT_PROGRAMS_PER_CU working programs by its KV
+    length, read on the GPU (see seq_num_segments), so a CUDA graph captured
+    with the 1M max_seqlen_k bound still splits by the real lengths.
+    NUM_SEGMENTS is then SPLIT_NUM_SEGMENTS, which only caps one sequence's
+    split; calls left out, skip_reduce included, keep the uniform NUM_SEGMENTS.
+    """
+    per_cu = config.get("SPLIT_PROGRAMS_PER_CU")
+    num_segments = config.get("SPLIT_NUM_SEGMENTS", config["NUM_SEGMENTS"])
+    if per_cu is None or num_segments == 1 or params.skip_reduce:
+        return None
+    # The dtype tag also covers fp16, and the config matches the wider head.
+    if (
+        params.q_dtype != torch.bfloat16
+        or params.head_size != 64
+        or params.head_size_v != 64
+    ):
+        return None
+    if not params.all_decode and params.max_seqlen_q > _attn_3d_block_q(params):
+        return None
+    budget = max(1, params.num_sms * per_cu // params.num_kv_heads)
+    # the kernels sum the KV lengths and round that up by budget in int32, and
+    # pack the sequences before an item in 15 bits and the items before it in 16
+    if params.num_seqs * params.max_seqlen_k + budget >= 2**31:
+        return None
+    if budget + params.num_seqs >= 2**16 or params.num_seqs >= 2**15:
+        return None
+    return budget, int(num_segments)
+
+
+def _attn_3d_block_q(params: _UAParams) -> int:
+    config = get_unified_attention_config("attn_3d", params, backend="triton")
+    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    return block_m // params.num_queries_per_kv
+
+
 def _gfx950_gluon_supported(params: _UAParams):
     """GFX950 Gluon supported configs."""
     if params.shuffled_kv_cache and (
@@ -149,6 +194,8 @@ def _gfx950_gluon_supported(params: _UAParams):
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
+        # its non-causal branch is not validated
+        and params.causal
         # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
         and not params.softcap
         and not params.use_qq_bias
@@ -253,7 +300,30 @@ def unified_attention(
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
-    assert causal, "Only causal attention is supported"
+    """Paged attention for a varlen batch of query tokens.
+
+    Each sequence i has the query tokens cu_seqlens_q[i]:cu_seqlens_q[i + 1]
+    and seqused_k[i] keys in the paged cache that block_table addresses. The
+    query tokens are the last keys of their sequence. With causal=True, a
+    query token attends to the keys up to its own position. With causal=False,
+    it attends to all keys of its sequence. Non-causal attention does not
+    support a sliding window, ALiBi, a query-query bias or an fp4 Q or KV.
+    The result goes into out. With skip_reduce and a split launch, the
+    function returns the unmerged segments instead.
+    """
+    # Checked before the decode case below, so a decode batch rejects them too.
+    if not causal:
+        assert (
+            window_size[0] < 0 and window_size[1] < 0
+        ), "Non-causal attention does not support a sliding window"
+        assert (
+            alibi_slopes is None and qq_bias is None
+        ), "Non-causal attention does not support ALiBi or a query-query bias"
+        assert (
+            q.dtype != torch.uint8 and k.dtype != torch.uint8
+        ), "Non-causal attention does not support an fp4 Q or KV cache"
+    # A decode query sees all keys either way, so it keeps the causal kernels.
+    causal = causal or int(max_seqlen_q) == 1
 
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
@@ -423,6 +493,10 @@ def unified_attention(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
         NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
+        split_budget = None
+        length_aware = None if use_gluon_3d else _length_aware_split(config, params)
+        if length_aware is not None:
+            split_budget, NUM_SEGMENTS = length_aware
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -488,6 +562,7 @@ def unified_attention(
                 segm_expsum,
                 NUM_SEGMENTS,
                 TILE_SIZE,
+                split_budget,
             )
 
         if NUM_SEGMENTS == 1:
@@ -520,6 +595,7 @@ def unified_attention(
                 segm_expsum,
                 NUM_SEGMENTS,
                 TILE_SIZE,
+                split_budget,
             )
     return out
 
@@ -530,8 +606,10 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
     # arch-specific gates
     use_gluon_arch = False
     if DEVICE_ARCH == "gfx1250":
+        # The gfx1250 Gluon kernels are not validated for non-causal attention.
         use_gluon_arch = (
             _unified_attention_kernel_2d_gfx1250 is not None
+            and params.causal
             and not params.softcap
             and not params.use_qq_bias
             and not params.use_alibi_slopes
@@ -554,6 +632,7 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
     if DEVICE_ARCH == "gfx1250":
         use_gluon_arch = (
             _unified_attention_kernel_3d_gfx1250 is not None
+            and params.causal
             and params.shuffled_kv_cache
         )
     elif DEVICE_ARCH == "gfx950":
@@ -656,6 +735,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        CAUSAL=params.causal,
         **config,
         enable_fp_fusion=True,
     )
@@ -668,8 +748,10 @@ def _unified_attention_3d_triton(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    split_budget=None,
 ):
     config = get_unified_attention_config("attn_3d", params, backend="triton")
+    split_runs_per_xcd = config.pop("SPLIT_RUNS_PER_XCD", None)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -680,10 +762,36 @@ def _unified_attention_3d_triton(
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
+    grid = (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
+    length_aware = {}
+    if split_budget is not None:
+        # one program per (sequence, segment) work item and KV head: the
+        # per-sequence floor shares sum to at most split_budget + num_seqs, and
+        # no sequence takes more than NUM_SEGMENTS. Items are dealt out in runs
+        # of ITEM_RUN, once per head; a multiple of the XCD count keeps every
+        # head of an item on one XCD, so they share its L2.
+        assert (
+            split_runs_per_xcd is not None
+        ), "a length-aware split needs SPLIT_RUNS_PER_XCD in the attn_3d config"
+        num_xcds = get_num_xcds()
+        num_items = min(split_budget + params.num_seqs, params.num_seqs * NUM_SEGMENTS)
+        # a batch with fewer items than a full run takes a shorter one, so the
+        # padding does not launch idle programs for every KV head
+        runs = min(
+            split_runs_per_xcd, triton.next_power_of_2(triton.cdiv(num_items, num_xcds))
+        )
+        item_run = runs * num_xcds
+        num_items = triton.cdiv(num_items, item_run) * item_run
+        grid = (num_items * params.num_kv_heads, 1, 1)
+        length_aware = {
+            "split_budget": split_budget,
+            "LENGTH_AWARE_SPLIT": True,
+            "SEQ_BLOCK": _length_aware_seq_block(params.num_seqs),
+            "ITEM_RUN": item_run,
+            "num_tokens": params.num_tokens,
+        }
 
-    kernel_unified_attention_3d[
-        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
-    ](
+    kernel_unified_attention_3d[grid](
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
@@ -738,6 +846,8 @@ def _unified_attention_3d_triton(
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
+        **length_aware,
+        CAUSAL=params.causal,
         **config,
         enable_fp_fusion=True,
     )
@@ -750,9 +860,28 @@ def _reduce_segments_triton(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    split_budget=None,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
+    split_segment_block_min = config.pop("SPLIT_SEGMENT_BLOCK_MIN", None)
+    length_aware = {}
+    if split_budget is not None:
+        # merge as many slots per step as a sequence of an even batch uses, so
+        # the usual merge is one step and only an outsized sequence loops
+        assert (
+            split_segment_block_min is not None
+        ), "a length-aware split needs SPLIT_SEGMENT_BLOCK_MIN in the reduce config"
+        even_share = triton.cdiv(split_budget, params.num_seqs)
+        length_aware = {
+            "split_budget": split_budget,
+            "LENGTH_AWARE_SPLIT": True,
+            "SEQ_BLOCK": _length_aware_seq_block(params.num_seqs),
+            "LENGTH_AWARE_SEGMENT_BLOCK": min(
+                NUM_SEGMENTS,
+                max(split_segment_block_min, triton.next_power_of_2(even_share)),
+            ),
+        }
     v_head_size_padded = triton.next_power_of_2(params.head_size_v)
     num_d_blocks = triton.cdiv(
         v_head_size_padded, config.get("BLOCK_D") or v_head_size_padded
@@ -778,6 +907,7 @@ def _reduce_segments_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         BLOCK_Q=None,
+        **length_aware,
         **config,
         enable_fp_fusion=True,
     )

@@ -153,6 +153,8 @@ def _mode_label(args):
         parts.append("fp8out")
     if args.shuffled_kv_cache:
         parts.append("shuffled")
+    if args.non_causal:
+        parts.append("noncausal")
     return "_".join(parts) + "_fwd"
 
 
@@ -305,7 +307,7 @@ def run_benchmark(custom, args):
                 max_seqlen_q=inputs["max_query_len"],
                 max_seqlen_k=inputs["max_kv_len"],
                 softmax_scale=inputs["scale"],
-                causal=True,
+                causal=not args.non_causal,
                 window_size=window_size,
                 block_table=inputs["block_tables"],
                 softcap=0,
@@ -344,6 +346,7 @@ def run_benchmark(custom, args):
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
                 out_dtype=inputs["output"].dtype,
+                causal=0 if args.non_causal else 1,
             )
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
@@ -373,7 +376,10 @@ def run_benchmark(custom, args):
         for i in range(num_contexts):
             sq = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
             sk = seqlens_k[i].item()
-            if window is None:
+            if args.non_causal:
+                valid = sq * sk
+                kv_read = sk
+            elif window is None:
                 valid = sq * sk - ((sq**2 - sq) / 2)
                 kv_read = sk
             else:
@@ -496,6 +502,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Pre-shuffle the KV cache into the layout the gluon kernels expect",
     )
+    parser.add_argument(
+        "-non_causal",
+        action="store_true",
+        default=False,
+        help="Let each query token attend to all keys of its sequence",
+    )
 
     return parser.parse_args(args=args)
 
@@ -507,6 +519,11 @@ def main(args: list[str] | None = None) -> None:
         raise ValueError(
             "-fp8 already quantizes K/V; -fp8_kv is redundant. Use one or the other."
         )
+    # A window of 0 or less means no window.
+    if args.sliding_window is not None and args.sliding_window <= 0:
+        args.sliding_window = None
+    if args.non_causal and args.sliding_window is not None:
+        raise ValueError("-non_causal does not support -sliding_window.")
 
     custom_config = False
 
