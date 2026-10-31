@@ -75,12 +75,14 @@ _FILLS = (
     "neg_underflow",
     "overflow_512",
     "zeros",
+    "large_every_rank",
 )
 _CODEC_FILL_CASES = (
     ("pos_underflow", "pos-underflow-2^-8"),
     ("neg_underflow", "neg-underflow-2^-8"),
     ("overflow_512", "overflow-512"),
     ("zeros", "true-zero-scale"),
+    ("large_every_rank", "every-rank-2048"),
 )
 # (512, 5120) runs ST=1 and (32768, 5120) runs ST=8.
 _DIVISOR_SHAPES = [(512, 5120), (32768, 5120)]
@@ -110,11 +112,13 @@ def _make_inp(
     elif fill == "neg_underflow":
         val = -(2.0**-8)
     elif fill == "overflow_512":
-        # Drives the E4M3 scale above its largest exponent, which the encoder
-        # has to saturate. Only rank 0 carries the value: if every rank sent
-        # 512 the reduced sum would also saturate the INT4 group codec, and
-        # the case would fail on codec range rather than on scale encoding.
+        # A rank-0 partial above 480, the largest E4M3 group scale; the E5M2
+        # scale holds it. Only rank 0 carries the value.
         val = 512.0 if rank == 0 else 0.0
+    elif fill == "large_every_rank":
+        # Every partial and the reduced sum above 480: an E4M3 group scale
+        # clipped both (MiniMax-M3 all-reduce outputs reach ~16k).
+        val = 2048.0
     elif fill == "zeros":
         val = 0.0
     else:
