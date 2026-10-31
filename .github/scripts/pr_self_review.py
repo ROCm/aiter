@@ -61,6 +61,27 @@ REQUIRED_CHECKS = {
 }
 PASS_CONCLUSIONS = {"success"}
 
+# Pure CI or documentation changes never trigger the Aiter Test workflow, so its gate
+# check-run structurally cannot exist on such PRs. Keeping it required there makes those
+# PRs permanently "not ready" -- a false positive with no CI signal to wait for.
+CI_ONLY_PREFIXES = (".github/", "docs/")
+CI_ONLY_SUFFIXES = (".md", ".rst")
+
+
+def required_checks(paths: list[str]) -> dict[str, set[str]]:
+    """Drop the Aiter Test Gate requirement when all changed paths are CI-only or
+    documentation; everything else keeps the full four-check requirement."""
+    if paths and all(
+        path.startswith(CI_ONLY_PREFIXES) or path.endswith(CI_ONLY_SUFFIXES)
+        for path in paths
+    ):
+        return {
+            label: aliases
+            for label, aliases in REQUIRED_CHECKS.items()
+            if label != "Aiter Test Gate"
+        }
+    return REQUIRED_CHECKS
+
 
 class APIError(RuntimeError):
     pass
@@ -432,13 +453,17 @@ def inspect_copilot(
     return issues[:20], advisories[:20]
 
 
-def inspect_ci(api: GitHub, head_sha: str) -> dict[str, str]:
+def inspect_ci(
+    api: GitHub, head_sha: str, required: dict[str, set[str]] | None = None
+) -> dict[str, str]:
+    if required is None:
+        required = REQUIRED_CHECKS
     if not head_sha:
-        return {name: "missing" for name in REQUIRED_CHECKS}
+        return {name: "missing" for name in required}
     result = api.request(f"commits/{head_sha}/check-runs?filter=latest&per_page=100")
     runs = result.get("check_runs") if isinstance(result, dict) else []
     states: dict[str, str] = {}
-    for label, aliases in REQUIRED_CHECKS.items():
+    for label, aliases in required.items():
         matches = [run for run in runs or [] if run.get("name") in aliases]
         if not matches:
             states[label] = "missing"
@@ -492,10 +517,11 @@ def evaluate(api: GitHub, number: int, mode: str) -> Result:
     )
     copilot_issues, copilot_advisories = inspect_copilot(api, number, author)
     ci_unavailable = False
+    required = required_checks(paths)
     try:
-        ci = inspect_ci(api, head_sha)
+        ci = inspect_ci(api, head_sha, required)
     except APIError:
-        ci = {name: "unavailable" for name in REQUIRED_CHECKS}
+        ci = {name: "unavailable" for name in required}
         ci_unavailable = True
     result = Result(
         head_sha=head_sha,
