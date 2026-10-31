@@ -10,15 +10,23 @@ Usage:
     python bench_mhc_dsv4.py --metric bandwidth
 """
 
+import functools
+
 import torch
 import triton
 
 from aiter.ops.triton.fusions.mhc import mhc_head_dsv4, mhc_post_dsv4, mhc_pre_dsv4
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 # DSV4 representative shapes: (M, n, C)
 _SHAPES = [
@@ -49,10 +57,20 @@ def _make_head_inputs(M, n, C, dtype, device="cuda"):
     return residual, fn, scale, base
 
 
+def _make_post_inputs(M, n, C, dtype, device="cuda"):
+    residual = torch.randn(M, n, C, dtype=dtype, device=device) * 0.1
+    post_mix = torch.randn(M, n, 1, dtype=torch.float32, device=device)
+    comb_mix = torch.randn(M, n, n, dtype=torch.float32, device=device)
+    layer_input = torch.randn(M, C, dtype=dtype, device=device)
+    return layer_input, residual, post_mix, comb_mix
+
+
 def benchmark(args):
     op = args.op
     unit = "ms" if args.metric == "time" else "GB/s"
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     x_vals = [(M, n, C) for M, n, C in _SHAPES]
 
@@ -70,47 +88,41 @@ def benchmark(args):
 
     @triton.testing.perf_report([config])
     def _run(M, n, C, provider):
+        hp = dtype.itemsize
         if op == "pre":
-            residual, fn, scale, base = _make_pre_inputs(M, n, C, dtype)
-            fn_b = lambda: mhc_pre_dsv4(residual, fn, scale, base)
+            _p_gen = functools.partial(_make_pre_inputs, M, n, C, dtype)
+            _out_val_keys = ["residual", "fn", "scale", "base"]
+            kernel_fn = mhc_pre_dsv4
             rows = 2 * n + n * n
             # reads: residual + fn + scale + base; writes: post_mix + comb_mix + layer_input
             mem = (
-                M * n * C * residual.element_size()
+                M * n * C * hp
                 + rows * n * C * 4
                 + 3 * 4
                 + rows * 4
                 + M * n * 4  # post_mix fp32
                 + M * n * n * 4  # comb_mix fp32
-                + M * C * residual.element_size()  # layer_input
+                + M * C * hp  # layer_input
             )
         elif op == "post":
-            residual, fn, scale, base = _make_pre_inputs(M, n, C, dtype)
-            post_mix = torch.randn(M, n, 1, dtype=torch.float32, device="cuda")
-            comb_mix = torch.randn(M, n, n, dtype=torch.float32, device="cuda")
-            layer_input = torch.randn(M, C, dtype=dtype, device="cuda")
-            fn_b = lambda: mhc_post_dsv4(layer_input, residual, post_mix, comb_mix)
+            _p_gen = functools.partial(_make_post_inputs, M, n, C, dtype)
+            _out_val_keys = ["layer_input", "residual", "post_mix", "comb_mix"]
+            kernel_fn = mhc_post_dsv4
             # reads: layer_input + residual + post_mix + comb_mix; writes: output
             mem = (
-                M * C * residual.element_size()
-                + M * n * C * residual.element_size()
-                + M * n * 4
-                + M * n * n * 4
-                + M * n * C * residual.element_size()
+                M * C * hp + M * n * C * hp + M * n * 4 + M * n * n * 4 + M * n * C * hp
             )
         else:  # head
-            residual, fn, scale, base = _make_head_inputs(M, n, C, dtype)
-            fn_b = lambda: mhc_head_dsv4(residual, fn, scale, base)
+            _p_gen = functools.partial(_make_head_inputs, M, n, C, dtype)
+            _out_val_keys = ["residual", "fn", "scale", "base"]
+            kernel_fn = mhc_head_dsv4
             # reads: residual + fn + scale + base; writes: output
-            mem = (
-                M * n * C * residual.element_size()
-                + n * n * C * 4
-                + 1 * 4
-                + n * 4
-                + M * C * residual.element_size()
-            )
+            mem = M * n * C * hp + n * n * C * 4 + 1 * 4 + n * 4 + M * C * hp
 
-        ms = triton.testing.do_bench(fn_b, warmup=25, rep=100)
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+        )
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         if args.metric == "time":
             return ms
         return mem * 1e-9 / (ms * 1e-3)
