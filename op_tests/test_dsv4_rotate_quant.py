@@ -294,7 +294,7 @@ def test_rope_fp4quant_round_rope(
         rope_dim,
         out_scale=scale,
         group_size=32,
-        shuffle_scale=shuffle_scale,
+        scale_layout="flydsl" if shuffle_scale else "none",
         do_rotate_act=False,
         round_rope=True,
     )
@@ -350,7 +350,7 @@ def test_rope_rotate_fp4quant(
         rope_dim,
         out_scale=scale,
         group_size=32,
-        shuffle_scale=shuffle_scale,
+        scale_layout="flydsl" if shuffle_scale else "none",
     )
     err = checkAllclose(
         mxfp4_to_f32(y_ref),
