@@ -1215,6 +1215,23 @@ def mla_decode_fwd(
             num_kv_splits, num_kv_splits_indptr = get_meta_param(
                 num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
             )
+        if (
+            return_lse
+            and num_kv_splits == 1
+            and nhead in (64, 128)
+            and q.dtype == dtypes.bf16
+            and kv_buffer.dtype == dtypes.bf16
+            and not kv_shuffled_flag
+        ):
+            # With one KV split, the BF16 QH64 and QH128 stage-1 kernels write
+            # the final output directly and skip the per-split LSE, so the
+            # returned LSE would be uninitialized memory. Two splits run the
+            # stage-2 merge, which writes the same output and the LSE.
+            num_kv_splits = 2
+            num_kv_splits_indptr = torch.arange(
+                0, (bs + 1) * num_kv_splits, num_kv_splits,
+                dtype=torch.int32, device=device,
+            )  # fmt: skip
         mgc = (
             64
             if nhead in [8, 16]
