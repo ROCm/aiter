@@ -28,6 +28,8 @@ static inline int map_activation_to_ck_stage1(int activation)
         return 3;
     case ActivationType::GeluTanh:
         return 4;
+    case ActivationType::Relu2:
+        return 5;
     default:
         TORCH_CHECK(false, "Unsupported activation for ck_moe_stage1: ", activation);
         return -1;
@@ -103,8 +105,9 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     int tokens = hidden_states.size(0);
     int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
-    int N = w1.size(1) / 2;
     int K = hidden_states.size(-1);
+    bool is_gated_activation = static_cast<ActivationType>(activation) != ActivationType::Relu2;
+    int N = is_gated_activation ? w1.size(1) / 2 : w1.size(1);
     int MPerBlock = block_m.value();
 
     void *hidden_states_ptr = hidden_states.data_ptr();
