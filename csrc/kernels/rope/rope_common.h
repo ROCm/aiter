@@ -7401,7 +7401,8 @@ struct alignas(sizeof(T) * vec_size) vec_t
             for(int i = 0; i < vec_size; ++i)
                 data[i] = src[i];
         }
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx942__) || defined(__gfx950__))
+#if defined(__HIP_DEVICE_COMPILE__) && \
+    (defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__))
         else if constexpr((std::is_same_v<T, fp8e4m3fnuz> || std::is_same_v<T, fp8e4m3fn>) &&
                           (vec_size % 2 == 0))
         {
@@ -7862,7 +7863,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int64_t v_head_stride    = 0,
                                           bool v_norm              = false,
                                           KVT* q_out_fp8           = nullptr,
-                                          const float* per_tensor_q_scale = nullptr)
+                                          const float* per_tensor_q_scale = nullptr,
+                                          int64_t qkv_token_stride = 0)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -7911,8 +7913,13 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
     const int access_id_in_head = (threadIdx.x % WARP_SIZE) * VEC_SIZE;
     const int neighbor_offset =
         access_id_in_head < HALF_HEAD_SIZE ? HALF_HEAD_SIZE / VEC_SIZE : -HALF_HEAD_SIZE / VEC_SIZE;
-    const T* qkv_ =
-        &qkv[(static_cast<int64_t>(token_id) * num_heads + head_id_in_token) * HEAD_SIZE];
+    // A token's q|k|v heads are contiguous; its row may be longer (a strided view of a
+    // wider projection output, e.g. one that also holds an output gate).
+    const int64_t qkv_row = qkv_token_stride != 0
+                                ? qkv_token_stride
+                                : static_cast<int64_t>(num_heads) * HEAD_SIZE;
+    const T* qkv_ = &qkv[static_cast<int64_t>(token_id) * qkv_row +
+                         static_cast<int64_t>(head_id_in_token) * HEAD_SIZE];
 
     if(!is_v)
     {
@@ -8226,7 +8233,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             int64_t k_token_stride   = 0,
                             int64_t k_head_stride    = 0,
                             int64_t v_token_stride   = 0,
-                            int64_t v_head_stride    = 0)
+                            int64_t v_head_stride    = 0,
+                            KVT* q_out_fp8           = nullptr,
+                            const float* per_tensor_q_scale = nullptr,
+                            int64_t qkv_token_stride = 0)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     // po2_div/po2_mod in the paged and shuffle-layout address math assume these are
@@ -8250,10 +8260,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
     dim3 threadsPerBlock(THREAD_BLOCK_SIZE);
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
 
-#define DISPATCH_NEOX(HEAD_SIZE, IS_INTERLEAVED)                                     \
+#define DISPATCH_NEOX(HEAD_SIZE, IS_INTERLEAVED, HAS_QFP8)                                   \
     if(is_neox_style)                                                                \
     {                                                                                \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, true, IS_INTERLEAVED, M, KVT>  \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, true, IS_INTERLEAVED, M, KVT, HAS_QFP8> \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                         \
                                                         q_w,                         \
                                                         k_w,                         \
@@ -8286,11 +8296,15 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         k_token_stride,              \
                                                         k_head_stride,               \
                                                         v_token_stride,              \
-                                                        v_head_stride);              \
+                                                        v_head_stride,               \
+                                                        false,                       \
+                                                        q_out_fp8,                   \
+                                                        per_tensor_q_scale,          \
+                                                        qkv_token_stride);           \
     }                                                                                \
     else                                                                             \
     {                                                                                \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, true, IS_INTERLEAVED, M, KVT> \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, true, IS_INTERLEAVED, M, KVT, HAS_QFP8>\
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                         \
                                                         q_w,                         \
                                                         k_w,                         \
@@ -8323,27 +8337,53 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         k_token_stride,              \
                                                         k_head_stride,               \
                                                         v_token_stride,              \
-                                                        v_head_stride);              \
+                                                        v_head_stride,               \
+                                                        false,                       \
+                                                        q_out_fp8,                   \
+                                                        per_tensor_q_scale,          \
+                                                        qkv_token_stride);           \
     }
 
-    if(is_interleaved)
+#define DISPATCH_HEADS(HAS_QFP8)                                   \
+    if(is_interleaved)                                             \
+    {                                                              \
+        switch(head_size)                                          \
+        {                                                          \
+        case 64: DISPATCH_NEOX(64, true, HAS_QFP8) break;          \
+        case 128: DISPATCH_NEOX(128, true, HAS_QFP8) break;        \
+        case 256: DISPATCH_NEOX(256, true, HAS_QFP8) break;        \
+        }                                                          \
+    }                                                              \
+    else                                                           \
+    {                                                              \
+        switch(head_size)                                          \
+        {                                                          \
+        case 64: DISPATCH_NEOX(64, false, HAS_QFP8) break;         \
+        case 128: DISPATCH_NEOX(128, false, HAS_QFP8) break;       \
+        case 256: DISPATCH_NEOX(256, false, HAS_QFP8) break;       \
+        }                                                          \
+    }
+
+    // Q in the cache dtype as well (the fp8 epilogue): only an fp8 cache instantiates it.
+    AITER_CHECK((q_out_fp8 == nullptr) == (per_tensor_q_scale == nullptr),
+                "q_out_fp8 and per_tensor_q_scale go together");
+    if constexpr(!std::is_same_v<KVT, T>)
     {
-        switch(head_size)
+        if(q_out_fp8 != nullptr)
         {
-        case 64: DISPATCH_NEOX(64, true) break;
-        case 128: DISPATCH_NEOX(128, true) break;
-        case 256: DISPATCH_NEOX(256, true) break;
+            DISPATCH_HEADS(true)
+        }
+        else
+        {
+            DISPATCH_HEADS(false)
         }
     }
     else
     {
-        switch(head_size)
-        {
-        case 64: DISPATCH_NEOX(64, false) break;
-        case 128: DISPATCH_NEOX(128, false) break;
-        case 256: DISPATCH_NEOX(256, false) break;
-        }
+        AITER_CHECK(q_out_fp8 == nullptr, "q_out_fp8 needs an fp8 cache");
+        DISPATCH_HEADS(false)
     }
+#undef DISPATCH_HEADS
 
 #undef DISPATCH_NEOX
 }
