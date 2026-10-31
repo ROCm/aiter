@@ -12,9 +12,10 @@ fp32 NCCL all-reduce of the same per-rank inputs. INT4 is lossy, so
 validity uses SQNR, a calibrated mismatch ratio, and a per-tile SQNR
 floor.
 
-The divisor cases run at TP 8: an outlier fill that clips the E4M3 scale
-at divisor 1 must recover SQNR at divisor 8, and a small-magnitude fill
-must keep full SQNR at the default divisor.
+The divisor cases run at TP 8: with the E5M2 group scale an outlier fill
+no longer clips at divisor 1, so divisor 1 must reach the SQNR floor and the
+opt-in divisor 8 must not lose more than 1 dB against it; a small-magnitude
+fill must keep full SQNR at the default divisor.
 
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
 requires. QuickAllReduceInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other
@@ -513,11 +514,16 @@ def main():
                 fixed,
                 _OUTLIER_DIVISOR,
             )
-            if fixed - base < 3.0:
+            if base < SQNR_MIN_DB:
+                raise AssertionError(
+                    f"outlier tokens={tokens} hidden={hidden}: SQNR {base:.2f} dB "
+                    f"at divisor 1 < {SQNR_MIN_DB}; the group scale clips"
+                )
+            if fixed < base - 1.0:
                 raise AssertionError(
                     f"outlier tokens={tokens} hidden={hidden}: divisor "
                     f"{_OUTLIER_DIVISOR} gives {fixed:.2f} dB vs {base:.2f} dB "
-                    "at divisor 1; expected the E4M3 clip to be recovered"
+                    "at divisor 1; the opt-in divisor should not cost precision"
                 )
 
     for dtype in args.dtype:
