@@ -2,7 +2,7 @@ import functools
 
 import triton
 
-from aiter.ops.triton.normalization.fused_rmsnorm_add import fused_rmsnorm_add
+from aiter.ops.triton.fusions.fused_rmsnorm_add import fused_rmsnorm_add
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_do_bench_graph_kwargs,
@@ -16,7 +16,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
 )
-from op_tests.triton_tests.normalization.test_fused_rmsnorm_add import (
+from op_tests.triton_tests.fusions.test_fused_rmsnorm_add import (
     generate_fused_rmsnorm_add_inputs,
 )
 
@@ -36,6 +36,10 @@ def get_x_vals():
         (8192, 16384),
         (256, 32768),
         # model_shapes hidden sizes
+        (1, 2048),
+        (256, 2048),
+        (1024, 2048),
+        (2048, 2048),
         (8192, 2880),
         (8192, 7168),
         (4096, 5120),
