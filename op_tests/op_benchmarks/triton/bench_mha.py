@@ -47,6 +47,7 @@ class BenchRun:
     print_vgpr: bool
     bench_torch: bool
     backend: str = "triton"
+    shared_k_pe: bool = False
 
 
 VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
@@ -206,6 +207,7 @@ def _make_varlen_fn(q, k, v, **kw):
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
         backend=kw.get("backend"),
+        k_pe=kw.get("k_pe"),
     )
 
 
@@ -374,7 +376,8 @@ def model_benchmark_configs(
             b = args.b if args.b else 1
             causal = args.causal if args.causal is not None else True
             workloads = [
-                (b, args.sq, args.sk if args.sk else args.sq, causal, functions)
+                (b, sq, sk if sk else sq, causal, functions)
+                for sq, sk in itertools.product(args.sq, args.sk or [0])
             ]
         else:
             # Realistic serving on MI350 node: 8192 token budget per step, 64 concurrent decodes
@@ -674,6 +677,19 @@ def run_benchmark(run: BenchRun):
         if is_gluon and (is_bwd or is_decode):
             warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
             return 0
+        # The gfx1250 Gluon kernel covers only the MLA prefill shapes of fwd_varlen.
+        if is_gluon and get_arch().name == "gfx1250" and (
+            not is_varlen or has_sliding_window or run.sink or dtype != "bf16"
+        ):
+            warnings.warn(
+                "Skipping: the gfx1250 Gluon backend supports only bf16 fwd_varlen "
+                "without a sliding window or sink."
+            )
+            return 0
+        pe_dim = D_HEAD - D_HEAD_V
+        if run.shared_k_pe and (not is_varlen or is_bwd or pe_dim <= 0):
+            warnings.warn("Skipping: -shared_k_pe needs fwd_varlen and -d > -dv.")
+            return 0
         mha_set_use_fused_bwd_kernel(fused)
         make_fn = get_make_fn(function, dtype, run.backend)
 
@@ -759,6 +775,11 @@ def run_benchmark(run: BenchRun):
             v_unpad.requires_grad = requires_grad
 
             q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
+            k_pe = None
+            if run.shared_k_pe:
+                # MLA layout: K without its PE columns, and one PE part for all heads
+                k_pe = k_unpad[:, :1, D_HEAD - pe_dim :].contiguous()
+                k_input = k_unpad[..., : D_HEAD - pe_dim].contiguous()
 
             num_contexts = len(cu_seqlens_q) - 1
             for i in range(num_contexts):
@@ -784,6 +805,7 @@ def run_benchmark(run: BenchRun):
                 "has_pe": has_pe,
                 "has_sink": run.sink,
                 "backend": run.backend,
+                "k_pe": k_pe,
                 "cu_seqlens_q": cu_seqlens_q,
                 "cu_seqlens_k": cu_seqlens_k,
                 "max_seqlen_q": max_seqlen_q,
@@ -887,6 +909,10 @@ def run_benchmark(run: BenchRun):
             total_num_tokens_k = BATCH * N_CTX_K
         q_size = total_num_tokens_q * HQ * D_HEAD * q.element_size()
         k_size = total_num_tokens_k * HK * D_HEAD * k.element_size()
+        if run.shared_k_pe:
+            k_size = (
+                total_num_tokens_k * (HK * D_HEAD_V + D_HEAD - D_HEAD_V) * k.element_size()
+            )
         v_size = total_num_tokens_k * HK * D_HEAD_V * v.element_size()
         o_size = total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
         if is_bwd:
@@ -917,6 +943,10 @@ def run_benchmark(run: BenchRun):
 
 
 # argparse lacks support for boolean argument type (sigh...)
+def int_list(v: str) -> list[int]:
+    return [int(x) for x in v.split(",") if x]
+
+
 def str2bool(v):
     if isinstance(v, bool) or v is None:
         return v
@@ -948,8 +978,18 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
-    parser.add_argument("-sq", type=int, default=0)
-    parser.add_argument("-sk", type=int, default=0)
+    parser.add_argument(
+        "-sq",
+        type=int_list,
+        default=[],
+        help="Q sequence length, or a comma-separated list of lengths",
+    )
+    parser.add_argument(
+        "-sk",
+        type=int_list,
+        default=[],
+        help="K sequence length, or a comma-separated list (default: sq)",
+    )
     parser.add_argument(
         "-equal_seqlens",
         action="store_true",
@@ -1031,7 +1071,15 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         default="triton",
         choices=["triton", "gluon"],
         help="Attention backend: 'triton' (default) or 'gluon' "
-        "(forward-only gfx950 kernel; only fwd / fwd_varlen).",
+        "(forward-only; gfx950: fwd / fwd_varlen; gfx1250: bf16 fwd_varlen with "
+        "-d 192 -dv 128 or 192 and -hk = -hq).",
+    )
+    parser.add_argument(
+        "-shared_k_pe",
+        action="store_true",
+        default=False,
+        help="fwd_varlen only: give K without its last (d - dv) PE columns, plus "
+        "one PE part shared by all heads (k_pe), as in MLA prefill.",
     )
     parsed = parser.parse_args(args=args)
 
@@ -1081,7 +1129,6 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
 
     if custom:
         hk = parsed.hk if parsed.hk else parsed.hq
-        sk = parsed.sk if parsed.sk else parsed.sq
         causals = [parsed.causal] if parsed.causal is not None else [False, True]
         configs = [
             BenchConfig(
@@ -1089,8 +1136,8 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
                 batch=parsed.b,
                 hq=parsed.hq,
                 hk=hk,
-                sq=parsed.sq,
-                sk=sk,
+                sq=sq,
+                sk=sk if sk else sq,
                 d_head=d_head,
                 d_head_v=d_head_v,
                 causal=c,
@@ -1103,6 +1150,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
             )
             for c, fn, d in itertools.product(causals, functions, dtypes)
             for wl, wr in windows
+            for sq, sk in itertools.product(parsed.sq, parsed.sk or [0])
         ]
     elif parsed.model:
         configs = model_benchmark_configs(
@@ -1136,6 +1184,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         print_vgpr=parsed.print_vgpr,
         bench_torch=parsed.bench_torch,
         backend=parsed.backend,
+        shared_k_pe=parsed.shared_k_pe,
     )
 
 

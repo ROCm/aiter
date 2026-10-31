@@ -1,0 +1,51 @@
+{
+  "fwd": {
+    "pe_narrow_v_causal": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 2,
+      "PERSISTENT": true,
+      "WG_PER_CU": 2
+    },
+    "pe_causal": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 1,
+      "PERSISTENT": true,
+      "WG_PER_CU": 1
+    },
+    "short_max_seqlen_k": 2048,
+    "pe_narrow_v_short": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 2,
+      "PERSISTENT": false
+    },
+    "pe_short": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 1,
+      "PERSISTENT": false
+    },
+    "pe_narrow_v": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 1,
+      "PERSISTENT": false
+    },
+    "pe": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 1,
+      "PERSISTENT": false
+    },
+    "split_kv_max_num_splits": 8,
+    "split_kv_min_tiles_per_split": 16
+  }
+}
