@@ -240,7 +240,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             else
             {
                 using Traits =
-                    opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 8, D_ATTN, true>;
+                    opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 4, D_ATTN, true>;
                 dim3 grid(N, ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M), num_splits);
                 opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel<Traits>
                     <<<grid, Traits::BLOCK_SIZE, 0, stream>>>(split_kargs);
@@ -278,7 +278,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                    opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits, 64, 4);
     else
         LAUNCH_OPUS_MLA_V4_PREFILL(opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel,
-                                   opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits, 32, 8);
+                                   opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits, 32, 4);
 
 #undef LAUNCH_OPUS_MLA_V4_PREFILL
 }
