@@ -793,6 +793,108 @@ def test_triton_unified_attn_3d_length_aware_split(
         assert rel_err < 2e-2, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
 
 
+@torch.inference_mode()
+def test_triton_unified_attn_3d_length_aware_split_graph_replay() -> None:
+    """A CUDA graph captured at the 1M bound splits by the seqused_k of each replay.
+
+    A serving engine changes the lengths in place between replays, from a skewed
+    batch to a uniform one and back.
+    """
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("the length-aware kv_split entry is tuned for gfx950")
+    torch.cuda.empty_cache()
+    block_size, query_len = 128, 4
+    skewed = _length_aware_seq_lens("skewed", query_len)
+    batches = [skewed, _length_aware_seq_lens("uniform", query_len), skewed]
+    max_blocks = max(triton.cdiv(kv, block_size) for b in batches for _, kv in b)
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        _,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=skewed,
+        num_blocks=max_blocks * len(skewed),
+        block_size=block_size,
+        head_size=64,
+        num_heads=(8, 2),
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+    )
+
+    def run():
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=1 << 20,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()  # compile outside the capture
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for batch in batches:
+        kv = [k for _, k in batch]
+        kv_lens.copy_(torch.tensor(kv, dtype=kv_lens.dtype, device="cuda"))
+        output.zero_()
+        graph.replay()
+        ref_output = ref_paged_attn(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            query_lens=[q for q, _ in batch],
+            kv_lens=kv,
+            block_tables=block_tables,
+            scale=scale,
+            out_dtype=torch.bfloat16,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        start = 0
+        for q_len, kv_len in batch:
+            out_rows = output[start : start + q_len].float()
+            ref_rows = ref_output[start : start + q_len].float()
+            start += q_len
+            rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
+            assert rel_err < 2e-2, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+
+
 def _gfx950_split(**overrides):
     """gfx950 Triton kv_split config and params, Kimi-K3 draft decode at the 1M bound."""
     p = {
