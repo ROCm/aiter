@@ -2778,6 +2778,43 @@ def decode_update_mla_metadata_v1(
     )
 
 
+@compile_ops("module_hk_mla_verify", develop=True)
+def hk_mla_verify_fwd(
+    # bf16 [bs * 8, 12, 576]
+    q: torch.Tensor,
+    # fp8 [N, ..., 576], page size 1
+    kv: torch.Tensor,
+    # int32 [bs + 1]
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    # fp32 [1]
+    kv_scale: torch.Tensor,
+    # bf16 [bs, nsplit, 96, 512]
+    o_part: torch.Tensor,
+    # fp32 [bs, nsplit, 96], base-2 LSE
+    lse_part: torch.Tensor,
+    # bf16 [bs * 8, 12, 512], written directly when nsplit == 1
+    out: torch.Tensor,
+    nsplit: int,
+    min_chunk: int,
+    sm_scale_log2: float,
+    part8_min: int,
+) -> None: ...
+
+
+@compile_ops("module_hk_mla_verify", develop=True)
+def hk_mla_verify_reduce(
+    o_part: torch.Tensor,
+    lse_part: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_scale: torch.Tensor,
+    out: torch.Tensor,
+    nsplit: int,
+    min_chunk: int,
+    part8_min: int,
+) -> None: ...
+
+
 @compile_ops(
     "module_hk_mla_v32_fwd_mi3xx", fc_name="hk_mla_v32_decode_fwd", develop=True
 )
