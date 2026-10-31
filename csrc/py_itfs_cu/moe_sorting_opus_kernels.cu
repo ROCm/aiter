@@ -12,6 +12,7 @@
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
 
+#include <hip/hip_bfloat16.h>
 #include <string>
 #include <vector>
 
