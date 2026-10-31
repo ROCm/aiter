@@ -1666,6 +1666,53 @@ def test_chunk_fwd_h_beyond_int32_chunk_offsets(seqlens):
         base += -(-seqlen // BT)
 
 
+@pytest.mark.skipif(not IS_AMD, reason="HIP backend requires an AMD device")
+def test_chunk_fwd_h_hip_repeatable():
+    """Identical HIP K5 calls must return bitwise identical h, v_new and final state.
+
+    The batch has sequences with and without a partial last chunk, tail-only
+    sequences and exact chunks, so every reuse of the kernel's shared-memory
+    panels runs. BV is fixed so that the launch does not depend on the device.
+    """
+    from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
+        chunk_local_cumsum,
+    )
+
+    torch.manual_seed(42)
+    seqlens = [5000, 64, 1, 3000, 333, 63, 65, 4096, 2048, 8192, 1024, 64, 640]
+    H, Hg, D = 24, 8, 128
+    T = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0, *itertools.accumulate(seqlens)], device=device, dtype=torch.long
+    )
+    k = F.normalize(torch.randn(1, T, Hg, D, device=device), dim=-1).to(torch.bfloat16)
+    w = (0.05 * torch.randn(1, H, T, D, device=device)).to(torch.bfloat16)
+    u = (0.5 * torch.randn(1, H, T, D, device=device)).to(torch.bfloat16)
+    g = chunk_local_cumsum(
+        -0.1 * F.softplus(torch.randn(1, T, H, device=device)),
+        chunk_size=64,
+        cu_seqlens=cu_seqlens,
+    )
+    initial_state = 0.5 * torch.randn(len(seqlens), H, D, D, device=device)
+
+    def run():
+        return chunk_gated_delta_rule_fwd_h_hip_fn(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            selected_bv=16,
+        )
+
+    first = run()
+    for i in range(1, 10):
+        for name, a, b in zip(("h", "v_new", "final_state"), first, run()):
+            assert torch.equal(a, b), f"{name} of call {i} differs from call 0"
+
+
 @pytest.mark.parametrize(
     "state_dtype",
     [
