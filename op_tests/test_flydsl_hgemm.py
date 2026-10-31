@@ -25,6 +25,11 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_hgemm
+from aiter.ops.flydsl.gemm_kernels import (
+    flydsl_hgemm_supports_shape,
+    get_flydsl_hgemm_kernel_params,
+)
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import gemm_a16w16
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -72,6 +77,8 @@ _TUNED = [
     (800, 384, 7168, 64, 96, 64, 4, 4, 2, 2, 1, 0, False),
     (32, 7168, 2048, 32, 32, 64, 8, 1, 2, 1, 1, 0, False),
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
+    # M * N > 2^31
+    (360448, 6144, 1280, 256, 256, 64, 2, 1, 2, 4, 1, 0, True),
 ]
 _CONCURRENT_COPY_MNK = [(8192, 8192, 128)]
 
@@ -210,6 +217,169 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     return ret
 
 
+def check_shape_limits():
+    params = get_flydsl_hgemm_kernel_params(
+        "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias1_ktail0_gm0_pht_gfx950"
+    )
+    # A must stay below the 4 GiB flat-buffer limit: 1677721 * 1280 * 2 < 2^32.
+    assert flydsl_hgemm_supports_shape(1677721, 6144, 1280, params)
+    assert not flydsl_hgemm_supports_shape(1677722, 6144, 1280, params)
+
+
+def check_input_span():
+    # A strided A spans 4 GiB while M * K * 2 stays below it; no memory needed.
+    a = torch.empty_strided((600000, 1280), (4096, 1), dtype=dtypes.bf16, device="meta")
+    b = torch.empty((256, 1280), dtype=dtypes.bf16, device="meta").t()
+    try:
+        gemm_a16w16(a, b)
+    except ValueError as e:
+        assert "A must span less than 4 GiB" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for a 4 GiB A span")
+
+
+def check_large_a():
+    # A just under 4 GiB: its byte offsets pass 2^31. Checks the first and last rows.
+    m, n, k = 1677721, 256, 1280
+    torch.manual_seed(SEED)
+    a = torch.empty((m, k), dtype=dtypes.bf16).uniform_(-1, 1)
+    w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
+    y = flydsl_hgemm(
+        a,
+        w,
+        block_m=256,
+        block_n=256,
+        block_k=64,
+        stages=2,
+        split_k=1,
+        m_waves=2,
+        n_waves=4,
+        k_waves=1,
+        group_m=0,
+        policy="hti",
+    )
+    rows = torch.cat([torch.arange(1024), torch.arange(m - 1024, m)])
+    atol, rtol = _atol_rtol(k, 1, 1, dtypes.bf16)
+    err = checkAllclose(
+        run_torch(a[rows], w, dtypes.bf16).to(dtypes.fp32),
+        y[rows].to(dtypes.fp32),
+        rtol=rtol,
+        atol=atol,
+        msg=f"{m}x{n}x{k} first and last rows",
+    )
+    assert err == 0
+
+
+def check_strided_out():
+    # A row-strided `out` (a view into a larger buffer) is written in place.
+    for row in _TUNED:
+        m, n, k, policy, split_k, tile = _unpack(row)
+        if (m, n, k, policy, split_k) not in (
+            (32, 14336, 4096, "ft", 1),
+            (4096, 4096, 4096, "hti", 1),
+            (16, 5120, 2880, "ft", 3),
+        ):
+            continue
+        torch.manual_seed(SEED)
+        a = torch.empty((m, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        parent = torch.full(
+            (m + tile["block_m"], n + tile["block_n"]), 4096.0, dtype=dtypes.bf16
+        )
+        out = parent[:m, :n]
+        y = flydsl_hgemm(
+            a,
+            w,
+            out=out,
+            block_m=tile["block_m"],
+            block_n=tile["block_n"],
+            block_k=tile["block_k"],
+            stages=tile["stages"],
+            split_k=tile["split_k"],
+            m_waves=tile["m_waves"],
+            n_waves=tile["n_waves"],
+            k_waves=tile["k_waves"],
+            group_m=tile["group_m"],
+            policy=policy,
+        )
+        assert y is out
+        assert torch.all(parent[m:] == 4096) and torch.all(parent[:, n:] == 4096)
+        atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtypes.bf16)
+        err = checkAllclose(
+            run_torch(a, w, dtypes.bf16).to(dtypes.fp32),
+            y.to(dtypes.fp32),
+            rtol=rtol,
+            atol=atol,
+            msg=f"strided out {m}x{n}x{k} {policy} ks{split_k}",
+        )
+        assert err == 0
+
+
+def _run_tile(a, w, out, policy, tile):
+    return flydsl_hgemm(
+        a,
+        w,
+        out=out,
+        block_m=tile["block_m"],
+        block_n=tile["block_n"],
+        block_k=tile["block_k"],
+        stages=tile["stages"],
+        split_k=tile["split_k"],
+        m_waves=tile["m_waves"],
+        n_waves=tile["n_waves"],
+        k_waves=tile["k_waves"],
+        group_m=tile["group_m"],
+        policy=policy,
+    )
+
+
+def check_out_column_offset():
+    # An out starting at a nonzero column is written in place and nothing outside
+    # it changes. Split-K's atomics need 4-byte alignment, so it starts at column 2.
+    for m, n, k, policy, split_k, col in (
+        (32, 14336, 4096, "ft", 1, 1),
+        (4096, 4096, 4096, "hti", 1, 1),
+        (16, 5120, 2880, "ft", 3, 2),
+    ):
+        tile = _tile_for(m, n, k, policy, split_k)
+        torch.manual_seed(SEED)
+        a = torch.empty((m, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        parent = torch.full((m + 1, n + 64), 4096.0, dtype=dtypes.bf16)
+        out = parent[:m, col : col + n]
+        y = _run_tile(a, w, out, policy, tile)
+        assert y is out
+        outside = torch.ones_like(parent, dtype=torch.bool)
+        outside[:m, col : col + n] = False
+        assert torch.all(parent[outside] == 4096)
+        atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtypes.bf16)
+        err = checkAllclose(
+            run_torch(a, w, dtypes.bf16).to(dtypes.fp32),
+            y.to(dtypes.fp32),
+            rtol=rtol,
+            atol=atol,
+            msg=f"out at column {col} {m}x{n}x{k} {policy} ks{split_k}",
+        )
+        assert err == 0
+
+
+def check_split_k_out_alignment():
+    # Split-K's atomics write 4-byte units, so an out 2 bytes off is rejected.
+    m, n, k = 16, 5120, 2880
+    tile = _tile_for(m, n, k, "ft", 3)
+    a = torch.empty((m, k), dtype=dtypes.bf16)
+    w = torch.empty((n, k), dtype=dtypes.bf16)
+    strided = torch.empty((m, n + 64), dtype=dtypes.bf16)[:, 1 : 1 + n]
+    contiguous = torch.empty(m * n + 1, dtype=dtypes.bf16)[1:].view(m, n)
+    for out in (strided, contiguous):
+        try:
+            _run_tile(a, w, out, "ft", tile)
+        except ValueError as e:
+            assert "4-byte-aligned" in str(e), e
+        else:
+            raise AssertionError(f"expected ValueError for out stride={out.stride()}")
+
+
 @benchmark()
 def test_hgemm_concurrent_copy(m, n, k, dtype):
     # The HTI tail LDS race shows only with exactly two K tiles (no main loop) and
@@ -305,6 +475,13 @@ def main():
     )
     args = parser.parse_args()
     wanted = set(args.mnk)
+    if wanted == set(parser.get_default("mnk")):
+        check_shape_limits()
+        check_input_span()
+        check_strided_out()
+        check_out_column_offset()
+        check_split_k_out_alignment()
+        check_large_a()
 
     for dtype in args.dtype:
         rows = []
