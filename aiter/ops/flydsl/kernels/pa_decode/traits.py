@@ -20,6 +20,10 @@ WAVE = 64
 MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
 LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
+# MXFP4 V staging: per wave and 16-token chunk, all 128 dims as bf16 laid out
+# [16 chunks of 8 dims][16 tokens][16 B] (conflict free for the 16 B row writes
+# and the transposed reads).
+MX_V_CHUNK_BYTES = 16 * 16 * 16
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
@@ -128,6 +132,7 @@ class PaDecodeSchedule:
         sliding_window: int = 0,
         trans_k: bool = True,
         mask_unowned_kv: bool = True,
+        direct_output: bool = False,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
@@ -138,15 +143,17 @@ class PaDecodeSchedule:
             raise NotImplementedError("Non-transposed key cache is not implemented")
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
-        if kv_dtype not in ("fp8", "bf16"):
+        if kv_dtype not in ("fp8", "bf16", "mxfp4"):
             raise ValueError(f"Unsupported PA KV dtype {kv_dtype!r}")
-        is_bf16_kv = kv_dtype == "bf16"
+        is_bf16_kv = kv_dtype in ("bf16", "mxfp4")
         if is_bf16_kv:
             if arch not in BF16_KV_SUPPORTED_ARCHS:
                 raise ValueError(
                     f"BF16 PA decode requires gfx942 or gfx950; got {arch}"
                 )
-            if query_dtype != "bf16":
+            if query_dtype != "bf16" and not (
+                kv_dtype == "mxfp4" and query_dtype == "fp8"
+            ):
                 raise ValueError("BF16 KV requires a BF16 query")
             if per_token_kv:
                 raise ValueError("BF16 KV does not use quantization scales")
@@ -279,7 +286,7 @@ class PaDecodeSchedule:
             not D256_PIPE or query_splits == 1
         ), "the head-256 page-16/64 pipe keeps all query rows in one CTA"
         stage_pages = 0
-        if D256_PIPE and max_context_length is not None:
+        if (D256_PIPE or kv_dtype == "mxfp4") and max_context_length is not None:
             stage_pages = stage_page_capacity(
                 num_seqs,
                 work_capacity,
@@ -289,6 +296,16 @@ class PaDecodeSchedule:
                 sliding_window,
                 query_length,
             )
+        if kv_dtype == "mxfp4":
+            if not stage_pages:
+                raise ValueError(
+                    "MXFP4 PA reads page ids from LDS: pass max_context_length "
+                    "and keep the pages of a task within PAGE_ID_STAGE_LIMIT"
+                )
+            if block_size != 128 or head_dim != 128 or M_TILES != 1:
+                raise NotImplementedError(
+                    "MXFP4 PA supports head_dim 128, block 128, one M-tile"
+                )
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
             D256_PIPE
@@ -347,6 +364,7 @@ class PaDecodeSchedule:
             sliding_window,
             kv_dtype,
             bool(mask_unowned_kv),
+            direct_output,
             D256_PIPE,
             stage_pages,
         )
@@ -390,7 +408,11 @@ class PaDecodeTraits:
     FP8: type
     FP8_MAX: float
     Q_DTYPE: type
+    QFP8: bool
+    DIRECT: bool
     is_bf16_kv: bool
+    MXFP4: bool
+    sMxV_off: int
     KV_DTYPE: type
     KV_VECTOR_WIDTH: int
     QP_ELEM_BYTES: int
@@ -486,12 +508,17 @@ class PaDecodeTraits:
             sliding_window,
             kv_dtype,
             mask_unowned_kv,
+            DIRECT,
             D256_PIPE,
             stage_page_capacity,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
-        is_bf16_kv = kv_dtype == "bf16"
-        IS_BF16 = query_dtype == "bf16"
+        is_bf16_kv = kv_dtype in ("bf16", "mxfp4")
+        MXFP4 = kv_dtype == "mxfp4"
+        # MXFP4 QK is one scaled MFMA (fp4 K x e4m3 Q): a bf16 query is quantized per
+        # row in-kernel like the fp8 path, an "fp8" query is used as stored (scale 1).
+        QFP8 = query_dtype == "fp8"
+        IS_BF16 = query_dtype in ("bf16", "fp8")
         TUNED_SHAPE = (
             not is_bf16_kv and is_gfx950 and head_dim == 128 and block_size in (16, 128)
         )
@@ -524,7 +551,8 @@ class PaDecodeTraits:
         assert query_dtype in (
             "f16",
             "bf16",
-        ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16'), got {query_dtype}"
+            "fp8",
+        ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16', 'fp8'), got {query_dtype}"
         Q_DTYPE = fx.BFloat16 if IS_BF16 else fx.Float16
         KV_DTYPE = fx.BFloat16 if is_bf16_kv else FP8
         KV_VECTOR_WIDTH = 8 if is_bf16_kv else 16
@@ -623,6 +651,8 @@ class PaDecodeTraits:
         VHE_CHUNKS = head_dim // (
             NWARP * MFMA_MNK
         )  # 2 for head_dim=128, 1 for head_dim=64
+        if MXFP4:
+            VHE_CHUNKS = head_dim // MFMA_MNK  # a wave owns its tokens, all dims
         VHE_SIZE = head_dim // VHE_CHUNKS
         OP_ELEMS = MFMA_ACC_ELEMS  # PV C-fragment elements/lane/chunk
         # BF16 has sixteen K16 packs; FP8 has eight K32 or two K128 instructions.
@@ -650,7 +680,7 @@ class PaDecodeTraits:
         SP_ROW_BYTES = TILE_TOK * QP_ELEM_BYTES + 16
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
         sQscale_off = max(sQ_bytes, sP_bytes)
-        sQscale_bytes = 0 if is_bf16_kv else ROWS_PADDED * f32
+        sQscale_bytes = 0 if is_bf16_kv and not MXFP4 else ROWS_PADDED * f32
         # Tuned rows need 16-byte vector alignment; other paths use bank padding.
         NWARP_PAD = NWARP if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
         # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
@@ -674,6 +704,10 @@ class PaDecodeTraits:
         # Page ids for the task's tiles, one i32 each, staged before the loop.
         sPages_off = total_bytes
         total_bytes += stage_page_capacity * 4
+        # MXFP4: wave-private bf16 V staging (it also holds the wave's O at the end).
+        sMxV_off = (total_bytes + 15) // 16 * 16
+        if MXFP4:
+            total_bytes = sMxV_off + NWARP * NCHUNK * MX_V_CHUNK_BYTES
 
         return cls(
             cache_key=cache_key,
@@ -697,7 +731,11 @@ class PaDecodeTraits:
             FP8=FP8,
             FP8_MAX=FP8_MAX,
             Q_DTYPE=Q_DTYPE,
+            QFP8=QFP8,
+            DIRECT=DIRECT,
             is_bf16_kv=is_bf16_kv,
+            MXFP4=MXFP4,
+            sMxV_off=sMxV_off,
             KV_DTYPE=KV_DTYPE,
             KV_VECTOR_WIDTH=KV_VECTOR_WIDTH,
             QP_ELEM_BYTES=QP_ELEM_BYTES,
