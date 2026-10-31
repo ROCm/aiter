@@ -161,7 +161,13 @@ class FMoeKernel
         args.ptr_O      = out->ptr;
         args.ptr_X      = input->ptr;
         args.ptr_GU     = w1->ptr;
-        args.ptr_XC     = num_valid_ids->ptr;
+        // FLAT and EMSORT route directly from raw top-k ids and use the
+        // token-count kernarg.  Their XC[0] ABI is a token count, whereas
+        // num_valid_ids is the host-sorted assignment count (token_cnt * topk).
+        // EMSORT also sizes its leader O-zero sweep from XC[0], so handing it
+        // the assignment count makes that sweep run token_cnt*topk*dim*2 bytes
+        // past the end of out.
+        args.ptr_XC     = this->flat_mode == 0 ? num_valid_ids->ptr : nullptr;
         args.ptr_D      = w2->ptr;
         if constexpr(I_elemSize == 1)
         {
