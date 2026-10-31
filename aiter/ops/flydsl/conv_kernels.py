@@ -43,11 +43,11 @@ from .kernels.conv.conv3d_transpose import (
 
 # TILE_K=32 is mfma_f32_16x16x32_bf16 (CDNA4). Allow-list so an unsupported
 # card fails at the entry, including the 1x1 matmul path.
-SUPPORTED_GFX = ("gfx950",)
+SUPPORTED_GFX = ("gfx950", "gfx1250")
 
 
 def _check_supported_arch():
-    """Refuse an arch whose MFMA this kernel is written against, before compiling."""
+    """Refuse an arch this op has no backend for, before compiling."""
     from aiter.jit.utils.chip_info import get_gfx
 
     # get_gfx matches the tuned table / tuner stamp; strip feature suffixes.
@@ -55,9 +55,16 @@ def _check_supported_arch():
     if gfx not in SUPPORTED_GFX:
         raise RuntimeError(
             f"flydsl_conv_implicit requires one of {list(SUPPORTED_GFX)}, got {gfx}. "
-            f"Its MMA is mfma_f32_16x16x32_bf16 (TILE_K={TILE_K}), which is CDNA4 "
-            f"only; use torch.nn.functional.conv{{1,2,3}}d on this device."
+            f"gfx950 uses mfma_f32_16x16x32_bf16 (TILE_K={TILE_K}); "
+            f"gfx1250 uses wmma_f32_16x16x32_bf16. "
+            f"Use torch.nn.functional.conv{{1,2,3}}d on this device."
         )
+
+
+def _current_gfx():
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx().split(":", 1)[0]
 
 
 # Tuned launch configs from csrc/flydsl_conv3d/conv3d_tune.py, which times
@@ -385,15 +392,15 @@ def _log_tuned_lookup(table, dev, key, hit, borrowed=False):
     if hit is not None:
         splitk = hit[2]
         sk_s = f", splitK={splitk}" if splitk is not None else ""
+        br_s = f", block_rows={hit[3]}" if hit[3] > 1 else ""
         if borrowed:
             logger.info(
                 f"conv3d_implicit: {shape} has no tuned row of its own on "
                 f"gfx={dev[0]}, cu_num={dev[1]}; borrowing this layer's nearest "
-                f"tuned resolution, tile={hit[0]}, wgm={hit[1]}. Tune this shape "
-                f"for the exact config."
+                f"tuned resolution, tile={hit[0]}, wgm={hit[1]}{br_s}. Tune this "
+                f"shape for the exact config."
             )
             return
-        br_s = f", block_rows={hit[3]}" if hit[3] > 1 else ""
         logger.info(
             f"conv3d_implicit: {shape} is tuned on gfx={dev[0]}, "
             f"cu_num={dev[1]}; running tile={hit[0]}, wgm={hit[1]}{sk_s}{br_s}."
@@ -759,6 +766,7 @@ def _conv3d_impl(
     input_layout="NCDHW",
     output_layout="NCDHW",
     block_rows=None,
+    patch_reuse=True,
 ):
     _check_layouts(3, input_layout, output_layout)
 
@@ -877,6 +885,29 @@ def _conv3d_impl(
         if bias is not None:
             y = y + bias.to(y.dtype).view(1, k, 1, 1, 1)
         return y.permute(0, 2, 3, 4, 1).contiguous() if out_ndhwc else y
+
+    # gfx1250: separate TDM+WMMA backend (host pre-pad, NDHWC, C aligned to 32).
+    # Use the already-normalized x / pad_mode / (pt,ph,pw) so asymmetric and
+    # non-zero modes that were materialized above are not padded twice.
+    if _current_gfx() == "gfx1250":
+        from .conv3d_gfx1250 import run_conv3d_gfx1250
+
+        return run_conv3d_gfx1250(
+            x,
+            weight,
+            bias=bias,
+            stride=(st, sh, sw),
+            padding=(pt, ph, pw),
+            dilation=(dt, dh, dw),
+            groups=groups,
+            padding_mode=pad_mode,
+            stream=stream,
+            tile=tile,
+            input_layout="NDHWC" if in_ndhwc else "NCDHW",
+            output_layout=output_layout,
+            block_rows=block_rows,
+            patch_reuse=patch_reuse,
+        )
 
     do = out_extent(d, pt, dt, kt, st)
     ho = out_extent(h, ph, dh, kh, sh)

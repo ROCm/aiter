@@ -202,9 +202,13 @@ Tolerable error ratio against the `torch.nn.functional.conv3d` reference
 (default 0.0, not the usual 0.05). The reference is bf16 rather than fp32 on
 purpose: the tuner needs to catch a config that computes the wrong thing, not to
 measure bf16 rounding, and a matching rounding regime puts every correct
-candidate at exactly 0. Raise it only to investigate a specific failure --
-`op_tests/test_flydsl_conv_implicit.py` fails on any mismatched element, so a
-row tuned under a looser bar is a row that test will reject.
+candidate at exactly 0. Each candidate is scored by `strict_compare`, which
+returns 1.0 on any element outside tolerance: `mp_tuner` rounds the ratio to 4
+decimals, so a plain ratio would pass thousands of wrong elements as 0.0. That
+makes this flag a pass/fail switch: anything below 1.0 behaves like 0.0, and 1.0
+lets a wrong candidate win. Use 1.0 only to investigate, never for a shipped
+table -- `op_tests/test_flydsl_conv_implicit.py` fails on any mismatched
+element, so such a row is one that test will reject.
 
 ### `--timeout`
 Per-task watchdog in seconds (default 1800). A worker killed by a GPU
