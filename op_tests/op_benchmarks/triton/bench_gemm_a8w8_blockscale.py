@@ -4,6 +4,9 @@ from collections.abc import Callable
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
@@ -20,8 +23,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -36,8 +37,7 @@ block_shape = (128, 128)
 
 
 def bench_gemm_fn(
-    kwargs_rot_bufs: dict,
-    kwargs_do_bench_graph: dict,
+    bencher: RotatingBufferBench,
     M: int,
     N: int,
     K: int,
@@ -77,9 +77,7 @@ def bench_gemm_fn(
     else:
         _out_vals_keys = ["x", "w", "_", "x_scale", "_", "w_scale", "y"]
 
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen], [_out_vals_keys], **kwargs_rot_bufs
-    )
+    rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
 
     kernel_fn = functools.partial(impl, dtype=c_dtype)
 
@@ -92,7 +90,7 @@ def bench_gemm_fn(
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
-    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+    ms = bencher.bench(kernel_fn)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -113,8 +111,9 @@ def run_model_benchmark(args, impl):
     """
     benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
 
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(
@@ -145,8 +144,7 @@ def run_model_benchmark(args, impl):
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(
-            kwargs_rot_bufs,
-            kwargs_do_bench_graph,
+            bencher,
             M,
             N,
             K,
@@ -163,16 +161,16 @@ def run_model_benchmark(args, impl):
 def run_shape_benchmark(args, impl):
     benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
 
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
         return bench_gemm_fn(
-            kwargs_rot_bufs,
-            kwargs_do_bench_graph,
+            bencher,
             M,
             N,
             K,

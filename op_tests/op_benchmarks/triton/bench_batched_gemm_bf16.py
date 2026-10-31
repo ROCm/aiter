@@ -4,6 +4,9 @@ import sys
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -15,8 +18,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     batched_model_benchmark_shapes,
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -28,8 +29,7 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_bf16 import (
 
 
 def bench_gemm_fn(
-    kwargs_rot_bufs: dict,
-    kwargs_do_bench_graph: dict,
+    bencher: RotatingBufferBench,
     batch: int,
     M: int,
     N: int,
@@ -52,9 +52,7 @@ def bench_gemm_fn(
     # batched_gemm_bf16 names its activation/weight/output kwargs XQ/WQ/YQ
     _out_vals_keys = ["XQ", "WQ", "bias", "YQ"]
 
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen], [_out_vals_keys], **kwargs_rot_bufs
-    )
+    rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
 
     kernel_fn = functools.partial(batched_gemm_bf16, dtype=c_dtype)
 
@@ -74,7 +72,7 @@ def bench_gemm_fn(
     mem_write = (batch * M * N) * rot_bufs[0]["YQ"].element_size()
     mem = mem_read + mem_write
 
-    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+    ms = bencher.bench(kernel_fn)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -97,8 +95,9 @@ def run_model_benchmark(args):
         model_benchmark_shapes_fn=batched_model_benchmark_shapes,
     )
 
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_bf16(
@@ -126,9 +125,7 @@ def run_model_benchmark(args):
         else:
             raise ValueError(f"Unsupported layer: {layer}")
 
-        return bench_gemm_fn(
-            kwargs_rot_bufs, kwargs_do_bench_graph, batch, M, N, K, metric, args.layout
-        )
+        return bench_gemm_fn(bencher, batch, M, N, K, metric, args.layout)
 
     bench_batched_gemm_bf16.run(
         save_path="." if args.o else None,
@@ -143,14 +140,13 @@ def run_shape_benchmark(args):
         x_names=["batch", "M", "N", "K"],
     )
 
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_bf16(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(
-            kwargs_rot_bufs, kwargs_do_bench_graph, batch, M, N, K, metric, args.layout
-        )
+        return bench_gemm_fn(bencher, batch, M, N, K, metric, args.layout)
 
     bench_batched_gemm_bf16.run(
         save_path="." if args.o else None,
