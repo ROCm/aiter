@@ -1029,6 +1029,12 @@ def mla_decode_fwd(
     Physical ``page_size`` remains 64. Token CSR is only supported by the
     shuffled QH64 path; it does not change the KV byte layout.
     """
+    if o.dtype not in (dtypes.bf16, dtypes.fp16):
+        raise ValueError(
+            "mla_decode_fwd output must use a 16-bit floating dtype "
+            f"(BF16 or FP16), got {o.dtype}."
+        )
+
     if kv_csr_layout not in ("page", "token"):
         raise ValueError(f"unknown MLA kv_csr_layout: {kv_csr_layout!r}")
     kv_indptr_is_token_level = kv_csr_layout == "token"
