@@ -1837,13 +1837,19 @@ def get_seq_metadata(
     seq_idx,
     TILE_SIZE: gl.constexpr,
     NUM_SEGMENTS_PER_SEQ: gl.constexpr,
+    segm_tiles_ptr,
 ):
     # sequence len for this particular sequence
     seq_len = gl.load(seq_lens_ptr + seq_idx)
 
-    # number of segments for this particular sequence
-    num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    if segm_tiles_ptr is not None:
+        # token split: every sequence's segments cover the same number of tiles,
+        # so a long sequence gets more segments rather than longer ones
+        tiles_per_segment = gl.load(segm_tiles_ptr)
+    else:
+        # number of segments for this particular sequence
+        num_segments = NUM_SEGMENTS_PER_SEQ
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
     return seq_len, tiles_per_segment
 
@@ -1943,6 +1949,7 @@ def _unified_attention_gluon_kernel_3d(
     k_scale_ptr,  # [1, ], float32
     v_scale_ptr,  # [1, ], float32v
     out_scale_ptr,  # [1, ], float32
+    segm_tiles_ptr,  # [1, ] int32 tiles a KV segment covers (token split), or None
     softcap,  # float32
     num_seqs: gl.int32,  # int
     num_blocks: gl.int32,  # int
@@ -2075,6 +2082,7 @@ def _unified_attention_gluon_kernel_3d(
         seq_idx,
         cfg.TILE_SIZE,
         cfg.NUM_SEGMENTS_PER_SEQ,
+        segm_tiles_ptr,
     )
 
     if segm_idx * tiles_per_segment * cfg.TILE_SIZE >= seq_len:

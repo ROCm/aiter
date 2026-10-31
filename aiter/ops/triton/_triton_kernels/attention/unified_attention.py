@@ -994,6 +994,7 @@ def reduce_segments(
     num_seqs,  # int
     num_query_heads: tl.constexpr,  # int
     out_scale_ptr,  # float32
+    segm_tiles_ptr,  # [1] int32 tiles a KV segment covers (token split), or None
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
     block_table_stride: tl.int64,  # int
@@ -1026,7 +1027,10 @@ def reduce_segments(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    if segm_tiles_ptr is not None:
+        tiles_per_segment = tl.load(segm_tiles_ptr)
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
     # create masks for subsequent loads
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
