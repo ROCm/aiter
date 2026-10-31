@@ -7,6 +7,9 @@ import functools
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.attention.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.utils._triton import arch_info
@@ -17,11 +20,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
-    get_caller_name_no_ext,
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 from op_tests.triton_tests.attention.test_mla import input_helper, shuffle_kv_buffer
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -126,13 +125,14 @@ def benchmark(args):
     use_out_scale = out_dtype != torch.bfloat16
     backend = args.backend
     skip_reduce = args.skip_reduce
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     # Prefill, adjust graph capture args. Otherwise, it takes too long to run
-    if decode_qlen == 0 and kwargs_do_bench_graph["kernels_per_graph"] > 20:
+    if decode_qlen == 0 and bencher.kernels_per_graph > 20:
         print("Prefill: setting kernels_per_graph=20 to reduce benchmark run time")
-        kwargs_do_bench_graph["kernels_per_graph"] = 20
+        bencher.kernels_per_graph = 20
 
     if shuffled_kv_cache:
         assert BLOCK_SIZE >= 16, "Block size must be at least 16 for shuffled KV cache"
@@ -255,9 +255,7 @@ def benchmark(args):
             "kv_descale",
             "out_scale",
         ]
-        rot_bufs = generate_rotating_buffers_pool(
-            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-        )
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
         # Calculate Bytes accessed
         # If varlen is set
@@ -309,7 +307,7 @@ def benchmark(args):
         mem = (sum(mem_in) + sum(mem_out)) / len(rot_bufs) * 1e-12
 
         # Run benchmark
-        ms = do_bench_aiter_triton(_op_fn, rot_bufs, **kwargs_do_bench_graph)
+        ms = bencher.bench(_op_fn)
 
         # Compute metric
         if provider == "time":
