@@ -1,0 +1,8 @@
+H3 prepare source reproduction
+
+prepare.hip is an unchanged copy of the research-vresidual-uniform-v3 source
+used by the research-residual-combined release. The reduction helper retains
+its vLLM, NVIDIA and SageAttention attribution. See LICENSE (Apache-2.0).
+
+reference/prepare.fatbin is the original prepare GPU code from that release.
+The Python test driver and prepare-only binding were added for this package.
