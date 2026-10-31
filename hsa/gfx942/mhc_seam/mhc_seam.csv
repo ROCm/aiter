@@ -1,0 +1,8 @@
+# gfx942 delayed mHC seam for DeepSeek-V4.1-Flash (hc_mult 4, hidden_size 5120).
+# kind fused: residual_out, layer_input and the split-K partials of the next pre GEMM over 512-column chunks (persistent grid); kind small: the same over 128-column slices, one wave per slice and token (few tokens); kind gates: the next post / comb / pre from the partials.
+# store_nt: nontemporal residual_out / layer_input stores. nw: waves per workgroup, tpw: tokens per workgroup (small).
+knl_name,co_name,kind,store_nt,nw,tpw,block
+_ZN5aiter14mhc_seam_v3_b2E,mhc_seam_v3_b2.co,fused,0,4,0,256
+_ZN5aiter19mhc_seam_v3_b2_stntE,mhc_seam_v3_b2_stnt.co,fused,1,4,0,256
+_ZN5aiter12mhc_seam_v4sE,mhc_seam_v4s.co,small,0,1,1,64
+_ZN5aiter18mhc_seam_gates_b40E,mhc_seam_gates_b40.co,gates,0,4,0,256
