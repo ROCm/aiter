@@ -489,7 +489,7 @@ def chunk_gated_delta_rule_opt_vk(
     transposed hidden state layout [V, K] instead of [K, V].
 
     The signature mirrors
-    ``aiter.ops.flydsl.linear_attention_prefill_kernels.flydsl_gdr_prefill`` so
+    ``aiter.ops.flydsl.linear_attention_prefill_kernels.flydsl_gdn_prefill`` so
     the two can be used interchangeably as drop-in backends, including the
     optional in-place ``o`` buffer and the ``num_decodes`` /
     ``num_decode_tokens`` decode-prefix arguments.
