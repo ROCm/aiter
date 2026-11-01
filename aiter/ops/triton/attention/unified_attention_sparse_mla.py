@@ -1,3 +1,5 @@
+import triton
+
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
     _kernel_unified_attention_sparse_mla_2d,
 )
@@ -49,7 +51,7 @@ def unified_attention_sparse_mla(
 
     BLOCK_M = 16
 
-    total_num_q_blocks = q.shape[0] * (num_query_heads // BLOCK_M)
+    total_num_q_blocks = q.shape[0] * triton.cdiv(num_query_heads, BLOCK_M)
     ALL_DECODE = max_seqlen_q == 1
 
     ROPE_RANK = head_size - kv_lora_rank
