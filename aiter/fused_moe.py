@@ -1712,7 +1712,7 @@ def _fused_moe_impl(
         activation, beta, linear_beta, swiglu_limit
     )
 
-    def _resolve_metadata(disable_inline_sort=False, exclude_mxmoe_opus=False):
+    def _resolve_metadata(disable_inline_sort=False, exclude_mxmoe=False):
         metadata = get_2stage_cfgs(
             get_padded_M(M),
             model_dim,
@@ -1741,7 +1741,7 @@ def _fused_moe_impl(
             gate_up_interleave=getattr(w1, "gate_up_interleave", None),
             config_file=_metadata_config_file,
             _disable_inline_sort=disable_inline_sort,
-            _exclude_mxmoe_opus=exclude_mxmoe_opus,
+            _exclude_mxmoe=exclude_mxmoe,
             q_dtype_a2=quant_dtype_a2,
             input_dtype=hidden_states.dtype,
             has_stage2_scatter=stage2_scatter is not None,
@@ -1754,6 +1754,7 @@ def _fused_moe_impl(
         )
 
     metadata = _resolve_metadata(disable_inline_sort=bool(herd_topk))
+    reason = ""
     if _is_mxmoe_opus_metadata(metadata):
         reason = _mxmoe_opus_call_unsupported(
             metadata,
@@ -1766,19 +1767,28 @@ def _fused_moe_impl(
             topk_ids,
             block_size_M=block_size_M,
         )
-        if reason:
-            logger.warning(
-                f"[fused_moe] MXMOE -> OPUS pair is unsupported ({reason}); "
-                "using default heuristics"
+    elif (
+        getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
+        and not _is_mxfp4_inline_sort(metadata)
+        and block_size_M is not None
+        and int(block_size_M) != int(metadata.block_m)
+    ):
+        reason = (
+            f"block_size_M={block_size_M} differs from configured BM={metadata.block_m}"
+        )
+    if reason:
+        logger.warning(
+            f"[fused_moe] MXMOE pair is unsupported ({reason}); "
+            "using default heuristics"
+        )
+        metadata = _resolve_metadata(
+            disable_inline_sort=bool(herd_topk), exclude_mxmoe=True
+        )
+        if block_size_M is not None and int(block_size_M) != int(metadata.block_m):
+            raise NotImplementedError(
+                f"No fallback backend supports block_size_M={block_size_M}; "
+                f"resolved backend requires block_m={metadata.block_m}"
             )
-            metadata = _resolve_metadata(
-                disable_inline_sort=bool(herd_topk), exclude_mxmoe_opus=True
-            )
-            if block_size_M is not None and int(block_size_M) != int(metadata.block_m):
-                raise NotImplementedError(
-                    f"No fallback backend supports block_size_M={block_size_M}; "
-                    f"resolved backend requires block_m={metadata.block_m}"
-                )
     if herd_topk and (
         metadata.flat or metadata.output_aux or metadata.full_impl is not None
     ):
@@ -3553,6 +3563,16 @@ def _is_mxmoe_opus_metadata(metadata: MOEMetadata) -> bool:
     )
 
 
+def _mxmoe_gemm2_sort_block_m(kernel_name2, sort_block_m):
+    """GEMM2's sort block; a layout-v2 name without _sbm reads the actual one."""
+    v2 = parse_flydsl_v2_gemm2_kernel(kernel_name2)
+    if v2 is not None:
+        return v2["sort_block_m"] or sort_block_m
+    if _is_mxfp4_kname(kernel_name2):
+        return _parse_mxfp4_g2_kname(kernel_name2)["BM"]
+    return sort_block_m
+
+
 def _mxmoe_opus_call_unsupported(
     metadata: MOEMetadata,
     hidden_states: torch.Tensor,
@@ -3794,7 +3814,7 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
-    _exclude_mxmoe_opus=False,
+    _exclude_mxmoe=False,
     _has_input_activation_scales=False,
 ):
     gate_mode = GateMode(gate_mode)
@@ -4145,11 +4165,11 @@ def get_2stage_cfgs(
                 f"MXMOE cannot apply swiglu_limit={swiglu_limit!r} to "
                 f"activation {expected_act!r}"
             )
+        elif _exclude_mxmoe:
+            reject_reason = "excluded for this invocation"
         elif _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2):
             reject_reason = (
-                "excluded for this invocation"
-                if _exclude_mxmoe_opus
-                else _mxmoe_opus_cfg_unsupported(
+                _mxmoe_opus_cfg_unsupported(
                     parsed_g1,
                     kn2,
                     cfg,
@@ -4174,7 +4194,17 @@ def get_2stage_cfgs(
                     has_stage2_scatter=has_stage2_scatter,
                     has_num_local_tokens=has_num_local_tokens,
                 )
-            ) or None
+                or None
+            )
+        elif not (
+            int(cfg.get("block_m", BLOCK_SIZE_M))
+            == parsed_g1["BM"]
+            == _mxmoe_gemm2_sort_block_m(kn2, parsed_g1["BM"])
+        ):
+            reject_reason = (
+                f"sort block_m={cfg.get('block_m', BLOCK_SIZE_M)} and GEMM2 {kn2!r} "
+                f"must both match GEMM1 BM={parsed_g1['BM']}"
+            )
         elif not aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk):
             reject_reason = (
                 "generated MXFP4 auxiliary kernels do not cover "
