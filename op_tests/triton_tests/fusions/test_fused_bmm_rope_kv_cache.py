@@ -328,7 +328,6 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
             sin,
             group_size=128,
             transpose_bm=True,
-            config=None,
             k_scale=k_scale,
             is_neox=(rotate_style == RotateStyle.NEOX),
             q_out_dtype=dtype,
@@ -356,3 +355,236 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
     )
 
     torch.testing.assert_close(ref_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
+
+
+def _make_fp8_bmm_mla_inputs(
+    T, seed=0, q_out_dtype="fp8", num_decode=0, is_neox=False, reuse_freqs=True
+):
+    if not arch_info.is_fp8_avail():
+        pytest.skip("FP8 is not available on this device")
+
+    q_nope, w_k, w_k_scale, _, _ = generate_batched_gemm_a16w8_inputs(
+        8, T, 512, 192, torch.bfloat16, False, False, transpose_bm=True
+    )
+    _, _, _, _, _, positions, _, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        1,
+        8,
+        64,
+        cached=True,
+        reuse_freqs_front_part=reuse_freqs,
+        nope=False,
+        pos=True,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=torch.bfloat16,
+    )
+    torch.manual_seed(seed)
+    q_nope.normal_()
+    q_nope[..., :128].mul_(0.25)
+    w_k.copy_(torch.randn_like(w_k, dtype=torch.bfloat16) * 0.25)
+    w_k_scale.fill_(0.5)
+    q_pe = torch.randn((T, 8, 64), dtype=torch.bfloat16, device="cuda")
+    k_nope = torch.randn((T, 1, 512), dtype=torch.bfloat16, device="cuda")
+    k_rope = torch.randn((T, 1, 64), dtype=torch.bfloat16, device="cuda")
+    # Leave cache rows on both sides untouched by the call.
+    kv_cache = torch.full((T + 7, 1, 576), 0.25, dtype=w_k.dtype, device="cuda")
+    return {
+        "q_nope": q_nope,
+        "w_k": w_k,
+        "w_k_scale": w_k_scale,
+        "q_pe": q_pe,
+        "k_nope": k_nope,
+        "k_rope": k_rope,
+        "kv_cache": kv_cache,
+        "slot_mapping": torch.randperm(T, device="cuda") + 3,
+        "positions": positions,
+        "cos": cos.roll(seed, dims=0)[:, None, None, :],
+        "sin": sin.roll(seed, dims=0)[:, None, None, :],
+        "group_size": 128,
+        "transpose_bm": True,
+        "k_scale": torch.full((), 0.75, dtype=torch.float32, device="cuda"),
+        "is_neox": is_neox,
+        "q_out_dtype": w_k.dtype if q_out_dtype == "fp8" else q_out_dtype,
+        "num_decode_toks_for_zeros": num_decode,
+    }
+
+
+def _reference_fp8_bmm_mla(inputs):
+    # Keep the projection in FP32 until the final output cast.
+    q_nope = ref_fp8_bmm(
+        inputs["q_nope"],
+        inputs["w_k"],
+        inputs["w_k_scale"],
+        inputs["group_size"],
+        torch.float32,
+    )
+    kv_cache = inputs["kv_cache"].clone()
+    num_decode = inputs["num_decode_toks_for_zeros"]
+    decode_q_pe = torch.empty(
+        (num_decode, 8, 64), dtype=inputs["q_nope"].dtype, device=q_nope.device
+    )
+    q, decode_q_pe, k_pe, zeros = fused_qk_rope_cat_and_cache_mla(
+        q_nope,
+        inputs["q_pe"],
+        inputs["k_nope"],
+        inputs["k_rope"],
+        kv_cache,
+        inputs["slot_mapping"],
+        inputs["positions"],
+        inputs["cos"],
+        inputs["sin"],
+        k_scale=inputs["k_scale"],
+        is_neox=inputs["is_neox"],
+        num_decode_toks_for_zeros=num_decode,
+        q_out_dtype=inputs["q_out_dtype"] or torch.bfloat16,
+        decode_q_pe_out=decode_q_pe,
+    )
+    return (q, decode_q_pe, k_pe, zeros.to(inputs["q_nope"].dtype)), kv_cache
+
+
+def _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache):
+    assert len(actual) == len(expected) == 4
+    for result, reference in zip(actual, expected):
+        assert result.shape == reference.shape
+        assert result.dtype == reference.dtype
+        assert result.device == reference.device
+
+    torch.testing.assert_close(
+        actual[0][..., :512].float(),
+        expected[0][..., :512].float(),
+        atol=1e-2,
+        rtol=1e-1,
+    )
+    torch.testing.assert_close(
+        actual[0][..., 512:].float(),
+        expected[0][..., 512:].float(),
+        atol=0,
+        rtol=0,
+    )
+    for index in (1, 3):
+        torch.testing.assert_close(actual[index], expected[index], atol=0, rtol=0)
+    # A negative slot leaves the corresponding k_pe output row unspecified.
+    valid = inputs["slot_mapping"] >= 0
+    torch.testing.assert_close(actual[2][valid], expected[2][valid], atol=0, rtol=0)
+    torch.testing.assert_close(
+        inputs["kv_cache"].float(), expected_cache.float(), atol=0, rtol=0
+    )
+
+
+def _assert_same_tensor_bytes(actual, expected):
+    torch.testing.assert_close(
+        actual.contiguous().view(-1).view(torch.uint8),
+        expected.contiguous().view(-1).view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("T", [6, 12, 64, 65, 1856, 11072, 16385, 32768])
+def test_fused_fp8_bmm_mla_fp8_output(T):
+    inputs = _make_fp8_bmm_mla_inputs(T)
+    expected, expected_cache = _reference_fp8_bmm_mla(inputs)
+    actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+    _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache)
+
+
+@pytest.mark.parametrize(
+    "T, q_out_dtype, num_decode, is_neox, reuse_freqs",
+    [
+        (1856, torch.bfloat16, 0, False, True),
+        (1856, None, 0, False, True),
+        (129, "fp8", 3, False, True),
+        (129, "fp8", 0, True, True),
+        (129, "fp8", 0, False, False),
+    ],
+    ids=["bf16", "default-dtype", "decode", "neox", "full-frequencies"],
+)
+def test_fused_fp8_bmm_mla_output_variants(
+    T, q_out_dtype, num_decode, is_neox, reuse_freqs
+):
+    inputs = _make_fp8_bmm_mla_inputs(
+        T,
+        q_out_dtype=q_out_dtype,
+        num_decode=num_decode,
+        is_neox=is_neox,
+        reuse_freqs=reuse_freqs,
+    )
+    expected, expected_cache = _reference_fp8_bmm_mla(inputs)
+    actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+    _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache)
+
+
+def test_fused_fp8_bmm_mla_negative_slots():
+    inputs = _make_fp8_bmm_mla_inputs(129)
+    inputs["slot_mapping"][0] = -1
+    inputs["slot_mapping"][-1] = -1
+    expected, expected_cache = _reference_fp8_bmm_mla(inputs)
+    actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+    _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache)
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_fused_fp8_bmm_mla_query_views(padded):
+    inputs = _make_fp8_bmm_mla_inputs(1856)
+    width = 256 if padded else 192
+    queries = torch.empty((1856, 8, width), dtype=torch.bfloat16, device="cuda")
+    queries[..., :192].copy_(inputs["q_nope"].transpose(0, 1))
+    inputs["q_nope"] = queries[..., :192].transpose(0, 1)
+    if padded:
+        queries[..., 192:].copy_(inputs["q_pe"])
+        inputs["q_pe"] = queries[..., 192:]
+    before = queries.clone()
+    expected, expected_cache = _reference_fp8_bmm_mla(inputs)
+    actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+    _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache)
+    _assert_same_tensor_bytes(queries, before)
+
+
+def test_fused_fp8_bmm_mla_shape_alternation_preserves_inputs_and_outputs():
+    retained = []
+    for seed, T in enumerate((64, 65, 1856, 64)):
+        inputs = _make_fp8_bmm_mla_inputs(T, seed=seed)
+        before = {
+            name: value.clone()
+            for name, value in inputs.items()
+            if isinstance(value, torch.Tensor) and name != "kv_cache"
+        }
+        expected, expected_cache = _reference_fp8_bmm_mla(inputs)
+        actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+        _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache)
+        for name, value in before.items():
+            _assert_same_tensor_bytes(inputs[name], value)
+        for previous, snapshot in retained:
+            for result, saved in zip(previous, snapshot):
+                _assert_same_tensor_bytes(result, saved)
+        retained.append((actual, tuple(result.clone() for result in actual)))
+
+
+@pytest.mark.parametrize("T", [1856, 32768])
+def test_fused_fp8_bmm_mla_graph_replay_reads_current_inputs(T):
+    inputs = _make_fp8_bmm_mla_inputs(T)
+    fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+
+    for factor in (0.5, 2.0):
+        inputs["q_nope"].mul_(factor)
+        inputs["q_pe"].neg_()
+        inputs["k_nope"].add_(0.25)
+        inputs["k_rope"].mul_(factor)
+        inputs["w_k"].copy_((inputs["w_k"].float() * factor).to(inputs["w_k"].dtype))
+        inputs["w_k_scale"].add_(0.25)
+        inputs["k_scale"].add_(0.25)
+        inputs["positions"].add_(1).remainder_(T)
+        inputs["slot_mapping"].copy_(inputs["slot_mapping"].roll(1))
+        inputs["cos"].neg_()
+        inputs["sin"].neg_()
+        inputs["kv_cache"].fill_(0.25)
+        expected, expected_cache = _reference_fp8_bmm_mla(inputs)
+        graph.replay()
+        _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache)
