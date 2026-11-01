@@ -1,0 +1,625 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""FlyDSL kernel for jagged_dense_bmm_broadcast_add (grouped BF16 GEMM + bias).
+
+For each group ``b`` over ``[seq_offsets[b], seq_offsets[b+1])``::
+
+    Out[s:e, :] = Jagged[s:e, :] @ Dense[b] + Bias[b]
+
+Dense is ``(B * N, K)`` (host-pre-transposed) or ``(B, K, N)`` (DENSE_KN:
+N-contiguous, transposed in registers). Supports a uniform
+grid launch with optional XCD remap, and a compact launch for skewed
+sequence lengths that maps each workgroup to its group on device.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr.typing import T
+
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes, get_num_xcds
+from aiter.ops.flydsl.kernels import buffer_ops
+
+from .tensor_shim import _run_compiled
+
+BLOCK_M = 128
+BLOCK_N = 128
+STAGES_A = 2
+B_STAGES = 3
+
+
+@dataclass(frozen=True)
+class ArchTraits:
+    mma_mnk: tuple[int, int, int]
+    k_perm_shape: tuple[int, int, int]
+    k_perm_stride: tuple[int, int, int]
+    lds_bytes: int
+    a_swizzle: tuple[int, int, int]
+    wave_size: int
+    min_block_k: int
+
+    @property
+    def k_tile_gran(self) -> int:
+        return math.prod(self.k_perm_shape)
+
+
+ARCH_TRAITS = {
+    "gfx942": ArchTraits(
+        mma_mnk=(16, 16, 16),
+        k_perm_shape=(4, 4, 2),
+        k_perm_stride=(1, 8, 4),
+        lds_bytes=get_lds_capacity_bytes("gfx942"),
+        a_swizzle=(3, 3, 3),
+        wave_size=64,
+        min_block_k=64,
+    ),
+}
+
+_DEFAULT_STREAM = fx.Stream(None)
+
+
+def _f32_to_bf16_rne(x):
+    """fp32 -> bf16, round to nearest even, with no NaN check.
+
+    A NaN input must have a zero low 16 bits (bf16-derived or the hardware
+    default NaN). Any other NaN can round into Inf.
+    """
+    n = x.numel
+    bits = x.bitcast(fx.Int32)
+    rounded = bits + 0x7FFF + ((bits >> 16) & 1)
+    halves = rounded.bitcast(fx.Int16)
+    hi = halves.shuffle(halves, list(range(1, 2 * n, 2)))
+    return fx.Vector(hi.bitcast(fx.BFloat16), x.shape, fx.BFloat16)
+
+
+def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD):
+    xy = fx.Int32(xy)
+    cnXCD = fx.Int32(nXCD)
+    cC = fx.Int32(C)
+    cW = fx.Int32(W)
+    c_num_cols = fx.Int32(num_cols)
+    c_num_rows = fx.Int32(num_rows)
+
+    xcd = xy % cnXCD
+    local = xy // cnXCD
+    chunk_idx = local // cC
+    pos = local % cC
+    xy_g_remap = chunk_idx * (cnXCD * cC) + xcd * cC + pos
+
+    total = c_num_rows * c_num_cols
+    period = fx.Int32(nXCD * C)
+    prefix = total - (total % period)
+    xy_g = (xy < prefix).select(xy_g_remap, xy)
+
+    tids_per_grp = cW * c_num_cols
+    group_id = xy_g // tids_per_grp
+    first_row = group_id * cW
+    remaining = c_num_rows - first_row
+    win_h = (remaining < cW).select(remaining, cW)  # last window may be short
+    tid_in_grp = xy_g % tids_per_grp
+    row = first_row + (tid_in_grp % win_h)
+    col = tid_in_grp // win_h
+    return row, col
+
+
+_LAUNCHERS: dict = {}
+
+
+def _build_launcher(
+    N,
+    K,
+    BLOCK_M,
+    BLOCK_N,
+    BLOCK_K,
+    THREADS,
+    XCD_C,
+    XCD_W,
+    COMPACT,
+    NXCD,
+    DENSE_KN,
+    TRAITS,
+):
+    MMA_N = TRAITS.mma_mnk[1]
+    K_STEP = TRAITS.k_tile_gran
+    N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
+    # DENSE_KN: >= 2 adjacent n per lane, so each B load is at least 32-bit.
+    WAVES = THREADS // TRAITS.wave_size
+    N_WARPS = min(WAVES, BLOCK_N // (MMA_N * (2 if DENSE_KN else 1)))
+    M_WARPS = WAVES // N_WARPS
+    B_REPS = BLOCK_N // (MMA_N * N_WARPS)
+    smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
+
+    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    def jdbba_kernel(
+        C: fx.Tensor,  # out    (L, N)   bf16
+        A: fx.Tensor,  # jagged (L, K)   bf16
+        B: fx.Tensor,  # dense  (n_groups * N, K) bf16 (pre-transposed, tall)
+        BIAS: fx.Tensor,  # bias   (n_groups * N,)   bf16
+        SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
+        n_groups: fx.Int32,
+        search_steps: fx.Int32,
+        tiled_mma: fx.TiledMma,
+        tiled_copy_g2s_A: fx.TiledCopy,
+        tiled_copy_s2g_C: fx.TiledCopy,
+    ):
+        tid = fx.thread_idx.x
+        pid_mn, _, raw_b = fx.block_idx
+        seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
+
+        def load_seq(i):
+            return fx.Int32(
+                buffer_ops.buffer_load(seq_rsrc, i, vec_width=1, is_scalar=True)
+            )
+
+        if fx.const_expr(COMPACT):
+            if fx.const_expr(XCD_C > 1):
+                grid_x = fx.Int32(fx.grid_dim.x)
+                raw_xy = fx.Int32(raw_b) * grid_x + fx.Int32(pid_mn)
+                tile_row, n_col = _xcd_remap(
+                    raw_xy, grid_x, N_BLOCKS, XCD_C, XCD_W, NXCD
+                )
+                tile_row = fx.Int32(fx.rocdl.readfirstlane(T.i32, tile_row))
+                block_n_idx = fx.Int32(fx.rocdl.readfirstlane(T.i32, n_col))
+            else:
+                tile_row = fx.Int32(pid_mn)
+                block_n_idx = fx.Int32(raw_b)
+            # Group g owns M-tile slots [f(g), f(g+1)), with
+            # f(g) = seq_offsets[g] // BLOCK_M + g. f is strictly increasing and
+            # gives each group >= ceil(M_g / BLOCK_M) slots; surplus slots fail
+            # start_m < M_b.
+            c_bm_shift = fx.Int32(BLOCK_M.bit_length() - 1)
+
+            def slot_start(g, seq_g):
+                return (seq_g >> c_bm_shift) + g
+
+            c_one = fx.Int32(1)
+            for _, state in range(
+                fx.Int32(0),
+                search_steps,
+                c_one,
+                init=[fx.Int32(0), n_groups - c_one],
+            ):
+                lo, hi = state[0], state[1]
+                mid = (lo + hi + c_one) >> c_one
+                take = slot_start(mid, load_seq(mid)) <= tile_row
+                results = yield [take.select(mid, lo), take.select(hi, mid - c_one)]
+            off_b = results[0]
+            seq_start = load_seq(off_b)
+            seq_end = load_seq(off_b + c_one)
+            block_m_idx = tile_row - slot_start(off_b, seq_start)
+        else:
+            grid_x = fx.Int32(fx.grid_dim.x)
+            bm_tiles = grid_x // fx.Int32(N_BLOCKS)
+            num_rows = bm_tiles * fx.Int32(fx.grid_dim.z)
+            raw_xy = fx.Int32(raw_b) * grid_x + fx.Int32(pid_mn)
+            row, col = _xcd_remap(raw_xy, num_rows, N_BLOCKS, XCD_C, XCD_W, NXCD)
+            row = fx.Int32(fx.rocdl.readfirstlane(T.i32, row))
+            col = fx.Int32(fx.rocdl.readfirstlane(T.i32, col))
+
+            off_b = row // bm_tiles
+            block_m_idx = row % bm_tiles
+            block_n_idx = col
+            seq_start = load_seq(off_b)
+            seq_end = load_seq(off_b + fx.Int32(1))
+        M_b = seq_end - seq_start
+        start_m = fx.Int32(block_m_idx) * fx.Int32(BLOCK_M)
+
+        if start_m < M_b:
+            a_row_off = fx.Int64(seq_start) * fx.Int64(K)
+            c_row_off = fx.Int64(seq_start) * fx.Int64(N)
+            A_g = fx.make_view(
+                fx.add_offset(fx.get_iter(A), fx.make_int_tuple(a_row_off)),
+                fx.get_layout(A),
+            )
+            C_g = fx.make_view(
+                fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_row_off)),
+                fx.get_layout(C),
+            )
+            b_row_off = fx.Int64(off_b) * fx.Int64(N) * fx.Int64(K)
+            B_g = fx.make_view(
+                fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)),
+                fx.make_layout((N, K), (1, N)) if DENSE_KN else fx.get_layout(B),
+            )
+
+            # Rows >= M_b fall outside num_records: loads read 0, stores drop.
+            A_buf = fx.rocdl.make_buffer_tensor(
+                A_g, num_records_bytes=fx.Int64(M_b) * fx.Int64(K * 2)
+            )
+            B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
+            C_buf = fx.rocdl.make_buffer_tensor(
+                C_g, num_records_bytes=fx.Int64(M_b) * fx.Int64(N * 2)
+            )
+
+            gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[
+                None, None, block_m_idx, None
+            ]
+            gB_k = fx.flat_divide(B_buf, (BLOCK_N, BLOCK_K))[
+                None, None, block_n_idx, None
+            ]
+            gC = fx.flat_divide(C_buf, (BLOCK_M, BLOCK_N))[
+                None, None, block_m_idx, block_n_idx
+            ]
+
+            bias_elem_off = fx.Int32(off_b) * fx.Int32(N)
+            BIAS_g = fx.make_view(
+                fx.add_offset(fx.get_iter(BIAS), fx.make_int_tuple(bias_elem_off)),
+                fx.get_layout(BIAS),
+            )
+            BIAS_buf = fx.rocdl.make_buffer_tensor(BIAS_g, max_size=True)
+            gBias2d = fx.make_view(
+                fx.get_iter(BIAS_buf), fx.make_layout((BLOCK_M, N), (0, 1))
+            )
+            gBias = fx.flat_divide(gBias2d, (BLOCK_M, BLOCK_N))[
+                None, None, 0, block_n_idx
+            ]
+
+            thr_mma = tiled_mma.thr_slice(tid)
+            thr_copy_g2s_A = tiled_copy_g2s_A.get_slice(tid)
+
+            uni_copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+            buffer_copy_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+
+            tiled_copy_s2r_A = fx.make_tiled_copy_A(uni_copy_128b, tiled_mma)
+            thr_copy_s2r_A = tiled_copy_s2r_A.get_slice(tid)
+            if fx.const_expr(DENSE_KN):
+                b_copy = fx.make_copy_atom(
+                    fx.rocdl.BufferCopy(B_REPS * MMA_N), fx.BFloat16
+                )
+                tv_mma_B = tiled_mma.tv_layout_B_tiled
+                k_in_atom, n_rep, k_rep = 0, 1, 2
+                vals_g2r_B = fx.coalesce(
+                    fx.select(fx.coalesce(tv_mma_B[1]), [n_rep, k_in_atom, k_rep])
+                )
+                tv_g2r_B = fx.group(
+                    fx.append(tv_mma_B[0], vals_g2r_B), 0, tv_mma_B[0].rank
+                )
+                thr_copy_g2r_B = fx.make_tiled_copy(
+                    b_copy, tv_g2r_B, fx.make_tile(BLOCK_N, K_STEP)
+                ).get_slice(tid)
+            else:
+                b_copy = buffer_copy_128b
+                thr_copy_g2r_B = fx.make_tiled_copy_B(b_copy, tiled_mma).get_slice(tid)
+
+            composed_layout_A = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(*TRAITS.a_swizzle)),
+                fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2)),
+            )
+            sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)
+
+            thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)
+            thr_sA = thr_copy_g2s_A.partition_D(sA)
+            thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)
+            thr_gB_k = thr_copy_g2r_B.partition_S(gB_k)
+
+            copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])
+
+            mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])
+            mma_frag_C = thr_mma.make_fragment_C(gC)
+
+            mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
+            if fx.const_expr(DENSE_KN):
+                # Ring slots hold (n-rep, k) as loaded; each K32 step shuffles
+                # them into the MFMA's K-packed (k, n-rep) operand.
+                b_ring = [
+                    fx.make_fragment_like(thr_gB_k[None, None, None, 0])
+                    for _ in range(B_STAGES)
+                ]
+                mma_frag_B = thr_mma.make_fragment_B(gB_k[None, None, 0])
+                mma_to_ring_B = fx.composition(fx.left_inverse(vals_g2r_B), tv_mma_B[1])
+                b_shuffle = [
+                    fx.get_scalar(fx.crd2idx(i, mma_to_ring_B))
+                    for i in range(fx.get_scalar(fx.size(mma_to_ring_B)))
+                ]
+
+                def b_dst(slot):
+                    return b_ring[slot]
+
+                def b_operand(slot, kc):
+                    raw = b_ring[slot][None, None, kc].load()
+                    dst = mma_frag_B[None, None, (None, kc)]
+                    dst.store(
+                        raw.shuffle(raw, b_shuffle).reshape(dst.shape.to_py_value())
+                    )
+                    return dst
+
+            else:
+                mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=B_STAGES)
+                mma_frag_B_retile = thr_copy_g2r_B.retile(mma_frag_B)
+
+                def b_dst(slot):
+                    return mma_frag_B_retile[None, None, None, slot]
+
+                def b_operand(slot, kc):
+                    return mma_frag_B[None, None, (None, kc), slot]
+
+            gA_k_stride = fx.get_scalar(gA_k.stride[2])
+            gB_k_stride = fx.get_scalar(gB_k.stride[2])
+
+            def run_pipeline_stage(
+                a_read_stage, b_read_slot, a_next_k=None, b_next_k=None
+            ):
+                a_write_stage = a_read_stage ^ 1
+                if fx.const_expr(a_next_k is not None):
+                    fx.copy(
+                        buffer_copy_128b,
+                        thr_gA_k[None, None, None, 0],
+                        copy_frag_A,
+                        soffset=fx.Int32(a_next_k) * gA_k_stride,
+                    )
+                if fx.const_expr(b_next_k is not None):
+                    b_fetch_slot = (b_read_slot + B_STAGES - 1) % B_STAGES
+                    fx.copy(
+                        b_copy,
+                        thr_gB_k[None, None, None, 0],
+                        b_dst(b_fetch_slot),
+                        soffset=fx.Int32(b_next_k) * gB_k_stride,
+                    )
+
+                for block_k_iter in fx.range_constexpr(BLOCK_K // K_STEP):
+                    fx.copy(
+                        uni_copy_128b,
+                        thr_sA_s2r[None, None, block_k_iter, a_read_stage],
+                        mma_frag_A_retile[None, None, block_k_iter],
+                    )
+                    frag_A_k = mma_frag_A[None, None, (None, block_k_iter)]
+                    frag_B_k = b_operand(b_read_slot, block_k_iter)
+                    fx.gemm(
+                        tiled_mma,
+                        mma_frag_C,
+                        frag_A_k,
+                        frag_B_k,
+                        mma_frag_C,
+                        traversal_order=fx.GemmTraversalOrder.KNM,
+                    )
+
+                if fx.const_expr(a_next_k is not None):
+                    fx.copy(
+                        uni_copy_128b,
+                        copy_frag_A,
+                        thr_sA[None, None, None, a_write_stage],
+                    )
+                fx.gpu.barrier()
+
+            mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
+            thr_copy_r2s_C = fx.make_tiled_copy_C(
+                fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16), tiled_mma
+            ).get_slice(tid)
+            mma_frag_C_retile = thr_copy_r2s_C.retile(mma_frag_C_bf16)
+
+            thr_gBias = thr_copy_r2s_C.partition_S(gBias)
+            bias_frag = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
+            fx.copy(
+                fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16),
+                thr_gBias,
+                thr_copy_r2s_C.retile(bias_frag),
+            )
+
+            n_tiles = K // BLOCK_K
+            fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
+            fx.copy(
+                b_copy,
+                thr_gB_k[None, None, None, 0],
+                b_dst(0),
+            )
+            if fx.const_expr(n_tiles > 1):
+                fx.copy(
+                    b_copy,
+                    thr_gB_k[None, None, None, 0],
+                    b_dst(1),
+                    soffset=fx.Int32(1) * gB_k_stride,
+                )
+            mma_frag_C.store(bias_frag.load().to(fx.Float32))
+            fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
+            fx.gpu.barrier()
+
+            for k_tile in fx.range_constexpr(n_tiles):
+                a_slot = k_tile % 2
+                b_slot = k_tile % B_STAGES
+                a_next = k_tile + 1 if k_tile + 1 < n_tiles else None
+                b_next = (
+                    (k_tile + B_STAGES - 1)
+                    if (k_tile + B_STAGES - 1) < n_tiles
+                    else None
+                )
+                run_pipeline_stage(a_slot, b_slot, a_next_k=a_next, b_next_k=b_next)
+
+            acc = mma_frag_C.load()
+            mma_frag_C_bf16.store(_f32_to_bf16_rne(acc))
+
+            sC = fx.make_view(
+                fx.get_dyn_shared(fx.BFloat16),
+                fx.make_ordered_layout((BLOCK_M, BLOCK_N), (1, 0)),
+            )
+            thr_sC = thr_copy_r2s_C.partition_D(sC)
+
+            fx.copy(
+                fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16),
+                mma_frag_C_retile,
+                thr_sC,
+            )
+            fx.gpu.barrier()
+
+            thr_copy_s2g_C = tiled_copy_s2g_C.get_slice(tid)
+            thr_sC_read = thr_copy_s2g_C.partition_S(sC)
+            thr_gC = thr_copy_s2g_C.partition_D(gC)
+            cs_frag = fx.make_fragment_like(thr_sC_read)
+            fx.copy(
+                fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
+                thr_sC_read,
+                cs_frag,
+            )
+            fx.copy(
+                fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16),
+                cs_frag,
+                thr_gC,
+            )
+
+    @flyc.jit
+    def _launch(
+        C: fx.Tensor,
+        A: fx.Tensor,
+        B: fx.Tensor,
+        BIAS: fx.Tensor,
+        SEQ_OFFSETS: fx.Tensor,
+        grid_m: int,
+        n_groups: int,
+        search_steps: int,
+        stream: fx.Stream = _DEFAULT_STREAM,
+    ):
+        n_perm = (
+            fx.make_layout((MMA_N, N_WARPS, B_REPS), (B_REPS, MMA_N * B_REPS, 1))
+            if DENSE_KN
+            else None
+        )
+        tiled_mma = fx.make_tiled_mma(
+            fx.make_mma_atom(fx.rocdl.MFMA(*TRAITS.mma_mnk, fx.BFloat16)),
+            fx.make_layout((M_WARPS, N_WARPS, 1), (1, M_WARPS, 0)),
+            fx.make_tile(
+                None,
+                n_perm,
+                fx.make_layout(TRAITS.k_perm_shape, TRAITS.k_perm_stride),
+            ),
+        )
+        val_per_thr = 8  # 16B / bf16
+        thrs_col = BLOCK_K // val_per_thr
+        thrs_row = THREADS // thrs_col
+        tiled_copy_g2s_A = fx.make_tiled_copy_tv(
+            fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
+            fx.make_layout((thrs_row, thrs_col), (thrs_col, 1)),
+            fx.make_layout((1, val_per_thr), (1, 1)),
+        )
+
+        c_val = 8
+        c_thrs_n = BLOCK_N // c_val  # threads along N
+        c_thrs_m = THREADS // c_thrs_n  # threads along M
+        tiled_copy_s2g_C = fx.make_tiled_copy_tv(
+            fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16),
+            fx.make_layout((c_thrs_m, c_thrs_n), (c_thrs_n, 1)),
+            fx.make_layout((1, c_val), (1, 1)),
+        )
+
+        epi_smem_bytes = max(smem_bytes, BLOCK_M * BLOCK_N * 2)
+
+        if fx.const_expr(COMPACT):
+            grid = (grid_m, 1, N_BLOCKS)
+        else:
+            grid = (grid_m * N_BLOCKS, 1, n_groups)
+        jdbba_kernel(
+            C,
+            A,
+            B,
+            BIAS,
+            SEQ_OFFSETS,
+            n_groups,
+            search_steps,
+            tiled_mma,
+            tiled_copy_g2s_A,
+            tiled_copy_s2g_C,
+        ).launch(grid=grid, block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream)
+
+    return _launch
+
+
+def jagged_dense_bmm(
+    C,
+    A,
+    B,
+    BIAS,
+    SEQ_OFFSETS,
+    n_groups: int,
+    max_seq_len: int,
+    stream: fx.Stream = _DEFAULT_STREAM,
+    *,
+    xcd_c: int,
+    xcd_w: int,
+    block_k: int,
+    threads: int,
+    uniform_seqlen: bool = True,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    traits: ArchTraits,
+):
+    dense_kn = B.dim() == 3
+    if dense_kn:
+        K, N = B.shape[1], B.shape[2]
+        B = B.view(n_groups * K, N)
+    else:
+        N = B.shape[0] // n_groups
+        K = B.shape[1]
+    bmn = BLOCK_M if block_m is None else int(block_m)
+    bnn = BLOCK_N if block_n is None else int(block_n)
+    if bmn <= 0 or bmn & (bmn - 1):
+        raise ValueError(f"block_m must be a power of two, got {bmn}")
+    # No partial-tile path in N: N_BLOCKS floors, so a non-divisor block_n
+    # would silently drop the trailing N % block_n output columns.
+    if bnn <= 0 or N % bnn != 0:
+        raise ValueError(f"block_n={bnn} must be a positive divisor of N={N}")
+    if dense_kn and bnn % 32:
+        raise ValueError(f"3-D dense needs block_n % 32 == 0, got {bnn}")
+    block_k = int(block_k)
+    if block_k <= 0 or block_k % traits.k_tile_gran != 0:
+        raise ValueError(
+            f"block_k must be a positive multiple of {traits.k_tile_gran}, "
+            f"got {block_k}"
+        )
+    if block_k < traits.min_block_k:
+        mma = "x".join(map(str, traits.mma_mnk))
+        raise ValueError(
+            f"block_k must be >= {traits.min_block_k} for MFMA {mma}, got {block_k}"
+        )
+    # n_tiles = K // block_k floors, silently dropping the K tail.
+    if K % block_k != 0:
+        raise ValueError(f"block_k={block_k} must divide K={K}")
+    a_smem = bmn * block_k * STAGES_A * 2
+    epi_smem = max(a_smem, bmn * bnn * 2)
+    if epi_smem > traits.lds_bytes:
+        raise ValueError(
+            f"block_k={block_k} needs {epi_smem} bytes LDS "
+            f"(max {traits.lds_bytes}); "
+            f"A-stage staging is {a_smem} bytes"
+        )
+    nthreads = int(threads)
+    compact = not uniform_seqlen
+    if compact:
+        # Slot-count bound from A.shape[0] >= SEQ_OFFSETS[-1]; reading
+        # SEQ_OFFSETS[-1] would need a host sync.
+        grid_m = A.shape[0] // bmn + n_groups
+    else:
+        grid_m = (max_seq_len + bmn - 1) // bmn
+
+    search_steps = (n_groups - 1).bit_length()
+    key = (
+        N,
+        K,
+        bmn,
+        bnn,
+        block_k,
+        nthreads,
+        xcd_c,
+        xcd_w,
+        compact,
+        get_num_xcds(),
+        dense_kn,
+        traits,
+    )
+    launch_args = (
+        C,
+        A,
+        B,
+        BIAS,
+        SEQ_OFFSETS,
+        grid_m,
+        n_groups,
+        search_steps,
+        stream,
+    )
+
+    launch = _LAUNCHERS.get(key)
+    if launch is None:
+        launch = _LAUNCHERS[key] = _build_launcher(*key)
+    _run_compiled(launch, *launch_args)
