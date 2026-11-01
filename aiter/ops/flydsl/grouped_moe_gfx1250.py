@@ -2038,7 +2038,8 @@ def herd_route_psum_remap(
         valid_rows_i32 = (
             num_valid_rows.reshape(-1)[:1].to(device=device, dtype=torch.int32)
         ).contiguous()
-    _get_compiled_route_psum_herd(topk, num_valid_rows is not None)(
+    _run_compiled(
+        _get_compiled_route_psum_herd(topk, num_valid_rows is not None),
         ptr_arg(cand_ids.to(torch.int32).contiguous().reshape(-1)),
         ptr_arg(cand_scores.to(torch.float32).contiguous().reshape(-1)),
         ptr_arg(topids_to_rows),
@@ -2052,7 +2053,7 @@ def herd_route_psum_remap(
         int(tile_m),
         float(routed_scaling_factor),
         ptr_arg(valid_rows_i32),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return (
         masked_m,
