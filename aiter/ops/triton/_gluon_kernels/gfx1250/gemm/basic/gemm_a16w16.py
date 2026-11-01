@@ -27,7 +27,7 @@ _gemm_a16w16_compute_bound_repr = make_kernel_repr(
 )
 
 
-def create_store_layout(BLOCK_M, BLOCK_N, num_warps, elem_bits=16):
+def create_store_layout(BLOCK_N, num_warps, elem_bits=16):
     """Blocked layout for the compute_bound kernel's coalesced register store: 16-byte vectors along N."""
     vec = min(128 // elem_bits, BLOCK_N)
     tpw_n = min(32, BLOCK_N // vec)
@@ -414,6 +414,36 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     gl.amd.gfx1250.buffer_store(
         accumulator.to(c_ptr.type.element_ty), c_base, offs_c, mask=mask_c
     )
+
+
+@gluon.jit
+def _store_tile_from_registers(
+    c_ptr,
+    c_vals,
+    pid_m,
+    pid_n,
+    M,
+    N,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
+    """Store a (BLOCK_M, BLOCK_N) tile held in registers with layout LAYOUT, masked to (M, N)."""
+    offs_cm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LAYOUT))
+    offs_cn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LAYOUT))
+    # buffer_store offsets are 32-bit: rebase C to this block in int64.
+    c_base = (
+        c_ptr
+        + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+        + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+    )
+    offs_c = stride_cm * (offs_cm[:, None] - pid_m * BLOCK_M) + stride_cn * (
+        offs_cn[None, :] - pid_n * BLOCK_N
+    )
+    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    gl.amd.gfx1250.buffer_store(c_vals, c_base, offs_c, mask=mask_c)
 
 
 @gluon.jit(repr=_gemm_a16w16_compute_bound_repr)
@@ -840,48 +870,25 @@ def _gemm_a16w16_compute_bound_kernel(
     if USE_ACTIVATION:
         accumulator = activation(accumulator)
 
+    gl.static_assert(
+        (REGISTER_STORE >= 0) & (REGISTER_STORE <= 2), "REGISTER_STORE must be 0, 1 or 2"
+    )
     if REGISTER_STORE == 2:
         # Register store, coalesced: convert the tile to STORE_LAYOUT (16-byte vectors along N; the layout
         # conversion's LDS round trip is ordinary ds_store/barrier/ds_load), then buffer stores. The TDM store of an
         # LDS-staged tile (REGISTER_STORE == 0) is the gfx1250 B1 pattern: tensor_store_from_lds can read LDS before
         # the waves' ds_stores are visible to it, and no documented wait or fence closes that window.
-        c_vals = gl.convert_layout(accumulator.to(c_ptr.type.element_ty), STORE_LAYOUT)
-        offs_cm = pid_m * BLOCK_M + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, STORE_LAYOUT)
+        _store_tile_from_registers(
+            c_ptr,
+            gl.convert_layout(accumulator.to(c_ptr.type.element_ty), STORE_LAYOUT),
+            pid_m, pid_n, M, N, stride_cm, stride_cn, BLOCK_M, BLOCK_N, STORE_LAYOUT,
         )
-        offs_cn = pid_n * BLOCK_N + gl.arange(
-            0, BLOCK_N, layout=gl.SliceLayout(0, STORE_LAYOUT)
-        )
-        c_base = (
-            c_ptr
-            + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
-            + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
-        )
-        offs_c = stride_cm * (offs_cm[:, None] - pid_m * BLOCK_M) + stride_cn * (
-            offs_cn[None, :] - pid_n * BLOCK_N
-        )
-        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        gl.amd.gfx1250.buffer_store(c_vals, c_base, offs_c, mask=mask_c)
     elif REGISTER_STORE == 1:
         # Register store straight from the WMMA layout (as the bandwidth_bound kernel does).
-        offs_cm = pid_m * BLOCK_M + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-        )
-        offs_cn = pid_n * BLOCK_N + gl.arange(
-            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-        )
-        # buffer_store offsets are 32-bit: rebase C to this block in int64.
-        c_base = (
-            c_ptr
-            + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
-            + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
-        )
-        offs_c = stride_cm * (offs_cm[:, None] - pid_m * BLOCK_M) + stride_cn * (
-            offs_cn[None, :] - pid_n * BLOCK_N
-        )
-        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        gl.amd.gfx1250.buffer_store(
-            accumulator.to(c_ptr.type.element_ty), c_base, offs_c, mask=mask_c
+        _store_tile_from_registers(
+            c_ptr,
+            accumulator.to(c_ptr.type.element_ty),
+            pid_m, pid_n, M, N, stride_cm, stride_cn, BLOCK_M, BLOCK_N, WMMA_LAYOUT,
         )
     else:
         # TDM Store: accumulator → shared memory → global memory

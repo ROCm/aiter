@@ -447,19 +447,24 @@ def gemm_a16w16_(
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
-        # compute_bound's epilogue (the gfx1250 TDM-store race, B1): a config entry's "REGISTER_STORE" picks it:
-        # 0 = the LDS-staged TDM store (default, unchanged), 1 = register store from the WMMA layout,
-        # 2 = coalesced register store (convert_layout, 16-byte buffer stores). AITER_GFX1250_A16W16_STORE
-        # overrides every entry (A/B only).
+        # compute_bound's epilogue (the gfx1250 TDM-store race, B1), picked by the config entry's "REGISTER_STORE":
+        # 0 = the LDS-staged TDM store (default: entries without the key are unchanged), 1 = register store from the
+        # WMMA layout, 2 = coalesced register store (convert_layout, 16-byte buffer stores). For A/B only,
+        # AITER_GFX1250_A16W16_STORE overrides the entry's value for this (non-persistent gluon compute_bound)
+        # kernel; it must be unset in serving.
         extra_kwargs = {}
         if kernel_type == "compute_bound":
             store_mode = int(
                 os.environ.get("AITER_GFX1250_A16W16_STORE", register_store)
             )
+            if store_mode not in (0, 1, 2):
+                raise ValueError(
+                    f"REGISTER_STORE / AITER_GFX1250_A16W16_STORE must be 0, 1 or 2, got {store_mode}"
+                )
             extra_kwargs["REGISTER_STORE"] = store_mode
             if store_mode == 2:
                 extra_kwargs["STORE_LAYOUT"] = create_store_layout(
-                    BLOCK_M, BLOCK_N, num_warps, y.element_size() * 8
+                    BLOCK_N, num_warps, y.element_size() * 8
                 )
 
         _LOGGER.info(
