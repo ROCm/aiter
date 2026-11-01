@@ -1,4 +1,21 @@
 {
+    "M_BOUNDS": [
+        1,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768
+    ],
     "M_LEQ_1": {
         "BLOCK_M": 16,
         "BLOCK_N": 16,
@@ -99,22 +116,44 @@
         "waves_per_eu": 1
     },
     "M_LEQ_4096": {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 128,
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
         "NUM_BUFFERS": 4,
-        "num_warps": 4,
+        "num_warps": 8,
         "kernel_type": "compute_bound",
-        "waves_per_eu": 0
+        "waves_per_eu": 1,
+        "REGISTER_STORE": 2
     },
     "M_LEQ_8192": {
         "BLOCK_M": 256,
-        "BLOCK_N": 128,
+        "BLOCK_N": 256,
         "BLOCK_K": 64,
-        "NUM_BUFFERS": 5,
-        "num_warps": 4,
+        "NUM_BUFFERS": 4,
+        "num_warps": 8,
         "kernel_type": "compute_bound",
-        "waves_per_eu": 1
+        "waves_per_eu": 1,
+        "REGISTER_STORE": 2
+    },
+    "M_LEQ_16384": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 4,
+        "num_warps": 8,
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 1,
+        "REGISTER_STORE": 2
+    },
+    "M_LEQ_32768": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 4,
+        "num_warps": 8,
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 1,
+        "REGISTER_STORE": 2
     },
     "any": {
         "BLOCK_M": 256,
