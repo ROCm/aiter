@@ -732,6 +732,56 @@ def test_mhc_post(m, hidden_size, hc_mult, dtype=dtypes.bf16, data_init="norm", 
     return ret
 
 
+def test_mhc_post_noncontiguous(m=4, hidden_size=256, hc_mult=4, dtype=dtypes.bf16):
+    """Non-contiguous mixes must be rejected, not silently misread (#5292).
+
+    ``mhc_post_kernel`` indexes ``post_layer_mix`` / ``comb_res_mix`` / ``out``
+    with hardcoded contiguous offsets, so the HIP wrapper must raise before
+    launch. Exercises each tensor through a strided view of a larger buffer.
+    """
+    gen = make_generator(0)
+    x = fill((m, hidden_size), "norm", gen, dtype=dtype)
+    residual = fill((m, hc_mult, hidden_size), "norm", gen, dtype=dtype)
+    post_base = fill((m, hc_mult, 2), "norm", gen, dtype=dtypes.fp32)
+    comb_base = fill((m, hc_mult, hc_mult * 2), "norm", gen, dtype=dtypes.fp32)
+    cases = {
+        "post_layer_mix": (
+            post_base[:, :, 0],
+            lambda post, comb, out: aiter.mhc_post(out, x, residual, post, comb),
+        ),
+        "comb_res_mix": (
+            comb_base[:, :, ::2],
+            lambda post, comb, out: aiter.mhc_post(out, x, residual, post, comb),
+        ),
+    }
+    post_ok = fill((m, hc_mult, 1), "norm", gen, dtype=dtypes.fp32)
+    comb_ok = fill((m, hc_mult, hc_mult), "norm", gen, dtype=dtypes.fp32)
+    for name, (bad, call) in cases.items():
+        assert not bad.is_contiguous(), name
+        out = torch.empty_like(residual)
+        try:
+            call(
+                bad if name == "post_layer_mix" else post_ok,
+                bad if name == "comb_res_mix" else comb_ok,
+                out,
+            )
+        except RuntimeError as e:
+            assert "contiguous" in str(e), f"{name}: unexpected error: {e}"
+        else:
+            raise AssertionError(f"{name}: non-contiguous input was not rejected")
+    # A strided out must also be rejected.
+    out_base = torch.empty((m, hc_mult, hidden_size * 2), dtype=dtype)
+    out_bad = out_base[:, :, ::2]
+    assert not out_bad.is_contiguous()
+    try:
+        aiter.mhc_post(out_bad, x, residual, post_ok, comb_ok)
+    except RuntimeError as e:
+        assert "contiguous" in str(e), f"out: unexpected error: {e}"
+    else:
+        raise AssertionError("out: non-contiguous input was not rejected")
+    return {"mhc_post_noncontiguous": "rejected"}
+
+
 def mhc_post_pre_ref(
     layer_input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -1251,6 +1301,9 @@ for dtype in args.dtype:
 print_json_table("mhc_pre summary", df)
 
 if not args.hc_head:
+    test_mhc_post_noncontiguous(
+        m=args.m[0], hidden_size=args.hidden_size[0], dtype=args.dtype[0]
+    )
     df = []
     for dtype in args.dtype:
         for data_init in args.data_init:

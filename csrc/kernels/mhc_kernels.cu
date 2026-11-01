@@ -1888,6 +1888,21 @@ namespace aiter {
         int x_stride = x.stride(0);
         int residual_stride = residual.stride(0);
         AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
+        // mhc_post_kernel indexes out, post_layer_mix and comb_res_mix with
+        // hardcoded contiguous offsets (out: idx * hc_mult * hidden_size,
+        // mixes: idx * hc_mult / idx * hc_mult * hc_mult), and reads the
+        // inner dims of x and residual as packed rows. No stride is
+        // forwarded for those, so reject any layout the kernel would
+        // silently misread instead of producing wrong results.
+        AITER_CHECK(out.is_contiguous(), "mhc_post: out must be contiguous");
+        AITER_CHECK(post_layer_mix.is_contiguous(),
+                    "mhc_post: post_layer_mix must be contiguous");
+        AITER_CHECK(comb_res_mix.is_contiguous(),
+                    "mhc_post: comb_res_mix must be contiguous");
+        AITER_CHECK(x.stride(-1) == 1, "mhc_post: x last dim must be contiguous");
+        AITER_CHECK(residual.stride(-1) == 1 && residual.stride(1) == hidden_size,
+                    "mhc_post: residual inner dims must be packed "
+                    "(stride(1) == hidden_size, stride(-1) == 1)");
 
         const HipDeviceGuard device_guard(residual.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
