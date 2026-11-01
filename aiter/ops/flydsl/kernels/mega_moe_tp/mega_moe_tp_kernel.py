@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import os
 import struct
 
 import flydsl.compiler as flyc
@@ -25,9 +24,6 @@ from ..communication_ops_utils import (
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _e8m0_from_amax
 from .common import (
-    REL,
-    spin0,
-    wait_lgkm0,
     AUX_SYS,
     MAX_TP,
     V4I,
@@ -58,7 +54,6 @@ from .common import (
     pack_bf16x8,
     rsrc,
     sum_live,
-    trace_mark,
     uni,
     wait_vm,
     wave_red,
@@ -69,7 +64,6 @@ from .mega_moe_tp_config import (
     C_ECNT,
     C_EPOCH,
     C_ERR,
-    C_QDONE,
     C_FILL,
     C_OFF,
     C_PH,
@@ -80,7 +74,6 @@ from .mega_moe_tp_config import (
     C_TURN,
     C_UN,
     C_XW,
-    CTRL_INTS,
     CTRL_TNC,
     ERR_YAG,
     FLAG_TN,
@@ -152,13 +145,10 @@ def compile_mega_moe_tp(
     tn_local: bool = False,
     lbpf: bool = False,
     lbp: int = 0,
-    trace: bool = False,
     sm: bool = False,
     ar2: bool = False,
-    env: tuple = (),
 ):
     """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
-    env: the AITER_MEGAMOE_TP_* debug variables (part of the cache key only).
 
     Units are planned in the kernel over the active experts: an expert routed by R
     tokens runs as ceil(R / rch) row chunks (chunk c takes its tokens t with
@@ -183,11 +173,9 @@ def compile_mega_moe_tp(
         rank into qall / sall; tn 2: the bf16 normed rows too (qall after the FP8 rows).
     sm: (ll_rs, ll_route, not lb) the small-M schedule (smallm.py). ar2: (ar, LL route rows)
         the two-shot all-reduce (reduce-scatter, then the owners' y rows to every rank)
-        instead of the one-shot one. trace: per-CTA timestamps (mega_moe_tp_config TRACE).
+        instead of the one-shot one.
     """
-    kw = dict(locals())
-    kw.pop("env")
-    kc = kernel_config(**kw)
+    kc = kernel_config(**locals())
     kc.add(build_communication(kc))
     kc.add(build_gemm(kc))
     kc.add(build_schedule(kc))
@@ -211,19 +199,7 @@ def compile_mega_moe_tp(
 
     TN_V = H // 8
     TN_IT = ceildiv(TN_V, NTT)
-    (TRACE,) = kc.get("TRACE")
     (ag_ready_all,) = kc.get("ag_ready_all")
-    AGRA = os.environ.get("AITER_MEGAMOE_TP_AGRA", "1") == "1"  # (debug)
-    # small-M: the helper waves quantize the input rows while the compute waves take the
-    # routing and plan (the weight stream starts earlier)
-    QOVL = kc.SM and os.environ.get("AITER_MEGAMOE_TP_QOVL", "0") == "1"
-    # (ar two-shot) the y rows copied to out= in the kernel (host copy otherwise)
-    YCOPY = os.environ.get("AITER_MEGAMOE_TP_YCOPY", "0") == "1"
-
-    def mark(tid, a, k, lead=0):
-        """trace builds: CTA timestamp k (thread lead)"""
-        if TRACE and (not kc.TRACE_LIGHT or k < 10 or k >= 40):
-            trace_mark(a["ctrl"], CTRL_INTS, k, tid, lead)
 
     @flyc.jit
     def blk_red(L, tid, v, op, slot):
@@ -406,24 +382,18 @@ def compile_mega_moe_tp(
     def roles(L, tid, a, epoch):
         if tid < i32(NT):
             compute_units(L, tid, a)
-            if const_expr(DLL and kc.CPUSH):
+            if const_expr(DLL):
                 push_dll(L, tid, a, 4 + tid // 64)
             comm_help(L, tid, a, epoch)
         else:
             if tid < i32(NT + 64):
-                if const_expr(QOVL):
-                    spin0(L, tid % i32(64), L_CTL + C_QDONE * 4, i32(NTT // 64 - NW))
                 ag_send(L, tid % i32(64), a)
-                mark(tid, a, 5, NT)
-                if const_expr(AGRA):
-                    ag_ready_all(L, tid % i32(64), a, epoch)
+                ag_ready_all(L, tid % i32(64), a, epoch)
                 if const_expr(DLL):
                     push_dll(L, tid, a)
-                    mark(tid, a, 6, NT)
                     comm_wave(L, tid, a, epoch)
                 else:
                     poll_loop(L, tid, a, epoch)
-                mark(tid, a, 7, NT)
             elif tid < i32(NT + 128):
                 a_loader(L, tid, a)
                 if const_expr(LBPF):
@@ -490,7 +460,6 @@ def compile_mega_moe_tp(
         assert layout_tag and name
         lds = fx.SharedAllocator().allocate(Shared).peek()
         L = uni(fx.Int32(fx.ptrtoint(lds.buf.ptr)))
-        mark(tid, a, 0)
         peers = [p0, p1, p2, p3, p4, p5, p6, p7]
         mine = peers[0]
         for j in range_constexpr(1, MAX_TP):
@@ -499,12 +468,10 @@ def compile_mega_moe_tp(
         _dyn_zero(L, tid)
         init_lds(L, tid, a)
         gpu.barrier()
-        mark(tid, a, 16)
         epoch = lds_ld_i32(L, L_CTL + C_EPOCH * 4)
         a["epoch"] = epoch
         _drop_stale(tid, a)
         sm_zero_next(tid, a)
-        mark(tid, a, 17)
         if (tid == i32(0)) & (i32(gpu.block_id("x")) == i32(0)):
             g_st_sys(claim_addr(a, 1), i32(0))
         if const_expr(ar):
@@ -521,17 +488,8 @@ def compile_mega_moe_tp(
                     _ag_send_meta_ll(tid % i32(64), a)
                 else:
                     _ag_send_meta(tid % i32(64), a)
-                mark(tid, a, 18, NT)
-        if const_expr(QOVL):
-            if tid >= i32(NT):
-                quant_chunks(L, tid - i32(NT), NTT - NT, a, i32(0), i32(NCHA))
-                wait_lgkm0()
-                if (tid % i32(64)) == i32(0):
-                    lds_atomic_add(L, L_CTL + C_QDONE * 4, 1, REL)
-        else:
-            quant_chunks(L, tid, NTT, a, i32(0), i32(NCHA))
-            gpu.barrier()
-        mark(tid, a, 1)
+        quant_chunks(L, tid, NTT, a, i32(0), i32(NCHA))
+        gpu.barrier()
         a["ax"] = fx.Int64(mine) + off_x
         a["axs"] = fx.Int64(mine) + off_xs
         roles(L, tid, a, epoch)
@@ -540,13 +498,9 @@ def compile_mega_moe_tp(
         if const_expr(TN):
             wait_vm(0)
         gpu.barrier()
-        mark(tid, a, 8)
         if const_expr(ar and not ARLL):
             yag_flush(L, tid, a)
             yag_wait(tid, a, epoch)
-            if const_expr(not AG8 and YCOPY):
-                gpu.barrier()
-                kc.yout_copy(tid, a)
         if const_expr(TN):
             tn_rows(L, tid, a)
             if const_expr(not TNL):
@@ -556,7 +510,6 @@ def compile_mega_moe_tp(
             ag8_convert(tid, a)
         if const_expr(lb):
             lb_finish(tid, a, L)
-        mark(tid, a, 9)
         finish(tid, a, epoch)
 
     kargs = list(inspect.signature(mega_moe_tp_kernel).parameters)

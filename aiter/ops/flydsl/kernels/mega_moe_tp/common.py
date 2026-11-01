@@ -12,8 +12,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
@@ -386,21 +386,6 @@ def now():
     return fx.Int64(
         _llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], [])
     )
-
-
-@flyc.jit
-def trace_mark(ctrl, base, k, tid, lead):
-    """Debug (trace builds): thread lead stores its CTA's s_memrealtime (low 32 bits) at
-    ctrl[base + bid * 64 + k]."""
-    if tid == i32(lead):
-        t = fx.Int32(now())
-        slot = i32(base) + i32(gpu.block_id("x")) * i32(64) + i32(k)
-        fx.generic_store(
-            gptr(fx.Int64(ctrl) + fx.Int64(slot * i32(4))),
-            t,
-            memory_order=MONO,
-            syncscope="agent",
-        )
 
 
 def before(cur, target):

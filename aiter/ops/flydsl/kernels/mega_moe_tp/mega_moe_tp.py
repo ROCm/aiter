@@ -53,10 +53,9 @@ LDS_LIMIT = 160 * 1024
 LB_PF_MAX = 1024
 AG8_MIN = 512
 AR2_MIN = 64
-# small-M persistent grid for <= 8 / 16 / 32 tokens (0: every CU)
-SMNC = "224,232,240"
-# global tokens from which the small-M kernel runs (it falls back to the dynamic schedule's
-# fused units in-kernel when the G1 blocks do not fill the CTAs)
+# (small-M, no tuned row) the persistent grid for <= 8 / 16 / 32 tokens (0: every CU)
+SMNC = (224, 232, 240)
+# global tokens from which the small-M kernel runs
 SM_MIN = {"ag_rs": 1, "ar": 1}
 COMM_MODES = ("ag_rs", "ar")
 _ERR_NAMES = (
@@ -95,11 +94,6 @@ class LaunchCfg:
 _ALIGN = 256
 # a peer allocation maps once per process (arenas can share one): handle -> [ptr, refs]
 _OPEN: dict[bytes, list] = {}
-
-
-def _YCOPY() -> bool:
-    # (debug) ar two-shot: the kernel's own y -> out= copy (else a host copy)
-    return os.environ.get("AITER_MEGAMOE_TP_YCOPY", "0") == "1"
 
 
 def _allocation_base(ptr: int) -> int:
@@ -331,9 +325,6 @@ class MegaMoeTPEngine:
             )
         self.mode = comm_mode
         self.check = os.environ.get("AITER_MEGAMOE_TP_CHECK", "0") == "1"
-        # debug: per-CTA phase timestamps after the ctrl block (trace_dump)
-        # (2: the phase marks 0-9 only)
-        self.trace = {"1": 1, "2": 2}.get(os.environ.get("AITER_MEGAMOE_TP_TRACE", "0"), 0)
         # small-M schedule (fp8 comm, fp4 activations) from SM_MIN global tokens (ag_rs / ar)
         # up to the dynamic schedule's limit; AITER_MEGAMOE_TP_SMALLM: 0 off, "all" every
         # dynamic-schedule batch
@@ -384,7 +375,7 @@ class MegaMoeTPEngine:
         self._bind_weights(w1, w1_scale, w2, w2_scale)
 
         props = torch.cuda.get_device_properties(self.device)
-        self.n_cta = int(os.environ.get("AITER_MEGAMOE_TP_NCTA", props.multi_processor_count))  # (debug)
+        self.n_cta = int(props.multi_processor_count)
         if self.n_cta > NCTA_MAX:
             raise ValueError(f"at most {NCTA_MAX} CTAs (flag layout)")
         self.gfx = getattr(props, "gcnArchName", "").split(":")[0]
@@ -431,11 +422,7 @@ class MegaMoeTPEngine:
         self.tn_local = True
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(
-            CTRL_INTS + (NCTA_MAX * 64 if self.trace else 0),
-            dtype=torch.int32,
-            device=self.device,
-        )
+        self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
         self.routes = torch.zeros(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
         )
@@ -628,35 +615,27 @@ class MegaMoeTPEngine:
         return {k: int(row[k]) for k in _SM_TUNED_FIELDS if row.get(k, "") != ""}
 
     def _sm_mt(self, tot: int) -> int:
-        # (debug: AITER_MEGAMOE_TP_SMMT "mt<=32,mt<=64,mt<=128,mt<=256" over the tuned file)
-        env = os.environ.get("AITER_MEGAMOE_TP_SMMT")
-        tu = self._sm_tuned(tot)
-        if env is None and "mt" in tu:
-            return self._fit_mt(tu["mt"])
-        m = [int(v) for v in (env or "1,2,2,3").split(",")]
-        return self._fit_mt(m[0] if tot <= 32 else m[1] if tot <= 64 else m[2] if tot <= 128 else m[3])
+        mt = self._sm_tuned(tot).get("mt")
+        if mt is None:
+            mt = 1 if tot <= 32 else 2 if tot <= 128 else 3
+        return self._fit_mt(mt)
 
     def _sm_nc(self, tot: int) -> int:
         # few tokens: a smaller persistent grid (measured faster: the HBM stays saturated
         # and the per-launch sync / all-gather counting has fewer participants); 0: all CUs
-        # (debug: AITER_MEGAMOE_TP_SMNC "ctas<=8,ctas<=16,ctas<=32")
-        env = os.environ.get("AITER_MEGAMOE_TP_SMNC")
-        tu = self._sm_tuned(tot)
-        if env is None and "nc" in tu:
-            nc = tu["nc"]
-        else:
-            n = [int(v) for v in (env or SMNC).split(",")]
+        nc = self._sm_tuned(tot).get("nc")
+        if nc is None:
+            n = SMNC
             nc = n[0] if tot <= 8 else n[1] if tot <= 16 else n[2] if tot <= 32 else 0
         return 0 if nc <= 0 or nc >= self.n_cta else nc
 
     def _sm_ar2(self, tot: int) -> bool:
         if not self.ar:
             return False
-        env = os.environ.get("AITER_MEGAMOE_TP_AR2MIN")
         tu = self._sm_tuned(tot)
-        if env is None and "ar2" in tu:
+        if "ar2" in tu:
             return bool(tu["ar2"])
-        return tot >= int(env or AR2_MIN)
+        return tot >= AR2_MIN
 
     def _sm_fits(self, tot: int) -> bool:
         # small-M: every CTA's G1 blocks (rounds of n_cta over all row chunks' inter
@@ -691,9 +670,6 @@ class MegaMoeTPEngine:
                     # AR2_MIN tokens on
                     ar2=self._sm_ar2(tot),
                     nc=self._sm_nc(tot),
-                    # (debug) ar: the all-reduce's second hop (y rows) in MXFP8 from this many
-                    ag8=self.ar
-                    and tot >= int(os.environ.get("AITER_MEGAMOE_TP_SMAG8MIN", "100000")),
                 )
             elif self._lb_ok(tot):
                 cfg = self._lb_config(tot)
@@ -796,16 +772,8 @@ class MegaMoeTPEngine:
                 tn_local=self.tn_local,
                 lbpf=cfg.pf,
                 lbp=cfg.lp,
-                trace=self.trace,
                 sm=cfg.sm,
                 ar2=cfg.ar2,
-                env=tuple(
-                    sorted(
-                        (k, v)
-                        for k, v in os.environ.items()
-                        if k.startswith("AITER_MEGAMOE_TP_")
-                    )
-                ),
             )
             self._launchers[self._key(cfg)] = fn
         return fn
@@ -956,7 +924,7 @@ class MegaMoeTPEngine:
             ptr(x),
             ptr(ids),
             ptr(tw),
-            ptr(y),
+            y.data_ptr(),
             self.routes.data_ptr(),
             self.proutes.data_ptr(),
             self.ctrl.data_ptr(),
@@ -1025,16 +993,9 @@ class MegaMoeTPEngine:
             self._check_tail(tail, m)
             cfg = dataclasses.replace(self.tail_config(m), tn=2 if bf16 else 1)
         local_y = not self.ar or self._arll(cfg) or self._ag8(cfg)
-        # (ar two-shot) the kernel copies the gathered y rows to out= itself (y the out
-        # pointer; None: no copy, the shared yall rows are returned)
-        ycopy = not local_y and out is not None and _YCOPY()
-        if local_y:
-            y = out if out is not None else self.y
-        else:
-            y = out if ycopy else None
+        y = out if out is not None and local_y else self.y
         tptr = tuple(t.data_ptr() for t in tail) if tail is not None else ()
-        yp = 0 if y is None else y.data_ptr()
-        key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), yp, cfg, tptr)
+        key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), y.data_ptr(), cfg, tptr)
         if self._args[0] != key:
             args = self._launch_args(m, cfg, y, x, ids, tw, tail)
             self._args = (key, (args, x, ids, tw))
@@ -1045,8 +1006,6 @@ class MegaMoeTPEngine:
         if self.check and not torch.cuda.is_current_stream_capturing():
             self.check_errors()
         if not local_y:
-            if ycopy:
-                return out
             y = self._yall.local[:rows]
             return y if out is None else out.copy_(y)
         y = y[:rows] if out is None else out
@@ -1066,10 +1025,6 @@ class MegaMoeTPEngine:
         return y
 
     __call__ = forward
-
-    def trace_dump(self) -> torch.Tensor:
-        """trace builds: [n_cta, 64] int32 timestamps (s_memrealtime, 10 ns) of the last launch"""
-        return self.ctrl[CTRL_INTS:].view(NCTA_MAX, 64)[: self.n_cta].clone()
 
     def clear_errors(self) -> None:
         self.ctrl[CTRL_ERR] = 0

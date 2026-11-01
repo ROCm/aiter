@@ -20,16 +20,11 @@ bytes per CTA even:
       chunks, then every CTA an even part of the rest. Per chunk of a run: wait for its
       blocks (the w2 prologue already in flight), import its intermediate, one GEMM2 over
       the run's columns -> the route rows (one region: the push sums topk rows only).
-
-With fewer G1 blocks than CTAs and at most one route per CTA (e.g. 8 tokens) the launch
-runs the dynamic schedule's fused units instead (decided in the plan: C_SMODE).
 """
 
 from __future__ import annotations
 
-import functools
 import math
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -43,9 +38,6 @@ from .common import (
     bld,
     bst,
     g_add_agent,
-    gptr,
-    MONO,
-    now,
     i32,
     lds_ld_i32,
     lds_st,
@@ -54,14 +46,12 @@ from .common import (
 )
 from .mega_moe_tp_config import (
     C_DYNP,
-    C_GEXP,
     C_NCH,
     C_PLAN,
     C_UL,
     C_UNIT,
     C_UROWS,
     C_USEQ,
-    CTRL_INTS,
     CTRL_SMC,
     CTRL_SMF,
     G1C_STRIDE,
@@ -73,7 +63,6 @@ from .mega_moe_tp_config import (
     KernelCtx,
     _nsk2_for,
 )
-from .schedule import DPF
 
 const_expr = fx.const_expr
 # split-K partial sums of a block's last piece: PB slots x JG accumulators per step
@@ -83,14 +72,9 @@ QC = 3
 # LDS ctl slots (unused by the dynamic schedule): the row chunk whose intermediate L_INTER
 # holds; this CTA's G2 runs (first share, end share) x 2
 C_SMK, C_SM2 = 66, 70
-# 1: this launch runs the small-M units, 0: the dynamic schedule's (fewer G1 blocks than CTAs
-# and few routes: the fused units keep the intermediate in LDS, no G1 -> G2 waits)
-C_SMODE = 74
 # this CTA's split-K unit was its block's last piece
 C_SMLAST = 67
-# the G1 block a CTA without one prefetches (schedule.pf_unit)
-C_SMPF = 75
-# (ROT) the chunk-table rotation: the plan's chunk j is the table's (j + C_JSH) % chunks
+# the chunk-table rotation: the plan's chunk j is the table's (j + C_JSH) % chunks (_rot)
 C_JSH = 69
 
 
@@ -102,40 +86,11 @@ def build_smallm(kc: KernelCtx) -> dict:
     gather_routes_chunk, gemm1, gemm2 = kc.get("gather_routes_chunk gemm1 gemm2")
     lb_import, spin_sys_ge, unit_fields = kc.get("lb_import spin_sys_ge unit_fields")
     xq_export, _xcd_rank = kc.get("xq_export _xcd_rank")
-    _dyn_units, _dyn_loop = kc.get("_dyn_units _dyn_loop")
-    mark, TRACE = kc.get("mark TRACE")
-
-    @flyc.jit
-    def _tval(tid, a, k, v):
-        if tid == i32(0):
-                slot = i32(CTRL_INTS) + i32(gpu.block_id("x")) * i32(64) + k
-                fx.generic_store(
-                    gptr(fx.Int64(a["ctrl"]) + fx.Int64(slot * i32(4))),
-                    v,
-                    memory_order=MONO,
-                    syncscope="agent",
-                )
-
-    def tval(tid, a, k, v):
-        """trace builds: CTA value v at trace slot k (32..63: G1 / G2 call events)"""
-        if TRACE and not kc.TRACE_LIGHT:
-            _tval(tid, a, k, v)
-
-    def tnow(tid, a, k):
-        if TRACE and not kc.TRACE_LIGHT:
-            tval(tid, a, k, fx.Int32(now()))
 
     KS1, MT, TMAX, _g1_out, nsk = kc.get("KS1 MT TMAX _g1_out nsk")
     (HB,) = kc.get("HB")
-    GPRE = os.environ.get("AITER_MEGAMOE_TP_GPRE", "1") == "1"  # (debug)
-    # (debug) half blocks after a full round while r <= C / HBF
-    HBF = int(os.environ.get("AITER_MEGAMOE_TP_HBF", "3"))
-    # (whole-inter G2 calls) a k-step pair's w2 scale dwords loaded once
-    SDD2 = os.environ.get("AITER_MEGAMOE_TP_SDD", "1") == "1"
-    # the dynamic schedule's fused units while the G1 blocks fill under DYN_HI / 256 of
-    # the CTAs (debug: AITER_MEGAMOE_TP_DYNHI)
-    # (128: never, given more than C / 2 blocks; measured: the small-M units win)
-    DYN_HI = int(os.environ.get("AITER_MEGAMOE_TP_DYNHI", "128"))
+    # half blocks after a full round while r <= C / HBF
+    HBF = 3
     # split-K pieces (ascending): the K steps of a piece a multiple of the B interleave
     IL1 = nsk * KCS // math.gcd(nsk, KCS)
     SKS = [s for s in (2, 3, 4, 6, 12) if KS1 % s == 0 and (KS1 // s) % IL1 == 0]
@@ -155,22 +110,18 @@ def build_smallm(kc: KernelCtx) -> dict:
     # a G2 share: GPC groups (of NW * 64 columns), a whole number of GEMM2 iterations
     nsk2 = _nsk2_for(KS2, G2)
     assert GPC % (nsk2 * KS2 // math.gcd(nsk2, KS2) // KS2) == 0
-    # G1 block bytes / G2 share bytes (2 * 128 * H vs H / NCK * I weights)
+    # the early-share cap per CTA without an extra block: G1 block bytes / G2 share bytes
+    # (2 * 128 * H vs H / NCK * I weights)
     D = max(1, round(256 * NCK / I))
-    # (debug) the early-share cap per CTA without an extra block
-    D = int(os.environ.get("AITER_MEGAMOE_TP_SMD", str(D)))
-    # (debug) the rest run in single groups (else whole shares of GPC groups)
-    RGU = GPC if os.environ.get("AITER_MEGAMOE_TP_G2G", "1") == "1" else 1
-    # (debug) the plan's chunk order starts at the last expert's chunks when it has several
-    # (the shared expert: every token's): its GEMM1 blocks in the first round, all CTAs in
-    # step, so the reads of one weight block by its row chunks meet in L2
-    ROT = os.environ.get("AITER_MEGAMOE_TP_ROT", "1") == "1"
+    # the rest run in single groups (GPC per share)
+    RGU = GPC
 
     def _rot(L, j):
-        if const_expr(ROT):
-            nun = fx.max(lds_ld_i32(L, L_CTL + C_NCH * 4), i32(1))
-            return (j + lds_ld_i32(L, L_CTL + C_JSH * 4)) % nun
-        return j
+        """the plan's chunk order starts at the last expert's chunks when it has several
+        (the shared expert: every token's): its GEMM1 blocks in the first round, all CTAs
+        in step, so the reads of one weight block by its row chunks meet in L2"""
+        nun = fx.max(lds_ld_i32(L, L_CTL + C_NCH * 4), i32(1))
+        return (j + lds_ld_i32(L, L_CTL + C_JSH * 4)) % nun
 
     def smc(a, j, bank):
         return ctrl_at(a, i32(CTRL_SMC) + (bank * i32(NCHLB_MAX) + j) * i32(G1C_STRIDE))
@@ -180,39 +131,17 @@ def build_smallm(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def sm_units(L, tid, a):
-        """(after the chunk table) the dynamic schedule's units if the G1 blocks do not fill
-        the CTAs and the routes are few (its P partial route rows per route stay cheap),
-        else the small-M ones"""
-        nb = lds_ld_i32(L, L_CTL + C_NCH * 4) * i32(KS2)
-        C = i32(gpu.grid_dim.x)
-        # (from at most C / 2 blocks on the small-M units split K: they fill the CTAs)
-        # (more blocks: the small-M units, their G2 spread over all CTAs, win)
-        if (
-            (nb * i32(256) < C * i32(DYN_HI))
-            & (nb * i32(2) > C)
-            & (a["ttot"] * i32(TOPK) <= C)
-        ):
-            _dyn_units(L, tid)
-            if tid == i32(0):
-                lds_st(L, L_CTL + C_SMODE * 4, i32(0))
-        else:
-            _sm_plan(L, tid, a)
-
-    @flyc.jit
-    def _sm_plan(L, tid, a):
-        """(tid 0) this CTA's G1 inter blocks as unit records (chunk entry, i0, icnt, chunk)
-        and its G2 runs"""
+        """(after the chunk table, tid 0) this CTA's G1 inter blocks as unit records (chunk
+        entry, i0, icnt, chunk) and its G2 runs"""
         if tid == i32(0):
-            lds_st(L, L_CTL + C_SMODE * 4, i32(1))
             nun = lds_ld_i32(L, L_CTL + C_NCH * 4)
-            if const_expr(ROT):
-                last = lds_ld_i32(L, L_DCH + fx.max(nun - i32(1), i32(0)) * i32(4))
-                ce_l = last.shrui(i32(16)) & i32(0xFF)
-                lds_st(
-                    L,
-                    L_CTL + C_JSH * 4,
-                    ((nun > i32(0)) & (ce_l > i32(1))).select(nun - ce_l, i32(0)),
-                )
+            last = lds_ld_i32(L, L_DCH + fx.max(nun - i32(1), i32(0)) * i32(4))
+            ce_l = last.shrui(i32(16)) & i32(0xFF)
+            lds_st(
+                L,
+                L_CTL + C_JSH * 4,
+                ((nun > i32(0)) & (ce_l > i32(1))).select(nun - ce_l, i32(0)),
+            )
             C = i32(gpu.grid_dim.x)
             x = _xcd_rank(C)
             nb = nun * i32(KS2)
@@ -334,14 +263,6 @@ def build_smallm(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + (C_SM2 + 2) * 4, s2)
             lds_st(L, L_CTL + (C_SM2 + 3) * 4, t2)
             lds_st(L, L_CTL + C_DYNP * 4, qg)
-            # (a CTA without a G1 block: the block it prefetches, -1 none)
-            lds_st(
-                L,
-                L_CTL + C_SMPF * 4,
-                ((n == i32(0)) & (sk == i32(1)) & (nu > i32(0))).select(
-                    (x - r) % fx.max(nu, i32(1)), i32(-1)
-                ),
-            )
             lds_st(L, L_CTL + C_UNIT * 4, i32(0))
             lds_st(L, L_CTL + (C_UNIT + 1) * 4, fx.min(n, i32(UL_MAX)))
             lds_st(L, L_CTL + C_SMK * 4, i32(-1))
@@ -415,24 +336,10 @@ def build_smallm(kc: KernelCtx) -> dict:
         piece = kf.shrui(i32(16)) & i32(0xFF)
         sk = fx.max(kf.shrui(i32(24)) & i32(0xFF), i32(1))
         e, cc, ce = _chunk(ent)
-        mark(tid, a, 10)
-        tnow(tid, a, i32(32) + fx.min(u, i32(3)) * i32(2))
         R = gather_routes_chunk(L, tid, a, e, cc, ce, det=sk > i32(1))
-        if const_expr(os.environ.get("AITER_MEGAMOE_TP_ICTEST", "0") == "1"):
-            mark(tid, a, 27)
-            for _ in range_constexpr(10):
-                cbar(L, tid)
-            mark(tid, a, 26)
-            if tid == i32(0):
-                lds_st(L, L_CTL + C_GEXP * 4, i32(-1))
-            cbar(L, tid)
-            R = gather_routes_chunk(L, tid, a, e, cc, ce)
         if tid == i32(0):
             lds_st(L, L_CTL + C_UROWS * 4, R)
             lds_st_rel(L, L_CTL + C_USEQ * 4, u + i32(1))
-        mark(tid, a, 13)
-        if u == i32(0):
-            mark(tid, a, 25)
         # this unit's partial slot (block * sk + piece; one piece per CTA)
         uid = _xcd_rank(i32(gpu.grid_dim.x)) + u * i32(gpu.grid_dim.x)
         nk = i32(KS1) // sk
@@ -459,9 +366,6 @@ def build_smallm(kc: KernelCtx) -> dict:
                 half=icnt == i32(64),
                 dup=ce > i32(1),
             )
-        mark(tid, a, 14)
-        if u == i32(0):
-            mark(tid, a, 26)
         if sk > i32(1):
             blk = uid // sk
             if tid == i32(0):
@@ -477,7 +381,6 @@ def build_smallm(kc: KernelCtx) -> dict:
             if lds_ld_i32(L, L_CTL + C_SMLAST * 4) == i32(1):
                 _part_finish(L, tid, a, blk * sk, sk)
                 cbar(L, tid)
-                mark(tid, a, 27)
                 xq_export(L, tid, a, i0, icnt, i32(0), R)
                 cbar(L, tid)
                 if tid == i32(0):
@@ -487,8 +390,6 @@ def build_smallm(kc: KernelCtx) -> dict:
             cbar(L, tid)
             if tid == i32(0):
                 g_add_agent(smc(a, j, bank), icnt // i32(64))
-        mark(tid, a, 11)
-        tnow(tid, a, i32(33) + fx.min(u, i32(3)) * i32(2))
 
     @flyc.jit
     def _sm_import(L, tid, a, j, R, bank):
@@ -496,32 +397,20 @@ def build_smallm(kc: KernelCtx) -> dict:
             if tid == i32(0):
                 spin_sys_ge(smc(a, j, bank), i32(2 * KS2), a)
             cbar(L, tid)
-            mark(tid, a, 30)
             lb_import(L, tid, a, R)
             if tid == i32(0):
                 lds_st(L, L_CTL + C_SMK * 4, j)
-        mark(tid, a, 31)
 
     @flyc.jit
-    def _sm_g2(L, tid, a, j, c0, c1, bank, piece, qg, ev):
+    def _sm_g2(L, tid, a, j, c0, c1, bank, piece, qg):
         """GEMM2 of row chunk j over its column groups [c0, c1): the whole inter dim
         (qg 1), else its inter piece of KS2 / QF k-steps (partial route region piece)"""
-        mark(tid, a, 28)
-        tnow(tid, a, ev)
-        tval(tid, a, ev + i32(2), (c1 - c0) | (j << i32(8)))
         e, cc, ce = _chunk(lds_ld_i32(L, L_DCH + j * i32(4)))
-        if const_expr(GPRE):
-            # (the gather inside the GEMM2 prologue: after the w2 ring prefetch is issued)
-            def pre():
-                R_ = gather_routes_chunk(L, tid, a, e, cc, ce)
-                mark(tid, a, 29)
-                _sm_import(L, tid, a, j, R_, bank)
 
-            R = None
-        else:
-            R = gather_routes_chunk(L, tid, a, e, cc, ce)
-            mark(tid, a, 29)
-            pre = functools.partial(_sm_import, L, tid, a, j, R, bank)
+        # (the gather inside the GEMM2 prologue: after the w2 ring prefetch is issued)
+        def pre():
+            _sm_import(L, tid, a, j, gather_routes_chunk(L, tid, a, e, cc, ce), bank)
+
         if qg == i32(1):
             gemm2(
                 L,
@@ -530,14 +419,14 @@ def build_smallm(kc: KernelCtx) -> dict:
                 e,
                 i32(0),
                 i32(0),
-                R,
+                None,
                 fx.Boolean(False),
                 KS2,
                 i32(0),
                 c0,
                 c1,
                 pre=pre,
-                sdd=SDD2,
+                sdd=True,
                 odd=RGU > 1,
                 dup=ce > i32(1),
             )
@@ -549,7 +438,7 @@ def build_smallm(kc: KernelCtx) -> dict:
                 e,
                 piece * i32(KS2 // QF),
                 i32(0),
-                R,
+                None,
                 fx.Boolean(False),
                 KS2 // QF,
                 piece,
@@ -561,8 +450,6 @@ def build_smallm(kc: KernelCtx) -> dict:
                 dup=ce > i32(1),
             )
         cbar(L, tid)
-        mark(tid, a, 15)
-        tnow(tid, a, ev + i32(1))
 
     @flyc.jit
     def _sm_run(L, tid, a, s0, s1, bank, run):
@@ -579,30 +466,15 @@ def build_smallm(kc: KernelCtx) -> dict:
             c0 = (fx.max(s0, g * i32(NU)) - g * i32(NU)) * i32(GPC // U)
             c1 = (fx.min(s1, (g + i32(1)) * i32(NU)) - g * i32(NU)) * i32(GPC // U)
             jp = g // qg
-            ev = i32(40 + 12 * run) + fx.min(i32(k_), i32(3)) * i32(3)
-            _sm_g2(L, tid, a, _rot(L, jp), c0, c1, bank, g - jp * qg, qg, ev)
+            _sm_g2(L, tid, a, _rot(L, jp), c0, c1, bank, g - jp * qg, qg)
 
     @flyc.jit
     def sm_compute(L, tid, a):
-        """(compute waves, after the plan)"""
-        if lds_ld_i32(L, L_CTL + C_SMODE * 4) == i32(1):
-            _sm_compute(L, tid, a)
-        else:
-            _dyn_loop(L, tid, a)
-
-    @flyc.jit
-    def _sm_compute(L, tid, a):
-        """the G1 blocks, then the G2 runs"""
+        """(compute waves, after the plan) the G1 blocks, then the G2 runs"""
         bank = a["epoch"] & i32(1)  # (sm_zero_next: zeroed by the previous launch)
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
         for u_ in range(i32(0), ue, i32(1)):
             _sm_g1(L, tid, a, i32(u_), bank)
-        if const_expr(DPF):
-            pf = lds_ld_i32(L, L_CTL + C_SMPF * 4)
-            if pf >= i32(0):
-                jp = pf // i32(KS2)
-                ent = lds_ld_i32(L, L_DCH + _rot(L, jp) * i32(4))
-                kc.pf_unit(L, tid, a, ent & i32(0xFFFF), (pf - jp * i32(KS2)) * i32(128), i32(128), False)
         for run in range_constexpr(2):
             _sm_run(
                 L,
@@ -613,6 +485,5 @@ def build_smallm(kc: KernelCtx) -> dict:
                 bank,
                 run,
             )
-        mark(tid, a, 12)
 
     return locals()

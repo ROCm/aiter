@@ -90,7 +90,7 @@ XQ_SHIFT = 20
 NW = 4
 NT = NW * 64
 NTT = NT + 4 * 64
-NSK = int(os.environ.get("AITER_MEGAMOE_TP_NSK", "4"))  # (debug override)
+NSK = 4
 SLOT = 4 * 1024 + 2 * 256
 OPS = 6
 KCS = 2
@@ -123,16 +123,6 @@ _SM_KEY = _src_key(
     "mega_moe_tp_kernel.py",
     "common.py",
 )
-
-
-def _env_tag() -> str:
-    """the AITER_MEGAMOE_TP_* debug variables set (kernel variants in one process)"""
-    env = sorted(
-        (k, v) for k, v in os.environ.items() if k.startswith("AITER_MEGAMOE_TP_")
-    )
-    if not env:
-        return ""
-    return "_env" + hashlib.sha1(repr(env).encode()).hexdigest()[:8]
 
 
 def mega_moe_tp_shape_supported(model_dim: int, inter_dim: int, tp: int) -> bool:
@@ -273,8 +263,6 @@ C_G2LAST, C_G2VN, C_PFW, C_LBJ2 = 88, 89, 90, 94
 # 1: every activation chunk of the launch landed (the AG helper polled it before the GEMMs
 # load the memory system: the A loader skips its per-chunk waits)
 C_AGALL = 95
-# (QOVL) helper waves done quantizing the input rows
-C_QDONE = 54
 # per-CTA unit list (dynamic / LB): UL_MAX records of 4 ints
 C_UL = 96
 UL_MAX = (128 - C_UL) // 4
@@ -324,7 +312,6 @@ def kernel_config(
     tn_local: bool = False,
     lbpf: bool = False,
     lbp: int = 0,
-    trace: bool = False,
     sm: bool = False,
     ar2: bool = False,
 ):
@@ -338,24 +325,17 @@ def kernel_config(
     # pairs (both A chunks in one buffer), when the LDS takes the second A chunk
     HB = (
         bool(sm)
-        and os.environ.get("AITER_MEGAMOE_TP_HB", "1") == "1"
-        and (MT <= 2 or os.environ.get("AITER_MEGAMOE_TP_HB3", "0") == "1")  # (MT 3: the halves run at half the bytes per us, measured)
+        # (MT 3: the halves run at half the bytes per us, measured)
+        and MT <= 2
         and (KCS * 2) <= H // 128
         and (H // 128 // 2) % (nsk * KCS // math.gcd(nsk, KCS)) == 0
     )
     # (small-M) the plan's route list (route ranks from the count's LDS atomics, after
     # aiter #7095's route histograms): the chunk gathers copy instead of scanning
-    RL = (
-        min(TMAX, DYN_MAX) * TOPK
-        if sm and not lb and os.environ.get("AITER_MEGAMOE_TP_RLIST", "1") == "1"
-        else 0
-    )
+    RL = min(TMAX, DYN_MAX) * TOPK if sm and not lb else 0
     if HB:
         c_ = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, True, RL)
-        HB = (
-            c_["LDS_BYTES"] <= 160 * 1024
-            and 2 * c_["NA_L"] * (ALOAD_DEPTH - 1) <= 63
-        )
+        HB = c_["LDS_BYTES"] <= 160 * 1024 and 2 * c_["NA_L"] * (ALOAD_DEPTH - 1) <= 63
     c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, HB, RL)
     ABS, ASS = c["ABS"], c["ASS"]
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
@@ -456,29 +436,10 @@ def kernel_config(
         + (f"_ad{ADEPTH}" if ADEPTH != ALOAD_DEPTH else "")
         + ("_pf" if LBPF else "")
         + ("_tnl" if TNL else "")
-        + ("_trace" if trace else "")
-        + ("2" if trace == 2 else "")
         + (f"_sm{_SM_KEY}" if sm else "")
         + ("_hb" if HB else "")
-        + _env_tag()
         + ("_ar2" if ar and ar2 else "")
-        + (f"_nsk{NSK}" if NSK != 4 else "")
-        + ("_dpf" if sm and os.environ.get("AITER_MEGAMOE_TP_DPF", "0") == "1" else "")
-        + (f"_cnap{os.environ.get('AITER_MEGAMOE_TP_CNAP')}" if os.environ.get("AITER_MEGAMOE_TP_CNAP", "4") != "4" else "")
-        + ("_qovl" if sm and os.environ.get("AITER_MEGAMOE_TP_QOVL", "0") == "1" else "")
-        + ("_agra0" if os.environ.get("AITER_MEGAMOE_TP_AGRA", "1") != "1" else "")
-        + (f"_rsk{os.environ.get('AITER_MEGAMOE_TP_RSK')}" if sm and os.environ.get("AITER_MEGAMOE_TP_RSK", "0") != "0" else "")
     )
-    # debug: per-CTA s_memrealtime marks after the ctrl block (MegaMoeTPEngine.trace_dump,
-    # AITER_MEGAMOE_TP_TRACE=1): 0 start, 16 LDS init, 17 stale lines dropped, 18 routing sent,
-    # 1 input quantized, 5 input all-gather sent; compute waves: 2 routing landed, 24 stale
-    # dropped, 21 routes counted, 23 chunk table, 3 plan, 10 / 11 / 12 last unit: GEMM1 start
-    # / GEMM1 end / GEMM2 end (small-M: last G1 unit start / end, G2 done; 13 / 14 last G1
-    # routes gathered / GEMM1 end; 28 / 29 / 30 / 31 / 15 last G2 call: start, routes
-    # gathered, chunk waited, imported, end), 4 compute done; wave 4: 6 push done, 7 finals
-    # done; 8 roles barrier, 9 before finish
-    TRACE = bool(trace)
-    TRACE_LIGHT = trace == 2
     # small-M schedule (smallm.py): needs the dynamic schedule's LL route rows
     SM = bool(sm)
     assert not SM or (DLL and not lb and not a8)

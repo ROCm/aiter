@@ -5,8 +5,6 @@ GEMM2 units claimed by whichever CTA is free)."""
 
 from __future__ import annotations
 
-import os
-
 import functools
 
 import flydsl.compiler as flyc
@@ -35,14 +33,11 @@ from .common import (
     rsrc,
     spin0,
     spin_lds_ge,
-    trace_mark,
-    dma16,
     uni,
     wait_lgkm0,
     wait_vm,
     wave_rank,
 )
-from .mega_moe_tp_config import DYN_MAX
 from .mega_moe_tp_config import (
     C_CDONE,
     C_CLAIM,
@@ -69,12 +64,12 @@ from .mega_moe_tp_config import (
     C_USEQ,
     CTRL_COLC,
     CTRL_G1C,
-    CTRL_INTS,
     CTRL_LBR,
     CTRL_LBSEQ,
     CTRL_SMC,
     CTRL_SMF,
     CTRL_XF,
+    DYN_MAX,
     G1C_STRIDE,
     LRDY_STRIDE,
     N_XCD,
@@ -88,10 +83,6 @@ from .mega_moe_tp_config import (
     XQ_SHIFT,
     KernelCtx,
 )
-
-
-# (small-M) CTAs without GEMM1 work prefetch a neighbour's back half
-DPF = os.environ.get("AITER_MEGAMOE_TP_DPF", "0") == "1"
 
 
 def build_schedule(kc: KernelCtx) -> dict:
@@ -110,12 +101,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     lb, lrdy_at, masked = kc.get("lb lrdy_at masked")
     rch, report_chunk, spin_sys_ge = kc.get("rch report_chunk spin_sys_ge")
     unit_fields, zero_masked = kc.get("unit_fields zero_masked")
-    TRACE, SM, route_regs = kc.get("TRACE SM route_regs")
-    H, KS1, L_RING = kc.get("H KS1 L_RING")
-
-    def mark(tid, a, k):
-        if TRACE and (not kc.TRACE_LIGHT or k < 10 or k >= 40):
-            trace_mark(a["ctrl"], CTRL_INTS, k, tid, 0)
+    SM, route_regs = kc.get("SM route_regs")
 
     @flyc.jit
     def gemm2_dispatch(L, tid, a, expert, ks0, icnt, r0, rows, signal):
@@ -155,13 +141,11 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     # small-M launches: no L2 invalidate at the start (it evicts the kernarg lines, whose
     # re-load then stalls every CTA ~2 us); their reads of peer-written data are sc1 / sys
-    DSTALE = os.environ.get(
-        "AITER_MEGAMOE_TP_DSTALE", "none" if SM and not kc.TN else "agent"
-    )
+    DSTALE = not SM or kc.TN
 
     @flyc.jit
     def _drop_stale(tid, a):
-        if const_expr(DSTALE == "agent"):
+        if const_expr(DSTALE):  # noqa: SIM102
             if tid < i32(64):
                 fx.memory_fence(syncscope="agent", ordering=ACQ)  # drop stale L1 lines
         bid = i32(gpu.block_id("x"))
@@ -177,11 +161,8 @@ def build_schedule(kc: KernelCtx) -> dict:
             spin_sys_ge(ctrl_at(a, i32(CTRL_XF) + x), a["epoch"])
 
     def unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig):
-        mark(tid, a, 10)
         gemm1(L, tid, a, expert, i0, icnt // i32(128))
-        mark(tid, a, 11)
         gemm2_dispatch(L, tid, a, expert, i0 // i32(128), icnt, r0, rows, sig)
-        mark(tid, a, 12)
 
     @flyc.jit
     def _dyn_loop(L, tid, a):
@@ -190,8 +171,6 @@ def build_schedule(kc: KernelCtx) -> dict:
         ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
         if ub == ue:
-            if const_expr(SM and DPF):
-                _dyn_prefetch(L, tid, a)
             report_chunk(L, lane, w, i32(NCK - 1))
         for u_ in range(ub, ue, i32(1)):
             u = i32(u_)
@@ -226,48 +205,6 @@ def build_schedule(kc: KernelCtx) -> dict:
             lb_g2_phase(L, tid, a)
 
     @flyc.jit
-    def pf_unit(L, tid, a, e, i0, icnt, w2):
-        """read the back half of a unit -- its GEMM1 k-steps from KS1 / 2 on (inter rows
-        [i0, i0 + icnt) of expert e) and (w2) its GEMM2 k-step -- into the MALL: a CTA
-        without work of its own, while the unit's CTA streams the front half"""
-        lane = tid % i32(64)
-        w = uni(tid // i32(64))
-        e = uni(e)
-        dst = L + i32(L_RING) + w * i32(1024)
-        r1 = rsrc(fx.Int64(a["w1"]) + fx.Int64(e) * fx.Int64(I * H))
-        ng = icnt // i32(16)  # 16-row groups per half (gate / up)
-        nk = KS1 - KS1 // 2
-        for q_ in range(w, ng * i32(2 * nk), i32(NW)):
-            q = i32(q_)
-            g = q // i32(nk)
-            kk = q - g * i32(nk) + i32(KS1 // 2)
-            up = g >= ng
-            row = up.select(i32(I) + i0 + (g - ng) * i32(16), i0 + g * i32(16))
-            wait_vm(40)
-            dma16(dst, r1, lane * i32(16), row * i32(H // 2) + kk * i32(1024))
-        if const_expr(w2):
-            r2 = rsrc(fx.Int64(a["w2"]) + fx.Int64(e) * fx.Int64(H * (I // 2)))
-            kp = i0 // i32(128)
-            for n_ in range(w, i32(H // 16), i32(NW)):
-                wait_vm(40)
-                dma16(dst, r2, lane * i32(16), i32(n_) * i32(16 * (I // 2)) + kp * i32(1024))
-        wait_vm(0)
-
-    @flyc.jit
-    def _dyn_prefetch(L, tid, a):
-        """(a CTA without a dynamic unit) pf_unit of the next CTA's"""
-        C = i32(gpu.grid_dim.x)
-        P = lds_ld_i32(L, L_CTL + C_DYNP * 4)
-        U = lds_ld_i32(L, L_CTL + C_NCH * 4) * P
-        if U > i32(0):
-            u = fx.min(_xcd_rank(C) * U // C, U - i32(1))
-            j = u // P
-            icnt = i32(I) // P
-            pf_unit(
-                L, tid, a, lds_ld_i32(L, L_DCH + j * i32(4)) & i32(0xFFFF), (u - j * P) * icnt, icnt, True
-            )
-
-    @flyc.jit
     def compute_units(L, tid, a):
         if const_expr(not ar and not MLL):
             ag_wait_meta(a, tid, a["epoch"])
@@ -275,9 +212,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         if const_expr(not lb):
             # the dynamic schedule's routes in registers (MLL: the meta wait)
             a["rregs"] = route_regs(tid, a)
-        mark(tid, a, 2)
         _stale_dropped(tid, a)
-        mark(tid, a, 24)
         if const_expr(ar and not DLL):
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         cbar(L, tid)
@@ -290,12 +225,10 @@ def build_schedule(kc: KernelCtx) -> dict:
             lb_plan(L, tid, a)
         else:
             dyn_plan(L, tid, a)
-        mark(tid, a, 3)
         if const_expr(SM):
             kc.sm_compute(L, tid, a)
         else:
             _dyn_loop(L, tid, a)
-        mark(tid, a, 4)
         if const_expr(DLL):  # noqa: SIM102
             if tid == i32(0):
                 lds_st_rel(L, L_CTL + C_CDONE * 4, i32(1))
@@ -312,10 +245,8 @@ def build_schedule(kc: KernelCtx) -> dict:
                 rk = lds_atomic_add(L, L_DCNT + e * i32(4), 1)
             ranks.append((ok, e, rk, idx, wv))
         cbar(L, tid)
-        mark(tid, a, 21)
-        if const_expr(PCT):
-            _par_chunk_table(L, tid)
-        if const_expr(RL and PCT):
+        _par_chunk_table(L, tid)
+        if const_expr(RL):
             # (aiter #7095's route histogram: the count's LDS atomic gives each route its
             # rank in its expert) the route list, expert by expert: the chunk gathers copy
             # their rows from it (published by the closing barrier below)
@@ -325,9 +256,6 @@ def build_schedule(kc: KernelCtx) -> dict:
                     lds_st(L, L_RLI + sl * i32(4), idx)
                     lds_st(L, L_RLW + sl * i32(4), wv)
         if tid < i32(64):
-            if const_expr(not PCT):
-                _wave_chunk_table(L, tid)
-            mark(tid, a, 23)
             if const_expr(SM):
                 kc.sm_units(L, tid, a)
             else:
@@ -335,13 +263,14 @@ def build_schedule(kc: KernelCtx) -> dict:
         cbar(L, tid)
 
     # the chunk table over the compute waves (contiguous expert groups of 64 per wave)
-    PCT = os.environ.get("AITER_MEGAMOE_TP_PCT", "1") == "1"
     NG = ceildiv(E, 64)
     GPW = ceildiv(NG, NW)
 
     @flyc.jit
     def _par_chunk_table(L, tid):
-        """(compute waves) _wave_chunk_table, wave w the expert groups [w GPW, (w+1) GPW)"""
+        """(compute waves) expert e -> ceil(routes / rch) row chunks, listed expert-ascending
+        in L_DCH (e | chunks << 16 | chunk << 24), C_NCH = their number; wave w the expert
+        groups [w GPW, (w+1) GPW). RL: L_ROFF = each expert's first route list entry"""
         lane = tid % i32(64)
         w = tid // i32(64)
         ces = []
@@ -395,29 +324,6 @@ def build_schedule(kc: KernelCtx) -> dict:
         if tid == i32(0):
             lds_st(L, L_CTL + C_NCH * 4, nch)
         cbar(L, tid)
-
-    @flyc.jit
-    def _wave_chunk_table(L, lane):
-        """(one wave) expert e -> ceil(routes / rch) row chunks, listed expert-ascending in
-        L_DCH (e | chunks << 16 | chunk << 24); C_NCH = their number"""
-        base = i32(0)
-        for k in range_constexpr(ceildiv(E, 64)):
-            e = lane + i32(k * 64)
-            live = e < i32(E)
-            r = live.select(
-                lds_ld_i32(L, L_DCNT + fx.min(e, i32(E - 1)) * i32(4)), i32(0)
-            )
-            ce = fx.min(ceildiv(r, i32(rch)), i32(255))
-            pre, tot = _wave_prefix(ce, 8)
-            off = base + pre
-            for c_ in range(i32(0), ce, i32(1)):
-                c = i32(c_)
-                lds_st(
-                    L, L_DCH + (off + c) * i32(4), e | (ce << i32(16)) | (c << i32(24))
-                )
-            base = base + tot
-        if lane == i32(0):
-            lds_st(L, L_CTL + C_NCH * 4, base)
 
     @flyc.jit
     def _dyn_prefix(L, tid):
