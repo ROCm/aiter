@@ -1,10 +1,17 @@
 import triton
 import triton.language as tl
+from triton.language.extra.hip import libdevice
 
 
 @triton.jit
 def _silu_exp2(x):
     return x / (1.0 + tl.exp2(-(x * 1.44269504089)))
+
+
+@triton.jit
+def _silu_exp2_fast(x):
+    # Approximate reciprocal (v_rcp_f32) instead of the IEEE divide sequence. Use it in memory-bound kernels.
+    return libdevice.fast_dividef(x, 1.0 + tl.exp2(-(x * 1.44269504089)))
 
 
 @triton.jit
@@ -63,6 +70,7 @@ def _get_activation_from_str(activation: str):
         "sigmoid_exp2": _sigmoid_exp2,
         "silu": _silu,
         "silu_exp2": _silu_exp2,
+        "silu_exp2_fast": _silu_exp2_fast,
         "relu": _relu,
         "relu6": _relu6,
     }
@@ -83,6 +91,8 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
         return _silu(x)
     elif activation == "silu_exp2":
         return _silu_exp2(x)
+    elif activation == "silu_exp2_fast":
+        return _silu_exp2_fast(x)
     elif activation == "relu":
         return _relu(x)
     elif activation == "relu6":
