@@ -16,10 +16,16 @@
 Replace `F.linear` with `tgemm.mm` in `aiter/tuned_gemm.py`, then run your workload:
 
 ```bash
-AITER_TUNE_GEMM=1 python {workload_tests}
+AITER_TUNE_GEMM=1 \
+  AITER_TUNE_GEMM_DIR=/tuning/<model-or-run> \
+  AITER_TUNE_GEMM_SHARD_ID=${HOSTNAME}-${RANK:-0} \
+  python {workload_tests}
 ```
 
-Captured shapes are written to `aiter/configs/bf16_untuned_gemm.csv`.
+`AITER_TUNE_GEMM_DIR` is required so that unrelated model runs cannot mix
+shards. The shard ID is optional (the default is hostname plus PID), but a
+rank/pod ID makes distributed output easier to identify. Merge the resulting
+`bf16_untuned_gemm.<shard-id>.csv` files before tuning.
 
 ### 2) Tune GEMMs
 
