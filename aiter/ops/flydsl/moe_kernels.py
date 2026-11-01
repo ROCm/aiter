@@ -3459,9 +3459,9 @@ def flydsl_moe_fused_quant_preshuffle(
     if skip_padding:
         masked_m = masked_m.to(device=device, dtype=torch.int32).reshape(-1)
     else:
-        # Unused by the kernel (skip_padding=False); a tiny dummy keeps the launch
-        # signature uniform without allocating per-row scratch.
-        masked_m = torch.empty(max(E, 1), dtype=torch.int32, device=device)
+        # Unread when skip_padding=False (and in non-remapping route branches).
+        # Keep the pointer ABI without allocating another unused tensor.
+        masked_m = out_payload
 
     from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 
