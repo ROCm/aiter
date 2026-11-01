@@ -55,6 +55,20 @@ _GLUON_REDUCE_MAX_SEGMENTS = 8
 # (tokens * query heads) per CU; past that the 2D grid fills the GPU.
 _GFX12_3D_MAX_SEQLEN_Q = 16
 _GFX12_3D_MAX_QUERY_ROWS_PER_CU = 8
+# attn_3d config keys that steer use_2d_kernel on gfx1250 rather than the launch:
+# MAX_QUERY_ROWS_PER_CU overrides the short-query bound above, and
+# PREFILL_MAX_2D_PRGMS / PREFILL_MIN_KV / PREFILL_MIN_KV_PER_PRGM opt an entry
+# into the 3D split for prefill over a long cached prefix, and PREFILL_FILL_TIERS
+# raises that cap for uneven batches when the caller passes attn_work (see
+# use_2d_kernel).
+_GFX12_ROUTING_KEYS = (
+    "MAX_QUERY_ROWS_PER_CU",
+    "PREFILL_MAX_2D_PRGMS",
+    "PREFILL_MIN_KV",
+    "PREFILL_MIN_KV_PER_PRGM",
+    "PREFILL_FILL_TIERS",
+    "PREFILL_REF_BLOCK_M",
+)
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -118,6 +132,9 @@ class _UAParams(NamedTuple):
     q_dtype: torch.dtype
     kv_cache_dtype: torch.dtype
     all_decode: bool  # max_seqlen_q == 1
+    # equal_seqlen_q and not all_decode: speculative-decode verify, every seq
+    # holds max_seqlen_q queries
+    spec_decode: bool
     shuffled_kv_cache: bool
     use_alibi_slopes: bool  # alibi_slopes is not None
     use_qq_bias: bool  # qq_bias is not None
@@ -127,6 +144,9 @@ class _UAParams(NamedTuple):
     target_num_prgms: int  # num_sms * 4: the target the heuristics aim at
 
     # optional inputs
+    # sum over seqs of new tokens x mean attended context (causal query-key pairs),
+    # from the caller's host-side lengths; 0 when not given
+    attn_work: int = 0
     sinks: torch.Tensor | None = None
     alibi_slopes: torch.Tensor | None = None
     qq_bias: torch.Tensor | None = None
@@ -185,20 +205,70 @@ def _gfx950_split_grid(params: _UAParams):
     return config["NUM_SEGMENTS"] > 1
 
 
+def _gfx12_2d_prgms(params: _UAParams, block_m: int | None = None):
+    """Programs the gfx1250 2D kernel would launch (KV heads x query blocks), and
+    the queries a block covers; at the attn_2d entry's BLOCK_M unless given."""
+    if block_m is None:
+        config = get_unified_attention_config("attn_2d", params, backend="gluon")
+        block_m = config["BLOCK_M"]
+    block_m = max(block_m, triton.next_power_of_2(params.num_queries_per_kv))
+    block_q = block_m // params.num_queries_per_kv
+    prgms = params.num_kv_heads * (params.num_tokens // block_q + params.num_seqs)
+    return prgms, block_q
+
+
+def _gfx12_prefill_fill(params: _UAParams, prgms: int, block_q: int):
+    """Share of a 2D prefill launch's time that is real work: the caller's
+    attn_work over (programs x the longest walk, one block over the longest
+    context). Near 1 the grid is evenly loaded; low when a long-context seq adds
+    a few tokens next to a big chunk over a short context. None without the hint."""
+    if params.attn_work <= 0:
+        return None
+    return (params.attn_work * params.num_kv_heads) / (
+        prgms * block_q * params.max_seqlen_k
+    )
+
+
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     # if IS_DEVICE_ARCH_GFX12, use 3D for decode, and for short (spec-decode verify)
-    # queries while their rows are too few to fill the 2D grid; 2D otherwise.
+    # queries while their rows are too few to fill the 2D grid; 2D otherwise, unless
+    # the attn_3d entry opts prefill over a long cached prefix into the 3D split.
     if IS_DEVICE_ARCH_GFX12:
         if params.sliding_window > 0:
             return True
         if params.all_decode:
             return False
-        short_query_3d = (
-            params.max_seqlen_q <= _GFX12_3D_MAX_SEQLEN_Q
-            and params.num_tokens * params.num_query_heads
-            <= _GFX12_3D_MAX_QUERY_ROWS_PER_CU * params.num_sms
+        route = get_unified_attention_config("attn_3d", params, backend="gluon")
+        if params.max_seqlen_q <= _GFX12_3D_MAX_SEQLEN_Q:
+            rows_cap = route.get(
+                "MAX_QUERY_ROWS_PER_CU", _GFX12_3D_MAX_QUERY_ROWS_PER_CU
+            )
+            return (
+                params.num_tokens * params.num_query_heads > rows_cap * params.num_sms
+            )
+        # With few KV heads (TP) a prefill chunk can launch too few 2D programs to
+        # fill the GPU, each streaming the whole prefix; the 3D kernel splits the
+        # KV range instead. It pays while each of those programs has a long run of
+        # keys to split, i.e. the prefix dominates the chunk.
+        max_prgms = route.get("PREFILL_MAX_2D_PRGMS", 0)
+        if max_prgms == 0:
+            return True
+        prgms, block_q = _gfx12_2d_prgms(params, route.get("PREFILL_REF_BLOCK_M"))
+        # A 2D call lasts as long as its longest program, one block walking the
+        # longest context. With the caller's work hint, fill = work / (programs x
+        # that walk) says how much of the grid's time is real work: a long-context
+        # seq adding a few tokens next to a big chunk over a short context leaves
+        # most programs idle, and the 3D split pays above the plain program cap.
+        fill = _gfx12_prefill_fill(params, prgms, block_q)
+        if fill is not None:
+            for max_fill, tier_prgms in route.get("PREFILL_FILL_TIERS", ()):
+                if fill < max_fill:
+                    max_prgms = max(max_prgms, tier_prgms)
+        min_kv = max(
+            route.get("PREFILL_MIN_KV", 0),
+            route.get("PREFILL_MIN_KV_PER_PRGM", 0) * prgms,
         )
-        return not short_query_3d
+        return prgms >= max_prgms or params.max_seqlen_k < min_kv
 
     # The gfx950 Gluon kernel is one kernel with a decode and a prefill grid,
     # and it owns its KV split, so decode and split batches take the 3d path
@@ -250,6 +320,13 @@ def unified_attention(
     sinks=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    # every seq has the same query length (max_seqlen_q), e.g. speculative-decode
+    # verify; lets the kernels locate a query block without searching cu_seqlens_q
+    equal_seqlen_q: bool = False,
+    # optional: the batch's causal query-key pairs, sum_i q_i * (k_i - q_i / 2) over
+    # its seqs, computed by the caller on the host. Lets the gfx1250 router see how
+    # evenly a prefill's work spreads over the 2D grid; never read on the GPU.
+    attn_work: int | None = None,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
@@ -346,6 +423,11 @@ def unified_attention(
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
     ALL_DECODE = int(max_seqlen_q) == 1
+    # With equal_seqlen_q, seq i's queries are q rows [i, i + 1) * max_seqlen_q.
+    # Trailing pad seqs may have no rows behind them so long as their seqused_k
+    # is 0: the launches stop at the last seq with rows, and both kernels return
+    # on an empty KV before they touch q or out.
+    SPEC_DECODE = equal_seqlen_q and not ALL_DECODE
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
     else:
@@ -384,6 +466,8 @@ def unified_attention(
         q_dtype=q_dtype,
         kv_cache_dtype=kv_cache_dtype,
         all_decode=ALL_DECODE,
+        spec_decode=SPEC_DECODE,
+        attn_work=int(attn_work or 0),
         shuffled_kv_cache=shuffled_kv_cache,
         use_alibi_slopes=use_alibi_slopes,
         use_qq_bias=use_qq_bias,
@@ -423,6 +507,22 @@ def unified_attention(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
         NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
+        if (
+            use_gluon_3d
+            and IS_DEVICE_ARCH_GFX12
+            and not (params.all_decode or params.spec_decode)
+            and config.get("FILL_MIN_SEGMENTS")
+        ):
+            # the derived split bounds the grid at BLOCK_M 16, which on an uneven
+            # batch leaves it a few segments; the work hint says when to widen it
+            ref = get_unified_attention_config("attn_3d", params, backend="gluon")
+            prgms_bq = _gfx12_2d_prgms(params, ref.get("PREFILL_REF_BLOCK_M"))
+            fill = _gfx12_prefill_fill(params, *prgms_bq)
+            if fill is not None:
+                limit = triton.cdiv(params.max_seqlen_k, CONFIG_TILE_SIZE)
+                for max_fill, min_segments in config["FILL_MIN_SEGMENTS"]:
+                    if fill < max_fill:
+                        NUM_SEGMENTS = max(NUM_SEGMENTS, min(min_segments, limit))
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -825,6 +925,20 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     assert params.softcap == 0, "Softcap is not supported"
 
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
+    override = config.pop("FILL_OVERRIDE", None)
+    if override and not (params.all_decode or params.spec_decode):
+        # Over a long context, a batch the hint shows unevenly loaded runs faster on
+        # a wider block and tile; an even one (a single long sequence) does not.
+        ref = get_unified_attention_config("attn_3d", params, backend="gluon")
+        fill = _gfx12_prefill_fill(
+            params, *_gfx12_2d_prgms(params, ref.get("PREFILL_REF_BLOCK_M"))
+        )
+        if (
+            fill is not None
+            and fill < override["max_fill"]
+            and params.max_seqlen_k >= override["min_kv"]
+        ):
+            config.update(override["config"])
     NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -854,8 +968,16 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
 
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
+    # spec decode launches the exact block count, so the kernel needs no search
+    SEQLEN_Q = int(params.max_seqlen_q) if params.spec_decode else 1
     if params.all_decode:
         total_query_blocks = NUM_SEQS
+    elif params.spec_decode:
+        # only the seqs with q rows behind them; the trailing pad seqs of a
+        # DP-padded batch have none (and seqused_k == 0)
+        total_query_blocks = min(NUM_SEQS, params.num_tokens // SEQLEN_Q) * triton.cdiv(
+            SEQLEN_Q, BLOCK_Q
+        )
     else:
         total_query_blocks = params.num_tokens // BLOCK_Q + NUM_SEQS
 
@@ -906,6 +1028,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
         ALL_DECODE=params.all_decode,
+        SPEC_DECODE=params.spec_decode,
+        SEQLEN_Q=SEQLEN_Q,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         CAUSAL=params.causal,
         # useful for debugging when needed
@@ -928,14 +1052,23 @@ def _unified_attention_3d_gfx1250(
     QUERY_DTYPE = get_dtype_str(params.q_dtype)
     KV_CACHE_DTYPE = get_dtype_str(params.kv_cache_dtype)
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    for key in _GFX12_ROUTING_KEYS:
+        config.pop(key, None)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
 
+    # spec decode launches the exact block count, so the kernel needs no search
+    SEQLEN_Q = int(params.max_seqlen_q) if params.spec_decode else 1
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
+    elif params.spec_decode:
+        # only the seqs with q rows behind them, as in the 2d launch
+        total_num_q_blocks = min(
+            params.num_seqs, params.num_tokens // SEQLEN_Q
+        ) * triton.cdiv(SEQLEN_Q, config["BLOCK_Q"])
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
@@ -996,6 +1129,8 @@ def _unified_attention_3d_gfx1250(
         NUM_QUERY_HEADS=params.num_query_heads,
         NUM_KV_HEADS=params.num_kv_heads,
         ALL_DECODE=params.all_decode,
+        SPEC_DECODE=params.spec_decode,
+        SEQLEN_Q=SEQLEN_Q,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         SCALE_K_WIDTH=params.scale_k_width,
