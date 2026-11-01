@@ -1885,9 +1885,33 @@ namespace aiter {
         int m = residual.size(0);
         int hc_mult = residual.size(1);
         int hidden_size = residual.size(2);
+        // Reached from the Python binding: failed checks below must surface
+        // as a catchable RuntimeError, not abort the process.
+        aiter_detail::AiterThrowGuard throw_guard;
         int x_stride = x.stride(0);
         int residual_stride = residual.stride(0);
         AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
+        // mhc_post_kernel indexes out, post_layer_mix and comb_res_mix with
+        // hardcoded contiguous offsets (out: idx * hc_mult * hidden_size,
+        // mixes: idx * hc_mult / idx * hc_mult * hc_mult), and reads the
+        // inner dims of x and residual as packed rows. No stride is
+        // forwarded for those, so reject any layout the kernel would
+        // silently misread instead of producing wrong results.
+        AITER_CHECK(out.is_contiguous(), "mhc_post: out must be contiguous");
+        AITER_CHECK(out.size(0) == m && out.size(1) == hc_mult && out.size(2) == hidden_size,
+                    "mhc_post: out shape must be (m, hc_mult, hidden_size)");
+        AITER_CHECK(post_layer_mix.is_contiguous(), "mhc_post: post_layer_mix must be contiguous");
+        AITER_CHECK(post_layer_mix.size(0) == m && post_layer_mix.size(1) == hc_mult
+                        && post_layer_mix.numel() == m * hc_mult,
+                    "mhc_post: post_layer_mix shape must be (m, hc_mult[, 1])");
+        AITER_CHECK(comb_res_mix.is_contiguous(), "mhc_post: comb_res_mix must be contiguous");
+        AITER_CHECK(comb_res_mix.size(0) == m && comb_res_mix.size(1) == hc_mult
+                        && comb_res_mix.size(2) == hc_mult,
+                    "mhc_post: comb_res_mix shape must be (m, hc_mult, hc_mult)");
+        AITER_CHECK(x.stride(-1) == 1, "mhc_post: x last dim must be contiguous");
+        AITER_CHECK(residual.stride(-1) == 1 && residual.stride(1) == hidden_size,
+                    "mhc_post: residual inner dims must be packed "
+                    "(stride(1) == hidden_size, stride(-1) == 1)");
 
         const HipDeviceGuard device_guard(residual.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
