@@ -570,21 +570,43 @@ def launch_gemm_a8w4_tdm(
         tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
         has_work = blk_m < tile_map[n_experts - 1]
 
-        # In-kernel bisect: find the expert owning this valid M-tile.  Seed the
+        # Find the expert owning this valid M-tile.  Seed the
         # result with the padding sentinel so it remains defined outside the
         # dynamic branch and the existing main-body guard stays valid.
         expert = blk_m * 0 + n_experts
         if has_work:
-            lo, hi = blk_m * 0, blk_m * 0 + n_experts
-            for _ in range_constexpr(
-                max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
+            if const_expr(
+                persistent_workers > 0
+                and tile_m <= 32
+                and n_experts <= 256
+                and not enable_ep_scatter
             ):
-                mid = (lo + hi) >> 1
-                mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-                go_right = tile_map[mid_clamped] <= blk_m
-                lo = go_right.select(mid + 1, lo)
-                hi = go_right.select(hi, mid)
-            expert = lo
+                # Small persistent tiles are sensitive to dependent bisect
+                # loads. Count endpoints <= row with coalesced wave32 loads;
+                # repeated endpoints skip empty experts. Every wave covers the
+                # whole table, without LDS or inter-wave synchronization.
+                matched = fx.Int32(0)
+                for base in range_constexpr(0, n_experts, WAVE):
+                    index = fx.Int32(base) + fx.Int32(lane)
+                    valid_index = index < fx.Int32(n_experts)
+                    safe_index = valid_index.select(index, fx.Int32(0))
+                    endpoint = tile_map[safe_index]
+                    hit = valid_index & (endpoint <= blk_m)
+                    # ROCDL returns i64 even on wave32; only its low half is live.
+                    bits = fx.Uint32(rocdl.ballot(T.i64, hit))
+                    matched = matched + fx.Int32(fx.ctpop(bits))
+                expert = matched
+            else:
+                lo, hi = blk_m * 0, blk_m * 0 + n_experts
+                for _ in range_constexpr(
+                    max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
+                ):
+                    mid = (lo + hi) >> 1
+                    mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
+                    go_right = tile_map[mid_clamped] <= blk_m
+                    lo = go_right.select(mid + 1, lo)
+                    hi = go_right.select(hi, mid)
+                expert = lo
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)
