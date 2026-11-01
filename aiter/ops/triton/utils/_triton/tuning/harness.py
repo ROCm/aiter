@@ -13,10 +13,13 @@ config=None (the installed config). Records are appended as soon as a candidate 
 Record fields:
   status    ready (worker is set up), start (candidate began), ok, error
   baseline  true for the installed config
-  config    the raw candidate, never the mutated copy; for the baseline the installed config
-            (launched through the wrapper's own config=None path unless keys DEFAULT.json does
-            not have had to be stripped first; dropped_keys lists them)
+  config    the raw candidate, never the mutated copy; for the baseline the installed config of
+            the tree the sweep installs into (the default tree, or with --cu-dir the <cu_num>cu/
+            tree), launched through the wrapper's own config=None path unless that path reads
+            another tree on this device or keys DEFAULT.json does not have had to be stripped
+            first (dropped_keys lists them)
   gpu       HIP_VISIBLE_DEVICES of the worker
+  cu_num    CU count of the worker's device (get_config_cu_num()); null when it cannot be read
   is_tuned  baseline only: a specialized file served this shape
   us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
   error     the exception text when status is error
@@ -38,7 +41,7 @@ from kernels import (
     family_bounds,
     flops,
     get_spec,
-    resolve_installed,
+    installed_baseline,
 )
 from space import UnknownConfigKey, build_space, load_defaults
 
@@ -111,9 +114,12 @@ def gpu_alive():
         return False
 
 
-def plan(spec, shape, backend, arch, should_skip, space_out):
+def plan(spec, shape, backend, arch, should_skip, space_out, cu_num=None):
+    """cu_num: the --cu-dir scope; the plan also records the device's CU count."""
+    from aiter.ops.triton.utils.config_utils import get_config_cu_num
+
     try:
-        configs, report = build_space(spec, shape, backend, arch, should_skip)
+        configs, report = build_space(spec, shape, backend, arch, should_skip, cu_num)
     except UnknownConfigKey as e:
         print(e, file=sys.stderr)
         return 2
@@ -123,8 +129,10 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
         backend=backend,
         kernel=spec.name,
         shape=shape,
-        bounds=list(family_bounds(spec, backend, shape)),
+        bounds=list(family_bounds(spec, backend, shape, cu_num)),
         configs=configs,
+        cu_num=get_config_cu_num(),
+        cu_dir=cu_num is not None,
     )
     with open(space_out, "w") as f:
         json.dump(plan_, f)
@@ -132,9 +140,22 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
 
 
 def benchmark(
-    spec, shape, backend, arch, call, inputs, candidates, out, calls, replays, cold_mb
+    spec,
+    shape,
+    backend,
+    arch,
+    call,
+    inputs,
+    candidates,
+    out,
+    calls,
+    replays,
+    cold_mb,
+    cu_num=None,
 ):
-    keys, _, _ = load_defaults(spec, backend)
+    from aiter.ops.triton.utils.config_utils import get_config_cu_num
+
+    keys, _, _ = load_defaults(spec, backend, cu_num)
     copies = make_cold_copies(inputs, cold_mb)
     common = {
         "kernel": spec.name,
@@ -142,6 +163,7 @@ def benchmark(
         "arch": arch,
         "shape": shape,
         "gpu": os.environ.get("HIP_VISIBLE_DEVICES"),
+        "cu_num": get_config_cu_num(),
     }
     append_record(
         out,
@@ -164,11 +186,12 @@ def benchmark(
         t0 = time.time()
         try:
             if is_baseline:
-                installed, record["is_tuned"] = resolve_installed(spec, shape, backend)
-                dropped = sorted(k for k in installed if k not in keys)
-                record["config"] = {k: v for k, v in installed.items() if k in keys}
+                record["config"], record["is_tuned"], dropped, explicit = (
+                    installed_baseline(spec, shape, backend, keys, cu_num)
+                )
                 if dropped:  # keys DEFAULT.json does not have are never launched
                     record["dropped_keys"] = dropped
+                if explicit:
                     candidate = record["config"]
                 # otherwise candidate stays None: the wrapper's own installed-config path
             median, low, high = time_with_cuda_graph(
@@ -208,6 +231,11 @@ def main(argv=None):
         "--plan", action="store_true", help="only build the search space"
     )
     parser.add_argument("--space-out", help="where --plan writes the space (JSON)")
+    parser.add_argument(
+        "--cu-dir",
+        action="store_true",
+        help="plan from and time the baseline of the <arch>/<cu_num>cu/ tree of this device",
+    )
     parser.add_argument("--configs", help="JSON list of candidates, null = baseline")
     parser.add_argument("--out", help="JSONL results file, appended")
     parser.add_argument("--replays", type=int, default=25)
@@ -228,9 +256,16 @@ def main(argv=None):
     backend = args.backend or spec.default_backend(arch)
     check_backend(spec, arch, backend)
     call, inputs, should_skip = spec.setup(shape, backend)
+    cu_num = None
+    if args.cu_dir:
+        from aiter.ops.triton.utils.config_utils import get_config_cu_num
+
+        cu_num = get_config_cu_num()
+        if cu_num is None:
+            sys.exit("--cu-dir: the CU count of this device cannot be read")
 
     if args.plan:
-        return plan(spec, shape, backend, arch, should_skip, args.space_out)
+        return plan(spec, shape, backend, arch, should_skip, args.space_out, cu_num)
     with open(args.configs) as f:
         candidates = json.load(f)
     benchmark(
@@ -245,6 +280,7 @@ def main(argv=None):
         args.calls,
         args.replays,
         args.cold_mb,
+        cu_num,
     )
     return 0
 
