@@ -244,8 +244,9 @@ def case_to_tuned_row(
     *,
     gfx: str,
     cu_num: int,
+    watts: float | None = None,
 ) -> dict[str, Any]:
-    return {
+    row = {
         "gfx": gfx,
         "cu_num": int(cu_num),
         "dtype": str(case.dtype),
@@ -266,6 +267,14 @@ def case_to_tuned_row(
         "BV": int(bv),
         "us": float(f"{us:.1f}"),
     }
+    if watts is not None:
+        try:
+            watts_f = float(watts)
+        except (TypeError, ValueError):
+            watts_f = float("nan")
+        if math.isfinite(watts_f):
+            row["watts"] = round(watts_f, 3)
+    return row
 
 
 def sweep_case_row(
@@ -276,7 +285,11 @@ def sweep_case_row(
     *,
     gfx: str,
     cu_num: int,
+    policy=None,
 ) -> dict[str, Any] | None:
+    from aiter.utility.selection_policy import active_policy
+
+    policy = active_policy() if policy is None else policy
     if case.K != 128 or case.V != 128 or case.BT != 64:
         print(f"{case_id:58s} skipped (kernel supports K=V=128, BT=64 only)")
         return None
@@ -287,20 +300,32 @@ def sweep_case_row(
     )
 
     times = {}
+    watts = {}
     for bv in BV_CANDIDATES:
         if case.V % bv:
             continue
         times[bv] = bench_us(inputs, bv, warmup, iters)
+        os.environ["FLYDSL_K5_OPT_BV"] = str(bv)
+        try:
+            policy.record(watts, bv, lambda: k5(**inputs), kernel_us=times[bv])
+        finally:
+            os.environ.pop("FLYDSL_K5_OPT_BV", None)
 
     if not times:
         return None
 
-    best = min(times, key=times.get)
+    best = min(
+        times, key=lambda bv: policy.rank(times[bv], watts.get(bv, float("nan")))
+    )
     rule = _hipeq_select_bv(
         torch.device("cuda:0"), case.H, total_chunks, max_seq_chunks
     )
     gain = (times[rule] - times[best]) / times[rule] * 100 if rule in times else 0.0
     cells = " ".join(f"{times.get(bv, float('nan')):8.1f}" for bv in BV_CANDIDATES)
+    if watts:
+        cells += " " + " ".join(
+            f"{watts.get(bv, float('nan')):8.1f}" for bv in BV_CANDIDATES
+        )
     print(f"{case_id:58s} {total_chunks:7d} {cells} {best:5d} {rule:5d} {gain:6.1f}")
 
     return case_to_tuned_row(
@@ -314,6 +339,7 @@ def sweep_case_row(
         times[best],
         gfx=gfx,
         cu_num=cu_num,
+        watts=watts.get(best),
     )
 
 
@@ -370,6 +396,8 @@ def dataframe_from_cases(
 
 
 class K5BvTuner(TunerCommon):
+    SUPPORTS_POWER_SELECT = True
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "untune_file": _DEFAULT_UNTUNED,
@@ -460,10 +488,15 @@ class K5BvTuner(TunerCommon):
         if untunedf.empty:
             return []
 
+        policy = self.policy_for(args)
         if not hasattr(self, "_printed_tune_header"):
+            watt_header = ""
+            if policy.measures_power:
+                watt_header = " " + " ".join(f"W{bv:<7d}" for bv in BV_CANDIDATES)
             header = (
                 f"{'case':58s} {'chunks':>7s} "
                 + " ".join(f"BV{bv:<7d}" for bv in BV_CANDIDATES)
+                + watt_header
             ) + f" {'best':>5s} {'rule':>5s} {'gain%':>6s}"
             print(header)
             print("-" * len(header))
@@ -480,6 +513,7 @@ class K5BvTuner(TunerCommon):
                 args.iters,
                 gfx=self._gfx,
                 cu_num=self._cu_num,
+                policy=policy,
             )
             if tuned_row is None:
                 continue
@@ -501,29 +535,49 @@ class K5BvTuner(TunerCommon):
 
         if not emitted:
             return []
-        return pd.DataFrame(list(emitted.values()), columns=self.columns).to_dict(
-            "records"
-        )
+        frame = pd.DataFrame(list(emitted.values()))
+        columns = [
+            col for col in list(self.columns) + ["watts"] if col in frame.columns
+        ]
+        return frame.loc[:, columns].to_dict("records")
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         if isinstance(results, list):
-            results = pd.DataFrame(results, columns=self.columns)
+            frame = pd.DataFrame(results)
+            columns = [col for col in self.columns if col in frame.columns]
+            extras = [
+                col for col in frame.columns if col not in columns and col != "_case_id"
+            ]
+            results = frame.loc[:, columns + extras] if columns else frame
         if isinstance(results, pd.DataFrame):
             if results.empty:
                 return results
-            return (
-                results.sort_values("us")
-                .drop_duplicates(subset=self.keys, keep="first")
-                .reset_index(drop=True)
+            if "watts" in results.columns:
+                results = results.assign(
+                    watts=pd.to_numeric(results["watts"], errors="coerce")
+                )
+            results = self.policy_for(args).sort_frame(results)
+            return results.drop_duplicates(subset=self.keys, keep="first").reset_index(
+                drop=True
             )
         return pd.DataFrame(columns=self.columns)
 
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
-        for col in self.columns:
-            if col not in old_tunedf.columns:
-                old_tunedf[col] = pd.NA
-        resultdf = self.update_tunedf(old_tunedf, results.loc[:, self.columns])
+        saved_columns = self.columns
+        if (
+            isinstance(results, pd.DataFrame)
+            and "watts" in results.columns
+            and "watts" not in self.columns
+        ):
+            self.columns = list(self.columns) + ["watts"]
+        try:
+            for col in self.columns:
+                if col not in old_tunedf.columns:
+                    old_tunedf[col] = pd.NA
+            resultdf = self.update_tunedf(old_tunedf, results.loc[:, self.columns])
+        finally:
+            self.columns = saved_columns
         self.success = pd.concat([self.success, results], ignore_index=True)
         if results is not None and not results.empty:
             resultdf = resultdf.astype(str).drop_duplicates(
