@@ -10,6 +10,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `moe.py` | `MOE` | Every FlyDSL kernel the tuned fused-MoE / FHMoE / gfx1250 grouped rows reach, by replaying `fused_moe` itself (see below) |
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
+| `mxscale_preshuffle.py` | `MXSCALE_PRESHUFFLE` | gfx950 MX-scale preshuffle GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
@@ -132,6 +133,9 @@ python -m aiter.aot.flydsl.gemm
 
 # conv3d
 python -m aiter.aot.flydsl.conv
+
+# MX-scale preshuffle GEMM (gfx950)
+python -m aiter.aot.flydsl.mxscale_preshuffle
 
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
