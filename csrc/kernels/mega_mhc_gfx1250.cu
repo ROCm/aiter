@@ -346,6 +346,19 @@ struct Mxfp8Out
     }
 };
 
+// SUB_TDM (res_preshuffle, post): a wave walks adjacent K block pairs, and the
+// sublayer of a pair arrives by TDM as [16 rows][64 columns]: 128-byte rows at
+// 128-byte aligned addresses, so the fetch can take the direct-copy path that
+// bypasses the WGP$ instead of per-lane 64-byte row loads through it. Needs an
+// even K block count. Pairs are dealt to waves, so it is used only where the
+// busiest wave does not get more stages than with single K blocks.
+template <class C>
+constexpr int sub_kb = C::H && C::SPLIT ? C::H / C::SPLIT / C::KC : 1;
+template <class C, bool HAS_POST>
+constexpr bool sub_tdm_v =
+    C::RES_SHUF && HAS_POST && sub_kb<C> % 2 == 0 &&
+    2 * ((sub_kb<C> / 2 + C::WAVES - 1) / C::WAVES) <= (sub_kb<C> + C::WAVES - 1) / C::WAVES;
+
 // LDS of one tile body. The tensor ring is dead after the main loop; the
 // cross-wave reduction and the staged norm weight reuse its storage.
 template <class C, bool HAS_POST>
@@ -357,11 +370,16 @@ struct Smem
     static constexpr int RING     = C::WAVES * C::STAGES * SLOT * sizeof(bf16);
     static constexpr int RED      = C::WAVES * BM * SLOTS * sizeof(float);
     static constexpr int WEIGHT   = (C::STAGE_COLS ? C::STAGE_COLS : 8) * sizeof(bf16);
-    static constexpr int POOL     = RING > RED + WEIGHT ? RING : RED + WEIGHT;
-    static constexpr int STAGED   = (C::STAGE_COLS ? BM : 1) * XP * sizeof(bf16);
-    static constexpr int TOTAL    = POOL + STAGED;
-    static constexpr int FLAGS    = TOTAL + BM * SLOTS * sizeof(float);
-    static constexpr int BYTES    = FLAGS + 16;
+    // SUB_TDM: two [16][64 + PAD] sublayer slots per wave after the ring.
+    static constexpr int SUBP    = 2 * C::KC + PAD;
+    static constexpr int SUBSLOT = BM * SUBP;
+    static constexpr int SUBRING =
+        sub_tdm_v<C, HAS_POST> ? C::WAVES * 2 * SUBSLOT * sizeof(bf16) : 0;
+    static constexpr int POOL   = RING + SUBRING > RED + WEIGHT ? RING + SUBRING : RED + WEIGHT;
+    static constexpr int STAGED = (C::STAGE_COLS ? BM : 1) * XP * sizeof(bf16);
+    static constexpr int TOTAL  = POOL + STAGED;
+    static constexpr int FLAGS  = TOTAL + BM * SLOTS * sizeof(float);
+    static constexpr int BYTES  = FLAGS + 16;
 };
 
 template <class C, bool HAS_POST, bool IDENTITY_PRE, bool MXFP8>
@@ -491,8 +509,44 @@ __device__ __forceinline__ void tiles(char* smem,
         const int64_t block_elems = static_cast<int64_t>(4) * res_rows * KC;
         const int row0            = res_row0 + tile_token;
         const uint32_t ring_lds   = lds_address(&ring[wave][0][0]);
-        auto issue                = [&](int i) {
-            const int kb = (begin + (wave + i * WAVES) * KC) / KC;
+        // SUBT: stage i of a wave takes K block 2 * (wave + i / 2 * WAVES) + i % 2
+        // of its split. TDM ops complete in issue order; their sequence numbers
+        // give each stage's tensorcnt wait.
+        constexpr bool SUBT = sub_tdm_v<C, HAS_POST>;
+        constexpr int SUBP = S::SUBP, SUBSLOT = S::SUBSLOT;
+        const int my_pairs = (nstage / 2) > wave ? (nstage / 2 - wave + WAVES - 1) / WAVES : 0;
+        const int my_st    = SUBT ? 2 * my_pairs : my_stages;
+        auto kb_of         = [&](int i) {
+            return SUBT ? begin / KC + 2 * (wave + i / 2 * WAVES) + i % 2
+                                : (begin + (wave + i * WAVES) * KC) / KC;
+        };
+        int nops = 0, rseq0 = 0, rseq1 = 0, sseq0 = 0, sseq1 = 0;
+        bf16* sub_ring = reinterpret_cast<bf16*>(smem + S::RING) + wave * 2 * SUBSLOT;
+        auto issue_sub = [&](int pp) {
+            if constexpr(SUBT)
+            {
+                using sub_pad_t = opus::tdm_traits::padding<bf16, 2 * KC, PAD>;
+                using sub_tdm   = opus::tdm<bf16, opus::seq<2 * KC, BM>, sub_pad_t, nt_t>;
+                static_assert(sub_pad_t::pitch_elements == SUBP);
+                const opus::u32_t shape[2] = {static_cast<opus::u32_t>(begin + hp),
+                                              static_cast<opus::u32_t>(tile_rows)};
+                const opus::u64_t pitch[1] = {static_cast<opus::u64_t>(hidden)};
+                const opus::u32_t coord[2] = {
+                    static_cast<opus::u32_t>(begin + 2 * (wave + pp * WAVES) * KC), 0u};
+                sub_tdm window;
+                window.make_from_layout(lds_address(sub_ring + (pp % 2) * SUBSLOT),
+                                        sublayer + tile_base,
+                                        shape,
+                                        pitch,
+                                        coord);
+                window.async_load();
+                (pp % 2 == 0 ? sseq0 : sseq1) = nops++;
+            }
+        };
+        auto issue = [&](int i) {
+            const int kb = kb_of(i);
+            if constexpr(SUBT)
+                (i % STAGES == 0 ? rseq0 : rseq1) = nops++;
             const uint32_t lds =
                 ring_lds + (i % STAGES) * SLOT * static_cast<uint32_t>(sizeof(bf16));
             const opus::u32_t shape[3] = {
@@ -505,8 +559,10 @@ __device__ __forceinline__ void tiles(char* smem,
             window.async_load();
         };
         for(int s = 0; s < STAGES; ++s)
-            if(s < my_stages)
+            if(s < my_st)
                 issue(s);
+        if(SUBT && my_st > 0)
+            issue_sub(0);
         constexpr int WEIGHT_VECS = (STAGE_COLS + THREADS * 8 - 1) / (THREADS * 8);
         bf16x8 weight_regs[WEIGHT_VECS > 0 ? WEIGHT_VECS : 1];
 #pragma unroll
@@ -529,17 +585,17 @@ __device__ __forceinline__ void tiles(char* smem,
                     (arow + p * RPP) * hidden + acol, col, opus::number<NT>{});
         };
         bf16x8 x_cur[PASSES] = {};
-        if constexpr(HAS_POST)
+        if constexpr(HAS_POST && !SUBT)
             if(my_stages > 0)
                 load_sub(0, x_cur);
 
         f32x8 acc0 = {}, acc1 = {};
         float sq_r[PASSES] = {}, sq_x[PASSES] = {};
-        for(int i = 0; i < my_stages; ++i)
+        for(int i = 0; i < my_st; ++i)
         {
-            const int own_col = (wave + i * WAVES) * KC; // column offset in this split
-            const int col0    = begin + own_col;
-            const int kb      = col0 / KC;
+            const int kb      = kb_of(i);
+            const int col0    = kb * KC;
+            const int own_col = col0 - begin; // column offset in this split
             // Packed fn: [H/32][stream][operand][kq 0..3][row 0..15][8]. A wave32
             // lane takes kq = lane / 16 and lane / 16 + 2 for its two halves.
             // The K block offset goes in soffset: the 24 loads share two
@@ -554,12 +610,28 @@ __device__ __forceinline__ void tiles(char* smem,
                     fa[j][op]     = concat(g_fn.template load<8>(lane * 8, off),
                                        g_fn.template load<8>(lane * 8 + 256, off));
                 }
-            if(i + STAGES <= my_stages)
+            if constexpr(SUBT)
+            {
+                // Wait for this stage's residual and its pair's sublayer only.
+                const int need =
+                    max(i % STAGES == 0 ? rseq0 : rseq1, i / 2 % 2 == 0 ? sseq0 : sseq1);
+                const int allowed = __builtin_amdgcn_readfirstlane(nops - 1 - need);
+                if(allowed <= 0)
+                    opus::s_wait_tensorcnt(opus::number<0>{});
+                else if(allowed == 1)
+                    opus::s_wait_tensorcnt(opus::number<1>{});
+                else if(allowed == 2)
+                    opus::s_wait_tensorcnt(opus::number<2>{});
+                else
+                    opus::s_wait_tensorcnt(opus::number<3>{});
+            }
+            else if(i + STAGES <= my_stages)
                 opus::s_wait_tensorcnt(opus::number<STAGES - 1>{});
             else
                 opus::s_wait_tensorcnt(opus::number<0>{});
             asm volatile("" ::: "memory");
-            bf16* slot = &ring[wave][i % STAGES][0];
+            bf16* slot           = &ring[wave][i % STAGES][0];
+            const bf16* sub_slot = sub_ring + (i / 2 % 2) * SUBSLOT + (i % 2) * KC;
             // Each stream block of this K block is a contiguous 1 KiB run. Rows
             // past the tile would alias the next stream's rows.
             auto g_blk =
@@ -574,6 +646,11 @@ __device__ __forceinline__ void tiles(char* smem,
                     r[h] = lds_load(slot + row_offset<C>(h * BM + t) + acol);
                 if constexpr(HAS_POST)
                 {
+                    bf16x8 xs;
+                    if constexpr(SUBT)
+                        xs = lds_load(sub_slot + t * SUBP + acol);
+                    else
+                        xs = x_cur[p];
                     bf16x8 mixed[4];
 #pragma unroll
                     for(int j = 0; j < 4; ++j)
@@ -581,7 +658,7 @@ __device__ __forceinline__ void tiles(char* smem,
 #pragma unroll
                         for(int e = 0; e < 8; ++e)
                         {
-                            float v = static_cast<float>(x_cur[p][e]) * post[p][j];
+                            float v = static_cast<float>(xs[e]) * post[p][j];
 #pragma unroll
                             for(int h = 0; h < 4; ++h)
                                 v = fmaf(static_cast<float>(r[h][e]), comb[p][h][j], v);
@@ -631,7 +708,7 @@ __device__ __forceinline__ void tiles(char* smem,
                         g_norm, collapsed, t * hidden + col0 + acol);
             }
             // x_cur is consumed; prefetch the next stage's sublayer into it.
-            if constexpr(HAS_POST)
+            if constexpr(HAS_POST && !SUBT)
                 load_sub(i + 1, x_cur);
             // WMMA phase. Lane holds token lane % 16 and columns kq + [0, 8) and
             // kq + 16 + [0, 8). Rows 0..15 of operand 2 are hi/lo of projections
@@ -649,8 +726,11 @@ __device__ __forceinline__ void tiles(char* smem,
             // Every LDS access of this slot completes before TDM refills it.
             opus::s_wait_dscnt(opus::number<0>{});
             asm volatile("" ::: "memory");
-            if(i + STAGES < my_stages)
+            if(i + STAGES < my_st)
                 issue(i + STAGES);
+            // A pair's first stage frees the previous pair's sublayer slot.
+            if(SUBT && i % 2 == 0 && i + 2 < my_st)
+                issue_sub(i / 2 + 1);
         }
         opus::s_wait_tensorcnt(opus::number<0>{});
         __syncthreads();
