@@ -554,7 +554,7 @@ __global__ void __launch_bounds__(512, 1) ar_rmsnorm_reduce_scatter_gfx1250(
 // Sum or max over the block; every thread gets the result. Threads past the
 // row contribute 0, so the block size may exceed the row as long as it is a
 // whole number of waves.
-template <bool kMax>
+template <bool kMax, bool parallel_waves = false>
 DINLINE float block_allreduce_f32(float v)
 {
     __shared__ float partial[32];
@@ -567,7 +567,24 @@ DINLINE float block_allreduce_f32(float v)
     if(threadIdx.x % warpSize == 0)
         partial[threadIdx.x / warpSize] = v;
     __syncthreads();
-    if(threadIdx.x == 0)
+    // The two-stage FP8 epilogue reduces nonnegative amax values in parallel.
+    // Keep the sum's original order so normalization and split quantization
+    // retain their rounding. At most 32 wave32 partials fit in the first wave.
+    if constexpr(parallel_waves)
+    {
+        if(threadIdx.x < warpSize)
+        {
+            float r = threadIdx.x < blockDim.x / warpSize ? partial[threadIdx.x] : 0.f;
+            for(int off = warpSize / 2; off > 0; off >>= 1)
+            {
+                const float o = __shfl_xor(r, off);
+                r             = kMax ? fmaxf(r, o) : r + o;
+            }
+            if(threadIdx.x == 0)
+                result = r;
+        }
+    }
+    else if(threadIdx.x == 0)
     {
         float r = partial[0];
         for(int w = 1; w < (int)(blockDim.x / warpSize); ++w)
@@ -691,7 +708,7 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
             if(active && bf16_output != nullptr)
                 reinterpret_cast<P*>(bf16_output)[idx] = o;
             const float fp8_max = opus::cast<opus::fp32_t>(opus::numeric_limits<OutT>::max());
-            const float scale   = block_allreduce_f32<true>(amax) * (float)(1. / fp8_max);
+            const float scale   = block_allreduce_f32<true, TWO_STAGE>(amax) * (float)(1. / fp8_max);
             const float inv     = __builtin_amdgcn_rcpf(scale);
             if(active)
             {
