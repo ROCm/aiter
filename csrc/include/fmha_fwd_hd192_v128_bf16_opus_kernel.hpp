@@ -71,7 +71,8 @@ template<typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     using D_ACC = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_max = -1e30f;
+    // Keep fully masked tiles finite without clipping any finite fp32 score.
+    D_ACC row_max = opus::numeric_limits<D_ACC>::lowest();
     opus::static_for<s_len>([&](auto i) { row_max = max(row_max, v_s[i.value]); });
     opus::vector_t<opus::u32_t, 2> res = __builtin_amdgcn_permlane32_swap(
         std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
