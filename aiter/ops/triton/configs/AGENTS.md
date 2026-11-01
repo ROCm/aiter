@@ -250,6 +250,37 @@ in lowercase (`mhc_fused_sinkhorn`).
 
 `get_mhc_post_config(M, C)` reads `mhc_post/DEFAULT.json`.
 
+## PA decode
+
+`_get_dispatch_config(kv_dtype)` and `_get_launch_config(kernel, kv_blk_sz)`
+read `<arch>/triton/attention/pa_decode/DEFAULT.json`. Both return `None` when
+the arch has no file or no entry. `launch` has no built-in values in Python:
+an arch that runs the GQA decode kernel needs the `v1_w_dot` entry.
+
+| Table | Key | Meaning |
+| ----- | --- | ------- |
+| `dispatch.<bf16 or fp16>` | `v1_max_partitions` | Use the v1 kernel up to this number of 1024-token partitions. |
+| | `v1_min_programs`, `v1_busy_max_partitions` | With this many programs (batch x KV heads), v1 is also allowed up to the second value. |
+| | `split_target_programs` | Aim for this many programs when the GQA kernel splits a sequence. |
+| | `split_sizes` | Partition sizes to try, in tokens. A size must be a multiple of the page size. 1024 means do not split. |
+| | `split_max_partitions` | Largest number of partitions for one sequence. |
+| | `split_max_programs` | A grid with this many programs or more is not split. |
+| | `split_short_seq`, `split_short_min_programs` | A sequence shorter than the first value on a grid with at least the second value is not split. |
+| | `tdm_num_warps` | gfx1250 only. A call with unit K/V scales, no ALiBi, page 128, head size 56, 64 or 128 and a group of at most 16 runs the Gluon TDM kernel with this many warps, one of 1, 2, 4 or 8. `null` or no key turns it off. |
+| | `tdm_split_target_programs`, `tdm_split_sizes`, `tdm_split_max_partitions` | The Gluon kernel cuts a sequence into partitions when the grid has fewer programs than the first value. It takes the largest size in the list (tokens, a multiple of 128) that reaches the target within the partition cap, else the smallest size. Partials go through the v2 reduce kernel. `null` or no key keeps sequences whole. |
+| `launch.<v1_w_dot, v2_w_dot, v1_wo_dot or v2_wo_dot>` | `BLK_LEQ_<x>`, `any` | `num_warps`, `num_stages` and `waves_per_eu` for page sizes up to `<x>`, else `any`. `w_dot` kernels run GQA, `wo_dot` kernels run MHA. |
+
+- A `split_*` key is optional. Without `split_target_programs` the kernel does
+  not split.
+- A part with another CU count can have its own file next to `DEFAULT.json`:
+  `PA-DECODE-CU=<n>.json`. `<n>` is `get_num_sms()`. The file lists only the
+  keys that differ, under `dispatch.<dtype>` and `launch.<kernel>`. A key in
+  `dispatch.<dtype>` replaces the key of `DEFAULT.json`. A key in
+  `launch.<kernel>` (`BLK_LEQ_<x>` or `any`) replaces the whole entry. It must
+  not add a key that `DEFAULT.json` does not have. The loader merges such a key
+  anyway, and only the test rejects it.
+- Do not set `num_stages` to 3 or more on gfx1250. It can hang the GPU.
+
 ## Autotune
 
 - Give every `@triton.autotune` its list through
