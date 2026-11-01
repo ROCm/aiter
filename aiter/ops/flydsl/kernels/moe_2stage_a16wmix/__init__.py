@@ -97,6 +97,8 @@ def flydsl_a16w4_gemm1(
     the W-load cache modifier (0=cached, 2=nt), taken as-is (nt when unset).
 
     ``situ_beta``/``situ_linear_beta`` (SiTUv2 only) are runtime f32 scalars (nothing baked).
+    ``swiglu_limit`` is the SiLU / SwiGLU / SiTUv2 clamp bound; SiLU treats a
+    falsy or +inf limit as no clamp (``runtime_swiglu_limit``).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
