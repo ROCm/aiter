@@ -82,6 +82,7 @@ def _situv2_problem(model_dim, inter_dim, token):
         "topk_ids": topk_ids,
         "w1_qt": w1_qt,
         "w2_qt": w2_qt,
+        "w1_scale": w1_scale,
         "w1_scale_e": w1_scale.view(E, inter_dim * 2, model_dim // 32),
         "w2_scale_e": w2_scale.view(E, model_dim, inter_dim // 32),
         # caller contract: standard GGUU (separated gate/up) W1 layout, matching main
@@ -226,6 +227,69 @@ def test_flydsl_a16wfp4_situv2_fp8_mfma(model_dim, inter_dim, token, monkeypatch
     )
     ld = _cos_diff(ref.float(), out.float())
     assert ld < 1e-3, f"a16w4 fp8 MFMA vs fp8-aware reference: {ld:.3e}"
+
+
+def _situv2_fused_moe_fp8(p, situ_beta, situ_linear_beta, monkeypatch):
+    """fused_moe in fp8 MFMA mode, recording (gemm, a_dtype) of each a16w4 launch."""
+    from aiter.ops.flydsl.kernels import moe_2stage_a16wmix
+
+    ran = []
+
+    def _spy(name):
+        fn = getattr(moe_2stage_a16wmix, name)
+
+        def spy(**kw):
+            ran.append((name, kw.get("a_dtype", "bf16")))
+            return fn(**kw)
+
+        return spy
+
+    for name in ("flydsl_a16w4_gemm1", "flydsl_a16w4_gemm2"):
+        monkeypatch.setattr(moe_2stage_a16wmix, name, _spy(name))
+    monkeypatch.setenv("AITER_FLYDSL_A16W4_FP8_MFMA", "1")
+    return _situv2_fused_moe(p, situ_beta, situ_linear_beta), ran
+
+
+@_SKIP_FP8_MFMA
+@pytest.mark.parametrize(
+    "inter_dim,token",
+    [(768, 1), (768, 16), (768, 512), (768, 1024), (768, 2048), (768, 8192)]
+    + [(256, 512), (256, 2048)],
+)
+def test_flydsl_a16wfp4_situv2_fp8_mfma_untuned_tiers(inter_dim, token, monkeypatch):
+    """No tuned row at these inter_dims: every fp8 MFMA heuristic tier (rows per
+    expert < 1, < 12, < 24, < 96, >= 96), with TILE_N=64 at inter_dim 256."""
+    situ_beta, situ_linear_beta = 4.0, 25.0
+    p = _situv2_problem(3584, inter_dim, token)
+    out, ran = _situv2_fused_moe_fp8(p, situ_beta, situ_linear_beta, monkeypatch)
+
+    assert ran == [("flydsl_a16w4_gemm1", "fp8"), ("flydsl_a16w4_gemm2", "fp8")], ran
+    assert not out.isnan().any().item(), "a16w4 fp8 MFMA output contains NaN"
+    ref = _situv2_ref(
+        p, _fp8_rows(p["inp"]), situ_beta, situ_linear_beta, quant_inter=_fp8_rows
+    )
+    ld = _cos_diff(ref.float(), out.float())
+    assert ld < 1e-3, f"a16w4 fp8 MFMA vs fp8-aware reference: {ld:.3e}"
+
+
+@_SKIP_FP8_MFMA
+@pytest.mark.parametrize("token", [1, 2048])
+def test_flydsl_a16wfp4_fp8_mfma_bf16_fallback_tiers(token, monkeypatch):
+    """A stage whose MXFP4 scales are out of the fp8 decode's range runs the bf16
+    kernel on the tile its fp8 heuristic tier picked (k_wave=2 at 1 token, b_nt=0 at
+    2048), so those tiles must also be valid bf16 kernels."""
+    situ_beta, situ_linear_beta = 4.0, 25.0
+    p = _situv2_problem(3584, 768, token)
+    # One W1 group 10 binades under its row maximum: past the fp8 decode's range.
+    p["w1_scale_e"].view(torch.uint8)[0, 0, 0] -= 10
+    p["w1_scale_gui"] = shuffle_scale_a16w4(p["w1_scale"], p["E"], False)
+    out, ran = _situv2_fused_moe_fp8(p, situ_beta, situ_linear_beta, monkeypatch)
+
+    assert ran == [("flydsl_a16w4_gemm1", "bf16"), ("flydsl_a16w4_gemm2", "fp8")], ran
+    assert not out.isnan().any().item(), "a16w4 fp8 fallback output contains NaN"
+    ref = _situv2_ref(p, p["inp"], situ_beta, situ_linear_beta, quant_inter=_fp8_rows)
+    ld = _cos_diff(ref.float(), out.float())
+    assert ld < 1e-3, f"a16w4 bf16 stage 1 + fp8 stage 2 vs reference: {ld:.3e}"
 
 
 @_SKIP_FP8_MFMA

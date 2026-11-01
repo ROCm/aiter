@@ -4368,6 +4368,7 @@ def get_2stage_cfgs(
 
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
+            _a16w4_fp8_mfma_enabled,
             flydsl_kernel_name,
             get_flydsl_kernel_params,
             pick_flydsl_stage2_tile_k,
@@ -4388,9 +4389,30 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
-        _s1_tk = 256
+        _s1_tn, _s1_tk, _s2_tn = 128, 256, 128
         # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
-        if _is_a16w4 and gfx == "gfx942":
+        if _is_a16w4 and gfx == "gfx942" and _a16w4_fp8_mfma_enabled():
+            # fp8 MFMA tiers, from an MI300X sweep of the registered tiles on
+            # E=896/topk=16/model_dim=3584 and E=256/topk=8/model_dim=7168 shapes (MALL
+            # flushed between launches up to 2048 tokens), keyed on routed rows per
+            # expert. W loads stream (b_nt=2) until an expert fills about one BM=32
+            # m-block, then cache (b_nt=0) for the m-blocks that re-read it. TILE_N=64
+            # doubles the workgroups when there are few expert x N tiles. Every tile
+            # also fits 64 KiB of LDS as the bf16 kernel, which a stage falls back to
+            # when its MXFP4 scales are out of the fp8 decode's range.
+            _rows = token * topk / expert
+            _tn = 64 if expert * inter_dim < 2048 * 128 else 128
+            if _rows < 1:
+                _tile_m, _s1_tn, _s2_tn = 16, 32, 256
+                _s1_sfx, _s2_sfx = "_kw2", "_bnt2"
+            elif _rows < 12:
+                _tile_m, _s1_tn, _s2_tn = 16, _tn, 256 if _tn == 64 else 128
+                _s1_sfx, _s2_sfx = "", "_bnt2"
+            else:
+                _tile_m, _s1_tn, _s2_tk = 32, _tn, 128
+                _s1_tk = 256 if _rows < 96 else 128
+                _s1_sfx, _s2_sfx = ("_bnt0", "") if _rows >= 24 else ("", "_bnt2")
+        elif _is_a16w4 and gfx == "gfx942":
             # gfx942 has 64 KiB of LDS, and the a16w-mix port needs 128 KiB at
             # BM=128 x TILE_K=256. Use the a16wi4 fallback's shape-safe tiles
             # (TILE_K=128, no waves_per_eu cap), with BM=32 from 1024 tokens.
@@ -4405,10 +4427,10 @@ def get_2stage_cfgs(
         else:
             _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
         _base_kn1 = flydsl_kernel_name(
-            1, _a_type, _w_type, _out_type, _tile_m, 128, _s1_tk
+            1, _a_type, _w_type, _out_type, _tile_m, _s1_tn, _s1_tk
         )
         _base_kn2 = flydsl_kernel_name(
-            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+            2, _a_type, _w_type, _out_type, _tile_m, _s2_tn, _s2_tk, "atomic"
         )
         kn1 = f"{_base_kn1}{_s1_sfx}"
         kn2 = f"{_base_kn2}{_s2_sfx}"
