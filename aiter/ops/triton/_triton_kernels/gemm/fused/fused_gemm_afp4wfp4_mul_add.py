@@ -142,9 +142,8 @@ def _fused_gemm_afp4wfp4_mul_add_kernel(
             offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
         # Create pointers for the first block of A and B scales
-        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
-        )
+        offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + offs_scale_k
         a_scale_ptrs = (
             a_scales_ptr + offs_am[:, None] * stride_asm + offs_ks[None, :] * stride_ask
         )
@@ -156,15 +155,27 @@ def _fused_gemm_afp4wfp4_mul_add_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            a_scales = tl.load(a_scale_ptrs)
-            b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
-
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
+                a_scales = tl.load(a_scale_ptrs)
+                b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
+                # OOB scale bytes are not guaranteed to be zero, and 0xFF is NaN
+                # in e8m0, which dot_scaled propagates even where the masked-off
+                # data is zero. Read those groups as 127, a scale of 2^0.
+                scale_mask = offs_scale_k[None, :] < (
+                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
+                a_scales = tl.load(a_scale_ptrs, mask=scale_mask, other=127)
+                b_scales = tl.load(
+                    b_scale_ptrs,
+                    mask=scale_mask,
+                    other=127,
+                    cache_modifier=cache_modifier,
+                )
                 a = tl.load(
                     a_ptrs, mask=offs_k[None, :] < K - k * (BLOCK_SIZE_K // 2), other=0
                 )
