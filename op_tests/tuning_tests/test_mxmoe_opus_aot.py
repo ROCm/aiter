@@ -63,7 +63,7 @@ class TestMxmoeOpusAot(unittest.TestCase):
         rows = [self.row(self.native), self.row(self.opus)]
         jobs = self.aot.parse_csv(str(self.write_csv(rows + rows)))
         stage1 = [job for job in jobs if job["stage"] == 1]
-        self.assertEqual(len(stage1), 8)
+        self.assertEqual(len(stage1), 4)
         self.assertEqual(
             {
                 (job["native_scale_layout"], job["interleave"], job["enable_bias"])
@@ -71,13 +71,9 @@ class TestMxmoeOpusAot(unittest.TestCase):
             },
             {
                 (True, False, False),
-                (True, False, True),
                 (True, True, False),
-                (True, True, True),
                 (False, False, False),
-                (False, False, True),
                 (False, True, False),
-                (False, True, True),
             },
         )
         self.assertEqual({job["D_INTER"] for job in stage1}, {384})
@@ -88,14 +84,20 @@ class TestMxmoeOpusAot(unittest.TestCase):
         torch = importlib.import_module("torch")
         fm = importlib.import_module("aiter.fused_moe")
         launcher = importlib.import_module("aiter.ops.flydsl.mxfp4_gemm1_kernels")
+        # Only Swiglu rows build the GEMM1 bias variant this test compares.
+        g1 = self.g1 + "_swiglu"
         jobs = [
             job
             for job in self.aot.parse_csv(
                 str(
                     self.write_csv(
                         [
-                            self.row(self.native),
-                            self.row(self.opus),
+                            self.row(
+                                consumer,
+                                act_type="ActivationType.Swiglu",
+                                kernelName1=g1,
+                            )
+                            for consumer in (self.native, self.opus)
                         ]
                     )
                 )
@@ -109,7 +111,7 @@ class TestMxmoeOpusAot(unittest.TestCase):
         experts = torch.empty(9, dtype=torch.int32)
         counts = torch.tensor([144, 31], dtype=torch.int32)
         metadata = [
-            fm._make_mxfp4_metadata(self.g1, consumer, fm.GateMode.INTERLEAVE, 0)
+            fm._make_mxfp4_metadata(g1, consumer, fm.GateMode.INTERLEAVE, 0)
             for consumer in (self.native, self.opus, self.native)
         ]
         self.assertEqual(
@@ -239,9 +241,10 @@ class TestMxmoeOpusAot(unittest.TestCase):
                         shared_expert_id=shared_expert,
                     )
                     jobs = self.aot.parse_csv(str(self.write_csv([row, row])))
+                    has_bias_variant = shared_expert < 0 and activation == "swiglu"
                     self.assertEqual(
                         len(jobs),
-                        len(expected_parameters) * 2 * (2 if shared_expert < 0 else 1),
+                        len(expected_parameters) * 2 * (2 if has_bias_variant else 1),
                     )
                     self.assertEqual(
                         {
@@ -257,7 +260,7 @@ class TestMxmoeOpusAot(unittest.TestCase):
                     self.assertEqual({job["act"] for job in jobs}, {activation})
                     self.assertEqual(
                         {job["enable_bias"] for job in jobs},
-                        {False, True} if shared_expert < 0 else {False},
+                        {False, True} if has_bias_variant else {False},
                     )
                     self.assertTrue(all(not job["native_scale_layout"] for job in jobs))
 
