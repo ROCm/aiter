@@ -13,6 +13,7 @@ from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
+    is_gluon_available,
     mha_set_impl,
     mha_set_use_fused_bwd_kernel,
 )
@@ -51,10 +52,23 @@ class BenchRun:
 
 VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
 
-# The (left, right) window variants the default sweep benches: dense + a representative
-# causal sliding window. A swept axis like the default function/dtype sets; override with
-# --window-size-left/right to bench one specific window instead.
+# The (left, right) window variants the default sweep benches: dense and a representative causal
+# sliding window. A swept axis like the default function/dtype sets.
+# Omit both window CLI options (--window-size-left and --window-size-right) to run this default
+# sweep. Pass either flag to run one window. An omitted side is unbounded (-1). For a dense only
+# bench, explicitly pass (-1, -1).
 DEFAULT_WINDOWS = [(-1, -1), (1024, 0)]
+
+
+def _resolve_windows(
+    window_size_left: int | None, window_size_right: int | None
+) -> list[tuple[int, int]]:
+    """Return the windows for this run."""
+    if window_size_left is None and window_size_right is None:
+        return DEFAULT_WINDOWS  # both unspecified, default windows sweep
+    left = -1 if window_size_left is None else window_size_left
+    right = -1 if window_size_right is None else window_size_right
+    return [(left, right)]
 
 
 @dataclass(frozen=True)
@@ -649,18 +663,24 @@ def run_benchmark(run: BenchRun):
         return_lse = True
         return_attn_probs = False
         has_pe = D_HEAD > D_HEAD_V
-        # Dense iff BOTH bounds are off (-1); either set = a window (matches the kernel's
-        # `LEFT < 0 and RIGHT < 0` dense test -- neither side is privileged).
-        has_sliding_window = window_size_left >= 0 or window_size_right >= 0
         window_size = (window_size_left, window_size_right)
-        if impl != "default":
-            mha_set_impl(impl)
-        # SWA runs on the dao_ai path (any dtype), the fp8 path (routes to FA3, which
-        # has it) and the Gluon backend; only native non-fp8 triton lacks it (left-only,
-        # right rejected). Skip that combo cleanly rather than hard-error mid-sweep.
-        if has_sliding_window and not is_gluon and impl != "dao_ai" and dtype != "fp8":
+        mha_set_impl(impl)
+        # Native Triton and Gluon support a left window (and a sink on the native
+        # one-kernel path). A right window needs dao_ai or the fp8/FA3 path.
+        # Skip that combo cleanly rather than hard-error mid-sweep.
+        if is_gluon and not is_gluon_available():
             warnings.warn(
-                "Skipping: sliding window needs -impl dao_ai (or an fp8 dtype)."
+                "Skipping: Gluon MHA backend is not available on this device."
+            )
+            return 0
+        if (
+            window_size_right >= 0
+            and not is_gluon
+            and impl != "dao_ai"
+            and dtype != "fp8"
+        ):
+            warnings.warn(
+                "Skipping: right sliding window needs -impl dao_ai (or an fp8 dtype)."
             )
             return 0
         if is_gluon and window_size_right >= 0:
@@ -1016,14 +1036,22 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     parser.add_argument(
         "--window-size-left",
         type=int,
-        default=-1,
-        help="left sliding window size (-1 = no left bound; dense only when both -1)",
+        default=None,
+        help=(
+            "Left sliding window size. -1 means no left bound. "
+            f"Omit both window options to run the default sweep {DEFAULT_WINDOWS}. "
+            "Pass either flag to run one window. An omitted side is -1. "
+            "Dense only bench when both window sizes are -1."
+        ),
     )
     parser.add_argument(
         "--window-size-right",
         type=int,
-        default=-1,
-        help="right sliding window size (-1 = no right bound)",
+        default=None,
+        help=(
+            "Right sliding window size. -1 means no right bound. "
+            "Please also check related help of --window-size-left option."
+        ),
     )
     parser.add_argument(
         "-backend",
@@ -1071,11 +1099,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     impl = parsed.impl
     fused = parsed.fused_bwd
     functions = [parsed.fn] if parsed.fn else sorted(VALID_FUNCTIONS)
-    windows = (
-        [(parsed.window_size_left, parsed.window_size_right)]
-        if parsed.window_size_left >= 0 or parsed.window_size_right >= 0
-        else DEFAULT_WINDOWS
-    )
+    windows = _resolve_windows(parsed.window_size_left, parsed.window_size_right)
     d_head = parsed.d if parsed.d else 128
     d_head_v = parsed.dv if parsed.dv else d_head
 

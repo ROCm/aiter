@@ -18,6 +18,9 @@ from aiter.ops.triton.utils._triton.arch_info import (
     get_arch,
 )
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from op_tests.op_benchmarks.triton.proton_visible_devices import (
+    proton_visible_devices,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
@@ -214,7 +217,8 @@ def bench_mlp_single_weight_init(
 
     # run layer
     fpath = Path(tempfile.mktemp())
-    proton.start(str(fpath), hook="triton")
+    with proton_visible_devices():
+        proton.start(str(fpath), hook="triton")
     for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
         rdata, gather_indx, _scatter_indx = routing(logits, n_expts_act)
