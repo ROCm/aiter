@@ -7,7 +7,7 @@ import triton.language as tl
 
 @triton.jit
 def remap_xcd_chunked(
-    pid, GRID_MN, NUM_XCDS: tl.constexpr = 8, CHUNK_SIZE: tl.constexpr = 2
+    pid, GRID_MN, NUM_XCDS: tl.constexpr, CHUNK_SIZE: tl.constexpr = 2
 ):
     # Compute current XCD and local PID
     xcd = pid % NUM_XCDS
@@ -25,6 +25,8 @@ def remap_xcd_chunked(
 
 @triton.jit
 def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
+    # Legacy callers discard the result and rely on the default. Callers using
+    # the remapped PID must pass the device's XCD count.
     ## pid remapping on xcds
     # Number of pids per XCD in the new arrangement
     pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
@@ -107,7 +109,7 @@ def remap_workgroup_spatial(
     NUM_BLOCKS,
     BATCH,
     NUM_QUERIES_PER_KV: tl.constexpr,
-    NUM_XCDS: tl.constexpr = 8,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     XCD-aware workgroup mapping for multi-head attention on AMD CDNA3/3.5 GPUs.
@@ -140,7 +142,7 @@ def remap_workgroup_spatial(
         NUM_BLOCKS        : number of sequence blocks along the Q dimension
         BATCH             : batch size
         NUM_QUERIES_PER_KV: Q heads per KV head (1 for MHA, >1 for GQA)
-        NUM_XCDS          : number of XCDs on the device (8 for MI3xx)
+        NUM_XCDS          : number of XCDs on the device
 
     Returns:
         off_q_head : Q head index for this workgroup
