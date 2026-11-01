@@ -497,7 +497,7 @@ def _run_grouped_via_fused_moe(
         w1_arg = w1_grouped.view(dtypes.fp4x2)
         w2_arg = w2_grouped.view(dtypes.fp4x2)
     else:  # a8w4
-        w1_arg = w1_grouped  # uint8 -> grouped helper sets q_dtype_a=fp8
+        w1_arg = w1_grouped
         w2_arg = w2_grouped
 
     def _call():  # the grouped path is auto-enabled on gfx1250
@@ -509,6 +509,9 @@ def _run_grouped_via_fused_moe(
             topk_id,
             activation=activation,
             quant_type=QuantType.per_1x32,
+            # Match the reference format, not fused_moe's model-dependent
+            # activation default (uint8 weights do not imply FP8 activations).
+            quant_dtype_a=dtypes.fp4x2 if data_format == "a4w4" else dtypes.fp8,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             bias1=bias1_phys if use_bias else None,
@@ -938,6 +941,39 @@ def test_grouped_a4w4_situv2_matches_torch_ref():
         model_dim=512,
         inter_dim=512,
     )
+
+
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+@pytest.mark.parametrize(
+    "activation", [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2]
+)
+def test_grouped_runner_uses_requested_activation_format(
+    data_format, activation, monkeypatch
+):
+    """The public runner and independent reference must use the same A format."""
+    _require_gfx1250()
+    from aiter.ops.flydsl import grouped_gemm_mxfp4 as grouped
+
+    launch = grouped._run_compiled
+    actual_fp4 = []
+
+    def record_format(*args, **kwargs):
+        # gemm_spec: K, tile_m/n/k, m/n_warp, out_is_f16, buffers, a_is_fp4.
+        actual_fp4.append(kwargs["specialization_key"][0][8])
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(grouped, "_run_compiled", record_format)
+    out, expected, _, _ = _run_grouped_via_fused_moe(
+        experts=4,
+        tokens=8,
+        topk=2,
+        model_dim=512,
+        inter_dim=512,
+        data_format=data_format,
+        activation=activation,
+    )
+    assert actual_fp4 == [int(data_format == "a4w4")] * 2
+    assert _logits_diff(out, expected) < LOGITS_DIFF_TOL
 
 
 def test_grouped_a8w4_situv2_matches_torch_ref():
