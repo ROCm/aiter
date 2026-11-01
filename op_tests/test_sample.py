@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 
@@ -20,9 +20,8 @@ state_gpu = torch.cuda.get_rng_state()
 
 def run_greedy_sample(input):
     input = input.to(torch.float)
-    _, sampled_tokens = topk(input, 1)
-    # sampled_tokens = torch.argmax(input, dim=-1)
-    return sampled_tokens.view(-1)
+    # Match the native ArgMax tie policy: equal values select the lower index.
+    return torch.argmax(input, dim=-1)
 
 
 def run_aiter_greedy_sample(input):
@@ -41,7 +40,10 @@ def test_greedy_sample(M, N, dtype=torch.bfloat16):
 
 
 def run_random_sample(input, temperatures, eps, use_aiter_exponential=False):
-    logits = input.to(torch.float)
+    # Always own the benchmark working buffer. Tensor.to() aliases FP32 input
+    # unless copy=True, and the in-place temperature scaling would otherwise
+    # corrupt the input reused by run_perftest.
+    logits = input.to(torch.float, copy=True)
     logits = logits.div_(temperatures.unsqueeze(dim=1))
     probs = softmax(logits)
     torch.cuda.set_rng_state(state_gpu)
@@ -102,7 +104,8 @@ def test_random_sample(M, N, dtype=torch.bfloat16, eps=1e-6):
 
 
 def run_mixed_sample(input, temperatures, eps, use_aiter_exponential=False):
-    logits = input.to(torch.float)
+    # See run_random_sample: this tensor is modified in-place below.
+    logits = input.to(torch.float, copy=True)
     # _, greedy_tokens = topk(logits, 1)
     greedy_tokens = torch.argmax(logits, dim=-1)
     logits.div_(temperatures.unsqueeze(dim=1))
@@ -163,6 +166,70 @@ def test_mixed_sample(M, N, dtype=torch.bfloat16, eps=1e-6):
     }
 
 
+def _check_tail_tokens(name, actual, expected, n):
+    if not torch.equal(actual, expected):
+        raise AssertionError(
+            f"{name} N={n}: expected {expected.tolist()}, got {actual.tolist()}"
+        )
+    if not ((actual >= 0) & (actual < n)).all().item():
+        raise AssertionError(f"{name} N={n}: sampled an out-of-range token")
+
+
+def run_tail_checks(dtype, sizes=(1, 17, 4097, 16385), eps=1e-6):
+    """Exercise partial vectors and row boundaries with deterministic winners."""
+    for n in sizes:
+        logits = torch.full((2, n), -1000.0, dtype=dtype, device="cuda")
+        logits[0, -1] = 1000.0
+        logits[1, 0] = 2000.0
+        expected = torch.tensor([n - 1, 0], dtype=torch.int32, device="cuda")
+        temperatures = torch.ones(2, dtype=torch.float32, device="cuda")
+        mixed_temperatures = torch.tensor(
+            [1.0, 0.0], dtype=torch.float32, device="cuda"
+        )
+        exponentials = torch.ones((2, n), dtype=torch.float32, device="cuda")
+        out = torch.empty(2, dtype=torch.int32, device="cuda")
+
+        aiter.greedy_sample(out, logits)
+        _check_tail_tokens("greedy_sample", out, expected, n)
+
+        aiter.random_sample_outer_exponential(
+            out, logits, exponentials, temperatures, eps=eps
+        )
+        _check_tail_tokens("random_sample_outer_exponential", out, expected, n)
+
+        generator = torch.Generator(device="cuda").manual_seed(42)
+        aiter.random_sample(
+            out, logits, temperatures, generator=generator, eps=eps
+        )
+        _check_tail_tokens("random_sample", out, expected, n)
+
+        aiter.mixed_sample_outer_exponential(
+            out, logits, exponentials, mixed_temperatures, eps=eps
+        )
+        _check_tail_tokens("mixed_sample_outer_exponential", out, expected, n)
+
+        generator = torch.Generator(device="cuda").manual_seed(42)
+        aiter.mixed_sample(
+            out, logits, mixed_temperatures, generator=generator, eps=eps
+        )
+        _check_tail_tokens("mixed_sample", out, expected, n)
+
+        sentinel = -1234.0
+        backing = torch.full((2, n + 4), sentinel, dtype=dtype, device="cuda")
+        exponential_out = backing[:, :n]
+        guard = backing[:, n:].clone()
+        generator = torch.Generator(device="cuda").manual_seed(42)
+        aiter.exponential(exponential_out, generator=generator, eps=eps)
+        if not torch.isfinite(exponential_out).all().item():
+            raise AssertionError(f"exponential N={n}: produced a non-finite value")
+        if not (exponential_out > 0).all().item():
+            raise AssertionError(f"exponential N={n}: produced a non-positive value")
+        if not torch.equal(backing[:, n:], guard):
+            raise AssertionError(f"exponential N={n}: overwrote the row tail guard")
+
+        print(f"PASS sampling vector tails dtype={dtype} M=2 N={n}")
+
+
 d_sample = {
     "greedy": test_greedy_sample,
     "random": test_random_sample,
@@ -217,6 +284,11 @@ parser.add_argument(
     help="""Sample type.
     e.g.: -s greedy random mixed""",
 )
+parser.add_argument(
+    "--tail-only",
+    action="store_true",
+    help="Run deterministic partial-vector correctness checks and exit.",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -232,13 +304,18 @@ if len(args.sample_type) > 0:
 
 list_sample_func = [d_sample[key] for key in args.sample_type if key in d_sample]
 
-for test_func in list_sample_func:
-    df = []
+if args.tail_only:
+    tail_sizes = tuple(l_n) if args.n is not None else (1, 17, 4097, 16385)
     for dtype in list_dtype:
-        for n in l_n:
-            for m in l_m:
-                ret = test_func(m, n, dtype)
-                df.append(ret)
-    df = pd.DataFrame(df)
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("sample summary (markdown):\n%s", df_md)
+        run_tail_checks(dtype, tail_sizes)
+else:
+    for test_func in list_sample_func:
+        df = []
+        for dtype in list_dtype:
+            for n in l_n:
+                for m in l_m:
+                    ret = test_func(m, n, dtype)
+                    df.append(ret)
+        df = pd.DataFrame(df)
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("sample summary (markdown):\n%s", df_md)
