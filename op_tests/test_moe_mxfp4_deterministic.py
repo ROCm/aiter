@@ -6,7 +6,8 @@ A token's output must be bitwise the same whatever the batch it is in and from
 run to run, including across the token counts where the default changes its
 kernels, tiles or activation dtype, and it must be as accurate as the
 default. The deterministic path takes gate/up-interleaved weights and MXFP8
-activations, as the default does from 256 tokens.
+activations, as the default does from 256 tokens. SwiGLU and SiLU experts are
+covered.
 
 Run (the checks, then a latency sweep of the default and the deterministic
 path that ends in a markdown table):
@@ -207,6 +208,28 @@ def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk, bias):
 
 
 @_SKIP
+@pytest.mark.parametrize(
+    "model_dim,inter_dim,E,topk",
+    [(1024, 512, 32, 4), (4096, 512, 288, 8), (4096, 512, 256, 6)],
+)
+def test_deterministic_silu_clamped(model_dim, inter_dim, E, topk):
+    """SiLU with a clamp and no bias (GLM-5 and DeepSeek-V4 routed experts, per GPU
+    at TP4)."""
+    kw = {"swiglu_limit": 10.0}
+    p = _problem(_M, model_dim, inter_dim, E, topk, bias=False)
+    out = _run(p, slice(None), ActivationType.Silu, True, **kw)
+    assert not out.isnan().any().item(), "deterministic output contains NaN"
+    ref = _reference(p, _M, model_dim, inter_dim, E, topk, ActivationType.Silu, **kw)
+    default = _run(p, slice(None), ActivationType.Silu, False, **kw)
+    ld = _cos_diff(ref.float(), out.float())
+    ld_default = _cos_diff(ref.float(), default.float())
+    assert (
+        ld <= ld_default * 1.05 + 1e-5
+    ), f"cos/logits_diff vs the bf16 reference {ld:.3e}, default {ld_default:.3e}"
+    _check_batch_invariant(p, out, ActivationType.Silu, **kw)
+
+
+@_SKIP
 @pytest.mark.parametrize("M", [1, 8, 64, 300])
 def test_deterministic_zero_routing_weights(M):
     """Routes with zero weight must not change a token's result: half the tokens
@@ -317,9 +340,7 @@ def test_deterministic_rejects_unsupported():
 
     with pytest.raises(ValueError, match="needs quant_dtype_a"):
         call(quant_dtype_a=None)
-    with pytest.raises(NotImplementedError, match="SwiGLU only"):
-        call(activation=ActivationType.Silu)
-    with pytest.raises(NotImplementedError, match="SwiGLU only"):
+    with pytest.raises(NotImplementedError, match="SwiGLU or SiLU only"):
         call(activation=ActivationType.Situv2)
     with pytest.raises(NotImplementedError, match="activation dtype"):
         call(quant_dtype_a=dtypes.bf16)

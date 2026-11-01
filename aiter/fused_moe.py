@@ -1203,7 +1203,7 @@ def fused_moe(
     one activation dtype with ``quant_dtype_a``, which is required with
     ``deterministic=True``: today ``dtypes.fp8`` (MXFP8, the precision the
     default uses from 256 tokens). It is supported on gfx950 for MXFP4 weights
-    (``QuantType.per_1x32``, preshuffled gate/up-interleaved) with SwiGLU, bf16
+    (``QuantType.per_1x32``, preshuffled gate/up-interleaved) with SwiGLU or SiLU, bf16
     output, without expert parallelism.
 
     Supplying any shared tensor (or ``shared_expert_id``) requires all four
@@ -4063,10 +4063,10 @@ def _check_deterministic_supported(
             ),
             (dtype != dtypes.bf16, f"output dtype {dtype} (bf16 only)"),
             (
-                # SwiGLU is where the default also uses quantized activations (from
-                # 256 tokens); SiTUv2's default keeps bf16 activations.
-                activation != ActivationType.Swiglu,
-                f"activation {activation!s} (SwiGLU only)",
+                # SwiGLU and SiLU are where the default also quantizes the
+                # activations (from 256 tokens); SiTUv2's default keeps bf16.
+                activation not in (ActivationType.Swiglu, ActivationType.Silu),
+                f"activation {activation!s} (SwiGLU or SiLU only)",
             ),
             (
                 # The MXFP8-activation (a8w4) kernels take the gate/up-interleaved
