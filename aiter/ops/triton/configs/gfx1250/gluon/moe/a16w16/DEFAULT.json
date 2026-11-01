@@ -28,9 +28,9 @@
         "num_subtiles": 1
     },
     "bm128_swiglu_any": {
-        "block_n": 128,
-        "block_k": 128,
-        "num_buffers": 3,
+        "block_n": 256,
+        "block_k": 64,
+        "num_buffers": 4,
         "num_warps": 8,
         "num_subtiles": 1
     }
