@@ -16,6 +16,7 @@ from flydsl.expr import rocdl
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
+    _buffer_at,
     _buffer_store_words,
     _buffer_words,
     _exp,
@@ -106,17 +107,42 @@ def _output(
 
 
 def _pack_block(
-    kr, vr, pk, pv, sources, pair, half, lane, packed, hk, source_extent, extent
+    kr,
+    vr,
+    pk,
+    pv,
+    sources,
+    pair,
+    half,
+    lane,
+    packed,
+    hk,
+    source_extent,
+    extent,
+    slots,
+    slotted,
 ):
     block, head = pair // hk, pair % hk
     valid = pair < packed * hk
     start = fx.Int32(sources[_min(block, packed - 1)])
     token, chunk = lane >> 4, lane & 15
     dim = half * 128 + chunk * 8
-    # Tokens past a request's end are masked by the direct kernel.
-    source = valid.select(
-        fx.Uint32((start + token) * hk + head) * 512 + dim * 2, source_extent
-    )
+    if slotted:
+        # A wave packs one block, four consecutive pool rows from the slot table's first:
+        # give it its own 64-bit base, so the pool may exceed 4 GiB. kr/vr are the pool
+        # addresses here.
+        row = _uniform(fx.Int32(slots[_uniform(start)]))
+        base = (fx.Int64(row) * hk + _uniform(head)) * 512
+        kr = _buffer_at(kr + base, 4 * hk * 512)
+        vr = _buffer_at(vr + base, 4 * hk * 512)
+        source = valid.select(
+            fx.Uint32(token * hk * 512 + dim * 2), fx.Uint32(4 * hk * 512)
+        )
+    else:
+        # Tokens past a request's end are masked by the direct kernel.
+        source = valid.select(
+            fx.Uint32((start + token) * hk + head) * 512 + dim * 2, source_extent
+        )
     key = _buffer_words(kr, source)
     target = (
         fx.Uint32(
@@ -165,14 +191,19 @@ def _pack_block(
 
 
 @flyc.jit
-def _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK):
+def _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED):
     tid = fx.thread_idx.x
     lane, half = tid & 63, (tid >> 6) & 1
     first = fx.block_idx.x * 8 + (tid >> 7)
     source_extent = fx.Uint32(N) * HK * 512
     extent = fx.Uint32(PACKED) * 4 * HK * 512
-    kr, vr = _buffer(K, source_extent), _buffer(V, source_extent)
+    if fx.const_expr(SLOTTED):
+        kr = fx.Int64(fx.ptrtoint(fx.get_iter(K)))
+        vr = fx.Int64(fx.ptrtoint(fx.get_iter(V)))
+    else:
+        kr, vr = _buffer(K, source_extent), _buffer(V, source_extent)
     pk, pv = _buffer(PK, extent), _buffer(PV, extent)
+    slots = rocdl.make_buffer_tensor(SLOTS)
     for u in fx.range_constexpr(4):
         _pack_block(
             kr,
@@ -187,6 +218,8 @@ def _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK):
             HK,
             source_extent,
             extent,
+            slots,
+            SLOTTED,
         )
 
 
@@ -197,11 +230,13 @@ def _pack(
     PK: fx.Tensor,
     PV: fx.Tensor,
     SOURCES: fx.Tensor,
+    SLOTS: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
     HK: fx.Constexpr[int],
+    SLOTTED: fx.Constexpr[bool],
 ):
-    _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK)
+    _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED)
 
 
 @flyc.kernel(name="sparse_prefill_pack_kv_gated_bf16_d256")
@@ -211,13 +246,15 @@ def _pack_gated(
     PK: fx.Tensor,
     PV: fx.Tensor,
     SOURCES: fx.Tensor,
+    SLOTS: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
     HK: fx.Constexpr[int],
+    SLOTTED: fx.Constexpr[bool],
 ):
     if _uniform(DIRECT_FLAG[0]) != 0:
-        _pack_body(K, V, PK, PV, SOURCES, N, PACKED, HK)
+        _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED)
 
 
 def _key_offset(cached, n, visible, extent, hk, topk):
@@ -592,6 +629,7 @@ def _launch(
     K: fx.Tensor,
     V: fx.Tensor,
     OUT: fx.Tensor,
+    SLOTS: fx.Tensor,
     PK: fx.Tensor,
     PV: fx.Tensor,
     SOURCES: fx.Tensor,
@@ -611,15 +649,18 @@ def _launch(
     GATED: fx.Constexpr[bool],
     SCALE: fx.Constexpr[float],
     TOPK: fx.Constexpr[int],
+    SLOTTED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if TASKS > 0:
         if fx.const_expr(GATED):
-            _pack_gated(K, V, PK, PV, SOURCES, DIRECT_FLAG, NK, PACKED, HK).launch(
+            _pack_gated(
+                K, V, PK, PV, SOURCES, SLOTS, DIRECT_FLAG, NK, PACKED, HK, SLOTTED
+            ).launch(
                 grid=((PACKED * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
             )
         else:
-            _pack(K, V, PK, PV, SOURCES, NK, PACKED, HK).launch(
+            _pack(K, V, PK, PV, SOURCES, SLOTS, NK, PACKED, HK, SLOTTED).launch(
                 grid=((PACKED * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
             )
         kernel = _kernel(
@@ -646,7 +687,8 @@ def _launch(
 
 
 def launch_args(inputs, prepared, out, tasks, stream):
-    # A raw plan compiles this path ahead of time with its public KV as stand-ins.
+    # A raw plan compiles this path ahead of time with its public KV as stand-ins. The fifth
+    # argument is the slot table (a stand-in without one).
     packed_key = inputs.k if prepared.packed_key is None else prepared.packed_key
     packed_value = inputs.v if prepared.packed_value is None else prepared.packed_value
     sources = (
@@ -654,11 +696,13 @@ def launch_args(inputs, prepared, out, tasks, stream):
         if prepared.pack_sources is None
         else prepared.pack_sources
     )
+    slots = inputs.kv_slots if prepared.slotted else prepared.metadata.view(-1)
     return (
         inputs.q.view(-1),
         inputs.k,
         inputs.v,
         out.view(-1),
+        slots,
         packed_key,
         packed_value,
         sources,
@@ -678,6 +722,7 @@ def launch_args(inputs, prepared, out, tasks, stream):
         prepared.gated,
         inputs.scale,
         inputs.topk,
+        prepared.slotted,
         stream,
     )
 

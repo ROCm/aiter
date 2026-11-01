@@ -5,16 +5,16 @@
 These three FlyDSL kernels (K1-K3) are the private preparation step of the
 FlyDSL QSA sparse attention; they are not a public op.
 
-Recovery does not validate the selection layout. Dense membership is zero when a plan is
-allocated and after every completed build. Recovery scatters into it; its owning compact CTA
-consumes and clears the same causal prefix. The next launch sorts tasks and builds disjoint
-mask partitions. Plans use one stream's scratch and are pinned for graphs.
+Recovery does not validate the selection layout; it writes each row's sorted complete blocks.
+Compaction builds each union candidate tile's block union and membership from those rows, in LDS.
+The next launch sorts tasks and builds disjoint mask partitions; with a slot table it also maps
+the union blocks to pool blocks. Plans use one stream's scratch and are pinned for graphs.
 """
 
 import math
 import operator
 from dataclasses import dataclass
-from functools import partial
+from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -24,7 +24,17 @@ from flydsl.expr import rocdl
 
 from aiter.jit.utils.chip_info import get_cu_num
 
-from .sparse_prefill_common import _buffer, _buffer_words, _min, _uniform, platform
+from .sparse_prefill_common import (
+    _buffer,
+    _buffer_store_words,
+    _buffer_words,
+    _lds_load,
+    _lds_pointer,
+    _lds_store,
+    _min,
+    _uniform,
+    platform,
+)
 
 THREADS = 256
 INT_MAX = 2**31 - 1
@@ -39,7 +49,6 @@ ORDER_WORDS = EXCHANGE_WORDS + 4 * (2 + 4 * LIMITS)
 @dataclass(kw_only=True)
 class SparsePlan:
     metadata: torch.Tensor
-    dense_membership: torch.Tensor
     blocks: torch.Tensor
     membership: torch.Tensor
     score_masks: torch.Tensor
@@ -59,14 +68,20 @@ class SparsePlan:
     route_model: tuple  # platform union_fixed, union_step, row_step, route_margin
     union_ratio: float
     routing: bool = True
+    # Slot-table launches (K/V read from a token pool through kv_slots): K3 writes each union block's
+    # pool block id and each tile's final partial block pool row (-1: none) for the union kernel.
+    slotted: bool = False
+    pool_blocks: torch.Tensor | None = None
+    tails: torch.Tensor | None = None
+    # Gated raw direct (set by its plan): K3 lists the row groups holding a direct row, so the
+    # direct grid runs them first. direct_flag[1] counts them.
+    direct_meta: torch.Tensor | None = None
+    direct_list: torch.Tensor | None = None
+    direct_groups: int = 0
 
 
 def _ballot(pred):
     return fx.Int64(rocdl.ballot(fx.Int64.ir_type, pred))
-
-
-def _lanes_below(mask, lane):
-    return fx.Int32(fx.ctpop(mask & ((fx.Int64(1) << fx.Int64(lane)) - 1)))
 
 
 # gfx9 DPP controls: quad_perm xor 1 / 2 / 3, row_half_mirror (xor 7), row_mirror (xor 15).
@@ -183,16 +198,11 @@ def _recover_row(
     INDICES: fx.Tensor,
     POSITIONS: fx.Tensor,
     BLOCKS: fx.Tensor,
-    DENSE: fx.Tensor,
-    QUERY_TILES: fx.Tensor,
-    META: fx.Tensor,
     ROWS: fx.Int32,
-    MAX_BLOCKS: fx.Int32,
     row,
     lane,
     scratch,
     slot,
-    MEMBER_BITS: fx.Constexpr[int],
     TOPK: fx.Constexpr[int],
 ):
     # An indices row holds TOPK four-token blocks, then 3 tail tokens.
@@ -225,18 +235,6 @@ def _recover_row(
     for k in fx.range_constexpr(columns):
         column = k * 64 + lane
         BLOCKS[row * TOPK + column] = (column < complete).select(keys[k], fx.Int32(-1))
-    if fx.const_expr(MEMBER_BITS != 0):
-        tile = _uniform(QUERY_TILES[row])
-        if tile >= 0:
-            member = fx.Int64 if MEMBER_BITS == 64 else fx.Int32
-            bit = member(1) << member(row - _uniform(META[tile * 5]))
-            dense = fx.get_iter(DENSE) + fx.Int64(tile) * fx.Int64(MAX_BLOCKS)
-            for k in fx.range_constexpr(columns):
-                block = keys[k]
-                if (k * 64 + lane < complete) & (block >= 0) & (block < MAX_BLOCKS):
-                    fx.atomic_or(dense + block, bit, syncscope="agent")
-            if (lane == 0) & ((visible & 3) != 0):
-                fx.atomic_or(dense + (visible >> 2), bit, syncscope="agent")
 
 
 @flyc.kernel(name="sparse_prefill_recover_scatter", known_block_size=[THREADS, 1, 1])
@@ -244,12 +242,7 @@ def _recover_kernel(
     INDICES: fx.Tensor,
     POSITIONS: fx.Tensor,
     BLOCKS: fx.Tensor,
-    DENSE: fx.Tensor,
-    QUERY_TILES: fx.Tensor,
-    META: fx.Tensor,
     ROWS: fx.Int32,
-    MAX_BLOCKS: fx.Int32,
-    MEMBER_BITS: fx.Constexpr[int],
     TOPK: fx.Constexpr[int],
 ):
     words = 64 * _sort_columns(TOPK)  # one wave's sort transpose
@@ -268,16 +261,11 @@ def _recover_kernel(
             INDICES,
             POSITIONS,
             BLOCKS,
-            DENSE,
-            QUERY_TILES,
-            META,
             ROWS,
-            MAX_BLOCKS,
             row,
             tid & 63,
             scratch,
             wave * words,
-            MEMBER_BITS,
             TOPK,
         )
 
@@ -287,12 +275,7 @@ def _recover_launch(
     INDICES: fx.Tensor,
     POSITIONS: fx.Tensor,
     BLOCKS: fx.Tensor,
-    DENSE: fx.Tensor,
-    QUERY_TILES: fx.Tensor,
-    META: fx.Tensor,
     ROWS: fx.Int32,
-    MAX_BLOCKS: fx.Int32,
-    MEMBER_BITS: fx.Constexpr[int],
     TOPK: fx.Constexpr[int],
     stream: fx.Stream,
 ):
@@ -301,144 +284,559 @@ def _recover_launch(
             INDICES,
             POSITIONS,
             BLOCKS,
-            DENSE,
-            QUERY_TILES,
-            META,
             ROWS,
-            MAX_BLOCKS,
-            MEMBER_BITS,
             TOPK,
         ).launch(grid=((ROWS + 3) // 4, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
-@flyc.kernel(name="sparse_prefill_compact", known_block_size=[THREADS, 1, 1])
+# K2: each union candidate tile's exact block union, from the rows' sorted complete blocks
+# (K1's block_indices) and their causal tail blocks. One CTA per tile, last tile first; LDS is
+# sized per launch. A tile whose causal range fits the LDS ORs each row's bit into a per-block
+# membership word and compacts the nonzero words in block order. Longer ranges go a
+# WINDOW_BLOCKS-block window at a time: blocks set bits of a presence bitmap, a CTA-wide prefix
+# over its words ranks every present block, and membership accumulates in LDS by union index,
+# MEMBER_BYTES at a time. A tile whose padded union exceeds `ratio` times its direct work is
+# routed direct (its count is then partial). Work grows with the rows' selections, plus one
+# bitmap word per 32 blocks of a long range; no scratch grows with tiles x KV blocks.
+
+# CTA sizes: tiles of more rows take more waves.
+COMPACT_THREADS = (256, 512)
+# Block ids loaded in flight per thread in a pass over the rows' blocks.
+UNROLL = 16
+WINDOW_BLOCKS = 65536
+WORDS = WINDOW_BLOCKS // 32
+# LDS of a launch whose longest range does not fit densely: two CTAs per CU.
+LDS_BUDGET = 32768
+# Windowed LDS: presence words, their exclusive prefix counts in the window, then a membership
+# chunk up to the waves' scan totals, which always take the last SCAN_BYTES.
+SCAN_BYTES = max(COMPACT_THREADS) // 64 * 4
+PRESENCE, PREFIX, MEMBER = 0, WORDS * 4, 2 * WORDS * 4
+MEMBER_BYTES = LDS_BUDGET - SCAN_BYTES - MEMBER
+
+
+def _resource(tensor, size_bytes, offset=None):
+    """Byte-addressed buffer over tensor from element offset on."""
+    pointer = fx.get_iter(tensor)
+    if offset is not None:
+        pointer = pointer + offset
+    return _buffer(fx.make_view(pointer, fx.make_layout(1, 1)), size_bytes)
+
+
+def _word(buffer, offset):
+    return _buffer_words(buffer, offset, 1)[0]
+
+
+def _put(buffer, index, value):
+    words = fx.Vector.from_elements([fx.Int32(value)], fx.Int32)
+    _buffer_store_words(words, buffer, fx.Int32(index) * 4)
+
+
+def _cta_sync():
+    fx.memory_fence(syncscope="workgroup")
+    rocdl.s_barrier()
+    fx.memory_fence(syncscope="workgroup")
+
+
+def _inclusive_scan(value, lane):
+    for offset in (1, 2, 4, 8, 16, 32):
+        source = ((lane - offset) & 63) * 4
+        other = fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, source, value))
+        value = (lane >= offset).select(value + other, value)
+    return value
+
+
+def _popcount(value):
+    return fx.Int32(fx.ctpop(value))
+
+
+def _entry_bytes(wide):
+    return 8 if wide else 4
+
+
+def _entry_type(wide):
+    return fx.Int64 if wide else fx.Int32
+
+
+def _or(address, value, wide):
+    fx.atomic_or(_lds_pointer(address, _entry_type(wide)), value, syncscope="workgroup")
+
+
+def _member_bit(row, wide):
+    return (fx.Int64(1) << fx.Int64(row)) if wide else (fx.Int32(1) << row)
+
+
+def _load_entry(address, wide):
+    return _lds_load(address, _entry_type(wide))
+
+
+def _store_entry(address, value, wide):
+    _lds_store(address, value, _entry_type(wide))
+
+
+def _put_entry(members, index, value, wide):
+    words = fx.Vector.from_elements([value], _entry_type(wide)).bitcast(fx.Int32)
+    _buffer_store_words(words, members, index * _entry_bytes(wide))
+
+
+def _zero(wide):
+    return fx.Int64(0) if wide else fx.Int32(0)
+
+
+def _rank(shared, offset):
+    """Union index within the window of the present block `offset` blocks into it."""
+    word = offset >> 5
+    below = (fx.Int32(1) << (offset & 31)) - 1
+    return _lds_load(shared + PREFIX + word * 4) + _popcount(
+        _lds_load(shared + PRESENCE + word * 4) & below
+    )
+
+
+@flyc.jit
+def _dense_block(shared, block, row, end, wide):
+    if (block >= 0) & (block < end):
+        _or(shared + block * _entry_bytes(wide), _member_bit(row, wide), wide)
+
+
+@flyc.jit
+def _mark_block(shared, block, w0, w1):
+    if (block >= w0) & (block < w1):
+        offset = block - w0
+        _or(shared + PRESENCE + (offset >> 5) * 4, fx.Int32(1) << (offset & 31), False)
+
+
+@flyc.jit
+def _member_block(shared, block, row, w0, w1, c0, entries, wide):
+    if (block >= w0) & (block < w1):
+        index = _rank(shared, block - w0) - c0
+        if (index >= 0) & (index < entries):
+            address = shared + MEMBER + index * _entry_bytes(wide)
+            _or(address, _member_bit(row, wide), wide)
+
+
+def _visit(cta, block, row, mode, w0, w1, c0, entries):
+    """Mode 0: OR the row's bit into the block's dense word; 1: mark the block present;
+    2: add the row's bit to the block's union entry in the membership chunk."""
+    if mode == 0:
+        _dense_block(cta.shared, block, row, w1, cta.wide)
+    elif mode == 1:
+        _mark_block(cta.shared, block, w0, w1)
+    else:
+        _member_block(cta.shared, block, row, w0, w1, c0, entries, cta.wide)
+
+
+def _chunks(cta, first, total):
+    """UNROLL block ids at elements first + k * threads (all loads issued before any use;
+    a wave's lanes hold consecutive elements), as (element, id), id -1 past the tile's rows.
+    """
+    loads = []
+    for k in range(UNROLL):
+        element = first + k * cta.threads
+        loads.append((element, _word(cta.rows, element * 4)))
+    return [
+        (element, (element < total).select(block, fx.Int32(-1)))
+        for element, block in loads
+    ]
+
+
+def _visit_chunks(cta, chunks, mode, w0, w1, c0, entries):
+    topk = cta.topk
+    for element, block in chunks:
+        # Row of the element: TOPK block ids per row.
+        if topk & (topk - 1) == 0:
+            row = element >> (topk.bit_length() - 1)
+        else:
+            row = element // topk
+        _visit(cta, block, row, mode, w0, w1, c0, entries)
+
+
+@flyc.jit
+def _blocks(cta, mode, w0, w1, c0, entries):
+    """Visit every complete block of the tile's rows, then each row's causal tail block
+    (visible // 4 holds its last visible % 4 tokens)."""
+    total = cta.nrows * cta.topk
+    for start in range(cta.tid, total, fx.Int32(cta.threads * UNROLL)):
+        chunks = _chunks(cta, fx.Int32(start), total)
+        _visit_chunks(cta, chunks, mode, w0, w1, c0, entries)
+    visible = cta.position + cta.tid + 1
+    if (cta.tid < cta.nrows) & ((visible & 3) != 0) & ((visible >> 2) < cta.max_blocks):
+        _visit(cta, visible >> 2, cta.tid, mode, w0, w1, c0, entries)
+
+
+def _prefix_base(cta, inclusive, local):
+    """(this thread's exclusive prefix over the CTA, CTA total) from the waves' inclusive scans."""
+    totals = [_lds_load(cta.scan + w * 4) for w in range(cta.threads // 64)]
+    running = inclusive - local
+    for w, total in enumerate(totals):
+        running = running + (fx.Int32(w) < cta.wave).select(total, fx.Int32(0))
+    present = totals[0]
+    for total in totals[1:]:
+        present = present + total
+    return running, present
+
+
+@flyc.jit
+def _cta_prefix(cta, local):
+    inclusive = _inclusive_scan(local, cta.lane)
+    if cta.lane == 63:
+        _lds_store(cta.scan + cta.wave * 4, inclusive)
+    _cta_sync()
+    running, present = _prefix_base(cta, inclusive, local)
+    return running, present
+
+
+def _over(count, budget):
+    padded = (16 * ((count + 15) >> 4)).to(fx.Float32)
+    return (padded > budget).select(fx.Int32(1), fx.Int32(0))
+
+
+def _owned(cta, count):
+    """This thread's contiguous share [lo, hi) of `count` items."""
+    per = (count + cta.threads - 1) // cta.threads
+    lo = _min(cta.tid * per, count)
+    return lo, _min(lo + per, count)
+
+
+def _below(mask):
+    low = rocdl.mbcnt_lo(
+        fx.Int32.ir_type, fx.Int32(mask).ir_value(), fx.Int32(0).ir_value()
+    )
+    return fx.Int32(
+        rocdl.mbcnt_hi(fx.Int32.ir_type, fx.Int32(mask >> 32).ir_value(), low)
+    )
+
+
+def _count(mask):
+    return fx.Int32(fx.ctpop(mask))
+
+
+@flyc.jit
+def _wave_bases(cta, total):
+    """(this wave's exclusive prefix over the CTA, CTA total) of the waves' uniform totals."""
+    if cta.lane == 0:
+        _lds_store(cta.scan + cta.wave * 4, total)
+    _cta_sync()
+    base, present = _prefix_base(cta, fx.Int32(0), fx.Int32(0))
+    return base, present
+
+
+@flyc.jit
+def _put_word(cta, index, word, base, mask):
+    if word != _zero(cta.wide):
+        destination = base + _below(mask)
+        _put(cta.output, destination, index)
+        _put_entry(cta.members, destination, word, cta.wide)
+
+
+@flyc.jit
+def _dense(cta, end, budget):
+    """(union size, whether over budget) of a tile whose causal range fits the LDS, one word
+    per block. Each wave compacts its contiguous share 64 words at a time, so the outputs
+    coalesce."""
+    size = _entry_bytes(cta.wide)
+    zero = _zero(cta.wide)
+    for index in range(cta.tid, end, fx.Int32(cta.threads)):
+        _store_entry(cta.shared + fx.Int32(index) * size, zero, cta.wide)
+    _cta_sync()
+    _blocks(cta, 0, fx.Int32(0), end, fx.Int32(0), fx.Int32(0))
+    _cta_sync()
+    waves = cta.threads // 64
+    per = ((end + waves - 1) // waves + 63) & ~63
+    lo = _min(cta.wave * per, end)
+    hi = _min(lo + per, end)
+    total = fx.Int32(0)
+    for start in range(lo, hi, fx.Int32(64)):
+        index = fx.Int32(start) + cta.lane
+        address = cta.shared + _min(index, end - 1) * size
+        word = (index < hi).select(_load_entry(address, cta.wide), zero)
+        total = total + _count(_ballot(word != zero))
+    base, present = _wave_bases(cta, total)
+    over = _over(present, budget)
+    if over == 0:
+        for start in range(lo, hi, fx.Int32(64)):
+            index = fx.Int32(start) + cta.lane
+            address = cta.shared + _min(index, end - 1) * size
+            word = (index < hi).select(_load_entry(address, cta.wide), zero)
+            mask = _ballot(word != zero)
+            _put_word(cta, index, word, base, mask)
+            base = base + _count(mask)
+    return present, over
+
+
+@flyc.jit
+def _emit_blocks(cta, base, w0, lo, hi):
+    # Present blocks of this thread's words in order, from union index base + prefix.
+    for index in range(lo, hi, fx.Int32(1)):
+        word = fx.Int32(index)
+        bits = _lds_load(cta.shared + PRESENCE + word * 4)
+        union = base + _lds_load(cta.shared + PREFIX + word * 4)
+        while bits != 0:
+            bit = fx.cttz(bits)
+            _put(cta.output, union, w0 + word * 32 + bit)
+            union = union + 1
+            bits = bits & (bits - 1)
+
+
+@flyc.jit
+def _window(cta, w0, w1, count, budget):
+    """Union of blocks [w0, w1) appended at `count`; returns (new count, whether over budget)."""
+    words = (w1 - w0 + 31) >> 5
+    for index in range(cta.tid, words, fx.Int32(cta.threads)):
+        _lds_store(cta.shared + PRESENCE + fx.Int32(index) * 4, 0)
+    _cta_sync()
+    zero = fx.Int32(0)
+    _blocks(cta, 1, w0, w1, zero, zero)
+    _cta_sync()
+    # Thread t owns words [lo, hi); a CTA-wide exclusive scan of their set bits gives each
+    # word's prefix.
+    lo, hi = _owned(cta, words)
+    local = fx.Int32(0)
+    for index in range(lo, hi, fx.Int32(1)):
+        local = local + _popcount(
+            _lds_load(cta.shared + PRESENCE + fx.Int32(index) * 4)
+        )
+    running, present = _cta_prefix(cta, local)
+    for index in range(lo, hi, fx.Int32(1)):
+        word = fx.Int32(index)
+        _lds_store(cta.shared + PREFIX + word * 4, running)
+        running = running + _popcount(_lds_load(cta.shared + PRESENCE + word * 4))
+    over = _over(count + present, budget)
+    if over == 0:
+        _emit_blocks(cta, count, w0, lo, hi)
+        size = _entry_bytes(cta.wide)
+        entries = MEMBER_BYTES // size
+        for start in range(fx.Int32(0), present, fx.Int32(entries)):
+            c0 = fx.Int32(start)
+            # Union indices c0 .. c0 + filled - 1 of this chunk.
+            filled = _min(present - c0, fx.Int32(entries))
+            for index in range(cta.tid, filled, fx.Int32(cta.threads)):
+                address = cta.shared + MEMBER + fx.Int32(index) * size
+                _store_entry(address, _zero(cta.wide), cta.wide)
+            _cta_sync()
+            _blocks(cta, 2, w0, w1, c0, fx.Int32(entries))
+            _cta_sync()
+            for index in range(cta.tid, filled, fx.Int32(cta.threads)):
+                slot = fx.Int32(index)
+                entry = _load_entry(cta.shared + MEMBER + slot * size, cta.wide)
+                _put_entry(cta.members, count + c0 + slot, entry, cta.wide)
+            _cta_sync()
+    _cta_sync()
+    return count + over.select(fx.Int32(0), present), over
+
+
+@flyc.jit
+def _tile(
+    ROWS,
+    META,
+    BLOCKS,
+    MEMBERSHIP,
+    COUNTS,
+    COSTS,
+    DIRECT_FLAG,
+    max_blocks,
+    capacity,
+    ratio,
+    dense_limit,
+    lds_bytes,
+    wide,
+    threads,
+    topk,
+):
+    storage = (
+        fx.SharedAllocator(static=False).allocate(fx.Array[fx.Int8, 16, 16]).peek()
+    )
+    shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(16, 1)))))
+    tid = fx.thread_idx.x
+    wave, lane = _uniform(tid >> 6), tid & 63
+    program = fx.block_idx.x
+    # Last tile first: in a causal request it holds the most blocks.
+    tile = fx.grid_dim.x - 1 - program
+    first_row, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
+    position = _uniform(META[tile * 5 + 4])
+    # Union pads blocks to N64 steps; one step equals sixteen BN32 direct steps of a row.
+    visible = position + lane + 1
+    tokens = _min(visible >> 2, fx.Int32(topk)) * 4 + (visible & 3)
+    steps = (lane < rows).select((tokens + 31) >> 5, fx.Int32(0))
+    direct_steps = _wave_reduce(steps, operator.add)
+    row_steps = _wave_reduce(steps, fx.max)
+    budget = ratio * direct_steps.to(fx.Float32)
+    end = _min(max_blocks, (position + rows + 3) >> 2)
+    size = _entry_bytes(wide)
+    # MEMBERSHIP is an int32 view; 64-bit entries take two words.
+    cta = SimpleNamespace(
+        shared=shared,
+        scan=shared + lds_bytes - SCAN_BYTES,
+        tid=tid,
+        wave=wave,
+        lane=lane,
+        threads=threads,
+        topk=topk,
+        wide=wide,
+        nrows=rows,
+        position=position,
+        max_blocks=max_blocks,
+        rows=_resource(ROWS, rows * (topk * 4), fx.Int64(first_row) * topk),
+        output=_resource(BLOCKS, capacity * 4, fx.Int64(tile) * fx.Int64(capacity)),
+        members=_resource(
+            MEMBERSHIP,
+            capacity * size,
+            fx.Int64(tile) * fx.Int64(capacity * (size // 4)),
+        ),
+    )
+    count, over = fx.Int32(0), fx.Int32(0)
+    if end <= dense_limit:
+        count, over = _dense(cta, end, budget)
+    else:
+        w0 = fx.Int32(0)
+        while (w0 < end) & (over == 0):
+            w1 = _min(w0 + WINDOW_BLOCKS, end)
+            count, over = _window(cta, w0, w1, count, budget)
+            w0 = w1
+    if tid == 0:
+        _put(_resource(COUNTS, 4, fx.Int64(tile)), fx.Int32(0), count)
+        costs = _resource(COSTS, 12, fx.Int64(tile) * 3)
+        _put(costs, fx.Int32(0), direct_steps)
+        _put(costs, fx.Int32(1), row_steps)
+        _put(costs, fx.Int32(2), (over == 0).select(fx.Int32(1), fx.Int32(0)))
+        if program == 0:
+            flag = _resource(DIRECT_FLAG, 8)
+            _put(flag, fx.Int32(0), fx.Int32(0))
+            _put(flag, fx.Int32(1), fx.Int32(0))
+
+
+@flyc.kernel(name="sparse_prefill_compact", known_block_size=[COMPACT_THREADS[0], 1, 1])
 def _compact_kernel(
-    DENSE: fx.Tensor,
+    ROWS: fx.Tensor,
+    META: fx.Tensor,
     BLOCKS: fx.Tensor,
     MEMBERSHIP: fx.Tensor,
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
-    META: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
     MAX_BLOCKS: fx.Int32,
     CAPACITY: fx.Int32,
     RATIO: fx.Float32,
-    TILES: fx.Int32,
+    DENSE_LIMIT: fx.Int32,
+    LDS_BYTES: fx.Int32,
     MEMBERS64: fx.Constexpr[bool],
     TOPK: fx.Constexpr[int],
 ):
-    totals = (
-        fx.SharedAllocator()
-        .allocate(fx.Array[fx.Int32, 32, 16])
-        .peek()
-        .view(fx.make_layout(32, 1))
+    _tile(
+        ROWS,
+        META,
+        BLOCKS,
+        MEMBERSHIP,
+        COUNTS,
+        COSTS,
+        DIRECT_FLAG,
+        MAX_BLOCKS,
+        CAPACITY,
+        RATIO,
+        DENSE_LIMIT,
+        LDS_BYTES,
+        MEMBERS64,
+        COMPACT_THREADS[0],
+        TOPK,
     )
-    # Membership words hold one bit per query row (64-bit for BQ > 32).
-    member, member_bytes = (fx.Int64, 8) if MEMBERS64 else (fx.Int32, 4)
-    tid = fx.thread_idx.x
-    lane, wave = tid & 63, _uniform(tid >> 6)
-    if (fx.block_idx.x == 0) & (tid == 0):
-        DIRECT_FLAG[0] = 0
-    # Last tile first: in a causal request it holds the most blocks.
-    tile = TILES - 1 - fx.block_idx.x
-    rows = _uniform(META[tile * 5 + 1])
-    position = _uniform(META[tile * 5 + 4])
-    # Union pads blocks to N64 steps; one step equals sixteen BN32 direct steps.
-    visible = position + lane + 1
-    tokens = _min(visible >> 2, fx.Int32(TOPK)) * 4 + (visible & 3)
-    in_tile = (lane < rows) & (lane < (64 if MEMBERS64 else 32))
-    steps = in_tile.select((tokens + 31) >> 5, fx.Int32(0))
-    direct_steps = _wave_reduce(steps, operator.add)
-    row_steps = _wave_reduce(steps, fx.max)
-    budget = RATIO * fx.Float32(direct_steps)
-    end = _min(MAX_BLOCKS, (position + rows + 3) >> 2)
-    # Recovery only scatters within the tile's causal range. Copy the union out in block order
-    # and zero what was set; past the budget the tile is direct, its count partial, and the
-    # rest is only zeroed. Chunks of 256/512/1024 blocks (by MAX_BLOCKS) set where it stops.
-    chunks = (MAX_BLOCKS <= 512).select(fx.Int32(2), fx.Int32(4))
-    chunks = (MAX_BLOCKS <= 256).select(fx.Int32(1), chunks)
-    row_bytes = MAX_BLOCKS * member_bytes
-    row_start = fx.get_iter(DENSE) + fx.Int64(tile) * fx.Int64(MAX_BLOCKS)
-    dense = rocdl.make_buffer_ptr(
-        fx.recast_iter(fx.Int8, row_start), num_records_bytes=row_bytes
+
+
+@flyc.kernel(name="sparse_prefill_compact", known_block_size=[COMPACT_THREADS[1], 1, 1])
+def _compact_kernel_large(
+    ROWS: fx.Tensor,
+    META: fx.Tensor,
+    BLOCKS: fx.Tensor,
+    MEMBERSHIP: fx.Tensor,
+    COUNTS: fx.Tensor,
+    COSTS: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor,
+    MAX_BLOCKS: fx.Int32,
+    CAPACITY: fx.Int32,
+    RATIO: fx.Float32,
+    DENSE_LIMIT: fx.Int32,
+    LDS_BYTES: fx.Int32,
+    MEMBERS64: fx.Constexpr[bool],
+    TOPK: fx.Constexpr[int],
+):
+    _tile(
+        ROWS,
+        META,
+        BLOCKS,
+        MEMBERSHIP,
+        COUNTS,
+        COSTS,
+        DIRECT_FLAG,
+        MAX_BLOCKS,
+        CAPACITY,
+        RATIO,
+        DENSE_LIMIT,
+        LDS_BYTES,
+        MEMBERS64,
+        COMPACT_THREADS[1],
+        TOPK,
     )
-    count = fx.Int32(0)
-    start = fx.Int32(0)
-    parity = fx.Int32(0)
-    while (start < end) & (fx.Float32(((count + 15) >> 4) * 16) <= budget):
-        ids, bits, masks = [], [], []
-        for k in fx.range_constexpr(4):
-            index = start + k * THREADS + tid
-            offset = ((index < end) & (k < chunks)).select(
-                index * member_bytes, row_bytes
-            )
-            words = _buffer_words(dense, offset, member_bytes // 4)
-            ids.append(index)
-            bits.append(words.bitcast(fx.Int64)[0] if MEMBERS64 else words[0])
-            masks.append(_ballot(bits[k] != 0))
-            # Every lane stores its wave's (equal) count; parity double-buffers the chunks.
-            totals[parity * 16 + k * 4 + wave] = fx.Int32(fx.ctpop(masks[k]))
-        fx.gpu.barrier()
-        for k in fx.range_constexpr(4):
-            waves = [totals[parity * 16 + k * 4 + w] for w in range(4)]
-            before = _lanes_below(masks[k], lane)
-            for w in fx.range_constexpr(3):
-                before = before + (wave > w).select(waves[w], fx.Int32(0))
-            if bits[k] != 0:
-                BLOCKS[tile * CAPACITY + count + before] = ids[k]
-                MEMBERSHIP[tile * CAPACITY + count + before] = bits[k]
-                row_start[ids[k]] = member(0)
-            count = count + waves[0] + waves[1] + waves[2] + waves[3]
-        start = start + chunks * THREADS
-        parity = parity ^ 1
-    rest = start
-    while rest < end:
-        for k in fx.range_constexpr(4):
-            index = rest + k * THREADS + tid
-            if index < end:
-                row_start[index] = member(0)
-        rest = rest + 4 * THREADS
-    proposal = (start >= end) & (fx.Float32(((count + 15) >> 4) * 16) <= budget)
-    if tid == 0:
-        COUNTS[tile] = count
-        COSTS[tile * 3] = direct_steps
-        COSTS[tile * 3 + 1] = row_steps
-        COSTS[tile * 3 + 2] = proposal.select(fx.Int32(1), fx.Int32(0))
 
 
 @flyc.jit
 def _compact_launch(
-    DENSE: fx.Tensor,
+    ROWS: fx.Tensor,
+    META: fx.Tensor,
     BLOCKS: fx.Tensor,
     MEMBERSHIP: fx.Tensor,
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
-    META: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
     MAX_BLOCKS: fx.Int32,
     CAPACITY: fx.Int32,
     RATIO: fx.Float32,
+    DENSE_LIMIT: fx.Int32,
+    LDS_BYTES: fx.Int32,
     TILES: fx.Int32,
     MEMBERS64: fx.Constexpr[bool],
+    LARGE: fx.Constexpr[bool],
     TOPK: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     if TILES > 0:
-        _compact_kernel(
-            DENSE,
+        args = (
+            ROWS,
+            META,
             BLOCKS,
             MEMBERSHIP,
             COUNTS,
             COSTS,
-            META,
             DIRECT_FLAG,
             MAX_BLOCKS,
             CAPACITY,
             RATIO,
-            TILES,
+            DENSE_LIMIT,
+            LDS_BYTES,
             MEMBERS64,
             TOPK,
-        ).launch(grid=(TILES, 1, 1), block=(THREADS, 1, 1), stream=stream)
+        )
+        if fx.const_expr(LARGE):
+            _compact_kernel_large(*args).launch(
+                grid=(TILES, 1, 1),
+                block=(COMPACT_THREADS[1], 1, 1),
+                smem=LDS_BYTES,
+                stream=stream,
+            )
+        else:
+            _compact_kernel(*args).launch(
+                grid=(TILES, 1, 1),
+                block=(COMPACT_THREADS[0], 1, 1),
+                smem=LDS_BYTES,
+                stream=stream,
+            )
+
+
+def lds_layout(max_blocks, wide):
+    """(LDS bytes, longest causal range in blocks compacted densely) of a K2 launch: one
+    word per block when the plan's longest range fits LDS_BUDGET, else LDS_BUDGET (ranges
+    up to it still dense, longer ones windowed).
+    """
+    dense = (-(-max_blocks // 64) * 64) * _entry_bytes(wide) + SCAN_BYTES
+    if dense <= LDS_BUDGET:
+        return dense, max_blocks
+    return LDS_BUDGET, (LDS_BUDGET - SCAN_BYTES) // _entry_bytes(wide)
 
 
 def _block_reduce(values, ops, scratch, offset, wave):
@@ -605,6 +1003,56 @@ def _order(
             ORDER[destination] = task
 
 
+def _claim(flag, count):
+    """Atomically add count to flag[1]; returns the previous value."""
+    return fx.atomic_add(fx.get_iter(flag) + 1, fx.Int32(count), syncscope="agent")
+
+
+@flyc.jit
+def _direct_groups(
+    COUNTS: fx.Tensor,
+    COSTS: fx.Tensor,
+    QUERY_TILES: fx.Tensor,
+    GROUP_META: fx.Tensor,
+    GROUP_LIST: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor,
+    scratch,
+    chunk,
+    threshold,
+    GROUPS: fx.Int32,
+):
+    """Append this CTA's raw direct row groups that hold a row of a direct tile to GROUP_LIST
+    (count in DIRECT_FLAG[1]), in group order within the CTA."""
+    tid = fx.thread_idx.x
+    wave = _uniform(tid >> 6)
+    group = chunk * THREADS + tid
+    index = _min(group, GROUPS - 1)
+    first, rows = GROUP_META[index * 5], GROUP_META[index * 5 + 1]
+    direct = fx.Int32(0)
+    # A raw group holds up to four rows; the route matches _order's.
+    for local in fx.range_constexpr(4):
+        tile = QUERY_TILES[first + _min(fx.Int32(local), rows - 1)]
+        steps = (COUNTS[tile] + 15) >> 4
+        active = (COSTS[tile * 3 + 2] == 1) & (steps <= threshold)
+        direct = direct | active.select(fx.Int32(0), fx.Int32(1))
+    listed = (group < GROUPS) & (direct != 0)
+    mask = _ballot(listed)
+    scratch[wave] = _count(mask)
+    fx.gpu.barrier()
+    totals = [scratch[w] for w in range(THREADS // 64)]
+    total = totals[0]
+    for w in fx.range_constexpr(1, THREADS // 64):
+        total = total + totals[w]
+    if tid == 0:
+        scratch[THREADS // 64] = _claim(DIRECT_FLAG, total)
+    fx.gpu.barrier()
+    base = scratch[THREADS // 64]
+    for w in fx.range_constexpr(THREADS // 64 - 1):
+        base = base + (fx.Int32(w) < wave).select(totals[w], fx.Int32(0))
+    if listed:
+        GROUP_LIST[base + _below(mask)] = group
+
+
 def _slot(MEMBERSHIP, BLOCKS, slot, live):
     slot = live.select(slot, fx.Int32(0))
     member = MEMBERSHIP[slot]
@@ -620,15 +1068,20 @@ def _masks(
     BLOCKS: fx.Tensor,
     MEMBERSHIP: fx.Tensor,
     MASKS: fx.Tensor,
+    SLOTS: fx.Tensor,
+    POOL_BLOCKS: fx.Tensor,
+    TAILS: fx.Tensor,
     task,
     QB: fx.Int32,
     CAP: fx.Int32,
     TILES: fx.Int32,
+    SLOTTED: fx.Constexpr[bool],
 ):
     # Entry (nt, query, quarter) holds 4 bits for each of the slots nt*16 + quarter*2 +
     # (group//2)*8 + group%2. One lane owns an (nt, quarter) pair: its four slots are
     # loaded once and shared by every query. Each wave owns one (tile, part); a part
-    # takes 16 of every 64 slot groups.
+    # takes 16 of every 64 slot groups. With a slot table the same lanes map their
+    # blocks to pool blocks (a four-token block occupies four aligned pool rows).
     lane = fx.thread_idx.x & 63
     tile = TILES - 1 - (task >> 2)
     if _uniform(COSTS[tile * 3 + 2]) != 0:
@@ -636,6 +1089,13 @@ def _masks(
         rows = _uniform(META[tile * 5 + 1])
         length = _uniform(META[tile * 5 + 3])
         position = _uniform(META[tile * 5 + 4])
+        kv_start = fx.Int32(0)
+        if fx.const_expr(SLOTTED):
+            kv_start = _uniform(META[tile * 5 + 2])
+            if ((task & 3) == 0) & (lane == 0):
+                # Pool row of the final partial block's first token, -1 without one.
+                tail = fx.Int32(SLOTS[kv_start + (((length - 1) >> 2) << 2)])
+                TAILS[tile] = ((length & 3) != 0).select(tail, fx.Int32(-1))
         groups = (count + 15) >> 4
         first = (task & 3) * 16 + (lane >> 2)
         quarter = lane & 3
@@ -649,6 +1109,12 @@ def _masks(
                 _slot(MEMBERSHIP, BLOCKS, base + o, valid & (slot + o < count))
                 for o in (0, 1, 8, 9)
             ]
+            if fx.const_expr(SLOTTED):
+                for i in fx.range_constexpr(4):
+                    o = (0, 1, 8, 9)[i]
+                    if valid & (slot + o < count):
+                        row = fx.Int32(SLOTS[kv_start + pairs[i][1]])
+                        POOL_BLOCKS[base + o] = row >> 2
             masks = tile * (CAP >> 4) * QB * 4 + nt * QB * 4 + quarter
             for query in range(fx.Int32(0), QB, fx.Int32(1)):
                 visible = fx.min(position + query + 1, length)
@@ -666,6 +1132,7 @@ def _masks(
 
 @flyc.kernel(name="sparse_prefill_order_masks", known_block_size=[THREADS, 1, 1])
 def _order_masks_kernel(
+    SLOTS: fx.Tensor,
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
     ACTIVE: fx.Tensor,
@@ -675,6 +1142,11 @@ def _order_masks_kernel(
     MEMBERSHIP: fx.Tensor,
     META: fx.Tensor,
     MASKS: fx.Tensor,
+    POOL_BLOCKS: fx.Tensor,
+    TAILS: fx.Tensor,
+    QUERY_TILES: fx.Tensor,
+    GROUP_META: fx.Tensor,
+    GROUP_LIST: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -683,6 +1155,7 @@ def _order_masks_kernel(
     QB: fx.Int32,
     CAP: fx.Int32,
     TILES: fx.Int32,
+    GROUPS: fx.Int32,
     TASK_SHARE: fx.Float32,
     DIRECT_STEP: fx.Float32,
     DIRECT_FIXED: fx.Float32,
@@ -691,6 +1164,7 @@ def _order_masks_kernel(
     WIDE: fx.Constexpr[bool],
     ROUTE: fx.Constexpr[bool],
     ROUTE_MODEL: fx.Constexpr[tuple],
+    SLOTTED: fx.Constexpr[bool],
 ):
     scratch = (
         fx.SharedAllocator()
@@ -699,7 +1173,8 @@ def _order_masks_kernel(
         .view(fx.make_layout(ORDER_WORDS, 1))
     )
     program = fx.block_idx.x
-    if program < ORDER_CTAS:
+    # Order CTAs, then one mask CTA per tile, then the raw direct group-list CTAs.
+    if (program < ORDER_CTAS) | (program >= ORDER_CTAS + TILES):
         threshold = fx.Int32(INT_MAX)
         if fx.const_expr(ROUTE):
             threshold = _route(
@@ -712,36 +1187,66 @@ def _order_masks_kernel(
                 DIRECT_FIXED,
                 ROUTE_MODEL,
             )
-        for width in fx.range_constexpr(len(SORT_WIDTHS)):
-            width = SORT_WIDTHS[width]
-            lower = 0 if width == 1 else THREADS * width // 2
-            if (SIZE > lower) & (SIZE <= THREADS * width):
-                _order(
-                    COUNTS,
-                    COSTS,
-                    ACTIVE,
-                    ORDER,
-                    DIRECT_FLAG,
-                    scratch,
-                    program,
-                    threshold,
-                    TASKS,
-                    GRID,
-                    SIZE,
-                    SHIFT,
-                    HK,
-                    SLICES,
-                    WIDE,
-                    width,
-                )
+        if program < ORDER_CTAS:
+            for width in fx.range_constexpr(len(SORT_WIDTHS)):
+                width = SORT_WIDTHS[width]
+                lower = 0 if width == 1 else THREADS * width // 2
+                if (SIZE > lower) & (SIZE <= THREADS * width):
+                    _order(
+                        COUNTS,
+                        COSTS,
+                        ACTIVE,
+                        ORDER,
+                        DIRECT_FLAG,
+                        scratch,
+                        program,
+                        threshold,
+                        TASKS,
+                        GRID,
+                        SIZE,
+                        SHIFT,
+                        HK,
+                        SLICES,
+                        WIDE,
+                        width,
+                    )
+        else:
+            _direct_groups(
+                COUNTS,
+                COSTS,
+                QUERY_TILES,
+                GROUP_META,
+                GROUP_LIST,
+                DIRECT_FLAG,
+                scratch,
+                program - ORDER_CTAS - TILES,
+                threshold,
+                GROUPS,
+            )
     else:
         # Mask CTAs pack one (tile, part) per wave.
         task = (program - ORDER_CTAS) * 4 + _uniform(fx.thread_idx.x >> 6)
-        _masks(COUNTS, COSTS, META, BLOCKS, MEMBERSHIP, MASKS, task, QB, CAP, TILES)
+        _masks(
+            COUNTS,
+            COSTS,
+            META,
+            BLOCKS,
+            MEMBERSHIP,
+            MASKS,
+            SLOTS,
+            POOL_BLOCKS,
+            TAILS,
+            task,
+            QB,
+            CAP,
+            TILES,
+            SLOTTED,
+        )
 
 
 @flyc.jit
 def _order_masks_launch(
+    SLOTS: fx.Tensor,
     COUNTS: fx.Tensor,
     COSTS: fx.Tensor,
     ACTIVE: fx.Tensor,
@@ -751,6 +1256,11 @@ def _order_masks_launch(
     MEMBERSHIP: fx.Tensor,
     META: fx.Tensor,
     MASKS: fx.Tensor,
+    POOL_BLOCKS: fx.Tensor,
+    TAILS: fx.Tensor,
+    QUERY_TILES: fx.Tensor,
+    GROUP_META: fx.Tensor,
+    GROUP_LIST: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -759,6 +1269,7 @@ def _order_masks_launch(
     QB: fx.Int32,
     CAP: fx.Int32,
     TILES: fx.Int32,
+    GROUPS: fx.Int32,
     TASK_SHARE: fx.Float32,
     DIRECT_STEP: fx.Float32,
     DIRECT_FIXED: fx.Float32,
@@ -767,10 +1278,12 @@ def _order_masks_launch(
     WIDE: fx.Constexpr[bool],
     ROUTE: fx.Constexpr[bool],
     ROUTE_MODEL: fx.Constexpr[tuple],
+    SLOTTED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if TILES > 0:
         _order_masks_kernel(
+            SLOTS,
             COUNTS,
             COSTS,
             ACTIVE,
@@ -780,6 +1293,11 @@ def _order_masks_launch(
             MEMBERSHIP,
             META,
             MASKS,
+            POOL_BLOCKS,
+            TAILS,
+            QUERY_TILES,
+            GROUP_META,
+            GROUP_LIST,
             TASKS,
             GRID,
             SIZE,
@@ -788,6 +1306,7 @@ def _order_masks_launch(
             QB,
             CAP,
             TILES,
+            GROUPS,
             TASK_SHARE,
             DIRECT_STEP,
             DIRECT_FIXED,
@@ -796,7 +1315,12 @@ def _order_masks_launch(
             WIDE,
             ROUTE,
             ROUTE_MODEL,
-        ).launch(grid=(ORDER_CTAS + TILES, 1, 1), block=(THREADS, 1, 1), stream=stream)
+            SLOTTED,
+        ).launch(
+            grid=(ORDER_CTAS + TILES + (GROUPS + THREADS - 1) // THREADS, 1, 1),
+            block=(THREADS, 1, 1),
+            stream=stream,
+        )
 
 
 def _cdiv(a, b):
@@ -810,29 +1334,25 @@ def upload(array, device) -> torch.Tensor:
 
 
 def scratch_specs(plan: SparsePlan) -> list:
-    """(field, shape, dtype, zeroed) of the per-call scratch; every launch rewrites what it reads."""
+    """(field, shape, dtype) of the per-call scratch; every launch rewrites what it reads."""
     tiles, capacity = plan.num_tiles, plan.block_capacity
     members = torch.int64 if plan.query_tile > 32 else torch.int32
-    return [
-        ("dense_membership", (tiles, plan.max_blocks), members, True),
-        ("blocks", (tiles, capacity), torch.int32, False),
-        ("membership", (tiles, capacity), members, False),
-        (
-            "score_masks",
-            (tiles, capacity // 16, plan.query_tile, 4),
-            torch.int16,
-            False,
-        ),
+    specs = [
+        ("blocks", (tiles, capacity), torch.int32),
+        ("membership", (tiles, capacity), members),
+        ("score_masks", (tiles, capacity // 16, plan.query_tile, 4), torch.int16),
     ]
+    if plan.slotted:
+        specs += [
+            ("pool_blocks", (tiles, capacity), torch.int32),
+            ("tails", (tiles,), torch.int32),
+        ]
+    return specs
 
 
 def allocate_scratch(owner, specs, device) -> None:
-    for name, shape, dtype, zeroed in specs:
-        setattr(
-            owner,
-            name,
-            (torch.zeros if zeroed else torch.empty)(shape, dtype=dtype, device=device),
-        )
+    for name, shape, dtype in specs:
+        setattr(owner, name, torch.empty(shape, dtype=dtype, device=device))
 
 
 def wide_tile_rows(query_tile: int) -> int:
@@ -840,7 +1360,9 @@ def wide_tile_rows(query_tile: int) -> int:
     return math.ceil(query_tile * get_cu_num() * platform().wide_tiles_per_cu)
 
 
-def allocate_plan(*, inputs, query_tile: int, scratch: bool = True) -> SparsePlan:
+def allocate_plan(
+    *, inputs, query_tile: int, scratch: bool = True, slotted: bool = False
+) -> SparsePlan:
     group = inputs.q.shape[1] // inputs.k.shape[1]
     if query_tile < 1 or query_tile > 32:
         raise ValueError("Require 1<=BQ<=32")
@@ -911,7 +1433,6 @@ def allocate_plan(*, inputs, query_tile: int, scratch: bool = True) -> SparsePla
     kwargs = {"dtype": torch.int32, "device": inputs.q.device}
     plan = SparsePlan(
         metadata=upload(metadata, inputs.q.device),
-        dense_membership=None,
         blocks=None,
         membership=None,
         score_masks=None,
@@ -919,7 +1440,7 @@ def allocate_plan(*, inputs, query_tile: int, scratch: bool = True) -> SparsePla
         costs=torch.empty((tiles, 3), **kwargs),
         active=torch.empty(tiles, **kwargs),
         task_order=torch.empty(_cdiv(tasks, grid) * grid if grid else 0, **kwargs),
-        direct_flag=torch.empty(1, **kwargs),
+        direct_flag=torch.empty(2, **kwargs),
         query_tiles=upload(np.repeat(np.arange(tiles), sizes), inputs.q.device),
         query_tile=query_tile,
         group_padded=group,
@@ -935,6 +1456,7 @@ def allocate_plan(*, inputs, query_tile: int, scratch: bool = True) -> SparsePla
             config.route_margin,
         ),
         union_ratio=config.union_ratio,
+        slotted=slotted,
     )
     if scratch:
         allocate_scratch(plan, scratch_specs(plan), inputs.q.device)
@@ -961,44 +1483,43 @@ def _compiled(launch, args, grid, constants):
 
 
 def _launches(inputs, plan, stream):
-    """(compiled, args) of K1-K3 in launch order; K1's first argument is the indices."""
-    standin = inputs.query_positions  # tensor slots K1 does not read without a plan
-    bits = 0 if plan is None else 64 if plan.query_tile > 32 else 32
+    """(compiled, args) of K1-K3 in launch order; K1's first argument is the indices, K3's
+    the slot table (a stand-in without one)."""
     args = (
         inputs.indices,
         inputs.query_positions,
         inputs.block_indices.view(-1),
-        # 2-D: FlyDSL passes int32 dims, and tiles * max_blocks may exceed 2**31.
-        standin if plan is None else plan.dense_membership,
-        standin if plan is None else plan.query_tiles,
-        standin if plan is None else plan.metadata.view(-1),
         inputs.q.shape[0],
-        0 if plan is None else plan.max_blocks,
-        bits,
         inputs.topk,
         stream,
     )
-    yield _compiled(_recover_launch, args, 6, (bits, inputs.topk)), args
+    yield _compiled(_recover_launch, args, 3, (inputs.topk,)), args
     if plan is None or plan.num_tiles == 0:
         return
     members64 = plan.query_tile > 32
+    # BQ > 21 tiles take the larger compact CTA.
+    large = plan.query_tile > 21
+    lds_bytes, dense_limit = lds_layout(plan.max_blocks, members64)
     args = (
-        plan.dense_membership,
+        inputs.block_indices.view(-1),
+        plan.metadata.view(-1),
         plan.blocks.view(-1),
-        plan.membership.view(-1),
+        plan.membership.view(torch.int32).view(-1),
         plan.counts,
         plan.costs.view(-1),
-        plan.metadata.view(-1),
         plan.direct_flag,
         plan.max_blocks,
         plan.block_capacity,
         plan.union_ratio,
+        dense_limit,
+        lds_bytes,
         plan.num_tiles,
         members64,
+        large,
         inputs.topk,
         stream,
     )
-    yield _compiled(_compact_launch, args, 10, (members64, inputs.topk)), args
+    yield _compiled(_compact_launch, args, 12, (members64, large, inputs.topk)), args
     hk = inputs.k.shape[1]
     slices = _cdiv(plan.query_tile * plan.group_padded, 128)
     tasks = plan.num_tiles * hk * slices
@@ -1007,7 +1528,9 @@ def _launches(inputs, plan, stream):
     size = min(THREADS * SORT_WIDTHS[-1], numel)
     shift = max(1, (tasks - 1).bit_length())
     wide = ((plan.block_capacity // 16) << shift) + tasks - 1 >= 2**31
+    standin = plan.counts  # slot-table tensors K3 does not read without a slot table
     args = (
+        inputs.kv_slots if plan.slotted else standin,
         plan.counts,
         plan.costs.view(-1),
         plan.active,
@@ -1017,6 +1540,11 @@ def _launches(inputs, plan, stream):
         plan.membership.view(-1),
         plan.metadata.view(-1),
         plan.score_masks.view(-1),
+        plan.pool_blocks.view(-1) if plan.slotted else standin,
+        plan.tails if plan.slotted else standin,
+        plan.query_tiles,
+        plan.direct_meta.view(-1) if plan.direct_groups else standin,
+        plan.direct_list if plan.direct_groups else standin,
         tasks,
         plan.grid,
         size,
@@ -1025,16 +1553,26 @@ def _launches(inputs, plan, stream):
         plan.query_tile,
         plan.block_capacity,
         plan.num_tiles,
+        plan.direct_groups,
         *plan.route_costs,
         hk,
         slices,
         wide,
         plan.routing,
         plan.route_model,
+        plan.slotted,
         stream,
     )
-    constants = (hk, slices, wide, plan.routing, plan.route_model, members64)
-    yield _compiled(_order_masks_launch, args, 16, constants), args
+    constants = (
+        hk,
+        slices,
+        wide,
+        plan.routing,
+        plan.route_model,
+        members64,
+        plan.slotted,
+    )
+    yield _compiled(_order_masks_launch, args, 22, constants), args
 
 
 def run(*, inputs, plan):
@@ -1044,13 +1582,21 @@ def run(*, inputs, plan):
 
 
 def launchers(*, inputs, plan):
-    """K1-K3 launches with this binding's other arguments prebuilt; K1 takes the indices.
+    """K1-K3 launches with this binding's other arguments prebuilt. K1 takes the indices,
+    K2 and K3 the slot table (read by K3 of a slot-table plan, ignored otherwise).
 
     Valid while the plan's scratch bindings and the current stream stay the same.
     """
     stream = torch.cuda.current_stream(inputs.q.device)
     (recover, args), *rest = _launches(inputs, plan, stream)
     tail = args[1:]
-    return [lambda indices: recover(indices, *tail)] + [
-        partial(compiled, *args) for compiled, args in rest
-    ]
+    result = [lambda indices: recover(indices, *tail)]
+    if rest:
+        (compact, compact_args), (masks, mask_args) = rest
+        mask_tail = mask_args[1:]
+        result.append(lambda slots: compact(*compact_args))
+        if plan.slotted:
+            result.append(lambda slots: masks(slots, *mask_tail))
+        else:
+            result.append(lambda slots: masks(*mask_args))
+    return result

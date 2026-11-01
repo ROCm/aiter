@@ -17,15 +17,25 @@ Groups (Q heads per KV head) follow Qwen3.8-Flash-Next per TP rank (12/6/3 for
 TP2/4/8, where HK = 1 and H = group); HK = 2/16 cases repeat those groups over
 more KV heads. Functional cases cover one row, a short extend and chunked
 prefill against long cached contexts (one whose packed KV exceeds the direct
-kernel's 64 MiB budget), ragged batches with an empty request, HK > 1,
-T = 256/768/1024 selections and constant Q/K whose logits sit near +1e11 on the
-union path (``large_logits``). The graph case captures a union layout on its own
-stream, replays it after rewriting its indices in place, then again after another
-layout grows the stream's scratch arena, which must keep the captured scratch
-allocated. Performance cases are single-request full prefills of 1k-32k tokens
-plus the 12000-token serving prompt (T = 512); they are checked as well and are
-the only cases using the full-prefill BQ21/BQ42 union tiles. ``shared`` selections
-let 32-row windows share block priorities; ``random`` rows choose independently;
+kernel's 64 MiB budget, one packed by the per-row rule, one only raw direct
+reads), nine 1M-token requests whose packed K/V exceed 4 GiB (the last, a
+1024-row chunk, starts at 4 GiB), one request whose K and V each span the
+4 GiB - 1 MiB limit (raw direct and union), ragged batches with an empty request,
+HK > 1 (HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections and
+constant Q/K whose logits sit near +1e11 on the union path (``large_logits``).
+The graph case captures a union layout on its own stream, replays it after
+rewriting its indices in place, then again after another layout grows the
+stream's scratch arena, which must keep the captured scratch allocated. The
+kv_slots cases scatter a layout's K/V into random 64-token pages of a NaN-filled
+token pool (past 4 GiB for the ``pool_4g`` cases) and read it in place through
+the slot table; the result must equal the packed call on the gathered rows bit
+for bit. The span limit cases must be rejected: one request whose K/V spans one
+token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry past it.
+Cases needing more device memory than is free are skipped with a warning.
+Performance cases are single-request full prefills of 1k-32k tokens plus the
+12000-token serving prompt (T = 512); they are checked as well and are the only
+cases using the full-prefill BQ21/BQ42 union tiles. ``shared`` selections let
+32-row windows share block priorities; ``random`` rows choose independently;
 ``correlated`` (performance cases) simulates the real indexer's selection
 distribution, captured Qwen3.8 layers whose neighbouring rows share about half
 of their blocks (see correlated_prefill).
@@ -64,16 +74,43 @@ HEAD_DIM = 256
 SCALE = HEAD_DIM**-0.5
 
 # name -> (query_lens, prefix_lens, kv_heads, selection, blocks per row T)
-# Functional coverage: request layouts, selections, KV heads, T, and the packed
-# direct, raw direct and union paths.
 FUNCTIONAL_CASES = {
+    # Below the union row threshold: direct only (packed, raw, HK2 with an empty request).
     "one_row": ((1,), (0,), 1, "shared", 512),
     "extend_17_ctx_30017": ((17,), (30000,), 1, "random", 512),
-    "chunk_1024_ctx_31024_random": ((1024,), (30000,), 1, "random", 512),
-    "ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 512),
-    "chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 512),
+    "extend_64_ctx_70065": ((64,), (70001,), 1, "random", 512),
     "hk2_ragged": ((7, 0, 9), (0, 5, 3000), 2, "shared", 512),
-    "hk16_chunk_1024_ctx_9216": ((1024,), (8192,), 16, "random", 512),
+    # Union + packed direct; random rows route every tile direct, 4096 rows pack per row.
+    "ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 512),
+    "chunk_1024_ctx_31024_random": ((1024,), (30000,), 1, "random", 512),
+    "chunk_4096_ctx_131072": ((4096,), (126976,), 1, "shared", 512),
+    # Union + gated raw direct over a windowed K2.
+    "chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 512),
+    # Packed K/V over 4 GiB: the 1024-row request starts at 4 GiB (union, 4 K2 windows).
+    "batch_9_ctx_1048576": (
+        (2,) * 8 + (1024,),
+        (2**20 - 2,) * 8 + (2**20 - 1024,),
+        1,
+        "shared",
+        512,
+    ),
+    # One request at the 4 GiB - 1 MiB K/V limit, by raw direct and by union.
+    "extend_64_ctx_8386560": (
+        (64,),
+        ((2**32 - 2**20) // (HEAD_DIM * 2) - 64,),
+        1,
+        "random",
+        512,
+    ),
+    "chunk_768_ctx_8386560": (
+        (768,),
+        ((2**32 - 2**20) // (HEAD_DIM * 2) - 768,),
+        1,
+        "shared",
+        512,
+    ),
+    # HK16 (over 4096 K3 tasks at H192/H96: two order CTAs) and T = 256/768/1024.
+    "hk16_chunk_4096_ctx_12288": ((4096,), (8192,), 16, "random", 512),
     "topk256_chunk_1024_ctx_31024": ((1024,), (30000,), 1, "shared", 256),
     "topk768_ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 768),
     "topk1024_chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 1024),
@@ -93,8 +130,39 @@ CASES = {
     **PERF_CASES,
     **{name: shape for name, (shape, _) in CONSTANT_CASES.items()},
 }
-# name -> (captured union layout, layout whose first call then grows the scratch arena)
-GRAPH_CASES = {"graph_ragged_4": ("ragged_4", "chunk_1024_ctx_132096")}
+# name -> (captured union layout, layout whose first call then grows the scratch arena:
+# its packed KV outgrows the captured layout's)
+GRAPH_CASES = {"graph_ragged_4": ("ragged_4", "chunk_1024_ctx_31024_random")}
+# name -> (layout, pool rows or None for twice the pages needed, first pool page)
+PAGE = 64
+POOL_4G_ROWS = 9_000_000 // PAGE * PAGE
+SLOT_CASES = {
+    "kv_slots_ragged_4": ("ragged_4", None, 1),
+    "kv_slots_hk2_ragged": ("hk2_ragged", None, 1),
+    "kv_slots_extend_64_ctx_70065": ("extend_64_ctx_70065", None, 1),
+    "kv_slots_topk1024_chunk_1024_ctx_132096": (
+        "topk1024_chunk_1024_ctx_132096",
+        None,
+        1,
+    ),
+    "kv_slots_pool_4g_ragged_4": ("ragged_4", POOL_4G_ROWS, 8_000_000 // PAGE),
+    "kv_slots_pool_4g_extend_64_ctx_70065": (
+        "extend_64_ctx_70065",
+        POOL_4G_ROWS,
+        8_000_000 // PAGE,
+    ),
+    "kv_slots_pool_4g_chunk_1024_ctx_132096": (
+        "chunk_1024_ctx_132096",
+        POOL_4G_ROWS,
+        8_000_000 // PAGE,
+    ),
+}
+# name -> (K/V tokens of one request, read through kv_slots): one past the
+# 4 GiB - 1 MiB byte span of the request's K/V, or of the int32 slot table
+SPAN_LIMIT_CASES = {
+    "span_over_limit": ((2**32 - 2**20) // (HEAD_DIM * 2) + 1, False),
+    "kv_slots_span_over_limit": ((2**32 - 2**20) // 4 + 1, True),
+}
 
 # Sharing levels of real Qwen3.8 indexer selections at layers 3 and 47.
 CORRELATED_PROFILES = (
@@ -610,8 +678,10 @@ def test_qsa_sparse_attention(case, heads):
         "kv_heads": kv_heads,
         "topk": topk,
     }
+    # Rotated copies of the 1M-token contexts' K/V would take tens of GiB.
+    rotate = 10 if k.nbytes < 2**30 else 1
     for name, (fn, args, kwargs) in candidates.items():
-        out, us = run_perftest(fn, *args, **kwargs, num_rotate_args=10)
+        out, us = run_perftest(fn, *args, **kwargs, num_rotate_args=rotate)
         err = checkAllclose(
             ref,
             out.to(dtypes.fp32),
@@ -629,14 +699,15 @@ def test_qsa_sparse_attention(case, heads):
 
 
 def released(pointer):
-    """Whether the caching allocator holds device address pointer in a free block."""
+    """Whether device address pointer is outside every active caching-allocator block
+    (a segment returned to HIP no longer appears in the snapshot)."""
     for segment in torch.cuda.memory_snapshot():
         address = segment["address"]
         for block in segment["blocks"]:
             if address <= pointer < address + block["size"]:
                 return block["state"] != "active_allocated"
             address += block["size"]
-    return False
+    return True
 
 
 @benchmark()
@@ -700,6 +771,156 @@ def test_qsa_graph_replay(case, heads):
     }
 
 
+def make_pool(k, v, query_lens, prefix_lens, pool_rows, first_page, generator):
+    """K/V token pools and int32 slots: each request's packed K/V rows scattered to
+    random PAGE-token pages from first_page on; every other pool row is NaN."""
+    lengths = [n + p for n, p in zip(query_lens, prefix_lens)]
+    counts = [-(-n // PAGE) for n in lengths]
+    pool_rows = pool_rows or (2 * sum(counts) + first_page) * PAGE
+    pages = first_page + torch.randperm(
+        pool_rows // PAGE - first_page, generator=generator, device="cuda"
+    )
+    slots, first = [], 0
+    for n, count in zip(lengths, counts):
+        tokens = torch.arange(n)
+        slots.append(
+            pages[first : first + count][tokens // PAGE] * PAGE + tokens % PAGE
+        )
+        first += count
+    slots = torch.cat(slots).to(dtypes.i32)
+    pools = []
+    for packed in (k, v):
+        pool = torch.full(
+            (pool_rows, *packed.shape[1:]), float("nan"), dtype=packed.dtype
+        )
+        pool[slots.long()] = packed
+        pools.append(pool)
+    return *pools, slots
+
+
+@benchmark()
+def test_qsa_kv_slots(case, heads):
+    """K/V read in place from a token pool through kv_slots, against the packed call on
+    the gathered rows (what a caller without kv_slots runs); both match bit for bit."""
+    layout, pool_rows, first_page = SLOT_CASES[case]
+    query_lens, prefix_lens, kv_heads, *_ = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(
+        list(CASES).index(layout) * 16 + heads
+    )
+    q, k, v, indices = make_inputs(layout, heads, generator)
+    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    pool_k, pool_v, slots = make_pool(
+        k, v, query_lens, prefix_lens, pool_rows, first_page, generator
+    )
+    del k, v
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+
+    def gather(q, pool_k, pool_v, indices, slots):
+        rows = slots.long()
+        return qsa_sparse_prefill(q, pool_k[rows], pool_v[rows], indices, **kwargs)
+
+    candidates = {
+        "flydsl_gather": (gather, (q, pool_k, pool_v, indices, slots), {}),
+        "flydsl_kv_slots": (
+            qsa_sparse_prefill,
+            (q, pool_k, pool_v, indices),
+            {**kwargs, "kv_slots": slots},
+        ),
+    }
+    flops = 4 * heads * HEAD_DIM * int((indices >= 0).sum().item())
+    kv_bytes = slots.numel() * pool_k.stride(0) * pool_k.element_size()
+    nbytes = 2 * q.nbytes + 2 * kv_bytes + indices.nbytes + slots.nbytes
+    ret = {
+        "gfx": get_gfx(),
+        "rows": q.shape[0],
+        "kv_tokens": slots.numel(),
+        "kv_heads": kv_heads,
+        "pool GiB": pool_k.nbytes / 2**30,
+    }
+    outputs = {}
+    for name, (fn, args, kw) in candidates.items():
+        out, us = run_perftest(
+            fn, *args, **kw, num_rotate_args=10 if pool_k.nbytes < 2**30 else 1
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = checkAllclose(
+            ref,
+            out.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{case} H{heads} {name}: out",
+        )
+        outputs[name] = out
+    assert ret["flydsl_kv_slots err"] == 0, f"{case} H{heads}: kv_slots mismatch"
+    bitwise = checkAllclose(
+        outputs["flydsl_gather"],
+        outputs["flydsl_kv_slots"],
+        rtol=0,
+        atol=0,
+        msg=f"{case} H{heads} flydsl_kv_slots vs flydsl_gather: out",
+    )
+    assert bitwise == 0, f"{case} H{heads}: kv_slots differs from the gathered call"
+    return ret
+
+
+@benchmark()
+def test_qsa_span_limit(case, heads):
+    """A request whose K/V or slot table spans more than 4 GiB - 1 MiB is rejected
+    before any launch."""
+    tokens, slotted = SPAN_LIMIT_CASES[case]
+    q = torch.zeros(1, heads, HEAD_DIM, dtype=dtypes.bf16)
+    kv = torch.empty(PAGE if slotted else tokens, 1, HEAD_DIM, dtype=dtypes.bf16)
+    slots = torch.zeros(tokens, dtype=dtypes.i32) if slotted else None
+    span = (kv if slots is None else slots).nbytes
+    # A valid selection (blocks 0-511, then the causal tail), so that a missing check
+    # fails the assertion rather than faulting in a kernel.
+    indices = torch.full((1, 4 * 512 + 3), -1, dtype=dtypes.i32)
+    indices[0, : 4 * 512] = torch.arange(4 * 512)
+    indices[0, 4 * 512 : 4 * 512 + tokens % 4] = torch.arange(tokens // 4 * 4, tokens)
+    try:
+        qsa_sparse_prefill(
+            q,
+            kv,
+            kv,
+            indices,
+            query_lens=(1,),
+            prefix_lens=(tokens - 1,),
+            kv_slots=slots,
+        )
+        rejected = False
+    except ValueError as error:
+        message = str(error)
+        rejected = "byte span" in message and ("kv_slots" in message) == slotted
+    assert rejected, f"{case} H{heads}: a {span}-byte span was accepted"
+    return {
+        "gfx": get_gfx(),
+        "kv_tokens": tokens,
+        "kv_slots": slotted,
+        "span bytes": span,
+        "limit bytes": 2**32 - 2**20,
+        "rejected": rejected,
+    }
+
+
+def kv_bytes(case):
+    """K/V bytes a case allocates, pools included (graph cases stay small)."""
+    if case in SPAN_LIMIT_CASES:
+        tokens, slotted = SPAN_LIMIT_CASES[case]
+        return tokens * (4 if slotted else HEAD_DIM * 2)
+    layout, pool_rows, _ = SLOT_CASES.get(case, (case, None, None))
+    if layout not in CASES:
+        return 0
+    query_lens, prefix_lens, hk = CASES[layout][:3]
+    rows = max(pool_rows or 0, sum(query_lens) + sum(prefix_lens))
+    return 2 * rows * hk * HEAD_DIM * 2
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -716,9 +937,10 @@ def main():
         "--case",
         type=str,
         nargs="*",
-        choices=[*CASES, *GRAPH_CASES],
-        default=[*CASES, *GRAPH_CASES],
-        help="input layouts to run (functional, graph and performance cases)",
+        choices=[*CASES, *GRAPH_CASES, *SLOT_CASES, *SPAN_LIMIT_CASES],
+        default=[*CASES, *GRAPH_CASES, *SLOT_CASES, *SPAN_LIMIT_CASES],
+        help="input layouts to run (functional, graph, kv_slots, span limit and "
+        "performance cases)",
     )
     parser.add_argument(
         "-g",
@@ -730,18 +952,33 @@ def main():
     )
     args = parser.parse_args()
 
+    layouts = {**GRAPH_CASES, **SLOT_CASES}
     for suite, cases, test in (
         ("functional", [*FUNCTIONAL_CASES, *CONSTANT_CASES], test_qsa_sparse_attention),
         ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
+        ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
+        ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
         ("performance", list(PERF_CASES), test_qsa_sparse_attention),
     ):
+        df = []
         selected = [case for case in args.case if case in cases]
-        if not selected:
+        for case, group in itertools.product(selected, args.group):
+            # Rough peak: twice the K/V bytes (pools, gathered copies) plus 4 GiB of
+            # reference temporaries.
+            needed = 2 * kv_bytes(case) + 2**32
+            torch.cuda.empty_cache()
+            if needed > torch.cuda.mem_get_info()[0]:
+                aiter.logger.warning(
+                    "%s needs about %.0f GiB of free device memory; skipping",
+                    case,
+                    needed / 2**30,
+                )
+                continue
+            layout = layouts.get(case, (case,))[0]
+            hk = CASES[layout][2] if layout in CASES else 1
+            df.append(test(case, group * hk))
+        if not df:
             continue
-        df = [
-            test(case, group * CASES[GRAPH_CASES.get(case, (case,))[0]][2])
-            for case, group in itertools.product(selected, args.group)
-        ]
         aiter.logger.info(
             "qsa_sparse_prefill %s summary (markdown):\n%s",
             suite,

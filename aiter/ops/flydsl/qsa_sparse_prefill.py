@@ -6,7 +6,8 @@ Public entry for the ``sparse_prefill_*`` kernels in ``kernels/qsa/``. Each call
 recovers the selected four-token blocks (FlyDSL K1-K3), routes every query tile to
 the union kernel (queries of a tile share one compact block list with exact
 per-query membership) or to the direct kernel (one query per wave over its own
-blocks), and writes O in place. Plans and scratch are private.
+blocks), and writes O in place. Plans and scratch are private. K/V may also be a
+token pool read in place through a slot table.
 """
 
 import math
@@ -50,27 +51,20 @@ def _aligned(nbytes):
 class _Arena:
     """Scratch shared by one stream's workspaces: every call rewrites what it reads.
 
-    buffers[1] holds dense membership; each completed build clears what it set.
-    Growth replaces the buffers; captured workspaces keep theirs alive.
+    Growth replaces the buffer; captured workspaces keep theirs alive.
     """
 
     def __init__(self):
-        self.buffers = [None, None]
+        self.buffers = [None]
         self.generation = 0
         self.users = weakref.WeakSet()
 
-    def reserve(self, sizes, device):
-        grown = False
-        for zeroed, size in enumerate(sizes):
-            buffer = self.buffers[zeroed]
-            if buffer is None or buffer.numel() < size:
-                growth = 0 if buffer is None else buffer.numel() * ARENA_GROWTH_PERCENT
-                size = max(size, growth // 100)
-                self.buffers[zeroed] = (torch.zeros if zeroed else torch.empty)(
-                    size, dtype=torch.uint8, device=device
-                )
-                grown = True
-        if grown:
+    def reserve(self, size, device):
+        buffer = self.buffers[0]
+        if buffer is None or buffer.numel() < size:
+            growth = 0 if buffer is None else buffer.numel() * ARENA_GROWTH_PERCENT
+            size = max(size, growth // 100)
+            self.buffers[0] = torch.empty(size, dtype=torch.uint8, device=device)
             self.generation += 1
             for user in list(self.users):
                 user.release()
@@ -81,12 +75,15 @@ _arenas = weakref.WeakValueDictionary()
 
 
 class _Workspace:
-    def __init__(self, q, k, v, indices, query_lens, prefix_lens, scale):
+    def __init__(self, q, k, v, indices, query_lens, prefix_lens, scale, kv_slots=None):
         topk = (indices.shape[1] - 3) // 4
         q_lens = np.asarray(query_lens, dtype=np.int64)
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
         sequence = np.repeat(np.arange(len(q_lens)), q_lens)
         positions = np.arange(len(sequence)) + (lengths - np.cumsum(q_lens))[sequence]
+        slotted = kv_slots is not None
+        # Past this pool span raw direct byte offsets no longer reach every row.
+        wide = slotted and k.numel() * k.element_size() > _MAX_SPAN
         self.metadata = {
             "query_lens": query_lens,
             "prefix_lens": prefix_lens,
@@ -94,24 +91,33 @@ class _Workspace:
             "topk": topk,
             "query_positions": prepare.upload(positions, q.device),
             "max_seqlen_k": int(lengths.max(initial=0)),
+            "wide": wide,
         }
         self.captured = False
         self.block_indices = None
         inputs = SimpleNamespace(
-            q=q, k=k, v=v, indices=indices, block_indices=None, **self.metadata
+            q=q,
+            k=k,
+            v=v,
+            indices=indices,
+            block_indices=None,
+            kv_slots=kv_slots,
+            **self.metadata,
         )
         self.union = None
         if q.shape[0] >= _union_min_rows(q.shape[1] // k.shape[1]):
-            plan = prepare.allocate_plan(inputs=inputs, query_tile=32, scratch=False)
-            # Dense membership grows with tiles x KV blocks.
+            plan = prepare.allocate_plan(
+                inputs=inputs, query_tile=32, scratch=False, slotted=slotted
+            )
+            # Union scratch grows with tiles x their block capacity.
             needed = sum(
                 _aligned(math.prod(shape) * dtype.itemsize)
-                for _, shape, dtype, _ in prepare.scratch_specs(plan)
+                for _, shape, dtype in prepare.scratch_specs(plan)
             )
             if needed <= UNION_SCRATCH_LIMIT:
                 self.union = plan
         self.direct = direct.prepare(inputs=inputs, union=self.union, scratch=False)
-        self.specs = [(self, "block_indices", (q.shape[0], topk), torch.int32, False)]
+        self.specs = [(self, "block_indices", (q.shape[0], topk), torch.int32)]
         if self.union is not None:
             self.specs += [
                 (self.union, *spec) for spec in prepare.scratch_specs(self.union)
@@ -119,16 +125,17 @@ class _Workspace:
         self.specs += [
             (self.direct, *spec) for spec in direct.scratch_specs(self.direct)
         ]
-        sizes = [0, 0]
-        for *_, shape, dtype, zeroed in self.specs:
-            sizes[zeroed] += _aligned(math.prod(shape) * dtype.itemsize)
+        size = sum(
+            _aligned(math.prod(shape) * dtype.itemsize)
+            for *_, shape, dtype in self.specs
+        )
         self.arena = _arenas.setdefault(
             (q.device, torch.cuda.current_stream(q.device).cuda_stream), _Arena()
         )
         self.generation = None
         self.pinned = None
         self.hot = None
-        self.arena.reserve(sizes, q.device)
+        self.arena.reserve(size, q.device)
 
     def release(self):
         if self.pinned is None:
@@ -141,14 +148,12 @@ class _Workspace:
     def attach(self):
         """Point the plans at this stream's scratch (again after arena growth); pin it for capture."""
         if self.pinned is None and self.generation != self.arena.generation:
-            offsets = [0, 0]
-            for owner, name, shape, dtype, zeroed in self.specs:
+            offset = 0
+            for owner, name, shape, dtype in self.specs:
                 nbytes = math.prod(shape) * dtype.itemsize
-                view = self.arena.buffers[zeroed][
-                    offsets[zeroed] : offsets[zeroed] + nbytes
-                ]
+                view = self.arena.buffers[0][offset : offset + nbytes]
                 setattr(owner, name, view.view(dtype).view(shape))
-                offsets[zeroed] += _aligned(nbytes)
+                offset += _aligned(nbytes)
             self.generation = self.arena.generation
             self.arena.users.add(self)
             self.hot = None
@@ -157,7 +162,7 @@ class _Workspace:
             # Graph pointers must outlive arena growth.
             self.pinned = tuple(self.arena.buffers)
 
-    def bind(self, q, k, v, indices):
+    def bind(self, q, k, v, indices, kv_slots=None):
         self.attach()
         return SimpleNamespace(
             q=q,
@@ -165,6 +170,7 @@ class _Workspace:
             v=v,
             indices=indices,
             block_indices=self.block_indices,
+            kv_slots=kv_slots,
             **self.metadata,
         )
 
@@ -174,8 +180,8 @@ class _Hot:
     Building it performs the current call through the normal paths.
     """
 
-    def __init__(self, workspace, q, k, v, indices, out):
-        inputs = workspace.bind(q, k, v, indices)
+    def __init__(self, workspace, q, k, v, indices, out, kv_slots=None):
+        inputs = workspace.bind(q, k, v, indices, kv_slots)
         prepare.run(inputs=inputs, plan=workspace.union)
         self.prepare = prepare.launchers(inputs=inputs, plan=workspace.union)
         self.compute = []
@@ -190,15 +196,15 @@ class _Hot:
         )
         self.compute = [launch for launch in self.compute if launch is not None]
 
-    def prepare_call(self, indices):
+    def prepare_call(self, indices, kv_slots):
         recover, *rest = self.prepare
         recover(indices)
         for launch in rest:
-            launch()
+            launch(kv_slots)
 
-    def compute_call(self, q, k, v, out):
+    def compute_call(self, q, k, v, out, kv_slots):
         # K/V stay 3-D: FlyDSL passes int32 dims and K/V may exceed 2**31 elements.
-        views = (q.view(-1), k, v, out.view(-1))
+        views = (q.view(-1), k, v, out.view(-1), kv_slots)
         for launch in self.compute:
             launch(*views)
 
@@ -209,7 +215,16 @@ _device = None
 
 
 def flydsl_qsa_sparse_prefill(
-    q, k, v, indices, *, query_lens=None, prefix_lens=None, softmax_scale=None, out=None
+    q,
+    k,
+    v,
+    indices,
+    *,
+    query_lens=None,
+    prefix_lens=None,
+    softmax_scale=None,
+    out=None,
+    kv_slots=None,
 ):
     """Return QSA sparse attention for BF16 Q[M,H,256] and K/V[N,HK,256].
 
@@ -225,14 +240,20 @@ def flydsl_qsa_sparse_prefill(
     calls on the same stream.
 
     Host query_lens/prefix_lens describe packed requests. For one request they
-    default to (M,) and (N-M,). Plans are built and cached per layout. Hot calls
-    rebuild the selection: per-layout plans share one private per-stream scratch
-    arena. out is optional and must not alias Q/K/V. Warm the same stream and
-    layout before graph capture. Captured workspaces stay pinned for graph pointer
-    lifetime and share their stream's scratch: do not replay them concurrently
-    with each other or with that stream's calls.
-    Each kernel variant compiles on its first use: a few seconds with empty FlyDSL
-    caches. One GPU per process (TP uses separate workers).
+    default to (M,) and (N-M,). Plans are built and cached per layout. With kv_slots
+    (contiguous int32[N] of at most 2**32 - 2**20 bytes, packed token -> pool row),
+    K/V are a token pool [P,HK,256] read in place: each request's four-token blocks,
+    the final partial one included, must occupy four consecutive pool rows starting
+    at a multiple of four (paged pools whose pages are a multiple of four tokens
+    satisfy this), and the result is the same as for K/V packed by those slots. A
+    pool may exceed 4 GiB (raw direct then uses 64-bit loads); slot values are not
+    validated. Hot calls rebuild the selection: per-layout plans share one private
+    per-stream scratch arena. out is optional and must not overlap Q/K/V, indices or
+    kv_slots. Warm the same stream and layout before graph capture. Captured
+    workspaces stay pinned for graph pointer lifetime and share their stream's
+    scratch: do not replay them concurrently with each other or with that stream's
+    calls. Each kernel variant compiles on its first use: a few seconds with empty
+    FlyDSL caches. One GPU per process (TP uses separate workers).
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -244,10 +265,23 @@ def flydsl_qsa_sparse_prefill(
     scaled = scale * math.log2(math.e)
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
         raise ValueError("softmax_scale * log2(e) must be finite and positive in FP32")
+    if kv_slots is not None and (
+        not isinstance(kv_slots, torch.Tensor)
+        or kv_slots.dtype != torch.int32
+        or kv_slots.ndim != 1
+        or kv_slots.device != q.device
+        or not kv_slots.is_contiguous()
+    ):
+        raise ValueError("kv_slots must be a contiguous device int32 [N] tensor")
+    # The kernels read the slot table at unsigned 32-bit buffer offsets and upload
+    # each request's start in it as int32.
+    if kv_slots is not None and kv_slots.numel() * kv_slots.element_size() > _MAX_SPAN:
+        raise ValueError("kv_slots requires a byte span <= 2**32 - 2**20")
+    keys = k.shape[0] if kv_slots is None else kv_slots.shape[0]
     query_lens = (q.shape[0],) if query_lens is None else tuple(query_lens)
     if prefix_lens is None:
         if len(query_lens) == 1:
-            prefix_lens = (k.shape[0] - q.shape[0],)
+            prefix_lens = (keys - q.shape[0],)
         else:
             prefix_lens = (0,) * len(query_lens)
     else:
@@ -259,7 +293,7 @@ def flydsl_qsa_sparse_prefill(
             for n in (*query_lens, *prefix_lens)
         )
         or sum(query_lens) != q.shape[0]
-        or sum(query_lens) + sum(prefix_lens) != k.shape[0]
+        or sum(query_lens) + sum(prefix_lens) != keys
     ):
         raise ValueError("Host query/prefix lengths must describe the packed Q/K/V")
     if q.device.type != "cuda" or torch.version.hip is None:
@@ -287,9 +321,11 @@ def flydsl_qsa_sparse_prefill(
     if q.shape[1] // k.shape[1] > 16:
         raise ValueError("At most 16 Q heads per KV head fit the direct fallback wave")
     # K/V are addressed per request, so only each request's K (or V) span is bounded,
-    # not the packed total: about 8M context tokens at HK1, 4M at HK2.
+    # not the packed total: about 8M context tokens at HK1, 4M at HK2. A slot-table
+    # pool is addressed from its base instead.
     tokens = max(map(sum, zip(query_lens, prefix_lens)), default=0)
-    if max(q.numel(), tokens * k.stride(0)) * q.element_size() > _MAX_SPAN:
+    span = q.numel() if kv_slots is not None else max(q.numel(), tokens * k.stride(0))
+    if span * q.element_size() > _MAX_SPAN:
         raise ValueError("Q and each request's K/V require byte spans <= 2**32 - 2**20")
     if get_gfx_runtime() != "gfx942":
         raise ValueError("QSA sparse attention requires gfx942")
@@ -318,12 +354,13 @@ def flydsl_qsa_sparse_prefill(
     ):
         raise ValueError("out must be aligned, contiguous and match Q")
     begin, end = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
-    for source in (q, k, v, indices):
+    sources = (q, k, v, indices) + (() if kv_slots is None else (kv_slots,))
+    for source in sources:
         if (
             begin < source.data_ptr() + source.numel() * source.element_size()
             and source.data_ptr() < end
         ):
-            raise ValueError("out must not overlap Q/K/V or indices")
+            raise ValueError("out must not overlap Q/K/V, indices or kv_slots")
     if q.shape[0] == 0:
         return out
     with _lock, torch.cuda.device(q.device):
@@ -340,6 +377,8 @@ def flydsl_qsa_sparse_prefill(
             k.shape[1],
             scale,
             topk,
+            # Pool rows: they set the raw direct extent and the WIDE path.
+            None if kv_slots is None else k.shape[0],
         )
         workspace = _workspaces.get(key)
         if workspace is None:
@@ -347,7 +386,9 @@ def flydsl_qsa_sparse_prefill(
                 raise RuntimeError(
                     "Warm attention on this stream and layout before graph capture"
                 )
-            workspace = _Workspace(q, k, v, indices, query_lens, prefix_lens, scale)
+            workspace = _Workspace(
+                q, k, v, indices, query_lens, prefix_lens, scale, kv_slots
+            )
             _workspaces[key] = workspace
             for stale in list(_workspaces):
                 if len(_workspaces) <= WORKSPACE_CACHE:
@@ -359,8 +400,8 @@ def flydsl_qsa_sparse_prefill(
         workspace.attach()
         hot = workspace.hot
         if hot is not None:
-            hot.prepare_call(indices)
-            hot.compute_call(q, k, v, out)
+            hot.prepare_call(indices, kv_slots)
+            hot.compute_call(q, k, v, out, kv_slots)
         else:
-            workspace.hot = _Hot(workspace, q, k, v, indices, out)
+            workspace.hot = _Hot(workspace, q, k, v, indices, out, kv_slots)
     return out

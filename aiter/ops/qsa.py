@@ -204,8 +204,10 @@ def qsa_sparse_prefill(
     prefix_lens: Sequence[int] | None = None,
     softmax_scale: float | None = None,
     out: torch.Tensor | None = None,
+    kv_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sparse prefill/extend attention over packed K/V; FlyDSL on gfx942 only.
+    """Sparse prefill/extend attention over packed K/V, or a token pool read through
+    kv_slots; FlyDSL on gfx942 only.
 
     See ``aiter.ops.flydsl.qsa_sparse_prefill.flydsl_qsa_sparse_prefill``.
     """
@@ -220,6 +222,7 @@ def qsa_sparse_prefill(
         prefix_lens=prefix_lens,
         softmax_scale=softmax_scale,
         out=out,
+        kv_slots=kv_slots,
     )
 
 

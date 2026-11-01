@@ -16,6 +16,7 @@ from flydsl.expr import rocdl
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
+    _buffer_at,
     _buffer_words,
     _copy_coordinates,
     _cross,
@@ -63,19 +64,17 @@ def _read_ids_g2r(blocks, tile, count, offset):
     return _buffer_words(_buffer(view, (count - tile * 16) * 4), offset, 1)[0]
 
 
-def _kv_rows(ids, wave, hk):
-    """SOFFSET rows of the wave's four blocks for the K/V DMA: lanes 0..3 hold their ids."""
-    return fx.Vector.from_elements(
-        [
-            fx.Int32(
-                fx.Uint32(rocdl.readlane(fx.Int32.ir_type, ids, slot))
-                * (4 * hk * D * 2)
-                + (wave >> 2) * 256
-            )
-            for slot in range(4)
-        ],
-        fx.Int32,
-    )
+def _kv_rows(ids, wave, hk, slotted):
+    """SOFFSET rows of the wave's four blocks for the K/V DMA: lanes 0..3 hold their ids.
+
+    With a slot table the ids are pool blocks, kept as is for per-block descriptors."""
+    rows = []
+    for slot in range(4):
+        block = fx.Uint32(rocdl.readlane(fx.Int32.ir_type, ids, slot))
+        if not slotted:
+            block = block * (4 * hk * D * 2) + (wave >> 2) * 256
+        rows.append(fx.Int32(block))
+    return fx.Vector.from_elements(rows, fx.Int32)
 
 
 def _read_packet_g2s(
@@ -100,6 +99,10 @@ def _read_packet_g2s(
     # Token k of a block reads SOFFSET min(row, limits[k]) + k rows: a partial final block re-reads
     # the request's last token, whose K is masked and V weighted 0; with fewer than k + 1 tokens
     # the limit is 0 and the range-checked VOFFSET + offset returns 0, so reads stay in the request.
+    # Slot-table launches pass limits None, a resource (block 0 address, final partial block, its
+    # records, records of a full block) and rows that are pool blocks: each block gets its own
+    # descriptor (64-bit base), whose records end at the request's last token.
+    slotted = limits is None
     token, _ = _copy_coordinates(wave, packet, 4)
     voffset = lane * 4 if is_v else (lane ^ (_k_phase(token) * 4)) * 4
     step = (packet & 3) * hk * D * 2
@@ -116,7 +119,17 @@ def _read_packet_g2s(
     base_row, base_channel = _copy_coordinates(wave, 0, 4)
     base_destination = fx.Int32(base_row * 512 + base_channel * 2)
     immediate = destination_offset - offset
-    row, limit = fx.Uint32(rows[packet // 4]), limits[packet & 3]
+    if slotted:
+        base, final, partial, full = resource
+        block = rows[packet // 4]
+        records = (block == final).select(partial, full)
+        resource = rocdl.get_buffer_rsrc(
+            _buffer_at(base + fx.Int64(fx.Uint32(block)) * (4 * hk * D * 2), records)
+        )
+        soffset = fx.Uint32(0)
+    else:
+        row, limit = fx.Uint32(rows[packet // 4]), limits[packet & 3]
+        soffset = _min(row, limit)
     data = None if read is None else _load_lds(*read)
     # Raw LDS DMA: BufferCopyLDS adds its own vmcnt wait; the pipeline waits itself.
     rocdl.raw_ptr_buffer_load_lds(
@@ -124,7 +137,7 @@ def _read_packet_g2s(
         fx.to_llvm_ptr(fx.get_iter(storage) + (base_destination + immediate)),
         4,
         fx.Int32(voffset),
-        _min(row, limit),
+        soffset,
         offset,
     )
     return data
@@ -212,6 +225,7 @@ def _body(
     BLOCKS,
     MEMBERS,
     COUNTS,
+    TAILS,
     k_lds,
     v_lds,
     work,
@@ -223,6 +237,7 @@ def _body(
     GP: fx.Constexpr[int],
     SCALE: fx.Constexpr[float],
     STAGGER: fx.Constexpr[bool],
+    SLOTTED: fx.Constexpr[bool],
 ):
     """One task: 128 (query, head) rows of a union tile over its compact key list.
 
@@ -262,30 +277,44 @@ def _body(
     qoffset = valid_row.select(fx.Uint32((query * H * D + head * D) * 2), qextent)
     # Q stays in registers for all key tiles.
     q = _read_q_g2r(gq, qoffset, lane)
-    extent = (fx.Uint32(kv_len) * HK - hkv) * D * 2
-    limit = fx.Uint32(kv_len - 1) * (HK * D * 2) + (wave >> 2) * 256
-    limits = tuple(
-        (limit > k * HK * D * 2).select(limit - k * HK * D * 2, fx.Uint32(0))
-        for k in range(4)
-    )
-    gk = rocdl.get_buffer_rsrc(
-        _buffer(
-            fx.make_view(
-                fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * D,
-                fx.make_layout(extent // 2, 1),
-            ),
-            extent,
+    if fx.const_expr(SLOTTED):
+        # BLOCKS holds K3's pool blocks: each gets a descriptor from the pool's base (no 4 GiB
+        # limit); TAILS holds the final partial block's first pool row (-1: none).
+        row_bytes, half = HK * D * 2, (wave >> 2) * 256
+        tail = _uniform(TAILS[tile_id])
+        final = (tail >= 0).select(tail >> 2, fx.Int32(-1))
+        partial = (kv_len & 3) * row_bytes - half
+        full = fx.Int32(4 * row_bytes) - half
+        offset = fx.Int64(hkv * D * 2 + half)
+        gk = (fx.Int64(fx.ptrtoint(fx.get_iter(K))) + offset, final, partial, full)
+        gv = (fx.Int64(fx.ptrtoint(fx.get_iter(V))) + offset, final, partial, full)
+        extent = fx.Uint32(4 * row_bytes)
+        limits = None
+    else:
+        extent = (fx.Uint32(kv_len) * HK - hkv) * D * 2
+        limit = fx.Uint32(kv_len - 1) * (HK * D * 2) + (wave >> 2) * 256
+        limits = tuple(
+            (limit > k * HK * D * 2).select(limit - k * HK * D * 2, fx.Uint32(0))
+            for k in range(4)
         )
-    )
-    gv = rocdl.get_buffer_rsrc(
-        _buffer(
-            fx.make_view(
-                fx.get_iter(V) + (fx.Int64(k0) * HK + hkv) * D,
-                fx.make_layout(extent // 2, 1),
-            ),
-            extent,
+        gk = rocdl.get_buffer_rsrc(
+            _buffer(
+                fx.make_view(
+                    fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * D,
+                    fx.make_layout(extent // 2, 1),
+                ),
+                extent,
+            )
         )
-    )
+        gv = rocdl.get_buffer_rsrc(
+            _buffer(
+                fx.make_view(
+                    fx.get_iter(V) + (fx.Int64(k0) * HK + hkv) * D,
+                    fx.make_layout(extent // 2, 1),
+                ),
+                extent,
+            )
+        )
     scale = fx.Float32(SCALE * math.log2(math.e))
     compact_len = count * 4
     key_tiles = (compact_len + BN - 1) // BN
@@ -307,7 +336,7 @@ def _body(
         return _read_mask_g2r(mask_resource, tile, mask_offset, BQ)
 
     def kv_rows(ids):
-        return _kv_rows(ids, wave, HK)
+        return _kv_rows(ids, wave, HK, SLOTTED)
 
     def k_s2r(half, lower_first=False):
         """Read plan of K keys 32 * half .. 32 * half + 31."""
@@ -562,6 +591,7 @@ def _kernel(
     BLOCKS: fx.Tensor,
     MEMBERS: fx.Tensor,
     COUNTS: fx.Tensor,
+    TAILS: fx.Tensor,
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
     H: fx.Constexpr[int],
@@ -573,6 +603,7 @@ def _kernel(
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SCALE: fx.Constexpr[float],
+    SLOTTED: fx.Constexpr[bool],
 ):
     body = _body
     allocator = fx.SharedAllocator()
@@ -601,6 +632,7 @@ def _kernel(
                     BLOCKS,
                     MEMBERS,
                     COUNTS,
+                    TAILS,
                     k_lds,
                     v_lds,
                     mapped,
@@ -612,6 +644,7 @@ def _kernel(
                     GP,
                     SCALE,
                     True,
+                    SLOTTED,
                 )
             else:
                 body(
@@ -623,6 +656,7 @@ def _kernel(
                     BLOCKS,
                     MEMBERS,
                     COUNTS,
+                    TAILS,
                     k_lds,
                     v_lds,
                     mapped,
@@ -634,6 +668,7 @@ def _kernel(
                     GP,
                     SCALE,
                     False,
+                    SLOTTED,
                 )
         work = work + GRID
 
@@ -648,6 +683,7 @@ def _launch(
     BLOCKS: fx.Tensor,
     MEMBERS: fx.Tensor,
     COUNTS: fx.Tensor,
+    TAILS: fx.Tensor,
     ACTIVE: fx.Tensor,
     ORDER: fx.Tensor,
     H: fx.Constexpr[int],
@@ -659,6 +695,7 @@ def _launch(
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SCALE: fx.Constexpr[float],
+    SLOTTED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if GRID > 0:
@@ -671,6 +708,7 @@ def _launch(
             BLOCKS,
             MEMBERS,
             COUNTS,
+            TAILS,
             ACTIVE,
             ORDER,
             H,
@@ -682,6 +720,7 @@ def _launch(
             TASKS,
             GRID,
             SCALE,
+            SLOTTED,
             value_attrs={
                 "rocdl.waves_per_eu": 2,
                 "llvm.target_features": _target_features(),
@@ -693,15 +732,17 @@ _COMPILED = {}
 
 
 def _args(inputs, plan, out, stream):
+    # Slot-table plans read K/V through K3's pool block table, addressed from the pool's base.
     return (
         inputs.q.view(-1),
         inputs.k,
         inputs.v,
         out.view(-1),
         plan.metadata.view(-1),
-        plan.blocks.view(-1),
+        (plan.pool_blocks if plan.slotted else plan.blocks).view(-1),
         plan.score_masks.view(-1),
         plan.counts.view(-1),
+        plan.tails if plan.slotted else plan.counts,
         plan.active,
         plan.task_order,
         inputs.q.shape[1],
@@ -715,19 +756,20 @@ def _args(inputs, plan, out, stream):
         * ((plan.query_tile * plan.group_padded + 127) // 128),
         plan.grid,
         inputs.scale,
+        plan.slotted,
         stream,
     )
 
 
 def _compiled(inputs, args, stream):
-    key = (inputs.q.device, args[10], args[11], args[14], args[15], args[18])
+    key = (inputs.q.device, args[11], args[12], args[15], args[16], args[19], args[20])
     compiled = _COMPILED.get(key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
             compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:17], 0, args[18], stream
+                _launch, *args[:18], 0, *args[19:21], stream
             )
     return compiled
 
@@ -742,7 +784,8 @@ def run(*, inputs, plan, out):
 
 
 def launcher(*, inputs, plan, out):
-    """launch(q, k, v, out) with flat Q/out and unflattened K/V; other arguments prebuilt.
+    """launch(q, k, v, out, slots) with flat Q/out and unflattened K/V; other arguments
+    prebuilt. Union reads pool rows through K3's table, so the slot table is unused here.
 
     Valid while the plan's scratch bindings and the current stream stay the same.
     """
@@ -752,4 +795,4 @@ def launcher(*, inputs, plan, out):
     args = _args(inputs, plan, out, stream)
     compiled = _compiled(inputs, args, stream)
     tail = args[4:]
-    return lambda q, k, v, o: compiled(q, k, v, o, *tail)
+    return lambda q, k, v, o, slots: compiled(q, k, v, o, *tail)

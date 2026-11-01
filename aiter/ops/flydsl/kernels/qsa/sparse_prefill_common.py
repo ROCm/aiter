@@ -36,6 +36,7 @@ WORKSPACE_CACHE = 8  # layouts kept per process; captured workspaces are never e
 ARENA_GROWTH_PERCENT = 125  # a growing arena takes at least this share of its size
 SCRATCH_ALIGN = 256  # bytes between the scratch views of an arena
 UNION_SCRATCH_LIMIT = 4 << 30  # union scratch bytes; past it a layout runs direct only
+MAX_ROW_PACKED_KV_BYTES = 1 << 30  # PK+PV bytes of the pack_tokens_per_row rule
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,6 +55,9 @@ class Platform:
     union_min_rows_per_head: int
     wide_tiles_per_cu: float  # full H6/H3 prefill: BQ21/BQ42 from this many tiles/CU
     max_packed_kv_bytes: int  # direct packs KV while PK+PV fits, else reads the raw KV
+    # Past that budget, direct still packs a context of at most this many tokens per query row
+    # (packing copies the whole context each call).
+    pack_tokens_per_row: int
 
 
 PLATFORMS = {
@@ -71,6 +75,7 @@ PLATFORMS = {
         union_min_rows_per_head=64,
         wide_tiles_per_cu=1.0,
         max_packed_kv_bytes=64 * 1024 * 1024,
+        pack_tokens_per_row=32,
     ),
 }
 OVERRIDE = "AITER_QSA_PLATFORM"
@@ -264,6 +269,16 @@ def _buffer(tensor, size_bytes):
     )
 
 
+def _buffer_at(address, size_bytes):
+    """Byte-addressed buffer pointer at a 16-byte aligned 64-bit global address; loads at or
+    past size_bytes return zero."""
+    pointer = fx.inttoptr(
+        fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Global, 16),
+        fx.Int64(address),
+    )
+    return rocdl.make_buffer_ptr(pointer, num_records_bytes=size_bytes)
+
+
 def _buffer_words(buffer, offset, words=4):
     data = fx.make_rmem_tensor(4 * words, fx.Int8)
     fx.copy(
@@ -275,12 +290,13 @@ def _buffer_words(buffer, offset, words=4):
 
 
 def _buffer_store_words(words, buffer, offset):
-    data = fx.make_rmem_tensor(16, fx.Int8)
-    data.store(fx.Vector(words).bitcast(fx.Int8))
+    words = fx.Vector(words)
+    data = fx.make_rmem_tensor(4 * words.numel, fx.Int8)
+    data.store(words.bitcast(fx.Int8))
     fx.copy(
-        fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int8),
+        fx.make_copy_atom(rocdl.BufferCopy(32 * words.numel), fx.Int8),
         data,
-        fx.make_view(buffer + offset, fx.make_layout(16, 1)),
+        fx.make_view(buffer + offset, fx.make_layout(4 * words.numel, 1)),
     )
 
 
@@ -299,6 +315,22 @@ def _write_address(address, words):
     data = fx.make_rmem_tensor(4, fx.Int32)
     data.store(fx.Vector(words).bitcast(fx.Int32))
     fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), data, fx.Tensor(lds))
+
+
+def _lds_pointer(address, dtype):
+    ptr_type = fx.PointerType.get(
+        dtype.ir_type, fx.AddressSpace.Shared, dtype.width // 8
+    )
+    return fx.inttoptr(ptr_type, fx.Int32(address))
+
+
+def _lds_load(address, dtype=fx.Int32):
+    """One value at an LDS byte address."""
+    return fx.generic_load(_lds_pointer(address, dtype))
+
+
+def _lds_store(address, value, dtype=fx.Int32):
+    fx.generic_store(_lds_pointer(address, dtype), dtype(value))
 
 
 @flyc.jit
