@@ -276,6 +276,7 @@ def get_flydsl_a16w16_configs(
     has_bias: bool,
     *,
     use_large_gemm_fast_path: bool = True,
+    apply_policy_pruning: bool = True,
 ):
     """Generate and validate the shape-aware policy catalog used by tuning."""
 
@@ -487,7 +488,13 @@ def get_flydsl_a16w16_configs(
                 "use_half_tile_interleaved": False,
             }
         )
-    is_large_gemm = use_large_gemm_fast_path and m >= 4096 and n >= 4096 and k >= 4096
+    is_large_gemm = (
+        apply_policy_pruning
+        and use_large_gemm_fast_path
+        and m >= 4096
+        and n >= 4096
+        and k >= 4096
+    )
     if is_large_gemm:
         configs = [
             config
@@ -505,7 +512,7 @@ def get_flydsl_a16w16_configs(
             )
         ]
     device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if not is_large_gemm:
+    if apply_policy_pruning and not is_large_gemm:
         configs = GemmConfigPruner(
             m,
             n,
@@ -529,7 +536,11 @@ def get_flydsl_a16w16_configs(
             and n % config["block_n"] != 0
         ):
             continue
-        if not is_large_gemm and not config["use_half_tile_interleaved"]:
+        if (
+            apply_policy_pruning
+            and not is_large_gemm
+            and not config["use_half_tile_interleaved"]
+        ):
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
             if (mma_m_iters > 4 or mma_n_iters > 4) and (

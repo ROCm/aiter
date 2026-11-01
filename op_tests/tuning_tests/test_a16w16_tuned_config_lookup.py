@@ -210,6 +210,25 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                 False,
                 use_large_gemm_fast_path=False,
             )
+            raw_configs = policy.get_flydsl_a16w16_configs(
+                128,
+                256,
+                128,
+                torch.bfloat16,
+                torch.bfloat16,
+                False,
+                use_large_gemm_fast_path=False,
+                apply_policy_pruning=False,
+            )
+            pruned_configs = policy.get_flydsl_a16w16_configs(
+                128,
+                256,
+                128,
+                torch.bfloat16,
+                torch.bfloat16,
+                False,
+                use_large_gemm_fast_path=False,
+            )
 
         self.assertGreater(len(configs), 2)
         self.assertGreater(
@@ -221,6 +240,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             ),
             1,
         )
+        self.assertGreater(len(raw_configs), len(pruned_configs))
 
     def test_small_bm_half_tile_rejects_ragged_n(self):
         from types import SimpleNamespace
