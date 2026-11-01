@@ -4350,13 +4350,16 @@ def flash_attn_varlen_fp8_pertensor_func(
     window_size=(-1, -1, 0),  # -1 means infinite context window
     softmax_scale=None,
     sink_ptr=None,
+    out=None,
 ):
+    """`out`: optional buffer of the output's shape ([total_q, nheads, head_size_v],
+    bf16) that receives the result; it is then the returned tensor."""
     if not ENABLE_CK and sink_ptr is None:
         from .triton.attention.mha_v3 import (
             flash_attn_varlen_func as flash_attn_varlen_func_v3_triton,
         )
 
-        return flash_attn_varlen_func_v3_triton(
+        result = flash_attn_varlen_func_v3_triton(
             q=q,
             k=k,
             v=v,
@@ -4371,6 +4374,10 @@ def flash_attn_varlen_fp8_pertensor_func(
             v_descale=v_descale,
             window_size=(window_size[0], window_size[1]),
         )
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(-1)
@@ -4378,7 +4385,8 @@ def flash_attn_varlen_fp8_pertensor_func(
     if head_size_q_og % 8 != 0:
         q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
         k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
-    if head_size_v_og % 8 != 0:
+    padded_v = head_size_v_og % 8 != 0
+    if padded_v:
         v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
     out_padded, _, _, _ = _flash_attn_varlen_forward(
         q,
@@ -4406,6 +4414,11 @@ def flash_attn_varlen_fp8_pertensor_func(
         return_lse=False,
         return_softmax=False,
         sink_ptr=sink_ptr,
+        # The kernel writes a caller's buffer directly unless v was padded.
+        out=None if padded_v else out,
     )
-    out = out_padded[..., :head_size_v_og]
+    result = out_padded[..., :head_size_v_og]
+    if out is None or result.data_ptr() == out.data_ptr():
+        return result
+    out.copy_(result)
     return out
