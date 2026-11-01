@@ -12,10 +12,12 @@ Key differences from the wave64 version:
   - Kernel names suffixed with "w32" to avoid JIT cache collision
   - FP8 VEC=4 packing path (no pair-coop shuffle needed)
 
-Two kernel families:
+Three kernel families:
   - Single-wave (``_build_kernel``): 1 wave32 per boundary
   - K-split multi-wave (``_build_kernel_ksplit``): K split across NW waves,
     block = 32*NW
+  - FP4 CSA indexer (``_build_kernel_fp4``): 1 wave32 per boundary, the design of
+    the Gluon kernel; quant_mode="fp4" always uses it
 
 See ``fused_compress_attn.py`` for the original wave64 documentation.
 """
@@ -30,14 +32,13 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, fastmath, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, CmpFPredicate
+from flydsl.expr.arith import CmpFPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.utility.mx_types import MxDtypeInt as _MxDtypeInt
-from aiter.utility.mx_types import MxScaleRoundModeInt as _MxRoundInt
 
 from .fused_compress_attn_common import (
     _NEG_INF,
@@ -50,13 +51,16 @@ from .fused_compress_attn_common import (
     state_slot_byte_offset,
 )
 from .kernels_common import LOG2E as _LOG2E
-from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
-from .tensor_shim import _run_compiled, _to_raw
+from .tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    _run_compiled,
+    _to_raw,
+)
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250); D must be a multiple
 _FP4_GROUP_SIZE = 32
-_FP4_K_TILE = 128
 
 
 # ============================================================================
@@ -213,7 +217,6 @@ def _build_kernel(
     # For Indexer (D=128, VEC=4) -> 16 .. 31 are rope threads, 2 pairs each (=64=2RD/2).
     # The RD%(2*VEC) == 0 invariant means rope threads cleanly own whole pairs.
 
-    quant_fp4 = quant_mode == "fp4"
     # FP8 1xG e8m0 group-quant geometry (quant_mode=="group_fp8" only): wave32 ->
     # VEC=16, RTS = G/VEC = 4, N_GROUPS = NOPE/G = 7. Byte-identical to wave64.
     nm_asm = quant_mode == "group_fp8"
@@ -240,11 +243,6 @@ def _build_kernel(
         # quant=True with no scatter is meaningless (the scale write is what
         # the FP8 cache reader consumes). Reject early.
         raise ValueError("quant=True requires has_block_table=True")
-    if quant_fp4:
-        assert D % _FP4_K_TILE == 0, f"FP4 requires D%128==0, got D={D}"
-        assert D % _FP4_GROUP_SIZE == 0, f"FP4 requires D%32==0, got D={D}"
-        assert _FP4_GROUP_SIZE % VEC == 0
-        assert not preshuffle, "gfx1250 FP4 cache uses the natural layout"
 
     # --- kernel name ----
     _name_parts = [
@@ -259,9 +257,7 @@ def _build_kernel(
         _name_parts.append(f"KB{k_per_block}")
         if quant:
             _name_parts.append("Q")
-            if quant_fp4:
-                _name_parts.append("fp4nat_v4")
-            elif nm_asm:
+            if nm_asm:
                 _name_parts.append(f"nmasm{GROUP_SIZE_Q}")
             else:
                 if use_ue8m0:
@@ -881,7 +877,7 @@ def _build_kernel(
                         ROPE_THREAD_LO=ROPE_THREAD_LO,
                         wave_width=BLOCK_THREADS,
                     )
-                elif const_expr(not quant_fp4):
+                else:
                     # -- QUANT=1: FP8 per-row scaled write + fp32 scale --
                     # Steps:
                     #   (a) per-lane amax over VEC values, wave-reduce-max
@@ -1097,90 +1093,6 @@ def _build_kernel(
                             ),
                         )
                         buffer_ops.buffer_store(scale_v, cs_rsrc, slot_in_block)
-                else:
-                    # -- FP4 natural scatter (gfx1250 OPUS layout) --
-                    # D=128 / wave32 gives VEC=4. Eight lanes cooperate on each
-                    # 32-element MX group. Adjacent lanes combine their two
-                    # packed bytes into one aligned dword store, producing one
-                    # contiguous 64-byte E2M1 row. Lane 0 gathers the four group
-                    # scales and writes the row's contiguous 4-byte E8M0 record.
-                    NTG = _FP4_GROUP_SIZE // VEC
-                    LOG2_NTG = int(math.log2(NTG))
-                    PACKED_BYTES = VEC // 2
-                    c_eps_amax = arith.constant(
-                        6.0 * float.fromhex("0x1p-126"), type=f32
-                    )
-
-                    am_grp = arith.constant(0.0, type=f32)
-                    for i in range_constexpr(VEC):
-                        am_grp = arith.maximumf(am_grp, fmath.absf(out_lane[i]))
-                    for sh_exp in range_constexpr(LOG2_NTG):
-                        off = NTG // (2 << sh_exp)
-                        peer = _to_raw(
-                            fx.Float32(am_grp).shuffle_xor(off, BLOCK_THREADS)
-                        )
-                        am_grp = arith.maximumf(am_grp, peer)
-                    am_safe = arith.maximumf(am_grp, c_eps_amax)
-
-                    e8m0 = emit_mx_e8m0_scale(
-                        am_safe,
-                        mode=_MxRoundInt.RoundUp,
-                        dtype=_MxDtypeInt.FP4_E2M1,
-                    )
-                    e8m0_v = ArithValue(e8m0)
-                    quant_exp = ArithValue(arith.constant(254, type=i32)) - e8m0_v
-                    quant_scale = (
-                        quant_exp << ArithValue(arith.constant(23, type=i32))
-                    ).bitcast(f32)
-                    nibs = [
-                        emit_f32_to_e2m1(ArithValue(out_lane[i]) * quant_scale)
-                        for i in range_constexpr(VEC)
-                    ]
-                    assert PACKED_BYTES == 2, "gfx1250 natural FP4 expects D=128"
-                    packed16 = (
-                        ArithValue(nibs[0])
-                        | (ArithValue(nibs[1]) << 4)
-                        | (ArithValue(nibs[2]) << 8)
-                        | (ArithValue(nibs[3]) << 12)
-                    )
-                    peer16 = packed16.shuffle_xor(1, BLOCK_THREADS)
-                    packed32 = packed16 | (peer16 << fx.Int32(16))
-
-                    data_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache,
-                        max_size=True,
-                        base_byte_offset=block_base_bytes_i64(
-                            physical_block, k_per_block * (D // 2), 1
-                        ),
-                    )
-                    fp4_byte_off = fx.Int32(slot_in_block) * (D // 2) + (
-                        (fx.Uint32(tid) * VEC) >> 1
-                    )
-                    if (fx.Int32(tid) & 1) == 0:
-                        buffer_ops.buffer_store(
-                            packed32,
-                            data_rsrc,
-                            fp4_byte_off,
-                            offset_is_bytes=True,
-                        )
-
-                    if (fx.Int32(tid) % NTG) == 0:
-                        scale_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale,
-                            max_size=True,
-                            base_byte_offset=block_base_bytes_i64(
-                                physical_block,
-                                k_per_block * (D // _FP4_GROUP_SIZE),
-                                1,
-                            ),
-                        )
-                        buffer_ops.buffer_store(
-                            fx.Uint8(e8m0_v).ir_value(),
-                            scale_rsrc,
-                            fx.Int32(slot_in_block) * (D // _FP4_GROUP_SIZE)
-                            + fx.Int32(tid) // NTG,
-                            offset_is_bytes=True,
-                        )
             # else: warmup -- no scatter, just consume compute.
 
     @flyc.jit
@@ -1310,7 +1222,6 @@ def _build_kernel_ksplit(
     NW = k_split_num_waves
     BLOCK_TH = BLOCK_THREADS * NW
     K_PER_WAVE = K // NW
-    quant_fp4 = quant_mode == "fp4"
 
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
@@ -1324,9 +1235,6 @@ def _build_kernel_ksplit(
     if quant and preshuffle:
         assert D % _PRESHUFFLE_TILE == 0
         assert k_per_block % _PRESHUFFLE_TILE == 0
-    if quant_fp4:
-        assert D == 128 and k_per_block == 64
-        assert not preshuffle
 
     # LDS: 3 fp32 arrays, each NW * D entries.
     LDS_ELEMS = NW * D
@@ -1349,9 +1257,7 @@ def _build_kernel_ksplit(
     ]
     if quant:
         _name_parts.append("Q")
-        if quant_fp4:
-            _name_parts.append("fp4nat_v3")
-        elif use_ue8m0:
+        if use_ue8m0:
             _name_parts.append("ue8m0")
         if preshuffle:
             _name_parts.append("psh")
@@ -1759,7 +1665,7 @@ def _build_kernel_ksplit(
                         )
                         buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
                         buffer_ops.buffer_store(hi, out_rsrc, cache_off_dw + 4)
-                elif const_expr(not quant_fp4):
+                else:
                     # -- FP8 per-row scaled write + fp32 scale (mirror legacy) --
                     # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
                     # store via shuffle_xor(1) within the wave.
@@ -1927,77 +1833,6 @@ def _build_kernel_ksplit(
                             ),
                         )
                         buffer_ops.buffer_store(scale_v, cs_rsrc, slot_in_block)
-                else:
-                    # Natural gfx1250 MXFP4 rows. The K reduction above is
-                    # shared; wave 0 quantizes four f32 values per lane.
-                    NTG = _FP4_GROUP_SIZE // VEC
-                    LOG2_NTG = int(math.log2(NTG))
-                    c_eps_amax = arith.constant(
-                        6.0 * float.fromhex("0x1p-126"), type=f32
-                    )
-                    am_grp = arith.constant(0.0, type=f32)
-                    for i in range_constexpr(VEC):
-                        am_grp = arith.maximumf(am_grp, fmath.absf(out_lane[i]))
-                    for sh_exp in range_constexpr(LOG2_NTG):
-                        off = NTG // (2 << sh_exp)
-                        peer = _to_raw(
-                            fx.Float32(am_grp).shuffle_xor(off, BLOCK_THREADS)
-                        )
-                        am_grp = arith.maximumf(am_grp, peer)
-                    e8m0 = emit_mx_e8m0_scale(
-                        arith.maximumf(am_grp, c_eps_amax),
-                        mode=_MxRoundInt.RoundUp,
-                        dtype=_MxDtypeInt.FP4_E2M1,
-                    )
-                    e8m0_v = ArithValue(e8m0)
-                    quant_scale = (
-                        (ArithValue(arith.constant(254, type=i32)) - e8m0_v)
-                        << ArithValue(arith.constant(23, type=i32))
-                    ).bitcast(f32)
-                    nibs = [
-                        ArithValue(
-                            emit_f32_to_e2m1(ArithValue(out_lane[i]) * quant_scale)
-                        )
-                        for i in range_constexpr(VEC)
-                    ]
-                    packed16 = (
-                        nibs[0] | (nibs[1] << 4) | (nibs[2] << 8) | (nibs[3] << 12)
-                    )
-                    packed32 = packed16 | (packed16.shuffle_xor(1, BLOCK_THREADS) << 16)
-                    data_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache,
-                        max_size=True,
-                        base_byte_offset=block_base_bytes_i64(
-                            physical_block, k_per_block * (D // 2), 1
-                        ),
-                    )
-                    fp4_byte_off = fx.Int32(slot_in_block) * (D // 2) + (
-                        (lid * VEC) >> 1
-                    )
-                    if (fx.Int32(lid) & 1) == 0:
-                        buffer_ops.buffer_store(
-                            _to_raw(packed32),
-                            data_rsrc,
-                            fp4_byte_off,
-                            offset_is_bytes=True,
-                        )
-                    if (fx.Int32(lid) % NTG) == 0:
-                        scale_rsrc = buffer_ops.create_buffer_resource(
-                            cache_scale,
-                            max_size=True,
-                            base_byte_offset=block_base_bytes_i64(
-                                physical_block,
-                                k_per_block * (D // _FP4_GROUP_SIZE),
-                                1,
-                            ),
-                        )
-                        buffer_ops.buffer_store(
-                            fx.Uint8(e8m0_v).ir_value(),
-                            scale_rsrc,
-                            fx.Int32(slot_in_block) * (D // _FP4_GROUP_SIZE)
-                            + fx.Int32(lid) // NTG,
-                            offset_is_bytes=True,
-                        )
 
     @flyc.jit
     def launch_fused_compress_attn_ksplit(
@@ -2059,6 +1894,391 @@ def _build_kernel_ksplit(
         )
 
     return launch_fused_compress_attn_ksplit
+
+
+# ============================================================================
+# FP4 kernel (CSA indexer): one wave per plan row
+# ============================================================================
+# Same design and the same float operations as the Gluon kernel
+# (aiter/ops/triton/_gluon_kernels/gfx1250/fusions/fused_compress_attn.py), so both
+# write the same bytes. Lane l holds window tokens 4*(l//16) .. +3 and columns
+# 8*(l%16) .. +7: lanes l and l^16 hold the same columns. Every window load starts
+# before the first wait, the softmax runs in registers, and one hardware convert
+# writes the 8 e2m1 values of a lane.
+
+_FP4_HEAD = 128
+_FP4_ROPE = 64
+_FP4_RATIO = 4
+_FP4_WINDOW = 8
+_FP4_ROW = 256  # values in one state, input or ape row: the previous group, then the current one
+_FP4_K_PER_BLOCK = 64
+_FP4_LOG2E = 0x3FB8AA3B  # f32 log2(e)
+_FP4_INV_SIX = 0x3E2AAAAB  # f32 1/6
+_FP4_SCALE_FLOOR = 6.0 * 2.0**-126  # an all-zero group gets scale byte 1
+_FP4_DPP_ROW_XMASK = 0x160  # DPP control row_xmask:m (0x160 + m): lane l reads lane l^m
+# A masked lane reads at byte offset 2**31. The buffer bound is below that, so the
+# lane gets 0 and reads no memory. The default bound (2**32 - 1) would let it read.
+_FP4_NUM_RECORDS = 0x7FFFFFFE
+_FP4_MASKED_OFFSET = 0x80000000
+
+
+def _fp4_f32(bits):
+    return fx.Int32(bits).bitcast(fx.Float32)
+
+
+def _fp4_exp2(x):
+    """2^x as one v_exp_f32."""
+    return fx.Float32(rocdl.exp2(T.f32, x.ir_value()))
+
+
+def _fp4_rcp(x):
+    """1/x as one v_rcp_f32. The compiler pads the TRANS hazard."""
+    return fx.Float32(rocdl.rcp(T.f32, x.ir_value()))
+
+
+def _fp4_rsq(x):
+    """1/sqrt(x) as one v_rsq_f32."""
+    return fx.Float32(rocdl.rsq(T.f32, x.ir_value()))
+
+
+def _fp4_xor16(v):
+    """The value of lane l^16: one v_permlanex16_b32."""
+    moved = rocdl.permlanex16(
+        T.i32,
+        _llvm.mlir_poison(T.i32),
+        v.bitcast(fx.Int32).ir_value(),
+        fx.Int32(0x76543210).ir_value(),
+        fx.Int32(-0x01234568).ir_value(),  # 0xFEDCBA98: lane l reads lane l^16
+        True,
+        False,
+    )
+    return fx.Int32(moved).bitcast(fx.Float32)
+
+
+def _fp4_xor_row(v, mask):
+    """The value of lane l^mask, mask in {1, 2, 4, 8}: one DPP move."""
+    moved = rocdl.update_dpp(
+        T.i32,
+        _llvm.mlir_poison(T.i32),
+        v.bitcast(fx.Int32).ir_value(),
+        _FP4_DPP_ROW_XMASK + mask,
+        0xF,
+        0xF,
+        True,
+    )
+    return fx.Int32(moved).bitcast(fx.Float32)
+
+
+def _fp4_buffer(ptr, elems_per_load):
+    """Buffer view of ptr for loads of elems_per_load elements at an element offset."""
+    view = fx.make_view(ptr, fx.make_layout((0x3FFFFFFF, elems_per_load), (1, 1)))
+    return fx.rocdl.make_buffer_tensor(
+        view, num_records_bytes=fx.Int64(_FP4_NUM_RECORDS)
+    )
+
+
+def _fp4_load_f32(buf, index):
+    """4 f32 at element offset index: one 16-byte buffer load."""
+    frag = fx.make_rmem_tensor(4, fx.Float32)
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+    fx.copy(atom, fx.slice(buf, (index, None)), frag)
+    v = fx.Vector(frag.load())
+    return [v[i] for i in range(4)]
+
+
+def _fp4_load_bf16(buf, count, index):
+    """count (4 or 8) bf16 at element offset index as exact f32: one 8- or 16-byte
+    buffer load."""
+    frag = fx.make_rmem_tensor(count, fx.BFloat16)
+    copy = fx.rocdl.BufferCopy128b() if count == 8 else fx.rocdl.BufferCopy64b()
+    fx.copy(fx.make_copy_atom(copy, fx.BFloat16), fx.slice(buf, (index, None)), frag)
+    words = fx.Vector(frag.load()).bitcast(fx.Int32)
+    low = (words << 16).bitcast(fx.Float32)
+    high = (words & fx.Int32(-65536)).bitcast(fx.Float32)
+    return [low[i // 2] if i % 2 == 0 else high[i // 2] for i in range(count)]
+
+
+def _fp4_masked(mask, index, elem_bytes):
+    """The element offset for a load, or the masked offset when mask is false."""
+    return mask.select(index, fx.Int32(_FP4_MASKED_OFFSET // elem_bytes))
+
+
+def _fp4_softmax_pool(values, scores):
+    """values, scores: [4 tokens][8 columns] of the lane. Returns the 8 pooled values."""
+    log2e = _fp4_f32(_FP4_LOG2E)
+    pooled = []
+    for j in range(8):
+        s = [scores[t][j] for t in range(4)]
+        v = [values[t][j] for t in range(4)]
+        top = fx.maxnumf(fx.maxnumf(fx.maxnumf(s[0], s[1]), s[2]), s[3])
+        top = fx.maxnumf(top, _fp4_xor16(top))
+        w = [_fp4_exp2((s[t] - top) * log2e) for t in range(4)]
+        sum_w = (w[0] + w[1]) + (w[2] + w[3])
+        sum_w = sum_w + _fp4_xor16(sum_w)
+        sum_wv = fx.fma(v[0], w[0], v[1] * w[1]) + fx.fma(v[2], w[2], v[3] * w[3])
+        sum_wv = sum_wv + _fp4_xor16(sum_wv)
+        pooled.append(sum_wv * _fp4_rcp(sum_w))
+    return pooled
+
+
+def _fp4_rmsnorm(x, weight, eps):
+    """x, weight: the 8 values of the lane. The 16 lanes of a row hold the 128 values."""
+    a0 = fx.fma(x[0], x[0], x[2] * x[2])
+    a1 = fx.fma(x[1], x[1], x[3] * x[3])
+    b0 = fx.fma(x[4], x[4], x[6] * x[6])
+    b1 = fx.fma(x[5], x[5], x[7] * x[7])
+    total = (a0 + b0) + (a1 + b1)
+    for mask in (8, 4, 2, 1):
+        total = total + _fp4_xor_row(total, mask)
+    inv_rms = _fp4_rsq(fx.fma(total, fx.Float32(1.0 / _FP4_HEAD), fx.Float32(eps)))
+    return [(x[j] * inv_rms) * weight[j] for j in range(8)]
+
+
+def _fp4_interleaved_rope(x, cos, sin, is_rope):
+    """Adjacent pairs (x[2k], x[2k+1]) rotate together on the RoPE columns."""
+    out = []
+    for k in range(4):
+        x0, x1 = x[2 * k], x[2 * k + 1]
+        r0 = fx.fma(cos[2 * k], x0, sin[2 * k] * (-x1))
+        r1 = fx.fma(cos[2 * k + 1], x1, sin[2 * k + 1] * x0)
+        out += [is_rope.select(r0, x0), is_rope.select(r1, x1)]
+    return out
+
+
+def _fp4_quant(x):
+    """MXFP4 of the 8 values of the lane; 4 adjacent lanes form one 32-value group.
+
+    Returns the 8 e2m1 values packed in an i32 (value 0 in bits 3:0) and the e8m0
+    scale byte: ceil(log2(max(amax, 6 * 2^-126) / 6)) + 127.
+    """
+    amax = fx.absf(x[0])
+    for j in range(1, 8):
+        amax = fx.maxnumf(amax, fx.absf(x[j]))
+    amax = fx.maxnumf(amax, _fp4_xor_row(amax, 2))
+    amax = fx.maxnumf(amax, _fp4_xor_row(amax, 1))
+    ratio = fx.maxnumf(amax, fx.Float32(_FP4_SCALE_FLOOR)) * _fp4_f32(_FP4_INV_SIX)
+    # Adding 0x7FFFFF carries into the exponent unless the mantissa is 0.
+    carry = ratio.bitcast(fx.Int32) + 0x7FFFFF
+    scale_byte = fx.Int32(fx.Uint32(carry) >> 23) & 0xFF
+    # The convert reads only the exponent field of its f32 scale.
+    scale = (carry & 0x7F800000).bitcast(fx.Float32)
+    vec = fx.Vector.from_elements(x, fx.Float32)
+    packed = rocdl.cvt_scalef32_pk8_fp4_f32(T.i32, vec.ir_value(), scale.ir_value())
+    return fx.Int32(packed), scale_byte
+
+
+def _build_kernel_fp4(
+    *,
+    state_size: int,
+    kv_state_slot_stride: int,
+    score_state_slot_stride: int,
+    rms_weight_is_bf16: bool,
+    rms_eps: float,
+):
+    """CSA indexer FP4 compressor: one wave32 per plan row (head_dim 128, ratio 4,
+    overlap). The state slot strides are compile-time constants."""
+    HEAD = _FP4_HEAD
+    ROPE = _FP4_ROPE
+    RATIO = _FP4_RATIO
+    WINDOW = _FP4_WINDOW
+    ROW = _FP4_ROW
+    KPB = _FP4_K_PER_BLOCK
+    name = (
+        f"fused_compress_attn_w32_D128_RD64_R4_OVL_SS{state_size}_KB64_Q_fp4nat_1w"
+        f"{'_rmsbf16' if rms_weight_is_bf16 else ''}_flydsl"
+    )
+
+    @flyc.kernel(name=name, known_block_size=[32, 1, 1])
+    def fused_compress_attn_fp4_kernel(
+        plan: fx.Pointer,
+        state_slots: fx.Pointer,
+        block_tables: fx.Pointer,
+        kv_state: fx.Pointer,
+        score_state: fx.Pointer,
+        kv_in: fx.Pointer,
+        score_in: fx.Pointer,
+        ape: fx.Pointer,
+        rms_weight: fx.Pointer,
+        cos: fx.Pointer,
+        sin: fx.Pointer,
+        kv_cache: fx.Pointer,
+        cache_scale: fx.Pointer,
+        num_seqs: fx.Int32,
+        stride_block_tables: fx.Int32,
+        stride_kv_in: fx.Int32,
+        stride_score_in: fx.Int32,
+    ):
+        # The 13 pointers and 4 ints fill 30 kernarg dwords, which the wave gets
+        # preloaded in SGPRs.
+
+        # --- 1. Read the plan row ---
+        plan_row = fx.block_idx.x
+        lane = fx.thread_idx.x
+        # Each plan row is [last_token_row, seq, last_pos, num_from_state].
+        row = plan + plan_row * 4
+        last_token_row, seq, last_pos, num_from_state = row[0], row[1], row[2], row[3]
+        # Row i of a decode plan is usually sequence i, so load that slot together
+        # with the plan row. Clamp, because a plan can have more rows than sequences.
+        state_slot = state_slots[fx.min(plan_row, num_seqs - 1)]
+
+        # An empty plan row has a negative position. The slot test keeps the slot
+        # load next to the plan-row load.
+        if (last_pos >= 0) & ((state_slot >= 0) | (seq != plan_row)):
+            # A row of another sequence loads its own slot.
+            if seq != plan_row:
+                state_slot = state_slots[seq]
+            entry = last_pos // RATIO
+            group = lane // 16  # window tokens 4*group .. 4*group + 3
+            col = (lane % 16) * 8  # the first of the 8 columns of the lane
+            # The previous group is in the first half of a row, the current group
+            # in the second half: tokens 0..3 and 4..7.
+            half = group * HEAD + col
+
+            # --- 2. Load the window, the RMSNorm weight and the RoPE values ---
+            if const_expr(rms_weight_is_bf16):
+                weight = _fp4_load_bf16(_fp4_buffer(rms_weight, 8), 8, col)
+            else:
+                weight_buf = _fp4_buffer(rms_weight, 4)
+                weight = _fp4_load_f32(weight_buf, col) + _fp4_load_f32(
+                    weight_buf, col + 4
+                )
+            # Slots can be far apart: the slot offset is 64-bit.
+            slot = fx.Int64(state_slot)
+            kv_ring = _fp4_buffer(kv_state + slot * kv_state_slot_stride, 4)
+            score_ring = _fp4_buffer(score_state + slot * score_state_slot_stride, 4)
+            kv_rows = _fp4_buffer(kv_in, 8)
+            score_rows = _fp4_buffer(score_in, 8)
+            ape_rows = _fp4_buffer(ape, 4)
+            neg_inf = fx.Float32(float("-inf"))
+            values, scores = [], []
+            for j in range_constexpr(4):
+                token = group * 4 + j
+                token_pos = last_pos - (WINDOW - 1) + token
+                is_real = token_pos >= 0
+                from_state = is_real & (token < num_from_state)
+                from_input = is_real & (token >= num_from_state)
+                ring_start = _fp4_masked(
+                    from_state, (token_pos % state_size) * ROW + half, 4
+                )
+                in_row = last_token_row - (WINDOW - 1) + token
+                kv_start = _fp4_masked(from_input, in_row * stride_kv_in + half, 2)
+                score_start = _fp4_masked(
+                    from_input, in_row * stride_score_in + half, 2
+                )
+                state_v = _fp4_load_f32(kv_ring, ring_start) + _fp4_load_f32(
+                    kv_ring, ring_start + 4
+                )
+                state_s = _fp4_load_f32(score_ring, ring_start) + _fp4_load_f32(
+                    score_ring, ring_start + 4
+                )
+                input_v = _fp4_load_bf16(kv_rows, 8, kv_start)
+                input_s = _fp4_load_bf16(score_rows, 8, score_start)
+                # The state ring stores scores with ape added. Add ape to the input
+                # scores only. The other tokens have an input score of -inf, so the
+                # ape load needs no mask.
+                ape_start = j * ROW + half
+                ape_v = _fp4_load_f32(ape_rows, ape_start) + _fp4_load_f32(
+                    ape_rows, ape_start + 4
+                )
+                # Each token comes from at most one source. A masked source gives 0,
+                # so add the values; its score becomes -inf.
+                values.append([state_v[e] + input_v[e] for e in range(8)])
+                scores.append(
+                    [
+                        fx.maxnumf(
+                            from_state.select(state_s[e], neg_inf),
+                            from_input.select(input_s[e], neg_inf) + ape_v[e],
+                        )
+                        for e in range(8)
+                    ]
+                )
+            # The cache row uses the RoPE angle of the first position in its group.
+            # Columns 2i and 2i + 1 of the RoPE part use table entry i.
+            is_rope = col >= HEAD - ROPE
+            table_start = _fp4_masked(
+                is_rope, entry * RATIO * (ROPE // 2) + (col - (HEAD - ROPE)) // 2, 2
+            )
+            cos4 = _fp4_load_bf16(_fp4_buffer(cos, 4), 4, table_start)
+            sin4 = _fp4_load_bf16(_fp4_buffer(sin, 4), 4, table_start)
+            cos8 = [cos4[e // 2] for e in range(8)]
+            sin8 = [sin4[e // 2] for e in range(8)]
+            # The block is needed only by the stores. Its load waits under the window
+            # loads.
+            block = block_tables[seq * stride_block_tables + entry // KPB]
+            cache_row = fx.Int64(block * KPB + entry % KPB)
+
+            # --- 3. Softmax pool, RMSNorm, RoPE and MXFP4 ---
+            pooled = _fp4_softmax_pool(values, scores)
+            normed = _fp4_rmsnorm(pooled, weight, rms_eps)
+            rotated = _fp4_interleaved_rope(normed, cos8, sin8, is_rope)
+            packed, scale_byte = _fp4_quant(rotated)
+
+            # --- 4. Write the cache row ---
+            # Lanes l and l^16 write the same bytes, and the 4 lanes of a group the same
+            # scale byte. A store from every lane needs no branch.
+            row_words = fx.inttoptr(
+                fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+                fx.ptrtoint(kv_cache + cache_row * (HEAD // 2)),
+            )
+            (row_words + lane % 16).store(packed)
+            group_scale = cache_scale + cache_row * (HEAD // _FP4_GROUP_SIZE)
+            (group_scale + (lane % 16) // 4).store(fx.Int8(scale_byte))
+
+    @flyc.jit
+    def launch_fused_compress_attn_fp4(
+        plan: fx.Pointer,
+        state_slots: fx.Pointer,
+        block_tables: fx.Pointer,
+        kv_state: fx.Pointer,
+        score_state: fx.Pointer,
+        kv_in: fx.Pointer,
+        score_in: fx.Pointer,
+        ape: fx.Pointer,
+        rms_weight: fx.Pointer,
+        cos: fx.Pointer,
+        sin: fx.Pointer,
+        kv_cache: fx.Pointer,
+        cache_scale: fx.Pointer,
+        num_seqs: fx.Int32,
+        stride_block_tables: fx.Int32,
+        stride_kv_in: fx.Int32,
+        stride_score_in: fx.Int32,
+        plan_capacity: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        # cluster_dims 1,1,1 reads the block index from ttmp9, without the cluster
+        # prologue.
+        fused_compress_attn_fp4_kernel(
+            plan,
+            state_slots,
+            block_tables,
+            kv_state,
+            score_state,
+            kv_in,
+            score_in,
+            ape,
+            rms_weight,
+            cos,
+            sin,
+            kv_cache,
+            cache_scale,
+            num_seqs,
+            stride_block_tables,
+            stride_kv_in,
+            stride_score_in,
+            value_attrs={"rocdl.cluster_dims": "1,1,1"},
+        ).launch(grid=(plan_capacity, 1, 1), block=(32, 1, 1), stream=stream)
+
+    # No fast-math: the float operations must match the Gluon kernel. coexec is the
+    # scheduler that Triton uses on gfx1250.
+    launch_fused_compress_attn_fp4.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+            "amdgpu-sched-strategy": "coexec",
+        },
+    }
+    return launch_fused_compress_attn_fp4
 
 
 # ============================================================================
@@ -2225,6 +2445,103 @@ def compile_flydsl_fused_compress_attn_ksplit_gfx1250(
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
+
+
+@lru_cache(maxsize=32)
+def compile_flydsl_fused_compress_attn_fp4_gfx1250(
+    *,
+    state_size: int,
+    kv_state_slot_stride: int,
+    score_state_slot_stride: int,
+    rms_weight_is_bf16: bool,
+    rms_eps: float,
+):
+    return _build_kernel_fp4(
+        state_size=state_size,
+        kv_state_slot_stride=kv_state_slot_stride,
+        score_state_slot_stride=score_state_slot_stride,
+        rms_weight_is_bf16=rms_weight_is_bf16,
+        rms_eps=rms_eps,
+    )
+
+
+def _fp4_pointer(t: torch.Tensor, dtype):
+    """A 16-byte aligned tensor as a raw pointer kernel argument (8 kernarg bytes)."""
+    if t.data_ptr() % 16 != 0:
+        raise ValueError("gfx1250 FP4 compressor needs 16-byte aligned tensors")
+    return flyc.from_c_void_p(dtype, t.data_ptr(), assumed_align=16)
+
+
+def _launch_fp4(
+    *,
+    kv_in,
+    score_in,
+    kv_state,
+    score_state,
+    plan_gpu,
+    state_slot_mapping,
+    ape,
+    rms_weight,
+    rms_eps,
+    cos_2d,
+    sin_2d,
+    kv_cache,
+    cache_scale,
+    block_tables,
+    stream,
+):
+    """Checks the layouts that the one-wave FP4 kernel reads and launches it."""
+    if kv_in.stride(0) % 8 != 0 or score_in.stride(0) % 8 != 0:
+        raise ValueError(
+            "gfx1250 FP4 compressor needs kv_in/score_in row strides % 8 == 0"
+        )
+    for state in (kv_state, score_state):
+        if state.stride(1) != state.shape[2] or state.stride(0) % 4 != 0:
+            raise ValueError(
+                "gfx1250 FP4 compressor needs kv_state/score_state rows of 256 "
+                "contiguous values and a slot stride % 4 == 0"
+            )
+    if not (ape.is_contiguous() and rms_weight.is_contiguous()):
+        raise ValueError("gfx1250 FP4 compressor needs contiguous ape and rms_weight")
+    if not (plan_gpu.is_contiguous() and state_slot_mapping.is_contiguous()):
+        raise ValueError("gfx1250 FP4 compressor needs contiguous plan and slot map")
+    if state_slot_mapping.numel() == 0:
+        # Without sequences every plan row is empty, but the kernel loads one slot.
+        state_slot_mapping = torch.full(
+            (1,), -1, dtype=torch.int32, device=state_slot_mapping.device
+        )
+    rms_weight_is_bf16 = rms_weight.dtype == torch.bfloat16
+    launcher = compile_flydsl_fused_compress_attn_fp4_gfx1250(
+        state_size=kv_state.shape[1],
+        kv_state_slot_stride=kv_state.stride(0),
+        score_state_slot_stride=score_state.stride(0),
+        rms_weight_is_bf16=rms_weight_is_bf16,
+        rms_eps=float(rms_eps),
+    )
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    _run_compiled(
+        launcher,
+        _fp4_pointer(plan_gpu, fx.Int32),
+        _fp4_pointer(state_slot_mapping, fx.Int32),
+        _fp4_pointer(block_tables, fx.Int32),
+        _fp4_pointer(kv_state, fx.Float32),
+        _fp4_pointer(score_state, fx.Float32),
+        _fp4_pointer(kv_in, fx.BFloat16),
+        _fp4_pointer(score_in, fx.BFloat16),
+        _fp4_pointer(ape, fx.Float32),
+        _fp4_pointer(rms_weight, fx.BFloat16 if rms_weight_is_bf16 else fx.Float32),
+        _fp4_pointer(cos_2d, fx.BFloat16),
+        _fp4_pointer(sin_2d, fx.BFloat16),
+        _fp4_pointer(kv_cache, fx.Int8),
+        _fp4_pointer(cache_scale, fx.Int8),
+        state_slot_mapping.numel(),
+        block_tables.stride(0),
+        kv_in.stride(0),
+        score_in.stride(0),
+        plan_gpu.shape[0],
+        Stream(stream),
+    )
 
 
 def flydsl_fused_compress_attn_gfx1250(
@@ -2440,6 +2757,31 @@ def flydsl_fused_compress_attn_gfx1250(
         krope_block_stride = 0
         krope_token_stride = 0
 
+    # ---- FP4 (CSA indexer): one wave per plan row, for every plan size ----
+    if quant_fp4:
+        if rope_head_dim != 64 or ratio != 4 or not overlap:
+            raise ValueError(
+                "gfx1250 FP4 compressor requires rope_head_dim=64, ratio=4 and overlap"
+            )
+        _launch_fp4(
+            kv_in=kv_in,
+            score_in=score_in,
+            kv_state=kv_state,
+            score_state=score_state,
+            plan_gpu=plan_gpu,
+            state_slot_mapping=state_slot_mapping,
+            ape=ape,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            cos_2d=cos_2d,
+            sin_2d=sin_2d,
+            kv_cache=kv_cache,
+            cache_scale=cache_scale,
+            block_tables=block_tables,
+            stream=stream,
+        )
+        return
+
     # ---- K-split fast path (BF16 + FP8 scatter) ----
     # k_split_num_waves: None ? auto-pick (tuned geometries only); int>1 ?
     # forced NW; 1 ? forced legacy. Auto triggers for the CSA Main (BF16) and
@@ -2453,12 +2795,10 @@ def flydsl_fused_compress_attn_gfx1250(
         and rope_head_dim == 64
         and ratio == 4
         and overlap
-        and quant_mode in ("per_row_fp8", "fp4")
+        and quant_mode == "per_row_fp8"
     )
     if k_split_num_waves is None and has_bt and (_is_csa_main or _is_csa_indexer):
         nw_eff = csa_ksplit_num_waves_gfx1250(plan_capacity)
-        if quant_fp4:
-            nw_eff = max(nw_eff, 2)
     else:
         nw_eff = k_split_num_waves if k_split_num_waves is not None else 1
     use_ksplit = (
