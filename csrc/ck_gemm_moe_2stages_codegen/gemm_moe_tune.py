@@ -7497,9 +7497,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
         requested_warmup = int(args.warmup if num_warmup is None else num_warmup)
         measured_iters = int(args.iters if num_iters is None else num_iters)
 
-        def validate_output(out, phase):
+        def validate_output(expected, out, phase):
             accuracy_error = cosine_diff_compare(
-                reference,
+                expected,
                 out,
                 msg=f"port[{kn1}+{kn2}]",
                 printLog=False,
@@ -7527,6 +7527,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 )
                 accuracy_errors.append(
                     validate_output(
+                        reference,
                         out,
                         f"warmup-and-accuracy-check {check_index + 1}/"
                         f"{requested_warmup}",
@@ -7580,12 +7581,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
             profile_warm_iters=0 if fast_scan else 1,
             num_rotate_args=1 if fast_scan else 0,
         )
+        # run_perftest synchronizes before returning. Validate its last
+        # output now, outside the profiler interval, to catch result
+        # instability without changing reported kernel-active latency.
         if reference is not None:
-            # run_perftest synchronizes before returning. Validate its last
-            # output now, outside the profiler interval, to catch result
-            # instability without changing reported kernel-active latency.
-            accuracy_errors.append(validate_output(timed_out, "measured output"))
+            accuracy_errors.append(
+                validate_output(reference, timed_out, "measured output")
+            )
             err = max(accuracy_errors)
+        elif not fast_scan:
+            err = max(float(err), validate_output(ref, timed_out, "measured output"))
         if previously_observed_errors:
             err = max(float(err), *previously_observed_errors)
         us = round(float(us), 4)
