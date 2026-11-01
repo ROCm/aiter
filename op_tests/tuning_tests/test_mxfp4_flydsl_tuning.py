@@ -183,6 +183,35 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown token 'bias'"):
                 parse_csv(str(path))
 
+    def test_staged_plan_accepts_bias_free_g1_names(self) -> None:
+        staged = importlib.import_module(
+            "csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search"
+        )
+        g1_tiles = {
+            16: "16x256x256_f16in_nt",
+            32: "32x256x256_nt",
+            64: "64x256x256_nt",
+            128: "128x256x256",
+        }
+        for block_m, tile in g1_tiles.items():
+            for act in ("silu", "situv2", "swiglu"):
+                suffix = "" if act == "silu" else f"_{act}"
+                row = {
+                    "kernelName1": f"flydsl_mxmoe_g1_a4w4_{tile}{suffix}",
+                    "kernelName2": (
+                        "flydsl_moe2_layout_afp4_wfp4_bf16_"
+                        f"t{block_m}x256x256_atomic_sbm{block_m}"
+                    ),
+                    "block_m": block_m,
+                }
+                shape = shape_row(act_type=f"ActivationType.{act.capitalize()}")
+                with self.subTest(block_m=block_m, act=act):
+                    plan = staged.build_staged_candidate_plan(shape, [row])
+                    self.assertEqual(
+                        [pair.key.gemm1.kernel_name for pair in plan.pairs],
+                        [row["kernelName1"]],
+                    )
+
     def test_mxmoe_wrapper_passes_runtime_bias_without_name_flag(self) -> None:
         fm = importlib.import_module("aiter.fused_moe")
         hidden = torch.empty((2, 512), dtype=torch.float8_e4m3fn)
