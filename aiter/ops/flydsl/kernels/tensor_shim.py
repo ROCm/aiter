@@ -277,6 +277,18 @@ def check_e8m0(
         raise RuntimeError(f"[{owner}] {name} must be contiguous")
 
 
+# Resolve the optional API once, but query its device/stream on every call.
+# This is not a stream cache: graph capture and thread-local stream switches
+# must still be observed. Older torch builds keep the public API fallback.
+_get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def current_stream_arg():
+    if _get_current_raw_stream is None:
+        return torch.cuda.current_stream()
+    return fx.Stream(_get_current_raw_stream(torch.cuda.current_device()))
+
+
 def ptr_arg(t: torch.Tensor, dtype=None):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
     if dtype is None:
