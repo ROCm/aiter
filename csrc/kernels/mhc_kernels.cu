@@ -1901,8 +1901,9 @@ namespace aiter {
         AITER_CHECK(out.size(0) == m && out.size(1) == hc_mult && out.size(2) == hidden_size,
                     "mhc_post: out shape must be (m, hc_mult, hidden_size)");
         AITER_CHECK(post_layer_mix.is_contiguous(), "mhc_post: post_layer_mix must be contiguous");
-        AITER_CHECK(post_layer_mix.size(0) == m && post_layer_mix.size(1) == hc_mult,
-                    "mhc_post: post_layer_mix shape must be (m, hc_mult)");
+        AITER_CHECK(post_layer_mix.size(0) == m && post_layer_mix.size(1) == hc_mult
+                        && post_layer_mix.numel() == m * hc_mult,
+                    "mhc_post: post_layer_mix shape must be (m, hc_mult[, 1])");
         AITER_CHECK(comb_res_mix.is_contiguous(), "mhc_post: comb_res_mix must be contiguous");
         AITER_CHECK(comb_res_mix.size(0) == m && comb_res_mix.size(1) == hc_mult
                         && comb_res_mix.size(2) == hc_mult,
