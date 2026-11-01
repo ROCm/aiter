@@ -11,6 +11,7 @@
         512,
         1024,
         2048,
+        3072,
         4096,
         8192,
         16384,
@@ -114,6 +115,16 @@
         "num_warps": 4,
         "kernel_type": "compute_bound",
         "waves_per_eu": 1
+    },
+    "M_LEQ_3072": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 2
     },
     "M_LEQ_4096": {
         "BLOCK_M": 256,
