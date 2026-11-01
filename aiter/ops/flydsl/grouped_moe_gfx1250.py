@@ -735,8 +735,17 @@ def _grouped_a8w4_tdm_moe(
             f"divide their max ({_align_m}); otherwise a GEMM tile straddles "
             "two experts and silently computes against the wrong weights"
         )
+    # Only experts that take a route pad their tail, and at most min(E, routes) do.
+    _routes = token_num * topk
     contiguous_m = max(
-        _align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m)
+        _align_m,
+        _tdm_align_up(
+            min(
+                _routes + E * _align_m - topk,
+                _routes + min(E, _routes) * (_align_m - 1),
+            ),
+            _align_m,
+        ),
     )
     max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
     if _compact:
