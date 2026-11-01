@@ -89,17 +89,25 @@ def main(d):
                     if m:
                         last = m[-1]
                         last = next(x for x in last if x) if isinstance(last, tuple) else last
-                        vals.append(float(last))
+                        if float(last) > 0:  # 0 = no kernel events in the profiler trace
+                            vals.append(float(last))
                 if not vals:
+                    print(f"{n:10} {k:8} {timer:9} n/a: no value in any timed round")
+                    continue
+                if len(vals) < len(timed):
+                    print(
+                        f"{n:10} {k:8} {timer:9} n/a: a value in only {len(vals)} of {len(timed)} timed rounds"
+                        f" ({' '.join(f'{v:.2f}' for v in vals)})"
+                    )
                     continue
                 med = statistics.median(vals)
-                tbs = nbytes[k] / (med * 1e-6) / 1e12 if k in nbytes else float("nan")
+                tbs = f"{nbytes[k] / (med * 1e-6) / 1e12:6.2f}" if k in nbytes else "     -"
                 key = (k, timer)
                 first.setdefault(key, med)
                 rel = (med / first[key] - 1) * 100
                 cells = " ".join(f"{v:.2f}" for v in vals)
                 print(
-                    f"{n:10} {k:8} {timer:9} {cells:34} {med:8.2f} {tbs:6.2f} {rel:+6.1f}%"
+                    f"{n:10} {k:8} {timer:9} {cells:34} {med:8.2f} {tbs} {rel:+6.1f}%"
                 )
     print()
     for n in names:

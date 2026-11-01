@@ -106,7 +106,10 @@ def _run_grouped_via_fused_moe(*args, **kwargs):
         names = [f"callable{i}" for i in range(len(funcs))]
     for name in names:
         if name in (kernel_us or {}):
-            print(f"[moe-exp] {name}: profiler_us = {kernel_us[name]:.2f}", flush=True)
+            v = float(kernel_us[name])
+            # run_perftest returns 0 when the profiler trace has no events for the callable's kernels
+            text = f"{v:.2f}" if v > 0 else "n/a (no kernel events in the profiler trace)"
+            print(f"[moe-exp] {name}: profiler_us = {text}", flush=True)
     if GRAPH_ITERS > 0:
         for name, func in zip(names, funcs):
             torch.cuda.synchronize()

@@ -37,7 +37,8 @@ How the work maps onto the GPU (one workgroup per WGP; the LDS stages leave no r
 
 Kernels (names from the FlyDSL dump):
 `a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain`
-(gemm1) and the same with `_K2048_e64_cluster1x4_` (gemm2).
+(gemm1) and the same with `_K2048_e64_cluster1x4_` (gemm2); quant_a1 = `moe_apre_quant_fd7168_r8_fp4_pk8_w16` +
+`moe_apre_scatter_fd7168_r8_fp4_pk8_w16_tk7168_grid_sw8_async_ballot`.
 
 ## Setup
 
@@ -100,7 +101,9 @@ is the Python launcher bound to one eager run's tensors, so calling it re-launch
   device durations from the trace (first iteration and outliers outside 1.5 IQR dropped; a two-kernel callable
   like `quant_a1` reports the sum). The callables pass no tensor arguments, so `run_perftest`'s input rotation
   does nothing: every launch reads the same inputs and writes the same outputs. The test prints gemm1 and gemm2;
-  `bench_driver.py` prints all three (`[moe-exp] <name>: profiler_us`), from the same values.
+  `bench_driver.py` prints all three (`[moe-exp] <name>: profiler_us`), from the same values. If it prints
+  `n/a` (the test: `us = nan`), the profiler trace had no kernel events; `profiler_probe.py` checks whether the
+  node's torch profiler records kernels at all.
 - **graph_us**: after the test has timed all three callables, `bench_driver.py` captures each callable 128 times
   into one CUDA graph, replays it 10 times, and times each replay with CUDA events: the median time per launch.
   No profiler; launches run back to back and the number includes the ~1.5 us gaps between kernels. The GPU idles
@@ -134,7 +137,29 @@ Clocks, power limits and firmware matter: a node whose perf settings were not re
 
 ## Results
 
-(2026-11-01 baseline at 8ea2265dc: added by the commit after the one that moved the branch.)
+### 2026-11-01, heliosr-1b114-d01-3 (MI450X), at 8ea2265dc
+
+`results/20261101_d01-3_base/` (meta.txt, summary.txt, run_log.txt, one full process log, profiler_probe.txt).
+Command: `LOCK=gpu-lock IDLE_CHECK=1 SITE=... op_tests/flydsl_tests/moe_exp/bench.sh 5`, 5 timed rounds, one process
+each, 21:15-21:21 UTC.
+
+| Kernel | graph_us (median, range) | TB/s (graph) | profiler_us |
+|---|---|---|---|
+| quant_a1 | 20.25 (20.11-20.28) | - | n/a |
+| gemm1 | 74.76 (74.69-74.95) | 14.16 | n/a |
+| gemm2 | 51.69 (51.63-51.74) | 13.32 | n/a |
+
+- **No profiler_us on this boot.** The torch profiler returned no device events for gemm1 and gemm2 in any round
+  (the test prints `us = nan`) and a single, implausible event (2.85 ms) for quant_a1 in 2 of 5 rounds.
+  `profiler_probe.py` gets 0 of 256 events for plain torch copies and matmuls on the same boot, while rocprofv3
+  `--kernel-trace` records every kernel. So the node's torch-profiler path is broken, not this code; on
+  2026-10-29 (MEC 2560) the same code gave profiler numbers.
+- Correct in every round (`logits_diff=3.4249e-06`, `rel_l2=2.6172e-03`); all 6 outputs bit-identical.
+- Node state: boot 2026-11-01 08:28 UTC, MEC firmware 2430 (`gc_12_1_0_mec.bin` sha256 d798bf71...), PM
+  02.125.15.00, MAX_CLK 2400 MHz, 2.5 kW socket power limit, the node's perf settings not re-applied after that boot.
+- Against 2026-10-29 (same code; MEC 2560, another boot, the kit's first driver): graph_us gemm1 84.83 -> 74.76
+  (-11.9%), gemm2 54.18 -> 51.69 (-4.6%), quant_a1 20.73 -> 20.25. Firmware, boot and the graph timer's order
+  changed together, so the cause is not known.
 
 ### 2026-10-28, heliosr-1b114-d01-3 (MI450X), at 2489bae2d (`run_dsr1.sh`'s environment)
 
