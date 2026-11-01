@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Run test_flydsl_grouped_gemm.py's main() unchanged, with two additions.
+"""Run test_flydsl_grouped_gemm.py's main() unchanged, with three additions.
 
-1. A second, profiler-free kernel time: every gemm1/gemm2 launch callable that the
-   test's kernel-bench times with ``run_perftest`` is also captured
-   ``MOE_EXP_GRAPH_ITERS`` times into one CUDA graph; the graph is replayed
-   ``MOE_EXP_GRAPH_REPS`` times and each replay is timed with CUDA events. Printed
-   as ``[moe-exp] <name>: graph_us = <median per launch>``; it includes the gaps
-   between back-to-back kernels.
-2. ``MOE_EXP_SAVE_OUT=<file.pt>`` saves the fused-MoE output that the test checks
+1. ``[moe-exp] <name>: profiler_us = ...`` for every launch callable the test's
+   kernel-bench times (quant_a1, gemm1, gemm2). These are the values the test
+   computes with ``run_perftest``; the test itself prints only gemm1 and gemm2.
+2. A second, profiler-free kernel time: after the test's kernel-bench has timed
+   all callables, each callable is captured ``MOE_EXP_GRAPH_ITERS`` times into
+   one CUDA graph, the graph is replayed ``MOE_EXP_GRAPH_REPS`` times and each
+   replay is timed with CUDA events. Printed as ``[moe-exp] <name>: graph_us =
+   <median per launch>``; it includes the gaps between back-to-back kernels.
+   The GPU idles ``MOE_EXP_GRAPH_GAP_S`` seconds (default 1) before each
+   callable's graph timing, so one kernel's back-to-back run does not heat the
+   GPU for the next kernel's timing. The graph timing runs only after all of
+   the test's own timing, so it cannot change the test's numbers.
+3. ``MOE_EXP_SAVE_OUT=<file.pt>`` saves the fused-MoE output that the test checks
    against its torch reference, for a bit-exact comparison between runs.
 
 usage (from the repository root):
@@ -19,6 +25,7 @@ import importlib.util
 import os
 import statistics
 import sys
+import time
 
 import torch
 
@@ -28,9 +35,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TEST = os.path.join(os.path.dirname(HERE), "test_flydsl_grouped_gemm.py")
 GRAPH_ITERS = int(os.environ.get("MOE_EXP_GRAPH_ITERS", "128"))
 GRAPH_REPS = int(os.environ.get("MOE_EXP_GRAPH_REPS", "10"))
+GRAPH_GAP_S = float(os.environ.get("MOE_EXP_GRAPH_GAP_S", "1"))
 SAVE_OUT = os.environ.get("MOE_EXP_SAVE_OUT")
 
-_graph_us = []  # per run_perftest call of the kernel-bench loop, in call order
+_timed = []  # launch callables of the kernel-bench loop, in run_perftest call order
 
 
 def graph_time_us(fn, iters, reps):
@@ -67,15 +75,10 @@ _orig_run_perftest = test_common.run_perftest
 
 
 def run_perftest(func, *args, **kwargs):
-    result = _orig_run_perftest(func, *args, **kwargs)
     # The kernel-bench loop passes a bare launch callable with testGraph=False.
-    if not args and not kwargs.get("testGraph", False) and GRAPH_ITERS > 0:
-        try:
-            _graph_us.append(graph_time_us(func, GRAPH_ITERS, GRAPH_REPS))
-        except RuntimeError as exc:  # report and keep the test's own result
-            print(f"[moe-exp] graph timing failed: {exc!r}", flush=True)
-            _graph_us.append(None)
-    return result
+    if not args and not kwargs.get("testGraph", False):
+        _timed.append(func)
+    return _orig_run_perftest(func, *args, **kwargs)
 
 
 test_common.run_perftest = run_perftest
@@ -89,17 +92,34 @@ _orig_run = mod._run_grouped_via_fused_moe
 
 
 def _run_grouped_via_fused_moe(*args, **kwargs):
-    first = len(_graph_us)
+    first = len(_timed)
     out, ref, us, kernel_us = _orig_run(*args, **kwargs)
+    funcs = _timed[first:]
+    names = list(kernel_us or {})
     # kernel_us is filled in the same order as the run_perftest calls above.
-    for name, timed in zip(kernel_us or {}, _graph_us[first:]):
-        if timed is not None:
-            median, times = timed
-            spread = f"{min(times):.2f}-{max(times):.2f}"
+    if len(names) != len(funcs):
+        print(
+            f"[moe-exp] {len(funcs)} timed callables but kernel_us has {names}; "
+            "labelling graph times by index",
+            flush=True,
+        )
+        names = [f"callable{i}" for i in range(len(funcs))]
+    for name in names:
+        if name in (kernel_us or {}):
+            print(f"[moe-exp] {name}: profiler_us = {kernel_us[name]:.2f}", flush=True)
+    if GRAPH_ITERS > 0:
+        for name, func in zip(names, funcs):
+            torch.cuda.synchronize()
+            time.sleep(GRAPH_GAP_S)
+            try:
+                median, times = graph_time_us(func, GRAPH_ITERS, GRAPH_REPS)
+            except RuntimeError as exc:  # report and keep the test's own result
+                print(f"[moe-exp] {name}: graph timing failed: {exc!r}", flush=True)
+                continue
             print(
                 f"[moe-exp] {name}: graph_us = {median:.2f} "
                 f"(median of {len(times)} replays x {GRAPH_ITERS} launches, "
-                f"range {spread})",
+                f"range {min(times):.2f}-{max(times):.2f}, after {GRAPH_GAP_S:g} s idle)",
                 flush=True,
             )
     if SAVE_OUT:

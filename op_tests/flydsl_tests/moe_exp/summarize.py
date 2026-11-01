@@ -2,9 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Summarize a bench.sh output directory.
 
-Per variant: median gemm1/gemm2 time over the timed rounds (round 0 is warm-up),
-for both timers (``profiler_us`` = the test's kernel-bench, ``graph_us`` =
-bench_driver.py's CUDA-graph timer), TB/s from the byte model below, the test's
+Per variant: median quant_a1/gemm1/gemm2 time over the timed rounds (round 0 is
+warm-up), for both timers (``profiler_us`` = the test's kernel-bench, ``graph_us`` =
+bench_driver.py's CUDA-graph timer), TB/s from the byte model below (gemm1 and
+gemm2 only; quant_a1 is two kernels, the A quant and its scatter), the test's
 accuracy line, the kernel names, and a bit-exact comparison of every saved output
 with the first variant's round-1 output.
 
@@ -66,7 +67,7 @@ def main(d):
         + "  (see summarize.py)"
     )
     print()
-    hdr = f"{'variant':10} {'kernel':6} {'timer':9} {'per-round us':34} {'median':>8} {'TB/s':>6} {'vs 1st':>7}"
+    hdr = f"{'variant':10} {'kernel':8} {'timer':9} {'per-round us':34} {'median':>8} {'TB/s':>6} {'vs 1st':>7}"
     print(hdr)
     print("-" * len(hdr))
     first = {}
@@ -76,26 +77,29 @@ def main(d):
             key=lambda p: int(re.search(r"_r(\d+)\.log$", p).group(1)),
         )
         timed = [p for p in logs if not p.endswith("_r0.log")]
-        for k in ("gemm1", "gemm2"):
+        for k in ("quant_a1", "gemm1", "gemm2"):
             for timer, pat in (
-                ("profiler", rf"\] {k}: us = ([0-9.]+)"),
+                # bench_driver.py prints every kernel; the test prints gemm1/gemm2 only
+                ("profiler", rf"\[moe-exp\] {k}: profiler_us = ([0-9.]+)|\] {k}: us = ([0-9.]+)"),
                 ("graph", rf"\[moe-exp\] {k}: graph_us = ([0-9.]+)"),
             ):
                 vals = []
                 for p in timed:
                     m = re.findall(pat, read(p))
                     if m:
-                        vals.append(float(m[-1]))
+                        last = m[-1]
+                        last = next(x for x in last if x) if isinstance(last, tuple) else last
+                        vals.append(float(last))
                 if not vals:
                     continue
                 med = statistics.median(vals)
-                tbs = nbytes[k] / (med * 1e-6) / 1e12
+                tbs = nbytes[k] / (med * 1e-6) / 1e12 if k in nbytes else float("nan")
                 key = (k, timer)
                 first.setdefault(key, med)
                 rel = (med / first[key] - 1) * 100
                 cells = " ".join(f"{v:.2f}" for v in vals)
                 print(
-                    f"{n:10} {k:6} {timer:9} {cells:34} {med:8.2f} {tbs:6.2f} {rel:+6.1f}%"
+                    f"{n:10} {k:8} {timer:9} {cells:34} {med:8.2f} {tbs:6.2f} {rel:+6.1f}%"
                 )
     print()
     for n in names:
