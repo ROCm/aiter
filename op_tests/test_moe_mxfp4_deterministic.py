@@ -5,9 +5,8 @@
 A token's output must be bitwise the same whatever the batch it is in and from
 run to run, including across the token counts where the default changes its
 kernels, tiles or activation dtype, and it must be as accurate as the
-default. Separated gate/up weights use MXFP4 activations, which the default
-also uses from 256 tokens; gate/up-interleaved weights use MXFP8 activations,
-as the default does from 256 tokens.
+default. The deterministic path takes gate/up-interleaved weights and MXFP8
+activations, as the default does from 256 tokens.
 
 Run:
     pytest op_tests/test_moe_mxfp4_deterministic.py -q
@@ -28,7 +27,7 @@ _SKIP = pytest.mark.skipif(
 )
 
 # Token counts on both sides of where the default switches the activation dtype
-# (256) and where the deterministic tile height grows (1,024 and 2,048).
+# (256) and where the deterministic tile height grows (2,048), plus 1,024.
 _PREFIXES = (1, 31, 255, 256, 257, 1024, 1025, 2048, 2049)
 _M = 2304
 
@@ -39,7 +38,7 @@ def _cos_diff(x, y):
     return float(1 - 2 * (x * y).sum() / denom)
 
 
-def _problem(M, model_dim, inter_dim, E, topk, bias=True, interleaved=False):
+def _problem(M, model_dim, inter_dim, E, topk, bias=True, interleaved=True):
     dtype = dtypes.bf16
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -152,7 +151,8 @@ def _check_batch_invariant(p, out, activation, **kwargs):
 )
 def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk):
     """SwiGLU with clamp and per-expert biases; gpt-oss shapes, and MiniMax-M3's per
-    GPU at TP4 and TP2 (128 routed experts plus a fused shared expert)."""
+    GPU at TP4 and TP2 (128 routed experts plus a fused shared expert). The
+    stage-1 bias stays in [gate.., up..] order."""
     limit = 7.0
     p = _problem(_M, model_dim, inter_dim, E, topk)
     out = _run(p, slice(None), ActivationType.Swiglu, True, swiglu_limit=limit)
@@ -160,33 +160,8 @@ def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk):
     ref = _reference(
         p, _M, model_dim, inter_dim, E, topk, ActivationType.Swiglu, swiglu_limit=limit
     )
-    # The default also quantizes the activations to MXFP4 at this token count, so
+    # The default also quantizes the activations to MXFP8 at this token count, so
     # it is the accuracy to match.
-    default = _run(p, slice(None), ActivationType.Swiglu, False, swiglu_limit=limit)
-    ld = _cos_diff(ref.float(), out.float())
-    ld_default = _cos_diff(ref.float(), default.float())
-    assert (
-        ld <= ld_default * 1.05 + 1e-5
-    ), f"cos/logits_diff vs the bf16 reference {ld:.3e}, default {ld_default:.3e}"
-    _check_batch_invariant(p, out, ActivationType.Swiglu, swiglu_limit=limit)
-
-
-@_SKIP
-@pytest.mark.parametrize(
-    "model_dim,inter_dim,E,topk",
-    [(1024, 512, 32, 4), (3072, 3072, 32, 4), (3072, 3072, 128, 4)],
-)
-def test_deterministic_mxfp8_interleaved_swiglu_bias(model_dim, inter_dim, E, topk):
-    """Gate/up-interleaved weights (gpt-oss in SGLang) run with MXFP8 activations;
-    the stage-1 bias stays in [gate.., up..] order."""
-    limit = 7.0
-    p = _problem(_M, model_dim, inter_dim, E, topk, interleaved=True)
-    out = _run(p, slice(None), ActivationType.Swiglu, True, swiglu_limit=limit)
-    assert not out.isnan().any().item(), "deterministic output contains NaN"
-    ref = _reference(
-        p, _M, model_dim, inter_dim, E, topk, ActivationType.Swiglu, swiglu_limit=limit
-    )
-    # The default also quantizes the activations to MXFP8 at this token count.
     default = _run(p, slice(None), ActivationType.Swiglu, False, swiglu_limit=limit)
     ld = _cos_diff(ref.float(), out.float())
     ld_default = _cos_diff(ref.float(), default.float())
@@ -234,11 +209,11 @@ def test_deterministic_rejects_unsupported():
     E = 32
     p = _problem(8, 1024, 512, E, 4, bias=False)
 
-    def call(interleaved=False, in_dtype=dtypes.bf16, **kw):
+    def call(interleaved=True, in_dtype=dtypes.bf16, **kw):
         args = {
             "activation": ActivationType.Swiglu,
             "deterministic": True,
-            "gate_mode": GateMode.SEPARATED.value,
+            "gate_mode": GateMode.INTERLEAVE.value,
         }
         args.update(kw)
         return fused_moe(
@@ -259,20 +234,18 @@ def test_deterministic_rejects_unsupported():
         call(activation=ActivationType.Situv2)
     with pytest.raises(NotImplementedError, match="activation dtype"):
         call(quant_dtype_a=dtypes.bf16)
+    with pytest.raises(NotImplementedError, match="MXFP8 only"):
+        call(quant_dtype_a=dtypes.fp4x2)
     with pytest.raises(NotImplementedError, match="output dtype"):
         call(in_dtype=dtypes.fp16)
-    with pytest.raises(NotImplementedError, match="interleaved"):
-        call(interleaved=True)
-    with pytest.raises(NotImplementedError, match="interleaved weights MXFP8"):
-        call(
-            interleaved=True,
-            gate_mode=GateMode.INTERLEAVE.value,
-            quant_dtype_a=dtypes.fp4x2,
-        )
+    with pytest.raises(NotImplementedError, match="gate/up-interleaved only"):
+        call(interleaved=False, gate_mode=GateMode.SEPARATED.value)
+    with pytest.raises(NotImplementedError, match="gate/up-interleaved only"):
+        call(interleaved=False)
     with pytest.raises(NotImplementedError, match="block_size_M"):
         call(block_size_M=128)
     with pytest.raises(NotImplementedError, match="stage-2 activation dtype"):
-        call(quant_dtype_a2=dtypes.fp8)
+        call(quant_dtype_a2=dtypes.fp4x2)
     with pytest.raises(NotImplementedError, match="hidden padding"):
         call(hidden_pad=256)
 
@@ -288,7 +261,7 @@ def test_deterministic_rejects_unsupported():
             w2_scale=q["w2_scale_s"],
             quant_type=QuantType.per_1x32,
             activation=ActivationType.Swiglu,
-            gate_mode=GateMode.SEPARATED.value,
+            gate_mode=GateMode.INTERLEAVE.value,
             deterministic=True,
         )
 
