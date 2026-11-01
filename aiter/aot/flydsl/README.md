@@ -2,16 +2,18 @@
 
 This directory holds the **AOT (Ahead-Of-Time) pre-compilation entry points** for
 FlyDSL kernels. Each module derives the runtime-reachable jobs from aiter's
-tuned CSV configs—including ABI/cache variants that share a kernel name—and
-compiles them up front so the runtime JIT path hits the cache.
+tuned CSV configs (and, for MoE, from the deployments in
+`moe_deployments.json`)—including ABI/cache variants that share a kernel
+name—and compiles them up front so the runtime JIT path hits the cache.
 
 | Module | OpKind | Description |
 | --- | --- | --- |
-| `moe.py` | `MOE` | Every FlyDSL kernel the tuned fused-MoE / FHMoE / gfx1250 grouped rows reach, by replaying `fused_moe` itself (see below) |
+| `moe.py` | `MOE` | Every FlyDSL kernel the tuned fused-MoE / FHMoE / gfx1250 grouped rows and the MoE deployments reach, by replaying `fused_moe` itself (see below) |
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
-| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
+| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 and A4W4 bundles of every MegaMoE deployment, by preloading `MegaMoEV2` itself (see below) |
+| `deployments.py` | — | Loads `moe_deployments.json`, the MoE models and deployments `moe.py`, `mega_moe.py` and `op_tests/test_moe_ep.py` derive each rank's call from (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
 | `mxfp4_moe.py` | — | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
@@ -55,9 +57,11 @@ need no AOT change.
 - Rows of the gfx1250 grouped table replay with the gate/up-interleaved
   weights and n32k4 scales gfx1250 callers pass; `_fused_moe_impl` hands them
   to FlyDSL's grouped GEMM. Grouped rows tuned for EP only (`topk` -1, or
-  `ep_fused`) are skipped: the runtime picks them only under a caller's expert
-  mask or MegaMoE's stage-2 scatter, and the table records neither the global
-  expert count nor the real topk.
+  `ep_fused`) are not replayed as rows: the runtime picks them only under a
+  caller's expert mask or MegaMoE's stage-2 scatter, and the table records
+  neither the global expert count nor the real topk. The EP deployments
+  below reach the `topk` -1 rows; MegaMoE's stage-2 scatter (`ep_fused`) is
+  not replayed.
 - Each row compiles for the arch its `gfx` column names. When `GPU_ARCHS`
   names targets, as `setup.py`'s wheel build has it, only rows of those archs
   are replayed; unset or `native`, rows of every arch are.
@@ -78,13 +82,126 @@ need no AOT change.
 - `--check` compiles nothing and fails on any kernel the replay would need but
   the cache lacks; it is the CPU-side counterpart of the step-2 test below.
 
+#### Deployments
+
+A caller behind an expert-parallel dispatch passes `fused_moe` an
+`expert_mask`, which brings in launches no tuned row reaches: the gfx950
+stage-2 reduction, compiled for the mask's length
+(`moe_reduction_..._m1e<len>`), and the gfx1250 route (`moe_g2l_lut`,
+`moe_route_g2l_lds`) and bf16 gather-reduce. The mask's length follows from
+the deployment, which no tuned row records, so these callers come from the
+`fused_moe` deployments of `moe_deployments.json` (see
+[MoE deployments](#moe-deployments)). A tensor-parallel caller passes no
+mask, but its call also depends on what tuned rows leave out: how it runs the
+shared expert (in the routed weights, apart, or through FHMoE). The file
+lists those deployments too.
+
+Each deployment replays at the smallest and largest M of every
+`get_padded_M` bucket up to `max_tokens`, bisected as for rows, with the
+caller's default gate/up layout, the model's `swiglu_limit`, and the SiTUv2
+betas a row would get plus the model's own. An EP
+deployment replays with its mask, with and without `num_local_tokens` (MORI
+dispatch passes it, the all-gather path does not). A deployment reads the
+tuned tables serving reads (`AITER_CONFIG_FMOE`, `AITER_CONFIG_GROUPED_FMOE`,
+`AITER_CONFIG_FHMOE`, or the merged defaults), so it needs no tuned row and
+picks one up where the table has it. The activation dtype is
+pinned to the deployment's quant recipe, as serving pins it: left to
+`fused_moe`, gfx950 takes bf16 activations at small M (at every M for SiTUv2),
+which expert masking refuses, and gfx1250 fp4 unless `AITER_FORCE_A8W4` is
+set. `--csv` or `--deployments` alone replays only what it names; with
+neither, both defaults are replayed.
+
+### MoE deployments
+
+`moe_deployments.json` lists the MoE models aiter serves and how each is
+deployed; `deployments.py` validates it and derives what each rank hands the
+runtime. `moe.py` replays its `fused_moe` deployments, `mega_moe.py` its
+`mega_moe` ones, and `op_tests/test_moe_ep.py -t aot_ep_profiles` checks the
+EP `fused_moe` ones on a GPU.
+
+A model, under `models`, records its architecture as its `config.json` gives
+it:
+
+| Field | Meaning |
+| --- | --- |
+| `name`, `source` | display name; where the numbers come from |
+| `model_dim`, `inter_dim` | `hidden_size`; `moe_intermediate_size`, unsplit |
+| `routed_experts`, `top_k` | routed experts; how many each token picks (`num_experts_per_tok`) |
+| `shared_experts` | shared experts, 0 if none |
+| `activation` | `Silu`, `Situv2` or `Swiglu` |
+| `swiglu_limit` | the activation clamp, if the model has one |
+| `situ_beta`, `situ_linear_beta` | the SiTUv2 betas: required for `Situv2` models, refused for others |
+| `note` | free text (JSON has no comments) |
+
+A deployment, under `fused_moe` or `mega_moe`, names a model and the knobs it
+is served with. `quant`, `ep`, `tp` and `redundant_experts` take one value or
+a list, and expand to every combination:
+
+| Field | Meaning |
+| --- | --- |
+| `model`, `gfx`, `cu_num` | the model; the GPU (`fused_moe`: gfx950 or gfx1250, `mega_moe`: MI355X, i.e. gfx950 with 256 CUs) |
+| `quant` | `a8w4` or `a4w4`: MXFP4 (per_1x32) weights with FP8 or FP4 activations |
+| `ep` | EP size (`fused_moe`: default 1, no EP), the world size for MegaMoE |
+| `tp` | `fused_moe` only: TP size of the experts, default 1. The experts split over TP or over EP, not both |
+| `redundant_experts` | EPLB redundant experts (ATOM's `num_redundant_experts`), default 0; EP only |
+| `shared_expert_mode` | `fused_moe` only: `separate` (default), `fused` into the rank's experts, or `fhmoe` (FHMoE runs the one shared expert from its own weights; TP only) |
+| `max_tokens` | `fused_moe` only: the largest M a rank passes |
+| `max_tokens_per_rank` | `mega_moe` only: MegaMoE's `max_tok_per_rank`, one value or a list |
+| `source`, `note` | where the deployment comes from; free text |
+
+ATOM and vLLM build a rank's call one way, and `deployments.py` follows it.
+With P the routed plus redundant experts, which must split evenly over EP, and
+S the shared experts the call runs (0 when `separate`), a `fused_moe` rank
+passes:
+
+- `w1.shape[0]` = P / EP + S experts, every routed expert under TP;
+- `topk_ids.shape[1]` = top-k, or top-k + S when the call runs shared experts,
+  plus, behind an EP dispatch, a sentinel column that masks them on the tokens
+  of other ranks (ATOM's `init_aiter_topK_meta_data`);
+- behind an EP dispatch, an `expert_mask` of P + S + 1 entries; under TP none;
+- an intermediate dim of `inter_dim` / TP, and the model's `hidden_size`;
+- with `fhmoe`, `shared_expert_id` = the routed expert count, the shared
+  expert's slot.
+
+For example DeepSeek-V4-Pro at EP8 with 64 EPLB redundant experts passes 56
+local experts, top-k 6 and a 449-entry mask; at TP8 through FHMoE it passes
+385 experts (the shared one at slot 384), top-k 7 and no mask, with an
+intermediate dim of 384. A MegaMoE rank holds P / EP experts.
+
+Each deployment gets an id, `{model}/{gfx}/{quant}/ep{N}[-r{redundant}][-fused]`
+or `{model}/{gfx}/{quant}/tp{N}[-fused|-fhmoe]`, for example
+`deepseek-v4-pro/gfx950/a8w4/ep8-r32`, which
+the replays log and `test_moe_ep.py --deployment-id` selects by. Files given
+together load together: their models merge, one id per definition, and a file
+of your own may name the default file's models without repeating them.
+Unknown or missing fields, experts that do not split over EP or an
+intermediate dim that does not split over TP, TP and EP together, redundant
+experts without EP, fusing a model without shared experts, FHMoE with EP or
+with more than one shared expert, a `mega_moe` GPU other than MI355X, or an id
+listed twice fail the load.
+
+To add a deployment:
+
+1. add its model under `models` if it is new, from the model's `config.json`;
+2. add the deployment with its `source`;
+3. check what it expands to: `python -m aiter.aot.flydsl.deployments`;
+4. build it (`python -m aiter.aot.flydsl.moe --deployments ...` or
+   `python -m aiter.aot.flydsl.mega_moe --deployments ...`) and, for an EP
+   `fused_moe` deployment, run `op_tests/test_moe_ep.py -t aot_ep_profiles`
+   on its GPU (see section 2);
+5. to see which of the model's tuned rows still compile only because of the
+   tuned tables, build the default deployments alone into an empty cache and
+   run `python -m aiter.aot.flydsl.moe --check` against it: each `[FAIL]` is a
+   tuned-row job no deployment builds.
+
 ### How `mega_moe.py` works
 
 `mega_moe.py` does not restate MegaMoE's kernel selection either. For each rank
-of each deployment profile it builds the runtime's own `MegaMoEV2` inside
-`dry_run`, with FakeTensor expert weights, and calls `preload_aot_bundles()`:
-the method serving uses to load every Stage1/prepare, Stage2 and combine
-variant of the profile's bundle plan.
+of each `mega_moe` deployment, at each of its max tokens per rank, it builds
+the runtime's own `MegaMoEV2` inside `dry_run`, with FakeTensor expert
+weights, and calls `preload_aot_bundles()`: the method serving uses to load
+every Stage1/prepare, Stage2 and combine variant of the deployment's bundle
+plan.
 
 - mori shmem, through which `MegaMoEV2` allocates its symmetric buffers and
   exchanges peer pointers, hands out FakeTensors and fake addresses, so no GPU,
@@ -136,10 +253,10 @@ python -m aiter.aot.flydsl.conv
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
 
-# MegaMoE profile bundles (all token buckets and all eight ranks)
+# MegaMoE bundles of every MegaMoE deployment (all token capacities, all ranks)
 python -m aiter.aot.flydsl.mega_moe
 
-# Restrict the deployment profiles when building a smaller custom image.
+# Only some deployments, when building a smaller custom image
 python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
 ```
 
@@ -167,10 +284,11 @@ GPU_ARCHS=gfx950 python -c "import aiter"
 GPU_ARCHS=gfx1250 python -m aiter.aot.flydsl.moe
 ```
 
-MegaMoE defaults to every profile the service ships: DeepSeek-V4-Pro r0/r32/r64
-(`experts_per_rank=48/52/56`) and Kimi-K3 (`experts_per_rank=112`). The expert
-count is part of the compiled ABI, so one profile cannot safely reuse another
-profile's bundle.
+MegaMoE builds every `mega_moe` deployment of `moe_deployments.json`:
+DeepSeek-V4-Pro r0/r32/r64 (`experts_per_rank` 48/52/56) and Kimi-K3 (112).
+The expert count is part of the compiled ABI, so one deployment cannot safely
+reuse another's bundle. `--mtpr`, `--quant` and `--experts-per-rank` narrow
+the deployments down; `--deployments` takes files of your own.
 
 ### Common arguments
 
@@ -181,6 +299,12 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 
 # MoE: verify an existing cache on CPU instead of compiling
 python -m aiter.aot.flydsl.moe --csv /path/to/config.csv --check
+
+# MoE: only the deployments (default file or your own)
+python -m aiter.aot.flydsl.moe --deployments aiter/aot/flydsl/moe_deployments.json
+
+# Validate deployment files and list what they expand to
+python -m aiter.aot.flydsl.deployments
 ```
 
 ### MXFP4 activation and stage2 settings
@@ -259,10 +383,22 @@ selection is fully automatic.
 ## 2. Run the "AOT cache hit" test
 
 Compiling successfully is not enough — you also want to verify that the **runtime
-actually hits the AOT cache** (no cache miss). That is done by
-`op_tests/test_moe_2stage.py`, which wraps test cases with
-`aiter.aot.flydsl.common.fail_on_aot_cache_miss`: if the runtime falls back to
-JIT compilation, the case fails.
+actually hits the AOT cache** (no cache miss). The MoE tests do that by running
+cases in FlyDSL run-only mode (`aiter.aot.flydsl.common.run_only_env`,
+`FLYDSL_RUNTIME_RUN_ONLY=1`): a kernel missing from the cache raises instead of
+compiling, and the case fails.
+
+- `op_tests/test_moe_2stage.py` runs every FlyDSL row of the tuned tables
+  (cases with `check_aot_cache=True`).
+- `op_tests/test_moe_ep.py -t aot_ep_profiles` runs every EP `fused_moe`
+  deployment of this GPU's arch through the expert-parallel `fused_moe` call
+  (MXFP4 a8w4 / a4w4, Silu / SiTUv2), at each `-m` token count up to the
+  deployment's `max_tokens`. `--deployments` points it at other files,
+  `--deployment-id <glob>` picks deployments by id, `--ep-mode fake` routes
+  every token locally. A `--deployments` or `--deployment-id` that selects no
+  case on this GPU fails; with neither, a GPU no default deployment targets is
+  skipped. It runs first among the test's defaults, before the other tests
+  JIT-compile in the same process.
 
 Full flow:
 
@@ -272,22 +408,24 @@ source /path/to/venv/bin/activate
 # (1) First compile the kernels into the cache
 python -m aiter.aot.flydsl.moe
 
-# (2) Then run the MoE 2stage test with cache checking.
-#     When a case has check_aot_cache=True it routes through
-#     test_fmoe_with_aot_cache_check, which raises AssertionError on a cache miss.
+# (2) Then run the tests with cache checking.
 python op_tests/test_moe_2stage.py
+python op_tests/test_moe_ep.py -t aot_ep_profiles -m 16 128 1024 8192
 ```
 
 > Note: both steps must use the **same** `FLYDSL_RUNTIME_CACHE_DIR` and run on
 > (or target) the **same GPU arch**, otherwise step 2 will be treated as a miss
-> because the cache dir / arch don't line up.
+> because the cache dir / arch don't line up. Deployments replay against
+> the tuned tables the environment selects, so keep `AITER_CONFIG_FMOE` /
+> `AITER_CONFIG_GROUPED_FMOE` the same in both steps too.
 
 ---
 
 ## 3. Troubleshooting
 
-- **`CSV file not found`**: check the `--csv` path, or whether `AITER_CONFIGS`
-  points at a valid config directory.
+- **`CSV file not found` / `file not found`**: check the `--csv` (or, for MoE,
+  `--deployments`) path, or whether `AITER_CONFIGS` points at a valid config
+  directory.
 - **Lots of `[FAIL]` prints + exit code 1**: an individual kernel failed to
   compile; stdout has per-kernel diagnostics. The exception message inlines at
   most 10 entries (`_MAX_ERRORS_IN_MSG` in `common.py`), the rest are elided as
