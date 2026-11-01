@@ -14,6 +14,7 @@ import torch
 
 from aiter import per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.test_common import checkAllclose
 
 
 @pytest.fixture
@@ -474,7 +475,53 @@ _COMMON_CASES = [
         },
     ),
 ]
+_WAVE_TILE_CASES = [
+    # Two/three tiles used to exchange softmax and P between waves. These
+    # cases pin the wave-private path, including its unused query tiles.
+    (
+        "mtp2-g16-page128-wave-direct",
+        {
+            "query_length": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "pattern": "varied",
+            "capture": True,
+            "wave_tiles": True,
+        },
+    ),
+    (
+        "mtp3-g16-page128-wave-cluster",
+        {
+            "query_length": 3,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 4,
+            "cluster": 4,
+            "pattern": "varied",
+            "capture": True,
+            "wave_tiles": True,
+        },
+    ),
+    (
+        "mtp5-g8-page128-wave-merge",
+        {
+            "query_length": 5,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 4100),
+            "max_partitions": 4,
+            "budget": 1,
+            "pattern": "varied",
+            "capture": True,
+            "wave_tiles": True,
+        },
+    ),
+]
+
+
 _FP8_CASES = _COMMON_CASES + [
+    *_WAVE_TILE_CASES,
     (
         "packed-mtp4",
         {
@@ -561,6 +608,7 @@ _FP8_CASES = _COMMON_CASES + [
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *_WAVE_TILE_CASES,
     (
         "mtp",
         {
@@ -798,7 +846,7 @@ _INVALID_CASES = [
 
 def _check_output(output, reference):
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    assert checkAllclose(output.float(), reference.float(), atol=5e-3, rtol=5e-3) == 0
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
@@ -865,6 +913,23 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
+    if case["wave_tiles"] and arch == "gfx1250":
+        from aiter.ops.flydsl.kernels.pa_decode.traits import Gfx1250Traits
+
+        kwargs = compile_kwargs[-1]
+        traits = Gfx1250Traits(
+            head_dim=kwargs["head_dim"],
+            query_group_size=kwargs["query_group_size"],
+            block_size=kwargs["block_size"],
+            softmax_scale=kwargs["softmax_scale"],
+            query_dtype=kwargs["query_dtype"],
+            per_token_kv=kwargs["per_token_kv"],
+            query_length=kwargs["query_length"],
+            trans_v=kwargs["trans_v"],
+            sliding_window=kwargs["sliding_window"],
+            compute_dtype=kwargs["kv_dtype"],
+        )
+        assert traits.bf16_wave_query_tiles if traits.bf16 else traits.wave_query_tiles
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
@@ -940,6 +1005,7 @@ def test_pa_decode(case, device, monkeypatch):
             "pipe": False,
             "staged": None,
             "cluster": None,
+            "wave_tiles": False,
         },
         **case,
     )
