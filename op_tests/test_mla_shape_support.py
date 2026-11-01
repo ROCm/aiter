@@ -436,8 +436,17 @@ def test_metadata_info_sizes_96_heads_for_both_plans():
 
 
 def _run_decode(
-    n, msq, d, lse, bs=2, persistent=True, v_head_dim=KV_LORA_RANK, cp_rank=None
+    n,
+    msq,
+    d,
+    lse,
+    bs=2,
+    persistent=True,
+    v_head_dim=KV_LORA_RANK,
+    cp_rank=None,
+    plan_cprr=None,
 ):
+    # plan_cprr plans the metadata for round-robin CP or not; None follows cp_rank.
     qd = _dtype(d)
     qo, kv_indptr, last = _indptrs(bs, msq, cp_rank)
     total_q, total_kv = bs * msq, int(kv_indptr[-1].item())
@@ -452,7 +461,8 @@ def _run_decode(
         kw["kv_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
     o = torch.empty(total_q, n, v_head_dim, dtype=torch.bfloat16, device="cuda")
     if persistent:
-        _, _, meta = _run_planner(bs, msq, n, qd, qd, cp_rank)
+        plan_rank = cp_rank if plan_cprr is None else (0 if plan_cprr else None)
+        _, _, meta = _run_planner(bs, msq, n, qd, qd, plan_rank)
         names = ("work_meta_data", "work_info_set", "work_indptr")
         names += ("reduce_indptr", "reduce_final_map", "reduce_partial_map")
         kw.update(zip(names, meta))
@@ -514,6 +524,17 @@ def test_native_96_head_fp8_cprr_decode_matches_reference():
         ).item()
         lse_err = (lse.view_as(ref_lse).float() - ref_lse).abs().max().item()
         assert err < 0.1 and cos > 0.999 and lse_err < 0.05, (msq, err, cos, lse_err)
+
+
+@requires_gpu
+def test_decode_rejects_metadata_planned_for_the_other_cp_mode():
+    # 96 fp8 heads at qlen 8 run natively under round-robin CP and folded without
+    # it, so metadata planned for one mode would drive the other layout silently.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
+    for cp_rank, plan_cprr in ((0, False), (None, True)):
+        with pytest.raises(ValueError, match="is_cp_round_robin"):
+            _run_decode(96, 8, "fp8", True, cp_rank=cp_rank, plan_cprr=plan_cprr)
 
 
 @requires_gpu

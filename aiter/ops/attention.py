@@ -2470,7 +2470,8 @@ def _get_mla_metadata_v1_impl(
         intra_batch_mode: Fake non-persistent mode; same split count per batch (default False).
         is_cp_round_robin: Context-parallel round-robin work assignment (default False).
             Must be True exactly when mla_decode_fwd gets g_kv_indptr: 96 fp8 heads at
-            qlen 7 and 8 are planned natively with it and folded without it.
+            qlen 7 and 8 are planned natively with it and folded without it, and
+            mla_decode_fwd raises ValueError where the two disagree on the plan.
         mla_version: MLA kernel version (default V32).
         dtype_q_nope / dtype_kv_nope: Q/KV NoPE dtypes. None -> bf16 (C++ default).
         dtype_q_rope / dtype_kv_rope: Q/KV RoPE dtypes. None -> the matching NoPE dtype.
@@ -2555,7 +2556,7 @@ def get_mla_metadata_v1(
     def _dtype_id(d):
         return _aiter_dtype_id(d) if d is not None else None
 
-    return _get_mla_metadata_v1_impl(
+    _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,
         seqlens_kv_indptr,
         kv_last_page_lens,
@@ -2583,6 +2584,9 @@ def get_mla_metadata_v1(
         dtype_kv_nope=_dtype_id(dtype_kv_nope),
         dtype_kv_rope=_dtype_id(dtype_kv_rope),
     )
+    # mla_decode_fwd checks its launch against this: for some shapes the head
+    # plan, folded or native, depends on round-robin CP.
+    work_metadata_ptrs._aiter_planned_cp_round_robin = bool(is_cp_round_robin)
 
 
 @compile_ops("module_mla_reduce", develop=True)
