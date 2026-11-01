@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_num_xcds
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
@@ -372,6 +372,7 @@ def flydsl_preshuffle_gemm_a8(
         waves_per_eu=wpe,
         enable_scheduler=bool(enable_scheduler),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=get_num_xcds(),
         lds_stage=int(lds_stage),
         split_k=int(split_k),
     )
