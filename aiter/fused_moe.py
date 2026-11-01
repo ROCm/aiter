@@ -1717,6 +1717,23 @@ def _fused_moe_impl(
             f"FHMoE block_size_M={block_size_M} does not match the selected "
             f"kernel block size {metadata.block_m}"
         )
+    # a16w16 tiles size moe_sorting and both gemms. A caller block_size_M that
+    # disagrees used to let stage1 run on the wrong layout; stage2 then raised
+    # FlyDSL stage2 sorting layout mismatch. Reject here, same as FHMoE.
+    # Not a general FlyDSL rule: some a16w4 names advertise sort_block_m !=
+    # tile_m via _sbm. a16w16 has no such suffix, so tile_m is the sort size.
+    _a16w16_kn1 = str(
+        getattr(metadata.stage1, "keywords", {}).get("kernelName", "") or ""
+    )
+    if (
+        _a16w16_kn1.startswith("flydsl_moe1_abf16_wbf16_")
+        and block_size_M is not None
+        and int(block_size_M) != int(metadata.block_m)
+    ):
+        raise ValueError(
+            f"a16w16 block_size_M={block_size_M} does not match kernel tile "
+            f"{metadata.block_m}; moe_sorting and both gemm tiles share this size"
+        )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
@@ -3401,11 +3418,14 @@ def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
 
 
 def _swiglu_limit_is_active(swiglu_limit) -> bool:
-    """True only for a finite positive clamp bound.
+    """True only when the caller asked for a finite positive clamp bound.
 
-    ``None``, ``0.0``, and ``+inf`` are not active. That matches
-    ``runtime_swiglu_limit`` and vLLM's ROCm adapter, which forwards ``0.0``
-    when the config limit is unset.
+    ``None``, ``0.0``, and ``+inf`` are dispatch sentinels: vLLM's ROCm adapter
+    sends ``0.0`` when the config limit is unset, and those calls must stay on
+    CK. This is not kernel clamp encoding. Once a call is on a16wmix,
+    ``runtime_swiglu_limit`` maps a SwiGLU ``None``/``0.0`` to 7.0 (only ``+inf``
+    turns that clamp off). Rerouting those sentinels would start clamping
+    existing SwiGLU callers at 7, so they must not count as active here.
     """
     if swiglu_limit is None:
         return False
@@ -3416,22 +3436,19 @@ def _swiglu_limit_is_active(swiglu_limit) -> bool:
     return math.isfinite(value) and value > 0.0
 
 
-def _force_a16wmix_bf16() -> bool:
-    """Debug override: select a16w16 even when the limit is a no-clamp sentinel.
-
-    Used to time the same kernel with and without a binding clamp. Not a
-    production switch — sentinels otherwise keep the pre-patch CK / 1-stage path.
-    """
-    return os.environ.get("AITER_FORCE_A16WMIX_BF16", "0") == "1"
-
-
 # a16wmix gemm1 clamps SwiGLU natively and SiLU via clamp_gate_up then
 # silu_mul_batch (the shared helper stays unclamped for mixed_moe).
 _A16WMIX_BF16_ACTIVATIONS = (ActivationType.Silu, ActivationType.Swiglu)
+# The port's only arch split is gfx942 vs everything else (gfx950 16x16x32
+# MFMA, buffer_atomic_pk_add_bf16). gfx90a compiles with
+# "s_waitcnt is not supported on target arch 'gfx90a'". Same CDNA pair as the
+# a16w4 FlyDSL guard below.
+_A16WMIX_BF16_ARCHS = ("gfx942", "gfx950")
 
 
 def _can_reroute_bf16_to_a16wmix(
     *,
+    gfx,
     model_dim,
     inter_dim,
     dtype,
@@ -3449,10 +3466,15 @@ def _can_reroute_bf16_to_a16wmix(
 ):
     """Whether untuned/CK BF16 QuantType.No can take the a16wmix a16w16 port.
 
-    Inactive sentinels (None / 0.0 / +inf) keep the pre-patch CK / 1-stage path
-    so those outputs stay bit-identical, unless ``AITER_FORCE_A16WMIX_BF16=1``.
-    Weights must be preshuffled; a16wmix consumes shuffle_weight (16,16).
+    Not a default-path swap: ``None`` / ``0.0`` / ``+inf`` stay on CK, so
+    existing callers stay bit-identical. The finite limit is the gate; there is
+    no ``AITER_*`` override. Weights must be preshuffled; a16wmix consumes
+    shuffle_weight (16,16). ``gfx`` is the live device from
+    ``get_gfx_runtime()``.
     """
+    # gfx90a and RDNA must not fall through to the gfx950 compile path.
+    if gfx not in _A16WMIX_BF16_ARCHS:
+        return False
     if not (
         dtype == dtypes.bf16
         and q_type == QuantType.No
@@ -3469,8 +3491,6 @@ def _can_reroute_bf16_to_a16wmix(
         and inter_dim % 128 == 0
     ):
         return False
-    if _force_a16wmix_bf16():
-        return True
     return _swiglu_limit_is_active(swiglu_limit)
 
 
@@ -4094,6 +4114,7 @@ def get_2stage_cfgs(
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
     reroute_a16wmix_bf16 = _can_reroute_bf16_to_a16wmix(
+        gfx=gfx,
         model_dim=model_dim,
         inter_dim=inter_dim,
         dtype=dtype,
@@ -4139,10 +4160,12 @@ def get_2stage_cfgs(
 
     if reroute_a16wmix_bf16:
         # Untuned a16w16 fallback (and override of a CK/asm tuned row) when a
-        # finite swiglu_limit is configured, or when AITER_FORCE_A16WMIX_BF16=1.
-        # Tiles belong in the CSV; this is the shape-safe default until a tuner
-        # row exists. block_m MUST equal tile_m -- it sizes both moe_sorting
-        # and the gemm tile.
+        # finite swiglu_limit is configured. Tiles belong in the CSV; this is
+        # the shape-safe default until a tuner row exists. block_m MUST equal
+        # tile_m -- it sizes both moe_sorting and the gemm tile. A caller
+        # block_size_M that disagrees is rejected in _fused_moe_impl, because
+        # the only other check (FHMoE) does not cover this path and stage1
+        # would otherwise run on the mismatched layout.
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         _out_str = "bf16"
@@ -4153,8 +4176,11 @@ def get_2stage_cfgs(
             2, "bf16", "bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
         )
         logger.warning(
-            f"[fused_moe] no FlyDSL a16w16 config for {keys}, "
-            f"using untuned fallback ({kn1=}, {kn2=})"
+            "[fused_moe] no FlyDSL a16w16 config for %s, "
+            "using untuned fallback (kn1=%s, kn2=%s)",
+            keys,
+            kn1,
+            kn2,
         )
         return MOEMetadata(
             functools.partial(

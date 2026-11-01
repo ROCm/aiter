@@ -3,8 +3,7 @@
 
 """a16wmix BF16×BF16 must honour swiglu_limit for SiLU and SwiGLU.
 
-Dispatch tests do not need a GPU. Bind / asymmetry / force-override launches
-need ROCm.
+Dispatch tests do not need a GPU. Bind / asymmetry launches need ROCm.
 """
 
 from __future__ import annotations
@@ -37,7 +36,9 @@ pytestmark_gpu = pytest.mark.skipif(
 
 @pytest.fixture
 def gfx942(monkeypatch):
+    # get_2stage_cfgs keys and the a16w16 predicate both use get_gfx_runtime.
     monkeypatch.setattr("aiter.fused_moe.get_gfx", lambda: "gfx942")
+    monkeypatch.setattr("aiter.fused_moe.get_gfx_runtime", lambda: "gfx942")
 
 
 def _arch():
@@ -77,6 +78,7 @@ def _a16w16_cfg_kwargs(
 
 def _reroute_base(**overrides):
     base = {
+        "gfx": "gfx942",
         "model_dim": 256,
         "inter_dim": 128,
         "dtype": dtypes.bf16,
@@ -193,7 +195,11 @@ def _bind_inputs(tokens, *, seed=0, limit=1.0, negative_gate=False):
 
 
 def test_a16w16_kernel_names_are_registered():
-    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+    from aiter.ops.flydsl.moe_kernels import (
+        get_flydsl_kernel_params,
+        get_flydsl_stage1_kernels_a16w16,
+        get_flydsl_stage2_kernels_a16w16,
+    )
 
     p1 = get_flydsl_kernel_params(_A16W16_S1)
     p2 = get_flydsl_kernel_params(_A16W16_S2)
@@ -202,6 +208,10 @@ def test_a16w16_kernel_names_are_registered():
     assert p1["a_dtype"] == "bf16" and p1["b_dtype"] == "bf16"
     assert p1["tile_m"] == 16 and p1["tile_n"] == 128 and p1["tile_k"] == 128
     assert p2["mode"] == "atomic"
+    # Port has no f16 output; f16 names would alias the bf16 kernel.
+    assert get_flydsl_kernel_params("flydsl_moe1_abf16_wbf16_f16_t16x128x128") is None
+    assert get_flydsl_stage1_kernels_a16w16("f16") == {}
+    assert get_flydsl_stage2_kernels_a16w16("f16") == {}
 
 
 def test_a16w16_force_reduce_stays_atomic(monkeypatch):
@@ -245,14 +255,9 @@ def test_can_reroute_requires_finite_limit_and_shuffle(activation):
     assert not _can_reroute_bf16_to_a16wmix(**{**base, "swiglu_limit": float("inf")})
     assert not _can_reroute_bf16_to_a16wmix(**{**base, "is_shuffled": False})
     assert not _can_reroute_bf16_to_a16wmix(**{**base, "use_g1u1": False})
-
-
-def test_can_reroute_force_env_ignores_sentinel(monkeypatch):
-    monkeypatch.setenv("AITER_FORCE_A16WMIX_BF16", "1")
-    base = _reroute_base(swiglu_limit=None, activation=ActivationType.Silu)
-    assert _can_reroute_bf16_to_a16wmix(**base)
-    monkeypatch.setenv("AITER_FORCE_A16WMIX_BF16", "0")
-    assert not _can_reroute_bf16_to_a16wmix(**base)
+    assert not _can_reroute_bf16_to_a16wmix(**{**base, "gfx": "gfx90a"})
+    assert not _can_reroute_bf16_to_a16wmix(**{**base, "gfx": "gfx1100"})
+    assert _can_reroute_bf16_to_a16wmix(**{**base, "gfx": "gfx950"})
 
 
 @pytest.mark.parametrize(
@@ -291,21 +296,29 @@ def test_sentinels_do_not_select_a16wmix(gfx942, monkeypatch, limit, activation)
         get_2stage_cfgs.cache_clear()
 
 
-def test_force_env_selects_a16wmix_with_sentinel(gfx942, monkeypatch):
+def test_gfx90a_limit_stays_on_ck(monkeypatch):
+    """The port's non-gfx942 path is gfx950 MFMA; gfx90a must not take it."""
+    monkeypatch.setattr("aiter.fused_moe.get_gfx", lambda: "gfx90a")
+    monkeypatch.setattr("aiter.fused_moe.get_gfx_runtime", lambda: "gfx90a")
     monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
-    monkeypatch.setenv("AITER_FORCE_A16WMIX_BF16", "1")
     get_2stage_cfgs.cache_clear()
     try:
-        metadata = get_2stage_cfgs(
-            **_a16w16_cfg_kwargs(limit=None, activation=ActivationType.Silu)
-        )
+        metadata = get_2stage_cfgs(**_a16w16_cfg_kwargs())
         stage1 = getattr(metadata.stage1, "func", metadata.stage1)
-        assert stage1 is _flydsl_stage1_wrapper
-        assert metadata.stage1.keywords["kernelName"].startswith(
-            "flydsl_moe1_abf16_wbf16_"
-        )
+        assert stage1 is ck_moe_stage1, stage1
     finally:
         get_2stage_cfgs.cache_clear()
+
+
+def test_aot_caller_inputs_has_a16w16_recipe():
+    """PREBUILD_KERNELS=1 replays every flydsl_ CSV row; QuantType.No must not raise."""
+    from aiter.aot.flydsl import moe as aot_moe
+
+    src = inspect.getsource(aot_moe._caller_inputs)
+    assert "QuantType.No" in src
+    assert "get_flydsl_stage1_kernels_a16w16" in src
+    assert "_can_reroute_bf16_to_a16wmix" in src
+    assert "_swiglu_limit_is_active" in src
 
 
 def test_unshuffled_does_not_select_a16wmix(gfx942, monkeypatch):
@@ -315,6 +328,20 @@ def test_unshuffled_does_not_select_a16wmix(gfx942, monkeypatch):
         metadata = get_2stage_cfgs(**_a16w16_cfg_kwargs(shuffled=False))
         stage1 = getattr(metadata.stage1, "func", metadata.stage1)
         assert stage1 is not _flydsl_stage1_wrapper
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+
+def test_untuned_fallback_tile_follows_token_count(gfx942, monkeypatch):
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
+    get_2stage_cfgs.cache_clear()
+    try:
+        md16 = get_2stage_cfgs(**_a16w16_cfg_kwargs(token=4))
+        md32 = get_2stage_cfgs(**_a16w16_cfg_kwargs(token=2048))
+        assert md16.block_m == 16
+        assert "t16x" in md16.stage1.keywords["kernelName"]
+        assert md32.block_m == 32
+        assert "t32x" in md32.stage1.keywords["kernelName"]
     finally:
         get_2stage_cfgs.cache_clear()
 
@@ -369,6 +396,39 @@ def test_a16wmix_bf16_clamp_binds(monkeypatch, tokens, activation, act_name):
 
 
 @pytestmark_gpu
+def test_a16w16_rejects_mismatched_block_size_m(monkeypatch):
+    """Caller block_size_M=32 with a t16 kernel must fail at the host, not in stage2."""
+    arch = _arch()
+    if arch not in ("gfx942", "gfx950"):
+        pytest.skip(f"a16wmix a16w16 not asserted on {arch}")
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
+    tokens = 4
+    x, w1, w2, weights, ids = _bind_inputs(tokens, limit=1.0)
+    get_2stage_cfgs.cache_clear()
+    try:
+        metadata = get_2stage_cfgs(
+            **_a16w16_cfg_kwargs(
+                token=tokens, limit=1.0, activation=ActivationType.Silu
+            )
+        )
+        assert metadata.block_m == 16
+        with pytest.raises(ValueError, match="block_size_M"):
+            fused_moe(
+                x,
+                shuffle_weight(w1),
+                shuffle_weight(w2),
+                weights,
+                ids,
+                activation=ActivationType.Silu,
+                quant_type=QuantType.No,
+                swiglu_limit=1.0,
+                block_size_M=32,
+            )
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+
+@pytestmark_gpu
 def test_a16wmix_silu_asymmetric_clamp_leaves_negative_gate(monkeypatch):
     """gate.clamp(max=L) must NOT floor large negative gates at -L."""
     arch = _arch()
@@ -396,43 +456,6 @@ def test_a16wmix_silu_asymmetric_clamp_leaves_negative_gate(monkeypatch):
     print(stats)
     assert err_as < err_sy, stats
     assert err_sy > 1.0, stats + " symmetric ref did not diverge; case is too weak"
-
-
-@pytestmark_gpu
-def test_force_env_same_kernel_with_and_without_limit(monkeypatch):
-    """P1 isolation: force a16wmix even when the sentinel would skip it."""
-    arch = _arch()
-    if arch not in ("gfx942", "gfx950"):
-        pytest.skip(f"not asserted on {arch}")
-    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
-    monkeypatch.setenv("AITER_FORCE_A16WMIX_BF16", "1")
-    tokens = 4
-    x, w1, w2, weights, ids = _bind_inputs(tokens, limit=1.0)
-    get_2stage_cfgs.cache_clear()
-    try:
-        md_none = get_2stage_cfgs(
-            **_a16w16_cfg_kwargs(
-                token=tokens, limit=None, activation=ActivationType.Silu
-            )
-        )
-        md_lim = get_2stage_cfgs(
-            **_a16w16_cfg_kwargs(
-                token=tokens, limit=1.0, activation=ActivationType.Silu
-            )
-        )
-    finally:
-        get_2stage_cfgs.cache_clear()
-    kn_none = md_none.stage1.keywords["kernelName"]
-    kn_lim = md_lim.stage1.keywords["kernelName"]
-    assert kn_none == kn_lim, (kn_none, kn_lim)
-    assert kn_none.startswith("flydsl_moe1_abf16_wbf16_")
-    out_none = _run_fused(
-        x, w1, w2, weights, ids, limit=None, activation=ActivationType.Silu
-    )
-    out_lim = _run_fused(
-        x, w1, w2, weights, ids, limit=1.0, activation=ActivationType.Silu
-    )
-    assert not torch.equal(out_none, out_lim), "force-path limit=None vs 1.0 identical"
 
 
 # Per-rank Command A shape the clamped server ran: H=4096, I=512, E=128, top-8.

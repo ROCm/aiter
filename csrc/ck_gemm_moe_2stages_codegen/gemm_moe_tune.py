@@ -3745,6 +3745,8 @@ class FmoeTuner(TunerCommon):
 
         # a16w16: bf16 A x bf16 W on the a16w-mix port, the kernel the runtime
         # selects for BF16 QuantType.No when swiglu_limit is active.
+        # Arch list matches fused_moe._A16WMIX_BF16_ARCHS: the port's
+        # non-gfx942 path is gfx950 MFMA; gfx90a does not compile.
         is_a16w16 = (
             q_type == QuantType.No
             and dtype == dtypes.bf16
@@ -3752,6 +3754,7 @@ class FmoeTuner(TunerCommon):
             and q_dtype_w == dtypes.bf16
             and act_type in (ActivationType.Silu, ActivationType.Swiglu)
             and not doweight_stage1
+            and str(_gfx) in ("gfx942", "gfx950")
         )
         if not is_a16w16 and (
             q_type != QuantType.per_1x32 or q_dtype_w not in (dtypes.fp4x2, dtypes.fp8)
@@ -3774,6 +3777,10 @@ class FmoeTuner(TunerCommon):
 
         if is_a16w16:
             b_dtype_str = "bf16"
+            # The a16w-mix port has no f16 output. AOT replay
+            # (aiter.aot.flydsl.moe._caller_inputs) only has a QuantType.No
+            # bf16×bf16 recipe; f16 names would break PREBUILD_KERNELS=1.
+            out_dtype_str = "bf16"
             # The runtime wrapper passes waves_per_eu=None for registry entries
             # without the key; run_flydsl_stage1_out would otherwise time wpe=3.
             flydsl_s1_kernels = {

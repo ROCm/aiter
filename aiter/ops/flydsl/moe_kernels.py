@@ -632,7 +632,14 @@ def get_flydsl_stage1_kernels_a16w16(out_dtype: str) -> dict[str, dict]:
 
     Same tile / k_wave constraints as a16wi4: the shared a16w-mix port has no
     grid split-K. Names look like ``flydsl_moe1_abf16_wbf16_bf16_t32x128x128``.
+
+    The port writes ``T.bf16`` (stage1 intermediate and gemm2 pointer). An
+    ``f16`` name would compile the same kernel and store bf16 bits into an
+    fp16 buffer, so only ``out_dtype=="bf16"`` emits names. Tuner and AOT
+    replay (``aiter.aot.flydsl.moe._caller_inputs``) use these bf16 names.
     """
+    if out_dtype != "bf16":
+        return {}
     kernels = {}
     a_dtype = "bf16"
     b_dtype = "bf16"
@@ -680,7 +687,10 @@ def get_flydsl_stage2_kernels_a16w16(out_dtype: str) -> dict[str, dict]:
     """Return {kernelName: params} for a16w16 (bf16 A x bf16 W) stage2 configs.
 
     Names look like ``flydsl_moe2_abf16_wbf16_bf16_t32x128x128_atomic``.
+    ``f16`` is rejected: gemm2 stores through a ``T.bf16`` pointer.
     """
+    if out_dtype != "bf16":
+        return {}
     kernels = {}
     a_dtype = "bf16"
     b_dtype = "bf16"
@@ -729,10 +739,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
-    # a16w16 (bf16 A x bf16 W) on the shared a16w-mix port
-    for out in ("bf16", "f16"):
-        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_a16w16(out))
-        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_a16w16(out))
+    # a16w16: bf16 output only. Do not copy the a16w4/a16wi4 f16 loop —
+    # compile_flydsl_moe_stage{1,2} never pass out_dtype into the a16w-mix port.
+    _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_a16w16("bf16"))
+    _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_a16w16("bf16"))
 
 
 _register_all_configs()
