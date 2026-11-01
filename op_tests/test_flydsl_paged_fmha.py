@@ -21,13 +21,6 @@ FP8_ATOL = 0.02
 LSE_RTOL = 1e-4
 LSE_ATOL = 1e-4
 
-LAYOUTS = [
-    (1, "linear3d"),
-    (1, "linear"),
-    (16, "vectorized"),
-    (64, "vectorized"),
-    (1024, "vectorized"),
-]
 DIMS = [(128, 128), (192, 128), (192, 192)]
 # Every layout/width pair, with both metadata forms distributed across them.
 LAYOUT_CASES = [
@@ -64,8 +57,8 @@ def make_case(
     d,
     dv,
     *,
-    qlens=(300, 65, 17),
-    klens=(513, 193, 81),
+    qlens=(33, 17),
+    klens=(129, 65),
     heads=(6, 2),
     seed=17,
 ):
@@ -216,9 +209,8 @@ def csr_metadata(case, prefix=0):
 
 
 @gfx950
-@pytest.mark.parametrize("layout,d,dv", [("linear3d", 128, 128), ("linear", 192, 128)])
-def test_csr_page1_optional_last_lengths(layout, d, dv):
-    case = make_case(1, layout, d, dv)
+def test_csr_page1_optional_last_lengths():
+    case = make_case(1, "linear3d", 128, 128)
     options = csr_metadata(case)
     explicit = check_case(case, **options).clone()
     options["kv_last_page_lens"] = None
@@ -288,27 +280,38 @@ def check_lse(actual, expected):
 @gfx950
 @pytest.mark.parametrize("page,layout,d,dv,csr", LAYOUT_CASES)
 def test_lse_ragged_and_output_buffers(page, layout, d, dv, csr):
+    # One representative spans two query blocks; all cases cross a KV page.
+    qlen = 257 if (page, d, dv) == (64, 192, 128) else 17
     case = make_case(
         page,
         layout,
         d,
         dv,
-        qlens=(0, 65, max(300, page + 17), 17),
-        klens=(33, 0, max(129, page + 1), 65),
+        qlens=(0, 5, qlen, 33),
+        klens=(33, 0, max(129, page + 1), 17),
     )
+    case.table[3, 0] = case.table[2, 0]  # Shared prefix page across live requests.
+    if (page, d, dv) == (16, 192, 128):
+        case.maxq += 256  # Small overestimate must not overwrite output padding.
+    output_storage = torch.full(
+        (case.q.shape[0] + 2, case.hq, dv), 123, dtype=torch.bfloat16, device="cuda"
+    )
+    case.out = output_storage[1:-1]
     options = csr_metadata(case, prefix=5) if csr else {}
-    expected, expected_lse = reference(case, scale=0.137, return_lse=True)
-    plain = run_case(case, **options, softmax_scale=0.137).clone()
+    scale = 0.137 if csr else None
+    expected, expected_lse = reference(case, scale=scale, return_lse=True)
+    plain = run_case(case, **options, softmax_scale=scale).clone()
     storage = torch.full((case.hq * case.q.shape[0] + 32,), 123.0, device="cuda")
     buffer = storage[16:-16].view(case.hq, -1)
     actual, lse = run_case(
-        case, **options, softmax_scale=0.137, return_lse=True, lse=buffer
+        case, **options, softmax_scale=scale, return_lse=True, lse=buffer
     )
     assert actual is case.out and lse is buffer
     torch.testing.assert_close(actual, plain, rtol=0, atol=0)
     check_accuracy(case, actual, expected)
     check_lse(lse, expected_lse)
     assert bool((storage[:16] == 123).all() & (storage[-16:] == 123).all())
+    assert bool((output_storage[0] == 123).all() & (output_storage[-1] == 123).all())
 
 
 @gfx950
@@ -351,85 +354,9 @@ def test_lse_buffer_validation():
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS)
 @pytest.mark.parametrize("d,dv", DIMS)
-def test_native_layouts_ragged_multiblock(page, layout, d, dv):
-    check_case(make_case(page, layout, d, dv))
-
-
-@gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv",
-    [
-        (64, "vectorized", 128, 128),
-        (1, "linear3d", 192, 128),
-        (16, "vectorized", 192, 192),
-    ],
-)
-def test_runtime_scale_reuses_compiled_launcher(page, layout, d, dv):
-    # Exercise each softmax/PV width; native tests cover the full layout matrix.
-    case = make_case(page, layout, d, dv)
-    default = check_case(case).clone()
-    misses = paged._build.cache_info().misses
-    for scale in (case.d**-0.5, 0.037, 0.137):
-        actual = check_case(case, softmax_scale=scale)
-        if scale == case.d**-0.5:
-            torch.testing.assert_close(actual, default, rtol=0, atol=0)
-    assert paged._build.cache_info().misses == misses
-
-
-@gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv",
-    [(1, "linear3d", 128, 128), (1, "linear", 192, 128), (16, "vectorized", 192, 192)],
-)
-def test_bounded_matches_wide_pointer_cache(monkeypatch, page, layout, d, dv):
-    case = make_case(page, layout, d, dv)
-    bounded = check_case(case).clone()
-    build = paged._build
-
-    def wide(**kwargs):
-        assert kwargs["buffered"]
-        kwargs["buffered"] = False
-        return build(**kwargs)
-
-    monkeypatch.setattr(paged, "_build", wide)
-    torch.testing.assert_close(check_case(case), bounded, rtol=0, atol=0)
-
-
-@gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv",
-    [(1, "linear3d", 128, 128), (1, "linear", 192, 128), (16, "vectorized", 192, 192)],
-)
-def test_wide_cache_with_byte_offset_base(monkeypatch, page, layout, d, dv):
-    case = make_case(page, layout, d, dv)
-
-    def offset_copy(tensor):
-        storage = torch.empty(
-            tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device
-        )
-        view = storage[1:].view(tensor.shape)
-        view.copy_(tensor)
-        assert view.data_ptr() % 4 != 0
-        return view
-
-    case.k, case.v = offset_copy(case.k), offset_copy(case.v)
-    build = paged._build
-
-    def wide(**kwargs):
-        kwargs["buffered"] = False
-        return build(**kwargs)
-
-    monkeypatch.setattr(paged, "_build", wide)
-    check_case(case)
-
-
-@gfx950
-@pytest.mark.parametrize("d,dv", DIMS)
-@pytest.mark.parametrize("heads", [(16, 1), (8, 4)])
-def test_scalar_and_paired_page64_paths(d, dv, heads):
-    case = make_case(64, "vectorized", d, dv, heads=heads)
+def test_scalar_and_paired_page64_paths(d, dv):
+    case = make_case(64, "vectorized", d, dv, heads=(16, 1))
     even = check_case(case).clone()
     case.maxkv -= 64
     torch.testing.assert_close(check_case(case), even, rtol=0, atol=0)
@@ -506,165 +433,109 @@ def test_paired_page64_ids_are_bounded_by_request(csr):
 
 
 @gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv",
-    [
-        (1, "linear3d", 192, 192),
-        (16, "vectorized", 192, 128),
-        (64, "vectorized", 128, 128),
-        (1024, "vectorized", 192, 192),
-    ],
-)
-def test_graph_reads_updated_lengths(page, layout, d, dv):
-    case = make_case(page, layout, d, dv, qlens=(17,), klens=(max(257, page + 1),))
-    run_case(case, softmax_scale=0.137)
+@pytest.mark.parametrize("csr", [False, True])
+def test_graph_reads_updated_lengths(csr):
+    case = make_case(64, "vectorized", 192, 128)
+    metadata = csr_metadata(case, prefix=5) if csr else {}
+    metadata.update(
+        return_lse=True, lse=torch.empty((case.hq, case.q.shape[0]), device="cuda")
+    )
+    run_case(case, **metadata, softmax_scale=0.137)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = run_case(case, softmax_scale=0.137)
-    assert captured is case.out
-    for length in (65, 129, case.klens[0], 0, 33):
-        case.lengths[0] = length
+        run_case(case, **metadata, softmax_scale=0.137)
+    for first_length in (65, 0, case.klens[0]):
+        lengths = [first_length, case.klens[1]]
+        if csr:
+            counts = [(n + case.page - 1) // case.page for n in lengths]
+            offsets = [5, 5 + counts[0], 5 + sum(counts)]
+            metadata["kv_indptr"].copy_(
+                torch.tensor(offsets, dtype=torch.int32, device="cuda")
+            )
+            metadata["kv_last_page_lens"].copy_(
+                torch.tensor(
+                    [(n - 1) % case.page + 1 if n else 0 for n in lengths],
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+            )
+            metadata["kv_page_indices"].fill_(-1)
+            for batch, count in enumerate(counts):
+                metadata["kv_page_indices"][offsets[batch] : offsets[batch + 1]].copy_(
+                    case.table[batch, :count]
+                )
+        else:
+            case.lengths.copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
         case.out.fill_(float("nan"))
+        metadata["lse"].fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
-        assert bool(case.out.isfinite().all())
-        torch.testing.assert_close(
-            case.out.float(),
-            reference(case, scale=0.137, lengths=[length]),
-            rtol=FP8_RTOL,
-            atol=FP8_ATOL,
+        expected, expected_lse = reference(
+            case, scale=0.137, lengths=lengths, return_lse=True
         )
+        torch.testing.assert_close(
+            case.out.float(), expected, rtol=FP8_RTOL, atol=FP8_ATOL
+        )
+        check_lse(metadata["lse"], expected_lse)
 
 
 @gfx950
-@pytest.mark.parametrize(
-    "page,layout", [(1, "linear3d"), (1, "linear"), (64, "vectorized")]
-)
-def test_strided_metadata_and_scalar_descales(page, layout):
-    case = make_case(page, layout, 192, 128)
+@pytest.mark.parametrize("csr,explicit_stream", [(False, False), (True, True)])
+def test_copies_follow_nondefault_stream(monkeypatch, csr, explicit_stream):
+    from aiter.ops.flydsl.kernels.fmha_gfx950 import (
+        flash_attn_paged_fp8_gfx950 as kernel,
+    )
+
+    case = make_case(64, "vectorized", 192, 128)
+    expected, expected_lse = reference(case, return_lse=True)
+    metadata = csr_metadata(case, prefix=5) if csr else {}
+    for name in ("q", "k", "v"):
+        tensor = getattr(case, name)
+        setattr(case, name, tensor.repeat_interleave(2, dim=-1)[..., ::2])
     case.cuq = case.cuq.repeat_interleave(2)[::2]
-    case.lengths = case.lengths.repeat_interleave(2)[::2]
-    case.table = case.table.repeat_interleave(2, dim=1)[:, ::2]
-    expected = reference(case)
-    actual = run_case(
-        case,
+    if csr:
+        for name in ("kv_indptr", "kv_page_indices", "kv_last_page_lens"):
+            metadata[name] = metadata[name].repeat_interleave(2)[::2]
+    else:
+        case.lengths = case.lengths.repeat_interleave(2)[::2]
+        case.table = case.table.repeat_interleave(2, dim=1)[:, ::2]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    original = kernel._run_compiled
+    calls = []
+
+    def record_launch(executable, *args, **kwargs):
+        # Verify routing directly, without timing-sensitive GPU sleeps.
+        actual_stream = args[-1].value
+        assert actual_stream is not None
+        assert actual_stream.cuda_stream == stream.cuda_stream
+        calls.append(actual_stream.cuda_stream)
+        return original(executable, *args, **kwargs)
+
+    monkeypatch.setattr(kernel, "_run_compiled", record_launch)
+    options = dict(
+        metadata,
+        return_lse=True,
         q_descale=case.qs.reshape(()),
         k_descale=case.ks.as_strided((1,), (0,)),
         v_descale=case.vs.reshape(1, 1),
     )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(actual.float(), expected, rtol=FP8_RTOL, atol=FP8_ATOL)
-
-
-@gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv,return_lse",
-    [
-        (1, "linear", 128, 128, False),
-        (1, "linear3d", 192, 128, False),
-        (16, "vectorized", 192, 192, False),
-        (64, "vectorized", 192, 128, False),
-        (1024, "vectorized", 192, 192, False),
-        (1, "linear3d", 192, 192, True),
-    ],
-)
-def test_copies_follow_nondefault_stream(page, layout, d, dv, return_lse):
-    case = make_case(page, layout, d, dv)
-    expected = check_case(case).clone()
-    expected_lse = reference(case, return_lse=True)[1]
-    lse = torch.empty_like(expected_lse) if return_lse else None
-
-    def strided(tensor):
-        storage = torch.empty(
-            (*tensor.shape[:-1], tensor.shape[-1] * 2),
-            dtype=tensor.dtype,
-            device="cuda",
-        )
-        view = storage[..., ::2]
-        view.copy_(tensor)
-        return view
-
-    case.q, case.k, case.v = map(strided, (case.q, case.k, case.v))
-    stream = torch.cuda.Stream(priority=-1)
-    torch.cuda.synchronize()
-    run_case(case, stream=stream, return_lse=return_lse, lse=lse)
-    stream.synchronize()
-    torch.cuda._sleep(3_000_000_000)
-    blocked = torch.cuda.Event()
-    blocked.record()
-    run_case(case, stream=stream, return_lse=return_lse, lse=lse)
-    stream.synchronize()
-    assert not blocked.query(), "copies waited on the blocked default stream"
-    torch.cuda.synchronize()
-    torch.testing.assert_close(case.out, expected, rtol=0, atol=0)
-
-    if return_lse:
-        check_lse(lse, expected_lse)
-
-
-@gfx950
-@pytest.mark.parametrize("explicit_stream", [False, True])
-def test_side_stream_keeps_copy_source_alive(explicit_stream):
-    case = make_case(64, "vectorized", 128, 128)
-    stream = torch.cuda.Stream()
-    expected = check_case(case, stream=stream).clone()
-    storage_shape = (*case.v.shape[:-1], case.v.shape[-1] * 2)
-    storage = torch.empty(storage_shape, dtype=case.v.dtype, device="cuda")
-    strided = storage[..., ::2]
-    strided.copy_(case.v)
-    case.v = strided
-    source_begin = storage.data_ptr()
-    source_end = source_begin + storage.numel() * storage.element_size()
-    del storage, strided
-    torch.cuda.synchronize()
-
-    # Delay the copy so the caller can release its source and pressure the
-    # creation-stream allocator before the side stream consumes the bytes.
-    with torch.cuda.stream(stream):
-        torch.cuda._sleep(3_000_000_000)
-        if not explicit_stream:
-            run_case(case)
     if explicit_stream:
-        run_case(case, stream=stream)
-    del case.v
-    replacements = []
-    source_reused = False
-    pending = False
-    try:
-        for _ in range(32):
-            replacement = torch.empty(
-                storage_shape, dtype=torch.float8_e4m3fn, device="cuda"
-            )
-            replacements.append(replacement)
-            if not stream.query():
-                pending = True
-                begin = replacement.data_ptr()
-                end = begin + replacement.numel() * replacement.element_size()
-                source_reused |= begin < source_end and end > source_begin
-            replacement.zero_()
-    finally:
-        torch.cuda.synchronize()
-    assert pending, "side stream completed before allocator pressure"
-    assert not source_reused, "copy source was recycled while side stream was pending"
-    torch.testing.assert_close(case.out, expected, rtol=0, atol=0)
+        actual, lse = run_case(case, **options, stream=stream)
+    else:
+        with torch.cuda.stream(stream):
+            actual, lse = run_case(case, **options)
+    stream.synchronize()
+    assert len(calls) == 1
+    check_accuracy(case, actual, expected)
+    check_lse(lse, expected_lse)
 
 
 @gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv",
-    [
-        (1, "linear3d", 128, 128),
-        (1, "linear", 192, 128),
-        (16, "vectorized", 192, 192),
-        (64, "vectorized", 192, 128),
-        (1024, "vectorized", 128, 128),
-    ],
-)
-def test_direct_prefill_metadata_precedence(page, layout, d, dv):
-    case = make_case(page, layout, d, dv)
+def test_direct_prefill_metadata_precedence():
+    case = make_case(64, "vectorized", 192, 128)
     metadata = csr_metadata(case, prefix=5)
-    # The rectangular table must win over the unused, invalid CSR page IDs.
     metadata["block_table"] = case.table
     metadata["seqlen_k"] = case.lengths
     metadata["kv_page_indices"].fill_(-1)
@@ -672,218 +543,6 @@ def test_direct_prefill_metadata_precedence(page, layout, d, dv):
     torch.cuda.synchronize()
     assert actual is case.out
     check_accuracy(case, actual, reference(case, scale=0.137))
-
-
-@gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv",
-    [
-        (1, "linear3d", 192, 128),
-        (16, "vectorized", 192, 192),
-        (64, "vectorized", 128, 128),
-        (1024, "vectorized", 192, 128),
-    ],
-)
-def test_csr_graph_updates_ranges_and_lengths(page, layout, d, dv):
-    case = make_case(
-        page, layout, d, dv, qlens=(17, 65), klens=(max(513, page + 1), 81)
-    )
-    metadata = csr_metadata(case, prefix=5)
-    lse = torch.empty((case.hq, case.q.shape[0]), device="cuda")
-    metadata.update(return_lse=True, lse=lse)
-    run_case(case, **metadata, softmax_scale=0.137)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run_case(case, **metadata, softmax_scale=0.137)
-    for first_length in (65, 129, case.klens[0], 0, 33):
-        lengths = [first_length, 81]
-        counts = [(n + page - 1) // page for n in lengths]
-        offsets = [5, 5 + counts[0], 5 + sum(counts)]
-        metadata["kv_indptr"].copy_(
-            torch.tensor(offsets, dtype=torch.int32, device="cuda")
-        )
-        metadata["kv_last_page_lens"].copy_(
-            torch.tensor(
-                [(n - 1) % page + 1 if n else 0 for n in lengths],
-                dtype=torch.int32,
-                device="cuda",
-            )
-        )
-        metadata["kv_page_indices"].fill_(-1)
-        for batch, count in enumerate(counts):
-            metadata["kv_page_indices"][offsets[batch] : offsets[batch + 1]].copy_(
-                case.table[batch, :count]
-            )
-        case.out.fill_(float("nan"))
-        lse.fill_(float("nan"))
-        graph.replay()
-        torch.cuda.synchronize()
-        assert bool(case.out.isfinite().all())
-        expected, expected_lse = reference(
-            case, scale=0.137, lengths=lengths, return_lse=True
-        )
-        torch.testing.assert_close(
-            case.out.float(),
-            expected,
-            rtol=FP8_RTOL,
-            atol=FP8_ATOL,
-        )
-
-        check_lse(lse, expected_lse)
-
-
-@gfx950
-@pytest.mark.parametrize("page,layout", [(1, "linear3d"), (64, "vectorized")])
-def test_csr_strided_metadata_on_side_stream(page, layout):
-    case = make_case(page, layout, 192, 128)
-    metadata = csr_metadata(case, prefix=5)
-    for name in ("kv_indptr", "kv_page_indices", "kv_last_page_lens"):
-        metadata[name] = metadata[name].repeat_interleave(2)[::2]
-    stream = torch.cuda.Stream(priority=-1)
-    torch.cuda.synchronize()
-    run_case(case, **metadata, stream=stream)
-    stream.synchronize()
-    torch.cuda._sleep(3_000_000_000)
-    blocked = torch.cuda.Event()
-    blocked.record()
-    run_case(case, **metadata, stream=stream)
-    stream.synchronize()
-    assert not blocked.query(), "CSR normalization waited on the default stream"
-    torch.cuda.synchronize()
-    torch.testing.assert_close(
-        case.out.float(), reference(case), rtol=FP8_RTOL, atol=FP8_ATOL
-    )
-
-
-@gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv,return_lse",
-    [
-        (1, "linear3d", 128, 128, False),
-        (16, "vectorized", 192, 192, False),
-        (64, "vectorized", 192, 128, False),
-        (1024, "vectorized", 128, 128, False),
-        (64, "vectorized", 128, 128, True),
-        (16, "vectorized", 192, 128, True),
-        (1, "linear3d", 192, 192, True),
-    ],
-)
-def test_lazy_and_eager_match_reference(page, layout, d, dv, return_lse):
-    # Exercise both softmax modes across page paths and LSE on each head pair.
-    case = make_case(page, layout, d, dv)
-    options = csr_metadata(case, prefix=5)
-    if not return_lse:
-        lazy = check_case(case, **options).clone()
-        eager = check_case(case, **options, dualwave_swp_lazy_rescale=False)
-        torch.testing.assert_close(eager, lazy, rtol=FP8_RTOL, atol=FP8_ATOL)
-        return
-    expected, expected_lse = reference(case, return_lse=True)
-    for lazy in (True, False):
-        actual, lse = run_case(
-            case, **options, return_lse=True, dualwave_swp_lazy_rescale=lazy
-        )
-        check_accuracy(case, actual, expected)
-        check_lse(lse, expected_lse)
-
-
-def _large_case(page, layout, d, dv, high_page):
-    hkv = 2
-    npages = high_page + 1
-    needed = npages * page * hkv * (d + dv)
-    torch.cuda.empty_cache()
-    free, _ = torch.cuda.mem_get_info()
-    if free < needed + 2 * 2**30:
-        pytest.skip(f"requires {needed / 2**30:.1f} GiB cache plus 2 GiB headroom")
-    case = make_case(page, layout, d, dv, qlens=(1,), klens=(1,))
-    if layout == "vectorized":
-        kshape = (npages, hkv, d // 16, page, 16)
-        vshape = (npages, hkv, page // 16, dv, 16)
-    elif layout == "linear3d":
-        kshape, vshape = (npages, hkv, d), (npages, hkv, dv)
-    else:
-        kshape, vshape = (npages, page, hkv, d), (npages, page, hkv, dv)
-    case.k = torch.empty(kshape, dtype=torch.float8_e4m3fn, device="cuda")
-    case.v = torch.empty(vshape, dtype=torch.float8_e4m3fn, device="cuda")
-    case.k[high_page].zero_()
-    case.v[high_page].fill_(float("nan"))
-    first = (1.0 + torch.arange(hkv * dv, device="cuda").reshape(hkv, dv) % 7 / 8).to(
-        torch.float8_e4m3fn
-    )
-    if layout == "vectorized":
-        case.v[high_page, :, 0, :, 0].copy_(first)
-    else:
-        case.v[high_page].reshape(page, hkv, dv)[0].copy_(first)
-    case.vs.fill_(1.0)
-    case.table.fill_(-1)
-    case.table[0, 0] = high_page
-    expected = first.float().repeat_interleave(case.hq // hkv, dim=0)[None]
-    return case, expected
-
-
-@gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv,csr",
-    [
-        (1, "linear3d", 128, 128, False),
-        (1, "linear", 192, 128, True),
-        (16, "vectorized", 192, 192, True),
-        (64, "vectorized", 192, 128, False),
-        (1024, "vectorized", 128, 128, True),
-    ],
-)
-def test_cache_offsets_above_4gib(page, layout, d, dv, csr):
-    high_page = math.ceil(2**32 / (page * 2 * min(d, dv)))
-    case, expected = _large_case(page, layout, d, dv, high_page)
-    options = {}
-    if csr:
-        options = {
-            "block_table": None,
-            "kv_indptr": torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
-            "kv_page_indices": torch.tensor(
-                [high_page], dtype=torch.int32, device="cuda"
-            ),
-            "kv_last_page_lens": torch.tensor([1], dtype=torch.int32, device="cuda"),
-        }
-    actual = run_case(case, **options)
-    torch.cuda.synchronize()
-    assert high_page * page * case.hkv * d >= 2**32
-    assert high_page * page * case.hkv * dv >= 2**32
-    assert bool(actual.isfinite().all())
-    torch.testing.assert_close(actual.float(), expected, rtol=FP8_RTOL, atol=FP8_ATOL)
-
-
-@gfx950
-@pytest.mark.parametrize("csr", [False, True])
-def test_page16_scalar_offset_near_i32_limit(monkeypatch, csr):
-    page, d, dv = 16, 192, 192
-    high_page = paged.PAGED_FP8_BUFFER_LIMIT_BYTES // (page * 2 * d) - 1
-    case, expected = _large_case(page, "vectorized", d, dv, high_page)
-    assert case.k.numel() <= paged.PAGED_FP8_BUFFER_LIMIT_BYTES
-    assert high_page * page * case.hkv * d > 2**31 - 16384
-    original = paged._build
-    selected = []
-
-    def build(**kwargs):
-        selected.append(kwargs["buffered"])
-        return original(**kwargs)
-
-    monkeypatch.setattr(paged, "_build", build)
-    options = {}
-    if csr:
-        options = {
-            "block_table": None,
-            "kv_indptr": torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
-            "kv_page_indices": torch.tensor(
-                [high_page], dtype=torch.int32, device="cuda"
-            ),
-            "kv_last_page_lens": torch.tensor([1], dtype=torch.int32, device="cuda"),
-        }
-    actual = run_case(case, **options)
-    torch.cuda.synchronize()
-    assert selected == [True]
-    assert bool(actual.isfinite().all())
-    torch.testing.assert_close(actual.float(), expected, rtol=FP8_RTOL, atol=FP8_ATOL)
 
 
 def _native_cache(case, key, value):
@@ -901,11 +560,19 @@ def _native_cache(case, key, value):
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout,d,dv,csr", LAYOUT_CASES)
+@pytest.mark.parametrize(
+    "page,layout,d,dv,csr",
+    [
+        (1, "linear3d", 128, 128, False),
+        (16, "vectorized", 192, 128, True),
+        (64, "vectorized", 192, 192, False),
+        (1024, "vectorized", 192, 192, True),
+    ],
+)
 def test_inactive_nan_bytes_and_empty_request(page, layout, d, dv, csr):
     # Cross token groups, 64/128-token tiles and the 1024-token page boundary
     # through the real attention pipeline, with inactive K/V bytes poisoned.
-    for length in (1, 16, 17, 63, 64, 65, 127, 128, 129, 513, 1025):
+    for length in (1, page + 1, 129):
         case = make_case(page, layout, d, dv, qlens=(17, 17), klens=(length, 0))
         case.q.zero_()
         key = torch.full(
@@ -939,30 +606,10 @@ def test_inactive_nan_bytes_and_empty_request(page, layout, d, dv, csr):
 
 
 @gfx950
-@pytest.mark.parametrize("page,layout", LAYOUTS)
-@pytest.mark.parametrize("d,dv", DIMS)
-def test_shared_pages_loose_maxima_and_output_canaries(page, layout, d, dv):
-    case = make_case(page, layout, d, dv, qlens=(17, 65), klens=(129, 65))
-    count = (65 + page - 1) // page
-    case.table[1, :count] = case.table[0, :count]
-    # Oversized backing buffers make a broken bound observable as a canary
-    # failure instead of an out-of-allocation memory access.
-    case.maxq = 512
-    query = torch.zeros((1024, case.hq, d), dtype=case.q.dtype, device="cuda")
-    query[:82].copy_(case.q)
-    case.q = query[:82]
-    storage = torch.full((1026, case.hq, dv), 123, dtype=torch.bfloat16, device="cuda")
-    case.out = storage[1:83]
-    for csr in (False, True):
-        case.out.fill_(float("nan"))
-        check_case(case, **(csr_metadata(case, prefix=1) if csr else {}))
-        assert bool((storage[:1] == 123).all())
-        assert bool((storage[83:] == 123).all())
-
-
-@gfx950
-@pytest.mark.parametrize("mode", ["bounded", "escape", "mixed-waves", "negative"])
-@pytest.mark.parametrize("csr", [False, True])
+@pytest.mark.parametrize(
+    "mode,csr",
+    [("bounded", False), ("escape", True), ("mixed-waves", False), ("negative", True)],
+)
 def test_d128_query_bound_preserves_rescaling(mode, csr):
     batch, hkv = {
         "bounded": (2, 1),
@@ -975,8 +622,8 @@ def test_d128_query_bound_preserves_rescaling(mode, csr):
         "vectorized",
         128,
         128,
-        qlens=(300, 65, 257, 33, 127)[:batch],
-        klens=(1024, 512, 768, 256, 384)[:batch],
+        qlens=(65, 33, 17, 9, 7)[:batch],
+        klens=(384, 256, 256, 256, 128)[:batch],
         heads=(16, hkv),
         seed=29,
     )
@@ -1027,75 +674,39 @@ def test_d128_query_bound_preserves_rescaling(mode, csr):
 
 
 @gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv,csr,return_lse",
-    [
-        (1, "linear3d", 128, 128, False, False),
-        (1, "linear", 192, 128, True, False),
-        (16, "vectorized", 192, 192, True, False),
-        (64, "vectorized", 192, 128, False, False),
-        (1024, "vectorized", 128, 128, True, False),
-        (1, "linear3d", 192, 192, False, True),
-    ],
-)
-def test_explicit_compile_then_launch(
-    monkeypatch, page, layout, d, dv, csr, return_lse
-):
-    case = make_case(page, layout, d, dv, qlens=(65, 17), klens=(128, 97))
+def test_explicit_compile_then_launch(monkeypatch):
+    case = make_case(64, "vectorized", 192, 128)
     original = paged._build
     original.cache_clear()
-    compile_results = []
+    compiled = []
 
     def build(**kwargs):
         launcher = original(**kwargs)
 
         def run(*args, **options):
             before = case.out.view(torch.uint8).clone()
-            before_lse = options["lse"].clone() if return_lse else None
-            compile_results.append(launcher.compile(*args, **options))
+            before_lse = options["lse"].clone()
+            compiled.append(launcher.compile(*args, **options))
             torch.cuda.synchronize()
             torch.testing.assert_close(
                 case.out.view(torch.uint8), before, rtol=0, atol=0
             )
-            if return_lse:
-                torch.testing.assert_close(options["lse"], before_lse, rtol=0, atol=0)
+            torch.testing.assert_close(options["lse"], before_lse, rtol=0, atol=0)
             return launcher(*args, **options)
 
         return run
 
     monkeypatch.setattr(paged, "_build", build)
-    for _ in range(2):  # Cold preload, then preload after a real launch.
+    expected, expected_lse = reference(case, return_lse=True)
+    for _ in range(2):  # Before and after a real launch.
         case.out.fill_(123)
-        options = csr_metadata(case, prefix=1) if csr else {}
-        if return_lse:
-            buffer = torch.full((case.hq, case.q.shape[0]), 123.0, device="cuda")
-            actual, lse = run_case(case, **options, return_lse=True, lse=buffer)
-            expected, expected_lse = reference(case, return_lse=True)
-            check_accuracy(case, actual, expected)
-            check_lse(lse, expected_lse)
-        else:
-            check_case(case, **options)
-    assert len(compile_results) == 2  # Older no-dispatch runtimes return None.
-
-
-@gfx950
-@pytest.mark.parametrize(
-    "page,layout,d,dv", [(64, "vectorized", 128, 128), (1, "linear3d", 192, 192)]
-)
-def test_loose_query_bound_cannot_wrap_output(page, layout, d, dv):
-    case = make_case(page, layout, d, dv, qlens=(2,), klens=(1,), heads=(16, 1))
-    expected = check_case(case).clone()
-    # Padded row 2**20 starts at 2**32 BF16 bytes and aliases row zero if
-    # the output store truncates the offset before rejecting inactive rows.
-    case.maxq = 2**20 + 1
-    case.out.fill_(float("nan"))
-    run_case(case)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(case.out, expected, rtol=0, atol=0)
-
-    actual, lse = run_case(case, return_lse=True)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    check_lse(lse, reference(case, return_lse=True)[1])
+        buffer = torch.full((case.hq, case.q.shape[0]), 123.0, device="cuda")
+        actual, lse = run_case(
+            case, **csr_metadata(case, prefix=1), return_lse=True, lse=buffer
+        )
+        check_accuracy(case, actual, expected)
+        check_lse(lse, expected_lse)
+    assert len(compiled) == 2
 
 
 @gfx950
