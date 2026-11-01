@@ -556,6 +556,99 @@ class TestMxmoeOpusRuntime(unittest.TestCase):
         self.assertIs(executions[2], executions[0])
         self.assertFalse(torch.cuda.is_initialized())
 
+    def test_non_opus_pair_requires_one_sort_block(self):
+        self.g1 = "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out"
+        v2_sbm16 = "flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x256_atomic_sbm16"
+        v2_sbm32 = "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x256_atomic_sbm32"
+        native_bm32 = "flydsl_mxmoe_g2_a4w4_32x256x256_atomic"
+        self.write_csv(kernelName2=v2_sbm16, block_m=16)
+        selected = self.select()
+        self.assertEqual(selected.stage1.keywords["kernelName1"], self.g1)
+        self.assertEqual(selected.stage2.keywords["kernelName2"], v2_sbm16)
+        self.assertEqual(selected.block_m, 16)
+        for kernel2, block_m in (
+            (v2_sbm32, 32),
+            (v2_sbm32, 16),
+            (native_bm32, 16),
+        ):
+            with self.subTest(kernel2=kernel2, block_m=block_m):
+                self.write_csv(kernelName2=kernel2, block_m=block_m)
+                self.fm.cfg_2stages = None
+                self.fm.get_2stage_cfgs.cache_clear()
+                with self.assertLogs("aiter", level="WARNING") as logs:
+                    metadata = self.select()
+                self.assertNotEqual(
+                    metadata.stage1.keywords.get("kernelName1"), self.g1
+                )
+                self.assertTrue(
+                    any("GEMM1 BM=16" in message for message in logs.output)
+                )
+
+    def test_public_override_on_non_opus_pair_falls_back_before_sort(self):
+        torch, a, fm = self.torch, self.aiter, self.fm
+        self.g1 = "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out"
+        self.g2 = "flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x256_atomic_sbm16"
+        self.write_csv(block_m=16)
+        hidden = torch.empty((31, 3072), dtype=a.dtypes.bf16)
+        w1 = torch.empty((128, 1024, 1536), dtype=a.dtypes.fp4x2)
+        w2 = torch.empty((128, 3072, 256), dtype=a.dtypes.fp4x2)
+        w1.is_shuffled = w2.is_shuffled = True
+        w1s = torch.empty((128, 1024, 96), dtype=a.dtypes.fp8_e8m0)
+        w2s = torch.empty((128 * 3072, 16), dtype=a.dtypes.fp8_e8m0)
+        ids = torch.empty((31, 4), dtype=a.dtypes.i32)
+        weights = torch.empty((31, 4), dtype=a.dtypes.fp32)
+        sorts, executions = [], []
+
+        def sorting(*args, **kwargs):
+            sorts.append(args[5])
+            result = (
+                torch.empty(32, dtype=a.dtypes.i32),
+                torch.empty(32),
+                torch.empty(1, dtype=a.dtypes.i32),
+                torch.empty(2, dtype=a.dtypes.i32),
+                torch.empty((31, 3072), dtype=a.dtypes.bf16),
+                torch.empty(32, dtype=a.dtypes.i32),
+                torch.empty(124, dtype=a.dtypes.i32),
+            )
+            return result if kwargs.get("output_aux") else result[:5]
+
+        def execute(*args, **kwargs):
+            metadata = kwargs["_metadata_transform"](None)
+            executions.append(metadata)
+            return args[8]
+
+        def public(block):
+            return fm.fused_moe(
+                hidden,
+                w1,
+                w2,
+                weights,
+                ids,
+                activation=a.ActivationType.Silu,
+                quant_type=a.QuantType.per_1x32,
+                quant_dtype_a=a.dtypes.fp8,
+                dtype=a.dtypes.bf16,
+                gate_mode="interleave",
+                w1_scale=w1s,
+                w2_scale=w2s,
+                block_size_M=block,
+            )
+
+        with patch.object(fm, "moe_sorting", sorting), patch.object(
+            fm, "fused_moe_2stages", execute
+        ):
+            public(16)
+            with self.assertLogs("aiter", level="WARNING") as logs:
+                public(32)
+            public(16)
+        self.assertTrue(any("block_size_M=32" in message for message in logs.output))
+        self.assertEqual(sorts, [16, 32, 16])
+        self.assertEqual(executions[0].stage1.keywords["kernelName1"], self.g1)
+        self.assertNotEqual(executions[1].stage1.keywords.get("kernelName1"), self.g1)
+        self.assertEqual(executions[1].block_m, 32)
+        self.assertIs(executions[2], executions[0])
+        self.assertFalse(torch.cuda.is_initialized())
+
 
 if __name__ == "__main__":
     unittest.main()
