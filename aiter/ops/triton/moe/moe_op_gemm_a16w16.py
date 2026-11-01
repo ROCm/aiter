@@ -52,13 +52,25 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config_gluon(m, n, k, routing_data):
+def get_kernel_config_gluon(m, n, k, routing_data, apply_swiglu=False):
+    """Tuned config for one call.
+
+    A call that fuses SwiGLU needs its own entry. The epilogue splits the whole
+    BLOCK_M x BLOCK_N accumulator, so it spills above block_n=128: 260 spilled
+    registers at 256 and 516 at 512, which costs 10x. A call without SwiGLU
+    prefers the wider tile, so the two cannot share one entry.
+    """
     block_m = routing_data.block_m
 
     tuned = get_moe_dispatch("A16W16", get_arch(), "gluon")
-    key = f"bm{block_m}_n{n}_k{k}_{m2bucket(m)}"
-    if key not in tuned:
-        key = f"bm{block_m}_any"
+    suffix = "_swiglu" if apply_swiglu else ""
+    for key in (
+        f"bm{block_m}{suffix}_n{n}_k{k}_{m2bucket(m)}",
+        f"bm{block_m}{suffix}_any",
+        f"bm{block_m}_any",
+    ):
+        if key in tuned:
+            break
     cfg = tuned[key]
 
     block_k = cfg["block_k"]
@@ -169,7 +181,7 @@ def moe_gemm_a16w16(
     if unpadded_K and block_m == 16:
         K = unpadded_K
 
-    config = get_kernel_config_gluon(M, N, K, routing_data)
+    config = get_kernel_config_gluon(M, N, K, routing_data, apply_swiglu)
 
     if apply_swiglu:
         apply_swiglu_matmul = True
