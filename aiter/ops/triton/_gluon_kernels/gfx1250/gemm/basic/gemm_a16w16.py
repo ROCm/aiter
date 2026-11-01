@@ -23,8 +23,16 @@ _gemm_a16w16_bandwidth_bound_repr = make_kernel_repr(
 )
 
 _gemm_a16w16_compute_bound_repr = make_kernel_repr(
-    "_gemm_a16w16_gfx1250_compute_bound_kernel", _GLUON_REPR_KEYS
+    "_gemm_a16w16_gfx1250_compute_bound_kernel", _GLUON_REPR_KEYS + ["REGISTER_STORE"]
 )
+
+
+def create_store_layout(BLOCK_M, BLOCK_N, num_warps, elem_bits=16):
+    """Blocked layout for the compute_bound kernel's coalesced register store: 16-byte vectors along N."""
+    vec = min(128 // elem_bits, BLOCK_N)
+    tpw_n = min(32, BLOCK_N // vec)
+    tpw_m = 32 // tpw_n
+    return gl.BlockedLayout([1, vec], [tpw_m, tpw_n], [num_warps, 1], [1, 0])
 
 
 # TDM encodes log2(pad interval in dwords) - 1 in a 3-bit field, so the
@@ -436,6 +444,8 @@ def _gemm_a16w16_compute_bound_kernel(
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    REGISTER_STORE: gl.constexpr = 0,
+    STORE_LAYOUT: gl.constexpr = None,
 ):
     """Local-load pipelining across K-tiles.
 
@@ -830,29 +840,75 @@ def _gemm_a16w16_compute_bound_kernel(
     if USE_ACTIVATION:
         accumulator = activation(accumulator)
 
-    # TDM Store: accumulator → shared memory → global memory
-    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
-    )
-    c_buffer = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_M, BLOCK_N],
-        layout=SHARED_LAYOUT_C,
-    )
-    c_buffer.store(accumulator.to(c_ptr.type.element_ty))
+    if REGISTER_STORE == 2:
+        # Register store, coalesced: convert the tile to STORE_LAYOUT (16-byte vectors along N; the layout
+        # conversion's LDS round trip is ordinary ds_store/barrier/ds_load), then buffer stores. The TDM store of an
+        # LDS-staged tile (REGISTER_STORE == 0) is the gfx1250 B1 pattern: tensor_store_from_lds can read LDS before
+        # the waves' ds_stores are visible to it, and no documented wait or fence closes that window.
+        c_vals = gl.convert_layout(accumulator.to(c_ptr.type.element_ty), STORE_LAYOUT)
+        offs_cm = pid_m * BLOCK_M + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, STORE_LAYOUT)
+        )
+        offs_cn = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, STORE_LAYOUT)
+        )
+        c_base = (
+            c_ptr
+            + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+            + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+        )
+        offs_c = stride_cm * (offs_cm[:, None] - pid_m * BLOCK_M) + stride_cn * (
+            offs_cn[None, :] - pid_n * BLOCK_N
+        )
+        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        gl.amd.gfx1250.buffer_store(c_vals, c_base, offs_c, mask=mask_c)
+    elif REGISTER_STORE == 1:
+        # Register store straight from the WMMA layout (as the bandwidth_bound kernel does).
+        offs_cm = pid_m * BLOCK_M + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        )
+        offs_cn = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
+        # buffer_store offsets are 32-bit: rebase C to this block in int64.
+        c_base = (
+            c_ptr
+            + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+            + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+        )
+        offs_c = stride_cm * (offs_cm[:, None] - pid_m * BLOCK_M) + stride_cn * (
+            offs_cn[None, :] - pid_n * BLOCK_N
+        )
+        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        gl.amd.gfx1250.buffer_store(
+            accumulator.to(c_ptr.type.element_ty), c_base, offs_c, mask=mask_c
+        )
+    else:
+        # TDM Store: accumulator → shared memory → global memory
+        SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+        )
+        c_buffer = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            shape=[BLOCK_M, BLOCK_N],
+            layout=SHARED_LAYOUT_C,
+        )
+        c_buffer.store(accumulator.to(c_ptr.type.element_ty))
 
-    # Ensure all wavefronts have finished writing to LDS before TDM reads it.
-    gl.barrier()
+        # Ensure all wavefronts have finished writing to LDS before TDM reads it.
+        gl.barrier()
 
-    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr,
-        shape=(M, N),
-        strides=(stride_cm, stride_cn),
-        block_shape=(BLOCK_M, BLOCK_N),
-        layout=SHARED_LAYOUT_C,
-    )
-    gl.amd.gfx1250.tdm.async_store(c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_buffer)
-    gl.amd.gfx1250.tdm.async_wait(0)
+        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_M, BLOCK_N),
+            layout=SHARED_LAYOUT_C,
+        )
+        gl.amd.gfx1250.tdm.async_store(
+            c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_buffer
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
 
 
 _KERNEL_MAP = {
