@@ -66,18 +66,23 @@ def _as_bool(value, default: bool) -> bool:
     return str(value).strip() in _TRUTHY_ENV
 
 
-def _as_int(value, default: int | None) -> int | None:
-    # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
-    # cell can come back as the literal "nan"; read those as unset like _cell.
-    # The model_configs/ merge goes through pandas, which stores an int column
-    # with blank cells as float; accept such integral floats, reject the rest.
-    text = "" if value is None else str(value).strip()
+@functools.lru_cache(maxsize=128)
+def _parse_config_int(text: str) -> int | None:
+    """Parse immutable CSV text once; missing cells defer to each call's default."""
+    text = text.strip()
     if text == "" or text.lower() in ("nan", "none"):
-        return default
+        return None
     number = float(text)
     if not number.is_integer():
         raise ValueError(f"expected an integer config value, got {text!r}")
     return int(number)
+
+
+def _as_int(value, default: int | None) -> int | None:
+    # Read/stringify on every call, so changed rows or mutable scalar-like
+    # objects are observed. Cache only strings, never a row, Tensor or default.
+    parsed = _parse_config_int("" if value is None else str(value))
+    return default if parsed is None else parsed
 
 
 def _dtype_name(dtype) -> str:
