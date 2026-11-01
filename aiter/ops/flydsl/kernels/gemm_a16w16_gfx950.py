@@ -8,17 +8,21 @@ from typing import Any
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
+    SPLIT_K_COUNTER_STRIDE,
     SPLIT_K_SEMAPHORE_MAX_LEN,
     BlockSwizzle,
-    SplitKProtocol,
+    SplitKReduction,
     get_wave_lds_offset,
     make_lds_layout,
     make_transposed_lds_layout,
@@ -27,10 +31,103 @@ from .gemm_a16w16_gfx950_utils import (
     wait_vmcnt_and_barrier,
 )
 from .kernels_common import run_cached, set_slp_vectorize_once_used
+from .tensor_shim import buf_base_i64
 
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
 GEMM_A16W16_DTYPE_FP16 = 3
+# Split-K tiles with fragment partials at least this large keep their own partial
+# in registers and skip rows past M in the partial traffic; smaller ones gain
+# nothing from it.
+SPLIT_K_TRIM_MIN_TILE_ELEMS = 1024
+
+
+def load_kernargs_up_front(tensors, scalars):
+    """Load the tensors' base addresses and the Int32 scalar arguments together.
+
+    The scalars pass through an empty asm that also uses the base addresses, so
+    every later use of them waits for all of these kernarg loads at once: one
+    scalar round trip before the first global load instead of two. Returns the
+    scalars.
+    """
+    n = len(scalars)
+    ptrs = [fx.as_ir_value(buf_base_i64(t)) for t in tensors]
+    struct = ir.Type.parse("!llvm.struct<(" + ", ".join(["i32"] * n) + ")>")
+    op = llvm.InlineAsmOp(
+        struct,
+        [fx.as_ir_value(v) for v in scalars] + ptrs,
+        "",
+        ",".join(["=s"] * n + [str(i) for i in range(n)] + ["s"] * len(ptrs)),
+        has_side_effects=True,
+    )
+    i32 = ir.IntegerType.get_signless(32)
+    return tuple(fx.Int32(llvm.extractvalue(i32, op.res, [i])) for i in range(n))
+
+
+# fp32 elements of padding per row of an LDS slice-K tile: the 16-row groups of an
+# MFMA accumulator then write to distinct banks.
+SLICE_K_ROW_PAD = 4
+GFX950_LDS_BYTES = 163840
+
+
+@functools.cache
+def device_cu_num():
+    """CUs of the device (what the tuned tables are keyed on); 256 without one."""
+    try:
+        return get_cu_num()
+    except Exception:  # noqa: BLE001 - compile-only hosts have no GPU to query
+        return 256
+
+
+def slice_k_tile_elems(block_m, block_n):
+    return block_m * (block_n + SLICE_K_ROW_PAD)
+
+
+# Split-K tiles of at least this many elements are reduced by all of their
+# splits, a share each; smaller tiles by the last split to arrive, whose single
+# reducer is cheaper than waiting for every split.
+SPLIT_K_SHARED_MIN_TILE = 4096
+# Without slice-K, sharing costs a round trip of the fp32 tile through LDS that
+# partials stored straight from the MMA fragments do not: it pays off only once
+# the last split would read at least this many partial elements of a tile.
+SPLIT_K_SHARED_MIN_PARTIALS = 16384
+
+
+def split_k_shared(block_m, block_n, k_waves, split_k, hti=False):
+    """Whether every split of a tile reduces a share of it (the shared
+    reduction of SplitKReduction) rather than the last arrival all of it."""
+    return (
+        not hti
+        # one promise bit per split
+        and 1 < split_k <= 16
+        and block_m * block_n >= SPLIT_K_SHARED_MIN_TILE
+        and (k_waves > 1 or split_k * block_m * block_n >= SPLIT_K_SHARED_MIN_PARTIALS)
+        and k_waves * slice_k_tile_elems(block_m, block_n) * 4 + 16 <= GFX950_LDS_BYTES
+    )
+
+
+def slice_k_lds_combine(block_m, block_n, k_waves, split_k, hti, shared):
+    """Whether the tile goes through LDS as fp32, row-major, once per k-wave, so
+    the whole workgroup adds the k-waves in one pass and stores C or row-major
+    split-K partials (else k-waves 1.. add into k-wave 0 one at a time and
+    split-K partials are stored straight from the MMA fragments)."""
+    return (
+        not hti
+        and (k_waves > 1 or shared)
+        and k_waves * slice_k_tile_elems(block_m, block_n) * 4
+        + (16 if split_k > 1 else 0)
+        <= GFX950_LDS_BYTES
+    )
+
+
+def c_lds_elems(block_m, block_n, k_waves, out_data_bytes, split_k, lds_combine):
+    """Shared C elements (output dtype): the C tile, the fp32 slice-K exchange
+    tile or every k-wave's fp32 tile, plus 16 bytes for the split-K arrival flag."""
+    if lds_combine:
+        tile_bytes = k_waves * slice_k_tile_elems(block_m, block_n) * 4
+    else:
+        tile_bytes = block_m * block_n * (4 if k_waves > 1 else out_data_bytes)
+    return (tile_bytes + (16 if split_k > 1 else 0)) // out_data_bytes
 
 
 @fx.struct
@@ -41,7 +138,7 @@ class GemmA16W16Gfx950Param:
     block_n: fx.Constexpr[int]
     block_k: fx.Constexpr[int]
     stages: fx.Constexpr[int]
-    is_split_k: fx.Constexpr[bool]
+    split_k: fx.Constexpr[int]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
     k_waves: fx.Constexpr[int]
@@ -50,6 +147,9 @@ class GemmA16W16Gfx950Param:
     a_is_transposed: fx.Constexpr[bool]
     b_is_transposed: fx.Constexpr[bool]
     has_bias: fx.Constexpr[bool]
+    lds_combine: fx.Constexpr[bool]
+    split_k_shared: fx.Constexpr[bool]
+    split_k_row_mask: fx.Constexpr[bool]
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
@@ -105,6 +205,8 @@ def make_gemm_a16w16_gfx950_param(
     a_is_transposed: bool = False,
     b_is_transposed: bool = True,
     has_bias: bool = False,
+    split_k_resident: bool = True,
+    m_tail: bool = True,
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
@@ -161,8 +263,20 @@ def make_gemm_a16w16_gfx950_param(
             else max_cshuffle_r2g_vec_size
         )
         assert block_n % cshuffle_r2g_vec_size == 0
+    # The shared reduction waits for the other splits of a tile, so it needs
+    # them all resident; otherwise partials go straight from the MMA fragments.
+    shared = split_k_resident and split_k_shared(
+        block_m, block_n, k_waves, split_k, use_half_tile_interleaved
+    )
+    lds_combine = slice_k_lds_combine(
+        block_m, block_n, k_waves, split_k, use_half_tile_interleaved, shared
+    )
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
-    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * out_dbytes)
+    smem_bytes = max(
+        smem_bytes,
+        c_lds_elems(block_m, block_n, k_waves, out_dbytes, split_k, lds_combine)
+        * out_dbytes,
+    )
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
         "gfx942": 65536,
@@ -269,7 +383,7 @@ def make_gemm_a16w16_gfx950_param(
         block_n=block_n,
         block_k=block_k,
         stages=stages,
-        is_split_k=split_k > 1,
+        split_k=split_k,
         m_waves=m_waves,
         n_waves=n_waves,
         k_waves=k_waves,
@@ -278,6 +392,16 @@ def make_gemm_a16w16_gfx950_param(
         a_is_transposed=a_is_transposed,
         b_is_transposed=b_is_transposed,
         has_bias=has_bias,
+        lds_combine=lds_combine,
+        split_k_shared=shared,
+        # Fragment partials of the rows below M only, when the tiles cross M.
+        split_k_row_mask=(
+            m_tail
+            and split_k > 1
+            and not lds_combine
+            and not use_half_tile_interleaved
+            and block_m * block_n >= SPLIT_K_TRIM_MIN_TILE_ELEMS
+        ),
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
@@ -298,8 +422,15 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     # @flyc.kernel bodies, so old bf16-rounding fp32 binaries are never reused.
     out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
-    name += "_kst4" if param.is_split_k else "_ks1"
+    # "fp32" and "f32" mark the fp32 split-K and slice-K reductions (cache key).
+    name += f"_ks{param.split_k}" + ("fp32" if param.split_k > 1 else "")
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
+    name += "f32" if param.k_waves > 1 else ""
+    combine = param.lds_combine
+    name += "c" if combine else ""
+    name += "s" if param.split_k_shared else ""
+    # "m": split-K partials of the rows below M only
+    name += "m" if param.split_k_row_mask else ""
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
     a_layout = "t" if param.a_is_transposed else "n"
@@ -424,60 +555,10 @@ def async_load_to_lds(
 
 
 @flyc.jit
-def write_cshuffle_vec_to_global(
-    out,
-    out_buf,
-    global_offset,
-    c_vec,
-    is_split_k,
-    is_fp32_output,
-):
-    vec_size = c_vec.numel
-    elem_dtype = c_vec.dtype
+def write_cshuffle_vec_to_global(out, global_offset, c_vec, is_fp32_output):
     if const_expr(is_fp32_output):
-        c_vec_global = c_vec.to(fx.Float32)
-        if const_expr(is_split_k):
-            atomic_atom = fx.make_copy_atom(
-                fx.rocdl.BufferAtomicAdd(fx.Float32), fx.Float32
-            )
-            scalar_layout = fx.make_layout(1, 1)
-            scalar_frag = fx.make_rmem_tensor(scalar_layout, fx.Float32)
-            for elem_idx in range_constexpr(vec_size):
-                scalar_frag.store(
-                    fx.Vector.from_elements(
-                        [c_vec_global[elem_idx]],
-                        fx.Float32,
-                    )
-                )
-                scalar_dst = fx.make_view(
-                    fx.get_iter(out_buf) + global_offset + elem_idx,
-                    scalar_layout,
-                )
-                fx.copy_atom_call(atomic_atom, scalar_frag, scalar_dst)
-        else:
-            fx.ptr_store(c_vec_global, fx.get_iter(out) + global_offset)
-    elif const_expr(is_split_k):
-        atomic_atom = fx.make_copy_atom(
-            fx.rocdl.BufferAtomicPkAdd(elem_dtype), elem_dtype
-        )
-        pair_layout = fx.make_layout(2, 1)
-        pair_frag = fx.make_rmem_tensor(pair_layout, elem_dtype)
-        for pair_idx in range_constexpr(vec_size // 2):
-            pair = fx.Vector.from_elements(
-                [
-                    c_vec[pair_idx * 2],
-                    c_vec[pair_idx * 2 + 1],
-                ],
-                elem_dtype,
-            )
-            pair_frag.store(pair)
-            pair_dst = fx.make_view(
-                fx.get_iter(out_buf) + global_offset + pair_idx * 2,
-                pair_layout,
-            )
-            fx.copy_atom_call(atomic_atom, pair_frag, pair_dst)
-    else:
-        fx.ptr_store(c_vec, fx.get_iter(out) + global_offset)
+        c_vec = c_vec.to(fx.Float32)
+    fx.ptr_store(c_vec, fx.get_iter(out) + global_offset)
 
 
 @flyc.kernel
@@ -487,7 +568,7 @@ def gemm_a16w16_gfx950_kernel(
     b: fx.Tensor,
     bias: fx.Tensor,
     semaphore: fx.Tensor,
-    signal: fx.Tensor,
+    workspace: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
@@ -498,7 +579,7 @@ def gemm_a16w16_gfx950_kernel(
     tiled_mma: fx.TiledMma,
     param: GemmA16W16Gfx950Param,
 ):
-    is_split_k = param.is_split_k
+    is_split_k = param.split_k > 1
     is_slice_k = param.k_waves > 1
     block_m = param.block_m
     block_n = param.block_n
@@ -520,16 +601,12 @@ def gemm_a16w16_gfx950_kernel(
         if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
         else elem_dtype
     )
-    if const_expr(is_split_k):
-        splitk_protocol = SplitKProtocol(
-            block_m,
-            block_n,
-            cshuffle_r2g_vec_size,
-            param.out_data_bytes,
-            block_threads,
-            param.has_bias,
-        )
-
+    m, n, k, working_k = load_kernargs_up_front(
+        (a, b, out)
+        + ((semaphore, workspace) if const_expr(param.split_k > 1) else ())
+        + ((bias,) if const_expr(param.has_bias) else ()),
+        (m, n, k, working_k),
+    )
     tid = fx.thread_idx.x
     threads_per_k_slice = param.m_waves * param.n_waves * GFX950_WAVE_SIZE
     tid_in_k_slice = tid % threads_per_k_slice
@@ -539,8 +616,17 @@ def gemm_a16w16_gfx950_kernel(
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
-    bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    ks_idx = fx.block_idx.y
+    if const_expr(param.group_m <= 0):
+        # Grid (n tiles, m tiles, splits): the same dispatch order as the linear
+        # tile id, without dividing it by num_pid_n.
+        bid_n = fx.block_idx.x
+        bid_m = fx.block_idx.y
+        ks_idx = fx.block_idx.z
+        tile_idx = bid_m * num_pid_n + bid_n
+    else:
+        bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
+        ks_idx = fx.block_idx.y
+        tile_idx = fx.block_idx.x
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
@@ -556,7 +642,18 @@ def gemm_a16w16_gfx950_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[global_output_dtype, k_waves * block_m * block_n, 16]
+        c: fx.Array[
+            global_output_dtype,
+            c_lds_elems(
+                block_m,
+                block_n,
+                k_waves,
+                param.out_data_bytes,
+                param.split_k,
+                param.lds_combine,
+            ),
+            16,
+        ]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -571,22 +668,31 @@ def gemm_a16w16_gfx950_kernel(
     else:
         bias_buf = None
 
+    lds_combine = param.lds_combine
+    smem_x = fx.recast_iter(fx.Float32, smem_c)
+    x_ld = block_n + SLICE_K_ROW_PAD
+    x_tile = slice_k_tile_elems(block_m, block_n)
+    if const_expr(lds_combine):
+        smem_k_tiles = smem_x + k_wave_idx * x_tile
+        flag_ptr = fx.recast_iter(fx.Int32, smem_x + k_waves * x_tile)
+    else:
+        flag_ptr = fx.recast_iter(fx.Int32, smem_c + block_m * block_n)
+
     if const_expr(is_split_k):
-        splitk_protocol.init(
-            semaphore,
-            signal,
-            out,
-            bias,
-            tid,
-            ks_idx,
-            m,
-            n,
-            block_m_offset,
-            block_n_offset,
-            global_output_dtype,
-            fx.block_idx.x,
-            n,
+        splitk_reduction = SplitKReduction(
+            param.split_k,
+            block_m * block_n,
+            block_threads if const_expr(lds_combine) else threads_per_k_slice,
         )
+        splitk_reduction.init(
+            semaphore,
+            workspace,
+            flag_ptr,
+            tid if const_expr(lds_combine) else tid_in_k_slice,
+            tile_idx,
+            ks_idx,
+        )
+        shared_reduce = param.split_k_shared
 
     ab_load_context = make_gemm_ab_load_context(
         elem_dtype,
@@ -620,7 +726,7 @@ def gemm_a16w16_gfx950_kernel(
 
     sA = fx.make_view(smem_a, a_lds_layout)
     sB = fx.make_view(smem_b, b_lds_layout)
-    sC_write = fx.make_view(smem_c + k_wave_idx * block_m * block_n, c_lds_layout)
+    sC_write = fx.make_view(smem_c, c_lds_layout)
 
     frag_A = thr_mma.make_fragment_A(sA)
     frag_B = thr_mma.make_fragment_B(sB)
@@ -636,20 +742,24 @@ def gemm_a16w16_gfx950_kernel(
     thr_mma_cRow = thr_mma.partition_C(row_coords)
     thr_mma_cCol = thr_mma.partition_C(col_coords)
 
+    def init_frag_C():
+        if const_expr(param.has_bias):
+            for i in range_constexpr(fx.size(frag_C.shape).unpack()):
+                col_idx = fx.get_scalar(thr_mma_cCol[i])
+                global_n_idx = block_n_offset + col_idx
+                safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
+                bias_val = bias_buf[safe_global_n_idx].to(fx.Float32)
+                if const_expr(is_slice_k):
+                    is_first_k_slice = k_wave_idx == 0
+                    bias_val = is_first_k_slice.select(bias_val, fx.Float32(0.0))
+                frag_C[i] = bias_val
+        else:
+            frag_C.fill(0.0)
+
     if const_expr(is_split_k):
         frag_C.fill(0.0)
-    elif const_expr(param.has_bias):
-        for i in range_constexpr(fx.size(frag_C.shape).unpack()):
-            col_idx = fx.get_scalar(thr_mma_cCol[i])
-            global_n_idx = block_n_offset + col_idx
-            safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
-            bias_val = bias_buf[safe_global_n_idx].to(fx.Float32)
-            if const_expr(is_slice_k):
-                is_first_k_slice = k_wave_idx == 0
-                bias_val = is_first_k_slice.select(bias_val, fx.Float32(0.0))
-            frag_C[i] = bias_val
     else:
-        frag_C.fill(0.0)
+        init_frag_C()
 
     def async_load_a_to_lds(k_tile, stage):
         async_load_to_lds(
@@ -726,10 +836,6 @@ def gemm_a16w16_gfx950_kernel(
         async_load_b_to_lds(stage, stage)
         async_load_a_to_lds(stage, stage)
         rocdl.asyncmark()
-    if const_expr(is_split_k):
-        splitk_protocol.zero_c()
-        expected_signal = splitk_protocol.take_ticket(split_k)
-        splitk_protocol.publish(expected_signal)
     rocdl.sched_barrier(0)
 
     main_loop_end = k_tiles - (stages - 1)
@@ -751,101 +857,299 @@ def gemm_a16w16_gfx950_kernel(
         compute_stage(current_stage, main_loop_end + s)
         current_stage = (current_stage + 1) % stages
 
-    frag_C_out = fx.make_fragment_like(frag_C, global_output_dtype)
-    frag_C_out.store(frag_C.load().to(global_output_dtype))
-
-    gpu.barrier()
-    for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
-        row = fx.get_scalar(thr_mma_cRow[i])
-        col = fx.get_scalar(thr_mma_cCol[i])
-        sC_write[row, col] = frag_C_out[i]
-
-    if const_expr(is_split_k):
-        splitk_protocol.wait_until_initialized(expected_signal)
-    else:
+    if const_expr(lds_combine):
         gpu.barrier()
+        # Every k-wave stores its fp32 tile row-major; the whole workgroup then
+        # adds the k-waves in order and writes C (or the split's partial).
+        for i in range_constexpr(fx.size(frag_C.shape).unpack()):
+            row = fx.get_scalar(thr_mma_cRow[i])
+            col = fx.get_scalar(thr_mma_cCol[i])
+            fx.ptr_store(frag_C[i], smem_k_tiles + row * x_ld + col)
+        gpu.barrier()
+    elif const_expr(is_slice_k):
+        gpu.barrier()
+        # Add the k-wave partials into k-wave 0 in fp32 and in k-wave order, one
+        # k-wave at a time through LDS, so C is rounded to the output dtype once.
+        smem_x = fx.recast_iter(fx.Float32, smem_c)
+        frag_C_groups = fx.size(frag_C.shape).unpack() // 4
 
-    cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
-    cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
-    cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
-    lane_contig_atomics = is_split_k
-    if const_expr(lane_contig_atomics):
-        # Split-K: lanes walk consecutive output elements (one fp32, or one bf16/fp16
-        # pair for the packed atomics), so each wave-level atomic covers whole 64 B
-        # lines (16 lanes per line) and the memory-side read-modify-write runs once per
-        # line per instruction. The vec-per-lane mapping below would touch 16 lines with
-        # 4 lanes each and pay four passes per line.
-        atom_elems = 1 if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
-        wave_idx = tid // GFX950_WAVE_SIZE
-        lane_idx = tid % GFX950_WAVE_SIZE
-        tile_elems = block_m * block_n
-        for i in range_constexpr(cshuffle_iters):
-            chunk = (
-                block_threads * i + wave_idx * GFX950_WAVE_SIZE
-            ) * cshuffle_r2g_vec_size
-            for j in range_constexpr(cshuffle_r2g_vec_size // atom_elems):
-                elem_idx = chunk + (j * GFX950_WAVE_SIZE + lane_idx) * atom_elems
-                if elem_idx < tile_elems:
-                    local_row = elem_idx // block_n
-                    local_col = elem_idx % block_n
-                    global_row = block_m_offset + local_row
-                    global_col = block_n_offset + local_col
-                    if (global_row < m) and (global_col < n):
-                        c_val = fx.ptr_load(
-                            smem_c + elem_idx,
-                            result_type=fx.Vector.make_type(
-                                atom_elems, global_output_dtype
-                            ),
-                        )
-                        for k_slice in range_constexpr(1, k_waves):
-                            c_val = c_val + fx.ptr_load(
-                                smem_c + k_slice * tile_elems + elem_idx,
-                                result_type=fx.Vector.make_type(
-                                    atom_elems, global_output_dtype
-                                ),
-                            )
-                        write_cshuffle_vec_to_global(
-                            out,
-                            out_buf,
-                            global_row * n + global_col,
-                            c_val,
-                            is_split_k,
-                            param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                        )
-    for i in range_constexpr(0 if lane_contig_atomics else cshuffle_iters):
-        vector_idx = block_threads * i + tid
-        if vector_idx < cshuffle_vectors:
-            local_row = vector_idx // cshuffle_r2g_x_threads
-            local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
-            global_row = block_m_offset + local_row
-            global_col = block_n_offset + local_col
-            if (global_row < m) and (global_col < n):
-                c_vec = fx.ptr_load(
-                    smem_c + local_row * block_n + local_col,
-                    result_type=fx.Vector.make_type(
-                        cshuffle_r2g_vec_size, global_output_dtype
-                    ),
+        def store_k_slice_partial():
+            for g in range_constexpr(frag_C_groups):
+                x_vec = fx.Vector.from_elements(
+                    [frag_C[g * 4 + e] for e in range_constexpr(4)], fx.Float32
                 )
-                for k_slice in range_constexpr(1, k_waves):
-                    peer_c_vec = fx.ptr_load(
-                        smem_c
-                        + k_slice * block_m * block_n
-                        + local_row * block_n
-                        + local_col,
+                fx.ptr_store(
+                    x_vec, smem_x + (g * threads_per_k_slice + tid_in_k_slice) * 4
+                )
+
+        def add_k_slice_partial():
+            for g in range_constexpr(frag_C_groups):
+                x_vec = fx.ptr_load(
+                    smem_x + (g * threads_per_k_slice + tid_in_k_slice) * 4,
+                    result_type=fx.Vector.make_type(4, fx.Float32),
+                )
+                for e in range_constexpr(4):
+                    frag_C[g * 4 + e] = frag_C[g * 4 + e] + x_vec[e]
+
+        for k_slice in range_constexpr(1, k_waves):
+            if k_wave_idx == k_slice:
+                store_k_slice_partial()
+            gpu.barrier()
+            if k_wave_idx == 0:
+                add_k_slice_partial()
+            gpu.barrier()
+
+    def store_c_tile_to_lds():
+        frag_C_out = fx.make_fragment_like(frag_C, global_output_dtype)
+        frag_C_out.store(frag_C.load().to(global_output_dtype))
+        for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
+            row = fx.get_scalar(thr_mma_cRow[i])
+            col = fx.get_scalar(thr_mma_cCol[i])
+            sC_write[row, col] = frag_C_out[i]
+
+    def store_c_tile_to_global():
+        if const_expr(is_slice_k):
+            if k_wave_idx == 0:
+                store_c_tile_to_lds()
+        else:
+            store_c_tile_to_lds()
+        gpu.barrier()
+        cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
+        cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
+        cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+        for i in range_constexpr(cshuffle_iters):
+            vector_idx = block_threads * i + tid
+            if vector_idx < cshuffle_vectors:
+                local_row = vector_idx // cshuffle_r2g_x_threads
+                local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
+                global_row = block_m_offset + local_row
+                global_col = block_n_offset + local_col
+                if (global_row < m) and (global_col < n):
+                    c_vec = fx.ptr_load(
+                        smem_c + local_row * block_n + local_col,
                         result_type=fx.Vector.make_type(
                             cshuffle_r2g_vec_size, global_output_dtype
                         ),
                     )
-                    c_vec = c_vec + peer_c_vec
-                global_offset = global_row * n + global_col
-                write_cshuffle_vec_to_global(
-                    out,
-                    out_buf,
-                    global_offset,
-                    c_vec,
-                    is_split_k,
-                    param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                    write_cshuffle_vec_to_global(
+                        out,
+                        global_row * n + global_col,
+                        c_vec,
+                        param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                    )
+
+    def combine_k_tiles(local_row, local_col, width):
+        """Sum of the k-waves' fp32 tiles at one row and ``width`` columns."""
+        acc = None
+        for w in range_constexpr(k_waves):
+            parts = [
+                fx.ptr_load(
+                    smem_x + w * x_tile + local_row * x_ld + local_col + q * 4,
+                    result_type=fx.Vector.make_type(4, fx.Float32),
                 )
+                for q in range_constexpr(width // 4)
+            ]
+            vals = [part[e] for part in parts for e in range_constexpr(4)]
+            acc = vals if acc is None else [x + y for x, y in zip(acc, vals)]
+        return acc
+
+    def store_c_vec(local_row, local_col, vals):
+        global_row = block_m_offset + local_row
+        global_col = block_n_offset + local_col
+        if (global_row < m) and (global_col < n):
+            write_cshuffle_vec_to_global(
+                out,
+                global_row * n + global_col,
+                fx.Vector.from_elements(vals, fx.Float32).to(global_output_dtype),
+                False,
+            )
+
+    if const_expr(lds_combine and is_split_k):
+        # Row-major float4 partials: every thread of the workgroup stores and
+        # reduces whole vectors, and the reducer writes C straight from its sums.
+        store_partial_vec = splitk_reduction.store_partial_vec
+        load_partial_vec = splitk_reduction.load_partial_vec
+        vec_x_threads = block_n // 4
+        vecs = block_m * block_n // 4
+        vec_iters = (vecs + block_threads - 1) // block_threads
+
+        def bias_vec(local_col):
+            if const_expr(param.has_bias):
+                acc = []
+                for e in range_constexpr(4):
+                    global_n_idx = block_n_offset + local_col + e
+                    safe_n_idx = (global_n_idx < n).select(global_n_idx, 0)
+                    acc.append(bias_buf[safe_n_idx].to(fx.Float32))
+                return acc
+            return [fx.Float32(0.0) for _ in range_constexpr(4)]
+
+        if const_expr(shared_reduce):
+            # Shared reduction. The vectors of the tile's valid rows are cut into
+            # split_k contiguous ranges; range c is reduced by split c if it
+            # promised to and saw every split arrive, else by the last arrival.
+            # A split does not store its own range (it adds it from LDS) unless
+            # its wait times out: then it stores the range before withdrawing
+            # the promise.
+            m_rem = m - block_m_offset
+            valid_vecs = (m_rem < block_m).select(m_rem, block_m) * vec_x_threads
+            per_range = (valid_vecs + (param.split_k - 1)) // param.split_k
+            range_iters = (
+                (vecs + param.split_k - 1) // param.split_k + block_threads - 1
+            ) // block_threads
+            own_lo = ks_idx * per_range
+            own_hi = own_lo + per_range
+
+            def own_vec(j):
+                return combine_k_tiles(j // vec_x_threads, j % vec_x_threads * 4, 4)
+
+            def vec_ok(j):
+                col_ok = block_n_offset + j % vec_x_threads * 4 < n
+                return (j < valid_vecs) & col_ok
+
+            for i in range_constexpr(vec_iters):
+                j = block_threads * i + tid
+                if (j < vecs) & vec_ok(j) & ((j < own_lo) | (j >= own_hi)):
+                    store_partial_vec(j, own_vec(j), j >= 0)
+
+            def store_own():
+                for i in range_constexpr(range_iters):
+                    j = own_lo + block_threads * i + tid
+                    if (j < own_hi) & vec_ok(j):
+                        store_partial_vec(j, own_vec(j), j >= 0)
+
+            def reduce_range(c):
+                # Issue every load before the first add; the own split's share
+                # comes from LDS, and its load (possibly never stored) reads nothing.
+                lo = c * per_range
+                hi = lo + per_range
+                loads = []
+                for i in range_constexpr(range_iters):
+                    j = lo + block_threads * i + tid
+                    ok = (j < hi) & vec_ok(j)
+                    safe_j = ok.select(j, 0)
+                    parts = []
+                    for ks in range_constexpr(param.split_k):
+                        parts.append(load_partial_vec(ks, safe_j, ok & (ks_idx != ks)))
+                    loads.append((safe_j, ok, parts))
+                for safe_j, ok, parts in loads:
+                    if ok:
+                        local_row = safe_j // vec_x_threads
+                        local_col = safe_j % vec_x_threads * 4
+                        acc = bias_vec(local_col)
+                        own = own_vec(safe_j)
+                        for ks in range_constexpr(param.split_k):
+                            is_own = ks_idx == ks
+                            acc = [
+                                acc[e] + is_own.select(own[e], parts[ks][e])
+                                for e in range_constexpr(4)
+                            ]
+                        store_c_vec(local_row, local_col, acc)
+
+            def reduce_unpromised(old):
+                for range_idx in range(0, param.split_k, 1, unroll=1):
+                    promised = (old >> (range_idx + splitk_reduction.PROMISE_SHIFT)) & 1
+                    if (range_idx != ks_idx) & (promised == 0):
+                        reduce_range(range_idx)
+
+            arrive_poll = splitk_reduction.arrive_poll
+            arrived = splitk_reduction.arrived
+            withdraw = splitk_reduction.withdraw
+            old = arrive_poll()
+            is_last = (old & 0xFF) == param.split_k - 1
+            keep = arrived()
+            if keep == 0:
+                # Timed out: hand the own range to the last arrival, unless it
+                # has already arrived (the withdrawal fails then).
+                store_own()
+                keep = 1 - withdraw()
+            if keep != 0:
+                reduce_range(ks_idx)
+            # The last arrival also reduces the ranges of the splits whose
+            # promise is missing from the word it saw.
+            missing = (
+                (((1 << param.split_k) - 1) << splitk_reduction.PROMISE_SHIFT)
+                - (fx.Int32(1) << (ks_idx + splitk_reduction.PROMISE_SHIFT))
+            ) & (old ^ fx.Int32(-1))
+            if is_last & (missing != 0):
+                reduce_unpromised(old)
+        else:
+            for i in range_constexpr(vec_iters):
+                vector_idx = block_threads * i + tid
+                if vector_idx < vecs:
+                    local_row = vector_idx // vec_x_threads
+                    local_col = vector_idx % vec_x_threads * 4
+                    store_partial_vec(
+                        vector_idx,
+                        combine_k_tiles(local_row, local_col, 4),
+                        (block_m_offset + local_row < m)
+                        & (block_n_offset + local_col < n),
+                    )
+            arrive = splitk_reduction.arrive
+            if arrive():
+                for i in range_constexpr(vec_iters):
+                    vector_idx = block_threads * i + tid
+                    if vector_idx < vecs:
+                        local_row = vector_idx // vec_x_threads
+                        local_col = vector_idx % vec_x_threads * 4
+                        row_ok = (block_m_offset + local_row < m) & (
+                            block_n_offset + local_col < n
+                        )
+                        acc = bias_vec(local_col)
+                        for ks in range_constexpr(param.split_k):
+                            part = load_partial_vec(ks, vector_idx, row_ok)
+                            acc = [acc[e] + part[e] for e in range_constexpr(4)]
+                        store_c_vec(local_row, local_col, acc)
+    elif const_expr(lds_combine):
+        vec_x_threads = block_n // cshuffle_r2g_vec_size
+        vecs = block_m * block_n // cshuffle_r2g_vec_size
+        for i in range_constexpr((vecs + block_threads - 1) // block_threads):
+            vector_idx = block_threads * i + tid
+            if vector_idx < vecs:
+                local_row = vector_idx // vec_x_threads
+                local_col = vector_idx % vec_x_threads * cshuffle_r2g_vec_size
+                store_c_vec(
+                    local_row,
+                    local_col,
+                    combine_k_tiles(local_row, local_col, cshuffle_r2g_vec_size),
+                )
+    elif const_expr(is_split_k):
+        # Calls through plain names: a dynamic `if` treats `obj.method()` as
+        # state that must be yielded.
+        store_partial = splitk_reduction.store_partial
+        accumulate = splitk_reduction.accumulate
+
+        def group_live(group):
+            # Groups are 4 rows of one column; skip the ones entirely past M.
+            return block_m_offset + fx.get_scalar(thr_mma_cRow[group * 4]) < m
+
+        live = group_live if const_expr(param.split_k_row_mask) else None
+
+        def reduce_tile():
+            if const_expr(block_m * block_n >= SPLIT_K_TRIM_MIN_TILE_ELEMS):
+                # One copy per split index, so this split's partial comes from
+                # registers and is added in its place without per-element selects.
+                for own_split in range_constexpr(param.split_k):
+                    if ks_idx == own_split:
+                        accumulate(frag_C, 0, init_frag_C, own_split, live)
+            else:
+                accumulate(frag_C, 0, init_frag_C, None, live)
+
+        if const_expr(is_slice_k):
+            if k_wave_idx == 0:
+                store_partial((frag_C,), live)
+        else:
+            store_partial((frag_C,), live)
+        if splitk_reduction.arrive():
+            if const_expr(is_slice_k):
+                if k_wave_idx == 0:
+                    reduce_tile()
+            else:
+                reduce_tile()
+            store_c_tile_to_global()
+    else:
+        if const_expr(not is_slice_k):
+            gpu.barrier()
+        store_c_tile_to_global()
 
 
 @flyc.kernel
@@ -855,7 +1159,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     b: fx.Tensor,
     bias: fx.Tensor,
     semaphore: fx.Tensor,
-    signal: fx.Tensor,
+    workspace: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
@@ -866,7 +1170,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     tiled_mma: fx.TiledMma,
     param: GemmA16W16Gfx950Param,
 ):
-    is_split_k = param.is_split_k
+    is_split_k = param.split_k > 1
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
@@ -888,16 +1192,12 @@ def gemm_a16w16_hti_gfx950_kernel(
         if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
         else elem_dtype
     )
-    if const_expr(is_split_k):
-        splitk_protocol = SplitKProtocol(
-            block_m,
-            block_n,
-            cshuffle_r2g_vec_size,
-            param.out_data_bytes,
-            block_threads,
-            param.has_bias,
-        )
-
+    m, n, k, working_k = load_kernargs_up_front(
+        (a, b, out)
+        + ((semaphore, workspace) if const_expr(param.split_k > 1) else ())
+        + ((bias,) if const_expr(param.has_bias) else ()),
+        (m, n, k, working_k),
+    )
     tid = fx.thread_idx.x
     wid = tid // GFX950_WAVE_SIZE
     num_pid_m = (m + block_m - 1) // block_m
@@ -905,8 +1205,17 @@ def gemm_a16w16_hti_gfx950_kernel(
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
-    bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    ks_idx = fx.block_idx.y
+    if const_expr(param.group_m <= 0):
+        # Grid (n tiles, m tiles, splits): the same dispatch order as the linear
+        # tile id, without dividing it by num_pid_n.
+        bid_n = fx.block_idx.x
+        bid_m = fx.block_idx.y
+        ks_idx = fx.block_idx.z
+        tile_idx = bid_m * num_pid_n + bid_n
+    else:
+        bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
+        ks_idx = fx.block_idx.y
+        tile_idx = fx.block_idx.x
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
@@ -922,7 +1231,13 @@ def gemm_a16w16_hti_gfx950_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[global_output_dtype, block_m * block_n, 16]
+        c: fx.Array[
+            global_output_dtype,
+            c_lds_elems(
+                block_m, block_n, 1, param.out_data_bytes, param.split_k, False
+            ),
+            16,
+        ]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -938,20 +1253,16 @@ def gemm_a16w16_hti_gfx950_kernel(
         bias_buf = None
 
     if const_expr(is_split_k):
-        splitk_protocol.init(
+        splitk_reduction = SplitKReduction(
+            param.split_k, block_m * block_n, block_threads
+        )
+        splitk_reduction.init(
             semaphore,
-            signal,
-            out,
-            bias,
+            workspace,
+            fx.recast_iter(fx.Int32, smem_c + block_m * block_n),
             tid,
+            tile_idx,
             ks_idx,
-            m,
-            n,
-            block_m_offset,
-            block_n_offset,
-            global_output_dtype,
-            fx.block_idx.x,
-            n,
         )
 
     ab_load_context = make_gemm_ab_load_context(
@@ -1106,13 +1417,10 @@ def gemm_a16w16_hti_gfx950_kernel(
                             cshuffle_r2g_vec_size, global_output_dtype
                         ),
                     )
-                    global_offset = global_row * n + global_col
                     write_cshuffle_vec_to_global(
                         out,
-                        out_buf,
-                        global_offset,
+                        global_row * n + global_col,
                         c_vec,
-                        is_split_k,
                         param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
                     )
 
@@ -1121,38 +1429,26 @@ def gemm_a16w16_hti_gfx950_kernel(
     c10 = make_c_fragment(1, 0)
     c11 = make_c_fragment(1, 1)
 
-    if const_expr(is_split_k):
-        c00.fill(0.0)
-        c01.fill(0.0)
-        c10.fill(0.0)
-        c11.fill(0.0)
-    elif const_expr(param.has_bias):
-        for i in range_constexpr(fx.size(c00.shape).unpack()):
-            col_idx = fx.get_scalar(thr_mma_cCol[i])
-            global_n0_idx = block_n_offset + col_idx
-            global_n1_idx = global_n0_idx + half_block_n
-            safe_global_n0_idx = (global_n0_idx < n).select(global_n0_idx, 0)
-            safe_global_n1_idx = (global_n1_idx < n).select(global_n1_idx, 0)
-            bias0 = bias_buf[safe_global_n0_idx].to(fx.Float32)
-            bias1 = bias_buf[safe_global_n1_idx].to(fx.Float32)
-            c00[i] = bias0
-            c01[i] = bias1
-            c10[i] = bias0
-            c11[i] = bias1
-    else:
-        c00.fill(0.0)
-        c01.fill(0.0)
-        c10.fill(0.0)
-        c11.fill(0.0)
+    def init_c_fragment(frag, n_part, with_bias):
+        if const_expr(param.has_bias and with_bias):
+            for i in range_constexpr(fx.size(frag.shape).unpack()):
+                col_idx = fx.get_scalar(thr_mma_cCol[i])
+                global_n_idx = block_n_offset + n_part * half_block_n + col_idx
+                safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
+                frag[i] = bias_buf[safe_global_n_idx].to(fx.Float32)
+        else:
+            frag.fill(0.0)
+
+    # Split-K adds the bias once, when the partials are reduced.
+    init_c_fragment(c00, 0, not is_split_k)
+    init_c_fragment(c01, 1, not is_split_k)
+    init_c_fragment(c10, 0, not is_split_k)
+    init_c_fragment(c11, 1, not is_split_k)
 
     async_load_b_to_lds(0, 0, 0)
     async_load_a_to_lds(0, 0, 0)
     async_load_b_to_lds(1, 0, 0)
     async_load_a_to_lds(1, 0, 0)
-    if const_expr(is_split_k):
-        splitk_protocol.zero_c()
-        expected_signal = splitk_protocol.take_ticket(split_k)
-        splitk_protocol.publish(expected_signal)
     rocdl.sched_barrier(0)
     if wid // n_waves == 1:
         rocdl.s_barrier()
@@ -1216,8 +1512,6 @@ def gemm_a16w16_hti_gfx950_kernel(
 
     k_tile = main_loop_end
     # 0
-    if const_expr(is_split_k):
-        wait_vmcnt_and_barrier(0)
     b0 = load_b_fragment(0, 0)
     a0 = load_a_fragment(0, 0)
     async_load_a_to_lds(1, k_tile + 1, 1)
@@ -1252,25 +1546,38 @@ def gemm_a16w16_hti_gfx950_kernel(
     a1 = load_a_fragment(1, 1)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
-    store_half_tile_to_lds(0, 0, c00)
+    if const_expr(not is_split_k):
+        store_half_tile_to_lds(0, 0, c00)
     consume(c10, a1, b0, False)
     rocdl.sched_barrier(0)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
-    store_half_tile_to_lds(0, 1, c01)
+    if const_expr(not is_split_k):
+        store_half_tile_to_lds(0, 1, c01)
     consume(c11, a1, b1, False)
     rocdl.sched_barrier(0)
     if const_expr(is_split_k):
         if wid // n_waves == 0:
             rocdl.s_barrier()
         rocdl.s_barrier()
-        store_half_tile_to_lds(1, 0, c10)
-        store_half_tile_to_lds(1, 1, c11)
-        splitk_protocol.wait_until_initialized(expected_signal)
-        store_half_tile_to_global(0, 0)
-        store_half_tile_to_global(0, 1)
-        store_half_tile_to_global(1, 0)
-        store_half_tile_to_global(1, 1)
+        store_partial = splitk_reduction.store_partial
+        accumulate = splitk_reduction.accumulate
+        group = fx.size(c00.shape).unpack() // 4
+        store_partial((c00, c01, c10, c11))
+        if splitk_reduction.arrive():
+            accumulate(c00, 0, lambda: init_c_fragment(c00, 0, True))
+            accumulate(c01, group, lambda: init_c_fragment(c01, 1, True))
+            accumulate(c10, 2 * group, lambda: init_c_fragment(c10, 0, True))
+            accumulate(c11, 3 * group, lambda: init_c_fragment(c11, 1, True))
+            store_half_tile_to_lds(0, 0, c00)
+            store_half_tile_to_lds(0, 1, c01)
+            store_half_tile_to_lds(1, 0, c10)
+            store_half_tile_to_lds(1, 1, c11)
+            gpu.barrier()
+            store_half_tile_to_global(0, 0)
+            store_half_tile_to_global(0, 1)
+            store_half_tile_to_global(1, 0)
+            store_half_tile_to_global(1, 1)
     else:
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(0, 0)
@@ -1290,7 +1597,7 @@ def gemm_a16w16_gfx950(
     b: fx.Tensor,
     bias: fx.Tensor,
     semaphore: fx.Tensor,
-    signal: fx.Tensor,
+    workspace: fx.Tensor,
     split_k: fx.Int32,
     param: GemmA16W16Gfx950Param,
     stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -1328,9 +1635,9 @@ def gemm_a16w16_gfx950(
             ),
         ),
     )
-    split_alignment = GFX950_DMA_BYTES // param.in_data_bytes
+    # Whole K tiles per split; the last split takes the remainder.
     working_k = (k + split_k - 1) // split_k
-    working_k = (working_k + split_alignment - 1) // split_alignment * split_alignment
+    working_k = (working_k + param.block_k - 1) // param.block_k * param.block_k
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
     gemm_a16w16_kernel_impl = (
@@ -1346,7 +1653,7 @@ def gemm_a16w16_gfx950(
         b,
         bias,
         semaphore,
-        signal,
+        workspace,
         m,
         n,
         k,
@@ -1357,7 +1664,11 @@ def gemm_a16w16_gfx950(
         tiled_mma,
         param,
     ).launch(
-        grid=(num_pid_m * num_pid_n, split_k, 1),
+        grid=(
+            (num_pid_n, num_pid_m, split_k)
+            if const_expr(param.group_m <= 0)
+            else (num_pid_m * num_pid_n, split_k, 1)
+        ),
         block=(param.block_threads, 1, 1),
         stream=stream,
     )
@@ -1370,17 +1681,25 @@ set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 def _gemm_a16w16_gfx950_param_for(items):
     # Building the param struct coerces every field through FlyDSL's typing
     # layer, which costs more host time than the launch itself; it depends
-    # only on the config, so one struct per config serves every M.
+    # only on the config and two facts about the grid, so a few structs per
+    # config serve every M.
     return make_gemm_a16w16_gfx950_param(**dict(items))
 
 
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     result = None
+    split_k = kwargs.get("split_k", 1)
+    block_m = kwargs.get("block_m", 256)
+    tiles = -(-m // block_m) * -(-n // kwargs.get("block_n", 256))
+    kwargs = {
+        **kwargs,
+        "split_k_resident": tiles * split_k <= device_cu_num(),
+        "m_tail": m % block_m != 0,
+    }
     try:
         result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
         return None
-    split_k = kwargs.get("split_k", 1)
     try:
         assert_no_k_tail(k, kwargs)
     except AssertionError:
@@ -1399,9 +1718,18 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     num_pid_n = (n + result.block_n - 1) // result.block_n
     if split_k > 1:
         c_elements_per_iteration = result.block_threads * cshuffle_r2g_vec_size
+        workspace_bytes = (
+            num_pid_m * num_pid_n * split_k * result.block_m * result.block_n * 4
+        )
+        # The one-pass slice-K combine guards its partial vectors per thread.
+        lds_combine = result.lds_combine
         if (
             num_pid_m * num_pid_n > SPLIT_K_SEMAPHORE_MAX_LEN
-            or result.block_m * result.block_n % c_elements_per_iteration != 0
+            or (
+                not lds_combine
+                and result.block_m * result.block_n % c_elements_per_iteration != 0
+            )
+            or workspace_bytes >= 2**31
         ):
             return None
     return result
@@ -1412,18 +1740,9 @@ def assert_no_k_tail(k: int, kwargs: dict):
     block_k = kwargs["block_k"]
     stages = kwargs["stages"]
     use_half_tile_interleaved = kwargs["use_half_tile_interleaved"]
-    async_load_vec_size = GFX950_DMA_BYTES // 2
     working_k = (k + split_k - 1) // split_k
-    working_k = (
-        (working_k + async_load_vec_size - 1)
-        // async_load_vec_size
-        * async_load_vec_size
-    )
+    working_k = (working_k + block_k - 1) // block_k * block_k
     last_working_k = k - (split_k - 1) * working_k
-    assert working_k % block_k == 0, (
-        "K-tail is unsupported: aligned split-K partition size "
-        f"{working_k} is not divisible by block_k={block_k}"
-    )
     assert last_working_k > 0 and last_working_k % block_k == 0, (
         "K-tail is unsupported: final split-K partition size "
         f"{last_working_k} must be positive and divisible by block_k={block_k}"
@@ -1453,17 +1772,14 @@ def assert_no_k_tail(k: int, kwargs: dict):
 
 
 @functools.lru_cache(maxsize=128)
-def get_split_k_buffers(stream, device, split_k):
-    # Keyed by split_k: a semaphore word only ever advances by split_k per launch,
-    # which is what lets the kernel derive the launch index from its ticket.
+def get_split_k_buffers(stream, device):
+    # One arrival counter per output tile, which the last split to arrive resets.
     with persistent_alloc(torch.device(device)):
-        semaphore = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int64, device=device
+        return torch.zeros(
+            (SPLIT_K_SEMAPHORE_MAX_LEN * SPLIT_K_COUNTER_STRIDE,),
+            dtype=torch.int32,
+            device=device,
         )
-        signal = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
-        )
-    return semaphore, signal
 
 
 def _dynamic_tensor_arg(tensor, leading_dim):
@@ -1487,7 +1803,7 @@ def gemm_a16w16(
     Each layout character controls only the corresponding tensor stride:
     N is row-major and T is column-major. Logical tensor shapes never change.
     Inputs that violate the selected layout or DMA alignment are rejected.
-    Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions.
+    Set ``user_kwargs["split_k"]`` above 1 to reduce K partitions in fp32.
     Set ``user_kwargs["k_waves"]`` above 1 for full-tile workgroup-local slice-K.
     ``out_dtype`` may be the input dtype or ``torch.float32``.
     """
@@ -1610,18 +1926,29 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
-    semaphore, signal = get_split_k_buffers(stream, device, split_k)
+    semaphore = get_split_k_buffers(stream, device)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)
     bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
+    if split_k > 1:
+        # One fp32 partial tile per (output tile, split), reduced by the last split.
+        tiles = -(-m // param.block_m) * -(-n // param.block_n)
+        workspace = torch.empty(
+            (split_k * tiles * param.block_m * param.block_n,),
+            dtype=torch.float32,
+            device=device,
+        )
+        workspace_arg = _dynamic_tensor_arg(workspace, 0)
+    else:
+        workspace_arg = out_arg
     dispatch_args = (
         out_arg,
         a_arg,
         b_arg,
         bias_arg,
         semaphore,
-        signal,
+        workspace_arg,
         split_k,
         param,
         stream,
