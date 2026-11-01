@@ -55,8 +55,11 @@ def dg_tmp_rows(x):
 def num_programs_fwd(x):
     # Replaces num_programs() for the forward operators on gfx950, and falls back
     # to num_programs() for other architectures
-    if get_arch() == "gfx950":
-        # num_programs() caps the grid at one workgroup per CU, so oversubscribe
+    if get_arch() in ("gfx950", "gfx1250"):
+        # num_programs() caps the grid at one workgroup per CU, so oversubscribe.
+        # gfx1250 (96-CU DPX partition, N 2880, block 4096): 4 per CU halves the
+        # fused-add forward at M 1024-16384 (7500 rows: 61.6 -> 31.6 us); 8 and 16
+        # are no better.
         fwd_program_oversub = 4
         fwd_oversub_max_block_size = 8192
         # except large blocks
