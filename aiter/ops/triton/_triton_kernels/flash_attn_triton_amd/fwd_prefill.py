@@ -963,12 +963,14 @@ def attn_fwd(
     if FP8_AS_FP16:
         # q, k and v reach the dot as fp16 without descale: q_descale * k_descale
         # joins the SM_SCALE multiply, v_descale scales the output. Same descale
-        # indexing as the IS_FP8 branch.
+        # indexing as the IS_FP8 branch. The product is taken in fp32, as the
+        # IS_FP8 branch does, so fp16 descales do not overflow.
         if GROUP_SIZE != 1:
             q_scale = tl.load(Q_Descale + off_z * stride_q_descale_z + off_h_k)
         else:
             q_scale = tl.load(Q_Descale + off_z * stride_q_descale_z + off_h_q)
-        q_scale = q_scale * tl.load(K_Descale + off_z * stride_k_descale_z + off_h_k)
+        k_scale = tl.load(K_Descale + off_z * stride_k_descale_z + off_h_k)
+        q_scale = q_scale.to(tl.float32) * k_scale.to(tl.float32)
         v_scale = tl.load(V_Descale + off_z * stride_v_descale_z + off_h_k)
         q_descale = q_scale
 
@@ -1387,7 +1389,7 @@ def _fp8_to_fp16_bshd(
     off_s = tl.program_id(0).to(tl.int64) * BLOCK_S + tl.arange(0, BLOCK_S)
     off_h = tl.program_id(1).to(tl.int64)
     off_z = tl.program_id(2).to(tl.int64)
-    offs_d = tl.arange(0, BLOCK_D)
+    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
     mask = (off_s[:, None] < seqlen) & (offs_d[None, :] < head_dim)
     x = tl.load(
         X
@@ -1497,20 +1499,22 @@ def attention_forward_prefill_triton_impl(
                 "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
                 UserWarning,
             )
+            ones = torch.ones(
+                q.shape[0], k.shape[2], dtype=torch.float32, device=q.device
+            )
+            q_descale = ones if q_descale is None else q_descale
+            k_descale = ones if k_descale is None else k_descale
+            v_descale = ones if v_descale is None else v_descale
         descale_shape = (q.shape[0], k.shape[2])
         for name, descale in (("q", q_descale), ("k", k_descale), ("v", v_descale)):
             assert (
-                descale is None or tuple(descale.shape) == descale_shape
+                tuple(descale.shape) == descale_shape
             ), f"{name}_descale expected shape {descale_shape} got {tuple(descale.shape)}"
         assert o.dtype in [
             torch.float16,
             torch.bfloat16,
             torch.float32,
         ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
-        ones = torch.ones(q.shape[0], k.shape[2], dtype=torch.float32, device=q.device)
-        q_descale = ones if q_descale is None else q_descale
-        k_descale = ones if k_descale is None else k_descale
-        v_descale = ones if v_descale is None else v_descale
         k = _fp8_to_fp16(k)
         v = _fp8_to_fp16(v)
 

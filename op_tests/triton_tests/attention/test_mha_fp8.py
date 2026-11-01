@@ -5,7 +5,11 @@ import pytest
 import torch
 
 from aiter import logger
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import ANY_FP8_ARCHS
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import fwd_prefill
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
+    ANY_FP8_ARCHS,
+    GpuArch,
+)
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_func,
@@ -142,6 +146,70 @@ def test_mha_fp8_strided_qkv(SEQLEN: int, HEAD_SZ: int, CAUSAL: bool):
     )
 
     torch.testing.assert_close(strided_out, contiguous_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("DESCALE", ["fp32", "fp16_large"])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp8_sw_emulated_path(monkeypatch, DESCALE: str, CAUSAL: bool):
+    # Forces the path for archs with software-emulated fp8, so it also runs on archs
+    # with fp8 hardware. The arch name and its configs stay real. "fp16_large" has
+    # fp16 descales whose q * k product exceeds the fp16 range.
+    monkeypatch.setattr(
+        GpuArch, "supports_sw_emulated_fp8", property(lambda self: True)
+    )
+    calls = []
+    to_fp16 = fwd_prefill._fp8_to_fp16
+    monkeypatch.setattr(
+        fwd_prefill, "_fp8_to_fp16", lambda x: calls.append(x) or to_fp16(x)
+    )
+
+    BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 2, 300, 8, 2, 128
+    torch.manual_seed(20)
+    # q and k shrink with the large descales, so the scores stay in a usual range
+    qk_scale, descale_dtype, descale_value = {
+        "fp32": (1.0, torch.float32, None),
+        "fp16_large": (2.0**-6, torch.float16, 256.0),
+    }[DESCALE]
+    q, k, v = (
+        (
+            torch.randn((BATCH, SEQLEN, n, HEAD_SZ), device="cuda", dtype=torch.float32)
+            * scale
+        ).to(get_fp8_e4m3_dtype())
+        for n, scale in (
+            (NUM_Q_HEADS, qk_scale),
+            (NUM_K_HEADS, qk_scale),
+            (NUM_K_HEADS, 1.0),
+        )
+    )
+    if descale_value is None:
+        q_descale, k_descale, v_descale = (
+            torch.rand((BATCH, NUM_K_HEADS), device="cuda") + 0.5 for _ in range(3)
+        )
+    else:
+        q_descale, k_descale, v_descale = (
+            torch.full((BATCH, NUM_K_HEADS), value, device="cuda", dtype=descale_dtype)
+            for value in (descale_value, descale_value, 1.0)
+        )
+
+    triton_out = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=CAUSAL,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    assert len(calls) == 2, "the software-emulated fp8 path did not run"
+
+    group = NUM_Q_HEADS // NUM_K_HEADS
+    q_ref = q.float() * q_descale.float().repeat_interleave(group, 1)[:, None, :, None]
+    k_ref = k.float() * k_descale.float()[:, None, :, None]
+    v_ref = v.float() * v_descale.float()[:, None, :, None]
+    torch_out, _, _ = attention_ref(q_ref, k_ref, v_ref, causal=CAUSAL)
+
+    assert torch.isfinite(triton_out).all()
+    torch.testing.assert_close(triton_out.float(), torch_out, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4])
