@@ -8,9 +8,11 @@ from aiter import logger
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import ANY_FP8_ARCHS
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
+    flash_attn_func,
     flash_attn_varlen_fp8_func,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
@@ -97,6 +99,49 @@ def test_mha(
     )
 
     fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
+
+
+@pytest.mark.parametrize("SEQLEN", [64, 300])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp8_strided_qkv(SEQLEN: int, HEAD_SZ: int, CAUSAL: bool):
+    # q, k and v are views into one packed fp8 qkv tensor, so their seqlen stride is
+    # (q heads + 2 * kv heads) * head dim. The output must equal the output for
+    # contiguous copies bit for bit.
+    BATCH, NUM_Q_HEADS, NUM_K_HEADS = 2, 8, 2
+    torch.manual_seed(20)
+    qkv = torch.randn(
+        (BATCH, SEQLEN, NUM_Q_HEADS + 2 * NUM_K_HEADS, HEAD_SZ),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).to(get_fp8_e4m3_dtype())
+    q, k, v = qkv.split([NUM_Q_HEADS, NUM_K_HEADS, NUM_K_HEADS], dim=2)
+    assert not k.is_contiguous() and not v.is_contiguous()
+    q_descale, k_descale, v_descale = (
+        torch.rand((BATCH, NUM_K_HEADS), device="cuda", dtype=torch.float32) + 0.5
+        for _ in range(3)
+    )
+
+    strided_out = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=CAUSAL,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    contiguous_out = flash_attn_func(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        causal=CAUSAL,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    torch.testing.assert_close(strided_out, contiguous_out, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4])

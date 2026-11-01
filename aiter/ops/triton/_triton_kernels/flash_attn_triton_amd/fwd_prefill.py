@@ -20,6 +20,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     is_fp8,
     remap_xcd,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
@@ -314,6 +315,7 @@ def _attn_fwd_inner(
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
     ACCUMULATOR_TYPE,
+    FP8_AS_FP16: tl.constexpr = False,
 ):
     """
     Unified attention forward inner loop.
@@ -374,7 +376,11 @@ def _attn_fwd_inner(
             qk += tl.dot(q, k) * q_descale * k_descale
         else:
             qk = tl.dot(q, k, acc=qk)
-        qk_scaled = qk * SM_SCALE
+        if FP8_AS_FP16:
+            # q_descale holds q_descale * k_descale here, see attn_fwd
+            qk_scaled = qk * (SM_SCALE * q_descale)
+        else:
+            qk_scaled = qk * SM_SCALE
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -869,6 +875,7 @@ def attn_fwd(
     FORCE_MASKING: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
     HEAD_STRIDE_ALIGNED_8: tl.constexpr = False,
+    FP8_AS_FP16: tl.constexpr = False,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32
@@ -953,6 +960,17 @@ def attn_fwd(
         v_descale = tl.load(V_Descale + off_z * stride_v_descale_z + off_h_k)
     else:
         q_descale, k_descale, v_descale = 1.0, 1.0, 1.0
+    if FP8_AS_FP16:
+        # q, k and v reach the dot as fp16 without descale: q_descale * k_descale
+        # joins the SM_SCALE multiply, v_descale scales the output. Same descale
+        # indexing as the IS_FP8 branch.
+        if GROUP_SIZE != 1:
+            q_scale = tl.load(Q_Descale + off_z * stride_q_descale_z + off_h_k)
+        else:
+            q_scale = tl.load(Q_Descale + off_z * stride_q_descale_z + off_h_q)
+        q_scale = q_scale * tl.load(K_Descale + off_z * stride_k_descale_z + off_h_k)
+        v_scale = tl.load(V_Descale + off_z * stride_v_descale_z + off_h_k)
+        q_descale = q_scale
 
     # figure out masking pattern
     (
@@ -1071,6 +1089,9 @@ def attn_fwd(
     if PADDED_HEAD_QK:
         q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :] < ACTUAL_BLOCK_DMODEL_QK)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
+    if FP8_AS_FP16:
+        # converted once here, outside the K/V loop
+        q = q.to(tl.float16)
 
     # ========== Process MASKED K Blocks in the front ==========
     # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
@@ -1136,6 +1157,7 @@ def attn_fwd(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            FP8_AS_FP16=FP8_AS_FP16,
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1203,6 +1225,7 @@ def attn_fwd(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            FP8_AS_FP16=FP8_AS_FP16,
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1275,6 +1298,7 @@ def attn_fwd(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            FP8_AS_FP16=FP8_AS_FP16,
         )
 
     # ============================================================
@@ -1288,6 +1312,8 @@ def attn_fwd(
     l_i_safe = tl.where(invalid_mask, 1.0, l_i)
     l_recip = 1 / l_i_safe[:, None]
     acc = acc * l_recip
+    if FP8_AS_FP16:
+        acc = acc * v_scale
 
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
@@ -1336,6 +1362,71 @@ def attn_fwd(
         o_ptrs_mask = o_ptrs_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
 
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
+
+
+_fp8_to_fp16_bshd_repr = make_kernel_repr("_fp8_to_fp16_bshd", ["BLOCK_S", "BLOCK_D"])
+
+
+@triton.jit(repr=_fp8_to_fp16_bshd_repr)
+def _fp8_to_fp16_bshd(
+    X,
+    Y,
+    stride_xb,
+    stride_xs,
+    stride_xh,
+    stride_xd,
+    stride_yb,
+    stride_ys,
+    stride_yh,
+    seqlen,
+    head_dim,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # int64: s * nheads * head_dim can exceed 2**31 elements
+    off_s = tl.program_id(0).to(tl.int64) * BLOCK_S + tl.arange(0, BLOCK_S)
+    off_h = tl.program_id(1).to(tl.int64)
+    off_z = tl.program_id(2).to(tl.int64)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask = (off_s[:, None] < seqlen) & (offs_d[None, :] < head_dim)
+    x = tl.load(
+        X
+        + off_z * stride_xb
+        + off_h * stride_xh
+        + off_s[:, None] * stride_xs
+        + offs_d[None, :] * stride_xd,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(
+        Y
+        + off_z * stride_yb
+        + off_h * stride_yh
+        + off_s[:, None] * stride_ys
+        + offs_d[None, :],
+        x.to(Y.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def _fp8_to_fp16(x: torch.Tensor) -> torch.Tensor:
+    batch, seqlen, nheads, head_dim = x.shape
+    y = torch.empty(
+        (batch, seqlen, nheads, head_dim), dtype=torch.float16, device=x.device
+    )
+    BLOCK_S = 64
+    grid = (triton.cdiv(seqlen, BLOCK_S), nheads, batch)
+    _fp8_to_fp16_bshd[grid](
+        x,
+        y,
+        *x.stride(),
+        *y.stride()[:3],
+        seqlen,
+        head_dim,
+        BLOCK_S=BLOCK_S,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+    )
+    return y
 
 
 def attention_forward_prefill_triton_impl(
@@ -1392,6 +1483,36 @@ def attention_forward_prefill_triton_impl(
     assert (
         q.is_cuda and q.device.index == current_device
     ), f"Device mismatch: Kernel will launch on cuda:{current_device}, but tensors are on {q.device}"
+
+    # Without fp8 hardware, Triton converts fp8 K and V to fp16 in every tile.
+    # Converting k and v once and q once per program in attn_fwd is faster.
+    # Every fp8 value is exact in fp16, so the conversion skips the descales
+    # and attn_fwd applies them.
+    PRE_DEQUANT = (
+        layout == "bshd" and is_fp8([q, k, v]) and get_arch().supports_sw_emulated_fp8
+    )
+    if PRE_DEQUANT:
+        if (q_descale is None) or (k_descale is None) or (v_descale is None):
+            warnings.warn(
+                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
+                UserWarning,
+            )
+        descale_shape = (q.shape[0], k.shape[2])
+        for name, descale in (("q", q_descale), ("k", k_descale), ("v", v_descale)):
+            assert (
+                descale is None or tuple(descale.shape) == descale_shape
+            ), f"{name}_descale expected shape {descale_shape} got {tuple(descale.shape)}"
+        assert o.dtype in [
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
+        ones = torch.ones(q.shape[0], k.shape[2], dtype=torch.float32, device=q.device)
+        q_descale = ones if q_descale is None else q_descale
+        k_descale = ones if k_descale is None else k_descale
+        v_descale = ones if v_descale is None else v_descale
+        k = _fp8_to_fp16(k)
+        v = _fp8_to_fp16(v)
 
     # get shapes and strides
     if IS_VARLEN:
@@ -1589,7 +1710,7 @@ def attention_forward_prefill_triton_impl(
         )
 
     # fp8 setup and assertions
-    IS_FP8 = is_fp8([q, k, v])
+    IS_FP8 = not PRE_DEQUANT and is_fp8([q, k, v])
     if IS_FP8:
         arch = get_arch()
         if not arch.supports_any_fp8:
@@ -1653,12 +1774,17 @@ def attention_forward_prefill_triton_impl(
             print("FP8 path triggered in fwd_prefill.py")
     else:
         FP8_MAX = None
-        q_descale = k_descale = v_descale = None
-        stride_q_descale_z = stride_k_descale_z = stride_v_descale_z = None
+        if PRE_DEQUANT:
+            stride_q_descale_z = q_descale.stride(0)
+            stride_k_descale_z = k_descale.stride(0)
+            stride_v_descale_z = v_descale.stride(0)
+        else:
+            q_descale = k_descale = v_descale = None
+            stride_q_descale_z = stride_k_descale_z = stride_v_descale_z = None
 
         # check output dtype matches input dtype when not using fp8
         assert (
-            o.dtype == q.dtype
+            o.dtype == q.dtype or PRE_DEQUANT
         ), f"Output dtype {o.dtype} must match input dtype {q.dtype} when not using fp8"
 
     # check features
@@ -1819,5 +1945,6 @@ def attention_forward_prefill_triton_impl(
         FORCE_MASKING=force_masking,
         NUM_XCD=num_xcd,
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
+        FP8_AS_FP16=PRE_DEQUANT,
         enable_fp_fusion=True,
     )
