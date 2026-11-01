@@ -4388,8 +4388,15 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
+        _s1_tk = 256
         # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
-        if token < 2048:
+        if _is_a16w4 and gfx == "gfx942":
+            # gfx942 has 64 KiB of LDS, and the a16w-mix port needs 128 KiB at
+            # BM=128 x TILE_K=256. Use the a16wi4 fallback's shape-safe tiles
+            # (TILE_K=128, no waves_per_eu cap), with BM=32 from 1024 tokens.
+            _tile_m = 16 if token < 1024 else 32 if token < 16384 else 64
+            _s1_tk, _s1_sfx, _s2_sfx = 128, "", ""
+        elif token < 2048:
             _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
         elif token < 4096:
             _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
@@ -4398,7 +4405,7 @@ def get_2stage_cfgs(
         else:
             _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
         _base_kn1 = flydsl_kernel_name(
-            1, _a_type, _w_type, _out_type, _tile_m, 128, 256
+            1, _a_type, _w_type, _out_type, _tile_m, 128, _s1_tk
         )
         _base_kn2 = flydsl_kernel_name(
             2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"

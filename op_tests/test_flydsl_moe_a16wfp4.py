@@ -174,6 +174,17 @@ def test_flydsl_a16wfp4_situv2_e2e(
     assert ld < 1e-2, f"a16w4 SiTUv2 cos/logits_diff too large: {ld:.3e}"
 
 
+@_SKIP
+@pytest.mark.parametrize("token", [2048, 4096])
+def test_flydsl_a16wfp4_situv2_untuned_tiers(token):
+    """3584/768 has no tuned row, so fused_moe takes the heuristic tiers.
+
+    On gfx942 the 4096-token tier used to pick BM=128 x TILE_K=256, which needs
+    128 KiB of LDS and cannot launch there.
+    """
+    test_flydsl_a16wfp4_situv2_e2e(3584, 768, token, 4.0, 25.0)
+
+
 @_SKIP_FP8_MFMA
 @pytest.mark.parametrize("model_dim,inter_dim", [(3584, 512), (3584, 384)])
 @pytest.mark.parametrize("token", [1, 16, 128])
