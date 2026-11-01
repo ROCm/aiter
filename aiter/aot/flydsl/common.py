@@ -33,6 +33,7 @@ class OpKind(enum.Enum):
     GEMM = "gemm"
     CONV = "conv"
     CHUNK_GDN_H = "chunk_gdn_h"
+    UNIFIED_ATTENTION = "unified_attention"
     MEGA_MOE = "mega_moe"
     FMHA_FP8 = "fmha_fp8"
 
@@ -189,6 +190,10 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .fmha_fp8 import default_jobs
 
         return default_jobs()
+    if kind is OpKind.UNIFIED_ATTENTION:
+        from .unified_attention import default_jobs
+
+        return default_jobs()
     if kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CONV:
@@ -209,6 +214,8 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
         from .conv import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
+    elif kind is OpKind.UNIFIED_ATTENTION:
+        from .unified_attention import compile_one_config
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return compile_one_config
