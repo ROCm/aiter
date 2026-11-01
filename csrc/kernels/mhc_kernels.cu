@@ -1885,6 +1885,9 @@ namespace aiter {
         int m = residual.size(0);
         int hc_mult = residual.size(1);
         int hidden_size = residual.size(2);
+        // Reached from the Python binding: failed checks below must surface
+        // as a catchable RuntimeError, not abort the process.
+        aiter_detail::AiterThrowGuard throw_guard;
         int x_stride = x.stride(0);
         int residual_stride = residual.stride(0);
         AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
@@ -1895,10 +1898,8 @@ namespace aiter {
         // forwarded for those, so reject any layout the kernel would
         // silently misread instead of producing wrong results.
         AITER_CHECK(out.is_contiguous(), "mhc_post: out must be contiguous");
-        AITER_CHECK(post_layer_mix.is_contiguous(),
-                    "mhc_post: post_layer_mix must be contiguous");
-        AITER_CHECK(comb_res_mix.is_contiguous(),
-                    "mhc_post: comb_res_mix must be contiguous");
+        AITER_CHECK(post_layer_mix.is_contiguous(), "mhc_post: post_layer_mix must be contiguous");
+        AITER_CHECK(comb_res_mix.is_contiguous(), "mhc_post: comb_res_mix must be contiguous");
         AITER_CHECK(x.stride(-1) == 1, "mhc_post: x last dim must be contiguous");
         AITER_CHECK(residual.stride(-1) == 1 && residual.stride(1) == hidden_size,
                     "mhc_post: residual inner dims must be packed "
