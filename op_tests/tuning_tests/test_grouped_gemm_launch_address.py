@@ -54,3 +54,11 @@ class LaunchAddressTest(unittest.TestCase):
         self.assertTrue(flat.is_contiguous())
         self.assertEqual(flat.data_ptr(), scales.data_ptr())
         self.assertEqual(flat.view(torch.uint8)[:224].tolist(), list(range(224)))
+
+    def test_extent_fits_the_launch_abi(self):
+        # gemm2's output at 16k tokens a rank: 540672 rows x 7168 bf16.
+        out = torch.empty((540672, 7168), dtype=torch.bfloat16, device="meta")
+        flat = _launch_address(out, torch.bfloat16)
+        self.assertEqual(flat.ndim, 1)
+        self.assertEqual(flat.shape[0], 2**31 - 1)
+        self.assertEqual(flat.storage_offset(), out.storage_offset())

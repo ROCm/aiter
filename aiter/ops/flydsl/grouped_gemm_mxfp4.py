@@ -14,6 +14,8 @@ from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
+# The launch ABI packs a tensor's extent as an int32.
+_MAX_LAUNCH_EXTENT = 2**31 - 1
 
 
 def _launch_address(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -24,6 +26,10 @@ def _launch_address(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     the dispatch-wire pitch, so that view is rejected. The kernel steps rows
     with ``a_scale_row_stride_bytes`` and only needs the base pointer, which a
     unit-stride span of the pitched storage still provides.
+
+    The extent is cut to what the launch ABI holds: the kernel never reads it,
+    and a whole buffer can pass 2^31 elements (gemm2's output at 16k tokens a
+    rank).
     """
     if tensor.numel() == 0:
         empty = tensor if tensor.dtype == dtype else tensor.view(dtype)
@@ -45,7 +51,7 @@ def _launch_address(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         tensor = torch.as_strided(tensor, (span,), (1,))
     if tensor.dtype != dtype:
         tensor = tensor.view(dtype)
-    return tensor.view(-1)
+    return tensor.view(-1)[:_MAX_LAUNCH_EXTENT]
 
 
 def _select_bool_env(name: str, csv_value: int) -> int:
@@ -226,8 +232,10 @@ def flydsl_grouped_gemm_a8w4_masked(
     # These tensor arguments only supply base addresses, so normalize their
     # ranks without specializing the compiled callable on buffer shapes.
     quant_scale_tensor = (
-        out if quant_scale is None else quant_scale.view(torch.uint8)
-    ).view(-1)
+        _launch_address(out, out.dtype)
+        if quant_scale is None
+        else _launch_address(quant_scale, torch.uint8)
+    )
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
@@ -272,7 +280,8 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"{stage2_scatter.combine_quant_bits} needs N % {n_align} == 0 to "
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
-    ep_row_map_tensor = (ep_row_map if ep_row_map is not None else out).view(-1)
+    row_map = ep_row_map if ep_row_map is not None else out
+    ep_row_map_tensor = _launch_address(row_map, row_map.dtype)
     gemm_spec = (
         K,
         tile_m,
@@ -319,7 +328,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
-        out.view(-1),
+        _launch_address(out, out.dtype),
         ptr_arg(a),
         ptr_arg(w),
         _launch_address(a_scales, torch.int32),
