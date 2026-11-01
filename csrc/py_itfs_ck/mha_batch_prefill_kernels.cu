@@ -570,7 +570,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     }
 
 
-    if(max_seqlen_q == 1 && !alibi_slopes_.has_value())
+    if(max_seqlen_q == 1 && !alibi_slopes_.has_value() && !sink_ptr.has_value())
     {
         is_causal = false;
     } // causal=true is the same as causal=false in this case

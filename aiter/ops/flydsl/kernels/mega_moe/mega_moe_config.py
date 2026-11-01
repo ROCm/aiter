@@ -769,6 +769,23 @@ def _tune_kimi_k3(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
     return config
 
 
+def _tune_v41_flash_ep2(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+    """DeepSeek-V4.1-Flash at EP2 (192 experts per rank), the two buckets swept
+    on gfx950 (bench_mega_moe_v2, 384 and 16384 source tokens a rank): SBM32
+    halves the decode padding and Stage2's tile with it."""
+    if ctx.bucket == 512:
+        config = _replace_config(
+            config, stage1={"sort_block_m": 32, "tile_n": 512, "num_waves": 8}
+        )
+    elif ctx.bucket == 16384:
+        config = _replace_config(
+            config,
+            stage1={"sort_block_m": 128, "tile_n": 512, "num_waves": 4},
+            stage2={"persist_cu": 256},
+        )
+    return config
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkProfile:
     """One tunable network, identified by (experts_per_rank, model_dim, inter_dim).
@@ -804,6 +821,7 @@ _NETWORKS = (
     NetworkProfile(
         "kimi_k3", KIMI_K3_EXPERTS_PER_RANK, K3_MODEL_DIM, K3_INTER_DIM, _tune_kimi_k3
     ),
+    NetworkProfile("v41_flash_ep2", 192, 5120, 2304, _tune_v41_flash_ep2),
 )
 
 

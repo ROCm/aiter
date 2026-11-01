@@ -55,11 +55,8 @@ def _run_allreduce_case(rankID, tp_size, case_idx, shape, dtype, withGraph, grap
     Each rank regenerates all ``tp_size`` inputs from the same ``case_idx``
     seed and keeps its own, so the reference is available locally and only
     scalars go back to the parent. In graph mode the captured graph and its
-    buffers are appended to ``graphs`` and must outlive the whole sweep:
-    custom all-reduce caches the peer IPC address of every captured buffer by
-    its local pointer, so freeing one and capturing a later shape at the
-    same address would replay with stale peer pointers. A model keeps all
-    its captured graphs alive the same way.
+    buffers are appended to ``graphs`` and outlive the whole sweep, the way a
+    model keeps all its captured graphs alive.
     """
     gen = torch.Generator(device="cuda").manual_seed(case_idx)
     ref = torch.zeros(shape, dtype=dtype, device="cuda")

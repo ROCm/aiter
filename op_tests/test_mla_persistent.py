@@ -1106,10 +1106,16 @@ def _make_mla_metadata(
     causal=True,
     is_cp_round_robin=False,
     metadata_mode=None,
+    kv_granularity=None,
 ):
     if metadata_mode is None:
         metadata_mode = "v1_0" if non_persistent_mode else "fast"
     fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
+    if kv_granularity is None:
+        kv_granularity = max(
+            page_size,
+            32 if nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8 else 16,
+        )
     names = (
         "work_meta_data",
         "work_indptr",
@@ -1147,10 +1153,7 @@ def _make_mla_metadata(
         metadata["reduce_final_map"],
         metadata["reduce_partial_map"],
         page_size=page_size,
-        kv_granularity=max(
-            page_size,
-            32 if nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8 else 16,
-        ),
+        kv_granularity=kv_granularity,
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=fast_mode,
@@ -1184,6 +1187,7 @@ def test_mla(
     return_lse,
     causal,
     metadata_mode=None,
+    kv_granularity=None,
 ):
     ret = {}
 
@@ -1322,6 +1326,7 @@ def test_mla(
         max_split_per_batch,
         causal=causal,
         metadata_mode=metadata_mode,
+        kv_granularity=kv_granularity,
     )
     work_meta_data = metadata["work_meta_data"]
     work_indptr = metadata["work_indptr"]
@@ -1922,6 +1927,50 @@ def test_mla(
     return ret
 
 
+def test_mla_v1_0_kv_tail():
+    # v1_0 folds a 1-4 key tail into the previous split. gfx942 plans 16 splits per
+    # row, so 17-20 keys end in one split at granularity 16; gfx950 plans
+    # seqlen // 196 splits, so 513-516 keys do at granularity 256. 16 and 512 keep
+    # their split count and are the controls.
+    gfx = get_gfx()
+    if gfx == "gfx942":
+        kv_granularity, ctx_lens = 16, [16, 17, 18, 19, 20]
+    elif gfx == "gfx950":
+        kv_granularity, ctx_lens = 256, [512, 513, 514, 515, 516]
+    else:
+        return
+    bad = {}
+    for ctx_len in ctx_lens:
+        ret = test_mla(
+            ctx_lens=ctx_len,
+            batch_size=1,
+            nhead=16,
+            kv_lora_rank=512,
+            qk_nope_head_dim=512,
+            qk_rope_head_dim=64,
+            v_head_dim=512,
+            dtype=dtypes.bf16,
+            kvtype=dtypes.bf16,
+            page_size=1,
+            varlen=False,
+            decode_qlen=1,
+            max_split_per_batch=32,
+            non_persistent_mode=True,
+            paged_layout="LEGACY",
+            scale_dim=16,
+            return_lse=False,
+            causal=True,
+            metadata_mode="v1_0",
+            kv_granularity=kv_granularity,
+        )
+        if ret["decode:err"] > 0.05:
+            bad[ctx_len] = ret["decode:err"]
+    assert not bad, (
+        f"v1_0 decode mismatches the reference at kv_granularity {kv_granularity}: "
+        + ", ".join(f"ctx_len {k} on {v:.1%} of outputs" for k, v in bad.items())
+    )
+
+
 _HEADS = 16
 _KV_LEN = 2048
 _KV_LORA_RANK = 512
@@ -2370,6 +2419,8 @@ def main():
         aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
     check_fold_seqlen_indptr_cuda_graph_capture()
     aiter.logger.info("_fold_seqlen_indptr cuda-graph capture: passed")
+    test_mla_v1_0_kv_tail()
+    aiter.logger.info("v1_0 KV tail end-to-end: passed")
     return df if args.nhead else None
 
 

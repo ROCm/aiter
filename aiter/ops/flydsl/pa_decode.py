@@ -15,6 +15,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.utility import dtypes
 
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
@@ -57,12 +58,11 @@ def launch_pa_decode_ps_reduce(
     query_seq_len: int,
     query_group_size: int,
     head_size: int,
-    partition_bound: int,
     max_partitions: int,
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor,
 ) -> None:
-    """Reduce packed partials; every sequence has at most ``partition_bound``."""
+    """Reduce packed partials; every sequence has at most ``max_partitions``."""
     props = torch.cuda.get_device_properties(output.device)
     if max_partitions > props.multi_processor_count:
         raise ImportError(
@@ -70,16 +70,19 @@ def launch_pa_decode_ps_reduce(
             f"{props.multi_processor_count} partitions"
         )
     arch = get_gfx_runtime()
-    wave = 32 if arch == "gfx1250" else 64
+    wave = props.warp_size
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = 1024 // wave
     batch, kv_heads = output.shape[0], output.shape[2]
     rows = query_seq_len * query_group_size
     # Exact bounds keep the register ladder short; above a wave a power of two
-    # bounds the specialization count.
-    partitions = min(partition_bound, max_partitions)
+    # bounds the specialization count. Per-sequence buffer bounds zero-fill
+    # partitions beyond the live count, so rounding past the bound is safe.
+    partitions = max_partitions
     if partitions > register_partitions:
-        partitions = min(max_partitions, 1 << (partitions - 1).bit_length())
+        partitions = min(
+            props.multi_processor_count, 1 << (partitions - 1).bit_length()
+        )
     # A per-sequence span <= INT32_MAX keeps every attempted byte offset,
     # including inactive partitions, below 2**32, so out-of-bounds reads
     # cannot wrap back into valid data.
@@ -117,11 +120,7 @@ def launch_pa_decode_ps_reduce(
             ):
                 groups *= 2
         per_seq = rows * kv_heads
-        if (
-            arch != "gfx1250"
-            and ctas * group_waves >= budget
-            and batch * per_seq * per_seq <= 2**30
-        ):
+        if ctas * group_waves >= budget and batch * per_seq * per_seq <= 2**30:
             num_xcds = get_num_xcds()
     num_xcds = num_xcds if num_xcds > 1 else 0
     compiled = compile_pa_decode_ps_reduce(
@@ -193,6 +192,7 @@ def pa_decode(
     sliding_window: int = 0,
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
+    mask_unowned_kv: bool = True,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -221,7 +221,7 @@ def pa_decode(
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
     query_length=1. Positive ``sliding_window`` includes each query's own
-    position; 0 and -1 disable it.
+    position; nonpositive values disable it.
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
     calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
@@ -250,6 +250,13 @@ def pa_decode(
     ``max_context_length``. A smaller value still covers the real context:
     page ids outside the staged window are read from the block table.
 
+    ``mask_unowned_kv`` (default True) zeroes, on gfx942/gfx950, V bytes and
+    K/V scales of tokens at or past each sequence's context length before PV,
+    so pinned block-0 pages and the unwritten tail of the last page may hold
+    any bytes, including NaN. False skips that masking (slightly faster on
+    tiny boundary-tile-only calls); the caller must then keep those bytes and
+    scales finite. gfx1250 ignores it and always requires finite bytes.
+
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
@@ -269,8 +276,6 @@ def pa_decode(
         raise NotImplementedError("pa_decode does not support ALiBi")
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
-    if sliding_window < -1:
-        raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
     if not isinstance(query_length, int):
         raise TypeError("query_length must be an int")
@@ -340,18 +345,13 @@ def pa_decode(
         )
 
     arch = get_gfx_runtime()
-    expected_fp8_dtype = {
-        "gfx942": torch.float8_e4m3fnuz,
-        "gfx950": torch.float8_e4m3fn,
-        "gfx1250": torch.float8_e4m3fn,
-    }.get(arch)
-    if expected_fp8_dtype is None:
+    if arch not in ("gfx942", "gfx950", "gfx1250"):
         raise NotImplementedError(
             f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
     is_bf16_kv = key_cache.dtype == torch.bfloat16
     kv_dtype = "bf16" if is_bf16_kv else "fp8"
-    expected_kv_dtype = torch.bfloat16 if is_bf16_kv else expected_fp8_dtype
+    expected_kv_dtype = torch.bfloat16 if is_bf16_kv else dtypes.fp8
     compute_type = key_cache.dtype if compute_type is None else compute_type
     if compute_type != expected_kv_dtype:
         raise NotImplementedError(
@@ -644,6 +644,7 @@ def pa_decode(
             sliding_window=sliding_window,
             direct_output=direct_output,
             trans_k=trans_k,
+            mask_unowned_kv=mask_unowned_kv,
         )
 
     total_rows = query_length * query_group_size
@@ -743,7 +744,8 @@ def pa_decode(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
         )
         # Bound the reducer without shrinking the reusable plan or scratch.
-        partition_bound = min(
+        max_partitions = min(
+            num_partitions,
             work_plan.capacity,
             max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
         )
@@ -752,7 +754,7 @@ def pa_decode(
             window_tiles = (
                 sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
             ) // KV_COMPUTE_BLOCK + 1
-            partition_bound = min(partition_bound, window_tiles)
+            max_partitions = min(max_partitions, window_tiles)
         launch_pa_decode_ps_reduce(
             output_5d,
             psum,
@@ -771,8 +773,7 @@ def pa_decode(
             query_seq_len=query_length,
             query_group_size=query_group_size,
             head_size=head_dim,
-            partition_bound=partition_bound,
-            max_partitions=num_partitions,
+            max_partitions=max_partitions,
             stream=s,
             reduce_info=work_plan.reduce_info,
         )

@@ -10,14 +10,8 @@ import flydsl.expr as fx
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .tensor_shim import buf_base_i64, buf_copy_load, ptr_buf_tensor
+from .tensor_shim import _FX_ELEM, buf_base_i64, buf_copy_load, ptr_buf_tensor
 from .utils import rcp_f32, udiv_const, urem_const
-
-_DTYPE_MAP = {
-    "f32": fx.Float32,
-    "f16": fx.Float16,
-    "bf16": fx.BFloat16,
-}
 
 WAVE = 64
 # Above this partition bound the CTA reduces in LDS; at most DUAL_REGISTER
@@ -91,7 +85,7 @@ def compile_pa_decode_ps_reduce(
             f"head_size must be a multiple of 64 in [64, 1024], got {head_size}"
         )
     for dtype_str in (output_dtype_str, logits_dtype_str, sink_dtype_str):
-        if dtype_str not in _DTYPE_MAP:
+        if dtype_str not in ("f32", "f16", "bf16"):
             raise ValueError(f"Unsupported FlyDSL dtype: {dtype_str!r}")
     if query_group_size <= 0:
         raise ValueError(f"query_group_size must be positive, got {query_group_size}")
@@ -110,9 +104,9 @@ def compile_pa_decode_ps_reduce(
     if num_xcds < 0:
         raise ValueError(f"num_xcds must be nonnegative, got {num_xcds}")
 
-    output_dtype = _DTYPE_MAP[output_dtype_str]
-    logits_dtype = _DTYPE_MAP[logits_dtype_str]
-    sink_dtype = _DTYPE_MAP[sink_dtype_str]
+    output_dtype = _FX_ELEM[output_dtype_str]
+    logits_dtype = _FX_ELEM[logits_dtype_str]
+    sink_dtype = _FX_ELEM[sink_dtype_str]
     log2e = 1.4426950408889634
 
     low_rungs = high_rungs = dual_rungs = lds_rungs = ()
@@ -145,8 +139,21 @@ def compile_pa_decode_ps_reduce(
         weights: fx.Array[fx.Float32, weight_chunks * wave, 16]
         partials: fx.Array[fx.Float32, max(1, (groups - 1) * head_size), 16]
 
-    @flyc.kernel(known_block_size=block)
-    def pa_decode_ps_reduce_kernel(
+    kernel_name = (
+        f"pa_decode_reduce_kernel_o{output_dtype_str}_d{head_size}"
+        f"_np{partitions}_gqa{query_group_size}"
+    )
+    if use_sinks:
+        kernel_name += "_sinks"
+    if pairs:
+        kernel_name += "_pairs"
+    if groups > 1:
+        kernel_name += f"_g{groups}"
+    if num_xcds:
+        kernel_name += f"_xcd{num_xcds}"
+
+    @flyc.kernel(name=kernel_name, known_block_size=block)
+    def pa_decode_reduce_kernel(
         output_ptr: fx.Pointer,
         exp_sums_ptr: fx.Pointer,
         max_logits_ptr: fx.Pointer,
@@ -475,7 +482,7 @@ def compile_pa_decode_ps_reduce(
     ):
         query_rows = query_seq_len * fx.Int32(query_group_size)
         num_ctas = batch_size * num_kv_heads * query_rows
-        pa_decode_ps_reduce_kernel(
+        pa_decode_reduce_kernel(
             output,
             exp_sums,
             max_logits,
@@ -508,5 +515,5 @@ def compile_pa_decode_ps_reduce(
 
     return {
         "launch": launch_pa_decode_ps_reduce_kernel,
-        "kernel": pa_decode_ps_reduce_kernel,
+        "kernel": pa_decode_reduce_kernel,
     }
