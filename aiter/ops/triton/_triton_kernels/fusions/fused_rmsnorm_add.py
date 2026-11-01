@@ -13,6 +13,7 @@ _triton_fused_rms_kernel_repr = make_kernel_repr(
     [
         "BLOCK_SIZE_N",
         "FIRST_INPUT_RES",
+        "GEMMA",
     ],
 )
 
@@ -33,6 +34,7 @@ def _triton_fused_rms_kernel(
     out_res_stride_m,
     BLOCK_SIZE_N: tl.constexpr,
     FIRST_INPUT_RES: tl.constexpr,
+    GEMMA: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     tl.assume(pid_m >= 0)
@@ -62,5 +64,7 @@ def _triton_fused_rms_kernel(
         )
 
     w = tl.load(w_ptr + n_offs, mask=mask, other=0.0).to(tl.float32)
+    if GEMMA:
+        w = w + 1.0
     out = _rmsnorm_op(x, w, N, eps).to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + pid_m * out_stride_m + n_offs, out, mask=mask)
