@@ -851,6 +851,10 @@ class Gfx1250Traits:
 
     @property
     def q_tiles(self):
+        # Wave-private FP8 tiles still use four cooperative staging waves;
+        # inactive tiles need initialized Q rows and their scale padding.
+        if self.wave_query_tiles:
+            return self.NWARP
         # The widest BF16 MTP tile fits by staging one query tile at a time.
         full = self.m_tiles * 16 * self.q_stride
         return (
@@ -927,22 +931,22 @@ class Gfx1250Traits:
 
     @property
     def wave_query_tiles(self):
-        # One D128 query tile per wave keeps scores, P and output in registers:
+        # Up to four D128 query tiles stay private to their waves:
         # softmax needs no cross-wave exchange, only the page buffers are shared.
         return (
             self.fp8_multi_tile
-            and self.m_tiles == self.NWARP
+            and 2 <= self.m_tiles <= self.NWARP
             and self.head_dim == 128
             and self.async_page
         )
 
     @property
     def bf16_wave_query_tiles(self):
-        # Four D128 query tiles over BF16 page128 caches: wave pairs share two
+        # Two to four D128 query tiles over BF16 page128 caches: pairs share two
         # tiles, P stays in registers, and a page needs only its buffer barrier.
         return (
             self.bf16_page128_packed
-            and self.m_tiles == self.NWARP
+            and 2 <= self.m_tiles <= self.NWARP
             and self.head_dim == 128
         )
 

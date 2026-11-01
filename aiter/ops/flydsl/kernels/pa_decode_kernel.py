@@ -16,7 +16,7 @@ f32 softmax state and accumulation. BF16 KV does not use quantization scales.
 gfx1250 uses wave32 WMMA with native FP8 Q/P conversion or BF16 operands.
 Its four waves process 64- or 128-token compute tiles within each 256-token
 plan tile. Packed FP8 D128/D256 full-attention paths use K128 WMMA; other
-FP8 paths use K64 and BF16 uses K32. Four FP8 D128 query tiles over page128
+FP8 paths use K64 and BF16 uses K32. Two to four FP8 D128 query tiles over page128
 caches give each wave its own tile and keep P in registers. Supported layouts
 use TDM K/V transfers, with two LDS buffers where capacity permits.
 One-partition plans can write final output directly. Plans with one task slot
