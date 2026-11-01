@@ -1,0 +1,173 @@
+name: vLLM Nightly Integration
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: vllm-nightly-integration
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BASE_IMAGE: vllm/vllm-openai-rocm:latest
+
+jobs:
+  accuracy:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - name: Kimi-K2.5 MI300X
+            runner: linux-aiter-oci-mi300x-8
+            gpu_arch: gfx942
+            model: moonshotai/Kimi-K2.5
+            serve_args: --tensor-parallel-size 8 --trust-remote-code
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=64,max_length=40960,max_gen_toks=32768
+            extra_env: -e OMP_NUM_THREADS=1 -e VLLM_ENGINE_READY_TIMEOUT_S=7200
+          - name: GLM-5.2 MI355X
+            runner: linux-aiter-mi355-8
+            gpu_arch: gfx950
+            model: zai-org/GLM-5.2-FP8
+            serve_args: --tensor-parallel-size 8 --trust-remote-code
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=64,max_length=40960,max_gen_toks=32768
+            extra_env: -e OMP_NUM_THREADS=1
+          - name: MiniMax-M2.5 MI300X
+            runner: linux-aiter-oci-mi300x-8
+            gpu_arch: gfx942
+            model: MiniMaxAI/MiniMax-M2.5
+            serve_args: --tensor-parallel-size 8 --enable-expert-parallel --trust-remote-code
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=64,max_length=40960,max_gen_toks=32768
+            extra_env: ""
+          - name: Qwen3.5 MI355X
+            runner: linux-aiter-mi355-8
+            gpu_arch: gfx950
+            model: Qwen/Qwen3.5-397B-A17B-FP8
+            serve_args: --tensor-parallel-size 8 --enable-expert-parallel --reasoning-parser qwen3 --trust-remote-code
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=64,max_length=40960
+            extra_env: ""
+          - name: MiniMax-M3 MI355X
+            runner: linux-aiter-mi355-8
+            gpu_arch: gfx950
+            model: amd/MiniMax-M3-MXFP4
+            serve_args: >-
+              --tensor-parallel-size 4 --trust-remote-code --block-size 128
+              --attention-backend TRITON_ATTN --moe-backend aiter
+              --kv-cache-dtype fp8 --mm-encoder-tp-mode data
+              --mm-encoder-attn-backend ROCM_AITER_FA
+              --tool-call-parser minimax_m3 --enable-auto-tool-choice
+              --reasoning-parser minimax_m3
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=16,max_length=32768,max_gen_toks=8192
+            extra_env: -e VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 -e VLLM_ROCM_USE_AITER_MOE=1
+          - name: GPT-OSS-120B MI355X
+            runner: linux-aiter-mi355-8
+            gpu_arch: gfx950
+            model: openai/gpt-oss-120b
+            serve_args: --tensor-parallel-size 1 --trust-remote-code --kv-cache-dtype fp8
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=64,max_length=32768,max_gen_toks=8192
+            extra_env: ""
+          - name: Kimi-K3 MI355X
+            runner: linux-aiter-mi355-8
+            gpu_arch: gfx950
+            model: moonshotai/Kimi-K3
+            serve_args: --tensor-parallel-size 8 --trust-remote-code
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=64,max_length=40960,max_gen_toks=32768
+            extra_env: -e VLLM_USE_BREAKABLE_CUDAGRAPH=0 -e VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4=1
+          - name: Kimi-K2.5 MI355X
+            runner: linux-aiter-mi355-8
+            gpu_arch: gfx950
+            model: moonshotai/Kimi-K2.5
+            serve_args: --tensor-parallel-size 8 --trust-remote-code
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=64,max_length=40960,max_gen_toks=32768
+            extra_env: -e OMP_NUM_THREADS=1
+          - name: MiniMax-M2.5 MI355X
+            runner: linux-aiter-mi355-8
+            gpu_arch: gfx950
+            model: MiniMaxAI/MiniMax-M2.5
+            serve_args: --tensor-parallel-size 4 --enable-expert-parallel --trust-remote-code
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=64,max_length=40960,max_gen_toks=32768
+            extra_env: ""
+          - name: DeepSeek-V4-Pro MI355X
+            runner: linux-aiter-mi355-8
+            gpu_arch: gfx950
+            model: deepseek-ai/DeepSeek-V4-Pro
+            serve_args: >-
+              --tensor-parallel-size 8 --kv-cache-dtype fp8 --trust-remote-code
+              --no-enable-prefix-caching --quantization deepseek_v4_fp8
+            model_args: tokenized_requests=False,tokenizer_backend=None,timeout=6000,num_concurrent=64,max_length=32768,max_gen_toks=8192
+            extra_env: -e OMP_NUM_THREADS=1
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pull vLLM nightly
+        run: docker pull "$BASE_IMAGE"
+
+      - name: Start container
+        run: |
+          if [[ -f /etc/podinfo/gha-render-devices ]]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          MODEL_MOUNT=""
+          if [[ -d /models ]]; then
+            MODEL_MOUNT="-v /models:/models"
+          fi
+          docker rm -f vllm-nightly || true
+          docker run -d --name vllm-nightly \
+            --device /dev/kfd $DEVICE_FLAG --group-add video \
+            --ipc host --network host --privileged --shm-size 16G \
+            --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            $MODEL_MOUNT \
+            -v "$GITHUB_WORKSPACE:/workspace" -w /workspace \
+            -e HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" \
+            -e VLLM_ROCM_USE_AITER=1 \
+            -e MODEL_ID="${{ matrix.model }}" \
+            -e SERVE_ARGS="${{ matrix.serve_args }}" \
+            -e MODEL_ARGS="${{ matrix.model_args }}" \
+            ${{ matrix.extra_env }} \
+            --entrypoint /bin/bash "$BASE_IMAGE" -lc "sleep infinity"
+
+      # Uninstall the AITER shipped in vLLM nightly, and install AITER ToT main
+      - name: Install current AITER
+        run: |
+          docker exec \
+            -e AITER_USE_SYSTEM_TRITON=1 \
+            -e GPU_ARCHS="${{ matrix.gpu_arch }}" \
+            -e MAX_JOBS=64 \
+            -e PREBUILD_KERNELS=0 \
+            vllm-nightly bash -lc '
+              set -e
+              pip uninstall -y amd-aiter aiter || true
+              pip install -e /workspace
+              pip install "lm-eval[api]"
+              pip show amd-aiter || pip show aiter
+            '
+
+      - name: Run lm_eval
+        run: |
+          docker exec -e OUT=/workspace/vllm-nightly-results \
+            vllm-nightly bash -lc \
+            'bash /workspace/.github/scripts/vllm_nightly_accuracy.sh "$MODEL_ID" "$SERVE_ARGS" "$MODEL_ARGS"'
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-nightly-${{ strategy.job-index }}
+          path: vllm-nightly-results
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f vllm-nightly || true
