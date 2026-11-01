@@ -62,6 +62,11 @@ def fused_topk_dispatch(
     config = load_config_json(
         os.path.join(resolve_config_dir("moe", "FUSED-TOPK-DISPATCH"), "DEFAULT.json")
     )
+    # BS and Q are constexprs. Pass 1 where the kernel does not read them, so a
+    # call with a new row count (an eager prefill) does not compile a new kernel.
+    limit_from_cu = num_valid_rows is None and not no_padding
+    bs_key = batch_size if write_requests or (limit_from_cu and not is_draft) else 1
+    q_key = n // batch_size if is_draft and limit_from_cu else 1
     _fused_topk_dispatch_kernel[(n,)](
         logits,
         weights,
@@ -72,11 +77,11 @@ def fused_topk_dispatch(
         recv_counter,
         num_valid_rows,
         STRIDE=logits.stride(0),
-        BS=batch_size,
-        Q=n // batch_size,
+        BS=bs_key,
+        Q=q_key,
         DRAFT=is_draft,
         WRITE_REQUESTS=write_requests,
-        BLOCK_BS=triton.next_power_of_2(batch_size),
+        BLOCK_BS=triton.next_power_of_2(bs_key),
         NO_PADDING=no_padding,
         HAS_VALID_ROWS=num_valid_rows is not None,
         **config,
