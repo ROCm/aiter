@@ -1029,6 +1029,7 @@ class CustomAllreduce:
             self._ops_all_reduce = ops.all_reduce_gfx1250
             self._ops_all_reduce_residual = None
             self._ops_all_gather = ops.all_gather_gfx1250
+            self._ops_all_gather_lastdim_add = None
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm_gfx1250
             self._ops_fused_ar_rms_quant = ops.fused_allreduce_rmsnorm_quant_gfx1250
@@ -1054,6 +1055,7 @@ class CustomAllreduce:
             self._ops_all_reduce = ops.all_reduce
             self._ops_all_reduce_residual = ops.all_reduce_residual
             self._ops_all_gather = None
+            self._ops_all_gather_lastdim_add = ops.all_gather_lastdim_add
             self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_fused_ar_rms = ops.fused_allreduce_rmsnorm
             self._ops_fused_ar_rms_quant = ops.fused_allreduce_rmsnorm_quant
@@ -2127,6 +2129,74 @@ class CustomAllreduce:
                 out,
                 dim,
             )
+        return out
+
+    def should_custom_ag_lastdim_add(self, inp: torch.Tensor) -> bool:
+        """Whether all_gather_lastdim_add can run on this [rows, n] shard."""
+        if self.disabled or self._ops_all_gather_lastdim_add is None:
+            return False
+        if self.world_size not in (2, 4, 8):
+            return False
+        if not (self.world_size == 2 or self.fully_connected):
+            return False
+        if inp.dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if inp.dim() != 2 or not inp.is_contiguous():
+            return False
+        if inp.shape[1] % 8 != 0 or inp.data_ptr() % 16 != 0:
+            return False
+        return inp.numel() * inp.element_size() <= self.max_size
+
+    def all_gather_lastdim_add(
+        self,
+        inp: torch.Tensor,
+        add_b: torch.Tensor,
+        add_c: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """out = bf16(bf16(allgather(inp, dim=-1) + add_b) [+ add_c]) in one
+        launch (the add3 double rounding), for 2D [rows, n] shards. Under graph
+        capture with enable_register_for_capturing, inp is read in place
+        (capture registers it); otherwise it is staged into the registered
+        input pool first."""
+        if self.disabled or self._ops_all_gather_lastdim_add is None:
+            raise RuntimeError(
+                "all_gather_lastdim_add is unavailable on this communicator; "
+                "check should_custom_ag_lastdim_add first"
+            )
+        assert inp.dim() == 2, "all_gather_lastdim_add only supports 2D tensors"
+        assert inp.is_contiguous(), "all_gather_lastdim_add expects a contiguous inp"
+        shape = (inp.shape[0], inp.shape[1] * self.world_size)
+        if out is None:
+            out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+        for t in (add_b, add_c, out):
+            assert t is None or (
+                t.shape == shape
+                and t.is_contiguous()
+                and t.dtype == inp.dtype
+                and t.device == inp.device
+            ), (
+                f"all_gather_lastdim_add expects contiguous {shape} add/out "
+                f"tensors with inp's dtype ({inp.dtype}) and device ({inp.device})"
+            )
+        for t in (inp, add_b, add_c, out):
+            assert (
+                t is None or t.data_ptr() % 16 == 0
+            ), "all_gather_lastdim_add expects 16-byte aligned tensors"
+        assert out.data_ptr() not in (
+            add_b.data_ptr(),
+            add_c.data_ptr() if add_c is not None else None,
+        ), "all_gather_lastdim_add does not support out aliasing add_b or add_c"
+        registered = (
+            self._IS_CAPTURING
+            and torch.cuda.is_current_stream_capturing()
+            and self._capture_registered(inp)
+        )
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        self._ops_all_gather_lastdim_add(
+            self._ptr, inp, out, add_b, add_c, reg, reg_bytes
+        )
         return out
 
     def all_gather_unreg(
