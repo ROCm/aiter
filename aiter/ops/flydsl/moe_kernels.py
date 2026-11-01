@@ -3163,6 +3163,10 @@ def _get_compiled_fused_quant_preshuffle(
     quant_mode: str = "fp4",
     skip_padding: bool = False,
     payload_preshuffled: bool = False,
+    activation: int = 0,
+    swiglu_limit: float = float("inf"),
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_module,
@@ -3174,6 +3178,10 @@ def _get_compiled_fused_quant_preshuffle(
         quant_mode=quant_mode,
         skip_padding=skip_padding,
         payload_preshuffled=payload_preshuffled,
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -3370,6 +3378,10 @@ def flydsl_moe_fused_quant_preshuffle(
     # row_major_ascale=1. Unsupported with A-preshuffled payloads or quantization.
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    activation: int = 0,
+    swiglu_limit: float = float("inf"),
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3377,7 +3389,21 @@ def flydsl_moe_fused_quant_preshuffle(
     payload_preshuffled is true, FP4 payload bytes follow the logical
     (M/16, K/128, 4, 16, 32) layout; each final 32-element span is 16 bytes.
     This mode requires logical K divisible by 1024, with 0 < K <= 16384.
+    With activation=1/2/3, grouped_in contains element-interleaved BF16
+    gate/up pairs (2*K columns); activation and quantization share one kernel.
     """
+    if activation not in (0, 1, 2, 3):
+        raise ValueError("activation must be 0, 1 (silu), 2 (swiglu), or 3 (situv2)")
+    if activation and (
+        topids_to_rows is not None
+        or prequantized_scale is not None
+        or row_starts is not None
+        or source_topk
+        or ep_psum_params is not None
+    ):
+        raise ValueError("fused activation requires non-routed BF16 gate/up input")
+    if activation == 3 and (situ_beta <= 0 or situ_linear_beta <= 0):
+        raise ValueError("SiTUv2 beta and linear_beta must be positive")
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
@@ -3421,6 +3447,10 @@ def flydsl_moe_fused_quant_preshuffle(
     # features per byte -- taking shape[-1] there would halve every derived
     # geometry (Pb, Ws, the module name) without tripping a single assert.
     feat_dim = grouped_in.shape[-1]
+    if activation:
+        if feat_dim % 2:
+            raise ValueError("activation input must contain complete gate/up pairs")
+        feat_dim //= 2
     if prequantized and quant_mode == "fp4":
         feat_dim *= 2
     if payload_preshuffled:
@@ -3681,6 +3711,10 @@ def flydsl_moe_fused_quant_preshuffle(
         quant_mode=quant_mode,
         skip_padding=skip_padding,
         payload_preshuffled=payload_preshuffled,
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     _dispatch_compiled(
         launch,
