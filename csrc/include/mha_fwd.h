@@ -361,4 +361,24 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      const ck_tile::stream_config& s);
 
 float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s);
+
+inline constexpr int kFmhaHd192SplitKvMinSplits = 2;
+inline constexpr int kFmhaHd192SplitKvMaxSplits = 8;
+
+float fmha_fwd_v3_splitkv(mha_fwd_args args,
+                          int num_splits,
+                          const ck_tile::stream_config& stream_config);
+
+// Partial layouts are [split, query, head, value] for output and
+// [split, head, query] for natural-log LSE.
+void launch_fmha_fwd_v3_splitkv_combine(const void* partial_out,
+                                        const void* partial_lse,
+                                        void* out,
+                                        void* lse,
+                                        int seqlen_q,
+                                        int num_heads,
+                                        int num_splits,
+                                        int64_t out_token_stride,
+                                        int64_t out_head_stride,
+                                        hipStream_t stream);
 } // namespace aiter
