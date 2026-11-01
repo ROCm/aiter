@@ -1860,6 +1860,12 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
 # predicated stores at clamped in-plane offsets, i64 descriptor extents) is the
 # bf16 kernel's.  ``QSA_FP8_PATH=scalar`` routes fp8 back to the round-F scalar
 # kernel (LDS-staged Q), which stays built and selectable.
+# Only the full r32 padded-TDM pair conversion is eligible; native is default.
+# Explicit current, r16, raw/mixed/tail and bf16 retain the champion converter.
+_FP8_CVT = os.environ.get("QSA_FP8_CVT", "fast").strip().lower()
+if _FP8_CVT not in ("current", "fast"):
+    raise ValueError(f"QSA_FP8_CVT must be 'current' or 'fast', got {_FP8_CVT!r}")
+
 _FP8_PATH = os.environ.get("QSA_FP8_PATH", "wmma").strip().lower()
 if _FP8_PATH not in ("wmma", "scalar"):
     raise ValueError(f"QSA_FP8_PATH must be 'wmma' or 'scalar', got {_FP8_PATH!r}")
@@ -1943,6 +1949,47 @@ def _e4m3x4_to_bf16x2(x):
     return lo, hi
 
 
+def _e4m3x8_to_bf16x4_fast(src0, src1):
+    """Eight exact legacy E4M3 codes -> four bf16 pairs on stock gfx1250.
+
+    Native E4M3FN treats 0x7f/0xff as NaN, while this kernel deliberately
+    treats them as +/-480. Convert *positive* magnitudes, then packed unsigned
+    min with bf16(480): all finite magnitudes are <=448, and every bf16 NaN
+    payload is >480. Finally restore the original signs, including -0.
+    Direct bf16 conversion has no half-subnormal intermediate; the production
+    kernel's FLOAT_DENORM_MODE_16_64=preserve is required for legacy identity.
+    No scale or head-sum arithmetic is changed here.
+    """
+    from flydsl._mlir.dialects import llvm
+
+    src = (fx.Int32(src0), fx.Int32(src1))
+    magnitudes = Vec.from_elements([v & fx.Int32(0x7F7F7F7F) for v in src], dtype=fx.Int32)
+    converted = Vec(llvm.inline_asm(
+        Vec.make_type(4, fx.Int32), [magnitudes.ir_value()],
+        # LLVM marks the pk8 destination early-clobber: four output registers
+        # must not overlap the two input registers during its blocking cycles.
+        "v_cvt_scale_pk8_bf16_fp8 $0, $1, 0x7f", "=&v,v",
+        has_side_effects=False,
+    ))
+    words = []
+    for j in range_constexpr(4):
+        magnitude = llvm.inline_asm(
+            fx.Int32.ir_type, [fx.Int32(converted[j]).ir_value(), fx.Int32(0x43F043F0).ir_value()],
+            "v_pk_min_u16 $0, $1, $2", "=v,v,s", has_side_effects=False,
+        )
+        selector = "0x01010000" if j % 2 == 0 else "0x03030202"
+        sign = llvm.inline_asm(
+            fx.Int32.ir_type, [src[j // 2].ir_value()],
+            "v_perm_b32 $0, $1, $1, " + selector, "=v,v", has_side_effects=False,
+        )
+        word = llvm.inline_asm(
+            fx.Int32.ir_type, [sign, fx.Int32(_s32(0x80008000)).ir_value(), magnitude],
+            "v_and_or_b32 $0, $1, $2, $3", "=v,v,s,v", has_side_effects=False,
+        )
+        words.append(fx.Int32(word))
+    return Vec.from_elements(words, dtype=fx.Int32)
+
+
 @lru_cache(maxsize=None)
 def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str | None = None):
     """fp8 WMMA specialization; r32 shares exact E4M3 B fragments across M tiles.
@@ -2014,10 +2061,27 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
             words.append(w1)
         return Vec.from_elements(words, dtype=fx.Int32)
 
+    def _pair_frag_tdm_fast(ptr, byte_off, kgrp):
+        # Exactly the champion addresses and lane-half selection; only conversion
+        # widens from four to eight codes. Result is the identical eight-i32 B.
+        lo = Vec(fx.ptr_load(ptr + byte_off // 4, result_type=Vec.make_type(4, fx.Int32)))
+        hi = Vec(fx.ptr_load(ptr + (byte_off + 16) // 4, result_type=Vec.make_type(4, fx.Int32)))
+        words = []
+        for vec in (lo, hi):
+            src0 = (kgrp == 0).select(fx.Int32(vec[0]), fx.Int32(vec[2]))
+            src1 = (kgrp == 0).select(fx.Int32(vec[1]), fx.Int32(vec[3]))
+            converted = _e4m3x8_to_bf16x4_fast(src0, src1)
+            for j in range_constexpr(4):
+                words.append(fx.Int32(converted[j]))
+        return Vec.from_elements(words, dtype=fx.Int32)
+
+    fast_cvt = use_tdm and _FP8_CVT == "fast"
     pair_storage = _pair_storage_tdm if use_tdm else _pair_storage_raw
     pair_stage = _pair_stage_tdm if use_tdm else _pair_stage_raw
     pair_base = _pair_base_tdm if use_tdm else _pair_base_raw
     pair_frag = _pair_frag_tdm if use_tdm else _pair_frag_raw
+    if fast_cvt:
+        pair_frag = _pair_frag_tdm_fast
     inv_divisor = 1.0 / divisor
     q_row_bytes = NUM_HEADS * HEAD_DIM * 2            # 1024 B
     head_bytes = HEAD_DIM * 2                         # 256 B
@@ -2030,6 +2094,7 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
         f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}"
         f"_r{rows_per_block}_c{WMMA_COLS}_flydsl"
         + ("_tdm" if use_tdm else "")
+        + ("_cvtfast" if fast_cvt else "")
     )
 
     # ---- helpers: plain Python at trace time (no `if`/runtime `for` inside; the

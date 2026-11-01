@@ -693,6 +693,15 @@ class FP8KernelSourceCPU(unittest.TestCase):
         self.assertEqual(ast.unparse(bound["guard_load"]), "_ld_uniform_i32 if use_tdm else _ld_i32")
         self.assertEqual(ast.unparse(bound["pair_base"]), "_pair_base_tdm if use_tdm else _pair_base_raw")
         self.assertEqual(ast.unparse(bound["pair_frag"]), "_pair_frag_tdm if use_tdm else _pair_frag_raw")
+        self.assertEqual(ast.unparse(bound["fast_cvt"]), "use_tdm and _FP8_CVT == 'fast'")
+        override = next(n for n in self.build.body if isinstance(n, ast.If)
+                        and ast.unparse(n.test) == "fast_cvt")
+        self.assertEqual(ast.unparse(override.body[0]), "pair_frag = _pair_frag_tdm_fast")
+        # Mixed/tail/r16 helpers and bf16 never reference the conversion switch.
+        for root in (self.helpers["_pair_frag_raw"], self.helpers["_kfrag_fp8"],
+                     self.helpers["kernel"], self.top["_build_wmma_kernel"]):
+            self.assertFalse(any(isinstance(n, ast.Name) and n.id == "_FP8_CVT"
+                                 for n in ast.walk(root)))
 
 
 class FP8RequestStoresCPU(unittest.TestCase):

@@ -71,6 +71,8 @@ def check(path: Path, tdm: bool) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", type=Path)
+    parser.add_argument("--cvt", choices=("current", "fast"), default="fast",
+                        help="conversion selection used for these dumps (default: fast)")
     args = parser.parse_args()
     records = []
     prefix = "qsa_paged_mqa_logits_page4_gfx1250_fp8_wmma_D128_H4_P4"
@@ -82,13 +84,19 @@ def main():
         for rows, dispatch in ((16, "fp8_wmma"), (32, "fp8_wmma_r32")):
             # Shared raw mode overrides both dtypes, including raw + R64=1.
             tdm = rows == 32 and mode not in ("raw", "r64raw")
-            name = f"{prefix}_r{rows}_c64_flydsl" + ("_tdm" if tdm else "")
+            fast = tdm and args.cvt == "fast"
+            name = (f"{prefix}_r{rows}_c64_flydsl" + ("_tdm" if tdm else "")
+                    + ("_cvtfast" if fast else ""))
             compiled = re.findall(r"^\[COMPILED\] " + dispatch + r" kernel=(\S+)\s*$", log, re.MULTILINE)
             assert compiled == [name], (mode, dispatch, compiled, name)
             path = args.results / mode / "isa" / name / "21_final_isa.s"
             rec = check(path, tdm)
+            native = len(re.findall(r"\bv_cvt_scale_pk8_bf16_fp8\b", path.read_text(encoding="utf-8")))
+            assert native == (32 if fast else 0), (mode, rows, "conversion routing", native)
             rec.update(mode=mode, rows_per_block=rows, kernel_name=name,
-                       selected_k_load="tdm" if tdm else "raw")
+                       selected_k_load="tdm" if tdm else "raw",
+                       selected_fp8_cvt="fast" if fast else "current",
+                       native_pk8_count=native)
             records.append(rec)
     by = {(r["mode"], r["rows_per_block"]): r for r in records}
     assert by["auto", 16]["sha256"] == by["raw", 16]["sha256"] == by["tdm", 16]["sha256"]
