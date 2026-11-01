@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
@@ -15,11 +16,13 @@ TRITON_GE_38 = TRITON_VERSION >= Version("3.8.0")
 
 arch = arch_info.get_arch()
 _gluon_fp8_mqa_logits_kernel = None
+_gluon_fp8_mqa_logits_rows8_kernel = None
 if TRITON_GE_36:
     try:
         if arch == "gfx950":
             from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
+                _gluon_fp8_mqa_logits_rows8_kernel,
             )
         elif arch == "gfx1250":
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
@@ -27,6 +30,7 @@ if TRITON_GE_36:
             )
     except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
+        _gluon_fp8_mqa_logits_rows8_kernel = None
 
 
 # Hacks to see if we can use some newer features
@@ -147,6 +151,84 @@ def fp8_mqa_logits(
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
+    if seq_len == 0 or seq_len_kv == 0:
+        return logits
+
+    if (
+        use_gluon
+        and arch == "gfx950"
+        and _gluon_fp8_mqa_logits_rows8_kernel is not None
+        and FOLDED_REDUCTED_SUPPORT
+        and ASYNC_COPY_SUPPORTS_DISTRIBUTED
+        and Q.dtype == torch.float8_e4m3fn
+        and KV.dtype == torch.float8_e4m3fn
+        and num_heads == 32
+        and head_size == 128
+        and seq_len % 8 == 0
+        and not clean_logits
+    ):
+        config_dir = resolve_config_dir("attention", "FP8_MQA_LOGITS", backend="gluon")
+        config = dict(load_config_json(f"{config_dir}/DEFAULT.json")["rows8"])
+        min_seq_len_kv = config.pop("min_seq_len_kv")
+        if seq_len_kv >= min_seq_len_kv:
+            # Normalize non-unit inner strides before FP8 async copies.
+            if stride_kv_d != 1:
+                KV = KV.contiguous()
+                stride_kv_s, stride_kv_d = KV.stride()
+            block_m = config["BLOCK_M"]
+            block_kv = config["BLOCK_KV"]
+            num_warps = config["NUM_WARPS"]
+            waves_per_eu = config["WAVES_PER_EU"]
+            num_kv_splits = _gfx950_kv_splits(
+                seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
+            )
+            # Buffer offsets span one KV tile or one eight-row output tile.
+            max_buffer_bytes = 2**31 - 1
+            kv_tile_bytes = (
+                (block_kv - 1) * stride_kv_s + (head_size - 1) * stride_kv_d + 1
+            ) * KV.element_size()
+            scale_pair_bytes = (
+                (2 * block_kv - 1) * kv_scales.stride(0) + 1
+            ) * kv_scales.element_size()
+            logits_tile_bytes = (
+                (block_m - 1) * stride_logits_s
+                + (block_kv // 2 - 1) * stride_logits_k
+                + 1
+            ) * logits.element_size()
+            _gluon_fp8_mqa_logits_rows8_kernel[(seq_len // block_m, num_kv_splits)](
+                Q_ptr=Q,
+                KV_ptr=KV,
+                kv_scales_ptr=kv_scales,
+                weights_ptr=weights,
+                cu_start_ptr=cu_starts,
+                cu_end_ptr=cu_ends,
+                logits_ptr=logits,
+                seq_len_kv=seq_len_kv,
+                NUM_HEADS=num_heads,
+                HEAD_SIZE=head_size,
+                stride_q_s=stride_q_s,
+                stride_q_h=stride_q_h,
+                stride_q_d=stride_q_d,
+                stride_kv_s=stride_kv_s,
+                stride_kv_d=stride_kv_d,
+                stride_w_s=stride_w_s,
+                stride_w_h=stride_w_h,
+                stride_ks=kv_scales.stride(0),
+                stride_cu_start=cu_starts.stride(0),
+                stride_cu_end=cu_ends.stride(0),
+                stride_logits_s=stride_logits_s,
+                stride_logits_k=stride_logits_k,
+                USE_BUFFER_LOAD=max(kv_tile_bytes, scale_pair_bytes)
+                <= max_buffer_bytes,
+                USE_BUFFER_STORE=logits_tile_bytes <= max_buffer_bytes,
+                USE_PADDED_SHARED_LAYOUT=ASYNC_COPY_SUPPORTS_DISTRIBUTED,
+                num_warps=num_warps,
+                waves_per_eu=waves_per_eu,
+                enable_fp_fusion=True,
+                **config,
+            )
+            return logits
+
     if not use_gluon:
         # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
         # the default (128, 2) tile would not fit two co-resident workgroups

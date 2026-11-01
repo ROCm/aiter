@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -217,6 +220,7 @@ class MQAAsyncKVLoader:
         WARP_SIZE: gl.constexpr,
         NUM_BUFFERS: gl.constexpr,
         USE_PADDED_SHARED_LAYOUT: gl.constexpr,
+        USE_64BIT_OFFSETS: gl.constexpr = False,
     ):
         kv_cfg = MQAAsyncKVLoaderConfig(
             BLOCK_KV,
@@ -238,7 +242,12 @@ class MQAAsyncKVLoader:
             0, kv_cfg.BLOCK_KV, layout=gl.SliceLayout(0, kv_cfg.blocked)
         )[None, :]
         # Advance the pointer instead of having large offset to enable buffer ops
-        base_offset = offs_d * stride_kv_d + offs_n * stride_kv_s
+        if USE_64BIT_OFFSETS:
+            base_offset = (
+                offs_d.to(gl.int64) * stride_kv_d + offs_n.to(gl.int64) * stride_kv_s
+            )
+        else:
+            base_offset = offs_d * stride_kv_d + offs_n * stride_kv_s
         return MQAAsyncKVLoader(
             kv_cfg,
             KV_ptr,
@@ -1143,3 +1152,400 @@ def _gluon_fp8_mqa_logits_kernel(
         UNROLL,
         RELAXED_STORE,
     )
+
+
+@gluon.constexpr_function
+def _check_rows8_layout(linear_layout):
+    reg = sorted(tuple(b) for b in linear_layout.reg_bases)
+    lane = sorted(tuple(b) for b in linear_layout.lane_bases)
+    warp = sorted(tuple(b) for b in linear_layout.warp_bases)
+    assert reg == sorted([(1, 0), (2, 0), (8, 0), (16, 0), (128, 0)])
+    assert lane == sorted([(0, 1), (0, 2), (0, 4), (0, 8), (0, 16), (4, 0)])
+    assert warp == sorted([(32, 0), (64, 0)])
+    return True
+
+
+@gluon.jit
+def _rows8_fold(s, w, mfma_layout: gl.constexpr):
+    gl.static_assert(_check_rows8_layout(gl.to_linear_layout(mfma_layout, [256, 32])))
+    # Put the row-pair bit in lane bit 5 and head bit 2 in registers.
+    shape: gl.constexpr = (2, 4, 2, 2, 2, 2, 2, 32)
+    order: gl.constexpr = (1, 4, 7, 2, 3, 5, 6, 0)
+    s = s.reshape(shape).permute(order)
+    w = w.broadcast_to([256, 32]).reshape(shape).permute(order)
+    sa, sb = s.split()
+    wa, wb = w.split()
+    acca = _weighted_fma_fold_serial(relu_f32(sa), wa, 16, 4)
+    accb = _weighted_fma_fold_serial(relu_f32(sb), wb, 16, 4)
+    return acca + accb
+
+
+@gluon.jit
+def _rows8_copy_scales(
+    ks_shared,
+    kv_scales_ptr,
+    offset,
+    stride_ks,
+    relative_end,
+    BLOCK_KV: gl.constexpr,
+    ks_layout: gl.constexpr,
+    USE_BUFFER_LOAD: gl.constexpr,
+    MASKED: gl.constexpr,
+):
+    offset = gl.cast(offset, gl.int64)
+    cols = gl.arange(0, 2 * BLOCK_KV, layout=ks_layout)
+    mask = cols < relative_end - offset if MASKED else None
+    if USE_BUFFER_LOAD:
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            ks_shared,
+            kv_scales_ptr + offset.to(gl.int64) * stride_ks,
+            cols * stride_ks,
+            mask=mask,
+        )
+    else:
+        gl.amd.cdna4.async_copy.global_load_to_shared(
+            ks_shared,
+            kv_scales_ptr + (offset.to(gl.int64) + cols) * stride_ks,
+            mask=mask,
+        )
+
+
+@gluon.jit
+def _rows8_load_k(k_view, BLOCK_KV: gl.constexpr, dot_b_layout: gl.constexpr):
+    half: gl.constexpr = BLOCK_KV // 2
+    k0 = k_view.slice(0, half, dim=1).load(layout=dot_b_layout)
+    k1 = k_view.slice(half, half, dim=1).load(layout=dot_b_layout)
+    return k0, k1
+
+
+@gluon.jit
+def _rows8_load_scales(ks_view, BLOCK_KV: gl.constexpr, ks_layout: gl.constexpr):
+    half: gl.constexpr = BLOCK_KV // 2
+    ks0 = ks_view.slice(0, half).load(layout=ks_layout)
+    ks1 = ks_view.slice(half, half).load(layout=ks_layout)
+    return ks0, ks1
+
+
+@gluon.jit
+def _rows8_emit_tile(
+    q,
+    w,
+    k,
+    ks,
+    logits_ptr,
+    store_offsets,
+    cols,
+    stride_logits_k,
+    BLOCK_M: gl.constexpr,
+    NUM_HEADS: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    output_layout: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+    relative_end=0,
+    MASKED: gl.constexpr = False,
+):
+    half: gl.constexpr = BLOCK_KV // 2
+    for h in gl.static_range(2):
+        scores = _mqa_dot(q, k[h], BLOCK_M * NUM_HEADS, half, mfma_layout)
+        out = gl.convert_layout(_rows8_fold(scores, w, mfma_layout), output_layout)
+        out *= ks[h][None, None, :]
+        if MASKED:
+            mask = (cols < relative_end - h * half).broadcast_to([4, 2, half])
+        else:
+            mask = None
+        _store_logits_block(
+            logits_ptr + h * half * stride_logits_k,
+            store_offsets,
+            out,
+            USE_BUFFER_STORE,
+            mask,
+        )
+
+
+_gluon_fp8_mqa_logits_rows8_kernel_repr = make_kernel_repr(
+    "_gluon_fp8_mqa_logits_rows8_kernel",
+    [
+        "NUM_HEADS",
+        "HEAD_SIZE",
+        "BLOCK_M",
+        "BLOCK_KV",
+        "NUM_WARPS",
+        "NUM_BUFFERS",
+        "WAVES_PER_EU",
+        "USE_BUFFER_LOAD",
+        "USE_BUFFER_STORE",
+        "USE_PADDED_SHARED_LAYOUT",
+    ],
+)
+
+
+@gluon.jit(repr=_gluon_fp8_mqa_logits_rows8_kernel_repr)
+def _gluon_fp8_mqa_logits_rows8_kernel(
+    Q_ptr,
+    KV_ptr,
+    kv_scales_ptr,
+    weights_ptr,
+    cu_start_ptr,
+    cu_end_ptr,
+    logits_ptr,
+    seq_len_kv: gl.int32,
+    NUM_HEADS: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    stride_q_s: gl.int64,
+    stride_q_h: gl.constexpr,
+    stride_q_d: gl.constexpr,
+    stride_kv_s: gl.int64,
+    stride_kv_d: gl.constexpr,
+    stride_w_s: gl.int64,
+    stride_w_h: gl.constexpr,
+    stride_ks: gl.constexpr,
+    stride_cu_start: gl.constexpr,
+    stride_cu_end: gl.constexpr,
+    stride_logits_s: gl.int64,
+    stride_logits_k: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    WAVES_PER_EU: gl.constexpr,
+    USE_BUFFER_LOAD: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+    USE_PADDED_SHARED_LAYOUT: gl.constexpr,
+):
+    gl.static_assert(BLOCK_M == 8 and NUM_WARPS == 4 and gl.num_warps() == 4)
+    gl.static_assert(NUM_HEADS == 32 and HEAD_SIZE == 128 and BLOCK_KV == 64)
+    gl.static_assert(NUM_BUFFERS == 2)
+    stride_q_s = stride_q_s.to(gl.int64)
+    stride_w_s = stride_w_s.to(gl.int64)
+    stride_logits_s = stride_logits_s.to(gl.int64)
+    if USE_BUFFER_LOAD:
+        stride_kv_s = stride_kv_s.to(gl.int32)
+    else:
+        stride_kv_s = stride_kv_s.to(gl.int64)
+    row_id = (gl.num_programs(0) - gl.program_id(0) - 1) * BLOCK_M
+    row_id = row_id.to(gl.int64)
+    union_start = gl.maximum(gl.load(cu_start_ptr + row_id * stride_cu_start), 0)
+    union_end = gl.minimum(gl.load(cu_end_ptr + row_id * stride_cu_end), seq_len_kv)
+    for row in gl.static_range(1, BLOCK_M):
+        union_start = gl.minimum(
+            union_start,
+            gl.maximum(gl.load(cu_start_ptr + (row_id + row) * stride_cu_start), 0),
+        )
+        union_end = gl.maximum(
+            union_end,
+            gl.minimum(
+                gl.load(cu_end_ptr + (row_id + row) * stride_cu_end), seq_len_kv
+            ),
+        )
+    # Each split owns whole tile pairs, with at most one partial pair at the end.
+    pair_size: gl.constexpr = 2 * BLOCK_KV
+    pairs = gl.cdiv(gl.maximum(union_end - union_start, 0), pair_size)
+    pairs_per_split = gl.cdiv(pairs, gl.num_programs(1))
+    start = union_start + gl.program_id(1) * pairs_per_split * pair_size
+    end = gl.minimum(start + pairs_per_split * pair_size, union_end)
+    if start >= end:
+        return
+
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[32, 32, 64],
+        transposed=False,
+        warps_per_cta=[NUM_WARPS, 1],
+    )
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(0, mfma_layout, 16)
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(1, mfma_layout, 16)
+    q_layout: gl.constexpr = gl.BlockedLayout([1, 16], [8, 8], [NUM_WARPS, 1], [1, 0])
+    mq = gl.arange(0, BLOCK_M * NUM_HEADS, layout=gl.SliceLayout(1, q_layout))
+    mw = gl.arange(0, BLOCK_M * NUM_HEADS, layout=gl.SliceLayout(1, mfma_layout))
+    q_row = 2 * ((mq // 32) % 4) + (mq // 4) % 2
+    q_head = mq % 4 + 4 * (mq // 128) + 8 * ((mq // 8) % 4)
+    w_row = 2 * ((mw // 32) % 4) + (mw // 4) % 2
+    w_head = mw % 4 + 4 * (mw // 128) + 8 * ((mw // 8) % 4)
+    q_offsets = ((row_id + q_row) * stride_q_s + q_head.to(gl.int64) * stride_q_h)[
+        :, None
+    ]
+    q_offsets += (
+        gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, q_layout)).to(gl.int64)
+        * stride_q_d
+    )[None, :]
+    q = gl.convert_layout(gl.load(Q_ptr + q_offsets), dot_a_layout)
+    w_offsets = ((row_id + w_row) * stride_w_s + w_head.to(gl.int64) * stride_w_h)[
+        :, None
+    ]
+    w = gl.load(weights_ptr + w_offsets)
+    kv_loader = MQAAsyncKVLoader.initialize(
+        KV_ptr,
+        seq_len_kv,
+        stride_kv_s,
+        stride_kv_d,
+        BLOCK_KV,
+        HEAD_SIZE,
+        NUM_WARPS,
+        64,
+        NUM_BUFFERS,
+        USE_PADDED_SHARED_LAYOUT,
+        USE_64BIT_OFFSETS=not USE_BUFFER_LOAD,
+    )
+    output_layout: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[],
+        lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16], [0, 1, 0]],
+        warp_bases=[[1, 0, 0], [2, 0, 0]],
+        block_bases=[],
+        shape=[4, 2, 32],
+    )
+    ks_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, output_layout))
+    pair = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, output_layout)))[
+        :, None, None
+    ]
+    row = gl.arange(0, 2, layout=gl.SliceLayout(0, gl.SliceLayout(2, output_layout)))[
+        None, :, None
+    ]
+    cols = gl.arange(0, BLOCK_KV // 2, layout=ks_layout)[None, None, :]
+    store_offsets = (2 * pair + row) * stride_logits_s + cols * stride_logits_k
+    if USE_BUFFER_STORE:
+        store_offsets = store_offsets.to(gl.int32)
+    ks_shared = gl.allocate_shared_memory(
+        gl.float32, [pair_size], gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    )
+    ks_a = ks_shared.slice(0, BLOCK_KV)
+    ks_b = ks_shared.slice(BLOCK_KV, BLOCK_KV)
+    ks_copy_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    kv_scales_ptr += start.to(gl.int64) * stride_ks
+    logits_ptr += row_id * stride_logits_s + start.to(gl.int64) * stride_logits_k
+    relative_end = end - start
+    full_tiles = relative_end // BLOCK_KV
+    full_pairs = full_tiles // 2
+    if full_pairs > 0:
+        _rows8_copy_scales(
+            ks_shared,
+            kv_scales_ptr,
+            0,
+            stride_ks,
+            relative_end,
+            BLOCK_KV,
+            ks_copy_layout,
+            USE_BUFFER_LOAD,
+            False,
+        )
+        kv_loader.load_to_shared(start, 0, USE_BUFFER_LOAD)
+        kv_loader.load_to_shared(start + BLOCK_KV, 1, USE_BUFFER_LOAD)
+        for i in tl.range(full_pairs):
+            tile = 2 * i
+            next_a = gl.minimum(tile + 2, full_tiles - 1)
+            next_b = gl.minimum(tile + 3, full_tiles - 1)
+            next_ks = gl.minimum(tile + 2, full_tiles - 2)
+            kv_loader.wait(1)
+            ka = _rows8_load_k(kv_loader.kv_shared.index(0), BLOCK_KV, dot_b_layout)
+            ksa = _rows8_load_scales(ks_a, BLOCK_KV, ks_layout)
+            ksb = _rows8_load_scales(ks_b, BLOCK_KV, ks_layout)
+            _rows8_copy_scales(
+                ks_shared,
+                kv_scales_ptr,
+                next_ks * BLOCK_KV,
+                stride_ks,
+                relative_end,
+                BLOCK_KV,
+                ks_copy_layout,
+                USE_BUFFER_LOAD,
+                False,
+            )
+            kv_loader.load_to_shared(start + next_a * BLOCK_KV, 0, USE_BUFFER_LOAD)
+            _rows8_emit_tile(
+                q,
+                w,
+                ka,
+                ksa,
+                logits_ptr + tile * BLOCK_KV * stride_logits_k,
+                store_offsets,
+                cols,
+                stride_logits_k,
+                BLOCK_M,
+                NUM_HEADS,
+                BLOCK_KV,
+                mfma_layout,
+                output_layout,
+                USE_BUFFER_STORE,
+            )
+            kv_loader.wait(1)
+            kb = _rows8_load_k(kv_loader.kv_shared.index(1), BLOCK_KV, dot_b_layout)
+            kv_loader.load_to_shared(start + next_b * BLOCK_KV, 1, USE_BUFFER_LOAD)
+            _rows8_emit_tile(
+                q,
+                w,
+                kb,
+                ksb,
+                logits_ptr + (tile + 1) * BLOCK_KV * stride_logits_k,
+                store_offsets,
+                cols,
+                stride_logits_k,
+                BLOCK_M,
+                NUM_HEADS,
+                BLOCK_KV,
+                mfma_layout,
+                output_layout,
+                USE_BUFFER_STORE,
+            )
+        kv_loader.wait(0)
+
+    tail_offset = full_pairs * pair_size
+    tail = relative_end - tail_offset
+    if tail > 0:
+        _rows8_copy_scales(
+            ks_shared,
+            kv_scales_ptr,
+            tail_offset,
+            stride_ks,
+            relative_end,
+            BLOCK_KV,
+            ks_copy_layout,
+            USE_BUFFER_LOAD,
+            True,
+        )
+        kv_loader.load_to_shared(start + tail_offset, 0, USE_BUFFER_LOAD, masked=True)
+        kv_loader.load_to_shared(
+            start + tail_offset + BLOCK_KV, 1, USE_BUFFER_LOAD, masked=True
+        )
+        kv_loader.wait(1)
+        ka = _rows8_load_k(kv_loader.kv_shared.index(0), BLOCK_KV, dot_b_layout)
+        ksa = _rows8_load_scales(ks_a, BLOCK_KV, ks_layout)
+        _rows8_emit_tile(
+            q,
+            w,
+            ka,
+            ksa,
+            logits_ptr + tail_offset * stride_logits_k,
+            store_offsets,
+            cols,
+            stride_logits_k,
+            BLOCK_M,
+            NUM_HEADS,
+            BLOCK_KV,
+            mfma_layout,
+            output_layout,
+            USE_BUFFER_STORE,
+            tail,
+            True,
+        )
+        kv_loader.wait(0)
+        if tail > BLOCK_KV:
+            kb = _rows8_load_k(kv_loader.kv_shared.index(1), BLOCK_KV, dot_b_layout)
+            ksb = _rows8_load_scales(ks_b, BLOCK_KV, ks_layout)
+            _rows8_emit_tile(
+                q,
+                w,
+                kb,
+                ksb,
+                logits_ptr + (tail_offset + BLOCK_KV) * stride_logits_k,
+                store_offsets,
+                cols,
+                stride_logits_k,
+                BLOCK_M,
+                NUM_HEADS,
+                BLOCK_KV,
+                mfma_layout,
+                output_layout,
+                USE_BUFFER_STORE,
+                tail - BLOCK_KV,
+                True,
+            )
