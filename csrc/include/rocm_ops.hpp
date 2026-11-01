@@ -2578,6 +2578,9 @@ namespace py = pybind11;
           &topk_plain_reads_pitch,                \
           py::arg("numRows"),                     \
           py::arg("width"),                       \
+          py::arg("k"));                          \
+    m.def("topk_plain_merge_workspace_size",      \
+          &topk_plain_merge_workspace_size,       \
           py::arg("k"));
 
 #define RMSNORM_QUANT_PYBIND                 \

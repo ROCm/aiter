@@ -40,6 +40,18 @@ def topk_plain_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
 
 
 @compile_ops("module_topk_plain")
+def topk_plain_merge_workspace_size(k: int) -> int: ...
+
+
+@functools.cache
+def _merge_workspace_size(device: torch.device, k: int) -> int:
+    # The bound comes from occupancy queries against the current device, so it
+    # is cached per device rather than recomputed on every call.
+    with torch.cuda.device(device):
+        return topk_plain_merge_workspace_size(k)
+
+
+@compile_ops("module_topk_plain")
 def topk_plain_width(name: str) -> int: ...
 
 
@@ -130,10 +142,13 @@ def topk_plain(
 ) -> None:
     """Plain top-k over the last dim.
 
-    The fp32 radix path needs a device scratch workspace; it is allocated (and
-    cached) here on the Python side via torch's caching allocator and passed into
-    the kernel, so the C++ side never allocates device memory itself. Non-fp32
-    inputs never reach the radix path, so no workspace is allocated for them.
+    Two kernel paths need device scratch: the fp32 radix path, and the
+    multi-block path (any dtype) that splits each row across several blocks when
+    there are fewer rows than the grid holds and merges their partial results.
+    The workspace is allocated here on the Python side via torch's caching
+    allocator and passed into the kernel, so the C++ side never allocates device
+    memory itself and the call stays capturable in a CUDA graph. One call takes
+    at most one of the two paths, so they share the buffer.
 
     `topk_out` may be None for fp32 input with `largest=True` where
     `topk_plain_batches_ragged_rows` holds; elsewhere it raises TypeError, as a
@@ -201,17 +216,18 @@ def topk_plain(
         else:
             x = x.contiguous()
             stride0 = -1
-    workspace = None
+    size = _merge_workspace_size(x.device, topk)
     if x.dtype == torch.float32:
         device, width = x.device, x.shape[-1]
         # Mirror the C++ default: stride0 < 0 means a contiguous last dim.
         s0 = stride0 if ranged and stride0 >= 0 else width
-        size, radix = _workspace_plan(device, x.shape[0], s0, width, topk)
+        radix_size, radix = _workspace_plan(device, x.shape[0], s0, width, topk)
         if topk_out is None and not (largest and radix):
             _refuse_no_values(x, largest, topk)
-        workspace = get_topk_scratch_workspace(device, size)
+        size = max(size, radix_size)
     elif topk_out is None:
         _refuse_no_values(x, largest, topk)
+    workspace = get_topk_scratch_workspace(x.device, size)
     return _topk_plain(
         x,
         topk_ids,
