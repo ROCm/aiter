@@ -97,6 +97,11 @@ _ALIGN = 256
 _OPEN: dict[bytes, list] = {}
 
 
+def _YCOPY() -> bool:
+    # (debug) ar two-shot: the kernel's own y -> out= copy (else a host copy)
+    return os.environ.get("AITER_MEGAMOE_TP_YCOPY", "0") == "1"
+
+
 def _allocation_base(ptr: int) -> int:
     hip = _Ipc._load_hip()
     hip.hipMemGetAddressRange.argtypes = [
@@ -686,6 +691,9 @@ class MegaMoeTPEngine:
                     # AR2_MIN tokens on
                     ar2=self._sm_ar2(tot),
                     nc=self._sm_nc(tot),
+                    # (debug) ar: the all-reduce's second hop (y rows) in MXFP8 from this many
+                    ag8=self.ar
+                    and tot >= int(os.environ.get("AITER_MEGAMOE_TP_SMAG8MIN", "100000")),
                 )
             elif self._lb_ok(tot):
                 cfg = self._lb_config(tot)
@@ -948,7 +956,7 @@ class MegaMoeTPEngine:
             ptr(x),
             ptr(ids),
             ptr(tw),
-            y.data_ptr(),
+            ptr(y),
             self.routes.data_ptr(),
             self.proutes.data_ptr(),
             self.ctrl.data_ptr(),
@@ -1017,9 +1025,16 @@ class MegaMoeTPEngine:
             self._check_tail(tail, m)
             cfg = dataclasses.replace(self.tail_config(m), tn=2 if bf16 else 1)
         local_y = not self.ar or self._arll(cfg) or self._ag8(cfg)
-        y = out if out is not None and local_y else self.y
+        # (ar two-shot) the kernel copies the gathered y rows to out= itself (y the out
+        # pointer; None: no copy, the shared yall rows are returned)
+        ycopy = not local_y and out is not None and _YCOPY()
+        if local_y:
+            y = out if out is not None else self.y
+        else:
+            y = out if ycopy else None
         tptr = tuple(t.data_ptr() for t in tail) if tail is not None else ()
-        key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), y.data_ptr(), cfg, tptr)
+        yp = 0 if y is None else y.data_ptr()
+        key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), yp, cfg, tptr)
         if self._args[0] != key:
             args = self._launch_args(m, cfg, y, x, ids, tw, tail)
             self._args = (key, (args, x, ids, tw))
@@ -1030,6 +1045,8 @@ class MegaMoeTPEngine:
         if self.check and not torch.cuda.is_current_stream_capturing():
             self.check_errors()
         if not local_y:
+            if ycopy:
+                return out
             y = self._yall.local[:rows]
             return y if out is None else out.copy_(y)
         y = y[:rows] if out is None else out

@@ -176,9 +176,11 @@ def mega_moe_tp_consts(
     a8: bool = False,
     lb: bool = False,
     hb: bool = False,
+    rl: int = 0,
 ) -> dict:
     """hb: the A chunk buffers hold two chunks (small-M half blocks: the K halves of a
-    64-column GEMM1 block on the two wave pairs)"""
+    64-column GEMM1 block on the two wave pairs); rl: (small-M) the route list's entries
+    (every route by expert, rank order: the per-chunk gathers copy from it)"""
     RG = MT * 16
     KS1 = H // 128
     KS2 = I // 128
@@ -240,6 +242,9 @@ def mega_moe_tp_consts(
     c["L_DCH"] = take((nch + 2 * NW) * 4) if nch else 0
     c["L_EOFF"] = take(dyn_e * 4) if lb else 0
     c["L_DPRE"] = take(dyn_e * 4) if lb else 0
+    c["L_ROFF"] = take(dyn_e * 4) if rl else 0
+    c["L_RLI"] = take(rl * 4) if rl else 0
+    c["L_RLW"] = take(rl * 4) if rl else 0
     c["LDS_BYTES"] = ceildiv(off, 128) * 128
     assert H // 256 <= NCHA_MAX
     assert KS1 % NSK == 0 and NSK % KCS == 0
@@ -338,13 +343,20 @@ def kernel_config(
         and (KCS * 2) <= H // 128
         and (H // 128 // 2) % (nsk * KCS // math.gcd(nsk, KCS)) == 0
     )
+    # (small-M) the plan's route list (route ranks from the count's LDS atomics, after
+    # aiter #7095's route histograms): the chunk gathers copy instead of scanning
+    RL = (
+        min(TMAX, DYN_MAX) * TOPK
+        if sm and not lb and os.environ.get("AITER_MEGAMOE_TP_RLIST", "1") == "1"
+        else 0
+    )
     if HB:
-        c_ = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, True)
+        c_ = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, True, RL)
         HB = (
             c_["LDS_BYTES"] <= 160 * 1024
             and 2 * c_["NA_L"] * (ALOAD_DEPTH - 1) <= 63
         )
-    c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, HB)
+    c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, HB, RL)
     ABS, ASS = c["ABS"], c["ASS"]
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
     CH1, CH2, SI_STRIDE = c["CH1"], c["CH2"], c["SI_STRIDE"]
@@ -357,6 +369,7 @@ def kernel_config(
     L_B1, L_B1S = c["L_B1"], c["L_B1S"]
     L_DCNT, L_DCH = c["L_DCNT"], c["L_DCH"]
     L_EOFF, L_DPRE = c["L_EOFF"], c["L_DPRE"]
+    L_ROFF, L_RLI, L_RLW = c["L_ROFF"], c["L_RLI"], c["L_RLW"]
     L_WSUM = L_DCH + nch * 4
     assert npp >= 1 and nsk % (npp * KCS) == 0 and (KS1 * npp) % nsk == 0
     assert 3 <= NAB <= 4

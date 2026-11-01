@@ -417,7 +417,7 @@ def build_smallm(kc: KernelCtx) -> dict:
         e, cc, ce = _chunk(ent)
         mark(tid, a, 10)
         tnow(tid, a, i32(32) + fx.min(u, i32(3)) * i32(2))
-        R = gather_routes_chunk(L, tid, a, e, cc, ce)
+        R = gather_routes_chunk(L, tid, a, e, cc, ce, det=sk > i32(1))
         if const_expr(os.environ.get("AITER_MEGAMOE_TP_ICTEST", "0") == "1"):
             mark(tid, a, 27)
             for _ in range_constexpr(10):

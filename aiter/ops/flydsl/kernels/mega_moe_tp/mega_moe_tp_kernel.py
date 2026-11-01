@@ -217,6 +217,8 @@ def compile_mega_moe_tp(
     # small-M: the helper waves quantize the input rows while the compute waves take the
     # routing and plan (the weight stream starts earlier)
     QOVL = kc.SM and os.environ.get("AITER_MEGAMOE_TP_QOVL", "0") == "1"
+    # (ar two-shot) the y rows copied to out= in the kernel (host copy otherwise)
+    YCOPY = os.environ.get("AITER_MEGAMOE_TP_YCOPY", "0") == "1"
 
     def mark(tid, a, k, lead=0):
         """trace builds: CTA timestamp k (thread lead)"""
@@ -542,6 +544,9 @@ def compile_mega_moe_tp(
         if const_expr(ar and not ARLL):
             yag_flush(L, tid, a)
             yag_wait(tid, a, epoch)
+            if const_expr(not AG8 and YCOPY):
+                gpu.barrier()
+                kc.yout_copy(tid, a)
         if const_expr(TN):
             tn_rows(L, tid, a)
             if const_expr(not TNL):

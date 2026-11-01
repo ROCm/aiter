@@ -144,6 +144,7 @@ def build_communication(kc: KernelCtx) -> dict:
     L_CTL, L_DCNT, L_DPRE, L_DYN = kc.get("L_CTL L_DCNT L_DPRE L_DYN")
     L_INTER, L_INTERS, L_RIX, L_WT, MLL = kc.get("L_INTER L_INTERS L_RIX L_WT MLL")
     (L_WSUM,) = kc.get("L_WSUM")
+    L_ROFF, L_RLI, L_RLW, RL = kc.get("L_ROFF L_RLI L_RLW RL")
     MT, NBW, NCH, NCK, NMETA, NPC, NV = kc.get("MT NBW NCH NCK NMETA NPC NV")
     RG, SCAN_G, SCAN_IT, SI_STRIDE = kc.get("RG SCAN_G SCAN_IT SI_STRIDE")
     TMAX, TN, TOPK, TPC, VPL, XB, XLPR = kc.get("TMAX TN TOPK TPC VPL XB XLPR")
@@ -273,15 +274,54 @@ def build_communication(kc: KernelCtx) -> dict:
         return fx.Int32(e).bitcast(fx.Uint32) >= fx.Uint32(E)
 
     @flyc.jit
-    def gather_routes_chunk(L, tid, a, expert, cc, ce):
+    def gather_routes_chunk(L, tid, a, expert, cc, ce, det=None):
+        """chunk cc of ce of the expert's routes -> L_RIX / L_WT, C_CNT rows. RL: copied
+        from the plan's route list (rank order, differs between CTAs), unless det (the
+        split-K pieces need the same rows on every CTA: the deterministic scan)"""
         key = expert + i32(1) + (cc << i32(12)) + (ce << i32(20))
+        if const_expr(RL and det is not None):
+            key = key + det.select(i32(1 << 28), i32(0))
         if lds_ld_i32(L, L_CTL + C_GEXP * 4) != key:
-            if ce == i32(1):
-                _gather_scan(L, tid, a, expert, key)
+            if const_expr(RL):
+                # (one chunk: every CTA lists the same routes, in its own order; several:
+                # the chunks must hold the same routes on every CTA, the deterministic
+                # scan's split)
+                lst = ce == i32(1)
+                if const_expr(det is not None):
+                    lst = lst & (det == fx.Boolean(False))
+                if lst:
+                    _gather_list(L, tid, expert, key, cc, ce)
+                else:
+                    _gather_scan_any(L, tid, a, expert, key, cc, ce)
             else:
-                inv = fx.Float32(1.0) / ce.to(fx.Float32)
-                _gather_scan(L, tid, a, expert, key, (cc, ce, inv))
+                _gather_scan_any(L, tid, a, expert, key, cc, ce)
         return fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(TMAX))
+
+    @flyc.jit
+    def _gather_scan_any(L, tid, a, expert, key, cc, ce):
+        if ce == i32(1):
+            _gather_scan(L, tid, a, expert, key)
+        else:
+            inv = fx.Float32(1.0) / ce.to(fx.Float32)
+            _gather_scan(L, tid, a, expert, key, (cc, ce, inv))
+
+    @flyc.jit
+    def _gather_list(L, tid, expert, key, cc, ce):
+        """(RL) ranks cc, cc + ce, ... of the expert's route list"""
+        cbar(L, tid)  # (the last gather's rows read)
+        n = lds_ld_i32(L, L_DCNT + expert * i32(4))
+        tot = fx.max(n - cc + ce - i32(1), i32(0)) // ce
+        off = lds_ld_i32(L, L_ROFF + expert * i32(4)) + cc
+        for i_ in range(tid, fx.min(tot, i32(TMAX)), i32(NT)):
+            i = i32(i_)
+            sl = off + i * ce
+            lds_st(L, L_RIX + i * i32(4), lds_ld_i32(L, L_RLI + sl * i32(4)))
+            lds_st(L, L_WT + i * i32(4), lds_ld_i32(L, L_RLW + sl * i32(4)))
+        # (every wave stores the count and key before the one barrier)
+        if (tid % i32(64)) == i32(0):
+            lds_st(L, L_CTL + C_CNT * 4, tot)
+            lds_st(L, L_CTL + C_GEXP * 4, key)
+        cbar(L, tid)
 
     def _in_chunk(idx, chunk):
         if chunk is None:
@@ -757,6 +797,24 @@ def build_communication(kc: KernelCtx) -> dict:
             f = fx.Int32(bld(rf, idx * i32(4), 0, T.i32, AUX_SYS))
             pend = fx.max(pend, (ok & before(f, epoch)).select(i32(1), i32(0)))
         return wave_red(pend, lane, fx.max)
+
+    @flyc.jit
+    def yout_copy(tid, a):
+        """(ar two-shot, out= given: y != 0) this CTA's rows src * m + bid, the ones its
+        yag_wait saw land, from the shared yall to out (no host copy after the launch)"""
+        bid = i32(gpu.block_id("x"))
+        if (bid < a["m"]) & (fx.Int64(a["y"]) != fx.Int64(0)):
+            ry = own_rs(a, "off_yall")
+            ro = rsrc(a["y"])
+            H8 = H // 8
+            for p in range_constexpr(MAX_TP):
+                if i32(p) < a["tp"]:
+                    row = i32(p) * a["m"] + bid
+                    for k in range_constexpr(ceildiv(H8, NTT)):
+                        q = tid + i32(k * NTT)
+                        if q < i32(H8):
+                            off = (row * i32(H) + q * i32(8)) * i32(2)
+                            bst(bld(ry, off, 0, V4I, AUX_SYS), ro, off, 0, 0)
 
     @flyc.jit
     def yag_wait(tid, a, epoch):

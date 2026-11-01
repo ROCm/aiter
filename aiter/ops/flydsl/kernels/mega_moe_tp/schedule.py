@@ -42,6 +42,7 @@ from .common import (
     wait_vm,
     wave_rank,
 )
+from .mega_moe_tp_config import DYN_MAX
 from .mega_moe_tp_config import (
     C_CDONE,
     C_CLAIM,
@@ -99,6 +100,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     L_B1, L_B1S, L_CTL, L_DCH, L_DCNT = kc.get("L_B1 L_B1S L_CTL L_DCH L_DCNT")
     L_DPRE, L_DYN, L_EOFF, L_INTER = kc.get("L_DPRE L_DYN L_EOFF L_INTER")
     L_INTERS, L_RIX, L_WSUM, L_WT, LB_B = kc.get("L_INTERS L_RIX L_WSUM L_WT LB_B")
+    L_ROFF, L_RLI, L_RLW, RL = kc.get("L_ROFF L_RLI L_RLW RL")
     LB_PS, LBMIX, LBMIX_DIV, LBPF, MLL = kc.get("LB_PS LBMIX LBMIX_DIV LBPF MLL")
     NBW, NCG, NCK, RG, SI_STRIDE, TMAX = kc.get("NBW NCG NCK RG SI_STRIDE TMAX")
     TOPK, ag_stage_free, ag_wait_meta = kc.get("TOPK ag_stage_free ag_wait_meta")
@@ -302,13 +304,26 @@ def build_schedule(kc: KernelCtx) -> dict:
     def dyn_plan(L, tid, a):
         """(compute waves) the routes per expert (LDS atomics from the registers), then wave
         0 alone: the row-chunk table (expert ascending) and this CTA's units"""
-        for _, e, _, live in a["rregs"]:
-            if live & (masked(e) == fx.Boolean(False)):
-                lds_atomic_add(L, L_DCNT + e * i32(4), 1)
+        ranks = []
+        for idx, e, wv, live in a["rregs"]:
+            ok = live & (masked(e) == fx.Boolean(False))
+            rk = i32(0)
+            if ok:
+                rk = lds_atomic_add(L, L_DCNT + e * i32(4), 1)
+            ranks.append((ok, e, rk, idx, wv))
         cbar(L, tid)
         mark(tid, a, 21)
         if const_expr(PCT):
             _par_chunk_table(L, tid)
+        if const_expr(RL and PCT):
+            # (aiter #7095's route histogram: the count's LDS atomic gives each route its
+            # rank in its expert) the route list, expert by expert: the chunk gathers copy
+            # their rows from it (published by the closing barrier below)
+            for ok, e, rk, idx, wv in ranks:
+                if ok:
+                    sl = lds_ld_i32(L, L_ROFF + e * i32(4)) + rk
+                    lds_st(L, L_RLI + sl * i32(4), idx)
+                    lds_st(L, L_RLW + sl * i32(4), wv)
         if tid < i32(64):
             if const_expr(not PCT):
                 _wave_chunk_table(L, tid)
@@ -331,6 +346,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         w = tid // i32(64)
         ces = []
         loc = i32(0)
+        rlo = i32(0)
         for g in range_constexpr(GPW):
             e = (w * i32(GPW) + i32(g)) * i32(64) + lane
             live = e < i32(E)
@@ -339,19 +355,36 @@ def build_schedule(kc: KernelCtx) -> dict:
             )
             ce = fx.min(ceildiv(r, i32(rch)), i32(255))
             pre, tot = _wave_prefix(ce, 8)
-            ces.append((e, ce, loc + pre))
+            rpre = i32(0)
+            if const_expr(RL):
+                # (the route list offsets: routes per expert at most the batch's tokens)
+                rpre, rtot = _wave_prefix(r, min(TMAX, DYN_MAX).bit_length())
+                rpre = rlo + rpre
+                rlo = rlo + rtot
+            ces.append((e, ce, loc + pre, rpre))
             loc = loc + tot
         if lane == i32(0):
             lds_st(L, L_WSUM + w * i32(4), loc)
+            if const_expr(RL):
+                lds_st(L, L_WSUM + (w + i32(NW)) * i32(4), rlo)
         cbar(L, tid)
         base = i32(0)
         nch = i32(0)
+        rbase = i32(0)
         for v in range_constexpr(NW):
             cv = lds_ld_i32(L, L_WSUM + i32(v * 4))
             base = base + (i32(v) < w).select(cv, i32(0))
             nch = nch + cv
+            if const_expr(RL):
+                rv = lds_ld_i32(L, L_WSUM + i32((NW + v) * 4))
+                rbase = rbase + (i32(v) < w).select(rv, i32(0))
+        if const_expr(RL):
+            for gi in range_constexpr(GPW):
+                e, _, _, rpre = ces[gi]
+                if e < i32(E):
+                    lds_st(L, L_ROFF + e * i32(4), rbase + rpre)
         for gi in range_constexpr(GPW):
-            e, ce, off = ces[gi]
+            e, ce, off, _ = ces[gi]
             for c_ in range(i32(0), ce, i32(1)):
                 c = i32(c_)
                 lds_st(
