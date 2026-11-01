@@ -1608,6 +1608,12 @@ def _fused_moe_impl(
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
 
+    default_situ_beta, default_situ_linear_beta = (
+        (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
+        if activation == ActivationType.Situv2
+        else (1.0, 1.0)
+    )
+
     # grouped_gemm_gfx1250_a8w4 reads GUGU (gate/up row-interleaved) w1 only,
     # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
     # weights fall through to the generic MoE below.
@@ -1640,8 +1646,10 @@ def _fused_moe_impl(
             bias2=bias2,
             swiglu_limit=swiglu_limit,
             num_local_tokens=num_local_tokens,
-            situ_beta=1.0 if beta is None else float(beta),
-            situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
+            situ_beta=default_situ_beta if beta is None else float(beta),
+            situ_linear_beta=(
+                default_situ_linear_beta if linear_beta is None else float(linear_beta)
+            ),
             stage2_scatter=stage2_scatter,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
@@ -2516,8 +2524,10 @@ def _normalize_mxfp4_activation_params(
     situ_beta = 1.0
     situ_linear_beta = 1.0
     if activation == ActivationType.Situv2:
-        situ_beta = 1.0 if beta is None else float(beta)
-        situ_linear_beta = 1.0 if linear_beta is None else float(linear_beta)
+        situ_beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
+        situ_linear_beta = (
+            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+        )
     normalized_swiglu_limit = (
         swiglu_limit
         if activation in (ActivationType.Silu, ActivationType.Swiglu)
@@ -5365,16 +5375,8 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = config_situ_linear_beta
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         # MXMOE's activation comes from its name and betas enter its compile key.
-        extra_stage1_args["situ_beta"] = (
-            DEFAULT_SITUV2_BETA
-            if activation == ActivationType.Situv2 and beta is None
-            else config_situ_beta
-        )
-        extra_stage1_args["situ_linear_beta"] = (
-            DEFAULT_SITUV2_LINEAR_BETA
-            if activation == ActivationType.Situv2 and linear_beta is None
-            else config_situ_linear_beta
-        )
+        extra_stage1_args["situ_beta"] = config_situ_beta
+        extra_stage1_args["situ_linear_beta"] = config_situ_linear_beta
     elif stage1_func is _opus_a8w4_stage1_wrapper:
         if metadata.skip_inter_quant:
             extra_stage1_args["output_sorted"] = True

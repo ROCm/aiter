@@ -727,6 +727,94 @@ class TestMxmoeOpusRuntime(unittest.TestCase):
         self.assertIs(kwargs["a1_scale"], scales)
         self.assertFalse(torch.cuda.is_initialized())
 
+    def test_situv2_without_beta_uses_default_on_every_stage1(self):
+        torch, a, fm = self.torch, self.aiter, self.fm
+        grouped = importlib.import_module("aiter.ops.flydsl.grouped_moe_gfx1250")
+        hidden = torch.empty((31, 3072), dtype=a.dtypes.bf16)
+        w1 = torch.empty((128, 1024, 1536), dtype=a.dtypes.fp4x2)
+        w2 = torch.empty((128, 3072, 256), dtype=a.dtypes.fp4x2)
+        w1.is_shuffled = w2.is_shuffled = True
+        w1s = torch.empty((128 * 1024, 96), dtype=a.dtypes.fp8_e8m0)
+        w2s = torch.empty((128 * 3072, 16), dtype=a.dtypes.fp8_e8m0)
+        quantized = (
+            torch.empty((31, 3072), dtype=a.dtypes.fp8),
+            torch.empty((32, 96), dtype=a.dtypes.fp8_e8m0),
+        )
+
+        class ReachedStage1(Exception):
+            pass
+
+        def sorting(*args, **kwargs):
+            result = (
+                torch.empty(32, dtype=a.dtypes.i32),
+                torch.empty(32),
+                torch.empty(1, dtype=a.dtypes.i32),
+                torch.tensor([32, 31], dtype=a.dtypes.i32),
+                torch.empty((31, 3072), dtype=a.dtypes.bf16),
+                torch.empty(32, dtype=a.dtypes.i32),
+                torch.empty(124, dtype=a.dtypes.i32),
+            )
+            return result if kwargs.get("output_aux") else result[:5]
+
+        betas = {}
+
+        def grouped_gemm(*args, **kwargs):
+            betas["gfx1250"] = (kwargs["situ_beta"], kwargs["situ_linear_beta"])
+
+        def run_stage1(*args, **kwargs):
+            betas["stage1"] = (kwargs["situ_beta"], kwargs["situ_linear_beta"])
+            raise ReachedStage1
+
+        for stage1, g1, g2, block_m in (
+            (
+                "_mxfp4_a4w4_stage1_fw",
+                "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out_situv2",
+                "flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x256_atomic_sbm16",
+                16,
+            ),
+            (
+                "_flydsl_stage1_wrapper",
+                "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w2_gui_fp8",
+                "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x256_atomic_sbm32",
+                32,
+            ),
+        ):
+            with self.subTest(stage1=stage1):
+                self.write_csv(
+                    act_type=str(a.ActivationType.Situv2),
+                    kernelName1=g1,
+                    kernelName2=g2,
+                    block_m=block_m,
+                )
+                fm.cfg_2stages = None
+                fm.get_2stage_cfgs.cache_clear()
+                betas.clear()
+                with patch.object(
+                    grouped, "grouped_gemm_gfx1250_a8w4", grouped_gemm
+                ), patch.object(fm, "moe_sorting", sorting), patch.object(
+                    fm, "fused_dynamic_mxfp8_quant_moe_sort", return_value=quantized
+                ), patch.object(
+                    fm, stage1, run_stage1
+                ), self.assertRaises(
+                    ReachedStage1
+                ):
+                    fm.fused_moe(
+                        hidden,
+                        w1,
+                        w2,
+                        torch.empty((31, 4), dtype=a.dtypes.fp32),
+                        torch.empty((31, 4), dtype=a.dtypes.i32),
+                        activation=a.ActivationType.Situv2,
+                        quant_type=a.QuantType.per_1x32,
+                        quant_dtype_a=a.dtypes.fp8,
+                        dtype=a.dtypes.bf16,
+                        gate_mode="interleave",
+                        w1_scale=w1s,
+                        w2_scale=w2s,
+                    )
+                self.assertEqual(betas, {"gfx1250": (4.0, 25.0), "stage1": (4.0, 25.0)})
+        self.assertFalse(torch.cuda.is_initialized())
+
 
 if __name__ == "__main__":
     unittest.main()
