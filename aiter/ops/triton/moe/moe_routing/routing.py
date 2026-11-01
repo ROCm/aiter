@@ -654,7 +654,6 @@ def ep_sort_routing(
         tile_dim_log2=block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(num_local_experts == BLOCK_A),
-        N_CTAS=n_ctas,
         HAS_DST_ROW=dst_row is not None,
     )
 

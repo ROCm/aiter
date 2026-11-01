@@ -397,7 +397,6 @@ def _ep_gate_prep_scan_kernel(
     tile_dim_log2: tl.constexpr,
     BLOCK_A: tl.constexpr,
     EQUAL_A: tl.constexpr,
-    N_CTAS: tl.constexpr,
     HAS_DST_ROW: tl.constexpr,
 ):
     """EP sort kernel A: gating + histogram + (in the last CTA) the scan and
@@ -466,10 +465,12 @@ def _ep_gate_prep_scan_kernel(
     tl.debug_barrier()
 
     # Grid-wide join. `acquire` pairs with the release above, so the CTA that
-    # sees N_CTAS-1 predecessors also sees all their histogram increments.
+    # sees all other CTAs as predecessors also sees their histogram increments.
+    # The grid size is read at run time: as a constexpr, each new gate count
+    # would compile a new kernel.
     one = tl.arange(0, 1)
     prev = tl.atomic_add(Ticket + one, 1, sem="acq_rel", scope="gpu")
-    if tl.sum(prev, 0) == N_CTAS - 1:
+    if tl.sum(prev, 0) == tl.num_programs(0) - 1:
         bins = tl.arange(0, N_BINS)
         h = tl.load(HistAtomic + bins)
         tl.store(Hist + bins, h)
