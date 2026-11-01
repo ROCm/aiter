@@ -13,7 +13,8 @@ layout is a new dtype case, not a new entry.
 * :func:`mla_sparse_prefill_v4`  -- v4: NoPE with its E8M0 scales in the row, plus bf16
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
-  (q, kv fp8): opus on gfx950.
+  (q, kv fp8): opus on gfx950; on gfx1250 a HIP kernel (``v41fp8_gfx1250``) when
+  ``AITER_V41_FP8_GFX1250=1`` (H == 64, 528-byte rows with the scales inline at +512).
 
 ``backend`` forces one backend. A configuration no backend serves raises RuntimeError;
 a bad argument raises ValueError.
@@ -21,6 +22,7 @@ a bad argument raises ValueError.
 
 import functools
 import math
+import os
 from typing import NamedTuple
 
 import torch
@@ -485,6 +487,43 @@ def _opus_sparse_prefill_v41(
     num_kv_splits=None,
 ):
     gfx = get_gfx_runtime()
+    if gfx == "gfx1250" and os.environ.get("AITER_V41_FP8_GFX1250", "0") not in (
+        "",
+        "0",
+    ):
+        # gfx1250: warp-specialized persistent HIP kernel (TDM gather + MX-FP8 WMMA), env-gated
+        from .v41fp8_gfx1250 import sparse_prefill_v41_gfx1250
+
+        for name, scale in (
+            ("q_scale", q_scale),
+            ("unified_kv_scale", unified_kv_scale),
+            ("kv_scale", kv_scale),
+        ):
+            if scale.dtype not in (torch.uint8, dtypes.fp8_e8m0):
+                raise RuntimeError(f"{name} must be E8M0 (uint8), got {scale.dtype}")
+        if (
+            q.dtype != dtypes.fp8
+            or unified_kv.dtype != dtypes.fp8
+            or kv.dtype != dtypes.fp8
+        ):
+            raise RuntimeError(
+                "gfx1250 mla_sparse_prefill_v41 expects fp8 q / unified_kv / kv"
+            )
+        return sparse_prefill_v41_gfx1250(
+            q,
+            q_scale,
+            unified_kv,
+            unified_kv_scale,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_scale,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+            out,
+        )
     if gfx != "gfx950":
         raise RuntimeError(f"mla_sparse_prefill_v41 requires gfx950, got {gfx}")
 
@@ -759,7 +798,9 @@ def mla_sparse_prefill_v41(
     """MLA v4.1 sparse prefill: rows of 512 values with separate E8M0 scales (uint8
     or fp8_e8m0, one per 32 values). Same argument order as
     :func:`mla_sparse_prefill_v4`, with the RoPE tensors replaced by the scales.
-    Supported (q, kv) dtypes: (fp8, fp8), on gfx950.
+    Supported (q, kv) dtypes: (fp8, fp8), on gfx950, and on gfx1250 with
+    ``AITER_V41_FP8_GFX1250=1`` (H == 64; rows of 528 bytes with the scales
+    inline at +512, as in ATOM's V4.1 FP8 KV cache).
 
     Args:
       q:                 ``[T, H, 512]`` query.
