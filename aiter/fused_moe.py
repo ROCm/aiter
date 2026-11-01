@@ -4196,6 +4196,10 @@ def get_2stage_cfgs(
                 )
                 or None
             )
+        elif parsed_g1["inline_quant"] and input_dtype not in (None, dtypes.bf16):
+            reject_reason = (
+                f"inline GEMM1 reads BF16 and cannot accept {input_dtype} input"
+            )
         elif not (
             int(cfg.get("block_m", BLOCK_SIZE_M))
             == parsed_g1["BM"]

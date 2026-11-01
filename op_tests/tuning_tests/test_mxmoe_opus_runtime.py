@@ -649,6 +649,84 @@ class TestMxmoeOpusRuntime(unittest.TestCase):
         self.assertIs(executions[2], executions[0])
         self.assertFalse(torch.cuda.is_initialized())
 
+    def test_non_opus_inline_row_requires_bf16_input(self):
+        a = self.aiter
+        self.g1 = "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out"
+        self.g2 = "flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x256_atomic_sbm16"
+        self.write_csv(block_m=16)
+        self.assertEqual(self.select().stage1.keywords["kernelName1"], self.g1)
+        for input_dtype, has_scales in (
+            (a.dtypes.fp8, True),
+            (a.dtypes.fp4x2, True),
+            (a.dtypes.fp16, False),
+        ):
+            with self.subTest(input_dtype=input_dtype):
+                with self.assertLogs("aiter", level="WARNING") as logs:
+                    metadata = self.select(
+                        input_dtype=input_dtype,
+                        _has_input_activation_scales=has_scales,
+                    )
+                self.assertNotEqual(
+                    metadata.stage1.keywords.get("kernelName1"), self.g1
+                )
+                self.assertTrue(
+                    any("inline GEMM1 reads BF16" in message for message in logs.output)
+                )
+
+    def test_public_prequantized_fp8_skips_non_opus_inline_row(self):
+        torch, a, fm = self.torch, self.aiter, self.fm
+        self.g1 = "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out"
+        self.g2 = "flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x256_atomic_sbm16"
+        self.write_csv(block_m=16)
+        hidden = torch.empty((31, 3072), dtype=a.dtypes.fp8)
+        scales = torch.empty((31, 96), dtype=a.dtypes.fp8_e8m0)
+        w1 = torch.empty((128, 1024, 1536), dtype=a.dtypes.fp4x2)
+        w2 = torch.empty((128, 3072, 256), dtype=a.dtypes.fp4x2)
+        w1.is_shuffled = w2.is_shuffled = True
+        w1s = torch.empty((128 * 1024, 96), dtype=a.dtypes.fp8_e8m0)
+        w2s = torch.empty((128 * 3072, 16), dtype=a.dtypes.fp8_e8m0)
+        executions = []
+
+        def sorting(*args, **kwargs):
+            result = (
+                torch.empty(32, dtype=a.dtypes.i32),
+                torch.empty(32),
+                torch.empty(1, dtype=a.dtypes.i32),
+                torch.tensor([32, 31], dtype=a.dtypes.i32),
+                torch.empty((31, 3072), dtype=a.dtypes.bf16),
+                torch.empty(32, dtype=a.dtypes.i32),
+                torch.empty(124, dtype=a.dtypes.i32),
+            )
+            return result if kwargs.get("output_aux") else result[:5]
+
+        def execute(*args, **kwargs):
+            executions.append((kwargs["_metadata_transform"](None), args, kwargs))
+            return args[8]
+
+        with patch.object(fm, "moe_sorting", sorting), patch.object(
+            fm, "fused_moe_2stages", execute
+        ):
+            fm.fused_moe(
+                hidden,
+                w1,
+                w2,
+                torch.empty((31, 4), dtype=a.dtypes.fp32),
+                torch.empty((31, 4), dtype=a.dtypes.i32),
+                activation=a.ActivationType.Silu,
+                quant_type=a.QuantType.per_1x32,
+                quant_dtype_a=a.dtypes.fp8,
+                dtype=a.dtypes.bf16,
+                gate_mode="interleave",
+                a1_scale=scales,
+                w1_scale=w1s,
+                w2_scale=w2s,
+            )
+        ((metadata, args, kwargs),) = executions
+        self.assertNotEqual(metadata.stage1.keywords.get("kernelName1"), self.g1)
+        self.assertIs(args[0], hidden)
+        self.assertIs(kwargs["a1_scale"], scales)
+        self.assertFalse(torch.cuda.is_initialized())
+
 
 if __name__ == "__main__":
     unittest.main()
