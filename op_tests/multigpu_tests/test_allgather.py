@@ -299,6 +299,11 @@ l_shape = [
     # dim=0 path: size = 65*7168/8 = 58240, NOT a multiple of 256*4 = 1024 ->
     # naive_unroll4 kernel drops the tail.
     (65, 7168),
+    # gfx1250 LL all-gather: a decode step's LM-head logits at TP4 (MiniMax-M3
+    # vocab 200064 -> 50016 a rank, 12 rows), 1.2 MB a rank; rows of 4 bf16
+    # are whole 8-byte packets but not 16-byte ones.
+    (12, 50016),
+    (12, 4),
 ]
 
 parser = argparse.ArgumentParser(description="config input of test")

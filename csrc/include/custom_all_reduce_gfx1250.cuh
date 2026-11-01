@@ -714,6 +714,88 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
         end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// LL all-gather: ar_ll_gfx1250's publish, then every peer's lines polled from
+// this rank's scratch together and written to their place in the output. Rank
+// r's packet pk of row y = pk / row_pk lands at output packet
+// (y * ngpus + r) * row_pk + pk % row_pk: row_pk = nPk gathers along dim 0,
+// the last dim's packets along the last dim. Shares ar_ll_gfx1250's epoch and
+// banks, so the two interleave freely.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
+    T* const* __restrict__ peer_scratch,
+    T* __restrict__ result,
+    const T* __restrict__ sendbuff,
+    uint32_t nPk,    // 8-byte packets a rank sends
+    uint32_t row_pk, // 8-byte packets of a gathered row
+    int rank,
+    uint32_t* __restrict__ block_flags)
+{
+    constexpr size_t slot = kLLPackCapacity;
+
+    __shared__ uint32_t s_flag;
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 2u;
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag        = s_flag;
+    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+
+    const uint32_t gtid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    const uint2* in2      = reinterpret_cast<const uint2*>(sendbuff);
+    uint2* out2           = reinterpret_cast<uint2*>(result);
+    const auto out_at     = [&](int r, uint32_t pk) {
+        const uint32_t y = pk / row_pk;
+        return ((size_t)y * ngpus + r) * row_pk + (pk - y * row_pk);
+    };
+
+    for(uint32_t pk = gtid; pk < nPk; pk += stride)
+    {
+        const uint2 d = in2[pk];
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            int          peer = (rank + r) % ngpus;
+            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
+                               bankOffPkts + (size_t)rank * slot;
+            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d.x, flag, d.y, flag);
+        }
+        out2[out_at(rank, pk)] = d;
+    }
+
+    LLPackedMsg* myBase =
+        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+    for(uint32_t pk = gtid; pk < nPk; pk += stride)
+    {
+        uint32_t pending = ((1u << ngpus) - 1u) & ~(1u << rank);
+        while(pending)
+        {
+            uint32_t line[ngpus][4];
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+                if(pending & (1u << r))
+                    ll_load_b128(
+                        reinterpret_cast<const uint32_t*>(&myBase[(size_t)r * slot + pk]),
+                        line[r][0], line[r][1], line[r][2], line[r][3]);
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+                if((pending & (1u << r)) && line[r][1] == flag && line[r][3] == flag)
+                {
+                    out2[out_at(r, pk)] = make_uint2(line[r][0], line[r][2]);
+                    pending &= ~(1u << r);
+                }
+        }
+    }
+
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
+}
+
 // ---------------------------------------------------------------------------
 // gfx1250 allgather kernel — scalar fallback (size not pack-aligned)
 // ---------------------------------------------------------------------------
@@ -1343,6 +1425,35 @@ public:
             peers, output, input, nPk, rank_, d_ll_block_flags_)
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_LL);
 #undef LAUNCH_LL
+    }
+
+    // Whether an all-gather of `bytes` a rank takes ag_ll_gfx1250, which reads
+    // the input in place: whole 8-byte packets (a row's too, along the last
+    // dim), and no output over the input it is still publishing.
+    bool use_ll_ag(const void* input, const void* output, size_t bytes, size_t row_bytes) const
+    {
+        const auto in  = reinterpret_cast<uintptr_t>(input);
+        const auto out = reinterpret_cast<uintptr_t>(output);
+        return use_ll(bytes) && bytes % 8 == 0 && row_bytes % 8 == 0 && in % 8 == 0 &&
+               out % 8 == 0 && (out >= in + bytes || in >= out + bytes * world_size_);
+    }
+
+    // LL all-gather (see ag_ll_gfx1250); row_bytes == bytes gathers along dim 0.
+    template <typename T>
+    void allgather_ll(hipStream_t stream, const T* input, T* output, size_t bytes, size_t row_bytes)
+    {
+        ensure_ll_tables_();
+        const uint32_t nPk = bytes >> 3;
+        const int threads  = (bytes < 65536) ? 512 : 256;
+        int blocks = std::max(1, std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads)));
+
+        T* const* peers = reinterpret_cast<T* const*>(d_ll_peers_);
+#define LAUNCH_AG_LL(NG)                                                   \
+        ag_ll_gfx1250<T, NG><<<blocks, threads, 0, stream>>>(              \
+            peers, output, input, nPk, (uint32_t)(row_bytes >> 3), rank_, \
+            d_ll_block_flags_)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LL);
+#undef LAUNCH_AG_LL
     }
 
     // gfx1250: return raw device pointers (no hipIpc handles).
