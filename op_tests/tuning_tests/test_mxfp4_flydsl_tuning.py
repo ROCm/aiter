@@ -149,7 +149,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             matching = [job for job in stage1 if job["a_dtype"] == precision]
             self.assertEqual(
                 {(job["interleave"], job["enable_bias"]) for job in matching},
-                {(False, False), (False, True), (True, False), (True, True)},
+                {(False, False), (True, False)},
             )
 
     def test_mxmoe_aot_shared_expert_has_no_bias_variant(self) -> None:
