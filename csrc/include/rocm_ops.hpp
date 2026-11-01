@@ -2939,6 +2939,34 @@ namespace py = pybind11;
           py::arg("split_lse"),         \
           py::arg("final_output"));
 
+#define MLA_HK_VERIFY_PYBIND                                   \
+    m.def("hk_mla_verify_fwd",                                 \
+          &hk_mla_verify_fwd,                                  \
+          "hk_mla_verify_fwd",                                 \
+          py::arg("q"),                                        \
+          py::arg("kv"),                                       \
+          py::arg("kv_indptr"),                                \
+          py::arg("kv_indices"),                               \
+          py::arg("kv_scale"),                                 \
+          py::arg("o_part"),                                   \
+          py::arg("lse_part"),                                 \
+          py::arg("out"),                                      \
+          py::arg("nsplit"),                                   \
+          py::arg("min_chunk"),                                \
+          py::arg("sm_scale_log2"),                            \
+          py::arg("part8_min"));                               \
+    m.def("hk_mla_verify_reduce",                              \
+          &hk_mla_verify_reduce,                               \
+          "hk_mla_verify_reduce",                              \
+          py::arg("o_part"),                                   \
+          py::arg("lse_part"),                                 \
+          py::arg("kv_indptr"),                                \
+          py::arg("kv_scale"),                                 \
+          py::arg("out"),                                      \
+          py::arg("nsplit"),                                   \
+          py::arg("min_chunk"),                                \
+          py::arg("part8_min"));
+
 #define MLA_HK_V40_PYBIND               \
     m.def("hk_mla_v40_decode_fwd",      \
           &hk_mla_v40_decode_fwd,       \
