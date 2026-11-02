@@ -21,7 +21,7 @@ else:
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
-from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import FALLBACK_CATALOG, gemm_a16w16
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import gemm_a16w16
 
 
 def _require_gfx942():
@@ -554,55 +554,73 @@ def test_gfx942_fallback_catalog_keeps_n336_down_projection_family():
     import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
 
     config = g.gfx942_fallback_config(4000, 336, 10240)
-    keys = (
-        "block_m",
-        "block_n",
-        "block_k",
-        "split_k",
-        "m_waves",
-        "n_waves",
-        "k_waves",
-    )
-    assert tuple(config[key] for key in keys) == (128, 112, 128, 3, 4, 1, 1)
+    assert _catalog_entry(config) == (128, 112, 128, 3, 4, 1, 1)
 
 
+def _catalog_entry(config):
+    keys = ("block_m", "block_n", "block_k", "split_k", "m_waves", "n_waves")
+    return (*(config[key] for key in keys), config.get("k_waves", 1))
+
+
+# One shape that selects each config the fallback can return: the catalogue
+# entries, then the four K=64 async last-resort tiles.
+_FALLBACK_WITNESSES = {
+    (32, 32, 64, 1, 2, 2, 1): (1, 32, 128),
+    (32, 32, 64, 4, 2, 2, 1): (1, 1536, 2048),
+    (32, 32, 128, 8, 2, 2, 1): (1, 32, 2048),
+    (64, 64, 64, 1, 2, 2, 1): (1, 10240, 128),
+    (64, 64, 128, 3, 2, 2, 1): (100, 2560, 2048),
+    (64, 64, 128, 4, 2, 2, 1): (1, 2560, 4096),
+    (64, 128, 64, 1, 2, 2, 1): (100, 10240, 128),
+    (64, 128, 128, 2, 2, 2, 1): (1, 10240, 7168),
+    (64, 128, 128, 4, 2, 2, 1): (1, 7168, 16384),
+    (128, 112, 128, 3, 4, 1, 1): (4096, 336, 4096),
+    (128, 128, 64, 1, 2, 2, 1): (200, 10240, 128),
+    (128, 192, 64, 1, 2, 2, 1): (4096, 1536, 128),
+}
+_ASYNC_WITNESSES = {
+    (32, 32, 64, 1, 2, 2, 1): (20, 20, 64),
+    (32, 64, 64, 1, 2, 2, 1): (20, 50, 64),
+    (64, 32, 64, 1, 2, 2, 1): (50, 20, 64),
+    (64, 64, 64, 1, 2, 2, 1): (50, 50, 64),
+}
 _FALLBACK_LAUNCHES = [
-    *(("catalog", entry) for entry in FALLBACK_CATALOG),
-    *(("async", mn) for mn in ((20, 20), (20, 50), (50, 20), (50, 50))),
+    *_FALLBACK_WITNESSES.values(),
+    *_ASYNC_WITNESSES.values(),
 ]
 
 
-@pytest.mark.parametrize(
-    "kind,arg",
-    _FALLBACK_LAUNCHES,
-    ids=[
-        (
-            "x".join(map(str, arg[:3])) + f"-sk{arg[3]}"
-            if kind == "catalog"
-            else f"async-M{arg[0]}-N{arg[1]}"
-        )
-        for kind, arg in _FALLBACK_LAUNCHES
-    ],
-)
-def test_gemm_a16w16_gfx942_fallback_configs(kind, arg):
-    """Every config the fallback can return runs once, on ragged M and N: the
-    catalogue entries and the K=64 async last resort."""
-    _require_gfx942()
+def test_gfx942_fallback_catalog_entries_are_reachable():
+    """Each catalogue entry is selected by some shape, so none is dead weight
+    in the JIT and AOT fan-out."""
     import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
 
-    if kind == "catalog":
-        m, n, k = 200, 336, 2048
-        cfg = g.fallback_catalog_configs()[FALLBACK_CATALOG.index(arg)]
-    else:
-        (m, n), k = arg, 64
-        cfg = g.gfx942_fallback_config(m, n, k)
-        assert "pingpong" not in cfg, "K=64 must take the async last resort"
-    assert g.config_is_valid(m, n, k, cfg)
+    assert set(_FALLBACK_WITNESSES) == set(g.FALLBACK_CATALOG)
+    for entry, (m, n, k) in _FALLBACK_WITNESSES.items():
+        config = g.gfx942_fallback_config(m, n, k)
+        assert config.get("pingpong"), f"M{m} N{n} K{k} left the catalogue"
+        assert _catalog_entry(config) == entry, f"M{m} N{n} K{k}"
+    for entry, (m, n, k) in _ASYNC_WITNESSES.items():
+        config = g.gfx942_fallback_config(m, n, k)
+        assert "pingpong" not in config, f"M{m} N{n} K{k} must take the async pipeline"
+        assert _catalog_entry(config) == entry, f"M{m} N{n} K{k}"
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    _FALLBACK_LAUNCHES,
+    ids=[f"M{m}-N{n}-K{k}" for m, n, k in _FALLBACK_LAUNCHES],
+)
+def test_gemm_a16w16_gfx942_fallback_configs(m, n, k, monkeypatch):
+    """Every config the fallback can return runs once, selected by its witness
+    shape (ragged M) through the default path."""
+    _require_gfx942()
+    monkeypatch.setenv("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE", "1")
     x, w, ref = _inputs(m, n, k)
     out = _guarded_out(m, n, torch.bfloat16)
-    y = gemm_a16w16(x, w.t(), out=out[:m], layout="nt", user_kwargs=cfg)
+    y = gemm_a16w16(x, w.t(), out=out[:m], layout="nt")
     torch.cuda.synchronize()
-    _assert_close(y, ref, f"fallback config {cfg}")
+    _assert_close(y, ref, f"fallback M{m} N{n} K{k}")
     assert torch.isnan(out[m:]).all(), "stores past M overwrote the guard rows"
 
 

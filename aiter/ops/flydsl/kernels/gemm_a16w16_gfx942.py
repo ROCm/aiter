@@ -29,10 +29,12 @@ Configs come from the tuned table (``aiter/configs/flydsl_gemm_a16w16_gfx942_tun
 and fall back to a cost-model search for shapes that are not in it.
 
 Entry points are ``gemm_a16w16`` and ``flydsl_hgemm``; the table is tuned by
-``op_tests/flydsl_tests/tune_gfx942_csv.py``. TunedGemm's FlyDSL catalog
-(``gemm_a16w16_policy``) and AOT compilation do not cover gfx942: their
-``flydsl_hgemm_*`` kernel names cannot encode the pipeline flags
-(``pingpong``, ``buffered_load``, ``direct_store``, ``split_k_reduce``).
+``op_tests/flydsl_tests/tune_gfx942_csv.py``. AOT compiles this kernel directly
+(``aiter.aot.flydsl.gemm``): every tuned-table row plus every config the
+fallback can return. TunedGemm's FlyDSL catalog (``gemm_a16w16_policy``) does
+not cover gfx942: its ``flydsl_hgemm_*`` kernel names cannot encode the
+pipeline flags (``pingpong``, ``buffered_load``, ``direct_store``,
+``split_k_reduce``).
 """
 
 import contextlib
@@ -701,6 +703,8 @@ PINGPONG_PIPELINE = {
 # (block_m, block_n, block_k, split_k, m_waves, n_waves, k_waves).
 # Bounding the runtime catalogue bounds JIT fan-out for dynamic shapes. The
 # tuner still searches the complete candidate space above.
+# The cost model ignores block_k and ties go to the earlier entry, so an entry
+# that only differs from an earlier one in block_k can never be selected.
 FALLBACK_CATALOG = (
     (32, 32, 64, 1, 2, 2, 1),
     (32, 32, 64, 4, 2, 2, 1),
@@ -709,12 +713,10 @@ FALLBACK_CATALOG = (
     (64, 64, 128, 3, 2, 2, 1),
     (64, 64, 128, 4, 2, 2, 1),
     (64, 128, 64, 1, 2, 2, 1),
-    (64, 128, 128, 1, 2, 2, 1),
     (64, 128, 128, 2, 2, 2, 1),
     (64, 128, 128, 4, 2, 2, 1),
     (128, 112, 128, 3, 4, 1, 1),
     (128, 128, 64, 1, 2, 2, 1),
-    (128, 128, 128, 1, 2, 2, 1),
     (128, 192, 64, 1, 2, 2, 1),
 )
 
