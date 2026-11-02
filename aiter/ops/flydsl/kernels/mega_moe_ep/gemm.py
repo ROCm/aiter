@@ -31,6 +31,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from ..mega_moe.gemm_util import (
     AS2RLoader,
@@ -40,6 +41,7 @@ from ..mega_moe.gemm_util import (
     BWeightLoader,
     MfmaScaleGU,
 )
+from ..dpp_utils import update_dpp_i32
 from ..mxfp4_gemm_common import _activation_mul_batch
 from ..tensor_shim import ptr_buf_tensor
 from .communication import _PROF, _quantize_group8  # per-8 fp8 combine codec (P==1 fused scatter)
@@ -63,12 +65,14 @@ from .common import (
     spin0,
     spin_lds_ge,
     uni,
+    uni64,
     wait_lgkm0,
     wait_vm,
 )
 from .mega_moe_ep_config import (
     C_BARCNT,
     C_BARGEN,
+    G8PF,
     MAX_NPES,
     NLOAD,
     RC_AFREE,
@@ -106,6 +110,13 @@ def _lds_f32_ptr(L, off):
 
 
 _FRESH_TID = int(os.environ.get("EP_FRESH_TID", "1"))
+_EDPP = int(os.environ.get("EP_EDPP", "1"))
+
+
+def _dpp_f32(x, ctrl):
+    """``x`` from the lane DPP ``ctrl`` selects (within a 16-lane row)."""
+    xi = fx.Float32(x).bitcast(fx.Int32)
+    return fx.Int32(update_dpp_i32(xi, xi, ctrl, 0xF, 0xF, True)).bitcast(fx.Float32)
 
 
 def _fresh_tid():
@@ -119,6 +130,91 @@ def _fresh_tid():
                                has_side_effects=True))
 
 
+class _AS2RFold:
+    """``AS2RLoader`` (same swizzle) with the lane part of the address computed once: the
+    XOR mask depends on row & 14 (fp4) / row & 15 (fp8) only, so for row = mi*16 + lane%16
+    it is the same for every m-tile, and operand (mi, ksub, bank) is a constant byte
+    offset off its ksub's lane pointer -- the ds_read immediate."""
+
+    def __init__(self, lds_ptr, *, k_step_bytes, a_dtype):
+        self._ksb = k_step_bytes
+        self._fp4 = a_dtype == "fp4"
+        lane = i32(fx.thread_idx.x) % i32(64)
+        l16 = lane % i32(16)
+        klane4 = (lane // i32(16)) * i32(4)
+        mask = ((l16 & i32(14)) << i32(1)) if self._fp4 else ((l16 & i32(15)) << i32(2))
+        row = l16 * i32(k_step_bytes // 4)
+        self._p = [
+            [
+                fx.add_offset(lds_ptr, fx.make_int_tuple(
+                    (row + ((klane4 + i32(ks * (16 if self._fp4 else 32) + h * 16)) ^ mask))
+                    * i32(4)))
+                for h in range(1 if self._fp4 else 2)
+            ]
+            for ks in range(2)
+        ]
+
+    def _ld(self, p, nbytes):
+        it = fx.recast_iter(fx.Uint8, fx.add_offset(p, fx.make_int_tuple(nbytes)))
+        return Vec(fx.make_view(it, fx.make_layout(16, 1)).load()).bitcast(fx.Int32)
+
+    def load_operand(self, mi, ksub, bank_bytes):
+        c = mi * 16 * self._ksb + bank_bytes
+        lo = self._ld(self._p[ksub][0], c)
+        if self._fp4:
+            return lo
+        lo = lo.bitcast(fx.Int64)
+        hi = self._ld(self._p[ksub][1], c).bitcast(fx.Int64)
+        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(fx.Int32)
+
+
+class _BFold:
+    """``BWeightLoader`` + ``BScaleLoader`` (same layouts) with the lane term a fixed VGPR
+    and every wave-uniform term (n-block, ni, group, k-step, ksub) in the SGPR soffset:
+    no per-load VALU address math and no address VGPRs live across the k-loop."""
+
+    def __init__(self, w_addr, s_addr, b_row, *, num_acc_n, model_dim):
+        lane = i32(fx.thread_idx.x) % i32(64)
+        self._wr = rsrc(w_addr)
+        self._sr = rsrc(s_addr)
+        self._wv = (lane // i32(16)) * i32(256) + (lane % i32(16)) * i32(16)
+        self._sv = lane * i32(4)
+        self._nacc = num_acc_n
+        self._n0 = model_dim * 8  # bytes per 16-row n-block
+        self._srow = (model_dim // 256) * 256  # bytes per 32-row scale group
+        b = uni(b_row)
+        self._ws = (b // i32(16)) * i32(self._n0)
+        self._ss = (b // i32(32)) * i32(self._srow)
+
+    def load_step(self, k):
+        w = [
+            [Vec(bld(self._wr, self._wv, self._ws + i32(ni * self._n0 + (k * 2 + ks) * 1024), V4I))
+             for ks in range(2)]
+            for ni in range(self._nacc)
+        ]
+        s = [
+            fx.Int32(bld(self._sr, self._sv, self._ss + i32(g * self._srow + k * 256), T.i32))
+            for g in range(self._nacc // 2)
+        ]
+        return w, s
+
+
+def _mfma_step_apf(mfma_gu, a_load, b, acc, sa, sb, m_repeat, num_acc_n):
+    """``MfmaScaleGU.call`` with the A operand read one (m-tile, ksub) ahead: its
+    ds_read is in flight under the previous operand's MFMAs instead of waited on by them."""
+    order = [(ks, mi) for ks in range(2) for mi in range(m_repeat)]
+    a_nx = a_load(order[0][1], order[0][0])
+    for t, (ks, mi) in enumerate(order):
+        a_op = a_nx
+        if t + 1 < len(order):
+            a_nx = a_load(order[t + 1][1], order[t + 1][0])
+        for ni in range(num_acc_n):
+            k = mi * num_acc_n + ni
+            acc[k] = mfma_gu._mfma(a_op, b[ni][ks], acc[k], sa[mi // 2], sb[ni // 2], ks, mi % 2,
+                                   ni % 2)
+    return acc
+
+
 def _global_byte_tensor(addr_i64, nbytes):
     """An ``fx.Tensor`` byte-view over a raw global address (for ``ATileLoader``)."""
     pt = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=16)
@@ -129,12 +225,18 @@ def _global_byte_tensor(addr_i64, nbytes):
 def build_gemm(kc: KernelCtx) -> dict:
     """The per-unit GEMM1+act+GEMM2 device functions of one instance (added to kc)."""
     H, I, TOPK, a8 = kc.get("H I TOPK a8")
+    INTER_REBASE = kc.get("INTER_REBASE")[0]
     act, swiglu_limit = kc.get("act swiglu_limit")
     situ_beta, situ_linear_beta = kc.get("situ_beta situ_linear_beta")
     RG, L_RIX, const_expr = kc.get("RG L_RIX const_expr")
     L_A, L_AS, L_CTL, TMAX = kc.get("L_A L_AS L_CTL TMAX")
     N_TILES, NUM_ACC_N, M_REPEAT = kc.get("N_TILES NUM_ACC_N M_REPEAT")
     A_K_STEP, K_ITERS, A_LDS_I32, NAB = kc.get("A_K_STEP K_ITERS A_LDS_I32 NAB")
+    # NW=8 inline-A ring: A_NBK banks, K-step sp+A_AH staged during step sp, one barrier
+    # per A_AH K-steps (bank sp+A_AH last held K-step sp-A_AH, read a barrier earlier)
+    A_NBK = 4 if G8PF & 8 else 2
+    A_AH = A_NBK // 2
+    assert K_ITERS % A_AH == 0 and (I // TILE_K) % A_AH == 0
     L_C, L_RCTL, L_PF = kc.get("L_C L_RCTL L_PF")
     WL, NWB, L_W, WB = kc.get("WL NWB L_W WB")
     combine_arrive = kc.get("combine_arrive")[0]  # fused-combine epilogue signals source
@@ -250,6 +352,21 @@ def build_gemm(kc: KernelCtx) -> dict:
     scale_cols = H // 32  # E8M0 A-scale groups per row
     inter_row_bytes = I // a_pack  # quantized intermediate bytes per row
     inter_scols = I // 32  # E8M0 inter-scale groups per row
+
+    # inter / inters base + first row of echunk e: past 2 GB (INTER_REBASE) the 64-bit
+    # base absorbs e*RG rows so the 32-bit buffer offsets stay within one echunk.
+    def _inter_at(a, e):
+        if INTER_REBASE:
+            return uni64(fx.Int64(a["inter"]) + fx.Int64(e) * fx.Int64(RG * inter_row_bytes))
+        return fx.Int64(a["inter"])
+
+    def _inters_at(a, e):
+        if INTER_REBASE:
+            return uni64(fx.Int64(a["inters"]) + fx.Int64(e) * fx.Int64(RG * inter_scols))
+        return fx.Int64(a["inters"])
+
+    def _irow0(e):
+        return i32(0) if INTER_REBASE else e * i32(RG)
     K2 = I // 128  # GEMM2 K steps (MFMA K=128)
     max_norm = 448.0 if a8 else 6.0
     a_dtype = "fp8" if a8 else "fp4"
@@ -407,10 +524,11 @@ def build_gemm(kc: KernelCtx) -> dict:
     # ============================ GEMM1 (pipelined) ==============================
     def _epilogue(L, tid, acc, n_tile, cptr, r_inter, r_inters, e):
         """CShuffle the gate|up accumulators -> silu(gate)*up -> E8M0-quant -> the
-        row-major intermediate (natural col order) of echunk ``e`` (rows e*RG..), using
-        ``cbar`` for the two LDS syncs.  Mirrors ``SiluQuantEpilogue.store`` (evec==2) but
-        stores the E8M0 out-scale ROW-MAJOR (``row_g*inter_scols + col_s``) so the GEMM2
-        reader is unchanged."""
+        row-major intermediate (natural col order) of echunk ``e`` (``r_inter`` /
+        ``r_inters`` are based at its first row), using ``cbar`` for the two LDS syncs.
+        Mirrors ``SiluQuantEpilogue.store`` (evec==2) but stores the E8M0 out-scale
+        ROW-MAJOR (``row_g*inter_scols + col_s``) so the GEMM2 reader is unchanged."""
+        row0 = _irow0(e)
         lane = tid % i32(64)
         wave = tid // i32(64)
         l16 = lane % i32(16)
@@ -436,15 +554,21 @@ def build_gemm(kc: KernelCtx) -> dict:
                     [fx.Float32(x).to(fx.BFloat16).to(fx.Float32) for x in _act_batch(gs, us)]
                 )
             for v in range_constexpr(4):
-                row_g = e * i32(RG) + i32(mi * 16) + q4 * i32(4) + i32(v)
+                row_g = row0 + i32(mi * 16) + q4 * i32(4) + i32(v)
                 out_row = row_g * i32(inter_row_bytes)
                 s_row = row_g * i32(inter_scols)
                 c0, c1 = cnj[0][v], cnj[1][v]
                 a0 = c0.maximumf(fx.Float32(0.0) - c0)
                 a1 = c1.maximumf(fx.Float32(0.0) - c1)
                 m = a0.maximumf(a1)
-                for off in (1, 2, 4, 8):
-                    m = m.maximumf(m.shuffle_xor(i32(off), c64))
+                if const_expr(_EDPP):
+                    # quad xor1, xor2, then 8- / 16-lane mirrors: every lane of the 16-lane
+                    # row ends with the row max (VALU DPP, no ds_swizzle round trip)
+                    for ctrl in (0xB1, 0x4E, 0x141, 0x140):
+                        m = m.maximumf(_dpp_f32(m, ctrl))
+                else:
+                    for off in (1, 2, 4, 8):
+                        m = m.maximumf(m.shuffle_xor(i32(off), c64))
                 max_rounded = (m.bitcast(fx.Int32) + i32(0x400000)) & i32(0xFF800000)
                 _e = (max_rounded >> i32(23)) - i32(8 if a8 else 2)
                 e8 = (_e > i32(0)).select(_e, i32(0))
@@ -460,7 +584,8 @@ def build_gemm(kc: KernelCtx) -> dict:
                 even = is_odd == i32(0)
                 for nj in range_constexpr(gui_n):
                     cv = cnj[nj][v]
-                    cvn = cv.shuffle_xor(i32(1), c64)  # neighbour col (l16 ^ 1)
+                    # neighbour col (l16 ^ 1)
+                    cvn = _dpp_f32(cv, 0xB1) if _EDPP else cv.shuffle_xor(i32(1), c64)
                     first = even.select(cv, cvn)  # the even col's value of this 2-col byte
                     second = even.select(cvn, cv)  # the odd col's value
                     gcol = gbase + i32(nj * 16) + l16 - is_odd  # even col of the pair
@@ -527,8 +652,8 @@ def build_gemm(kc: KernelCtx) -> dict:
         a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
         cptr = _lds_f32_ptr(L, L_C)  # cshuffle C tile (own region; the A-ring runs ahead)
         w_ring = _LdsView(_lds_byte_ptr(L, L_W))
-        r_inter = rsrc(a["inter"])
-        r_inters = rsrc(a["inters"])
+        r_inter = rsrc(_inter_at(a, e))
+        r_inters = rsrc(_inters_at(a, e))
         wave_id = tid // i32(64)
         tib = e * i32(RG)
 
@@ -688,9 +813,9 @@ def build_gemm(kc: KernelCtx) -> dict:
             fx.Int32, unit_elems=4,
         )
         b_loader = BWeightLoader(w_rsrc=w_rsrc, num_acc_n=NUM_ACC_N, model_dim=H)
-        sw_rsrc = ptr_buf_tensor(
-            fx.Int64(a["w1s"]) + fx.Int64(expert) * fx.Int64(2 * I * (H // 32)), fx.Int32,
-        )
+        s_addr = fx.Int64(a["w1s"]) + fx.Int64(expert) * fx.Int64(2 * I * (H // 32))
+        w_addr = fx.Int64(a["w1"]) + fx.Int64(expert) * fx.Int64(2 * I * (H // 2))
+        sw_rsrc = ptr_buf_tensor(s_addr, fx.Int32)
         b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=NUM_ACC_N, model_dim=H)
         sx_rsrc = ptr_buf_tensor(
             fx.Int64(a["mine"]) + fx.Int64(a["off_pscale"]), fx.Int32, unit_elems=4
@@ -702,8 +827,8 @@ def build_gemm(kc: KernelCtx) -> dict:
         mfma_gu = MfmaScaleGU(m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N, a_dtype=a_dtype)
         a_buf = _LdsView(_lds_byte_ptr(L, L_A))
         a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
-        r_inter = rsrc(a["inter"])
-        r_inters = rsrc(a["inters"])
+        r_inter = rsrc(_inter_at(a, e))
+        r_inters = rsrc(_inters_at(a, e))
         wave_id = tid // i32(64)
         tib = e * i32(RG)
         a_gather.for_tile(tib)
@@ -712,34 +837,62 @@ def build_gemm(kc: KernelCtx) -> dict:
         gpu.barrier()
 
         def _bank(j):
-            return uni((i32(j) % i32(2)) * i32(A_LDS_I32))  # 2-bank A double-buffer
+            return uni((i32(j) % i32(A_NBK)) * i32(A_LDS_I32))
 
         def _run_ntile(nt):
+            _pmark(L, tid, i32(PM_G1B))
             b_row = wave_id * i32(n_per_wave) + nt * i32(TILE_N)
+            a_fold = _AS2RFold(a_buf.ptr, k_step_bytes=A_K_STEP, a_dtype=a_dtype)
+            b_fold = _BFold(w_addr, s_addr, b_row, num_acc_n=NUM_ACC_N, model_dim=H) if G8PF & 4 else None
+
+            def _ldb(k):
+                if const_expr(G8PF & 4):
+                    return b_fold.load_step(k)
+                return b_loader.load_step(b_row, i32(k)), b_scale.load_step(b_row, i32(k))
+
             # prime bank 0 (K=0), prefetch K=1 regs (HBM->reg, overlaps the barrier)
-            regs = a_gather.load_regs(i32(0))
-            a_gather.store(a_buf, regs, _bank(i32(0)))
-            regs = a_gather.load_regs(i32(A_K_STEP))
+            for j in range_constexpr(A_AH):
+                a_gather.store(a_buf, a_gather.load_regs(i32(j * A_K_STEP)), _bank(i32(j)))
+            regs = [a_gather.load_regs(i32((A_AH + j) % K_ITERS * A_K_STEP)) for j in range(A_AH)]
+            if const_expr(G8PF & 2):
+                b_nx, sb_nx = _ldb(0)
             wait_lgkm0()
             gpu.barrier()
+            _pmark(L, tid, i32(14))
             acc = [mfma_gu.zero_value for _ in range(N_ACC)]
             for sp in range_constexpr(K_ITERS):
                 cur = _bank(i32(sp))
-                sb = b_scale.load_step(b_row, i32(sp))
+                if const_expr(G8PF & 2):
+                    b_cur, sb = b_nx, sb_nx
+                else:
+                    sb = b_scale.load_step(b_row, i32(sp))
                 sa = a_scale.load_step(a_scale_lds, i32(sp))
 
-                def _al(mi, ks, _b=cur):
+                def _al(mi, ks, _b=cur, _bb=(sp % A_NBK) * A_LDS_I32 * 4):
+                    if const_expr(G8PF & 1):
+                        return a_fold.load_operand(mi, ks, _bb)
                     return a_s2r.load_operand(a_buf, mi, ks, _b)
 
                 # store the prefetched next K-tile into the OTHER bank (no conflict with the
                 # MFMA's read of ``cur``), then prefetch K=sp+2 (unconditional wrap so flyc
                 # doesn't treat ``regs`` as conditionally-assigned scf state; see a_loader_g1).
-                a_gather.store(a_buf, regs, _bank(i32(sp + 1)))
-                regs = a_gather.load_regs(i32(((sp + 2) % K_ITERS) * A_K_STEP))
-                acc = mfma_gu.call(_al, b_loader.load_step(b_row, i32(sp)), acc, sa, sb)
-                wait_lgkm0()  # the next-bank ds_write landed
-                gpu.barrier()  # next bank visible; all waves done reading ``cur``
+                a_gather.store(a_buf, regs[0], _bank(i32(sp + A_AH)))
+                regs = regs[1:] + [a_gather.load_regs(i32(((sp + 2 * A_AH) % K_ITERS) * A_K_STEP))]
+                if const_expr(G8PF & 2):
+                    if const_expr(sp + 1 < K_ITERS):
+                        b_nx, sb_nx = _ldb(sp + 1)
+                else:
+                    b_cur = b_loader.load_step(b_row, i32(sp))
+                if const_expr(G8PF & 16):
+                    acc = _mfma_step_apf(mfma_gu, _al, b_cur, acc, sa, sb, M_REPEAT, NUM_ACC_N)
+                else:
+                    acc = mfma_gu.call(_al, b_cur, acc, sa, sb)
+                if const_expr(sp % A_AH == A_AH - 1):
+                    wait_lgkm0()  # the next banks' ds_writes landed
+                    gpu.barrier()  # next banks visible; all waves done reading this pair
+            _pmark(L, tid, i32(PM_G1K))
             _epilogue(L, tid, acc, nt, i32(0), r_inter, r_inters, e)
+            _pmark(L, tid, i32(PM_G1E))
 
         for nt_ in range(nt_lo, nt_hi, i32(1)):
             _run_ntile(i32(nt_))
@@ -817,7 +970,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             fx.Int64(a["w2s"]) + fx.Int64(expert) * fx.Int64(H * (I // 32)), fx.Int32
         )
         b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=NUM_ACC_N2, model_dim=I)
-        sx_rsrc = ptr_buf_tensor(fx.Int64(a["inters"]), fx.Int32, unit_elems=4)
+        sx_rsrc = ptr_buf_tensor(_inters_at(a, e), fx.Int32, unit_elems=4)
         a_scale = AScaleLoader(
             scale_rsrc=sx_rsrc,
             m_repeat=M_REPEAT,
@@ -832,13 +985,12 @@ def build_gemm(kc: KernelCtx) -> dict:
         cptr = _lds_f32_ptr(L, L_C)  # cshuffle C tile (own region; the A-ring runs ahead)
         w_ring = _LdsView(_lds_byte_ptr(L, L_W))
         wave_id = tid // i32(64)
-        tib = e * i32(RG)
         # Stage the A-scale ONCE per unit (same per-echunk block for every n-tile) -- off
         # the per-n-tile critical path (see gemm1).  Runs when the @flyc.jit wrapper calls
         # _gemm2_core, before its n-tile loop.
         cbar(L, tid)  # sync waves entering the unit before the cooperative stage
         a_scale._tx = _fresh_tid()
-        a_scale.stage(a_scale_lds, tib)
+        a_scale.stage(a_scale_lds, _irow0(e))
         cbar(L, tid)  # A-scale staged + visible to all compute waves
 
         # No nt-boundary cbar (see gemm1): prev n-tile's epilogue / the per-unit stage
@@ -957,7 +1109,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         paced by the RC_AFREE back-pressure.  ``lane`` is loader-local (= ``tid-B_LOADER``,
         the ATileLoader ``tid_override``).  Mirrors ``_gemm2_core``'s n-tile / K walk so the
         running ring tile index ``q`` matches the consumer."""
-        inter_tensor = _global_byte_tensor(fx.Int64(a["inter"]), INTER_NBYTES)
+        inter_tensor = _global_byte_tensor(_inter_at(a, e), INTER_NBYTES)
         a_gather = ATileLoader(
             row_bytes=inter_row_bytes,
             sort_block_m=RG,
@@ -971,8 +1123,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             tid_override=lane,
         )
         a_buf = _LdsView(_lds_byte_ptr(L, L_A))
-        tib = e * i32(RG)
-        a_gather.for_tile(tib)
+        a_gather.for_tile(_irow0(e))
 
         # Depth-2 loader pipeline (see a_loader_g1): prefetch next K-step while current drains.
         def _produce_nt(nt):
@@ -1153,7 +1304,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         ``epi(acc, nt, cptr)`` consumes each n-tile (gout store or fused-combine scatter).
         Returns ``_run_ntile``; the @flyc.jit wrapper drives the dynamic n-tile loop (the
         plain def cannot host a runtime ``range`` over dynamic bounds -- see ``_gemm2_core``)."""
-        inter_tensor = _global_byte_tensor(fx.Int64(a["inter"]), INTER_NBYTES)
+        inter_tensor = _global_byte_tensor(_inter_at(a, e), INTER_NBYTES)
         a_gather = ATileLoader(
             row_bytes=inter_row_bytes, sort_block_m=RG, k_step_bytes=A_K_STEP,
             total_threads=NT, swizzle=True, x_tensor=inter_tensor, async_copy=False,
@@ -1165,11 +1316,11 @@ def build_gemm(kc: KernelCtx) -> dict:
             fx.Int32, unit_elems=4,
         )
         b_loader = BWeightLoader(w_rsrc=w_rsrc, num_acc_n=NUM_ACC_N2, model_dim=I)
-        sw_rsrc = ptr_buf_tensor(
-            fx.Int64(a["w2s"]) + fx.Int64(expert) * fx.Int64(H * (I // 32)), fx.Int32
-        )
+        s_addr = fx.Int64(a["w2s"]) + fx.Int64(expert) * fx.Int64(H * (I // 32))
+        w_addr = fx.Int64(a["w2"]) + fx.Int64(expert) * fx.Int64(H * (I // 2))
+        sw_rsrc = ptr_buf_tensor(s_addr, fx.Int32)
         b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=NUM_ACC_N2, model_dim=I)
-        sx_rsrc = ptr_buf_tensor(fx.Int64(a["inters"]), fx.Int32, unit_elems=4)
+        sx_rsrc = ptr_buf_tensor(_inters_at(a, e), fx.Int32, unit_elems=4)
         a_scale = AScaleLoader(
             scale_rsrc=sx_rsrc, m_repeat=M_REPEAT, model_dim=I, sort_block_m=RG,
             total_threads=NT, indexed_input=False,
@@ -1179,37 +1330,64 @@ def build_gemm(kc: KernelCtx) -> dict:
         a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
         cptr = _lds_f32_ptr(L, L_C)
         wave_id = tid // i32(64)
-        tib = e * i32(RG)
-        a_gather.for_tile(tib)
+        a_gather.for_tile(_irow0(e))
         gpu.barrier()
-        a_scale.stage(a_scale_lds, tib)
+        a_scale.stage(a_scale_lds, _irow0(e))
         gpu.barrier()
 
         def _bank(j):
-            return uni((i32(j) % i32(2)) * i32(A_LDS_I32))
+            return uni((i32(j) % i32(A_NBK)) * i32(A_LDS_I32))
 
         def _run_ntile(nt):
+            _pmark(L, tid, i32(PM_G2B))
             b_row = wave_id * i32(n_per_wave2) + nt * i32(TILE_N2)
-            regs = a_gather.load_regs(i32(0))
-            a_gather.store(a_buf, regs, _bank(i32(0)))
-            regs = a_gather.load_regs(i32(A_K_STEP))
+            a_fold = _AS2RFold(a_buf.ptr, k_step_bytes=A_K_STEP, a_dtype=a_dtype)
+            b_fold = _BFold(w_addr, s_addr, b_row, num_acc_n=NUM_ACC_N2, model_dim=I) if G8PF & 4 else None
+
+            def _ldb(k):
+                if const_expr(G8PF & 4):
+                    return b_fold.load_step(k)
+                return b_loader.load_step(b_row, i32(k)), b_scale.load_step(b_row, i32(k))
+
+            for j in range_constexpr(A_AH):
+                a_gather.store(a_buf, a_gather.load_regs(i32(j * A_K_STEP)), _bank(i32(j)))
+            regs = [a_gather.load_regs(i32((A_AH + j) % K_ITERS2 * A_K_STEP)) for j in range(A_AH)]
+            if const_expr(G8PF & 2):
+                b_nx, sb_nx = _ldb(0)
             wait_lgkm0()
             gpu.barrier()
+            _pmark(L, tid, i32(15))
             acc = [mfma_gu.zero_value for _ in range(N_ACC2)]
             for sp in range_constexpr(K_ITERS2):
                 cur = _bank(i32(sp))
-                sb = b_scale.load_step(b_row, i32(sp))
+                if const_expr(G8PF & 2):
+                    b_cur, sb = b_nx, sb_nx
+                else:
+                    sb = b_scale.load_step(b_row, i32(sp))
                 sa = a_scale.load_step(a_scale_lds, i32(sp))
 
-                def _al(mi, ks, _b=cur):
+                def _al(mi, ks, _b=cur, _bb=(sp % A_NBK) * A_LDS_I32 * 4):
+                    if const_expr(G8PF & 1):
+                        return a_fold.load_operand(mi, ks, _bb)
                     return a_s2r.load_operand(a_buf, mi, ks, _b)
 
-                a_gather.store(a_buf, regs, _bank(i32(sp + 1)))
-                regs = a_gather.load_regs(i32(((sp + 2) % K_ITERS2) * A_K_STEP))
-                acc = mfma_gu.call(_al, b_loader.load_step(b_row, i32(sp)), acc, sa, sb)
-                wait_lgkm0()
-                gpu.barrier()
+                a_gather.store(a_buf, regs[0], _bank(i32(sp + A_AH)))
+                regs = regs[1:] + [a_gather.load_regs(i32(((sp + 2 * A_AH) % K_ITERS2) * A_K_STEP))]
+                if const_expr(G8PF & 2):
+                    if const_expr(sp + 1 < K_ITERS2):
+                        b_nx, sb_nx = _ldb(sp + 1)
+                else:
+                    b_cur = b_loader.load_step(b_row, i32(sp))
+                if const_expr(G8PF & 16):
+                    acc = _mfma_step_apf(mfma_gu, _al, b_cur, acc, sa, sb, M_REPEAT, NUM_ACC_N2)
+                else:
+                    acc = mfma_gu.call(_al, b_cur, acc, sa, sb)
+                if const_expr(sp % A_AH == A_AH - 1):
+                    wait_lgkm0()
+                    gpu.barrier()
+            _pmark(L, tid, i32(PM_G2K))
             epi(acc, nt, cptr)
+            _pmark(L, tid, i32(PM_G2E))
 
         return _run_ntile
 

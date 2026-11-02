@@ -87,10 +87,21 @@ for bs in [int(b) for b in os.environ.get("EP_BS", "8,512").split(",")]:
     for _, a0, a1, _c in PH:
         d = (a1 - a0) / 1e5
         vals += [float(d.mean()), float(d.max())]
-    SPL = ["g1 kloop", "g1 pre-epi cbar", "g1 epilogue", "g2 kloop", "g2 pre-epi cbar", "g2 epilogue"]
+    SPL = ["g1 kloop", "g1 entry(rowmap+ascale)", "g1 epilogue", "g2 kloop", "g2 entry(ascale)", "g2 epilogue"]
     for k in range(6):
         d = (ts[:, 13 + k] & 0xFFFFFFFF) / 1e5
         vals += [float(d.mean()), float(d.max())]
+    SPL += ["g1 drain+done+pull", "g2 drain+done+pull", "g1 top+pay_wait", "g2 arrive+top+ech_wait", "g1 prime", "g2 prime"]
+    for k in range(6):
+        d = (ts[:, 13 + k] >> 32) / 1e5
+        vals += [float(d.mean()), float(d.max())]
+    # EP_OVL: slot 6 = per-CTA payload-wait ticks (low 32) | sender send ticks (high 32)
+    pw = (ts[:, 6] & 0xFFFFFFFF) / 1e5
+    sd = (ts[:, 6] >> 32) / 1e5
+    sdn = sd[sd > 0]
+    vals += [float(pw.mean()), float(pw.max()),
+             float(sdn.mean()) if sdn.size else 0.0, float(sd.max())]
+    SPL += ["ovl pay_wait", "ovl send(snd)"]
     dev = torch.tensor(vals, device=DEV, dtype=torch.float64)
     gath = [torch.empty_like(dev) for _ in range(WORLD)]
     dist.all_gather(gath, dev)

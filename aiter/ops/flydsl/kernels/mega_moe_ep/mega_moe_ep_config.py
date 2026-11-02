@@ -31,7 +31,6 @@ __all__ = [
     "B_DISPATCH",
     "B_LOADER",
     "CTRL_ERR",
-    "CTRL_INTS",
     "C_BARCNT",
     "C_BARGEN",
     "C_CNT",
@@ -59,17 +58,20 @@ __all__ = [
     "FLAG_INTS",
     "GBAR_CNT",
     "GBAR_GEN",
+    "GOUT_ROWS",
     "MAX_NPES",
-    "NCHA",
     "NCTA_MAX",
     "NT",
     "NTT",
     "NW",
     "N_XCD",
     "UL_MAX",
+    "ctrl_ints",
     "ep_shape_supported",
+    "inter_rows",
     "kernel_config",
     "mega_moe_ep_consts",
+    "nch_max",
 ]
 
 MAX_NPES = MAX_TP
@@ -84,8 +86,9 @@ N_XCD = 8
 # MFMA occupancy" direction.  Block stays 8 waves (NTT=512) either way.
 EP_NW8 = bool(int(os.environ.get("EP_NW8", "0")))
 # Engine auto-selects the NW=8 (all-8-wave-MFMA, serial-comm) variant per launch once the
-# token count reaches this (GEMM-bound regime; crossover ~2048). EP_NW8=1 forces it always.
-EP_NW8_MIN = int(os.environ.get("EP_NW8_MIN", "2048"))
+# token count reaches this. EP_NW8=1 forces it always.  With the NW=8 K-loop prefetch
+# (EP_G8PF) NW=8 is never slower: bs1 even, bs8..512 -8%..-30%, bs1536 -44% vs NW=4.
+EP_NW8_MIN = int(os.environ.get("EP_NW8_MIN", "1"))
 NW = 8 if EP_NW8 else 4  # module default (compile path takes NW per-launch; see kernel_config)
 NT = NW * 64  # 512 (NW8) or 256 compute threads
 NTT = NT + (0 if EP_NW8 else 4 * 64)  # 512 threads (8 waves) in both modes
@@ -126,12 +129,30 @@ NAB = 4
 # Up to this many received (token, expert) pairs per rank use the dynamic planner
 # (the one ported here); larger batches want an LB-style two-phase planner (future).
 DYN_MAX = 256
-# Chunk-table slots (active-expert row chunks of 16*mt rows) the dynamic planner emits.
-# Also the per-echunk capacity of the global inter/gout/rowmap/rowidx scratch. Larger
-# than the #CU grid (256) so high-bs launches whose chunk count exceeds the grid run the
-# GEMM/combine in multiple CTA waves (overlap room) instead of hanging on overflow.
-# Covers v4_pro up to ~bs 10K/rank (nch ~= epr*ceil(R_e/RG)); raise for larger prefill.
-NCHA = 1024
+# gout rows: only the n-tile-sharded (P > 1) passes write gout, and they need
+# nch <= #CTA <= NCTA_MAX, so NCTA_MAX echunks of at most GOUT_RG rows.  Every other
+# per-echunk table (chunk lookup, ECNT counters, inter / inters / rowmap / rowidx) is
+# sized by nch_max() / inter_rows().
+GOUT_RG = 128
+GOUT_ROWS = NCTA_MAX * GOUT_RG
+
+
+def nch_max(tmax: int, topk: int, rg: int, epr: int) -> int:
+    """Worst-case echunk count of one launch: every received (token, route) pair --
+    at most ``tmax * topk`` (all ranks routing to this one) -- in ``rg``-row chunks,
+    plus one partial chunk per local expert."""
+    return ceildiv(tmax * topk, rg) + epr
+
+
+def inter_rows(tmax: int, topk: int, epr: int, rg_max: int = 128) -> int:
+    """Worst-case rows of the per-echunk scratch (inter / inters / rowmap / rowidx):
+    every received pair plus each local expert's partial last chunk at the largest RG."""
+    return tmax * topk + epr * rg_max
+
+
+def ctrl_ints(tmax: int, topk: int, epr: int, rg_min: int = 32) -> int:
+    """ctrl ints covering ECNT1 / ECNT2 of any row tile >= ``rg_min``."""
+    return ECNT1 + 2 * nch_max(tmax, topk, rg_min, epr)
 
 # Epoch-flag arena: ints in the symmetric arena ``off_flag`` region. Two banks selected
 # by epoch parity so a launch never races the previous one's slots. Each readiness tile
@@ -159,7 +180,11 @@ FLAG_INIT_CNT = FLAG_INIT + 2 * NCTA_MAX
 # gather, all routing-only) while the big payload a2a is still in flight.
 FLAG_DISPM = FLAG_INIT_CNT + 2 * NCTA_MAX
 FLAG_DISPM_CNT = FLAG_DISPM + 2 * NCTA_MAX
-FLAG_INTS = FLAG_DISPM_CNT + 2 * NCTA_MAX
+# FLAG_PAYC + parity*NCTA_MAX + le    EP_OVL: routes to local expert le whose payload row
+# has landed (senders add after draining; the owner compares with its L_DCNT[le] and its
+# last CTA out zeroes the parity's counters).
+FLAG_PAYC = FLAG_DISPM_CNT + 2 * NCTA_MAX
+FLAG_INTS = FLAG_PAYC + 2 * NCTA_MAX
 
 # Global control ints (device tensor): a sticky watchdog error word plus room.
 CTRL_ERR = 0
@@ -173,9 +198,9 @@ GBAR_CNT, GBAR_GEN = 16, 17
 # release-adds 1 when its slice of inter / gout is written, so a consumer waits only
 # for its own echunk's P shards instead of a grid barrier.  The last GEMM2 shard of an
 # echunk combines it and zeroes both counters (every waiter has passed by then).
-ECNT1 = 64  # [ECNT1, ECNT1 + NCHA): GEMM1 shards done per echunk
-ECNT2 = ECNT1 + NCHA  # [ECNT2, ECNT2 + NCHA): GEMM2 shards done per echunk
-CTRL_INTS = ECNT2 + NCHA
+# [ECNT1, ECNT1 + NCHM): GEMM1 shards done per echunk; [ECNT2, ECNT2 + NCHM): GEMM2.
+# NCHM = nch_max() of the instance, so ECNT2 = ECNT1 + NCHM is per-instance (kc).
+ECNT1 = 64
 ESYNC = int(os.environ.get("EP_ESYNC", "1"))
 # GEMM unit walk in XCD-major CTA order (workgroups land on XCDs round-robin): the
 # consecutive echunks of one expert -- same n-tile shard, same pace -- then run on the
@@ -211,7 +236,34 @@ DYNQ = int(os.environ.get("EP_DYNQ", "1")) and ESYNC
 # bid % N_XCD reports ERR_COMPUTE), 1 = agent-scope release/acquire per tile.
 DQF = int(os.environ.get("EP_DQF", "0"))
 QCNT = 32  # [QCNT, QCNT + N_XCD): per-XCD tile-queue counters (self-resetting)
-assert QCNT + N_XCD <= ECNT1
+QDONE = QCNT + N_XCD  # EP_OVL: CTAs past the tile queue (the last one resets FLAG_PAYC)
+assert QDONE < ECNT1
+# NW=8 dispatch/GEMM overlap (needs EP_DYNQ): the payload goes in LB = ceil(EPR / N_XCD)
+# rounds -- round g: the (token, owner) rows whose smallest le % LB over the token's local
+# experts on that owner is g, so expert le is complete after round le % LB, about one
+# expert per owner XCD per round -- each counting its landed routes into the owner's
+# FLAG_PAYC[le].  Every CTA sends rounds [0, EP_OVG0) with the routing (before plan: the
+# plan's grid barriers would wait on any CTA still sending), then EP_NSX CTAs per XCD
+# send the rest while the others start the tile queue.  The queue runs expert-major from
+# the XCD's first round-0 expert, and a GEMM1 tile waits its expert's count.  vs EMAJ
+# alone: bs2048 -4%, 4096 -7%, 8192 -7% (NSX 2..4 within noise; OVG0=1/3 slower).
+OVL = int(os.environ.get("EP_OVL", "1")) and DYNQ
+NSX = int(os.environ.get("EP_NSX", "4"))
+OVG0 = int(os.environ.get("EP_OVG0", "2"))
+# EP_DYNQ tile order: expert-major (an expert's n-tiles, its echunks minor, so the
+# expert's A stays in L2 across its n-tiles) vs n-tile-major over the XCD's whole echunk
+# range.  EP_OVL needs expert-major.
+EMAJ = int(os.environ.get("EP_EMAJ", "1")) or OVL
+# NW=8 GEMM K-loop (gemm1_nw8 / _gemm2_core_nw8), bit flags.  1: A ds_read addresses as
+# two per-lane pointers + immediate offsets (AS2RLoader's one-expression address kept a
+# VGPR per (m-tile, ksub, bank) live across the loop).  2: W + B-scale loaded one K-step
+# ahead (else issued after the step's barrier and waited on by its first MFMA).  4: W +
+# B-scale wave-uniform address terms in the SGPR soffset (the per-load VALU address math
+# kept ~16 VGPRs live and spilled 30): -3..-5% e2e bs256..8192.  8: 4-bank A ring, one
+# barrier per two K-steps, A gathered two K-steps ahead: a further -1% bs2048, -3% bs8192.
+# 16: A operand ds_read one (m-tile, ksub) ahead of its MFMAs: -1% bs2048..8192.
+G8PF_DEF = 31
+G8PF = int(os.environ.get("EP_G8PF", str(G8PF_DEF)))
 
 # LDS control slots (ints at ``L_CTL``; see schedule.py). The cbar generation barrier,
 # the dynamic plan's bookkeeping and the per-CTA unit list live here.
@@ -222,6 +274,7 @@ C_S1, C_K1, C_S2, C_K2 = 6, 7, 8, 9  # NW=4 pass split: shard size / packed rema
 C_ELAST = 10  # EP_ESYNC: old value of this CTA's last echunk-counter add (tid0 -> waves)
 C_QIDX = 11  # EP_DYNQ: the tile index tid0 pulled from the XCD queue (tid0 -> waves)
 C_UNIT = 12  # [C_UNIT, C_UNIT+1): this CTA's unit range [lo, hi)
+C_ROT = 14  # EP_OVL: the expert-major walk's start group (in echunks from e_lo)
 C_UL = 16  # per-CTA unit list base (records of 4 ints: expert_chunk, i0, icnt, kind)
 UL_MAX = (128 - C_UL) // 4
 
@@ -289,7 +342,7 @@ def mega_moe_ep_consts(
     # so size the pool to the banks ACTUALLY used. At NW8 this reclaims (NAB-2)*a_lds_size
     # (~16 KB a4 / 32 KB a8), which drops a4w4 NW8 back under the 80 KB (2 CTA/CU) occupancy
     # threshold (the TILE_N=512 cshuffle L_C had pushed it to 83.8 KB -> only 1 CTA/CU).
-    a_banks = 2 if NW == 8 else NAB
+    a_banks = (4 if G8PF & 8 else 2) if NW == 8 else NAB
     lds_pool = a_banks * a_lds_size
     c = {
         "RG": RG,
@@ -338,7 +391,12 @@ def mega_moe_ep_consts(
     c["L_DYN"] = take((2 * NBW + EPR) * 4)  # bitmap words | prefix words | dense list
     c["L_DCNT"] = take(EPR * 4)  # received rows per local expert
     c["L_WSUM"] = take(NW * 2 * 4)  # wave-prefix scratch (count + offset)
-    c["L_DCH"] = take(NCHA * 4)  # chunk table: expert | ce<<16 | c<<24
+    # chunk prefix: first echunk of the j-th active expert (dense order), [nact] = nch
+    c["L_DCH"] = take((EPR + 1) * 4)
+    # echunk -> active index j, one byte per echunk (4 per word) for the first 4*NDIXW
+    # echunks; later echunks binary-search L_DCH.  j <= EPR + 3 must fit in a byte.
+    c["NDIXW"] = 2048 if EPR <= 252 else 0
+    c["L_DIX"] = take(c["NDIXW"] * 4)
     c["L_EOFF"] = take(EPR * 4)  # per-expert row offset (gather)
     c["L_RIX"] = take(
         RG * 4
@@ -392,6 +450,7 @@ def kernel_config(
     L_A, L_AS = c["L_A"], c["L_AS"]
     L_DYN, L_DCNT, L_WSUM = c["L_DYN"], c["L_DCNT"], c["L_WSUM"]
     L_DCH, L_EOFF, L_RIX, L_CTL = c["L_DCH"], c["L_EOFF"], c["L_RIX"], c["L_CTL"]
+    L_DIX, NDIXW = c["L_DIX"], c["NDIXW"]
     L_C, L_RCTL, L_PF = c["L_C"], c["L_RCTL"], c["L_PF"]
     # W ring (EP_WLDS, NW=4): one bank = one K-step of the CTA's W (TILE_N cols x TILE_K
     # fp4) + its B-scale (TILE_N/32 groups x 256 B); as many banks as the free LDS fits.
@@ -414,6 +473,14 @@ def kernel_config(
     # intermediate to re-enable P>1 ([p for p in range(1, KS2+1) if KS2 % p == 0]).
     DYN_PS = [1]
     rch = RG  # dynamic row chunk = one row tile (16*mt)
+    NCHM = nch_max(TMAX, TOPK, RG, EPR)
+    ECNT2 = ECNT1 + NCHM
+    CE_BITS = ceildiv(TMAX, RG).bit_length()  # bits of one expert's chunk count
+    # inter (/ inters) past 2 GB: rebase its 64-bit base per echunk so the 32-bit buffer
+    # offsets stay within one echunk; rowmap / rowidx stay 32-bit
+    INTER_REBASE = inter_rows(TMAX, TOPK, EPR) * (I if a8 else I // 2) >= 2**31
+    assert NCHM * RG * 4 < 2**31
+    assert RG <= GOUT_RG, f"RG={RG} > GOUT_RG={GOUT_RG} (gout scratch rows per echunk)"
     const_expr = fx.const_expr
     name = (
         f"mega_moe_ep_h{H}_i{I}_e{E}_epr{EPR}_k{TOPK}_mt{MT}_t{TMAX}_np{NPES}_nw{NW}_{act}"
@@ -427,7 +494,10 @@ def kernel_config(
         + ("_dw0" if not DISPW and NW == 8 else "")
         + ("" if DYNQ or NW == 4 else "_nodq")
         + ("_dqf" if DYNQ and DQF and NW == 8 else "")
+        + ("" if not DYNQ or NW == 4 or (OVL and NSX == 4 and OVG0 == 2)
+           else f"_ovl{NSX}g{OVG0}" if OVL else "_noovl" if EMAJ else "_noovl_noem")
+        + ("" if G8PF == G8PF_DEF or NW == 4 else f"_pf{G8PF}")
         + (f"_lim{swiglu_limit:g}" if math.isfinite(swiglu_limit) else "")
     )
-    layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"
+    layout_tag = f"{ECNT2 + NCHM}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"
     return KernelCtx(**locals())

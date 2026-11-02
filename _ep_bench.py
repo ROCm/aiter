@@ -28,7 +28,9 @@ H, I, K, SWIGLU = 7168, 3072, 6, 10.0
 EPR = 48  # per-rank experts fixed across world sizes (8-GPU v4_pro value)
 E = EPR * WORLD  # 384 @ world=8, 192 @ world=4 -- keeps per-rank geometry identical
 MTPR = int(os.environ.get("EP_MTPR", "1024"))  # raise for high-bs probing
+ROUTE = os.environ.get("EP_ROUTE", "uniform")  # uniform | bias:<b> | rank0 | same
 ITERS, WARMUP = 20, 5
+QUANT = os.environ.get("EP_QUANT", "a4w4")  # EP/V2 only; TP stays a4w4
 qz = aiter.get_torch_quant(aiter.QuantType.per_1x32)
 
 
@@ -47,7 +49,7 @@ def build_ep():
     return MegaMoeEPEngine(
         rank=RANK, world_size=WORLD, model_dim=H, inter_dim=I, experts=E, topk=K,
         max_tok_per_rank=MTPR, w1=w1q, w1_scale=w1s, w2=w2q, w2_scale=w2s,
-        quant="a4w4", act="silu", swiglu_limit=SWIGLU, device=DEV,
+        quant=QUANT, act="silu", swiglu_limit=SWIGLU, device=DEV,
     )
 
 
@@ -58,7 +60,7 @@ def build_v2():
     w2q, w2sr, _ = _q(EPR, H, I, I**-0.25, 200 + RANK)
     return MegaMoEV2(
         rank=RANK, world_size=WORLD, model_dim=H, inter_dim=I, experts=E, topk=K,
-        quant="a4w4",
+        quant=QUANT,
         w1=shuffle_weight_a16w4(w1q, 16, True).contiguous(),
         w1_scale=shuffle_scale_a16w4(w1sr, EPR, True).contiguous(),
         w2=shuffle_weight_a16w4(w2q, 16, False).contiguous(),
@@ -87,7 +89,15 @@ def build_tp():
 def make_inputs(bs):
     g = torch.Generator(device=DEV).manual_seed(777 + RANK * 131 + bs)
     x = torch.randn(bs, H, dtype=torch.bfloat16, device=DEV, generator=g) * 0.1
-    wts, ids = torch.topk(torch.softmax(torch.randn(bs, E, device=DEV, generator=g), -1), K, -1)
+    logits = torch.randn(bs, E, device=DEV, generator=g)
+    epr = E // WORLD
+    if ROUTE.startswith("bias:"):  # hot rank 0: its experts' logits get +b
+        logits[:, :epr] += float(ROUTE[5:])
+    elif ROUTE == "rank0":
+        logits[:, epr:] = -1e9
+    wts, ids = torch.topk(torch.softmax(logits, -1), K, -1)
+    if ROUTE == "same":
+        ids = torch.arange(K, device=DEV).expand(bs, K)
     return x, wts.to(torch.float32).contiguous(), ids.to(torch.int32).contiguous()
 
 
@@ -134,6 +144,11 @@ for bs in [int(b) for b in os.environ.get("EP_BS", "1,2,4,8,64,256,512,1024").sp
         if RANK == 0:
             print(f"[{ENGINE}] bs={bs} RUN FAIL: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
     dist.barrier()
+
+if int(os.environ.get("EP_MEMACCT", "0")) and RANK == 0:
+    from _mem_acct import report
+
+    report(f"{ENGINE} {QUANT} mtpr={MTPR}", engine)
 
 if ENGINE == "V2":
     ms.shmem_finalize()

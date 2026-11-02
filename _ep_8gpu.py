@@ -30,6 +30,7 @@ E = EPR * WORLD  # 384 @ world=8, 192 @ world=4 -- keeps per-rank geometry ident
 MTPR = int(os.environ.get("EP_MTPR", "1024"))  # raise for high-bs probing
 QUANT = os.environ.get("EP_QUANT", "a8w4")
 TOL = 0.25 if QUANT == "a4w4" else 0.10
+ROUTE = os.environ.get("EP_ROUTE", "uniform")  # uniform | bias:<b> | rank0 | same
 
 # this rank's local experts (natural / unshuffled MXFP4), distinct per rank
 qz = aiter.get_torch_quant(aiter.QuantType.per_1x32)
@@ -51,7 +52,7 @@ engine = MegaMoeEPEngine(
     quant=QUANT, act="silu", swiglu_limit=10.0, device=DEV,
 )
 if RANK == 0:
-    print(f"8-GPU EP: n_cta={engine.n_cta} epr={EPR} quant={QUANT} tol={TOL}", flush=True)
+    print(f"8-GPU EP: n_cta={engine.n_cta} epr={EPR} quant={QUANT} tol={TOL} route={ROUTE} mtpr={MTPR}", flush=True)
 
 
 def run(bs):
@@ -59,16 +60,28 @@ def run(bs):
     g = torch.Generator(device=DEV).manual_seed(777 + RANK * 131 + bs)
     x = torch.randn(bs, H, dtype=torch.bfloat16, device=DEV, generator=g) * 0.1
     logits = torch.randn(bs, E, device=DEV, generator=g)
+    if ROUTE.startswith("bias:"):  # hot rank 0: its experts' logits get +b
+        logits[:, :EPR] += float(ROUTE[5:])
+    elif ROUTE == "rank0":  # every token's top-k lands on rank 0's experts
+        logits[:, EPR:] = -1e9
     wts, ids = torch.topk(torch.softmax(logits, dim=-1), K, dim=-1)
+    if ROUTE == "same":  # every token routes to experts 0..K-1 (one expert gets all tokens)
+        ids = torch.arange(K, device=DEV).expand(bs, K)
     ids = ids.to(torch.int32).contiguous()
     wts = wts.to(torch.float32).contiguous()
+    ids_all = [torch.empty_like(ids) for _ in range(WORLD)]
+    dist.all_gather(ids_all, ids)
+    ids_all = torch.cat(ids_all)
+    exp_recv = ((ids_all >= RANK * EPR) & (ids_all < (RANK + 1) * EPR)).sum().item()
     engine._part.local.zero_()
     out = engine.forward(x, wts, ids)
     torch.cuda.synchronize()
     err = engine.poll_errors()
     recv = engine._recv.local
     nrecv = recv.ge(0).logical_and(recv.lt(EPR)).sum().item()
-    print(f"[r{RANK}] bs={bs} err={err} recv_valid={nrecv}", flush=True)
+    print(f"[r{RANK}] bs={bs} err={err} recv_valid={nrecv} expect={exp_recv}", flush=True)
+    if nrecv != exp_recv:
+        err = err or -1
     ref = engine.reference_forward(x, wts, ids, (w1_q, w1_s, w2_q, w2_s))
     o, r = out.float(), ref.float()
     rel = ((o - r).norm() / r.norm().clamp_min(1e-9)).item()

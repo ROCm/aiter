@@ -37,7 +37,8 @@ from .common import bst, i32, lds_st, now, rsrc, uni
 # are compile-time gated and the `dbg` arg is just an unused pointer).
 _PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
 _PROF_SLOTS = 19  # 0:entry 1:post-barrier_init 2:post-roles 3:post-combine_final
-#   4:post-dispatch_wait 5:post-dyn_plan 6:unit-count 7:post-gemm1 8:post-gemm2 (schedule)
+#   4:post-dispatch_wait 5:post-dyn_plan 7:post-gemm1 8:post-gemm2 (schedule)
+#   6: EP_OVL payload-wait tick sum | sender send ticks << 32 (schedule)
 #   9:post-dispatch_send(NW8) 10:post-gather 11:post-payload-wait (schedule)
 #   12:post-combine_wait (communication.combine_final)
 #   13..18: gemm1 {kloop, pre-epi cbar, epi}, gemm2 {..} tick sums (gemm.py _pmark)
@@ -117,7 +118,7 @@ def compile_mega_moe_ep(
         for s_ in range(tid, i32(RC_INTS), i32(NTT)):
             lds_st(L, L_RCTL + i32(s_) * i32(4), i32(0))
         if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid < i32(8):  # gemm.py _pmark tick sums + last mark
+            if tid < i32(16):  # gemm.py _pmark tick sums + last mark, 8/9: EP_OVL waits
                 lds_st(L, L_PF + tid * i32(4), i32(0))
         if tid == i32(0):
             lds_st(L, L_CTL + C_BARCNT * 4, i32(0))

@@ -19,13 +19,16 @@ from ..mega_moe.quant import per_1x32_mx_quant
 from ..mega_moe_tp.mega_moe_tp import SymmetricArena
 from ..tensor_shim import _run_compiled
 from .mega_moe_ep_config import (
-    CTRL_INTS,
     EP_NW8,
     EP_NW8_MIN,
     FLAG_INTS,
+    G8PF,
+    GOUT_ROWS,
     MAX_NPES,
-    NCHA,
+    NCTA_MAX,
+    ctrl_ints,
     ep_shape_supported,
+    inter_rows,
     mega_moe_ep_consts,
 )
 from .mega_moe_ep_kernel import compile_mega_moe_ep
@@ -37,9 +40,11 @@ LDS_LIMIT = 160 * 1024
 # mega_moe/mega_moe_config.INDEXED_PAYLOAD_MIN_MTPR): the receive row = rank*mtpr +
 # token is bounded by npes*mtpr, overflow-proof under any cross-rank routing skew.
 INDEXED_PAYLOAD_MIN_MTPR = 32768
-# NW=8 picks mt=8 (RG=128: each W tile serves twice the rows) over mt=4 when the
-# expected rounds x rows-per-echunk cost is lower; mt=8's per-row GEMM cost relative to
-# mt=4 (8x MI355X: e2e -7% @4096, -10% @8192, +15% @6144 where it needs 2 vs 3 rounds).
+# NW=8 without the K-loop W prefetch (EP_G8PF & 2) picks mt=8 (RG=128: each W tile
+# serves twice the rows) over mt=4 when the expected rounds x rows-per-echunk cost is
+# lower; mt=8's per-row GEMM cost relative to mt=4 (8x MI355X: e2e -7% @4096, -10% @8192,
+# +15% @6144 where it needs 2 vs 3 rounds).  With the prefetch mt=4 always: mt=8 then
+# spills into the K-loop (+9%), mt=4 is -7% (bs8192) .. -18% (bs6144) vs the old pick.
 MT8_EFF = 0.9
 
 
@@ -220,6 +225,8 @@ class MegaMoeEPEngine:
         self._bind_weights(w1, w1_scale, w2, w2_scale)
         props = torch.cuda.get_device_properties(self.device)
         self.n_cta = int(props.multi_processor_count)
+        if self.n_cta > NCTA_MAX:
+            raise ValueError(f"{self.n_cta} CUs > NCTA_MAX={NCTA_MAX} (flag / gout sizing)")
         self.gfx = getattr(props, "gcnArchName", "").split(":")[0]
         if self.gfx != "gfx950":
             raise ValueError(f"fused EP MegaMoE needs gfx950, not {self.gfx}")
@@ -244,7 +251,9 @@ class MegaMoeEPEngine:
         self._out = arena.reserve("out", (self.mtpr, self.H), torch.bfloat16)
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
+        self.ctrl = torch.zeros(
+            ctrl_ints(tot, self.K, self.epr), dtype=torch.int32, device=self.device
+        )
         # Epoch starts at 1: the arena ready-flags are zero-initialized and the waits are
         # serial-number ``flag >= epoch`` (wrap-safe ``before``), so epoch 0 would make
         # every dispatch_wait / combine_wait pass instantly (0 >= 0) and all cross-wave /
@@ -252,31 +261,29 @@ class MegaMoeEPEngine:
         self.epoch = 1
         # Per-CTA GEMM scratch (local, NOT peer-visible): GEMM1 writes the E8M0-quantized
         # intermediate (inter / inters), GEMM2 reads it + writes model-dim bf16 (gout) for
-        # combine_send. Indexed bid*RG*row in the kernel; sized for the largest row tile
-        # (pipelined GEMM1 uses mt in {2,4} -> RG in {32,64}) so a smaller-RG launch
-        # indexes a strict prefix.
-        rg_max = 64
+        # combine_send.
         a_pack = 1 if self.a8 else 2
-        # inter / inters / gout / rowmap / rowidx are indexed by ECHUNK id (0..nch), not
-        # bid: sized for NCHA echunks (the planner's chunk-table capacity) so a launch
-        # whose chunk count exceeds the #CU grid (high bs -> multi-wave) still has distinct
-        # per-echunk storage.
+        # inter / inters / rowmap / rowidx are indexed by ECHUNK id (0..nch) * RG + row, not
+        # bid: sized for the worst-case routing (inter_rows), so any skew fits.
+        # gout is only used when an echunk is n-tile-sharded (P > 1 => nch <= #CTAs):
+        # GOUT_ROWS = NCTA_MAX echunks x GOUT_RG rows.
+        rows_cap = inter_rows(tot, self.K, self.epr)
         self._inter = torch.empty(
-            NCHA * rg_max * (self.I // a_pack), dtype=torch.uint8, device=self.device
+            rows_cap * (self.I // a_pack), dtype=torch.uint8, device=self.device
         )
         self._inters = torch.empty(
-            NCHA * rg_max * (self.I // 32), dtype=torch.uint8, device=self.device
+            rows_cap * (self.I // 32), dtype=torch.uint8, device=self.device
         )
         self._gout = torch.empty(
-            NCHA * rg_max * self.H, dtype=torch.bfloat16, device=self.device
+            GOUT_ROWS * self.H, dtype=torch.bfloat16, device=self.device
         )
         # Per-echunk GEMM1 A-gather source keys written to global by the gather pass:
         # rowmap = payload row (recv_slot // topk) for the V2 ATileLoader indexed gather;
         # rowidx = the full recv_slot (the combine pass recovers route = idx % topk and
         # the source rank/token from it -- read in a later pass so it cannot stay in the
         # per-CTA LDS L_RIX). Indexed echunk*RG + r.
-        self._rowmap = torch.empty(NCHA * rg_max, dtype=torch.int32, device=self.device)
-        self._rowidx = torch.empty(NCHA * rg_max, dtype=torch.int32, device=self.device)
+        self._rowmap = torch.empty(rows_cap, dtype=torch.int32, device=self.device)
+        self._rowidx = torch.empty(rows_cap, dtype=torch.int32, device=self.device)
         # Balanced-gather tables: the planner's pre-pass assigns each received
         # (token,route) pair a GLOBAL per-local-expert position (0..R_e-1 rank via _ecnt
         # atomics) and buckets its recv slot at _rowlist[le*cap + pos] (cap = world*mtpr:
@@ -315,6 +322,8 @@ class MegaMoeEPEngine:
         self._bind_weights(w1, w1_scale, w2, w2_scale)
 
     def _nw8_mt(self, m):
+        if G8PF & 2:
+            return 4
         # Each CTA runs whole echunks (RG rows) in rounds of n_cta, so the critical path is
         # ceil(nch / n_cta) echunks; nch from the uniform-routing rows per local expert.
         rows = m * self.K / self.epr
@@ -329,10 +338,8 @@ class MegaMoeEPEngine:
     def _fit_mt(self, m, nw):
         # The V2 pipelined GEMM1 packs rows in pairs (MfmaScaleGU / AScaleLoader use
         # m_repeat//2 scale groups), so the row tile mt (=m_repeat) must be EVEN.
-        # mt=2 (RG=32) for small/mid batches; mt=4 (RG=64) for large batches so the
-        # per-expert row-chunk count (~received_rows/(RG/2)) stays under the planner's
-        # NCHA LDS chunk table -- otherwise the chunk table overflows past L_EOFF into
-        # L_CTL and corrupts the compute-wave cbar slots (a 2^24-chunk hang).
+        # mt=2 (RG=32) for small/mid batches; mt=4 (RG=64) for large batches (fewer,
+        # fuller echunks).
         # NW=8 inline-A GEMM stages A with all NT=512 threads (16 B/thread), so the A tile
         # RG*A_K_STEP must be >= 512*16 = 8192 B, i.e. RG>=64 -> mt>=4 (low bs just pads
         # to 64 rows, still correct); mt=8 where _nw8_mt's round model favours it.
@@ -357,7 +364,7 @@ class MegaMoeEPEngine:
         cfg = self._cfgs.get(m)
         if cfg is None:
             # Big-M occupancy: NW=8 (all 8 waves MFMA, serial comm) wins once the GEMM
-            # dominates (m >= EP_NW8_MIN, crossover ~2048); NW=4 (comm-overlap) below.
+            # dominates (m >= EP_NW8_MIN, default 1: NW=8 everywhere); NW=4 (comm-overlap) below.
             # EP_NW8=1 forces NW8 everywhere (back-compat / debugging).
             nw = 8 if (EP_NW8 or m >= EP_NW8_MIN) else 4
             cfg = LaunchCfg(
