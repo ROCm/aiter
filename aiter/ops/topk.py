@@ -32,7 +32,8 @@ def topk_gating_fwd(
 
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
 _GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
-_GFX1250_SIGMOID_TOPKS = {4, 8, 16}
+# Top-K and the Top-(K+1) candidates HERD routing hands to fused_moe(herd_topk=K).
+_GFX1250_SIGMOID_TOPKS = {4, 5, 8, 9, 16, 17}
 
 
 def _can_use_gfx1250_exact_sigmoid_topk(
@@ -59,9 +60,11 @@ def _can_use_gfx1250_exact_sigmoid_topk(
         and gating_output.stride(1) == 1
         and gating_output.stride(0) >= experts
     )
+    # An FP32 bias with BF16 logits has no wave32 HIP path: the HIP kernel
+    # reads the bias in the logits' dtype.
     bias_ok = (
         correction_bias.shape == (experts,)
-        and correction_bias.dtype == torch.bfloat16
+        and correction_bias.dtype in (torch.bfloat16, torch.float32)
         and correction_bias.stride(0) == 1
     )
     outputs_ok = (

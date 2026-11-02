@@ -1081,6 +1081,38 @@ def resolve_activation_dtype(
     return q_dtype_a
 
 
+def _herd_finalize_routes(
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    experts: int,
+    herd_topk: int,
+    routed_scaling_factor: float,
+    *,
+    expert_mask: torch.Tensor | None,
+    doweight_stage1: bool,
+    stage2_scatter: Stage2ScatterContext | None,
+    num_local_tokens: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop each row's Top-(K+1) HERD candidates to K renormalized routes."""
+    if get_gfx() != "gfx1250":
+        raise ValueError("herd_topk is supported only on gfx1250")
+    if topk_ids.shape[1] != herd_topk + 1 or topk_weight.shape != topk_ids.shape:
+        raise ValueError("herd_topk requires K+1 candidate IDs and weights per token")
+    if expert_mask is not None or stage2_scatter is not None or doweight_stage1:
+        raise ValueError(
+            "HERD routing requires unmasked routes and doweight_stage1=False"
+        )
+    from aiter.ops.flydsl.herd_topk import herd_finalize_candidates
+
+    return herd_finalize_candidates(
+        topk_weight,
+        topk_ids,
+        experts,
+        routed_scaling_factor,
+        num_valid_rows=num_local_tokens,
+    )
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1126,6 +1158,10 @@ def fused_moe(
     quant_dtype_a2: torch.dtype | None = None,
     # False explicitly selects unclamped shared-expert SiLU semantics.
     clamp_shared: bool = True,
+    # gfx1250 HERD: topk_ids/topk_weight hold Top-(K+1) candidates, finalized
+    # to K = herd_topk routes before the MoE.
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1148,6 +1184,20 @@ def fused_moe(
         )
         or shared_expert_id != -1
     )
+    if herd_topk:
+        if has_shared_expert:
+            raise ValueError("herd_topk does not support fused shared experts")
+        topk_weight, topk_ids = _herd_finalize_routes(
+            topk_weight,
+            topk_ids,
+            get_inter_dim(w1.shape, w2.shape)[0],
+            herd_topk,
+            herd_routed_scaling_factor,
+            expert_mask=expert_mask,
+            doweight_stage1=doweight_stage1,
+            stage2_scatter=stage2_scatter,
+            num_local_tokens=num_local_tokens,
+        )
     if not clamp_shared and not has_shared_expert:
         raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
     if has_shared_expert:
