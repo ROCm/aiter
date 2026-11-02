@@ -68,11 +68,18 @@ inline SelectedImage select_image(const std::string& root,
                                      path.string() + ": " + error.message());
         return result;
     };
-    // Combined roots contain gfx1250/ and/or gfx1250-a0/. A direct profile
+    // Combined roots contain gfx1250/ and/or gfx1250-strict/. A direct profile
     // override names the leaf directory itself. Missing A0 files in a combined
-    // root stay on the A0 path; never fall back to its regular sibling.
-    const bool combined = is_directory(base / family) || is_directory(base / (family + "-a0"));
-    const auto directory = combined ? base / (a0 ? family + "-a0" : family) : base;
+    // root stay on the A0 path; never fall back to its regular sibling. The
+    // pre-rename gfx1250-a0/ spelling is still read for existing checkouts.
+    const std::filesystem::path strict_dir = base / (family + "-strict");
+    const std::filesystem::path legacy_a0_dir = base / (family + "-a0");
+    const bool has_strict = is_directory(strict_dir);
+    const bool has_legacy_a0 = is_directory(legacy_a0_dir);
+    const bool combined =
+        is_directory(base / family) || has_strict || has_legacy_a0;
+    const auto a0_dir = has_strict ? strict_dir : (has_legacy_a0 ? legacy_a0_dir : strict_dir);
+    const auto directory = combined ? (a0 ? a0_dir : base / family) : base;
     return {(directory / (symbol + ".co")).lexically_normal().string(),
             asic_revision, a0 ? 0xebu : 0x49u};
 }
@@ -90,8 +97,9 @@ inline std::optional<SelectedImage> select_regular_fallback(const std::string& r
     std::vector<std::filesystem::path> candidates;
     // Combined root: <root>/gfx1250/<symbol>.co
     candidates.push_back(base / family / (symbol + ".co"));
-    // Direct A0 leaf: <root>/../gfx1250/<symbol>.co
-    if(base.filename() == family + "-a0" && base.has_parent_path())
+    // Direct A0 leaf (current or legacy spelling): <root>/../gfx1250/<symbol>.co
+    if((base.filename() == family + "-strict" || base.filename() == family + "-a0") &&
+       base.has_parent_path())
         candidates.push_back(base.parent_path() / family / (symbol + ".co"));
     for(const auto& candidate : candidates) {
         std::error_code error;

@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
     const auto alternate = work / "alternate";
     for(const auto& base : {root, alternate}) {
         write_image(base / "gfx1250" / (symbol + ".co"), 0x49);
-        write_image(base / "gfx1250-a0" / (symbol + ".co"), 0xeb);
+        write_image(base / "gfx1250-strict" / (symbol + ".co"), 0xeb);
     }
     setenv("OPUS_GEN_CO_DIR", root.c_str(), 1);
     auto* a0 = &opus_gfx1250_co::co_kernel(symbol, 0);
@@ -108,14 +108,14 @@ int main(int argc, char** argv) {
     assert(b0 != a0 && test_state::state().created == 2);
     test_state::device = 0;
     assert(&opus_gfx1250_co::co_kernel(symbol, 0) == a0);
-    setenv("OPUS_GEN_CO_DIR", (root / "gfx1250-a0").c_str(), 1);
+    setenv("OPUS_GEN_CO_DIR", (root / "gfx1250-strict").c_str(), 1);
     assert(&opus_gfx1250_co::co_kernel(symbol, 0) == a0);
     setenv("OPUS_GEN_CO_DIR", alternate.c_str(), 1);
     auto* other = &opus_gfx1250_co::co_kernel(symbol, 0);
     assert(other != a0 && test_state::state().created == 3);
 
     const auto retry_root = work / "retry";
-    write_image(retry_root / "gfx1250-a0" / (symbol + ".co"), 0xeb);
+    write_image(retry_root / "gfx1250-strict" / (symbol + ".co"), 0xeb);
     setenv("OPUS_GEN_CO_DIR", retry_root.c_str(), 1);
     test_state::state().fail = true;
     bool failed = false;
@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     // so the loader must fall back to the already-validated regular 0x49 image.
     const auto oldrt = work / "oldrt";
     write_image(oldrt / "gfx1250" / (symbol + ".co"), 0x49);
-    write_image(oldrt / "gfx1250-a0" / (symbol + ".co"), 0xeb);
+    write_image(oldrt / "gfx1250-strict" / (symbol + ".co"), 0xeb);
     setenv("OPUS_GEN_CO_DIR", oldrt.c_str(), 1);
     test_state::state().strict_unloadable = true;
     auto* fallback = &opus_gfx1250_co::co_kernel(symbol, 0);
@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
     // New HIP runtime: strict 0xeb is loadable and stays preferred.
     const auto newrt = work / "newrt";
     write_image(newrt / "gfx1250" / (symbol + ".co"), 0x49);
-    write_image(newrt / "gfx1250-a0" / (symbol + ".co"), 0xeb);
+    write_image(newrt / "gfx1250-strict" / (symbol + ".co"), 0xeb);
     setenv("OPUS_GEN_CO_DIR", newrt.c_str(), 1);
     auto* strict_pref = &opus_gfx1250_co::co_kernel(symbol, 0);
     assert(strict_pref != fallback);

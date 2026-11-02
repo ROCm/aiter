@@ -237,21 +237,23 @@ previous explicit-candidate path. The additional 221 A0 images are separate:
 | runtime image root | compiler target | ELF processor |
 |---|---|---|
 | `gen_co/` or `gen_co/named_reg/` | `gfx1250` | `0x49` |
-| `gen_co/gfx1250-a0/` | `gfx1250-strict` | `0xeb` |
+| `gen_co/gfx1250-strict/` | `gfx1250-strict` | `0xeb` |
 
-The runtime architecture remains `gfx1250`; strict is a distinct compiler CPU,
-not a runtime architecture name or a relabelled regular object. Both profiles retain
-exactly the same manifest kids, symbols and 64-byte ABI.
+The A0 profile is compiled with `--offload-arch=gfx1250-strict` and stored under
+`gfx1250-strict/`. The runtime id may still be reported as `gfx1250` by older
+`rocm_agent_enumerator` builds, or as `gfx1250-strict` by newer ROCr stacks; the
+loader accepts both and keeps one logical CO set. Both profiles retain exactly
+the same manifest kids, symbols and 64-byte ABI.
 
 The default loader now selects per **current HIP device** using its ASIC
 Revision (the same HSA field printed by `rocminfo`, not PCI/chip revision):
-`0x0` selects `gen_co/gfx1250-a0/`; `0x1` and later select
+`0x0` selects `gen_co/gfx1250-strict/`; `0x1` and later select
 `gen_co/gfx1250/`. No stepping-specific kid or manual environment setting is
 needed. The lookup uses HIP device ordinals, so visibility remapping and mixed
 A0/B0 nodes do not use a node-wide minimum.
 
-`OPUS_GEN_CO_DIR` can name a combined root containing `gfx1250-a0/` and
-`gfx1250/`, or a direct profile leaf such as `gen_co/gfx1250-a0/`. A direct leaf
+`OPUS_GEN_CO_DIR` can name a combined root containing `gfx1250-strict/` and
+`gfx1250/`, or a direct profile leaf such as `gen_co/gfx1250-strict/`. A direct leaf
 is read without adding another subdirectory, but its ELF processor must match the detected
 stepping. Missing/wrong A0 images fail clearly rather than falling back to B0.
 
@@ -295,7 +297,7 @@ python3 -m pytest -q op_tests/test_opus_co_integration.py
 # Optional explicit combined root; selection remains device-aware:
 export OPUS_GEN_CO_DIR="$PWD/csrc/opus_gemm/gen_co"
 
-# Rebuild A0 separately; the default output is gen_co/gfx1250-a0/:
+# Rebuild A0 separately; the default output is gen_co/gfx1250-strict/:
 python3 csrc/opus_gemm/gen_co/build_co.py --llvm-bin /path/to/hybrid/bin \
     --offload-arch=gfx1250-strict --fail-on-spill
 ```
@@ -326,7 +328,7 @@ candidate/A0 `asm/` directories are excluded from wheels as well.
 ## Runtime
 
 [`opus_co_launch_gfx1250.cuh`](../include/gfx1250/opus_co_launch_gfx1250.cuh)
-selects `$OPUS_GEN_CO_DIR/gfx1250-a0/<name>.co` for current-device ASIC
+selects `$OPUS_GEN_CO_DIR/gfx1250-strict/<name>.co` for current-device ASIC
 Revision 0, or `$OPUS_GEN_CO_DIR/gfx1250/<name>.co` for Revision 1 and later
 (direct-profile overrides are validated too). It registers once per device and
 resolved path, then launches via `AiterAsmKernelFast` + `hipDrvLaunchKernelEx`.

@@ -18,7 +18,7 @@
 
 // Python exports the installed base root. The compiled macro is only a fallback
 // for callers without Python (a wheel build-tree macro may no longer exist).
-// ASIC Revision 0 selects its gfx1250-a0/ directory; B0+ selects gfx1250/.
+// ASIC Revision 0 selects its gfx1250-strict/ directory; B0+ selects gfx1250/.
 #ifndef OPUS_GEN_CO_DIR
 #define OPUS_GEN_CO_DIR ""
 #endif

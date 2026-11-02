@@ -20,12 +20,15 @@ includes libc/libunwind common headers needed by this LLVM/LLD revision.
 | profile | entries | compiler target | actual ELF processor | runtime root |
 |---|---:|---|---|---|
 | regular | 221 | `gfx1250` | `0x49` | `gen_co/` |
-| A0 | 221 | `gfx1250-strict` | `0xeb` | `gen_co/gfx1250-a0/` |
+| A0 | 221 | `gfx1250-strict` | `0xeb` | `gen_co/gfx1250-strict/` |
 
 The regular files are also mirrored in `gen_co/named_reg/` to retain the previous
 explicit-root interface. Regular images use `gfx1250/`; A0 images use the flat
-sibling `gfx1250-a0/`. The logical runtime architecture remains gfx1250. Kids, filenames, exported symbols,
-launch bounds, cluster dimensions, and the 64-byte argument structure are stable.
+sibling `gfx1250-strict/`, named after their compiler target. The runtime id can
+be reported as `gfx1250` by older `rocm_agent_enumerator` builds or as
+`gfx1250-strict` by newer ROCr stacks; both select the same logical CO set. Kids,
+filenames, exported symbols, launch bounds, cluster dimensions, and the 64-byte
+argument structure are stable.
 
 Each profile contains **87,968 WMMA instructions**, all with actual destinations
 inside the requested accumulator/output register banks. Every file passed:
@@ -94,14 +97,14 @@ used by the failing extended-test job also reports HIP `7.16.26315`
 (`torch.version.hip=7.16.26315`), which explains its
 `kernel registration failed for 'opus_gemm_gfx1250_4wave_wl_co_...': invalid
 device function` on an A0 node: the loader correctly selected
-`gen_co/gfx1250-a0/`, but the CI runtime was too old to load it.
+`gen_co/gfx1250-strict/`, but the CI runtime was too old to load it.
 
 ### Automatic regular-CO fallback on old runtimes
 
 The loader now keeps old-ROCm A0 nodes working without changing the strict
 preference on new runtimes:
 
-1. On ASIC Revision 0 it first selects `gen_co/gfx1250-a0/`.
+1. On ASIC Revision 0 it first selects `gen_co/gfx1250-strict/`.
 2. It checks that image with `hipModuleLoadData`. If the runtime rejects the
    strict ELF (`hipErrorNoBinaryForGpu` / `invalid device function`), and a
    regular `gen_co/gfx1250/<symbol>.co` exists, it transparently falls back to
@@ -171,7 +174,7 @@ Details and exact reproduction commands are in
 
 The host CO loader now reads the current HIP device's `hipDeviceProp_t.asicRevision`,
 the same HSA ASIC Revision field printed by `rocminfo`: `0x0` selects the A0
-`gfx1250-a0/` subtree and `0x1` (or later) selects regular `gfx1250/`. It does not
+`gfx1250-strict/` subtree and `0x1` (or later) selects regular `gfx1250/`. It does not
 read PCI/chip revision, take the minimum across devices, or spawn `rocminfo`.
 Default imports export the combined root, so manual A0/B0 environment switching
 is no longer needed and the exact kid/symbol remains the same.
@@ -204,7 +207,7 @@ python3 csrc/opus_gemm/gen_co/build_co.py --llvm-bin /path/to/hybrid/bin \
   --offload-arch=gfx1250 --out-dir csrc/opus_gemm/gen_co/gfx1250 \
   --jobs=24 --fail-on-spill
 python3 csrc/opus_gemm/gen_co/build_co.py --llvm-bin /path/to/hybrid/bin \
-  --offload-arch=gfx1250-strict --out-dir csrc/opus_gemm/gen_co/gfx1250-a0 \
+  --offload-arch=gfx1250-strict --out-dir csrc/opus_gemm/gen_co/gfx1250-strict \
   --jobs=24 --fail-on-spill
 
 # Rebuild the host launcher for the automatic selector; device COs are unchanged.

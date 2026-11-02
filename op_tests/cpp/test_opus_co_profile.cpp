@@ -27,14 +27,14 @@ template<class F> void must_throw(F f) {
 int main(int argc, char** argv) {
     assert(argc == 2);
     const auto work = fs::absolute(argv[1]).lexically_normal();
-    fs::create_directories(work / "combined" / "gfx1250-a0");
+    fs::create_directories(work / "combined" / "gfx1250-strict");
     fs::create_directories(work / "combined" / "gfx1250");
     fs::create_directories(work / "flat-a0");
     const auto base = work / "combined";
     const std::string symbol = "kid_496_same_symbol";
     const auto a0 = select_image(base.string(), "gfx1250", 0, symbol);
     const auto b0 = select_image(base.string(), "gfx1250", 1, symbol);
-    assert(a0.path == (base / "gfx1250-a0" / (symbol + ".co")).string());
+    assert(a0.path == (base / "gfx1250-strict" / (symbol + ".co")).string());
     assert(b0.path == (base / "gfx1250" / (symbol + ".co")).string());
     assert(fs::path(a0.path).filename() == fs::path(b0.path).filename());
     assert(a0.processor == 0xeb && b0.processor == 0x49);
@@ -62,8 +62,15 @@ int main(int argc, char** argv) {
     assert(a0_strict.path == a0.path && a0_strict.processor == 0xeb);
     assert(b0_strict.path == b0.path && b0_strict.processor == 0x49);
 
+    // Existing checkouts with the pre-rename gfx1250-a0/ directory keep working.
+    fs::create_directories(work / "legacy" / "gfx1250-a0");
+    fs::create_directories(work / "legacy" / "gfx1250");
+    const auto legacy = select_image((work / "legacy").string(), "gfx1250", 0, symbol);
+    assert(legacy.path == (work / "legacy" / "gfx1250-a0" / (symbol + ".co")).string());
+    assert(legacy.processor == 0xeb);
+
     // Direct-profile overrides never append a0 twice.
-    assert(select_image((base / "gfx1250-a0").string(), "gfx1250", 0, symbol).path == a0.path);
+    assert(select_image((base / "gfx1250-strict").string(), "gfx1250", 0, symbol).path == a0.path);
     const auto flat = select_image((work / "flat-a0").string(), "gfx1250", 0, symbol);
     assert(flat.path == (work / "flat-a0" / (symbol + ".co")).string());
     validate_image_profile(elf(0xeb), flat);
@@ -87,10 +94,10 @@ int main(int argc, char** argv) {
     const auto strict_fallback =
         select_regular_fallback(base.string(), "gfx1250-strict:sramecc+", symbol);
     assert(strict_fallback.has_value() && strict_fallback->path == fallback->path);
-    const auto leaf = select_regular_fallback((base / "gfx1250-a0").string(), "gfx1250", symbol);
+    const auto leaf = select_regular_fallback((base / "gfx1250-strict").string(), "gfx1250", symbol);
     assert(leaf.has_value() && leaf->path == fallback->path);
     const auto strict_leaf =
-        select_regular_fallback((base / "gfx1250-a0").string(), "gfx1250-strict", symbol);
+        select_regular_fallback((base / "gfx1250-strict").string(), "gfx1250-strict", symbol);
     assert(strict_leaf.has_value() && strict_leaf->path == fallback->path);
     assert(!select_regular_fallback((work / "flat-a0").string(), "gfx1250", symbol).has_value());
 
