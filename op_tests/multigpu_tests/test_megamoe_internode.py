@@ -3,7 +3,7 @@
 """EP16 inter-node MegaMoE tile test: accuracy and performance in one pass.
 
 Launch one torchrun per node (2 nodes x 8 GPUs); see
-scripts/megamoe_tile/run_internode_test.sh.  Every (TPR, fixture) case of one
+scripts/megamoe_internode/run_internode_test.sh.  Every (TPR, fixture) case of one
 network runs in this process, largest TPR first:
 
   check      fused eager output vs the MORI A4W4 reference built on the same
@@ -48,13 +48,21 @@ NETWORKS = {
         activation="silu", swiglu_limit=10.0, smallop_quant="a8w4",
         fmoe_csv="aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv",
     ),
+    # DeepSeek-V4.1-Flash (config.json: hidden 5120, moe_intermediate 2304, 384 routed
+    # experts, top-6, SwiGLU limit 10).  The fused_moe tables carry no EP16 row
+    # (24 experts/rank): run the small-op baseline with --allow-tune-miss.
+    "dsv41_flash": dict(
+        model_dim=5120, inter_dim=2304, experts=384, topk=6,
+        activation="silu", swiglu_limit=10.0, smallop_quant="a8w4",
+        fmoe_csv="aiter/configs/model_configs/dsv41_fp8fp4_tuned_fmoe.csv",
+    ),
 }
 EP_SIZE, GPUS_PER_NODE = 16, 8
 
-# Per-shape knobs come from the tune tables (megamoe_tile_stage{1,2}_tuned.csv,
+# Per-shape knobs come from the tune tables (megamoe_internode_stage{1,2}_tuned.csv,
 # else the built-in rule).  A sweep passes --set <key>=<its own table>; the
 # guard resolves the same table, so it stays on for those.
-TILE_ENV_KEYS = ("AITER_CONFIG_MEGAMOE_TILE_STAGE1", "AITER_CONFIG_MEGAMOE_TILE_STAGE2")
+TILE_ENV_KEYS = ("AITER_CONFIG_MEGAMOE_INTERNODE_STAGE1", "AITER_CONFIG_MEGAMOE_INTERNODE_STAGE2")
 
 SMALLOP_ENV = {
     "a4w4": {"AITER_SITUV2_A4W4": "1", "AITER_SITUV2_A8W4": "0"},
@@ -78,6 +86,8 @@ def parse_args(argv=None):
     p.add_argument("--tpr-list", default="512", help="tokens per rank, comma separated")
     p.add_argument("--fixtures", default="eplb,random",
                    help="route fixtures, comma separated: eplb, random, permuted")
+    p.add_argument("--route-file", default="",
+                   help="file fixture: DIR:KEY:CHUNK (routes dumped from a serving run)")
     p.add_argument("--paths", default="fused,smallop",
                    help="fused and/or smallop, comma separated")
     p.add_argument("--timing", default="total,breakdown",
@@ -101,12 +111,6 @@ def parse_args(argv=None):
     p.add_argument("--set", dest="env_set", action="append", default=[], metavar="KEY=VALUE",
                    help="env override (repeatable); anything but a tile tune table "
                         "disables the kernel-name guard")
-    p.add_argument("--variants", default="",
-                   help="A/B in one process: 'name:key=v,key=v;name2:key=v' where keys are "
-                        "MegaMoEInternode stage1_overrides (tile_ready, waves_per_eu, lite_sync, "
-                        "acq_one_wave, fan_wt; empty body = defaults). Each case rebuilds the fused "
-                        "operator per variant, interleaved over --rounds; checks run in round 0")
-    p.add_argument("--rounds", type=int, default=1, help="rounds of --variants")
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--out-dir", default="trace_data/internode")
     p.add_argument("--tag", default="run")
@@ -114,7 +118,7 @@ def parse_args(argv=None):
     args.paths = split_choices(p, "--paths", args.paths, ("fused", "smallop"))
     args.timing = split_choices(p, "--timing", args.timing, ("total", "breakdown", "none"))
     args.timing.discard("none")
-    fixtures = split_choices(p, "--fixtures", args.fixtures, ("eplb", "random", "permuted"))
+    fixtures = split_choices(p, "--fixtures", args.fixtures, ("eplb", "random", "permuted", "file"))
     # The CCO symmetric memory is pooled and only grows, so the largest window
     # goes first: TPR descending, and eplb (route cap 1) last within a TPR.
     args.fixtures = sorted(fixtures, key=lambda f: (f == "eplb", f))
@@ -123,37 +127,7 @@ def parse_args(argv=None):
         p.error("--tpr-list is empty")
     if not 1 <= args.prof_tail <= args.prof_replays or args.iters < 1:
         p.error("need iters >= 1 and 1 <= prof-tail <= prof-replays")
-    args.variant_list = parse_variants(p, args.variants)
-    if args.variant_list and "fused" not in args.paths:
-        p.error("--variants needs the fused path")
-    if args.rounds < 1:
-        p.error("--rounds must be >= 1")
     return args
-
-
-_OVERRIDE_KEYS = {"tile_ready": int, "waves_per_eu": int, "lite_sync": int, "acq_one_wave": int,
-                  "fan_wt": int}
-
-
-def parse_variants(parser, value):
-    out = []
-    for group in (g.strip() for g in value.split(";")):
-        if not group:
-            continue
-        name, sep, body = group.partition(":")
-        if not sep or not name:
-            parser.error(f"--variants group needs 'name:key=v,...', got {group!r}")
-        ovr = {}
-        for item in (i for i in body.split(",") if i):
-            key, eq, val = item.partition("=")
-            if not eq or key not in _OVERRIDE_KEYS:
-                parser.error(f"--variants expects key=value with key in {sorted(_OVERRIDE_KEYS)}, got {item!r}")
-            v = _OVERRIDE_KEYS[key](val)
-            ovr[key] = bool(v) if key != "waves_per_eu" else v
-        out.append((name, ovr))
-    if len({n for n, _ in out}) != len(out):
-        parser.error("--variants names must be unique")
-    return out
 
 
 def split_choices(parser, flag, value, allowed):
@@ -200,6 +174,8 @@ def fixture_route(fixture, topk):
         if topk != 16:
             raise ValueError("the permuted fixture tables are defined for topk=16 only")
         return "permuted-arbitrary-topk", 4
+    if fixture == "file":
+        return "file", topk
     return "rank-balanced-hot", topk
 
 
@@ -208,7 +184,7 @@ def fixture_route(fixture, topk):
 # --------------------------------------------------------------------------
 
 def stage1_tile(net, tpr):
-    from aiter.ops.flydsl.kernels.megamoe_tile.stage1_tune import resolve_stage1_tile
+    from aiter.ops.flydsl.kernels.megamoe_internode.mega_moe_internode_config import resolve_stage1_tile
 
     return resolve_stage1_tile(token=tpr * net["topk"], model_dim=net["model_dim"],
                                inter_dim=net["inter_dim"], expert=net["experts"] // EP_SIZE,
@@ -218,7 +194,7 @@ def stage1_tile(net, tpr):
 def stage2_tile(net, tpr):
     """GEMM2 (kernel1) N tile, resolved exactly as the operator does."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
-    from aiter.ops.flydsl.kernels.megamoe_tile.stage2_tune import (
+    from aiter.ops.flydsl.kernels.megamoe_internode.mega_moe_internode_config import (
         lookup_stage2_tune, resolve_gemm2_bn, resolve_gemm2_cu)
 
     tuned = lookup_stage2_tune(gfx=get_gfx_runtime(), cu_num=get_cu_num(),
@@ -235,10 +211,10 @@ def stage2_tile(net, tpr):
 def tile_fragments(tile):
     """(must contain, must not contain) kernel-name fragments for a tile config."""
     g = tile["tile_group"]
-    # gmm1_bn (256) and compute_first (8) are constants: no _gbn, always _cf8.
+    # The first GMM1 ticket (8) is a kernel constant: always _cf8.
     # _slg / _nsl stands for split_local together with its companion switches.
     has = ([f"_tg{g}"] if g != 1 else []) + [
-        f"_cf{tile['compute_first']}", f"_fos{tile['fanout_shards']}",
+        "_cf8", f"_fos{tile['fanout_shards']}",
         "_slg" if tile["split_local"] else "_nsl"]
     lacks = ([] if g != 1 else ["_tg"]) + ["_gbn", "_nsl" if tile["split_local"] else "_slg"]
     return has, lacks
@@ -319,14 +295,14 @@ class _BorrowedMemory:
 
 
 class PooledCommunicator:
-    def __init__(self, rank, world):
+    def __init__(self, rank, world, per_rank_vmm=16 * 1024**3):
         import torch.distributed as dist
         from mori.cco import Communicator, UniqueId
 
         payload = [bytes(Communicator.get_unique_id()) if rank == 0 else None]
         dist.broadcast_object_list(payload, src=0)
         self._comm = Communicator.init(world, rank, UniqueId.from_bytes(payload[0]),
-                                       per_rank_vmm=16 * 1024**3)
+                                       per_rank_vmm=per_rank_vmm)
         self._memory = None
 
     def __getattr__(self, name):
@@ -405,7 +381,7 @@ class MoriSmallOp:
             # expert IDs lose contributions; the eager reference sums their
             # weights instead (valid since doweight_stage1=False).  The candidate
             # keeps the original slots.
-            from op_tests.multigpu_tests.megamoe_tile_ep16_inputs import (
+            from op_tests.multigpu_tests.megamoe_internode_inputs import (
                 coalesce_reference_routes)
 
             ids, weights = coalesce_reference_routes(
@@ -472,7 +448,7 @@ def time_replays(torch, dist, graph, device, warmup, iters):
 
 
 def kernel_class(name):
-    if "megamoe_tile_ep16_stage1" in name:
+    if "megamoe_stage1" in name:
         return "stage1"
     if name.startswith("megamoe_k1"):             # fused kernel1: GEMM2 + push
         return "gemm2"
@@ -562,10 +538,14 @@ class Runner:
     def __init__(self, args, net):
         import torch
         import torch.distributed as dist
-        from op_tests.multigpu_tests import megamoe_tile_ep16_inputs as inputs
+        from op_tests.multigpu_tests import megamoe_internode_inputs as inputs
 
         self.torch, self.dist, self.args, self.net = torch, dist, args, net
         self.inputs = inputs
+        if args.route_file:
+            parts = args.route_file.split(":")  # DIR:KEY:CHUNK[:BALANCE_FROM_KEY[:inv]]
+            inputs.ROUTE_FILE = (parts[0], parts[1], int(parts[2]),
+                                 parts[3] if len(parts) > 3 else "", parts[4] if len(parts) > 4 else "")
         self.out_root = Path(args.out_dir) / args.tag
         self.out_root.mkdir(parents=True, exist_ok=True)
         self.rank, world, self.device = inputs.setup_dist(str(self.out_root / "preflight"))
@@ -573,7 +553,7 @@ class Runner:
             raise ValueError(f"EP16 needs {EP_SIZE} ranks, got {world}")
         self.tune_log = TuneLog()
         logging.getLogger("aiter").addHandler(self.tune_log)
-        self.guard = (not args.variant_list) and all(
+        self.guard = all(
             item.partition("=")[0] in TILE_ENV_KEYS for item in args.env_set)
         self.comm = None          # created by the first fused case
         # Weights depend on the shape only: prepare them once for every case.
@@ -621,9 +601,11 @@ class Runner:
 
     def check_routes(self, shape, shared, fixture, cap):
         torch, epr = self.torch, shape.local_experts
-        owners = torch.div(shared.topk_ids.long(), epr, rounding_mode="floor")
+        ids = shared.topk_ids.long()
+        valid = ids >= 0  # -1 = invalid slot (no route)
+        owners = torch.div(ids.clamp_min(0), epr, rounding_mode="floor")
         per_rank = torch.zeros((shape.tokens, EP_SIZE), dtype=torch.int64, device=owners.device)
-        per_rank.scatter_add_(1, owners, torch.ones_like(owners))
+        per_rank.scatter_add_(1, owners, valid.long())
         if int(per_rank.max()) > cap:
             raise ValueError(f"{fixture}: {int(per_rank.max())} routes to one rank, cap {cap}")
         if fixture == "eplb":
@@ -651,10 +633,7 @@ class Runner:
         if (args.check and "fused" in args.paths) or (quant == "a4w4" and "smallop" in args.paths):
             reference = MoriSmallOp("a4w4", shape, shared, self.rank,
                                     swiglu_limit=net["swiglu_limit"])
-        if "fused" in args.paths and args.variant_list:
-            rec["variants"] = self.run_variants(shape, shared, cap, reference, fixture)
-            rec["fused"] = rec["variants"][args.variant_list[0][0]][0]
-        elif "fused" in args.paths:
+        if "fused" in args.paths:
             rec["fused"] = self.run_fused(shape, shared, cap, reference, fixture)
         if "smallop" in args.paths:
             small = reference if quant == "a4w4" else MoriSmallOp(
@@ -668,43 +647,30 @@ class Runner:
         self.torch.cuda.empty_cache()
         return rec
 
-    def run_variants(self, shape, shared, cap, reference, fixture):
-        """Interleave the variants round by round; each builds the operator with its overrides."""
-        out = {name: [] for name, _ in self.args.variant_list}
-        for rnd in range(self.args.rounds):
-            for name, ovr in self.args.variant_list:
-                res = self.run_fused(shape, shared, cap, reference, fixture,
-                                     check=self.args.check and rnd == 0,
-                                     case_tag=f"{name}_r{rnd}", stage1_overrides=ovr)
-                if self.rank == 0:
-                    print(f"[VARIANT] t{shape.tokens} {fixture} round {rnd} {name}: "
-                          f"total {fmt((res.get('total') or {}).get('min'))} "
-                          f"{variant_segments(res)} ok={res.get('ok')}", flush=True)
-                out[name].append(res)
-        return out
-
-    def run_fused(self, shape, shared, cap, reference, fixture, check=None, case_tag="",
-                  stage1_overrides=None):
-        from aiter.ops.flydsl.kernels.megamoe_tile import MegaMoEInternode
+    def run_fused(self, shape, shared, cap, reference, fixture):
+        from aiter.ops.flydsl.kernels.megamoe_internode import MegaMoEInternode
 
         torch, dist, args, device = self.torch, self.dist, self.args, self.device
         tokens = shape.tokens
         w = shared.prepared_weights
         if self.comm is None:
-            self.comm = PooledCommunicator(self.rank, EP_SIZE)
+            # TPR 16384 needs a ~30 GiB window (K3/DSv4); the pool lives for the
+            # whole run, so size it for the largest TPR of the run.
+            vmm = 40 * 1024**3 if max(self.args.tprs) > 4096 else 16 * 1024**3
+            self.comm = PooledCommunicator(self.rank, EP_SIZE, per_rank_vmm=vmm)
         op = MegaMoEInternode(
             rank=self.rank, world_size=EP_SIZE, model_dim=shape.hidden, inter_dim=shape.inter,
             experts=shape.experts, topk=shape.topk, quant="a4w4", w1=w.w1, w1_scale=w.w1_scale,
             w2=w.w2, w2_scale=w.w2_scale, max_tok_per_rank=tokens,
             swiglu_limit=self.net["swiglu_limit"], activation=shape.activation,
             comm_quant=args.comm_quant, communicator=self.comm,
-            max_routes_per_token_per_rank=cap, stage1_overrides=stage1_overrides)
+            max_routes_per_token_per_rank=cap)
         res = {"stage1_kernel": op.stage1_kernel_name,
                "stage1_tile": stage1_tile(self.net, tokens),
                "stage2_tile": stage2_tile(self.net, tokens), "checks": []}
         coalesce = fixture == "permuted"
         graph = None
-        do_check = args.check if check is None else check
+        do_check = args.check
         try:
             call = lambda: op.forward(shared.x, shared.route_weights, shared.topk_ids)
 
@@ -740,14 +706,19 @@ class Runner:
                 replay_vs("restored_input", eager, 1e-2)
                 # Swapping the two expert nodes keeps each token's per-rank route
                 # count; local-only routes become remote and stale payload must clear.
+                # Invalid (-1) slots stay invalid: shifting them would route every
+                # pad slot of every token to one expert (duplicate ids, overflow).
                 original_ids = shared.topk_ids.clone()
-                shared.topk_ids.copy_((original_ids + shape.experts // 2) % shape.experts)
+                shared.topk_ids.copy_(torch.where(
+                    original_ids >= 0,
+                    (original_ids + shape.experts // 2) % shape.experts,
+                    original_ids))
                 replay_vs("swapped_routing", ref_forward(), thr)
                 shared.topk_ids.copy_(original_ids)
                 replay_vs("restored_routing", eager, 1e-2)
             ok = all(c["ok"] for c in checks)
             if ok:
-                self.time_path(res, graph, f"fused_t{tokens}_{fixture}{case_tag and '_' + case_tag}")
+                self.time_path(res, graph, f"fused_t{tokens}_{fixture}")
                 if do_check:
                     replay_vs("after_timing", eager, 1e-2)
                     ok = checks[-1]["ok"]
@@ -808,8 +779,6 @@ class Runner:
                     failed |= print_case(self.net, self.args, rec)
         if self.rank == 0:
             print_summary(self.args, self.results)
-            if self.args.variant_list:
-                print_variants(self.args, self.results)
             out = self.out_root / "results.json"
             out.write_text(json.dumps({"args": {k: sorted(v) if isinstance(v, set) else v
                                                 for k, v in vars(self.args).items()},
@@ -936,45 +905,6 @@ def print_case(net, args, rec):
             p(f"    {t['example']}")
         failed |= not small["ok"]
     return failed
-
-
-VARIANT_SEGS = ("stage1", "gemm2", "k2", "stage2")
-
-
-def variant_segments(res):
-    b = res.get("breakdown") or {}
-    return " ".join(f"{k} {fmt(b.get(k))}" for k in VARIANT_SEGS if k in b)
-
-
-def print_variants(args, results):
-    """Per case: each variant's per-round total (per-rank min, mean over ranks)
-    and the round means of total and the breakdown rows."""
-    print("[VARIANTS] us; rounds interleaved in one process; 'd' = mean minus the first variant's",
-          flush=True)
-    for rec in results:
-        var = rec.get("variants")
-        if not var:
-            continue
-        print(f"  TPR {rec['tpr']} {rec['fixture']}", flush=True)
-        base = None
-        for name, _ in args.variant_list:
-            runs = var[name]
-            tot = [(r.get("total") or {}).get("min") for r in runs]
-            tot_ok = [t for t in tot if t is not None]
-            mean = statistics.mean(tot_ok) if tot_ok else None
-            segs = []
-            for k in VARIANT_SEGS:
-                vals = [(r.get("breakdown") or {}).get(k) for r in runs]
-                vals = [v for v in vals if v is not None]
-                if vals:
-                    segs.append(f"{k} {statistics.mean(vals):.1f}")
-            if base is None:
-                base = mean
-            d = "" if mean is None or base is None or name == args.variant_list[0][0] \
-                else f"  d {mean - base:+.1f}"
-            ok = all(r.get("ok", False) for r in runs)
-            print(f"    {name:<10} total {' / '.join(fmt(t) for t in tot)}  mean {fmt(mean)}{d}"
-                  f"  | {'  '.join(segs)}{'' if ok else '  FAIL'}", flush=True)
 
 
 def print_summary(args, results):

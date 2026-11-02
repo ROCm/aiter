@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Inputs of the EP16 MegaMoE tile test (test_megamoe_tile_internode.py).
+"""Inputs of the EP16 MegaMoE tile test (test_megamoe_internode.py).
 
 Process setup with the GPU-occupancy preflight, the route fixtures, the packed
 A4W4 weights and the duplicate-expert coalescing of the eager reference.
@@ -201,7 +201,53 @@ def _balanced_routes(shape, rank, generator, device, *, per_node_group):
     return topk_ids, route_weights
 
 
-ROUTE_PATTERNS = ("rank-balanced-hot", "cross_node", "eplb-balanced", "permuted-arbitrary-topk")
+ROUTE_PATTERNS = ("rank-balanced-hot", "cross_node", "eplb-balanced", "permuted-arbitrary-topk", "file")
+
+# "file": replay routes dumped from a serving run.  Set by the test driver:
+# (directory, key such as "s3_l45", chunk index); each rank reads
+# <dir>/<key>_rank<r>.pt and takes rows [chunk*tokens, (chunk+1)*tokens).
+ROUTE_FILE = None
+
+
+def _balanced_perm(d, key, experts, ep_size):
+    """EPLB-r0-like placement: logical expert -> physical id, greedy by load."""
+    load = torch.zeros(experts, dtype=torch.long)
+    for r in range(ep_size):
+        ids = torch.load(f"{d}/{key}_rank{r}.pt")["ids"].long().flatten()
+        load += torch.bincount(ids[ids >= 0], minlength=experts)
+    epr = experts // ep_size
+    rank_load = [0] * ep_size
+    slots = [0] * ep_size
+    phys = torch.empty(experts, dtype=torch.int32)
+    for e in torch.argsort(load, descending=True).tolist():
+        r = min((r for r in range(ep_size) if slots[r] < epr), key=lambda r: rank_load[r])
+        phys[e] = r * epr + slots[r]
+        slots[r] += 1
+        rank_load[r] += int(load[e])
+    return phys
+
+
+def _file_routes(shape, rank, device):
+    d, key, chunk = ROUTE_FILE[:3]
+    blob = torch.load(f"{d}/{key}_rank{rank}.pt")
+    ids, wts = blob["ids"].to(torch.int32), blob["wts"].to(torch.float32)
+    if len(ROUTE_FILE) > 3 and ROUTE_FILE[3]:
+        phys = _balanced_perm(d, ROUTE_FILE[3], shape.experts, shape.ep_size)
+        ids = torch.where(ids >= 0, phys[ids.clamp_min(0).long()], ids)
+    rows = ids[chunk * shape.tokens:(chunk + 1) * shape.tokens]
+    w = wts[chunk * shape.tokens:(chunk + 1) * shape.tokens]
+    epr = shape.local_experts
+    invalid_pad = len(ROUTE_FILE) > 4 and ROUTE_FILE[4] == "inv"
+    # Pad (and -1) slots: invalid id -1 ("inv") or this rank's local experts, weight 0.
+    pad = (torch.full((shape.topk,), -1, dtype=torch.int32) if invalid_pad
+           else rank * epr + torch.arange(shape.topk, dtype=torch.int32) % epr)
+    out_ids = pad.repeat(shape.tokens, 1)
+    out_w = torch.zeros(shape.tokens, shape.topk)
+    n = rows.shape[0]
+    valid = rows >= 0
+    out_ids[:n] = torch.where(valid, rows, pad)
+    out_w[:n] = torch.where(valid, w, 0.0)
+    return out_ids.to(device).contiguous(), out_w.to(device).contiguous()
 
 
 def shared_inputs(shape, rank, device, *, route_pattern, seed, prepared_weights):
@@ -227,6 +273,8 @@ def shared_inputs(shape, rank, device, *, route_pattern, seed, prepared_weights)
         x.normal_(generator=generator)
         topk_ids, route_weights = _balanced_routes(
             shape, rank, generator, device, per_node_group=route_pattern == "eplb-balanced")
+    elif route_pattern == "file":
+        topk_ids, route_weights = _file_routes(shape, rank, device)
     elif route_pattern == "permuted-arbitrary-topk":
         if shape.topk != 16:
             raise ValueError("the permuted fixture is defined for topk=16 only")

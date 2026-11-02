@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch test_megamoe_tile_internode.py on one node of an EP16 (2 x 8 GPU) job.
+# Launch test_megamoe_internode.py on one node of an EP16 (2 x 8 GPU) job.
 #
 #   run_internode_test.sh NODE_RANK MASTER_ADDR MASTER_PORT TAG -- [test args]
 #
@@ -54,7 +54,7 @@ timeout --signal=TERM --kill-after=30s "${MEGAMOE_RUN_TIMEOUT:-3600s}" \
   --nnodes=2 --nproc-per-node=8 --node-rank="${node_rank}" \
   --master-addr="${master_addr}" --master-port="${master_port}" --max-restarts=0 \
   ${ATT_WRAP:+--no-python "${ATT_WRAP}"} \
-  op_tests/multigpu_tests/test_megamoe_tile_internode.py \
+  op_tests/multigpu_tests/test_megamoe_internode.py \
   --out-dir trace_data/internode --tag "${tag}" "$@" >"${out_dir}/node${node_rank}.log" 2>&1
 rc=$?
 set -e
