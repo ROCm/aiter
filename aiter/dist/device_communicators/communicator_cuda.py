@@ -949,6 +949,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             input_tensor = input_.movedim(dim, 0).contiguous()
 
             assert input_tensor.shape[0] % world_size == 0
+            # Axis 0 is already the caller's layout: scatter straight into it.
+            if dim == 0 and output_.is_contiguous():
+                pynccl_comm.reduce_scatter(output_, input_tensor)
+                return
             chunk_size = input_tensor.shape[0] // world_size
             tmp_shape = (chunk_size,) + input_tensor.shape[1:]
             # pynccl writes the scattered result with the split axis at 0, so it

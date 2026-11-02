@@ -57,6 +57,7 @@ from aiter.dist.parallel_state import (
     get_prefill_context_model_parallel_rank,
     get_prefill_context_model_parallel_world_size,
     get_tp_group,
+    graph_capture,
     init_distributed_environment,
     set_custom_all_reduce,
 )
@@ -139,6 +140,11 @@ def _worker(
         "pcp_ws_accessor": get_prefill_context_model_parallel_world_size(),
         "pcp_rank_accessor": get_prefill_context_model_parallel_rank(),
     }
+
+    # graph_capture() must arm the PCP group's custom all-reduce too.
+    pcp_ca = getattr(pcp_grp.device_communicator, "ca_comm", None)
+    with graph_capture():
+        group_info["pcp_capturing"] = pcp_ca is None or pcp_ca._IS_CAPTURING
 
     x = all_inputs[rank].to(device)
 
@@ -313,6 +319,7 @@ def test_parallel_groups(
             f"Rank {rank}: pcp_rank_accessor={info['pcp_rank_accessor']} "
             f"!= expected {exp_pcp.index(rank)}"
         )
+        assert info["pcp_capturing"], f"Rank {rank}: graph_capture() missed PCP"
         print(
             f"  Rank {rank}: TP{info['tp_ranks']}  EP{info['ep_ranks']}  "
             f"DP{info['dp_ranks']}  PP{info['pp_ranks']}  PCP{info['pcp_ranks']}"

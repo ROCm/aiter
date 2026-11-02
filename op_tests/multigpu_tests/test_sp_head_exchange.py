@@ -85,6 +85,24 @@ def _worker(rank, port, invalid_source):
             for _ in range(5):
                 graph.replay()
             torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+    # The communicator's wrappers: a producer writing the registered pool,
+    # a staged input, and a captured input bound in place.
+    x = (torch.arange(16 * 32, device=rank).view(16, 32) + rank * 17) % 127
+    x = x.to(torch.bfloat16)
+    peers = [None] * 4
+    dist.all_gather_object(peers, x.cpu())
+    expected = torch.cat([peer[rank * 4 : (rank + 1) * 4] for peer in peers], dim=1)
+    assert ca.should_head_exchange(x)
+    view = ca.registered_input_view(x.shape, x.dtype)
+    view.copy_(x)
+    for out in (ca.head_exchange(view, registered=True), ca.head_exchange(x)):
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with ca.capture(), torch.cuda.graph(graph, stream=stream):
+        out = ca.head_exchange(x)
+    graph.replay()
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
     torch.cuda.synchronize()
     dist.barrier()
     ca.close()
