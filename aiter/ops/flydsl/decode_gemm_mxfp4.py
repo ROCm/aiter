@@ -129,6 +129,16 @@ def flydsl_decode_gemm_mxfp4(
     padded_k = -(-K // DECODE_K_TILE) * 256
     if A_scale.numel() < padded_k or B_scale.numel() < N * padded_k // 32:
         raise ValueError("requires padded shuffled A scales and shuffled B scales")
+    # Fixed-base buffer descriptors: 32-bit num_records and unsigned 32-bit byte offsets.
+    limit = 1 << 32
+    if any(t.numel() * t.element_size() >= limit for t in tensors):
+        raise ValueError("decode MXFP4 requires operand extents below 4 GiB")
+    if split_k > 1 and 4 * split_k * M * N >= limit:
+        raise ValueError("decode MXFP4 requires split-K workspace below 4 GiB")
+    # The K-tail sentinel offset for B must not wrap 32 bits.
+    tail = K % 256
+    if tail and N * K + 8 * (256 - tail) > limit:
+        raise ValueError("decode MXFP4 K-tail B offsets exceed 32-bit addressing")
     if get_gfx_runtime() != "gfx950":
         raise ValueError(f"decode MXFP4 supports gfx950, got {get_gfx_runtime()}")
     target = out
