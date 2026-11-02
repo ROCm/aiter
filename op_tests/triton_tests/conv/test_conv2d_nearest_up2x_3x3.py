@@ -9,7 +9,7 @@ from aiter.ops.triton.conv.conv2d_nearest_up2x_3x3 import conv2d_nearest_up2x_3x
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # Archs with a CONV2D-NEAREST-UP2X-3X3 config.
-SUPPORTED_ARCHS = ("gfx1150", "gfx1151")
+SUPPORTED_ARCHS = ("gfx1150", "gfx1151", "gfx1201")
 
 # bf16 / fp16: the op rounds the folded 2x2 weights once to the input dtype and
 # sums in another order than the conv on the upsampled tensor.
