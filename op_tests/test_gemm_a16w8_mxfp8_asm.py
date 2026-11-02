@@ -27,6 +27,9 @@
 # which run the default kernel for M rows.
 
 import argparse
+import ctypes
+import gc
+import weakref
 
 import pandas as pd
 import torch
@@ -35,6 +38,8 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a16w8_mxfp8 import (
+    _mx_workspace,
+    _mx_workspace_by_stream,
     gemm_a16w8_mxfp8_asm,
     gemm_a16w8_mxfp8_prepare_weight,
     is_gemm_a16w8_mxfp8_tuned,
@@ -232,9 +237,31 @@ def _run_guard_checks():
             gemm_a16w8_mxfp8_asm(a, b, bs, o)
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    cap = torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=cap):
         for o in outs:
             gemm_a16w8_mxfp8_asm(a, b, bs, o)
+
+    # The graph keeps the addresses of the capture stream's split-K workspace,
+    # so split-K calls on 64 other streams must not free it.
+    with torch.cuda.stream(cap):
+        captured = [weakref.ref(t) for t in _mx_workspace(a.device)]
+    hip = ctypes.CDLL("libamdhip64.so")
+    handles = []
+    for _ in range(64):
+        h = ctypes.c_void_p()
+        assert hip.hipStreamCreate(ctypes.byref(h)) == 0, "hipStreamCreate failed"
+        handles.append(h)
+        with torch.cuda.stream(torch.cuda.ExternalStream(h.value)):
+            gemm_a16w8_mxfp8_asm(a, b, bs)
+    torch.cuda.synchronize()
+    for h in handles:
+        _mx_workspace_by_stream.pop((a.device, h.value), None)
+        hip.hipStreamDestroy(h)
+    gc.collect()
+    assert all(
+        r() is not None for r in captured
+    ), "split-K workspace of a captured graph was freed"
     for _ in range(2):
         for o in outs:
             o.fill_(float("nan"))
@@ -260,7 +287,8 @@ def _run_guard_checks():
     aiter.logger.info(
         "guard checks passed: M 65, N 1800, unprepared weights or scales, 3-D A, "
         "strided A, short B_scale, fp16 out, splitK 9, and exponent 254 or NaN "
-        "weights in prepare_weight raise; M 0 is a no-op; graph replay and "
+        "weights in prepare_weight raise; M 0 is a no-op; a captured graph keeps "
+        "its split-K workspace after calls on 64 other streams; graph replay and "
         "torch.compile(fullgraph) equal eager"
     )
 

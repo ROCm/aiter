@@ -19,7 +19,9 @@ three K steps ahead.
   default files (header only).
 - `aiter/configs/model_configs/dsv41_a16w8_mxfp8_asm_{tuned,untuned}_gemm.csv`:
   DeepSeek-V4.1-Flash, tensor parallel 4, per-rank projections, M = 1, 12, 24,
-  36, 48, 64, tuned on MI325X (gfx942, 304 CUs).
+  36, 48, 64, tuned on MI325X (gfx942, 304 CUs) with ROCm 7.2.3, hipBLASLt
+  1.2.2 (the ROCm 7.2.3 package, the BF16 baseline) and PyTorch 2.12.0. A newer
+  hipBLASLt moves that baseline, so re-tune after upgrading it.
 
 At run time `AITER_CONFIGS.AITER_CONFIG_GEMM_A16W8_MXFP8_ASM_FILE` merges the
 default file with every `model_configs/*a16w8_mxfp8_asm_tuned_gemm*.csv`.

@@ -230,12 +230,7 @@ def _mx_default_kernel(M: int, N: int) -> str:
     return _mx_registry()[name]["knl_name"]
 
 
-@functools.lru_cache(maxsize=64)
-def _mx_workspace_keyed(device: torch.device, stream_id: int) -> tuple[Tensor, Tensor]:
-    with persistent_alloc(device):
-        ws = torch.empty(_MX_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-        cnt = torch.zeros(_MX_COUNTERS, dtype=torch.int32, device=device)
-    return ws, cnt
+_mx_workspace_by_stream: dict[tuple[torch.device, int], tuple[Tensor, Tensor]] = {}
 
 
 def _mx_workspace(device: torch.device) -> tuple[Tensor, Tensor]:
@@ -243,10 +238,17 @@ def _mx_workspace(device: torch.device) -> tuple[Tensor, Tensor]:
 
     The last split of each tile resets its counter, so the counters stay zero
     between calls. Launches on different streams must not share counters, so
-    each stream gets its own pair.
+    each stream gets its own pair. Pairs are never freed: a captured graph keeps
+    their addresses and can replay them at any time.
     """
-    stream = torch.cuda.current_stream(device)
-    return _mx_workspace_keyed(device, stream.cuda_stream)
+    key = (device, torch.cuda.current_stream(device).cuda_stream)
+    pair = _mx_workspace_by_stream.get(key)
+    if pair is None:
+        with persistent_alloc(device):
+            ws = torch.empty(_MX_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+            cnt = torch.zeros(_MX_COUNTERS, dtype=torch.int32, device=device)
+        pair = _mx_workspace_by_stream[key] = (ws, cnt)
+    return pair
 
 
 def gemm_a16w8_mxfp8_asm(
