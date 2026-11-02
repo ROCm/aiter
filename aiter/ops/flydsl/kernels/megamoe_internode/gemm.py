@@ -9,11 +9,14 @@
 """
 
 import math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T, Vector as Vec, Float4E2M1FN, Float32, Int32
+from flydsl.expr.typing import Float4E2M1FN, Float32, Int32, T
+from flydsl.expr.typing import Vector as Vec
+
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_agent as _nc_atomic_add_agent,
 )
@@ -25,12 +28,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     situv2_consts,
 )
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
-from .common import (
-    _e8m0_from_amax,
-    bscale_bytes_for,
-    kbs_per_expert_dw_for,
-    kbs_stride_n0_dw_for,
-)
+
 from ..mxfp4_gemm_common import (
     _buffer_rsrc,
     _fabs_f32,
@@ -54,6 +52,12 @@ from ..mxfp4_gemm_common import (
     num_n_blocks_for,
 )
 from ..tensor_shim import buf_copy_load, ptr_buf_tensor
+from .common import (
+    _e8m0_from_amax,
+    bscale_bytes_for,
+    kbs_per_expert_dw_for,
+    kbs_stride_n0_dw_for,
+)
 
 
 def _global_i32_ptr(addr_i64):
@@ -135,9 +139,9 @@ def _gate_up_batch(
     pairs = list(zip(gs, us))
     if act in ("silu", "swiglu"):
         limit = (
-            7.0 if act == "swiglu" and swiglu_limit is None
-            else float("inf") if swiglu_limit is None
-            else float(swiglu_limit)
+            7.0
+            if act == "swiglu" and swiglu_limit is None
+            else float("inf") if swiglu_limit is None else float(swiglu_limit)
         )
         return batched_silu_swiglu(
             pairs,
@@ -151,9 +155,7 @@ def _gate_up_batch(
             fx.Float32(float(situ_beta)),
             fx.Float32(float(situ_linear_beta)),
         )
-        return batched_situv2(
-            pairs, consts=consts, range_constexpr=range_constexpr
-        )
+        return batched_situv2(pairs, consts=consts, range_constexpr=range_constexpr)
     raise ValueError(f"unsupported A4W4 GMM1 activation {act!r}")
 
 
@@ -230,7 +232,9 @@ def _gemm1_body_sc2(
     # 只会变松不会变错(in-order 返回,A(kt+1) 之后的条数只多不少)。
     if const_expr(next_claim):
         _nc_lds_min = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL)[3]
-        assert next_claim_lds_dw * 4 >= _nc_lds_min, "next_claim mailbox aliases the GMM1 LDS"
+        assert (
+            next_claim_lds_dw * 4 >= _nc_lds_min
+        ), "next_claim mailbox aliases the GMM1 LDS"
         assert next_claim_lead >= 1
         _NC_STEP = max(0, K_TILES_TOTAL - int(next_claim_lead))
 
@@ -288,7 +292,7 @@ def _gemm1_body_sc2(
     # 每个 A 槽一个 scope、A-scale 区一个 scope,读写都带上,LLVM 只等同槽的 DMA。
     from flydsl._mlir import ir as _ir
 
-    _dom = "#llvm.alias_scope_domain<id = distinct[0]<>, description = \"gmm1_lds\">"
+    _dom = '#llvm.alias_scope_domain<id = distinct[0]<>, description = "gmm1_lds">'
     _sc = _ir.ArrayAttr(
         _ir.Attribute.parse(
             "["
@@ -302,19 +306,16 @@ def _gemm1_body_sc2(
     _scopes = [_sc[i] for i in range(kAStages + 1)]  # [A 槽 0..kAStages-1, A-scale]
 
     def _scope_attrs(idx):
-        return dict(
-            alias_scopes=_ir.ArrayAttr.get([_scopes[idx]]),
-            noalias_scopes=_ir.ArrayAttr.get(
+        return {
+            "alias_scopes": _ir.ArrayAttr.get([_scopes[idx]]),
+            "noalias_scopes": _ir.ArrayAttr.get(
                 [_scopes[j] for j in range(kAStages + 1) if j != idx]
             ),
-        )
+        }
 
     _lds_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     _asc_base_i32 = _lds_base_i32 + fx.Int32(kAStages * BM * KH_TILE)
     aq_rsrc = _buffer_rsrc(arg_aq, aq_num_records)
-
-
-
 
     # Union LDS region [s_aq | s_asc], reused as lds_acc (f32 accumulator) in
     # the epilogue. s_aq/lds_acc start at lds_raw_ptr; s_asc follows at
@@ -372,6 +373,7 @@ def _gemm1_body_sc2(
                 fx.Int32(0),
                 **_scope_attrs(slot),
             )
+
     # s_aq as flat i32, divided into 4-element (128-bit) and 1-element tiles.
     s_aq_i32_flat = fx.make_view(
         fx.recast_iter(fx.Int32, lds_raw_ptr),
@@ -409,8 +411,6 @@ def _gemm1_body_sc2(
                     ).result
                 )
         return a
-
-
 
     def issue_a_scale_ds_read(kt):
         out = []
@@ -459,7 +459,9 @@ def _gemm1_body_sc2(
             db = rb * fx.Int32(_GS_ROW_DW) + ku * fx.Int32(2)
             loads.append(
                 (
-                    sub, n_lane, ku,
+                    sub,
+                    n_lane,
+                    ku,
                     _global_i32_at(arg_ascale, da),
                     _global_i32_at(arg_ascale, da + fx.Int32(1)),
                     _global_i32_at(arg_ascale, db),
@@ -492,6 +494,7 @@ def _gemm1_body_sc2(
                     alignment=4,
                     **_scope_attrs(kAStages),
                 )
+
     def issue_b_load_j(b_slot, K_C, j):
         v = (
             (lane_div_16 * fx.Int32(256))
@@ -573,6 +576,7 @@ def _gemm1_body_sc2(
         # vmcnt(N) 等本步开头发出的 A DMA 落地(之后发的 N 条 B 预取继续飞),再 barrier。
         rocdl.s_waitcnt((vmcnt & 0xF) | ((vmcnt & 0x30) << 10) | (7 << 4))
         rocdl.s_barrier()
+
     # MegaMoEv2 do_tile 的同步写法(每步末尾一把 wait_lds_barrier),A 三级、DMA 提前两步:
     #   第 kt 步开头把 A(kt+2) 搬进槽 (kt+2)%3 —— 该槽上一步已被全体 wave 读完
     #   (上一步末尾的 lgkmcnt(0)+barrier 保证);
@@ -606,9 +610,7 @@ def _gemm1_body_sc2(
         if const_expr(next_claim and kt == _NC_STEP):
             rocdl.sched_barrier(0)
             if nc_tx0:
-                nc_raw = fx.Int32(
-                    _nc_atomic_add_agent(arg_nc_head, fx.Int32(1))
-                )
+                nc_raw = fx.Int32(_nc_atomic_add_agent(arg_nc_head, fx.Int32(1)))
             rocdl.sched_barrier(0)
         if const_expr(refill):
             rocdl.sched_barrier(0)
@@ -698,7 +700,9 @@ def _gemm1_body_sc2(
     if const_expr(aqout_row_base):
         aqout_tiles = _global_scalar_tiles(
             fx.Int64(arg_aqout) + fx.Int64(m_row_out) * fx.Int64(K_G2_HALF),
-            fx.Int32, 1 << 24)
+            fx.Int32,
+            1 << 24,
+        )
         aqout_row0 = fx.Int32(0)
     else:
         aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
@@ -771,9 +775,7 @@ def _gemm1_body_sc2(
                 scales_per_mr[sub * 2 + 1] << fx.Int32(8)
             )
             addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-            _scalar_store(
-                ascaleout_i16_tiles, addr // fx.Int32(2), pair_i32, fx.Int16
-            )
+            _scalar_store(ascaleout_i16_tiles, addr // fx.Int32(2), pair_i32, fx.Int16)
 
     if const_expr(next_claim):
         nc_job = nc_valid.select(
@@ -852,11 +854,17 @@ def _epi_swz_selfcheck(BM, BN):
             up = BN // 2 if J % 2 == 1 else 0
             for v in range(4):
                 addrs = [
-                    ((lane // 16) * 4 + v) * stride + wave * (BN // 8) + (J // 2) * 16 + lane % 16 + up
+                    ((lane // 16) * 4 + v) * stride
+                    + wave * (BN // 8)
+                    + (J // 2) * 16
+                    + lane % 16
+                    + up
                     for lane in range(64)
                 ]
                 assert _ways(addrs, 1, 64, (range(64),)) == 1, "epi store conflict 64"
-                assert _ways(addrs, 1, 32, (range(32), range(32, 64))) == 1, "epi store conflict 32"
+                assert (
+                    _ways(addrs, 1, 32, (range(32), range(32, 64))) == 1
+                ), "epi store conflict 32"
         for up in (0, 128):
             for h in (0, 1):
                 addrs = []
@@ -867,8 +875,12 @@ def _epi_swz_selfcheck(BM, BN):
                     a = m * stride + up + wg * 32 + kk * 8 + 4 * h
                     assert a % 4 == 0
                     addrs.append(a)
-                assert _ways(addrs, 4, 64, _B128_PHASES_CDNA4) == 1, "epi load conflict cdna4"
-                assert _ways(addrs, 4, 32, _B128_PHASES_CDNA3) == 1, "epi load conflict cdna3"
+                assert (
+                    _ways(addrs, 4, 64, _B128_PHASES_CDNA4) == 1
+                ), "epi load conflict cdna4"
+                assert (
+                    _ways(addrs, 4, 32, _B128_PHASES_CDNA3) == 1
+                ), "epi load conflict cdna3"
     _EPI_SWZ_CHECKED.add(key)
 
 
@@ -963,7 +975,9 @@ def issue_a_load_lds_dt(
     rows_per_call = 64 // lanes_per_row  # 8 (fp4)
     a_lane_row = lane // lanes_per_row
     rows_per_wave = BM // 4  # rows each wave loads (BM32: 8)
-    assert rows_per_wave >= rows_per_call, "every wave loads whole row groups (BM >= 32)"
+    assert (
+        rows_per_wave >= rows_per_call
+    ), "every wave loads whole row groups (BM >= 32)"
     gather_base_row = wave * rows_per_wave
     n_row_groups = rows_per_wave // rows_per_call
     lane_col = (lane % lanes_per_row) * 16
@@ -1238,12 +1252,10 @@ def gemm2_compute_v2(
     # g2_ascale_pf: carry the A-scale through scf.for state, same rotating-buffer model as B.
     cur_saf = nxt_saf = None
     cur_saf = [
-        fx.make_fragment_like(sc_frag_tmpl)
-        for _ in range_constexpr(kScaleSubBlocks)
+        fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(kScaleSubBlocks)
     ]
     nxt_saf = [
-        fx.make_fragment_like(sc_frag_tmpl)
-        for _ in range_constexpr(kScaleSubBlocks)
+        fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(kScaleSubBlocks)
     ]
 
     def load_b_carry():
@@ -1335,10 +1347,7 @@ def gemm2_compute_v2(
         if nxt_a < K_TILES_RT:
             issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
         # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.
-        sa = [
-            Vec(cur_saf[sub].load())[0]
-            for sub in range_constexpr(kScaleSubBlocks)
-        ]
+        sa = [Vec(cur_saf[sub].load())[0] for sub in range_constexpr(kScaleSubBlocks)]
         # Fence the MFMA chain from the B vmem loads (next-tile loads ride ahead of compute).
         rocdl.sched_barrier(0)
         rocdl.s_setprio(1)

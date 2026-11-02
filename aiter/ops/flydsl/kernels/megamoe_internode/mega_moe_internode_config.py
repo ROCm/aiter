@@ -81,11 +81,15 @@ shape.  The rail queue count was 8 on every measured shape and is the constant
 persistent grid (0 = the operator's worker_blocks).  BM stays 32: kernel1
 requires ``SBM % BM == 0`` and the arena tile (SBM) is 32 rows.
 """
+
 from __future__ import annotations
 
 import csv
+import logging
 import os
 import threading
+
+logger = logging.getLogger(__name__)
 
 _KEY_FIELDS = ("gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk")
 
@@ -123,16 +127,26 @@ class _TuneTable:
                 if not raw.get("gfx") or raw["gfx"].lstrip().startswith("#"):
                     continue
                 key = tuple(
-                    raw["gfx"].strip() if f == "gfx" else int(raw[f]) for f in _KEY_FIELDS
+                    raw["gfx"].strip() if f == "gfx" else int(raw[f])
+                    for f in _KEY_FIELDS
                 )
                 row = {f: int(raw[f]) for f in self.value_fields}
                 self.validate(row, f"{path}:{lineno}")
                 table[key] = row
         return table
 
-    def lookup(self, *, gfx, cu_num, token, model_dim, inter_dim, expert, topk) -> dict | None:
-        key = (str(gfx), int(cu_num), int(token), int(model_dim), int(inter_dim),
-               int(expert), int(topk))
+    def lookup(
+        self, *, gfx, cu_num, token, model_dim, inter_dim, expert, topk
+    ) -> dict | None:
+        key = (
+            str(gfx),
+            int(cu_num),
+            int(token),
+            int(model_dim),
+            int(inter_dim),
+            int(expert),
+            int(topk),
+        )
         path = self.path()
         with self._lock:
             if self._cache is None or self._cache_path != path:
@@ -177,14 +191,18 @@ def _validate_stage1(row: dict, where: str) -> None:
             f"{where}: tile_group must be one of {TILE_GROUPS} (got {row['tile_group']})"
         )
     if row["split_local"] not in (0, 1):
-        raise ValueError(f"{where}: split_local must be 0 or 1 (got {row['split_local']})")
+        raise ValueError(
+            f"{where}: split_local must be 0 or 1 (got {row['split_local']})"
+        )
     fs = row["fanout_shards"]
     if not FANOUT_SHARDS_MIN <= fs <= FANOUT_SHARDS_MAX:
         raise ValueError(
             f"{where}: fanout_shards must be in [{FANOUT_SHARDS_MIN}, {FANOUT_SHARDS_MAX}] (got {fs})"
         )
     if row["split_local"] and fs < 17:
-        raise ValueError(f"{where}: the split path needs fanout_shards >= 17 (fan2 uses 16)")
+        raise ValueError(
+            f"{where}: the split path needs fanout_shards >= 17 (fan2 uses 16)"
+        )
 
 
 STAGE1_TABLE = _TuneTable(
@@ -239,22 +257,30 @@ def resolve_stage1_tile(
             gfx = chip_gfx if gfx is None else gfx
             cu_num = chip_cu if cu_num is None else cu_num
         tuned = STAGE1_TABLE.lookup(
-            gfx=gfx, cu_num=cu_num, token=token, model_dim=model_dim,
-            inter_dim=inter_dim, expert=expert, topk=topk,
+            gfx=gfx,
+            cu_num=cu_num,
+            token=token,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            expert=expert,
+            topk=topk,
         )
     except ValueError:
         # A malformed table is a configuration error, not a miss.
         raise
     except Exception:
         # Anything else (no device, no aiter root) falls back to the rule.
+        logger.debug("Stage1 tune lookup failed; using built-in rules", exc_info=True)
         tuned = None
     if tuned is not None:
         out, source = dict(tuned), "table"
     else:
         split = default_split_local(token, expert)
-        out = {"split_local": split,
-               "tile_group": default_tile_group(token, expert, split),
-               "fanout_shards": default_fanout_shards(split)}
+        out = {
+            "split_local": split,
+            "tile_group": default_tile_group(token, expert, split),
+            "fanout_shards": default_fanout_shards(split),
+        }
         source = "default"
         _validate_stage1(out, "stage1 tile rule")
     out["source"] = source
@@ -310,8 +336,13 @@ def lookup_stage2_tune(
     one, matching ``kimik3_a4w4_tuned_fmoe.csv``.
     """
     return STAGE2_TABLE.lookup(
-        gfx=gfx, cu_num=cu_num, token=token, model_dim=model_dim,
-        inter_dim=inter_dim, expert=expert, topk=topk,
+        gfx=gfx,
+        cu_num=cu_num,
+        token=token,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        expert=expert,
+        topk=topk,
     )
 
 
@@ -326,7 +357,9 @@ def resolve_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
     else:
         bn, source = DEFAULT_GEMM2_BN, "default"
     if bn not in GEMM2_BNS:
-        raise ValueError(f"gemm2_bn must be one of {GEMM2_BNS} (got {bn}, from {source})")
+        raise ValueError(
+            f"gemm2_bn must be one of {GEMM2_BNS} (got {bn}, from {source})"
+        )
     return bn, source
 
 
@@ -340,5 +373,7 @@ def resolve_gemm2_cu(tuned: dict | None) -> tuple[int, str]:
     else:
         cu, source = DEFAULT_GEMM2_CU, "default"
     if not 0 <= cu <= GEMM2_CU_MAX:
-        raise ValueError(f"gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu}, from {source})")
+        raise ValueError(
+            f"gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu}, from {source})"
+        )
     return cu, source
