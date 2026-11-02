@@ -38,6 +38,9 @@ block_shape = (128, 128)
 SCALE_BLOCK_SHAPES = {"1x32": (1, 32), "32x32": (32, 32), "128x128": block_shape}
 # Native E8M0 preshuffle dispatch is supported on these architectures.
 NATIVE_SCALE_GFX = ("gfx950", "gfx1250")
+# The default run's 32x32 cases (M, N, K) on those archs: DSv4.1 shapes whose last
+# K tile (K=576) or N tile (N=1152 on the compute kernel) is partial.
+DEFAULT_32X32_CASES = ((1, 5120, 576), (8192, 5120, 576), (8192, 1152, 5120))
 TEST_NUM_ITERS = 100
 
 
@@ -518,8 +521,12 @@ parser.add_argument(
     default=None,
     help="""CSV file containing M, N, K columns (one shape per row).
     An optional w_scale_block column selects 1x32, 32x32 or 128x128 per row.
-    Without --csv or explicit -m/-nk, sweep all configured CSVs for this GPU.
     e.g.: --csv shapes.csv""",
+)
+parser.add_argument(
+    "--tuned-csvs",
+    action="store_true",
+    help="sweep every tuned blockscale CSV configured for this GPU instead of -m/-nk",
 )
 parser.add_argument(
     "--table",
@@ -560,13 +567,10 @@ init_pairs = list(zip(data_init_list, scale_init_list))
 
 l_preshuffle = args.b_preshuffle or ([True] if args.flydsl else [True, False])
 l_apre = args.apre
-# Preserve the -m/-nk defaults; only explicit shape arguments select shape mode.
-default_csv = args.csv is None and not any(
-    arg.startswith(("-m", "-nk")) for arg in sys.argv[1:]
-)
+tuned_csvs = args.csv is None and args.tuned_csvs
 
 df = []
-if args.csv is not None or default_csv:
+if args.csv is not None or tuned_csvs:
     sources = [
         ("", False, False, "128x128"),
         ("_BPRESHUFFLE", True, False, "128x128"),
@@ -604,7 +608,7 @@ if args.csv is not None or default_csv:
         print(f"Loaded {len(table)} shapes from {path}", flush=True)
     shapes_df = pd.concat(tables, ignore_index=True).drop_duplicates()
     if args.w_scale_block:
-        if default_csv:
+        if tuned_csvs:
             shapes_df = shapes_df[shapes_df["w_scale_block"] == args.w_scale_block]
         else:
             shapes_df["w_scale_block"] = args.w_scale_block
@@ -616,9 +620,9 @@ if args.csv is not None or default_csv:
     shapes_df["use_flydsl"] &= shapes_df["b_preshuffle"].ne(False) | (
         shapes_df["w_scale_block"] != "128x128"
     )
-    if default_csv and args.flydsl:
+    if tuned_csvs and args.flydsl:
         shapes_df = shapes_df[shapes_df["use_flydsl"]]
-    if default_csv and args.b_preshuffle is not None:
+    if tuned_csvs and args.b_preshuffle is not None:
         shapes_df = shapes_df[shapes_df["b_preshuffle"].isin(args.b_preshuffle)]
     if get_gfx() != "gfx950":
         # Without B preshuffle, group32 runs through Triton, which needs gfx950.
@@ -650,7 +654,7 @@ for w_scale_block in set(scale_blocks):
     if args.w_scale_block and w_scale_block != "128x128" and any(l_apre):
         parser.error("Group32 scales do not support --apre True")
 
-if args.csv is not None or default_csv:
+if args.csv is not None or tuned_csvs:
     for dtype in args.dtype:
         for _, row in shapes_df.iterrows():
             preshuffles = (
@@ -698,6 +702,27 @@ else:
                                 w_scale_block=args.w_scale_block or "128x128",
                             )
                             df.append(ret)
+    if (
+        args.m == parser.get_default("m")
+        and args.nk == parser.get_default("nk")
+        and args.w_scale_block is None
+        and get_gfx() in NATIVE_SCALE_GFX
+    ):
+        for dtype in args.dtype:
+            for m, n, k in DEFAULT_32X32_CASES:
+                for data_init, scale_init in init_pairs:
+                    ret = test_gemm(
+                        dtype,
+                        m,
+                        n,
+                        k,
+                        use_flydsl=True,
+                        data_init=data_init,
+                        scale_init=scale_init,
+                        seed=args.seed,
+                        w_scale_block="32x32",
+                    )
+                    df.append(ret)
 
 df = pd.DataFrame([row for row in df if row is not None])
 print_json_table("gemm_a8w8_blockscale summary", df)
