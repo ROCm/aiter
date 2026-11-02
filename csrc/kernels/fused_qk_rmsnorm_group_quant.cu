@@ -508,6 +508,10 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
 #define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
     FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V)
 
+// gfx1250 no-quant rows use coalesced wave32 vector chunks.
+#define FUSED_RMSNORM_GFX1250_NO_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
+    FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, true)
+
 #define FUSED_RMSNORM_FP8_PER_TOKEN_QUANT_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V) \
     FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, 1, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, false, true, true)
 
@@ -991,6 +995,39 @@ void fused_qk_rmsnorm_group_quant(
     HipDeviceGuard device_guard(inp1.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     (void)get_num_cu_func();
+
+    // No-quant dispatch is based on wave/vector capacity, not model widths.
+    // Keep quantized, dual-input and vector-tail dispatch on the existing paths.
+    // RTS=1 is sufficient because no-quant does not execute group-scale reduction.
+    if(no_quant && !has_second_input && n1 > 0 && n1 % 8 == 0 && get_gpu_arch() == "gfx1250")
+    {
+        constexpr int wave_threads = 32;
+        constexpr int block_threads = 256;
+        if(n1 <= wave_threads * 4)
+        {
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, wave_threads, 4, 1);
+            return;
+        }
+        if(n1 <= wave_threads * 8)
+        {
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, wave_threads, 8, 1);
+            return;
+        }
+        // Above 24 values/thread the interleaved kernel regresses on gfx1250;
+        // keep the original wider-row configuration rather than extrapolating it.
+        if(n1 > block_threads * 16 && n1 <= block_threads * 24)
+        {
+            int cu_count = 0;
+            HIP_CALL(hipDeviceGetAttribute(
+                &cu_count, hipDeviceAttributeMultiprocessorCount, inp1.device_id));
+            // Keep the decode dispatch while there are fewer rows than CUs.
+            if(m >= cu_count)
+            {
+                DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_GFX1250_NO_QUANT_DISPATCH, block_threads, 24, 1);
+                return;
+            }
+        }
+    }
 
     if(per_token_quant)
     {
