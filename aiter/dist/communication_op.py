@@ -293,6 +293,8 @@ def tensor_model_parallel_fused_qknorm_allreduce_rope(
 
 
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
+    """The TP group's custom all-gather; raises where it has no kernel (see
+    `GroupCoordinator.custom_all_gather`)."""
     _assert_no_custom_group("tensor_model_parallel_custom_all_gather")
     return get_tp_group().custom_all_gather(input_)
 
