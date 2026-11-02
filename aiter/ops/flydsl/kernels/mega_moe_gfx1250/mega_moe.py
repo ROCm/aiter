@@ -355,7 +355,13 @@ class MegaMoEGfx1250:
         )
         ep = self._ep
         dmk = ep.decode_mega
-        if dmk is not None and not quant_bits and bias1 is None and bias2 is None:
+        if (
+            dmk is not None
+            and dmk.enabled
+            and not quant_bits
+            and bias1 is None
+            and bias2 is None
+        ):
             # Every rank of this MegaMoE runs it (the choice is per instance),
             # so the ranks always agree on the path.
             return dmk.forward(

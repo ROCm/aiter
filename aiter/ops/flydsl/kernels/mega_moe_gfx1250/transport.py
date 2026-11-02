@@ -3,6 +3,8 @@
 
 """The recipe's dispatch and combine stages over one shared arena."""
 
+import contextlib
+
 import torch
 
 from .arena import SymmetricArena, _ArenaLayout
@@ -117,10 +119,9 @@ class _EpDispatcher:
             return
         self._closed = True
         if self.decode_mega is not None:
-            try:
+            # Diagnostics only (AITER_DMK_TRACE): never fail a close over them.
+            with contextlib.suppress(Exception):
                 self.decode_mega.report()
-            except Exception:  # noqa: BLE001 - diagnostics only
-                pass
         try:
             # A launch still in flight (a graph replay, say) reads the window:
             # let it finish before anything it reads is freed.
