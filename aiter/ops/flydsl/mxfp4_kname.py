@@ -16,7 +16,6 @@ _MXMOE_G1_FLAG_TOKENS = {
     "FP8OUT",
     "SITUV2",
     "SWIGLU",
-    "BIAS",
     "W2",
 }
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
@@ -43,15 +42,16 @@ MXFP4_G1_VARIANTS = {
 }
 
 
-def native_scale_layout_for(BM: int, out_dtype: str) -> bool:
+def native_scale_layout_for(BM: int, out_dtype: str, kernel_name2=None) -> bool:
     """The A-scale layout GEMM1 must emit for a block_m and output dtype.
 
-    This is a GEMM1/GEMM2 contract, not a tuning knob: BM16 FP4 output writes
-    the native scale layout and the matching GEMM2 reads it back. FP8 output
-    uses the regular scale layout. Every caller must agree, so the rule lives
-    here.
+    BM16 FP4/FP8 output writes one padded native scale chunk per block to
+    match the SBM16 GEMM2 reader. Larger blocks use 32-row regular chunks.
+    Runtime, tuner and AOT must all select the same layout.
     """
-    return int(BM) == 16 and str(out_dtype).lower() == "fp4"
+    if isinstance(kernel_name2, str) and kernel_name2.startswith("opus_moe2_"):
+        return False
+    return int(BM) == 16 and str(out_dtype).lower() in ("fp4", "fp8")
 
 
 _FLYDSL_V2_GEMM2_RE = re.compile(
@@ -105,6 +105,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
 def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
     # Gate/up layout comes from the runtime gate_mode; the same config name
     # can compile both interleaved and separated GPU kernels.
+    # Bias is selected from the runtime tensor, not a config-name flag.
     parsed = _tokenize_mxfp4_kname(kname, 1, _MXMOE_G1_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
     act = "situv2" if "SITUV2" in flags else ("swiglu" if "SWIGLU" in flags else "silu")
@@ -121,7 +122,6 @@ def _parse_mxfp4_g1_kname_cached(kname: str) -> dict:
         "a_dtype": parsed["mode"].get("a_dtype", "fp4"),
         "out_dtype": "fp8" if "FP8OUT" in flags else "fp4",
         "act": act,
-        "enable_bias": "BIAS" in flags,
         "num_waves": 2 if "W2" in flags else 4,
         "k_wave": nums.get("k_wave", 1),
     }
