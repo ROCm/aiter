@@ -25,7 +25,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mha_v4_quant import (
     MHA_V4_HD256,
     MHA_V4_LOG2E,
-    _check_mxfp6_qk_available,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -357,8 +356,6 @@ def _validate_format_contract(
         )
     if q_format != k_format:
         raise ValueError("MHA v4 currently requires matching Q and K formats")
-    if q_format == AttentionFormat.FP6_E2M3:
-        _check_mxfp6_qk_available()
     if q_format == AttentionFormat.BF16:
         if v_format != AttentionFormat.BF16 and not _is_fp8_format(v_format):
             raise ValueError("BF16 Q/K currently requires BF16 or FP8 V")

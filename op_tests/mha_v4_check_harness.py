@@ -13,7 +13,6 @@ import re
 import traceback
 
 from aiter import logger
-from aiter.ops.mha_v4_quant import MhaV4Fp6UnavailableError
 
 
 class Param:
@@ -127,9 +126,6 @@ class CheckRegistry:
                 try:
                     fn(**case)
                     ran += 1
-                except MhaV4Fp6UnavailableError as error:
-                    skipped += 1
-                    logger.warning("check %s skipped: %s", label, error)
                 # One bad check must not hide the rest; they are re-raised in aggregate.
                 # The traceback is the whole report: a bare assert carries no message.
                 except Exception:  # noqa: BLE001
