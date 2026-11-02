@@ -192,22 +192,9 @@ def _parse_flydsl_v2_gemm2_kernel_cached(name):
 
 
 def deterministic_v2_gemm2_name(name):
-    """Return the order-stable ``reduce`` sibling of a v2 GEMM2 kernel name.
+    """Return the ``reduce`` sibling of a layout-v2 ``atomic`` GEMM2 name.
 
-    The epilogue is a compile-time parameter of the same ``flydsl_moe2_layout``
-    GEMM2 builder, so a name that differs only in its epilogue compiles from
-    the same tile and dtype parameters. The ``atomic`` epilogue accumulates the
-    routed contributions of one token with BF16 read-modify-write adds into a
-    shared output row, which makes the rounding of every partial sum depend on
-    the order in which the contributing workgroups reach that row; two launches
-    with identical inputs can therefore return different bits. The ``reduce``
-    epilogue writes one private row per (token, route) and reduces them in
-    fixed top-k order instead.
-
-    The substitution keeps the name inside ``_FLYDSL_V2_GEMM2_RE`` because the
-    epilogue alternation is the only part of the grammar that changes, so the
-    returned name always parses. Returns ``None`` when ``name`` is not a v2
-    GEMM2 kernel or does not use the atomic epilogue.
+    Returns ``None`` for any other name family or epilogue.
     """
     m = _FLYDSL_V2_GEMM2_RE.match(name or "")
     if m is None or m.group("epilog") != "atomic":
@@ -215,14 +202,12 @@ def deterministic_v2_gemm2_name(name):
     return f"{name[: m.start('epilog')]}reduce{name[m.end('epilog') :]}"
 
 
-# Rollback switch for the stage2 epilogue policy: the atomic epilogue's
-# accumulation order is launch-order dependent, so its deterministic reduce
-# sibling is the default and this env var only exists to re-enable atomic.
+# Launch-order-dependent rollback switch for the stage2 epilogue policy.
 ATOMIC_STAGE2_ENV = "AITER_MXFP4_ATOMIC_STAGE2"
 
 
 def atomic_stage2_opt_in() -> bool:
-    """True when the caller asked for the order-dependent atomic stage2 epilogue."""
+    """True when the caller opted back into the atomic stage2 epilogue."""
     return os.environ.get(ATOMIC_STAGE2_ENV, "0") == "1"
 
 

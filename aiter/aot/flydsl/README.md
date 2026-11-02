@@ -193,10 +193,13 @@ and always compiles the default limits. Situv2 rejects an explicit limit and
 retains its existing `(beta, linear_beta)` variants `(1, 1)` and `(4, 25)`.
 
 Set the same output switches before tuning, AOT and production:
-`AITER_FLYDSL_STAGE2_FP8=1` selects FP8 route output for reduce, and
+`AITER_FLYDSL_STAGE2_FP8=1` selects FP8 route output for reduce,
 `AITER_MXFP4_INTERMEDIATE=1` selects packed FP4 scatter output for BM128,
-BN128/BN256 without bias. With both enabled, reduce uses FP8 and scatter uses
-FP4. Bias scatter retains BF16. Each switch is enabled only by the value `1`.
+BN128/BN256 without bias, and `AITER_MXFP4_ATOMIC_STAGE2=1` keeps the tuned
+`atomic` layout-v2 stage-2 epilogue instead of compiling its deterministic
+`reduce` sibling. With both output switches enabled, reduce uses FP8 and
+scatter uses FP4. Bias scatter retains BF16. Each switch is enabled only by the
+value `1`.
 
 ```bash
 # Standalone compilation of a separately tuned limit-5, both-switches CSV.
@@ -232,6 +235,7 @@ correctness nor precompiled replay acceptance.
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
+| `AITER_MXFP4_ATOMIC_STAGE2` | Set to `1` to keep the tuned `atomic` layout-v2 stage-2 epilogue at runtime and AOT. A cache built with one value does not serve the other. | `0` |
 | `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). `conv.py` applies it inside `parse_csv`, and `moe.py` and `mega_moe.py` (`GPU_ARCHS` only) before they start their replays, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled

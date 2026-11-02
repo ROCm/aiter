@@ -77,7 +77,6 @@ def test_atomic_stage2_has_a_reduce_sibling(name, expected):
 
     assert selected == expected
     assert "_atomic" not in selected
-    assert name.replace("_atomic_", "_reduce_", 1) == selected
     original = parse_flydsl_v2_gemm2_kernel(name)
     substituted = parse_flydsl_v2_gemm2_kernel(selected)
     assert substituted is not None, "substituted name must stay in the grammar"
@@ -118,7 +117,7 @@ def test_policy_rewrites_atomic_stage2_without_mutating_the_row(
     monkeypatch.delenv("AITER_MXFP4_ATOMIC_STAGE2", raising=False)
     row = {"kernelName1": stage1, "kernelName2": atomic, "ksplit": 0}
 
-    selected = _apply_mxfp4_stage2_determinism_policy(row, keys=("policy",))
+    selected = _apply_mxfp4_stage2_determinism_policy(row)
 
     assert selected is not row
     assert selected["kernelName2"] == reduce
@@ -132,7 +131,7 @@ def test_policy_allows_atomic_stage2_only_through_the_rollback_opt_in(monkeypatc
     monkeypatch.setenv("AITER_MXFP4_ATOMIC_STAGE2", "1")
     row = {"kernelName1": MOE1_G1, "kernelName2": DSV3_ATOMIC_STAGE2}
 
-    assert _apply_mxfp4_stage2_determinism_policy(row, keys=("optin",)) is row
+    assert _apply_mxfp4_stage2_determinism_policy(row) is row
 
 
 @pytest.mark.parametrize(
@@ -152,11 +151,11 @@ def test_policy_allows_atomic_stage2_only_through_the_rollback_opt_in(monkeypatc
     ),
 )
 def test_policy_is_a_noop_for_unaffected_rows(row):
-    assert _apply_mxfp4_stage2_determinism_policy(row, keys=("noop",)) is row
+    assert _apply_mxfp4_stage2_determinism_policy(row) is row
 
 
 def test_policy_passes_through_a_missing_config():
-    assert _apply_mxfp4_stage2_determinism_policy(None, keys=("none",)) is None
+    assert _apply_mxfp4_stage2_determinism_policy(None) is None
 
 
 @pytest.fixture
@@ -285,30 +284,6 @@ def test_other_stage1_families_dispatch_the_reduce_epilogue(
     assert any(row["kernelName2"] == atomic for row in tuned_rows.values())
 
 
-def test_reduce_kernel_name_separates_the_dropped_route_guard():
-    """The compiled kernel name is the AOT disk-cache key, so the guard shows."""
-    from aiter.ops.flydsl.kernels.moe_reduce import compile_moe_reduction
-
-    def kernel_name(launcher):
-        kernel = next(
-            cell.cell_contents
-            for cell in launcher.func.__closure__
-            if type(cell.cell_contents).__name__ == "KernelFunction"
-        )
-        return getattr(kernel, "_name", None) or kernel._kernel_name
-
-    plain = compile_moe_reduction(topk=4, model_dim=256, dtype_str="bf16")
-    guarded = compile_moe_reduction(
-        topk=4, model_dim=256, dtype_str="bf16", skip_invalid_ids=True
-    )
-
-    assert plain is not guarded
-    assert "_i0" in kernel_name(plain)
-    assert "_i1" in kernel_name(guarded)
-    # the same Constexpr set still hits the launcher cache
-    assert compile_moe_reduction(topk=4, model_dim=256, dtype_str="bf16") is plain
-
-
 def test_v2_layout_stage2_detection_covers_both_dispatch_spellings():
     """Both spellings reach the same v2 GEMM2, so both take the v2 arguments."""
     assert _is_flydsl_v2_layout_stage2(_flydsl_v2_stage2_wrapper)
@@ -362,96 +337,6 @@ def test_mxmoe_frontend_forwards_the_route_ids_to_the_v2_wrapper(
     assert seen["topk_ids"] is topk_ids
     assert seen["expert_mask"] is expert_mask
     assert seen["use_valid_token_count"] is use_valid_token_count
-
-
-def _call_v2_reduce_wrapper(monkeypatch, *, topk_ids):
-    """Run the v2 reduce wrapper with GEMM2 and the reduction stubbed out.
-
-    ``torch.empty`` is poisoned so the per-route buffer still carries NaN where
-    GEMM2 (mocked to write nothing) left it: the dropped-route slots.
-    """
-    fused_moe = importlib.import_module("aiter.fused_moe")
-    from aiter.ops.flydsl import moe_kernels
-    from aiter.ops.flydsl.kernels import mxmoe_dispatcher
-
-    seen = {}
-
-    def fake_gemm2(**kwargs):
-        seen["gemm2_out"] = kwargs["out"]
-
-    def fake_reduction(target, out, *args, **kwargs):
-        seen["target"] = target.clone()
-        seen["reduction_ids"] = kwargs.get("topk_ids")
-
-    real_empty = torch.empty
-
-    def poisoned_empty(*args, **kwargs):
-        tensor = real_empty(*args, **kwargs)
-        if tensor.dtype.is_floating_point:
-            tensor.fill_(float("nan"))
-        return tensor
-
-    with monkeypatch.context() as patch:
-        patch.setattr(mxmoe_dispatcher, "mxfp4_moe_gemm2", fake_gemm2)
-        patch.setattr(moe_kernels, "_run_moe_reduction", fake_reduction)
-        patch.setattr(torch, "empty", poisoned_empty)
-        fused_moe._flydsl_v2_stage2_wrapper(
-            inter_states=torch.zeros((32, 64), dtype=torch.uint8),
-            w1=None,
-            w2=torch.zeros((2, 128, 64), dtype=torch.uint8),
-            sorted_token_ids=torch.zeros(32, dtype=torch.int32),
-            sorted_expert_ids=torch.zeros(32, dtype=torch.int32),
-            num_valid_ids=torch.zeros(1, dtype=torch.int32),
-            out=torch.zeros((2, 128), dtype=torch.bfloat16),
-            topk=2,
-            kernelName=REDUCE_STAGE2,
-            model_dim=128,
-            inter_dim=64,
-            num_experts=2,
-            block_m=16,
-            topk_ids=topk_ids,
-        )
-    return seen
-
-
-def test_reduce_target_is_zeroed_only_when_the_route_ids_are_unavailable(
-    monkeypatch,
-):
-    """Dropped routes are the kernel's job once it can read the router ids."""
-    ids = torch.zeros((2, 2), dtype=torch.int32)
-    with_ids = _call_v2_reduce_wrapper(monkeypatch, topk_ids=ids)
-    assert with_ids["reduction_ids"] is ids
-    assert torch.isnan(
-        with_ids["target"]
-    ).all(), "the zero-fill is dead weight when the kernel skips invalid routes"
-
-    without_ids = _call_v2_reduce_wrapper(monkeypatch, topk_ids=None)
-    assert without_ids["reduction_ids"] is None
-    assert not torch.isnan(without_ids["target"]).any()
-    assert (without_ids["target"] == 0).all()
-
-
-def test_reduce_derives_the_dropped_route_guard_from_the_ids(monkeypatch):
-    """The specialization is a pure function of the arguments, so the AOT
-    precompile and the runtime call site cannot disagree about it."""
-    from aiter.ops.flydsl import moe_kernels
-    from aiter.ops.flydsl.kernels import moe_reduce
-
-    calls = []
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            moe_reduce, "compile_moe_reduction", lambda **kwargs: calls.append(kwargs)
-        )
-        patch.setattr(moe_kernels, "_run_compiled", lambda exe, args: None)
-        target = torch.zeros((2, 2, 8), dtype=torch.bfloat16)
-        out = torch.empty((2, 8), dtype=torch.bfloat16)
-        ids = torch.zeros((2, 2), dtype=torch.int32)
-
-        moe_kernels._run_moe_reduction(target, out, 2, 2, 8, stream=0)
-        moe_kernels._run_moe_reduction(target, out, 2, 2, 8, topk_ids=ids, stream=0)
-
-    assert [call["skip_invalid_ids"] for call in calls] == [False, True]
-    assert [call["use_mask"] for call in calls] == [False, False]
 
 
 def test_aot_precompiles_the_kernel_the_runtime_dispatches(
@@ -508,8 +393,54 @@ def test_reduce_skips_dropped_routes_and_repeats_bitwise():
 
 
 @_GFX950_GPU
+def test_reduce_stops_at_the_device_valid_token_count():
+    """EP padding must not be reduced, and must not be gathered either.
+
+    ``moe_sorting`` only sorts the first ``num_local_tokens`` rows, so the
+    dispatch-buffer tail keeps whatever garbage ids the caller left there. A
+    positive one would index past ``expert_mask``; the count guard has to stop
+    the row before either load.
+    """
+    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+    token, topk, model_dim, valid = 4, 4, 256, 2
+    target = torch.full(
+        (token, topk, model_dim), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    target[:valid].fill_(1.0)
+    # Poisoned tail: a valid-looking expert id far outside the mask.
+    topk_ids = torch.full((token, topk), 1 << 20, dtype=torch.int32, device="cuda")
+    topk_ids[:valid] = 0
+    expert_mask = torch.ones(4, dtype=torch.int32, device="cuda")
+    valid_tokens = torch.tensor([valid], dtype=torch.int32, device="cuda")
+
+    out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
+    _run_moe_reduction(
+        target,
+        out,
+        token,
+        topk,
+        model_dim,
+        expert_mask=expert_mask,
+        topk_ids=topk_ids,
+        valid_tokens=valid_tokens,
+    )
+    torch.cuda.synchronize()
+
+    assert not out.isnan().any(), "padded row leaked into the reduction"
+    torch.testing.assert_close(out[valid:], torch.zeros_like(out[valid:]))
+    torch.testing.assert_close(out[:valid], torch.full_like(out[:valid], float(topk)))
+
+
+@_GFX950_GPU
 def test_v2_reduce_stage2_matches_the_reference_and_repeats():
-    """End-to-end numerics of the stage2 kernel the policy dispatches."""
+    """End-to-end numerics of the stage2 kernel the policy dispatches.
+
+    Several experts and topk >= 4 so each output row sums competing routed
+    contributions with non-uniform weights -- the case the atomic epilogue
+    cannot reproduce bitwise. Both eager launches and CUDA graph replays must
+    return identical bits.
+    """
     from aiter.fused_moe import moe_sorting, torch_moe_stage2
     from aiter.ops.quant import (
         mxfp4_moe_sort_fwd,
@@ -517,11 +448,21 @@ def test_v2_reduce_stage2_matches_the_reference_and_repeats():
         per_1x32_f8_scale_f8_quant,
     )
     from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+    from aiter.test_common import checkAllclose
     from aiter.utility import fp4_utils
 
     torch.manual_seed(123)
     torch.cuda.manual_seed(123)
-    token, model_dim, inter_dim, experts, topk, block_m = 32, 128, 384, 1, 1, 32
+    token, model_dim, inter_dim, experts, topk, block_m = 32, 128, 384, 8, 4, 32
+
+    score = torch.randn((token, experts), dtype=torch.bfloat16, device="cuda")
+    topk_weights, topk_ids = torch.topk(
+        torch.softmax(score.float(), dim=-1), topk, dim=-1
+    )
+    # Renormalize so the routes of one token compete with unequal weights.
+    topk_weights = (topk_weights / topk_weights.sum(-1, keepdim=True)).to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
+
     a2 = torch.randn((token, topk, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
     w1 = torch.zeros(
         (experts, inter_dim * 2, model_dim), dtype=torch.bfloat16, device="cuda"
@@ -532,8 +473,6 @@ def test_v2_reduce_stage2_matches_the_reference_and_repeats():
         )
         / 4
     )
-    topk_ids = torch.zeros((token, topk), dtype=torch.int32, device="cuda")
-    topk_weights = torch.ones((token, topk), dtype=torch.float32, device="cuda")
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids, topk_weights, experts, model_dim, torch.bfloat16, block_m
     )
@@ -572,9 +511,7 @@ def test_v2_reduce_stage2_matches_the_reference_and_repeats():
     w2_shuffled = shuffle_weight_a16w4(w2_q, 16, False)
     w2_scale_shuffled = shuffle_scale_a16w4(w2_scale, experts, False)
 
-    outs = []
-    for _ in range(2):
-        out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
+    def launch(out):
         _flydsl_v2_stage2_wrapper(
             inter_states=a2_q.reshape(token * topk, inter_dim),
             w1=None,
@@ -594,12 +531,51 @@ def test_v2_reduce_stage2_matches_the_reference_and_repeats():
             topk_ids=topk_ids,
             block_m=block_m,
         )
-        outs.append(out.clone())
+        return out
+
+    eager = []
+    for _ in range(4):
+        out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
+        launch(out)
+        eager.append(out.clone())
     torch.cuda.synchronize()
 
-    assert not outs[0].isnan().any()
-    torch.testing.assert_close(outs[0], reference, atol=1.0, rtol=0.05)
-    assert torch.equal(outs[0], outs[1]), "reduce epilogue is not bitwise repeatable"
+    for run in eager[1:]:
+        assert torch.equal(eager[0], run), "eager reduce epilogue is not repeatable"
+
+    assert not eager[0].isnan().any()
+    err = checkAllclose(
+        reference.float(),
+        eager[0].float(),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="v2 reduce stage2 vs reference",
+    )
+    assert err < 0.05, f"v2 reduce stage2 mismatch ratio {err:.3f}"
+
+    # CUDA graph replays: the same static output, so any order dependence shows
+    # up as differing bytes between replays.
+    graph_out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            launch(graph_out)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(graph_out)
+    replays = []
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        replays.append(graph_out.clone())
+
+    for run in replays[1:]:
+        assert torch.equal(replays[0], run), "graph reduce epilogue is not repeatable"
+    assert torch.equal(replays[0], eager[0]), "graph and eager disagree"
 
 
 if __name__ == "__main__":

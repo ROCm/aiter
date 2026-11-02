@@ -2592,6 +2592,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    valid_tokens=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2649,6 +2650,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        valid_tokens=valid_tokens,
     )
 
 
@@ -3092,6 +3094,7 @@ def _mxfp4_a4w4_stage2_fw(
     use_valid_token_count=False,
     expert_mask=None,
     topk_ids=None,
+    valid_tokens=None,
     **_kwargs,
 ):
 
@@ -3145,6 +3148,7 @@ def _mxfp4_a4w4_stage2_fw(
             use_valid_token_count=use_valid_token_count,
             expert_mask=expert_mask,
             topk_ids=topk_ids,
+            valid_tokens=valid_tokens,
         )
     if bias2 is not None:
         raise ValueError(f"MXMOE GEMM2 {kernelName2!r} does not support bias")
@@ -3244,6 +3248,7 @@ def _flydsl_v2_stage2_wrapper(
     topk_weights=None,
     reverse_sorted=None,
     use_valid_token_count=False,
+    valid_tokens=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -3344,6 +3349,9 @@ def _flydsl_v2_stage2_wrapper(
             # always, masked experts under EP) and GEMM2 leaves those per-route
             # slots unwritten. _run_moe_reduction skips them when it can read
             # the ids; without them the buffer has to be initialized here.
+            # This fill only covers the per-route slots. Rows of `out` past
+            # num_local_tokens are handled by the reduction's count guard
+            # (zeros); the atomic epilogue leaves them undefined.
             target.zero_()
     mxfp4_moe_gemm2(
         inter_sorted_quant=_mxfp4_scale_u8(inter_states),
@@ -3418,6 +3426,12 @@ def _flydsl_v2_stage2_wrapper(
             topk_weights=topk_weights if _defer_w else None,
             fp8_scale_blk=_fp8_scale_blk,
             fp8_pitch_align=_fp8_pitch_align,
+            valid_tokens=(
+                valid_tokens
+                if valid_tokens is not None
+                # num_valid_ids[1] is the per-call local token count.
+                else (num_valid_ids.reshape(-1)[1:2] if use_valid_token_count else None)
+            ),
         )
     return out
 
@@ -3506,40 +3520,32 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
-# MXFP4 MoE stage2 runs the deterministic per-route ``reduce`` epilogue by
-# default; the ``atomic`` epilogue is an order-dependent rollback switch. See
-# _apply_mxfp4_stage2_determinism_policy.
-@functools.lru_cache(maxsize=128)
-def _log_mxfp4_stage2_policy(kernel2, selected, keys):
-    """Log one decision per (row, kernel, outcome); bounded by the cache."""
+# One line per process: the decision is global (an env switch + a name
+# grammar), so per-row logging only repeats it.
+_MXFP4_STAGE2_POLICY_LOGGED = set()
+
+
+def _log_mxfp4_stage2_policy(kernel2, selected):
+    """Log the stage2 epilogue decision once per outcome per process."""
+    outcome = "reduce" if selected else "atomic"
+    if outcome in _MXFP4_STAGE2_POLICY_LOGGED:
+        return
+    _MXFP4_STAGE2_POLICY_LOGGED.add(outcome)
     if selected:
         logger.info(
-            "[fused_moe] MXFP4 stage2 deterministic epilogue selected "
-            f"keys={keys} rejected_kernel={kernel2} selected_kernel={selected}"
+            "[fused_moe] MXFP4 layout-v2 stage2 uses the deterministic reduce "
+            f"epilogue (first row: {kernel2} -> {selected})"
         )
     else:
         logger.warning(
             "[fused_moe] MXFP4 atomic stage2 epilogue re-enabled by "
             f"{ATOMIC_STAGE2_ENV}=1; its accumulation order is not "
-            "reproducible, so MTP/speculative decoding and prefix reuse can "
-            f"diverge keys={keys} kernel={kernel2}"
+            f"reproducible (first row: {kernel2})"
         )
 
 
-def _apply_mxfp4_stage2_determinism_policy(cfg, *, keys):
-    """Run the MXFP4 stage2 epilogue that is reproducible across launches.
-
-    The v2 layout GEMM2 accumulates one token's routed contributions with BF16
-    read-modify-write adds in its ``atomic`` epilogue, so the rounding of every
-    partial sum depends on workgroup arrival order and two launches with
-    identical inputs can return different bits. This can change MTP/speculative
-    verification and prefix-reuse results. Tuned atomic v2 layout GEMM2 rows
-    are rewritten to the epilogue-only ``reduce`` sibling, which writes one
-    private row per (token, route) and reduces them in fixed order; both
-    epilogues compile from the same tile/dtype parameters. Every other stage-2
-    family is left alone. ``AITER_MXFP4_ATOMIC_STAGE2=1`` is an explicit deployer
-    rollback that restores the order-dependent tuned epilogue.
-    """
+def _apply_mxfp4_stage2_determinism_policy(cfg):
+    """Rewrite a tuned v2 stage2 ``atomic`` row to its ``reduce`` sibling."""
     if cfg is None:
         return cfg
     kernel2 = str(cfg.get("kernelName2", "") or "").strip()
@@ -3547,7 +3553,7 @@ def _apply_mxfp4_stage2_determinism_policy(cfg, *, keys):
     if reduce2 is None:
         return cfg
     atomic = atomic_stage2_opt_in()
-    _log_mxfp4_stage2_policy(kernel2, None if atomic else reduce2, keys)
+    _log_mxfp4_stage2_policy(kernel2, None if atomic else reduce2)
     if atomic:
         return cfg
     # Never mutate the cached tuning row: it still serves the atomic opt-in.
@@ -3851,7 +3857,7 @@ def get_2stage_cfgs(
 
     # Apply the epilogue policy before the validation below so every later
     # check and the stage2 metadata are built from the kernel that will run.
-    cfg = _apply_mxfp4_stage2_determinism_policy(cfg, keys=keys)
+    cfg = _apply_mxfp4_stage2_determinism_policy(cfg)
 
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()
@@ -5106,16 +5112,18 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = (
             25.0 if linear_beta is None else float(linear_beta)
         )
-    # moe_sorting drops the routes it cannot place (negative router ids always,
-    # masked experts under EP) and GEMM2 leaves their per-route slots unwritten.
-    # The flydsl reduce epilogues skip those slots when handed the ids, so give
-    # them to every wrapper that can reach a reduce kernel -- EP still needs the
-    # mask on top for the remote-expert routes.
+    # The flydsl reduce epilogues need the router ids (and, under EP, the
+    # mask) to skip the route slots GEMM2 leaves unwritten.
     uses_flydsl_v2_stage2 = _is_flydsl_v2_layout_stage2(metadata.stage2)
     if stage2_func is _flydsl_stage2_wrapper or uses_flydsl_v2_stage2:
         extra_stage2_args["topk_ids"] = topk_ids
         if expert_mask is not None:
             extra_stage2_args["expert_mask"] = expert_mask
+        # EP batches pad the dispatch buffer past the received token count;
+        # those rows have no written GEMM2 slots, so the reduce kernel must
+        # stop at the device-side count instead of reading them.
+        if num_local_tokens is not None:
+            extra_stage2_args["valid_tokens"] = num_local_tokens
     if uses_flydsl_v2_stage2:
         extra_stage2_args["use_valid_token_count"] = num_local_tokens is not None
         if not doweight_stage1 and _flydsl_stage2_fp8_enabled():

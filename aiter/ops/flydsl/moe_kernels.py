@@ -1057,13 +1057,15 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    valid_tokens=None,
 ):
     """Topk reduction epilogue for stage2 reduce mode.
 
-    ``moe_sorting`` drops every route whose router id is negative, so the slot
-    GEMM2 writes per (token, route) is left uninitialized for those routes. When
-    ``topk_ids`` is available the kernel skips them (and, under EP, the
-    mask-rejected ones) instead of summing garbage into ``out``.
+    ``valid_tokens`` is a device scalar with the per-call local token count.
+    Rows at or beyond it are caller padding that GEMM2 never writes, so the
+    kernel zeroes them instead of reducing poisoned memory (and, under EP,
+    instead of gathering ``expert_mask`` for a garbage id). Passing ``None``
+    reduces every row up to ``token_num``.
     """
     use_mask = expert_mask is not None
     if use_mask and topk_ids is None:
@@ -1074,6 +1076,7 @@ def _run_moe_reduction(
     # function of the arguments so the AOT precompile cannot disagree with the
     # runtime call site.
     skip_invalid_ids = topk_ids is not None
+    use_valid_tokens = valid_tokens is not None
     # Map torch dtype -> compile_moe_reduction dtype_str
     if out.dtype == torch.float16:
         _reduce_dtype_str = "f16"
@@ -1086,10 +1089,11 @@ def _run_moe_reduction(
 
     if _reduce_dtype_str is None:
         # Unsupported dtype for the masked kernel -- fall back to torch.sum.
-        # This drops the EP mask, so only valid for non-EP runs.
-        if use_mask:
+        # It cannot honour either guard (it sums unwritten route slots), so the
+        # fallback is only valid for a caller that zero-filled them.
+        if use_mask or skip_invalid_ids or use_valid_tokens:
             raise NotImplementedError(
-                f"Masked moe reduction not supported for dtype {out.dtype}"
+                f"Guarded moe reduction not supported for dtype {out.dtype}"
             )
         torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
         return
@@ -1117,7 +1121,7 @@ def _run_moe_reduction(
     if use_mask:
         em = expert_mask.to(torch.int32).contiguous()
     else:
-        # Placeholder; the kernel ignores it when use_mask=False (and for fp8).
+        # Placeholder; the kernel ignores it when use_mask=False.
         em = torch.empty(0, device=out.device, dtype=torch.int32)
     # Real ids make the kernel skip the routes moe_sorting dropped; without
     # them the caller has to have zeroed those rows (see the v2 stage2 wrapper).
@@ -1132,6 +1136,13 @@ def _run_moe_reduction(
         topk_weights.to(torch.float32).contiguous()
         if use_weight
         else torch.empty(0, device=out.device, dtype=torch.float32)
+    )
+    # per-call local token count, read on-device so a graph replay with a
+    # smaller batch is honoured without a host sync.
+    vt = (
+        valid_tokens.reshape(-1)[:1].to(device=out.device, dtype=torch.int32)
+        if use_valid_tokens
+        else torch.empty(0, device=out.device, dtype=torch.int32)
     )
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -1148,6 +1159,7 @@ def _run_moe_reduction(
         use_weight=use_weight,
         scale_blk=fp8_scale_blk if is_fp8 else None,
         pitch_align=fp8_pitch_align if is_fp8 else None,
+        valid_tokens=use_valid_tokens,
     )
     _run_compiled(
         reduce_exe,
@@ -1157,6 +1169,7 @@ def _run_moe_reduction(
             ptr_arg(em),
             ptr_arg(tk),
             ptr_arg(tw),
+            ptr_arg(vt),
             token_num,
             stream,
         ),
@@ -2058,6 +2071,7 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    valid_tokens: torch.Tensor | None = None,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2143,6 +2157,7 @@ def _flydsl_moe_stage2_impl(
                 model_dim,
                 expert_mask,
                 topk_ids,
+                valid_tokens=valid_tokens,
             )
         return out
 
@@ -2348,6 +2363,7 @@ def _flydsl_moe_stage2_impl(
             is_fp8=_s2_fp8_inter,
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
+            valid_tokens=valid_tokens,
         )
     return out
 
@@ -2384,6 +2400,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2405,6 +2422,10 @@ def flydsl_moe_stage2(
         post-GEMM reduction fuses the EP validity gather
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+
+    valid_tokens: optional device scalar with the per-call local token count
+        (``num_valid_ids[1]`` from ``moe_sorting``). Rows past it are caller
+        padding that neither GEMM2 nor the reduction may read.
     """
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
@@ -2437,6 +2458,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        valid_tokens=valid_tokens,
     )
 
 

@@ -73,7 +73,7 @@ def _job_key(job: dict) -> tuple:
             job.get("enable_bias", False),
             job.get("g2_spart"),
             job.get("g2_bf16_lds"),
-            bool(job.get("use_valid_token_count", False) and job["epilog"] == "atomic"),
+            bool(job.get("use_valid_token_count", False)),
         )
     if job["stage"] == 1:
         return (
@@ -115,12 +115,16 @@ def _job_key(job: dict) -> tuple:
 
 
 def parse_csv(
-    csv_path: "str | io.TextIOBase", swiglu_limit: float | None = None
+    csv_path: "str | io.TextIOBase",
+    swiglu_limit: float | None = None,
+    *,
+    rewrite_epilogue: bool = True,
 ) -> "list[dict[str, object]]":
     """Parse a tuned CSV path or text stream into deduplicated AOT jobs.
 
     ``swiglu_limit`` defaults to AITER_MXFP4_TUNE_SWIGLU_LIMIT, else the
-    activation default.
+    activation default. ``rewrite_epilogue`` applies the runtime stage-2
+    epilogue policy; tuning candidates are compiled under their own names.
     """
     from aiter.fused_moe import (
         _flydsl_stage2_fp8_enabled,
@@ -173,7 +177,7 @@ def parse_csv(
 
             kn1 = (row.get("kernelName1") or "").strip()
             kn2 = (row.get("kernelName2") or "").strip()
-            if not _ATOMIC_STAGE2:
+            if rewrite_epilogue and not _ATOMIC_STAGE2:
                 # Same policy get_2stage_cfgs applies at runtime: a tuned atomic
                 # layout-v2 row dispatches its reduce sibling, so precompile that
                 # name -- the epilogue also decides the fp8 route-out below.
@@ -262,8 +266,10 @@ def parse_csv(
                     if bias_supported and include_bias_variants
                     else [False]
                 )
+                # atomic and reduce both read cumsum_tensor[1] when an EP
+                # caller passes num_local_tokens; scatter never does.
                 count_options = (
-                    (False, True) if v2_g2["epilog"] == "atomic" else (False,)
+                    (False,) if v2_g2["epilog"] == "scatter" else (False, True)
                 )
                 for enable_bias in enable_bias_options:
                     effective_out_dtype = out_dtype
@@ -338,7 +344,11 @@ def parse_csv(
 
 
 def jobs_from_rows(rows, *, include_bias_variants=True):
-    """Build deduplicated AOT jobs from in-memory tuner candidate rows."""
+    """Build deduplicated AOT jobs from in-memory tuner candidate rows.
+
+    Candidates compile under the name the tuner will launch, so the epilogue
+    policy is not applied here (``_port_e2e`` launches the candidate as given).
+    """
     rows = [
         dict(row, _include_bias_variants="1" if include_bias_variants else "0")
         for row in rows
@@ -351,7 +361,7 @@ def jobs_from_rows(rows, *, include_bias_variants=True):
     writer.writeheader()
     writer.writerows(rows)
     stream.seek(0)
-    return parse_csv(stream)
+    return parse_csv(stream, rewrite_epilogue=False)
 
 
 def _dummy(nbytes=256):
@@ -523,6 +533,7 @@ def _compile_v2_stage2(job):
     if job["epilog"] == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
+        use_valid_tokens = bool(job.get("use_valid_token_count", False))
         _run_moe_reduction(
             target,
             out,
@@ -531,12 +542,20 @@ def _compile_v2_stage2(job):
             job["N_OUT"],
             expert_mask=None,
             # The runtime always forwards topk_ids, which enables the
-            # dropped-route guard; a real int32 placeholder precompiles that
-            # same specialization instead of the unmasked one.
-            topk_ids=torch.zeros((job["BM"], job["topk"]), dtype=torch.int32),
+            # dropped-route guard; a CPU int32 placeholder precompiles that
+            # same specialization instead of the unmasked one. CPU, like the
+            # surrounding placeholders: compile-only workers may own no GPU.
+            topk_ids=torch.zeros(
+                (job["BM"], job["topk"]), dtype=torch.int32, device="cpu"
+            ),
             stream=0,
             is_fp8=is_fp8_route_out,
             topk_weights=d if is_fp8_route_out else None,
+            valid_tokens=(
+                torch.zeros(1, dtype=torch.int32, device="cpu")
+                if use_valid_tokens
+                else None
+            ),
         )
 
 
