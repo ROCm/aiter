@@ -87,6 +87,7 @@ if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
+TDM_EARLY_TIMEOUT = int(os.environ.get("AITER_FLYDSL_TDM_EARLY_TIMEOUT", "1"))
 if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 if PLANAR_LDS not in (0, 1):
@@ -99,6 +100,8 @@ if FORCE_1X4_CLUSTER not in (0, 1):
     raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
 if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
+if TDM_EARLY_TIMEOUT not in (0, 1):
+    raise ValueError("AITER_FLYDSL_TDM_EARLY_TIMEOUT must be 0 or 1")
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
@@ -278,6 +281,7 @@ def launch_gemm_a8w4_tdm(
         stage1_act,
         has_bias,
         TDM_DESCRIPTOR_VERSION,
+        TDM_EARLY_TIMEOUT,
         stage1_quant_out,
         quant_wmma_rep,
         cluster_n,
@@ -471,6 +475,7 @@ def launch_gemm_a8w4_tdm(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
+    _early_timeout = "_et0" if not TDM_EARLY_TIMEOUT else ""
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -480,7 +485,7 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_early_timeout}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -805,7 +810,7 @@ def launch_gemm_a8w4_tdm(
                 num_warps=nw,
                 # Descriptor bit 21: release to the peers already present and
                 # re-broadcast later, so early arrivals are not held for a merge.
-                early_timeout=bool(wg_mask is not None),
+                early_timeout=bool(wg_mask is not None and TDM_EARLY_TIMEOUT),
                 cache_modifier=cache_modifier,
                 **pad_kw,
             )
@@ -1039,8 +1044,7 @@ def launch_gemm_a8w4_tdm(
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
-        # Split each region's offset into a lane-varying base, which keepalive
-        # can pin, and a compile-time part that folds into ds_load's offset:.
+        # Keep stage/lane bases separate from the constant DS load offsets.
         lds_a_lane_off = (
             (wmb // 16) * 16 * A_ROW_B + lane16 * 16 + kgrp * 256
             if a_preshuffled
@@ -1062,35 +1066,69 @@ def launch_gemm_a8w4_tdm(
 
         LdsAddr = namedtuple("LdsAddr", "a b sa sb")
 
-        def calc_lds_addr(slot):
-            """Calculate the lane-specific LDS bases for one stage buffer."""
-            slot_idx = fx.Index(slot)
-            return LdsAddr(
-                a=(
+        def lds_base(addr):
+            # Hide the stage constant from address reassociation. Otherwise
+            # LLVM can fold it into every load and materialize many full VGPR
+            # addresses instead of one base plus DS offset immediates.
+            # Tied input/output: identity, no instruction or memory barrier.
+            return fx.Int32(
+                llvm_dialect.InlineAsmOp(
+                    res=T.i32,
+                    operands_=[_raw(fx.Int32(addr))],
+                    asm_string="",
+                    constraints="=v,0",
+                    has_side_effects=False,
+                    is_align_stack=False,
+                ).res
+            )
+
+        def calc_payload_bases(slot):
+            return (
+                lds_base(
                     stC_idx
                     + A_LDS_OFF
-                    + slot_idx * A_LDS_STAGE
+                    + fx.Index(slot) * A_LDS_STAGE
                     + fx.index_cast(T.index, lds_a_lane_off)
                 ),
-                b=(
+                lds_base(
                     stC_idx
                     + B_LDS_OFF
-                    + slot_idx * B_LDS_STAGE
+                    + fx.Index(slot) * B_LDS_STAGE
                     + fx.index_cast(T.index, lds_b_lane_off)
                 ),
-                sa=(
+            )
+
+        def calc_scale_bases(slot):
+            return (
+                lds_base(
                     stC_idx
                     + SA_LDS_OFF
-                    + slot_idx * SA_LDS_STAGE
+                    + fx.Index(slot) * SA_LDS_STAGE
                     + fx.index_cast(T.index, lds_sa_lane_off)
                 ),
-                sb=(
+                lds_base(
                     stC_idx
                     + SB_LDS_OFF
-                    + slot_idx * SB_LDS_STAGE
+                    + fx.Index(slot) * SB_LDS_STAGE
                     + fx.index_cast(T.index, lds_sb_lane_off)
                 ),
             )
+
+        # Materialize each constant-stage base in the prologue. KSL/operand
+        # offsets stay in DS immediates instead of rebuilding scale addresses
+        # inside the unrolled ring. Runtime-stage paths keep their fallback.
+        payload_bases = [calc_payload_bases(s) for s in range_constexpr(num_buffers)]
+        scale_bases = [calc_scale_bases(s) for s in range_constexpr(num_buffers)]
+
+        def calc_lds_addr(slot):
+            """Get the lane-specific LDS bases for one stage buffer."""
+            if const_expr(isinstance(slot, int)):
+                a_base, b_base = payload_bases[slot]
+                sa_base, sb_base = scale_bases[slot]
+            else:
+                a_base, b_base = calc_payload_bases(slot)
+                sa_base, sb_base = calc_scale_bases(slot)
+            return LdsAddr(a=a_base, b=b_base, sa=sa_base, sb=sb_base)
 
         def load_a(base, wm, ksl):
             off = (
@@ -1183,8 +1221,25 @@ def launch_gemm_a8w4_tdm(
                     register_class=fx.rocdl.VGPR,
                     start=512 + idx * WMMA_VECTOR_DWORDS,
                 )
-        for cf in c_frags:
-            cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
+
+        def init_accumulators():
+            # Cover prologue TDM latency before the first pipeline wait.
+            rocdl.sched_barrier(0)
+            for cf in c_frags:
+                # A tied identity emits no instruction, but its side effect
+                # keeps zero materialization from sinking past the wait.
+                zero = fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
+                cf.store(
+                    llvm_dialect.InlineAsmOp(
+                        res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
+                        operands_=[zero],
+                        asm_string="",
+                        constraints="=v,0",
+                        has_side_effects=True,
+                        is_align_stack=False,
+                    ).res
+                )
+            rocdl.sched_barrier(0)
 
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
@@ -1195,12 +1250,13 @@ def launch_gemm_a8w4_tdm(
         # tiles can have n_acc as low as the tail itself, so clamp it to keep at
         # least one group for the interleaved part.
         FENCE_COVER_MMA = min(8, max(0, n_acc - sched_mma_group))
+        # Whole KSL1 rows before the reuse fence, separate from IGLP group size.
+        PREFENCE_MMA = 4
 
-        def mma_rows(wm_list, act, wt, sa_k, sb_k):
-            for i in range_constexpr(len(wm_list)):
+        def mma_rows(wm_list, act, wt, sa_k, sb_k, start=0, end=None):
+            for i in range_constexpr(start, len(wm_list) if end is None else end):
                 wm = wm_list[i]
-                for wn_raw in range_constexpr(wmma_n_rep):
-                    wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
+                for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
                     scale_a = sb_k[wn if a_is_fp4 else wn // 2]
                     scale_b = sa_k[wm // 2]
@@ -1217,6 +1273,8 @@ def launch_gemm_a8w4_tdm(
                                 scale_b,
                                 scaleAType=0,
                                 scaleBType=wm % 2,
+                                # Retain activation for the next WMMA in this row.
+                                reuseB=wn + 1 < wmma_n_rep,
                             )
                         )
                     else:
@@ -1231,10 +1289,18 @@ def launch_gemm_a8w4_tdm(
                         )
 
         DS_A = 2 if a_is_fp4 else 4
-        DS_B = 2
+        # FP4 WMMA spans N32: load_b joins two halves, each with two b128 reads.
+        DS_B = 4 if a_is_fp4 else 2
         sb_pairs = output_n_rep // 2
         sa_pairs = (wmma_m_rep + 1) // 2
-        BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
+        # Packed scale b32 reads merge pairwise into native ds_load_2addr.
+        # Keep a conservative scalar-read count for the alternate A-scale
+        # addressing paths, where pairing is not guaranteed.
+        SA_DS = (
+            sa_pairs if row_major_ascale or tdm_as_in_prologue else ceildiv(sa_pairs, 2)
+        )
+        SB_DS = ceildiv(sb_pairs, 2)
+        BS_DS = wmma_n_rep * DS_B + SB_DS + SA_DS
         STATE_DS = wmma_m_rep * DS_A + BS_DS
 
         SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
@@ -1256,6 +1322,8 @@ def launch_gemm_a8w4_tdm(
                 fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
                 for _ in range_constexpr(wmma_n_rep)
             ]
+            sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
+            sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
             if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
                 slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
                 assert slot_width <= 128
@@ -1267,11 +1335,19 @@ def launch_gemm_a8w4_tdm(
                     fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
                     reg += WMMA_VECTOR_DWORDS
                 assert reg <= 256 + (slot_idx + 1) * 128
+                # WMMA scales use v0-v255. Keep the two scale slots disjoint
+                # from one another and from the pinned payload/accumulators.
+                scale_reg = 64 + slot_idx * (SA_WIDTH + SB_WIDTH)
+                assert scale_reg + SA_WIDTH + SB_WIDTH <= 256
+                fx.set_register(sa, register_class=fx.rocdl.VGPR, start=scale_reg)
+                fx.set_register(
+                    sb, register_class=fx.rocdl.VGPR, start=scale_reg + SA_WIDTH
+                )
             return RmemSlot(
                 a=a,
                 b=b,
-                sa=fx.make_rmem_tensor(SA_WIDTH, fx.Int32),
-                sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
+                sa=sa,
+                sb=sb,
             )
 
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
@@ -1323,9 +1399,24 @@ def launch_gemm_a8w4_tdm(
             num_outstanding_tdm=None,
             issue_fn=None,
             fence_fn=None,
+            pre_fence_rows=0,
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
             reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
+            if const_expr(pre_fence_rows > 0):
+                sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
+                mma_rows(
+                    FRONT,
+                    cur_rmem.a[:front_wm],
+                    cur_rmem.b,
+                    sa_k,
+                    sb_k,
+                    end=pre_fence_rows,
+                )
+                # Close the prefix region before the LDS-reuse fence. The
+                # suffix hints must not count these WMMAs a second time.
+                rocdl.sched_mfma(pre_fence_rows * wmma_n_rep)
+                rocdl.sched_barrier(0)
             if const_expr(issue_fn is not None):
                 # The carried operands may still be reading the LDS buffer
                 # that issue_fn recycles. Retire those reads before all waves
@@ -1340,7 +1431,14 @@ def launch_gemm_a8w4_tdm(
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
             sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-            mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
+            mma_rows(
+                FRONT,
+                cur_rmem.a[:front_wm],
+                cur_rmem.b,
+                sa_k,
+                sb_k,
+                start=pre_fence_rows,
+            )
             if const_expr(len(BACK) > 0):
                 mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
             if const_expr(reuse_cur_rmem):
@@ -1396,12 +1494,14 @@ def launch_gemm_a8w4_tdm(
                     previous = current
                 return counts
 
-            def emit_hints(ksl, tail_mfma=0):
+            def emit_hints(ksl, tail_mfma=0, pre_fence_mma=0):
                 has_next = ksl + 1 < kws or (
                     ksl + 1 == kws and next_stage_lds_addr is not None
                 )
-                if const_expr(ksl == 0):
-                    rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
+                if const_expr(ksl == 0 and not rmem_preloaded):
+                    # Initial operands must be loaded before their first MMA.
+                    # A carried slot needs no leading DS group.
+                    rocdl.sched_dsrd(STATE_DS)
                 # Keep one normal group for the LDS/TDM scheduling slots. Small
                 # tiles can have no more MFMAs than the requested fence tail.
                 tail_mfma = min(tail_mfma, max(0, n_acc - sched_mma_group))
@@ -1410,6 +1510,7 @@ def launch_gemm_a8w4_tdm(
                 # turning the complete A/B/scale prefetch into long LDS bursts.
                 mma_group = min(sched_mma_group, mma_total) if KWS > 1 else 1
                 first_group = min(sched_first_group, mma_total) if KWS > 1 else 1
+                assert 0 <= pre_fence_mma <= mma_total
                 remaining_mma = mma_total - first_group
                 remaining_slots = (
                     (remaining_mma + mma_group - 1) // mma_group
@@ -1432,9 +1533,16 @@ def launch_gemm_a8w4_tdm(
                 for i in range_constexpr(schedule_slots):
                     if const_expr(tdm_schedule[i] > 0):
                         rocdl.sched_vmem(tdm_schedule[i])
+                    # Omit WMMAs already emitted before the fence, but retain
+                    # every DS group: STATE_DS still covers all native reads.
+                    group_mma = max(
+                        0,
+                        mma_groups[i] - max(0, pre_fence_mma - sum(mma_groups[:i])),
+                    )
+                    if const_expr(group_mma > 0):
+                        rocdl.sched_mfma(group_mma)
                     if const_expr(i == 0 and first_ds > 0):
                         rocdl.sched_dsrd(first_ds)
-                    rocdl.sched_mfma(mma_groups[i])
                     remaining_ds = future_schedule[i] - (first_ds if i == 0 else 0)
                     if const_expr(remaining_ds > 0):
                         rocdl.sched_dsrd(remaining_ds)
@@ -1462,6 +1570,20 @@ def launch_gemm_a8w4_tdm(
                     )
                 else:
                     next_rmem, load_nxt_fn = None, None
+                # Split whole WMMA rows on K256's issuing KSL1.
+                # Other shapes and drain steps keep their original schedule.
+                pre_fence_rows = (
+                    PREFENCE_MMA // wmma_n_rep
+                    if (
+                        a_is_fp4
+                        and kws == 2
+                        and ksl == 1
+                        and prefetch_kt is not None
+                        and PREFENCE_MMA % wmma_n_rep == 0
+                        and PREFENCE_MMA <= front_wm * wmma_n_rep
+                    )
+                    else 0
+                )
                 k_step(
                     rmem_slots[ksl % 2],
                     next_rmem,
@@ -1475,9 +1597,10 @@ def launch_gemm_a8w4_tdm(
                         else None
                     ),
                     fence_fn=(next_stage_fence_fn if const_expr(carries) else None),
+                    pre_fence_rows=pre_fence_rows,
                 )
-                # One region per k128: sched_group_barrier only partitions
-                # within a region, and only sched_barrier delimits one.
+                # The optional prefix has its own region. Keep all DS/TDM
+                # hints here, but omit all already-issued prefix WMMAs.
                 emit_hints(
                     ksl,
                     (
@@ -1489,6 +1612,7 @@ def launch_gemm_a8w4_tdm(
                         )
                         else 0
                     ),
+                    pre_fence_mma=pre_fence_rows * wmma_n_rep,
                 )
                 rocdl.sched_barrier(0)
 
@@ -1566,6 +1690,7 @@ def launch_gemm_a8w4_tdm(
                     # Post-compute issue: better for decode (small tile_m).
                     for i in range_constexpr(num_buffers):
                         issue(i, i)
+                    init_accumulators()
                     n_steady = K_TILES - num_buffers
                     if const_expr(next_stage_on):
                         # Every rolled iteration reads the carry, so prime it here --
@@ -1640,6 +1765,7 @@ def launch_gemm_a8w4_tdm(
                     PRE = num_buffers if next_stage_on else num_buffers - 1
                     for i in range_constexpr(PRE):
                         issue(i, i)
+                    init_accumulators()
                     n_steady = K_TILES - PRE
                     if const_expr(next_stage_on):
                         pipeline_fence(outstanding=TDM_PER * (PRE - 1))
