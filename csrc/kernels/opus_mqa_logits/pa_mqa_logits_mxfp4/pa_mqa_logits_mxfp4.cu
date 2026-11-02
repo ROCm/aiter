@@ -513,8 +513,8 @@ void check_i32_vector(const aiter_tensor_t& t, const char* name) {
 // by the leading field count).
 #define MQA_LOGITS_INSTANCE_FIELDS                                                              \
     X(id) X(heads) X(rows_per_wave) X(waves) X(stages) X(scale_tdm) X(gather) X(entry_rows_min) \
-    X(entry_rows_max) X(tile_keys) X(modes) X(flat_out) X(resident_table) X(resident_free)      \
-    X(resident_prefill)
+    X(entry_rows_max) X(tile_keys) X(modes) X(flat_out) X(kv_nt) X(slot_waves)                  \
+    X(resident_table) X(resident_free) X(resident_prefill)
 
 int mqa_logits_mxfp4_instances(int device_id, aiter_tensor_t& out) {
     aiter_detail::AiterThrowGuard throw_guard;
@@ -536,8 +536,9 @@ int mqa_logits_mxfp4_instances(int device_id, aiter_tensor_t& out) {
         for (int i = 0; i < n; ++i, ++id) {
             const ol::mqa_logits_instance& in = table[i];
             if (arch != in.arch) continue;
-            // CTAs resident at once in each compiled mode: occupancy x CUs, queried, not
-            // hard-coded (a stale figure silently under-fills the part).
+            // Slots (CTAs, or a slot-wave instance's waves) resident at once in each compiled
+            // mode: occupancy x CUs, queried, not hard-coded (a stale figure silently under-fills
+            // the part).
             int resident[ol::SCHED_MODES] = {};
             for (int m = 0; m < ol::SCHED_MODES; ++m) {
                 if (!(in.modes & (1 << m))) continue;
@@ -547,8 +548,9 @@ int mqa_logits_mxfp4_instances(int device_id, aiter_tensor_t& out) {
             }
             const int row[] = {id, in.heads, in.rows_per_wave, in.waves, in.stages, in.scale_tdm,
                                in.gather, in.entry_rows_min, in.entry_rows_max, in.tile_keys,
-                               in.modes, in.flat_out, resident[ol::SCHED_TABLE],
-                               resident[ol::SCHED_FREE], resident[ol::SCHED_PREFILL]};
+                               in.modes, in.flat_out, in.kv_nt, in.slot_waves,
+                               resident[ol::SCHED_TABLE], resident[ol::SCHED_FREE],
+                               resident[ol::SCHED_PREFILL]};
             static_assert(sizeof(row) / sizeof(row[0]) == fields);
             recs.insert(recs.end(), row, row + fields);
         }

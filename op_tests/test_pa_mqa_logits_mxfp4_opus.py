@@ -9,7 +9,7 @@ correctness.
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes semantics --checks edges graph
 
 Models (``-m``): ``v4`` (DeepSeek-V4, 64 index heads, compression ratio 4, 64-row pages, one a
-table entry), ``v41`` (V4.1 full layers, 32 heads, 8-row pages, a table entry a 256-token PAGE
+table entry), ``v41`` (V4.1 full layers, 32 heads, 8-row pages, a table entry a 128-token PAGE
 of them, ratio ``--ratio``) and ``cand`` (V4.1 candidate layers: every row its own sequence and
 its own table of 8-row pages).
 
@@ -57,7 +57,9 @@ SUPPORTED_GFX = ["gfx950", "gfx1250"]
 
 D = 128
 PAGE_ROWS = 8  # the index plane's page
-PAGE_TOKENS = 256  # ATOM's KV PAGE: a full layer's table entry spans it, compressed
+# ATOM's KV PAGE, tokens: a full layer's table entry spans one, compressed. V4's at ratio 4, V4.1's
+# at ratios 2 and 1.
+V4_PAGE_TOKENS, PAGE_TOKENS = 256, 128
 CANDIDATE_BLOCKS = 2048
 TILE = 64
 PREFILL_ROWS = 16384
@@ -125,10 +127,11 @@ def _tables(ctx_keys, rows_per_entry, g):
 def full_layer(label, ctx, rows_per_seq, ratio, *, seed=0):
     """Sequences whose last token sits at ``ctx[b] - 1``, each scoring its last
     ``rows_per_seq[b]`` tokens at compression ``ratio`` (row at position p sees (p + 1) // ratio
-    keys). A table entry is one 256-token PAGE: 256 / ratio keys."""
+    keys). A table entry is one PAGE: 256 / ratio keys at ratio 4 (V4), else 128 / ratio.
+    """
     g = _gen(seed)
     keys = [c // ratio for c in ctx]
-    ppb = PAGE_TOKENS // ratio // PAGE_ROWS
+    ppb = (V4_PAGE_TOKENS if ratio == 4 else PAGE_TOKENS) // ratio // PAGE_ROWS
     table, entries = _tables(keys, ppb * PAGE_ROWS, g)
     ends, qsl = [], [0]
     for c, n in zip(ctx, rows_per_seq):
@@ -199,7 +202,10 @@ def make_data(rows: Rows, heads, *, seed=1):
     row to row, so a scale applied to the wrong 32 elements or lane half shows."""
     g = _gen(seed)
     u8 = {"dtype": torch.uint8, "generator": g}
-    keys, n = rows.num_pages * PAGE_ROWS, rows.rows
+    keys, n = (
+        -(-rows.num_pages * PAGE_ROWS // TILE) * TILE,
+        rows.rows,
+    )  # whole 64-row groups
     return Fp4Data(
         values=torch.randint(0, 256, (keys, D // 2), **u8),
         scales=torch.randint(120, 128, (keys, D // 32), **u8),
@@ -262,14 +268,15 @@ def _permuted():
 
 
 def _scale_to_gfx950(e8, rows_per_group):
-    """[rows, 4] natural E8M0 -> gfx950's [rows / 64, 2 (g), 32 (m), 4 (kt, tile)], a lane's four
-    bytes in one dword: byte kt * 2 + tile of dword (g, m) is row tile * 32 + m's block
-    kt * 2 + g. ``rows_per_group``: 64 heads (q_scale) or a 64-row page (kv_scale)."""
-    groups = e8.shape[0] // rows_per_group
+    """[rows, 4] natural E8M0 -> gfx950's [rows / G, 2 (g), 32 (m), 2 * G / 32 (kt, tile)], G =
+    ``rows_per_group``: byte kt * tiles + tile of lane (g, m) is row tile * 32 + m's block
+    kt * 2 + g. G: a row's heads (q_scale; 64 -- one dword a lane -- or 32) or the KV plane's
+    64-row group (kv_scale)."""
+    groups, tiles = e8.shape[0] // rows_per_group, rows_per_group // 32
     return (
-        e8.reshape(groups, rows_per_group // 32, 32, 2, 2)
+        e8.reshape(groups, tiles, 32, 2, 2)
         .permute(0, 4, 2, 3, 1)
-        .reshape(groups, 2, 32, 4)
+        .reshape(groups, 2, 32, 2 * tiles)
         .contiguous()
     )
 
@@ -293,16 +300,14 @@ class Case:
                 d.values.view(-1, self.page_size, D // 2),
                 d.scales.view(-1, self.page_size, D // 32),
             )
-        # kv_cache[page, b, o, :] holds key o's 32-element block b, 16 packed bytes
-        kv = (
-            d.values.view(-1, self.page_size, D // 32, 16)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
+        # kv_cache[group, b, o, :] holds the 64-row group's key o's 32-element block b, 16 packed
+        # bytes; a page is the group or an aligned slice of it
+        group = M._PERMUTE_ROWS[get_gfx()]
+        kv = d.values.view(-1, group, D // 32, 16).permute(0, 2, 1, 3).contiguous()
         return (
             _scale_to_gfx950(d.q_scale.reshape(-1, D // 32), self.heads),
             kv,
-            _scale_to_gfx950(d.scales, self.page_size),
+            _scale_to_gfx950(d.scales, group),
         )
 
     def arch_inputs(self):
@@ -423,13 +428,9 @@ def ways(case: Case):
 
 
 def takes(case: Case):
-    """Whether this arch's KV layout exists at the case's page size (gfx950: 64 rows only)."""
-    return M._PAGE_SIZE.get(get_gfx(), case.page_size) == case.page_size
-
-
-def serves(model):
-    """Whether this op serves `model` on this arch (gfx950 sends V4.1 to FlyDSL)."""
-    return (get_gfx(), MODEL_HEADS[model]) not in M._ELSEWHERE
+    """Whether this arch's KV layout exists at the case's page size (gfx950: a page is its 64-row
+    group or an aligned slice of it)."""
+    return M._PERMUTE_ROWS.get(get_gfx(), case.page_size) % case.page_size == 0
 
 
 def default_way(case: Case):
@@ -1091,11 +1092,6 @@ def main():
         help="semantics: which checks",
     )
     args = parser.parse_args()
-    for model in [m for m in args.model if not serves(m)]:
-        aiter.logger.warning(
-            "%s: %s", model, M._ELSEWHERE[get_gfx(), MODEL_HEADS[model]]
-        )
-    args.model = [m for m in args.model if serves(m)]
 
     def ratios(model):
         return [4] if model == "v4" else [1] if model == "cand" else args.ratio

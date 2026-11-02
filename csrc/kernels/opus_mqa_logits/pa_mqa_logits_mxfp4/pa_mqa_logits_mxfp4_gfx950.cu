@@ -2,33 +2,51 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // gfx950's MXFP4 MQA-logits instances: their traits and registry entries. DeepSeek-V4's 64 index
-// heads on 64-row pages (V4.1's 32 heads run FlyDSL's row-group kernel on gfx950). The kernels are
-// in pa_mqa_logits_mxfp4_gfx950_kv.cuh and pa_mqa_logits_mxfp4_gfx950_qshare.cuh.
+// heads and V4.1's 32, on one KV layout: the plane permuted 64 rows at a time, a 64-key tile one
+// such group. The kernels are in pa_mqa_logits_mxfp4_gfx950_kv.cuh,
+// pa_mqa_logits_mxfp4_gfx950_qshare.cuh and pa_mqa_logits_mxfp4_gfx950_rows.cuh.
 //
 // Built with `-mllvm -enable-post-misched=1` (optCompilerConfig.json's per-source flags),
 // overriding aiter's default of 0: the kernels' MFMA / VALU interleave depends on it.
 #include "pa_mqa_logits_mxfp4.h"
 
+#include <type_traits>
+
 namespace opus_logits::gfx950 {
 
 // -- traits ---------------------------------------------------------------------------------------
 // Host-safe: the host pass sizes the launch from them. No D_DATA: opus::fp4_t is device-only.
-// DeepSeek-V4 geometry (64 heads, D = 128, 64-row pages) in the KV cache writer's MFMA-permuted
-// layouts: q [T, H, D/2] natural, q_scale [T, 2, 32, 4], kv [pages, 4, 64, 16],
-// kv_scale [pages, 2, 32, 4].
+// D = 128, the KV cache writer's MFMA-permuted layouts: q [T, H, D/2] natural,
+// q_scale [T, 2, 32, H / 16], kv [groups, 4, 64, 16], kv_scale [groups, 2, 32, 4]. A 64-row group
+// is a V4 page, or eight V4.1 8-row pages (page p: rows (p % 8) * 8 .. + 7 of group p / 8); the
+// table names whole groups (V4) or runs of them (V4.1 full layers, an entry 2^tpb_shift groups).
 
-// What both kernels share: one wave computes a whole 64-key tile (one page) for one query row.
+// What both kernels share: one wave computes a whole 64-key tile (one group) for one query row of
+// N_HEADS heads, M_TILES MFMA m-tiles of 32 heads.
+template<int N_HEADS_ = 64>
 struct mqa_logits_traits {
-    static constexpr int N_HEADS      = 64;
-    static constexpr int HEAD_DIM     = 128;
-    static constexpr int PAGE_SIZE    = 64;
-    static constexpr int KV_TILE_SIZE = PAGE_SIZE;
-    static constexpr int WAVE_SIZE    = 64;
+    static constexpr int N_HEADS       = N_HEADS_;
+    static constexpr int ROWS_PER_WAVE = 1;
+    static constexpr int HEAD_DIM      = 128;
+    static constexpr int PAGE_SIZE     = 64;   // the permuted group
+    static constexpr int KV_TILE_SIZE  = PAGE_SIZE;
+    static constexpr int WAVE_SIZE     = 64;
+    static constexpr int SLOT_WAVES    = 1;    // a CTA is one schedule slot
+
+    // A table entry names one tile; V4.1's logits may go to a flat out (out_offsets).
+    static constexpr bool ENTRY_RUNS = false;
+    static constexpr bool FLAT_OUT   = N_HEADS == 32;
+    static constexpr bool KV_NT      = false;
+    // V4.1 candidate layers (GATHER, kv_traits): a tile gathers TILE_PAGES 8-row pages, and each
+    // n-tile holds GATHER_NT_KEYS consecutive keys of a lane's page.
+    static constexpr bool GATHER         = false;
+    static constexpr int  PAGE_ROWS      = 8;
+    static constexpr int  TILE_PAGES     = KV_TILE_SIZE / PAGE_ROWS;   // 8
 
     using D_WEIGHT = __bf16;   // per-head weights
     using D_ACC    = float;    // MFMA accumulator
     using D_OUT    = float;    // output logits
-    using D_SCALE  = int;      // four E8M0 bytes, one dword a lane
+    using D_SCALE  = int;      // a key's four E8M0 bytes, one dword a lane
 
     static constexpr int MMA_M = 32;   // heads
     static constexpr int MMA_N = 32;   // keys
@@ -37,10 +55,11 @@ struct mqa_logits_traits {
     static constexpr int ELEM_BITS   = 4;
     static constexpr int SCALE_BLOCK = 32;
 
-    static constexpr int M_TILES  = N_HEADS / MMA_M;        // 2
-    static constexpr int N_TILES  = KV_TILE_SIZE / MMA_N;   // 2
-    static constexpr int K_TILES  = HEAD_DIM / MMA_K;       // 2: the outer K loop
-    static constexpr int K_CHUNKS = MMA_K / SCALE_BLOCK;    // 2: scale blocks a k-tile
+    static constexpr int M_TILES        = N_HEADS / MMA_M;        // 2 (V4) / 1 (V4.1)
+    static constexpr int N_TILES        = KV_TILE_SIZE / MMA_N;   // 2
+    static constexpr int GATHER_NT_KEYS = PAGE_ROWS / N_TILES;    // 4
+    static constexpr int K_TILES        = HEAD_DIM / MMA_K;       // 2: the outer K loop
+    static constexpr int K_CHUNKS       = MMA_K / SCALE_BLOCK;    // 2: scale blocks a k-tile
 
     // C fragment of one m-tile: n = L % 32, m = rept * 8 + (L / 32) * 4 + pack.
     static constexpr int C_FRAG         = MMA_M * MMA_N / WAVE_SIZE;   // 16
@@ -48,7 +67,7 @@ struct mqa_logits_traits {
     static constexpr int GRPM_C         = WAVE_SIZE / GRPN_C;           // 2
     static constexpr int PACK_C         = 4;
     static constexpr int REPT_C         = C_FRAG / PACK_C;              // 4
-    static constexpr int HEADS_PER_LANE = M_TILES * C_FRAG;             // 32
+    static constexpr int HEADS_PER_LANE = M_TILES * C_FRAG;             // 32 / 16
 
     // A lane holds one 32-element block, 16 B: the low half of the 256-bit MFMA operand.
     static constexpr int KV_GRP_BYTES     = SCALE_BLOCK * ELEM_BITS / 8;                 // 16
@@ -65,15 +84,17 @@ struct mqa_logits_traits {
     static constexpr int STRIDE_KV_KTILE = K_CHUNKS * STRIDE_KV_G;    // 2048
     static constexpr int KV_PAGE_BYTES   = K_TILES * STRIDE_KV_KTILE; // 4096
 
-    // q_scale [T][g][m][4] / kv_scale [pages][g][m][4]: lane L = g * 32 + m reads dword L, whose
-    // byte kt * 2 + tile is the E8M0 of (head / key tile * 32 + m, block kt * K_CHUNKS + g). The
-    // MFMA's op_sel picks the byte: kt * M_TILES + mi for A, kt * N_TILES + nt for B.
+    // q_scale [T][g][m][KT * M_TILES] / kv_scale [groups][g][m][4]: lane L = g * 32 + m reads
+    // element L (a row's D_QSCALE, a group's dword), whose byte kt * tiles + tile is the E8M0 of
+    // (head / key tile * 32 + m, block kt * K_CHUNKS + g). The MFMA's op_sel picks the byte:
+    // kt * M_TILES + mi for A, kt * N_TILES + nt for B.
+    using D_QSCALE = std::conditional_t<M_TILES == 2, int, unsigned short>;
     static constexpr int KVS_PAGE_BYTES = K_CHUNKS * MMA_N * 4;   // 256
 
-    static_assert(M_TILES == 2 && N_TILES == 2 && K_TILES == 2,
-                  "the kernels unroll two m-tiles, two n-tiles and two k-tiles");
-    static_assert(K_TILES * M_TILES == 4 && K_TILES * N_TILES == 4,
-                  "a scale dword holds exactly the four (kt, tile) bytes");
+    static_assert(M_TILES >= 1 && M_TILES <= 2, "a row is one or two m-tiles of heads");
+    static_assert(N_TILES == 2 && K_TILES == 2, "the kernels unroll two n-tiles and two k-tiles");
+    static_assert(K_TILES * M_TILES == (int)sizeof(D_QSCALE) && K_TILES * N_TILES == 4,
+                  "a lane's scale element holds exactly its (kt, tile) bytes");
     static_assert(STRIDE_KV_G == PAGE_SIZE * KV_GRP_BYTES,
                   "a 32-element block's stride must span the whole page");
     static_assert(KV_GRP_BYTES == 16 && A_BYTES_PER_LANE == 16,
@@ -82,23 +103,28 @@ struct mqa_logits_traits {
                   "a lane and its permlane32 partner must together hold every head");
 };
 
-// One query row a CTA, the KV read straight from global into a register double buffer.
-struct kv_traits : mqa_logits_traits {
+// One query row a CTA, the KV read straight from global into a register double buffer. GATHER:
+// a candidate layer's row (V4.1), a tile 8 arbitrary 8-row pages.
+template<int N_HEADS_ = 64, bool GATHER_ = false>
+struct kv_traits : mqa_logits_traits<N_HEADS_> {
+    using base = mqa_logits_traits<N_HEADS_>;
+    static constexpr bool GATHER    = GATHER_;
+    static_assert(!GATHER || N_HEADS_ == 32, "a gathered tile is a candidate row's (V4.1)");
     static constexpr int NUM_WAVES  = 1;
-    static constexpr int BLOCK_SIZE = NUM_WAVES * WAVE_SIZE;
+    static constexpr int BLOCK_SIZE = NUM_WAVES * base::WAVE_SIZE;
     static constexpr int STAGES     = 2;
     static constexpr int SCALE_TDM  = 0;
 };
 
 // QPB query rows of one sequence a CTA, one a wave, sharing each 64-key tile through a ring of
-// STAGES LDS stages.
+// STAGES LDS stages (V4).
 //
 // The page copy: a 4096 B page is one buffer_load_lds of 16 B a lane per 4 waves. The first
 // ISSUE_WAVES waves (the largest power of two <= QPB, at most 4) copy it, ASYNC_ISSUES issues
 // each, into a byte-exact LDS image. Every wave copies its own image of the page's 256 B of
 // scales (64 lanes x 4 B), so it reads one page id a phase.
 template<int QPB_, int STAGES_ = 4>
-struct qshare_traits : mqa_logits_traits {
+struct qshare_traits : mqa_logits_traits<> {
     static constexpr int Q_PER_BLOCK = QPB_;
     static constexpr int NUM_WAVES   = Q_PER_BLOCK;
     static constexpr int BLOCK_SIZE  = NUM_WAVES * WAVE_SIZE;
@@ -154,6 +180,58 @@ struct qshare_traits : mqa_logits_traits {
     static_assert(Q_PER_BLOCK >= 1 && Q_PER_BLOCK <= 16, "Q_PER_BLOCK out of range");
 };
 
+// V4.1 full layers (32 heads): ROWS_PER_WAVE query rows of one sequence a wave, MFMA 32x32x64,
+// STAGES KV tiles in registers (rows_kernel). The same layouts: q_scale [T, 2, 32, 2],
+// kv [groups, 4, 64, 16], kv_scale [groups, 2, 32, 4]. SLOT_WAVES waves a CTA, each a schedule
+// slot of its own (instance_kernels counts grids and residency in slots).
+template<int ROWS_PER_WAVE_, bool KV_NT_, int STAGES_ = 3, int SLOT_WAVES_ = 1, int MIN_WAVES_ = 2>
+struct rows_traits {
+    static constexpr int  N_HEADS       = 32;
+    static constexpr int  ROWS_PER_WAVE = ROWS_PER_WAVE_;
+    static constexpr int  HEAD_DIM      = 128;
+    static constexpr int  PAGE_SIZE     = 64;   // the permuted group, a tile
+    static constexpr int  KV_TILE_SIZE  = PAGE_SIZE;
+    static constexpr int  PAGE_ROWS     = 8;    // V4.1's page
+    static constexpr int  WAVE_SIZE     = 64;
+    static constexpr int  NUM_WAVES     = 1;   // the rows a slot: rows_per_cta = ROWS_PER_WAVE
+    static constexpr int  SLOT_WAVES    = SLOT_WAVES_;
+    static constexpr int  BLOCK_SIZE    = WAVE_SIZE * SLOT_WAVES;
+    static constexpr int  STAGES        = STAGES_;
+    static constexpr int  SCALE_TDM     = 0;
+    static constexpr bool GATHER        = false;
+    static constexpr bool ENTRY_RUNS    = true;
+    static constexpr bool FLAT_OUT      = true;
+    // Nontemporal KV loads (buffer aux 2) where no other CTA reads the walk again (decode): they
+    // stream past the caches. Prefill re-reads a sequence's keys group after group from L2.
+    static constexpr bool KV_NT         = KV_NT_;
+    static constexpr int  KV_AUX        = KV_NT ? 2 : 0;
+    static constexpr int  MIN_WAVES     = MIN_WAVES_;   // a SIMD's, __launch_bounds__
+
+    using D_WEIGHT = __bf16;
+    using D_OUT    = float;
+
+    static constexpr int MMA_M = 32;   // heads
+    static constexpr int MMA_N = 32;   // keys
+    static constexpr int MMA_K = 64;   // head_dim
+
+    static constexpr int N_TILES = KV_TILE_SIZE / MMA_N;        // 2
+    static constexpr int K_TILES = HEAD_DIM / MMA_K;            // 2
+    static constexpr int C_FRAG  = MMA_M * MMA_N / WAVE_SIZE;   // 16
+
+    static constexpr int KV_GRP_BYTES   = 16;                          // a lane's 32 fp4
+    static constexpr int Q_HEAD_BYTES   = HEAD_DIM / 2;                // 64
+    static constexpr int Q_ROW_BYTES    = N_HEADS * Q_HEAD_BYTES;      // 2048
+    static constexpr int W_ROW_ELEMS    = N_HEADS;
+    static constexpr int QS_ROW_SHORTS  = 2 * N_HEADS;                 // [g][m] shorts (kt0, kt1)
+    static constexpr int STRIDE_KV_M    = KV_GRP_BYTES;                // key
+    static constexpr int STRIDE_KV_G    = PAGE_SIZE * KV_GRP_BYTES;    // a 32-element block: 1 KB
+    static constexpr int KV_PAGE_BYTES  = HEAD_DIM / 32 * STRIDE_KV_G; // 4096
+    static constexpr int KVS_PAGE_BYTES = PAGE_SIZE * 4;               // 256
+
+    static_assert(ROWS_PER_WAVE >= 1 && ROWS_PER_WAVE <= 8 && STAGES >= 2, "rows / stages");
+    static_assert(N_TILES == 2 && K_TILES == 2 && C_FRAG == 16, "the kernel's item shape");
+};
+
 }  // namespace opus_logits::gfx950
 
 // The device pass on gfx950 gets the kernels; every other pass gets empty stubs so the launch
@@ -161,38 +239,63 @@ struct qshare_traits : mqa_logits_traits {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
 #include "pa_mqa_logits_mxfp4_gfx950_kv.cuh"
 #include "pa_mqa_logits_mxfp4_gfx950_qshare.cuh"
+#include "pa_mqa_logits_mxfp4_gfx950_rows.cuh"
 #else
 namespace opus_logits::gfx950 {
 template<class T, int SCHED> __global__ void kv_kernel(mqa_logits_mxfp4_kargs) {}
 template<class T, int SCHED> __global__ void qshare_kernel(mqa_logits_mxfp4_kargs) {}
+template<class T, int SCHED> __global__ void rows_kernel(mqa_logits_mxfp4_kargs) {}
 }  // namespace opus_logits::gfx950
 #endif
 
 namespace opus_logits::gfx950 {
 namespace {
 
-// Six- and eight-row qshare CTAs are not registered: one such CTA fills a CU and its waves stall
-// at the per-phase barrier together, where two or four smaller CTAs a CU overlap theirs.
-using h64_r1w1s2L = kv_traits;          // decode, 1 row a sequence; prefill
+// V4: six- and eight-row qshare CTAs are not registered: one such CTA fills a CU and its waves
+// stall at the per-phase barrier together, where two or four smaller CTAs a CU overlap theirs.
+using h64_r1w1s2L = kv_traits<>;        // decode, 1 row a sequence; prefill
 using h64_r1w2s4T = qshare_traits<2>;   // decode, 2 rows a sequence; 5-6 (three groups)
 using h64_r1w4s4T = qshare_traits<4>;   // decode, 3-4 rows; 7-8 (two groups)
+// V4.1 full layers: a wave a sequence's rows (up to eight), nontemporal for decode (no other CTA
+// reads a walk again), cached for prefill (the groups of a sequence re-read its keys). Decode
+// also has four-wave CTAs, a slot a wave, for large batches: a CTA's slots are cut by one wave
+// and the grid is a quarter the CTAs.
+using h32_r1w1s3Ln   = rows_traits<1, true>;
+using h32_r2w1s3Ln   = rows_traits<2, true>;
+using h32_r3w1s3Ln   = rows_traits<3, true>;
+using h32_r4w1s2Ln   = rows_traits<4, true, 2>;
+using h32_r6w1s3Ln   = rows_traits<6, true>;
+using h32_r8w1s3Ln   = rows_traits<8, true>;
+using h32_r1w1s3Lnx4 = rows_traits<1, true, 3, 4>;
+using h32_r2w1s3Lnx4 = rows_traits<2, true, 3, 4>;
+using h32_r3w1s3Lnx4 = rows_traits<3, true, 3, 4>;
+using h32_r4w1s2Lnx4 = rows_traits<4, true, 2, 4>;
+using h32_r6w1s3Lnx4 = rows_traits<6, true, 3, 4>;
+using h32_r8w1s3Lnx4 = rows_traits<8, true, 3, 4>;
+using h32_r4w1s3L    = rows_traits<4, false>;
+// V4.1 candidate layers.
+using h32g_r1w1s2L = kv_traits<32, true>;
 
-// A table entry is one 64-row page (pages_per_block 1): the MFMA-permuted kv_cache / kv_scale
-// are laid out a page at a time.
+// A table entry is one 64-row group (V4: a page; pages_per_block 1), or (V4.1 full layers) a
+// power-of-two run of up to 2^MAX_TPB_SHIFT of them: the MFMA-permuted kv_cache / kv_scale are laid
+// out a group at a time. V4.1 candidate layers: an 8-row page.
 template<class T, class K>
 constexpr mqa_logits_instance entry() {
+    constexpr int run_max = T::ENTRY_RUNS ? T::PAGE_SIZE << MAX_TPB_SHIFT : T::PAGE_SIZE;
     return {.arch           = "gfx950",
             .heads          = T::N_HEADS,
-            .rows_per_wave  = 1,
+            .rows_per_wave  = T::ROWS_PER_WAVE,
             .waves          = T::NUM_WAVES,
             .stages         = T::STAGES,
             .scale_tdm      = T::SCALE_TDM,
-            .gather         = 0,
-            .entry_rows_min = T::PAGE_SIZE,
-            .entry_rows_max = T::PAGE_SIZE,
+            .gather         = T::GATHER,
+            .entry_rows_min = T::GATHER ? T::PAGE_ROWS : T::PAGE_SIZE,
+            .entry_rows_max = T::GATHER ? T::PAGE_ROWS : run_max,
             .tile_keys      = T::KV_TILE_SIZE,
             .modes          = K::modes,
-            .flat_out       = 0,
+            .flat_out       = T::FLAT_OUT,
+            .kv_nt          = T::KV_NT,
+            .slot_waves     = T::SLOT_WAVES,
             // a page's byte offset from kv_cache is 32 bits (a 0xffffffff-byte buffer resource)
             .max_kv_bytes   = 0xffffffff,
             .launch         = K::launch,
@@ -203,6 +306,14 @@ template<class T>
 constexpr mqa_logits_instance kv_entry() {
     using K = instance_kernels<T::BLOCK_SIZE, kv_kernel<T, SCHED_TABLE>, kv_kernel<T, SCHED_FREE>,
                                kv_kernel<T, SCHED_PREFILL>>;
+    return entry<T, K>();
+}
+
+template<class T>
+constexpr mqa_logits_instance rows_entry() {
+    using K = instance_kernels<T::BLOCK_SIZE, rows_kernel<T, SCHED_TABLE>,
+                               rows_kernel<T, SCHED_FREE>, rows_kernel<T, SCHED_PREFILL>,
+                               T::SLOT_WAVES>;
     return entry<T, K>();
 }
 
@@ -224,6 +335,20 @@ const mqa_logits_instance* mqa_logits_gfx950_instances(int* count) {
         kv_entry<h64_r1w1s2L>(),
         qshare_entry<h64_r1w2s4T>(),
         qshare_entry<h64_r1w4s4T>(),
+        rows_entry<h32_r1w1s3Ln>(),
+        rows_entry<h32_r2w1s3Ln>(),
+        rows_entry<h32_r3w1s3Ln>(),
+        rows_entry<h32_r4w1s2Ln>(),
+        rows_entry<h32_r6w1s3Ln>(),
+        rows_entry<h32_r8w1s3Ln>(),
+        rows_entry<h32_r1w1s3Lnx4>(),
+        rows_entry<h32_r2w1s3Lnx4>(),
+        rows_entry<h32_r3w1s3Lnx4>(),
+        rows_entry<h32_r4w1s2Lnx4>(),
+        rows_entry<h32_r6w1s3Lnx4>(),
+        rows_entry<h32_r8w1s3Lnx4>(),
+        rows_entry<h32_r4w1s3L>(),
+        kv_entry<h32g_r1w1s2L>(),
     };
     *count = static_cast<int>(sizeof(table) / sizeof(table[0]));
     return table;

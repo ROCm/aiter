@@ -39,17 +39,21 @@ LAYOUTS (the caller's; nothing here touches the data). Every arch::
 and per arch (the KV cache writer's; both have the same byte counts, so only the ndim tells
 them apart -- checked here, as nothing on device can)::
 
-               gfx1250 (natural)                 gfx950 (MFMA-permuted, page_size 64)
-    q_scale    [rows, H, D/32]   uint8 (E8M0)    [rows, 2, 32, 4]
-    kv_cache   [pages, page_size, D/2]           [pages, 4, page_size, 16]
-    kv_scale   [pages, page_size, D/32]          [pages, 2, 32, 4]
+               gfx1250 (natural)                 gfx950 (MFMA-permuted 64 rows at a time)
+    q_scale    [rows, H, D/32]   uint8 (E8M0)    [rows, 2, 32, H/16]
+    kv_cache   [pages, page_size, D/2]           [groups, 4, 64, 16]
+    kv_scale   [pages, page_size, D/32]          [groups, 2, 32, 4]
+
+On gfx950 a page is a whole 64-row group (V4) or an aligned slice of one (V4.1's 8-row page p is
+rows (p % 8) * 8 .. + 7 of group p / 8): the plane is laid out a group at a time, whatever the page.
 
 Only ``out[r, c]`` for ``c < row_ends[r]`` is written; rows past ``query_start_loc[-1]`` (CUDAGraph
 padding) are untouched. The caller owes what the kernel cannot check: ``row_ends`` does not
 decrease along a sequence, ``row_ends[r] <= max_seq_len`` and within the sequence's table, and a
-page's offset fits 32 bits -- on gfx950 its byte offset (page id x 4 KiB: a ``kv_cache`` under
-4 GiB, which the launch checks), on gfx1250 its row (page id x ``page_size``). ``max_seq_len`` is
-under 2^30 (a row's logits are addressed in 32 bits); the config checks it.
+page's offset fits 32 bits -- on gfx950 its 64-row group's byte offset (group id x 4 KiB: a
+``kv_cache`` under 4 GiB, which the launch checks), on gfx1250 its row (page id x
+``page_size``). ``max_seq_len`` is under 2^30 (a row's logits are addressed in 32 bits); the
+config checks it.
 
 NaN: relu is IEEE ``maximum``. A logit is NaN exactly where a key's or the row's E8M0 scales hold
 0xFF, or a weight is NaN or Inf (the kernels compute relu as max_num and put the NaN back from the
@@ -86,7 +90,22 @@ _DECODE_MAX_QLEN = 8
 # stalls every SIMD at its per-phase barrier at once).
 _GFX1250_H64_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 6, 8: 4}
 _GFX950_H64_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 2, 8: 4}
-# 32 heads (V4.1 full layers): (rows_per_wave, waves, scale_tdm), a sequence's rows a CTA.
+# 32 heads (V4.1 full layers). gfx950: a wave scores a sequence's rows, as many as the tier's
+# (rows_per_wave), keys nontemporal; from _GFX950_H32_SLOT_WORK rows x keys (max_rows x
+# max_seq_len) on, four-wave CTAs of a slot a wave: a quarter the CTAs and a CTA's slots cut once,
+# which pays only on large launches. Prefill: four rows a wave, cached. gfx1250: (rows_per_wave,
+# waves, scale_tdm), a sequence's rows a CTA.
+_GFX950_H32_DECODE_TIERS = {1: 1, 2: 2, 3: 3, 4: 4, 6: 6, 8: 8}
+_GFX950_H32_SLOT_WAVES = 4
+_GFX950_H32_SLOT_WORK = 12 << 20
+_GFX950_H32_PREFILL = 4
+# Free on gfx950, one- and two-row waves (V4.1 decode at one or two rows a sequence): slots of at
+# least _GFX950_H32_FREE_WALK row-tiles (rows x 64-key tiles, at max_seq_len), but no fewer than
+# one a SIMD. Each slot cuts the batch for itself before its first page, so many short walks pay
+# that cut over and over, and a one- or two-row wave keeps its SIMD's loads going alone. From
+# three rows a wave a tile's compute covers the cut, and every resident slot is used.
+_GFX950_H32_FREE_WALK = 32
+_GFX950_H32_FREE_LIGHT_ROWS = 2
 _GFX1250_H32_DECODE_TIERS = {
     1: (1, 1, 0),
     2: (1, 2, 1),
@@ -103,19 +122,23 @@ _CANDIDATE_PREFILL_ROWS = 16384
 _PREFILL_ROUNDS = 8
 _PREFILL_MIN_WALK = 16
 _CAND_MAX_WALK = 32
+# Candidate rows on gfx950 (one row a CTA over its own table of 2048 8-row pages, 256 tiles at
+# most): the walk -- tiles a CTA -- by the launch's row-tiles (rows x width tiles), short while
+# there are few tiles to share, longer as the grid fills. A row's parts are a multiple of
+# _GFX950_XCDS: CTAs go round-robin over the XCDs, so the same part of every row runs on one,
+# where the rows of a request -- most of their pages shared -- meet in its L2.
+_GFX950_CAND_WALK = ((3072, 2), (8192, 4), (24576, 8), (49152, 16))
+_GFX950_XCDS = 8
 _MAX_PREFILL_PARTS = 65536  # the kernels' 32-bit split (part_point) needs parts <= 2^16
 _MAX_SEQ_LEN = 1 << 30  # a row's logits are bounded by a 32-bit byte count (4 B a key)
 
 # Per arch: the ndim of q_scale / kv_scale / kv_cache, and kv_cache's page-rows dim. gfx950's are
-# MFMA-permuted (4-D, kv_cache [pages, 4, page_size, 16]); gfx1250's natural (3-D).
+# MFMA-permuted (4-D, kv_cache [groups, 4, 64, 16]); gfx1250's natural (3-D).
 _LAYOUT = {GFX950: (4, 2), GFX1250: (3, 1)}
-# Arches whose KV layout is defined for one page size only: gfx950 permutes a 64-row page at a time.
-_PAGE_SIZE = {GFX950: 64}
-# Requests an arch serves through another op, not this one.
-_ELSEWHERE = {
-    (GFX950, 32): "V4.1 (heads=32) on gfx950 runs FlyDSL's row-group kernel "
-    "(aiter.ops.flydsl.flydsl_pa_mqa_logits_fp4), not this op",
-}
+# Arches whose KV plane is permuted a group of rows at a time: gfx950's kv_cache is
+# [groups, 4, 64, 16], and a page is a whole group (V4) or an aligned slice of one (V4.1's 8 rows:
+# page p is rows (p % 8) * 8 .. + 7 of group p / 8).
+_PERMUTE_ROWS = {GFX950: 64}
 
 
 # == JIT stubs: signatures must match MQA_LOGITS_MXFP4_PYBIND exactly ============================
@@ -260,7 +283,11 @@ class _Instance:
     tile_keys: int
     modes: int  # bit m: schedule mode m is compiled
     flat_out: int  # reads out_offsets
-    resident: tuple[int, int, int]  # CTAs resident at once, a mode (0: not compiled)
+    kv_nt: int  # 1: loads the KV nontemporal (decode: no other CTA reads a walk again)
+    slot_waves: (
+        int  # > 1: a CTA's waves are schedule slots of their own (grids count slots)
+    )
+    resident: tuple[int, int, int]  # slots resident at once, a mode (0: not compiled)
 
     @property
     def rows_per_cta(self) -> int:
@@ -271,7 +298,8 @@ class _Instance:
         g = "g" if self.gather else ""
         s = "T" if self.scale_tdm else "L"
         shape = f"r{self.rows_per_wave}w{self.waves}s{self.stages}"
-        return f"h{self.heads}{g}_{shape}{s}"
+        x = f"x{self.slot_waves}" if self.slot_waves > 1 else ""
+        return f"h{self.heads}{g}_{shape}{s}" + ("n" if self.kv_nt else "") + x
 
     def has(self, mode: int) -> bool:
         return bool(self.modes >> mode & 1)
@@ -290,6 +318,12 @@ class _Instance:
 
 
 @functools.cache
+def _simds(device: torch.device) -> int:
+    """The device's SIMDs: four a CU."""
+    return torch.cuda.get_device_properties(device).multi_processor_count * 4
+
+
+@functools.cache
 def _instances(device: torch.device) -> tuple[_Instance, ...]:
     """The instances compiled for `device`'s arch, with their resident CTAs a mode."""
     buf = torch.empty(1024, dtype=torch.int32, device="cpu")
@@ -302,7 +336,7 @@ def _instances(device: torch.device) -> tuple[_Instance, ...]:
     out = []
     for i in range(0, len(rows), n):
         f = rows[i : i + n]
-        out.append(_Instance(*f[:12], resident=(f[12], f[13], f[14])))
+        out.append(_Instance(*f[:14], resident=(f[14], f[15], f[16])))
     return tuple(out)
 
 
@@ -322,7 +356,9 @@ def _tier(tiers: dict, max_qlen: int):
     return tiers[min(t for t in tiers if t >= max_qlen)]
 
 
-def _rule_gfx1250(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
+def _rule_gfx1250(
+    heads: int, entry_rows: int, max_rows: int, max_qlen: int, max_seq_len: int
+):
     """V4 decode by tier, prefill four rows a CTA; V4.1 full layers decode by tier, prefill
     eight rows a CTA; V4.1 candidate layers one row a CTA, a deeper ring below prefill size.
     """
@@ -350,20 +386,47 @@ def _rule_gfx1250(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
     return None
 
 
-def _rule_gfx950(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
-    """V4 decode by tier (qshare above one row a sequence), prefill one row a CTA. V4.1 runs
-    FlyDSL's kernel (_ELSEWHERE)."""
-    if heads != 64:
-        return None
+def _rule_gfx950(
+    heads: int, entry_rows: int, max_rows: int, max_qlen: int, max_seq_len: int
+):
+    """V4 decode by tier (qshare above one row a sequence), prefill one row a CTA; V4.1 full
+    layers decode a sequence's rows a wave by tier (four-wave CTAs for large batches), prefill
+    four rows a wave; V4.1 candidate layers one row a CTA, gathered."""
     decode = max_qlen <= _DECODE_MAX_QLEN
-    rpc = _tier(_GFX950_H64_DECODE_TIERS, max_qlen) if decode else 1
-    want = {"rows_per_cta": rpc, "tile_keys": _TILE}
-    return want, FREE if decode else PREFILL
+    if heads == 64:
+        rpc = _tier(_GFX950_H64_DECODE_TIERS, max_qlen) if decode else 1
+        want = {"rows_per_cta": rpc, "tile_keys": _TILE}
+        return want, FREE if decode else PREFILL
+    if heads == 32 and entry_rows >= _TILE:
+        want = {
+            "rows_per_wave": _GFX950_H32_PREFILL,
+            "waves": 1,
+            "kv_nt": 0,
+            "gather": 0,
+            "slot_waves": 1,
+        }
+        if decode:
+            sw = (
+                _GFX950_H32_SLOT_WAVES
+                if max_rows * max_seq_len >= _GFX950_H32_SLOT_WORK
+                else 1
+            )
+            want = {
+                "rows_per_wave": _tier(_GFX950_H32_DECODE_TIERS, max_qlen),
+                "waves": 1,
+                "kv_nt": 1,
+                "gather": 0,
+                "slot_waves": sw,
+            }
+        return want, FREE if decode else PREFILL
+    if heads == 32:
+        return {"rows_per_cta": 1, "gather": 1}, PREFILL
+    return None
 
 
-# Each arch's selection: (heads, entry_rows, max_rows, max_qlen) -> (wanted attributes, the
-# schedule-free mode), or None when no rule covers the request. Mixed batches run the prefill
-# choice.
+# Each arch's selection: (heads, entry_rows, max_rows, max_qlen, max_seq_len) -> (wanted
+# attributes, the schedule-free mode), or None when no rule covers the request. Mixed batches run
+# the prefill choice.
 _RULES = {GFX1250: _rule_gfx1250, GFX950: _rule_gfx950}
 
 
@@ -496,9 +559,9 @@ def mqa_logits_mxfp4_config(
     """The launch configuration for a shape bucket: static bounds only, no device data read.
 
     ``heads``            index heads: 64 (V4) or 32 (V4.1).
-    ``page_size``        rows of one KV page (``kv_cache.shape[1]``): 64 (V4) or 8 (V4.1).
-    ``pages_per_block``  consecutive pages a table entry names (V4.1 full layers: 16 at ratio 2,
-                         32 at ratio 1; candidate layers and V4: 1).
+    ``page_size``        rows of one KV page (gfx1250: ``kv_cache.shape[1]``): 64 (V4) or 8 (V4.1).
+    ``pages_per_block``  consecutive pages a table entry names (V4.1 full layers: 8 at ratio 2,
+                         16 at ratio 1, a 128-token PAGE; candidate layers and V4: 1).
     ``max_rows``         query rows of a call, at most (CUDAGraph padding included).
     ``max_seqs``         ``len(query_start_loc) - 1``, at most.
     ``max_qlen``         rows of one sequence, at most; a decode bucket passes its MTP depth + 1.
@@ -563,18 +626,18 @@ def _config(
             f"bits), got {max_seq_len}"
         )
     arch = _device_arch(dev)
-    if (arch, heads) in _ELSEWHERE:
-        raise ValueError(_ELSEWHERE[arch, heads])
-    if _PAGE_SIZE.get(arch, page_size) != page_size:
+    if _PERMUTE_ROWS.get(arch, page_size) % page_size:
         raise ValueError(
-            f"{arch}'s KV layout is permuted a {_PAGE_SIZE[arch]}-row page at a time; "
-            f"page_size={page_size}"
+            f"{arch}'s KV plane is permuted {_PERMUTE_ROWS[arch]} rows at a time, which a page "
+            f"must divide; page_size={page_size}"
         )
     insts = _instances(dev)
     entry_rows = page_size * pages_per_block
     supported = [i for i in insts if i.heads == heads and i.reads(entry_rows)]
     rule_of = _RULES.get(arch)
-    rule = rule_of(heads, entry_rows, max_rows, max_qlen) if rule_of else None
+    rule = (
+        rule_of(heads, entry_rows, max_rows, max_qlen, max_seq_len) if rule_of else None
+    )
     if override is not None:
         inst = _resolve_instance(insts, override)
         if inst not in supported:
@@ -704,12 +767,21 @@ def mqa_logits_mxfp4_schedule(
 
 
 # == the launch =====================================================================================
-def _prefill_parts(inst: _Instance, groups: int, width_tiles: int) -> int:
+def _prefill_parts(
+    inst: _Instance, groups: int, width_tiles: int, arch: str | None = None
+) -> int:
     """Pieces a group is cut into in the Prefill schedule, from static shapes only (the logits
     width bounds every window), so a captured graph keeps its grid. The grid is a whole number of
-    rounds of resident CTAs: a part-filled last round costs a whole one."""
+    rounds of resident CTAs: a part-filled last round costs a whole one. gfx950 candidate rows
+    instead walk by size (_GFX950_CAND_WALK)."""
     resident = inst.resident[PREFILL]
     groups = max(1, groups)
+    if inst.gather and arch == GFX950:
+        total = groups * width_tiles
+        walk = next((w for top, w in _GFX950_CAND_WALK if total <= top), _CAND_MAX_WALK)
+        parts = -(-width_tiles // walk)
+        parts = -(-parts // _GFX950_XCDS) * _GFX950_XCDS
+        return max(1, min(parts, _MAX_PREFILL_PARTS))
     if inst.gather:
         rounds = max(1, -(-groups * width_tiles // (_CAND_MAX_WALK * resident)))
         return max(1, min(rounds * resident // groups, _MAX_PREFILL_PARTS))
@@ -771,10 +843,11 @@ def mqa_logits_mxfp4(
         raise ValueError(
             f"q must be [rows, {cfg.heads}, {_TOKEN_BYTES}] (D/2 packed fp4), got {tuple(q.shape)}"
         )
-    if kv_cache.shape[page_dim] != cfg.page_size:
+    page_rows = _PERMUTE_ROWS.get(cfg.arch, cfg.page_size)
+    if kv_cache.shape[page_dim] != page_rows:
         raise ValueError(
-            f"kv_cache pages hold {kv_cache.shape[page_dim]} rows; the config is for "
-            f"{cfg.page_size}"
+            f"kv_cache's dim {page_dim} holds {kv_cache.shape[page_dim]} rows; the config "
+            f"(page_size {cfg.page_size}) needs {page_rows}"
         )
     if block_tables.dim() != 2 or block_tables.shape[1] < cfg.block_table_width:
         raise ValueError(
@@ -888,11 +961,23 @@ def mqa_logits_mxfp4(
     elif cfg._mode is not None:
         mode, cta_info = cfg._mode, cfg._empty_i32
         groups = _max_groups(rows, seqs, inst.rows_per_cta)
-        if mode == FREE:
+        if mode == FREE and cfg.arch == GFX950:
+            # one round of resident CTAs, no more than there are tiles to share out; the kernel
+            # cuts at most max(cta_target, groups) chunks
+            width_tiles = -(-cfg.max_seq_len // inst.tile_keys)
+            cta_target = max(1, min(inst.resident[FREE], groups * width_tiles))
+            light = inst.rows_per_cta <= _GFX950_H32_FREE_LIGHT_ROWS
+            if inst.heads == 32 and not inst.gather and light:
+                walk = rows * width_tiles // _GFX950_H32_FREE_WALK
+                cta_target = min(cta_target, max(_simds(out.device), walk))
+            grid = max(cta_target, groups)
+        elif mode == FREE:  # the kernel cuts at most cta_target + groups chunks
             cta_target = inst.resident[FREE]
             grid = groups + cta_target
         else:
-            parts = _prefill_parts(inst, groups, -(-cfg.max_seq_len // inst.tile_keys))
+            parts = _prefill_parts(
+                inst, groups, -(-cfg.max_seq_len // inst.tile_keys), cfg.arch
+            )
             grid = groups * parts
     else:
         # An instance without a schedule-free mode: a schedule into buffers of this call's own.

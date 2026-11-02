@@ -21,9 +21,9 @@
 //   2. row_ends[r] <= the logits width and <= what block_tables[b] covers (the width, a row's
 //      logits addressed in 32 bits, is under 2^30: the config checks that);
 //   3. query_start_loc[-1] <= rows; rows past it are neither read nor written;
-//   4. a page's offset in the cache fits 32 bits: on gfx950 its byte offset (page id x 4 KiB, so
-//      the kv_cache a call reads is under 4 GiB: the launch checks that), on gfx1250 its plane
-//      row (page id x page rows).
+//   4. a page's offset in the cache fits 32 bits: on gfx950 its 64-row group's byte offset
+//      (group id x 4 KiB, so the kv_cache a call reads is under 4 GiB: the launch checks that), on
+//      gfx1250 its plane row (page id x page rows).
 #pragma once
 #include "aiter_tensor.h"
 #include <hip/hip_runtime.h>
@@ -102,6 +102,8 @@ struct mqa_logits_instance {
     int tile_keys;        // the KV tile, the Table builder's block_k
     int modes;            // bit m: schedule mode m is compiled
     int flat_out;         // reads out_offsets
+    int kv_nt;            // 1: the KV is loaded nontemporal (a walk no other CTA reads again)
+    int slot_waves = 1;   // a CTA's waves that are schedule slots of their own (else 1)
     int64_t max_kv_bytes; // the largest kv_cache the kernels address (0: no limit)
     hipError_t (*launch)(int mode, const mqa_logits_mxfp4_kargs& k, int grid, hipStream_t stream);
     hipError_t (*occupancy)(int mode, int* ctas_per_cu);
@@ -110,7 +112,10 @@ struct mqa_logits_instance {
 using mqa_logits_kernel = void (*)(mqa_logits_mxfp4_kargs);
 
 // An instance's registry hooks from its kernel in each schedule mode (null: not compiled).
-template<int BLOCK_SIZE, mqa_logits_kernel TABLE, mqa_logits_kernel FREE, mqa_logits_kernel PREFILL>
+// SLOT_WAVES > 1: each of a CTA's SLOT_WAVES waves is a schedule slot of its own (slot = CTA *
+// SLOT_WAVES + wave); grids and residency are counted in slots, a launch rounds up to whole CTAs.
+template<int BLOCK_SIZE, mqa_logits_kernel TABLE, mqa_logits_kernel FREE, mqa_logits_kernel PREFILL,
+         int SLOT_WAVES = 1>
 struct instance_kernels {
     static constexpr int modes = (TABLE != nullptr ? 1 << SCHED_TABLE : 0) |
                                  (FREE != nullptr ? 1 << SCHED_FREE : 0) |
@@ -130,14 +135,19 @@ struct instance_kernels {
         const mqa_logits_kernel kernel = of(mode);
         if (!kernel) return hipErrorInvalidValue;
         void* args[] = {const_cast<mqa_logits_mxfp4_kargs*>(&k)};
-        return hipLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(grid),
-                               dim3(BLOCK_SIZE), args, 0, stream);
+        return hipLaunchKernel(reinterpret_cast<const void*>(kernel),
+                               dim3((grid + SLOT_WAVES - 1) / SLOT_WAVES), dim3(BLOCK_SIZE), args,
+                               0, stream);
     }
 
+    // Slots resident a CU.
     static hipError_t occupancy(int mode, int* ctas_per_cu) {
         const mqa_logits_kernel kernel = of(mode);
         if (!kernel) return hipErrorInvalidValue;
-        return hipOccupancyMaxActiveBlocksPerMultiprocessor(ctas_per_cu, kernel, BLOCK_SIZE, 0);
+        const hipError_t e =
+            hipOccupancyMaxActiveBlocksPerMultiprocessor(ctas_per_cu, kernel, BLOCK_SIZE, 0);
+        *ctas_per_cu *= SLOT_WAVES;
+        return e;
     }
 };
 

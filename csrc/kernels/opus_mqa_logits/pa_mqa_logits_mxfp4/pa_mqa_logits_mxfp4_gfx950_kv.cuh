@@ -2,8 +2,8 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // gfx950 wave64 (MFMA 32x32x64) one-row kernel: one query row a CTA, one wave over each 64-key
-// tile, the KV read straight from global into a register double buffer. Device pass on gfx950
-// only (pa_mqa_logits_mxfp4_gfx950.cu).
+// tile, the KV read straight from global into a register double buffer: V4, and V4.1's candidate
+// layers (GATHER). Device pass on gfx950 only (pa_mqa_logits_mxfp4_gfx950.cu).
 #pragma once
 #include "pa_mqa_logits_mxfp4_gfx950_common.cuh"
 
@@ -50,6 +50,11 @@ __device__ inline auto make_layout_bt(int wave) {
 
 // Grid: Table one CTA a record; Free groups + cta_target; Prefill groups x prefill_parts
 // (pa_mqa_logits_mxfp4.py sizes them). A group is one row here.
+//
+// GATHER (V4.1 candidate layers, one row): a table entry is one 8-row page and a tile is 8 of them,
+// anywhere in the plane. Lane (g, m) of n-tile nt holds tile key (m / 4) * 8 + nt * 4 + m % 4:
+// page m / 4 of the tile in both n-tiles, so a lane reads one page id a tile (a VMEM load, as the
+// contiguous walk's) and its n-tiles' keys sit an immediate apart in the page's 128 B a block.
 template<class T, int SCHED>
 __global__ __launch_bounds__(T::BLOCK_SIZE, MIN_WAVES_PER_EU)
 void kv_kernel(mqa_logits_mxfp4_kargs k) {
@@ -57,6 +62,7 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
     using D_BYTE   = uint8_t;       // fp4 is addressed in bytes
     using D_WEIGHT = typename T::D_WEIGHT;
     using D_SCALE  = typename T::D_SCALE;
+    using D_QSCALE = typename T::D_QSCALE;
     using D_ACC    = typename T::D_ACC;
     using D_OUT    = typename T::D_OUT;
 
@@ -84,6 +90,10 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
     pin_sgpr(p_q); pin_sgpr(p_q_scale); pin_sgpr(p_kv); pin_sgpr(p_kv_scale);
     pin_sgpr(p_bt); pin_sgpr(p_weights); pin_sgpr(p_out);
     pin_sgpr(stride_out); pin_sgpr(weight_scale); pin_sgpr(bt_stride);
+    [[maybe_unused]] const int* p_out_offsets = k.ptr_out_offsets;
+    [[maybe_unused]] unsigned kv_last_row = k.kv_last_row;
+    if constexpr (T::FLAT_OUT) pin_sgpr(p_out_offsets);
+    if constexpr (T::GATHER) pin_sgpr(kv_last_row);
 
     const int tid     = opus::thread_id_x();
     const int wave    = tid >> 6;
@@ -93,7 +103,7 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
 
     // CTA-uniform early return. The window is a prefix [0, local_end).
     mqa_work wk;
-    if (!mqa_assign<1, TK, SCHED>(sa, lane, wk)) return;
+    if (!mqa_assign<1, TK, SCHED, T::GATHER>(sa, lane, wk)) return;
     const int row_id      = wk.row_id;
     const int batch_id    = wk.batch_id;
     const int chunk_start = wk.chunk_start;
@@ -111,12 +121,13 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
 
     // The row folded into the base pointers to keep voffsets small.
     const D_BYTE* q_base = reinterpret_cast<const D_BYTE*>(p_q) + (size_t)row_id * T::Q_ROW_BYTES;
-    const D_SCALE* qs_base = reinterpret_cast<const D_SCALE*>(p_q_scale) + (size_t)row_id * WAVE;
+    const D_QSCALE* qs_base =
+        reinterpret_cast<const D_QSCALE*>(p_q_scale) + (size_t)row_id * WAVE;
     const D_WEIGHT* w_base =
         reinterpret_cast<const D_WEIGHT*>(p_weights) + (size_t)row_id * T::W_ROW_ELEMS;
     const int* bt_base = p_bt + (size_t)batch_id * bt_stride;
     // The out V# spans exactly the window: the hardware's range check is the whole store mask.
-    D_OUT* out_base = p_out + (size_t)row_id * stride_out;
+    D_OUT* out_base = row_out<T>(p_out, p_out_offsets, stride_out, row_id);
     const unsigned out_bytes = (unsigned)(local_end > 0 ? local_end : 0) * (unsigned)sizeof(D_OUT);
 
     auto g_q   = opus::make_gmem(q_base);
@@ -132,7 +143,7 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
     auto u_q = make_layout_q<T>(lane_m0, lane_g);
     typename Mma::vtype_a q_a[MT][KT]{};
     auto u_qs = make_layout_scale<T>(lane);
-    int q_scale;
+    int q_scale;   // the row's scale bytes, zero-extended
     auto u_w = make_layout_w<T>(lane_g);
     opus::vector_t<float, EC> w_pl[MT];
     auto u_kv  = make_layout_kv<T>(lane_m0, lane_g);
@@ -144,8 +155,20 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
     // large negative constant, never a multiple of the window: that could land back inside it.
     const int lane_bias = (lane_g != 0) ? -(chunk_start + tile_count) * TK : 0;
 
+    // Tile t of the walk: its entry's page, or (GATHER) the lane's 8-row page of it. A gathered
+    // tile's last ids run past the row's window into slots the caller may have padded with
+    // anything: clamped into the pool (unsigned, so a negative id clamps too), each reads a real
+    // page, whose keys are then never stored.
+    [[maybe_unused]] const int lane_page = lane_m0 / T::GATHER_NT_KEYS;
+    [[maybe_unused]] const unsigned last_page = (kv_last_row - (T::PAGE_ROWS - 1)) / T::PAGE_ROWS;
     auto load_page_id = [&](int tile_idx) {
-        return opus::load<1>(g_bt, u_bt + (chunk_start + tile_idx))[0];
+        if constexpr (T::GATHER) {
+            const unsigned id = (unsigned)opus::load<1>(
+                g_bt, (chunk_start + tile_idx) * T::TILE_PAGES + lane_page)[0];
+            return (int)(id < last_page ? id : last_page);
+        } else {
+            return opus::load<1>(g_bt, u_bt + (chunk_start + tile_idx))[0];
+        }
     };
     auto load_kv_scale = [&](int page_id) {
         return opus::load<1>(
@@ -154,34 +177,71 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
 
     using kv_nt_t = typename Mma::vtype_b;
     using sfrag   = opus::vector_t<float, MT * EC>;
+    using kvs_t   = std::conditional_t<T::GATHER, gather_scales, int>;
 
     auto clamp_tile = [&](int t) { return t < tile_count ? t : tile_count - 1; };
-    // NT * KT independent 16 B loads, each covering two 512 B runs.
-    auto issue_kv = [&](kv_nt_t (&kv)[NT][KT], int& kvs, int page_id) {
-        kvs = load_kv_scale(page_id);
+    // GATHER: lane (g, m)'s bytes of its page p -- group p / 8, rows (p % 8) * 8 .. + 7 -- and
+    // scale dwords. Key (p % 8) * 8 + nt * 4 + m % 4 of the group: block g at
+    // group + kt * 2048 + g * 1024 + key * 16; its scales in dword g * 32 + key % 32 at byte
+    // kt * 2 + key / 32 (the selector moves that to kt * 2 + nt, from dword lo or hi).
+    [[maybe_unused]] const int lane_kv_g =
+        lane_g * T::STRIDE_KV_G + (lane_m0 % T::GATHER_NT_KEYS) * T::STRIDE_KV_M;
+    [[maybe_unused]] const int lane_kvs_g = lane_g * T::MMA_N + lane_m0 % T::GATHER_NT_KEYS;
+    auto issue_gather = [&](kv_nt_t (&kv)[NT][KT], gather_scales& kvs, int page_id) {
+        const int grp = page_id / T::TILE_PAGES, sub = page_id % T::TILE_PAGES;
+        const int kv_off = kv_page_offset<T>(grp) + sub * T::PAGE_ROWS * T::STRIDE_KV_M + lane_kv_g;
+        const int kvs_off = grp * (T::KVS_PAGE_BYTES / (int)sizeof(D_SCALE)) +
+                            (sub % (T::TILE_PAGES / 2)) * T::PAGE_ROWS + lane_kvs_g;
+        kvs.lo  = opus::load<1>(g_kvs, kvs_off)[0];
+        kvs.hi  = opus::load<1>(g_kvs, kvs_off + T::GATHER_NT_KEYS)[0];
+        // byte kt * 2 + nt <- byte kt * 2 + half of lo (nt 0: selector 4..7) or hi (nt 1: 0..3)
+        kvs.sel = 0x02060004 + (sub / (T::TILE_PAGES / 2)) * 0x01010101;
         opus::static_for<NT>([&](auto ntc) {
             constexpr int nt = ntc.value;
             opus::static_for<KT>([&](auto ktc) {
                 constexpr int kt = ktc.value;
                 auto v = opus::load<T::KV_GRP_BYTES>(
-                    g_kv, u_kv + kv_page_offset<T>(page_id) + kt * T::STRIDE_KV_KTILE +
-                              nt * T::STRIDE_KV_NTILE);
+                    g_kv,
+                    kv_off + kt * T::STRIDE_KV_KTILE + nt * T::GATHER_NT_KEYS * T::STRIDE_KV_M);
                 opus::set_slice(kv[nt][kt], v, opus::number<0>{}, opus::number<T::KV_GRP_BYTES>{});
             });
         });
     };
+    // NT * KT independent 16 B loads, each covering two 512 B runs.
+    auto issue_kv = [&](kv_nt_t (&kv)[NT][KT], kvs_t& kvs, int page_id) {
+        if constexpr (T::GATHER) {
+            issue_gather(kv, kvs, page_id);
+        } else {
+            kvs = load_kv_scale(page_id);
+            opus::static_for<NT>([&](auto ntc) {
+                constexpr int nt = ntc.value;
+                opus::static_for<KT>([&](auto ktc) {
+                    constexpr int kt = ktc.value;
+                    auto v = opus::load<T::KV_GRP_BYTES>(
+                        g_kv, u_kv + kv_page_offset<T>(page_id) + kt * T::STRIDE_KV_KTILE +
+                                  nt * T::STRIDE_KV_NTILE);
+                    opus::set_slice(kv[nt][kt], v, opus::number<0>{},
+                                    opus::number<T::KV_GRP_BYTES>{});
+                });
+            });
+        }
+    };
 
     // One phase: refill the buffer tile t freed with tile t + 2, then tile t + 1's GEMMs, tile t's
     // relu and head reduction.
-    auto compute_phase = [&](kv_nt_t (&kv_c)[NT][KT], int& kvs_c, sfrag (&acc_c)[NT],
-                             kv_nt_t (&kv_p)[NT][KT], int& kvs_p, sfrag (&acc_p)[NT],
+    auto compute_phase = [&](kv_nt_t (&kv_c)[NT][KT], kvs_t& kvs_c, sfrag (&acc_c)[NT],
+                             kv_nt_t (&kv_p)[NT][KT], kvs_t& kvs_p, sfrag (&acc_p)[NT],
                              int& pg_c, int pf_tile, opus::vector_t<float, NT>& out) {
         __builtin_amdgcn_sched_barrier(0);
         issue_kv(kv_c, kvs_c, pg_c);
         pg_c = load_page_id(clamp_tile(pf_tile + 2));
         __builtin_amdgcn_sched_barrier(0);
-        compute_tile<T>(mma_op, q_a, q_scale, w_pl, acc_c, acc_p, kv_p, kvs_p, out);
+        compute_tile<T>(mma_op, q_a, q_scale, w_pl, acc_c, acc_p, kv_p, kv_scale_word(kvs_p), out);
     };
+    // The lane's key of n-tile 0 in a tile (n-tile nt: + nt * the n-tile's step).
+    constexpr int KEY_NT_STEP = T::GATHER ? T::GATHER_NT_KEYS : T::MMA_N;
+    const int key_col =
+        T::GATHER ? lane_page * T::PAGE_ROWS + lane_m0 % T::GATHER_NT_KEYS : key_lane;
     // Lanes L and L^32 hold the same logit after the head reduction; lane group 1 is biased out of
     // bounds. Fenced so the stores stay out of the MFMA groups' interleave.
     auto store = [&](opus::vector_t<float, NT>& out, int t) {
@@ -189,14 +249,14 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
         const int tile_off = (chunk_start + t) * TK + lane_bias;
         opus::static_for<NT>([&](auto ntc) {
             constexpr int nt = ntc.value;
-            g_out.template store<1>(out[nt], tile_off + nt * T::MMA_N + key_lane);
+            g_out.template store<1>(out[nt], tile_off + nt * KEY_NT_STEP + key_col);
         });
         __builtin_amdgcn_sched_barrier(0);
     };
 
     // Zero-initialized: fp4 fills only the low 16 B of each 256-bit operand.
     kv_nt_t kvA[NT][KT]{}, kvB[NT][KT]{};
-    int     kvsA, kvsB;
+    kvs_t   kvsA, kvsB;
     sfrag   accA[NT], accB[NT];
     int     pgA, pgB;
     opus::vector_t<float, NT> outA, outB;
@@ -211,8 +271,8 @@ void kv_kernel(mqa_logits_mxfp4_kargs k) {
     issue_kv(kvA, kvsA, load_page_id(clamp_tile(0)));
     issue_kv(kvB, kvsB, load_page_id(clamp_tile(1)));
     pgA = load_page_id(clamp_tile(2));
-    gemm_ntile<T, 0>(mma_op, q_a, q_scale, accA[0], kvA[0], kvsA);
-    gemm_ntile<T, 1>(mma_op, q_a, q_scale, accA[1], kvA[1], kvsA);
+    gemm_ntile<T, 0>(mma_op, q_a, q_scale, accA[0], kvA[0], kv_scale_word(kvsA));
+    gemm_ntile<T, 1>(mma_op, q_a, q_scale, accA[1], kvA[1], kv_scale_word(kvsA));
     pgB = load_page_id(clamp_tile(3));
     __builtin_amdgcn_sched_barrier(0);
 

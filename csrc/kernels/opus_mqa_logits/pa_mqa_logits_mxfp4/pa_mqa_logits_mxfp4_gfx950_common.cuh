@@ -66,11 +66,16 @@ __device__ inline int wave64_incl_scan(int v) {
 }
 
 // Every value that leaves here is wave-uniform (readlane / readfirstlane / the record), so the
-// kernel's pin_sgpr on them holds.
-template<int QPB, int TK, int SCHED>
-__device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& wk) {
+// kernel's pin_sgpr on them holds. GATHER: a candidate row is its own group (Prefill: no scan).
+//
+// W > 1: a CTA's W waves are W slots (slot = CTA * W + wave, the launcher counts slots). Table and
+// Prefill: each wave its own. Free: wave 0 cuts the CTA's W slots in one walk and hands them out
+// through LDS -- the cut reads and scans every sequence, and a CU's waves all cutting at once at
+// the start contend for its VALU and SALU.
+template<int QPB, int TK, int SCHED, bool GATHER = false, int W = 1>
+__device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& wk, int wave = 0) {
     constexpr int WAVE = 64;
-    const int slot = opus::block_id_x();
+    const int slot = W == 1 ? opus::block_id_x() : opus::block_id_x() * W + wave;
 
     if constexpr (SCHED == SCHED_TABLE) {
         // The whole assignment in one s_load_dwordx8 off a blockIdx-uniform address. A surplus
@@ -91,13 +96,16 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
         };
         auto tiles_of = [](int e) { return e > 0 ? (e + TK - 1) / TK : 0; };
         auto groups_of = [](int n) { return (n + QPB - 1) / QPB; };
+        auto set_to = [](mqa_work& o, int b, int r0, int n, int j, int start, int count, int e) {
+            o.batch_id    = __builtin_amdgcn_readfirstlane(b);
+            o.row_id      = __builtin_amdgcn_readfirstlane(r0 + j * QPB);
+            o.group_rows  = __builtin_amdgcn_readfirstlane(n - j * QPB < QPB ? n - j * QPB : QPB);
+            o.chunk_start = __builtin_amdgcn_readfirstlane(start);
+            o.chunk_count = __builtin_amdgcn_readfirstlane(count);
+            o.local_end   = __builtin_amdgcn_readfirstlane(e);
+        };
         auto set = [&](int b, int r0, int n, int j, int start, int count, int e) {
-            wk.batch_id    = __builtin_amdgcn_readfirstlane(b);
-            wk.row_id      = __builtin_amdgcn_readfirstlane(r0 + j * QPB);
-            wk.group_rows  = __builtin_amdgcn_readfirstlane(n - j * QPB < QPB ? n - j * QPB : QPB);
-            wk.chunk_start = __builtin_amdgcn_readfirstlane(start);
-            wk.chunk_count = __builtin_amdgcn_readfirstlane(count);
-            wk.local_end   = __builtin_amdgcn_readfirstlane(e);
+            set_to(wk, b, r0, n, j, start, count, e);
         };
 
         if constexpr (SCHED == SCHED_PREFILL) {
@@ -106,6 +114,37 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
             // end; across sequences nothing orders the sizes.
             const int parts = k.prefill_parts;
             const int gs = slot / parts, part = slot - gs * parts;   // once a CTA, scalar
+            if constexpr (GATHER) {
+                // A row is its own group (group g is row g) and normally its own sequence: one
+                // round trip checks that (qsl[g] == g, qsl[g + 1] == g + 1) beside the row's
+                // window. Otherwise -- empty sequences, rows past them, several rows a sequence --
+                // the row's sequence is searched for. No scan: a candidate grid runs to tens of
+                // thousands of CTAs over as many rows (gfx1250's mqa_assign does the same).
+                static_assert(QPB == 1, "a candidate row is its own group");
+                const int g = gs;
+                if (g >= k.num_rows) return false;   // the host's grid: a group a row, x parts
+                const int gi = g < num_seqs ? g : num_seqs - 1;
+                const int q0 = qsl[gi], q1 = qsl[gi + 1];
+                int e = k.row_ends[g];
+                // Landed before the branch, so the three loads share one round trip.
+                pin_sgpr(e);
+                int b = g;
+                if (!(gi == g && q0 == g && q1 == g + 1)) {   // uniform
+                    if (g >= qsl[num_seqs]) return false;
+                    int lo = 0, hi = num_seqs;
+                    while (lo < hi) {
+                        const int mid = (lo + hi + 1) >> 1;
+                        if (qsl[mid] <= g) lo = mid; else hi = mid - 1;
+                    }
+                    b = lo;
+                }
+                const int tiles = tiles_of(e);
+                const int start = part_point(part, tiles, parts);
+                const int count = part_point(part + 1, tiles, parts) - start;
+                if (count <= 0) return false;
+                set(b, g, 1, 0, start, count, e);
+                return true;
+            }
             int carry = 0;
             for (int base = 0; base < num_seqs; base += WAVE) {
                 const int b = base + lane;
@@ -132,126 +171,280 @@ __device__ inline bool mqa_assign(const mqa_sched_args& k, int lane, mqa_work& w
             }
             return false;
         } else {   // SCHED_FREE
-            // The first CHUNKS * 64 sequences are read once, up front: their bounds, then the
-            // window ends of their first GC groups -- a decode bucket's (max_qlen <= 8) at the qlen
-            // each instance is picked for -- so the whole assignment is two round trips. Sequences
-            // past the cache, and groups past GC, are re-read where they are needed. Every load of
-            // a round is issued before any is used -- indices clamped into range, the lanes past
-            // the batch masked after -- or the rounds go serial; the cached chunks are walked
-            // unrolled, not indexed through a select chain. The one-row kernel runs MTP 1 only, so
-            // it caches two groups: every cached group costs each CTA its loads and cuts.
-            constexpr int CHUNKS = 4;
-            constexpr int GC     = QPB == 1 ? 2 : (8 + QPB - 1) / QPB;
-            int c_r0[CHUNKS], c_n[CHUNKS], c_e[CHUNKS][GC];
-            int c_qa[CHUNKS], c_qb[CHUNKS];
-            opus::static_for<CHUNKS>([&](auto cc) {   // round 1: the sequences' bounds
-                constexpr int c = cc.value;
-                c_qa[c] = 0; c_qb[c] = 0;
-                if (c * WAVE < num_seqs) {   // uniform
-                    const int b = min(c * WAVE + lane, num_seqs - 1);
-                    c_qa[c] = qsl[b]; c_qb[c] = qsl[b + 1];
-                }
-            });
-            // A lane's first GC groups' window ends (0 past its rows), every load issued first.
-            auto group_ends = [&](int r0, int n, int (&e)[GC]) {
-                int v[GC];
-                opus::static_for<GC>([&](auto jc) {
-                    const int l = last_row(r0, n, jc.value);
-                    v[jc.value] = k.row_ends[l > 0 ? l : 0];   // a lane with no rows reads row 0
-                });
-                opus::static_for<GC>([&](auto jc) {
-                    e[jc.value] = n > jc.value * QPB ? v[jc.value] : 0;
-                });
-            };
-            opus::static_for<CHUNKS>([&](auto cc) {   // round 2: their groups' window ends
-                constexpr int c = cc.value;
-                const bool live = c * WAVE + lane < num_seqs;
-                c_r0[c] = live ? c_qa[c] : 0;
-                c_n[c]  = live ? c_qb[c] - c_qa[c] : 0;
-                opus::static_for<GC>([&](auto jc) { c_e[c][jc.value] = 0; });
-                if (c * WAVE < num_seqs) group_ends(c_r0[c], c_n[c], c_e[c]);   // uniform
-            });
-            // visit(base, r0, n, ends) on each 64 sequences in order until it returns true.
-            auto for_chunks = [&](auto&& visit) {
-                bool done = false;
+            // The cut of the W slots from slot0: sink(w, work) for each that has work (the rest
+            // are surplus slots).
+            auto free_cut = [&](int slot0, auto&& sink) {
+                // The first CHUNKS * 64 sequences are read once, up front: their bounds, then the
+                // window ends of their first GC groups -- a decode bucket's (max_qlen <= 8) at the
+                // qlen each instance is picked for -- so the whole assignment is two round trips.
+                // Sequences past the cache, and groups past GC, are re-read where they are needed.
+                // Every load of a round is issued before any is used -- indices clamped into range,
+                // the lanes past the batch masked after -- or the rounds go serial; the cached
+                // chunks are walked unrolled, not indexed through a select chain. The one-row
+                // kernel runs MTP 1 only, so it caches two groups: every cached group costs each
+                // CTA its loads and cuts.
+                constexpr int CHUNKS = 4;
+                constexpr int GC     = QPB == 1 ? 2 : (8 + QPB - 1) / QPB;
+                int c_r0[CHUNKS], c_n[CHUNKS], c_e[CHUNKS][GC];
+                int c_qa[CHUNKS], c_qb[CHUNKS];
+                // A lane's first GC groups' window ends (0 past its rows): loads, then the mask.
+                auto load_ends = [&](int r0, int n, int (&v)[GC]) {
+                    opus::static_for<GC>([&](auto jc) {
+                        const int l = last_row(r0, n, jc.value);
+                        // a lane with no rows reads row 0
+                        v[jc.value] = k.row_ends[l > 0 ? l : 0];
+                    });
+                };
+                auto mask_ends = [&](int n, const int (&v)[GC], int (&e)[GC]) {
+                    opus::static_for<GC>([&](auto jc) {
+                        e[jc.value] = n > jc.value * QPB ? v[jc.value] : 0;
+                    });
+                };
+                // Round 1: the sequences' bounds, and -- a decode batch is usually uniform, every
+                // sequence nq = num_rows / num_seqs rows -- the window ends at the rows uniformity
+                // puts them. The bounds confirm it; else round 2 reads the ends where they say.
+                const int nq = k.num_rows / num_seqs;
+                const int gq = groups_of(nq);   // a uniform sequence's groups
+                int s_e[CHUNKS][GC];
                 opus::static_for<CHUNKS>([&](auto cc) {
                     constexpr int c = cc.value;
-                    if (!done && c * WAVE < num_seqs)
-                        done = visit(c * WAVE, c_r0[c], c_n[c], c_e[c]);
-                });
-                for (int base = CHUNKS * WAVE; !done && base < num_seqs; base += WAVE) {
-                    const int b = base + lane;
-                    int r0 = 0, n = 0, e[GC];
-                    if (b < num_seqs) { r0 = qsl[b]; n = qsl[b + 1] - r0; }
-                    group_ends(r0, n, e);
-                    done = visit(base, r0, n, e);
-                }
-            };
-            // pass 1: total tiles, and the groups that have any
-            int part = 0, ngroups = 0;
-            for_chunks([&](int, int r0, int n, const int (&e)[GC]) {
-                opus::static_for<GC>([&](auto jc) {
-                    const int t = tiles_of(e[jc.value]);
-                    part += t;
-                    ngroups += t > 0;
-                });
-                for (int j = GC; j < groups_of(n); ++j) {
-                    const int t = tiles_of(k.row_ends[last_row(r0, n, j)]);
-                    part += t;
-                    ngroups += t > 0;
-                }
-                return false;
-            });
-            const int total = __builtin_amdgcn_readlane(wave64_incl_scan(part), WAVE - 1);
-            const int G     = __builtin_amdgcn_readlane(wave64_incl_scan(ngroups), WAVE - 1);
-            // Each group's last chunk rounds up, so ceil(total / target) cuts up to G chunks past
-            // the target -- past the resident CTAs, a second round of a few CTAs the kernel then
-            // waits for. Cutting for target - G bounds the chunks by the target; with G a large
-            // share of it, a group a CTA is the best there is anyway.
-            const int tgt   = k.cta_target > 2 * G ? k.cta_target - G : k.cta_target;
-            const int safe  = total > 0 ? ceil_div_rcp(total, tgt, 1.0f / (float)tgt) : 1;
-            const float rcp = 1.0f / (float)safe;
-            // pass 2: each group takes ceil(tiles / safe) slots, sequences and groups in order
-            int carry = 0;
-            bool found = false;
-            for_chunks([&](int base, int r0, int n, const int (&e)[GC]) {
-                int s = 0;
-                opus::static_for<GC>([&](auto jc) {
-                    s += ceil_div_rcp(tiles_of(e[jc.value]), safe, rcp);
-                });
-                for (int j = GC; j < groups_of(n); ++j)
-                    s += ceil_div_rcp(tiles_of(k.row_ends[last_row(r0, n, j)]), safe, rcp);
-                const int incl = wave64_incl_scan(s), excl = incl - s;
-                const unsigned long long hit = __builtin_amdgcn_ballot_w64(
-                    carry + excl <= slot && slot < carry + incl);
-                if (!hit) {
-                    carry += __builtin_amdgcn_readlane(incl, WAVE - 1);
-                    return false;
-                }
-                // a uniform walk of the hit sequence's groups for this slot's chunk
-                const int l  = __builtin_ctzll(hit);
-                const int sr = __builtin_amdgcn_readlane(r0, l);
-                const int sn = __builtin_amdgcn_readlane(n, l);
-                int o = slot - carry - __builtin_amdgcn_readlane(excl, l);
-                auto take = [&](int j, int e_j) {
-                    const int t  = tiles_of(e_j);
-                    const int nc = ceil_div_rcp(t, safe, rcp);
-                    if (o < nc) {
-                        const int start = o * safe;
-                        set(base + l, sr, sn, j, start, t - start < safe ? t - start : safe, e_j);
-                        found = true;
+                    c_qa[c] = 0; c_qb[c] = 0;
+                    opus::static_for<GC>([&](auto jc) { s_e[c][jc.value] = 0; });
+                    if (c * WAVE < num_seqs) {   // uniform
+                        const int b = min(c * WAVE + lane, num_seqs - 1);
+                        c_qa[c] = qsl[b]; c_qb[c] = qsl[b + 1];
+                        opus::static_for<GC>([&](auto jc) {
+                            if (jc.value < gq) {   // uniform
+                                const int l = last_row(b * nq, nq, jc.value);
+                                s_e[c][jc.value] = k.row_ends[l > 0 ? l : 0];
+                            }
+                        });
                     }
-                    o -= nc;
-                };
-                opus::static_for<GC>([&](auto jc) {
-                    if (!found && jc.value < groups_of(sn))
-                        take(jc.value, __builtin_amdgcn_readlane(e[jc.value], l));
                 });
-                for (int j = GC; !found && j < groups_of(sn); ++j)
-                    take(j, __builtin_amdgcn_readfirstlane(k.row_ends[last_row(sr, sn, j)]));
-                return true;
-            });
-            return found;   // false: a surplus slot
+                // A decode batch at its tier -- at most 64 sequences, uniform rows, one group a
+                // sequence -- whatever its lengths: the cut below on one lane a sequence, the ends
+                // round 1 read, no chunks and no group walk. Same chunks and order, a third of the
+                // instructions, and every one of them is on each slot's path to its first page.
+                if (num_seqs <= WAVE && gq == 1 && nq * num_seqs == k.num_rows) {   // uniform
+                    const bool live = lane < num_seqs;
+                    const bool bad  = live & ((c_qa[0] != lane * nq) |
+                                              (c_qb[0] != (lane + 1) * nq));
+                    if (__builtin_amdgcn_ballot_w64(bad) == 0) {   // uniform
+                        const int e = live ? s_e[0][0] : 0;
+                        const int t = tiles_of(e);
+                        const int total = __builtin_amdgcn_readlane(wave64_incl_scan(t), WAVE - 1);
+                        const int G = num_seqs, tgt = k.cta_target;
+                        int safe = 1 << 24;
+                        if (tgt > G && total > 0) {
+                            const int lo = ceil_div_rcp(total, tgt, 1.0f / (float)tgt);
+                            safe = ceil_div_rcp(total, tgt - G, 1.0f / (float)(tgt - G));
+                            if (lo < safe) {   // uniform
+                                const int cnt    = ceil_div_rcp(t, lo, 1.0f / (float)lo);
+                                const int chunks = wave64_incl_scan(cnt);
+                                if (__builtin_amdgcn_readlane(chunks, WAVE - 1) <= tgt)
+                                    safe = lo;
+                            }
+                        }
+                        const int nc   = ceil_div_rcp(t, safe, 1.0f / (float)safe);
+                        const int incl = wave64_incl_scan(nc), excl = incl - nc;
+                        opus::static_for<W>([&](auto wc) {
+                            const int sl = slot0 + wc.value;
+                            const unsigned long long hit =
+                                __builtin_amdgcn_ballot_w64(excl <= sl && sl < incl);
+                            if (!hit) return;   // uniform: a surplus slot
+                            const int l     = __builtin_ctzll(hit);
+                            const int start = (sl - __builtin_amdgcn_readlane(excl, l)) * safe;
+                            const int tl    = __builtin_amdgcn_readlane(t, l);
+                            mqa_work o_w;
+                            set_to(o_w, l, l * nq, nq, 0, start,
+                                   tl - start < safe ? tl - start : safe,
+                                   __builtin_amdgcn_readlane(e, l));
+                            sink(wc.value, o_w);
+                        });
+                        return;
+                    }
+                }
+                // (every per-chunk step below is under a uniform branch on the chunk: a decode
+                // batch's one chunk does not pay four chunks' exec-masked instructions)
+                bool odd = nq * num_seqs != k.num_rows;
+                opus::static_for<CHUNKS>([&](auto cc) {
+                    constexpr int c = cc.value;
+                    if (c * WAVE < num_seqs) {   // uniform
+                        const int b = c * WAVE + lane;
+                        odd |= (b < num_seqs) & ((c_qa[c] != b * nq) | (c_qb[c] != (b + 1) * nq));
+                    }
+                });
+                const bool uniform = __builtin_amdgcn_ballot_w64(odd) == 0;
+                // Cached groups any lane has: uniform rows tell from the scalars (a bucket's
+                // instance caches its largest qlen's groups; smaller ones skip the rest's cuts).
+                const int gc_live = uniform ? gq : GC;
+                opus::static_for<CHUNKS>([&](auto cc) {
+                    constexpr int c = cc.value;
+                    c_r0[c] = 0; c_n[c] = 0;
+                    opus::static_for<GC>([&](auto jc) { c_e[c][jc.value] = 0; });
+                    if (c * WAVE < num_seqs) {   // uniform
+                        const bool live = c * WAVE + lane < num_seqs;
+                        c_r0[c] = live ? c_qa[c] : 0;
+                        c_n[c]  = live ? c_qb[c] - c_qa[c] : 0;
+                        if (uniform) {
+                            mask_ends(c_n[c], s_e[c], c_e[c]);
+                        } else {   // round 2
+                            int v[GC];
+                            load_ends(c_r0[c], c_n[c], v);
+                            mask_ends(c_n[c], v, c_e[c]);
+                        }
+                    }
+                });
+                // visit(base, r0, n, ends) on each 64 sequences in order until it returns true.
+                auto for_chunks = [&](auto&& visit) {
+                    bool done = false;
+                    opus::static_for<CHUNKS>([&](auto cc) {
+                        constexpr int c = cc.value;
+                        if (!done && c * WAVE < num_seqs)
+                            done = visit(c * WAVE, c_r0[c], c_n[c], c_e[c]);
+                    });
+                    for (int base = CHUNKS * WAVE; !done && base < num_seqs; base += WAVE) {
+                        const int b = base + lane;
+                        int r0 = 0, n = 0, v[GC], e[GC];
+                        if (b < num_seqs) { r0 = qsl[b]; n = qsl[b + 1] - r0; }
+                        load_ends(r0, n, v);
+                        mask_ends(n, v, e);
+                        done = visit(base, r0, n, e);
+                    }
+                };
+                // pass 1: total tiles, and the groups that have any (uniform rows: every group, a
+                // bound read off the scalars, which spares a wave reduction)
+                int part = 0, ngroups = 0;
+                for_chunks([&](int, int r0, int n, const int (&e)[GC]) {
+                    opus::static_for<GC>([&](auto jc) {
+                        if (jc.value >= gc_live) return;   // uniform
+                        const int t = tiles_of(e[jc.value]);
+                        part += t;
+                        ngroups += t > 0;
+                    });
+                    for (int j = GC; j < groups_of(n); ++j) {
+                        const int t = tiles_of(k.row_ends[last_row(r0, n, j)]);
+                        part += t;
+                        ngroups += t > 0;
+                    }
+                    return false;
+                });
+                const int total = __builtin_amdgcn_readlane(wave64_incl_scan(part), WAVE - 1);
+                const int G =
+                    uniform ? num_seqs * gq
+                            : __builtin_amdgcn_readlane(wave64_incl_scan(ngroups), WAVE - 1);
+                // The grid is max(target, groups) slots (the launcher's). Each group's last chunk
+                // rounds up, so ceil(total / target) cuts up to G chunks past the target; cutting
+                // for target - G bounds them by it, but needlessly coarsely where the groups split
+                // evenly: by a third with G a good share of the target (B = 128 x 6 one-row groups
+                // into 3072 slots), by half with few tiles a slot (512 tiles into 512 slots:
+                // 2-tile chunks where 1 fits). So where the two sizes differ, ceil(total / target)
+                // is counted and cut if it fits. A target of at most G: a group a slot.
+                const int tgt = k.cta_target;
+                int safe = 1 << 24;   // a group a chunk: more tiles than any walk
+                if (tgt > G && total > 0) {
+                    const int lo = ceil_div_rcp(total, tgt, 1.0f / (float)tgt);
+                    safe = ceil_div_rcp(total, tgt - G, 1.0f / (float)(tgt - G));
+                    if (lo < safe) {   // uniform: the count can only pick lo
+                        const float lo_rcp = 1.0f / (float)lo;
+                        int cnt = 0;
+                        for_chunks([&](int, int r0, int n, const int (&e)[GC]) {
+                            opus::static_for<GC>([&](auto jc) {
+                                if (jc.value < gc_live)   // uniform
+                                    cnt += ceil_div_rcp(tiles_of(e[jc.value]), lo, lo_rcp);
+                            });
+                            for (int j = GC; j < groups_of(n); ++j)
+                                cnt += ceil_div_rcp(tiles_of(k.row_ends[last_row(r0, n, j)]), lo,
+                                                    lo_rcp);
+                            return false;
+                        });
+                        if (__builtin_amdgcn_readlane(wave64_incl_scan(cnt), WAVE - 1) <= tgt)
+                            safe = lo;
+                    }
+                }
+                const float rcp = 1.0f / (float)safe;
+                // pass 2: each group takes ceil(tiles / safe) slots, sequences and groups in order;
+                // the W slots from slot0 are found in one walk
+                bool fnd[W];
+                opus::static_for<W>([&](auto wc) { fnd[wc.value] = false; });
+                int carry = 0;
+                for_chunks([&](int base, int r0, int n, const int (&e)[GC]) {
+                    int s = 0;
+                    opus::static_for<GC>([&](auto jc) {
+                        if (jc.value < gc_live)   // uniform
+                            s += ceil_div_rcp(tiles_of(e[jc.value]), safe, rcp);
+                    });
+                    for (int j = GC; j < groups_of(n); ++j)
+                        s += ceil_div_rcp(tiles_of(k.row_ends[last_row(r0, n, j)]), safe, rcp);
+                    const int incl = wave64_incl_scan(s), excl = incl - s;
+                    bool all = true;
+                    opus::static_for<W>([&](auto wc) {
+                        constexpr int w = wc.value;
+                        if (fnd[w]) return;
+                        const int sl = slot0 + w;
+                        const unsigned long long hit = __builtin_amdgcn_ballot_w64(
+                            carry + excl <= sl && sl < carry + incl);
+                        if (!hit) {
+                            all = false;
+                            return;
+                        }
+                        // a uniform walk of the hit sequence's groups for this slot's chunk
+                        const int l  = __builtin_ctzll(hit);
+                        const int sr = __builtin_amdgcn_readlane(r0, l);
+                        const int sn = __builtin_amdgcn_readlane(n, l);
+                        int o = sl - carry - __builtin_amdgcn_readlane(excl, l);
+                        bool f = false;
+                        auto take = [&](int j, int e_j) {
+                            const int t  = tiles_of(e_j);
+                            const int nc = ceil_div_rcp(t, safe, rcp);
+                            if (o < nc) {
+                                const int start = o * safe;
+                                mqa_work o_w;
+                                set_to(o_w, base + l, sr, sn, j, start,
+                                       t - start < safe ? t - start : safe, e_j);
+                                sink(w, o_w);
+                                f = true;
+                            }
+                            o -= nc;
+                        };
+                        opus::static_for<GC>([&](auto jc) {
+                            if (!f && jc.value < groups_of(sn))
+                                take(jc.value, __builtin_amdgcn_readlane(e[jc.value], l));
+                        });
+                        for (int j = GC; !f && j < groups_of(sn); ++j)
+                            take(j, __builtin_amdgcn_readfirstlane(
+                                        k.row_ends[last_row(sr, sn, j)]));
+                        fnd[w] = true;
+                    });
+                    carry += __builtin_amdgcn_readlane(incl, WAVE - 1);
+                    return all;
+                });
+            };
+            if constexpr (W == 1) {
+                bool found = false;
+                free_cut(slot, [&](int, const mqa_work& o) { wk = o; found = true; });
+                return found;
+            } else {
+                __shared__ int s_rec[W][6];
+                if (wave == 0) {
+                    if (lane < W) s_rec[lane][4] = 0;   // no work unless the cut finds some
+                    free_cut(opus::block_id_x() * W, [&](int w, const mqa_work& o) {
+                        if (lane == 0) {
+                            s_rec[w][0] = o.row_id;      s_rec[w][1] = o.batch_id;
+                            s_rec[w][2] = o.group_rows;  s_rec[w][3] = o.chunk_start;
+                            s_rec[w][4] = o.chunk_count; s_rec[w][5] = o.local_end;
+                        }
+                    });
+                }
+                __syncthreads();
+                wk.row_id      = __builtin_amdgcn_readfirstlane(s_rec[wave][0]);
+                wk.batch_id    = __builtin_amdgcn_readfirstlane(s_rec[wave][1]);
+                wk.group_rows  = __builtin_amdgcn_readfirstlane(s_rec[wave][2]);
+                wk.chunk_start = __builtin_amdgcn_readfirstlane(s_rec[wave][3]);
+                wk.chunk_count = __builtin_amdgcn_readfirstlane(s_rec[wave][4]);
+                wk.local_end   = __builtin_amdgcn_readfirstlane(s_rec[wave][5]);
+                return wk.chunk_count > 0;
+            }
         }
     }
 }
@@ -301,6 +494,34 @@ __device__ inline int kv_page_offset(int page_id) {
                             static_cast<unsigned>(T::KV_PAGE_BYTES));
 }
 
+// A wave-uniform int through the constant address space, so it is an s_load: a plain dereference
+// lands on flat_load once the kernel has stored to `out` (that defeats the no-clobber proof).
+__device__ inline int scalar_load(const int* p, int i) {
+    using scalar_ptr = const int __attribute__((address_space(4)))*;
+    return reinterpret_cast<scalar_ptr>(reinterpret_cast<__UINTPTR_TYPE__>(p))[i];
+}
+
+// A gathered tile's key scales (candidate layers): the raw dwords of the lane's two n-tiles, each
+// holding its key's (kt) bytes at kt * 2 + the key's half of its 64-row group, and the v_perm
+// selector that packs them into the (kt, nt) bytes the MFMA's op_sel reads. Permuted where it is
+// used, not where it is loaded: there the loads are still in flight.
+struct gather_scales {
+    int lo, hi, sel;
+};
+__device__ inline int kv_scale_word(int s) { return s; }
+__device__ inline int kv_scale_word(const gather_scales& s) {
+    return __builtin_amdgcn_perm(s.lo, s.hi, s.sel);
+}
+
+// Row `row`'s first logit: out_offsets[row] when the out is flat (an offset is >= 0, so it is
+// zero-extended), else row * out_stride.
+template<class T>
+__device__ inline float* row_out(float* out, const int* out_offsets, int out_stride, int row) {
+    if constexpr (T::FLAT_OUT)
+        if (out_offsets != nullptr) return out + (unsigned)scalar_load(out_offsets, row);
+    return out + (size_t)row * out_stride;
+}
+
 // Q: natural [T][head][D/2]; lane L reads 16 B at
 // head(mi * MMA_M + L % 32) * 64 + (kt * K_CHUNKS + L / 32) * 16. Un-coalesced: Q is loaded once
 // in the prologue, so the layout stays natural.
@@ -328,7 +549,7 @@ __device__ inline auto make_layout_q(int lane_m0, int lane_g) {
         opus::unfold_p_coord(dim, opus::make_tuple(lane_m0, lane_g)));
 }
 
-// q_scale / kv_scale: one dword at index == lane.
+// q_scale / kv_scale: one element (a q_scale's D_QSCALE, a kv_scale's dword) at index == lane.
 template<class T>
 __device__ inline auto make_layout_scale(int lane) {
     constexpr auto shape = opus::make_tuple(
