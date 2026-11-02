@@ -396,6 +396,7 @@ def test_grouped_topk_stable(
         "all_nan": 4,
         "masked_scores": 5,
         "all_zero_sigmoid": 6,
+        "thirty_two_way_tie": 7,
     }[pattern]
     torch.manual_seed(
         5632 + token * 17 + expert * 3 + topk + mode_id * 1009 + pattern_id * 101
@@ -405,9 +406,9 @@ def test_grouped_topk_stable(
     if pattern == "all_equal":
         gating.zero_()
         bias.zero_()
-    elif pattern == "sixteen_way_tie":
+    elif pattern in ("sixteen_way_tie", "thirty_two_way_tie"):
         gating.fill_(-4)
-        gating[:, -16:] = 0
+        gating[:, -(16 if pattern == "sixteen_way_tie" else 32) :] = 0
         bias.zero_()
     elif pattern == "one_finite":
         gating.zero_()
@@ -1033,6 +1034,8 @@ stable_cases = [
     (1, 256, 8, dtypes.bf16, "biased", True, "all_equal", False),
     (1, 256, 8, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
     (1, 256, 8, dtypes.bf16, "biased", False, "sixteen_way_tie", False),
+    (1, 256, 8, dtypes.fp32, "biased", True, "thirty_two_way_tie", True),
+    (1, 256, 8, dtypes.fp32, "biased", False, "thirty_two_way_tie", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", True, "random", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", True, "sixteen_way_tie", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "sixteen_way_tie", False),
