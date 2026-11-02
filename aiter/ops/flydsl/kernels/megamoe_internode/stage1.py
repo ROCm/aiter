@@ -664,7 +664,7 @@ def _compile_stage1(
                                 ),
                                 tr_e,
                             )
-            rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
                 comm.fence_system_release()
@@ -899,7 +899,7 @@ def _compile_stage1(
                 )
             if const_expr(fan_wt):
                 # 上面全是写穿:等它们完成即对端可见,不必整 L2 写回。
-                rocdl.s_waitcnt(0)
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             else:
                 comm.fence_system_release()
             for j in range_constexpr(G):
@@ -1265,7 +1265,7 @@ def _compile_stage1(
             if const_expr(tile_ready):
                 # 本批的行元数据/载荷(各 wave 的远端 store)落地后,按组报到达行数。
                 # 段 [seg, seg+n) 至多跨 2 个组(_GB_PH 只解析首/末组,同一前提)。
-                rocdl.s_waitcnt(0)
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 gpu.barrier()
                 if tx < fx.Int32(LOCAL_EXPERTS):
                     tr_n = _gb_ld(fx.Int32(_GB_CNT) + tx)
@@ -1619,7 +1619,7 @@ def _compile_stage1(
                         generation,
                     )
             _cta_acquire()
-            rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             # h1_phys 下排序视图整体在段 2 算(每个 expert 先本地组后远端组);
             # 这里只发布本地段 tile 数。否则本地段自成一段、段基址 0。
@@ -1646,7 +1646,7 @@ def _compile_stage1(
                 )
             if const_expr(early_local_gmm):
                 _seal_group_list(0, ())
-            rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if const_expr(early_local_gmm):  # noqa: SIM102
                 if tx == fx.Int32(0):
@@ -1713,7 +1713,7 @@ def _compile_stage1(
                 # local_eos:本源 rank 给 dest 的 fan1(本地来源那一半)全部推完。
                 # 与 comm_eos 同一套分片计数+减法复位,计数器在 [8,16);只经 xGMI,
                 # 不依赖 rail,所以不引入新的跨节点等待环。
-                rocdl.s_waitcnt(0)
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 gpu.barrier()
                 if tx == fx.Int32(0):
                     _ldone = (
@@ -1777,7 +1777,7 @@ def _compile_stage1(
                 # 一批都没轮到的 fan CTA(发帖 CTA 等)也要报一次,计数才凑满 fan_stride。
                 if (fan_wshard >= f2_end) & (tx == fx.Int32(0)):
                     _tr_resv_signal(dest, fan_stride)
-            rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             # 在发布本分片之前回收自己的数据请求:consumed 到齐前必然完成,
             # T0 的 credit 段不会和这里同时轮询同一个 QP 的 CQ。
@@ -1918,7 +1918,7 @@ def _compile_stage1(
                 _seal_pad(0)
             else:
                 _seal_pad_par(0)
-            rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             # sealer 内部分段(槽 5..7 本是 T0 专用;rank0 的 sealer 就是 T0,会覆盖,分析时丢掉 rank0/8)
             finish_scratch = fx.recast_iter(fx.Int32, lds_raw)
@@ -1949,7 +1949,7 @@ def _compile_stage1(
             perm_res = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("tile_dst_of_src")
             )
-            rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             # Stage2 indexes these two by absolute row, so they follow the
             # output rather than the source.  Partial-tile padding above has
@@ -1989,13 +1989,13 @@ def _compile_stage1(
                     wts_sorted_res,
                     dst_row,
                 )
-            rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             # GMM1 的一个 m_block 覆盖 G 个物理 tile,所以作业数按组算。
             total_jobs = (tiles // fx.Int32(G)) * fx.Int32(GNB)
             # 非 pipeline 的 GMM1 按 tile_alloc 闭式跨步取作业,不读
             # h1_ready_queue / h1_ready_queue_generation,不再逐 job 写它们。
-            rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
                 buffer_ops.buffer_store(
@@ -2470,7 +2470,7 @@ def _compile_stage1(
                             fx.Int32(INVALID_SOURCE), tr_src, tr_base + tr_r
                         )
                         buffer_ops.buffer_store(fx.Float32(0.0), tr_w, tr_base + tr_r)
-                    rocdl.s_waitcnt(0)
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                     gpu.barrier()
                     _run_gemm1_job(tr_job)
                     gpu.barrier()
@@ -2594,7 +2594,7 @@ def _compile_stage1(
                 for job in range(consumer_index, total_jobs, consumer_count):
                     _run_gemm1_job(job)
                     gpu.barrier()
-            rocdl.s_waitcnt(0)
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
                 _remaining = total_jobs - consumer_index

@@ -14,8 +14,8 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import ReductionOp, T
 
-from .. import buffer_ops
 from ..mega_moe.quant import _FP4_INV_MAX_POS_BITS, BLOCK, GROUP
+from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 
 def rail_record_layout(hidden: int, topk: int):
@@ -52,18 +52,17 @@ def build_rail_record_quant(hidden: int, topk: int):
         if group_id < m * fx.Int32(scale_n):
             token = group_id // fx.Int32(scale_n)
             gi = group_id % fx.Int32(scale_n)
-            x_rs = buffer_ops.create_buffer_resource_from_addr(x)
-            out_rs = buffer_ops.create_buffer_resource_from_addr(out)
+            x_buf = ptr_buf_tensor(x, fx.Int32, unit_elems=4)
+            out_q = ptr_buf_tensor(out, fx.Int32, unit_elems=4)
+            out_scale = ptr_buf_tensor(out, fx.Uint8)
+            out_meta = ptr_buf_tensor(out, fx.Int32)
             # 与 quant.py fp4 路径相同的数学。
             in_vec = group_id * fx.Int32(GROUP * 2 // 16)
             act = []
             local_max = fx.Float32(1e-10)
             for chunk in range_constexpr(GROUP // 8):
-                raw = buffer_ops.buffer_load(
-                    x_rs,
-                    (in_vec + fx.Int32(chunk)) * fx.Int32(4),
-                    vec_width=4,
-                    dtype=T.i32,
+                raw = buf_copy_load(
+                    x_buf, in_vec + fx.Int32(chunk), fx.Int32, unit_elems=4
                 )
                 values = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
                 local_max = local_max.maximumf(
@@ -81,12 +80,7 @@ def build_rail_record_quant(hidden: int, topk: int):
             )
             e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
             rec_base = token * fx.Int32(rec)
-            buffer_ops.buffer_store(
-                e8m0.to(fx.Uint8),
-                out_rs,
-                rec_base + fx.Int32(off_s) + gi,
-                offset_is_bytes=True,
-            )
+            out_scale[rec_base + fx.Int32(off_s) + gi] = e8m0.to(fx.Uint8)
             dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
             words = []
             for word in range_constexpr(GROUP // 8):
@@ -97,37 +91,24 @@ def build_rail_record_quant(hidden: int, topk: int):
                         T.i32, packed, act[idx], act[idx + 1], dequant_scale, pair
                     )
                 words.append(packed)
-            buffer_ops.buffer_store(
+            buf_copy_store(
+                out_q,
+                (rec_base + fx.Int32(off_q)) // fx.Int32(16) + gi,
                 fx.Vector.from_elements(words, fx.Int32),
-                out_rs,
-                rec_base + fx.Int32(off_q) + gi * fx.Int32(16),
-                offset_is_bytes=True,
+                fx.Int32,
+                unit_elems=4,
             )
             # 每 token 前 2*topk 个 group 线程顺带把 ids / weights 写进 record。
             if gi < fx.Int32(topk):
-                ids_rs = buffer_ops.create_buffer_resource_from_addr(topk_ids)
-                v = buffer_ops.buffer_load(
-                    ids_rs, token * fx.Int32(topk) + gi, vec_width=1, dtype=T.i32
-                )
-                buffer_ops.buffer_store(
-                    v,
-                    out_rs,
-                    rec_base + fx.Int32(off_i) + gi * fx.Int32(4),
-                    offset_is_bytes=True,
-                )
+                ids_buf = ptr_buf_tensor(topk_ids, fx.Int32)
+                out_meta[(rec_base + fx.Int32(off_i)) // fx.Int32(4) + gi] = ids_buf[
+                    token * fx.Int32(topk) + gi
+                ]
             if (gi >= fx.Int32(topk)) & (gi < fx.Int32(2 * topk)):
-                w_rs = buffer_ops.create_buffer_resource_from_addr(route_weights)
-                v = buffer_ops.buffer_load(
-                    w_rs,
-                    token * fx.Int32(topk) + gi - fx.Int32(topk),
-                    vec_width=1,
-                    dtype=T.i32,
-                )
-                buffer_ops.buffer_store(
-                    v,
-                    out_rs,
-                    rec_base + fx.Int32(off_w) + (gi - fx.Int32(topk)) * fx.Int32(4),
-                    offset_is_bytes=True,
+                weights_buf = ptr_buf_tensor(route_weights, fx.Int32)
+                weight_slot = gi - fx.Int32(topk)
+                out_meta[(rec_base + fx.Int32(off_w)) // fx.Int32(4) + weight_slot] = (
+                    weights_buf[token * fx.Int32(topk) + weight_slot]
                 )
 
     @flyc.jit
