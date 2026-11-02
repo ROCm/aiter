@@ -5,14 +5,12 @@
 import random
 import sys
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
-    _unified_attention_3d_gfx1250,
     is_2d_gluon_available,
     unified_attention,
 )
