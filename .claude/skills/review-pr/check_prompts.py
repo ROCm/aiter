@@ -199,6 +199,93 @@ def check_runner_label_exclusive():
     return 0
 
 
+def check_publish_needs_post_flag():
+    """_publish.py's only closure against posting with excess write access is its missing
+    `--post` flag: on the self-hosted box it falls back to ~/.git-credentials, a human PAT
+    with repo write access, and posts over plain curl -- so GITHUB_TOKEN permission scoping
+    does not stop it from posting at all. Today the workflow grants the review job only
+    `contents: read`, so that fallback never has write access to use. If the workflow is ever
+    changed to grant `issues: write` or `pull-requests: write` anywhere, GITHUB_TOKEN stops
+    being irrelevant to _publish.py's reach, and the invocation MUST pass --post explicitly
+    -- or there is a silent gap between what the token in scope can do and what the one call
+    site that would use it was actually told to do."""
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    run_one = (HERE / "run_one.sh").read_text(encoding="utf-8")
+    granted = re.search(r"^\s*(issues|pull-requests):\s*write\s*$", wf, re.M)
+    invocations = re.findall(r"[^\n]*_publish\.py[^\n]*", wf) \
+        + re.findall(r"[^\n]*_publish\.py[^\n]*", run_one)
+    has_post = any("--post" in line for line in invocations)
+    if granted and not has_post:
+        print(f"\u274c aiter-review-bot.yml grants '{granted.group(0).strip()}' somewhere, "
+              f"but _publish.py is never invoked with --post -- GITHUB_TOKEN scoping is no "
+              f"longer the only thing standing between a job and a post, and _publish.py's "
+              f"missing-flag default (dry-run) must now be an explicit match, not an "
+              f"accident")
+        return 1
+    if granted:
+        print("\u2705 aiter-review-bot.yml grants write, and _publish.py is invoked with "
+              "--post to match it")
+        return 0
+    print("\u2705 aiter-review-bot.yml grants no issues/pull-requests write anywhere; "
+          "_publish.py's missing --post is its only closure, as documented")
+    return 0
+
+
+def check_publish_review_is_advisory():
+    """The card goes up as a PR review, and a review carries an `event`. COMMENT leaves the
+    bot advisory; APPROVE or REQUEST_CHANGES would make it a merge gate -- which is a
+    different thing from what the workflow's `contents: read` was reasoned about, and a
+    change no one would see in a diff that only touches a JSON literal. Pin the event, and
+    pin that the one POST in the file is the review call."""
+    src = (HERE / "_publish.py").read_text(encoding="utf-8")
+    bad = 0
+    for verdict in ("APPROVE", "REQUEST_CHANGES"):
+        if f'"{verdict}"' in src or f"'{verdict}'" in src:
+            print(f"\u274c _publish.py names {verdict}; this bot is advisory and must only ever "
+                  f"send event COMMENT -- a review that gates merge changes what the "
+                  f"workflow's permissions mean")
+            bad += 1
+    posts = re.findall(r'_api\(\s*f?"([^"]+)"\s*,\s*method="POST"', src)
+    if posts != ["pulls/{pr}/reviews"]:
+        print(f"\u274c _publish.py's POST call sites are {posts}; expected exactly one, "
+              f"pulls/{{pr}}/reviews -- the card is published as a review with inline "
+              f"comments, not as a top-level issue comment")
+        bad += 1
+    if '"event": "COMMENT"' not in src:
+        print("\u274c _publish.py does not set event COMMENT on the review it builds")
+        bad += 1
+    if not bad:
+        print("\u2705 _publish.py posts exactly one review, event COMMENT, never APPROVE/"
+              "REQUEST_CHANGES")
+    return bad
+
+
+def check_anchoring_has_a_citation_check():
+    """_publish.py anchors a finding inline only when check_citations.py vouched for its
+    citation; with no citations.txt it anchors nothing and the whole card falls back into
+    the summary. That degradation is silent and looks identical to a card whose findings
+    simply cite nothing in the diff. So the two halves must stay wired: run_one.sh has to
+    run the checker, and _collect.py has to carry its verdict into the report dir
+    _publish.py reads."""
+    run_one = (HERE / "run_one.sh").read_text(encoding="utf-8")
+    lib = (HERE / "_lib.py").read_text(encoding="utf-8")
+    broken = []
+    if not (HERE / "check_citations.py").is_file():
+        broken.append("check_citations.py is missing")
+    if "check_citations.py" not in run_one:
+        broken.append("run_one.sh never runs check_citations.py")
+    if 'tee "$W/citations.txt"' not in run_one:
+        broken.append("run_one.sh does not write citations.txt")
+    if "citations.txt" not in lib:
+        broken.append("_lib.py does not collect citations.txt into the report dir")
+    if broken:
+        print("\u274c inline anchoring is wired to nothing: %s -- every finding would "
+              "silently fall back to the summary" % "; ".join(broken))
+        return 1
+    print("\u2705 anchoring wired: run_one.sh -> citations.txt -> _lib.py OPTIONAL -> _publish.py")
+    return 0
+
+
 def main():
     skill = _skill_md()
     bad = 0
@@ -219,6 +306,9 @@ def main():
     bad += check_no_self_trigger()
     bad += check_notified_handoff()
     bad += check_runner_label_exclusive()
+    bad += check_publish_needs_post_flag()
+    bad += check_publish_review_is_advisory()
+    bad += check_anchoring_has_a_citation_check()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
     return bad
 

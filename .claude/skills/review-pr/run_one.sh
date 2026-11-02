@@ -197,6 +197,23 @@ fi
 # 0-finding card (NONE AVAILABLE) or a count mismatch.
 python3 "$SKILL/_apply_refutation.py" "$W/card.md" "$W/independent.txt"
 
+# 3c) citation check -- advisory, and deliberately not a gate.
+#
+# Measured on seven real ATOM reviews (this check is ported from there; it has not been
+# rerun on aiter's own cards): the deterministic half -- does the cited file resolve, is
+# the line within it -- never fired, while the proximity half caught a real defect, a
+# finding citing envs.py:263 for a construct that lives at :253. Proximity is a heuristic
+# and it misfires: a finding legitimately quotes symbols that live elsewhere (the remedy
+# it proposes, a caller, a related flag). It ran 1-for-2 on real cards. A 50%-precision
+# heuristic that WITHHOLDS correct reviews costs more than the defect it catches, so this
+# writes its verdict and never fails the run (`|| true`, and it is not in _gates.py).
+#
+# The verdict is not only for the log. _publish.py reads citations.txt to decide which
+# findings may be posted inline on the lines they cite: a flagged citation forfeits the
+# inline slot, and no citations.txt at all means nothing is anchored. Removing this step
+# does not break publishing -- it silently degrades it to the whole card in the summary.
+python3 "$SKILL/check_citations.py" "$W" 2>&1 | tee "$W/citations.txt" || true
+
 # 4) gates + collect (call the python directly; no thin shell wrappers)
 say "gates..."
 # errexit is on: a bare call exits here on a red gate, and the EXIT trap then reports "exited

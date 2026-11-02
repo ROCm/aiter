@@ -245,5 +245,28 @@ if [ "$lr_rc" -ne 0 ] && [ "$lbad" -eq 0 ]; then
   echo "  ❌ lost_review_test.py did not run — ${why:-exit $lr_rc}"; bad=$((bad + 1))
 fi
 
+echo "[publish]"
+# The publish path's guards are pytest cases (_publish_test.py): the --post closure, the
+# anchoring rule, and the degrade-to-summary fallback. Run them from here so they are not a
+# file nobody executes -- a test suite that only runs when someone remembers it is the same
+# kind of silence this script exists to break. pytest is not part of the runner's baseline,
+# so its absence is reported out loud rather than passed over: a check that did not run is
+# not a check that passed, and it is counted red in neither direction here, it is SAID.
+if python3 -c "import pytest" 2>/dev/null; then
+  pt=$(cd "$S" && python3 -m pytest _publish_test.py -q 2>&1); pt_rc=$?
+  n=$(printf '%s\n' "$pt" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' || echo 0)
+  if [ "$pt_rc" -eq 0 ]; then
+    echo "  ✅ _publish_test.py: ${n:-0} passed (--post closure, anchoring, degrade-to-summary)"
+    ok=$((ok + 1))
+  else
+    printf '%s\n' "$pt" | grep -E '^(FAILED|ERROR)' | sed 's/^/  ❌ /' || true
+    echo "  ❌ _publish_test.py failed — run: python3 -m pytest $S/_publish_test.py"
+    bad=$((bad + 1))
+  fi
+else
+  echo "  ⏭️  _publish_test.py NOT RUN — no pytest on this box. The --post closure, the"
+  echo "      anchoring rule and the degrade-to-summary fallback are unverified here."
+fi
+
 echo "=== $ok green / $bad red ==="
 [ "$bad" -eq 0 ]
