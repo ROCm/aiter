@@ -8,7 +8,11 @@
 // launchers (own TUs). Dispatch only -- no kernel instantiation here.
 #include "rmsnorm_opus_norm.hpp"
 
+#ifdef _WIN32
+#define OPUS_EXPORT extern "C" __declspec(dllexport)
+#else
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
 
 // Dispatch a norm launch on the dtype code. R = residual_in, RO = residual_out.
 #define OPUS_NORM_DISPATCH(DTYPE, O, I, W, R, RO)                                                    \

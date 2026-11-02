@@ -36,6 +36,15 @@ MFMA32_SMALL_KERNEL = "_ZN5aiter40f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_ntE"
 MFMA32_SWZ0_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_tE"
 MFMA32_GROUPED_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a4_tE"
 MFMA32_LONG_K_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a5_tE"
+DMABIG_SWZ0_KERNEL = "_ZN5aiter44f6f4gemm_bf16_per1x32Fp6Fp4_dmabig_m82_s0_ntE"
+DMABIG_GROUPED_KERNEL = "_ZN5aiter44f6f4gemm_bf16_per1x32Fp6Fp4_dmabig_m82_s3_ntE"
+SPECIALIZED_SQUARE_KERNEL = (
+    "_ZN5aiter49f6f4gemm_bf16_per1x32Fp6Fp4_m9472_n5120_k5120_m82E"
+)
+SPECIALIZED_UP_KERNEL = "_ZN5aiter50f6f4gemm_bf16_per1x32Fp6Fp4_m9472_n13824_k5120_m82E"
+SPECIALIZED_DOWN_KERNEL = (
+    "_ZN5aiter50f6f4gemm_bf16_per1x32Fp6Fp4_m9472_n5120_k13824_m82E"
+)
 
 
 def _is_gfx950() -> bool:
@@ -169,6 +178,8 @@ test_gemm_a6w4_benchmark.__test__ = False
         ((513, 769, 257), MFMA32_SMALL_KERNEL, MX_DEFAULT_ROUND_MODE),
         ((257, 513, 129), MFMA32_SMALL_KERNEL, MX_DEFAULT_ROUND_MODE),
         ((257, 513, 513), MFMA32_SMALL_KERNEL, MX_DEFAULT_ROUND_MODE),
+        ((257, 513, 129), DMABIG_SWZ0_KERNEL, MX_DEFAULT_ROUND_MODE),
+        ((513, 769, 257), DMABIG_GROUPED_KERNEL, MX_DEFAULT_ROUND_MODE),
         ((2048, 512, 256), None, MX_DEFAULT_ROUND_MODE),
         ((2048, 256, 512), None, MX_DEFAULT_ROUND_MODE),
         ((9450, 5120, 5120), None, MX_DEFAULT_ROUND_MODE),
@@ -246,6 +257,8 @@ def test_a6w4_mfma32_variants_match_swizzle0_bitwise():
         MFMA32_SMALL_KERNEL,
         MFMA32_GROUPED_KERNEL,
         MFMA32_LONG_K_KERNEL,
+        DMABIG_SWZ0_KERNEL,
+        DMABIG_GROUPED_KERNEL,
     ):
         actual = torch.empty_like(baseline)
         gemm_a6w4_asm(
@@ -286,13 +299,17 @@ def test_a6w4_long_k_path_matches_swizzle0_bitwise():
     assert torch.equal(actual, baseline)
 
 
-def test_a6w4_dispatch_respects_grouped_kernel_bounds():
+@requires_gfx950
+def test_a6w4_dispatch_uses_specialized_kernels_and_respects_default_bounds():
     assert _select_gemm_a6w4_kernel(512, 5120, 5120, None) == MFMA32_SMALL_KERNEL
-    # Equality is intentionally format-specific: A6W4's tuned square default
-    # is grouped, while A4W6's is natural order.
-    assert _select_gemm_a6w4_kernel(9450, 5120, 5120, None) == MFMA32_GROUPED_KERNEL
-    assert _select_gemm_a6w4_kernel(9450, 13824, 5120, None) == MFMA32_GROUPED_KERNEL
-    assert _select_gemm_a6w4_kernel(9450, 5120, 13824, None) == MFMA32_LONG_K_KERNEL
+    assert a6w4_ops._default_gemm_a6w4_kernel(9450, 5120, 5120) == MFMA32_GROUPED_KERNEL
+    assert (
+        a6w4_ops._default_gemm_a6w4_kernel(9450, 13824, 5120) == MFMA32_GROUPED_KERNEL
+    )
+    assert a6w4_ops._default_gemm_a6w4_kernel(9450, 5120, 13824) == MFMA32_LONG_K_KERNEL
+    assert _select_gemm_a6w4_kernel(9450, 5120, 5120, None) == SPECIALIZED_SQUARE_KERNEL
+    assert _select_gemm_a6w4_kernel(9450, 13824, 5120, None) == SPECIALIZED_UP_KERNEL
+    assert _select_gemm_a6w4_kernel(9450, 5120, 13824, None) == SPECIALIZED_DOWN_KERNEL
     assert _select_gemm_a6w4_kernel(9450, 27648, 5120, None) == MFMA32_SWZ0_KERNEL
     assert _select_gemm_a6w4_kernel(131073, 13824, 5120, None) == MFMA32_SWZ0_KERNEL
 
@@ -323,6 +340,16 @@ def test_a6w4_asm_rejects_malformed_or_misaligned_buffers():
     misaligned_x.copy_(x_packed)
     with pytest.raises(RuntimeError, match="aligned to 16 bytes"):
         gemm_a6w4_asm(misaligned_x, w_packed, x_scales, w_scales, out, K)
+    with pytest.raises(RuntimeError, match="requested physical shape"):
+        gemm_a6w4_asm(
+            x_packed,
+            w_packed,
+            x_scales,
+            w_scales,
+            out,
+            K,
+            SPECIALIZED_SQUARE_KERNEL,
+        )
 
 
 def test_mxfp4_compile_launch_avoids_device_context(

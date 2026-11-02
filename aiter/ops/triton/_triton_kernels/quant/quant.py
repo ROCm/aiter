@@ -707,13 +707,16 @@ def _dynamic_mxfp4_quant_blockscale_kernel(
 
 # MXFP8 (1x32 e8m0) quant: derives a per-block uint8 e8m0 scale + FP8 e4m3
 # values. The bit-trick (bitcast amax to int32, add 0x200000, mask 0xFF800000,
-# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() - 8
-# is the unbiased e8m0 exponent (dtypeMax = 2**8).
+# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() -
+# LOG2_DTYPE_MAX is the unbiased e8m0 exponent (8 for OCP e4m3fn, 7 for fnuz).
 
 
 @triton.jit
 def _mxfp8_quant_op(
-    x_grouped, QUANT_AXIS: tl.constexpr, LOG2_DTYPE_MAX: tl.constexpr = 8
+    x_grouped,
+    QUANT_AXIS: tl.constexpr,
+    LOG2_DTYPE_MAX: tl.constexpr = 8,
+    AMAX_FLOOR: tl.constexpr = 0.0,
 ):
     """Shared MXFP8 (1x32 e8m0) scale derivation.
 
@@ -721,8 +724,11 @@ def _mxfp8_quant_op(
     returns (scale_e8m0, quant_scale): the per-group uint8 e8m0 scale and the
     matching fp32 multiplicative scale. Both outputs keep QUANT_AXIS with size 1
     so they broadcast against the input for in-place quantization.
+    AMAX_FLOOR > 0 floors each group's amax (none by default).
     """
     amax = tl.max(tl.abs(x_grouped), axis=QUANT_AXIS, keep_dims=True)
+    if AMAX_FLOOR > 0:
+        amax = tl.maximum(amax, AMAX_FLOOR)
     amax_i32 = amax.to(tl.int32, bitcast=True)
     amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
     amax_p2 = amax_i32.to(tl.float32, bitcast=True)
@@ -758,6 +764,7 @@ def _dynamic_mxfp8_quant_kernel(
     BLOCK_SIZE_N: tl.constexpr,  # power-of-2 covering full N
     QUANT_BLOCK_SIZE: tl.constexpr,  # =32
     NUM_PRGMS: tl.constexpr,  # row-loop range (usually =M)
+    LOG2_DTYPE_MAX: tl.constexpr = 8,
 ):
     """
     Per-1x32 MXFP8 quant. One program per row, holding the full row in
@@ -771,6 +778,8 @@ def _dynamic_mxfp8_quant_kernel(
     n_groups: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
 
     for row_idx in tl.range(row_start, M, NUM_PRGMS, num_stages=2):
+        # row_idx * stride_xm can exceed int32 for stacked expert weights.
+        row_idx = row_idx.to(tl.int64)
         x = tl.load(
             x_ptr + row_idx * stride_xm + col_offsets * stride_xn,
             mask=mask,
@@ -779,7 +788,9 @@ def _dynamic_mxfp8_quant_kernel(
 
         # (BLOCK_SIZE_N,) -> (n_groups, QUANT_BLOCK_SIZE)
         x_2d = tl.reshape(x, (n_groups, QUANT_BLOCK_SIZE))
-        scale_e8m0, quant_scale = _mxfp8_quant_op(x_2d, QUANT_AXIS=1)
+        scale_e8m0, quant_scale = _mxfp8_quant_op(
+            x_2d, QUANT_AXIS=1, LOG2_DTYPE_MAX=LOG2_DTYPE_MAX
+        )
 
         qx_2d = x_2d * quant_scale
         qx = tl.reshape(qx_2d, (BLOCK_SIZE_N,))

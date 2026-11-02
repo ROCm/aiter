@@ -190,8 +190,8 @@ def _scale_sub_score_pair(v_s, row_max_raw, scale, zero_f, fm_fast, bias=None):
         # exp2 lands on 2**bias * P instead of P, at no extra instruction: the
         # FMA's addend absorbs it.
         neg_scaled_max = neg_scaled_max + bias
-    scale_v = Vec.from_elements([scale], fx.Float32).broadcast_to(16)
-    nsm_v = Vec.from_elements([neg_scaled_max], fx.Float32).broadcast_to(16)
+    scale_v = fx.full(16, fx.Float32(scale), fx.Float32)
+    nsm_v = fx.full(16, fx.Float32(neg_scaled_max), fx.Float32)
     lo = fx.fma(Vec(s_lo), scale_v, nsm_v, fastmath=fm_fast)
     hi = fx.fma(Vec(s_hi), scale_v, nsm_v, fastmath=fm_fast)
     return as_mlir_value(lo), as_mlir_value(hi)
@@ -202,18 +202,18 @@ def _exp2_score_slice(v_s, start):
         s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
         lo_partial = []
         for r in range_constexpr(16):
-            lo_partial.append(rocdl.exp2(T.f32, as_mlir_value(s_lo[r])))
+            lo_partial.append(fx.Float32(s_lo[r]).exp2(fastmath="afn"))
         return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
 
     lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
     hi_full = []
     for r in range_constexpr(16):
-        hi_full.append(rocdl.exp2(T.f32, as_mlir_value(Vec(v_s[1])[r])))
+        hi_full.append(fx.Float32(Vec(v_s[1])[r]).exp2(fastmath="afn"))
     return lo_partial, hi_full
 
 
 def _scale_o_accs(v_o, scale_scalar, traits):
-    scale_vec = Vec.from_elements([scale_scalar], fx.Float32).broadcast_to(16)
+    scale_vec = fx.full(16, fx.Float32(scale_scalar), fx.Float32)
     for dc in range_constexpr(traits.D_CHUNKS):
         v_o[dc] = Vec(v_o[dc]) * scale_vec
 
@@ -262,7 +262,7 @@ def _cu_load(div, idx, cu_atom, cu_v1i32):
         [cu_v1i32], cu_atom, fx.slice(div, (None, fx.Int32(idx)))
     )
     return fx.Index(
-        rocdl.readfirstlane(T.i32, as_mlir_value(fx.Int32(Vec(v, (1,), fx.Int32)[0])))
+        rocdl.readfirstlane(T.i32, as_mlir_value(Vec(v, (1,), fx.Int32)[0]))
     )
 
 
@@ -343,7 +343,7 @@ def _buffer_store_128(
 @flyc.jit
 def _stagger_extra_barrier_if_one(stagger_i32):
     """Emit `sched_barrier(0); s_barrier;` only when stagger == 1."""
-    if fx.Int32(stagger_i32) != fx.Int32(0):
+    if fx.Int32(stagger_i32) != 0:
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
 
@@ -737,7 +737,7 @@ class DualwaveFp8KernelContext:
         self.c_neg_floor = fx.Float32(-3.0e38)
         self.c_zero_f = fx.Float32(0.0)
         self.c_rescale_thr_f = fx.Float32(traits.DUALWAVE_SWP_RESCALE_THRESHOLD)
-        self.c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
+        self.c_zero_v16f32 = fx.full(16, 0.0, fx.Float32)
 
     def init_runtime_indices(self):
         traits = self.traits
@@ -771,11 +771,8 @@ class DualwaveFp8KernelContext:
         lds = fx.SharedAllocator().allocate(shared_storage).peek()
         self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
-        self.lds_kv_base_ptr = lds.kv.ptr.llvm_ptr
         self.lds_vt_base_idx = fx.Index(fx.ptrtoint(lds.vt.ptr))
-        self.lds_vt_base_ptr = lds.vt.ptr.llvm_ptr
         self.lds_q_base_idx = fx.Index(fx.ptrtoint(lds.q.ptr))
-        self.lds_q_base_ptr = lds.q.ptr.llvm_ptr
 
     def init_thread_mapping(self):
         _init_dualwave_thread_mapping(self)
@@ -884,7 +881,7 @@ class DualwaveFp8KernelContext:
                 _atom,
                 fx.slice(_div, (None, fx.Int32(0))),
             )
-            return fx.Float32(Vec(_v, (1,), fx.Float32)[0])
+            return Vec(_v, (1,), fx.Float32)[0]
 
         c_log2e_f = fx.Float32(_LOG2E)
         c_sm_scale_log2e = self.softmax_scale * c_log2e_f
@@ -911,15 +908,15 @@ class DualwaveFp8KernelContext:
             causal_num_tiles = (
                 fx.Index(causal_end_i32) + kv_tile_size - 1
             ) // kv_tile_size
-            max_num_tiles = fx.Index(
-                (causal_num_tiles < num_kv_tiles).select(causal_num_tiles, num_kv_tiles)
+            max_num_tiles = (causal_num_tiles < num_kv_tiles).select(
+                causal_num_tiles, num_kv_tiles
             )
         else:
             causal_end_raw_i32 = None
             max_num_tiles = num_kv_tiles
         # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
         max_num_tiles = ((max_num_tiles + 1) // 2) * 2
-        max_num_tiles = fx.Index((max_num_tiles < 4).select(4, max_num_tiles))
+        max_num_tiles = (max_num_tiles < 4).select(4, max_num_tiles)
         self.max_num_tiles = max_num_tiles
         if const_expr(traits.SPLITK):
             chunk = (
@@ -930,14 +927,14 @@ class DualwaveFp8KernelContext:
                 // 2
                 * 2
             )
-            chunk = fx.Index((chunk < 6).select(6, chunk))
+            chunk = (chunk < 6).select(6, chunk)
             split_t0 = self.split_idx * chunk
             split_t_end = split_t0 + chunk
-            split_t_end = fx.Index(
-                (split_t_end < max_num_tiles).select(split_t_end, max_num_tiles)
+            split_t_end = (split_t_end < max_num_tiles).select(
+                split_t_end, max_num_tiles
             )
-            split_t_end = fx.Index(
-                (max_num_tiles - split_t_end < 4).select(max_num_tiles, split_t_end)
+            split_t_end = (max_num_tiles - split_t_end < 4).select(
+                max_num_tiles, split_t_end
             )
             self.split_nonempty = split_t0 + 4 <= max_num_tiles
         else:
@@ -952,7 +949,7 @@ class DualwaveFp8KernelContext:
             if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
                 in_mask = causal_end_raw_i32 > fx.Int32(0)
                 active = in_mask if active is None else (active & in_mask)
-            split_t_end = fx.Index(active.select(split_t_end, split_t0))
+            split_t_end = active.select(split_t_end, split_t0)
 
         self.split_t0 = split_t0
         self.split_t_end = split_t_end
@@ -969,7 +966,7 @@ class DualwaveFp8KernelContext:
             self.ws_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
 
     def ws_store_f32(self, f32_val, elem_index):
-        pack = Vec.from_elements([fx.Float32(f32_val)], fx.Float32).bitcast(fx.Int32)
+        pack = Vec.from_elements([f32_val], fx.Float32).bitcast(fx.Int32)
         fx.memref_store_vec(pack, self.ws_store_reg_32)
         fx.copy(
             self.ws_store_atom_32,
@@ -978,7 +975,7 @@ class DualwaveFp8KernelContext:
         )
 
     def ws_store_quad_i32(self, dwords, elem_index):
-        pack = Vec.from_elements([fx.Int32(v) for v in dwords], fx.Int32)
+        pack = Vec.from_elements(dwords, fx.Int32)
         fx.memref_store_vec(pack, self.ws_store_reg_128)
         fx.copy(
             self.store_atom_128,
@@ -1035,12 +1032,13 @@ class DualwaveFp8KernelContext:
         )
 
     def read_i32x8_lds(self, base_ptr, byte_row):
+        vec_ty = Vec.make_type(4, fx.Int32)
+        ptr_ty = fx.PointerType.get(
+            fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16
+        )
+        base_ptr = fx.recast_iter(ptr_ty, base_ptr)
         halves = []
         for h in range_constexpr(2):
-            p = buffer_ops.get_element_ptr(
-                base_ptr, byte_offset=fx.Int32(byte_row + h * 16), elem_type=T.i8
-            )
-            halves.append(
-                Vec(llvm.LoadOp(Vec.make_type(4, fx.Int32), p, alignment=16).result)
-            )
+            p = fx.add_offset(base_ptr, fx.Int32(byte_row + h * 16))
+            halves.append(fx.ptr_load(p, result_type=vec_ty))
         return halves[0].shuffle(halves[1], [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()

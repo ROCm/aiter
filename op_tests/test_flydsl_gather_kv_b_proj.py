@@ -115,6 +115,10 @@ _SKIP = pytest.mark.skipif(
     get_gfx() not in SUPPORTED_GFX,
     reason="gfx950 FlyDSL required",
 )
+_SKIP_GFX1250 = pytest.mark.skipif(
+    get_gfx() != "gfx1250",
+    reason="gfx1250 FlyDSL required",
+)
 
 
 def _make_case(
@@ -279,7 +283,43 @@ def _check_output(case):
                 == 0
             )
         else:
-            checkAllclose(ref, actual, atol=1e-2, rtol=1e-2, msg=key)
+            assert (
+                checkAllclose(
+                    ref,
+                    actual,
+                    atol=1e-2,
+                    rtol=1e-2,
+                    tol_err_ratio=0,
+                    msg=key,
+                )
+                == 0
+            )
+
+
+@_SKIP_GFX1250
+@pytest.mark.parametrize(
+    "num_tokens,n_heads,alloc",
+    [(257, 12, 320), (512, 96, None), (2048, 96, 2176), (4096, 96, None)],
+)
+def test_gather_kv_b_proj_flydsl_gfx1250_ptpc(num_tokens, n_heads, alloc):
+    case = _make_case(num_tokens, n_heads, alloc=alloc)
+    case["k_scale"] = torch.tensor(1.0)
+    weight = shuffle_weight(case["weight"], layout=(16, 16))
+    assert gather_kv_b_proj_flydsl_supported(
+        case["k_buffer"],
+        weight,
+        case["weight_scale"],
+        case["k_prefix"],
+        case["v_prefix"],
+    )
+    if alloc is not None:
+        case["k_prefix"][num_tokens:].fill_(float("nan"))
+        case["v_prefix"][num_tokens:].fill_(float("nan"))
+    _run_flydsl(case)
+    _check_output(case)
+    if alloc is not None:
+        assert torch.isnan(case["k_prefix"][num_tokens:]).all()
+        assert torch.isnan(case["v_prefix"][num_tokens:]).all()
 
 
 @_SKIP

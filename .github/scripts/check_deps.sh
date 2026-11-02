@@ -3,6 +3,7 @@
 CURRENT_COMMIT=$(git submodule status 3rdparty/composable_kernel | awk '{print $1}')
 
 TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
 git clone --filter=blob:none --no-checkout --single-branch --branch develop https://github.com/ROCm/composable_kernel.git "$TEMP_DIR" 2>/dev/null
 
 # clone CK to tmp dir
@@ -11,12 +12,7 @@ if [ ! -d "$TEMP_DIR/.git" ]; then
   exit 1
 fi
 
-DEVELOP_COMMITS=$(git -C "$TEMP_DIR" rev-list develop)
-
-# echo "CURRENT COMMIT: $CURRENT_COMMIT"
-# echo "DEVELOP COMMIT: $DEVELOP_COMMITS"
-
-if ! echo "$DEVELOP_COMMITS" | grep -q "^$CURRENT_COMMIT$"; then
+if ! git -C "$TEMP_DIR" merge-base --is-ancestor "$CURRENT_COMMIT" develop; then
   echo "?3rdparty/composable_kernel must be commits from develop branch"
   echo "CURRENT COMMIT: $CURRENT_COMMIT"
   exit 1

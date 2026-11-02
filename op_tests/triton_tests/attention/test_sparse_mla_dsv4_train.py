@@ -14,8 +14,6 @@ from aiter.ops.triton.attention.sparse_mla_dsv4_train import (
     sparse_mla_fwd,
 )
 
-torch.set_default_device("cuda")
-
 # ── PyTorch reference ────────────────────────────────────────────────
 
 
@@ -75,10 +73,12 @@ def _run_fwd(N, H, D, N_kv, topk, has_sink=True):
         f"  FWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" "
     )
 
-    q = torch.randn(N, H, D, dtype=torch.bfloat16)
-    kv = torch.randn(N_kv, D, dtype=torch.bfloat16)
-    indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32)
-    attn_sink = torch.randn(H, dtype=torch.float32) * 0.1 if has_sink else None
+    q = torch.randn(N, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(N_kv, D, dtype=torch.bfloat16, device="cuda")
+    indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32, device="cuda")
+    attn_sink = (
+        torch.randn(H, dtype=torch.float32, device="cuda") * 0.1 if has_sink else None
+    )
     scale = 1.0 / (D**0.5)
 
     out, lse = sparse_mla_fwd(q, kv, attn_sink, indices, scale)
@@ -98,11 +98,11 @@ def _run_bwd(N, H, D, N_kv, topk, has_sink=True):
         f"  BWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" "
     )
 
-    q = torch.randn(N, H, D, dtype=torch.bfloat16, requires_grad=True)
-    kv = torch.randn(N_kv, D, dtype=torch.bfloat16, requires_grad=True)
-    indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32)
+    q = torch.randn(N, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    kv = torch.randn(N_kv, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32, device="cuda")
     attn_sink = (
-        (torch.randn(H, dtype=torch.float32) * 0.1).requires_grad_(True)
+        (torch.randn(H, dtype=torch.float32, device="cuda") * 0.1).requires_grad_(True)
         if has_sink
         else None
     )
@@ -161,11 +161,11 @@ def _run_autograd(N, H, D, N_kv, topk, has_sink=True):
         end=" ",
     )
 
-    q = torch.randn(N, H, D, dtype=torch.bfloat16, requires_grad=True)
-    kv = torch.randn(N_kv, D, dtype=torch.bfloat16, requires_grad=True)
-    indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32)
+    q = torch.randn(N, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    kv = torch.randn(N_kv, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32, device="cuda")
     attn_sink = (
-        (torch.randn(H, dtype=torch.float32) * 0.1).requires_grad_(True)
+        (torch.randn(H, dtype=torch.float32, device="cuda") * 0.1).requires_grad_(True)
         if has_sink
         else None
     )

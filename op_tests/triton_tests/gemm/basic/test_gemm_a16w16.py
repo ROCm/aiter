@@ -97,6 +97,29 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
+# Output larger than 2**31 bytes (Wan2.2 FFN up-projection at 720p x 193 frames).
+@pytest.mark.parametrize("M, N, K", [(90000, 13824, 5120)])
+def test_gemm_a16_w16_large_output(M: int, N: int, K: int):
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    assert M * N * 2 > 2**31
+
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(
+        M, N, K, dtype=torch.bfloat16, output=False
+    )
+    # NaN-fill so any row the kernel never writes fails the comparison.
+    y = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    gemm_a16w16(x, w, y=y, backend="gluon")
+
+    boundary_row = 2**31 // (N * 2)
+    for rows in (
+        slice(0, 1024),
+        slice(boundary_row - 512, boundary_row + 512),
+        slice(M - 1024, M),
+    ):
+        torch.testing.assert_close(y[rows], F.linear(x[rows], w), atol=1e-1, rtol=1e-2)
+
+
 # Smaller set for testing activations, setting the output tensor and dtype
 def get_fewer_x_vals():
     x_vals = [(16, 1024, 1024)]

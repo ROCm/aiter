@@ -30,6 +30,7 @@
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
 #include "moe_op.h"
+#include "topk_pad_rows.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -137,7 +138,8 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
                                                const int end_expert,
                                                const int output_row_stride,
                                                const int index_row_stride,
-                                               const bool need_renorm)
+                                               const bool need_renorm,
+                                               const int* num_valid_rows)
 {
 
     using cub_kvp = aiter::KeyValuePair<int, float>;
@@ -147,6 +149,15 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
 
     const int num_rows  = gridDim.x;
     const int block_row = blockIdx.x;
+    if(aiter::is_pad_row(num_valid_rows, block_row))
+    {
+        aiter::write_pad_row(output + output_row_stride * block_row,
+                             indices + index_row_stride * block_row,
+                             k,
+                             threadIdx.x,
+                             TPB);
+        return;
+    }
 
     float renorm_value           = 0.0f;
     const bool row_is_active     = finished ? !finished[block_row] : true;
@@ -247,7 +258,8 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
                            const int end_expert,
                            const int output_stride,
                            const int indices_stride,
-                           const int input_stride)
+                           const int input_stride,
+                           const int* num_valid_rows)
 {
     // We begin by enforcing compile time assertions and setting up compile time constants.
     static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
@@ -302,6 +314,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
         return;
     }
     const bool row_is_active = finished ? !finished[thread_row] : true;
+    const bool pad           = aiter::is_pad_row(num_valid_rows, thread_row);
 
     // We finally start setting up the read pointers for each thread. First, each thread jumps to
     // the start of the row it will read.
@@ -449,8 +462,10 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
             const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx         = k * thread_row + k_idx;
             const float numer     = expf(max_val - thread_max);
-            output[output_idx]    = numer;
-            indices[indices_idx]  = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
+            output[output_idx]    = pad ? 0.f : numer;
+            indices[indices_idx]  = pad                  ? -1
+                                    : should_process_row ? (expert - start_expert)
+                                                         : NUM_EXPERTS;
             source_rows[idx]      = k_idx * num_rows + thread_row;
 
             // Accumulate renorm scalar
@@ -545,7 +560,8 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                      const int indices_stride,
                                      const int input_stride,
                                      const bool need_renorm,
-                                     hipStream_t stream)
+                                     hipStream_t stream,
+                                     const int* num_valid_rows)
 {
     static constexpr std::size_t MAX_BYTES_PER_LDG = EXPERTS < 512 ? 32 : 64;
 
@@ -572,7 +588,8 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                                    end_expert,
                                                    output_stride,
                                                    indices_stride,
-                                                   input_stride);
+                                                   input_stride,
+                                                   num_valid_rows);
     }
     else
     {
@@ -588,7 +605,8 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                                    end_expert,
                                                    output_stride,
                                                    indices_stride,
-                                                   input_stride);
+                                                   input_stride,
+                                                   num_valid_rows);
     }
 }
 
@@ -607,7 +625,8 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                                                       topk_id_stride,       \
                                                                       gating_token_stride,  \
                                                                       need_renorm,          \
-                                                                      stream);
+                                                                      stream,               \
+                                                                      num_valid_rows);
 
 // Helper macro that dispatches based on num_shared_experts and scoring function
 #define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB)                                           \
@@ -677,7 +696,8 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                      const int topk_id_stride,
                                      const int gating_token_stride,
                                      const bool need_renorm,
-                                     hipStream_t stream)
+                                     hipStream_t stream,
+                                     const int* num_valid_rows)
 {
     // Convert string to enum for template dispatch
     SharedExpertScoringFunc scoring_func_enum = SharedExpertScoringFunc::NONE;
@@ -726,7 +746,8 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                                      num_experts,
                                                      topk_weights_stride,
                                                      topk_id_stride,
-                                                     need_renorm);
+                                                     need_renorm,
+                                                     num_valid_rows);
 
         // Handle shared experts for non-power-of-2 case
         if(num_shared_experts > 0 && !shared_experts_scoring_func.empty())
@@ -795,6 +816,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
                            const int output_stride,
                            const int indices_stride,
                            const int input_stride,
+                           const int* num_valid_rows,
                            // Option A ("fuse-gate") shared-expert inputs. gate_weight
                            // != nullptr selects in-kernel GEMV scoring; otherwise the
                            // shared logit is read from input's trailing columns (legacy).
@@ -892,6 +914,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
         return;
     }
     const bool row_is_active = finished ? !finished[thread_row] : true;
+    const bool pad           = aiter::is_pad_row(num_valid_rows, thread_row);
 
     // We finally start setting up the read pointers for each thread. First, each thread jumps to
     // the start of the row it will read.
@@ -1067,15 +1090,16 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
             const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx         = k * thread_row + k_idx;
             const float numer     = expf(max_val - thread_max);
-            output[output_idx]    = numer;
+            output[output_idx]    = pad ? 0.f : numer;
             // Filtered-slot marker must sit OUTSIDE the valid id space
             // [0, NUM_EXPERTS + NUM_SHARED_EXPERTS): the shared ids occupy
             // [NUM_EXPERTS, NUM_EXPERTS + NUM_SHARED_EXPERTS), so plain NUM_EXPERTS would
             // alias shared expert 0. (This op passes finished=nullptr and the full
             // [0, num_experts) range, so no slot is filtered today; the marker is chosen
             // defensively for any future expert-parallel wiring.)
-            indices[indices_idx] =
-                should_process_row ? (expert - start_expert) : (NUM_EXPERTS + NUM_SHARED_EXPERTS);
+            indices[indices_idx] = pad                  ? -1
+                                   : should_process_row ? (expert - start_expert)
+                                                        : (NUM_EXPERTS + NUM_SHARED_EXPERTS);
             source_rows[idx]      = k_idx * num_rows + thread_row;
 
             // Accumulate renorm scalar
@@ -1155,6 +1179,7 @@ void topkGatingSoftmaxFusedGateLauncherHelper(const DTYPE* input,
                                      const int input_stride,
                                      const bool need_renorm,
                                      hipStream_t stream,
+                                     const int* num_valid_rows,
                                      const DTYPE* shared_hidden_states = nullptr,
                                      const DTYPE* shared_gate_weight   = nullptr,
                                      const int shared_hidden_size      = 0,
@@ -1188,6 +1213,7 @@ void topkGatingSoftmaxFusedGateLauncherHelper(const DTYPE* input,
                                                    output_stride,
                                                    indices_stride,
                                                    input_stride,
+                                                   num_valid_rows,
                                                    shared_hidden_states,
                                                    shared_gate_weight,
                                                    shared_hidden_size,
@@ -1210,6 +1236,7 @@ void topkGatingSoftmaxFusedGateLauncherHelper(const DTYPE* input,
                                                    output_stride,
                                                    indices_stride,
                                                    input_stride,
+                                                   num_valid_rows,
                                                    shared_hidden_states,
                                                    shared_gate_weight,
                                                    shared_hidden_size,
@@ -1235,6 +1262,7 @@ void topkGatingSoftmaxFusedGateLauncherHelper(const DTYPE* input,
                                                                       gating_token_stride,  \
                                                                       need_renorm,          \
                                                                       stream,               \
+                                                                      num_valid_rows,       \
                                                                       shared_hidden_states, \
                                                                       shared_gate_weight,   \
                                                                       shared_hidden_size,   \
@@ -1283,6 +1311,7 @@ void topkGatingSoftmaxFusedGateKernelLauncher(const DTYPE* gating_output,
                                      const int gating_token_stride,
                                      const bool need_renorm,
                                      hipStream_t stream,
+                                     const int* num_valid_rows,
                                      const DTYPE* shared_hidden_states = nullptr,
                                      const DTYPE* shared_gate_weight   = nullptr,
                                      const int shared_hidden_size      = 0,
@@ -1343,7 +1372,8 @@ void topk_softmax(const aiter_tensor_t& topk_weights,         // [num_tokens, to
                   const aiter_tensor_t& softmax_workspace,    // [num_tokens * num_routing_experts] fp32, python-allocated
                   bool need_renorm,
                   int num_shared_experts,
-                  const std::string& shared_expert_scoring_func)
+                  const std::string& shared_expert_scoring_func,
+                  std::optional<aiter_tensor_t> num_valid_rows)
 {
     const int num_experts_total   = gating_output.size(-1);
     const int num_tokens          = gating_output.numel() / num_experts_total;
@@ -1398,7 +1428,8 @@ void topk_softmax(const aiter_tensor_t& topk_weights,         // [num_tokens, to
             topk_id_stride,
             gating_token_stride,
             need_renorm,
-            stream);
+            stream,
+            num_valid_rows_ptr(num_valid_rows));
     });
 }
 
@@ -1416,7 +1447,8 @@ void topk_softmax_fused_shared_gate(
     const aiter_tensor_t& hidden_states,         // [num_tokens, hidden]
     const aiter_tensor_t& gate_weight,           // [num_shared_experts, hidden]
     float shared_expert_scale,
-    int shared_expert_base)
+    int shared_expert_base,
+    std::optional<aiter_tensor_t> num_valid_rows)
 {
     // Surface AITER_CHECK failures as a Python RuntimeError (pybind path) instead of
     // aborting the process, so callers get a catchable error on bad input.
@@ -1525,6 +1557,7 @@ void topk_softmax_fused_shared_gate(
             gating_token_stride,
             need_renorm,
             stream,
+            num_valid_rows_ptr(num_valid_rows),
             shared_hidden_ptr,
             shared_gate_ptr,
             shared_hidden_size,

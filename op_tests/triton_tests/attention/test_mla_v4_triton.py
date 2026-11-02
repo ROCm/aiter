@@ -10,7 +10,6 @@ import triton
 from aiter.benchmark_data_init import fill, make_generator
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -290,7 +289,7 @@ def bench_mla_v4_triton_perf(
 def _wrapper_main_kernel_params(T: int, H: int, D: int):
     """Reproduce the (use_exp2, block_k) the wrapper picks for the main kernel.
 
-    Must stay in sync with ``pa_decode_sparse``'s USE_EXP2 and block_k logic.
+    Must stay in sync with ``pa_decode_sparse``'s (always exp2) block_k logic.
     """
     use_gluon = arch_info.get_arch() == "gfx1250"
     use_exp2 = True
@@ -451,95 +450,6 @@ def test_pa_decode_sparse_vs_reference(
     )
 
 
-# ---------------------------------------------------------------------------
-# FP8 KV cache quantization helpers
-# ---------------------------------------------------------------------------
-
-_FP8_GROUP_SIZE = 64
-_FP8_DTYPE = get_fp8_e4m3_dtype()
-
-
-def _quantize_kv_fp8(unified_kv, group_size=_FP8_GROUP_SIZE):
-    """Quantize bf16/fp16 unified_kv to (fp8, scales) with 1xGROUP_SIZE block scaling.
-
-    Returns (kv_fp8, kv_scales) where kv_fp8 is _FP8_DTYPE and
-    kv_scales is [total_pages, D // group_size] fp32.
-    """
-    total_pages, D = unified_kv.shape
-    assert D % group_size == 0
-    num_groups = D // group_size
-    kv_f32 = unified_kv.float().view(total_pages, num_groups, group_size)
-    amax = kv_f32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    fp8_max = torch.finfo(_FP8_DTYPE).max
-    scales = (amax / fp8_max).squeeze(-1)  # [total_pages, num_groups]
-    kv_scaled = kv_f32 / amax * fp8_max
-    kv_fp8 = kv_scaled.view(total_pages, D).to(_FP8_DTYPE)
-    return kv_fp8, scales.to(torch.float32)
-
-
-def _dequant_kv_fp8(kv_fp8, kv_scales, group_size=_FP8_GROUP_SIZE):
-    """Dequantize for reference comparison."""
-    total_pages, D = kv_fp8.shape
-    num_groups = D // group_size
-    kv_f32 = kv_fp8.float().view(total_pages, num_groups, group_size)
-    scales_expanded = kv_scales.unsqueeze(-1).expand(
-        total_pages, num_groups, group_size
-    )
-    return (kv_f32 * scales_expanded).view(total_pages, D)
-
-
-@pytest.mark.parametrize("T", [1, 32])
-@pytest.mark.parametrize("H", [16])
-@pytest.mark.parametrize("D", [512])
-@pytest.mark.parametrize("kv_len", [100])
-@pytest.mark.parametrize("var_len", [True, False])
-def test_pa_decode_sparse_fp8_vs_reference(T, H, D, kv_len, var_len):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-
-    pages = T * kv_len
-    q, ukv_bf16, indices, indptr, sink, scale = _make_inputs(
-        T,
-        H,
-        D,
-        kv_len,
-        pages,
-        variable_len=var_len,
-    )
-
-    # Quantize KV to fp8 + scales
-    kv_fp8, kv_scales = _quantize_kv_fp8(ukv_bf16)
-
-    # Reference: dequant back to bf16, run the torch reference
-    ukv_deq = _dequant_kv_fp8(kv_fp8, kv_scales).to(q.dtype)
-    ref = pa_decode_sparse_reference(q, ukv_deq, indices, indptr, sink, scale)
-
-    # Triton kernel with fp8 kv + kv_scales
-    out = pa_decode_sparse(
-        q,
-        kv_fp8,
-        indices,
-        indptr,
-        sink,
-        scale,
-        kv_scales=kv_scales,
-        has_invalid=False,
-    )
-
-    tol_err_ratio = 0.01
-    assert (
-        checkAllclose(
-            out.to(torch.bfloat16),
-            ref.to(torch.bfloat16),
-            atol=1e-2,
-            rtol=1e-2,
-            tol_err_ratio=tol_err_ratio,
-            msg="pa_decode_sparse output",
-        )
-        <= tol_err_ratio
-    )
-
-
 def make_packed_cache(num_tokens, D, dtype):
     device = "cuda"
     rope = 64  # DSv4 RoPE dim, stored bf16
@@ -547,7 +457,9 @@ def make_packed_cache(num_tokens, D, dtype):
     nope = D - rope  # NoPE dim, stored fp8 e4m3 OCP
     nb = triton.cdiv(num_tokens, block)
     if dtype == "bf16":
-        cache = (torch.randn(nb, block, D, device=device) * 0.4).to(torch.bfloat16)
+        cache = (
+            torch.randn(nb, block, D, device=device, dtype=torch.float32) * 0.4
+        ).to(torch.bfloat16)
         return cache, cache.reshape(nb * block, D).float()
 
     # per token: [nope fp8 (1B) | rope bf16 (2B) | 8 UE8M0 scale bytes]
@@ -558,11 +470,13 @@ def make_packed_cache(num_tokens, D, dtype):
     flat = cache.view(nb, block * row_bytes)
     data = flat[:, : block * data_bytes].view(nb, block, data_bytes)
     scales_region = flat[:, block * data_bytes :].view(nb, block, scale_bytes)
-    nope_fp8 = (torch.randn(nb, block, nope, device=device) * 0.4).to(
-        torch.float8_e4m3fn
-    )
+    nope_fp8 = (
+        torch.randn(nb, block, nope, device=device, dtype=torch.float32) * 0.4
+    ).to(torch.float8_e4m3fn)
     data[:, :, :nope] = nope_fp8.view(torch.uint8)
-    rope_bf16 = (torch.randn(nb, block, rope, device=device) * 0.4).to(torch.bfloat16)
+    rope_bf16 = (
+        torch.randn(nb, block, rope, device=device, dtype=torch.float32) * 0.4
+    ).to(torch.bfloat16)
     data[:, :, nope:data_bytes] = rope_bf16.view(torch.uint8).view(nb, block, rope * 2)
     num_groups = nope // 64
     exps = torch.randint(

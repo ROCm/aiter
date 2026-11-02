@@ -10,7 +10,6 @@ One provider per kernel:
   segment_m  -> quant_fp8_blockwise_segment_m_kernel
 """
 
-import argparse
 import math
 
 import torch
@@ -23,6 +22,10 @@ from aiter.ops.triton.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise_segment_m,
     requant_fp8_row_to_col,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 _BS = 128
@@ -32,9 +35,9 @@ def _segment_indptrs(M, nseg, device):
     """Equal-length segments over M rows -> (seg_indptr, scales_seg_indptr)."""
     base = M // nseg
     lens = [base] * (nseg - 1) + [M - base * (nseg - 1)]
-    seg = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), device=device).int()
+    seg = torch.tensor([0] + lens, device=device).cumsum(0).int()
     blocks = [math.ceil(length / _BS) for length in lens]
-    sseg = torch.tensor([0] + list(torch.tensor(blocks).cumsum(0)), device=device).int()
+    sseg = torch.tensor([0] + blocks, device=device).cumsum(0).int()
     return seg, sseg
 
 
@@ -100,15 +103,9 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark FP8 blockwise quant", allow_abbrev=False
-    )
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
+    parser = get_parser(kernel_name="FP8 blockwise quant")
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()

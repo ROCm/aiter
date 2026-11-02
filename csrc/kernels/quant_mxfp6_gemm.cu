@@ -51,10 +51,17 @@ __device__ __forceinline__ float swap_lane_distance_two(float value)
     return opus::mov_dpp(value, opus::number<0x4e>{});
 }
 
+template <typename T>
+__forceinline__ __device__ float mxfp6_to_float(T x) { return x; }
+template <>
+__forceinline__ __device__ float mxfp6_to_float<__half>(__half x) { return __half2float(x); }
+template <>
+__forceinline__ __device__ float mxfp6_to_float<__hip_bfloat16>(__hip_bfloat16 x) { return __bfloat162float(x); }
+
 template <typename input_t>
 __device__ __forceinline__ float to_bf16_dot_operand(input_t input)
 {
-    const float value = static_cast<float>(input);
+    const float value = mxfp6_to_float(input);
     if constexpr(std::is_same_v<input_t, hip_bfloat16>)
         return value;
     return __bfloat162float(__float2bfloat16(value));

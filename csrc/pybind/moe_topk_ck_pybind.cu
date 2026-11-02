@@ -2,7 +2,7 @@
    Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 */
 #include "rocm_ops.hpp"
-#include <torch/all.h>
+#include <torch/extension.h>
 
 // topk_sigmoid is still a torch-based op (module_moe_topk_ck); declared here so it
 // does not pull a torch dependency into the now torch-free moe_op.h.

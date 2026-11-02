@@ -346,7 +346,7 @@ def chunk_kda_walk_kernel(
     o_s = gl.allocate_shared_memory(o_ptr.dtype.element_ty, [BV, BT], SL_O)
     SL_D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     d_s = gl.allocate_shared_memory(gl.float32, [NUM_STAGES, 1, K], SL_D)
-    d_1 = d_s._reinterpret(
+    d_1 = d_s.reinterpret(
         gl.float32, [NUM_STAGES, K], gl.SwizzledSharedLayout(1, 1, 1, [0])
     )
     # descriptors span the sequence, so the clamp zero-fills a partial last chunk

@@ -12,6 +12,7 @@ enum class ActivationType : int
     Swiglu   = 2,
     Situv2   = 3,
     GeluTanh = 4,
+    Relu2    = 5,
 };
 
 enum class QuantType : int
@@ -24,6 +25,7 @@ enum class QuantType : int
     per_128x128,
     per_256x128,
     per_1024x128,
+    iq2r_2bit, // weight format tag (offline IQ2R checkpoints); no online quant kernel
 };
 
 enum class MlaVersion : int

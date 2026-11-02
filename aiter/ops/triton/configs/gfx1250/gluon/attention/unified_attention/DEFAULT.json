@@ -169,7 +169,6 @@
     }
   },
   "reduce": {
-    "num_stages": 1,
     "waves_per_eu": 2
   },
   "kv_split": {

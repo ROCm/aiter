@@ -21,14 +21,25 @@ Usage:
 import argparse
 import itertools
 import math
+import os
 import random
+
+# This test exists to exercise the FlyDSL m32x8 kernel, so take every shape it can
+# serve away from ASM/CK. Read live by both dispatchers, so setting it here is enough.
+os.environ["AITER_ENABLE_EXPERIMENTAL"] = "1"
 
 import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_a8w8_m32x8_supported,
+)
+from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    flash_attn_a16w16_m32x8_supported,
+    supports_gqa_ratio,
+)
 from aiter.ops.mha import flash_attn_func, flash_attn_varlen_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import dtypes
@@ -37,7 +48,18 @@ SUPPORTED_GFX = ["gfx1250"]
 
 # (d_qk, d_v) pairs the FlyDSL kernels can serve at all. Anything else is
 # rejected up front rather than silently falling through to CK/Triton.
-SUPPORTED_D_QK_V = [(256, 128), (192, 128), (128, 128)]
+SUPPORTED_D_QK_V = [
+    (256, 256),
+    (128, 256),
+    (256, 128),
+    (192, 128),
+    (128, 128),
+    (64, 64),
+    (256, 64),
+    (192, 64),
+    (128, 64),
+    (64, 128),
+]
 
 # Kernels that can be timed per case. "flydsl" is the path under test; "triton"
 # is an optional cross-check for plain (no sink / no window) thd configs.
@@ -48,6 +70,13 @@ KERNELS = ["flydsl", "triton"]
 # different number of times and land in different L2 states -- their `us`
 # columns then are not comparable with each other.
 _ROTATE = 4
+
+# Timing loop size. This file is a correctness harness: 101 timed iterations per
+# row used to dominate a sweep's wall clock for a `us` column nobody reads here.
+# Default is now a token loop; `--bench` restores a converged one. Either way,
+# measure perf with op_tests/op_benchmarks/flydsl/bench_mha_fwd.py, not with this script.
+_ITERS = 3
+_WARMUP = 1
 
 
 # ============================================================================
@@ -110,6 +139,9 @@ def _apply_sink(qk, sink):
 def run_torch_varlen(q, k, v, cu_q, cu_k, scale, causal, return_lse, sink, window_size):
     """PyTorch reference for varlen THD layout, per-batch.
 
+    Q/K/V may be any element dtype, 8-bit included: everything is upcast to fp32
+    here, so the reference sees exactly what the kernel dequantizes.
+
     Causal is routed through the local (sliding-window) mask: ``causal`` forces
     the effective right window to 0 while leaving the left window as given, so
     ``_local_mask(sq, sk, -1, 0)`` reproduces the pure-causal mask exactly.
@@ -145,6 +177,8 @@ def run_torch_varlen(q, k, v, cu_q, cu_k, scale, causal, return_lse, sink, windo
 
 def run_torch_batch(q, k, v, scale, causal, return_lse, sink, window_size):
     """PyTorch reference for batched BSHD layout, per-batch.
+
+    Q/K/V may be any element dtype, 8-bit included (see ``run_torch_varlen``).
 
     Loops over the batch so peak scratch stays at one ``[H_q, sq, sk]`` score
     matrix instead of ``[B, H_q, sq, sk]``. Causal is routed through the local
@@ -191,52 +225,32 @@ def _flops(shapes, H_q, d_qk, d_v, causal):
     return total
 
 
-def _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v, elem_size, return_lse):
-    """Q + K + V reads and O (+ LSE) writes. Ignores re-reads of K/V across
-    M-blocks, so this is the compulsory-traffic lower bound."""
-    n = (
-        tot_q * H_q * d_qk  # Q
-        + tot_k * H_kv * d_qk  # K
-        + tot_k * H_kv * d_v  # V
-        + tot_q * H_q * d_v  # O
-    ) * elem_size
+def _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v, elem_size, out_elem_size, return_lse):
+    """Q + K + V reads at ``elem_size`` and O (+ LSE) writes at ``out_elem_size``.
+    The a8w8 backend reads 1-byte Q/K/V but writes a bf16 O, so the two sizes are
+    tracked apart. Ignores re-reads of K/V across M-blocks, so this is the
+    compulsory-traffic lower bound."""
+    in_elems = tot_q * H_q * d_qk + tot_k * H_kv * d_qk + tot_k * H_kv * d_v
+    out_elems = tot_q * H_q * d_v
+    n = in_elems * elem_size + out_elems * out_elem_size
     if return_lse:
         n += tot_q * H_q * 4
     return n
 
 
 # ============================================================================
-# Routing mirrors -- only sweep configs that really reach the FlyDSL kernel
+# Dispatch filter -- only sweep pairs the FlyDSL kernel can serve
 # ============================================================================
 
 
-def _flydsl_serves_thd(d_qk, d_v, causal, sink, window):
-    """True when ``flash_attn_varlen_func`` lands on the FlyDSL m32x8 kernel.
+def _flydsl_serves(d_qk, d_v):
+    """True when the FlyDSL m32x8 kernel serves this (d_qk, d_v).
 
-    Mirrors ``aiter/ops/mha.py`` (the PR3039 gfx1250 ASM gate) and
-    ``flydsl_flash_attn_varlen_func`` in ``aiter/ops/flydsl/fmha_kernels.py``.
+    AITER_ENABLE_EXPERIMENTAL is forced on at import, so both routers hand us every
+    pair we support regardless of what ASM or CK would otherwise claim; the pair is
+    the only thing left to filter on.
     """
-    if d_v != 128:
-        return False
-    exp = is_experimental_enabled()
-    if d_qk == 256:
-        return exp  # else CK
-    if d_qk not in (128, 192):
-        return False
-    # The gfx1250 ASM kernel claims d128 only for plain causal attention with
-    # no sink and no finite window; non-causal / sink / windowed d128 is ours.
-    asm_claims_d128 = (
-        d_qk == 128 and not exp and causal and not sink and tuple(window) == (-1, -1)
-    )
-    return not asm_claims_d128
-
-
-def _flydsl_serves_bshd(d_qk, d_v):
-    """True when ``flash_attn_func`` lands on the FlyDSL m32x8 BSHD kernel.
-    No ASM/sibling competes for BSHD, so routing is head-dim only."""
-    if d_v != 128:
-        return False
-    return d_qk in (128, 192) or (d_qk == 256 and is_experimental_enabled())
+    return (d_qk, d_v) in SUPPORTED_D_QK_V
 
 
 # ============================================================================
@@ -330,9 +344,10 @@ def test_mha_flydsl_varlen(
     total_q, total_k = cu_q[-1], cu_k[-1]
     max_sq, max_sk = max(seqs_q), max(seqs_k)
 
-    q = torch.randn(total_q, H_q, d_qk, dtype=dtype, device=device)
-    k = torch.randn(total_k, H_kv, d_qk, dtype=dtype, device=device)
-    v = torch.randn(total_k, H_kv, d_v, dtype=dtype, device=device)
+    q_dtype, kv_dtype = dtype
+    q = _randn_as((total_q, H_q, d_qk), q_dtype, device)
+    k = _randn_as((total_k, H_kv, d_qk), kv_dtype, device)
+    v = _randn_as((total_k, H_kv, d_v), kv_dtype, device)
     cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device=device)
     cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=device)
 
@@ -345,14 +360,25 @@ def test_mha_flydsl_varlen(
     ref, ref_lses = ref_result if return_lse else (ref_result, None)
 
     candidates = {"flydsl": _call_varlen}
-    # Triton has no sink / sliding-window support here, so cross-check it only on
-    # plain configs; elsewhere its column stays nan.
-    if "triton" in kernels and not sink and tuple(window) == (-1, -1):
+    # Triton has no sink / sliding-window support here, and its 8-bit kernel wants
+    # descales ``_call_varlen_triton`` does not pass (plus its own hdim rule), so
+    # cross-check it only on plain 16-bit configs; elsewhere its column stays nan.
+    _b8_case = q_dtype in _B8_TORCH or kv_dtype in _B8_TORCH
+    if "triton" in kernels and not sink and tuple(window) == (-1, -1) and not _b8_case:
         candidates["triton"] = _call_varlen_triton
 
     flops = _flops(list(zip(seqs_q, seqs_k)), H_q, d_qk, d_v, causal)
+    _out_esize = 2 if q_dtype in _B8_TORCH else q.element_size()
     nbytes = _nbytes(
-        total_q, total_k, H_q, H_kv, d_qk, d_v, q.element_size(), return_lse
+        total_q,
+        total_k,
+        H_q,
+        H_kv,
+        d_qk,
+        d_v,
+        q.element_size(),
+        _out_esize,
+        return_lse,
     )
 
     ret = {"gfx": get_gfx()}
@@ -372,6 +398,8 @@ def test_mha_flydsl_varlen(
             return_lse and name == "flydsl",
             sink_t,
             num_rotate_args=_ROTATE,
+            num_iters=_ITERS,
+            num_warmup=_WARMUP,
         )
         # Only the flydsl call was asked for an LSE.
         if isinstance(data, (tuple, list)):
@@ -394,20 +422,26 @@ def test_mha_flydsl_varlen(
         )
 
         if lse is not None:
-            # Kernel LSE is [total_q, nheads_q]; the reference is per batch
-            # [nheads_q, sq]. Empty-KV batches carry -inf (or sink[h]) and are
-            # compared the same way -- isclose(-inf, -inf) holds.
+            # Kernel LSE is fp32 [nheads_q, total_q] (the aiter varlen convention,
+            # asserted here because test_mha_varlen.py, test_flydsl_fmha.py and the
+            # bwd test all slice it as lse[:, cu[b]:cu[b+1]]); the reference is
+            # per batch [nheads_q, sq]. Empty-KV batches carry -inf (or sink[h])
+            # and are compared the same way -- isclose(-inf, -inf) holds.
+            assert lse.dtype == torch.float32, f"lse dtype {lse.dtype}"
+            assert tuple(lse.shape) == (
+                H_q,
+                total_q,
+            ), f"bad thd lse shape {tuple(lse.shape)}"
             for b in range(B):
+                got = lse[:, cu_q[b] : cu_q[b + 1]]
                 if seqs_k[b] == 0:
                     exp_lse = (
-                        sink_t.view(1, -1).expand(seqs_q[b], H_q)
+                        sink_t.view(-1, 1).expand(H_q, seqs_q[b])
                         if sink_t is not None
-                        else torch.full((seqs_q[b], H_q), float("-inf"), device=device)
+                        else torch.full((H_q, seqs_q[b]), float("-inf"), device=device)
                     )
-                    got = lse[cu_q[b] : cu_q[b + 1]]
                 else:
                     exp_lse = ref_lses[b]
-                    got = lse[cu_q[b] : cu_q[b + 1]].permute(1, 0)
                 err = max(
                     err,
                     checkAllclose(
@@ -436,9 +470,10 @@ def test_mha_flydsl_batch(
     assert (d_qk, d_v) in SUPPORTED_D_QK_V, f"unsupported d_qk/d_v {(d_qk, d_v)}"
     assert H_q % H_kv == 0, f"nheads_q={H_q} must be a multiple of nheads_kv={H_kv}"
 
-    q = torch.randn(B, sq, H_q, d_qk, dtype=dtype, device=device)
-    k = torch.randn(B, sk, H_kv, d_qk, dtype=dtype, device=device)
-    v = torch.randn(B, sk, H_kv, d_v, dtype=dtype, device=device)
+    q_dtype, kv_dtype = dtype
+    q = _randn_as((B, sq, H_q, d_qk), q_dtype, device)
+    k = _randn_as((B, sk, H_kv, d_qk), kv_dtype, device)
+    v = _randn_as((B, sk, H_kv, d_v), kv_dtype, device)
 
     scale = 1.0 / math.sqrt(d_qk)
     sink_t = _make_sink(H_q, device) if sink else None
@@ -447,7 +482,18 @@ def test_mha_flydsl_batch(
     ref, ref_lse = ref_result if return_lse else (ref_result, None)
 
     flops = _flops([(sq, sk)] * B, H_q, d_qk, d_v, causal)
-    nbytes = _nbytes(B * sq, B * sk, H_q, H_kv, d_qk, d_v, q.element_size(), return_lse)
+    _out_esize = 2 if q_dtype in _B8_TORCH else q.element_size()
+    nbytes = _nbytes(
+        B * sq,
+        B * sk,
+        H_q,
+        H_kv,
+        d_qk,
+        d_v,
+        q.element_size(),
+        _out_esize,
+        return_lse,
+    )
 
     ret = {"gfx": get_gfx()}
     data, us = run_perftest(
@@ -461,6 +507,8 @@ def test_mha_flydsl_batch(
         return_lse,
         sink_t,
         num_rotate_args=_ROTATE,
+        num_iters=_ITERS,
+        num_warmup=_WARMUP,
     )
     out, lse = data if return_lse else (data, None)
 
@@ -472,7 +520,13 @@ def test_mha_flydsl_batch(
     ), f"bad out shape {tuple(out.shape)}"
     err = checkAllclose(ref, out.float(), rtol=1e-2, atol=1e-2, msg="flydsl bshd out: ")
     if lse is not None:
-        # Kernel LSE is [B, nheads_q, sq]; the reference matches that layout.
+        # Kernel LSE is fp32 [B, nheads_q, sq], the layout test_mha.py asserts.
+        assert lse.dtype == torch.float32, f"lse dtype {lse.dtype}"
+        assert tuple(lse.shape) == (
+            B,
+            H_q,
+            sq,
+        ), f"bad bshd lse shape {tuple(lse.shape)}"
         err = max(
             err,
             checkAllclose(ref_lse, lse, rtol=1e-2, atol=1e-2, msg="flydsl bshd lse: "),
@@ -533,6 +587,8 @@ THD_SHAPES = [
     ([256], [256], 8, 1),  # MQA
     ([341], [341], 8, 2),  # non-tile-multiple seq
     ([512], [512], 16, 4),
+    ([128], [128], 32, 1),  # gqa 32: packed rows are a head SLICE, not whole seqs
+    ([128], [128], 48, 1),  # gqa 48: only num_q_tiles=1 packs it
     ([128], [512], 6, 3),  # non-power-of-two nheads
     ([128, 256], [256, 384], 8, 2),  # multi-batch, sq != sk
     ([72], [600], 32, 4),  # decode-like
@@ -570,6 +626,8 @@ BSHD_SHAPES = [
     (2, 256, 256, 8, 1),  # MQA
     (1, 341, 341, 8, 2),  # non-tile-multiple seq
     (2, 512, 512, 16, 4),
+    (1, 128, 128, 32, 1),  # gqa 32: packed rows are a head SLICE, not whole seqs
+    (1, 128, 128, 48, 1),  # gqa 48: only num_q_tiles=1 packs it
     (1, 128, 512, 6, 3),  # non-power-of-two nheads, sq != sk
     (1, 16, 1024, 32, 4),  # decode-like
     (2, 1024, 1024, 32, 8),
@@ -581,33 +639,80 @@ BSHD_SHAPES = [
 
 def _rand_seqs(B, max_sq, max_sk, rng):
     """Random per-batch lengths with ``1 <= sq_i <= sk_i <= max_sk``."""
+    if min(max_sq, max_sk) < 1:
+        raise SystemExit(
+            f"--rand-seqlens draws in [1, len] and has no form at zero "
+            f"(got -sq {max_sq} -sk {max_sk})"
+        )
     seqs_k = [rng.randint(1, max_sk) for _ in range(B)]
     seqs_q = [rng.randint(1, min(max_sq, sk)) for sk in seqs_k]
     return seqs_q, seqs_k
 
 
+def _gqa_packs(H_q, H_kv):
+    """True when the router will serve this head pair (same rule, same source)."""
+    return H_q % H_kv == 0 and supports_gqa_ratio(H_q // H_kv)
+
+
+# Per-axis values present in the built-in lists; an axis the user does not name
+# inherits these, so a partial -b/-nh/-nhkv/-sq/-sk run is no longer silently ignored.
+_AXIS_DEFAULTS = {
+    "batch_size": sorted(
+        {len(sq) for sq, _, _, _ in THD_SHAPES} | {B for B, *_ in BSHD_SHAPES}
+    ),
+    "nheads": sorted(
+        {h for *_, h, _ in THD_SHAPES} | {h for _, _, _, h, _ in BSHD_SHAPES}
+    ),
+    "nheads_kv": sorted({k for *_, k in THD_SHAPES} | {k for *_, k in BSHD_SHAPES}),
+    "seqlen_q": sorted(
+        {x for sq, _, _, _ in THD_SHAPES for x in sq}
+        | {sq for _, sq, _, _, _ in BSHD_SHAPES}
+    ),
+    "seqlen_k": sorted(
+        {x for _, sk, _, _ in THD_SHAPES for x in sk}
+        | {sk for _, _, sk, _, _ in BSHD_SHAPES}
+    ),
+}
+
+
 def _shape_lists(args):
     """``(thd, bshd)`` shape lists for this run.
 
-    The ``-b/-nh/-nhkv/-sq/-sk`` axes replace the built-in lists when all of
-    ``-b/-nh/-sq/-sk`` are given, so a single shape can be driven from the CLI;
-    their cross product is the sweep. With ``--rand-seqlens N`` each combination
-    contributes N random varlen draws instead of one uniform ``[SQ]*B`` shape.
+    With no ``-b/-nh/-nhkv/-sq/-sk`` at all, the curated built-in lists run as-is.
+    Name any of them and the sweep becomes the cross product of those axes, each
+    unnamed axis taking the values it has in the built-in lists (``_AXIS_DEFAULTS``).
+    ``--max-cases`` then bounds what that product costs. With ``--rand-seqlens N``
+    each combination contributes N random varlen draws instead of one uniform shape.
     """
-    if not (args.batch_size and args.nheads and args.seqlen_q and args.seqlen_k):
+    named = [args.batch_size, args.nheads, args.nheads_kv, args.seqlen_q, args.seqlen_k]
+    if not any(named):
         if args.rand_seqlens:
             aiter.logger.warning(
-                "--rand-seqlens needs -b/-nh/-sq/-sk; using built-in shapes"
+                "--rand-seqlens needs one of -b/-nh/-nhkv/-sq/-sk; using built-in shapes"
             )
         return THD_SHAPES, BSHD_SHAPES
 
-    nheads_kv = args.nheads_kv or args.nheads
+    def axis(name, given):
+        vals = given or _AXIS_DEFAULTS[name]
+        if args.rand_seqlens and not given and name.startswith("seqlen"):
+            # The curated empty-KV cases contribute 0, which has no random form; they
+            # stay covered by the built-in lists.
+            vals = [v for v in vals if v > 0]
+        return vals
+
+    # -nhkv unset falls back to -nh (plain MHA) as the flag documents; only with neither
+    # given does it take the built-in values.
+    kv_heads = args.nheads_kv or args.nheads or _AXIS_DEFAULTS["nheads_kv"]
     rng = random.Random(args.seed)
     thd, bshd, skipped = [], [], 0
     for B, H_q, H_kv, sq, sk in itertools.product(
-        args.batch_size, args.nheads, nheads_kv, args.seqlen_q, args.seqlen_k
+        axis("batch_size", args.batch_size),
+        axis("nheads", args.nheads),
+        kv_heads,
+        axis("seqlen_q", args.seqlen_q),
+        axis("seqlen_k", args.seqlen_k),
     ):
-        if H_q % H_kv:
+        if not _gqa_packs(H_q, H_kv):
             skipped += 1
             continue
         bshd.append((B, sq, sk, H_q, H_kv))
@@ -618,8 +723,58 @@ def _shape_lists(args):
                 seqs_q, seqs_k = [sq] * B, [sk] * B
             thd.append((seqs_q, seqs_k, H_q, H_kv))
     if skipped:
-        aiter.logger.warning("skipped %d combos where nheads %% nheads_kv", skipped)
+        aiter.logger.warning(
+            "skipped %d head combos the router declines (nheads %% nheads_kv, or a "
+            "GQA ratio whose head group would split across waves)",
+            skipped,
+        )
+    if not thd and not bshd:
+        raise SystemExit(
+            "no requested shape survives the head-packing invariant -- nothing to run"
+        )
     return thd, bshd
+
+
+_B8_TORCH = (torch.float8_e4m3fn, torch.float8_e5m2)
+# dtypes.str2Dtype knows "fp8" (e4m3) but has no name for e5m2.
+_EXTRA_DTYPES = {"bf8": torch.float8_e5m2}
+
+
+def _one_dtype(name):
+    """One element-dtype name, e.g. ``bf16``/``fp16``/``fp8``/``bf8``."""
+    name = str(name).strip()
+    try:
+        return _EXTRA_DTYPES.get(name) or dtypes.str2Dtype(name)
+    except Exception as exc:
+        raise argparse.ArgumentTypeError(f"bad dtype {name!r}: {exc}") from exc
+
+
+def _backend_serves_dtypes(q_dtype, kv_dtype):
+    """Does the gfx1250 backend accept this (q, kv) dtype pair? Metadata only.
+
+    Ask the kernel's own gate rather than hardcoding a list here -- a pair the kernel
+    cannot express (today, q and kv differing) then reports as declined instead of
+    failing mid-run. The gate's dtype clause is hdim-independent, so one served hdim
+    stands in for all of them and the dtype axis can be filtered up front like the
+    hdim one."""
+    meta = torch.device("meta")
+    q = torch.empty(16, 8, 128, dtype=q_dtype, device=meta)
+    k = torch.empty(16, 2, 128, dtype=kv_dtype, device=meta)
+    v = torch.empty(16, 2, 128, dtype=kv_dtype, device=meta)
+    gate = (
+        flash_attn_a8w8_m32x8_supported
+        if q_dtype in _B8_TORCH
+        else flash_attn_a16w16_m32x8_supported
+    )
+    return bool(gate("varlen", q, k, v))
+
+
+def _randn_as(shape, dtype, device):
+    """``randn`` in ``dtype``; 8-bit has no randn, so round a scaled fp32 draw. The
+    0.3 keeps e4m3 well inside range so the fp8 error stays representative."""
+    if dtype in _B8_TORCH:
+        return (torch.randn(*shape, dtype=torch.float32, device=device) * 0.3).to(dtype)
+    return torch.randn(*shape, dtype=dtype, device=device)
 
 
 def _str2d_qk_v(v):
@@ -657,6 +812,49 @@ def summarize(title, rows):
     aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
 
 
+def check_routing_declines():
+    """Options m32x8 cannot honour must never reach it -- they belong to CK.
+
+    Both escapes found so far (padded cu_seqlens, logits_soft_cap) were silent: the
+    kernel ran and returned plausible-looking numbers computed under the wrong contract.
+    A numeric sweep cannot catch that, so assert on the dispatch itself.
+    """
+    import aiter.ops.flydsl.fmha_kernels as fk
+
+    dev, L, D, H, H_kv = "cuda", 128, 64, 8, 2
+    cu = torch.tensor([0, L], dtype=dtypes.i32, device=dev)
+    q = torch.randn(L, H, D, dtype=dtypes.bf16, device=dev)
+    k = torch.randn(L, H_kv, D, dtype=dtypes.bf16, device=dev)
+    v = torch.randn(L, H_kv, D, dtype=dtypes.bf16, device=dev)
+
+    served = {}
+    real = fk.flydsl_flash_attn_varlen_fwd
+
+    def spy(*a, **kw):
+        out = real(*a, **kw)
+        served["hit"] = out is not None
+        return out
+
+    def ran_on_flydsl(**kw):
+        served.clear()
+        fk.flydsl_flash_attn_varlen_fwd = spy
+        try:
+            flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True, **kw)
+        finally:
+            fk.flydsl_flash_attn_varlen_fwd = real
+        return served.get("hit", False)
+
+    assert ran_on_flydsl(), "baseline d64/64 should be served by m32x8"
+    for label, kw in [
+        ("logits_soft_cap", {"logits_soft_cap": 20.0}),
+        # the screen keys off presence, not value -- these never reach the kernel
+        ("cu_seqlens_q_padded", {"cu_seqlens_q_padded": cu}),
+        ("cu_seqlens_k_padded", {"cu_seqlens_k_padded": cu}),
+    ]:
+        assert not ran_on_flydsl(**kw), f"{label} must not route to m32x8"
+    aiter.logger.info("routing: m32x8 correctly declines %d unsupported options", 3)
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -668,13 +866,32 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         description="FlyDSL FMHA forward-prefill unit test & perf sweep (gfx1250).",
     )
+    _DEFAULT_DTYPES = [
+        dtypes.bf16,
+        dtypes.fp16,
+        torch.float8_e5m2,
+        torch.float8_e4m3fn,
+    ]
     parser.add_argument(
-        "-d",
-        "--dtype",
-        type=dtypes.str2Dtype,
+        "-dq",
+        "--dtype-q",
+        type=_one_dtype,
         nargs="*",
-        default=[dtypes.bf16, dtypes.fp16],
-        help="Element dtype (q/k/v share one).\n        e.g.: -d bf16",
+        default=_DEFAULT_DTYPES,
+        help="Q element dtypes.\n        e.g.: -dq bf16 fp8",
+    )
+    parser.add_argument(
+        "-dkv",
+        "--dtype-kv",
+        type=_one_dtype,
+        nargs="*",
+        default=None,
+        help=(
+            "KV element dtypes (V follows K); defaults to --dtype-q.\n"
+            "        Swept as the PRODUCT with --dtype-q, so pairs the backend\n"
+            "        declines (today, q != kv) are dropped with a log line.\n"
+            "        e.g.: -dq fp8 -dkv bf8"
+        ),
     )
     parser.add_argument(
         "-l",
@@ -699,18 +916,9 @@ def main():
         "--d_qk_v",
         type=_str2d_qk_v,
         nargs="*",
-        default=[(192, 128)],
-        help="(d_qk, d_v) for the thd suite.\n"
-        f"        Supported: {SUPPORTED_D_QK_V}.\n        e.g.: -s 192,128",
-    )
-    parser.add_argument(
-        "-bs",
-        "--batch_d_qk_v",
-        type=_str2d_qk_v,
-        nargs="*",
-        default=[(128, 128)],
-        help="(d_qk, d_v) for the bshd suite.\n"
-        f"        Supported: {SUPPORTED_D_QK_V}.\n        e.g.: -bs 128,128",
+        default=[],
+        help="(d_qk, d_v) for both suites. Empty (the default) runs every supported\n"
+        f"        pair.\n        Supported: {SUPPORTED_D_QK_V}.\n        e.g.: -s 192,128",
     )
     parser.add_argument(
         "-c",
@@ -794,7 +1002,14 @@ def main():
         "--seed",
         type=int,
         default=42,
-        help="Seed for --rand-seqlens.\n        e.g.: --seed 7",
+        help="Seed for --rand-seqlens and --max-cases sampling.\n        e.g.: --seed 7",
+    )
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=256,
+        help="Cap each layout's sweep at N cases, sampled at random from the full\n"
+        "        cross product (0 = no cap).\n        e.g.: --max-cases 0",
     )
     parser.add_argument(
         "-w",
@@ -806,21 +1021,85 @@ def main():
         "        ('i' rather than -1: argparse reads a leading -1 as a flag.)\n"
         "        e.g.: -w i,i 64,64 128,0 256,i i,256",
     )
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Restore a converged timing loop (101 iters / 2 warmup) so the us and\n"
+        "        TFLOPS columns mean something. Off by default -- a correctness sweep\n"
+        "        pays for the compile and the allclose only.\n"
+        "        e.g.: --bench",
+    )
     args = parser.parse_args()
+
+    if args.bench:
+        global _ITERS, _WARMUP
+        _ITERS, _WARMUP = 101, 2
 
     causals = [bool(c) for c in args.causal]
     lses = [bool(e) for e in args.return_lse]
     sinks = [bool(n) for n in args.sink]
     windows = [tuple(w) for w in args.window]
+    check_routing_declines()
     thd_shapes, bshd_shapes = _shape_lists(args)
+    # No -s: run every pair the kernel serves. With -b/-nh/-sq/-sk also unset that is
+    # the full default sweep CI runs; any explicit flag narrows only what it names.
+    d_qk_v = args.d_qk_v or SUPPORTED_D_QK_V
+    case_rng = random.Random(args.seed)
+
+    def _cases(hdims, shapes, label):
+        """The sweep for one layout, randomly thinned to --max-cases.
+
+        The axes multiply fast (hdim pairs x shapes x causal x lse x sink x window), so
+        sample the product rather than trim an axis: every combination stays reachable,
+        and a different --seed walks a different slice of it. The sample is drawn over
+        product INDICES -- materializing millions of tuples to keep a few hundred costs
+        hundreds of MB on a partial-axis run. ``_flydsl_serves`` depends only on the hdim
+        axis, so filtering it up front leaves the index space exact."""
+        axes = [
+            [h for h in hdims if _flydsl_serves(*h)],
+            shapes,
+            served_dtypes,
+            causals,
+            lses,
+            sinks,
+            windows,
+        ]
+        total = math.prod(len(a) for a in axes)
+        if not args.max_cases or total <= args.max_cases:
+            return list(itertools.product(*axes))
+        aiter.logger.info(
+            "%s: sampling %d of %d cases (--seed %d; --max-cases 0 runs all)",
+            label,
+            args.max_cases,
+            total,
+            args.seed,
+        )
+        picked = []
+        for idx in case_rng.sample(range(total), args.max_cases):
+            combo = []
+            for a in reversed(axes):
+                idx, j = divmod(idx, len(a))
+                combo.append(a[j])
+            picked.append(tuple(reversed(combo)))
+        return picked
+
+    requested_dtypes = list(
+        itertools.product(args.dtype_q, args.dtype_kv or args.dtype_q)
+    )
+    served_dtypes = [d for d in requested_dtypes if _backend_serves_dtypes(*d)]
+    for d in requested_dtypes:
+        if d not in served_dtypes:
+            aiter.logger.info(
+                "skipping dtype pair q=%s kv=%s: declined by the backend", *d
+            )
+    if not served_dtypes:
+        raise SystemExit("no requested dtype pair is served by the backend")
 
     if "thd" in args.layout:
         rows = []
-        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in itertools.product(
-            args.d_qk_v, thd_shapes, args.dtype, causals, lses, sinks, windows
+        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in _cases(
+            d_qk_v, thd_shapes, "thd"
         ):
-            if not _flydsl_serves_thd(d_qk, d_v, causal, sink, window):
-                continue  # CK / ASM / sibling would run -- not what this test gates
             seqs_q, seqs_k, H_q, H_kv = shape
             rows.append(
                 test_mha_flydsl_varlen(
@@ -842,11 +1121,9 @@ def main():
 
     if "bshd" in args.layout:
         rows = []
-        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in itertools.product(
-            args.batch_d_qk_v, bshd_shapes, args.dtype, causals, lses, sinks, windows
+        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in _cases(
+            d_qk_v, bshd_shapes, "bshd"
         ):
-            if not _flydsl_serves_bshd(d_qk, d_v):
-                continue
             B, sq, sk, H_q, H_kv = shape
             rows.append(
                 test_mha_flydsl_batch(

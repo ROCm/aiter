@@ -53,7 +53,15 @@ template <typename ADataType,
           int split_k>
 struct moe_gemm1_heuristic_dispatcher
 {
-    static MoeKernel dispatch(int M, int N, int K, int block_m) {}
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
+    {
+        TORCH_CHECK(false,
+                    "moe_gemm1_heuristic_dispatcher: no generated kernel instance for "
+                    "(activation=", activation,
+                    ", has_bias=", kHasBias,
+                    ", split_k=", split_k,
+                    ") at M=", M, ", N=", N, ", K=", K, ", block_m=", block_m);
+    }
 };
 
 template <typename ADataType,
@@ -65,7 +73,15 @@ template <typename ADataType,
           int split_k>
 struct moe_gemm2_heuristic_dispatcher
 {
-    static MoeKernel dispatch(int M, int N, int K, int block_m) {}
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
+    {
+        TORCH_CHECK(false,
+                    "moe_gemm2_heuristic_dispatcher: no generated kernel instance for "
+                    "(activation=", activation,
+                    ", has_bias=", kHasBias,
+                    ", split_k=", split_k,
+                    ") at M=", M, ", N=", N, ", K=", K, ", block_m=", block_m);
+    }
 };
 
 __attribute__((visibility("default"))) torch::Tensor

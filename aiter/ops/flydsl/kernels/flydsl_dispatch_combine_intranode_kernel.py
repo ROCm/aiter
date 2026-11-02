@@ -499,7 +499,7 @@ def make_combine_kernel(
             return accum_val.to(fx.BFloat16).bitcast(fx.Int32)
 
         def _zero_accum():
-            return Vec.filled(4, 0.0, fx.Float32)
+            return fx.full(4, 0.0, fx.Float32)
 
     elif _is_fp4:
 
@@ -534,7 +534,7 @@ def make_combine_kernel(
             return old
 
         def _zero_accum():
-            return Vec.filled(8, 0.0, fx.Float32)
+            return fx.full(8, 0.0, fx.Float32)
 
     elif hidden_elem_size == 2:  # bf16
 
@@ -549,7 +549,7 @@ def make_combine_kernel(
             return accum_val.to(fx.BFloat16).bitcast(fx.Int32)[0]
 
         def _zero_accum():
-            return Vec.filled(2, 0.0, fx.Float32)
+            return fx.full(2, 0.0, fx.Float32)
 
     elif hidden_elem_size == 4:  # f32
 
@@ -586,7 +586,7 @@ def make_combine_kernel(
             return _pack_f32x4_to_fp8(accum_val)
 
         def _zero_accum():
-            return Vec.filled(4, 0.0, fx.Float32)
+            return fx.full(4, 0.0, fx.Float32)
 
     def _accum_experts(vals):
         """Reduce the k per-expert i32 partials into one merged i32 (widen to f32,
@@ -1070,9 +1070,7 @@ def make_combine_kernel(
                                     scale_raws[u][k_slot],
                                 )
                             )
-                            scales[u].append(
-                                (sc_i32 << fx.Int32(23)).bitcast(fx.Float32)
-                            )
+                            scales[u].append((sc_i32 << 23).bitcast(fx.Float32))
 
                 if const_expr(_xfer_bf16_to_fp8 or blockwise_fp8_transport):
                     out_off = tok_id * out_n_i32 + ec_abs * 2

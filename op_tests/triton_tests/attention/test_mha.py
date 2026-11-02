@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from aiter import logger
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -25,6 +26,13 @@ from op_tests.triton_tests.attention.mha_test_utils import (
     skip_if_gluon_unsupported,
     skip_if_triton_padded_head_miscompiled,
 )
+
+
+@pytest.fixture(params=[False, True])
+def FUSED(request):
+    mha_set_use_fused_bwd_kernel(request.param)
+    yield request.param
+    mha_set_use_fused_bwd_kernel(False)
 
 
 def _test_mha_impl(
@@ -386,13 +394,13 @@ def test_mha_int64_strides(
     def _generate_input(
         batch: int, seqlen: int, nheads: int, dim_size: int, large_stride: bool = False
     ) -> torch.Tensor:
-        seqlens = torch.full((batch,), seqlen)
+        seqlens = torch.full((batch,), seqlen, device="cuda")
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32, device="cuda"),
                 seqlens.cumsum(dim=0, dtype=torch.int32),
             ]
-        ).to(device="cuda")
+        )
         total_seqlen = cu_seqlens[-1].item()
 
         if large_stride:
@@ -467,7 +475,6 @@ def _test_mha_varlen_impl(
 ):
     skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
-    torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -720,7 +727,6 @@ def test_mha_varlen_return_lse_softmax(
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward(
     BATCH: int,
     SEQLEN_Q: int,
@@ -742,7 +748,6 @@ def test_mha_backward(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -793,6 +798,89 @@ def test_mha_backward(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("head_size", [33, 53, 64])
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(97, 113), (113, 97)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_mha_dao_ai_backward_head_size(
+    head_size, varlen, seqlen_q, seqlen_k, strided, monkeypatch
+):
+    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, interface_v2
+    from aiter.ops.triton.attention import mha
+
+    monkeypatch.setattr(interface_v2, "BWD_MODE", "fused")
+    kernel = bwd.bwd_kernel_fused_causal
+    original_run = kernel.run
+    launches = 0
+
+    def trace_run(*args, **kwargs):
+        nonlocal launches
+        result = original_run(*args, **kwargs)
+        launches += 1
+        return result
+
+    monkeypatch.setattr(kernel, "run", trace_run)
+
+    monkeypatch.setattr(mha, "_MHA_IMPL", "dao_ai")
+    torch.manual_seed(20)
+    batch = 2
+    q = torch.randn(
+        batch,
+        seqlen_q,
+        4,
+        head_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        batch,
+        seqlen_k,
+        2,
+        head_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    do = torch.randn_like(q)
+    inputs = (q, k, v)
+    if varlen:
+        inputs = tuple(x.flatten(0, 1) for x in inputs)
+    if strided:
+        # Change token/head strides after packing so flatten cannot undo them.
+        inputs = tuple(
+            x.transpose(-3, -2).contiguous().transpose(-3, -2).detach().requires_grad_()
+            for x in inputs
+        )
+        assert all(not x.is_contiguous() for x in inputs)
+    if varlen:
+        cu_q = torch.arange(
+            0, (batch + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+        )
+        cu_k = torch.arange(
+            0, (batch + 1) * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32
+        )
+        out = flash_attn_varlen_func(
+            *inputs, cu_q, cu_k, seqlen_q, seqlen_k, causal=True, backend="triton"
+        )
+    else:
+        out = flash_attn_func(*inputs, causal=True, backend="triton")
+    grads = torch.autograd.grad(out, inputs, do.reshape_as(out))
+    assert launches > 0, "Expected the Dao-AI fused causal backward kernel"
+    ref_out, ref_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
+        q, k, v, do, causal=True
+    )
+    torch.testing.assert_close(
+        out, ref_out.reshape_as(out).to(out.dtype), atol=fwd_tol[0], rtol=fwd_tol[1]
+    )
+    for inp, grad, ref, (atol, rtol) in zip(inputs, grads, ref_grads, bwd_tols):
+        assert grad.shape == inp.shape
+        torch.testing.assert_close(
+            grad, ref.reshape_as(grad).to(grad.dtype), atol=atol, rtol=rtol
+        )
+
+
 @pytest.mark.parametrize("BATCH", [2, 4])
 @pytest.mark.parametrize("SEQLEN_Q", [256, 512])
 @pytest.mark.parametrize("SEQLEN_K", [256, 512])
@@ -800,7 +888,6 @@ def test_mha_backward(
 @pytest.mark.parametrize("NUM_K_HEADS", [8])
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [False])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward_sbhd_do(
     BATCH: int,
     SEQLEN_Q: int,
@@ -824,7 +911,6 @@ def test_mha_backward_sbhd_do(
 
     torch.cuda.empty_cache()
     torch.manual_seed(42)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -870,7 +956,6 @@ def test_mha_backward_sbhd_do(
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward_varlen(
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -892,7 +977,6 @@ def test_mha_backward_varlen(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -989,6 +1073,121 @@ def test_mha_backward_varlen(
     tols = [fwd_tol] + bwd_tols
     for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("bwd_mode", [None, "fused", "split"])
+def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
+    # Rows whose logits are all very negative (logsumexp < -88) used to overflow exp(0 - lse) to inf
+    # on the zero-loaded keys of the last partial key block of the unmasked dq loop, and inf * 0 put
+    # NaN in dq. Seen on real Qwen2.5-1.5B activations. The sequence lengths are not block multiples
+    # so that partial block exists.
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    mha_set_use_fused_bwd_kernel(False)
+    NUM_HEADS, HEAD_SZ = 4, 128
+    seqlens = [300, 250]
+    total = sum(seqlens)
+    u = torch.nn.functional.normalize(
+        torch.randn(HEAD_SZ, device="cuda", dtype=torch.float32), dim=0
+    )
+    a = 34.0  # q . k ~ -a^2, so logits ~ -a^2 / sqrt(HEAD_SZ) ~ -102
+    q = (
+        -a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    k = (
+        a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    v = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
+    do = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(seqlens, device="cuda").cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    if bwd_mode is None:
+        triton_out = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens), causal=True
+        )
+        triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
+    else:
+        # The flash_attn_2 backward has "fused" and "split" modes with different dq loops; monkeypatch restores the mode.
+        monkeypatch.setattr(flash_attn_2, "BWD_MODE", bwd_mode)
+        scale = HEAD_SZ**-0.5
+        out, lse, _, _ = flash_attn_2.varlen_fwd(
+            q,
+            k,
+            v,
+            None,
+            cu_seqlens,
+            cu_seqlens,
+            seqused_k=None,
+            leftpad_k=None,
+            block_table_=None,
+            alibi_slopes=None,
+            max_seqlen_q=max(seqlens),
+            max_seqlen_k=max(seqlens),
+            dropout_p=0.0,
+            softmax_scale=scale,
+            zero_tensors=False,
+            causal=True,
+            window_size_left=-1,
+            window_size_right=-1,
+            softcap=0.0,
+            return_softmax=False,
+        )
+        triton_dq, triton_dk, triton_dv, _ = flash_attn_2.varlen_bwd(
+            do,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            None,
+            None,
+            None,
+            cu_seqlens,
+            cu_seqlens,
+            None,
+            max_seqlen_q=max(seqlens),
+            max_seqlen_k=max(seqlens),
+            dropout_p=0.0,
+            softmax_scale=scale,
+            zero_tensors=False,
+            causal=True,
+            window_size_left=-1,
+            window_size_right=-1,
+            softcap=0.0,
+            deterministic=False,
+        )
+
+    # Reference: fp32 attention per sequence.
+    q_ref, k_ref, v_ref = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    ref_out = torch.cat(
+        [
+            attention_ref(
+                q_ref[s:e][None], k_ref[s:e][None], v_ref[s:e][None], causal=True
+            )[0][0]
+            for s, e in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
+        ]
+    )
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(
+        ref_out, (q_ref, k_ref, v_ref), do.float()
+    )
+
+    for tri, ref in zip(
+        (triton_dq, triton_dk, triton_dv), (torch_dq, torch_dk, torch_dv)
+    ):
+        assert torch.isfinite(tri).all()
+        # |q| and |k| are ~34 here, so bf16 rounding alone gives ~2% error (the fused backward matches it).
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.parametrize(
