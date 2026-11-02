@@ -34,26 +34,25 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.derived import make_layout_tv
-from flydsl.expr.typing import T, full
+from flydsl.expr.typing import full
 
-from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.jit.utils.chip_info import get_num_xcds
+from aiter.ops.flydsl.kernels.tensor_shim import buf_scalar_load
 
-# Forward tile/shape constants + the runtime-bounded buffer helper, shared so
-# forward and backward stay in lockstep. Imported dual-path so this module works
-# both as an aiter package submodule (production: ``aiter.ops.flydsl.kernels``)
-# and as a bare sibling.
+# Forward tile/shape constants. Imported dual-path so this module works both as
+# an aiter package submodule (production: ``aiter.ops.flydsl.kernels``) and as a
+# bare sibling. The gen forward no longer exports module-level BLOCK_K / THREADS
+# (those live on the dispatch defaults). grad_jagged keeps the historical 64 / 256
+# tiles. Bounded views use fx.rocdl.make_buffer_tensor(..., num_records_bytes=).
 try:
     from . import jagged_dense_bmm_gen as _fwd  # package-relative (aiter import path)
 except ImportError:  # bare sibling import (kernels dir on sys.path[0])
     import jagged_dense_bmm_gen as _fwd
 
-BLOCK_K = _fwd.BLOCK_K
+BLOCK_K = 64
 BLOCK_M = _fwd.BLOCK_M
 BLOCK_N = _fwd.BLOCK_N
-STAGES_A = _fwd.STAGES_A
-THREADS = _fwd.THREADS
-C_FRAG_LEN = BLOCK_M * BLOCK_N // THREADS
-make_bounded_buffer_tensor = _fwd.make_bounded_buffer_tensor
+THREADS = 256
 
 # --- D-INDEPENDENT constants (module-level; the kernels snapshot these as fixed
 # values regardless of D). ---
@@ -73,22 +72,32 @@ DDENSE_BM = 64  # m-contraction tile staged per step (the MFMA K dimension)
 DDENSE_BK = 128  # output K-tile per workgroup (MFMA M dimension)
 DDENSE_BN = 128  # output N-tile per workgroup (MFMA N dimension)
 DDENSE_THREADS = 256
-_D_LDS_LOADS = (DDENSE_BM * DDENSE_BN) // DDENSE_THREADS  # 32
 _DDENSE_SMEM_BYTES = (DDENSE_BK * DDENSE_BM + DDENSE_BN * DDENSE_BM) * 2  # bf16 staging
+
+# dOut global->LDS staging map. Each thread loads _D_VEC contiguous n (one 128-bit
+# buffer load) from _D_ROW_PASSES rows of the (DDENSE_BM, DDENSE_BN) m-tile, then
+# scatters them into the (n, m) sD tile. A wave covers _D_LANE_CHUNKS n-chunks x
+# _D_LANE_ROWS rows: fewer, wider chunks per row keep the transposed b16 LDS stores
+# spread across banks (sD rows are 128 B apart), while each row still reads 64 B
+# contiguous. Thread tid owns n-chunk
+#   c = (tid // 64) * _D_LANE_CHUNKS + tid % _D_LANE_CHUNKS
+# and rows m = pass * _D_LANE_ROWS + (tid % 64) // _D_LANE_CHUNKS.
+_D_VEC = 8  # 16 B / bf16
+_D_CHUNKS = DDENSE_BN // _D_VEC  # 16 n-chunks per row
+_D_LANE_CHUNKS = 4
+_D_LANE_ROWS = 64 // _D_LANE_CHUNKS  # 16
+_D_ROW_PASSES = DDENSE_BM // _D_LANE_ROWS  # 4
+assert _D_CHUNKS == (DDENSE_THREADS // 64) * _D_LANE_CHUNKS, "dOut staging map"
+assert _D_ROW_PASSES * _D_LANE_ROWS == DDENSE_BM, "dOut staging map"
 
 # dBias[b][n] = sum_m dOut[m,n] reduces over the same dynamic m axis as dDense, and
 # the dDense partials kernel already streams every dOut element through LDS, so the
 # bias column-sums are folded into that pass instead of re-reading dOut in a separate
-# kernel. In the dOut global->LDS staging map, thread tid always loads output column
-# n = tid % DDENSE_BN (DDENSE_THREADS is a multiple of DDENSE_BN), so each column is
-# co-owned by DDENSE_NROW_GROUPS threads {c, c+DDENSE_BN, ...}; each accumulates its
-# rows into one fp32 register and the owners are combined once through LDS at the end.
-# Only the k-tile-0 workgroups (k_off == 0) emit a column's bias partial, so every
-# N-tile is written exactly once regardless of the K-tiling.
-assert (
-    DDENSE_THREADS % DDENSE_BN == 0
-), "dOut staging map assumes DDENSE_THREADS % DDENSE_BN == 0"
-DDENSE_NROW_GROUPS = DDENSE_THREADS // DDENSE_BN
+# kernel. Under the staging map above, thread tid always owns the _D_VEC columns of
+# n-chunk c, so each column is co-owned by the _D_LANE_ROWS threads that share c.
+# Each thread carries _D_VEC fp32 running sums and the owners are combined once
+# through LDS at the end. Only the k-tile-0 workgroups (k_off == 0) emit a column's
+# bias partial, so every N-tile is written exactly once regardless of the K-tiling.
 
 # Default schedule knobs (baked into a build unless the caller overrides). See
 # build_backward for how they specialize per shape.
@@ -126,7 +135,7 @@ def _load_scalar(copy_atom, elem_dtype, divided_tensor, index):
     """Load one element at column `index` from a row already divided by (1, 1)."""
     view = fx.slice(divided_tensor, (None, index))
     r = fx.make_rmem_tensor(1, elem_dtype)
-    fx.copy_atom_call(copy_atom, view, r)
+    fx.copy(copy_atom, view, r)
     return fx.memref_load_vec(r)[0]
 
 
@@ -136,7 +145,7 @@ def _store_scalar(copy_atom, store_dtype, divided_tensor, index, val):
     ts = full(1, store_dtype(val), store_dtype)
     fx.memref_store_vec(ts, r)
     view = fx.slice(divided_tensor, (None, index))
-    fx.copy_atom_call(copy_atom, r, view)
+    fx.copy(copy_atom, r, view)
 
 
 # A built backward: the two host launchers + the resolved SPLIT for this shape.
@@ -146,25 +155,37 @@ Backward = collections.namedtuple(
 
 
 # maxsize=None (unbounded) is intentional: the key space is the handful of
-# distinct (D, split, gj_stages_a, coarsen_m) tuples a process actually launches
-# (typically 1-2 D x a couple of knob sets), and each entry is a set of compiled
-# kernels we WANT to keep resident for the process lifetime. No eviction needed.
-@functools.cache
-def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
+# distinct (D, split, gj_stages_a, coarsen_m, num_xcds) tuples a process
+# actually launches (typically 1-2 D x a couple of knob sets), and each entry
+# is a set of compiled kernels we WANT to keep resident for the process
+# lifetime. No eviction needed.
+def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None, num_xcds=None):
     """Build (and memoize) the backward launchers specialized to this (D, knobs).
 
     D (= K = N) and every D-derived tiling constant are baked in as closure
     constants, so FlyDSL memoizes one compiled kernel set per (D, split,
-    gj_stages_a, coarsen_m) and MULTIPLE can coexist in one process (mirrors the
-    forward gen kernel's factory). Returns a ``Backward`` namedtuple of the two
-    host launchers plus the resolved SPLIT.
+    gj_stages_a, coarsen_m, num_xcds) and MULTIPLE can coexist in one process
+    (mirrors the forward gen kernel's factory). Returns a ``Backward`` namedtuple
+    of the two host launchers plus the resolved SPLIT.
 
     ``split`` / ``gj_stages_a`` / ``coarsen_m`` default (None) to the D-derived
     SPLIT and the module knob defaults; the dispatch layer overrides them per shape.
-    Because they are closure constants (not module globals), the FlyDSL artifact
-    cache keys on them correctly -- no cache-collision hazard.
+    ``num_xcds`` defaults to the current device's XCD count and is part of the
+    memo key, so a 4-XCD part does not reuse an 8-XCD schedule. Because they are
+    closure constants (not module globals), the FlyDSL artifact cache keys on
+    them correctly -- no cache-collision hazard.
     """
+    if num_xcds is None:
+        num_xcds = get_num_xcds()
+    return _build_backward(D, split, gj_stages_a, coarsen_m, int(num_xcds))
+
+
+@functools.cache
+def _build_backward(D, split, gj_stages_a, coarsen_m, num_xcds):
     D = int(D)
+    num_xcds = int(num_xcds)
+    if num_xcds < 1:
+        raise ValueError(f"num_xcds must be >= 1, got {num_xcds}")
     if D % DDENSE_BK or D % DDENSE_BN or D % BLOCK_N or D % BLOCK_K:
         raise ValueError(
             f"D={D} must be divisible by the tile sizes "
@@ -196,13 +217,23 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
         tiled_mma: fx.TiledMma,
         tiled_copy_g2s_A: fx.TiledCopy,
+        n_groups: fx.Int32,
+        tiles_per_group: fx.Int32,
     ):
         # dJagged[m,k] = sum_n dOut[m,n] * Dense[b][k,n]. In MFMA C[i,j]=sum_l A[i,l]
         # B[j,l] form: i=m (rows), j=k (output column), l=n (contraction). So A is the
         # dOut group view (M_b, N) and B is Dense[b] read in its plain (K, N) layout.
         tid = fx.thread_idx.x
-        pid_mn, _, off_b = fx.block_idx
-        off_b = fx.Int32(off_b)
+        # Same XCD stripe as grad_dense_partials: column tiles of one row-group reread
+        # the same dOut rows, and every row-group of one group rereads Dense[b].
+        # linear = (g % num_xcds) + num_xcds * (tile + (g // num_xcds) * T).
+        linear = fx.block_idx.x
+        xcd = linear % fx.Int32(num_xcds)
+        slot = linear // fx.Int32(num_xcds)
+        pid_mn = slot % tiles_per_group
+        off_b = xcd + (slot // tiles_per_group) * fx.Int32(num_xcds)
+        in_range = off_b < n_groups
+        off_b = in_range.select(off_b, fx.Int32(0))
 
         # One workgroup owns COARSEN_M consecutive BLOCK_M output row-tiles (all sharing
         # the same K-column tile / Dense slice). group_mn indexes the coarsened m-group;
@@ -215,17 +246,14 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         for m_sub in fx.range_constexpr(COARSEN_M):
             block_m_idx = group_mn * fx.Int32(COARSEN_M) + fx.Int32(m_sub)
 
-            # Device group resolution; scalarize to keep group-derived values uniform.
-            seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-            seq_start = buffer_ops.buffer_load(
-                seq_rsrc, fx.Int32(off_b), vec_width=1, dtype=T.i32
-            )
-            seq_end = buffer_ops.buffer_load(
-                seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, dtype=T.i32
-            )
-            seq_start = fx.rocdl.readfirstlane(T.i32, seq_start)
-            seq_end = fx.rocdl.readfirstlane(T.i32, seq_end)
+            # off_b comes from the block id, so both offsets are wave-uniform and
+            # land in SGPRs. A tail id past n_groups clamps M_b to 0, and the
+            # start_m < M_b check below then stores nothing.
+            seq_buf = fx.rocdl.make_buffer_tensor(SEQ_OFFSETS, max_size=True)
+            seq_start = fx.Int32(buf_scalar_load(seq_buf, off_b))
+            seq_end = fx.Int32(buf_scalar_load(seq_buf, off_b + fx.Int32(1)))
             M_b = seq_end - seq_start
+            M_b = in_range.select(M_b, fx.Int32(0))
             start_m = block_m_idx * fx.Int32(BLOCK_M)
 
             # Runtime early-exit: tail tile fell off the end of a short group.
@@ -264,14 +292,16 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 # HW return 0 for the tail rows instead (they are masked out on the C store
                 # anyway, so the result is unchanged). num_records is int32-safe (per-group
                 # M_b*N*2 <= Mi*N*2). Mirrors grad_dense_partials_kernel's bounded reads.
-                A_buf = make_bounded_buffer_tensor(
-                    A_g, fx.Int64(fx.Int32(M_b) * fx.Int32(N) * fx.Int32(2))
+                A_buf = fx.rocdl.make_buffer_tensor(
+                    A_g,
+                    num_records_bytes=fx.Int64(M_b * fx.Int32(N * 2)),
                 )
                 B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
                 # Bound C to exactly M_b rows (K cols, bf16=2B) so partial tail-tile
                 # stores are HW-dropped instead of corrupting the next group's rows.
-                C_buf = make_bounded_buffer_tensor(
-                    C_g, fx.Int64(fx.Int32(M_b) * fx.Int32(K) * fx.Int32(2))
+                C_buf = fx.rocdl.make_buffer_tensor(
+                    C_g,
+                    num_records_bytes=fx.Int64(M_b * fx.Int32(K * 2)),
                 )
 
                 gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[
@@ -308,8 +338,8 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 )  # (BM, BK, GJ_STAGES_A)
 
                 thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)  # (VA, VM, VK, n)
-                thr_sA = thr_copy_g2s_A.partition_D(sA)  # (VA, VM, VK, STAGES_A)
-                thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)  # (VA, VM, VK, STAGES_A)
+                thr_sA = thr_copy_g2s_A.partition_D(sA)  # (VA, VM, VK, GJ_STAGES_A)
+                thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)  # (VA, VM, VK, GJ_STAGES_A)
                 thr_gB_k = thr_copy_g2r_B.partition_S(gB_k)  # (VB, VN, VK, n)
 
                 copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])
@@ -417,9 +447,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C_bf16)
                 thr_gC = thr_copy_r2g_C.partition_S(gC)
 
-                mma_frag_C_bf16.store(
-                    fx.arith.trunc_f(T.vec(C_FRAG_LEN, T.bf16), mma_frag_C.load())
-                )
+                mma_frag_C_bf16.store(mma_frag_C.load().to(fx.BFloat16))
                 fx.copy(
                     fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16),
                     mma_frag_C_retile,
@@ -448,26 +476,32 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         )
         val_per_thr = 8  # 16B / bf16
         thrs_col = BLOCK_K // val_per_thr
-        thrs_row = 256 // thrs_col
-        tiled_copy_g2s_A = fx.make_tiled_copy(
+        thrs_row = THREADS // thrs_col
+        tiled_copy_g2s_A = fx.make_tiled_copy_tv(
             fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
-            fx.make_layout(
-                ((thrs_col, thrs_row), (1, val_per_thr)),
-                ((thrs_row * val_per_thr, 1), (1, thrs_row)),
-            ),
-            fx.make_tile(thrs_row, BLOCK_K),
+            fx.make_layout((thrs_row, thrs_col), (thrs_col, 1)),
+            fx.make_layout((1, val_per_thr), (1, 1)),
         )
 
         bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
         bm_coarse = (bm + COARSEN_M - 1) // COARSEN_M  # M row-tiles per WG = COARSEN_M
+        tiles_per_group = bm_coarse * KOUT_BLOCKS
+        xcd_rounds = (n_groups + num_xcds - 1) // num_xcds
         gj_smem = (
             BLOCK_M * BLOCK_K * GJ_STAGES_A * 2
         )  # bf16 sA staging (32 KB at 2 stages)
         grad_jagged_kernel(
-            dJagged, dOut, DENSE, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A
+            dJagged,
+            dOut,
+            DENSE,
+            SEQ_OFFSETS,
+            tiled_mma,
+            tiled_copy_g2s_A,
+            n_groups,
+            tiles_per_group,
         ).launch(
-            grid=(bm_coarse * KOUT_BLOCKS, 1, n_groups),
-            block=(256, 1, 1),
+            grid=(num_xcds * tiles_per_group * xcd_rounds, 1, 1),
+            block=(THREADS, 1, 1),
             smem=gj_smem,
             stream=stream,
         )
@@ -480,8 +514,8 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         # Sum this group's SPLIT fp32 partials and write bf16 dBias[b]. Thread tid
         # owns column n = col_tile*NRED_BLK + tid.
         tid = fx.thread_idx.x
-        col_tile = fx.Int32(fx.block_idx.x)
-        off_b = fx.Int32(fx.block_idx.y)
+        col_tile = fx.block_idx.x
+        off_b = fx.block_idx.y
         col = col_tile * fx.Int32(NRED_BLK) + tid
 
         PART_buf = fx.rocdl.make_buffer_tensor(PARTIALS, max_size=True)
@@ -518,30 +552,48 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
         tiled_mma: fx.TiledMma,
         tiled_copy_g2s_J: fx.TiledCopy,
+        tiled_copy_s2s_J: fx.TiledCopy,
+        n_groups: fx.Int32,
     ):
         # dDense[b][k,n] = sum_m Jagged[m,k] * dOut[m,n]. Written as the MFMA atom form
         # C[i,j] = sum_l A[i,l]*B[j,l] with i=k, j=n, l=m: A[k,m] = J[m,k] (= J.T) and
         # B[n,m] = dOut[m,n] (= dOut.T). Both operands therefore carry the reduction
         # axis m as their *contiguous* fragment (K) axis, so each m-tile is staged
         # transposed into LDS (sJ as (k, m), sD as (n, m)) and fed to bf16 MFMA. Split
-        # s reduces a strided subset of the group's m-tiles; block_idx.x selects this
-        # workgroup's (DDENSE_BK x DDENSE_BN) output sub-tile of the (K, N) block.
+        # s reduces a strided subset of the group's m-tiles. block_idx.x is the
+        # XCD-striped launch id; it decodes to this workgroup's (DDENSE_BK x
+        # DDENSE_BN) output sub-tile of the (K, N) block.
         tid = fx.thread_idx.x
-        pid_kn, off_s, off_b = fx.block_idx
-        off_b = fx.Int32(off_b)
-        off_s = fx.Int32(off_s)
-        pid_kn = fx.Int32(pid_kn)
+        # The dispatcher deals workgroup i to XCD (i % num_xcds), and each XCD
+        # has its own L2. This group's (K, N) output tiles reread the same
+        # Jagged and dOut rows, so they have to share an XCD; groups themselves
+        # stay striped (group g on XCD g % num_xcds) so a run of empty or full
+        # groups cannot pile onto one die. Launch order is the inverse:
+        # linear = (g % num_xcds) + num_xcds * (tile + (g // num_xcds) * T).
+        # A group count that does not fill the last round of XCDs takes the
+        # in_range == false path and stores nothing.
+        tiles_kn = fx.Int32(NK_TILES * NN_TILES)
+        tiles_per_group = tiles_kn * fx.Int32(SPLIT)
+        linear = fx.block_idx.x
+        xcd = linear % fx.Int32(num_xcds)
+        slot = linear // fx.Int32(num_xcds)
+        tile = slot % tiles_per_group
+        off_b = xcd + (slot // tiles_per_group) * fx.Int32(num_xcds)
+        in_range = off_b < n_groups
+        off_b = in_range.select(off_b, fx.Int32(0))
+        pid_kn = tile % tiles_kn
+        off_s = tile // tiles_kn
         k_off = (pid_kn // fx.Int32(NN_TILES)) * fx.Int32(DDENSE_BK)
         n_off = (pid_kn % fx.Int32(NN_TILES)) * fx.Int32(DDENSE_BN)
 
-        seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-        seq_start = buffer_ops.buffer_load(seq_rsrc, off_b, vec_width=1, dtype=T.i32)
-        seq_end = buffer_ops.buffer_load(
-            seq_rsrc, off_b + fx.Int32(1), vec_width=1, dtype=T.i32
-        )
-        seq_start = fx.rocdl.readfirstlane(T.i32, seq_start)
-        seq_end = fx.rocdl.readfirstlane(T.i32, seq_end)
+        # off_b comes from the block id, so both offsets are wave-uniform and stay in SGPRs.
+        seq_buf = fx.rocdl.make_buffer_tensor(SEQ_OFFSETS, max_size=True)
+        seq_start = fx.Int32(buf_scalar_load(seq_buf, off_b))
+        seq_end = fx.Int32(buf_scalar_load(seq_buf, off_b + fx.Int32(1)))
         M_b = seq_end - seq_start
+        # Out-of-range tail ids clamp onto group 0 and then run an empty
+        # contraction, so the epilogue below is what keeps them from storing.
+        M_b = in_range.select(M_b, fx.Int32(0))
 
         # Group-rebased buffers bounded to M_b rows: any local row >= M_b zero-fills
         # (CDNA OOB-load == 0), so tail rows contribute 0 to the contraction.
@@ -556,15 +608,25 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
             ),
             fx.get_layout(JAGGED),
         )
-        J_buf = make_bounded_buffer_tensor(
-            J_g, fx.Int64(fx.Int32(M_b) * fx.Int32(K) * fx.Int32(2))
+        J_buf = fx.rocdl.make_buffer_tensor(
+            J_g,
+            num_records_bytes=fx.Int64(M_b * fx.Int32(K * 2)),
         )
-        d_rsrc = buffer_ops.create_buffer_resource(
-            DOUT,
-            max_size=False,
-            num_records_bytes=fx.Int64(fx.Int32(M_b) * fx.Int32(N) * fx.Int32(2)),
-            base_byte_offset=fx.Int64(seq_start) * fx.Int64(N * 2),
+        D_g = fx.make_view(
+            fx.add_offset(
+                fx.get_iter(DOUT),
+                fx.make_int_tuple(fx.Int64(seq_start) * fx.Int64(N)),
+            ),
+            fx.get_layout(DOUT),
         )
+        D_buf = fx.rocdl.make_buffer_tensor(
+            D_g,
+            num_records_bytes=fx.Int64(M_b * fx.Int32(N * 2)),
+        )
+        d_chunk = (tid // fx.Int32(64)) * fx.Int32(_D_LANE_CHUNKS) + tid % fx.Int32(
+            _D_LANE_CHUNKS
+        )
+        d_row = (tid % fx.Int32(64)) // fx.Int32(_D_LANE_CHUNKS)
 
         # LDS staging tiles, both (out_dim, m) with m (the contraction) contiguous so
         # the s2r feed lands m on the MFMA K-fragment. Same swizzle as the forward sA.
@@ -591,8 +653,8 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
             tid
         )
         buffer_copy_16b = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
-        uni_copy_16b_j = fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16)
         thr_copy_g2s_J = tiled_copy_g2s_J.get_slice(tid)
+        thr_copy_s2s_J = tiled_copy_s2s_J.get_slice(tid)
 
         thr_sJ_s2r = thr_copy_s2r_A.partition_S(sJ)  # (VA, VM, VK)
         thr_sD_s2r = thr_copy_s2r_B.partition_S(sD)  # (VB, VN, VK)
@@ -623,19 +685,24 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
 
         # fp32 MFMA accumulator carried in place across the dynamic, split-strided
         # m-tile loop (AGPR accumulate; no SSA carry needed). The fused dBias column
-        # partial is carried as an fp32 loop iter_arg: each thread sums the dOut elements
-        # it already loads for the transpose-staging (one running fp32 per thread), so the
-        # bias reduction piggybacks on the dDense dOut traffic at no extra global reads.
+        # partials are carried as an fp32 loop iter_arg: each thread sums the dOut
+        # elements it already loads for the transpose-staging (_D_VEC running fp32 per
+        # thread), so the bias reduction piggybacks on the dDense dOut traffic at no
+        # extra global reads.
         mma_frag_C.fill(0)
-        bias_acc0 = fx.Float32(0.0)
+        bias_acc0 = fx.Vector.filled(_D_VEC, 0.0, fx.Float32)
+        copy_d_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         for m_tile, _carry in range(
             off_s, num_tiles, fx.Int32(SPLIT), init=[bias_acc0]
         ):
-            bias_acc = fx.Float32(_carry[0])
+            bias_acc = fx.Vector(_carry[0])
             mt = fx.Int32(m_tile)
-            # Transpose-stage J for this m-tile via tiled g2s (dOut staging stays manual
-            # until commit 2). Global J is viewed in logical (k, m) order for the
-            # workgroup's K sub-tile; partition_D lands in swizzled sJ (k, m).
+            # Transpose-stage J for this m-tile via tiled g2s. Global J is viewed in
+            # logical (k, m) order for the workgroup's K sub-tile; partition_D lands in
+            # swizzled sJ (k, m). The global m stride is K so the load stays scalar b16,
+            # but each thread owns 32 contiguous m at one k, so the LDS store is 128-bit
+            # (4 writes, conflict-free in the same Swizzle(3,3,3) as the forward sA)
+            # instead of 32 scalar b16 writes that scatter across banks.
             j_tile_off = fx.Int64(mt) * fx.Int64(DDENSE_BM) * fx.Int64(K) + fx.Int64(
                 k_off
             )
@@ -644,23 +711,33 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 fx.make_layout((DDENSE_BK, DDENSE_BM), (1, K)),
             )
             thr_gJ = thr_copy_g2s_J.partition_S(gJ_tile)
-            thr_sJ_g2s = thr_copy_g2s_J.partition_D(sJ)
+            thr_sJ_g2s = thr_copy_s2s_J.partition_D(sJ)
             copy_frag_J = fx.make_fragment_like(thr_gJ)
             fx.copy(buffer_copy_16b, thr_gJ, copy_frag_J)
-            fx.copy(uni_copy_16b_j, copy_frag_J, thr_sJ_g2s)
-            tile_sum = fx.Float32(0.0)
-            for i in fx.range_constexpr(_D_LDS_LOADS):
-                lin = tid + fx.Int32(i * DDENSE_THREADS)
-                m_local = lin // fx.Int32(DDENSE_BN)
-                n_local = lin % fx.Int32(DDENSE_BN)
-                doff = (mt * fx.Int32(DDENSE_BM) + m_local) * fx.Int32(N) + (
-                    n_off + n_local
+            fx.copy(uni_copy_128b, thr_copy_s2s_J.retile(copy_frag_J), thr_sJ_g2s)
+            # dOut is row-major (m, n) in global but sD is (n, m), so the 128-bit row
+            # loads are scattered into sD one element at a time. Tail rows (m >= M_b)
+            # zero-fill via the bounded descriptor, so they add 0 to the bias sums.
+            d_tile_off = fx.Int64(mt) * fx.Int64(DDENSE_BM) * fx.Int64(N) + fx.Int64(
+                n_off
+            )
+            gD_tile = fx.make_view(
+                fx.add_offset(fx.get_iter(D_buf), fx.make_int_tuple(d_tile_off)),
+                fx.make_layout((DDENSE_BM, DDENSE_BN), (N, 1)),
+            )
+            for p in fx.range_constexpr(_D_ROW_PASSES):
+                m_local = d_row + fx.Int32(p * _D_LANE_ROWS)
+                row_div = fx.logical_divide(
+                    fx.slice(gD_tile, (m_local, None)), fx.make_layout(_D_VEC, 1)
                 )
-                dval = buffer_ops.buffer_load(d_rsrc, doff, vec_width=1, dtype=T.bf16)
-                fx.memref_store(dval, sD, (n_local, m_local))
-                # Tail rows (m >= M_b) zero-fill via the bounded descriptor, so they add 0.
-                tile_sum = tile_sum + fx.Float32(dval)
-            bias_acc = bias_acc + tile_sum
+                frag_d = fx.make_rmem_tensor(_D_VEC, fx.BFloat16)
+                fx.copy(copy_d_128b, fx.slice(row_div, (None, d_chunk)), frag_d)
+                dvec = fx.Vector(fx.memref_load_vec(frag_d))
+                for j in fx.range_constexpr(_D_VEC):
+                    fx.memref_store(
+                        dvec[j], sD, (d_chunk * fx.Int32(_D_VEC) + fx.Int32(j), m_local)
+                    )
+                bias_acc = bias_acc + dvec.to(fx.Float32)
             fx.gpu.barrier()
 
             for block_k_iter in fx.range_constexpr(DDENSE_BM // 32):
@@ -686,77 +763,97 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
             _carry_out = yield [bias_acc]
         bias_acc_final = _carry_out
 
-        # Epilogue. SPLIT==1 (e.g. D=512): each (K,N) tile is fully reduced inside this one
-        # workgroup, so truncate the fp32 accumulator to bf16 and store it STRAIGHT to dDense
-        # (PARTIALS *is* the bf16 dDense view in that case -- part_off collapses to the
-        # dDense element offset since off_s==0). This skips the fp32 partials round-trip and
-        # the separate grad_dense_reduce launch. SPLIT>=2 (e.g. D=256): write the fp32
-        # accumulator to the partials scratch; the reduce pass sums the SPLIT partials and
-        # casts to bf16.
-        if fx.const_expr(SPLIT == 1):
-            mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
-            thr_copy_r2g_C = fx.make_tiled_copy_C(
-                fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), tiled_mma
-            ).get_slice(tid)
-            mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C_bf16)
-            thr_gPart = thr_copy_r2g_C.partition_S(gPart)
-            mma_frag_C_bf16.store(
-                fx.arith.trunc_f(T.vec(C_FRAG_LEN, T.bf16), mma_frag_C.load())
-            )
-            fx.copy(
-                fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16),
-                mma_frag_C_retile,
-                thr_gPart,
-            )
-        else:
-            thr_copy_r2g_C = fx.make_tiled_copy_C(
-                fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32), tiled_mma
-            ).get_slice(tid)
-            mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C)
-            thr_gPart = thr_copy_r2g_C.partition_S(gPart)
-            fx.copy(
-                fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32),
-                mma_frag_C_retile,
-                thr_gPart,
-            )
-
-        # Fused dBias epilogue: combine the per-thread column partials through LDS (the
-        # sJ/sD staging region is dead now, so reuse it as fp32 scratch -> no extra smem,
-        # occupancy unchanged) and write one fp32 bias partial per output column for this
-        # (group, split). Only the k-tile-0 workgroups emit it so each N-tile is written
-        # once. M_b == 0 groups never enter the m-loop, so bias_acc stays 0 -> 0 bias.
-        if k_off == fx.Int32(0):
-            smem_f32 = fx.get_dyn_shared(fx.Float32)
-            bias_lds = fx.make_view(smem_f32, fx.make_layout((DDENSE_THREADS,), (1,)))
-            fx.gpu.barrier()
-            fx.memref_store(bias_acc_final, bias_lds, (tid,))
-            fx.gpu.barrier()
-            if tid < fx.Int32(DDENSE_BN):
-                col_sum = fx.Float32(fx.memref_load(bias_lds, (tid,)))
-                for r in fx.range_constexpr(1, DDENSE_NROW_GROUPS):
-                    col_sum = col_sum + fx.Float32(
-                        fx.memref_load(bias_lds, (tid + fx.Int32(r * DDENSE_BN),))
-                    )
-                BP_buf = fx.rocdl.make_buffer_tensor(BIAS_PARTIALS, max_size=True)
-                part_row = off_b * fx.Int32(SPLIT) + off_s
-                bp_div = fx.logical_divide(
-                    fx.slice(BP_buf, (part_row, None)), fx.make_layout(1, 1)
+        if in_range:
+            # Epilogue. SPLIT==1 (e.g. D=512): each (K,N) tile is fully reduced inside this one
+            # workgroup, so truncate the fp32 accumulator to bf16 and store it STRAIGHT to dDense
+            # (PARTIALS *is* the bf16 dDense view in that case -- part_off collapses to the
+            # dDense element offset since off_s==0). This skips the fp32 partials round-trip and
+            # the separate grad_dense_reduce launch. SPLIT>=2 (e.g. D=256): write the fp32
+            # accumulator to the partials scratch; the reduce pass sums the SPLIT partials and
+            # casts to bf16.
+            if fx.const_expr(SPLIT == 1):
+                mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
+                thr_copy_r2g_C = fx.make_tiled_copy_C(
+                    fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), tiled_mma
+                ).get_slice(tid)
+                mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C_bf16)
+                thr_gPart = thr_copy_r2g_C.partition_S(gPart)
+                mma_frag_C_bf16.store(mma_frag_C.load().to(fx.BFloat16))
+                fx.copy(
+                    fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16),
+                    mma_frag_C_retile,
+                    thr_gPart,
                 )
-                if fx.const_expr(SPLIT == 1):
-                    # SPLIT==1: BIAS_PARTIALS is the bf16 dBias view (part_row == off_b),
-                    # so write the final column sum straight to dBias[b] -- no separate
-                    # grad_bias_reduce launch.
-                    copy_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
-                    _store_scalar(
-                        copy_bf16,
-                        fx.BFloat16,
-                        bp_div,
-                        n_off + tid,
-                        col_sum.to(fx.BFloat16),
+            else:
+                thr_copy_r2g_C = fx.make_tiled_copy_C(
+                    fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32), tiled_mma
+                ).get_slice(tid)
+                mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C)
+                thr_gPart = thr_copy_r2g_C.partition_S(gPart)
+                fx.copy(
+                    fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32),
+                    mma_frag_C_retile,
+                    thr_gPart,
+                )
+
+            # Fused dBias epilogue: combine the per-thread column partials through LDS (the
+            # sJ/sD staging region is dead now, so reuse it as fp32 scratch -> no extra smem,
+            # occupancy unchanged) and write one fp32 bias partial per output column for this
+            # (group, split). Only the k-tile-0 workgroups emit it so each N-tile is written
+            # once. M_b == 0 groups never enter the m-loop, so bias_acc stays 0 -> 0 bias.
+            if k_off == fx.Int32(0):
+                smem_f32 = fx.get_dyn_shared(fx.Float32)
+                bias_lds = fx.make_view(
+                    smem_f32,
+                    fx.make_layout((_D_VEC, DDENSE_THREADS), (1, _D_VEC)),
+                )
+                bias_final = fx.Vector(bias_acc_final)
+                fx.gpu.barrier()
+                for j in fx.range_constexpr(_D_VEC):
+                    fx.memref_store(bias_final[j], bias_lds, (fx.Int32(j), tid))
+                fx.gpu.barrier()
+                if tid < fx.Int32(DDENSE_BN):
+                    # Column tid lives in n-chunk c at slot j; its owners are the
+                    # _D_LANE_ROWS threads of wave c // _D_LANE_CHUNKS with that lane chunk.
+                    col_c = tid // fx.Int32(_D_VEC)
+                    col_j = tid % fx.Int32(_D_VEC)
+                    owner0 = (col_c // fx.Int32(_D_LANE_CHUNKS)) * fx.Int32(
+                        64
+                    ) + col_c % fx.Int32(_D_LANE_CHUNKS)
+                    col_sum = fx.Float32(0.0)
+                    for r in fx.range_constexpr(_D_LANE_ROWS):
+                        col_sum = col_sum + fx.Float32(
+                            fx.memref_load(
+                                bias_lds,
+                                (col_j, owner0 + fx.Int32(r * _D_LANE_CHUNKS)),
+                            )
+                        )
+                    BP_buf = fx.rocdl.make_buffer_tensor(BIAS_PARTIALS, max_size=True)
+                    part_row = off_b * fx.Int32(SPLIT) + off_s
+                    bp_div = fx.logical_divide(
+                        fx.slice(BP_buf, (part_row, None)), fx.make_layout(1, 1)
                     )
-                else:
-                    copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-                    _store_scalar(copy_f32, fx.Float32, bp_div, n_off + tid, col_sum)
+                    if fx.const_expr(SPLIT == 1):
+                        # SPLIT==1: BIAS_PARTIALS is the bf16 dBias view (part_row == off_b),
+                        # so write the final column sum straight to dBias[b] -- no separate
+                        # grad_bias_reduce launch.
+                        copy_bf16 = fx.make_copy_atom(
+                            fx.rocdl.BufferCopy16b(), fx.BFloat16
+                        )
+                        _store_scalar(
+                            copy_bf16,
+                            fx.BFloat16,
+                            bp_div,
+                            n_off + tid,
+                            col_sum.to(fx.BFloat16),
+                        )
+                    else:
+                        copy_f32 = fx.make_copy_atom(
+                            fx.rocdl.BufferCopy32b(), fx.Float32
+                        )
+                        _store_scalar(
+                            copy_f32, fx.Float32, bp_div, n_off + tid, col_sum
+                        )
 
     @flyc.kernel
     def grad_dense_reduce_kernel(
@@ -766,9 +863,9 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         # Sum this group's SPLIT fp32 (K, N) partials and write bf16 dDense[b]. Block
         # (col-tile, k-row, group); thread tid owns column n = col_tile*NRED_BLK + tid.
         tid = fx.thread_idx.x
-        col_tile = fx.Int32(fx.block_idx.x)
-        off_k = fx.Int32(fx.block_idx.y)
-        off_b = fx.Int32(fx.block_idx.z)
+        col_tile = fx.block_idx.x
+        off_k = fx.block_idx.y
+        off_b = fx.block_idx.z
         col = col_tile * fx.Int32(NRED_BLK) + tid
 
         PART_buf = fx.rocdl.make_buffer_tensor(PARTIALS, max_size=True)
@@ -829,6 +926,10 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
             fx.make_layout((1, 4, 1), (0, 1, 0)),
             fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
         )
+        # One TV layout shared by two copy atoms: the global J load is strided in m
+        # (stride K) so it stays scalar b16, but each thread owns 32 contiguous m at one
+        # k, so the swizzled sJ store is 128-bit. partition_S/partition_D retile the
+        # value mode to the atom width, so the store needs its own 128b tiled copy.
         j_g2s_tiler_mn, j_g2s_tv = make_layout_tv(
             fx.make_layout((128, 2), (2, 1)),
             fx.make_layout((1, 32), (1, 1)),
@@ -838,13 +939,30 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
             j_g2s_tv,
             j_g2s_tiler_mn,
         )
+        tiled_copy_s2s_J = fx.make_tiled_copy(
+            fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
+            j_g2s_tv,
+            j_g2s_tiler_mn,
+        )
+        # 1D grid: the dispatcher round-robins the flattened id, and grid.y tops
+        # out at 65535, which (D/128)^2 * SPLIT * ceil(n_groups/num_xcds) can pass.
+        xcd_rounds = (n_groups + num_xcds - 1) // num_xcds
+        partials_grid = (num_xcds * NK_TILES * NN_TILES * SPLIT * xcd_rounds, 1, 1)
         if SPLIT == 1:
             # SPLIT==1 fast path: partials kernel writes bf16 dDense + dBias directly
             # (dDense/dBias passed as the PARTIALS/BIAS_PARTIALS args); scratch unused.
             grad_dense_partials_kernel(
-                dDense, dBias, JAGGED, dOut, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_J
+                dDense,
+                dBias,
+                JAGGED,
+                dOut,
+                SEQ_OFFSETS,
+                tiled_mma,
+                tiled_copy_g2s_J,
+                tiled_copy_s2s_J,
+                n_groups,
             ).launch(
-                grid=(NK_TILES * NN_TILES, SPLIT, n_groups),
+                grid=partials_grid,
                 block=(DDENSE_THREADS, 1, 1),
                 smem=_DDENSE_SMEM_BYTES,
                 stream=stream,
@@ -858,8 +976,10 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 SEQ_OFFSETS,
                 tiled_mma,
                 tiled_copy_g2s_J,
+                tiled_copy_s2s_J,
+                n_groups,
             ).launch(
-                grid=(NK_TILES * NN_TILES, SPLIT, n_groups),
+                grid=partials_grid,
                 block=(DDENSE_THREADS, 1, 1),
                 smem=_DDENSE_SMEM_BYTES,
                 stream=stream,

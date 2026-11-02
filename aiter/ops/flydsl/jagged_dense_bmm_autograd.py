@@ -33,7 +33,6 @@ import torch
 from .jagged_dense_bmm_bwd_dispatch import jagged_dense_bmm_bwd_dispatched
 from .jagged_dense_bmm_dispatch import jagged_dense_bmm_dispatched
 from .jagged_dense_bmm_validation import validate_jdbba_autograd_inputs
-from .kernels.jagged_dense_bmm_gen import BLOCK_M as _FWD_BLOCK_M
 
 __all__ = ["jagged_dense_bmm_autograd"]
 
@@ -50,8 +49,6 @@ class _JaggedDenseBmmBroadcastAdd(torch.autograd.Function):
         max_seq_len,
         uniform_seqlen,
     ):
-        import flydsl.compiler as flyc
-
         n_groups = int(n_groups)
         max_seq_len = int(max_seq_len)
         _, K, N = dense.shape
@@ -69,16 +66,12 @@ class _JaggedDenseBmmBroadcastAdd(torch.autograd.Function):
         dense_tall = dense_k.transpose(1, 2).reshape(n_groups * N, K).contiguous()
         bias_flat = bias_k.reshape(n_groups * N).contiguous()
 
-        # Output padded by BLOCK_M so a partial tail-tile store stays in-bounds;
-        # every returned row [0, L) is written by the kernel, so empty is safe.
-        out = torch.empty(L + _FWD_BLOCK_M, N, dtype=torch.bfloat16, device=device)
-        tC = flyc.from_dlpack(out).mark_layout_dynamic(leading_dim=1, divisibility=8)
-        tA = flyc.from_dlpack(jagged_k).mark_layout_dynamic(
-            leading_dim=1, divisibility=8
-        )
+        # Each group's C stores are bounded to its length, so C is exactly (L, N).
+        # The dispatcher takes torch.Tensor and converts at the jit boundary.
+        out = torch.empty(L, N, dtype=torch.bfloat16, device=device)
         jagged_dense_bmm_dispatched(
-            tC,
-            tA,
+            out,
+            jagged_k,
             dense_tall,
             bias_flat,
             seq_offsets,
@@ -90,7 +83,7 @@ class _JaggedDenseBmmBroadcastAdd(torch.autograd.Function):
         ctx.save_for_backward(jagged_k, dense_k, seq_offsets)
         ctx.n_groups = n_groups
         ctx.max_seq_len = max_seq_len
-        return out[:L]
+        return out
 
     @staticmethod
     def backward(ctx, grad_out):
