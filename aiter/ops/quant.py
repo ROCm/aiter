@@ -1439,8 +1439,8 @@ def rope_rotate_activation(
     - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
       (``scale`` required; ``group_size`` defaults to 32). ``scale_layout``
       selects ``"none"`` (the default, natural rows), ``"flydsl"`` (dsv4
-      preshuffle), or ``"opus"`` (gfx950 scales [T, 2, 32, 4], requiring
-      H=64, D=128, group_size=32).
+      preshuffle), or ``"opus"`` (gfx950 scales [T, 2, 32, H/16], requiring
+      H=32 or 64, D=128, group_size=32).
     - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
 

@@ -101,10 +101,12 @@ __device__ __forceinline__ void store_scale_e8m0(opus::e8m0_t* __restrict__ scal
     auto* scale_u8 = reinterpret_cast<uint8_t*>(scale);
     if(fp4_scale_layout == Fp4ScaleLayout::Opus)
     {
-        // [token, group%2, head%32, group/2, head/32], packed as [T,2,32,4].
-        const int32_t head = row_idx % 64;
-        const int64_t offset = static_cast<int64_t>(row_idx / 64) * 256 +
-            (group_idx % 2) * 128 + (head % 32) * 4 + (group_idx / 2) * 2 + head / 32;
+        // [token, group%2, head%32, group/2, head/32]: [T,2,32,H/16].
+        const int32_t head = row_idx % head_num;
+        const int32_t tiles = head_num / 32;
+        const int64_t offset = static_cast<int64_t>(row_idx / head_num) * head_num * 4 +
+            (group_idx % 2) * head_num * 2 + (head % 32) * 2 * tiles +
+            (group_idx / 2) * tiles + head / 32;
         scale_u8[offset] = scale_e8m0;
         return;
     }
@@ -792,12 +794,12 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
     const int32_t groups_per_row = dim / group_size;
     if(fp4_scale_layout == Fp4ScaleLayout::Opus)
     {
-        AITER_CHECK(head_num == 64 && dim == 128 && group_size == 32,
-                    "OPUS scales require H=64, D=128, group_size=32");
+        AITER_CHECK((head_num == 32 || head_num == 64) && dim == 128 && group_size == 32,
+                    "OPUS scales require H=32 or 64, D=128, group_size=32");
         AITER_CHECK(scale.is_contiguous() && scale.dim() == 4 &&
                     scale.size(0) == m / head_num && scale.size(1) == 2 &&
-                    scale.size(2) == 32 && scale.size(3) == 4,
-                    "OPUS scale must be contiguous [T,2,32,4]");
+                    scale.size(2) == 32 && scale.size(3) == head_num / 16,
+                    "OPUS scale must be contiguous [T,2,32,H/16]");
     }
     else if(fp4_scale_layout == Fp4ScaleLayout::Flydsl)
     {
