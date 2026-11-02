@@ -43,6 +43,7 @@ from .allreduce_host_shared import (
     require_arch,
 )
 from .allreduce_policy import (
+    MAX_PAYLOAD_BYTES,
     MIN_BATCH_BLOCKS,
     PAYLOAD_ALIGN_BYTES,
     QUANT_MIN_PAYLOAD_BYTES,
@@ -54,6 +55,7 @@ from .allreduce_policy import (
     ring_st_ladder,
     select_rung,
 )
+from .ipc_heap import UncachedIpcHeap
 from .kernels.comm.allreduce_shared import (
     ATOMS,
     BLOCK,
@@ -62,12 +64,17 @@ from .kernels.comm.allreduce_shared import (
 )
 from .kernels.comm.quick_allreduce_mesh import (
     MESH_CODECS,
+    MESH_RELAY_DEFAULTS,
     SUPER_TILES,
+    check_relay,
     clamp_grid_cap,
     latency_max_tiles,
     make_quick_allreduce_mesh_kernel,
     mxfp4_scale_shape,
     rmsnorm_hidden_supported,
+)
+from .kernels.comm.quick_allreduce_mesh import (
+    relay_tile_fraction as _tile_fraction,
 )
 from .kernels.comm.quick_allreduce_ring import (
     AG_CODECS,
@@ -76,8 +83,12 @@ from .kernels.comm.quick_allreduce_ring import (
     make_quick_allreduce_ring_kernel,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
+from .quick_allreduce_relay import InGroupRelayProvider, RelayProvider
 
 logger = logging.getLogger("aiter")
+
+# Largest payload ``check_payload`` accepts, rounded down to its alignment.
+_MAX_PAYLOAD = MAX_PAYLOAD_BYTES - MAX_PAYLOAD_BYTES % PAYLOAD_ALIGN_BYTES
 
 
 @dataclass(frozen=True)
@@ -109,6 +120,7 @@ def _build_mesh(
     rs_codec,
     ag_codec,
     block,
+    relay=None,
     **norm,
 ):
     if rs_codec != ag_codec:
@@ -125,6 +137,7 @@ def _build_mesh(
         block=block,
         rank=rank,
         **norm,
+        relay=relay,
     )
 
 
@@ -257,6 +270,15 @@ class FlyQuickAllReduce:
     when not given. ``ladder`` replaces the tuning ladder of the policy, for
     tests that run other configurations. Both schedules specialise their
     binary to this rank, so the JIT symbol carries an ``_r<n>_`` field.
+
+    ``relay_devices=(r01, r10)`` routes a fraction of each call's blocks through
+    other GPUs of the node, the relay for rank0→rank1 and the one for
+    rank1→rank0, for TP2 on xGMI only. ``r01 == r10`` relays both directions
+    through one GPU. ``relay_fraction=(num, den)`` is the share
+    of blocks and ``relay_min_bytes`` the payload from which relay engines are
+    used; ``None`` takes the per-arch default, and an arch with none needs both.
+    ``relay_provider`` supplies the bounce buffers. Every rank passes the same
+    values, and a relay setup that cannot be completed raises.
     """
 
     def __init__(
@@ -273,6 +295,10 @@ class FlyQuickAllReduce:
         ag_codec: str | None = None,
         link: str | None = None,
         ladder: tuple[TwoShotRung, ...] | None = None,
+        relay_devices: tuple[int, int] | None = None,
+        relay_fraction: tuple[int, int] | None = None,
+        relay_min_bytes: int | None = None,
+        relay_provider: RelayProvider | None = None,
     ):
         check_world_size(world_size)
         if algorithm not in ALGORITHMS:
@@ -281,6 +307,14 @@ class FlyQuickAllReduce:
             )
         algo = ALGORITHMS[algorithm]
         link = resolve_link(link)
+        if relay_devices is None and (
+            relay_fraction is not None
+            or relay_min_bytes is not None
+            or relay_provider is not None
+        ):
+            raise ValueError(
+                "relay_fraction, relay_min_bytes and relay_provider need relay_devices"
+            )
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         _validate_ipc_process_group(
             group, rank=int(rank), world_size=world_size, owner="FlyQuickAllReduce"
@@ -354,6 +388,22 @@ class FlyQuickAllReduce:
         # RMSNorm builds that ``norm_launch`` adds on first use.
         self._build_kw = {}
         self._norm_launch = {}
+        self._relay_by_cfg = {}
+        self._relay_bounces = []
+        self.relay_devices = None
+        self.relay_fraction = None
+        self.relay_min_bytes = None
+        if relay_devices is not None:
+            self._init_relay(
+                arch,
+                relay_devices,
+                relay_fraction,
+                relay_min_bytes,
+            )
+            provider = (
+                InGroupRelayProvider() if relay_provider is None else relay_provider
+            )
+
         try:
             with torch.cuda.device(self._device_index):
                 for key in sorted(caps):
@@ -397,6 +447,34 @@ class FlyQuickAllReduce:
                         world_size=self.world_size,
                         inbox_flags=inbox_flags,
                     )
+                if self.relay_devices is not None:
+                    # A relay engine shares its direct twin's grid, and each owns
+                    # its inbox and bounce: a rank can start a call on one while
+                    # its peer is still reading the other's.
+                    reachable = set(self.cfgs_for(self.relay_min_bytes, _MAX_PAYLOAD))
+                    for key in sorted(self._by_cfg):
+                        if key not in reachable:
+                            continue
+                        spec = algo.build(
+                            **self._build_kw[key], relay=self.relay_fraction
+                        )
+                        bounce = provider.open(
+                            group=self.group,
+                            rank=self.rank,
+                            device=self._device_index,
+                            relay_out=self.relay_devices[self.rank],
+                            relay_in=self.relay_devices[1 - self.rank],
+                            nbytes=spec["bounce_bytes"],
+                        )
+                        self._relay_bounces.append(bounce)
+                        self._relay_by_cfg[key] = _StEngine(
+                            spec=spec,
+                            group=self.group,
+                            rank=self.rank,
+                            world_size=self.world_size,
+                            inbox_flags=inbox_flags,
+                            extra_ptrs=(bounce.out_ptr, bounce.in_ptr),
+                        )
         except Exception:
             self.close()
             raise
@@ -411,6 +489,84 @@ class FlyQuickAllReduce:
         self.rank_tile_bytes = primary.rank_tile_bytes
         self.wire_tile_bytes = primary.wire_tile_bytes
 
+    def _init_relay(self, arch, devices, fraction, min_bytes) -> None:
+        """Validate the relay arguments, and have every rank agree on them.
+
+        Anything wrong with the arguments is reported by *every* rank, after the
+        gather, so a check that depends on this rank's device cannot leave its
+        peer waiting in the exchange.
+        """
+        default = MESH_RELAY_DEFAULTS.get((self.link, self.world_size, arch))
+        err = None
+        try:
+            if self.world_size != 2 or self.algorithm != "mesh" or self.link != "xgmi":
+                raise ValueError(
+                    "relay needs world_size=2, algorithm='mesh' and link='xgmi', got "
+                    f"world_size={self.world_size}, algorithm={self.algorithm!r}, "
+                    f"link={self.link!r}"
+                )
+            if (fraction is None or min_bytes is None) and default is None:
+                raise ValueError(
+                    f"no relay defaults for {arch} on {self.link}: pass both "
+                    "relay_fraction and relay_min_bytes"
+                )
+            devices = tuple(int(d) for d in devices)
+            if len(devices) != 2:
+                raise ValueError(
+                    f"relay_devices must be one device per direction, got {devices}"
+                )
+            n_devices = torch.cuda.device_count()
+            if not all(0 <= d < n_devices for d in devices):
+                raise ValueError(
+                    f"relay_devices {devices} are not among the {n_devices} "
+                    "visible devices"
+                )
+            if self._device_index in devices:
+                raise ValueError(
+                    f"relay_devices {devices} include this rank's own device "
+                    f"{self._device_index}"
+                )
+            fraction = check_relay(default[1] if fraction is None else fraction)
+            min_bytes = int(default[0] if min_bytes is None else min_bytes)
+            if min_bytes < 0:
+                raise ValueError(
+                    f"relay_min_bytes must be non-negative, got {min_bytes}"
+                )
+            mine = (
+                UncachedIpcHeap.pci_bus_id(self._device_index),
+                tuple(UncachedIpcHeap.pci_bus_id(d) for d in devices),
+                devices,
+                fraction,
+                min_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # pci bus ids raise RuntimeError, and a bad device id raises
+            # TypeError. Either one has to reach the gather below: the peer
+            # is already waiting there.
+            err, mine = f"{type(exc).__name__}: {exc}", None
+        views = UncachedIpcHeap.gather_object_list_via_broadcast(
+            self.group, (err, mine)
+        )
+        failures = UncachedIpcHeap.rank_failures([v[0] for v in views])
+        if failures:
+            raise RuntimeError(failures)
+        (_, a), (_, b) = views
+        # Device ordinals are per process; the bus ids are what the ranks share.
+        if (a[1], a[3], a[4]) != (b[1], b[3], b[4]):
+            raise RuntimeError(
+                "ranks disagree on the relay setup: "
+                f"(relay buses, fraction, min_bytes) {(a[1], a[3], a[4])} vs "
+                f"{(b[1], b[3], b[4])}"
+            )
+        if a[0] == b[0] or {a[0], b[0]} & set(a[1]):
+            raise RuntimeError(
+                f"relay buses {a[1]} must differ from the TP devices {(a[0], b[0])}"
+            )
+        own = views[self.rank][1]
+        self.relay_devices = own[2]
+        self.relay_fraction = own[3]
+        self.relay_min_bytes = own[4]
+
     @property
     def inbox_bytes(self) -> int:
         """IPC inbox bytes this object holds on *this* rank, across every rung.
@@ -423,6 +579,14 @@ class FlyQuickAllReduce:
         once is the realistic way to exhaust a device.
         """
         return sum(eng.buf_bytes for eng in self._by_cfg.values())
+
+    @property
+    def relay_bytes(self) -> int:
+        """Device bytes this rank holds for relaying, on top of ``inbox_bytes``:
+        its incoming bounce on each relay engine, and those engines' inboxes."""
+        return sum(b.nbytes for b in self._relay_bounces) + sum(
+            eng.buf_bytes for eng in self._relay_by_cfg.values()
+        )
 
     def _ladder_cfg(self, live_bytes: int) -> tuple[int, int]:
         """``(super_tile, block)`` the ladder assigns to *live_bytes*.
@@ -476,6 +640,33 @@ class FlyQuickAllReduce:
             batched = max(-(-num_tiles // super_tile), MIN_BATCH_BLOCKS)
             num_tiles = min(num_tiles, batched)
         return max(1, min(num_tiles, grid))
+
+    def _pick_engine(self, live_bytes: int) -> tuple[_StEngine, int]:
+        """The engine a *live_bytes* payload runs on, and its tile count.
+
+        A pure function of the payload and the agreed relay setup, so ranks
+        cannot pick different engines for the same call.
+        """
+        cfg, num_tiles = self._pick_cfg(live_bytes)
+        if live_bytes >= (self.relay_min_bytes or 0) and cfg in self._relay_by_cfg:
+            return self._relay_by_cfg[cfg], num_tiles
+        return self._by_cfg[cfg], num_tiles
+
+    def uses_relay(self, nbytes: int) -> bool:
+        """Whether an *nbytes* payload runs on a relay engine.
+
+        Ring engines have no ``relay`` field. That is the direct path.
+        """
+        return self._pick_engine(int(nbytes))[0].spec.get("relay") is not None
+
+    def relay_tile_fraction(self, nbytes: int) -> float:
+        """Share of an *nbytes* payload's tiles carried by relay blocks."""
+        eng, num_tiles = self._pick_engine(int(nbytes))
+        relay = eng.spec.get("relay")
+        if relay is None:
+            return 0.0
+        grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
+        return _tile_fraction(num_tiles, grid_x, relay)
 
     def _launch_args(
         self,
@@ -560,8 +751,17 @@ class FlyQuickAllReduce:
         launch.
         """
         keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
-        for key in keys:
-            eng = self._by_cfg[key]
+        engines = [self._by_cfg[key] for key in keys]
+        if payload_range is None:
+            engines += self._relay_by_cfg.values()
+        else:
+            lo, hi = payload_range
+            engines += [
+                self._relay_by_cfg[key]
+                for key in self.cfgs_for(max(lo, self.relay_min_bytes or 0), hi)
+                if key in self._relay_by_cfg
+            ]
+        for eng in engines:
             args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
             _preload_compiled(eng.launch, *args)
 
@@ -865,9 +1065,17 @@ class FlyQuickAllReduce:
             if getattr(self, "_has_launched", False):
                 torch.cuda.synchronize(self._device_index)
                 self._has_launched = False
-            for eng in engines.values():
+            relay_engines = getattr(self, "_relay_by_cfg", {})
+            for eng in (*engines.values(), *relay_engines.values()):
                 eng.close()
             engines.clear()
+            relay_engines.clear()
+            for bounce in getattr(self, "_relay_bounces", ()):
+                try:
+                    bounce.close()
+                except RuntimeError:
+                    pass
+            self._relay_bounces = []
 
     def __del__(self):
         try:
@@ -878,8 +1086,7 @@ class FlyQuickAllReduce:
 
     def variant(self, nbytes: int) -> str:
         """Identity of the binary an *nbytes* payload would actually run."""
-        cfg, num_tiles = self._pick_cfg(int(nbytes))
-        eng = self._by_cfg[cfg]
+        eng, num_tiles = self._pick_engine(int(nbytes))
         grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
         return f"{kernel_symbol(eng.launch)}/grid_x{grid_x}"
 
@@ -909,5 +1116,5 @@ class FlyQuickAllReduce:
                 "small messages to an exact all-reduce, or pass min_bytes=0 "
                 "to override."
             )
-        cfg, _num_tiles = self._pick_cfg(live_bytes)
-        self._launch_eng(self._by_cfg[cfg], inp, out, stream, live_bytes=live_bytes)
+        eng, _num_tiles = self._pick_engine(live_bytes)
+        self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
