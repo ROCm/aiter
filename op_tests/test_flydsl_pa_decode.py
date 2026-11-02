@@ -1147,28 +1147,6 @@ def run_pa_decode_plan(batch, max_parts, budget, window, query_length):
     return {"gfx": get_gfx_runtime()}
 
 
-def _check_unsupported_select(invalid, error, match):
-    """The schedule refuses these itself, whatever the Python wrapper checks first."""
-    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
-    arch, kv_dtype, query_dtype = _SELECT_INVALID[invalid]
-    with mock.patch.object(traits, "get_rocm_arch", lambda: arch):
-        _expect_error(
-            error,
-            match,
-            lambda: traits.PaDecodeSchedule.select(
-                head_dim=128,
-                query_group_size=16,
-                block_size=128,
-                num_seqs=1,
-                num_kv_heads=1,
-                num_compute_units=256,
-                work_capacity=1,
-                query_dtype=query_dtype,
-                kv_dtype=kv_dtype,
-            ),
-        )
-
-
 def _check_unsupported_mxfp4(invalid, error, match):
     """An MXFP4 input the wrapper refuses before any kernel compiles."""
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
@@ -1253,10 +1231,30 @@ def run_pa_decode(name, geometry):
         kind, invalid, error, match = geometry["invalid"]
         if kind == "bf16":
             _check_unsupported_input(_prepare({"lengths": (1,)}), invalid, error, match)
+        elif kind == "select":
+            # The schedule refuses these itself, whatever the Python wrapper checks first.
+            traits = importlib.import_module(
+                "aiter.ops.flydsl.kernels.pa_decode.traits"
+            )
+            arch, kv_dtype, query_dtype = _SELECT_INVALID[invalid]
+            with mock.patch.object(traits, "get_rocm_arch", lambda: arch):
+                _expect_error(
+                    error,
+                    match,
+                    lambda: traits.PaDecodeSchedule.select(
+                        head_dim=128,
+                        query_group_size=16,
+                        block_size=128,
+                        num_seqs=1,
+                        num_kv_heads=1,
+                        num_compute_units=256,
+                        work_capacity=1,
+                        query_dtype=query_dtype,
+                        kv_dtype=kv_dtype,
+                    ),
+                )
         else:
-            {"select": _check_unsupported_select, "mxfp4": _check_unsupported_mxfp4}[
-                kind
-            ](invalid, error, match)
+            _check_unsupported_mxfp4(invalid, error, match)
         return {"gfx": get_gfx_runtime(), "raised": error.__name__}
     s = _prepare(geometry)
     case, pa, query, window = s.case, s.pa, s.query, s.case["window"]

@@ -456,7 +456,9 @@ def pa_decode(
     heads per KV head. Refused: other block sizes, head dims and output dtypes,
     sliding windows and sinks (``mask_unowned_kv`` has no effect: tokens past the
     context are always masked). Scale bytes 0 and 255 are not supported in valid
-    rows. ``work_plan=None`` is accepted for MXFP4 only: one task per sequence
+    rows. V is staged as bf16, so a V element above the bf16 maximum (3.39e38: e8m0
+    byte 254 with an e2m1 magnitude of 2 or more, byte 253 with 4 or more) widens to
+    infinity even when the normalized output is finite. ``work_plan=None`` is accepted for MXFP4 only: one task per sequence
     writes its row directly (the output needs the query's row and head strides,
     a context-0 row is zero-filled) and nothing is specialized on ``num_seqs``; a
     plan with ``max_partitions == 1`` is served the same way. A task may span at

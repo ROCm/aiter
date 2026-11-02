@@ -32,6 +32,10 @@ MXFP4_V_BF16_CHUNK_BYTES = 16 * 16 * 16
 # (the f32 subnormal floor 2**-149 after the shift) are rounded or lost, and so are
 # weights p below ~2**-113 (bf16 floor 2**-133 after it). The smallest MXFP4 V,
 # 2**-128, is exact. Upgrade to a shift from the task's token count if that matters.
+# shortcut: V is widened to bf16 before the MFMA, so |V| above the bf16 maximum (e8m0
+# byte 254 with e2m1 >= 2, byte 253 with e2m1 >= 4) becomes inf. A 2**-2 pre-shift of V
+# cannot go through the widening scale operand (an e8m0 exponent: bytes 0 and 1 have no
+# 2**-129 / 2**-128) and an f32 widening costs 17-20% on gfx950, so it is not done.
 MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024  # gfx950 LDS; MXFP4 stages V wave-privately.
