@@ -213,8 +213,15 @@ task from host-launch caching.
 Leave `specialization_key` unset for factory launchers with fixed compile
 parameters. For launchers with varying constexpr arguments, key every compile
 parameter and any tensor ABI or device variation that changes the artifact;
-reuse the family's existing cache owner when available. Cached calls still take
-the runtime pointers, scalars and stream in the compiled signature's order.
+reuse the family's existing cache owner when available.
+
+For ordinary torch arguments with layout-dynamic memrefs, key the artifact ABI
+(dtype, rank, unit-stride dimension), not exact runtime extents or non-unit
+strides. Explicit static memrefs need their static layout in the key. Verify the
+pinned runtime's defaults before choosing either scheme.
+
+Cached calls still take the runtime pointers, scalars and stream in the compiled
+signature's order.
 `flyc.compile` executes the first live call, so do not launch it a second time.
 Use `_preload_compiled` for no-dispatch preload, and keep kernel-internal JIT
 helpers inside the tracing context. See the

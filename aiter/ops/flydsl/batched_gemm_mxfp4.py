@@ -24,6 +24,11 @@ WMMA_K_GFX1250 = 128
 _A_CODES_PER_BYTE = {"fp4": 2, "fp6": 1, "fp8": 1}
 
 
+def _dynamic_tensor_abi_key(*tensors):
+    # Plain torch inputs have dynamic extents/non-unit strides in pinned FlyDSL.
+    return tuple((t.dtype, t.ndim, t.stride().index(1)) for t in tensors)
+
+
 def flydsl_batched_gemm_mxfp4(
     a: torch.Tensor,
     w: torch.Tensor,
@@ -140,8 +145,7 @@ def flydsl_batched_gemm_mxfp4(
             a_dtype,
             out_dtype,
             B,
-            *strides,
-            0,
+            layout,
         ),
     )
 
@@ -249,15 +253,17 @@ def _run_gfx1250(
 
     # A/B only need the base address (views built in-kernel) -> pass as pointers;
     # bind the contiguous A to a local so its storage outlives the async launch.
-    # Tensor arguments retain their layouts, so include those in the cache key.
+    # Tensor extents/strides stay dynamic; key only their compiled memref ABI.
     a_c = a.contiguous()
+    scale_a_i32 = a_scales.view(torch.int32)
+    scale_b_i32 = w_scales.view(torch.int32)
     _run_compiled(
         launch_gemm_a8w4_tdm,
         out_phys,
         ptr_arg(a_c),
         ptr_arg(w),
-        a_scales.view(torch.int32),
-        w_scales.view(torch.int32),
+        scale_a_i32,
+        scale_b_i32,
         M,
         torch.cuda.current_stream(),
         N,
@@ -276,7 +282,6 @@ def _run_gfx1250(
         0,
         specialization_key=(
             a.device,
-            N,
             K,
             tile_m,
             tile_n,
@@ -288,15 +293,7 @@ def _run_gfx1250(
             layout_mbn,
             num_buffers,
             a_is_fp4,
-            out_phys.dtype,
-            tuple(out_phys.shape),
-            tuple(out_phys.stride()),
-            a_scales.dtype,
-            tuple(a_scales.shape),
-            tuple(a_scales.stride()),
-            w_scales.dtype,
-            tuple(w_scales.shape),
-            tuple(w_scales.stride()),
+            _dynamic_tensor_abi_key(out_phys, scale_a_i32, scale_b_i32),
         ),
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys

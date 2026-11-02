@@ -536,6 +536,11 @@ _run_compiled(compiled["launch"],
   can change the answer. A `@cache` factory named `compile_*` or
   `_get_compiled_*` may still return a JitFunction: inspect the returned object
   and its runtime caller.
+- On a layout-dynamic runtime, ordinary torch tensor extents and non-unit strides
+  are runtime inputs. Key the compiled memref ABI (dtype, rank and unit-stride
+  dimension), not every shape/stride value. Static memrefs need their static
+  layout represented. Compile parameters derived from retained key fields do
+  not need separate entries; verify these relationships against the pinned API.
 
 ### Rescan an updated repository
 
