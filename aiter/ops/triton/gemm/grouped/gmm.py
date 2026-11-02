@@ -23,7 +23,6 @@ from aiter.ops.triton._triton_kernels.gemm.grouped.gmm import (
     tgmm_non_persistent_kernel,
     tgmm_persistent_kernel,
 )
-
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 # AITER: GMM utility functions
