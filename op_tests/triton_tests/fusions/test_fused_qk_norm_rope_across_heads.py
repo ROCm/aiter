@@ -11,7 +11,7 @@ from aiter.ops.triton.fusions.fused_qk_norm_rope_across_heads import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # Archs with a fused_qk_norm_rope_across_heads config.
-SUPPORTED_ARCHS = ("gfx1150", "gfx1151")
+SUPPORTED_ARCHS = ("gfx1150", "gfx1151", "gfx1201")
 
 
 def torch_apply_rotary_emb(x, cos, sin):
