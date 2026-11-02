@@ -363,6 +363,13 @@ python op_tests/test_moe_2stage.py
   your local FlyDSL checkout (`scripts/build.sh`, after `pip install
   nanobind==2.12.0` if CMake reports it missing) so the on-`PYTHONPATH` build dir
   is refreshed to the right version.
+- **`ReplayHookBroken`, or an `AttributeError` on `JitFunction`, after a FlyDSL
+  upgrade**: the replay learns each launch's cache key by hooking two private
+  methods of FlyDSL's `JitFunction`, `_compile_or_execute` and
+  `_build_full_cache_key` (`replay.requested_kernels`). A release that renames
+  either fails every replay with an `AttributeError`; one whose launches stop
+  deriving their key in `_build_full_cache_key` fails them with
+  `ReplayHookBroken`. Update `requested_kernels` for that release.
 - **Worker OOM / killed (exitcode -9)**: abnormal exits are auto-retried
   (`AITER_FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
   bounded by the shared CPU and memory policy. If it still happens,
