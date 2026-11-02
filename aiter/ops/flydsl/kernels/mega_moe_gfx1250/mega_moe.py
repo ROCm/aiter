@@ -22,6 +22,7 @@ from .combine import (
     COMBINE_LDS_BUDGET,
     _make_combine_fused_reduce,
     _make_combine_fused_sync,
+    _make_combine_fused_tail,
     combine_reduce_lds_bytes,
 )
 from .config import _DISPATCH_COMPACT, _WAVE_SIZE, _select_dispatch_config
@@ -29,7 +30,32 @@ from .dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from .types import COMBINE_SCALE_BLOCK as _COMBINE_SCALE_BLOCK
 from .types import Stage2ScatterContext, _from_gpu_ptr
 
-__all__ = ["MegaMoEGfx1250"]
+__all__ = ["CombineTail", "MegaMoEGfx1250"]
+
+
+@dataclass
+class CombineTail:
+    """The MoE layer's tail, folded into the combine (``forward(combine_tail=)``).
+
+    The combine then returns ``(out, residual_out)`` instead of the routed sum:
+    ``moe = routed + sigmoid(gate) * shared``, ``residual_out = residual + moe``,
+    ``out = rmsnorm(residual_out) * (1 + weight)`` (``gemma``; ``* weight``
+    otherwise). ``gate`` is ``[tokens, 1]`` (rows may be strided) or None for an
+    already gated ``shared``; ``write_residual=False`` skips that store (a final
+    norm) and returns ``(out, None)``. All bf16, rows dense along hidden.
+    """
+
+    shared: torch.Tensor
+    gate: torch.Tensor | None
+    residual: torch.Tensor
+    weight: torch.Tensor
+    eps: float
+    gemma: bool = True
+    write_residual: bool = True
+
+
+def _env_on(name: str) -> bool:
+    return os.environ.get(name, "0") == "1"
 
 # "flydsl": AITER's FlyDSL/TDM dispatch. "mori": mori's HIP/JIT kernel through
 # its EpDispatchPlan.
@@ -699,8 +725,14 @@ class MegaMoEGfx1250:
         next_recv_token_bound: int | None = None,
         combine_quant: str | None = None,
         recv_counter_is_zero: bool = False,
-    ) -> torch.Tensor:
+        combine_tail: CombineTail | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
+
+        ``combine_tail`` (bf16 combine wire only) folds the layer's tail -- the
+        gated shared-expert add, the residual add and the next RMSNorm -- into
+        the combine, which then returns ``(out, residual_out)``; see
+        ``CombineTail``.
 
         ``recv_token_bound`` caps how many recv slots the GEMM is shown. Dispatch
         always fills a world_size*max_tokens_per_rank arena, so a caller that
@@ -861,6 +893,10 @@ class MegaMoEGfx1250:
             )
         finally:
             set_flydsl_dispatch_context(None)
+        if combine_tail is not None:
+            if combine_quant_bits != 0:
+                raise ValueError("combine_tail needs the bf16 combine wire")
+            return self._combine_tail(routing, combine_tail)
         return self._combine(routing, combine_quant_bits)
 
     def _resolve_combine_quant(self, combine_quant: str | None) -> int:
@@ -1338,6 +1374,12 @@ class MegaMoEGfx1250:
                 off_xdb_mem=self._arena.offset("cross_device_barrier"),
             )
         )
+        # AITER_MEGA_COMBINE_MERGED=1: the bf16 combine as ONE launch (every
+        # reduce block does the cross-device wait itself). forward(combine_tail=)
+        # takes that kernel either way.
+        self._combine_merged = _env_on("AITER_MEGA_COMBINE_MERGED")
+        self._combine_ticket = torch.zeros(1, dtype=torch.int32, device=device)
+        self._combine_one_kernel = {}
 
     def _build_tdm_dispatch(self, config: MegaMoEConfig, device) -> dict:
         """Build FlyDSL TDM dispatch launchers keyed by (block, warp) spec.
@@ -1821,6 +1863,105 @@ class MegaMoEGfx1250:
             combine_quant_bits=combine_quant_bits,
         )
 
+    # The one-kernel combine runs a power-of-two grid up to this many blocks,
+    # each looping over token rows; the bucket keeps the variants few. Every
+    # block with rows spins on the peers' phase slots, so all of them must be
+    # able to be resident at once next to whatever else the GPU runs -- one GPU
+    # a rank (production) always is; ranks sharing a GPU (tests) need a
+    # smaller AITER_MEGA_COMBINE_BLOCKS.
+    _ONE_KERNEL_MAX_BLOCKS = int(os.environ.get("AITER_MEGA_COMBINE_BLOCKS", "512"))
+
+    def _one_kernel_combine(self, routing: Routing, out, tail=None):
+        """Barrier + top-k reduce [+ ``tail``] in one launch; bf16 wire only.
+
+        Writes ``out`` (the routed sum, or the normed rows with a tail) and, with
+        a tail that writes it, returns the new residual.
+        """
+        cfg = self._config
+        count = int(routing.token_count)
+        nb = 1 << (min(self._ONE_KERNEL_MAX_BLOCKS, max(1, count)) - 1).bit_length()
+        has_tail = tail is not None
+        has_gate = has_tail and tail.gate is not None
+        write_res = has_tail and tail.write_residual
+        key = (
+            nb,
+            has_tail,
+            has_gate,
+            write_res,
+            float(tail.eps) if has_tail else 0.0,
+            bool(tail.gemma) if has_tail else True,
+        )
+        kern = self._combine_one_kernel.get(key)
+        if kern is None:
+            kern = fast_jit(
+                _make_combine_fused_tail(
+                    rank=cfg.rank,
+                    npes=cfg.world_size,
+                    off_xdb_mem=self._arena.offset("cross_device_barrier"),
+                    experts_per_token=cfg.topk,
+                    hidden_dim=cfg.hidden_dim,
+                    slot_stride_nbytes=cfg.combine_slot_stride_for(0),
+                    block_num=nb,
+                    tail=has_tail,
+                    has_gate=has_gate,
+                    write_residual=write_res,
+                    gemma=key[5],
+                    eps=key[4],
+                )
+            )
+            self._combine_one_kernel[key] = kern
+        res_out = None
+        if has_tail:
+            h = cfg.hidden_dim
+            for name, t in (("shared", tail.shared), ("residual", tail.residual)):
+                if (
+                    t.dtype != torch.bfloat16
+                    or tuple(t.shape) != (count, h)
+                    or t.stride(1) != 1
+                ):
+                    raise ValueError(
+                        f"combine_tail.{name} must be bf16 [{count}, {h}] with "
+                        f"dense rows, got {t.dtype} {tuple(t.shape)}"
+                    )
+            if has_gate and (
+                tail.gate.dtype != torch.bfloat16 or tuple(tail.gate.shape) != (count, 1)
+            ):
+                raise ValueError("combine_tail.gate must be bf16 [tokens, 1]")
+            if write_res:
+                res_out = torch.empty(
+                    (count, h), dtype=torch.bfloat16, device=tail.residual.device
+                )
+        stream = fx.Stream(torch.cuda.current_stream())
+        kern(
+            self._arena.handle,
+            self._cross_device_flag.data_ptr(),
+            self._combine_ticket.data_ptr(),
+            cfg.rank,
+            self._arena.local_ptr("comb_inp"),
+            count,
+            tail.shared.data_ptr() if has_tail else 0,
+            tail.shared.stride(0) if has_tail else 0,
+            tail.gate.data_ptr() if has_gate else 0,
+            tail.gate.stride(0) if has_gate else 0,
+            tail.residual.data_ptr() if has_tail else 0,
+            tail.residual.stride(0) if has_tail else 0,
+            tail.weight.data_ptr() if has_tail else 0,
+            out.data_ptr(),
+            res_out.data_ptr() if res_out is not None else 0,
+            stream,
+        )
+        return res_out
+
+    def _combine_tail(self, routing: Routing, tail: CombineTail):
+        count = int(routing.token_count)
+        out = torch.empty(
+            (count, self._config.hidden_dim),
+            dtype=torch.bfloat16,
+            device=tail.residual.device,
+        )
+        res_out = self._one_kernel_combine(routing, out, tail)
+        return out, res_out
+
     def _combine(self, routing: Routing, combine_quant_bits: int = 0) -> torch.Tensor:
         """Reduce the staged slots into this rank's tokens.
 
@@ -1828,6 +1969,15 @@ class MegaMoEGfx1250:
         slots as; it defaults to bf16, the wire a caller gets unless it asked
         forward() for another.
         """
+        if self._combine_merged and combine_quant_bits == 0:
+            count = routing.token_count
+            out = (
+                self._combine_output[: count * self._config.hidden_dim]
+                .view(torch.bfloat16)
+                .view(count, self._config.hidden_dim)
+            )
+            self._one_kernel_combine(routing, out)
+            return out
         stream = fx.Stream(torch.cuda.current_stream())
         # 1-block cross-device barrier, then the barrier-free reduce on the same
         # stream; the kernel boundary gives the reduce its visibility.

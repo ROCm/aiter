@@ -21,6 +21,8 @@
 # SOFTWARE.
 """Barrier-wait and top-k reduce kernel for gfx1250 Stage2-fused MegaMoE."""
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -569,5 +571,267 @@ def _make_combine_fused_reduce(
             block=[lanes, 1, 1],
             stream=stream,
         )
+
+    return run
+
+
+# ---------------------------------------------------------------------------
+# One-kernel combine: barrier + top-k reduce [+ the MoE layer's tail]
+# ---------------------------------------------------------------------------
+#
+# ``_make_combine_fused_sync`` + ``_make_combine_fused_reduce`` are two launches;
+# a decode step pays the kernel boundary between them once a MoE layer. Here
+# every reduce block waits on the peers' phase slots itself (block 0 also
+# pushes this rank's phase), then reduces whole token rows, so the same block
+# can finish the layer: with ``tail`` it adds
+#     moe      = routed + sigmoid(gate_logit) * shared
+#     residual = residual + moe;   out = rmsnorm(residual) * (1 + w)
+# rounding where the unfused ops round (sigmoid and the gated product to bf16,
+# the sum stored as bf16, the residual add and the norm in fp32).
+#
+# The phase counter is the same one the two-kernel path advances
+# (``_cross_device_flag``), so the two can alternate call by call. Every block
+# reads it at entry; the last block to finish (an agent-scope ticket) advances
+# it, which is after every block's read.
+
+COMBINE_TAIL_ELEMS_PER_LANE = 8
+_LOG2E = 1.4426950408889634
+
+
+def combine_tail_lanes(hidden_dim):
+    """Block size of the one-kernel combine: one bf16x8 per lane across a row."""
+    if hidden_dim % (COMBINE_TAIL_ELEMS_PER_LANE * WAVE):
+        raise ValueError(
+            f"hidden_dim must be a multiple of {COMBINE_TAIL_ELEMS_PER_LANE * WAVE}"
+        )
+    lanes = hidden_dim // COMBINE_TAIL_ELEMS_PER_LANE
+    if lanes > 1024:
+        raise ValueError(f"hidden_dim={hidden_dim} needs {lanes} lanes > 1024")
+    return lanes
+
+
+def _make_combine_fused_tail(
+    *,
+    rank,
+    npes,
+    off_xdb_mem,
+    experts_per_token,
+    hidden_dim,
+    slot_stride_nbytes,
+    block_num,
+    tail=True,
+    has_gate=True,
+    write_residual=True,
+    gemma=True,
+    eps=1e-6,
+    fence=None,
+):
+    """Build the one-kernel combine (see the section comment).
+
+    ``tail=False``: the barrier + reduce alone, storing the bf16 top-k sum
+    (``ep_combine_fused``'s output) to ``addr_out``. bf16 combine wire only.
+    """
+    from flydsl.expr import gpu
+    from flydsl.expr import math as fmath
+
+    const_expr = fx.const_expr
+    if fence is None:
+        fence = os.environ.get("AITER_MEGA_COMBINE_FENCE", "sys")
+
+    from ..mega_moe_tp.common import (
+        V4I,
+        bf16x8_to_f32,
+        bld,
+        bst,
+        i32,
+        lds_ld_i32,
+        lds_st,
+        pack_bf16x8,
+        rsrc,
+        uni,
+    )
+
+    topk = experts_per_token
+    H = hidden_dim
+    lanes = combine_tail_lanes(H)
+    n_waves = lanes // WAVE
+    slot_stride = slot_stride_nbytes
+    NB = block_num
+    if npes > lanes:
+        raise ValueError(f"npes={npes} exceeds the block's {lanes} lanes")
+
+    Shared = fx.struct(
+        type(
+            "CombineTailShared",
+            (),
+            {"__annotations__": {"buf": fx.Array[fx.Int8, 4 * max(n_waves, 4), 16]}},
+        )
+    )
+
+    def bf16r(x):
+        return fx.Float32(x).to(fx.BFloat16).to(fx.Float32)
+
+    def wave_sum(v):
+        for k in (1, 2, 4, 8, 16):
+            v = v + fx.Float32(v).shuffle_xor(i32(k), i32(WAVE))
+        return v
+
+    @flyc.jit
+    def block_sum(L, tid, v):
+        w = wave_sum(v)
+        if (tid % i32(WAVE)) == i32(0):
+            lds_st(L, (tid // i32(WAVE)) * i32(4), fx.Float32(w).bitcast(fx.Int32))
+        gpu.barrier()
+        t = fx.Float32(0.0)
+        for k in range_constexpr(n_waves):
+            t = t + lds_ld_i32(L, k * 4).bitcast(fx.Float32)
+        gpu.barrier()
+        return t
+
+    name = (
+        f"ep_combine_fused_tail_h{H}_k{topk}_nb{NB}"
+        + ("" if tail else "_reduce")
+        + ("" if has_gate else "_nogate")
+        + ("" if write_residual else "_nores")
+    )
+
+    @flyc.kernel(name=name, known_block_size=[lanes, 1, 1])
+    def ep_combine_fused_tail(
+        arena: Int64,
+        addr_xdb_flag: Int64,
+        addr_ticket: Int64,
+        my_lsa_rank: Int32,
+        addr_comb_inp: Int64,
+        num_tok: Int32,
+        addr_shared: Int64,
+        shared_stride: Int32,
+        addr_gate: Int64,
+        gate_stride: Int32,
+        addr_res: Int64,
+        res_stride: Int32,
+        addr_w: Int64,
+        addr_out: Int64,
+        addr_res_out: Int64,
+    ):
+        tid = i32(fx.thread_idx.x)
+        bid = i32(fx.block_idx.x)
+        lds = fx.SharedAllocator().allocate(Shared).peek()
+        L = uni(fx.Int32(fx.ptrtoint(lds.buf.ptr)))
+        window = cco.Window(arena)
+        rsrc_flag = create_buffer_resource_from_addr(addr_xdb_flag)
+        phase = fx.Int64(buffer_load(rsrc_flag, 0, vec_width=1, dtype=T.i64))
+        # Block 0 tells every peer this rank's gemm2 writes into them are done.
+        # Only block 0: a system-scope release store per block (an L2 write-back
+        # each) cost ~0.4 us a block. Peers wait on block 0 alone, which the
+        # grid (<= 512 blocks of one CU's worth of lanes or less) always has
+        # resident on a dedicated GPU.
+        if (bid == i32(0)) & (tid < i32(npes)):
+            xdb_remote = fx.Int64(window.lsa_ptr(tid, off_xdb_mem)) + fx.Int64(rank) * 8
+            comm_ops.store_i64_global_system(xdb_remote, phase)
+        # A block with rows waits for every peer's writes into this rank.
+        if (bid < num_tok) & (tid < i32(npes)):
+            xdb_peer_slot = (
+                fx.Int64(window.lsa_ptr(my_lsa_rank, off_xdb_mem)) + fx.Int64(tid) * 8
+            )
+            comm_ops.spin_until_ge_i64(xdb_peer_slot, phase)
+            if const_expr(fence == "sys"):
+                comm_ops.fence_system_acquire()
+            elif const_expr(fence == "agent"):
+                comm_ops.fence_agent_acquire()
+        gpu.barrier()
+
+        col = tid * i32(COMBINE_TAIL_ELEMS_PER_LANE)
+        rw = rsrc(addr_w)
+        for t_ in range(bid, num_tok, NB):
+            t = i32(t_)
+            rin = rsrc(addr_comb_inp + fx.Int64(t) * fx.Int64(topk * slot_stride))
+            acc = [fx.Float32(0.0) for _ in range_constexpr(8)]
+            for k in range_constexpr(topk):
+                v = bf16x8_to_f32(bld(rin, i32(k * slot_stride) + col * i32(2), 0, V4I))
+                acc = [a + b for a, b in zip(acc, v)]
+            row_off = (t * i32(H) + col) * i32(2)
+            if const_expr(not tail):
+                bst(pack_bf16x8(acc), rsrc(addr_out), row_off, 0)
+            else:
+                routed = [bf16r(a) for a in acc]
+                rsh = rsrc(addr_shared + fx.Int64(t) * fx.Int64(shared_stride) * 2)
+                sh = bf16x8_to_f32(bld(rsh, col * i32(2), 0, V4I))
+                if const_expr(has_gate):
+                    # The gate logit: one bf16 at a 2-byte-aligned address.
+                    gaddr = addr_gate + fx.Int64(t) * fx.Int64(gate_stride) * 2
+                    gw = fx.Int32(bld(rsrc(gaddr & fx.Int64(-4)), 0, 0, T.i32))
+                    hi = (gaddr & fx.Int64(2)) != fx.Int64(0)
+                    gbits = hi.select(gw & i32(-65536), gw << i32(16))
+                    g = gbits.bitcast(fx.Float32)
+                    s = fx.Float32(1.0) / (
+                        fx.Float32(1.0)
+                        + fx.Float32(fmath.exp2(g * fx.Float32(-_LOG2E)))
+                    )
+                    s = bf16r(s)
+                    sh = [bf16r(x * s) for x in sh]
+                moe = [bf16r(a + b) for a, b in zip(sh, routed)]
+                rres = rsrc(addr_res + fx.Int64(t) * fx.Int64(res_stride) * 2)
+                rv = bf16x8_to_f32(bld(rres, col * i32(2), 0, V4I))
+                x = [a + b for a, b in zip(moe, rv)]
+                if const_expr(write_residual):
+                    bst(pack_bf16x8(x), rsrc(addr_res_out), row_off, 0)
+                ss = fx.Float32(0.0)
+                for xi in x:
+                    ss = ss + xi * xi
+                tot = block_sum(L, tid, ss)
+                rstd = fx.Float32(
+                    fmath.rsqrt(tot / fx.Float32(float(H)) + fx.Float32(float(eps)))
+                )
+                wv = bf16x8_to_f32(bld(rw, col * i32(2), 0, V4I))
+                y = [
+                    (xi * rstd) * ((wi + fx.Float32(1.0)) if gemma else wi)
+                    for xi, wi in zip(x, wv)
+                ]
+                bst(pack_bf16x8(y), rsrc(addr_out), row_off, 0)
+
+        # The last block out advances the phase: every block read it at entry.
+        gpu.barrier()
+        if tid == i32(0):
+            old = fx.Int32(comm_ops.atomic_add_agent(addr_ticket, fx.Int32(1)))
+            if old == i32(NB - 1):
+                comm_ops.store_i32_global_agent_release(addr_ticket, fx.Int32(0))
+                buffer_store(phase + arith.constant(1, type=T.i64), rsrc_flag, 0)
+
+    @flyc.jit
+    def run(
+        arena: Int64,
+        addr_xdb_flag: Int64,
+        addr_ticket: Int64,
+        my_lsa_rank: Int32,
+        addr_comb_inp: Int64,
+        num_tok: Int32,
+        addr_shared: Int64,
+        shared_stride: Int32,
+        addr_gate: Int64,
+        gate_stride: Int32,
+        addr_res: Int64,
+        res_stride: Int32,
+        addr_w: Int64,
+        addr_out: Int64,
+        addr_res_out: Int64,
+        stream=fx.Stream(None),  # noqa: B008
+    ):
+        ep_combine_fused_tail(
+            arena,
+            addr_xdb_flag,
+            addr_ticket,
+            my_lsa_rank,
+            addr_comb_inp,
+            num_tok,
+            addr_shared,
+            shared_stride,
+            addr_gate,
+            gate_stride,
+            addr_res,
+            res_stride,
+            addr_w,
+            addr_out,
+            addr_res_out,
+        ).launch(grid=(NB, 1, 1), block=[lanes, 1, 1], stream=stream)
 
     return run
