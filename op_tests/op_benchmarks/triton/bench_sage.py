@@ -28,6 +28,7 @@ from aiter.ops.mha_v4 import (
     AttentionScaleMode,
     mha_v4,
     mha_v4_kv_tile,
+    mha_v4_mx_producers,
     mha_v4_packed,
     native_fp8_format,
     scale_modes_for_formats,
@@ -38,20 +39,14 @@ from aiter.ops.mha_v4_quant import (
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    mxfp6_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
-    quantize_mxfp4_k,
-    quantize_mxfp4_k_hd256,
-    quantize_mxfp4_q,
-    quantize_mxfp4_q_hd256,
-    quantize_mxfp6_k,
-    quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
-    quantize_v_mxfp4_fp6_p_hd256,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
@@ -93,20 +88,9 @@ logger = logging.getLogger(__name__)
 
 
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
-    # MXFP4 is the one recipe with an hd256 object; its producers are separate entry points
-    # rather than a head-dim argument, so pick the trio the same way mha_v4's raw path does.
-    if query.shape[-1] == MHA_V4_HD256:
-        quant_q, quant_k, quant_v = (
-            quantize_mxfp4_q_hd256,
-            quantize_mxfp4_k_hd256,
-            quantize_v_mxfp4_fp6_p_hd256,
-        )
-    else:
-        quant_q, quant_k, quant_v = (
-            quantize_mxfp4_q,
-            quantize_mxfp4_k,
-            quantize_v_mxfp4_fp6_p,
-        )
+    quant_q, quant_k, quant_v = mha_v4_mx_producers(
+        AttentionFormat.MXFP4, query.shape[-1]
+    )
     q_fp4, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale = quant_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
@@ -125,16 +109,20 @@ def _production_quantize_mxfp8(query, key, value, softmax_scale):
 def _production_quantize_mxfp6(
     query, key, value, softmax_scale, v_format=None, fp6_p=False
 ):
-    q_fp6, q_scale = quantize_mxfp6_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale_raw = quantize_mxfp6_k(key)
-    batch, sequence, heads, _ = key.shape
-    k_fp6, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
+    batch, sequence, heads, head_dim = key.shape
+    quant_q, quant_k, quant_v_fp6_p = mha_v4_mx_producers(
+        AttentionFormat.MXFP6, head_dim
+    )
+    q_fp6, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale_raw = quant_k(key)
+    k_view = mxfp6_k_view_hd256 if head_dim == MHA_V4_HD256 else mxfp6_k_view
+    k_fp6, k_scale = k_view(k_raw, k_scale_raw, batch, sequence, heads)
     if v_format is None:
         v_quantized, v_scale = quantize_v_fp8(value)
         return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
     if v_format == AttentionFormat.MXFP6:
-        quantize_v = quantize_v_mxfp6_fp6_p if fp6_p else quantize_v_mxfp6
+        quantize_v = quant_v_fp6_p if fp6_p else quantize_v_mxfp6
         return q_fp6, q_scale, k_fp6, k_scale, *quantize_v(value)
     if v_format != AttentionFormat.MXFP4:
         raise ValueError(f"unsupported MXFP6 Q/K V format: {v_format!r}")
@@ -198,7 +186,7 @@ KERNEL_SPECS = {
     "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
     "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
     # FMHA v3 per-tensor FP8, the quantized counterpart to the aiter_bf16 baseline. Select it
-    # explicitly; at d=256 it is the one non-MXFP4 row that runs at all.
+    # explicitly; at d=256 it is the one non-MX row that runs at all.
     "aiter_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True),
     "mha4_bf16": _mha_v4_spec(
         (2.0, 2.0, 2.0), quantized=False, supports_block_sparse=True
