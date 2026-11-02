@@ -578,6 +578,28 @@ CASES += [
     for _d in (128, 64)
     for _c in _PAGED_BASE
 ]
+
+# Long-context paged, appended after the block above so those ids do not move either.
+# d128 only and narrower heads on the longest shapes, to keep the pool affordable: at
+# page_size 1 a 2^17 sequence is ~131k blocks. The short-q/long-kv rows are the shape
+# prefix caching actually produces.
+_PAGED_LARGE = [
+    {"layout": "paged", "B": 4, "sq": 16384, "sk": 16384, "Hq": 8, "Hkv": 8,
+     "causal": True, "desc": "16k causal, multi-batch (paged case 10)"},
+    {"layout": "paged", "B": 1, "sq": 65536, "sk": 65536, "Hq": 4, "Hkv": 1,
+     "causal": True, "desc": "64k causal, MQA long context"},
+    {"layout": "paged", "B": 1, "sq": 131071, "sk": 131071, "Hq": 4, "Hkv": 1,
+     "causal": True, "desc": "odd ~2^17 causal, MQA long context"},
+    {"layout": "paged", "B": 1, "sq": 897, "sk": 65537, "Hq": 8, "Hkv": 8,
+     "causal": True, "desc": "short q into a long cache (prefix caching)"},
+    {"layout": "paged", "B": 8, "sq": 1, "sk": 32768, "Hq": 8, "Hkv": 1,
+     "causal": True, "desc": "decode-shaped q=1 into a long cache"},
+]
+CASES += [
+    dict(_c, d_qk=128, d_v=128, page=_p)
+    for _p in (1, 16, 1024)
+    for _c in _PAGED_LARGE
+]
 for _i, _c in enumerate(CASES):
     _c["id"] = _i
 
