@@ -94,14 +94,23 @@ def parse_bmm_kernel_name(name: str) -> dict[str, int] | None:
     return cfg
 
 
-def parse_bmm_mx32_kernel_name(name: str) -> dict[str, int] | None:
-    """Parse a batched mxfp8_32 kernelName, or ``None`` if it is not one."""
+@functools.lru_cache(maxsize=1024)
+def _parse_bmm_mx32_kernel_name_cached(name: str) -> dict[str, int] | None:
     match = _BMM_MX32_KERNEL_NAME_RE.fullmatch(name)
     if match is None:
         return None
     cfg = {key: int(value) for key, value in match.groupdict().items()}
     cfg["preload"] = 0
     return cfg
+
+
+def parse_bmm_mx32_kernel_name(name: str) -> dict[str, int] | None:
+    """Parse a batched mxfp8_32 kernelName, or ``None`` if it is not one.
+
+    Every launch parses its kernel name, so the regex result is cached per name;
+    each caller gets its own copy of the dict."""
+    cfg = _parse_bmm_mx32_kernel_name_cached(name)
+    return None if cfg is None else dict(cfg)
 
 
 def bmm_kernel_name(
@@ -235,7 +244,7 @@ def pick_bmm_kernel_name(b: int, m: int, n: int, k: int) -> str:
 
 
 @functools.lru_cache(maxsize=1024)
-def pick_bmm_mx32_kernel_name(
+def _pick_bmm_mx32_kernel_name_exact(
     b: int, m: int, n: int, k: int, w_scale_32x32: bool = False
 ) -> str:
     """Heuristic batched mxfp8_32 config for a shape with no tuned row."""
@@ -283,6 +292,76 @@ def pick_bmm_mx32_kernel_name(
         c["n_warp"],
         c["num_buffers"],
     )
+
+
+@functools.cache
+def _mx32_m_class_params() -> tuple[tuple[tuple[int, int | None], ...], bool]:
+    """How M enters ``_pick_bmm_mx32_kernel_name_exact``.
+
+    The pick reads M only through ``bmm_candidates`` -> ``kernel_fits_shape``
+    on the non-compute, split-K 1, 1x1-cluster instances (M parity when an
+    instance preshuffles A; ``ceil(M / tile_m)`` against ``_MAX_M_BLOCKS`` when
+    ``tile_m < _LARGE_M_TILE_MIN``) and through its rank (``ceil(M / tile_m)``).
+    So ``ceil(M / tile_m)`` per candidate tile_m -- saturated just past the
+    block limit where that limit already rejects the tile -- plus the parity
+    when it matters, determines the pick. Returns
+    ``((tile_m, saturation or None), ...), parity_matters``.
+    """
+    from .gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        _LARGE_M_TILE_MIN,
+        _MAX_M_BLOCKS,
+        is_compute_kernel,
+        kernels_list,
+    )
+
+    tiles = set()
+    parity = False
+    for ki in kernels_list.values():
+        if is_compute_kernel(ki) or ki.split_k != 1:
+            continue
+        if ki.cluster_m != 1 or ki.cluster_n != 1:
+            continue
+        tiles.add(ki.tile_m)
+        parity = parity or bool(ki.a_preshuffle)
+    params = tuple(
+        (tm, _MAX_M_BLOCKS + 1 if tm < _LARGE_M_TILE_MIN else None)
+        for tm in sorted(tiles)
+    )
+    return params, parity
+
+
+# (b, n, k, w_scale_32x32, M class) -> kernel name. Prefill hands the GEMM a new
+# M nearly every step; keying the heuristic on the M class instead of the exact
+# M turns those into hits (a few hundred classes per weight shape vs. every M).
+_MX32_PICK_BY_M_CLASS: dict = {}
+
+
+def pick_bmm_mx32_kernel_name(
+    b: int, m: int, n: int, k: int, w_scale_32x32: bool = False
+) -> str:
+    """Heuristic batched mxfp8_32 config for a shape with no tuned row.
+
+    Same answer as ``_pick_bmm_mx32_kernel_name_exact(b, m, n, k, w_scale_32x32)``,
+    memoised per M class (see ``_mx32_m_class_params``)."""
+    params, parity = _mx32_m_class_params()
+    m_class = tuple(
+        (-(-m // tm) if sat is None else min(-(-m // tm), sat)) for tm, sat in params
+    )
+    key = (b, n, k, bool(w_scale_32x32), m_class, (m & 1) if parity else 0, m > 0)
+    name = _MX32_PICK_BY_M_CLASS.get(key)
+    if name is None:
+        name = _pick_bmm_mx32_kernel_name_exact(b, m, n, k, w_scale_32x32)
+        _MX32_PICK_BY_M_CLASS[key] = name
+    return name
+
+
+def _pick_bmm_mx32_cache_clear() -> None:
+    _MX32_PICK_BY_M_CLASS.clear()
+    _pick_bmm_mx32_kernel_name_exact.cache_clear()
+    _mx32_m_class_params.cache_clear()
+
+
+pick_bmm_mx32_kernel_name.cache_clear = _pick_bmm_mx32_cache_clear
 
 
 def _check_bmm_operands(

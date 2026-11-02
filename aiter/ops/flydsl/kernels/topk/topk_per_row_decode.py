@@ -17,7 +17,6 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.utility.graph_alloc import persistent_alloc
 
 from ..communication_ops_utils import (
@@ -32,6 +31,7 @@ from .radix_topk_one_block import (
     build_radix_topk_one_block_module,
 )
 from .topk_common import _row_length
+from .topk_launch import run_topk_launcher
 
 _BLOCK_THREADS = 1024
 _MAX_PARTS = 16
@@ -351,7 +351,7 @@ def launch_topk_per_row_decode(
             packed_rows=packed_rows,
             full_rows=full_rows,
         )
-        _run_compiled(
+        run_topk_launcher(
             launcher,
             logits,
             row_starts,
@@ -377,7 +377,7 @@ def launch_topk_per_row_decode(
     partial_indices, partial_values, counters = _get_workspace(
         indices.device, stream.cuda_stream, rows, parts * k
     )
-    _run_compiled(
+    run_topk_launcher(
         launcher,
         logits,
         row_starts,

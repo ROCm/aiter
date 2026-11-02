@@ -100,11 +100,11 @@ def get_kernel_config_triton(m, n, k, routing_data):
 
     # Entries carry no BLOCK_SIZE_M: block_m is the dispatch key, not a
     # tunable, because routing fixes it for the layer.
-    tuned = get_moe_dispatch("A16W4", get_arch(), "triton").get(
-        f"bm{block_m}_n{n}_k{k}"
-    )
+    arch = get_arch()
+    key = f"bm{block_m}_n{n}_k{k}"
+    tuned = get_moe_dispatch("A16W4", arch, "triton").get(key)
     if tuned is not None:
-        return {
+        config = {
             "block_m": block_m,
             "block_n": tuned["BLOCK_SIZE_N"],
             "block_k": tuned["BLOCK_SIZE_K"],
@@ -118,6 +118,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
             "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
             "kpack": tuned.get("kpack", 1),
         }
+        return config
 
     num_stages = 1
     block_k = 256
@@ -162,7 +163,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "split_k": split_k,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
+        "kpack": 2 if arch == "gfx942" and block_m <= 32 else 1,
     }
     return ret
 
