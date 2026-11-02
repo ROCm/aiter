@@ -9,12 +9,14 @@
 dense/windowed mode; batch, capacity, partition cap and window are runtime
 values. The kernels for batches up to a ``max_batch_size`` therefore form a
 finite set per arch, derived here from the planner's own bucket and block-size
-rules and the arch's LDS capacity. This script is standalone, not part of
-``run_aot``.
+rules and the arch's LDS capacity. ``run_aot`` compiles the set for
+``AOT_MAX_BATCH_SIZE``, which reaches every arch's LDS limit and therefore
+covers every power-of-two cap and every cap at or above that limit; other caps
+need their own run.
 
 Usage:
-    python -m aiter.aot.flydsl.pa_decode_plan                        # 4096
-    python -m aiter.aot.flydsl.pa_decode_plan --max-batch-size 32768 --arch gfx950
+    python -m aiter.aot.flydsl.pa_decode_plan                        # 81792
+    python -m aiter.aot.flydsl.pa_decode_plan --max-batch-size 5000 --arch gfx950
 """
 
 from __future__ import annotations
@@ -32,6 +34,9 @@ from aiter.aot.flydsl.common import (
 
 # Archs that pa_decode dispatches to.
 AOT_ARCHS = ("gfx942", "gfx950", "gfx1250")
+# gfx1250's LDS limit, the largest of AOT_ARCHS; each arch clips the final
+# bucket to its own limit (16256 on gfx942, 40832 on gfx950).
+AOT_MAX_BATCH_SIZE = 81792
 
 
 def plan_variants(max_batch_size: int, lds_bytes: int) -> list[tuple[int, int, bool]]:
@@ -82,13 +87,11 @@ def jobs_for_arch(arch: str, max_batch_size: int) -> list[dict]:
 
 def default_jobs(max_batch_sizes: list[int] | None = None) -> list[dict]:
     """Every variant of the archs ``GPU_ARCHS`` names (all supported archs when
-    unset) for each ``max_batch_size``, by default the planner's default."""
-    from aiter.ops.flydsl.kernels.pa_decode_plan import DEFAULT_MAX_BATCH_SIZE
-
+    unset) for each ``max_batch_size``, by default ``AOT_MAX_BATCH_SIZE``."""
     targets = aot_target_archs()
     archs = [arch for arch in AOT_ARCHS if targets is None or arch in targets]
     jobs = []
-    for max_batch_size in max_batch_sizes or [DEFAULT_MAX_BATCH_SIZE]:
+    for max_batch_size in max_batch_sizes or [AOT_MAX_BATCH_SIZE]:
         for arch in archs:
             jobs.extend(jobs_for_arch(arch, max_batch_size))
     return dedupe_jobs(jobs)
@@ -144,7 +147,7 @@ def main():
         "--max-batch-size",
         type=_positive_int,
         nargs="+",
-        help="planner batch caps to cover (default: the planner's default, 4096)",
+        help=f"planner batch caps to cover (default: {AOT_MAX_BATCH_SIZE})",
     )
     parser.add_argument(
         "--arch",
