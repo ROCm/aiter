@@ -9,7 +9,7 @@ from aiter.ops.triton.normalization.channel_rmsnorm import channel_rmsnorm
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # Archs with a channel_rmsnorm config.
-SUPPORTED_ARCHS = ("gfx1150", "gfx1151")
+SUPPORTED_ARCHS = ("gfx1150", "gfx1151", "gfx1201")
 
 _ACT = {None: lambda t: t, "silu": F.silu, "gelu": F.gelu}
 
