@@ -14,12 +14,14 @@ and the extend range is causal.
 
 The ``prec`` axis picks both the input format and the backends that run:
 
-* ``bf16`` -- single ``D=512`` Q/K/V/O tensor (``mla_sparse_prefill``): ``opus``,
+* ``bf16``    -- single ``D=512`` Q/K/V/O tensor (``mla_sparse_prefill``): ``opus``,
   ``triton``.
-* ``v4``   -- v4 split NoPE-fp8 / RoPE-bf16 inputs (``mla_sparse_prefill_v4``):
+* ``v4_fp8``  -- v4 split NoPE-fp8 / RoPE-bf16 inputs (``mla_sparse_prefill_v4``):
   ``opus``, ``asm``.
-* ``v41``  -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
+* ``v41_fp8`` -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
   (``mla_sparse_prefill_v41``): ``opus``, gfx950 only.
+* ``v41_fp4`` -- ``v41_fp8`` with an NVFP4 prefix source: 512 e2m1 and 32 e4m3
+  scales packed in a 288-byte row: ``opus``, gfx950 only.
 
 ``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
 gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
@@ -30,7 +32,7 @@ Example CLI usage::
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 256 2048
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
-        -n 1024 --h_q 128 --prec v4 --no-verify
+        -n 1024 --h_q 128 --prec v4_fp8 --no-verify
 """
 
 from __future__ import annotations
@@ -57,6 +59,8 @@ from aiter.test_common import (
     checkAllclose,
     perftest,
 )
+from aiter.utility import dtypes
+from aiter.utility.fp4_utils import f32_to_mxfp4, mxfp4_to_f32
 
 try:
     from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
@@ -485,6 +489,20 @@ def _make_inputs_fp8(
 
 _V41_D = 512
 _V41_D_SCALE = _V41_D // _FP8_BLK
+_NVFP4_BLK = 16
+
+
+def _quantize_nvfp4_rows(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[R, 512]`` reals -> (``[R, 288]`` uint8 NVFP4 rows, 256 e2m1 pairs then 32 e4m3
+    scales, the dequantized fp32 ``[R, 512]``)."""
+    r, nblk = real.shape[0], _V41_D // _NVFP4_BLK
+    blk = real.reshape(r, nblk, _NVFP4_BLK).to(torch.float32)
+    scale = (blk.abs().amax(dim=-1) / 6.0).clamp(2.0**-9, 448.0).to(torch.float8_e4m3fn)
+    s = scale.to(torch.float32).unsqueeze(-1)
+    q = f32_to_mxfp4((blk / s).reshape(r, _V41_D)).view(torch.uint8)
+    deq = (mxfp4_to_f32(q).reshape(r, nblk, _NVFP4_BLK) * s).reshape(r, _V41_D)
+    rows = torch.cat([q, scale.view(torch.uint8)], dim=-1)
+    return rows, deq
 
 
 def _make_inputs_v41(
@@ -497,20 +515,29 @@ def _make_inputs_v41(
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
+    prefix_fp4: bool = False,
 ) -> dict:
-    """:func:`_make_inputs_fp8` for v41: e4m3 rows with ``[rows, 16]`` E8M0 scales."""
+    """:func:`_make_inputs_fp8` for v41: e4m3 rows with ``[rows, 16]`` E8M0 scales, or
+    with ``prefix_fp4`` NVFP4 prefix rows as views of :func:`_quantize_nvfp4_rows`."""
     device = torch.device(device)
     gen = make_generator(seed, device=device)
 
+    def _real(rows: int):
+        return fill((rows, _V41_D), data_init, gen, dtype=torch.float32, device=device)
+
     def _stream(rows: int):
-        real = fill((rows, _V41_D), data_init, gen, dtype=torch.float32, device=device)
-        return _quantize_e8m0_blocks(real * 0.5)
+        return _quantize_e8m0_blocks(_real(rows) * 0.5)
 
     q, q_scale, q_fp32 = _stream(n * h)
     q = q.reshape(n, h, _V41_D)
     q_scale = q_scale.reshape(n, h, _V41_D_SCALE)
     q_fp32 = q_fp32.reshape(n, h, _V41_D)
-    ukv, ukv_scale, ukv_fp32 = _stream(total_pages)
+    if prefix_fp4:
+        rows, ukv_fp32 = _quantize_nvfp4_rows(_real(total_pages) * 0.5)
+        ukv = rows[:, : _V41_D // 2].view(dtypes.fp4x2)
+        ukv_scale = rows[:, _V41_D // 2 :].view(torch.float8_e4m3fn)
+    else:
+        ukv, ukv_scale, ukv_fp32 = _stream(total_pages)
     kv, kv_scale, kv_fp32 = _stream(total_tokens)
 
     attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
@@ -522,7 +549,7 @@ def _make_inputs_v41(
         n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
     )
 
-    # 0xFF is NaN both as e4m3 and as E8M0.
+    # 0xFF is NaN both as e4m3 and as E8M0; an NVFP4 row is NaN through its scales.
     _poison_unreferenced(total_pages, ix_p, nope=ukv)
     _poison_unreferenced(total_pages, ix_p, nope=ukv_scale)
     _poison_unreferenced(total_tokens, ix_e, nope=kv)
@@ -562,8 +589,9 @@ _BACKENDS = ("opus", "asm", "triton")
 
 _PREC_BACKENDS = {
     "bf16": ("opus", "triton"),
-    "v4": ("opus", "asm"),
-    "v41": ("opus",),
+    "v4_fp8": ("opus", "asm"),
+    "v41_fp8": ("opus",),
+    "v41_fp4": ("opus",),
 }
 
 # Baked into the asm code object; its Q address math needs gridDim.y == 1.
@@ -591,7 +619,7 @@ def _profile_func(target_func, *, backend: str):
 # ---------------------------------------------------------------------------
 
 
-_PRECS = ("bf16", "v4", "v41")
+_PRECS = ("bf16", "v4_fp8", "v41_fp8", "v41_fp4")
 _PREC_TO_DTYPE = {"bf16": torch.bfloat16}
 
 _RTOL = 1e-2
@@ -635,7 +663,7 @@ def run_mla_sparse_prefill(
     # Lambdas, not partials: @perftest() deep-copies args, cloning bound tensors.
     candidates: list = []
 
-    if prec == "v41":
+    if prec in ("v41_fp8", "v41_fp4"):
         data = _make_inputs_v41(
             n,
             h,
@@ -644,6 +672,7 @@ def run_mla_sparse_prefill(
             topk=topk,
             seed=seed,
             data_init=data_init,
+            prefix_fp4=prec == "v41_fp4",
         )
         kernel_inputs = data["kernel"]
         ref_fn, ref_inputs = _ref_mla_sparse_prefill_fp8, data["ref"]
@@ -659,7 +688,7 @@ def run_mla_sparse_prefill(
                     ),
                 )
             )
-    elif prec == "v4":
+    elif prec == "v4_fp8":
         data = _make_inputs_fp8(
             n,
             h,
@@ -781,7 +810,7 @@ def run_mla_sparse_prefill(
 # ---------------------------------------------------------------------------
 
 
-_PYTEST_PRECS = ["bf16", "v4", "v41"]
+_PYTEST_PRECS = ["bf16", "v4_fp8", "v41_fp8", "v41_fp4"]
 
 # topk rides in the case instead of being its own axis: crossed with the shapes,
 # most combinations would collapse onto the same whole-pool budget.
@@ -883,10 +912,11 @@ parser.add_argument(
     default=list(_PRECS),
     choices=list(_PRECS),
     help=(
-        "precision(s) to sweep (default: [bf16, v4, v41]).\n"
-        "  bf16: single-tensor Q/K/V/O kernel      -> opus, triton\n"
-        "  v4  : split NoPE-fp8 / RoPE-bf16 kernel -> opus, asm\n"
-        "  v41 : e4m3 rows + E8M0 scales (MLA v4.1) -> opus (gfx950)"
+        "precision(s) to sweep (default: [bf16, v4_fp8, v41_fp8, v41_fp4]).\n"
+        "  bf16   : single-tensor Q/K/V/O kernel           -> opus, triton\n"
+        "  v4_fp8 : split NoPE-fp8 / RoPE-bf16 kernel      -> opus, asm\n"
+        "  v41_fp8: e4m3 rows + E8M0 scales (MLA v4.1)     -> opus (gfx950)\n"
+        "  v41_fp4: v41_fp8 with an NVFP4 prefix source    -> opus (gfx950)"
     ),
 )
 parser.add_argument(

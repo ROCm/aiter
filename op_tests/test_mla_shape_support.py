@@ -33,8 +33,22 @@ requires_gpu = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_opus_env(monkeypatch):
+    # The tests pin the default backends; AITER_MLA_USE_OPUS is read on every
+    # query and launch, so an inherited value would select OPUS instead. Tests
+    # that cover OPUS set it themselves.
+    monkeypatch.delenv("AITER_MLA_USE_OPUS", raising=False)
+
+
 def _dtype(name):
     return dtypes.fp8 if name == "fp8" else torch.bfloat16
+
+
+def _gfx950_dtype(name):
+    # For queries pinned to arch="gfx950": the host's dtypes.fp8 is e4m3fnuz on
+    # gfx942 (and uint8 without a GPU), which would pick a different backend.
+    return torch.float8_e4m3fn if name == "fp8" else torch.bfloat16
 
 
 def _fold(arch, d, n, msq=1):
@@ -366,9 +380,8 @@ def test_planner_fold_agreement():
         assert n_bid == s.fold_factor * s.seqlen_fold, (n, msq, d, n_bid)
 
 
-def _run_decode(n, msq, d, lse, bs=2):
+def _run_decode(n, msq, d, lse, bs=2, persistent=True, v_head_dim=KV_LORA_RANK):
     qd = _dtype(d)
-    _, _, meta = _run_planner(bs, msq, n, qd, qd)
     qo, kv_indptr, last = _indptrs(bs, msq)
     total_q, total_kv = bs * msq, int(kv_indptr[-1].item())
     dim = KV_LORA_RANK + QK_ROPE
@@ -380,10 +393,12 @@ def _run_decode(n, msq, d, lse, bs=2):
     if d == "fp8":
         kw["q_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
         kw["kv_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
-    o = torch.empty(total_q, n, KV_LORA_RANK, dtype=torch.bfloat16, device="cuda")
-    names = ("work_meta_data", "work_info_set", "work_indptr")
-    names += ("reduce_indptr", "reduce_final_map", "reduce_partial_map")
-    kw.update(zip(names, meta))
+    o = torch.empty(total_q, n, v_head_dim, dtype=torch.bfloat16, device="cuda")
+    if persistent:
+        _, _, meta = _run_planner(bs, msq, n, qd, qd)
+        names = ("work_meta_data", "work_info_set", "work_indptr")
+        names += ("reduce_indptr", "reduce_final_map", "reduce_partial_map")
+        kw.update(zip(names, meta))
     aiter.mla.mla_decode_fwd(
         *(qt, kvb, o, qo, kv_indptr, kv_indices, last, msq),
         page_size=1,
@@ -414,6 +429,87 @@ def test_decode_agreement():
         if ok != s.supported:
             bad.append((n, msq, d, lse, s.backend.value, s.supported))
     assert not bad, bad
+
+
+def _dim_rejected(s):
+    return any("v_head_dim 512" in r for r in s.reasons)
+
+
+@requires_gpu
+def test_decode_asm_route_needs_v_head_dim_512():
+    # mla_reduce_v1 has a (12, 128) case for prefill, but the stage-1 asm decode
+    # kernels only take v_head_dim 512; the reducer row must not make 128 pass.
+    def support(v_head_dim):
+        return get_mla_decode_shape_support(
+            *(12, 1, _gfx950_dtype("fp8"), _gfx950_dtype("fp8")),
+            v_head_dim=v_head_dim,
+            arch="gfx950",
+            enable_experimental=False,
+            flydsl_ps1=False,
+        )
+
+    s = support(128)
+    assert s.backend is MlaBackend.ASM, s.backend
+    assert s.supported is False and _dim_rejected(s), s.reasons
+    s512 = support(512)
+    assert s512.backend is MlaBackend.ASM, s512.backend
+    assert not _dim_rejected(s512), s512.reasons
+    # A build without the gfx950 asm table (e.g. gfx942 only) rejects every shape.
+    if s512.asm_status is not MlaAsmStatus.ARCH_NOT_BUILT:
+        assert s512.supported is not False, s512.reasons
+
+
+def test_decode_opus_needs_v_head_dim_512(monkeypatch):
+    # opus_mla_decode_fwd checks that the output's last dim is 512 as well.
+    monkeypatch.setenv("AITER_MLA_USE_OPUS", "1")
+    for v_dim in (128, KV_LORA_RANK):
+        s = get_mla_decode_shape_support(
+            *(12, 1, _gfx950_dtype("fp8"), _gfx950_dtype("fp8")),
+            v_head_dim=v_dim,
+            arch="gfx950",
+            enable_experimental=False,
+            flydsl_ps1=False,
+        )
+        assert s.backend is MlaBackend.OPUS, s.backend
+        if v_dim == KV_LORA_RANK:
+            assert s.supported is not False and not _dim_rejected(s), s.reasons
+        else:
+            assert s.supported is False, s.reasons
+            assert any(
+                r.startswith("opus_mla_decode_fwd") and "v_head_dim 512" in r
+                for r in s.reasons
+            ), s.reasons
+
+
+@requires_gpu
+def test_decode_non_persistent_asm_needs_v_head_dim_512():
+    # Non-persistent decode runs the same mla_decode_stage1_asm_fwd, which rejects
+    # an output head dim other than 512, so v_head_dim 128 fails there too.
+    run = aiter.get_gfx() == "gfx950"
+    for d in ("bf16", "fp8"):
+        for v_dim, ok in ((128, False), (KV_LORA_RANK, True)):
+            s = get_mla_decode_shape_support(
+                *(16, 1, _gfx950_dtype(d), _gfx950_dtype(d)),
+                v_head_dim=v_dim,
+                persistent=False,
+                arch="gfx950",
+            )
+            assert s.backend is MlaBackend.ASM, s.backend
+            assert _dim_rejected(s) is not ok, s.reasons
+            # A build without the gfx950 asm table (e.g. gfx942 only) has no
+            # kernel to launch and reports every shape as unsupported.
+            built = s.asm_status is not MlaAsmStatus.ARCH_NOT_BUILT
+            if not ok:
+                assert s.supported is False, s.reasons
+            elif built:
+                assert s.supported is not False, s.reasons
+            if not (run and built):
+                continue
+            if ok:
+                _run_decode(16, 1, d, False, persistent=False, v_head_dim=v_dim)
+            else:
+                with pytest.raises(RuntimeError, match="v_head_dim 512"):
+                    _run_decode(16, 1, d, False, persistent=False, v_head_dim=v_dim)
 
 
 @requires_gpu
