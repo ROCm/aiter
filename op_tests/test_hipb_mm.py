@@ -9,6 +9,7 @@ from aiter import dtypes
 from aiter.jit.core import get_module
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.gradlib import HipblasLtMatmulScaleMode as ScaleMode
+from aiter.ops.shuffle import shuffle_scale
 from aiter.test_common import assertAllclose
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -240,6 +241,62 @@ def test_hipb_mm_accepts_mxfp8_scale_dtype(mode, scale_dtype):
         scaleB_mode=mode,
     )
     torch.cuda.synchronize()
+
+
+@requires_fp8
+@requires_mxfp8
+@pytest.mark.parametrize(
+    "mode, rows, k",
+    [
+        pytest.param(ScaleMode.VEC32_UE8M0, 32, 256, id="unswizzled-32x256"),
+        pytest.param(ScaleMode.VEC32_UE8M0, 64, 768, id="unswizzled-64x768"),
+        pytest.param(ScaleMode.BLK32_UE8M0_32_8_EXT, 2, 256, id="swizzled-2x256"),
+        pytest.param(ScaleMode.BLK32_UE8M0_32_8_EXT, 33, 768, id="swizzled-33x768"),
+    ],
+)
+@pytest.mark.parametrize("out_dtype", [dtypes.bf16, dtypes.fp16])
+def test_hipb_mm_mxfp8_nonuniform_scales(mode, rows, k, out_dtype):
+    if mode == ScaleMode.BLK32_UE8M0_32_8_EXT and get_module(
+        "module_hipbsolgemm"
+    ).hipblaslt_build_version < (1, 3, 0):
+        pytest.skip("Swizzled MXFP8 requires hipBLASLt >=1.3")
+    # Unswizzled hipBLASLt kernels require aligned rows on older libraries.
+    # The swizzled cases retain small and odd rows with padded scale storage.
+    generator = torch.Generator(device="cuda").manual_seed(6582)
+    x = torch.randint(-2, 3, (rows, k), device="cuda", generator=generator).to(
+        dtypes.fp8
+    )
+    w = torch.randint(-2, 3, (128, k), device="cuda", generator=generator).to(
+        dtypes.fp8
+    )
+    blocks = torch.arange(k // 32, device="cuda")[None, :]
+    # Both operands vary by row and K block, with different scale patterns.
+    # E8M0 stores an exponent with bias 127; these bytes represent 0.25..4.
+    exp_a = (torch.arange(rows, device="cuda")[:, None] + blocks) % 5 - 2
+    exp_b = (2 * torch.arange(128, device="cuda")[:, None] + 3 * blocks) % 5 - 2
+    scale_a = (exp_a + 127).to(dtypes.u8)
+    scale_b = (exp_b + 127).to(dtypes.u8)
+    ref = (
+        (x.float() * torch.exp2(exp_a.float()).repeat_interleave(32, dim=1))
+        @ (w.float() * torch.exp2(exp_b.float()).repeat_interleave(32, dim=1)).t()
+    ).to(out_dtype)
+    if mode == ScaleMode.BLK32_UE8M0_32_8_EXT:
+        # Odd rows exercise the padded scale layout used by the full sweep.
+        scale_a = shuffle_scale(scale_a)
+        scale_b = shuffle_scale(scale_b)
+    out = aiter.hipb_mm(
+        x,
+        w.t(),
+        solution_index=-1,
+        out_dtype=out_dtype,
+        scaleA=scale_a,
+        scaleB=scale_b,
+        scaleA_mode=mode,
+        scaleB_mode=mode,
+    )
+    assertAllclose(
+        ref, out, rtol=1e-2, atol=1e-2, tol_err_ratio=0, catastrophic_check=True
+    )
 
 
 if __name__ == "__main__":
