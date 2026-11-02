@@ -16,6 +16,7 @@ pre-folded ``score_weight``, and an online softmax mixes the raw values.
 import math
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Literal
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -25,6 +26,7 @@ from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, Stream, T
 
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from . import dpp_utils
@@ -53,9 +55,8 @@ _SOURCE_GROUP_SIZE = 2
 _WIDE_ROW_THREADS = 256
 _WIDE_SOURCE_PREFETCH_IN_FLIGHT = 1
 _WIDE_SOURCE_GROUP_SIZE = 1
-# Butterfly used by ``_wave_reduce_add_f32``: "auto" | "swizzle" | "dpp".
 # Changing this constant requires _build_attn_res.cache_clear().
-_WAVE_REDUCE_MODE = "auto"
+_WAVE_REDUCE_MODE: Literal["auto", "swizzle", "dpp"] = "auto"
 _LOG2E = math.log2(math.e)
 _DPP_QUAD_XOR1 = 0xB1
 _DPP_QUAD_XOR2 = 0x4E
@@ -126,8 +127,18 @@ def _dpp_row_f32(
     return fx.Int32(peer).bitcast(fx.Float32)
 
 
-def _wave_reduce_to_one_lane_f32(value, fastmath):
-    """Wave64 sum via a ``row_shr`` cascade into ``row_bcast``.
+def _combine_f32(a, b, op: str, fastmath):
+    """``max`` treats zero as identity, so inputs must be non-negative.
+
+    Masked DPP lanes and idle LDS slots read zero.
+    """
+    if op == "max":
+        return a.maximumf(b)
+    return a.addf(b, fastmath=fastmath)
+
+
+def _wave_reduce_to_one_lane_f32(value, fastmath, op: str = "add"):
+    """Wave64 sum or max via a ``row_shr`` cascade into ``row_bcast``.
 
     Lane 63 holds the total; ``readlane`` moves it into an SGPR, so the
     result is wave-uniform and every lane can consume it without a
@@ -140,24 +151,18 @@ def _wave_reduce_to_one_lane_f32(value, fastmath):
         _DPP_ROW_SHR4,
         _DPP_ROW_SHR8,
     ):
-        reduced = reduced.addf(
-            _dpp_row_f32(reduced, dpp_ctrl),
-            fastmath=fastmath,
-        )
-    reduced = reduced.addf(
-        _dpp_row_f32(reduced, _DPP_ROW_BCAST15, _DPP_ROW_BCAST15_MASK),
-        fastmath=fastmath,
-    )
-    reduced = reduced.addf(
-        _dpp_row_f32(reduced, _DPP_ROW_BCAST31, _DPP_ROW_BCAST31_MASK),
-        fastmath=fastmath,
-    )
+        reduced = _combine_f32(reduced, _dpp_row_f32(reduced, dpp_ctrl), op, fastmath)
+    for dpp_ctrl, row_mask in (
+        (_DPP_ROW_BCAST15, _DPP_ROW_BCAST15_MASK),
+        (_DPP_ROW_BCAST31, _DPP_ROW_BCAST31_MASK),
+    ):
+        peer = _dpp_row_f32(reduced, dpp_ctrl, row_mask)
+        reduced = _combine_f32(reduced, peer, op, fastmath)
     bits = reduced.bitcast(fx.Int32)
     return fx.Int32(fx.rocdl.readlane(T.i32, bits, 63)).bitcast(fx.Float32)
 
 
-def _wave_reduce_add_f32(value, mode: str, fastmath):
-    """Wave64 sum. ``dpp`` uses VALU DPP for offsets <= 8; ``swizzle`` uses shuffle_xor."""
+def _wave_reduce_f32(value, mode: str, fastmath, op: str = "add"):
     reduced = value
     for shift_exp in range_constexpr(int(math.log2(_WARP_SIZE))):
         offset = _WARP_SIZE // (2 << shift_exp)
@@ -165,12 +170,12 @@ def _wave_reduce_add_f32(value, mode: str, fastmath):
             peer = _dpp_xor_f32(reduced, offset)
         else:
             peer = reduced.shuffle_xor(offset, _WARP_SIZE)
-        reduced = reduced.addf(peer, fastmath=fastmath)
+        reduced = _combine_f32(reduced, peer, op, fastmath)
     return reduced
 
 
-def _narrow_dpp_reduce_add_f32(value, red_slots: int, fastmath):
-    """Sum the first ``red_slots`` lanes (rest already zero) and broadcast lane 0.
+def _narrow_dpp_reduce_f32(value, red_slots: int, fastmath, op: str = "add"):
+    """Reduce the first ``red_slots`` lanes (rest already zero) and broadcast lane 0.
 
     Offsets 32/16/8 of a wave64 butterfly add zeros when ``red_slots <= 8``.
     The remaining tree (span/2 .. 1) fits DPP; ``v_readfirstlane`` replaces
@@ -187,10 +192,24 @@ def _narrow_dpp_reduce_add_f32(value, red_slots: int, fastmath):
     for shift_exp in range_constexpr(int(math.log2(span))):
         offset = span // (2 << shift_exp)
         peer = _dpp_xor_f32(reduced, offset)
-        reduced = reduced.addf(peer, fastmath=fastmath)
+        reduced = _combine_f32(reduced, peer, op, fastmath)
     bits = reduced.bitcast(fx.Int32)
     broadcast = fx.Int32(fx.rocdl.readfirstlane(T.i32, bits))
     return broadcast.bitcast(fx.Float32)
+
+
+def _pack_fp8(values, width: int):
+    """Bytes are the arch's e4m3 variant, matching ``dtypes.fp8``."""
+    words = []
+    for word in range_constexpr(width // 4):
+        lo = fx.rocdl.cvt_pk_fp8_f32(
+            T.i32, values[4 * word], values[4 * word + 1], fx.Int32(0), False
+        )
+        hi = fx.rocdl.cvt_pk_fp8_f32(
+            T.i32, values[4 * word + 2], values[4 * word + 3], lo, True
+        )
+        words.append(fx.Int32(hi))
+    return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Int8)
 
 
 def _wide_row_supported(hidden_size: int) -> bool:
@@ -256,6 +275,7 @@ class _AttnResSpec:
     scale: float
     rows_per_wg: int
     wide_grid: bool
+    fp8_dtype: torch.dtype | None = None
 
     @property
     def kernel_name(self) -> str:
@@ -263,6 +283,7 @@ class _AttnResSpec:
             f"{KERNEL_NAME}_d{self.hidden_size}_b{self.num_blocks}"
             f"_r{self.rows_per_wg}_add{int(self.has_add) + int(self.has_add2)}"
             f"_close{int(self.close_block)}_onorm{int(self.output_norm)}"
+            f"{'_fp8' if self.fp8_dtype is not None else ''}"
             f"{'_wide' if self.wide_grid else ''}"
         )
 
@@ -280,6 +301,8 @@ def _build_attn_res(spec: _AttnResSpec):
     output_rms_eps = spec.output_rms_eps
     scale = spec.scale
     wide_grid = spec.wide_grid
+    fp8 = spec.fp8_dtype is not None
+    fp8_max = torch.finfo(spec.fp8_dtype).max if fp8 else 1.0
     if hidden_size <= 0 or hidden_size % _VEC_WIDTH:
         raise ValueError(f"D={hidden_size} must be a positive multiple of {_VEC_WIDTH}")
     if not 0 <= num_blocks <= _MAX_BLOCKS:
@@ -356,6 +379,7 @@ def _build_attn_res(spec: _AttnResSpec):
         score_weight: fx.Tensor,
         output_rms_weight: fx.Tensor,
         y: fx.Tensor,
+        y_scale: fx.Tensor,
         prefix_out: fx.Tensor,
         block_out: fx.Tensor,
         num_tokens: fx.Int32,
@@ -395,16 +419,13 @@ def _build_attn_res(spec: _AttnResSpec):
                 has_side_effects=True,
             )
 
-        def wave_reduce_add(value):
-            return _wave_reduce_add_f32(value, wave_reduce_mode, fm_fast)
+        def store_reduce(value, op="add"):
+            return _wave_reduce_to_one_lane_f32(value, fm_fast, op)
 
-        def store_reduce_add(value):
-            return _wave_reduce_to_one_lane_f32(value, fm_fast)
-
-        def finish_reduce(value):
+        def finish_reduce(value, op="add"):
             if const_expr(use_dpp_finish):
-                return _narrow_dpp_reduce_add_f32(value, red_slots, fm_fast)
-            return wave_reduce_add(value)
+                return _narrow_dpp_reduce_f32(value, red_slots, fm_fast, op)
+            return _wave_reduce_f32(value, wave_reduce_mode, fm_fast, op)
 
         def store_pair_partials(sumsq_local, dot_local, slot, buf):
             """Wave-reduce and write LDS partials. No barrier."""
@@ -412,8 +433,8 @@ def _build_attn_res(spec: _AttnResSpec):
             s_dot = fx.slice(s_dot_all, (buf, slot, None))
             lane = local_tid % _WARP_SIZE
             wave = local_tid // _WARP_SIZE
-            sumsq_wave = store_reduce_add(sumsq_local)
-            dot_wave = store_reduce_add(dot_local)
+            sumsq_wave = store_reduce(sumsq_local)
+            dot_wave = store_reduce(dot_local)
             if lane == 0:
                 fx.memref_store(sumsq_wave, s_sumsq, wave)
                 fx.memref_store(dot_wave, s_dot, wave)
@@ -433,32 +454,29 @@ def _build_attn_res(spec: _AttnResSpec):
 
         def block_reduce_add2(sumsq_local, dot_local, buf, slot):
             if const_expr(red_slots == 1):
-                return store_reduce_add(sumsq_local), store_reduce_add(dot_local)
+                return store_reduce(sumsq_local), store_reduce(dot_local)
             store_pair_partials(sumsq_local, dot_local, slot, buf)
             fx.gpu.barrier()
             return finish_pair_reduce(slot, buf)
 
-        def block_reduce_add(value, buf, slot):
+        def block_reduce(value, s_all, buf, op):
             if const_expr(red_slots == 1):
-                return store_reduce_add(value)
+                return store_reduce(value, op)
 
-            # Keep this structurally aligned with the pair reduce. The output
-            # RMSNorm epilogue has one payload, so reducing a dummy zero through
-            # s_dot would spend shuffles and LDS traffic for no result.
-            s_sumsq = fx.slice(s_sumsq_all, (buf, slot, None))
+            s_partials = fx.slice(s_all, (buf, 0, None))
             lane = local_tid % _WARP_SIZE
             wave = local_tid // _WARP_SIZE
-            wave_total = store_reduce_add(value)
+            wave_total = store_reduce(value, op)
 
             if lane == 0:
-                fx.memref_store(wave_total, s_sumsq, wave)
+                fx.memref_store(wave_total, s_partials, wave)
             fx.gpu.barrier()
 
             in_range = lane < red_slots
             lane_safe = in_range.select(lane, 0)
-            partial = fx.memref_load(s_sumsq, lane_safe)
+            partial = fx.memref_load(s_partials, lane_safe)
             partial = in_range.select(partial, zero)
-            return finish_reduce(partial)
+            return finish_reduce(partial, op)
 
         copy_atoms = {
             width: fx.make_copy_atom(copy_op(), fx.BFloat16)
@@ -497,6 +515,35 @@ def _build_attn_res(spec: _AttnResSpec):
                 copy_atoms[width],
                 register,
                 fx.slice(divided[width], (None, vector_index_for(tile))),
+            )
+
+        fp8_atoms = {
+            width: fx.make_copy_atom(copy_op(), fx.Int8)
+            for width, copy_op in (
+                (_VEC_WIDTH, fx.rocdl.BufferCopy64b),
+                (_TAIL_VEC_WIDTH, fx.rocdl.BufferCopy32b),
+            )
+            if width in tile_widths
+        }
+
+        def store_fp8_vec(value, divided, tile):
+            width = tile_widths[tile]
+            register = fx.make_rmem_tensor(width, fx.Int8)
+            fx.memref_store_vec(_pack_fp8(value, width), register)
+            fx.copy(
+                fp8_atoms[width],
+                register,
+                fx.slice(divided[width], (None, vector_index_for(tile))),
+            )
+
+        def store_scale(value):
+            register = fx.make_rmem_tensor(1, fx.Float32)
+            fx.memref_store_vec(fx.full(1, value, fx.Float32), register)
+            scale_row = fx.slice(fx.rocdl.make_buffer_tensor(y_scale), (token, None))
+            fx.copy(
+                fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32),
+                register,
+                fx.slice(fx.logical_divide(scale_row, fx.make_layout(1, 1)), (None, 0)),
             )
 
         def row_of(buffer, *index):
@@ -684,14 +731,16 @@ def _build_attn_res(spec: _AttnResSpec):
                     if const_expr(wide_grid):
                         pin_registers(mixed_local)
 
+            # Use the LDS half the last group did not touch, so epilogue writes
+            # cannot race waves still reading it.
+            epilogue_buf = num_groups % 2
             if const_expr(output_norm):
                 thread_sumsq = zero
                 for tile in range_constexpr(tiles_per_thread):
                     thread_sumsq = thread_sumsq + (
                         mixed_local[tile] * mixed_local[tile]
                     ).reduce(ReductionOp.ADD, fastmath=fm_fast)
-                # Last group used (num_groups-1)%2; epilogue takes the other half.
-                sumsq = block_reduce_add(thread_sumsq, num_groups % 2, 0)
+                sumsq = block_reduce(thread_sumsq, s_sumsq_all, epilogue_buf, "add")
                 norm_scale = fmath.rsqrt(
                     sumsq * inv_hidden_size
                     + output_rms_eps * denominator * denominator,
@@ -701,17 +750,37 @@ def _build_attn_res(spec: _AttnResSpec):
                 output_rms_weight_div = divide_row(
                     fx.rocdl.make_buffer_tensor(output_rms_weight)
                 )
-                for tile in range_constexpr(tiles_per_thread):
+
+                def y_tile(tile):
                     output_gamma = load_bf16_vec(output_rms_weight_div, tile).to(
                         fx.Float32
                     )
-                    result = mixed_local[tile] * norm_scale * output_gamma
-                    store_bf16_vec(result.to(fx.BFloat16), y_div, tile)
+                    return mixed_local[tile] * norm_scale * output_gamma
+
             else:
                 inverse_denominator = 1.0 / denominator
+
+                def y_tile(tile):
+                    return mixed_local[tile] * inverse_denominator
+
+            if const_expr(fp8):
+                y_local = [y_tile(tile) for tile in range_constexpr(tiles_per_thread)]
+                thread_amax = zero
                 for tile in range_constexpr(tiles_per_thread):
-                    result = (mixed_local[tile] * inverse_denominator).to(fx.BFloat16)
-                    store_bf16_vec(result, y_div, tile)
+                    thread_amax = thread_amax.maximumf(
+                        fmath.absf(y_local[tile]).reduce(ReductionOp.MAX)
+                    )
+                amax = block_reduce(thread_amax, s_dot_all, epilogue_buf, "max")
+                # amax * (1 / fp8_max), not a divide, matches the HIP per-token quant.
+                row_scale = amax * (1.0 / fp8_max)
+                inverse_scale = (row_scale > zero).select(1.0 / row_scale, zero)
+                for tile in range_constexpr(tiles_per_thread):
+                    store_fp8_vec(y_local[tile] * inverse_scale, y_div, tile)
+                if local_tid == 0:
+                    store_scale(row_scale)
+            else:
+                for tile in range_constexpr(tiles_per_thread):
+                    store_bf16_vec(y_tile(tile).to(fx.BFloat16), y_div, tile)
 
         if const_expr(rows_per_wg == 1):
             run_row()
@@ -728,6 +797,7 @@ def _build_attn_res(spec: _AttnResSpec):
         score_weight: fx.Tensor,
         output_rms_weight: fx.Tensor,
         y: fx.Tensor,
+        y_scale: fx.Tensor,
         prefix_out: fx.Tensor,
         block_out: fx.Tensor,
         num_tokens: fx.Int32,
@@ -741,6 +811,7 @@ def _build_attn_res(spec: _AttnResSpec):
             score_weight,
             output_rms_weight,
             y,
+            y_scale,
             prefix_out,
             block_out,
             num_tokens,
@@ -832,8 +903,11 @@ def flydsl_attn_res(
         raise ValueError("add_hidden2 requires add_hidden")
     if out_quant_dtype is not None and output_rms_weight is None:
         raise ValueError("out_quant_dtype requires output_rms_weight")
-    if out_quant_dtype is not None:
-        raise NotImplementedError("out_quant_dtype is not supported yet")
+    if out_quant_dtype is not None and out_quant_dtype != dtypes.fp8:
+        raise ValueError(
+            f"out_quant_dtype must be the arch-native FP8 type {dtypes.fp8}, "
+            f"got {out_quant_dtype}"
+        )
 
     hidden_size = prefix.shape[-1]
     if block_residual.ndim < 2 or block_residual.shape[-1] != hidden_size:
@@ -897,8 +971,19 @@ def flydsl_attn_res(
             _check_row_layout(tensor, name)
 
     num_tokens = rows.shape[0]
-    y = torch.empty_like(rows, memory_format=torch.contiguous_format)
-    prefix_out = torch.empty_like(y) if add_hidden is not None else rows
+    y = torch.empty(
+        rows.shape, device=prefix.device, dtype=out_quant_dtype or prefix.dtype
+    )
+    y_scale = (
+        torch.empty((num_tokens, 1), device=prefix.device, dtype=torch.float32)
+        if out_quant_dtype is not None
+        else None
+    )
+    prefix_out = (
+        torch.empty(rows.shape, device=prefix.device, dtype=prefix.dtype)
+        if add_hidden is not None
+        else rows
+    )
     block_out = (
         torch.empty(
             (num_tokens, num_blocks + 1, hidden_size),
@@ -931,11 +1016,14 @@ def flydsl_attn_res(
             scale=float(scale),
             rows_per_wg=rows_per_wg,
             wide_grid=wide_grid,
+            fp8_dtype=out_quant_dtype,
         )
-        _launch(spec, tensors, y, prefix_out, block_out, stream)
+        _launch(spec, tensors, y, y_scale, prefix_out, block_out, stream)
 
     leading = prefix.shape[:-1]
     y_result = y.view(prefix.shape)
+    if y_scale is not None:
+        y_result = (y_result, y_scale.view(*leading, 1))
     prefix_result = prefix if add_hidden is None else prefix_out.view(prefix.shape)
     if not close_block:
         return y_result, prefix_result
@@ -946,7 +1034,7 @@ def flydsl_attn_res(
     )
 
 
-def _launch(spec, tensors, y, prefix_out, block_out, stream) -> None:
+def _launch(spec, tensors, y, y_scale, prefix_out, block_out, stream) -> None:
     rows = tensors["prefix"]
     with torch.cuda.device(rows.device):
         launch_stream = (
@@ -964,13 +1052,14 @@ def _launch(spec, tensors, y, prefix_out, block_out, stream) -> None:
             tensors["block_residual"] if spec.num_blocks else rows,
             tensors["score_weight"],
             tensors.get("output_rms_weight", rows),
-            y,
+            y if y_scale is None else y.view(torch.int8),
+            rows if y_scale is None else y_scale,
             prefix_out,
             rows if block_out is None else block_out,
             rows.shape[0],
             Stream(launch_stream),
         )
         if stream is not None:
-            for output in (y, prefix_out, block_out):
+            for output in (y, y_scale, prefix_out, block_out):
                 if output is not None and output is not rows:
                     output.record_stream(launch_stream)
