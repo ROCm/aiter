@@ -1453,7 +1453,13 @@ def mla_decode_fwd(
 
             o = o.view(total_s, nhead, -1)
 
-            qo_indptr = _fold_seqlen_indptr(qo_indptr, fold_factor)
+            qo_indptr = torch.arange(
+                0,
+                (bs * fold_factor + 1) * max_seqlen_q,
+                max_seqlen_q,
+                dtype=qo_indptr.dtype,
+                device=device,
+            )
             if g_kv_indptr is not None:
                 g_kv_indptr = _fold_seqlen_indptr(g_kv_indptr, fold_factor)
                 # Each pseudo-batch shares the original batch's local kv begin.
