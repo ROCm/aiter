@@ -4,6 +4,8 @@
 """Correctness tests for QSA quantized cache writes, scoring, selection and
 sparse paged GQA."""
 
+import functools
+
 import pytest
 import torch
 
@@ -515,7 +517,9 @@ def test_qsa_scorers_reject_scale_planes_that_do_not_match_the_cache():
         qsa_sparse_paged_gqa(q, bf16, bf16, *args, k_scale=scale, v_scale=scale)
 
 
-def _index_case(requests, context, rows_per_request, page_rows, seed=2):
+def _index_case(
+    requests, context, rows_per_request, page_rows, seed=2, heads=4, dim=128
+):
     g = torch.Generator(device="cuda").manual_seed(seed)
     groups = context // 4
     pages_per_request = -(-groups // page_rows)
@@ -523,12 +527,12 @@ def _index_case(requests, context, rows_per_request, page_rows, seed=2):
     order = torch.randperm(pages, device="cuda", generator=g).to(torch.int32)
     table = order[: requests * pages_per_request].view(requests, pages_per_request)
     keys = torch.randn(
-        pages * page_rows, 1, 128, dtype=torch.float32, device="cuda", generator=g
+        pages * page_rows, 1, dim, dtype=torch.float32, device="cuda", generator=g
     )
     q = torch.randn(
         requests * rows_per_request,
-        4,
-        128,
+        heads,
+        dim,
         dtype=torch.float32,
         device="cuda",
         generator=g,
@@ -558,8 +562,11 @@ def _index_reference(q, restored, table, t2r, columns):
     ("rows_per_request", "stacked", "page_rows"),
     [(4, True, 4), (4, False, 4), (4, True, 16), (256, True, 4), (256, True, 16)],
 )
+@pytest.mark.parametrize(
+    ("heads", "dim"), [(4, 128), (4, 32), (4, 64), (4, 256), (1, 128), (2, 128)]
+)
 def test_qsa_quantized_index_scores_match_dequantized_keys(
-    fmt, rows_per_request, stacked, page_rows
+    fmt, rows_per_request, stacked, page_rows, heads, dim
 ):
     """Every scorer (stacked decode, CUDA-core decode, prefill MFMA) scores a
     quantized page as FP32 math on its dequantized keys would."""
@@ -567,7 +574,7 @@ def test_qsa_quantized_index_scores_match_dequantized_keys(
 
     requests = 9 if rows_per_request == 4 else 2
     keys, q, table, t2r, positions, lens = _index_case(
-        requests, 8192, rows_per_request, page_rows
+        requests, 8192, rows_per_request, page_rows, heads=heads, dim=dim
     )
     cache, scale = _store(fmt, keys, page_rows)
     out, visible = qsa_paged_mqa_logits(
@@ -581,7 +588,7 @@ def test_qsa_quantized_index_scores_match_dequantized_keys(
         compressed_k_scale=scale,
         stacked_decode=stacked,
     )
-    restored = _dequant(fmt, cache, scale).view(-1, page_rows, 128)
+    restored = _dequant(fmt, cache, scale).view(-1, page_rows, dim)
     ref = _index_reference(q, restored, table, t2r, out.shape[1])
     expected = torch.minimum((positions + 1) // 4, lens[t2r.long()] // 4)
     assert torch.equal(visible, expected.to(visible.dtype))
@@ -638,8 +645,28 @@ def test_qsa_quantized_index_topk_matches_reference(fmt, rows_per_request, stack
         assert (scores[groups.long()] >= threshold - 1e-3 * threshold.abs()).all()
 
 
+@pytest.fixture
+def without_qsa_config(monkeypatch):
+    """Run as on an arch with no `configs/<arch>/triton/attention/qsa`."""
+    from aiter.ops.triton.attention import qsa
+    from aiter.ops.triton.utils.config_utils import resolve_config_dir
+
+    # gfx1100 has Triton attention configs, but none for QSA.
+    monkeypatch.setattr(
+        qsa, "resolve_config_dir", functools.partial(resolve_config_dir, arch="gfx1100")
+    )
+    qsa._tuned_tile.cache_clear()
+    assert qsa._tuned_tile("gqa_fp8", "decode") is None
+    yield
+    qsa._tuned_tile.cache_clear()
+
+
+@pytest.mark.parametrize("config", ["arch", "missing"])
 @pytest.mark.parametrize(("tokens", "requests"), [(36, 9), (1024, 1)])
-def test_qsa_fp8_sparse_gqa_matches_dequantized_kv(tokens, requests):
+def test_qsa_fp8_sparse_gqa_matches_dequantized_kv(tokens, requests, config, request):
+    """Also without a QSA config for the arch: FP8 K/V then use `_kernel_config`."""
+    if config == "missing":
+        request.getfixturevalue("without_qsa_config")
     from aiter.ops.qsa import (
         FP8_DTYPE,
         qsa_sparse_paged_gqa,
@@ -818,6 +845,21 @@ def test_qsa_stacked_scorer_matches_cuda_core(page_size, rows_per_request):
             out[stacked], _seen(ref, visible), rtol=1e-4, atol=1e-4
         )
     torch.testing.assert_close(out[True], out[False], rtol=5e-5, atol=5e-5)
+
+
+def test_qsa_stacked_decode_falls_back_without_a_tile(without_qsa_config):
+    from aiter.ops.qsa import qsa_paged_mqa_logits
+
+    case = _stacked_case(4, 16, [4103, 37, 1990])
+    ref, ref_visible = _stacked_reference(*case)
+    (logits, visible), kernels = _launched_kernels(
+        qsa_paged_mqa_logits, *case, compress_ratio=_STACKED_RATIO, stacked_decode=True
+    )
+    assert not any("_stacked" in name for name in kernels), sorted(kernels)
+    assert torch.equal(visible, ref_visible)
+    torch.testing.assert_close(
+        _seen(logits, visible), _seen(ref, visible), rtol=1e-4, atol=1e-4
+    )
 
 
 def test_qsa_stacked_scorer_respects_max_columns():

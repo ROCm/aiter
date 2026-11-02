@@ -249,10 +249,12 @@ _SCORING_COLUMN_PROGRAMS = 64
 
 
 @functools.lru_cache(maxsize=1024)
-def _tuned_tile(kernel: str, case: str) -> dict:
-    """`kernel[case]` of `configs/<arch>/triton/attention/qsa/DEFAULT.json`."""
+def _tuned_tile(kernel: str, case: str) -> dict | None:
+    """`kernel[case]` of `configs/<arch>/triton/attention/qsa/DEFAULT.json`,
+    None on an arch without that file."""
     cfg_dir = resolve_config_dir("attention", "QSA", backend="triton")
-    return load_config_json(f"{cfg_dir}/DEFAULT.json")[kernel][case]
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+    return None if table is None else table[kernel][case]
 
 
 def _check_vector(name: str, tensor: torch.Tensor, length: int | None = None) -> None:
@@ -291,7 +293,8 @@ def qsa_paged_mqa_logits(
 
     `stacked_decode` scores decode-sized calls (<= 256 rows) with an MFMA
     kernel that stacks each row's heads into M, so a request's keys are read
-    once per call rather than once per row.
+    once per call rather than once per row. An arch without a QSA config
+    (`configs/<arch>/triton/attention/qsa`) scores those calls as without it.
     """
     if q.ndim != 3 or q.shape[1] <= 0 or q.shape[2] <= 0:
         raise ValueError("q must have shape [tokens, heads, head_dim]")
@@ -360,6 +363,7 @@ def qsa_paged_mqa_logits(
         and head_dim >= 16
     ):
         tile = _tuned_tile("stacked_decode", QSA_CACHE_FORMATS[key_fmt])
+    # No stacked tile for this arch, or too few heads to fill M: other kernels.
     if tile is not None and tile["BMT"] * heads >= 16:
         bmt, bn = tile["BMT"], tile["BN"]
         _qsa_paged_mqa_logits_stacked_kernel[
@@ -622,9 +626,12 @@ def qsa_sparse_paged_gqa(
     block_n, num_warps, num_stages, waves_per_eu, sub_group = _kernel_config(
         q.shape[0], k_cache.shape[2], kv_splits, group_size
     )
+    tile = None
     if kv_fp8:
         phase = "prefill" if num_decode_requests is None else "decode"
         tile = _tuned_tile("gqa_fp8", phase)
+    # Without an FP8 tile for this arch, FP8 K/V keep `_kernel_config`.
+    if tile is not None:
         block_n, num_warps = tile["BLOCK_N"], tile["num_warps"]
         num_stages, waves_per_eu = tile["num_stages"], tile["waves_per_eu"]
     num_head_groups = (group_size + sub_group - 1) // sub_group
