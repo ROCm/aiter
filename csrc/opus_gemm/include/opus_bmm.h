@@ -11,7 +11,7 @@
 // fp8 e8m0 mxscale (block-scale) BMM (zero-copy DSV4 wo_a): O/Y are [M, batch,
 // *], wo_a/w_scale batch-major. Y dtype in {fp32, bf16}. dim0=M, dim1=batch (K
 // contiguous); the batch axis memory position is otherwise free (see host
-// stride checks). The global kid is exact: no fallback or redirect is allowed.
+// stride checks). The local kid is exact: no fallback or redirect is allowed.
 void opus_gemm_a8w8_mxscale_bmm_launch(
     aiter_tensor_t& XQ,
     aiter_tensor_t& WQ,

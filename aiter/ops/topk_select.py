@@ -80,6 +80,11 @@ __all__ = ["topk_select", "topk_select_backend"]
 _SUPPORTED_GFX = ("gfx942", "gfx950", "gfx1250")
 
 _PLAIN_MAX_K = 2048
+# Where plain's module builds. Its kernels are wave64 code -- for gfx1250 the
+# build stops at topk_plain_kernels.cu's `>= 2 * opus::get_warp_size()`
+# static_asserts -- and the questions `_available` and the shape rules ask of it
+# live in the same module, so elsewhere plain is neither offered nor asked.
+_PLAIN_ARCHES = ("gfx942", "gfx950")
 # Which backends can promise a column order among equal scores. `plain` appears
 # in no list: its tie order falls out of its internal geometry.
 #
@@ -575,7 +580,11 @@ def _available(
         return frozenset(out)
     if topk_per_row_small_k_serves(k, width, wave_size) is None:
         out.add("small_k")
-    if k <= _PLAIN_MAX_K and topk_plain_batches_ragged_rows(width, k):
+    if (
+        arch in _PLAIN_ARCHES
+        and k <= _PLAIN_MAX_K
+        and topk_plain_batches_ragged_rows(width, k)
+    ):
         # plain's radix path only: it is the build that writes no values and
         # ranks a NaN of either sign above +inf, as the other backends do. The
         # block-sort fallback does neither, and for ranged rows it is a

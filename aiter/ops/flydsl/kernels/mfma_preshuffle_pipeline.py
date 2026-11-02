@@ -396,22 +396,26 @@ def xcd_remap_bx_by(
     _clip = (_xcd < _r).select(_xcd, _r)
     _wgid = _xcd * _q + _clip + _in_xcd
 
-    _num_wgid_in_group = xcd_swizzle * grid_n
-    _group_id = _wgid // _num_wgid_in_group
-    _first_pid_m = _group_id * xcd_swizzle
-    _remaining_m = _gy - _first_pid_m
-    _group_size_m = (_remaining_m < xcd_swizzle).select(_remaining_m, xcd_swizzle)
+    return group_m_major(_wgid, _gy, grid_n, fx.Index(xcd_swizzle))
 
-    _wgid_in_group = _wgid % _num_wgid_in_group
-    new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
-    new_by = _wgid_in_group // _group_size_m
-    return new_bx, new_by
+
+def group_m_major(wgid, grid_m, grid_n, group):
+    """(bx, by) of the ``wgid``-th tile of a grid_m x grid_n run re-tiled
+    M-major in groups of ``group`` M tiles; the last group holds what is left.
+    ``group`` is a DSL value of ``wgid``'s type, ``grid_n`` may be an int."""
+    num_wgid_in_group = group * grid_n
+    first_pid_m = wgid // num_wgid_in_group * group
+    remaining_m = grid_m - first_pid_m
+    group_size_m = (remaining_m < group).select(remaining_m, group)
+    wgid_in_group = wgid % num_wgid_in_group
+    return first_pid_m + wgid_in_group % group_size_m, wgid_in_group // group_size_m
 
 
 __all__ = [
     "PreshuffleBLayout",
     "PreshuffleScaleLayout",
     "buffer_copy_gmem16_dwordx4",
+    "group_m_major",
     "lds_store_4b_xor16",
     "lds_store_8b_xor16",
     "lds_store_16b_xor16",

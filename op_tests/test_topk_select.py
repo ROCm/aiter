@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 from contextlib import contextmanager
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -502,6 +503,8 @@ def test_plain_pitch_in_place():
     dev = torch.cuda.current_device()
     wave = wave_size_of(dev)
     failures, checked, copies = [], 0, []
+    if _device_arch(dev) not in ts._PLAIN_ARCHES:
+        return failures
     real = torch.Tensor.contiguous
 
     def spy(t, *args, **kwargs):
@@ -1248,6 +1251,93 @@ def test_arch_decisions():
     return failures
 
 
+class _PlainAsked(Exception):
+    pass
+
+
+def test_plain_off_its_arches():
+    """Off `_PLAIN_ARCHES` -- gfx1250, wave32, where plain's module does not
+    build -- the dispatch neither picks plain nor asks its module anything:
+    asking builds the module, and that build fails. Run as gfx1250 on whatever
+    GPU this is, since the routing is host code."""
+    import aiter.ops.topk as tk
+    import aiter.ops.topk_plain as tp
+    import aiter.ops.topk_select as ts
+
+    failures, asked = [], []
+
+    def refuse(name):
+        def ask(*args, **kwargs):
+            asked.append(name)
+            raise _PlainAsked(name)
+
+        return ask
+
+    def clear():
+        for mod in (ts, tp):
+            for v in vars(mod).values():
+                if hasattr(v, "cache_clear"):
+                    v.cache_clear()
+
+    names = (
+        "_topk_plain",
+        "topk_plain",
+        "topk_plain_batches_ragged_rows",
+        "topk_plain_reads_pitch",
+        "topk_plain_use_mulblocks",
+        "topk_plain_uses_radix",
+        "topk_plain_width",
+        "topk_plain_workspace_size",
+    )
+    patches = [
+        mock.patch.object(mod, name, refuse(name))
+        for mod in (tp, ts)
+        for name in names
+        if hasattr(mod, name)
+    ]
+    patches += [
+        mock.patch.object(mod, "_device_arch", lambda device: "gfx1250")
+        for mod in (tk, ts)
+    ]
+    dev = torch.cuda.current_device()
+    clear()
+    try:
+        for p in patches:
+            p.start()
+        for rows in (1, 64, 4096):
+            for width in (2048, 4096, 32768, 131072, 1048576):
+                for k in (1, 16, 512, 1024, 2048):
+                    for ragged in (False, True):
+                        for tie, det in ((None, False), ("low", False), (None, True)):
+                            label = f"{rows}x{width} k={k} ragged={ragged} tie={tie}"
+                            try:
+                                got = ts._choose.__wrapped__(
+                                    rows,
+                                    width,
+                                    width,
+                                    k,
+                                    32,
+                                    ragged,
+                                    tie,
+                                    det,
+                                    True,
+                                    dev,
+                                    True,
+                                )
+                            except _PlainAsked as e:
+                                failures.append(f"{label} det={det}: asked {e}")
+                                continue
+                            if got == "plain":
+                                failures.append(f"{label} det={det}: chose plain")
+    finally:
+        for p in reversed(patches):
+            p.stop()
+        clear()
+    for label in failures[:8]:
+        aiter.logger.error("PLAIN OFF ITS ARCHES FAILED: %s", label)
+    return failures
+
+
 def test_invariants(m, n, k):
     """The properties a value comparison cannot see."""
     failures = []
@@ -1467,6 +1557,12 @@ def main():
         "arch decisions: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"arch decisions: {len(bad)} failed"
+    bad = test_plain_off_its_arches()
+    aiter.logger.info(
+        "plain off its arches: %s",
+        "all hold" if not bad else f"{len(bad)} FAILED: {bad[:4]}",
+    )
+    assert not bad, f"plain off its arches: {len(bad)} failed"
     bad = test_full_rows_graphs()
     aiter.logger.info(
         "full-rows graphs: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"

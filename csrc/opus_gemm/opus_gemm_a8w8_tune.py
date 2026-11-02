@@ -12,25 +12,27 @@ import torch
 
 from aiter import dtypes
 from aiter.ops.opus import opus_gemm
+from aiter.ops.opus._arch import _device_arch_and_cu
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from csrc.opus_gemm.opus_gemm_common import (
     canonical_output_dtype,
     get_kernel_instance,
-    kernels_list,
+    get_registry,
+    parse_integer,
 )
 
 _SUPPORTED_GFX = "gfx950"
 
 
-def candidate_kids_for_shape(gfx, m, n, k, scale_ab, outdtype="fp32"):
+def candidate_kids_for_shape(gfx, m, n, k, scale_ab, outdtype="fp32", *, cu_num):
     """Return registered plain A8W8 kids whose launch constraints fit the shape."""
     if min(m, n, k) <= 0 or k % 2:
         return []
     family = "a8w8_blockscale" if scale_ab else "a8w8"
     candidates = []
-    for kid in sorted(kernels_list):
-        instance = get_kernel_instance(gfx, family, kid, outdtype)
+    for kid in sorted(get_registry(family, gfx, cu_num)):
+        instance = get_kernel_instance(gfx, family, kid, outdtype, cu_num=cu_num)
         if instance is None:
             continue
         # These pipelines prime two K tiles and advance in pairs.
@@ -53,8 +55,9 @@ def candidate_kids_for_shape(gfx, m, n, k, scale_ab, outdtype="fp32"):
     return candidates
 
 
-def generate_data(m, n, k, kid, *, device):
-    instance = kernels_list[kid]
+def generate_data(m, n, k, kid, family="a8w8", *, device):
+    gfx, cu = _device_arch_and_cu(device)
+    instance = get_registry(family, gfx, cu)[kid]
     generator = torch.Generator(device=device).manual_seed(0)
     x = torch.randn((m, k), device=device, generator=generator).to(torch.float8_e4m3fn)
     w = torch.randn((n, k), device=device, generator=generator).to(torch.float8_e4m3fn)
@@ -92,7 +95,15 @@ def run_torch(x, w, x_scale, w_scale):
 
 
 def run_bench(x, w, out, x_scale, w_scale, kid):
-    opus_gemm(x, w, out, kid=kid, x_scale=x_scale, w_scale=w_scale)
+    opus_gemm(
+        x,
+        w,
+        out,
+        family="a8w8_blockscale" if x_scale is not None else "a8w8",
+        kid=kid,
+        x_scale=x_scale,
+        w_scale=w_scale,
+    )
     return out
 
 
@@ -249,17 +260,26 @@ class OpusA8W8Tuner(GemmCommonTuner):
     def tune(self, untunedf, tunedf, args):
         tasks, tasks_data = [], []
         for row in untunedf.itertuples(index=False):
+            family = "a8w8_blockscale" if row.scaleAB else "a8w8"
+            cu_num = int(row.cu_num)
             kids = candidate_kids_for_shape(
-                row.gfx, row.M, row.N, row.K, row.scaleAB, row.outdtype
+                row.gfx,
+                row.M,
+                row.N,
+                row.K,
+                row.scaleAB,
+                row.outdtype,
+                cu_num=cu_num,
             )
             if not kids:
                 raise ValueError(f"No OPUS A8W8 candidates for {row}")
+            kernels = get_registry(family, row.gfx, cu_num)
             for kid in kids:
                 tasks.append(
                     (
-                        (tuple(row), kid, 0, kernels_list[kid].name),
+                        (tuple(row), kid, 0, kernels[kid].name),
                         generate_data,
-                        (row.M, row.N, row.K, kid),
+                        (row.M, row.N, row.K, kid, family),
                         run_bench,
                         (_BENCH_KEYS, kid),
                         {"num_warmup": args.warmup, "num_iters": args.iters},
@@ -286,13 +306,27 @@ class OpusA8W8Tuner(GemmCommonTuner):
         )
 
     def getKernelName(self, kernel_id):
-        return kernels_list[kernel_id].name
+        return None
 
     def calculate(self, results, bpes=(1, 1, 4)):
         return super().calculate(results, bpes)
 
     def result_to_df(self, results):
-        df = super().result_to_df(results)
+        resolved = []
+        for info, time, err_ratio in results:
+            keys, kid, split_k, name = info
+            shape = dict(zip(self.keys, keys))
+            family = "a8w8_blockscale" if shape["scaleAB"] else "a8w8"
+            if name == "" or pd.isna(name):
+                instance = get_kernel_instance(
+                    shape["gfx"],
+                    family,
+                    int(kid),
+                    cu_num=int(shape["cu_num"]),
+                )
+                name = instance.name if instance is not None else "None"
+            resolved.append(((keys, kid, split_k, name), time, err_ratio))
+        df = super().result_to_df(resolved)
         df["libtype"] = "opus"
         return df[self.columns]
 
@@ -305,15 +339,29 @@ class OpusA8W8Tuner(GemmCommonTuner):
                 f"--run_config requires a tuned CSV with {sorted(missing)}"
             )
         results = []
+        gfx, cu_num = _device_arch_and_cu(torch.cuda.current_device())
         for row in self.untunedf.itertuples(index=False):
-            kid = row.kernelId
+            family = "a8w8_blockscale" if row.scaleAB else "a8w8"
+            if (row.gfx, int(row.cu_num)) != (gfx, cu_num):
+                raise ValueError("saved kernel namespace does not match tuning device")
+            kid = parse_integer(row.kernelId, name="saved kernel id")
             if row.splitK != 0:
                 raise ValueError(f"OPUS A8W8 kid {kid} requires splitK=0")
             if kid not in candidate_kids_for_shape(
-                row.gfx, row.M, row.N, row.K, row.scaleAB, row.outdtype
+                row.gfx,
+                row.M,
+                row.N,
+                row.K,
+                row.scaleAB,
+                row.outdtype,
+                cu_num=int(row.cu_num),
             ):
                 raise ValueError(f"Saved kid {kid} is incompatible with {row}")
-            data = generate_data(row.M, row.N, row.K, kid, device="cuda")
+            instance = get_registry(family, gfx, cu_num)[kid]
+            name = str(getattr(row, "kernelName", ""))
+            if name not in ("", "nan", "None") and name != instance.name:
+                raise ValueError(f"Saved symbol does not match kid {kid}")
+            data = generate_data(row.M, row.N, row.K, kid, family, device="cuda")
             ref = run_torch(*(data[key] for key in _REF_KEYS))
             data["out"].fill_(float("nan"))
             out, us = run_perftest(

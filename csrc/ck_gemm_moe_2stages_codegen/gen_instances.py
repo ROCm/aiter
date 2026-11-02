@@ -430,7 +430,11 @@ A16W16_gemm2_gfx950_heuristic_dispatch = """
     }}
 """
 
-# NOTE: temporarily not using KPerBlock=64 for inter_dim=192 cases due to gfx950 fp8 mfma instruction limitation
+# NOTE: KPerBlock=64 is not usable here. The kernel's 16x16 tile selects the
+# gfx950 fp8 MFMA that consumes 128 K elements, so inter_dim must be a
+# multiple of 128. block_m 32 and 64 use K=256 when 256 divides inter_dim,
+# and K=128 when only 128 does (for example 384). 192, 320, and 448 are
+# rejected. block_m 128 and 256 only have K=128 instances.
 A8W8_gemm2_gfx950_heuristic_dispatch = """
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
@@ -438,13 +442,31 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
+        // One gfx950 fp8 16x16 MFMA consumes 128 K elements. Two fit in 256.
+        const int k128 = 128 / sizeof({A0DataType});
+        const int k256 = 256 / sizeof({A0DataType});
+        TORCH_CHECK(
+            inter_dim % k128 == 0,
+            "gfx950 a8w8 stage2 requires inter_dim to be a multiple of ",
+            k128,
+            ", got ",
+            inter_dim);
+        const bool k_is_256 = inter_dim % k256 == 0;
         if (block_m == 32)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            if (k_is_256)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
         else if (block_m == 64)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            if (k_is_256)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
         else if (block_m == 128)
         {{

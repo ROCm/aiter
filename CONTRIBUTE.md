@@ -453,47 +453,39 @@ Examples:
 
 ### PR Description Template
 
-```markdown
-## Summary
-Brief description of changes
-
-## Motivation
-Why is this change needed?
-
-## Changes
-- Detailed list of changes
-- Impact on existing code
-
-## Performance (if applicable)
-| Configuration | Before | After | Improvement |
-|---------------|--------|-------|-------------|
-| ...           | ...    | ...   | ...         |
-
-## Testing
-- [ ] Unit tests added/updated
-- [ ] Performance benchmarks run
-- [ ] Tested on MI250X
-- [ ] Tested on MI300X
-
-## Documentation
-- [ ] Docstrings updated
-- [ ] User guide updated
-- [ ] Performance guide updated
-
-## Dependencies
-- [ ] No new third-party dependencies added
-- [ ] If new dependencies added, justification provided
-
-## Breaking Changes
-List any breaking changes and migration guide
-```
+GitHub automatically loads `.github/pull_request_template.md`. Complete its
+summary, motivation, changes, testing and PR Self-Review sections. Complete the
+performance, documentation, dependency and breaking-change sections when they
+apply, and state why when an expected item was not run or is not applicable.
 
 ### Code Review Process
 
-1. **Initial Review**: A maintainer will review within 3-5 business days
-2. **Feedback**: Address comments and push updates
-3. **Approval**: After approval, CI will run full test suite
-4. **Merge**: Once CI passes, a maintainer will merge
+Before requesting a human review, complete the **PR Self-Review** section in the
+pull request description for the current head revision. The automated comment
+asks one question selected from the files changed by the pull request. It also
+reports current Copilot findings, obvious code/test hygiene issues and the
+required baseline CI state.
+
+A pull request is ready for human review only when:
+
+* The pull request is no longer a draft.
+* The behavior, reason for the change and current revision are stated.
+* Validation evidence and anything still unverified are stated.
+* Kernel or performance changes include hardware, workload and before/after results.
+* The PR-specific question is answered.
+* Every changed `op_tests/` file has a stated, non-redundant purpose.
+* Current Copilot findings have a substantive author reply. Resolving the
+  conversation is recommended but does not block readiness.
+* Black, Ruff, repository dependency and Aiter Test Gate checks pass.
+
+Any new push invalidates the previous self-review until the author updates the
+reviewed revision and answers for the new head.
+
+1. **Self-review**: Complete PR Self-Review and required baseline CI
+2. **Initial Review**: A maintainer reviews a prepared pull request
+3. **Feedback**: Address comments and update the self-review after new pushes
+4. **Approval**: Obtain the required approval for the latest revision
+5. **Merge**: Once all required checks pass, a maintainer will merge
 
 If your PR is urgent or hasn't been reviewed, ping maintainers on the issue or PR.
 

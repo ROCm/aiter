@@ -42,5 +42,14 @@
                 "num_stages": 2
             }
         ]
+    },
+    "chunk_delta_attn_fwd_kernel_intra_token_parallel": {
+        "BH": 4,
+        "num_warps": 1,
+        "num_stages": 3
+    },
+    "flash_kda_segments": {
+        "MAX_CHUNKS": 64,
+        "HARD_CAP": true
     }
 }
