@@ -26,6 +26,7 @@ struct OpusArchInfo
     OpusGfxArch arch;
     std::string name;  // full gcnArchName, e.g. "gfx950:sramecc+:xnack-"
     int dev;
+    int cu_num;
 };
 }  // namespace opus_arch_detail
 
@@ -53,7 +54,7 @@ inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
         {
             a = OpusGfxArch::Gfx1250;
         }
-        return OpusArchInfo{a, std::move(name), dev};
+        return OpusArchInfo{a, std::move(name), dev, prop.multiProcessorCount};
     }();
     return info;
 }

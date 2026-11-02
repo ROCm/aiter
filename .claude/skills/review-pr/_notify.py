@@ -28,6 +28,21 @@ def owner_for(cls):
     return os.environ.get(var) or default or os.environ.get("AITER_FLOW_OWNER") or "zufayu"
 
 
+def mark_notified():
+    """Tell the report job this PR has been told -- only once a post has actually landed.
+
+    Every early return in main() is a path where nothing reached the PR: no status file, no
+    token, or a POST that threw. The report job on hosted infra is the last thing that could
+    speak in those cases, and it stays quiet when this flag is set, so setting it anywhere else
+    would trade a visible failure for a silent one.
+    """
+    out = os.environ.get("GITHUB_OUTPUT")
+    if not out:
+        return
+    with open(out, "a", encoding="utf-8") as fh:
+        fh.write("notified=true\n")
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: _notify.py <pr>"); return 2
@@ -59,6 +74,7 @@ def main():
         method="POST")
     try:
         urllib.request.urlopen(req, timeout=15)
+        mark_notified()
         print(f"reported [{cls}] -> @{owner}")
     except Exception as e:  # noqa: BLE001 - a failed notice must not fail CI
         print(f"notify failed: {e}")

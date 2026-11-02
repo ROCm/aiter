@@ -10,7 +10,7 @@ using sorted token infrastructure from moe_align_block_size.
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.tuned_config_utils import (
     autotune_configs,
     get_tuned_kernel_config,

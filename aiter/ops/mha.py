@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.util
 import os
 from typing import Any
 
@@ -22,6 +23,8 @@ from ..jit.utils.mha_recipes import (
 )
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+
+_FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
 
 
 def _fmha_kv_byte_extent_ge_u32(
@@ -685,8 +688,9 @@ def fmha_fwd_with_sink_varlen_asm(
       * cu_seqlens_q/k : int32 [batch+1] cumulative (cu[batch] == total)
 
     Contract details:
-      * The varlen kernel carries NO strides; q/k/v/out MUST be densely packed,
-        so this wrapper calls `.contiguous()` defensively.
+      * D64 / D128 take no strides: q/k/v are made dense, `out` must be dense.
+      * D192x128 takes strides: q/k/v/out are used in place as views; the
+        dispatchers only send tensors `_fmha_varlen_asm_d192_operands_ok` accepts.
       * `max_seqlen_q` is the maximum per-batch Q sequence length (caller-
         supplied, e.g. flash_attn_varlen convention) -- it sets the launch tile
         count; the kernel early-exits tiles beyond each batch's actual length.
@@ -696,7 +700,9 @@ def fmha_fwd_with_sink_varlen_asm(
         allocated even when `return_lse=False`; in that case ignore the result.
     """
     require_gfx1250_asm("fmha_fwd_with_sink_varlen_asm")
-    q, k, v = (x.contiguous() for x in (q, k, v))
+    strided = q.size(-1) == 192 and v.size(-1) == 128
+    if not strided:
+        q, k, v = (x.contiguous() for x in (q, k, v))
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
 
@@ -725,6 +731,26 @@ def fmha_fwd_with_sink_varlen_asm(
         bool(return_lse),
     )
     return out, lse
+
+
+def _fmha_varlen_asm_strided_ok(x: Tensor) -> bool:
+    """True if the D192x128 kernel can address `x` in place (mirrors the C++ check)."""
+    esz = x.element_size()
+    ts, hs = x.stride(0) * esz, x.stride(1) * esz
+    return x.stride(-1) == 1 and 0 < ts < (1 << 24) and 0 < hs <= 0x7FFFFFFF
+
+
+def _fmha_varlen_asm_d192_operands_ok(q, k, v, out=None, dense_last_dim_later=False):
+    """True if the D192x128 kernel can use q/k/v (and `out`) in place.
+
+    dense_last_dim_later: skip the last-dim check; `_flash_attn_varlen_forward`
+    fixes it with `maybe_contiguous` and checks again.
+    """
+    ops = (q, k, v) if out is None else (q, k, v, out)
+    return all(
+        (dense_last_dim_later and x.stride(-1) != 1) or _fmha_varlen_asm_strided_ok(x)
+        for x in ops
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1243,7 +1269,7 @@ def cmdGenFunc_mha_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1501,7 +1527,7 @@ def cmdGenFunc_mha_varlen_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1542,7 +1568,7 @@ def cmdGenFunc_mha_batch_prefill(
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
-    if max_seqlen_q == 1 and alibi_slopes is None:
+    if max_seqlen_q == 1 and alibi_slopes is None and sink_ptr is None:
         causal = False
         if window_size_left >= max_seqlen_k:
             window_size_left = -1
@@ -1928,6 +1954,12 @@ def _flash_attn_forward(
         )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
+        # The fmha_v3_fwd ASM kernels take no sink arguments: dispatching a call
+        # with sink_ptr or sink_size to them would silently drop the sink term.
+        # `not swa` does not exclude sinks, since a window that covers the whole
+        # sequence is reset to -1 above, so route any sink request to CK
+        # (mha_fwd), which applies sinks under both causal and window masks.
+        ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
         # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
@@ -2837,15 +2869,15 @@ def flash_attn_func(
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
-    if (
+    if _FLYDSL_AVAILABLE and (
         cu_seqlens_q is None
         and cu_seqlens_kv is None
         and num_splits <= 1
         and (len(window_size) < 3 or window_size[2] == 0)
     ):
-        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
-        _flydsl_result = flydsl_flash_attn_batch_func(
+        _flydsl_result = flydsl_flash_attn_batch_fwd(
             q,
             k,
             v,
@@ -2994,6 +3026,13 @@ def _flash_attn_varlen_forward(
         )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
+        # The fmha_v3_varlen_fwd ASM kernels take no sink arguments: dispatching
+        # a call with sink_ptr or sink_size to them would silently drop the sink
+        # term. `not swa` does not exclude sinks, since a window that covers the
+        # whole sequence is reset to -1 above, so route any sink request to CK
+        # (mha_varlen_fwd), which applies sinks under both causal and window
+        # masks.
+        ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and logits_soft_cap == 0.0
         # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
@@ -3016,6 +3055,9 @@ def _flash_attn_varlen_forward(
             (hdim_q in (64, 128) and hdim_v == hdim_q)
             or (hdim_q == 192 and hdim_v == 128)
         )
+        # D192x128: strides the kernel cannot address go to another backend.
+        if hdim_q == 192 and hdim_v == 128:
+            ret = ret and _fmha_varlen_asm_d192_operands_ok(q, k, v, out)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (sink_size == 0)
@@ -3092,10 +3134,9 @@ def _flash_attn_varlen_forward(
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_fwd_with_sink_varlen_asm():
-        # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
-        # requires dense packing (the wrapper calls `.contiguous()` defensively)
-        # and carries no strides.  softmax_scale is forwarded as-is (the kernel
-        # applies it internally to Q·K^T).  sink_ptr is passed through verbatim;
+        # gfx1250 packed/varlen ASM bf16 path (THD; D192x128 takes strided views).
+        # softmax_scale is forwarded as-is (the kernel applies it internally to
+        # Q·K^T).  sink_ptr is passed through verbatim;
         # `can_impl_fmha_fwd_with_sink_varlen_asm` already enforces the per-hdim
         # (D128 / D192x128 → no sink, D64 → sink) contract so we never feed a
         # null sink to a D64 binary that unconditionally reads it.
@@ -3353,7 +3394,7 @@ def _flash_attn_varlen_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     # Evaluated after maybe_contiguous: the gate checks contiguity.
-    can_impl_fmha_bwd_flydsl_ = can_impl_fmha_bwd_flydsl()
+    can_impl_fmha_bwd_flydsl_ = _FLYDSL_AVAILABLE and can_impl_fmha_bwd_flydsl()
 
     if can_impl_fmha_bwd_flydsl_:
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
@@ -3482,6 +3523,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         is_v3_atomic_fp32: bool | None = True,
         how_v3_bf16_cvt: int | None = 1,
         sink_ptr=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3513,9 +3557,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             sink_size=window_size[2] if len(window_size) > 2 else 0,
             bias=bias,
             alibi_slopes=alibi_slopes,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
             how_v3_bf16_cvt=how_v3_bf16_cvt,
@@ -3623,7 +3667,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # is_grad_enabled,
         # cu_seqlens_q_padded, cu_seqlens_k_padded,
         # is_v3_atomic_fp32, how_v3_bf16_cvt,
-        # sink_ptr (fwd-only sink scores; not differentiable via autograd.
+        # sink_ptr, q_descale, k_descale, v_descale
+        # (fwd-only inputs; not differentiable via autograd.
         #           bwd sink gradient d_sink is computed inside mha_varlen_bwd kernel,
         #           not returned here as a positional gradient.)
         # We only have gradients for q,k,v (dq,dk,dv) and possibly bias (dbias). Others are None.
@@ -3654,6 +3699,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # is_v3_atomic_fp32
             None,  # how_v3_bf16_cvt
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
+            None,  # q_descale
+            None,  # k_descale
+            None,  # v_descale
         )
 
 
@@ -3682,6 +3730,9 @@ def flash_attn_varlen_func(
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -3746,6 +3797,17 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    descales = (q_descale, k_descale, v_descale)
+    has_any_descale = any(descale is not None for descale in descales)
+    has_all_descales = all(descale is not None for descale in descales)
+    if has_any_descale and not has_all_descales:
+        raise ValueError(
+            "FP8 attention requires q_descale, k_descale, and v_descale together"
+        )
+    if has_all_descales and not ENABLE_CK:
+        raise RuntimeError(
+            "prequantized FP8 attention with descales requires ENABLE_CK=1"
+        )
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3763,9 +3825,13 @@ def flash_attn_varlen_func(
         is_hd192x128 = hdim_q == 192 and hdim_v == 128
         if not ((hdim_q in (64, 128) and hdim_v == hdim_q) or is_hd192x128):
             return False
-        # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
-        # yield so it reaches flydsl_flash_attn_varlen_func below.
-        if hdim_q == 128 and is_experimental_enabled():
+        # D192x128: strides the kernel cannot address go to another backend.
+        if is_hd192x128 and not _fmha_varlen_asm_d192_operands_ok(
+            q, k, v, out, dense_last_dim_later=True
+        ):
+            return False
+        # Yield these to the FlyDSL m32x8 kernel below; without 192 the bshd and thd routers disagree.
+        if hdim_q in (64, 128, 192) and is_experimental_enabled():
             return False
         if nhead_q % nhead_k != 0:
             return False
@@ -3786,7 +3852,7 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    if can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+    if not has_all_descales and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
         return FlashAttnVarlenFunc.apply(
             q,
             k,
@@ -3814,15 +3880,22 @@ def flash_attn_varlen_func(
             True,
             how_v3_bf16_cvt,
             sink_ptr,
+            q_descale,
+            k_descale,
+            v_descale,
         )
 
-    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
-    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
-    # the path so a sink-token request is never silently dropped.
-    if len(window_size) < 3 or window_size[2] == 0:
-        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+    if (
+        _FLYDSL_AVAILABLE
+        and not has_all_descales
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and cu_seqlens_q_padded is None
+        and cu_seqlens_k_padded is None
+        and logits_soft_cap == 0.0
+    ):
+        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
 
-        _flydsl_result = flydsl_flash_attn_varlen_func(
+        _flydsl_result = flydsl_flash_attn_varlen_fwd(
             q,
             k,
             v,
@@ -3899,6 +3972,9 @@ def flash_attn_varlen_func(
         True,
         how_v3_bf16_cvt,
         sink_ptr,
+        q_descale,
+        k_descale,
+        v_descale,
     )
 
 

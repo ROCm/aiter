@@ -39,7 +39,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Update FILE_TIMES from recent runs
+      - name: Update split test times from recent runs
         id: update_times
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,12 +86,14 @@ jobs:
         with:
           token: ${{ steps.pr_app_token.outputs.token }}
           branch: ci/update-split-tests-file-times
-          title: "CI: auto-update split test FILE_TIMES"
+          title: "CI: auto-update split test times"
           assignees: gyohuangxin
           body-path: ${{ runner.temp }}/pr-body.md
           # Without this the action commits every dirty file in the workspace,
           # which is how its own PR body and summary reached the repo root in
-          # #5131. This job only ever means to change the one file.
-          add-paths: .github/scripts/split_tests.sh
-          commit-message: "CI: auto-update split test FILE_TIMES"
+          # #5131. This job only ever means to change split test timing data.
+          add-paths: |
+            .github/split-test-times/aiter.tsv
+            .github/split-test-times/triton.tsv
+          commit-message: "CI: auto-update split test times"
           delete-branch: true

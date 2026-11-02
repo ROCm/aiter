@@ -11,8 +11,6 @@ python bench_na3d_flash.py
 python bench_na3d_flash.py -s '(1,79,192,192,4,64,11,11,11)'
 """
 
-import argparse
-
 import pandas as pd
 import torch
 
@@ -21,6 +19,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.triton.attention.na3d_flash import na3d_flash_attn
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.attention.test_na3d_flash import (
     _DEFAULT_SHAPES,
     _na3d_sdpa_exact,
@@ -100,10 +99,7 @@ def main():
         aiter.logger.warning("na3d_flash unsupported on %s; skipping", gfx)
         return
 
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter,
-        description="Benchmark 3D neighborhood flash attention",
-    )
+    parser = get_parser(kernel_name="NA3D Flash Attention")
     parser.add_argument(
         "-d",
         "--dtype",

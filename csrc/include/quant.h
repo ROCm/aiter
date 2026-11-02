@@ -52,8 +52,8 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
 // Canonical dtype-aware per-group dynamic quant. Accepts fp8 / i8 / fp4x2.
 // For fp4x2 it writes an e8m0 byte per group; for fp8/i8 it writes an
 // fp32 per-group scale.
-// scale_layout_m32k4: fp8 + e8m0 + group_size 32 only. Writes the scale directly in the
-// gfx1250 MXFP8 ASM GEMM A-scale layout (shuffle_mxfp8fp4_scale bytes); `scales` must hold
+// scale_layout_m32k4: fp8 or fp4x2 + e8m0 + group_size 32 only. Writes the scale directly in
+// the gfx1250 ASM / FlyDSL GEMM A-scale layout (shuffle_mxfp8fp4_scale bytes); `scales` must hold
 // (pad32(M), K/32) bytes and the pad rows are written as 0x7F. shuffle_scale is ignored.
 void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     const aiter_tensor_t& input, // [..., d]
@@ -117,6 +117,7 @@ void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& out,         // [token_
                                             const aiter_tensor_t& num_valid_ids,
                                             int token_num,
                                             int block_m,
+                                            int64_t total_routes, // token_num * routing top-k
                                             int group_size = 32,
                                             std::optional<aiter_tensor_t> sorted_weights = std::nullopt);
 

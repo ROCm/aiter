@@ -129,6 +129,12 @@ class DeviceCommunicatorBase:
         self.all2all_backend = "mori"
         self.all2all_manager: All2AllManagerBase | None = None
 
+    def get_or_create_all2all_manager(
+        self, backend: str | None = None
+    ) -> All2AllManagerBase:
+        """Return a fully initialized manager for the requested backend."""
+        raise NotImplementedError
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(input_, group=self.device_group)
         return input_

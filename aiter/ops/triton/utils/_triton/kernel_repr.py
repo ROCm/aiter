@@ -8,7 +8,7 @@ def _sanitize_constexpr_value(value):
     if isinstance(value, float):
         if value.is_integer():
             return str(int(value))
-        return str(value)
+        return str(value).replace("-", "NEG_").replace("+", "POS_").replace(".", "_")
 
     # for lists, tuples, sets - recursively join each
     if isinstance(value, (list, tuple, set)):

@@ -31,7 +31,7 @@ from aiter.ops.custom_all_reduce import (
     fused_allreduce_mhc_post_only,
     fused_allreduce_mhc_post_split,
 )
-from aiter.test_common import benchmark, checkAllclose
+from aiter.test_common import checkAllclose
 
 logger = logging.getLogger("aiter")
 
@@ -104,32 +104,28 @@ def _event_mean_us(fn, *, warmup: int, iters: int) -> float:
     return sum(latencies) / len(latencies)
 
 
-def _profile_worker(
+def _run_mhc_post_case(
     tp_size: int,
     rank_id: int,
     m: int,
     hidden_size: int,
     with_graph: bool,
-    init_method: str,
+    device: torch.device,
+    graphs: list,
     *,
     run_correctness: bool,
-    breakdown: bool = False,
-    compare_stages: bool = False,
+    breakdown: bool,
+    compare_stages: bool,
 ):
-    device = torch.device(f"cuda:{rank_id}")
-    torch.cuda.set_device(device)
-    set_custom_all_reduce(True)
-    init_distributed_environment(
-        world_size=tp_size,
-        rank=rank_id,
-        distributed_init_method=init_method,
-    )
-    ensure_model_parallel_initialized(tp_size, 1)
-    tensors = _make_inputs(m, hidden_size, rank_id, device)
-    group = get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1, device=device), group=group)
-    torch.cuda.synchronize()
+    """Profile one (m, hidden_size, with_graph) case on an initialized rank.
 
+    In graph mode the captured graphs and the buffers they reference are
+    appended to ``graphs`` and must outlive the whole sweep: custom all-reduce
+    caches the peer IPC address of every captured buffer by its local pointer,
+    so freeing one and capturing a later case at the same address would
+    replay with stale peer pointers.
+    """
+    tensors = _make_inputs(m, hidden_size, rank_id, device)
     ca_comm = get_tp_group().device_communicator.ca_comm
     next_residual_split = torch.empty_like(tensors["residual_in"])
     next_residual_fused = torch.empty_like(tensors["residual_in"])
@@ -265,6 +261,7 @@ def _profile_worker(
         with graph_capture() as gc, torch.cuda.graph(graph_fused, stream=gc.stream):
             fused_ar_post(registered=True)
         next_residual_fused.zero_()
+        captured = [graph_split, graph_fused]
 
         split_us = _event_mean_us(
             graph_split.replay, warmup=BENCH_WARMUP, iters=BENCH_ITERS
@@ -279,6 +276,7 @@ def _profile_worker(
             ):
                 fused_ar_post_split(registered=True)
             next_residual_split_fused.zero_()
+            captured.append(graph_fused_split)
             fused_split_us = _event_mean_us(
                 graph_fused_split.replay, warmup=BENCH_WARMUP, iters=BENCH_ITERS
             )
@@ -316,9 +314,16 @@ def _profile_worker(
             iters=BENCH_ITERS,
         )
 
-    barrier_before_teardown()
-    destroy_model_parallel()
-    destroy_distributed_environment()
+    if with_graph:
+        graphs.append(
+            (
+                captured,
+                tensors,
+                next_residual_split,
+                next_residual_fused,
+                next_residual_split_fused,
+            )
+        )
 
     return {
         "rank": rank_id,
@@ -333,35 +338,61 @@ def _profile_worker(
     }
 
 
-def _run_profile(
+def _profile_sweep_worker(
     tp_size: int,
-    m: int,
-    hidden_size: int,
-    with_graph: bool,
-    init_method: str | None = None,
+    rank_id: int,
+    cases: list[tuple[int, int, bool]],
+    init_method: str,
     *,
-    run_correctness: bool = False,
+    run_correctness: bool,
     breakdown: bool = False,
     compare_stages: bool = False,
 ):
-    if init_method is None:
-        init_method = get_distributed_init_method(get_ip(), get_open_port())
-    pool = Pool(processes=tp_size)
-    rets = [
-        pool.apply_async(
-            _profile_worker,
-            args=(tp_size, r, m, hidden_size, with_graph, init_method),
-            kwds={
-                "run_correctness": run_correctness,
-                "breakdown": breakdown,
-                "compare_stages": compare_stages,
-            },
+    """Run every ``(m, hidden_size, with_graph)`` case inside one init.
+
+    Setting up the TP group dominates a single case (seconds vs. microseconds
+    of kernel time), so graph-on and graph-off cases share one group that is
+    created and torn down once.
+    """
+    device = torch.device(f"cuda:{rank_id}")
+    torch.cuda.set_device(device)
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rank_id,
+        distributed_init_method=init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, 1)
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1, device=device), group=group)
+    torch.cuda.synchronize()
+
+    graphs = []
+    results = [
+        _run_mhc_post_case(
+            tp_size,
+            rank_id,
+            m,
+            hidden_size,
+            with_graph,
+            device,
+            graphs,
+            run_correctness=run_correctness,
+            breakdown=breakdown,
+            compare_stages=compare_stages,
         )
-        for r in range(tp_size)
+        for m, hidden_size, with_graph in cases
     ]
-    pool.close()
-    pool.join()
-    rows = [r.get() for r in rets]
+
+    barrier_before_teardown()
+    destroy_model_parallel()
+    destroy_distributed_environment()
+    graphs.clear()
+    return results
+
+
+def _summarize_profile(tp_size: int, m: int, hidden_size: int, rows: list[dict]):
+    """Reduce one case's per-rank timings to rank-max stats."""
     split = max(x["split_us"] for x in rows)
     fused = max(x["fused_us"] for x in rows)
     ar = max(x["ar_us"] for x in rows)
@@ -398,92 +429,79 @@ def _run_profile(
     }
 
 
-@benchmark()
 def test_ar_mhc_post_only_profile(
     tp_size: int,
-    m: int,
-    hidden_size: int,
-    with_graph: bool = False,
+    cases: list[tuple[int, int, bool]],
     distributed_init_method: str | None = None,
     run_correctness: bool = False,
     breakdown: bool = False,
     compare_stages: bool = False,
 ):
-    stats = _run_profile(
-        tp_size,
-        m,
-        hidden_size,
-        with_graph,
-        distributed_init_method,
-        run_correctness=run_correctness,
-        breakdown=breakdown,
-        compare_stages=compare_stages,
-    )
-    return {
-        "tp_size": tp_size,
-        "m": m,
-        "hidden_size": hidden_size,
-        "withGraph": with_graph,
-        **stats,
-    }
+    """Profile ``(m, hidden_size, with_graph)`` cases on one TP group and
+    return one summary row per case."""
+    if distributed_init_method is None:
+        distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with Pool(processes=tp_size) as pool:
+        rets = [
+            pool.apply_async(
+                _profile_sweep_worker,
+                args=(tp_size, r, cases, distributed_init_method),
+                kwds={
+                    "run_correctness": run_correctness,
+                    "breakdown": breakdown,
+                    "compare_stages": compare_stages,
+                },
+            )
+            for r in range(tp_size)
+        ]
+        per_rank = [r.get() for r in rets]
+    return [
+        {
+            "tp_size": tp_size,
+            "m": m,
+            "hidden_size": hidden_size,
+            "withGraph": with_graph,
+            "run_correctness": run_correctness,
+            "breakdown": breakdown,
+            "compare_stages": compare_stages,
+            **_summarize_profile(
+                tp_size, m, hidden_size, [results[i] for results in per_rank]
+            ),
+        }
+        for i, (m, hidden_size, with_graph) in enumerate(cases)
+    ]
 
 
 try:
     import pytest
 
-    @pytest.mark.parametrize("m", [16, 4096])
-    def test_fused_ar_mhc_post_only_tp2_smoke(m: int):
-        if torch.cuda.device_count() < 2:
-            pytest.skip(f"requires >=2 GPUs, got {torch.cuda.device_count()}")
-        ret = test_ar_mhc_post_only_profile(
-            tp_size=2,
-            m=m,
-            hidden_size=4096,
-            with_graph=False,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
+    def _correctness_rows(tp_size: int, ms: list[int]) -> list[dict]:
+        if torch.cuda.device_count() < tp_size:
+            pytest.skip(f"requires >={tp_size} GPUs, got {torch.cuda.device_count()}")
+        return test_ar_mhc_post_only_profile(
+            tp_size,
+            [(m, 4096, False) for m in ms],
             run_correctness=True,
         )
-        assert ret["err"] == 0
 
-    @pytest.mark.parametrize("m", [16, 128, 4096, 8192])
-    def test_fused_auto_dispatch_tp2(m: int):
-        if torch.cuda.device_count() < 2:
-            pytest.skip(f"requires >=2 GPUs, got {torch.cuda.device_count()}")
-        ret = test_ar_mhc_post_only_profile(
-            tp_size=2,
-            m=m,
-            hidden_size=4096,
-            with_graph=False,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
-            run_correctness=True,
-        )
-        assert ret["err"] == 0
-        assert ret["auto_path"] == "1stage"
+    def test_fused_ar_mhc_post_only_tp2_smoke():
+        for ret in _correctness_rows(2, [16, 4096]):
+            assert ret["err"] == 0, ret["m"]
 
-    @pytest.mark.parametrize("m", [16, 8192])
-    def test_fused_auto_dispatch_tp4(m: int):
-        if torch.cuda.device_count() < 4:
-            pytest.skip(f"requires >=4 GPUs, got {torch.cuda.device_count()}")
-        ret = test_ar_mhc_post_only_profile(
-            tp_size=4,
-            m=m,
-            hidden_size=4096,
-            with_graph=False,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
-            run_correctness=True,
-        )
-        assert ret["err"] == 0
-        input_bytes = m * 4096 * 2
-        if input_bytes > 512 * 1024:
-            assert ret["auto_path"] == "2stage"
-        else:
-            assert ret["auto_path"] == "1stage"
+    def test_fused_auto_dispatch_tp2():
+        for ret in _correctness_rows(2, [16, 128, 4096, 8192]):
+            assert ret["err"] == 0, ret["m"]
+            assert ret["auto_path"] == "1stage", ret["m"]
+
+    def test_fused_auto_dispatch_tp4():
+        for ret in _correctness_rows(4, [16, 8192]):
+            m = ret["m"]
+            assert ret["err"] == 0, m
+            input_bytes = m * 4096 * 2
+            if input_bytes > 512 * 1024:
+                assert ret["auto_path"] == "2stage", m
+            else:
+                assert ret["auto_path"] == "1stage", m
 
 except ImportError:
     pass
@@ -574,27 +592,21 @@ if __name__ == "__main__":
     print("# metric=rank-max mean (us)")
     print()
 
+    # One TP group per tp_size; graph-on/off modes and shapes share it.
     df_rows = []
-    init_method = get_distributed_init_method(get_ip(), get_open_port())
     for tp_size in args.tp_size:
+        rows = test_ar_mhc_post_only_profile(
+            tp_size,
+            [(m, h, with_graph) for with_graph in graph_modes for m, h in shapes],
+            breakdown=args.breakdown,
+            compare_stages=args.compare_stages,
+        )
+        df_rows.extend(rows)
         for with_graph in graph_modes:
-            mode_rows = []
-            for m, hidden_size in shapes:
-                ret = test_ar_mhc_post_only_profile(
-                    tp_size,
-                    m,
-                    hidden_size,
-                    with_graph=with_graph,
-                    distributed_init_method=init_method,
-                    breakdown=args.breakdown,
-                    compare_stages=args.compare_stages,
-                )
-                mode_rows.append(ret)
-                df_rows.append(ret)
             _print_table(
                 tp_size,
                 with_graph,
-                mode_rows,
+                [row for row in rows if row["withGraph"] == with_graph],
                 breakdown=args.breakdown,
                 compare_stages=args.compare_stages,
             )

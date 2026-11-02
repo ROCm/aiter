@@ -16,6 +16,24 @@ import pandas as pd
 TEST_GFX = "gfx942"
 
 
+class TestFlydslA8w8BpreshuffleCandidates(unittest.TestCase):
+
+    def test_async_copy_is_disabled_only_on_gfx942(self):
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+            kernels_list_942,
+            kernels_list_950,
+        )
+
+        self.assertFalse(
+            any(ki.use_async_copy for ki in kernels_list_942.values()),
+            "gfx942 cannot lower the 128-bit LDS-direct load used by async copy",
+        )
+        self.assertTrue(
+            any(ki.use_async_copy for ki in kernels_list_950.values()),
+            "gfx950 supports async copy and must keep those tuning candidates",
+        )
+
+
 class _StubTuner:
     """Lazy-init helper -- avoids importing aiter at module level."""
 
@@ -572,6 +590,271 @@ class TestUpdateConfigFiles(unittest.TestCase):
         finally:
             if os.path.exists(merged_path):
                 os.unlink(merged_path)
+
+
+class TestGroupedFmoeResultToCsv(unittest.TestCase):
+    """GroupedFmoeTuner.result_to_csv on a file laid out like tuned_grouped_fmoe.csv,
+    which has no gate_mode column and blank cells in integer columns."""
+
+    # The key and result columns gemm_moe_tune.py builds the grouped tuner with.
+    KEYS = (
+        "gfx",
+        "cu_num",
+        "token",
+        "model_dim",
+        "inter_dim",
+        "expert",
+        "topk",
+        "act_type",
+        "dtype",
+        "q_dtype_a",
+        "q_dtype_w",
+        "q_type",
+        "use_g1u1",
+        "doweight_stage1",
+        "gate_mode",
+        "ep_fused",
+    )
+    RESULTS = (
+        "max_m",
+        "tile_m",
+        "tile_n",
+        "tile_k",
+        "m_warp",
+        "n_warp",
+        "num_buffers",
+        "grouped_persistent_m",
+        "persistent_workers",
+        "kernelName1",
+        "kernelName2",
+        "us",
+        "tflops",
+        "bw",
+    )
+    HEADER = (
+        "gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,"
+        "q_dtype_w,ep_fused,q_type,use_g1u1,doweight_stage1,max_m,tile_m,tile_n,tile_k,"
+        "tile_m2,m_warp,n_warp,num_buffers,split_k1,grouped_persistent_m,"
+        "persistent_workers,kernelName1,kernelName2,us,tflops,bw"
+    )
+    SHAPE = (
+        "7168,768,384,6,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,"
+        "torch.float4_e2m1fn_x2,,QuantType.per_1x32,1,0"
+    )
+
+    def _tuner(self):
+        import importlib
+        import sys
+
+        tune_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "csrc",
+            "ck_gemm_moe_2stages_codegen",
+        )
+        sys.path.insert(0, os.path.abspath(tune_dir))
+        try:
+            gemm_moe_tune = importlib.import_module("gemm_moe_tune")
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"gemm_moe_tune not importable: {e}")
+        finally:
+            sys.path.pop(0)
+        return gemm_moe_tune.GroupedFmoeTuner(
+            "groupedFmoeTuner",
+            list(self.KEYS),
+            list(self.RESULTS),
+            "grouped fmoe tuner",
+        )
+
+    def _candidate(self, token, tile_m, us):
+        return {
+            "gfx": "gfx1250",
+            "cu_num": 256,
+            "token": token,
+            "model_dim": 7168,
+            "inter_dim": 768,
+            "expert": 384,
+            "topk": 6,
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float8_e4m3fn",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
+            "gate_mode": "GateMode.INTERLEAVE",
+            "ep_fused": float("nan"),
+            "max_m": tile_m,
+            "tile_m": tile_m,
+            "tile_n": 256,
+            "tile_k": 256,
+            "m_warp": 1,
+            "n_warp": 4,
+            "num_buffers": 2,
+            "grouped_persistent_m": 1,
+            "persistent_workers": "",
+            "kernelName1": "grouped_gemm1_a8w4_gugu",
+            "kernelName2": "grouped_gemm2_a8w4",
+            "us": us,
+            "tflops": 0,
+            "bw": 0,
+        }
+
+    def test_replaces_in_place_and_keeps_other_rows(self):
+        tuner = self._tuner()
+        old_4096 = f"gfx1250,256,4096,{self.SHAPE},4096,16,256,256,16,1,4,2,1,0,,k1,k2,468.0528,0,0"
+        old_8192 = f"gfx1250,256,8192,{self.SHAPE},8192,64,256,256,,1,4,2,1,0,,k1,k2,2011.94,0,0"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write(f"{self.HEADER}\n{old_4096}\n{old_8192}\n")
+            path = f.name
+        try:
+            results = pd.DataFrame(
+                [self._candidate(4096, 64, 300.5), self._candidate(2048, 32, 250.25)],
+                columns=tuner.columns,
+            )
+            tuner.result_to_csv(results, path)
+            with open(path) as f:
+                lines = f.read().splitlines()
+            # No gate_mode column is added, so the re-tuned row matches the old one.
+            self.assertEqual(lines[0], self.HEADER)
+            self.assertEqual(len(lines), 4)
+            # The row this run does not tune keeps its text: tile_m2 stays blank
+            # here and the other integers do not turn into "64.0".
+            self.assertEqual(lines[2], old_8192)
+            # The re-tuned row is replaced in place. A column the tuner does not
+            # set stays blank where the file has blank cells (tile_m2), and gets
+            # the value a blank means where it has none (split_k1), so the
+            # config merge does not turn that column into floats.
+            new_4096 = dict(zip(self.HEADER.split(","), lines[1].split(",")))
+            self.assertEqual(new_4096["token"], "4096")
+            self.assertEqual(new_4096["tile_m"], "64")
+            self.assertEqual(new_4096["tile_m2"], "")
+            self.assertEqual(new_4096["split_k1"], "1")
+            self.assertEqual(new_4096["us"], "300.5")
+            # A shape the file does not have yet is appended.
+            self.assertEqual(lines[3].split(",")[2], "2048")
+        finally:
+            os.unlink(path)
+
+    def _retune_production_row(self):
+        """Re-tune the first row of a copy of aiter/configs/tuned_grouped_fmoe.csv
+        with a different tile_m; return the old lines, the new lines and tile_m."""
+        tuner = self._tuner()
+        production = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "aiter",
+            "configs",
+            "tuned_grouped_fmoe.csv",
+        )
+        with open(production) as f:
+            old_lines = f.read().splitlines()
+        header = old_lines[0].split(",")
+        first = dict(zip(header, old_lines[1].split(",")))
+        tile_m = "64" if first["tile_m"] != "64" else "32"
+        candidate = {c: first.get(c, "") for c in tuner.columns}
+        candidate.update(
+            gate_mode="GateMode.INTERLEAVE",
+            max_m=first["token"],
+            tile_m=tile_m,
+            grouped_persistent_m=1,
+            us=1.5,
+            tflops=0,
+            bw=0,
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write("\n".join(old_lines) + "\n")
+            path = f.name
+        try:
+            tuner.result_to_csv(pd.DataFrame([candidate], columns=tuner.columns), path)
+            with open(path) as f:
+                new_lines = f.read().splitlines()
+        finally:
+            os.unlink(path)
+        return old_lines, new_lines, tile_m
+
+    def test_production_layout_keeps_its_columns(self):
+        # #6269 dropped max_m and grouped_persistent_m from the production file;
+        # writing one row must not add them back, blank in every other row.
+        old_lines, new_lines, tile_m = self._retune_production_row()
+        self.assertEqual(new_lines[0], old_lines[0])
+        self.assertEqual(len(new_lines), len(old_lines))
+        changed = [i for i, (a, b) in enumerate(zip(old_lines, new_lines)) if a != b]
+        self.assertEqual(changed, [1])
+        new = dict(zip(old_lines[0].split(","), new_lines[1].split(",")))
+        self.assertEqual(new["tile_m"], tile_m)
+
+    def test_production_layout_gets_no_new_blank_cell(self):
+        # A blank cell in a filled column makes the config merge write the whole
+        # column as floats, which the AOT parser's int() rejects.
+        old_lines, new_lines, _ = self._retune_production_row()
+        header = old_lines[0].split(",")
+        old_rows = [dict(zip(header, line.split(","))) for line in old_lines[1:]]
+        filled = [c for c in header if all(row[c].strip() for row in old_rows)]
+        new = dict(zip(header, new_lines[1].split(",")))
+        self.assertEqual([c for c in filled if not new[c].strip()], [])
+        for column in ("rolled_drain", "persistent_workers2"):
+            if column in header:
+                self.assertEqual(new[column], "0")
+
+    def _file_with_unknown_column(self):
+        header = f"{self.HEADER},new_knob"
+        old_4096 = f"gfx1250,256,4096,{self.SHAPE},4096,16,256,256,16,1,4,2,1,0,,k1,k2,468.0528,0,0,7"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write(f"{header}\n{old_4096}\n")
+            return f.name
+
+    def test_unknown_filled_column_is_rejected_before_writing(self):
+        tuner = self._tuner()
+        path = self._file_with_unknown_column()
+        try:
+            with open(path) as f:
+                before = f.read()
+            results = pd.DataFrame(
+                [self._candidate(4096, 64, 300.5)], columns=tuner.columns
+            )
+            with self.assertRaisesRegex(ValueError, "new_knob"):
+                tuner.result_to_csv(results, path)
+            with open(path) as f:
+                self.assertEqual(f.read(), before)
+        finally:
+            os.unlink(path)
+
+    def test_unknown_filled_column_stops_tuning_before_timing(self):
+        from types import SimpleNamespace
+
+        tuner = self._tuner()
+        path = self._file_with_unknown_column()
+        timed = []
+        try:
+            tuner._run_candidate = lambda *a: timed.append(a) or 1.0
+            with self.assertRaisesRegex(ValueError, "new_knob"):
+                tuner.tune(
+                    pd.DataFrame([self._candidate(4096, 64, 0)]),
+                    None,
+                    SimpleNamespace(tune_file=path),
+                )
+            self.assertEqual(timed, [])
+        finally:
+            os.unlink(path)
+
+    def test_csv_text_writes_integral_numbers_exactly(self):
+        tuner = self._tuner()
+        cases = {
+            "16.0": "16",
+            "1e5": "100000",
+            "1.5e2": "150",
+            "9007199254740993.0": "9007199254740993",
+            "300.5": "300.5",
+            "-1": "-1",
+            "nan": "",
+            "": "",
+            "torch.bfloat16": "torch.bfloat16",
+            "grouped_gemm1_a8w4_gugu": "grouped_gemm1_a8w4_gugu",
+        }
+        self.assertEqual({k: tuner._csv_text(k) for k in cases}, cases)
 
 
 if __name__ == "__main__":

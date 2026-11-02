@@ -1,0 +1,64 @@
+# The GPU suite deliberately skips `.claude/` (see detect_aiter_test_scope in aiter-test.yaml):
+# the review bot's tooling never enters the wheel or the runtime, so building it proves nothing.
+# That would leave the tooling with no check at all, so run its own guards here instead --
+# seconds on a hosted runner, no GPU, no wheel.
+#
+# aiter-review-bot.yml is watched too: check_prompts.py asserts across the two files (the run
+# budget must fit the review job's timeout-minutes, the watchdog's owner must match _notify.py,
+# the runner label must be exclusive), so a change there can break a guard that lives here.
+name: review-bot selftest
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.claude/skills/review-pr/**', '.github/workflows/aiter-review-bot.yml']
+  push:
+    branches: [main]
+    paths: ['.claude/skills/review-pr/**', '.github/workflows/aiter-review-bot.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Shell syntax
+        run: |
+          for f in .claude/skills/review-pr/*.sh; do bash -n "$f"; done
+
+      - name: Prompts match SKILL.md, and fail classes match _notify.py
+        run: python3 .claude/skills/review-pr/check_prompts.py
+
+      - name: Guards — failure triage, run budget, refuter call site, watchdog
+        run: bash .claude/skills/review-pr/selftest.sh
+
+      # pyproject.toml excludes `.claude` from the repo-wide ruff: the directory was invisible to
+      # it until `.gitignore` was narrowed, and a 174-finding burndown does not belong in whatever
+      # PR happens to touch the bot next. Excluding it and stopping there would leave these files
+      # with no linter at all, which is the kind of gap this skill exists to close, so they get
+      # their own -- narrower on purpose.
+      #
+      # Measured with ruff 0.16.0, the version pinned in pre-checks.yaml:
+      #
+      #     F,E9                                       7   <- enforced here
+      #     default - {UP031,FURB167,SIM115,ISC004}   29
+      #     default - UP031                          101
+      #     default                                  174   (102 of them in triage.py)
+      #
+      # F and E9 are the findings that break something at runtime -- an undefined name, an unused
+      # import, a syntax error. The rest are style, and widening to them is a deliberate, costed
+      # step rather than a mystery: the numbers above are what it costs.
+      #
+      # `--no-force-exclude` keeps the explicit path winning over that pyproject exclude, so this
+      # cannot be turned into a silent no-op by a later config change.
+      - name: Lint the skill for real errors
+        run: |
+          pip3 install --quiet ruff==0.16.0
+          ruff check --no-cache --no-force-exclude --select F,E9 .claude/skills/review-pr/

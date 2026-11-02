@@ -38,11 +38,12 @@ import torch.distributed as dist
 
 from aiter import dtypes, logger
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest
 
 set_start_method("spawn", force=True)
 
 _INIT_TIMEOUT_SEC = 120
+_CASE_TIMEOUT_SEC = 10
 
 
 def _get_gpu_arch(device_idx: int | None = None) -> str:
@@ -56,24 +57,85 @@ def _is_gfx1250(device_idx: int = 0) -> bool:
     return "gfx1250" in _get_gpu_arch(device_idx)
 
 
-def _worker(
+def _run_allreduce_case(
     tp_size: int,
     rank: int,
-    tensor_on_cpu: torch.Tensor,
+    case_idx: int,
+    shape: tuple,
+    dtype: torch.dtype,
+    with_graph: bool,
+    graphs: list,
+):
+    """All-reduce one ``(shape, dtype)`` on an initialized rank and check it
+    against the sum of every rank's input.
+
+    Each rank regenerates all ``tp_size`` inputs from the same ``case_idx``
+    seed and keeps its own, so the reference is available locally and only
+    scalars go back to the parent. In graph mode the captured graph and its
+    buffers are appended to ``graphs`` and must outlive the whole sweep:
+    custom all-reduce caches the peer IPC address of every captured buffer by
+    its local pointer, so freeing one and capturing a later case at the same
+    address would replay with stale peer pointers.
+    """
+    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+    from aiter.dist.parallel_state import graph_capture
+
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+    ref = torch.zeros(shape, dtype=dtype, device="cuda")
+    for r in range(tp_size):
+        xr = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
+        ref += xr
+        if r == rank:
+            x = xr
+
+    if with_graph:
+        graph = torch.cuda.CUDAGraph()
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_reduce(x)
+        out.fill_(0)
+        graphs.append((graph, x, out))
+
+        @perftest()
+        def run_ca():
+            graph.replay()
+
+        _, us = run_ca()
+    else:
+
+        @perftest()
+        def run_ca(x):
+            return tensor_model_parallel_all_reduce(x)
+
+        out, us = run_ca(x)
+
+    msg = (
+        f"test_gfx1250_allreduce: rank={rank} tp={tp_size} {shape=} {dtype=} "
+        f"{with_graph=} {us:>8.2f}"
+    )
+    return {"us": us, "err": checkAllclose(ref, out, msg=msg)}
+
+
+def _allreduce_sweep(
+    tp_size: int,
+    rank: int,
+    cases: list,
     distributed_init_method: str,
     with_graph: bool = False,
 ):
-    """Per-rank worker: init custom allreduce and run the test."""
+    """Per-rank worker: init custom allreduce once and run every
+    ``(shape, dtype)`` case.
+
+    Setting up the TP group costs seconds per init vs. microseconds of kernel
+    time, so the group is created and torn down once.
+    """
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
-    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
     from aiter.dist.parallel_state import (
         destroy_distributed_environment,
         destroy_model_parallel,
         ensure_model_parallel_initialized,
         get_tp_group,
-        graph_capture,
         init_distributed_environment,
         set_custom_all_reduce,
     )
@@ -101,78 +163,63 @@ def _worker(
             )
         raise
 
-    x = tensor_on_cpu.to(device)
-
     group = get_tp_group().device_group
     dist.all_reduce(torch.zeros(1, device=device), group=group)
     torch.cuda.synchronize()
 
     logger.info("RANK %d: initialization complete, running allreduce...", rank)
 
-    if with_graph:
-        graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
-            out = tensor_model_parallel_all_reduce(x)
-        out.fill_(0)
-
-        @perftest()
-        def run_ca():
-            graph.replay()
-
-        _, us = run_ca()
-        out = (out, us)
-    else:
-
-        @perftest()
-        def run_ca(x):
-            return tensor_model_parallel_all_reduce(x)
-
-        out = run_ca(x)
+    graphs = []
+    results = [
+        _run_allreduce_case(tp_size, rank, case_idx, shape, dtype, with_graph, graphs)
+        for case_idx, (shape, dtype) in enumerate(cases)
+    ]
 
     if dist.is_initialized():
+        # Drain and align all ranks before freeing IPC buffers / groups.
+        torch.cuda.synchronize()
+        get_tp_group().barrier()
+        torch.cuda.synchronize()
         destroy_model_parallel()
         destroy_distributed_environment()
+        graphs.clear()
         torch.cuda.empty_cache()
 
-    return out
+    return results
 
 
-@benchmark()
 def test_gfx1250_allreduce(
     tp_size: int,
-    shape: tuple,
-    dtype: torch.dtype,
+    cases: list,
     with_graph: bool = False,
-    distributed_init_method: str | None = None,
 ):
+    """Sweep ``(shape, dtype)`` cases on one TP group and return one summary
+    row per case."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
     pool = Pool(processes=tp_size)
-    ref = torch.zeros(shape, dtype=dtype)
-    rets = []
-    for i in range(tp_size):
-        x = torch.randn(shape, dtype=dtype)
-        ref += x
-        rets.append(
-            pool.apply_async(
-                _worker,
-                args=(tp_size, i, x, distributed_init_method, with_graph),
-            )
+    rets = [
+        pool.apply_async(
+            _allreduce_sweep,
+            args=(tp_size, rank, cases, init_method, with_graph),
         )
+        for rank in range(tp_size)
+    ]
     pool.close()
 
     # Collect results with a per-worker timeout to detect IPC hangs
-    results = []
+    timeout = _INIT_TIMEOUT_SEC + _CASE_TIMEOUT_SEC * len(cases)
+    per_rank = []
     try:
-        for i, r in enumerate(rets):
-            results.append(r.get(timeout=_INIT_TIMEOUT_SEC))
+        for r in rets:
+            per_rank.append(r.get(timeout=timeout))
     except Exception as e:
         pool.terminate()
         pool.join()
-        str(e)
         if isinstance(e, (MpTimeoutError, TimeoutError)):
             raise RuntimeError(  # noqa: TRY004
-                f"Worker timed out after {_INIT_TIMEOUT_SEC}s — likely hung "
+                f"Worker timed out after {timeout}s — likely hung "
                 f"in IPC handle exchange (hipIpcGetMemHandle/"
                 f"hipIpcOpenMemHandle). On MI450, "
                 f"hipExtMallocWithFlags(hipDeviceMallocUncached) may produce "
@@ -182,21 +229,21 @@ def test_gfx1250_allreduce(
         raise
     pool.join()
 
-    rets = results
-    all_us = [us for _, us in rets]
-    max_err = 0.0
-    for out, us in rets:
-        msg = (
-            f"test_gfx1250_allreduce: tp={tp_size} {shape=} {dtype=} "
-            f"{with_graph=} {us:>8.2f}"
+    rows = []
+    for i, (shape, dtype) in enumerate(cases):
+        all_us = [results[i]["us"] for results in per_rank]
+        rows.append(
+            {
+                "tp_size": tp_size,
+                "shape": shape,
+                "dtype": dtype,
+                "withGraph": with_graph,
+                "min_us": min(all_us),
+                "max_us": max(all_us),
+                "err": max(results[i]["err"] for results in per_rank),
+            }
         )
-        err = checkAllclose(ref, out.to(ref), msg=msg)
-        max_err = max(max_err, err)
-    return {
-        "min_us": min(all_us),
-        "max_us": max(all_us),
-        "err": max_err,
-    }
+    return rows
 
 
 l_dtype = ["fp16", "bf16"]
@@ -282,23 +329,13 @@ if __name__ == "__main__":
         logger.error("Not enough GPUs: need at least 2, have %d", num_gpus)
         sys.exit(1)
 
+    cases = [(shape, dtype) for dtype in test_dtypes for shape in test_shapes]
     df = []
     for tp_size in test_tp_sizes:
         if tp_size > num_gpus:
             logger.warning("Skipping tp=%d: only %d GPUs available", tp_size, num_gpus)
             continue
-        for dtype in test_dtypes:
-            for shape in test_shapes:
-                ret = test_gfx1250_allreduce(
-                    tp_size,
-                    shape,
-                    dtype,
-                    with_graph=args.with_graph,
-                    distributed_init_method=get_distributed_init_method(
-                        get_ip(), get_open_port()
-                    ),
-                )
-                df.append(ret)
+        df.extend(test_gfx1250_allreduce(tp_size, cases, with_graph=args.with_graph))
 
     df = pd.DataFrame(df)
     show_cols = [
