@@ -819,6 +819,155 @@ def test_mla_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
     )
 
 
+# Force both paths to cover CSR transitions, tails and partial head tiles.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("h", [16, 24, 32], ids=lambda h: f"h{h}")
+@pytest.mark.parametrize("num_kv_splits", [1, 4], ids=["unsplit", "split4"])
+@pytest.mark.parametrize(
+    "total_pages,total_tokens,topk",
+    [
+        pytest.param(0, 0, 64, id="empty"),
+        pytest.param(0, 129, 65, id="extend-only"),
+        pytest.param(129, 0, 65, id="prefix-only"),
+        pytest.param(129, 129, 63, id="both-tail63"),
+        pytest.param(129, 129, 64, id="both-full64"),
+        pytest.param(129, 129, 65, id="both-tail65"),
+        pytest.param(257, 257, 129, id="both-tail129"),
+    ],
+)
+def test_opus_csr_boundaries(dtype, h, num_kv_splits, total_pages, total_tokens, topk):
+    _check_opus_csr_case(65, h, total_pages, total_tokens, topk, dtype, num_kv_splits)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize(
+    "n,h,total_pages,total_tokens,topk",
+    [
+        pytest.param(120, 15, 129, 129, 65, id="h15-n120"),
+        pytest.param(121, 15, 129, 129, 65, id="h15-n121"),
+        pytest.param(60, 17, 129, 129, 65, id="h17-n60"),
+        pytest.param(61, 17, 129, 129, 65, id="h17-n61"),
+        pytest.param(16, 15, 4096, 4096, 4096, id="long-n16-h15"),
+        pytest.param(256, 17, 4096, 4096, 4096, id="long-n256-h17"),
+    ],
+)
+def test_opus_auto_dispatch_csr(dtype, n, h, total_pages, total_tokens, topk):
+    _check_opus_csr_case(n, h, total_pages, total_tokens, topk, dtype, None)
+
+
+def _check_opus_csr_case(
+    n, h, total_pages, total_tokens, topk, dtype, num_kv_splits, has_sink=True
+):
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=n,
+        h=h,
+        d=512,
+        total_pages=total_pages,
+        total_tokens=total_tokens,
+        dtype=dtype,
+        topk=topk,
+        seed=42,
+    )
+    softmax_scale = 1.0 / math.sqrt(512)
+    if not has_sink:
+        # An explicit -inf sink contributes zero to the unchanged FP32 reference.
+        inputs["attn_sink"].fill_(-math.inf)
+    expected = _ref_mla_sparse_prefill(**inputs, softmax_scale=softmax_scale)
+    if not has_sink:
+        inputs["attn_sink"] = None
+    actual = mla_sparse_prefill(
+        **inputs,
+        softmax_scale=softmax_scale,
+        num_kv_splits=num_kv_splits,
+        backend="opus",
+    )
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("num_kv_splits", [1, 4], ids=["unsplit", "split4"])
+@pytest.mark.parametrize(
+    "total_pages,total_tokens,topk",
+    [
+        pytest.param(0, 0, 64, id="empty"),
+        pytest.param(0, 129, 65, id="extend-only"),
+        pytest.param(129, 0, 65, id="prefix-only"),
+        pytest.param(129, 129, 65, id="both-tail65"),
+    ],
+)
+def test_opus_csr_without_sink(dtype, num_kv_splits, total_pages, total_tokens, topk):
+    _check_opus_csr_case(
+        65, 24, total_pages, total_tokens, topk, dtype, num_kv_splits, has_sink=False
+    )
+
+
+@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "lower-sink"])
+@pytest.mark.parametrize("num_kv_splits", [1, 4], ids=["unsplit", "split4"])
+def test_opus_csr_negative_logits(has_sink, num_kv_splits):
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=1,
+        h=16,
+        d=512,
+        total_pages=1,
+        total_tokens=0,
+        dtype=torch.bfloat16,
+        topk=1,
+        seed=42,
+    )
+    inputs["q"].zero_()
+    inputs["q"][..., 0] = 2.0**60
+    # Make a zero-output defect visible in every element under the native oracle.
+    inputs["unified_kv"].fill_(-(2.0**60))
+    inputs["attn_sink"].fill_(-(2.0**125) if has_sink else -math.inf)
+    scale = 1.0 / math.sqrt(512)
+    expected = _ref_mla_sparse_prefill(**inputs, softmax_scale=scale)
+    if not has_sink:
+        inputs["attn_sink"] = None
+    actual = mla_sparse_prefill(
+        **inputs, softmax_scale=scale, num_kv_splits=num_kv_splits, backend="opus"
+    )
+    assert torch.isfinite(actual).all()
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_opus_csr_one_key_scale_one(dtype):
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=1,
+        h=24,
+        d=512,
+        total_pages=1,
+        total_tokens=0,
+        dtype=dtype,
+        topk=1,
+        seed=42,
+    )
+    inputs["attn_sink"].fill_(-math.inf)
+    expected = _ref_mla_sparse_prefill(**inputs, softmax_scale=1.0)
+    inputs["attn_sink"] = None
+    actual = mla_sparse_prefill(
+        **inputs, softmax_scale=1.0, num_kv_splits=1, backend="opus"
+    )
+    assert torch.isfinite(actual).all()
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+
+
 # ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
 # ---------------------------------------------------------------------------
