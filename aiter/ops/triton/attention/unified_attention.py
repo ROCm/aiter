@@ -2,6 +2,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 from typing import NamedTuple
 
+import os
 import torch
 import triton
 
@@ -136,6 +137,8 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+    # NVFP4 KV cache only: PV as an FP8 WMMA (P and the upcast V in e4m3) instead of BF16
+    force_fp8_pv_on_fp4_kv_cache: bool = False
 
 
 def _gfx950_gluon_supported(params: _UAParams):
@@ -260,6 +263,9 @@ def unified_attention(
     sinks=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    # NVFP4 (uint8 e2m1) KV cache only: run PV as an FP8 WMMA, with P and the upcast,
+    # scaled V in e4m3, instead of a BF16 WMMA. Same for A8W4 and A4W4; ignored otherwise.
+    force_fp8_pv_on_fp4_kv_cache: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
@@ -408,6 +414,7 @@ def unified_attention(
         v_descale=v_descale,
         output_scale=output_scale,
         skip_reduce=skip_reduce,
+        force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
     )
 
     # if batch contains a prefill
@@ -547,9 +554,18 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
             and not params.softcap
             and not params.use_qq_bias
             and not params.use_alibi_slopes
-            and params.q_dtype != torch.uint8
-            and params.kv_cache_dtype != torch.uint8
-            and params.q_dtype == params.kv_cache_dtype
+            and (
+                params.q_dtype == params.kv_cache_dtype
+                # NVFP4 KV: fp8 Q (A8W4) or NVFP4 Q (A4W4), shuffled 128-token pages
+                or (
+                    params.kv_cache_dtype == torch.uint8
+                    and params.q_dtype.itemsize == 1
+                )
+            )
+            and (
+                params.kv_cache_dtype != torch.uint8
+                or (params.shuffled_kv_cache and params.block_size == 128)
+            )
             and params.head_size_v == params.head_size
         )
     elif DEVICE_ARCH == "gfx950":
@@ -865,6 +881,17 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     if query_span > TILE_SIZE or TILE_SIZE <= 32:
         loop_variant = 0
 
+    num_buffers = config["NUM_BUFFERS"]
+    waves_per_eu = config["waves_per_eu"]
+    kv_nvfp4 = params.kv_cache_dtype == torch.uint8
+    if kv_nvfp4:
+        # NVFP4 KV runs the double-buffered loop variant 0 with one 128-token page per tile
+        TILE_SIZE = params.block_size
+        loop_variant = 0
+        num_buffers = 2
+        # the NVFP4 path (packed K, upcast V, scale layouts) needs the whole VGPR file: one wave per SIMD
+        waves_per_eu = 1
+
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
     if params.all_decode:
@@ -914,7 +941,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         BLOCK_Q=BLOCK_Q,
         BLOCK_M=BLOCK_M,
         ARCH_NAME=DEVICE_ARCH,
-        waves_per_eu=config["waves_per_eu"],
+        waves_per_eu=waves_per_eu,
         USE_LOAD_BUFFER_OP=False,
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
@@ -923,8 +950,13 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         CAUSAL=params.causal,
         # useful for debugging when needed
         REMOVE_INDIRECT_ACCESS=False,
-        NUM_BUFFERS=config["NUM_BUFFERS"],
+        NUM_BUFFERS=num_buffers,
         LOOP_VARIANT=loop_variant,
+        Q_NVFP4=params.q_dtype == torch.uint8,
+        KV_NVFP4=kv_nvfp4,
+        query_scales_ptr=params.q_scales,
+        query_scales_stride_0=params.q_scales.stride(0) if params.q_scales is not None else 0,
+        query_scales_stride_1=params.q_scales.stride(1) if params.q_scales is not None else 0,
         enable_fp_fusion=True,
     )
 
@@ -1015,6 +1047,15 @@ def _unified_attention_3d_gfx1250(
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         SCALE_K_WIDTH=params.scale_k_width,
+        FP8_PV=params.force_fp8_pv_on_fp4_kv_cache
+        and params.kv_cache_dtype == torch.uint8,
+        USE_STORE_TDM=True,
+        # experiment knob: NVFP4 KV + BF16 PV processed in 2 head-dim halves
+        HEAD_SIZE_SPLIT=(
+            int(os.environ.get("AITER_UA_FP4_HEAD_SPLIT", "1"))
+            if params.kv_cache_dtype == torch.uint8 and not params.force_fp8_pv_on_fp4_kv_cache
+            else 1
+        ),
         WARP_SIZE=WARP_SIZE,
         NUM_BLOCKS_GATHER_PER_TILE=NUM_BLOCKS_GATHER_PER_TILE,
         QUERY_DTYPE=QUERY_DTYPE,
