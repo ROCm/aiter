@@ -1765,22 +1765,17 @@ def test_mha_v4_mx_hd256_matches_attention(
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 hd256 GQA validation")
-def test_mha_v4_mxfp4_hd256_gqa_matches_repeated_kv():
+@parametrize("qkv_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
+def test_mha_v4_mx_hd256_gqa_matches_repeated_kv(qkv_format):
     torch.manual_seed(44)
     q = torch.randn((1, 257, 16, 256), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 320, 4, 256), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
+    formats = (qkv_format, qkv_format, qkv_format)
 
-    gqa = mha_v4(
-        q, k, v, AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4
-    )
+    gqa = mha_v4(q, k, v, *formats)
     mha = mha_v4(
-        q,
-        k.repeat_interleave(4, dim=2),
-        v.repeat_interleave(4, dim=2),
-        AttentionFormat.MXFP4,
-        AttentionFormat.MXFP4,
-        AttentionFormat.MXFP4,
+        q, k.repeat_interleave(4, dim=2), v.repeat_interleave(4, dim=2), *formats
     )
     torch.cuda.synchronize()
 
