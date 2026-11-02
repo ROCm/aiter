@@ -20,6 +20,7 @@ _KERNEL_PARAMS: dict[str, dict] = {}
 
 # HIP limits grid.y/grid.z to 65535.
 _HIP_MAX_GRID_DIM_Y = 65535
+_FP8_STAGE2_PERSIST = os.environ.get("AITER_FLYDSL_FP8_STAGE2_PERSIST", "1") == "1"
 
 
 @functools.lru_cache(maxsize=256)
@@ -2206,9 +2207,11 @@ def _flydsl_moe_stage2_impl(
     else:
         _persist_m = -1 if m_blocks > 256 else 1
 
-    if a_dtype == "fp8":
-        # Normalize FP8-A grid scheduling from runtime occupancy, even for
-        # legacy tuned names that retain `_persist` as part of their identity.
+    if a_dtype == "fp8" and not (_persist_m == -1 and _FP8_STAGE2_PERSIST):
+        # Non-persistent FP8 grid.y follows the sorted buffer, which under EP is
+        # much larger than the valid rows, so cap it from runtime occupancy.
+        # Persist-named kernels stay at _persist_m == -1 and bound the loop by
+        # num_valid_ids instead. AITER_FLYDSL_FP8_STAGE2_PERSIST selects that.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:
