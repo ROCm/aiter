@@ -261,9 +261,10 @@ def _auto_num_splits(
 #                                                (default _auto_num_splits)
 # The ``_lds`` suffix selects the LDS-pipelined builder, in which all WPB waves
 # share one staged KV tile and partition rows, so a block owns RPB*WPB rows.
-# Any tag in this grammar builds on demand (``_variant_builder``); the registry
-# below only names the hand-picked ones, and a tuned dispatch table is a list
-# of tags.
+# gfx950 has no hand-picked registry: any tag in this grammar builds on demand
+# (``_variant_builder``), and the tuned dispatch table ``_GFX950_ROUTES`` is a
+# list of tags. Only gfx942's fixed ``mfma_r<RPB>_w<WPB>`` family is registered
+# up front.
 #
 # Each entry hardcodes its own block_kv, overriding whatever the caller passed
 # to ``compile_fp8_mqa_logits``.
@@ -350,179 +351,10 @@ if _ARCH == "gfx942":
         {f"mfma_r{r}_w{w}": _mk_builder(r, w) for r in (1, 2, 4) for w in (1, 2, 4)}
     )
 
-if _ARCH == "gfx950":
-    # CDNA4 scaled MFMA atoms (K=128/64): gfx950-only, since those instructions
-    # require native FN operands and do not exist on gfx942.
-    _K64 = _MFMA32_K64
-    _K128 = _MFMA16_K128
-    _register_variants(
-        {
-            # -- direct load: every wave fetches its own KV tile, no LDS --
-            "mfma16x16x128_bkv128_r1_w1": _mk_builder(1, 1, mfma=_K128, bkv=128),
-            "mfma16x16x128_bkv128_r2_w1": _mk_builder(2, 1, mfma=_K128, bkv=128),
-            "mfma16x16x128_bkv128_r1_w2": _mk_builder(1, 2, mfma=_K128, bkv=128),
-            "mfma16x16x128_bkv128_r2_w2": _mk_builder(2, 2, mfma=_K128, bkv=128),
-            "mfma32x32x64_bkv128_r1_w1": _mk_builder(1, 1, mfma=_K64, bkv=128),
-            "mfma32x32x64_bkv128_r2_w1": _mk_builder(2, 1, mfma=_K64, bkv=128),
-            "mfma32x32x64_bkv128_r1_w2": _mk_builder(1, 2, mfma=_K64, bkv=128),
-            "mfma32x32x64_bkv128_r2_w2": _mk_builder(2, 2, mfma=_K64, bkv=128),
-            # -- LDS double-buffered: WPB waves share one staged KV tile --
-            "mfma32x32x64_bkv64_r1_w2_lds2": _mk_builder(
-                1, 2, mfma=_K64, bkv=64, lds=2
-            ),
-            "mfma32x32x64_bkv64_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K64, bkv=64, lds=2
-            ),
-            "mfma32x32x64_bkv64_r2_w4_lds2": _mk_builder(
-                2, 4, mfma=_K64, bkv=64, lds=2
-            ),
-            "mfma32x32x64_bkv128_r1_w2_lds2": _mk_builder(
-                1, 2, mfma=_K64, bkv=128, lds=2
-            ),
-            "mfma32x32x64_bkv128_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K64, bkv=128, lds=2
-            ),
-            "mfma32x32x64_bkv128_r2_w4_lds2": _mk_builder(
-                2, 4, mfma=_K64, bkv=128, lds=2
-            ),
-            "mfma32x32x64_bkv256_r1_w2_lds2": _mk_builder(
-                1, 2, mfma=_K64, bkv=256, lds=2
-            ),
-            "mfma32x32x64_bkv256_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K64, bkv=256, lds=2
-            ),
-            "mfma16x16x128_bkv64_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K128, bkv=64, lds=2
-            ),
-            "mfma16x16x128_bkv128_r1_w2_lds2": _mk_builder(
-                1, 2, mfma=_K128, bkv=128, lds=2
-            ),
-            "mfma16x16x128_bkv128_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K128, bkv=128, lds=2
-            ),
-            "mfma16x16x128_bkv128_r2_w4_lds2": _mk_builder(
-                2, 4, mfma=_K128, bkv=128, lds=2
-            ),
-            "mfma16x16x128_bkv256_r2_w2_lds2": _mk_builder(
-                2, 2, mfma=_K128, bkv=256, lds=2
-            ),
-            # -- LDS triple-buffered: same in-flight depth as _lds2 but the
-            #    reader/writer barrier is elided (num_buffers > prefetch_depth) --
-            "mfma32x32x64_bkv64_r1_w2_lds3": _mk_builder(
-                1, 2, mfma=_K64, bkv=64, lds=3
-            ),
-            "mfma32x32x64_bkv64_r2_w2_lds3": _mk_builder(
-                2, 2, mfma=_K64, bkv=64, lds=3
-            ),
-            "mfma32x32x64_bkv64_r2_w4_lds3": _mk_builder(
-                2, 4, mfma=_K64, bkv=64, lds=3
-            ),
-            "mfma32x32x64_bkv64_r2_w4_lds3_swp": _mk_builder(
-                2, 4, mfma=_K64, bkv=64, lds=3, sw_pipe=True
-            ),
-            # -- reduce-scatter head reduce (_rs): the 64 // MFMA_N n-tiles of
-            #    a group are head-reduced with permlane swaps and stored by all
-            #    64 lanes at once --
-            "mfma32x32x64_bkv64_r2_w4_lds3_rs": _mk_builder(
-                2, 4, mfma=_K64, bkv=64, lds=3, rs_head=True
-            ),
-            "mfma32x32x64_bkv64_r2_w4_lds3_rs_ls": _mk_builder(
-                2, 4, mfma=_K64, bkv=64, lds=3, rs_head=True, lds_scales=True
-            ),
-            "mfma32x32x64_bkv64_r2_w4_lds3_swp_rs": _mk_builder(
-                2, 4, mfma=_K64, bkv=64, lds=3, sw_pipe=True, rs_head=True
-            ),
-            "mfma16x16x128_bkv64_r2_w4_lds3_swp_rs": _mk_builder(
-                2, 4, mfma=_K128, bkv=64, lds=3, sw_pipe=True, rs_head=True
-            ),
-            # -- kv_scales staged in LDS with the KV tile (_ls) --
-            "mfma32x32x64_bkv64_r2_w4_lds3_swp_ls": _mk_builder(
-                2, 4, mfma=_K64, bkv=64, lds=3, sw_pipe=True, lds_scales=True
-            ),
-            "mfma32x32x64_bkv64_r2_w4_lds3_swp_rs_ls": _mk_builder(
-                2,
-                4,
-                mfma=_K64,
-                bkv=64,
-                lds=3,
-                sw_pipe=True,
-                rs_head=True,
-                lds_scales=True,
-            ),
-            # H64/H128 routes (r1/r2 x w2) with the _rs/_ls epilogue.
-            **{
-                f"mfma32x32x64_bkv64_r{r}_w2_lds3{swp}_rs_ls": _mk_builder(
-                    r,
-                    2,
-                    mfma=_K64,
-                    bkv=64,
-                    lds=3,
-                    sw_pipe=bool(swp),
-                    rs_head=True,
-                    lds_scales=True,
-                )
-                for r in (1, 2)
-                for swp in ("", "_swp")
-            },
-            "mfma16x16x128_bkv64_r1_w2_lds3_swp_rs_ls": _mk_builder(
-                1,
-                2,
-                mfma=_K128,
-                bkv=64,
-                lds=3,
-                sw_pipe=True,
-                rs_head=True,
-                lds_scales=True,
-            ),
-            "mfma16x16x128_bkv64_r2_w4_lds3_swp_rs_ls": _mk_builder(
-                2,
-                4,
-                mfma=_K128,
-                bkv=64,
-                lds=3,
-                sw_pipe=True,
-                rs_head=True,
-                lds_scales=True,
-            ),
-            "mfma32x32x64_bkv128_r1_w2_lds3": _mk_builder(
-                1, 2, mfma=_K64, bkv=128, lds=3
-            ),
-            "mfma32x32x64_bkv128_r2_w4_lds3": _mk_builder(
-                2, 4, mfma=_K64, bkv=128, lds=3
-            ),
-            # -- K128/bkv64 triple-buffered (complement the _lds2 entry above).
-            #
-            # At H=32, mfma16x16x128 gives M_TILES=2 and N_TILES=4 per BKV-64
-            # tile (8 MFMAs/wave), vs mfma32x32x64's M_TILES=1 N_TILES=2
-            # (4 MFMAs/wave).  Despite the 2x MFMA advantage, K128 measured
-            # slower for H=32 square shapes: MFMA_N=16 (vs 32) doubles the
-            # scatter-write count per BKV tile and adds an extra shuffle in the
-            # head-reduce butterfly, erasing the MFMA gain.  K64 + WPB=4 is
-            # the preferred auto-selection for H<=32; these variants are kept
-            # as exploration coverage and may perform better for higher H. --
-            "mfma16x16x128_bkv64_r1_w2_lds3": _mk_builder(
-                1, 2, mfma=_K128, bkv=64, lds=3
-            ),
-            "mfma16x16x128_bkv64_r2_w2_lds3": _mk_builder(
-                2, 2, mfma=_K128, bkv=64, lds=3
-            ),
-            "mfma16x16x128_bkv128_r4_w4_lds3": _mk_builder(
-                4, 4, mfma=_K128, bkv=128, lds=3
-            ),
-            "mfma16x16x128_bkv128_r2_w2_lds3": _mk_builder(
-                2, 2, mfma=_K128, bkv=128, lds=3
-            ),
-        }
-    )
-
-KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
-# None on an unsupported/undetected arch: there is no variant to name when
-# _VARIANT_BUILDERS is empty, and compile_fp8_mqa_logits' membership check then
-# rejects it with the available-variants list rather than a confusing KeyError.
 DEFAULT_VARIANT = (
     "mfma_r2_w4"
     if _ARCH == "gfx942"
-    else ("mfma32x32x64_bkv64_r1_w2_lds3" if _ARCH == "gfx950" else None)
+    else ("mfma32x32x64_bkv64_r1_w1_lds2_swp_rs_hfma" if _ARCH == "gfx950" else None)
 )
 
 # Parses both tag schemes (see the grammar above); ``shape`` is None for the
@@ -714,6 +546,11 @@ def _auto_variants():
             f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
             "supported: gfx942, gfx950"
         )
+
+
+# The variants worth naming: gfx942's registry, gfx950's routed tags (any other
+# tag in the gfx950 grammar also builds, on demand).
+KERNEL_VARIANTS = tuple(_auto_variants() if _ARCH == "gfx950" else _VARIANT_BUILDERS)
 
 
 def _resolve_variant(variant, seq_len, seq_len_kv, num_heads, head_size=128):

@@ -447,7 +447,8 @@ def _emit_row_neg_inf_fill(
 
 # MfmaAtom bundles every MFMA-shape-derived constant plus the atom/fragment
 # factories, so the kernel builders carry no hardcoded tile shape. Supporting a
-# new MFMA instruction is a new MfmaAtom instance plus a _VARIANT_BUILDERS entry.
+# new MFMA instruction is a new MfmaAtom instance plus, on gfx950, an
+# ``_GFX950_ATOMS`` entry (and on gfx942 a ``_VARIANT_BUILDERS`` entry).
 
 
 #: UE8M0 bias-127 in all four bytes -> multiplier 1.0.
@@ -1137,7 +1138,7 @@ def _build_kernel_mfma_lds_pipe(
         slots: fx.Array[fx.Int32, NUM_BUFFERS * SLOT_I32, 128]
 
     _cl_tag = "" if clean_logits else "_nocl"
-    _pd_tag = "" if PREFETCH_DEPTH == 2 else f"_pd{PREFETCH_DEPTH}"
+    _pd_tag = f"_pd{PREFETCH_DEPTH}"
     _kname = (
         f"fp8_mqa_logits_H{H}_D{D}_mfma{mfma.name}"
         f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}{_pd_tag}"
