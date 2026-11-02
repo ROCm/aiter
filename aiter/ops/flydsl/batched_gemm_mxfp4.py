@@ -108,9 +108,10 @@ def flydsl_batched_gemm_mxfp4(
         out if out is not None else torch.empty(shape, dtype=dtype, device=a.device)
     )
 
-    # @flyc.jit caches per Constexpr config internally; M rides i32_m at runtime (not baked).
+    # Cache compiled dispatch per configuration; M rides i32_m at runtime (not baked).
     # Operands go in as ptr_arg (raw data_ptr) so each launch skips per-tensor DLPack conversion.
-    launch_gemm(
+    _run_compiled(
+        launch_gemm,
         ptr_arg(out_phys.view(-1)),
         ptr_arg(a.reshape(-1)),
         ptr_arg(w),
@@ -129,6 +130,19 @@ def flydsl_batched_gemm_mxfp4(
         B,
         *strides,
         0,
+        specialization_key=(
+            a.device,
+            N,
+            K,
+            tile_m,
+            tile_n,
+            tile_k,
+            a_dtype,
+            out_dtype,
+            B,
+            *strides,
+            0,
+        ),
     )
 
     # mbn C physical [M,B,N] -> logical [B,M,N] view.
@@ -235,8 +249,10 @@ def _run_gfx1250(
 
     # A/B only need the base address (views built in-kernel) -> pass as pointers;
     # bind the contiguous A to a local so its storage outlives the async launch.
+    # Tensor arguments retain their layouts, so include those in the cache key.
     a_c = a.contiguous()
-    launch_gemm_a8w4_tdm(
+    _run_compiled(
+        launch_gemm_a8w4_tdm,
         out_phys,
         ptr_arg(a_c),
         ptr_arg(w),
@@ -258,6 +274,30 @@ def _run_gfx1250(
         a_is_fp4,
         ptr_arg(a_c),  # masked_m unused when grouped_masked=0
         0,
+        specialization_key=(
+            a.device,
+            N,
+            K,
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            out_is_f16,
+            B,
+            layout_mbn,
+            num_buffers,
+            a_is_fp4,
+            out_phys.dtype,
+            tuple(out_phys.shape),
+            tuple(out_phys.stride()),
+            a_scales.dtype,
+            tuple(a_scales.shape),
+            tuple(a_scales.stride()),
+            w_scales.dtype,
+            tuple(w_scales.shape),
+            tuple(w_scales.stride()),
+        ),
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys
 

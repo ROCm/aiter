@@ -522,8 +522,41 @@ _run_compiled(compiled["launch"],
   `stream`) — bypasses DLPack. See `mla_reduce_kernels.py`,
   `linear_attention_prefill_kernels.py`, `splitk_hgemm.py`.
 - Reuse `tensor_shim._run_compiled`; don't add a second copy in wrapper modules.
-- Worth it for small kernels in tight loops, not cold one-shot launches. Arg
-  order/types must match the compiled signature — verify.
+- Preserve existing GEMM APIs during host-launch caching work. No in-tree callers
+  does not rule out downstream use (for example, ATOM); change dispatch unless
+  API retirement is part of the task. Record missing dependencies or stale
+  kernel signatures separately from caching.
+- New runtime entry points and routing branches must use this helper or an
+  existing equivalent `CompiledFunction` cache. Arg order/types must match the
+  compiled signature; the first `flyc.compile` call already executes it.
+- A factory with fixed compile parameters can keep one `_cf`. A JitFunction
+  with varying constexpr parameters needs `specialization_key` covering those
+  parameters and artifact-changing tensor ABI/device variation, or the family's
+  existing cache owner. Reusing its first artifact for another configuration
+  can change the answer. A `@cache` factory named `compile_*` or
+  `_get_compiled_*` may still return a JitFunction: inspect the returned object
+  and its runtime caller.
+
+### Rescan an updated repository
+
+Before reporting current `main` coverage, run `git fetch origin main` and record
+the fetched `origin/main` SHA plus the scanned revision. Compare it with the
+working branch; preserve uncommitted work and scan an isolated worktree when
+the workspace is behind or has unrelated edits. Do not label a workspace scan
+as current-main coverage.
+
+Trace host calls through aliases, factories, Python wrappers and dispatch
+branches. Count runtime call sites separately from unique kernels, and exclude
+kernel-internal JIT helpers and intentional AOT/preload calls. Classify compile
+failure fallbacks and obsolete APIs separately; check callers, exports and the
+imported kernel before treating a text hit as an active omission.
+
+For omissions found after an earlier cleanup, use `git blame`, introducing
+diffs and commit ancestry to establish whether the call was added later.
+Report the introducing commit instead of assuming it survived the previous
+scan. After fixing it, rescan the final tree and exercise warmed dispatch with
+changing runtime buffers and relevant compile configurations, including graph
+replay or compile-only behavior when the path supports them.
 
 ---
 

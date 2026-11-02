@@ -191,10 +191,35 @@ def launch(
 
 # Usage:
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
 A = torch.randn(1024, device="cuda", dtype=torch.float32)
 B = torch.empty(1024, device="cuda", dtype=torch.float32)
-launch(A, B, 1024)
+_run_compiled(launch, A, B, 1024, fx.Stream(None), specialization_key=1024)
 ```
+
+### Host launch caching
+
+New aiter runtime entry points must dispatch their `@flyc.jit` launchers through
+`tensor_shim._run_compiled` or an existing equivalent cache of `flyc.compile`'s
+`CompiledFunction`. Apply this when adding a kernel or a new routing branch;
+an earlier repository cleanup does not cover later additions. A cached factory
+returning a JitFunction is not itself a compiled-dispatch cache.
+
+Preserve existing entry points when adding compiled dispatch. No in-tree callers
+does not establish absence of downstream users; API retirement is a separate
+task from host-launch caching.
+
+Leave `specialization_key` unset for factory launchers with fixed compile
+parameters. For launchers with varying constexpr arguments, key every compile
+parameter and any tensor ABI or device variation that changes the artifact;
+reuse the family's existing cache owner when available. Cached calls still take
+the runtime pointers, scalars and stream in the compiled signature's order.
+`flyc.compile` executes the first live call, so do not launch it a second time.
+Use `_preload_compiled` for no-dispatch preload, and keep kernel-internal JIT
+helpers inside the tracing context. See the
+[cleanup skill's launch audit](../flydsl-kernel-code-cleanup/SKILL.md#9-cut-launch-overhead-with-_run_compiled)
+when checking existing entry points.
 
 ### Current Syntax Quick Reference
 
