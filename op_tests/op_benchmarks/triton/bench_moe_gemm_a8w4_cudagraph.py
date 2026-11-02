@@ -2,8 +2,8 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 """Benchmark the fp8 x mxfp4 MoE MLP (two moe_gemm_a8w4 calls).
 
-Each batch size is measured three times with `triton.testing.do_bench_cudagraph`
-and reported as three rows, keyed by the `layer` column:
+Each batch size is measured with `RotatingBufferBench` (CUDA graph replay)
+and reported as up to three rows, keyed by the `layer` column:
 
   moe1   the gathered up projection alone   (N = dim2 / TP, K = dim1, + swiglu)
   moe2   the scattered down projection alone (N = dim1, K = dim2 / TP / 2)
@@ -55,12 +55,12 @@ gluon-only gfx1250 WMMA weight preshuffle.
 
 import argparse
 import csv
+import functools
 import inspect
 from itertools import chain
 from pathlib import Path
 
 import torch
-import triton
 
 from aiter.ops.shuffle import shuffle_weight_gfx1250
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
@@ -69,7 +69,14 @@ from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 # measurable layers, in report order; see the module docstring
 LAYERS = ("moe1", "moe2", "total")
@@ -275,7 +282,246 @@ def kernel_variant(block_m, K, backend=None):
     return "_moe_gemm_a8w4_decode_persistent" if K <= 768 else "_moe_gemm_a8w4_decode"
 
 
-def bench_mlp_single_weight_init(
+_POOL_FIELDS = [
+    "x1",
+    "w1",
+    "x1_scales",
+    "w1_scales",
+    "x1_static_scale",
+    "quant_static_scale1",
+    "b1",
+    "rdata",
+    "gather_indx",
+    "swizzle_mx_scale1",
+    "x2",
+    "w2",
+    "x2_scales",
+    "w2_scales",
+    "x2_static_scale",
+    "b2",
+    "scatter_indx",
+    "swizzle_mx_scale2",
+    "y1_bytes",
+]
+
+
+def _generate_pool_inputs(
+    batch,
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    x_dtype,
+    w_dtype,
+    TP,
+    preshuffle,
+    bias,
+    backend,
+    routed_experts,
+    static_fp8,
+    out_dtype1,
+    alpha,
+    limit,
+    swiglu_add_residual,
+):
+    """One full weight-init draw: weights, routing, and the layer-1 swiglu
+    output layer 2 reads. Regenerated per pool entry, so replaying through the
+    pool rotates through distinct weight/routing draws instead of keeping one
+    draw's tensors cache-resident -- the role `num_weight_inits` used to play
+    via a Python averaging loop.
+    """
+    rank = 0
+    dev = f"cuda:{rank}"
+
+    # -- init data --
+    # weights
+    wg = torch.randn((dim1, n_expts_tot), dtype=torch.float32, device=dev)
+    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), dtype=torch.float32, device=dev)
+    w2 = torch.randn(
+        (n_expts_tot, dim2 // TP // 2, dim1), dtype=torch.float32, device=dev
+    )
+    # biases
+    bg = torch.randn((n_expts_tot,), dtype=torch.float32, device=dev)
+    if bias:
+        b1 = torch.randn((n_expts_tot, dim2 // TP), dtype=torch.float32, device=dev)
+        b2 = torch.randn((n_expts_tot, dim1), dtype=torch.float32, device=dev)
+    else:
+        b1 = b2 = None
+
+    # -- numerics --
+    wg, _ = quantize(wg, "bf16")
+    w1, w1_scales = quantize(w1, w_dtype)
+    w2, w2_scales = quantize(w2, w_dtype)
+    w1_scales, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scales, dim2 // TP, dim1)
+    w2_scales, swizzle_mx_scale2 = check_and_shuffle_scales(
+        w2_scales, dim1, dim2 // TP // 2
+    )
+    if preshuffle:
+        w1 = preshuffle_weight(w1)
+        w2 = preshuffle_weight(w2)
+
+    # -- routing + layer-1 activations --
+    x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
+    logits = gemm_a16w16(x, wg.T, bg)
+    if routed_experts is not None:
+        logits, _ = pin_routed_experts(logits, routed_experts, n_expts_act)
+    rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
+
+    if static_fp8:
+        x1_scales = None
+        x1_static_scale = static_scale_of(x)
+        x1 = downcast_to_static_fp8(x, x1_static_scale)
+    else:
+        x1_static_scale = None
+        x1, x1_scales = quantize(x, x_dtype)
+
+    def gemm1(out_dtype, quant_static_scale):
+        return moe_gemm_a8w4(
+            x1,
+            w1,
+            x1_scales,
+            w1_scales,
+            x1_static_scale,
+            quant_static_scale,
+            b1,
+            routing_data=rdata,
+            gather_indx=gather_indx,
+            swizzle_mx_scale=swizzle_mx_scale1,
+            out_dtype=out_dtype,
+            apply_swiglu=True,
+            alpha=alpha,
+            limit=limit,
+            swiglu_add_residual=swiglu_add_residual,
+            preshuffled=preshuffle,
+            backend=backend,
+        )
+
+    if static_fp8:
+        # Layer 1 quantizes its own swiglu output in the epilogue, so layer 2
+        # reads fp8 with no quant kernel in between -- but the scale has to be
+        # known up front. Calibrate it from one untimed bf16 call so the
+        # hand-off lands in e4m3 range instead of saturating.
+        y1_bf16 = gemm1(torch.bfloat16, None)
+        x2_static_scale = static_scale_of(y1_bf16)
+        del y1_bf16
+        quant_static_scale1 = x2_static_scale
+    else:
+        x2_static_scale = None
+        quant_static_scale1 = None
+
+    # layer 2 reads layer 1's swiglu output; get it (and, for mxfp8, its
+    # scales) once here, outside the timed region. This doubles as the
+    # compile warmup.
+    y1 = gemm1(out_dtype1, quant_static_scale1)
+    y1_bytes = y1.numel() * y1.element_size()
+    if static_fp8:
+        # already e4m3, quantized by layer 1 with x2_static_scale
+        x2, x2_scales = y1, None
+    else:
+        x2, x2_scales = quantize(y1, x_dtype)
+        del y1
+
+    return (
+        x1,
+        w1,
+        x1_scales,
+        w1_scales,
+        x1_static_scale,
+        quant_static_scale1,
+        b1,
+        rdata,
+        gather_indx,
+        swizzle_mx_scale1,
+        x2,
+        w2,
+        x2_scales,
+        w2_scales,
+        x2_static_scale,
+        b2,
+        scatter_indx,
+        swizzle_mx_scale2,
+        y1_bytes,
+    )
+
+
+def _layer1_fn(out_dtype1, alpha, limit, swiglu_add_residual, preshuffle, backend):
+    def _fn(
+        x1,
+        w1,
+        x1_scales,
+        w1_scales,
+        x1_static_scale,
+        quant_static_scale1,
+        b1,
+        rdata,
+        gather_indx,
+        swizzle_mx_scale1,
+        **_,
+    ):
+        return moe_gemm_a8w4(
+            x1,
+            w1,
+            x1_scales,
+            w1_scales,
+            x1_static_scale,
+            quant_static_scale1,
+            b1,
+            routing_data=rdata,
+            gather_indx=gather_indx,
+            swizzle_mx_scale=swizzle_mx_scale1,
+            out_dtype=out_dtype1,
+            apply_swiglu=True,
+            alpha=alpha,
+            limit=limit,
+            swiglu_add_residual=swiglu_add_residual,
+            preshuffled=preshuffle,
+            backend=backend,
+        )
+
+    return _fn
+
+
+def _layer2_fn(preshuffle, backend):
+    def _fn(
+        x2,
+        w2,
+        x2_scales,
+        w2_scales,
+        x2_static_scale,
+        b2,
+        rdata,
+        scatter_indx,
+        swizzle_mx_scale2,
+        **_,
+    ):
+        return moe_gemm_a8w4(
+            x2,
+            w2,
+            x2_scales,
+            w2_scales,
+            x2_static_scale,
+            None,
+            b2,
+            routing_data=rdata,
+            scatter_indx=scatter_indx,
+            swizzle_mx_scale=swizzle_mx_scale2,
+            preshuffled=preshuffle,
+            backend=backend,
+        )
+
+    return _fn
+
+
+def _both_fn(layer1_fn, layer2_fn):
+    def _fn(**kwargs):
+        layer1_fn(**kwargs)
+        layer2_fn(**kwargs)
+
+    return _fn
+
+
+def bench_mlp(
+    bencher,
     batch,
     dim1,
     dim2,
@@ -289,12 +535,9 @@ def bench_mlp_single_weight_init(
     activation,
     backend,
     routed_experts,
-    rep,
     layers=LAYERS,
+    num_weight_inits=1,
 ):
-    rank = 0
-    dev = f"cuda:{rank}"
-
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
     assert x_dtype in ACT_DTYPES, f"{x_dtype=} must be one of {ACT_DTYPES}"
     assert w_dtype == "mx4", f"a8w4 weights are mxfp4 (E2M1), got {w_dtype}"
@@ -320,143 +563,60 @@ def bench_mlp_single_weight_init(
     assert layers, "at least one layer must be selected"
     assert set(layers) <= set(LAYERS), f"unknown layer(s) in {layers=}"
 
-    # -- init data --
-    # weights
-    wg = torch.randn((dim1, n_expts_tot), dtype=torch.float32, device=dev)
-    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), dtype=torch.float32, device=dev)
-    w2 = torch.randn(
-        (n_expts_tot, dim2 // TP // 2, dim1), dtype=torch.float32, device=dev
-    )
-    # biases
-    bg = torch.randn((n_expts_tot,), dtype=torch.float32, device=dev)
-    if bias:
-        b1 = torch.randn((n_expts_tot, dim2 // TP), dtype=torch.float32, device=dev)
-        b2 = torch.randn((n_expts_tot, dim1), dtype=torch.float32, device=dev)
-    else:
-        b1 = b2 = None
-    # activation
     if activation == "silu":
-        alpha = 1.0
-        limit = None
-        swiglu_add_residual = False
+        alpha, limit, swiglu_add_residual = 1.0, None, False
     else:
-        alpha = 1.7
-        limit = 7.0
-        swiglu_add_residual = True
-
-    # -- numerics --
-    wg, _ = quantize(wg, "bf16")
-    w1, w1_scale = quantize(w1, w_dtype)
-    w2, w2_scale = quantize(w2, w_dtype)
-    w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
-    w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
-        w2_scale, dim1, dim2 // TP // 2
-    )
-    if preshuffle:
-        w1 = preshuffle_weight(w1)
-        w2 = preshuffle_weight(w2)
-
-    # -- routing + layer-1 activations: built once, outside the timed region --
-    x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
-    logits = gemm_a16w16(x, wg.T, bg)
-    n_pinned = None
-    if routed_experts is not None:
-        logits, n_pinned = pin_routed_experts(logits, routed_experts, n_expts_act)
-    rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
+        alpha, limit, swiglu_add_residual = 1.7, 7.0, True
 
     static_fp8 = x_dtype == "fp8"
-    if static_fp8:
-        x1_scale = None
-        x1_static_scale = static_scale_of(x)
-        x1 = downcast_to_static_fp8(x, x1_static_scale)
-    else:
-        x1_static_scale = None
-        x1, x1_scale = quantize(x, x_dtype)
+    out_dtype1 = fp8_dtype() if static_fp8 else torch.bfloat16
 
-    def gemm1(out_dtype, quant_static_scale):
-        return moe_gemm_a8w4(
-            x1,
-            w1,
-            x1_scale,
-            w1_scale,
-            x1_static_scale,
-            quant_static_scale,
-            b1,
-            rdata,
-            gather_indx=gather_indx,
-            swizzle_mx_scale=swizzle_mx_scale1,
-            out_dtype=out_dtype,
-            apply_swiglu=True,
-            alpha=alpha,
-            limit=limit,
-            swiglu_add_residual=swiglu_add_residual,
-            preshuffled=preshuffle,
-            backend=backend,
-        )
+    _p_gen = functools.partial(
+        _generate_pool_inputs,
+        batch,
+        dim1,
+        dim2,
+        n_expts_tot,
+        n_expts_act,
+        x_dtype,
+        w_dtype,
+        TP,
+        preshuffle,
+        bias,
+        backend,
+        routed_experts,
+        static_fp8,
+        out_dtype1,
+        alpha,
+        limit,
+        swiglu_add_residual,
+    )
+    # pool_len == num_weight_inits: each captured call in the graph replays a
+    # distinct weight/routing draw, the same role the old averaging loop played.
+    rot_bufs = bencher.build_pool(
+        [_p_gen],
+        [_POOL_FIELDS],
+        min_pool_len=num_weight_inits,
+        max_pool_len=num_weight_inits,
+    )
 
-    if static_fp8:
-        # Layer 1 quantizes its own swiglu output in the epilogue, so layer 2
-        # reads fp8 with no quant kernel in between -- but the scale has to be
-        # known up front. Calibrate it from one untimed bf16 call so the
-        # hand-off lands in e4m3 range instead of saturating.
-        y1_bf16 = gemm1(torch.bfloat16, None)
-        x2_static_scale = static_scale_of(y1_bf16)
-        del y1_bf16
-        out_dtype1, quant_static_scale1 = fp8_dtype(), x2_static_scale
-    else:
-        x2_static_scale = None
-        out_dtype1, quant_static_scale1 = torch.bfloat16, None
-
-    def layer1():
-        return gemm1(out_dtype1, quant_static_scale1)
-
-    # layer 2 reads layer 1's swiglu output; get it (and, for mxfp8, its
-    # scales) once here so the timed region holds only the two GEMMs. This
-    # doubles as the compile warmup.
-    y1 = layer1()
-    y1_bytes = y1.numel() * y1.element_size()
-    if static_fp8:
-        # already e4m3, quantized by layer 1 with x2_static_scale
-        x2, x2_scale = y1, None
-    else:
-        x2, x2_scale = quantize(y1, x_dtype)
-        del y1
-
-    def layer2():
-        return moe_gemm_a8w4(
-            x2,
-            w2,
-            x2_scale,
-            w2_scale,
-            x2_static_scale,
-            None,
-            b2,
-            rdata,
-            scatter_indx=scatter_indx,
-            swizzle_mx_scale=swizzle_mx_scale2,
-            preshuffled=preshuffle,
-            backend=backend,
-        )
-
-    y2 = layer2()
-    torch.cuda.synchronize()
-
-    def both():
-        layer1()
-        layer2()
+    layer1_fn = _layer1_fn(
+        out_dtype1, alpha, limit, swiglu_add_residual, preshuffle, backend
+    )
+    layer2_fn = _layer2_fn(preshuffle, backend)
+    both_fn = _both_fn(layer1_fn, layer2_fn)
 
     # -- analytic FLOPs / bytes, matching the proton metadata the kernel itself
     # reports: 2*M*N*K per GEMM, and activations + routed-expert weights +
     # matmul output for traffic. mx scales (~1/16 of the weight bytes, and of
     # the activation bytes under --act-dtype mx8) and the moe2 scatter
     # reduction are not counted; the reduction's runtime is inside
-    # moe_gemm_a8w4 and so is inside the measurement.
-    n_tokens = gather_indx.shape[0]  # routed rows == batch * n_expts_act
-    routed = int((rdata.expt_data.hist > 0).sum())  # experts that got >= 1 token
-    if n_pinned is not None:
-        assert (
-            routed == n_pinned
-        ), f"--routed-experts pinned {n_pinned} experts, routing used {routed}"
+    # moe_gemm_a8w4 and so is inside the measurement. Taken from entry 0: the
+    # shapes are identical across entries even though the routed count can
+    # drift slightly with the random draw.
+    sample = rot_bufs[0]
+    n_tokens = sample["gather_indx"].shape[0]  # routed rows == batch * n_expts_act
+    routed = int((sample["rdata"].expt_data.hist > 0).sum())  # experts w/ >= 1 token
 
     def w_bytes(w):
         return (w.numel() * w.element_size() // n_expts_tot) * routed
@@ -464,17 +624,24 @@ def bench_mlp_single_weight_init(
     def w_scale_bytes(w):
         return (w.numel() * w.element_size() * 2 // 32 // n_expts_tot) * routed
 
+    x1, w1, x2, w2 = sample["x1"], sample["w1"], sample["x2"], sample["w2"]
     moe1_flops = 2 * n_tokens * (dim2 // TP) * dim1  # N = dim2 // TP, K = dim1
     moe1_bytes = (
-        x1.numel() * x1.element_size() + w_bytes(w1) + w_scale_bytes(w1) + y1_bytes
+        x1.numel() * x1.element_size()
+        + w_bytes(w1)
+        + w_scale_bytes(w1)
+        + sample["y1_bytes"]
     )
     if not static_fp8:
         moe1_bytes += x1.numel() // 32
     if bias:
+        b1 = sample["b1"]
         moe1_bytes += (b1.numel() * b1.element_size() // n_expts_tot) * routed
     moe2_flops = 2 * n_tokens * dim1 * (dim2 // TP // 2)  # N = dim1, K = dim2/TP/2
     # y2 is the scatter-compressed [batch, dim1] result; the GEMM writes the
-    # uncompressed [n_tokens, dim1] rows the reduction then combines.
+    # uncompressed [n_tokens, dim1] rows the reduction then combines. Computed
+    # once here (outside the timed region) purely for its dtype/element size.
+    y2 = layer2_fn(**sample)
     moe2_bytes = (
         x2.numel() * x2.element_size()
         + w_bytes(w2)
@@ -484,12 +651,13 @@ def bench_mlp_single_weight_init(
     if not static_fp8:
         moe2_bytes += x2.numel() // 32
     if bias:
+        b2 = sample["b2"]
         moe2_bytes += (b2.numel() * b2.element_size() // n_expts_tot) * routed
 
     # the two projections have the same block_m but different K, so they can
     # land on different gluon variants
-    kernel1 = kernel_variant(rdata.block_m, dim1, backend)
-    kernel2 = kernel_variant(rdata.block_m, dim2 // TP // 2, backend)
+    kernel1 = kernel_variant(sample["rdata"].block_m, dim1, backend)
+    kernel2 = kernel_variant(sample["rdata"].block_m, dim2 // TP // 2, backend)
     kernels = {
         "moe1": kernel1,
         "moe2": kernel2,
@@ -501,13 +669,13 @@ def bench_mlp_single_weight_init(
     # `total` is NOT moe1 + moe2 -- an isolated projection replays one kernel
     # over and over, so its weights stay hotter than they are in the real layer.
     to_bench = {
-        "moe1": (layer1, moe1_flops, moe1_bytes),
-        "moe2": (layer2, moe2_flops, moe2_bytes),
-        "total": (both, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes),
+        "moe1": (layer1_fn, moe1_flops, moe1_bytes),
+        "moe2": (layer2_fn, moe2_flops, moe2_bytes),
+        "total": (both_fn, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes),
     }
     measured = {
         name: {
-            "latency_ms": triton.testing.do_bench_cudagraph(f, rep=rep),
+            "latency_ms": bencher.bench(f),
             "flops": flops,
             "bytes": byts,
             "kernel": kernels[name],
@@ -518,73 +686,13 @@ def bench_mlp_single_weight_init(
 
     return {
         "layers": measured,
-        "block_m": rdata.block_m,
+        "block_m": sample["rdata"].block_m,
         "routed_experts": routed,
     }
 
 
-def bench_mlp(
-    batch,
-    dim1,
-    dim2,
-    n_expts_tot,
-    n_expts_act,
-    x_dtype,
-    w_dtype,
-    TP,
-    preshuffle,
-    bias,
-    activation,
-    backend,
-    routed_experts,
-    rep,
-    layers=LAYERS,
-    num_weight_inits=1,
-):
-    all_results = []
-    for i in range(num_weight_inits):
-        result = bench_mlp_single_weight_init(
-            batch,
-            dim1,
-            dim2,
-            n_expts_tot,
-            n_expts_act,
-            x_dtype,
-            w_dtype,
-            TP,
-            preshuffle,
-            bias,
-            activation,
-            backend,
-            routed_experts,
-            rep,
-            layers,
-        )
-        all_results.append(result)
-
-    num_runs = len(all_results)
-    aggregated = {
-        "layers": {
-            name: {
-                **{
-                    key: sum(r["layers"][name][key] for r in all_results) / num_runs
-                    for key in ("latency_ms", "flops", "bytes")
-                },
-                # the dispatched kernel depends on batch/topk/E and the layer's
-                # K, none of which move with the weight draw
-                "kernel": all_results[0]["layers"][name]["kernel"],
-            }
-            for name in all_results[0]["layers"]
-        },
-        # routing block_m depends only on batch/topk/E
-        "block_m": all_results[0]["block_m"],
-        "routed_experts": sum(r["routed_experts"] for r in all_results) / num_runs,
-    }
-
-    return aggregated
-
-
 def roofline_mlp(
+    bencher,
     batch_sizes,
     dim1,
     dim2,
@@ -598,7 +706,6 @@ def roofline_mlp(
     activation,
     backend,
     routed_experts,
-    rep,
     layers=LAYERS,
     num_weight_inits=1,
     name="",
@@ -624,6 +731,7 @@ def roofline_mlp(
     out_csv = out_dir / f"{stem}.csv"
 
     compute_roofline(
+        bencher,
         dim1,
         dim2,
         n_expts_tot,
@@ -635,8 +743,7 @@ def roofline_mlp(
         bias,
         activation,
         backend,
-        routed_experts,
-        rep,  # fixed args
+        routed_experts,  # fixed args
         layers,
         num_weight_inits,
         bench_fn=bench_mlp,  # function to benchmark
@@ -733,7 +840,8 @@ def parse_args(args: list[str] | None = None):
         "--rep",
         type=int,
         default=20,
-        help="do_bench_cudagraph measurement target per batch size, in ms (default: 20).",
+        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
+        "constant, not an adaptive rep target. Kept for CLI compatibility.",
     )
     parser.add_argument(
         "--num-weight-inits",
@@ -765,8 +873,12 @@ def main(args: list[str] | None = None) -> None:
     else:
         batch_sizes_moe = parsed_args.M
     quantized_dtypes = [parsed_args.act_dtype, "mx4"]
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(parsed_args), **get_do_bench_graph_kwargs(parsed_args)}
+    )
 
     roofline_mlp(
+        bencher,
         batch_sizes_moe,
         dim1,
         dim2,
@@ -780,7 +892,6 @@ def main(args: list[str] | None = None) -> None:
         activation=parsed_args.activation,
         backend=parsed_args.backend,
         routed_experts=parsed_args.routed_experts,
-        rep=parsed_args.rep,
         # dedupe, keeping the canonical report order rather than argv order
         layers=tuple(n for n in LAYERS if n in parsed_args.layers),
         num_weight_inits=parsed_args.num_weight_inits,

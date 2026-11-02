@@ -4,6 +4,7 @@
 """Benchmark the merged MoE SiTU Triton epilogue."""
 
 import argparse
+import functools
 
 import torch
 import triton
@@ -11,12 +12,36 @@ import triton
 from aiter.ops.triton.moe.moe_situ_epilogue import (
     moe_situ_epilogue,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 _M_VALUES = [1, 4, 16, 32, 64, 128, 192, 512, 1024, 1536, 2048]
+
+_OUT_VAL_KEYS = ["merged_projection", "shared_out", "router_out", "routed_out"]
+
+
+def _generate_pool_inputs(M, shared_intermediate_size, num_experts, routed_latent_size):
+    projection_size = 2 * shared_intermediate_size + num_experts + routed_latent_size
+    merged_projection = torch.randn(
+        (M, projection_size), dtype=torch.float32, device="cuda"
+    )
+    shared_out = torch.empty(
+        (M, shared_intermediate_size), dtype=torch.bfloat16, device="cuda"
+    )
+    router_out = torch.empty((M, num_experts), dtype=torch.float32, device="cuda")
+    routed_out = torch.empty(
+        (M, routed_latent_size), dtype=torch.bfloat16, device="cuda"
+    )
+    return merged_projection, shared_out, router_out, routed_out
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
@@ -32,53 +57,29 @@ def run_benchmark(args: argparse.Namespace) -> None:
         plot_name=get_caller_name_no_ext(),
         args={},
     )
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench(M: int, provider: str) -> float:
         del provider
-        projection_size = (
-            2 * args.shared_intermediate_size
-            + args.num_experts
-            + args.routed_latent_size
+        _p_gen = functools.partial(
+            _generate_pool_inputs,
+            M,
+            args.shared_intermediate_size,
+            args.num_experts,
+            args.routed_latent_size,
         )
-        merged_projection = torch.randn(
-            (M, projection_size), dtype=torch.float32, device="cuda"
-        )
-        shared = torch.empty(
-            (M, args.shared_intermediate_size),
-            dtype=torch.bfloat16,
-            device=merged_projection.device,
-        )
-        router = torch.empty(
-            (M, args.num_experts),
-            dtype=torch.float32,
-            device=merged_projection.device,
-        )
-        routed = torch.empty(
-            (M, args.routed_latent_size),
-            dtype=torch.bfloat16,
-            device=merged_projection.device,
-        )
+        bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
 
-        def fn():
-            return moe_situ_epilogue(
-                merged_projection,
-                shared_intermediate_size=args.shared_intermediate_size,
-                num_experts=args.num_experts,
-                routed_latent_size=args.routed_latent_size,
-                shared_out=shared,
-                router_out=router,
-                routed_out=routed,
-            )
-
-        return (
-            triton.testing.do_bench_cudagraph(
-                fn,
-                rep=args.rep,
-                return_mode="mean",
-            )
-            * 1000
+        kernel_fn = functools.partial(
+            moe_situ_epilogue,
+            shared_intermediate_size=args.shared_intermediate_size,
+            num_experts=args.num_experts,
+            routed_latent_size=args.routed_latent_size,
         )
+        return bencher.bench(kernel_fn) * 1000
 
     bench.run(save_path="." if args.output else None, print_data=True)
 
@@ -89,7 +90,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shared-intermediate-size", type=int, default=768)
     parser.add_argument("--num-experts", type=int, default=896)
     parser.add_argument("--routed-latent-size", type=int, default=3584)
-    parser.add_argument("--rep", type=int, default=100)
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=100,
+        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
+        "constant, not an adaptive rep target. Kept for CLI compatibility.",
+    )
     parser.add_argument("-o", "--output", action="store_true")
     return parser.parse_args()
 
