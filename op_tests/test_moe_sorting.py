@@ -21,6 +21,39 @@ SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
 def test_moe_sorting_opus_host_dispatch_boundaries():
+    if get_gfx() == "gfx942":
+        device_id = torch.cuda.current_device()
+        expect_multi = {
+            (128, 8): False,
+            (129, 8): True,
+            (32, 32): False,
+            (33, 32): True,
+            (16, 64): False,
+            (17, 64): True,
+            (8, 128): False,
+            (9, 128): True,
+            (1, 129): True,
+            (1, 257): True,
+            (24, 257): True,
+            (1, 385): True,
+            (1, 512): True,
+        }
+        for (token, E), multi in expect_multi.items():
+            auto_workspace = aiter.moe_sorting_opus_get_workspace_size(
+                token, E, 8, 0, device_id
+            )
+            assert (
+                auto_workspace > 0
+            ) == multi, f"unexpected auto dispatch for E={E}, M={token}"
+            assert (
+                aiter.moe_sorting_opus_get_workspace_size(token, E, 8, 1, device_id)
+                == 0
+            ), f"forced oneshot failed for E={E}, M={token}"
+            assert (
+                aiter.moe_sorting_opus_get_workspace_size(token, E, 8, 2, device_id) > 0
+            ), f"forced multi failed for E={E}, M={token}"
+        return
+
     if get_gfx() != "gfx950":
         device_id = torch.cuda.current_device()
         assert aiter.moe_sorting_opus_get_workspace_size(1, 384, 8, 0, device_id) == 0
@@ -69,7 +102,7 @@ def test_moe_sorting_opus_workspace_uses_explicit_device():
     try:
         workspace = aiter.moe_sorting_opus_get_workspace_size(8, 256, 8, 0, target)
         assert torch.cuda.current_device() == original
-        if _device_arch(target) == "gfx950":
+        if _device_arch(target) in ("gfx942", "gfx950"):
             assert workspace > 0
     finally:
         torch.cuda.set_device(original)
@@ -83,12 +116,18 @@ def test_moe_sorting_opus_workspace_switches_arch_policy():
         aiter.logger.warning("arch-switch test requires gfx950 and non-gfx950 devices")
         return
 
+    # M=1 is multi-phase at E=385 on gfx950 only, and at E=256 on gfx942 only.
+    E = 256 if arches[other] == "gfx942" else 385
     original = torch.cuda.current_device()
     try:
         torch.cuda.set_device(other)
-        assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, gfx950) > 0
+        assert (aiter.moe_sorting_opus_get_workspace_size(1, E, 8, 0, gfx950) > 0) == (
+            E == 385
+        )
         torch.cuda.set_device(gfx950)
-        assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, other) == 0
+        assert (aiter.moe_sorting_opus_get_workspace_size(1, E, 8, 0, other) > 0) == (
+            E == 256
+        )
     finally:
         torch.cuda.set_device(original)
 
