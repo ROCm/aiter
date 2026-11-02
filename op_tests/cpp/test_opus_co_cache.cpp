@@ -14,7 +14,10 @@ struct Module { int device; const char* image; const void* host = nullptr; };
 struct State {
     int created = 0;
     int destroyed = 0;
+    int module_loads = 0;
     bool fail = false;
+    bool strict_unloadable = false;
+    int last_processor = -1;
     std::unordered_map<const void*, Module*> hosts;
 };
 State& state() { static State* value = new State; return *value; }
@@ -31,6 +34,18 @@ extern "C" hipError_t hipGetDeviceProperties(hipDeviceProp_t* prop, int device) 
     return hipSuccess;
 }
 extern "C" const char* hipGetErrorString(hipError_t) { return "mock HIP status"; }
+extern "C" const char* hipGetErrorName(hipError_t) { return "mockHIPError"; }
+// Preflight path used by the A0 fallback: old runtimes reject 0xeb images.
+extern "C" hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
+    ++test_state::state().module_loads;
+    const auto processor =
+        static_cast<int>(reinterpret_cast<const unsigned char*>(image)[48]);
+    if(test_state::state().strict_unloadable && processor == 0xeb)
+        return hipErrorNoBinaryForGpu;
+    *module = reinterpret_cast<hipModule_t>(0x1);
+    return hipSuccess;
+}
+extern "C" hipError_t hipModuleUnload(hipModule_t) { return hipSuccess; }
 extern "C" hipError_t hipGetFuncBySymbol(hipFunction_t* function, const void* host) {
     const auto it = test_state::state().hosts.find(host);
     if(test_state::state().fail || it == test_state::state().hosts.end() ||
@@ -44,6 +59,8 @@ extern "C" hipError_t hipGetFuncBySymbol(hipFunction_t* function, const void* ho
 namespace aiter_detail {
 extern "C" void* __hipRegisterFatBinary(const FatBinaryWrapper* wrapper) noexcept {
     ++test_state::state().created;
+    const auto* bytes = static_cast<const unsigned char*>(wrapper->binary);
+    test_state::state().last_processor = static_cast<int>(bytes[48]);
     return new test_state::Module{test_state::device, static_cast<const char*>(wrapper->binary)};
 }
 extern "C" void __hipUnregisterFatBinary(void* value) noexcept {
@@ -124,12 +141,37 @@ int main(int argc, char** argv) {
     catch(const std::runtime_error&) { failed = true; }
     assert(failed);
 
+    // A0 + old HIP runtime: the strict 0xeb image is rejected by the runtime,
+    // so the loader must fall back to the already-validated regular 0x49 image.
+    const auto oldrt = work / "oldrt";
+    write_image(oldrt / "gfx1250" / (symbol + ".co"), 0x49);
+    write_image(oldrt / "gfx1250-a0" / (symbol + ".co"), 0xeb);
+    setenv("OPUS_GEN_CO_DIR", oldrt.c_str(), 1);
+    test_state::state().strict_unloadable = true;
+    auto* fallback = &opus_gfx1250_co::co_kernel(symbol, 0);
+    assert(test_state::state().created == 6);
+    assert(test_state::state().last_processor == 0x49);
+    assert(test_state::state().module_loads >= 2);
+    assert(&opus_gfx1250_co::co_kernel(symbol, 0) == fallback);
+    test_state::state().strict_unloadable = false;
+
+    // New HIP runtime: strict 0xeb is loadable and stays preferred.
+    const auto newrt = work / "newrt";
+    write_image(newrt / "gfx1250" / (symbol + ".co"), 0x49);
+    write_image(newrt / "gfx1250-a0" / (symbol + ".co"), 0xeb);
+    setenv("OPUS_GEN_CO_DIR", newrt.c_str(), 1);
+    auto* strict_pref = &opus_gfx1250_co::co_kernel(symbol, 0);
+    assert(strict_pref != fallback);
+    assert(test_state::state().last_processor == 0xeb);
+    assert(test_state::state().created == 7);
+
     // No environment mutation while threads are running. Each keeps its own
     // current device and TLS fast path; shared modules remain process-lifetime.
+    setenv("OPUS_GEN_CO_DIR", root.c_str(), 1);
     std::thread ta([&] { test_state::device = 0; assert(&opus_gfx1250_co::co_kernel(symbol, 0) == a0); });
     std::thread tb([&] { test_state::device = 1; assert(&opus_gfx1250_co::co_kernel(symbol, 1) == b0); });
     ta.join(); tb.join();
-    assert(test_state::state().created == 5);
+    assert(test_state::state().created == 7);
     std::cout << "CO_DEVICE_ROOT_CACHE_AND_REGISTRATION_ROLLBACK_TESTS_PASS\n";
 }
 #endif
