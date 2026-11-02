@@ -41,11 +41,22 @@ _DISPATCH_EP8_TDM = (
 #   128                                           13.2
 #   256         31.0            21.2      16.3    14.4
 #   512         32.0            34.2                       18.6     18.8
+#
+# The tail entry covers everything above 512, which the rows above never
+# reached. Retuned for the prefill sizes, dispatch us at inter 2048, random
+# routing:
+#
+#   tpr     128x16 tok-major   128x16 route   192x16 tok-major   192x16 route
+#   4096        87.2              90.4             96.9              85.2
+#   16384      299.0             314.0            297.2             294.2
+#
+# Both fields matter: either change on its own is slower than the entry it
+# replaces at both sizes. 384x16 is slower again, 54.0us at tpr 1536 vs 48.7.
 _DISPATCH_COMPACT = (
     (64, 64, 8, True),
     (256, 192, 8, True),
     (512, 192, 16, True),
-    (None, 128, 16, False),
+    (None, 192, 16, True),
 )
 
 _DISPATCH_TDM_SCHEDULES = {

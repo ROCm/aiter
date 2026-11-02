@@ -664,6 +664,7 @@ def dynamic_mxfp8_quant(
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
             NUM_PRGMS=NUM_PRGMS,
+            LOG2_DTYPE_MAX=7 if quant_dtype == torch.float8_e4m3fnuz else 8,
         )
 
     y = y.view(*orig_shape[:-1], K)
