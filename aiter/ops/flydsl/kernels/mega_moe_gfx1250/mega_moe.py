@@ -57,6 +57,7 @@ class CombineTail:
 def _env_on(name: str) -> bool:
     return os.environ.get(name, "0") == "1"
 
+
 # "flydsl": AITER's FlyDSL/TDM dispatch. "mori": mori's HIP/JIT kernel through
 # its EpDispatchPlan.
 _DISPATCH_BACKENDS = ("flydsl", "mori")
@@ -1924,7 +1925,8 @@ class MegaMoEGfx1250:
                         f"dense rows, got {t.dtype} {tuple(t.shape)}"
                     )
             if has_gate and (
-                tail.gate.dtype != torch.bfloat16 or tuple(tail.gate.shape) != (count, 1)
+                tail.gate.dtype != torch.bfloat16
+                or tuple(tail.gate.shape) != (count, 1)
             ):
                 raise ValueError("combine_tail.gate must be bf16 [tokens, 1]")
             if write_res:
