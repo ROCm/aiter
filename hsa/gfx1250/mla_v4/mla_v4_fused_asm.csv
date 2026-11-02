@@ -1,0 +1,15 @@
+//
+// Fused split-KV decode (stage1 + cross-split LSE merge in ONE launch). The
+// kv splits of one (seq, q-tile) form a hardware cluster along grid.x and the
+// merge happens in-cluster, so there is no triton stage2. Same 120-byte preload
+// kernarg as mla_v4_asm.csv, with a different buffer contract:
+//   ptr_R           = fp32 partial scratch [total_q, nsplit, (Gqa+1)*512]
+//   ptr_valid_split = final bf16 output (re-purposed; s_use_valid_split=0)
+// The .co must be built WITHOUT .cluster_dims metadata (cluster_x=1): the
+// cluster size then comes from the launch attribute (= num_kv_splits, 2..16),
+// so one code object serves every split count. A .co carrying .cluster_dims
+// only launches with that exact cluster. num_kv_splits > 16 (or == 1) keeps
+// using mla_v4_asm.csv.
+//   qh32 32mx1_16nx4_sparse <- poc_kl/mi400/mla/shaders/fused_mla_a8w8_qh32_1tg_32mx1_16nx4_sparse.sp3
+qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,sub_Q,knl_name,co_name
+fp8,fp8,32,0,1,0,0,0,32,_ZN5aiter41fused_mla_a8w8_qh32_1tg_32mx1_16nx4_sparseE,fused_mla_a8w8_qh32_1tg_32mx1_16nx4_sparse.co

@@ -188,6 +188,7 @@ def shuffle_weight(
             x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
         x_ = x_.view(*x.shape).contiguous().view(x_type)
         x_.is_shuffled = True
+        x_.gate_up_interleave = gate_up
         return x_
 
     IN, IK = layout
@@ -447,55 +448,6 @@ def shuffle_scale_a16w4(
     """Backward-compatible wrapper around `shuffle_scale(..., is_guinterleave=True)`."""
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
-    )
-
-
-def _pad_kblocks(s: torch.Tensor, K: int) -> tuple[torch.Tensor, int]:
-    K1 = (K + 255) // 256
-    if s.shape[-1] < 2 * K1:
-        s = F.pad(s, (0, 2 * K1 - s.shape[-1]), value=0x7F)
-    return s, K1
-
-
-def shuffle_scale_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
-    s = a_scale.view(torch.uint8).contiguous()
-    rows = s.shape[0]
-    if s.shape[-1] != K // 128:
-        raise ValueError(
-            f"blockscale a_scale must be (rows, K//128)=(*, {K // 128}); "
-            f"got {tuple(a_scale.shape)}"
-        )
-    if rows % 32:
-        s = F.pad(s, (0, 0, 0, (-rows) % 32), value=0x7F)  # 0x7F = E8M0 1.0
-        rows = s.shape[0]
-    s, K1 = _pad_kblocks(s, K)
-    from aiter.utility import dtypes
-
-    return (
-        s.view(rows // 32, 2, 16, K1, 2)
-        .permute(0, 3, 2, 4, 1)
-        .contiguous()
-        .view(-1)
-        .view(dtypes.fp8_e8m0)
-    )
-
-
-def shuffle_scale_blockscale_b(b_scale: torch.Tensor, N: int, K: int) -> torch.Tensor:
-    s = b_scale.view(torch.uint8).contiguous()
-    if s.shape != (N // 128, K // 128):
-        raise ValueError(
-            f"blockscale b_scale must be (N//128, K//128)=({N // 128}, {K // 128}); "
-            f"got {tuple(b_scale.shape)}"
-        )
-    s, K1 = _pad_kblocks(s, K)
-    from aiter.utility import dtypes
-
-    return (
-        s.view(N // 128, K1, 2, 1)
-        .expand(N // 128, K1, 2, 2)
-        .contiguous()
-        .view(-1)
-        .view(dtypes.fp8_e8m0)
     )
 
 

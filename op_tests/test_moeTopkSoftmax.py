@@ -384,6 +384,8 @@ def test_grouped_topk_stable(
     need_renorm,
     pattern,
     strided_output,
+    num_expert_group=1,
+    topk_group=1,
 ):
     mode_id = {"biased": 0, "sigmoid": 1, "softmax": 2}[mode]
     pattern_id = {
@@ -415,8 +417,8 @@ def test_grouped_topk_stable(
         gating.fill_(torch.nan)
         bias.zero_()
     elif pattern == "masked_scores":
-        if token != 2 or expert != 128 or mode != "biased":
-            raise AssertionError("masked_scores requires biased token=2, E=128")
+        if token != 2 or expert not in (128, 256) or mode != "biased":
+            raise AssertionError("masked_scores requires biased token=2, E=128 or 256")
         gating.zero_()
         bias.fill_(-torch.inf)
         bias[:3] = 0
@@ -445,8 +447,8 @@ def test_grouped_topk_stable(
             bias,
             w,
             ids,
-            1,
-            1,
+            num_expert_group,
+            topk_group,
             need_renorm,
             2.5,
             num_iters=2,
@@ -458,8 +460,8 @@ def test_grouped_topk_stable(
             gating,
             w,
             ids,
-            1,
-            1,
+            num_expert_group,
+            topk_group,
             need_renorm,
             mode == "softmax",
             2.5,
@@ -494,7 +496,8 @@ def test_grouped_topk_stable(
             w,
             expected_w,
             rtol=0,
-            atol=0,
+            # The grouped wave64 path (opt_sort) renormalizes with rcp(sum).
+            atol=0 if num_expert_group == 1 else 1e-6,
             tol_err_ratio=0,
             msg=f"{mode}/{pattern}: degenerate weights",
         )
@@ -505,6 +508,8 @@ def test_grouped_topk_stable(
                 f"winner={wrong_first_id}, weight_err={weight_err}"
             )
     else:
+        if num_expert_group != 1:
+            raise AssertionError("the padded legacy reference needs one expert group")
         legacy_gating = torch.full((token, expert + 4), -torch.inf, dtype=dtype)
         legacy_gating[:, :expert] = gating
         legacy_bias = torch.full((expert + 4,), -torch.inf, dtype=dtype)
@@ -1041,6 +1046,8 @@ stable_cases = [
     (1, 256, 32, dtypes.bf16, "biased", True, "one_finite", False),
     (2, 128, 8, dtypes.bf16, "biased", True, "masked_scores", True),
     (2, 128, 8, dtypes.bf16, "biased", False, "masked_scores", False),
+    # wave64 opt_sort path (DeepSeek-style routing).
+    (2, 256, 8, dtypes.bf16, "biased", True, "masked_scores", False, 8, 4),
     (1, 256, 8, dtypes.bf16, "biased", True, "all_nan", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "all_nan", False),
     (1, 256, 8, dtypes.bf16, "softmax", True, "all_nan", False),
@@ -1077,7 +1084,23 @@ ret = test_biased_grouped_topk(
     num_iters=args.iters,
     num_warmup=args.warmup,
 )
-df = pd.DataFrame([ret])
+df = [ret]
+# fp32 rows 16 B- but not 32 B-aligned: wave32 must skip its eight-float vector loads.
+backing = torch.randn((odd_token, 260), dtype=dtypes.fp32)
+ret = test_biased_grouped_topk(
+    odd_token,
+    256,
+    8,
+    8,
+    4,
+    True,
+    dtypes.fp32,
+    gating_output=backing[:, :256],
+    num_iters=args.iters,
+    num_warmup=args.warmup,
+)
+df.append(ret)
+df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info(
     "moeTopkSoftmax_reg_biased_grouped_topk_odd_stride summary (markdown):\n%s",

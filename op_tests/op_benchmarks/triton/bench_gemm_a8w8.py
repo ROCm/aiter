@@ -6,16 +6,18 @@ from collections.abc import Callable
 import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
-from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
-    gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
-)
+from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -25,13 +27,27 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
     generate_gemm_a8w8_inputs,
 )
 
+# generate_gemm_a8w8_inputs returns (x, weight, weight_shuffled, x_scale, w_scale,
+# bias, y); the kernels take the (possibly shuffled) weight as `w`, and the plain
+# `weight` return value is unused here.
+_OUT_VALS_KEYS = ["x", "_", "w", "x_scale", "w_scale", "bias", "y"]
+
 
 def bench_gemm_fn(
-    M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, impl: Callable
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    shuffle: bool,
+    impl: Callable,
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]
-    x, _, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+    _p_gen = functools.partial(
+        generate_gemm_a8w8_inputs,
         M,
         N,
         K,
@@ -42,17 +58,22 @@ def bench_gemm_fn(
         shuffle=shuffle,
     )
 
-    # flops
+    # create rotating buffers pool
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_OUT_VALS_KEYS], **kwargs_rot_bufs
+    )
+
+    # Kernel FLOPS and Mem Accesses(bytes)
     flops = 2.0 * M * N * K
     # memory transfer
-    mem_read = (M * K) * x.element_size() + (N * K) * weight.element_size()
-    mem_write = (M * N) * bias.element_size()
+    mem_read = (M * K) * rot_bufs[0]["x"].element_size() + (N * K) * rot_bufs[0][
+        "w"
+    ].element_size()
+    mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
-    ms = triton.testing.do_bench(
-        lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),
-        warmup=25,
-        rep=100,
-    )
+
+    kernel_fn = functools.partial(impl, dtype=c_dtype)
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -72,6 +93,9 @@ def run_model_benchmark(args, impl):
     Runs benchmark given a --model argument.
     """
     benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
+
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8(
@@ -101,7 +125,17 @@ def run_model_benchmark(args, impl):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, args.shuffle, impl)
+        return bench_gemm_fn(
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            args.shuffle,
+            impl,
+        )
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -112,11 +146,24 @@ def run_shape_benchmark(args, impl):
     """
     benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, args.shuffle, impl)
+        return bench_gemm_fn(
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            args.shuffle,
+            impl,
+        )
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -125,16 +172,12 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-    if args.gluon:
-        if args.shuffle:
-            impl = gluon_gemm_a8w8_preshuffle
-        else:
-            impl = functools.partial(triton_gemm_a8w8, backend="gluon")
+    backend = "gluon" if args.gluon else "triton"
+    if args.shuffle:
+        impl = functools.partial(gemm_a8w8_preshuffle, backend=backend)
+    elif args.gluon:
+        impl = functools.partial(triton_gemm_a8w8, backend="gluon")
     else:
-        if args.shuffle:
-            raise RuntimeError(
-                "Argument --shuffle is only supported with --gluon flag."
-            )
         impl = triton_gemm_a8w8
     if args.model:
         unsupported_args = []

@@ -7,60 +7,28 @@ from functools import lru_cache
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from ..kernels.kernels_common import get_warp_size
-from ..kernels.tensor_shim import _run_compiled
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
     build_radix_topk_one_block_module,
 )
+from ..kernels.topk.topk_launch import run_topk_launcher
 from ..kernels.topk.topk_per_row_decode import (
-    build_topk_per_row_decode_module,
-    topk_per_row_decode_chunks,
-    topk_per_row_decode_workspace_shapes,
+    clear_topk_per_row_decode_workspace_cache,  # noqa: F401 -- public re-export
+    launch_topk_per_row_decode,
 )
 from ..kernels.topk.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
+    one_workgroup_rows_are_exact,
 )
+from .row_lens import row_len_slot
 
-# Measured crossover between the one-workgroup and multi-kernel paths.
+# Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
-
-
-@lru_cache(maxsize=16)
-def _get_cached_workspace(
-    device: torch.device,
-    stream_id: int,
-    hist_shape: tuple[int, ...],
-    state_shape: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Keep scratch isolated by device, stream, and exact kernel layout."""
-    return (
-        torch.empty(hist_shape, device=device, dtype=torch.int32),
-        torch.empty(state_shape, device=device, dtype=torch.int32),
-    )
-
-
-def _get_topk_workspace(
-    device: torch.device,
-    stream_id: int,
-    hist_shape: tuple[int, ...],
-    state_shape: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Do not let graph-pool allocations escape through the process cache.
-    if torch.cuda.is_current_stream_capturing():
-        return (
-            torch.empty(hist_shape, device=device, dtype=torch.int32),
-            torch.empty(state_shape, device=device, dtype=torch.int32),
-        )
-    return _get_cached_workspace(device, stream_id, hist_shape, state_shape)
-
-
-def clear_topk_per_row_decode_workspace_cache() -> None:
-    _get_cached_workspace.cache_clear()
 
 
 @lru_cache(maxsize=128)
@@ -69,10 +37,10 @@ def _validate_topk_signature(
     logits_stride: tuple[int, ...],
     logits_dtype: torch.dtype,
     logits_device: torch.device,
-    seq_lens_shape: torch.Size,
-    seq_lens_stride: tuple[int, ...],
-    seq_lens_dtype: torch.dtype,
-    seq_lens_device: torch.device,
+    seq_lens_shape: torch.Size | None,
+    seq_lens_stride: tuple[int, ...] | None,
+    seq_lens_dtype: torch.dtype | None,
+    seq_lens_device: torch.device | None,
     indices_shape: torch.Size,
     indices_stride: tuple[int, ...],
     indices_dtype: torch.dtype,
@@ -106,17 +74,19 @@ def _validate_topk_signature(
     if (stride0, stride1) != logits_stride:
         raise ValueError("stride0 and stride1 must match logits strides")
 
-    if len(seq_lens_shape) != 1 or seq_lens_dtype != torch.int32:
-        raise ValueError("seq_lens must be a 1D int32 tensor")
-    if seq_lens_stride != (1,):
-        raise ValueError("seq_lens must be contiguous")
-    if seq_lens_device != logits_device:
-        raise ValueError("seq_lens must be on the same CUDA device as logits")
     if next_n <= 0:
         raise ValueError("next_n must be positive")
-    required_seq_lens = (rows + next_n - 1) // next_n
-    if seq_lens_shape[0] < required_seq_lens:
-        raise ValueError("seq_lens does not have enough entries for logits rows")
+    # A None signature is `seq_lens=None`: every row is full-width.
+    if seq_lens_shape is not None:
+        if len(seq_lens_shape) != 1 or seq_lens_dtype != torch.int32:
+            raise ValueError("seq_lens must be a 1D int32 tensor")
+        if seq_lens_stride != (1,):
+            raise ValueError("seq_lens must be contiguous")
+        if seq_lens_device != logits_device:
+            raise ValueError("seq_lens must be on the same CUDA device as logits")
+        required_seq_lens = (rows + next_n - 1) // next_n
+        if seq_lens_shape[0] < required_seq_lens:
+            raise ValueError("seq_lens does not have enough entries for logits rows")
 
     if indices_shape != (rows, k) or indices_dtype != torch.int32:
         raise ValueError("indices must be an int32 tensor with shape [rows, k]")
@@ -149,7 +119,7 @@ def _validate_values_signature(
 def _validate_flydsl_topk_call(
     logits: torch.Tensor,
     next_n: int,
-    seq_lens: torch.Tensor,
+    seq_lens: torch.Tensor | None,
     indices: torch.Tensor,
     num_rows: int,
     stride0: int,
@@ -162,10 +132,7 @@ def _validate_flydsl_topk_call(
         logits.stride(),
         logits.dtype,
         logits.device,
-        seq_lens.shape,
-        seq_lens.stride(),
-        seq_lens.dtype,
-        seq_lens.device,
+        *_optional_tensor_signature(seq_lens),
         indices.shape,
         indices.stride(),
         indices.dtype,
@@ -206,8 +173,7 @@ def _validate_radix_topk_one_block_call(
     next_n: int,
     width: int | None = None,
 ) -> None:
-    """Raise if this call cannot run the one-block radix kernel. ``width``: a
-    row's bound, the logits' width unless packed rows stand for a plane."""
+    """Raise if this call cannot run the one-block radix kernel."""
     _validate_flydsl_topk_call(
         logits, next_n, row_ends, indices, num_rows, stride0, stride1, k, values
     )
@@ -224,6 +190,11 @@ _TensorSignature = tuple[torch.Size, tuple[int, ...], torch.dtype, torch.device]
 
 def _tensor_signature(tensor: torch.Tensor) -> _TensorSignature:
     return tensor.shape, tensor.stride(), tensor.dtype, tensor.device
+
+
+def _optional_tensor_signature(tensor: torch.Tensor | None) -> tuple:
+    """`_tensor_signature`, or four Nones for an absent tensor."""
+    return (None,) * 4 if tensor is None else _tensor_signature(tensor)
 
 
 @lru_cache(maxsize=128)
@@ -340,7 +311,7 @@ def _is_flydsl_radix_topk_one_block_supported(
 def is_flydsl_top_k_per_row_decode_supported(
     logits: torch.Tensor,
     next_n: int,
-    seq_lens: torch.Tensor,
+    seq_lens: torch.Tensor | None,
     indices: torch.Tensor,
     num_rows: int,
     stride0: int,
@@ -351,7 +322,7 @@ def is_flydsl_top_k_per_row_decode_supported(
     """Return whether a call satisfies every FlyDSL-only precondition."""
     return _is_flydsl_topk_call_supported(
         _tensor_signature(logits),
-        _tensor_signature(seq_lens),
+        _optional_tensor_signature(seq_lens),
         _tensor_signature(indices),
         next_n,
         num_rows,
@@ -365,7 +336,7 @@ def is_flydsl_top_k_per_row_decode_supported(
 def flydsl_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
-    seq_lens: torch.Tensor,
+    seq_lens: torch.Tensor | None,
     indices: torch.Tensor,
     num_rows: int,
     stride0: int,
@@ -379,11 +350,15 @@ def flydsl_top_k_per_row_decode(
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
-    ``row_starts`` [rows] i32: row r's scores start at element row_starts[r]
-    of ``logits``' first row (a packed buffer viewed with stride0 0), the
-    indices still relative to that start. ``plane_width`` (default the
-    logits' width) bounds every row and picks the kernel and its chunking,
-    as that plane's width would."""
+    ``row_starts`` enables packed rows: row r starts at row_starts[r] in the
+    input's first row, while output indices remain relative to that start.
+    ``plane_width`` bounds every row and selects the launch geometry.
+    ``seq_lens=None`` makes every row ``plane_width`` (default: the logits
+    width) long; the kernels then read no length tensor, so there is nothing
+    for a captured graph to hold an address of.
+    Before CUDAGraph capture, warm the split path on the capture stream so its
+    stream-local arrival counter is allocated and initialized.
+    """
 
     _validate_flydsl_topk_call(
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
@@ -391,22 +366,30 @@ def flydsl_top_k_per_row_decode(
 
     rows, width = logits.shape
     width = width if plane_width is None else plane_width
-    arch = torch.cuda.get_device_properties(logits.device).gcnArchName
+    if rows == 0:
+        return
+    # The bare arch name: the selector keys its radix layout and LDS on it.
+    arch = get_gfx_runtime()
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     packed = row_starts is not None
-    # unread unless packed: any int32 tensor keeps the launch's signature,
-    # and seq_lens is one
-    starts = row_starts if packed else seq_lens
+    full_rows = seq_lens is None
+    len_slot = row_len_slot(seq_lens, logits.device)
+    starts = row_starts if packed else len_slot
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
-            k, wave_size=wave_size, write_values=values is not None, packed_rows=packed
+            k,
+            wave_size=wave_size,
+            write_values=values is not None,
+            packed_rows=packed,
+            full_rows=full_rows,
+            exact_rows=full_rows and one_workgroup_rows_are_exact(width),
         )
-        _run_compiled(
+        run_topk_launcher(
             launcher,
             logits,
             starts,
-            seq_lens,
+            len_slot,
             indices,
             values if values is not None else logits,
             width,
@@ -417,37 +400,25 @@ def flydsl_top_k_per_row_decode(
         )
         return
 
-    # One row is `chunks` blocks, so the split has to follow the row count: at
-    # one row, 16 chunks leaves all but a handful of CUs idle, and at many rows
-    # it makes the single-block reduce walk counters nobody needed.
-    chunks = topk_per_row_decode_chunks(rows, width, wave_size)
-    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable, chunks)
-    partial_hist, state = _get_topk_workspace(
-        logits.device, stream.cuda_stream, hist_shape, state_shape
-    )
-
-    launcher = build_topk_per_row_decode_module(
-        k,
-        stable,
+    # Allocated width bounds every row, but a wide buffer may still hold short
+    # rows: the kernel reads each row's length and splits only the long ones.
+    launch_topk_per_row_decode(
+        logits=logits,
+        next_n=next_n,
+        seq_lens=len_slot,
+        row_starts=starts,
+        indices=indices,
+        rows=rows,
+        width=width,
+        k=k,
+        stable=stable,
+        values=values,
+        arch=arch,
         wave_size=wave_size,
-        write_values=values is not None,
-        chunks_per_row=chunks,
+        num_cus=get_cu_num(),
+        stream=stream,
         packed_rows=packed,
-    )
-    _run_compiled(
-        launcher,
-        logits,
-        starts,
-        seq_lens,
-        indices,
-        values if values is not None else logits,
-        partial_hist,
-        state,
-        width,
-        next_n,
-        stride0,
-        rows,
-        stream,
+        full_rows=full_rows,
     )
 
 
@@ -470,13 +441,13 @@ def flydsl_radix_topk_one_block(
 ) -> None:
     """Launch the one-block radix TopK kernel for one prefill or decode call.
 
-    ``packed_rows`` (decode): row r is read from element row_starts[r] of
-    ``logits``' first row (a packed buffer viewed with stride0 0), its
-    indices relative to that start. Explicit, because decode callers pass
-    their lengths as row_starts too. ``plane_width`` (default the logits'
-    width) bounds every row and picks the variant, as that plane's would."""
+    With ``packed_rows`` in decode mode, row r starts at ``row_starts[r]`` in
+    the input's first row, while output indices remain relative to that start.
+    ``plane_width`` defaults to the logits width; it bounds every row and
+    selects the same kernel variant that an unpacked plane of that width uses.
+    """
     if packed_rows and (not is_decode or row_starts is None):
-        raise ValueError("packed rows are a decode call with row_starts")
+        raise ValueError("packed rows require decode mode and row_starts")
     if row_starts is None:
         if not is_decode:
             raise ValueError("row_starts is required for prefill")
@@ -517,7 +488,7 @@ def flydsl_radix_topk_one_block(
         arch=arch,
         packed_rows=packed_rows,
     )
-    _run_compiled(
+    run_topk_launcher(
         launcher,
         logits,
         row_starts,

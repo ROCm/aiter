@@ -15,7 +15,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 
-from .kernels.tensor_shim import ptr_arg
+from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 SCALE_GROUP_SIZE = 32
 WMMA_K_GFX1250 = 128
@@ -437,12 +437,13 @@ def flydsl_batched_gemm_a8w4_v2(
     )
 
     a_c = a.contiguous()
-    _launch_v2(
-        out_phys,
+    _run_compiled(
+        _launch_v2,
+        out_phys.view(-1),
         ptr_arg(a_c),
         ptr_arg(w),
-        a_scales.view(torch.int32),
-        w_scales.view(torch.int32),
+        a_scales.view(torch.int32).view(-1),
+        w_scales.view(torch.int32).view(-1),
         M,
         torch.cuda.current_stream(),
         N,
@@ -459,5 +460,19 @@ def flydsl_batched_gemm_a8w4_v2(
         a_is_fp4,
         cluster_m,
         cluster_n,
+        specialization_key=(
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            out_is_f16,
+            B,
+            layout_mbn,
+            num_buffers,
+            a_is_fp4,
+            cluster_m,
+            cluster_n,
+        ),
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys

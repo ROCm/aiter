@@ -320,8 +320,8 @@ def build_communication(kc: KernelCtx) -> dict:
                         lds_st(L, L_WT + slot * i32(4), fx.Int32(wv))
             for idx_ in range(n4 * i32(4) + tid, n, i32(NT)):
                 idx = i32(idx_)
-                e = g_ld_i32(fx.Int64(ids_addr) + fx.Int64(idx) * fx.Int64(4))
-                wv = g_ld_i32(fx.Int64(tw_addr) + fx.Int64(idx) * fx.Int64(4))
+                e = g_ld_i32(fx.Int64(ids_addr) + fx.Int64(idx) * 4)
+                wv = g_ld_i32(fx.Int64(tw_addr) + fx.Int64(idx) * 4)
                 _gather_one(L, idx, (e == expert) & _in_chunk(idx, chunk), wv)
         cbar(L, tid)
         if tid == i32(0):
@@ -343,10 +343,10 @@ def build_communication(kc: KernelCtx) -> dict:
             off = fx.min(i, n - i32(1)) * i32(16 if MLL else 4)
             e = fx.Int32(bld(rid, off, 0, T.i32, 0))
             bal = fx.Int64(rocdl.ballot(T.i64, (i < hi) & masked(e)))
-            if bal != fx.Int64(0):
+            if bal != 0:
                 for j_ in range(i32(0), i32(64), i32(1)):
                     j = i32(j_)
-                    if ((bal >> fx.Int64(j)) & fx.Int64(1)) != fx.Int64(0):
+                    if ((bal >> fx.Int64(j)) & 1) != 0:
                         _zero_route(a, lane, i32(b_) + j)
                 wait_vm(0)
 

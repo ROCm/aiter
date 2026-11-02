@@ -10,7 +10,10 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+from aiter.ops.flydsl.kernels.kernels_common import (
+    ceildiv,
+    set_slp_vectorize_once_used,
+)
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 
 
@@ -189,7 +192,7 @@ class StoreC:
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def _store_bf16(self, value_bf16, c_index):
-        fx.memref_store_vec(Vec.filled(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
+        fx.memref_store_vec(fx.full(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
         fx.copy(
             self.out_atom_1,
             self.reg_bf16_1,
@@ -225,7 +228,7 @@ class Mfma16x16x128:
         self.atom = fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN)
         )
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.zero_value = fx.full(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
 
@@ -446,6 +449,7 @@ def compile_fp8_gemm_8w(
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
+            rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.s_barrier()
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
@@ -477,7 +481,7 @@ def compile_fp8_gemm_8w(
         k = K_ITERS - 2
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
-        rocdl.s_barrier()
+        wait_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 
@@ -523,7 +527,8 @@ def compile_fp8_gemm_8w(
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
         rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        if wave_m == 0:
+            rocdl.s_barrier()
 
         # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)
@@ -562,4 +567,4 @@ def compile_fp8_gemm_8w(
             },
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
 
-    return launch_gemm
+    return set_slp_vectorize_once_used(launch_gemm, False)

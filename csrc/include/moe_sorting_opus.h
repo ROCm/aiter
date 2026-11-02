@@ -29,6 +29,25 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> m_indices        = std::nullopt,
                           std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt);
 
+// Narrow gfx950 decode helper. It fuses route sorting, BF16->MXFP4 activation
+// quantization and routed-output zeroing for H=4096, block_m=32 batches of
+// M in [1, 128]. (num_experts, topk) must be one of (512,10) or
+// (513,11) -- the expert histogram is a template parameter. Emits compact
+// per-token E8M0 scales, which FlyDSL GEMM1 can consume directly; callers that
+// need the sorted-row layout run the conventional conversion afterwards.
+void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
+                              aiter_tensor_t& topk_ids,
+                              aiter_tensor_t& topk_weights,
+                              aiter_tensor_t& sorted_token_ids,
+                              aiter_tensor_t& sorted_weights,
+                              aiter_tensor_t& sorted_expert_ids,
+                              aiter_tensor_t& num_valid_ids,
+                              aiter_tensor_t& moe_buf,
+                              aiter_tensor_t& activation_quant,
+                              aiter_tensor_t& activation_scale_token,
+                              int num_experts,
+                              std::optional<aiter_tensor_t> num_local_tokens = std::nullopt);
+
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
 // Implementation section - only compiled in the .cu translation unit
@@ -1133,6 +1152,14 @@ struct MoeSortingKernel
             return;
         }
 
+        if(kargs.p_reverse_sorted)
+        {
+            opus::index_t* p_reverse_sorted = static_cast<opus::index_t*>(kargs.p_reverse_sorted);
+            const opus::index_t routes      = kargs.tokens * kargs.topk_mdiv.divisor;
+            for(opus::index_t i = threadIdx.x; i < routes; i += kBlockSize)
+                p_reverse_sorted[i] = -1;
+        }
+
         extern __shared__ char smem[];
 
         return moe_align_block_size_kernel_ex(
@@ -1157,6 +1184,24 @@ struct MoeSortingKernel
 };
 
 namespace impl {
+
+// Vector `i` of a [tokens, topk] id tensor holding `numel` ids. Under a device-side
+// token count (LocalToken) the vector loops run to that count rounded up to the
+// vector width, which can pass the tensor's end when the count is its height; the
+// vector that would is read id by id, its ids past the end -1 (no expert).
+template <typename VecType, typename IndexType, int Vec>
+OPUS_D VecType moe_sorting_load_topk_vec(const VecType* p, opus::index_t i, opus::index_t numel)
+{
+    if((i + 1) * Vec <= numel)
+        return p[i];
+    const IndexType* ids = reinterpret_cast<const IndexType*>(p);
+    VecType x;
+    opus::static_for<Vec>([&](auto j) {
+        const opus::index_t idx = i * Vec + j.value;
+        x[j.value]              = idx < numel ? ids[idx] : static_cast<IndexType>(-1);
+    });
+    return x;
+}
 
 // [expert, padded_tokens]
 OPUS_H_D opus::index_t moe_sorting_mp_mesh_stride(opus::index_t tokens)
@@ -1368,6 +1413,22 @@ OPUS_D void moe_buf_set_zero_kernel_2d(void* buf,
         i += blocks * kBlockSize)
     {
         p_buf[i] = zero_;
+    }
+}
+
+template <opus::index_t kBlockSize>
+OPUS_D void moe_sorting_reverse_sorted_set_invalid(void* p_reverse_sorted,
+                                                   opus::index_t tokens,
+                                                   opus::index_t topk)
+{
+    if(p_reverse_sorted == nullptr)
+        return;
+    opus::index_t* p_buf       = reinterpret_cast<opus::index_t*>(p_reverse_sorted);
+    const opus::index_t routes = tokens * topk;
+    for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < routes;
+        i += gridDim.x * kBlockSize)
+    {
+        p_buf[i] = -1;
     }
 }
 
@@ -1629,6 +1690,7 @@ struct MoeSortingMultiPhaseKernel_P0_v1
         const void* p_topk_ids;     // [tokens, topk]
         const void* p_local_tokens; // [1], if not nullptr, use this as actual tokens
         void* p_expert_mesh;        // [expert, tokens]
+        void* p_reverse_sorted;
         opus::index_t tokens; // if p_local_tokens is not nullptr, this indicate the max possible
                               // tokens used for ws/LDS calculation
         opus::index_t num_experts;
@@ -1654,6 +1716,7 @@ struct MoeSortingMultiPhaseKernel_P0_v1
         k.p_topk_ids     = h.p_topk_ids;
         k.p_local_tokens = h.p_local_tokens;
         k.p_expert_mesh  = h.p_ws;
+        k.p_reverse_sorted = h.p_reverse_sorted;
         k.tokens         = h.tokens;
         k.num_experts    = h.num_experts;
         k.mesh_stride    = impl::moe_sorting_mp_mesh_stride(h.tokens);
@@ -1670,6 +1733,9 @@ struct MoeSortingMultiPhaseKernel_P0_v1
 
     OPUS_D void operator()(Kargs kargs) const
     {
+        impl::moe_sorting_reverse_sorted_set_invalid<kBlockSize>(
+            kargs.p_reverse_sorted, kargs.tokens, kargs.topk_mdiv.divisor);
+
         using topk_id_t = opus::vector_t<IndexType, Problem::SubTokenTile>;
 
         const topk_id_t* p_topk_ids = reinterpret_cast<const topk_id_t*>(kargs.p_topk_ids);
@@ -1709,7 +1775,8 @@ struct MoeSortingMultiPhaseKernel_P0_v1
         for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < total_elem;
             i += gridDim.x * kBlockSize)
         {
-            auto x = p_topk_ids[i];
+            auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, Problem::SubTokenTile>(
+                p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
             opus::static_for<Problem::SubTokenTile>([&](auto j) {
                 IndexType eid = x[j.value]; // ext_vector_type must use int to []
                 uint32_t curr_token_id, curr_topk_id;
@@ -1758,6 +1825,7 @@ struct MoeSortingMultiPhaseKernel_P0_v2
 
         const void* p_local_expert_mask; // [expert]
         void* p_expert_cumsum;           // [expert]
+        void* p_reverse_sorted;
         opus::index_t num_experts;
     };
 
@@ -1786,6 +1854,7 @@ struct MoeSortingMultiPhaseKernel_P0_v2
         k.mesh_stride         = impl::moe_sorting_mp_mesh_stride(h.tokens);
         k.topk_mdiv           = opus::mdiv{static_cast<uint32_t>(h.topk)};
         k.p_local_expert_mask = h.p_local_expert_mask;
+        k.p_reverse_sorted    = h.p_reverse_sorted;
         k.num_experts         = h.num_experts;
         return k;
     }
@@ -1802,6 +1871,9 @@ struct MoeSortingMultiPhaseKernel_P0_v2
 
     OPUS_D void operator()(Kargs kargs) const
     {
+        impl::moe_sorting_reverse_sorted_set_invalid<kBlockSize>(
+            kargs.p_reverse_sorted, kargs.tokens, kargs.topk_mdiv.divisor);
+
         constexpr opus::index_t index_pack = Problem::SubTokenTile; // always packed
         __shared__ char smem[GetSmemSize()];
         using topk_id_t             = opus::vector_t<IndexType, index_pack>;
@@ -1859,7 +1931,8 @@ struct MoeSortingMultiPhaseKernel_P0_v2
 #pragma unroll index_pack
         for(opus::index_t i = threadIdx.x; i < total_elem; i += kBlockSize)
         {
-            auto x = p_topk_ids[i];
+            auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, index_pack>(
+                p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
             opus::static_for<index_pack>([&](auto j) {
                 IndexType eid_x = x[j.value]; // ext_vector_type must use int to []
                 if(eid_x == eid)
@@ -2198,7 +2271,8 @@ struct MoeSortingMultiPhaseKernel_P01
             for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < total_elem;
                 i += kBlockSize * gridDim.x)
             {
-                auto x = p_topk_ids[i];
+                auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, Problem::SubTokenTile>(
+                    p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
                 opus::static_for<Problem::SubTokenTile>([&](auto j) {
                     IndexType eid = x[j.value]; // ext_vector_type must use int to []
                     uint32_t curr_token_id, curr_topk_id;

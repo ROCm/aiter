@@ -16,6 +16,7 @@ from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_FP32,
     make_gemm_a16w16_param_and_validate,
 )
+from .kernels.gemm_a16w16_kernel_gfx1250 import LDS_PAD_A, LDS_PAD_B
 
 __all__ = ["GemmConfigPruner", "get_flydsl_a16w16_configs"]
 
@@ -125,6 +126,76 @@ class GemmConfigPruner:
         return [config for index, config in enumerate(kept) if index in keep]
 
 
+# Tiles of the gfx1250 kernel (gemm_a16w16_gfx1250) as (block_m, block_n, block_k,
+# m_waves, n_waves). They hold the config of every gfx1250 FlyDSL row in the BF16
+# tuned CSVs, which come from sweeps over BF16 shapes from M = 1 to 16384.
+_GFX1250_TILES = (
+    (16, 16, 256, 1, 1),
+    (16, 64, 256, 1, 2),
+    (16, 128, 256, 1, 2),
+    (64, 64, 128, 4, 2),
+    (64, 64, 256, 4, 2),
+    (64, 128, 128, 2, 2),
+    (128, 128, 32, 2, 4),
+    (128, 128, 64, 2, 2),
+    (128, 256, 64, 2, 4),
+    (256, 128, 64, 4, 2),
+    (256, 256, 64, 2, 4),
+    (256, 256, 128, 2, 2),
+    (256, 256, 128, 2, 4),
+)
+
+
+def gfx1250_lds_bytes(block_m, block_n, block_k, stages, split_k):
+    """LDS of gemm_a16w16_gfx1250: every stage holds a padded A and B tile."""
+    a_elems = block_m * (block_k + LDS_PAD_A) + LDS_PAD_A
+    b_elems = block_n * (block_k + LDS_PAD_B) + LDS_PAD_B
+    # Split-K adds a 16-byte-aligned flag.
+    return stages * (a_elems + b_elems) * 2 + (16 if split_k > 1 else 0)
+
+
+def _gfx1250_configs(m: int, n: int, k: int):
+    lds_bytes = get_lds_capacity_bytes("gfx1250")
+    split_k_candidates = [1]
+    split_k_candidates.extend(split_k for split_k in range(2, 9) if k % split_k == 0)
+    configs = []
+    for (
+        (block_m, block_n, block_k, m_waves, n_waves),
+        stages,
+        split_k,
+        half,
+    ) in itertools.product(
+        _GFX1250_TILES, range(2, 7), split_k_candidates, (False, True)
+    ):
+        if gfx1250_lds_bytes(block_m, block_n, block_k, stages, split_k) > lds_bytes:
+            continue
+        # The split-K reduction code grows with the accumulators per wave: with 64 of
+        # them (256x256 on 2x2 waves) one candidate compiled for minutes, and no gfx1250
+        # row uses split-K with more than 2.
+        if split_k > 1 and (block_m // m_waves // 16) * (block_n // n_waves // 16) > 4:
+            continue
+        # The prologue fills stages - 1 buffers from each split's K range.
+        if -(-(k // split_k) // block_k) < stages - 1:
+            continue
+        configs.append(
+            {
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": block_k,
+                "stages": stages,
+                "split_k": split_k,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                # The gfx1250 kernel has no slice-K and ignores group_m.
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": half,
+            }
+        )
+    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return GemmConfigPruner(m, n, k, device_props, 2).prune(configs)
+
+
 def get_flydsl_a16w16_configs(
     m: int,
     n: int,
@@ -135,13 +206,15 @@ def get_flydsl_a16w16_configs(
 ):
     """Generate and validate the shape-aware policy catalog used by tuning."""
 
-    if make_gemm_a16w16_param_and_validate is None:
-        return []
-    if get_gfx() != "gfx950":
-        return []
     if dtype not in (torch.float16, torch.bfloat16):
         return []
     if out_dtype not in (dtype, torch.float32):
+        return []
+    if get_gfx() == "gfx1250":
+        return _gfx1250_configs(m, n, k)
+    if make_gemm_a16w16_param_and_validate is None:
+        return []
+    if get_gfx() != "gfx950":
         return []
 
     split_k_candidates = [1]

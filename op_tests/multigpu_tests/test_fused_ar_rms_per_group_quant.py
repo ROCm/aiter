@@ -57,6 +57,7 @@ from aiter.dist.parallel_state import (
     destroy_model_parallel,
     ensure_model_parallel_initialized,
     get_tp_group,
+    graph_capture,
     init_distributed_environment,
     set_custom_all_reduce,
 )
@@ -216,6 +217,8 @@ def _run_per_group_quant_case(
     group_size,
     emit_bf16,
     transpose_scale,
+    gemma_norm=False,
+    with_graph=False,
 ):
     """Run one fused AR+RMSNorm+per-group-quant case on an initialized rank.
 
@@ -234,6 +237,11 @@ def _run_per_group_quant_case(
     keeps the logical ``(M, num_groups)`` shape but column-major storage, so
     the dequant must still reproduce the reference -- proving the kernel wrote
     each group's scale to the correct transposed slot.
+
+    When ``with_graph=True`` the call is captured once under ``graph_capture()``
+    (custom all-reduce in capture mode, registered buffers), every output is
+    zeroed, and the graph is replayed: the checks below then read what the
+    replay wrote, so a flag lost on the capture path fails the comparison.
     """
     from aiter.dist.communication_op import (
         tensor_model_parallel_fused_allreduce_rmsnorm_quant,
@@ -242,15 +250,24 @@ def _run_per_group_quant_case(
     gen = torch.Generator(device="cuda").manual_seed(case_idx)
     x = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
     weight = torch.randn((shape[1],), dtype=dtype, device="cuda", generator=gen)
-    ref = F.rms_norm(
-        input=x * tp_size + x,
-        normalized_shape=(shape[1],),
-        weight=weight,
-        eps=eps,
-    )
+    if gemma_norm:
+        # Gemma / Qwen3.5 norm: x * (1 + w) from the raw weight, the + 1 in fp32
+        # as the kernel does it.
+        ref = F.rms_norm(
+            input=(x * tp_size + x).float(),
+            normalized_shape=(shape[1],),
+            weight=weight.float() + 1.0,
+            eps=eps,
+        ).to(dtype)
+    else:
+        ref = F.rms_norm(
+            input=x * tp_size + x,
+            normalized_shape=(shape[1],),
+            weight=weight,
+            eps=eps,
+        )
 
-    @perftest()
-    def run_fused(x):
+    def fused(x):
         res = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
             x,
             x,
@@ -260,6 +277,7 @@ def _run_per_group_quant_case(
             group_size=group_size,
             emit_bf16=emit_bf16,
             transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
         )
         if emit_bf16:
             out, res_out, scale_out, bf16_out = res
@@ -267,7 +285,21 @@ def _run_per_group_quant_case(
         out, res_out, scale_out = res
         return out, scale_out, res_out
 
-    result, us = run_fused(x)
+    if with_graph:
+        graph = torch.cuda.CUDAGraph()
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            result = fused(x)
+        for t in result:
+            t.zero_()
+
+        @perftest()
+        def run_graph():
+            graph.replay()
+
+        _, us = run_graph()
+        torch.cuda.synchronize()
+    else:
+        result, us = perftest()(fused)(x)
     if emit_bf16:
         out_fp8, scale_out, _res_out, bf16_out = result
     else:
@@ -308,7 +340,7 @@ def _run_per_group_quant_case(
     msg = (
         f"test_fused_ar_rmsnorm_per_group_quant: rank={rankID} "
         f"{shape=} {dtype=} {group_size=} "
-        f"{emit_bf16=} {transpose_scale=} {us:>8.2f}"
+        f"{emit_bf16=} {transpose_scale=} {gemma_norm=} {with_graph=} {us:>8.2f}"
     )
     err = checkAllclose(ref, dequant.to(dtype), msg=msg, atol=5e-2, rtol=5e-2)
     return {
@@ -361,6 +393,8 @@ def fused_ar_rmsnorm_per_group_quant_sweep(
             case["group_size"],
             case["emit_bf16"],
             case["transpose_scale"],
+            case.get("gemma_norm", False),
+            case.get("withGraph", False),
         )
         for case_idx, case in enumerate(cases)
     ]
@@ -407,6 +441,15 @@ def check_per_group_quant_case(tp_size, dtype, case, rank_results):
         )
 
     max_err = max(r["err"] for r in rank_results)
+    # checkAllclose only logs a mismatch and returns the mismatched fraction;
+    # fail the case at its own threshold (tol_err_ratio=0.05) so a wrong output
+    # -- e.g. a flag lost on the CUDA-graph capture path -- fails the sweep.
+    assert max_err < 0.05, (
+        f"fused output disagrees with the reference on {max_err:.1%} of elements "
+        f"({shape=} emit_bf16={emit_bf16} transpose_scale={transpose_scale} "
+        f"gemma_norm={case.get('gemma_norm', False)} "
+        f"withGraph={case.get('withGraph', False)})"
+    )
 
     # bf16 side-output correctness: should agree with fp8+scale dequant to
     # within at most one FP8 quantization step (~3% relative).
@@ -425,6 +468,7 @@ def check_per_group_quant_case(tp_size, dtype, case, rank_results):
         "withGraph": case["withGraph"],
         "emit_bf16": emit_bf16,
         "transpose_scale": transpose_scale,
+        "gemma_norm": case.get("gemma_norm", False),
         "per_group_min_us": min(all_us),
         "per_group_max_us": max(all_us),
         "per_group_err": max_err,
@@ -494,7 +538,9 @@ l_shape = [
 ]
 l_tp = [8]
 l_pp = [1]
-l_graph = [False]
+# Eager calls and a CUDA-graph capture + replay of the same call: the capture
+# path takes the custom all-reduce's registered-buffer branch.
+l_graph = [False, True]
 l_group_size = [128]
 # Cover both the fp8-only output (keep_bf16=False, std-attention layers)
 # and the fp8+bf16 dual-output (keep_bf16=True, GDN-style layers).
@@ -503,6 +549,9 @@ l_emit_bf16 = [False, True]
 # column-major (transpose_scale=True, what gemm_a8w8_blockscale_preshuffle
 # consumes). Both must reproduce the same reference dequant.
 l_transpose_scale = [False, True]
+# Plain RMSNorm (x * w) and Gemma RMSNorm (x * (1 + w), Qwen3.5) from the raw
+# weight; every kernel path (1-stage / 2-stage / split) takes either.
+l_gemma_norm = [False, True]
 
 parser = argparse.ArgumentParser(
     description="Test fused AR+RMSNorm+per-group FP8 quant"
@@ -583,6 +632,16 @@ parser.add_argument(
         "(transpose_scale) only. Default sweeps both."
     ),
 )
+parser.add_argument(
+    "--gemma-norm",
+    type=int,
+    choices=[0, 1],
+    nargs="?",
+    const=None,
+    default=None,
+    help="Pin the norm: 0 = x * w only, 1 = Gemma x * (1 + w) only. "
+    "Default sweeps both.",
+)
 
 if __name__ == "__main__":
     freeze_support()
@@ -610,6 +669,8 @@ if __name__ == "__main__":
         l_group_size = [args.group_size]
     if args.transpose_scale is not None:
         l_transpose_scale = [bool(args.transpose_scale)]
+    if args.gemma_norm is not None:
+        l_gemma_norm = [bool(args.gemma_norm)]
 
     # ``--sweep-group-size`` replaces the default matrix with the cross
     # product of every supported group_size (power-of-two tpg on bf16)
@@ -630,9 +691,17 @@ if __name__ == "__main__":
             "group_size": gs,
             "emit_bf16": emit_bf16,
             "transpose_scale": transpose_scale,
+            "gemma_norm": gemma_norm,
         }
-        for shape, graph_on, gs, emit_bf16, transpose_scale in itertools.product(
-            l_shape, l_graph, l_group_size, l_emit_bf16, l_transpose_scale
+        for shape, graph_on, gs, emit_bf16, transpose_scale, gemma_norm in (
+            itertools.product(
+                l_shape,
+                l_graph,
+                l_group_size,
+                l_emit_bf16,
+                l_transpose_scale,
+                l_gemma_norm,
+            )
         )
     ]
     df = []
@@ -648,6 +717,7 @@ if __name__ == "__main__":
         "withGraph",
         "emit_bf16",
         "transpose_scale",
+        "gemma_norm",
         "per_group_min_us",
         "per_group_max_us",
         "per_group_err",

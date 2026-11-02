@@ -107,7 +107,8 @@ Release automation validates that the release tag points at the matching release
 ```bash
 git clone --recursive https://github.com/ROCm/aiter.git
 cd aiter
-python3 setup.py develop
+./.github/scripts/install_triton.sh
+AITER_USE_SYSTEM_TRITON=1 python3 -m pip install -e .
 ```
 
 If you happen to forget the `--recursive` during `clone`, you can use the following command after `cd aiter`
@@ -117,7 +118,7 @@ git submodule sync && git submodule update --init --recursive
 
 ### FlyDSL
 
-AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 setup.py develop`.
+AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 -m pip install -e .`.
 
 To install it manually:
 
@@ -127,18 +128,47 @@ pip install -r requirements.txt
 
 ### Triton
 
-AITER includes Triton-based operators that require triton from AMD PyPI, with the correct version selected based on your ROCm installation.
+AITER includes Triton-based operators that require Triton from AMD PyPI, with the correct version selected based on your ROCm installation. For an editable installation, run the install script before `pip install -e .` as shown above.
 
-If you install with `python3 setup.py develop`, triton is installed automatically. To skip this and keep your existing triton, set:
+To keep an existing compatible Triton installation, skip the script and set:
 
 ```bash
-AITER_USE_SYSTEM_TRITON=1 python3 setup.py develop
+AITER_USE_SYSTEM_TRITON=1 python3 -m pip install -e .
 ```
 
-If you use `pip install -e .`, run the install script manually:
+### Build parallelism
+
+AITER compiles kernels ahead of time during wheel builds and on first use through runtime JIT. Both paths size their compiler pools from one shared policy in `aiter_worker_limits.py` instead of per-entrypoint constants.
+
+**Automatic sizing.** The CPU budget is 80% of the smaller of affinity-available CPUs and the tightest readable cgroup v2 `cpu.max` or v1 `cpu.cfs_quota_us` / `cpu.cfs_period_us` quota, rounded down with a one-worker minimum (including sub-CPU quotas). For example, 192 visible CPUs with an 8-CPU quota yield six workers before memory and explicit ceilings apply. Quotas are reread on each worker-policy call. Unlimited, missing, unreadable, or malformed quota entries add no constraint; CPU shares/weights and burst allowances do not increase this sustained budget, and ancestors hidden by the container's cgroup mount cannot be inspected.
+
+The memory budget is effective available memory divided by the observed 1.5 GB (1.40 GiB) RSS estimate per worker. Effective available memory is the smaller of host `MemAvailable` and remaining cgroup v2/v1 memory when a finite container limit is present. Reclaimable page cache is counted as used, and a finite limit with an unreadable usage file fails closed to one worker.
+
+**Ceilings.** `AITER_MAX_JOBS` is AITER's optional top-level worker ceiling. CPU compilation additionally applies the live CPU and memory caps; GPU execution uses the device allowance described below. Invalid values fall back to automatic sizing, and non-positive values impose a one-worker ceiling. Automatic results are not written back into the environment. A generic `MAX_JOBS` inherited from vLLM, SGLang, PyTorch, or another parent framework is ignored by plain AITER imports and remains unchanged.
+
+For an AITER-owned compile, worker-ceiling precedence is:
+
+1. An explicitly set `AITER_MAX_JOBS` is AITER's requested ceiling.
+2. Otherwise, runtime JIT and AITER-owned standalone entrypoints use a valid positive legacy `MAX_JOBS` as a ceiling. Runtime JIT reads it without modifying either variable; standalone entrypoints copy it into `AITER_MAX_JOBS` and warn that it is deprecated.
+3. Otherwise, AITER uses automatic sizing. Plain imports do not perform any legacy lookup.
+
+The compatibility paths never change `MAX_JOBS`. Both explicit and legacy ceilings remain upper bounds on the applicable CPU-compilation or GPU-execution budget. The runtime lookup occurs only at the AITER-owned compiler boundary, not during `import aiter` or generic worker-policy calls.
+
+The OPUS `csrc/opus_gemm/gen_co/build_co.py` and `op_tests/opus/device/setup.py` entrypoints accept `--jobs N`, `--jobs=N`, `-j N`, and `-jN` as additional worker ceilings. They never override tighter CPU, memory, environment, or work-count limits. Omitting the option keeps automatic sizing; zero and negative values select one worker. The device-test builder also retains its Python `build(verbose=False, jobs=None)` interface.
+
+**Nested fan-out.** Process-pool workers set the AITER compilation budget to one; AITER's Ninja launcher enforces that budget with an explicit `-j 1` argument. Ninja does not read `NINJAFLAGS`, and arbitrary Ninja invocations are not constrained by these environment settings. Workers also set CMake/Make parallelism controls and one-thread environment hints for OpenMP, BLAS, and NumExpr; numerical runtimes must read those hints before initialization.
+
+When the wheel prebuild compiles several modules in parallel, it divides the live budget between the outer module pool, capped at 5 concurrent modules, and each module's inner Ninja invocation, handing the inner share to the nested compilers through `AITER_MAX_JOBS` for the duration of that phase.
+
+**GPU-executing pools.** Pools whose tasks execute kernels on the GPU during an AITER build, such as the PA-Gluon accuracy prebuild, use a separate device budget. The pool is capped at visible GPUs times `AITER_GPU_WORKERS_PER_DEVICE` (default 8), further limited by submitted work and `AITER_MAX_JOBS`. PA-Gluon assigns workers round-robin to devices at startup and runs each worker's tests on its assigned device, so no device receives more than its allowance. Device discovery uses `torch.cuda.device_count()`, including PyTorch's visibility-mask handling and, on ROCm, its amdsmi discovery with HIP-runtime fallback. PA-Gluon requires at least one visible GPU; CPU-only compilation continues to use the CPU/memory policy. Nested compilation inside GPU workers remains limited to one job.
+
+**Cgroup-memory diagnostics.** Diagnostics compare the memory budget with the CPU budget after applying the requested worker ceiling. A warning is emitted when memory reduces that budget to three workers or fewer, or by at least a factor of four. Repeated warnings are suppressed unless the budget halves or reaches one worker, with a 60-second minimum interval. Recovery resets the reporting baseline without bypassing that interval. These diagnostics do not change worker selection or discount reclaimable page cache.
+
+Examples:
 
 ```bash
-./.github/scripts/install_triton.sh
+AITER_MAX_JOBS=8 python3 -m pip install -e .
+AITER_MAX_JOBS=8 python3 -m aiter.aot.pa
 ```
 
 ### Opus — Lightweight C++ Template for Kernel Development

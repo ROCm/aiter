@@ -31,6 +31,7 @@ from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
@@ -46,6 +47,7 @@ if triton_version >= Version("3.5.0"):
 
     from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
         _deepgemm_fp8_paged_mqa_logits,
+        _deepgemm_fp8_paged_mqa_logits_persistent_schedule,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
@@ -65,6 +67,7 @@ else:
 
     from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
         _deepgemm_fp8_paged_mqa_logits,
+        _deepgemm_fp8_paged_mqa_logits_persistent_schedule,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
@@ -78,6 +81,54 @@ else:
         enable_aot_gluon_pa_mqa_logits and get_gfx() in _GLUON_PA_MQA_LOGITS_ARCHS
     )
     enable_jit_gluon_pa_mqa_logits_kernel = False
+
+
+def _context_lens_and_stride(
+    context_lens: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+    device: torch.device | None = None,
+):
+    """Check ``context_lens`` and return it with the stride the kernels read it at.
+
+    ``context_lens``: int32, contiguous, on the query's device (any GPU for the
+    schedule, which takes no query). Either
+
+    - ``[B]``: the full length ``L_b`` of request ``b``, including its ``next_n``
+      query tokens, or
+    - ``(B, next_n)``: row ``b`` is ``[L_b - next_n + 1, ..., L_b]``, the layout
+      vLLM builds. Only the last column is read: query row ``j``
+      (``0 <= j < next_n``) attends to KV positions ``[0, L_b - next_n + 1 + j)``,
+      so other row values are not supported.
+
+    ``(B, 1)`` is the same as ``[B]``. The kernels read request ``b``'s length at
+    ``b * stride + stride - 1``. Anything else raises ``ValueError``: a strided
+    tensor is rejected rather than copied (a hidden copy would allocate on every
+    call), and the Gluon kernels take ``context_len_ptr`` as ``*i32``.
+    """
+    on_device = (
+        context_lens.device == device
+        if device is not None
+        else context_lens.device.type == "cuda"
+    )
+    if context_lens.dtype != torch.int32 or not on_device:
+        raise ValueError(
+            f"context_lens must be int32 on {device or 'the GPU'}, got "
+            f"{context_lens.dtype} on {context_lens.device}"
+        )
+    if context_lens.dim() not in (1, 2) or not context_lens.is_contiguous():
+        raise ValueError(
+            "context_lens must be a contiguous [B] or [B, n], got shape "
+            f"{tuple(context_lens.shape)} with strides {context_lens.stride()}"
+        )
+    rows = context_lens.shape[0]
+    cols = context_lens.shape[1] if context_lens.dim() == 2 else 1
+    if rows != batch_size or cols not in (1, next_n):
+        raise ValueError(
+            f"context_lens must be [B] or (B, n) with B={batch_size} and n in "
+            f"(1, next_n={next_n}), got shape {tuple(context_lens.shape)}"
+        )
+    return context_lens, cols
 
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
@@ -209,6 +260,10 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         f"got q hidden_dim={hidden_dim} and packed KV dim={packed_dim}."
     )
 
+    context_lens, ctx_stride = _context_lens_and_stride(
+        context_lens, batch_size, next_n, q_fp8.device
+    )
+
     TileQCount = batch_size * next_n * (heads // ChunkQ)
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
 
@@ -256,6 +311,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         **config,
         KVBlockSize=block_size,
         enable_fp_fusion=True,
+        ContextLenStride=ctx_stride,
     )
 
 
@@ -269,6 +325,10 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     is_padded_mode: bool,
     WavePerEU: int = 2,
     VarCtxOpt: bool = False,
+    UseBufferLoad: bool = True,
+    Persistent: bool = False,
+    NextN: int = 1,
+    ContextLenStride: int = 1,
 ):
     gfx_version = get_gfx()
     assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
@@ -321,7 +381,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     if VarCtxOpt:
         fn_signature["safe_chunks_per_cta_ptr"] = "*i32"
     else:
-        fn_signature["SplitKV"] = "i32"
+        fn_signature["SplitKV"] = "*i32" if Persistent else "i32"
 
     if triton_version < Version("3.4.0"):
         assert not enable_jit_gluon_pa_mqa_logits_kernel
@@ -332,6 +392,15 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["HiddenDim"] = "constexpr"
     fn_signature["CDNA_VERSION"] = "constexpr"
     fn_signature["ARCH"] = "constexpr"
+    persistent_constexpr = {}
+    if triton_version >= Version("3.5.0") and not VarCtxOpt:
+        fn_signature["PERSISTENT"] = "constexpr"
+        fn_signature["PERSISTENT_NEXT_N"] = "constexpr"
+        persistent_constexpr["PERSISTENT"] = Persistent
+        persistent_constexpr["PERSISTENT_NEXT_N"] = NextN
+    if VarCtxOpt and triton_version >= Version("3.5.0"):
+        fn_signature["UseBufferLoad"] = "constexpr"
+    fn_signature["ContextLenStride"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
     effective_num_warps = 1 if is_gfx1250 and Preshuffle else 4
@@ -379,6 +448,13 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             "HiddenDim": HiddenDim,
             "CDNA_VERSION": cdna_version,
             "ARCH": gfx_version,
+            **(
+                {"UseBufferLoad": UseBufferLoad}
+                if VarCtxOpt and triton_version >= Version("3.5.0")
+                else {}
+            ),
+            **persistent_constexpr,
+            "ContextLenStride": ContextLenStride,
         },
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
@@ -414,8 +490,13 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     else:
         padded_str = "T" if is_padded_mode and not Preshuffle else "F"
         preshuffle_suffix = "_preshuffle" if Preshuffle else ""
-        varctx_suffix = "_varctx" if VarCtxOpt else ""
-        kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
+        varctx_suffix = (
+            f"_persistent_n{NextN}" if Persistent else "_varctx" if VarCtxOpt else ""
+        )
+        stride_suffix = f"_S{ContextLenStride}" if ContextLenStride != 1 else ""
+        kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}{stride_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
+        if VarCtxOpt and triton_version >= Version("3.5.0") and not UseBufferLoad:
+            kernel_str += "_kv64"
         metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
         with AOTMetadataContext(
             kernel_fn.fn.__name__,
@@ -447,10 +528,13 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
     grid = (TotalCuCount * schedule_waves_per_eu, 1, 1)
     TryCount = math.ceil(max_chunks / grid[0])
     align_power_of_2_batch = 1 << (batch_size - 1).bit_length()
+    context_lens, ctx_stride = _context_lens_and_stride(
+        context_lens, batch_size, next_n
+    )
 
     safe_chunks_per_cta = torch.empty(
         (1,),
-        device="cuda",
+        device=context_lens.device,
         dtype=torch.int32,
     )
     _deepgemm_fp8_paged_mqa_logits_varctx_schedule[grid](
@@ -463,8 +547,99 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         TryCount,
         waves_per_eu=schedule_waves_per_eu,
         enable_fp_fusion=True,
+        ContextLenStride=ctx_stride,
     )
     return safe_chunks_per_cta
+
+
+def deepgemm_fp8_paged_mqa_logits_persistent_schedule(
+    batch_size: int,
+    next_n: int,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    ChunkK: int = 256,
+    TotalCuCount: int | None = None,
+    WavePerEU: int = 2,
+    NumCTAs: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build the FP8 decode persistent grid entirely on the GPU.
+
+    The returned int32 ``[NumCTAs, 4]`` table contains packed query row, first
+    chunk, chunk count and context length. Pass it as ``PersistentSchedule`` to
+    :func:`deepgemm_fp8_paged_mqa_logits`. Rebuild it when context lengths,
+    ``next_n``, ``ChunkK`` or ``max_model_len`` change. Both construction and
+    execution can be captured in a CUDA graph; ``out`` allows storage reuse.
+
+    The default starts at ``TotalCuCount * WavePerEU`` CTAs and adds grid waves
+    when the upper bound exceeds 32 chunks per CTA, up to four times that
+    budget. It is rounded to complete ``next_n`` groups and capped at one CTA
+    per chunk. Explicit ``NumCTAs`` must accommodate one CTA per query.
+    """
+    if batch_size <= 0 or next_n <= 0 or ChunkK <= 0 or max_model_len < 0:
+        raise ValueError(
+            "batch_size, next_n and ChunkK must be positive; max_model_len >= 0"
+        )
+    if context_lens.ndim == 2:
+        # The (B, next_n) table vLLM builds: row b ends with request b's length.
+        if context_lens.shape[0] != batch_size or context_lens.shape[1] not in (
+            1,
+            next_n,
+        ):
+            raise ValueError(
+                "a 2D context_lens must have shape (batch_size, 1) or "
+                "(batch_size, next_n)"
+            )
+        context_lens = context_lens[:, -1]
+    if context_lens.ndim != 1 or context_lens.numel() != batch_size:
+        raise ValueError("context_lens must have shape [batch_size]")
+    if not context_lens.is_cuda or context_lens.dtype not in (torch.int32, torch.int64):
+        raise ValueError("context_lens must be a CUDA int32 or int64 tensor")
+    if NumCTAs is None:
+        if TotalCuCount is None:
+            TotalCuCount = get_num_sms()
+        if TotalCuCount <= 0 or WavePerEU <= 0:
+            raise ValueError("TotalCuCount and WavePerEU must be positive")
+        base_slots = max(batch_size, triton.cdiv(TotalCuCount * WavePerEU, next_n))
+        max_slots = batch_size * max(1, triton.cdiv(max_model_len, ChunkK))
+        # Keep enough queued work for long contexts without letting a loose
+        # output-width bound grow the persistent grid indefinitely.
+        grid_waves = min(4, max(1, triton.cdiv(max_slots, 32 * base_slots)))
+        slots = min(base_slots * grid_waves, max_slots)
+        NumCTAs = slots * next_n
+    if NumCTAs < batch_size * next_n or NumCTAs % next_n:
+        raise ValueError(
+            "NumCTAs must be a multiple of next_n and >= batch_size * next_n"
+        )
+    if out is None:
+        out = torch.empty((NumCTAs, 4), dtype=torch.int32, device=context_lens.device)
+    elif (
+        out.shape != (NumCTAs, 4)
+        or out.dtype != torch.int32
+        or out.device != context_lens.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous int32 [NumCTAs, 4] on the context device"
+        )
+    slots = NumCTAs // next_n
+    # Keep the prefix lookup small and within one wave for common decode
+    # batches. Larger batches retain four waves to limit register pressure.
+    block_s = 16
+    schedule_warps = 1 if batch_size <= 128 else 4
+    _deepgemm_fp8_paged_mqa_logits_persistent_schedule[(triton.cdiv(slots, block_s),)](
+        context_lens.to(torch.int32).contiguous(),
+        out,
+        batch_size,
+        slots,
+        max_model_len,
+        ChunkK=ChunkK,
+        NEXT_N=next_n,
+        BLOCK_B=triton.next_power_of_2(batch_size),
+        BLOCK_S=block_s,
+        num_warps=schedule_warps,
+    )
+    return out
 
 
 def deepgemm_fp8_paged_mqa_logits(
@@ -481,12 +656,51 @@ def deepgemm_fp8_paged_mqa_logits(
     TotalCuCount: int | None = None,
     WavePerEU: int = 2,
     VarCtxSchedule: torch.Tensor = None,
+    SplitKV: int | None = None,
+    PersistentSchedule: torch.Tensor = None,
 ):
+    """Compute paged FP8 decode logits, optionally using a persistent CTA table.
+
+    Build ``PersistentSchedule`` with the same query geometry, context lengths,
+    ``max_model_len`` and ``ChunkK`` using the persistent schedule helper above.
+    The caller initializes logits outside the context to ``-inf`` as on the
+    SplitKV path. Persistent AOT binaries use a separate ``_persistent`` name.
+    """
     if TotalCuCount is None:
         TotalCuCount = get_num_sms()
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, block_Size, _, index_dim = kv_cache.size()
     _, max_block_len = kv_indices.size()
+    Persistent = PersistentSchedule is not None
+    if Persistent:
+        # The kernels take each row's length from PersistentSchedule, so
+        # context_lens is not read here.
+        ctx_stride = 1
+    else:
+        context_lens, ctx_stride = _context_lens_and_stride(
+            context_lens, batch_size, next_n, q_fp8.device
+        )
+    if Persistent:
+        if VarCtxSchedule is not None:
+            raise ValueError(
+                "PersistentSchedule and VarCtxSchedule are mutually exclusive"
+            )
+        if triton_version < Version("3.5.0") or get_gfx() not in ("gfx942", "gfx950"):
+            raise ValueError(
+                "PersistentSchedule requires Triton >= 3.5 and gfx942/gfx950"
+            )
+        if (
+            PersistentSchedule.ndim != 2
+            or PersistentSchedule.shape[1] != 4
+            or PersistentSchedule.dtype != torch.int32
+            or PersistentSchedule.device != q_fp8.device
+            or not PersistentSchedule.is_contiguous()
+            or PersistentSchedule.shape[0] < batch_size * next_n
+            or PersistentSchedule.shape[0] % next_n
+        ):
+            raise ValueError(
+                "PersistentSchedule must be contiguous int32 [NumCTAs, 4] on the query device"
+            )
 
     if get_gfx() == "gfx1250":
         if Preshuffle and hidden_dim <= 128:
@@ -495,13 +709,30 @@ def deepgemm_fp8_paged_mqa_logits(
             WavePerEU = 1
 
     TileQCount = batch_size * next_n
-    SplitKV = (
-        (max(1, TotalCuCount // TileQCount) + 4)
-        // 5
-        * 5
-        * WavePerEU
-        * (2 if get_gfx() == "gfx1250" else 1)
-    )
+    if SplitKV is None:
+        if get_gfx() == "gfx1250":
+            SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU * 2
+        else:
+            # One full residency wave, with the context split evenly across it.
+            # waves_per_eu is passed to LLVM as both the minimum and the
+            # maximum, so WavePerEU 4-warp workgroups fit on a CU. Rounding
+            # SplitKV itself to a multiple of 5 leaves the grid at a fraction
+            # of that -- 2.5 workgroups per CU at batch 16/32/64 with the
+            # default WavePerEU=2 -- so half the CUs run one more workgroup
+            # than the other half and the kernel waits for them. Sizing the
+            # grid instead of SplitKV keeps that from happening at any batch.
+            SplitKV = max(1, triton.cdiv(WavePerEU * TotalCuCount, TileQCount))
+            chunks = max(1, triton.cdiv(max_model_len, ChunkK))
+            # One wave stops being enough once a workgroup's share of the
+            # context passes ~32 chunks: at batch 128/256 it leaves each one
+            # chewing 128-256 chunks with no queue behind it to rebalance
+            # against. Split further there, by at most 2x -- `max_model_len` is
+            # only an upper bound on the context, since the real lengths live in
+            # a device tensor, and a loose bound must not over-split without
+            # limit.
+            SplitKV = min(max(SplitKV, triton.cdiv(chunks, 32)), SplitKV * 2)
+            # Splits past the last chunk return immediately; don't launch them.
+            SplitKV = min(SplitKV, chunks)
 
     assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
@@ -539,7 +770,11 @@ def deepgemm_fp8_paged_mqa_logits(
         VarCtxSchedule = None
 
     VarCtxOpt = VarCtxSchedule is not None
-    if VarCtxOpt:
+    # buffer_load uses 32-bit offsets; the packed cache span covers K and scales.
+    use_buffer_load = max_addressable_bytes(kv_cache) < 2**31 - 1 if VarCtxOpt else True
+    if Persistent:
+        grid = (PersistentSchedule.shape[0], 1, 1)
+    elif VarCtxOpt:
         grid = (TotalCuCount * WavePerEU, 1, 1)
     else:
         grid = (batch_size * next_n * SplitKV, 1, 1)
@@ -555,6 +790,10 @@ def deepgemm_fp8_paged_mqa_logits(
             is_padded_mode=is_padded_mode,
             WavePerEU=WavePerEU,
             VarCtxOpt=VarCtxOpt,
+            UseBufferLoad=use_buffer_load,
+            Persistent=Persistent,
+            NextN=next_n if Persistent else 1,
+            ContextLenStride=ctx_stride,
         )
         if triton_version >= Version("3.5.0"):
             cdna_version = get_cdna_version()
@@ -579,7 +818,11 @@ def deepgemm_fp8_paged_mqa_logits(
                 max_model_len,
                 max_block_len,
                 num_block,
-                SplitKV if not VarCtxOpt else VarCtxSchedule,
+                (
+                    PersistentSchedule
+                    if Persistent
+                    else VarCtxSchedule if VarCtxOpt else SplitKV
+                ),
                 # constexpr
                 heads,
                 ChunkK,
@@ -587,6 +830,12 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
                 cdna_version,
                 get_gfx(),
+                *(
+                    (use_buffer_load,)
+                    if VarCtxOpt
+                    else (Persistent, next_n if Persistent else 1)
+                ),
+                ctx_stride,
             )
         else:  #  load AOT compiled gluon kernel
             assert triton_version < Version(
@@ -656,5 +905,6 @@ def deepgemm_fp8_paged_mqa_logits(
             SplitKV=SplitKV,
             HiddenDim=hidden_dim,
             KVBlockSize=KVBlockSize,
+            ContextLenStride=ctx_stride,
         )
     return triton.runtime.cache.get_cache_manager(kernel.hash).key

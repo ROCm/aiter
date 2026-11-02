@@ -1,5 +1,6 @@
+import functools
+
 import torch
-import triton
 
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     fused_gemm_a8w8_blockscale_a16w16,
@@ -10,6 +11,8 @@ from op_tests.op_benchmarks.triton.bench_fused_gemm_commons import (
     run_fused_benchmark,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -28,7 +31,16 @@ kernel_label = "fused_gemm_a8w8_blockscale_a16w16"
 shape = "(N8=512, N16=256, K=7168)"
 
 
-def bench_fn(M: int, N8: int, N16: int, K: int, metric: str, **kwargs):
+def bench_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+    M: int,
+    N8: int,
+    N16: int,
+    K: int,
+    metric: str,
+    **kwargs,
+):
     """
     Single-shape timing of the fused kernel via its public wrapper.
     Output buffers are pre-allocated and passed in to keep allocation out of the
@@ -38,19 +50,30 @@ def bench_fn(M: int, N8: int, N16: int, K: int, metric: str, **kwargs):
     c_dtype = torch.bfloat16
 
     # FP8 branch inputs (N8 = N_fp8). ``output=True`` pre-allocates ``y_fp8``
-    x_fp8, w_fp8, _, x_fp8_scale, _, w_fp8_scale, y_fp8 = (
-        generate_gemm_a8w8_blockscale_inputs(
-            M,
-            N8,
-            K,
-            block_shape_n,
-            block_shape_k,
-            dtype=c_dtype,
-            output=True,
-        )
+    _p_gen_fp8 = functools.partial(
+        generate_gemm_a8w8_blockscale_inputs,
+        M,
+        N8,
+        K,
+        block_shape_n,
+        block_shape_k,
+        dtype=c_dtype,
+        output=True,
     )
+    # (x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y)
+    _out_vals_keys_fp8 = [
+        "x_fp8",
+        "w_fp8",
+        "_",
+        "x_fp8_scale",
+        "_",
+        "w_fp8_scale",
+        "y_fp8",
+    ]
+
     # BF16 branch inputs (N16 = N_bf16). Same M, same K, and no bias
-    x_bf16, w_bf16, _, _, y_bf16 = generate_gemm_a16w16_inputs(
+    _p_gen_bf16 = functools.partial(
+        generate_gemm_a16w16_inputs,
         M,
         N16,
         K,
@@ -58,34 +81,34 @@ def bench_fn(M: int, N8: int, N16: int, K: int, metric: str, **kwargs):
         output=True,
         bias=False,
     )
-    flops = 2.0 * M * (N8 + N16) * K  # summed across the two fused outputs
-    # bytes moved, summed as numel() * element_size() per tensor
-    mem = (
-        x_fp8.numel() * x_fp8.element_size()
-        + w_fp8.numel() * w_fp8.element_size()
-        + x_fp8_scale.numel() * x_fp8_scale.element_size()
-        + w_fp8_scale.numel() * w_fp8_scale.element_size()
-        + x_bf16.numel() * x_bf16.element_size()
-        + w_bf16.numel() * w_bf16.element_size()
-        + y_fp8.numel() * y_fp8.element_size()
-        + y_bf16.numel() * y_bf16.element_size()
+    # (x, weight, bias, out_dtype, y)
+    _out_vals_keys_bf16 = ["x_bf16", "w_bf16", "_", "_", "y_bf16"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen_fp8, _p_gen_bf16],
+        [_out_vals_keys_fp8, _out_vals_keys_bf16],
+        **kwargs_rot_bufs,
     )
 
-    ms = triton.testing.do_bench(
-        lambda: fused_gemm_a8w8_blockscale_a16w16(
-            x_fp8,
-            w_fp8,
-            x_fp8_scale,
-            w_fp8_scale,
-            x_bf16,
-            w_bf16,
-            dtype=c_dtype,
-            y_fp8=y_fp8,
-            y_bf16=y_bf16,
-        ),
-        warmup=25,
-        rep=100,
+    kernel_fn = functools.partial(fused_gemm_a8w8_blockscale_a16w16, dtype=c_dtype)
+
+    flops = 2.0 * M * (N8 + N16) * K  # summed across the two fused outputs
+    # bytes moved, derived from M/N8/N16/K; the blockscale scale tensors keep
+    # their own numel (one scale per block, which doesn't reduce to a clean
+    # M/N/K product).
+    buf0 = rot_bufs[0]
+    mem = (
+        (M * K) * buf0["x_fp8"].element_size()
+        + (N8 * K) * buf0["w_fp8"].element_size()
+        + buf0["x_fp8_scale"].numel() * buf0["x_fp8_scale"].element_size()
+        + buf0["w_fp8_scale"].numel() * buf0["w_fp8_scale"].element_size()
+        + (M * K) * buf0["x_bf16"].element_size()
+        + (N16 * K) * buf0["w_bf16"].element_size()
+        + (M * N8) * buf0["y_fp8"].element_size()
+        + (M * N16) * buf0["y_bf16"].element_size()
     )
+
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
     return metric_to_scalar(metric, ms, flops, mem)
 

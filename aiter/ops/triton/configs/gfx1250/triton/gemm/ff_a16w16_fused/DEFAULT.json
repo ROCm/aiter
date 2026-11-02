@@ -7,7 +7,6 @@
         "num_warps": 8,
         "num_stages": 2,
         "waves_per_eu": 3,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
     "M_LEQ_8": {
@@ -18,7 +17,6 @@
         "num_warps": 8,
         "num_stages": 2,
         "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
     "M_LEQ_64": {
@@ -29,7 +27,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
     "any": {
@@ -40,7 +37,6 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
         "cache_modifier": null
     }
 }

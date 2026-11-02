@@ -28,7 +28,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     ptr_buf_tensor,
 )
-from aiter.ops.flydsl.kernels.topk.topk_per_row_decode import (
+from aiter.ops.flydsl.kernels.topk.topk_common import (
     _warp_inclusive_prefix_i32,
 )
 

@@ -8,12 +8,12 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
-    invert_sorted_ids,
     sorted_sum,
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
@@ -26,39 +26,95 @@ class Config:
     BLOCK_N: int
     BLOCK_K: int
     use_prefill: bool
+    down_path: str = "default"
+    down_output_padding_bytes: int = 0
+    use_batch1_algorithm: bool = False
+
+    def __post_init__(self):
+        if self.down_path not in ("default", "1x4_64x256", "8x1_compact"):
+            raise ValueError(f"Unsupported Down path: {self.down_path}")
+        if self.down_output_padding_bytes not in (0, 32, 64, 128):
+            raise ValueError("Down output padding must be 0, 32, 64 or 128 bytes")
+        if self.down_path == "default" and self.down_output_padding_bytes != 0:
+            raise ValueError("The default Down path does not support output padding")
+        if self.down_path != "default" and not self.use_prefill:
+            raise ValueError("Specialized Down paths require prefill")
+        if self.use_batch1_algorithm and (
+            self.use_prefill or self.down_path != "default"
+        ):
+            raise ValueError(
+                "Direct decoding cannot use prefill or specialized Down paths"
+            )
+        # The batch-1 kernels have a fixed tile, so any other tile would be misreported.
+        tile = (self.BLOCK_M, self.BLOCK_N, self.BLOCK_K)
+        if self.use_batch1_algorithm and tile != (16, 16, 16):
+            raise ValueError("Direct decoding uses the 16_16_16 tile")
 
     def to_string(self):
+        # Only direct decoding adds the fifth tile field, so existing strings are unchanged.
+        batch1 = "_True" if self.use_batch1_algorithm else ""
         return (
-            str(self.BLOCK_M)
-            + "_"
-            + str(self.BLOCK_N)
-            + "_"
-            + str(self.BLOCK_K)
-            + "_"
-            + str(self.use_prefill)
+            f"{self.BLOCK_M}_{self.BLOCK_N}_{self.BLOCK_K}_{self.use_prefill}{batch1}:"
+            f"{self.down_path}:{self.down_output_padding_bytes}"
         )
 
     @classmethod
     def from_string(cls, data: str):
-        parts = data.split("_")
-        if len(parts) != 4:
-            raise ValueError(f"Invalid config string: {data}")
-
-        def parse_bool(value: str) -> bool:
-            if value == "True":
-                return True
-            if value == "False":
-                return False
-            raise ValueError(f"Invalid boolean value in config string: {value}")
-
+        parts = data.split(":")
+        # Configs tuned before the Down suffix existed use the default Down path.
+        if len(parts) == 1:
+            parts += ["default", "0"]
+        tile, down_path, padding = parts
+        fields = tile.split("_")
+        if len(fields) == 4:
+            fields.append("False")
+        block_m, block_n, block_k, use_prefill, use_batch1_algorithm = fields
+        if use_prefill not in ("True", "False") or use_batch1_algorithm not in (
+            "True",
+            "False",
+        ):
+            raise ValueError(f"Invalid algorithm flags: {tile}")
         return cls(
-            int(parts[0]),
-            int(parts[1]),
-            int(parts[2]),
-            parse_bool(parts[3]),
+            int(block_m),
+            int(block_n),
+            int(block_k),
+            use_prefill == "True",
+            down_path,
+            int(padding),
+            use_batch1_algorithm=use_batch1_algorithm == "True",
         )
 
     def unsupported_reason(self, problem: "_Problem") -> str | None:
+        if self.use_batch1_algorithm and not 2 <= problem.batch <= 8:
+            return "direct decoding requires 2 to 8 tokens"
+        # Batch 1 runs the batch-1 kernels for any tile; tune it only as 16_16_16.
+        tile = (self.BLOCK_M, self.BLOCK_N, self.BLOCK_K)
+        if not self.use_prefill and problem.batch == 1 and tile != (16, 16, 16):
+            return "batch 1 uses the 16_16_16 config"
+        if self.down_path != "default":
+            if self.BLOCK_M != 64:
+                return "specialized Down paths require unchanged M64 Gate/Up metadata"
+            # The native tuner's empty quant_type is a shape-only probe. The
+            # runtime wrapper checks actual FP8 weight and activation support.
+            if problem.quant_type not in ("", "ptpc", "per_tensor"):
+                return "specialized Down paths require FP8 weights"
+            if self.down_path == "8x1_compact":
+                if problem.inter_dim not in (192, 256, 384, 512, 640):
+                    return "compact Down requires inter_dim in {192,256,384,512,640}"
+                if problem.model_dim < 512:
+                    return "compact Down requires model_dim >= 512"
+                if not 0 < problem.experts <= 2048:
+                    return "compact Down requires 1 to 2048 experts"
+            scale_bytes = 0 if problem.quant_type == "per_tensor" else 256 * 4
+            if 64 * problem.inter_dim + scale_bytes + 4 * 16 * 64 * 2 > 64 * 1024:
+                return "specialized M64 Down exceeds the 64 KiB LDS capacity"
+        if self.use_prefill and problem.quant_type == "no":
+            if self.BLOCK_K not in (64, 128):
+                return "BF16 prefill requires Gate/Up BLOCK_K=64 or 128"
+            if 2 * self.BLOCK_M * self.BLOCK_K * 2 > 64 * 1024:
+                return "BF16 Gate/Up ping-pong exceeds the 64 KiB LDS capacity"
+            if self.BLOCK_M * problem.inter_dim * 2 > 64 * 1024:
+                return "BF16 default Down exceeds the 64 KiB LDS capacity"
         if self.use_prefill and problem.gateup_dim % self.BLOCK_N != 0:
             return (
                 f"gateup_dim={problem.gateup_dim} is not divisible by "
@@ -113,17 +169,30 @@ class _Problem:
             model_dim=model_dim,
             inter_dim=inter_dim,
             topk=topk_ids.shape[1],
-            quant_type=("ptpc" if quant_type == QuantType.per_Token else "per_tensor"),
+            quant_type={
+                QuantType.No: "no",
+                QuantType.per_Token: "ptpc",
+                QuantType.per_Tensor: "per_tensor",
+            }[quant_type],
         )
 
 
 def get_tune_space():
-    return [
-        Config(16, 16, 16, False).to_string(),
-        Config(64, 256, 128, True).to_string(),
-        Config(64, 128, 256, True).to_string(),
-        Config(64, 128, 128, True).to_string(),
+    prefill = [(256, 128), (128, 256), (128, 128)]
+    configs = [
+        Config(16, 16, 16, False),
+        Config(16, 16, 16, False, use_batch1_algorithm=True),
+        Config(16, 128, 64, False),
     ]
+    configs.extend(Config(64, block_n, block_k, True) for block_n, block_k in prefill)
+    configs.extend(
+        Config(
+            64, block_n, block_k, True, down_path=path, down_output_padding_bytes=128
+        )
+        for path in ("1x4_64x256", "8x1_compact")
+        for block_n, block_k in prefill
+    )
+    return [config.to_string() for config in configs]
 
 
 @cache
@@ -142,6 +211,9 @@ def _get_compiled_kernel(
     BLOCK_TILE_SIZE_K=None,
     activation_str="silu",
     swiglu_limit=None,
+    down_path="default",
+    down_output_padding_bytes=0,
+    fused_down_clear=False,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
 
@@ -161,6 +233,9 @@ def _get_compiled_kernel(
         act_quant_type=act_quant_type_str,
         activation=activation_str,
         swiglu_limit=swiglu_limit,
+        down_path=down_path,
+        down_output_padding_bytes=down_output_padding_bytes,
+        fused_down_clear=fused_down_clear,
     )
 
 
@@ -216,7 +291,16 @@ def _run_prefill(
     activation_str: str,
     swiglu_limit: float | None,
 ):
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+    # Opus also returns each route's sorted row; merged repeated expert IDs get -1.
+    (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        _,
+        _,
+        loc_ids,
+    ) = moe_sorting(
         topk_ids,
         topk_weight,
         problem.experts,
@@ -226,6 +310,14 @@ def _run_prefill(
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
+        # sorted_sum writes every output row, so the sort need not clear one.
+        accumulate=False,
+        output_aux=AUX_SORT_OPUS,
+    )
+    cur_out = torch.empty(
+        [problem.batch, problem.model_dim],
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
@@ -248,6 +340,9 @@ def _run_prefill(
         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
     gemm1_out = _gateup_output(hidden_states, problem)
+    if quant_type == QuantType.per_Tensor:
+        # Gate/Up skips routes sorting drops, but the Down absmax reads every row.
+        gemm1_out.zero_()
     gateup_kernel = _get_compiled_kernel(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
@@ -291,8 +386,12 @@ def _run_prefill(
         down_in = gemm1_out
         down_in_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
+    output_row_size = (
+        problem.model_dim
+        + config.down_output_padding_bytes // hidden_states.element_size()
+    )
     gemm2_out = torch.empty(
-        [sorted_expert_ids.shape[0] * config.BLOCK_M, problem.model_dim],
+        [sorted_expert_ids.shape[0] * config.BLOCK_M, output_row_size],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
@@ -308,9 +407,10 @@ def _run_prefill(
         alg="prefill_1x4",
         E=problem.experts,
         act_quant_type_str=act_quant_type_str,
+        down_path=config.down_path,
+        down_output_padding_bytes=config.down_output_padding_bytes,
     )
-    _launch(
-        down_kernel,
+    down_args = (
         down_in,
         w2,
         gemm2_out,
@@ -323,20 +423,30 @@ def _run_prefill(
         problem.batch,
         task_num,
     )
+    if config.down_path == "8x1_compact":
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm2_8x1_compact import (
+            allocate_task_buffers,
+        )
 
-    loc_ids = torch.empty(
-        [problem.batch, problem.topk],
-        dtype=torch.int32,
-        device=hidden_states.device,
-    )
-    invert_sorted_ids(problem.topk)(
-        sorted_ids,
-        loc_ids,
-        num_valid_ids,
-        sorted_ids.shape[0],
-        problem.batch,
-    )
-    sorted_sum(problem.topk, problem.model_dim)(
+        # The split policy and its buffer capacities must use the same CU count.
+        cu_count = get_cu_num()
+        full_tasks, tail_tasks, counts = allocate_task_buffers(
+            sorted_expert_ids, problem.experts, cu_count
+        )
+        _launch(
+            down_kernel,
+            *down_args,
+            full_tasks,
+            tail_tasks,
+            counts,
+            full_tasks.shape[0],
+            tail_tasks.shape[0],
+            cu_count,
+        )
+    else:
+        _launch(down_kernel, *down_args)
+
+    sorted_sum(problem.topk, problem.model_dim, config.down_output_padding_bytes)(
         loc_ids, gemm2_out, cur_out, problem.batch
     )
     return cur_out
@@ -358,15 +468,20 @@ def _run_batch1(
         topk_weight if topk_weight.dtype == torch.float32 else topk_weight.float()
     )
     gemm1_out = _gateup_output(hidden_states, problem)
-    cur_out = torch.zeros(
-        [1, problem.model_dim],
+    # Gate/Up zeroes the output itself when the output row matches its input row.
+    fused_down_clear = problem.model_dim == problem.hidden_dim
+    allocate_output = torch.empty if fused_down_clear else torch.zeros
+    cur_out = allocate_output(
+        [problem.batch, problem.model_dim],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
+    route_count = problem.batch * problem.topk
+    weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     gateup_kernel = _get_compiled_kernel(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
-        weight_dtype_str="fp8",
+        weight_dtype_str=weight_dtype_str,
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=16,
@@ -376,6 +491,7 @@ def _run_batch1(
         E=None,
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
+        fused_down_clear=fused_down_clear,
     )
     _launch(
         gateup_kernel,
@@ -383,15 +499,15 @@ def _run_batch1(
         w1,
         gemm1_out,
         topk_ids,
-        topk_weight,
+        cur_out,
         w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
-        problem.topk,
+        route_count,
     )
 
     down_kernel = _get_compiled_kernel(
         N=problem.model_dim,
         K=problem.inter_dim,
-        weight_dtype_str="fp8",
+        weight_dtype_str=weight_dtype_str,
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=16,
@@ -408,7 +524,7 @@ def _run_batch1(
         topk_ids,
         topk_weight,
         w2_scale if w2_scale is not None else _empty_scale(hidden_states.device),
-        problem.topk,
+        route_count,
     )
     return cur_out
 
@@ -444,15 +560,17 @@ def _run_decode(
     if problem.batch * problem.topk <= problem.experts:
         grid = problem.batch * problem.topk
 
+    block_n = 64 if config.BLOCK_N == 16 else config.BLOCK_N
     gemm1_out = _gateup_output(hidden_states, problem)
+    weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     gateup_kernel = _get_compiled_kernel(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
-        weight_dtype_str="fp8",
+        weight_dtype_str=weight_dtype_str,
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
-        BLOCK_TILE_SIZE_N=64,
+        BLOCK_TILE_SIZE_N=block_n,
         stage="gateup",
         alg="splitk",
         E=problem.experts,
@@ -476,11 +594,11 @@ def _run_decode(
     down_kernel = _get_compiled_kernel(
         N=problem.model_dim,
         K=problem.inter_dim,
-        weight_dtype_str="fp8",
+        weight_dtype_str=weight_dtype_str,
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
-        BLOCK_TILE_SIZE_N=64,
+        BLOCK_TILE_SIZE_N=block_n,
         stage="down",
         alg="splitk",
         E=problem.experts,
@@ -535,18 +653,27 @@ def run_flydsl_moe_gfx942(
                 f"gfx942 FlyDSL whole-graph backend requires contiguous {name}"
             )
     config = Config.from_string(config_string)
+    is_bf16 = (
+        w1.dtype == torch.bfloat16
+        and w2.dtype == torch.bfloat16
+        and quant_type == QuantType.No
+    )
+    is_fp8 = (
+        w1.dtype == torch.float8_e4m3fnuz
+        and w2.dtype == torch.float8_e4m3fnuz
+        and quant_type in (QuantType.per_Token, QuantType.per_Tensor)
+    )
     if (
         hidden_states.dtype != torch.bfloat16
         or expert_mask is not None
         or activation not in (ActivationType.Silu, ActivationType.Swiglu)
-        or w1.dtype != torch.float8_e4m3fnuz
-        or w2.dtype != torch.float8_e4m3fnuz
+        or not (is_bf16 or is_fp8)
     ):
         raise RuntimeError("Unsupported input for the gfx942 FlyDSL MoE backend")
-    if quant_type not in (QuantType.per_Token, QuantType.per_Tensor):
-        raise RuntimeError(f"Unsupported quant_type: {quant_type}")
-    if w1_scale is None or w2_scale is None:
+    if is_fp8 and (w1_scale is None or w2_scale is None):
         raise ValueError("FP8 weights require both w1_scale and w2_scale")
+    if is_bf16 and (w1_scale is not None or w2_scale is not None):
+        raise NotImplementedError("BF16 weights do not support weight scales")
 
     activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
     problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)
@@ -574,7 +701,7 @@ def run_flydsl_moe_gfx942(
             activation_str,
             swiglu_limit,
         )
-    if problem.batch == 1:
+    if problem.batch == 1 or config.use_batch1_algorithm:
         return _run_batch1(
             hidden_states,
             w1,
@@ -651,13 +778,16 @@ def run_flydsl_moe_gfx942_impl(
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support split-K"
         )
-    if request.q_dtype_a not in (None, torch.float8_e4m3fnuz):
+    quant_dtype = (
+        torch.bfloat16 if request.w1.dtype == torch.bfloat16 else torch.float8_e4m3fnuz
+    )
+    if request.q_dtype_a not in (None, quant_dtype):
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend requires FP8 E4M3FNUZ activations"
+            "gfx942 FlyDSL whole-graph activation dtype must match the weight mode"
         )
-    if request.q_dtype_w not in (None, torch.float8_e4m3fnuz):
+    if request.q_dtype_w not in (None, quant_dtype):
         raise NotImplementedError(
-            "gfx942 FlyDSL whole-graph backend requires FP8 E4M3FNUZ weights"
+            "gfx942 FlyDSL whole-graph weight dtype must match the weight mode"
         )
     return run_flydsl_moe_gfx942(
         request.hidden_states,

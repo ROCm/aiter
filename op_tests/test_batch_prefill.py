@@ -3881,6 +3881,66 @@ def test_batch_prefill_sink(
     )
 
 
+_VIRTUAL_SINK_CASES = [
+    (1, -1, True),
+    (1, 8, True),
+    (1, 1, True),
+    (2, -1, True),
+    (1, -1, False),
+]
+
+
+@pytest.mark.parametrize("qo_len,window_left,with_sink", _VIRTUAL_SINK_CASES)
+def test_batch_prefill_virtual_sink(qo_len, window_left, with_sink):
+    torch.manual_seed(42)
+    kv_lens, num_heads, num_kv_heads, head_dim = (4, 7), 8, 2, 128
+    q = torch.randn(
+        (len(kv_lens) * qo_len, num_heads, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = torch.randn(
+        (sum(kv_lens), num_kv_heads, head_dim), dtype=q.dtype, device=q.device
+    )
+    v = torch.randn_like(k)
+    sink = (
+        torch.linspace(-1.0, 3.0, num_heads, dtype=torch.float32, device=q.device)
+        if with_sink
+        else None
+    )
+    kv_indices = torch.randperm(sum(kv_lens), device=q.device).to(torch.int32)
+    out = aiter.mha_batch_prefill_func(
+        q,
+        k,
+        v,
+        torch.tensor([0, qo_len, 2 * qo_len], dtype=torch.int32, device=q.device),
+        torch.tensor([0, kv_lens[0], sum(kv_lens)], dtype=torch.int32, device=q.device),
+        kv_indices,
+        max_seqlen_q=qo_len,
+        max_seqlen_k=max(kv_lens),
+        causal=True,
+        window_size=(window_left, -1),
+        sink_ptr=sink,
+    )
+    expected = []
+    offset = 0
+    for i, kv_len in enumerate(kv_lens):
+        indices = kv_indices[offset : offset + kv_len].long()
+        expected.append(
+            ref_masked_attention_with_sink(
+                q[i * qo_len : (i + 1) * qo_len],
+                k[indices].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                v[indices].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                window_left,
+                0,
+                sink,
+            )
+        )
+        offset += kv_len
+    rtol, atol = get_tolerances(q.dtype)
+    torch.testing.assert_close(out, torch.cat(expected), rtol=rtol, atol=atol)
+
+
 # CI runs `python3 test_batch_prefill.py` (no pytest), so the __main__ block
 # above only executes the non-sink scenarios. Add a small representative sweep
 # of the StreamLLM sink scenarios here so they actually exercise in CI.
@@ -3908,3 +3968,6 @@ if __name__ == "__main__":
             dtype=dtype,
             seed=42,
         )
+
+    for case in _VIRTUAL_SINK_CASES:
+        test_batch_prefill_virtual_sink(*case)
