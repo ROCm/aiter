@@ -734,12 +734,35 @@ def main() -> int:
         4, HEADS, HDIM)
     expect_raise("reject misaligned q (2-byte offset view)", ValueError,
                  lambda: K.qsa_paged_mqa_logits_page4(**{**base, "q": misaligned}))
-    expect_raise("reject metadata that wraps int32", ValueError,
-                 lambda: K.qsa_paged_mqa_logits_page4(
-                     **{**base, "context_lens": torch.tensor([2**40], dtype=torch.int64)}))
-    expect_raise("reject page_table values that wrap int32", ValueError,
-                 lambda: K.qsa_paged_mqa_logits_page4(
-                     **{**base, "page_table": torch.full((1, 16), 2**33, dtype=torch.int64)}))
+    # ROUND-NOSYNC: the historical raise-on-wrap contract is opt-in
+    # (QSA_STRICT_I32=1, read at import -> patched module flag here). The
+    # default saturates on the device with no host sync; its exactness is
+    # covered by test_nosync_i32_cpu.py and checked directly below.
+    _strict = K._QSA_STRICT_I32
+    K._QSA_STRICT_I32 = True
+    try:
+        expect_raise("[strict] reject metadata that wraps int32", ValueError,
+                     lambda: K.qsa_paged_mqa_logits_page4(
+                         **{**base, "context_lens": torch.tensor([2**40], dtype=torch.int64)}))
+        expect_raise("[strict] reject page_table values that wrap int32", ValueError,
+                     lambda: K.qsa_paged_mqa_logits_page4(
+                         **{**base, "page_table": torch.full((1, 16), 2**33, dtype=torch.int64)}))
+    finally:
+        K._QSA_STRICT_I32 = _strict
+    for tag, value, hi, want in (
+        ("default saturates context 2**40 -> INT32_MAX", 2**40, 2**31 - 1, 2**31 - 1),
+        ("default saturates page 2**33 -> INT32_MAX", 2**33, 2**31 - 1, 2**31 - 1),
+        ("default saturates -2**40 -> INT32_MIN", -2**40, 2**31 - 1, -2**31),
+        ("default position INT32_MAX -> INT32_MAX-1", 2**31 - 1, 2**31 - 2, 2**31 - 2),
+    ):
+        got = K._to_i32_saturated(torch.tensor([value], dtype=torch.int64), hi)
+        ok = got.dtype == torch.int32 and int(got[0]) == want
+        print("[%s] %s" % ("PASS" if ok else "FAIL", tag))
+        fails += 0 if ok else 1
+    i32 = torch.zeros(3, dtype=torch.int32)
+    ok = K._to_i32_saturated(i32) is i32
+    print("[%s] default int32 metadata is zero-copy" % ("PASS" if ok else "FAIL"))
+    fails += 0 if ok else 1
 
     # the guard helpers are also unit-tested directly (they carry the invariants)
     for tag, fn, exc in (

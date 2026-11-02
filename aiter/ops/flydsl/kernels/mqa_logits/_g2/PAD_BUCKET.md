@@ -87,7 +87,9 @@ are LDS-only. TDM requires128B. Cache pages/scales are never extended.
   builder, alias-only tensor views and single kernel launch remain unchanged.
 - Allocation/sync-free evidence assumes caller-supplied outputs, contiguous
   int32 metadata, and an already-built specialization, just as PAD=0. Missing
-  outputs still allocate; int64 narrowing still probes min/max and converts;
+  outputs still allocate; int64 narrowing costs one device clamp+narrow launch
+  per int64 tensor and no host sync since ROUND-NOSYNC (`QSA_STRICT_I32=1`
+  restores the historical min/max probe, see `ROUND_NOSYNC.md`);
   noncontiguous metadata still copies; first compilation still costs. These
   are unchanged original API costs, not bucket-padding overhead.
 - **Non-native extent path** retains the full ROUND-PAD plan/allocate/launch/

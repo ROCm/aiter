@@ -2659,6 +2659,78 @@ def _to_i32_checked(tensor, name):
     return tensor.to(torch.int32)
 
 
+# ROUND-NOSYNC: opt-in strict narrowing. Read once at import, like the other
+# switches. QSA_STRICT_I32=1 restores the historical _to_i32_checked contract
+# exactly (int64 values outside int32 raise; two host synchronizations plus a
+# cast launch per int64 tensor). Default: _to_i32_saturated (no host sync).
+_QSA_STRICT_I32 = os.environ.get("QSA_STRICT_I32", "0").strip() == "1"
+_MIN_I32 = -(2**31)
+_I32_BOUNDS: dict = {}
+
+
+def _i32_bounds(device, hi):
+    """0-d int64 clamp bounds, created once per (device, stream, hi).
+
+    Created with ``torch.full`` (a fill launch, graph-capture safe, no H2D copy)
+    on the stream that first consumes them, so every reader is stream-ordered
+    after its own creation fill; steady-state calls allocate/launch nothing here.
+    """
+    stream = (torch.cuda.current_stream(device).cuda_stream
+              if device.type == "cuda" else None)
+    key = (device, stream, hi)
+    bounds = _I32_BOUNDS.get(key)
+    if bounds is None:
+        bounds = (torch.full((), _MIN_I32, dtype=torch.int64, device=device),
+                  torch.full((), hi, dtype=torch.int64, device=device))
+        _I32_BOUNDS[key] = bounds
+    return bounds
+
+
+def _to_i32_saturated(tensor, hi=_MAX_I32):
+    """int32: zero-copy passthrough. int64: ONE fused clamp+narrow, no host sync.
+
+    ``torch.clamp(int64, lo_t, hi_t, out=int32)`` is a single TensorIterator
+    launch on the device (the int64 -> int32 store cast is done in-kernel); on
+    CPU it is the same op (with an internal temporary). No ``.min()``/``.max()``
+    /``.item()`` host round-trip. Values are saturated to ``[INT32_MIN, hi]``.
+
+    Why saturation is exact (proof, see also ``test_nosync_i32_cpu.py``):
+    every metadata semantic the kernel computes is monotone in the value and
+    constant outside the int32 range, given the plane caps enforced by
+    ``_check_plane`` (rows/columns/requests/pages are all < 2**29):
+
+    * ``token_to_request``: valid iff ``0 <= r < requests``. Saturation fixes
+      every in-range value; ``r > INT32_MAX`` -> ``INT32_MAX >= requests`` and
+      ``r < INT32_MIN`` -> ``INT32_MIN < 0``: invalid stays invalid.
+    * ``page_table``: valid iff ``0 <= p < cache_pages``; identical argument
+      (invalid pages stay invalid and are clamped to page 0 by the kernel).
+    * ``context_lens`` ``c`` and ``query_positions`` ``p`` (``hi = INT32_MAX-1``
+      for positions so the kernel's i32 ``pos + 1`` can never wrap):
+      ``V = max(0, min((p+1)//4, c//4))``. Let ``p', c'`` be the saturated
+      values and ``V'`` the same formula. If ``p <= INT32_MAX-2`` and
+      ``INT32_MIN <= c <= INT32_MAX`` (and ``p >= INT32_MIN``) nothing changes.
+      ``p >= INT32_MAX-1``: ``(p'+1)//4 = 2**29 > c'//4``, so
+      ``V' = max(0, c'//4)``; ``V = max(0, c//4)`` too because
+      ``(p+1)//4 >= 2**29``, unless ``c > INT32_MAX``. ``c > INT32_MAX``:
+      ``c'//4 = 2**29-1 >= (p'+1)//4`` for ``p' <= INT32_MAX-2``, so
+      ``V' = max(0, (p+1)//4) = V``; only when both ``p+1 >= 2**31`` and
+      ``c > INT32_MAX`` is ``V' = 2**29-1 < V``. Negative ``p`` or ``c``
+      (saturated or not) give 0 both ways. Hence ``V' = min(V, 2**29-1)``.
+      Since ``columns*4 <= INT32_MAX`` (logits plane cap) every column is
+      ``< 2**29-1``, so the masks ``c < V`` and ``c < V'`` are identical:
+      every logit is golden-exact. ``visible_groups`` is golden-exact
+      whenever ``V < 2**29``, i.e. for every input the strict contract
+      accepted (and it fixes the historical int64 ``pos = INT32_MAX`` wrap);
+      for ``V >= 2**29`` (only reachable with out-of-int32 metadata) the
+      returned count saturates at ``2**29-1``, still >= every column.
+    """
+    if tensor.dtype == torch.int32:
+        return tensor
+    lo_t, hi_t = _i32_bounds(tensor.device, hi)
+    out = torch.empty(tensor.shape, dtype=torch.int32, device=tensor.device)
+    return torch.clamp(tensor, lo_t, hi_t, out=out)
+
+
 def qsa_pad_plan(shape, dtype):
     """CPU-only bucket map; no tensor allocation, compiler or device access.
 
@@ -3014,13 +3086,25 @@ def qsa_paged_mqa_logits_page4(
     if is_fp8:
         _check_align(compressed_k_scale, "compressed_k_scale", 4)
 
-    # Explicit, checked narrowings (never a silent cast): the kernel reads int32
-    # indices and FlyDSL passes tensor extents as int32.  The min/max probes only
-    # run for non-int32 inputs, so the common path stays launch-free.
-    page_table_i32 = _to_i32_checked(page_table, "page_table")
-    t2r_i32 = _to_i32_checked(token_to_request, "token_to_request").contiguous().view(-1)
-    qp_i32 = _to_i32_checked(query_positions, "query_positions").contiguous().view(-1)
-    cl_i32 = _to_i32_checked(context_lens, "context_lens").contiguous().view(-1)
+    # Explicit narrowings (never a wrapping cast): the kernel reads int32
+    # indices and FlyDSL passes tensor extents as int32.  ROUND-NOSYNC: int32
+    # inputs are zero-copy; each int64 input costs ONE device clamp+narrow
+    # launch and NO host synchronization (saturation is semantics-preserving,
+    # see _to_i32_saturated; positions saturate at INT32_MAX-1 so `pos + 1`
+    # cannot wrap).  QSA_STRICT_I32=1 restores the historical raising probe.
+    if _QSA_STRICT_I32:
+        page_table_i32 = _to_i32_checked(page_table, "page_table")
+        t2r_i32 = _to_i32_checked(token_to_request, "token_to_request")
+        qp_i32 = _to_i32_checked(query_positions, "query_positions")
+        cl_i32 = _to_i32_checked(context_lens, "context_lens")
+    else:
+        page_table_i32 = _to_i32_saturated(page_table)
+        t2r_i32 = _to_i32_saturated(token_to_request)
+        qp_i32 = _to_i32_saturated(query_positions, _MAX_I32 - 1)
+        cl_i32 = _to_i32_saturated(context_lens)
+    t2r_i32 = t2r_i32.contiguous().view(-1)
+    qp_i32 = qp_i32.contiguous().view(-1)
+    cl_i32 = cl_i32.contiguous().view(-1)
 
     if divisor is None:
         divisor = math.sqrt(HEAD_DIM)
