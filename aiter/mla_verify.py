@@ -38,10 +38,24 @@ _HK_PART8_MIN_SPLITS = 96
 _LOG2E = 1.4426950408889634
 
 # Gluon -> HK crossover per GPU: HK when batch * max_kv_len >= threshold, keyed
-# by the largest batch size each threshold covers. Measured with CUDA graphs on
-# MI355X at QLEN 8, 12 heads, FP8 KV.
+# by the largest batch size each threshold covers (the default covers larger
+# batches). Measured with CUDA graphs on MI355X at QLEN 8, 12 heads, FP8 KV.
 _HK_THRESHOLDS = {
-    "gfx950": ({1: 27000, 2: 28000, 4: 27000, 8: 29000, 16: 30000}, 30000),
+    "gfx950": (
+        {
+            1: 27000,
+            2: 28000,
+            4: 27000,
+            8: 29000,
+            12: 23000,
+            16: 30000,
+            24: 30000,
+            32: 45000,
+            48: 36000,
+            64: 49000,
+        },
+        49000,
+    ),
 }
 
 
@@ -95,8 +109,8 @@ def select_mla_verify_kernel(
 
 
 def mla_verify_hk_num_splits(batch_size: int) -> int:
-    """KV splits per request so batch * splits fills one wave of CTAs."""
-    n = -(-_HK_TARGET_CTAS // max(batch_size, 1))
+    """KV splits per request so batch * splits fills at most one wave of CTAs."""
+    n = _HK_TARGET_CTAS // max(batch_size, 1)
     return max(2, min(n, _HK_MAX_SPLITS))
 
 
