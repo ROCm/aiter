@@ -1,0 +1,23 @@
+{
+    "stats": {
+        "ROWS_LEQ_16": {
+            "GROUPS": 64,
+            "num_warps": 4,
+            "CHUNKS_PER_PROGRAM": 1
+        },
+        "ROWS_LEQ_64": {
+            "GROUPS": 128,
+            "num_warps": 4,
+            "CHUNKS_PER_PROGRAM": 1
+        },
+        "any": {
+            "GROUPS": 256,
+            "num_warps": 4,
+            "CHUNKS_PER_PROGRAM": 2
+        }
+    },
+    "select": {
+        "CAPG": 64,
+        "num_warps": 4
+    }
+}
