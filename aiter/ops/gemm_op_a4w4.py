@@ -82,6 +82,37 @@ def get_GEMM_config(M: int, N: int, K: int):
     return config
 
 
+# Tuned-CSV kernel names that route to the Triton gemm_afp4wfp4_preshuffle kernel,
+# e.g. triton_preshuffle_bm32_bn64_bk256_ks16_w4_wpe2. It reads the same preshuffled
+# weight and shuffled scale bytes as the asm kernel, so no operand is copied.
+_TRITON_PRESHUFFLE_RE = (
+    r"^triton_preshuffle_bm(\d+)_bn(\d+)_bk(\d+)_ks(\d+)_w(\d+)_wpe(\d+)$"
+)
+_TRITON_PRESHUFFLE_ARCHS = {"gfx950"}
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_triton_preshuffle_name(name):
+    import re
+
+    mt = re.match(_TRITON_PRESHUFFLE_RE, name)
+    if mt is None:
+        return None
+    bm, bn, bk, ks, nw, wpe = (int(g) for g in mt.groups())
+    return (
+        ("BLOCK_SIZE_M", bm),
+        ("BLOCK_SIZE_N", bn),
+        ("BLOCK_SIZE_K", bk),
+        ("GROUP_SIZE_M", 1),
+        ("num_warps", nw),
+        ("num_stages", 2),
+        ("waves_per_eu", wpe),
+        ("matrix_instr_nonkdim", 16),
+        ("cache_modifier", ".cg"),
+        ("NUM_KSPLIT", ks),
+    )
+
+
 # Mirrors the arch check in flydsl_decode_gemm_mxfp4.
 _FLYDSL_DECODE_ARCHS = {"gfx950"}
 
@@ -411,6 +442,49 @@ def gemm_a4w4(
                 reason = str(e)
         _log_flydsl_decode_fallback(kernelName, reason)
         # A flydsl_ name must never reach the CK path; use the default asm heuristic.
+        kernelName = ""
+        splitK = 0
+        ck_config = None
+    if kernelName.startswith("triton_"):
+        tri = _parse_triton_preshuffle_name(kernelName)
+        reason = None
+        if tri is None:
+            reason = "unparsable name"
+        elif gfx_arch not in _TRITON_PRESHUFFLE_ARCHS:
+            reason = f"unsupported arch {gfx_arch}"
+        elif m < 32:
+            # Below 32 rows the Triton kernel expects un-shuffled A scales.
+            reason = "M < 32"
+        elif (
+            global_A_scale is not None
+            or global_B_scale is not None
+            or bias is not None
+            or alpha not in (None, 1.0)
+            or beta not in (None, 0.0)
+            or dtype != dtypes.bf16
+            or not bpreshuffle
+            or apreshuffle
+            or k % 256
+        ):
+            reason = "unsupported gemm_a4w4 arguments"
+        if reason is None:
+            from .triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+
+            u8 = torch.uint8
+            # Scales are viewed as one row per 32-row stripe of the shuffle_scale
+            # layout; the config dict is mutated by the wrapper, so pass a fresh one.
+            tri_out = out[:m]
+            gemm_afp4wfp4_preshuffle(
+                A.view(u8).view(m, k // 2),
+                B.view(u8).view(n // 16, -1),
+                A_scale.view(u8).view(-1, A_scale.shape[-1] * 32),
+                B_scale.view(u8).view(-1, B_scale.shape[-1] * 32),
+                dtype,
+                tri_out,
+                dict(tri),
+            )
+            return tri_out.view(*A.shape[:-1], n)
+        _log_flydsl_decode_fallback(kernelName, reason)
         kernelName = ""
         splitK = 0
         ck_config = None
