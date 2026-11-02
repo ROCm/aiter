@@ -394,7 +394,7 @@ def compile_gemm2_8wave_sdma(
 
     ``layout``: the ``stage2_sdma.ArenaLayout`` of the cco window; ``chunk_tiles``: sort
     tiles per shipped chunk; ``grid_ctas``: one per CU, workgroup 0 being the comm
-    workgroup; ``comb_bytes``: size of a rank's ``comb_inp`` (rows past the reservation).
+    workgroup; ``comb_bytes``: size of a rank's ``comb_inp`` (rows past the end of ``S``).
     """
     assert K % 256 == 0 and N % BLOCK_N == 0, f"K={K} needs % 256, N={N} % {BLOCK_N}"
     assert 256 % SBM == 0, f"SBM={SBM} must divide 256"
@@ -417,7 +417,7 @@ def compile_gemm2_8wave_sdma(
     A_GRP_ROWS = N_TILES_A * 16  # rows one wave_m owns inside one LDS half
     B_GRP_ROWS = N_TILES_B * 16
     B_K_STEP = 1024  # one 16-row group x 128 K of the a16w4 layout
-    send_nbytes = layout.n_rows * layout.row_bytes
+    send_nbytes = layout.send_rows * layout.row_bytes
     row_bytes = layout.row_bytes
     gemm_ctas = grid_ctas - 1
     log2_max_tok = max_tok.bit_length() - 1
@@ -427,7 +427,7 @@ def compile_gemm2_8wave_sdma(
 
     kname = (
         f"mega_moe_gemm2_8wave_sdma_n{N}_k{K}_e{experts}_t{topk}_p{npes}_m{max_tok}_s{SBM}"
-        f"_c{layout.cap}_ct{chunk_tiles}_g{grid_ctas}_r{rank}"
+        f"_s{layout.send_rows}r{layout.recv_rows}_ct{chunk_tiles}_g{grid_ctas}_r{rank}"
     )
 
     @fx.struct
@@ -775,7 +775,7 @@ def compile_gemm2_8wave_sdma(
                         cache_modifier=SEND_CM,
                         offset_is_bytes=True,
                     )
-                    # Rows past the per-pair reservation go straight to the origin rank.
+                    # Rows past the end of S go straight to the origin rank.
                     for h in range_constexpr(2):
                         rh = (
                             wave_id * fx.Int32(16)
@@ -884,9 +884,18 @@ def compile_gemm2_8wave_sdma(
                     sdma_wait_consumed(w, peer, phase, layout=lay, rank=rank)
                 # inv entries go out while the GEMM computes its first chunk; they must be
                 # visible before any put or signal of mine, hence the vmcnt wait.
-                cnt = ptr_buf_tensor(cursor, fx.Int32)[peer]
+                # The plan's exact offsets: rows in my run for peer, the run's base in S,
+                # and where it lands in peer's R.
+                cursor_buf = ptr_buf_tensor(cursor, fx.Int32)
+                cnt = cursor_buf[peer]
+                run0 = fx.Int32(
+                    rocdl.readfirstlane(T.i32, cursor_buf[fx.Int32(npes) + peer])
+                )
+                land_run0 = fx.Int32(
+                    rocdl.readfirstlane(T.i32, cursor_buf[fx.Int32(2 * npes) + peer])
+                )
                 inv_peer = fx.Int64(w.lsa_ptr(peer, lay.off_inv))
-                land0 = fx.Int32(npes * lay.cap + rank * lay.cap)
+                land0 = fx.Int32(lay.send_rows) + land_run0
                 for base in range(fx.Int32(0), cnt, fx.Int32(64 * PUSH_U)):
                     ok, js, slots = [], [], []
                     for u in range_constexpr(PUSH_U):
@@ -894,11 +903,7 @@ def compile_gemm2_8wave_sdma(
                         in_run = j < cnt
                         ok.append(in_run)
                         js.append(j)
-                        slots.append(
-                            idx_buf[
-                                peer * fx.Int32(lay.cap) + in_run.select(j, fx.Int32(0))
-                            ]
-                        )
+                        slots.append(idx_buf[run0 + in_run.select(j, fx.Int32(0))])
                     for u in range_constexpr(PUSH_U):
                         if ok[u]:
                             comm_ops.store_i32_global_system_monotonic(
@@ -937,7 +942,8 @@ def compile_gemm2_8wave_sdma(
                                 peer,
                                 queue,
                                 layout=lay,
-                                rank=rank,
+                                send_base=run0,
+                                land_off=land_run0,
                                 lo=lo,
                                 hi=hi,
                                 cco=cco,
@@ -950,7 +956,8 @@ def compile_gemm2_8wave_sdma(
                                 peer,
                                 queue,
                                 layout=lay,
-                                rank=rank,
+                                send_base=run0,
+                                land_off=land_run0,
                                 lo=lo,
                                 hi=hi,
                                 cco=cco,

@@ -3,15 +3,15 @@
 """MegaMoEV2 Stage2 + combine with the transfer done by the SDMA copy engines.
 
 Ported from mori's ``examples/cco/python/11_flydsl_mega_moe_sdma`` (ROCm/mori#859),
-with the 8-wave GEMM2 of ``gemm2_8wave.py`` and a fallback for rows the per-pair
-reservation cannot hold.
+with the 8-wave GEMM2 of ``gemm2_8wave.py``, an exact send/landing layout from the
+gathered route counts, and a fallback for rows the send buffer cannot hold.
 
 The default Stage2 scatters every GEMM2 row straight into the origin rank's
 ``comb_inp``, so the GEMM's stores wait on the XGMI links. Here a row goes to a
 local send buffer ``S`` grouped by origin rank, and a copy engine moves one
 contiguous run per peer while the GEMM is still computing::
 
-    S = [ origin rank 0: rows... | origin rank 1: rows... | ... ]   (cap rows each)
+    S = [ origin rank 0: rows... | origin rank 1: rows... | ... ]   (exact counts, packed)
 
 Within a rank's run rows are in sorted-row (expert-major) order, so a prefix of
 every run is finished as soon as the first experts are.
@@ -30,22 +30,26 @@ window for source and destination and only the byte offsets differ::
     [ S | R | inv | sig | flags | done | counter ]
 
 ``inv[slot]`` (``slot = origin_lid * topk + k``) is the landing row of that slot's
-row, counted from the start of ``S`` (``S`` rows ``[0, npes*cap)``, ``R`` rows
-``[npes*cap, 2*npes*cap)``; my own run is read from ``S`` in place), or
+row, counted from the start of ``S`` (``S`` rows ``[0, send_rows)``, ``R`` rows
+``[send_rows, send_rows + recv_rows)``; my own run is read from ``S`` in place), or
 ``INV_P2P`` for a row that came through ``comb_inp``, or -1. The sender writes it,
 so no index travels with the data. ``flags[src]`` says "src's data for call n has
 landed", ``done[dst]`` "dst has finished reading call n" (a sender waits for it
 before overwriting that peer's ``R`` / ``inv``), and ``counter`` is the call number,
 advanced only by the combine.
 
-``cap`` is the rows reserved for ONE (src, dst) pair: a sender writes into the
-peer's ``R`` at a statically known offset with no handshake. Reserving the worst
-case (every token of a peer routing all of top-k here) costs ``npes`` times the
-window, so ``cap`` is the even share times ``row_slack``. A row past it is not
-dropped: the plan marks it ``OUT_ROW_P2P`` and GEMM2 writes it straight into the
+The layout is exact. Prepare all-gathers every rank's per-expert route counts
+(``bigcnt``), so the plan kernel knows how many rows every rank sends every other
+rank before anything moves: my run for ``d`` starts at ``send_base[d]`` (the rows I
+send lower-numbered ranks), and lands in ``d``'s ``R`` at ``land_off[d]`` (the rows
+lower-numbered ranks other than ``d`` send ``d``). ``R`` holds what one rank gets
+back, at most ``max_tok * topk`` rows, so it never overflows. ``S`` holds what one
+rank sends -- everything it received in the dispatch, which skewed routing can make
+several times the even share -- and is sized ``send_slack`` times ``max_tok * topk``
+(capped by the 32-bit buffer-resource range). Only rows past it take the direct
+path: the plan marks them ``OUT_ROW_P2P`` and GEMM2 writes them straight into the
 origin rank's ``comb_inp[slot]`` (the default Stage2's layout) and sets the peer's
-``inv[slot]`` to ``INV_P2P``. Skewed routing therefore stays correct; only the
-rows past the reservation pay for the direct path.
+``inv[slot]`` to ``INV_P2P``.
 
 Rows are fp8 with one e8m0 scale per 32 values, payload then scales, as the
 default Stage2's P2P scatter lays them out, so one contiguous put carries a row.
@@ -54,7 +58,7 @@ default Stage2's P2P scatter lays them out, so one contiguous put carries a row.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Int8, T
 
@@ -70,7 +74,7 @@ __all__ = ["MegaMoESdmaStage2", "sdma_stage2_unsupported_reason"]
 CDONE_STRIDE = 32
 #: Rows per lane per loop trip when a comm wave pushes inv entries to a peer.
 PUSH_U = 8
-#: ``out_row`` of a valid row past the per-pair reservation: written through ``comb_inp``.
+#: ``out_row`` of a valid row past the end of ``S``: written through ``comb_inp``.
 OUT_ROW_P2P = -2
 #: ``inv`` of a slot whose row is in this rank's ``comb_inp``.
 INV_P2P = -2
@@ -90,31 +94,32 @@ def _align(n):
 class ArenaLayout:
     """Byte offsets inside the cco window; identical on every rank."""
 
-    def __init__(self, npes, cap, row_bytes, slot_cap):
-        self.npes, self.cap, self.row_bytes, self.slot_cap = (
-            npes,
-            cap,
-            row_bytes,
-            slot_cap,
-        )
-        self.n_rows = npes * cap
+    def __init__(self, npes, send_rows, recv_rows, row_bytes, slot_cap):
+        self.npes, self.send_rows, self.recv_rows = npes, send_rows, recv_rows
+        self.row_bytes, self.slot_cap = row_bytes, slot_cap
         self.off_s = 0
-        self.off_r = self.n_rows * row_bytes
-        self.off_inv = self.off_r + self.n_rows * row_bytes
+        self.off_r = send_rows * row_bytes
+        self.off_inv = self.off_r + recv_rows * row_bytes
         self.off_sig = self.off_inv + _align(slot_cap * 4)
         self.off_flags = self.off_sig + _align(npes * 4)
         self.off_done = self.off_flags + _align(npes * 4)
         self.off_counter = self.off_done + _align(npes * 4)
         self.total_bytes = self.off_counter + _ALIGN
-        # The combine addresses S and R through one 32-bit buffer-resource offset.
-        if 2 * self.n_rows * row_bytes >= 1 << 31:
+        # GEMM2 and the combine address S and R through one 32-bit buffer-resource offset.
+        if self.off_inv >= 1 << 31:
             raise ValueError(
-                f"SDMA Stage2 send+landing buffers ({2 * self.n_rows * row_bytes} B) exceed "
-                "the 32-bit buffer-resource range; lower row_slack or max_tok_per_rank"
+                f"SDMA Stage2 send+landing buffers ({self.off_inv} B) exceed the 32-bit "
+                "buffer-resource range; lower send_slack or max_tok_per_rank"
             )
 
     def key(self):
-        return (self.npes, self.cap, self.row_bytes, self.slot_cap)
+        return (
+            self.npes,
+            self.send_rows,
+            self.recv_rows,
+            self.row_bytes,
+            self.slot_cap,
+        )
 
 
 def _uniform_i64(x):
@@ -145,23 +150,34 @@ def sdma_wait_consumed(w, peer, phase, *, layout, rank):
 
 
 def sdma_put_run(
-    sdma, win, peer, queue, *, layout, rank, lo, hi, cco, remote_signal=False
+    sdma,
+    win,
+    peer,
+    queue,
+    *,
+    layout,
+    send_base,
+    land_off,
+    lo,
+    hi,
+    cco,
+    remote_signal=False,
 ):
-    """Ship rows ``[lo, hi)`` of my run for ``peer`` with one put.
+    """Ship rows ``[lo, hi)`` of my run for ``peer`` (``S`` row ``send_base`` on) with one
+    put, to ``peer``'s ``R`` row ``land_off`` on.
 
     No local signal (nothing waits on it). ``remote_signal`` hangs the completion
     signal on this put: the copy engine bumps the peer's counter once the bytes
     are there, and the peer's combine polls it. A queue is a FIFO its engine
     drains in order, so a signal on the last put covers every put before it.
     """
-    rb, cap = layout.row_bytes, layout.cap
+    rb = layout.row_bytes
     sdma.put(
         peer,
         win,
-        fx.Int64(layout.off_r + rank * cap * rb) + fx.Int64(lo) * fx.Int64(rb),
+        fx.Int64(layout.off_r) + (fx.Int64(land_off) + fx.Int64(lo)) * fx.Int64(rb),
         win,
-        fx.Int64(layout.off_s)
-        + (fx.Int64(peer) * fx.Int64(cap) + fx.Int64(lo)) * fx.Int64(rb),
+        fx.Int64(layout.off_s) + (fx.Int64(send_base) + fx.Int64(lo)) * fx.Int64(rb),
         fx.Int64(hi - lo) * fx.Int64(rb),
         queue,
         coop=cco.CoopScope.THREAD,
@@ -235,21 +251,29 @@ def tree_barrier(bar_addr, nblocks, tid, bid):
     fx.barrier()
 
 
-def build_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
+def build_plan(
+    *, SBM, topk, log2_max_tok, recv_cap, npes, rank, epr, total_segments, send_rows
+):
     """Kernel 1: give every valid sorted row a stable index in its rank's run.
 
+    * offsets: from the gathered route counts ``bigcnt[src][segment]`` (per expert, then
+              one group column per rank for the dispatch's fanout pair), per pe:
+              ``n_send`` (rows I send it), ``send_base`` (rows I send lower pes),
+              ``land_off`` (rows lower ranks other than pe send it) and ``avail``
+              (rows of its run that fit in ``S``: ``send_rows - send_base``, clamped)
     * count:  ``tile_cnt[tile][pe]`` = rows of the sort tile bound for ``pe``
     * prefix: ``tile_base[tile][pe]`` = rows for ``pe`` in earlier tiles (so the rows
               of a tile range are contiguous in the run), ``cursor[pe]`` = total
-    * assign: ``out_row = pe*cap + tile_base + (earlier rows of this tile for pe)``
+    * assign: ``out_row = send_base[pe] + tile_base + (earlier rows of this tile for pe)``
               and ``idx_send[out_row] = origin_lid*topk + k``. Rows bound for this rank
               also get their ``inv`` entry here; the peers' entries are pushed by
-              the GEMM2 comm waves. A row past ``cap`` gets ``OUT_ROW_P2P``.
+              the GEMM2 comm waves. A row past ``avail`` gets ``OUT_ROW_P2P``.
 
-    One grid-wide rendezvous, between count and prefix. Before writing anything the
-    kernel waits until every peer has consumed the previous call: with the copy
-    engine's FIFO that means this rank's puts have finished reading ``S``.
-    ``tile_base`` is clamped to ``cap``, so a chunk never ships past the reservation.
+    ``cursor`` = [rows in the run (clamped to avail) | send_base | land_off | avail]
+    per pe, then a counter of pes whose counted rows differ from ``bigcnt``'s (must
+    stay 0). One grid-wide rendezvous, between count and prefix. Before writing
+    anything the kernel waits until every peer has consumed the previous call: with
+    the copy engine's FIFO that means this rank's puts have finished reading ``S``.
     """
     dec = {
         "log2_max_tok": log2_max_tok,
@@ -268,20 +292,26 @@ def build_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
     # LDS words: per-wave per-pe counts | per-thread partial sums | the tile's prefix.
     OFF_PART = WAVES * npes
     OFF_PREF = OFF_PART + BLOCK
-    lds_bytes = (OFF_PREF + npes) * 4
+    # Per pe, for the whole kernel: rows I send it, my run's base in S, rows that fit.
+    OFF_NSEND = OFF_PREF + npes
+    OFF_SBASE = OFF_NSEND + npes
+    OFF_AVAIL = OFF_SBASE + npes
+    OFF_LAND = OFF_AVAIL + npes
+    lds_bytes = (OFF_LAND + npes) * 4
 
     @fx.struct
     class PlanShared:
         buf: fx.Array[Int8, lds_bytes, 16]
 
     # fmt: off
-    @flyc.kernel(name=f"mega_moe_sdma_plan_sbm{SBM}_k{topk}_p{npes}_c{cap}_r{rank}",
-                 known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name=f"mega_moe_sdma_plan_sbm{SBM}_k{topk}_p{npes}_s{send_rows}_e{epr}x{total_segments}"
+                      f"_r{rank}", known_block_size=[BLOCK, 1, 1])
     def plan(arg_stids: fx.Int64, arg_trb: fx.Int64, arg_num_valid: fx.Int64,
         arg_tile_cnt: fx.Int64, arg_tile_base: fx.Int64, arg_cursor: fx.Int64,
         arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_inv: fx.Int64, arg_cdone: fx.Int64,
         arg_bar: fx.Int64, arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
-        i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32):
+        arg_bigcnt: fx.Int64, arg_pair_cfg: fx.Int64, arg_parity: fx.Int64, i32_nblocks: fx.Int32,
+        i32_cdone_n: fx.Int32):
     # fmt: on
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -315,6 +345,51 @@ def build_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
         # The GEMM2 kernel's per-chunk completion counters start from zero every call.
         for g in range(gid, i32_cdone_n, stride):
             cdone[g] = fx.Int32(0)
+
+        # Exact offsets from the gathered route counts. Thread pe reads bigcnt row pe
+        # (the routes pe dispatched) and, per rank s, the rows pe sent s: s's expert
+        # counts plus, for the fanout pair the dispatch picked at s this call, one row per
+        # pair member for every token sent once as a group (bigcnt column TE + s).
+        # Rows I send pe = the rows pe sent me; they land in pe's R after the rows of
+        # the ranks below me other than pe itself.
+        cursor_buf = ptr_buf_tensor(arg_cursor, fx.Int32)
+        bc = ptr_buf_tensor(arg_bigcnt, fx.Int32)
+        parity = fx.Int32(comm_ops.load_i32_system(arg_parity, fx.Int32(0)))
+        if tid < fx.Int32(npes):
+            row = tid * fx.Int32(total_segments)
+            n_send = fx.Int32(0)
+            below = fx.Int32(0)
+            for dst in range_constexpr(npes):
+                if const_expr(dst <= rank):
+                    rows = fx.Int32(0)
+                    for e in range(fx.Int32(dst * epr), fx.Int32(dst * epr + epr), fx.Int32(1)):
+                        rows = rows + fx.Int32(bc[row + e])
+                    packed = fx.Int32(comm_ops.load_i32_system(arg_pair_cfg, parity * fx.Int32(npes) + fx.Int32(dst)))
+                    enabled = (packed & fx.Int32(1 << 16)) != fx.Int32(0)
+                    same = (packed & fx.Int32(0xFF)) == ((packed >> fx.Int32(8)) & fx.Int32(0xFF))
+                    members = enabled.select(same.select(fx.Int32(1), fx.Int32(2)), fx.Int32(0))
+                    rows = rows + members * fx.Int32(bc[row + fx.Int32(total_segments - npes + dst)])
+                    if const_expr(dst == rank):
+                        n_send = rows
+                    else:
+                        below = below + (tid != fx.Int32(dst)).select(rows, fx.Int32(0))
+            fx.ptr_store(n_send, lw(fx.Int32(OFF_NSEND) + tid))
+            fx.ptr_store(below, lw(fx.Int32(OFF_LAND) + tid))
+        fx.barrier()
+        if tid == fx.Int32(0):
+            sbase = fx.Int32(0)
+            for p in range_constexpr(npes):
+                n_p = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_NSEND + p))))
+                room = fx.Int32(send_rows) - sbase
+                room = (room > fx.Int32(0)).select(room, fx.Int32(0))
+                fx.ptr_store(sbase, lw(fx.Int32(OFF_SBASE + p)))
+                fx.ptr_store((n_p < room).select(n_p, room), lw(fx.Int32(OFF_AVAIL + p)))
+                sbase = sbase + n_p
+        fx.barrier()
+        if (bid == fx.Int32(0)) & (tid < fx.Int32(npes)):
+            cursor_buf[fx.Int32(npes) + tid] = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_SBASE) + tid)))
+            cursor_buf[fx.Int32(2 * npes) + tid] = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_LAND) + tid)))
+            cursor_buf[fx.Int32(3 * npes) + tid] = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_AVAIL) + tid)))
 
         lane = tid % fx.Int32(WAVE)
         wave = tid // fx.Int32(WAVE)
@@ -353,7 +428,9 @@ def build_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
         # No rows at all: the loop below never runs, so say so explicitly.
         if (tiles == fx.Int32(0)) & (bid == fx.Int32(0)) & (tid < fx.Int32(npes)):
             tile_base[tid] = fx.Int32(0)
-            ptr_buf_tensor(arg_cursor, fx.Int32)[tid] = fx.Int32(0)
+            cursor_buf[tid] = fx.Int32(0)
+            if fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_NSEND) + tid))) != fx.Int32(0):
+                comm_ops.atomic_add_agent(fx.Int64(arg_cursor) + fx.Int64(16 * npes), fx.Int32(1))
 
         idx_buf = ptr_buf_tensor(arg_idx, fx.Int32)
         inv_buf = ptr_buf_tensor(arg_inv, fx.Int32)
@@ -371,15 +448,20 @@ def build_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
                 for k in range_constexpr(GROUPS):
                     pre = pre + fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_PART + k * npes) + tid)))
                 fx.ptr_store(pre, lw(fx.Int32(OFF_PREF) + tid))
-                tile_base[tile * fx.Int32(npes) + tid] = (pre < fx.Int32(cap)).select(
-                    pre, fx.Int32(cap)
-                )
+                avail = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_AVAIL) + tid)))
+                tile_base[tile * fx.Int32(npes) + tid] = (pre < avail).select(pre, avail)
                 # The extra row holds the totals the comm waves read as a chunk's end.
                 if tile == tiles - fx.Int32(1):
                     total = pre + tile_cnt[tile * fx.Int32(npes) + tid]
-                    capped = (total < fx.Int32(cap)).select(total, fx.Int32(cap))
+                    capped = (total < avail).select(total, avail)
                     tile_base[tiles * fx.Int32(npes) + tid] = capped
-                    ptr_buf_tensor(arg_cursor, fx.Int32)[tid] = capped
+                    cursor_buf[tid] = capped
+                    # The rows counted here must be the ones the gathered counts promised
+                    # (the peers placed my rows in their R from those).
+                    if total != fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_NSEND) + tid))):
+                        comm_ops.atomic_add_agent(
+                            fx.Int64(arg_cursor) + fx.Int64(16 * npes), fx.Int32(1)
+                        )
             fx.barrier()
 
             valid, dest_pe, dest_lid, s, masks = tile_masks(tile)
@@ -397,12 +479,12 @@ def build_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
                         fx.Int32(fx.ptr_load(lw(fx.Int32(w * npes) + dest_pe))), fx.Int32(0)
                     )
                 place = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_PREF) + dest_pe))) + within
-                if place >= fx.Int32(cap):
-                    # Past the per-pair reservation: GEMM2 writes it through comb_inp.
+                if place >= fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_AVAIL) + dest_pe))):
+                    # Past the end of S: GEMM2 writes it through comb_inp.
                     out_buf[g] = fx.Int32(OUT_ROW_P2P)
                     comm_ops.atomic_add_agent(arg_over, fx.Int32(1))
                 else:
-                    out_row = dest_pe * fx.Int32(cap) + place
+                    out_row = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_SBASE) + dest_pe))) + place
                     out_buf[g] = out_row
                     slot = dest_lid * fx.Int32(topk) + s
                     idx_buf[out_row] = slot
@@ -416,11 +498,12 @@ def build_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
         arg_tile_cnt: fx.Int64, arg_tile_base: fx.Int64, arg_cursor: fx.Int64,
         arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_inv: fx.Int64, arg_cdone: fx.Int64,
         arg_bar: fx.Int64, arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
-        i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32, stream: fx.Stream):
+        arg_bigcnt: fx.Int64, arg_pair_cfg: fx.Int64, arg_parity: fx.Int64, i32_nblocks: fx.Int32,
+        i32_cdone_n: fx.Int32, stream: fx.Stream):
     # fmt: on
         plan(arg_stids, arg_trb, arg_num_valid, arg_tile_cnt, arg_tile_base, arg_cursor,
              arg_out_row, arg_idx, arg_inv, arg_cdone, arg_bar, arg_over, arg_done, arg_counter,
-             i32_nblocks, i32_cdone_n).launch(
+             arg_bigcnt, arg_pair_cfg, arg_parity, i32_nblocks, i32_cdone_n).launch(
             grid=(i32_nblocks, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return launch
@@ -448,7 +531,7 @@ def build_combine(*, layout, rank, hidden, topk):
     row_bytes = layout.row_bytes
 
     # fmt: off
-    @flyc.kernel(name=f"mega_moe_sdma_combine_p{npes}_c{layout.cap}_h{hidden}_k{topk}_r{rank}",
+    @flyc.kernel(name=f"mega_moe_sdma_combine_p{npes}_s{layout.send_rows}r{layout.recv_rows}_h{hidden}_k{topk}_r{rank}",
                  known_block_size=[BLOCK, 1, 1])
     def combine(win: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64, arg_comb_inp: fx.Int64,
         arg_fin: fx.Int64, arg_dev_comm: fx.Int64, i32_nblocks: fx.Int32, i32_tokens: fx.Int32):
@@ -513,7 +596,7 @@ def build_combine(*, layout, rank, hidden, topk):
                             0, landed.select(slots[k], fx.Int32(0)) * fx.Int32(row_bytes), u
                         )
                         acc = acc + vals * (scale * keep)
-                    # Rare: rows past the per-pair reservation, in comb_inp[slot]. The
+                    # Rare: rows past the end of S, in comb_inp[slot]. The
                     # slots are the same for the whole block, so this branch is uniform.
                     direct = [slots[k] == fx.Int32(INV_P2P) for k in range_constexpr(topk)]
                     any_direct = direct[0]
@@ -609,13 +692,16 @@ class MegaMoESdmaStage2:
     """Stage2 + combine of one ``MegaMoEV2`` with the transfer on the SDMA engines.
 
     Owns a cco communicator and window; reads the instance's Stage1 state (sorted
-    rows, srcmap, weights, ``expert_tile_end``) and its P2P ``comb_inp`` for rows
-    past the reservation. ``run`` returns the combined ``[max_tok_per_rank, hidden]``
-    bf16 output. Needs ``MORI_ENABLE_SDMA=1``; construction raises RuntimeError
-    when the communicator connected no SDMA queue.
+    rows, srcmap, weights, ``expert_tile_end``, the gathered route counts) and its P2P
+    ``comb_inp`` for rows past the end of ``S``. ``run`` returns the combined
+    ``[max_tok_per_rank, hidden]`` bf16 output. ``send_slack``: rows of ``S`` as a
+    multiple of ``max_tok * topk`` (what one rank sends in an even split), capped so
+    that ``S`` and ``R`` fit the 32-bit buffer-resource range. Needs
+    ``MORI_ENABLE_SDMA=1``; construction raises RuntimeError when the communicator
+    connected no SDMA queue.
     """
 
-    def __init__(self, moe, *, chunk_tiles=16, row_slack=2.0):
+    def __init__(self, moe, *, chunk_tiles=16, send_slack=4.0):
         import torch.distributed as dist
         from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator
 
@@ -623,9 +709,9 @@ class MegaMoESdmaStage2:
             raise RuntimeError(
                 "the SDMA Stage2 needs an initialized torch.distributed group"
             )
-        if chunk_tiles < 1 or row_slack <= 0:
+        if chunk_tiles < 1 or send_slack <= 0:
             raise ValueError(
-                f"chunk_tiles={chunk_tiles} and row_slack={row_slack} must be positive"
+                f"chunk_tiles={chunk_tiles} and send_slack={send_slack} must be positive"
             )
         self.moe = moe
         self.rank, self.npes = moe.rank, moe.world_size
@@ -633,11 +719,23 @@ class MegaMoESdmaStage2:
         self.chunk_tiles = int(chunk_tiles)
         self.block_m = 256  # GEMM2 tile rows
         self.slot_cap = self.max_tok * self.topk
-        share = -(-self.slot_cap // self.npes)
-        self.cap = -(-int(share * row_slack) // 128) * 128
+        row_bytes = self.hidden + self.hidden // 32
+        # R: what one rank gets back is at most its own routes, so it never overflows.
+        # S: what one rank sends is everything it received; size it by send_slack,
+        # capped so S + R stay in the 32-bit buffer-resource range.
+        recv_rows = _align(self.slot_cap)
+        fit = ((1 << 31) - 1 - recv_rows * row_bytes) // row_bytes // _ALIGN * _ALIGN
+        send_rows = min(_align(int(self.slot_cap * send_slack)), fit)
+        if send_rows < _ALIGN:
+            raise ValueError(
+                f"max_tok_per_rank={self.max_tok} leaves no room for the send buffer"
+            )
         self.layout = ArenaLayout(
-            self.npes, self.cap, self.hidden + self.hidden // 32, self.slot_cap
+            self.npes, send_rows, recv_rows, row_bytes, self.slot_cap
         )
+        self.epr = moe.epr
+        self.bigcnt = moe._s1_dispatch_workspace["bigcnt"]
+        self.total_segments = self.bigcnt.numel() // self.npes
         lay = self.layout
         dev = moe.dev
 
@@ -679,19 +777,20 @@ class MegaMoESdmaStage2:
         self.out_row = torch.full((nvm + 4 * 128,), -1, **i32)
         self.tile_cnt = torch.zeros(self.max_tiles * self.npes, **i32)
         self.tile_base = torch.zeros((self.max_tiles + 1) * self.npes, **i32)
-        self.cursor = torch.zeros(self.npes, **i32)
+        # [run rows | send_base | land_off | avail] per pe, then the count-mismatch counter.
+        self.cursor = torch.zeros(4 * self.npes + 1, **i32)
         self.cdone = torch.zeros((self.max_tiles + 1) * CDONE_STRIDE, **i32)
         n_cu = torch.cuda.get_device_properties(dev).multi_processor_count
         # Never-reset counters: the plan's barrier and the combine's last-block count.
         self.plan_bar = torch.zeros(n_cu * BAR_STRIDE, **i32)
         self.combine_fin = torch.zeros(1, **i32)
-        # Rows written through comb_inp because they did not fit the reservation.
+        # Rows written through comb_inp because they did not fit in S.
         self.overflow = torch.zeros(1, **i32)
         self.inv = _torch_view(
             self.mem.ptr + lay.off_inv, self.slot_cap * 4, torch.int32
         )
         self.inv.fill_(-1)
-        self.idx_send = torch.zeros(self.npes * self.cap, **i32)
+        self.idx_send = torch.zeros(lay.send_rows, **i32)
         self.out = torch.empty(
             self.max_tok, self.hidden, dtype=torch.bfloat16, device=dev
         )
@@ -720,8 +819,10 @@ class MegaMoESdmaStage2:
                 log2_max_tok=self.max_tok.bit_length() - 1,
                 recv_cap=int(self.moe.max_recv),
                 npes=self.npes,
-                cap=self.cap,
                 rank=self.rank,
+                epr=self.epr,
+                total_segments=self.total_segments,
+                send_rows=self.layout.send_rows,
             )
         return self._plans[sbm]
 
@@ -770,6 +871,9 @@ class MegaMoESdmaStage2:
             fx.Int64(self.overflow.data_ptr()),
             fx.Int64(self.mem.ptr + lay.off_done),
             fx.Int64(self.mem.ptr + lay.off_counter),
+            fx.Int64(self.bigcnt.data_ptr()),
+            fx.Int64(moe._s1_dispatch_workspace["fanout_pair_config"].data_ptr()),
+            fx.Int64(moe._s1_epoch_parity.data_ptr()),
             fx.Int32(self.plan_blocks),
             fx.Int32(min(self.cdone.numel(), n_chunks * CDONE_STRIDE)),
             s_fx,
@@ -813,10 +917,17 @@ class MegaMoESdmaStage2:
         return self.out
 
     def take_overflow_rows(self):
-        """Rows that took the ``comb_inp`` path since the last call (synchronizes)."""
+        """Rows that took the ``comb_inp`` path since the last call (synchronizes).
+        Raises if a plan found its row counts differ from the gathered ones (the exact
+        layout would then be wrong)."""
         torch.cuda.synchronize()
         rows = int(self.overflow.item())
         self.overflow.zero_()
+        bad = int(self.cursor[4 * self.npes].item())
+        if bad:
+            raise RuntimeError(
+                f"rank {self.rank}: {bad} per-rank row counts differ from the gathered route counts"
+            )
         return rows
 
     def close(self):

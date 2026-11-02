@@ -44,9 +44,10 @@ environment_variables: dict[str, tuple[Callable[[str], Any], str]] = {
     "AITER_MEGA_STAGE2_SDMA": (_flag, "0"),
     # SDMA Stage2: sort tiles per shipped chunk.
     "AITER_MEGA_SDMA_CHUNK_TILES": (int, "16"),
-    # SDMA Stage2: rows reserved per (src, dst) pair, as a multiple of the even share
-    # max_tok_per_rank * topk / world_size. Rows past it take the direct P2P path.
-    "AITER_MEGA_SDMA_ROW_SLACK": (float, "2.0"),
+    # SDMA Stage2: rows of the send buffer, as a multiple of max_tok_per_rank * topk
+    # (what one rank sends in an even split); capped by the 32-bit buffer-resource
+    # range. Rows past it take the direct P2P path.
+    "AITER_MEGA_SDMA_SEND_SLACK": (float, "4.0"),
 }
 
 

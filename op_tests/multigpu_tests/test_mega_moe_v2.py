@@ -356,7 +356,7 @@ def _time_graph(fn, device, iters):
 
 def _check_sdma_exact(moe, x, weights, ids, output, rank, device):
     """The SDMA Stage2 must produce the default Stage2's bytes: same GEMM2 numerics,
-    same fp8 1x32 rows, same top-k sum order. Rows past the per-pair reservation
+    same fp8 1x32 rows, same top-k sum order. Rows past the end of the send buffer
     took the direct P2P path and must match too."""
     tokens = x.shape[0]
     overflow = moe._sdma_stage2.take_overflow_rows()
@@ -622,15 +622,15 @@ def main():
         "byte for byte against the default Stage2 (needs MORI_ENABLE_SDMA=1)",
     )
     parser.add_argument(
-        "--sdma-row-slack",
+        "--sdma-send-slack",
         type=float,
         default=None,
-        help="Rows reserved per rank pair for --stage2-sdma, as a multiple of the even "
-        "share; a small value forces rows onto the direct P2P fallback",
+        help="Send-buffer rows for --stage2-sdma, as a multiple of max_tok_per_rank * "
+        "topk; a small value forces rows onto the direct P2P fallback",
     )
     args = parser.parse_args()
-    if args.sdma_row_slack is not None:
-        os.environ["AITER_MEGA_SDMA_ROW_SLACK"] = str(args.sdma_row_slack)
+    if args.sdma_send_slack is not None:
+        os.environ["AITER_MEGA_SDMA_SEND_SLACK"] = str(args.sdma_send_slack)
     if (
         sum(
             (

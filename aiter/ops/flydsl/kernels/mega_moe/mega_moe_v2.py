@@ -522,7 +522,7 @@ class MegaMoEV2:
                 self._sdma_stage2 = MegaMoESdmaStage2(
                     self,
                     chunk_tiles=envs.AITER_MEGA_SDMA_CHUNK_TILES,
-                    row_slack=envs.AITER_MEGA_SDMA_ROW_SLACK,
+                    send_slack=envs.AITER_MEGA_SDMA_SEND_SLACK,
                 )
             except RuntimeError as exc:
                 reason = str(exc)
