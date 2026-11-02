@@ -616,8 +616,9 @@ def build_moe_route_psum_fused_module():
     atomics, no global round-trip), and the tile-aligned prefix sum + in-place
     masked->contiguous row remap reuse the single-block scan below.
 
-    Outputs match ``topids_to_rows`` (contiguous layout) + ``masked_m`` counts
-    + ``psum`` (m_tile_map) of the split-kernel path bit-for-bit.
+    Counts and expert bands match the split-kernel route+remap path.
+    Routes outside [0, experts) retain DROPPED_ROUTE_ROW and claim no row.
+    Row order within an expert is assigned atomically and is not guaranteed.
     """
     use_wave_scan = get_rocm_arch().split(":")[0] == "gfx1250"
     wave_size = 32
@@ -667,9 +668,14 @@ def build_moe_route_psum_fused_module():
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
             e = topk_p[route_i32]
-            ptr = lds_cnt + e
-            slot = fx.atomic_add(ptr, fx.Int32(1), syncscope="workgroup")
-            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
+            # Padded/dropped routes carry -1. Never use them as LDS
+            # counter indices; preserve the sentinel for downstream consumers.
+            valid_expert = (e >= fx.Int32(0)) & (e < experts)
+            row = fx.Int32(DROPPED_ROUTE_ROW)
+            if valid_expert:
+                ptr = lds_cnt + e
+                slot = fx.atomic_add(ptr, fx.Int32(1), syncscope="workgroup")
+                row = fx.Int32(fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m))
             rows_p[route_i32] = row
         gpu.barrier()
 
@@ -734,16 +740,21 @@ def build_moe_route_psum_fused_module():
 
         # Phase D: in-place masked -> contiguous row remap.
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
-            row = fx.Uint32(rows_p[route_i32])
-            m = fx.Uint32(max_m)
-            expert = row // m
-            slot = row - expert * m
-            if const_expr(use_wave_scan):
-                previous = (expert > 0).select(expert - 1, fx.Uint32(0))
-                start = (expert > 0).select(fx.Uint32(src[previous]), fx.Uint32(0))
-            else:
-                start = fx.Uint32(s_p[expert])
-            rows_p[route_i32] = start + slot
+            row_raw = rows_p[route_i32]
+            # Check the original expert ID, not the sign of the masked row:
+            # valid masked offsets can use the high bit of a Uint32.
+            e = topk_p[route_i32]
+            if (e >= fx.Int32(0)) & (e < experts):
+                row = fx.Uint32(row_raw)
+                m = fx.Uint32(max_m)
+                expert = row // m
+                slot = row - expert * m
+                if const_expr(use_wave_scan):
+                    previous = (expert > 0).select(expert - 1, fx.Uint32(0))
+                    start = (expert > 0).select(fx.Uint32(src[previous]), fx.Uint32(0))
+                else:
+                    start = fx.Uint32(s_p[expert])
+                rows_p[route_i32] = start + slot
 
     @flyc.jit
     def launch_route_psum_fused(
