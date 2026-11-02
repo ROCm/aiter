@@ -36,7 +36,12 @@ import pandas as pd
 # pd.set_option('display.max_rows', 200)
 # pd.set_option('display.max_columns', 100)
 # pd.set_option('display.width', 1000)
-TEST_NUM_ITERS = 100
+# Direct performance runs keep the original repetition count. Standard CI
+# overrides this for correctness sweeps in .github/scripts/aiter_test.sh.
+TEST_NUM_ITERS = int(os.environ.get("AITER_GEMM_TEST_ITERS", "100"))
+if TEST_NUM_ITERS < 2:
+    raise ValueError("AITER_GEMM_TEST_ITERS must be at least 2")
+aiter.logger.info("gemm_a8w8 benchmark iterations: %d", TEST_NUM_ITERS)
 
 
 _TUNED_SHAPES_CACHE = None
@@ -72,8 +77,7 @@ def is_shape_tuned(
     return (m, n, k, str(q_dtype_w)) in _TUNED_SHAPES_CACHE[tuned_file]
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
-def run_torch(
+def reference_gemm(
     x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_mode="per-token"
 ):
     # MXFP8 reference scales are unswizzled E8M0, one per 32 elements along K.
@@ -86,6 +90,14 @@ def run_torch(
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_torch(
+    x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_mode="per-token"
+):
+    # Skinny tests report a torch baseline latency.
+    return reference_gemm(x, weight, x_scale, w_scale, bias, dtype, quant_mode)
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -140,12 +152,12 @@ def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias, dtype)
 
 
-@perftest()
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
 
 
-@perftest()
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
 
@@ -177,6 +189,7 @@ def test_gemm(
     pad_a=128,
     skip_ck=False,
     quant_mode="per-token",
+    test_hipb=True,
 ):
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
@@ -226,9 +239,8 @@ def test_gemm(
     # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
     # print(f"{x_pad.shape=}{x_pad.stride()}")
 
-    a, _avg_a = run_torch(
-        x, weight, x_scale, w_scale, bias, dtype, quant_mode=quant_mode
-    )
+    # Correctness sweeps need one reference output, not a reference benchmark.
+    a = reference_gemm(x, weight, x_scale, w_scale, bias, dtype, quant_mode=quant_mode)
     # skip_ck bypasses gemm_a8w8_CK (module_gemm_a8w8) only.
     # run_gemm_ck_bpreshuffle is gated by quantDtype/quant_mode below.
     if skip_ck or quant_mode != "per-token":
@@ -281,7 +293,11 @@ def test_gemm(
             avg_d = None
 
     avg_hipb = err_hipb = None
-    if quantDtype == dtypes.fp8 and (dtype == dtypes.bf16 or quant_mode != "per-token"):
+    if (
+        test_hipb
+        and quantDtype == dtypes.fp8
+        and (dtype == dtypes.bf16 or quant_mode != "per-token")
+    ):
         init_hipblas()
         hipb_x_scale, hipb_w_scale = x_scale, w_scale
         if quant_mode == "mxfp8-swizzled":
@@ -728,6 +744,9 @@ def _iter_flydsl_csv_cases():
                 "quant_mode": "per-token",
                 "pad_a": 128,
                 "skip_ck": True,
+                # This sweep validates FlyDSL dispatch for every tuned shape.
+                # The legacy sweep and test_hipb_mm.py cover ordinary hipb_mm.
+                "test_hipb": False,
             },
             {
                 "source": "flydsl_csv",
@@ -768,8 +787,9 @@ parser.add_argument(
     "--quant-mode",
     choices=["per-token", "per-tensor", "mxfp8-unswizzled", "mxfp8-swizzled"],
     nargs="+",
-    default=["per-token", "per-tensor", "mxfp8-unswizzled", "mxfp8-swizzled"],
+    default=["per-token"],
     help="""Quantization mode.
+    Default: per-token. Other modes have focused coverage in test_hipb_mm.py.
     per-token/per-tensor use FP32 scales; MXFP8 uses one E8M0 scale per 32 elements.
     e.g.: --quant-mode mxfp8-unswizzled mxfp8-swizzled""",
 )

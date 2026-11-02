@@ -93,6 +93,11 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+        op_tests/test_gemm_a8w8.py)
+            # This suite checks correctness across thousands of tuned shapes.
+            # Dedicated performance runs can explicitly retain 100 iterations.
+            test_cmd=(timeout 60m env "AITER_GEMM_TEST_ITERS=${AITER_GEMM_TEST_ITERS:-10}" python3 "$file")
+            ;;
         tests/test_*.py)
             # The focused regression suite is pytest-style with no runnable
             # __main__, so `python3 "$file"` would exit 0 without executing a
