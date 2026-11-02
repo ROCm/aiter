@@ -19,7 +19,7 @@ from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, MX_P_EXP_SHIFT, WAVE
+from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, MXFP4_P_EXP_SHIFT, WAVE
 
 
 class PaDecodePipeline:
@@ -53,7 +53,7 @@ class PaDecodePipeline:
             gpu.barrier()
         k_pf0 = self.kv.prefetch_first()
         if const_expr(self.traits.MXFP4):
-            v_page_pf0 = self.kv.mx_prefetch("v")
+            v_page_pf0 = self.kv.mxfp4_prefetch("v")
         self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
         self.query.stage(q_units_prefetched)
         gpu.barrier()
@@ -64,7 +64,7 @@ class PaDecodePipeline:
         self.ctx.init_causal_offsets()
         o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all)
         if const_expr(self.traits.MXFP4):
-            self.epilogue.store_mx(o_final)
+            self.epilogue.store_mxfp4(o_final)
         else:
             self.epilogue.store(o_final)
 
@@ -177,7 +177,7 @@ class PaDecodePipeline:
                     q_ops_all,
                 )
             elif const_expr(self.traits.MXFP4):
-                next_state = self.single_query_tile_mx(
+                next_state = self.single_query_tile_mxfp4(
                     ostate, k_cur, tt1, tile_valid, q_ops_all
                 )
             else:
@@ -643,7 +643,7 @@ class PaDecodePipeline:
         return next_state
 
     @flyc.jit
-    def single_query_tile_mx(
+    def single_query_tile_mxfp4(
         self,
         ostate,
         k_cur,
@@ -663,9 +663,11 @@ class PaDecodePipeline:
         # Unconditional: a branch around the loads makes the compiler's vmcnt
         # counts assume they were skipped and drain them right after issue. The
         # last tile re-reads itself (tt1 clamped); nothing consumes the result.
-        base = self.kv.mx_base(self.kv.mx_pages(fx.min(tt1, self.ctx.part_end - 1)))
+        base = self.kv.mxfp4_base(
+            self.kv.mxfp4_pages(fx.min(tt1, self.ctx.part_end - 1))
+        )
         k_scales = [
-            self.kv.mx_scale_byte(k_cur[a * 5]) for a in range_constexpr(t.NCHUNK)
+            self.kv.mxfp4_e8m0_byte(k_cur[a * 5]) for a in range_constexpr(t.NCHUNK)
         ]
         # q_scale = 2**e * mantissa, mantissa in [1, 2): 2**e rides on the MFMA's e8m0
         # scale of Q and the mantissa is applied after it, so the f32 accumulator holds
@@ -679,10 +681,10 @@ class PaDecodePipeline:
             [(q_bits & fx.Int32(0x7FFFFF)) | fx.Int32(0x3F800000)], dtype=fx.Int32
         ).bitcast(fx.Float32)[0]
         frag_Ss = self.gemm.qk_mxfp4(k_cur, k_scales, q_ops_all[0], q_bits >> 23)
-        k_next = self.kv.mx_load("k", base)
+        k_next = self.kv.mxfp4_load("k", base)
         # Widen V while the softmax runs.
         for a in range_constexpr(t.NCHUNK):
-            self.kv.mx_stage_v(v_raw, a, tile_valid)
+            self.kv.mxfp4_stage_v_bf16(v_raw, a, tile_valid)
         scale_b = fx.full(4, self.ctx.scale_qk * q_mantissa, fx.Float32)
         scores = [frag_Ss[a] * scale_b for a in range_constexpr(t.NCHUNK)]
         if tile_valid < t.TILE_TOK:  # only a sequence's last tile has masked tokens
@@ -713,19 +715,20 @@ class PaDecodePipeline:
         for a in range_constexpr(t.NCHUNK):
             l_new = l_new + probs[a].reduce(ReductionOp.ADD)  # this lane's tokens
         # S^T[token 4g+v][head] is the B operand layout of the PV MFMA: P stays here.
-        # P enters the PV MFMA times 2**-MX_P_EXP_SHIFT (l_new above is unscaled): the
-        # f32 sum then cannot overflow; ``store_mx`` restores it after normalizing.
-        p_shift = fx.full(4, 2.0**-MX_P_EXP_SHIFT, fx.Float32)
+        # P enters the PV MFMA times 2**-MXFP4_P_EXP_SHIFT (l_new above is unscaled):
+        # the f32 sum then cannot overflow; ``store_mxfp4`` restores it after
+        # normalizing.
+        p_shift = fx.full(4, 2.0**-MXFP4_P_EXP_SHIFT, fx.Float32)
         p_ops = [
             (probs[a] * p_shift).to(fx.BFloat16).bitcast(fx.Int64)[0]
             for a in range_constexpr(t.NCHUNK)
         ]
         # V's loads follow K's by part of a tile so the two bursts do not queue together.
-        v_next = self.kv.mx_load("v", base)
+        v_next = self.kv.mxfp4_load("v", base)
         alpha_b = fx.full(t.OP_ELEMS, alpha, fx.Float32)
         o_acc = [o_acc[vh] * alpha_b for vh in range_constexpr(t.VHE_CHUNKS)]
         for a in range_constexpr(t.NCHUNK):
-            v_ops = self.kv.mx_read_v(a)
+            v_ops = self.kv.mxfp4_read_staged_v_bf16(a)
             for vh in range_constexpr(t.VHE_CHUNKS):
                 o_acc[vh] = fx.Vector(
                     self.gemm.mfma([v_ops[vh]], [p_ops[a]], 0, 0, 1, o_acc[vh])

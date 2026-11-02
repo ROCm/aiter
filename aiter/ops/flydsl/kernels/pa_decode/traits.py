@@ -23,17 +23,18 @@ KV_COMPUTE_BLOCK = 256
 # MXFP4 V staging: per wave and 16-token chunk, all 128 dims as bf16 laid out
 # [16 chunks of 8 dims][16 tokens][16 B] (conflict free for the 16 B row writes
 # and the transposed reads).
-MX_V_CHUNK_BYTES = 16 * 16 * 16
-# MXFP4 PV: P (<= 1) feeds the MFMA times 2**-MX_P_EXP_SHIFT and the epilogue restores
-# it after the softmax normalization. The f32 O accumulator then holds at most
+MXFP4_V_BF16_CHUNK_BYTES = 16 * 16 * 16
+# MXFP4 PV: P (<= 1) feeds the MFMA times 2**-MXFP4_P_EXP_SHIFT and the epilogue
+# restores it after the softmax normalization. The f32 O accumulator then holds at most
 # tokens * |V| * 2**-20 <= |V| / 2 for the 2**19 tokens one task can own, so it cannot
 # overflow where the normalized output is finite.
 # shortcut: a fixed shift cannot be lossless at both ends. Terms p * |V| below 2**-129
 # (the f32 subnormal floor 2**-149 after the shift) are rounded or lost, and so are
 # weights p below ~2**-113 (bf16 floor 2**-133 after it). The smallest MXFP4 V,
 # 2**-128, is exact. Upgrade to a shift from the task's token count if that matters.
-MX_P_EXP_SHIFT = 20
+MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
+MXFP4_LDS_LIMIT_BYTES = 160 * 1024  # gfx950 LDS; MXFP4 stages V wave-privately.
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
 
@@ -154,23 +155,34 @@ class PaDecodeSchedule:
         is_gfx950 = "gfx95" in arch
         if kv_dtype not in ("fp8", "bf16", "mxfp4"):
             raise ValueError(f"Unsupported PA KV dtype {kv_dtype!r}")
-        is_bf16_kv = kv_dtype in ("bf16", "mxfp4")
-        if is_bf16_kv:
+        # Q and P are bf16 in LDS only for BF16 KV; MXFP4 has its own tile.
+        is_bf16_kv = kv_dtype == "bf16"
+        if kv_dtype == "mxfp4":
+            if arch != "gfx950":
+                raise ValueError(f"MXFP4 PA decode requires gfx950; got {arch}")
+            if query_dtype not in ("bf16", "fp8"):
+                raise ValueError("MXFP4 KV requires a BF16 or FP8 query")
+            if per_token_kv:
+                raise ValueError("MXFP4 KV scales are in the cache, not per token")
+        elif is_bf16_kv:
             if arch not in BF16_KV_SUPPORTED_ARCHS:
                 raise ValueError(
                     f"BF16 PA decode requires gfx942 or gfx950; got {arch}"
                 )
-            if query_dtype != "bf16" and not (
-                kv_dtype == "mxfp4" and query_dtype == "fp8"
-            ):
+            if query_dtype != "bf16":
                 raise ValueError("BF16 KV requires a BF16 query")
             if per_token_kv:
                 raise ValueError("BF16 KV does not use quantization scales")
             if not trans_v:
                 raise ValueError("BF16 KV requires a vectorized-5D value cache")
+        elif query_dtype == "fp8":
+            raise ValueError("An FP8 query needs MXFP4 KV")
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (
-            not is_bf16_kv and is_gfx950 and head_dim == 128 and block_size in (16, 128)
+            kv_dtype == "fp8"
+            and is_gfx950
+            and head_dim == 128
+            and block_size in (16, 128)
         )
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
         # Scalar KV scheduling also supports FP16 queries and multiple query rows.
@@ -420,8 +432,9 @@ class PaDecodeTraits:
     QFP8: bool
     DIRECT: bool
     is_bf16_kv: bool
+    PV_BF16: bool
     MXFP4: bool
-    sMxV_off: int
+    sMxfp4VBf16_off: int
     KV_DTYPE: type
     KV_VECTOR_WIDTH: int
     QP_ELEM_BYTES: int
@@ -522,14 +535,20 @@ class PaDecodeTraits:
             stage_page_capacity,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
-        is_bf16_kv = kv_dtype in ("bf16", "mxfp4")
         MXFP4 = kv_dtype == "mxfp4"
+        # Q/P bf16 in LDS (BF16 KV only), and bf16 PV operands without an fp8 scale
+        # (BF16 and MXFP4 KV).
+        is_bf16_kv = kv_dtype == "bf16"
+        PV_BF16 = is_bf16_kv or MXFP4
         # MXFP4 QK is one scaled MFMA (fp4 K x e4m3 Q): a bf16 query is quantized per
         # row in-kernel like the fp8 path, an "fp8" query is used as stored (scale 1).
         QFP8 = query_dtype == "fp8"
         IS_BF16 = query_dtype in ("bf16", "fp8")
         TUNED_SHAPE = (
-            not is_bf16_kv and is_gfx950 and head_dim == 128 and block_size in (16, 128)
+            kv_dtype == "fp8"
+            and is_gfx950
+            and head_dim == 128
+            and block_size in (16, 128)
         )
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
@@ -563,8 +582,11 @@ class PaDecodeTraits:
             "fp8",
         ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16', 'fp8'), got {query_dtype}"
         Q_DTYPE = fx.BFloat16 if IS_BF16 else fx.Float16
-        KV_DTYPE = fx.BFloat16 if is_bf16_kv else FP8
-        KV_VECTOR_WIDTH = 8 if is_bf16_kv else 16
+        # Load-path constants below follow the PV operands; MXFP4's own loader
+        # (``mxfp4_load``) does not use KV_DTYPE or KV_VECTOR_WIDTH.
+        KV_DTYPE = fx.BFloat16 if PV_BF16 else FP8
+        KV_VECTOR_WIDTH = 8 if PV_BF16 else 16
+        # Q in LDS: bf16 for BF16 KV, e4m3 bytes otherwise (MXFP4 included).
         QP_ELEM_BYTES = 2 if is_bf16_kv else 1
 
         assert (
@@ -592,7 +614,7 @@ class PaDecodeTraits:
             TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
         )
         WIDE_FP8_MFMA = PER_TOKEN_WIDE or D256_PIPE
-        PACK_K = BF16_PACK_K if is_bf16_kv else FP8_PACK_K
+        PACK_K = BF16_PACK_K if PV_BF16 else FP8_PACK_K
         MFMA_K = 128 if WIDE_FP8_MFMA else PACK_K
         PACKS_PER_MFMA = MFMA_K // PACK_K
         MTP4_FUSED = PER_TOKEN_WIDE and M_TILES == 4
@@ -606,7 +628,7 @@ class PaDecodeTraits:
             WIDE_FP8_MFMA and PER_TOKEN_M1 and (block_size == 16 or not trans_v)
         )
         # Scale before masking to avoid -inf * 0 and a second mask.
-        M1_SCALE_BEFORE_MASK = PER_TOKEN_M1 or D256_PIPE or is_bf16_kv
+        M1_SCALE_BEFORE_MASK = PER_TOKEN_M1 or D256_PIPE or PV_BF16
         # The d256 pipe gives each M-tile a private P and Lsum slot so one barrier
         # publishes all of them.
         P_BUFFERS = (
@@ -650,7 +672,7 @@ class PaDecodeTraits:
             head_dim // NQCHUNK
         )  # f16 elements per lane's load chunk (8 for head_dim=128, 4 for head_dim=64)
         # Loads are at most 128 bits; larger chunks must not leave an unloaded tail.
-        assert is_bf16_kv or QCHUNK <= 8 or QCHUNK % 8 == 0, (
+        assert PV_BF16 or QCHUNK <= 8 or QCHUNK % 8 == 0, (
             f"head_dim {head_dim} is unsupported: head_dim//{NQCHUNK} ({QCHUNK}) must "
             f"be <= 8 or a multiple of 8"
         )
@@ -689,7 +711,7 @@ class PaDecodeTraits:
         SP_ROW_BYTES = TILE_TOK * QP_ELEM_BYTES + 16
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
         sQscale_off = max(sQ_bytes, sP_bytes)
-        sQscale_bytes = 0 if is_bf16_kv and not MXFP4 else ROWS_PADDED * f32
+        sQscale_bytes = 0 if is_bf16_kv else ROWS_PADDED * f32
         # Tuned rows need 16-byte vector alignment; other paths use bank padding.
         NWARP_PAD = NWARP if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
         # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
@@ -714,9 +736,14 @@ class PaDecodeTraits:
         sPages_off = total_bytes
         total_bytes += stage_page_capacity * 4
         # MXFP4: wave-private bf16 V staging (it also holds the wave's O at the end).
-        sMxV_off = (total_bytes + 15) // 16 * 16
+        sMxfp4VBf16_off = (total_bytes + 15) // 16 * 16
         if MXFP4:
-            total_bytes = sMxV_off + NWARP * NCHUNK * MX_V_CHUNK_BYTES
+            total_bytes = sMxfp4VBf16_off + NWARP * NCHUNK * MXFP4_V_BF16_CHUNK_BYTES
+            if total_bytes > MXFP4_LDS_LIMIT_BYTES:
+                raise ValueError(
+                    f"MXFP4 PA needs {total_bytes} LDS bytes, over the "
+                    f"{MXFP4_LDS_LIMIT_BYTES} B of gfx950"
+                )
 
         return cls(
             cache_key=cache_key,
@@ -743,8 +770,9 @@ class PaDecodeTraits:
             QFP8=QFP8,
             DIRECT=DIRECT,
             is_bf16_kv=is_bf16_kv,
+            PV_BF16=PV_BF16,
             MXFP4=MXFP4,
-            sMxV_off=sMxV_off,
+            sMxfp4VBf16_off=sMxfp4VBf16_off,
             KV_DTYPE=KV_DTYPE,
             KV_VECTOR_WIDTH=KV_VECTOR_WIDTH,
             QP_ELEM_BYTES=QP_ELEM_BYTES,

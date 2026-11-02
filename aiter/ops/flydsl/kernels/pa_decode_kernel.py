@@ -390,12 +390,8 @@ def compile_pa_decode_tile(
         if const_expr(traits.DIRECT):
             # One task per sequence, no plan: ``work_info`` is the context lengths.
             context = fx.Int32(fx.ptr_load(fx.add_offset(work, slot)))
-            tiles = (context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
-            # Tiles past the staged page window are dropped.
-            end = fx.min(
-                tiles,
-                fx.Int32(traits.stage_page_capacity * block_size // KV_COMPUTE_BLOCK),
-            )
+            # Page ids past the staged window come from the block table.
+            end = (context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
             if end > 0:
                 _run_task(slot, fx.Int32(0), end, context)
             else:

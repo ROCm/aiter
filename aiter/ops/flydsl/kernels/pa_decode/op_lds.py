@@ -15,7 +15,7 @@ from ..kernels_common import create_llvm_ptr
 from ..moe_2stage_a16wmix.utils import _e8m0_byte_to_f32
 from ..tensor_shim import buf_base_i64, ptr_buf_tensor
 from ..utils import rcp_f32
-from .traits import MFMA_MNK, MX_V_CHUNK_BYTES
+from .traits import MFMA_MNK, MXFP4_V_BF16_CHUNK_BYTES
 
 
 def _gptr(base, elem_ty, align):
@@ -175,7 +175,7 @@ class PaDecodeQueryLoader:
         q_scale = absmax * fx.Float32(1.0 / self.traits.FP8_MAX)
         if const_expr(self.traits.MXFP4):
             # Published scale is a normal f32: the QK MFMA takes its exponent as the
-            # e8m0 byte of Q (see single_query_tile_mx). The floor keeps 1/0 finite
+            # e8m0 byte of Q (see single_query_tile_mxfp4). The floor keeps 1/0 finite
             # and still leaves a bf16 subnormal row (>= 2**-133) inside e4m3.
             q_scale = fx.maxnumf(q_scale, fx.Float32(1.17549435e-38))
             inv = fx.Float32(rcp_f32(q_scale))
@@ -202,7 +202,7 @@ class PaDecodeQueryLoader:
 
     @flyc.jit
     def stage_row(self, m, q_row_off, q_units):
-        if const_expr(self.traits.is_bf16_kv and not self.traits.MXFP4):
+        if const_expr(self.traits.is_bf16_kv):
             for u in range_constexpr(self.traits.N_QLOADS):
                 elem_off = (
                     self.ctx.qh_local * self.traits.head_dim
@@ -245,7 +245,7 @@ class PaDecodeQueryLoader:
             elif flat_idx < self.traits.CTA_ROWS:
                 self.stage_row(m, q_row_off, self.load_row(qi, gs_head))
             else:
-                if const_expr(self.traits.is_bf16_kv and not self.traits.MXFP4):
+                if const_expr(self.traits.is_bf16_kv):
                     for u in range_constexpr(self.traits.N_QLOADS):
                         elem_off = (
                             self.ctx.qh_local * self.traits.head_dim
@@ -273,7 +273,7 @@ class PaDecodeQueryLoader:
 
     def load_operands(self):
         if const_expr(self.traits.MXFP4):
-            return self._load_operands_mx()
+            return self._load_operands_mxfp4()
         # Match the head-dim permutation of PaDecodeKVLoader.load_k_chunk.
         q_ops_all = []
         for m in range_constexpr(self.traits.M_TILES):
@@ -294,9 +294,9 @@ class PaDecodeQueryLoader:
                     q_ops_all.append(chunk[qkr])
         return q_ops_all
 
-    def _load_operands_mx(self):
+    def _load_operands_mxfp4(self):
         """B operand of the scaled MFMA: head ``lane16``, bytes 16*rgroup..+15 and
-        64 + 16*rgroup..+15 of its fp8 row (the layout measured for fp8 B with an
+        64 + 16*rgroup..+15 of its E4M3 Q row (the layout measured for fp8 B with an
         fp4 A, whose lane holds one 32-element e8m0 group)."""
         row = self.ctx.lane16 * self.traits.head_dim + self.ctx.rgroup * 16
         lo = self.lds.load(row, fx.Int32, 4)
@@ -423,7 +423,7 @@ class PaDecodeKVLoader:
                 num_records_bytes=bt_num_records_bytes,
             )
         )
-        if const_expr(not self.traits.per_token_kv and not self.traits.is_bf16_kv):
+        if const_expr(not self.traits.per_token_kv and not self.traits.PV_BF16):
             key_scale_buf = ptr_buf_tensor(self.ctx.key_scale_ptr, fx.Float32)
             value_scale_buf = ptr_buf_tensor(self.ctx.value_scale_ptr, fx.Float32)
             self.key_scale = fx.Float32(key_scale_buf[0])
@@ -703,18 +703,21 @@ class PaDecodeKVLoader:
                 fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
         return ops  # N_SUBCHUNKS i64 operands
 
-    # ---- MXFP4 K/V: raw words are loaded one tile ahead and widened where used.
+    # ---- MXFP4 K/V: packed E2M1 data and E8M0 scales (one per 32 dims) are loaded
+    # raw one tile ahead; K stays packed for the scaled MFMA, V is widened to BF16.
     # A wave owns 64 tokens of the tile; lane (lane16, rgroup) loads, per 16-token
     # chunk a, token warp*64 + 16a + lane16: 16 B (one 32-dim e8m0 group, dims
     # 32*rgroup..+31) of K and of V, and the token's scale dword (byte rgroup).
 
-    def mx_init(self):
+    def mxfp4_init(self):
         c = self.ctx
-        self.mx_warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, c.warp))
-        row = (self.mx_warp % 2) * 64 + c.lane16  # token row of chunk 0 in its page
-        self.mx_data = row * 64 + c.rgroup * 16  # byte offsets, chunk a adds 1024 * a
-        self.mx_scale = row * 4  # chunk a adds 64 * a
-        self.mx_ptr = {
+        self.mxfp4_warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, c.warp))
+        row = (self.mxfp4_warp % 2) * 64 + c.lane16  # token row of chunk 0 in its page
+        self.mxfp4_data_off = (
+            row * 64 + c.rgroup * 16
+        )  # byte offsets, chunk a adds 1024 * a
+        self.mxfp4_scale_off = row * 4  # chunk a adds 64 * a
+        self.mxfp4_ptr = {
             n: _gptr(p, fx.Int32, al)
             for n, p, al in (
                 ("kd", c.key_cache_ptr, 16),
@@ -727,7 +730,7 @@ class PaDecodeKVLoader:
         }
 
     @flyc.jit
-    def mx_pages(self, tt):
+    def mxfp4_pages(self, tt):
         """The two page ids of tile ``tt`` (wave-uniform): the pair staged in LDS, or
         the block table past the staged window (``max_context_length`` below the
         context). ``tt`` is not before ``part_start``."""
@@ -751,29 +754,31 @@ class PaDecodeKVLoader:
             fx.Int32(fx.rocdl.readfirstlane(T.i32, p1)),
         ]
 
-    def mx_base(self, pages):
+    def mxfp4_base(self, pages):
         """This wave's page byte offset; K and V views share page and head strides."""
-        page = (self.mx_warp >= 2).select(pages[1], pages[0])
+        page = (self.mxfp4_warp >= 2).select(pages[1], pages[0])
         return fx.Int64(page) * fx.Int64(self.ctx.stride_ks_block) + fx.Int64(
             self.ctx.kv_h
         ) * fx.Int64(self.ctx.stride_ks_head)
 
-    def mx_load(self, kv, base):
-        """Raw K (``kv`` "k") or V ("v") of a tile: per chunk [scale dword, 4 data
-        dwords]. The scales are issued first: a later use of a register that an
-        in-flight scale load targets then waits (vmcnt counts in order) for the
-        scales only, not for the data loaded after them."""
+    def mxfp4_load(self, kv, base):
+        """Raw K (``kv`` "k") or V ("v") of a tile: per chunk [E8M0 scale dword, 4
+        packed-E2M1 data dwords]. The scales are issued first: a later use of a
+        register that an in-flight scale load targets then waits (vmcnt counts in
+        order) for the scales only, not for the data loaded after them."""
         # Uniform base + unsigned 32-bit lane offset (the saddr form of the load).
-        data = fx.add_offset(self.mx_ptr[kv + "d"], base // 4)
-        scale = fx.add_offset(self.mx_ptr[kv + "s"], base // 4)
+        data = fx.add_offset(self.mxfp4_ptr[kv + "d"], base // 4)
+        scale = fx.add_offset(self.mxfp4_ptr[kv + "s"], base // 4)
         n = self.traits.NCHUNK
         sc = [
-            fx.ptr_load(fx.add_offset(scale, fx.Uint32(self.mx_scale // 4 + 16 * a)))
+            fx.ptr_load(
+                fx.add_offset(scale, fx.Uint32(self.mxfp4_scale_off // 4 + 16 * a))
+            )
             for a in range_constexpr(n)
         ]
         dw = [
             fx.ptr_load(
-                fx.add_offset(data, fx.Uint32((self.mx_data + 1024 * a) // 4)),
+                fx.add_offset(data, fx.Uint32((self.mxfp4_data_off + 1024 * a) // 4)),
                 result_type=fx.Vector.make_type(4, fx.Int32),
             )
             for a in range_constexpr(n)
@@ -784,26 +789,29 @@ class PaDecodeKVLoader:
         return fx.Vector.from_elements(raw, dtype=fx.Int32)
 
     @flyc.jit
-    def mx_prefetch(self, kv):
+    def mxfp4_prefetch(self, kv):
         raw = fx.full(self.traits.NCHUNK * 5, 0, fx.Int32)
         if self.ctx.part_start < self.ctx.part_end:
-            raw = self.mx_load(kv, self.mx_base(self.mx_pages(self.ctx.part_start)))
+            raw = self.mxfp4_load(
+                kv, self.mxfp4_base(self.mxfp4_pages(self.ctx.part_start))
+            )
         return raw
 
-    def mx_scale_byte(self, dword):
+    def mxfp4_e8m0_byte(self, dword):
         """This lane's e8m0 byte (group ``rgroup``) of a token's scale dword."""
         return (fx.Int32(dword) >> (self.ctx.rgroup * 8)) & fx.Int32(0xFF)
 
-    def _mx_v_chunk(self, a):
+    def _mxfp4_v_bf16_chunk(self, a):
         return (
-            self.traits.sMxV_off
-            + (self.mx_warp * self.traits.NCHUNK + a) * MX_V_CHUNK_BYTES
+            self.traits.sMxfp4VBf16_off
+            + (self.mxfp4_warp * self.traits.NCHUNK + a) * MXFP4_V_BF16_CHUNK_BYTES
         )
 
-    def mx_stage_v(self, v_raw, a, tile_valid):
-        """Widen chunk ``a``'s 16 B row of this lane to bf16 into the wave's V staging."""
+    def mxfp4_stage_v_bf16(self, v_raw, a, tile_valid):
+        """Widen chunk ``a``'s packed-E2M1 row of this lane, times its E8M0 scale, to
+        BF16 into the wave's V staging."""
         c = self.ctx
-        tok = self.mx_warp * 64 + 16 * a + c.lane16
+        tok = self.mxfp4_warp * 64 + 16 * a + c.lane16
         # An invalid token widens to exact zeros, whatever its scale byte holds.
         scale = (tok < tile_valid).select(
             _e8m0_byte_to_f32(fx.Int32(v_raw[a * 5]), c.rgroup), fx.Float32(0.0)
@@ -814,16 +822,17 @@ class PaDecodeKVLoader:
                 dtype=fx.BFloat16,
             )
             self.lds.store(
-                self._mx_v_chunk(a) + (4 * c.rgroup + q) * 256 + c.lane16 * 16,
+                self._mxfp4_v_bf16_chunk(a) + (4 * c.rgroup + q) * 256 + c.lane16 * 16,
                 fx.BFloat16,
                 vec,
             )
 
-    def mx_read_v(self, a):
-        """PV A operands of chunk ``a``, [dim block] i64 (4 bf16): the LDS transpose read."""
+    def mxfp4_read_staged_v_bf16(self, a):
+        """PV A operands of chunk ``a``, [dim block] i64 (4 bf16): the transpose read
+        of the staged BF16 V (not packed MXFP4)."""
         c = self.ctx
         lane = (
-            self._mx_v_chunk(a)
+            self._mxfp4_v_bf16_chunk(a)
             + ((c.lane16 % 4) // 2) * 256
             + (4 * c.rgroup + c.lane16 // 4) * 16
             + (c.lane16 % 2) * 8
@@ -1008,8 +1017,8 @@ class PaDecodeKVLoader:
     def prefetch_first(self):
         # Empty partitions must not read K/V or block_tables.
         if const_expr(self.traits.MXFP4):
-            self.mx_init()
-            return self.mx_prefetch("k")
+            self.mxfp4_init()
+            return self.mxfp4_prefetch("k")
         k_pf0 = fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
         if self.ctx.part_start < self.ctx.part_end:
             if const_expr(self.traits.D256_PIPE and self.traits.per_token_kv):

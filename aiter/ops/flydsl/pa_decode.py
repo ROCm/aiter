@@ -189,6 +189,16 @@ def _pa_decode_mxfp4(
     """MXFP4 K/V on gfx950: ``kv_dtype="mxfp4"`` of the shared tile kernel."""
     if get_gfx_runtime() != "gfx950":
         raise NotImplementedError("MXFP4 pa_decode supports gfx950")
+    # fp4x2 data and fp8_e8m0 scale views are the same bytes as uint8 ones.
+    k_data, v_data, k_scale, v_scale = (
+        (
+            t.view(torch.uint8)
+            if isinstance(t, torch.Tensor)
+            and t.dtype in (dtypes.fp4x2, dtypes.fp8_e8m0)
+            else t
+        )
+        for t in (k_data, v_data, k_scale, v_scale)
+    )
     dev = query.device
     num_seqs, num_q_heads, head_dim = query.shape
     num_kv_heads = k_data.shape[1]
@@ -239,10 +249,11 @@ def _pa_decode_mxfp4(
         ):
             raise ValueError(
                 f"{name} must be a uint8 [{k_data.shape[0]} pages, {num_kv_heads}, "
-                f"128, {tail}] view on {dev} with the key cache's page count, page "
-                f"and head strides, got {t.dtype} {tuple(t.shape)} {t.stride()}"
+                f"128, {tail}] view (or {'fp4x2' if tail == 64 else 'fp8_e8m0'}) "
+                f"on {dev} with the key cache's page count, page and head strides, "
+                f"got {t.dtype} {tuple(t.shape)} {t.stride()}"
             )
-        # mx_init loads data as 16 B and scale as 4 B aligned.
+        # mxfp4_init loads data as 16 B and scale as 4 B aligned.
         align = 16 if tail == 64 else 4
         if t.data_ptr() % align:
             raise ValueError(f"{name} base pointer must be {align} B aligned")
@@ -438,9 +449,10 @@ def pa_decode(
     Each contributes once, independently of the window; -inf disables it and
     +inf suppresses the head's output.
 
-    MXFP4 K/V (gfx950): ``key_cache``/``value_cache`` are uint8 data views
-    [pages, kv_heads, 128, 64] and ``key_scale``/``value_scale`` uint8 e8m0 views
-    [pages, kv_heads, 128, 4] of the same pages (the four share page and head
+    MXFP4 K/V (gfx950): ``key_cache``/``value_cache`` are data views
+    [pages, kv_heads, 128, 64] (``dtypes.fp4x2`` or uint8) and
+    ``key_scale``/``value_scale`` e8m0 views [pages, kv_heads, 128, 4]
+    (``dtypes.fp8_e8m0`` or uint8) of the same pages (the four share page and head
     byte strides, multiples of 16). ``query`` is float8_e4m3fn, used as stored, or
     bf16, quantized to e4m3 per head row in the kernel; ``output`` is bf16.
     Supported: head_dim 128, block size 128, ``query_length`` 1, at most 16 query
@@ -451,7 +463,9 @@ def pa_decode(
     writes its row directly (the output needs the query's row and head strides,
     a context-0 row is zero-filled) and nothing is specialized on ``num_seqs``; a
     plan with ``max_partitions == 1`` is served the same way. A task may span at
-    most 4096 pages: pass a smaller ``max_context_length`` otherwise.
+    most 4096 pages in ``max_context_length``: pass a smaller one otherwise. A
+    real context longer than that bound is still fully attended (up to 2**19
+    tokens a task, the bound of the fixed PV shift, unchecked on the GPU).
 
     Refresh ``work_plan`` on the current stream after changing lengths. Its
     max_partitions is bounded by device CUs. Match sliding_window and, for
@@ -476,7 +490,10 @@ def pa_decode(
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
-    mxfp4 = isinstance(key_cache, torch.Tensor) and key_cache.dtype == torch.uint8
+    mxfp4 = isinstance(key_cache, torch.Tensor) and key_cache.dtype in (
+        torch.uint8,
+        dtypes.fp4x2,
+    )
     if not isinstance(work_plan, PADecodePlan) and not (mxfp4 and work_plan is None):
         raise TypeError("work_plan must be a PADecodePlan")
     if context_partition_size != KV_COMPUTE_BLOCK:
@@ -538,9 +555,10 @@ def pa_decode(
             )
         if sinks is not None:
             raise NotImplementedError("MXFP4 KV supports no sinks, got sinks")
-        if compute_type not in (None, torch.uint8):
+        if compute_type not in (None, torch.uint8, dtypes.fp4x2):
             raise NotImplementedError(
-                f"MXFP4 KV takes compute_type None or torch.uint8, got {compute_type}"
+                "MXFP4 KV takes compute_type None, uint8 or fp4x2, "
+                f"got {compute_type}"
             )
         return _pa_decode_mxfp4(
             output,

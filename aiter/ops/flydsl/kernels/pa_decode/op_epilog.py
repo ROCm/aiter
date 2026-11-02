@@ -10,7 +10,7 @@ from flydsl.expr.typing import ReductionOp
 
 from ..tensor_shim import buf_base_i64, buf_copy_store, ptr_buf_tensor
 from ..utils import rcp_f32
-from .traits import LOG2E, MFMA_MNK, MX_P_EXP_SHIFT, MX_V_CHUNK_BYTES, WAVE
+from .traits import LOG2E, MFMA_MNK, MXFP4_P_EXP_SHIFT, MXFP4_V_BF16_CHUNK_BYTES, WAVE
 
 
 class PaDecodeEpilogue:
@@ -87,7 +87,7 @@ class PaDecodeEpilogue:
             l_row = o_final[self.traits.l_slot(m)]
             safe_l = (l_row > self.ctx.ZERO_F).select(l_row, fx.Float32(1.0))
             inv_l = fx.Float32(rcp_f32(safe_l))
-            if const_expr(self.traits.per_token_kv or self.traits.is_bf16_kv):
+            if const_expr(self.traits.per_token_kv or self.traits.PV_BF16):
                 o_scale = inv_l
             else:
                 o_scale = inv_l * (self.ctx.v_scale_f * inv_fp8)
@@ -115,7 +115,7 @@ class PaDecodeEpilogue:
                     psum[base] = l_row
 
     @flyc.jit
-    def store_mx(self, o_final):
+    def store_mxfp4(self, o_final):
         """MXFP4: each wave holds (max, sum, O over all dims) of its own tokens. One
         barrier publishes them; each of the head x 8-dim threads merges its slice."""
         # Keep pointer writes as SSA operands of the guards (as in ``store``).
@@ -125,8 +125,8 @@ class PaDecodeEpilogue:
         for sh in (16, 32):
             l_w = l_w + l_w.shuffle_xor(sh, WAVE)  # this lane's tokens -> the wave's
         # The wave's V staging is free: its O goes there, [head][dim] f32.
-        o_off = self.traits.sMxV_off + self.ctx.warp * (
-            self.traits.NCHUNK * MX_V_CHUNK_BYTES
+        o_off = self.traits.sMxfp4VBf16_off + self.ctx.warp * (
+            self.traits.NCHUNK * MXFP4_V_BF16_CHUNK_BYTES
         )
         if self.ctx.rgroup == 0:
             self.lds.store_wave(
@@ -168,8 +168,8 @@ class PaDecodeEpilogue:
             for w in range_constexpr(self.traits.NWARP):
                 h_sum = h_sum + ls[w] * wts[w]
                 part = self.lds.load(
-                    self.traits.sMxV_off
-                    + w * (self.traits.NCHUNK * MX_V_CHUNK_BYTES)
+                    self.traits.sMxfp4VBf16_off
+                    + w * (self.traits.NCHUNK * MXFP4_V_BF16_CHUNK_BYTES)
                     + (row * self.traits.head_dim + dim8 * 8) * 4,
                     fx.Float32,
                     8,
@@ -178,9 +178,10 @@ class PaDecodeEpilogue:
             inv = (h_sum > self.ctx.ZERO_F).select(
                 fx.Float32(rcp_f32(h_sum)), self.ctx.ZERO_F
             )
-            # O holds PV * 2**-MX_P_EXP_SHIFT (``single_query_tile_mx``): restore it
-            # here, after the normalization (the row's max token has p = 1, so h_sum >= 1).
-            inv = inv * fx.Float32(2.0**MX_P_EXP_SHIFT)
+            # O holds PV * 2**-MXFP4_P_EXP_SHIFT (``single_query_tile_mxfp4``): restore
+            # it here, after the normalization (the row's max token has p = 1, so
+            # h_sum >= 1).
+            inv = inv * fx.Float32(2.0**MXFP4_P_EXP_SHIFT)
             o_norm = (o * fx.full(8, inv, fx.Float32)).to(self.traits.Q_DTYPE)
             global_row = self.ctx.query_begin * self.traits.query_group_size + row
             for half in range_constexpr(2):
