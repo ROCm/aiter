@@ -121,6 +121,7 @@ def dry_run(arch: str, cu_num: int, name: str | None = None) -> Iterator[None]:
             (torch.cuda, "synchronize", lambda *_a, **_k: None),
             (torch.Tensor, "data_ptr", data_ptr),
             (chip_info, "_detect_native", lambda: [arch]),
+            (chip_info, "_gpu_info_archs", lambda: [arch]),
             (
                 jit_core,
                 "_pybind_develop_hooks_cache",
