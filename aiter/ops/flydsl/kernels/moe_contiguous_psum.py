@@ -18,12 +18,14 @@ from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32
 
 from aiter.ops.flydsl.kernels.herd_topk import _kept_routes
+from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     ptr_buf_tensor,
 )
+from aiter.ops.flydsl.kernels.topk.topk_common import _warp_inclusive_prefix_i32
 
 MAX_EXPERTS_PER_BLOCK = 512
 
@@ -232,7 +234,7 @@ def build_moe_contiguous_psum_module():
     return launch_psum
 
 
-def build_moe_contiguous_psum_remap_module():
+def build_moe_contiguous_psum_remap_module(packed_expert_map: bool = False):
     """JIT launcher: contiguous psum + in-place masked-to-contiguous row remap.
 
     The scan spans E and costs nothing; the remap walks every route. Running both
@@ -246,7 +248,11 @@ def build_moe_contiguous_psum_remap_module():
     """
 
     @flyc.kernel(
-        name="moe_contiguous_psum_remap",
+        name=(
+            "moe_contiguous_psum_remap_packed"
+            if packed_expert_map
+            else "moe_contiguous_psum_remap"
+        ),
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def psum_remap_kernel(
@@ -255,10 +261,12 @@ def build_moe_contiguous_psum_remap_module():
         starts: fx.Pointer,
         psum: fx.Pointer,
         contiguous_m: fx.Pointer,
+        expert_tile_map: fx.Pointer,
         numel: Int32,
         experts: Int32,
         route_max_m: Int32,
         tile_m: Int32,
+        expert_tile_m: Int32,
         num_valid_routes: fx.Pointer,
         row_to_token: fx.Pointer,
         topk: Int32,
@@ -282,6 +290,10 @@ def build_moe_contiguous_psum_remap_module():
         s_p = ptr_buf_tensor(starts)
         p_p = ptr_buf_tensor(psum)
         c_p = ptr_buf_tensor(contiguous_m)
+        expert_map_p = ptr_buf_tensor(
+            expert_tile_map,
+            fx.Int64 if packed_expert_map else fx.Int32,
+        )
 
         is_lane0 = tid == 0
         if is_lane0:
@@ -341,6 +353,30 @@ def build_moe_contiguous_psum_remap_module():
 
         gpu.barrier()
 
+        # Use map to find experts instead of binary search
+        expert_map_is_set = fx.Int64(ptrtoint(expert_tile_map)) != 0
+        if expert_map_is_set & is_blk0:
+            e = tid
+            in_expert = e < fx.Uint32(experts)
+            if in_expert:
+                m_e = fx.Uint32(m_p[e])
+                aligned_rows = (m_e + tile_minus_1) // tile_v * tile_v
+                fine_tile = fx.Uint32(expert_tile_m)
+                map_start = fx.Uint32(starts_lds[e]) // fine_tile
+                map_count = aligned_rows // fine_tile
+                for local_tile in range(map_count):
+                    if const_expr(packed_expert_map):
+                        expert_end = fx.Uint32(starts_lds[e]) + m_e
+                        expert_bits = fx.Int64(e)
+                        if local_tile > 0:
+                            # bit 31 is a flag for if this expert's weights are reusable.
+                            # for reuse_resident_b policy
+                            expert_bits = expert_bits | fx.Int64(1 << 31)
+                        packed = (fx.Int64(expert_end) << fx.Int64(32)) | expert_bits
+                        expert_map_p[map_start + fx.Uint32(local_tile)] = packed
+                    else:
+                        expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(e)
+
         # Only remap valid routes ([0, valid_route_count)); dead-tail routes hold
         # unwritten rows from the route kernel and must not be used as a row index.
         # When truncation is disabled the caller passes a null pointer instead of a
@@ -377,10 +413,12 @@ def build_moe_contiguous_psum_remap_module():
         starts: fx.Pointer,
         psum: fx.Pointer,
         contiguous_m: fx.Pointer,
+        expert_tile_map: fx.Pointer,
         numel: fx.Int32,
         experts: fx.Int32,
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
+        expert_tile_m: fx.Int32,
         num_valid_routes: fx.Pointer,
         row_to_token: fx.Pointer,
         topk: fx.Int32,
@@ -392,10 +430,12 @@ def build_moe_contiguous_psum_remap_module():
             starts,
             psum,
             contiguous_m,
+            expert_tile_map,
             numel,
             experts,
             route_max_m,
             tile_m,
+            expert_tile_m,
             num_valid_routes,
             row_to_token,
             topk,
@@ -605,7 +645,7 @@ def build_moe_contiguous_psum_remap_ep_module():
     return launch_psum_remap_ep
 
 
-def build_moe_route_psum_fused_module():
+def build_moe_route_psum_fused_module(emit_aux: bool = True):
     """JIT launcher: single-workgroup fused route + atomic + psum + remap.
 
     For small token counts every route fits in one workgroup, so the three
@@ -618,8 +658,11 @@ def build_moe_route_psum_fused_module():
     + ``psum`` (m_tile_map) of the split-kernel path bit-for-bit.
     """
 
+    wave_size = get_warp_size()
+    num_waves = MAX_EXPERTS_PER_BLOCK // wave_size
+
     @flyc.kernel(
-        name="moe_route_psum_fused",
+        name="moe_route_psum_fused" + ("" if emit_aux else "_lean"),
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def route_psum_fused_kernel(
@@ -628,10 +671,12 @@ def build_moe_route_psum_fused_module():
         masked_m: fx.Pointer,  # (E,) i32 out (per-expert counts)
         starts: fx.Pointer,  # (E,) i32 out (contiguous row base per expert)
         psum: fx.Pointer,  # (E,) i32 out (= m_tile_map)
+        expert_tile_map: fx.Pointer,  # optional fine tile -> expert i32 map
         numel: Int32,
         experts: Int32,
         max_m: Int32,
         tile_m: Int32,
+        expert_tile_m: Int32,
     ):
         # Uint32: every value here is a non-negative count/index, so `<`, `>=`
         # and `//` lower to ult/uge/divui rather than their signed forms.
@@ -649,6 +694,7 @@ def build_moe_route_psum_fused_module():
         m_p = ptr_buf_tensor(masked_m)
         s_p = ptr_buf_tensor(starts)
         p_p = ptr_buf_tensor(psum)
+        expert_map_p = ptr_buf_tensor(expert_tile_map)
 
         in_expert = tid < fx.Uint32(experts)
 
@@ -668,36 +714,53 @@ def build_moe_route_psum_fused_module():
             rows_p[route_i32] = row
         gpu.barrier()
 
-        # Phase C: tile-aligned inclusive scan of per-expert counts.
+        # Phase C: tile-aligned scan. Scan within each wave in registers, then
+        # scan the wave totals with one wave (0).
+
+        # first subphase of psum reducing, local psums
+        lane = fx.Int32(tid % wave_size)
+        wave = fx.Int32(tid // wave_size)
+        aligned_rows = fx.Int32(0)
+        # round expert count up so all experts begin on a gemm tile boundary
         if in_expert:
             m = fx.Uint32(lds_cnt[tid])
-            lds0[tid] = (m + tile_minus_1) // tile_v * tile_v
-            m_p[tid] = m
+            aligned_rows = fx.Int32((m + tile_minus_1) // tile_v * tile_v)
+            if const_expr(emit_aux):
+                m_p[tid] = m
+        # find local psum counts in each wave
+        inclusive = _warp_inclusive_prefix_i32(aligned_rows, lane, wave_size)
+        if lane == wave_size - 1:
+            lds0[wave] = inclusive
         gpu.barrier()
 
-        src = lds0
-        dst = lds1
-        for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
-            if const_expr((offset & (offset - 1)) != 0):
-                continue
-            if in_expert:
-                val = src[tid]
-                has_prev = tid >= offset
-                prev = fx.Int32(0)
-                if has_prev:
-                    prev = src[tid - offset]
-                dst[tid] = val + prev
-            gpu.barrier()
-            src, dst = dst, src
+        # second subphase of psum reducing, accumulate partial psums in one wave
+        if wave == 0:
+            active = lane < num_waves
+            safe_lane = active.select(lane, fx.Int32(0))
+            wave_total = active.select(lds0[safe_lane], fx.Int32(0))
+            wave_offset = (
+                _warp_inclusive_prefix_i32(wave_total, lane, wave_size) - wave_total
+            )
+            if active:
+                lds0[lane] = wave_offset
+        gpu.barrier()
 
+        # define beginning + end of token rows for each expert
         if in_expert:
-            is_not_first = tid != 0
-            start = fx.Int32(0)
-            if is_not_first:
-                start = src[tid - 1]
+            start = lds0[wave] + inclusive - aligned_rows
             m_tid = lds_cnt[tid]
-            s_p[tid] = start
+            lds1[tid] = start
+            if const_expr(emit_aux):
+                s_p[tid] = start
             p_p[tid] = start + m_tid
+            expert_map_is_set = fx.Int64(ptrtoint(expert_tile_map)) != 0
+            if expert_map_is_set:
+                aligned_rows = (fx.Uint32(m_tid) + tile_minus_1) // tile_v * tile_v
+                fine_tile = fx.Uint32(expert_tile_m)
+                map_start = fx.Uint32(start) // fine_tile
+                map_count = aligned_rows // fine_tile
+                for local_tile in range(map_count):
+                    expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(tid)
         gpu.barrier()
 
         # Phase D: in-place masked -> contiguous row remap.
@@ -706,7 +769,7 @@ def build_moe_route_psum_fused_module():
             m = fx.Uint32(max_m)
             expert = row // m
             slot = row - expert * m
-            start = fx.Uint32(s_p[expert])
+            start = fx.Uint32(lds1[expert])
             rows_p[route_i32] = start + slot
 
     @flyc.jit
@@ -716,10 +779,12 @@ def build_moe_route_psum_fused_module():
         masked_m: fx.Pointer,
         starts: fx.Pointer,
         psum: fx.Pointer,
+        expert_tile_map: fx.Pointer,
         numel: fx.Int32,
         experts: fx.Int32,
         max_m: fx.Int32,
         tile_m: fx.Int32,
+        expert_tile_m: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         route_psum_fused_kernel(
@@ -728,10 +793,12 @@ def build_moe_route_psum_fused_module():
             masked_m,
             starts,
             psum,
+            expert_tile_map,
             numel,
             experts,
             max_m,
             tile_m,
+            expert_tile_m,
         ).launch(
             grid=(1, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),

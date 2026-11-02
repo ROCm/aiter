@@ -111,16 +111,8 @@ def _select_cluster_m(csv_cluster_m: int, cluster_n: int, stage1_act: int) -> in
 
 
 def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
-    """Selects the CSV value or falls back to the environment setting."""
-    if csv_num_waves in (1, 2, 4):
-        return csv_num_waves
-
-    try:
-        num_waves = int(os.environ.get("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM", "2"))
-    except ValueError as exc:
-        raise ValueError(
-            "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4"
-        ) from exc
+    """Select the CSV value or the two-wave default."""
+    num_waves = csv_num_waves if csv_num_waves in (1, 2, 4) else 2
     if num_waves not in (1, 2, 4):
         raise ValueError(
             "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4, got "
@@ -176,7 +168,22 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_row_stride_bytes=0,
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
+    persistent_single_task=0,
+    force_mid_compute=0,
+    linear_wg_map=0,
     rolled_drain=0,
+    persistent_contiguous_chunks=0,
+    reuse_resident_b=0,
+    defer_output_store_wait=0,
+    lds_n_partitions=1,
+    ds_first_n=-1,  # -1: kernel's per-shape IGLP default
+    mma_prio=0,
+    # moe-specific performance
+    m_alignment=0,
+    m_expert_tile_map=None,
+    expert_tile_m=0,
+    packed_expert_map=0,
+    reuse_persistent_map_loads=0,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -216,6 +223,11 @@ def flydsl_grouped_gemm_a8w4_masked(
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     k_tiles = (K + tile_k - 1) // tile_k
     num_buffers = min(num_buffers, max(1, k_tiles))
+    m_alignment = int(m_alignment or tile_m)
+    if m_alignment % tile_m:
+        raise ValueError(
+            f"m_alignment={m_alignment} must be divisible by tile_m={tile_m}"
+        )
     if bias is None:
         has_bias = 0
     elif bias.dtype in _BIAS_MODE:
@@ -232,6 +244,10 @@ def flydsl_grouped_gemm_a8w4_masked(
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
     stage = 1 if stage1_act else 2
+    # Decode padded M is fixed, prefill is runtime.
+    # Simplifying to constant for decode to reduce runtime
+    decode_static_m = int(stage == 1 and int(contiguous_m) <= 32768)
+    constexpr_m = decode_static_m
     persistent_workers = int(
         os.environ.get(
             f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
@@ -240,6 +256,29 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
+    persistent_single_task = int(persistent_single_task)
+    force_mid_compute = int(force_mid_compute)
+    linear_wg_map = int(linear_wg_map)
+    reuse_persistent_map_loads = int(reuse_persistent_map_loads)
+    defer_output_store_wait = int(defer_output_store_wait)
+    mma_prio = int(mma_prio)
+    lds_n_partitions = int(lds_n_partitions)
+    if any(
+        value not in (0, 1)
+        for value in (
+            persistent_single_task,
+            force_mid_compute,
+            linear_wg_map,
+            reuse_persistent_map_loads,
+            defer_output_store_wait,
+            mma_prio,
+        )
+    ):
+        raise ValueError("persistent and pipeline policies must be 0 or 1")
+    if persistent_single_task and not persistent_workers:
+        persistent_single_task = 0
+    if lds_n_partitions not in (1, 2, 4, 8):
+        raise ValueError("lds_n_partitions must be 1, 2, 4, or 8")
     if persistent_workers:
         if cluster_m != 1:
             raise ValueError("persistent workers require cluster_m=1")
@@ -312,6 +351,28 @@ def flydsl_grouped_gemm_a8w4_masked(
         rolled_drain,
         int(a_preshuffled),
     )
+    expert_tile_map_tensor = (
+        m_expert_tile_map
+        if m_expert_tile_map is not None
+        else torch.empty(0, dtype=torch.int32, device=out.device)
+    ).view(-1)
+    moe_spec = (
+        m_alignment,
+        int(expert_tile_m or tile_m),
+        int(m_expert_tile_map is not None),
+        int(packed_expert_map),
+        int(contiguous_m) if constexpr_m else 0,
+        persistent_single_task,
+        force_mid_compute,
+        linear_wg_map,
+        int(persistent_contiguous_chunks),
+        int(reuse_resident_b),
+        reuse_persistent_map_loads,
+        defer_output_store_wait,
+        lds_n_partitions,
+        int(ds_first_n),
+        _select_bool_env("AITER_FLYDSL_MMA_PRIO", mma_prio),
+    )
     _run_compiled(
         launch_gemm_a8w4_tdm,
         out.view(-1),
@@ -335,6 +396,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
+        expert_tile_map_tensor,
+        *moe_spec,
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -342,6 +405,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
+            moe_spec,
         ),
     )
     return out
