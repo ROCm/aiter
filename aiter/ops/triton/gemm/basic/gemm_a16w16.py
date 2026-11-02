@@ -30,7 +30,10 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+_GLUON_SUPPORTED_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 
 
 def _is_gluon_available():

@@ -116,9 +116,9 @@ def fused_rms_mxfp4_quant(
 
     # checks args for either gluon, triton, or auto. auto will check for gfx1250 hardware and set to gluon if it exists, otherwise defaults to triton
     if inargs == "auto":
-        use_gluon = get_arch() == "gfx1250"
+        use_gluon = get_arch() in ("gfx1250", "gfx1250-strict")
     elif inargs == "gluon":
-        if get_arch() != "gfx1250":
+        if get_arch() not in ("gfx1250", "gfx1250-strict"):
             raise RuntimeError("Gluon kernel only supported on gfx1250 hardware")
         use_gluon = True
     elif inargs == "triton":
@@ -666,7 +666,7 @@ def fused_reduce_rms_mxfp4_quant(
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * r,)
 
     # check if args is gluon and arch is not gfx1250
-    if args == "gluon" and get_arch() != "gfx1250":
+    if args == "gluon" and get_arch() not in ("gfx1250", "gfx1250-strict"):
         _LOGGER.warning(
             "Gluon kernel is not supported on this arch, defaulting to triton kernel"
         )
@@ -674,7 +674,7 @@ def fused_reduce_rms_mxfp4_quant(
     # select kernel based on args and arch
     kernel = (
         _gluon_fused_reduce_rms_mxfp4_quant_kernel
-        if (args in ["gluon", "auto"]) and get_arch() == "gfx1250"
+        if (args in ["gluon", "auto"]) and get_arch() in ("gfx1250", "gfx1250-strict")
         else _fused_reduce_rms_mxfp4_quant_kernel
     )
 
@@ -803,12 +803,12 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         M_o, BLOCK_SIZE_M
     ) * triton.cdiv(N_i, BLOCK_SIZE_N)
 
-    if args == "gluon" and get_arch() != "gfx1250":
+    if args == "gluon" and get_arch() not in ("gfx1250", "gfx1250-strict"):
         raise ValueError("Gluon is only supported on gfx1250")
 
     kernel = (
         _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel
-        if (args in ["gluon", "auto"] and get_arch() == "gfx1250")
+        if (args in ["gluon", "auto"] and get_arch() in ("gfx1250", "gfx1250-strict"))
         else _fused_dynamic_mxfp4_quant_moe_sort_kernel
     )
 

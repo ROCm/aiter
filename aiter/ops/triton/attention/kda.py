@@ -16,7 +16,7 @@ _ARCH = arch_info.get_arch()
 
 fused_recurrent_kda_packed_decode_kernel = None
 get_kda_config = None
-if _ARCH == "gfx1250":
+if _ARCH in ("gfx1250", "gfx1250-strict"):
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.kda_decode import (
         fused_recurrent_kda_packed_decode_kernel,
         get_kda_config,

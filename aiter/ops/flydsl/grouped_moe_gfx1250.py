@@ -276,7 +276,7 @@ def _find_grouped_config(
 
 def _use_grouped_gemm_enabled() -> bool:
     env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
-    is_gfx1250 = get_gfx() == "gfx1250"
+    is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
     return env_enabled or is_gfx1250
 
 
@@ -1640,7 +1640,7 @@ def grouped_gemm_gfx1250_a8w4(
         return None
     # The env overrides only matter off gfx1250 (same condition, evaluated
     # lazily so the native-arch path skips the four env reads).
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         _gfx_env = ";".join(
             str(os.environ.get(k, "")).lower()
             for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")

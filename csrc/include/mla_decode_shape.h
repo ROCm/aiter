@@ -154,7 +154,7 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
     const bool flydsl_ps1_dtypes =
         (q_dtype == kv_dtype) && (q_is_fp8 || (q_dtype == AITER_DTYPE_bf16));
     const bool gfx1250_flydsl_ps1_heads =
-        flydsl_ps1 && (arch_id == "gfx1250") && flydsl_ps1_dtypes &&
+        flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) && flydsl_ps1_dtypes &&
         ((num_heads == 96) ||
          (((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
           (max_seqlen_qo == 1)) ||
@@ -272,7 +272,7 @@ inline MlaBackendId mla_decode_backend(const std::string_view arch_id,
     const bool ps1_is_fp8     = q_is_fp8 && kv_is_fp8 && has_scales;
     const bool ps1_is_bf16    = q_is_bf16 && kv_is_bf16;
     const bool use_flydsl_ps1 =
-        flags.flydsl_ps1 && (arch_id == "gfx1250") && (page_size == 1) &&
+        flags.flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) && (page_size == 1) &&
         (ps1_is_fp8 || ps1_is_bf16) &&
         ((num_heads == 16) || (num_heads == 32) || (num_heads == 64) || (num_heads == 96) ||
          (num_heads == 128)) &&

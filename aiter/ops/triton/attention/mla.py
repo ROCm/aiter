@@ -39,7 +39,7 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 
@@ -114,7 +114,9 @@ def select_3d_config(
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_num_warps,
         "waves_per_eu": attn_waves_per_eu,
-        "num_stages": 2 if DEVICE_ARCH in ("gfx1250", "gfx950") else 1,
+        "num_stages": (
+            2 if DEVICE_ARCH in ("gfx1250", "gfx1250-strict", "gfx950") else 1
+        ),
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -385,7 +387,7 @@ def mla_decode_fwd(
 
     selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
     use_lds_pipeline = (
-        DEVICE_ARCH == "gfx1250"
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
         and ALL_DECODE
         and total_num_tokens == num_seqs
         and shuffled_kv_cache
