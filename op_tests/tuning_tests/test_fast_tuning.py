@@ -905,5 +905,494 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
         self.assertNotIn("swiglu_limit", precompiled[2])
 
 
+class TestFusedStage1QuantizedCompare(unittest.TestCase):
+    """The fused fp4 stage-1 check: codes and e8m0 scales against the reference
+    quantizer."""
+
+    def _quantized(self, x):
+        from aiter import dtypes
+        from aiter.ops.quant import per_1x32_f4_quant
+
+        codes, scales = per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2)
+        return codes, scales
+
+    def _compare(self, ref, res):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        return gemm_moe_tune.quantized_output_compare(ref, res, printLog=False)
+
+    def test_identical_output_passes(self):
+        import torch
+
+        codes, scales = self._quantized(torch.randn(64, 4, 256))
+        self.assertEqual(self._compare(codes, codes.clone()), 0.0)
+        self.assertEqual(self._compare(scales, scales.clone()), 0.0)
+
+    def test_a_few_rounding_flips_pass(self):
+        import torch
+
+        codes, _ = self._quantized(torch.randn(64, 4, 256))
+        flipped = codes.view(torch.uint8).clone()
+        flipped.view(-1)[:50] ^= 0x1
+        err = self._compare(codes, flipped.view(codes.dtype))
+        self.assertGreater(err, 0.0)
+        self.assertLess(err, 1.0)
+
+    def test_systematic_bias_fails(self):
+        import torch
+
+        x = torch.randn(64, 4, 256)
+        codes, scales = self._quantized(x)
+        biased_codes, biased_scales = self._quantized(x * 1.03)
+        self.assertEqual(self._compare(codes, biased_codes), 1.0)
+        self.assertEqual(self._compare(scales, biased_scales), 1.0)
+
+    def test_misplaced_scales_fail(self):
+        import torch
+
+        _, scales = self._quantized(torch.randn(64, 4, 256))
+        flat = scales.view(torch.uint8).reshape(-1)
+        permuted = flat[torch.randperm(flat.numel())].view(scales.dtype)
+        self.assertEqual(self._compare(scales, permuted), 1.0)
+
+    def test_scale_off_by_two_exponents_fails(self):
+        import torch
+
+        _, scales = self._quantized(torch.randn(64, 4, 256))
+        off = scales.view(torch.uint8).clone()
+        off.view(-1)[0] += 2
+        self.assertEqual(self._compare(scales, off.view(scales.dtype)), 1.0)
+
+    def test_unmapped_scale_positions_are_skipped(self):
+        import torch
+
+        from aiter import dtypes
+
+        ref = torch.full((256,), 0xFF, dtype=torch.uint8)
+        ref[:128] = 127
+        res = torch.randint(0, 255, (256,), dtype=torch.uint8)
+        res[:128] = 127
+        self.assertEqual(
+            self._compare(ref.view(dtypes.fp8_e8m0), res.view(dtypes.fp8_e8m0)), 0.0
+        )
+
+    def test_sorted_codes_skip_padding_rows(self):
+        import torch
+
+        from aiter import dtypes
+
+        codes = torch.randint(0, 256, (1000, 64), dtype=torch.uint8)
+        ref = torch.full((1000, 64), float("nan"), dtype=dtypes.fp16)
+        ref[:8] = codes[:8].to(dtypes.fp16)
+        wrong = codes.clone()
+        wrong[:8] = torch.randint(0, 256, (8, 64), dtype=torch.uint8)
+        self.assertEqual(self._compare(ref, wrong), 1.0)
+        padding_garbage = codes.clone()
+        padding_garbage[8:] = 0xAA
+        self.assertEqual(self._compare(ref, padding_garbage), 0.0)
+
+    def test_scale_layout_matches_moe_mxfp4_sort(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("moe_mxfp4_sort needs a GPU")
+        from aiter import dtypes
+        from aiter.utility.fp4_utils import moe_mxfp4_sort
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        token_num, topk, cols = 37, 3, 12
+        routes = [t | (s << 24) for t in range(token_num) for s in range(topk)]
+        routes = torch.tensor(routes, dtype=torch.int32)[torch.randperm(len(routes))]
+        sorted_ids = torch.full((192,), token_num, dtype=torch.int32)
+        sorted_ids[: routes.numel()] = routes
+        sorted_ids = sorted_ids.cuda()
+        num_valid_ids = torch.tensor([routes.numel()], dtype=torch.int32).cuda()
+        scales = torch.randint(
+            0, 255, (token_num * topk, cols), dtype=torch.uint8, device="cuda"
+        ).view(dtypes.fp8_e8m0)
+
+        ours = gemm_moe_tune._sorted_route_scales(
+            scales, sorted_ids, num_valid_ids, token_num, topk
+        ).view(torch.uint8)
+        theirs = moe_mxfp4_sort(
+            scales.view(token_num, topk, cols),
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            block_size=32,
+        ).view(torch.uint8)
+
+        mapped = ours != 0xFF
+        self.assertEqual(int(mapped.sum()), token_num * topk * cols)
+        self.assertTrue(torch.equal(ours[mapped], theirs.reshape(-1)[mapped]))
+
+
+class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
+    """The fused fp8 stage-1 reference quantizer, and the split-K check of
+    dequantized values against the fp32 reference."""
+
+    token_num, topk, inter = 37, 3, 256
+
+    @staticmethod
+    def _tune():
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        return gemm_moe_tune
+
+    def _routes(self):
+        import torch
+
+        routes = [
+            t | (s << 24) for t in range(self.token_num) for s in range(self.topk)
+        ]
+        routes = torch.tensor(routes, dtype=torch.int32)[torch.randperm(len(routes))]
+        sorted_ids = torch.full((192,), self.token_num, dtype=torch.int32)
+        sorted_ids[: routes.numel()] = routes
+        return sorted_ids, torch.tensor([routes.numel()], dtype=torch.int32)
+
+    def test_mxfp8_quant_uses_the_given_scale_rule(self):
+        import torch
+
+        from aiter.utility import fp4_utils
+
+        tune = self._tune()
+        x = (torch.randn(64, 256) * torch.rand(64, 1) * 10).view(64, 8, 32)
+        scales_by_rule = []
+        for rule in (fp4_utils.f32_to_fused_moe_mxfp8_scale, tune._roundup_mxfp8_scale):
+            codes, scales = tune._mxfp8_quant(x.view(64, 256), rule)
+            expected = rule(x.abs().amax(-1)).view(torch.uint8)
+            self.assertTrue(torch.equal(scales.view(torch.uint8), expected))
+            scale = fp4_utils.e8m0_to_f32(scales).unsqueeze(-1)
+            dequant = codes.float().view(64, 8, 32) * scale
+            # Round to nearest e4m3: half a step, 2^-4 relative or 2^-10 * scale
+            # for subnormals.
+            bound = torch.maximum(x.abs() * 2**-4, scale * 2**-10)
+            self.assertTrue(torch.all((dequant - x).abs() <= bound))
+            scales_by_rule.append(scales.view(torch.uint8))
+        # The two kernels' rules disagree on some blocks, so each check names its own.
+        self.assertFalse(torch.equal(*scales_by_rule))
+
+    def test_fp8_codes_compare(self):
+        import torch
+
+        from aiter.utility import fp4_utils
+
+        tune = self._tune()
+        rule = fp4_utils.f32_to_fused_moe_mxfp8_scale
+        x = torch.randn(64, 4, 256)
+        codes, _ = tune._mxfp8_quant(x, rule)
+        biased_codes, _ = tune._mxfp8_quant(x * 1.03, rule)
+        compare = tune.quantized_output_compare
+        self.assertEqual(compare(codes, codes.clone(), printLog=False), 0.0)
+        self.assertEqual(compare(codes, biased_codes, printLog=False), 1.0)
+
+    def test_scale_positions_invert_the_sorted_layout(self):
+        import torch
+
+        from aiter import dtypes
+
+        tune = self._tune()
+        sorted_ids, num_valid_ids = self._routes()
+        cols = self.inter // 32
+        scales = torch.randint(
+            0, 255, (self.token_num * self.topk, cols), dtype=torch.uint8
+        )
+        sorted_scales = tune._sorted_route_scales(
+            scales.view(dtypes.fp8_e8m0),
+            sorted_ids,
+            num_valid_ids,
+            self.token_num,
+            self.topk,
+        )
+        positions = tune._route_scale_positions(
+            sorted_ids, num_valid_ids, self.token_num, self.topk, cols
+        )
+        gathered = sorted_scales.view(torch.uint8)[positions]
+        self.assertTrue(torch.equal(gathered, scales))
+
+    def test_scale_positions_reject_an_unmapped_route(self):
+        tune = self._tune()
+        sorted_ids, num_valid_ids = self._routes()
+        sorted_ids[0] = self.token_num  # drop one route to padding
+        with self.assertRaises(ValueError):
+            tune._route_scale_positions(
+                sorted_ids, num_valid_ids, self.token_num, self.topk, 8
+            )
+
+    def _split_k(self, quant, scale_of=lambda x: x):
+        """A split-K-like output: the bf16-rounded result quantized by quant, its
+        scales in the sorted layout, and the reference the check reads."""
+        import torch
+
+        tune = self._tune()
+        sorted_ids, num_valid_ids = self._routes()
+        x = torch.randn(self.token_num, self.topk, self.inter)
+        codes, scales = quant(scale_of(x).bfloat16().float())
+        sorted_scales = tune._sorted_route_scales(
+            scales, sorted_ids, num_valid_ids, self.token_num, self.topk
+        )
+        positions = tune._route_scale_positions(
+            sorted_ids, num_valid_ids, self.token_num, self.topk, self.inter // 32
+        )
+        return (x, positions), (codes, sorted_scales)
+
+    def _quantizers(self):
+        from aiter import dtypes
+        from aiter.ops.quant import per_1x32_f4_quant
+        from aiter.utility import fp4_utils
+
+        tune = self._tune()
+        return {
+            "fp4": lambda x: per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2),
+            "fp8": lambda x: tune._mxfp8_quant(
+                x, fp4_utils.f32_to_fused_moe_mxfp8_scale
+            ),
+        }
+
+    def test_split_k_within_one_step_passes(self):
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, res = self._split_k(quant)
+                self.assertLessEqual(compare(ref, res, printLog=False), 1e-2)
+
+    def test_split_k_bias_fails(self):
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, res = self._split_k(quant, scale_of=lambda x: x * 1.03)
+                self.assertEqual(compare(ref, res, printLog=False), 1.0)
+
+    def test_split_k_misplaced_scales_fail(self):
+        import torch
+
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, (codes, scales) = self._split_k(quant)
+                flat = scales.view(torch.uint8)
+                permuted = flat[torch.randperm(flat.numel())].view(scales.dtype)
+                self.assertEqual(compare(ref, (codes, permuted), printLog=False), 1.0)
+
+    def test_split_k_scale_one_exponent_off_fails(self):
+        import torch
+
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, (codes, scales) = self._split_k(quant)
+                smaller = (scales.view(torch.uint8) - 1).view(scales.dtype)
+                self.assertEqual(compare(ref, (codes, smaller), printLog=False), 1.0)
+
+
+class TestStage2RelativeL2Compare(unittest.TestCase):
+    """The stage-2 check: relative L2 and slope against the reference."""
+
+    @staticmethod
+    def _atomic(parts):
+        """Sum the top-k partials in bf16, one add at a time, as an atomic
+        stage 2 accumulates them."""
+        import torch
+
+        acc = torch.zeros(parts.shape[0], dtype=torch.bfloat16)
+        for k in range(parts.shape[1]):
+            acc = (acc.float() + parts[:, k].bfloat16().float()).bfloat16()
+        return acc
+
+    def _parts(self, topk=16):
+        import torch
+
+        torch.manual_seed(0)
+        return torch.randn(200000, topk) * 8
+
+    def _compare(self, ref, res):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        return gemm_moe_tune.relative_l2_compare(ref, res, printLog=False)
+
+    def test_atomic_bf16_accumulation_passes(self):
+        parts = self._parts()
+        ref = parts.sum(1).bfloat16()
+        err = self._compare(ref, self._atomic(parts))
+        self.assertGreater(err, 0.0)
+        self.assertLess(err, 1e-2)
+
+    def test_three_percent_bias_fails(self):
+        parts = self._parts()
+        ref = parts.sum(1).bfloat16()
+        self.assertEqual(self._compare(ref, self._atomic(parts * 1.03)), 1.0)
+
+    def test_noise_above_the_cap_fails(self):
+        import torch
+
+        ref = self._parts().sum(1)
+        noisy = ref + torch.randn_like(ref) * ref.std() * 0.02
+        self.assertEqual(self._compare(ref.bfloat16(), noisy.bfloat16()), 1.0)
+
+    def test_nan_output_fails(self):
+        ref = self._parts().sum(1).bfloat16()
+        res = ref.clone()
+        res[0] = float("nan")
+        self.assertEqual(self._compare(ref, res), 1.0)
+
+
+class TestRunConfigRouting(unittest.TestCase):
+    """How FmoeTuner.run_config calls fused_moe and builds its reference for a
+    row: gate mode, activation dtype, fp8 scale rule and the fp32 retry. The
+    kernel call and the torch reference are replaced by recorders."""
+
+    md, inter, expert, topk = 256, 256, 4, 2
+
+    def setUp(self):
+        import torch
+
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        if not torch.cuda.is_available():
+            self.skipTest("run_config builds its inputs on the GPU")
+        if get_gfx_runtime() != "gfx950":
+            self.skipTest("the rows and their routing are gfx950's")
+
+    def _row(self, token, q_dtype_a, q_dtype_w, act="Silu", kernel1="", stage1=0):
+        return {
+            "gfx": "gfx950",
+            "cu_num": 256,
+            "token": token,
+            "model_dim": self.md,
+            "inter_dim": self.inter,
+            "expert": self.expert,
+            "topk": self.topk,
+            "act_type": f"ActivationType.{act}",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": q_dtype_a,
+            "q_dtype_w": q_dtype_w,
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
+            "kernelName1": kernel1,
+            "run_1stage": stage1,
+        }
+
+    def _run(self, row, first_reference_matches=True):
+        """Run run_config on one row; return the fused_moe kwargs, the reference
+        calls and the result. The kernel returns ones; the reference returns
+        ones, or zeros unless it quantizes the fp32 result."""
+        from unittest import mock
+
+        import pandas as pd
+        import torch
+
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        kernel_calls, reference_calls = [], []
+
+        def kernel(hidden, *args, **kwargs):
+            kernel_calls.append(kwargs)
+            return torch.ones(hidden.shape, dtype=torch.bfloat16, device="cuda")
+
+        def reference(a1_qt, *args, quantize_fp32=False, **kwargs):
+            reference_calls.append(
+                dict(kwargs, a1_dtype=a1_qt.dtype, quantize_fp32=quantize_fp32)
+            )
+            fill = 1.0 if first_reference_matches or quantize_fp32 else 0.0
+            return torch.full(
+                (a1_qt.shape[0], self.md), fill, dtype=torch.bfloat16, device="cuda"
+            )
+
+        tuner = gemm_moe_tune.FmoeTuner.__new__(gemm_moe_tune.FmoeTuner)
+        tuner.untunedf = pd.DataFrame([row])
+        args = SimpleNamespace(warmup=1, iters=2, errRatio=0.05)
+        with mock.patch.object(
+            gemm_moe_tune.FmoeTuner, "torch_moe_2stages", staticmethod(reference)
+        ):
+            (result,) = tuner.run_config(args, target_fused_moe=kernel)
+        self.assertEqual(result["status"], "ok", result)
+        return kernel_calls[-1], reference_calls
+
+    def test_a8w4_runs_interleaved_with_the_fp8_activation(self):
+        from aiter import dtypes
+        from aiter.utility import fp4_utils
+
+        kernel, refs = self._run(
+            self._row(
+                256,
+                "torch.float8_e4m3fn",
+                "torch.float4_e2m1fn_x2",
+                kernel1="flydsl_moe1_afp8_wfp4_bf16_t32x64x256_fp8",
+            )
+        )
+        self.assertEqual(kernel["gate_mode"], "interleave")
+        self.assertIsNone(kernel["quant_dtype_a"])
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.fp8)
+        self.assertIsNotNone(refs[0]["a1_scale"])
+        self.assertIs(refs[0]["fp8_scale_fn"], fp4_utils.f32_to_fused_moe_mxfp8_scale)
+
+    def test_unfused_stage1_quantizes_stage2_input_with_roundup(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        _, refs = self._run(
+            self._row(
+                256,
+                "torch.float8_e4m3fn",
+                "torch.float4_e2m1fn_x2",
+                kernel1="flydsl_moe1_afp8_wfp4_bf16_t32x64x256",
+            )
+        )
+        self.assertIs(refs[0]["fp8_scale_fn"], gemm_moe_tune._roundup_mxfp8_scale)
+
+    def test_a8w4_below_the_bound_warns_and_runs_bf16(self):
+        from aiter import dtypes
+
+        with self.assertLogs("aiter", level="WARNING") as logs:
+            kernel, refs = self._run(
+                self._row(1, "torch.float8_e4m3fn", "torch.float4_e2m1fn_x2")
+            )
+        self.assertEqual(kernel["gate_mode"], "interleave")
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.bf16)
+        self.assertTrue(any("kernels are not what" in m for m in logs.output))
+
+    def test_mxfp8_runs_interleaved_with_the_fp8_activation(self):
+        from aiter import dtypes
+
+        kernel, refs = self._run(
+            self._row(256, "torch.float8_e4m3fn", "torch.float8_e4m3fn")
+        )
+        self.assertEqual(kernel["gate_mode"], "interleave")
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.fp8)
+
+    def test_situv2_row_passes_its_tuned_activation_dtype(self):
+        from aiter import dtypes
+
+        kernel, refs = self._run(
+            self._row(256, "torch.float4_e2m1fn_x2", "torch.float4_e2m1fn_x2", "Situv2")
+        )
+        self.assertEqual(kernel["gate_mode"], "separated")
+        self.assertEqual(kernel["quant_dtype_a"], dtypes.fp4x2)
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.fp4x2)
+
+    def test_asm_1stage_reference_quantizes_the_activation_to_fp4(self):
+        from aiter import dtypes
+
+        kernel, refs = self._run(
+            self._row(
+                16,
+                "torch.bfloat16",
+                "torch.float4_e2m1fn_x2",
+                "Situv2",
+                kernel1="_ZN5aiter46fmoe_bf16_pertokenMXfp4_g1u1_flat_situv2_16x32E",
+                stage1=1,
+            )
+        )
+        self.assertEqual(kernel["quant_dtype_a"], dtypes.bf16)
+        self.assertEqual(refs[0]["a1_dtype"], dtypes.fp4x2)
+
+    def test_failing_shape_is_retried_at_the_fp32_quantization_point(self):
+        row = self._row(256, "torch.float4_e2m1fn_x2", "torch.float4_e2m1fn_x2")
+        _, refs = self._run(row, first_reference_matches=False)
+        self.assertEqual([r["quantize_fp32"] for r in refs], [False, True])
+        _, refs = self._run(row)
+        self.assertEqual([r["quantize_fp32"] for r in refs], [False])
+
+
 if __name__ == "__main__":
     unittest.main()

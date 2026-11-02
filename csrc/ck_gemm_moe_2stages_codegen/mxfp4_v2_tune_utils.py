@@ -115,12 +115,8 @@ def _stage2_quant_sort(
     )
 
 
-# Rows per batch in the cosine check; caps the int64 gather mxfp4_to_f32 does.
-_COS_ROW_CHUNK = 32768
-
-
 def _dequant_inter_sorted_quant(row, inter_dim, adtype):
-    """Convert v2 sorted intermediate rows to fp32 for debug/cosine checks.
+    """Convert v2 sorted intermediate rows to fp32 for debug checks.
 
     Takes a single row or a batch; the trailing dim becomes inter_dim.
     """
@@ -282,19 +278,25 @@ def gen(
         .view(E, model_dim, inter_dim)
         .to(dtypes.bf16)
     )
-    ref1 = torch_moe_stage1(
-        a_deq,
+    # The a8w4 stage 1 reads a plain fp8 cast of the input (a_scale_one), not a1_qt.
+    if adtype == "fp8" and b_dtype == "fp4":
+        a_stage1 = inp.to(dtypes.fp8).to(dtypes.bf16)
+    else:
+        a_stage1 = a_deq
+    ref1_fp32 = torch_moe_stage1(
+        a_stage1,
         w1_deq,
         w2_deq,
         topk_weights,
         topk_ids,
-        dtype=dtypes.bf16,
+        dtype=dtypes.fp32,
         activation=activation,
         quant_type=QuantType.No,
         doweight=False,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )  # [token, topk, inter]
+    ref1 = ref1_fp32.to(dtypes.bf16)
     ref2 = torch_moe_stage2(
         ref1,
         w1_deq,
@@ -305,24 +307,23 @@ def gen(
         quant_type=QuantType.No,
         doweight=True,
     )  # [token, hidden]
-    ref2_quantized = None
-    if b_dtype == "fp8":
-        a2_ref_q, a2_ref_scale = quant_a(
-            ref1.contiguous().view(token * topk, inter_dim), adtype
-        )
-        a2_ref_deq = _a_deq(
-            a2_ref_q, a2_ref_scale, token * topk, inter_dim, adtype
-        ).view(token, topk, inter_dim)
-        ref2_quantized = torch_moe_stage2(
-            a2_ref_deq,
-            w1_deq,
-            w2_deq,
-            topk_weights,
-            topk_ids,
-            dtype=dtypes.bf16,
-            quant_type=QuantType.No,
-            doweight=True,
-        )
+    # Stage 2 reads the quantized intermediate (populate_v2_intermediate_from_ref).
+    a2_ref_q, a2_ref_scale = quant_a(
+        ref1.contiguous().view(token * topk, inter_dim), adtype
+    )
+    a2_ref_deq = _a_deq(a2_ref_q, a2_ref_scale, token * topk, inter_dim, adtype).view(
+        token, topk, inter_dim
+    )
+    ref2_quantized = torch_moe_stage2(
+        a2_ref_deq,
+        w1_deq,
+        w2_deq,
+        topk_weights,
+        topk_ids,
+        dtype=dtypes.bf16,
+        quant_type=QuantType.No,
+        doweight=True,
+    )
 
     # ---- baseline (aiter mixed_moe stage1) prep ----
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
@@ -377,6 +378,7 @@ def gen(
 
     return {
         "ref1": ref1,
+        "ref1_fp32": ref1_fp32,
         "ref2": ref2,
         "ref2_quantized": ref2_quantized,
         "topk_ids": topk_ids,
@@ -616,31 +618,3 @@ def v2_stage1_sorted_ref(
             continue
         out[r] = ref1[t, int(slot[0].item())].to(torch.bfloat16)
     return out
-
-
-def v2_stage1_dequant_cosine_err(ref, res, msg="", printLog=True, *, inter_dim, adtype):
-    """compare_fn: res=原始 isq [max_sorted,inter_cols] uint8; ref=v2_stage1_sorted_ref
-    产出的 [max_sorted,inter] bf16。对每有效行 (ref 非全 0) 做 per-32-group cosine,
-    返回 err_ratio = 1 - mean_cos (与 cosine_diff_compare 语义一致)。"""
-    valid = (ref.abs().sum(dim=1) > 0).nonzero(as_tuple=True)[0]
-    if valid.numel() == 0:
-        return 1.0
-    groups = inter_dim // 32
-    # Batched: a per-row loop costs one .item() sync per sorted row, ~295k of
-    # them per timed candidate at token=32768/topk=9. Chunked to bound the
-    # int64 gather inside mxfp4_to_f32.
-    cos_rows = []
-    for start in range(0, valid.numel(), _COS_ROW_CHUNK):
-        idx = valid[start : start + _COS_ROW_CHUNK]
-        vg = _dequant_inter_sorted_quant(res[idx], inter_dim, adtype).view(
-            -1, groups, 32
-        )
-        rg = ref[idx].float().view(-1, groups, 32)
-        rn = rg / (rg.norm(dim=2, keepdim=True) + 1e-8)
-        vn = vg / (vg.norm(dim=2, keepdim=True) + 1e-8)
-        cos_rows.append((vn * rn).sum(dim=2).mean(dim=1))
-    cos = torch.cat(cos_rows).mean().item()
-    err = 1.0 - cos
-    if printLog:
-        print(f"{msg}[v2_stage1 cos={cos:.4f} err={err:.4f}]")
-    return max(err, 0.0)
