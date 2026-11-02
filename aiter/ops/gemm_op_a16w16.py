@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 
 import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from ..utility.graph_alloc import persistent_alloc
+from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 
 @compile_ops(
@@ -34,7 +33,7 @@ _SEMA_SHAPE = (16, 64)
 ASM_SPLITK_MAX_GRID = _SEMA_SHAPE[0] * _SEMA_SHAPE[1]
 
 
-@functools.lru_cache(maxsize=64)
+@capture_scoped_cache
 def _get_semaphore_workspace_keyed(device: torch.device, stream_id: int) -> Tensor:
     with persistent_alloc(device):
         return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)

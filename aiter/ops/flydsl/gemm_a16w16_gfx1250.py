@@ -9,7 +9,7 @@ import functools
 
 import torch
 
-from aiter.utility.graph_alloc import persistent_alloc
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 _compile_gemm_a16w16 = None
 _run_compiled = None
@@ -83,7 +83,7 @@ def _cached_launcher(*cfg):
 _SPLIT_K_MAX_TILES = 4096
 
 
-@functools.cache
+@capture_scoped_cache
 def _split_k_counters(device, stream):
     with persistent_alloc(torch.device(device)):
         return torch.zeros(_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device)

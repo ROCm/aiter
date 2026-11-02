@@ -11,7 +11,7 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.utility.graph_alloc import persistent_alloc
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
@@ -1452,7 +1452,7 @@ def assert_no_k_tail(k: int, kwargs: dict):
         )
 
 
-@functools.lru_cache(maxsize=128)
+@capture_scoped_cache
 def get_split_k_buffers(stream, device, split_k):
     # Keyed by split_k: a semaphore word only ever advances by split_k per launch,
     # which is what lets the kernel derive the launch index from its ticket.
