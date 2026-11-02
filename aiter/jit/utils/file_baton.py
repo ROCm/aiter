@@ -108,6 +108,30 @@ class FileBaton:
         return int(lines[0].strip()), lines[1].strip()
 
     @staticmethod
+    def _is_zombie(pid):
+        """True if ``pid`` has already exited but was never reaped.
+
+        A zombie stays in the process table and still answers ``os.kill(pid, 0)``
+        with success, so without this check a lock left by a killed builder
+        would never be considered stale and waiters would spin forever. Only
+        Linux exposes the process state; elsewhere the kill probe decides.
+        """
+        if not sys.platform.startswith("linux"):
+            return False
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                data = f.read()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            return False
+        # "<pid> (<comm>) <state> ..." — the comm field is parenthesised and
+        # may itself contain spaces or ')', so slice between the outer parens.
+        rparen = data.rfind(b")")
+        if rparen < 0:
+            return False
+        rest = data[rparen + 1 :].split()
+        return bool(rest) and rest[0] in (b"Z", b"X")
+
+    @staticmethod
     def _pid_alive(pid):
         if sys.platform == "win32":
             # os.kill() on Windows calls TerminateProcess() for any signal
@@ -146,8 +170,11 @@ class FileBaton:
         except ProcessLookupError:
             return False
         except PermissionError:
-            return True  # exists but owned by another user
-        return True
+            # Exists but owned by another user; /proc still reports its state.
+            return not FileBaton._is_zombie(pid)
+        # Success only proves the pid is taken: a zombie answers the probe but
+        # has already exited and can never release the lock.
+        return not FileBaton._is_zombie(pid)
 
     def _is_stale(self):
         """A lock is stale if its recorded holder is dead, or if it carries no
