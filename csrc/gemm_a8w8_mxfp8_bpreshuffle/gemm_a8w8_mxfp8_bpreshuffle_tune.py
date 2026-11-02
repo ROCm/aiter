@@ -116,18 +116,6 @@ def opus_kernel_name(kid, *, cu_num):
     return instance.name
 
 
-def _opus_geometry(instance):
-    entry = instance.bpreshuffle_co or instance.bpreshuffle_entry
-    return (
-        entry["pipeline"],
-        instance.B_M,
-        instance.B_N,
-        instance.B_K,
-        instance.T_M,
-        instance.T_N,
-    )
-
-
 _OPUS_B_DEFAULTS = (None,) * 4 + tuple(
     map(str, (0, "false", 7168, 4, 1, 0, 2, 0, 256, "false", "false", "false", 0))
 )
@@ -142,8 +130,13 @@ _OPUS_TRAIT_DEFAULTS = {
 
 
 @lru_cache(maxsize=65536)
-def _opus_schedule_profile(pipeline, traits):
-    """Normalize omitted defaults using the current pipelines' traits interface."""
+def _opus_kernel_profile(geometry, traits, wg, threads):
+    """Return effective traits, fixed LDS bytes, and A-scale LDS alignment.
+
+    Shape-dependent A-scale storage is added by opus_candidates. Cache keys
+    contain immutable kernel metadata, so this work is reused across shapes.
+    """
+    pipeline, bm, bn, bk, wm, wn = geometry
     match = re.fullmatch(r"\s*\w+\s*<([^<>]*)>\s*", traits)
     if not match:
         raise ValueError(f"Unsupported OPUS traits: {traits}")
@@ -155,14 +148,10 @@ def _opus_schedule_profile(pipeline, traits):
         arg is None or not re.fullmatch(r"-?\d+|true|false", arg) for arg in args
     ):
         raise ValueError(f"Incomplete OPUS traits: {traits}")
-    return args
-
-
-@lru_cache(maxsize=65536)
-def _opus_variant_profile(pipeline, traits, bm, bn, bk, wn, wg, group_n_active):
-    """Normalize effective B queues and inactive GroupN for variant comparison."""
-    profile = list(_opus_schedule_profile(pipeline, traits))
+    profile, scale_alignment = list(args), 0
     if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+        lds = int(profile[2]) * bm * bk + threads * 4
+        scale_alignment = threads * 16
         stages, distance = int(profile[2]), int(profile[3])
         mr, nr = bm // 16, bn // (wn * 16)
         room = (256 if wg == 2 else 512) - mr * nr * 4 - (bk // 128) * mr * 8 - 48
@@ -178,54 +167,34 @@ def _opus_variant_profile(pipeline, traits, bm, bn, bk, wn, wg, group_n_active):
         ):
             ahead = 3
         profile[3] = f"ahead{min(distance * (bk // 128) * nr, ahead)}"
-    if pipeline == "pingpong_lds" and (int(profile[5]) > 0 or not group_n_active):
-        # GroupM overwrites the N swizzle. Otherwise GroupN is used only in
-        # the wide-N branch of the m-repeat pipeline's launch-order mapping.
-        profile[12] = "inactive"
-    return tuple(profile)
+    elif pipeline == "pingpong_lds":
+        packs = math.ceil((bm // (wm * 16)) / 4)
+        lds = 264 * (bm + bn) + int(profile[2]) * (packs * wm * 64 + 4)
+    else:
+        rows = threads // 8
+        a_slot = math.ceil((bm // 2) / rows) * rows * 128
+        lds = 2 * (2 * a_slot + 2 * 128 * 128) + 127 * 256 + 128 * 2
+    return tuple(profile), lds, scale_alignment
 
 
-def _opus_jit_lds(instance, k):
-    """LDS allocation from the four registered JIT pipelines' traits formulas."""
-    entry = instance.bpreshuffle_entry
-    profile = _opus_schedule_profile(entry["pipeline"], entry["traits"])
-    bm, bn, threads = instance.B_M, instance.B_N, instance.BLOCK_SIZE
-    if entry["pipeline"] in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-        scale = math.ceil(bm * (k // 128) / (threads * 16)) * threads * 16
-        return int(profile[2]) * bm * instance.B_K + scale + threads * 4
-    if entry["pipeline"] == "pingpong_lds":
-        packs = math.ceil((bm // (instance.T_M * 16)) / 4)
-        return 264 * (bm + bn) + int(profile[2]) * (packs * instance.T_M * 64 + 4)
-    rows = threads // 8
-    a_slot = math.ceil((bm // 2) / rows) * rows * 128
-    return 2 * (2 * a_slot + 2 * 128 * 128) + 127 * 256 + 128 * 2
-
-
-def _opus_select_variants(kids, registry, m, n, k, mode):
+def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mode):
     """Keep a baseline for every tile; expand primary or secondary modes.
 
     Primary tiles add joint parameter routes and scheduling representatives.
     Secondary tiles add representatives, sampling overlap publication timing.
     """
-    footprints = {kid: _opus_jit_lds(registry[kid], k) for kid in kids}
     selected = {min(kids, key=lambda kid: (footprints[kid], kid))}
     if mode == "baseline":
         return selected
-    instance = registry[kids[0]]
-    pipeline = instance.bpreshuffle_entry["pipeline"]
-    bm, bn, bk, wn = instance.B_M, instance.B_N, instance.B_K, instance.T_N
+    pipeline, bm, bn, bk, wm, wn = geometry
     unique = {}
     for kid in sorted(kids):
-        profile = _opus_variant_profile(
-            pipeline,
-            registry[kid].bpreshuffle_entry["traits"],
-            bm,
-            bn,
-            bk,
-            wn,
-            registry[kid].WG_PER_CU,
-            n // bn >= 256 and m > bm,
-        )
+        profile = kernel_profiles[kid]
+        if pipeline == "pingpong_lds" and (
+            int(profile[5]) > 0 or n // bn < 256 or m <= bm
+        ):
+            # GroupM overrides GroupN; narrow-N and single-M-tile routes ignore it.
+            profile = (*profile[:12], "inactive")
         unique.setdefault(profile, kid)
     profiles = {kid: profile for profile, kid in unique.items()}
     if mode == "primary":
@@ -243,8 +212,8 @@ def _opus_select_variants(kids, registry, m, n, k, mode):
                 routes = [kid for kid in routes if aheads[kid] <= bound]
         elif pipeline in ("pingpong_lds", "wave_interleave"):
             if pipeline == "pingpong_lds":
-                em = bm // (instance.T_M * 16)
-                if not (instance.T_M * wn == 8 and 3 <= em <= 4):
+                em = bm // (wm * 16)
+                if not (wm * wn == 8 and 3 <= em <= 4):
                     # Include each variant's scale panel in two-block residency.
                     resident = {kid for kid in kids if footprints[kid] <= 80 * 1024}
                     if resident:
@@ -310,83 +279,99 @@ def _opus_select_variants(kids, registry, m, n, k, mode):
     return selected
 
 
-def _opus_best_geometries(geometries, m, n, cu_num):
-    """Choose a representative tile independently for each pipeline/BK/layout."""
-    by_layout = defaultdict(list)
-    for geometry in geometries:
-        by_layout[(geometry[0], *geometry[3:])].append(geometry)
-    return {
-        min(group, key=lambda g: (_opus_geometry_cost(g, m, n, cu_num), g))
-        for group in by_layout.values()
-    }
+def opus_candidates(m, n, k, *, cu_num):
+    """Calculate tile ranges and variants from shape and cached kernel resources."""
+    from csrc.opus_gemm.opus_gemm_common import candidate_kids_for_shape, get_registry
 
+    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)
+    legal = candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num)
+    if not legal:
+        return []
+    selected = {kid for kid in legal if registry[kid].bpreshuffle_co is not None}
+    co_count = len(selected)
+    groups, profiles, footprints = defaultdict(list), {}, {}
+    for kid in legal:
+        instance = registry[kid]
+        if instance.bpreshuffle_co is not None:
+            continue
+        geometry = (
+            instance.bpreshuffle_entry["pipeline"],
+            instance.B_M,
+            instance.B_N,
+            instance.B_K,
+            instance.T_M,
+            instance.T_N,
+        )
+        groups[geometry].append(kid)
+        profile, lds, alignment = _opus_kernel_profile(
+            geometry,
+            instance.bpreshuffle_entry["traits"],
+            instance.WG_PER_CU,
+            instance.BLOCK_SIZE,
+        )
+        profiles[kid] = profile
+        if alignment:
+            lds += math.ceil(instance.B_M * (k // 128) / alignment) * alignment
+        footprints[kid] = lds
 
-def _opus_geometry_cost(geometry, m, n, cu_num):
-    """Relative padding, CU fill, tail, and matrix-request cost of a tile."""
-    bm, bn = geometry[1:3]
-    tiles = math.ceil(m / bm) * math.ceil(n / bn)
-    padding = math.ceil(m / bm) * bm / m * math.ceil(n / bn) * bn / n
-    occupancy = tiles / max(cu_num, 1)
-    return (
-        0.25 * (padding - 1)
-        + 0.25 * max(0, 1 - occupancy)
-        + 0.1 * (math.ceil(occupancy) / occupancy - 1)
-        + 8 / bm
-        + 8 / bn
-    )
+    # Compute each tile's grid, relative cost, and minimum LDS once.
+    cu_grid = max(cu_num, 1)
+    grids, costs, min_lds, by_pipeline = {}, {}, {}, defaultdict(list)
+    for geometry, kids in groups.items():
+        pipeline, bm, bn, _, _, _ = geometry
+        tiles = math.ceil(m / bm) * math.ceil(n / bn)
+        padding = math.ceil(m / bm) * bm / m * math.ceil(n / bn) * bn / n
+        occupancy = tiles / cu_grid
+        grids[geometry] = tiles
+        costs[geometry] = (
+            0.25 * (padding - 1)
+            + 0.25 * max(0, 1 - occupancy)
+            + 0.1 * (math.ceil(occupancy) / occupancy - 1)
+            + 8 / bm
+            + 8 / bn
+        )
+        min_lds[geometry] = min(footprints[kid] for kid in kids)
+        by_pipeline[pipeline].append(geometry)
 
-
-def _opus_calculate_geometry_range(groups, registry, m, n, k, cu_num):
-    """Calculate primary tile ranges and secondary resource states, without times.
-
-    B tiles keep the largest full-A geometry. When it underfills the CU grid,
-    allow up to 1.5x more M tiles and 2x more N tiles to recover parallelism.
-    The 4-wave layout gets full settings; other wave counts get them while
-    their grid has too few blocks to fill four SIMDs per CU.
-
-    M-repeat core tiles fill the three-fragment A ring without requiring a
-    second packed scale word (E_M=3..4). If those tiles underfill the CUs,
-    also search the largest layouts whose matrix/scale LDS permits two blocks.
-    """
-    by_pipeline = defaultdict(list)
-    for geometry in groups:
-        by_pipeline[geometry[0]].append(geometry)
     primary, secondary = set(), set()
-    cu_num = max(cu_num, 1)
     for pipeline, tiles in by_pipeline.items():
+        layouts = defaultdict(list)
+        for geometry in tiles:
+            layouts[geometry[3:]].append(geometry)
+        ranked = {
+            min(layout, key=lambda g: (costs[g], g)) for layout in layouts.values()
+        }
         if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
-            layouts = defaultdict(list)
             native = any(
                 wm * wn == 4 and (bk // 128) * (bm // 16) < 16
                 for _, bm, _, bk, wm, wn in tiles
             )
-            for geometry in tiles:
-                layouts[(geometry[3], geometry[4], geometry[5])].append(geometry)
             for (bk, wm, wn), layout in layouts.items():
                 full_a = [g for g in layout if (bk // 128) * (g[1] // 16) < 16]
                 if full_a:
                     largest = max(full_a, key=lambda g: (g[1] * g[2], g))
                     max_bm, max_bn = largest[1:3]
-                    grid = math.ceil(m / max_bm) * math.ceil(n / max_bn)
-                    if grid < cu_num:
-                        chosen = {
+                    grid = grids[largest]
+                    chosen = (
+                        {
                             g
                             for g in full_a
                             if 3 * g[1] >= 2 * max_bm and 2 * g[2] >= max_bn
                         }
-                    else:
-                        chosen = {largest}
+                        if grid < cu_grid
+                        else {largest}
+                    )
                     waves = wm * wn
-                    if native and waves != 4 and grid >= cu_num * max(1, 4 / waves):
+                    if native and waves != 4 and grid >= cu_grid * max(1, 4 / waves):
                         secondary.update(chosen)
                     else:
                         primary.update(chosen)
                 rotated = [g for g in layout if (bk // 128) * (g[1] // 16) >= 16]
                 if rotated:
-                    # This changes the A live set, LDS waits, and B queue clamp.
-                    # Cover its resource modes even when full-A tiles rank higher.
-                    secondary.update(_opus_best_geometries(rotated, m, n, cu_num))
+                    # Cover the changed A live set, LDS waits, and B queue clamp.
+                    secondary.add(min(rotated, key=lambda g: (costs[g], g)))
         elif pipeline == "pingpong_lds":
+            # Fill the A ring with E_M=3..4; add two-resident-block tiles if needed.
             core = [
                 g for g in tiles if g[4] * g[5] == 8 and 3 <= g[1] // (g[4] * 16) <= 4
             ]
@@ -396,86 +381,59 @@ def _opus_calculate_geometry_range(groups, registry, m, n, k, cu_num):
                 core = [g for g in core if g[2] == max_bn]
                 primary.update(core)
                 largest = max(core, key=lambda g: (g[1] * g[2], g))
-                grid = math.ceil(m / largest[1]) * math.ceil(n / largest[2])
-                underfilled = grid < cu_num
+                underfilled = grids[largest] < cu_grid
             for waves in (4, 8):
                 resident = [
-                    g
-                    for g in tiles
-                    if g[4] * g[5] == waves
-                    and min(_opus_jit_lds(registry[kid], k) for kid in groups[g])
-                    <= 160 * 1024 // 2
+                    g for g in tiles if g[4] * g[5] == waves and min_lds[g] <= 80 * 1024
                 ]
                 if resident:
                     max_area = max(g[1] * g[2] for g in resident)
                     chosen = {g for g in resident if g[1] * g[2] == max_area}
                     (primary if underfilled else secondary).update(chosen)
         elif pipeline == "wave_interleave":
-            ranked = _opus_best_geometries(tiles, m, n, cu_num)
             for geometry in ranked:
                 (primary if geometry[4] * geometry[5] == 8 else secondary).add(geometry)
         else:
             secondary.update(tiles)
-        if not any(g in primary for g in tiles) and not any(
-            g in secondary for g in tiles
-        ):
-            # A registry/shape may have no core or two-resident-block layout.
-            secondary.update(_opus_best_geometries(tiles, m, n, cu_num))
+        if not (primary | secondary).intersection(tiles):
+            secondary.update(ranked)
+
+    # Tighten primary ranges by relative work and grid supply, retaining modes.
     dropped, core_costs, by_layout = set(), {}, defaultdict(list)
     for geometry in primary:
         _, bm, bn, _, wm, wn = geometry
         if geometry[0] == "pingpong_lds" and wm * wn == 8 and bm // (wm * 16) >= 3:
-            # Relative work weights include startup and rolling A-ring refill.
             em, en = bm // (16 * wm), bn // (16 * wn)
             mfma = em * en * 32 * wm * wn / 4
             transfer = (bm + bn) * 128 / 512
             refill = max(0, em - 3) * 64
             body = (k / 128) * (mfma + transfer + refill) + 3072 + bm * bn * 2 / 512
-            tiles = math.ceil(m / bm) * math.ceil(n / bn)
-            occupancy = tiles / cu_num
+            occupancy = grids[geometry] / cu_grid
             tail = 1 + 0.1 * (math.ceil(occupancy) / occupancy - 1)
-            core_costs[geometry] = tiles * body * tail / (m * n * k)
+            core_costs[geometry] = grids[geometry] * body * tail / (m * n * k)
         elif geometry[0] in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
             by_layout[(geometry[0], *geometry[3:])].append(geometry)
-        if math.ceil(m / bm) * math.ceil(n / bn) < cu_num / 2:
+        if grids[geometry] < cu_grid / 2:
             dropped.add(geometry)
     if core_costs:
         best = min(core_costs.values())
         dropped.update(g for g in core_costs if core_costs[g] > 1.025 * best)
     for geometries in by_layout.values():
-        costs = {g: _opus_geometry_cost(g, m, n, cu_num) for g in geometries}
-        best = min(costs.values())
-        # Two-wave blocks have more residency-dependent CU-fill choices.
+        best = min(costs[g] for g in geometries)
         margin = 4 / 3 if geometries[0][4] * geometries[0][5] < 4 else 1.1
         dropped.update(g for g in geometries if costs[g] > margin * best)
     primary -= dropped
-    return primary, (secondary | dropped) - primary
+    secondary = (secondary | dropped) - primary
 
-
-def opus_candidates(m, n, k, *, cu_num):
-    """Calculate one shape/resource range, retaining legal COs and tile baselines."""
-    from csrc.opus_gemm.opus_gemm_common import candidate_kids_for_shape, get_registry
-
-    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)
-    legal = candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num)
-    if not legal:
-        return []
-    selected = {kid for kid in legal if registry[kid].bpreshuffle_co is not None}
-    co_count = len(selected)
-    groups = defaultdict(list)
-    for kid in legal:
-        if registry[kid].bpreshuffle_co is None:
-            groups[_opus_geometry(registry[kid])].append(kid)
-    primary, secondary = _opus_calculate_geometry_range(
-        groups, registry, m, n, k, cu_num
-    )
     for geometry, kids in groups.items():
         mode = "baseline"
         if geometry in primary:
             mode = "primary"
         elif geometry in secondary:
             mode = "secondary"
-        selected.update(_opus_select_variants(kids, registry, m, n, k, mode))
+        selected.update(
+            _opus_select_variants(geometry, kids, profiles, footprints, m, n, mode)
+        )
     print(
         f"[OPUS search] shape={(m, n, k)} legal={len(legal)} "
         f"primary={len(primary)} secondary={len(secondary)} "
@@ -634,24 +592,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         "profile_file": "",
     }
 
-    def _setup_common_arguments(self):
-        super()._setup_common_arguments()
-        for option in (
-            "--run_config",
-            "--e2e_tune",
-            "--compare",
-            "--update_improved",
-            "--min_improvement_pct",
-        ):
-            action = self.parser._option_string_actions.pop(option)
-            self.parser._remove_action(action)
-            self.parser._optionals._group_actions.remove(action)
-        # The shared run() reads these switches before entering candidate tuning.
-        self.parser.set_defaults(run_config=False, compare=False, update_improved=False)
-        self.parser._option_string_actions["--errRatio"].help = (
-            "Tolerable error ratio (default 0.05); candidates above this are rejected."
-        )
-
     def getKernelName(self, kernelId):
         # Pipeline id ranges are disjoint (8-wave ids start at 1_000_000).
         for pipe in MXFP8_ROW_PIPELINES:
@@ -735,6 +675,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 f"gemm_a8w8_mxfp8_bpreshuffle tuner covers gfx950 and gfx1250, got {gfx}"
             )
             return []
+        if args.libtype == "opus" and gfx != "gfx950":
+            raise ValueError("OPUS bpreshuffle tuning supports gfx950 only")
         cu_num = self.get_cu_num()
         gemm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
         ref_args = (["x_deq", "w_deq"], dtypes.bf16)
@@ -749,18 +691,15 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 f"w_scale block {coarse} is tuned for gemm_a8w8_blockscale_"
                 f"bpreshuffle only: pass --mxscale_table"
             )
-        if gfx == "gfx1250":
-            if not self._mxscale_table or set(untunedf["w_scale_block"]) != {"128x128"}:
-                raise ValueError(
-                    "gfx1250 tunes the mxfp8_128 kernels of gemm_a8w8_blockscale_"
-                    "bpreshuffle's table only: pass --mxscale_table and 128x128 shapes"
-                )
-            if args.libtype == "opus":
-                raise ValueError("OPUS bpreshuffle tuning supports gfx950 only")
+        if gfx == "gfx1250" and (
+            not self._mxscale_table or set(untunedf["w_scale_block"]) != {"128x128"}
+        ):
+            raise ValueError(
+                "gfx1250 tunes the mxfp8_128 kernels of gemm_a8w8_blockscale_"
+                "bpreshuffle's table only: pass --mxscale_table and 128x128 shapes"
+            )
         seeds = (
-            self._bmm_seeds()
-            if self._mxscale_table and gfx == "gfx950" and args.libtype != "opus"
-            else {}
+            self._bmm_seeds() if self._mxscale_table and args.libtype != "opus" else {}
         )
         opus_by_shape = {}
         if gfx == "gfx950" and args.libtype != "flydsl" and self._mxscale_table:
