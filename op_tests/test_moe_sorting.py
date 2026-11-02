@@ -20,6 +20,79 @@ BLOCK_SIZE_M = 32
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
+def test_moe_sorting_opus_host_dispatch_boundaries():
+    if get_gfx() != "gfx950":
+        device_id = torch.cuda.current_device()
+        assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, device_id) == 0
+        assert aiter.moe_sorting_opus_get_workspace_size(1, 512, 8, 0, device_id) > 0
+        return
+
+    device_id = torch.cuda.current_device()
+    tokens = (1, 7, 8, 12, 16, 24, 25, 31)
+    multi_tokens = {
+        255: (25, 31),
+        256: (8, 12, 16, 24, 25, 31),
+        257: (8, 12, 16, 24, 25, 31),
+        384: (8, 12, 16, 24, 25, 31),
+        385: tokens,
+    }
+    for E, token in itertools.product(multi_tokens, tokens):
+        auto_workspace = aiter.moe_sorting_opus_get_workspace_size(
+            token, E, 8, 0, device_id
+        )
+        oneshot_workspace = aiter.moe_sorting_opus_get_workspace_size(
+            token, E, 8, 1, device_id
+        )
+        multi_workspace = aiter.moe_sorting_opus_get_workspace_size(
+            token, E, 8, 2, device_id
+        )
+        expect_auto_multi = token in multi_tokens[E]
+        assert (
+            auto_workspace > 0
+        ) == expect_auto_multi, f"unexpected auto dispatch for E={E}, M={token}"
+        assert oneshot_workspace == 0, f"forced oneshot failed for E={E}, M={token}"
+        assert multi_workspace > 0, f"forced multi failed for E={E}, M={token}"
+
+
+def test_moe_sorting_opus_workspace_uses_explicit_device():
+    original = torch.cuda.current_device()
+    target = (
+        (original + 1) % torch.cuda.device_count()
+        if torch.cuda.device_count() > 1
+        else original
+    )
+    try:
+        workspace = aiter.moe_sorting_opus_get_workspace_size(8, 256, 8, 0, target)
+        assert torch.cuda.current_device() == original
+        if _device_arch(target) == "gfx950":
+            assert workspace > 0
+    finally:
+        torch.cuda.set_device(original)
+
+
+def test_moe_sorting_opus_workspace_switches_arch_policy():
+    arches = [_device_arch(device_id) for device_id in range(torch.cuda.device_count())]
+    gfx950 = next((i for i, arch in enumerate(arches) if arch == "gfx950"), None)
+    other = next((i for i, arch in enumerate(arches) if arch != "gfx950"), None)
+    if gfx950 is None or other is None:
+        aiter.logger.warning("arch-switch test requires gfx950 and non-gfx950 devices")
+        return
+
+    original = torch.cuda.current_device()
+    try:
+        torch.cuda.set_device(other)
+        assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, gfx950) > 0
+        torch.cuda.set_device(gfx950)
+        assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, other) == 0
+    finally:
+        torch.cuda.set_device(original)
+
+
+def _device_arch(device_id: int) -> str:
+    props = torch.cuda.get_device_properties(device_id)
+    return str(getattr(props, "gcnArchName", props.name)).split(":", 1)[0]
+
+
 def set_moe_sorting_backend(backend: str) -> None:
     """Force which moe_sorting backend `moe_sorting()` dispatches to."""
     if backend == "flydsl":
@@ -172,52 +245,97 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
     return errs
 
 
-def test_moe_sorting_opus_aux_capacity(dtype, model_dim):
-    """Cover the production MXFP4 auxiliary-sort route with a small OOB case.
+def test_moe_sorting_opus_aux_outputs(dtype, model_dim):
+    """Cover auxiliary outputs on one-shot and newly multi-phase auto routes."""
+    for token, E, topk in ((7, 32, 5), (8, 256, 8), (1, 385, 7)):
+        topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+            token,
+            model_dim,
+            E,
+            topk,
+            dtype,
+            has_expert_mask=False,
+            padding_extra=0,
+        )
+        for block_size in (16, 32, 64, 128):
+            # Other shapes go to the fused aux sort, which has no instance for them.
+            if not fm._aux_uses_opus(fm.AUX_SORT_OPUS, block_size, token * topk, E):
+                continue
+            ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
+            out = moe_sorting(
+                topk_ids,
+                topk_weights,
+                E,
+                model_dim,
+                dtype,
+                block_size,
+                output_aux=fm.AUX_SORT_OPUS,
+            )
 
-    At block size 32, the old formula allocated 1054 rows while GEMM described
-    1056 rows.
-    """
-    token, E, topk = 7, 32, 5
-    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
-        token,
-        model_dim,
-        E,
-        topk,
-        dtype,
-        has_expert_mask=False,
-        padding_extra=0,
-    )
-    for block_size in (16, 32, 64, 128):
-        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
-        out = moe_sorting(
+            errs = _compare_moe_sorting_outputs(ref, out[:5], topk, token)
+            bad = {name: err for name, err in errs.items() if err}
+            mismatch = (
+                f"Opus auxiliary sort mismatch at M={token}, E={E}, "
+                f"block_size={block_size}: {bad}"
+            )
+            assert not bad, mismatch
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                _,
+                _,
+                aux_m_indices,
+                aux_reverse_sorted,
+            ) = out
+            expected_capacity = sorted_expert_ids.numel() * block_size
+            assert sorted_ids.numel() == expected_capacity
+            assert sorted_weights.numel() == expected_capacity
+            assert aux_m_indices.numel() == expected_capacity
+            assert aux_reverse_sorted.numel() == topk_ids.numel()
+            num_tokens_post_pad = out[3][0].item()
+            assert torch.equal(
+                aux_m_indices[:num_tokens_post_pad],
+                sorted_ids[:num_tokens_post_pad] & 0x00FFFFFF,
+            )
+            topk_slots = torch.arange(
+                topk, dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            expected_sorted_ids = (
+                topk_slots.unsqueeze(0) << 24
+                | torch.arange(
+                    token, dtype=topk_ids.dtype, device=topk_ids.device
+                ).unsqueeze(1)
+            ).flatten()
+            assert torch.equal(
+                sorted_ids[aux_reverse_sorted.long()], expected_sorted_ids
+            )
+
+
+def test_moe_sorting_opus_local_ids_large_expert_auto(dtype, model_dim):
+    for token, E, topk in ((8, 256, 8), (1, 385, 7)):
+        topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+            token,
+            model_dim,
+            E,
+            topk,
+            dtype,
+            has_expert_mask=False,
+            padding_extra=0,
+        )
+        *_, local_topk_ids = moe_sorting(
             topk_ids,
             topk_weights,
             E,
             model_dim,
             dtype,
-            block_size,
-            output_aux=fm.AUX_SORT_OPUS,
+            BLOCK_SIZE_M,
+            dispatch_policy=0,
+            return_local_topk_ids=True,
         )
-
-        errs = _compare_moe_sorting_outputs(ref, out[:5], topk, token)
-        bad = {name: err for name, err in errs.items() if err}
-        mismatch = f"Opus auxiliary sort mismatch at block_size={block_size}: {bad}"
-        assert not bad, mismatch
-        (
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            _,
-            _,
-            aux_m_indices,
-            aux_reverse_sorted,
-        ) = out
-        expected_capacity = sorted_expert_ids.numel() * block_size
-        assert sorted_ids.numel() == expected_capacity
-        assert sorted_weights.numel() == expected_capacity
-        assert aux_m_indices.numel() == expected_capacity
-        assert aux_reverse_sorted.numel() == topk_ids.numel()
+        assert torch.equal(
+            topk_ids, local_topk_ids
+        ), f"local_topk_ids mismatch at M={token}, E={E}"
 
 
 def _build_moe_sorting_inputs(
@@ -792,8 +910,12 @@ def main():
     model_configs = list(zip(args.expert, args.topk))
     routing_cases = args.routing_case if args.routing_case is not None else ["valid"]
 
+    test_moe_sorting_opus_host_dispatch_boundaries()
+    test_moe_sorting_opus_workspace_uses_explicit_device()
+    test_moe_sorting_opus_workspace_switches_arch_policy()
     for dtype in args.dtype:
-        test_moe_sorting_opus_aux_capacity(dtype, args.model_dim)
+        test_moe_sorting_opus_aux_outputs(dtype, args.model_dim)
+        test_moe_sorting_opus_local_ids_large_expert_auto(dtype, args.model_dim)
         df = []
         for (
             padding_extra,

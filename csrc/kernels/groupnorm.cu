@@ -361,6 +361,11 @@ void groupnorm_run(
 
     AITER_CHECK(weights.numel() > 0 && bias.numel() > 0,
                 "groupnorm requires non-empty affine weight and bias");
+    AITER_CHECK(y.dtype() == x.dtype() && weights.dtype() == x.dtype() &&
+                    bias.dtype() == x.dtype(),
+                "groupnorm requires input, output, weight, and bias to have the same dtype");
+    AITER_CHECK(workspace.dtype() == AITER_DTYPE_fp32,
+                "groupnorm workspace must have dtype fp32");
     // x/weights/bias contiguity is guaranteed by the Python wrapper; check defensively.
     AITER_CHECK(x.is_contiguous(), "groupnorm input x must be contiguous");
 
@@ -380,4 +385,3 @@ void groupnorm_run(
 }
 
 } // namespace aiter
-

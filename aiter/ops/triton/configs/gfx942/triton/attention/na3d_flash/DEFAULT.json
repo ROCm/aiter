@@ -1,0 +1,14 @@
+{
+    "na3d_flash_small_kw": {
+        "BLOCK_Q": 16,
+        "BLOCK_KV": 32,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "na3d_flash_large_kw": {
+        "BLOCK_Q": 32,
+        "BLOCK_KV": 64,
+        "num_warps": 4,
+        "num_stages": 4
+    }
+}

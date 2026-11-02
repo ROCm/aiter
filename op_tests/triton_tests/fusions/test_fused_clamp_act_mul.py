@@ -414,11 +414,11 @@ def test_fused_clamp_act_mul_activations(M, D, activation, dtype_quant, backend)
 @pytest.mark.parametrize(
     "M, n_half",
     [
-        # N=4096 config: M_LEQ_16384 → BLOCK_SIZE_M=2, ROWS_PER_PROG=2
+        # N=4096 config: any → BLOCK_SIZE_M=1, ROWS_PER_PROG=1
         (16384, 4096),
-        # N=8192 config: M_LEQ_8192 → BLOCK_SIZE_M=4, ROWS_PER_PROG=3
+        # N=8192 config: any → BLOCK_SIZE_M=4, ROWS_PER_PROG=3
         (8192, 8192),
-        # N=8192 config: M_LEQ_16384 → BLOCK_SIZE_M=2, ROWS_PER_PROG=1
+        # N=8192 config: any → BLOCK_SIZE_M=4, ROWS_PER_PROG=3
         (16384, 8192),
     ],
 )

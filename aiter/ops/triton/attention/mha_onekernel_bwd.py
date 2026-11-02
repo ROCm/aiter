@@ -237,6 +237,7 @@ def flash_attn_onekernel_backward(
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8,
+        enable_fp_fusion=True,
     )
 
     # dropout_mask
@@ -323,6 +324,7 @@ def flash_attn_onekernel_backward(
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
             **config_onekernel,
+            enable_fp_fusion=True,
         )
     else:
         bwd_kernel_noncausal[grid](
@@ -380,6 +382,7 @@ def flash_attn_onekernel_backward(
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
             **config_onekernel,
+            enable_fp_fusion=True,
         )
 
     return delta

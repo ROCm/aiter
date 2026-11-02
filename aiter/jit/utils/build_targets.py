@@ -5,6 +5,7 @@
 # No torch dependency — safe to import in build scripts, gen_instances, and tests
 # that run without a GPU or a full PyTorch install.
 import os
+import re
 
 GFX_MAP = {
     0: "native",
@@ -39,8 +40,31 @@ GFX_MAP = {
 GFX_CU_NUM_MAP = {
     "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
     "gfx950": 256,  # MI350
+    "gfx1100": 96,  # Radeon RX 7900 XTX
+    "gfx1101": 60,  # Radeon RX 7800 XT
+    "gfx1102": 32,  # Radeon RX 7600
+    "gfx1103": 12,  # Radeon 780M
+    "gfx1150": 16,  # Radeon 890M; set CU_NUM=12 for Radeon 880M
+    "gfx1151": 40,  # Strix Halo / Radeon 8060S
+    "gfx1200": 32,  # Radeon RX 9060 XT; set CU_NUM=28 for Radeon RX 9060
+    "gfx1201": 64,  # Radeon RX 9070 XT / Radeon AI PRO R9700
     "gfx1250": 256,  # Gfx1250
 }
+
+
+def torch_processor_count_to_cu(gfx: str, processor_count: int) -> int:
+    """Return physical CUs from HIP's mode-dependent processor count."""
+    gfx = gfx.split(":", 1)[0].lower()
+    rdna = gfx.startswith("gfx11") or gfx in ("gfx1200", "gfx1201")
+    if rdna:
+        wgp_mode = os.getenv("GPU_ENABLE_WGP_MODE", "1")
+        numeric_mode = re.match(r"\s*([+-]?[0-9]+)", wgp_mode)
+        wgp_enabled = wgp_mode == "true" or (
+            numeric_mode is not None and int(numeric_mode.group(1)) != 0
+        )
+        if wgp_enabled:
+            return processor_count * 2
+    return processor_count
 
 
 def _parse_gpu_archs_env(gfx_env: str) -> list[str]:

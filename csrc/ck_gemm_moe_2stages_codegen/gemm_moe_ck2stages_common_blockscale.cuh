@@ -52,8 +52,22 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     ck::index_t StrideB = K;
     ck::index_t SplitK  = splitk.has_value() ? splitk.value() : 1;
 
+    // CK reads KBatch (tiles per split) == 1 as "no split" and skips zeroing, so keep it >= 2.
     ck::index_t KBatch = SplitK > 1 ? K / (SplitK * KPerBlock) : 1;
-    if(KBatch > 1)
+    if(SplitK > 1 && KBatch < 2)
+    {
+        const ck::index_t KTiles = K / KPerBlock;
+        TORCH_CHECK(KTiles >= 2,
+                    "K(",
+                    K,
+                    ") must span at least two KPerBlock(",
+                    KPerBlock,
+                    ") tiles for split-K.\n");
+        KBatch = 2;
+        while(KTiles % KBatch != 0)
+            ++KBatch;
+    }
+    else if(KBatch > 1)
     {
         TORCH_CHECK((KBatch * KPerBlock * SplitK == K),
                     "K(",

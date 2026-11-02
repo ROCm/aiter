@@ -197,13 +197,14 @@ def test_fused_without_quant(
     os.environ["MASTER_PORT"] = "49374"
     ensure_spawn_method()
 
-    # Create input data
+    # Create input data on the CPU. The pool sends it to the workers, and each
+    # worker moves it to its own GPU.
     torch.manual_seed(42)
-    gamma = torch.ones(N, dtype=dtype)
+    gamma = torch.ones(N, dtype=dtype, device="cpu")
     inputs = []
     for i in range(tp_size):
         torch.manual_seed(42 + i)
-        x = torch.randn(M, N, dtype=dtype) * (i + 1)
+        x = torch.randn(M, N, dtype=dtype, device="cpu") * (i + 1)
         inputs.append(x)
 
     # Compute reference
@@ -291,13 +292,14 @@ def test_fused_with_fp8_quant(tp_size, M, N, dtype, heap_size=1 << 30):
     os.environ["MASTER_PORT"] = "49375"
     ensure_spawn_method()
 
-    # Create input data
+    # Create input data on the CPU. The pool sends it to the workers, and each
+    # worker moves it to its own GPU.
     torch.manual_seed(42)
-    gamma = torch.ones(N, dtype=dtype)
+    gamma = torch.ones(N, dtype=dtype, device="cpu")
     inputs = []
     for i in range(tp_size):
         torch.manual_seed(42 + i)
-        x = torch.randn(M, N, dtype=dtype) * (i + 1)
+        x = torch.randn(M, N, dtype=dtype, device="cpu") * (i + 1)
         inputs.append(x)
 
     # Run fused kernel on each GPU

@@ -24,7 +24,8 @@ static void opus_bmm_a8w8_common_checks(aiter_tensor_t &O, aiter_tensor_t &wo_a,
                                         aiter_tensor_t &Y,
                                         aiter_tensor_t &x_scale,
                                         aiter_tensor_t &w_scale,
-                                        const char *who)
+                                        const char *who,
+                                        int group_n, int group_k)
 {
   aiter_detail::g_aiter_can_throw = true;
   AITER_CHECK(O.dim() == 3 && wo_a.dim() == 3 && Y.dim() == 3 &&
@@ -46,19 +47,27 @@ static void opus_bmm_a8w8_common_checks(aiter_tensor_t &O, aiter_tensor_t &wo_a,
   const int N = wo_a.size(1);
   AITER_CHECK(M > 0 && batch > 0 && N > 0 && K > 0,
               who, ": M, batch, N and K must be positive");
-  AITER_CHECK(K % 128 == 0 && N % 128 == 0,
-              who, ": N and K must be multiples of 128; got N=", N,
-              ", K=", K);
+  // Against this kid's own scale blocks, not a constant 128: a GROUP_K=32 kid
+  // wants four times as many scales per row, and the two must not be allowed to
+  // disagree. A mismatch is not a shape error downstream -- the bytes are the
+  // same dtype and the buffer is merely read with the wrong stride -- so it
+  // would return a plausible wrong answer rather than fail.
+  AITER_CHECK(group_n > 0 && group_k > 0,
+              who, ": kid reported no scale block size");
+  AITER_CHECK(K % group_k == 0 && N % group_n == 0,
+              who, ": N must be a multiple of ", group_n, " and K of ", group_k,
+              "; got N=", N, ", K=", K);
   AITER_CHECK(wo_a.size(0) == batch && wo_a.size(2) == K,
               who, ": wo_a must have shape [batch,N,K]");
   AITER_CHECK(Y.size(0) == M && Y.size(1) == batch && Y.size(2) == N,
               who, ": Y must have shape [M,batch,N]");
   AITER_CHECK(x_scale.size(0) == M && x_scale.size(1) == batch &&
-                  x_scale.size(2) == K / 128,
-              who, ": x_scale must have shape [M,batch,K/128]");
-  AITER_CHECK(w_scale.size(0) == batch && w_scale.size(1) == N / 128 &&
-                  w_scale.size(2) == K / 128,
-              who, ": w_scale must have shape [batch,N/128,K/128]");
+                  x_scale.size(2) == K / group_k,
+              who, ": x_scale must have shape [M,batch,K/", group_k, "]");
+  AITER_CHECK(w_scale.size(0) == batch && w_scale.size(1) == N / group_n &&
+                  w_scale.size(2) == K / group_k,
+              who, ": w_scale must have shape [batch,N/", group_n, ",K/",
+              group_k, "]");
 
   AITER_CHECK(O.device_id == wo_a.device_id && O.device_id == Y.device_id &&
                   O.device_id == x_scale.device_id &&

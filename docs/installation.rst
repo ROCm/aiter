@@ -81,9 +81,19 @@ Environment Variables
    * - ``PREBUILD_KERNELS``
      - ``0`` = JIT only, ``1`` = core kernels, ``2`` = inference kernels, ``3`` = MHA only
      - ``0``
-   * - ``MAX_JOBS``
-     - Max parallel compilation threads
-     - Auto-calculated
+   * - ``AITER_MAX_JOBS``
+     - Optional worker ceiling, bounded by live CPU/memory limits for
+       compilation or the device allowance for GPU-executing pools.
+     - Automatic
+   * - ``AITER_GPU_WORKERS_PER_DEVICE``
+     - Concurrent GPU-executing workers per visible device in the PA-Gluon
+       prebuild, further capped by ``AITER_MAX_JOBS`` and submitted work.
+       CPU-only compilation ignores this knob.
+     - ``8``
+
+For sizing, legacy ``MAX_JOBS`` compatibility, nested builds, and GPU assignment,
+see `Build parallelism <https://github.com/ROCm/aiter#build-parallelism>`_
+in the repository README.
 
 Example Configurations
 """"""""""""""""""""""

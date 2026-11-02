@@ -1,0 +1,42 @@
+{
+    "any": {
+        "BLOCK_K": 256,
+        "num_stages": 1,
+        "num_warps": 8,
+        "waves_per_eu": 0
+    },
+    "M_LEQ_16384": {
+        "BLOCK_K": 256,
+        "num_stages": 1,
+        "num_warps": 8,
+        "waves_per_eu": 2
+    },
+    "M_LEQ_2048": {
+        "BLOCK_K": 256,
+        "num_stages": 1,
+        "num_warps": 8
+    },
+    "M_LEQ_1024": {
+        "BLOCK_K": 256,
+        "num_stages": 1,
+        "num_warps": 8,
+        "waves_per_eu": 0
+    },
+    "shapes": {
+        "N=1,C=192,D=6,H=178,W=198,K=192,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_K": 256,
+            "num_stages": 1,
+            "num_warps": 8
+        },
+        "N=1,C=384,D=4,H=90,W=100,K=384,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_K": 256,
+            "num_stages": 1,
+            "num_warps": 8
+        },
+        "N=1,C=1024,D=18,H=17,W=30,K=1024,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_K": 256,
+            "num_stages": 1,
+            "num_warps": 8
+        }
+    }
+}

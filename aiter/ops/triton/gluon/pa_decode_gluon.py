@@ -20,37 +20,6 @@ except Exception:  # noqa: BLE001
     CXX_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
 
-FLYDSL_PS_REDUCE_AVAILABLE = True
-try:
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx
-    from flydsl._mlir import ir
-    from flydsl._mlir.dialects import arith as _mlir_arith
-    from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import arith, gpu, range_constexpr, rocdl
-    from flydsl.expr.typing import Int32, T
-    from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-
-    from aiter.ops.flydsl.kernels import buffer_ops
-except Exception:  # noqa: BLE001
-    FLYDSL_PS_REDUCE_AVAILABLE = False
-    flyc = None
-    fx = None
-    arith = None
-    gpu = None
-    rocdl = None
-    buffer_ops = None
-    range_constexpr = None
-    T = None
-    Int32 = None
-    SmemAllocator = None
-    SmemPtr = None
-    get_hip_arch = None
-    ir = None
-    CompilationContext = None
-    _mlir_arith = None
-
 GLUON_JIT_KERNEL_ENABLED = True
 try:
     from triton.experimental import gluon
@@ -89,6 +58,13 @@ except ImportError:
 
 
 @gluon.jit
+def _load_kv(ptrs, mask, MASKED: gl.constexpr, cache_modifier: gl.constexpr = ""):
+    if MASKED:
+        return gl.load(ptrs, mask=mask, other=0.0, cache_modifier=cache_modifier)
+    return gl.load(ptrs, cache_modifier=cache_modifier)
+
+
+@gluon.jit
 def _fused_max_combine(a1, a2, b1, b2):
     return tl.maximum(a1, b1), tl.maximum(a2, b2)
 
@@ -104,18 +80,39 @@ def get_cdna_version():
         return -1
 
 
+def pa_decode_gluon_supports_arch() -> bool:
+    """Whether the Gluon paged-decode backend supports the current GPU."""
+    return get_cdna_version() in (3, 4)
+
+
 def get_occupancy():
     return 2
 
 
-def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
+def get_recommended_splits(
+    num_sequences,
+    num_kv_heads,
+    split_kv_blocks=1,
+    *,
+    query_length=1,
+    max_context_length=None,
+):
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count * get_occupancy()
-    max_context_partition_num = triton.cdiv(
-        num_sm, num_sequences * num_kv_heads * split_kv_blocks
-    )
-    max_context_partition_num *= split_kv_blocks
-    return min(max_context_partition_num, 8)
+    programs = num_sequences * num_kv_heads * split_kv_blocks
+    max_context_partition_num = triton.cdiv(num_sm, programs) * split_kv_blocks
+    legacy = min(max_context_partition_num, 8)
+    # Small grids leave CUs idle; ps=True with query_length > 1 is inexact when split.
+    if (
+        max_context_length is None
+        or query_length != 1
+        or split_kv_blocks != 1
+        or programs * 32 > num_sm
+    ):
+        return legacy
+    context_tiles = triton.cdiv(max_context_length, 256)
+    # The C++ ps reduce is wrong above 32 partitions (cross-half ds_swizzle).
+    return max(legacy, min(max_context_partition_num, context_tiles, 32))
 
 
 DS_WRITE = gl.constexpr(0x200)
@@ -305,6 +302,8 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     IS_CAUSAL: gl.constexpr,
     CDNA_VERSION: gl.constexpr,
+    KEY_HEAD_PADDED: gl.constexpr = False,
+    VALUE_HEAD_PADDED: gl.constexpr = False,
     SLIDING_WINDOW: gl.constexpr = 0,
 ):
     """
@@ -791,8 +790,17 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             + contiguous_kv_elements_offsets[None, None, :]
         )
 
-        # Load key cache block
-        key_block = gl.load(key_cache_ptr + key_block_offsets)
+        # HEAD_SIZE_POW2 pads non-power-of-two heads (for example 192 -> 256)
+        # for the MFMA layouts.  Do not let that logical padding turn into an
+        # out-of-bounds cache read from the physically unpadded head dimension.
+        key_head_mask = (
+            head_size_split_offsets[:, None, None] * CONTIGUOUS_KV_ELEMENTS_16B_LOAD
+            + contiguous_kv_elements_offsets[None, None, :]
+            < head_size
+        )
+        key_block = _load_kv(
+            key_cache_ptr + key_block_offsets, key_head_mask, KEY_HEAD_PADDED
+        )
         # Reshape key block to [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
         key_block = gl.permute(key_block, [0, 2, 1])
         key_block = gl.reshape(key_block, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
@@ -827,8 +835,12 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 + value_dim1_offsets[None, :, None] * CONTIGUOUS_KV_ELEMENTS_16B_LOAD
                 + value_dim2_offsets[None, None, :]
             )
-            # Load transposed value block
-            value_block = gl.load(value_cache_ptr + value_block_offsets)
+            value_head_mask = value_dim1_offsets[None, :, None] < head_size
+            value_block = _load_kv(
+                value_cache_ptr + value_block_offsets,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
+            )
             # Reshape to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             value_block = gl.permute(value_block, [0, 2, 1])
             value_block = gl.reshape(
@@ -842,8 +854,12 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 + value_dim0_offsets[:, None] * stride_value_head_size
                 + (current_page_offset + value_dim1_offsets)[None, :]
             )
-            # Load standard value block
-            value_block = gl.load(value_cache_ptr + value_block_offsets)
+            value_head_mask = value_dim0_offsets[:, None] < head_size
+            value_block = _load_kv(
+                value_cache_ptr + value_block_offsets,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
+            )
             # Transpose to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             value_block = gl.permute(value_block, [1, 0])
         # Perform matrix multiplication
@@ -1027,10 +1043,10 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 def paged_attention_decode_sliding_window_head_1(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
-    output_ptr,  # [batch_size, query_length, num_kv_heads, query_group_size, head_size]
+    output_ptr,  # [batch_size, query_length, num_kv_heads, query_group_size, value_head_size]
     query_ptr,  # [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
+    value_cache_ptr,  # [num_blocks, num_kv_heads, value_head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     context_lengths_ptr,  # [num_seqs]
     softmax_scale: float,
@@ -1041,7 +1057,7 @@ def paged_attention_decode_sliding_window_head_1(
     stride_max_logits_seq: int,
     stride_max_logits_head: int,
     stride_max_logits_part: int,
-    # 5D output strides for [batch_size, query_length, num_kv_heads, query_group_size, head_size]
+    # 5D output strides for [batch_size, query_length, num_kv_heads, query_group_size, value_head_size]
     stride_output_bs: int,
     stride_output_len: int,
     stride_output_kv_head: int,
@@ -1071,6 +1087,9 @@ def paged_attention_decode_sliding_window_head_1(
     QUERY_SEQ_LEN_POW2: gl.constexpr,
     ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr,
     HEAD_SIZE_POW2: gl.constexpr,
+    KEY_HEAD_SIZE: gl.constexpr,
+    VALUE_HEAD_SIZE_POW2: gl.constexpr,
+    VALUE_HEAD_SIZE: gl.constexpr,
     KV_BLOCK_SIZE: gl.constexpr,
     CONTEXT_PARTITION_SIZE: gl.constexpr,
     QUERY_QUANT_MODE: gl.constexpr,
@@ -1081,6 +1100,8 @@ def paged_attention_decode_sliding_window_head_1(
     SLIDING_WINDOW: gl.constexpr = 0,
     CDNA_VERSION: gl.constexpr = 3,
     ONE_SHOT: gl.constexpr = False,
+    KEY_HEAD_PADDED: gl.constexpr = False,
+    VALUE_HEAD_PADDED: gl.constexpr = False,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -1111,6 +1132,13 @@ def paged_attention_decode_sliding_window_head_1(
     """
     # ==================== VALIDATION CHECKS ====================
     # Data type validation
+    # Share the existing Q/K bound for symmetric unpadded heads. The physical
+    # V width is otherwise a compile-time value, like its padded layout width.
+    if not KEY_HEAD_PADDED and VALUE_HEAD_SIZE == HEAD_SIZE_POW2:
+        value_head_size = head_size
+    else:
+        value_head_size = VALUE_HEAD_SIZE
+
     gl.static_assert(
         query_ptr.dtype.is_fp8()
         or query_ptr.dtype.element_ty == gl.bfloat16
@@ -1270,7 +1298,7 @@ def paged_attention_decode_sliding_window_head_1(
         )
         value_dim2_offsets = gl.arange(
             0,
-            HEAD_SIZE_POW2,
+            VALUE_HEAD_SIZE_POW2,
             layout=gl.SliceLayout(
                 0, gl.SliceLayout(1, gl.SliceLayout(3, blocked_value_layout))
             ),
@@ -1296,7 +1324,7 @@ def paged_attention_decode_sliding_window_head_1(
 
         value_dim1_offsets = gl.arange(
             0,
-            HEAD_SIZE_POW2,
+            VALUE_HEAD_SIZE_POW2,
             layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_value_layout)),
         )
         value_dim2_offsets = gl.arange(
@@ -1324,6 +1352,7 @@ def paged_attention_decode_sliding_window_head_1(
     if QUERY_SEQ_LEN_POW2 == 1:
         query_group_size_layout: gl.constexpr = gl.SliceLayout(1, blocked_query_layout)
         head_size_layout: gl.constexpr = gl.SliceLayout(0, blocked_query_layout)
+        value_head_size_layout: gl.constexpr = gl.SliceLayout(0, blocked_query_layout)
     else:
         mtp_query_len_layout: gl.constexpr = gl.SliceLayout(
             1, gl.SliceLayout(2, mtp_blocked_query_layout)
@@ -1332,6 +1361,9 @@ def paged_attention_decode_sliding_window_head_1(
             0, gl.SliceLayout(2, mtp_blocked_query_layout)
         )
         mtp_head_size_layout: gl.constexpr = gl.SliceLayout(
+            0, gl.SliceLayout(1, mtp_blocked_query_layout)
+        )
+        mtp_value_head_size_layout: gl.constexpr = gl.SliceLayout(
             0, gl.SliceLayout(1, mtp_blocked_query_layout)
         )
 
@@ -1355,6 +1387,9 @@ def paged_attention_decode_sliding_window_head_1(
             0, ONE_QUERY_GROUP_SIZE_POW2, layout=query_group_size_layout
         )
         head_size_offsets = gl.arange(0, HEAD_SIZE_POW2, layout=head_size_layout)
+        value_head_size_offsets = gl.arange(
+            0, VALUE_HEAD_SIZE_POW2, layout=value_head_size_layout
+        )
     else:
         mtp_query_len_offsets = gl.arange(
             0, QUERY_SEQ_LEN_POW2, layout=mtp_query_len_layout
@@ -1364,6 +1399,9 @@ def paged_attention_decode_sliding_window_head_1(
         )
         mtp_head_size_offsets = gl.arange(
             0, HEAD_SIZE_POW2, layout=mtp_head_size_layout
+        )
+        mtp_value_head_size_offsets = gl.arange(
+            0, VALUE_HEAD_SIZE_POW2, layout=mtp_value_head_size_layout
         )
 
     head_size_split_offsets = gl.arange(
@@ -1397,8 +1435,8 @@ def paged_attention_decode_sliding_window_head_1(
         output_group_offsets = (
             mtp_idx * QUERY_SEQ_LEN_POW2 + output_query_len_idx
         ) * query_group_size + output_group_idx_in_len
-    output_head_size_offsets = gl.arange(
-        0, HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
+    output_value_head_size_offsets = gl.arange(
+        0, VALUE_HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
     )
 
     # ==================== PROGRAM ID AND INITIALIZATION ====================
@@ -1416,7 +1454,9 @@ def paged_attention_decode_sliding_window_head_1(
         layout=gl.SliceLayout(1, qk_linear_layout),
     )
     attention_accumulator = gl.zeros(
-        (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
+        (QUERY_GROUP_SIZE_POW2, VALUE_HEAD_SIZE_POW2),
+        dtype=gl.float32,
+        layout=pv_mfma_layout,
     )
     if QUERY_SEQ_LEN_POW2 == 1:
         query_offsets = (
@@ -1532,7 +1572,7 @@ def paged_attention_decode_sliding_window_head_1(
                 sequence_idx * stride_output_bs
                 + mtp_idx * stride_output_len
                 + query_group_size_offsets[:, None] * stride_output_group_size
-                + head_size_offsets[None, :]
+                + value_head_size_offsets[None, :]
             )
         else:
             output_offsets = (
@@ -1540,14 +1580,14 @@ def paged_attention_decode_sliding_window_head_1(
                 + (mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None])
                 * stride_output_len
                 + mtp_query_group_size_offsets[None, :, None] * stride_output_group_size
-                + mtp_head_size_offsets[None, None, :]
+                + mtp_value_head_size_offsets[None, None, :]
             )
     else:
         output_offsets = sequence_idx * stride_output_bs
         output_offsets += (
             split_idx * stride_output_kv_head
             + output_group_offsets[:, None] * stride_output_group_size
-            + output_head_size_offsets[None, :]
+            + output_value_head_size_offsets[None, :]
         )
 
         max_logits_offsets = (
@@ -1563,12 +1603,21 @@ def paged_attention_decode_sliding_window_head_1(
     )
     if ONE_SHOT:
         if QUERY_SEQ_LEN_POW2 == 1:
-            output_mask = query_mask
+            output_mask = (query_group_size_offsets[:, None] < query_group_size) & (
+                value_head_size_offsets[None, :] < value_head_size
+            )
         else:
-            output_mask = mtp_query_mask
+            output_mask = (
+                (
+                    mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None]
+                    < query_seq_len
+                )
+                & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
+                & (mtp_value_head_size_offsets[None, None, :] < value_head_size)
+            )
     else:
         output_mask = pv_row_mask[:, None] & (
-            output_head_size_offsets[None, :] < head_size
+            output_value_head_size_offsets[None, :] < value_head_size
         )
 
     if (sequence_start_idx >= context_length) | (
@@ -1698,7 +1747,14 @@ def paged_attention_decode_sliding_window_head_1(
             + contiguous_kv_element_offsets[None, None, None, :]
         )
 
-    key_tensor = gl.load(key_cache_ptr + key_block_offsets)
+    key_head_mask = (
+        head_size_split_offsets[None, :, None, None] * KV_16B_ELEMENT_COUNT
+        + contiguous_kv_element_offsets[None, None, None, :]
+        < KEY_HEAD_SIZE
+    )
+    key_tensor = _load_kv(
+        key_cache_ptr + key_block_offsets, key_head_mask, KEY_HEAD_PADDED
+    )
     query_converted = query_shared.load(qk_lhs_operand_layout)
     for sequence_partition_idx in range(
         sequence_partition_start_idx,
@@ -1782,7 +1838,12 @@ def paged_attention_decode_sliding_window_head_1(
                     + value_dim2_offsets[None, None, :, None] * KV_16B_ELEMENT_COUNT
                     + value_dim3_offsets[None, None, None, :]
                 )
-            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+            value_head_mask = value_dim2_offsets[None, None, :, None] < value_head_size
+            value_tensor = _load_kv(
+                value_cache_ptr + value_block_offsets,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
+            )
 
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
@@ -1807,12 +1868,17 @@ def paged_attention_decode_sliding_window_head_1(
                 )
 
             # Schedule: Start value VMEM load, then QK MFMA
-            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+            value_head_mask = value_dim1_offsets[None, :, None] < value_head_size
+            value_tensor = _load_kv(
+                value_cache_ptr + value_block_offsets,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
+            )
 
             # Permute and resape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
         value_tensor = gl.reshape(
-            value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
+            value_tensor, [CONTEXT_PARTITION_SIZE, VALUE_HEAD_SIZE_POW2]
         )
         # Compute QK attention scores using MFMA (overlaps with value load)
         attention_scores = gl.amd.cdna3.mfma(
@@ -1863,19 +1929,23 @@ def paged_attention_decode_sliding_window_head_1(
         if QUERY_SEQ_LEN_POW2 == 1:
             if IS_CAUSAL:
                 sequence_position_extension = query_seq_len - 1 - mtp_idx
-                causal_mask = (
-                    sequence_position_extension + qk_column_offsets[None, :]
-                    < sequence_end_idx
-                )
                 if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
+                    causal_mask = (
+                        sequence_position_extension + qk_column_offsets[None, :]
+                        < sequence_end_idx
+                    ) & (
                         sequence_position_extension + qk_column_offsets[None, :]
                         >= sequence_start_idx + query_seq_len
                     )
                 else:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension + qk_column_offsets[None, :]
-                        >= sequence_start_idx
+                    # Keep this split's own keys; the causal cut is global.
+                    causal_mask = (
+                        (qk_column_offsets[None, :] >= sequence_start_idx)
+                        & (qk_column_offsets[None, :] < sequence_end_idx)
+                        & (
+                            sequence_position_extension + qk_column_offsets[None, :]
+                            < context_length
+                        )
                     )
             else:
                 causal_mask = qk_column_offsets[None, :] < sequence_end_idx
@@ -1891,21 +1961,25 @@ def paged_attention_decode_sliding_window_head_1(
 
             if IS_CAUSAL:
                 sequence_position_extension = query_seq_len - 1 - query_token_idx
-                causal_mask = (
-                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                    < sequence_end_idx
-                )
                 if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
+                    causal_mask = (
+                        sequence_position_extension[:, None]
+                        + qk_column_offsets[None, :]
+                        < sequence_end_idx
+                    ) & (
                         sequence_position_extension[:, None]
                         + qk_column_offsets[None, :]
                         >= sequence_start_idx + query_seq_len
                     )
                 else:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension[:, None]
-                        + qk_column_offsets[None, :]
-                        >= sequence_start_idx
+                    causal_mask = (
+                        (qk_column_offsets[None, :] >= sequence_start_idx)
+                        & (qk_column_offsets[None, :] < sequence_end_idx)
+                        & (
+                            sequence_position_extension[:, None]
+                            + qk_column_offsets[None, :]
+                            < context_length
+                        )
                     )
             else:
                 causal_mask = qk_column_offsets[None, :] < sequence_end_idx
@@ -2039,13 +2113,15 @@ def paged_attention_decode_sliding_window_head_1(
         attention_accumulator *= accumulator_scale_expanded
 
         pv_accumulator = gl.zeros(
-            (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2),
+            (QUERY_GROUP_SIZE_POW2, VALUE_HEAD_SIZE_POW2),
             dtype=gl.float32,
             layout=pv_mfma_layout,
         )
         probs_converted = probs_shared.load(pv_lhs_operand_layout)
         key_block_offsets2 = _amd_iglp_sched_barrier(key_block_offsets2, 0x0)
-        key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2)
+        key_tensor2 = _load_kv(
+            key_cache_ptr + key_block_offsets2, key_head_mask, KEY_HEAD_PADDED
+        )
 
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
@@ -2080,13 +2156,9 @@ def paged_attention_decode_sliding_window_head_1(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if (
-            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
-            < sequence_partition_end_idx
-        ):
-            kv_block_numbers = kv_block_numbers2
-            key_tensor = key_tensor2
-            kv_block_start_idx = kv_block_start_idx2
+        kv_block_numbers = kv_block_numbers2
+        key_tensor = key_tensor2
+        kv_block_start_idx = kv_block_start_idx2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
@@ -2123,7 +2195,7 @@ def paged_attention_decode_sliding_window_head_1(
         if QUERY_SEQ_LEN_POW2 == 1:
             attention_accumulator = gl.reshape(
                 attention_accumulator,
-                [ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2],
+                [ONE_QUERY_GROUP_SIZE_POW2, VALUE_HEAD_SIZE_POW2],
             )
             attention_accumulator = gl.convert_layout(
                 attention_accumulator, layout=blocked_query_layout
@@ -2131,7 +2203,11 @@ def paged_attention_decode_sliding_window_head_1(
         else:
             attention_accumulator = gl.reshape(
                 attention_accumulator,
-                [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2],
+                [
+                    QUERY_SEQ_LEN_POW2,
+                    ONE_QUERY_GROUP_SIZE_POW2,
+                    VALUE_HEAD_SIZE_POW2,
+                ],
             )
             attention_accumulator = gl.convert_layout(
                 attention_accumulator, layout=mtp_blocked_query_layout
@@ -2223,6 +2299,8 @@ def paged_attention_decode_sliding_window(
     SLIDING_WINDOW: gl.constexpr = 0,
     CDNA_VERSION: gl.constexpr = 3,
     ONE_SHOT: gl.constexpr = False,
+    KEY_HEAD_PADDED: gl.constexpr = False,
+    VALUE_HEAD_PADDED: gl.constexpr = False,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -2268,7 +2346,6 @@ def paged_attention_decode_sliding_window(
         or value_cache_ptr.dtype.element_ty == gl.bfloat16
         or value_cache_ptr.dtype.element_ty == gl.float16
     )
-
     if QUERY_QUANT_MODE >= 0:
         gl.static_assert(query_scale.dtype.element_ty == gl.float32)
     if KV_QUANT_MODE >= 0:
@@ -2744,7 +2821,17 @@ def paged_attention_decode_sliding_window(
         * stride_key_block_elem
         + contiguous_kv_element_offsets[None, None, None, :]
     )
-    key_tensor = gl.load(key_cache_ptr + key_block_offsets, cache_modifier=".cg")
+    key_head_mask = (
+        head_size_split_offsets[None, :, None, None] * KV_16B_ELEMENT_COUNT
+        + contiguous_kv_element_offsets[None, None, None, :]
+        < head_size
+    )
+    key_tensor = _load_kv(
+        key_cache_ptr + key_block_offsets,
+        key_head_mask,
+        KEY_HEAD_PADDED,
+        cache_modifier=".cg",
+    )
     query_converted = query_shared.load(qk_lhs_operand_layout)
     for sequence_partition_idx in range(
         sequence_partition_start_idx,
@@ -2871,14 +2958,21 @@ def paged_attention_decode_sliding_window(
                 )
                 value_in_window_mask = value_token_global >= sequence_start_idx
 
-                value_tensor = gl.load(
+                value_head_mask = value_dim2_offsets[None, None, :, None] < head_size
+                value_tensor = _load_kv(
                     value_cache_ptr + value_block_offsets,
+                    value_head_mask,
+                    VALUE_HEAD_PADDED,
                     cache_modifier=".cg",
                 )
                 value_tensor = gl.where(value_in_window_mask, value_tensor, 0.0)
             else:
-                value_tensor = gl.load(
-                    value_cache_ptr + value_block_offsets, cache_modifier=".cg"
+                value_head_mask = value_dim2_offsets[None, None, :, None] < head_size
+                value_tensor = _load_kv(
+                    value_cache_ptr + value_block_offsets,
+                    value_head_mask,
+                    VALUE_HEAD_PADDED,
+                    cache_modifier=".cg",
                 )
 
             # Permute and reshape for matrix multiplication
@@ -2903,16 +2997,23 @@ def paged_attention_decode_sliding_window(
                     kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + value_dim2_offsets
                 )
                 value_in_window_mask = value_token_global >= sequence_start_idx
-                value_tensor = gl.load(
+                value_head_mask = value_dim1_offsets[None, :, None] < head_size
+                value_tensor = _load_kv(
                     value_cache_ptr + value_block_offsets,
+                    value_head_mask,
+                    VALUE_HEAD_PADDED,
                     cache_modifier=".cg",
                 )
                 value_tensor = gl.where(
                     value_in_window_mask[None, None, :], value_tensor, 0.0
                 )
             else:
-                value_tensor = gl.load(
-                    value_cache_ptr + value_block_offsets, cache_modifier=".cg"
+                value_head_mask = value_dim1_offsets[None, :, None] < head_size
+                value_tensor = _load_kv(
+                    value_cache_ptr + value_block_offsets,
+                    value_head_mask,
+                    VALUE_HEAD_PADDED,
+                    cache_modifier=".cg",
                 )
 
             # Permute and resape for matrix multiplication
@@ -2952,19 +3053,24 @@ def paged_attention_decode_sliding_window(
         if IS_CAUSAL:
             # Compute causal mask based on sequence positions
             sequence_position_extension = query_seq_len - 1 - query_token_idx
-            causal_mask = (
-                sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                < sequence_end_idx
-            )
             if SLIDING_WINDOW > 0:
-                causal_mask = causal_mask & (
+                causal_mask = (
+                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
+                    < sequence_end_idx
+                ) & (
                     sequence_position_extension[:, None] + qk_column_offsets[None, :]
                     >= sequence_start_idx + query_seq_len
                 )
             else:
-                causal_mask = causal_mask & (
-                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                    >= sequence_start_idx
+                # Keep this split's own keys; the causal cut is global.
+                causal_mask = (
+                    (qk_column_offsets[None, :] >= sequence_start_idx)
+                    & (qk_column_offsets[None, :] < sequence_end_idx)
+                    & (
+                        sequence_position_extension[:, None]
+                        + qk_column_offsets[None, :]
+                        < context_length
+                    )
                 )
         else:
             causal_mask = qk_column_offsets[None, :] < sequence_end_idx
@@ -3047,15 +3153,21 @@ def paged_attention_decode_sliding_window(
             )
             kv_in_window_mask2 = kv_token_global2 >= sequence_start_idx
 
+            kv_mask2 = kv_in_window_mask2[None, None, :, None]
+            if KEY_HEAD_PADDED:
+                kv_mask2 = kv_mask2 & key_head_mask
             key_tensor2 = gl.load(
                 key_cache_ptr + key_block_offsets2,
-                mask=kv_in_window_mask2[None, None, :, None],
+                mask=kv_mask2,
                 other=0.0,
                 cache_modifier=".cg",
             )
         else:
-            key_tensor2 = gl.load(
-                key_cache_ptr + key_block_offsets2, cache_modifier=".cg"
+            key_tensor2 = _load_kv(
+                key_cache_ptr + key_block_offsets2,
+                key_head_mask,
+                KEY_HEAD_PADDED,
+                cache_modifier=".cg",
             )
 
         attention_output = gl.amd.cdna3.mfma(
@@ -3066,14 +3178,10 @@ def paged_attention_decode_sliding_window(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if (
-            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
-            < sequence_partition_end_idx
-        ):
-            kv_block_numbers = kv_block_numbers2
-            key_tensor = key_tensor2
-            kv_block_start_idx = kv_block_start_idx2
-            page_offset = page_offset2
+        kv_block_numbers = kv_block_numbers2
+        key_tensor = key_tensor2
+        kv_block_start_idx = kv_block_start_idx2
+        page_offset = page_offset2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
@@ -3202,6 +3310,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     IS_CAUSAL: gl.constexpr,
     CDNA_VERSION: gl.constexpr = 3,
+    KEY_HEAD_PADDED: gl.constexpr = False,
+    VALUE_HEAD_PADDED: gl.constexpr = False,
     SLIDING_WINDOW: gl.constexpr = 0,
 ):
     """
@@ -3703,7 +3813,14 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             + block_element_offsets[None, None, :, None] * KV_16B_ELEMENT_COUNT
             + contiguous_kv_element_offsets[None, None, None, :]
         )
-        key_tensor = gl.load(key_cache_ptr + key_block_offsets)
+        key_head_mask = (
+            head_size_split_offsets[None, :, None, None] * KV_16B_ELEMENT_COUNT
+            + contiguous_kv_element_offsets[None, None, None, :]
+            < head_size
+        )
+        key_tensor = _load_kv(
+            key_cache_ptr + key_block_offsets, key_head_mask, KEY_HEAD_PADDED
+        )
 
         # Load key quantization scales if needed
         if KV_QUANT_MODE >= 0:
@@ -3770,7 +3887,12 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 + value_dim2_offsets[None, None, :, None] * KV_16B_ELEMENT_COUNT
                 + value_dim3_offsets[None, None, None, :]
             )
-            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+            value_head_mask = value_dim2_offsets[None, None, :, None] < head_size
+            value_tensor = _load_kv(
+                value_cache_ptr + value_block_offsets,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
+            )
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
             value_tensor = gl.reshape(
@@ -3788,7 +3910,12 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 + value_dim1_offsets[None, :, None] * stride_value_head_size
                 + value_dim2_offsets[None, None, :]
             )
-            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+            value_head_mask = value_dim1_offsets[None, :, None] < head_size
+            value_tensor = _load_kv(
+                value_cache_ptr + value_block_offsets,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
+            )
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
             value_tensor = gl.reshape(
@@ -4045,10 +4172,10 @@ def paged_attention_decode_ps_reduce_kernel(
 
 @triton.jit
 def paged_attention_decode_v2_reduce_kernel(
-    output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
-    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+    output_ptr,  # [num_seqs, query_length, num_kv_heads, query_group_size, head_size]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size, head_size]
     context_lengths_ptr,  # [num_seqs]
     sink_token_ptr,  # [num_query_heads]
     stride_output_bs,
@@ -4070,6 +4197,7 @@ def paged_attention_decode_v2_reduce_kernel(
     HEAD_SIZE_POW2: tl.constexpr,
     CONTEXT_PARTITION_SIZE: tl.constexpr,
     USE_SINKS: tl.constexpr,
+    VALUE_HEAD_PADDED: tl.constexpr = False,
 ):
     """
     Triton reduction kernel for paged attention decode that combines partial results.
@@ -4234,12 +4362,15 @@ def paged_attention_decode_v2_reduce_kernel(
             + head_size_offsets[None, None, :]
         )
         logits_mask = (
-            partition_offsets[:, None] < context_partition_num
-        ) & query_group_mask[None, :]
+            (partition_offsets[:, None] < context_partition_num)
+            & query_group_mask[None, :]
+        )[:, :, None]
+        if VALUE_HEAD_PADDED:
+            logits_mask = logits_mask & (head_size_offsets[None, None, :] < head_size)
 
         # Load partial logits from current chunk of partitions
         partial_logits = tl.load(
-            logits_ptr + logits_offsets, mask=logits_mask[:, :, None], other=0.0
+            logits_ptr + logits_offsets, mask=logits_mask, other=0.0
         )
 
         updated_output = partial_logits * attention_probs
@@ -4319,6 +4450,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     query_seq_len,
     query_group_size,
     HEAD_SIZE,
+    VALUE_HEAD_SIZE,
     KV_BLOCK_SIZE,
     KV_16B_ELEMENT_COUNT,
     CONTEXT_PARTITION_SIZE,
@@ -4344,6 +4476,9 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     """
     num_sequences, num_kv_heads, num_splits = grid
     HEAD_SIZE_POW2 = triton.next_power_of_2(HEAD_SIZE)
+    VALUE_HEAD_SIZE_POW2 = triton.next_power_of_2(VALUE_HEAD_SIZE)
+    KEY_HEAD_PADDED = HEAD_SIZE != HEAD_SIZE_POW2
+    VALUE_HEAD_PADDED = VALUE_HEAD_SIZE != VALUE_HEAD_SIZE_POW2
     QUERY_SEQ_LEN_POW2 = triton.next_power_of_2(query_seq_len)
     ONE_QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
     KV_COMPUTE_BLOCK_SIZE = CONTEXT_PARTITION_SIZE
@@ -4355,6 +4490,12 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
+            # Only this kernel supports independent physical K/V widths.
+            head_size_kwargs = {
+                "KEY_HEAD_SIZE": HEAD_SIZE,
+                "VALUE_HEAD_SIZE": VALUE_HEAD_SIZE,
+                "VALUE_HEAD_SIZE_POW2": VALUE_HEAD_SIZE_POW2,
+            }
             if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
                 grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)
                 QUERY_SEQ_LEN_POW2 = 1
@@ -4367,6 +4508,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
+            head_size_kwargs = {}
         paged_attention_kernel[grid](
             exp_sums_ptr,
             max_logits_ptr,
@@ -4414,6 +4556,8 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             QUERY_SEQ_LEN_POW2=QUERY_SEQ_LEN_POW2,
             ONE_QUERY_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
             HEAD_SIZE_POW2=HEAD_SIZE_POW2,
+            KEY_HEAD_PADDED=KEY_HEAD_PADDED,
+            VALUE_HEAD_PADDED=VALUE_HEAD_PADDED,
             KV_BLOCK_SIZE=KV_BLOCK_SIZE,
             CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
             QUERY_QUANT_MODE=QUERY_QUANT_MODE,
@@ -4424,6 +4568,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             SLIDING_WINDOW=SLIDING_WINDOW,
             CDNA_VERSION=CDNA_VERSION,
             ONE_SHOT=ONE_SHOT,
+            **head_size_kwargs,
         )
         return
 
@@ -4481,6 +4626,8 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         QUERY_SEQ_LEN=query_seq_len,
         ONE_QUERY_GROUP_SIZE=query_group_size,
         HEAD_SIZE_POW2=HEAD_SIZE_POW2,
+        KEY_HEAD_PADDED=KEY_HEAD_PADDED,
+        VALUE_HEAD_PADDED=VALUE_HEAD_PADDED,
         KV_BLOCK_SIZE=KV_BLOCK_SIZE,
         CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
         KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
@@ -4494,564 +4641,12 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     )
 
 
-def _flydsl_dtype_str(dtype: torch.dtype) -> str:
-    if dtype == torch.float32:
-        return "f32"
-    if dtype == torch.float16:
-        return "f16"
-    if dtype == torch.bfloat16:
-        return "bf16"
-    raise ValueError(f"Unsupported FlyDSL dtype: {dtype!r}")
-
-
-@lru_cache(maxsize=256)
-def compile_pa_decode_ps_reduce_flydsl(
-    *,
-    max_context_partition_num: int,
-    query_seq_len: int,
-    query_group_size: int,
-    head_size: int,
-    output_dtype_str: str,
-    logits_dtype_str: str,
-    sink_dtype_str: str,
-    use_sinks: bool,
-):
-    if not FLYDSL_PS_REDUCE_AVAILABLE:
-        raise ImportError("FlyDSL is unavailable for pa_decode PS reduce")
-
-    FLYDSL_WARP_SIZE = 64
-    FLYDSL_LOG2E = 1.4426950408889634
-
-    block_threads = head_size
-    assert block_threads > 0, "head_size must be positive"
-    assert block_threads <= 1024, "head_size must fit in one workgroup"
-    reduce_width = (
-        1
-        if max_context_partition_num <= 1
-        else 1 << ((max_context_partition_num - 1).bit_length())
-    )
-    reduce_shuffle_offsets = [off for off in [32, 16, 8, 4, 2, 1] if off < reduce_width]
-    red_slots = max(1, (block_threads + FLYDSL_WARP_SIZE - 1) // FLYDSL_WARP_SIZE)
-    arch = get_hip_arch()
-    allocator = SmemAllocator(None, arch=arch, global_sym_name="pa_ps_sw_reduce_smem")
-    red_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = red_off + red_slots * 4
-    part_weights_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = part_weights_off + max_context_partition_num * 4
-
-    @flyc.kernel(known_block_size=(block_threads, 1, 1))
-    def pa_decode_ps_reduce_flydsl_kernel(
-        output_ptr: fx.Tensor,
-        exp_sums_ptr: fx.Tensor,
-        max_logits_ptr: fx.Tensor,
-        logits_ptr: fx.Tensor,
-        sink_token_ptr: fx.Tensor,
-        stride_output_bs: Int32,
-        stride_output_len: Int32,
-        stride_output_kv_head: Int32,
-        stride_output_group_size: Int32,
-        stride_exp_sums_seq: Int32,
-        stride_exp_sums_head: Int32,
-        stride_exp_sums_part: Int32,
-        stride_logits_seq: Int32,
-        stride_logits_head: Int32,
-        stride_logits_part: Int32,
-        stride_logits_group: Int32,
-    ):
-        tid = gpu.thread_idx.x
-        batch_idx = gpu.block_idx.x
-        kv_head_idx = gpu.block_idx.y
-        eqgs_idx = gpu.block_idx.z
-
-        smem_base = allocator.get_base()
-        red_scratch = SmemPtr(smem_base, red_off, T.f32, shape=(red_slots,))
-        red_scratch.get()
-        if max_context_partition_num > FLYDSL_WARP_SIZE:
-            part_weights_lds = SmemPtr(
-                smem_base, part_weights_off, T.f32, shape=(max_context_partition_num,)
-            )
-            part_weights_lds.get()
-
-        out_rsrc = buffer_ops.create_buffer_resource(output_ptr, max_size=True)
-        es_rsrc = buffer_ops.create_buffer_resource(exp_sums_ptr, max_size=True)
-        ml_rsrc = buffer_ops.create_buffer_resource(max_logits_ptr, max_size=True)
-        logits_rsrc = buffer_ops.create_buffer_resource(logits_ptr, max_size=True)
-        if use_sinks:
-            sink_rsrc = buffer_ops.create_buffer_resource(sink_token_ptr, max_size=True)
-
-        c_zero_f = arith.constant(0.0, type=T.f32)
-        c_one_f = arith.constant(1.0, type=T.f32)
-        c_neg_inf = arith.constant(float("-inf"), type=T.f32)
-        c_log2e = arith.constant(FLYDSL_LOG2E, type=T.f32)
-        fm_fast = arith.FastMathFlags.fast
-        c_zero_i = arith.constant(0, type=T.i32)
-        c_w = arith.constant(FLYDSL_WARP_SIZE, type=T.i32)
-        c_wave_mask = arith.constant(FLYDSL_WARP_SIZE - 1, type=T.i32)
-        c_wave_shift = arith.constant(6, type=T.i32)
-        c_red_slots = arith.constant(red_slots, type=T.i32)
-        lane = tid & c_wave_mask
-        wave = tid >> c_wave_shift
-        c_qgs = arith.constant(query_group_size, type=T.i32)
-        group_idx = eqgs_idx % c_qgs
-
-        def _wave_reduce_max_full(val):
-            red = val
-            for sh in [32, 16, 8, 4, 2, 1]:
-                red = red.maximumf(red.shuffle_xor(arith.constant(sh, type=T.i32), c_w))
-            return red
-
-        def _wave_reduce_sum_full(val):
-            red = val
-            for sh in [32, 16, 8, 4, 2, 1]:
-                red = red.addf(
-                    red.shuffle_xor(arith.constant(sh, type=T.i32), c_w),
-                    fastmath=fm_fast,
-                )
-            return red
-
-        def _block_reduce(val, mode):
-            if red_slots == 1:
-                return (
-                    _wave_reduce_max_full(val)
-                    if mode == "max"
-                    else _wave_reduce_sum_full(val)
-                )
-
-            neutral = c_neg_inf if mode == "max" else c_zero_f
-            w = (
-                _wave_reduce_max_full(val)
-                if mode == "max"
-                else _wave_reduce_sum_full(val)
-            )
-
-            if arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero_i):
-                wave_idx = arith.index_cast(T.index, wave)
-                red_scratch.store(w, [wave_idx])
-            gpu.barrier()
-
-            if arith.cmpi(arith.CmpIPredicate.eq, wave, c_zero_i):
-                in_range = arith.cmpi(arith.CmpIPredicate.slt, lane, c_red_slots)
-                lane_safe = arith.select(in_range, lane, c_zero_i)
-                lane_safe_idx = arith.index_cast(T.index, lane_safe)
-                red_val = red_scratch.load([lane_safe_idx])
-                red_val = arith.select(in_range, red_val, neutral)
-                red_val = (
-                    _wave_reduce_max_full(red_val)
-                    if mode == "max"
-                    else _wave_reduce_sum_full(red_val)
-                )
-                if arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero_i):
-                    red_scratch.store(red_val, [arith.constant(0, index=True)])
-            gpu.barrier()
-
-            return red_scratch.load([arith.constant(0, index=True)])
-
-        if max_context_partition_num <= FLYDSL_WARP_SIZE:
-            c_part_num = arith.constant(max_context_partition_num, type=T.i32)
-            c_reduce_width = arith.constant(reduce_width, type=T.i32)
-            c_four = arith.constant(4, type=T.i32)
-
-            def _wave_reduce_max(val):
-                red = val
-                for sh in reduce_shuffle_offsets:
-                    red = red.maximumf(
-                        red.shuffle_xor(arith.constant(sh, type=T.i32), c_w)
-                    )
-                return red
-
-            def _wave_reduce_sum(val):
-                red = val
-                for sh in reduce_shuffle_offsets:
-                    red = red.addf(
-                        red.shuffle_xor(arith.constant(sh, type=T.i32), c_w),
-                        fastmath=fm_fast,
-                    )
-                return red
-
-            lane_in_range = arith.cmpi(arith.CmpIPredicate.slt, lane, c_part_num)
-            lane_in_reduce = arith.cmpi(arith.CmpIPredicate.slt, lane, c_reduce_width)
-            part_sum = c_zero_f
-            part_max = c_neg_inf
-            if lane_in_reduce:
-                part_i32 = arith.select(lane_in_range, lane, c_zero_i)
-                es_off = (
-                    batch_idx * stride_exp_sums_seq
-                    + kv_head_idx * stride_exp_sums_head
-                    + part_i32 * stride_exp_sums_part
-                    + eqgs_idx
-                )
-                part_sum_raw = buffer_ops.buffer_load(
-                    es_rsrc, es_off, vec_width=1, dtype=T.f32
-                )
-                part_max_raw = buffer_ops.buffer_load(
-                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
-                )
-                part_sum = arith.select(lane_in_range, part_sum_raw, c_zero_f)
-                part_max = arith.select(lane_in_range, part_max_raw, c_neg_inf)
-
-            global_max = _wave_reduce_max(part_max)
-            safe_global_max = arith.select(
-                global_max > c_neg_inf,
-                global_max,
-                c_zero_f,
-            )
-            part_scale = arith.select(
-                part_max > c_neg_inf,
-                ((part_max - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
-                c_zero_f,
-            )
-            scaled_sum = part_sum * part_scale
-            global_exp_sum = _wave_reduce_sum(scaled_sum)
-            if use_sinks:
-                sink_off = kv_head_idx * c_qgs + group_idx
-                if sink_dtype_str == "f32":
-                    sink_value = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.f32
-                    )
-                elif sink_dtype_str == "f16":
-                    sink_value_raw = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.f16
-                    )
-                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
-                else:
-                    sink_value_raw = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.bf16
-                    )
-                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
-                sink_scale = arith.select(
-                    global_max > c_neg_inf,
-                    ((sink_value - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
-                    c_zero_f,
-                )
-                global_exp_sum = global_exp_sum + sink_scale
-            safe_global_exp_sum = arith.select(
-                global_exp_sum > c_zero_f,
-                global_exp_sum,
-                c_one_f,
-            )
-            weight_local = scaled_sum / safe_global_exp_sum
-            weight_local_i32 = arith.bitcast(T.i32, weight_local)
-
-            acc = c_zero_f
-            for part_idx in range_constexpr(max_context_partition_num):
-                part_i32 = arith.constant(part_idx, type=T.i32)
-                bcast_addr = part_i32 * c_four
-                weight_i32 = rocdl.ds_bpermute(
-                    T.i32, arith.unwrap(bcast_addr), arith.unwrap(weight_local_i32)
-                )
-                weight = arith.bitcast(T.f32, weight_i32)
-                logits_off = (
-                    batch_idx * stride_logits_seq
-                    + kv_head_idx * stride_logits_head
-                    + part_i32 * stride_logits_part
-                    + eqgs_idx * stride_logits_group
-                    + tid
-                )
-                if logits_dtype_str == "f32":
-                    part_logits = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.f32
-                    )
-                elif logits_dtype_str == "f16":
-                    part_logits_raw = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.f16
-                    )
-                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
-                else:
-                    part_logits_raw = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.bf16
-                    )
-                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
-                acc = acc + part_logits * weight
-        else:
-            global_max = c_neg_inf
-            for chunk_base in range(0, max_context_partition_num, block_threads):
-                chunk_size = min(block_threads, max_context_partition_num - chunk_base)
-                c_chunk_size = arith.constant(chunk_size, type=T.i32)
-                c_chunk_base = arith.constant(chunk_base, type=T.i32)
-                in_chunk = arith.cmpi(arith.CmpIPredicate.slt, tid, c_chunk_size)
-                part_i32 = arith.select(in_chunk, tid + c_chunk_base, c_zero_i)
-                es_off = (
-                    batch_idx * stride_exp_sums_seq
-                    + kv_head_idx * stride_exp_sums_head
-                    + part_i32 * stride_exp_sums_part
-                    + eqgs_idx
-                )
-                part_max_raw = buffer_ops.buffer_load(
-                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
-                )
-                part_max = arith.select(in_chunk, part_max_raw, c_neg_inf)
-                chunk_max = _block_reduce(part_max, "max")
-                global_max = global_max.maximumf(chunk_max)
-
-            safe_global_max = arith.select(
-                global_max > c_neg_inf,
-                global_max,
-                c_zero_f,
-            )
-            global_exp_sum = c_zero_f
-            for chunk_base in range(0, max_context_partition_num, block_threads):
-                chunk_size = min(block_threads, max_context_partition_num - chunk_base)
-                c_chunk_size = arith.constant(chunk_size, type=T.i32)
-                c_chunk_base = arith.constant(chunk_base, type=T.i32)
-                in_chunk = arith.cmpi(arith.CmpIPredicate.slt, tid, c_chunk_size)
-                part_i32 = arith.select(in_chunk, tid + c_chunk_base, c_zero_i)
-                es_off = (
-                    batch_idx * stride_exp_sums_seq
-                    + kv_head_idx * stride_exp_sums_head
-                    + part_i32 * stride_exp_sums_part
-                    + eqgs_idx
-                )
-                part_sum_raw = buffer_ops.buffer_load(
-                    es_rsrc, es_off, vec_width=1, dtype=T.f32
-                )
-                part_max_raw = buffer_ops.buffer_load(
-                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
-                )
-                part_sum = arith.select(in_chunk, part_sum_raw, c_zero_f)
-                part_max = arith.select(in_chunk, part_max_raw, c_neg_inf)
-                part_scale = arith.select(
-                    part_max > c_neg_inf,
-                    ((part_max - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
-                    c_zero_f,
-                )
-                chunk_sum = _block_reduce(part_sum * part_scale, "sum")
-                global_exp_sum = global_exp_sum + chunk_sum
-
-            if use_sinks:
-                sink_off = kv_head_idx * c_qgs + group_idx
-                if sink_dtype_str == "f32":
-                    sink_value = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.f32
-                    )
-                elif sink_dtype_str == "f16":
-                    sink_value_raw = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.f16
-                    )
-                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
-                else:
-                    sink_value_raw = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.bf16
-                    )
-                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
-                sink_scale = arith.select(
-                    global_max > c_neg_inf,
-                    ((sink_value - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
-                    c_zero_f,
-                )
-                global_exp_sum = global_exp_sum + sink_scale
-
-            safe_global_exp_sum = arith.select(
-                global_exp_sum > c_zero_f,
-                global_exp_sum,
-                c_one_f,
-            )
-
-            for chunk_base in range(0, max_context_partition_num, block_threads):
-                chunk_size = min(block_threads, max_context_partition_num - chunk_base)
-                c_chunk_size = arith.constant(chunk_size, type=T.i32)
-                c_chunk_base = arith.constant(chunk_base, type=T.i32)
-                in_chunk = arith.cmpi(arith.CmpIPredicate.slt, tid, c_chunk_size)
-                part_i32 = arith.select(in_chunk, tid + c_chunk_base, c_zero_i)
-                es_off = (
-                    batch_idx * stride_exp_sums_seq
-                    + kv_head_idx * stride_exp_sums_head
-                    + part_i32 * stride_exp_sums_part
-                    + eqgs_idx
-                )
-                part_sum_raw = buffer_ops.buffer_load(
-                    es_rsrc, es_off, vec_width=1, dtype=T.f32
-                )
-                part_max_raw = buffer_ops.buffer_load(
-                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
-                )
-                if in_chunk:
-                    part_sum = part_sum_raw
-                    part_max = part_max_raw
-                    part_scale = arith.select(
-                        part_max > c_neg_inf,
-                        ((part_max - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
-                        c_zero_f,
-                    )
-                    weight = (part_sum * part_scale) / safe_global_exp_sum
-                    part_idx_idx = arith.index_cast(T.index, part_i32)
-                    part_weights_lds.store(weight, [part_idx_idx])
-
-            gpu.barrier()
-
-            acc = c_zero_f
-            for part_idx in range_constexpr(max_context_partition_num):
-                part_i32 = arith.constant(part_idx, type=T.i32)
-                part_idx_idx = arith.constant(part_idx, index=True)
-                weight = part_weights_lds.load([part_idx_idx])
-                logits_off = (
-                    batch_idx * stride_logits_seq
-                    + kv_head_idx * stride_logits_head
-                    + part_i32 * stride_logits_part
-                    + eqgs_idx * stride_logits_group
-                    + tid
-                )
-                if logits_dtype_str == "f32":
-                    part_logits = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.f32
-                    )
-                elif logits_dtype_str == "f16":
-                    part_logits_raw = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.f16
-                    )
-                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
-                else:
-                    part_logits_raw = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.bf16
-                    )
-                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
-                acc = acc + part_logits * weight
-
-        query_idx = eqgs_idx // c_qgs
-        group_idx = eqgs_idx % c_qgs
-        out_off = (
-            batch_idx * stride_output_bs
-            + query_idx * stride_output_len
-            + kv_head_idx * stride_output_kv_head
-            + group_idx * stride_output_group_size
-            + tid
-        )
-        if output_dtype_str == "f32":
-            out_val = acc
-        elif output_dtype_str == "f16":
-            out_val = arith.trunc_f(T.f16, acc)
-        else:
-            out_val = arith.trunc_f(T.bf16, acc)
-        buffer_ops.buffer_store(out_val, out_rsrc, out_off)
-
-    @flyc.jit
-    def launch_pa_decode_ps_reduce_flydsl(
-        output,
-        exp_sums,
-        max_logits,
-        logits,
-        sink_token,
-        stride_output_bs,
-        stride_output_len,
-        stride_output_kv_head,
-        stride_output_group_size,
-        stride_exp_sums_seq,
-        stride_exp_sums_head,
-        stride_exp_sums_part,
-        stride_logits_seq,
-        stride_logits_head,
-        stride_logits_part,
-        stride_logits_group,
-        batch_size,
-        num_kv_heads,
-        stream: fx.Stream,
-    ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-        pa_decode_ps_reduce_flydsl_kernel(
-            output,
-            exp_sums,
-            max_logits,
-            logits,
-            sink_token,
-            stride_output_bs,
-            stride_output_len,
-            stride_output_kv_head,
-            stride_output_group_size,
-            stride_exp_sums_seq,
-            stride_exp_sums_head,
-            stride_exp_sums_part,
-            stride_logits_seq,
-            stride_logits_head,
-            stride_logits_part,
-            stride_logits_group,
-        ).launch(
-            grid=(batch_size, num_kv_heads, query_seq_len * query_group_size),
-            block=(block_threads, 1, 1),
-            stream=stream,
-        )
-
-    return {
-        "launch": launch_pa_decode_ps_reduce_flydsl,
-        "kernel": pa_decode_ps_reduce_flydsl_kernel,
-        "allocator": allocator,
-    }
-
-
-def launch_pa_decode_ps_reduce_flydsl(
-    output_ptr,
-    exp_sums_ptr,
-    max_logits_ptr,
-    logits_ptr,
-    sink_token_ptr,
-    stride_output_bs,
-    stride_output_len,
-    stride_output_kv_head,
-    stride_output_group_size,
-    stride_exp_sums_seq,
-    stride_exp_sums_head,
-    stride_exp_sums_part,
-    stride_logits_seq,
-    stride_logits_head,
-    stride_logits_part,
-    stride_logits_group,
-    query_seq_len,
-    query_group_size,
-    head_size,
-    context_partition_num,
-):
-    if logits_ptr.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ImportError(
-            "FlyDSL PS reduce fallback: only bf16/fp16/fp32 logits supported"
-        )
-
-    compiled = compile_pa_decode_ps_reduce_flydsl(
-        max_context_partition_num=context_partition_num,
-        query_seq_len=query_seq_len,
-        query_group_size=query_group_size,
-        head_size=head_size,
-        output_dtype_str=_flydsl_dtype_str(output_ptr.dtype),
-        logits_dtype_str=_flydsl_dtype_str(logits_ptr.dtype),
-        sink_dtype_str=_flydsl_dtype_str(
-            output_ptr.dtype if sink_token_ptr is None else sink_token_ptr.dtype
-        ),
-        use_sinks=sink_token_ptr is not None,
-    )
-
-    if sink_token_ptr is None:
-        sink_token_ptr = torch.empty(
-            0, dtype=output_ptr.dtype, device=output_ptr.device
-        )
-    compiled["launch"](
-        output_ptr,
-        exp_sums_ptr,
-        max_logits_ptr,
-        logits_ptr,
-        sink_token_ptr,
-        stride_output_bs,
-        stride_output_len,
-        stride_output_kv_head,
-        stride_output_group_size,
-        stride_exp_sums_seq,
-        stride_exp_sums_head,
-        stride_exp_sums_part,
-        stride_logits_seq,
-        stride_logits_head,
-        stride_logits_part,
-        stride_logits_group,
-        output_ptr.shape[0],
-        output_ptr.shape[2],
-        torch.cuda.current_stream(output_ptr.device),
-    )
-
-
 def _paged_attention_decode_v2_reduce_kernel_wrapper(
     grid,
-    output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
-    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+    output_ptr,  # [num_seqs, query_length, num_kv_heads, query_group_size, head_size]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size, head_size]
     context_lengths_ptr,  # [num_seqs]
     sink_token_ptr,  # [num_query_heads]
     stride_output_bs,
@@ -5072,15 +4667,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     PS=False,
     context_partition_num=1,
 ):
-    """
-    Wrapper function for paged attention reduction kernel with kernel selection.
-
-    This wrapper selects between Gluon and Triton kernel implementations
-    based on configuration and launches the appropriate kernel.
-
-    Args:
-        All parameters from the reduction kernel plus execution grid configuration
-    """
+    """Dispatch partition reduction to C++ or Triton."""
     if PS:
         if CXX_PS_REDUCE_AVAILABLE:
             try:
@@ -5109,59 +4696,31 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 return
             except ImportError:
                 pass
-        try:
-            launch_pa_decode_ps_reduce_flydsl(
-                output_ptr,
-                exp_sums_ptr,
-                max_logits_ptr,
-                logits_ptr,
-                sink_token_ptr,
-                stride_output_bs,
-                stride_output_len,
-                stride_output_kv_head,
-                stride_output_group_size,
-                stride_exp_sums_seq,
-                stride_exp_sums_head,
-                stride_exp_sums_part,
-                stride_logits_seq,
-                stride_logits_head,
-                stride_logits_part,
-                stride_logits_group,
-                query_seq_len=query_seq_len,
-                query_group_size=query_group_size,
-                head_size=head_size,
-                context_partition_num=context_partition_num,
-                # Was the `fx.Stream(None)` parameter default; passed explicitly
-                # now that the default is gone. fx.Stream(None) is the default queue.
-                stream=fx.Stream(None),
-            )
-            return
-        except ImportError:
-            ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
-            paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
-                output_ptr,
-                exp_sums_ptr,
-                max_logits_ptr,
-                logits_ptr,
-                sink_token_ptr,
-                stride_output_bs,
-                stride_output_len,
-                stride_output_kv_head,
-                stride_output_group_size,
-                stride_exp_sums_seq,
-                stride_exp_sums_head,
-                stride_exp_sums_part,
-                stride_logits_seq,
-                stride_logits_head,
-                stride_logits_part,
-                stride_logits_group,
-                query_group_size=query_group_size,
-                head_size=head_size,
-                context_partition_num=context_partition_num,
-                HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
-                USE_SINKS=sink_token_ptr is not None,
-                MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
-            )
+        ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
+        paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
+            output_ptr,
+            exp_sums_ptr,
+            max_logits_ptr,
+            logits_ptr,
+            sink_token_ptr,
+            stride_output_bs,
+            stride_output_len,
+            stride_output_kv_head,
+            stride_output_group_size,
+            stride_exp_sums_seq,
+            stride_exp_sums_head,
+            stride_exp_sums_part,
+            stride_logits_seq,
+            stride_logits_head,
+            stride_logits_part,
+            stride_logits_group,
+            query_group_size=query_group_size,
+            head_size=head_size,
+            context_partition_num=context_partition_num,
+            HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
+            USE_SINKS=sink_token_ptr is not None,
+            MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
+        )
     else:
         paged_attention_decode_v2_reduce_kernel[grid](
             output_ptr,
@@ -5187,16 +4746,17 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             OUTPUT_SEQ_LEN=query_seq_len,
             ONE_OUTPUT_GROUP_SIZE=query_group_size,
             HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
+            VALUE_HEAD_PADDED=head_size != triton.next_power_of_2(head_size),
             CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
             USE_SINKS=sink_token_ptr is not None,
         )
 
 
 def pa_decode_gluon(
-    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
+    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, value_head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, value_head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, value_head_size, x]
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -5207,9 +4767,9 @@ def pa_decode_gluon(
     query_scale: torch.Tensor = None,  # [num_seqs * query_length, num_query_heads, 1] or [1]
     key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    exp_sums: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-    max_logits: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
+    exp_sums: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
+    max_logits: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
+    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size, value_head_size]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
@@ -5227,7 +4787,8 @@ def pa_decode_gluon(
     ----------
     output : torch.Tensor
         Output tensor for final attention results.
-        - Shape: [num_seqs * query_length, num_query_heads, head_size]
+        - Shape: [num_seqs * query_length, num_query_heads, value_head_size]
+          where value_head_size is the value-cache dimension, independent of Q/K head_size.
         - Dtype: torch.bfloat16, torch.float16
 
     query : torch.Tensor
@@ -5243,8 +4804,8 @@ def pa_decode_gluon(
 
     value_cache : torch.Tensor
         Paged value cache in block layout. Supports two layouts:
-        - Non-transposed shape: [num_blocks, num_kv_heads, head_size, kv_block_size]
-        - Transposed shape: [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+        - Non-transposed shape: [num_blocks, num_kv_heads, value_head_size, kv_block_size]
+        - Transposed shape: [num_blocks, num_kv_heads, kv_block_size // x, value_head_size, x]
           where x = 16 // dtype.itemsize
         - Dtype: torch.float8_e4m3fnuz (fp8), torch.bfloat16, torch.float16
 
@@ -5291,19 +4852,24 @@ def pa_decode_gluon(
 
     exp_sums : torch.Tensor
         Buffer for exponential sums used in online softmax computation.
-        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+        - Shape: [num_seqs, num_kv_heads, max_context_partition_num,
+          query_length * query_group_size]
           where max_context_partition_num = ceil(max_context_length / context_partition_size)
         - Dtype: torch.float32
 
     max_logits : torch.Tensor
         Buffer for maximum logits used in online softmax computation.
-        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+        - Shape: [num_seqs, num_kv_heads, max_context_partition_num,
+          query_length * query_group_size]
         - Dtype: torch.float32
 
     temporary_output : torch.Tensor
         Buffer for partial attention outputs from each context partition.
-        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
-        - Dtype: torch.float32
+        - Minimum shape: [num_seqs, num_kv_heads, max_context_partition_num,
+          query_length * query_group_size, value_head_size]
+        - The last dimension must have stride 1; larger reusable buffers are allowed.
+        - Dtype: defaults to query.dtype when allocated internally.
+        - Not used for one-shot execution (a single partition).
 
     alibi_slopes : torch.Tensor, optional
         ALiBi (Attention with Linear Biases) slopes for positional encoding.
@@ -5324,6 +4890,13 @@ def pa_decode_gluon(
       between standard and gluon layouts
     - For FP8 computation, query_scale and key_scale/value_scale are required
     - For BF16/FP16 computation, scales can be None
+    - Asymmetric Q/K and V dimensions require one KV head and persistent dispatch.
+      One-shot execution selects the persistent kernel even when ps=False.
+      Sliding-window attention with page size 1024 bypasses that kernel and is
+      therefore unsupported for asymmetric dimensions, even with ps=True.
+    - The validated asymmetric configuration is Q/K192-V128 on gfx942/gfx950,
+      BF16 or FP8 KV, vectorized 5D page-64 caches, and query length 1 or 4,
+      with full attention or sliding-window attention with sinks.
     """
     if not GLUON_JIT_KERNEL_ENABLED:
         raise RuntimeError(
@@ -5339,6 +4912,7 @@ def pa_decode_gluon(
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
+    value_head_size = output.shape[-1]
     batch_size = query.shape[0] // query_length
     num_kv_heads = key_cache.shape[1]
     query_group_size = num_query_heads // num_kv_heads
@@ -5389,8 +4963,30 @@ def pa_decode_gluon(
     assert (
         len(key_cache.shape) == 5
     ), f"Expected 5D key_cache tensor, but got shape {key_cache.shape}"
+    assert output.shape[:2] == query.shape[:2], (
+        "output and query must have matching token/head dimensions, but got "
+        f"output={output.shape}, query={query.shape}"
+    )
+    assert key_cache.shape[0] == value_cache.shape[0], (
+        "key/value caches must have the same number of blocks, but got "
+        f"key={key_cache.shape}, value={value_cache.shape}"
+    )
+    assert key_cache.shape[1] == value_cache.shape[1], (
+        "key/value caches must have the same number of KV heads, but got "
+        f"key={key_cache.shape}, value={value_cache.shape}"
+    )
+    assert key_cache.shape[2] * kv_elements_per_16b == head_size, (
+        f"key_cache must have Q/K head dimension {head_size}, but got "
+        f"shape {key_cache.shape} with vector width {kv_elements_per_16b}"
+    )
+    assert key_cache.shape[4] == kv_elements_per_16b, (
+        f"key_cache must have vector width {kv_elements_per_16b}, "
+        f"but got shape {key_cache.shape}"
+    )
 
     one_shot = max_context_partition_num <= 1
+    ps = ps or one_shot
+    uses_persistent_kernel = ps and not (sliding_window > 0 and kv_block_size == 1024)
 
     if exp_sums is None:
         exp_sums = torch.empty(
@@ -5416,10 +5012,30 @@ def pa_decode_gluon(
             num_kv_heads,
             max_context_partition_num,
             equivalent_query_group_size,
-            head_size,
+            value_head_size,
             device=query.device,
             dtype=query.dtype,
         )
+    elif not one_shot:
+        required_shape = (
+            batch_size,
+            num_kv_heads,
+            max_context_partition_num,
+            equivalent_query_group_size,
+            value_head_size,
+        )
+        if temporary_output.ndim != 5 or any(
+            actual < required
+            for actual, required in zip(temporary_output.shape, required_shape)
+        ):
+            raise ValueError(
+                f"temporary_output must have at least shape {required_shape}, "
+                f"but got {temporary_output.shape}"
+            )
+        if temporary_output.stride(-1) != 1:
+            raise ValueError(
+                "temporary_output must have stride 1 in its last dimension"
+            )
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
     stride_query_scale_bs = 0
@@ -5497,10 +5113,39 @@ def pa_decode_gluon(
     value_transposed = False
     if len(value_cache.shape) == 5:
         value_transposed = True
+        cache_value_head_size = value_cache.shape[3]
+        assert value_cache.shape[2] == kv_block_size // kv_elements_per_16b, (
+            f"value_cache must have {kv_block_size // kv_elements_per_16b} "
+            f"page vectors, but got shape {value_cache.shape}"
+        )
+        assert value_cache.shape[4] == kv_elements_per_16b, (
+            f"value_cache must have vector width {kv_elements_per_16b}, "
+            f"but got shape {value_cache.shape}"
+        )
     elif len(value_cache.shape) == 4:
         value_transposed = False
+        cache_value_head_size = value_cache.shape[2]
+        assert value_cache.shape[3] == kv_block_size, (
+            f"value_cache must have page size {kv_block_size}, "
+            f"but got shape {value_cache.shape}"
+        )
     else:
         raise RuntimeError(f"Unsupported value cache shape: {value_cache.shape}")
+    assert cache_value_head_size == value_head_size, (
+        "value cache and output must have the same head dimension, but got "
+        f"value_cache={cache_value_head_size}, output={value_head_size}"
+    )
+    asymmetric_value = value_head_size != head_size
+    if asymmetric_value and num_kv_heads != 1:
+        raise NotImplementedError(
+            "asymmetric Q/K and V head dimensions currently require one KV head"
+        )
+    if asymmetric_value and not uses_persistent_kernel:
+        raise NotImplementedError(
+            "asymmetric Q/K and V head dimensions require persistent dispatch "
+            "(ps=True or a single partition); sliding_window > 0 with page size "
+            "1024 always bypasses the persistent kernel, even with ps=True"
+        )
 
     # ==================== FP8 CONFIGURATION ====================
     fp8_max_value = 1.0
@@ -5513,12 +5158,15 @@ def pa_decode_gluon(
     )
     # Reshape output to 5D for direct write access
     output_5d = output.reshape(
-        batch_size, query_length, num_kv_heads, query_group_size, head_size
+        batch_size,
+        query_length,
+        num_kv_heads,
+        query_group_size,
+        value_head_size,
     )
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
     # Determine output tensor and strides based on one_shot mode
     output_for_kernel = output_5d if one_shot else temporary_output
-    ps = ps or one_shot
     _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         grid,
         exp_sums,
@@ -5560,6 +5208,7 @@ def pa_decode_gluon(
         COMPUTE_TYPE=torch_to_triton_dtype[compute_type],
         query_seq_len=query_length,
         HEAD_SIZE=head_size,
+        VALUE_HEAD_SIZE=value_head_size,
         query_group_size=query_group_size,
         KV_BLOCK_SIZE=kv_block_size,
         KV_16B_ELEMENT_COUNT=kv_elements_per_16b,
@@ -5599,7 +5248,7 @@ def pa_decode_gluon(
             temporary_output.stride(3),
             query_seq_len=query_length,
             query_group_size=query_group_size,
-            head_size=head_size,
+            head_size=value_head_size,
             CONTEXT_PARTITION_SIZE=context_partition_size,
             PS=ps,
             context_partition_num=max_context_partition_num,

@@ -58,6 +58,10 @@ class OpusA8W4LaunchConfig:
     def route_out(self) -> bool:
         return self.instance.route_out
 
+    @property
+    def route_out_fp8(self) -> bool:
+        return self.instance.route_out_fp8
+
 
 def _contiguous(tensor: Tensor) -> Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
@@ -130,6 +134,11 @@ def _gen_opus_moe_stage2_a8w4_decode_fake_tensors(
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
+    token_num: int,
+    topk: int,
+    block_m: int,
+    kernel_id: int,
+    inter_dim_pad: int,
 ) -> Tensor:
     return out
 
@@ -225,9 +234,16 @@ def opus_moe_stage2_a8w4_decode_fwd(
         )
     if route_out_dtype is not None and not return_per_slot:
         raise ValueError("route_out_dtype requires return_per_slot=True")
+    requested_route_out_mode = (
+        None if route_out_dtype is None else _route_out_mode_from_dtype(route_out_dtype)
+    )
     if return_per_slot and kernel_id == -1:
         kernel_id = opus_a8w4_decode_kid(
-            _route_out_mode_from_dtype(route_out_dtype),
+            (
+                OPUS_A8W4_OUT_MODE_FP8
+                if requested_route_out_mode is None
+                else requested_route_out_mode
+            ),
             block_m,
         )
     elif not return_per_slot and kernel_id == -1 and block_m == 32:
@@ -245,7 +261,17 @@ def opus_moe_stage2_a8w4_decode_fwd(
                 f"kid, got kernel_id={kernel_id} ({instance.name})"
             )
         route_out = instance.route_out
-        route_out_fp8 = instance.route_out_fp8
+        if route_out:
+            route_out_fp8 = (
+                instance.route_out_fp8
+                if requested_route_out_mode is None
+                else requested_route_out_mode == OPUS_A8W4_OUT_MODE_FP8
+            )
+            if route_out_fp8 and not instance.route_out_fp8:
+                raise ValueError(
+                    "MXFP8 route output requires an MXFP8 route-output kid, got "
+                    f"kernel_id={kernel_id} ({instance.name})"
+                )
     scale_cols = opus_a8w4_scale_cols_for_effective_inter_dim(effective_inter_dim)
     scale_row_pack = 2 * OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.mfma_m
     scale_rows = (
@@ -563,6 +589,7 @@ def opus_moe_stage2_a8w4_fwd(
     out: Tensor | None = None,
     token_num: int | None = None,
     topk: int | None = None,
+    route_out_dtype: str | None = None,
 ) -> Tensor:
     """Run Stage2 and fold route-output reduction into one shared path."""
 
@@ -608,6 +635,7 @@ def opus_moe_stage2_a8w4_fwd(
         kernel_id=launch.kernel_id,
         inter_dim_pad=inter_dim_pad,
         return_per_slot=True,
+        route_out_dtype=route_out_dtype,
         token_num=token_num,
         topk=topk,
     )
@@ -639,6 +667,7 @@ def opus_a8w4_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    stage2_fp8_enabled: bool = True,
     block_m: int = _DEFAULT_SORT_BLOCK_M,
     **_kwargs,
 ):
@@ -682,21 +711,29 @@ def opus_a8w4_stage2_wrapper(
             f"got {tuple(out.shape)}"
         )
 
-    return opus_moe_stage2_a8w4_fwd(
-        inter_states,
-        w2,
-        a2_scale,
-        w2_scale,
-        sorted_token_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        launch=launch,
-        inter_dim_pad=int(inter_dim_pad),
-        out=out,
-        token_num=int(token_num),
-        topk=int(topk),
-    )
+    def run_stage2(route_out_dtype: str | None) -> Tensor:
+        return opus_moe_stage2_a8w4_fwd(
+            inter_states,
+            w2,
+            a2_scale,
+            w2_scale,
+            sorted_token_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            launch=launch,
+            inter_dim_pad=int(inter_dim_pad),
+            out=out,
+            token_num=int(token_num),
+            topk=int(topk),
+            route_out_dtype=route_out_dtype,
+        )
+
+    if launch.route_out_fp8:
+        if stage2_fp8_enabled:
+            return run_stage2("fp8")
+        return run_stage2("bf16")
+    return run_stage2(None)
 
 
 __all__ = [

@@ -3,7 +3,6 @@
 """Generate gfx942 OPUS launchers."""
 
 import os
-from pathlib import Path
 
 from opus_gemm_common import (
     GFX942_BF16WS_EXACT_N,
@@ -23,6 +22,7 @@ from codegen.common import (
     register_arch_map,
     register_emit,
     splitk_workspace_type,
+    write_if_changed,
 )
 
 
@@ -529,7 +529,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     record_one_instantiation(
         cg,
@@ -631,7 +631,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     inst_extra_param = (
         ",\n    std::optional<aiter_tensor_t>,\n    int"
@@ -995,7 +995,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
     record_one_instantiation(
         cg,
         k,

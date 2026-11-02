@@ -217,7 +217,7 @@ def _batched_gemm_bf16_kernel(
         offs_cn = tl.cast(pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N), tl.int64)
         c_ptrs = (
             c_ptr
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
             + stride_cb * batch_id
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]

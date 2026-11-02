@@ -6,6 +6,7 @@ self-hosted-runner:
     - aiter-di-ci-spur-login-vllm
     - aiter-gfx1100
     - build-only-aiter
+    - windows-gfx1201-gpu-rocm
     - linux-aiter-build-mi250
     - linux-aiter-do-mi350x-1
     - linux-aiter-do-mi350x-2
@@ -19,6 +20,7 @@ self-hosted-runner:
     - linux-aiter-mi35x-8
     - linux-aiter-mi355-1
     - linux-aiter-mi355-8
+    - box308
 
 config-variables: null
 

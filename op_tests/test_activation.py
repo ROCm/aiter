@@ -69,6 +69,43 @@ def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
     return ret
 
 
+def test_scaled_silu_and_mul_edge_cases():
+    """Saturation, d % vec_size != 0, strided rows, and a scale updated in place
+    between graph replays."""
+    fp8_info = torch.finfo(dtypes.fp8)
+    for d, pad in [(3, 0), (4098, 0), (14336, 8), (14338, 3)]:
+        # One extra row and `pad` extra columns that the kernel must not write.
+        x_buf = torch.randn(65, 2 * d + pad, dtype=torch.bfloat16, device="cuda") * 8
+        out_buf = torch.full((65, d + pad), 0x5A, dtype=torch.uint8, device="cuda")
+        x = x_buf[:64, : 2 * d]
+        out = out_buf[:64, :d].view(dtypes.fp8)
+        scale = torch.tensor([0.01], device="cuda")
+        aiter.scaled_silu_and_mul(out, x, scale)
+        assert (out_buf[:64, d:] == 0x5A).all() and (
+            out_buf[64:] == 0x5A
+        ).all(), f"d={d}: write outside the output rows"
+        ref = torch_silu_and_mul(x.float()) / scale
+        ref = ref.clamp(fp8_info.min, fp8_info.max).to(dtypes.fp8).float()
+        err = (out.float() - ref).abs()
+        assert not out.float().isnan().any(), f"d={d}: NaN instead of saturation"
+        assert (err <= ref.abs() * 0.125 + 2**-9).all(), f"d={d}: wrong values"
+
+    x = torch.randn(64, 8192, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(64, 4096, dtype=dtypes.fp8, device="cuda")
+    expected = torch.empty_like(out)
+    scale = torch.tensor([1.0], device="cuda")
+    aiter.scaled_silu_and_mul(out, x, scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        aiter.scaled_silu_and_mul(out, x, scale)
+    scale.fill_(0.5)
+    graph.replay()
+    aiter.scaled_silu_and_mul(expected, x, scale)
+    assert torch.equal(
+        out.view(torch.uint8), expected.view(torch.uint8)
+    ), "graph replay did not pick up the updated scale"
+
+
 @benchmark()
 def test_silu_and_mul(m, n, dtype, output_dtype=None, limit=0.0):
     """
@@ -184,6 +221,74 @@ def test_gelu_fast(m, n, dtype, output_dtype=None):
     ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
     ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
     ret["err"] = err
+    return ret
+
+
+def torch_relu2_ref(x: torch.Tensor) -> torch.Tensor:
+    r = torch.nn.functional.relu(x.float())
+    return r * r
+
+
+def relu2_wrapper(input: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(input)
+    aiter.relu2(out, input)
+    return out
+
+
+@benchmark()
+def test_relu2(m, n, dtype, output_dtype=None):
+    ret = {}
+    input = torch.randn(m, 1, n, dtype=dtype, device="cuda")
+    out_dtype = output_dtype if output_dtype is not None else dtype
+    if out_dtype != dtype:
+        raise ValueError(
+            "test_relu2 does not support output_dtype != dtype: relu2_wrapper "
+            "always allocates `out` with the same dtype as `input` "
+            "(torch.empty_like(input)), so a differing output_dtype would "
+            "silently compare a mis-cast reference against a same-dtype "
+            "kernel output."
+        )
+
+    out, us_aiter = run_perftest(relu2_wrapper, input)
+    ref, us_torch = run_perftest(torch_relu2_ref, input)
+
+    # Always cast the fp32 reference down to the kernel's output dtype
+    # before comparing (torch_relu2_ref computes in fp32 via x.float()).
+    ref = ref.to(out_dtype)
+
+    err = checkAllclose(ref, out)
+
+    dtype_map = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}
+    ret["input_dtype"] = dtype_map.get(dtype, str(dtype))
+    ret["output_dtype"] = dtype_map.get(out_dtype, str(out_dtype))
+    ret["M"] = m
+    ret["N"] = n
+    ret["us"] = us_aiter
+    ret["torch_us"] = us_torch
+    ret["speedup_vs_torch"] = us_torch / us_aiter
+    ret["perf_gain_vs_torch_pct"] = (us_torch - us_aiter) / us_torch * 100.0
+    ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
+    ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
+    ret["err"] = err
+    return ret
+
+
+@benchmark()
+def test_relu2_bounds(numel, dtype):
+    ret = {
+        "numel": numel,
+        "dtype": {torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, str(dtype)),
+    }
+    input = torch.randn(1, numel, dtype=dtype, device="cuda")
+    out = torch.empty_like(input)
+    aiter.relu2(out, input)
+    if numel == 0:
+        assert out.numel() == 0
+        ret["err"] = 0.0
+        return ret
+    ref = torch_relu2_ref(input).to(dtype)
+    ret["err"] = checkAllclose(ref, out)
     return ret
 
 
@@ -402,6 +507,8 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+test_scaled_silu_and_mul_edge_cases()
+
 df = []
 for dtype in args.dtype:
     for m in args.m:
@@ -562,3 +669,37 @@ df = df[
 ]
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gelu_fast summary (markdown):\n%s", df_md)
+
+df = []
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
+            ret = test_relu2(m, n, dtype)
+            df.append(ret)
+df = pd.DataFrame(df)
+df = df[
+    [
+        "M",
+        "N",
+        "input_dtype",
+        "output_dtype",
+        "us",
+        "torch_us",
+        "speedup_vs_torch",
+        "perf_gain_vs_torch_pct",
+        "TB/s",
+        "RD TB/s",
+        "WR TB/s",
+        "err",
+    ]
+]
+df_md = df.to_markdown(index=False)
+aiter.logger.info("relu2 summary (markdown):\n%s", df_md)
+df = []
+for dtype in args.dtype:
+    for numel in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63]:
+        ret = test_relu2_bounds(numel, dtype)
+        df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("relu2_bounds summary (markdown):\n%s", df_md)

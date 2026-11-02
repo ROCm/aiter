@@ -121,13 +121,13 @@ def test_quant_fp8_blockwise_segment_m(seg_lens):
     x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 2.0
 
     seg_indptr = torch.tensor(
-        [0] + list(torch.tensor(seg_lens).cumsum(0).tolist()),
+        [0] + list(torch.tensor(seg_lens, device="cuda").cumsum(0).tolist()),
         device="cuda",
         dtype=torch.int32,
     )
     blocks_per_seg = [math.ceil(length / bs) for length in seg_lens]
     scales_seg_indptr = torch.tensor(
-        [0] + list(torch.tensor(blocks_per_seg).cumsum(0).tolist()),
+        [0] + list(torch.tensor(blocks_per_seg, device="cuda").cumsum(0).tolist()),
         device="cuda",
         dtype=torch.int32,
     )

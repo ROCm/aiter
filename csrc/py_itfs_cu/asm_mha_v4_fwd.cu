@@ -73,6 +73,15 @@ struct MhaV4Recipe
 };
 
 constexpr int64_t kHeadDim = 128;
+constexpr int64_t kGfx950StagedSparseMaxKvTiles = 8192;
+
+bool uses_gfx950_staged_sparse_lut(const MhaV4Recipe& recipe)
+{
+    return recipe.q_format == format_id(AttentionFormat::Bf16) ||
+           recipe.q_format == format_id(AttentionFormat::Fp8E4M3) ||
+           recipe.q_format == format_id(AttentionFormat::Fp4E2M1) ||
+           recipe.q_format == format_id(AttentionFormat::Int8);
+}
 
 struct PointerSlot
 {
@@ -207,10 +216,9 @@ void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* n
     }
 }
 
-// E8M0 scale gathers are unguarded global loads: they address every row of the tile they are
-// running, plus MXFP4 K's two-tile producer lead, so the final tiles read past the logical rows.
+// MXFP4 K's scale gather keeps a two-tile producer lead, so its final tiles read past the logical
+// rows. Q scales are bounded by their buffer descriptor and need no backing slack.
 constexpr int64_t kMxScaleBlocksPerRow      = 4;
-constexpr int64_t kQueryScaleTileRows       = 256;
 constexpr int64_t kKvScaleTileRows          = 128;
 constexpr int64_t kKvScaleLookaheadRows     = 2 * kKvScaleTileRows;
 constexpr int64_t kKvScaleTrailingDwordSlack = 4;
@@ -715,13 +723,6 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
         TORCH_CHECK(k_descale.sizes() ==
                         torch::IntArrayRef({shapes.batch, shapes.seqlen_k, shapes.nhead_k, 4}),
                     "MX K descale must have shape [batch, key_length, key_heads, 4]");
-        check_scale_backing_storage(q_descale,
-                                    shapes.seqlen_q,
-                                    shapes.nhead_q,
-                                    kQueryScaleTileRows,
-                                    0,
-                                    0,
-                                    "Q");
         if(recipe.k_format == format_id(AttentionFormat::Fp4E2M1))
         {
             check_scale_backing_storage(k_descale,
@@ -793,6 +794,40 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     return shapes;
 }
 
+// Shared by the dense and sorted-sparse entries so the two cannot drift: the kernels branch on
+// s_lse and skip the store when it is zero, so a launch without an LSE tensor leaves the reserved
+// slots at zero and keeps the same code object.
+void populate_lse_kernarg(FmhaV4Kernarg& args,
+                          const std::optional<at::Tensor>& lse,
+                          const at::Tensor& q,
+                          const PackedMhaV4Shapes& shapes)
+{
+    if(!lse.has_value())
+    {
+        return;
+    }
+    TORCH_CHECK(lse->is_cuda() && lse->device() == q.device(),
+                "MHA v4 lse must be a GPU tensor on the same device as Q");
+    TORCH_CHECK(lse->scalar_type() == at::kFloat,
+                "MHA v4 lse must be float32, got ",
+                lse->scalar_type());
+    TORCH_CHECK(lse->is_contiguous(), "MHA v4 lse must be contiguous");
+    TORCH_CHECK(lse->dim() == 3 && lse->size(0) == shapes.batch &&
+                    lse->size(1) == shapes.nhead_q && lse->size(2) == shapes.seqlen_q,
+                "MHA v4 lse must be [batch, nhead_q, seqlen_q] = [",
+                shapes.batch,
+                ", ",
+                shapes.nhead_q,
+                ", ",
+                shapes.seqlen_q,
+                "]");
+    // The kernel derives the batch stride as q_head_num * s_lse_Hs, which only holds for a
+    // contiguous [batch, head, seqlen_q] buffer.
+    args.ptr_lse.value  = lse->data_ptr();
+    args.s_lse.value    = 1;
+    args.s_lse_Hs.value = byte_stride(*lse, 1, "LSE head stride");
+}
+
 } // namespace
 
 at::Tensor
@@ -817,7 +852,9 @@ void fmha_v4_fwd(const at::Tensor& q,
                  int64_t q_scale_mode,
                  int64_t k_scale_mode,
                  int64_t v_scale_mode,
-                 double softmax_scale)
+                 double softmax_scale,
+                 std::optional<at::Tensor> seqlens_k,
+                 std::optional<at::Tensor> lse)
 {
     const MhaV4Recipe recipe{q_format,
                              k_format,
@@ -859,6 +896,30 @@ void fmha_v4_fwd(const at::Tensor& q,
                            shapes.gqa_ratio,
                            softmax_scale);
 
+    // Per-batch key lengths are optional: the kernels read this slot only when it is non-null, so a
+    // dense launch leaves it zero rather than selecting a different code object.
+    if(seqlens_k.has_value())
+    {
+        TORCH_CHECK(seqlens_k->is_cuda() && seqlens_k->device() == q.device(),
+                    "MHA v4 seqlens_k must be a GPU tensor on the same device as Q");
+        TORCH_CHECK(seqlens_k->scalar_type() == at::kInt,
+                    "MHA v4 seqlens_k must be int32, got ",
+                    seqlens_k->scalar_type());
+        TORCH_CHECK(seqlens_k->is_contiguous(), "MHA v4 seqlens_k must be contiguous");
+        TORCH_CHECK(seqlens_k->numel() >= shapes.batch,
+                    "MHA v4 seqlens_k needs one entry per batch: got ",
+                    seqlens_k->numel(),
+                    " for batch ",
+                    shapes.batch);
+        // Contents stay the caller's contract, as they do for cu_seqlens on the varlen path:
+        // they live on the device, so bounding them here would synchronize every launch.
+        args.ptr_kseq.value = seqlens_k->data_ptr();
+    }
+
+    // LSE is opt-in the same way: the kernels branch on s_lse and skip the store when it is zero,
+    // so a launch without it leaves the reserved slots at zero and keeps the same code object.
+    populate_lse_kernarg(args, lse, q, shapes);
+
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
     auto& kernel                = kernels.get_or_create(
@@ -889,7 +950,8 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         double softmax_scale,
                         const at::Tensor& kv_block_indices,
                         const at::Tensor& lut_start,
-                        const at::Tensor& lut_count)
+                        const at::Tensor& lut_count,
+                        std::optional<at::Tensor> lse)
 {
     const MhaV4Recipe recipe{q_format,
                              k_format,
@@ -920,6 +982,14 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
 
     const int64_t q_tiles  = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
     const int64_t kv_tiles = (shapes.seqlen_k + cfg.ts_kv - 1) / cfg.ts_kv;
+    if(arch == "gfx950" && uses_gfx950_staged_sparse_lut(recipe))
+    {
+        TORCH_CHECK(kv_tiles <= kGfx950StagedSparseMaxKvTiles,
+                    "gfx950 LDS-staged sparse MHA v4 supports at most ",
+                    kGfx950StagedSparseMaxKvTiles,
+                    " KV tiles, got ",
+                    kv_tiles);
+    }
     const int64_t lut_rows = shapes.batch * shapes.nhead_q * q_tiles;
     TORCH_CHECK(kv_block_indices.is_cuda() && lut_start.is_cuda() && lut_count.is_cuda(),
                 "LUT tensors must be GPU tensors");
@@ -984,6 +1054,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     args.ptr_work_table.value       = work_table.data_ptr();
     args.s_num_wgs                  = static_cast<uint32_t>(lut_rows);
     args.s_total_tiles              = static_cast<uint32_t>(lut_rows);
+    populate_lse_kernarg(args.dense, lse, q, shapes);
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;

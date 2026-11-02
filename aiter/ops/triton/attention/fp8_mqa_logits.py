@@ -207,6 +207,7 @@ def fp8_mqa_logits(
             num_stages=num_stages,
             waves_per_eu=2,
             matrix_instr_nonkdim=matrix_instr_nonkdim,
+            enable_fp_fusion=True,
         )
     else:
         # The buffer path keeps the row strides 32-bit and re-bases the pointer
@@ -331,6 +332,7 @@ def fp8_mqa_logits(
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
             **other,
+            enable_fp_fusion=True,
         )
 
     return logits

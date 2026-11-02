@@ -121,26 +121,32 @@ def mhc_pre_big_fuse_rmsnorm(
 # its next_residual write use this layout, so it stays internal to a stack of layers:
 # only the first residual in and the last one out need converting.
 MHC_RES_KS = 32
+# Block width of the residual layout the gfx1250 Gluon mhc_post_pre path reads and
+# writes (its k-step); the HIP kernels keep MHC_RES_KS. Shuffle with ks= this value
+# for the Gluon path.
+MHC_RES_KS_GLUON = 64
 
 
-def _validate_mhc_res_input(x: torch.Tensor) -> tuple[int, int, int]:
+def _validate_mhc_res_input(
+    x: torch.Tensor, ks: int = MHC_RES_KS
+) -> tuple[int, int, int]:
     assert x.dim() == 3, f"expected a 3D residual, got {x.dim()}D"
     assert x.is_cuda, "residual must be on GPU"
     assert x.is_contiguous(), "residual must be contiguous"
     assert x.dtype in (torch.bfloat16, torch.float16)
     m, hc_mult, hidden_size = x.shape
     assert m > 0 and hc_mult > 0
-    assert hidden_size % MHC_RES_KS == 0
+    assert hidden_size % ks == 0
     return m, hc_mult, hidden_size
 
 
 @functools.cache
 def _get_compiled_mhc_res_layout(
-    kind: str, hidden_size: int, hc_mult: int, itemsize: int
+    kind: str, hidden_size: int, hc_mult: int, itemsize: int, ks: int = MHC_RES_KS
 ):
     from aiter.ops.flydsl.kernels.mhc_res_layout import build_mhc_res_layout_module
 
-    return build_mhc_res_layout_module(kind, hidden_size, hc_mult, MHC_RES_KS, itemsize)
+    return build_mhc_res_layout_module(kind, hidden_size, hc_mult, ks, itemsize)
 
 
 def _run_mhc_res_layout(
@@ -150,6 +156,7 @@ def _run_mhc_res_layout(
     m: int,
     hc_mult: int,
     hidden_size: int,
+    ks: int = MHC_RES_KS,
 ) -> None:
     from aiter.ops.flydsl.kernels.mhc_res_layout import to_shuffled_row_blocks
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -159,13 +166,13 @@ def _run_mhc_res_layout(
     assert (
         m * hc_mult * hidden_size * itemsize < 2**32
     ), "residual exceeds the 4GiB a buffer descriptor can address"
-    launcher = _get_compiled_mhc_res_layout(kind, hidden_size, hc_mult, itemsize)
+    launcher = _get_compiled_mhc_res_layout(kind, hidden_size, hc_mult, itemsize, ks)
     _run_compiled(
         launcher,
         src,
         dst,
         m,
-        to_shuffled_row_blocks(m, MHC_RES_KS, itemsize),
+        to_shuffled_row_blocks(m, ks, itemsize),
         torch.cuda.current_stream(src.device),
     )
 
@@ -173,6 +180,7 @@ def _run_mhc_res_layout(
 def mhc_res_repeat_flydsl(
     hidden_states: torch.Tensor,
     hc_mult: int,
+    ks: int = MHC_RES_KS,
 ) -> torch.Tensor:
     assert hidden_states.dim() == 2
     assert hidden_states.is_cuda
@@ -180,7 +188,7 @@ def mhc_res_repeat_flydsl(
     assert hidden_states.dtype in (torch.bfloat16, torch.float16)
     m, hidden_size = hidden_states.shape
     assert m > 0 and hc_mult > 0
-    assert hidden_size % MHC_RES_KS == 0
+    assert hidden_size % ks == 0
 
     out = torch.empty(
         m,
@@ -189,21 +197,25 @@ def mhc_res_repeat_flydsl(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    _run_mhc_res_layout("repeat", hidden_states, out, m, hc_mult, hidden_size)
+    _run_mhc_res_layout("repeat", hidden_states, out, m, hc_mult, hidden_size, ks)
     return out
 
 
-def mhc_res_shuffle_flydsl(residual: torch.Tensor) -> torch.Tensor:
-    m, hc_mult, hidden_size = _validate_mhc_res_input(residual)
+def mhc_res_shuffle_flydsl(
+    residual: torch.Tensor, ks: int = MHC_RES_KS
+) -> torch.Tensor:
+    m, hc_mult, hidden_size = _validate_mhc_res_input(residual, ks)
     out = torch.empty_like(residual)
-    _run_mhc_res_layout("shuffle", residual, out, m, hc_mult, hidden_size)
+    _run_mhc_res_layout("shuffle", residual, out, m, hc_mult, hidden_size, ks)
     return out
 
 
-def mhc_res_unshuffle_flydsl(shuffled: torch.Tensor) -> torch.Tensor:
-    m, hc_mult, hidden_size = _validate_mhc_res_input(shuffled)
+def mhc_res_unshuffle_flydsl(
+    shuffled: torch.Tensor, ks: int = MHC_RES_KS
+) -> torch.Tensor:
+    m, hc_mult, hidden_size = _validate_mhc_res_input(shuffled, ks)
     out = torch.empty_like(shuffled)
-    _run_mhc_res_layout("unshuffle", shuffled, out, m, hc_mult, hidden_size)
+    _run_mhc_res_layout("unshuffle", shuffled, out, m, hc_mult, hidden_size, ks)
     return out
 
 
@@ -227,6 +239,46 @@ def mhc_res_shuffle_enabled(m: int, arch: str | None = None) -> bool:
     return arch == "gfx1250" and 0 < m < fused_m_upper_bound
 
 
+# Hidden sizes the gfx1250 Gluon mhc_post_pre kernels are tuned for (DSV4-Flash 4096,
+# DSV4-Pro 7168); other hidden sizes keep the HIP kernels.
+MHC_GLUON_POST_PRE_HIDDEN_SIZES = (4096, 7168)
+
+
+def _mhc_res_gluon(m: int, hidden_size: int, arch: str | None = None) -> bool:
+    """Whether a shuffled residual of m rows and this hidden size is the Gluon
+    kernels' (MHC_RES_KS_GLUON blocks): where a residual can be shuffled
+    (mhc_res_shuffle_enabled) and the hidden size is a tuned one."""
+    return hidden_size in MHC_GLUON_POST_PRE_HIDDEN_SIZES and mhc_res_shuffle_enabled(
+        m, arch
+    )
+
+
+_MHC_POST_PRE_BACKENDS = ("hip", "gluon")
+
+
+def _check_mhc_post_pre_backend(backend: str | None) -> None:
+    if backend is not None and backend not in _MHC_POST_PRE_BACKENDS:
+        raise ValueError(
+            f"mhc_fused_post_pre backend must be None, hip or gluon, got {backend!r}"
+        )
+
+
+def mhc_res_ks(
+    m: int,
+    hidden_size: int,
+    arch: str | None = None,
+    backend: str | None = None,
+) -> int:
+    """Block width of the shuffled residual of m rows: MHC_RES_KS_GLUON where
+    mhc_fused_post_pre reads it with the Gluon kernels, MHC_RES_KS (the HIP
+    kernels) otherwise. ``backend``: the width for a forced mhc_fused_post_pre
+    backend instead of the automatic choice."""
+    _check_mhc_post_pre_backend(backend)
+    if backend is not None:
+        return MHC_RES_KS_GLUON if backend == "gluon" else MHC_RES_KS
+    return MHC_RES_KS_GLUON if _mhc_res_gluon(m, hidden_size, arch) else MHC_RES_KS
+
+
 def _check_mhc_res_preshuffle_arch(shuffled: bool, arch: str) -> None:
     if shuffled and arch != "gfx1250":
         raise ValueError(
@@ -235,20 +287,25 @@ def _check_mhc_res_preshuffle_arch(shuffled: bool, arch: str) -> None:
         )
 
 
-def mhc_res_layout_fake(residual: torch.Tensor) -> torch.Tensor:
+def mhc_res_layout_fake(residual: torch.Tensor, ks: int | None = None) -> torch.Tensor:
     return torch.empty_like(residual)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_res_layout_fake)
-def mhc_res_shuffle(residual: torch.Tensor) -> torch.Tensor:
-    """res[row][head][k] -> resS[k//KS][head][row][k%KS], same shape."""
-    return mhc_res_shuffle_flydsl(residual)
+def mhc_res_shuffle(residual: torch.Tensor, ks: int | None = None) -> torch.Tensor:
+    """res[row][head][k] -> resS[k//ks][head][row][k%ks], same shape. ks: the
+    block width; None (default) takes the one mhc_fused_post_pre reads for these
+    rows (mhc_res_ks)."""
+    if ks is None:
+        ks = mhc_res_ks(residual.size(0), residual.size(-1))
+    return mhc_res_shuffle_flydsl(residual, ks)
 
 
 def mhc_res_repeat_fake(
     hidden_states: torch.Tensor,
     hc_mult: int,
     res_preshuffle: bool = False,
+    ks: int | None = None,
 ) -> torch.Tensor:
     return torch.empty(
         hidden_states.size(0),
@@ -264,12 +321,14 @@ def mhc_res_repeat(
     hidden_states: torch.Tensor,
     hc_mult: int,
     res_preshuffle: bool = False,
+    ks: int | None = None,
 ) -> torch.Tensor:
     """Repeat ``[m, hidden]`` into an mHC residual, optionally pre-shuffled.
 
     The shuffled branch writes the kernel layout directly, avoiding an
     intermediate ``[m, hc_mult, hidden]`` repeat followed by another full
-    shuffle copy.
+    shuffle copy. ``ks``: the block width; None (default) takes the one
+    mhc_fused_post_pre reads for these rows (mhc_res_ks).
     """
     assert (
         hidden_states.ndim == 2
@@ -279,13 +338,17 @@ def mhc_res_repeat(
     if not res_preshuffle or not mhc_res_shuffle_enabled(m):
         return hidden_states.unsqueeze(-2).repeat(1, hc_mult, 1)
 
-    return mhc_res_repeat_flydsl(hidden_states, hc_mult)
+    if ks is None:
+        ks = mhc_res_ks(m, hidden_states.size(1))
+    return mhc_res_repeat_flydsl(hidden_states, hc_mult, ks)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_res_layout_fake)
-def mhc_res_unshuffle(shuffled: torch.Tensor) -> torch.Tensor:
-    """Inverse of :func:`mhc_res_shuffle`."""
-    return mhc_res_unshuffle_flydsl(shuffled)
+def mhc_res_unshuffle(shuffled: torch.Tensor, ks: int | None = None) -> torch.Tensor:
+    """Inverse of :func:`mhc_res_shuffle` (same ks; None: mhc_res_ks)."""
+    if ks is None:
+        ks = mhc_res_ks(shuffled.size(0), shuffled.size(-1))
+    return mhc_res_unshuffle_flydsl(shuffled, ks)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -775,6 +838,7 @@ def mhc_fused_post_pre_fake(
     force_fused: bool = False,
     w_preshuffle_bf16: bool = False,  # True: packed BF16 hi/lo
     res_preshuffle: bool = False,  # True: shuffled residual (gfx1250 only)
+    backend: str | None = None,  # None: automatic; "hip" / "gluon": forced
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
@@ -855,6 +919,74 @@ def mhc_fused_post_pre_large_m(
     return post_mix, comb_mix, layer_input_out, next_residual
 
 
+def _mhc_fused_post_pre_gluon(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    w_preshuffle_bf16: bool,
+    res_preshuffle: bool,
+):
+    """mhc_fused_post_pre on the gfx1250 Gluon kernels, for a shuffled residual
+    (MHC_RES_KS_GLUON blocks). Inputs the Gluon kernels do not take are an error:
+    the HIP kernels read MHC_RES_KS blocks."""
+    from aiter.ops.triton.fusions.mhc import (
+        mhc_post_pre,
+        mhc_post_pre_gfx1250_supported,
+    )
+
+    hc_mult = residual_in.size(1)
+    # phi (K, N) = fn.T: the C-contiguous view the Gluon kernels read.
+    phi = fn.T
+    if not mhc_post_pre_gfx1250_supported(
+        layer_input,
+        residual_in,
+        phi,
+        hc_scale,
+        hc_base,
+        hc_mult,
+        sinkhorn_repeat,
+        True,
+        norm_weight,
+        w_preshuffle_bf16,
+    ):
+        raise ValueError(
+            "mhc_fused_post_pre: the gfx1250 Gluon kernels do not take these "
+            "inputs, and the shuffled residual (MHC_RES_KS_GLUON blocks) cannot go "
+            "to the HIP kernels; use res_preshuffle=False"
+        )
+    return mhc_post_pre(
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        phi,
+        hc_scale,
+        hc_base,
+        hc_mult,
+        eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_iters=sinkhorn_repeat,
+        asymmetric_exp_domain=True,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        w_preshuffle_bf16=w_preshuffle_bf16,
+        res_preshuffle=res_preshuffle,
+    )
+
+
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_fake)
 def mhc_fused_post_pre(
     layer_input: torch.Tensor,
@@ -874,6 +1006,7 @@ def mhc_fused_post_pre(
     force_fused: bool = False,
     w_preshuffle_bf16: bool = False,  # True: packed BF16 hi/lo
     res_preshuffle: bool = False,  # True: shuffled residual (gfx1250 only)
+    backend: str | None = None,  # None: automatic; "hip" / "gluon": forced
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mhc_post + next mhc_pre (HIP), mirroring ``mhc_pre`` with post-step inputs.
 
@@ -898,11 +1031,25 @@ def mhc_fused_post_pre(
     ``w_preshuffle_bf16=True, res_preshuffle=False``.
 
     Both flags are boolean, default to False, and are controlled independently.
+
+    A shuffled residual (gfx1250, 0 < m < the fused bound) of a hidden size in
+    ``MHC_GLUON_POST_PRE_HIDDEN_SIZES`` runs the gfx1250 Gluon kernels
+    (``aiter.ops.triton.fusions.mhc.mhc_post_pre``) and uses ``MHC_RES_KS_GLUON``
+    blocks (``mhc_res_ks``), which ``mhc_res_repeat`` / ``mhc_res_shuffle`` /
+    ``mhc_res_unshuffle``, ``mhc_pre`` and ``mhc_post`` follow by default. Plain
+    residuals and other hidden sizes keep the HIP kernels. The fuse/unfuse
+    boundary is unchanged.
+
+    ``backend``: None (default) picks as above; ``"hip"`` / ``"gluon"`` force the
+    implementation of the fused path (tests, benchmarks). A shuffled residual must
+    then be in that backend's blocks (``mhc_res_ks(..., backend=backend)``).
+    ``"gluon"`` needs gfx1250 and inputs the Gluon kernels take, or raises.
     """
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
     hidden_size = residual_in.size(2)
     arch = get_gfx_runtime()
+    _check_mhc_post_pre_backend(backend)
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     res_preshuffle = res_preshuffle and mhc_res_shuffle_enabled(m, arch)
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
@@ -956,6 +1103,28 @@ def mhc_fused_post_pre(
             norm_eps,
             w_preshuffle_bf16=w_preshuffle_bf16,
             res_preshuffle=False,
+        )
+
+    if backend == "gluon" or (
+        backend is None and res_preshuffle and _mhc_res_gluon(m, hidden_size, arch)
+    ):
+        return _mhc_fused_post_pre_gluon(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+            w_preshuffle_bf16,
+            res_preshuffle,
         )
 
     assert layer_input.shape == (

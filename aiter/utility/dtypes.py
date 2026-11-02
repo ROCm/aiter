@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
+import os
 
 import torch
 
-from ..jit.utils.chip_info import get_gfx_runtime
-from ..ops.enum import ActivationType, QuantType
 from .aiter_types import aiter_dtypes, aiter_tensor_t
 
 defaultDtypes = {
@@ -25,7 +24,15 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    return defaultDtypes.get(get_gfx_runtime(), {"fp8": _8bit_fallback})["fp8"]
+    # An AOT replay process hides the GPUs yet compiles for one arch, which
+    # get_gfx_runtime() returns there.
+    aot_replay = os.getenv("AITER_AOT_REPLAY") == "1"
+    if not aot_replay and (torch.version.hip is None or not torch.cuda.is_available()):
+        return _8bit_fallback
+    from ..jit.utils.chip_info import get_gfx_runtime
+
+    gfx = get_gfx_runtime()
+    return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]
 
 
 i4x2 = getattr(torch, "int4", _8bit_fallback)
@@ -164,6 +171,8 @@ def str2Dtype(v):
         elif s in d_dtypes:
             return d_dtypes[s]
         else:
+            from ..ops.enum import QuantType
+
             # Case-insensitive lookup for QuantType
             s_lower = s.lower()
             for name in dir(QuantType):
@@ -182,6 +191,8 @@ def str2Dtype(v):
 
 
 def str2ActivationType(s):
+    from ..ops.enum import ActivationType
+
     s = str(s)
     members = getattr(ActivationType, "__members__", None)
     if members is not None:

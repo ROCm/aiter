@@ -21,24 +21,14 @@
 # SOFTWARE.
 """FlyDSL intranode EP dispatch driven by the gfx1250 Tensor Data Mover.
 
-``dispatch._make_dispatch`` spends a whole wave per (token, expert-slot) route:
-a remote atomic for the recv slot, then per-lane 16-byte stores. A TDM moves the
-whole row on one descriptor, so the copy needs no lanes and the costs it used to
-hide -- the per-route atomic, the scattered 4-byte metadata stores -- surface.
-Three changes follow, and only pay off together:
+A TDM moves a whole payload row on one descriptor. Routes are one lane each
+(``WAVE / topk`` tokens per wave); a wave dedups a token's same-peer routes
+with a ballot + mbcnt_lo match-any. Recv slots are reserved one remote atomic
+per (block, peer) off an LDS histogram. idx / weights / srcmap -- and, on a
+quantized wire, the token's e8m0 scale row -- are gathered into a destTokId-
+ordered SoA so the cross-GPU metadata write is a few bulk TDM runs.
 
-  * a route is one LANE, not one wave (``WAVE / topk`` tokens per wave), so a
-    wave dedups a token's same-peer routes with a ballot + mbcnt_lo match-any
-    instead of a permute probe per route slot;
-  * recv slots are reserved one remote atomic per (block, peer) off an LDS
-    histogram, not one per route;
-  * idx / weights / srcmap -- and, on a quantized wire, the token's e8m0 scale
-    row -- are gathered into a destTokId-ordered SoA, so the cross-GPU metadata
-    write is a few bulk TDM runs, not thousands of dwords.
-
-State left behind is bit-compatible with ``_make_dispatch`` bar which recv slot
-a token lands in, slots being handed out block-local -- nothing indexes by slot
-order, but a slot-by-slot arena diff will.
+Slots are handed out block-local; nothing indexes by slot order.
 
 The payload is bf16/f32, fp8 or fp4; the last two carry a per-token e8m0 scale
 row alongside it, padded to a 128-byte stride so a run of them is something the
@@ -119,11 +109,9 @@ def _tile_bytes(payload_bytes, slab_bytes):
 def tdm_max_warps(*, hidden_dim, hidden_elem_size, npes, slab_bytes=0):
     """Widest power-of-two warp count whose payload tiles fit the LDS budget.
 
-    The vector dispatch holds no per-warp LDS, so a geometry tuned against it
-    can name a warp count this one cannot honour: a 7168-wide bf16 tile is 14 KB
-    and 32 of them want 448 KB against a 320 KB budget. A caller clamping to this
-    keeps the tuned block count -- which is what paces the grid barrier -- and
-    gives up only the warp width.
+    A 7168-wide bf16 tile is 14 KB and 32 of them want 448 KB against a 320 KB
+    budget. A caller clamping to this keeps the tuned block count -- which is
+    what paces the grid barrier -- and gives up only the warp width.
     """
     tile = _tile_bytes(hidden_dim * hidden_elem_size, slab_bytes)
     room = (_LDS_BUDGET - _align(3 * npes * 4, 128)) // tile
@@ -168,15 +156,14 @@ def _make_dispatch_tdm(
     compact_row_stride=0,
     off_ep_rowmap=0,
     max_tok_slot_stride=0,
+    route_parallel=False,
 ):
     """Build the TDM dispatch kernel. Returns a ``@flyc.jit`` launcher.
 
-    Arguments mirror :func:`dispatch._make_dispatch` so the host layer can
-    forward the same kwargs; the launcher takes five extra pointers between
-    ``addr_total_recv`` and ``my_lsa_rank`` -- four staging bases and the
-    caller's scale buffer. ``meta_tdm=False`` routes the metadata through
-    per-lane stores instead of the TDM engine -- same result, and the A/B that
-    says whether the bulk path is worth its LDS.
+    The launcher takes five extra pointers between ``addr_total_recv`` and
+    ``my_lsa_rank`` -- four staging bases and the caller's scale buffer.
+    ``meta_tdm=False`` routes the metadata through per-lane stores instead of
+    the TDM engine.
 
     ``scale_bytes`` is the caller's packed e8m0 row and ``scale_stride`` the
     padded one the wire uses; ``slab_bytes`` floors the LDS tile so an fp4
@@ -184,6 +171,9 @@ def _make_dispatch_tdm(
     row. All three are 0 on a bf16 wire and the scale path disappears.
     """
     compact_plan = bool(compact_plan)
+    route_parallel = bool(route_parallel)
+    if route_parallel and not compact_plan:
+        raise ValueError("route_parallel requires compact_plan")
     compact_row_stride = int(compact_row_stride)
     off_ep_rowmap = int(off_ep_rowmap)
     max_tok_slot_stride = int(max_tok_slot_stride)
@@ -336,13 +326,13 @@ def _make_dispatch_tdm(
         ctl = fx.Int64(fx.ptrtoint(ctl_ptr))
 
         def s_n(p):
-            return ctl + fx.Int64(p) * fx.Int64(4)
+            return ctl + fx.Int64(p) * 4
 
         def s_base(p):
-            return ctl + (fx.Int64(p) + fx.Int64(npes)) * fx.Int64(4)
+            return ctl + (fx.Int64(p) + fx.Int64(npes)) * 4
 
         def s_run(p):
-            return ctl + (fx.Int64(p) + fx.Int64(2 * npes)) * fx.Int64(4)
+            return ctl + (fx.Int64(p) + fx.Int64(2 * npes)) * 4
 
         # Tokens a warp takes per iteration. A fixed quota of `tpi` only fills the
         # grid once there are `warps_total * tpi` tokens to go round: below that
@@ -436,9 +426,7 @@ def _make_dispatch_tdm(
                     base = comm_ops.atomic_add_system(
                         fx.Int64(window.lsa_ptr(tid, off_tok_off)), n
                     )
-                    comm_ops.atomic_add_system(
-                        fx.Int64(addr_dest_pe_ctr) + fx.Int64(tid) * fx.Int64(4), n
-                    )
+                    comm_ops.atomic_add_system(addr_dest_pe_ctr + fx.Int64(tid) * 4, n)
                 comm_ops.store_i32_lds(s_base(tid), base)
             fx.barrier()
 
@@ -541,14 +529,14 @@ def _make_dispatch_tdm(
                 n_kv = n_tok * topk
                 kv_bytes = fx.Int64(src_tok) * fx.Int64(topk * 4)
                 kv_dbytes = fx.Int64(dst_tok) * fx.Int64(topk * 4)
-                s_idx = fx.Int64(addr_stg_idx) + kv_bytes
+                s_idx = addr_stg_idx + kv_bytes
                 d_idx = fx.Int64(window.lsa_ptr(peer_id, off_out_idx)) + kv_dbytes
-                s_wt = fx.Int64(addr_stg_wt) + kv_bytes
+                s_wt = addr_stg_wt + kv_bytes
                 d_wt = fx.Int64(window.lsa_ptr(peer_id, off_out_wts)) + kv_dbytes
-                s_src = fx.Int64(addr_stg_src) + fx.Int64(src_tok) * fx.Int64(4)
-                d_src = fx.Int64(window.lsa_ptr(peer_id, off_tis)) + fx.Int64(
-                    dst_tok
-                ) * fx.Int64(4)
+                s_src = addr_stg_src + fx.Int64(src_tok) * 4
+                d_src = (
+                    fx.Int64(window.lsa_ptr(peer_id, off_tis)) + fx.Int64(dst_tok) * 4
+                )
                 h_idx, r_idx = TDM.tdm_plan_xfer_4b(s_idx, d_idx, n_kv)
                 h_wt, r_wt = TDM.tdm_plan_xfer_4b(s_wt, d_wt, n_kv)
                 h_src, r_src = TDM.tdm_plan_xfer_4b(s_src, d_src, n_tok)
@@ -560,24 +548,22 @@ def _make_dispatch_tdm(
                 l_src = l_wt + b_wt * 4
                 if r_idx > 0:
                     TDM.tdm_load(
-                        TDM.tdm_group0(l_idx, s_idx + fx.Int64(h_idx) * fx.Int64(4)),
+                        TDM.tdm_group0(l_idx, s_idx + fx.Int64(h_idx) * 4),
                         TDM.tdm_group1_rows_4b(r_idx),
                     )
                 if r_wt > 0:
                     TDM.tdm_load(
-                        TDM.tdm_group0(l_wt, s_wt + fx.Int64(h_wt) * fx.Int64(4)),
+                        TDM.tdm_group0(l_wt, s_wt + fx.Int64(h_wt) * 4),
                         TDM.tdm_group1_rows_4b(r_wt),
                     )
                 if r_src > 0:
                     TDM.tdm_load(
-                        TDM.tdm_group0(l_src, s_src + fx.Int64(h_src) * fx.Int64(4)),
+                        TDM.tdm_group0(l_src, s_src + fx.Int64(h_src) * 4),
                         TDM.tdm_group1_rows_4b(r_src),
                     )
                 if const_expr(scale_bytes > 0):
                     n_sc = n_tok * scale_dst_dw
-                    s_sc = fx.Int64(addr_stg_scale) + fx.Int64(src_tok) * fx.Int64(
-                        scale_stride
-                    )
+                    s_sc = addr_stg_scale + fx.Int64(src_tok) * fx.Int64(scale_stride)
                     d_sc = fx.Int64(window.lsa_ptr(peer_id, off_out_scales)) + fx.Int64(
                         dst_tok
                     ) * fx.Int64(scale_stride)
@@ -586,7 +572,7 @@ def _make_dispatch_tdm(
                     l_sc = l_src + b_src * 4
                     if r_sc > 0:
                         TDM.tdm_load(
-                            TDM.tdm_group0(l_sc, s_sc + fx.Int64(h_sc) * fx.Int64(4)),
+                            TDM.tdm_group0(l_sc, s_sc + fx.Int64(h_sc) * 4),
                             TDM.tdm_group1_rows_4b(r_sc),
                         )
                 # The edges are global-to-global and owe the tile nothing, so they
@@ -617,22 +603,22 @@ def _make_dispatch_tdm(
                 TDM.tdm_wait(0)
                 if r_idx > 0:
                     TDM.tdm_store(
-                        TDM.tdm_group0(l_idx, d_idx + fx.Int64(h_idx) * fx.Int64(4)),
+                        TDM.tdm_group0(l_idx, d_idx + fx.Int64(h_idx) * 4),
                         TDM.tdm_group1_rows_4b(r_idx),
                     )
                 if r_wt > 0:
                     TDM.tdm_store(
-                        TDM.tdm_group0(l_wt, d_wt + fx.Int64(h_wt) * fx.Int64(4)),
+                        TDM.tdm_group0(l_wt, d_wt + fx.Int64(h_wt) * 4),
                         TDM.tdm_group1_rows_4b(r_wt),
                     )
                 if r_src > 0:
                     TDM.tdm_store(
-                        TDM.tdm_group0(l_src, d_src + fx.Int64(h_src) * fx.Int64(4)),
+                        TDM.tdm_group0(l_src, d_src + fx.Int64(h_src) * 4),
                         TDM.tdm_group1_rows_4b(r_src),
                     )
                 if const_expr(scale_bytes > 0) and r_sc > 0:
                     TDM.tdm_store(
-                        TDM.tdm_group0(l_sc, d_sc + fx.Int64(h_sc) * fx.Int64(4)),
+                        TDM.tdm_group0(l_sc, d_sc + fx.Int64(h_sc) * 4),
                         TDM.tdm_group1_rows_4b(r_sc),
                     )
                 TDM.tdm_wait(0)
@@ -758,12 +744,27 @@ def _make_dispatch_tdm(
         row_stride = compact_row_stride if compact_plan else nbytes
         # Compact plan fills tok_map in a prior low-LDS kernel, so every warp
         # may read it. Token-major dispatch still only trusts entries it wrote.
+        #
+        # route_parallel walks routes, not tokens: `tok_base` is a route id and
+        # each warp ships one row per step. One warp's remote TDM stores retire
+        # serially, so fanning a token out from a single warp costs topk
+        # back-to-back fabric writes; one route per warp overlaps them. Ids go
+        # block-minor so a token's routes land on different CUs.
         tok_step = warps_total if compact_plan else (warps_total * etpi)
-        tok_begin = global_warp_id if compact_plan else (global_warp_id * etpi)
-        for tok_base in range(tok_begin, inp_cur_tok, tok_step):
+        if const_expr(route_parallel):
+            tok_begin = warp * fx.Int32(block_num) + bid
+            tok_end = inp_cur_tok * fx.Int32(topk)
+        else:
+            tok_begin = global_warp_id if compact_plan else (global_warp_id * etpi)
+            tok_end = inp_cur_tok
+        for tok_base in range(tok_begin, tok_end, tok_step):
             sub_limit = fx.Int32(1) if compact_plan else etpi
             for sub in range(sub_limit):
-                tok = tok_base + sub
+                if const_expr(route_parallel):
+                    tok = tok_base // fx.Int32(topk)
+                    route_k = tok_base - tok * fx.Int32(topk)
+                else:
+                    tok = tok_base + sub
                 if tok < inp_cur_tok:
                     flat = buffer_load(
                         rsrc_tok_map, tok * topk + probe_off, vec_width=1, dtype=T.i32
@@ -772,6 +773,8 @@ def _make_dispatch_tdm(
                     # sentinel, so a slot FINALIZE never published can never name
                     # a route.
                     live = (lane < topk) & (flat >= 0)
+                    if const_expr(route_parallel):
+                        live = live & (lane == route_k)
                     if const_expr(not compact_plan):
                         live = live & (flat < sentinel_val)
                     live_mask = ballot(T.i32, live)
@@ -796,8 +799,7 @@ def _make_dispatch_tdm(
                         TDM.tdm_load(
                             TDM.tdm_group0(
                                 my_tile,
-                                fx.Int64(addr_inp_tok)
-                                + fx.Int64(tok) * fx.Int64(nbytes),
+                                addr_inp_tok + fx.Int64(tok) * fx.Int64(nbytes),
                             ),
                             g_payload_load,
                         )
@@ -820,16 +822,16 @@ def _make_dispatch_tdm(
                                 )
                                 if const_expr(scale_vec == 2):
                                     comm_ops.store_i32_lds(
-                                        scale_lds + fx.Int64(si) * fx.Int64(4),
+                                        scale_lds + fx.Int64(si) * 4,
                                         val[0],
                                     )
                                     comm_ops.store_i32_lds(
-                                        scale_lds + fx.Int64(si + 1) * fx.Int64(4),
+                                        scale_lds + fx.Int64(si + 1) * 4,
                                         val[1],
                                     )
                                 else:
                                     comm_ops.store_i32_lds(
-                                        scale_lds + fx.Int64(si) * fx.Int64(4),
+                                        scale_lds + fx.Int64(si) * 4,
                                         val,
                                     )
                             fx.rocdl.s_wait_dscnt(0)
@@ -895,7 +897,7 @@ def _make_dispatch_tdm(
             arrive_ticket = arith.constant(-1)
             if tid == 0:
                 arrive_ticket = comm_ops.atomic_add_system(
-                    fx.Int64(addr_disp_bar), arith.constant(1)
+                    addr_disp_bar, arith.constant(1)
                 )
             if warp == 0:
                 arrive_ticket = readlane(T.i32, arrive_ticket, 0)
@@ -905,9 +907,10 @@ def _make_dispatch_tdm(
                     buffer_store(arith.constant(0), rsrc_disp_bar, 0)
                 comm_ops.fence_system_release()
                 for dest_pe in range(lane, npes, WAVE):
-                    recv_num_remote_addr = fx.Int64(
-                        window.lsa_ptr(dest_pe, off_recv_num)
-                    ) + fx.Int64(rank) * fx.Int64(4)
+                    recv_num_remote_addr = (
+                        fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
+                        + fx.Int64(rank) * 4
+                    )
                     comm_ops.store_i32_system(
                         recv_num_remote_addr, arith.constant(0), arith.constant(1)
                     )
@@ -915,7 +918,7 @@ def _make_dispatch_tdm(
 
                 local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
                 for src_pe in range(lane, npes, WAVE):
-                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
+                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * 4
                     comm_ops.spin_until_gt_i32(recv_num_src_addr, 0)
                     comm_ops.store_i32_system(
                         recv_num_src_addr, arith.constant(0), arith.constant(0)
@@ -944,7 +947,7 @@ def _make_dispatch_tdm(
             arrive_ticket = arith.constant(no_ticket)
             if tid == 0:
                 arrive_ticket = comm_ops.atomic_add_system(
-                    fx.Int64(addr_disp_bar), arith.constant(1)
+                    addr_disp_bar, arith.constant(1)
                 )
             if warp == 0:
                 arrive_ticket = readlane(T.i32, arrive_ticket, 0)
@@ -956,13 +959,13 @@ def _make_dispatch_tdm(
                 for dest_pe in range(lane, npes, WAVE):
                     comm_ops.spin_until_eq_i32(
                         fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
-                        + fx.Int64(rank) * fx.Int64(4),
+                        + fx.Int64(rank) * 4,
                         0,
                     )
                 comm_ops.waitcnt_stores()
                 if lane == 0:
                     drain_ticket = comm_ops.atomic_add_system(
-                        fx.Int64(addr_disp_bar), arith.constant(1)
+                        addr_disp_bar, arith.constant(1)
                     )
                 drain_ticket = readlane(T.i32, drain_ticket, 0)
 
@@ -985,9 +988,10 @@ def _make_dispatch_tdm(
                     for expert in range(lane, experts_per_rank, WAVE):
                         buffer_store(arith.constant(0), rsrc_route_counter, expert)
                 for dest_pe in range(lane, npes, WAVE):
-                    recv_num_remote_addr = fx.Int64(
-                        window.lsa_ptr(dest_pe, off_recv_num)
-                    ) + fx.Int64(rank) * fx.Int64(4)
+                    recv_num_remote_addr = (
+                        fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
+                        + fx.Int64(rank) * 4
+                    )
                     signal_value = (
                         buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32)
                         + 1
@@ -1008,7 +1012,7 @@ def _make_dispatch_tdm(
             if is_first:
                 if lane == 0:
                     comm_ops.store_i32_system(
-                        fx.Int64(addr_total_recv),
+                        addr_total_recv,
                         arith.constant(0),
                         arith.constant(0),
                     )
@@ -1016,14 +1020,12 @@ def _make_dispatch_tdm(
                 # program order; the wait is what makes it ahead in memory too.
                 comm_ops.waitcnt_stores()
                 for src_pe in range(lane, npes, WAVE):
-                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
+                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * 4
                     signal_value = comm_ops.spin_until_gt_i32(recv_num_src_addr, 0)
                     comm_ops.store_i32_system(
                         recv_num_src_addr, arith.constant(0), arith.constant(0)
                     )
-                    comm_ops.atomic_add_system(
-                        fx.Int64(addr_total_recv), signal_value - 1
-                    )
+                    comm_ops.atomic_add_system(addr_total_recv, signal_value - 1)
                 if lane == 0:
                     local_tok_off = fx.Int64(window.lsa_ptr(my_lsa_rank, off_tok_off))
                     comm_ops.store_i32_system(

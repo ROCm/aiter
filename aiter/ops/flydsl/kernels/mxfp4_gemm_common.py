@@ -104,7 +104,7 @@ def _global_scalar_tiles(addr_i64, numeric_cls, num_elems):
 def _scalar_store(tiles, idx, value, numeric_cls):
     atom = fx.make_copy_atom(fx.UniversalCopy(numeric_cls.width), numeric_cls)
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), numeric_cls)
-    r.store(fx.Vector.from_elements([numeric_cls(value)], numeric_cls))
+    r.store(fx.Vector.from_elements([value], numeric_cls))
     fx.copy(atom, r, fx.slice(tiles, (None, idx)))
 
 
@@ -155,7 +155,7 @@ def _global_i32_buffer_view(addr_i64, num_bytes):
     view = fx.Tensor(
         fx.make_view(
             global_typed_ptr(addr_i64, T.i32),
-            fx.make_layout(num_bytes_i64 // fx.Int64(4), 1),
+            fx.make_layout(num_bytes_i64 // 4, 1),
         )
     )
     return fx.rocdl.make_buffer_tensor(
@@ -218,7 +218,7 @@ def _fabs_f32(x):
 def _e8m0_roundup(amax_f32, max_norm=6.0):
     wi = (amax_f32 * fx.Float32(1.0 / float(max_norm))).bitcast(fx.Int32)
     bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
-    lt = fx.Uint32(bexp) < fx.Uint32(254)
+    lt = fx.Uint32(bexp) < 254
     return lt.select(bexp, fx.Int32(254))
 
 
@@ -239,11 +239,16 @@ def _pkmax_u16(a_i32, b_i32):
     return fx.max(va, vb).bitcast(fx.Int32)[0]
 
 
-def _swiglu_mul_batch(gate_values, up_values, limit=7.0):
+def _clamp_gate_up_batch(gate_values, up_values, limit=7.0):
     limit_f32 = fx.Float32(float(limit))
     neg_limit_f32 = fx.Float32(-float(limit))
     gates = [fx.min(gate, limit_f32) for gate in gate_values]
     ups = [fx.max(fx.min(up, limit_f32), neg_limit_f32) for up in up_values]
+    return gates, ups
+
+
+def _swiglu_mul_batch(gate_values, up_values, limit):
+    gates, ups = _clamp_gate_up_batch(gate_values, up_values, limit)
     # Fold alpha into the exp2 constant to retain this kernel's rounding.
     sigmoids = sigmoid_batch(gates, alpha=1.702)
     return [
@@ -284,6 +289,9 @@ def _activation_mul_batch(
             beta=situ_beta,
             linear_beta=situ_linear_beta,
         )
+    # DSV4/DSV4.1 SiLU semantics clamp gate/up before the multiply. The host
+    # supplies +inf for ordinary unclamped SiLU.
+    gate_values, up_values = _clamp_gate_up_batch(gate_values, up_values, swiglu_limit)
     return _silu_mul_batch(gate_values, up_values)
 
 

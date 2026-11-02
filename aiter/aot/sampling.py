@@ -1,7 +1,8 @@
-import concurrent.futures
-import os
+"""AOT-compile sampling kernels; this module does not perform token sampling."""
+
 from collections import namedtuple
 
+from aiter_worker_limits import adopt_legacy_max_jobs, run_compile_jobs
 from csrc.cpp_itfs.sampling.top_k_renorm_probs import (
     compile as top_k_renorm_probs_compile,
 )
@@ -77,14 +78,15 @@ def main():
                 )
             )
 
-    max_jobs = int(os.environ.get("MAX_JOBS", os.cpu_count() or 16))
-
-    # Process all configs in parallel
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_jobs) as executor:
-        executor.map(process_top_k_renorm_config, top_k_renorm_configs)
-        executor.map(process_top_p_sampling_config, top_p_sampling_configs)
-        executor.map(process_top_k_top_p_sampling_config, top_k_top_p_sampling_configs)
+    run_compile_jobs(
+        (
+            (process_top_k_renorm_config, top_k_renorm_configs),
+            (process_top_p_sampling_config, top_p_sampling_configs),
+            (process_top_k_top_p_sampling_config, top_k_top_p_sampling_configs),
+        )
+    )
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()

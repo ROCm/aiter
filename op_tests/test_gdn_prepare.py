@@ -101,11 +101,11 @@ def _load_kernels():
         gdn_prepare_flydsl_supported,
         gdn_prepare_fwd_flydsl,
     )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    from aiter.ops.triton._triton_kernels.gated_delta_net.prefill import (
         fused_chunk_local_cumsum_scaled_dot_kkt_fwd,
         fused_solve_tril_recompute_w_u,
     )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+    from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
         build_gated_delta_rule_prefill_metadata,
     )
     from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk

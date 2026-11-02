@@ -4,7 +4,7 @@ import argparse
 import glob
 import json
 import os
-import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -19,23 +19,23 @@ from codegen.common import (
     _NOSPLIT,
     _SPLITK,
     get_arch_map,
-)
-from codegen.common import (
-    kid_arch as _kid_arch_common,
+    open_if_changed,
+    prune_unwritten,
+    reset_written_paths,
+    write_if_changed,
 )
 from opus_gemm_common import (
-    BMM_MXSCALE_KIDS,
-    DEFAULT_COMPILED_KIDS,
-    OPUS_MANDATORY_A8_KIDS,
+    KERNEL_REGISTRY,
+    KernelKey,
     OpusGemmInstance,
     a8w8_kernels_list,
-    a8w8_mxscale_bmm_kernel_lists,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
     a16w16_kernels_list,
     a16w16_mono_tile_kernels_list,
-    default_compiled_kids_for_arch,
+    default_compiled_keys,
+    get_registry,
     gfx942_a8w8_kernels_list,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
@@ -43,8 +43,54 @@ from opus_gemm_common import (
     gfx1250_clusterlaunch_kernels_list,
     gfx1250_kernels_list,
     gfx1250_splitk_fuse_kernels_list,
-    kernels_list,
 )
+
+
+def _build_targets_standalone(explicit_targets=()):
+    if explicit_targets:
+        targets = []
+        for value in explicit_targets:
+            gfx, cu = value.split("/")
+            targets.append((gfx.split(":", 1)[0].strip().lower(), int(cu)))
+        return sorted(set(targets))
+    explicit_arches = [
+        gfx.strip().lower()
+        for gfx in os.getenv("GPU_ARCHS", "native").split(";")
+        if gfx.strip() and gfx.strip().lower() != "native"
+    ]
+    if explicit_arches:
+        return sorted(
+            {
+                (gfx, cu)
+                for gfx in explicit_arches
+                for arches in KERNEL_REGISTRY.values()
+                for cu in arches.get(gfx, {})
+            }
+        )
+    import importlib.util
+
+    spec = importlib.util.find_spec("aiter")  # locates, does not execute
+    if spec is None or not spec.submodule_search_locations:
+        raise ImportError("aiter package not found")
+    utils_dir = os.path.join(
+        next(iter(spec.submodule_search_locations)), "jit", "utils"
+    )
+    if utils_dir not in sys.path:
+        sys.path.insert(0, utils_dir)
+    mod_spec = importlib.util.spec_from_file_location(
+        "_opus_chip_info", os.path.join(utils_dir, "chip_info.py")
+    )
+    mod = importlib.util.module_from_spec(mod_spec)
+    mod_spec.loader.exec_module(mod)
+    targets = set(mod.get_build_targets())
+    for gfx, _cu in tuple(targets):
+        targets.update(
+            (gfx, cu)
+            for arches in KERNEL_REGISTRY.values()
+            for cu in arches.get(gfx, {})
+        )
+    return sorted(targets)
+
 
 # Merge the codegen maps registered by each architecture.
 PIPELINE_HEADER_MAP = {
@@ -184,14 +230,27 @@ def _kernel_func_for(k):
 
 
 INPUT_DTYPE_MAP = {
+    "a8w8_mxscale_bmm_bpreshuffle_compact": ("fp8_t", "fp8_t"),
     "a8w8_scale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_flatmm_splitk": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_bcast": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_blds": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_allwave": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_sfmpack": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_fused": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_minterleave": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_mouter": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_mouter_tunable": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_pipeline": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_wave8n2": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
@@ -232,25 +291,85 @@ KARGS_NAME_MAP = {
 
 
 def _kargs_template_vars(kernel_tag, kargs_name):
+    # a8w8_mxscale BMM flatmm splitK kernel has two extra compile-time booleans
+    # (DIRECT_ONLY, PREFETCH_SCALE) plus a non-void D_OUT after Traits. The fused
+    # host TU must forward-declare all four template params so the launcher body
+    # (which launches gemm_a8w8_mxscale_flatmm_splitk_kernel<Traits, D_OUT, dir,
+    # pfk>) compiles without pulling in the device pipeline header.
+    # The tags sharing gemm_a8w8_mxscale_flatmm_splitk_kernel carry a 6th and 7th
+    # parameter, SHUFFLE_SCALE and SF_SHUF_IN_LDS, which the others' kernels do not
+    # declare -- so this list tracks the KERNEL_FUNC_MAP grouping and not the
+    # parameter count. No defaults, deliberately: a missing site must be a
+    # compile error rather than a silent link against the non-panel kernel.
     if kernel_tag in (
         "a8w8_mxscale_bmm_flatmm_splitk",
         "a8w8_mxscale_bmm_fused",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_allwave",
+    ):
+        return (
+            "",
+            (
+                ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE,"
+                " bool PRELOAD_SF_LDS, bool SHUFFLE_SCALE, bool SF_SHUF_IN_LDS"
+            ),
+            kargs_name,
+        )
+    if kernel_tag in (
+        "a8w8_mxscale_bmm_bpreshuffle",
+        "a8w8_mxscale_bmm_bpreshuffle_bcast",
+        "a8w8_mxscale_bmm_bpreshuffle_sfmpack",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
     ):
         return (
             "",
             ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE, bool PRELOAD_SF_LDS",
             kargs_name,
         )
+    # The wave8 family shares one kernel that carries a 6th through 9th
+    # parameter: SFA_MPACK_GLOBAL, XCD_WGM, SHUFFLE_SCALE and SF_SHUF_IN_LDS. No
+    # defaults here either -- the fused host TU pulls in one decl per kid and a
+    # default argument may appear only once per TU. The launchers pass all four.
+    if kernel_tag in (
+        "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+    ):
+        return (
+            "",
+            (
+                ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE,"
+                " bool PRELOAD_SF_LDS, bool SFA_MPACK_GLOBAL, int XCD_WGM,"
+                " bool SHUFFLE_SCALE, bool SF_SHUF_IN_LDS"
+            ),
+            kargs_name,
+        )
+    # BMM M-tile-interleaved kernel: <Traits, D_OUT, bool SKIP_SCALE_WAIT>. The
+    # fused host TU must forward-declare all three template params so the launcher
+    # body's gemm_a8w8_mxscale_flatmm_minterleave_kernel<Traits, D_OUT, skip>
+    # <<<...>>> call compiles without the device pipeline header.
     if kernel_tag == "a8w8_mxscale_bmm_minterleave":
         return "", ", typename D_OUT, bool SKIP_SCALE_WAIT", kargs_name
-    if kernel_tag == "a8w8_mxscale_bmm_pipeline":
+    # BMM specialized pipelines: forward-declare the exact kernel template params
+    # so the fused host TU's <<<...>>> call compiles against only the traits header.
+    if kernel_tag in (
+        "a8w8_mxscale_bmm_pipeline",
+        "a8w8_mxscale_bmm_pipeline_bpreshuffle",
+    ):
+        # scale-pipeline kernels are templated on a single Traits (output dtype is
+        # baked into the traits tuple) -> no extra template params.
         return "", "", kargs_name
     if kernel_tag in (
         "a8w8_mxscale_bmm_mouter",
         "a8w8_mxscale_bmm_mouter_tunable",
     ):
         return "", ", typename D_OUT, bool SKIP_SCALE_WAIT", kargs_name
-    if kernel_tag == "a8w8_mxscale_bmm_wave8n2":
+    if kernel_tag in (
+        "a8w8_mxscale_bmm_wave8n2",
+        "a8w8_mxscale_bmm_bpreshuffle_compact",
+    ):
         return "", ", typename D_OUT", kargs_name
     if kernel_tag == "a8w8_mxscale_bmm_wave4m2_selfload":
         return (
@@ -310,12 +429,10 @@ def instance_impl_host_tu_split(
 # Extra parameters appended to each generated launcher signature.
 A16W16_LAUNCH_HOST_EXTRA = ",\n    std::optional<aiter_tensor_t>,\n    int"
 A16W16_WORKSPACE_LAUNCH_HOST_EXTRA = (
-    ",\n    aiter_tensor_t &workspace,"
-    "\n    std::optional<aiter_tensor_t>,"
-    "\n    int"
+    ",\n    aiter_tensor_t &workspace,\n    std::optional<aiter_tensor_t>,\n    int"
 )
 A8W8_BLOCKSCALE_HOST_EXTRA = (
-    ",\n    aiter_tensor_t &x_scale," "\n    aiter_tensor_t &w_scale"
+    ",\n    aiter_tensor_t &x_scale,\n    aiter_tensor_t &w_scale"
 )
 
 
@@ -572,7 +689,9 @@ class opus_gemm_codegen:
                 return
             f.write(f"#define {macro_name}{macro_suffix} \\\n")
             for index, (kid, name) in enumerate(rows):
-                line = entry.format(kid=kid, kernel_name=name)
+                line = entry.format(
+                    kid=f"{{ {kid.cu_num}, {kid.kid} }}", kernel_name=name
+                )
                 if index == len(rows) - 1:
                     line = line.rstrip().rstrip("\\").rstrip() + "\n"
                 f.write(line)
@@ -582,14 +701,15 @@ class opus_gemm_codegen:
             rows = []
             for kid, k in kernels_dict.items():
                 if not (
-                    isinstance(kid, int) and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
+                    isinstance(kid, KernelKey)
+                    and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
                 ):
                     continue
-                if _kid_arch_common(k) != arch or k.kernel_tag in SPLITK_TAGS:
+                if kid.gfx != arch or k.kernel_tag in SPLITK_TAGS:
                     continue
                 if ctype not in k.output_dtypes:
                     continue
-                if _kid_arch_common(k) != arch:
+                if kid.gfx != arch:
                     continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda r: r[0])
@@ -604,10 +724,11 @@ class opus_gemm_codegen:
             rows = []
             for kid, k in kernels_dict.items():
                 if not (
-                    isinstance(kid, int) and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
+                    isinstance(kid, KernelKey)
+                    and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
                 ):
                     continue
-                if _kid_arch_common(k) != arch or k.kernel_tag not in SPLITK_TAGS:
+                if kid.gfx != arch or k.kernel_tag not in SPLITK_TAGS:
                     continue
                 if "fp32_t" not in k.output_dtypes:
                     raise ValueError(
@@ -619,8 +740,8 @@ class opus_gemm_codegen:
             macro_name = f"GENERATE_A16W16_WORKSPACE_KID_DISPATCH_{arch.upper()}"
             _write_rows(f, macro_name, rows, WORKSPACE_ENTRY)
 
-        with open(
-            os.path.join(self.working_path, "opus_gemm_a16w16_kid_dispatch.h"), "w"
+        with open_if_changed(
+            os.path.join(self.working_path, "opus_gemm_a16w16_kid_dispatch.h")
         ) as f:
             f.write(HEADER)
             for arch in SPLITK_REDUCE_ARCHES:
@@ -646,9 +767,9 @@ class opus_gemm_codegen:
         def _rows(arch, tags, ctype):
             rows = []
             for kid, k in kernels_dict.items():
-                if not isinstance(kid, int) or k.kernel_tag not in tags:
+                if not isinstance(kid, KernelKey) or k.kernel_tag not in tags:
                     continue
-                if _kid_arch_common(k) != arch or ctype not in k.output_dtypes:
+                if kid.gfx != arch or ctype not in k.output_dtypes:
                     continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda row: row[0])
@@ -661,14 +782,16 @@ class opus_gemm_codegen:
                 return
             f.write(f"#define {macro_name} \\\n")
             for index, (kid, name) in enumerate(rows):
-                line = entry.format(kid=kid, kernel_name=name, ctype=ctype)
+                line = entry.format(
+                    kid=f"{{ {kid.cu_num}, {kid.kid} }}", kernel_name=name, ctype=ctype
+                )
                 if index == len(rows) - 1:
                     line = line.rstrip().rstrip("\\").rstrip() + "\n"
                 f.write(line)
             f.write("\n")
 
-        with open(
-            os.path.join(self.working_path, "opus_gemm_a8w8_kid_dispatch.h"), "w"
+        with open_if_changed(
+            os.path.join(self.working_path, "opus_gemm_a8w8_kid_dispatch.h")
         ) as f:
             f.write(header)
             _emit_map(
@@ -699,8 +822,8 @@ class opus_gemm_codegen:
                         ctype,
                     )
 
-    def gen_bmm_mxscale_kid_dispatch(self):
-        """Emit the global exact-kid table for gfx950 MXFP8 BMM launchers."""
+    def gen_bmm_mxscale_kid_dispatch(self, kernels_dict):
+        """Emit exact (CU, local kid) routes for gfx950 MXFP8 BMM launchers."""
         header = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -710,25 +833,53 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\
 """
 
+        # The scale-shape check runs before the kid is dispatched, and what shape
+        # is correct depends on the kid: GROUP_N and GROUP_K are 128 or 32. So
+        # the table below travels with the dispatch table rather than the check
+        # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
+        group_entry = """\
+    {{ {kid}, {{ {group_n}, {group_k} }} }},  \\
+"""
+
         rows = sorted(
-            (kid, instance.name)
-            for family in a8w8_mxscale_bmm_kernel_lists
-            for kid, instance in family.items()
-            if "fp32_t" in instance.output_dtypes
+            (kid, instance.name, instance.GROUP_N, instance.GROUP_K)
+            for kid, instance in kernels_dict.items()
+            if kid.family == "a8w8_mxscale_bmm" and "fp32_t" in instance.output_dtypes
         )
-        with open(
-            os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h"),
-            "w",
-        ) as f:
-            f.write(header)
-            f.write(f"#define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE {len(rows)}\n")
-            f.write("#define GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE) \\\n")
-            for index, (kid, name) in enumerate(rows):
-                line = entry.format(kid=kid, kernel_name=name)
+
+        def emit(f, macro, fmt, fields):
+            f.write(f"#define {macro} \\\n")
+            for index, row in enumerate(rows):
+                line = fmt.format(**fields(row))
                 if index == len(rows) - 1:
                     line = line.rstrip().rstrip("\\").rstrip() + "\n"
                 f.write(line)
             f.write("\n")
+
+        with open_if_changed(
+            os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h")
+        ) as f:
+            f.write(header)
+            f.write(f"#define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE {len(rows)}\n")
+            emit(
+                f,
+                "GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE)",
+                entry,
+                lambda r: {
+                    "kid": f"{{ {r[0].cu_num}, {r[0].kid} }}",
+                    "kernel_name": r[1],
+                },
+            )
+            emit(
+                f,
+                "GENERATE_BMM_MXSCALE_KID_GROUPS",
+                group_entry,
+                lambda r: {
+                    "kid": f"{{ {r[0].cu_num}, {r[0].kid} }}",
+                    "group_n": r[2],
+                    "group_k": r[3],
+                },
+            )
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
@@ -805,23 +956,27 @@ void
     std::optional<aiter_tensor_t> workspace,
     int splitK);
 """
-        with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
-            f.write(MANIFEST_HEAD)
-            for k in kernels_dict.values():
-                if k.kernel_tag.startswith("a8w8_mxscale_bmm_"):
-                    f.write(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
-                elif k.kernel_tag in SPLITK_TAGS:
-                    f.write(MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name))
-                elif k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
-                    f.write(MANIFEST_A16W16.format(kernel_name=k.name))
-                elif k.kernel_tag == "a8w8":
-                    f.write(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
-                elif k.kernel_tag == "a8w8_scale":
-                    f.write(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
-                elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
-                    f.write(MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(kernel_name=k.name))
-                else:
-                    raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
+        parts = [MANIFEST_HEAD]
+        for k in kernels_dict.values():
+            if k.kernel_tag.startswith("a8w8_mxscale_bmm_"):
+                parts.append(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
+            elif k.kernel_tag in SPLITK_TAGS:
+                parts.append(MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name))
+            elif k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
+                parts.append(MANIFEST_A16W16.format(kernel_name=k.name))
+            elif k.kernel_tag == "a8w8":
+                parts.append(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
+            elif k.kernel_tag == "a8w8_scale":
+                parts.append(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
+            elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
+                parts.append(MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(kernel_name=k.name))
+            else:
+                raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
+        # Every TU includes this header, so rewriting it unconditionally would
+        # invalidate the whole build even when the manifest is identical.
+        write_if_changed(
+            os.path.join(self.working_path, "opus_gemm_manifest.h"), "".join(parts)
+        )
 
     # -- Per-pass TU emission -- Replaces the old "one .cpp per (kid, dtype)" scheme.
 
@@ -885,9 +1040,10 @@ void
                 + host_body
                 + "#endif // host pass only\n"
             )
-            Path(
-                os.path.join(self.instances_path, f"all_instances_host_{arch}.cu")
-            ).write_text(contents)
+            write_if_changed(
+                os.path.join(self.instances_path, f"all_instances_host_{arch}.cu"),
+                contents,
+            )
 
     def _emit_device_tus(self):
         """Emit one device-only .device.cu per (kid, dtype).
@@ -931,9 +1087,10 @@ void
                 + row["device_decl"]
                 + guard_close
             )
-            Path(
-                os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu")
-            ).write_text(contents)
+            write_if_changed(
+                os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu"),
+                contents,
+            )
 
     def _emit_splitk_reduce_tu(self):
         """Emit a single splitk_reduce.device.cu carrying the 4 reduce
@@ -1021,14 +1178,22 @@ void
             extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(reduce_arch, {})
             contents += extra_reduce.get("device_instantiations", lambda: "")()
             contents += guard_close
-            Path(
+            write_if_changed(
                 os.path.join(
                     self.instances_path, f"splitk_reduce_{reduce_arch}.device.cu"
-                )
-            ).write_text(contents)
+                ),
+                contents,
+            )
 
     def gen_instances(self, kernels_dict):
         """Regenerate launchers, manifests and exact-kid tables."""
+        by_symbol = {}
+        for instance in kernels_dict.values():
+            previous = by_symbol.setdefault(instance.name, instance)
+            if previous != instance:
+                raise ValueError(
+                    f"different configurations share launcher symbol {instance.name}"
+                )
         # A rerun in an existing blob directory must not leave removed or
         # renamed generated policy headers behind.
         for legacy_header in (
@@ -1039,19 +1204,20 @@ void
         ):
             Path(self.working_path, legacy_header).unlink(missing_ok=True)
 
-        if os.path.exists(self.impl_path):
-            shutil.rmtree(self.impl_path)
-        os.mkdir(self.impl_path)
-        if os.path.exists(self.instances_path):
-            shutil.rmtree(self.instances_path)
-        os.mkdir(self.instances_path)
+        # Generate in place and prune afterwards instead of wiping these two
+        # trees: an rmtree hands every surviving file a fresh mtime, which made
+        # ninja recompile all ~670 opus TUs on every rebuild even when the
+        # generated text was byte-identical.
+        reset_written_paths()
+        os.makedirs(self.impl_path, exist_ok=True)
+        os.makedirs(self.instances_path, exist_ok=True)
 
         # Reset the instantiation accumulators so reruns under the same
         # codegen object don't double-emit.
         self._host_instantiations = []
         self._device_instantiations = []
 
-        for k in kernels_dict.values():
+        for k in by_symbol.values():
             self.gen_instance(k)
 
         # Emit one fused HOST TU + N device TUs (one per kid, dtype) + one dedicated splitk_reduce.device.cu.
@@ -1066,21 +1232,14 @@ void
         if needs_reduce_tu:
             self._emit_splitk_reduce_tu()
 
-        self.gen_manifest_head(kernels_dict)
+        self.gen_manifest_head(by_symbol)
         self.gen_a16w16_kid_dispatch(kernels_dict)
         self.gen_a8w8_kid_dispatch(kernels_dict)
-        self.gen_bmm_mxscale_kid_dispatch()
+        self.gen_bmm_mxscale_kid_dispatch(kernels_dict)
 
-
-def _tune_df_kids(df):
-    """Read kid values from either supported tuned-CSV column name."""
-    kids = None
-    for col in ("solidx", "kernelId"):
-        if col not in df.columns:
-            continue
-        values = pd.to_numeric(df[col], errors="coerce")
-        kids = values if kids is None else kids.fillna(values)
-    return kids
+        # Kids that left the compile set must not leave a source behind.
+        prune_unwritten(self.impl_path)
+        prune_unwritten(self.instances_path)
 
 
 if __name__ == "__main__":
@@ -1132,22 +1291,28 @@ if __name__ == "__main__":
         default=None,
         required=False,
         help=(
-            "Path to the subset-compile sidecar (JSON list of int kids). "
+            "Path to the subset-compile sidecar (JSON list of family/gfx/CU/local-kid strings). "
             "Defaults to {working_path}/compiled_kids.json. The sidecar "
             "captures the union of CSV opus rows + previous sidecar "
             "contents + extra kids + DEFAULT_COMPILED_KIDS and mandatory "
             "family kids. JIT supplies a "
             "staged copy and publishes it after successful compilation. "
-            "Tuners pass new candidates with --extra_kids."
+            "Tuners pass new candidates with --extra_kernel_keys."
         ),
     )
 
     parser.add_argument(
-        "--extra_kids",
+        "--extra_kernel_keys",
         nargs="*",
-        type=int,
+        action="extend",
         default=[],
-        help="Additional tuner candidates for this build; persisted only after success.",
+        help="Additional family/gfx/CU/local-kid identities to compile.",
+    )
+    parser.add_argument(
+        "--targets",
+        nargs="+",
+        default=[],
+        help="Explicit gfx/CU build targets, e.g. gfx950/128 gfx950/256.",
     )
 
     # Legacy --tune_file alias kept for backward compat with any existing
@@ -1160,8 +1325,11 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    targets = _build_targets_standalone(args.targets)
+    requested_keys = {KernelKey.decode(value) for value in args.extra_kernel_keys}
     if args.tune_files is None and args.tune_file is not None:
         args.tune_files = args.tune_file
+
     TAG_TO_LIST = {
         "a8w8_scale": a8w8_scale_kernels_list,
         "a8w8": a8w8_kernels_list,
@@ -1192,9 +1360,6 @@ if __name__ == "__main__":
         },
     }
 
-    # --- Compute the subset-compile set S ------------------------------------ S = (CSV opus rows'
-    # kids) ?
-
     def _expand_tune_paths(spec):
         out = []
         seen = set()
@@ -1211,175 +1376,100 @@ if __name__ == "__main__":
                 out.append(path)
         return out
 
-    csv_kids: set[int] = set()
-    csv_paths = _expand_tune_paths(args.tune_files)
-    for path in csv_paths:
+    available = {
+        KernelKey(family, gfx, cu, kid): instance
+        for gfx, cu in targets
+        for family, arches in KERNEL_REGISTRY.items()
+        if gfx in arches
+        for kid, instance in get_registry(family, gfx, cu).items()
+    }
+    csv_keys = set()
+    for path in _expand_tune_paths(args.tune_files):
         try:
             df = pd.read_csv(path)
         except (pd.errors.EmptyDataError, FileNotFoundError):
             continue
-        if "libtype" not in df.columns:
+        if "libtype" not in df:
             continue
-        df = df[df["libtype"] == "opus"]
-        if df.empty:
-            continue
-        kids = _tune_df_kids(df)
-        if kids is None:
-            continue
-        for v in kids.dropna().tolist():
+        for row in df[df["libtype"].eq("opus")].to_dict("records"):
             try:
-                csv_kids.add(int(v))
-            except (TypeError, ValueError):
+                value = pd.to_numeric(row.get("solidx"), errors="coerce")
+                if pd.notna(value):
+                    family = "a16w16"
+                else:
+                    value = pd.to_numeric(row.get("kernelId"), errors="coerce")
+                    if pd.notna(row.get("b")):
+                        family = "a8w8_mxscale_bmm"
+                    elif pd.notna(row.get("scaleAB")):
+                        scale_ab = str(row["scaleAB"]).strip().lower() in ("true", "1")
+                        family = "a8w8_blockscale" if scale_ab else "a8w8"
+                    else:
+                        family = "a8w8_blockscale_bpreshuffle"
+                key = KernelKey(family, str(row["gfx"]), int(row["cu_num"]), int(value))
+            except (ValueError, KeyError, TypeError, OverflowError):
                 continue
-
+            if (key.gfx, key.cu_num) not in targets:
+                continue
+            instance = available.get(key)
+            name = str(row.get("kernelName", ""))
+            if instance is None or (
+                name not in ("", "nan", "None") and name != instance.name
+            ):
+                continue
+            csv_keys.add(key)
     sidecar_path = args.compiled_kids_sidecar or os.path.join(
         args.working_path, "compiled_kids.json"
     )
-    sidecar_kids: set[int] = set()
-    if os.path.exists(sidecar_path):
-        try:
-            with open(sidecar_path) as f:
-                sidecar_kids = {int(x) for x in json.load(f)}
-        except (OSError, ValueError, TypeError):
-            sidecar_kids = set()
-
-    # The compile set: union, intersected with valid kernels_list entries.
-    # MXFP8 BMM launchers are emitted as one gfx950 family below and deduplicated
-    # by generated symbol name, so they never participate in the per-kid subset.
-    valid_kids = set(kernels_list.keys())
-    S = (
-        csv_kids | sidecar_kids | set(args.extra_kids) | set(DEFAULT_COMPILED_KIDS)
-    ) & valid_kids
-    S -= set(BMM_MXSCALE_KIDS)
-
-    # Per-arch filter: drop kids whose arch_prefix is not in the target build set.
-    _kid_arch = _kid_arch_common
-
-    target_arches = None
-    gpu_archs_env = os.getenv("GPU_ARCHS", "native").strip()
-    explicit = [
-        a.strip().lower()
-        for a in gpu_archs_env.split(";")
-        if a.strip() and a.strip().lower() != "native"
-    ]
-    if explicit:
-        target_arches = set(explicit)
-    else:
-        # GPU_ARCHS=native: probe live GPU; skip filter if rocminfo unavailable.
-        try:
-            from aiter.jit.utils.chip_info import get_gfx_runtime
-
-            target_arches = {get_gfx_runtime().lower()}
-        except Exception:  # noqa: BLE001
-            target_arches = None
-
-    if target_arches is not None:
-        before = len(S)
-        S = {kid for kid in S if _kid_arch(kernels_list[kid]) in target_arches}
-        dropped = before - len(S)
-        print(
-            f"[opus gen_instances] arch filter: target={sorted(target_arches)} "
-            f"dropped {dropped} off-arch kids from |S|"
-        )
-
-    # Emit OPUS_BUILD_HAS_* macros so opus_gemm.cu can gate per-arch dispatch
-    # tables: a single-arch build (GPU_ARCHS=gfx950) must not link gfx942
-    # launcher symbols and vice versa.
-    archs_for_header = (
-        sorted(target_arches)
-        if target_arches is not None
-        else ["gfx942", "gfx950", "gfx1250"]
-    )
-    with open(os.path.join(args.working_path, "opus_build_archs.h"), "w") as f:
-        f.write(
-            "// SPDX-License-Identifier: MIT\n"
-            "// Auto-generated. See gen_instances.py.\n"
-            "#pragma once\n"
-        )
-        f.writelines(
-            f"#define OPUS_BUILD_HAS_{a.upper()} 1\n" for a in archs_for_header
-        )
-
-    # Family ABI defaults must be linkable even when no tuned row or sidecar
-    # mentions them.  This set is arch-scoped so single-arch builds never pull
-    # another architecture's launcher symbol into their host TU.
-    mandatory_arches = (
-        set(OPUS_MANDATORY_A8_KIDS) if target_arches is None else set(target_arches)
-    )
-    mandatory_a8_kids = set().union(
-        *(OPUS_MANDATORY_A8_KIDS.get(arch, frozenset()) for arch in mandatory_arches)
-    )
-    S |= mandatory_a8_kids & valid_kids
-
-    # Honor --kernel_tag as a developer override that *further restricts* the set (within the a16w16
-    # / a8w8 families).
-    if args.kernel_tag:
-        tag_keys = set(TAG_TO_LIST.get(args.kernel_tag, {}).keys())
-        if tag_keys:
-            # Restrict to the requested family + default compile floor.
-            S = (S & tag_keys) | set(default_compiled_kids_for_arch(target_arches))
-            S |= mandatory_a8_kids & valid_kids
-
-    # Default exact-id compile-floor invariant (single source of truth:
-    # opus_gemm_common.py). C++ and Python both perform exact-kid routing.
-    required_default = set(default_compiled_kids_for_arch(target_arches))
-    missing_default = required_default - S
-    assert not missing_default, (
-        f"Subset-compile error: default exact-id kids "
-        f"{sorted(missing_default)} are missing from the compile set S. "
-        f"Add them to the compile set or update DEFAULT_COMPILED_KIDS "
-        f"in csrc/opus_gemm/opus_gemm_common.py."
-    )
-
-    # The sidecar and request validation describe every emitted route, including
-    # BMM ids whose shared symbols are generated outside the per-kid subset.
-    bmm_kids = (
-        BMM_MXSCALE_KIDS
-        if target_arches is None or "gfx950" in target_arches
-        else frozenset()
-    )
-    compiled_kids = S | bmm_kids
-    missing_requested = set(args.extra_kids) - compiled_kids
-    if missing_requested:
-        parser.error(
-            "cannot compile requested --extra_kids "
-            f"{sorted(missing_requested)}: unknown kernel, outside target arches "
-            f"{sorted(target_arches) if target_arches is not None else 'all'}, "
-            "or excluded by --kernel_tag"
-        )
-
-    # Build the per-kid dict that drives codegen.
-    kdict = {kid: kernels_list[kid] for kid in sorted(S)}
-
-    # All 45 BMM ids are exact-routable in the canonical registry.  Several ids
-    # intentionally share one device geometry, so key this codegen-only merge by
-    # symbol name to emit each host/device specialization once.
-    if bmm_kids:
-        for family in a8w8_mxscale_bmm_kernel_lists:
-            for instance in family.values():
-                kdict[instance.name] = instance
-
-    print(
-        f"[opus gen_instances] subset compile: |S|={len(S)} kids "
-        f"(sources: CSV={len(S & csv_kids)}, "
-        f"sidecar={len(S & sidecar_kids)}, "
-        f"default-compiled={len(S & required_default)}, "
-        f"mandatory-a8={len(S & mandatory_a8_kids)}, "
-        f"extra={len(S & set(args.extra_kids))}); "
-        f"always-emitted-bmm={len(bmm_kids)}"
-    )
-
-    codegen = opus_gemm_codegen(args.working_path, args.tune)
-    codegen.gen_instances(kdict)
-
-    # Write the generated set inside staging. JIT publishes it to bd_dir only
-    # after the binary is installed, so a failed compile cannot advance it.
+    sidecar_keys = set()
     try:
-        os.makedirs(os.path.dirname(sidecar_path) or ".", exist_ok=True)
-    except OSError:
+        document = json.loads(Path(sidecar_path).read_text())
+        if isinstance(document, list) and all(
+            isinstance(value, str) for value in document
+        ):
+            sidecar_keys = {KernelKey.decode(value) for value in document}
+    except (OSError, ValueError, TypeError, KeyError):
         pass
-    with open(sidecar_path, "w") as f:
-        json.dump(sorted(compiled_kids), f)
+    defaults = {
+        key for gfx, cu in targets for key in default_compiled_keys(gfx, cu)
+    } & available.keys()
+    mandatory = {key for key in available if key.family != "a16w16"}
+    selected = (
+        csv_keys | sidecar_keys | requested_keys | defaults | mandatory
+    ) & available.keys()
+    if args.tune:
+        selected = set(available)
+    if args.kernel_tag:
+        tag_list = TAG_TO_LIST.get(args.kernel_tag, {})
+        tag_keys = {
+            key
+            for key, instance in available.items()
+            if key.kid in tag_list and instance.name == tag_list[key.kid].name
+        }
+        if tag_keys:
+            selected = (selected & tag_keys) | defaults | mandatory
+    missing = requested_keys - selected
+    if missing:
+        parser.error(
+            f"requested local kernels are unavailable: {sorted(key.encode() for key in missing)}"
+        )
+    target_arches = {gfx for gfx, cu in targets}
+    Path(args.working_path).mkdir(parents=True, exist_ok=True)
+    write_if_changed(
+        os.path.join(args.working_path, "opus_build_archs.h"),
+        "// SPDX-License-Identifier: MIT\n"
+        "// Auto-generated. See gen_instances.py.\n"
+        "#pragma once\n"
+        + "".join(
+            f"#define OPUS_BUILD_HAS_{gfx.upper()} 1\n" for gfx in sorted(target_arches)
+        ),
+    )
     print(
-        f"[opus gen_instances] wrote sidecar with {len(compiled_kids)} kids: {sidecar_path}"
+        f"[opus gen_instances] targets={targets}, routes={len(selected)}, "
+        f"symbols={len({available[key].name for key in selected})}"
+    )
+    codegen = opus_gemm_codegen(args.working_path, args.tune)
+    codegen.gen_instances({key: available[key] for key in sorted(selected)})
+    Path(sidecar_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(sidecar_path).write_text(
+        json.dumps(sorted(key.encode() for key in selected)) + "\n"
     )

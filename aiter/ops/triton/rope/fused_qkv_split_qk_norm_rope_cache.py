@@ -4,6 +4,7 @@ import triton
 from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
     _fused_qkv_split_qk_norm_rope_cache_kernel,
 )
+from aiter.ops.triton.utils._triton import arch_info
 
 
 def infer_rope_cache_triton_block_t(T: int, device: torch.device) -> int:
@@ -53,6 +54,8 @@ def fused_qkv_split_qk_norm_rope_cache(
     eps: float = 1e-5,
     gated_qkv_layout: str = "interleaved",
     kv_cache_layout: str = "HND",
+    q_scale: float = 1.0,
+    block_t: int | None = None,
 ):
     """Split packed ``qkv``, RMSNorm Q and K, apply RoPE, write K/V into paged caches.
 
@@ -90,7 +93,11 @@ def fused_qkv_split_qk_norm_rope_cache(
             ``cos/sin.shape[-1] == 2 * rotary_dim_half``.
         attn_output_gate: Whether Q+gate is packed in ``qkv``; returns ``(q, gate, k, v)``.
         k_scale, v_scale: Optional per-call scalars applied before cache write.
-        eps: RMSNorm epsilon.
+        eps: RMSNorm epsilon. Zero Q/K weights give weightless RMSNorm.
+        q_scale: Optional scale applied to Q after RMSNorm's output dtype cast,
+            then cast back to that dtype before RoPE (Muse Glimmer semantics).
+        block_t: Optional token tile override for tuning; defaults to the
+            device-aware heuristic.
         rotary_dim_half: Optional half-width of the rotated subspace. When set, it
             corresponds to ``cos.shape[-1]`` only in reuse mode; in non-reuse mode the
             table last dim is the full rotary width, ``2 * rotary_dim_half``.
@@ -170,12 +177,24 @@ def fused_qkv_split_qk_norm_rope_cache(
     assert cos.shape[-1] == sin.shape[-1], "cos and sin must match in last dim"
     # the effective rotary dim, half or full of the rotary dim depending on reuse_freqs_front_part
     ROTARY_DIM_EFFECTIVE = cos.shape[-1]
+    rotary_span = ROTARY_DIM_EFFECTIVE * (2 if reuse_freqs_front_part else 1)
+    if q_scale != 1.0 and rotary_span != head_dim:
+        raise ValueError("q_scale currently requires full-head RoPE")
 
     # Logic for dimension splitting
     BLOCK_D = head_dim
     BLOCK_D_HALF = head_dim // 2
 
-    BLOCK_T = infer_rope_cache_triton_block_t(T, qkv.device)
+    if block_t is not None:
+        BLOCK_T = block_t
+    elif q_scale != 1.0 and arch_info.get_arch() == "gfx950":
+        # Muse shapes: the generic token/CU heuristic picks 1 and 2 for
+        # decode-64 and prefill-1024. A sweep selected 4 and 16 respectively.
+        BLOCK_T = min(triton.next_power_of_2(T), 4) if T <= 128 else 16
+    else:
+        BLOCK_T = infer_rope_cache_triton_block_t(T, qkv.device)
+    if BLOCK_T < 1 or BLOCK_T > 32 or BLOCK_T & (BLOCK_T - 1):
+        raise ValueError("block_t must be a power of two from 1 through 32")
     num_warps = 4
     grid = (triton.cdiv(T, BLOCK_T), qh)
 
@@ -196,6 +215,7 @@ def fused_qkv_split_qk_norm_rope_cache(
         slot_mapping_ptr=slot_mapping,
         T=T,
         eps=eps,
+        Q_SCALE=q_scale,
         k_scale_ptr=k_scale,
         v_scale_ptr=v_scale,
         stride_qkv_t=qkv.stride(0),
