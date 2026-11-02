@@ -19,16 +19,24 @@ default sweep hits all four tiles. Usage:
     python3 bench_fused_gdn_prefill_qkvz.py --shapes 1x1024,4x2048,8x1600
 """
 
+import functools
 import sys
 
 import torch
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.gated_delta_net.fused_gdn_prefill_qkvz import (
     _select_tile_key,
     fused_gdn_prefill_qkvz,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 
 # Peak theoretical HBM bandwidth, bytes/s.
 _PEAK_BW = {"gfx950": 8.0e12, "gfx942": 5.3e12}
@@ -37,6 +45,22 @@ _CONV_WIDTH = 4
 
 # Default sweep: (batch, seqlen) pairs chosen to cover every tile.
 _DEFAULT_SHAPES = "1x1024,1x2048,1x3072,1x8192,3x2048,1x16384,8x1600"
+
+# fused_gdn_prefill_qkvz's keyword-only params use lowercase a_log, not A_log.
+_OUT_VAL_KEYS = [
+    "projected_qkvz",
+    "projected_ba",
+    "conv_state",
+    "delta_state",
+    "cache_indices",
+    "cu_seqlens",
+    "has_initial_state",
+    "conv_weight",
+    "conv_bias",
+    "a_log",
+    "dt_bias",
+    "norm_weight",
+]
 
 
 def make_inputs(batch, seqlen, num_k_heads, head_dim, device="cuda"):
@@ -48,7 +72,7 @@ def make_inputs(batch, seqlen, num_k_heads, head_dim, device="cuda"):
     slots = batch + 1
     bf16 = {"dtype": torch.bfloat16, "device": device}
     cu = torch.arange(0, m + 1, seqlen, dtype=torch.int32, device=device)
-    return {
+    inp = {
         "projected_qkvz": torch.randn(m, num_k_heads * group_width, **bf16),
         "projected_ba": torch.randn(m, 2 * num_v_heads, **bf16),
         "conv_state": torch.randn(slots, channels, _CONV_WIDTH - 1, **bf16),
@@ -64,6 +88,20 @@ def make_inputs(batch, seqlen, num_k_heads, head_dim, device="cuda"):
         "dt_bias": torch.randn(num_v_heads, **bf16),
         "norm_weight": torch.randn(head_dim, **bf16),
     }
+    return (
+        inp["projected_qkvz"],
+        inp["projected_ba"],
+        inp["conv_state"],
+        inp["delta_state"],
+        inp["cache_indices"],
+        inp["cu_seqlens"],
+        inp["has_initial_state"],
+        inp["conv_weight"],
+        inp["conv_bias"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["norm_weight"],
+    )
 
 
 def bytes_moved(m, batch, num_k_heads, head_dim):
@@ -80,51 +118,14 @@ def bytes_moved(m, batch, num_k_heads, head_dim):
     return total
 
 
-def bench_one(batch, seqlen, num_k_heads, head_dim, iters, warmup=25):
-    inp = make_inputs(batch, seqlen, num_k_heads, head_dim)
-    args = (
-        inp["projected_qkvz"],
-        inp["projected_ba"],
-        inp["conv_state"],
-        inp["delta_state"],
-        inp["cache_indices"],
-        inp["cu_seqlens"],
-        inp["has_initial_state"],
-        inp["conv_weight"],
-        inp["conv_bias"],
-        inp["A_log"],
-        inp["dt_bias"],
-        inp["norm_weight"],
+def bench_one(bencher, batch, seqlen, num_k_heads, head_dim):
+    _p_gen = functools.partial(make_inputs, batch, seqlen, num_k_heads, head_dim)
+    bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
+
+    kernel_fn = functools.partial(
+        fused_gdn_prefill_qkvz, scale=head_dim**-0.5, eps=1e-6
     )
-    kwargs = {"scale": head_dim**-0.5, "eps": 1e-6}
-
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(warmup):
-            fused_gdn_prefill_qkvz(*args, **kwargs)
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        fused_gdn_prefill_qkvz(*args, **kwargs)
-    torch.cuda.synchronize()
-    for _ in range(5):
-        graph.replay()
-    torch.cuda.synchronize()
-
-    samples = []
-    for _ in range(5):
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        start.record()
-        for _ in range(iters):
-            graph.replay()
-        end.record()
-        torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0 / iters)
-    samples.sort()
-    return samples[len(samples) // 2]
+    return bencher.bench(kernel_fn) * 1000.0  # ms -> us
 
 
 def main():
@@ -136,7 +137,13 @@ def main():
     )
     ap.add_argument("--num-k-heads", type=int, default=4)
     ap.add_argument("--head-dim", type=int, default=_HEAD_DIM)
-    ap.add_argument("--iters", type=int, default=100)
+    ap.add_argument(
+        "--iters",
+        type=int,
+        default=100,
+        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
+        "constant, not an adaptive iters target. Kept for CLI compatibility.",
+    )
     args = ap.parse_args()
 
     arch = get_arch()
@@ -149,6 +156,9 @@ def main():
         f"fused_gdn_prefill_qkvz on {torch.cuda.get_device_name(0)} ({arch}), "
         f"num_k_heads={args.num_k_heads} head_dim={args.head_dim}"
     )
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
     hdr = f"{'batch':>6}{'seqlen':>8}{'tokens':>8}{'tile':>20}{'us':>10}{'Mtok/s':>9}{'TB/s':>8}{'%pk':>6}"
     print(hdr)
     for spec in args.shapes.split(","):
@@ -159,7 +169,7 @@ def main():
         if tile is None:
             print(f"{b:>6}{s:>8}{m:>8}{'(uncovered)':>20}")
             continue
-        us = bench_one(b, s, args.num_k_heads, args.head_dim, args.iters)
+        us = bench_one(bencher, b, s, args.num_k_heads, args.head_dim)
         mtoks = m / (us * 1e-6) / 1e6
         nbytes = bytes_moved(m, b, args.num_k_heads, args.head_dim)
         tbs = nbytes / (us * 1e-6) / 1e12

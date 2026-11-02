@@ -18,26 +18,36 @@ worth it -- the question VLLM_DSV4_QPACK_FUSION exists to answer:
 read back and the producer may skip writing it.
 """
 
-# The timing closures below capture the shape loop's variables by
-# reference. Every one is built and consumed inside its own iteration
-# (do_bench runs before the loop advances), so late binding cannot bite.
-# File-scoped rather than per-line: a trailing suppression comment sits
-# on a line black then rewraps, which moves it off the line ruff reports.
-# ruff: noqa: B023
-
-import argparse
+import functools
 import sys
 
 import torch
-import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_deepseek_v4_mxfp8_quant_q_pack,
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 
 _QK, _NOPE, _ROPE = 512, 448, 64
 _REC = 640  # the producer writes the aligned record only
+
+_PRODUCER_OUT_VAL_KEYS = [
+    "q",
+    "kv",
+    "kv_cache",
+    "kv_slot_mapping",
+    "positions",
+    "cos_sin_cache",
+]
+_Q_PACK_OUT_VAL_KEYS = ["q"]
 
 
 def build(tokens, heads, padded, nb, block, device="cuda"):
@@ -53,6 +63,29 @@ def build(tokens, heads, padded, nb, block, device="cuda"):
     pos = torch.randint(0, 128, (tokens,), device=device, dtype=torch.int64)
     cos_sin = torch.randn(256, _ROPE, device=device, dtype=torch.float32)
     return q, kv, cache, slot, pos, cos_sin
+
+
+def _generate_q_pack_pool_inputs(
+    tokens, heads, padded, nb, block, apply_q_norm, write_q
+):
+    """A realistic packer input: run the (untimed) unfused producer once per
+    entry to get the bf16 Q it would actually emit, rather than random data."""
+    q, kv, cache, slot, pos, cs = build(tokens, heads, padded, nb, block)
+    q_out = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q,
+        kv,
+        cache,
+        slot,
+        pos,
+        cs,
+        block,
+        1e-6,
+        padded,
+        apply_q_norm=apply_q_norm,
+        pack_q=False,
+        write_q=write_q,
+    )
+    return (q_out,)
 
 
 def producer_bytes(tokens, heads, padded, pack, write_q):
@@ -72,10 +105,7 @@ def pack_bytes(rows):
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Benchmark the DSv4 Q/KV producer and Q pack",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    p = get_parser(kernel_name="DSv4 Q/KV producer and Q pack")
     p.add_argument("--tokens", type=int, nargs="+", default=[1, 64, 256, 1024])
     p.add_argument("--heads", type=int, default=16, help="local Q heads")
     p.add_argument(
@@ -101,7 +131,8 @@ def main():
         "--rep",
         type=int,
         default=20,
-        help="do_bench_cudagraph measurement target, in ms",
+        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
+        "constant, not an adaptive rep target. Kept for CLI compatibility.",
     )
     a = p.parse_args()
 
@@ -119,40 +150,62 @@ def main():
         f"{'q_pack us':<11} {'fused GB/s':<11} fused vs split"
     )
 
+    bencher_producer = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(a), **get_do_bench_graph_kwargs(a)}
+    )
+    bencher_q_pack = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(a), **get_do_bench_graph_kwargs(a)}
+    )
+
     for t in a.tokens:
         nb = max(1, (t + a.block - 1) // a.block * 2)
-        q, kv, cache, slot, pos, cs = build(t, a.heads, a.padded_heads, nb, a.block)
-        args = (q, kv, cache, slot, pos, cs, a.block, 1e-6, a.padded_heads)
-        kw = {"apply_q_norm": a.q_norm, "write_q": a.write_q}
 
-        def fused():
-            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args, pack_q=True, **kw)
+        _p_gen_producer = functools.partial(
+            build, t, a.heads, a.padded_heads, nb, a.block
+        )
+        bencher_producer.build_pool([_p_gen_producer], [_PRODUCER_OUT_VAL_KEYS])
 
-        def unfused():
-            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args, pack_q=False, **kw)
-
-        q_out = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            *args, pack_q=False, **kw
+        kernel_fn_fused = functools.partial(
+            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+            kv_cache_block_size=a.block,
+            eps=1e-6,
+            padded_heads=a.padded_heads,
+            apply_q_norm=a.q_norm,
+            pack_q=True,
+            write_q=a.write_q,
+        )
+        kernel_fn_unfused = functools.partial(
+            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+            kv_cache_block_size=a.block,
+            eps=1e-6,
+            padded_heads=a.padded_heads,
+            apply_q_norm=a.q_norm,
+            pack_q=False,
+            write_q=a.write_q,
         )
 
-        def only_pack():
-            fused_deepseek_v4_mxfp8_quant_q_pack(q_out)
+        _p_gen_q_pack = functools.partial(
+            _generate_q_pack_pool_inputs,
+            t,
+            a.heads,
+            a.padded_heads,
+            nb,
+            a.block,
+            a.q_norm,
+            a.write_q,
+        )
+        bencher_q_pack.build_pool([_p_gen_q_pack], [_Q_PACK_OUT_VAL_KEYS])
 
-        for fn in (fused, unfused, only_pack):  # compile outside the timed region
-            fn()
-        torch.cuda.synchronize()
-
-        f = triton.testing.do_bench_cudagraph(fused, rep=a.rep) * 1e3
-        u = triton.testing.do_bench_cudagraph(unfused, rep=a.rep) * 1e3
-        k = triton.testing.do_bench_cudagraph(only_pack, rep=a.rep) * 1e3
+        f = bencher_producer.bench(kernel_fn_fused) * 1e3
+        u = bencher_producer.bench(kernel_fn_unfused) * 1e3
+        k = bencher_q_pack.bench(fused_deepseek_v4_mxfp8_quant_q_pack) * 1e3
         gbs = (
             producer_bytes(t, a.heads, a.padded_heads, True, a.write_q)
             / (f * 1e-6)
             / 1e9
         )
         print(
-            f"{t:<8d} {f:<11.2f} {u:<11.2f} {k:<11.2f} "
-            f"{gbs:<11.1f} {(u + k) / f:.2f}x"
+            f"{t:<8d} {f:<11.2f} {u:<11.2f} {k:<11.2f} {gbs:<11.1f} {(u + k) / f:.2f}x"
         )
 
 

@@ -7,6 +7,7 @@
 
 # Python standard library
 import argparse
+import functools
 import logging
 
 # PyTorch
@@ -14,6 +15,9 @@ import torch
 
 # Triton
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 # AITER: Triton kernel wrappers
 from aiter.ops.triton.gemm.grouped.gmm import (
@@ -39,8 +43,12 @@ from aiter.ops.triton.utils.gmm_common import (
     TRANS_LHS,
     TRANS_RHS,
     dtype_from_str,
-    gen_gmm_tensors,
-    gen_tgmm_tensors,
+    gen_gmm_input,
+    gen_gmm_output,
+    gen_multiple_group_sizes,
+    gen_tgmm_bias_grad,
+    gen_tgmm_input,
+    gen_tgmm_output,
     group_sizes_dtype_from_str,
     str_from_dtype,
     str_from_group_sizes_dtype,
@@ -48,7 +56,9 @@ from aiter.ops.triton.utils.gmm_common import (
 
 # AITER: shared argparse helper
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
     positive_int,
 )
@@ -103,31 +113,113 @@ assert (
 def select_triton_kernel(gmm_type: str):
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
     if gmm_type == "gmm":
-        desc, gen_tensors, kernel_wrapper = (
-            "GMM",
-            gen_gmm_tensors,
-            triton_gmm,
-        )
+        desc, kernel_wrapper = "GMM", triton_gmm
     if gmm_type == "ptgmm":
-        desc, gen_tensors, kernel_wrapper = (
-            "persistent TGMM",
-            gen_tgmm_tensors,
-            triton_ptgmm,
-        )
+        desc, kernel_wrapper = "persistent TGMM", triton_ptgmm
     if gmm_type == "nptgmm":
-        desc, gen_tensors, kernel_wrapper = (
-            "non-persistent TGMM",
-            gen_tgmm_tensors,
-            triton_nptgmm,
+        desc, kernel_wrapper = "non-persistent TGMM", triton_nptgmm
+    return desc, kernel_wrapper
+
+
+def _generate_rotating_lhs_rhs(
+    gmm_type: str,
+    M: int,
+    K: int,
+    N: int,
+    G: int,
+    in_dtype: torch.dtype,
+    group_sizes_dtype: torch.dtype,
+    trans_lhs: bool,
+    trans_rhs: bool,
+    rng_seed: int,
+    unif_group_sizes: bool,
+):
+    """lhs/rhs only -- the large GEMM operands, regenerated per pool entry so
+    replaying through the pool defeats cache residency. The group_sizes_0
+    this also returns is discarded: group_sizes variants are generated once
+    (see _generate_multiple_group_sizes) and tested outside the pool, not
+    per entry.
+    """
+    if gmm_type == "gmm":
+        lhs, rhs, _ = gen_gmm_input(
+            M,
+            K,
+            N,
+            G,
+            preferred_element_type=in_dtype,
+            group_sizes_dtype=group_sizes_dtype,
+            trans_rhs=trans_rhs,
+            rng_seed=rng_seed,
+            unif_group_sizes=unif_group_sizes,
         )
-    return (
-        desc,
-        gen_tensors,
-        kernel_wrapper,
+    else:
+        lhs, rhs, _ = gen_tgmm_input(
+            M,
+            K,
+            N,
+            G,
+            preferred_element_type=in_dtype,
+            group_sizes_dtype=group_sizes_dtype,
+            trans_lhs=trans_lhs,
+            rng_seed=rng_seed,
+            unif_group_sizes=unif_group_sizes,
+        )
+    return lhs, rhs
+
+
+def _generate_multiple_group_sizes(
+    gmm_type: str,
+    M: int,
+    K: int,
+    N: int,
+    G: int,
+    in_dtype: torch.dtype,
+    group_sizes_dtype: torch.dtype,
+    trans_lhs: bool,
+    trans_rhs: bool,
+    rng_seed: int,
+    num_group_sizes: int,
+    unif_group_sizes: bool,
+) -> list[torch.Tensor]:
+    """The num_group_sizes variants to test against the same rotating lhs/rhs
+    pool, generated once per shape -- not per pool entry, since these test
+    load-balancing scenarios, not cache residency."""
+    if gmm_type == "gmm":
+        _, _, group_sizes_0 = gen_gmm_input(
+            M,
+            K,
+            N,
+            G,
+            preferred_element_type=in_dtype,
+            group_sizes_dtype=group_sizes_dtype,
+            trans_rhs=trans_rhs,
+            rng_seed=rng_seed,
+            unif_group_sizes=unif_group_sizes,
+        )
+    else:
+        _, _, group_sizes_0 = gen_tgmm_input(
+            M,
+            K,
+            N,
+            G,
+            preferred_element_type=in_dtype,
+            group_sizes_dtype=group_sizes_dtype,
+            trans_lhs=trans_lhs,
+            rng_seed=rng_seed,
+            unif_group_sizes=unif_group_sizes,
+        )
+    return gen_multiple_group_sizes(
+        num_group_sizes,
+        M,
+        G,
+        group_sizes_dtype=group_sizes_dtype,
+        rng_seed=None,
+        group_sizes_0=group_sizes_0,
     )
 
 
 def benchmark_gmm(
+    bencher: RotatingBufferBench,
     gmm_type: str,
     bench_shape: tuple[int, int, int, int] | None = None,
     in_dtype: torch.dtype = DTYPE,
@@ -148,7 +240,7 @@ def benchmark_gmm(
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
     assert metric in METRICS, "Invalid benchmark metric."
 
-    desc, gen_tensors, kernel_wrapper = select_triton_kernel(gmm_type)
+    desc, kernel_wrapper = select_triton_kernel(gmm_type)
 
     in_dtype_str: str = str_from_dtype(in_dtype)
     out_dtype_str: str = str_from_dtype(out_dtype)
@@ -191,61 +283,83 @@ def benchmark_gmm(
     def benchmark(M: int, K: int, N: int, G: int, provider: str):
         logger.info("    (M, K, N, G) = (%d, %d, %d, %d)", M, K, N, G)
 
-        lhs, rhs, multiple_group_sizes, out, bias = gen_tensors(
+        _p_gen = functools.partial(
+            _generate_rotating_lhs_rhs,
+            gmm_type,
             M,
             K,
             N,
             G,
-            num_group_sizes,
-            input_type=in_dtype,
-            output_type=out_dtype,
-            group_sizes_dtype=group_sizes_dtype,
-            trans_lhs=trans_lhs,
-            trans_rhs=trans_rhs,
-            rng_seed=rng_seed,
-            unif_group_sizes=unif_group_sizes,
-            use_bias=use_bias,
+            in_dtype,
+            group_sizes_dtype,
+            trans_lhs,
+            trans_rhs,
+            rng_seed,
+            unif_group_sizes,
         )
 
-        quantiles = [0.5, 0.2, 0.8]
-        p50_ms_sum = 0.0
-        p20_ms_sum = 0.0
-        p80_ms_sum = 0.0
+        if gmm_type == "gmm":
+            out = gen_gmm_output(M, N, preferred_element_type=out_dtype)
+            bias = None
+            if use_bias:
+                torch.manual_seed(rng_seed + 1000)  # Different seed for bias
+                bias = torch.randn(G, N, dtype=in_dtype, device="cuda")
+            bias_key = "bias"
+        else:
+            out = gen_tgmm_output(K, N, G, preferred_element_type=out_dtype)
+            bias = gen_tgmm_bias_grad(K, G, with_bias_grad=True) if use_bias else None
+            bias_key = "bias_grad"
+
+        def _gen_fixed():
+            return out, bias
+
+        rot_bufs = bencher.build_pool(
+            [_p_gen],
+            [["lhs", "rhs"]],
+            inp_gen_fixed_fns=[_gen_fixed],
+            inp_fixed_keys=[["existing_out", bias_key]],
+        )
+
+        # Generated once per shape, not per pool entry: these test
+        # load-balancing scenarios, not cache residency.
+        multiple_group_sizes = _generate_multiple_group_sizes(
+            gmm_type,
+            M,
+            K,
+            N,
+            G,
+            in_dtype,
+            group_sizes_dtype,
+            trans_lhs,
+            trans_rhs,
+            rng_seed,
+            num_group_sizes,
+            unif_group_sizes,
+        )
+
         tops_sum = 0.0
         gb_sum = 0.0
+        ms_sum = 0.0
 
         for group_sizes in multiple_group_sizes:
             logger.debug(
                 "      group_sizes (first 5) = %s", str(group_sizes[:5].tolist())
             )
 
-            kwargs = {
-                "lhs": lhs,
-                "rhs": rhs,
+            extra_kwargs = {
                 "group_sizes": group_sizes,
                 "preferred_element_type": out_dtype,
-                "existing_out": out,
             }
-
             if gmm_type == "gmm":
-                kwargs["bias"] = bias
-                kwargs["work_stealing"] = work_stealing
+                extra_kwargs["work_stealing"] = work_stealing
             elif gmm_type == "ptgmm" or gmm_type == "nptgmm":
-                kwargs["bias_grad"] = bias
-                kwargs["accumulate"] = accumulate
-
+                extra_kwargs["accumulate"] = accumulate
             if has_grid_dim:
-                kwargs["grid_dim"] = grid_dim
+                extra_kwargs["grid_dim"] = grid_dim
 
-            p50_ms, p20_ms, p80_ms = triton.testing.do_bench(
-                lambda kwargs=kwargs: kernel_wrapper(**kwargs),
-                quantiles=quantiles,
-            )
-
-            # Aggregate time, in milliseconds.
-            p50_ms_sum += p50_ms
-            p20_ms_sum += p20_ms
-            p80_ms_sum += p80_ms
+            kernel_fn = functools.partial(kernel_wrapper, **extra_kwargs)
+            ms = bencher.bench(kernel_fn)
+            ms_sum += ms
 
             m = torch.sum(group_sizes).item()
 
@@ -253,6 +367,7 @@ def benchmark_gmm(
             tops_sum += 1e-12 * 2 * m * N * K
 
             # Aggregate memory, in GB.
+            lhs, rhs = rot_bufs[0]["lhs"], rot_bufs[0]["rhs"]
             if "tgmm" in gmm_type:
                 # TGMM case.
                 read_bytes = K * m * lhs.element_size() + m * N * rhs.element_size()
@@ -263,51 +378,27 @@ def benchmark_gmm(
                 write_bytes = m * N * out.element_size()
             gb_sum += 1e-9 * (read_bytes + write_bytes)
 
-        # Compute milliseconds: milliseconds of all group sizes / number of group sizes.
-        p50_ms = round(p50_ms_sum / num_group_sizes, 4)
-        p20_ms = round(p20_ms_sum / num_group_sizes, 4)
-        p80_ms = round(p80_ms_sum / num_group_sizes, 4)
-
-        # Compute total seconds.
-        p50_s_sum = 1e-3 * p50_ms_sum
-        p20_s_sum = 1e-3 * p20_ms_sum
-        p80_s_sum = 1e-3 * p80_ms_sum
+        # Aggregate across all group_sizes variants: milliseconds of all
+        # group sizes / number of group sizes.
+        ms = round(ms_sum / num_group_sizes, 4)
+        s_sum = 1e-3 * ms_sum
 
         # Compute TFLOPS: TOps of all group sizes / seconds of all group sizes.
-        p50_tflops = round(tops_sum / p50_s_sum, 2)
-        p20_tflops = round(tops_sum / p80_s_sum, 2)
-        p80_tflops = round(tops_sum / p20_s_sum, 2)
+        tflops = round(tops_sum / s_sum, 2)
 
         # Compute GB/s: GB of all group sizes / seconds of all group sizes.
-        p50_gbps = round(gb_sum / p50_s_sum, 2)
-        p20_gbps = round(gb_sum / p80_s_sum, 2)
-        p80_gbps = round(gb_sum / p20_s_sum, 2)
+        gbps = round(gb_sum / s_sum, 2)
 
-        logger.info(
-            "      ms: p20 = %7.4f, p50 = %7.4f, p80 = %7.4f",
-            p20_ms,
-            p50_ms,
-            p80_ms,
-        )
-        logger.info(
-            "      TFLOPS: p20 = %6.2f, p50 = %6.2f, p80 = %6.2f",
-            p20_tflops,
-            p50_tflops,
-            p80_tflops,
-        )
-        logger.info(
-            "      GB/s: p20 = %6.2f, p50 = %6.2f, p80 = %6.2f",
-            p20_gbps,
-            p50_gbps,
-            p80_gbps,
-        )
+        logger.info("      ms: %7.4f", ms)
+        logger.info("      TFLOPS: %6.2f", tflops)
+        logger.info("      GB/s: %6.2f", gbps)
 
         if metric == "time":
-            return p50_ms, p20_ms, p80_ms
+            return ms
         if metric == "throughput":
-            return p50_tflops, p20_tflops, p80_tflops
+            return tflops
         if metric == "bandwidth":
-            return p50_gbps, p20_gbps, p80_gbps
+            return gbps
 
     logger.info("Benchmarking Triton %s kernel:", desc)
     logger.info(
@@ -506,8 +597,12 @@ def main() -> None:
     in_dtype = dtype_from_str(args.input_type)
     out_dtype = dtype_from_str(args.output_type)
     group_sizes_dtype = group_sizes_dtype_from_str(args.group_sizes_type)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     benchmark_gmm(
+        bencher,
         args.gmm_type,
         bench_shape=None if all(arg is None for arg in shape) else shape,
         in_dtype=in_dtype,

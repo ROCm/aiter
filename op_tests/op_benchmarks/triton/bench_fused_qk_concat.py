@@ -3,14 +3,23 @@ Benchmark for the fused q/k concat kernels: fused_qk_cat (concat only) and
 fused_qk_rope_cat (RoPE on pe part, then concat).
 """
 
-import argparse
+import functools
 
-import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.fusions.fused_qk_concat import fused_qk_cat, fused_qk_rope_cat
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.op_benchmarks.triton.utils.argparse import positive_int, pow2_int
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+    positive_int,
+    pow2_int,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -19,6 +28,20 @@ from op_tests.triton_tests.fusions.test_fused_qk_concat import (
     generate_qk_inputs,
     generate_rope_cached_freqs,
 )
+
+
+def _qk_cat_fn(q_nope, q_pe, k_nope, k_pe, **_):
+    return fused_qk_cat(q_nope, q_pe, k_nope, k_pe)
+
+
+def _generate_qk_rope_cat_pool_inputs(
+    B, qh_per_kh, KH, D_nope, D_pe, dtype, d_freq, max_embed_positions
+):
+    q_nope, q_pe, k_nope, k_pe = generate_qk_inputs(
+        B, qh_per_kh, KH, D_nope, D_pe, dtype
+    )
+    pos, _, cos, sin = generate_rope_cached_freqs(B, max_embed_positions, d_freq, dtype)
+    return q_nope, q_pe, k_nope, k_pe, pos, cos, sin
 
 
 def get_benchmark_shapes(args):
@@ -36,39 +59,46 @@ def get_benchmark_shapes(args):
     ]
 
 
-def bench_fused_qk_concat_fn(B, QH, KH, D_pe, metric, args):
+def bench_fused_qk_concat_fn(bencher, B, QH, KH, D_pe, metric, args):
     dtype = str_to_torch_dtype[args.dtype]
     D_nope = args.d_nope
 
-    q_nope, q_pe, k_nope, k_pe = generate_qk_inputs(
-        B, QH // KH, KH, D_nope, D_pe, dtype
-    )
     if args.op == "qk_cat":
         freq_bytes = 0
-
-        def fn():
-            return fused_qk_cat(q_nope, q_pe, k_nope, k_pe)
-
+        _p_gen = functools.partial(
+            generate_qk_inputs, B, QH // KH, KH, D_nope, D_pe, dtype
+        )
+        _out_val_keys = ["q_nope", "q_pe", "k_nope", "k_pe"]
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
+        kernel_fn = _qk_cat_fn
     else:
         d_freq = D_pe // 2 if args.reuse_freqs_front_part else D_pe
-        pos, _, cos, sin = generate_rope_cached_freqs(
-            B, args.max_embed_positions, d_freq, dtype
+        _p_gen = functools.partial(
+            _generate_qk_rope_cat_pool_inputs,
+            B,
+            QH // KH,
+            KH,
+            D_nope,
+            D_pe,
+            dtype,
+            d_freq,
+            args.max_embed_positions,
         )
-        freq_bytes = 2 * B * d_freq * cos.element_size()
+        _out_val_keys = ["q_nope", "q_pe", "k_nope", "k_pe", "pos", "cos", "sin"]
+        rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
+        freq_bytes = 2 * B * d_freq * rot_bufs[0]["cos"].element_size()
+        kernel_fn = functools.partial(fused_qk_rope_cat, is_neox=args.neox)
 
-        def fn():
-            return fused_qk_rope_cat(
-                q_nope, q_pe, k_nope, k_pe, pos, cos, sin, args.neox
-            )
-
-    torch.cuda.synchronize()
-    ms = triton.testing.do_bench_cudagraph(fn, rep=args.rep)
+    ms = bencher.bench(kernel_fn)
     if metric == "time":
         return ms
 
     # Bytes: q/k nope and pe reads, q_out/k_out writes, and for RoPE one cos and one sin
     # row per token
-    mem = 2 * B * (QH + KH) * (D_nope + D_pe) * q_nope.element_size() + freq_bytes
+    mem = (
+        2 * B * (QH + KH) * (D_nope + D_pe) * rot_bufs[0]["q_nope"].element_size()
+        + freq_bytes
+    )
     return mem / (ms * 1e-3) * 1e-9  # GB/s
 
 
@@ -85,9 +115,13 @@ def run_benchmark(args):
         args={},
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([benchmark])
     def bench_fn(B, QH, KH, D_pe, metric):
-        return bench_fused_qk_concat_fn(B, QH, KH, D_pe, metric, args)
+        return bench_fused_qk_concat_fn(bencher, B, QH, KH, D_pe, metric, args)
 
     df = bench_fn.run(print_data=True, return_df=True)[0]
     if args.o:
@@ -95,11 +129,7 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused_qk_concat",
-        description="Benchmark the Triton fused q/k concat (and RoPE + concat) kernels",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="fused_qk_concat")
     parser.add_argument(
         "--op",
         type=str,
@@ -167,18 +197,19 @@ def parse_args(args: list[str] | None = None):
         default=131072,
         help="Rows in the cos/sin cache (qk_rope_cat only, default: 131072)",
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default="time",
+    override_parser_action(
+        parser,
+        action="--metric",
         choices=["time", "bandwidth"],
+        default="time",
         help="Metric to report (default: time)",
     )
     parser.add_argument(
         "--rep",
         type=positive_int,
         default=20,
-        help="do_bench_cudagraph measurement budget in ms (default: 20)",
+        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
+        "constant, not an adaptive rep target. Kept for CLI compatibility.",
     )
     parser.add_argument(
         "-print_vgpr",

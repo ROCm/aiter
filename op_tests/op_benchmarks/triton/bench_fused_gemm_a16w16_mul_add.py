@@ -1,5 +1,9 @@
+import functools
+
 import torch
-import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_mul_add import (
     fused_gemm_a16w16_mul_add,
@@ -22,27 +26,35 @@ kernel_name = "Fused A16W16 GEMM + mul_add"
 kernel_label = "fused_gemm_a16w16_mul_add"
 shape = "(B, S, N, K)"
 
+_OUT_VAL_KEYS = ["x", "w", "a", "b", "bias", "y"]
 
-def bench_fn(B: int, S: int, N: int, K: int, metric: str, **kwargs):
+
+def _generate_pool_inputs(B, S, N, K, dtype):
+    x, w, a, b, bias = generate_fused_gemm_a16w16_mul_add_inputs(
+        B, S, N, K, dtype, "gate", "full", bias=True
+    )
+    y = torch.empty((B, S, N), dtype=dtype, device="cuda")
+    return x, w, a, b, bias, y
+
+
+def bench_fn(
+    bencher: RotatingBufferBench, B: int, S: int, N: int, K: int, metric: str, **kwargs
+):
     """
     Single-shape timing of the gated residual
     ``out = residual + gate * (x @ w^T + bias)`` through the public wrapper.
     The gate has shape (B, 1, N) and the residual has shape (B, S, N).
     """
     dtype = torch.bfloat16
-    x, w, a, b, bias = generate_fused_gemm_a16w16_mul_add_inputs(
-        B, S, N, K, dtype, "gate", "full", bias=True
-    )
-    y = torch.empty((B, S, N), dtype=dtype, device="cuda")
+    _p_gen = functools.partial(_generate_pool_inputs, B, S, N, K, dtype)
+    rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
 
+    sample = rot_bufs[0]
     flops = 2.0 * B * S * N * K
-    mem = sum(t.numel() * t.element_size() for t in (x, w, a, b, bias, y))
+    mem = sum(sample[k].numel() * sample[k].element_size() for k in _OUT_VAL_KEYS)
 
-    ms = triton.testing.do_bench(
-        lambda: fused_gemm_a16w16_mul_add(x, w, a, b, bias=bias, dtype=dtype, y=y),
-        warmup=25,
-        rep=100,
-    )
+    kernel_fn = functools.partial(fused_gemm_a16w16_mul_add, dtype=dtype)
+    ms = bencher.bench(kernel_fn)
 
     return metric_to_scalar(metric, ms, flops, mem)
 

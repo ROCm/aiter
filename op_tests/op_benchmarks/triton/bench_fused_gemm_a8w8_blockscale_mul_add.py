@@ -1,6 +1,9 @@
 import functools
 
 import torch
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     fused_gemm_a8w8_blockscale_mul_add,
@@ -12,8 +15,6 @@ from op_tests.op_benchmarks.triton.bench_fused_gemm_commons import (
     run_fused_benchmark,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -30,8 +31,7 @@ shape = "(N=7168, K=256)"
 
 
 def bench_fn(
-    kwargs_rot_bufs: dict,
-    kwargs_do_bench_graph: dict,
+    bencher: RotatingBufferBench,
     M: int,
     N: int,
     K: int,
@@ -73,10 +73,8 @@ def bench_fn(
     )
     _out_vals_keys_mul_add = ["a", "b"]
 
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen_gemm, _p_gen_mul_add],
-        [_out_vals_keys_gemm, _out_vals_keys_mul_add],
-        **kwargs_rot_bufs,
+    rot_bufs = bencher.build_pool(
+        [_p_gen_gemm, _p_gen_mul_add], [_out_vals_keys_gemm, _out_vals_keys_mul_add]
     )
 
     kernel_fn = functools.partial(
@@ -99,7 +97,7 @@ def bench_fn(
         + (M * N) * buf0["y"].element_size()
     )
 
-    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+    ms = bencher.bench(kernel_fn)
 
     return metric_to_scalar(metric, ms, flops, mem)
 

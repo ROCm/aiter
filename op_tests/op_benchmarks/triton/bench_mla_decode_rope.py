@@ -5,6 +5,9 @@ import sys
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.attention.mla_decode_rope import (
     decode_attention_fwd_grouped_rope,
@@ -15,8 +18,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
@@ -196,8 +197,7 @@ def _generate_inputs(
 
 
 def bench_fn(
-    kwargs_rot_bufs: dict,
-    kwargs_do_bench_graph: dict,
+    bencher: RotatingBufferBench,
     BATCH: int,
     H: int,  # number of query heads, equal to the number of k/v heads
     S: int,
@@ -255,9 +255,7 @@ def bench_fn(
         "tri_o",
         "k_pe_tokens",
     ]
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-    )
+    rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
 
     # Shapes/dtypes are identical across the pool, so any entry works for sizing.
     sample = rot_bufs[0]
@@ -356,7 +354,7 @@ def bench_fn(
             is_neox_style,
         )
 
-    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+    ms = bencher.bench(_run)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -374,8 +372,9 @@ def bench_fn(
 def run_benchmark(args: argparse.Namespace):
     torch.manual_seed(20)
 
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report(create_benchmark_configs(args))
     def bench_mla(
@@ -397,8 +396,7 @@ def run_benchmark(args: argparse.Namespace):
     ):
 
         return bench_fn(
-            kwargs_rot_bufs,
-            kwargs_do_bench_graph,
+            bencher,
             BATCH,
             H,
             S,

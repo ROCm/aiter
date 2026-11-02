@@ -1,14 +1,20 @@
+import functools
 import math
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter import logger
 from aiter.ops.triton.gemm.basic.gemm_a16w4 import gemm_a16w4
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -20,8 +26,12 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a16w4 import (
     generate_gemm_a16w4_inputs,
 )
 
+_OUT_VAL_KEYS = ["x", "w", "w_scales", "w_zeros", "x_perm", "_", "y", "_"]
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, args):
+
+def bench_gemm_fn(
+    bencher: RotatingBufferBench, M: int, N: int, K: int, metric: str, args
+):
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
     group_size = args.group_size
     if group_size != -1 and K % group_size != 0:
@@ -31,7 +41,9 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, args):
             group_size,
         )
         group_size = -1
-    x, w, w_scales, w_zeros, x_perm, _, y, _ = generate_gemm_a16w4_inputs(
+
+    _p_gen = functools.partial(
+        generate_gemm_a16w4_inputs,
         M,
         N,
         K,
@@ -41,28 +53,22 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, args):
         act_order=args.act_order,
         output=True,
     )
+    rot_bufs = bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
 
+    sample = rot_bufs[0]
+    x, w, w_scales, w_zeros = (
+        sample["x"],
+        sample["w"],
+        sample["w_scales"],
+        sample["w_zeros"],
+    )
     flops = 2.0 * M * N * K
     w_bytes = w.numel() + w_scales.numel() * w_scales.element_size()
     if w_zeros is not None:
         w_bytes += w_zeros.numel()
     mem = (M * K + M * N) * x.element_size() + w_bytes
 
-    # Copies of the weights, so that each call reads its weights from memory.
-    num_copies = max(1, int(args.rotate_mb * 2**20) // w_bytes)
-    weights = [(w, w_scales, w_zeros)]
-    weights += [
-        (w.clone(), w_scales.clone(), None if w_zeros is None else w_zeros.clone())
-        for _ in range(num_copies - 1)
-    ]
-    calls = [0]
-
-    def fn():
-        wi, si, zi = weights[calls[0] % len(weights)]
-        calls[0] += 1
-        return gemm_a16w4(x, wi, si, w_zeros=zi, x_perm=x_perm, y=y)
-
-    ms = triton.testing.do_bench_cudagraph(fn)
+    ms = bencher.bench(gemm_a16w4)
 
     if metric == "time":
         return ms
@@ -76,6 +82,9 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, args):
 
 def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a16w4(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):
@@ -94,18 +103,21 @@ def run_model_benchmark(args):
             N, K = hidden_dim, intermediate_dim
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(M, N, K, metric, args)
+        return bench_gemm_fn(bencher, M, N, K, metric, args)
 
     bench_gemm_a16w4.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a16w4(M, N, K, metric, **kwargs):
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args)
+        return bench_gemm_fn(bencher, M, N, K, metric, args)
 
     bench_gemm_a16w4.run(save_path="." if args.o else None, print_data=True)
 
@@ -156,8 +168,9 @@ def parse_args(args: list[str] | None = None):
         "--rotate-mb",
         type=float,
         default=0,
-        help="Rotate over weight copies of this total size in MB, so that the "
-        "weights do not stay in the caches. Use it for small M.",
+        help="Unused: RotatingBufferBench.build_pool's rotating buffer pool "
+        "defeats weight-cache residency generically (see --rot-bufs-*). Kept "
+        "for CLI compatibility.",
     )
     return get_ff_args(parser, args=args)
 

@@ -11,8 +11,8 @@ captured from a live vLLM run with VLLM_DSV4_AITER_SPARSE_MLA=1 (the aligned
 layers, so --variant selects one of the two live layer groups and any
 individual flag overrides it.
 
-Timing uses triton.testing.do_bench_cudagraph, matching
-bench_moe_gemm_a4w4_cudagraph.py; --rep is the measurement target in ms.
+Timing uses RotatingBufferBench.bench (CUDA graph replay). --rep is unused,
+kept for CLI compatibility.
 
   python bench_fused_kv_compress_sparse_attn.py
   python bench_fused_kv_compress_sparse_attn.py --variant cr4
@@ -23,24 +23,50 @@ For register pressure / ISA rather than timing, compile the kernel under a
 dedicated TRITON_CACHE_DIR and read the .amdgcn instead.
 """
 
-# The timing closures below capture the shape loop's variables by
-# reference. Every one is built and consumed inside its own iteration
-# (do_bench runs before the loop advances), so late binding cannot bite.
-# File-scoped rather than per-line: a trailing suppression comment sits
-# on a line black then rewraps, which moves it off the line ruff reports.
-# ruff: noqa: B023
-
-import argparse
+import functools
 import sys
 from types import SimpleNamespace
 
 import torch
-import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_deepseek_v4_compress_norm_rope_store,
     fused_deepseek_v4_compress_norm_rope_store_two_stage,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+
+_OUT_VAL_KEYS = [
+    "state_cache",
+    "num_actual",
+    "token_to_req_indices",
+    "positions",
+    "slot_mapping",
+    "block_table",
+    "block_size",
+    "state_width",
+    "cos_sin_cache",
+    "kv_cache",
+    "k_cache_metadata",
+    "pdl_kwargs",
+    "head_dim",
+    "rope_head_dim",
+    "compress_ratio",
+    "overlap",
+    "use_fp4_cache",
+    "rms_norm_weight",
+    "rms_norm_eps",
+    "quant_block",
+    "token_stride",
+    "scale_dim",
+    "compress_scratch",
+]
 
 
 def emitting_positions(a, device="cuda"):
@@ -161,7 +187,28 @@ def build(a, device="cuda"):
         "quant_block": a.quant_block,
         "token_stride": a.token_stride,
         "scale_dim": a.scale_dim,
+        # The split exists to fan the compression across CUs when one program
+        # per token cannot fill them, so it is only interesting against the
+        # single-pass launcher at the same shape.
+        "compress_scratch": torch.zeros(
+            a.tokens, a.head_dim, dtype=torch.float32, device=device
+        ),
     }
+
+
+def _generate_pool_inputs(a):
+    built = build(a)
+    return tuple(built[k] for k in _OUT_VAL_KEYS)
+
+
+def _run_single(compress_scratch=None, **kwargs):
+    fused_deepseek_v4_compress_norm_rope_store(**kwargs)
+
+
+def _run_two_stage(**kwargs):
+    # num_decode_tokens=0 sends every token down the split rather than
+    # falling back to the single-pass launcher.
+    fused_deepseek_v4_compress_norm_rope_store_two_stage(**kwargs, num_decode_tokens=0)
 
 
 def counted_bytes(a):
@@ -187,10 +234,7 @@ def counted_bytes(a):
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Benchmark the DeepSeek-V4 fused KV compressor",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    p = get_parser(kernel_name="DeepSeek-V4 fused KV compressor")
     p.add_argument(
         "--variant",
         choices=sorted(VARIANTS),
@@ -208,7 +252,8 @@ def main():
         "--rep",
         type=int,
         default=20,
-        help="do_bench_cudagraph measurement target, in ms",
+        help="Unused: RotatingBufferBench.bench's replay count is a fixed "
+        "constant, not an adaptive rep target. Kept for CLI compatibility.",
     )
 
     g = p.add_argument_group("shape (defaults are DeepSeek-V4-Pro tp4)")
@@ -267,30 +312,18 @@ def main():
         f"{'single GB/s':<12} {'us/token':<10} 2stage speedup"
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(a), **get_do_bench_graph_kwargs(a)}
+    )
+
     all_tokens = a.tokens
     for n in all_tokens:
         a.tokens = n
-        kwargs = build(a)
+        _p_gen = functools.partial(_generate_pool_inputs, a)
+        bencher.build_pool([_p_gen], [_OUT_VAL_KEYS])
 
-        def run():
-            fused_deepseek_v4_compress_norm_rope_store(**kwargs)
-
-        # The split exists to fan the compression across CUs when one program
-        # per token cannot fill them, so it is only interesting against the
-        # single-pass launcher at the same shape. num_decode_tokens=0 sends
-        # every token down the split rather than falling back.
-        scratch = torch.zeros(a.tokens, a.head_dim, dtype=torch.float32, device="cuda")
-
-        def run_two_stage():
-            fused_deepseek_v4_compress_norm_rope_store_two_stage(
-                **kwargs, num_decode_tokens=0, compress_scratch=scratch
-            )
-
-        run()  # compile outside the timed region
-        run_two_stage()
-        torch.cuda.synchronize()
-        ms = triton.testing.do_bench_cudagraph(run, rep=a.rep)
-        ms2 = triton.testing.do_bench_cudagraph(run_two_stage, rep=a.rep)
+        ms = bencher.bench(_run_single)
+        ms2 = bencher.bench(_run_two_stage)
 
         us, us2 = ms * 1e3, ms2 * 1e3
         gbs = counted_bytes(a) / (ms * 1e-3) / 1e9

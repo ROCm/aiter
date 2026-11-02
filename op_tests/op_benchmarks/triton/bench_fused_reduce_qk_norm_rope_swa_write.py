@@ -11,6 +11,9 @@ import functools
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
@@ -23,8 +26,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -98,8 +99,9 @@ def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args)
     max_seq = max(32768, M)  # Ensure every requested token has a valid position.
     dtype = str_to_torch_dtype[args.dtype]
     device = torch.device("cuda")
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     torch.manual_seed(0)
     _p_gen = functools.partial(
@@ -128,9 +130,7 @@ def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args)
         "swa_kv",
         "win",
     ]
-    rot_bufs = generate_rotating_buffers_pool(
-        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-    )
+    rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
     sample = rot_bufs[0]
 
     def _run(
@@ -172,7 +172,7 @@ def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args)
             **swa_kwargs,
         )
 
-    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+    ms = bencher.bench(_run)
     if metric == "time":
         return ms
 

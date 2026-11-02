@@ -3,6 +3,9 @@ import math
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.normalization.rmsnorm import rms_norm
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_rms_mxfp4_quant
@@ -13,8 +16,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
@@ -120,8 +121,9 @@ def run_benchmark(args):
     do_backward = args.backward
     if do_backward and quant != "none":
         raise ValueError("--backward cannot be combined with --quant")
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_rmsnorm(M, N, metric, model_name=None, **kwargs):
@@ -135,9 +137,7 @@ def run_benchmark(args):
                 _generate_rmsnorm_mxfp4_inputs, M, N, c_dtype, add_residual
             )
             _out_val_keys = ["x", "w", "res"]
-            rot_bufs = generate_rotating_buffers_pool(
-                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-            )
+            rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
             es = rot_bufs[0]["x"].element_size()
 
             def _run(x, w, res):
@@ -153,7 +153,7 @@ def run_benchmark(args):
             mem = mem_read + mem_write
             flops = 4 * M * N  # dominated by the norm; quant is elementwise
 
-            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+            ms = bencher.bench(_run)
         elif do_backward:
             # backward() builds its autograd graph on the default stream; let CUDA
             # graph capture (on its own side stream) adopt that stale reference.
@@ -165,9 +165,7 @@ def run_benchmark(args):
                 _generate_rmsnorm_backward_inputs, M, N, c_dtype, eps
             )
             _out_val_keys = ["x", "w", "y", "dy"]
-            rot_bufs = generate_rotating_buffers_pool(
-                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-            )
+            rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
             es = rot_bufs[0]["x"].element_size()
 
             def _run(x, w, y, dy):
@@ -194,13 +192,11 @@ def run_benchmark(args):
             mem = mem_read + mem_write
             flops = 8 * M * N
 
-            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+            ms = bencher.bench(_run)
         else:
             _p_gen = functools.partial(generate_rmsnorm_inputs, M, N, c_dtype)
             _out_val_keys = ["x", "w"]
-            rot_bufs = generate_rotating_buffers_pool(
-                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-            )
+            rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
             es = rot_bufs[0]["x"].element_size()
 
             def _run(x, w):
@@ -212,7 +208,7 @@ def run_benchmark(args):
             mem = mem_read + mem_write
             flops = 4 * M * N
 
-            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+            ms = bencher.bench(_run)
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":

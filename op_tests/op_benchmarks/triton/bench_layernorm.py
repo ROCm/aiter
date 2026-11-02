@@ -2,6 +2,9 @@ import functools
 
 import torch
 import triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 from aiter.ops.triton.normalization.norm import (
     layer_norm,
@@ -19,8 +22,6 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton,
-    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -130,8 +131,9 @@ def run_benchmark(args):
     add_residual = args.add_residual
     do_backward = args.backward
     c_dtype = str_to_torch_dtype[args.dtype]
-    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
-    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_layernorm(M, N, metric, **kwargs):
@@ -148,9 +150,7 @@ def run_benchmark(args):
                 _generate_layernorm_backward_inputs, M, N, c_dtype, add_residual
             )
             _out_val_keys = ["x", "weight", "bias", "dy", "y"]
-            rot_bufs = generate_rotating_buffers_pool(
-                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-            )
+            rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
             es = rot_bufs[0]["x"].element_size()
 
             def _run(x, weight, bias, dy, y):
@@ -163,7 +163,7 @@ def run_benchmark(args):
             mem = mem_read + mem_write
             flops = 12 * M * N
 
-            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+            ms = bencher.bench(_run)
         else:
             _p_gen = functools.partial(
                 _generate_layernorm_forward_inputs, M, N, c_dtype, add_residual, quant
@@ -179,9 +179,7 @@ def run_benchmark(args):
                 "yscale",
                 "xscale",
             ]
-            rot_bufs = generate_rotating_buffers_pool(
-                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
-            )
+            rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
             es = rot_bufs[0]["x"].element_size()
 
             if quant == "none":
@@ -254,7 +252,7 @@ def run_benchmark(args):
             if quant != "none":
                 flops += 2 * M * N
 
-            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+            ms = bencher.bench(_run)
 
         if metric == "time":
             return ms
