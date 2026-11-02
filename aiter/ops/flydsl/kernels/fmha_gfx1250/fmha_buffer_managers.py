@@ -568,7 +568,10 @@ def _tdm_gather_band_descriptor(
 
     Pages are contiguous, so the pool is a token-indexed table: token row is
     ``page_indices[p] * page_size + off`` at any page size, and ``stride_seq`` is the
-    per-token stride. Rows past ``valid`` take ``sentinel_row``, which must be IN RANGE
+    per-token stride. From ``page_size >= gather_rows`` the band is assembled from plain
+    per-page TDM copies instead -- fewer issues, and the trace shows a gather's 4th issue
+    stalling 100-140 cycles behind its 3rd. Below that the gather wins, and rows past
+    ``valid`` take ``sentinel_row``, which must be IN RANGE
     (gather defines OOB only for non-decreasing indices, ISA 4.10.3.2, and a page table
     is permuted) and FINITE (a NaN reaches O through ``P == 0`` under fast math, so pool
     row 0 will not do -- its page may never have been written).
@@ -586,6 +589,39 @@ def _tdm_gather_band_descriptor(
     _assert_multiple("band rows", num_rows, gather_rows)
     assert page_size & (page_size - 1) == 0, f"page_size {page_size} is not a power of two"
     rows_left = fx.max(valid - band_r0, fx.Int32(0))
+
+    # A page contributes page_size CONSECUTIVE pool rows, so once a page covers at least
+    # gather_rows of the band, one plain 2-D TDM per page costs no more issues than a
+    # gather and usually far fewer (num_rows/page_size vs num_rows/gather_rows). It also
+    # drops the index expansion and the sentinel: `valid` as the global extent gives
+    # hardware OOB zero-fill, which is finite by construction.
+    if page_size >= gather_rows:
+        rows_per_page = min(page_size, num_rows)
+        views = []
+        for p in range(max(1, num_rows // page_size)):
+            if page_size >= num_rows:
+                _off = (row0 + band_r0) & fx.Int32(page_size - 1)
+                row0_p = page_indices[0] * fx.Int32(page_size) + _off
+                valid_p = rows_left
+            else:
+                row0_p = page_indices[p] * fx.Int32(page_size)
+                valid_p = fx.max(rows_left - fx.Int32(p * page_size), fx.Int32(0))
+            views += _tdm_load_views(
+                ptr_x=ptr_x,
+                stride_seq=stride_seq,
+                stride_head=stride_head,
+                head=head,
+                row0=row0_p,
+                valid=valid_p,
+                num_rows=rows_per_page,
+                hdim=hdim,
+                pad_elems=pad_elems,
+                lds_base=lds_base + fx.Int32(p * rows_per_page * padded_row_bytes),
+                elem_dtype=elem_dtype,
+                num_warps=1,
+            )
+        return TdmCopyDescriptor(views)
+
     lds_span = num_rows * padded_row_bytes
     lds_view = fx.Tensor(
         fx.make_view(_lds_ptr_b128(lds_base), fx.make_layout(lds_span, 1))
