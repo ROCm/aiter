@@ -1054,13 +1054,19 @@ def derive(files, title="", raw_diff=""):
     INFRA = (".github/", "docs/", "3rdparty/", "third_party/", ".gitignore",
              "requirements", "README", "CONTRIBUTING", ".gitmodules",
              "setup.py", "conftest.py", "pyproject.toml", "hsa/")
+    # 3rdparty/ is INFRA, so a repin has to be seen before either shortcut below: otherwise a
+    # standalone repin, or one that only touches docs alongside, returns NONE and HK20 never runs.
+    repin = any(p.startswith("3rdparty/") and any(l.startswith("Subproject commit") for l in f["add"])
+                for p, f in files.items())
+    if repin:
+        hit("submodule-repin", "HK20")
     if paths and all(p.startswith(INFRA) or p.endswith((".md", ".txt", ".cfg", ".toml"))
                      or "/docs/" in p for p in paths):
-        return [("infra-only", "NONE")]
+        return t or [("infra-only", "NONE")]
     # Pure submodule / version-pointer bump: subproject commit lines and nothing else
     if add and all(re.match(r"^(Subproject commit|[0-9a-f]{40}$|.*version.*=)", l.strip())
                    for l in add.splitlines() if l.strip()):
-        return [("version-bump", "NONE")]
+        return t or [("version-bump", "NONE")]
 
     if any(f["new"] and (p.startswith("csrc/kernels/") or "/triton/" in p or "_gluon_kernels/" in p)
            for p, f in files.items()):
@@ -1070,9 +1076,9 @@ def derive(files, title="", raw_diff=""):
         return p.endswith((".cu", ".cuh", ".hip", ".h", ".hpp")) or \
                (p.endswith(".py") and any(k in p for k in KERNEL_PY))
     if any(not f["new"] and is_kernel(p) and (f["add"] or f["del"]) for p, f in files.items()):
-        hit("modified-kernel", "A1 B2 D1 D8 P6")   # D9 is scanner-backed, not read as prose
+        hit("modified-kernel", "A1 A4 B2 D1 D8 P6")   # D9 is scanner-backed, not read as prose
     if re.search(r"tl\.constexpr", add) or re.search(r"['\"]gfx\d+['\"]", add):
-        hit("new-routing-value", "B4 C4")
+        hit("new-routing-value", "A4 B4 C4")
     if any(p.endswith((".csv", ".yaml", ".yml")) or
            (p.endswith(".json") and ("config" in p or "tuned" in p)) for p in paths):
         hit("tuning-config", "D3 HK4")
@@ -1111,7 +1117,7 @@ def derive(files, title="", raw_diff=""):
     # `tl.load`/`tl.store` without a mask, and there is no tl in FlyDSL.
     if any("aiter/ops/flydsl/kernels/" in p and p.endswith(".py") and (f["add"] or f["del"])
            for p, f in files.items()):
-        hit("flydsl-kernel", "A1 B8 D1 D8 D12 P6 C5")
+        hit("flydsl-kernel", "A1 A4 B8 D1 D8 D12 P6 C5")
     if any(d in p for p in paths for d in DOWNSTREAM):
         hit("downstream-op", "E4 E5 A2")   # A2 is the same shared-path condition
     if any("codegen" in p or p.startswith("csrc/cpp_itfs/") or p.endswith("Makefile")
@@ -1220,9 +1226,9 @@ UNREACHABLE_BY_DESIGN = {
     "D11": "evidence-backed: triage.py structabi writes struct_abi.txt in Step 1b",
 }
 
-ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 C5 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
+ALL_RULES = ("A1 A2 A3 A4 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 C5 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
              "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
-             "T1 T2 T3 T4 T5 T6 T8 D11 HK12 HK12b STEP4")
+             "T1 T2 T3 T4 T5 T6 T8 D11 HK12 HK12b HK20 STEP4")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert
@@ -2380,6 +2386,11 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # The files this verdict cited, so a card that obeys the no-rule-codes rule
             # can still be matched to the FIRE it is reporting.
             fire_paths[m.group(1)] = [pp for pp, _ in CITATION.findall(m.group(2))]
+            # CITATION needs an extension, so a submodule (3rdparty/composable_kernel) is
+            # never a citation and an HK20 FIRE could not be matched to its own finding.
+            fire_paths[m.group(1)] += [p for p in touched if "." not in p.rsplit("/", 1)[-1]
+                                       and re.search(rf"(?<![\w/]){re.escape(p)}(?![\w/])",
+                                                     m.group(2))]
     backing = _fold_punct((verdicts_text or "") + "\n" + (diagnostic_text or "")
                           + "\n" + (answers_text or ""))
     problems = []
