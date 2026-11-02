@@ -25,8 +25,9 @@ A module provides
 - ``describe(job) -> str``: one line naming the job in the log.
 - optionally ``config_env(csv_paths)``, the environment that points the
   runtime's tuned-config lookups at the given tables,
-  ``configure(parser)`` for options of its own, and ``SCAN_ARCHS``, the archs
-  whose jobs have every size identified (below).
+  ``configure(parser)`` for options of its own, ``SCAN_ARCHS``, the archs
+  whose jobs have every size identified, and ``REFUSALS``, the limits the
+  runtime meets at sizes inside a row's range (both below).
 
 Its ``python -m`` entry is :func:`main`, and ``setup.py``'s build runs
 :func:`run_default`. Both run one process per target arch (``replay_env``),
@@ -47,6 +48,13 @@ makes from the size is monotonic, so that two sizes that request the same
 kernels bound a run that requests nothing else. An end that requests no
 FlyDSL kernel at all (another backend serves it, or the runtime refuses the
 size) bounds nothing, and is not bisected against.
+
+At a size inside a row's range the runtime may meet a limit of its own, e.g.
+no FlyDSL kernel that fits an untuned M. A module names each such limit in
+``REFUSALS``, patterns searched in the error's ``"Type: message"``, and a
+size that fails with one is reported as refused. Any other error there fails
+the replay, as it does at the row itself: a dry-run stand-in that an upgrade
+broke must not pass for the runtime refusing a size.
 """
 
 from __future__ import annotations
@@ -164,10 +172,10 @@ def replay_job(
 ) -> tuple[dict[str, Any], frozenset | None]:
     """Replay one job of ``module``; returns its result and the kernels it
     requested (None when it failed). A ``NotImplementedError`` is the runtime
-    refusing the call, which is reported, not failed. So is any error of the
-    runtime's host code before it reaches FlyDSL at a ``probe`` (a size inside
-    a row's range rather than the row's own), where the runtime meets a limit
-    of its own (e.g. no kernel for an odd M below the smallest tuned one)."""
+    refusing the call, which is reported, not failed. So, at a ``probe`` (a
+    size inside a row's range rather than the row's own), is an error the
+    module names in ``REFUSALS``: a limit the runtime meets there (e.g. no
+    FlyDSL kernel that fits an untuned M)."""
     from aiter.aot.flydsl.dry_run import GpuRuntimeReached, dry_run
 
     arch = job_arch(job, getattr(module, "AOT_ARCH_DEFAULT", "gfx950"))
@@ -203,14 +211,10 @@ def replay_job(
                 result["other_backend"] = f"{type(error).__name__}: {error}"
                 result["kernels"] = 0
                 return result, frozenset()
-            if (
-                probe
-                and not isinstance(error, (GpuRuntimeReached, ReplayHookBroken))
-                and not _in_flydsl(error)
-                and not kernels
-            ):
+            reason = f"{type(error).__name__}: {error}"
+            if probe and not kernels and _refused(module, reason):
                 result["compile_time"] = 0.0
-                result["refused"] = f"{type(error).__name__}: {error}"
+                result["refused"] = reason
                 result["kernels"] = 0
                 return result, frozenset()
             print(
@@ -250,6 +254,12 @@ def _in_flydsl(error: BaseException) -> bool:
         marker in frame.filename and not frame.filename.startswith(_AOT_DIR)
         for frame in traceback.extract_tb(error.__traceback__)
     )
+
+
+def _refused(module: Any, reason: str) -> bool:
+    """Whether ``reason``, an error's ``"Type: message"``, is one of the
+    limits ``module.REFUSALS`` says the runtime meets inside a row's range."""
+    return any(re.search(p, reason) for p in getattr(module, "REFUSALS", ()))
 
 
 def _bisect(module, job: dict, kernels: dict, low: int, high: int) -> list[dict]:

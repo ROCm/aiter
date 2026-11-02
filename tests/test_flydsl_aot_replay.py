@@ -1,4 +1,5 @@
-"""FlyDSL AOT replay: how it hooks into FlyDSL's launches.
+"""FlyDSL AOT replay: how it hooks into FlyDSL's launches, and which errors at a
+size inside a row's range it may report as the runtime refusing that size.
 
 These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
 """
@@ -42,8 +43,10 @@ def _launcher():
     return launch
 
 
-def _module(replay_job):
-    return SimpleNamespace(replay=replay_job, describe=lambda job: f"M={job['m']}")
+def _module(replay_job, refusals=()):
+    return SimpleNamespace(
+        replay=replay_job, describe=lambda job: f"M={job['m']}", REFUSALS=refusals
+    )
 
 
 def _keyless(self, args, kwargs, **_options):
@@ -74,3 +77,18 @@ def test_a_launch_that_derives_no_key_fails_the_replay(run_only):
         result, kernels = replay.replay_job(module, _JOB, probe=True)
     assert result["compile_time"] is None
     assert kernels is None
+
+
+def test_a_probe_error_is_a_refusal_only_where_the_module_declares_it():
+    def refuse(job):
+        raise RuntimeError(f"no config for M={job['m']}")
+
+    declared = _module(refuse, refusals=(r"^RuntimeError: no config for M=",))
+    result, kernels = replay.replay_job(declared, _JOB, probe=True)
+    assert result["refused"] == "RuntimeError: no config for M=64"
+    assert kernels == frozenset()
+
+    for module, probe in ((declared, False), (_module(refuse), True)):
+        result, kernels = replay.replay_job(module, _JOB, probe=probe)
+        assert result["compile_time"] is None
+        assert kernels is None
