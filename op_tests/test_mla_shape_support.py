@@ -418,6 +418,8 @@ def test_metadata_info_sizes_96_heads_for_both_plans():
     # and 6 one-tile pseudo-batches without it. get_mla_metadata_info_v1 cannot
     # tell which, so it sizes for both, and no more: mla_decode_fwd's fp32 logits
     # grow with these buffers.
+    if get_gfx() != "gfx950":
+        pytest.skip("the native 96-head fp8 route is gfx950 only")
     for bs, msq in itertools.product((1, 56), (7, 8)):
         info = aiter.get_mla_metadata_info_v1(
             bs,
