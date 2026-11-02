@@ -719,8 +719,9 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
 // r's packet pk of row y = pk / row_pk lands at output packet
 // (y * ngpus + r) * row_pk + pk % row_pk: row_pk = nPk gathers along dim 0,
 // the last dim's packets along the last dim. Shares ar_ll_gfx1250's epoch and
-// banks, so the two interleave freely.
-template <typename T, int ngpus>
+// banks, so the two interleave freely. ALIGNED: input and output 8-byte
+// aligned; otherwise their packets move byte by byte (same protocol).
+template <typename T, int ngpus, bool ALIGNED>
 __global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
     T* const* __restrict__ peer_scratch,
     T* __restrict__ result,
@@ -746,16 +747,28 @@ __global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
 
     const uint32_t gtid   = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t stride = gridDim.x * blockDim.x;
-    const uint2* in2      = reinterpret_cast<const uint2*>(sendbuff);
-    uint2* out2           = reinterpret_cast<uint2*>(result);
     const auto out_at     = [&](int r, uint32_t pk) {
         const uint32_t y = pk / row_pk;
         return ((size_t)y * ngpus + r) * row_pk + (pk - y * row_pk);
     };
+    const auto load = [&](uint32_t pk) {
+        uint2 d;
+        if constexpr(ALIGNED)
+            d = reinterpret_cast<const uint2*>(sendbuff)[pk];
+        else
+            __builtin_memcpy(&d, reinterpret_cast<const uint8_t*>(sendbuff) + (size_t)pk * 8, 8);
+        return d;
+    };
+    const auto store = [&](size_t at, uint2 d) {
+        if constexpr(ALIGNED)
+            reinterpret_cast<uint2*>(result)[at] = d;
+        else
+            __builtin_memcpy(reinterpret_cast<uint8_t*>(result) + at * 8, &d, 8);
+    };
 
     for(uint32_t pk = gtid; pk < nPk; pk += stride)
     {
-        const uint2 d = in2[pk];
+        const uint2 d = load(pk);
 #pragma unroll
         for(int r = 1; r < ngpus; ++r)
         {
@@ -764,7 +777,7 @@ __global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
                                bankOffPkts + (size_t)rank * slot;
             ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d.x, flag, d.y, flag);
         }
-        out2[out_at(rank, pk)] = d;
+        store(out_at(rank, pk), d);
     }
 
     LLPackedMsg* myBase =
@@ -785,7 +798,7 @@ __global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
             for(int r = 0; r < ngpus; ++r)
                 if((pending & (1u << r)) && line[r][1] == flag && line[r][3] == flag)
                 {
-                    out2[out_at(r, pk)] = make_uint2(line[r][0], line[r][2]);
+                    store(out_at(r, pk), make_uint2(line[r][0], line[r][2]));
                     pending &= ~(1u << r);
                 }
         }
@@ -1427,15 +1440,23 @@ public:
 #undef LAUNCH_LL
     }
 
-    // Whether an all-gather of `bytes` a rank takes ag_ll_gfx1250, which reads
-    // the input in place: whole 8-byte packets (a row's too, along the last
-    // dim), and no output over the input it is still publishing.
-    bool use_ll_ag(const void* input, const void* output, size_t bytes, size_t row_bytes) const
+    // Whether an all-gather of `bytes` a rank takes ag_ll_gfx1250: whole 8-byte
+    // packets, a row's too along the last dim. The shape alone decides, so
+    // every rank of the collective takes the same protocol.
+    bool use_ll_ag(size_t bytes, size_t row_bytes) const
+    {
+        return use_ll(bytes) && bytes % 8 == 0 && row_bytes % 8 == 0;
+    }
+
+    // Whether ag_ll_gfx1250 may read this rank's input in place: clear of the
+    // output it writes while still publishing the input, or a dim-0 gather into
+    // the output's own slice (that slice is rewritten with the same bytes).
+    bool ll_ag_reads_in_place(const void* input, const void* output, size_t bytes, size_t row_bytes) const
     {
         const auto in  = reinterpret_cast<uintptr_t>(input);
         const auto out = reinterpret_cast<uintptr_t>(output);
-        return use_ll(bytes) && bytes % 8 == 0 && row_bytes % 8 == 0 && in % 8 == 0 &&
-               out % 8 == 0 && (out >= in + bytes || in >= out + bytes * world_size_);
+        return out >= in + bytes || in >= out + bytes * world_size_ ||
+               (row_bytes == bytes && in == out + bytes * rank_);
     }
 
     // LL all-gather (see ag_ll_gfx1250); row_bytes == bytes gathers along dim 0.
@@ -1448,10 +1469,18 @@ public:
         int blocks = std::max(1, std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads)));
 
         T* const* peers = reinterpret_cast<T* const*>(d_ll_peers_);
-#define LAUNCH_AG_LL(NG)                                                   \
-        ag_ll_gfx1250<T, NG><<<blocks, threads, 0, stream>>>(              \
-            peers, output, input, nPk, (uint32_t)(row_bytes >> 3), rank_, \
-            d_ll_block_flags_)
+        // a rank-local choice of kernel, not of protocol: both move the same packets
+        const bool aligned = (reinterpret_cast<uintptr_t>(input) & 7) == 0 &&
+                             (reinterpret_cast<uintptr_t>(output) & 7) == 0;
+#define LAUNCH_AG_LL(NG)                                                              \
+        if(aligned)                                                                   \
+            ag_ll_gfx1250<T, NG, true><<<blocks, threads, 0, stream>>>(               \
+                peers, output, input, nPk, (uint32_t)(row_bytes >> 3), rank_,         \
+                d_ll_block_flags_);                                                   \
+        else                                                                          \
+            ag_ll_gfx1250<T, NG, false><<<blocks, threads, 0, stream>>>(              \
+                peers, output, input, nPk, (uint32_t)(row_bytes >> 3), rank_,         \
+                d_ll_block_flags_)
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LL);
 #undef LAUNCH_AG_LL
     }
