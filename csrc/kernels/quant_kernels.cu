@@ -69,7 +69,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       int32_t ori_row_stride,
                                       int64_t oob_size,
                                       int32_t const* __restrict__ num_rows = nullptr,
-                                      const int32_t num_cols_factor        = 1)
+                                      const int32_t num_cols_factor        = 1,
+                                      // Row-strided outputs (row-major, unshuffled scale
+                                      // only): output row pitch in stored elements and
+                                      // scale row pitch in scale elements. -1: dense.
+                                      const int64_t out_row_stride         = -1,
+                                      const int64_t scale_row_stride       = -1)
 {
     // The 2D path is selected only for dense input without dynamic row counts.
     // This invariant is independent of the numeric M/K values.
@@ -365,7 +370,9 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         // Keep row and in-row offsets separate so tensors beyond a global descriptor's
         // 32-bit byte reach can use one row as the descriptor range.
         const int64_t out_row_offset =
-            std::is_same_v<DTYPE_O, opus::fp4_t> ? x * ori_cols / 2 : x * ori_cols;
+            out_row_stride >= 0
+                ? x * out_row_stride
+                : (std::is_same_v<DTYPE_O, opus::fp4_t> ? x * ori_cols / 2 : x * ori_cols);
         const int32_t out_thread_offset =
             (std::is_same_v<DTYPE_O, opus::fp4_t> ? y * group_size / 2
                                                   : y * group_size) +
@@ -382,7 +389,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         scale_elem_t  scale_val{};
         if(lane_in_group == 0)
         {
-            int64_t scale_idx = groupId;
+            int64_t scale_idx = scale_row_stride >= 0 ? x * scale_row_stride + y : groupId;
             if constexpr(shuffle_scale)
             {
                 if constexpr(use_e8m0_scale && group_size == 32)
@@ -1703,12 +1710,30 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
     AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
                 " only support group_size [32, 64 , 128]");
-    AITER_CHECK(out.is_contiguous());
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
     int const row_stride  = input.stride(-2);
     int32_t* num_rows_ptr = num_rows.has_value() ? reinterpret_cast<int32_t*>(num_rows->data_ptr()) : nullptr;
+
+    // Row-strided outputs: `out` and `scales` may be 2-D row views of one wider
+    // buffer (e.g. MegaMoE S1F's combined wire rows, payload | e8m0 | pad), as
+    // long as each row is dense and the scale is unshuffled. Dense tensors keep
+    // the original (stride -1) code path.
+    int64_t out_row_stride   = -1;
+    int64_t scale_row_stride = -1;
+    if(!out.is_contiguous() || !scales.is_contiguous())
+    {
+        AITER_CHECK(!shuffle_scale && out.dim() == 2 && scales.dim() == 2 &&
+                        out.stride(-1) == 1 && scales.stride(-1) == 1 &&
+                        out.size(0) == rows && scales.size(0) == rows &&
+                        scales.size(1) >= cols / group_size && num_rows_ptr == nullptr,
+                    __func__,
+                    " row-strided out/scales need 2-D dense rows, rows == input rows, "
+                    "an unshuffled scale and no num_rows");
+        out_row_stride   = out.stride(0);
+        scale_row_stride = scales.stride(0);
+    }
 
     AITER_CHECK(cols % group_size == 0, __func__, " cols is not divisible by group_size");
 
@@ -1775,7 +1800,10 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             static constexpr int32_t ooba = 4 / sizeof(out_t);
             const int64_t oob_elems =
                 (static_cast<int64_t>(rows) * cols + ooba - 1) / ooba * ooba;
-            const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
+            const int64_t oob_size =
+                out_row_stride >= 0
+                    ? (static_cast<int64_t>(rows) * out_row_stride + 3) / 4 * 4
+                    : oob_elems * static_cast<int64_t>(sizeof(out_t));
 
             // Staging was decided at the block size above, because the two interact; it is
             // named again here only because it also changes the grid.
@@ -1800,6 +1828,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                             return value && value[0] == '1' && value[1] == '\0';
                         }();
                         if(d01_tuning && dyn_gq_tuned_arch() && num_rows_ptr == nullptr &&
+                           out_row_stride < 0 &&
                            (rows == 16384 || (rows == 512 && cols == 16384)) && row_stride == cols &&
                            (cols == 7168 || cols == 16384))
                         {
@@ -1836,7 +1865,9 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         row_stride,
                         oob_size,
                         num_rows_ptr,
-                        num_rows_factor);
+                        num_rows_factor,
+                        out_row_stride,
+                        scale_row_stride);
                     };
                     using BlkTuned = std::integral_constant<int32_t, kBlkTuned>;
                     using Blk64    = std::integral_constant<int32_t, 64>;
