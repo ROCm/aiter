@@ -53,7 +53,9 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     int q_out_u_stride,
     int k_out_stride,
     int q_res_out_stride,
-    int group_size)
+    int group_size,
+    const int32_t* __restrict__ q_row_index,
+    int q_rows)
 {
     // Keep internal names stable to avoid touching tuned kernel body logic.
     auto* out1_q = q_out_quantized;
@@ -109,17 +111,29 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     using vec2_f = opus::vector_t<float, 2>;
 
     int n = is_x1 ? n1 : n2;
-    const DTYPE_I* in_ptr = is_x1 ? (inp1 + idx * static_cast<int64_t>(inp1_stride))
+    // q_row_index: q's row of this output row is q_row_index[idx] (a gather, e.g. an
+    // embedding lookup fused in front of the norm). An index outside [0, q_rows) reads
+    // a zero row: its buffer is given no bytes, so every load comes back 0.
+    int64_t q_row = idx;
+    bool q_row_valid = true;
+    if(q_row_index != nullptr)
+    {
+        const int32_t r = q_row_index[idx];
+        q_row_valid = r >= 0 && r < q_rows;
+        q_row = q_row_valid ? r : 0;
+    }
+    const DTYPE_I* in_ptr = is_x1 ? (inp1 + q_row * static_cast<int64_t>(inp1_stride))
                                   : (inp2 + idx * static_cast<int64_t>(inp2_stride));
     const DTYPE_I* w_ptr = is_x1 ? w1 : w2;
     int oob_i = (n + ooba_i - 1) / ooba_i * ooba_i;
+    const int in_bytes = (is_x1 && !q_row_valid) ? 0 : oob_i * static_cast<int>(sizeof(DTYPE_I));
     int row_offset = (interleave && (num_load_inst > 1))
                          ? (tid % WARP_SIZE * load_vec_size +
                             (tid / WARP_SIZE) * WARP_SIZE * thread_data_size)
                          : (tid * thread_data_size);
     const bool row_active = row_offset < n;
 
-    auto in_buffer = opus::make_gmem<DTYPE_I>(in_ptr, oob_i * sizeof(DTYPE_I));
+    auto in_buffer = opus::make_gmem<DTYPE_I>(in_ptr, in_bytes);
     auto w_buffer = opus::make_gmem<DTYPE_I>(w_ptr, oob_i * sizeof(DTYPE_I));
     vec_i thread_data_i{};
     vec_i thread_data_w{};
@@ -466,7 +480,9 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             out1_u_stride,                                                                                                        \
             out2_stride,                                                                                                          \
             out_res1_stride,                                                                                                      \
-            group_size);                                                                                                          \
+            group_size,                                                                                                           \
+            q_row_index_ptr,                                                                                                      \
+            q_rows);                                                                                                              \
     });
 
 #define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, interleave) \
@@ -617,7 +633,8 @@ void fused_qk_rmsnorm_group_quant(
     std::optional<aiter_tensor_t> q_residual,
     int64_t group_size,
     bool transpose_scale,
-    bool gemma_norm)
+    bool gemma_norm,
+    std::optional<aiter_tensor_t> q_row_index)
 {
     // q / q_weight / q_epsilon are surfaced as std::optional only so the pybind-generated
     // Python signature is valid (default-arg ordering is preserved for the existing public
@@ -708,7 +725,20 @@ void fused_qk_rmsnorm_group_quant(
                 inp1.size(1),
                 ", got ",
                 inp1_weight.numel());
-    const int m = inp1.size(0);
+    // With q_row_index the output rows are the indices' (q is a table they index).
+    const int32_t* q_row_index_ptr = nullptr;
+    const int q_rows = inp1.size(0);
+    if(q_row_index.has_value())
+    {
+        const auto& qi = q_row_index.value();
+        AITER_CHECK(qi.is_gpu(), __func__, " q_row_index must be on CUDA/HIP device");
+        AITER_CHECK(qi.dim() == 1, __func__, " q_row_index must be a 1D tensor");
+        AITER_CHECK(qi.dtype() == AITER_DTYPE_i32, __func__, " q_row_index must be int32");
+        check_1d_contiguous(qi, "q_row_index");
+        AITER_CHECK(!q_residual.has_value(), __func__, " q_row_index does not take q_residual");
+        q_row_index_ptr = reinterpret_cast<const int32_t*>(qi.data_ptr());
+    }
+    const int m = q_row_index.has_value() ? q_row_index.value().size(0) : inp1.size(0);
     const int n1 = inp1.size(1);
     const bool per_token_quant = (!no_quant && group_size == 0);
 
@@ -1091,7 +1121,8 @@ void fused_qk_rmsnorm_per_token_quant(
                                  q_residual,
                                  0,
                                  false,
-                                 gemma_norm);
+                                 gemma_norm,
+                                 std::nullopt);
 }
 
 } // namespace aiter

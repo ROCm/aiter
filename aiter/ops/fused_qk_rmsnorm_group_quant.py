@@ -32,6 +32,7 @@ def _fused_qk_rmsnorm_group_quant_kernel(
     group_size: int = 128,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
+    q_row_index: Tensor | None = None,
 ) -> None: ...
 
 
@@ -73,7 +74,12 @@ def fused_qk_rmsnorm_group_quant(
     group_size: int = 128,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
+    q_row_index: Tensor | None = None,
 ) -> None:
+    """``q_row_index`` (int32, one per output row): row ``i`` normalizes
+    ``q[q_row_index[i]]`` -- a gather (an embedding lookup) fused in front of
+    the norm; an index outside ``q``'s rows reads as zeros. Outputs and ``k``
+    then have ``q_row_index.numel()`` rows. Not with ``q_residual``."""
     # No-quant mode: when q_out_scale is None we only do RMSNorm and write to q_out_unquantized.
     no_quant = q_out_scale is None
     if no_quant:
@@ -131,6 +137,7 @@ def fused_qk_rmsnorm_group_quant(
         group_size,
         transpose_scale,
         gemma_norm,
+        q_row_index,
     )
 
 
