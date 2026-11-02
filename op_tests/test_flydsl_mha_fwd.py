@@ -348,7 +348,7 @@ def _build_paged(seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, device)
 
 @benchmark()
 def test_mha_flydsl_paged(
-    seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, causal, lse
+    seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, causal, lse, sink, window
 ):
     """Paged KV: the pool is page-indexed, Q is ragged exactly as in thd."""
     device = "cuda"
@@ -364,10 +364,12 @@ def test_mha_flydsl_paged(
         seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, device
     )
     scale = 1.0 / math.sqrt(d_qk)
-    ref = run_torch_varlen(
-        q, k_dense, v_dense, cu_q.tolist(), cu_k.tolist(), scale, causal, False, None,
-        (-1, -1),
+    sink_t = _make_sink(H_q, device) if sink else None
+    ref_result = run_torch_varlen(
+        q, k_dense, v_dense, cu_q.tolist(), cu_k.tolist(), scale, causal, lse, sink_t,
+        window,
     )
+    ref, ref_lses = ref_result if lse else (ref_result, None)
 
     # No CK candidate: mha_batch_prefill does not compile on gfx1250 -- its tile
     # distributions static_assert on wave64 -- so there is no paged baseline here.
@@ -376,21 +378,34 @@ def test_mha_flydsl_paged(
             q, k_pool, v_pool, cu_q, kv_indptr, page_ids,
             kv_last_page_lens=last_lens, max_seqlen_q=max(seqs_q),
             max_seqlen_k=max(seqs_k), causal=causal, return_lse=lse,
+            window_size=window, sink=sink_t,
         )
 
     flops = _flops(list(zip(seqs_q, seqs_k)), H_q, d_qk, d_v, causal)
     nbytes = _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v,
                      q.element_size(), q.element_size(), lse)
     ret = {"gfx": get_gfx()}
-    out, us = run_perftest(_run)
-    out = out[0] if isinstance(out, (tuple, list)) else out
+    data, us = run_perftest(_run)
+    out, out_lse = data if lse else (data, None)
     ret["flydsl us"] = us
     ret["flydsl TFLOPS"] = flops / us / 1e6
     ret["flydsl TB/s"] = nbytes / us / 1e6
-    ret["flydsl err"] = checkAllclose(
+    err = checkAllclose(
         ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=1e-2, atol=1e-2,
-        msg="flydsl: paged prefill",
+        msg="flydsl: paged out",
     )
+    if out_lse is not None:
+        # same [nheads_q, total_q] fp32 convention the thd path asserts
+        assert out_lse.dtype == torch.float32, f"lse dtype {out_lse.dtype}"
+        assert tuple(out_lse.shape) == (H_q, tot_q), (
+            f"bad paged lse shape {tuple(out_lse.shape)}"
+        )
+        for b in range(len(seqs_q)):
+            err = max(err, checkAllclose(
+                ref_lses[b], out_lse[:, cu_q[b] : cu_q[b + 1]],
+                rtol=1e-2, atol=1e-2, msg=f"flydsl: paged lse b{b}",
+            ))
+    ret["flydsl err"] = err
     return ret
 
 
@@ -1212,19 +1227,23 @@ def main():
         # paged is a16w16 only, so the 8-bit dtypes in the sweep do not apply
         paged_dtypes = [d for d in served_dtypes if d[0].itemsize == 2 and d[0] == d[1]]
         rows = []
-        for (d_qk, d_v), shape, dtype, page_size, causal, lse in itertools.product(
+        for (
+            (d_qk, d_v), shape, dtype, page_size, causal, lse, sink, window
+        ) in itertools.product(
             [h for h in d_qk_v if _flydsl_serves(*h) and h[0] != 192],
             thd_shapes,
             paged_dtypes,
             args.page_size,
             causals,
             lses,
+            sinks,
+            windows,
         ):
             seqs_q, seqs_k, H_q, H_kv = shape
             rows.append(
                 test_mha_flydsl_paged(
                     seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size,
-                    dtype[0], causal, lse,
+                    dtype[0], causal, lse, sink, window,
                 )
             )
         summarize("FlyDSL FMHA prefill paged summary", rows)
