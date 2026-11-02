@@ -739,15 +739,19 @@ def _unified_attention_3d_triton(
     length_aware = {}
     if split_budget is not None:
         # one program per (sequence, segment) work item and KV head: the
-        # per-sequence floor shares sum to at most split_budget + num_seqs, and
-        # no sequence takes more than NUM_SEGMENTS. Items are dealt out in runs
-        # of ITEM_RUN, once per head; a multiple of the XCD count keeps every
-        # head of an item on one XCD, so they share its L2.
+        # per-sequence floor shares sum to at most split_budget + num_seqs - 1
+        # (a sequence below segment_tokens takes 1 but leaves its tokens out of
+        # the other shares), and no sequence takes more than NUM_SEGMENTS.
+        # Items are dealt out in runs of ITEM_RUN, once per head; a multiple of
+        # the XCD count keeps every head of an item on one XCD, so they share
+        # its L2.
         assert (
             split_runs_per_xcd is not None
         ), "a length-aware split needs SPLIT_RUNS_PER_XCD in the attn_3d config"
         num_xcds = get_num_xcds()
-        num_items = min(split_budget + params.num_seqs, params.num_seqs * NUM_SEGMENTS)
+        num_items = min(
+            split_budget + params.num_seqs - 1, params.num_seqs * NUM_SEGMENTS
+        )
         # a batch with fewer items than a full run takes a shorter one, so the
         # padding does not launch idle programs for every KV head
         runs = min(

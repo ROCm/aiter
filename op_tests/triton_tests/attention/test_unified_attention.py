@@ -768,7 +768,7 @@ def test_triton_unified_attn_3d_length_aware_split(
     kv = [k for _, k in seq_lens]
     segment_tokens = max(triton.cdiv(sum(kv), split_budget), 1)
     used = [min(max(k // segment_tokens, 1), num_segments) for k in kv]
-    assert sum(used) <= split_budget + len(kv)
+    assert sum(used) <= split_budget + len(kv) - 1
     if batch != "uniform":
         assert used[0] > max(used[1:]) and min(used) < num_segments, used
     else:
@@ -951,6 +951,22 @@ def test_length_aware_split_scope() -> None:
         _length_aware_split(config, SimpleNamespace(**{**wide, "num_seqs": 2**15}))
         is None
     )
+
+    # the grid holds split_budget + num_seqs - 1 work items; the shares reach that
+    # only when empty sequences sit beside one that fills the budget
+    def num_items(kv, budget):
+        segment_tokens = max(triton.cdiv(sum(kv), budget), 1)
+        return sum(max(k // segment_tokens, 1) for k in kv)
+
+    rng = random.Random(0)
+    for _ in range(2000):
+        kv = [
+            rng.choice((0, 1, rng.randint(1, 1 << 17)))
+            for _ in range(rng.randint(1, 40))
+        ]
+        budget = rng.randint(1, 1024)
+        assert num_items(kv, budget) <= budget + len(kv) - 1, (kv, budget)
+    assert num_items([512 * 64, 0], 512) == 512 + 2 - 1
     # the 3D launch and the reduce read their length-aware keys from these entries
     assert "SPLIT_RUNS_PER_XCD" in get_unified_attention_config(
         "attn_3d", params, arch="gfx950"

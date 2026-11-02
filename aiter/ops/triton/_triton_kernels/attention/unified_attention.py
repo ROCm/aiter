@@ -59,10 +59,10 @@ def find_seq_idx(
 # segments of
 #     segment_tokens = cdiv(sum(seq_len), split_budget)
 # and a sequence takes seq_len // segment_tokens of them, at least one and at
-# most NUM_SEGMENTS_PER_SEQ. The counts sum to at most split_budget + num_seqs,
-# so the attention grid is a flat list of that many (sequence, segment) work
-# items per KV head; the reduce recomputes the same count to merge exactly the
-# segments a sequence used.
+# most NUM_SEGMENTS_PER_SEQ. The counts sum to at most
+# split_budget + num_seqs - 1, so the attention grid is a flat list of that many
+# (sequence, segment) work items per KV head; the reduce recomputes the same
+# count to merge exactly the segments a sequence used.
 # The KV heads of one token share cache lines, so the grid deals each run of
 # ITEM_RUN items out once per KV head: workgroups go round-robin over the XCDs,
 # and a run that is a multiple of the XCD count puts every head of an item on
