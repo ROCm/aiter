@@ -522,6 +522,10 @@ _run_compiled(compiled["launch"],
   `stream`) — bypasses DLPack. See `mla_reduce_kernels.py`,
   `linear_attention_prefill_kernels.py`, `splitk_hgemm.py`.
 - Reuse `tensor_shim._run_compiled`; don't add a second copy in wrapper modules.
+- Preserve existing GEMM APIs during host-launch caching work. No in-tree callers
+  does not rule out downstream use (for example, ATOM); change dispatch unless
+  API retirement is part of the task. Record missing dependencies or stale
+  kernel signatures separately from caching.
 - New runtime entry points and routing branches must use this helper or an
   existing equivalent `CompiledFunction` cache. Arg order/types must match the
   compiled signature; the first `flyc.compile` call already executes it.

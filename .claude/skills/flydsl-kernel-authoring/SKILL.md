@@ -206,6 +206,10 @@ New aiter runtime entry points must dispatch their `@flyc.jit` launchers through
 an earlier repository cleanup does not cover later additions. A cached factory
 returning a JitFunction is not itself a compiled-dispatch cache.
 
+Preserve existing entry points when adding compiled dispatch. No in-tree callers
+does not establish absence of downstream users; API retirement is a separate
+task from host-launch caching.
+
 Leave `specialization_key` unset for factory launchers with fixed compile
 parameters. For launchers with varying constexpr arguments, key every compile
 parameter and any tensor ABI or device variation that changes the artifact;
