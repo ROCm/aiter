@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the FlyDSL flash-attention kernels: gfx1201 bf16/f16 and gfx950 fp8."""
+"""Tests for the FlyDSL flash-attention kernels: gfx11 and gfx1201 bf16/f16, gfx950 fp8."""
 
 from __future__ import annotations
 
+import math
+import os
 from contextlib import nullcontext
 from itertools import pairwise
 
@@ -344,6 +346,147 @@ def test_flydsl_fmha_rejects_device_mismatch():
     v = torch.randn(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda:1")
     with pytest.raises(ValueError, match="same device"):
         flydsl_flash_attn_func(q, k, v)
+
+
+# gfx11 (RDNA3 / RDNA3.5) bf16/f16. Any sequence lengths, cross-attention and
+# head_dim % 8 == 0, with no host padding, so the grid leans on the tails.
+
+_gfx11_only = pytest.mark.skipif(
+    not _arch().startswith("gfx11"),
+    reason="flydsl_flash_attn_func gfx11 path needs an RDNA3 / RDNA3.5 GPU",
+)
+
+# (batch, seq_q, seq_kv, num_heads, head_dim, causal, dtype). Override with
+# AITER_FLYDSL_FMHA_GFX11_SHAPES="b,sq,skv,h,d,causal,dtype;..." (dtype bf16/f16).
+_GFX11_DEFAULT_SHAPES = [
+    (1, 32760, 32760, 12, 128, False, "bf16"),  # Wan2.1 1.3B self-attn
+    (1, 32760, 512, 12, 128, False, "bf16"),  # Wan2.1 1.3B cross-attn
+    (2, 4096, 4096, 8, 128, True, "bf16"),
+    (2, 1000, 1000, 3, 128, True, "bf16"),  # tails on both q and kv
+    (1, 777, 333, 4, 64, False, "bf16"),  # cross, odd lengths
+    (2, 129, 129, 8, 128, False, "bf16"),  # one key past a tile
+    (1, 1000, 77, 2, 96, False, "bf16"),  # kv shorter than a tile
+    (2, 4096, 4096, 8, 40, False, "f16"),  # SD1.5 head_dim, padded to 48 in-kernel
+    (2, 4096, 4096, 16, 72, False, "f16"),  # PixArt head_dim, padded to 80
+    (2, 1024, 1024, 8, 80, True, "f16"),
+    (2, 1024, 1024, 8, 160, False, "f16"),
+    (1, 1024, 1024, 2, 256, False, "bf16"),  # single LDS buffer fallback
+    (3, 1, 1, 2, 64, False, "bf16"),
+]
+
+
+def _gfx11_shapes():
+    spec = os.environ.get("AITER_FLYDSL_FMHA_GFX11_SHAPES")
+    if not spec:
+        return _GFX11_DEFAULT_SHAPES
+    shapes = []
+    for cell in spec.split(";"):
+        b, sq, skv, h, d, causal, dtype = cell.split(",")
+        if dtype not in ("bf16", "f16"):
+            raise ValueError(f"bad dtype {dtype!r} in AITER_FLYDSL_FMHA_GFX11_SHAPES")
+        shapes.append(
+            (int(b), int(sq), int(skv), int(h), int(d), causal in ("1", "True"), dtype)
+        )
+    return shapes
+
+
+def _ref_head_fp32(q, k, v, b, h, causal, scale, chunk=4096):
+    """fp32 attention for one (batch, head) of BSHD inputs, in query chunks."""
+    qh, kh, vh = q[b, :, h].float(), k[b, :, h].float(), v[b, :, h].float()
+    out = torch.empty_like(qh)
+    for r0 in range(0, qh.shape[0], chunk):
+        s = (qh[r0 : r0 + chunk] @ kh.t()) * scale
+        if causal:
+            rows = torch.arange(r0, r0 + s.shape[0], device=s.device)[:, None]
+            cols = torch.arange(kh.shape[0], device=s.device)[None, :]
+            s = s.masked_fill(cols > rows, float("-inf"))
+        out[r0 : r0 + chunk] = torch.softmax(s, dim=-1) @ vh
+    return out
+
+
+def _check_gfx11(out, q, k, v, causal, scale, heads=None):
+    batch, _, num_heads, _ = q.shape
+    assert out.shape == q.shape and out.dtype == q.dtype
+    assert not torch.isnan(out).any()
+    tol = 1e-2 if q.dtype == torch.bfloat16 else 2e-3
+    # Every head of the last batch, plus head 0 of batch 0: the last batch/head
+    # is where a narrow offset would wrap first.
+    pairs = heads or ([(batch - 1, h) for h in range(num_heads)] + [(0, 0)])
+    for b, h in pairs:
+        ref = _ref_head_fp32(q, k, v, b, h, causal, scale)
+        rel = ((out[b, :, h].float() - ref).norm() / ref.norm()).item()
+        assert rel < tol, f"(b={b}, h={h}) rel_err={rel:.3e} >= {tol}"
+
+
+@_gfx11_only
+@pytest.mark.parametrize(
+    "batch,seq_q,seq_kv,num_heads,head_dim,causal,dtype_str", _gfx11_shapes()
+)
+def test_flydsl_fmha_gfx11_correctness(
+    batch, seq_q, seq_kv, num_heads, head_dim, causal, dtype_str
+):
+    dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch, seq_q, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    k = torch.randn(
+        batch, seq_kv, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    v = torch.randn(
+        batch, seq_kv, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    out = flydsl_flash_attn_func(q, k, v, causal=causal)
+    _check_gfx11(out, q, k, v, causal, 1.0 / math.sqrt(head_dim))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_softmax_scale():
+    q, k, v = _make_qkv(1, 1000, 4, 64, torch.bfloat16)
+    out = flydsl_flash_attn_func(q, k, v, softmax_scale=0.05)
+    _check_gfx11(out, q, k, v, False, 0.05)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_large_batch_offset():
+    """Batch offsets past 2**32 bytes: each slice gets a 64-bit base address."""
+    batch, seq, heads, dim = 600, 1024, 32, 128  # 4.8 GiB per tensor
+    if torch.cuda.mem_get_info()[0] < 24 * 2**30:
+        pytest.skip("needs ~24 GiB of free device memory")
+    q, k, v = _make_qkv(batch, seq, heads, dim, torch.bfloat16)
+    out = flydsl_flash_attn_func(q, k, v)
+    _check_gfx11(
+        out,
+        q,
+        k,
+        v,
+        False,
+        1.0 / math.sqrt(dim),
+        heads=[(batch - 1, heads - 1), (batch // 2, 0)],
+    )
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_rejects_head_dim():
+    q = torch.randn(1, 256, 4, 36, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="head_dim"):
+        flydsl_flash_attn_func(q, q.clone(), q.clone())
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_rejects_causal_cross():
+    q = torch.randn(1, 256, 4, 64, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(1, 128, 4, 64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="causal"):
+        flydsl_flash_attn_func(q, kv, kv.clone(), causal=True)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_rejects_dtype_mismatch():
+    q = torch.randn(1, 256, 4, 64, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(1, 256, 4, 64, dtype=torch.float16, device="cuda")
+    with pytest.raises(ValueError, match="dtype"):
+        flydsl_flash_attn_func(q, k, q.clone())
 
 
 # gfx950 fp8 (e4m3fn). The reference dequantizes the *same* fp8 tensors, so the
