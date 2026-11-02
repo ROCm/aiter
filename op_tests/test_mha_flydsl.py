@@ -314,6 +314,96 @@ def _call_batch(q, k, v, scale, causal, window, lse, sink):
 
 
 @benchmark()
+def test_mha_flydsl_descale(seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, dtype, causal):
+    """Per-tensor fp8 descales: q/k scale the logits, v scales O alone.
+
+    Besides the usual error against a reference, this checks two invariants that
+    pin the fold itself and do not depend on fp8 noise: descales of 1.0 must
+    reproduce the no-descale path bit for bit, and v_descale must scale O exactly.
+    """
+    device = "cuda"
+    cu_q, cu_k = [0], [0]
+    for sq, sk in zip(seqs_q, seqs_k):
+        cu_q.append(cu_q[-1] + sq)
+        cu_k.append(cu_k[-1] + sk)
+    total_q, total_k = cu_q[-1], cu_k[-1]
+    max_sq, max_sk = max(seqs_q), max(seqs_k)
+    q_dtype, kv_dtype = dtype
+    q = _randn_as((total_q, H_q, d_qk), q_dtype, device)
+    k = _randn_as((total_k, H_kv, d_qk), kv_dtype, device)
+    v = _randn_as((total_k, H_kv, d_v), kv_dtype, device)
+    cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device=device)
+    cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=device)
+    scale = 1.0 / math.sqrt(d_qk)
+
+    def _d(x):
+        return torch.full((1,), x, dtype=torch.float32, device=device)
+
+    qd, kd, vd = _d(0.37), _d(1.9), _d(0.6)
+
+    def _run(q_s, k_s, v_s, sc=scale):
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q_t,
+            cu_k_t,
+            max_sq,
+            max_sk,
+            softmax_scale=sc,
+            causal=causal,
+            q_descale=q_s,
+            k_descale=k_s,
+            v_descale=v_s,
+        )
+
+    # the kernel sees raw fp8 and applies the descales, so the reference pre-scales
+    ref = run_torch_varlen(
+        q.float() * qd,
+        k.float() * kd,
+        v.float() * vd,
+        cu_q,
+        cu_k,
+        scale,
+        causal,
+        False,
+        None,
+        (-1, -1),
+    )
+
+    ret = {"gfx": get_gfx()}
+    out, us = run_perftest(lambda: _run(qd, kd, vd))
+    flops = _flops(list(zip(seqs_q, seqs_k)), H_q, d_qk, d_v, causal)
+    nbytes = _nbytes(total_q, total_k, H_q, H_kv, d_qk, d_v, q.element_size(), 2, False)
+    ret["flydsl us"] = us
+    ret["flydsl TFLOPS"] = flops / us / 1e6
+    ret["flydsl TB/s"] = nbytes / us / 1e6
+    ret["flydsl err"] = checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="flydsl: fp8 descale",
+    )
+
+    # descale 1.0 == no descale, bit for bit
+    one = _d(1.0)
+    base = flash_attn_varlen_func(
+        q, k, v, cu_q_t, cu_k_t, max_sq, max_sk, softmax_scale=scale, causal=causal
+    )
+    ret["identity"] = bool(torch.equal(base, _run(one, one, one)))
+    # O scales exactly with v_descale: x4 shifts the bf16 exponent and leaves the
+    # mantissa alone, so round(4x) == 4*round(x) and this is bitwise, not approximate.
+    # (A magnitude threshold is wrong here -- non-causal O is ~30x smaller.)
+    scaled = _run(one, one, _d(4.0))
+    ret["v_scale_ok"] = bool(torch.equal(scaled, (base.float() * 4.0).to(base.dtype)))
+    ret["qk_fold_ok"] = bool(
+        torch.equal(base, _run(_d(2.0), _d(2.0), one, sc=scale / 4))
+    )
+    return ret
+
+
+@benchmark()
 def test_mha_flydsl_varlen(
     seqs_q,
     seqs_k,
@@ -903,6 +993,13 @@ def main():
         help="Layouts to sweep.\n        e.g.: -l thd",
     )
     parser.add_argument(
+        "--descale",
+        type=int,
+        default=1,
+        help="Also sweep per-tensor fp8 descales (8-bit dtypes only).\n"
+        "        e.g.: --descale 0",
+    )
+    parser.add_argument(
         "-k",
         "--kernels",
         type=str,
@@ -1046,24 +1143,14 @@ def main():
     d_qk_v = args.d_qk_v or SUPPORTED_D_QK_V
     case_rng = random.Random(args.seed)
 
-    def _cases(hdims, shapes, label):
-        """The sweep for one layout, randomly thinned to --max-cases.
+    def _sample(axes, label):
+        """One sweep's product, randomly thinned to --max-cases.
 
-        The axes multiply fast (hdim pairs x shapes x causal x lse x sink x window), so
-        sample the product rather than trim an axis: every combination stays reachable,
-        and a different --seed walks a different slice of it. The sample is drawn over
-        product INDICES -- materializing millions of tuples to keep a few hundred costs
-        hundreds of MB on a partial-axis run. ``_flydsl_serves`` depends only on the hdim
-        axis, so filtering it up front leaves the index space exact."""
-        axes = [
-            [h for h in hdims if _flydsl_serves(*h)],
-            shapes,
-            served_dtypes,
-            causals,
-            lses,
-            sinks,
-            windows,
-        ]
+        The axes multiply fast, so sample the product rather than trim an axis: every
+        combination stays reachable, and a different --seed walks a different slice of
+        it. The sample is drawn over product INDICES -- materializing millions of tuples
+        to keep a few hundred costs hundreds of MB on a partial-axis run. Every sweep
+        goes through here, so --max-cases bounds the run as a whole."""
         total = math.prod(len(a) for a in axes)
         if not args.max_cases or total <= args.max_cases:
             return list(itertools.product(*axes))
@@ -1083,6 +1170,22 @@ def main():
             picked.append(tuple(reversed(combo)))
         return picked
 
+    def _cases(hdims, shapes, label):
+        """One layout's sweep. ``_flydsl_serves`` depends only on the hdim axis, so
+        filtering it up front leaves the index space exact."""
+        return _sample(
+            [
+                [h for h in hdims if _flydsl_serves(*h)],
+                shapes,
+                served_dtypes,
+                causals,
+                lses,
+                sinks,
+                windows,
+            ],
+            label,
+        )
+
     requested_dtypes = list(
         itertools.product(args.dtype_q, args.dtype_kv or args.dtype_q)
     )
@@ -1094,6 +1197,28 @@ def main():
             )
     if not served_dtypes:
         raise SystemExit("no requested dtype pair is served by the backend")
+
+    # Descales are a8w8-only (a16w16 has none), so this sweep takes just the 8-bit
+    # pairs and runs regardless of layout -- the kernel path is the thd one.
+    _b8_dtypes = [d for d in served_dtypes if d[0] in _B8_TORCH or d[1] in _B8_TORCH]
+    if args.descale and _b8_dtypes:
+        rows = []
+        for (d_qk, d_v), shape, dtype, causal in _sample(
+            [
+                [h for h in d_qk_v if _flydsl_serves(*h)],
+                thd_shapes,
+                _b8_dtypes,
+                causals,
+            ],
+            "fp8 descale",
+        ):
+            seqs_q, seqs_k, H_q, H_kv = shape
+            rows.append(
+                test_mha_flydsl_descale(
+                    seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, dtype, causal
+                )
+            )
+        summarize("FlyDSL FMHA prefill fp8 descale summary", rows)
 
     if "thd" in args.layout:
         rows = []

@@ -2810,6 +2810,9 @@ def flash_attn_func(
     cu_seqlens_kv: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
     num_splits: int = 0,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -2869,6 +2872,13 @@ def flash_attn_func(
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
+    _descales = (q_descale, k_descale, v_descale)
+    _has_any_descale = any(d is not None for d in _descales)
+    if _has_any_descale and not all(d is not None for d in _descales):
+        raise ValueError(
+            "FP8 attention requires q_descale, k_descale, and v_descale together"
+        )
+
     if _FLYDSL_AVAILABLE and (
         cu_seqlens_q is None
         and cu_seqlens_kv is None
@@ -2891,9 +2901,21 @@ def flash_attn_func(
             deterministic=deterministic,
             return_attn_probs=return_attn_probs,
             sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         if _flydsl_result is not None:
             return _flydsl_result
+
+    # Neither fallback below consumes descales, so a request that got here with them
+    # would be served unscaled. Say so rather than return a wrong answer.
+    if _has_any_descale:
+        raise RuntimeError(
+            "batched prequantized FP8 attention is served only by the gfx1250 FlyDSL "
+            "kernel; this configuration fell through to a backend without descale "
+            "support"
+        )
 
     if not ENABLE_CK:
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
@@ -3804,10 +3826,6 @@ def flash_attn_varlen_func(
         raise ValueError(
             "FP8 attention requires q_descale, k_descale, and v_descale together"
         )
-    if has_all_descales and not ENABLE_CK:
-        raise RuntimeError(
-            "prequantized FP8 attention with descales requires ENABLE_CK=1"
-        )
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3887,7 +3905,6 @@ def flash_attn_varlen_func(
 
     if (
         _FLYDSL_AVAILABLE
-        and not has_all_descales
         and (len(window_size) < 3 or window_size[2] == 0)
         and cu_seqlens_q_padded is None
         and cu_seqlens_k_padded is None
@@ -3915,11 +3932,18 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         if _flydsl_result is not None:
             return _flydsl_result
 
     if not ENABLE_CK:
+        if has_all_descales:
+            raise RuntimeError(
+                "prequantized FP8 attention with descales requires ENABLE_CK=1"
+            )
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
         )
