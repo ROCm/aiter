@@ -44,6 +44,41 @@ def _umod(a, c):
     return fx.Int32(fx.Uint32(a) % fx.Uint32(c))
 
 
+# XCDs per die on gfx942 / gfx950 (MI300 / MI350 class); the stage-1 tile map below
+# round-robins over them.
+NUM_XCD = 8
+
+
+def gemm1_grid(BM, *, INTER, TILE_N, max_m_blocks):
+    """Flattened stage-1 grid: (m-blocks) x (INTER / TILE_N) n-blocks."""
+    return int(max_m_blocks) * (INTER // TILE_N)
+
+
+def xcd_tile_map(bound, total_m_blocks, num_n_blocks, swizzle):
+    """``pid -> tile`` over the ``bound`` valid tiles of a flattened (m-block,
+    n-block) stage-1 grid: a bijective round-robin over the XCDs to balance
+    per-XCD / HBM weight-load traffic, then an M-group swizzle of ``swizzle``
+    m-blocks for per-XCD L2 locality. The divisions of ``bound`` happen here, where
+    the caller builds the map, as they did inline."""
+    xq = _udiv(bound, NUM_XCD)
+    xr = _umod(bound, NUM_XCD)
+
+    def tile(pid):
+        xc = _umod(pid, NUM_XCD)
+        wgid = xc * xq + fx.min(xc, xr) + _udiv(pid, NUM_XCD)
+        ng = fx.Int32(swizzle * num_n_blocks)
+        group_id = wgid // ng
+        first_pid_m = group_id * fx.Int32(swizzle)
+        remaining_m = total_m_blocks - first_pid_m
+        group_size_m = fx.min(remaining_m, fx.Int32(swizzle))
+        wig = wgid % ng
+        m_block = first_pid_m + (wig % group_size_m)
+        n_block = wig // group_size_m
+        return m_block * fx.Int32(num_n_blocks) + n_block
+
+    return tile
+
+
 def _global_i32_at(addr_i64, idx):
     return global_typed_ptr(addr_i64, T.i32)[idx]
 
