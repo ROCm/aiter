@@ -478,6 +478,185 @@ def test_flydsl_attn_res_rejects_tensors_over_4gib():
         flydsl_attn_res(prefix, block_residual, inputs.score_weight, _EPS)
 
 
+_BLOCK_OUT_CFGS = tuple(
+    dataclasses.replace(cfg, close=False)
+    for cfg in (MIX, ALL_ON, EVERY_FEATURE, ALL_ON_FP8)
+)
+
+
+def _cap_inputs(tokens: int, hidden_size: int, num_blocks: int, slots: int):
+    inputs = _make_inputs(tokens, hidden_size, num_blocks)
+    cap = torch.randn(tokens, slots, hidden_size, dtype=torch.bfloat16)
+    inputs.block_residual = cap[:, :num_blocks]
+    return inputs, cap
+
+
+def _expected_closed(inputs, cfg: _Config):
+    return _call(attn_res_reference, inputs, dataclasses.replace(cfg, close=True))
+
+
+def _spy_block_alias(monkeypatch) -> list[bool]:
+    seen: list[bool] = []
+    launch = attn_res_kernel._launch
+
+    def spy(spec, *args, **kwargs):
+        seen.append(spec.block_alias)
+        return launch(spec, *args, **kwargs)
+
+    monkeypatch.setattr(attn_res_kernel, "_launch", spy)
+    return seen
+
+
+@_skip_unsupported_gfx
+@pytest.mark.parametrize("cfg", _BLOCK_OUT_CFGS, ids=str)
+@pytest.mark.parametrize("num_blocks", (0, 1, _MAX_BLOCKS - 1))
+@pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
+@pytest.mark.parametrize("wide", (False, True), ids=("narrow", "wide"))
+def test_flydsl_attn_res_block_out_aliased(
+    monkeypatch, wide: bool, hidden_size: int, num_blocks: int, cfg: _Config
+):
+    tokens = _num_cus() + 1 if wide else 17
+    inputs, cap = _cap_inputs(tokens, hidden_size, num_blocks, _MAX_BLOCKS + 1)
+    cap_before = cap.clone()
+    expected = _expected_closed(inputs, cfg)
+    seen = _spy_block_alias(monkeypatch)
+
+    out = _call(flydsl_attn_res, inputs, cfg, block_out=cap[:, : num_blocks + 1])
+    torch.cuda.synchronize()
+
+    assert seen == [num_blocks > 0]
+    assert len(out) == 3
+    assert out[2].data_ptr() == cap.data_ptr()
+    assert out[2].shape == (tokens, num_blocks + 1, hidden_size)
+    _assert_y_close(out[0], expected[0], cfg, f"aliased {cfg}")
+    assert torch.equal(out[1], expected[1])
+    assert torch.equal(cap[:, : num_blocks + 1], expected[2])
+    assert torch.equal(cap[:, :num_blocks], cap_before[:, :num_blocks])
+    assert torch.equal(cap[:, num_blocks + 1 :], cap_before[:, num_blocks + 1 :])
+
+
+@_skip_unsupported_gfx
+@pytest.mark.parametrize("cfg", _BLOCK_OUT_CFGS, ids=str)
+@pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
+@pytest.mark.parametrize("wide", (False, True), ids=("narrow", "wide"))
+def test_flydsl_attn_res_block_out_separate_buffer(
+    monkeypatch, wide: bool, hidden_size: int, cfg: _Config
+):
+    tokens = _num_cus() + 1 if wide else 17
+    num_blocks = _MAX_BLOCKS - 1
+    inputs = _make_inputs(tokens, hidden_size, num_blocks)
+    closed = dataclasses.replace(cfg, close=True)
+    expected = _call(attn_res_reference, inputs, closed)
+    closed_out = _call(flydsl_attn_res, inputs, closed)
+    seen = _spy_block_alias(monkeypatch)
+
+    cap = torch.randn(tokens, _MAX_BLOCKS + 1, hidden_size, dtype=torch.bfloat16)
+    cap_before = cap.clone()
+    out = _call(flydsl_attn_res, inputs, cfg, block_out=cap[:, : num_blocks + 1])
+    torch.cuda.synchronize()
+
+    assert seen == [False]
+    assert torch.equal(out[2], closed_out[2])
+    assert torch.equal(cap[:, : num_blocks + 1], expected[2])
+    assert torch.equal(cap[:, num_blocks + 1 :], cap_before[:, num_blocks + 1 :])
+    _assert_y_close(out[0], closed_out[0], cfg, f"separate {cfg}")
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_block_out_accepts_interleaved_views():
+    """Slots of one buffer that share no memory pass even though their extents overlap."""
+    num_blocks = 3
+    inputs = _make_inputs(17, _D, num_blocks)
+    cap = torch.randn(17, 2 * (num_blocks + 1), _D, dtype=torch.bfloat16)
+    inputs.block_residual = cap[:, 1::2][:, :num_blocks]
+    expected = _expected_closed(inputs, ALL_ON)
+
+    out = _call(flydsl_attn_res, inputs, ALL_ON, block_out=cap[:, 0::2])
+    torch.cuda.synchronize()
+
+    assert torch.equal(cap[:, 0::2], expected[2])
+    _assert_bf16_close(out[0], expected[0], "interleaved views")
+
+
+@_skip_unsupported_gfx
+def test_flydsl_attn_res_block_out_empty():
+    inputs, cap = _cap_inputs(0, _D, 2, 4)
+    out = _call(flydsl_attn_res, inputs, ALL_ON, block_out=cap[:, :3])
+    assert out[2].shape == (0, 3, _D)
+
+
+def _block_out_overlap_call(case: str):
+    num_blocks = 3
+    inputs, cap = _cap_inputs(4, _D, num_blocks, 6)
+    block_out = cap[:, : num_blocks + 1]
+    if case == "shifted_view_of_block_residual":
+        block_out = cap[:, 1 : num_blocks + 2]
+    elif case == "row_b_inside_block_residual":
+        inputs.block_residual = cap[:, 1 : num_blocks + 1]
+    elif case == "row_b_is_prefix":
+        inputs.prefix = cap[:, num_blocks]
+    elif case == "add_hidden_inside_block_out":
+        inputs.block_residual = torch.randn(4, num_blocks, _D, dtype=torch.bfloat16)
+        inputs.add_hidden = cap[:, 2]
+    elif case == "prefix_rows_inside_block_out_other_stride":
+        inputs.block_residual = torch.randn(4, num_blocks, _D, dtype=torch.bfloat16)
+        inputs.prefix = cap.reshape(-1, _D)[:4]
+    elif case == "block_out_rows_overlap":
+        base = torch.randn((4 + num_blocks) * _D, dtype=torch.bfloat16)
+        block_out = base.as_strided((4, num_blocks + 1, _D), (_D, _D, 1))
+        inputs.block_residual = torch.randn(4, num_blocks, _D, dtype=torch.bfloat16)
+    return lambda: _call(flydsl_attn_res, inputs, ALL_ON, block_out=block_out)
+
+
+@_skip_unsupported_gfx
+@pytest.mark.parametrize(
+    "case",
+    (
+        "shifted_view_of_block_residual",
+        "row_b_inside_block_residual",
+        "row_b_is_prefix",
+        "add_hidden_inside_block_out",
+        "prefix_rows_inside_block_out_other_stride",
+        "block_out_rows_overlap",
+    ),
+)
+def test_flydsl_attn_res_block_out_rejects_overlap(case: str):
+    with pytest.raises(ValueError, match="overlap"):
+        _block_out_overlap_call(case)()
+
+
+@_skip_unsupported_gfx
+@pytest.mark.parametrize(
+    ("case", "error"),
+    (
+        ("wrong_rows", ValueError),
+        ("wrong_hidden_size", ValueError),
+        ("fp16", TypeError),
+        ("wrong_device", ValueError),
+        ("not_flat_viewable", ValueError),
+    ),
+)
+def test_flydsl_attn_res_block_out_rejects_invalid(case: str, error):
+    num_blocks = 3
+    inputs = _make_inputs(4, _D, num_blocks)
+    shape = (4, num_blocks + 1, _D)
+    block_out = torch.empty(shape, dtype=torch.bfloat16)
+    if case == "wrong_rows":
+        block_out = torch.empty(4, num_blocks, _D, dtype=torch.bfloat16)
+    elif case == "wrong_hidden_size":
+        block_out = torch.empty(4, num_blocks + 1, _D + 8, dtype=torch.bfloat16)
+    elif case == "fp16":
+        block_out = block_out.half()
+    elif case == "wrong_device":
+        block_out = block_out.cpu()
+    elif case == "not_flat_viewable":
+        inputs = _make_inputs(6, _D, num_blocks, leading=(2,))
+        swapped = torch.empty(6, 2, num_blocks + 1, _D, dtype=torch.bfloat16)
+        block_out = swapped.transpose(0, 1)
+    with pytest.raises(error):
+        _call(flydsl_attn_res, inputs, ALL_ON, block_out=block_out)
+
+
 def _moved_bytes(tokens: int, hidden_size: int, num_blocks: int, cfg: _Config):
     """HBM bytes moved, excluding the [D] weight vectors."""
     reads = num_blocks + 1 + int(cfg.add) + int(cfg.add2)

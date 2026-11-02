@@ -276,13 +276,15 @@ class _AttnResSpec:
     rows_per_wg: int
     wide_grid: bool
     fp8_dtype: torch.dtype | None = None
+    block_alias: bool = False
 
     @property
     def kernel_name(self) -> str:
         return (
             f"{KERNEL_NAME}_d{self.hidden_size}_b{self.num_blocks}"
             f"_r{self.rows_per_wg}_add{int(self.has_add) + int(self.has_add2)}"
-            f"_close{int(self.close_block)}_onorm{int(self.output_norm)}"
+            f"_close{int(self.close_block)}{'a' if self.block_alias else ''}"
+            f"_onorm{int(self.output_norm)}"
             f"{'_fp8' if self.fp8_dtype is not None else ''}"
             f"{'_wide' if self.wide_grid else ''}"
         )
@@ -296,6 +298,7 @@ def _build_attn_res(spec: _AttnResSpec):
     has_add = spec.has_add
     has_add2 = spec.has_add2
     close_block = spec.close_block
+    block_alias = spec.block_alias
     output_norm = spec.output_norm
     eps = spec.eps
     output_rms_eps = spec.output_rms_eps
@@ -577,7 +580,7 @@ def _build_attn_res(spec: _AttnResSpec):
 
             def take_block_source(block):
                 source_local = load_issued_source(in_flight.pop(0))
-                if const_expr(close_block):
+                if const_expr(close_block and not block_alias):
                     block_out_div = row_of(block_out_buf, token, block)
                     for tile in range_constexpr(tiles_per_thread):
                         store_bf16_vec(source_local[tile], block_out_div, tile)
@@ -859,6 +862,108 @@ def _check_row_layout(tensor: torch.Tensor, name: str) -> None:
             )
 
 
+def _geometry(tensor: torch.Tensor) -> tuple:
+    return tensor.data_ptr(), tuple(tensor.shape), tensor.stride()
+
+
+def _byte_extent(geometry: tuple) -> tuple[int, int]:
+    ptr, shape, strides = geometry
+    last = sum((size - 1) * stride for size, stride in zip(shape, strides))
+    return ptr, ptr + (last + 1) * 2
+
+
+def _row_starts(geometry: tuple) -> torch.Tensor:
+    """Element address of every row's first element, as a flat CPU int64 tensor."""
+    ptr, shape, strides = geometry
+    starts = torch.full((1,), ptr // 2, device="cpu")
+    for size, stride in zip(shape[:-1], strides[:-1]):
+        steps = torch.arange(size, device="cpu") * stride
+        starts = (starts[:, None] + steps).reshape(-1)
+    return starts
+
+
+def _rows_overlap(a: tuple, b: tuple) -> bool:
+    """Whether any row of ``a`` shares an element with a row of ``b`` (BF16 geometry).
+
+    Rows are contiguous and ``D`` long, so two rows overlap iff their starts are
+    closer than ``D``. Strided views that interleave without sharing memory pass.
+    """
+    if 0 in a[1] or 0 in b[1]:
+        return False
+    (a_lo, a_hi), (b_lo, b_hi) = _byte_extent(a), _byte_extent(b)
+    if a_hi <= b_lo or b_hi <= a_lo:
+        return False
+    token_stride = a[2][0]
+    if (
+        len(a[1]) > 1
+        and len(b[1]) > 1
+        and a[1][0] == b[1][0]
+        and token_stride == b[2][0]
+    ):
+        # Same token layout: when each token's rows fit one token stride, rows of
+        # different tokens never meet and one token decides.
+        a_one, b_one = (a[0], a[1][1:], a[2][1:]), (b[0], b[1][1:], b[2][1:])
+        (a_lo, a_hi), (b_lo, b_hi) = _byte_extent(a_one), _byte_extent(b_one)
+        if max(a_hi, b_hi) - min(a_lo, b_lo) <= token_stride * 2:
+            return _rows_overlap(a_one, b_one)
+    row = a[1][-1]
+    a_starts, b_starts = _row_starts(a), _row_starts(b).sort().values
+    right = torch.searchsorted(b_starts, a_starts).clamp_max(b_starts.numel() - 1)
+    left = (right - 1).clamp_min(0)
+    near = (b_starts[right] - a_starts).abs() < row
+    return bool((near | ((b_starts[left] - a_starts).abs() < row)).any())
+
+
+def _same_rows(a: tuple, b: tuple) -> bool:
+    """Same shape, data pointer, and strides; the strides of size-1 dims never matter."""
+    return (
+        a[1] == b[1]
+        and a[0] == b[0]
+        and all(sa == sb for size, sa, sb in zip(a[1], a[2], b[2]) if size > 1)
+    )
+
+
+def _rows_self_disjoint(geometry: tuple) -> bool:
+    """Sufficient, not necessary: some non-overlapping layouts return False."""
+    _, shape, strides = geometry
+    span = 1
+    for stride, size in sorted((st, sz) for sz, st in zip(shape, strides) if sz > 1):
+        if stride < span:
+            return False
+        span = stride * (size - 1) + span
+    return True
+
+
+@lru_cache(maxsize=512)
+def _block_out_aliases(out: tuple, blocks: tuple, inputs: tuple) -> bool:
+    """Return whether ``out[:, :B]`` is ``blocks``; raise if ``out`` overlaps an input.
+
+    Overlap is a pure function of the geometries, so the result is cached: the
+    row-level test costs more than a small-token launch.
+    """
+    num_tokens, rows, hidden_size = out[1]
+    num_blocks = rows - 1
+    if not _rows_self_disjoint(out):
+        raise ValueError(f"block_out rows overlap each other, got strides {out[2]}")
+    alias = num_blocks > 0 and _same_rows(
+        (out[0], (num_tokens, num_blocks, hidden_size), out[2]), blocks
+    )
+    written = out
+    if alias:
+        written = (
+            out[0] + num_blocks * out[2][1] * 2,
+            (num_tokens, 1, hidden_size),
+            out[2],
+        )
+    for name, geometry in inputs:
+        if _rows_overlap(written, geometry):
+            raise ValueError(
+                f"block_out overlaps {name}; only block_out[..., :B, :] may be "
+                "block_residual itself"
+            )
+    return alias
+
+
 def flydsl_attn_res(
     prefix: torch.Tensor,
     block_residual: torch.Tensor,
@@ -874,6 +979,7 @@ def flydsl_attn_res(
     out_quant_dtype: torch.dtype | None = None,
     rows_per_wg: int | None = None,
     stream: torch.cuda.Stream | None = None,
+    block_out: torch.Tensor | None = None,
 ):
     """Drop-in for Triton ``attn_res_gate`` on BF16 inputs over ``B + 1`` candidates.
 
@@ -886,10 +992,18 @@ def flydsl_attn_res(
     applies an output RMSNorm with ``output_rms_eps``.
 
     Returns ``(y, prefix_out)``, or ``(y, prefix_out, block_out)`` with
-    ``close_block``. ``prefix_out`` is a new BF16 tensor holding the rounded sum
-    when ``add_hidden`` is given, otherwise ``prefix`` itself. ``block_out`` is
+    ``close_block`` or a caller-owned ``block_out``. ``prefix_out`` is a new BF16
+    tensor holding the rounded sum when ``add_hidden`` is given, otherwise
+    ``prefix`` itself. ``block_out`` is
     ``cat([block_residual, prefix_out[..., None, :]], -2)``. Inputs are never
     mutated.
+
+    ``block_out`` is an optional BF16 ``[.., B + 1, D]`` buffer that receives
+    ``cat([block_residual, prefix_out[..., None, :]], -2)`` and implies
+    ``close_block``. When ``block_out[..., :B, :]`` is ``block_residual`` itself
+    (same shape, data pointer, and strides) the ``B`` copies are skipped and only
+    row ``B`` is written. Any other overlap between ``block_out`` and an input
+    raises ``ValueError``.
 
     Every input must be a BF16 CUDA tensor on ``prefix.device`` with unit
     trailing stride, positive leading strides that are multiples of
@@ -951,6 +1065,21 @@ def flydsl_attn_res(
                 raise ValueError(f"{name} must have {rows.shape[0]} rows")
 
     tensors = {"prefix": rows, "block_residual": blocks, **weights, **adds}
+    block_out_rows = None
+    if block_out is not None:
+        expected_shape = (*prefix.shape[:-1], num_blocks + 1, hidden_size)
+        if block_out.shape != expected_shape:
+            raise ValueError(
+                f"block_out must have shape {expected_shape}, "
+                f"got {tuple(block_out.shape)}"
+            )
+        block_out_rows = block_out.reshape(rows.shape[0], num_blocks + 1, hidden_size)
+        if block_out.numel() and block_out_rows.data_ptr() != block_out.data_ptr():
+            raise ValueError(
+                "block_out leading dims must be viewable as flat rows, got "
+                f"strides {block_out.stride()}"
+            )
+        tensors["block_out"] = block_out_rows
     if any(t.dtype != torch.bfloat16 for t in tensors.values()):
         raise TypeError("only BF16 inputs are supported")
     if any(t.device != prefix.device for t in tensors.values()):
@@ -970,6 +1099,15 @@ def flydsl_attn_res(
         if tensor.numel():
             _check_row_layout(tensor, name)
 
+    block_alias = False
+    if block_out is not None:
+        tensors.pop("block_out")
+        block_alias = _block_out_aliases(
+            _geometry(block_out_rows),
+            _geometry(blocks),
+            tuple((name, _geometry(tensor)) for name, tensor in tensors.items()),
+        )
+
     num_tokens = rows.shape[0]
     y = torch.empty(
         rows.shape, device=prefix.device, dtype=out_quant_dtype or prefix.dtype
@@ -984,17 +1122,15 @@ def flydsl_attn_res(
         if add_hidden is not None
         else rows
     )
-    block_out = (
-        torch.empty(
-            (num_tokens, num_blocks + 1, hidden_size),
+    if block_out is None and close_block:
+        block_out = torch.empty(
+            (*prefix.shape[:-1], num_blocks + 1, hidden_size),
             device=prefix.device,
             dtype=prefix.dtype,
         )
-        if close_block
-        else None
-    )
-    if block_out is not None:
-        _check_row_layout(block_out, "block_out")
+        block_out_rows = block_out.view(num_tokens, num_blocks + 1, hidden_size)
+        _check_row_layout(block_out_rows, "block_out")
+    close_block = block_out is not None
 
     if num_tokens:
         wide_grid = (
@@ -1017,8 +1153,9 @@ def flydsl_attn_res(
             rows_per_wg=rows_per_wg,
             wide_grid=wide_grid,
             fp8_dtype=out_quant_dtype,
+            block_alias=block_alias,
         )
-        _launch(spec, tensors, y, y_scale, prefix_out, block_out, stream)
+        _launch(spec, tensors, y, y_scale, prefix_out, block_out_rows, stream)
 
     leading = prefix.shape[:-1]
     y_result = y.view(prefix.shape)
@@ -1027,11 +1164,7 @@ def flydsl_attn_res(
     prefix_result = prefix if add_hidden is None else prefix_out.view(prefix.shape)
     if not close_block:
         return y_result, prefix_result
-    return (
-        y_result,
-        prefix_result,
-        block_out.view(*leading, num_blocks + 1, hidden_size),
-    )
+    return y_result, prefix_result, block_out
 
 
 def _launch(spec, tensors, y, y_scale, prefix_out, block_out, stream) -> None:
