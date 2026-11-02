@@ -1793,16 +1793,24 @@ def test_mha_v4_mxfp4_hd256_gqa_matches_repeated_kv():
 )
 def test_mha_v4_rejects_non_mx_head_dim_256(qk_format):
     q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
-    with expect_raises(ValueError, match="MXFP4- or all-MXFP6-only"):
+    with expect_raises(ValueError, match="all-MXFP4 or all-MXFP6 only"):
         mha_v4(q, q, q, qk_format, qk_format, qk_format)
 
 
 def test_mha_v4_rejects_mixed_mxfp6_head_dim_256():
     q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
-    with expect_raises(ValueError, match="MXFP4- or all-MXFP6-only"):
+    with expect_raises(ValueError, match="all-MXFP4 or all-MXFP6 only"):
         mha_v4(
             q, q, q, AttentionFormat.MXFP6, AttentionFormat.MXFP6, AttentionFormat.MXFP4
         )
+
+
+@parametrize("qkv_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
+def test_mha_v4_rejects_sparse_head_dim_256(qkv_format):
+    q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
+    block_mask = torch.ones((1, 1, 1, 2), device="meta", dtype=torch.bool)
+    with expect_raises(ValueError, match="head dimension 256 is dense-only"):
+        mha_v4(q, q, q, qkv_format, qkv_format, qkv_format, block_mask=block_mask)
 
 
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 I8FP8 validation")
