@@ -285,3 +285,223 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, b
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+def test_gluon_layout_cache_key_and_eviction(monkeypatch):
+    """The private cache keeps no tensors and separates every layout input."""
+    import importlib
+
+    mod = importlib.import_module("aiter.ops.triton.gemm.basic.gemm_a16w16")
+    impl = importlib.import_module(
+        "aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16"
+    )
+    cache = mod._get_gluon_layouts
+    calls = {"wmma": 0, "shared": 0}
+
+    def wmma(warps):
+        calls["wmma"] += 1
+        return (("wmma", warps), ("a", warps), ("b", warps))
+
+    def shared(bm, bn, bk, layout, bits):
+        calls["shared"] += 1
+        return (("sa", bm, bn, bk, layout, bits), ("sb", bm, bn, bk, layout, bits))
+
+    monkeypatch.setattr(impl, "create_wmma_layouts", wmma)
+    monkeypatch.setattr(impl, "create_shared_layouts", shared)
+    cache.cache_clear()
+    try:
+        base = (128, 128, 64, "TN", 16, 4)
+        variants = [
+            base,
+            (64, 128, 64, "TN", 16, 4),
+            (128, 64, 64, "TN", 16, 4),
+            (128, 128, 128, "TN", 16, 4),
+            (128, 128, 64, "NN", 16, 4),
+            (128, 128, 64, "TN", 8, 4),
+            (128, 128, 64, "TN", 16, 8),
+        ]
+        for args in variants:
+            first = cache(*args)
+            assert cache(*args) is first
+            assert len(first) == 5
+        assert calls == {"wmma": len(variants), "shared": len(variants)}
+        assert cache.cache_info().maxsize == 128
+        for i in range(129):
+            cache(i + 1, 128, 64, "TN", 16, 4)
+        assert cache.cache_info().currsize == 128
+        misses = cache.cache_info().misses
+        cache(1, 128, 64, "TN", 16, 4)
+        assert cache.cache_info().misses == misses + 1
+    finally:
+        cache.cache_clear()
+
+
+@pytest.mark.parametrize("layout", ["TN", "NN", "TT", "NT"])
+def test_gluon_cached_layout_values(layout):
+    import importlib
+
+    mod = importlib.import_module("aiter.ops.triton.gemm.basic.gemm_a16w16")
+    impl = importlib.import_module(
+        "aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16"
+    )
+    cache = mod._get_gluon_layouts
+    cache.cache_clear()
+    try:
+        for bits, warps in ((8, 4), (16, 4), (16, 8)):
+            expected = (
+                *impl.create_wmma_layouts(warps),
+                *impl.create_shared_layouts(128, 128, 64, layout, bits),
+            )
+            got = cache(128, 128, 64, layout, bits, warps)
+            assert got == expected
+            assert cache(128, 128, 64, layout, bits, warps) is got
+    finally:
+        cache.cache_clear()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN", "NN", "TT", "NT"])
+def test_gluon_layout_cache_replay(dtype, layout, monkeypatch):
+    import dataclasses
+    import gc
+    import importlib
+    import weakref
+
+    if not torch.cuda.is_available() or not is_gluon_supported():
+        pytest.skip("requires gfx1250")
+    mod = importlib.import_module("aiter.ops.triton.gemm.basic.gemm_a16w16")
+    cache = mod._get_gluon_layouts
+    cache.cache_clear()
+    try:
+        # Both kernel variants and output-buffer modes. Smaller irregular M
+        # avoids spending GPU memory on an unrelated large-matrix test.
+        for kernel_type, rows in (("bandwidth_bound", 37), ("compute_bound", 129)):
+            x, w, _, _, _ = generate_gemm_a16w16_inputs(
+                rows, 128, 512, dtype=dtype, layout=layout, output=False
+            )
+            x *= 0.1
+            w *= 0.1
+            bias = torch.randn(128, dtype=dtype, device="cuda") * 0.1
+            with monkeypatch.context() as patch:
+                patch.setattr(mod, "_get_gluon_layouts", cache.__wrapped__)
+                expected = gemm_a16w16(
+                    x, w, bias, dtype=dtype, backend="gluon", kernel_type=kernel_type
+                )
+            y = torch.empty_like(expected)
+            actual = gemm_a16w16(
+                x, w, bias, dtype=dtype, y=y, backend="gluon", kernel_type=kernel_type
+            )
+            assert actual.data_ptr() == y.data_ptr()
+            assert torch.equal(actual, expected)
+            torch.testing.assert_close(
+                actual.float(),
+                x.float() @ w.float().T + bias.float(),
+                atol=3e-2,
+                rtol=3e-2,
+            )
+            # Dataclasses are frozen but contain nested lists. Verify
+            # compiler/launch consumers do not mutate the shared metadata.
+            tracked = []
+            original_get = mod._get_gluon_layouts
+
+            def observe(*args, original_get=original_get, tracked=tracked):
+                layouts = original_get(*args)
+                tracked.append(layouts)
+                return layouts
+
+            with monkeypatch.context() as patch:
+                patch.setattr(mod, "_get_gluon_layouts", observe)
+                gemm_a16w16(
+                    x,
+                    w,
+                    bias,
+                    dtype=dtype,
+                    y=y,
+                    backend="gluon",
+                    kernel_type=kernel_type,
+                )
+            layouts = tracked[-1]
+            snapshot = [dataclasses.asdict(v) for v in layouts]
+            hashes = [hash(v) for v in layouts]
+            before = cache.cache_info()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                gemm_a16w16(
+                    x,
+                    w,
+                    bias,
+                    dtype=dtype,
+                    y=y,
+                    backend="gluon",
+                    kernel_type=kernel_type,
+                )
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(y, expected)
+            assert cache.cache_info().hits > before.hits
+            # Reused metadata must not capture previous tensor values/pointers.
+            x.neg_()
+            changed = gemm_a16w16(
+                x, w, bias, dtype=dtype, backend="gluon", kernel_type=kernel_type
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(y, changed)
+            assert [dataclasses.asdict(v) for v in layouts] == snapshot
+            assert [hash(v) for v in layouts] == hashes
+            # Only scalar configuration/layout metadata is cached.
+            refs = [weakref.ref(v) for v in (x, w, bias, y)]
+            del graph, actual, expected, changed, x, w, bias, y
+            gc.collect()
+            assert all(ref() is None for ref in refs)
+    finally:
+        cache.cache_clear()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gluon_layout_cache_compile(dtype):
+    import importlib
+
+    if not torch.cuda.is_available() or not is_gluon_supported():
+        pytest.skip("requires gfx1250")
+    mod = importlib.import_module("aiter.ops.triton.gemm.basic.gemm_a16w16")
+    mod._get_gluon_layouts.cache_clear()
+    torch._dynamo.reset()
+
+    def call(x, w):
+        return gemm_a16w16(x, w, dtype=dtype, backend="gluon")
+
+    compiled = torch.compile(call, fullgraph=True, dynamic=True)
+    try:
+        for rows in (12, 257):
+            torch.manual_seed(73)
+            x = torch.randn(rows, 6144, device="cuda", dtype=dtype) * 0.1
+            w = torch.randn(128, 6144, device="cuda", dtype=dtype) * 0.1
+            expected = call(x, w)
+            assert torch.equal(compiled(x, w), expected)
+    finally:
+        mod._get_gluon_layouts.cache_clear()
+
+
+def test_gluon_layout_cache_concurrent():
+    import importlib
+    from concurrent.futures import ThreadPoolExecutor
+
+    mod = importlib.import_module("aiter.ops.triton.gemm.basic.gemm_a16w16")
+    cache = mod._get_gluon_layouts
+    cache.cache_clear()
+    try:
+        keys = [
+            (128, 128, 64, layout, 16, warps)
+            for layout in ("TN", "NN", "TT", "NT")
+            for warps in (4, 8)
+        ]
+        expected = {key: cache.__wrapped__(*key) for key in keys}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda key: cache(*key), keys * 8))
+        for key, value in zip(keys * 8, results):
+            assert value == expected[key]
+            assert tuple(map(hash, value)) == tuple(map(hash, expected[key]))
+        assert cache.cache_info().currsize == len(keys)
+    finally:
+        cache.cache_clear()
