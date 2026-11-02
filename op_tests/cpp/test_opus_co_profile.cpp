@@ -49,6 +49,19 @@ int main(int argc, char** argv) {
     const auto c0 = select_image(base.string(), "gfx1250", 2, symbol);
     assert(c0.path == b0.path && c0.processor == 0x49);
 
+    // A0 stacks may report the strict ISA id. Both runtime IDs must select the
+    // same logical OPUS BF16 GEMM CO set (and the same ASIC-Revision profile).
+    assert(canonical_arch("gfx1250") == "gfx1250");
+    assert(canonical_arch("gfx1250-strict") == "gfx1250");
+    assert(canonical_arch("GFX1250-STRICT") == "gfx1250");
+    assert(canonical_arch("gfx1250-strict:sramecc+") == "gfx1250");
+    assert(canonical_arch(" gfx1250-strict ") == "gfx1250");
+    assert(canonical_arch("gfx950") == "gfx950");
+    const auto a0_strict = select_image(base.string(), "gfx1250-strict", 0, symbol);
+    const auto b0_strict = select_image(base.string(), "gfx1250-strict:sramecc+", 1, symbol);
+    assert(a0_strict.path == a0.path && a0_strict.processor == 0xeb);
+    assert(b0_strict.path == b0.path && b0_strict.processor == 0x49);
+
     // Direct-profile overrides never append a0 twice.
     assert(select_image((base / "gfx1250-a0").string(), "gfx1250", 0, symbol).path == a0.path);
     const auto flat = select_image((work / "flat-a0").string(), "gfx1250", 0, symbol);
@@ -70,8 +83,15 @@ int main(int argc, char** argv) {
     assert(fallback->path == (base / "gfx1250" / (symbol + ".co")).string());
     assert(fallback->processor == 0x49);
     assert(!select_regular_fallback(base.string(), "gfx950", symbol).has_value());
+    // The old-runtime fallback must also work when the device id is strict.
+    const auto strict_fallback =
+        select_regular_fallback(base.string(), "gfx1250-strict:sramecc+", symbol);
+    assert(strict_fallback.has_value() && strict_fallback->path == fallback->path);
     const auto leaf = select_regular_fallback((base / "gfx1250-a0").string(), "gfx1250", symbol);
     assert(leaf.has_value() && leaf->path == fallback->path);
+    const auto strict_leaf =
+        select_regular_fallback((base / "gfx1250-a0").string(), "gfx1250-strict", symbol);
+    assert(strict_leaf.has_value() && strict_leaf->path == fallback->path);
     assert(!select_regular_fallback((work / "flat-a0").string(), "gfx1250", symbol).has_value());
 
     // HIP visibility can reorder device IDs. Stepping is supplied per device,

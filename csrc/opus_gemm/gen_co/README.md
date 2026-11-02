@@ -264,6 +264,30 @@ schedule is not the A0-tuned one, so upgrade to ROCm 10.1.0 release (HIP
 first choice and no fallback occurs. A missing file or a wrong ELF profile is
 still a hard error and never silently selects another profile.
 
+### `gfx1250-strict` runtime id at the OPUS CO call
+
+During the strict-ISA reporting transition the same A0 device can be named
+`gfx1250` (`rocm_agent_enumerator`, used by current HIP builds and aiter CI) or
+`gfx1250-strict` (`rocminfo`/HIP device properties on stacks with native strict
+reporting). Arch probes keep reporting the real id; only the CO call itself
+ignores the distinction, because the CO images are the same logical `gfx1250`
+set:
+
+- the CO loader (`select_image`, `select_regular_fallback`) accepts both ids,
+  selects the profile from the ASIC Revision, and still falls back to the
+  regular image on old runtimes;
+- OPUS A16W16 launch planning resolves **CO kids only** through the base
+  `gfx1250` family when the real id is `gfx1250-strict`; non-CO kids and all
+  other OPUS kernels keep the real id.
+
+Nothing outside the CO call changes: arch detection, shared JIT probes,
+`GPU_ARCHS`/build targets, registry keys, tuned-CSV lookup and the JIT codegen
+path keep their existing behaviour. For JIT builds during the transition, keep
+setting `GPU_ARCHS=gfx1250`. One CO set serves both runtime ids; do not create
+per-runtime-id CO directories, and keep
+`build_co.py --offload-arch=gfx1250-strict` as the way A0-tuned images are
+produced.
+
 ```sh
 # Default automatic selection; do not set a stepping-specific root.
 python3 -m pytest -q op_tests/test_opus_co_integration.py
