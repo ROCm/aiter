@@ -154,6 +154,14 @@ SLOPE_BIAS_CAP = 1e-2
 # partial sum to bf16 (half an ulp, 2^-9), which comes to about 0.6% at topk=16.
 # A 3% scale error is 3%.
 STAGE2_REL_L2_CAP = 1e-2
+# Largest relative L2 error of any one stage-2 output row. A correct kernel's
+# worst row stays near its global error; one wrong row is diluted in the global
+# figure as the token count grows, but not in its own.
+STAGE2_ROW_REL_L2_CAP = 3e-2
+# Error, as a fraction of its 32-value block's largest magnitude, a dequantized
+# value may have whatever the code grid: near zero the grid is finer than the
+# difference between the kernel's and torch's fp32 accumulation.
+DEQUANT_BLOCK_FLOOR = 2.0**-12
 
 
 _TUNE_EXCLUDE_KERNEL_PATTERNS = [
@@ -563,11 +571,12 @@ def _mxfp8_quant(x, scale_fn):
 
 @compares_whole_output
 def dequantized_output_compare(ref, res, msg="", printLog=True):
-    """compare_fn for a split-K fused stage-1 output, given the whole tuples:
+    """compare_fn for a fused stage-1 output, given the whole tuples:
     res = (codes, sorted e8m0 scales), ref = (fp32 stage-1 result, positions from
-    _route_scale_positions). Each dequantized value must be within one step of
-    the reference on the kernel's grid, and the slope within SLOPE_BIAS_CAP of 1.
-    Returns the fraction more than one step away, or 1.0 on failure."""
+    _route_scale_positions). Every dequantized value must be within one step of
+    the reference on the kernel's grid, or within DEQUANT_BLOCK_FLOOR of its
+    block's largest magnitude, and the slope within SLOPE_BIAS_CAP of 1.
+    Returns 0.0, or 1.0 on failure."""
     from aiter import logger
 
     ref1, positions = ref
@@ -593,36 +602,47 @@ def dequantized_output_compare(ref, res, msg="", printLog=True):
     # code the largest exponent's, so a scale too small to hold x still fails.
     exponent = torch.floor(torch.log2(x.abs() / scale)).clamp(min_exp, max_exp)
     step = torch.exp2(exponent - mbits) * scale
-    beyond = ~((dequant - x).abs() <= step)
+    floor = x.abs().amax(-1, keepdim=True) * DEQUANT_BLOCK_FLOOR
+    beyond = ~((dequant - x).abs() <= torch.maximum(step, floor))
     mismatch = beyond.float().mean().item()
     # Fit on the reference rounded to the same grid: the raw reference would
     # carry the format's own rounding bias.
     slope = ((dequant * rounded).sum() / (rounded * rounded).sum()).item()
     if printLog:
         logger.info(
-            f"{msg}[dequantized: {mismatch:.4%} beyond one step, slope {slope:.4f}]"
+            f"{msg}[dequantized: {mismatch:.4%} beyond tolerance, slope {slope:.4f}]"
         )
-    if not mismatch <= QUANTIZED_MISMATCH_CAP or not (abs(slope - 1) <= SLOPE_BIAS_CAP):
+    if mismatch > 0 or not (abs(slope - 1) <= SLOPE_BIAS_CAP):
         return 1.0
     return mismatch
 
 
 def relative_l2_compare(ref, res, msg="", printLog=True):
     """compare_fn for a bf16 stage-2 output: relative L2 error against the
-    reference within STAGE2_REL_L2_CAP and a least-squares slope within
-    SLOPE_BIAS_CAP of 1. An elementwise rtol does not fit here: atomic kernels
-    round every partial sum, so an output that cancels to near zero carries the
-    rounding of much larger partials. Returns the relative L2 error, or 1.0 when
-    either bound fails."""
+    reference within STAGE2_REL_L2_CAP, that of every output row within
+    STAGE2_ROW_REL_L2_CAP, and a least-squares slope within SLOPE_BIAS_CAP of 1.
+    An elementwise rtol does not fit here: atomic kernels round every partial
+    sum, so an output that cancels to near zero carries the rounding of much
+    larger partials. Returns the relative L2 error, or 1.0 when a bound fails."""
     from aiter import logger
 
     y = ref.float().reshape(-1)
     x = res.float().reshape(-1)[: y.numel()]
     rel_l2 = ((x - y).norm() / y.norm()).item()
     slope = ((x * y).sum() / (y * y).sum()).item()
+    rows = ref.shape[0] if ref.dim() > 1 else 1
+    rows_y, rows_x = y.view(rows, -1), x.view(rows, -1)
+    row_rel_l2 = ((rows_x - rows_y).norm(dim=1) / rows_y.norm(dim=1)).max().item()
     if printLog:
-        logger.info(f"{msg}[relative L2 {rel_l2:.4%}, slope {slope:.4f}]")
-    if not (rel_l2 <= STAGE2_REL_L2_CAP and abs(slope - 1) <= SLOPE_BIAS_CAP):
+        logger.info(
+            f"{msg}[relative L2 {rel_l2:.4%}, worst row {row_rel_l2:.4%}, "
+            f"slope {slope:.4f}]"
+        )
+    if not (
+        rel_l2 <= STAGE2_REL_L2_CAP
+        and row_rel_l2 <= STAGE2_ROW_REL_L2_CAP
+        and abs(slope - 1) <= SLOPE_BIAS_CAP
+    ):
         return 1.0
     return rel_l2
 
@@ -4084,18 +4104,13 @@ class FmoeTuner(TunerCommon):
                 for s1_name, s1_params, is_fp4, is_fp8 in s1_variants:
                     s1_compare_fn = None
                     s1_ref_kwargs = {}
-                    if is_splitk:
-                        # Split-K quantizes a bf16 sum of partials, which no
-                        # reference quantizer reproduces byte for byte.
+                    if is_splitk or is_fp4 or is_fp8:
+                        # Judge the dequantized values: split-K quantizes a bf16
+                        # sum of partials that no reference quantizer reproduces
+                        # byte for byte, and a byte count cannot tell a rounding
+                        # tie from a value that moved by its whole block.
                         s1_compare_fn = dequantized_output_compare
                         s1_ref_kwargs = {"scale_positions": True}
-                    elif is_fp4 or is_fp8:
-                        s1_compare_fn = quantized_output_compare
-                        s1_ref_kwargs = {"return_scale": True}
-                        if is_fp8:
-                            s1_ref_kwargs["fp8_scale_fn"] = (
-                                fp4_utils.f32_to_fused_moe_mxfp8_scale
-                            )
                     # fp8-activation kernels read a1_qt cast to fp8; the reference
                     # reads the same.
                     a1_ref, a1_ref_scale = (

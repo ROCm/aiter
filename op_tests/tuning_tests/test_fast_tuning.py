@@ -1119,14 +1119,15 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
                 sorted_ids, num_valid_ids, self.token_num, self.topk, 8
             )
 
-    def _split_k(self, quant, scale_of=lambda x: x):
+    def _split_k(self, quant, scale_of=lambda x: x, x=None):
         """A split-K-like output: the bf16-rounded result quantized by quant, its
         scales in the sorted layout, and the reference the check reads."""
         import torch
 
         tune = self._tune()
         sorted_ids, num_valid_ids = self._routes()
-        x = torch.randn(self.token_num, self.topk, self.inter)
+        if x is None:
+            x = torch.randn(self.token_num, self.topk, self.inter)
         codes, scales = quant(scale_of(x).bfloat16().float())
         sorted_scales = tune._sorted_route_scales(
             scales, sorted_ids, num_valid_ids, self.token_num, self.topk
@@ -1154,7 +1155,35 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
         for name, quant in self._quantizers().items():
             with self.subTest(name):
                 ref, res = self._split_k(quant)
-                self.assertLessEqual(compare(ref, res, printLog=False), 1e-2)
+                self.assertEqual(compare(ref, res, printLog=False), 0.0)
+
+    def test_near_zero_value_within_the_block_floor_passes(self):
+        """Near zero the fp8 grid is finer than fp32 accumulation noise: a value
+        several fine steps off but tiny next to its block still passes."""
+        import torch
+
+        compare = self._tune().dequantized_output_compare
+        x = torch.randn(self.token_num, self.topk, self.inter)
+        x[0, 0, 1] = 0
+        (_, positions), res = self._split_k(self._quantizers()["fp8"], x=x)
+        drifted = x.clone()
+        drifted[0, 0, 1] = x[0, 0, :32].abs().max() * 2**-13
+        self.assertEqual(compare((drifted, positions), res, printLog=False), 0.0)
+        drifted[0, 0, 1] = x[0, 0, :32].abs().max() * 2**-10
+        self.assertEqual(compare((drifted, positions), res, printLog=False), 1.0)
+
+    def test_one_corrupted_route_fails(self):
+        """A fault in one route of many is below any whole-output fraction, but
+        each of its values is far from the reference."""
+        import torch
+
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, (codes, scales) = self._split_k(quant)
+                codes = codes.clone()
+                codes.view(torch.uint8).view(-1, codes.shape[-1])[3] = 0
+                self.assertEqual(compare(ref, (codes, scales), printLog=False), 1.0)
 
     def test_split_k_bias_fails(self):
         compare = self._tune().dequantized_output_compare
@@ -1234,6 +1263,20 @@ class TestStage2RelativeL2Compare(unittest.TestCase):
         res = ref.clone()
         res[0] = float("nan")
         self.assertEqual(self._compare(ref, res), 1.0)
+
+    def test_one_wrong_row_among_many_fails(self):
+        """One zeroed output row of 32768 is under the global cap but is
+        entirely wrong on its own."""
+        import torch
+
+        torch.manual_seed(0)
+        ref = torch.randn(32768, 128).bfloat16()
+        res = ref.clone()
+        res[5] = 0
+        global_rel = ((res.float() - ref.float()).norm() / ref.float().norm()).item()
+        self.assertLess(global_rel, 1e-2)
+        self.assertEqual(self._compare(ref, res), 1.0)
+        self.assertEqual(self._compare(ref, ref.clone()), 0.0)
 
 
 class TestRunConfigRouting(unittest.TestCase):
