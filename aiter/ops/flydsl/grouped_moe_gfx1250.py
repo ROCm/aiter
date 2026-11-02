@@ -405,18 +405,44 @@ def _use_fused_quant_preshuffle(
     """Can this call take the compact quant + scale-rebuild path?
 
     The caller sizes token-indexed buffers on the answer, so it needs it up front
-    rather than letting the launch decide.
+    rather than letting the launch decide. Automatic FP4 compact selection also
+    waits until the direct quantizer no longer needs K-splitting for occupancy;
+    a valid explicit minimum-token override retains the old selection.
     """
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         fused_quant_preshuffle_supported,
+        token_multidest_ksplit,
     )
     from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
 
-    return (
+    supported = (
         token_num >= _compact_scale_min_tokens(wmma_rep)
         and token_multidest_eligible(token_num, topk)
         and fused_quant_preshuffle_supported(model_dim, wmma_rep, quant_mode)
     )
+
+    if not supported:
+        return False
+    # FP8 graph measurements do not show a consistent benefit from this
+    # policy; preserve its existing compact-selection behavior.
+    if quant_mode != "fp4":
+        return True
+    # A valid explicit threshold is a tuning override, not an automatic
+    # policy choice. Keep its existing power to force compact scales.
+    threshold = os.environ.get("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
+    if threshold is not None:
+        try:
+            int(threshold)
+        except ValueError:
+            threshold = None  # The threshold helper already warned.
+        else:
+            return True
+
+    # Compact quant has one unsplit warp per token and adds a scale-rebuild
+    # launch. While the direct quantizer still splits K to fill its grid,
+    # retain that parallelism instead of switching to the unsplit pair.
+    # Larger grids keep the existing compact policy and coalesced scale writes.
+    return token_multidest_ksplit(model_dim, wmma_rep, quant_mode, token_num) == 1
 
 
 @functools.cache
