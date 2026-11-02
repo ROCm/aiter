@@ -19,7 +19,7 @@
 // MORI's wrapper exposes a team argument and optFlags on GDA.
 //
 // Only the (rail, warp) instantiation exists because that is the only one the
-// operator uses: kernel2 rejects any other team (stage2_node_combine.py), and
+// operator uses: kernel2 rejects any other team (stage2.py), and
 // no call site asks for block coop.
 
 #include "mori/cco/cco_scale_out.hpp"
