@@ -107,14 +107,19 @@ def run_bmm_a8w8_mxfp8(
                 f"{w_scale_block} w_scale on {get_gfx()}"
             )
         return run(
-            XQ, WQ, x_scale, w_scale, Out, kernel_name=kernel_name,
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            Out,
+            kernel_name=kernel_name,
             y_scale_out=y_scale_out,
         )
     return run(XQ, WQ, x_scale, w_scale, Out, kernel_name=kernel_name)
 
 
 __all__ = [
-    "bmm_a8w8_mxfp8_supported",
     "bmm_a8w8_mxfp8_fused_quant_supported",
+    "bmm_a8w8_mxfp8_supported",
     "run_bmm_a8w8_mxfp8",
 ]

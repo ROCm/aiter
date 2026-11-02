@@ -97,7 +97,7 @@ def main():
     a = p.parse_args()
     bad = 0
     for m in (int(x) for x in a.s.split(",")):
-        sc, fp, tot = run_case(a.b, m, a.n, a.k)
+        sc, fp, _tot = run_case(a.b, m, a.n, a.k)
         if sc != 0 or fp > 0:
             bad += 1
     print("ALL BIT-EXACT" if bad == 0 else f"{bad} shape(s) mismatched")

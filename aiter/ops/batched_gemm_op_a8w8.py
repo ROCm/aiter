@@ -472,9 +472,7 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
             f"{get_gfx()}; use batched_gemm_a8w8_mxscale_bpreshuffle + quantize_fp8"
         )
     y8 = torch.empty((m, g, n), dtype=dtypes.fp8, device=x.device)
-    y_scale = torch.empty(
-        (m, g * n // 32), dtype=torch.float8_e8m0fnu, device=x.device
-    )
+    y_scale = torch.empty((m, g * n // 32), dtype=torch.float8_e8m0fnu, device=x.device)
     run_bmm_a8w8_mxfp8(
         x, wo_a, x_scale, w_scale, y8, y_scale_out=y_scale.view(torch.uint8)
     )

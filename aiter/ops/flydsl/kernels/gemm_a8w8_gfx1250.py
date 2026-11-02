@@ -974,9 +974,8 @@ def launch_gemm_a8w8(
             n32_64 = fx.Int64(i32_n) // 32
             srow = ldc64 // 32  # scale row stride = (B*N)//32
             sbase_blk = (
-                (bz64 * n32_64 if const_expr(batched) else fx.Int64(0))
-                + blk_n64 // 32
-            )
+                bz64 * n32_64 if const_expr(batched) else fx.Int64(0)
+            ) + blk_n64 // 32
             cbase_blk = (
                 bz64 * fx.Int64(i32_n) if const_expr(batched) else fx.Int64(0)
             ) + blk_n64
