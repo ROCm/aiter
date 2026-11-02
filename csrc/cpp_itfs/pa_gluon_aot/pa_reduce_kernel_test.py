@@ -89,6 +89,7 @@ def compile_reduce_kernel(
                 head_size_pow2,
                 context_partition_size,
                 use_sinks,
+                head_size != head_size_pow2,
             ),
         )
 
@@ -136,6 +137,7 @@ def compile_reduce_kernel(
             f"{head_size_pow2}",
             f"{context_partition_size}",
             f"{use_sinks}",
+            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
         ]
         signature = ",".join(signature_parts)
 
@@ -292,6 +294,7 @@ def run_direct_kernel(
         OUTPUT_SEQ_LEN=output_seq_len,
         ONE_OUTPUT_GROUP_SIZE=one_output_group_size,
         HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
+        VALUE_HEAD_PADDED=head_size != triton.next_power_of_2(head_size),
         CONTEXT_PARTITION_SIZE=context_partition_size,
         USE_SINKS=sinks is not None,
     )
