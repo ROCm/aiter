@@ -442,6 +442,14 @@ def _check_output(output, reference):
     torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
 
 
+def _can_use(pa, output, arguments, options):
+    """can_use_flydsl_pa_decode on a pa_decode call: same arguments, no scale."""
+    query, key, value, context, table, _scale, query_length = arguments
+    return pa.can_use_flydsl_pa_decode(
+        output, query, key, value, context, table, query_length, **options
+    )
+
+
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
     query, key, value, *rest = arguments
     invalid = case["invalid_input"]
@@ -463,6 +471,8 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         pytest.fail("invalid BF16 inputs reached kernel compilation")
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
+    arguments = (query, key, value, *rest)
+    assert not _can_use(pa, torch.empty_like(query), arguments, options)
     with pytest.raises(case["error"], match=case["match"]):
         pa.pa_decode(
             torch.empty_like(query),
@@ -701,6 +711,7 @@ def test_pa_decode(case, device, monkeypatch):
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
 
     output = torch.full_like(query, float("nan"))
+    assert _can_use(pa, output, arguments, options)
     workspace = {}
     if case["capture"]:
         scalar_shape = (kv_heads, plan.capacity, query_length * group_size)
