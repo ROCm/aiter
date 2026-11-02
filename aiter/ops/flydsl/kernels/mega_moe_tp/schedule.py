@@ -20,6 +20,7 @@ from .common import (
     _ctpop,
     bld,
     bst,
+    deadline_in,
     g_add_agent,
     g_ld_sys,
     g_st_sys,
@@ -119,7 +120,11 @@ def build_schedule(kc: KernelCtx) -> dict:
     def _stale_dropped(tid, a):
         if (tid == i32(0)) & (a["epoch"] == i32(1)):
             x = i32(gpu.block_id("x")) % i32(N_XCD)
-            spin_sys_ge(ctrl_at(a, i32(CTRL_XF) + x), a["epoch"])
+            spin_sys_ge(
+                ctrl_at(a, i32(CTRL_XF) + x),
+                a["epoch"],
+                end=deadline_in(a["wait_ticks"]),
+            )
 
     def unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig):
         gemm1(L, tid, a, expert, i0, icnt // i32(128))
@@ -279,7 +284,12 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     def lb_lbr_wait(a, bank, x):
         nblk = i32(gpu.grid_dim.x)
-        spin_sys_ge(lb_lbr(a, bank, x), ceildiv(nblk - x, i32(N_XCD)), a)
+        spin_sys_ge(
+            lb_lbr(a, bank, x),
+            ceildiv(nblk - x, i32(N_XCD)),
+            end=deadline_in(a["wait_ticks"]),
+            a=a,
+        )
 
     @flyc.jit
     def lb_none(L, tid, a, nun):
@@ -711,7 +721,12 @@ def build_schedule(kc: KernelCtx) -> dict:
         R = fx.min(lds_ld_i32(L, L_DCNT + e * i32(4)) - r0, i32(rch))
         base = lds_ld_i32(L, L_EOFF + e * i32(4)) + r0
         if lane == i32(0):
-            spin_sys_ge(lb_g1c(a, j, bank), lb_pieces(L, j), a)
+            spin_sys_ge(
+                lb_g1c(a, j, bank),
+                lb_pieces(L, j),
+                end=deadline_in(a["wait_ticks"]),
+                a=a,
+            )
         rocdl.sched_barrier(0)
         rix0 = i32(L_RIX) + b * i32(128 * 4)
         wt0 = i32(L_WT) + b * i32(128 * 4)
@@ -797,7 +812,12 @@ def build_schedule(kc: KernelCtx) -> dict:
         ent = lds_ld_i32(L, L_DCH + j * i32(4))
         bank = lb_bank(L)
         if tid == i32(0):
-            spin_sys_ge(lb_g1c(a, j, bank), lb_pieces(L, j), a)
+            spin_sys_ge(
+                lb_g1c(a, j, bank),
+                lb_pieces(L, j),
+                end=deadline_in(a["wait_ticks"]),
+                a=a,
+            )
         R = lb_routes(L, tid, a, ent)
         gemm2(
             L,
