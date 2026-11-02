@@ -3801,10 +3801,6 @@ def flash_attn_varlen_func(
         raise ValueError(
             "FP8 attention requires q_descale, k_descale, and v_descale together"
         )
-    if has_all_descales and not ENABLE_CK:
-        raise RuntimeError(
-            "prequantized FP8 attention with descales requires ENABLE_CK=1"
-        )
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3914,6 +3910,10 @@ def flash_attn_varlen_func(
             return _flydsl_result
 
     if not ENABLE_CK:
+        if has_all_descales:
+            raise RuntimeError(
+                "prequantized FP8 attention with descales requires ENABLE_CK=1"
+            )
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
         )
