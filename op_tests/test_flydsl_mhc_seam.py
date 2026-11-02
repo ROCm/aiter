@@ -4,8 +4,9 @@
 """FlyDSL two-launch delayed mHC seam with RMSNorm (gfx942) vs fp32 torch.
 
 Tables:
-  test_mhc_seam          flydsl (policy config) and the Triton seam against the fp32
-                         reference, plus a CUDA-graph replay check of the flydsl launches.
+  test_mhc_seam          flydsl (policy config), the Triton seam and, where it runs, the ASM
+                         seam + aiter.rms_norm against the fp32 reference, plus a CUDA-graph
+                         replay check of the flydsl launches.
                          "graph us" is the replayed-graph latency per call (both launches
                          and the gap between them); "kernel us" the profiler's summed
                          kernel time of eager calls.
@@ -109,6 +110,38 @@ def _with_fn(op, fn):
     return call
 
 
+def _asm_seam(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    *consts,
+    pre_mix,
+    sublayer_out,
+    post_layer_mix,
+    comb_res_mix,
+    norm_weight,
+    norm_eps,
+    residual_out=None,
+):
+    """The ASM seam, which has no RMSNorm, followed by aiter.rms_norm: the same outputs as
+    the other ops. It allocates its own residual_out, so the caller's is unused."""
+    from aiter.ops.mhc import mhc_fused_post_pre_delayed
+
+    out = mhc_fused_post_pre_delayed(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        *consts,
+        pre_mix,
+        sublayer_out,
+        post_layer_mix,
+        comb_res_mix,
+    )
+    return (*out[:3], aiter.rms_norm(out[3], norm_weight, norm_eps), out[4])
+
+
 def _clone_inputs(args, kw):
     def clone(v):
         return v.clone() if isinstance(v, torch.Tensor) else v
@@ -192,9 +225,13 @@ def _seam_ops(T, H):
 @benchmark()
 def test_mhc_seam(T, H, mode):
     from aiter.ops.flydsl import flydsl_mhc_seam
+    from aiter.ops.mhc import mhc_fused_post_pre_delayed_asm_supported
 
     args, kw, ref = _call_kwargs(mode, T, H)
     ops = _seam_ops(T, H)
+    # The ASM seam always applies the post block.
+    if mode != "no_post" and mhc_fused_post_pre_delayed_asm_supported(H, 4):
+        ops["asm_seam"] = _asm_seam
     ret = {"gfx": get_gfx()}
     for name, op in ops.items():
         if not T:  # empty-batch edge case: the call must return, nothing to time
@@ -218,6 +255,8 @@ def test_mhc_seam(T, H, mode):
         )
     if "triton_seam graph us" in ret and T:
         ret["graph speedup"] = ret["triton_seam graph us"] / ret["flydsl graph us"]
+    if "asm_seam" in ops and T:
+        ret["vs asm"] = ret["asm_seam graph us"] / ret["flydsl graph us"]
     return ret
 
 
