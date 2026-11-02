@@ -371,6 +371,8 @@ def gen_gemm_a8w8_blockscale_ck_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
+    kernelName: str = "",
 ) -> Tensor:
     return Out
 
@@ -391,10 +393,23 @@ def gemm_a8w8_blockscale_ck(
 ) -> torch.Tensor: ...
 
 
+def gen_gemm_a8w8_blockscale_cktile_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    isBpreshuffled: bool = False,
+    splitK: int = 0,
+    kernelName: str = "",
+) -> Tensor:
+    return Out
+
+
 @compile_ops(
     "module_gemm_a8w8_blockscale_cktile",
     fc_name="gemm_a8w8_blockscale_cktile",
-    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+    gen_fake=gen_gemm_a8w8_blockscale_cktile_fake_tensors,
 )
 def gemm_a8w8_blockscale_cktile(
     XQ: torch.Tensor,
@@ -408,10 +423,21 @@ def gemm_a8w8_blockscale_cktile(
 ) -> torch.Tensor: ...
 
 
+def gen_gemm_a8w8_blockscale_bpreshuffle_ck_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelName: str = "",
+) -> Tensor:
+    return Out
+
+
 @compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle",
     fc_name="gemm_a8w8_blockscale_bpreshuffle",
-    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+    gen_fake=gen_gemm_a8w8_blockscale_bpreshuffle_ck_fake_tensors,
 )
 def gemm_a8w8_blockscale_bpreshuffle_ck(
     XQ: torch.Tensor,
@@ -423,10 +449,22 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
 ) -> torch.Tensor: ...
 
 
+def gen_gemm_a8w8_blockscale_bpreshuffle_cktile_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    isBpreshuffled: bool = True,
+    kernelName: str = "",
+) -> Tensor:
+    return Out
+
+
 @compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
     fc_name="gemm_a8w8_blockscale_bpreshuffle_cktile",
-    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+    gen_fake=gen_gemm_a8w8_blockscale_bpreshuffle_cktile_fake_tensors,
 )
 def gemm_a8w8_blockscale_bpreshuffle_cktile(
     XQ: torch.Tensor,
