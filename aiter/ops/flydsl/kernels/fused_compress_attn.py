@@ -36,9 +36,10 @@ Per-thread layout (single wave64, BLOCK_THREADS=64):
     arrays carried across K iterations via scf.for loop-carried state.
 
 Two-phase K loop (matches Triton perf split):
-  Phase 1 (state cache): k ? [0, window_len) -- dynamic bound, scf.for with
+  Phase 1 (state cache): k ? [max(0, K-1-position), window_len) -- scf.for with
     loop-carry. Each iter loads kv_state/score_state at ``s = pos - K + 1 + k``,
-    masking padding (s < 0) via ``select(is_padding, NEG_INF, score_b)``.
+    skipping source positions before the sequence starts; the ``s < 0`` mask
+    is retained as a guard.
   Phase 2 (ragged input): k ? [window_len, K) -- dynamic start, constexpr end.
     Each iter loads kv_in/score_in/ape, then ``score_k = score_a + ape_v``.
 
@@ -480,7 +481,10 @@ def _build_kernel(
 
             # ---- Step 6: Phase 1 -- state cache loop (dynamic bound = window_len) ----
             # window_len ? [0, K]. When 0, the loop is a no-op.
-            for k_static, state in range(0, window_len, 1, init=init_state):
+            # Skip non-existent source positions before the sequence starts.
+            # Masking only their scores still feeds stale KV into the recurrence.
+            state_start = fx.max(fx.Int32(K - 1) - position, fx.Int32(0))
+            for k_static, state in range(state_start, window_len, 1, init=init_state):
                 m_lane, kv_lane, w_lane = _split_state(state, VEC)
 
                 k_i32 = fx.Int32(k_static)
@@ -1552,9 +1556,12 @@ def _build_kernel_ksplit(
             init_w = [c_zero_f32 for _ in range(VEC)]
             init_state = init_m + init_kv + init_w
 
-            # Phase 1 sub-loop [k_start, split): state cache.
+            # Skip negative history within this wave's state-cache range. An
+            # empty range keeps the initial state without reading stale KV.
+            pad_end = fx.max(fx.Int32(K - 1) - position, fx.Int32(0))
+            p1_start = fx.min(fx.max(pad_end, k_start), split)
             p1 = init_state
-            for k_static, state in range(k_start, split, 1, init=init_state):
+            for k_static, state in range(p1_start, split, 1, init=init_state):
                 m_lane = list(state[0:VEC])
                 kv_lane = list(state[VEC : 2 * VEC])
                 w_lane = list(state[2 * VEC : 3 * VEC])
