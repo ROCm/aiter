@@ -70,23 +70,32 @@ mtpr > 4096 时（h1 / k1 push 平面 / k2 inbox 超过 2 GiB）GMM1、k1、k2 �
 < 1 GiB；≤ 4096 的布局和 ISA 与之前逐字节一致。DSV4 在 16384 下用 bf16 rail 会超过 1 GiB，
 构造时直接拒绝。
 
-## 跑一个用例
+## 跑测试
 
-两个节点各跑一次，node_rank 分别是 0 和 1，master 是 node0；同一个网络的所有
-(TPR, fixture) case 在一个进程里跑完（只建一次链，权重只生成一次）：
+入口就是测试文件本身。两个节点跑同一条命令，只有 `--node-rank` 不同（0 / 1），
+`--master-addr` 填 node0 的地址。用普通 `python3` 启动时它是 launcher：设置
+传输层环境，然后按 `--network` 的顺序逐个拉起 torchrun（第 i 个网络用
+`--master-port + i`）。同一个网络的所有 (TPR, fixture) case 在一个进程里跑完
+（只建一次链，权重只生成一次）：
 
 ```bash
-# node0 / node1
-bash scripts/megamoe_internode/run_internode_test.sh 0 <master_ip> <port> <tag> -- \
-  --network kimi_k3 --tpr-list 128,256,512,1024 --fixtures eplb,random
-bash scripts/megamoe_internode/run_internode_test.sh 1 <master_ip> <port> <tag> -- <同上>
+# node0；node1 换成 --node-rank 1
+python3 op_tests/multigpu_tests/test_megamoe_internode.py \
+  --node-rank 0 --master-addr <node0_ip> --master-port 29500 --tag <tag> \
+  --network kimi_k3,dsv4 --tpr-list 16384,4096,1024,512,128,64,32 --fixtures random,eplb
 ```
+
+launcher 参数：`--timeout`（每个网络的秒数，默认 3600，超时整组 SIGTERM 再 SIGKILL）、
+`--socket-ifname`（Gloo / MORI bootstrap 网卡，默认 `enp193s0f1np1`）、
+`--torchrun-wrap`（torchrun `--no-python` 包装脚本，如只在一个 rank 上跑
+`rocprofv3 --att`）、`--max-idle-vram-gib`（preflight 认为空闲的显存上限，默认 2）。
+MORI 的 NIC 相关变量（`MORI_DEVICE_NIC` 等）若已在 shell 里设置则沿用。
 
 每个 case 依次做：fused 的 eager 输出对 MORI A4W4 参照（同一份权重）的 relL2，
 graph replay 对 eager（中间改输入、换路由各验一次），然后计时。选项：
 
-* `--timing total,breakdown`（默认两者）：`total` 是总耗时，`breakdown` 是分段，
-  `none` 只验精度；
+* `--timing total,breakdown`（默认两者）：`total` 是总耗时，`breakdown` 是 fused 的分段
+  （小算子不做分段，见下面「测量口径」），`none` 只验精度；
 * `--paths fused,smallop`（默认两者）：fused 算子和/或小算子基线
   （quant + MORI dispatch + 调过的 fused_moe + MORI combine；DSV4 是 a8w4）；
 * `--no-check` 跳过参照和 replay 检查。
@@ -94,8 +103,9 @@ graph replay 对 eager（中间改输入、换路由各验一次），然后计�
 最后打印一张 `[SUMMARY]` 表（每个 case 一行：relL2、fused / 小算子总耗时、加速比、
 fused 的 stage1 / stage2 分段）。
 
-日志在 `trace_data/internode/<tag>/node<r>.log`，结果（rank 0）在
-`trace_data/internode/<tag>/results.json`。
+输出同时打到终端和 `trace_data/internode/<tag>/node<r>.log`，退出码写到
+`node<r>.status`（任一网络失败即非 0；tag 已有 status 时拒绝启动）。结果（rank 0）在
+`trace_data/internode/<tag>/results.json`；多个网络时在 `<tag>/<network>/results.json`。
 
 配置不走环境变量：算子里写死的是实测最优配置，按 shape 变的参数查两张表
 （`aiter/configs/megamoe_internode_stage1_tuned.csv`：tile_group / split_local /
@@ -111,7 +121,9 @@ gemm2_cu），查不到时按 `mega_moe_internode_config.py` 里的规则推。�
 forward，warmup 10 次后计时 40 次，每次 replay 后 synchronize、用 host 墙钟计时。
 总耗时报每个 rank 的 min / median 再对 16 个 rank 取平均。分段在计时之后另跑
 torch.profiler：20 次 replay，取最后 5 次，每行是每个 rank 的最小值再取平均；
-profiler 偶尔丢事件，所以它不进总耗时。跨 harness 比较**必须先对齐统计量**：
+profiler 偶尔丢事件，所以它不进总耗时。只对 fused 做分段：小算子的 graph 在
+torch.profiler 下 replay 偶发在 HIP 内死锁（roctracer 的完成回调和发射线程互等），
+16 个 rank 一起挂住，所以小算子只报总耗时。跨 harness 比较**必须先对齐统计量**：
 `pooled_min` 会藏住 rank 间离散度。
 
 下面的基线是旧口径（profiler span、后 20 轮池化），墙钟要高 ~10 µs，不能直接比。

@@ -1,18 +1,33 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""EP16 inter-node MegaMoE tile test: accuracy and performance in one pass.
+"""EP16 inter-node MegaMoE test: accuracy and performance in one pass.
 
-Launch one torchrun per node (2 nodes x 8 GPUs); see
-scripts/megamoe_internode/run_internode_test.sh.  Every (TPR, fixture) case of one
-network runs in this process, largest TPR first:
+Run the same command on both nodes (2 nodes x 8 GPUs), only --node-rank differs::
+
+    python3 op_tests/multigpu_tests/test_megamoe_internode.py \\
+        --node-rank 0 --master-addr <node0 ip> --master-port 29500 --tag k3_dsv4 \\
+        --network kimi_k3,dsv4 --tpr-list 16384,4096,512,128,32 --fixtures random,eplb
+
+Run with plain ``python3`` it is the launcher: it sets the transport
+environment, then starts one torchrun job per network in --network, in order,
+each on --master-port + its index.  Output is printed and also written to
+<out-dir>/<tag>/node<r>.log; the exit code goes to node<r>.status.  With several
+networks each one keeps its results in <out-dir>/<tag>/<network>/results.json
+(one network: <out-dir>/<tag>/results.json).
+
+Inside torchrun (RANK set) it is one network's worker.  Every (TPR, fixture)
+case runs in that process, largest TPR first:
 
   check      fused eager output vs the MORI A4W4 reference built on the same
              weights (relL2), then CUDA-graph replays vs eager, with changed
              inputs and swapped routing in between (--no-check skips all)
   total      bench_mega_moe.py timing: each replay is synchronized and timed
              with the host clock; per-rank min/median, mean over ranks
-  breakdown  torch.profiler over --prof-replays more replays; per-kernel rows
-             from the last --prof-tail of them
+  breakdown  fused only: torch.profiler over --prof-replays more replays;
+             per-kernel rows from the last --prof-tail of them.  The small-op
+             graph is not profiled: under torch.profiler its replay now and then
+             deadlocks inside HIP (a roctracer completion callback against the
+             launching thread), which hangs all 16 ranks
 
 --timing picks total and/or breakdown; --paths picks the fused operator and/or
 the small-op baseline (quant + MORI dispatch + tuned fused_moe + MORI combine).
@@ -30,8 +45,11 @@ import json
 import logging
 import os
 import re
+import signal
 import statistics
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -77,7 +95,8 @@ MORI_BLOCKS = {"a4w4": (96, 64), "a8w4": (256, 128)}
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--network", choices=sorted(NETWORKS), default="kimi_k3")
+    p.add_argument("--network", default="kimi_k3",
+                   help=f"comma separated, run in order; one of {sorted(NETWORKS)}")
     p.add_argument("--model-dim", type=int)
     p.add_argument("--inter-dim", type=int)
     p.add_argument("--experts", type=int)
@@ -114,7 +133,27 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--out-dir", default="trace_data/internode")
     p.add_argument("--tag", default="run")
+    p.add_argument("--max-idle-vram-gib", type=float, default=2.0,
+                   help="preflight: VRAM an idle GPU may already hold")
+    g = p.add_argument_group("launcher (plain python3 entry)")
+    g.add_argument("--node-rank", type=int, choices=(0, 1))
+    g.add_argument("--master-addr", help="node0 address")
+    g.add_argument("--master-port", type=int, default=29500,
+                   help="network i of --network uses this + i")
+    g.add_argument("--timeout", type=int, default=3600, help="seconds per network")
+    g.add_argument("--socket-ifname", default="enp193s0f1np1",
+                   help="Gloo / MORI bootstrap interface")
+    g.add_argument("--torchrun-wrap", default="",
+                   help="torchrun --no-python wrapper (e.g. rocprofv3 --att on one rank); "
+                        "the test script and its args follow it")
     args = p.parse_args(argv)
+    args.networks = list(dict.fromkeys(v for v in args.network.split(",") if v))
+    if not args.networks or set(args.networks) - set(NETWORKS):
+        p.error(f"--network takes a comma separated subset of {sorted(NETWORKS)}, "
+                f"got {args.network!r}")
+    if "RANK" in os.environ and len(args.networks) != 1:
+        p.error("a torchrun worker runs one network")
+    args.network = args.networks[0]
     args.paths = split_choices(p, "--paths", args.paths, ("fused", "smallop"))
     args.timing = split_choices(p, "--timing", args.timing, ("total", "breakdown", "none"))
     args.timing.discard("none")
@@ -454,16 +493,6 @@ def kernel_class(name):
         return "gemm2"
     if name.startswith("megamoe_k2"):             # fused kernel2: node reduce + rail + combine
         return "k2"
-    if name.startswith("EpDispatch"):
-        return "dispatch"
-    if "moe_sorting" in name or "mxfp4_moe_sort" in name:
-        return "sorting"
-    if name.startswith("mfma_moe1") or "moe1_" in name:
-        return "gemm1"
-    if name.startswith("gemm2_") or "moe2_" in name:
-        return "gemm2"
-    if name.startswith("EpCombine"):
-        return "combine"
     if "quant" in name:
         return "quant"
     return "other"
@@ -508,14 +537,12 @@ def profile_breakdown(torch, graph, device, replays, tail, trace_file):
             names.add(e["name"])
         ends = [float(e["ts"]) + float(e["dur"]) for e in active]
         row["span"] = max(ends) - min(float(e["ts"]) for e in active)
-        # Stage2 = first GEMM2 start to last k2/combine end, gaps included.
+        # Stage2 = first GEMM2 (k1) start to last k2 end, gaps included.
         first = [float(e["ts"]) for e in active if kernel_class(e["name"]) == "gemm2"]
         last = [float(e["ts"]) + float(e["dur"]) for e in active
-                if kernel_class(e["name"]) in ("k2", "combine")]
+                if kernel_class(e["name"]) == "k2"]
         if first and last:
             row["stage2"] = max(last) - min(first)
-        if "stage1" not in row and all(k in row for k in ("dispatch", "sorting", "gemm1")):
-            row["stage1"] = row["dispatch"] + row["sorting"] + row["gemm1"]
         samples.append(row)
     if not samples:
         return None, "no kernels inside the profiled replays"
@@ -548,7 +575,8 @@ class Runner:
                                  parts[3] if len(parts) > 3 else "", parts[4] if len(parts) > 4 else "")
         self.out_root = Path(args.out_dir) / args.tag
         self.out_root.mkdir(parents=True, exist_ok=True)
-        self.rank, world, self.device = inputs.setup_dist(str(self.out_root / "preflight"))
+        self.rank, world, self.device = inputs.setup_dist(
+            str(self.out_root / "preflight"), int(args.max_idle_vram_gib * 2**30))
         if world != EP_SIZE:
             raise ValueError(f"EP16 needs {EP_SIZE} ranks, got {world}")
         self.tune_log = TuneLog()
@@ -738,7 +766,7 @@ class Runner:
         res = {"quant": path.quant}
         if self.args.timing:
             graph, _ = capture_graph(self.torch, self.dist, path.forward, self.device)
-            self.time_path(res, graph, f"smallop_t{shape.tokens}_{fixture}")
+            self.time_path(res, graph, f"smallop_t{shape.tokens}_{fixture}", profile=False)
             del graph
         else:  # still look the config up in the fused_moe tune table
             path.forward()
@@ -750,13 +778,13 @@ class Runner:
         res["ok"] = bool(res["tune"]["misses"] == 0 or self.args.allow_tune_miss)
         return res
 
-    def time_path(self, res, graph, case):
+    def time_path(self, res, graph, case, profile=True):
         args = self.args
         if "total" in args.timing:
             samples = time_replays(self.torch, self.dist, graph, self.device,
                                    args.warmup, args.iters)
             res["total"] = wall_stats(self.gather(samples))
-        if "breakdown" in args.timing:
+        if profile and "breakdown" in args.timing:
             trace = self.out_root / f"{case}_rank{self.rank}.json"
             rows, names = profile_breakdown(self.torch, graph, self.device,
                                             args.prof_replays, args.prof_tail, trace)
@@ -777,15 +805,19 @@ class Runner:
                 self.results.append(rec)
                 if self.rank == 0:
                     failed |= print_case(self.net, self.args, rec)
+                    self.write_results()  # every case, so a later hang keeps it
         if self.rank == 0:
             print_summary(self.args, self.results)
-            out = self.out_root / "results.json"
-            out.write_text(json.dumps({"args": {k: sorted(v) if isinstance(v, set) else v
-                                                for k, v in vars(self.args).items()},
-                                       "network": self.net, "results": self.results},
-                                      indent=2) + "\n")
-            print(f"[RESULTS] {out}", flush=True)
+            print(f"[RESULTS] {self.write_results()}", flush=True)
         return failed
+
+    def write_results(self):
+        out = self.out_root / "results.json"
+        out.write_text(json.dumps({"args": {k: sorted(v) if isinstance(v, set) else v
+                                            for k, v in vars(self.args).items()},
+                                   "network": self.net, "results": self.results},
+                                  indent=2) + "\n")
+        return out
 
     def close(self):
         self.dist.barrier()
@@ -802,40 +834,15 @@ def fmt(value):
     return "-" if value is None else f"{value:.1f}"
 
 
-def overlap_rate(compute, comm, fused):
-    """bench_mega_moe.py's overlap rate: the share of the shorter of the small-op's
-    back-to-back compute and communication kernels the fused kernels hide
-    (1.0 = fully hidden, 0.0 = none, < 0 = fused is slower than not overlapping)."""
-    if None in (compute, comm, fused) or min(compute, comm) <= 0:
-        return None
-    return (compute + comm - fused) / min(compute, comm)
-
-
 def compare(rec):
-    """Speedups (small-op / fused) and overlap rates of one case."""
+    """Speedup (small-op / fused) of one case's total time."""
     fused, small = rec.get("fused") or {}, rec.get("smallop") or {}
     ft, st = (fused.get("total") or {}).get("min"), (small.get("total") or {}).get("min")
-    fb, sb = fused.get("breakdown") or {}, small.get("breakdown") or {}
-    ratio = lambda a, b: a / b if a and b else None
-    add = lambda *v: None if None in v else sum(v)
-    s1 = (add(sb.get("sorting"), sb.get("gemm1")), sb.get("dispatch"), fb.get("stage1"))
-    s2 = (sb.get("gemm2"), sb.get("combine"), add(fb.get("gemm2"), fb.get("k2")))
-    return {
-        "speedup": ratio(st, ft),
-        "speedup_stage1": ratio(sb.get("stage1"), fb.get("stage1")),
-        "speedup_stage2": ratio(sb.get("stage2"), fb.get("stage2")),
-        "overlap_stage1": overlap_rate(*s1),
-        "overlap_stage2": overlap_rate(*s2),
-        "overlap": overlap_rate(*(add(a, b) for a, b in zip(s1, s2))),
-    }
+    return {"speedup": st / ft if ft and st else None}
 
 
 def fmt_x(value):
     return "-" if value is None else f"{value:.2f}x"
-
-
-def fmt_pct(value):
-    return "-" if value is None else f"{100 * value:.0f}%"
 
 
 def print_case(net, args, rec):
@@ -865,35 +872,14 @@ def print_case(net, args, rec):
           f"fused {fmt((ft or {}).get('min'))} / {fmt((ft or {}).get('median'))}"
           f"  | small-op {fmt((st or {}).get('min'))} / {fmt((st or {}).get('median'))}{speed}")
     fb = (fused or {}).get("breakdown")
-    sb = (small or {}).get("breakdown")
-    for name, r in (("fused", fused), ("small-op", small)):
-        if r and r.get("breakdown_error"):
-            p(f"  breakdown {name} unavailable: {r['breakdown_error']}")
-    if fb or sb:
-        fb, sb = fb or {}, sb or {}
-        p(f"  breakdown (us, per-rank min over profiled replays "
-          f"{args.prof_replays - args.prof_tail}..{args.prof_replays - 1}, mean over ranks)"
-          f"   fused | small-op")
-        rows = (("quant", "quant", "quant"),
-                ("stage1", "stage1", "stage1"),
-                ("  dispatch/sorting/gemm1", None, None),
-                ("GEMM2", "gemm2", "gemm2"),
-                ("k2 / combine", "k2", "combine"),
-                ("stage2", "stage2", "stage2"),
-                ("replay span", "span", "span"))
-        for label, fk, sk in rows:
-            if fk is None:
-                if all(k in sb for k in ("dispatch", "sorting", "gemm1")):
-                    p(f"    {label:<24} {'':>8} | {fmt(sb['dispatch'])} + {fmt(sb['sorting'])}"
-                      f" + {fmt(sb['gemm1'])}")
-                continue
-            p(f"    {label:<24} {fmt(fb.get(fk)):>8} | {fmt(sb.get(sk)):>8}"
-              + (f"  {fmt_x(sb[sk] / fb[fk])}" if fb.get(fk) and sb.get(sk) else ""))
-        c = rec["compare"]
-        p(f"  overlap   (bench_mega_moe: (compute + comm - fused) / min(compute, comm))  "
-          f"stage1 {fmt_pct(c['overlap_stage1'])} (dispatch vs sorting+gemm1)  "
-          f"stage2 {fmt_pct(c['overlap_stage2'])} (combine vs gemm2)  "
-          f"all {fmt_pct(c['overlap'])}")
+    if fused and fused.get("breakdown_error"):
+        p(f"  breakdown fused unavailable: {fused['breakdown_error']}")
+    if fb:
+        p(f"  breakdown (us, fused, per-rank min over profiled replays "
+          f"{args.prof_replays - args.prof_tail}..{args.prof_replays - 1}, mean over ranks)")
+        for label, key in (("quant", "quant"), ("stage1", "stage1"), ("GEMM2 (k1)", "gemm2"),
+                           ("k2", "k2"), ("stage2", "stage2"), ("replay span", "span")):
+            p(f"    {label:<12} {fmt(fb.get(key)):>8}")
     if small:
         t = small["tune"]
         # fused_moe logs a lookup only the first time it sees a shape; a later
@@ -908,14 +894,10 @@ def print_case(net, args, rec):
 
 
 def print_summary(args, results):
-    print(f"[SUMMARY] network={args.network} (us; total = per-rank min, mean over ranks)",
-          flush=True)
-    print("  speedup = small-op / fused; s1/s2 from the breakdown rows; overlap = "
-          "bench_mega_moe.py's rate, (compute + comm - fused) / min(compute, comm) of the "
-          "small-op kernels; > 100% = fused beats a perfect overlap of them", flush=True)
+    print(f"[SUMMARY] network={args.network} (us; total = per-rank min, mean over ranks; "
+          f"speedup = small-op / fused; stage1/stage2 = fused breakdown)", flush=True)
     print(f"  {'TPR':>5} {'fixture':<9} {'check':<5} {'relL2':>8} {'fused':>8} "
-          f"{'small-op':>9} {'speedup':>8} {'f.stage1':>9} {'f.stage2':>9} "
-          f"{'s1 x':>6} {'s2 x':>6} {'ovl s1':>7} {'ovl s2':>7} {'ovl':>5}", flush=True)
+          f"{'small-op':>9} {'speedup':>8} {'f.stage1':>9} {'f.stage2':>9}", flush=True)
     for rec in results:
         fused, small = rec.get("fused") or {}, rec.get("smallop") or {}
         checks = fused.get("checks") or []
@@ -924,13 +906,11 @@ def print_summary(args, results):
                  else "FAIL")
         rel = next((c["rel_l2"] for c in checks if c["label"] == "eager_vs_mori"), None)
         ft, st = (fused.get("total") or {}).get("min"), (small.get("total") or {}).get("min")
-        fb, c = fused.get("breakdown") or {}, rec["compare"]
+        fb = fused.get("breakdown") or {}
         print(f"  {rec['tpr']:>5} {rec['fixture']:<9} {state:<5} "
               f"{'-' if rel is None else f'{rel:.5f}':>8} {fmt(ft):>8} {fmt(st):>9} "
-              f"{fmt_x(c['speedup']):>8} {fmt(fb.get('stage1')):>9} {fmt(fb.get('stage2')):>9} "
-              f"{fmt_x(c['speedup_stage1']):>6} {fmt_x(c['speedup_stage2']):>6} "
-              f"{fmt_pct(c['overlap_stage1']):>7} {fmt_pct(c['overlap_stage2']):>7} "
-              f"{fmt_pct(c['overlap']):>5}", flush=True)
+              f"{fmt_x(rec['compare']['speedup']):>8} {fmt(fb.get('stage1')):>9} "
+              f"{fmt(fb.get('stage2')):>9}", flush=True)
 
 
 def main(argv=None):
@@ -949,5 +929,119 @@ def main(argv=None):
     return 1 if failed else 0
 
 
+# --------------------------------------------------------------------------
+# Launcher: plain python3 entry, one torchrun job per network
+# --------------------------------------------------------------------------
+
+# Transport environment of the two-node ionic setup; a value already exported
+# by the caller wins for the setdefault ones.
+LAUNCH_ENV_DEFAULT = {
+    "MORI_DEVICE_NIC": "ionic",
+    "MORI_RDMA_DEVICES": "^rocep193s0f0,rocep193s0f1",
+    "MORI_IB_GID_INDEX": "1",
+    "MORI_SHMEM_HEAP_SIZE": "40G",
+}
+LAUNCH_ENV_FORCED = {
+    "OMP_NUM_THREADS": "1",
+    "MORI_NUM_QP_PER_PE": "2",
+    "MORI_EP_LAUNCH_CONFIG_MODE": "AUTO",
+    "AITER_MOE_EXPERT_BALANCE": "true",
+    "AMD_SERIALIZE_KERNEL": "0",
+    "FLYDSL_RUNTIME_ENABLE_CACHE": "1",
+}
+
+
+def _run_job(cmd, env, log, timeout):
+    """Run one torchrun job, copying its output to stdout and ``log``.
+
+    On timeout the whole process group gets SIGTERM, then SIGKILL 30 s later.
+    """
+    proc = subprocess.Popen(cmd, env=env, cwd=REPO_ROOT, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    expired = threading.Event()
+
+    def kill():
+        expired.set()
+        for sig, wait in ((signal.SIGTERM, 30), (signal.SIGKILL, None)):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                return
+            if wait is None:
+                return
+            try:
+                proc.wait(wait)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+
+    timer = threading.Timer(timeout, kill)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            sys.stdout.buffer.write(line)
+            sys.stdout.flush()
+            log.write(line)
+            log.flush()
+        rc = proc.wait()
+    finally:
+        timer.cancel()
+    if expired.is_set():
+        msg = f"[LAUNCH] timeout after {timeout}s, rc={rc}\n".encode()
+        sys.stdout.buffer.write(msg)
+        log.write(msg)
+        rc = rc or 124
+    return rc
+
+
+def launch(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = parse_args(argv)
+    if args.node_rank is None or not args.master_addr:
+        raise SystemExit("launcher needs --node-rank and --master-addr "
+                         "(or start the script under torchrun yourself)")
+    out_root = REPO_ROOT / args.out_dir / args.tag  # the jobs run in REPO_ROOT
+    status = out_root / f"node{args.node_rank}.status"
+    if status.exists():
+        raise SystemExit(f"run tag already exists: {status}")
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ)
+    for key, value in LAUNCH_ENV_DEFAULT.items():
+        env.setdefault(key, value)
+    env.update(LAUNCH_ENV_FORCED)
+    for key in ("GLOO_SOCKET_IFNAME", "MORI_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME"):
+        env[key] = args.socket_ifname
+    env["PYTHONPATH"] = os.pathsep.join(
+        v for v in (str(REPO_ROOT), env.get("PYTHONPATH", "")) if v)
+
+    multi = len(args.networks) > 1
+    rcs = {}
+    with open(out_root / f"node{args.node_rank}.log", "wb") as log:
+        for i, network in enumerate(args.networks):
+            tag = f"{args.tag}/{network}" if multi else args.tag
+            cmd = [sys.executable, "-u", "-m", "torch.distributed.run",
+                   "--nnodes=2", f"--nproc-per-node={GPUS_PER_NODE}",
+                   f"--node-rank={args.node_rank}", f"--master-addr={args.master_addr}",
+                   f"--master-port={args.master_port + i}", "--max-restarts=0"]
+            if args.torchrun_wrap:
+                cmd += ["--no-python", args.torchrun_wrap]
+            cmd += [os.path.abspath(__file__), *argv, "--network", network, "--tag", tag]
+            head = (f"[LAUNCH] {time.strftime('%T')} network={network} ({i + 1}/"
+                    f"{len(args.networks)}) node_rank={args.node_rank} "
+                    f"port={args.master_port + i} tag={tag}\n").encode()
+            sys.stdout.buffer.write(head)
+            sys.stdout.flush()
+            log.write(head)
+            rcs[network] = _run_job(cmd, env, log, args.timeout)
+        tail = (f"[LAUNCH] {time.strftime('%T')} done "
+                + " ".join(f"{n}={rc}" for n, rc in rcs.items()) + "\n").encode()
+        sys.stdout.buffer.write(tail)
+        log.write(tail)
+    rc = next((rc for rc in rcs.values() if rc), 0)
+    status.write_text(f"{rc}\n")
+    return rc
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main() if "RANK" in os.environ else launch())
