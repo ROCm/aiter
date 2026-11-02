@@ -198,8 +198,11 @@ def s1f_ctl_words(*, npes: int, tile_cap: int) -> int:
 #: P48/rb4 67.9 (2), P32/rb4 70.1 (2); 768 P64 101.1, P48 101.5, P80 101.4
 #: (2), P96 102.7 (2); 1536 P64 155.1, P80 155.7 (2), P96 155.5 (2), P48
 #: 156.3 (2); 4096 P64 313.7, P48 314.0, P80 313.9 (2).
+#: Runs per claim: the tpr <= 1024 bucket uses 2 (was 8), from DSV4.1-Flash
+#: DEP4 on MI455X, MLPerf Endpoints agentic c512 (end to end, with the rest of
+#: the S1F defaults: +2.1% gen tok/s/GPU over S1F off).
 S1F_PRODUCERS = (64, 64, 64, 64)
-S1F_BLOCK_RUNS = (4, 8, 8, 8)
+S1F_BLOCK_RUNS = (4, 2, 8, 8)
 
 
 def _tpr_bucket(tokens_per_rank: int) -> int:
