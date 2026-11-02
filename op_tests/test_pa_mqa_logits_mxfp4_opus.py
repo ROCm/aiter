@@ -881,7 +881,7 @@ def check_graph(model):
             )
             launch(case, cfg, out, schedule=s, ends=ends)
 
-        step()  # warm: the module, the config's internal buffers
+        step()  # warm: the module
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):

@@ -23,8 +23,8 @@ pages (its value is the first page's id / ``pages_per_block``)::
 The caller never names a kernel instance: the config picks one from the static bounds. A
 schedule is optional. Given, the launch runs the table-driven mode; absent, it runs the
 instance's schedule-free mode, or (an instance without one) builds a schedule internally into
-buffers the config owns -- correct and graph-safe, one more launch a call, not reentrant across
-concurrent streams. Nothing reads device data on the host, so every path can be captured.
+buffers of the call's own -- correct and graph-safe, one more launch a call. Nothing reads device
+data on the host, so every path can be captured.
 
 A slice of rows ``[start, start + count)`` (a band) is scored by slicing the per-row tensors and
 passing ``query_start_loc.clamp(start, start + count) - start``.
@@ -386,8 +386,9 @@ class MqaLogitsScheduleBuffers:
 
 @dataclass(frozen=True, eq=False)
 class MqaLogitsSchedule:
-    """One forward's Table schedule, bound to its cfg and to the very `query_start_loc` and
-    `row_ends` tensors it was built from (the launch checks identity, not contents)."""
+    """One forward's Table schedule, bound to its cfg (or an equal one) and to the very
+    `query_start_loc` and `row_ends` tensors it was built from (the launch checks their identity,
+    not contents)."""
 
     cfg: "MqaLogitsConfig"
     query_start_loc: torch.Tensor
@@ -420,7 +421,18 @@ class MqaLogitsConfig:
     _tpb_shift: int  # log2(tiles a table entry); 0 where a tile spans entries
     _table_slots: int  # the Table grid at the bounds
     _empty_i32: torch.Tensor
-    _internal: list  # [MqaLogitsScheduleBuffers], built on first need
+    # What fixes the launch: device, bounds, instance, schedule-free mode. Configs compare and
+    # hash by it, so a schedule or buffers from one serve any equal one (an evicted config's
+    # successor included).
+    _key: tuple
+
+    def __eq__(self, other) -> bool:
+        return self is other or (
+            isinstance(other, MqaLogitsConfig) and self._key == other._key
+        )
+
+    def __hash__(self) -> int:
+        return hash(self._key)
 
     def schedule_buffers(self) -> MqaLogitsScheduleBuffers:
         """Buffers for one live schedule, sized from the bounds. Hold one set per micro-batch or
@@ -492,10 +504,11 @@ def mqa_logits_mxfp4_config(
     ``max_qlen``         rows of one sequence, at most; a decode bucket passes its MTP depth + 1.
     ``max_seq_len``      the logits width: the most keys a row sees.
 
-    Cached: equal arguments give the same object. Building one asks HIP for each instance's
-    occupancy once a device. Raises if no instance compiled for the device's arch supports the
-    request. ``_instance`` (an id or name) and ``_mode`` ("table" / "free" / "prefill") override
-    the choice, for tuning and tests.
+    Cached, the most recent 1024: equal arguments give an equal config (the same object while
+    it stays cached), which holds no device memory, so a caller may ask once a step with that
+    step's shapes. Building one asks HIP for each instance's occupancy once a device. Raises if
+    no instance compiled for the device's arch supports the request. ``_instance`` (an id or
+    name) and ``_mode`` ("table" / "free" / "prefill") override the choice, for tuning and tests.
     """
     dev = (
         torch.device(device)
@@ -518,7 +531,9 @@ def mqa_logits_mxfp4_config(
     )
 
 
-@functools.cache
+# Bounded: a caller may pass each step's shapes, and prefill's rows, sequences and widths vary
+# without end. A config is a value (no device memory), so evicting one costs only its rebuild.
+@functools.lru_cache(maxsize=1024)
 def _config(
     dev,
     heads,
@@ -616,7 +631,18 @@ def _config(
         _tpb_shift=0 if inst.gather else tpb.bit_length() - 1,
         _table_slots=slots,
         _empty_i32=torch.empty(0, dtype=torch.int32, device=dev),
-        _internal=[],
+        _key=(
+            dev,
+            heads,
+            page_size,
+            pages_per_block,
+            max_rows,
+            max_seqs,
+            max_qlen,
+            max_seq_len,
+            inst.id,
+            free_mode,
+        ),
     )
 
 
@@ -665,7 +691,7 @@ def mqa_logits_mxfp4_schedule(
     _check_rows(cfg, query_start_loc, row_ends)
     if buffers is None:
         buffers = cfg.schedule_buffers()
-    elif buffers.cfg is not cfg:
+    elif buffers.cfg != cfg:
         raise ValueError("these buffers were sized for another config")
     _build(cfg, buffers, query_start_loc, row_ends)
     return MqaLogitsSchedule(
@@ -846,7 +872,7 @@ def mqa_logits_mxfp4(
     cta_target, parts = 1, 1
     if schedule is not None:
         if (
-            schedule.cfg is not cfg
+            schedule.cfg != cfg
             or schedule.query_start_loc is not query_start_loc
             or schedule.row_ends is not row_ends
         ):
@@ -869,9 +895,9 @@ def mqa_logits_mxfp4(
             parts = _prefill_parts(inst, groups, -(-cfg.max_seq_len // inst.tile_keys))
             grid = groups * parts
     else:
-        if not cfg._internal:
-            cfg._internal.append(cfg.schedule_buffers())
-        buf = cfg._internal[0]
+        # An instance without a schedule-free mode: a schedule into buffers of this call's own.
+        # Captured, they are the graph's; nothing outlives the call or races another stream.
+        buf = cfg.schedule_buffers()
         _build(cfg, buf, query_start_loc, row_ends)
         mode, cta_info, grid = TABLE, buf.cta_info, buf.num_ctas
 
