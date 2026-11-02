@@ -69,14 +69,14 @@ REF_IMPL = (
 try:
     from aiter.ops.flydsl import flydsl_fp8_mqa_logits
     from aiter.ops.flydsl.fp8_mqa_logits_kernels import (
-        _VARIANT_MFMA_M,
         _auto_variant,
         _auto_variants,
         _resolve_variant,
+        _variant_supports,
     )
 except ImportError:
     flydsl_fp8_mqa_logits = _auto_variant = _auto_variants = None
-    _resolve_variant = _VARIANT_MFMA_M = None
+    _resolve_variant = _variant_supports = None
 
 # Bench timing knobs, set from argv in main(), read by _time_us.
 BENCH_WARMUP = 10
@@ -467,8 +467,8 @@ def verify_production_variants(num_heads, head_dims, clean_logits):
 
     Auto-routing is shape-dependent, so the reduced/full sweeps reach a given
     production variant only by chance; this pins each one down across the
-    num_heads, head-dim, clean_logits and window axes. Heads the variant's MFMA
-    atom cannot tile are skipped. Returns (rows, failures) in the shape main()
+    num_heads, head-dim, clean_logits and window axes. Heads and head dims the
+    variant's MFMA atom cannot tile are skipped. Returns (rows, failures) in the shape main()
     reports them.
     """
     rows, failures = [], []
@@ -479,7 +479,7 @@ def verify_production_variants(num_heads, head_dims, clean_logits):
         clean_logits,
         _PRODUCTION_WINDOWS,
     ):
-        if nh % _VARIANT_MFMA_M[tag]:
+        if not _variant_supports(tag, nh, hd):
             continue
         case = {
             **_PRODUCTION_CASE,
@@ -645,7 +645,7 @@ def bench_fp8_mqa_logits(
     ret = {
         "shape": _shape_label(s_q, s_k, batch),
         "gfx": get_gfx(),
-        "variant": _resolve_variant(None, s_q, s_k, num_heads),
+        "variant": _resolve_variant(None, s_q, s_k, num_heads, head_dim),
         "status": "ok",
     }
     times = {}
@@ -699,6 +699,8 @@ def _log_speedup(ratios, output_file=None):
         r.max(),
         int(r.gt(1).sum()),
     )
+    if output_file is None:
+        return
     with open(output_file, "a") as file:
         line = (
             f"\n\nfp8_mqa_logits bench: FlyDSL speedup over {REF_IMPL} on {len(r)} of {len(ratios)} cases: "  

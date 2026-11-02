@@ -100,11 +100,46 @@ def _issue_mfmas(mfma, mma, gemm_kw, a_mi, b_pack):
     return c_frag
 
 
-def _accumulate_heads(mfma, c_frag, w_mi, col_sum, f32_0):
+#: ``head_acc`` modes: how a lane sums its ReLU(acc) * weight head terms.
+#:   ``"add"``  -- ``sum + relu * w``. Under fast-math LLVM may reassociate the
+#:                 chain, and on gfx950 its SLP vectorizer then rebuilds it as
+#:                 a mix of packed and scalar adds (~1.7 VALU per head term).
+#:   ``"fma"``  -- one explicit ``fma(relu, w, sum)`` chain, which is not
+#:                 reassociable: a ``v_max`` + ``v_fmac`` pair per head term.
+#:   ``"fma2"`` -- two interleaved chains (even / odd accumulator elements) as
+#:                 ``<2 x f32>`` fmas, i.e. ``v_pk_fma_f32``; summed at the end.
+HEAD_ACC_MODES = ("add", "fma", "fma2")
+
+
+def _head_acc_init(head_acc, f32_0):
+    if head_acc == "fma2":
+        return Vec.filled(2, 0.0, fx.Float32)
+    return f32_0
+
+
+def _accumulate_heads(mfma, c_frag, w_mi, col_sum, f32_0, head_acc="add"):
     """Add one M-tile's ReLU(acc) * weight terms to this lane's column sum."""
     acc = c_frag.load()
-    for ii in range_constexpr(mfma.ACC_ELEMS):
-        col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_mi[ii]
+    if head_acc == "add":
+        for ii in range_constexpr(mfma.ACC_ELEMS):
+            col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_mi[ii]
+    elif head_acc == "fma":
+        for ii in range_constexpr(mfma.ACC_ELEMS):
+            col_sum = fx.math.fma(Vec(acc)[ii].maximumf(f32_0), w_mi[ii], col_sum)
+    else:
+        relu = Vec(acc).maximumf(Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32))
+        for ii in range_constexpr(0, mfma.ACC_ELEMS, 2):
+            pair = [ii, ii + 1]
+            col_sum = fx.math.fma(
+                relu.shuffle(relu, pair), w_mi.shuffle(w_mi, pair), col_sum
+            )
+    return col_sum
+
+
+def _head_acc_total(head_acc, col_sum):
+    """The lane's scalar head sum (``fma2`` carries two partials)."""
+    if head_acc == "fma2":
+        return col_sum[0] + col_sum[1]
     return col_sum
 
 
@@ -129,17 +164,27 @@ def _finish_col_sum(mfma, col_sum, kv_scale, reduce):
 
 
 def _emit_col_sum(
-    mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0, reduce=True
+    mfma,
+    mma,
+    gemm_kw,
+    a_row,
+    b_pack,
+    w_row,
+    kv_scale,
+    f32_0,
+    reduce=True,
+    head_acc="add",
 ):
     """One lane's logit contribution for a single (query row, n-tile) pair.
 
     ``a_row``/``w_row`` are that row's per-(mi, kk) A-fragments and per-(mi, ii)
     weights; ``b_pack`` is the n-tile's per-kk B-fragments.
     """
-    col_sum = f32_0
+    col_sum = _head_acc_init(head_acc, f32_0)
     for mi in range_constexpr(len(a_row)):
         c_frag = _issue_mfmas(mfma, mma, gemm_kw, a_row[mi], b_pack)
-        col_sum = _accumulate_heads(mfma, c_frag, w_row[mi], col_sum, f32_0)
+        col_sum = _accumulate_heads(mfma, c_frag, w_row[mi], col_sum, f32_0, head_acc)
+    col_sum = _head_acc_total(head_acc, col_sum)
     return _finish_col_sum(mfma, col_sum, kv_scale, reduce)
 
 
@@ -151,11 +196,16 @@ def _emit_acc_issue(mfma, mma, gemm_kw, a_row, b_pack):
     return c_frags
 
 
-def _emit_acc_reduce(mfma, c_frags, w_row, kv_scale, f32_0, reduce=True):
+def _emit_acc_reduce(
+    mfma, c_frags, w_row, kv_scale, f32_0, reduce=True, head_acc="add"
+):
     """Phase 2 of a software-pipelined ``_emit_col_sum``: consume the accumulators."""
-    col_sum = f32_0
+    col_sum = _head_acc_init(head_acc, f32_0)
     for mi in range_constexpr(len(c_frags)):
-        col_sum = _accumulate_heads(mfma, c_frags[mi], w_row[mi], col_sum, f32_0)
+        col_sum = _accumulate_heads(
+            mfma, c_frags[mi], w_row[mi], col_sum, f32_0, head_acc
+        )
+    col_sum = _head_acc_total(head_acc, col_sum)
     return _finish_col_sum(mfma, col_sum, kv_scale, reduce)
 
 
@@ -183,6 +233,7 @@ class _EpilogueCtx:
     f32_0: object
     store_if: Callable  # (pred, out_row_t, col, value) -> None
     iglp: bool = False  # rocdl.iglp_opt(0) ahead of the sw_pipe nest
+    head_acc: str = "add"  # see HEAD_ACC_MODES
 
 
 @dataclass(frozen=True)
@@ -233,6 +284,7 @@ def _mfma_and_epilogue_per_tile(ctx, tile):
                 ctx.w_frag[j],
                 tile.kv_scales[ni],
                 ctx.f32_0,
+                head_acc=ctx.head_acc,
             )
             _store_tile_cols(ctx, j, tile.out_row_ts[j], tile.cols[ni], col_sum)
 
@@ -254,6 +306,7 @@ def _mfma_and_reduce_scatter_epilogue(ctx, tile):
                     tile.kv_scales[g * rs_group + q],
                     ctx.f32_0,
                     reduce=False,
+                    head_acc=ctx.head_acc,
                 )
                 for q in range_constexpr(rs_group)
             ]
@@ -292,7 +345,13 @@ def _mfma_and_epilogue_pipelined(ctx, tile, rs_head):
                 mfma, mma, gemm_kw, ctx.a_packs[jn], tile.b_packs[nin]
             )
         col_sum = _emit_acc_reduce(
-            mfma, cf, ctx.w_frag[j], tile.kv_scales[ni], ctx.f32_0, reduce=not rs_head
+            mfma,
+            cf,
+            ctx.w_frag[j],
+            tile.kv_scales[ni],
+            ctx.f32_0,
+            reduce=not rs_head,
+            head_acc=ctx.head_acc,
         )
         if not rs_head:
             _store_tile_cols(ctx, j, tile.out_row_ts[j], tile.cols[ni], col_sum)
@@ -534,6 +593,7 @@ def _build_kernel_mfma_r_w(
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
     clean_logits: bool = True,
+    head_acc: str = "add",
 ):
     """Multi-row, multi-wave MFMA kernel.
 
@@ -595,9 +655,11 @@ def _build_kernel_mfma_r_w(
     # keep the names they have always had (same convention as _cvt_tag).
     _cl_tag = "" if clean_logits else "_nocl"
     _shape_tag = mfma.kname_tag or f"mfma{mfma.name}"
+    assert head_acc in HEAD_ACC_MODES, f"head_acc={head_acc!r}"
+    _ha_tag = "" if head_acc == "add" else f"_h{head_acc}"
     _kname = (
         f"fp8_mqa_logits_H{H}_D{D}_bkv{BKV}_{_shape_tag}_r{RPB}_w{WPB}"
-        f"{_cvt_tag}{_cl_tag}_flydsl"
+        f"{_ha_tag}{_cvt_tag}{_cl_tag}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -711,8 +773,12 @@ def _build_kernel_mfma_r_w(
             in_rows = row < seq_len
             ss = fx.max(fx.Int32(cs_t[row_ld]), fx.Int32(0))
             ee = fx.min(fx.Int32(ce_t[row_ld]), seq_len_kv)
-            starts[j] = in_rows.select(ss, seq_len_kv)
-            ends[j] = in_rows.select(ee, fx.Int32(0))
+            # An empty window also takes [seq_len_kv, 0), so it cannot stretch
+            # the union (a cu_starts past seq_len_kv would otherwise leave
+            # ee == seq_len_kv). The -inf fill still covers the whole row.
+            live = in_rows & (ss < ee)
+            starts[j] = live.select(ss, seq_len_kv)
+            ends[j] = live.select(ee, fx.Int32(0))
 
             # lane -> Q[row, h = mi*MFMA_M + lane%MFMA_N,
             #            d = kk*MFMA_K + (lane//MFMA_N)*8 + 0..7]
@@ -794,6 +860,7 @@ def _build_kernel_mfma_r_w(
                         w_frag[j],
                         kv_scales_tile[ni],
                         f32_0,
+                        head_acc=head_acc,
                     )
 
                     # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
@@ -898,6 +965,7 @@ def _build_kernel_mfma_lds_pipe(
     sw_pipe: bool = False,
     rs_head: bool = False,
     lds_scales: bool = False,
+    head_acc: str = "add",
 ):
     """LDS multi-buffered variant for gfx950 MfmaAtoms (scaled CDNA4 atoms).
 
@@ -921,8 +989,10 @@ def _build_kernel_mfma_lds_pipe(
     run, instead of one shuffle butterfly and one MFMA_N-lane store per n-tile.
     ``lds_scales`` stages the tile's kv_scales into the LDS slot with the same
     async DMA as the KV bytes, instead of a blocking per-n-tile global load
-    that every wave repeats.
+    that every wave repeats. ``head_acc`` picks how each lane sums its head
+    terms (``HEAD_ACC_MODES``).
     """
+    assert head_acc in HEAD_ACC_MODES, f"head_acc={head_acc!r}"
     H = num_heads
     D = head_size
     BKV = block_kv
@@ -1047,9 +1117,9 @@ def _build_kernel_mfma_lds_pipe(
     # period, and it lets every n-tile share the lane's read addresses
     # (immediate offsets).
     NTILE_BYTES = mfma.MFMA_N * D
-    assert NTILE_BYTES % (1 << sum(LDS_SWZ)) == 0, (
-        f"n-tile ({NTILE_BYTES} bytes) must be a multiple of the swizzle period"
-    )
+    assert (
+        NTILE_BYTES % (1 << sum(LDS_SWZ)) == 0
+    ), f"n-tile ({NTILE_BYTES} bytes) must be a multiple of the swizzle period"
 
     # The DMA's 128-byte LDS alignment must sit on the fx.Array type:
     # SharedAllocator.allocate(alignment=) is only bookkeeping.
@@ -1063,7 +1133,8 @@ def _build_kernel_mfma_lds_pipe(
         f"fp8_mqa_logits_H{H}_D{D}_mfma{mfma.name}"
         f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}{_pd_tag}"
         f"{'_swp' if sw_pipe else ''}"
-        f"{'_rs' if rs_head else ''}{'_ls' if lds_scales else ''}{_cl_tag}_flydsl"
+        f"{'_rs' if rs_head else ''}{'_ls' if lds_scales else ''}"
+        f"{'' if head_acc == 'add' else f'_h{head_acc}'}{_cl_tag}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -1283,10 +1354,13 @@ def _build_kernel_mfma_lds_pipe(
             in_rows = rr < seq_len
             ss = fx.max(fx.Int32(cs_t[rr_ld]), fx.Int32(0))
             ee = fx.min(fx.Int32(ce_t[rr_ld]), seq_len_kv)
-            # Empty [seq_len_kv, 0) for a past-the-end slot leaves min/max
-            # untouched.
-            ss = in_rows.select(ss, seq_len_kv)
-            ee = in_rows.select(ee, fx.Int32(0))
+            # Empty [seq_len_kv, 0) for a past-the-end slot, or for an empty
+            # window, leaves min/max untouched. Without the second case a row
+            # whose cu_starts lies past seq_len_kv would still stretch u_end
+            # to seq_len_kv, and the block would scan KV for nothing.
+            live = in_rows & (ss < ee)
+            ss = live.select(ss, seq_len_kv)
+            ee = live.select(ee, fx.Int32(0))
             if jj == 0:
                 u_start = ss
                 u_end = ee
@@ -1355,6 +1429,7 @@ def _build_kernel_mfma_lds_pipe(
             f32_0=f32_0,
             store_if=_store_if,
             iglp=IGLP_SW_PIPE,
+            head_acc=head_acc,
         )
 
         # ---- Steady-state software pipeline over BKV tiles ----
