@@ -334,15 +334,58 @@ def torch_compile_guard(
         # A bound C++ function arrives through calling_func_; its func is a stub.
         python_body = calling_func_ is None
 
+        # Keep the existing dummy-Tensor schema, including for saved graphs.
+        # Only our own implementation is known to ignore this argument. An
+        # external registration may inspect it and must keep the old path.
+        reuse_dispatch_tensor = False
+        dispatch_tensor_index = None
+        dispatch_tensor_name = None
+        if not input_is_tensor and not return_non_tensor and device in ("cpu", "cuda"):
+            positional_index = 0
+            for param in parameters:
+                positional = param.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+                if (
+                    param.annotation is torch.Tensor
+                    and param.default is inspect.Parameter.empty
+                    and param.kind
+                    not in (
+                        inspect.Parameter.VAR_POSITIONAL,
+                        inspect.Parameter.VAR_KEYWORD,
+                    )
+                ):
+                    dispatch_tensor_index = positional_index if positional else None
+                    dispatch_tensor_name = param.name
+                    break
+                if positional:
+                    positional_index += 1
+
         def wrapper_custom(*args, **kwargs):
             if python_body and _python_ops_real:
                 return func(*args, **kwargs)
+            dummy = None
+            if not input_is_tensor:
+                if reuse_dispatch_tensor:
+                    tensor = (
+                        args[dispatch_tensor_index]
+                        if dispatch_tensor_index is not None
+                        and len(args) > dispatch_tensor_index
+                        else kwargs.get(dispatch_tensor_name)
+                    )
+                    if (
+                        type(tensor) is torch.Tensor
+                        and not tensor.requires_grad
+                        and tensor.device.type == device
+                    ):
+                        dummy = tensor
+                if dummy is None:
+                    dummy = torch.empty(1, device=device)
             result = (
                 getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
                 if input_is_tensor
-                else getattr(torch.ops.aiter, f"{loadName}")(
-                    torch.empty(1, device=device), *args, **kwargs
-                )
+                else getattr(torch.ops.aiter, f"{loadName}")(dummy, *args, **kwargs)
             )
             return result[1] if return_non_tensor else result
 
@@ -413,6 +456,7 @@ def torch_compile_guard(
             # second torch.ops dispatch. Set only when this decorator registered
             # the op: a pre-existing registration may run a different body.
             wrapper_custom._eager_body = func
+            reuse_dispatch_tensor = dispatch_tensor_name is not None
 
         return _as_public(wrapper_custom)
 
