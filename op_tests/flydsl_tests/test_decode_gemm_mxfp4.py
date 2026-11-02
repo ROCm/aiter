@@ -77,7 +77,7 @@ def test_decode_gemm_mxfp4(
 ):
     if not torch.cuda.is_available():
         pytest.skip("GPU required")
-    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    arch = get_gfx_runtime()
     if arch != "gfx950":
         pytest.skip(f"requires gfx950, got {arch}")
     torch.manual_seed(1219)
@@ -301,7 +301,7 @@ def test_gemm_a4w4_dispatch_flydsl(
 def _require_gfx950():
     if not torch.cuda.is_available():
         pytest.skip("GPU required")
-    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    arch = get_gfx_runtime()
     if arch != "gfx950":
         pytest.skip(f"requires gfx950, got {arch}")
 
