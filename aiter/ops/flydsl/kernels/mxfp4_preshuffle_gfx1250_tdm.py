@@ -6,6 +6,7 @@
 import math
 import os
 from collections import namedtuple
+from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -193,6 +194,7 @@ def launch_gemm_a8w4_tdm(
     persistent_workers: Constexpr[int] = 0,
     rolled_drain: Constexpr[int] = 0,
     a_preshuffled: Constexpr[int] = 0,
+    explicit_vgpr_partition: Constexpr[int] = int(SUPPORT_EXPLICIT_VGPR_PARTITION),
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -220,6 +222,10 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
     """
+    assert explicit_vgpr_partition in (0, 1)
+    explicit_vgpr_partition = bool(
+        explicit_vgpr_partition and is_fx_set_register_available()
+    )
     if persistent_workers:
         assert cluster_m == 1, "persistent workers require cluster_m=1"
         assert persistent_workers % cluster_n == 0
@@ -306,7 +312,7 @@ def launch_gemm_a8w4_tdm(
         sched_mma_group,
         sched_first_group,
         sched_ds_first,
-        SUPPORT_EXPLICIT_VGPR_PARTITION,
+        explicit_vgpr_partition,
         planar_lds_on,
         interleaved_lds_load_on,
         row_major_ascale,
@@ -352,10 +358,10 @@ def launch_gemm_a8w4_tdm(
     quant_gemm1_prefill = fp4_prefill and stage1_act == 1 and bool(stage1_quant_out)
     reuse_lds_stage_base = fp4_prefill and bool(planar_lds_on)
     skip_initial_cluster_sync = fp4_prefill and bool(next_stage_on) and not tdm_as_in_prologue
-    pinned_fp4_prefill = fp4_prefill and SUPPORT_EXPLICIT_VGPR_PARTITION
+    pinned_fp4_prefill = fp4_prefill and explicit_vgpr_partition
     resident_ring_addresses = pinned_fp4_prefill and bool(next_stage_on) and not rolled_drain
     checked_recip_expert = (pinned_fp4_prefill or
-                            (use_spec_prefill_opt and SUPPORT_EXPLICIT_VGPR_PARTITION
+                            (use_spec_prefill_opt and explicit_vgpr_partition
                              and stage1_act == 1 and bool(stage1_quant_out))) and 1 < n_experts <= 65536
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
@@ -492,7 +498,7 @@ def launch_gemm_a8w4_tdm(
         else f"_mg{sched_first_group}x{sched_mma_group}"
     )
     _ds_first = f"_dsfirst{sched_ds_first}" if sched_ds_first else ""
-    _explicit_vgpr_partition = "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
+    _explicit_vgpr_partition = "_regpart" if explicit_vgpr_partition else ""
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
@@ -1206,7 +1212,7 @@ def launch_gemm_a8w4_tdm(
                 values = []
                 for component in range_constexpr(4):
                     value = stage_bases[component] + fx.index_cast(T.index, lane_offsets[component])
-                    if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
+                    if const_expr(explicit_vgpr_partition):
                         value = (fx.Int32(stC_idx) + region_offsets[component]
                                  + fx.Int32(slot) * stage_strides[component] + fx.Int32(lane_offsets[component]))
                         value = fx.Int32(llvm_dialect.InlineAsmOp(
@@ -1308,7 +1314,7 @@ def launch_gemm_a8w4_tdm(
             fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Float32)
             for _ in range_constexpr(n_acc)
         ]
-        if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
+        if const_expr(explicit_vgpr_partition):
             assert n_acc * WMMA_VECTOR_DWORDS <= 512
             for idx in range_constexpr(n_acc):
                 fx.set_register(
@@ -1426,7 +1432,7 @@ def launch_gemm_a8w4_tdm(
                 fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
                 for _ in range_constexpr(wmma_n_rep)
             ]
-            if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
+            if const_expr(explicit_vgpr_partition):
                 slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
                 assert slot_width <= 128
                 slot_base = ((64 if slot_idx == 0 else 128) if resident_ring_addresses else
@@ -1464,7 +1470,7 @@ def launch_gemm_a8w4_tdm(
             sa_pairs = (active_m_rep + 1) // 2
             SA_WIDTH = max(2, sa_pairs)
             if const_expr(interleaved_m_rows and active_m_rep == 8
-                          and not SUPPORT_EXPLICIT_VGPR_PARTITION):
+                          and not explicit_vgpr_partition):
                 rocdl.sched_barrier(0)
             if const_expr(interleaved_m_rows and active_m_rep in (6, 7)):
                 # Shorter bodies need the v80 scale-slot retirement dependency.
@@ -1515,7 +1521,7 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(pinned_fp4_prefill):
                     load_scales()
             if const_expr(interleaved_m_rows and active_m_rep == 8
-                          and not SUPPORT_EXPLICIT_VGPR_PARTITION):
+                          and not explicit_vgpr_partition):
                 rocdl.sched_barrier(0)
 
         def k_step(
@@ -2047,7 +2053,7 @@ def launch_gemm_a8w4_tdm(
                         compute_drain_tile(PRE - 1, False, kws=KWS_TAIL)
 
             # Keep the v80 six/seven bodies adjacent and emit the output tail once.
-            if const_expr(interleaved_m_rows and not SUPPORT_EXPLICIT_VGPR_PARTITION):
+            if const_expr(interleaved_m_rows and not explicit_vgpr_partition):
                 if fx.Boolean(llvm_dialect.intr_expect(
                     ((4 * M_ROW_STEP < mn_oob) & (7 * M_ROW_STEP >= mn_oob)).ir_value(),
                     fx.Boolean(True).ir_value(),
@@ -2819,3 +2825,23 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
 if SUPPORT_EXPLICIT_VGPR_PARTITION:
     launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
     launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
+
+
+@lru_cache(maxsize=2)
+def get_gemm_a8w4_tdm_register_launcher(explicit_vgpr_partition):
+    """Cache independent register policies without mutating a live launcher.
+
+    The constexpr selects the same kernel body; the separate JitFunction owns
+    its compiler hints and fast-dispatch cache. Switching a shared launcher's
+    hints between GEMM stages would make cache selection and concurrent calls
+    depend on the last stage that compiled.
+    """
+    assert explicit_vgpr_partition in (0, 1)
+    launcher = flyc.jit(launch_gemm_a8w4_tdm.func)
+    launcher.compile_hints["llvm_options"] = dict(
+        launch_gemm_a8w4_tdm.compile_hints["llvm_options"]
+    )
+    if explicit_vgpr_partition:
+        launcher.compile_hints["waves_per_eu"] = 1
+        launcher.compile_hints["maxnreg"] = 1024
+    return launcher
