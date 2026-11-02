@@ -110,6 +110,52 @@ def tensor_cache(fn):
     return wrapper
 
 
+def upload_ints(
+    values: list[int], dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.cuda.Stream]:
+    """Copy host integers to ``device`` without stalling the host or the stream.
+
+    A blocking host-to-device copy synchronizes the stream. Going through pinned
+    memory with ``non_blocking`` does not, and PyTorch keeps the pinned block
+    alive until the copy has run. Returns the tensor and the stream the copy was
+    queued on, for ``wait_for_upload``.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "KDA varlen metadata cannot be built during graph capture: the copy "
+            "would read a host buffer at replay. Run the same call once before "
+            "capturing so it is cached."
+        )
+    stream = torch.cuda.current_stream(device)
+    host = torch.tensor(values, dtype=dtype).pin_memory()
+    return host.to(device, non_blocking=True), stream
+
+
+# Cached uploads used during graph capture. A graph replays their addresses,
+# so they must outlive eviction from the cache that owns them.
+_captured_uploads: dict[int, torch.Tensor] = {}
+
+
+def wait_for_upload(stream: torch.cuda.Stream, buf: torch.Tensor) -> None:
+    """Make ``buf``, from a cached ``upload_ints`` made on ``stream``, safe to
+    use on the current stream.
+
+    From another stream, the copy may not have run yet and the cache may evict
+    and free ``buf`` while kernels queued here still read it: wait on ``stream``
+    and record ``buf`` on the current stream. During graph capture neither can
+    be expressed, so ``buf`` is kept for the life of the process, and the copy
+    must have completed before capture began: ``torch.cuda.graph`` synchronizes
+    the device first; a caller of ``CUDAGraph.capture_begin`` must do so itself.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        _captured_uploads[buf.data_ptr()] = buf
+        return
+    current = torch.cuda.current_stream(stream.device)
+    if current != stream:
+        current.wait_stream(stream)
+        buf.record_stream(current)
+
+
 def _get_available_device() -> str:
     try:
         return triton.runtime.driver.active.get_current_target().backend
