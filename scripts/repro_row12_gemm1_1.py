@@ -70,6 +70,7 @@ ap.add_argument("--kernel", choices=["a4w4", "a8w4"], default="a4w4")
 ap.add_argument("--shape", choices=["9b", "t5"], default="9b")
 ap.add_argument("--M", type=int, nargs="+", default=[4096])
 ap.add_argument("--block-m", type=int, nargs="+", default=[32, 64, 128])
+ap.add_argument("--apply-swiglu", action='store_true', default=False, help='whether apply swiglu')
 ap.add_argument("--seed", type=int, default=0)
 A = ap.parse_args()
 
@@ -150,12 +151,12 @@ def routing(ids, wts, block_m):
     ), gidx
 
 
-def gemm1(xq, xs, w1, s1, rd, gidx):
+def gemm1(xq, xs, w1, s1, rd, gidx, apply_swiglu=True):
     kw = dict(
         gather_indx=gidx,
         swizzle_mx_scale="GFX1250_SCALE",
         out_mx_quant=True,
-        apply_swiglu=True,
+        apply_swiglu=apply_swiglu,
         alpha=1.0,
         limit=1e4,
         swiglu_add_residual=False,
@@ -185,31 +186,38 @@ def main():
         )
         xq, xs = act_quant(x)
         xr = upcast(xq, xs)
+        apply_swiglu = A.apply_swiglu
         for bm in A.block_m:
             rd, gidx = routing(ids, wts, bm)
-            print(f"gidx_shape = {gidx.shape}\ngidx = {gidx[0:512]}")
             n = int(rd.expt_data.hist.sum())
             gate = gidx.long()[:n]
             tok = gate // TOPK
             exp = ids.flatten().long()[gate]
-            ref = torch.empty((n, I), device=dev)
+            if apply_swiglu:
+                ref = torch.empty((n, I), device=dev)
+            else:
+                ref = torch.empty((n, 2 * I), device=dev)
             for e in exp.unique().tolist():
                 s = (exp == e).nonzero(as_tuple=True)[0]
                 h = xr[tok[s]] @ w1r[e]
-                ref[s] = (
-                    h[:, ::2] * torch.sigmoid(h[:, ::2]) * h[:, 1::2]
-                )  # kernel convention: gate even, up odd cols
+                if apply_swiglu:
+                    ref[s] = (
+                        h[:, ::2] * torch.sigmoid(h[:, ::2]) * h[:, 1::2]
+                    )  # kernel convention: gate even, up odd cols
+                else:
+                    ref[s] = h
             ref_rq = upcast(*act_quant(ref.bfloat16()))
             hist = rd.expt_data.hist.long()
             off = (
                 torch.arange(n, device=dev) - (torch.cumsum(hist, 0) - hist)[exp]
             )  # row offset inside its expert
             
-            for mode in ("in-kernel gather", "pre-gathered"):
+            for mode in ("in-kernel gather",):
+                print(f"apply_swiglu = {apply_swiglu}")
                 if mode == "in-kernel gather":
-                    y, ys = gemm1(xq, xs, w1, s1, rd, gidx)
+                    y, ys = gemm1(xq, xs, w1, s1, rd, gidx, apply_swiglu=apply_swiglu)
                 else:
-                    y, ys = gemm1(xq[tok], xs[tok], w1, s1, rd, None)
+                    y, ys = gemm1(xq[tok], xs[tok], w1, s1, rd, None, apply_swiglu=apply_swiglu)
                 torch.cuda.synchronize()
                 got = upcast(y[:n], ys[:n])
                 cos = torch.nn.functional.cosine_similarity(
