@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import math
 
 import torch
 import triton
@@ -42,49 +43,25 @@ KV_HEADS = 2
 BUDGET = 2048
 
 
-def _quantize(values, fmt, second=None):
-    """Store paged `values` `[pages, page, heads, dim]` (and optionally a
-    second tensor of the same shape) in `fmt`; returns (caches, scales)."""
+def _quantize(values, fmt):
+    """Paged `values` `[pages, page, heads, dim]` stored in `fmt`, as
+    (cache, scale)."""
     if fmt == "bf16":
-        return (values, second), (None, None)
+        return values, None
     pages, page, heads, dim = values.shape
     vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, dim)
+    cache = torch.empty(pages, page, heads, vdim, dtype=vdtype, device="cuda")
+    scale = torch.empty(pages, page, heads, *tail, dtype=sdtype, device="cuda")
     slots = torch.arange(pages * page, device="cuda")
-    caches, scales = [], []
-    for _ in range(1 if second is None else 2):
-        caches.append(
-            torch.empty(pages, page, heads, vdim, dtype=vdtype, device="cuda")
-        )
-        scales.append(
-            torch.empty(pages, page, heads, *tail, dtype=sdtype, device="cuda")
-        )
-    if second is None:
-        qsa_store_quantized_rows(
-            caches[0], scales[0], slots, values.view(-1, heads, dim)
-        )
-        return (caches[0], None), (scales[0], None)
-    qsa_store_quantized_rows(
-        caches[0],
-        scales[0],
-        slots,
-        values.view(-1, heads, dim),
-        caches[1],
-        scales[1],
-        second.view(-1, heads, dim),
-    )
-    return tuple(caches), tuple(scales)
+    qsa_store_quantized_rows(cache, scale, slots, values.view(-1, heads, dim))
+    return cache, scale
 
 
 def _row_bytes(fmt, dim):
     """Bytes of one cached row including its scale."""
     vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, dim)
-    size = vdim * vdtype.itemsize
-    if tail is not None:
-        n = 1
-        for t in tail:
-            n *= t
-        size += n * sdtype.itemsize
-    return size
+    scale_bytes = 0 if tail is None else math.prod(tail) * sdtype.itemsize
+    return vdim * vdtype.itemsize + scale_bytes
 
 
 def _make_scenario(batch, tokens_per_seq, context_len, index_dtype, kv_dtype):
@@ -130,7 +107,7 @@ def _make_scenario(batch, tokens_per_seq, context_len, index_dtype, kv_dtype):
         dtype=torch.bfloat16,
         device="cuda",
     )
-    (compressed, _), (compressed_scale, _) = _quantize(compressed, index_dtype)
+    compressed, compressed_scale = _quantize(compressed, index_dtype)
     query = torch.randn(
         rows, QUERY_HEADS, QUERY_DIM, dtype=torch.bfloat16, device="cuda"
     )
@@ -143,7 +120,8 @@ def _make_scenario(batch, tokens_per_seq, context_len, index_dtype, kv_dtype):
         device="cuda",
     )
     values = torch.randn_like(keys)
-    (keys, values), (k_scale, v_scale) = _quantize(keys, kv_dtype, values)
+    keys, k_scale = _quantize(keys, kv_dtype)
+    values, v_scale = _quantize(values, kv_dtype)
     return {
         "positions": positions,
         "tables": tables,
@@ -161,12 +139,6 @@ def _make_scenario(batch, tokens_per_seq, context_len, index_dtype, kv_dtype):
         "total_pages": total_pages,
         "pages_per_req": pages_per_req,
     }
-
-
-def _scenario(args, batch, tokens_per_seq, context_len):
-    return _make_scenario(
-        batch, tokens_per_seq, context_len, args.index_dtype, args.kv_dtype
-    )
 
 
 def _label(args, name):
@@ -223,7 +195,9 @@ def bench_select(args, scoring_only=False):
     @triton.testing.perf_report([config])
     def _run(batch, tokens_per_seq, context_len, provider):
         torch.manual_seed(42)
-        s = _scenario(args, batch, tokens_per_seq, context_len)
+        s = _make_scenario(
+            batch, tokens_per_seq, context_len, args.index_dtype, args.kv_dtype
+        )
         columns = s["pages_per_req"] * COMPRESSED_PAGE_SIZE
         rows = s["rows"]
         elem = 2  # bf16
@@ -304,7 +278,9 @@ def bench_gqa(args):
     @triton.testing.perf_report([config])
     def _run(batch, tokens_per_seq, context_len, provider):
         torch.manual_seed(42)
-        s = _scenario(args, batch, tokens_per_seq, context_len)
+        s = _make_scenario(
+            batch, tokens_per_seq, context_len, args.index_dtype, args.kv_dtype
+        )
         rows = s["rows"]
         elem = 2  # bf16
 

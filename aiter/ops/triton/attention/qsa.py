@@ -15,7 +15,6 @@ from aiter.ops.triton._triton_kernels.attention.qsa import (
     _expand_selected_groups,
     _qsa_paged_mqa_logits_kernel,
     _qsa_paged_mqa_logits_mfma_kernel,
-    _qsa_paged_mqa_logits_stacked_kernel,
     _qsa_sparse_paged_gqa_kernel,
     _qsa_store_rows_fp4_kernel,
     _qsa_store_rows_fp8_kernel,
@@ -84,6 +83,23 @@ def _merge_slots(plane: torch.Tensor, name: str) -> torch.Tensor:
     return plane.view(pages * page_size, *rest)
 
 
+def _check_scale_plane(
+    name: str, cache: torch.Tensor, scale: torch.Tensor, fmt: int, head_dim: int
+) -> None:
+    """Raise unless `scale` is the scale plane of a `fmt` cache, as laid out by
+    `qsa_cache_row_layout`."""
+    _, _, tail, scale_dtype = qsa_cache_row_layout(QSA_CACHE_FORMATS[fmt], head_dim)
+    if (
+        scale.shape != (*cache.shape[:3], *tail)
+        or scale.dtype != scale_dtype
+        or (tail and scale.stride(-1) != 1)
+    ):
+        raise ValueError(
+            f"{name} must be the {scale_dtype} [pages, page, heads(, groups)] "
+            "plane of the cache"
+        )
+
+
 def qsa_store_quantized_rows(
     cache: torch.Tensor,
     scale: torch.Tensor,
@@ -116,17 +132,8 @@ def qsa_store_quantized_rows(
         return
     if slots.shape[0] < rows or heads != cache.shape[2]:
         raise ValueError("slots or heads disagree with the cache")
-    _, _, tail, scale_dtype = qsa_cache_row_layout(QSA_CACHE_FORMATS[fmt], head_dim)
-    if scale.shape != (*cache.shape[:3], *tail) or scale.dtype != scale_dtype:
-        raise ValueError(
-            f"scale must be the {scale_dtype} [pages, page, heads(, groups)] "
-            "plane of the cache"
-        )
-    if (
-        values.stride(-1) != 1
-        or cache.stride(-1) != 1
-        or (tail and scale.stride(-1) != 1)
-    ):
+    _check_scale_plane("scale", cache, scale, fmt, head_dim)
+    if values.stride(-1) != 1 or cache.stride(-1) != 1:
         raise ValueError("quantized QSA rows must be contiguous in the head dim")
     flat = _merge_slots(cache, "cache")
     flat_scale = _merge_slots(scale, "scale")
@@ -157,14 +164,13 @@ def qsa_store_quantized_rows(
             raise ValueError("the second FP8 tensor must mirror the first")
         _qsa_store_rows_fp8_kernel[(rows, heads)](
             *args,
-            second_cache if second else flat,
-            second_scale if second else flat_scale,
-            second_values if second else values,
+            second_cache,
+            second_scale,
+            second_values,
             *(second_values.stride()[:2] if second else (0, 0)),
             HEAD_DIM=head_dim,
             BLOCK_D=triton.next_power_of_2(head_dim),
             FP8_MAX_C=FP8_MAX,
-            HAS_SECOND=second,
             num_warps=4,
         )
         return
@@ -299,17 +305,15 @@ def qsa_paged_mqa_logits(
     if key_fmt == _FMT_BF16 and q.dtype != compressed_k_cache.dtype:
         raise ValueError("q and compressed_k_cache must have the same dtype")
     if key_fmt != _FMT_BF16:
-        _, _, tail, scale_dtype = qsa_cache_row_layout(
-            QSA_CACHE_FORMATS[key_fmt], q.shape[2]
+        _check_scale_plane(
+            "compressed_k_scale",
+            compressed_k_cache,
+            compressed_k_scale,
+            key_fmt,
+            q.shape[2],
         )
-        if (
-            compressed_k_scale.shape != (*compressed_k_cache.shape[:3], *tail)
-            or compressed_k_scale.dtype != scale_dtype
-            or compressed_k_scale.stride(-1) != 1
-            or q.stride(2) != 1
-            or compressed_k_cache.stride(3) != 1
-        ):
-            raise ValueError("compressed_k_scale must be the scale plane of the cache")
+        if q.stride(2) != 1 or compressed_k_cache.stride(3) != 1:
+            raise ValueError("quantized QSA rows must be contiguous in the head dim")
     # BF16 keys pass a None scale, which binds as a constexpr.
     scale_strides = (
         (0, 0) if compressed_k_scale is None else compressed_k_scale.stride()[:2]
@@ -356,14 +360,14 @@ def qsa_paged_mqa_logits(
     stacked = tile is not None and tile["BMT"] * heads >= 16
     if stacked or (q.shape[0] > 256 and contiguous and head_dim >= 16):
         if stacked:
-            kernel = _qsa_paged_mqa_logits_stacked_kernel
             bmt, bn, num_warps = tile["BMT"], tile["BN"], tile["num_warps"]
             column_programs = min(triton.cdiv(columns, bn), tile["column_programs"])
         else:
-            kernel = _qsa_paged_mqa_logits_mfma_kernel
             bmt, bn, num_warps = 16, 128, 4
             column_programs = triton.cdiv(columns, bn)
-        kernel[(triton.cdiv(q.shape[0], bmt), column_programs)](
+        _qsa_paged_mqa_logits_mfma_kernel[
+            (triton.cdiv(q.shape[0], bmt), column_programs)
+        ](
             q,
             compressed_k_cache,
             compressed_k_scale,
@@ -395,6 +399,7 @@ def qsa_paged_mqa_logits(
             BN=bn,
             KEY_FMT=key_fmt,
             GROUP=FP4_GROUP,
+            STACK_HEADS=stacked,
             num_warps=num_warps,
         )
         return logits, visible_groups
@@ -527,18 +532,12 @@ def qsa_sparse_paged_gqa(
         raise ValueError("K/V caches must have matching [pages, page, heads, dim]")
     kv_fp8 = _cache_format(k_cache, k_scale) == _FMT_FP8
     if kv_fp8:
-        if (
-            v_cache.dtype != k_cache.dtype
-            or v_scale is None
-            or k_scale.shape != k_cache.shape[:3]
-            or v_scale.shape != k_scale.shape
-            or v_scale.stride() != k_scale.stride()
-            or k_scale.dtype != torch.float32
-            or v_scale.dtype != torch.float32
-        ):
-            raise ValueError(
-                "FP8 K/V need matching float32 [pages, page, heads] scales"
-            )
+        if v_cache.dtype != k_cache.dtype or v_scale is None:
+            raise ValueError("an FP8 k_cache needs an FP8 v_cache and v_scale")
+        for name, plane in (("k_scale", k_scale), ("v_scale", v_scale)):
+            _check_scale_plane(name, k_cache, plane, _FMT_FP8, q.shape[2])
+        if v_scale.stride() != k_scale.stride():
+            raise ValueError("v_scale must have the strides of k_scale")
     elif v_scale is not None:
         raise ValueError("v_scale needs an FP8 cache and k_scale")
     elif q.dtype != k_cache.dtype or q.dtype != v_cache.dtype:
