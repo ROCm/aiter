@@ -59,7 +59,12 @@ def _setup_a4w4(x, w, M, N, K):
     config = get_GEMM_config(M, N, K)
     kernel = str(config.get("kernelName", "")) if config is not None else ""
     split_k = int(config.get("splitK", 0) or 0) if config is not None else 0
-    use_ck = bool(config is not None and "_ZN" not in kernel)
+    # flydsl_ rows are dispatched in Python by gemm_a4w4, not CK or asm; drop the
+    # name so the asm path below uses its default heuristic.
+    is_flydsl = kernel.startswith("flydsl_")
+    if is_flydsl:
+        kernel = ""
+    use_ck = bool(config is not None and not is_flydsl and "_ZN" not in kernel)
     out = torch.empty((_ceil(M, 32), N), dtype=torch.bfloat16, device=x.device)
 
     def run(a, a_scale):

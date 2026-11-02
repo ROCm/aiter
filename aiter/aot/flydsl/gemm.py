@@ -20,6 +20,7 @@ Supported kernel families:
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_compute_wmma_*`` gfx1250 compute-bound mxfp8_128 kernels
   - ``flydsl_mxfp8_32_bpreshuffle_{,compute_}wmma_*`` the same kernels on 1x32 scales
+  - ``flydsl_decode_*``                       gfx950 decode MXFP4 GEMM kernels
   - ``flydsl_mxpsh_*``                        gfx950 MX-microscale preshuffle GEMM
   - ``flydsl_mxfp8_8w_*``                     gfx950 8-wave mxfp8 (1x32 row scales) GEMM
   - ``flydsl_bmm_mxfp8_mfma_*``               gfx950 mxscale batched GEMM kernels
@@ -75,6 +76,7 @@ from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
+from aiter.ops.flydsl.decode_gemm_mxfp4 import parse_flydsl_decode_name
 from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
     compile_8wave_gemm,
     parse_8wave_kernel_name,
@@ -99,6 +101,10 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     parse_kernel_name as parse_mxscale_preshuffle_kernel_name,
+)
+from aiter.ops.flydsl.kernels.decode_gemm_mxfp4 import compile_decode_gemm_mxfp4
+from aiter.ops.flydsl.kernels.decode_gemm_mxfp4_reduce import (
+    compile_decode_gemm_mxfp4_reduce,
 )
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
@@ -140,8 +146,10 @@ from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
     MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK,
 )
 from aiter.ops.gemm_op_common import (
+    find_padded_m_row,
     mxscale_bmm_groups_of_block,
     mxscale_w_scale_block_cell,
+    padded_m_py,
 )
 from aiter_worker_limits import adopt_legacy_max_jobs
 
@@ -259,6 +267,28 @@ def _bmm_mfma_job(
     }
 
 
+DECODE_MAX_M = 16
+
+
+def _decode_served_ms(row_keys, gfx, cu_num, m, n, k):
+    """Actual M in 1..DECODE_MAX_M whose runtime lookup lands on the row at M=m.
+
+    Mirrors get_GEMM_config (aiter/ops/gemm_op_a4w4.py): try M itself, then M
+    padded at getPaddedM granularity 0 and 1, first present row wins. The
+    padding comes from the pure-Python mirror of getPaddedM, so the wheel
+    build needs no GPU."""
+    served = []
+    for actual in range(1, DECODE_MAX_M + 1):
+        # Pure-Python getPaddedM: the wheel build runs without a GPU, and the
+        # compiled get_padded_m is a CUDA custom op (torch_compile_guard allocates).
+        hit, padded = find_padded_m_row(
+            row_keys, lambda pm: (gfx, cu_num, pm, n, k), actual, n, k, pad=padded_m_py
+        )
+        if hit is not None and padded == m:
+            served.append(actual)
+    return served
+
+
 def _a4w4_jobs(rows: list[dict]) -> list[dict]:
     """Every specialization an a4w4_mxscale_bpreshuffle table can launch: each FlyDSL
     kernel it names or falls back to below a shape's smallest tuned M, at every cluster_m
@@ -334,10 +364,27 @@ def parse_csv(csv_path: str):
     # mxpsh rows any other table may still hold.
     mxfp8_table = "a8w8_mxfp8_bpreshuffle" in os.path.basename(csv_path)
 
+    # Keys of every row, not only FlyDSL ones: a non-FlyDSL row at the exact M
+    # shadows a padded FlyDSL row at runtime.
+    row_keys = {
+        (
+            r.get("gfx", "").strip(),
+            int(r.get("cu_num", "0")),
+            int(r["M"]),
+            int(r["N"]),
+            int(r["K"]),
+        ): True
+        for r in rows
+        if not r.get("b", "").strip() and r.get("M")
+    }
+
     for row in other_rows:
         kernel_name = row.get("kernelName", "").strip()
         libtype = row.get("libtype", "").strip()
-        if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
+        is_decode = kernel_name.startswith("flydsl_decode_")
+        if not kernel_name.startswith("flydsl_") or (
+            libtype != "flydsl" and not is_decode
+        ):
             continue
 
         if row.get("b", "").strip():  # a batched row (may be in a mixed table)
@@ -389,7 +436,13 @@ def parse_csv(csv_path: str):
                     jobs.append(job)
             continue
 
-        if kernel_name.startswith("flydsl_bpreshuflle_"):
+        if is_decode:
+            if job_arch(cu_num, gfx) != "gfx950":
+                continue
+            params = parse_flydsl_decode_name(kernel_name)
+            if params is not None:
+                params = {"kind": "decode", **params}
+        elif kernel_name.startswith("flydsl_bpreshuflle_"):
             params = _parse_preshuffle_kernel_name(kernel_name)
         elif kernel_name.startswith("flydsl_mxpsh_"):
             if not raw_scales:
@@ -454,22 +507,26 @@ def parse_csv(csv_path: str):
             print(f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping")
             continue
 
-        job = {
-            "kernel_name": kernel_name,
-            "m": m,
-            "n": n,
-            "k": k,
-            "cu_num": cu_num,
-            "gfx": gfx,
-            "has_bias": _parse_bool(row.get("bias")),
-            **params,
-        }
-        key = job_identity(job)
-        if key in seen:
-            continue
-        seen.add(key)
+        # The decode kernel specializes on the actual M, so each M the row
+        # serves needs its own cache entry.
+        ms = _decode_served_ms(row_keys, gfx, cu_num, m, n, k) if is_decode else [m]
+        for job_m in ms:
+            job = {
+                "kernel_name": kernel_name,
+                "m": job_m,
+                "n": n,
+                "k": k,
+                "cu_num": cu_num,
+                "gfx": gfx,
+                "has_bias": _parse_bool(row.get("bias")),
+                **params,
+            }
+            key = job_identity(job)
+            if key in seen:
+                continue
+            seen.add(key)
 
-        jobs.append(job)
+            jobs.append(job)
 
     if batched_skipped:
         print(
@@ -898,6 +955,53 @@ def _compile_mxscale_preshuffle_to_cache(
         )
 
 
+def _compile_decode_mxfp4_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    tile_n: int,
+    k_waves: int,
+    num_buffers: int,
+    split_k: int,
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    dev = torch.device("cpu")
+    padded_k = (k + 255) // 256 * 256
+    # Match the wrapper's flattened int32 operand views and output dtype/rank.
+    a = torch.empty((m * k // 8,), device=dev, dtype=torch.int32)
+    b = torch.empty((n * k // 8,), device=dev, dtype=torch.int32)
+    scale_a = torch.empty((padded_k // 4,), device=dev, dtype=torch.int32)
+    scale_b = torch.empty((n * padded_k // 128,), device=dev, dtype=torch.int32)
+    out = torch.empty((m * n,), device=dev, dtype=torch.bfloat16)
+    target = (
+        torch.empty((split_k * m * n,), device=dev, dtype=torch.float32)
+        if split_k > 1
+        else out
+    )
+    exe = compile_decode_gemm_mxfp4(
+        M=m,
+        N=n,
+        K=k,
+        tile_n=tile_n,
+        k_waves=k_waves,
+        num_buffers=num_buffers,
+        split_k=split_k,
+    )
+    _compile_executable_to_cache(exe, a, b, scale_a, scale_b, target, fx.Stream(0))
+    if split_k > 1:
+        _compile_executable_to_cache(
+            compile_decode_gemm_mxfp4_reduce(M=m, N=n, split_k=split_k),
+            target,
+            out,
+            fx.Stream(0),
+        )
+
+
 def _compile_8wave_to_cache(
     *,
     m: int,
@@ -1297,6 +1401,12 @@ def compile_one_config(
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxscale_preshuffle":
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "decode":
+                if aot_arch != "gfx950":
+                    raise ValueError(
+                        f"Decode MXFP4 only supports gfx950, got {aot_arch}"
+                    )
+                _compile_decode_mxfp4_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "blockscale_8wave":
