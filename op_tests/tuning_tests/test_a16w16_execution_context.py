@@ -5,6 +5,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
+import torch
+
 import aiter.tuned_gemm as tuned
 from aiter.execution_context import (
     execution_phase,
@@ -176,6 +178,47 @@ class TestExecutionContext(unittest.TestCase):
                 tuned.get_GEMM_A16W16_config(**args, gfx="gfx950", cu_num=304),
                 ordinary,
             )
+
+    def test_mono_tile_tuner_gate_accepts_supported_m_tails(self):
+        import sys
+        from pathlib import Path
+
+        from aiter.ops.opus import _arch
+        from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
+
+        opus_tune_dir = Path(__file__).resolve().parents[2] / "csrc" / "opus_gemm"
+        with mock.patch.object(
+            _arch, "_device_arch_and_cu", lambda _: ("gfx950", 256)
+        ), mock.patch.object(
+            torch.cuda, "current_device", lambda: 0
+        ), mock.patch.object(
+            torch.cuda, "device_count", lambda: 1
+        ):
+            sys.path.insert(0, str(opus_tune_dir))
+            try:
+                import opus_gemm_tune
+            finally:
+                sys.path.pop(0)
+
+        for kid, m_values in (
+            (138, (1, 96, 1024)),
+            (137, (1025, 1535, 1536)),
+        ):
+            instance = get_kernel_instance("gfx950", "a16w16", kid, cu_num=256)
+            self.assertIsNotNone(instance)
+            for m in m_values:
+                with self.subTest(kid=kid, m=m):
+                    self.assertFalse(
+                        opus_gemm_tune.kid_rejects_shape(instance, m, 4096, 1536)
+                    )
+            with self.subTest(kid=kid, misaligned_n=True):
+                self.assertTrue(
+                    opus_gemm_tune.kid_rejects_shape(instance, 1, 4097, 1536)
+                )
+            with self.subTest(kid=kid, misaligned_k=True):
+                self.assertTrue(
+                    opus_gemm_tune.kid_rejects_shape(instance, 1, 4096, 1537)
+                )
 
 
 if __name__ == "__main__":

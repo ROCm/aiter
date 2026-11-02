@@ -98,3 +98,7 @@ def test_glm53_bf16_indexer_prefill_invariance(seed, wide_values):
             graph_out.fill_(float("nan"))
             graph.replay()
             torch.testing.assert_close(graph_out, graph_expected, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
