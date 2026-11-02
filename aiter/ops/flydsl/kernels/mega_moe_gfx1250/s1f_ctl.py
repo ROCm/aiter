@@ -63,6 +63,14 @@ _S1F_PROBING = "probing the GEMM1 configuration"
 # waits out dispatch first. At or below this token count the next layer's plan
 # starts before dispatch returns and overlaps both.
 _DECODE_PLAN_OVERLAP_TOKENS = 128
+#: AITER_S1F_MAX_RECV=N: a step whose receive bound exceeds N runs the whole
+#: S1F=0 path (see _Stage1Fusion.step_off), e.g. to fuse decode only. 0/unset =
+#: no limit.
+_S1F_MAX_RECV = int(os.environ.get("AITER_S1F_MAX_RECV", "0").strip() or "0")
+#: AITER_S1F_ANY_TILE=1: fuse whenever the tuned GEMM1's tile_m matches; the
+#: stage-1 kernel then runs its own 256x256 n/k tiles instead of the tuned
+#: GEMM1's (e.g. tpr 480's t64x256x128 GEMM1 can fuse).
+_S1F_ANY_TILE = os.environ.get("AITER_S1F_ANY_TILE", "0") == "1"
 
 
 def read_s1f_mode() -> bool:
@@ -289,8 +297,33 @@ class _Stage1Fusion:
         step = self.d._step
         return (int(step.align_m), int(step.recv_bound))
 
+    def _recv_too_big(self) -> bool:
+        # The receive bound is identical on every rank.
+        step = getattr(self.d, "_step", None)
+        return (
+            bool(_S1F_MAX_RECV)
+            and step is not None
+            and (int(step.recv_bound) > _S1F_MAX_RECV)
+        )
+
+    def step_off(self) -> bool:
+        """A step over AITER_S1F_MAX_RECV runs exactly the S1F=0 path.
+
+        Not only GEMM1: its compact plan keeps the S1F=0 key and width (one
+        kernel per alignment and slot, instead of one per launch width, block
+        count, tok_map and fused-quant choice) and it never probes. Before,
+        every new prefill width JIT-compiled a stage-1 plan inside the serving
+        loop (first ~100 s of a c512 run: 250-470 ms prefill steps), and the
+        wide stage-1 plan left the remaining prefill steps ~6% slower.
+        """
+        return self.enabled and self._recv_too_big()
+
     def _gemm1_reasons(self) -> list:
         reasons = self.tile_reasons(self.d._step.align_m)
+        if self._recv_too_big():
+            reasons = reasons + [
+                f"recv_bound {int(self.d._step.recv_bound)} > AITER_S1F_MAX_RECV"
+            ]
         seen = self.g1_seen.get(self._g1_key())
         if seen is None:
             return reasons + [_S1F_PROBING]
@@ -335,11 +368,14 @@ class _Stage1Fusion:
             seen is not None
             and not seen
             and not self.tile_reasons(self.d._step.align_m)
+            and not self._recv_too_big()
         )
 
     def should_probe(self) -> bool:
         """The first step at this alignment records the real GEMM1 tile."""
         if not self.enabled or torch.cuda.is_current_stream_capturing():
+            return False
+        if self.step_off():
             return False
         return self.g1_seen.get(self._g1_key()) is None
 
@@ -352,6 +388,7 @@ class _Stage1Fusion:
             and self.wire is not None
             and not d._plan_pending
             and self.plan_mode(d._step.align_m)
+            and not self.step_off()
         )
 
     def quantize(self, hidden, token_count: int, run: bool):
@@ -415,6 +452,8 @@ class _Stage1Fusion:
             "tile_n": _S1F_TILE_N,
             "tile_k": _S1F_TILE_K,
         }
+        if _S1F_ANY_TILE:
+            want = {"tile_m": int(align_m)}
         return tuple(
             f"GEMM1 {k} {got[k]} != {v}" for k, v in want.items() if got.get(k) != v
         )
@@ -593,6 +632,9 @@ class _Stage1Fusion:
             "a_strides": (wire_row, wire_row),
             "variant": align_m if align_m in _S1F_VARIANTS else sorted(_S1F_VARIANTS),
         }
+        if _S1F_ANY_TILE:
+            # The stage-1 kernel runs its own 256x256 n/k tiles.
+            got["tile"], want["tile"] = got["tile"][:1], want["tile"][:1]
         bad = {k: (got[k], want[k]) for k in want if got[k] != want[k]}
         if bad or stage1_act not in (1, 2) or quant_scale is None:
             raise RuntimeError(

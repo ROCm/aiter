@@ -67,6 +67,8 @@ producer block-claim heads 64 KB away.
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -200,6 +202,22 @@ def s1f_ctl_words(*, npes: int, tile_cap: int) -> int:
 #: 156.3 (2); 4096 P64 313.7, P48 314.0, P80 313.9 (2).
 S1F_PRODUCERS = (64, 64, 64, 64)
 S1F_BLOCK_RUNS = (4, 8, 8, 8)
+
+
+# Overrides for the two tables above (unset = the defaults): "N" sets all four
+# tokens-per-rank buckets (<=128 / <=1024 / <=2048 / above), "a,b,c,d" sets
+# them one by one. DSV4.1-Flash DEP4 agentic c512: AITER_S1F_BLOCK_RUNS=4,2,8,8.
+def _env_buckets(name, default):
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return default
+    vals = tuple(int(x) for x in v.split(","))
+    return vals * 4 if len(vals) == 1 else vals
+
+
+S1F_PRODUCERS = _env_buckets("AITER_S1F_PRODUCERS", S1F_PRODUCERS)
+S1F_BLOCK_RUNS = _env_buckets("AITER_S1F_BLOCK_RUNS", S1F_BLOCK_RUNS)
+assert len(S1F_PRODUCERS) == 4 and len(S1F_BLOCK_RUNS) == 4
 
 
 def _tpr_bucket(tokens_per_rank: int) -> int:
