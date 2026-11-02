@@ -122,6 +122,10 @@ class ExpertGrouping:
         """As ``Stage2ScatterContext``'s compact_* fields."""
         return {
             "compact_layout": True,
+            # The compact wire is one row per token per peer. The grouped GEMM
+            # scatters those rows into expert order, then clears the flag so
+            # GEMM1 loads A contiguously.
+            "compact_row_gather": True,
             "compact_masked_m": self.masked_m,
             "compact_psum": self.psum,
             "compact_ep_rowmap": self.ep_rowmap,

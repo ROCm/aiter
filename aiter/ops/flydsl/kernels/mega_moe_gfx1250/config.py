@@ -41,12 +41,65 @@ _DISPATCH_EP8_TDM = (
 #   128                                           13.2
 #   256         31.0            21.2      16.3    14.4
 #   512         32.0            34.2                       18.6     18.8
+#   1536                                                        384x16 route
 _DISPATCH_COMPACT = (
     (64, 64, 8, True),
     (256, 192, 8, True),
     (512, 192, 16, True),
+    # EP4, h7168, topk8, fp4 wire: 1536-token decode is 1.9% faster
+    # end-to-end in the MegaMoE microbenchmark with this route-parallel
+    # geometry than the generic 128x16 token-major fallback below.
+    (1536, 384, 16, True),
+    # 4096-token prefill: route-parallel 256x16 lowers dispatch from 159 us
+    # (128x16 token-major) to 130 us on EP4/h7168/topk8/fp4.
+    (4096, 256, 16, True),
     (None, 128, 16, False),
 )
+
+# EP4 h7168 topk9 (topk8 + the fused shared expert) fp4 wire. Route-parallel
+# wins at every size here, prefill included; the topk8 table's 384-block decode
+# geometry loses to 1024x8. Dispatch us, MegaMoE microbenchmark (eager):
+#   tpr    old table            this table
+#   64     22.7 (64x8)          15.9 (256x8)
+#   256    24.0 (192x8)         17.8 (256x16)
+#   1024   37.9 (384x16)        31.9 (1024x8)
+#   1536   47.8 (384x16)        38.5 (1024x8)
+#   8192   171.7 (128x16 tok)   100.3 (512x16)
+#   16384  314 (128x16 tok)     182 (512x16)
+_DISPATCH_COMPACT_EP4_TOPK9 = (
+    (64, 256, 8, True),
+    (256, 256, 16, True),
+    (2048, 1024, 8, True),
+    (4096, 256, 16, True),
+    (None, 512, 16, True),
+)
+
+
+# EP2 h5120 topk6 fp4 (DSV4.1 Flash). The EP4 tail is token-major 128x16 past
+# 4096 tokens/rank. On this geometry that tail is slower than 256x16, and
+# route-parallel grids (256/384/512/1024) are slower still: each token hits
+# about two peers, so fanning six routes does not hide the deduped stores.
+# MegaMoE microbenchmark, scatter compact path, tpr 8192, per layer:
+#   128x16 token-major  1075 us
+#   256x16 token-major  1059 us
+#   512x16 route        1072 us
+_DISPATCH_COMPACT_EP2_TOPK6 = (
+    (64, 64, 8, True),
+    (256, 192, 8, True),
+    (512, 192, 16, True),
+    (1536, 384, 16, True),
+    (4096, 256, 16, True),
+    (None, 256, 16, False),
+)
+
+
+def _compact_dispatch_schedule(world_size: int, topk: int):
+    if (int(world_size), int(topk)) == (4, 9):
+        return _DISPATCH_COMPACT_EP4_TOPK9
+    if (int(world_size), int(topk)) == (2, 6):
+        return _DISPATCH_COMPACT_EP2_TOPK6
+    return _DISPATCH_COMPACT
+
 
 _DISPATCH_TDM_SCHEDULES = {
     (4, 7168, 8): _DISPATCH_EP4_TDM,

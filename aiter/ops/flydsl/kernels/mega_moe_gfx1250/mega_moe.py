@@ -547,7 +547,7 @@ class MegaMoEGfx1250:
         token_count: int | None = None,
     ) -> None:
         """Compile the compact plan this bound needs, before any graph capture.
-        ``token_count`` is unused: the bound alone picks the tile.
+        ``token_count`` sizes the plan grid; the bound picks the tile.
 
         The plan is compiled per tile alignment and the alignment follows the
         bound's token bucket, so a captured batch whose bucket never ran eagerly

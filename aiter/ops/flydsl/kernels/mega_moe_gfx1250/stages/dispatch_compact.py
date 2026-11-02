@@ -13,7 +13,7 @@ from aiter import dtypes, logger
 
 from ...tensor_shim import _preload_compiled, _run_compiled
 from ..arena import _align_up
-from ..config import _DISPATCH_COMPACT, _WAVE_SIZE
+from ..config import _WAVE_SIZE, _compact_dispatch_schedule
 from ..dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from ..recipe import MegaMoEConfig
 from ..types import _from_gpu_ptr
@@ -199,9 +199,19 @@ class _CompactDispatch(_Dispatch):
         blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
         warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
         if blocks_env is not None or warps_env is not None:
-            schedule = ((None, int(blocks_env or "64"), int(warps_env or "8")),)
+            route_parallel = os.environ.get(
+                "AITER_TDM_COMPACT_ROUTE_PARALLEL", "0"
+            ) in ("1", "true", "True")
+            schedule = (
+                (
+                    None,
+                    int(blocks_env or "64"),
+                    int(warps_env or "8"),
+                    route_parallel,
+                ),
+            )
         else:
-            schedule = _DISPATCH_COMPACT
+            schedule = _compact_dispatch_schedule(config.world_size, config.topk)
         super().__init__(config, schedule)
         self.compact = _CompactGeometry.of(config)
         self.scale_stride = _align_up(config.dispatch_scale_nbytes, 128)
@@ -263,12 +273,15 @@ class _CompactDispatch(_Dispatch):
 
     def build(self, res: _EpResources) -> None:
         super().build(res)
-        from ..compact_plan import PLAN_BLOCKS
+        from ..compact_plan import compact_plan_blocks
 
         config, geo, arena = self.config, self.compact, res.arena
         device = res.total_recv.device
         epr = config.experts_per_rank
         segs = config.world_size * epr
+        # Prefill splits the histogram across workgroups. Size the buffer for
+        # the widest split this arena's route count can ask for.
+        hist_blocks = compact_plan_blocks(config.max_tokens_per_rank * config.topk)
         slots = range(self._PLAN_SLOTS)
         # Slot 0 writes the shared map, slot 1 its own.
         self._tok_maps = [res.token_destination_map] + [
@@ -281,7 +294,7 @@ class _CompactDispatch(_Dispatch):
             torch.zeros(epr, dtype=torch.int32, device=device) for _ in slots
         ]
         self._block_hists = [
-            torch.empty(PLAN_BLOCKS * segs, dtype=torch.int32, device=device)
+            torch.empty(hist_blocks * segs, dtype=torch.int32, device=device)
             for _ in slots
         ]
         self._send_bases = [
@@ -400,6 +413,9 @@ class _CompactDispatch(_Dispatch):
                     clear_route_counter=False,
                     compact_plan=True,
                     off_ep_rowmap=arena.offset("ep_rowmap"),
+                    # One payload per token per peer. GEMM1 does not gather it;
+                    # the grouped kernel scatters the live rows into expert order.
+                    row_gather=True,
                     max_tok_slot_stride=config.max_tokens_per_rank * config.topk,
                     route_parallel=route_parallel,
                 )
@@ -497,11 +513,11 @@ class _CompactDispatch(_Dispatch):
 
     def warmup(self, recv_token_bound=None, token_count=None) -> None:
         """Compile the plan this bound's tile needs, in both slots.
-        ``token_count`` is unused: the bound alone picks the tile."""
+        ``token_count`` sizes the plan grid; the bound picks the tile."""
         _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
         self._step = self._step_for(self._recv_bound(recv_token_bound))
         for slot in range(self._PLAN_SLOTS):
-            self._plan_for(self._step.align_m, slot)
+            self._plan_for(self._step.align_m, slot, token_count)
 
     def _recv_bound(self, recv_token_bound: int | None) -> int:
         """This step's recv bound: the caller's, already checked, else the
@@ -529,39 +545,76 @@ class _CompactDispatch(_Dispatch):
         )
         return _CompactStep(recv_bound=bound, align_m=align_m, rows=min(rows, geo.cap))
 
-    def _plan_for(self, align_m: int, slot: int):
+    def _plan_waves_for(self, token_count: int | None) -> int:
+        """Wave count for this step's route count.
+
+        The histogram layout stays on the arena capacity so every rank agrees
+        on the stride. Only the launch width follows the step: a decode step
+        would otherwise pay the prefill kernel's wide barrier.
+        """
+        from ..compact_plan import compact_plan_waves
+
+        routes = self.compact.max_routes
+        if token_count is not None:
+            routes = min(
+                routes,
+                max(1, int(token_count) * int(self.config.topk)),
+            )
+        return compact_plan_waves(npes=self.config.world_size, max_routes=routes)
+
+    def _plan_for(self, align_m: int, slot: int, token_count: int | None = None):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
 
-        Compiled per alignment and hist/done slot, because the plan and the
-        expert GEMM must agree on the tile, and double-buffered plans must not
-        share a done counter.
+        Compiled per alignment, hist/done slot, wave width, and workgroup count.
+        The plan and the expert GEMM must agree on the tile, double-buffered
+        plans must not share a done counter, a decode step must not launch the
+        wide prefill grid, and the workgroup count follows this call's route
+        count.
         """
-        from ..compact_plan import compile_tdm_compact_plan
+        from ..compact_plan import (
+            compact_plan_blocks,
+            compact_plan_waves,
+            compile_tdm_compact_plan,
+        )
 
-        key = (int(align_m), int(slot))
+        align_m = int(align_m)
+        slot = int(slot)
+        waves = self._plan_waves_for(token_count)
+        tok = (
+            int(self.config.max_tokens_per_rank)
+            if token_count is None
+            else int(token_count)
+        )
+        blocks = compact_plan_blocks(tok * int(self.config.topk))
+        key = (align_m, slot, waves, blocks)
         launch = self._plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    f"compact plan for align_m={key[0]} slot={key[1]} was not "
-                    "compiled before graph capture; warm this token bucket "
-                    "eagerly first"
+                    f"compact plan for align_m={align_m} slot={slot} "
+                    f"waves={waves} blocks={blocks} was not compiled before "
+                    "graph capture; warm this token bucket eagerly first"
                 )
             config, geo, arena = self.config, self.compact, self.res.arena
+            full_waves = compact_plan_waves(
+                npes=config.world_size, max_routes=geo.max_routes
+            )
             launch = compile_tdm_compact_plan(
                 rank=config.rank,
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
                 topk=config.topk,
-                tile_m=key[0],
+                tile_m=align_m,
                 # The arena's row count, not this step's: the plan bounds what it
                 # may write against the region it writes into.
                 compact_cap=geo.cap,
-                off_hist=arena.offset("compact_hist") + key[1] * geo.hist_stride * 4,
-                off_done=arena.offset("compact_done") + key[1] * 4,
+                off_hist=arena.offset("compact_hist") + slot * geo.hist_stride * 4,
+                off_done=arena.offset("compact_done") + slot * 4,
                 hist_stride=geo.hist_stride,
                 max_routes=geo.max_routes,
                 hist_pingpong=False,
+                plan_waves=None if waves == full_waves else waves,
+                plan_blocks=blocks,
             )
             # Compiled now, without a launch, so a graph capture never has to.
             _preload_compiled(launch, *self._plan_args(0, 0, key[1]))
@@ -590,7 +643,7 @@ class _CompactDispatch(_Dispatch):
         plan_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(plan_stream):
             _run_compiled(
-                self._plan_for(align_m, slot),
+                self._plan_for(align_m, slot, token_count),
                 *self._plan_args(topk_ids.data_ptr(), token_count, slot),
             )
         self._plan_event.record(plan_stream)

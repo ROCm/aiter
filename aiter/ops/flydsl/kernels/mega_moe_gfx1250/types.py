@@ -73,6 +73,10 @@ class Stage2ScatterContext:
     world_size: int
     source_token_map: torch.Tensor
     compact_layout: bool = False
+    # Compact dispatch shipped one row per token per peer. The grouped GEMM
+    # scatters those rows into expert order before GEMM1, then clears this flag
+    # so GEMM1 does a contiguous load.
+    compact_row_gather: bool = False
     compact_masked_m: torch.Tensor | None = None
     compact_psum: torch.Tensor | None = None
     compact_ep_rowmap: torch.Tensor | None = None
@@ -99,6 +103,8 @@ class Stage2ScatterContext:
             raise ValueError(
                 f"combine_quant_bits must be 0, 8 or 4, got {self.combine_quant_bits}"
             )
+        if self.compact_row_gather and not self.compact_layout:
+            raise ValueError("compact_row_gather requires compact_layout")
         if self.arena_handle < 0:
             raise ValueError("arena_handle must be non-negative")
         if self.combine_input_offset < 0:
