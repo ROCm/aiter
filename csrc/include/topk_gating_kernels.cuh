@@ -588,10 +588,67 @@ __global__ void topk_gating_kernel_opt_multiwave(
 // reachable, where the ballot is empty and needs a guard.
 // ---------------------------------------------------------------------------
 
+__device__ __forceinline__ float readlane_f32(float v, int lane)
+{
+    return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), lane));
+}
+
+// __shfl_xor(v, OFF) without ds_bpermute for OFF < 32.
+template <int OFF>
+__device__ __forceinline__ float lane_xor(float v)
+{
+#if defined(__GFX9__)
+    const int x = __builtin_bit_cast(int, v);
+    if constexpr(OFF == 1)
+        return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(x, 0xb1, 0xf, 0xf, true));
+    else if constexpr(OFF == 2)
+        return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(x, 0x4e, 0xf, 0xf, true));
+    else if constexpr(OFF == 4) // row_shl:4 into banks 0 and 2, row_shr:4 into banks 1 and 3
+        return __builtin_bit_cast(
+            float,
+            __builtin_amdgcn_update_dpp(__builtin_amdgcn_update_dpp(x, x, 0x104, 0xf, 0x5, false),
+                                        x,
+                                        0x114,
+                                        0xf,
+                                        0xa,
+                                        false));
+    else if constexpr(OFF == 8) // row_ror:8
+        return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(x, 0x128, 0xf, 0xf, true));
+    else if constexpr(OFF == 16) // ds_swizzle bit mode, xor_mask 0x10
+        return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(x, 0x401f));
+    else
+#endif
+        return __shfl_xor(v, OFF);
+}
+
+// Same pairing order as the __shfl_xor butterfly from N / 2 down to 1.
+template <int N, typename Op>
+__device__ __forceinline__ float xor_butterfly(float v, Op op)
+{
+    if constexpr(N > 32)
+        v = op(v, lane_xor<32>(v));
+    if constexpr(N > 16)
+        v = op(v, lane_xor<16>(v));
+    if constexpr(N > 8)
+        v = op(v, lane_xor<8>(v));
+    if constexpr(N > 4)
+        v = op(v, lane_xor<4>(v));
+    if constexpr(N > 2)
+        v = op(v, lane_xor<2>(v));
+    if constexpr(N > 1)
+        v = op(v, lane_xor<1>(v));
+    return v;
+}
+
 template <int THREADS_PER_ROW>
 __device__ __forceinline__ int subwarpArgmaxLane(float& val)
 {
-    const float max_val = multithread_reduce_max_dpp<THREADS_PER_ROW>(val);
+    float max_val;
+    if constexpr(THREADS_PER_ROW == WARP_SIZE)
+        max_val = readlane_f32(multithread_reduce_max_dpp<THREADS_PER_ROW, false>(val),
+                               THREADS_PER_ROW - 1);
+    else
+        max_val = multithread_reduce_max_dpp<THREADS_PER_ROW>(val);
 
     constexpr uint64_t GROUP_MASK =
         (THREADS_PER_ROW >= 64) ? ~0ull : ((1ull << THREADS_PER_ROW) - 1);
@@ -609,8 +666,16 @@ template <int THREADS_PER_ROW>
 __device__ __forceinline__ int subwarpArgmax(float& val, float& orig, int& idx)
 {
     const int winner = subwarpArgmaxLane<THREADS_PER_ROW>(val);
-    orig             = __shfl(orig, winner, THREADS_PER_ROW);
-    idx              = __shfl(idx, winner, THREADS_PER_ROW);
+    if constexpr(THREADS_PER_ROW == WARP_SIZE)
+    {
+        orig = readlane_f32(orig, winner);
+        idx  = __builtin_amdgcn_readlane(idx, winner);
+    }
+    else
+    {
+        orig = __shfl(orig, winner, THREADS_PER_ROW);
+        idx  = __shfl(idx, winner, THREADS_PER_ROW);
+    }
     return winner;
 }
 
@@ -867,9 +932,8 @@ void topk_gating_kernel_prefill(
 #pragma unroll
         for(int i = 1; i < VPT; i++)
             local_max = fmaxf(local_max, row_chunk[i]);
-#pragma unroll
-        for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
-            local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+        local_max =
+            xor_butterfly<THREADS_PER_ROW>(local_max, [](float a, float b) { return fmaxf(a, b); });
 
         float local_sum = 0.0f;
 #pragma unroll
@@ -886,9 +950,8 @@ void topk_gating_kernel_prefill(
             row_chunk[i] = ex;
             local_sum += ex;
         }
-#pragma unroll
-        for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
-            local_sum += __shfl_xor(local_sum, off);
+        local_sum =
+            xor_butterfly<THREADS_PER_ROW>(local_sum, [](float a, float b) { return a + b; });
 
         // local_max == -Inf means the row had no valid expert at all. Every diff
         // is then -Inf - -Inf = NaN, which the +Inf case above reads as ex = 1.0,
