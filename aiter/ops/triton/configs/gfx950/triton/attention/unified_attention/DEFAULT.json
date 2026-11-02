@@ -118,7 +118,7 @@
     "D_GEQ_512.Q_GEQ_256.DT_fp8_fp8": {
       "BLOCK_M": 128,
       "num_warps": 4,
-      "num_stages": 1,
+      "num_stages": 2,
       "waves_per_eu": 1,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
