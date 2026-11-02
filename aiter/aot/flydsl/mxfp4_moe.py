@@ -183,8 +183,7 @@ def parse_csv(
                 and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
             )
             # Tuner precompiles measure without bias and skip both stages' bias
-            # variants; shipped CSV rows build every runtime bias choice, except
-            # that GEMM1 builds its bias variant for Swiglu rows only.
+            # variants; shipped CSV rows build every runtime bias choice.
             include_bias_variants = row.get("_include_bias_variants", "1") != "0"
             enable_bias_options = (
                 [False, True] if bias_supported and include_bias_variants else [False]
@@ -206,12 +205,11 @@ def parse_csv(
                 for situ_beta, situ_linear_beta in situ_params:
                     # gate_mode selects the layout at runtime; CSV kernel names
                     # represent both layouts, with separate compiled cache keys.
-                    # Only Swiglu callers pass an expert bias, so other
-                    # activations and shared-expert calls get no bias variant.
+                    # Like ordinary MOE1, one CSV name covers both runtime
+                    # bias choices. Shared-expert calls have no bias variant.
                     g1_bias_options = (
                         [False]
                         if int(row.get("shared_expert_id", "-1") or "-1") >= 0
-                        or p1["act"] != "swiglu"
                         else enable_bias_options
                     )
                     for interleave, enable_bias in itertools.product(
